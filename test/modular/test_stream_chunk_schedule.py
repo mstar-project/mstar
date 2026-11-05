@@ -122,7 +122,7 @@ def test_existing_policies_report_context_items(policy, expected):
 def test_returned_streaming_edge_keeps_its_chunk_info():
     buffer = StreamBuffer(request_id="r", edge_name="codec_tokens", from_partition="Talker",
                           policy=FixedChunkPolicy(chunk_size=3))
-    info = StreamChunkInfo(start_offset=7, context_items=3, num_items=12, is_final=True, chunk_index=0)
+    info = StreamChunkInfo(start_offset=7, context_items=3, num_items=12, is_final=True)
     edge = StreamingEdge("codec_tokens", "Codec", [7, 8, 9], info)
     buffer.store_uningested_edge(edge)
     assert buffer.pop_waiting_edge() == edge
@@ -132,7 +132,7 @@ def test_returned_streaming_edge_keeps_its_chunk_info():
 def test_chunk_info_matches_chunk():
     chunks = _drive(LeftContextChunkPolicy(chunk=4, left_context=1), total_items=10)
     for c in chunks:
-        assert c.info == (c.start_offset, c.context_items, c.num_items, c.is_final, c.chunk_index)
+        assert c.info == (c.start_offset, c.context_items, c.num_items, c.is_final)
 
 
 def test_primed_stream_delivers_its_lead_as_first_window_context():

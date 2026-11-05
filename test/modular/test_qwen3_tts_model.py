@@ -935,29 +935,33 @@ def test_qwen3_tts_talker_builds_official_non_streaming_prefill():
 ])
 def test_qwen3_tts_decode_feeds_its_text_stream_then_eos_then_pad(layout, first_empty):
     """Each decode frame adds one text token: the stream's next one, then TTS
-    EOS on the first chunk past its end (unless the prefill took it), then TTS
-    PAD. The chunk says which, so a step prepared twice (an admit retry) adds
-    the same token both times."""
+    EOS once past its end (unless the prefill took it), then TTS PAD. TTS EOS
+    counts as fed only once its step has run, so a step prepared twice (an
+    admit retry) adds the same token both times."""
     config = _tiny_model_config()
     submodule = TalkerSubmodule(Qwen3TTSTalkerModel(config), _code_predictor(config), config)
     submodule.request_state("r").add("generated_frames", 0)
-    info = SimpleNamespace(request_id="r", rid_handle="r", step_metadata={PROMPT_LAYOUT_KEY: layout})
+    info = SimpleNamespace(
+        request_id="r", rid_handle="r", graph_walk="talker_decode", step_metadata={PROMPT_LAYOUT_KEY: layout},
+    )
     loop_back = {"talker_input_embeds": [torch.zeros(1, 16)]}
 
-    def text_id(chunk, fed=()):
-        prepared = submodule.prepare_inputs(
-            "talker_decode", info, {**loop_back, "text_in": list(fed)},
-            input_metadata=InputMetadata(stream_chunks={"text_in": chunk}),
-        )
-        return int(prepared.kwargs["text_id"])
+    def prepare(fed=()):
+        return submodule.prepare_inputs("talker_decode", info, {**loop_back, "text_in": list(fed)})
+
+    def ran(prepared):
+        submodule.postprocess("r", info, {}, inputs=prepared)
 
     tokens = {"eos": config.tts_eos_token_id, "pad": config.tts_pad_token_id}
     # two tokens streamed, then the stream's empty chunks
-    assert text_id(StreamChunkInfo(0, 0, 1, False, 0), [torch.tensor([7])]) == 7
-    assert text_id(StreamChunkInfo(1, 0, 1, False, 1), [torch.tensor([8])]) == 8
-    past_end = StreamChunkInfo(2, 0, 0, False, 2)
-    assert text_id(past_end) == text_id(past_end) == tokens[first_empty]
-    assert text_id(StreamChunkInfo(2, 0, 0, False, 3)) == tokens["pad"]
+    for token in (7, 8):
+        step = prepare([torch.tensor([token])])
+        assert int(step.kwargs["text_id"]) == token
+        ran(step)
+    retried, step = prepare(), prepare()
+    assert int(retried.kwargs["text_id"]) == int(step.kwargs["text_id"]) == tokens[first_empty]
+    ran(step)
+    assert int(prepare().kwargs["text_id"]) == tokens["pad"]
 
 
 def test_qwen3_tts_talker_prefill_prepends_instruction_without_speaker():
@@ -1393,12 +1397,11 @@ def test_qwen3_tts_talker_preprocess_packs_the_tensors_the_per_row_device_copies
         # the rows' text_in tokens, projected in one call as preprocess does
         return submodule._project_text(torch.cat([row.kwargs["text_id"] for row in decode_rows]))
 
-    _assert_same_tensor(torch.cat([row.kwargs["text_id"] for row in rows]), torch.tensor(frames))
+    # the forward projects the decode rows' text ids
+    _assert_same_tensor(packed["text_ids"], torch.tensor(frames))
     _assert_same_tensor(packed["suppress_eos"], _old_flags(flags))
     _assert_same_tensor(packed["last_token_indices"], torch.arange(len(rows)))
-    _assert_same_tensor(
-        packed["input_embeds"], torch.cat([row.input_embeds for row in rows]) + text_conditions(rows),
-    )
+    _assert_same_tensor(packed["input_embeds"], torch.cat([row.input_embeds for row in rows]))
 
     def prefill_row(rid, walk, text_ids, layout, speaker_id, language_id, **inputs) -> ARNodeInputs:
         metadata = {PROMPT_LAYOUT_KEY: layout, SPEAKER_ID_KEY: speaker_id, LANGUAGE_ID_KEY: language_id}
@@ -1845,7 +1848,7 @@ def test_qwen3_tts_codec_postprocess_uses_its_own_pass_geometry():
 
     def prepare(codes, context):
         chunk = StreamChunkInfo(
-            start_offset=0, context_items=context, num_items=codes.shape[0], is_final=False, chunk_index=0,
+            start_offset=0, context_items=context, num_items=codes.shape[0], is_final=False,
         )
         return submodule.prepare_inputs(
             "codec_chunk", fwd_info, {"codec_tokens": [codes]},
@@ -2208,7 +2211,7 @@ def test_qwen3_tts_codec_takes_every_item_as_a_frame_and_pads_to_capture_shape()
         SimpleNamespace(request_id="request", rid_handle="request"),
         {"codec_tokens": [codes]},
         input_metadata=InputMetadata(stream_chunks={"codec_tokens": StreamChunkInfo(
-            start_offset=1, context_items=1, num_items=3, is_final=True, chunk_index=0,
+            start_offset=1, context_items=1, num_items=3, is_final=True,
         )}),
     )
 
@@ -2224,7 +2227,7 @@ def test_qwen3_tts_codec_takes_every_item_as_a_frame_and_pads_to_capture_shape()
     assert packed[0].t().tolist() == codes.tolist()
     assert submodule.request_state("request")["codec_bucket"] == 3
     assert submodule.cg_key_info("codec_chunk", {"request": None}, {
-        "request": InputMetadata(stream_chunks={"codec_tokens": StreamChunkInfo(1, 1, 3, True, 0)}),
+        "request": InputMetadata(stream_chunks={"codec_tokens": StreamChunkInfo(1, 1, 3, True)}),
     }) == 3
 
     # A single frame lands in the first ramp bucket; too many frames is an error.
@@ -2341,7 +2344,7 @@ def test_qwen3_tts_codec_stream_carries_no_eos_and_ends_on_the_last_frames(num_f
     assert final_samples == (final.num_items - final.context_items) * codec.total_upsample
     assert declined == (final_samples == 0) == (num_frames == 0)
     if num_frames == 0:
-        assert windows == [(StreamChunkInfo(0, 0, 0, True, 0), 0)]
+        assert windows == [(StreamChunkInfo(0, 0, 0, True), 0)]
 
 
 def test_qwen3_tts_codec_batches_and_declares_accelerator_graphs():
@@ -2384,7 +2387,7 @@ def test_qwen3_tts_codec_batches_and_declares_accelerator_graphs():
     # stream chunk info when present (before prepare_inputs), else off the state.
     def chunks(num_items):
         return InputMetadata(stream_chunks={"codec_tokens": StreamChunkInfo(
-            start_offset=0, context_items=0, num_items=num_items, is_final=False, chunk_index=0,
+            start_offset=0, context_items=0, num_items=num_items, is_final=False,
         )})
 
     infos = {"a": None, "b": None}

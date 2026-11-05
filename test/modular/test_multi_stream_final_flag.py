@@ -69,7 +69,7 @@ def _step(worker, node, final_edges):
 def _final_edge(name):
     return StreamingEdge(
         name, TOPOLOGY[name][0], [],
-        StreamChunkInfo(start_offset=0, context_items=0, num_items=1, is_final=True, chunk_index=0),
+        StreamChunkInfo(start_offset=0, context_items=0, num_items=1, is_final=True),
     )
 
 

@@ -411,7 +411,7 @@ def test_frameless_terminal_flush_is_declined(config, decoder, monkeypatch):
         SimpleNamespace(request_id="r", rid_handle="r"),
         {},
         input_metadata=InputMetadata(
-            stream_chunks={"codec_tokens": StreamChunkInfo(10, 0, 0, is_final=True, chunk_index=3)}
+            stream_chunks={"codec_tokens": StreamChunkInfo(10, 0, 0, is_final=True)}
         ),
     )
     assert item is None
@@ -426,7 +426,7 @@ def test_a_stream_of_only_im_end_ends_with_a_declined_chunk(config, decoder, mon
     steps, decodes = run_streams(submodule, {"r": stream_codes(0)})
 
     ((info, audio),) = steps["r"]
-    assert info == StreamChunkInfo(0, 0, 0, True, 0)
+    assert info == StreamChunkInfo(0, 0, 0, True)
     assert audio.numel() == 0 and decodes == 0
 
 
