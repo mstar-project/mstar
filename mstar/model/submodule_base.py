@@ -102,8 +102,10 @@ class IterationInput(NamedTuple):
     # the request-state entry holding the table, ``[T, ...]``
     source: str
     offset: int = 0
-    # past the table's end: a request-state entry holding the row, a value to
-    # fill it with, or None, where reading past it is an error
+    # past the table's end: a request-state entry holding its rows (the first
+    # iteration past the end reads row 0, each later one the next, the last
+    # repeating), a value to fill it with, or None, where reading past it is
+    # an error
     pad: str | float | None = None
     # one row's value, as the forward reads it ([B, *shape] batched)
     shape: tuple[int, ...] = ()
@@ -111,7 +113,8 @@ class IterationInput(NamedTuple):
     capture_fill: float = 0.0
     dtype: torch.dtype = torch.float32
     # the table is the step's items of the streamed input ``source`` (a stream
-    # window), iteration i of the step reading item i, not the request state
+    # window), iteration i of the step reading item i, not the request state;
+    # a row with no window this step reads its pad from row 0
     streamed: bool = False
 
 
@@ -1525,29 +1528,37 @@ def iteration_columns(
             streamed = row[2] if row is not None and len(row) > 2 else {}
             state = None if row is None else states.get(row[0])
             table = streamed.get(spec.source) if spec.streamed else None
-            if table is None and (state is None or spec.streamed):
+            if state is None:
                 if fill is None:
                     fill = torch.full((repeats, *spec.shape), spec.capture_fill, dtype=spec.dtype, device=device)
                 values.append(fill)
                 continue
             if table is None:
-                table = state[spec.source]
+                table = (
+                    torch.empty(0, *spec.shape, dtype=spec.dtype, device=device) if spec.streamed
+                    else state[spec.source]
+                )
             start = (0 if spec.streamed else row[1]) + spec.offset
             value = table[start:start + repeats]
             if value.shape[0] < repeats:
-                pad = _iteration_pad(spec, state or PerRequestState(), table, repeats - value.shape[0], name)
-                value = torch.cat([value, pad])
+                past = max(0, start - table.shape[0])
+                pad = _iteration_pad(spec, state, table, past, repeats - value.shape[0], name)
+                value = torch.cat([value, pad.to(table.dtype)])
             values.append(value.reshape(repeats, *spec.shape))
         out[name] = torch.stack(values)
     return out
 
 
-def _iteration_pad(spec: IterationInput, state: PerRequestState, table: torch.Tensor, n: int, name: str):
+def _iteration_pad(
+    spec: IterationInput, state: PerRequestState, table: torch.Tensor, past: int, n: int, name: str,
+) -> torch.Tensor:
+    """``n`` rows past ``table``'s end, the first of them ``past`` rows past it."""
     if spec.pad is None:
         raise ValueError(f"iteration input {name!r} reads past the {table.shape[0]} rows of {spec.source!r}")
     if isinstance(spec.pad, str):
-        row = state[spec.pad].reshape(1, *table.shape[1:])
-        return row.expand(n, *table.shape[1:])
+        rows = state[spec.pad].reshape(-1, *table.shape[1:])
+        at = torch.arange(past, past + n, device=rows.device).clamp_(max=rows.shape[0] - 1)
+        return rows[at]
     return table.new_full((n, *table.shape[1:]), spec.pad)
 
 

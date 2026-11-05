@@ -2849,11 +2849,55 @@ def test_a_step_that_reads_a_stream_window_repeats_as_far_as_every_row_has_items
     )
     worker._stamp_repeats(speculation, SimpleNamespace(batch=SimpleNamespace(repeats=1)), 1)
     assert ctx.repeats == 3 and set(node_batch.stream_windows) == {0, 1}
+    # a row with one item has one iteration of it
+    speculation.consumed_streaming_edges = {0: window(1), 1: window(5)}
+    worker._stamp_repeats(speculation, SimpleNamespace(batch=SimpleNamespace(repeats=1)), 1)
+    assert ctx.repeats == 1
 
     spec = IterationInput("chunk", shape=(2,), streamed=True)
     items = torch.arange(6.0).reshape(3, 2)
     metadata = SimpleNamespace(stream_chunks={"chunk": StreamChunkInfo(0, 0, 3, False)})
     assert torch.equal(_window_tables([spec], {"chunk": [items]}, metadata)["chunk"], items)
+
+
+def test_the_omni_talker_reads_the_thinkers_items_then_tts_eos_once_then_tts_pad():
+    """Whatever the runs, a Talker row's text inputs are the host path's: each
+    Thinker item once, then tts_eos for one iteration, then tts_pad."""
+    from mstar.engine.engine import _window_tables
+    from mstar.model.qwen3_omni.submodules import TalkerSubmodule
+    from mstar.model.submodule_base import iteration_columns
+    from mstar.streaming.stream_buffer import StreamChunkInfo
+
+    sub = TalkerSubmodule.__new__(TalkerSubmodule)
+    torch.nn.Module.__init__(sub)
+    sub.model = SimpleNamespace(text_projection=SimpleNamespace(linear_fc1=SimpleNamespace(weight=torch.zeros(1))))
+    sub.config = SimpleNamespace(thinker_hidden_size=2)
+    sub.request_states, sub._iteration_inputs = {}, {}
+    sub._tts_eos_raw, sub._tts_pad_raw = torch.full((1, 2), -1.0), torch.zeros(1, 2)
+    sub.get_device = lambda: CPU
+    (spec,) = sub.ITERATION_INPUTS.values()
+    item = iter(range(1, 100))
+    seen: dict[int, list[float]] = {0: [], 1: []}
+
+    def step(windows: dict[int, int], repeats: int) -> None:
+        rows = []
+        for rid, items in windows.items():
+            values = torch.tensor([[float(next(item))] * 2 for _ in range(items)])
+            inputs = {"talker_input_embeds": [torch.zeros(1, 2)], "thinker_states": [values] if items else []}
+            info = SimpleNamespace(rid_handle=rid)
+            sub.prepare_inputs("talker_decode", info, inputs)
+            chunks = SimpleNamespace(stream_chunks={"thinker_states": StreamChunkInfo(0, 0, items, False)})
+            rows.append((rid, 0, _window_tables([spec], inputs, chunks)))
+        column = iteration_columns(sub, rows, repeats, CPU)["text_raw"]
+        for (rid, _, _), values in zip(rows, column, strict=True):
+            seen[rid].extend(values[:, 0].tolist())
+
+    step({0: 1, 1: 1}, 1)
+    step({0: 2, 1: 0}, 2)  # row 1's stream has ended; the run is as long as row 0's window
+    step({0: 0, 1: 0}, 3)  # and now row 0's
+    step({0: 0, 1: 0}, 2)
+    assert seen[0] == [1, 3, 4, -1, 0, 0, 0, 0]
+    assert seen[1] == [2, -1, 0, 0, 0, 0, 0, 0]
 
 
 def test_a_run_stops_short_of_the_iteration_whose_items_run_another_consumer_walk():

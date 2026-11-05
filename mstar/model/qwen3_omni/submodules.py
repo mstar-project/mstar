@@ -88,6 +88,7 @@ from mstar.model.submodule_base import (
     DeviceLoopback,
     InputMetadata,
     InputSeqLenInfo,
+    IterationInput,
     ModelInputsFromEngine,
     NodeInputs,
     NodeSubmodule,
@@ -1395,10 +1396,8 @@ class TalkerSubmodule(ARNodeSubmodule):
         # with True at positions to suppress.  Cached on first forward.
         self._suppress_mask: torch.Tensor | None = None
 
-        # Per-request flag: whether we've already sent tts_eos_embed as
-        # the text conditioning for this request. We use this flag to
-        # inject tts_eos_embed for ONE step before falling back to pad.
-        self._eos_embed_sent: set[str] = set()
+        # ITERATION_INPUTS by the projection's dtype, which the engine settles after construction
+        self._iteration_inputs: dict[torch.dtype, Mapping[str, IterationInput]] = {}
 
         self.token_stop = talker_token_stop(config)
 
@@ -1528,6 +1527,10 @@ class TalkerSubmodule(ARNodeSubmodule):
         **kwargs
     ) -> ARNodeInputs:
         device = self.get_device()
+        state = self.request_state(fwd_info.rid_handle)
+        if "text_tail" not in state:
+            # every row has one: the engine stages the text input for each walk
+            state.add("text_tail", torch.cat([self._tts_eos_raw, self._tts_pad_raw]))
 
         if graph_walk == "talker_prefill":
             # The Thinker's walk, or one chunk of it when its prefill is chunked
@@ -1551,24 +1554,16 @@ class TalkerSubmodule(ARNodeSubmodule):
             seq_len = input_embeds.shape[0]
 
         elif graph_walk == "talker_decode":
-            # The previous step's codec embedding sum plus this step's text
-            # conditioning, which the forward projects for the whole batch:
-            # the Thinker's next token state (decode is always text), then
-            # tts_eos for one step, then tts_pad.
-            thinker_states = inputs.get("thinker_states", [])
-            rid = fwd_info.rid_handle
-            if thinker_states:
-                text_raw = thinker_states[0]
-            elif rid not in self._eos_embed_sent:
-                text_raw = self._tts_eos_raw
-                self._eos_embed_sent.add(rid)
-            else:
-                text_raw = self._tts_pad_raw
-            return ARNodeInputs(
-                input_embeds=inputs["talker_input_embeds"][0],
-                input_seq_len=1,
-                tensor_inputs={"text_raw": text_raw},
-            )
+            # The previous step's codec embedding sum. Its text conditioning,
+            # projected in the forward, is the engine's to stage (ITERATION_INPUTS):
+            # a step with no Thinker item reads text_tail from its first row, so
+            # tts_eos the first time and only tts_pad after.
+            state = self.request_state(fwd_info.rid_handle)
+            if state.get("text_ended"):
+                state.add("text_tail", self._tts_pad_raw)
+            elif not inputs.get("thinker_states"):
+                state.add("text_ended", True)
+            return ARNodeInputs(input_embeds=inputs["talker_input_embeds"][0], input_seq_len=1)
 
         return ARNodeInputs(
             input_embeds=input_embeds,
@@ -1624,13 +1619,11 @@ class TalkerSubmodule(ARNodeSubmodule):
         ], dim=0)
         device = self.get_device()
 
-        extra_args = {}
+        # a decode step's text input is the engine's to stage (ITERATION_INPUTS);
+        # the other walks have none
+        extra_args = {} if graph_walk == "talker_decode" else {"text_raw": None}
         if graph_walk == "talker_decode":
-            dtype = self.model.text_projection.linear_fc1.weight.dtype
-            input_embeds = input_embeds.to(dtype)
-            extra_args["text_raw"] = torch.cat(
-                [inp.tensor_inputs["text_raw"] for inp in inputs], dim=0,
-            ).to(dtype)
+            input_embeds = input_embeds.to(self.model.text_projection.linear_fc1.weight.dtype)
         if graph_walk == "talker_last_prefill":
             extra_args["last_token_indices"] = (
                 torch.tensor(seq_lens, device=device, dtype=torch.long).cumsum(0) - 1
@@ -1639,6 +1632,21 @@ class TalkerSubmodule(ARNodeSubmodule):
             "input_embeds": input_embeds,
             **extra_args
         }
+
+    @property
+    def ITERATION_INPUTS(self) -> Mapping[str, IterationInput]:  # noqa: N802
+        """A decode step's text input, before ``text_projection``: the
+        Thinker's next text state, an item of its stream an iteration, then
+        once the stream has ended tts_eos for one iteration and tts_pad after
+        (``text_tail``, which ``prepare_inputs`` keeps)."""
+        dtype = self.model.text_projection.linear_fc1.weight.dtype
+        specs = self._iteration_inputs.get(dtype)
+        if specs is None:
+            specs = self._iteration_inputs[dtype] = {"text_raw": IterationInput(
+                "thinker_states", pad="text_tail", shape=(self.config.thinker_hidden_size,), dtype=dtype,
+                streamed=True,
+            )}
+        return specs
 
     def repeat_carry(self, graph_walk: str, signals: Collection[str]) -> dict[str, CarryPair]:
         pairs = super().repeat_carry(graph_walk, signals)
@@ -1819,7 +1827,6 @@ class TalkerSubmodule(ARNodeSubmodule):
     def cleanup_request(self, request_id: str) -> None:
         """Remove per-request state when a request completes."""
         super().cleanup_request(request_id)
-        self._eos_embed_sent.discard(request_id)
 
     def can_batch(self, batch: ExecutingBatch, model_inputs: list[NodeInputs]) -> bool:
         return batch.graph_walk in [
@@ -1848,10 +1855,6 @@ class TalkerSubmodule(ARNodeSubmodule):
                         device=device, dtype=torch.bfloat16
                     ),
                     input_seq_len=1,
-                    tensor_inputs={"text_raw": torch.zeros(
-                        (1, self.config.thinker_hidden_size),
-                        device=device, dtype=torch.bfloat16,
-                    )},
                 ),
                 capture_batch_sizes=[1, 2, 4, 8, 16, 32],
                 compile=True

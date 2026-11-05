@@ -2967,7 +2967,7 @@ class Worker:
         # a stream window: as many iterations as every row has items for, and
         # what a row took past the step's own count goes back after its admit
         windows = {
-            rid: [e for e in edges if e.chunk.num_items > 1 and e.next_node == batch.node_name]
+            rid: [e for e in edges if e.chunk.num_items and e.next_node == batch.node_name]
             for rid, edges in speculation.consumed_streaming_edges.items()
         }
         windows = {rid: edges for rid, edges in windows.items() if edges}
