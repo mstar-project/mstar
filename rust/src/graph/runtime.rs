@@ -3435,7 +3435,7 @@ impl GraphRuntime {
         let pp = postprocess::Postprocess::new(
             partition, node_name, graph_walk, output_signals, rids, walks, rid_walk_idx,
             stop_rids.into_iter().zip(stop_loops).collect(), runtime_stops,
-            tokens, row_rids, inline, partition_done, python_send, loop_strides,
+            tokens, row_rids, inline, partition_done, python_send, loop_strides, token_width,
         );
         self.postprocess = None;
         self.pp_run(py, pp)

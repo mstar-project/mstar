@@ -1787,7 +1787,7 @@ class Engine:
                 phase_end("engine.collect_outputs", t0)
                 if self._enable_nvtx:
                     range_pop()
-            self._add_resource_host_rows(submodule_mgmt, out)
+            self._add_resource_host_rows(submodule_mgmt, out, batch.step_context.repeats)
             # Optional 1-step launch throttle (see MSTAR_ENGINE_STEP_SYNC).
             # Not for correctness — downstream reads already gate on the
             # completion event, so the token exists before it is read. This just
@@ -1815,9 +1815,13 @@ class Engine:
 
     @staticmethod
     def _add_resource_host_rows(
-        submodule_mgmt: SubmoduleManagement, out: BatchedModelOutput,
+        submodule_mgmt: SubmoduleManagement, out: BatchedModelOutput, repeats: int,
     ) -> None:
-        """Adds ``Resource.step_host_rows`` to the step's stop buffers."""
+        """Adds ``Resource.step_host_rows`` to the step's stop buffers. Not to a
+        step that repeats: no row of it wants any, or it would have settled at 1,
+        so rows offered now are for a request that arrived after it settled."""
+        if repeats > 1:
+            return
         for key, resource in submodule_mgmt.resources.items():
             if not (rows := resource.step_host_rows()):
                 continue

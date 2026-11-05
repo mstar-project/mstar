@@ -284,3 +284,19 @@ def test_a_repeated_step_stops_a_row_at_its_iteration_and_emits_up_to_it(tmp_pat
         for rid, value in zip(frame.body.request_ids, frame.body.values, strict=True):
             sent.setdefault(rid, []).append(value)
     assert sent == {"r0": [1, 2, 3], "r1": [4, EOS]}
+
+
+@pytest.mark.parametrize("limits", [True, False], ids=["store", "stops"])
+def test_a_repeated_step_refuses_the_worker_paths_that_read_one_iteration(tmp_path, limits):
+    """Only the runtime's own check and the inline route read every iteration:
+    a store or a model check would drop the rest of a row's tokens unseen."""
+    rt = _runtime(rust_runtime.RustGraphRuntime, str(tmp_path))
+    rids = _start(rt, 2, limits=limits)
+    assert rt.pop_rids(NODE, WALK, rids) is not None
+    wide = torch.tensor([[1, 2, 3], [4, 5, 6]], dtype=torch.int64)
+    with pytest.raises(RuntimeError):
+        rt.begin_postprocess(PostprocessRequest(
+            partition=PART, node_name=NODE, graph_walk=WALK, output_signals=[SIG],
+            wg_ids=ParallelList(list(rids), [0, 0]), runtime_stops=True,
+            tokens=wide[:, 0], row_rids=rids, loop_strides=[3, 3], token_width=3,
+        ))

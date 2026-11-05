@@ -193,20 +193,32 @@ def test_resource_rows_join_the_stop_buffers_without_touching_the_models_dict():
     out = BatchedModelOutput(check_stop_buffers=stop)
     mgmt = SimpleNamespace(resources={"kv": _Rows({}), "sampler": _Rows({SAMPLED_LOGPROB: logprobs})})
 
-    Engine._add_resource_host_rows(mgmt, out)
+    Engine._add_resource_host_rows(mgmt, out, 1)
 
     assert out.check_stop_buffers == {"new_token": tokens, SAMPLED_LOGPROB: logprobs}
     assert stop == {"new_token": tokens}
 
 
+def test_a_step_that_repeats_takes_no_rows_from_a_request_that_arrived_after_it_settled():
+    """Log-prob rows would send the step down the store path, which reads one
+    iteration, so every other row of it would lose the rest of its tokens."""
+    stop = {"new_token": torch.tensor([[5, 6], [7, 8]])}
+    out = BatchedModelOutput(check_stop_buffers=stop)
+    mgmt = SimpleNamespace(resources={"sampler": _Rows({SAMPLED_LOGPROB: torch.tensor([-0.1, -0.2])})})
+
+    Engine._add_resource_host_rows(mgmt, out, 2)
+
+    assert out.check_stop_buffers is stop
+
+
 def test_resource_rows_with_nowhere_to_go_raise():
     rows = _Rows({SAMPLED_LOGPROB: torch.tensor([-0.1])})
     with pytest.raises(RuntimeError, match="no row-addressed stop buffers"):
-        Engine._add_resource_host_rows(SimpleNamespace(resources={"sampler": rows}), BatchedModelOutput())
+        Engine._add_resource_host_rows(SimpleNamespace(resources={"sampler": rows}), BatchedModelOutput(), 1)
     # two resources under one key would keep only the last one's
     out = BatchedModelOutput(check_stop_buffers={"new_token": torch.tensor([1])})
     with pytest.raises(RuntimeError, match="already has"):
-        Engine._add_resource_host_rows(SimpleNamespace(resources={"talker": rows, "code_pred": rows}), out)
+        Engine._add_resource_host_rows(SimpleNamespace(resources={"talker": rows, "code_pred": rows}), out, 1)
 
 
 def test_a_second_sample_in_one_step_raises_while_logprobs_are_on():

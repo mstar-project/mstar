@@ -144,6 +144,8 @@ pub(super) struct Postprocess {
     /// rid -> the iterations of a repeated step that count, for a row that
     /// stopped inside it: what the device ran past that is dropped
     kept: FxHashMap<u32, u32>,
+    /// The iterations the step ran (`PostprocessRequest.token_width`)
+    width: usize,
     phase: Phase,
     stops: Option<Vec<(u32, Vec<String>)>>,
     stopped: Vec<u32>,
@@ -158,12 +160,12 @@ impl Postprocess {
         rids: Vec<u32>, walks: Option<Vec<String>>, rid_walk_idx: Option<Vec<u32>>,
         known_stops: Vec<(u32, Vec<String>)>, runtime_stops: bool,
         tokens: Option<TokenColumn>, row_rids: Vec<u32>, inline: Option<(String, TokenColumn)>,
-        partition_done: Vec<u32>, python_send: bool, loop_strides: Option<Vec<u32>>,
+        partition_done: Vec<u32>, python_send: bool, loop_strides: Option<Vec<u32>>, width: usize,
     ) -> Self {
         Postprocess {
             partition, node_name, graph_walk, output_signals, rids, walks, rid_walk_idx,
             known_stops, runtime_stops, tokens, row_rids, inline, partition_done, python_send,
-            loop_strides, kept: FxHashMap::default(),
+            loop_strides, kept: FxHashMap::default(), width,
             phase: Phase::Stops, stops: None, stopped: Vec::new(), stored: None, completion_id: 0,
         }
     }
@@ -186,6 +188,18 @@ impl Postprocess {
         }
         // a dropped row's streams do not end here
         self.partition_done.retain(|rid| !dropped.contains(rid));
+    }
+
+    /// The worker's stop check and store read one value a row, so on a step
+    /// that repeated the rest of each row's iterations would go unseen.
+    fn refuse_repeated(&self, path: &str) -> PyResult<()> {
+        if self.width > 1 {
+            return Err(PyRuntimeError::new_err(format!(
+                "{}/{}: a step of {} iterations can't take the worker's {path} path",
+                self.node_name, self.graph_walk, self.width,
+            )));
+        }
+        Ok(())
     }
 
     /// Whether the send needs what only the worker has (`_route_needs_python`).
@@ -462,6 +476,7 @@ impl GraphRuntime {
     pub(super) fn pp_run(&mut self, py: Python<'_>, mut pp: Postprocess) -> PyResult<PostprocessOut> {
         if pp.phase == Phase::Stops {
             if pp.stops.is_none() && !pp.runtime_stops {
+                pp.refuse_repeated("check_stop")?;
                 // checked by the worker: the request's stops are all of them
                 pp.stops = Some(merged_stops([&pp.known_stops, &[]]));
             }
@@ -484,6 +499,7 @@ impl GraphRuntime {
                 }
             }
             if pp.stops.is_none() {
+                pp.refuse_repeated("check_stop")?;
                 return Ok(self.pp_park(pp, NEED_STOPS));
             }
             pp.stopped = self.pp_stop_loops(py, &pp)?;
@@ -504,6 +520,7 @@ impl GraphRuntime {
         }
         let values = pp.inline.as_ref().and_then(|(_, col)| col.values_for(&pp.rids, &pp.row_rids));
         let Some(values) = values else {
+            pp.refuse_repeated("store")?;
             return Ok(self.pp_park(pp, NEED_STORE));
         };
         let tails = pp.inline.as_ref()
