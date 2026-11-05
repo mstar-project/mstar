@@ -724,9 +724,12 @@ The spec types are:
        prefix caching cover them, and selection gets fixed-shape buffers so decode captures.
        ``kpool`` above 1 scores one pooled key per ``kpool`` tokens (GLM-5.3). That
        resource is the paged one: its index rows sit on the aux planes ``INDEX_PLANES``
-       the model declares on the cache, and it scores, picks and attends
-       on device, under CUDA graphs. ``sm_scale`` is the absorbed MLA's softmax scale for
-       its sparse-attention plans.
+       the model declares on the cache, and it scores, picks and attends on device, under
+       CUDA graphs. Its ``plan`` builds the
+       step's rows from the KV plan, into buffers of the capture slot under a lease, and the
+       layers call ``write_index``, ``select`` and ``attend``, which read it; ``rows``
+       narrows it for a forward run in windows. ``sm_scale`` is the absorbed MLA's softmax
+       scale for its sparse-attention plans.
    * - ``CrossAttentionSpec(config=CrossAttentionConfig(...))``
      - Attention over a paged context that is written once and never extended.
        ``backend`` defaults to ``AttnBackend.AUTO``. Only FlashInfer is implemented.

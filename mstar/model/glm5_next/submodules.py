@@ -29,6 +29,7 @@ from mstar.engine.resources import (
 )
 from mstar.engine.resources.convenience import KDACallable
 from mstar.engine.resources.dsa import sparse_mla
+from mstar.engine.resources.dsa.config import DSAStep
 from mstar.engine.resources.linear_attn.config import LinearAttnStep
 from mstar.engine.resources.recurrent.config import RecurrentStep
 from mstar.model.glm5_next.config import (
@@ -131,7 +132,7 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
 
     @property
     def _dsa(self):
-        """The DSA resource (dsa_long_context), whose ``ctx`` the MLA layers read."""
+        """The DSA resource (dsa_long_context), which plans the step's rows for the MLA layers."""
         return self.node_resources.get(DSA) if self.config.dsa_long_context else None
 
     @property
@@ -371,8 +372,9 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
             del steps[SAMPLER]
             steps[KDA] = LinearAttnStep(speculative=True)
         if self.config.dsa_long_context:
-            # every MLA layer attends sparse (the DSA resource): no dense plan over the whole context
+            # every MLA layer attends sparse over the DSA resource's plan, not a dense one
             del steps[ATTN]
+            steps[DSA] = DSAStep()
         return SubmoduleStep(
             segments=[
                 Segment(request_id=rid, label=LABEL, span=inp.input_seq_len)
@@ -396,10 +398,6 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
             out["mtp_keep"] = self._mtp_keep(engine_inputs, inputs, out["input_ids"].shape[0])
         if self.mtp_k > 0 and graph_walk == "decode":
             out["mtp_seq"] = self._mtp_stage_seq(engine_inputs)
-        if self.config.dsa_long_context:
-            # the DSA resource stages its rows off the KV plan; the forward opens them
-            out.update(self._dsa.step_inputs(
-                engine_inputs.step.ctx, engine_inputs.captured, LABEL))
         return out
 
     def _mtp_keep(
@@ -462,23 +460,6 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         input_ids: torch.Tensor,
         last_rows: torch.Tensor | None = None,
         mtp_keep: torch.Tensor | None = None,
-        dsa_inputs: dict[str, Any] | None = None,
-    ) -> torch.Tensor:
-        if self._dsa is not None:
-            self._dsa.ctx = self._dsa.context(dsa_inputs or {})
-        try:
-            return self._forward_inner(graph_walk, engine_inputs, input_ids, last_rows, mtp_keep)
-        finally:
-            if self._dsa is not None:
-                self._dsa.ctx = None
-
-    def _forward_inner(
-        self,
-        graph_walk: str,
-        engine_inputs: ModelInputsFromEngine,
-        input_ids: torch.Tensor,
-        last_rows: torch.Tensor | None,
-        mtp_keep: torch.Tensor | None,
     ) -> torch.Tensor:
         attn = engine_inputs.resources[ATTN]
         sampler = engine_inputs.resources[SAMPLER]
@@ -510,7 +491,7 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         """dsa_long_context's prefill: the step's tokens in windows of prefill_window_tokens,
         each through every layer before the next (its KV rows and KDA state land first), so
         activations stay bounded however long the prompt. Samples each request's last row."""
-        ctx = self._dsa.ctx
+        dsa, ctx = self._dsa, self._dsa.current(LABEL)
         kv, kda = engine_inputs.resources[KV_CACHE], engine_inputs.resources[KDA]
         size = self.config.prefill_window_tokens
         total = input_ids.shape[0]
@@ -521,21 +502,17 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
             hidden = self.language_model.model(input_ids, rows=rows)
             return sampler.sample(engine_inputs.request_ids, logits=self.lm_head(hidden))
         hidden: list[torch.Tensor | None] = [None] * len(last)
-        try:
-            for start in range(0, total, size):
-                end = min(start + size, total)
-                pieces = [(max(r0, start), min(r0 + n, end), req)
-                          for r0, n, req in ctx.spans if r0 < end and r0 + n > start]
-                ends = [(i, r - start) for i, r in enumerate(last) if start <= r < end]
-                rows = _upload(self._long_stager, [r for _, r in ends] or [end - start - 1], input_ids.device)
-                self._dsa.ctx = ctx.window(start, end, pieces)
-                with kv.token_window(start, end, LABEL), kda.token_window(
-                        [(req, b - a) for a, b, req in pieces], LABEL):
-                    out = self.language_model.model(input_ids[start:end], rows=rows)
-                for k, (i, _) in enumerate(ends):
-                    hidden[i] = out[k]
-        finally:
-            self._dsa.ctx = ctx
+        for start in range(0, total, size):
+            end = min(start + size, total)
+            pieces = [(max(r0, start), min(r0 + n, end), req)
+                      for r0, n, req in ctx.spans if r0 < end and r0 + n > start]
+            ends = [(i, r - start) for i, r in enumerate(last) if start <= r < end]
+            rows = _upload(self._long_stager, [r for _, r in ends] or [end - start - 1], input_ids.device)
+            with dsa.rows(start, end, pieces, LABEL), kv.token_window(start, end, LABEL), \
+                    kda.token_window([(req, b - a) for a, b, req in pieces], LABEL):
+                out = self.language_model.model(input_ids[start:end], rows=rows)
+            for k, (i, _) in enumerate(ends):
+                hidden[i] = out[k]
         return sampler.sample(engine_inputs.request_ids, logits=self.lm_head(torch.stack(hidden)))
 
     # -- MTP device side ---------------------------------------------------
@@ -659,7 +636,7 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
             return self.forward_batched(graph_walk, engine_inputs, input_ids,
                                         mtp_seq=mtp_seq)[engine_inputs.request_ids[0]]
         return {"new_token": self._forward(
-            graph_walk, engine_inputs, input_ids, last_rows, mtp_keep, kwargs)}
+            graph_walk, engine_inputs, input_ids, last_rows, mtp_keep)}
 
     def can_batch(self, batch: ExecutingBatch, model_inputs: list[NodeInputs]) -> bool:
         return True
@@ -682,8 +659,7 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
                 rid: {"text_inputs": [next_input[i : i + 1]]}
                 for i, rid in enumerate(engine_inputs.request_ids)
             }
-        new_tokens = self._forward(
-            graph_walk, engine_inputs, input_ids, last_rows, mtp_keep, kwargs)
+        new_tokens = self._forward(graph_walk, engine_inputs, input_ids, last_rows, mtp_keep)
         # row i is request i: one clone out of the graph and one host copy a step
         return BatchedModelOutput(
             row_outputs={"new_token": new_tokens},
