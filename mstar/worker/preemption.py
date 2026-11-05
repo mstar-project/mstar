@@ -108,12 +108,6 @@ class Preemption:
         if rid in self._preempted and kept is not None:
             self._preempted[rid].returned_at = len(kept.sampled)
 
-    def prune_log(self, rid: int, node_name: str) -> None:
-        """Forget ``rid``'s log on ``node_name`` once a pool there will never preempt it again, as a guaranteed
-        request. A request keeps its log only for a drop."""
-        if not all(self._caches[key].cache.can_offload(rid) for key in self._keys[node_name]):
-            self._rebuilds.forget(rid, node_name)
-
     def remove_request(self, rid: int) -> None:
         self._preempted.pop(rid, None)
 
@@ -163,8 +157,6 @@ class Preemption:
                     "preempted %d times (%d earlier moves not logged)",
                     node_name, self._rid_str(rid), freed, pages_short, self._preempted[rid].times,
                 )
-            for node_name in nodes:
-                self.prune_log(rid, node_name)
         for rid in victims.to_drop:
             for node_name in self._held(rid, nodes):
                 freed = self._drop(rid, node_name)
