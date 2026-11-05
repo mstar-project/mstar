@@ -236,7 +236,9 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
    * - ``model``
      - Registry key of the model (see :doc:`models`).
    * - ``max_seq_len``
-     - Maximum sequence length (sizes the KV cache).
+     - Required, but nothing reads it: it neither sizes the KV cache nor caps context.
+       A KV cache's length limit is its own ``max_seq_len``, set by the model or under
+       ``resources: <kv>:`` (see the resource overrides below).
    * - ``node_groups``
      - List of placements. Each entry assigns ``node_names`` to ``ranks``, optionally
        scoped to specific ``graph_walks`` and/or sharded with ``tp_size``. An
