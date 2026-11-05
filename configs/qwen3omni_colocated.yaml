@@ -13,3 +13,19 @@ node_groups:
 
   - node_names: [Thinker, Talker]
     ranks: [0]
+# On AMD GPUs the Thinker (and the encoders), the Talker and Code2Wav get three
+# workers on one GPU (rank_devices), the layout of
+# qwen3omni_colocated_split3.yaml, so their steps no longer take turns on one
+# worker loop. MI325X: text 133 vs 85 audio-s/s at c=32, TTFA 146 vs 184 ms at
+# c=1, first text token 40 vs 27 ms. qwen3omni_colocated_stock.yaml keeps one
+# worker on every platform.
+platform_overrides:
+  rocm:
+    node_groups:
+      - node_names: [audio_encoder, vision_encoder, Thinker]
+        ranks: [0]
+      - node_names: [Talker]
+        ranks: [1]
+      - node_names: [Code2Wav]
+        ranks: [2]
+    rank_devices: {1: 0, 2: 0}

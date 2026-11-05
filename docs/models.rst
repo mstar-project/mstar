@@ -735,6 +735,41 @@ Qwen3-Omni notes
   prefill/decode split on two GPUs: the prefill Thinker shares rank 0 with the
   encoders, the Talker and Code2Wav, and rank 1 runs the Thinker's decode. At
   concurrency 1 its text matches ``configs/qwen3omni_2gpu.yaml``'s.
+- ``configs/qwen3omni_colocated_early_audio.yaml`` starts audio after 8 frames
+  and ramps up in smaller steps, ``codec_chunk_schedule: [8, 10, 13, 16, 20]``.
+  No chunk is more than 1.3x the one before, so each one arrives before the
+  previous one has played while the Talker gives a request about 16 frames/s.
+  The default's 13 to 25 frame step needs about 24, which one MI300X serving
+  32 requests doesn't always give a request over its first chunks. Measured on
+  one MI300X (a VM slice, one run per cell), text prompts: TTFA p50 192 / 436 / 542 ms at c=1 / 16 / 32
+  against 250 / 529 / 684 ms with the default; at c=32 the harness counts
+  every chunk in time for text and image prompts (0.99 and 0.97 with the
+  default) at the same text throughput, with image throughput 3% lower in its
+  one pair of runs. Spoken questions at c=32 keep one GPU too busy for either
+  ramp (0.90 of chunks in time, 0.87 with the default).
+- On AMD GPUs ``configs/qwen3omni_2gpu.yaml`` gives Code2Wav a worker of its own on
+  the Talker's GPU (a :ref:`platform_overrides <platform-overrides>` entry),
+  the layout of ``configs/qwen3omni_2gpu_split.yaml``, so Talker steps no longer
+  take turns with Code2Wav steps on one worker loop, and starts audio on the
+  ``ramp4g`` schedule below. On MI325X, at 32 text requests: 168 audio-s/s against
+  135, the same at one request. Other platforms serve one worker and the default
+  schedule, and ``configs/qwen3omni_2gpu_stock.yaml`` keeps those everywhere.
+- On AMD GPUs ``configs/qwen3omni_colocated.yaml`` runs the Thinker with the encoders,
+  the Talker and Code2Wav as three workers on one GPU, the layout of
+  ``configs/qwen3omni_colocated_split3.yaml``. On one MI325X (a quiet node, one run per
+  cell): 133 audio-s/s against 85 at 32 text requests, 13.1 against 10.8 and time to
+  first audio 146 against 184 ms at one request, first text 40 against 27 ms. Other
+  platforms serve one worker, and ``configs/qwen3omni_colocated_stock.yaml`` keeps it
+  everywhere.
+- ``configs/qwen3omni_2gpu_ramp4g.yaml``, the AMD default above, and
+  ``configs/qwen3omni_colocated_split3_ramp4g.yaml`` start audio after 4 frames,
+  ``codec_chunk_schedule: [4, 5, 6, 8, 10, 13, 16, 20]``. On MI325X time to first
+  audio at one text request is 78 ms on two GPUs (127 without the ramp) on a quiet
+  node, and 96 ms on one (147) on a shared one, and at 32 requests 263 ms on two
+  GPUs (413) and 349 ms on one (560). The ramp needs about 17
+  frames/s per request, while ``(4, 8, 16)`` needs 27: at 32 requests on two GPUs the
+  slowest 5% of requests get 21-27, so 4-14% of them paused against 1-6% with this
+  ramp, and on one worker on one GPU they get 15-16, so 24-68% paused.
 
 CosyVoice3 notes
 ----------------
@@ -1881,7 +1916,8 @@ Deployment knobs live under ``model_kwargs`` in ``configs/flux2_klein.yaml``:
      distilled sampler amplifies the last bit of inductor's own reductions and
      activation decompositions.
    * On AMD GPUs the setting is not applied unless the deployment asks for it
-     (``knobs: dit_exact_ops: true``, see :doc:`environment_variables`). hipBLASLt picks
+     (``knobs: dit_exact_ops: true``, see :doc:`environment_variables`), as the fp8 defaults
+     of the klein configs do (see ``linear_dtype``). hipBLASLt picks
      GEMM kernels per M, so the eager norms do not make the output match the reference
      there either, and the bar is the reference's own cross-seed spread. On MI325X the
      compiled norms take klein-4B from 0.406 to 0.384 s at B=1 and 2.97 to 3.32 images/s
@@ -1912,6 +1948,20 @@ Deployment knobs live under ``model_kwargs`` in ``configs/flux2_klein.yaml``:
 
 ``max_batch_size``
    Rows batched per denoise step.
+
+``text_encoder_max_batch_size``
+   Prompts in one text encoder step, ``max_batch_size`` unless set. The klein configs set
+   it to 1 on AMD GPUs through a :ref:`platform_overrides <platform-overrides>` entry, and
+   the DiT and VAE keep batching. A prompt encoded in a batch gives another image than the
+   same prompt alone, because a GEMM's rounding depends on its row count there and the
+   reference feeds all 512 positions, padding included, to the DiT. Run alone, a prompt
+   takes the path a single request takes, so images at one request do not change. On one
+   MI325X at 16 requests a klein-4B image lands a median 41 dB from its single-request twin
+   on bf16 and 30 to 34 dB on fp8, against 26 dB batched, for up to 2% of images per second
+   (4% at 4 requests on fp8). klein-9B reads 33 to 34 and 31 to 32 dB against 27 to 28. The
+   distance from diffusers does not improve, as that comes from the DiT. NVIDIA keeps the
+   batched encoder, and whether it has the same dependence is unmeasured.
+   ``z_image_turbo`` takes the same key and stays batched.
 
 ``vae_compile``
    ``torch.compile`` of the VAE decode with inductor autotuning, each nearest-x2 upsample
@@ -1971,7 +2021,7 @@ Deployment knobs live under ``model_kwargs`` in ``configs/flux2_klein.yaml``:
    it stays opt-in, a quality trade to make per deployment. Z-Image-Turbo's longer sampler
    carries the error further (two of 40 images half-way or more to another seed), so ``fp8``
    is not recommended there. Which linears to keep bf16 under ``fp8`` is a per-model
-   measurement: ``configs/flux2_klein_9b.yaml`` keeps the 51 of klein-9B's 80 fp8 linears with
+   measurement: ``configs/flux2_klein_9b_fp8_keep.yaml`` keeps the 51 of klein-9B's 80 fp8 linears with
    the most image error per millisecond saved (every double block's, most single blocks' output
    projections and two early fused projections); in a one-GPU MI325X A/B it serves at a median
    26.5 dB from the diffusers reference, over the ROCm floor, at about 1.18 times the bf16
@@ -1983,6 +2033,22 @@ Deployment knobs live under ``model_kwargs`` in ``configs/flux2_klein.yaml``:
    the knob on they repeat across launches at 26.5 and 22.6 dB. At one request the knob
    costs 8% and 7% of the fp8 images per second, which leaves 1.1 times bf16 with the knob
    off (one MI325X, shared node).
+   On AMD GPUs ``configs/flux2_klein.yaml`` and ``configs/flux2_klein_9b.yaml`` serve the step
+   schedule ``[bf16, bf16, fp8, fp8]`` (see ``linear_dtype_steps``; the 9B keeps its
+   ``linear_keep_bf16`` list on the fp8 steps), both with ``knobs: dit_exact_ops: true`` and
+   ``text_encoder_max_batch_size: 1``, through a :ref:`platform_overrides <platform-overrides>`
+   entry. NVIDIA stays on bf16 with a batched text encoder, and ``flux2_klein_bf16.yaml`` and
+   ``flux2_klein_9b_bf16.yaml`` serve bf16 everywhere. On MI325X the schedule loses 0.1 dB
+   (klein-4B) and 0.2 dB (klein-9B) on the typical image against bf16, where fp8 on every step
+   loses 1.0 and 1.3 dB, and keeps about half of the fp8 speedup. The AMD windows ran these
+   models with one step only partly in fp8, a schedule that is not implemented here; at one
+   request the shipped klein-4B schedule read level with it on one MI325X (3.039 against 3.087
+   images per second, shared node), and at more than one request it has not been measured. fp8
+   on every step and the 9B keep-list stay by name, as ``flux2_klein_fp8.yaml`` and
+   ``flux2_klein_9b_fp8_keep.yaml``. They clear the floor at one request (22.59 and 26.48 dB),
+   but not once batched: at 16 requests 6 of 12 klein-4B cells read under 22.43 dB and 1 of 10
+   klein-9B cells under 25.46. That distance comes from fp8 in the DiT, and encoding each prompt
+   alone does not move it.
 
 ``linear_keep_bf16``
    A list of module-name patterns over the transformer's linears to keep in bf16 for one

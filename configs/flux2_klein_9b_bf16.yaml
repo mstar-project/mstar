@@ -1,0 +1,45 @@
+model: "flux2_klein_9b"
+
+# bf16 on every platform: flux2_klein_9b.yaml without its AMD fp8 override. Its comments explain the settings, the solo
+# text encoder and the license. linear_keep_bf16 does nothing under bf16, it stays so a linear_dtype: fp8 here serves flux2_klein_9b_fp8_keep.yaml.
+max_seq_len: 512
+
+model_kwargs: &model_kwargs
+  # text_encoder_max_batch_size: prompts in one text encoder step, max_batch_size unless set. Default batched, 1 on AMD
+  # GPUs (platform_overrides below). Whether NVIDIA's text encoder depends on the batch size the same way is unmeasured
+  # torch's sdpa is the reference kernel on NVIDIA; on AMD GPUs auto runs AITER's asm flash attention
+  attention_backend: sdpa
+  compile: true
+  compile_eager_rounding: true
+  compile_exact_ops: [norms]
+  accelerator_graph: true
+  capture_sizes: [[1024, 1024], [768, 1344]]
+  capture_edit_sizes: [[1024, 1024]]
+  capture_batch_sizes: [1, 2, 3, 4]
+  max_batch_size: 4
+  vae_compile: true
+  linear_keep_bf16:
+    - double_blocks.*.attn.*
+    - double_blocks.*.img_ff.*
+    - double_blocks.*.txt_ff.*
+    - single_blocks.0-13.out
+    - single_blocks.15-16.out
+    - single_blocks.18.out
+    - single_blocks.0.qkv_mlp
+    - single_blocks.3.qkv_mlp
+
+node_groups:
+  - node_names: [text_encoder]
+    ranks: [0]
+  - node_names: [vae_encoder, vae_decoder]
+    ranks: [0]
+  - node_names: [dit]
+    ranks: [0]
+
+platform_overrides:
+  rocm:
+    model_kwargs:
+      <<: *model_kwargs
+      attention_backend: auto
+      # prompts encode one at a time: the batched encode's padding costs more than it saves here
+      text_encoder_max_batch_size: 1
