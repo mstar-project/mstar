@@ -245,6 +245,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         self._backend = _resolve_backend(self._requested_backend, self.device, use_fp16_qk_reduction, q_data_type,
                                          kv_data_type, head_dim_qk, head_dim_vo)
         self._cached_module = PrefillPlanner(self._backend)
+        self._planned = False
         fa2_args = [fixed_split_size or -1, disable_split_kv, 0, 0] if self._backend == "fa2" else []
         lens = torch.tensor([kv_host[r + 1] - kv_host[r] for r in range(batch)], dtype=torch.int32)
         self._cached_module.plan(  # FlashInfer plans a ragged batch as pages of one token

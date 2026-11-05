@@ -476,6 +476,7 @@ class PagedAttention:
         lens = [paged_kv_len(kv_host[r + 1] - kv_host[r], last_host[r], page_size) for r in range(batch)]
         self._max_q_len = max((qo_host[r + 1] - qo_host[r] for r in range(batch)), default=0)
         self._max_kv_len = max(lens, default=0)
+        self._planned = False  # a planner that raises leaves this half-written plan unrunnable
 
         as_tensor = lambda x: torch.tensor(x, dtype=torch.int32)  # noqa: E731 - host arrays, as FlashInfer's
         workspaces = (self._float_workspace_buffer, self._int_workspace_buffer, self._pin_memory_int_workspace_buffer)

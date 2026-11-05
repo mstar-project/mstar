@@ -354,11 +354,15 @@ def test_flashinfers_planner_runs_short_of_a_small_workspace():
                 raise SystemExit(f"a {size}-byte workspace held a plan that needs {need}")
             except RuntimeError as e:
                 assert f"allocating memory for {short_of}" in str(e), e
-        try:  # a failed plan is no plan
-            wrapper.run(torch.zeros(32, 8, 64, device="cuda"), None)
-            raise SystemExit("run() after a failed plan")
-        except RuntimeError as e:
-            assert "plan() must be called" in str(e), e
+
+        def unplanned():  # a failed plan is no plan
+            try:
+                wrapper.run(torch.zeros(32, 8, 64, device="cuda"), None)
+                raise SystemExit("run() after a failed plan")
+            except RuntimeError as e:
+                assert "plan() must be called" in str(e), e
+
+        unplanned()
         plan(disable_split_kv=True)  # no split, no partials: any workspace holds it
         ragged = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(workspace, "NHD", backend="fa2")
         one_chunk = torch.tensor([0, 4096, 8192], dtype=torch.int32)
@@ -370,6 +374,12 @@ def test_flashinfers_planner_runs_short_of_a_small_workspace():
             assert "batch_prefill_tmp_v" in str(e), e
         workspace.data = torch.empty(need, dtype=torch.uint8, device="cuda")
         plan()
+        workspace.data = torch.empty(need - 1, dtype=torch.uint8, device="cuda")  # and a failed re-plan undoes one
+        try:
+            plan()
+            raise SystemExit("a short workspace re-planned")
+        except RuntimeError:
+            unplanned()
         # auto takes fa3, which keeps no partials, only where its kernels serve the plan
         rows, pages = torch.tensor([0, 16, 32], dtype=torch.int32), torch.tensor([0, 2, 4], dtype=torch.int32)
         for head_dim, kv_dtype, overflows in ((128, torch.bfloat16, False), (80, torch.bfloat16, True),
