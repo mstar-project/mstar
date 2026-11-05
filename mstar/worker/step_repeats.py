@@ -6,10 +6,10 @@ and the stops are read when the step lands. A row that stopped inside the step
 costs the iterations the device ran past it, and the next step's, already
 launched: up to 2N-1, against the one a speculated step costs.
 
-The serving config's ``max_step_repeats`` asks for this; 1 is off. What a walk
-needs is decided once per (node, walk), here. What a step can have is decided
-twice: here against its rows and its Loop, then by its resources
-(``Resource.max_repeats``), which can only narrow it.
+The serving config's ``max_step_repeats`` asks for this; at 1 every step runs
+once. What a walk needs is decided once per (node, walk), here. What a step can
+have is decided twice: here against its rows and its Loop, then by its
+resources (``Resource.max_repeats``), which can only narrow it.
 """
 from __future__ import annotations
 
