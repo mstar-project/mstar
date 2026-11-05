@@ -499,6 +499,10 @@ class Worker:
     _held_messages: tuple = ()
     # (node, walk) whose runs go on the device
     _device_runs: frozenset = frozenset()
+    # (start, end, (node, walk), repeats) per step while a walk picks its run
+    # length (``step_repeats: auto``); None while none does
+    _auto_spans: deque | None = None
+    _auto_prev_end = None
     # nodes that keep their landed tokens (``NodeSubmodule.record_tokens``)
     _token_readers: frozenset[str] = frozenset()
 
@@ -585,10 +589,6 @@ class Worker:
         self._phase_buf = phase_buffer()
         # (start, end) CUDA events per step, drained once they land
         self._gpu_spans: deque = deque(maxlen=64)
-        # (start, end, (node, walk), repeats) per step while a walk picks its
-        # run length (``step_repeats: auto``); None while none does
-        self._auto_spans: deque | None = None
-        self._auto_prev_end = None
 
         self.enable_prof = enable_prof
         self.profile_info = WorkerProfileInfo()
@@ -3934,8 +3934,8 @@ class Worker:
                 if batch_N.node_batch.token_stream is not None:
                     self._stream_tokens(batch_N)
                 elif (
-                    batch_N.node_batch.step_context.repeats > 1
-                    and (batch_N.node_name, batch_N.graph_walk) in self._device_runs
+                    self._device_runs and (batch_N.node_name, batch_N.graph_walk) in self._device_runs
+                    and batch_N.node_batch.step_context.repeats > 1
                 ):
                     self._await_run(batch_N)
                 batch_N.node_batch.completion_event.synchronize()
