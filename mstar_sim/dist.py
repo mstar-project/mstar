@@ -114,10 +114,10 @@ def _meet(group, mine: list[int], replay: bool = False) -> list[list[int]]:
     seq = group._get_sequence_number_for_group()  # torch's count of the group's gloo ops
     where = f"mstar_sim: rank {me}, torch sequence number {seq} (meets included) on the group of ranks {ranks}"
     with clock.computing():  # the device's clock stands still while ranks meet
-        gathered = torch.empty(len(ranks) * len(mine), dtype=torch.int64)
+        gathered = torch.empty(len(ranks) * len(mine), dtype=torch.int64, device="cpu")  # whatever the default
         began = time.perf_counter()
         try:
-            _all_gather(gathered, torch.tensor(mine, dtype=torch.int64), group=group)
+            _all_gather(gathered, torch.tensor(mine, dtype=torch.int64, device="cpu"), group=group)
             waited = time.perf_counter() - began  # for its peers: a wait, not the emulator's work
             clock.STATS["host_compute"] -= waited
             clock.STATS["host_wait"] += waited
