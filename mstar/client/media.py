@@ -35,9 +35,11 @@ def pcm16_to_wav_bytes(pcm: bytes, sample_rate: int, num_channels: int = 1) -> b
 def parse_ndjson_line(line: str) -> dict | None:
     """Parse one NDJSON line from ``/generate`` streaming into a decoded dict.
 
-    Returns ``{"modality", "bytes", "metadata"}`` or ``None`` for blank /
-    unparseable lines. A top-level ``error`` is the Rust frontend's in-band
-    failure envelope and raises rather than being mistaken for an empty chunk.
+    Returns ``{"modality", "bytes", "metadata"}``, or ``None`` for a blank
+    line. The server writes only JSON lines, so one that does not parse is a
+    stream cut mid-line and raises, as does a top-level ``error`` (the Rust
+    frontend's in-band failure envelope), rather than ending the stream as if
+    it were complete.
     """
     line = line.strip()
     if not line:
@@ -45,7 +47,7 @@ def parse_ndjson_line(line: str) -> dict | None:
     try:
         msg = json.loads(line)
     except json.JSONDecodeError:
-        return None
+        raise RuntimeError(f"Server stream ended with a malformed line ({len(line)} chars)") from None
     if "error" in msg:
         status = msg.get("status")
         status_suffix = f" (status {status})" if status is not None else ""
@@ -93,9 +95,6 @@ def iter_binary_frames(raw, read_size: int = _FRAME_HEADER_READ_SIZE) -> Iterato
             buf += block
             newline = buf.find(b"\n")
 
-        # Unlike NDJSON, a malformed header is not recoverable by skipping the
-        # line: without ``nbytes`` there is no way to find the next frame, so
-        # this raises rather than returning None.
         header = json.loads(bytes(buf[:newline]))
         del buf[: newline + 1]
         if "modality" not in header and "error" in header:
