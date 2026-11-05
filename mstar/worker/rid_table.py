@@ -16,13 +16,14 @@ _lockstep_unread}, Rebuilds.{_kept, _droppable, _prefilling, _cursors}, Preempti
 RequestStateManager.{per_request_info, _fwd_by_partition} and
 StreamBufferManager._rids (purged by remove_request),
 the engine's and tensor manager's per-request state (including
-ChunkingManagement.prepared, and the tensor store's rid -> uuids ownership,
-held in the Rust bookkeeper under RustTensorStore; purged by
-force_cleanup_request), RecurrentStatePool.{_keyed, _leases, _restores,
-_snap_writes, _decode, _unkeyed, _admit_restores, _admit_snaps} (purged by
-remove_request), ResidentPlanner.{_slot_of, _stale, _moved} (purged by
-release), SamplerCells._cells (purged by the sampler's
-remove_request), and WorkerProfileInfo.
+ChunkingManagement.prepared, Glm52LLMSubmodule's MTP maps, cleared by its
+cleanup_request, and the tensor store's rid -> uuids ownership, held in the
+Rust bookkeeper under RustTensorStore; purged by force_cleanup_request),
+RecurrentStatePool.{_keyed, _leases, _restores, _snap_writes, _decode, _unkeyed,
+_admit_restores, _admit_snaps, _admit_taken, _preplan_taken, _reserved} and
+KDAManager._verifying (purged by remove_request), ResidentPlanner.{_slot_of,
+_stale, _moved} (purged by release), SamplerCells._cells (purged by the
+sampler's remove_request), and WorkerProfileInfo.
 
 MicroScheduler.pending_tp_follow_count is the one deliberate exception: a
 ScheduleTPNode can arrive before the NEW_REQUEST that mints the handle, so it
