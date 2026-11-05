@@ -245,7 +245,7 @@ def blocks_per_sm(threads: int, smem: int, regs: int = 0) -> int:
     if regs:  # allocated a warp at a time, 256 registers at a time, in 4 sub-partitions
         per_warp = _ceil(regs * 32, 256) * 256
         limit = min(limit, props.regs_per_multiprocessor // 4 // per_warp * 4 // warps)
-    block_smem = smem + 1024  # the driver reserves 1 KiB a block; a block's size is its 128-byte unit's multiple
+    block_smem = _ceil(smem + 1024, 128) * 128  # the driver reserves 1 KiB a block
     if block_smem > props.shared_memory_per_block + 1024:
         return 0
     return min(limit, props.shared_memory_per_multiprocessor // block_smem)

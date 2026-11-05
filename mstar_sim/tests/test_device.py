@@ -466,6 +466,7 @@ def test_flashinfers_planner_runs_short_of_a_small_workspace():
                        workspace, None, None, backwards, kv, torch.tensor([16, 16], dtype=torch.int32), 8, 2, 8, 8, 16,
                        False, 64, 64, True, -1, -1, False, 0, 0), RuntimeError, "qo_indptr[2]4 - qo_indptr[1]8"),
                    (lambda: cores.plan(*one_row, 8, 8, 128, 16, q_len_per_req=2), ValueError, "requires tensor-core"),
+                   (lambda: cores.plan(*one_row, 8, 8, 512, 16), NotImplementedError, "no stand-in yet"),
                    (lambda: decode.plan(*one_row, 8, 8, 128, 16, q_data_type=dtype, q_len_per_req=2),
                     NotImplementedError, "fa2 tensor-core"))
         for call, kind, text in refused:
