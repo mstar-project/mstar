@@ -19,7 +19,17 @@ def test_parse_ndjson_line():
     p = parse_ndjson_line(line)
     assert p["modality"] == "text" and p["bytes"] == b"hi"
     assert parse_ndjson_line("") is None
-    assert parse_ndjson_line("not json") is None
+    # A line cut mid-JSON is a truncated stream, not a chunk to skip.
+    with pytest.raises(RuntimeError, match="malformed line"):
+        parse_ndjson_line('{"modality": "te')
+
+
+def test_a_single_modality_string_is_sent_whole():
+    c = MStarClient("http://x")
+    with mock.patch.object(c._session, "post") as post:
+        c.generate(text="hi", output_modalities="audio", input_modalities="text")
+    data = post.call_args.kwargs["data"]
+    assert (data["output_modalities"], data["input_modalities"]) == ("audio", "text")
 
 
 def test_parse_result_groups_modalities():
@@ -83,7 +93,21 @@ def test_stream_without_content_type_charset():
     iter_lines.assert_called_once_with(
         chunk_size=1024 * 1024,
         decode_unicode=True,
+        delimiter="\n",
     )
+
+
+def test_a_line_separator_inside_a_json_string_does_not_split_the_line():
+    """The Rust frontend's serde_json writes U+2028 / U+2029 / U+0085 raw;
+    only "\n" ends an NDJSON line."""
+    metadata = {"t": "a\u2028b\u2029c\x85d"}
+    line = json.dumps({"modality": "text", "data": base64.b64encode(b"hi").decode(), "metadata": metadata},
+                      ensure_ascii=False)
+    resp = _fake_response("application/x-ndjson", (line + "\n").encode())
+
+    events, _ = _stream_with(MStarClient("http://x"), resp)
+
+    assert [(e.text, e.metadata) for e in events] == [("hi", metadata)]
 
 
 @pytest.mark.parametrize(
@@ -260,7 +284,7 @@ def test_stream_falls_back_to_ndjson_when_the_server_ignores_accept():
         events, _ = _stream_with(MStarClient("http://x", prefer_binary=True), resp)
 
     assert [e.text for e in events] == ["hi"]
-    iter_lines.assert_called_once_with(chunk_size=1024 * 1024, decode_unicode=True)
+    iter_lines.assert_called_once_with(chunk_size=1024 * 1024, decode_unicode=True, delimiter="\n")
 
 
 def test_stream_sends_no_negotiation_headers_when_binary_is_disabled():

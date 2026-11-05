@@ -488,9 +488,11 @@ class Qwen3TTSModel(Model):
         )
         return [
             KVSpec(resource_key=TALKER_KV, nodes={"Talker"}, config=talker_kv),
+            # Every checkpoint has two query heads per KV head: the CUDA-core
+            # decode kernel wins, since the tensor-core one pads them to a tile
             AttentionSpec(
                 resource_key=TALKER_ATTN, nodes={"Talker"},
-                config=AttentionConfig(kv_cache=TALKER_KV),
+                config=AttentionConfig(kv_cache=TALKER_KV, decode_tensor_cores=False),
             ),
             PositionSpec(
                 resource_key=TALKER_POS, nodes={"Talker"},
