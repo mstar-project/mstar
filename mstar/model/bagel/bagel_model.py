@@ -155,7 +155,7 @@ GEN_THINK_SYSTEM_PROMPT = (
 )
 
 
-def role_turns(parts: list[PromptPart], understanding: bool) -> bool:
+def uses_role_turns(parts: list[PromptPart], understanding: bool) -> bool:
     """Whether the prompt is written as role turns after a system turn.
 
     Only understanding with text is. Upstream's ``interleave_inference`` writes
@@ -586,7 +586,8 @@ class BagelModel(Model):
         layout a single user turn could express renders to the string that
         template gave. Generation leaves attachments outside the turn — the
         prefill_vae/vit walks put the input image ahead of the prompt — and
-        wraps what follows.
+        wraps what follows. Images with no text never reach this: see
+        :func:`uses_role_turns`.
         """
         if is_understanding:
             blocks = [self.VLM_TURN.format(role="system", content=system_prompt)]
@@ -704,9 +705,9 @@ class BagelModel(Model):
             if think_mode and is_understanding:
                 system_prompt = f"{system_prompt} {VLM_THINK_SYSTEM_PROMPT}"
 
-            templated = role_turns(parts, is_understanding)
-            if is_understanding and not templated:
-                text = "".join(self._render_body(body, sep="")[0]) + "<|im_start|>"
+            role_turns = uses_role_turns(parts, is_understanding)
+            if is_understanding and not role_turns:
+                text = self.IMAGE_PLACEHOLDER * len(body) + "<|im_start|>"
             else:
                 text = self._render_prompt(
                     body,
@@ -721,11 +722,11 @@ class BagelModel(Model):
                 spans = find_media_spans(input_ids, self._placeholder_specs())
                 segments = split_around_spans(input_ids, spans)
                 check_plan(
-                    prefill_plan(parts, leading_text=templated),
+                    prefill_plan(parts, leading_text=role_turns),
                     spans,
                     len(segments),
                 )
-                if think_mode and not templated:
+                if think_mode and not role_turns:
                     # Not part of the request layout: tokenized on its own and
                     # prefilled ahead of the plan.
                     instruction = VLM_THINK_SYSTEM_PROMPT if is_understanding else GEN_THINK_SYSTEM_PROMPT
@@ -787,9 +788,9 @@ class BagelModel(Model):
         target_output = (output_modalities or ["text"])[0]
         understanding = target_output == "text"
         think_mode, image_preprocess = params["think_mode"], vit_preprocess(params["image_preprocess"])
-        templated = role_turns(parts, understanding)
+        role_turns = uses_role_turns(parts, understanding)
         spans = []
-        if think_mode and not templated and segments:
+        if think_mode and not role_turns and segments:
             spans.append(Span("ids", "prefill_text", segments[0].numel(), segments[0].numel(), "text_inputs"))
 
         def image(step: PromptPart) -> list[Span]:
@@ -806,7 +807,7 @@ class BagelModel(Model):
 
         texts = segments[len(spans):]
         # skip a text step the prompt has no tensor for, as `_build_prefill_schedule` does
-        plan = prefill_plan(parts, leading_text=templated)
+        plan = prefill_plan(parts, leading_text=role_turns)
         plan = [step for step in plan if step.modality != TEXT or step.index < len(texts)]
         spans += prompt_spans(plan, texts, "prefill_text", image)
         keyed = int(bool(spans) and spans[0].kind == "ids")
@@ -1299,19 +1300,19 @@ class BagelModel(Model):
 
         Walks the prefill plan, so attachments prefill where they were written
         and N of them get N walks. Role turns open with the system span ahead
-        of them; any other prompt opens straight into them, after the
+        of them; any other prompt keeps the order it was written in, after the
         think-mode span when there is one.
         """
         texts = list(input_signals.get("text_inputs", []))
         images = input_signals.get("image_inputs", [])
         parts = parts_from_modalities(input_modalities)
-        templated = role_turns(parts, is_understanding)
+        role_turns = uses_role_turns(parts, is_understanding)
 
         schedule: list[tuple[str, TensorPointerInfo]] = []
-        if think_mode and not templated and texts:
+        if think_mode and not role_turns and texts:
             schedule.append(("prefill_text", texts.pop(0)))
 
-        plan = prefill_plan(parts, leading_text=templated)
+        plan = prefill_plan(parts, leading_text=role_turns)
         for step in plan:
             pool = texts if step.modality == "text" else images
             if step.index >= len(pool):
