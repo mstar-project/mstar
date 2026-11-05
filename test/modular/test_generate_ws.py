@@ -321,7 +321,7 @@ def test_a_live_call_takes_both_append_forms(monkeypatch, tmp_path, record):
     fake = _ListeningFakeServer(tmp_path)
     monkeypatch.setattr(entrypoint, "api_server", fake)
     with TestClient(entrypoint.app).websocket_connect("/generate/ws") as ws:
-        ws.send_text(json.dumps({"request_id": "call", "output_modalities": "text"}))
+        ws.send_text(json.dumps({"request_id": "call", "output_modalities": "text", "end_input": False}))
         ws.send_text(json.dumps({"request_id": "call", "append": record, "end_input": True}))
         msgs = _recv_until_finish(ws, binary=False)
 
@@ -464,9 +464,9 @@ def test_an_append_is_not_held_up_by_another_message_waiting_its_turn(monkeypatc
     _slow_decode(monkeypatch, seconds=0.5)
     monkeypatch.setattr(entrypoint, "api_server", fake)
     with TestClient(entrypoint.app).websocket_connect("/generate/ws") as ws:
-        ws.send_text(json.dumps({"request_id": "early", "output_modalities": "text"}))
+        ws.send_text(json.dumps({"request_id": "early", "output_modalities": "text", "end_input": False}))
         ws.send_text(json.dumps({"request_id": "upload", "text": "hi", "files": [_OBS], "end_input": True}))
-        ws.send_text(json.dumps({"request_id": "late", "output_modalities": "text"}))
+        ws.send_text(json.dumps({"request_id": "late", "output_modalities": "text", "end_input": False}))
         ws.send_text(json.dumps({"request_id": "late", "append": {"text": "hi"}}))
         ws.send_text(json.dumps({"request_id": "early", "append": {"text": "hi"}, "end_input": True}))
         ws.send_text(json.dumps({"request_id": "late", "end_input": True}))

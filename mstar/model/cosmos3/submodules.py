@@ -2997,9 +2997,8 @@ class Cosmos3VAEDecoderARSubmodule(Cosmos3VAEDecoderSubmodule):
 
     The chunk count is the completion signal — it is known per request up
     front — so the stream's terminal flush (an empty pass, and the only pass
-    a non-windowed request's idle stream ever delivers) runs as a no-op
-    forward: the pass must complete normally for the partition to report
-    done, so it is not vetoed.
+    a non-windowed request's idle stream ever delivers) is declined; the
+    partition still reports done.
     """
 
     def __init__(self, vae, config):
@@ -3024,15 +3023,16 @@ class Cosmos3VAEDecoderARSubmodule(Cosmos3VAEDecoderSubmodule):
         del graph_walk
         return StepOrder.TURNS
 
-    def prepare_inputs(self, graph_walk, fwd_info, inputs, **kwargs) -> NodeInputs:
+    def prepare_inputs(
+        self, graph_walk, fwd_info, inputs, is_final_stream_chunk=False, **kwargs,
+    ) -> NodeInputs | None:
         chunks = (inputs or {}).get("window_latents") or []
         if not chunks:
-            return NodeInputs(tensor_inputs={"latents": torch.empty(0)})
+            assert is_final_stream_chunk, "an empty chunk before the end of the stream"
+            return None
         return NodeInputs(tensor_inputs={"latents": chunks[0]})
 
     def forward(self, graph_walk, engine_inputs: ModelInputsFromEngine, latents, **kwargs):
-        if latents.numel() == 0:
-            return {}
         rid = engine_inputs.request_ids[0]
         st = self.request_state(rid)
         if "ar_chunks" not in st:

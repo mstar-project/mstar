@@ -74,6 +74,7 @@ def test_preprocess_failure_emits_error_chunk():
     wt._draining_rids = set()
     wt._reads_done_sent = set()
     wt._live_requests = {}
+    wt._client_edges = frozenset()
     wt._preparing = deque()
 
     wt.in_queue.put(PreprocessInput(

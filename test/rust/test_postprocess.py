@@ -217,6 +217,31 @@ def test_dropped_rows_are_not_routed(tmp_path):
     assert traces["native"][0][0] is PostprocessNeed.STOPS
 
 
+def test_a_row_with_no_host_value_routes_through_the_store(tmp_path):
+    """A row that ran no forward (``ExecutingBatch.no_forward_rids``) has no
+    host row: the step stores instead of riding inline, and the stored route
+    takes the row's value as None (the tensor path), in either implementation."""
+    traces, frames = {}, {}
+    for k, cls in (("native", rust_runtime.RustGraphRuntime), ("reference", _Reference)):
+        d = tmp_path / k
+        d.mkdir()
+        box = ZmqCommunicator("api_server", str(d))
+        rt = _runtime(cls, str(d))
+        rids = _start(rt, 3)
+        assert rt.pop_rids(NODE, WALK, rids) is not None
+        ran = rids[:2]
+        column = torch.tensor([100, 101], dtype=torch.int64)
+        traces[k] = _drive(rt, PostprocessRequest(
+            partition=PART, node_name=NODE, graph_walk=WALK, output_signals=[SIG],
+            wg_ids=ParallelList(list(rids), [0] * 3), stops={}, tokens=column, row_rids=ran,
+            inline=InlineColumn(SIG, column),
+        ), {ran[0]: 100, ran[1]: 101, rids[2]: None}, model_stops={})
+        frames[k] = _collect(box)
+    assert traces["native"] == traces["reference"]
+    assert [t[0] for t in traces["native"]] == [PostprocessNeed.STORE, PostprocessNeed.DONE]
+    assert frames["native"] == frames["reference"] and frames["native"]
+
+
 def test_missing_limits_leave_the_check_to_the_model(tmp_path):
     """A row with no registered limits: the runtime decides nothing (STOPS)."""
     rt = _runtime(rust_runtime.RustGraphRuntime, str(tmp_path))
