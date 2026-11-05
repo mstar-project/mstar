@@ -223,6 +223,8 @@ class VisionRotaryEmbedding(nn.Module):
 
 
 class VisionPatchEmbed(nn.Module):
+    lora_unservable = {"proj": "run as a matmul over its weight, never its own forward"}
+
     def __init__(self, config: ViTConfig):
         super().__init__()
         self.in_channels = config.in_channels
