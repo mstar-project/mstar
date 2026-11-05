@@ -323,22 +323,24 @@ def host_wait() -> None:
 
 
 def _check_devices(func, args, kwargs, flat=None) -> int:
-    """The cuda index of the call; raise for a cuda/cpu mix CUDA would refuse."""
-    index, cpu_tensor = None, False
+    """The cuda index of the call; raise for a mix of devices CUDA would refuse."""
+    index, other = None, None
     for x in (flat if flat is not None else tree_flatten((args, kwargs))[0]):
         if isinstance(x, SimTensor):
             if index is None:
                 index = x.device.index
+            elif x.device.index != index:
+                other = f"cuda:{x.device.index}"
         elif isinstance(x, torch.Tensor) and x.dim() > 0 and x.device.type == "cpu":
-            cpu_tensor = True
-    if cpu_tensor and index is not None and func is not None and func not in _MIXED_OK:
+            other = other or "cpu"
+    if other and index is not None and func is not None and func not in _MIXED_OK:
         where = [
-            f"{'cuda' if isinstance(x, SimTensor) else x.device.type}{tuple(x.shape)}"
+            f"{x.device if isinstance(x, SimTensor) else x.device.type}{tuple(x.shape)}"
             for x in tree_flatten((args, kwargs))[0] if isinstance(x, torch.Tensor)
         ]
         raise gpu_error(RuntimeError(
             "Expected all tensors to be on the same device, but found at least two "
-            f"devices, cuda:{index} and cpu! (mstar_sim: {getattr(func, '__name__', func)} "
+            f"devices, cuda:{index} and {other}! (mstar_sim: {getattr(func, '__name__', func)} "
             f"over {', '.join(where)})"
         ))
     return index or 0
