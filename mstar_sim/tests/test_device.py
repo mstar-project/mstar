@@ -619,12 +619,12 @@ def test_fast_mode_skips_device_time_but_keeps_host_semantics():
     and replay, and a host read during capture is still refused."""
     out = run_sim("""
         import time, torch
-        a = torch.randn(8192, 8192, device="cuda", dtype=torch.bfloat16)
+        a = torch.randn(16384, 16384, device="cuda", dtype=torch.bfloat16)
         t0 = time.perf_counter()
-        for _ in range(50):
-            a @ a  # ~0.1 s of simulated H100 time
+        for _ in range(500):
+            a @ a  # ~5 s of simulated H100 time; host work here is a few ms, so load can't reach the bound
         torch.cuda.synchronize()
-        assert time.perf_counter() - t0 < 0.05, time.perf_counter() - t0
+        assert time.perf_counter() - t0 < 1.0, time.perf_counter() - t0
         pos = torch.arange(4, device="cuda")
         g = torch.cuda.CUDAGraph()
         with torch.cuda.graph(g):
