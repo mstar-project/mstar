@@ -1,12 +1,14 @@
 """A shapes-only copy of a checkpoint, for simulating a model without its weights.
 
 ``synthesize(repo_or_dir, out_dir)`` reads a checkpoint's safetensors *headers*
-(an HF repo id, fetched without any weight data, or a local directory) and
-writes each file as its header over a sparse (unallocated) data region, next to
-copies of the configs, tokenizer and other small files. Every model's own
-loader reads it unchanged; the simulator reads only the headers
-(``mstar_sim.patches.header_only_weights``), so a model of any size costs a few
-MB of disk.
+(an HF repo id, fetched by ranges without the large weights' data, or a local
+directory) and writes each file as its header, verbatim, over a sparse
+(unallocated) data region holding only the bytes of its small tensors (under
+``SMALL_WEIGHT`` elements: norms, scales, a rotary table's inputs), next to
+copies of the configs, tokenizer and other small files. Every model's own loader
+reads it unchanged; the simulator reads the small tensors for real and the rest
+from the headers only (``mstar_sim.patches.header_only_weights``), so a model of
+any size costs a few MB of disk.
 
 CLI::
 
@@ -25,12 +27,18 @@ import os
 import shutil
 import struct
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 log = logging.getLogger(__name__)
 
 MANIFEST = "mstar_sim_checkpoint.json"
-VERSION = 2
+VERSION = 3
+# tensors this small are read for real (a norm, an fp8 scale, a LoRA alpha, a test's
+# fixture): cheap, and host code reads their values; only larger weights go value-less
+SMALL_WEIGHT = 1 << 16
+# small tensors' byte ranges closer than this are fetched from the Hub as one
+_MERGE_GAP = 1 << 20
 MAX_ASSET_BYTES = 50 * 2**20
 # weight formats that duplicate the safetensors; never copied next to them
 _DUPLICATE_WEIGHTS = ("*.bin", "*.h5", "*.msgpack", "*.gguf", "*.pt", "*.pth")
@@ -56,12 +64,13 @@ class _LocalSource:
     def fetch(self, rel: str) -> Path:
         return self.root / rel
 
-    def header(self, rel: str) -> dict[str, tuple[str, list[int]]]:
+    def ranges(self, rel: str, spans: list[tuple[int, int]]) -> list[bytes]:
+        out = []
         with open(self.root / rel, "rb") as f:
-            (n,) = struct.unpack("<Q", f.read(8))
-            header = json.loads(f.read(n))
-        header.pop("__metadata__", None)
-        return {k: (v["dtype"], v["shape"]) for k, v in header.items()}
+            for start, stop in spans:
+                f.seek(start)
+                out.append(f.read(stop - start))
+        return out
 
 
 class _HubSource:
@@ -79,27 +88,49 @@ class _HubSource:
 
         return Path(hf_hub_download(self.name, rel, revision=self.revision))
 
-    def header(self, rel: str) -> dict[str, tuple[str, list[int]]]:
-        meta = self.api.parse_safetensors_file_metadata(self.name, rel, revision=self.revision)
-        return {k: (t.dtype, list(t.shape)) for k, t in meta.tensors.items()}
+    def ranges(self, rel: str, spans: list[tuple[int, int]]) -> list[bytes]:
+        """HTTP range reads of the file, over a thread pool."""
+        from huggingface_hub import get_session, hf_hub_url
+        from huggingface_hub.utils import build_hf_headers, hf_raise_for_status
+
+        url, headers = hf_hub_url(self.name, rel, revision=self.revision), build_hf_headers()
+
+        def read(span):
+            reply = get_session().get(url, headers={**headers, "Range": f"bytes={span[0]}-{span[1] - 1}"})
+            hf_raise_for_status(reply)
+            return reply.content
+
+        with ThreadPoolExecutor(16) as pool:
+            return list(pool.map(read, spans))
 
 
-def _write_sparse(path: Path, tensors: dict[str, tuple[str, list[int]]]) -> int:
-    """A safetensors file whose data region is a hole: valid header, no bytes."""
-    header, offset = {}, 0
-    for name, (dtype, shape) in tensors.items():
-        n = math.prod(shape) * _ITEMSIZE[dtype]
-        header[name] = {"dtype": dtype, "shape": list(shape), "data_offsets": [offset, offset + n]}
-        offset += n
-    header["__metadata__"] = {"format": "pt", "mstar_sim": "shapes_only"}
-    blob = json.dumps(header, separators=(",", ":")).encode()
-    blob += b" " * (-len(blob) % 8)
+def _write_sparse(src, rel: str, path: Path) -> int:
+    """``rel`` as its header, verbatim (every tensor at its own offset), over a hole holding
+    only its small tensors' bytes; returns its parameter count."""
+    (n,) = struct.unpack("<Q", src.ranges(rel, [(0, 8)])[0])
+    blob = src.ranges(rel, [(0, 8 + n)])[0]
+    header = json.loads(blob[8:])
+    header.pop("__metadata__", None)
+    small = sorted(tuple(v["data_offsets"]) for v in header.values() if math.prod(v["shape"]) < SMALL_WEIGHT)
+    spans: list[list[int]] = []  # the small tensors' ranges, merged where they lie close
+    for start, stop in small:
+        if spans and start - spans[-1][1] < _MERGE_GAP:
+            spans[-1][1] = max(spans[-1][1], stop)
+        else:
+            spans.append([start, stop])
+    base = 8 + n
+    chunks = src.ranges(rel, [(base + start, base + stop) for start, stop in spans])
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "wb") as f:
-        f.write(struct.pack("<Q", len(blob)))
         f.write(blob)
-        f.truncate(8 + len(blob) + offset)
-    return sum(math.prod(shape) for _, shape in tensors.values())
+        f.truncate(base + max((v["data_offsets"][1] for v in header.values()), default=0))
+        span = 0
+        for start, stop in small:  # only the small tensors: a large one between stays a hole
+            while stop > spans[span][1]:
+                span += 1
+            f.seek(base + start)
+            f.write(chunks[span][start - spans[span][0]:stop - spans[span][0]])
+    return sum(math.prod(v["shape"]) for v in header.values())
 
 
 def _weight_copy(rel: str, files) -> bool:
@@ -112,8 +143,8 @@ def _weight_copy(rel: str, files) -> bool:
 
 
 def _shapes_only_torch_file(path: Path, dest: Path) -> bool:
-    """A ``torch.load``-able asset (a vocoder's ``hift.pt``) saved again with every
-    tensor value-less: a few KB, and ``torch.load`` gives back the same structure."""
+    """A ``torch.load``-able asset (a vocoder's ``hift.pt``) saved again with every tensor but
+    the small ones value-less: a few KB, and ``torch.load`` gives back the same structure."""
     import torch
 
     try:
@@ -126,8 +157,8 @@ def _shapes_only_torch_file(path: Path, dest: Path) -> bool:
     from torch.utils._pytree import tree_map
 
     dest.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(tree_map(lambda x: torch.empty_like(x, device="meta") if isinstance(x, torch.Tensor) else x, obj),
-               dest)
+    torch.save(tree_map(lambda x: (x.clone() if x.numel() < SMALL_WEIGHT else torch.empty_like(x, device="meta"))
+                        if isinstance(x, torch.Tensor) else x, obj), dest)
     return True
 
 
@@ -135,7 +166,7 @@ def _build(src, out: Path) -> dict:
     params, notes = 0, []
     for rel, size in src.files.items():
         if rel.endswith(".safetensors"):
-            params += _write_sparse(out / rel, src.header(rel))
+            params += _write_sparse(src, rel, out / rel)
         elif size > SMALL_WEIGHT_FILE and rel.endswith((".pt", ".pth", ".bin")) and not _weight_copy(rel, src.files):
             if not _shapes_only_torch_file(src.fetch(rel), out / rel):
                 notes.append(f"skipped {rel}: not a plain tensor file")

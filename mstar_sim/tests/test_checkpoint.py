@@ -10,7 +10,7 @@ from safetensors.torch import save_file
 from mstar_sim.checkpoint import main, synthesize
 
 
-def test_copy_keeps_every_tensor_header_but_no_data(tmp_path):
+def test_copy_keeps_every_tensor_header_and_only_small_tensors_data(tmp_path):
     src = tmp_path / "src"
     src.mkdir()
     (src / "config.json").write_text('{"num_hidden_layers": 2}')
@@ -21,12 +21,12 @@ def test_copy_keeps_every_tensor_header_but_no_data(tmp_path):
     # large torch assets are kept shapes-only: a component's own model.pt (no safetensors beside
     # it, so not a copy of the weights), and one saved in torch's legacy (non-zip) format
     (src / "codec").mkdir()
-    torch.save({"w": torch.zeros(3 << 20)}, src / "codec" / "model.pt")
+    torch.save({"w": torch.zeros(3 << 20), "scale": torch.tensor([0.5])}, src / "codec" / "model.pt")
     torch.save({"w": torch.zeros(3 << 20)}, src / "hift.pt", _use_new_zipfile_serialization=False)
     shards = {
         "model-00001-of-00002.safetensors": {"embed.weight": torch.zeros(4096, 1024, dtype=torch.bfloat16)},
         "model-00002-of-00002.safetensors": {"layers.0.q.weight": torch.zeros(1024, 1024, dtype=torch.float8_e4m3fn),
-                                             "layers.0.norm.weight": torch.zeros(1024)},
+                                             "layers.0.norm.weight": torch.arange(1024.0)},
     }
     for name, tensors in shards.items():
         save_file(tensors, str(src / name))
@@ -41,13 +41,16 @@ def test_copy_keeps_every_tensor_header_but_no_data(tmp_path):
             assert {k: (f.get_slice(k).get_shape(), f.get_slice(k).get_dtype()) for k in f.keys()} == {
                 k: (list(t.shape), {torch.bfloat16: "BF16", torch.float8_e4m3fn: "F8_E4M3",
                                     torch.float32: "F32"}[t.dtype]) for k, t in tensors.items()}
-        assert (out / name).stat().st_blocks * 512 < 64 << 10  # sparse: no data on disk
+        assert (out / name).stat().st_blocks * 512 < 64 << 10  # sparse: no large tensor's data on disk
+    with safe_open(str(out / "model-00002-of-00002.safetensors"), framework="pt") as f:  # a small one's is kept
+        assert torch.equal(f.get_tensor("layers.0.norm.weight"), torch.arange(1024.0))
     for name in ("config.json", "tokenizer.json", "model.safetensors.index.json"):
         assert (out / name).read_text() == (src / name).read_text()
     assert not (out / "pytorch_model.bin").exists()
     assert (out / "conds.pt").read_bytes() == (src / "conds.pt").read_bytes()
     for asset in ("codec/model.pt", "hift.pt"):
         assert torch.load(out / asset, weights_only=True)["w"].shape == (3 << 20,), asset
+    assert torch.load(out / "codec/model.pt", weights_only=True)["scale"].tolist() == [0.5]
 
     stamp = (out / "config.json").stat().st_mtime_ns
     synthesize(str(src), out)  # the same source: reused

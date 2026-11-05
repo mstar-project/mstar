@@ -33,6 +33,8 @@ import threading
 
 import torch
 
+from mstar_sim.checkpoint import SMALL_WEIGHT
+
 
 def _replace(owner, name: str, value) -> None:
     """``owner.name = value``, for an attribute mstar still has."""
@@ -193,9 +195,6 @@ def _header(path) -> dict:
     return header
 
 
-# tensors this small are read for real (a LoRA alpha, a norm, a test's fixture):
-# cheap, and host code reads their values; only weights this large go value-less
-SMALL_WEIGHT = 1 << 16
 
 
 def _small(info: dict) -> bool:
@@ -272,7 +271,7 @@ class _MetaSafeOpen:
 def header_only_weights() -> None:
     """Weights are read from safetensors headers only: every tensor above
     ``SMALL_WEIGHT`` elements is meta, so no large weight is read and a
-    checkpoint of sparse files will do (its small tensors read as zeros)."""
+    checkpoint of sparse files will do (``mstar_sim.checkpoint`` keeps the small ones' bytes)."""
     import safetensors
     import safetensors.torch
 
