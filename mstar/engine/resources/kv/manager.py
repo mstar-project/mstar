@@ -4029,7 +4029,7 @@ class KVManager(AttentionResource):
         with self._lock:
             for label, state in states.items():
                 # released with the copy still queued, since the next write to a host page queues behind it
-                self._cpu_pool.arena.release(self._cpu_pool.pop(rid, label).host_pages)
+                self._cpu_pool.discard(rid, label)
                 self._streams[rid][label].offloaded = False
                 run = runs[label]
                 if len(run) < len(state.keys):
