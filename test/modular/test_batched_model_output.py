@@ -318,19 +318,21 @@ def test_cloning_the_stop_buffers_leaves_nothing_for_the_collector():
     """A step that clones its stop buffers made a reference cycle (a nested
     function calling itself), which held the clones until a collection."""
     import gc
+    import weakref
 
     import torch
 
     from mstar.model.submodule_base import BatchedModelOutput
 
     out = BatchedModelOutput(check_stop_buffers={"t": torch.zeros(4, 2), "nested": {"u": torch.ones(4)}})
-    gc.collect()
     was = gc.isenabled()
     gc.disable()
     try:
-        for _ in range(10):
-            out.clone_check_stop_buffers()
-        assert gc.collect() == 0
+        clones = out.clone_check_stop_buffers()
+        refs = [weakref.ref(clones["t"]), weakref.ref(clones["nested"]["u"])]
+        del clones
+        # with the collector off, only reference counting can have freed them
+        assert [ref() for ref in refs] == [None, None]
     finally:
         if was:
             gc.enable()
