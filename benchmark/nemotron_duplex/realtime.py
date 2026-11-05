@@ -141,8 +141,8 @@ def run_session(args, clip: np.ndarray, start_at: float, lead_s: float, out: dic
             for at in range(0, total, chunk):
                 # absolute schedule: each append leaves when its audio has been "spoken"
                 due = t0 + min(at + chunk, total) / in_rate
-                late = max(late, time.perf_counter() - due)
                 time.sleep(max(0.0, due - time.perf_counter()))
+                late = max(late, time.perf_counter() - due)
                 piece = _encode(audio[at:at + chunk], args.codec)
                 ws.send(json.dumps({"type": "input_audio_buffer.append", "audio": base64.b64encode(piece).decode()}))
             def waiting() -> bool:
@@ -172,7 +172,8 @@ def run_session(args, clip: np.ndarray, start_at: float, lead_s: float, out: dic
     started = [r["first_audio"] for r in opened if _after_speech(r, t_speech_end)]
     out.update(
         replies=replies, errors=errors, unfinished=len(open_), send_late_s=late,
-        underruns=[r["underrun_s"] for r in opened],
+        underruns=[r["underrun_s"] for r in opened if r["first_audio"] is not None],
+        got_reply=bool(started),
         whole_steps=all(r["bytes"] % step == 0 for r in completed) if completed else None,
         before_speech_end=sum(r["first_audio"] is not None for r in opened) - len(started),
         reply_start_s=(min(started) - t_speech_end) if started and t_speech_end is not None else None,
@@ -212,7 +213,7 @@ def run_batch(args, clip: np.ndarray, n: int) -> dict:
     return {
         "sessions": n, "replies": len(replies),
         "not_completed": sum(r["status"] != "completed" for r in replies) + sum(s["unfinished"] for s in results),
-        "sessions_without_a_reply": sum(s["reply_start_s"] is None and args.speech_end is not None for s in results),
+        "sessions_without_a_reply": sum(not s["got_reply"] for s in results),
         "replies_before_speech_end": sum(s["before_speech_end"] for s in results),
         "sessions_with_errors": sum(bool(s["errors"]) for s in results),
         "errors": sorted({e for s in results for e in s["errors"]})[:5],
