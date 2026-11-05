@@ -60,25 +60,31 @@ def test_copy_keeps_every_tensor_header_and_only_small_tensors_data(tmp_path):
 
 def test_the_emulated_loader_reads_what_the_copy_kept(tmp_path):
     """mstar's loader under the emulator reads a small tensor's kept bytes, and a shard of a
-    large one (which the copy left a hole) as meta, not as the hole's zeros."""
+    large one (which the copy left a hole) as meta, not as the hole's zeros; it refuses a copy
+    made before small tensors kept their bytes."""
     src = tmp_path / "src"
     src.mkdir()
     save_file({"scale": torch.arange(float(1 << 17)).view(128, 1024), "norm": torch.arange(1024.0)},
               str(src / "model.safetensors"))
     synthesize(str(src), tmp_path / "out")
+    save_file({"norm": torch.zeros(1024)}, str(tmp_path / "old.safetensors"), metadata={"mstar_sim": "shapes_only"})
     out = run_sim(f"""
         import json, os, struct, torch
         from mstar.model.loader import iterators
 
-        fd = os.open("{tmp_path / "out" / "model.safetensors"}", os.O_RDONLY)
-        (n,) = struct.unpack("<Q", os.pread(fd, 8, 0))
-        header = json.loads(os.pread(fd, n, 8))
+        def read(path, key, spec=None):
+            fd = os.open(path, os.O_RDONLY)
+            (n,) = struct.unpack("<Q", os.pread(fd, 8, 0))
+            return iterators._read_tensor(fd, iterators._plan_read(json.loads(os.pread(fd, n, 8))[key], 8 + n, spec))
 
-        def read(key, spec=None):
-            return iterators._read_tensor(fd, iterators._plan_read(header[key], 8 + n, spec))
-
-        assert torch.equal(read("norm"), torch.arange(1024.0))
-        assert read("scale", iterators.TensorSlice(0, 0, 32)).is_meta  # a shard: small, of a large tensor
+        copy = "{tmp_path / "out" / "model.safetensors"}"
+        assert torch.equal(read(copy, "norm"), torch.arange(1024.0))
+        assert read(copy, "scale", iterators.TensorSlice(0, 0, 32)).is_meta  # a shard: small, of a large tensor
+        try:
+            read("{tmp_path / "old.safetensors"}", "norm")
+            raise SystemExit("an old copy's zeros were read as values")
+        except ValueError:
+            pass
         print("ok")
     """)
     assert out.strip() == "ok"

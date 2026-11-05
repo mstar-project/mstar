@@ -187,13 +187,15 @@ _DTYPES = {
 
 
 def _parse(fd: int) -> tuple[int, dict]:
-    """A safetensors file's data offset and header."""
+    """A safetensors file's data offset and header; refuses a copy that read its small tensors as zeros."""
     import json
     import struct
 
     (n,) = struct.unpack("<Q", os.pread(fd, 8, 0))
     header = json.loads(os.pread(fd, n, 8))
-    header.pop("__metadata__", None)
+    if (header.pop("__metadata__", None) or {}).get("mstar_sim") == "shapes_only":  # only VERSION 2 wrote it
+        raise ValueError(f"{os.readlink(f'/proc/self/fd/{fd}')} is a mstar_sim copy whose small tensors read as "
+                         "zeros: rebuild it with python -m mstar_sim.checkpoint <repo> --hf-home <dir>")
     return 8 + n, header
 
 
