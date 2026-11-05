@@ -528,7 +528,7 @@ degree above one runs its prefills whole, whatever the model and these budgets s
 logs a warning at load.
 
 **Data-parallel routing.** A node group whose ``ranks`` hold several lockstep instances
-(``tp_size * sp_size`` ranks each, or one rank) runs each request on one of them, its
+(``cfg_size * sp_size * tp_size`` ranks each, or one rank) runs each request on one of them, its
 replica. The conductor picks it per request, at ingest, as the replica with the lowest
 cost: ``routing_weights.load`` times the live requests on the replica (counted per set of
 groups that pick together, for each request with a partition on them that is not done at
