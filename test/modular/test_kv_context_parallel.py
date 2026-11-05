@@ -703,14 +703,10 @@ def test_placed_attention_refuses_a_kernel_outside_its_contract(monkeypatch):
     with pytest.raises(ValueError, match="PagedKernel"):
         attn._context_parallel_wrapper("main", 0, False, kwargs)
     monkeypatch.setattr(attn, "paged_kernel", good)
-    monkeypatch.setattr(attn, "whole_rows_kernel", lambda *args: types.SimpleNamespace())
-    with pytest.raises(ValueError, match="WholeRowsKernel"):
-        attn._context_parallel_wrapper("main", 0, False, kwargs)
-    monkeypatch.setattr(attn, "whole_rows_kernel", lambda *args: None)
-    with pytest.raises(ValueError, match="WholeRowsKernel"):
-        attn._context_parallel_wrapper("main", 0, False, kwargs)
-    with pytest.raises(ValueError, match="OwnTokensKernel"):
-        ZigzagWrapper(SPPlacement(P, 0, CommGroup.trivial()), _OneSlotPrefill(), CPU)
+    for wrong in (types.SimpleNamespace(), None):
+        monkeypatch.setattr(attn, "own_tokens_kernel", lambda *args, wrong=wrong: wrong)
+        with pytest.raises(ValueError, match="OwnTokensKernel"):
+            attn._context_parallel_wrapper("main", 0, False, kwargs)
 
 
 class _GatheredKeys(OwnTokensKernel):
@@ -718,14 +714,6 @@ class _GatheredKeys(OwnTokensKernel):
 
     def __init__(self, captured=None):
         self.captured = captured
-
-    @classmethod
-    def build(cls, kernels, workspace, kwargs, dtype, captured):
-        return cls(captured)
-
-    @staticmethod
-    def padded(qo_indptr, captured):
-        return qo_indptr
 
     def plan(self, rows, causal):
         self.rows, self.causal = rows, causal
@@ -882,7 +870,7 @@ def test_a_captured_buckets_padding_merges_to_0_and_reaches_no_real_row(monkeypa
     _plan(attn, case, bucket=BucketKey("w", bs=len(PREFILL_ROWS) + padding[0], num_tokens=n + pad))
     # this rank's query heads, which its own tokens attend for alone
     q, k, v, _ = case.inputs(placement, heads=slice(0, Q_HEADS // P), pad=pad)
-    out, lse = attn._current_plan_states["main"].new.run(q, k, v, return_lse=True)
+    out, lse = attn._current_plan_states["main"].new.run((q,), (k, v))
     merged = merge(torch.stack([torch.zeros_like(out), out]), torch.stack([torch.full_like(lse, -math.inf), lse]))
     assert torch.isfinite(merged).all() and not merged[n:].any()
     qo = np.cumsum([0, *(new for _, new in PREFILL_ROWS)]).tolist()
@@ -1085,29 +1073,41 @@ def test_mla_attention_refuses_at_admit_a_step_past_the_fa_planners_cap_so_the_w
     assert (refused.rows_fit, refused.rows_sized, refused.request_id) == (1, 2, "r1")
 
 
-def test_sp_placed_mla_attention_admits_a_captured_step_only_if_its_padded_shares_fit(monkeypatch):
-    """A capture pads each partner's zigzag share to its bucket (a row of the spare queries, then
-    empty rows), which can take the FA planner's bound past the real rows'. Admit bounds the shares
-    the plan makes, so the planner never refuses a step it admits, where it couldn't be retried."""
+def test_mla_attention_over_a_placed_pool_never_admits_a_step_its_planner_refuses(monkeypatch):
+    """A capture pads its own-token kernel's plan to its bucket (a row of the spare queries, then empty
+    rows), which can take the FA planner's bound past the real rows'. A bucket that could is refused
+    at capture, and admission bounds the real rows, so the planner never refuses a step admitted
+    to a captured bucket, where it couldn't be retried."""
     # a planner refusing every plan whose bound passes the cap
     _emulate_fa_planner(monkeypatch, lambda q, kv, heads, causal: fm.fa_work_items_bound(
         np.concatenate([[0], np.cumsum(q)]), heads, 132) > fm._FA_MAX_WORK_ITEMS)
     rows = ((0, 1), (3, 56))
     case = _Case.build(rows, CPU, torch.float32, mla=True)
-    attn, _ = _cp_attention(JointGroups(tp_group=CommGroup.trivial(), sp_group=_group(0, P)), CPU, torch.float32,
-                            mla=True, flashinfer_backend="fa2")
-    bucket = BucketKey(graph_walk="w", bs=len(rows), num_tokens=64)
     views = case.plan["main"].views
     step = AttentionStep(segments=tuple(Segment(v.request_id, "main", v.to_compute) for v in views))
-    ctx = StepContext(request_ids=tuple(v.request_id for v in views), graph_walk="w", slot=0, capture=False,
-                      slot_lease=SlotLease(0, bucket))
-    admitted = []
-    for cap in range(1, 400):
-        monkeypatch.setattr(fm, "_FA_MAX_WORK_ITEMS", cap)
-        admitted.append(attn.admit(step, ctx).ok)
-        if admitted[-1]:
-            _plan(attn, case, bucket=bucket)
-    assert set(admitted) == {False, True}
+    outcomes = set()
+    for over_sp in (False, True):
+        joint = (JointGroups(tp_group=CommGroup.trivial(), sp_group=_group(0, P)) if over_sp
+                 else JointGroups(tp_group=_group(0, P), sp_group=CommGroup.trivial()))
+        attn, _ = _cp_attention(joint, CPU, torch.float32, mla=True, flashinfer_backend="fa2")
+        bucket = BucketKey(graph_walk="w", bs=len(rows), num_tokens=64)
+        ctx = StepContext(request_ids=tuple(v.request_id for v in views), graph_walk="w", slot=0, capture=False,
+                          slot_lease=SlotLease(0, bucket))
+        for cap in range(1, 400):
+            monkeypatch.setattr(fm, "_FA_MAX_WORK_ITEMS", cap)
+            attn._cg_plan_states.clear()
+            try:
+                attn._cg_wrapper(SlotLease(0, bucket), "main", len(rows))
+            except ValueError as refused:
+                assert "capture bucket" in str(refused)
+                outcomes.add("capture refused")
+                continue
+            if attn.admit(step, ctx).ok:
+                _plan(attn, case, bucket=bucket)
+                outcomes.add("planned")
+            else:
+                outcomes.add("admission refused")
+    assert {"capture refused", "planned"} <= outcomes
 
 
 def test_sp_placed_mla_attention_admits_a_step_only_if_every_partners_zigzag_share_fits(monkeypatch):
@@ -1127,92 +1127,24 @@ def test_sp_placed_mla_attention_admits_a_step_only_if_every_partners_zigzag_sha
     assert isinstance(attn.admit(step, ctx).reason, AllocationFailed)
 
 
-def test_sp_placed_mla_attention_bounds_a_packed_bucket_of_one_token_rows_as_its_wrapper_plans_it(monkeypatch):
-    """A capture bucket of more tokens than rows (a packed one, ``force_prefill``) plans one-token rows
-    as a prefill, on the zigzag share padded to its bucket's tokens, so admission bounds it so too:
-    here the padded shares take the FA planner past its cap (64 heads, a 65536-token bucket of 8
-    rows), where a decode bucket's plan would not. Admitted, every rank would plan it, and the
-    planner could refuse it on one alone."""
+def test_mla_attention_refuses_a_bucket_its_padded_own_tokens_take_past_the_planners_cap(monkeypatch):
+    """A capture bucket of more tokens than rows (a packed one, ``force_prefill``) plans even one-token
+    rows as a prefill, on an own-token kernel padded to its bucket's tokens: here (64 heads, 8 rows,
+    65536 tokens, SP) past the FA planner's cap, which a step's own lengths would not reach. The
+    bucket is refused at capture, and a decode bucket of the same rows, which plans no own tokens,
+    is captured."""
     _fa_kernel(monkeypatch)
     attn, _ = _cp_attention(JointGroups(tp_group=CommGroup.trivial(), sp_group=_group(0, P)), CPU, torch.float32,
                             mla=True, num_qo_heads=64, flashinfer_backend="fa2")
     rows, tokens = 8, 65536
     step = AttentionStep(segments=tuple(Segment(f"r{i}", "main", 1) for i in range(rows)))
-
-    def ctx(num_tokens, force_prefill):
-        bucket = BucketKey(graph_walk="w", bs=rows, num_tokens=num_tokens)
-        return StepContext(request_ids=tuple(seg.request_id for seg in step.segments), graph_walk="w", slot=0,
-                           capture=False, slot_lease=SlotLease(0, bucket), force_prefill=force_prefill)
-
-    qo = np.arange(rows + 1)
-    padded = OneSlotPages.padded(zigzag_share(qo, P, 0), zigzag_capture(P, rows, tokens))
-    assert fm.fa_work_items_bound(padded, 64, 132) > fm._FA_MAX_WORK_ITEMS >= fm.fa_work_items_bound(qo, 64, 132)
-    assert attn.admit(step, ctx(rows, force_prefill=False)).ok
-    assert not attn.admit(step, ctx(tokens, force_prefill=True)).ok
-    # a bucket of more tokens than rows plans a prefill whether packed or not
-    assert not attn.admit(step, ctx(tokens, force_prefill=False)).ok
-
-
-def test_sp_placed_mla_attention_pads_a_leased_step_for_the_rows_its_wrapper_was_captured_with(monkeypatch):
-    """A leased step's own-token plans are padded to the rows its label's wrapper was captured with,
-    fewer than the bucket's where a capture's request has no segment in the label and more than a
-    step's that holds fewer, and a capture's empty rows raise the planner's bound: admission bounds
-    that plan, not one padded to the step's rows or the bucket's."""
-    _fa_kernel(monkeypatch)
-    attn, placement = _cp_attention(JointGroups(tp_group=CommGroup.trivial(), sp_group=_group(0, P)), CPU,
-                                    torch.float32, mla=True, flashinfer_backend="fa2")
-    tokens, spans, captured_rows = 64, (1, 4), 4
-    bucket = BucketKey(graph_walk="w", bs=16, num_tokens=tokens)
-    attn._cg_wrapper(SlotLease(0, bucket), "main", captured_rows)
-    step = AttentionStep(segments=tuple(Segment(f"r{i}", "main", span) for i, span in enumerate(spans)))
+    lease = SlotLease(0, BucketKey(graph_walk="w", bs=rows, num_tokens=tokens))
     ctx = StepContext(request_ids=tuple(seg.request_id for seg in step.segments), graph_walk="w", slot=0,
-                      capture=False, slot_lease=SlotLease(0, bucket))
-    heads, qo = attn._wrapper_kwargs["num_qo_heads"], np.cumsum([0, *spans])
-
-    def bound(rows):
-        plans = attn._placed.rank_plans(placement, qo, heads, attn.own_kernel, (rows, tokens))
-        return max(fm.fa_work_items_bound(plan, h, 132) for plan, h in plans)
-
-    assert bound(len(spans)) < bound(captured_rows) < bound(bucket.bs)
-    monkeypatch.setattr(fm, "_FA_MAX_WORK_ITEMS", bound(len(spans)))
-    assert not attn.admit(step, ctx).ok
-    monkeypatch.setattr(fm, "_FA_MAX_WORK_ITEMS", bound(captured_rows))
+                      capture=False, slot_lease=lease, force_prefill=True)
     assert attn.admit(step, ctx).ok
-
-
-def test_a_backend_plugs_in_its_own_kernel_for_a_share_of_the_own_tokens(monkeypatch):
-    """``own_kernel`` is where a backend whose keys aren't one-slot pages plugs in: the share is built
-    on it, admission bounds its padding, and one that drops its capture, which a replay's fixed
-    buffers are sized from, is refused when it is built, as is a build that returns anything else,
-    by type, before its capture is read."""
-    _fa_kernel(monkeypatch)
-    padded = []
-
-    class Counting(_GatheredKeys):
-        @staticmethod
-        def padded(qo_indptr, captured):
-            padded.append(captured)
-            return qo_indptr
-
-    class Forgetful(_GatheredKeys):
-        def __init__(self, captured):
-            super().__init__(None)
-
-    attn, _ = _cp_attention(JointGroups(tp_group=CommGroup.trivial(), sp_group=_group(0, P)), CPU, torch.float32,
-                            mla=True, flashinfer_backend="fa2")
-    bucket = BucketKey(graph_walk="w", bs=2, num_tokens=64)
-    attn.own_kernel = Counting
-    assert isinstance(attn._cg_wrapper(SlotLease(0, bucket), "main", 2).new.kernel, Counting)
-    step = AttentionStep(segments=(Segment("r0", "main", 5), Segment("r1", "main", 9)))
-    ctx = StepContext(request_ids=("r0", "r1"), graph_walk="w", slot=0, capture=False,
-                      slot_lease=SlotLease(0, bucket))
-    assert attn.admit(step, ctx).ok and padded == [zigzag_capture(P, 2, 64)] * P
-    attn.own_kernel = Forgetful
-    with pytest.raises(ValueError, match="built for"):
-        attn._cg_wrapper(SlotLease(1, bucket), "main", 2)
-    attn.own_kernel = types.SimpleNamespace(build=lambda *args: _OneSlotPrefill())
-    with pytest.raises(ValueError, match="OwnTokensKernel"):
-        attn._cg_wrapper(SlotLease(2, bucket), "main", 2)
+    with pytest.raises(ValueError, match="capture bucket"):
+        attn._cg_wrapper(lease, "main", rows, force_prefill=True)
+    attn._cg_wrapper(SlotLease(0, BucketKey(graph_walk="w", bs=rows, num_tokens=rows)), "main", rows)
 
 
 def test_tp_mla_decode_plans_its_context_where_the_causal_tile_check_cannot_refuse_it(monkeypatch):

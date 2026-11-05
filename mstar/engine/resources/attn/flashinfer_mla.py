@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import functools
 import logging
-import math
 
 import numpy as np
 import torch
@@ -25,9 +24,8 @@ from mstar.engine.resources.attn.base import (
 )
 from mstar.engine.resources.attn.config import AttentionStep
 from mstar.engine.resources.attn.workspace import Workspace
-from mstar.engine.resources.attn.wrappers import PagedKernel, WholeRowsKernel
+from mstar.engine.resources.attn.wrappers import PagedKernel
 from mstar.engine.resources.base import CGSlotKey
-from mstar.engine.resources.context_parallel import one_slot_pages
 from mstar.engine.resources.kv.config import KVConfig, KVLayout
 from mstar.engine.resources.kv.plan import KVPlanOutputs
 from mstar.engine.resources.step import (
@@ -261,47 +259,6 @@ class FlashInferMLAWrapper(PagedKernel):
         return (out, lse) if return_lse else out
 
 
-class FlashInferMLAOwnTokensWrapper(WholeRowsKernel):
-    """A step's own tokens attending each other from the latents ``run`` is passed (``[T, latent]``),
-    with no copy: the MLA kernel over pages of one slot, page ``i`` the step's token ``i``, so each
-    row's keys are its own queries' tokens."""
-
-    def __init__(self, workspace_buffer: Workspace, dtype: torch.dtype, **kwargs):
-        self._kernel = FlashInferMLAWrapper(workspace_buffer, page_size=1, **kwargs)
-        self._plan_dtype = dtype
-        self._out_buf = self._lse_buf = None
-        if self._kernel.use_cuda_graph and not self._kernel.fallback:
-            # as the ragged wrapper's (`_FlashInferRaggedPrefillBase`): the kernel writes only the
-            # planned rows, so ``plan`` resets a captured bucket's padding to out 0, lse -inf, which
-            # merges to 0. ``run`` returns these buffers themselves (no clone, unlike the ragged out):
-            # read them before the next ``run``. A page a token, so the pages are the bucket's tokens
-            rows = (kwargs["max_num_pages"], self._kernel.num_qo_heads)
-            device = self._kernel.device
-            self._out_buf = torch.zeros(*rows, self._kernel.kv_lora_rank, dtype=dtype, device=device)
-            self._lse_buf = torch.full(rows, -math.inf, dtype=torch.float32, device=device)
-
-    def plan(self, qo_indptr: torch.Tensor, causal: bool = True):
-        tokens = int(qo_indptr[-1])
-        self._kernel.plan(
-            qo_indptr, qo_indptr, torch.arange(tokens, dtype=torch.int32),
-            torch.ones(qo_indptr.shape[0] - 1, dtype=torch.int32), causal=causal, dtype=self._plan_dtype,
-        )
-        if self._out_buf is not None:
-            self._out_buf[tokens:].zero_()
-            self._lse_buf[tokens:].fill_(-math.inf)
-
-    def run(self, q_nope: torch.Tensor, q_pe: torch.Tensor, latent: torch.Tensor, return_lse: bool = False):
-        owned = {}
-        if self._out_buf is not None:
-            n = q_nope.shape[0]
-            assert n <= self._out_buf.shape[0], (
-                f"{type(self).__name__}: {n} rows exceeds the "
-                f"{self._out_buf.shape[0]} this graph-mode wrapper was built for"
-            )
-            owned = dict(out=self._out_buf[:n], lse=self._lse_buf[:n] if return_lse else None)
-        return self._kernel.run(q_nope, q_pe, one_slot_pages(latent), return_lse=return_lse, **owned)
-
-
 class FlashInferMLAManager(PlacedAttention):
 
     def __init__(
@@ -400,10 +357,10 @@ class FlashInferMLAManager(PlacedAttention):
             kwargs = {**self._wrapper_kwargs, "max_num_pages": captured_page_capacity(
                 num_rows, bucket.num_tokens, self._kv_config), "batch_size": num_rows, "use_cuda_graph": True}
             if self._placement is not None:
-                wrapper = self._context_parallel_wrapper(
-                    label, lease.slot, one_token_rows(bucket.bs, bucket.num_tokens, force_prefill), kwargs,
-                    bucket.num_tokens,
-                )
+                decode = one_token_rows(bucket.bs, bucket.num_tokens, force_prefill)
+                if not decode:
+                    self._refuse_capture_past_cap(bucket, num_rows)
+                wrapper = self._context_parallel_wrapper(label, lease.slot, decode, kwargs, bucket.num_tokens)
             else:
                 wrapper = FlashInferMLAWrapper(workspace_buffer=self._workspaces.get(label, lease.slot), **kwargs)
             self._cg_plan_states[key] = wrapper
@@ -427,13 +384,6 @@ class FlashInferMLAManager(PlacedAttention):
     def paged_kernel(self, workspace, decode, kwargs, max_total_tokens):
         # one wrapper takes either kind of step
         return FlashInferMLAWrapper(workspace_buffer=workspace, **kwargs)
-
-    def whole_rows_kernel(self, workspace, kwargs, max_total_tokens):
-        own = {**kwargs, "num_qo_heads": self._kv_config.num_qo_heads}
-        del own["page_size"]
-        if max_total_tokens is not None:
-            own["max_num_pages"] = max_total_tokens
-        return FlashInferMLAOwnTokensWrapper(workspace, self._dtype, **own)
 
     @property
     def supports_preplan(self):
@@ -501,27 +451,40 @@ class FlashInferMLAManager(PlacedAttention):
         """Whether each label's plans over ``rows`` (label -> queries, a request each) stay within
         the FA planner's work-item cap, as ``plan`` makes them for a step of ``ctx`` (an eager one
         when None): a decode step's context alone, any other step's context and own tokens
-        (``rank_plans``), padded as the leased capture's wrapper pads them. Its kind comes from the
-        rule ``plan`` picks the wrapper by (``one_token_rows``)."""
+        (``rank_plans``). Its kind comes from the rule ``plan`` picks the wrapper by
+        (``one_token_rows``); a capture's padding of the own tokens is bounded at capture
+        (``_refuse_capture_past_cap``)."""
         heads = self._wrapper_kwargs["num_qo_heads"]
         lease = None if ctx is None else ctx.slot_lease
         force_prefill = ctx is not None and ctx.force_prefill
         for label in {label for row in rows for label in row}:
             qo = np.cumsum([0, *(row[label] for row in rows if label in row)])
-            shape = None
             if lease is None:
                 decode = one_token_rows(len(qo) - 1, int(qo[-1]), force_prefill)
             else:
                 decode = one_token_rows(lease.bucket.bs, lease.bucket.num_tokens, force_prefill)
-                # the rows the label's wrapper was captured with, which its own-token part pads to
-                wrapper = self._cg_plan_states.get(CGSlotKey(bucket=lease.bucket, slot=lease.slot, label=label))
-                shape = (len(qo) - 1 if wrapper is None else wrapper.captured_rows, lease.bucket.num_tokens)
-            plans = [(qo, heads)]
-            if not decode:
-                plans = self._placed.rank_plans(self._placement, qo, heads, self.own_kernel, shape)
+            plans = [(qo, heads)] if decode else self._placed.rank_plans(self._placement, qo, heads)
             if any(fa_work_items_bound(plan, h, self._fa_sm_count) > _FA_MAX_WORK_ITEMS for plan, h in plans):
                 return False
         return True
+
+    def _refuse_capture_past_cap(self, bucket, rows: int) -> None:
+        """Refuses, at capture, a bucket whose own-token kernel the FA planner could refuse on one rank
+        alone: a captured kernel plans a fixed count of queries over fixed rows whatever the step,
+        padding the step's (``share_capture``), and no plan of those takes more than a query tile a
+        64 heads, a row each and an SM each. Admission then bounds a step's real lengths alone."""
+        if self._fa_sm_count is None:
+            return
+        shape = self._placed.share_capture(self._placement, rows, bucket.num_tokens)
+        heads = self._kv_config.num_qo_heads
+        ceiling = -(-shape.queries * heads // 64) + shape.rows + self._fa_sm_count
+        if ceiling > _FA_MAX_WORK_ITEMS:
+            raise ValueError(
+                f"capture bucket {bucket} over context-parallel KV pool {self._kv_cache_name!r}: its own-token "
+                f"kernel, padded to {shape.queries} queries over {shape.rows} rows at {heads} heads, can take "
+                f"FlashInfer's FA MLA planner up to {ceiling} work items, past its cap of {_FA_MAX_WORK_ITEMS}: "
+                "capture smaller buckets"
+            )
 
     def plan(self, step: AttentionStep, ctx: StepContext):
         if step.context_only and self._placement is not None:

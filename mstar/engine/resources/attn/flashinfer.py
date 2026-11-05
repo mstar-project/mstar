@@ -4,6 +4,7 @@ import logging
 from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
+import numpy as np
 import torch
 
 from mstar.engine.resources.attn.base import (
@@ -24,6 +25,7 @@ from mstar.engine.resources.attn.wrappers import (
     fmha_decode_applies,
 )
 from mstar.engine.resources.base import CGSlotKey
+from mstar.engine.resources.context_parallel import KeyRows, OwnTokensKernel
 from mstar.engine.resources.kv.config import PagedKVConfig
 from mstar.engine.resources.kv.plan import KVPlanOutputs
 from mstar.engine.resources.spec import CombinedSplit
@@ -34,6 +36,7 @@ from mstar.utils.profiler import PhaseLaps
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
+    from mstar.engine.resources.context_parallel import ShareCapture
     from mstar.engine.resources.resident import CapturedResidentStep
 
 
@@ -277,13 +280,18 @@ class FlashInferManager(PlacedAttention):
             )
         return FlashInferPrefillWrapper(workspace_buffer=workspace, max_total_tokens=max_total_tokens, **kwargs)
 
-    def whole_rows_kernel(self, workspace, kwargs, max_total_tokens):
+    def own_tokens_kernel(self, workspace, kwargs, captured, whole):
+        if not whole:
+            return super().own_tokens_kernel(workspace, kwargs, captured, whole)
+        # whole rows read their keys as contiguous runs, which the ragged prefill takes 1.06-1.16x
+        # faster than one-slot pages on a captured step (H200, FA2 and FA3)
         from mstar.engine.resources.attn.ragged.wrappers import FlashInferRaggedPrefillWrapper
 
-        return FlashInferRaggedPrefillWrapper(
-            workspace, max_num_segments=kwargs.get("batch_size"), max_total_tokens=max_total_tokens,
+        ragged = FlashInferRaggedPrefillWrapper(
+            workspace, max_num_segments=kwargs.get("batch_size"), max_total_tokens=captured and captured.tokens,
             accelerator_graph=kwargs.get("accelerator_graph", False), owns_padding=True, **self._new_kwargs,
         )
+        return _WholeRows(ragged, captured)
 
     @property
     def supports_preplan(self):
@@ -422,3 +430,24 @@ class FlashInferManager(PlacedAttention):
         if o.dtype != q.dtype:
             o = o.to(q.dtype)
         return o
+
+
+class _WholeRows(OwnTokensKernel):
+    """FlashInfer's ragged prefill as the own-token kernel for whole rows, each over its own tokens
+    (``KeyRows.whole``): their keys are contiguous runs of the step's, which it reads in place. It
+    takes no other rows, whose keys would have to be gathered."""
+
+    def __init__(self, ragged, captured: "ShareCapture | None"):
+        self._ragged, self.captured = ragged, captured
+
+    def plan(self, rows: KeyRows, causal: bool) -> None:
+        if not rows.is_whole():
+            raise ValueError("FlashInfer's ragged own-token kernel takes whole rows, each over its own tokens")
+        self._ragged.plan(torch.from_numpy(rows.qo_indptr.astype(np.int32)), causal=causal)
+
+    def run(self, queries, keys):
+        return self._ragged.run(*queries, *keys, return_lse=True)
+
+    def forget_plan(self) -> None:
+        # it skips a layout it already holds (`_RaggedPrefillBase.forget_plan`)
+        self._ragged.forget_plan()
