@@ -33,7 +33,7 @@ from mstar.engine.resources.attn import flashinfer_mla as fm
 from mstar.engine.resources.attn.base import AttentionManager
 from mstar.engine.resources.attn.config import AttentionConfig, AttentionSpec, AttentionStep, AttnBackend
 from mstar.engine.resources.attn.wrappers import PagedKernel
-from mstar.engine.resources.base import CGSlotKey, EngineResourceInfo, Resource
+from mstar.engine.resources.base import EngineResourceInfo, Resource
 from mstar.engine.resources.context_parallel import (
     OneSlotPages,
     SPPlacement,
@@ -691,8 +691,7 @@ def test_captured_zigzag_shares_replan_in_place_and_merge_to_attention_over_a_la
     captured = zigzag_capture(P, rows, tokens)
     wrappers = [
         ZigzagWrapper(
-            SPPlacement(P, index, CommGroup.trivial()), OneSlotPages(_OneSlotPrefill(), torch.float32, captured),
-            CPU, tokens,
+            SPPlacement(P, index, CommGroup.trivial()), OneSlotPages(_OneSlotPrefill(), torch.float32, captured), CPU,
         )
         for index in range(P)
     ]
@@ -1084,10 +1083,12 @@ def test_sp_placed_mla_attention_bounds_a_packed_bucket_of_one_token_rows_as_its
                            capture=False, slot_lease=SlotLease(0, bucket), force_prefill=force_prefill)
 
     qo = np.arange(rows + 1)
-    padded = OneSlotPages.padded(zigzag_share(qo, P, 0), *zigzag_capture(P, rows, tokens))
+    padded = OneSlotPages.padded(zigzag_share(qo, P, 0), zigzag_capture(P, rows, tokens))
     assert fm.fa_work_items_bound(padded, 64, 132) > fm._FA_MAX_WORK_ITEMS >= fm.fa_work_items_bound(qo, 64, 132)
     assert attn.admit(step, ctx(rows, force_prefill=False)).ok
     assert not attn.admit(step, ctx(tokens, force_prefill=True)).ok
+    # a bucket of more tokens than rows plans a prefill whether packed or not
+    assert not attn.admit(step, ctx(tokens, force_prefill=False)).ok
 
 
 def test_sp_placed_mla_attention_pads_a_leased_step_for_the_rows_its_wrapper_was_captured_with(monkeypatch):
@@ -1099,15 +1100,15 @@ def test_sp_placed_mla_attention_pads_a_leased_step_for_the_rows_its_wrapper_was
                                     torch.float32, mla=True, flashinfer_backend="fa2")
     tokens, spans = 64, (3, 3)
     bucket = BucketKey(graph_walk="w", bs=4, num_tokens=tokens)
-    attn._cg_plan_states[CGSlotKey(bucket=bucket, slot=0, label="main")] = types.SimpleNamespace(captured_rows=4)
+    attn._cg_wrapper(SlotLease(0, bucket), "main", bucket.bs)
     step = AttentionStep(segments=tuple(Segment(f"r{i}", "main", span) for i, span in enumerate(spans)))
     ctx = StepContext(request_ids=tuple(seg.request_id for seg in step.segments), graph_walk="w", slot=0,
                       capture=False, slot_lease=SlotLease(0, bucket))
     heads, qo = attn._wrapper_kwargs["num_qo_heads"], np.cumsum([0, *spans])
 
     def bound(rows):
-        return max(fm.fa_work_items_bound(plan, h, 132)
-                   for plan, h in attn._placed.rank_plans(placement, qo, heads, (rows, tokens)))
+        plans = attn._placed.rank_plans(placement, qo, heads, attn.own_kernel, (rows, tokens))
+        return max(fm.fa_work_items_bound(plan, h, 132) for plan, h in plans)
 
     assert bound(4) > bound(len(spans))
     monkeypatch.setattr(fm, "_FA_MAX_WORK_ITEMS", bound(len(spans)))

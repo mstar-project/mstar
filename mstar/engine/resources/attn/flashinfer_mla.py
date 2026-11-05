@@ -18,14 +18,14 @@ import numpy as np
 import torch
 
 from mstar.engine.resources.attn.base import (
-    AttentionManager,
     EagerSlotKey,
+    PlacedAttention,
     captured_page_capacity,
     one_token_rows,
 )
 from mstar.engine.resources.attn.config import AttentionStep
 from mstar.engine.resources.attn.workspace import Workspace, WorkspacePool
-from mstar.engine.resources.attn.wrappers import PagedKernel
+from mstar.engine.resources.attn.wrappers import PagedKernel, WholeRowsKernel
 from mstar.engine.resources.base import CGSlotKey
 from mstar.engine.resources.context_parallel import ContextParallel, one_slot_pages
 from mstar.engine.resources.kv.config import KVConfig, KVLayout
@@ -261,36 +261,34 @@ class FlashInferMLAWrapper(PagedKernel):
         return (out, lse) if return_lse else out
 
 
-class FlashInferMLAOwnTokensWrapper(FlashInferMLAWrapper):
+class FlashInferMLAOwnTokensWrapper(WholeRowsKernel):
     """A step's own tokens attending each other from the latents ``run`` is passed (``[T, latent]``),
     with no copy: the MLA kernel over pages of one slot, page ``i`` the step's token ``i``, so each
     row's keys are its own queries' tokens."""
 
     def __init__(self, workspace_buffer: Workspace, dtype: torch.dtype, **kwargs):
-        super().__init__(workspace_buffer, page_size=1, **kwargs)
+        self._kernel = FlashInferMLAWrapper(workspace_buffer, page_size=1, **kwargs)
         self._plan_dtype = dtype
         self._out_buf = self._lse_buf = None
-        if self.use_cuda_graph and not self.fallback:
+        if self._kernel.use_cuda_graph and not self._kernel.fallback:
             # as the ragged wrapper's (`_FlashInferRaggedPrefillBase`): the kernel writes only the
             # planned rows, so ``plan`` resets a captured bucket's padding to out 0, lse -inf, which
             # merges to 0. ``run`` returns these buffers themselves (no clone, unlike the ragged out):
             # read them before the next ``run``. A page a token, so the pages are the bucket's tokens
-            rows = (kwargs["max_num_pages"], self.num_qo_heads)
-            self._out_buf = torch.zeros(*rows, self.kv_lora_rank, dtype=dtype, device=self.device)
-            self._lse_buf = torch.full(rows, -math.inf, dtype=torch.float32, device=self.device)
+            rows = (kwargs["max_num_pages"], self._kernel.num_qo_heads)
+            device = self._kernel.device
+            self._out_buf = torch.zeros(*rows, self._kernel.kv_lora_rank, dtype=dtype, device=device)
+            self._lse_buf = torch.full(rows, -math.inf, dtype=torch.float32, device=device)
 
     def plan(self, qo_indptr: torch.Tensor, causal: bool = True):
         tokens = int(qo_indptr[-1])
-        super().plan(
+        self._kernel.plan(
             qo_indptr, qo_indptr, torch.arange(tokens, dtype=torch.int32),
             torch.ones(qo_indptr.shape[0] - 1, dtype=torch.int32), causal=causal, dtype=self._plan_dtype,
         )
         if self._out_buf is not None:
             self._out_buf[tokens:].zero_()
             self._lse_buf[tokens:].fill_(-math.inf)
-
-    def forget_plan(self) -> None:
-        """Every ``plan`` plans its kernel, so there is nothing to forget."""
 
     def run(self, q_nope: torch.Tensor, q_pe: torch.Tensor, latent: torch.Tensor, return_lse: bool = False):
         owned = {}
@@ -301,11 +299,10 @@ class FlashInferMLAOwnTokensWrapper(FlashInferMLAWrapper):
                 f"{self._out_buf.shape[0]} this graph-mode wrapper was built for"
             )
             owned = dict(out=self._out_buf[:n], lse=self._lse_buf[:n] if return_lse else None)
-        return super().run(q_nope, q_pe, one_slot_pages(latent), return_lse=return_lse, **owned)
+        return self._kernel.run(q_nope, q_pe, one_slot_pages(latent), return_lse=return_lse, **owned)
 
 
-class FlashInferMLAManager(AttentionManager):
-    supports_context_parallel = True
+class FlashInferMLAManager(PlacedAttention):
 
     def __init__(
         self,
@@ -481,8 +478,9 @@ class FlashInferMLAManager(AttentionManager):
         fit = next((n for n in range(len(real) - 1, 0, -1) if self._fits([rows[rid] for rid in real[:n]])), None)
         if alone or fit is None:
             # (no fit: one real row, which its capture's padding takes past the cap)
+            hint = self._placed.cap_hint(self._placement)
             return AdmitOutcome(ok=False, reason=AdmitRuntimeError(
-                message=f"The request's prompt takes {where} in one step; shorten it.{self._cap_hint()}",
+                message=f"The request's prompt takes {where} in one step; shorten it.{hint}",
                 request_ids=alone or frozenset(real),
             ))
         return AdmitOutcome(ok=False, reason=AllocationFailed(
@@ -518,21 +516,20 @@ class FlashInferMLAManager(AttentionManager):
         force_prefill = ctx is not None and ctx.force_prefill
         for label in {label for row in rows for label in row}:
             qo = np.cumsum([0, *(row[label] for row in rows if label in row)])
-            captured = None
+            bucket = None
             if lease is None:
                 decode = one_token_rows(len(qo) - 1, int(qo[-1]), force_prefill)
             else:
                 decode = one_token_rows(lease.bucket.bs, lease.bucket.num_tokens, force_prefill)
                 # the rows the label's wrapper was captured with, which its own-token part pads to
                 wrapper = self._cg_plan_states.get(CGSlotKey(bucket=lease.bucket, slot=lease.slot, label=label))
-                captured = (len(qo) - 1 if wrapper is None else wrapper.captured_rows, lease.bucket.num_tokens)
-            plans = [(qo, heads)] if decode else self._placed.rank_plans(self._placement, qo, heads, captured)
+                bucket = (len(qo) - 1 if wrapper is None else wrapper.captured_rows, lease.bucket.num_tokens)
+            plans = [(qo, heads)]
+            if not decode:
+                plans = self._placed.rank_plans(self._placement, qo, heads, self.own_kernel, bucket)
             if any(fa_work_items_bound(plan, h, self._fa_sm_count) > _FA_MAX_WORK_ITEMS for plan, h in plans):
                 return False
         return True
-
-    def _cap_hint(self) -> str:
-        return self._placed.cap_hint(self._placement)
 
     def plan(self, step: AttentionStep, ctx: StepContext):
         if step.context_only and self._placement is not None:

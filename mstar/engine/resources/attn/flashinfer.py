@@ -7,9 +7,9 @@ from typing import TYPE_CHECKING
 import torch
 
 from mstar.engine.resources.attn.base import (
-    AttentionManager,
     AttentionWrapper,
     EagerSlotKey,
+    PlacedAttention,
     captured_page_capacity,
     one_token_rows,
 )
@@ -38,8 +38,7 @@ if TYPE_CHECKING:
     from mstar.engine.resources.resident import CapturedResidentStep
 
 
-class FlashInferManager(AttentionManager):
-    supports_context_parallel = True
+class FlashInferManager(PlacedAttention):
 
     def __init__(
         self,

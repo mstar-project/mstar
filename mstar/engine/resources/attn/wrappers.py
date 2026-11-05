@@ -155,6 +155,24 @@ class PagedKernel(ABC):
         ``out``, and with ``return_lse`` also the natural-log lse ``[N, H]`` fp32."""
 
 
+class WholeRowsKernel(ABC):
+    """A step's own tokens, each row over its own tokens at this rank's heads, as attention over a
+    TP-placed pool plans and runs them (``PlacedAttention.whole_rows_kernel``)."""
+
+    @abstractmethod
+    def plan(self, qo_indptr: torch.Tensor, causal: bool = True) -> None:
+        """Plans the rows ``qo_indptr`` lays out."""
+
+    @abstractmethod
+    def run(self, *parts: torch.Tensor, return_lse: bool = False):
+        """The planned attention: ``parts`` are the query parts, then the step's own keys as the
+        backend's attention ``run`` takes them. Every query passed gets a result: past the plan (a
+        captured bucket's padding) out 0 and lse -inf."""
+
+    def forget_plan(self) -> None:  # noqa: B027 - a kernel that skips a layout it holds replans
+        """Every ``plan`` plans the kernel, so there is nothing to forget."""
+
+
 class FlashInferPrefillWrapper(PagedKernel):
     """Batched prefill attention with paged KV cache.
 

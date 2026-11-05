@@ -15,7 +15,7 @@ import math
 from abc import ABC, abstractmethod
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, NamedTuple, Protocol
+from typing import TYPE_CHECKING, NamedTuple
 
 import numpy as np
 import torch
@@ -26,41 +26,8 @@ from mstar.engine.resources.spec import NodeResourceSpec
 from mstar.utils.h2d import PinnedStager, to_device_nonblocking
 
 if TYPE_CHECKING:
-    from mstar.engine.resources.attn.wrappers import PagedKernel
-
-
-class WholeRowsKernel(Protocol):
-    """A backend's kernel for a step's own tokens, whole rows at this rank's heads, as TP placement
-    plans and runs it (``FlashInferMLAOwnTokensWrapper``, or FlashInfer's ragged prefill with
-    ``owns_padding``)."""
-
-    def plan(self, qo_indptr: torch.Tensor, causal: bool = True) -> None:
-        """Plans each row over its own tokens."""
-
-    def run(self, *queries_then_keys: torch.Tensor, return_lse: bool = False):
-        """``(out, lse)`` for every query passed, 0 and -inf past the plan (a captured bucket's
-        padding)."""
-
-    def forget_plan(self) -> None:
-        """Replans on the next ``plan`` whatever its layout (a dropped pre-plan)."""
-
-
-class PlacedKernels(Protocol):
-    """What a backend supplies to attend a placed pool: its kernels, which ``AttentionManager``
-    builds per label and slot. The rest (the own tokens' split, the exchanges, the merge) is
-    ``ContextParallelWrapper``'s."""
-
-    def paged_kernel(
-        self, workspace: torch.Tensor, decode: bool, kwargs: dict, max_total_tokens: int | None,
-    ) -> "PagedKernel":
-        """The paged kernel over this rank's slots, from ``kwargs`` (the backend's wrapper
-        arguments with the placed geometry, and any capture sizes), for a one-token-a-row step or
-        not; or, with ``page_size`` 1, over pages of one slot (``OneSlotPages``)."""
-
-    def whole_rows_kernel(
-        self, workspace: torch.Tensor, kwargs: dict, max_total_tokens: int | None,
-    ) -> WholeRowsKernel:
-        """The kernel a multi-token step attends its own tokens on under TP placement."""
+    from mstar.engine.resources.attn.base import PlacedAttention
+    from mstar.engine.resources.attn.wrappers import PagedKernel, WholeRowsKernel
 
 
 @dataclass(frozen=True)
@@ -172,23 +139,41 @@ class KeyRows(NamedTuple):
     kv_tokens: np.ndarray
 
 
+class ShareCapture(NamedTuple):
+    """What a captured share of a step's own tokens is sized for (``zigzag_capture``)."""
+
+    # the kernel's fixed rows and queries
+    rows: int
+    queries: int
+    # the bucket's tokens, which the share's keys are drawn from
+    tokens: int
+
+
 class OwnTokensKernel(ABC):
     """Attention of rows of a step's own queries over lists of its own tokens as keys
     (``KeyRows``), from the keys the layer passes ``run``: the kernel ``ZigzagWrapper`` runs a
     share on. Nothing here assumes pages: a paged kernel reads the keys in place
     (``OneSlotPages``); a ragged one would gather them by ``kv_tokens``.
 
-    A captured kernel is run on ``captured_queries`` queries every replay, however few its plan
-    has: ``ZigzagWrapper`` gathers that many, and the kernel pads its plan to them (``padded``)."""
+    A captured kernel is run on ``captured.queries`` queries every replay, however few its plan
+    has: ``ZigzagWrapper`` gathers that many, and the kernel pads its plan to them (``padded``). A
+    backend names its kernel in ``PlacedAttention.own_kernel``."""
 
-    # the queries a captured kernel runs on; None on an eager one
-    captured_queries: int | None = None
+    # what a captured kernel is sized for; None on an eager one
+    captured: ShareCapture | None = None
+
+    @classmethod
+    @abstractmethod
+    def build(
+        cls, kernels: "PlacedAttention", workspace: torch.Tensor, kwargs: dict, dtype: torch.dtype,
+        captured: ShareCapture | None,
+    ) -> "OwnTokensKernel":
+        """The backend's kernel from the attention wrapper's ``kwargs``, captured or not."""
 
     @staticmethod
-    def padded(qo_indptr: np.ndarray, rows: int, queries: int) -> np.ndarray:
-        """``qo_indptr`` as a kernel captured for ``rows`` rows and ``queries`` queries plans it:
-        what admission bounds. Unchanged by default."""
-        return qo_indptr
+    @abstractmethod
+    def padded(qo_indptr: np.ndarray, captured: ShareCapture) -> np.ndarray:
+        """``qo_indptr`` as a kernel captured so plans it, which admission bounds."""
 
     @abstractmethod
     def plan(self, rows: KeyRows, causal: bool) -> None:
@@ -221,24 +206,32 @@ def one_slot_pages(*keys: torch.Tensor):
 class OneSlotPages(OwnTokensKernel):
     """An ``OwnTokensKernel`` on a backend's paged kernel over pages of one slot, page ``i`` the
     step's token ``i``: rows whose key lists overlap (a zigzag share's two chunks) plan as rows of
-    one call with no copy of the keys. Captured for ``(rows, queries)``, it pads each plan as the
-    paged planner's fixed buffers read it (``padded``)."""
+    one call with no copy of the keys. Captured, it pads each plan as the paged planner's fixed
+    buffers read it (``padded``)."""
 
-    def __init__(self, kernel: "PagedKernel", dtype: torch.dtype, captured: tuple[int, int] | None = None):
-        self.kernel, self._dtype, self._captured = kernel, dtype, captured
-        if captured is not None:
-            self.captured_queries = captured[1]
+    def __init__(self, kernel: "PagedKernel", dtype: torch.dtype, captured: ShareCapture | None = None):
+        self.kernel, self._dtype, self.captured = kernel, dtype, captured
+
+    @classmethod
+    def build(cls, kernels, workspace, kwargs, dtype, captured):
+        kwargs = {**kwargs, "page_size": 1}
+        if captured is None:
+            return cls(kernels.paged_kernel(workspace, False, kwargs, None), dtype)
+        # a chunk's keys are at most the bucket's, and a row has two; the padding and leftover rows'
+        # one key each fit in the batch_size spare indices the kernel adds
+        kwargs.update(batch_size=captured.rows, max_num_pages=2 * captured.tokens)
+        return cls(kernels.paged_kernel(workspace, False, kwargs, captured.queries), dtype, captured)
 
     @staticmethod
-    def padded(qo_indptr: np.ndarray, rows: int, queries: int) -> np.ndarray:
+    def padded(qo_indptr: np.ndarray, captured: ShareCapture) -> np.ndarray:
         """The spare queries one row, the rows left over empty. The padding row's one key costs
         O(pad): under causal alignment all but its last query see none."""
-        return np.concatenate([qo_indptr, np.full(rows + 1 - len(qo_indptr), queries)])
+        return np.concatenate([qo_indptr, np.full(captured.rows + 1 - len(qo_indptr), captured.queries)])
 
     def plan(self, rows: KeyRows, causal: bool) -> None:
         qo, kv_indptr, kv_tokens = rows
-        if self._captured is not None:
-            qo = self.padded(qo, *self._captured)
+        if self.captured is not None:
+            qo = self.padded(qo, self.captured)
             # a padding or leftover row's one key is token 0
             extra = len(qo) - len(kv_indptr)
             kv_indptr = np.concatenate([kv_indptr, kv_indptr[-1] + np.arange(1, extra + 1)])
@@ -356,16 +349,17 @@ class ContextParallelWrapper(ABC):
         return self._pinned_indices[:n].copy_(indices)
 
     @staticmethod
-    @abstractmethod
     def local_geometry(placement: ContextParallel, page_size: int, num_qo_heads: int) -> dict[str, int]:
-        """A paged attention wrapper's ``page_size`` and ``num_qo_heads`` over this rank's slots."""
+        """A paged attention wrapper's ``page_size`` and ``num_qo_heads`` over this rank's slots: the
+        slots a page it stores, and its own query heads."""
+        return dict(page_size=page_size // placement.size, num_qo_heads=num_qo_heads)
 
     @classmethod
     @abstractmethod
     def own_tokens(
-        cls, kernels: PlacedKernels, placement: ContextParallel, device: torch.device, dtype: torch.dtype,
+        cls, kernels: "PlacedAttention", placement: ContextParallel, device: torch.device, dtype: torch.dtype,
         workspace: torch.Tensor, kwargs: dict, max_total_tokens: int | None,
-    ):
+    ) -> "WholeRowsKernel | ZigzagWrapper":
         """The part a multi-token step attends its own tokens on, from the backend's ``kernels``:
         ``plan(qo_indptr, causal)`` over the step's rows and ``forget_plan()``, and an ``(out, lse)``
         for every token of the step, out 0 and lse -inf on any it doesn't attend
@@ -374,12 +368,13 @@ class ContextParallelWrapper(ABC):
     @classmethod
     @abstractmethod
     def rank_plans(
-        cls, placement: ContextParallel, qo_indptr: np.ndarray, num_qo_heads: int, captured: tuple[int, int] | None,
+        cls, placement: ContextParallel, qo_indptr: np.ndarray, num_qo_heads: int,
+        own_kernel: type[OwnTokensKernel], bucket: tuple[int, int] | None,
     ) -> list[tuple[np.ndarray, int]]:
         """Every plan a multi-token step of ``qo_indptr``'s rows makes on any rank of the
         placement, as ``(qo_indptr, query heads)``: the context's at the local geometry's
-        ``num_qo_heads``, and the own tokens'. A wrapper captured for ``(rows, tokens)``
-        (``captured_rows`` and its bucket's tokens) pads them as it plans them. What admission
+        ``num_qo_heads``, and the own tokens', on the backend's ``own_kernel``. A wrapper captured
+        for ``bucket``, ``(captured_rows, its tokens)``, pads them as it plans them. What admission
         bounds a planner's refusals by, the same on every rank."""
 
     @staticmethod
@@ -441,19 +436,20 @@ class TPContextParallelWrapper(ContextParallelWrapper):
     attends whole for its own heads."""
 
     _placement: TPPlacement
+    new: "WholeRowsKernel | None"
 
     @staticmethod
     def local_geometry(placement: TPPlacement, page_size: int, num_qo_heads: int) -> dict[str, int]:
-        """The slots a page this rank stores, and every partner's query heads, which it attends for
-        them."""
-        return dict(page_size=page_size // placement.size, num_qo_heads=num_qo_heads * placement.size)
+        """And every partner's query heads, which it attends for them."""
+        geometry = ContextParallelWrapper.local_geometry(placement, page_size, num_qo_heads)
+        return {**geometry, "num_qo_heads": num_qo_heads * placement.size}
 
     @classmethod
     def own_tokens(cls, kernels, placement, device, dtype, workspace, kwargs, max_total_tokens):
         return kernels.whole_rows_kernel(workspace, kwargs, max_total_tokens)
 
     @classmethod
-    def rank_plans(cls, placement, qo_indptr, num_qo_heads, captured):
+    def rank_plans(cls, placement, qo_indptr, num_qo_heads, own_kernel, bucket):
         # the own tokens, whole, at this rank's own heads: the same lengths on every rank
         return [(qo_indptr, num_qo_heads), (qo_indptr, num_qo_heads // placement.size)]
 
@@ -506,36 +502,23 @@ class SPContextParallelWrapper(ContextParallelWrapper):
     two, and one gather merges every partner's."""
 
     _placement: SPPlacement
-    # the kernel a share runs on, whose padding admission bounds (`rank_plans`)
-    own_kernel = OneSlotPages
-
-    @staticmethod
-    def local_geometry(placement: SPPlacement, page_size: int, num_qo_heads: int) -> dict[str, int]:
-        """The slots a page this rank stores; its own query heads."""
-        return dict(page_size=page_size // placement.size, num_qo_heads=num_qo_heads)
+    new: "ZigzagWrapper | None"
 
     @classmethod
     def own_tokens(cls, kernels, placement, device, dtype, workspace, kwargs, max_total_tokens):
-        # its zigzag share of the own tokens, over pages of one slot; captured, sized for the
-        # bucket's share once (`zigzag_capture`)
-        if not max_total_tokens:
-            paged = kernels.paged_kernel(workspace, False, {**kwargs, "page_size": 1}, None)
-            return ZigzagWrapper(placement, cls.own_kernel(paged, dtype), device)
-        rows, queries = zigzag_capture(placement.size, kwargs.get("batch_size") or 0, max_total_tokens)
-        paged = kernels.paged_kernel(
-            workspace, False, {**kwargs, "page_size": 1, "batch_size": rows, "max_num_pages": 2 * max_total_tokens},
-            queries,
-        )
-        kernel = cls.own_kernel(paged, dtype, captured=(rows, queries))
-        return ZigzagWrapper(placement, kernel, device, max_total_tokens)
+        # its zigzag share of the own tokens, on the backend's kernel for one
+        captured = None
+        if max_total_tokens:
+            captured = zigzag_capture(placement.size, kwargs.get("batch_size") or 0, max_total_tokens)
+        return ZigzagWrapper(placement, kernels.own_kernel.build(kernels, workspace, kwargs, dtype, captured), device)
 
     @classmethod
-    def rank_plans(cls, placement, qo_indptr, num_qo_heads, captured):
+    def rank_plans(cls, placement, qo_indptr, num_qo_heads, own_kernel, bucket):
         # and every partner's zigzag share of the own tokens, which differ by rank, at the same heads
         shares = [zigzag_share(qo_indptr, placement.size, index) for index in range(placement.size)]
-        if captured is not None:
-            shape = zigzag_capture(placement.size, *captured)
-            shares = [cls.own_kernel.padded(share, *shape) for share in shares]
+        if bucket is not None:
+            captured = zigzag_capture(placement.size, *bucket)
+            shares = [own_kernel.padded(share, captured) for share in shares]
         return [(plan, num_qo_heads) for plan in (qo_indptr, *shares)]
 
     def _merged_over_ranks(self, queries, kv_cache_layer, keys):
@@ -569,11 +552,11 @@ def zigzag_share(qo_indptr: np.ndarray, size: int, index: int) -> np.ndarray:
     return np.concatenate([[0], np.cumsum(end - first)])
 
 
-def zigzag_capture(size: int, rows: int, tokens: int) -> tuple[int, int]:
+def zigzag_capture(size: int, rows: int, tokens: int) -> ShareCapture:
     """A zigzag share's kernel captured for a bucket of ``rows`` rows and ``tokens`` tokens: its
     fixed rows (at most 2 chunks a row, and one more for the padding queries) and queries (at most
     ``ceil(T / 2P)`` a chunk)."""
-    return 2 * rows + 1, min(tokens, -(-(tokens + rows * (2 * size - 1)) // size))
+    return ShareCapture(2 * rows + 1, min(tokens, -(-(tokens + rows * (2 * size - 1)) // size)), tokens)
 
 
 def _zigzag_chunks(
@@ -599,28 +582,22 @@ def _zigzag_chunks(
 
 class ZigzagWrapper:
     """A step's own tokens under SP placement, attended for this rank's zigzag chunks alone on
-    ``kernel``, out 0 and lse -inf off them. Captured for a bucket of ``tokens`` tokens, it gathers
-    the kernel's ``captured_queries``: its share, then padding, which gathers token 0 and scatters
-    to a row ``run`` drops."""
+    ``kernel``, out 0 and lse -inf off them. On a captured kernel it gathers the same number of
+    queries every replay: its share, then padding, which gathers token 0 and scatters to a row
+    ``run`` drops."""
 
-    def __init__(
-        self,
-        placement: SPPlacement,
-        kernel: OwnTokensKernel,
-        device: torch.device,
-        tokens: int = 0,
-    ):
+    def __init__(self, placement: SPPlacement, kernel: OwnTokensKernel, device: torch.device):
         self._placement, self.kernel, self._device = placement, kernel, device
         self._stager = PinnedStager(torch.int64)
-        self._bucket_tokens = tokens
+        self._bucket_tokens = 0 if kernel.captured is None else kernel.captured.tokens
         # the step's token count the last plan was for
         self._step_tokens = 0
         # each planned query's token to gather and row to scatter to; None when the last plan gave
         # this rank none
         self._gather = self._scatter = None
-        if tokens:
+        if kernel.captured is not None:
             # never reallocated, so a replay reads the addresses it was captured with
-            self._tokens = torch.zeros(2, kernel.captured_queries, dtype=torch.int64, device=device)
+            self._tokens = torch.zeros(2, kernel.captured.queries, dtype=torch.int64, device=device)
             self._gather, self._scatter = self._tokens
 
     @torch.compiler.disable
