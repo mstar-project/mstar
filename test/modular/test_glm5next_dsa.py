@@ -436,6 +436,19 @@ def test_a_non_bf16_cache_on_cuda_is_refused_at_load():
         sub.bind_node_resources({KV_CACHE: kv})
 
 
+def test_the_engine_plans_the_declared_dsa_step():
+    """A long prompt's prefill: the engine planned the DSA step its submodule declares, and the
+    layers read that plan, with nothing from preprocess."""
+    from mstar.model.glm5_next.config import DSA
+
+    engine, sub, _ = _engine(long_context=True)
+    ar = types.SimpleNamespace(input_ids=torch.tensor([1, 2]), input_seq_len=2)
+    assert DSA in sub.declare_step("prefill", ["a"], [ar]).keys()
+    engine.add_request("a", {SAMPLER: SamplingReqConfig(temperature=0.0)})
+    _step(engine, "prefill", {"a": torch.randint(0, 250, (100,))})
+    assert engine._resources[DSA].current().host_pos == list(range(100))
+
+
 def _admits(engine, rid, token, it) -> bool:
     """Whether one decode step of ``rid`` alone admits."""
     info = CurrentForwardPassInfo(

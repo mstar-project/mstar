@@ -34,7 +34,7 @@ def _force_cpu_flashinfer(monkeypatch):
 from mstar.engine.resources import StepContext  # noqa: E402
 from mstar.engine.resources.attn.flashinfer_mla import flashinfer_mla_supports  # noqa: E402
 from mstar.engine.resources.dsa import paged  # noqa: E402
-from mstar.engine.resources.dsa.config import INDEX_PLANES, DSAConfig  # noqa: E402
+from mstar.engine.resources.dsa.config import INDEX_PLANES, DSAConfig, DSAStep  # noqa: E402
 from mstar.engine.resources.dsa.manager import DSAManager  # noqa: E402
 from mstar.engine.resources.dsa.paged import DSAContext  # noqa: E402
 from mstar.model.glm52._testing import (  # noqa: E402
@@ -156,6 +156,8 @@ def _preprocess(sub, starts, seq_len, tables=None, steps=None):
     )
     if steps is not None:
         steps.append(engine_inputs.step)
+    if DSA_RESOURCE in resources:  # the engine plans the declared DSAStep before preprocess
+        resources[DSA_RESOURCE].plan(DSAStep(), engine_inputs.step.ctx)
     return sub.preprocess("prefill", engine_inputs, inputs)
 
 
@@ -163,8 +165,8 @@ def test_guard_flag_off_holds_context_to_topk():
     cfg = Glm52ModelConfig()
     assert cfg.dsa_long_context is False
     sub = _make_submodule(cfg)
-    out = _preprocess(sub, {"r0": 2032}, seq_len=16)  # exactly topk: allowed
-    assert sub._dsa_ctx(out) is None
+    _preprocess(sub, {"r0": 2032}, seq_len=16)  # exactly topk: allowed
+    assert sub._dsa_plan() is None
     with pytest.raises(RuntimeError, match="dsa_long_context"):
         _preprocess(sub, {"r0": 2040}, seq_len=16)
 
@@ -176,13 +178,17 @@ def test_guard_flag_on_lifts_cap_to_max_seq_len():
     sub = _make_submodule(cfg)
     topk = cfg.index_topk
 
-    # Decode one past topk: allowed, and the batch is marked for selection.
-    ctx = sub._dsa_ctx(_preprocess(sub, {"r0": topk}, seq_len=1))
+    # Decode one past topk: allowed, and the batch is marked for selection; the plan is the
+    # resource's, and preprocess hands the forward none of it
+    out = _preprocess(sub, {"r0": topk}, seq_len=1)
+    assert not any(key.startswith("dsa") for key in out)
+    ctx = sub._dsa_plan()
     assert ctx.needs_selection is True
     assert ctx.host_pos == [topk]  # it sees topk + 1 keys
 
     # Prefill rows past topk select too: each over its own causal prefix.
-    ctx = sub._dsa_ctx(_preprocess(sub, {"r0": topk}, seq_len=16))
+    _preprocess(sub, {"r0": topk}, seq_len=16)
+    ctx = sub._dsa_plan()
     assert ctx.needs_selection is True
     assert ctx.host_pos == list(range(topk, topk + 16))
 
@@ -196,8 +202,8 @@ def test_flag_on_identity_batch_builds_spans_without_selection():
     cfg.dsa_long_context = True
     sub = _make_submodule(cfg)
     steps = []
-    ctx = sub._dsa_ctx(
-        _preprocess(sub, {"r0": 0, "r1": 5}, seq_len=4, tables=[[0, 1, 2], [5]], steps=steps))
+    _preprocess(sub, {"r0": 0, "r1": 5}, seq_len=4, tables=[[0, 1, 2], [5]], steps=steps)
+    ctx = sub._dsa_plan()
 
     assert ctx.needs_selection is False  # everything fits topk: identity
     assert ctx.host_pos == [0, 1, 2, 3, 5, 6, 7, 8]
@@ -318,6 +324,19 @@ def _longctx_reduced_cfg(topk):
     return cfg
 
 
+def test_the_engine_plans_the_declared_dsa_step_for_the_layers():
+    """Each step the runner plans the DSAStep the submodule declares, and the layers read that
+    plan from the resource: past topk, the decode row selects."""
+    cfg = _longctx_reduced_cfg(topk=4)
+    sub = Glm52LLMSubmodule(language_model=build_random_model(cfg, seed=0), config=cfg)
+    driver = _Driver(sub, cfg)
+    dsa = driver.resources[DSA_RESOURCE]
+    driver.step("prefill", torch.randint(0, cfg.vocab_size, (6,)))
+    assert dsa.current().host_pos == list(range(6)) and dsa.current().needs_selection
+    driver.step("decode", torch.tensor([3]))
+    assert dsa.current().host_pos == [6] and dsa.current().decode_rows
+
+
 def test_declared_step_under_dsa_adds_the_dsa_resource():
     cfg = _longctx_reduced_cfg(topk=4)
     sub = Glm52LLMSubmodule(language_model=build_random_model(cfg, seed=0), config=cfg)
@@ -366,7 +385,7 @@ def test_full_to_shared_threading_order(monkeypatch):
     assert [layer for layer, _ in trace] == [0, 1]
     assert trace[0][1] is select_calls[0]
     assert trace[1][1] is select_calls[0]
-    assert dsa.ctx is None  # the forward's context closed with it
+    assert dsa.current().host_pos == [4]  # the decode step's declared plan
 
     # The FULL layer stored prompt + decode keys; there is no index plane for a SHARED one.
     kv = driver.resources[KV_RESOURCE]
@@ -382,7 +401,8 @@ def test_shared_layer_without_full_selection_raises():
     resources, _ = build_cpu_resources(cfg)
     attn1 = model.model.layers[1].self_attn  # SHARED
     attn1.bind_resources(resources)
-    with resources[DSA_RESOURCE].use(_ctx(True)), pytest.raises(RuntimeError, match="no FULL layer ran"):
+    resources[DSA_RESOURCE]._current = {"main": _ctx(True)}  # a step's plan, past topk
+    with pytest.raises(RuntimeError, match="no FULL layer ran"):
         attn1(torch.randn(1, cfg.hidden_size) * 0.1, torch.tensor([6]))
 
 

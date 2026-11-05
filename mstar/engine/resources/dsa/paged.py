@@ -33,14 +33,14 @@ PREFILL_SCORE_BYTES = 256 << 20
 
 @dataclass
 class DSAContext:
-    """Per-forward DSA state, from the inputs the resource staged (``DSAManager.step_inputs``).
+    """A step's DSA rows, as ``DSAManager.plan`` builds them from the KV plan.
 
     Device, per step row: ``pos`` its position (keys it sees are ``[0, pos]``), ``row_req`` its
     request. Per request: ``page_start`` its first entry in ``pages``, the flat page list of
     the step's requests. Host, when the step runs eager: ``host_pos``, ``spans`` ((first row,
     rows, request) per request, in row order) and ``host_page_start``. ``max_pools`` is the
     score width (the step's most pools, or a CUDA graph's fixed width); ``sparse_plan`` the
-    graph slot's plan, or the eager one the first layer builds.
+    graph slot's plan, or the eager one the first layer builds through ``eager``.
 
     ``needs_selection``: some row sees more than ``topk`` keys (below, dense MLA is the same
     computation). ``decode_rows``: every row scores on its own, the capturable launch (decode,

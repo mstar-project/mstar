@@ -123,6 +123,9 @@ class _Node:
             )
             for spec in specs
         }
+        for spec in specs:  # as the engine binds them (the DSA resource reads its KV pool)
+            self.resources[spec.resource_key].bind_dependencies(
+                {key: self.resources[key] for key in spec.depends_on()})
         self.runner = StepRunner(self.resources, node_resources={NODE: list(self.resources)})
         submodule.bind_node_resources(self.resources)
         self.overrides = model.get_request_resource_configs(

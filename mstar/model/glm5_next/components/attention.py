@@ -8,8 +8,6 @@ import torch.nn.functional as F
 from torch import nn
 
 from mstar.distributed.communication import CommGroup
-from mstar.engine.resources.dsa import paged
-from mstar.engine.resources.dsa.config import INDEX_PLANES
 from mstar.engine.resources.dsa.manager import DSAManager
 from mstar.model.components.mla import MLAAttention
 from mstar.model.glm5_next.config import ATTN, DSA, KV_CACHE, LABEL, Glm5NextModelConfig
@@ -97,22 +95,19 @@ class Glm5NextMLAAttention(MLAAttention):
 
     def _select(self, hidden_states, q_c, position_ids):
         """DSA past index_topk: write the step's index keys and select each row's slots (prefill
-        rows too: each selects over its own causal prefix); None without a context."""
-        ctx = self._dsa.ctx if self._dsa is not None else None
-        if ctx is None:
+        rows too: each selects over its own causal prefix); None without the resource."""
+        if self._dsa is None:
             return None
         k, gate = self.indexer.keys_and_gate(hidden_states)
-        paged.write_index(self._kv, self.index_plane, LABEL, k, ctx, gate=gate,
-                          ape=self.indexer.index_kpool_compress_ape)
+        self._dsa.write_index(self.index_plane, k, gate=gate,
+                              ape=self.indexer.index_kpool_compress_ape, label=LABEL)
         q, w = self.indexer.query_and_weights(q_c, hidden_states)
-        return paged.select(q, w, self._kv.aux_view(INDEX_PLANES, self.index_plane), ctx,
-                            self.dsa_group)
+        return self._dsa.select(self.index_plane, q, w, self.dsa_group, LABEL)
 
     def _attend_selected(self, slots, q_nope, q_pe, latent):
         """Write the step's latents, then attend each row over just its selected slots."""
         self._kv.write_kv(latent, None, layer_idx=self.kv_plane, label=LABEL)
-        return paged.sparse_attend(q_nope, q_pe, self._kv.layer_view(self.kv_plane), slots,
-                                   self._dsa.ctx, self.softmax_scale)
+        return self._dsa.attend(self.kv_plane, q_nope, q_pe, slots, self.softmax_scale, LABEL)
 
     def forward_block_row(
         self, hidden_states: torch.Tensor, row: int, latents: torch.Tensor,

@@ -519,25 +519,24 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
             out = dict(zip(fields, staged.split([len(v) for v in fields.values()]), strict=True))
         out["input_ids"] = (
             inputs[0].input_ids if len(inputs) == 1 else torch.cat([inp.input_ids for inp in inputs]))
-        if long_context:
-            # the DSA resource stages the step's rows off the KV plan; the forward opens them
-            # (_dsa_use)
-            out.update(engine_inputs.resources[DSA_RESOURCE].step_inputs(
-                engine_inputs.step.ctx, engine_inputs.captured))
         return out
 
     def _dsa(self) -> DSAManager | None:
         return self.node_resources.get(DSA_RESOURCE) if self.config.dsa_long_context else None
 
-    def _dsa_ctx(self, kwargs: dict) -> DSAContext | None:
-        """The forward's DSA context, from its preprocess inputs."""
+    def _dsa_plan(self) -> DSAContext | None:
+        """The step's DSA plan (the step declares DSAStep), or None without the resource."""
         dsa = self._dsa()
-        return dsa.context(kwargs) if dsa is not None else None
+        return dsa.current() if dsa is not None else None
 
-    def _dsa_use(self, dsa_ctx: DSAContext | None):
-        """Open ``dsa_ctx`` on the DSA resource for the layers a block runs (None: dense)."""
+    def _dsa_rows(self, c0: int, c1: int):
+        """The step's rows ``[c0, c1)`` alone for the layers a block runs."""
+        return self._dsa().rows(c0, c1)
+
+    def _dsa_dense(self):
+        """No DSA for the layers a block runs: they attend densely."""
         dsa = self._dsa()
-        return dsa.use(dsa_ctx) if dsa is not None else contextlib.nullcontext()
+        return dsa.dense() if dsa is not None else contextlib.nullcontext()
 
     def _positions(self, engine_inputs: ModelInputsFromEngine, num_tokens: int) -> torch.Tensor:
         """The step's positions as the position resource planned them, in the KV plan's
@@ -548,11 +547,9 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         self,
         input_ids: torch.Tensor,
         position_ids: torch.Tensor,
-        dsa_ctx: DSAContext | None = None,
         rows: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        with self._dsa_use(dsa_ctx):
-            return self.language_model.model(input_ids, position_ids, rows=rows)
+        return self.language_model.model(input_ids, position_ids, rows=rows)
 
     @torch.compiler.disable
     def _last_row_index(
@@ -588,13 +585,13 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         input_ids: torch.Tensor,
         **kwargs,
     ) -> NameToTensorList:
-        dsa_ctx = self._dsa_ctx(kwargs)
+        dsa_ctx = self._dsa_plan()
         position_ids = self._positions(engine_inputs, input_ids.shape[0])
         if self._long_prefill(graph_walk, input_ids, dsa_ctx):
             last = [input_ids.shape[0] - 1]
             return {"logits": [self.lm_head(
-                self._prefill_rows_chunked(input_ids, position_ids, dsa_ctx, last))]}
-        hidden = self._hidden(input_ids, position_ids, dsa_ctx)
+                self._prefill_rows_chunked(input_ids, position_ids, last))]}
+        hidden = self._hidden(input_ids, position_ids)
         return {"logits": [self.lm_head(hidden[-1:])]}
 
     def _long_prefill(self, graph_walk: str, input_ids: torch.Tensor, dsa_ctx) -> bool:
@@ -604,8 +601,7 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
                 and input_ids.shape[0] > self.config.prefill_chunk_tokens)
 
     def _prefill_rows_chunked(
-        self, input_ids: torch.Tensor, position_ids: torch.Tensor,
-        dsa_ctx: DSAContext, rows: list[int],
+        self, input_ids: torch.Tensor, position_ids: torch.Tensor, rows: list[int],
     ) -> torch.Tensor:
         """The trunk's final hidden state at ``rows`` (ascending) of a prefill longer than
         ``prefill_chunk_tokens``, run over row chunks in turn: each writes its keys and latents
@@ -614,9 +610,8 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         picked = []
         for c0 in range(0, input_ids.shape[0], chunk):
             c1 = min(c0 + chunk, input_ids.shape[0])
-            with kv.token_window(c0, c1):
-                hidden = self._hidden(
-                    input_ids[c0:c1], position_ids[c0:c1], dsa_ctx.rows(c0, c1))
+            with kv.token_window(c0, c1), self._dsa_rows(c0, c1):
+                hidden = self._hidden(input_ids[c0:c1], position_ids[c0:c1])
             want = [r - c0 for r in rows if c0 <= r < c1]
             if want:
                 picked.append(hidden[want])
@@ -636,8 +631,7 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
             # a verify step plans a block of rows per request around its one input token
             position_ids = self._positions(engine_inputs, input_ids.shape[0] * self.mtp_block)
             return self._mtp_decode(
-                engine_inputs, input_ids, position_ids, kwargs["mtp_slots"], kwargs["mtp_seq"],
-                self._dsa_ctx(kwargs))
+                engine_inputs, input_ids, position_ids, kwargs["mtp_slots"], kwargs["mtp_seq"])
         position_ids = self._positions(engine_inputs, input_ids.shape[0])
         if self.mtp_k > 0 and graph_walk == "prefill":
             return self._mtp_prefill(engine_inputs, input_ids, position_ids, kwargs)
@@ -662,17 +656,17 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         position_ids: torch.Tensor,
         **kwargs,
     ) -> dict[str, NameToTensorList]:
-        dsa_ctx = self._dsa_ctx(kwargs)
+        dsa_ctx = self._dsa_plan()
         if self._long_prefill(graph_walk, input_ids, dsa_ctx):
             last = [r0 + n - 1 for r0, n, _ in dsa_ctx.spans]
             return self._sample(engine_inputs, self.lm_head(
-                self._prefill_rows_chunked(input_ids, position_ids, dsa_ctx, last)))
+                self._prefill_rows_chunked(input_ids, position_ids, last)))
         rows = None
         if graph_walk == "prefill" and self.config.tuned_kernels:
             # the last layer's FFN on the rows it samples only: they take the small-batch MoE
             # path, so the first token's numerics move (the reference runs every row)
             rows = self._last_row_index(engine_inputs, kwargs)
-        hidden = self._hidden(input_ids, position_ids, dsa_ctx, rows=rows)
+        hidden = self._hidden(input_ids, position_ids, rows=rows)
         if graph_walk == "prefill" and rows is None:
             hidden = self._last_rows(engine_inputs, hidden, kwargs)
         logits = self.lm_head(hidden)  # (bs, vocab)
@@ -707,11 +701,11 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         row (each request's last row pairs with its sampled token): it fills the MTP plane and
         seeds the first decode step."""
         lm = self.language_model
-        dsa_ctx = self._dsa_ctx(kwargs)
+        dsa_ctx = self._dsa_plan()
         if self._long_prefill("prefill", input_ids, dsa_ctx):
             return self._mtp_prefill_chunked(engine_inputs, input_ids, position_ids, kwargs,
                                              dsa_ctx)
-        hidden = self._hidden(input_ids, position_ids, dsa_ctx)
+        hidden = self._hidden(input_ids, position_ids)
         last = self._last_row_index(engine_inputs, kwargs)
         new_tokens = self._sample_tokens(engine_inputs, self.lm_head(hidden.index_select(0, last)))
         # roll, not a shifted copy into empty memory: a captured bucket's tail is padding,
@@ -719,8 +713,7 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         nxt = torch.roll(input_ids, -1)
         nxt.index_copy_(0, last, new_tokens.to(nxt.dtype))
         # the MTP plane pairs the trunk's post-final-norm state, as the reference does
-        with self._dsa_use(dsa_ctx):
-            h_head, _ = lm.mtp(lm.model.embed_tokens(nxt), hidden, position_ids + 1)
+        h_head, _ = lm.mtp(lm.model.embed_tokens(nxt), hidden, position_ids + 1)
         self._mtp_seed(kwargs["mtp_slots"], h_head.index_select(0, last), new_tokens)
         return {
             rid: {"new_token": [new_tokens[i : i + 1]]}
@@ -740,17 +733,15 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         normed = []
         for c0 in range(0, input_ids.shape[0], chunk):
             c1 = min(c0 + chunk, input_ids.shape[0])
-            sub = dsa_ctx.rows(c0, c1)
-            with kv.token_window(c0, c1):
-                hidden = self._hidden(input_ids[c0:c1], position_ids[c0:c1], sub)
-                with self._dsa_use(sub):
-                    lm.mtp(lm.model.embed_tokens(nxt[c0:c1]), hidden, position_ids[c0:c1] + 1)
+            with kv.token_window(c0, c1), self._dsa_rows(c0, c1):
+                hidden = self._hidden(input_ids[c0:c1], position_ids[c0:c1])
+                lm.mtp(lm.model.embed_tokens(nxt[c0:c1]), hidden, position_ids[c0:c1] + 1)
             want = [r - c0 for r in last if c0 <= r < c1]
             if want:
                 normed.append(hidden[want])
         new_tokens = self._sample_tokens(engine_inputs, self.lm_head(torch.cat(normed)))
         rows = torch.tensor(last, device=input_ids.device)
-        with kv.token_rows(rows), self._dsa_use(dsa_ctx.pick(last)):
+        with kv.token_rows(rows), self._dsa().pick(last):
             h_head, _ = lm.mtp(
                 lm.model.embed_tokens(new_tokens), torch.cat(normed),
                 position_ids.index_select(0, rows) + 1)
@@ -763,7 +754,6 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
     def _mtp_decode(
         self, engine_inputs: ModelInputsFromEngine, input_ids: torch.Tensor,
         position_ids: torch.Tensor, mtp_slots: torch.Tensor, mtp_seq: torch.Tensor,
-        dsa_ctx: DSAContext | None = None,
     ) -> dict[str, NameToTensorList]:
         """One verify step. Drafts: d1 from the seed, each later one an MTP pass whose query
         sits at its row of this step's block. Verify: the trunk over [last | drafts], the
@@ -778,16 +768,17 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         h, d1 = self._mtp_read_seed(mtp_slots)
         drafts = [d1]
         rows: dict[str, torch.Tensor] = {}
-        for row in range(k - 1):
-            h_head, _ = lm.mtp.forward_block_row(
-                embed(drafts[-1]), h, positions[:, row] + 1, row, block, rows)
-            drafts.append(self._draft_tokens(h_head, drafts[-1]))
-            # the next pass's hnorm reads this pass's post-norm output, as d1's read the
-            # trunk's post-final-norm state: the reference chains it so (vLLM #45895)
-            h = h_head
+        with self._dsa_dense():  # the draft passes attend densely
+            for row in range(k - 1):
+                h_head, _ = lm.mtp.forward_block_row(
+                    embed(drafts[-1]), h, positions[:, row] + 1, row, block, rows)
+                drafts.append(self._draft_tokens(h_head, drafts[-1]))
+                # the next pass's hnorm reads this pass's post-norm output, as d1's read the
+                # trunk's post-final-norm state: the reference chains it so (vLLM #45895)
+                h = h_head
         drafts = torch.stack(drafts, 1)
         ids = torch.cat([input_ids.view(n, 1), drafts], 1).view(-1)
-        hidden = self._hidden(ids, position_ids, dsa_ctx)
+        hidden = self._hidden(ids, position_ids)
         target = self.lm_head(hidden).argmax(-1).view(n, block)
         accepted = (drafts == target[:, :k]).long().cumprod(1).sum(1)
         # every rank keeps rank 0's verdict: each trims its KV and seeds its next step by it, so
@@ -795,8 +786,7 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         verdict = self._broadcast(torch.cat([target, accepted[:, None]], 1))
         target, accepted = verdict[:, :block].contiguous(), verdict[:, block]
         self._stage_verdict(engine_inputs, verdict, mtp_seq)
-        with self._dsa_use(dsa_ctx):
-            h_head, _ = lm.mtp(embed(target.view(-1)), hidden, position_ids + 1)
+        h_head, _ = lm.mtp(embed(target.view(-1)), hidden, position_ids + 1)
         at = torch.arange(n, device=accepted.device) * block + accepted
         next_input = target.view(-1).index_select(0, at)
         self._mtp_seed(mtp_slots, h_head.index_select(0, at), next_input)
