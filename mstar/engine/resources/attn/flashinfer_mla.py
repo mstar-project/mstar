@@ -26,14 +26,7 @@ from mstar.engine.resources.attn.base import (
 from mstar.engine.resources.attn.config import AttentionStep
 from mstar.engine.resources.attn.workspace import Workspace, WorkspacePool
 from mstar.engine.resources.base import CGSlotKey
-from mstar.engine.resources.context_parallel import (
-    ContextParallel,
-    ContextParallelWrapper,
-    one_slot_pages,
-    padded_share,
-    zigzag_capture,
-    zigzag_share,
-)
+from mstar.engine.resources.context_parallel import ContextParallel, one_slot_pages
 from mstar.engine.resources.kv.config import KVConfig, KVLayout
 from mstar.engine.resources.kv.plan import KVPlanOutputs
 from mstar.engine.resources.step import (
@@ -362,9 +355,7 @@ class FlashInferMLAManager(AttentionManager):
     def _bind_placement(self, placement: ContextParallel) -> None:
         # the latent is every TP rank's, so under TP placement it is attended for every partner's heads
         cfg = self._kv_config
-        self._wrapper_kwargs.update(
-            ContextParallelWrapper.local_geometry(placement, cfg.tokens_per_page, cfg.num_qo_heads),
-        )
+        self._wrapper_kwargs.update(self._placed.local_geometry(placement, cfg.tokens_per_page, cfg.num_qo_heads))
         # the merge reads the natural-log lse fa2 and fa3 are known to return (`AttentionManager.build`
         # refuses the others); under auto a plan they refuse would fall through to another backend
         if self._wrapper_kwargs["backend"] == "auto" and torch.device(self._device).type == "cuda":
@@ -514,25 +505,16 @@ class FlashInferMLAManager(AttentionManager):
         """Whether each label's plans over ``rows`` (label -> queries, a request each) stay within
         the FA planner's work-item cap: its context's, and under SP placement every partner's
         zigzag share of its own tokens, padded as a capture of ``captured_tokens`` pads it."""
-        heads, size = self._wrapper_kwargs["num_qo_heads"], self._placement.size
+        heads = self._wrapper_kwargs["num_qo_heads"]
         for label in {label for row in rows for label in row}:
             qo = np.cumsum([0, *(row[label] for row in rows if label in row)])
-            plans = [qo]
-            if self._placement.over_sp:
-                shares = [zigzag_share(qo, size, index) for index in range(size)]
-                if captured_tokens is not None:
-                    shape = zigzag_capture(size, len(qo) - 1, captured_tokens)
-                    shares = [padded_share(share, *shape) for share in shares]
-                plans += shares
+            plans = self._placed.rank_plans(self._placement, qo, captured_tokens)
             if any(fa_work_items_bound(plan, heads, self._fa_sm_count) > _FA_MAX_WORK_ITEMS for plan in plans):
                 return False
         return True
 
     def _cap_hint(self) -> str:
-        if self._placement.over_sp:
-            return ""
-        return (f" Under TP placement each rank plans every partner's query heads, so a step reaches the cap "
-                f"{self._placement.size}x sooner; placing positions over SP ranks avoids that.")
+        return self._placed.cap_hint(self._placement)
 
     def plan(self, step: AttentionStep, ctx: StepContext):
         if step.context_only and self._placement is not None:

@@ -22,7 +22,7 @@ from mstar.engine.resources.kv.keys import fingerprint
 from mstar.platforms import current_platform
 
 if TYPE_CHECKING:
-    from mstar.engine.resources.context_parallel import ContextParallel
+    from mstar.engine.resources.context_parallel import ContextParallel, ContextParallelWrapper
 
 logger = logging.getLogger(__name__)
 _BACKEND_KV_CONFIG: dict[AttnBackend, type[KVConfig]] = {
@@ -47,8 +47,9 @@ def resolve_attn_backend(backend: AttnBackend, device: torch.device) -> AttnBack
 
 class AttentionManager(AttentionResource):
     prefix_skip_safe = True
-    # the KV pool's placement (`bind_dependencies`)
+    # the KV pool's placement, and the attention it takes (`bind_dependencies`)
     _placement: "ContextParallel | None" = None
+    _placed: "type[ContextParallelWrapper] | None" = None
     # a backend's refusal of a placed plan its planner may refuse on one rank alone
     # (`ContextParallelWrapper`'s ``check``)
     _plan_check = None
@@ -62,9 +63,16 @@ class AttentionManager(AttentionResource):
         return {self._kv_cache_name}
 
     def bind_dependencies(self, resources) -> None:
+        from mstar.engine.resources.context_parallel import (
+            SPContextParallelWrapper,
+            TPContextParallelWrapper,
+            TPPlacement,
+        )
+
         placement = resources[self._kv_cache_name].placement
         if placement is not None:
             self._placement = placement
+            self._placed = TPContextParallelWrapper if isinstance(placement, TPPlacement) else SPContextParallelWrapper
             self._bind_placement(placement)
 
     def _bind_placement(self, placement: "ContextParallel") -> None:
@@ -98,25 +106,10 @@ class AttentionManager(AttentionResource):
         wrapper keeps its plan in an int workspace of its own, and uses this one only for the
         split-KV partials of a ``run``, which it merges within that ``run``; the two run one after
         the other on one stream."""
-        from mstar.engine.resources.context_parallel import ContextParallelWrapper, ZigzagWrapper
-
         workspace = self._workspaces.get(label, slot)
         context = self._context_wrapper(workspace, decode, kwargs, max_total_tokens)
-        if decode:
-            new = None
-        elif self._placement.over_sp:
-            # SP partners hold the same heads, so each attends its zigzag share of the own tokens, on
-            # the context's kernel over pages of one slot
-            def paged(max_total_tokens=None, **captured):
-                return self._context_wrapper(workspace, False, {**kwargs, **captured, "page_size": 1}, max_total_tokens)
-
-            new = ZigzagWrapper(
-                self._placement, paged, self._query_parts, self._device, self._dtype,
-                kwargs.get("batch_size") or 0, max_total_tokens or 0, check=self._plan_check,
-            )
-        else:
-            new = self._own_tokens_wrapper(workspace, kwargs, max_total_tokens)
-        return ContextParallelWrapper(
+        new = None if decode else self._placed.own_tokens(self, workspace, kwargs, max_total_tokens)
+        return self._placed(
             self._placement, self._kv_config.tokens_per_page, self._dtype, context, new, self._device,
             kwargs.get("batch_size"), max_total_tokens, check=self._plan_check,
         )

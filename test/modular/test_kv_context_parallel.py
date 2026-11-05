@@ -34,9 +34,9 @@ from mstar.engine.resources.attn.base import AttentionManager
 from mstar.engine.resources.attn.config import AttentionConfig, AttentionSpec, AttentionStep, AttnBackend
 from mstar.engine.resources.base import EngineResourceInfo, Resource
 from mstar.engine.resources.context_parallel import (
-    ContextParallel,
-    ContextParallelWrapper,
+    SPPlacement,
     ZigzagWrapper,
+    local_indptrs,
     merge,
     zigzag_rows,
     zigzag_share,
@@ -273,7 +273,7 @@ def test_an_sp_placed_node_shards_heads_over_tp_and_refuses_a_dependent_without_
     assert engine._resources["dependent"].info.head_shards == 1 and engine._submodules[NODE].head_shards == 1
     assert (kv_spec.config.num_kv_heads, kv_spec.config.num_qo_heads) == heads
     placement = engine._resources[KV_CACHE].placement
-    assert (placement.size, placement.index, placement.over_sp) == (P, 0, True)
+    assert isinstance(placement, SPPlacement) and (placement.size, placement.index) == (P, 0)
     assert engine._resources[KV_CACHE].kv_cache.page_slots == kv_spec.config.tokens_per_page // P
     # built by hand, as a harness does, with a node's info told nothing about the placement: a
     # resource over the sharded pool that shards it another way is refused
@@ -336,7 +336,7 @@ def _reference(q, k, v, causal=True):
 def _reference_flashinfer() -> types.ModuleType:
     """FlashInfer's paged prefill/decode and ragged wrappers as dense torch math on CPU, with
     their lse bases. A paged plan refuses a row FlashInfer's split-KV planner would miscount: no
-    pages, or a last page holding no slot (see ``ContextParallelWrapper.local_indptrs``). The ragged one
+    pages, or a last page holding no slot (see ``local_indptrs``). The ragged one
     reads keys past each row's end as FA3 does."""
     fi = types.ModuleType("flashinfer")
 
@@ -694,7 +694,7 @@ def test_captured_zigzag_shares_replan_in_place_and_merge_to_attention_over_a_la
 
     wrappers = [
         ZigzagWrapper(
-            ContextParallel(P, index, CommGroup.trivial(), True, tuple(range(P))), paged, 1, CPU, torch.float32,
+            SPPlacement(P, index, CommGroup.trivial()), paged, 1, CPU, torch.float32,
             rows, tokens,
         )
         for index in range(P)
@@ -959,8 +959,7 @@ def test_mla_ranks_refuse_the_same_steps_past_the_fa_planners_work_item_cap(monk
         # the context lengths each rank plans
         indptrs = case.plan["main"].cpu_indptrs
         lens = [
-            ContextParallelWrapper.local_indptrs(place, indptrs.context_only(CP_PAGE), CP_PAGE)[0].kv_lens.tolist()
-            for _, place in ranks
+            local_indptrs(place, indptrs.context_only(CP_PAGE), CP_PAGE)[0].kv_lens.tolist() for _, place in ranks
         ]
         assert lens[0] != lens[1]
         decisions = []

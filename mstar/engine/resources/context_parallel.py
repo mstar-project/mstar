@@ -12,7 +12,9 @@ exactly.
 """
 
 import math
+from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable, Sequence
+from dataclasses import dataclass
 from typing import NamedTuple
 
 import numpy as np
@@ -24,22 +26,17 @@ from mstar.engine.resources.spec import NodeResourceSpec
 from mstar.utils.h2d import PinnedStager, to_device_nonblocking
 
 
-class ContextParallel(NamedTuple):
-    """This rank's place in its KV pool's placement.
-
-    Under SP placement the partners are the whole SP group. Under TP placement they are a block of
-    the TP group (the ranks sharing one KV head), and the exchange is an all-to-all over the whole
-    TP group with nothing sent to the ranks outside the block, so no group of its own is needed."""
+@dataclass(frozen=True)
+class ContextParallel:
+    """This rank's place in its KV pool's placement: which of a page's logical slots it stores.
+    ``SPPlacement`` or ``TPPlacement`` says over which ranks."""
 
     # P: how many partners each page's slots stripe over
     size: int
     # r: this rank owns the logical slots s with s % P == r
     index: int
-    # what the partners exchange over: the SP group in SP mode, the TP group in TP mode
+    # what the partners exchange over
     group: CommGroup
-    over_sp: bool
-    # the partners' ranks in ``group``, in partner-index order
-    partners: tuple[int, ...]
 
     def slot_range(self, start: int, end: int) -> tuple[int, int]:
         """The physical slots of a page holding this rank's share of logical slots ``[start, end)``."""
@@ -56,6 +53,55 @@ class ContextParallel(NamedTuple):
             where, pages, offsets = np.where, np.asarray(pages), np.asarray(offsets)
         owned = offsets % self.size == self.index
         return where(owned, pages, SINK_PAGE), where(owned, offsets // self.size, 0)
+
+
+@dataclass(frozen=True)
+class SPPlacement(ContextParallel):
+    """Placed over the node's SP group, whose ranks hold the same heads: the partners are the whole
+    group, in rank order (``SPContextParallelWrapper``)."""
+
+
+@dataclass(frozen=True)
+class TPPlacement(ContextParallel):
+    """Placed over the block of the node's TP ranks that hold one KV head, each with different query
+    heads of it (``TPContextParallelWrapper``). The exchange is an all-to-all over the whole TP
+    group with nothing sent to the ranks outside the block, so no group of its own is needed."""
+
+    # the partners' ranks in ``group``, in partner-index order
+    partners: tuple[int, ...]
+
+
+def local_indptrs(placement: ContextParallel, indptrs: PagedIndptrs, page_size: int) -> tuple[PagedIndptrs, np.ndarray]:
+    """A plan's logical paged indptrs as this rank's (``page_size`` the logical one), and per row
+    whether it holds any of this rank's slots.
+
+    Every row keeps a length of at least 1 and a last page holding at least one slot, as on one
+    rank: FlashInfer's split-KV planner counts a row's pages where its kernel counts its tokens,
+    and a last page with none of this rank's slots puts the two out of step. Such a page is
+    dropped from its row. A row with no slot here attends one slot of SINK_PAGE instead, and its
+    partial is masked before the merge (``_masked``)."""
+    size, index = placement.size, placement.index
+    kvp = indptrs.paged_kv_indptr.numpy().astype(np.int64)
+    npages = np.diff(kvp)
+    # this rank's slots in each row's last page, and its KV length
+    slots = page_size // size
+    last = np.clip((indptrs.paged_kv_last_page_len.numpy() - index + size - 1) // size, 0, slots)
+    lens = np.where(npages > 0, (npages - 1) * slots + last, 0)
+    valid = lens > 0
+    drop = valid & (last == 0)
+    kv_indptr, indices = indptrs.paged_kv_indptr, indptrs.paged_kv_indices
+    if drop.any() or not valid.all():
+        new_kvp, out = first_pages(kvp, indices.numpy(), np.where(valid, npages - drop, 0), fill=SINK_PAGE)
+        last = np.where(valid, np.where(drop, slots, last), 1)
+        lens = np.where(valid, lens, 1)
+        kv_indptr, indices = torch.from_numpy(new_kvp.astype(np.int32)), torch.from_numpy(out)
+    return PagedIndptrs(
+        qo_indptr=indptrs.qo_indptr,
+        paged_kv_indptr=kv_indptr,
+        paged_kv_indices=indices,
+        paged_kv_last_page_len=torch.from_numpy(last.astype(np.int32)),
+        kv_lens=torch.from_numpy(lens.astype(np.int32)).as_subclass(HostLens),
+    ), valid
 
 
 def _masked(out: torch.Tensor, lse: torch.Tensor, valid: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -77,70 +123,19 @@ def _unpack(packed: torch.Tensor, dtype: torch.dtype) -> tuple[torch.Tensor, tor
     return packed[..., :-4].view(dtype), packed[..., -4:].view(torch.float32).squeeze(-1)
 
 
-def _gather_partials(group: CommGroup, out: torch.Tensor, lse: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Every rank of ``group``'s ``(out, lse)`` for the same queries, stacked on a new first dim."""
-    return _unpack(group.all_gather(_pack(out, lse).unsqueeze(0), dim=0), out.dtype)
-
-
-class ContextParallelWrapper:
+class ContextParallelWrapper(ABC):
     """A step's attention over a placed pool from a backend's two wrappers: each rank attends its
-    own slots, and the partners exchange the partials and merge them. A one-token-a-row step
+    own slots, and the partners exchange the partials and merge them, as its placement's subclass
+    does (``TPContextParallelWrapper``, ``SPContextParallelWrapper``). A one-token-a-row step
     attends the pages after its write (``new`` None); any other step attends its stored context
     (not causal) on ``context`` and its own tokens, from the keys the layer passes to ``run``, on
-    ``new``: under TP placement all of them for this rank's heads, under SP placement this rank's
-    zigzag chunks (``ZigzagWrapper``). ``page_size`` is the logical one.
+    ``new``. ``page_size`` is the logical one.
 
     ``check(what, qo_indptr)``, before anything is planned, is the backend's refusal of a plan its
     kernel's planner may refuse on one rank of the lockstep instance alone. It sees every plan whose
     lengths differ by rank: the context's here, and under SP placement every partner's zigzag share
     of the own tokens (``ZigzagWrapper``). TP mode's own-token plan has the same lengths on every
     rank, so a refusal of it is symmetric already."""
-
-    @staticmethod
-    def local_geometry(placement: ContextParallel, page_size: int, num_qo_heads: int) -> dict[str, int]:
-        """A paged attention wrapper's ``page_size`` and ``num_qo_heads`` over this rank's slots: the
-        slots a page it stores, and under TP placement every partner's query heads, which it attends
-        for them (``_exchange_queries``)."""
-        return dict(
-            page_size=page_size // placement.size,
-            num_qo_heads=num_qo_heads * (1 if placement.over_sp else placement.size),
-        )
-
-    @staticmethod
-    def local_indptrs(
-        placement: ContextParallel, indptrs: PagedIndptrs, page_size: int,
-    ) -> tuple[PagedIndptrs, np.ndarray]:
-        """A plan's logical paged indptrs as this rank's (``page_size`` the logical one), and per row
-        whether it holds any of this rank's slots.
-
-        Every row keeps a length of at least 1 and a last page holding at least one slot, as on one
-        rank: FlashInfer's split-KV planner counts a row's pages where its kernel counts its tokens,
-        and a last page with none of this rank's slots puts the two out of step. Such a page is
-        dropped from its row. A row with no slot here attends one slot of SINK_PAGE instead, and its
-        partial is masked before the exchange (``_exchange_partials``)."""
-        size, index = placement.size, placement.index
-        kvp = indptrs.paged_kv_indptr.numpy().astype(np.int64)
-        npages = np.diff(kvp)
-        # this rank's slots in each row's last page, and its KV length
-        slots = page_size // size
-        last = np.clip((indptrs.paged_kv_last_page_len.numpy() - index + size - 1) // size, 0, slots)
-        lens = np.where(npages > 0, (npages - 1) * slots + last, 0)
-        valid = lens > 0
-        drop = valid & (last == 0)
-        kv_indptr, indices = indptrs.paged_kv_indptr, indptrs.paged_kv_indices
-        if drop.any() or not valid.all():
-            new_kvp, out = first_pages(kvp, indices.numpy(), np.where(valid, npages - drop, 0), fill=SINK_PAGE)
-            last = np.where(valid, np.where(drop, page_size // size, last), 1)
-            lens = np.where(valid, lens, 1)
-            kv_indptr, indices = torch.from_numpy(new_kvp.astype(np.int32)), torch.from_numpy(out)
-        return PagedIndptrs(
-            qo_indptr=indptrs.qo_indptr,
-            paged_kv_indptr=kv_indptr,
-            paged_kv_indices=indices,
-            paged_kv_last_page_len=torch.from_numpy(last.astype(np.int32)),
-            kv_lens=torch.from_numpy(lens.astype(np.int32)).as_subclass(HostLens),
-        ), valid
-
 
     def __init__(
         self,
@@ -193,7 +188,7 @@ class ContextParallelWrapper:
             qo = context.qo_indptr
             own = None if real_rows is None else _leading_rows(kv_out, real_rows)
             self.new.plan(qo if own is None else qo[: own + 1], causal=causal)
-        local, valid_rows = self.local_indptrs(self._placement, context, self._page_size)
+        local, valid_rows = local_indptrs(self._placement, context, self._page_size)
         if kv_out.cpu_indptrs.paged_kv_indices.is_pinned() and not local.paged_kv_indices.is_pinned():
             # page-locked plan indices (MSTAR_KV_PINNED_INDPTRS) stay page-locked once trimmed, so
             # FlashInfer copies them asynchronously on every rank alike, whichever rows a rank trims
@@ -230,6 +225,26 @@ class ContextParallelWrapper:
             grown = 2 * (0 if self._pinned_indices is None else len(self._pinned_indices))
             self._pinned_indices = torch.empty(max(n, grown, 256), dtype=torch.int32, pin_memory=True)
         return self._pinned_indices[:n].copy_(indices)
+
+    @staticmethod
+    @abstractmethod
+    def local_geometry(placement: ContextParallel, page_size: int, num_qo_heads: int) -> dict[str, int]:
+        """A paged attention wrapper's ``page_size`` and ``num_qo_heads`` over this rank's slots."""
+
+    @classmethod
+    @abstractmethod
+    def own_tokens(cls, backend, workspace: torch.Tensor, kwargs: dict, max_total_tokens: int | None):
+        """The part a multi-token step attends its own tokens on, from ``backend``'s kernels:
+        ``run(*queries, *keys, return_lse=True)``, out 0 and lse -inf on any token it doesn't
+        attend."""
+
+    @staticmethod
+    @abstractmethod
+    def rank_plans(placement: ContextParallel, qo_indptr: np.ndarray, captured_tokens: int | None) -> list:
+        """The ``qo_indptr`` of every plan a step of ``qo_indptr``'s rows makes on some rank of the
+        placement, whose lengths differ by rank, padded as a capture of ``captured_tokens`` pads
+        them: what admission bounds, so every rank refuses alike."""
+
     def attend(
         self, queries: tuple[torch.Tensor, ...], kv_cache_layer: torch.Tensor,
         new_keys: tuple[torch.Tensor | None, ...],
@@ -245,57 +260,15 @@ class ContextParallelWrapper:
                 "a row and got none"
             )
         new = None if self.new is None else self.new.run(*queries, *new_keys, return_lse=True)
-        placement = self._placement
-        if placement.over_sp:
-            # SP partners hold the same heads: this rank's slots' partial merged with its share of the
-            # own tokens, rounded back to the partial's dtype for the one gather
-            out, lse = self.context.run(*queries, kv_cache_layer, return_lse=True)
-            out, lse = _masked(out, lse, self._valid[: queries[0].shape[0]])
-            if new is not None:
-                merged, lse = _merged((out, new[0]), torch.stack([lse, new[1]]), with_lse=True)
-                out = merged.to(out.dtype)
-            return gather_merge(placement.group, out, lse).to(queries[0].dtype)
-        parts = self._exchange_queries(queries)
-        # over this rank's slots, with the rows holding any of them
-        out, lse = self.context.run(*parts, kv_cache_layer, return_lse=True)
-        outs, lses = self._exchange_partials(out, lse, self._valid[: parts[0].shape[0]])
-        if new is not None:
-            outs = torch.cat([outs, new[0].to(outs.dtype).unsqueeze(0)])
-            lses = torch.cat([lses, new[1].float().unsqueeze(0)])
-        return merge(outs, lses).to(queries[0].dtype)
+        return self._merged_over_ranks(queries, kv_cache_layer, new).to(queries[0].dtype)
 
-    def _exchange_queries(self, queries: tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, ...]:
-        """The query parts this rank attends its slots for, from its own (each ``[N, H, *]``). SP
-        partners hold the same heads, so they are its own; TP partners hold different query heads
-        of one KV head, so each gets every partner's, ``[N, P * H, *]`` partner-major, the parts
-        sent as one tensor."""
-        placement = self._placement
-        if placement.over_sp:
-            return queries
-        q = (queries[0] if len(queries) == 1 else torch.cat(queries, dim=-1)).unsqueeze(0)
-        if placement.size == placement.group.world_size:
-            # every rank of the group is a partner (MLA's always are): the same block goes to each
-            q = placement.group.all_gather(q.contiguous(), dim=0)
-        else:
-            q = placement.group.to_partners(q.expand(placement.size, *q.shape[1:]), placement.partners)
-        return q.transpose(0, 1).flatten(1, 2).split([part.shape[-1] for part in queries], dim=-1)
-
-    def _exchange_partials(
-        self, out: torch.Tensor, lse: torch.Tensor, valid: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Every partner's partial for this rank's heads, ``[P, N, H, D]`` in ``out``'s dtype and
-        ``[P, N, H]`` fp32, to ``merge``; from this rank's ``out`` ``[N, H', D]`` and natural-log
-        ``lse`` ``[N, H']`` over its slots, for the heads ``_exchange_queries`` returned. A query row
-        ``valid`` (``[N]``) marks as holding none of this rank's slots goes out as out 0, lse -inf,
-        whatever the kernel left there (a select, so a NaN cannot survive)."""
-        placement = self._placement
-        out = torch.where(valid[:, None, None], out, 0)
-        lse = torch.where(valid[:, None], lse.float(), -math.inf)
-        if placement.over_sp:
-            return _gather_partials(placement.group, out, lse)
-        heads = out.shape[1] // placement.size
-        blocks = _pack(out, lse).unflatten(1, (placement.size, heads)).transpose(0, 1)
-        return _unpack(placement.group.to_partners(blocks, placement.partners), out.dtype)
+    @abstractmethod
+    def _merged_over_ranks(
+        self, queries: tuple[torch.Tensor, ...], kv_cache_layer: torch.Tensor,
+        new: tuple[torch.Tensor, torch.Tensor] | None,
+    ) -> torch.Tensor:
+        """This rank's slots' partial for ``queries``, exchanged with the partners' and merged with
+        ``new``, the own tokens' ``(out, lse)``."""
 
     def forget_plan(self) -> None:
         """Replan the own-token wrapper on the next ``plan`` whatever its layout, for a dropped
@@ -318,6 +291,118 @@ def _leading_rows(kv_out, real_rows: frozenset) -> int | None:
         raise ValueError(f"a padding row comes before a real one in a plan of rows {rids}")
     return n if 0 < n < len(rids) else None
 
+
+class TPContextParallelWrapper(ContextParallelWrapper):
+    """Attention over a ``TPPlacement``: the partners hold different query heads of one KV head, so
+    each attends its slots for every partner's heads (``_exchange_queries``), sends each partner its
+    heads' partial back (``_exchange_partials``), and merges them with the own tokens, which it
+    attends whole for its own heads."""
+
+    _placement: TPPlacement
+
+    @staticmethod
+    def local_geometry(placement: TPPlacement, page_size: int, num_qo_heads: int) -> dict[str, int]:
+        """The slots a page this rank stores, and every partner's query heads, which it attends for
+        them."""
+        return dict(page_size=page_size // placement.size, num_qo_heads=num_qo_heads * placement.size)
+
+    @classmethod
+    def own_tokens(cls, backend, workspace: torch.Tensor, kwargs: dict, max_total_tokens: int | None):
+        return backend._own_tokens_wrapper(workspace, kwargs, max_total_tokens)
+
+    @staticmethod
+    def rank_plans(placement: TPPlacement, qo_indptr: np.ndarray, captured_tokens: int | None) -> list:
+        # the own tokens' plan has the same lengths on every rank
+        return [qo_indptr]
+
+    @staticmethod
+    def cap_hint(placement: TPPlacement) -> str:
+        """Why a planner's per-rank work cap comes sooner here than over SP ranks."""
+        return (f" Under TP placement each rank plans every partner's query heads, so a step reaches the cap "
+                f"{placement.size}x sooner; placing positions over SP ranks avoids that.")
+
+    def _merged_over_ranks(self, queries, kv_cache_layer, new):
+        parts = self._exchange_queries(queries)
+        # over this rank's slots, with the rows holding any of them
+        out, lse = self.context.run(*parts, kv_cache_layer, return_lse=True)
+        outs, lses = self._exchange_partials(out, lse, self._valid[: parts[0].shape[0]])
+        if new is not None:
+            outs = torch.cat([outs, new[0].to(outs.dtype).unsqueeze(0)])
+            lses = torch.cat([lses, new[1].float().unsqueeze(0)])
+        return merge(outs, lses)
+
+    def _exchange_queries(self, queries: tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, ...]:
+        """The query parts this rank attends its slots for, from its own (each ``[N, H, *]``): every
+        partner's, ``[N, P * H, *]`` partner-major, the parts sent as one tensor."""
+        placement = self._placement
+        q = (queries[0] if len(queries) == 1 else torch.cat(queries, dim=-1)).unsqueeze(0)
+        if placement.size == placement.group.world_size:
+            # every rank of the group is a partner (MLA's always are): the same block goes to each
+            q = placement.group.all_gather(q.contiguous(), dim=0)
+        else:
+            q = placement.group.to_partners(q.expand(placement.size, *q.shape[1:]), placement.partners)
+        return q.transpose(0, 1).flatten(1, 2).split([part.shape[-1] for part in queries], dim=-1)
+
+    def _exchange_partials(
+        self, out: torch.Tensor, lse: torch.Tensor, valid: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Every partner's partial for this rank's heads, ``[P, N, H, D]`` in ``out``'s dtype and
+        ``[P, N, H]`` fp32, to ``merge``; from this rank's ``out`` ``[N, H', D]`` and natural-log
+        ``lse`` ``[N, H']`` over its slots, for the heads ``_exchange_queries`` returned, masked by
+        ``valid`` (``_masked``)."""
+        placement = self._placement
+        out, lse = _masked(out, lse, valid)
+        heads = out.shape[1] // placement.size
+        blocks = _pack(out, lse).unflatten(1, (placement.size, heads)).transpose(0, 1)
+        return _unpack(placement.group.to_partners(blocks, placement.partners), out.dtype)
+
+
+class SPContextParallelWrapper(ContextParallelWrapper):
+    """Attention over an ``SPPlacement``: the partners hold the same heads, so each attends its own
+    slots and its zigzag share of the own tokens (``ZigzagWrapper``) for its own queries, merges the
+    two, and one gather merges every partner's."""
+
+    _placement: SPPlacement
+
+    @staticmethod
+    def local_geometry(placement: SPPlacement, page_size: int, num_qo_heads: int) -> dict[str, int]:
+        """The slots a page this rank stores; its own query heads."""
+        return dict(page_size=page_size // placement.size, num_qo_heads=num_qo_heads)
+
+    @classmethod
+    def own_tokens(cls, backend, workspace: torch.Tensor, kwargs: dict, max_total_tokens: int | None):
+        # each attends its zigzag share of the own tokens, on the context's kernel over pages of one slot
+        def paged(max_total_tokens=None, **captured):
+            return backend._context_wrapper(workspace, False, {**kwargs, **captured, "page_size": 1}, max_total_tokens)
+
+        return ZigzagWrapper(
+            backend._placement, paged, backend._query_parts, backend._device, backend._dtype,
+            kwargs.get("batch_size") or 0, max_total_tokens or 0, check=backend._plan_check,
+        )
+
+    @staticmethod
+    def rank_plans(placement: SPPlacement, qo_indptr: np.ndarray, captured_tokens: int | None) -> list:
+        # and every partner's zigzag share of the own tokens, which differ by rank
+        shares = [zigzag_share(qo_indptr, placement.size, index) for index in range(placement.size)]
+        if captured_tokens is not None:
+            shape = zigzag_capture(placement.size, len(qo_indptr) - 1, captured_tokens)
+            shares = [padded_share(share, *shape) for share in shares]
+        return [qo_indptr, *shares]
+
+    @staticmethod
+    def cap_hint(placement: SPPlacement) -> str:
+        return ""
+
+    def _merged_over_ranks(self, queries, kv_cache_layer, new):
+        # this rank's slots' partial merged with its share of the own tokens, rounded back to the
+        # partial's dtype for the one gather: one rounding more than TP placement's, at the floor a
+        # bf16 partial carries already; gathering the fp32 merge would double the gather's bytes
+        out, lse = self.context.run(*queries, kv_cache_layer, return_lse=True)
+        out, lse = _masked(out, lse, self._valid[: queries[0].shape[0]])
+        if new is not None:
+            merged, lse = _merged((out, new[0]), torch.stack([lse, new[1]]), with_lse=True)
+            out = merged.to(out.dtype)
+        return gather_merge(self._placement.group, out, lse)
 
 
 class ZigzagRows(NamedTuple):

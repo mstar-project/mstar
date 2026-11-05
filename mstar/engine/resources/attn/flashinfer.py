@@ -24,7 +24,7 @@ from mstar.engine.resources.attn.wrappers import (
     fmha_decode_applies,
 )
 from mstar.engine.resources.base import CGSlotKey
-from mstar.engine.resources.context_parallel import ContextParallel, ContextParallelWrapper
+from mstar.engine.resources.context_parallel import ContextParallel
 from mstar.engine.resources.kv.config import PagedKVConfig
 from mstar.engine.resources.kv.plan import KVPlanOutputs
 from mstar.engine.resources.spec import CombinedSplit
@@ -104,7 +104,12 @@ class FlashInferManager(AttentionManager):
         self._workspaces = WorkspacePool(device, owner=kv_cache)
 
     def _bind_placement(self, placement: ContextParallel) -> None:
-        if not self._decode_tensor_cores and not placement.over_sp:
+        cfg = self._kv_config
+        geometry = self._placed.local_geometry(placement, cfg.tokens_per_page, cfg.num_qo_heads)
+        if geometry["num_qo_heads"] != cfg.num_qo_heads and not self._decode_tensor_cores:
+            # a rank attending every partner's query heads over its one KV head (TP placement) forms
+            # a GQA group FlashInfer's CUDA-core decode can have no kernel for
+            self._decode_tensor_cores = True
             logger.info(
                 "attention over context-parallel KV pool %r decodes on tensor cores although "
                 "decode_tensor_cores is off: a TP-placed rank's query heads over its one KV head can form "
@@ -124,10 +129,7 @@ class FlashInferManager(AttentionManager):
                     "attention over context-parallel KV pool %r plans on fa2 for flashinfer_backend 'auto'",
                     self._kv_cache_name,
                 )
-        cfg = self._kv_config
-        self._wrapper_kv_kwargs.update(
-            ContextParallelWrapper.local_geometry(placement, cfg.tokens_per_page, cfg.num_qo_heads),
-        )
+        self._wrapper_kv_kwargs.update(geometry)
         self._new_kwargs = dict(
             num_qo_heads=cfg.num_qo_heads, num_kv_heads=cfg.num_kv_heads, head_dim=cfg.head_dim,
             device=self._device, backend=self._wrapper_kv_kwargs["backend"], q_data_type=self._dtype,
@@ -283,10 +285,10 @@ class FlashInferManager(AttentionManager):
 
     def _context_wrapper(self, workspace, decode, kwargs, max_total_tokens):
         if decode:
-            # under TP placement a rank attends every partner's query heads over one KV head, a GQA
-            # group FlashInfer's CUDA-core decode may have no kernel for
-            tensor_cores = self._decode_tensor_cores or not self._placement.over_sp
-            return FlashInferDecodeWrapper(workspace_buffer=workspace, use_tensor_cores=tensor_cores, **kwargs)
+            # on tensor cores under TP placement (`_bind_placement`)
+            return FlashInferDecodeWrapper(
+                workspace_buffer=workspace, use_tensor_cores=self._decode_tensor_cores, **kwargs,
+            )
         return FlashInferPrefillWrapper(workspace_buffer=workspace, max_total_tokens=max_total_tokens, **kwargs)
 
     def _own_tokens_wrapper(self, workspace, kwargs, max_total_tokens):
