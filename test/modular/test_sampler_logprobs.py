@@ -84,6 +84,14 @@ def _argmax_draw(monkeypatch):
     monkeypatch.setattr(utils, "sample_accelerator_graphable_gpu", lambda logits, *a, **kw: logits.argmax(-1))
 
 
+def _ingest(res: SamplerResource, rid: int, cfg: SamplingReqConfig) -> None:
+    """As the runner admits a request: with the in-graph scatter, its sampler
+    row is taken at admission."""
+    res.ingest_request(rid, cfg)
+    if res._cg_buffers is not None and res._cg_buffers.ingraph_scatter:
+        assert res.reserve(rid, "n", "decode", None) is None
+
+
 def _resource(graph: bool = False, enable: bool = True) -> SamplerResource:
     res = SamplerResource(
         vocab_size=None, enable_repetion_penalty=False, device=torch.device("cpu"),
@@ -151,8 +159,8 @@ def test_a_node_without_the_capability_refuses_at_ingest():
 
 def test_the_graph_sampler_writes_a_row_per_padded_slot_row():
     res = _resource(graph=True)
-    res.ingest_request(0, SamplingReqConfig(temperature=0.5, return_logprobs=True))
-    res.ingest_request(1, SamplingReqConfig(temperature=0.5))
+    _ingest(res, 0, SamplingReqConfig(temperature=0.5, return_logprobs=True))
+    _ingest(res, 1, SamplingReqConfig(temperature=0.5))
     logits = torch.cat([_logits(), _logits()[:1]])  # the bucket's 4 rows
 
     rows = _step(res, [0, 1], logits, padded_bs=4)[SAMPLED_LOGPROB]
@@ -164,14 +172,14 @@ def test_the_graph_sampler_writes_a_row_per_padded_slot_row():
 
 def test_a_recycled_slot_does_not_inherit_the_previous_requests_flag():
     res = _resource(graph=True)
-    res.ingest_request(0, SamplingReqConfig(temperature=1.0, return_logprobs=True))
-    res.ingest_request(9, SamplingReqConfig(temperature=1.0, return_logprobs=True))
+    _ingest(res, 0, SamplingReqConfig(temperature=1.0, return_logprobs=True))
+    _ingest(res, 9, SamplingReqConfig(temperature=1.0, return_logprobs=True))
     logits = torch.cat([_logits(), _logits()[:1]])
     assert not _step(res, [0], logits, padded_bs=4)[SAMPLED_LOGPROB][0].isnan()
     slot = res._cg_buffers._rid_to_slot[0]
     res.remove_request(0)
 
-    res.ingest_request(1, SamplingReqConfig(temperature=1.0))
+    _ingest(res, 1, SamplingReqConfig(temperature=1.0))
     assert res._cg_buffers._rid_to_slot[1] == slot
     assert _step(res, [1], logits, padded_bs=4)[SAMPLED_LOGPROB][0].isnan()
 

@@ -42,6 +42,13 @@ def buffer_device(request):
     return torch.device(request.param)
 
 
+@pytest.fixture(autouse=True)
+def _scatter_after_replay(monkeypatch):
+    """The scatter after the replay, which commit runs: the in-graph one sends
+    a dropped row to the trash row inside the captured sample instead."""
+    monkeypatch.setenv("MSTAR_SAMPLER_INGRAPH_SCATTER", "0")
+
+
 def _resource(graph: bool, device: torch.device) -> SamplerResource:
     res = SamplerResource(
         vocab_size=V, enable_repetion_penalty=True, device=device,

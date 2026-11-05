@@ -198,7 +198,9 @@ class SamplerResource(Resource):
             tp_group=self._comm_group,
             vocab_size=self._vocab_size,
             cg_slots=self._cg_slots,
-            ingraph_scatter=self._keep_last_token and sampler_ingraph_scatter() and self._decides,
+            # every deciding sampler moves its own RNG offset rows in the graph,
+            # a node reading its tokens back or not
+            ingraph_scatter=sampler_ingraph_scatter() and self._decides,
             loopback_state=self._loopback_state,
             **self._scalar_options(),
         )
@@ -404,18 +406,19 @@ class SamplerResource(Resource):
     # slot; the rest by this sampler's own rows (`sampler/resident.py`).
 
     def repeat_refusal(self, walk: str, host_step=None) -> str | None:
-        """Replays need the offset and the last token to move in the graph, and
-        no per-step state outside it. Fixed at load, as `_cg_buffers` decides it."""
-        if not (self._keep_last_token and sampler_ingraph_scatter() and self._decides):
+        """Replays need the offset and the last token to move in the graph.
+        Fixed at load, as `_cg_buffers` decides it. What else a draw reads
+        moves in the graph too, each replay: the seen-token mask, the
+        repetition window and the ``min_tokens`` count, gathered once a step
+        and kept after its last replay."""
+        if not (sampler_ingraph_scatter() and self._decides):
             return "it scatters its RNG offsets and last tokens outside the graph"
-        if self._history is not None:
-            return "its repetition window is kept per step outside the graph"
         return None
 
     def max_repeats(self, step, ctx) -> int:
-        """1 while a request on the pool wants a penalty or log-probs, or for a
+        """1 while a request on the pool wants log-probs (one a step), or for a
         step whose rows don't all keep their draw."""
-        if self._penalty_live or self._logprob_rids or self._kept_rids_of(step, ctx) is not None:
+        if self._logprob_rids or self._kept_rids_of(step, ctx) is not None:
             return 1
         return ANY_REPEATS
 

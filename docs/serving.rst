@@ -336,13 +336,13 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        on), with no new rows, on one rank, for a Loop walk on resident tables or one
        planned on the host whose step keeps nothing, with a stop the runtime checks, and
        at most a KV page's worth of iterations. Each edge of the
-       node in its Loop must be one a run serves: a loop-back carried on the device, a
-       constant input, a Loop output, or the client's copy of the token. Its resources
-       can refuse the walk (``Resource.repeat_refusal``): FlashInfer decode other than
-       tensor-core (CUDA-core, fa3, cuDNN), a sampler with a repetition window, loop-back
-       state or no in-graph scatter. They can narrow a step to 1
-       (``Resource.max_repeats``), for every step on the node while a request with a
-       repetition penalty or log-probs is live. At startup the worker logs one line per
+       node in its Loop must be one a run serves: a loop-back (carried between replays),
+       a constant input, a Loop output, an iteration input, a stream window, or a
+       per-iteration output to the client, a stream or an accumulated output. Its
+       resources can refuse the walk (``Resource.repeat_refusal``): FlashInfer decode
+       other than tensor-core (CUDA-core, fa3, cuDNN), or a sampler without the in-graph
+       scatter. They can narrow a step to 1 (``Resource.max_repeats``), for every step on
+       the node while a request with log-probs is live. At startup the worker logs one line per
        Loop walk with each capability ``on``, ``off: not asked for``, or
        ``off: <owner>: <reason>``. A setting other than ``max`` on a node whose ``max`` is
        1, a name that is no node of the model, and an unknown setting fail loading.

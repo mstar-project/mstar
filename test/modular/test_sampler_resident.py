@@ -109,7 +109,7 @@ def _expected(cfg: SamplingReqConfig) -> tuple:
 class _Node:
     """A planner over a KV pool and a sampler, driven as the engine drives them."""
 
-    def __init__(self, max_bs: int, with_kv: bool = True, planner: bool = True):
+    def __init__(self, max_bs: int, with_kv: bool = True, planner: bool = True, loopback: bool = True):
         self.kv = None
         resources = {}
         if with_kv:
@@ -122,7 +122,8 @@ class _Node:
             self.kv._cg_max_seq_len = 64
             resources["kv"] = self.kv
         self.sampler = SamplerResource(vocab_size=V, enable_repetion_penalty=True, device=CPU)
-        self.sampler.enable_device_loopback_reader()
+        if loopback:
+            self.sampler.enable_device_loopback_reader()
         resources["sampler"] = self.sampler
         # as warmup does: the runners claim their buffers, then the planner binds
         self.sampler.build_accelerator_graph_buffers(
@@ -162,9 +163,13 @@ class _Node:
             self.tokens.setdefault(rid, []).append(token)
         return out
 
-    def decode(self, rids, slot: int = 0, bs: int | None = None, preplan: bool = True, kept=None):
+    def decode(
+        self, rids, slot: int = 0, bs: int | None = None, preplan: bool = True, kept=None, replays: int = 1,
+        draws: int = 1,
+    ):
         """One captured decode step: capture once per (bucket, slot), then pre-plan,
-        promote, read the loop-back tokens, flush, replay and commit."""
+        promote, read the loop-back tokens, flush, replay and commit. A step
+        that repeats replays ``replays`` times, each drawing ``draws`` times."""
         bs = bs or len(rids)
         padded = tuple(rids) + tuple(-(i + 1) for i in range(bs - len(rids)))
         bucket = BucketKey(graph_walk=WALK, bs=bs, num_tokens=bs)
@@ -209,7 +214,7 @@ class _Node:
             self.kv.plan(kv, ctx)
         self.sampler.plan(smp, ctx)
         assert self.sampler._cg_sampler is graph_sampler
-        ids = self.sampler.loopback_tokens(list(padded))
+        ids = self.sampler.loopback_tokens(list(padded)) if self.sampler.has_slot_masters else torch.zeros(bs)
         if self.planner is not None:
             self.planner.flush(ctx.resident_plan)
             # what the capture recorded: each owner's gathers (the sampler's cells), the sample
@@ -218,18 +223,22 @@ class _Node:
                     self.sampler._cells.gather(rec)
                 else:
                     owner.resident_gather(rec)
-        out = graph_sampler.sample(list(padded), torch.zeros(bs, V))
-        if self.planner is not None:
-            self.planner.commit_in_graph(rec)
+        n = len(rids)
+        for _ in range(replays):
+            for _ in range(draws):
+                out = graph_sampler.sample(
+                    list(padded), torch.zeros(bs, V), apply_penalty=self.sampler._apply_penalty_this_step,
+                )
+            if self.planner is not None:
+                self.planner.commit_in_graph(rec)
+            for rid, token in zip(rids, out[:n].tolist(), strict=True):
+                if kept is None or rid in kept:
+                    self.tokens.setdefault(rid, []).append(token)
         if kv is not None:
             self.kv.commit(kv, ctx)
         self.sampler.commit(smp, ctx)
         if self.planner is not None:
             self.planner.commit(step, ctx)
-        n = len(rids)
-        for rid, token in zip(rids, out[:n].tolist(), strict=True):
-            if kept is None or rid in kept:
-                self.tokens.setdefault(rid, []).append(token)
         return SimpleNamespace(ids=ids[:n].tolist(), ctx=ctx, out=out)
 
 
@@ -495,3 +504,37 @@ def test_the_cell_kernel_matches_the_torch_ops_under_capture():
     assert torch.equal(got.row.cpu(), want.row)
     for f in fields:
         assert want.views[f.name][1].item() == f.default
+
+
+# ---- steps that repeat ----
+
+def test_a_penalised_run_of_four_draws_as_four_steps_do(drawn, ingraph):
+    """A run replays its draws on one plan: the RNG offset and the seen-token
+    mask move in the graph, so four replays give the tokens, offsets and mask
+    four one-replay steps do, and a live penalty no longer holds a step to one."""
+    seen = []
+    for replays in (1, 4):
+        node = _Node(max_bs=2, with_kv=False)
+        node.ingest(1, _cfg(seed=1, penalty=1.3))
+        smp_ctx = StepContext(request_ids=(1,), graph_walk=WALK, slot=0, capture=False)
+        assert node.sampler.max_repeats(SamplerStep(), smp_ctx) > 4
+        for _ in range(4 // replays):
+            node.decode([1], replays=replays)
+        mask = node.sampler._sampler.get_token_mask(1)._seen_token_mask
+        seen.append((node.tokens[1], _offset(node, 1), mask.nonzero().flatten().tolist()))
+    assert seen[0] == seen[1]
+    assert len(set(seen[0][0])) > 1 and seen[0][1] == 4 * STRIDE and seen[0][2]
+
+
+def test_a_loop_back_free_sampler_drawing_fifteen_times_a_replay_may_repeat(drawn, monkeypatch):
+    """A second sampler of a node, one no loop-back reads (a code predictor's),
+    moves its own offsets in the graph too: its walk may repeat, and each of
+    its 15 draws a replay, in each of 4 replays, is fresh."""
+    monkeypatch.setenv("MSTAR_SAMPLER_INGRAPH_SCATTER", "1")
+    node = _Node(max_bs=2, with_kv=False, loopback=False)
+    assert not node.sampler.has_slot_masters and node.sampler.repeat_refusal(WALK) is None
+    node.ingest(1, _cfg(seed=1))
+    node.decode([1], replays=4, draws=15)
+    offsets = [row[0][4] for row in drawn]
+    assert offsets == [i * STRIDE for i in range(60)]
+    assert _offset(node, 1) == 60 * STRIDE

@@ -508,7 +508,8 @@ def _attention(*wrappers):
 
 @pytest.mark.parametrize(("resource", "refuses"), [
     (_sampler, False),
-    (lambda: _sampler(_history=object()), True),
+    # the repetition window moves in the graph each replay, like the offset
+    (lambda: _sampler(_history=object()), False),
     (lambda: _sampler(_decides=False), True),  # above one rank: scattered on the host
     # loop-back state is carried between replays like any loop-back signal
     (lambda: _sampler(_loopback_state={"s": object()}), False),
