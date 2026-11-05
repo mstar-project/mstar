@@ -324,6 +324,36 @@ def test_vjepa2_ac_decodes_only_the_frames_its_walk_encodes(monkeypatch, tmp_pat
     assert out["video_inputs"] == []
 
 
+def _vjepa2_prompt(monkeypatch, tmp_path, **kwargs):
+    """V-JEPA 2's masked-predictor process_prompt on a 1000-frame upload."""
+    from mstar.model.vjepa2.vjepa2_model import VJepa2Model
+
+    _fake_torchcodec(monkeypatch, [], _Metadata(num_frames=1000, height=64, width=64))
+    model = VJepa2Model("unused", skip_weight_loading=True)
+    model._preprocess_frames = lambda frames: frames.float()  # no HF processor without weights
+    upload = tmp_path / "clip.mp4"
+    upload.write_bytes(b"not decoded by the fake")
+    loaded = model.load_video(str(upload), "cpu")
+    return model.process_prompt(
+        None, ["video"], ["video"],
+        tensors={"video_inputs": [loaded.data]}, input_metadata={"video_inputs": [loaded.metadata]}, **kwargs,
+    ).new_input_tensors
+
+
+@pytest.mark.parametrize("masks", [
+    {"target_mask": [[0, 1]]},  # alone, it was replaced by the full-coverage default
+    {"context_mask": [[0, 1]]},
+    {"context_mask": [[0, 1]], "target_mask": [[256]]},  # 2 frames are 256 tokens; the gather device-asserted
+    {"context_mask": [[0, 1]], "target_mask": [["abc"]]},  # a TypeError: a 500
+    {"context_mask": [[0.9, 1]], "target_mask": [[1]]},  # silently truncated to [[0, 1]]
+])
+def test_vjepa2_masks_come_together_and_index_the_clips_tokens(monkeypatch, tmp_path, masks):
+    with pytest.raises(ValueError, match="mask"):
+        _vjepa2_prompt(monkeypatch, tmp_path, num_frames=2, **masks)
+    out = _vjepa2_prompt(monkeypatch, tmp_path, num_frames=2, context_mask=[[0, 255]], target_mask=[[1]])
+    assert out["target_mask"][0].tolist() == [[1]]
+
+
 @pytest.mark.parametrize("key_frames, decoders", [
     (torch.tensor([0, 10, 20, 30, 40]), 3),  # one per group of GOPs; the index's decoder decodes the first
     ([0, 10, 20, 30, 40], 3),  # the list torchcodec's annotation promises
@@ -548,6 +578,57 @@ def test_flux2_checks_the_header_of_the_formats_pillow_decodes(tmp_path, monkeyp
         _flux2().load_image(str(path), "cpu")
 
 
+def _lingbot():
+    from mstar.model.lingbot_world.lingbot_world_model import LingBotWorldModel
+
+    return object.__new__(LingBotWorldModel)
+
+
+_IMAGE_LOADERS = pytest.mark.parametrize("load", [
+    lambda path: read_image(path).float() / 255,
+    lambda path: read_image(path, rgb=True).float() / 255,
+    lambda path: _flux2().load_image(path, "cpu").data,
+    lambda path: _lingbot().load_image(path, "cpu").data.float() / 255,
+], ids=["read_image", "read_image_rgb", "flux2_pillow", "lingbot_pillow"])
+
+
+def _left_half_white(path: str, exif: bytes) -> None:
+    from PIL import Image
+
+    stored = Image.new("RGB", (128, 64))
+    stored.paste((255, 255, 255), (0, 0, 64, 64))
+    stored.save(path, exif=exif, quality=100, lossless=True, dpi=(72, 72))
+
+
+@_IMAGE_LOADERS
+@pytest.mark.parametrize("ext", ["jpg", "webp"])
+def test_an_image_is_read_upright_by_its_exif_orientation(tmp_path, load, ext):
+    """A phone photo is stored sideways with an EXIF orientation; it reached the models rotated
+    (torchvision's WebP decoder ignores the orientation)."""
+    from PIL import Image
+
+    exif = Image.Exif()
+    exif[0x0112] = 6  # shown rotated 90 degrees clockwise: the stored left half is the top
+    path = str(tmp_path / f"phone.{ext}")
+    _left_half_white(path, exif.tobytes())
+    out = load(path)
+    assert tuple(out.shape) == (3, 128, 64)
+    assert out[:, 16, 32].tolist() == pytest.approx([1, 1, 1], abs=0.05)
+    assert out[:, 112, 32].tolist() == pytest.approx([0, 0, 0], abs=0.05)
+
+
+@_IMAGE_LOADERS
+@pytest.mark.parametrize("ext", ["jpg", "webp"])
+def test_an_image_with_a_malformed_exif_block_is_read_as_stored(tmp_path, load, ext):
+    """Pillow parses EXIF only when asked; a garbage block must not fail an image that decodes."""
+    path = str(tmp_path / f"odd.{ext}")
+    _left_half_white(path, b"Exif\0\0garbage!")
+    out = load(path)
+    assert tuple(out.shape) == (3, 64, 128)
+    assert out[:, 32, 16].tolist() == pytest.approx([1, 1, 1], abs=0.05)
+    assert out[:, 32, 112].tolist() == pytest.approx([0, 0, 0], abs=0.05)
+
+
 def test_animated_webp_is_read_by_pillow_as_its_first_frame(tmp_path, no_decode):
     from PIL import Image
 
@@ -614,7 +695,7 @@ def decoded(monkeypatch):
 
     paths = []
 
-    def decode(path, mode=None):
+    def decode(path, mode=None, apply_exif_orientation=False):
         paths.append(path)
         return torch.zeros(3, 1, 1, dtype=torch.uint8)
 

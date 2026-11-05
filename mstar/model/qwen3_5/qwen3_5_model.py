@@ -596,6 +596,8 @@ class Qwen3_5DenseModel(Model):
             self.image_processor(
                 images=[_as_hwc_uint8(image)], return_tensors="pt",
                 do_rescale=False, do_normalize=False,
+                # inferred, a 1 or 3 px tall image would be read as channels first
+                input_data_format="channels_last",
             )
             for image in raw_images
         ]
