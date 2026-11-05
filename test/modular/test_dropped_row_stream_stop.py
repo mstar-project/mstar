@@ -185,9 +185,9 @@ def _postprocess(
     stopped a step earlier."""
     eng, runtime = _engine(sub), _Runtime(pending_stops)
     batch = _batch(rids, streams)
-    eng.prepare_inputs(batch)
-    # rows the prefix cache served whole: declined by prepare, kept by postprocess
+    # rows the prefix cache served whole: noted, then declined, by prepare; kept by postprocess
     batch.cached_rids = set(cached)
+    eng.prepare_inputs(batch)
     outputs = BatchedModelOutput(per_rid_outputs={
         r: {"audio": [torch.zeros(1)]} for r in batch.request_ids
     })

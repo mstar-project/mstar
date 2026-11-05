@@ -519,8 +519,10 @@ class ExecutingBatch:
         # A row that failed must not end its streams on this step: the worker
         # would stop its loop and finalize a row it no longer has. A declined
         # row still does: it completes its node without a forward, so a
-        # consumer needs no dummy step to end on an empty final chunk.
-        ended = rids - self.skipped_rids
+        # consumer needs no dummy step to end on an empty final chunk. A row
+        # the cache served does not: its walk completes without one (its chunk
+        # Loop's stride, ``complete_cached_walk``).
+        ended = rids - (self.skipped_rids - self.cached_rids)
         self.final_stream_rids.difference_update(ended)
         self.partition_done_rids.difference_update(ended)
         self.per_request_info = {
@@ -2388,8 +2390,9 @@ class Engine:
         request_ids: list[int],
     ) -> None:
         """Publish state that must include the last iteration of a stopped loop."""
-        # A row that ran nothing this step -- one the prefix cache served whole
-        # -- has no iteration here to publish, though its loop still stops.
+        # A row that ran nothing this step -- one the prefix cache served whole,
+        # or one that declined its final chunk -- has no iteration here to
+        # publish, though its loop still stops.
         request_ids = [rid for rid in request_ids if rid in batch.per_request_info]
         if not request_ids:
             return
@@ -2401,10 +2404,7 @@ class Engine:
         )
         for rid in request_ids:
             rid_published = published.get(rid, {})
-            # a row that declined its final chunk has no forward-pass info
-            info = batch.per_request_info.get(rid)
-            if info is not None:
-                info.update_publish_info(rid_published)
+            batch.per_request_info[rid].update_publish_info(rid_published)
             merge_publish_info(
                 batch.resource_publish_info.setdefault(rid, {}),
                 rid_published,
