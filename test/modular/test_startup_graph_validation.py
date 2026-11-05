@@ -735,7 +735,7 @@ def _minicpm_o(name, model_kwargs, tmp_path, monkeypatch):
     config = MiniCPMOConfig(
         llm=Qwen3LMConfig(), vision=VisionConfig(), resampler=ResamplerConfig(), audio=AudioConfig(),
     )
-    return _bare(MiniCPMOModel, config=config)
+    return _bare(MiniCPMOModel, max_seq_len=64, config=config)
 
 
 def _orpheus(name, model_kwargs, tmp_path, monkeypatch):
@@ -847,15 +847,6 @@ def _parakeet(name, model_kwargs, tmp_path, monkeypatch):
     return _bare(ParakeetModel, config=ParakeetModelConfig(name, FastConformerConfig(), transducer))
 
 
-def _minicpm_o(name, model_kwargs, tmp_path, monkeypatch):
-    from mstar.model.components.qwen3_lm import Qwen3LMConfig
-    from mstar.model.minicpm_o.config import AudioConfig, MiniCPMOConfig, ResamplerConfig, VisionConfig
-    from mstar.model.minicpm_o.minicpm_o_model import MiniCPMOModel
-    return _bare(MiniCPMOModel, max_seq_len=64, config=MiniCPMOConfig(
-        llm=Qwen3LMConfig(), vision=VisionConfig(), resampler=ResamplerConfig(), audio=AudioConfig(),
-    ))
-
-
 def _default(name, model_kwargs, tmp_path, monkeypatch):
     return _constructed(name, model_kwargs)
 
@@ -875,7 +866,6 @@ _FACTORIES = {
     "KokoroModel": _kokoro,
     "MiniCPMOModel": _minicpm_o,
     "LTX25Model": _ltx2_5,
-    "MiniCPMOModel": _minicpm_o,
     "OrpheusModel": _orpheus,
     "ParakeetModel": _parakeet,
     "Qwen3_5DenseModel": _qwen3_5,
