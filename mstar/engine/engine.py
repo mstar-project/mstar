@@ -2756,6 +2756,10 @@ class Engine:
         capped = [cap for cap in caps if cap is not None]
         return min(capped) if capped else None
 
+    def batch_cap_varies(self, node_name: str, graph_walk: str) -> bool:
+        """Whether this walk's ``get_max_batch_size`` can move between passes."""
+        return self._submodules[node_name].submodule.batch_cap_varies(graph_walk)
+
     def get_max_batch_tokens(self, node_name: str, graph_walk: str) -> int | None:
         return self._chunking.max_batch_tokens(node_name, graph_walk)
 

@@ -229,8 +229,11 @@ class NoAuxTcRouter(nn.Module):
         self.e_score_correction_bias = nn.Parameter(
             torch.zeros(n_routed_experts, dtype=torch.float32)
         )
-        # fused_moe's (logits, bias, top_k, scale, renormalize) -> (weights, ids), from
-        # ``finalize_weights(topk_kernel=True)``
+        # fused_moe's router ops, from ``finalize_weights(topk_kernel=True)``: the decode
+        # router (logits and top-k) for up to ``_route_rows`` tokens, its top-k program on
+        # GEMM logits past them; both (..., bias, top_k, scale, renormalize) -> (weights, ids)
+        self._route_op = None
+        self._route_rows = 0
         self._topk_op = None
         # fp32 copy of ``weight``, built once by ``finalize_weights``: the
         # forward needs fp32 and the router never changes, so casting it once
@@ -240,18 +243,27 @@ class NoAuxTcRouter(nn.Module):
 
     def finalize_weights(self, topk_kernel: bool = False) -> None:
         """Cache the fp32 router weight; call after the weights are loaded. ``topk_kernel``
-        routes CUDA logits through fused_moe's top-k kernel, whose ids can differ from
-        torch's at exact ties."""
+        routes CUDA tokens through fused_moe's router kernels, whose ids can differ from
+        torch's at exact ties. Up to its MAX_ROUTER_TOKENS rows that is the decode router
+        itself, the one a fused decode chain runs, so a block's gate and its decode kernels
+        give the same weights bit for bit (a GEMM sums the logits in another order)."""
         self._weight_fp32 = self.weight.detach().float()
+        self._route_op = self._topk_op = None
         if topk_kernel:
-            from mstar.utils.fused_moe import decode  # registers the op
+            from mstar.utils.fused_moe import decode  # registers the ops
 
-            self._topk_op = decode.router_topk
+            self._route_op, self._topk_op = decode.route_op, decode.router_topk
+            self._route_rows = decode.MAX_ROUTER_TOKENS
 
     def forward(
         self, hidden_states: torch.Tensor, router_states: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, None]:
         flat = hidden_states.reshape(-1, self.hidden_size)
+        if self._route_op is not None and flat.is_cuda and flat.shape[0] <= self._route_rows:
+            topk_weights, topk_ids = self._route_op(
+                flat.contiguous(), self.weight, self.e_score_correction_bias, self.top_k,
+                self.routed_scaling_factor, self.norm_topk_prob)
+            return topk_weights, topk_ids, None
         # the engine's bf16 autocast would run F.linear in bf16 and round the logits
         with torch.autocast(flat.device.type, enabled=False):
             if _MM_OUT_DTYPE and flat.is_cuda and flat.dtype == self.weight.dtype == torch.bfloat16:
@@ -275,7 +287,9 @@ class NoAuxTcRouter(nn.Module):
         topk_weights = scores.gather(1, topk_ids)
 
         if self.norm_topk_prob:
-            topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+            # HF's 1e-20, as the fused kernel adds: it guards an all-zero top-k and rounds
+            # away for any sum above 2^-42
+            topk_weights = topk_weights / (topk_weights.sum(dim=-1, keepdim=True) + 1e-20)
         if self.routed_scaling_factor != 1.0:
             topk_weights = topk_weights * self.routed_scaling_factor
 

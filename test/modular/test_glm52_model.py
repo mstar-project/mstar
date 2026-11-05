@@ -720,7 +720,7 @@ def test_fallback_tokenizer_keeps_turn_tokens_special(tmp_path):
 
     from tokenizers import Tokenizer, decoders, models, pre_tokenizers
 
-    from mstar.model.utils import ByteLevelDetokenizer
+    from mstar.model.utils import ByteLevelDetokenizer, fast_tokenizer_from_snapshot
 
     alphabet = pre_tokenizers.ByteLevel.alphabet()
     raw = Tokenizer(models.BPE(vocab={c: i for i, c in enumerate(sorted(alphabet))}, merges=[]))
@@ -734,7 +734,7 @@ def test_fallback_tokenizer_keeps_turn_tokens_special(tmp_path):
         "eos_token": "<|endoftext|>", "pad_token": "<|endoftext|>",
         "extra_special_tokens": turns, "tokenizer_class": "TokenizersBackend"}))
 
-    tok = Glm52Model._fast_tokenizer_fallback(str(tmp_path))
+    tok = fast_tokenizer_from_snapshot(str(tmp_path))
     assert len(tok) == raw.get_vocab_size()
     assert set(tok.convert_tokens_to_ids(turns)) <= set(tok.all_special_ids)
     think, user = tok.convert_tokens_to_ids(["</think>", "<|user|>"])

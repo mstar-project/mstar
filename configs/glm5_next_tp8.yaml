@@ -1,0 +1,40 @@
+model: "glm5_next"
+# GLM-5.3-Flash on 8 GPUs of 80 GB: the 306 GB fp8 checkpoint is ~38 GB/rank at
+# TP8. Resolve the checkpoint through the HF cache (HF_HOME) or pass
+# model_kwargs.checkpoint_path.
+max_seq_len: 2048
+# One request per KDA slot below: past them a prefill would wait in the worker
+# for a slot, which stalls decode speculation.
+max_concurrent_requests: 64
+# FlashInfer's one-kernel all-reduce, faster than symm_multimem at decode sizes
+# and past 2 MB
+tp_allreduce: "flashinfer"
+# a 4096-token prefill bucket moves 32 MiB per all-reduce
+tp_allreduce_max_kb: 32768
+tp_async_sched: true
+model_kwargs:
+  # the fused fp8 MoE kernel where it runs, which is what lets decode capture;
+  # "reference" serves the eager loop
+  moe_quant_kernel: "auto"
+  # MTP drafts per step; glm5_next_tp8_mtp.yaml turns it on
+  mtp_num_draft_tokens: 0
+  # one graph per (rows, token bucket), ~40 s of capture at startup; other
+  # shapes run eager
+  prefill_graphs: true
+resources:
+  kv_cache:
+    # Only the 11 MLA layers are paged, a 512-wide latent each: ~11.3 KB/token.
+    # 1024 pages x 128 tokens hold a full-length request per KDA slot below,
+    # plus the sink page: ~1.5 GB/rank.
+    max_num_pages: 1025
+    page_size: 128
+  kda_state:
+    # 64 requests plus the pool's sink, head-sharded like the KDA layers:
+    # ~18.5 MB/slot/rank. The real slots also cap the decode batch and its
+    # captured sizes.
+    max_slots: 65
+node_groups:
+  - node_names: [LLM]
+    ranks: [0, 1, 2, 3, 4, 5, 6, 7]
+    tp_size: 8
+    graph_walks: [prefill, decode]

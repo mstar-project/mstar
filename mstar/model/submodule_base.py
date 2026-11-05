@@ -1219,6 +1219,12 @@ class NodeSubmodule(torch.nn.Module, ABC):
     def max_batch_size(self, graph_walk: str):
         return None
 
+    def batch_cap_varies(self, graph_walk: str) -> bool:
+        """Whether ``max_batch_size(graph_walk)`` follows state that changes while
+        serving (free slots, say). The scheduler caches every other cap."""
+        del graph_walk
+        return False
+
     def compile_regions(self) -> Mapping[str, Sequence[tuple]]:
         """Parts of this node the engine compiles on their own, for a node
         whose ``forward`` is not compiled whole (``disable_torch_compile``, or
