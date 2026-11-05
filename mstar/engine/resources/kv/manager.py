@@ -5022,12 +5022,7 @@ class KVManager(AttentionResource):
             elif kind == MoveKind.UNRESERVE:
                 self.unreserve(rid)
             elif kind == MoveKind.SET_ASIDE:
-                # as rank 0 set it aside, evicting the cached pages the room counted
-                if not self._cpu_pool.reserve(rid, count):
-                    raise RuntimeError(
-                        f"KV {self.name}: rank 0 set {count} host pages aside for {rid}, and this rank's host has "
-                        "no room for them"
-                    )
+                self._cpu_pool.reserved[rid] = count
             elif kind == MoveKind.GUARANTEE:
                 self._guarantee(rid, count)
             elif kind == MoveKind.ALLOT:
