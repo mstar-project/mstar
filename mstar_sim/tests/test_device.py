@@ -691,6 +691,13 @@ def test_tensor_parallel_ranks_meet_at_each_collective():
                 dist.all_reduce(y)
             graph.replay()
             assert never_computed(y._data)
+            # a rank's wait for a late peer is a host wait, not the emulator's own time
+            import time
+            from mstar_sim import clock
+            emulator = clock.STATS["host_compute"]
+            time.sleep(r)
+            dist.all_reduce(y)
+            assert clock.STATS["host_compute"] - emulator < 0.5, clock.STATS
             dist.destroy_process_group()
 
         if __name__ == "__main__":

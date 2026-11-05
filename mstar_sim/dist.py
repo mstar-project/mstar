@@ -23,6 +23,7 @@ import os
 import resource
 import sys
 import threading
+import time
 
 import torch
 import torch.distributed as dist
@@ -111,8 +112,12 @@ def _meet(group, mine: list[int], replay: bool = False) -> list[list[int]]:
     where = f"mstar_sim: rank {me}, torch sequence number {seq} (meets included) on the group of ranks {ranks}"
     with clock.computing():  # the device's clock stands still while ranks meet
         gathered = torch.empty(len(ranks) * len(mine), dtype=torch.int64)
+        began = time.perf_counter()
         try:
             _all_gather(gathered, torch.tensor(mine, dtype=torch.int64), group=group)
+            waited = time.perf_counter() - began  # for its peers: a wait, not the emulator's work
+            clock.STATS["host_compute"] -= waited
+            clock.STATS["host_wait"] += waited
         except RuntimeError as e:
             print(f"{where}: {_describe(mine)} met no peer ({e}). "
                   + ("A replayed graph's collectives are unwatched: this rank hangs, as on a GPU." if replay else
