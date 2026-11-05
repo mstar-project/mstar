@@ -124,8 +124,10 @@ def _meet(group, mine: list[int], replay: bool = False) -> list[list[int]]:
     if not _pairs(rows):
         lines = "".join(f"\n  rank {r}: {_describe(d)}{'  <- this rank' if r == me else ''}"
                         for r, d in zip(ranks, rows, strict=True))
-        print(f"{where}: the ranks' collectives don't pair (NCCL would hang or corrupt data):{lines}",
-              file=sys.stderr, flush=True)
+        why = ("the ranks took different capture paths (AGENTS.md invariant 11): NCCL pairs the collectives"
+               " inside one by one, so it may run on, hang or corrupt data"
+               if any(_PRIMITIVES[d[0]] == "Graph" for d in rows) else "NCCL would hang or corrupt data")
+        print(f"{where}: the ranks' collectives don't pair ({why}):{lines}", file=sys.stderr, flush=True)
         _abort()
     return rows
 

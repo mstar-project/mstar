@@ -735,11 +735,11 @@ def test_tensor_parallel_ranks_meet_at_each_collective():
     assert out.strip().endswith("ok")
 
 
-@pytest.mark.parametrize("case", ["mismatch", "extra_replay", "skip"])
+@pytest.mark.parametrize("case", ["mismatch", "graph_vs_eager", "extra_replay", "skip"])
 def test_ranks_whose_collectives_dont_pair_abort(case):
     """A rank whose collective doesn't pair with its peer's (another primitive, a graph
-    replayed once more on one rank) aborts with both ranks' descriptors; one whose peer
-    never comes aborts at the group's timeout, as NCCL's watchdog does."""
+    replayed against eager calls) aborts with both ranks' descriptors; one whose peer never
+    comes aborts at the group's timeout, as NCCL's watchdog does, or hangs in a replay."""
     out = run_sim(f"""
         import datetime, os, tempfile, time, torch, torch.distributed as dist, torch.multiprocessing as mp
 
@@ -751,12 +751,16 @@ def test_ranks_whose_collectives_dont_pair_abort(case):
             x = torch.empty(1 << 14, device="cuda")
             if "{case}" == "mismatch":
                 dist.all_reduce(x) if r else dist.all_gather_into_tensor(x, x[:1 << 13])
-            elif "{case}" == "extra_replay":
+            elif "{case}" in ("graph_vs_eager", "extra_replay"):
                 graph = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(graph):
                     dist.all_reduce(x)
                 graph.replay()
-                graph.replay() if r else dist.all_reduce(x)
+                if "{case}" == "graph_vs_eager":  # the same all-reduces, which NCCL would pair
+                    graph.replay() if r else dist.all_reduce(x)
+                elif r:
+                    open(path + ".again", "w").close()
+                    graph.replay()
             elif r == 0:
                 dist.all_reduce(x)
             else:
@@ -764,13 +768,23 @@ def test_ranks_whose_collectives_dont_pair_abort(case):
             print(f"rank {{r}} passed", flush=True)
 
         if __name__ == "__main__":
-            ctx = mp.spawn(rank, args=(tempfile.mkdtemp() + "/group",), nprocs=2, join=False)
+            path = tempfile.mkdtemp() + "/group"
+            ctx = mp.spawn(rank, args=(path,), nprocs=2, join=False)
+            ctx.processes[0].join()
+            if "{case}" == "extra_replay":
+                while not os.path.exists(path + ".again"):
+                    time.sleep(0.1)
+                ctx.processes[1].join(10)  # past the group's timeout: the replay hangs
+            else:
+                ctx.processes[1].join()
+            print("exits", [p.exitcode for p in ctx.processes], flush=True)
             for p in ctx.processes:
-                p.join()
-            print("exits", [p.exitcode for p in ctx.processes])
+                p.kill()
     """)
     if case == "skip":
         assert "exits [-6, 0]" in out and "rank 0, call" in out and "met no peer" in out, out
+    elif case == "extra_replay":
+        assert "exits [0, None]" in out and "rank 1 passed" not in out, out
     else:
         assert "exits [-6, -6]" in out and "don't pair" in out and "rank 0: " in out and "rank 1: " in out, out
         assert "passed" not in out, out
