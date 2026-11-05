@@ -612,13 +612,18 @@ def _shaped_by_never_computed(func, args) -> bool:
     return torch.Tag.dynamic_output_shape in func.tags
 
 
-def _passes_on_shapes(func, args, kwargs) -> bool:
-    """Whether what an aten op refused was its operands' values, not their shapes."""
-    args, kwargs = tree_map(lambda x: x.to(META) if isinstance(x, torch.Tensor) else x, (args, kwargs))
+def _passes_on_other_values(func, args, kwargs) -> bool:
+    """Whether what an aten op refused was its never-computed operands' values, not their
+    shapes or dtypes: it passes with other values in their place. An op that these values
+    break too (a Cholesky of random ones) reads as refusing shapes, the loud side."""
+    def other(x):
+        if not isinstance(x, torch.Tensor) or not never_computed(x):
+            return x
+        return torch.rand_like(x) if _floating(x) else torch.zeros_like(x)
+
+    args, kwargs = tree_map(other, (args, kwargs))
     try:
         func(*args, **kwargs)
-    except NotImplementedError:
-        return True  # it has no shape-only check to fail
     except RuntimeError:
         return False
     return True
@@ -632,7 +637,7 @@ def _kept_op(func, args, kwargs):
     try:
         out = func(*args, **kwargs)
     except RuntimeError:
-        VALUE_SHAPES[0] += never and _passes_on_shapes(func, args, kwargs)  # torch judged no kernel's values
+        VALUE_SHAPES[0] += never and _passes_on_other_values(func, args, kwargs)  # torch judged no kernel's values
         raise
     for t in (*tree_flatten(out)[0], *_written(func, args, kwargs)):
         if isinstance(t, torch.Tensor) and t.device.type == "cpu":
