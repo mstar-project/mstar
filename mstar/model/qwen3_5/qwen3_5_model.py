@@ -26,7 +26,6 @@ from mstar.engine.state import (
     Layout,
     Positions,
     Read,
-    Rope,
     Sampler,
     SampleSettings,
     Span,
@@ -224,7 +223,7 @@ class Qwen3_5DenseModel(Model):
                 KV_CACHE, nodes={"LLM"}, layers=c.full_layer_indices,
                 entry=KVEntry(heads=c.num_key_value_heads, head_dim=c.head_dim),
                 max_len=c.max_position_embeddings,
-                positions=Positions(rope=Rope()),
+                positions=Positions(),
                 reads={ATTN: Read(mask=Causal(), op=Attend(q_heads=c.num_attention_heads))},
             ),
             # written out because Qwen3.5 diverges silently without qk_l2norm

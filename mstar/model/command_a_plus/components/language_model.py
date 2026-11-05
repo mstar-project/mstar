@@ -113,7 +113,6 @@ class CommandAPlusAttention(ParallelAttention):
             qkv_bias=False,
             o_bias=False,
             qk_norm=False,
-            rope_theta=config.rope_theta,
             attn_key=LOCAL_ATTN if is_local else GLOBAL_ATTN,
             kv_key=KV_CACHE,
             pos_key=ROPE if is_local else None,
