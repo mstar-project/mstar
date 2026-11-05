@@ -63,6 +63,11 @@ def _identity(frames: torch.Tensor) -> torch.Tensor:
     return frames
 
 
+def _source_bytes(source) -> str | bytes:
+    """``source`` as `media_io` opens it: a path, or a uint8 tensor's bytes."""
+    return source.numpy().tobytes() if isinstance(source, torch.Tensor) else source
+
+
 def _decode(source, indices: list[int], transform: Transform, decoder=None) -> torch.Tensor:
     if decoder is None:
         from torchcodec.decoders import VideoDecoder
@@ -83,6 +88,12 @@ def decode_frames_at(
     batch (e.g. convert and resize), applied to each group on its decoding
     thread, so it overlaps the other groups' decode.
     """
+    from mstar.model.components import media_io
+
+    if not media_io.uses_torchcodec():
+        # PyAV where torchcodec does not load (ROCm, no FFmpeg): one decoder, in order
+        frames = media_io.decode_video(_source_bytes(source), indices).data
+        return (transform or _identity)(frames)
     from torchcodec.decoders import VideoDecoder
 
     decoder = VideoDecoder(source, num_ffmpeg_threads=video_decode_threads())
