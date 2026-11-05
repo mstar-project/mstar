@@ -561,13 +561,15 @@ def test_client_gone_after_a_parallel_tail_releases_it_and_submits_nothing_more(
     stub.collect_results = collect_until_gone
     monkeypatch.setattr(Request, "is_disconnected", is_disconnected)
     # window 0 stopped inside a segment, so it has a tail to decode
+    # fewer than the upload's 20 windows, so some are left unsubmitted
+    monkeypatch.setattr(serving_transcriptions, "PARALLEL_INFLIGHT", 8)
     stub.queued_chunks = [_text("<|en|>", "<|0.00|>", " One.", "<|20.00|>", "<|20.40|>", " cut off")]
     stub.queued_chunks += [_text("<|0.00|>", f" w{i}.", "<|29.00|>") for i in range(1, 30)]
     r = _post(client, {"model": "whisper_large", "long_form": "parallel", "language": "en",
                        "response_format": "verbose_json"}, filename="long.wav", content=_wav_bytes(10 * 60))
     assert r.status_code == 200, r.text
     # the first window's tail went out when that window came back, before the disconnect
-    assert len(stub.submits) == 2 + serving_transcriptions.PARALLEL_INFLIGHT
+    assert len(stub.submits) == 2 + 8
     # the tail's file is cut after every fixed window's, so it has the highest _wNNNN
     tail = max(stub.submits, key=lambda sub: sub["file_paths"]["audio"][0])["request_id"]
     assert tail in stub.released
@@ -926,13 +928,15 @@ def test_upload_longer_than_the_cap_is_rejected(client_and_stub, monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "mode, submitted", [("parallel", 1 + serving_transcriptions.PARALLEL_INFLIGHT), ("sequential", 2)],
+    "mode, submitted", [("parallel", 9), ("sequential", 2)],
 )
 def test_client_gone_mid_long_form_stops_submitting(client_and_stub, monkeypatch, mode, submitted):
     # collect_results aborts and returns [] once the client is gone; the
     # remaining windows must not be submitted after that
     from starlette.requests import Request
 
+    # fewer than the upload's 20 windows, so some are left unsubmitted
+    monkeypatch.setattr(serving_transcriptions, "PARALLEL_INFLIGHT", 8)
     client, stub = client_and_stub
     gone = False
     collect = stub.collect_results

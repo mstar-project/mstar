@@ -92,8 +92,10 @@ CUT_SEARCH_SECONDS = 2.0
 CUT_FRAME_SECONDS = 0.02
 # a tail shorter than this holds no speech, and some models refuse one so short
 MIN_TAIL_SECONDS = 0.02
-# parallel mode: windows on the engine at once for one upload
-PARALLEL_INFLIGHT = 8
+# parallel mode: windows on the engine at once for one upload. A decode batch can
+# hold no more than this many of one upload's windows, so a small value starves a
+# lone upload of batching; past the ASR configs' caps the rest queue in the conductor.
+PARALLEL_INFLIGHT = 32
 # shortest window a request may ask for (``window_seconds``)
 MIN_WINDOW_SECONDS = 5.0
 # longest upload the route accepts, in seconds and in bytes
