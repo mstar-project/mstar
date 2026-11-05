@@ -23,7 +23,7 @@ from mstar.platforms import current_platform
 
 if TYPE_CHECKING:
     from mstar.engine.resources.attn.wrappers import PagedKernel
-    from mstar.engine.resources.context_parallel import ContextParallel, ContextParallelWrapper
+    from mstar.engine.resources.context_parallel import ContextParallel, ContextParallelWrapper, WholeRowsKernel
 
 logger = logging.getLogger(__name__)
 _BACKEND_KV_CONFIG: dict[AttnBackend, type[KVConfig]] = {
@@ -63,6 +63,7 @@ class AttentionManager(AttentionResource):
     def bind_dependencies(self, resources) -> None:
         from mstar.engine.resources.context_parallel import (
             SPContextParallelWrapper,
+            SPPlacement,
             TPContextParallelWrapper,
             TPPlacement,
         )
@@ -70,7 +71,8 @@ class AttentionManager(AttentionResource):
         placement = resources[self._kv_cache_name].placement
         if placement is not None:
             self._placement = placement
-            self._placed = TPContextParallelWrapper if isinstance(placement, TPPlacement) else SPContextParallelWrapper
+            wrappers = {SPPlacement: SPContextParallelWrapper, TPPlacement: TPContextParallelWrapper}
+            self._placed = wrappers[type(placement)]
             self._bind_placement(placement)
 
     def _bind_placement(self, placement: "ContextParallel") -> None:
@@ -80,18 +82,16 @@ class AttentionManager(AttentionResource):
     # A backend that supports a placed pool supplies the kernels a step attends it on;
     # `_context_parallel_wrapper` composes them and `_attend_placed` runs them.
 
-    def _context_wrapper(
+    def paged_kernel(
         self, workspace: torch.Tensor, decode: bool, kwargs: dict, max_total_tokens: int | None,
     ) -> "PagedKernel":
-        """The paged kernel over this rank's slots, from ``kwargs`` (the backend's wrapper arguments
-        with the placed geometry, and any capture sizes), for a one-token-a-row step or not; or,
-        with ``page_size`` 1, over pages of one slot (``OneSlotPages``)."""
+        """``PlacedKernels.paged_kernel``."""
         raise NotImplementedError
 
-    def _own_tokens_wrapper(self, workspace: torch.Tensor, kwargs: dict, max_total_tokens: int | None):
-        """The wrapper a multi-token step attends its own tokens on under TP placement, from the
-        keys ``run`` is passed: ``run(*queries, *keys, return_lse=True)``, out 0 and lse -inf on a
-        captured bucket's padding."""
+    def whole_rows_kernel(
+        self, workspace: torch.Tensor, kwargs: dict, max_total_tokens: int | None,
+    ) -> "WholeRowsKernel":
+        """``PlacedKernels.whole_rows_kernel``."""
         raise NotImplementedError
 
     def _context_parallel_wrapper(
@@ -105,8 +105,10 @@ class AttentionManager(AttentionResource):
         split-KV partials of a ``run``, which it merges within that ``run``; the two run one after
         the other on one stream."""
         workspace = self._workspaces.get(label, slot)
-        context = self._context_wrapper(workspace, decode, kwargs, max_total_tokens)
-        new = None if decode else self._placed.own_tokens(self, workspace, kwargs, max_total_tokens)
+        context = self.paged_kernel(workspace, decode, kwargs, max_total_tokens)
+        new = None if decode else self._placed.own_tokens(
+            self, self._placement, self._device, self._dtype, workspace, kwargs, max_total_tokens,
+        )
         return self._placed(
             self._placement, self._kv_config.tokens_per_page, self._dtype, context, new, self._device,
             kwargs.get("batch_size"), max_total_tokens,

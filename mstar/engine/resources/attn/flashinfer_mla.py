@@ -435,11 +435,11 @@ class FlashInferMLAManager(AttentionManager):
         self._eager_plan_states[key] = wrapper
         return wrapper
 
-    def _context_wrapper(self, workspace, decode, kwargs, max_total_tokens):
+    def paged_kernel(self, workspace, decode, kwargs, max_total_tokens):
         # one wrapper takes either kind of step
         return FlashInferMLAWrapper(workspace_buffer=workspace, **kwargs)
 
-    def _own_tokens_wrapper(self, workspace, kwargs, max_total_tokens):
+    def whole_rows_kernel(self, workspace, kwargs, max_total_tokens):
         own = {**kwargs, "num_qo_heads": self._kv_config.num_qo_heads}
         del own["page_size"]
         if max_total_tokens is not None:

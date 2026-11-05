@@ -283,7 +283,7 @@ class FlashInferManager(AttentionManager):
             self._eager_plan_states[key] = wrapper
         return wrapper
 
-    def _context_wrapper(self, workspace, decode, kwargs, max_total_tokens):
+    def paged_kernel(self, workspace, decode, kwargs, max_total_tokens):
         if decode:
             # on tensor cores under TP placement (`_bind_placement`)
             return FlashInferDecodeWrapper(
@@ -291,7 +291,7 @@ class FlashInferManager(AttentionManager):
             )
         return FlashInferPrefillWrapper(workspace_buffer=workspace, max_total_tokens=max_total_tokens, **kwargs)
 
-    def _own_tokens_wrapper(self, workspace, kwargs, max_total_tokens):
+    def whole_rows_kernel(self, workspace, kwargs, max_total_tokens):
         from mstar.engine.resources.attn.ragged.wrappers import FlashInferRaggedPrefillWrapper
 
         return FlashInferRaggedPrefillWrapper(

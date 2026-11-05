@@ -692,7 +692,7 @@ def test_captured_zigzag_shares_replan_in_place_and_merge_to_attention_over_a_la
     wrappers = [
         ZigzagWrapper(
             SPPlacement(P, index, CommGroup.trivial()), OneSlotPages(_OneSlotPrefill(), torch.float32, captured),
-            CPU, captured[1], tokens,
+            CPU, tokens,
         )
         for index in range(P)
     ]
