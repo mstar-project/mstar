@@ -105,25 +105,32 @@ _COMPACT_SSE = _util.sse({"a": 1}) == 'data: {"a":1}\n\n'
 SSE_TYPE = "text/event-stream; charset=utf-8"
 
 
-def _sse_frames(body) -> list[dict]:
-    """The JSON of each ``data: ...\\n\\n`` frame of one SSE body, checking that
-    framing. Takes the whole body, or the pieces (bytes or str) it came in."""
-    raw = body if isinstance(body, bytes) else b"".join(
-        piece if isinstance(piece, bytes) else piece.encode() for piece in body)
-    assert raw.endswith(b"\n\n"), raw
-    frames = []
-    for frame in raw.split(b"\n\n")[:-1]:
-        assert frame.startswith(b"data: "), frame
-        frames.append(json.loads(frame[len(b"data: "):]))
-    return frames
+def _sse_frame(raw) -> dict:
+    """One ``data: ...\\n\\n`` frame's JSON, checking that it is exactly one."""
+    raw = raw if isinstance(raw, bytes) else raw.encode()
+    assert raw.startswith(b"data: ") and raw.endswith(b"\n\n"), raw
+    assert b"\n\n" not in raw[:-2], f"more than one event in one frame: {raw!r}"
+    return json.loads(raw[len(b"data: "):-2])
+
+
+def _sse_pieces(pieces) -> list[dict]:
+    """One event per piece (an HTTP chunk, or what a Python body yields), in
+    order: the framing a client reads a stream by, not just the events."""
+    return [_sse_frame(piece) for piece in pieces]
+
+
+def _sse_body(body: bytes) -> list[dict]:
+    """The events of one whole SSE body, for an answer read without its chunks."""
+    assert body.endswith(b"\n\n"), body
+    return [_sse_frame(frame + b"\n\n") for frame in body.split(b"\n\n")[:-1]]
 
 
 def _comparable(answer: tuple) -> tuple:
-    """An answer with an SSE body reduced to its frames, where the Python
+    """An answer with an SSE body reduced to its events, where the Python
     frontend has no orjson and so writes the same events with wider JSON."""
     if _COMPACT_SSE or answer[1] != SSE_TYPE:
         return answer
-    return (*answer[:3], _sse_frames(answer[3]), answer[4])
+    return (*answer[:3], _sse_body(answer[3]), answer[4])
 
 
 def _python_submits(submitted: list[dict]) -> list[dict]:
@@ -333,9 +340,10 @@ def test_an_sse_speech_stream_is_framed_as_the_python_route_frames_it(text, fmt,
         status, headers, chunks = _http(port, body)
     python = asyncio.run(_python_pieces("qwen3_tts_1p7b", dict(body), tmp_path))
     assert (status, headers.get("content-type")) == (200, SSE_TYPE)
-    events = _sse_frames(chunks)
-    assert events == _sse_frames(python)
-    assert len(chunks) == len(python), "one HTTP chunk per event on both frontends"
+    # one event per HTTP chunk on the Rust side, per yielded piece on the
+    # Python side, the same events in the same order
+    events = _sse_pieces(chunks)
+    assert events == _sse_pieces(python)
     if _COMPACT_SSE:
         assert chunks == [piece.encode() for piece in python]
     assert [e["type"] for e in events] == ["speech.audio.delta"] * (len(events) - 1) + ["speech.audio.done"]
@@ -354,8 +362,8 @@ def test_an_sse_speech_stream_ends_a_failure_with_an_in_band_error_event(tmp_pat
         status, headers, chunks = _http(port, body)
     python = asyncio.run(_python_pieces("qwen3_tts_1p7b", dict(body), tmp_path))
     assert (status, headers.get("content-type")) == (200, SSE_TYPE)
-    events = _sse_frames(chunks)
-    assert events == _sse_frames(python)
+    events = _sse_pieces(chunks)
+    assert events == _sse_pieces(python)
     if _COMPACT_SSE:
         assert chunks == [piece.encode() for piece in python]
     assert events[-1] == {"type": "error", "error": {
@@ -384,9 +392,11 @@ def test_stream_format_does_not_stream_a_compressed_container(sf, tmp_path, monk
         was_plain, was_switched, was_streamed = frontend
         assert was_switched == was_plain, "stream_format changed a compressed answer"
         assert was_switched[2] is None, "a streamed answer would set Cache-Control"
-        assert all(not s["streaming"] for s in was_switched[4]), was_switched
-        if was_switched[0] != 200:  # no encoder for it either way
+        if was_switched[0] == 200:  # it has an encoder for mp3 (soundfile)
+            assert was_switched[4] and all(not s["streaming"] for s in was_switched[4])
+        else:  # it has none, and refuses before any engine work
             assert "cannot be streamed" not in json.loads(was_switched[3])["error"]["message"]
+            assert was_switched[4] == []
         assert was_streamed[0] == 400, frontend
         assert "cannot be streamed" in json.loads(was_streamed[3])["error"]["message"]
     assert json.loads(rust[2][3]) == json.loads(python[2][3])
