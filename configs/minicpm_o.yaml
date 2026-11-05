@@ -31,7 +31,8 @@ resources:
   # Admission reserves only a prompt's pages, so 32 long replies can outgrow them;
   # 512 host pages (9 GiB of host memory) give a full pool a request to move, as
   # qwen3omni_2gpu.yaml does, where without them every reply would wait until it
-  # timed out. Past 896 pages in all the worker warns to raise cpu_offload_pages.
+  # timed out. Past 896 pages in all the worker warns to raise cpu_offload_pages
+  # and holds, as it would without host pages.
   llm_kv:
     max_num_pages: 384
     cpu_offload_pages: 512
