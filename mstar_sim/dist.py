@@ -8,7 +8,8 @@ and a rank whose call doesn't pair with its peers' (skipped, reordered,
 resized) aborts with every rank's, where NCCL would hang or corrupt data. A
 captured graph meets once per group at each replay, on its collectives over that
 group's ranks. The data moves (over gloo) only if every rank holds values (a vote,
-lengths); otherwise its outputs are never computed. Either way it is charged its
+lengths); otherwise its outputs are never computed. Point to point has no group to meet
+on: its two ranks swap their values bits before the payload, so both decide alike. Either way it is charged its
 NCCL time (:func:`mstar_sim.cost.collective_seconds`, measured tables where
 they exist) on the current stream, on every rank alike, so timing stays
 symmetric, as SGLang's simulator and Maya assume.
@@ -160,6 +161,16 @@ def collective(family: str, group, nbytes: int, desc: list[int] | None) -> int:
     return functools.reduce(operator.and_, (r[_VALUES] for r in _meet(group, desc)))
 
 
+def _swap(peer: int, group, mine: int) -> int:
+    """Point to point: swap values bits (:func:`row`) with rank ``peer`` and return its. The
+    lower rank sends first, so a send against a send pairs too, as ``isend`` pairs."""
+    out, back = torch.tensor([mine], device="cpu"), torch.empty(1, dtype=torch.int64, device="cpu")
+    with clock.computing():
+        for step in ("send", "recv") if dist.get_rank() < peer else ("recv", "send"):
+            getattr(dist, step)(out if step == "send" else back, peer, group=group)
+    return int(back)
+
+
 def seal(tape: clock.Tape) -> None:
     """At the end of a capture, fold the tape's collectives into what each replay meets on:
     one row per group (in first-use order) with the count and a hash of the captured
@@ -233,6 +244,7 @@ def _collective(name: str, family: str, primitive: str | None):
                 | COMPUTED * (not any(device.never_computed(t._data) for t in tensors
                                       if not any(t is c for c in covered))))
         desc = None  # point to point (mstar sends none)
+        peer = next((a[k] for k in ("dst", "src") if a.get(k) is not None), None)
         if primitive is not None:
             size = dist.get_world_size(group) if dist.is_initialized() else 1
             send = recv = None
@@ -243,6 +255,8 @@ def _collective(name: str, family: str, primitive: str | None):
             desc = row(primitive, 0 if send else sum(t.numel() for t in outputs), (outputs or tensors)[0].dtype,
                        op=int(op) if op is not None else 0, root=root, values=mine, send=send, recv=recv, size=size)
         values = collective(family, group, nbytes, desc) & mine
+        if desc is None and peer is not None and clock.capturing() is None:
+            values &= _swap(peer, group, mine)
         moved = bool(values & HELD)
         work = _Done() if kwargs.get("async_op") else None
         if moved:

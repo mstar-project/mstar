@@ -738,6 +738,14 @@ def test_tensor_parallel_ranks_meet_at_each_collective():
             out = torch.zeros(sum(receives), device="cuda")
             dist.all_to_all_single(out, torch.ones(sum(sends), device="cuda"), receives, sends)
             assert never_computed(out._data) if r == 0 else out._data.device.type == "meta"
+            # point to point moves only if both ranks hold values: a value-less send against a
+            # kept receive moves nothing, where the receive alone would wait for it forever
+            if r == 0:
+                dist.send(torch.empty(1 << 14, device="cuda")[:4] * 2, dst=1)
+            else:
+                kept = torch.zeros(4, device="cuda")
+                dist.recv(kept, src=0)
+                assert never_computed(kept._data)
             # captured, nothing moves, at each replay
             y, graph = torch.zeros(4, device="cuda"), torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
