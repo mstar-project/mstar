@@ -48,7 +48,9 @@ from .sampling import (
 )
 from .topk import TopKTieBreak, top_k_page_table_transform
 
-__version__ = "0.7.2"  # mstar's pin: the contract test in tests/test_device.py holds them together
+# mstar's pin: the contract test in tests/test_device.py holds them together. A new pin means porting
+# the planners' sizing again (``_paged.py``, ``mla.py``), which copies this version's ``scheduler.cuh``
+__version__ = "0.7.2"
 
 __all__ = [
     "BatchDecodeWithPagedKVCacheWrapper",
