@@ -3,7 +3,7 @@
 ``create_allreduce_fusion_workspace`` builds a workspace on every rank, so
 ``mstar.distributed.ar_fusion`` takes its fused path as on a GPU. The real
 workspace's ranks talk through its own IPC buffers, not NCCL: here it owns a
-gloo group of its ranks, which a fused call meets on (``mstar_sim.dist``). A
+gloo channel of its ranks, which a fused call meets on (``mstar_sim.dist``). A
 fused call returns its outputs' shapes and is priced as the NCCL all-reduce of
 its input plus the norm.
 """
@@ -47,18 +47,30 @@ class AllReduceFusionWorkspace:
 
     def destroy(self) -> None:
         if self.group is not None:
-            dist.destroy_process_group(self.group)
+            dist.distributed_c10d._world.pg_group_ranks.pop(self.group, None)
             self.group = None
 
 
 def create_allreduce_fusion_workspace(backend="auto", world_size=1, rank=0, max_token_num=0, hidden_dim=0,
                                       dtype=torch.bfloat16, comm_backend=None, group=None, **kwargs):
     """Collective over ``group``'s ranks, as the real one is: their channel is made here."""
-    channel = None
-    if world_size > 1:
-        channel = dist.new_group(dist.get_process_group_ranks(group or dist.group.WORLD), backend="gloo",
-                                 use_local_synchronization=True)
+    channel = _channel(group or dist.group.WORLD) if world_size > 1 else None
     return AllReduceFusionWorkspace(backend, world_size, rank, max_token_num, hidden_dim, dtype, channel)
+
+
+def _channel(group):
+    """A gloo group of ``group``'s ranks, kept out of torch's registry as the real IPC buffers
+    are (torch names a group by how many this process holds, which differs between ranks in
+    different groups): named by ``group`` and its count of collectives after one, which the
+    real one makes to swap its handles; with ``group``'s timeout. torch knows only its ranks."""
+    dist.barrier(group=group)
+    ranks = dist.get_process_group_ranks(group)
+    store = dist.PrefixStore(f"mstar_sim/ar_fusion/{group.group_name}/{group._get_sequence_number_for_group()}",
+                             dist.distributed_c10d._get_default_store())
+    channel = dist.ProcessGroupGloo(store, ranks.index(dist.get_rank()), len(ranks),
+                                    group._get_backend(torch.device("cpu")).options._timeout)
+    dist.distributed_c10d._world.pg_group_ranks[channel] = {r: i for i, r in enumerate(ranks)}
+    return channel
 
 
 def _norm_cost(input, *args, **kwargs):

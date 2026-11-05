@@ -713,6 +713,19 @@ def test_tensor_parallel_ranks_meet_at_each_collective():
                 dist.all_reduce(x, group=tp)
                 dist.all_to_all_single(y, x, group=sp)
             graph.replay()
+            # a fused all-reduce's workspace, on ranks that hold more groups than their peers (only
+            # TP 0-1 takes the fused path): its channel meets eagerly and replayed, with its group
+            from flashinfer import comm
+            spaces = [comm.create_allreduce_fusion_workspace(world_size=2, rank=r % 2, group=tp)] if r < 2 else []
+            spaces.append(comm.create_allreduce_fusion_workspace(world_size=2, rank=r // 2, group=sp))
+            fused = dict(pattern=comm.AllReduceFusionPattern.kAllReduce, output=torch.empty(8, 64, device="cuda"))
+            comm.allreduce_fusion(torch.empty(8, 64, device="cuda"), spaces[-1], **fused)
+            with torch.cuda.graph(graph := torch.cuda.CUDAGraph()):
+                comm.allreduce_fusion(torch.empty(8, 64, device="cuda"), spaces[-1], **fused)
+                dist.all_reduce(x, group=sp)
+            graph.replay()
+            for space in spaces:
+                space.destroy()
             dist.destroy_process_group()
 
         if __name__ == "__main__":
