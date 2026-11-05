@@ -118,10 +118,10 @@ What to read:
   for traffic that does not use it (no LoRA kernel runs: the step replays a capture
   without them). Expect `res.plan.lora` in tens of microseconds. The price also
   includes losing resident decode planning (#1127), which a `lora:` block turns off on
-  the LLM node (the pool keeps no resident table yet). `base` plans decode on the
-  host, so its `res.plan.*` means are higher than `off`'s, whose decode steps return
-  from those plans at once and show `res.plan.resident` instead. That, and a lower
-  tok/s on the CPU-bound 0.8B, is the cost, not the kernels'.
+  the LLM node (the pool keeps no resident table yet): `base` plans decode on the host,
+  `off` partly on the device (how much depends on the GPU). Read that gap off the
+  `res.pre_plan.*` means in `phases.txt` and tok/s on the CPU-bound 0.8B; it is not the
+  kernels' cost.
 * `adapters-captured` against `base-captured`: the kernels' GPU time
   (`worker.postprocess.event_sync` grows if the step is GPU-bound) and tok/s.
 * `*-eager` against `*-captured`: the graphs' win with adapters, which was the
