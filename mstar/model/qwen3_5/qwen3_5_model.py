@@ -5,7 +5,6 @@ import torch
 from jinja2 import TemplateError
 from transformers import AutoTokenizer
 
-from mstar.communication.tensors import NameToTensorList
 from mstar.engine.resources.attn.config import AttentionConfig, AttentionSpec
 from mstar.engine.resources.attn.ragged.config import (
     RaggedAttentionConfig,
@@ -20,7 +19,7 @@ from mstar.engine.resources.linear_attn.config import (
 from mstar.engine.resources.position.config import PositionConfig, PositionSpec
 from mstar.engine.resources.recurrent.config import DeltaNetGeometry, RecurrentStateConfig, RecurrentStateSpec
 from mstar.engine.resources.spec import NodeResourceSpec
-from mstar.model.base import ProcessPromptOutput, TensorAndMetadata
+from mstar.model.base import TensorAndMetadata
 from mstar.model.keys import MIXED
 from mstar.model.media_limits import read_image
 from mstar.model.multimodal import (
@@ -79,9 +78,7 @@ class Qwen3_5DenseModel(MultimodalDecoderModel):
         prefill_token_buckets: list[int] | None = None,
         **kwargs: Any,
     ):
-        super().__init__(model_path_hf, cache_dir)
-        # the captured text-prefill ladder (`LLMSubmodule.PREFILL_TOKEN_BUCKETS`)
-        self.prefill_token_buckets = prefill_token_buckets
+        super().__init__(model_path_hf, cache_dir, prefill_token_buckets)
         self.config = Qwen3_5Config.from_hf(self.local_dir)
         # None on a text-only checkpoint (`_create_submodule` then refuses a
         # vision_encoder node)
@@ -405,30 +402,6 @@ class Qwen3_5DenseModel(MultimodalDecoderModel):
         return PreparedMedia(
             {"pixel_values": video.pixel_values}, [int(group.prod()) // merge ** 2] * t, [group] * t,
         )
-
-    def process_prompt(
-        self,
-        prompt: str | None,
-        input_modalities: list[str],
-        output_modalities: list[str],
-        tensors: NameToTensorList | None = None,
-        prompt_parts: list[PromptPart] | None = None,
-        **kwargs,
-    ) -> ProcessPromptOutput:
-        """The shared intake: ``text_inputs`` is the whole prompt, one pad per
-        merged vision token, and ``pixel_values`` the images and videos in
-        prompt order; ``MEDIA_LAYOUT`` gives each image and video frame
-        group's offset, tokens and grid, for the tower's grid maths and the
-        LLM's MRoPE positions."""
-        out = super().process_prompt(prompt, input_modalities, output_modalities, tensors, prompt_parts, **kwargs)
-        if (tensors or {}).get("image_inputs"):
-            # the raw images are not a graph input (the encoder reads
-            # `pixel_values`), so do not ship them to the workers
-            out.new_input_tensors["image_inputs"] = []
-        if (tensors or {}).get("video_inputs"):
-            # the decoded frames are spent; don't hold them for the request's life
-            out.new_input_tensors["video_inputs"] = []
-        return out
 
     def kv_layout(self, layout: dict, length: int, advance: int | None = None) -> dict:
         # an image spans max(h', w') MRoPE positions, not its t * h' * w' tokens

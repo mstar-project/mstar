@@ -134,9 +134,15 @@ class MultimodalDecoderModel(Model):
     # by `__init__`; a model built without it reads none)
     sampling_defaults: Mapping[str, object] = MappingProxyType({})
 
-    def __init__(self, model_path_hf: str, cache_dir: str | None = None):
+    def __init__(
+        self, model_path_hf: str, cache_dir: str | None = None,
+        prefill_token_buckets: list[int] | None = None,
+    ):
         self.model_path_hf = model_path_hf
         self.cache_dir = cache_dir
+        # a deployment's captured text-prefill ladder for the LLM node
+        # (`model_kwargs.prefill_token_buckets`; None keeps the node's own)
+        self.prefill_token_buckets = prefill_token_buckets
         self.local_dir = self._resolve_model_metadata()
         # so weights are materialized at most once per node
         self._submodule_cache: dict[str, NodeSubmodule | None] = {}
@@ -242,8 +248,13 @@ class MultimodalDecoderModel(Model):
         layout (`intake`)."""
         prompt_in = self.intake(prompt, input_modalities, tensors, prompt_parts, **kwargs)
         layout = self.prompt_layout(prompt_in)
+        # the raw attachments are spent once prepared (the encoders read their
+        # inputs): don't hold them for the request's life
+        spent = {
+            f"{m.modality}_inputs": [] for m in self.media if (tensors or {}).get(f"{m.modality}_inputs")
+        }
         return ProcessPromptOutput(
-            {"text_inputs": [prompt_in.pads.ids], **prompt_in.inputs},
+            {"text_inputs": [prompt_in.pads.ids], **spent, **prompt_in.inputs},
             {MEDIA_LAYOUT: layout, "kv_layout": self.kv_layout(layout, int(prompt_in.pads.ids.numel()))},
         )
 
