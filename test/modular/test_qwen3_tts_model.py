@@ -173,19 +173,25 @@ def test_qwen3_tts_model_loads_tokenizer_with_correct_regex(
     assert captured["fix_mistral_regex"] is True
 
 
-@pytest.mark.parametrize("config, side", [
-    ("qwen3tts.yaml", (("Codec", "codec_chunk"),)),
-    ("qwen3tts_1p7b.yaml", (("Codec", "codec_chunk"),)),
-    ("qwen3tts_base.yaml", (("Codec", "codec_chunk"),)),
-    ("qwen3tts_voicedesign.yaml", (("Codec", "codec_chunk"),)),
-    ("qwen3tts_1p7b_split.yaml", ()),
+@pytest.mark.parametrize("config, ask, side", [
+    ("qwen3tts.yaml", False, ()),
+    ("qwen3tts_1p7b.yaml", False, ()),
+    ("qwen3tts_base.yaml", False, ()),
+    ("qwen3tts_voicedesign.yaml", False, ()),
+    ("qwen3tts_1p7b.yaml", True, (("Codec", "codec_chunk"),)),
+    ("qwen3tts_1p7b_split.yaml", False, ()),
 ])
-def test_the_codec_walk_runs_beside_the_talker_where_the_config_asks(config, side):
+def test_the_codec_walk_runs_beside_the_talker_where_the_config_asks(config, ask, side):
+    """No shipped config asks; a colocated one that sets ``side_stream`` on the
+    Codec's group runs its windows beside the Talker."""
     from mstar.distributed.communication import WorkerParallelGroups
     from mstar.worker.engine_manager import _side_lane_keys, side_stream_nodes
 
     model = _make_model()
     groups = yaml.safe_load((CONFIG_PATH.parent / config).read_text(encoding="utf-8"))["node_groups"]
+    for group in groups:
+        if ask and "Codec" in group["node_names"]:
+            group["side_stream"] = True
     assert CodecSubmodule.side_stream_walks == {"codec_chunk"}
     codec = CodecSubmodule.__new__(CodecSubmodule)
     for ranks in ({0}, {1}):
@@ -201,7 +207,7 @@ def test_the_codec_walk_runs_beside_the_talker_where_the_config_asks(config, sid
 
 def test_the_codec_holds_only_what_the_side_lane_admits():
     """The lane takes a node's recurrent state pools of its own and nothing
-    else, so a resource added to the Codec would turn the colocated configs'
+    else, so a resource added to the Codec would turn a config's
     ``side_stream`` into a startup error."""
     from mstar.worker.engine_manager import _lane_holds
 
