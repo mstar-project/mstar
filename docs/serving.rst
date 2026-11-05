@@ -327,12 +327,18 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        every prompt step. Off, the next chunk waits for the current one to land. Naming
        a node or walk the model does not chunk fails loading.
    * - ``max_step_repeats``
-     - *(optional, default 1)* The most iterations of a decode Loop one step may stand for.
-       The host plans once, the captured graph replays that many times, and stops are read
-       when the step lands, so a row that stopped inside it costs the replays past its stop.
-       Applies where a step's resources allow it (``Resource.max_repeats``): a walk on
-       resident tables, with a declared token stop, that keeps its outputs on the device, on
-       a GPU whose decode attention reads its lengths on the device. Elsewhere steps stay at 1.
+     - *(optional, default 1)* The most iterations of a decode Loop one step may stand for,
+       an integer. The host plans once, the captured graph replays that many times, and
+       stops are read when the step lands. The next step is already running by then, so a
+       row that stops inside a step runs up to 2N-1 iterations past its stop, against 1
+       at N=1. A step repeats only inside a speculated chain (async scheduling on), with
+       no new rows, on one rank, for a walk on resident tables with a declared token stop
+       and its outputs on the device, and at most a KV page's worth of iterations. Its
+       resources can narrow any step to 1 (``Resource.max_repeats``): FlashInfer decode
+       other than tensor-core (CUDA-core, fa3, cuDNN), a sampler with a repetition window
+       or without in-graph scatter, and, for every step on the node while one is live, a
+       request with a repetition penalty or log-probs. The worker log says why a walk
+       can't repeat.
    * - ``batch_builder``
      - *(optional, default* ``fifo`` *)* How the worker composes a step under a token
        budget (``max_batch_tokens``). ``fifo`` serves prompts in the order they started:

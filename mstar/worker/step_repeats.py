@@ -3,7 +3,8 @@
 A step of a steady batch needs nothing from the host between iterations: its
 capture advances every row itself, so the host plans once, the device replays,
 and the stops are read when the step lands. A row that stopped inside the step
-costs the iterations the device ran past it, as a speculated step already does.
+costs the iterations the device ran past it, and the next step's, already
+launched: up to 2N-1, against the one a speculated step costs.
 
 The serving config's ``max_step_repeats`` asks for this; 1 is off. What a walk
 needs is decided once per (node, walk), here. What a step can have is decided

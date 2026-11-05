@@ -1659,6 +1659,16 @@ own: its per-request scalars (temperature, top-k, top-p, seed, penalties) become
 of the row, so a resident step stages none of them, while the RNG offset, the last token
 and the repetition-penalty mask stay by the sampler's own row of each request.
 
+A resident step can also stand for several iterations of its Loop (``max_step_repeats``
+in the serving config): the host plans once and the capture replays, the token carried
+from one replay to the next by ``repeat_carry``, which ``DeviceLoopback`` supplies. Every
+resource the step declares answers ``Resource.max_repeats`` at admit, and the step runs
+the smallest answer; the default is 1, so a resource takes part only once it says how far
+its capture advances itself. Whatever it counts per step (stored lengths, positions,
+recurrent token counts) it counts with ``StepContext.run_span``, not the declared
+``span``. What a replay reads that its capture doesn't advance moves in
+``Resource.next_replay``, between replays.
+
 A ``SubmoduleStep`` contains a list of ``Segment`` objects and one ``ResourceStep`` per
 resource key:
 
