@@ -244,8 +244,9 @@ def resident_planning() -> str:
     """``resident_planning`` / ``MSTAR_RESIDENT_PLANNING`` (default ``auto``):
     a captured decode step reads its rows off per-request tables held on the
     device instead of having them rebuilt on the plan thread
-    (``mstar.engine.resources.resident``). ``auto`` turns it on for a node
-    whose submodule names resident walks and every resource of which is
-    resident-capable, and says why at startup when one is not; ``off`` keeps
-    the host plan everywhere."""
+    (``mstar.engine.resources.resident``). ``auto`` turns it on for each walk
+    that runs a node in a Loop where every owner of a fact it needs agrees
+    (its capture, its declared step, each resource, its ``preprocess``), and
+    logs one line per such walk at startup; ``off`` keeps the host plan
+    everywhere."""
     return _resident_planning_value(_setting("resident_planning", "auto"))

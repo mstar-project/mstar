@@ -141,7 +141,7 @@ class FlashInferCrossManager(CrossAttentionManager):
 
         self._workspaces = WorkspacePool(device, owner=kv_cache)
 
-    def resident_refusal(self) -> str | None:
+    def resident_refusal(self, key, streams) -> str | None:
         if self._query_kv_cache_name == self._kv_cache_name:
             return "a context in the query's own pool would be a second stream on one resident row"
         return None

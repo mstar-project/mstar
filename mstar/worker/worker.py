@@ -465,8 +465,8 @@ class Worker:
     # postprocess.
     chunk_loops: ChunkLoops = ChunkLoops()
 
-    # Set at load when ``max_step_repeats`` is above 1; None, every step runs
-    # once, so a worker built without it -- any test fake -- never repeats.
+    # Set at load; None, every step runs once, so a worker built without it --
+    # any test fake -- never repeats.
     _step_repeats: StepRepeats | None = None
 
     # Metrics are off unless __init__ gets a status interval; class-level so a
@@ -489,6 +489,8 @@ class Worker:
     # never updated in place
     _rows_by_lane: Mapping[int, frozenset[int]] = MappingProxyType({})
     _process_cpus: frozenset[int] = frozenset()
+    # (graph_walk, node) -> innermost enclosing loop, set at load; empty on a bare instance
+    _innermost_loop_by_node: Mapping[tuple[str, str], str] = MappingProxyType({})
 
     @cached_property
     def device_capability(self) -> DeviceCapability:
@@ -625,12 +627,10 @@ class Worker:
             my_walks.update(
                 (node, walk) for node in wg_nodes for walk in wg.graph_walks
             )
-        step_repeats = StepRepeats((model_config or {}).get("max_step_repeats", 1), my_walks, {
+        streamed = {
             (node, walk) for wg in my_worker_graphs for node, graph_node in wg.section.get_nodes().items()
             if graph_node.consumes_stream for walk in wg.graph_walks
-        })
-        if step_repeats.limit > 1:
-            self._step_repeats = step_repeats
+        }
         self.chunk_loops = ChunkLoops.from_graphs(
             my_worker_graphs, (model_config or {}).get("speculate_mid_prefill"),
             model.chunking_policy_of() if model is not None else {},
@@ -870,11 +870,14 @@ class Worker:
         # stream-terminated loop and refusing an END_PARTITION from inside a
         # loop in _postprocess_batch. Structural, so it is derived from the
         # model here rather than asked of the graph runtime per step.
-        self._innermost_loop_by_node: dict[tuple[str, str], str] = {}
         if model:
             self._innermost_loop_by_node = self._build_innermost_loop_cache(
                 model.get_graph_walk_graphs(),
             )
+        self._step_repeats = StepRepeats(
+            (model_config or {}).get("max_step_repeats", 1),
+            {(node, walk) for walk, node in self._innermost_loop_by_node if (node, walk) in my_walks}, streamed,
+        )
 
         if status_interval_s is not None:
             self._metrics = self._start_metrics(status_interval_s)
@@ -2899,7 +2902,7 @@ class Worker:
     def _stamp_repeats(self, speculation: Speculation, pending: PendingBatch, in_chain: int) -> None:
         """Ask for as many iterations as the step can have; its resources narrow
         it at admit (`_await_admit_settled` takes the answer)."""
-        if self._step_repeats is None:
+        if self._step_repeats is None or self._step_repeats.limit == 1:
             return
         batch = speculation.scheduled_batch
         speculation.node_batch.step_context.repeats = self._step_repeats.ceiling(
@@ -2914,8 +2917,6 @@ class Worker:
         """Why no step of this walk can stand for several iterations, or None:
         something about its rows has to reach the host every iteration."""
         engine = self.engine_manager.get_engine(node_name)
-        if (graph_walk, node_name) not in self._innermost_loop_by_node:
-            return "its node isn't in a Loop"
         if self._stop_token_signal.get((node_name, graph_walk)) is None:
             return "the runtime doesn't check its stop: it declares no token stop"
         if not self._all_on_device(
@@ -5082,10 +5083,10 @@ class Worker:
         self._verify_tp_async_sched_agrees()
 
         # CUDA graph capture before entering the main loop
-        self.engine_manager.warmup_all()
+        self.engine_manager.warmup_all({(node, walk) for walk, node in self._innermost_loop_by_node})
         if self._step_repeats is not None:
-            # after capture: an attention decides from the kernels it captured
-            self._step_repeats.settle(self._repeat_refusal)
+            # after capture: an attention decides repeats from the kernels it captured
+            self._step_repeats.settle(self.engine_manager.engine.resident_refusal, self._repeat_refusal)
 
         # Sync every worker before the main loop opens. Per-batch-size
         # captures inside CudaGraphRunner are already barriered on the

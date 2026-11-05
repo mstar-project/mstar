@@ -46,7 +46,7 @@ from mstar.engine.resources.kv.config import instance_size, opening_prefix_cache
 from mstar.engine.resources.kv.keys import fingerprint
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.engine.resources.lora.config import LoraBaseOnly, node_capture_key
-from mstar.engine.resources.resident import ResidentPlanner, build_planner
+from mstar.engine.resources.resident import ResidentPlanner, build_planner, watch_table_reads
 from mstar.engine.resources.spec import resolve_spec_dependencies
 from mstar.engine.resources.step import (
     ADMIT_OK,
@@ -194,6 +194,8 @@ class SubmoduleManagement:
     fp32_precision: Fp32Precision | None = None
     # the node's request slots and device tables, where it runs on them
     resident: ResidentPlanner | None = None
+    # walk -> why it stays host-planned, for each walk that loops the node and isn't resident
+    resident_refusals: dict[str, str] = field(default_factory=dict)
 
     # Rotated globally, not per runner: slot-keyed buffers are shared across
     # buckets and regions, so per-runner counters let consecutive steps collide
@@ -721,27 +723,51 @@ class Engine:
                 # reads them back on the device (see DeviceLoopback)
                 resources[loopback.sampler].enable_device_loopback_reader()
 
-    def _build_resident_planner(self, node_name: str, runner: AcceleratorGraphRunner) -> None:
-        """Put ``node_name`` on resident tables if it can and the deployment
-        lets it; the startup log says why a node that named walks stays on the
-        host. In `order`, so an owner runs after what it depends on. Built here
-        because the tables are sized by the node's captures, and ahead of them
-        because a capture holds the tables' addresses."""
-        if knobs.resident_planning() == "off":
+    def _build_resident_planner(self, node_name: str, runner: AcceleratorGraphRunner, looped: Collection[str]) -> None:
+        """Put each walk in ``looped`` (those that loop ``node_name``) on
+        resident tables if every owner of a fact it needs agrees, and keep why
+        each other one stays host-planned (`resident_refusal`). After every
+        runner has claimed its capture buffers, which a template's plan reads,
+        and before any capture, which holds the tables' addresses."""
+        if not looped:
             return
         submodule_mgmt = self._submodules[node_name]
-        walks = submodule_mgmt.submodule.resident_walks()
-        if not walks:
+        refusals = submodule_mgmt.resident_refusals
+        if knobs.resident_planning() == "off":
+            refusals.update(dict.fromkeys(looped, "resident_planning is off"))
+            return
+        steps = {}
+        for walk in sorted(looped):
+            refusal = runner.resident_refusal(walk)
+            if refusal is None:
+                steps[walk] = runner.template_step(walk)
+            else:
+                refusals[walk] = refusal
+
+        def probe(walk: str) -> str | None:
+            # a resident step's tables fill these in its graph, after its preprocess
+            with watch_table_reads() as reads:
+                runner.prepare_template(walk)
+            return f"its captured preprocess reads {reads[0]}, which the graph fills after it" if reads else None
+
+        if not steps:
             return
         resources = submodule_mgmt.resources
         submodule_mgmt.resident, refused = build_planner(
-            node_name, walks,
+            node_name, steps,
             {key: resources[key] for key in self._runner.order if key in resources},
-            self._resource_nodes, self._device, runner.max_capture_bs(walks),
+            self._resource_nodes, self._device, runner.max_capture_bs, probe,
         )
-        if submodule_mgmt.resident is None:
-            logger.warning("resident planning stays off on %s: %s", node_name, refused)
+        refusals.update(refused)
         runner.bind_resident(submodule_mgmt.resident)
+
+    def resident_refusal(self, node_name: str, graph_walk: str) -> str | None:
+        """Why steps of ``graph_walk`` on ``node_name`` plan on the host, or
+        None if they run on resident tables. Settled at load."""
+        mgmt = self._submodules[node_name]
+        if mgmt.resident is not None and graph_walk in mgmt.resident.walks:
+            return None
+        return mgmt.resident_refusals.get(graph_walk, "its node isn't in a Loop of it")
 
     def paged_kv_caches(self) -> list[PagedKVCache]:
         """Every paged KV cache this engine built, with the nodes that use it."""
@@ -848,7 +874,9 @@ class Engine:
         """This node's resolved dtype, or None for one that opted out."""
         return self._submodules[node_name].node_dtype
 
-    def warmup(self) -> None:
+    def warmup(self, looped: Collection[tuple[str, str]] = ()) -> None:
+        """Capture every node's graphs. ``looped``: the (node, walk) pairs whose
+        walk runs the node inside a Loop, which may run on resident tables."""
         # before capture: a region inside a captured graph compiles in its warm-up
         self._compile_regions()
         ag_runners: dict[str, AcceleratorGraphRunner] = {}
@@ -869,7 +897,6 @@ class Engine:
                 device_capability=self.device_capability,
                 capture_stream=capture_stream,
             )
-            self._build_resident_planner(node_name, runner)
             piecewise[node_name] = self._build_piecewise_runners(
                 node_name, submodule_mgmt, capture_stream,
             )
@@ -881,6 +908,10 @@ class Engine:
             ag_runners[node_name].prepare_for_capture()
             for runner in piecewise[node_name].values():
                 runner.prepare_for_capture()
+        for node_name in self._submodules:
+            self._build_resident_planner(
+                node_name, ag_runners[node_name], {walk for node, walk in looped if node == node_name},
+            )
 
         # every bucket sized before any is captured, so one plan weighs them all
         # against the largest eager step on the device
@@ -2149,9 +2180,17 @@ class Engine:
             range_push("engine.preprocess")
         t0 = phase_start()
         try:
-            preprocessed = submodule.preprocess(
-                ctx.graph_walk, engine_inputs=engine_inputs, inputs=inputs,
-            )
+            if ctx.resident is None:
+                preprocessed = submodule.preprocess(ctx.graph_walk, engine_inputs=engine_inputs, inputs=inputs)
+            else:
+                with watch_table_reads() as reads:
+                    preprocessed = submodule.preprocess(ctx.graph_walk, engine_inputs=engine_inputs, inputs=inputs)
+                if reads:
+                    # a branch the capture template didn't take at load
+                    raise SystemExit(
+                        f"{batch.node_name}/{ctx.graph_walk}: a resident step's preprocess read {reads[0]}, "
+                        "which its graph fills after it; serve it with resident_planning: off"
+                    )
         finally:
             phase_end("engine.preprocess", t0)
             if nvtx:
@@ -2836,9 +2875,9 @@ class Engine:
         """Why a step of this walk can't replay with no host work between, or
         None if it may: the deployment, the walk's step and every resource of
         the node each answer. After capture, which some resources decide at."""
-        mgmt = self._submodules.get(node_name)
-        if mgmt is None or mgmt.resident is None or graph_walk not in mgmt.resident.walks:
+        if self.resident_refusal(node_name, graph_walk) is not None:
             return "it doesn't run on resident tables"
+        mgmt = self._submodules[node_name]
         if mgmt.joint_comm_group.world_size > 1:
             # every rank would have to replay the same count, which one rank settles
             return "it runs on more than one rank"

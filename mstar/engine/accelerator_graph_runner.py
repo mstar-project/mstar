@@ -29,7 +29,7 @@ from mstar.engine.node_dtype import node_scope
 from mstar.engine.resources import BucketKey, CGSlotSpec, Resource, SlotLease, StepContext, StepRunner
 from mstar.engine.resources.lora.config import LoraBaseOnly
 from mstar.engine.resources.resident import ResidentPlanner
-from mstar.engine.resources.step import PIECEWISE_WALK
+from mstar.engine.resources.step import PIECEWISE_WALK, SubmoduleStep
 from mstar.model.submodule_base import (
     BatchedModelOutput,
     ModelInputsFromEngine,
@@ -667,6 +667,14 @@ class AcceleratorGraphBucket:
     slots: list[AcceleratorGraphSlot] = field(default_factory=list)
 
 
+class CaptureTemplate(NamedTuple):
+    """A capture's padding rows, their inputs, and the step they declare."""
+    rids: list[int]
+    inputs: list[NodeInputs]
+    engine_inputs: ModelInputsFromEngine
+    step: SubmoduleStep | None
+
+
 class WarmedSpec(NamedTuple):
     """A spec prepared and run eagerly: what its capture reads."""
     run: Callable[[], Any]
@@ -795,6 +803,39 @@ class AcceleratorGraphRunner:
     def bind_resident(self, planner: ResidentPlanner | None) -> None:
         """Before any capture: a capture of a walk ``planner`` covers records its kernels."""
         self._resident = planner
+
+    def resident_refusal(self, walk: str) -> str | None:
+        """Why the captures of ``walk`` can't run it on resident tables, or
+        None. After `prepare_for_capture`."""
+        if self._graph_backend is None or not self._graph_backend.is_available():
+            return "its device captures no graphs"
+        configs = [c for c in self._capture_configs if c.capture_graph_walk == walk]
+        if not any(not _is_packed(c) for c in configs):
+            return "it has no batched capture"
+        if any(set(c.replay_graph_walks) - {walk} for c in configs):
+            # one graph would serve walks with and without the tables
+            return "its capture also replays other walks"
+        if not any(spec.bucket.graph_walk == walk for spec in self.prepare_for_capture()):
+            return "every capture of it was dropped"
+        return None
+
+    def template_step(self, walk: str) -> SubmoduleStep | None:
+        """The step ``walk``'s widest capture declares."""
+        return self._template(self._widest(walk)).step
+
+    def prepare_template(self, walk: str) -> None:
+        """Admit, plan and preprocess ``walk``'s widest capture on its padding
+        rows, as its capture will, then free them. Before any capture, so the
+        engine can watch what this ``preprocess`` reads (`resident.table_read`)."""
+        spec = self._widest(walk)
+        template = self._template(spec)
+        try:
+            self._prepare(spec, template)
+        finally:
+            self._dummy_rows.reset(template.rids, free=True)
+
+    def _widest(self, walk: str) -> CGSlotSpec:
+        return next(s for s in self.prepare_for_capture() if s.bucket.graph_walk == walk and s.slot == 0)
 
     # ── Capture ─────────────────────────────────────────────────────────
 
@@ -1151,44 +1192,9 @@ class AcceleratorGraphRunner:
         its first capture needs."""
         walk = spec.bucket.graph_walk
         config = spec.config
-        dummy_rids = self._dummy_rows.ensure(
-            f"{spec.config_idx}_slot{spec.slot}", spec.bs
-        )
-        dummy_inputs = config.get_node_inputs(spec.bs, spec.num_tokens)
-        engine_inputs = self._dummy_engine_inputs(dummy_rids, walk)
-
-        lease = SlotLease(slot=spec.slot, bucket=spec.bucket)
-        step = engine_step(
-            self._submodule,
-            graph_walk=walk, request_ids=dummy_rids, inputs=dummy_inputs,
-            slot_lease=lease, per_request_info=engine_inputs.per_request_info,
-        )
-        if step is not None:
-            step = replace(step, _ctx=StepContext(
-                request_ids=tuple(dummy_rids),
-                graph_walk=walk,
-                slot=spec.slot,
-                capture=True,
-                slot_lease=lease,
-                force_prefill=_is_packed(config),
-            ))
-
-        engine_inputs.step = step
-
-        def prepare() -> dict[str, Any]:
-            if step is not None:
-                outcome = self._step_runner.admit(step)
-                if not outcome.ok:
-                    raise RuntimeError(
-                        f"capture admit failed for {spec.bucket}: {outcome.reason}"
-                    )
-                self._step_runner.plan(step)
-            return self._submodule.preprocess(
-                graph_walk=walk,
-                engine_inputs=engine_inputs,
-                inputs=dummy_inputs,
-            )
-
+        template = self._template(spec)
+        dummy_rids, engine_inputs, step = template.rids, template.engine_inputs, template.step
+        prepare = partial(self._prepare, spec, template)
         try:
             static_inputs = prepare()
             # Intern before capture so every bucket of this config records the
@@ -1256,6 +1262,41 @@ class AcceleratorGraphRunner:
             # Capture ran the dummy rows as real requests; free their storage
             # now, since replay's padding rows address the sink page and slot.
             self._dummy_rows.reset(dummy_rids, free=True)
+
+    def _template(self, spec: CGSlotSpec) -> CaptureTemplate:
+        """``spec``'s padding rows, inputs and declared step."""
+        walk = spec.bucket.graph_walk
+        dummy_rids = self._dummy_rows.ensure(f"{spec.config_idx}_slot{spec.slot}", spec.bs)
+        dummy_inputs = spec.config.get_node_inputs(spec.bs, spec.num_tokens)
+        engine_inputs = self._dummy_engine_inputs(dummy_rids, walk)
+        lease = SlotLease(slot=spec.slot, bucket=spec.bucket)
+        step = engine_step(
+            self._submodule,
+            graph_walk=walk, request_ids=dummy_rids, inputs=dummy_inputs,
+            slot_lease=lease, per_request_info=engine_inputs.per_request_info,
+        )
+        if step is not None:
+            step = replace(step, _ctx=StepContext(
+                request_ids=tuple(dummy_rids),
+                graph_walk=walk,
+                slot=spec.slot,
+                capture=True,
+                slot_lease=lease,
+                force_prefill=_is_packed(spec.config),
+            ))
+        engine_inputs.step = step
+        return CaptureTemplate(dummy_rids, dummy_inputs, engine_inputs, step)
+
+    def _prepare(self, spec: CGSlotSpec, template: CaptureTemplate) -> dict[str, Any]:
+        """Admit and plan ``template``'s step, and preprocess its inputs."""
+        if template.step is not None:
+            outcome = self._step_runner.admit(template.step)
+            if not outcome.ok:
+                raise RuntimeError(f"capture admit failed for {spec.bucket}: {outcome.reason}")
+            self._step_runner.plan(template.step)
+        return self._submodule.preprocess(
+            graph_walk=spec.bucket.graph_walk, engine_inputs=template.engine_inputs, inputs=template.inputs,
+        )
 
     def _forward_for(self, spec: CGSlotSpec):
         """The callable this bucket captures, compiled once per config.

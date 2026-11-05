@@ -390,11 +390,6 @@ class LLMSubmodule(ARNodeSubmodule):
         input_ids = inputs["text_inputs"][0]
         return ARNodeInputs(input_seq_len=input_ids.shape[0], input_ids=input_ids)
 
-    def resident_walks(self) -> frozenset[str]:
-        # a captured decode step builds its rope inside the graph on every config
-        # (`_rope_in_graph`), so its `preprocess` reads nothing the tables fill
-        return frozenset({"decode"})
-
     @staticmethod
     def _rope_in_graph(engine_inputs: ModelInputsFromEngine, graph_walk: str) -> bool:
         """A step of a text walk replayed on a leased slot, or being captured

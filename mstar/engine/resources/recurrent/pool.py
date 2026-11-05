@@ -48,6 +48,7 @@ if TYPE_CHECKING:
     from mstar.engine.resources.resident import (
         CapturedResidentStep,
         ResidentPlanner,
+        ResidentStream,
         ResidentTable,
         ResidentWrites,
     )
@@ -1137,9 +1138,11 @@ class RecurrentStatePool(Resource):
     def repeat_refusal(self) -> str | None:
         return None  # a row's state is updated in place, at its slot
 
-    def resident_refusal(self) -> str | None:
+    def resident_refusal(self, key: str, streams: Mapping[str, "ResidentStream"]) -> str | None:
         if self.config.disable_sink_slot:
             return "a pool with no sink slot has nowhere for a padding row"
+        if streams[key].reads:
+            return "a resident step advances its state, not reads it"
         return None
 
     def bind_resident(self, planner: "ResidentPlanner", key: str) -> None:
@@ -1152,8 +1155,6 @@ class RecurrentStatePool(Resource):
 
     def resident_gather(self, step: "CapturedResidentStep") -> None:
         stream = step.streams[self._resident_key]
-        if stream.reads:
-            raise ValueError(f"recurrent pool {self._resident_key!r}: a resident step advances its state, not reads it")
         key = CGSlotKey(bucket=step.bucket, slot=step.slot, label=stream.label)
         table = self._resident_table
         # a padding row reads the trash row's zero, which is SINK_SLOT

@@ -128,7 +128,7 @@ class FlashInferManager(AttentionManager):
             if isinstance(wrapper, FlashInferDecodeWrapper):
                 wrapper.next_replay()
 
-    def resident_refusal(self) -> str | None:
+    def resident_refusal(self, key, streams) -> str | None:
         if self._window_left >= 0:
             return "a sliding window reads pages a resident row no longer holds"
         return None

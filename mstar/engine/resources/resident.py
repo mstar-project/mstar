@@ -25,9 +25,12 @@ from __future__ import annotations
 
 import logging
 import threading
-from collections.abc import Collection, Iterable, Mapping
+from collections.abc import Callable, Collection, Iterator, Mapping
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from itertools import chain
+from typing import NamedTuple
 
 import numpy as np
 import torch
@@ -44,6 +47,30 @@ logger = logging.getLogger(__name__)
 # Row 0 of every table, never a request's. Padding rows read and write it: its
 # cells stay zero, which every owner's table takes to mean the sink.
 TRASH_SLOT = 0
+
+
+# The reads of buffers a resident step's graph fills, after `preprocess` has run.
+_TABLE_READS: ContextVar[list[str] | None] = ContextVar("resident_table_reads", default=None)
+
+
+def table_read(name: str) -> None:
+    """Called by an accessor of a buffer that a resident step's tables fill in
+    its graph. A `preprocess` that reads one would read the last step's value;
+    the engine watches for it (`watch_table_reads`). Free outside a watch."""
+    reads = _TABLE_READS.get()
+    if reads is not None:
+        reads.append(name)
+
+
+@contextmanager
+def watch_table_reads() -> Iterator[list[str]]:
+    """The names `table_read` records on this thread while open."""
+    reads: list[str] = []
+    token = _TABLE_READS.set(reads)
+    try:
+        yield reads
+    finally:
+        _TABLE_READS.reset(token)
 
 
 # What a captured step records: a small kernel apiece. The torch ops for the same
@@ -124,15 +151,13 @@ class ResidentTable:
         return slot * self.stride + self.col + col
 
 
-class ResidentStream:
-    """One resource's stream on a resident bucket's steps, fixed by its capture."""
+class ResidentStream(NamedTuple):
+    """One resource's stream on a resident walk's steps, fixed at load by the
+    step its capture template declares."""
 
-    __slots__ = ("label", "reads")
-
-    def __init__(self, label: str, reads: bool):
-        self.label = label
-        # declared at span 0: the step reads the stream and appends nothing
-        self.reads = reads
+    label: str
+    # declared at span 0: the step reads the stream and appends nothing
+    reads: bool
 
 
 class ResidentWrites:
@@ -234,11 +259,13 @@ class ResidentPlanner:
     """
 
     def __init__(
-        self, node: str, walks: Collection[str], resources: Mapping[str, Resource],
+        self, node: str, walks: Mapping[str, Mapping[str, ResidentStream]], resources: Mapping[str, Resource],
         device: torch.device, max_bs: int,
     ):
         self.node = node
         self.walks = frozenset(walks)
+        # each walk's stream per resource key, which every bucket of it declares
+        self._walk_streams = dict(walks)
         self.device = device
         # request rows plus the trash row
         self.max_slots = 2 * max_bs + 1
@@ -252,7 +279,7 @@ class ResidentPlanner:
         self.narrow_cols = 0
         self._buffers: dict[tuple[BucketKey, int], ResidentBuffers] = {}
         # each resource's stream on a bucket's steps, by bucket then resource key, from its capture
-        self._streams: dict[BucketKey, dict[str, ResidentStream]] = {}
+        self._streams: dict[BucketKey, Mapping[str, ResidentStream]] = {}
         # buckets whose steps need no host plan at all
         self.host_plan_free: set[BucketKey] = set()
 
@@ -572,50 +599,21 @@ class ResidentPlanner:
     # The capture
 
     def capture_step(self, bucket: BucketKey, slot: int, step: SubmoduleStep) -> CapturedResidentStep:
-        """What a capture of ``bucket`` records around its forward. Refuses a
-        walk whose declared step isn't, for each resource, one stream that it
-        appends one token a row to or only reads, each row advancing alone: a
-        captured step can't hold anything else."""
-        if step is None:
-            raise ValueError(f"resident walk {bucket.graph_walk!r} on {self.node} declares no step")
-        # once per bucket: each of its captures, and every step it replays, reads these
-        streams = self._streams.get(bucket) or self._declared_streams(bucket, step)
-        for key, resource_step in step.steps.items():
-            refusal = next(
-                (
-                    name for name in ("pre_forks", "post_forks", "retention", "sink", "advance", "pos_ids", "fork_rids")
-                    if getattr(resource_step, name, None)
-                ),
-                # a step that keeps no tokens: the table's commit would advance past its stream
-                "commit=False" if getattr(resource_step, "commit", True) is False else None,
-            )
+        """What a capture of ``bucket`` records around its forward. Its walk
+        passed `step_refusal` at load on its widest bucket; the others declare
+        the same step or the worker stops."""
+        streams = self._streams.get(bucket)
+        if streams is None:
+            want = self._walk_streams[bucket.graph_walk]
+            refusal = step_refusal(self._keys, step)
+            if refusal is None and declared_streams(self._keys, step) != want:
+                refusal = f"its streams {declared_streams(self._keys, step)} aren't its walk's {dict(want)}"
             if refusal is not None:
-                raise ValueError(
-                    f"resident walk {bucket.graph_walk!r} on {self.node}: resource {key!r} declares "
-                    f"{refusal}, which a resident step can't carry"
-                )
-        self._streams[bucket] = streams
+                raise SystemExit(f"resident walk {bucket.graph_walk!r} on {self.node}: bucket {bucket} {refusal}")
+            # once per bucket: each of its captures, and every step it replays, reads these
+            streams = self._streams[bucket] = want
         buffers = self.buffers(bucket, slot)
         return CapturedResidentStep(bucket, slot, buffers.slots, buffers, self._store, streams)
-
-    def _declared_streams(self, bucket: BucketKey, step: SubmoduleStep) -> dict[str, ResidentStream]:
-        """Each resource's stream on ``bucket``'s steps: the label of its own
-        segments, or of the step's when it names none, and whether it appends
-        one token a row (span 1) or only reads (span 0)."""
-        streams = {}
-        for key in self._keys:
-            resource_step = step.steps.get(key)
-            segments = (resource_step.segments if resource_step is not None else None) or step.segments or ()
-            labels = {seg.label for seg in segments}
-            spans = {seg.span for seg in segments}
-            if len(labels) != 1 or spans not in ({1}, {0}):
-                raise ValueError(
-                    f"resident walk {bucket.graph_walk!r} on {self.node}: resource {key!r} declares "
-                    f"{len(segments)} segments over labels {sorted(labels)} and spans {sorted(spans)}; "
-                    "a resident step is one token per row in one stream a resource, or a stream it only reads"
-                )
-            streams[key] = ResidentStream(labels.pop(), reads=spans == {0})
-        return streams
 
     def gather(self, step: CapturedResidentStep) -> None:
         if self._length_keys:
@@ -632,22 +630,83 @@ class ResidentPlanner:
             resource.resident_commit(step)
 
 
+# what a resource's part of a step may declare that a captured step can't carry
+_UNCARRIED = ("pre_forks", "post_forks", "retention", "sink", "advance", "pos_ids", "fork_rids")
+
+
+def step_refusal(keys: Collection[str], step: SubmoduleStep | None) -> str | None:
+    """Why ``step`` can't be a resident step, or None: for each resource of
+    ``keys``, one stream that it appends one token a row to (span 1) or only
+    reads (span 0), each row advancing alone."""
+    if step is None:
+        return "it declares no step"
+    for key, resource_step in step.steps.items():
+        uncarried = next((name for name in _UNCARRIED if getattr(resource_step, name, None)), None)
+        if uncarried is None and getattr(resource_step, "commit", True) is False:
+            # a step that keeps no tokens: the table's commit would advance past its stream
+            uncarried = "commit=False"
+        if uncarried is not None:
+            return f"resource {key!r} declares {uncarried}, which a resident step can't carry"
+    for key in keys:
+        segments = _segments(key, step)
+        labels = {seg.label for seg in segments}
+        spans = {seg.span for seg in segments}
+        if len(labels) != 1 or spans not in ({1}, {0}):
+            return (
+                f"resource {key!r} declares {len(segments)} segments over labels {sorted(labels)} and spans "
+                f"{sorted(spans)}, not one token a row in one stream or a stream it only reads"
+            )
+    return None
+
+
+def declared_streams(keys: Collection[str], step: SubmoduleStep) -> dict[str, ResidentStream]:
+    """Each resource's stream on a step that passed `step_refusal`: the label
+    of its own segments, or of the step's when it names none."""
+    streams = {}
+    for key in keys:
+        segments = _segments(key, step)
+        streams[key] = ResidentStream(segments[0].label, reads=segments[0].span == 0)
+    return streams
+
+
+def _segments(key: str, step: SubmoduleStep) -> list:
+    resource_step = step.steps.get(key)
+    return list((resource_step.segments if resource_step is not None else None) or step.segments or ())
+
+
 def build_planner(
-    node: str, walks: Iterable[str], resources: Mapping[str, Resource],
-    resource_nodes: Mapping[str, Collection[str]], device: torch.device, max_bs: int,
-) -> tuple[ResidentPlanner | None, str]:
-    """A planner for ``node``, or None and why not. Every resource of the node
-    must be able to, since a capture is one graph: one host-planned resource
-    would need the row a resident step no longer stages."""
-    walks = frozenset(walks)
+    node: str, steps: Mapping[str, SubmoduleStep | None], resources: Mapping[str, Resource],
+    resource_nodes: Mapping[str, Collection[str]], device: torch.device,
+    max_capture_bs: Callable[[Collection[str]], int], probe: Callable[[str], str | None] = lambda walk: None,
+) -> tuple[ResidentPlanner | None, dict[str, str]]:
+    """A planner for the walks of ``steps`` that can run on resident tables,
+    or None, and why each other walk can't. ``steps``: each walk's step as
+    its widest capture declares it; ``probe``: the last check, of a walk that
+    passed the others. Every resource of the node must be able to, since a
+    capture is one graph: one host-planned resource would need the row a
+    resident step no longer stages."""
+    refusal = None if resources else "no resource of it keeps a table"
+    for key in resources:
+        if refusal is None and len(resource_nodes.get(key, ())) > 1:
+            refusal = f"resource {key!r} is shared by nodes {sorted(resource_nodes[key])}"
+    if refusal is not None:
+        return None, dict.fromkeys(steps, refusal)
+    refusals: dict[str, str] = {}
+    walks: dict[str, dict[str, ResidentStream]] = {}
+    for walk, step in steps.items():
+        refusal = step_refusal(resources, step)
+        if refusal is None:
+            streams = declared_streams(resources, step)
+            refusal = next((
+                f"resource {key!r}: {why}" for key, resource in resources.items()
+                if (why := resource.resident_refusal(key, streams)) is not None
+            ), None)
+        if refusal is None:
+            refusal = probe(walk)
+        if refusal is None:
+            walks[walk] = streams
+        else:
+            refusals[walk] = refusal
     if not walks:
-        return None, "its submodule names no resident walk"
-    if max_bs < 1:
-        return None, f"nothing captures its resident walks {sorted(walks)}"
-    for key, resource in resources.items():
-        if len(resource_nodes.get(key, ())) > 1:
-            return None, f"resource {key!r} is shared by nodes {sorted(resource_nodes[key])}"
-        refusal = resource.resident_refusal()
-        if refusal is not None:
-            return None, f"resource {key!r}: {refusal}"
-    return ResidentPlanner(node, walks, resources, device, max_bs), ""
+        return None, refusals
+    return ResidentPlanner(node, walks, resources, device, max_capture_bs(walks)), refusals

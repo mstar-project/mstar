@@ -2,7 +2,7 @@
 
 has ownership of per-(request,label) position counter"""
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, fields
 from typing import TYPE_CHECKING
 
@@ -29,13 +29,14 @@ from mstar.engine.resources.position.config import (
 from mstar.engine.resources.position.rope import (
     rope_apply_qk_inplace,  # noqa: F401  (registers mstar::rope_apply_qk_inplace)
 )
-from mstar.engine.resources.resident import gather_column
+from mstar.engine.resources.resident import gather_column, table_read
 from mstar.engine.resources.step import ADMIT_OK, AdmitOutcome, StepContext
 
 if TYPE_CHECKING:
     from mstar.engine.resources.resident import (
         CapturedResidentStep,
         ResidentPlanner,
+        ResidentStream,
         ResidentWrites,
     )
 
@@ -364,9 +365,16 @@ class RopeManager(PositionManager):
     def repeat_refusal(self) -> str | None:
         return None  # a resident row's position is its length plus a fixed offset
 
-    def resident_refusal(self) -> str | None:
+    def resident_refusal(self, key: str, streams: Mapping[str, "ResidentStream"]) -> str | None:
         if self._config.scheme != PosScheme.SEQUENTIAL:
             return f"position scheme {self._config.scheme} doesn't advance with the stream"
+        own, pool = streams[key], streams[self._kv_cache_name]
+        if own.label != pool.label or own.reads or pool.reads:
+            # the offset holds only while both advance a token a step, as one stream
+            return (
+                f"positions on stream {own.label!r} over {self._kv_cache_name!r}'s {pool.label!r} don't "
+                "advance with the stream their KV cache appends to"
+            )
         return None
 
     def bind_resident(self, planner: "ResidentPlanner", key: str) -> None:
@@ -380,13 +388,7 @@ class RopeManager(PositionManager):
         row[self._resident_delta.col] = self.position(rid, label) - writes.kv_len[self._kv_cache_name]
 
     def resident_gather(self, step: "CapturedResidentStep") -> None:
-        own, pool = step.streams[self._resident_key], step.streams[self._kv_cache_name]
-        if own.label != pool.label or own.reads or pool.reads:
-            # the offset holds only while both advance a token a step, as one stream
-            raise ValueError(
-                f"positions on stream {own.label!r} over {self._kv_cache_name!r}'s {pool.label!r}: "
-                "a resident step's positions advance with the stream their KV cache appends to"
-            )
+        own = step.streams[self._resident_key]
         key = CGSlotKey(bucket=step.bucket, slot=step.slot, label=own.label)
         table = self._resident_delta
         gather_column(
@@ -539,6 +541,8 @@ class RopeManager(PositionManager):
         return self._counters.get(rid, {}).get(label, 0)
 
     def pos_ids(self, label: str) -> torch.Tensor | None:
+        # a resident step's graph fills these after its `preprocess`
+        table_read("rope.pos_ids")
         return self._current_pos_ids.get(label)
 
     def _check_rope_table_args(

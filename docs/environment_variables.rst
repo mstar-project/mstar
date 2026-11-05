@@ -654,11 +654,11 @@ Worker scheduling
        objects between collections. Read by ``knobs.gc_gen0_threshold``.
    * - ``MSTAR_RESIDENT_PLANNING``
      - config's ``knobs: resident_planning``, else ``auto``
-     - ``auto`` runs a node's captured decode steps off per-request tables on
-       the device where the submodule names resident walks
-       (``NodeSubmodule.resident_walks``) and every resource of the node can
-       (``Resource.resident_refusal``); the worker log says why a node that
-       names walks stays on the host. ``off`` plans every step on the host. The
+     - ``auto`` runs a node's captured steps off per-request tables on the
+       device for each walk that runs the node in a Loop, where its capture,
+       its declared step, its ``preprocess`` and every resource of the node
+       (``Resource.resident_refusal``) agree; the worker logs one line per
+       such walk saying which refused. ``off`` plans every step on the host. The
        tables are sized at startup, not by a setting: twice the walk's largest
        capture batch in rows, plus one, since a request that finds no row takes
        the least recently run one's. A row has a cell per page of the KV pool's

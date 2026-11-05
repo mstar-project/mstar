@@ -421,7 +421,7 @@ class SamplerResource(Resource):
             return 1
         return ANY_REPEATS
 
-    def resident_refusal(self) -> str | None:
+    def resident_refusal(self, key, streams) -> str | None:
         # never holds a node back: without a planner it stages its rows on the host
         return None
 

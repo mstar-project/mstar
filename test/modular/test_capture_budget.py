@@ -65,6 +65,8 @@ class _StubMeasuredRunner:
 
     size_captures = AcceleratorGraphRunner.size_captures
     size_lent_captures = AcceleratorGraphRunner.size_lent_captures
+    _template = AcceleratorGraphRunner._template
+    _prepare = AcceleratorGraphRunner._prepare
     NUM_WARMUP = AcceleratorGraphRunner.NUM_WARMUP
     _capture_stream = None
 

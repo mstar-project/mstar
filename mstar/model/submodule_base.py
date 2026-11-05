@@ -107,6 +107,11 @@ class DeviceLoopback(NamedTuple):
     for a node that declares this: their eager step write is a small
     synchronous host-to-device copy per step, which a node that reads its
     tokens on the host would pay for nothing.
+
+    It is also what carries a step that repeats (``max_step_repeats``) from one
+    replay to the next (``repeat_carry``), and only the token moves between
+    replays. So every other input of the walk must be the same each iteration:
+    ``preprocess`` stages no per-iteration value, ``step_metadata`` included.
     """
 
     walk: str
@@ -1114,18 +1119,6 @@ class NodeSubmodule(torch.nn.Module, ABC):
         ``ARNodeSubmodule`` derives it from ``DeviceLoopback``."""
         del graph_walk
         return None
-
-    def resident_walks(self) -> frozenset[str]:
-        """Walks whose captured steps may read their rows off the resident
-        tables (`mstar.engine.resources.resident`). A walk here runs, for each
-        resource, one stream that takes one token a row or one it only reads
-        (span 0), with no forks or retention, and its `preprocess` reads no
-        planned position or KV location: the forward's graph fills those in.
-        The engine still refuses if a resource can't. A step of one may repeat
-        (``max_step_repeats``), and only the loop-back token moves between its
-        replays (``repeat_carry``), so every other input of the walk must be the
-        same each iteration."""
-        return frozenset()
 
     def step_is_input_free(self, graph_walk: str) -> bool:
         """Whether ``declare_step`` for this walk reads nothing from the inputs

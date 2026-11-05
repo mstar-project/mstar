@@ -4706,7 +4706,7 @@ class KVManager(AttentionResource):
         evictable = 0 if self._index is None else len(self._index.evictable())
         return self._groups[0].page_size if self._arena.num_free + evictable >= rows else 1
 
-    def resident_refusal(self) -> str | None:
+    def resident_refusal(self, key, streams) -> str | None:
         if len(self._groups) > 1:
             return "a pool with sliding-window layers holds its pages per group, which a block table row can't"
         if self.kv_cache.layout != KVLayout.NHD:

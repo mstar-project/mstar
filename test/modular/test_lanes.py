@@ -845,9 +845,6 @@ class _Codec:
     def spanned_outputs(self, walk):
         return frozenset()
 
-    def resident_walks(self):
-        return frozenset()
-
 
 class _Groups:
     def __init__(self, world=1):
@@ -903,11 +900,6 @@ class _Loops(_Codec):
     device_loopback = DeviceLoopback(walk="codec_chunk", signal="tok", sampler="s", buffer="tok")
 
 
-class _Resident(_Codec):
-    def resident_walks(self):
-        return frozenset({"codec_chunk"})
-
-
 _LOOP = Loop(name="decode_loop", section=_codec_node(), max_iters=4, outputs=[])
 
 
@@ -917,7 +909,6 @@ _LOOP = Loop(name="decode_loop", section=_codec_node(), max_iters=4, outputs=[])
     (dict(graph_backend=False), "no accelerator-graph backend"),
     (dict(model=_Model({"codec_chunk": _codec_node(), "codec_warm": _LOOP})), "speculate into"),
     (dict(model=_Model({"codec_chunk": _LOOP})), "speculate into"),
-    (dict(submodules={"Codec": _Resident(), "Talker": object()}), "resident tables"),
     (dict(model=_Model(combined={CODEC: "codec_mixed"})), "combined walk"),
     (dict(submodules={"Codec": _Spans(), "Talker": object()}), "output spans or a stop check"),
     (dict(submodules={"Codec": _Stops(), "Talker": object()}), "output spans or a stop check"),
@@ -927,14 +918,6 @@ def test_what_a_lane_cannot_serve_is_refused_naming_the_field(kwargs, reason):
     with pytest.raises(ValueError, match=reason) as raised:
         _placed(**kwargs)
     assert "placed on lane 1" in str(raised.value) or "off the chain" in str(raised.value)
-
-
-def test_a_resident_walk_takes_the_lane_where_resident_planning_is_off(monkeypatch):
-    from mstar.utils import knobs
-
-    monkeypatch.setattr(knobs, "resident_planning", lambda: "off")
-
-    assert _placed({"Codec": _Resident(), "Talker": object()}) == {"Codec": LANE}
 
 
 class _Owned(Resource):

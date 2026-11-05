@@ -16,7 +16,6 @@ from mstar.graph.base import GraphNode
 from mstar.graph.runtime.base import GraphRuntime
 from mstar.model.base import Model, node_moe_parallel_configs, parse_autocast_dtype, serving_resources
 from mstar.model.submodule_base import NodeSubmodule
-from mstar.utils import knobs
 from mstar.utils.device import DeviceCapability
 from mstar.utils.streams import reset_device_scheduling
 
@@ -172,8 +171,6 @@ def _refuse_unservable_lanes(
                          "rank, and every rank of a lockstep instance has to agree on it")
         if not graph_backend:
             raise refuse("its device has no accelerator-graph backend (CUDA or XPU) to give it a stream")
-        if submodule.resident_walks() and knobs.resident_planning() != "off":
-            raise refuse("it plans walks on resident tables, which a lane off the chain doesn't")
         for walk, graph in sorted(walks.items()):
             if name not in graph.get_nodes():
                 continue
@@ -350,10 +347,11 @@ class EngineManager:
 
         return cls(engine=engine, node_names=set(node_names), node_lanes=lanes)
 
-    def warmup_all(self) -> None:
-        """CUDA graph capture, for the whole forward and any piecewise region."""
+    def warmup_all(self, looped: Collection[tuple[str, str]] = ()) -> None:
+        """CUDA graph capture, for the whole forward and any piecewise region.
+        ``looped``: the (node, walk) pairs whose walk runs the node in a Loop."""
         with torch.no_grad():
-            self.engine.warmup()
+            self.engine.warmup(looped)
         # warmup ran side-stream work beside graph replays; start serving from
         # a clean scheduling state (see reset_device_scheduling)
         reset_device_scheduling(self.engine._device)

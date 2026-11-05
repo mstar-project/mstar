@@ -449,7 +449,7 @@ def test_the_engine_seals_between_sizing_and_capture(monkeypatch):
     engine._resources = {"attn": _Resource()}
     engine._runner = None
     engine._submodules = {"dit": SimpleNamespace(
-        submodule=SimpleNamespace(warmup_compiles=lambda: None, resident_walks=frozenset), resources={},
+        submodule=SimpleNamespace(warmup_compiles=lambda: None), resources={},
         joint_comm_group=None, num_slots=2,
         fp32_precision=None, node_dtype=None, lora_pools=(),
     )}

@@ -159,7 +159,7 @@ class GDNManager(LinearAttnManager):
     def repeat_refusal(self) -> str | None:
         return None  # decode addresses the pool by slot alone
 
-    def resident_refusal(self) -> str | None:
+    def resident_refusal(self, key, streams) -> str | None:
         # decode addresses the pool by slot alone, which the pool's table holds
         return None
 

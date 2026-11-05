@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import random
 import sys
+from functools import partial
 from types import SimpleNamespace
 
 import pytest
@@ -54,6 +55,16 @@ from mstar.worker.worker import Worker  # noqa: E402
 PAGE = 4
 WALK = "decode"
 CPU = torch.device("cpu")
+
+
+def _walk(*keys: str, reads: tuple[str, ...] = ()) -> dict:
+    """WALK's streams as its template declares them: each resource on label
+    "main", appending a token a row unless it only ``reads``."""
+    return {WALK: {key: resident_mod.ResidentStream("main", key in reads) for key in keys}}
+
+
+def _planner(res, max_bs: int, keys=("kv", "pool", "rope")) -> ResidentPlanner:
+    return ResidentPlanner("n", _walk(*keys), {k: res[k] for k in keys}, CPU, max_bs=max_bs)
 
 
 class _StubTransfer:
@@ -198,7 +209,7 @@ def _setup(prompts: dict[int, int], cpu_offload_pages: int = 0, max_num_pages: i
     """The same requests prefilled on resident resources and on a host-planned reference."""
     live = _resources(cpu_offload_pages, max_num_pages, pool_slots)
     ref = _resources(cpu_offload_pages, max_num_pages, pool_slots)
-    planner = ResidentPlanner("n", {WALK}, {k: live[k] for k in ("kv", "pool", "rope")}, CPU, max_bs=4)
+    planner = _planner(live, max_bs=4)
     for res in (live, ref):
         for rid, n in prompts.items():
             _ingest(res, rid)
@@ -316,27 +327,36 @@ def test_a_step_repeats_only_when_its_rows_all_continue(in_chain, fresh, same_no
         continuing_rids={0, 1}, is_new_iter=True, is_same_node=same_node,
     )
     repeats = StepRepeats(8, [("n", WALK)])
-    repeats.settle(lambda *key: None)
+    repeats.settle(lambda *key: None, lambda *key: None)
     assert repeats.ceiling(speculation, in_chain, lambda: room) == want
 
 
-def test_the_startup_line_names_the_resource_that_refuses_a_walk(caplog):
-    """Each resource answers for itself at load; the engine names the one that
-    refused, and the worker says so once, at startup."""
+@pytest.mark.parametrize("limit", [1, 4])
+def test_the_startup_line_names_the_owner_that_refuses_each_capability(caplog, limit):
+    """Each owner answers for itself; the worker prints one line per Loop walk,
+    at every limit, naming the first that refused each capability."""
     from mstar.engine.engine import Engine
     from mstar.engine.resources.resident_hooks import ResidentHooks
 
     willing = SimpleNamespace(repeat_refusal=lambda: None)
     engine = Engine.__new__(Engine)
     engine._submodules = {node: SimpleNamespace(
-        resident=SimpleNamespace(walks={WALK}), joint_comm_group=SimpleNamespace(world_size=1),
+        resident=SimpleNamespace(walks={WALK} - refused.keys()), resident_refusals=refused,
+        joint_comm_group=SimpleNamespace(world_size=1),
         submodule=SimpleNamespace(repeat_carry=lambda walk: ("t", "i"), step_is_input_free=lambda walk: True),
         resources=resources,
-    ) for node, resources in (("a", {"kv": willing}), ("b", {"kv": willing, "pool": ResidentHooks()}))}
+    ) for node, resources, refused in (
+        ("a", {"kv": willing}, {}), ("b", {"kv": willing, "pool": ResidentHooks()}, {}),
+        ("c", {"kv": willing}, {WALK: "resource 'kv': why"}),
+    )}
     with caplog.at_level("INFO", logger="mstar.worker.step_repeats"):
-        StepRepeats(4, [("a", WALK), ("b", WALK)]).settle(engine.repeat_refusal)
-    assert f"steps of a/{WALK} repeat up to 4" in caplog.text
-    assert f"steps of b/{WALK} run once: resource 'pool': ResidentHooks keeps no per-replay support" in caplog.text
+        StepRepeats(limit, [(n, WALK) for n in "abc"]).settle(engine.resident_refusal, engine.repeat_refusal)
+    lines = {line.split(":", 1)[0]: line for line in caplog.messages}
+    want = "resident | repeats up to 4" if limit > 1 else "resident | runs once: max_step_repeats is 1"
+    assert lines[f"a/{WALK}"].endswith(want)
+    if limit > 1:
+        assert lines[f"b/{WALK}"].endswith("runs once: resource 'pool': ResidentHooks keeps no per-replay support")
+    assert lines[f"c/{WALK}"].startswith(f"c/{WALK}: host-planned: resource 'kv': why | runs once")
 
 
 class _CudaCoreDecode(FlashInferDecodeWrapper):
@@ -415,7 +435,7 @@ def test_a_step_its_resources_held_to_one_iteration_moves_its_rows_by_one():
     ctx = SimpleNamespace(repeats=1)
     worker = Worker.__new__(Worker)
     worker._step_repeats = StepRepeats(8, [("n", WALK)])
-    worker._step_repeats.settle(lambda *key: None)
+    worker._step_repeats.settle(lambda *key: None, lambda *key: None)
     worker._graph_runtime = SimpleNamespace(loop_room=lambda *args: 100)
     speculation = SimpleNamespace(
         scheduled_batch=batch, node_batch=SimpleNamespace(step_context=ctx), loop_name="loop",
@@ -649,7 +669,7 @@ def test_a_real_offload_gives_the_slot_up_and_its_reload_is_written_whole():
         name="kv", joint_comm_group=None, transfer_engine_info=None, device=device, dtype=torch.float32,
     )
     kv._cg_max_seq_len = 64
-    planner = ResidentPlanner("n", {WALK}, {"kv": kv}, device, max_bs=2)
+    planner = ResidentPlanner("n", _walk("kv"), {"kv": kv}, device, max_bs=2)
     engine = _offload_engine({"kv": kv}, planner)
     kv.ingest_request(1, KVReqConfig())
     segments = (Segment(1, "main", 9),)
@@ -1088,7 +1108,7 @@ def test_ranks_with_the_same_history_displace_the_same_requests():
 
 def test_the_store_is_sized_by_the_widest_capture():
     res = _resources()
-    planner = ResidentPlanner("n", {WALK}, {k: res[k] for k in ("kv", "pool", "rope")}, CPU, max_bs=8)
+    planner = _planner(res, max_bs=8)
     assert planner.max_slots == 17
     assert len(planner._free) == 16
     assert TRASH_SLOT not in planner._free
@@ -1096,7 +1116,7 @@ def test_the_store_is_sized_by_the_widest_capture():
 
 def test_a_flush_of_the_largest_step_stages_without_growing(monkeypatch):
     res = _resources(max_num_pages=64)
-    planner = ResidentPlanner("n", {WALK}, {k: res[k] for k in ("kv", "pool", "rope")}, CPU, max_bs=4)
+    planner = _planner(res, max_bs=4)
     stride = planner._tables[0].stride
     assert planner._stager._seg_numel >= 4 * stride + 4 * 4
     monkeypatch.setattr(planner._stager, "_grow", lambda numel: pytest.fail(f"grew to {numel}"))
@@ -1115,7 +1135,7 @@ def test_a_flush_of_the_largest_step_stages_on_the_device_without_growing(monkey
         ),
         name="kv", joint_comm_group=None, transfer_engine_info=None, device=device, dtype=torch.float32,
     )
-    planner = ResidentPlanner("n", {WALK}, {"kv": kv}, device, max_bs=4)
+    planner = ResidentPlanner("n", _walk("kv"), {"kv": kv}, device, max_bs=4)
     stride = planner._tables[0].stride
     monkeypatch.setattr(planner._stager, "_grow", lambda numel: pytest.fail(f"grew to {numel}"))
     rows = [(slot, 0, list(range(100, 100 + stride))) for slot in range(1, 5)]
@@ -1139,19 +1159,19 @@ def _kv(max_seq_len: int, max_num_pages: int) -> KVManager:
 
 def test_a_row_is_as_wide_as_the_pool_when_the_context_is_wider():
     kv = _kv(max_seq_len=1 << 20, max_num_pages=64)
-    ResidentPlanner("n", {WALK}, {"kv": kv}, CPU, max_bs=1)
+    ResidentPlanner("n", _walk("kv"), {"kv": kv}, CPU, max_bs=1)
     assert kv._resident.block_table.width == kv.config.request_pages == 63
 
 
 def test_a_row_is_as_wide_as_the_context_when_the_pool_is_wider():
     kv = _kv(max_seq_len=4 * 10 + 1, max_num_pages=64)
-    ResidentPlanner("n", {WALK}, {"kv": kv}, CPU, max_bs=1)
+    ResidentPlanner("n", _walk("kv"), {"kv": kv}, CPU, max_bs=1)
     assert kv._resident.block_table.width == 11
 
 
 def test_a_stream_wider_than_a_row_raises():
     kv = _kv(max_seq_len=8, max_num_pages=64)
-    planner = ResidentPlanner("n", {WALK}, {"kv": kv}, CPU, max_bs=1)
+    planner = ResidentPlanner("n", _walk("kv"), {"kv": kv}, CPU, max_bs=1)
     tables = kv._resident
     assert tables.block_table.width == 2
     writes = resident_mod.ResidentWrites({"kv": resident_mod.ResidentStream("main", reads=False)})
@@ -1233,7 +1253,7 @@ def test_a_raise_in_the_preplan_leaves_the_reservation_for_exec(monkeypatch, rai
     stream, the in-flight mark goes, and exec's admit finds the page and takes no
     other. The same for a raise from the planner and from the runner's own pre-plan."""
     res = _resources()
-    planner = ResidentPlanner("n", {WALK}, {k: res[k] for k in ("kv", "pool", "rope")}, CPU, max_bs=4)
+    planner = _planner(res, max_bs=4)
     _ingest(res, 1)
     step, ctx = _host_step(res, [1], [3])
     planner.commit(step, ctx)
@@ -1374,7 +1394,7 @@ def test_a_refused_admit_offloads_a_victim_and_its_reload_is_written_whole():
     # seven pages to hand out, all held: each of 1 and 2 has room for one more token
     live = _resources(max_num_pages=8)
     owned = {k: live[k] for k in ("kv", "pool", "rope")}
-    planner = ResidentPlanner("n", {WALK}, owned, CPU, max_bs=4)
+    planner = ResidentPlanner("n", _walk(*owned), owned, CPU, max_bs=4)
     for rid, tokens in ((1, 7), (2, 7), (3, 11)):
         _ingest(live, rid)
         step, ctx = _host_step(live, [rid], [tokens])
@@ -1426,7 +1446,7 @@ def test_a_recurrent_pool_refusal_holds_the_request_since_the_pool_cannot_evict(
     """The pool refuses with `AllocationFailed`, which is backpressure: it has no
     eviction, so nothing is offloaded and the row it named is held for a smaller retry."""
     live = _resources(pool_slots=2)
-    planner = ResidentPlanner("n", {WALK}, {k: live[k] for k in ("kv", "pool", "rope")}, CPU, max_bs=4)
+    planner = _planner(live, max_bs=4)
     for rid in (1, 2):
         _ingest(live, rid)
     step, ctx = _host_step(live, [1], [3])
@@ -1485,11 +1505,13 @@ def _decoder(positions: str = "kv"):
     return {"kv": _pool("kv"), "ctx": _pool("ctx", max_seq_len=64), "rope": rope}
 
 
-def _decoder_setup(prompts: dict[int, tuple[int, int]], positions: str = "kv"):
+def _decoder_setup(prompts: dict[int, tuple[int, int]], positions: str = "kv", context_span: int = 0):
     """Each request's prompt and context prefilled on resident resources and a
-    host-planned reference. ``prompts`` is rid -> (prompt tokens, context tokens)."""
+    host-planned reference. ``prompts`` is rid -> (prompt tokens, context tokens);
+    decode steps append ``context_span`` tokens a row to the context."""
     live, ref = _decoder(positions), _decoder(positions)
-    planner = ResidentPlanner("n", {WALK}, {k: live[k] for k in ("kv", "ctx", "rope")}, CPU, max_bs=4)
+    walk = _walk("kv", "ctx", "rope", reads=() if context_span else ("ctx",))
+    planner = ResidentPlanner("n", walk, {k: live[k] for k in ("kv", "ctx", "rope")}, CPU, max_bs=4)
     for res in (live, ref):
         for rid, (prompt, context) in prompts.items():
             res["kv"].ingest_request(rid, KVReqConfig())
@@ -1697,7 +1719,7 @@ def test_a_context_the_step_only_reads_never_advances():
 def test_positions_follow_the_pool_their_config_names(positions):
     """Two pools that both append, at different lengths: the position offset is
     taken against, and gathered with, the length of the pool positions name."""
-    live, ref, planner = _decoder_setup({1: (3, 11), 2: (9, 2)}, positions=positions)
+    live, ref, planner = _decoder_setup({1: (3, 11), 2: (9, 2)}, positions=positions, context_span=1)
     for t in range(8):
         a = _decoder_step(live, planner, [1, 2], slot=t % 2, bs=4, context_span=1)
         b = _decoder_step(ref, None, [1, 2], slot=t % 2, bs=4, context_span=1)
@@ -1708,39 +1730,41 @@ def test_positions_follow_the_pool_their_config_names(positions):
     assert planner.buffers(BucketKey(WALK, 4, 4), 0).cells.shape == (2, 2 * 4 * 2)
 
 
-def test_positions_over_a_pool_the_step_only_reads_refuse_at_capture():
-    live, ref, planner = _decoder_setup({1: (3, 7)}, positions="ctx")
-    del ref
-    with pytest.raises(ValueError, match="advance with the stream"):
-        _decoder_step(live, planner, [1], slot=0, bs=1)
+def test_positions_over_a_pool_the_step_only_reads_are_refused_at_load():
+    res = _decoder("ctx")
+    steps = {WALK: SubmoduleStep(
+        steps={"ctx": KVStep(segments=(Segment(1, "main", 0),))}, segments=[Segment(1, "main", 1)],
+    )}
+    planner, refused = build_planner("n", steps, res, {}, CPU, lambda walks: 4)
+    assert planner is None and "advance with the stream" in refused[WALK]
 
 
-def test_capture_takes_a_label_for_each_resource():
-    live, _, planner = _decoder_setup({})
-    del live
+def test_a_walk_takes_a_label_for_each_resource():
     rows = [Segment(1, "self", 1)]
     step = SubmoduleStep(
         steps={"kv": KVStep(), "ctx": KVStep(segments=(Segment(1, "context", 0),)), "rope": PositionStep()},
         segments=rows,
     )
-    captured = planner.capture_step(BucketKey(WALK, 1, 1), 0, step)
-    streams = {key: (s.label, s.reads) for key, s in captured.streams.items()}
+    streams = {key: tuple(s) for key, s in resident_mod.declared_streams(("kv", "ctx", "rope"), step).items()}
     assert streams == {"kv": ("self", False), "ctx": ("context", True), "rope": ("self", False)}
-    assert planner._streams[BucketKey(WALK, 1, 1)] is captured.streams
 
 
-def test_capture_refuses_two_labels_on_one_resource():
-    live, _, planner = _decoder_setup({})
-    del live
+def test_a_walk_with_two_labels_on_one_resource_is_refused():
     rows = [Segment(1, "main", 1)]
     two = (Segment(1, "main", 1), Segment(1, "aux", 1))
     step = SubmoduleStep(steps={"kv": KVStep(segments=two), "ctx": KVStep(), "rope": PositionStep()}, segments=rows)
-    with pytest.raises(ValueError, match="resource 'kv' declares 2 segments over labels"):
-        planner.capture_step(BucketKey(WALK, 1, 1), 0, step)
+    assert "resource 'kv' declares 2 segments over labels" in resident_mod.step_refusal(("kv", "ctx", "rope"), step)
     mixed = (Segment(1, "main", 1), Segment(2, "main", 0))
     step = SubmoduleStep(steps={"kv": KVStep(), "ctx": KVStep(segments=mixed), "rope": PositionStep()}, segments=rows)
-    with pytest.raises(ValueError, match="resource 'ctx'"):
-        planner.capture_step(BucketKey(WALK, 2, 2), 0, step)
+    assert "resource 'ctx'" in resident_mod.step_refusal(("kv", "ctx", "rope"), step)
+
+
+def test_a_bucket_that_declares_other_streams_than_its_walk_stops_the_worker():
+    _, _, planner = _decoder_setup({})
+    rows = [Segment(1, "main", 1)]
+    step = SubmoduleStep(steps={"kv": KVStep(), "ctx": KVStep(), "rope": PositionStep()}, segments=rows)
+    with pytest.raises(SystemExit, match="aren't its walk's"):
+        planner.capture_step(BucketKey(WALK, 1, 1), 0, step)
 
 
 class _Fmha:
@@ -1767,7 +1791,7 @@ def test_the_fmha_gather_reads_its_own_pools_table_and_lengths(monkeypatch, pool
     from mstar.engine.resources.attn import flashinfer as flashinfer_mod
 
     monkeypatch.setattr(flashinfer_mod, "FmhaDecodeWrapper", _Fmha)
-    live, _, planner = _decoder_setup({})
+    live, _, planner = _decoder_setup({}, context_span=1)
     wrapper = _Fmha()
     manager = _fmha_manager(pool, wrapper)
     segments = [Segment(1, "main", 1), Segment(2, "main", 1)]
@@ -1828,7 +1852,7 @@ class _Attention(Resource):
     def __init__(self, reads_tables: bool):
         self._reads = reads_tables
 
-    def resident_refusal(self):
+    def resident_refusal(self, key, streams):
         return None
 
     def resident_gather(self, step):
@@ -1843,7 +1867,7 @@ class _Attention(Resource):
 ])
 def test_a_bucket_is_host_plan_free_only_when_every_attention_reads_the_tables(attentions, free):
     resources = {f"attn{i}": _Attention(reads) for i, reads in enumerate(attentions)}
-    planner = ResidentPlanner("n", {WALK}, resources, CPU, max_bs=2)
+    planner = ResidentPlanner("n", _walk(*resources), resources, CPU, max_bs=2)
     step = SubmoduleStep(steps={}, segments=[Segment(1, "main", 1)])
     planner.gather(planner.capture_step(BucketKey(WALK, 1, 1), 0, step))
     assert (BucketKey(WALK, 1, 1) in planner.host_plan_free) is free
@@ -1854,9 +1878,9 @@ def test_cross_attention_over_its_own_context_pool_runs_on_the_planner():
 
     manager = FlashInferCrossManager.__new__(FlashInferCrossManager)
     manager._kv_cache_name, manager._query_kv_cache_name = "ctx", "kv"
-    assert manager.resident_refusal() is None
+    assert manager.resident_refusal("x", {}) is None
     manager._query_kv_cache_name = "ctx"
-    assert "second stream" in manager.resident_refusal()
+    assert "second stream" in manager.resident_refusal("x", {})
     step = SimpleNamespace(reads_tables=False, host_planned=False)
     FlashInferCrossManager.resident_gather(manager, step)
     assert step.host_planned and not step.reads_tables
@@ -1870,13 +1894,13 @@ class _Spare(Resource):
         return cls()
 
 
-def _build(resources, nodes=None, walks=(WALK,), max_bs=4):
-    return build_planner("n", walks, resources, nodes or {}, CPU, max_bs)
+_ONE_TOKEN = SubmoduleStep(steps={}, segments=[Segment(1, "main", 1)])
 
 
-def test_a_node_with_no_table_owner_still_builds():
-    planner = ResidentPlanner("n", {WALK}, {}, CPU, max_bs=2)
-    assert planner.max_slots == 5
+def _build(resources, nodes=None, step=_ONE_TOKEN):
+    """The planner for WALK on its declared ``step``, and why not."""
+    planner, refused = build_planner("n", {WALK: step}, resources, nodes or {}, CPU, lambda walks: 4)
+    return planner, refused.get(WALK, "")
 
 
 def test_every_resident_resource_passes():
@@ -1885,17 +1909,15 @@ def test_every_resident_resource_passes():
     assert planner is not None and why == ""
 
 
-def test_no_walks_no_planner():
-    res = _resources()
-    planner, why = _build({"kv": res["kv"]}, walks=())
-    assert planner is None and "no resident walk" in why
-
-
-def test_no_capture_of_the_walks_no_planner():
-    res = _resources()
-    planner, why = _build({"kv": res["kv"]}, max_bs=0)
-    assert planner is None and "nothing captures" in why
-    assert res["kv"]._resident is None
+@pytest.mark.parametrize(("resources", "step", "why"), [
+    ({}, _ONE_TOKEN, "no resource of it keeps a table"),
+    ({"kv": None}, None, "declares no step"),
+], ids=["no_table_owner", "no_step"])
+def test_a_looped_node_with_no_step_or_no_table_owner_is_refused_at_load(resources, step, why):
+    if "kv" in resources:
+        resources = {"kv": _resources()["kv"]}
+    planner, refused = _build(resources, step=step)
+    assert planner is None and why in refused
 
 
 def test_a_resource_without_a_table_refuses():
@@ -1945,7 +1967,7 @@ def test_a_sliding_window_pool_refuses():
 
 def test_block_positions_refuse():
     rope = RopeManager(PositionConfig(kv_cache="kv", scheme=PosScheme.BLOCK), CPU, max_seq_len=512, head_dim=8)
-    assert "doesn't advance" in rope.resident_refusal()
+    assert "doesn't advance" in rope.resident_refusal("rope", {})
 
 
 def test_a_pool_without_a_sink_refuses():
@@ -1953,7 +1975,7 @@ def test_a_pool_without_a_sink_refuses():
         num_layers=1, max_slots=4, blocks={"state": RecurrentBlockConfig(shape=(2,), dtype=torch.float32)},
         disable_sink_slot=True,
     ))
-    assert "sink" in pool.resident_refusal()
+    assert "sink" in pool.resident_refusal("pool", {})
 
 
 @pytest.mark.parametrize("module,name", [
@@ -1977,42 +1999,42 @@ def test_flashinfer_refuses_a_sliding_window():
 
     manager = FlashInferManager.__new__(FlashInferManager)
     manager._window_left = 5
-    assert "sliding window" in manager.resident_refusal()
+    assert "sliding window" in manager.resident_refusal("attn", {})
     manager._window_left = -1
-    assert manager.resident_refusal() is None
+    assert manager.resident_refusal("attn", {}) is None
 
 
 @pytest.mark.parametrize("field,value", [
     ("pre_forks", (("a", "b"),)), ("post_forks", (("a", "b"),)), ("sink", frozenset({(1, "main")})), ("commit", False),
 ])
-def test_a_resident_walk_can_not_declare_forks_or_a_sink(field, value):
-    _, _, planner = _setup({})
+def test_a_walk_declaring_forks_or_a_sink_is_refused_at_load(field, value):
+    res = _resources()
     segments = [Segment(1, "main", 1)]
     kv = KVStep(segments=tuple(segments), **{field: value})
-    with pytest.raises(ValueError, match=field):
-        planner.capture_step(BucketKey(WALK, 1, 1), 0, SubmoduleStep(steps={"kv": kv}, segments=segments))
+    planner, why = _build({"kv": res["kv"]}, step=SubmoduleStep(steps={"kv": kv}, segments=segments))
+    assert planner is None and field in why
 
 
-def test_a_resident_walk_is_one_token_a_row_in_one_stream():
-    _, _, planner = _setup({})
-    two = [Segment(1, "main", 2)]
-    with pytest.raises(ValueError, match="one token per row"):
-        planner.capture_step(BucketKey(WALK, 1, 2), 0, SubmoduleStep(steps={}, segments=two))
-    labels = [Segment(1, "a", 1), Segment(1, "b", 1)]
-    with pytest.raises(ValueError, match="one token per row"):
-        planner.capture_step(BucketKey(WALK, 2, 2), 0, SubmoduleStep(steps={}, segments=labels))
+@pytest.mark.parametrize("segments", [
+    [Segment(1, "main", 2)], [Segment(1, "a", 1), Segment(1, "b", 1)],
+], ids=["two_tokens", "two_labels"])
+def test_a_walk_that_isnt_one_token_a_row_in_one_stream_is_refused_at_load(segments):
+    res = _resources()
+    planner, why = _build({"kv": res["kv"]}, step=SubmoduleStep(steps={}, segments=segments))
+    assert planner is None and "not one token a row" in why
 
 
 # ---- the engine ----
 
-def _capture_runner(max_bs=4):
+def _capture_runner(max_bs=4, refusal=None, step=_ONE_TOKEN):
     bound = {}
     return SimpleNamespace(
+        resident_refusal=lambda walk: refusal, template_step=lambda walk: step, prepare_template=lambda walk: None,
         max_capture_bs=lambda walks: max_bs, bind_resident=lambda planner: bound.update(p=planner), bound=bound,
     )
 
 
-def _engine(walks, resources, device=CPU):
+def _engine(resources, device=CPU):
     from mstar.engine.engine import Engine
     from mstar.engine.resources.runner import StepRunner
 
@@ -2020,49 +2042,108 @@ def _engine(walks, resources, device=CPU):
     engine._device = device
     engine._runner = StepRunner(resources)
     engine._resource_nodes = {key: frozenset({"n"}) for key in resources}
-    submodule = SimpleNamespace(resident_walks=lambda: frozenset(walks))
-    engine._submodules = {"n": SimpleNamespace(submodule=submodule, resources=resources, resident=None)}
+    engine._submodules = {"n": SimpleNamespace(resources=resources, resident=None, resident_refusals={})}
     return engine, engine._submodules["n"]
 
 
-def test_the_engine_builds_a_planner_for_a_capable_node():
+def test_the_engine_puts_a_loop_walk_on_resident_tables_with_nothing_declared():
     res = _resources()
-    engine, mgmt = _engine({WALK}, {k: res[k] for k in ("kv", "pool", "rope")})
+    engine, mgmt = _engine({k: res[k] for k in ("kv", "pool", "rope")})
     runner = _capture_runner()
-    engine._build_resident_planner("n", runner)
+    engine._build_resident_planner("n", runner, {WALK})
     assert isinstance(mgmt.resident, ResidentPlanner)
     assert runner.bound["p"] is mgmt.resident
     assert mgmt.resident.max_slots == 9
+    assert engine.resident_refusal("n", WALK) is None
     assert mgmt.resident.covers(BucketKey(WALK, 2, 2))
     assert not mgmt.resident.covers(BucketKey("prefill_text", 2, 64))
 
 
-def test_the_knob_turns_it_off(monkeypatch):
-    monkeypatch.setenv("MSTAR_RESIDENT_PLANNING", "off")
+@pytest.mark.parametrize(("knob", "runner", "resources", "why"), [
+    ("off", _capture_runner(), ("kv",), "resident_planning is off"),
+    ("auto", _capture_runner(refusal="it has no batched capture"), ("kv",), "no batched capture"),
+    ("auto", _capture_runner(), ("kv", "other"), "_Spare keeps no resident table"),
+], ids=["knob", "capture", "resource"])
+def test_a_refused_walk_stays_on_the_host_and_says_why(monkeypatch, knob, runner, resources, why):
+    monkeypatch.setenv("MSTAR_RESIDENT_PLANNING", knob)
+    res = {**_resources(), "other": _Spare()}
+    engine, mgmt = _engine({k: res[k] for k in resources})
+    engine._build_resident_planner("n", runner, {WALK})
+    assert mgmt.resident is None and res["kv"]._resident is None
+    assert why in engine.resident_refusal("n", WALK)
+
+
+def _probe_runner(preprocess, freed: list):
+    """A runner whose one batched capture of WALK preprocesses with ``preprocess``."""
+    from mstar.engine.accelerator_graph_config import AcceleratorGraphConfigType
+    from mstar.engine.resources import CGSlotSpec
+
+    config = SimpleNamespace(
+        capture_graph_walk=WALK, replay_graph_walks=[WALK], capture_batch_sizes=[2],
+        get_config_type=lambda: AcceleratorGraphConfigType.BASIC_BATCHED, get_node_inputs=lambda bs, n: [None] * bs,
+    )
+    runner = AcceleratorGraphRunner.__new__(AcceleratorGraphRunner)
+    runner._capture_configs = [config]
+    runner._prepared_slot_specs = [CGSlotSpec(bucket=BucketKey(WALK, 2, 2), slot=0, config=config, config_idx=0)]
+    runner._graph_backend = SimpleNamespace(is_available=lambda: True)
+    runner._resources, runner._resident = {}, None
+    runner._dummy_rows = SimpleNamespace(
+        ensure=lambda key, bs: [-1, -2], reset=lambda rids, free=False: freed.append((rids, free)),
+    )
+    runner._step_runner = SimpleNamespace(admit=lambda step: SimpleNamespace(ok=True), plan=lambda step: None)
+    runner._submodule = SimpleNamespace(
+        declare_step=lambda **kwargs: SubmoduleStep(steps={}, segments=[Segment(r, "main", 1) for r in (-1, -2)]),
+        preprocess=lambda graph_walk, engine_inputs, inputs: preprocess(),
+    )
+    return runner
+
+
+@pytest.mark.parametrize("reads", [False, True])
+def test_a_walk_whose_captured_preprocess_reads_what_the_graph_fills_is_refused_naming_it(reads):
+    """The promise a model can't state in code is checked on the template its
+    capture runs, at load, whose padding rows the probe leaves at rest."""
     res = _resources()
-    engine, mgmt = _engine({WALK}, {"kv": res["kv"]})
-    engine._build_resident_planner("n", _capture_runner())
-    assert mgmt.resident is None
-    assert res["kv"]._resident is None
+    freed = []
+    runner = _probe_runner(lambda: res["rope"].pos_ids("main") if reads else None, freed)
+    engine, mgmt = _engine({k: res[k] for k in ("kv", "pool", "rope")})
+    engine._build_resident_planner("n", runner, {WALK})
+    assert freed == [([-1, -2], True)]
+    if reads:
+        assert mgmt.resident is None and "rope.pos_ids" in engine.resident_refusal("n", WALK)
+    else:
+        assert engine.resident_refusal("n", WALK) is None
+    res["rope"].pos_ids("main")  # outside a resident preprocess, a read is the forward's
 
 
-def test_a_refused_node_stays_on_the_host_and_says_why(caplog):
-    res = _resources()
-    engine, mgmt = _engine({WALK}, {"kv": res["kv"], "other": _Spare()})
-    with caplog.at_level("WARNING"):
-        engine._build_resident_planner("n", _capture_runner())
-    assert mgmt.resident is None
-    assert "_Spare keeps no resident table" in caplog.text
-    assert res["kv"]._resident is None
+@pytest.mark.parametrize("reader", ["preprocess", "forward"])
+def test_a_resident_preprocess_that_reads_what_the_graph_fills_stops_the_worker(reader):
+    """A branch the load-time template didn't take: the forward reads the same
+    buffer legitimately, after the graph has filled it."""
+    from mstar.engine.engine import Engine
 
+    rope = _resources()["rope"]
 
-def test_a_node_with_no_resident_walk_is_left_alone(caplog):
-    res = _resources()
-    engine, mgmt = _engine((), {"kv": res["kv"]})
-    with caplog.at_level("WARNING"):
-        engine._build_resident_planner("n", _capture_runner())
-    assert mgmt.resident is None
-    assert not caplog.text
+    def read(where):
+        if where == reader:
+            rope.pos_ids("main")
+        return {}
+
+    engine = Engine.__new__(Engine)
+    engine._enable_nvtx = engine._enable_profile = False
+    engine._forward = lambda *args: read("forward")
+    submodule = SimpleNamespace(preprocess=lambda walk, engine_inputs, inputs: read("preprocess"))
+    mgmt = SimpleNamespace(
+        accelerator_graph_runner=None, submodule=submodule, piecewise_runners={}, fp32_precision=None, resources={},
+    )
+    ctx = StepContext(request_ids=(1,), graph_walk=WALK, slot=0, capture=False)
+    ctx.resident = object()
+    batch = SimpleNamespace(node_name="n", per_request_input_metadata={}, launch_started_event=None)
+    drive = partial(engine._drive_step, batch, mgmt, [1], [], {}, ctx, None, True, None, False)
+    if reader == "preprocess":
+        with pytest.raises(SystemExit, match="rope.pos_ids"):
+            drive()
+    else:
+        assert drive() == ({}, None)
 
 
 def test_an_eager_step_marks_its_rows():
@@ -2079,17 +2160,29 @@ def test_an_eager_step_marks_its_rows():
 def _qwen35_llm():
     from mstar.model.qwen3_5 import submodules
 
-    return submodules, next(
-        cls for cls in vars(submodules).values()
-        if isinstance(cls, type) and cls.__module__ == submodules.__name__ and "resident_walks" in vars(cls)
-    )
+    return submodules, submodules.LLMSubmodule
+
+
+def test_qwen35s_resident_set_is_derived_as_its_decode_walk():
+    """Nothing declared: the LLM node's Loop walks are decode and the chunked
+    text prefill, and only decode has a batched capture."""
+    from mstar.model.qwen3_5.qwen3_5_model import Qwen3_5DenseModel
+
+    model = object.__new__(Qwen3_5DenseModel)
+    model.config = SimpleNamespace(max_position_embeddings=4096)
+    looped = {walk for walk, node in Worker._build_innermost_loop_cache(model.get_graph_walk_graphs()) if node == "LLM"}
+    _, llm = _qwen35_llm()
+    runner = AcceleratorGraphRunner.__new__(AcceleratorGraphRunner)
+    runner._capture_configs = object.__new__(llm).get_accelerator_graph_configs(CPU)
+    runner._graph_backend = SimpleNamespace(is_available=lambda: True)
+    runner._prepared_slot_specs = [SimpleNamespace(bucket=BucketKey(walk, 1, 1)) for walk in looped]
+    assert {walk for walk in looped if runner.resident_refusal(walk) is None} == {"decode"}
 
 
 @pytest.mark.parametrize("knob", [False, True])
 def test_qwen35_decode_builds_its_rope_in_the_graph_on_every_config(monkeypatch, knob):
     submodules, llm = _qwen35_llm()
     monkeypatch.setattr(submodules, "ingraph_decode_rope", lambda: knob)
-    assert llm.resident_walks(None) == {"decode"}
     assert llm._rope_in_graph(SimpleNamespace(captured=True), "decode")
     assert not llm._rope_in_graph(SimpleNamespace(captured=False), "decode")
 

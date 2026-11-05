@@ -7,10 +7,11 @@ costs the iterations the device ran past it, and the next step's, already
 launched: up to 2N-1, against the one a speculated step costs.
 
 The serving config's ``max_step_repeats`` asks for this; at 1 every step runs
-once. Which walks may repeat is settled once, at startup, and logged with the
-reason for each that can't. What a step can have is decided twice: here against
-its rows and its Loop, then by its resources (``Resource.max_repeats``), which
-can only narrow it.
+once. Which walks may repeat is settled once, at startup, after capture; the
+log has one line per Loop walk of each node, saying whether it runs on resident
+tables and repeats, and if not, which owner of a fact it needs refused. What a
+step can have is decided twice: here against its rows and its Loop, then by its
+resources (``Resource.max_repeats``), which can only narrow it.
 """
 from __future__ import annotations
 
@@ -25,8 +26,9 @@ logger = logging.getLogger(__name__)
 
 
 class StepRepeats:
-    """``walks``: this worker's (node, walk) pairs; ``streamed``: those whose
-    node reads a streamed input, which arrives between steps."""
+    """``walks``: this worker's (node, walk) pairs whose walk runs the node in
+    a Loop; ``streamed``: those whose node reads a streamed input, which
+    arrives between steps."""
 
     def __init__(self, limit: int, walks: Iterable[tuple[str, str]], streamed: Collection[tuple[str, str]] = ()):
         if type(limit) is not int or limit < 1:
@@ -36,18 +38,27 @@ class StepRepeats:
         self._streamed = streamed
         self._walks: set[tuple[str, str]] = set()
 
-    def settle(self, repeat_refusal: Callable[[str, str], str | None]) -> None:
-        """Which walks may repeat, and why each other one can't."""
+    def settle(
+        self, resident_refusal: Callable[[str, str], str | None], repeat_refusal: Callable[[str, str], str | None],
+    ) -> None:
+        """Which walks may repeat, and the line for each."""
         for key in self._candidates:
-            refusal = (
-                "its node reads a streamed input, which arrives between steps" if key in self._streamed
-                else repeat_refusal(*key)
-            )
-            if refusal is None:
-                self._walks.add(key)
-                logger.info("max_step_repeats: steps of %s/%s repeat up to %d", *key, self.limit)
+            resident = resident_refusal(*key)
+            if resident is not None:
+                repeats = "it plans on the host"
+            elif self.limit == 1:
+                repeats = "max_step_repeats is 1"
+            elif key in self._streamed:
+                repeats = "its node reads a streamed input, which arrives between steps"
             else:
-                logger.info("max_step_repeats: steps of %s/%s run once: %s", *key, refusal)
+                repeats = repeat_refusal(*key)
+            if repeats is None:
+                self._walks.add(key)
+            logger.info(
+                "%s/%s: %s | %s", *key,
+                "resident" if resident is None else f"host-planned: {resident}",
+                f"repeats up to {self.limit}" if repeats is None else f"runs once: {repeats}",
+            )
 
     def ceiling(self, speculation: Speculation, in_chain: int, loop_room) -> int:
         """The most ``speculation``'s step can repeat. Only a chain's step

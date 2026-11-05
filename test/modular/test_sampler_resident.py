@@ -21,7 +21,7 @@ sys.path.insert(0, ".")
 from mstar.engine.resources.kv import manager as manager_mod  # noqa: E402
 from mstar.engine.resources.kv.config import KVReqConfig, KVStep, PagedKVConfig  # noqa: E402
 from mstar.engine.resources.kv.manager import KVManager  # noqa: E402
-from mstar.engine.resources.resident import TRASH_SLOT, ResidentPlanner  # noqa: E402
+from mstar.engine.resources.resident import TRASH_SLOT, ResidentPlanner, ResidentStream  # noqa: E402
 from mstar.engine.resources.sampler import resident as sampler_resident  # noqa: E402
 from mstar.engine.resources.sampler import utils as sampler_utils  # noqa: E402
 from mstar.engine.resources.sampler.config import SamplerStep, SamplingReqConfig  # noqa: E402
@@ -124,11 +124,12 @@ class _Node:
         self.sampler = SamplerResource(vocab_size=V, enable_repetion_penalty=True, device=CPU)
         self.sampler.enable_device_loopback_reader()
         resources["sampler"] = self.sampler
-        # as warmup does: the planner binds, then the runners claim their buffers
-        self.planner = ResidentPlanner("n", {WALK}, resources, CPU, max_bs=max_bs) if planner else None
+        # as warmup does: the runners claim their buffers, then the planner binds
         self.sampler.build_accelerator_graph_buffers(
             [SimpleNamespace(slot=0), SimpleNamespace(slot=1)], max_bs=max_bs, max_seq_len=1,
         )
+        walk = {WALK: {key: ResidentStream("main", reads=False) for key in resources}}
+        self.planner = ResidentPlanner("n", walk, resources, CPU, max_bs=max_bs) if planner else None
         self.bufs = self.sampler._cg_buffers
         self.captured: dict = {}
         self.tokens: dict[int, list[int]] = {}

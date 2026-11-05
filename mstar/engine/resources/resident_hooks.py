@@ -1,6 +1,7 @@
 """What a resource overrides to take part in resident planning (`resident.py`)."""
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -9,6 +10,7 @@ if TYPE_CHECKING:
         CapturedResidentStep,
         ResidentPlan,
         ResidentPlanner,
+        ResidentStream,
         ResidentWrites,
     )
 
@@ -39,8 +41,11 @@ class ResidentHooks:
         repeats reads and its capture doesn't advance itself."""
         return
 
-    def resident_refusal(self) -> str | None:
-        """Why a node holding this resource can't run on resident tables, or None if it can."""
+    def resident_refusal(self, key: str, streams: Mapping[str, ResidentStream]) -> str | None:
+        """Why a walk of a node holding this resource can't run on resident
+        tables, or None if it can, asked at load. ``streams``: each resource's
+        stream on the walk's steps, by resource key; ``key`` is this one's."""
+        del key, streams
         return f"{type(self).__name__} keeps no resident table"
 
     def bind_resident(self, planner: ResidentPlanner, key: str) -> None:

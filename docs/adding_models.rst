@@ -1644,16 +1644,20 @@ and evict other requests. Without a declaration, the same situation raises a
 Returning ``None`` means that the submodule manages its own resources. This is the legacy
 path, kept for submodules that have not been migrated.
 
-A walk named in ``resident_walks()`` runs its captured steps off per-request tables on the
-device instead of a plan rebuilt per step (``mstar/engine/resources/resident.py``). The
-walk must declare, for each resource, one stream that takes one token per row, or one
-it only reads at span 0 (a cross-attention context), with no forks, retention or sink,
-and its ``preprocess`` must read no planned position or KV location, because the
-captured graph fills those in first. Each KV pool of the node keeps its own block table
-and lengths; positions read the pool their ``PositionConfig.kv_cache`` names. Capture raises on a declaration that breaks this. The engine
-turns it on only if every resource of the node can (``Resource.resident_refusal``) and
-the deployment left ``knobs: resident_planning`` at ``auto``; the worker log says why
-otherwise. Steps of other walks, and eager steps, keep the host plan and leave the row
+A walk that runs a node inside a ``Loop`` runs its captured steps off per-request tables
+on the device instead of a plan rebuilt per step (``mstar/engine/resources/resident.py``),
+with nothing for the model to declare. The engine decides at load, before capture, from
+what each owner already says: the walk has a batched capture; the step its widest capture
+declares has, for each resource, one stream that takes one token per row, or one it only
+reads at span 0 (a cross-attention context), with no forks, retention or sink; every
+resource of the node answers ``Resource.resident_refusal`` with None and none is shared
+with another node; and its captured ``preprocess`` reads no buffer the graph fills (an
+accessor of one, such as ``RopeManager.pos_ids``, calls ``resident.table_read``). Each KV
+pool of the node keeps its own block table and lengths; positions read the pool their
+``PositionConfig.kv_cache`` names. The worker logs one line per Loop walk saying whether
+it is resident and repeats, or which owner refused; ``knobs: resident_planning: off``
+turns it off. A resident ``preprocess`` that reads such a buffer on a branch the capture
+didn't take stops the worker. Steps of other walks, and eager steps, keep the host plan and leave the row
 stale, so the first resident step after them writes it. The sampler takes part on its
 own: its per-request scalars (temperature, top-k, top-p, seed, penalties) become cells
 of the row, so a resident step stages none of them, while the RNG offset, the last token
