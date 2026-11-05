@@ -495,6 +495,10 @@ class Worker:
 
     # (node, walk) -> its stop policy that withholds outputs; set at load
     _withholding: Mapping[tuple[str, str], StopPolicy] = MappingProxyType({})
+    # messages taken in while a run was awaited, not yet processed
+    _held_messages: tuple = ()
+    # (node, walk) whose runs go on the device
+    _device_runs: frozenset = frozenset()
     # nodes that keep their landed tokens (``NodeSubmodule.record_tokens``)
     _token_readers: frozenset[str] = frozenset()
 
@@ -1600,7 +1604,11 @@ class Worker:
                 phase_end(_MSG_SPANS[message.message_type], t0)
 
     def _process_messages(self) -> None:
-        self._process_message_list(self.communicator.get_all_new_messages())
+        messages = self.communicator.get_all_new_messages()
+        if self._held_messages:
+            # what arrived while a run was awaited, first (``_await_run``)
+            messages, self._held_messages = [*self._held_messages, *messages], ()
+        self._process_message_list(messages)
 
     # ------------------------------------------------------------------
     # Tensor readiness
@@ -3917,10 +3925,30 @@ class Worker:
             with self._span("worker.postprocess.event_sync"):
                 if batch_N.node_batch.token_stream is not None:
                     self._stream_tokens(batch_N)
+                elif (
+                    batch_N.node_batch.step_context.repeats > 1
+                    and (batch_N.node_name, batch_N.graph_walk) in self._device_runs
+                ):
+                    self._await_run(batch_N)
                 batch_N.node_batch.completion_event.synchronize()
         else:
             with self._span("worker.postprocess.device_sync"):
                 torch.accelerator.synchronize(self.device)
+
+    def _await_run(self, batch_N: PendingBatch) -> None:
+        """Wait out a run on the device, ending it at its next iteration once
+        a new request arrives: the yield the step's speculation asks for comes
+        before any arrival during the run. What arrived is held for
+        ``_process_messages``, in order."""
+        event = batch_N.node_batch.completion_event
+        while not event.query():
+            arrived = self.communicator.get_all_new_messages()
+            if arrived:
+                self._held_messages = (*self._held_messages, *arrived)
+                if any(m.message_type == WorkerMessageType.NEW_REQUEST for m in arrived):
+                    self.engine_manager.get_engine(batch_N.node_name).yield_runs(batch_N.node_name)
+                    return
+            time.sleep(_LANDED_POLL_S)
 
     def _stream_tokens(self, batch_N: PendingBatch) -> None:
         """While a run is in flight, send the client what it has landed. The
@@ -5479,6 +5507,12 @@ class Worker:
                 self.engine_manager.engine.repeat_note,
             )
             self.streams.windows = self._step_repeats.windows()
+            # a run on the device, which an arrival can end early (``_await_run``)
+            self._device_runs = frozenset(
+                key for key in self._step_repeats.device_stops()
+                if self._step_repeats.may_repeat(*key) and not self._step_repeats.config(key[0]).ready_waits
+                and self._device_stop_refusal(*key) is None
+            )
             if self._step_repeats.auto:
                 self._auto_spans = deque(maxlen=64)
 

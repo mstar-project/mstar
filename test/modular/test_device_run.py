@@ -423,3 +423,30 @@ def test_a_decode_wrapper_reads_its_lengths_off_the_table():
     wrapper.stage_page_base(torch.tensor([0, 3, 4]))
     wrapper.gather_lengths(torch.tensor([9, 2, 0]))
     assert wrapper._paged_kv_last_page_len_buf.tolist()[:2] == [2, 3]
+
+
+def test_a_request_that_arrives_mid_run_ends_the_run_and_is_processed_in_order(monkeypatch):
+    """The speculation's yield comes before any arrival during the run, so the
+    wait itself ends the run when a new request lands; what it took in is
+    processed next, ahead of anything later."""
+    from mstar.utils.ipc_format import WorkerMessageType
+    from mstar.worker.worker import Worker
+
+    worker = Worker.__new__(Worker)
+    arrivals = iter([[], [SimpleNamespace(message_type=WorkerMessageType.INPUT_SIGNALS)],
+                     [SimpleNamespace(message_type=WorkerMessageType.NEW_REQUEST)], ["later"]])
+    worker.communicator = SimpleNamespace(get_all_new_messages=lambda: next(arrivals))
+    yielded, processed = [], []
+    worker.engine_manager = SimpleNamespace(get_engine=lambda node: SimpleNamespace(yield_runs=yielded.append))
+    worker._process_message_list = processed.extend
+    landed = iter([False] * 10)
+    batch = SimpleNamespace(node_name="LLM", node_batch=SimpleNamespace(completion_event=SimpleNamespace(
+        query=lambda: next(landed),
+    )))
+    monkeypatch.setattr("mstar.worker.worker.time.sleep", lambda s: None)
+    worker._await_run(batch)
+    assert yielded == ["LLM"]
+    worker._process_messages()
+    assert [getattr(m, "message_type", m) for m in processed] == [
+        WorkerMessageType.INPUT_SIGNALS, WorkerMessageType.NEW_REQUEST, "later",
+    ]
