@@ -844,7 +844,9 @@ def test_patch_embed_matmul_matches_its_conv():
     )
     embed = VisionPatchEmbed(config).double()
     patches = torch.randn(10, 3 * 2 * 4 * 4, dtype=torch.float64)
-    conv = embed.proj(patches.view(-1, 3, 2, 4, 4)).view(-1, 32)
+    proj = embed.proj
+    conv = torch.nn.functional.conv3d(patches.view(-1, 3, 2, 4, 4), proj.weight, proj.bias, stride=proj.stride)
+    conv = conv.view(-1, 32)
     torch.testing.assert_close(embed(patches), conv)
 
 
