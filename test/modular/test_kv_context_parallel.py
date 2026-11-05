@@ -33,7 +33,7 @@ from mstar.engine.resources.attn import flashinfer_mla as fm
 from mstar.engine.resources.attn.base import AttentionManager
 from mstar.engine.resources.attn.config import AttentionConfig, AttentionSpec, AttentionStep, AttnBackend
 from mstar.engine.resources.base import EngineResourceInfo, Resource
-from mstar.engine.resources.context_parallel import ContextParallelWrapper, merge
+from mstar.engine.resources.context_parallel import ContextParallelWrapper, _merge_states, merge
 from mstar.engine.resources.kv import manager as manager_mod
 from mstar.engine.resources.kv.cache import KVCache
 from mstar.engine.resources.kv.config import KVLayout, KVReqConfig, KVSpec, KVStep, PagedKVConfig
@@ -745,6 +745,38 @@ def test_a_captured_buckets_padding_merges_to_0_and_reaches_no_real_row(monkeypa
     qo = np.cumsum([0, *(new for _, new in PREFILL_ROWS)]).tolist()
     want = torch.cat([_reference(q[a:b], k[a:b], v[a:b])[0] for a, b in itertools.pairwise(qo)])
     torch.testing.assert_close(merged[:n], want)
+
+
+def _merge_states_without_empty_guard(v, s):
+    """FlashInfer's ``merge_states`` as of 0.6.14: contiguous ``[N, K, H, D]`` and base-2 ``[N, K, H]``
+    fp32 in, and a query whose every part is -inf comes out NaN."""
+    assert v.is_contiguous() and s.is_contiguous() and s.dtype == torch.float32 and s.shape == v.shape[:3]
+    weights = torch.exp2(s - s.amax(1, keepdim=True))
+    return ((weights.unsqueeze(-1) * v.float()).sum(1) / weights.sum(1).unsqueeze(-1)).to(v.dtype), None
+
+
+@pytest.mark.parametrize("shape,k", [((6, 4, 64), 2), ((2, 3, 2, 128), 3), ((2, 4, 256), 9)],
+                         ids=["decode-K2", "BSHD-K3", "large-K"])
+@pytest.mark.parametrize("device", [
+    "cpu", pytest.param("cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")),
+])
+def test_the_fused_merge_is_the_fp32_merge(monkeypatch, device, shape, k):
+    """FlashInfer's one-kernel merge (a stand-in on CPU) against the merge in torch: parts in bf16,
+    one from a rank holding none of a row's keys and one row no part has a key for."""
+    if device == "cpu":
+        stand_in = types.SimpleNamespace(merge_states=_merge_states_without_empty_guard)
+        monkeypatch.setitem(sys.modules, "flashinfer", stand_in)
+    gen = torch.Generator().manual_seed(0)
+    outs = torch.randn(k, *shape, generator=gen).to(device, torch.bfloat16)
+    lses = (4 * torch.randn(k, *shape[:-1], generator=gen)).to(device)
+    lses[0, 0] = -math.inf
+    outs[:, 1], lses[:, 1] = 0, -math.inf
+    want = merge(outs.float(), lses).to(torch.bfloat16)
+    got = _merge_states(outs, lses)
+    assert torch.isfinite(got).all() and not got[1].any()
+    torch.testing.assert_close(got, want)
+    if device == "cuda":
+        assert torch.equal(merge(outs, lses), got)
 
 
 def test_a_dropped_preplan_leaves_its_own_token_wrappers_nothing_to_skip(monkeypatch):

@@ -11,8 +11,10 @@ returns the partial with its log-sum-exp; the partners exchange partials and ``m
 exactly.
 """
 
+import functools
+import importlib.util
 import math
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from typing import NamedTuple
 
 import numpy as np
@@ -21,6 +23,7 @@ import torch
 from mstar.distributed.communication import CommGroup
 from mstar.engine.resources.kv.plan import SINK_PAGE, HostLens, PagedIndptrs, first_pages
 from mstar.engine.resources.spec import NodeResourceSpec
+from mstar.platforms import current_platform
 from mstar.utils.h2d import PinnedStager
 
 
@@ -231,8 +234,7 @@ class ContextParallelWrapper:
         out, lse = self.context.run(*parts, kv_cache_layer, return_lse=True)
         outs, lses = self._exchange_partials(out, lse, self._valid[: parts[0].shape[0]])
         if new is not None:
-            outs = torch.cat([outs, new[0].to(outs.dtype).unsqueeze(0)])
-            lses = torch.cat([lses, new[1].float().unsqueeze(0)])
+            outs, lses = (*outs, new[0].to(outs.dtype)), (*lses, new[1])
         return merge(outs, lses).to(queries[0].dtype)
 
     def _exchange_queries(self, queries: tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, ...]:
@@ -290,19 +292,54 @@ def _leading_rows(kv_out, real_rows: frozenset) -> int | None:
     return n if 0 < n < len(rids) else None
 
 
-def merge(outs: torch.Tensor, lses: torch.Tensor) -> torch.Tensor:
-    """Attention over the union of disjoint key sets from each set's partial: ``outs`` ``[K, ..., D]``
-    and natural-log ``lses`` ``[K, ...]``; fp32, one ``[..., D]`` accumulated a part at a time. A
-    partial with lse -inf and a finite out adds nothing, and a query no partial has a key for (a
-    captured bucket's padding) comes out 0."""
-    lses = lses.float()
+def merge(outs: Sequence[torch.Tensor], lses: Sequence[torch.Tensor]) -> torch.Tensor:
+    """Attention over the union of disjoint key sets from each set's partial: the parts ``outs``
+    (each ``[..., D]``, or one tensor stacking them) and their natural-log ``lses`` (each ``[...]``),
+    merged in fp32 into one ``[..., D]`` in the parts' dtype. A partial with lse -inf adds nothing,
+    and a query no partial has a key for (a captured bucket's padding, every part out 0 and lse
+    -inf) comes out 0. On an NVIDIA GPU, half-precision parts of a head dim FlashInfer builds merge
+    in its one kernel; anything else merges here, a part at a time."""
+    first = outs[0]
+    if (
+        first.is_cuda and first.dtype in (torch.float16, torch.bfloat16)
+        and first.shape[-1] in _MERGE_STATES_HEAD_DIMS and first.numel() > 0
+        and all(part.dtype == first.dtype for part in outs) and _flashinfer_on_cuda()
+    ):
+        return _merge_states(outs, lses)
+    lses = torch.stack([lse.float() for lse in lses])
     # finite on a row with no key, so its every weight is 0
     top = lses.amax(0).clamp_min(torch.finfo(torch.float32).min)
     weights = (lses - top).exp_()
-    out = weights[0].unsqueeze(-1) * outs[0]
+    out = weights[0].unsqueeze(-1) * first
     for weight, part in zip(weights[1:], outs[1:], strict=True):
         out.addcmul_(weight.unsqueeze(-1), part)
-    return out.div_(weights.sum(0).clamp_min(torch.finfo(torch.float32).tiny).unsqueeze(-1))
+    return out.div_(weights.sum(0).clamp_min(torch.finfo(torch.float32).tiny).unsqueeze(-1)).to(first.dtype)
+
+
+# the head dims FlashInfer's merge kernels are built for
+_MERGE_STATES_HEAD_DIMS = frozenset({64, 128, 256, 512})
+# a key-less part's base-2 lse: FlashInfer before 0.7.2 merges a query whose every part is -inf to NaN
+_EMPTY_LSE = -1e30
+
+
+@functools.cache
+def _flashinfer_on_cuda() -> bool:
+    """Whether this process drives NVIDIA GPUs and has FlashInfer (ROCm's torch says ``cuda`` too)."""
+    return current_platform.is_cuda() and importlib.util.find_spec("flashinfer") is not None
+
+
+def _merge_states(outs: Sequence[torch.Tensor], lses: Sequence[torch.Tensor]) -> torch.Tensor:
+    """``merge`` in FlashInfer's ``merge_states``, which takes contiguous ``[N, K, H, D]`` parts and
+    base-2 ``[N, K, H]`` fp32 lses: one copy of each into that layout, then one kernel. It merges in
+    fp32, except that for at most K queries with K over 16, 8, 4 and 4 at D 64, 128, 256 and 512,
+    its kernel rounds partial merges to the parts' dtype before the last one."""
+    from flashinfer import merge_states
+
+    first = outs[0]
+    v = torch.stack(tuple(outs), dim=-3)
+    s = torch.stack(tuple(lse.float() for lse in lses), dim=-2).mul_(1 / math.log(2)).clamp_min_(_EMPTY_LSE)
+    out, _ = merge_states(v.reshape(-1, *v.shape[-3:]), s.reshape(-1, *s.shape[-2:]))
+    return out.view(first.shape)
 
 
 @torch.compiler.disable
@@ -312,7 +349,7 @@ def gather_merge(group: CommGroup, out: torch.Tensor, lse: torch.Tensor) -> torc
     of both, then ``merge``. Moves query-sized results rather than the keys."""
     if group.world_size == 1:
         return out
-    return merge(*_gather_partials(group, out, lse)).to(out.dtype)
+    return merge(*_gather_partials(group, out, lse))
 
 
 def _position_pools(specs: Iterable[NodeResourceSpec], node: str) -> dict[str, bool]:
