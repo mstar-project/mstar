@@ -90,7 +90,6 @@ from mstar.model.submodule_base import (
     ModelInputsFromEngine,
     NodeInputs,
     NodeSubmodule,
-    StopCheck,
     TokenStop,
 )
 from mstar.utils.h2d import to_device_nonblocking
@@ -1356,6 +1355,18 @@ class ThinkerSubmodule(ARNodeSubmodule):
 # 4. TalkerSubmodule (ar engine) -- SECOND MOST COMPLEX
 # ===================================================================
 
+def talker_token_stop(config: Qwen3OmniModelConfig) -> TokenStop | None:
+    """The Talker stops on codec_eos; the frame budget is the loop's cap
+    (``Qwen3OmniModel.get_loop_caps``). The codec_eos frame stays out of the
+    Code2Wav stream: it is not a codebook index, and only the stop check's
+    host copy tells it from audio."""
+    eos = config.talker.codec_eos_token_id
+    return None if eos is None else TokenStop(
+        loop="talker_decode_loop", buffer="layer0_codes", stop_ids=frozenset({eos}),
+        sampler=TALKER_SAMPLER, withhold=("codec_tokens",),
+    )
+
+
 class TalkerSubmodule(ARNodeSubmodule):
     MAX_BATCH_SIZE = 32
 
@@ -1388,6 +1399,8 @@ class TalkerSubmodule(ARNodeSubmodule):
         # the text conditioning for this request. We use this flag to
         # inject tts_eos_embed for ONE step before falling back to pad.
         self._eos_embed_sent: set[str] = set()
+
+        self.token_stop = talker_token_stop(config)
 
     def init_tts_embeds(self, thinker_embed_tokens: nn.Embedding) -> None:
         """Pre-compute TTS pad/bos/eos hidden states using the Thinker's
@@ -1791,27 +1804,10 @@ class TalkerSubmodule(ARNodeSubmodule):
     ):
         if "new_token" not in outputs:
             return
-        # Rename new_token → layer0_codes for downstream graph routing.
-        # check_stop reads layer0_codes (same tensor) on the worker's slow path.
+        # Rename new_token → layer0_codes for downstream graph routing; the
+        # stop check reads layer0_codes (same tensor).
         codes = outputs.pop("new_token")[0]
         outputs["layer0_codes"] = [codes]
-
-    def check_stop(
-        self, request_id: str,
-        request_info: CurrentForwardPassInfo,
-        outputs: dict[str, list[torch.Tensor]],
-    ) -> set[str] | StopCheck:
-        """Stop on codec_eos. The frame budget is the loop's cap
-        (``Qwen3OmniModel.get_loop_caps``), which the graph runtime enforces.
-        The codec_eos frame stays out of the Code2Wav stream: it is not a
-        codebook index, and only this host copy tells it from audio."""
-        if "layer0_codes" not in outputs:
-            return set()
-        token = outputs["layer0_codes"][0].item()
-        eos_token_id = self.config.talker.codec_eos_token_id
-        if eos_token_id is None or eos_token_id != token:
-            return set()
-        return StopCheck({"talker_decode_loop"}, withheld=("codec_tokens",))
 
     def cleanup_request(self, request_id: str) -> None:
         """Remove per-request state when a request completes."""

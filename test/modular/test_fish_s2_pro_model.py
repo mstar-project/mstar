@@ -38,7 +38,6 @@ from mstar.model.fish_s2_pro.config import (
 from mstar.model.fish_s2_pro.fish_s2_pro_model import FishS2ProModel, clip_digest, load_fast_ar_weights
 from mstar.model.fish_s2_pro.submodules import ARSubmodule
 from mstar.model.registry import HF_MODELS, get_model_class
-from mstar.model.submodule_base import StopCheck
 
 CONFIG_PATH = Path(__file__).resolve().parents[2] / "configs" / "fish_s2_pro.yaml"
 SEMANTIC_START, SEMANTIC_CODES, EOS_ID = 100, 32, 99
@@ -443,9 +442,10 @@ def test_clone_prefill_splices_reference_frames_after_the_prefix():
 
 
 def test_check_stop_ends_on_im_end_and_withholds_it_even_under_ignore_eos():
-    """<|im_end|> ends decode, and its frame stays out of the codec stream either
-    way, so the codec never reads it; under ``ignore_eos`` the row goes on. Other
-    frames neither stop nor withhold: the frame budget is the loop's cap."""
+    """<|im_end|> ends decode, and its declared stop withholds its frame from the
+    codec stream either way, so the codec never reads it; under ``ignore_eos``
+    the row goes on. Other frames neither stop nor withhold: the frame budget is
+    the loop's cap."""
     ar = tiny_ar()
 
     def check(head, ignore_eos=False, walk="ar_decode"):
@@ -457,8 +457,10 @@ def test_check_stop_ends_on_im_end_and_withholds_it_even_under_ignore_eos():
 
     assert check(4, walk="ar_prefill") == set()
     assert check(4) == set()
-    assert check(ar.eos_code) == StopCheck({"ar_decode_loop"}, withheld=("codec_tokens",))
-    assert check(ar.eos_code, ignore_eos=True) == StopCheck(set(), withheld=("codec_tokens",))
+    assert check(ar.eos_code) == {"ar_decode_loop"}
+    assert check(ar.eos_code, ignore_eos=True) == set()
+    (policy,) = ar.get_stop_policies("ar_decode").values()
+    assert policy.withhold == ("codec_tokens",) and ar.eos_code in policy.eos_tokens
 
 
 def ar_info(ignore_eos=False, layout=None):

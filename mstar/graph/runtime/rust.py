@@ -699,7 +699,6 @@ class RustGraphRuntime(GraphRuntime):
             node_name, graph_walk, list(policies),
             [p.reads_token for p in policies.values()],
             [sorted(p.eos_tokens) for p in policies.values()],
-            [bool(p.withhold) for p in policies.values()],
         )
 
     def loop_room(self, node_name: str, graph_walk: str, loop_name: str, rids: list[int], stride: int) -> int:
@@ -723,9 +722,9 @@ class RustGraphRuntime(GraphRuntime):
     ) -> RuntimeStops | None:
         policies = self._stop_policies[(node_name, graph_walk)]
         if not policies:
-            return RuntimeStops({}, {}, frozenset())
+            return RuntimeStops({}, {})
         ptr, rows, stride, dtype = _column(tokens)
-        stop_rids, stop_rules, kept, missing, w_rids, w_iters = self._rust.check_stops_inline(
+        stop_rids, stop_rules, kept, missing = self._rust.check_stops_inline(
             partition, node_name, graph_walk, rids, ptr, rows, stride, dtype, row_rids, token_width,
         )
         if missing:
@@ -734,10 +733,7 @@ class RustGraphRuntime(GraphRuntime):
         stops: dict[int, set[str]] = {}
         for rid, k in zip(stop_rids, stop_rules, strict=True):
             stops.setdefault(rid, set()).add(loops[k])
-        return RuntimeStops(
-            stops, dict(zip(stop_rids, kept, strict=True)) if token_width > 1 else {},
-            frozenset(zip(w_rids, w_iters, strict=True)),
-        )
+        return RuntimeStops(stops, dict(zip(stop_rids, kept, strict=True)) if token_width > 1 else {})
 
     def begin_postprocess(self, request: PostprocessRequest) -> PostprocessStep:
         """Natively (``postprocess.rs``)."""
@@ -801,14 +797,11 @@ class RustGraphRuntime(GraphRuntime):
         wg_of = dict(zip(wg_ids.keys, wg_ids.values, strict=True))
         rids = out.rids
         route = out.take_route()
-        kept = withheld = ()
-        if need is PostprocessNeed.STORE:
-            kept, withheld = out.kept_rids, out.withheld_rids
+        kept = out.kept_rids if need is PostprocessNeed.STORE else ()
         return PostprocessStep(
             need, ParallelList(rids, [wg_of[r] for r in rids]), out.rid_walk_idx,
             out.stopped_rids, None if route is None else self._route_output(route),
             kept=dict(zip(kept, out.kept, strict=True)) if kept else {},
-            withheld=frozenset(zip(withheld, out.withheld_iters, strict=True)) if withheld else frozenset(),
         )
 
     def stop_loops_batched(

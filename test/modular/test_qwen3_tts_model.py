@@ -46,12 +46,10 @@ from mstar.model.registry import HF_MODELS, get_model_class
 from mstar.model.submodule_base import (
     ARNodeInputs,
     BatchedModelOutput,
-    BatchedStopCheck,
     HostRows,
     InputMetadata,
     ModelInputsFromEngine,
     NodeSubmodule,
-    StopCheck,
 )
 from mstar.streaming.chunk_policy import ScheduledLeftContextChunkPolicy
 from mstar.streaming.stream_buffer import StreamBuffer, StreamChunkInfo
@@ -1051,16 +1049,14 @@ def test_qwen3_tts_stops_on_eos_from_routed_codec_tokens():
     submodule.postprocess("request", request_info, outputs)
 
     assert outputs["layer0_codes"][0].item() == config.talker.codec_eos_token_id
-    assert submodule.check_stop("request", request_info, outputs) == StopCheck(
-        {"talker_decode_loop"}, withheld=("codec_tokens",),
-    )
+    assert submodule.check_stop("request", request_info, outputs) == {"talker_decode_loop"}
 
 
 @pytest.mark.parametrize("ignore_eos", [False, True])
 def test_qwen3_tts_talker_withholds_eos_frames_from_the_codec_stream(ignore_eos):
-    """EOS is not a codebook index, so its frame never reaches the codec,
-    including under ``ignore_eos`` where the loop runs on past it. The stop
-    check decides both off one read."""
+    """EOS is not a codebook index, so its declared stop withholds its frame
+    from the codec, including under ``ignore_eos`` where the loop runs on past
+    it."""
     config = _tiny_model_config()
     submodule = TalkerSubmodule(Qwen3TTSTalkerModel(config), _code_predictor(config), config)
     request_info = SimpleNamespace(
@@ -1074,7 +1070,9 @@ def test_qwen3_tts_talker_withholds_eos_frames_from_the_codec_stream(ignore_eos)
         return {"layer0_codes": [torch.tensor(token)], "codec_tokens": [torch.tensor([token, 1, 2, 3])]}
 
     stops = set() if ignore_eos else {"talker_decode_loop"}
-    assert submodule.check_stop("request", request_info, outputs(eos)) == StopCheck(stops, ("codec_tokens",))
+    assert submodule.check_stop("request", request_info, outputs(eos)) == stops
+    (policy,) = submodule.get_stop_policies("talker_decode").values()
+    assert policy.withhold == ("codec_tokens",) and eos in policy.eos_tokens
     assert submodule.check_stop("request", request_info, outputs(eos - 1)) == set()
     assert submodule.check_stop("request", request_info, {}) == set()
 
@@ -1099,7 +1097,7 @@ def test_qwen3_tts_honors_ignore_eos_for_fixed_length_benchmarks():
 
     submodule.postprocess("request", request_info, outputs)
 
-    assert submodule.check_stop("request", request_info, outputs) == StopCheck(set(), ("codec_tokens",))
+    assert submodule.check_stop("request", request_info, outputs) == set()
 
 
 def test_qwen3_tts_batched_stop_check_agrees_with_the_per_request_one():
@@ -1130,19 +1128,13 @@ def test_qwen3_tts_batched_stop_check_agrees_with_the_per_request_one():
         rid: submodule.check_stop(rid, infos[rid], {"layer0_codes": [torch.tensor([cases[rid][0]])]})
         for rid in cases
     }
-    stops = {
-        rid: s for rid, check in checks.items()
-        if (s := check.stops if isinstance(check, StopCheck) else check)
-    }
-    withheld = {rid: check.withheld for rid, check in checks.items() if isinstance(check, StopCheck)}
+    stops = {rid: check for rid, check in checks.items() if check}
     assert stops == {"eos": {"talker_decode_loop"}}
-    # EOS frames stay out of the codec stream, ``ignore_eos`` or not
-    assert withheld == {"eos": ("codec_tokens",), "ignored": ("codec_tokens",)}
     # Rows in forward order (reversed here), plus a padding row past the real ones.
     order = list(reversed(cases))
     codes = torch.tensor([cases[rid][0] for rid in order] + [eos])
     host_rows = HostRows(tuple(order), {"layer0_codes": codes})
-    assert submodule.check_stop_batched(list(cases), infos, host_rows) == BatchedStopCheck(stops, withheld)
+    assert submodule.check_stop_batched(list(cases), infos, host_rows) == stops
 
 
 def test_qwen3_tts_talker_returns_row_outputs():
@@ -2275,7 +2267,7 @@ def test_qwen3_tts_streaming_policy_ramps_and_flushes_only_new_tail_audio():
 
 @pytest.mark.parametrize("num_frames", [0, 1, 2, 3, 4, 5, 6, 7, 8])
 def test_qwen3_tts_codec_stream_carries_no_eos_and_ends_on_the_last_frames(num_frames):
-    """The Talker's stop check withholds its EOS frame, so the codec's windows
+    """The Talker's declared stop withholds its EOS frame, so the codec's windows
     hold only frames and each frame's audio comes out once. Off a window
     boundary the final chunk carries the last frames; a stream whose first
     frame was EOS ends with an empty chunk that emits nothing."""
@@ -2293,14 +2285,15 @@ def test_qwen3_tts_codec_stream_carries_no_eos_and_ends_on_the_last_frames(num_f
             codec_config.chunk_schedule, codec_config.chunk_frames, 0,
         ),
     )
+    (policy,) = talker.get_stop_policies("talker_decode").values()
     for i, token in enumerate([*range(1, num_frames + 1), eos]):
         frame = torch.tensor([token, 1, 2, 3])
         result = talker.check_stop("r", info, {"layer0_codes": [torch.tensor(token)], "codec_tokens": [frame]})
-        if isinstance(result, StopCheck) and "codec_tokens" in result.withheld:
+        if "codec_tokens" in policy.withhold and token in policy.eos_tokens:
             continue
         stream.pre_read_register(f"t{i}")
         stream.put(f"t{i}", frame)
-    assert result == StopCheck({"talker_decode_loop"}, ("codec_tokens",))
+    assert result == {"talker_decode_loop"}
     stream.signal_done(num_frames)
 
     codec = _tiny_codec(config)

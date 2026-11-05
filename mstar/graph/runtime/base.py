@@ -643,9 +643,6 @@ class RuntimeStops(NamedTuple):
     # rid -> the iterations that count, for a row that stopped inside a step
     # that repeated; a row not here keeps all of them
     kept: dict[int, int]
-    # (rid, iteration) whose item of a withholding policy's signals
-    # (``StopPolicy.withhold``) is not routed: its token is a stop id
-    withheld: frozenset[tuple[int, int]]
 
 
 class PostprocessStep(NamedTuple):
@@ -660,9 +657,8 @@ class PostprocessStep(NamedTuple):
     route_output: RouteOutput | None = None
     # the rids a WORKER_GRAPHS_DONE went out for (DONE)
     completed_rids: list[int] | tuple[()] = ()
-    # STORE: what the stop check kept of each row (``RuntimeStops``)
+    # STORE: the iterations the stop check kept of each row (``RuntimeStops``)
     kept: Mapping[int, int] = MappingProxyType({})
-    withheld: frozenset[tuple[int, int]] = frozenset()
 
 
 class _PostprocessPhase(IntEnum):
@@ -686,13 +682,12 @@ class _Postprocess:
     route: RouteOutput | None = None
     send: SendInput | None = None
     kept: dict[int, int] = field(default_factory=dict)
-    withheld: frozenset[tuple[int, int]] = frozenset()
 
     def step(self, need: PostprocessNeed, completed: list[int] | None = None) -> PostprocessStep:
         if need is PostprocessNeed.DONE:
             return PostprocessStep(need, stopped_rids=self.stopped, completed_rids=completed or [])
         return PostprocessStep(
-            need, self.wg_ids, self.rid_walk_idx, self.stopped, self.route, kept=self.kept, withheld=self.withheld,
+            need, self.wg_ids, self.rid_walk_idx, self.stopped, self.route, kept=self.kept,
         )
 
 
@@ -781,7 +776,7 @@ class PhasedPostprocess:
                     _refuse_repeated(req, "check_stop")
                     return pp.step(PostprocessNeed.STOPS)
                 pp.stops = _merged_stops(req.stops, found.stops)
-                pp.kept, pp.withheld = found.kept, found.withheld
+                pp.kept = found.kept
                 self._keep_rows(pp, set())
             pp.stopped = self._stop_step_loops(pp)
             pp.phase = _PostprocessPhase.ROUTE
@@ -789,8 +784,7 @@ class PhasedPostprocess:
             if not pp.wg_ids.keys:
                 self._postprocess = None  # every row was dropped
                 return pp.step(PostprocessNeed.DONE)
-            # a withheld item has to be left out of the store
-            inline_values = None if req.inline is None or pp.withheld else self._inline_values(pp)
+            inline_values = None if req.inline is None else self._inline_values(pp)
             if inline_values is None and pp.stored is None:
                 return pp.step(PostprocessNeed.STORE)
             n = len(pp.wg_ids.keys) * len(req.output_signals)
@@ -1041,9 +1035,9 @@ class GraphRuntime(PhasedPostprocess, ABC):
     ) -> RuntimeStops | None:
         """(node, walk)'s declared stop policies over a step's rows: per rid,
         the loops it stops (``StopPolicy.stops``), at its first iteration that
-        stops it when the step repeated (``token_width`` values a row), and
-        the items a withholding policy drops; None when a row has no limits
-        for the walk, and the worker's ``check_stop`` decides.
+        stops it when the step repeated (``token_width`` values a row); None
+        when a row has no limits for the walk, and the worker's ``check_stop``
+        decides.
 
         Each loop's count is this runtime's as of the step: counts move when
         the step is routed, which comes after. ``tokens`` is the step's token

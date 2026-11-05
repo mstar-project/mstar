@@ -123,3 +123,18 @@ def test_a_class_without_its_own_stop_check_declares_no_stops(module, name, poli
     sub = cls.__new__(cls)
     torch.nn.Module.__init__(sub)
     assert sub.get_stop_policies("decode") == policies
+
+
+def test_the_omni_talker_withholds_its_codec_eos_frame_through_its_token_stop():
+    """The Talker's stop is a ``TokenStop`` like any other: the runtime checks
+    it, and its codec_eos frame stays out of the Code2Wav stream."""
+    from mstar.model.qwen3_omni.config import Qwen3OmniModelConfig
+    from mstar.model.qwen3_omni.submodules import TalkerSubmodule, talker_token_stop
+
+    config = Qwen3OmniModelConfig()
+    sub = TalkerSubmodule.__new__(TalkerSubmodule)
+    torch.nn.Module.__init__(sub)
+    sub.token_stop = talker_token_stop(config)
+    (policy,) = sub.get_stop_policies("talker_decode").values()
+    assert policy.eos_tokens == {config.talker.codec_eos_token_id}
+    assert policy.withhold == ("codec_tokens",)

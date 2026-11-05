@@ -51,7 +51,7 @@ def _batch(rids):
 
 
 def test_a_withheld_output_stays_out_of_the_row_store(tmp_path):
-    """The worker pops a withheld output (``StopCheck.withheld``) from the row's
+    """The worker pops a withheld output (``TokenStop.withhold``) from the row's
     outputs before storing; the row store must read those outputs, not the row
     views, or a Talker's EOS frame would reach its codec."""
     rids = [3, 5]

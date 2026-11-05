@@ -1481,7 +1481,7 @@ methods are:
    scheduling overlap. Use this method only to rename outputs for routing. Put decisions
    that depend on tensor values in ``check_stop``.
 
-``check_stop(...) -> set[str] | StopCheck`` (optional)
+``check_stop(...) -> set[str]`` (optional)
    Runs off the GPU thread, and may read tensor values. Return the names of the ``Loop``
    objects to stop, for example after seeing the EOS token. This is how a decode loop
    terminates. An AR submodule whose loop ends on a stop token sets
@@ -1503,18 +1503,16 @@ methods are:
    another walk after its loop (an ``align`` walk, or image generation after thinking) or
    publishes final-only state at the loop's stop needs its own transition instead. Keep
    ``check_stop_batched``, if you write one, in agreement.
-   To also keep some of this step's outputs from being routed, return
-   ``StopCheck(stops, withheld=(names...))``, for example a frame streamed alongside the
-   EOS token: its consumer then never receives it, instead of finding and dropping it with
-   a device read. ``check_stop_batched`` returns a ``BatchedStopCheck`` for the same.
-   The Qwen3-Omni Talker and Fish S2 Pro's AR keep their EOS frame out of the codec
-   stream this way; a ``TokenStop`` names such outputs in ``withhold``, left unrouted on a
-   row whose token is a stop id (the Qwen3-TTS Talker).
-   Only an output that leaves by a streaming edge can be withheld (any other consumer
-   would wait for an item that never comes), and not one that a node this worker
-   speculates into reads, nor the loop-back signal. Startup refuses a
-   ``TokenStop.withhold`` that breaks this; a ``StopCheck`` from ``check_stop`` is not
-   checked.
+   To also keep some of a step's outputs from being routed, for example a frame streamed
+   alongside the EOS token, a ``TokenStop`` names them in ``withhold``: they are left
+   unrouted on a row whose token is a stop id, ``ignore_eos`` or not, so the consumer never
+   receives them instead of finding and dropping them with a device read. The worker reads
+   that off the stop check's host copy, whichever check decided the stops. The Qwen3-Omni
+   and Qwen3-TTS Talkers and Fish S2 Pro's AR keep their EOS frame out of the codec stream
+   this way. Only an output that leaves by a streaming edge can be withheld (any other
+   consumer would wait for an item that never comes), and not one that a node this worker
+   speculates into reads, nor the loop-back signal; startup refuses a ``withhold`` that
+   breaks this.
 
 ``on_request_added(self, request_id, request_info)`` (optional)
    Called on the worker's main thread when the request reaches the worker, before any of
@@ -1568,7 +1566,7 @@ methods are:
    The worker cuts each row to its span after the step's completion event, before the stop
    check, transport or a streaming edge reads it. The cut is a view, not a copy. Engine-side
    ``postprocess`` still sees the uncut output. A row whose span is empty is left out of the
-   store after the stop check, as a withheld output is (``StopCheck``): a streaming edge
+   store after the stop check, as a withheld output is (``TokenStop.withhold``): a streaming edge
    gets no item for it. A spanned output must not feed a node that the same worker
    speculates into.
 

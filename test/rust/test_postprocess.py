@@ -304,13 +304,9 @@ def test_a_repeated_step_refuses_the_model_check_that_reads_one_iteration(tmp_pa
 @pytest.mark.parametrize("cls", [rust_runtime.RustGraphRuntime, _Reference], ids=["native", "reference"])
 def test_a_repeated_step_hands_the_store_what_each_row_kept(tmp_path, cls):
     """At STORE a step that ran three iterations says, per row, the iterations
-    its stop kept and which iteration's item a withholding policy drops: only
-    an EOS column's (ignore_eos or not), never a loop cap's, and nothing past
-    the stop. In order: row 0 runs on, row 1 stops on EOS at iteration 1, row
-    2 reaches its cap at iteration 1."""
+    its stop kept, nothing past the stop. In order: row 0 runs on, row 1 stops
+    on EOS at iteration 1, row 2 reaches its cap at iteration 1."""
     rt = _runtime(cls, str(tmp_path))
-    withholding = StopPolicy(StopKind.AR, token_signal=SIG, eos_tokens=(EOS,), withhold=(SIG,))
-    rt.set_stop_policies(NODE, WALK, {LOOP: withholding})
     rids = _start(rt, 3)
     rt.register_stop_limits(rids[2], SimpleNamespace(max_tokens=2, resource_configs={}))
     assert rt.pop_rids(NODE, WALK, rids) is not None
@@ -322,7 +318,6 @@ def test_a_repeated_step_hands_the_store_what_each_row_kept(tmp_path, cls):
     ))
     assert step.need is PostprocessNeed.STORE
     assert dict(step.kept) == {rids[1]: 2, rids[2]: 2}
-    assert step.withheld == {(rids[1], 1)}
     assert sorted(step.stopped_rids) == [rids[1], rids[2]]
 
 

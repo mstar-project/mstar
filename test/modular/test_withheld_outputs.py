@@ -1,40 +1,45 @@
-"""A step's output that the stop check finds is not data is never routed.
+"""A step's output that its declared stop withholds is never routed.
 
-``check_stop`` returns a ``StopCheck`` (``check_stop_batched`` a
-``BatchedStopCheck``) that names it beside the loops to stop, off the same
-read; ``Engine.check_stop_for_batch`` records it on the batch and the worker
-leaves those outputs out of the store, so the route carries zero tensors for
-them (a streaming edge then gets no item). Drives the real engine method and
-the real ``Worker._postprocess_batch`` on CPU, with the graph runtime stubbed
-to record what it was asked to route.
+A ``TokenStop.withhold`` (``StopPolicy.withhold``) names outputs that are not
+data on an iteration whose token is a stop id, ``ignore_eos`` or not. The
+worker reads that off the stop check's host copy, whichever check decided the
+stops, and leaves those items out of the store, so the route carries none of
+them (a streaming edge then gets no item). A step that repeated routes each
+row the iterations its stop kept. Drives the real ``Worker._postprocess_batch``
+on CPU, with the graph runtime stubbed to record what it was asked to route.
 """
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from mstar.communication.communicator import BaseCommunicator
 from mstar.communication.tensors import SharedMemoryCommunicationManager
 from mstar.engine.engine import Engine, ExecutingBatch
 from mstar.engine.resources import StepContext
-from mstar.graph.runtime.base import FreedTensors, PhasedPostprocess, RouteOutput
-from mstar.model.submodule_base import BatchedModelOutput, BatchedStopCheck, HostRows, NodeSubmodule, StopCheck
+from mstar.graph.runtime.base import FreedTensors, PhasedPostprocess, PostprocessNeed, PostprocessStep, RouteOutput
+from mstar.model.submodule_base import BatchedModelOutput, HostRows, NodeSubmodule, StopKind, StopPolicy
+from mstar.utils.containers import ParallelList
 from mstar.worker.micro_scheduler import ScheduledBatch
 from mstar.worker.stream_buffers import StreamBufferManager
-from mstar.worker.worker import Worker, _LazyPerRid
+from mstar.worker.worker import Worker
 
 NODE, WALK, STOP_TOKEN, LOOP = "producer", "decode", 9, "loop"
 KEEP, DROP = 1, 2
+# the producer's declared stop: STOP_TOKEN ends the loop and its frame is no data
+WITHHOLDING = {(NODE, WALK): StopPolicy(
+    StopKind.EOS, token_signal="token", eos_tokens=(STOP_TOKEN,), withhold=("frame",),
+)}
 
 
 class _Producer(NodeSubmodule):
-    """Streams a frame every step; the frame of a stop-token step is not data.
-    With ``stop=False`` (``ignore_eos``, say) the loop runs on past it."""
+    """Streams a frame every step; its own check stops on a stop token, or
+    with ``stop=False`` (``ignore_eos``, say) runs on past it."""
 
-    def __init__(self, fail_on=None, stop=True, batched=False):
+    def __init__(self, fail_on=None, stop=True):
         super().__init__()
-        self.fail_on, self.stop, self.batched = fail_on, stop, batched
-        self.reads = []
+        self.fail_on, self.stop = fail_on, stop
 
     def prepare_inputs(self, *args, **kwargs):
         raise NotImplementedError
@@ -42,36 +47,10 @@ class _Producer(NodeSubmodule):
     def forward(self, *args, **kwargs):
         raise NotImplementedError
 
-    def _check(self, request_id, token):
-        self.reads.append(request_id)
+    def check_stop(self, request_id, request_info, outputs):
         if request_id == self.fail_on:
             raise RuntimeError("cannot tell")
-        if token != STOP_TOKEN:
-            return set()
-        return StopCheck({LOOP} if self.stop else set(), withheld=("frame",))
-
-    def check_stop(self, request_id, request_info, outputs):
-        return self._check(request_id, int(outputs["token"][0].item()))
-
-    def check_stop_batched(self, request_ids, request_infos, host_rows):
-        if not self.batched:
-            return None
-        stops, withheld = {}, {}
-        for rid, token in host_rows.first_values("token", request_ids):
-            result = self._check(rid, token)
-            if isinstance(result, StopCheck):
-                if result.stops:
-                    stops[rid] = result.stops
-                withheld[rid] = result.withheld
-        return BatchedStopCheck(stops, withheld)
-
-
-class _Plain(_Producer):
-    """A stop check that only stops, the way every other model's does."""
-
-    def _check(self, request_id, token):
-        self.reads.append(request_id)
-        return {LOOP} if token == STOP_TOKEN else set()
+        return {LOOP} if self.stop and int(outputs["token"][0].item()) == STOP_TOKEN else set()
 
 
 def _batch(rids=(KEEP, DROP)):
@@ -94,49 +73,10 @@ def _engine(submodule):
     return engine
 
 
-def test_the_stop_check_records_what_the_submodule_withholds():
-    submodule, batch = _Producer(), _batch()
-    assert _engine(submodule).check_stop_for_batch(batch, _outputs()) == {DROP: {LOOP}}
-    assert batch.withheld_outputs == {DROP: ("frame",)}
-    assert submodule.reads == [KEEP, DROP]   # one read per row
-
-
-def test_a_row_can_be_withheld_without_stopping():
-    batch = _batch()
-    assert _engine(_Producer(stop=False)).check_stop_for_batch(batch, _outputs()) == {}
-    assert batch.withheld_outputs == {DROP: ("frame",)}
-
-
-def test_a_plain_set_withholds_nothing():
-    batch = _batch()
-    assert _engine(_Plain()).check_stop_for_batch(batch, _outputs()) == {DROP: {LOOP}}
-    assert batch.withheld_outputs == {}
-
-
 def test_a_raise_fails_only_that_request():
     batch = _batch()
-    _engine(_Producer(fail_on=KEEP)).check_stop_for_batch(batch, _outputs())
-    assert set(batch.failed_requests) == {KEEP}
-    assert batch.withheld_outputs == {DROP: ("frame",)}
-
-
-def test_the_batched_check_withholds_off_the_rows_without_building_per_row_dicts():
-    host = {"token": torch.tensor([[3], [STOP_TOKEN]]), "frame": torch.tensor([[3, 0], [STOP_TOKEN, 0]])}
-    per_rid = _LazyPerRid(host, [KEEP, DROP])
-    submodule, batch = _Producer(batched=True), _batch()
-
-    stops = _engine(submodule).check_stop_for_batch(batch, per_rid, host_rows=HostRows((KEEP, DROP), host))
-
-    assert stops == {DROP: {LOOP}} and batch.withheld_outputs == {DROP: ("frame",)}
-    assert submodule.reads == [KEEP, DROP]
-    assert per_rid._built is None
-
-
-def test_a_batched_check_that_declines_falls_back_per_row():
-    host = {"token": torch.tensor([[3], [STOP_TOKEN]])}
-    batch = _batch()
-    stops = _engine(_Producer()).check_stop_for_batch(batch, _outputs(), host_rows=HostRows((KEEP, DROP), host))
-    assert stops == {DROP: {LOOP}} and batch.withheld_outputs == {DROP: ("frame",)}
+    stops = _engine(_Producer(fail_on=KEEP)).check_stop_for_batch(batch, _outputs())
+    assert set(batch.failed_requests) == {KEEP} and stops == {DROP: {LOOP}}
 
 
 class _Communicator(BaseCommunicator):
@@ -184,8 +124,11 @@ class _RecordingRuntime(PhasedPostprocess):
         )
 
 
-def test_the_worker_routes_no_tensor_for_a_withheld_output(tmp_path):
-    engine = _engine(_Producer())
+@pytest.mark.parametrize("stop", [True, False], ids=["stops", "ignore_eos"])
+def test_the_worker_routes_no_tensor_for_a_withheld_output(tmp_path, stop):
+    """The model's own check decides the stops here (no runtime policies), and
+    the frame of the stop-token row is withheld whether or not it stops."""
+    engine = _engine(_Producer(stop=stop))
     w = Worker.__new__(Worker)
     w._phase_period = 0
     w.enable_nvtx = w.enable_prof = False
@@ -193,6 +136,7 @@ def test_the_worker_routes_no_tensor_for_a_withheld_output(tmp_path):
     w._innermost_loop_by_node = {}
     w._walk_drivers = {}  # no producer-driven walk transitions here
     w._stop_token_signal = {}  # no declared stop policies: check_stop decides
+    w._withholding = WITHHOLDING
     w._graph_runtime = _RecordingRuntime()
     w.scheduler = SimpleNamespace(failed_rids=set())
     w.tensor_manager = SharedMemoryCommunicationManager(
@@ -225,20 +169,18 @@ def test_the_worker_routes_no_tensor_for_a_withheld_output(tmp_path):
 
     Worker._postprocess_batch(w, pending, BatchedModelOutput(per_rid_outputs=_outputs()))
 
-    assert w._graph_runtime.stops == [{DROP: [LOOP]}]
+    assert w._graph_runtime.stops == ([{DROP: [LOOP]}] if stop else [])
     (route,) = w._graph_runtime.routes
     assert list(route.wg_ids.keys) == [KEEP, DROP]
-    # (KEEP: token, frame), (DROP: token, frame): the stop step's frame carries nothing
+    # (KEEP: token, frame), (DROP: token, frame): the stop-token step's frame carries nothing
     assert route.num_tensors == [1, 1, 1, 0]
     assert len(route.tensors) == 3
 
 
-def _cut(width, kept=None, withheld=frozenset(), emitted=None, columns=("frame",)):
+def _cut(width, tokens, kept=None, emitted=None, columns=("frame",)):
     """``Worker._cut_run_items`` over two rows whose "frame" holds a column
-    per replay: KEEP's values 0.., DROP's 10.."""
-    from mstar.graph.runtime.base import PostprocessNeed, PostprocessStep
-    from mstar.utils.containers import ParallelList
-
+    per replay (KEEP's values 0.., DROP's 10..) beside each replay's
+    ``tokens``; the frames a row routes."""
     def column(base):
         if emitted is not None:  # two items a replay along dim 1, as many as it emitted real
             return torch.arange(base, base + width * 2, dtype=torch.float32).reshape(1, width, 2)
@@ -246,15 +188,19 @@ def _cut(width, kept=None, withheld=frozenset(), emitted=None, columns=("frame",
         return values if width > 1 else values[:, 0]
 
     w = Worker.__new__(Worker)
-    w._withheld_signals = {(NODE, WALK): frozenset({"frame"})}
+    w._withholding = WITHHOLDING
     outputs = BatchedModelOutput(per_rid_outputs={KEEP: {"frame": [column(0)]}, DROP: {"frame": [column(10)]}})
-    host_rows = None if emitted is None else HostRows((KEEP, DROP), {"emitted_count": torch.tensor(emitted)})
-    pending = SimpleNamespace(node_name=NODE, graph_walk=WALK, batch=SimpleNamespace(repeats=width))
-    step = PostprocessStep(
-        PostprocessNeed.STORE, ParallelList([KEEP, DROP], [0, 0]), kept=kept or {}, withheld=withheld,
+    buffers = {"token": torch.tensor(tokens)}
+    if emitted is not None:
+        buffers["emitted_count"] = torch.tensor(emitted)
+    pending = SimpleNamespace(
+        node_name=NODE, graph_walk=WALK,
+        batch=ScheduledBatch(node_name=NODE, graph_walk=WALK, request_to_worker_graph={KEEP: 0, DROP: 0}),
     )
+    pending.batch.repeats = width
+    step = PostprocessStep(PostprocessNeed.STORE, ParallelList([KEEP, DROP], [0, 0]), kept=kept or {})
     engine = SimpleNamespace(run_columns=lambda node, walk: frozenset(columns))
-    Worker._cut_run_items(w, pending, outputs, step, host_rows, engine)
+    Worker._cut_run_items(w, pending, outputs, step, HostRows((KEEP, DROP), buffers), None, engine)
     return {
         rid: [t.reshape(-1)[0].item() for t in outs.get("frame", [])]
         for rid, outs in outputs.per_rid_outputs.items()
@@ -264,14 +210,15 @@ def _cut(width, kept=None, withheld=frozenset(), emitted=None, columns=("frame",
 def test_a_run_routes_each_row_its_kept_iterations_less_the_withheld_eos_column():
     """A row that stopped on an EOS at iteration 1 routes iteration 0 alone:
     the run past its stop goes nowhere, and the EOS column's frame is withheld."""
-    assert _cut(3, kept={DROP: 2}, withheld={(DROP, 1)}) == {KEEP: [0, 1, 2], DROP: [10]}
+    eos_at_1 = [[1, 2, 3], [4, STOP_TOKEN, 5]]
+    assert _cut(3, eos_at_1, kept={DROP: 2}) == {KEEP: [0, 1, 2], DROP: [10]}
     # a stop by the loop's cap withholds nothing: its last frame is data
-    assert _cut(3, kept={DROP: 2}) == {KEEP: [0, 1, 2], DROP: [10, 11]}
-    # one iteration: the withheld row routes no frame
-    assert _cut(1, withheld={(DROP, 0)}) == {KEEP: [0], DROP: []}
+    assert _cut(3, [[1, 2, 3], [4, 5, 6]], kept={DROP: 2}) == {KEEP: [0, 1, 2], DROP: [10, 11]}
+    # one iteration: the stop-token row routes no frame
+    assert _cut(1, [[1], [STOP_TOKEN]]) == {KEEP: [0], DROP: []}
 
 
 def test_a_replay_that_emits_two_items_routes_both():
     """``EMITTED_COUNT`` says how many of a replay's items along dim 1 are
     real: KEEP emits 2 then 1, DROP 1 then 2."""
-    assert _cut(2, emitted=[[2, 1], [1, 2]]) == {KEEP: [0, 1, 2], DROP: [10, 12, 13]}
+    assert _cut(2, [[1, 2], [3, 4]], emitted=[[2, 1], [1, 2]]) == {KEEP: [0, 1, 2], DROP: [10, 12, 13]}

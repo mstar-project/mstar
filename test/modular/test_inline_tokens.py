@@ -255,10 +255,10 @@ class _Scheduled:
 class _Batch:
     node_name = "LLM"
 
-    def __init__(self, walks=None, label="decode", withheld=None):
+    def __init__(self, walks=None, label="decode"):
         self.graph_walk = label
         self.batch = _Scheduled(walks or {})
-        self.node_batch = SimpleNamespace(withheld_outputs=withheld or {})
+        self.node_batch = SimpleNamespace()
 
 
 def _worker(runtime=_Runtime()):
@@ -331,11 +331,17 @@ def test_row_logprobs_follow_the_batch_order():
     assert Worker._row_logprobs(HostRows((7,), {SAMPLED_LOGPROB: torch.tensor([nan])}), [7]) == []
 
 
-def _inline_step(withheld=None):
+def _inline_step(withholds=False):
     """A one-row device-loopback decode step whose token rides inline, as
     `_get_postprocess_request` sees it."""
+    from mstar.model.submodule_base import StopKind, StopPolicy
+
     w = _worker()
     w._stop_token_signal, w._device_loopback, w._innermost_loop_by_node = {}, {}, {}
+    if withholds:
+        w._withholding = {("LLM", "decode"): StopPolicy(
+            StopKind.EOS, token_signal="new_token", eos_tokens=(70,), withhold=("text_inputs",),
+        )}
     w.enable_prof = False
     engine = SimpleNamespace(
         device_loopback_signals=lambda node, walk: ("text_inputs",),
@@ -346,7 +352,7 @@ def _inline_step(withheld=None):
     batch.batch.output_signals = ["text_inputs"]
     batch.batch.request_to_worker_graph = {7: 0}
     batch.node_batch = SimpleNamespace(
-        final_stream_rids=(), partition_done_rids=(), withheld_outputs=withheld or {},
+        final_stream_rids=(), partition_done_rids=(),
     )
     batch.batch.rids_by_walk = lambda: {"decode": [7]}
     return w, engine, batch
@@ -364,8 +370,8 @@ def test_a_step_with_logprobs_routes_through_the_store():
 
 
 def test_a_withheld_output_routes_through_the_store():
-    """An inline route carries every row's outputs, so a step whose stop check
-    withheld one stores, and the store leaves the withheld output out."""
+    """An inline route carries every row's outputs, so a step of a walk whose
+    stop withholds outputs stores, and the store leaves the withheld output out."""
     rows = HostRows((7,), {"new_token": torch.tensor([70])})
-    w, engine, batch = _inline_step(withheld={7: ("text_inputs",)})
+    w, engine, batch = _inline_step(withholds=True)
     assert w._get_postprocess_request(batch, rows, engine, False, None, None).inline is None

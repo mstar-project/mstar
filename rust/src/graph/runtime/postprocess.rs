@@ -113,14 +113,12 @@ pub(super) struct Stored {
 }
 
 /// `check_stops`' result: a stop per (rid, rule index), the iterations each
-/// stop kept, the rids with no limits for this walk yet, and each (rid,
-/// iteration) whose item of the withheld signals is dropped.
+/// stop kept, and the rids with no limits for this walk yet.
 pub(super) struct Stops {
     pub rids: Vec<u32>,
     pub rules: Vec<u32>,
     pub kept: Vec<u32>,
     pub missing: Vec<u32>,
-    pub withheld: Vec<(u32, u32)>,
 }
 
 /// A step's postprocess (`PostprocessRequest`), and how far it got.
@@ -146,8 +144,6 @@ pub(super) struct Postprocess {
     /// rid -> the iterations of a repeated step that count, for a row that
     /// stopped inside it: what the device ran past that is dropped
     kept: FxHashMap<u32, u32>,
-    /// (rid, iteration) items of the withheld signals the stop check dropped
-    withheld: Vec<(u32, u32)>,
     /// The iterations the step ran (`PostprocessRequest.token_width`)
     width: usize,
     phase: Phase,
@@ -169,7 +165,7 @@ impl Postprocess {
         Postprocess {
             partition, node_name, graph_walk, output_signals, rids, walks, rid_walk_idx,
             known_stops, runtime_stops, tokens, row_rids, inline, partition_done, python_send,
-            loop_strides, kept: FxHashMap::default(), withheld: Vec::new(), width,
+            loop_strides, kept: FxHashMap::default(), width,
             phase: Phase::Stops, stops: None, stopped: Vec::new(), stored: None, completion_id: 0,
         }
     }
@@ -250,7 +246,6 @@ impl Postprocess {
         };
         if need == NEED_STORE {
             (out.kept_rids, out.kept) = self.kept.iter().map(|(&r, &k)| (r, k)).unzip();
-            (out.withheld_rids, out.withheld_iters) = self.withheld.iter().copied().unzip();
         }
         out
     }
@@ -290,9 +285,6 @@ pub struct PostprocessOut {
     /// iterations each kept (a row not here keeps them all)
     #[pyo3(get)] pub kept_rids: Vec<u32>,
     #[pyo3(get)] pub kept: Vec<u32>,
-    /// STORE: each (rid, iteration) whose item of the withheld signals is dropped
-    #[pyo3(get)] pub withheld_rids: Vec<u32>,
-    #[pyo3(get)] pub withheld_iters: Vec<u32>,
     /// Wall time this crossing ran with the GIL released (an inline route
     /// and send).
     #[pyo3(get)] pub nogil_ns: u64,
@@ -326,9 +318,7 @@ impl GraphRuntime {
         let Some(rules) = self.stop_rules.get(&(node, walk)) else {
             return Err(PyKeyError::new_err("check_stops: no rules for this (node, walk)"));
         };
-        let mut out = Stops {
-            rids: Vec::new(), rules: Vec::new(), kept: Vec::new(), missing: Vec::new(), withheld: Vec::new(),
-        };
+        let mut out = Stops { rids: Vec::new(), rules: Vec::new(), kept: Vec::new(), missing: Vec::new() };
         if rules.is_empty() {
             return Ok(out);
         }
@@ -366,9 +356,6 @@ impl GraphRuntime {
             let width = tokens.map_or(1, |t| t.width) as u32;
             'iters: for at in 0..width {
                 let token = tokens.map_or(0, |t| t.read_at(row, at as usize));
-                if rules.iter().any(|r| r.ar && r.withhold && r.eos.contains(&token)) {
-                    out.withheld.push((rid, at));
-                }
                 let mut stopped = false;
                 for (k, (rule, &(max_iters, ignore_eos))) in rules.iter().zip(limits).enumerate() {
                     let count = p.map_or(0, |p| self.loop_count(rid, p, rule.lp));
@@ -512,7 +499,6 @@ impl GraphRuntime {
                     if found.missing.is_empty() {
                         let loops = self.stop_rule_loops(&pp.node_name, &pp.graph_walk);
                         pp.kept = found.rids.iter().copied().zip(found.kept.iter().copied()).collect();
-                        pp.withheld = found.withheld;
                         let found: Vec<(u32, Vec<String>)> = found.rids.iter().zip(&found.rules)
                             .map(|(&r, &k)| (r, vec![loops[k as usize].clone()]))
                             .collect();
@@ -541,8 +527,7 @@ impl GraphRuntime {
             return Ok(pp.done(completed));
         }
         let values = pp.inline.as_ref().and_then(|(_, col)| col.values_for(&pp.rids, &pp.row_rids));
-        // a withheld item has to be left out of the store
-        let Some(values) = values.filter(|_| pp.withheld.is_empty()) else {
+        let Some(values) = values else {
             return Ok(self.pp_park(pp, NEED_STORE));
         };
         let tails = pp.inline.as_ref()

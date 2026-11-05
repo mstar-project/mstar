@@ -67,6 +67,7 @@ from mstar.model.submodule_base import (
     END_PARTITION,
     BatchedModelOutput,
     HostRows,
+    StopPolicy,
     chunk_loop_name,
 )
 from mstar.profile.worker import WorkerProfileInfo
@@ -469,8 +470,8 @@ class Worker:
     # Set at load; None, every step runs once, so a worker built without it --
     # any test fake -- never repeats.
     _step_repeats: StepRepeats | None = None
-    # (node, walk) -> the signals its stop policies withhold; set at load
-    _withheld_signals: Mapping[tuple[str, str], frozenset[str]] = MappingProxyType({})
+    # (node, walk) -> its stop policy that withholds outputs; set at load
+    _withholding: Mapping[tuple[str, str], StopPolicy] = MappingProxyType({})
 
     # Metrics are off unless __init__ gets a status interval; class-level so a
     # worker built without __init__ reads them as off too.
@@ -3911,17 +3912,16 @@ class Worker:
                 _t_rt = _time.perf_counter() if self._phase_period else 0.0
                 step = rt.resume_postprocess(stops=model_stops.stops, dropped=model_stops.dropped)
             elif step.need is PostprocessNeed.STORE:
-                # What the stop check withheld (``StopCheck.withheld``), and an
-                # output cut to an empty span, is not stored, so not routed: a
-                # streaming edge then carries no item for the row, and the
-                # producer's item count leaves it out as well.
-                for withheld in (batch_N.node_batch.withheld_outputs, empty_spans):
-                    for rid, names in withheld.items():
-                        rid_outputs = outputs.get(rid)
-                        if rid_outputs:
-                            for name in names:
-                                rid_outputs.pop(name, None)
-                self._cut_run_items(batch_N, outputs, step, host_rows, engine)
+                # An output cut to an empty span, or withheld (``_cut_run_items``),
+                # is not stored, so not routed: a streaming edge then carries
+                # no item for the row, and the producer's item count leaves it
+                # out as well.
+                for rid, names in empty_spans.items():
+                    rid_outputs = outputs.get(rid)
+                    if rid_outputs:
+                        for name in names:
+                            rid_outputs.pop(name, None)
+                self._cut_run_items(batch_N, outputs, step, host_rows, cpu_outputs, engine)
                 stored, route_tensors = self._store_outputs(
                     batch_N, outputs, request, step, cpu_outputs, host_rows, engine,
                 )
@@ -4031,7 +4031,7 @@ class Worker:
             host_rows is not None and rid_walk_idx is None
             and SAMPLED_LOGPROB not in host_rows.buffers
             # an inline route carries every output, a withheld one too
-            and not batch_N.node_batch.withheld_outputs
+            and not any((batch_N.node_name, walk) in self._withholding for walk in walks)
             and self._all_on_device(engine, batch_N.node_name, batch_N.graph_walk, signals)
         ):
             client = engine.inline_client_signals(batch_N.node_name, batch_N.graph_walk)
@@ -4107,7 +4107,7 @@ class Worker:
         keeps ``check_stop``."""
         # (node, walk) -> the token signal its policies read, or None
         self._stop_token_signal: dict[tuple[str, str], str | None] = {}
-        self._withheld_signals = {}
+        self._withholding = {}
         for node, walk in sorted(walks):
             policies = self.engine_manager.get_engine(node).get_stop_policies(node, walk)
             if policies is None:
@@ -4121,9 +4121,11 @@ class Worker:
                 continue
             self._graph_runtime.set_stop_policies(node, walk, policies)
             self._stop_token_signal[(node, walk)] = next(iter(signals), None)
-            withheld = frozenset(name for p in policies.values() for name in p.withhold)
-            if withheld:
-                self._withheld_signals[(node, walk)] = withheld
+            withholding = [p for p in policies.values() if p.withhold]
+            if len(withholding) > 1:
+                raise ValueError(f"{node}/{walk}: one stop policy at most may withhold outputs")
+            if withholding:
+                self._withholding[(node, walk)] = withholding[0]
 
     def _buffer_publish(self, batch_N: PendingBatch) -> set[int]:
         """Buffer this step's publication for the conductor; the rids that
@@ -4136,19 +4138,55 @@ class Worker:
                 buffered.add(rid)
         return buffered
 
+    def _withheld_items(
+        self, batch_N: PendingBatch, host_rows: "HostRows | None", cpu_outputs,
+    ) -> tuple[frozenset[str], frozenset[tuple[int, int]]]:
+        """The signals the step's withholding stop policy names
+        (``StopPolicy.withhold``), and each (rid, iteration) whose token is
+        one of its stop ids, ``ignore_eos`` or not: those items aren't data.
+        Read off the stop check's host copy, whichever check decided the
+        stops."""
+        node, out = batch_N.node_name, set()
+        signals: set[str] = set()
+        for walk, walk_rids in batch_N.batch.rids_by_walk().items():
+            policy = self._withholding.get((node, walk))
+            if policy is None:
+                continue
+            signals.update(policy.withhold)
+            rids = set(walk_rids)
+            buf = None if host_rows is None else host_rows.buffers.get(policy.token_signal)
+            if torch.is_tensor(buf) and buf.dim():
+                eos = torch.tensor(sorted(policy.eos_tokens), dtype=buf.dtype)
+                hits = torch.isin(buf.reshape(buf.shape[0], -1), eos).nonzero().tolist()
+                out.update(
+                    (host_rows.request_ids[row], i) for row, i in hits
+                    if row < len(host_rows.request_ids) and host_rows.request_ids[row] in rids
+                )
+                continue
+            # a step with no stop buffers: each row's own host copy
+            for rid in rids:
+                token = cpu_outputs.get(rid, {}).get(policy.token_signal) if cpu_outputs is not None else None
+                if token and token[0].reshape(-1)[0].item() in policy.eos_tokens:
+                    out.add((rid, 0))
+        return frozenset(signals), frozenset(out)
+
     def _cut_run_items(
         self, batch_N: PendingBatch, outputs: BatchedModelOutput, step: PostprocessStep,
-        host_rows: "HostRows | None", engine,
+        host_rows: "HostRows | None", cpu_outputs, engine,
     ) -> None:
         """Each row's per-iteration outputs as the items it routes: a step that
         repeated holds a column per replay of each (``Engine.keep_run_columns``),
         of which a row routes the iterations its stop kept (``step.kept``);
-        an iteration the stop check withheld (``StopPolicy.withhold``) routes
-        none of the withheld signals; and a replay that emitted a count
+        an iteration whose token is a stop id routes none of the withheld
+        signals (``_withheld_items``); and a replay that emitted a count
         (``EMITTED_COUNT``) routes that many of each, along dim 1."""
         key = (batch_N.node_name, batch_N.graph_walk)
         width = batch_N.batch.repeats
-        withhold = self._withheld_signals.get(key, ()) if step.withheld else ()
+        withhold, withheld = (
+            self._withheld_items(batch_N, host_rows, cpu_outputs) if self._withholding else ((), frozenset())
+        )
+        if not withheld:
+            withhold = ()
         emitted = None if host_rows is None else host_rows.buffers.get(EMITTED_COUNT)
         if width == 1 and not withhold and emitted is None:
             return
@@ -4167,7 +4205,7 @@ class Worker:
                 (column,) = rid_outputs[name]
                 items = []
                 for i in range(kept):
-                    if name in withhold and (rid, i) in step.withheld:
+                    if name in withhold and (rid, i) in withheld:
                         continue
                     replay = column[:, i] if width > 1 else column
                     if counts is None:
