@@ -18,26 +18,29 @@ model_kwargs:
   # [norms] for reference-faithful output.
   compile_exact_ops: false
   accelerator_graph: true
-  capture_sizes: [[1024, 1024]]
+  # [height, width]: 1024^2 and 1344x768, the two sizes of the image benchmark set; an uncaptured size compiles per
+  # batch size inside its first requests and decodes on the eager VAE.
+  capture_sizes: [[1024, 1024], [768, 1344]]
   # Captions pad to multiples of 32 up to max_seq_len, so cap_len has 16 possible
   # values -- and it is an INPUT, not a shape: the DiT substitutes a learned
   # cap_pad_token at every padded position and attends over it, so a prompt cannot
   # be padded up into a wider bucket without changing the image. A cap_len with no
   # captured graph falls back to the eager batched path.
   #
-  # The capture budget is len(capture_caption_lengths) x len(capture_batch_sizes) graphs,
-  # 16 here. A step of 3 or 5-7 rows replays the next captured size with dummy rows.
-  # Capturing every batch size up to max_batch_size (the commented line) skips that padding,
-  # which pays under concurrency (requests at different steps, one or two outside the dit).
-  # H200, 1024^2, 8 steps, 2 rounds (before the fused q/k norm + rotary):
+  # The capture budget per size is len(capture_caption_lengths) x len(capture_batch_sizes) graphs.
+  # A step of 3 or 5-7 rows would replay the next captured size with dummy rows; at 16 concurrent
+  # requests steps average 5.7 rows, so with only 1/2/4/8 captured about 30% of a step's rows would
+  # be dummies. Capturing every batch size pays under concurrency (requests at different steps, one
+  # or two outside the dit). H200, 1024^2, 8 steps, 2 rounds (before the fused q/k norm + rotary):
   # c=4 1.05-1.08 -> 1.22 images/s, c=8 1.12-1.14 -> 1.21-1.22,
   # c=16 1.17-1.19 -> 1.23, c=1 unchanged, same peak VRAM. But each graph is a compile of its own:
-  # 32 graphs start ~100 s slower than 16 on a warm Inductor cache, ~8 min slower on a cold one.
+  # 32 graphs start ~100 s slower than 16 on a warm Inductor cache, ~8 min slower on a cold one,
+  # and the 64 graphs of the two sizes cost 5.3 GiB of VRAM and take a warm start from about 96 s to about 220 s on MI325X.
   # The text encoder captures its own geometric_batch_sizes: powers of two below max_batch_size,
   # then max_batch_size (4 graphs here, any caption length).
   capture_caption_lengths: [32, 64, 96, 128]
-  capture_batch_sizes: [1, 2, 4, 8]
-  # capture_batch_sizes: [1, 2, 3, 4, 5, 6, 7, 8]  # for deployments that batch 3, 5, 6 or 7
+  # every batch size up to max_batch_size; [1, 2, 4, 8] halves the graphs for deployments that start cold often
+  capture_batch_sizes: [1, 2, 3, 4, 5, 6, 7, 8]
   max_batch_size: 8
   # compiled VAE decode (max-autotune), not bit-exact with the eager decode: before the folded upsample and split
   # GroupNorm it was 3x faster at 1024^2 and ~56 dB from eager, and the autotuner may pick other conv kernels in another
