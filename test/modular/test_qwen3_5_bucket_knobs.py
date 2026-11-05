@@ -94,10 +94,11 @@ def _shipped_prefill_ladders():
 def test_every_shipped_prefill_ladder_is_a_model_argument(config):
     """A config's ladder is a named argument of its model, not lost in ``**kwargs``;
     Qwen3-Omni's Thinker captures its prefill on it."""
+    from mstar.model.glm52.glm52_model import Glm52Model
     from mstar.model.qwen3_5.qwen3_5_model import Qwen3_5DenseModel
     from mstar.model.qwen3_omni.qwen3_omni_model import Qwen3OmniModel
     cls, buckets = _configs_with_prefill_ladders()[config]
-    assert cls in (Qwen3_5DenseModel, Qwen3OmniModel), (
+    assert cls in (Qwen3_5DenseModel, Qwen3OmniModel, Glm52Model), (
         f"a {cls.__name__} config sets prefill_token_buckets, which no test checks")
     assert "prefill_token_buckets" in inspect.signature(cls.__init__).parameters, (
         f"prefill_token_buckets isn't a named argument of {cls.__name__}.__init__")
@@ -106,6 +107,10 @@ def test_every_shipped_prefill_ladder_is_a_model_argument(config):
         node = ThinkerSubmodule(None, SimpleNamespace(im_end_token_id=1), prefill_token_buckets=buckets)
         configs = {c.capture_graph_walk: c for c in node.get_accelerator_graph_configs(torch.device("cpu"))}
         assert configs["prefill_text"].capture_token_lengths == sorted(buckets)
+    if cls is Glm52Model:
+        # the submodule's prefill captures take it (test_glm52_prefill checks the configs)
+        assert Glm52Model("", tokenizer_mode="byte", config_variant="reduced",
+                          prefill_token_buckets=buckets).config.prefill_token_buckets == buckets
 
 
 @pytest.mark.parametrize("buckets", _shipped_prefill_ladders().values(), ids=_shipped_prefill_ladders().keys())
