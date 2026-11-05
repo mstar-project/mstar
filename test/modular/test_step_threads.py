@@ -103,6 +103,13 @@ def _intel_host(tmp_path_factory, monkeypatch):
     monkeypatch.setattr(cpus, "_CPUINFO", _cpuinfo(tmp_path_factory.mktemp("proc"), INTEL))
 
 
+@pytest.fixture(autouse=True)
+def _no_core_set(monkeypatch):
+    """``deployment_cpu_plan`` leaves the core set it locked in the environment for its workers: each test here
+    starts with none, and a set one test locks never reaches the next."""
+    monkeypatch.setenv(cpus.CORE_SET_ENV, "")
+
+
 def one_cpu_cluster(cpu: int) -> frozenset[int]:
     """An L2 per core, as on a P-core Xeon."""
     return frozenset({cpu})
@@ -1213,7 +1220,6 @@ def test_the_api_server_takes_the_next_free_set_and_its_workers_follow(core_serv
     monkeypatch.setattr(cpus, "smt_siblings", smt)
     monkeypatch.setattr(entrypoint, "accelerator_type", lambda: "cuda")
     monkeypatch.setenv("MSTAR_STEP_THREAD_CORE", "always")
-    monkeypatch.delenv(cpus.CORE_SET_ENV, raising=False)
     config = {"node_groups": [{"node_names": ["llm"], "ranks": [0]}]}
     other, _ = core_server(ON_NODE[0])
     api = entrypoint.deployment_cpu_plan(config)
