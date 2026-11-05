@@ -7,6 +7,7 @@ import itertools
 import logging
 from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass, field
+from typing import NamedTuple
 
 from mstar.engine.resources.base import PublishedInfo, Resource
 from mstar.engine.resources.step import FULL_ADMIT_QUEUED, FullAdmitOutcome
@@ -22,6 +23,13 @@ class _Waiting:
     asked: dict[str, tuple[str, str]] = field(default_factory=dict)
     nodes: dict[str, str] = field(default_factory=dict)
     published: dict[str, Mapping[str, PublishedInfo] | None] = field(default_factory=dict)
+
+
+class Refusal(NamedTuple):
+    """A waiting request that didn't fit, the resource that refused it, and the mark that resource returned."""
+    rid: str
+    key: str
+    mark: object
 
 
 class Admission:
@@ -124,6 +132,12 @@ class Admission:
         self.admit(rid, node_name, walk, None, keys)
         if rid not in self._waiting:
             self._returns.pop(rid, None)
+
+    def oldest_refusal(self) -> Refusal | None:
+        """The oldest waiting request that has been tried and didn't fit, or None."""
+        refused = [Refusal(rid, *held) for rid, held in self._returns.items() if held is not None]
+        refused += [Refusal(self._queues[key][0], key, mark) for key, mark in self._short.items()]
+        return min(refused, key=lambda refusal: self._arrival[refusal.rid], default=None)
 
     def admit_waiting(
         self, published_of: Callable[[str, str], Mapping[str, PublishedInfo] | None],

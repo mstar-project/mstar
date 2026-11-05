@@ -20,13 +20,16 @@ import torch
 from test_kv_admission import _remove, _runner
 from test_kv_preemption import (  # noqa: F401
     PAGE_SIZE,
+    _admitted,
     _ctx,
     _offload,
     _pool,
+    _preempt,
     _ready,
     _request,
     _returns,
     _running,
+    _short,
     _step,
     _stub_transfer,
 )
@@ -79,6 +82,8 @@ def _worker(kv):
         offload_request=lambda node, rid: _offload(kv, rid),
         readmit_request=lambda node, rid: _runner(kv).readmit(rid, node),
         newer_than=lambda rid: _runner(kv).newer_than(rid),
+        oldest_refusal=lambda: _runner(kv).oldest_refusal(),
+        paged_kv_caches=lambda: [PagedKVCache("kv", frozenset({NODE}), kv)],
         admit_request=lambda node, rid, info: _runner(kv).admit_request(rid, node, info.graph_walk),
         admit_waiting=lambda published_of: _runner(kv).admit_waiting(published_of),
     )
@@ -100,8 +105,7 @@ def _worker(kv):
             graph_walk="decode", dynamic_loop_iter_counts={"decode": 0}, resource_publish_info=None,
         ),
     )
-    caches = SimpleNamespace(paged_kv_caches=lambda: [PagedKVCache("kv", frozenset({NODE}), kv)])
-    w.engine_manager = SimpleNamespace(get_engine=lambda node: engine, engine=caches)
+    w.engine_manager = SimpleNamespace(get_engine=lambda node: engine, engine=engine)
     _preemption(w)
     w._graph_runtime = SimpleNamespace(push_back_node=lambda node, rids, wgs: None)
     w._apply_removes_whose_step_landed = lambda: None
@@ -272,6 +276,25 @@ def test_a_victim_whose_rebuild_wouldnt_write_what_its_kv_holds_isnt_chosen(why)
 
     assert kv.residency("v") is Residency.RESIDENT, "v was chosen though its rebuild doesn't write what its KV holds"
     assert kv.residency("r") is Residency.RESIDENT and _returns(kv) == ["r"], "r didn't wait for room beside v"
+
+
+def test_an_older_request_that_asks_after_a_newer_one_parks_moves_it():
+    """z ran short with nothing newer to move and waits holding its pages. p, older, asks only afterwards, as a
+    request held in an encoder does, and doesn't fit. z runs no step that could run short again, so nothing moved
+    it and both waited for good."""
+    kv = _pool()
+    kv._cpu_pool = host._HostPool(16)
+    _running(kv, "o", 4, arrival=0)
+    _running(kv, "z", 6, arrival=2)
+    assert _preempt(kv, "z", _short(kv, "z"), droppable=lambda rid: False).waits
+    _runner(kv).readmit("z", NODE)
+    _request(kv, "p", 5, arrival=1)
+    assert not _ready(kv, "p") and not _admitted(kv, "z")
+    w = _worker(kv)
+
+    w._preemption.make_room()
+
+    assert kv.is_offloaded("z") and _ready(kv, "p"), "z, newer and waiting, kept the pages p needs"
 
 
 def test_a_dropped_request_that_waits_for_room_is_unparked_and_rebuilt():
