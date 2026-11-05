@@ -56,10 +56,10 @@ class Preemption:
 
     def preempt(self, node_batch: ExecutingBatch) -> bool:
         """`KVManager.preempt` chooses victims for the request that hit KV OOM. Move each victim to the host or
-        drop it, or queue the request for its shortage when no move covers it, and return True. Return False, so
-        the offload and the hold run, when the failed resource isn't a paged KV cache, when the node rebuilds no
-        request here and the cache has no host pool or isn't the node's only one, or when `KVManager.preempt`
-        returns None."""
+        drop it, or, when no move covers the shortage, move the request itself to the host or queue it for its
+        shortage, and return True. Return False, so the offload and the hold run, when the failed resource isn't a
+        paged KV cache, when the node rebuilds no request here and the cache has no host pool or isn't the node's
+        only one, or when `KVManager.preempt` returns None."""
         kv = self._caches.get(node_batch.failed_resource)
         node_name = node_batch.node_name
         if kv is None or not self._moves(kv, node_name):

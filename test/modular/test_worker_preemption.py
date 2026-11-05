@@ -279,17 +279,20 @@ def test_a_victim_whose_rebuild_wouldnt_write_what_its_kv_holds_isnt_chosen(why)
 
 
 def test_an_older_request_that_asks_after_a_newer_one_parks_moves_it():
-    """z ran short with nothing newer to move and waits holding its pages. p, older, asks only afterwards, as a
-    request held in an encoder does, and doesn't fit. z runs no step that could run short again, so nothing moved
-    it and both waited for good."""
+    """z ran short with nothing newer to move and, the host too full to take it, waits holding its pages. p, older,
+    asks only afterwards, as a request held in an encoder does, and doesn't fit. z runs no step that could run short
+    again, so nothing moved it and both waited for good."""
     kv = _pool()
-    kv._cpu_pool = host._HostPool(16)
-    _running(kv, "o", 4, arrival=0)
-    _running(kv, "z", 6, arrival=2)
+    kv._cpu_pool = host._HostPool(8)
+    _running(kv, "x", 3, arrival=0)
+    assert kv.offload("x") == 3
+    _running(kv, "o", 4, arrival=1)
+    _running(kv, "z", 6, arrival=3)
     assert _preempt(kv, "z", _short(kv, "z"), droppable=lambda rid: False).waits
     _runner(kv).readmit("z", NODE)
-    _request(kv, "p", 5, arrival=1)
+    _request(kv, "p", 5, arrival=2)
     assert not _ready(kv, "p") and not _admitted(kv, "z")
+    _remove(kv, "x")
     w = _worker(kv)
 
     w._preemption.make_room()

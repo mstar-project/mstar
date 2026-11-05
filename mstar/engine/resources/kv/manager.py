@@ -347,8 +347,9 @@ class KVPageCounts(NamedTuple):
 class Allotment:
     """Pages an admitted request may take from free and evictable pages: its prompt, less the
     cache hits another request holds, and less what a window doesn't hold once its prompt is
-    written. ``remaining`` is its share of `KVManager._unused`, and ``prompt`` is the request's
-    prompt in pages, which `unreserve` puts back in `_asks`. An allotment for a request on the host
+    written. ``remaining`` is its share of `KVManager._unused`, and ``prompt`` is the least the request
+    asks for once it gives the allotment back, which `unreserve` puts back in `_asks`: its prompt in pages,
+    or what its grant needed once it has waited for a shortage. An allotment for a request on the host
     covers its reload, and ``returning`` is set while the request returns from the host: the pages it
     may take beyond its reload."""
     pages: int
@@ -366,8 +367,9 @@ class Dropped(NamedTuple):
 
 class Victims(NamedTuple):
     """The requests `KVManager.preempt` chose to move off the device: to the host, dropped, or, holding no page of
-    their own, already given back their allotment to ask again. When no move covers the shortage,
-    ``waits`` is the pages the request that ran short asks the pool for instead, and 0 otherwise."""
+    their own, already given back their allotment to ask again. When no move covers the shortage, ``to_host``
+    holds the request that ran short if the host takes it whole, and otherwise ``waits`` is the pages it asks
+    the pool for instead. ``waits`` is 0 otherwise."""
     to_host: list[str]
     to_drop: list[str]
     to_ask: list[str]
@@ -4717,8 +4719,10 @@ class KVManager(AttentionResource):
         its grant counted goes into its allotment with them, so its next grant can't fail. A victim the host can
         take whole moves there, and any other is dropped, once ``droppable`` says its launched steps allow it.
 
-        Returns the victims, or none once the room covers its grant. When no move covers the shortage, ``rid`` keeps
-        its allotment and asks for every page its grant needed past it, and waits for them once the runner asks again.
+        Returns the victims, or none once the room covers its grant. When no move covers the shortage, ``rid`` asks for
+        every page its grant needed past its allotment. It moves itself to the host when the host takes it whole, as
+        main's offload-and-hold does, and returns once its history and those pages fit. Otherwise it keeps its
+        allotment and waits for them once the runner asks again.
         None when the pool doesn't decide or ``newer`` is None, as it is for a request the conductor gave no number.
         """
         if not self._decides or newer is None:
@@ -4735,7 +4739,15 @@ class KVManager(AttentionResource):
                 return Victims([], [], [])
             victims = self._choose(pages_short, newer, droppable)
             if victims is None:
+                # Any move of ``rid`` from here on returns it with what its grant needed. Back with a page alone, it
+                # would run short again at once.
+                allotment = self._allotments[rid]
+                allotment.prompt = max(allotment.prompt, max(allotment.pages, self._held(rid)) + short.pages)
                 self._asks[rid] = short.pages
+                pages = self._host_pages(rid)
+                if pages is not None and pages <= self._cpu_pool.room() and self._movable(rid) and self._frees([rid]):
+                    self._hosted.add(rid)
+                    return Victims([rid], [], [])
                 return Victims([], [], [], waits=short.pages)
             self._allot(rid, claim)
             return self._earmark(Earmark(rid, short.pages, set(), claim), victims)
