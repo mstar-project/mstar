@@ -1319,6 +1319,10 @@ class AcceleratorGraphRunner:
             pinned = torch.accelerator.is_available()
             self._yield_word = torch.zeros(1, dtype=torch.int32, pin_memory=pinned)
 
+    def refuse_run(self, walk: str, why: str) -> None:
+        """Before capture: ``walk`` stays off the device, for its line."""
+        self._run_failures[walk] = why
+
     def yield_runs(self) -> None:
         """Ask the node's run in flight to end at its next iteration: other work is ready."""
         if self._yield_word is not None:

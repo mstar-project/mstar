@@ -1177,10 +1177,21 @@ class RecurrentStatePool(Resource):
         addressing.has_state.copy_(saved != 0)
 
     def rewind_run(self, step, ctx, replays: int) -> None:
-        for segment in step.segments or ():
-            slot = self._slots.get(segment.request_id, {}).get(segment.label)
-            if slot is not None and segment.span > 0:
+        with self._lock:
+            for segment in step.segments or ():
+                slot = self._slots.get(segment.request_id, {}).get(segment.label)
+                if slot is None or segment.span <= 0:
+                    continue
                 slot.tokens -= segment.span * replays
+                # a snapshot saved at commit from past where the run ended holds
+                # state of another length than the chain would name it by
+                key = (segment.request_id, segment.label)
+                decode = self._decode.get(key)
+                if decode is not None and key in self._unkeyed and decode.tokens > slot.tokens:
+                    del self._decode[key]
+                    self._drop_decode(key, decode)
+                    if decode.replaces is not None:
+                        self._decode[key] = decode.replaces
 
     def resident_commit(self, step: "CapturedResidentStep") -> None:
         # a row's next iteration, replay or step, resumes what this one wrote

@@ -4304,7 +4304,12 @@ class Worker:
         if replays is None:
             return
         ran = int(replays[0])
-        if ran < batch_N.batch.repeats:
+        width = batch_N.batch.repeats
+        if ran < width:
+            # before the prefix chains read them: nothing past ``ran`` was produced
+            for name, buffer in host_rows.buffers.items():
+                if buffer.dim() > 1 and buffer.shape[1] == width:
+                    host_rows.buffers[name] = buffer[:, :ran]
             engine.end_run_early(batch_N.node_batch, ran)
             batch_N.batch.repeats = ran
 

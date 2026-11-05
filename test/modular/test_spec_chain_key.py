@@ -41,11 +41,24 @@ def _worker(target, other_ready=True, speculation=None, mid_prefill_walks=frozen
     return fake, peeked, excluded
 
 
-def _pending():
+def _pending(repeats=1):
     return SimpleNamespace(
         batch=object(), node_name="LLM", graph_walk="mixed",
-        node_batch=SimpleNamespace(admit_error=None), tp_seq=-1,
+        node_batch=SimpleNamespace(admit_error=None, step_context=SimpleNamespace(repeats=repeats)), tp_seq=-1,
     )
+
+
+def test_ready_work_ends_a_run_in_flight_at_its_next_iteration():
+    """The rule that yields a chain away, on the device: a run needn't reach its count."""
+    target = SpeculationTarget(SimpleNamespace(node_name="LLM", graph_walk="decode"), [0, 1])
+    worker, _, _ = _worker(target)
+    yielded = []
+    worker.engine_manager = SimpleNamespace(get_engine=lambda node: SimpleNamespace(yield_runs=yielded.append))
+
+    worker._build_speculation(_pending(), 1, _SpecFairness(peek=True, max_consecutive=8))
+    assert yielded == []
+    worker._build_speculation(_pending(repeats=4), 1, _SpecFairness(peek=True, max_consecutive=8))
+    assert yielded == ["LLM"]
 
 
 def test_after_a_mixed_step_the_chain_keys_on_its_target_walk():

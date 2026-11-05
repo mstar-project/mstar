@@ -198,9 +198,54 @@ def test_the_worker_settles_a_run_that_ended_short():
     ended = []
     engine = SimpleNamespace(end_run_early=lambda batch, ran: ended.append(ran))
     batch = SimpleNamespace(batch=SimpleNamespace(repeats=4), node_batch=object())
-    rows = SimpleNamespace(buffers={RUN_REPLAYS: torch.tensor([3, 3]), "t": torch.zeros(2, 4)})
+    tokens = torch.tensor([[1, 2, 3, 0], [4, 5, 6, 0]])  # the last column was never written
+    rows = SimpleNamespace(buffers={RUN_REPLAYS: torch.tensor([3, 3]), "t": tokens, "one": torch.zeros(2)})
     worker._settle_run(batch, rows, engine)
     assert ended == [3] and batch.batch.repeats == 3 and RUN_REPLAYS not in rows.buffers
+    # what keys the prefix chain reads next: nothing the run didn't produce
+    assert rows.buffers["t"].tolist() == [[1, 2, 3], [4, 5, 6]]
+    assert rows.buffers["one"].shape == (2,)
+
+
+def test_a_short_run_takes_back_a_decode_snapshot_past_where_it_ended():
+    """Filed once the chain keys its page, a snapshot from past the row's real
+    tokens would serve state at the wrong length; its predecessor stands again."""
+    import threading
+
+    from mstar.engine.resources.recurrent.pool import DecodeSnapshot, RecurrentStatePool
+
+    pool = RecurrentStatePool.__new__(RecurrentStatePool)
+    pool._lock = threading.RLock()
+    held = SimpleNamespace(tokens=12)
+    pool._slots = {1: {"main": held}}
+    earlier = DecodeSnapshot(3, 8)
+    pool._decode = {(1, "main"): DecodeSnapshot(4, 12, replaces=earlier)}
+    pool._unkeyed = {(1, "main")}
+    freed = []
+    pool._drop_decode = lambda key, decode: (pool._unkeyed.discard(key), freed.append(decode.slot))
+    pool.rewind_run(SimpleNamespace(segments=[SimpleNamespace(request_id=1, label="main", span=1)]), None, 2)
+    assert held.tokens == 10 and freed == [4] and pool._decode[(1, "main")] is earlier
+
+
+def test_a_walk_that_drops_rows_refuses_a_prefix_chain():
+    """A dropped row's tokens past its stop hold no KV, which a chain would key."""
+    from mstar.engine.engine import Engine
+
+    asked = []
+    engine = Engine.__new__(Engine)
+    engine._runner = SimpleNamespace(prefix_chain_keys=lambda node: ["kv"])
+    engine._submodules = {"n": SimpleNamespace(
+        joint_comm_group=SimpleNamespace(world_size=1), device_stops={}, refills={}, loopback_rows=None,
+        submodule=SimpleNamespace(repeat_carry=lambda walk, signals: {}, ITERATION_INPUTS={}), run_columns={},
+    )}
+    engine.get_stop_policies = lambda node, walk: {"loop": SimpleNamespace(
+        reads_token=True, token_signal="t", eos_tokens=frozenset({9}),
+    )}
+    runner = SimpleNamespace(
+        ask_run=lambda walk, ask: asked.append(ask), refuse_run=lambda walk, why: asked.append(why),
+    )
+    engine._ask_run("n", runner, WALK, SimpleNamespace(device_stop="drop_rows", max=4, refill_at=None), ())
+    assert len(asked) == 1 and "prefix" in asked[0]
 
 
 def test_a_decode_wrapper_reads_its_lengths_off_the_table():

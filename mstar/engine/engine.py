@@ -1682,6 +1682,10 @@ class Engine:
             return
         mgmt.device_stops[graph_walk] = policy
         mgmt.refills[graph_walk] = config.refill_at
+        if config.device_stop == "drop_rows" and self._runner.prefix_chain_keys(node_name):
+            # its tokens past a stop hold no KV, and the chain keys every token that lands
+            runner.refuse_run(graph_walk, "resource: a dropped row's pages past its stop would key a prefix chain")
+            return
         heads = self._row_pairs(mgmt, graph_walk)[0] if mgmt.loopback_rows is not None else {}
         carries = mgmt.submodule.repeat_carry(graph_walk, signals)
         runner.ask_run(graph_walk, RunAsk(
