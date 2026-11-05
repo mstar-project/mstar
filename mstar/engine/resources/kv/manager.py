@@ -4636,7 +4636,7 @@ class KVManager(AttentionResource):
         if allotment is not None:
             self._unused -= allotment.remaining
             self._asks[rid] = allotment.prompt
-        # a request that holds nothing waits in the queue with no room set aside on the host
+        # a request that holds nothing waits with no room set aside on the host
         if self._cpu_pool is not None and self._unwritten(rid) and not self._on_host(rid):
             self._cpu_pool.unreserve(rid)
 
