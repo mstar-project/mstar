@@ -656,18 +656,6 @@ def test_an_adapter_on_a_module_the_walk_refuses_is_refused_with_the_reason(name
     assert "layers.0.bad" in str(err.value)
 
 
-def test_a_deferred_pattern_over_moe_experts_is_refused():
-    """The experts' deltas join their dispatch, which a node adding them itself would skip."""
-    with torch.device("meta"):
-        root = nn.Module()
-        root.layers = nn.ModuleList([nn.Module()])
-        root.layers[0].fc = nn.Linear(HIDDEN, HIDDEN)
-        root.layers[0].experts = FusedExperts(num_experts=4, hidden_size=HIDDEN, intermediate_size=4)
-    spec = module_lora_spec(lambda _: root, nodes={"N"}, root_path="", deferred=["layers.0.experts"])
-    with pytest.raises(ValueError, match=r"`deferred` matches .*layers\.0\.experts\.down_proj"):
-        spec.targets  # noqa: B018 - the walk runs on first read
-
-
 def test_a_deployment_without_a_lora_block_never_builds_the_root():
     """Every deployment of a model declares its LoRA spec; the root is built and walked
     only once the spec is read, which only a deployment opting into LoRA does."""

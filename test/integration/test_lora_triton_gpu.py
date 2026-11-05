@@ -430,8 +430,8 @@ def test_experts_kernels_match_the_reference(tokens, top_k, stage):
     x_top_k = top_k if gate_up else 1
     y0 = torch.randn(tokens * top_k, sum(slices), generator=g, device="cuda")
     want = y0.clone()
-    ref_ops.TorchLoraBackend().apply_experts_(x, want, a, b, ids, weight, x_top_k, slices)
-    backend = TritonLoraBackend()
+    ref_ops.experts_reference_(x, want, a, b, ids, weight, x_top_k, list(slices))
+    backend = ops.LoraOpsBackend()
     got = y0.to(torch.bfloat16)
     alignment = backend.align_experts(ids, num_ids)
     backend.apply_experts_(x.to(torch.bfloat16), got, a.to(torch.bfloat16), b.to(torch.bfloat16), ids, weight,
