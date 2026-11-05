@@ -456,14 +456,15 @@ class FlashInferPrefillWrapper(PagedKernel):
 
     @torch.compiler.disable
     def run(
-        self, q: torch.Tensor, kv_cache_layer: torch.Tensor, return_lse: bool = False,
+        self, q: torch.Tensor, kv_cache_layer: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+        return_lse: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Run planned batched prefill attention.
 
         Args:
             q: [total_tokens, num_qo_heads, head_dim]
             kv_cache_layer: [max_pages, 2, page_size, num_kv_heads, head_dim]
-                (single layer slice of the full KV cache)
+                (single layer slice of the full KV cache), or its ``(k, v)``
             return_lse: also return each query row's log-sum-exp of its scaled scores
         Returns:
             output: [total_tokens, num_qo_heads, head_dim], and with ``return_lse``
@@ -691,13 +692,14 @@ class FlashInferDecodeWrapper(PagedKernel):
 
     @torch.compiler.disable
     def run(
-        self, q: torch.Tensor, kv_cache_layer: torch.Tensor, return_lse: bool = False,
+        self, q: torch.Tensor, kv_cache_layer: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+        return_lse: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Run planned batched decode attention.
 
         Args:
             q: [n_req, num_qo_heads, head_dim]
-            kv_cache_layer: [max_pages, 2, page_size, num_kv_heads, head_dim]
+            kv_cache_layer: [max_pages, 2, page_size, num_kv_heads, head_dim], or its ``(k, v)``
             return_lse: as for the prefill wrapper's ``run``
         Returns:
             output: [n_req, num_qo_heads, head_dim], and with ``return_lse`` the

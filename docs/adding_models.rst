@@ -2604,13 +2604,14 @@ page. Attention runs on each rank's slots and merges the partials across the par
   contiguous blocks ``kv_head_replicas`` (``mstar/distributed/utils.py``) gives, as
   ``QKVParallelLinear`` loads them; a model that
   shards K and V itself must match. Each layer exchanges queries and partials over the TP group,
-  though an eager step with no stored context attends its own tokens alone, with no exchange.
+  except for a plan label of an eager step that isn't one token a row and has no stored context
+  on any row, which attends its own tokens alone.
 - **SP mode.** The partners are the node's SP ranks, ``P = sp_size``. Heads shard over TP alone.
   Without a ``SeqShardSpec`` every layer but attention runs copied across SP; prefer TP mode
   where it applies. With one whose ``exchange`` is ``all_gather`` or ``ring``, long steps split
   their tokens too (above).
   Every paged pool of the node must set the key. Each layer all-gathers the partials of a
-  copied step; that same eager step attends no slots and gathers its own tokens' shares alone.
+  copied step; under the same exception it attends no slots and gathers its own tokens' shares alone.
   Chunked prefill stays off on SP ranks (``_unchunkable_nodes``), so SP mode prefills a prompt in
   one step; chunking an SP-placed pool's prompts is not supported yet. TP mode chunks prompts as
   without placement.
@@ -2631,8 +2632,9 @@ batch size above 1 is refused at load: a replay's padding rows would sit between
 A step of one token a row attends the pages after its KV write (in TP mode on tensor cores
 whatever ``decode_tensor_cores`` says). Any other step attends its stored context on the pages
 and its own tokens from the ``k`` and ``v`` the layer passes ``run``, so a layer that calls
-``attn.run`` itself passes them (``AttentionCallable`` does). A fused K/V write that leaves ``k`` unrotated asks ``reads_step_kv()`` first and rotates it
-when the step attends it (``AttentionCallable.norm_rope_attend``). In SP mode, rank ``r`` attends only the step's
+``attn.run`` itself passes them (``AttentionCallable`` and ``MLAAttention`` without
+``mla_absorb`` do). A fused K/V write that leaves ``k`` unrotated asks ``reads_step_kv()`` first
+and rotates it when the step attends it (``AttentionCallable.norm_rope_attend``). In SP mode, rank ``r`` attends only the step's
 own tokens in *zigzag* chunks ``r`` and ``2P - 1 - r`` of each row's ``2P`` (``zigzag_rows``),
 which shares the causal work about evenly on rows of ``2P`` tokens or more; it merges them into
 its context partial before the gather.
