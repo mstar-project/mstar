@@ -256,17 +256,20 @@ def expand_slots(pool_first: torch.Tensor, ctx: KPoolContext, c0: int = 0,
 # -- sparse MLA --------------------------------------------------------------------------------
 
 def sparse_attend(q_nope: torch.Tensor, q_pe: torch.Tensor, latent: torch.Tensor,
-                  slots: torch.Tensor, ctx: KPoolContext, sm_scale: float) -> torch.Tensor:
+                  slots: torch.Tensor, ctx: KPoolContext, sm_scale: float,
+                  eager: sparse_mla.EagerSparsePlans | None = None) -> torch.Tensor:
     """Absorbed MLA of each row over its slots: ``[rows, heads, kv_lora_rank]``. ``latent`` is
-    the layer's latent plane ``[pages, page_size, kv_lora_rank + kpe]``."""
+    the layer's latent plane ``[pages, page_size, kv_lora_rank + kpe]``. An eager step plans
+    through ``eager``, the resource's reused plans, when given."""
     if not sparse_mla.uses_kernel(q_nope, latent):
         lens = ctx.attn_lens() if ctx.host_pos is not None else attn_lens(
             ctx.pos.tolist(), ctx.topk, ctx.kpool)
         return sparse_mla.reference(q_nope, q_pe, latent, slots, lens, sm_scale)
     if ctx.sparse_plan is None:  # eager: every layer of the forward shares one plan
-        ctx.sparse_plan = sparse_mla.EagerSparsePlan(
-            ctx.attn_lens(), ctx.width, q_nope.shape[1], q_nope.shape[-1], q_pe.shape[-1],
-            sm_scale, q_nope.device)
+        args = (ctx.attn_lens(), ctx.width, q_nope.shape[1], q_nope.shape[-1], q_pe.shape[-1],
+                sm_scale)
+        ctx.sparse_plan = (eager.plan(*args) if eager is not None
+                           else sparse_mla.EagerSparsePlan(*args, q_nope.device))
     return ctx.sparse_plan.attend(q_nope, q_pe, latent, slots)
 
 
@@ -308,6 +311,8 @@ class KPoolDSA(Resource):
         self._sparse_plans: dict[tuple[str, int, int], sparse_mla.SparseGraphPlan] = {}
         # (walk, capture slot) -> the workspace and index buffer its plans share
         self._sparse_buffers: dict[tuple[str, int], tuple[torch.Tensor, torch.Tensor]] = {}
+        # an eager step's sparse plans, reused (one workspace)
+        self._eager = sparse_mla.EagerSparsePlans(device) if device.type == "cuda" else None
 
     def depends_on(self) -> set[str]:
         return {self.config.kv_cache}
@@ -492,4 +497,4 @@ class KPoolDSA(Resource):
                sm_scale: float, label: str = _MAIN) -> torch.Tensor:
         """Absorbed MLA of each row over its ``slots`` of ``plane``'s latents."""
         return sparse_attend(q_nope, q_pe, self._need_kv().layer_view(plane), slots,
-                             self.current(label), sm_scale)
+                             self.current(label), sm_scale, self._eager)
