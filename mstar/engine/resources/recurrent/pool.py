@@ -1148,6 +1148,8 @@ class RecurrentStatePool(Resource):
     def resident_refusal(self, key: str, streams: Mapping[str, "ResidentStream"]) -> str | None:
         if self.config.disable_sink_slot:
             return "a pool with no sink slot has nowhere for a padding row"
+        if key not in streams:
+            return "its step declares it no stream"
         if streams[key].reads:
             return "a resident step advances its state, not reads it"
         return None

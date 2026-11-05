@@ -571,7 +571,7 @@ class ResidentPlanner:
             refreshed -= taken
             self._last_read[slots] = seq
             rows = [(rid, self._slot_of[rid]) for rid in taken]
-        if taken and (refusal := _row_refusal(self._keys, step, streams, taken)) is not None:
+        if taken and (refusal := _row_refusal(step, streams, taken)) is not None:
             # the tables advance each row on its walk's streams, every replay
             raise SystemExit(f"resident walk {ctx.graph_walk!r} on {self.node}: {refusal}")
         plan = ResidentPlan(
@@ -710,6 +710,8 @@ def step_refusal(keys: Collection[str], step: SubmoduleStep | None) -> str | Non
             return f"resource {key!r} declares {uncarried}, which a resident step can't carry"
     for key in keys:
         segments = _segments(key, step)
+        if not segments:
+            continue  # a resource with no segments has no stream to refuse
         labels = {seg.label for seg in segments}
         spans = {seg.span for seg in segments}
         if len(labels) != 1 or spans not in ({1}, {0}):
@@ -722,21 +724,22 @@ def step_refusal(keys: Collection[str], step: SubmoduleStep | None) -> str | Non
 
 def declared_streams(keys: Collection[str], step: SubmoduleStep) -> dict[str, ResidentStream]:
     """Each resource's stream on a step that passed `step_refusal`: the label
-    of its own segments, or of the step's when it names none."""
+    of its own segments, or of the step's when it names none. A resource with
+    neither has no stream."""
     streams = {}
     for key in keys:
         segments = _segments(key, step)
-        streams[key] = ResidentStream(segments[0].label, reads=segments[0].span == 0)
+        if segments:
+            streams[key] = ResidentStream(segments[0].label, reads=segments[0].span == 0)
     return streams
 
 
 def _row_refusal(
-    keys: Collection[str], step: SubmoduleStep, streams: Mapping[str, ResidentStream], rids: Collection[int],
+    step: SubmoduleStep, streams: Mapping[str, ResidentStream], rids: Collection[int],
 ) -> str | None:
     """Why a row of ``rids`` in ``step`` declares other than its walk's
     ``streams``. Asked of the rows a step writes whole, which every row is once."""
-    for key in keys:
-        want = streams[key]
+    for key, want in streams.items():
         span = 0 if want.reads else 1
         for seg in _segments(key, step):
             if seg.request_id in rids and (seg.label != want.label or seg.span != span):

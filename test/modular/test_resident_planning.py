@@ -808,7 +808,7 @@ def test_a_kv_pool_says_what_keeps_it_off_the_tables(groups, why):
     kv = KVManager.__new__(KVManager)
     kv._groups = [object()] * groups
     kv._needs_remote_transfer = False
-    refusal = kv.resident_refusal("kv", {})
+    refusal = kv.resident_refusal("kv", {"kv": object()})
     assert refusal is None if why is None else why in refusal
 
 
@@ -2226,6 +2226,9 @@ def test_a_walk_with_two_labels_on_one_resource_is_refused():
     two = (Segment(1, "main", 1), Segment(1, "aux", 1))
     step = SubmoduleStep(steps={"kv": KVStep(segments=two), "ctx": KVStep(), "rope": PositionStep()}, segments=rows)
     assert "resource 'kv' declares 2 segments over labels" in resident_mod.step_refusal(("kv", "ctx", "rope"), step)
+    # a resource with no segments has no stream: the line names the one that refuses
+    bagel = SubmoduleStep(steps={"kv": step.steps["kv"], "sampler": SimpleNamespace(segments=())})
+    assert "resource 'kv' declares" in resident_mod.step_refusal(("sampler", "kv"), bagel)
     mixed = (Segment(1, "main", 1), Segment(2, "main", 0))
     step = SubmoduleStep(steps={"kv": KVStep(), "ctx": KVStep(segments=mixed), "rope": PositionStep()}, segments=rows)
     assert "resource 'ctx'" in resident_mod.step_refusal(("kv", "ctx", "rope"), step)

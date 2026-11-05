@@ -4716,6 +4716,8 @@ class KVManager(AttentionResource):
         return self._groups[0].page_size if self._arena.num_free + evictable >= rows else 1
 
     def resident_refusal(self, key, streams) -> str | None:
+        if key not in streams:
+            return "its step declares it no stream"
         if len(self._groups) > 1:
             # a table per group would hold the pages; what's missing is the release: a group frees its
             # front pages at commit, a step behind the device, so a planned step's row would point at them

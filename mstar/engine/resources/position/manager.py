@@ -371,6 +371,8 @@ class RopeManager(PositionManager):
     def resident_refusal(self, key: str, streams: Mapping[str, "ResidentStream"]) -> str | None:
         if self._config.scheme != PosScheme.SEQUENTIAL:
             return f"position scheme {self._config.scheme} doesn't advance with the stream"
+        if key not in streams or self._kv_cache_name not in streams:
+            return "its step declares it no stream"
         own, pool = streams[key], streams[self._kv_cache_name]
         if own.label != pool.label or own.reads or pool.reads:
             # the offset holds only while both advance a token a step, as one stream
