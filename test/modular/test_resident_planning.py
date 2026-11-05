@@ -1018,7 +1018,7 @@ def test_a_node_that_never_chains_says_why_it_cant_repeat(state, why):
     assert worker._unchained_refusal("n", WALK) is None
 
 
-def test_a_row_declaring_another_stream_than_its_walk_stops_the_worker():
+def test_a_row_declaring_another_stream_than_its_walk_fails_its_step_not_the_worker():
     """A resident step, and each replay of one, advances every row on the walk's
     streams; a row whose declared label differs would be read and written on
     the wrong stream."""
@@ -1028,7 +1028,7 @@ def test_a_row_declaring_another_stream_than_its_walk_stops_the_worker():
     lease = SlotLease(slot=0, bucket=BucketKey(graph_walk=WALK, bs=2, num_tokens=2))
     ctx = StepContext(request_ids=padded, graph_walk=WALK, slot=0, capture=False, slot_lease=lease, repeats=4)
     step = SubmoduleStep(steps={}, segments=[Segment(1, "main", 1), Segment(2, "aux", 1)])
-    with pytest.raises(SystemExit, match="row 2 declares 'aux'"):
+    with pytest.raises(ValueError, match="row 2 declares 'aux'"):
         planner.plan(step, ctx)
 
 
@@ -2722,7 +2722,7 @@ def test_a_resident_preprocess_that_reads_what_the_graph_fills_stops_the_worker(
     batch = SimpleNamespace(node_name="n", per_request_input_metadata={}, launch_started_event=None)
     drive = partial(engine._drive_step, batch, mgmt, [1], [], {}, ctx, None, True, None, False)
     if reader == "preprocess":
-        with pytest.raises(SystemExit, match="rope.pos_ids"):
+        with pytest.raises(ValueError, match="rope.pos_ids"):
             drive()
     else:
         assert drive() == ({}, None)
@@ -2963,7 +2963,7 @@ def test_a_repeating_step_that_reads_the_loop_counter_stops_the_worker(repeats):
     if repeats == 1:
         _refuse_counter_read("n", ctx, reads, "preprocess")
     else:
-        with pytest.raises(SystemExit, match="preprocess read the loop counter"):
+        with pytest.raises(ValueError, match="preprocess read the loop counter"):
             _refuse_counter_read("n", ctx, reads, "preprocess")
 
 

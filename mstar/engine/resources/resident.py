@@ -572,8 +572,8 @@ class ResidentPlanner:
             self._last_read[slots] = seq
             rows = [(rid, self._slot_of[rid]) for rid in taken]
         if taken and (refusal := _row_refusal(step, streams, taken)) is not None:
-            # the tables advance each row on its walk's streams, every replay
-            raise SystemExit(f"resident walk {ctx.graph_walk!r} on {self.node}: {refusal}")
+            # the tables advance each row on its walk's streams, every replay; the step's rows fail
+            raise ValueError(f"resident walk {ctx.graph_walk!r} on {self.node}: {refusal}")
         plan = ResidentPlan(
             key, rids, slots, seq, self._commits, ResidentWrites(streams, ctx.repeats), taken, refreshed,
         )

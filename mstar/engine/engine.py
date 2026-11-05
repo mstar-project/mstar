@@ -354,7 +354,8 @@ def _refuse_counter_read(node_name: str, ctx: StepContext, reads: Collection[str
     once, so a value they derive from the loop counter would hold for every
     replay; an iteration's value belongs in ``ITERATION_INPUTS``."""
     if ctx.repeats > 1 and LOOP_COUNTER in reads:
-        raise SystemExit(
+        # the step's rows fail, not the worker: a branch only a real row takes can land here
+        raise ValueError(
             f"{node_name}/{ctx.graph_walk}: a repeating step's {stage} read "
             f"{LOOP_COUNTER}, which its later replays don't renew; declare the value in ITERATION_INPUTS"
         )
@@ -2636,8 +2637,8 @@ class Engine:
                     preprocessed = submodule.preprocess(ctx.graph_walk, engine_inputs=engine_inputs, inputs=inputs)
                 table = next((r for r in reads if r != LOOP_COUNTER), None)
                 if table is not None and ctx.resident is not None:
-                    # a branch the capture template didn't take at load
-                    raise SystemExit(
+                    # a branch the capture template didn't take at load: the step's rows fail
+                    raise ValueError(
                         f"{batch.node_name}/{ctx.graph_walk}: a resident step's preprocess read {table}, "
                         "which its graph fills after it; serve it with resident_planning: off"
                     )
