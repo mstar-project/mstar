@@ -555,8 +555,8 @@ so ``max_concurrent_requests`` caps the requests in flight and startup refuses a
 that can't hold that many full replies: overfilled, the TTS would stall. A reply's LLM
 pages have no such bound, so ``llm_kv`` has host pages (``cpu_offload_pages``): a full
 pool moves a request to the host until those fill (at most about 896 pages in all, about
-3.5k tokens a request at the cap); past that a long burst still waits (follow-up: reserve
-a request's whole layout).
+3.5k tokens a request at the cap of 32); past that a long burst still waits (follow-up:
+reserve a request's whole layout).
 
 Command A+ (``command_a_plus``)
 -------------------------------
