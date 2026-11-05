@@ -10,6 +10,7 @@ keeps host copies of them once the request's prefill row has run.
 
 from __future__ import annotations
 
+import logging
 from array import array
 from dataclasses import replace
 from types import SimpleNamespace
@@ -237,6 +238,19 @@ def test_a_request_the_full_pool_cant_hold_is_not_rebuildable():
     assert not _ingest(rebuilds, R, (PrefixSpan(2, 2, PREFILL),)), "two requests' ids would share host memory"
     rebuilds.keep_prompts(_ran(PREFILL, {A: {"text_inputs": [torch.arange(4)]}, R: {"text_inputs": [torch.arange(2)]}}))
     assert A in rebuilds._kept[NODE] and R not in rebuilds._kept[NODE]
+
+
+def test_a_full_pool_is_logged_once_and_not_per_request(caplog):
+    rebuilds = Rebuilds({NODE: POLICY}, _graphs(), HostPool(32, torch.device("cpu")))
+
+    with caplog.at_level(logging.WARNING, logger="mstar.worker.rebuild"):
+        for rid in (R, A, B):
+            _ingest(rebuilds, rid, (PrefixSpan(8, 8, PREFILL),))
+
+    lines = [record.getMessage() for record in caplog.records]
+    assert len(lines) == 1 and "the 64 bytes a request's ids and host copies take, with 0 of 32 bytes" in lines[0], (
+        "requests that can never be dropped would go unnoticed, or log a line each"
+    )
 
 
 def test_removing_a_request_gives_its_slice_back():
@@ -693,6 +707,17 @@ def test_a_request_mid_prefill_is_rebuilt_from_its_prompts_input_up_to_where_its
     assert (cursor.walk, cursor.total, cursor.length, cursor.resumes_prefill) == (PREFILL, 4, 10, True), (
         "the rebuild would run past where the prompt stood, or release the input the prompt's next chunk reads"
     )
+
+
+@pytest.mark.parametrize("prefilling", [None, Prefilling(PREFILL, 4, 10)], ids=["kept ids", "mid-prefill"])
+def test_a_drop_is_checked_against_the_tokens_its_rebuild_writes(prefilling):
+    rebuilds = _rebuilds()
+    rebuilds._kept[NODE][R] = _kept([1, 2, 3], 4, 5)
+
+    tokens = rebuilds.tokens(R, NODE, prefilling)
+    rebuilds.start(R, NODE, prefilling)
+
+    assert tokens == rebuilds.cursor(R, NODE).total, "the drop would check one count and the rebuild write another"
 
 
 def test_the_sampler_commits_no_draw_of_a_rebuild_row_whatever_the_model_declared():

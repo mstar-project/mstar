@@ -43,8 +43,8 @@ class _HostPool(CPUPagePool):
         self.offloaded, self.reserved = {}, {}
         self._refused_logged_at = None
         self._refused_unlogged = 0
-        self.dropped = self.written = self.cancelled = 0
-        self._dropped_logged_at = None
+        self.dropped = self.written = self.cancelled = self.guaranteed = 0
+        self._dropped_logged_at = self._guaranteed_logged_at = None
         self.copied_out: list[int] = []
         self.copied_in: list[int] = []
         self.written_out: list[int] = []

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import logging
 from array import array
 from collections import defaultdict, deque
 from collections.abc import Collection, ItemsView, Iterable, Mapping, MutableMapping
@@ -27,6 +28,8 @@ if TYPE_CHECKING:
     from mstar.engine.engine import ExecutingBatch
     from mstar.model.base import KVLabel
     from mstar.model.submodule_base import HostRows
+
+logger = logging.getLogger(__name__)
 
 # The serving config's ``rebuild_host_mb`` unless it sets one: 8M prompt ids
 # at 8 B each.
@@ -190,6 +193,12 @@ class Rebuilds:
         self._allowance = StepAllowance() if allowance is None else allowance
         # the copies to the host not yet started, oldest first
         self._queued: deque[QueuedCopy] = deque()
+        # nodes that have logged a request the pool couldn't hold
+        self._logged_full: set[str] = set()
+
+    @property
+    def pool(self) -> HostPool | None:
+        return self._pool
 
     @property
     def nodes(self) -> frozenset[str]:
@@ -227,7 +236,16 @@ class Rebuilds:
         if others and dtype is None:
             return None
         copies = sum(span.length * width[span.walk] for span in others) * (dtype.itemsize if others else 0)
-        piece = self._pool.take(aligned(ids * torch.long.itemsize) + copies)
+        nbytes = aligned(ids * torch.long.itemsize) + copies
+        piece = self._pool.take(nbytes)
+        if piece is None and node not in self._logged_full:
+            self._logged_full.add(node)
+            logger.warning(
+                "%s: the rebuild host pool has no room for the %d bytes a request's ids and host copies take, with %d "
+                "of %d bytes in use, so the request can't be dropped there. Only the first on each node is logged, "
+                "and the serving config's rebuild_host_mb and rebuild_media_host_mb size the pool.",
+                node, nbytes, self._pool.nbytes_used(), self._pool.nbytes,
+            )
         return None if piece is None else LogRoom(piece, sum(span.length for span in others))
 
     def ingest_request(
@@ -457,6 +475,14 @@ class Rebuilds:
         if len(kept.sampled) != loop_iters.get(policy.loop, 0) + 1:
             return f"its {len(kept.sampled)} kept samples don't cover its KV"
         return None
+
+    def tokens(self, rid: int, node: str, prefilling: Prefilling | None) -> int:
+        """How many slots ``rid``'s rebuild on ``node`` writes: the chunks its prompt was ``prefilling`` ran, or
+        else its kept prompt, every sample but the last, and the slots its host copies fill."""
+        if prefilling is not None:
+            return prefilling.done
+        kept = self._kept[node][rid]
+        return kept.prompt.view.numel() + len(kept.sampled) - 1 + (0 if kept.copies is None else kept.copies.slots)
 
     def start(self, rid: int, node: str, prefilling: Prefilling | None) -> Rebuild | None:
         """Open ``rid``'s rebuild on ``node``, and return what it writes from its kept ids, or None when it runs

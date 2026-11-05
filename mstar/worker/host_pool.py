@@ -48,6 +48,13 @@ class HostPool:
         self._stream: torch.Stream | None = None
         self._in_stream: torch.Stream | None = None
 
+    @property
+    def nbytes(self) -> int:
+        return self._memory.nbytes
+
+    def nbytes_used(self) -> int:
+        return self.nbytes - sum(free.nbytes for free in self._free)
+
     def take(self, nbytes: int) -> HostSlice | None:
         size = aligned(nbytes)
         for i, free in enumerate(self._free):
