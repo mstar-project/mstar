@@ -77,6 +77,12 @@ def fa_work_items_bound(qo_indptr: np.ndarray | torch.Tensor, num_heads: int, nu
     return int(((q * num_heads + tile - 1) // tile).sum()) + num_sm // cluster
 
 
+def fa_work_items_ceiling(queries: int, rows: int, num_heads: int, num_sm: int) -> int:
+    """At least ``fa_work_items_bound`` of any plan of ``queries`` queries over ``rows`` rows: a tile
+    of 64 heads' queries, a row and an SM each, whatever the cluster."""
+    return -(-queries * num_heads // 64) + rows + num_sm
+
+
 def _sm_count(device: torch.device) -> int | None:
     """The device's SMs; None off CUDA, where the torch fallback plans."""
     device = torch.device(device)
@@ -358,8 +364,7 @@ class FlashInferMLAManager(PlacedAttention):
                 num_rows, bucket.num_tokens, self._kv_config), "batch_size": num_rows, "use_cuda_graph": True}
             if self._placement is not None:
                 decode = one_token_rows(bucket.bs, bucket.num_tokens, force_prefill)
-                if not decode:
-                    self._refuse_capture_past_cap(bucket, num_rows)
+                self._refuse_capture_past_cap(bucket, num_rows, decode)
                 wrapper = self._context_parallel_wrapper(label, lease.slot, decode, kwargs, bucket.num_tokens)
             else:
                 wrapper = FlashInferMLAWrapper(workspace_buffer=self._workspaces.get(label, lease.slot), **kwargs)
@@ -397,29 +402,26 @@ class FlashInferMLAManager(PlacedAttention):
 
     def admit(self, step: AttentionStep, ctx: StepContext) -> AdmitOutcome:
         """Over a placed pool on the FA planner, refuses a step its planner may not hold before it is
-        planned (``_fits``), so the worker retries it smaller:
-        sized by how many of its requests, in its order, fit, or terminal for a request that
-        doesn't fit alone (or alone in its capture's bucket, whose padding counts). The bound reads
-        query lengths alone, so every rank refuses alike."""
-        if self._fa_sm_count is None or self._decode_fits(step, ctx):
+        planned (``_fits``), so the worker retries it smaller: sized by how many of its requests, in
+        its order, fit, or terminal for a request that doesn't fit alone. The bound reads query
+        lengths alone, so every rank refuses alike. A leased step's plans are bounded by its bucket,
+        once, at capture (``_refuse_capture_past_cap``)."""
+        if self._fa_sm_count is None or ctx.slot_lease is not None or self._decode_fits(step, ctx):
             return ADMIT_OK
         # request -> label -> its queries this step
         rows: dict[str, dict[str, int]] = {}
         for segment in step.segments:
             rows.setdefault(segment.request_id, {})[segment.label] = segment.span
         spans = list(rows.values())
-        # bounded as the step's wrappers plan it, a captured one's own-token plans padded
-        if self._fits(spans, ctx):
+        if self._fits(spans, ctx.force_prefill):
             return ADMIT_OK
         where = f"FlashInfer's FA MLA planner past its cap of {_FA_MAX_WORK_ITEMS} work items over " \
                 f"context-parallel KV pool {self._kv_cache_name!r}"
-        # sized by the real rows: a capture's padding rows (no queries, but they move the planner's
-        # tile) go with the bucket, so each retry is strictly smaller
-        real = [rid for rid in rows if not ctx.is_padding_row(rid)]
-        alone = frozenset(rid for rid in real if not self._fits([rows[rid]]))
-        fit = next((n for n in range(len(real) - 1, 0, -1) if self._fits([rows[rid] for rid in real[:n]])), None)
+        real = list(rows)
+        alone = frozenset(rid for rid in real if not self._fits([rows[rid]], ctx.force_prefill))
+        fit = next((n for n in range(len(real) - 1, 0, -1)
+                    if self._fits([rows[rid] for rid in real[:n]], ctx.force_prefill)), None)
         if alone or fit is None:
-            # (no fit: one real row, which its capture's padding takes past the cap)
             hint = self._placed.cap_hint(self._placement)
             return AdmitOutcome(ok=False, reason=AdmitRuntimeError(
                 message=f"The request's prompt takes {where} in one step; shorten it.{hint}",
@@ -437,54 +439,48 @@ class FlashInferMLAManager(PlacedAttention):
         ))
 
     def _decode_fits(self, step: AttentionStep, ctx: StepContext) -> bool:
-        """Whether ``step`` plans as decode (``_fits`` by the same rule) and, at a tile a row per 64
-        heads, can't reach the cap, sparing a decode step the per-row bound."""
-        lease = ctx.slot_lease
-        if lease is None:
-            decode = not ctx.force_prefill and all(segment.span == 1 for segment in step.segments)
-        else:
-            decode = one_token_rows(lease.bucket.bs, lease.bucket.num_tokens, ctx.force_prefill)
-        tiles = -(-self._wrapper_kwargs["num_qo_heads"] // 64)
-        return decode and len(step.segments) * tiles + self._fa_sm_count <= _FA_MAX_WORK_ITEMS
+        """Whether an eager ``step`` plans as decode (``_fits`` by the same rule) and can't reach the
+        cap, sparing a decode step the per-row bound."""
+        decode = not ctx.force_prefill and all(segment.span == 1 for segment in step.segments)
+        rows = len(step.segments)
+        return decode and fa_work_items_ceiling(rows, rows, self._wrapper_kwargs["num_qo_heads"],
+                                                self._fa_sm_count) <= _FA_MAX_WORK_ITEMS
 
-    def _fits(self, rows: list[dict[str, int]], ctx: StepContext | None = None) -> bool:
+    def _fits(self, rows: list[dict[str, int]], force_prefill: bool = False) -> bool:
         """Whether each label's plans over ``rows`` (label -> queries, a request each) stay within
-        the FA planner's work-item cap, as ``plan`` makes them for a step of ``ctx`` (an eager one
-        when None): a decode step's context alone, any other step's context and own tokens
-        (``rank_plans``). Its kind comes from the rule ``plan`` picks the wrapper by
-        (``one_token_rows``); a capture's padding of the own tokens is bounded at capture
-        (``_refuse_capture_past_cap``)."""
+        the FA planner's work-item cap, as ``plan`` makes them for an eager step: a decode step's
+        context alone, any other step's context and own tokens (``rank_plans``), its kind by the rule
+        ``plan`` picks the wrapper by (``one_token_rows``)."""
         heads = self._wrapper_kwargs["num_qo_heads"]
-        lease = None if ctx is None else ctx.slot_lease
-        force_prefill = ctx is not None and ctx.force_prefill
         for label in {label for row in rows for label in row}:
             qo = np.cumsum([0, *(row[label] for row in rows if label in row)])
-            if lease is None:
-                decode = one_token_rows(len(qo) - 1, int(qo[-1]), force_prefill)
-            else:
-                decode = one_token_rows(lease.bucket.bs, lease.bucket.num_tokens, force_prefill)
+            decode = one_token_rows(len(qo) - 1, int(qo[-1]), force_prefill)
             plans = [(qo, heads)] if decode else self._placed.rank_plans(self._placement, qo, heads)
             if any(fa_work_items_bound(plan, h, self._fa_sm_count) > _FA_MAX_WORK_ITEMS for plan, h in plans):
                 return False
         return True
 
-    def _refuse_capture_past_cap(self, bucket, rows: int) -> None:
-        """Refuses, at capture, a bucket whose own-token kernel the FA planner could refuse on one rank
-        alone: a captured kernel plans a fixed count of queries over fixed rows whatever the step,
-        padding the step's (``share_capture``), and no plan of those takes more than a query tile a
-        64 heads, a row each and an SM each. Admission then bounds a step's real lengths alone."""
+    def _refuse_capture_past_cap(self, bucket, rows: int, decode: bool) -> None:
+        """Refuses, at capture, a bucket whose plans the FA planner could refuse on one rank alone: a
+        captured wrapper plans at most its ``rows`` rows and its bucket's tokens over this rank's
+        slots, and its own-token kernel a fixed count of queries over fixed rows whatever the step
+        (``share_capture``), and no plan of those passes ``fa_work_items_ceiling``. Admission then
+        has nothing to bound for a leased step."""
         if self._fa_sm_count is None:
             return
-        shape = self._placed.share_capture(self._placement, rows, bucket.num_tokens)
-        heads = self._kv_config.num_qo_heads
-        ceiling = -(-shape.queries * heads // 64) + shape.rows + self._fa_sm_count
-        if ceiling > _FA_MAX_WORK_ITEMS:
-            raise ValueError(
-                f"capture bucket {bucket} over context-parallel KV pool {self._kv_cache_name!r}: its own-token "
-                f"kernel, padded to {shape.queries} queries over {shape.rows} rows at {heads} heads, can take "
-                f"FlashInfer's FA MLA planner up to {ceiling} work items, past its cap of {_FA_MAX_WORK_ITEMS}: "
-                "capture smaller buckets"
-            )
+        plans = [("context", bucket.num_tokens, rows, self._wrapper_kwargs["num_qo_heads"])]
+        if not decode:
+            shape = self._placed.share_capture(self._placement, rows, bucket.num_tokens)
+            plans.append(("own-token", shape.queries, shape.rows, self._kv_config.num_qo_heads))
+        for what, queries, plan_rows, heads in plans:
+            ceiling = fa_work_items_ceiling(queries, plan_rows, heads, self._fa_sm_count)
+            if ceiling > _FA_MAX_WORK_ITEMS:
+                raise ValueError(
+                    f"capture bucket {bucket} over context-parallel KV pool {self._kv_cache_name!r}: its {what} "
+                    f"plan, up to {queries} queries over {plan_rows} rows at {heads} heads, can take FlashInfer's FA "
+                    f"MLA planner to {ceiling} work items, past its cap of {_FA_MAX_WORK_ITEMS}: capture smaller "
+                    "buckets"
+                )
 
     def plan(self, step: AttentionStep, ctx: StepContext):
         if step.context_only and self._placement is not None:

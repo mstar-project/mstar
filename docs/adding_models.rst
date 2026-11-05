@@ -2460,9 +2460,11 @@ its context partial before the gather.
 
 MLA plans on FA3 (Hopper) or FA2 and refuses a ``context_only`` step. That planner caps a plan's
 work items, which TP mode reaches ``P`` times sooner, and counts each rank's own KV lengths, so
-admission refuses a step whose bound from its query lengths alone passes the cap (in SP mode, for
-every partner's zigzag share, padded as its capture pads it), on every rank alike, and the worker
-retries it with the requests that fit (a prompt past the cap alone fails). The bound copies
+admission refuses a step whose bound from its query lengths alone passes the cap (its own tokens'
+plans included, in SP mode every partner's zigzag share), on every rank alike, and the worker
+retries it with the requests that fit (a prompt past the cap alone fails). A capture bucket whose
+plans, padded to the bucket, could pass the cap is refused at load: capture smaller buckets
+(GLM-5.2's are far under it). The bound copies
 FlashInfer 0.7.2's rules, so another FlashInfer is refused at load, as is a per-rank head count
 that doesn't divide 64 (the planner's causal tile check). GLM-5.2 with ``dsa_long_context`` off
 loads under ``context_parallel``.

@@ -1059,19 +1059,6 @@ def test_mla_attention_refuses_at_admit_a_step_past_the_fa_planners_cap_so_the_w
     assert fm.fa_work_items_bound(qo, heads // P, 132) > fm.fa_work_items_bound(qo, heads, 132)
     assert not admit(fm.fa_work_items_bound(qo, heads, 132)).ok
 
-    # a capture's span-0 padding rows lower the planner's queries per row, which can halve its tile:
-    # the retry is sized by the real rows, never blaming a padding row (which would re-form the step)
-    spans, pad = (40, 30), 8
-    step = AttentionStep(segments=tuple(Segment(f"r{i}", "main", span) for i, span in enumerate(spans))
-                         + tuple(Segment(-1 - i, "main", 0) for i in range(pad)))
-    ctx = StepContext(request_ids=("r0", "r1"), graph_walk="w", slot=0, capture=False)
-    ctx.set_padded_rids(tuple(seg.request_id for seg in step.segments))
-    cap = max(bound([span]) for span in spans)
-    assert bound([*spans, *[0] * pad]) > cap >= bound(spans)
-    refused = admit(cap).reason
-    assert isinstance(refused, AllocationFailed)
-    assert (refused.rows_fit, refused.rows_sized, refused.request_id) == (1, 2, "r1")
-
 
 def test_mla_attention_over_a_placed_pool_never_admits_a_step_its_planner_refuses(monkeypatch):
     """A capture pads its own-token kernel's plan to its bucket (a row of the spare queries, then empty

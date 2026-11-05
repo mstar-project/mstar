@@ -441,7 +441,8 @@ class _WholeRows(OwnTokensKernel):
         self._ragged, self.captured = ragged, captured
 
     def plan(self, rows: KeyRows, causal: bool) -> None:
-        if not rows.is_whole():
+        if rows.kv_indptr is not rows.qo_indptr:
+            # each row over its own tokens, as only KeyRows.whole lays them out
             raise ValueError("FlashInfer's ragged own-token kernel takes whole rows, each over its own tokens")
         self._ragged.plan(torch.from_numpy(rows.qo_indptr.astype(np.int32)), causal=causal)
 

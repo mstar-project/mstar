@@ -143,11 +143,6 @@ class KeyRows(NamedTuple):
         """Each row of ``qo_indptr`` over its own tokens: TP placement's own tokens."""
         return cls(qo_indptr, qo_indptr, np.arange(int(qo_indptr[-1]), dtype=np.int64))
 
-    def is_whole(self) -> bool:
-        """Whether each row's keys are its own queries' tokens, back to back."""
-        return np.array_equal(self.kv_indptr, self.qo_indptr) and np.array_equal(
-            self.kv_tokens, np.arange(len(self.kv_tokens)))
-
 
 class ShareCapture(NamedTuple):
     """What the kernel of a captured step's own tokens is sized for (``share_capture``)."""
@@ -168,7 +163,8 @@ class OwnTokensKernel(ABC):
     ``kv_tokens``.
 
     A captured kernel is run on ``captured.queries`` queries every replay, however few its plan has
-    (``ZigzagWrapper`` gathers that many; TP passes the bucket's)."""
+    (``ZigzagWrapper`` gathers that many; TP passes the bucket's). A kernel the backend built for
+    whole rows (``PlacedAttention.own_tokens_kernel``) may refuse any other rows."""
 
     # what a captured kernel is sized for; None on an eager one
     captured: ShareCapture | None = None
