@@ -96,6 +96,7 @@ if TYPE_CHECKING:
     from mstar.engine.resources.kv.manager import KVManager
     from mstar.engine.resources.lora.pool import LoraAdapterPool
     from mstar.model.base import Model
+    from mstar.worker.rebuild import Rebuilds
 
 logger = logging.getLogger(__name__)
 
@@ -3336,11 +3337,11 @@ class Engine:
     def owes_moves(self) -> bool:
         return bool(self._resident_delta)
 
-    def apply_resident_delta(self, delta: OffloadDelta, rebuilding: Callable[[int, str], bool]) -> bool:
+    def apply_resident_delta(self, delta: OffloadDelta, rebuilds: "Rebuilds") -> bool:
         """Match the leader's resident set on each node a move names. Mutates OffloadDelta
         by popping off the steps that have already landed. False means not all
         has landed and the caller must retry before trying the next step.
-        ``rebuilding(rid, node)`` is whether this rank's rebuild of a request on a node is still running.
+        ``rebuilds`` holds this rank's kept ids and the rebuilds it is running.
         """
         for _ in range(len(delta)):
             move = delta.peek_left()
@@ -3369,12 +3370,17 @@ class Engine:
                              wire_rid, kind.name, node_name, len(delta))
                 return False
             elif kind == MoveKind.DROP:
+                if rebuilds.kept(rid, node_name) is None and (rid, node_name) not in self._chunking.prepared:
+                    raise RuntimeError(
+                        f"rank 0 dropped {wire_rid} on {node_name}, and this rank keeps neither its ids nor the input "
+                        "of its prompt mid-prefill to rebuild it from"
+                    )
                 # with the tokens rank 0's rebuild writes, which this rank's KV refuses unless it holds as many
                 freed = self.drop_request(node_name, rid, move.count)
                 logger.debug("Replayed rank 0's DROP of request %s on %s (%d, %d pages freed)", wire_rid, node_name,
                             move.count, freed)
             elif kind == MoveKind.LAND:
-                if rebuilding(rid, node_name):
+                if rebuilds.rebuilding(rid, node_name):
                     raise RuntimeError(
                         f"rank 0 landed {wire_rid}'s rebuild on {node_name}, and this rank's is still running"
                     )

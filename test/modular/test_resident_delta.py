@@ -62,8 +62,18 @@ from mstar.worker.stream_buffers import StreamBufferManager
 from mstar.worker.worker import Worker
 
 
-def _rebuilds_none(rid, node):
-    return False
+class _KeepsIds:
+    """A rebuild log that keeps every request's ids and runs no rebuild."""
+    nodes = frozenset()
+
+    def kept(self, rid, node):
+        return True
+
+    def rebuilding(self, rid, node):
+        return False
+
+
+_rebuilds_none = _KeepsIds()
 
 
 def _entries(delta: OffloadDelta) -> list[tuple[str, MoveKind]]:
@@ -1350,6 +1360,8 @@ def test_a_follower_replays_the_drop_of_a_request_that_keeps_no_ids(monkeypatch)
     (leader, lead), (follower, follow) = _both_short_then_drop(monkeypatch)
     scheduler = MicroScheduler(engine_manager=SimpleNamespace(get_engine=lambda node: follow))
     scheduler.rebuilds = Rebuilds({}, {})
+    # the input the engine keeps for v's prompt mid-prefill
+    follow._chunking.prepared["v", NODE] = SimpleNamespace()
 
     assert scheduler._apply_resident_delta(NODE, lead.take_resident_delta())
     assert follower.residency("v") is Residency.DROPPED and _counts(leader) == _counts(follower)
@@ -1683,7 +1695,7 @@ def test_a_follower_whose_counts_cant_take_rank_0s_move_stops(monkeypatch):
 def _follower_of(follow) -> MicroScheduler:
     """A follower's scheduler over ``follow``, whose log keeps v's ids and runs no rebuild."""
     scheduler = MicroScheduler(engine_manager=SimpleNamespace(get_engine=lambda node: follow))
-    scheduler.rebuilds = SimpleNamespace(rebuilding=_rebuilds_none, nodes=frozenset())
+    scheduler.rebuilds = _KeepsIds()
     return scheduler
 
 

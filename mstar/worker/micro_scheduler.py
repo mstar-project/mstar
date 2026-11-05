@@ -845,7 +845,7 @@ class MicroScheduler:
         if not len(delta):
             return True
 
-        return self.engine_manager.get_engine(node_name).apply_resident_delta(delta, self.rebuilds.rebuilding)
+        return self.engine_manager.get_engine(node_name).apply_resident_delta(delta, self.rebuilds)
 
     def _apply_delta_from_message(self, message: ScheduleTPNode) -> bool:
         new_delta = None
@@ -873,11 +873,11 @@ class MicroScheduler:
             return True
         if not self._apply_delta_from_message(head):
             return False
-        self._start_follow_rebuilds(request_state, head)
-        if not head.prefix_hits and not head.page_trails:
-            return True
         engine = self.engine_manager.get_engine(head.node_name)
         try:
+            self._start_follow_rebuilds(request_state, head)
+            if not head.prefix_hits and not head.page_trails:
+                return True
             engine.check_page_trails(head.node_name, head.graph_walk, head.spec_seq, head.page_trails)
             return engine.adopt_cached_prefix(head, caught_up)
         except Exception as exc:
