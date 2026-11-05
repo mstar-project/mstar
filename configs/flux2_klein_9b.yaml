@@ -6,7 +6,9 @@ model: "flux2_klein_9b"
 max_seq_len: 512
 
 model_kwargs:
-  # sdpa (cuDNN on H100) is the reference kernel; flashinfer stays available
+  # sdpa (cuDNN on H100) is the reference kernel; auto runs the DiT's joint attention on the
+  # engine's ragged attention resource with the platform's default kernel (FlashInfer FA3 on
+  # NVIDIA GPUs, AITER's asm flash attention on MI300X/MI325X, where torch's sdpa is AOTriton)
   attention_backend: sdpa
   compile: true
   # inductor rounds intermediates where eager PyTorch does (and fuses no FMAs); on its own the compiled
