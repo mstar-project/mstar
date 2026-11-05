@@ -21,6 +21,9 @@ def install() -> None:
         # before torch starts its native threads: they inherit the mask, so the
         # signal can only reach thread_dumps' waiter
         signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGUSR1})
+    from mstar_sim import waits
+
+    waits.install()  # every clock and wait of the process, before anything binds them
     # Triton launches go through the interpreter's entry point, which triton_launch prices
     os.environ.setdefault("TRITON_INTERPRET", "1")
     # stand-ins for CUDA-only kernel libraries (flashinfer, ...) shadow the real ones
@@ -85,7 +88,7 @@ def thread_dumps() -> None:
                 except ProcessLookupError:
                     pass
 
-    threading.Thread(target=wait, name="mstar_sim-thread-dump", daemon=True).start()
+    threading.Thread(target=wait, name="mstar_sim-thread-dump", daemon=True).start()  # (not counted: its own)
 
 
 def _small_dev_shm(mib: int) -> None:
@@ -179,32 +182,37 @@ def _no_compile(torch) -> None:
 
 
 def _report_at_exit(path: str) -> None:
-    """At exit, append one JSON line per process: simulated device busy time, the
-    host's waits on the device, and the emulator's own host time. Waits near
-    zero mean the run was host-bound (mstar's own CPU work plus the emulator's)."""
+    """At exit, append one JSON line per process that drove a GPU: its device's busy time, and
+    how its clock was made (``mstar_sim.clock``, ``mstar_sim.waits``). ``clock_s`` is the time
+    mstar saw pass; ``wall_s`` the box's. ``device_waited_s`` near zero means the run was
+    host-bound (mstar's own CPU work, the emulator's is not in it). ``slept_s`` is device waits
+    that ended in real time because another thread ran, with ``jump_blockers`` the call sites
+    that ran; ``late_resumes`` those ended over a millisecond late; ``thread_time_faster`` reads
+    of ``time.thread_time`` that ran ahead of the clock (an op that released the GIL inside the
+    emulator); ``run_delay_s`` the emulator's time the box descheduled."""
     import atexit
     import json
-    import time
 
-    from mstar_sim import clock
+    from mstar_sim import clock, waits
 
-    start = time.perf_counter()
+    start, real = clock.now(), clock._real()
 
     def write():
         if clock.DEFAULT.kernels == 0:
             return  # a process that drove no GPU (API server, conductor)
-        wall = time.perf_counter() - start
         row = {
             "pid": os.getpid(), "gpu": os.environ.get("MSTAR_SIM_GPU"),
             "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
-            "wall_s": round(wall, 3),
+            "wall_s": round(clock._real() - real, 3), "clock_s": round(clock.now() - start, 3),
             "device_busy_s": round(clock.DEFAULT.busy, 3),
             "kernels": clock.DEFAULT.kernels,
             "graph_replays": clock.STATS["replays"],
             # torch calls on cuda tensors outside graphs: per replay, a decode step's eager work
             "eager_calls": clock.STATS["calls"],
-            "host_wait_s": round(clock.STATS["host_wait"], 3),
-            "emulator_host_s": round(clock.STATS["host_compute"], 3),
+            **{k: round(v, 3) if isinstance(v, float) else v for k, v in clock.STATS.items()
+               if k not in ("replays", "calls")},
+            "slept_s": round(waits.REPORT["slept_s"], 3), "late_resumes": waits.REPORT["late_resumes"],
+            "jump_blockers": dict(sorted(waits.REPORT["jump_blockers"].items(), key=lambda kv: -kv[1])[:8]),
         }
         with open(path, "a") as f:
             f.write(json.dumps(row) + "\n")

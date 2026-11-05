@@ -289,19 +289,19 @@ def test_graph_replay_costs_its_kernels_and_reprices_value_dependent_ones():
         assert slots.tolist() == [[100, -1, -1, -1], [108, 109, -1, -1]], slots.tolist()
         assert raw.tolist() == [[0, -1, -1, -1], [0, 1, -1, -1]], raw.tolist()
         # the emulator's own work at a replay (re-running ops on kept values) is not host time
-        import time
+        work = lambda *_: sum(range(10_000_000))  # ~0.2 s of the emulator's own CPU
         g5 = torch.cuda.CUDAGraph()
         with torch.cuda.graph(g5):
-            clock.on_replay(lambda: time.sleep(1))
+            clock.on_replay(work)
             a @ a
         took = timed(g5.replay, queued=0.0)  # idle: a late launch would show
-        assert took < 0.5, took
+        assert took < 0.05, took
         # nor is what it does around a stand-in kernel
         from mstar_sim import device
-        count_storages, device.count_storages = device.count_storages, lambda out: time.sleep(1)
-        before = clock.vnow()
+        count_storages, device.count_storages = device.count_storages, work
+        before = clock.now()
         clock.kernel_fn("test.idle")(lambda: None)()
-        assert clock.vnow() - before < 0.5, clock.vnow() - before
+        assert clock.now() - before < 0.05, clock.now() - before
         device.count_storages = count_storages
         try:
             with torch.cuda.graph(torch.cuda.CUDAGraph()):
@@ -455,28 +455,27 @@ def test_flashinfers_planner_runs_short_of_a_small_workspace():
             assert "tensor core decode" in str(e), e
         # a plan's Python is the emulator's time, not the host's: FlashInfer's own is a C++ loop
         import time
-        from mstar_sim import clock
 
-        def counted_share(call):  # the largest share of call's wall time the emulator counted
-            # as its own, over a few tries: on a loaded box a preemption outside the count lowers one
+        def shown(call):  # the least share of call's wall time the clock showed, over a few tries:
+            # on a loaded box a preemption the clock can't place raises one
             shares = []
             for _ in range(5):
-                counted, began = clock.STATS["host_compute"], time.perf_counter()
+                wall, began = time.clock_gettime(time.CLOCK_MONOTONIC), time.perf_counter()
                 call()
-                shares.append((clock.STATS["host_compute"] - counted) / (time.perf_counter() - began))
-            return max(shares)
+                shares.append((time.perf_counter() - began) / (time.clock_gettime(time.CLOCK_MONOTONIC) - wall))
+            return min(shares)
 
         batch = torch.arange(257, dtype=torch.int32)
-        share = counted_share(lambda: get_batch_prefill_module("fa2").plan(
+        share = shown(lambda: get_batch_prefill_module("fa2").plan(
             torch.empty(1 << 30, dtype=torch.uint8, device="cuda"), None, None, batch, batch * 64,
             torch.full((256,), 1024, dtype=torch.int32), 256, 256, 8, 8, 16, False, 64, 64, True, -1, -1, False, 0, 0))
-        assert share > 1 / 2, share
+        assert share < 1 / 2, share
         rows = torch.arange(4097, dtype=torch.int32)  # a ragged wrapper prices in its own plan
         wide = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
             torch.empty(1 << 30, dtype=torch.uint8, device="cuda"), "NHD", backend="fa2")
-        share = counted_share(lambda: wide.plan(rows, rows * 64, 8, 8, 64, causal=True, q_data_type=torch.bfloat16,
-                                                disable_split_kv=True))
-        assert share > 0.9, share
+        share = shown(lambda: wide.plan(rows, rows * 64, 8, 8, 64, causal=True, q_data_type=torch.bfloat16,
+                                        disable_split_kv=True))
+        assert share < 1 / 10, share
         # what FlashInfer's plan refuses: a group size with no kernel, a negative length, and
         # several queries a row where the kernels take one
         one_row = torch.tensor([0, 1], **i32), torch.zeros(1, **i32), torch.tensor([3], **i32)
@@ -650,30 +649,91 @@ def test_device_time_follows_the_cost_model_not_the_host(gpu):
     assert flops / peak < device_s < 20 * flops / peak
 
 
-def test_an_event_on_an_idle_stream_holds_no_thread_back():
-    """An event is complete when its stream drains, not at the recording thread's clock:
-    a waiter whose host time lags (the emulator's own time on its thread) isn't delayed."""
+@pytest.mark.parametrize("gpu", ["h100", "b200"])
+def test_a_wait_on_the_gpu_threads_step_spans_its_device_time_not_the_emulators(gpu):
+    """A worker's main thread waits for the GPU thread's step, then syncs on its event: the
+    span is the step's device time, however long the emulator took to launch it, with the
+    parent watch asleep beside them as in a worker. So a faster GPU shows, host-bound box or
+    not."""
     out = run_sim("""
-        import threading, time, torch
+        import multiprocessing, os, time, torch
+        from concurrent.futures import ThreadPoolExecutor
         from mstar_sim import clock
-        event, stream = torch.cuda.Event(), torch.cuda.Stream()
-        start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        from mstar.utils import orphan
+
+        multiprocessing.parent_process = lambda: type("Alive", (), {"is_alive": lambda self: True})()
+        orphan.watch_parent("test", "parent")
+
+        @clock.kernel_fn("test.step", cost=lambda: (0.0, 4e9))  # ~1.6 ms of HBM traffic on an H100
+        def kernel():
+            sum(range(300000))  # the emulator's own work: longer than the kernel
+
+        def step():
+            for _ in range(50):
+                kernel()
+            done = torch.cuda.Event()
+            done.record()
+            return done
+
+        gpu = ThreadPoolExecutor(1)
+        gpu.submit(int).result()  # its thread is up
         torch.cuda.synchronize()
-        with clock.computing():
-            time.sleep(1)
-        from mstar_sim.device import SimMode
-        left, leave = [], SimMode.__exit__
-        SimMode.__exit__ = lambda self, *exc: (left.append(self), leave(self, *exc))[1]
-        recorder = threading.Thread(target=event.record)
-        recorder.start(); recorder.join()
-        assert left  # a thread leaves its mode in Python, not in its thread-local teardown
-        with torch.cuda.stream(stream):
-            start.record(); stream.wait_event(event); torch.empty(8, device="cuda").add_(1); end.record()
-        end.synchronize()
-        assert start.elapsed_time(end) < 500, start.elapsed_time(end)
-        print("ok")
+        busy, t0 = clock.DEFAULT.busy, time.perf_counter()
+        gpu.submit(step).result().synchronize()  # the worker's await and event_sync
+        print(time.perf_counter() - t0, clock.DEFAULT.busy - busy, flush=True)
+        os._exit(0)  # (torch's teardown can abort with a pool's thread gone: not what this tests)
+    """, gpu)
+    span, device = map(float, out.split())
+    assert device <= span < 1.25 * device, (span, device)
+
+
+def test_a_device_wait_jumps_the_clock_instead_of_sleeping():
+    out = run_sim("""
+        import time, torch
+        from mstar_sim import clock
+        wall, t0 = time.clock_gettime(time.CLOCK_MONOTONIC), time.perf_counter()
+        clock.charge(1.0)
+        torch.cuda.synchronize()
+        print(time.perf_counter() - t0, time.clock_gettime(time.CLOCK_MONOTONIC) - wall)
     """)
-    assert out.strip() == "ok"
+    moved, wall = map(float, out.split())
+    assert 0.999 < moved < 1.01 and wall < 0.2, (moved, wall)
+
+
+def test_a_thread_woken_by_another_runs_before_the_clock_can_jump():
+    """An executor's thread does the host's work and sets an event: its waiter's span is that
+    work, though the waker blocks at once and another thread waits for the device 10 s on."""
+    out = run_sim("""
+        import os, threading, time, torch
+        from concurrent.futures import ThreadPoolExecutor
+        from mstar_sim import clock
+
+        far, ready = threading.Event(), threading.Event()
+
+        def device_waiter():
+            clock.charge(10.0)
+            torch.cuda.synchronize()
+            far.set()
+
+        def work():
+            end = time.perf_counter() + 0.2  # the host's own work
+            while time.perf_counter() < end:
+                pass
+            ready.set()
+
+        pool = ThreadPoolExecutor(1)
+        pool.submit(int).result()
+        threading.Thread(target=device_waiter).start()
+        wall, t0 = time.clock_gettime(time.CLOCK_MONOTONIC), time.perf_counter()
+        pool.submit(work)
+        assert ready.wait(timeout=60)
+        span = time.perf_counter() - t0
+        far.wait()
+        print(span, time.clock_gettime(time.CLOCK_MONOTONIC) - wall, flush=True)
+        os._exit(0)  # (torch's teardown can abort with a pool's thread gone: not what this tests)
+    """)
+    span, wall = map(float, out.split())
+    assert 0.2 <= span < 1 and wall < 5, (span, wall)
 
 
 def test_timing_only_holds_shapes_not_values():
@@ -1093,21 +1153,27 @@ def test_tensor_parallel_ranks_meet_at_each_collective():
             # a rank's wait for a late peer is a host wait, not the emulator's own time
             import time
             from mstar_sim import clock
-            emulator = clock.STATS["host_compute"]
+            emulator = clock.STATS["emulator_s"]
             time.sleep(r)
             dist.all_reduce(y)
-            assert clock.STATS["host_compute"] - emulator < 0.5, clock.STATS
+            assert clock.STATS["emulator_s"] - emulator < 0.5, clock.STATS
             time.sleep(r)
             dist.recv(kept, src=1) if r == 0 else dist.send(mine, dst=0)
-            assert clock.STATS["host_compute"] - emulator < 0.5, clock.STATS
+            assert clock.STATS["emulator_s"] - emulator < 0.5, clock.STATS
             # so is gloo's transfer of held values, which NCCL's enqueue doesn't wait for: a peer late
-            # to it doesn't move mstar's clock
+            # to it doesn't move mstar's clock. It spins, as gloo can, for a thread the emulator
+            # sees on a CPU, where a sleep would be parked (a wait it can't see) with no help
             if r == 0:
+                def late():
+                    end = clock._real() + 1
+                    while clock._real() < end:
+                        pass
+
                 pg_broadcast = dist.ProcessGroup.broadcast
-                dist.ProcessGroup.broadcast = lambda *args: (time.sleep(1), pg_broadcast(*args))[1]
-            before = clock.vnow()
+                dist.ProcessGroup.broadcast = lambda *args: (late(), pg_broadcast(*args))[1]
+            before = clock.now()
             dist.broadcast(kept, src=0)
-            assert clock.vnow() - before < 0.5, clock.vnow() - before
+            assert clock.now() - before < 0.5, clock.now() - before
             dist.destroy_process_group()
 
         if __name__ == "__main__":
@@ -1220,10 +1286,14 @@ def test_ranks_whose_collectives_dont_pair_abort(case):
             elif "{case}" == "recv_skip":
                 dist.recv(x, src=1) if r == 0 else time.sleep(7)
             elif "{case}" == "held":  # autograd holds it, as a gloo that kept its work would
-                from mstar_sim.dist import _let_go
+                from mstar_sim.dist import _let_go, _waiting
                 held = torch.ones(1, requires_grad=True) * 2
                 kept = held * held
-                _let_go(dist.group.WORLD, held) if r == 0 else time.sleep(7)
+                if r == 0:
+                    with _waiting():  # where the clock stands still: the timeout is real time
+                        _let_go(dist.group.WORLD, held)
+                else:
+                    time.sleep(7)
             elif "{case}" in ("graph_vs_eager", "bucket", "extra_replay"):
                 graph = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(graph):

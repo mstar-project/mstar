@@ -12,6 +12,8 @@ from outside.
   work and table shape (a launch's traffic would count the whole state pool).
 - ``header_only_weights``: weights are read from safetensors headers only.
 - ``worker_flag``: a model built on the CPU in a worker allocates nothing.
+- ``rust_poll``: mstar's poll for other processes is a wait the clock knows
+  (:mod:`mstar_sim.waits`).
 - ``swap_or_assign``, ``relax_blockwise_scaled_mm_meta``: torch's own (every process, mstar
   or not; ``mstar_sim.device.install`` applies them).
 
@@ -343,6 +345,32 @@ def worker_process_target(*args, **kwargs):
     return impl(*args, **kwargs)
 
 
+def rust_poll() -> None:
+    """The Rust communicator's poll is a wait on other processes: its thread counts as blocked,
+    a write to its eventfd (``EventWakeup``) wakes it, and its timeout is a host deadline that
+    holds until the clock reaches it (:func:`mstar_sim.waits.polling`)."""
+    communicator = importlib.import_module("mstar.communication.rust_communicator").RustZMQCommunicator
+    _require(communicator, "_poll_once")
+    from mstar_sim import clock, waits
+
+    if clock.FAST:
+        return
+    poll_once = communicator._poll_once
+
+    def polled(self, timeout_ms):
+        if timeout_ms <= 0:
+            return poll_once(self, timeout_ms)
+
+        def poll(seconds):
+            kind = poll_once(self, max(1, math.ceil(seconds * 1000)))
+            return None if kind == "timeout" else kind
+
+        event = getattr(self, "event", None)
+        return waits.polling(poll, event.fd if event is not None else None, timeout_ms / 1000) or "timeout"
+
+    communicator._poll_once = polled
+
+
 def swap_or_assign() -> None:
     """Moving a module swaps its parameters in place (so tied weights stay tied), but a
     swap refuses a tensor something else holds (weight_norm's hooks): that module alone
@@ -435,4 +463,4 @@ def install() -> None:
 SKIPPED: list[tuple[str, str]] = []
 
 
-PATCHES = (cap_captures, no_graphs, kv_scatter, conv_kernels, header_only_weights, worker_flag)
+PATCHES = (cap_captures, no_graphs, kv_scatter, conv_kernels, header_only_weights, worker_flag, rust_poll)

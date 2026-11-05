@@ -107,13 +107,12 @@ def _abort() -> None:
 
 @contextmanager
 def _waiting():
-    """The host waits for its peers: not the emulator's work, and the device's clock stands still."""
-    with clock.computing():
-        began = time.perf_counter()
+    """The host waits for its peers, as NCCL's host doesn't: the wait is blocked time, so the
+    clock stands still through it (:func:`mstar_sim.waits.blocked`)."""
+    from mstar_sim import waits
+
+    with waits.blocked():
         yield
-        waited = time.perf_counter() - began
-        clock.STATS["host_compute"] -= waited
-        clock.STATS["host_wait"] += waited
 
 
 def _watched(wait, where: str, mine: list[int], replay: bool = False) -> None:
@@ -144,10 +143,11 @@ def _let_go(group, *tensors: torch.Tensor) -> None:
     worker has dropped the work that holds them, a moment after its wait returns. A tensor Python
     lets go of first is freed by that worker, which takes the GIL to free its Python object: in a
     process that is exiting, Python ends the thread there, inside gloo's C++, which aborts the
-    process. A worker that still holds them at the group's timeout aborts, as a wait does there."""
-    deadline = time.monotonic() + _timeout(group).total_seconds()
+    process. A worker that still holds them at the group's timeout aborts, as a wait does there:
+    the host's real time, as gloo's own timeout is, where the clock stands still in a wait."""
+    deadline = clock._real() + _timeout(group).total_seconds()
     while any(t._use_count() > 1 for t in tensors):
-        if time.monotonic() > deadline:
+        if clock._real() > deadline:
             print(f"mstar_sim: rank {dist.get_rank()}: gloo's worker still holds a finished collective's tensors"
                   f" at the group's timeout ({_timeout(group)}): this torch's gloo keeps its work past the wait.",
                   file=sys.stderr, flush=True)
@@ -314,9 +314,8 @@ def seal(tape: clock.Tape) -> None:
 
 def meet_replay(tape: clock.Tape) -> None:
     """A replay of a graph that captured collectives: meet on each row :func:`seal` left."""
-    with clock.computing():
-        for group, mine in tape.collectives:
-            _meet(group, mine, replay=True)
+    for group, mine in tape.collectives:
+        _meet(group, mine, replay=True)
 
 
 # each collective writes its first argument, but for these

@@ -39,7 +39,7 @@ Then drive it with mstar's own harnesses (`benchmark.runner`, `benchmark/worker_
 | Piece | What | File |
 |---|---|---|
 | Emulated device | `SimTensor` reports `cuda:N`. Small tensors (up to 4096 elements of any dtype, or 1M integers: positions, page tables, lengths, what mstar plans with) keep real values; every other tensor is `meta` (shape and dtype, no data). A host read of a never-computed value reads zeros, so a sampled token is token 0: benchmark with fixed output lengths (`ignore_eos`). | `device.py` |
-| Clock | Per-stream timelines on the host clock. A kernel starts at `max(launch, stream free)` and lasts its predicted time; events, `synchronize`, `.item()`/`.tolist()` and D2H copies wait for the device. The emulator's own CPU time is not counted: the clock stands still while it runs, so a launch is stamped when mstar made the call. A CUDA graph is a tape of nodes recorded at capture: its kernels' costs and its work on the values the emulator keeps. Capture runs nothing; each replay runs the nodes in order, as one launch (a kernel priced from its arguments' values, such as attention over the latest plan, is priced again at each replay). | `clock.py`, `cuda.py` |
+| Clock | One clock per process, which every time source mstar reads (`time.*`, `threading`, `queue`) shows: mstar's own host work at its real cost, device time at its predicted cost, the emulator's time at zero. Per-stream timelines on that clock: a kernel starts at `max(launch, stream free)` and lasts its predicted time; events, `synchronize`, `.item()`/`.tolist()` and D2H copies wait for the device. A wait for the device doesn't sleep: once every thread of the process is in a wait the emulator knows, the clock jumps to the device's time. A CUDA graph is a tape recorded at capture: its kernels' costs and its work on the values the emulator keeps. Capture runs nothing; each replay runs that work in order, as one launch (a kernel priced from its arguments' values, such as attention over the latest plan, is priced again at each replay). | `clock.py`, `waits.py`, `cuda.py` |
 | Kernel times | A profile DB you collect, then AIConfigurator's tables (GEMM, prefill and decode attention, GDN, NCCL and custom all-reduce, per GPU), interpolated in utilization space; a roofline (FLOPs from `torch.utils.flop_counter`, bytes from tensor sizes, datasheet peaks) for anything uncovered. Attention is priced from each request's real query and KV lengths. | `cost.py`, `tables.py`, `gpus.py` |
 | Memory | The simulated card's capacity, accounted as torch's caching allocator does: allocated bytes by storage; reserved bytes per pool, the default one and each graph's private pool, at its high-water mark until `empty_cache` (or until the graph goes); `mem_get_info` and `memory_snapshot` from those. A block is rounded to 512 B and a pool grows by the allocator's segment (2 MiB, 20 MiB, or the block rounded to 2 MiB). A reservation past the card raises `torch.cuda.OutOfMemoryError`. It is a lower bound, per process: the CUDA context, cuBLAS and NCCL workspaces and fragmentation are not counted, and each process sees the whole card, so workers sharing a GPU (MPS) each size from all of it. | `memory.py`, `cuda.py` |
 | Autocast | The engine runs forwards under CUDA autocast, which never sees the emulated tensors' payloads; its cast policy is applied by hand, so matmuls run (and are priced) in the autocast dtype. | `device.py` |
@@ -138,11 +138,14 @@ the roofline.
 
 ## Limits
 
-- **Host time is real time on this box.** mstar's own CPU work (scheduling, planning, Python) runs
-  at this CPU's speed, and the emulator's time is hidden only while the device is busy: a step
-  whose emulation outlasts its device time reads host-bound. A different CPU or a loaded box moves
-  host-bound results; device time is unaffected (the report's `device_busy_s` against `wall_s`
-  says which bound a run was).
+- mstar's own CPU work (scheduling, planning, Python) runs at this CPU's speed, so a different CPU
+  moves host-bound results. A loaded box moves them less: time the box took from the emulator
+  isn't counted, but time it took from mstar's own code is. Device time is unaffected.
+- A thread in a wait the emulator doesn't know (a plain lock, `Thread.join`, a socket) counts as
+  running, so its process sleeps for the device instead of jumping: `--report` counts that time
+  (`slept_s`) and names the call sites (`jump_blockers`).
+- Each process has its own clock: clients and the API server read real time less their own blocked
+  and emulator time, which isn't the workers' time.
 - `--eager-nodes A,B` runs just those nodes eagerly. Use it for a node whose capture needs a real
   Triton build.
 - `--no-graphs` changes admission: without capture buffers the sampler never asks admission for

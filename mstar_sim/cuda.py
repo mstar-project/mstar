@@ -13,7 +13,6 @@ import collections
 import itertools
 import os
 import threading
-import time
 import weakref
 from contextlib import contextmanager
 from types import SimpleNamespace
@@ -281,7 +280,7 @@ class Stream:
 
     def query(self) -> bool:
         _check_fault()
-        return time.perf_counter() >= self.timeline.free_at
+        return clock.now() >= self.timeline.free_at
 
     def synchronize(self) -> None:
         clock.wait_until(self.timeline.free_at)
@@ -368,14 +367,14 @@ class Event:
         # every thread (the recording thread's own virtual time would skew a waiter on
         # another); the timestamp, for elapsed_time, is when the GPU reaches it
         self.t = s.timeline.free_at
-        self.stamp = max(clock.vnow(), self.t)
+        self.stamp = max(clock.now(), self.t)
 
     def wait(self, stream: Stream | None = None) -> None:
         (stream if stream is not None else current_stream()).wait_event(self)
 
     def query(self) -> bool:
         _check_fault()
-        return self.t is None or time.perf_counter() >= self.t
+        return self.t is None or clock.now() >= self.t
 
     def synchronize(self) -> None:
         if self.t is not None:

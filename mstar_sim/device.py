@@ -365,7 +365,7 @@ class _Observe(TorchDispatchMode):
 
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):
         kwargs = kwargs or {}
-        launched = clock.vnow()  # the kernel is launched now; the emulator's time is not device time
+        launched = clock.now()  # the kernel is launched now; the emulator's time is not device time
         in_bounds = _check_bounds(func, args)
         with contextlib.nullcontext() if clock.FAST else clock.computing():
             if self.autocast is not None:
@@ -411,7 +411,7 @@ FAULT: list = ["", 0.0]  # what faulted, and the device time it did
 
 def check_fault() -> None:
     """Raise the device's fault, once the caller's time has reached it."""
-    if FAULT[0] and clock.vnow() >= FAULT[1]:
+    if FAULT[0] and clock.now() >= FAULT[1]:
         raise gpu_error(RuntimeError(f"CUDA error: device-side assert triggered (mstar_sim: {FAULT[0]})"))
 _TAKES_NEGATIVE = {"index", "index_put", "index_put_", "_index_put_impl_", "take", "index_fill", "index_fill_"}
 
@@ -1131,7 +1131,7 @@ def replay(tape: clock.Tape) -> None:
 
         dist.meet_replay(tape)
     clock.STATS["replays"] += 1
-    launched = clock.vnow()  # re-running the work on kept values is the emulator's time, not the host's
+    launched = clock.now()  # re-running the work on kept values is the emulator's time, not the host's
     total, kernels = tape.seconds, tape.kernels
     with contextlib.nullcontext() if clock.FAST else clock.computing(), torch.inference_mode():
         for seconds, effect in tape.nodes:
