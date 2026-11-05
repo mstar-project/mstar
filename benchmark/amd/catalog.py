@@ -111,6 +111,8 @@ ROWS: dict[str, Row] = {r.name: r for r in [
         moe_shapes=QWEN3_OMNI_MOE),
     Row("whisper_large", "asr", "openai/whisper-large-v3", "whisper_large", max_len=448,
         mstar_configs={"mstar-split": "whisper_large_split"}),
+    # Not in the asr table yet: no competitor arm serves it on AMD GPUs. phase_cells and --rows run it.
+    Row("qwen3_asr", "asr", "Qwen/Qwen3-ASR-1.7B", "qwen3_asr"),
     Row("flux2_klein", "image", "black-forest-labs/FLUX.2-klein-4B", "flux2_klein", generator_device="cpu"),
     Row("flux2_klein_9b", "image", "black-forest-labs/FLUX.2-klein-9B", "flux2_klein_9b", generator_device="cpu"),
     Row("z_image_turbo", "image", "Tongyi-MAI/Z-Image-Turbo", "z_image_turbo", generator_device="cpu"),
