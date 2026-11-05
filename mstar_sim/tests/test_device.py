@@ -432,6 +432,13 @@ def test_flashinfers_planner_runs_short_of_a_small_workspace():
             torch.full((256,), 1024, dtype=torch.int32), 256, 256, 8, 8, 16, False, 64, 64, True, -1, -1, False, 0, 0)
         elapsed = time.perf_counter() - began
         assert clock.STATS["host_compute"] - counted > elapsed / 2, (clock.STATS, elapsed)
+        rows = torch.arange(4097, dtype=torch.int32)  # a ragged wrapper prices in its own plan
+        wide = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+            torch.empty(1 << 30, dtype=torch.uint8, device="cuda"), "NHD", backend="fa2")
+        counted, began = clock.STATS["host_compute"], time.perf_counter()
+        wide.plan(rows, rows * 64, 8, 8, 64, causal=True, q_data_type=torch.bfloat16, disable_split_kv=True)
+        elapsed = time.perf_counter() - began
+        assert clock.STATS["host_compute"] - counted > 0.9 * elapsed, (clock.STATS, elapsed)
         # what FlashInfer's plan refuses: a group size with no kernel, a negative length, and
         # several queries a row where the kernels take one
         one_row = torch.tensor([0, 1], **i32), torch.zeros(1, **i32), torch.tensor([3], **i32)

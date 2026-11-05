@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import torch
 
+from mstar_sim import clock
 from mstar_sim.device import gpu_error
 
 from ._paged import (
@@ -177,6 +178,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
     def is_cuda_graph_enabled(self) -> bool:
         return self._use_cuda_graph
 
+    @clock.computing()
     def plan(
         self,
         qo_indptr: torch.Tensor,
