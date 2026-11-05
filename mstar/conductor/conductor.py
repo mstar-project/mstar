@@ -2359,6 +2359,10 @@ class Conductor:
         ):
             if deadlines:
                 due = min(due, deadlines[0][0])
+        lora_ops = getattr(self, "_lora_ops_cache", None)
+        lora_due = None if lora_ops is None else lora_ops.next_deadline()
+        if lora_due is not None:
+            due = min(due, lora_due)
         return max(1, math.ceil((due - time.perf_counter()) * 1000))
 
     def run(self):
