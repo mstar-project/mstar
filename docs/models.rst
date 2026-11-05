@@ -1976,9 +1976,7 @@ gave the same maximum absolute error against a whole-track decode, with RMSE
 2.70e-5 and 2.62e-5 respectively; this is not a general error bound. Only the
 transformer runs over that context; the causal SEANet decoder reruns over 4
 frames before the new ones, its receptive field. A request's audio does not
-depend on how the stream groups its frames. ``python -m
-benchmark.personaplex.sessions`` measures streamed delivery (time to first
-audio, response onset, playback underruns) for concurrent sessions.
+depend on how the stream groups its frames.
 
 Request: ``/generate`` with one audio input (decoded at 24 kHz; **channel 0** is
 used, not a downmix) and output modalities ``audio`` or ``audio`` + ``text``.
@@ -2037,24 +2035,23 @@ implementation on H100 and GH200 GPUs:
   H100 run gave 3.4 seconds of audio per second at one request and 25 at 32.
   Streaming the audio costs an estimated 0 to 8% of throughput, more at higher
   concurrency. In streamed playback (the whole clip uploaded at
-  once, not live input; a 320 ms client buffer), 8 concurrent sessions played
-  without underruns; at 16, 17 of 48 sessions had at least one.
-- ``python -m benchmark.personaplex.sweep`` measures goodput: on one GH200, with
-  N simultaneous sessions of a 17.7 s clip and ``max_batch_size`` N, every session
-  stayed under 10 ms of total stall up to 8 sessions (11.5 seconds of audio per
-  second); from 16 sessions none did. Throughput levelled off at 18 to 22 seconds
-  of audio per second from 32 to 128 sessions. Time to first audio was 2.8 s at
-  one session and 30 s at 128, since conditioning runs before the first frame, so
-  no session met a 200 ms limit. On an 18 s clip, one wave per N, setup (upload,
-  Mimi encode, conditioning and the first generated frame) took 2.6, 4.3 and 9.1 s
-  at 1, 8 and 32 sessions, and the first audio came 63, 190 and 511 ms after it.
+  once, not live input; a 320 ms client buffer), 8 concurrent requests played
+  without underruns; at 16, 17 of 48 requests had at least one.
+- Goodput, on one GH200 with N simultaneous streamed requests of a 17.7 s clip and
+  ``max_batch_size`` N: every request stayed under 10 ms of total stall up to 8
+  requests (11.5 seconds of audio per second); from 16 requests none did. Throughput
+  levelled off at 18 to 22 seconds of audio per second from 32 to 128 requests. Time
+  to first audio was 2.8 s at one request and 30 s at 128, since conditioning runs
+  before the first frame, so no request met a 200 ms limit. On an 18 s clip, one wave
+  per N, setup (upload, Mimi encode, conditioning and the first generated frame) took
+  2.6, 4.3 and 9.1 s at 1, 8 and 32 requests, and the first audio came 63, 190 and
+  511 ms after it.
 - Audio is checked by transcription and by ear. Whisper transcripts of M*'s
   and NVIDIA's responses matched on an English clip (word error rate 0) and
   differed on a second clip, after their tokens diverge. Listening to matched
   pairs, dense attention's output is indistinguishable from NVIDIA's; on the
   paged path the replies start the same, then differ in wording, and both stay
-  coherent. The suite's ``listen.html`` plays the input, NVIDIA's reply and
-  M*'s reply side by side.
+  coherent.
 
 Reference fixtures are generated outside Git by
 ``test/personaplex/reference_oracle.py`` (see

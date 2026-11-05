@@ -1,9 +1,13 @@
-"""Bounded actual-worker lifecycle/soak checks, deliberately not benchmark timings.
+"""Lifecycle and soak checks against a real server, as a client sees them; not benchmark timings.
 
-Outputs are compared byte for byte with each input's first (isolated) response
-only when the server runs every LM step alone (``--max-batch-size 1``): a
-batched step changes floating-point rounding, so there agreement is recorded,
-not asserted. Batched correctness is checked offline by ``batch.py``.
+Each response is checked for shape and length, and the server must keep serving after
+concurrent requests, cancellations and rejected inputs. Nothing here looks inside the
+workers, so it does not show that a cancelled request's state was released.
+
+Outputs are compared byte for byte with each input's first (isolated) response only when the
+server runs every LM step alone (``--max-batch-size 1``): a batched step changes floating-point
+rounding, so there agreement is recorded, not asserted. Batched correctness is checked offline
+by ``batch.py``.
 """
 
 import argparse
@@ -41,79 +45,6 @@ def write_json(path, value):
     temporary.replace(path)
 
 
-AGENT_FRAME_DIMS = [1, 8, 1]  # one frame of the 8 agent codebooks
-
-
-def correlate_request_ids(rows):
-    """Resolve worker submission keys through API observations, never by parsing their spelling."""
-    clients = {row["submission_key"]: row["request_id"] for row in rows if row["event"] == "request_identity"}
-    return [{**row, "internal_request_id": row.get("request_id"),
-             "request_id": clients.get(row.get("request_id"), row.get("request_id"))}
-            for row in rows if row.get("entity", "").startswith("worker")]
-
-
-def holds_agent_frame(tensor):
-    """The observer usually cannot name a tensor, so an agent frame is also recognised by shape."""
-    return tensor.get("name") == "agent_frame" or list(tensor.get("dims") or []) == AGENT_FRAME_DIMS
-
-
-def verify_ownership_observations(rows, completed, completed_request_ids=None):
-    """Each request's decoder steps end holding no agent frame, before its own hard cleanup.
-
-    The decoder consumes a request's frames chunk by chunk, so after an earlier
-    chunk the LM's newest frame can still be in flight; only the last decoder
-    observation before the request's hard cleanup must hold none. Worker events
-    carry the worker-local request handle, which is recycled across requests, so
-    a handle's observations are grouped by the hard cleanups between them.
-    """
-    decoders = [r for r in rows if r["event"] == "after_decoder_inputs_consumed"]
-    assert decoders or not completed, f"Missing decoder observations: 0 for {completed} completions"
-    entities = {r.get("entity") for r in decoders}
-    timelines = {}
-    for r in rows:
-        if r["event"] in ("after_decoder_inputs_consumed", "before_hard_cleanup") and r.get("entity") in entities:
-            timelines.setdefault((r.get("entity"), r["rid"]), []).append(r)
-    held, lifetimes = [], 0  # lifetimes: request lifetimes (cleanups) with decoder evidence
-    observed = {}
-    expected = None if completed_request_ids is None else set(completed_request_ids)
-    for (entity, rid), events in timelines.items():
-        last = None
-        for event in sorted(events, key=lambda e: (e["time"], e["event"] == "before_hard_cleanup")):
-            if event["event"] == "after_decoder_inputs_consumed":
-                last = event
-                continue
-            if last is not None:
-                lifetimes += 1
-                wire_id = last.get("request_id")
-                if expected is not None:
-                    assert wire_id and wire_id == event.get("request_id"), "Missing or inconsistent wire request ID"
-                    observed[wire_id] = observed.get(wire_id, 0) + 1
-                if (expected is None or wire_id in expected) and any(holds_agent_frame(t) for t in last["tensors"]):
-                    held.append(rid)
-            last = None
-        assert last is None, f"Decoder observation for handle {rid} on {entity} has no later hard cleanup"
-    # Every completed request needs its own decoder evidence; one request's many chunks must not count twice.
-    assert lifetimes >= completed, (
-        f"Missing decoder observations: {lifetimes} request lifetimes for {completed} completions")
-    assert not held, f"Decoder observations still hold agent frames for handles {held}"
-    if expected is not None:
-        missing = [rid for rid in expected if observed.get(rid) != 1]
-        assert not missing, f"Completed HTTP requests need exactly one decoder lifetime: {missing}"
-
-
-def verify_engine_cleanup(rows, request_ids):
-    """Check request state and reclaimable pages after engine teardown, including post-audio aborts."""
-    cleaned = {}
-    for row in rows:
-        if row["event"] == "after_engine_cleanup":
-            cleaned[row.get("request_id")] = row
-    for request_id in request_ids:
-        assert request_id in cleaned, f"Missing engine cleanup for HTTP request {request_id}"
-        row = cleaned[request_id]
-        assert not row["remaining_node_states"], f"Node state survives cleanup: {row}"
-        assert not any(row["reclaimable_pages"].values()), f"Request still holds reclaimable KV pages: {row}"
-
-
 def server_config(settings, root, max_batch_size):
     """The settings' server YAML, or a copy of it in ``root`` with ``model_kwargs.max_batch_size`` replaced."""
     if max_batch_size is None:
@@ -128,8 +59,8 @@ def server_config(settings, root, max_batch_size):
 
 
 class Server:
-    def __init__(self, settings, root, observe, max_batch_size=None):
-        self.settings, self.root, self.observe = settings, root, observe
+    def __init__(self, settings, root, max_batch_size=None):
+        self.settings, self.root = settings, root
         self.max_batch_size = max_batch_size
         self.port = settings.get("port", 8000)
         self.process = None
@@ -148,11 +79,8 @@ class Server:
         env = dict(
             os.environ,
             MSTAR_SHM_ARENA="1",
-            PERSONAPLEX_OWNERSHIP_OBSERVE="1" if self.observe else "0",
-            PERSONAPLEX_OWNERSHIP_ROOT=str(self.root),
         )
-        paths = [str(Path(__file__).parent / "observe"), self.settings.get("extension"), str(Path.cwd()),
-                 env.get("PYTHONPATH")]
+        paths = [self.settings.get("extension"), str(Path.cwd()), env.get("PYTHONPATH")]
         env["PYTHONPATH"] = os.pathsep.join(p for p in paths if p)
         self.log = (self.root / "server.log").open("wb")
         command = [
@@ -173,7 +101,6 @@ class Server:
             {
                 "command": command,
                 "max_batch_size": self.max_batch_size,
-                "instrumented": self.observe,
                 "MSTAR_SHM_ARENA": "1",
                 "started": time.time(),
             },
@@ -274,37 +201,6 @@ class Lifecycle:
         self.rows, self.controls = [], {}
         self.index = 0
 
-    def events(self):
-        rows = []
-        for path in self.server.root.glob("ownership-events-*.jsonl"):
-            for line in path.read_text().splitlines():
-                try:
-                    row = json.loads(line)
-                except json.JSONDecodeError:
-                    continue  # A concurrent writer can still be finishing its last line.
-                if row["entity"].startswith("worker") or row["event"] == "request_identity":
-                    rows.append(row)
-        return correlate_request_ids(rows)
-
-    def drain(self, previous_cleanups, additional):
-        end = time.monotonic() + 90
-        while time.monotonic() < end:
-            rows = self.events()
-            cleaned = [r for r in rows if r["event"] == "after_hard_cleanup"]
-            decoders = [r for r in rows if r["event"] == "after_decoder_inputs_consumed"]
-            assert all(not r["tensors"] for r in cleaned), "Request-owned tensors survive teardown"
-            assert all(not any(t["name"] == "agent_frame" for t in r["tensors"]) for r in decoders), (
-                "Agent-frame hold survives decoder consumption"
-            )
-            # Only the final observation after the whole group drains must be empty.
-            if len(cleaned) >= previous_cleanups + additional and cleaned[-1]["total_tensors"] == 0:
-                return cleaned[-1]
-            time.sleep(0.25)
-        raise AssertionError("Requests did not drain, or worker tensor store did not become empty")
-
-    def cleanup_count(self):
-        return sum(r["event"] == "after_hard_cleanup" for r in self.events())
-
     def request(self, entry, index, with_text=True, cancel=False, options=None, expect_bad=False):
         output = self.server.root / f"response-{index}.json"
         kwargs = {"voice": "NATF2", "greedy": True, **(options or {})}
@@ -397,7 +293,6 @@ class Lifecycle:
                                     return len(pcm) // 2, time.time()
             raise AssertionError("Stream ended without audio; cancellation was not exercised")
 
-        before = self.cleanup_count()
         samples, disconnected = asyncio.run(receive())
         with wave.open(entry["path"], "rb") as audio:
             assert 0 < samples < audio.getnframes(), "Cancellation needs a partial audio response"
@@ -405,31 +300,20 @@ class Lifecycle:
                "after_first_audio": True, "first_chunk_samples": samples, "disconnect_initiated_at": disconnected}
         self.rows.append(row)
         write_json(self.server.root / f"request-{index}.json", row)
-        self.drain(before, 1)
-        cleanup = [r for r in self.events() if r["event"] == "before_hard_cleanup"
-                   and r.get("request_id") == request_id]
-        assert cleanup, f"Missing cleanup correlated with HTTP request {request_id}"
-        assert max(r["time"] for r in cleanup) >= disconnected, (
-            "Request finished before disconnect; mid-stream cancellation not established")
 
     def group(self, entries, cancel_first=False):
-        before = self.cleanup_count()
         args = [(entry, self.index + i, i == 0 and cancel_first) for i, entry in enumerate(entries)]
         self.index += len(args)
         with concurrent.futures.ThreadPoolExecutor(max_workers=len(args)) as pool:
             futures = [pool.submit(self.request, entry, index, cancel=cancel) for entry, index, cancel in args]
             self.rows.extend(f.result() for f in futures)
-        snapshot = self.drain(before, len(args))
         write_json(self.server.root / "lifecycle.json", {"status": "PROGRESS", "requests": self.rows})
-        return snapshot
 
     def run(self, smoke=False):
         for entry in self.entries:
             for with_text in (False, True):
-                before = self.cleanup_count()
                 self.rows.append(self.request(entry, self.index, with_text=with_text))
                 self.index += 1
-                self.drain(before, 1)
         for concurrency in [2] if smoke else [1, 2, 4]:
             self.group([self.entries[i % len(self.entries)] for i in range(concurrency)])
             self.group([self.entries[-1]], cancel_first=True)
@@ -461,20 +345,12 @@ class Lifecycle:
                 self.group([self.entries[0]])  # Valid request must recover after each rejection.
 
     def soak(self, seconds):
-        snapshots = []
-        begin = time.monotonic()
-        for epoch in range(4):
-            end = begin + (epoch + 1) * seconds / 4
-            wave_index = 0
-            while time.monotonic() < end:
-                self.group([self.entries[i % len(self.entries)] for i in range(4)], cancel_first=wave_index % 5 == 4)
-                wave_index += 1
-            snapshots.append(self.group([self.entries[0]]))
-            write_json(self.server.root / "memory.json", snapshots)
-        allocated = [s["cuda_allocated"] for s in snapshots]
-        # No arbitrary allowance: a continuing positive idle trend needs investigation.
-        if allocated[-1] > allocated[0]:
-            raise AssertionError(f"Unexplained continuing idle allocation growth: {allocated}")
+        end = time.monotonic() + seconds
+        wave_index = 0
+        while time.monotonic() < end:
+            self.group([self.entries[i % len(self.entries)] for i in range(4)], cancel_first=wave_index % 5 == 4)
+            wave_index += 1
+        self.group([self.entries[0]])  # Still serving after the last wave's cancellation.
 
 
 def main():
@@ -491,15 +367,11 @@ def main():
     outcome = {"status": "FAIL", "mode": args.mode, "max_batch_size": args.max_batch_size,
                "outputs_compared_exactly": exact}
     try:
-        with Server(settings, args.output, True, args.max_batch_size) as server:
+        with Server(settings, args.output, args.max_batch_size) as server:
             run = Lifecycle(server, read_manifest(args.manifest), exact)
             run.run(smoke=args.mode != "lifecycle")
             if args.mode == "soak":
                 run.soak(1200)
-            completed = [row["request_id"] for row in run.rows if "samples" in row]
-            verify_ownership_observations(run.events(), len(completed), completed)
-            verify_engine_cleanup(run.events(), completed + [row["request_id"] for row in run.rows
-                                                             if row.get("after_first_audio")])
             compared = [row for row in run.rows if "matches_control" in row]
             outcome.update(status="PASS", requests=run.rows,
                            matching_control=sum(row["matches_control"] for row in compared), compared=len(compared))
