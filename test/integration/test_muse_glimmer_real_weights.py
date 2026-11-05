@@ -72,8 +72,10 @@ def test_the_replayed_block_loop_matches_the_inline_one():
     )
     runner.size_captures()
     runner.warmup_and_capture({runner._bucket(s) for s in runner.prepare_for_capture()})
-    # what `_replay_block_loop` asks, so the second encode below replays
-    assert runner.can_run(1, row.input_seq_len) and runner.can_lease([row])
+    # what the engine asks before it leases the region for a step
+    assert runner.can_run(1, row.input_seq_len) and runner.can_lease([row], [RID])
+    lease = runner.lease_slot(1, row.input_seq_len)
+    assert lease is not None
 
     def encode(runners: dict) -> torch.Tensor:
         step = None
@@ -83,8 +85,9 @@ def test_the_replayed_block_loop_matches_the_inline_one():
             step.set_ctx(StepContext(request_ids=(RID,), graph_walk=WALK, slot=0, capture=False))
             assert step_runner.admit(step).ok
             step_runner.plan(step)
-        # a declared step keeps the forward inline; a leased replay has none
-        engine_inputs = SimpleNamespace(request_ids=[RID], piecewise_runners=runners, step=step)
+        # leased, `_replay_block_loop` replays; unleased, the loop runs inline
+        leases = {VISION_BLOCK_LOOP: lease} if runners else {}
+        engine_inputs = SimpleNamespace(request_ids=[RID], piecewise_runners=runners, piecewise_leases=leases)
         with torch.no_grad(), autocast_scope(bf16, DEVICE.type):
             out = node.forward_batched(WALK, engine_inputs, **node.preprocess(WALK, None, [row]))
         if step is not None:

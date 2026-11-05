@@ -350,7 +350,7 @@ def _glimmer_encoder(max_segments: int):
 
     encoder = object.__new__(VisionEncoderSubmodule)
     encoder.config = SimpleNamespace(hidden_size=8, head_dim=4)
-    encoder.node_resources = {VISION_ATTN: SimpleNamespace(max_segments_per_request=max_segments)}
+    encoder.node_resources = {VISION_ATTN: SimpleNamespace(max_segments_per_step=max_segments)}
     return encoder
 
 
@@ -378,12 +378,15 @@ def test_glimmer_leases_and_replays_both_layouts():
 
     ran = {}
     runner = SimpleNamespace(
-        can_run=lambda batch_size, total_tokens: True,
         run=lambda **kwargs: ran.update(kwargs) or SimpleNamespace(get_view=lambda name: "replayed"),
     )
     hidden = torch.zeros(8, 8)
-    engine_inputs = SimpleNamespace(piecewise_runners={VISION_BLOCK_LOOP: runner}, request_ids=["r"], step=None)
+    engine_inputs = SimpleNamespace(
+        piecewise_runners={VISION_BLOCK_LOOP: runner}, piecewise_leases={VISION_BLOCK_LOOP: object()},
+        request_ids=["r"],
+    )
     lengths = {VISION_WINDOW: (4, 4), VISION_FULL: (8,)}
-    assert encoder._replay_block_loop(engine_inputs, hidden, hidden, hidden, lengths) == "replayed"
+    replayed = encoder._replay_block_loop(engine_inputs, hidden, hidden, hidden, lengths)
+    assert replayed.get_view("hidden") == "replayed"
     assert ran["seq_lens"] == [8]
     assert ran["label_seq_lens"] == {VISION_WINDOW: [4, 4], VISION_FULL: [8]}
