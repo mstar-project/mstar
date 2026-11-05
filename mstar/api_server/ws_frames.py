@@ -39,11 +39,11 @@ from mstar.utils.orphan import watch_parent
 logger = logging.getLogger(__name__)
 
 # A frame this long goes to the pool, whose round trip blocks the loop for a
-# millisecond or so and adds a few to this frame's own wait. A text frame costs
+# millisecond or so and adds to this frame's own wait, more with size. A text frame costs
 # the loop about 6 ms per MiB (JSON parse and base64 decode), so from 1 MiB up the
 # pool is cheaper for everyone. A binary frame costs it far less, since msgpack
 # only copies its files' bytes: measured, the pool added 2, 5 and 18 ms to the
-# frame's wait at 1, 4 and 16 MiB to save under 2 ms of lag, and at 32 MiB about
+# frame's wait at 1, 4 and 16 MiB to save at most about 2 ms of lag, and at 32 MiB about
 # 24 ms to save about 15, so a binary frame goes to the pool from 32 MiB.
 OFF_LOOP_TEXT_BYTES = 1 << 20
 OFF_LOOP_BINARY_BYTES = 32 << 20
