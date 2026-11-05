@@ -9,6 +9,7 @@ from mstar.engine.resources.attn.base import (
     AttentionWrapper,
     EagerSlotKey,
     PlanCacheKey,
+    flashinfer_kwargs,
     resolve_attn_backend,
 )
 from mstar.engine.resources.attn.config import (
@@ -71,7 +72,9 @@ class CrossAttentionManager(AttentionResource):
     def build(cls, spec: CrossAttentionSpec, info: EngineResourceInfo):
         # the context cache's own head counts; see AttentionManager.build
         kv_config = info.dependency(spec.config.kv_cache).config
-        backend = resolve_attn_backend(spec.config.backend, info.device)
+        backend = resolve_attn_backend(
+            spec.config.backend, info.device, kv_config.tokens_per_page,
+        )
         kv_config.shard(info.head_shards)
         if backend == AttnBackend.FLASHINFER:
             return FlashInferCrossManager(
@@ -81,74 +84,26 @@ class CrossAttentionManager(AttentionResource):
                 device=info.device,
                 dtype=info.kv_dtype,
                 kv_config=kv_config,
-                backend=spec.config.flashinfer_backend,
-                decode_tensor_cores=spec.config.decode_tensor_cores,
+                **flashinfer_kwargs(
+                    kv_config, spec.config.flashinfer_backend, spec.config.decode_tensor_cores,
+                ),
+            )
+        if backend == AttnBackend.AITER:
+            from mstar.engine.resources.attn.aiter import AiterCrossManager
+
+            return AiterCrossManager(
+                kv_cache=spec.config.kv_cache,
+                query_kv_cache=spec.config.query_kv_cache,
+                context_label=spec.config.context_label,
+                device=info.device,
+                dtype=info.kv_dtype,
+                kv_config=kv_config,
             )
         raise ValueError(f"Unknown cross attention backend {backend!r}")
 
-
-class FlashInferCrossManager(CrossAttentionManager):
-    """non-causal paged attention over fixed encoder context
-
-    context is an ordinary kv stream so requires no additional storage
-    or allocation on part of attention manager
-
-    encode step writes context via normal `Segment` on cache, and later
-    steps use `span=0` on that label
-
-    wrapper is planned per decoder plan label and run is keyed on that label
-    a la `FlashInferManager`"""
-
-    def __init__(
-        self,
-        kv_cache: str,
-        query_kv_cache: str | None,
-        context_label: str,
-        device: torch.device,
-        dtype: torch.dtype,
-        kv_config: PagedKVConfig,
-        backend: str = "auto",
-        decode_tensor_cores: bool = True,
-    ):
-        self._kv_cache_name = kv_cache
-        self._query_kv_cache_name = query_kv_cache
-        self._decode_tensor_cores = decode_tensor_cores
-        self._context_label = context_label
-        self._device = device
-        self._dtype = dtype
-
-        # decoder plan label -> wrapper
-        self._current_plan_states: dict[str, AttentionWrapper] = {}
-        # persistent wrappers [we can keep eager ones]
-        self._eager_plan_states: dict[EagerSlotKey, AttentionWrapper] = {}
-        self._cg_plan_states: dict[CGSlotKey, AttentionWrapper] = {}
-
-        self._preplan_states: dict[str, AttentionWrapper] = {}
-        self._preplanned = False
-        # wrapper key (EagerSlotKey, or CGSlotKey under capture) -> its last plan
-        self._last_plans: dict[Any, _LastPlan] = {}
-
-        self._kv_config = kv_config
-        self._wrapper_kv_kwargs = dict(
-            num_qo_heads=kv_config.num_qo_heads,
-            num_kv_heads=kv_config.num_kv_heads,
-            head_dim=kv_config.head_dim,
-            page_size=kv_config.tokens_per_page,
-            max_num_pages=kv_config.max_num_pages,
-            device=device,
-            backend=backend
-        )
-
-        self._workspaces = WorkspacePool(device, owner=kv_cache)
-
-    def resident_refusal(self) -> str | None:
-        if self._query_kv_cache_name == self._kv_cache_name:
-            return "a context in the query's own pool would be a second stream on one resident row"
-        return None
-
-    def resident_gather(self, step: "CapturedResidentStep") -> None:
-        # the context pool's row is read only, and this plans its views on the host
-        step.host_planned = True
+    # Context views and query packing are the same for every kernel. Each
+    # backend sets ``_kv_cache_name``, ``_query_kv_cache_name``,
+    # ``_context_label`` and ``_kv_config``.
 
     def depends_on(self):
         # a query side with no cache contributes no dependency: its packing
@@ -161,104 +116,6 @@ class FlashInferCrossManager(CrossAttentionManager):
     def context_cache_key(self) -> str:
         """label of kv resource holding context so x-attention can find cache to read"""
         return self._kv_cache_name
-
-    @property
-    def supports_preplan(self):
-        return True
-
-    @property
-    def force_double_buffer(self):
-        # same pinned staging inside FlashInfer's plan as the self-attention
-        # manager; see `FlashInferManager.force_double_buffer`
-        return True
-
-    def plan(self, step: AttentionStep, ctx: StepContext):
-        refuse_context_only(step, type(self).__name__)
-        self.reset_default_cursors()
-        lease = ctx.slot_lease
-        assert not ctx.is_preplan or lease is not None, (
-            "preplan requires a captured graph step: an eager wrapper shares its "
-            "workspace with the captured one on the same slot"
-        )
-        assert not (self._preplanned and ctx.is_preplan), (
-            "cross attention preplan is already pending; clear_preplan before "
-            "planning a different step ahead"
-        )
-        if self._preplanned:
-            self._current_plan_states = self._preplan_states
-            self._preplan_states = {}
-            self._preplanned = False
-            return
-
-        laps = PhaseLaps(f"{ctx.plan_phase}.cross_attn.")
-        context_out = self._context_output(ctx)
-        context_views = None
-        context_rids = None
-        # a preplan leases a different cg slot, so its wrappers and workspaces
-        # are disjoint from the ones the in-flight forward reads
-        plan_states = self._preplan_states if ctx.is_preplan else self._current_plan_states
-
-        plan_states.clear()
-        packings = self._query_packings(step, ctx)
-        laps.lap("packing")
-        for plan_label, packing in packings.items():
-            qo_indptr = tuple(packing.qo_indptr.tolist())
-            num_rows = len(qo_indptr) - 1
-            # every row queries one token (a span-0 row does not)
-            decode = not ctx.force_prefill and qo_indptr == tuple(range(num_rows + 1))
-            state_key, wrapper = self._wrapper_for(
-                plan_label, lease, num_rows=num_rows, slot=ctx.slot, decode=decode,
-            )
-            request_ids = tuple(packing.request_ids)
-            last = self._last_plans.get(state_key)
-            if (
-                last is not None and last.context is context_out
-                and last.request_ids == request_ids and last.qo_indptr == qo_indptr
-            ):
-                plan_states[plan_label] = wrapper
-                laps.lap("unchanged")
-                continue
-            if context_rids is None and context_out.columns is not None:
-                context_rids = tuple(row[0] for row in context_out.rows)
-            if request_ids == context_rids:
-                indptrs = self._context_indptrs(packing, context_out.columns)
-            else:
-                if context_views is None:
-                    context_views = {view.request_id: view for view in context_out.views}
-                indptrs = self._build_indptrs(packing, context_views)
-            # fork repeats pages, so batch can index more than held in cache.
-            assert len(indptrs.paged_kv_indices) <= self._kv_config.max_num_pages, (
-                f"cross attention plan {plan_label!r} indexes {len(indptrs.paged_kv_indices)} "
-                f"pages but the context cache holds {self._kv_config.max_num_pages}; "
-                "raise max_num_pages on the context cache's PagedKVConfig"
-            )
-            laps.lap("indptrs" if request_ids == context_rids else "indptrs_views")
-
-            # The context pages are immutable once written, so only the query
-            # side moves between steps; when neither moved, FlashInfer's plan
-            # is skippable. Every tensor here is on CPU.
-            plan_key = PlanCacheKey(
-                q_seq_lens=qo_indptr,
-                page_indices=indptrs.paged_kv_indices.numpy().tobytes(),
-                last_page_lens=indptrs.paged_kv_last_page_len.numpy().tobytes(),
-            )
-            laps.lap("plan_key")
-            if last is None or last.plan_key != plan_key:
-                wrapper.plan(
-                    causal=False,
-                    dtype=self._dtype,
-                    **indptrs.to_kwargs_dict()
-                )
-                laps.lap("wrapper_plan")
-            self._last_plans[state_key] = _LastPlan(context_out, request_ids, qo_indptr, plan_key)
-            plan_states[plan_label] = wrapper
-
-        self._preplanned = ctx.is_preplan
-
-    def clear_preplan(self):
-        # rebind rather than clear: a consumed preplan dict is the live one
-        self._preplanned = False
-        self._preplan_states = {}
 
     def _context_output(self, ctx: StepContext):
         """The context label's KV plan output (its views are each request's
@@ -278,6 +135,10 @@ class FlashInferCrossManager(CrossAttentionManager):
             f"that label. planned: {sorted(plan_outputs)}"
         )
         return kv_out
+
+    def _context_views(self, ctx: StepContext) -> dict[str, SequenceView]:
+        """The context stream of each request in the batch, by request id."""
+        return {view.request_id: view for view in self._context_output(ctx).views}
 
     def _query_packings(
         self, step: AttentionStep, ctx: StepContext
@@ -407,6 +268,168 @@ class FlashInferCrossManager(CrossAttentionManager):
             paged_kv_last_page_len=torch.from_numpy(np.array(last_page_lens, np.int32)),
             kv_lens=torch.from_numpy(np.array(kv_lens, np.int32)).as_subclass(HostLens),
         )
+
+
+class FlashInferCrossManager(CrossAttentionManager):
+    """non-causal paged attention over fixed encoder context
+
+    context is an ordinary kv stream so requires no additional storage
+    or allocation on part of attention manager
+
+    encode step writes context via normal `Segment` on cache, and later
+    steps use `span=0` on that label
+
+    wrapper is planned per decoder plan label and run is keyed on that label
+    a la `FlashInferManager`"""
+
+    def __init__(
+        self,
+        kv_cache: str,
+        query_kv_cache: str | None,
+        context_label: str,
+        device: torch.device,
+        dtype: torch.dtype,
+        kv_config: PagedKVConfig,
+        backend: str = "auto",
+        decode_tensor_cores: bool = True,
+    ):
+        self._kv_cache_name = kv_cache
+        self._query_kv_cache_name = query_kv_cache
+        self._decode_tensor_cores = decode_tensor_cores
+        self._context_label = context_label
+        self._device = device
+        self._dtype = dtype
+
+        # decoder plan label -> wrapper
+        self._current_plan_states: dict[str, AttentionWrapper] = {}
+        # persistent wrappers [we can keep eager ones]
+        self._eager_plan_states: dict[EagerSlotKey, AttentionWrapper] = {}
+        self._cg_plan_states: dict[CGSlotKey, AttentionWrapper] = {}
+
+        self._preplan_states: dict[str, AttentionWrapper] = {}
+        self._preplanned = False
+        # wrapper key (EagerSlotKey, or CGSlotKey under capture) -> its last plan
+        self._last_plans: dict[Any, _LastPlan] = {}
+
+        self._kv_config = kv_config
+        self._wrapper_kv_kwargs = dict(
+            num_qo_heads=kv_config.num_qo_heads,
+            num_kv_heads=kv_config.num_kv_heads,
+            head_dim=kv_config.head_dim,
+            page_size=kv_config.tokens_per_page,
+            max_num_pages=kv_config.max_num_pages,
+            device=device,
+            backend=backend
+        )
+
+        self._workspaces = WorkspacePool(device, owner=kv_cache)
+
+    def resident_refusal(self) -> str | None:
+        if self._query_kv_cache_name == self._kv_cache_name:
+            return "a context in the query's own pool would be a second stream on one resident row"
+        return None
+
+    def resident_gather(self, step: "CapturedResidentStep") -> None:
+        # the context pool's row is read only, and this plans its views on the host
+        step.host_planned = True
+
+    @property
+    def supports_preplan(self):
+        return True
+
+    @property
+    def force_double_buffer(self):
+        # same pinned staging inside FlashInfer's plan as the self-attention
+        # manager; see `FlashInferManager.force_double_buffer`
+        return True
+
+    def plan(self, step: AttentionStep, ctx: StepContext):
+        refuse_context_only(step, type(self).__name__)
+        self.reset_default_cursors()
+        lease = ctx.slot_lease
+        assert not ctx.is_preplan or lease is not None, (
+            "preplan requires a captured graph step: an eager wrapper shares its "
+            "workspace with the captured one on the same slot"
+        )
+        assert not (self._preplanned and ctx.is_preplan), (
+            "cross attention preplan is already pending; clear_preplan before "
+            "planning a different step ahead"
+        )
+        if self._preplanned:
+            self._current_plan_states = self._preplan_states
+            self._preplan_states = {}
+            self._preplanned = False
+            return
+
+        laps = PhaseLaps(f"{ctx.plan_phase}.cross_attn.")
+        context_out = self._context_output(ctx)
+        context_views = None
+        context_rids = None
+        # a preplan leases a different cg slot, so its wrappers and workspaces
+        # are disjoint from the ones the in-flight forward reads
+        plan_states = self._preplan_states if ctx.is_preplan else self._current_plan_states
+
+        plan_states.clear()
+        packings = self._query_packings(step, ctx)
+        laps.lap("packing")
+        for plan_label, packing in packings.items():
+            qo_indptr = tuple(packing.qo_indptr.tolist())
+            num_rows = len(qo_indptr) - 1
+            # every row queries one token (a span-0 row does not)
+            decode = not ctx.force_prefill and qo_indptr == tuple(range(num_rows + 1))
+            state_key, wrapper = self._wrapper_for(
+                plan_label, lease, num_rows=num_rows, slot=ctx.slot, decode=decode,
+            )
+            request_ids = tuple(packing.request_ids)
+            last = self._last_plans.get(state_key)
+            if (
+                last is not None and last.context is context_out
+                and last.request_ids == request_ids and last.qo_indptr == qo_indptr
+            ):
+                plan_states[plan_label] = wrapper
+                laps.lap("unchanged")
+                continue
+            if context_rids is None and context_out.columns is not None:
+                context_rids = tuple(row[0] for row in context_out.rows)
+            if request_ids == context_rids:
+                indptrs = self._context_indptrs(packing, context_out.columns)
+            else:
+                if context_views is None:
+                    context_views = {view.request_id: view for view in context_out.views}
+                indptrs = self._build_indptrs(packing, context_views)
+            # fork repeats pages, so batch can index more than held in cache.
+            assert len(indptrs.paged_kv_indices) <= self._kv_config.max_num_pages, (
+                f"cross attention plan {plan_label!r} indexes {len(indptrs.paged_kv_indices)} "
+                f"pages but the context cache holds {self._kv_config.max_num_pages}; "
+                "raise max_num_pages on the context cache's PagedKVConfig"
+            )
+            laps.lap("indptrs" if request_ids == context_rids else "indptrs_views")
+
+            # The context pages are immutable once written, so only the query
+            # side moves between steps; when neither moved, FlashInfer's plan
+            # is skippable. Every tensor here is on CPU.
+            plan_key = PlanCacheKey(
+                q_seq_lens=qo_indptr,
+                page_indices=indptrs.paged_kv_indices.numpy().tobytes(),
+                last_page_lens=indptrs.paged_kv_last_page_len.numpy().tobytes(),
+            )
+            laps.lap("plan_key")
+            if last is None or last.plan_key != plan_key:
+                wrapper.plan(
+                    causal=False,
+                    dtype=self._dtype,
+                    **indptrs.to_kwargs_dict()
+                )
+                laps.lap("wrapper_plan")
+            self._last_plans[state_key] = _LastPlan(context_out, request_ids, qo_indptr, plan_key)
+            plan_states[plan_label] = wrapper
+
+        self._preplanned = ctx.is_preplan
+
+    def clear_preplan(self):
+        # rebind rather than clear: a consumed preplan dict is the live one
+        self._preplanned = False
+        self._preplan_states = {}
 
     def _wrapper_for(
         self, plan_label: str, lease: SlotLease | None, num_rows: int, slot: int,

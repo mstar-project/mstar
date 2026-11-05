@@ -234,7 +234,9 @@ Notes
   ``moe_gemm`` table for the GPU (``mstar/kernels/tables/moe_gemm/``) when it has
   the expert shape, and default tiles otherwise. The server logs the sweep command
   for each shape it serves untuned; see "Tuned kernel configs" in :doc:`adding_models`.
+  On AMD GPUs the sweep tunes Triton's HIP compiler options too.
 - To add a new family, see :doc:`adding_models`.
+- For AMD GPUs, see `Running on AMD GPUs`_.
 
 OmniVoice notes
 ~~~~~~~~~~~~~~~
@@ -404,6 +406,28 @@ BAGEL notes
   ``graph_walks`` names these walks: ``LLM_cfg_text`` and ``combine_cfg`` both,
   ``LLM_cfg_img`` only ``image_gen_cfg3``.
 
+Qwen3-Omni MoE backend notes
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+- The Thinker's and Talker's routed experts run on mstar's Triton fused-MoE
+  kernels. On AMD Instinct GPUs a deployment can run them on AITER's fused MoE
+  instead, whose kernels read the expert weights re-tiled once at load. Set it in the
+  serving config's ``model_kwargs:`` block. It's read once when the model is
+  built, so a request's own ``model_kwargs`` can't change it::
+
+      model_kwargs:
+        moe_backend: aiter    # auto (default, Triton) | triton | aiter
+
+  ``aiter`` needs each rank's expert intermediate size to be a multiple of 128
+  (the Talker's experts at TP2 are not) and refuses to start otherwise. Its
+  output isn't bitwise reproducible (identical calls differ in the last bits),
+  so greedy decoding can flip near-tied tokens and repeated requests may not
+  match. The Triton kernels are reproducible.
+- The Triton kernels take their tiles from the ``moe_gemm`` table for the GPU
+  (``mstar/kernels/tables/moe_gemm/``); tables ship for MI300X and MI325X at the
+  Thinker's and Talker's expert sizes without TP or EP, swept with Triton's AMD
+  compiler options (``waves_per_eu``, ``matrix_instr_nonkdim``, ``kpack``).
+
 Qwen3.5 / Qwen3.8 (``qwen3_5_*``, ``qwen3_8_27b``)
 --------------------------------------------------
 
@@ -496,6 +520,12 @@ reproduces across server processes and the cold start more than halves. One-row
 decode pays for that at the larger sizes (c=1 at 9B on B300: 270 against 286 tok/s;
 at 27B TP4 on H200: 151 against 169) and gains at 4B on B300 (372 against 353); from
 c=4 up it makes no difference.
+On AMD GPUs the gated DeltaNet layers run AITER's kernels (``linear_attn.backend:
+auto``): FlyDSL decode, a chunked eager prefill, and for captured prefill
+buckets up to ``linear_attn.max_captured_prefill_tokens`` (512 by default) a
+sequential kernel; text and vision prefill buckets above that run eagerly. Prefix
+caching is off for these layers on AMD GPUs: AITER's kernels keep no state checkpoints,
+so the recurrent pool keeps no snapshot slots and the node's caches stay shut.
 
 ``temperature``, ``top_p``, ``max_tokens`` and ``seed`` are the standard fields.
 ``repetition_penalty`` and ``enable_thinking`` (default true; the template opens
@@ -1300,15 +1330,19 @@ Cosmos3 environment requirements
 --------------------------------
 
 - ``flashinfer`` is required: it is the paged KV/attention backend used by the
-  prefill, the captured CUDA graphs, and multi-request batches.
+  prefill, the captured CUDA graphs, and multi-request batches. On AMD GPUs the
+  paged backend is AITER's, but the non-causal denoise steps run on AMD's
+  FlashInfer build, so both are needed.
 - The default denoise attention backend is ``dense_gen``
   (``Cosmos3Config.attention_backend``), which runs bs=1 eager generation
-  attention as one FlashAttention-3 varlen kernel from the ``fa3-fwd`` wheel
-  (AITER's varlen kernel on ROCm).
-  That wheel is ABI-tied to the installed torch/CUDA build (Hopper builds
-  exist for at least torch 2.9 + cu12.8 and torch 2.11 + cu13.0); install the
-  one matching your environment. It ships kernels for sm_80 and sm_90a only.
-  Where it is not importable or has no kernel for the GPU (Blackwell), the
+  attention as one varlen kernel: FlashAttention-3 from the ``fa3-fwd`` wheel on
+  NVIDIA, AITER's ``flash_attn_varlen_func`` on AMD GPUs.
+  The ``fa3-fwd`` wheel is ABI-tied to the installed torch/CUDA build (Hopper
+  builds exist for at least torch 2.9 + cu12.8 and torch 2.11 + cu13.0); install
+  the one matching your environment. It ships kernels for sm_80 and sm_90a only.
+  On AMD GPUs install AITER's release wheel, whose prebuilt kernels keep the first
+  denoise request from waiting on a kernel build.
+  Where fa3-fwd is not importable or has no kernel for the GPU (Blackwell), the
   same dense pass runs on FlashInfer's ragged prefill, whose ``auto`` kernel on
   a B300 is CUTLASS's FMHA: 1.5 ms per layer for the 832x480x121 guidance pair
   against 6.3 ms for the paged prefill. ``resources: attn_gen:
@@ -1317,9 +1351,10 @@ Cosmos3 environment requirements
   FlashInfer build cannot run (a typo, ``fa3`` on Blackwell, ``cutlass`` on
   Hopper) stops it with a ``ValueError`` naming the backend.
   Without a usable FlashInfer either, the engine logs a warning and switches to
-  the paged backend, but that is FlashInfer too (the default backend on every
-  platform for now), so it cannot run there either: the dense pass needs
-  fa3-fwd (AITER on ROCm) or FlashInfer.
+  the paged backend AUTO picks. On NVIDIA that is FlashInfer too, so it cannot run
+  there either: the dense pass needs fa3-fwd or FlashInfer. On AMD GPUs it is the
+  platform's paged backend, so serving still works and only the bs=1 dense fast
+  path is lost.
   ``model_kwargs.attention_backend: flashinfer`` in the config YAML selects the
   paged backend explicitly.
 - Video-input requests (video-to-video, action inverse-dynamics) decode the
@@ -1632,7 +1667,7 @@ Generation knobs (per request, via ``model_kwargs`` or the request body):
 **The ÷32 rule.** Height and width must each be an exact multiple of **32**:
 a pixel dimension is downsampled 16x by the VAE and then patchified 2x by the
 DiT, and only exact multiples survive both. So ``720x1280`` is **not** a valid
-size for this model (720/32 = 22.5) — the 720p-class tier is **704**x1280. An
+size for this model (720/32 = 22.5) — the 720p-class tier is **704x1280**. An
 unaligned size is rejected at the request seam with a 400 naming the rule and
 the nearest valid sizes, because it has no clean failure deeper in: the two
 paths round the latent extent differently and the DiT dies mid-forward.
@@ -1929,3 +1964,61 @@ own scaling follows PEFT: an ``alpha`` key in the weights, else the ``lora_alpha
 fused result — M* merges in fp32 with one rounding, PEFT fuses in bf16).
 A DoRA adapter (PEFT's ``lora_magnitude_vector`` or Kohya's ``dora_scale``) is refused,
 since its magnitudes would be dropped from the merge.
+
+Running on AMD GPUs
+-------------------
+
+Models use the same code and configs on AMD Instinct MI300X/MI325X (``gfx942``), and the
+engine picks ROCm kernels for them (see :ref:`architecture:Hardware platforms` and
+:ref:`installation:ROCm (AMD Instinct MI300X/MI325X, gfx942)`). The table lists what has
+been run on an MI300X and checked against a reference. "Not yet run" means nobody has
+checked, not that it fails.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 22 16 62
+
+   * - Model
+     - Status
+     - Notes
+   * - ``kokoro``
+     - Works
+     - ``kokoro.yaml``. On 40 TTS prompts the Whisper word error rate of its speech
+       matched the reference ``kokoro`` package's (1.97%).
+   * - ``orpheus``
+     - Works
+     - ``orpheus_colocated.yaml`` (one GPU). On 40 prompts its WER was 1.75%, against
+       1.97% for the Hugging Face reference. Attention runs on AITER, and norms, RoPE and
+       sampling on AMD's FlashInfer. ``orpheus.yaml`` (two GPUs) and ``orpheus_tp2.yaml``
+       haven't been run.
+   * - ``qwen3_tts``
+     - Works
+     - ``qwen3tts.yaml`` (0.6B CustomVoice). 96 requests at concurrency 16 all succeeded,
+       and Whisper got one word wrong across 10 sampled outputs. The 1.7B configs
+       haven't been run.
+   * - ``qwen3_5_{0.8,2,4,9}b``
+     - Works, text only
+     - One GPU. Greedy output matched Hugging Face transformers over the first 64 tokens
+       on 7, 7, 5 and 8 of 8 prompts (0.8B, 2B, 4B, 9B). Every mismatch started where
+       transformers' own bf16 logits for the top two tokens were tied. Image input,
+       ``qwen3_5_9b_tp2``, ``qwen3_5_27b_tp4`` and ``qwen3_8_27b`` haven't been run.
+   * - ``whisper_large``
+     - Not yet
+     - Transcription requests fail while decoding the audio, which needs ``torchcodec``.
+       torchcodec has no ROCm build.
+   * - ``cosmos3`` and its variants
+     - Not yet run
+     - Dense attention's AITER kernel matches an fp32 reference, but no full model run
+       has been checked yet.
+   * - ``bagel``, ``chatterbox``, ``flux2_klein``, ``higgs_audio``, ``nemotron_duplex``,
+       ``omnivoice``, ``pi05``, ``qwen3_omni``, ``vjepa2``, ``wan22``, ``waypoint``,
+       ``z_image_turbo``
+     - Not yet run
+     -
+
+A few things apply to every model on AMD GPUs:
+
+- Only single-GPU configs have been run so far. Tensor-parallel ones, including the fused
+  all-reduce + RMSNorm, haven't been checked on AMD GPUs yet.
+- The first start compiles a lot. With empty caches on a 16-vCPU MI300X VM it took about
+  4 minutes for Kokoro and 17 to 24 for Orpheus.

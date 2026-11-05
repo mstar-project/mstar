@@ -505,8 +505,10 @@ Snapshots stay off without ``prefix_slots``, and also above one rank, without a 
 cache, when that cache isn't on every node of the pool, or when its ``prefix_cache`` is
 off or can't open at the pool's world size; in those cases the pool allocates no snapshot
 slots. Neither does a pool whose cache the engine keeps shut for another reason, such as a
-model that names no checkpoint and sets no salt. Every cache on the node of a pool without
-snapshots stays shut, and the engine logs which pool kept it shut.
+model that names no checkpoint and sets no salt, or a resource over the pool that can't
+write its snapshots, as AITER's GDN kernels on AMD GPUs can't (they keep no state
+checkpoints; ``NodeResourceSpec.restore_refusal`` says so). Every cache on the node of a
+pool without snapshots stays shut, and the engine logs which pool kept it shut.
 ``opening_prefix_caches`` in ``mstar/engine/resources/kv/config.py`` is that rule over the
 specs. The engine evaluates it once, before it builds any resource, and opens exactly the
 caches it returns of those it holds; the conductor's routing and the API server's prompt
@@ -642,24 +644,30 @@ The spec types are:
    * - ``AttentionSpec(config=AttentionConfig(kv_cache=...))``
      - Self-attention planned over the named cache. ``backend`` selects
        ``AttnBackend.AUTO`` (the default, which lets the engine pick the platform's
-       paged backend, FlashInfer for now), ``AttnBackend.FLASHINFER``,
+       paged backend), ``AttnBackend.FLASHINFER``, ``AttnBackend.AITER``,
        ``AttnBackend.DENSE``, ``AttnBackend.FLEX`` or ``AttnBackend.FLASHINFER_MLA``.
-       Leave it at ``AUTO`` unless the model needs a specific kernel. FlashInfer, dense
-       and MLA attention require a ``PagedKVConfig``; FlexAttention requires a
-       ``RingKVConfig``. ``DENSE`` runs one varlen pass over each stream's frozen
-       prefix (gathered from the pages once) and the step's fresh K/V, eager only:
-       FA3 (AITER on ROCm), or FlashInfer's ragged prefill where FA3 has no kernel for
-       the GPU, the same choice the ragged resources make (``dense_or_flashinfer``), with
-       ``flashinfer_backend`` picking its kernel. The engine plans and runs a tiny layout on
-       that kernel when it builds the resource, so a backend the GPU or FlashInfer build
-       cannot run stops the server with a ``ValueError`` naming it. Its wrappers share one
-       workspace, taken at build.
+       Leave it at ``AUTO`` unless the model needs a specific kernel. ``AUTO`` is
+       FlashInfer on NVIDIA. On AMD GPUs it is AITER's unified attention, except at
+       power-of-two page sizes up to 64, where that kernel reads the tail of a page
+       unmasked and ``AUTO`` picks AMD's FlashInfer build if it is installed.
+       FlashInfer on ROCm runs its ``fa2`` kernels. The AITER kernel is causal only, so
+       a non-causal step with more than one query per row runs on AMD's FlashInfer
+       build, which then has to be installed. FlashInfer, AITER, dense and MLA attention
+       require a ``PagedKVConfig``, and FlexAttention requires a ``RingKVConfig``.
+       ``DENSE`` runs one varlen pass over each stream's frozen prefix (gathered from the
+       pages once) and the step's fresh K/V, eager only: FA3 (AITER on ROCm), or
+       FlashInfer's ragged prefill where FA3 has no kernel for the GPU, the same choice the
+       ragged resources make (``dense_or_flashinfer``), with ``flashinfer_backend`` picking
+       its kernel. The engine plans and runs a tiny layout on that kernel when it builds the
+       resource, so a backend the GPU or FlashInfer build cannot run stops the server with a
+       ``ValueError`` naming it. Its wrappers share one workspace, taken at build.
        ``flashinfer_backend`` selects a kernel generation: ``"auto"``, ``"fa2"`` or
        ``"fa3"`` when the FlashInfer backend is selected. ``decode_tensor_cores``
        (default ``True``) runs one-token decode rows on FlashInfer's tensor-core
        kernel; ``False`` picks the CUDA-core decode kernel, which can be faster for
        MHA and narrow GQA (few query heads per KV head). Measure before changing it:
-       Whisper, Qwen3-ASR and Qwen3-TTS declare ``False``. ``decode_fmha`` (default ``False``) runs
+       Whisper, Qwen3-ASR and Qwen3-TTS declare ``False``. On AMD GPUs the platform decides it
+       from the GQA group instead (``flashinfer_kwargs``). ``decode_fmha`` (default ``False``) runs
        captured one-token decode rows on FlashInfer's trtllm-gen fmha kernel on Blackwell,
        with no FlashInfer plan per step; a geometry trtllm-gen has no kernel for keeps
        the paged kernel, with a warning. Eager steps and prompt rows stay on the paged
@@ -717,8 +725,9 @@ The spec types are:
        prefix caching cover them, and selection gets fixed-shape buffers so decode captures.
    * - ``CrossAttentionSpec(config=CrossAttentionConfig(...))``
      - Attention over a paged context that is written once and never extended.
-       ``backend`` defaults to ``AttnBackend.AUTO``. Only FlashInfer is implemented.
-       A step whose rows each query one token runs FlashInfer's decode kernel, and
+       ``backend`` defaults to ``AttnBackend.AUTO``, resolved as for
+       ``AttentionSpec``. FlashInfer and AITER are implemented. On FlashInfer, a step
+       whose rows each query one token runs the decode kernel, and
        ``decode_tensor_cores`` picks its variant as for ``AttentionConfig``.
        See `Cross-attention (encoder-decoder models)`_.
    * - ``RaggedAttentionSpec(config=RaggedAttentionConfig(...))``
@@ -726,9 +735,9 @@ The spec types are:
        forward. Nothing is paged, and nothing carries to the next step.
        ``RaggedAttentionConfig`` holds ``num_qo_heads``, ``num_kv_heads`` and
        ``head_dim`` (all pre-sharding, as in ``KVConfig``), an ``sm_scale`` that
-       defaults to ``head_dim ** -0.5``, ``backend`` (``RaggedAttnBackend.AUTO``, the
-       default, ``RaggedAttnBackend.FLASHINFER``, or ``RaggedAttnBackend.DENSE``),
-       ``flashinfer_backend``, the
+       defaults to ``head_dim ** -0.5``, ``backend`` (``RaggedAttnBackend.AUTO`` by
+       default, which is FlashInfer on NVIDIA and AITER's varlen flash attention on
+       AMD GPUs, or ``FLASHINFER`` / ``AITER`` / ``DENSE``), ``flashinfer_backend``, the
        two CUDA-graph ceilings ``max_segments_per_request`` (``max_segments_per_step``
        for a ``one_row_per_step`` region) and
        ``max_tokens_per_request``, ``compile_op``, ``shard_over_sp`` and
@@ -766,6 +775,15 @@ The spec types are:
        kernel must turn. A model with learned position
        embeddings also declares this spec, because it needs the position counter. Such a
        model never applies RoPE.
+   * - ``LinearAttnSpec(config=LinearAttnConfig(recurrent_state=..., variant=...))``
+     - The linear-attention layers' kernels, planned against the named pool:
+       ``LinearAttnVariant.GDN`` or ``MAMBA2``. ``backend`` selects the GDN kernels:
+       ``LinearAttnBackend.AUTO`` (the default: AITER's on an AMD GPU, FlashInfer's
+       elsewhere), ``FLASHINFER`` or ``AITER``. Mamba-2 runs M*'s own Triton kernels
+       under every backend. AITER's chunked prefill builds its schedule on the host,
+       so a prefill capture bucket larger than ``max_captured_prefill_tokens`` (512
+       by default) runs eagerly; smaller ones capture a sequential kernel whose cost
+       grows with the longest row.
    * - ``SamplerSpec(vocab_size=..., enable_repetion_penalty=...)``
      - A sampler with its own per-request parameter buffers, philox stream, and optional
        seen-token mask. ``enable_repetion_penalty`` declares a capability, not an
@@ -818,6 +836,12 @@ The spec types are:
        Returned from ``get_lora_specs`` (one per node), not this list, and built only
        when the serving YAML has a ``resources: lora:`` block. See `Per-request LoRA
        adapters`_.
+
+The ``backend`` fields above default to ``auto``. Leave them there unless the model
+needs a particular kernel. The engine picks the platform's kernels when it builds the
+resource, and :ref:`architecture:Hardware platforms` lists what ``auto`` turns into on
+NVIDIA and AMD GPUs. A deployment can still pin a backend in its YAML (see `Tuning
+resources per deployment`_).
 
 Orpheus declares four specs for its one autoregressive node. Its ``snac_decoder`` node
 appears in no spec, so it receives no resources:
@@ -2139,6 +2163,11 @@ BAGEL shows the case of two captures for one walk. It captures ``decode`` twice,
 with guidance enabled and a decode step with guidance disabled declare different segments
 over the same token count. BAGEL's ``cg_key_info`` reports which of the two a batch is.
 
+A resource can also turn a bucket down. If its kernel can't run some bucket inside a
+graph (AITER's chunked GDN prefill on AMD GPUs, for one), ``Resource.capture_refusal``
+returns the reason, the runner logs it and skips that capture, and the bucket runs
+eagerly. ``MSTAR_REQUIRE_ACCELERATOR_GRAPHS=1`` counts a refused bucket as a failed one.
+
 Piecewise CUDA graphs (capturing an inner loop)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -2422,18 +2451,22 @@ that a misspelled setting is never silently ignored:
        ``max_slots`` counts the sink unless ``disable_sink_slot``; a value that leaves no
        slot for a request is refused at startup.
    * - ``AttentionSpec``
-     - ``backend`` (``auto`` / ``flashinfer`` / ``dense`` / ``flex`` / ``xpu_paged``),
-       ``flashinfer_backend`` (``auto`` / ``fa2`` / ``fa3``), ``decode_tensor_cores``
-       (``true`` / ``false``), ``decode_fmha`` (``true`` / ``false``)
+     - ``backend`` (``auto`` / ``flashinfer`` / ``aiter`` / ``dense`` / ``flex`` /
+       ``xpu_paged``), ``flashinfer_backend`` (``auto`` / ``fa2`` / ``fa3``),
+       ``decode_tensor_cores`` (``true`` / ``false``), ``decode_fmha`` (``true`` / ``false``)
    * - ``CrossAttentionSpec``
-     - ``backend`` (``auto`` / ``flashinfer``), ``flashinfer_backend``
+     - ``backend`` (``auto`` / ``flashinfer`` / ``aiter``), ``flashinfer_backend``
        (``auto`` / ``fa2`` / ``fa3``), ``decode_tensor_cores`` (``true`` / ``false``)
    * - ``RaggedAttentionSpec``
-     - ``backend`` (``auto`` / ``flashinfer``), ``flashinfer_backend``
+     - ``backend`` (``auto`` / ``flashinfer`` / ``aiter``), ``flashinfer_backend``
        (``auto`` / ``fa2`` / ``fa3``), ``max_segments_per_request``,
        ``max_segments_per_step``, ``max_tokens_per_request``. The ceilings size CUDA-graph
        buckets, which is a memory-against-coverage trade the deployment makes, not the model.
        A resource sized per step refuses ``max_segments_per_request``, which it would ignore.
+   * - ``LinearAttnSpec``
+     - ``backend`` (``auto`` / ``flashinfer`` / ``aiter``; ``auto`` is the platform's
+       default), ``max_captured_prefill_tokens`` (AITER only: the largest prefill
+       capture bucket; larger buckets run eagerly)
    * - ``LoraSpec``
      - ``max_slots`` (adapters resident on the device at once, beside the zero adapter),
        ``max_rank`` (the largest rank served; slots are sized to it), ``cpu_capacity``

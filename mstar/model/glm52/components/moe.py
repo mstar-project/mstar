@@ -18,6 +18,7 @@ from mstar.model.components.moe import (
     _down_proj_weight_loader,
     _gate_up_fp8_weight_loader,
     _gate_up_weight_loader,
+    _make_experts_backend,
     dispatch_experts_fused,
 )
 from mstar.model.glm52.config import KERNELS, Glm52ModelConfig
@@ -142,6 +143,10 @@ class Glm52SparseMoeBlock(nn.Module):
                     config.n_routed_experts, config.hidden_size, shard_inter,
                 )
             )
+            # the fused kernels of the single-rank path, as the shared MoE blocks pick theirs
+            self.experts_backend = _make_experts_backend(
+                "auto", config.n_routed_experts, shard_inter, config.hidden_size, config.num_experts_per_tok,
+            )
         self._attach_expert_weight_loaders()
 
         # kernels: auto sums the shared and routed partials and reduces once; sum-then-reduce
@@ -241,6 +246,7 @@ class Glm52SparseMoeBlock(nn.Module):
                 self.num_experts,
                 topk_ids,
                 topk_weights,
+                self.experts_backend,
             )
         else:
             routed = dispatch_experts_fused(

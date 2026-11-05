@@ -19,7 +19,7 @@ High-level components
   submodules on the GPU. It compiles forwards, captures CUDA graphs, batches requests, and
   runs each step's resource lifecycle: admit, plan, forward, commit.
 - **Resources** (``mstar/engine/resources/``): the state that a node's compute uses. This
-  includes paged KV caches, the attention planned over them (FlashInfer or dense),
+  includes paged KV caches, the attention planned over them (FlashInfer, AITER or dense),
   cross-attention over a fixed context, cacheless (ragged) attention for encoder towers
   that attend within one packed forward, recurrent state pools and the linear attention
   planned over them (gated DeltaNet, for hybrid models whose non-KV layers carry a
@@ -78,3 +78,146 @@ Execution flow (simplified)
    and admits each step's resource work around the forward pass. Workers then route the
    output tensors to downstream nodes and workers.
 4. Outputs marked for the client are post-processed (``postprocess``) and streamed back.
+
+Hardware platforms
+------------------
+
+M* runs on NVIDIA GPUs (CUDA), AMD Instinct GPUs (ROCm) and, for some models, Intel GPUs
+(XPU). Model code is the same everywhere. Platform differences stay in the engine's
+resources, which pick their kernels when they're built.
+
+``mstar.platforms.current_platform`` says which stack a process runs on (``is_cuda()``,
+``is_rocm()``, ``is_xpu()``, ``is_cpu()``) and the GPU's architecture (``arch()``, e.g.
+``sm_90`` or ``gfx942``). Ask it instead of reading ``torch.version.hip`` or a compute
+capability. PyTorch's ROCm build calls AMD GPUs ``cuda`` devices and reports an MI300X as
+compute capability 9.4, so neither says who made the GPU. ``device.type == "cuda"`` is
+still the right check for "is this a GPU". Each process resolves the platform on first
+use and keeps it. Workers are spawned, so each one resolves its own.
+
+Kernel choice per resource
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Resource configs default their ``backend`` to ``auto``, which the resource turns into a
+kernel library once, in ``build``. On NVIDIA ``auto`` is what M* has always run. A
+backend named in the model or in the deployment YAML (``resources:`` overrides, see
+:ref:`adding_models:Tuning resources per deployment`) is used as named, and a backend that
+can't run on the platform fails at startup. Dense attention is the exception. Without its
+kernel it falls back to the paged backend and logs a warning. Ops with no ``backend``
+field (norms, RoPE, sampling) pick their kernel by platform on first call.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 24 34 42
+
+   * - Resource
+     - NVIDIA
+     - AMD (ROCm)
+   * - Paged attention (``AttentionSpec``)
+     - FlashInfer
+     - AITER's Triton unified attention. At a power-of-two page size of 64 or less it
+       uses AMD's FlashInfer build (``fa2``) when that's installed, because AITER's kernel
+       reads the tail of a row's last page without masking it there. Non-causal steps
+       with more than one query per row (DiT denoise, prefix-LM) also go to FlashInfer's
+       ``fa2``, since AITER's kernel is causal only.
+   * - Cross-attention (``CrossAttentionSpec``)
+     - FlashInfer
+     - AITER's unified attention, one kernel row per query token, with the same page
+       size rule
+   * - Dense attention (``backend: dense``)
+     - FlashAttention-3 (``fa3-fwd``)
+     - AITER's ``flash_attn_varlen_func``
+   * - Ragged and ragged-cross attention (``RaggedAttentionSpec``,
+       ``RaggedCrossAttentionSpec``)
+     - FlashInfer's ragged prefill
+     - AITER's ``flash_attn_varlen_func``, or AMD's FlashInfer if AITER is missing
+   * - Flex attention (``backend: flex``)
+     - ``flash-attn-4`` if it imports, else Triton (``MSTAR_FLEX_BACKEND``)
+     - Same rule, so Triton (``flash-attn-4`` is NVIDIA only)
+   * - Gated DeltaNet (``LinearAttnSpec``)
+     - FlashInfer's GDN kernels
+     - AITER. Chunked prefill runs eagerly, captured prefill buckets use a sequential
+       kernel, decode uses FlyDSL (``gfx942``/``gfx950``) or the sequential kernel.
+   * - Mamba-2 and causal conv1d
+     - M*'s Triton kernels
+     - The same kernels, without programmatic dependent launch (Hopper and newer only)
+   * - ``mstar::rms_norm``
+     - FlashInfer
+     - AMD's FlashInfer
+   * - Fused add + RMSNorm (``RMSNorm.forward_residual``)
+     - FlashInfer's ``fused_add_rmsnorm``, called directly
+     - AMD's FlashInfer, through the ``mstar::fused_add_rms_norm`` op
+   * - RoPE (``mstar::rope_apply_qk_inplace``)
+     - FlashInfer, angles computed in the kernel
+     - AMD's FlashInfer, reading an fp32 cos/sin cache that ``PositionManager`` builds
+       from ``PositionConfig``. A layer that passes other RoPE arguments gets the
+       in-kernel version.
+   * - Sampler (``SamplerSpec``)
+     - FlashInfer's samplers with per-row seed and offset tensors
+     - AMD's FlashInfer, same calls
+   * - TP all-reduce + add + RMSNorm (``mstar::allreduce_add_rmsnorm``)
+     - FlashInfer's ``allreduce_fusion``
+     - AITER's custom all-reduce with its fused RMSNorm (one-stage kernel, TP 2/4/8,
+       up to 80 tokens and fewer at TP4/TP8, AITER 0.1.19.post1 or newer). Anything
+       else gets RCCL plus a separate norm.
+
+When nothing on ROCm can serve a resource (neither AITER nor AMD's FlashInfer imports),
+the worker fails at startup and the error says what to install.
+
+Adding a backend
+~~~~~~~~~~~~~~~~
+
+There are a few places to plug in a new kernel library or platform. None of them run per
+step.
+
+- **The resource's backend enum.** Add a value and the class that runs the new kernels,
+  in its own module that imports the library lazily. Then teach the resource's resolver
+  (``resolve_attn_backend``, ``resolve_ragged_attn_backend``,
+  ``resolve_linear_attn_backend``) when ``auto`` should pick it. The resolver is the only
+  place that maps ``auto`` to a kernel.
+- **PlatformDispatch** (``mstar.platforms.dispatch``). On ROCm torch runs a custom op's
+  ``cuda`` kernel too, so an op whose ``cuda`` kernel has to call a different library
+  per vendor wraps the call in ``PlatformDispatch(name, cuda=...,
+  rocm=..., xpu=..., cpu=..., default=...)``. Each argument is a zero-argument factory that
+  imports the library and returns the function. The first call picks one and later calls
+  go straight to it. ``mstar::rms_norm``, the RoPE op, the samplers and the all-reduce
+  fusion work this way.
+- **Inductor settings.** The engine wraps each ``torch.compile`` it does in
+  ``with_inductor_overrides(fn, num_tokens)``, which patches in
+  ``current_platform.inductor_overrides(num_tokens)`` (``num_tokens`` is the capture
+  bucket's token count). No platform sets any today. An override should come with a
+  measured win.
+- **Process environment.** ``Platform.process_env_defaults()`` is applied with
+  ``os.environ.setdefault`` in the conductor before it spawns workers, so values you
+  export win. It's empty on every platform today.
+- **Capture refusal.** A resource whose kernel can't run some capture bucket inside a
+  graph returns a reason from ``Resource.capture_refusal(spec)``. Both graph runners ask
+  before capturing, and a refused bucket runs eagerly. Answer from the spec and the
+  resource's config only, never per-rank state, so every rank refuses the same buckets.
+
+Capture and compile on ROCm
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+CUDA graphs on ROCm are hipGraphs, captured and replayed through ``torch.cuda.graph`` with
+the same capture configs as on NVIDIA. ``torch.compile`` settings are the same too. The
+differences are in what each kernel can do inside a graph.
+
+- AITER's chunked GDN prefill builds its chunk schedule on the host, so it can't be
+  captured. Prefill buckets up to ``linear_attn.max_captured_prefill_tokens`` (512 by
+  default) are captured with a sequential kernel whose cost grows with the longest row.
+  Larger buckets are refused and run eagerly. Decode is always captured.
+- AITER's paged attention stages its block table from pinned host memory into static
+  buffers kept per bucket, slot and label. It also pins the kernel's ``max_seqlen`` hints
+  per bucket, so a replay runs the kernel variant its capture recorded.
+- Dense attention never runs under capture, on any platform.
+- AMD's FlashInfer samplers raise when traced by dynamo, so M* calls them through
+  ``torch.compiler.disable``. Captured graphs still draw fresh numbers on each replay
+  from the seed and offset tensors.
+- Under TP every capture runs inside the TP group's ``graph_capture()`` scope. With the
+  AITER all-reduce fusion it registers the buffers the capture recorded, on every rank.
+  Elsewhere it does nothing.
+- After warmup on NVIDIA, ``reset_device_scheduling`` creates and destroys a throwaway
+  CUDA context to undo late graph-node launches. It goes through the CUDA driver, so it
+  does nothing on ROCm.
+- Kernels compile during warmup, before capture. AITER ships most of its kernels prebuilt
+  in its release wheel, and FlyDSL and FlashInfer compile theirs the first time they
+  see a new configuration. Cold starts take minutes, see :doc:`installation`.
