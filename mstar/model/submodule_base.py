@@ -268,6 +268,22 @@ class StopPolicy:
         )
 
 
+def _clone_buffer(value, clones: dict[int, torch.Tensor]):
+    """``value`` cloned, a tensor once however many names it is under
+    (``clones``: by id). A module function: a nested one that called itself
+    would be a reference cycle, freed only by the collector, every step."""
+    if isinstance(value, torch.Tensor):
+        if id(value) not in clones:
+            clones[id(value)] = value.clone()
+        return clones[id(value)]
+    if isinstance(value, list):
+        return [x.clone() if isinstance(x, torch.Tensor) else x for x in value]
+    if isinstance(value, dict):
+        return {k: _clone_buffer(v, clones) for k, v in value.items()}
+    # pass anything else through: dropping it could lose a stop signal
+    return value
+
+
 @dataclass
 class BatchedModelOutput:
     """A step's outputs, split by how they are addressed.
@@ -374,21 +390,7 @@ class BatchedModelOutput:
             if name in rows and isinstance(clone, torch.Tensor)
         }
 
-        def _clone(value):
-            if isinstance(value, torch.Tensor):
-                if id(value) not in clones:
-                    clones[id(value)] = value.clone()
-                return clones[id(value)]
-            if isinstance(value, list):
-                return [
-                    x.clone() if isinstance(x, torch.Tensor) else x for x in value
-                ]
-            if isinstance(value, dict):
-                return {k: _clone(v) for k, v in value.items()}
-            # pass anything else through: dropping it could lose a stop signal
-            return value
-
-        return {k: _clone(v) for k, v in self.check_stop_buffers.items()}
+        return {k: _clone_buffer(v, clones) for k, v in self.check_stop_buffers.items()}
 
     def clone_row_outputs(self, num_rows: int) -> dict[str, torch.Tensor]:
         """One clone per row-addressed batch tensor, narrowed to the real rows

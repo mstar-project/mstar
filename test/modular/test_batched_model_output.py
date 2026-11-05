@@ -312,3 +312,25 @@ def test_staged_rows_land_a_tensor_under_two_names_once(accelerator_device):
     worker._stage_host_rows(out)
     host = out.host_rows.buffers
     assert host["text_inputs"] is host["new_token"], "one tensor was copied to the host twice"
+
+
+def test_cloning_the_stop_buffers_leaves_nothing_for_the_collector():
+    """A step that clones its stop buffers made a reference cycle (a nested
+    function calling itself), which held the clones until a collection."""
+    import gc
+
+    import torch
+
+    from mstar.model.submodule_base import BatchedModelOutput
+
+    out = BatchedModelOutput(check_stop_buffers={"t": torch.zeros(4, 2), "nested": {"u": torch.ones(4)}})
+    gc.collect()
+    was = gc.isenabled()
+    gc.disable()
+    try:
+        for _ in range(10):
+            out.clone_check_stop_buffers()
+        assert gc.collect() == 0
+    finally:
+        if was:
+            gc.enable()
