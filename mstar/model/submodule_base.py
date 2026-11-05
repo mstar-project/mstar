@@ -116,6 +116,8 @@ class DeviceLoopback(NamedTuple):
     sampler: str
     # the row-addressed output (``check_stop_buffers`` entry) holding the token
     buffer: str
+    # the forward input the token feeds (a key of ``preprocess``'s output)
+    input: str = "input_ids"
 
 
 class StopCheck(NamedTuple):
@@ -1108,7 +1110,8 @@ class NodeSubmodule(torch.nn.Module, ABC):
 
     def repeat_carry(self, graph_walk: str) -> tuple[str, str] | None:
         """What carries a replay of this walk's capture to the next, as (stop
-        buffer, static input); None when the walk's step can't repeat."""
+        buffer, static input); None when the walk's step can't repeat.
+        ``ARNodeSubmodule`` derives it from ``DeviceLoopback``."""
         del graph_walk
         return None
 
@@ -1118,7 +1121,10 @@ class NodeSubmodule(torch.nn.Module, ABC):
         resource, one stream that takes one token a row or one it only reads
         (span 0), with no forks or retention, and its `preprocess` reads no
         planned position or KV location: the forward's graph fills those in.
-        The engine still refuses if a resource can't."""
+        The engine still refuses if a resource can't. A step of one may repeat
+        (``max_step_repeats``), and only the loop-back token moves between its
+        replays (``repeat_carry``), so every other input of the walk must be the
+        same each iteration."""
         return frozenset()
 
     def step_is_input_free(self, graph_walk: str) -> bool:
@@ -1559,7 +1565,7 @@ class ARNodeSubmodule(NodeSubmodule):
         return super().device_loopback_signals(graph_walk)
 
     def repeat_carry(self, graph_walk: str) -> tuple[str, str] | None:
-        return (self.device_loopback.buffer, "input_ids") if self._loops_back(graph_walk) else None
+        return (self.device_loopback.buffer, self.device_loopback.input) if self._loops_back(graph_walk) else None
 
     def inline_client_signals(self, graph_walk: str) -> dict[str, str]:
         # the client's copy of the token the stop check already has on the host
@@ -1579,13 +1585,14 @@ class ARNodeSubmodule(NodeSubmodule):
         override its slot's."""
         sampler = engine_inputs.resources[self.device_loopback.sampler]
         rids = engine_inputs.request_ids
-        out = {"input_ids": sampler.loopback_tokens(rids)}
+        key = self.device_loopback.input
+        out = {key: sampler.loopback_tokens(rids)}
         out.update((name, sampler.loopback_state(name, rids)) for name in states)
         routed = [i for i, inp in enumerate(inputs) if inp.input_ids is not None and inp.input_seq_len]
         if routed:
             sampler.overwrite_rows(
                 routed,
-                (out["input_ids"], torch.cat([inputs[i].input_ids for i in routed])),
+                (out[key], torch.cat([inputs[i].input_ids for i in routed])),
                 *((out[name], torch.stack([inputs[i].tensor_inputs[name] for i in routed])) for name in states),
             )
         return out
