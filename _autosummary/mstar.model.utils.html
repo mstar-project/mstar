@@ -319,6 +319,15 @@
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.glm52.weight_loader.html">mstar.model.glm52.weight_loader</a></li>
 </ul>
 </details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="mstar.model.glm5_next.html">mstar.model.glm5_next</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.glm5_next.components.html">mstar.model.glm5_next.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.glm5_next.config.html">mstar.model.glm5_next.config</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.glm5_next.fused_decode.html">mstar.model.glm5_next.fused_decode</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.glm5_next.mhc.html">mstar.model.glm5_next.mhc</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.glm5_next.sinkhorn_kernel.html">mstar.model.glm5_next.sinkhorn_kernel</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.glm5_next.weight_loader.html">mstar.model.glm5_next.weight_loader</a></li>
+</ul>
+</details></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="mstar.model.higgs_audio.html">mstar.model.higgs_audio</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.higgs_audio.components.html">mstar.model.higgs_audio.components</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.higgs_audio.config.html">mstar.model.higgs_audio.config</a></li>
@@ -739,12 +748,16 @@
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.utils.check_kv_pools_fit"><code class="docutils literal notranslate"><span class="pre">check_kv_pools_fit()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.utils.check_loaded"><code class="docutils literal notranslate"><span class="pre">check_loaded()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.utils.drop_stop_tokens"><code class="docutils literal notranslate"><span class="pre">drop_stop_tokens()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.utils.fast_tokenizer_from_snapshot"><code class="docutils literal notranslate"><span class="pre">fast_tokenizer_from_snapshot()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.utils.kv_pages"><code class="docutils literal notranslate"><span class="pre">kv_pages()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.utils.load_generation_defaults"><code class="docutils literal notranslate"><span class="pre">load_generation_defaults()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.utils.load_snapshot_tokenizer"><code class="docutils literal notranslate"><span class="pre">load_snapshot_tokenizer()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.utils.load_weights"><code class="docutils literal notranslate"><span class="pre">load_weights()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.utils.load_weights_from_file"><code class="docutils literal notranslate"><span class="pre">load_weights_from_file()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.utils.load_weights_from_hf_shards"><code class="docutils literal notranslate"><span class="pre">load_weights_from_hf_shards()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.utils.process_weights_after_loading"><code class="docutils literal notranslate"><span class="pre">process_weights_after_loading()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.utils.read_fp8_block_quant_config"><code class="docutils literal notranslate"><span class="pre">read_fp8_block_quant_config()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.utils.resolve_checkpoint"><code class="docutils literal notranslate"><span class="pre">resolve_checkpoint()</span></code></a></li>
 </ul>
             </nav>
         </div>
@@ -776,11 +789,17 @@
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.utils.drop_stop_tokens" title="mstar.model.utils.drop_stop_tokens"><code class="xref py py-obj docutils literal notranslate"><span class="pre">drop_stop_tokens</span></code></a>(output, stop_token_ids, ...)</p></td>
 <td><p>Drop the stop tokens that ended a text reply, unless the request sets <code class="docutils literal notranslate"><span class="pre">ignore_eos</span></code>.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.utils.kv_pages" title="mstar.model.utils.kv_pages"><code class="xref py py-obj docutils literal notranslate"><span class="pre">kv_pages</span></code></a>(tokens, page_size, requests)</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.utils.fast_tokenizer_from_snapshot" title="mstar.model.utils.fast_tokenizer_from_snapshot"><code class="xref py py-obj docutils literal notranslate"><span class="pre">fast_tokenizer_from_snapshot</span></code></a>(source)</p></td>
+<td><p>A fast tokenizer from <code class="docutils literal notranslate"><span class="pre">tokenizer.json</span></code>, which is version-independent, with the snapshot's chat template and the special tokens <code class="docutils literal notranslate"><span class="pre">tokenizer_config.json</span></code> declares.</p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.utils.kv_pages" title="mstar.model.utils.kv_pages"><code class="xref py py-obj docutils literal notranslate"><span class="pre">kv_pages</span></code></a>(tokens, page_size, requests)</p></td>
 <td><p>Pages for <code class="docutils literal notranslate"><span class="pre">requests</span></code> sequences of <code class="docutils literal notranslate"><span class="pre">tokens</span></code> each, plus the sink page every KV cache keeps out of circulation.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.utils.load_generation_defaults" title="mstar.model.utils.load_generation_defaults"><code class="xref py py-obj docutils literal notranslate"><span class="pre">load_generation_defaults</span></code></a>(checkpoint_dir[, ...])</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.utils.load_generation_defaults" title="mstar.model.utils.load_generation_defaults"><code class="xref py py-obj docutils literal notranslate"><span class="pre">load_generation_defaults</span></code></a>(checkpoint_dir[, ...])</p></td>
 <td><p>The sampling defaults <code class="docutils literal notranslate"><span class="pre">checkpoint_dir/generation_config.json</span></code> declares.</p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.utils.load_snapshot_tokenizer" title="mstar.model.utils.load_snapshot_tokenizer"><code class="xref py py-obj docutils literal notranslate"><span class="pre">load_snapshot_tokenizer</span></code></a>(model_path_hf[, ...])</p></td>
+<td><p>The checkpoint's tokenizer, through <code class="docutils literal notranslate"><span class="pre">AutoTokenizer</span></code> or, where transformers 4.x cannot build the backend class a transformers-5 <code class="docutils literal notranslate"><span class="pre">tokenizer_config.json</span></code> names, <code class="docutils literal notranslate"><span class="pre">fast_tokenizer_from_snapshot</span></code>.</p></td>
 </tr>
 <tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.utils.load_weights" title="mstar.model.utils.load_weights"><code class="xref py py-obj docutils literal notranslate"><span class="pre">load_weights</span></code></a>(state_dict, module[, prefix, ...])</p></td>
 <td><p></p></td>
@@ -793,6 +812,12 @@
 </tr>
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.utils.process_weights_after_loading" title="mstar.model.utils.process_weights_after_loading"><code class="xref py py-obj docutils literal notranslate"><span class="pre">process_weights_after_loading</span></code></a>(root, device)</p></td>
 <td><p>Finalize kernel layouts across a freshly loaded module tree: any submodule exposing <code class="docutils literal notranslate"><span class="pre">process_weights_after_loading(device)</span></code> gets it called (the attention layers build their absorbed w_kc/w_vc here).</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.utils.read_fp8_block_quant_config" title="mstar.model.utils.read_fp8_block_quant_config"><code class="xref py py-obj docutils literal notranslate"><span class="pre">read_fp8_block_quant_config</span></code></a>(checkpoint_dir)</p></td>
+<td><p>The <code class="docutils literal notranslate"><span class="pre">Fp8BlockQuantConfig</span></code> in <code class="docutils literal notranslate"><span class="pre">checkpoint_dir/config.json</span></code>, or None: no file, none declared, or unreadable (the weights then load as they are, bf16).</p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.utils.resolve_checkpoint" title="mstar.model.utils.resolve_checkpoint"><code class="xref py py-obj docutils literal notranslate"><span class="pre">resolve_checkpoint</span></code></a>(model_path_hf[, cache_dir])</p></td>
+<td><p>A local checkpoint directory as given, a Hub id as its snapshot (fetched if not cached), None for no path.</p></td>
 </tr>
 </tbody>
 </table>
@@ -1211,6 +1236,18 @@ nothing and stays, one chunk per token.</p>
 </dd></dl>
 
 <dl class="py function">
+<dt class="sig sig-object py" id="mstar.model.utils.fast_tokenizer_from_snapshot">
+<span class="sig-prename descclassname"><span class="pre">mstar.model.utils.</span></span><span class="sig-name descname"><span class="pre">fast_tokenizer_from_snapshot</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">source</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/utils.html#fast_tokenizer_from_snapshot"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.utils.fast_tokenizer_from_snapshot" title="Link to this definition">#</a></dt>
+<dd><p>A fast tokenizer from <code class="docutils literal notranslate"><span class="pre">tokenizer.json</span></code>, which is version-independent, with the
+snapshot’s chat template and the special tokens <code class="docutils literal notranslate"><span class="pre">tokenizer_config.json</span></code> declares.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>source</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
 <dt class="sig sig-object py" id="mstar.model.utils.kv_pages">
 <span class="sig-prename descclassname"><span class="pre">mstar.model.utils.</span></span><span class="sig-name descname"><span class="pre">kv_pages</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">tokens</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">page_size</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">requests</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/utils.html#kv_pages"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.utils.kv_pages" title="Link to this definition">#</a></dt>
 <dd><p>Pages for <code class="docutils literal notranslate"><span class="pre">requests</span></code> sequences of <code class="docutils literal notranslate"><span class="pre">tokens</span></code> each, plus the sink page
@@ -1248,6 +1285,22 @@ Returns <code class="docutils literal notranslate"><span class="pre">{}</span></
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
 <dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)">dict</a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="mstar.model.utils.load_snapshot_tokenizer">
+<span class="sig-prename descclassname"><span class="pre">mstar.model.utils.</span></span><span class="sig-name descname"><span class="pre">load_snapshot_tokenizer</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">model_path_hf</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">cache_dir</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/utils.html#load_snapshot_tokenizer"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.utils.load_snapshot_tokenizer" title="Link to this definition">#</a></dt>
+<dd><p>The checkpoint’s tokenizer, through <code class="docutils literal notranslate"><span class="pre">AutoTokenizer</span></code> or, where transformers 4.x
+cannot build the backend class a transformers-5 <code class="docutils literal notranslate"><span class="pre">tokenizer_config.json</span></code> names,
+<code class="docutils literal notranslate"><span class="pre">fast_tokenizer_from_snapshot</span></code>.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>model_path_hf</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>cache_dir</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em> | </em><em>None</em>)</p></li>
+</ul>
 </dd>
 </dl>
 </dd></dl>
@@ -1316,6 +1369,36 @@ their absorbed w_kc/w_vc here).</p>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
 <dd class="field-even"><p>None</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="mstar.model.utils.read_fp8_block_quant_config">
+<span class="sig-prename descclassname"><span class="pre">mstar.model.utils.</span></span><span class="sig-name descname"><span class="pre">read_fp8_block_quant_config</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">checkpoint_dir</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/utils.html#read_fp8_block_quant_config"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.utils.read_fp8_block_quant_config" title="Link to this definition">#</a></dt>
+<dd><p>The <code class="docutils literal notranslate"><span class="pre">Fp8BlockQuantConfig</span></code> in <code class="docutils literal notranslate"><span class="pre">checkpoint_dir/config.json</span></code>, or None: no file, none
+declared, or unreadable (the weights then load as they are, bf16).</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>checkpoint_dir</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="mstar.model.utils.resolve_checkpoint">
+<span class="sig-prename descclassname"><span class="pre">mstar.model.utils.</span></span><span class="sig-name descname"><span class="pre">resolve_checkpoint</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">model_path_hf</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">cache_dir</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/utils.html#resolve_checkpoint"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.utils.resolve_checkpoint" title="Link to this definition">#</a></dt>
+<dd><p>A local checkpoint directory as given, a Hub id as its snapshot (fetched if not cached),
+None for no path.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>model_path_hf</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em> | </em><em>None</em>)</p></li>
+<li><p><strong>cache_dir</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em> | </em><em>None</em>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)">str</a> | None</p>
 </dd>
 </dl>
 </dd></dl>
@@ -1419,12 +1502,16 @@ their absorbed w_kc/w_vc here).</p>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.utils.check_kv_pools_fit"><code class="docutils literal notranslate"><span class="pre">check_kv_pools_fit()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.utils.check_loaded"><code class="docutils literal notranslate"><span class="pre">check_loaded()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.utils.drop_stop_tokens"><code class="docutils literal notranslate"><span class="pre">drop_stop_tokens()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.utils.fast_tokenizer_from_snapshot"><code class="docutils literal notranslate"><span class="pre">fast_tokenizer_from_snapshot()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.utils.kv_pages"><code class="docutils literal notranslate"><span class="pre">kv_pages()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.utils.load_generation_defaults"><code class="docutils literal notranslate"><span class="pre">load_generation_defaults()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.utils.load_snapshot_tokenizer"><code class="docutils literal notranslate"><span class="pre">load_snapshot_tokenizer()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.utils.load_weights"><code class="docutils literal notranslate"><span class="pre">load_weights()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.utils.load_weights_from_file"><code class="docutils literal notranslate"><span class="pre">load_weights_from_file()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.utils.load_weights_from_hf_shards"><code class="docutils literal notranslate"><span class="pre">load_weights_from_hf_shards()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.utils.process_weights_after_loading"><code class="docutils literal notranslate"><span class="pre">process_weights_after_loading()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.utils.read_fp8_block_quant_config"><code class="docutils literal notranslate"><span class="pre">read_fp8_block_quant_config()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.utils.resolve_checkpoint"><code class="docutils literal notranslate"><span class="pre">resolve_checkpoint()</span></code></a></li>
 </ul>
   </nav></div>
 

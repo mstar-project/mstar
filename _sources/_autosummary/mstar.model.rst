@@ -39,6 +39,7 @@
    fish_s2_pro
    flux2_klein
    glm52
+   glm5_next
    higgs_audio
    kokoro
    lingbot_world

@@ -672,6 +672,15 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.glm52.weight_loader.html">mstar.model.glm52.weight_loader</a></li>
 </ul>
 </details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="../../../_autosummary/mstar.model.glm5_next.html">mstar.model.glm5_next</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.glm5_next.components.html">mstar.model.glm5_next.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.glm5_next.config.html">mstar.model.glm5_next.config</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.glm5_next.fused_decode.html">mstar.model.glm5_next.fused_decode</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.glm5_next.mhc.html">mstar.model.glm5_next.mhc</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.glm5_next.sinkhorn_kernel.html">mstar.model.glm5_next.sinkhorn_kernel</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.glm5_next.weight_loader.html">mstar.model.glm5_next.weight_loader</a></li>
+</ul>
+</details></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="../../../_autosummary/mstar.model.higgs_audio.html">mstar.model.higgs_audio</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.higgs_audio.components.html">mstar.model.higgs_audio.components</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.higgs_audio.config.html">mstar.model.higgs_audio.config</a></li>
@@ -1573,6 +1582,82 @@ window.runMermaid = runMermaid;</script>
         <span class="n">hook</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">module</span><span class="p">,</span> <span class="s2">"process_weights_after_loading"</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
         <span class="k">if</span> <span class="nb">callable</span><span class="p">(</span><span class="n">hook</span><span class="p">):</span>
             <span class="n">hook</span><span class="p">(</span><span class="n">device</span><span class="p">)</span></div>
+
+
+
+<div class="viewcode-block" id="resolve_checkpoint">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.utils.html#mstar.model.utils.resolve_checkpoint">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">resolve_checkpoint</span><span class="p">(</span><span class="n">model_path_hf</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span><span class="p">,</span> <span class="n">cache_dir</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""A local checkpoint directory as given, a Hub id as its snapshot (fetched if not cached),</span>
+<span class="sd">    None for no path."""</span>
+    <span class="k">if</span> <span class="ow">not</span> <span class="n">model_path_hf</span><span class="p">:</span>
+        <span class="k">return</span> <span class="kc">None</span>
+    <span class="k">if</span> <span class="n">Path</span><span class="p">(</span><span class="n">model_path_hf</span><span class="p">)</span><span class="o">.</span><span class="n">exists</span><span class="p">():</span>
+        <span class="k">return</span> <span class="nb">str</span><span class="p">(</span><span class="n">model_path_hf</span><span class="p">)</span>
+    <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.utils.hf_snapshot</span><span class="w"> </span><span class="kn">import</span> <span class="n">resolve_snapshot_dir</span>
+
+    <span class="k">return</span> <span class="nb">str</span><span class="p">(</span><span class="n">resolve_snapshot_dir</span><span class="p">(</span><span class="n">model_path_hf</span><span class="p">,</span> <span class="n">cache_dir</span><span class="o">=</span><span class="n">cache_dir</span><span class="p">))</span></div>
+
+
+
+<div class="viewcode-block" id="read_fp8_block_quant_config">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.utils.html#mstar.model.utils.read_fp8_block_quant_config">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">read_fp8_block_quant_config</span><span class="p">(</span><span class="n">checkpoint_dir</span><span class="p">:</span> <span class="nb">str</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""The ``Fp8BlockQuantConfig`` in ``checkpoint_dir/config.json``, or None: no file, none</span>
+<span class="sd">    declared, or unreadable (the weights then load as they are, bf16)."""</span>
+    <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.utils.fp8_block</span><span class="w"> </span><span class="kn">import</span> <span class="n">Fp8BlockQuantConfig</span>
+
+    <span class="n">path</span> <span class="o">=</span> <span class="n">Path</span><span class="p">(</span><span class="n">checkpoint_dir</span><span class="p">)</span> <span class="o">/</span> <span class="s2">"config.json"</span>
+    <span class="k">if</span> <span class="ow">not</span> <span class="n">path</span><span class="o">.</span><span class="n">is_file</span><span class="p">():</span>
+        <span class="k">return</span> <span class="kc">None</span>
+    <span class="k">try</span><span class="p">:</span>
+        <span class="n">raw</span> <span class="o">=</span> <span class="n">json</span><span class="o">.</span><span class="n">loads</span><span class="p">(</span><span class="n">path</span><span class="o">.</span><span class="n">read_text</span><span class="p">())</span>
+    <span class="k">except</span> <span class="p">(</span><span class="ne">OSError</span><span class="p">,</span> <span class="ne">ValueError</span><span class="p">)</span> <span class="k">as</span> <span class="n">e</span><span class="p">:</span>
+        <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span><span class="s2">"could not read </span><span class="si">%s</span><span class="s2">: </span><span class="si">%s</span><span class="s2">"</span><span class="p">,</span> <span class="n">path</span><span class="p">,</span> <span class="n">e</span><span class="p">)</span>
+        <span class="k">return</span> <span class="kc">None</span>
+    <span class="k">return</span> <span class="n">Fp8BlockQuantConfig</span><span class="o">.</span><span class="n">from_hf_config_dict</span><span class="p">(</span><span class="n">raw</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"quantization_config"</span><span class="p">))</span></div>
+
+
+
+<div class="viewcode-block" id="load_snapshot_tokenizer">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.utils.html#mstar.model.utils.load_snapshot_tokenizer">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">load_snapshot_tokenizer</span><span class="p">(</span><span class="n">model_path_hf</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">cache_dir</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""The checkpoint's tokenizer, through ``AutoTokenizer`` or, where transformers 4.x</span>
+<span class="sd">    cannot build the backend class a transformers-5 ``tokenizer_config.json`` names,</span>
+<span class="sd">    ``fast_tokenizer_from_snapshot``."""</span>
+    <span class="kn">from</span><span class="w"> </span><span class="nn">transformers</span><span class="w"> </span><span class="kn">import</span> <span class="n">AutoTokenizer</span>
+
+    <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.utils.hf_snapshot</span><span class="w"> </span><span class="kn">import</span> <span class="n">resolve_snapshot_dir</span>
+
+    <span class="n">source</span> <span class="o">=</span> <span class="nb">str</span><span class="p">(</span><span class="n">resolve_snapshot_dir</span><span class="p">(</span><span class="n">model_path_hf</span><span class="p">,</span> <span class="n">cache_dir</span><span class="o">=</span><span class="n">cache_dir</span><span class="p">))</span>
+    <span class="k">try</span><span class="p">:</span>
+        <span class="k">return</span> <span class="n">AutoTokenizer</span><span class="o">.</span><span class="n">from_pretrained</span><span class="p">(</span><span class="n">source</span><span class="p">,</span> <span class="n">cache_dir</span><span class="o">=</span><span class="n">cache_dir</span><span class="p">)</span>
+    <span class="k">except</span> <span class="ne">ValueError</span><span class="p">:</span>
+        <span class="k">return</span> <span class="n">fast_tokenizer_from_snapshot</span><span class="p">(</span><span class="n">source</span><span class="p">)</span></div>
+
+
+
+<div class="viewcode-block" id="fast_tokenizer_from_snapshot">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.utils.html#mstar.model.utils.fast_tokenizer_from_snapshot">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">fast_tokenizer_from_snapshot</span><span class="p">(</span><span class="n">source</span><span class="p">:</span> <span class="nb">str</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""A fast tokenizer from ``tokenizer.json``, which is version-independent, with the</span>
+<span class="sd">    snapshot's chat template and the special tokens ``tokenizer_config.json`` declares."""</span>
+    <span class="kn">from</span><span class="w"> </span><span class="nn">transformers</span><span class="w"> </span><span class="kn">import</span> <span class="n">PreTrainedTokenizerFast</span>
+
+    <span class="n">snap</span> <span class="o">=</span> <span class="n">Path</span><span class="p">(</span><span class="n">source</span><span class="p">)</span>
+    <span class="n">tokenizer</span> <span class="o">=</span> <span class="n">PreTrainedTokenizerFast</span><span class="p">(</span><span class="n">tokenizer_file</span><span class="o">=</span><span class="nb">str</span><span class="p">(</span><span class="n">snap</span> <span class="o">/</span> <span class="s2">"tokenizer.json"</span><span class="p">))</span>
+    <span class="n">template</span> <span class="o">=</span> <span class="n">snap</span> <span class="o">/</span> <span class="s2">"chat_template.jinja"</span>
+    <span class="k">if</span> <span class="n">template</span><span class="o">.</span><span class="n">is_file</span><span class="p">():</span>
+        <span class="n">tokenizer</span><span class="o">.</span><span class="n">chat_template</span> <span class="o">=</span> <span class="n">template</span><span class="o">.</span><span class="n">read_text</span><span class="p">()</span>
+    <span class="c1"># built from tokenizer.json alone, the tokenizer has no special tokens, so the</span>
+    <span class="c1"># detokenizer would print &lt;|user|&gt; and the other turn markers into replies</span>
+    <span class="n">config</span> <span class="o">=</span> <span class="n">snap</span> <span class="o">/</span> <span class="s2">"tokenizer_config.json"</span>
+    <span class="k">if</span> <span class="n">config</span><span class="o">.</span><span class="n">is_file</span><span class="p">():</span>
+        <span class="n">cfg</span> <span class="o">=</span> <span class="n">json</span><span class="o">.</span><span class="n">loads</span><span class="p">(</span><span class="n">config</span><span class="o">.</span><span class="n">read_text</span><span class="p">())</span>
+        <span class="n">special</span> <span class="o">=</span> <span class="p">{</span><span class="n">k</span><span class="p">:</span> <span class="n">cfg</span><span class="p">[</span><span class="n">k</span><span class="p">]</span> <span class="k">for</span> <span class="n">k</span> <span class="ow">in</span> <span class="p">(</span><span class="s2">"eos_token"</span><span class="p">,</span> <span class="s2">"pad_token"</span><span class="p">)</span> <span class="k">if</span> <span class="n">cfg</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">k</span><span class="p">)}</span>
+        <span class="n">tokenizer</span><span class="o">.</span><span class="n">add_special_tokens</span><span class="p">(</span>
+            <span class="p">{</span><span class="o">**</span><span class="n">special</span><span class="p">,</span> <span class="s2">"additional_special_tokens"</span><span class="p">:</span> <span class="nb">list</span><span class="p">(</span><span class="n">cfg</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"extra_special_tokens"</span><span class="p">)</span> <span class="ow">or</span> <span class="p">[])})</span>
+    <span class="k">return</span> <span class="n">tokenizer</span></div>
 
 
 
