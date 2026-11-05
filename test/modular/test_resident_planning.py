@@ -315,8 +315,8 @@ def test_a_step_repeats_only_when_its_rows_all_continue(in_chain, fresh, same_no
         ),
         continuing_rids={0, 1}, is_new_iter=True, is_same_node=same_node,
     )
-    repeats = StepRepeats(8)
-    repeats.settle([("n", WALK)], lambda *key: None)
+    repeats = StepRepeats(8, [("n", WALK)])
+    repeats.settle(lambda *key: None)
     assert repeats.ceiling(speculation, in_chain, lambda: room) == want
 
 
@@ -334,7 +334,7 @@ def test_the_startup_line_names_the_resource_that_refuses_a_walk(caplog):
         resources=resources,
     ) for node, resources in (("a", {"kv": willing}), ("b", {"kv": willing, "pool": ResidentHooks()}))}
     with caplog.at_level("INFO", logger="mstar.worker.step_repeats"):
-        StepRepeats(4).settle([("a", WALK), ("b", WALK)], engine.repeat_refusal)
+        StepRepeats(4, [("a", WALK), ("b", WALK)]).settle(engine.repeat_refusal)
     assert f"steps of a/{WALK} repeat up to 4" in caplog.text
     assert f"steps of b/{WALK} run once: resource 'pool': ResidentHooks keeps no per-replay support" in caplog.text
 
@@ -382,7 +382,7 @@ def test_a_resource_refuses_repeats_at_load_for_what_it_knows_at_load(resource, 
 @pytest.mark.parametrize("limit", [2.5, True, "4", 0])
 def test_a_repeat_limit_that_isnt_a_positive_integer_is_refused(limit):
     with pytest.raises(ValueError, match="max_step_repeats"):
-        StepRepeats(limit)
+        StepRepeats(limit, [])
 
 
 def test_a_step_with_no_plan_of_its_own_leaves_the_last_steps_wrappers_alone():
@@ -414,8 +414,8 @@ def test_a_step_its_resources_held_to_one_iteration_moves_its_rows_by_one():
     batch = ScheduledBatch(node_name="n", graph_walk=WALK, request_to_worker_graph=dict(rows))
     ctx = SimpleNamespace(repeats=1)
     worker = Worker.__new__(Worker)
-    worker._step_repeats = StepRepeats(8)
-    worker._step_repeats.settle([("n", WALK)], lambda *key: None)
+    worker._step_repeats = StepRepeats(8, [("n", WALK)])
+    worker._step_repeats.settle(lambda *key: None)
     worker._graph_runtime = SimpleNamespace(loop_room=lambda *args: 100)
     speculation = SimpleNamespace(
         scheduled_batch=batch, node_batch=SimpleNamespace(step_context=ctx), loop_name="loop",

@@ -465,6 +465,10 @@ class Worker:
     # postprocess.
     chunk_loops: ChunkLoops = ChunkLoops()
 
+    # Set at load when ``max_step_repeats`` is above 1; None, every step runs
+    # once, so a worker built without it -- any test fake -- never repeats.
+    _step_repeats: StepRepeats | None = None
+
     # Metrics are off unless __init__ gets a status interval; class-level so a
     # worker built without __init__ reads them as off too.
     _metrics: WorkerMetrics | None = None
@@ -621,14 +625,12 @@ class Worker:
             my_walks.update(
                 (node, walk) for node in wg_nodes for walk in wg.graph_walks
             )
-        self._step_repeats = StepRepeats((model_config or {}).get("max_step_repeats", 1))
-        # settled once capture has run (`_step_repeats.settle`); a node reading a
-        # streamed input takes it per step
-        self._my_walks = my_walks
-        self._streamed_walks = {
+        step_repeats = StepRepeats((model_config or {}).get("max_step_repeats", 1), my_walks, {
             (node, walk) for wg in my_worker_graphs for node, graph_node in wg.section.get_nodes().items()
             if graph_node.consumes_stream for walk in wg.graph_walks
-        }
+        })
+        if step_repeats.limit > 1:
+            self._step_repeats = step_repeats
         self.chunk_loops = ChunkLoops.from_graphs(
             my_worker_graphs, (model_config or {}).get("speculate_mid_prefill"),
             model.chunking_policy_of() if model is not None else {},
@@ -2897,6 +2899,8 @@ class Worker:
     def _stamp_repeats(self, speculation: Speculation, pending: PendingBatch, in_chain: int) -> None:
         """Ask for as many iterations as the step can have; its resources narrow
         it at admit (`_await_admit_settled` takes the answer)."""
+        if self._step_repeats is None:
+            return
         batch = speculation.scheduled_batch
         speculation.node_batch.step_context.repeats = self._step_repeats.ceiling(
             speculation, in_chain,
@@ -2912,8 +2916,6 @@ class Worker:
         engine = self.engine_manager.get_engine(node_name)
         if (graph_walk, node_name) not in self._innermost_loop_by_node:
             return "its node isn't in a Loop"
-        if (node_name, graph_walk) in self._streamed_walks:
-            return "its node reads a streamed input, which arrives between steps"
         if self._stop_token_signal.get((node_name, graph_walk)) is None:
             return "the runtime doesn't check its stop: it declares no token stop"
         if not self._all_on_device(
@@ -5081,8 +5083,9 @@ class Worker:
 
         # CUDA graph capture before entering the main loop
         self.engine_manager.warmup_all()
-        # after capture: an attention decides from the kernels it captured
-        self._step_repeats.settle(self._my_walks, self._repeat_refusal)
+        if self._step_repeats is not None:
+            # after capture: an attention decides from the kernels it captured
+            self._step_repeats.settle(self._repeat_refusal)
 
         # Sync every worker before the main loop opens. Per-batch-size
         # captures inside CudaGraphRunner are already barriered on the

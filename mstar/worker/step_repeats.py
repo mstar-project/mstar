@@ -15,7 +15,7 @@ can only narrow it.
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Collection, Iterable
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -25,18 +25,24 @@ logger = logging.getLogger(__name__)
 
 
 class StepRepeats:
-    def __init__(self, limit: int = 1):
+    """``walks``: this worker's (node, walk) pairs; ``streamed``: those whose
+    node reads a streamed input, which arrives between steps."""
+
+    def __init__(self, limit: int, walks: Iterable[tuple[str, str]], streamed: Collection[tuple[str, str]] = ()):
         if type(limit) is not int or limit < 1:
             raise ValueError(f"max_step_repeats is {limit!r}; it must be an integer of at least 1")
         self.limit = limit
+        self._candidates = sorted(walks)
+        self._streamed = streamed
         self._walks: set[tuple[str, str]] = set()
 
-    def settle(self, walks: Iterable[tuple[str, str]], repeat_refusal: Callable[[str, str], str | None]) -> None:
-        """Which of ``walks`` (node, walk) may repeat, and why each other one can't."""
-        if self.limit == 1:
-            return
-        for key in sorted(walks):
-            refusal = repeat_refusal(*key)
+    def settle(self, repeat_refusal: Callable[[str, str], str | None]) -> None:
+        """Which walks may repeat, and why each other one can't."""
+        for key in self._candidates:
+            refusal = (
+                "its node reads a streamed input, which arrives between steps" if key in self._streamed
+                else repeat_refusal(*key)
+            )
             if refusal is None:
                 self._walks.add(key)
                 logger.info("max_step_repeats: steps of %s/%s repeat up to %d", *key, self.limit)
@@ -49,7 +55,7 @@ class StepRepeats:
         the chain has run a step, other ready work hasn't had its look in."""
         batch = speculation.scheduled_batch
         if (
-            self.limit == 1 or in_chain < 1 or not speculation.is_new_iter or not speculation.is_same_node
+            in_chain < 1 or not speculation.is_new_iter or not speculation.is_same_node
             or len(batch.request_to_worker_graph) != len(speculation.continuing_rids) or batch.chunk_ranges
         ):
             return 1
