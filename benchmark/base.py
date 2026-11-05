@@ -471,8 +471,16 @@ class MiniCPMO45(Model):
     def get_openai_system_message(self) -> Optional[dict]:
         return {"role": "system", "content": [{"type": "text", "text": self.SYSTEM_PROMPT}]}
 
+    def get_tokenizer(self):
+        # Qwen2's, as the server loads it: the checkpoint maps AutoTokenizer to its repo code (#509)
+        if self._tokenizer is None:
+            from transformers import Qwen2Tokenizer
+
+            self._tokenizer = Qwen2Tokenizer.from_pretrained(self.get_hf_url())
+        return self._tokenizer
+
     def get_model_kwargs(self, request_type: RequestType):
-        speech = request_type.get_output_modalities() == "audio"
+        speech =request_type.get_output_modalities() == "audio"
         # Greedy LLM, capped, no repetition penalty: vllm-omni's stage-0
         # defaults. The TTS keeps each system's own sampling defaults (both
         # upstream's temperature 0.8 / top-p 0.85 / top-k 25), since
