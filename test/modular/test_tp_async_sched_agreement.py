@@ -53,7 +53,7 @@ def _run_ranks(async_per_rank, axis):
         worker = make_worker(
             parallel_nodes={"node"},
             parallel_groups=types.SimpleNamespace(get_joint_group_for_node=lambda n: joint),
-            tp_async_sched=async_per_rank[i],
+            async_sched=(async_per_rank[i], None),
         )
         try:
             worker.lockstep.verify_async_sched_agrees()

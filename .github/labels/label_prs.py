@@ -111,7 +111,14 @@ CORE_FILES = {
     "mstar/graph/runtime/base.py",
     "mstar/model/base.py",
     "mstar/model/submodule_base.py",
+    "mstar/worker/admission.py",
+    "mstar/worker/input_ingest.py",
+    "mstar/worker/lockstep.py",
     "mstar/worker/micro_scheduler.py",
+    "mstar/worker/request_lifecycle.py",
+    "mstar/worker/speculation.py",
+    "mstar/worker/step_executor.py",
+    "mstar/worker/step_pipeline.py",
     "mstar/worker/worker.py",
 }
 # A change across many models (an engine API every model implements, say) gets

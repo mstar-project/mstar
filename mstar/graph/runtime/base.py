@@ -370,7 +370,7 @@ class PopRidsOutput(NamedTuple):
     wg_ids: ParallelList[int, int]
     # Columns, and each edge carries its own rid -- so there is no run-length
     # column to keep parallel and no rid-major invariant for callers to honour.
-    # Same shape as SpeculationPrepOutput, so _build_executing_batch walks
+    # Same shape as SpeculationPrepOutput, so ``build_executing_batch`` walks
     # either the same way.
     input_edges: ColumnarEdgeSpecs
     # The node's output edge names, structural and identical for every rid in
@@ -879,11 +879,7 @@ class GraphRuntime(PhasedPostprocess, ABC):
         the same event. A leaked string rid was harmless -- the string never
         recurred -- but a leaked handle silently attaches to whichever request
         gets that handle next, which reads as one request inheriting another's
-        state. Known handle-keyed maps: MicroScheduler.{failed_rids,
-        backlog} (purged by clear_rid), Admission.{admit_errors, held_until}
-        (purged by clear), Lockstep._follow_count (wire-keyed, purged by
-        clear_wire_rid), Worker._pending_removes, the runtime's pending loop stops
-        and do-not-speculate marks, and the tensor manager's per-request maps.
+        state. Known handle-keyed maps are listed in ``mstar.worker.rid_table``.
         """
         pass
 

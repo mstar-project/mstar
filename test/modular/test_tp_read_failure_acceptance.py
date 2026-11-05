@@ -658,12 +658,6 @@ def _worker(rank, scenario, comm, graph, engine, tm, group):
 
     from mstar.distributed.communication import CommGroup, JointGroups
     from mstar.testing_utils.worker import make_worker
-    from mstar.worker.admission import Admission
-    from mstar.worker.lockstep import Lockstep
-    from mstar.worker.micro_scheduler import MicroScheduler
-    from mstar.worker.rebuild import Rebuilds
-    from mstar.worker.request_lifecycle import RequestLifecycle
-    from mstar.worker.services import WorkerLayout, WorkerServices
     from mstar.worker.stream_buffers import StreamBufferManager
 
     parallel_groups = SimpleNamespace(
@@ -679,46 +673,16 @@ def _worker(rank, scenario, comm, graph, engine, tm, group):
         get_engine=lambda node: engine, warmup_all=lambda: None,
         remove_request=engine.remove_request,
     )
-    streams = StreamBufferManager(graph, tm, [])
-    services = WorkerServices(
-        worker_id=WORKERS[rank], device=torch.device("cpu"), graph_runtime=graph,
-        engine_manager=engine_manager, tensor_manager=tm, request_state=graph,
-        communicator=comm, parallel_groups=parallel_groups, rebuilds=Rebuilds({}, {}), streams=streams,
-    )
-    layout = WorkerLayout(
-        parallel_nodes=frozenset({NODE}), parallel_leader_nodes=frozenset({NODE} if rank == 0 else ()),
-        is_tp_follower=rank != 0,
-    )
-    admission = Admission(services=services, layout=layout)
-    lockstep = Lockstep(services=services, layout=layout, admission=admission)
-    lifecycle = RequestLifecycle(layout=layout)
     w = make_worker(
-        worker_id=WORKERS[rank], device=torch.device("cpu"), communicator=comm, tensor_manager=tm,
-        _graph_runtime=graph, engine_manager=engine_manager, request_state=graph,
-        parallel_groups=parallel_groups, layout=layout, admission=admission, lockstep=lockstep,
-        streams=streams, lifecycle=lifecycle,
-        scheduler=MicroScheduler(
-            services=services, layout=layout, lifecycle=lifecycle, lockstep=lockstep, admission=admission,
-        ),
+        worker_id=WORKERS[rank], communicator=comm, tensor_manager=tm, graph_runtime=graph,
+        engine_manager=engine_manager, request_state=graph, parallel_groups=parallel_groups,
+        streams=StreamBufferManager(graph, tm, []),
         wakeup_event=SimpleNamespace(
             drain=lambda: None, register_future=lambda f: None, register_futures=lambda f: None,
         ),
-        parallel_nodes={NODE}, parallel_leader_nodes=set(layout.parallel_leader_nodes),
-        is_tp_follower=rank != 0,
+        parallel_nodes={NODE}, parallel_leader_nodes={NODE} if rank == 0 else set(),
+        is_tp_follower=rank != 0, launch_wait_s=1.0, max_consecutive_spec=1,
     )
-    w.enable_nvtx = w.enable_prof = False
-    w._launch_wait_s = 1.0
-    w._max_consecutive_spec = 1
-    w._device_loopback = {}
-    w._host_rows_slot = 0
-    w.profile_info = SimpleNamespace(pop_request=lambda rid: None)
-    w._in_flight_rids = set()
-    w.partition_topology = None
-    w._my_consumer_connections = []
-    w._streaming_edge_names = set()
-    w._innermost_loop_by_node = {}
-    w._stop_token_signal = {}  # no declared stop policies: check_stop decides
-    w._metrics = None
     for setup in _DESIGN_SETUP:
         if hasattr(w, setup):
             getattr(w, setup)()

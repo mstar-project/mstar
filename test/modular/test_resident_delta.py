@@ -19,6 +19,7 @@ from __future__ import annotations
 import logging
 import sys
 import threading
+from concurrent.futures import Future
 from types import SimpleNamespace
 
 import pytest
@@ -39,7 +40,7 @@ from mstar.utils.ipc_format import (
     WorkerMessage,
     WorkerMessageType,
 )
-from mstar.worker import worker as worker_mod
+from mstar.utils.profiler import PhaseLaps
 from mstar.worker.micro_scheduler import ScheduledBatch
 from mstar.worker.stream_buffers import StreamBufferManager
 from mstar.worker.worker import Worker
@@ -600,7 +601,7 @@ def _leader(followers=("rank1", "rank2")) -> Worker:
         parallel_nodes={"node"}, parallel_leader_nodes={"node"},
         # Its ``get_rid_string`` is the same prefixing stub ``_Engine`` uses, so a
         # broadcast that shipped local handles instead of wire ids is visible.
-        _graph_runtime=SimpleNamespace(
+        graph_runtime=SimpleNamespace(
             get_sharding_config=lambda rid: SimpleNamespace(
                 get_sharding_group=lambda n, w: group
             ),
@@ -692,7 +693,7 @@ def _rank(*, leader: bool, parallel: bool = True) -> Worker:
     engine.reclaimable = lambda node, rid, resources: True
     engine.offload_request = lambda node, rid, affected_resources=None: engine.offload_attempts.append(node) or 1
     rank = make_worker(
-        _graph_runtime=_Queue(),
+        graph_runtime=_Queue(),
         engine_manager=SimpleNamespace(get_engine=lambda node: engine),
         parallel_nodes={"node"} if parallel else set(),
         parallel_leader_nodes={"node"} if leader else set(),
@@ -706,14 +707,14 @@ def _rank(*, leader: bool, parallel: bool = True) -> Worker:
     rank.flushed_removes = 0
     rank.flush_protected = None
     rank.lifecycle.add("victim", "victim")
-    teardown = rank._teardown
+    teardown = rank.pipeline._teardown
 
     def flush(in_flight_rids):
         rank.flushed_removes += 1
         assert engine.offload_attempts == [], "a teardown was spent after the eviction"
         rank.flush_protected = set(in_flight_rids)
         teardown(in_flight_rids)
-    rank._teardown = flush
+    rank.pipeline._teardown = flush
     return rank
 
 
@@ -722,7 +723,7 @@ def _oom(rank, referenced_rids=frozenset()):
         node_name="node", graph_walk="walk",
         request_to_worker_graph={"r0": "wg", "r1": "wg"},
     )
-    rank._handle_admit_failure(batch, SimpleNamespace(
+    rank.pipeline._handle_admit_failure(batch, SimpleNamespace(
         node_name="node", failed_resource=None,
         admit_error=AllocationFailed("out of pages", pages_short=1, label="main", request_id="r0"),
         request_ids=["r0", "r1"], cached_rids=set(),
@@ -921,7 +922,7 @@ def _forwarding_leader(broadcast_seq: int) -> Worker:
     tensor_manager = SimpleNamespace(force_cleanup_request=lambda rid: None)
     leader = make_worker(
         # ``remove_request`` here is what frees the handle
-        _graph_runtime=SimpleNamespace(
+        graph_runtime=SimpleNamespace(
             get_rid_handle=lambda rid: 0 if rid == "gone" else None,
             get_rid_string=lambda handle: "gone" if handle == 0 else None,
             get_sharding_config=lambda rid: SimpleNamespace(groups=[group]),
@@ -995,7 +996,7 @@ def test_the_teardown_flush_runs_after_the_push_back():
     leader._graph_runtime.push_back_node = (
         lambda node_name, rids, wg_ids: order.append("push")
     )
-    leader._teardown = lambda in_flight: order.append("flush")
+    leader.pipeline._teardown = lambda in_flight: order.append("flush")
 
     _oom(leader)
 
@@ -1007,20 +1008,39 @@ def test_the_speculation_is_cleared_before_the_recovery_runs():
     it reserved, so the eviction that follows may be unnecessary; and it unmarks
     those streams, so the teardown flush has nothing left to spare. Only a
     yield-away batch survives the clear, and only that needs sparing."""
-    import inspect
+    rank = _rank(leader=True)
+    pipeline = rank.pipeline
+    order: list[str] = []
 
-    src = inspect.getsource(worker_mod.Worker.run)
-    block = src[src.index("if pending.node_batch.admit_error is not None:"):]
-    clear = block.index("_maybe_clear_spec()")
-    recover = block.index("_handle_admit_failure(")
-    assert clear < recover, (
+    def clear_speculation():
+        order.append("clear")
+        pipeline._speculation = None
+
+    pipeline._clear_speculation = clear_speculation
+    pipeline._handle_admit_failure = lambda *a, **kw: order.append("recover")
+    pipeline._speculation = SimpleNamespace(is_yield_away=False)
+    rank._graph_runtime.set_in_flight = lambda node, rids, wg_ids, value: None
+    done = Future()
+    done.set_result({})
+    pipeline.pending = SimpleNamespace(
+        node_name="node", graph_walk="walk", future=done, speculative_new_iter=False,
+        batch=ScheduledBatch(node_name="node", graph_walk="walk", request_to_worker_graph={"r0": "wg"}),
+        node_batch=SimpleNamespace(
+            admit_error=AllocationFailed("out of pages", pages_short=1, label="main", request_id="r0"),
+            failed_requests={},
+        ),
+    )
+
+    pipeline._finish_chain_step(PhaseLaps("test."))
+
+    assert order == ["clear", "recover"], (
         "recovery runs before the speculation is cleared, so it evicts to make "
         "room the pre-plan was about to give back"
     )
 
 
 def _follow_spec(*, replay_refuses: bool) -> Worker:
-    """The real ``Worker._try_follow_speculation`` and ``MicroScheduler``, as far
+    """The real ``Speculator.follow`` and ``MicroScheduler``, as far
     as the delta gate, so the gate is driven by a real refusal rather than a
     stubbed return: the bug was the async path never asking, and a stub that
     answers proves nothing about whether it asked.
@@ -1042,7 +1062,7 @@ def _follow_spec(*, replay_refuses: bool) -> Worker:
     )
     worker = make_worker(
         worker_id="worker_1", engine_manager=engine_manager, scheduler=sched, lockstep=sched.lockstep,
-        admission=sched.admission, _graph_runtime=runtime, request_state=request_state,
+        admission=sched.admission, graph_runtime=runtime, request_state=request_state,
     )
     worker.head = head = ScheduleTPNode(
         node_name="node", graph_walk="walk", request_ids=["r0"],
@@ -1090,7 +1110,7 @@ def test_the_async_follow_path_will_not_build_mid_replay():
     worker = _follow_spec(replay_refuses=True)
     parent = _SpecParent()
 
-    assert worker._try_follow_speculation(parent) is None
+    assert worker.speculator.follow(parent) is None
     assert parent.reads == 0, "the build started before the replay had landed"
     assert worker.scheduler.lockstep.follow_head() is worker.head, (
         "the head was consumed mid-replay"
@@ -1103,5 +1123,5 @@ def test_the_async_follow_path_proceeds_once_the_replay_lands():
     worker = _follow_spec(replay_refuses=False)
     parent = _SpecParent()
 
-    assert worker._try_follow_speculation(parent) is None
+    assert worker.speculator.follow(parent) is None
     assert parent.reads == 1, "the gate blocked a build it should have allowed"

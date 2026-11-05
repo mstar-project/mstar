@@ -1,7 +1,7 @@
 """What the worker does with a step whose admit was refused, and with a
 speculation that was built but never submitted.
 
-* The refused-step branch of ``Worker.run`` protects the rids of a surviving
+* The refused-step branch of ``StepPipeline._finish_chain_step`` protects the rids of a surviving
   (yield-away) speculation from the teardown and eviction it runs; it read
   them off a ``ScheduledBatch`` field that no longer exists.
 * A speculation that never reached the GPU thread holds rids that came off
@@ -11,7 +11,7 @@ speculation that was built but never submitted.
   instead of re-queueing the step for ever; a full ring KV pool is retryable
   and holds only the request that waits.
 
-Drives the real ``Worker`` methods on a stub ``self`` and a real
+Drives the real ``StepPipeline`` over a stub engine and a real
 ``RingKVManager``.
 """
 
@@ -32,9 +32,10 @@ from mstar.engine.resources.step import (  # noqa: E402
     RequestOffloading,
     StepContext,
 )
-from mstar.testing_utils.worker import make_worker
+from mstar.testing_utils.worker import make_worker  # noqa: E402
 from mstar.worker.micro_scheduler import ScheduledBatch  # noqa: E402
-from mstar.worker.worker import PendingBatch, Speculation, Worker  # noqa: E402
+from mstar.worker.speculation import Speculation, Speculator  # noqa: E402
+from mstar.worker.step_executor import PendingBatch  # noqa: E402
 
 NODE, WALK = "dit", "rollout"
 
@@ -54,15 +55,15 @@ class _Runtime:
         pass
 
 
-def _worker(*, follower=False, engine_manager=None):
+def _worker(*, follower=False, engine_manager=None, **components):
     w = make_worker(
-        worker_id=0, _graph_runtime=_Runtime(), engine_manager=engine_manager or SimpleNamespace(
+        worker_id=0, graph_runtime=_Runtime(), engine_manager=engine_manager or SimpleNamespace(
             get_engine=lambda node: SimpleNamespace(release_cached_prefix=lambda batch: None),
         ),
-        parallel_nodes={NODE} if follower else set(), is_tp_follower=follower,
+        parallel_nodes={NODE} if follower else set(), is_tp_follower=follower, **components,
     )
     w.reported: dict[int, str] = {}
-    w._fail_requests = w.reported.update
+    w.pipeline._fail_requests = w.reported.update
     return w
 
 
@@ -102,8 +103,8 @@ def _yield_away(rids):
 
 
 def test_the_speculation_rids_come_off_a_real_scheduled_batch():
-    assert Worker._speculated_rids(_yield_away([3, 4])) == {3, 4}
-    assert Worker._speculated_rids(None) == frozenset()
+    assert Speculator.speculated_rids(_yield_away([3, 4])) == {3, 4}
+    assert Speculator.speculated_rids(None) == frozenset()
 
 
 # ── a speculation that was never submitted ──────────────────────────────
@@ -117,7 +118,7 @@ def test_an_unsubmitted_yield_away_gives_its_rids_back_when_the_iteration_raises
     spec = _yield_away([3, 4])
     assert spec.plan_future is None
 
-    w._handle_main_loop_error(RuntimeError("boom"), (pending, None), None, spec)
+    w.pipeline._handle_error(RuntimeError("boom"), (pending, None), None, spec)
 
     assert sorted(w._graph_runtime.pushed) == [3, 4], "yield-away rids stranded"
     assert set(w.reported) == {1, 2}
@@ -131,7 +132,7 @@ def test_a_submitted_speculation_fails_with_its_step():
     submitted = _pending([3, 4])
     submitted.batch = spec.scheduled_batch
 
-    w._handle_main_loop_error(RuntimeError("boom"), (pending, submitted), None, spec)
+    w.pipeline._handle_error(RuntimeError("boom"), (pending, submitted), None, spec)
 
     assert w._graph_runtime.pushed == []
     assert set(w.reported) == {1, 2, 3, 4}
@@ -148,7 +149,7 @@ def _refused(rids, reason):
 
 def _next_pass(w) -> None:
     """A refused step's admit errors, as the top of the worker's next pass fails them."""
-    w._fail_requests(w.admission.take_admit_errors())
+    w.pipeline._fail_requests(w.admission.take_admit_errors())
 
 
 def test_a_terminal_refusal_only_records_until_the_next_pass():
@@ -157,7 +158,7 @@ def test_a_terminal_refusal_only_records_until_the_next_pass():
     w = _worker()
     batch, node_batch = _refused([7, 8], AdmitRuntimeError("clock skipped", request_ids=frozenset({7})))
 
-    w._handle_admit_failure(batch, node_batch)
+    w.pipeline._handle_admit_failure(batch, node_batch)
 
     assert not w.reported
     assert set(w.admission.admit_errors) == {7}
@@ -173,7 +174,7 @@ def test_a_terminal_refusal_fails_the_request_it_names_and_requeues_the_rest():
     w = _worker()
     batch, node_batch = _refused([7, 8], AdmitRuntimeError("clock skipped", request_ids=frozenset({7})))
 
-    w._handle_admit_failure(batch, node_batch)
+    w.pipeline._handle_admit_failure(batch, node_batch)
     _next_pass(w)
 
     assert set(w.reported) == {7}
@@ -190,7 +191,7 @@ def test_a_terminal_refusal_fails_every_request_it_names():
     w = _worker()
     batch, node_batch = _refused([6, 7, 8], AdmitRuntimeError("bad rows", request_ids=frozenset({6, 8})))
 
-    w._handle_admit_failure(batch, node_batch)
+    w.pipeline._handle_admit_failure(batch, node_batch)
     _next_pass(w)
 
     assert set(w.reported) == {6, 8}
@@ -201,7 +202,7 @@ def test_a_terminal_refusal_naming_no_row_of_the_batch_fails_every_row():
     w = _worker()
     batch, node_batch = _refused([7, 8], AdmitRuntimeError("elsewhere", request_ids=frozenset({9})))
 
-    w._handle_admit_failure(batch, node_batch)
+    w.pipeline._handle_admit_failure(batch, node_batch)
     _next_pass(w)
 
     assert set(w.reported) == {7, 8}
@@ -212,7 +213,7 @@ def test_a_terminal_refusal_about_the_whole_step_fails_every_row():
     w = _worker()
     batch, node_batch = _refused([7, 8], AdmitRuntimeError("a row named twice"))
 
-    w._handle_admit_failure(batch, node_batch)
+    w.pipeline._handle_admit_failure(batch, node_batch)
     _next_pass(w)
 
     assert set(w.reported) == {7, 8}
@@ -223,7 +224,7 @@ def test_a_tp_follower_leaves_the_failure_to_rank_0():
     w = _worker(follower=True)
     batch, node_batch = _refused([7, 8], AdmitRuntimeError("clock skipped", request_ids=frozenset({7})))
 
-    w._handle_admit_failure(batch, node_batch)
+    w.pipeline._handle_admit_failure(batch, node_batch)
     _next_pass(w)
 
     assert not w.reported
@@ -249,14 +250,14 @@ def _ring_refusal(num_sessions, held, wanted):
 
 def test_a_full_ring_pool_holds_the_request_that_waits_and_runs_the_rest():
     engine = SimpleNamespace(evictable=lambda n, resources=None: False)
-    w = _worker(engine_manager=SimpleNamespace(get_engine=lambda node: engine))
-    w.scheduler = SimpleNamespace(
-        arrival={}, last_in_line=lambda *args: None, could_refill=lambda *args: False,
+    w = _worker(
+        engine_manager=SimpleNamespace(get_engine=lambda node: engine),
+        scheduler=SimpleNamespace(last_in_line=lambda *args: None, could_refill=lambda *args: False),
     )
     batch, node_batch = _ring_refusal(2, ["r0"], ["a", "b"])
     assert isinstance(node_batch.admit_error, AllocationFailed)
 
-    w._handle_admit_failure(batch, node_batch)
+    w.pipeline._handle_admit_failure(batch, node_batch)
 
     assert not w.reported and not w.admission.admit_errors, "a full pool is not a failure"
     assert list(w.admission.held_until) == ["b"]
@@ -273,7 +274,7 @@ def test_a_ring_clock_skip_fails_only_that_request():
     batch, node_batch = _refused(["a"], outcome.reason)
     w = _worker()
 
-    w._handle_admit_failure(batch, node_batch)
+    w.pipeline._handle_admit_failure(batch, node_batch)
     _next_pass(w)
 
     assert set(w.reported) == {"a"}

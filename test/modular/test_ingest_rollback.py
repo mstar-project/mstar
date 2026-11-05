@@ -45,7 +45,7 @@ def test_the_worker_fails_only_the_request_whose_ingest_raised():
     registered, processed = [], []
     parked = SimpleNamespace(body=SimpleNamespace(request_id="wire"))
     w = make_worker(
-        _graph_runtime=SimpleNamespace(
+        graph_runtime=SimpleNamespace(
             add_request=lambda **kw: 5, get_sharding_config=lambda rid: None,
             register_stop_limits=lambda rid, info: None,
         ),
@@ -55,6 +55,7 @@ def test_the_worker_fails_only_the_request_whose_ingest_raised():
         ),
         request_state=SimpleNamespace(per_request_info={}, add_request=lambda rid, info: None),
         tensor_manager=SimpleNamespace(
+            get_tensor=None,
             register_request=lambda rid, sharding: registered.append(rid),
             start_read_tensors=lambda *a, **kw: pytest.fail("no reads for a failed request"),
         ),
