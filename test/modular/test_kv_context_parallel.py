@@ -1183,7 +1183,8 @@ def test_sp_placed_mla_attention_pads_a_leased_step_for_the_rows_its_wrapper_was
 def test_a_backend_plugs_in_its_own_kernel_for_a_share_of_the_own_tokens(monkeypatch):
     """``own_kernel`` is where a backend whose keys aren't one-slot pages plugs in: the share is built
     on it, admission bounds its padding, and one that drops its capture, which a replay's fixed
-    buffers are sized from, is refused when it is built."""
+    buffers are sized from, is refused when it is built, as is a build that returns anything else,
+    by type, before its capture is read."""
     _fa_kernel(monkeypatch)
     padded = []
 

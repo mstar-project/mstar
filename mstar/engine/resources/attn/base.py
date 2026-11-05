@@ -364,10 +364,12 @@ class PlacedAttention(AttentionManager):
         new = None if decode else self._placed.own_tokens(
             self, self._placement, self._device, self._dtype, workspace, kwargs, max_total_tokens,
         )
-        if not isinstance(context, PagedKernel) or not (decode or isinstance(new, (WholeRowsKernel, ZigzagWrapper))):
+        if not isinstance(context, PagedKernel):
+            raise ValueError(f"attention over a placed pool takes a PagedKernel, not a {type(context).__name__}")
+        if not (decode or isinstance(new, (WholeRowsKernel, ZigzagWrapper))):
             raise ValueError(
-                f"attention over a placed pool takes a PagedKernel and a WholeRowsKernel or ZigzagWrapper, "
-                f"not a {type(context).__name__} and a {type(new).__name__}"
+                f"a multi-token step over a placed pool attends its own tokens on a WholeRowsKernel or a "
+                f"ZigzagWrapper, not a {type(new).__name__}"
             )
         return self._placed(
             self._placement, self._kv_config.tokens_per_page, self._dtype, context, new, self._device,
