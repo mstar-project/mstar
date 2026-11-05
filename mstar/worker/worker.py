@@ -10,7 +10,7 @@ import time as _time
 from collections import defaultdict, deque
 from collections.abc import Callable, Collection, Iterable, Mapping
 from concurrent.futures import Future
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from enum import Enum
 from functools import cache, cached_property, partial
@@ -340,14 +340,18 @@ class SpeculationTarget(NamedTuple):
 _HOST_ROWS_RING = 4
 
 
-def run_item(column: torch.Tensor, iteration: int) -> torch.Tensor:
+def run_item(column: torch.Tensor, iteration: int, copies: "torch.cuda.Stream | None" = None) -> torch.Tensor:
     """One iteration of a row's column of a step that repeated, as what leaves
     the step. A view of the row, which is the step's own clone, unless its
     last dim strides by the run's width (a one-element item): ``contiguous``
-    keeps that stride and a byte view refuses it, so that one is copied. A
-    copy per item was most of a Talker step's host time at N=4."""
+    keeps that stride and a byte view refuses it, so that one is copied, on
+    ``copies`` if given (``Worker._run_copies``). A copy per item was most of
+    a Talker step's host time at N=4."""
     item = column[:, iteration]
-    return item if item.dim() and item.stride(-1) == 1 else item.clone(memory_format=torch.contiguous_format)
+    if item.dim() and item.stride(-1) == 1:
+        return item
+    with torch.cuda.stream(copies) if copies is not None else nullcontext():
+        return item.clone(memory_format=torch.contiguous_format)
 
 
 def _host_column(host_rows: HostRows | None, name: str) -> torch.Tensor | None:
@@ -502,6 +506,8 @@ class Worker:
     _withholding: Mapping[tuple[str, str], StopPolicy] = MappingProxyType({})
     # messages taken in while a run was awaited, not yet processed
     _held_messages: tuple = ()
+    # ``_run_copies``'s stream, made on first use
+    _copy_stream: "torch.cuda.Stream | None" = None
     # (node, walk) whose runs go on the device
     _device_runs: frozenset = frozenset()
     # (start, end, (node, walk), repeats) per step while a walk picks its run
@@ -3727,7 +3733,10 @@ class Worker:
                 if input_name in wide:
                     # a signal that also leaves the Loop: a run kept it a column an
                     # iteration, of which the loop-back reads the last
-                    tensors = [run_item(tensor, -1) for tensor in tensors]
+                    copies = self._run_copies(tensors[0])
+                    tensors = [run_item(tensor, -1, copies) for tensor in tensors]
+                    if copies is not None:
+                        copies.synchronize()
                 speculation.node_batch.per_request_input_tensors[rid][input_name] \
                     = list(tensors)
             if ok:
@@ -4691,6 +4700,7 @@ class Worker:
             name: dict(zip(outputs.span_request_ids, span.tolist(), strict=False))
             for name, span in spans.items() if span.dim() == 3
         }
+        copies = None
         for rid in step.wg_ids.keys:
             rid_outputs = outputs.get(rid)
             if not rid_outputs:
@@ -4703,7 +4713,9 @@ class Worker:
                 for i in range(kept):
                     if name in withhold and (rid, i) in withheld:
                         continue
-                    replay = run_item(column, i) if width > 1 else column
+                    if copies is None:
+                        copies = self._run_copies(column)
+                    replay = run_item(column, i, copies) if width > 1 else column
                     if name in span_of:
                         start, end = span_of[name][rid][i]
                         if end <= start:
@@ -4717,8 +4729,22 @@ class Worker:
                     rid_outputs[name] = items
                 else:
                     del rid_outputs[name]
+        if copies is not None:
+            # stored for readers on other streams (``skip_cuda_sync``): done before they are
+            copies.synchronize()
         # the entries are no longer row views of the step's batch clones
         outputs.row_views = None
+
+    def _run_copies(self, like: torch.Tensor) -> "torch.cuda.Stream | None":
+        """The side stream a run's item copies go on, which the host waits for
+        alone: what they copy belongs to a step that has landed, and they are
+        handed to readers on other streams (the API server's transport, the
+        next step) that nothing orders after the main thread's own stream."""
+        if like.device.type != "cuda":
+            return None
+        if self._copy_stream is None:
+            self._copy_stream = torch.cuda.Stream(device=like.device)
+        return self._copy_stream
 
     def _store_outputs(
         self, batch_N: PendingBatch, outputs: BatchedModelOutput,
