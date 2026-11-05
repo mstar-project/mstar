@@ -25,8 +25,10 @@ moves a target fails there.
 
 from __future__ import annotations
 
+import bisect
 import functools
 import importlib
+import math
 import os
 import sys
 import threading
@@ -184,17 +186,30 @@ _DTYPES = {
 }
 
 
-def _header(path) -> dict:
+def _parse(fd: int) -> tuple[int, dict]:
+    """A safetensors file's data offset and header."""
     import json
     import struct
 
-    with open(path, "rb") as f:
-        (n,) = struct.unpack("<Q", f.read(8))
-        header = json.loads(f.read(n))
+    (n,) = struct.unpack("<Q", os.pread(fd, 8, 0))
+    header = json.loads(os.pread(fd, n, 8))
     header.pop("__metadata__", None)
-    return header
+    return 8 + n, header
 
 
+def _header(path) -> dict:
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        return _parse(fd)[1]
+    finally:
+        os.close(fd)
+
+
+@functools.lru_cache(maxsize=256)
+def _small_spans(fd: int, file: tuple[int, int, int]) -> list[tuple[int, int]]:
+    """The byte ranges of the file's small tensors (``file``: its device, inode and mtime)."""
+    base, header = _parse(fd)
+    return sorted((base + v["data_offsets"][0], base + v["data_offsets"][1]) for v in header.values() if _small(v))
 
 
 def _small(info: dict) -> bool:
@@ -291,9 +306,13 @@ def header_only_weights() -> None:
     real_read = iterators._read_tensor
 
     def read_tensor(fd, rd):
-        shape = rd.shape
-        if rd.nbytes < SMALL_WEIGHT * rd.dtype.itemsize:
+        """Real bytes for a read of a small tensor (a shard of a large one's too would be a hole)."""
+        st = os.fstat(fd)
+        spans = _small_spans(fd, (st.st_dev, st.st_ino, st.st_mtime_ns))
+        i = bisect.bisect_right(spans, (rd.offset, math.inf)) - 1
+        if rd.nbytes == 0 or (i >= 0 and rd.offset < spans[i][1]):
             return real_read(fd, rd)
+        shape = rd.shape
         if rd.narrow is not None:
             dim, start, stop = rd.narrow
             shape = shape[:dim] + (stop - start,) + shape[dim + 1:]

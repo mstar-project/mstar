@@ -8,6 +8,7 @@ from safetensors import safe_open
 from safetensors.torch import save_file
 
 from mstar_sim.checkpoint import main, synthesize
+from mstar_sim.tests.test_device import run_sim
 
 
 def test_copy_keeps_every_tensor_header_and_only_small_tensors_data(tmp_path):
@@ -55,6 +56,32 @@ def test_copy_keeps_every_tensor_header_and_only_small_tensors_data(tmp_path):
     stamp = (out / "config.json").stat().st_mtime_ns
     synthesize(str(src), out)  # the same source: reused
     assert (out / "config.json").stat().st_mtime_ns == stamp
+
+
+def test_the_emulated_loader_reads_what_the_copy_kept(tmp_path):
+    """mstar's loader under the emulator reads a small tensor's kept bytes, and a shard of a
+    large one (which the copy left a hole) as meta, not as the hole's zeros."""
+    src = tmp_path / "src"
+    src.mkdir()
+    save_file({"scale": torch.arange(float(1 << 17)).view(128, 1024), "norm": torch.arange(1024.0)},
+              str(src / "model.safetensors"))
+    synthesize(str(src), tmp_path / "out")
+    out = run_sim(f"""
+        import json, os, struct, torch
+        from mstar.model.loader import iterators
+
+        fd = os.open("{tmp_path / "out" / "model.safetensors"}", os.O_RDONLY)
+        (n,) = struct.unpack("<Q", os.pread(fd, 8, 0))
+        header = json.loads(os.pread(fd, n, 8))
+
+        def read(key, spec=None):
+            return iterators._read_tensor(fd, iterators._plan_read(header[key], 8 + n, spec))
+
+        assert torch.equal(read("norm"), torch.arange(1024.0))
+        assert read("scale", iterators.TensorSlice(0, 0, 32)).is_meta  # a shard: small, of a large tensor
+        print("ok")
+    """)
+    assert out.strip() == "ok"
 
 
 def test_hf_cache_copy_refuses_a_local_directory(tmp_path):
