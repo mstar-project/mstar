@@ -9,6 +9,7 @@ from jinja2 import TemplateError
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardConductorMetadata
+from mstar.engine.precision import NodePrecision
 from mstar.engine.resources import (
     AttentionConfig,
     AttentionSpec,
@@ -509,6 +510,14 @@ class Glm5NextModel(Model):
     # Model ABC: submodule loading
     # -------------------------------------------------------------------
 
+    def get_node_precision(self, node_name: str) -> NodePrecision:
+        """The dtypes the LLM is built and loaded in (bf16, with the params the
+        checkpoint stores fp32 re-widened), without autocast: the KDA conv and
+        delta rule, the router and mHC run in fp32 on purpose. No load cast also
+        keeps the KDA projections views into their fused weight."""
+        del node_name
+        return NodePrecision(None)
+
     def get_submodule(
         self, node_name: str, device: str = "cpu", tp_group=None,
         autocast_dtype: torch.dtype | None = None,
@@ -517,7 +526,8 @@ class Glm5NextModel(Model):
         if node_name in self._submodule_cache:
             return self._submodule_cache[node_name]
         submodule = self._create_submodule(
-            node_name, device, tp_group=tp_group, autocast_dtype=autocast_dtype,
+            # bf16: the engine passes None for the node's policy, which keeps it
+            node_name, device, tp_group=tp_group, autocast_dtype=autocast_dtype or torch.bfloat16,
         )
         self._submodule_cache[node_name] = submodule
         return submodule

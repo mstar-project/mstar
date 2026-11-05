@@ -12,9 +12,10 @@ from collections.abc import Mapping
 from typing import Any, NamedTuple
 
 from mstar.distributed.base import ShardingConfig
+from mstar.engine.precision import deployment_precisions
 from mstar.engine.resources.lora.config import LORA_RESOURCE_KEY, lora_enabled
 from mstar.engine.resources.lora.serving import declared_lora_specs, size_lora_specs
-from mstar.model.base import Model, WorkerGraph, built_resources, parse_autocast_dtype
+from mstar.model.base import Model, WorkerGraph, built_resources
 from mstar.validation.client_streams import check_client_streams
 from mstar.validation.knobs import check_knobs
 from mstar.validation.placement import check_worker_graphs, node_groups_problems, routing_weights_problems
@@ -73,8 +74,9 @@ def validate_deployment(
     if "max_seq_len" not in config:
         problems.append("the config must define `max_seq_len`")
     try:
-        parse_autocast_dtype(config.get("autocast_dtype"))
-    except ValueError as e:
+        # every placed node's precision, the deployment's blocks over the model's
+        deployment_precisions(model, config)
+    except (ValueError, TypeError) as e:
         problems.append(str(e))
     if not isinstance(mps := config.get("mps", False), bool):
         problems.append(f"mps must be true or false, got {mps!r}")

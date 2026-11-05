@@ -313,6 +313,25 @@ def test_encoder_submodule_batches_and_declares_one_capture_per_batch_size():
     assert torch.allclose(out["a"]["encoder_states"][0], single["encoder_states"][0], atol=1e-5)
 
 
+def test_encoder_precision_keeps_the_log_mel_front_end_fp32():
+    from mstar.engine.precision import apply_precision, precision_mismatches
+
+    cfg = _tiny_config()
+    sub = WhisperEncoderSubmodule(WhisperEncoderModel(cfg), cfg)
+    policy = WhisperModel.get_node_precision(WhisperModel.__new__(WhisperModel), ENCODER_NODE)
+    apply_precision(sub, policy)
+    assert precision_mismatches(sub, policy) == []
+    assert sub.encoder.conv1.weight.dtype == torch.bfloat16
+    assert sub.log_mel.mel_filters.dtype == sub.log_mel.window.dtype == torch.float32
+    reference = LogMelSpectrogram(
+        num_mel_bins=cfg.num_mel_bins, sampling_rate=cfg.sampling_rate, n_fft=cfg.n_fft,
+        hop_length=cfg.hop_length, chunk_length=cfg.chunk_length,
+    )
+    # the filter bank was never rounded through bf16
+    assert torch.equal(sub.log_mel.mel_filters, reference.mel_filters)
+    assert torch.equal(sub.log_mel.window, reference.window)
+
+
 # --------------------------------------------------------------------------
 # decoder submodule: step declaration
 # --------------------------------------------------------------------------

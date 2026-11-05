@@ -24,6 +24,7 @@ from mstar.engine.accelerator_graph_config import (
     PackedAcceleratorGraphConfig,
 )
 from mstar.engine.engine import ExecutingBatch
+from mstar.engine.input_spec import TensorSpec
 from mstar.engine.resources import AttentionStep, KVStep, PositionStep, SamplerStep, Segment, SlotLease, SubmoduleStep
 from mstar.engine.resources.position.manager import PositionManager
 from mstar.engine.resources.sampler.resource import SamplerResource
@@ -117,6 +118,8 @@ class WhisperEncoderSubmodule(NodeSubmodule):
     # up to the recompile limit per frame) until it was measured and
     # switched off. Every window is graph-replayed anyway.
     disable_torch_compile = True
+    # raw samples, fp32 for the log-mel front end
+    input_specs = {"audio": TensorSpec(torch.float32)}
 
     def __init__(self, encoder: WhisperEncoderModel, config: WhisperModelConfig):
         super().__init__()
@@ -133,9 +136,9 @@ class WhisperEncoderSubmodule(NodeSubmodule):
         ).to(device=encoder.conv1.weight.device, dtype=torch.float32)  # float32 even under a bf16 default dtype
 
     def _mel(self, audio: torch.Tensor) -> torch.Tensor:
-        """The spectrogram in float32 whatever dtype the engine cast this
-        module to (it casts submodules to the compute dtype after they are
-        built; a bf16 STFT would not match the reference features)."""
+        """The spectrogram in float32 (a bf16 STFT would not match the
+        reference features). The node's precision policy keeps ``log_mel``
+        fp32; this covers a caller that cast the whole module."""
         if self.log_mel.window.dtype != torch.float32:
             self.log_mel.float()
         return self.log_mel(audio)
@@ -170,7 +173,7 @@ class WhisperEncoderSubmodule(NodeSubmodule):
         inputs: NameToTensorList,
         **kwargs,
     ) -> NodeInputs:
-        audio = inputs["audio"][0].reshape(-1).to(device=self.get_device(), dtype=torch.float32)
+        audio = inputs["audio"][0].reshape(-1).to(self.get_device())
         audio = self.log_mel.pad_or_trim(audio)  # zero-pad to the 30 s window
         return NodeInputs(tensor_inputs={"audio": audio}, input_seq_len=1)
 

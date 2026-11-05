@@ -15,6 +15,7 @@ import torch
 pytest.importorskip("diffusers")
 from diffusers import AutoencoderKLWan  # noqa: E402
 
+from mstar.engine.input_spec import ingest  # noqa: E402
 from mstar.model.components import wan_vae  # noqa: E402
 from mstar.model.wan22.config import Wan22Config  # noqa: E402
 from mstar.model.wan22.submodules import Wan22VaeDecoderSubmodule  # noqa: E402
@@ -64,6 +65,8 @@ def _decoder(monkeypatch, vae, *, fast: bool, dtype=torch.float32, tiling: str =
 
 def _forward(sub, latents: torch.Tensor) -> torch.Tensor:
     """The node's emitted ``[F, H, W, 3]`` frames, as the decode's ``[1, 3, F, H, W]``."""
+    # in the decode dtype, as the node's input spec has the engine cast them
+    latents = ingest(sub, {"latents": [latents]})["latents"][0]
     frames = sub.forward("video_gen", engine_inputs=None, latents=latents)["video_output"][0]
     assert frames.is_contiguous() and frames.shape[-1] == 3
     return frames.permute(3, 0, 1, 2)[None]

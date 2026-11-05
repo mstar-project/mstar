@@ -414,7 +414,7 @@ def test_a_chunked_row_starts_past_the_prefix_rank_0_measured_on_every_rank():
             return ARNodeInputs(input_ids=torch.tensor(prompt), input_seq_len=len(prompt))
 
     engine = _engine(follower)
-    engine._submodules[NODE] = SimpleNamespace(submodule=_Prompt(), resources={})
+    engine._submodules[NODE] = SimpleNamespace(submodule=_Prompt(), resources={}, input_specs={})
     engine._chunking = ChunkingManagement(engine._submodules)
     batch = SimpleNamespace(
         node_name=NODE, per_request_info_wrapped={"b": None}, per_request_input_tensors={},

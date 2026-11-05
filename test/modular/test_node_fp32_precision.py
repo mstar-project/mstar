@@ -32,7 +32,6 @@ class _Recorder(NodeSubmodule):
     """Records the float32 flags its forward runs under; ``fail`` raises
     from inside the forward."""
 
-    disable_autocast = True
 
     def __init__(self, matmul=None, cudnn=None):
         super().__init__()
@@ -75,7 +74,7 @@ class _Groups:
 
 
 def _engine(submodules: dict[str, NodeSubmodule], graph_runtime=None) -> Engine:
-    engine = Engine(graph_runtime, autocast_dtype=None)
+    engine = Engine(graph_runtime)
     engine.load_model(
         submodules=submodules, specs=[], parallel_groups=_Groups(),
         device=torch.device("cpu"), transfer_engine_info=None,

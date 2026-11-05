@@ -29,6 +29,7 @@ from mstar.engine.accelerator_graph_config import (
     PiecewiseCallInputs,
 )
 from mstar.engine.engine import ExecutingBatch
+from mstar.engine.input_spec import TensorSpec
 from mstar.engine.resources import AttentionStep, KVStep, PositionStep, SamplerStep, Segment, SlotLease, SubmoduleStep
 from mstar.engine.resources.attn.base import AttentionManager
 from mstar.engine.resources.sampler.resource import SamplerResource
@@ -89,6 +90,8 @@ class HiggsAudioEncoderSubmodule(NodeSubmodule):
     CAPTURE_CHUNK_COUNTS = [1, 2, 4, 8, 16, 32, 64]
     TOWER = "tower"
     MASKED_TOWER = "tower_masked"
+    # the fp32 mel, taken in the tower's dtype
+    input_specs = {"audio_features": TensorSpec("param")}
 
     def __init__(
         self,
@@ -148,14 +151,13 @@ class HiggsAudioEncoderSubmodule(NodeSubmodule):
         engine_inputs: ModelInputsFromEngine,
         inputs: list[NodeInputs],
     ) -> dict[str, Any]:
-        dtype = next(self.audio_tower.parameters()).dtype
         features = [inp.tensor_inputs["audio_features"] for inp in inputs]
         widths = [f.shape[-1] for f in features]
         padded = self._padded(widths[0])
         if padded:
             features = [F.pad(f, (0, self.chunk_frames - f.shape[-1])) for f in features]
         out = {
-            "audio_features": torch.cat(features, dim=0).to(device=self.get_device(), dtype=dtype),
+            "audio_features": torch.cat(features, dim=0).to(self.get_device()),
             "valid_lengths": [inp.kwargs["valid_lengths"] for inp in inputs],
         }
         if padded:
@@ -306,9 +308,10 @@ class HiggsAudioLLMSubmodule(ARNodeSubmodule):
                 capture_graph_walk="prefill_audio",
                 make_node_input=lambda n: ARNodeInputs(
                     input_seq_len=n,
+                    # the dtype `prepare_inputs` embeds in, the node's param dtype
                     input_embeds=torch.zeros(
                         (n, self.config.hidden_size),
-                        device=device, dtype=torch.bfloat16,
+                        device=device, dtype=self.model.embed_tokens.weight.dtype,
                     ),
                 ),
                 capture_token_lengths=self.PREFILL_TOKEN_BUCKETS,
@@ -338,7 +341,8 @@ class HiggsAudioLLMSubmodule(ARNodeSubmodule):
                 if inputs.get(name) else None
                 for name in ("text_pre", "text_post")
             )
-            dtype = (pre if pre is not None else audio).dtype
+            # the LLM's dtype: the encoder node's policy may differ
+            dtype = self.model.embed_tokens.weight.dtype
             embeds = torch.cat([t.to(dtype) for t in (pre, audio, post) if t is not None], dim=0)
             return ARNodeInputs(
                 input_seq_len=embeds.shape[0],

@@ -117,9 +117,6 @@ class KokoroSynthSubmodule(NodeSubmodule):
     # it, so the whole method is not compilable; its two static halves are
     # captured piecewise instead.
     disable_torch_compile = True
-    # fp32 end to end, as the reference: the phase-sensitive vocoder does not
-    # tolerate reduced precision.
-    disable_autocast = True
     # cuDNN times the conv algorithms of both captured halves once per bucket,
     # in their capture sizing; eager steps keep its heuristic pick, so a new
     # frame count does not search again

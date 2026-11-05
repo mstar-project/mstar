@@ -68,7 +68,7 @@ def _submodule() -> KokoroSynthSubmodule:
 
 def _engine(submodule: KokoroSynthSubmodule) -> Engine:
     engine = Engine.__new__(Engine)
-    engine._submodules = {SYNTH_NODE: type("Mgmt", (), {"submodule": submodule, "resources": {}})()}
+    engine._submodules = {SYNTH_NODE: type("Mgmt", (), {"submodule": submodule, "resources": {}, "input_specs": {}})()}
     engine._enable_nvtx = False
     engine._loopback_steps = {}
     engine._chunking = ChunkingManagement(engine._submodules)

@@ -10,6 +10,7 @@ from mstar.engine.accelerator_graph_config import (
     geometric_batch_sizes,
 )
 from mstar.engine.accelerator_graph_runner import compile_kwargs
+from mstar.engine.input_spec import TensorSpec
 from mstar.engine.resources import AttentionStep, RingKVStep, SubmoduleStep
 from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs, NodeSubmodule
 from mstar.model.waypoint.components.dit import WaypointDiT
@@ -127,10 +128,8 @@ class WaypointDitSubmodule(_FunctionalAeMixin, NodeSubmodule):
     # Do not let the engine independently compile this wrapper and fuse
     # across the DiT's own full-graph regions.
     disable_torch_compile = True
-
-    # Waypoint pins an explicit fp32 island list at build time; this flag
-    # prevents EngineManager from blanket-casting those islands to bf16.
-    disable_autocast = True
+    # the prime walk's x0, off the vae_encoder node
+    input_specs = {"latent": TensorSpec("param")}
 
     def __init__(self, dit: WaypointDiT, taehv: torch.nn.Module, config: WaypointConfig):
         super().__init__()
@@ -232,7 +231,7 @@ class WaypointDitSubmodule(_FunctionalAeMixin, NodeSubmodule):
         }
         if graph_walk == PRIME_WALK:
             # Already-settled x0 for a real frame, off the vae_encoder node.
-            tensor_inputs["latent"] = inputs["latent"][0].to(device=device, dtype=dtype)
+            tensor_inputs["latent"] = inputs["latent"][0].to(device)
         elif graph_walk == ROLLOUT_WALK:
             tensor_inputs["noise"] = self._frame_noise(
                 fwd_info.random_seed, frame_pos, device, dtype
@@ -642,9 +641,6 @@ class WaypointVaeEncoderSubmodule(_SingleRequestMixin, _FunctionalAeMixin, NodeS
     """
 
     disable_torch_compile = True
-    # Dtype layout is settled at load; an engine-level cast would round it
-    # underneath the AE.
-    disable_autocast = True
 
     def __init__(self, taehv: torch.nn.Module, config: WaypointConfig):
         super().__init__()

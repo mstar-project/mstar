@@ -65,6 +65,7 @@ from mstar.conductor.request_info import (
     StreamingConnectionState,
 )
 from mstar.distributed.base import ShardingConfig
+from mstar.engine.precision import NodePrecision, apply_precision
 from mstar.engine.resources import (
     AttentionConfig,
     AttentionSpec,
@@ -130,6 +131,26 @@ from mstar.streaming.chunk_policy import FixedChunkPolicy
 from mstar.streaming.topology import Connection, PartitionTopology, StreamingGraphEdge
 
 logger = logging.getLogger(__name__)
+
+# The transformer's serving dtypes, relative to its root: bf16 but the timestep
+# embedder, which diffusers keeps fp32 (``_keep_in_fp32_modules``); the
+# multi-step video denoise scrambles when it runs in bf16.
+TRANSFORMER_PRECISION = NodePrecision(torch.bfloat16, fp32_modules=("time_embedder",), autocast=False)
+# The vision tower + projector: bf16, but the tower's last LayerNorm and the
+# projector's norm read it in fp32, as they did under autocast.
+VISION_PRECISION = NodePrecision(
+    torch.bfloat16, fp32_modules=("visual.post_layernorm", "projector.norm"), autocast=False,
+)
+
+
+def _under(attr: str, precision: NodePrecision) -> NodePrecision:
+    """``precision`` for a module the node holds as ``attr``."""
+    return NodePrecision(
+        precision.param_dtype,
+        fp32_modules=tuple(f"{attr}.{glob}" for glob in precision.fp32_modules),
+        autocast=precision.autocast,
+    )
+
 
 DIT_NODE = "dit"
 VAE_ENCODER_NODE = "vae_encoder"
@@ -1906,14 +1927,29 @@ class Cosmos3Model(Model):
     # Model ABC: submodule loading
     # ------------------------------------------------------------------
 
+    def get_node_precision(self, node_name: str) -> NodePrecision:
+        """No node runs under autocast: the towers run native bf16, as the
+        reference pipeline does (autocast's fp32 norms perturb the velocity
+        ~1 ULP/step, amplified over the multi-step video denoise).
+
+        The dit and the reasoner share one transformer, so one policy. The
+        encode VAE and the sound tokenizer are bf16, as built. The decode VAEs
+        keep the cuDNN-gated dtype ``Cosmos3VAEDecoderSubmodule`` casts them to.
+        """
+        if node_name in (DIT_NODE, REASONER_NODE):
+            return _under("transformer", TRANSFORMER_PRECISION)
+        if node_name == VISION_ENCODER_NODE:
+            return _under("vision_model", VISION_PRECISION)
+        if node_name in (VAE_DECODER_NODE, VAE_DECODER_AR_NODE):
+            return NodePrecision(None)
+        return NodePrecision(torch.bfloat16)
+
     def get_submodule(
         self, node_name: str, device: str = "cpu", tp_group=None,
         autocast_dtype: torch.dtype | None = None, sp_group=None,
     ) -> torch.nn.Module | None:
-        # autocast_dtype is accepted for interface parity (the engine manager
-        # passes it to every model). Cosmos3 already casts the meta module to
-        # bf16 before to_empty in _build_transformer, so params are allocated
-        # directly in the checkpoint dtype and the hint is redundant here.
+        # autocast_dtype is accepted for interface parity; each builder applies
+        # its node's precision policy on the meta module before to_empty.
         # sp_group is the DiT's sequence-parallel comm group (trivial unless the
         # config sets sp_size > 1); it is orthogonal to the tp_group.
         if node_name in self._submodule_cache:
@@ -2003,8 +2039,7 @@ class Cosmos3Model(Model):
         # target device and overwrite with the checkpoint weights — the same
         # path the other model packages use. bf16 matches the published
         # checkpoint exactly and halves resident weight memory vs the float32
-        # meta default; the engine additionally runs the forward under a bf16
-        # autocast (a no-op here).
+        # meta default.
         # Always meta: both branches below call ``to_empty``, which re-allocates
         # uninitialized storage and drops whatever construction produced, so
         # building on CPU only pays for allocation + parameter init that is then
@@ -2012,16 +2047,12 @@ class Cosmos3Model(Model):
         # path). Same shape as the orpheus / higgs_audio builders.
         with torch.device("meta"):
             model = Cosmos3OmniTransformer(self.config, comm_group=tp_group, sp_group=sp_group)
-        model = model.to(torch.bfloat16)
+        apply_precision(model, TRANSFORMER_PRECISION)
         if self.skip_weight_loading:
             return model.to_empty(device=device)
 
         model.to_empty(device=device)
         load_transformer_weights(model, self._ensure_repo(), device=device)
-        # Keep the timestep embedder in fp32, like diffusers'
-        # ``_keep_in_fp32_modules=["time_embedder"]`` (the upcast is lossless from
-        # the bf16 checkpoint and matches diffusers' numerics).
-        model.time_embedder.to(torch.float32)
         model.eval()
         return model
 
@@ -2081,7 +2112,7 @@ class Cosmos3Model(Model):
 
         with torch.device("meta"):
             model = Cosmos3VisionModel(self.config.reasoner)
-        model = model.to(torch.bfloat16)
+        apply_precision(model, VISION_PRECISION)
         if self.skip_weight_loading:
             return model.to_empty(device=device)
         model.to_empty(device=device)

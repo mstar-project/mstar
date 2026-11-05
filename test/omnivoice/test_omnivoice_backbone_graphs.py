@@ -10,6 +10,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from mstar.engine.precision import NodePrecision
 from mstar.model.omnivoice.submodules import (
     BACKBONE_ATTN,
     OmniVoiceBackboneSubmodule,
@@ -133,8 +134,9 @@ def test_the_codec_decoder_compiles_at_start_up_not_on_a_request(monkeypatch):
     engine._device = torch.device("cpu")
     engine._device_capability = SimpleNamespace(is_available=True)
     code2wav = OmniVoiceCode2WavSubmodule(codec, OmniVoiceConfig())
-    engine._submodules = {"code2wav": SimpleNamespace(submodule=code2wav, fp32_precision=None, node_dtype=None,
-                                                      lora_pools=())}
+    engine._submodules = {"code2wav": SimpleNamespace(
+        submodule=code2wav, fp32_precision=None, precision=NodePrecision(None), lora_pools=(),
+    )}
     counter, compile_ = CompileCounter(), torch.compile
     monkeypatch.setattr(torch, "compile", lambda fn, **kwargs: compile_(fn, backend=counter, **kwargs))
     torch._dynamo.reset()

@@ -144,6 +144,7 @@ if TYPE_CHECKING:
     from mstar.engine.accelerator_graph_config import AcceleratorGraphConfig, PiecewiseAcceleratorGraphConfig
     from mstar.engine.accelerator_graph_runner import PiecewiseAcceleratorGraphRunner
     from mstar.engine.engine import ExecutingBatch
+    from mstar.engine.input_spec import TensorSpec
     from mstar.streaming.stream_buffer import StreamChunkInfo
 
 
@@ -832,11 +833,6 @@ class NodeSubmodule(torch.nn.Module, ABC):
         it around this submodule's compiled calls only. None keeps the engine's."""
         return None
 
-    # Set True on a submodule that must run in its own parameter dtype — e.g. a
-    # numerically sensitive fp32 vocoder. The engine then neither casts its
-    # params to the autocast dtype nor wraps its forward (or capture) in
-    # autocast, and explicitly disables any ambient one.
-    disable_autocast: bool = False
     # Walks whose steps may run beside the worker's main chain, on a second
     # stream (``mstar.worker.side_steps``); they do where the node's group in
     # the serving config sets ``side_stream: true``. For a stream-fed walk that
@@ -872,6 +868,12 @@ class NodeSubmodule(torch.nn.Module, ABC):
     # several, as CFG's cond and uncond copies). A step that lays its rows out otherwise
     # declares its own ``LoraStep`` under the pool's key.
     lora_keys: tuple[str, ...] = ()
+
+    # The dtype each input signal is taken in (``mstar.engine.input_spec``). The
+    # engine resolves these at load and applies them to every request's routed
+    # tensors before ``prepare_inputs``, so the node casts none by hand. Read
+    # once, after the node is built: an instance may set it from its own state.
+    input_specs: Mapping[str, TensorSpec] = MappingProxyType({})
 
     def __init__(self):
         super().__init__()
@@ -1255,17 +1257,6 @@ class NodeSubmodule(torch.nn.Module, ABC):
         del graph_walk
         return StepOrder.ARRIVAL
 
-    def get_autocast_dtype(self) -> torch.dtype | None:
-        """This node's dtype in place of the model's: the engine manager casts
-        the node's params to it, and every forward, warm-up and capture runs
-        under autocast in it. Read once at load (``resolve_node_dtype``).
-
-        Default: ``None`` (inherit the model's dtype). Ignored when
-        ``disable_autocast`` is set; to run a node without autocast, in the
-        dtype it was built in, set that instead.
-        """
-        return None
-
     # Note: do not import CudaGraphConfig; it causes a circular import situation
     def get_accelerator_graph_configs(
         self, device: torch.device, tp_world_size: int = 1
@@ -1277,10 +1268,10 @@ class NodeSubmodule(torch.nn.Module, ABC):
     ) -> dict[str, PiecewiseAcceleratorGraphConfig]:
         """Return the piecewise CUDA graph configs this submodule opts into.
 
-        ``autocast_dtype`` is this node's resolved dtype, float32 for a node with
-        ``disable_autocast`` — passed so a config's ``make_static_inputs`` can
-        allocate the hidden-state buffer in the dtype the captured region runs
-        under (avoids a copy-time upcast at replay).
+        ``autocast_dtype`` is this node's param dtype (``NodePrecision``),
+        float32 for a node that keeps its build dtype — passed so a config's
+        ``make_static_inputs`` can allocate the hidden-state buffer in the dtype
+        the captured region runs in (avoids a copy-time upcast at replay).
 
         A piecewise CUDA graph captures ONE inner callable of this submodule's
         forward (e.g. a transformer block loop) as a CUDA graph while the

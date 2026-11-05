@@ -139,8 +139,9 @@ class RMSNormGated(nn.Module):
         x = hidden_states.to(torch.float32)
         var = x.pow(2).mean(-1, keepdim=True)
         x = x * torch.rsqrt(var + self.variance_epsilon)
-        # HF's casts, but the weight stays fp32 (see GatedDeltaNet._apply), so
-        # this product is fp32 where HF's is model dtype: within a bf16 ulp.
+        # HF's casts, but the weight stays fp32 (a precision-policy island), so
+        # this product is fp32 where HF's is model dtype: within a bf16 ulp,
+        # and what vLLM's fused gated norm does.
         x = self.weight * x.to(input_dtype)
         x = x * F.silu(gate.to(torch.float32))
         return x.to(input_dtype)

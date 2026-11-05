@@ -9,12 +9,17 @@ from mstar.distributed.base import ShardingConfig, ShardingGroup
 from mstar.distributed.communication import WorkerParallelGroups
 from mstar.engine.chunking import DEFAULT_MIN_CHUNK_TOKENS
 from mstar.engine.engine import Engine
-from mstar.engine.node_dtype import resolve_model_dtype, resolve_node_dtype
+from mstar.engine.precision import (
+    NodePrecision,
+    apply_precision,
+    deployment_precisions,
+    precision_mismatches,
+)
 from mstar.engine.resources import ResourceReqConfig
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.graph.base import GraphNode
 from mstar.graph.runtime.base import GraphRuntime
-from mstar.model.base import Model, node_moe_parallel_configs, parse_autocast_dtype, serving_resources
+from mstar.model.base import Model, node_moe_parallel_configs, serving_resources
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.utils.device import DeviceCapability
 from mstar.utils.streams import reset_device_scheduling
@@ -235,6 +240,21 @@ def refuse_combined_walks_across_tp_groups(
             )
 
 
+def _refuse_conflicting_shared_modules(
+    submodules: dict[str, torch.nn.Module], precisions: dict[str, NodePrecision],
+) -> None:
+    """Refuse two nodes that share a module but cast it differently: the one
+    loaded later would silently set the other's numerics."""
+    for name, submodule in submodules.items():
+        bad = precision_mismatches(submodule, precisions[name])
+        if bad:
+            raise ValueError(
+                f"node {name!r} does not hold the dtypes its precision policy gives it; "
+                f"a module it shares with another node was cast differently there: "
+                f"{bad[:5]}{' ...' if len(bad) > 5 else ''}"
+            )
+
+
 @dataclass
 class EngineManager:
     """Owns the worker's engine.
@@ -271,19 +291,20 @@ class EngineManager:
         """
         specs = serving_resources(model, model_config)
 
-        # YAML autocast_dtype over the model's own, but never re-enabling
-        # autocast for a model that pinned its numerics (see node_dtype)
-        autocast_dtype = parse_autocast_dtype(resolve_model_dtype(model, model_config))
+        # every placed node's policy, this worker's or not (see deployment_precisions)
+        policies = deployment_precisions(model, model_config, node_names)
 
         # Allocation dtype hint for get_submodule: a node's params should be
-        # allocated directly in ``autocast_dtype`` (cast meta -> dtype before
+        # allocated directly in their param dtype (cast meta -> dtype before
         # ``to_empty``) instead of allocating fp32 then down-casting after
         # return — the latter doubles the load-time VRAM peak. The cast below
-        # applies the same resolved dtype, so allocation and runtime agree.
+        # applies the same resolved policy, so allocation and runtime agree.
         submodules: dict[str, torch.nn.Module] = {}
         # Checked by the conductor's get_sharding_config before spawn.
         moe_parallel = node_moe_parallel_configs(model_config["node_groups"])
+        precisions: dict[str, NodePrecision] = {}
         for name in sorted(node_names):
+            precision = policies[name]
             # Sequence parallelism is opt-in per node; only forward the SP
             # group when this node actually participates in one, so models
             # that don't support SP keep their existing get_submodule call.
@@ -297,15 +318,17 @@ class EngineManager:
             submodule = model.get_submodule(
                 name, device,
                 tp_group=parallel_groups.get_tp_config_for_node(name),
-                autocast_dtype=autocast_dtype, **extra,
+                # the node's param dtype, under its pre-policy name
+                autocast_dtype=precision.param_dtype,
+                **extra,
             )
             if submodule is None:
                 continue
-            # the one dtype the load cast and every forward and capture use;
-            # None keeps the dtype the node was built in
-            node_dtype = resolve_node_dtype(submodule, autocast_dtype)
-            submodules[name] = submodule.to(device=device, dtype=node_dtype)
+            # the one policy the load cast and every forward and capture use
+            precisions[name] = precision
+            submodules[name] = apply_precision(submodule.to(device=device), precision)
         _refuse_split_combined_walks(submodules, model)
+        _refuse_conflicting_shared_modules(submodules, precisions)
         _refuse_speculated_spans(submodules, model)
         _refuse_unroutable_withholds(submodules, model)
         side_keys = _side_lane_keys(
@@ -316,7 +339,6 @@ class EngineManager:
 
         engine = Engine(
             graph_runtime=graph_runtime,
-            autocast_dtype=autocast_dtype,
             enable_nvtx=enable_nvtx,
             enable_profile=enable_prof,
             gpu_memory_fraction=model_config.get("gpu_memory_fraction"),
@@ -330,6 +352,7 @@ class EngineManager:
             device=device,
             transfer_engine_info=transfer_engine_info,
             model=model,
+            node_precisions=policies,
         )
         budgets = model_config.get("max_batch_tokens") or {}
         override_mixed = model_config.get("can_override_mixed_max_tokens") or {}

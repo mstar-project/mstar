@@ -9,6 +9,7 @@ from jinja2 import TemplateError
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardConductorMetadata
+from mstar.engine.precision import NodePrecision
 from mstar.engine.resources import (
     AttentionConfig,
     AttentionSpec,
@@ -514,6 +515,14 @@ class Glm52Model(Model):
     # Model ABC: submodule loading
     # -------------------------------------------------------------------
 
+    def get_node_precision(self, node_name: str) -> NodePrecision:
+        """Built bf16 with the params the checkpoint stores fp32 restored by the
+        loader (``restore_fp32_params``: the router's score bias, an fp8
+        checkpoint's block scales), so the engine casts nothing, and the forward
+        runs under bf16 autocast."""
+        del node_name
+        return NodePrecision(None, autocast=torch.bfloat16)
+
     def get_submodule(
         self, node_name: str, device: str = "cpu", tp_group=None,
         autocast_dtype: torch.dtype | None = None,
@@ -553,8 +562,9 @@ class Glm52Model(Model):
 
         with torch.device("meta"):
             language_model = Glm52ForCausalLM(self.config, comm_group=tp_group)
-        if autocast_dtype is not None:
-            language_model = language_model.to(autocast_dtype)
+        # the node keeps its build dtypes (get_node_precision): bf16, and the
+        # loader restores what the checkpoint stores fp32
+        language_model = language_model.to(autocast_dtype or torch.bfloat16)
         language_model.to_empty(device=device)
         self._load_checkpoint(language_model, source, device, tp_group)
         process_weights_after_loading(language_model, torch.device(device))

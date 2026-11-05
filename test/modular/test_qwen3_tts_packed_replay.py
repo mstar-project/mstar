@@ -100,11 +100,13 @@ class _Node:
         self.sub.bind_node_resources(self.resources)
         self.hidden: torch.Tensor | None = None
         self.sub.model.register_forward_hook(self._keep_hidden)
+        # the forward's autocast as serving runs it (the Talker's policy: none)
+        self.autocast = model.get_node_precision(NODE).autocast_dtype
         self.cg = None
         if capture:
             self.cg = AcceleratorGraphRunner(
                 submodule_name=NODE, submodule=self.sub, resources=self.resources, step_runner=self.runner,
-                device=DEVICE, autocast_dtype=DTYPE, joint_comm_group=groups, num_slots=1,
+                device=DEVICE, autocast_dtype=self.autocast, joint_comm_group=groups, num_slots=1,
             )
             with torch.no_grad():
                 self.cg.warmup_and_capture(None)
@@ -146,7 +148,7 @@ class _Node:
         step = self.sub.declare_step(WALK, list(step_ids), inputs, slot_lease=lease)
         step.set_ctx(ctx)
         try:
-            with torch.no_grad(), autocast_scope(DTYPE, device_type=DEVICE.type):
+            with torch.no_grad(), autocast_scope(self.autocast, device_type=DEVICE.type):
                 assert self.runner.admit(step).ok
                 self.runner.plan(step)
                 engine_inputs = ModelInputsFromEngine(

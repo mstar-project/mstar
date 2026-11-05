@@ -35,6 +35,7 @@ from mstar.conductor.request_info import (
     CurrentForwardConductorMetadata,
     StreamingConnectionState,
 )
+from mstar.engine.precision import NodePrecision
 from mstar.engine.resources import (
     AttentionConfig,
     AttentionSpec,
@@ -454,6 +455,11 @@ class Qwen3ASRModel(Model):
         from mstar.distributed.base import ShardingConfig
 
         return ShardingConfig(groups=[], tp_enabled_nodes={LLM_NODE}, shard_dim={})
+
+    def get_node_precision(self, node_name: str) -> NodePrecision:
+        """bf16 params under bf16 autocast, for the AuT encoder and the LLM."""
+        del node_name
+        return NodePrecision(torch.bfloat16, autocast=True)
 
     def get_submodule(
         self, node_name: str, device: str = "cpu", tp_group=None,
