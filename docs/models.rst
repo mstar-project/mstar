@@ -648,7 +648,9 @@ builds no pool, unless the YAML lists the ones to keep::
 An adapter deployment captures and compiles the LLM node as one without adapters does,
 each bucket twice: with the LoRA kernels, and base-only for steps none of whose rows names
 an adapter. The vision encoder's block loop is captured base-only; a step with an adapter
-row runs it uncaptured.
+row runs it uncaptured. The LoRA pool keeps no resident table yet, so a ``lora:`` block
+turns resident decode planning off on the LLM node (the server logs it): every decode
+step, base-only ones included, is planned on the host as before resident planning.
 
 Every size takes the same ``resources: lora:`` block; ``max_rank`` must cover the
 largest adapter served. Example blocks (Hub adapters, ranks as published; no shipped
