@@ -17,7 +17,7 @@ import threading
 import time
 import uuid
 from collections.abc import Callable, Collection, Iterable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from functools import cached_property
 from pathlib import Path
 from typing import Any, NamedTuple, Optional, Protocol
@@ -48,10 +48,14 @@ from mstar.api_server.request_types import (
     PreprocessInput,
     ResultChunk,
 )
+from mstar.api_server.served_models import ServedModels
 from mstar.api_server.streaming_response import ReleasingStreamingResponse
 from mstar.communication.communicator import CommProtocol, make_communicator
 from mstar.communication.tensors import ensure_deployment_token
 from mstar.conductor.workers import accelerator_type, deployment_workers
+from mstar.engine.resources.lora.config import lora_enabled
+from mstar.engine.resources.lora.serving import lora_specs
+from mstar.engine.resources.lora.store import check_adapters
 from mstar.model.multimodal import PromptPart
 from mstar.model.registry import model_init_kwargs
 from mstar.observability.catalog import STATUS_INTERVAL_S
@@ -69,7 +73,7 @@ from mstar.utils.client_errors import client_error_text, scrub_paths
 from mstar.utils.exitcode import describe_exitcode
 from mstar.utils.gc_freeze import freeze_after_setup
 from mstar.utils.generation_kwargs import normalize_generation_kwargs
-from mstar.utils.logging_config import quiet_noisy_loggers
+from mstar.utils.logging_config import log_off_thread, quiet_noisy_loggers
 from mstar.utils.orphan import watch_parent
 from mstar.utils.socket_prefix import per_port_socket_prefix
 from mstar.utils.threads import Thread, pin_thread
@@ -131,15 +135,18 @@ def _conductor_process_target(
     tensor_comm_protocol=CommProtocol.RDMA,
     tcp_transfer_device="",
     status_interval_s: float | None = None,
+    lora_adapter_digests: dict[str, str] | None = None,
 ):
     """Runs DummyConductor.run() in a spawned process. ``status_interval_s``
-    turns on the conductor's status message (metrics on)."""
+    turns on the conductor's status message (metrics on). ``lora_adapter_digests``
+    are the API server's checked serving-config adapters (name -> hex digest)."""
     logging.basicConfig(
         level=getattr(logging, log_level),
         format="%(asctime)s %(levelname)s [conductor] %(name)s: %(message)s",
         force=True,
     )
     quiet_noisy_loggers()
+    log_off_thread()
     # A server started as a background job of a non-interactive shell inherits
     # SIGINT ignored, and Python keeps an inherited ignore, so the graceful stop
     # below (and _shutdown_conductor_process's) would be a no-op. Make it real.
@@ -187,6 +194,7 @@ def _conductor_process_target(
         tensor_comm_protocol=tensor_comm_protocol,
         tcp_transfer_device=tcp_transfer_device,
         status_interval_s=status_interval_s,
+        lora_adapter_digests=lora_adapter_digests,
     )
     try:
         conductor.run()
@@ -456,6 +464,19 @@ class APIServer:
         # tokenizer-only model the API server already builds for preprocessing.
         self.model = model
         self.model_name = model_name
+        # what an OpenAI request's `model` field may name: the base model, or an adapter
+        self.served_models = ServedModels.of(model_name, model_config)
+        specs = lora_specs(model, model_config)
+        lora_spec = specs[0] if specs else None
+        # Every adapter the serving config names, checked against every LoRA spec and
+        # read once before anything else starts. Their digests key the prefix cache here
+        # and travel to the conductor, which pins them for the workers' reads. So a LoRA
+        # deployment's `resources:` block is read here, before the conductor's
+        # validate_deployment; one without LoRA reads nothing here.
+        self.lora_adapter_digests: dict[str, bytes] = (
+            check_adapters(lora_spec, others=specs[1:])
+            if lora_spec is not None and lora_spec.adapters else {}
+        )
         # Requests to a model with client streams keep their input open until
         # the client ends it (see ``stream_input``).
         self.client_streams = frozenset(
@@ -476,6 +497,7 @@ class APIServer:
             tcp_transfer_device=tcp_transfer_device,
             enable_prof=self.log_stats,
             enable_nvtx=self.enable_nvtx,
+            adapter_digests=self.lora_adapter_digests,
             is_pending=self.is_pending,
         )
 
@@ -543,8 +565,11 @@ class APIServer:
         plan = cpus.plan()
         self._result_cpu, self._process_cpus = plan.result, plan.mask
         if plan.result is not None:
-            logger.info("API server: message thread and frontend bridge on CPU %d (%s; mask %s)",
-                        plan.result, plan.why, cpus.format_cpu_list(plan.mask))
+            locked = f"; lock held on cores {plan.locked}" if plan.locked else ""
+            logger.info("API server: message thread and frontend bridge on CPU %d (%s%s; mask %s)",
+                        plan.result, plan.why, locked, cpus.format_cpu_list(plan.mask))
+        elif plan.declined:
+            logger.info("API server: result threads not pinned (%s)", plan.why)
         elif knobs.step_thread_core() != "off":
             logger.warning("API server: result threads not pinned (%s)", plan.why)
 
@@ -675,10 +700,15 @@ class APIServer:
         prompt_parts: list[PromptPart] | None = None,
         streaming: bool = True,
         request_id: str | None = None,
+        model: str | None = None,
         end_input: bool | Collection[str] = True,
         file_streams: dict[str, list[str | None]] | None = None,
     ) -> str:
         """Build a :class:`NewRequestConductor` and send it to the conductor.
+
+        ``model`` is an OpenAI request's ``model`` field: with LoRA on, it selects an
+        adapter (see :meth:`ServedModels.select`), and an unknown name is a 400. A
+        ``lora_adapter`` kwarg is checked the same way.
 
         Returns the ``request_id``. If a ``request_id`` is provided by the
         caller it is used as-is (useful for deterministic-noise debugging,
@@ -722,6 +752,7 @@ class APIServer:
         # here, before anything is queued: null is unset, types and ranges are
         # checked once for every endpoint, and an over-wide seed cannot be packed
         model_kwargs = normalize_generation_kwargs(model_kwargs)
+        model_kwargs = self.lora_kwargs(model, model_kwargs)
         self._report_ignored_params(model_kwargs)
 
         if file_streams:
@@ -781,6 +812,14 @@ class APIServer:
             request_id, key, input_modalities, output_modalities,
         )
         return request_id
+
+    def lora_kwargs(self, model: str | None, model_kwargs: dict | None) -> dict | None:
+        """``model_kwargs`` naming the LoRA adapter ``model`` or a ``lora_adapter`` kwarg
+        selects; an adapter this deployment does not serve is a 400."""
+        try:
+            return self.served_models.select(model, model_kwargs)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from None
 
     def _in_flight(self, request_id: str) -> bool:
         """The newest submission under ``request_id`` is still running: not
@@ -1012,6 +1051,7 @@ class APIServer:
         self.pin_result_thread()
         next_liveness_check = 0.0
         self.communicator.register_event_for_poll(self.preprocess_worker.results_wakeup)
+        failed_passes = 0  # in a row
         while self.running:
             now = time.monotonic()
             if now >= next_liveness_check:
@@ -1035,20 +1075,22 @@ class APIServer:
                         with self.request_lock:
                             pending = self.pending_requests
                             if all(rid in pending for rid in body.request_ids):
-                                rids, values = body.request_ids, body.values
+                                rids, values, logprobs = body.request_ids, body.values, body.logprobs
                             else:
-                                rids, values = [], []
-                                for rid, value in zip(body.request_ids, body.values, strict=True):
+                                rids, values, logprobs = [], [], []
+                                for i, (rid, value) in enumerate(zip(body.request_ids, body.values, strict=True)):
                                     if rid in pending:
                                         rids.append(rid)
                                         values.append(value)
+                                        if body.logprobs:
+                                            logprobs.append(body.logprobs[i])
                                     elif rid not in self.recently_completed:
                                         logger.warning(
                                             "Token for unknown request %s dropped", rid,
                                         )
                             if rids:
                                 self.preprocess_worker.new_result_tokens(
-                                    rids, values, body.signal, body.modality,
+                                    rids, values, body.signal, body.modality, logprobs or None,
                                 )
                         continue
 
@@ -1186,6 +1228,9 @@ class APIServer:
                         if req.profile.timing.first_chunk_time is None:
                             req.profile.timing.first_chunk_time = now
                         req.profile.timing.last_chunk_time = now
+                        if result_chunk.read_time is not None:
+                            req.profile.timing.last_output_read_time = result_chunk.read_time
+                        req.profile.timing.output_postprocess_s += result_chunk.postprocess_s
                         if metrics is not None and result_chunk.modality != "error":
                             req.first_chunk_times.setdefault(result_chunk.modality, now)
                         if req.request_id is not None:
@@ -1243,20 +1288,30 @@ class APIServer:
                 with self.request_lock:
                     if self.recently_completed:
                         next_expiry = self._prune_recently_completed()
+                # Everything else that changes what a pass reads signals the poll:
+                # a message, the data worker's flush (``ResultQueue``) and a
+                # request handler (``_wake_message_loop``). Only the liveness
+                # check and the delivery TTL are on a timer. Inside the try: a
+                # transport error from the wait is a failed pass, not the end of
+                # the thread that delivers every request's results.
+                wait_s = next_liveness_check - time.monotonic()
+                if next_expiry is not None:
+                    wait_s = min(wait_s, next_expiry - time.time())
+                self.communicator.poll_for_messages(timeout_ms=max(0, math.ceil(wait_s * 1000)))
+                if failed_passes:
+                    logger.warning("Message processing loop recovered after %d failed passes", failed_passes)
+                    failed_passes = 0
             except Exception:
+                # the next pass goes after the back-off, without a wait: the
+                # prune may not have run. A transport that stays broken logs
+                # its traceback once, then a count, backing off to 1 s a pass.
                 if self.running:
-                    logger.exception("Error in message processing loop")
-                    time.sleep(0.01)
-                # the prune may not have run: the next pass goes after the back-off
-                next_expiry = time.time()
-            # Everything else that changes what a pass reads signals the poll:
-            # a message, the data worker's flush (``ResultQueue``) and a
-            # request handler (``_wake_message_loop``). Only the liveness
-            # check and the delivery TTL are on a timer.
-            wait_s = next_liveness_check - time.monotonic()
-            if next_expiry is not None:
-                wait_s = min(wait_s, next_expiry - time.time())
-            self.communicator.poll_for_messages(timeout_ms=max(0, math.ceil(wait_s * 1000)))
+                    failed_passes += 1
+                    if failed_passes == 1:
+                        logger.exception("Error in message processing loop")
+                    elif failed_passes % 100 == 0:
+                        logger.error("Message processing loop: %d failed passes in a row", failed_passes)
+                    time.sleep(min(0.01 * 2 ** min(failed_passes - 1, 7), 1.0))
 
     def _wake_message_loop(self) -> None:
         """End the message thread's wait: a request handler changed what its
@@ -1787,6 +1842,12 @@ class WarmupMedia:
         return cls(path=path, modality=modality)
 
 
+def _positive_int(name: str, value: Any) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"{name} must be a positive integer, got {value!r}")
+    return value
+
+
 @dataclass
 class WarmupRequest:
     """One entry of the deployment's ``warmup_requests``: a ``/generate``
@@ -1809,9 +1870,7 @@ class WarmupRequest:
         text = spec.get("text")
         if text is not None and not isinstance(text, str):
             raise ValueError("text must be a string")
-        repeat = spec.get("repeat", 1)
-        if isinstance(repeat, bool) or not isinstance(repeat, int) or repeat < 1:
-            raise ValueError(f"repeat must be a positive integer, got {repeat!r}")
+        repeat = _positive_int("repeat", spec.get("repeat", 1))
         if repeat > 1 and not text:
             raise ValueError("repeat needs text")
         out_mods = spec.get("output_modalities") or ["text"]
@@ -1853,13 +1912,45 @@ class WarmupRequest:
         )
 
 
-def _run_warmup_requests(server: APIServer, specs: list) -> None:
+class DataParallelReplicas(NamedTuple):
+    """The most and fewest replicas any worker graph is served by. ``most`` is
+    how many copies of a request it takes for the conductor's placement to
+    reach them all."""
+
+    most: int
+    fewest: int
+
+
+def _data_parallel_replicas(model, config_path: str) -> DataParallelReplicas:
+    """``DataParallelReplicas(1, 1)``, with a warning, when the worker graphs
+    can't be counted: warmup is best effort and must not stop startup."""
+    try:
+        counts = [len(wg.replica_ranks) for wg in model.get_worker_graphs(config_path)]
+        return DataParallelReplicas(most=max(counts), fewest=min(counts))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("warmup: could not count data-parallel replicas (%s); sending one copy", exc)
+        return DataParallelReplicas(1, 1)
+
+
+def _run_warmup_requests(
+    server: APIServer, specs: list, replicas: DataParallelReplicas = DataParallelReplicas(1, 1),
+) -> None:
     """Run the deployment's ``warmup_requests`` once the workers are ready and
     before the server binds, so the first client does not pay what a first
     request of a shape costs (torch.compile of a denoise step, a cold
     inductor cache). Each spec is parsed into a :class:`WarmupRequest`. A
     warmup that is malformed or fails is logged and skipped; it must not keep
     the server from coming up.
+
+    Each spec runs as ``replicas.most`` concurrent copies, which warm every
+    replica of a data-parallel deployment, since the conductor sends
+    concurrent requests to different replicas (the least-loaded one each).
+    When some worker graph has fewer replicas than that, each spec first runs
+    once alone, since that graph would batch the copies and miss its
+    one-request shape. Past one copy, they run with ``prefix_cache=False``
+    unless the spec sets it, so no predicted hit (``routing_weights.prefix``)
+    gathers them on one replica; the cost is that they leave a prefill from
+    cached pages unwarmed.
     """
     if not isinstance(specs, list):
         logger.warning("warmup_requests must be a list; ignoring %r", type(specs).__name__)
@@ -1868,26 +1959,50 @@ def _run_warmup_requests(server: APIServer, specs: list) -> None:
     async def _one(request: WarmupRequest, request_id: str) -> None:
         await server.collect_results(request.submit(server, request_id))
 
+    async def _all(request: WarmupRequest, base_id: str, n: int) -> None:
+        # every copy runs to its end before a failure is reported, so none is
+        # cancelled mid-request and still in the server when the next spec starts
+        results = await asyncio.gather(
+            *(_one(request, f"{base_id}.{copy}") for copy in range(n)), return_exceptions=True,
+        )
+        for r in results:
+            if isinstance(r, BaseException):
+                raise r
+
     for index, spec in enumerate(specs):
         try:
             request = WarmupRequest.from_config(spec)
         except Exception as exc:  # noqa: BLE001 — a repeat too large to build, say
             logger.warning("warmup_requests[%d] skipped: %s", index, exc)
             continue
+        if replicas.fewest < replicas.most:
+            t0 = time.perf_counter()
+            try:
+                asyncio.run(_one(request, f"warmup-{index}.solo"))
+            except Exception as exc:  # noqa: BLE001 — the copies still run
+                logger.warning(
+                    "warmup request %d/%d failed after %.1f s alone: %s",
+                    index + 1, len(specs), time.perf_counter() - t0, getattr(exc, "detail", exc),
+                )
+            else:
+                logger.info(
+                    "warmup request %d/%d (%s) done in %.1f s alone",
+                    index + 1, len(specs), ",".join(request.output_modalities), time.perf_counter() - t0,
+                )
+        if replicas.most > 1:
+            request = replace(request, model_kwargs={"prefix_cache": False, **(request.model_kwargs or {})})
         t0 = time.perf_counter()
         try:
-            asyncio.run(_one(request, f"warmup-{index}"))
+            asyncio.run(_all(request, f"warmup-{index}", replicas.most))
         except Exception as exc:  # noqa: BLE001 — a cold server is better than none
             logger.warning(
                 "warmup request %d/%d failed after %.1f s: %s",
-                index + 1, len(specs), time.perf_counter() - t0,
-                getattr(exc, "detail", exc),
+                index + 1, len(specs), time.perf_counter() - t0, getattr(exc, "detail", exc),
             )
             continue
         logger.info(
             "warmup request %d/%d (%s) done in %.1f s",
-            index + 1, len(specs), ",".join(request.output_modalities),
-            time.perf_counter() - t0,
+            index + 1, len(specs), ",".join(request.output_modalities), time.perf_counter() - t0,
         )
 
 
@@ -2655,8 +2770,10 @@ async def shutdown_event():
 def deployment_cpu_plan(config: dict) -> cpus.CpuPlan:
     """The deployment's CPU plan, as each worker builds it from the conductor's
     device list: the config's ``step_thread_core`` and ``deployment_workers``.
-    Under ``auto`` this also takes the GPUs' locks, and a server that finds one
-    held pins nothing, here or in its workers. A bad knob value is left for the
+    Placing by rank (``always``, ``siblings``) also takes the GPUs' locks, and
+    any plan that pins takes its cores' locks, moving to the next core set
+    the mask holds when one is held; a server that finds a GPU held, or no set
+    free, pins nothing, here or in its workers. A bad knob value is left for the
     conductor's deployment check to report; a CPU number the mask can't honour
     raises ``CpuPlanError``."""
     try:
@@ -2667,13 +2784,17 @@ def deployment_cpu_plan(config: dict) -> cpus.CpuPlan:
     if setting == "off":
         return cpus.deployment_plan(setting, [])
     devices = deployment_workers(config, accelerator_type()).devices
-    plan = cpus.devices_plan(setting, devices)
-    if setting != "auto" or not plan.pinned:
+    plan = cpus.devices_plan(setting, devices, knobs.idle_hold(), slot=0)
+    if not plan.pinned:
         return plan
-    refused = cpus.claim_gpus(cpus.device_addresses(devices))
+    refused = cpus.claim_gpus(cpus.device_addresses(devices)) if setting in cpus.PLACED else None
     if refused is None:
-        return plan
-    logger.warning("step_thread_core auto: nothing pinned, %s", refused)
+        plan = cpus.claim_cores(plan, lambda slot: cpus.devices_plan(setting, devices, knobs.idle_hold(), slot=slot))
+        if plan.pinned:
+            os.environ[cpus.CORE_SET_ENV] = str(plan.slot)
+            return plan
+        refused = plan.why.removeprefix("not pinned: ")
+    logger.warning("step_thread_core %s: nothing pinned, %s", setting, refused)
     # the workers read the knob when they build their plan
     os.environ[knobs.KNOBS["step_thread_core"]] = "off"
     return cpus.CpuPlan(plan.mask, plan.usable, why=f"not pinned: {refused}")
@@ -2682,9 +2803,10 @@ def deployment_cpu_plan(config: dict) -> cpus.CpuPlan:
 def _uvicorn_config(app, host: str, port: int, config: dict) -> uvicorn.Config:
     # Per-message deflate is negotiated server-wide, for every WebSocket route,
     # so it is the deployment's to turn off (see ws_per_message_deflate in
-    # docs/serving.rst); on by default, as uvicorn's.
+    # docs/serving.rst); on by default, as uvicorn's. With no log config of its
+    # own, uvicorn's records reach the root logger and its writer thread.
     return uvicorn.Config(
-        app, host=host, port=port, access_log=False,
+        app, host=host, port=port, access_log=False, log_config=None,
         ws_per_message_deflate=bool(config.get("ws_per_message_deflate", True)),
     )
 
@@ -2797,6 +2919,7 @@ def main(argv: list[str] | None = None):
         format="%(asctime)s %(levelname)s [api_server] %(name)s: %(message)s",
     )
     quiet_noisy_loggers()
+    log_off_thread()
     api_key = resolve_api_key(args.api_key)
     api_key_guard.set(api_key)
     # The Rust frontend gets the key explicitly.
@@ -2804,6 +2927,19 @@ def main(argv: list[str] | None = None):
 
     with open(args.config) as f:
         config = yaml.safe_load(f)
+
+    if args.rust_frontend and lora_enabled(config):
+        # The Rust frontend translates OpenAI requests itself: it does not map the `model`
+        # field onto an adapter, so it would serve every request on the base model.
+        raise SystemExit(
+            "LoRA adapters (`resources: lora:` in the serving config) are served by the "
+            "Python frontend only; drop --rust-frontend"
+        )
+    if args.rust_frontend:
+        from mstar.api_server.rust_frontend import find_server_binary
+
+        # Before anything loads, so a missing or stale binary fails fast.
+        rust_frontend_bin = find_server_binary(args.rust_frontend_bin)
 
     model_name = config.get("model", "dummy")
     # Forward yaml-level model_kwargs to the API-server-side lightweight
@@ -2818,11 +2954,13 @@ def main(argv: list[str] | None = None):
         cache_dir=args.cache_dir,
         **{**model_init_kwargs(model_name), **yaml_model_kwargs},
     )
-    # before any thread: the pools are sized from the CPUs it leaves unpinned
+    # before any pool thread: the pools are sized from the CPUs it leaves unpinned
     try:
         cpus.install(deployment_cpu_plan(config))
     except cpus.CpuPlanError as e:
         raise SystemExit(f"mstar: {e}") from None
+    if knobs.idle_hold() == "qos":
+        logger.info(cpus.hold_idle())
     _set_preprocess_threads(model, config)
 
     global api_server
@@ -2862,7 +3000,12 @@ def main(argv: list[str] | None = None):
             args.tcp_transfer_device
         ),
         # The API server drops these until enable_metrics(), after the warmups.
-        kwargs={"status_interval_s": STATUS_INTERVAL_S if args.enable_metrics else None},
+        kwargs={
+            "status_interval_s": STATUS_INTERVAL_S if args.enable_metrics else None,
+            "lora_adapter_digests": {
+                name: digest.hex() for name, digest in api_server.lora_adapter_digests.items()
+            },
+        },
     )
     conductor_proc.start()
     logger.info("Conductor process started (pid=%d, model=%s)", conductor_proc.pid, model_name)
@@ -2879,8 +3022,12 @@ def main(argv: list[str] | None = None):
         # client never sees the first request of a shape.
         warmups = config.get("warmup_requests") or []
         if warmups:
-            logger.info("Running %d warmup request(s) before binding", len(warmups))
-            _run_warmup_requests(api_server, warmups)
+            replicas = _data_parallel_replicas(model, args.config)
+            logger.info(
+                "Running %d warmup request(s) before binding, %s%d copies at a time (one per replica)",
+                len(warmups), "each once alone, then " if replicas.fewest < replicas.most else "", replicas.most,
+            )
+            _run_warmup_requests(api_server, warmups, replicas)
         if args.enable_metrics:
             api_server.enable_metrics()
         if args.rust_frontend:
@@ -2888,7 +3035,6 @@ def main(argv: list[str] | None = None):
 
             from mstar.api_server.rust_frontend import (
                 RustFrontendBridge,
-                find_server_binary,
                 launch_rust_server,
             )
 
@@ -2897,7 +3043,7 @@ def main(argv: list[str] | None = None):
             # default; --host 0.0.0.0 for the multi-node / container case).
             os.environ.setdefault("MSTAR_SERVER_HOST", args.host)
             rust_proc = launch_rust_server(
-                find_server_binary(args.rust_frontend_bin), model_name,
+                rust_frontend_bin, model_name,
                 args.port, bridge_dir, args.upload_dir, api_key=api_key)
             logger.info("Starting mstar API server (Rust frontend) on port %s",
                         args.port)

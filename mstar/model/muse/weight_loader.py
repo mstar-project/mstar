@@ -25,6 +25,13 @@ _STACKED_PARAMS: list[StackedParamRule] = [
     StackedParamRule(".mlp.gate_up_proj", ".mlp.up_proj", 1),
 ]
 
+# the ViT's q/k/v load into the shared block's one fused projection
+_VISION_STACKED: list[StackedParamRule] = [
+    StackedParamRule(".attn.qkv", f".attn.{shard}_proj", shard) for shard in ("q", "k", "v")
+]
+# the shared block's MLP names
+_VISION_RENAMES = {".mlp.fc1.": ".mlp.linear_fc1.", ".mlp.fc2.": ".mlp.linear_fc2."}
+
 _TEXT_PREFIX = "model.language_model."
 _LM_HEAD = "lm_head.weight"
 _VISION = {
@@ -46,7 +53,10 @@ def text_name_remapper(name: str) -> str | None:
 def vision_name_remapper(name: str) -> str | None:
     for prefix, ours in _VISION.items():
         if name.startswith(prefix):
-            return ours + name[len(prefix):]
+            name = ours + name[len(prefix):]
+            for theirs, shared in _VISION_RENAMES.items():
+                name = name.replace(theirs, shared)
+            return name
     return None
 
 
@@ -78,4 +88,5 @@ def load_vision_weights(
     return _load(
         model, path, device, vision_name_remapper,
         [{"prefix": prefix} for prefix in _VISION],
+        stacked=_VISION_STACKED,
     )

@@ -62,7 +62,6 @@ from mstar.model.waypoint.submodules import (
     ROLLOUT_WALK,
     WaypointDitSubmodule,
     WaypointVaeEncoderSubmodule,
-    _rollout_capture_batch_sizes,
 )
 from mstar.model.waypoint.waypoint_model import (
     DIT_NODE,
@@ -944,25 +943,6 @@ def test_both_dit_walks_are_optional_captures(submodule, config):
     assert rollout["noise"].shape == prime["latent"].shape
     assert rollout["noise"].dtype == prime["latent"].dtype
     assert submodule.disable_torch_compile is True
-
-
-@pytest.mark.parametrize(
-    "step_batch_size, expected",
-    [
-        (1, [1]),
-        (2, [1, 2]),
-        (3, [1, 2, 3]),
-        (4, [1, 2, 4]),
-        (6, [1, 2, 4, 6]),
-        (8, [1, 2, 4, 8]),
-        (16, [1, 2, 4, 8, 16]),
-    ],
-)
-def test_rollout_capture_batch_sizes_is_geometric(step_batch_size, expected):
-    """Powers of two up to B, then B itself -- so startup grows with log B, not
-    B. B that is itself a power of two ends on it once (no duplicate); a B that
-    is not appends the odd top bucket the padding path rounds up to."""
-    assert _rollout_capture_batch_sizes(step_batch_size) == expected
 
 
 def test_both_walks_capture_the_same_geometric_buckets(config):

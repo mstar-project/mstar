@@ -7,6 +7,7 @@ including the ones that used to fail on every worker after spawn, and two
 that several problems come back together. The input limit is checked
 against the Rust graph runtime's own compiler.
 """
+import dataclasses
 import re
 from dataclasses import dataclass, field
 
@@ -106,11 +107,8 @@ def _a_then_b():
 
 
 @pytest.mark.parametrize("env,pattern", [
-    ({"MSTAR_RUST_GRAPH": "2"}, r"MSTAR_RUST_GRAPH must be 0, 1, or AUTO; got '2'"),
-    ({"MSTAR_RUST_ZMQ": "yes"}, r"MSTAR_RUST_ZMQ must be 0, 1, or AUTO; got 'YES'"),
     ({"MSTAR_WIRE_CODEC": "pickle"}, r"MSTAR_WIRE_CODEC must be msgpack; got 'pickle'"),
-    ({"MSTAR_RUST_GRAPH": "1", "MSTAR_RUST_ZMQ": "0"}, r"MSTAR_RUST_GRAPH=1 needs the Rust communicator"),
-], ids=["graph_runtime", "transport", "codec", "rust_graph_on_pyzmq"])
+], ids=["codec"])
 def test_bad_runtime_knob_is_refused_in_the_conductor(env, pattern, tmp_path, monkeypatch):
     """Each worker read these as it started and raised there, once per rank."""
     for key, value in env.items():
@@ -136,6 +134,11 @@ def test_missing_node_groups_is_refused(tmp_path):
     cfg = tmp_path / "cfg.yaml"
     cfg.write_text("max_seq_len: 64\n")
     _refused(_Model(), str(cfg), r"must define `node_groups`")
+
+
+def test_unknown_autocast_dtype_is_refused(tmp_path):
+    """Each worker refused it after spawn."""
+    _refused(_Model(), _cfg(tmp_path, autocast_dtype="bf16"), r"autocast_dtype 'bf16' is not a torch dtype")
 
 
 @pytest.mark.parametrize("node_groups,pattern", [
@@ -282,8 +285,8 @@ def _wide(n):
 
 @pytest.mark.parametrize("n", [MAX_NODE_INPUTS, MAX_NODE_INPUTS + 1])
 def test_input_limit_matches_the_rust_runtime(n, tmp_path):
-    """Both runtimes take the same nodes: the Python one used to accept a node
-    the Rust one refused when a worker compiled its graph."""
+    """The conductor refuses a node the graph runtime would refuse when a
+    worker compiled its graph."""
     model = _Model(_wide(n))
     cfg = _cfg(tmp_path, [{"node_names": ["wide"], "ranks": [0]}])
     if n > MAX_NODE_INPUTS:
@@ -481,8 +484,22 @@ def test_resource_over_local_nodes_in_different_parallel_groups_is_refused(tmp_p
     ([_Spec("kv", {"llm"}, deps={"kv"})], {}, r"resource 'kv' depends on itself"),
     ([_Spec("a", {"llm"}, deps={"b"}), _Spec("b", {"llm"}, deps={"a"})], {},
      r"dependency cycle among resources \['a', 'b'\]"),
+    # NaN would make every replica's cost NaN, and every DP ingest fail
+    ([_Spec("kv", {"llm"})], {"routing_weights": {"prefix": float("nan")}},
+     r"routing_weights.prefix must be a number from 0 to 1e\+06; got nan"),
+    # finite, but a busy replica's cost overflows to inf, and inf - inf is NaN
+    ([_Spec("kv", {"llm"})], {"routing_weights": {"load": 1e308, "prefix": 1e308}},
+     r"routing_weights.load must be a number from 0 to 1e\+06; got 1e\+308"),
+    # a weight is per term of the cost, not per resource
+    ([_Spec("kv", {"llm"})], {"routing_weights": {"kv": 2.0}},
+     r"routing_weights names \['kv'\]; it takes \['load', 'prefix'\]"),
+    # named on its own, not as a config the resource checks could not read, empty too
+    ([_Spec("kv", {"llm"})], {"routing_weights": []}, r"routing_weights must be a mapping"),
+    # nothing would spread a hot prefix
+    ([_Spec("kv", {"llm"})], {"routing_weights": {"load": 0}}, r"routing_weights.load must be above 0"),
 ], ids=["top_level_kv_cache", "unknown_resource", "bad_override", "duplicate_key", "missing_dependency",
-        "self_dependency", "cycle"])
+        "self_dependency", "cycle", "routing_weight_not_finite", "routing_weights_overflow",
+        "routing_weight_per_resource", "routing_weights_not_a_mapping", "routing_load_0"])
 def test_resource_problem_is_refused_in_the_conductor(specs, extra, pattern, tmp_path, monkeypatch):
     """EngineManager.build and Engine.load_model raised these on every worker."""
     with pytest.raises(DeploymentError, match=pattern):
@@ -528,6 +545,54 @@ def test_prefix_stream_laying_out_an_undeclared_resource_is_refused(tmp_path):
     )
 
 
+# -- LoRA ---------------------------------------------------------------------
+
+
+def _lora_spec(key="lora", nodes=("llm",)):
+    from test_lora_pool import make_spec  # skips the test without safetensors
+
+    return dataclasses.replace(make_spec({}), resource_key=key, nodes=set(nodes))
+
+
+class _LoraModel(_Model):
+    def __init__(self, lora, *args, **kw):
+        super().__init__(*args, **kw)
+        self._lora = lora
+
+    def get_lora_specs(self):
+        return list(self._lora)
+
+
+def test_a_lora_deployment_passes(tmp_path):
+    """The pass checks the specs the YAML turns on, as the workers build them: the
+    model's declaration alone has no `lora` resource for the block to override."""
+    _validate(_LoraModel([_lora_spec()]), _cfg(tmp_path, resources={"lora": {"max_slots": 2}}))
+
+
+@pytest.mark.parametrize("serves_lora, block, refusal", [
+    (True, {"max_slots": 0}, "resources.lora: max_slots must be an integer >= 1; got 0"),
+    # reported once, not again as an unknown resource
+    (False, {"max_slots": 0}, "declaring the LoRA specs failed: ValueError: the serving config "
+                              "has a `resources: lora:` block, but _LoraModel serves no LoRA adapters"),
+    (True, None, "declaring the LoRA specs failed: ValueError: `resources: lora:` must be a mapping; got None"),
+], ids=["bad_value", "no_lora_specs", "not_a_mapping"])
+def test_a_bad_lora_value_is_reported_with_the_other_problems(tmp_path, serves_lora, block, refusal):
+    """The `lora:` block sizes every LoRA spec; a bad value there is one problem, and the
+    other resources' checks still run."""
+    cfg = _cfg(tmp_path, [
+        {"node_names": ["a"], "ranks": [0, 1], "tp_size": 2},
+        {"node_names": ["b"], "ranks": [2]},
+    ], resources={"lora": block})
+    model = _LoraModel(
+        [_lora_spec(nodes={"a"}), _lora_spec("lora_b", nodes={"b"})] if serves_lora else [],
+        _a_then_b, specs=[_Spec("kv", {"a", "b"})], tp_enabled_nodes=["a"],
+    )
+    assert _problems(model, cfg) == [
+        refusal,
+        "Resource spec kv nodes ['a', 'b'] must use the same TP x SP shape across replicas",
+    ]
+
+
 # -- every problem at once ----------------------------------------------------
 
 
@@ -544,7 +609,7 @@ def test_client_stream_settings_are_reported_with_the_rest(tmp_path):
 def test_problems_from_every_stage_are_reported_together(tmp_path, monkeypatch):
     """A knob, a YAML key, the model's hook, placement and a resource override
     come back in one error, and no worker is started."""
-    monkeypatch.setenv("MSTAR_RUST_GRAPH", "on")
+    monkeypatch.setenv("MSTAR_WIRE_CODEC", "pickle")
     launched = []
 
     def launch(conductor):
@@ -559,14 +624,14 @@ def test_problems_from_every_stage_are_reported_together(tmp_path, monkeypatch):
     with pytest.raises(DeploymentError) as refusal:
         Conductor(model, str(cfg), socket_path_prefix=str(tmp_path / "s"))
     assert refusal.value.problems == [
-        "MSTAR_RUST_GRAPH must be 0, 1, or AUTO; got 'on'",
+        "MSTAR_WIRE_CODEC must be msgpack; got 'pickle'",
         "the config must define `max_seq_len`",
         "no admit queue",
         "node 'llm' of graph walk 'decode' is placed by no node_groups entry; place it in exactly "
         "one node_groups entry for that walk (use graph_walks to give one node different ranks per walk).",
         "serving config overrides unknown resource(s) ['vk']; this model declares ['kv']",
     ]
-    assert str(refusal.value).startswith(f"{cfg}: 5 problems; no worker was started:\n  - MSTAR_RUST_GRAPH")
+    assert str(refusal.value).startswith(f"{cfg}: 5 problems; no worker was started:\n  - MSTAR_WIRE_CODEC")
     assert not launched
 
 

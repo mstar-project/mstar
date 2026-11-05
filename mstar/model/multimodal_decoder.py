@@ -64,6 +64,7 @@ from mstar.model.utils import TextOutput, load_generation_defaults
 SAMPLING_KEYS = (
     "temperature", "top_p", "top_k", "min_p",
     "repetition_penalty", "penalize_prompt", "ignore_eos",
+    "return_logprobs", "logprobs_mode",
 )
 
 # A mixed step's prompt rows (as many as `max_rows_in_combined` lets in) take
@@ -119,6 +120,7 @@ class MultimodalDecoderModel(Model):
     # 35-130 ms); at 4, preprocessing held at 7-10 ms and p95 at 49 ms. One
     # thread is steadier but slower (13 ms).
     PREPROCESS_TORCH_THREADS = 4
+    INTERNAL_KWARGS = (MEDIA_LAYOUT,)
     # in errors and logs
     NAME: str
     # what the API and conductor processes download: enough to build the
@@ -132,9 +134,15 @@ class MultimodalDecoderModel(Model):
     # by `__init__`; a model built without it reads none)
     sampling_defaults: Mapping[str, object] = MappingProxyType({})
 
-    def __init__(self, model_path_hf: str, cache_dir: str | None = None):
+    def __init__(
+        self, model_path_hf: str, cache_dir: str | None = None,
+        prefill_token_buckets: list[int] | None = None,
+    ):
         self.model_path_hf = model_path_hf
         self.cache_dir = cache_dir
+        # a deployment's captured text-prefill ladder for the LLM node
+        # (`model_kwargs.prefill_token_buckets`; None keeps the node's own)
+        self.prefill_token_buckets = prefill_token_buckets
         self.local_dir = self._resolve_model_metadata()
         # so weights are materialized at most once per node
         self._submodule_cache: dict[str, NodeSubmodule | None] = {}
@@ -183,9 +191,8 @@ class MultimodalDecoderModel(Model):
         return media_walks(self.config.max_position_embeddings, self.encoders)
 
     def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
-        # the request's output budget; the stop check counts decode tokens only,
-        # so a reply is max_tokens + 1 tokens, as on main (#604)
-        return {"decode_loop": self.get_max_output_tokens(**model_kwargs)}
+        # the prefill emits the first of max_output_tokens, so the loop runs one fewer
+        return {"decode_loop": max(1, self.get_max_output_tokens(**model_kwargs) - 1)}
 
     # -----------------------------------------------------------------------
     # KV layout
@@ -241,8 +248,13 @@ class MultimodalDecoderModel(Model):
         layout (`intake`)."""
         prompt_in = self.intake(prompt, input_modalities, tensors, prompt_parts, **kwargs)
         layout = self.prompt_layout(prompt_in)
+        # the raw attachments are spent once prepared (the encoders read their
+        # inputs): don't hold them for the request's life
+        spent = {
+            f"{m.modality}_inputs": [] for m in self.media if (tensors or {}).get(f"{m.modality}_inputs")
+        }
         return ProcessPromptOutput(
-            {"text_inputs": [prompt_in.pads.ids], **prompt_in.inputs},
+            {"text_inputs": [prompt_in.pads.ids], **spent, **prompt_in.inputs},
             {MEDIA_LAYOUT: layout, "kv_layout": self.kv_layout(layout, int(prompt_in.pads.ids.numel()))},
         )
 

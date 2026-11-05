@@ -23,7 +23,7 @@ from mstar.engine.resources.base import EngineResourceInfo, Resource
 from mstar.engine.resources.dsa.config import DSAConfig, DSASpec, DSAStep
 from mstar.engine.resources.kv.plan import KVPlanOutputs
 from mstar.engine.resources.step import StepContext
-from mstar.utils.h2d import PinnedStager
+from mstar.utils.h2d import to_device_nonblocking
 
 _INITIAL_CAPACITY = 64
 _MAIN = "main"
@@ -183,8 +183,6 @@ class DSAManager(Resource):
         self._device = device
         self.keys = IndexKeyStore()
         self._plans: dict[str, DSAPlan] = {}
-        # a selecting step's page tables, in one pinned H2D per label
-        self._page_stager = PinnedStager(torch.long)
 
     def depends_on(self) -> set[str]:
         return {self.config.kv_cache}
@@ -229,7 +227,7 @@ class DSAManager(Resource):
         pages = [page for span in plan.spans for page in span.pages]
         offsets = list(itertools.accumulate((len(span.pages) for span in plan.spans[:-1]), initial=0))
         starts = [span.page_start for span in plan.spans]
-        staged = self._page_stager.to_device(pages + offsets + starts, self._device)
+        staged = to_device_nonblocking(pages + offsets + starts, self._device, dtype=torch.long)
         n, rows = len(pages), len(plan.spans)
         plan.pages = staged[:n]
         plan.row_page_offset = staged[n:n + rows]

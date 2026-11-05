@@ -61,3 +61,29 @@ def test_the_kernel_follows_a_packed_capture_not_the_spans(force_prefill, spans,
     gdn._build_plan("main", segments, addressing, ctx)
 
     assert gdn.kinds == [kind]
+
+
+@pytest.mark.parametrize("walk,inputs,length", [
+    ("decode", {}, 1),
+    ("prefill_text", {"text_inputs": [torch.zeros(7, dtype=torch.long)]}, 7),
+    ("prefill_vision", {"text_inputs": [torch.zeros(7, dtype=torch.long)]}, None),
+])
+def test_text_and_decode_rows_report_their_length(walk, inputs, length):
+    info = object.__new__(LLMSubmodule).get_input_sequence_len(walk, None, inputs)
+
+    assert (info.seq_len if info is not None else None) == length
+
+
+def test_text_prefill_chunks_under_a_budget_that_fits_the_captures():
+    model = Qwen3_5DenseModel.__new__(Qwen3_5DenseModel)
+    model.config = SimpleNamespace(max_position_embeddings=4096)
+    model.vision_config = None
+    policies = model.chunking_policy_of()
+
+    assert policies[("LLM", "prefill_text")].chunkable
+    assert ("LLM", "prefill_vision") not in policies
+    mixed = policies[("LLM", MIXED)]
+    assert not mixed.chunkable and mixed.max_batch_tokens == LLMSubmodule.MAX_BATCH_TOKENS
+    # decode rows count inside the budget, and a step over a bucket pads to the next one up
+    assert LLMSubmodule.MAX_BATCH_TOKENS in LLMSubmodule.PREFILL_TOKEN_BUCKETS
+

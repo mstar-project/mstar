@@ -54,6 +54,10 @@ class VisionEncoderSubmodule(PackedBlockLoopEncoder):
     # `embed` ends on `ln_pre`, which autocast runs and returns in fp32, so
     # the block loop's residual stream and rope tables are fp32
     BLOCK_LOOP_DTYPE = torch.float32
+    # One request a step: ``window_index`` and ``output_index`` index a
+    # request's own patches, so two requests' do not pack by concatenation,
+    # and the config has no ``spatial_merge_size`` to cut the output apart by.
+    MAX_BATCH_SIZE = 1
 
     def prepare_inputs(
         self,

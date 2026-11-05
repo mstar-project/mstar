@@ -23,7 +23,7 @@ from mstar.engine.resources.kv.page_copier import make_page_copier
 from mstar.engine.resources.kv.prefix_index import PrefixIndex
 
 if TYPE_CHECKING:
-    from mstar.engine.resources.kv.manager import PageArena
+    from mstar.engine.resources.kv.arena import PageArena
 
 logger = logging.getLogger(__name__)
 
@@ -73,7 +73,7 @@ class CPUPagePool:
         # be async
         self.cpu_kv_cache = torch.empty(
             kv_cache.tensor.shape[0],
-            arena.allocator.max_num_pages,
+            arena.max_num_pages,
             *kv_cache.tensor.shape[2:],  # one page: K/V axis under NHD, latent under MLA
             dtype=kv_cache.dtype,
             device="cpu",
@@ -159,7 +159,7 @@ class CPUPagePool:
             "(%d of %d pages free; %d more offloads refused since the last "
             "warning)",
             n_pages, rid, label, self.arena.num_free,
-            self.arena.allocator.max_num_pages, self._refused_unlogged,
+            self.arena.max_num_pages, self._refused_unlogged,
         )
         self._refused_logged_at = now
         self._refused_unlogged = 0

@@ -20,7 +20,7 @@ import torch.nn.functional as F
 
 from mstar.distributed.communication import CommGroup
 from mstar.model.components.distributed.linear import RowParallelLinear
-from mstar.model.loader.base import _apply_stacked
+from mstar.model.loader.base import apply_stacked
 from mstar.model.muse.components.text import (
     GatedQKVParallelLinear,
     MuseGlimmerForCausalLM,
@@ -40,6 +40,7 @@ from mstar.model.muse.config import (
 )
 from mstar.model.muse.weight_loader import (
     _STACKED_PARAMS,
+    _VISION_STACKED,
     text_name_remapper,
     vision_name_remapper,
 )
@@ -469,7 +470,7 @@ def test_every_text_parameter_has_a_checkpoint_tensor(ckpt_dir):
         model = MuseGlimmerForCausalLM(MuseGlimmerConfig.from_hf(ckpt_dir))
     targets = {}
     for name in _checkpoint_text_names(N_LAYERS):
-        target, shard = _apply_stacked(text_name_remapper(name), _STACKED_PARAMS)
+        target, shard = apply_stacked(text_name_remapper(name), _STACKED_PARAMS)
         targets.setdefault(target, set()).add(shard)
     params = {n for n, _ in model.named_parameters()}
     assert params == set(targets)
@@ -494,13 +495,20 @@ def test_every_vision_parameter_has_a_checkpoint_tensor():
         for mod in ("attn.q_proj", "attn.k_proj", "attn.v_proj", "attn.proj",
                     "mlp.fc1", "mlp.fc2", "norm1", "norm2"):
             names += [f"model.vision_tower.layers.{i}.{mod}.{p}" for p in ("weight", "bias")]
-    assert {vision_name_remapper(n) for n in names} == {n for n, _ in tower.named_parameters()}
+    targets: dict[str, set] = {}
+    for name in names:
+        target, shard = apply_stacked(vision_name_remapper(name), _VISION_STACKED)
+        targets.setdefault(target, set()).add(shard)
+    assert set(targets) == {n for n, _ in tower.named_parameters()}
+    # the split q/k/v land in the shared block's one fused projection
+    assert targets["layers.0.attn.qkv.weight"] == {"q", "k", "v"}
     assert vision_name_remapper("model.language_model.norm.weight") is None
 
 
-def test_a_checkpoint_tensor_with_no_parameter_here_is_refused(tmp_path):
-    """A weighted norm or a bias this port lacks would otherwise be dropped,
-    and the tower would run without it."""
+def test_the_vision_checkpoint_loads_and_refuses_a_tensor_with_no_parameter(tmp_path):
+    """The checkpoint's split q/k/v land in the shared block's fused rows, and
+    its MLP under the shared names. A weighted norm or a bias this port lacks
+    would otherwise be dropped, and the tower would run without it."""
     from safetensors.torch import save_file
 
     from mstar.model.muse.components.vision import MuseGlimmerVisionModel
@@ -518,9 +526,19 @@ def test_a_checkpoint_tensor_with_no_parameter_here_is_refused(tmp_path):
                 return theirs + ours[len(prefix):]
         return "model.vision_tower." + ours
 
-    tensors = {checkpoint_name(n): p.detach().clone() for n, p in tower.named_parameters()}
+    # as the checkpoint stores them: q, k and v apart, the MLP as fc1/fc2
+    tensors = {}
+    for name, param in tower.named_parameters():
+        name = checkpoint_name(name).replace(".mlp.linear_fc", ".mlp.fc")
+        if ".attn.qkv." in name:
+            for shard, part in zip("qkv", torch.randn_like(param).chunk(3), strict=True):
+                tensors[name.replace(".attn.qkv.", f".attn.{shard}_proj.")] = part.contiguous()
+        else:
+            tensors[name] = param.detach().clone()
     save_file(tensors, str(tmp_path / "model.safetensors"))
     load_vision_weights(tower, tmp_path)
+    split = [tensors[f"model.vision_tower.layers.0.attn.{s}_proj.weight"] for s in "qkv"]
+    assert torch.equal(tower.layers[0].attn.qkv.weight, torch.cat(split))
     tensors["model.vision_tower.layers.0.attn.q_norm.weight"] = torch.ones(8)
     save_file(tensors, str(tmp_path / "model.safetensors"))
     with pytest.raises(ValueError, match="no parameter here"):
@@ -604,6 +622,16 @@ def test_a_checkpoint_intake_would_misread_is_refused(model_dir, monkeypatch, pr
         glimmer_model.MuseGlimmerModel(str(model_dir))
 
 
+def test_a_deployment_s_prefill_ladder_reaches_the_llm(model_dir, monkeypatch):
+    """``model_kwargs.prefill_token_buckets`` is the LLM node's captured
+    ladder, not dropped in ``**kwargs``."""
+    from mstar.model.muse import glimmer_model, weight_loader
+
+    monkeypatch.setattr(weight_loader, "load_text_weights", lambda *args, **kwargs: None)
+    model = glimmer_model.MuseGlimmerModel(str(model_dir), prefill_token_buckets=[64, 32])
+    assert model._create_submodule("LLM", "cpu", torch.float32, None).PREFILL_TOKEN_BUCKETS == [32, 64]
+
+
 def test_the_tokenizer_s_eot_stops_without_a_generation_config(model_dir):
     from mstar.model.muse import glimmer_model
 
@@ -649,6 +677,8 @@ def test_each_image_expands_to_its_tokens_with_one_bos(model_dir, low):
     assert (t, h % 2, w % 2) == (1, 0, 0)
     assert "image_grid_thw" not in out
     assert out["pixel_values"][0].shape == (h * w, 2 * 3 * 14 * 14)
+    # the raw image is spent: not held in the request's tensors for its life
+    assert out["image_inputs"] == []
     (offset,), (n,) = layout["offset"], layout["tokens"]
     assert n == h * w // 4 and ids.count(9) == n
     assert ids[offset - 1:offset + n + 1] == [5] + [9] * n + [6]

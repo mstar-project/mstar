@@ -5,10 +5,14 @@ pinned cases need an accelerator, since there is nothing to pin without one.
 
 from __future__ import annotations
 
+import types
+
+import numpy as np
 import pytest
 import torch
 
-from mstar.utils.h2d import to_device_nonblocking
+from mstar.utils import h2d
+from mstar.utils.h2d import PinnedStager, to_device_nonblocking
 
 
 @pytest.fixture(params=["cuda", "xpu"])
@@ -44,3 +48,48 @@ def test_a_non_contiguous_input_is_copied_correctly(accelerator_device):
 def test_an_empty_tensor_arrives_with_its_shape(accelerator_device):
     got = to_device_nonblocking(torch.empty(0, 3), accelerator_device)
     assert got.shape == (0, 3) and got.device == accelerator_device
+
+
+@pytest.mark.parametrize("contiguous", [True, False])
+def test_an_already_pinned_tensor_is_copied_from_in_place(monkeypatch, contiguous):
+    """A pinned contiguous source (``NemoLogMel.batch`` pads its clips into pinned
+    memory) is copied from as is, not through a second pinned buffer. Runs on any
+    host: the device is made to take pinned memory and the source to report pinned."""
+    takes_pinned = types.SimpleNamespace(pin_memory=True)
+    monkeypatch.setattr(h2d, "DeviceCapability", types.SimpleNamespace(of=lambda device: takes_pinned))
+    monkeypatch.setattr(torch.Tensor, "is_pinned", lambda self: True)
+    pinned_allocs = []
+    empty = torch.empty
+
+    def spy_empty(*args, pin_memory=False, **kwargs):
+        if pin_memory:
+            pinned_allocs.append(args)
+        return empty(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "empty", spy_empty)
+    source = torch.arange(12.0).reshape(3, 4) if contiguous else torch.arange(12.0).reshape(4, 3).t()
+    got = to_device_nonblocking(source, torch.device("cpu"))
+    # a non-contiguous one is packed into a pinned buffer: ``.to`` would pack it pageable and sync
+    assert (pinned_allocs == []) == contiguous and (got.data_ptr() == source.data_ptr()) == contiguous
+    assert torch.equal(got, source)
+
+
+def test_runs_fill_their_destinations_in_order():
+    stager = PinnedStager(torch.long, numel=4)
+    store = torch.zeros(10, dtype=torch.long)
+    stager.copy_runs_([store[1:3], store[6:9]], [1, 2, 3, 4, 5])
+    assert store.tolist() == [0, 1, 2, 0, 0, 0, 3, 4, 5, 0]
+
+
+def test_runs_past_the_staging_buffer_grow_it(accelerator_device):
+    stager = PinnedStager(torch.long, numel=4)
+    # two runs that together are past one segment, so the claim grows the arena
+    run = stager._seg_numel // 2 + 8
+    store = torch.zeros(4 * run, dtype=torch.long, device=accelerator_device)
+    values = np.arange(1, 2 * run + 1, dtype=np.int64)
+    stager.copy_runs_([store[:run], store[2 * run:3 * run]], values)
+    torch.accelerator.synchronize(accelerator_device)
+    assert stager._seg_numel >= 2 * run
+    assert store[:run].tolist() == values[:run].tolist()
+    assert store[run:2 * run].tolist() == [0] * run
+    assert store[2 * run:3 * run].tolist() == values[run:].tolist()

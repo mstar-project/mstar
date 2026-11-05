@@ -155,6 +155,40 @@ def test_the_walks_run_the_prefill_then_decode_then_finish():
     assert next_prefill_args(meta, {}).request_done
 
 
+@pytest.mark.parametrize("knobs", [
+    {"return_logprobs": True}, {"logprobs_mode": "processed"},
+])
+def test_a_request_sets_its_sampling_knobs(knobs):
+    """Log-probs (#914) reach the sampler's config like every other knob."""
+    from mstar.model.qwen3_5.qwen3_5_model import Qwen3_5DenseModel
+
+    model = object.__new__(Qwen3_5DenseModel)
+    model.sampling_defaults = {}
+    config = model.get_request_resource_configs({}, knobs)[SAMPLER]
+    assert {k: getattr(config, k) for k in knobs} == knobs
+
+
+def test_qwen3_5_floors_a_float_images_levels():
+    """Qwen3.5 (and Qwen3-Omni) hand the processor floored levels, as their
+    parity was measured with; the shared helper rounds by default."""
+    from mstar.model.multimodal import as_uint8_chw
+    from mstar.model.qwen3_5.qwen3_5_model import Qwen3_5DenseModel
+
+    half = torch.full((3, 2, 2), 0.5)  # 127.5 levels
+    assert as_uint8_chw(half).max() == 128 and as_uint8_chw(half, truncate=True).max() == 127
+    model = object.__new__(Qwen3_5DenseModel)
+    model.vision_config = SimpleNamespace(spatial_merge_size=2)
+    seen = []
+
+    def processor(images, return_tensors, **kwargs):
+        seen.extend(images)
+        return {"pixel_values": torch.zeros(4, 8), "image_grid_thw": torch.tensor([[1, 2, 2]])}
+
+    model._image_processor = processor
+    model._image_intake(half, {})
+    assert int(seen[0].max()) == 127
+
+
 def test_a_media_walk_carries_its_layout_in_step_metadata():
     signals = _signals(text_inputs=1, pixel_values=1)
     layout = {"offset": [1], "tokens": [4], "output": ["vision_embeds"], "grid": [[1, 4, 4]]}
@@ -200,6 +234,31 @@ def test_a_media_prompt_hands_its_advance_and_ids_to_the_resources():
     # a mixed step never carries media rows
     assert llm.declare_step(MIXED, [0], [ARNodeInputs(input_seq_len=1, input_ids=torch.tensor([1]))]) \
         .steps[ROPE].advance is None
+
+
+def test_a_padded_media_step_moves_no_position_for_its_padding_rows():
+    """A replay pads a 3-row media batch to the 4-row capture with the
+    capture's own rows; those advance by their (zero) length beside real rows
+    that place their own positions."""
+    from mstar.engine.accelerator_graph_runner import AcceleratorGraphRunner
+    from mstar.engine.resources.step import BucketKey, SlotLease
+    from mstar.model.submodule_base import ARNodeInputs
+
+    llm = _qwen_llm()
+    (config,) = [
+        c for c in llm.get_accelerator_graph_configs(torch.device("cpu"))
+        if c.capture_graph_walk == "prefill_vision"
+    ]
+    rows = [
+        ARNodeInputs(input_seq_len=n, input_ids=torch.full((n,), IMAGE_PAD), resource_step_info=advance)
+        for n, advance in ((10, 6), (4, 4), (7, 5))
+    ]
+    bucket = BucketKey("prefill_vision", bs=4, num_tokens=32)
+    runner = AcceleratorGraphRunner.__new__(AcceleratorGraphRunner)
+    runner._buckets = {bucket: SimpleNamespace(config=config)}
+    padded = runner.pad_inputs(SlotLease(slot=0, bucket=bucket), rows)
+    step = llm.declare_step("prefill_vision", [0, 1, 2, 3], padded)
+    assert step.steps[ROPE].advance == (6, 4, 5, 0)
 
 
 def test_a_media_row_with_the_wrong_row_count_fails_its_request():
@@ -253,7 +312,7 @@ def test_qwen_media_capture_stages_every_media_buffer():
     ]
     for n in config.capture_token_lengths:
         rows = [config.make_node_input(n)]
-        engine_inputs = SimpleNamespace(resources={}, request_ids=[0])
+        engine_inputs = SimpleNamespace(resources={}, request_ids=[0], captured=True)
         out = type(llm).preprocess(llm, "prefill_vision", engine_inputs, rows)
         assert list(out) == ["input_ids", "vision_embeds", "cos_3d", "sin_3d"]
         assert out["vision_embeds"].shape == (n, 8) and out["vision_embeds"].dtype == torch.bfloat16

@@ -5,7 +5,6 @@ import torch
 from jinja2 import TemplateError
 from transformers import AutoTokenizer
 
-from mstar.communication.tensors import NameToTensorList
 from mstar.engine.resources.attn.config import AttentionConfig, AttentionSpec
 from mstar.engine.resources.attn.ragged.config import (
     RaggedAttentionConfig,
@@ -20,7 +19,9 @@ from mstar.engine.resources.linear_attn.config import (
 from mstar.engine.resources.position.config import PositionConfig, PositionSpec
 from mstar.engine.resources.recurrent.config import DeltaNetGeometry, RecurrentStateConfig, RecurrentStateSpec
 from mstar.engine.resources.spec import NodeResourceSpec
-from mstar.model.base import ProcessPromptOutput, TensorAndMetadata
+from mstar.model.base import TensorAndMetadata
+from mstar.model.keys import MIXED
+from mstar.model.media_limits import read_image
 from mstar.model.multimodal import (
     VIDEO,
     PromptPart,
@@ -52,7 +53,7 @@ from mstar.model.qwen3_5.video import (
     group_timestamps,
     sample_video,
 )
-from mstar.model.submodule_base import NodeSubmodule
+from mstar.model.submodule_base import ChunkingPolicy, NodeSubmodule
 from mstar.utils.fast_tokenize import encode_ids
 
 logger = logging.getLogger(__name__)
@@ -74,9 +75,10 @@ class Qwen3_5DenseModel(MultimodalDecoderModel):
         self,
         model_path_hf: str,
         cache_dir: str | None = None,
+        prefill_token_buckets: list[int] | None = None,
         **kwargs: Any,
     ):
-        super().__init__(model_path_hf, cache_dir)
+        super().__init__(model_path_hf, cache_dir, prefill_token_buckets)
         self.config = Qwen3_5Config.from_hf(self.local_dir)
         # None on a text-only checkpoint (`_create_submodule` then refuses a
         # vision_encoder node)
@@ -143,6 +145,7 @@ class Qwen3_5DenseModel(MultimodalDecoderModel):
                 config=AttentionConfig(
                     kv_cache=KV_CACHE,
                     splits=(MIXED_SPLIT,),
+                    decode_fmha=True,
                 ),
             ),
             PositionSpec(
@@ -193,14 +196,30 @@ class Qwen3_5DenseModel(MultimodalDecoderModel):
                     head_dim=vision.head_dim,
                     # A segment per image, not per request: the resize floors
                     # each image at `shortest_edge` pixels. A video frame group
-                    # has no floor; a prompt with more segments runs the block
+                    # has no floor; a step with more segments runs the block
                     # loop eagerly (`VisionEncoderSubmodule._fits_capture`).
-                    max_segments_per_request=(
+                    max_segments_per_step=(
                         VisionEncoderSubmodule.BLOCK_LOOP_PATCH_BUCKETS[-1] // min_patches
                     ),
+                    # the tower's compiled block loop keeps attention in its graph
+                    compile_op=True,
                 ),
             ),
         ]
+
+    # -----------------------------------------------------------------------
+    # Chunked prefill
+    # -----------------------------------------------------------------------
+
+    def get_chunking_policies(self) -> dict[str, tuple[ChunkingPolicy, ...]]:
+        from mstar.model.qwen3_5.submodules import LLMSubmodule
+
+        budget = LLMSubmodule.MAX_BATCH_TOKENS
+        return {"LLM": (
+            ChunkingPolicy(walks=("prefill_text",), chunkable=True, max_batch_tokens=budget),
+            # carries the budget for the steps that mix a chunk with decode rows
+            ChunkingPolicy(walks=(MIXED,), max_batch_tokens=budget),
+        )}
 
     # ------------------------------------------------------------------
     # Model ABC: I/O
@@ -236,14 +255,44 @@ class Qwen3_5DenseModel(MultimodalDecoderModel):
 
     @property
     def video_processor(self):
-        """The checkpoint's ``video_preprocessor_config.json``, lazily."""
+        """The checkpoint's ``video_preprocessor_config.json``, lazily. Its
+        patches are normalized by the image processor's settings
+        (`pixel_normalizer`), so it must agree with them; checked here, on the
+        first video, so a deployment that never sees one never loads it."""
         if self._video_processor is None:
             from transformers import AutoVideoProcessor
 
-            self._video_processor = AutoVideoProcessor.from_pretrained(
+            video = AutoVideoProcessor.from_pretrained(
                 self.local_dir, cache_dir=self.cache_dir,
             )
+            image = self.image_processor
+            for name in ("rescale_factor", "image_mean", "image_std", "temporal_patch_size", "patch_size"):
+                if getattr(video, name) != getattr(image, name):
+                    raise ValueError(f"image and video processors disagree on {name}")
+            self._video_processor = video
         return self._video_processor
+
+    def pixel_normalizer(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Per-column mean and std that turn the intake's byte patches into
+        the processors' normalized pixels: their fused rescale-and-normalize,
+        ``(x - mean / rescale) / (std / rescale)``, element for element. One
+        for images and videos, whose processors share it (`video_processor`)."""
+        processor = self.image_processor
+        scale = 1.0 / processor.rescale_factor
+        mean = torch.tensor(processor.image_mean) * scale
+        std = torch.tensor(processor.image_std) * scale
+        # a patch's columns are channel-major (C x T x P x P)
+        per_channel = processor.temporal_patch_size * processor.patch_size ** 2
+        return mean.repeat_interleave(per_channel), std.repeat_interleave(per_channel)
+
+    def load_image(self, filepath: str, device: str) -> TensorAndMetadata:
+        """The decoded RGB image, left uint8 ``(C, H, W)``.
+
+        The base class hands out floats in [0, 1], which would only be turned
+        back into bytes for the processor: two full-image passes that cost
+        more than the processor itself on a large image.
+        """
+        return TensorAndMetadata(read_image(filepath, rgb=True).to(device))
 
     def load_video(self, filepath: str, device: str) -> TensorAndMetadata:
         """Only the frames the video processor samples, on the host whatever
@@ -276,6 +325,9 @@ class Qwen3_5DenseModel(MultimodalDecoderModel):
             videos=[frames.cpu()],
             video_metadata=[VideoMetadata(**metadata)],
             do_sample_frames=False,
+            # bytes, normalized on the device like images' (`pixel_normalizer`)
+            do_rescale=False,
+            do_normalize=False,
             return_tensors="pt",
         )
         (grid,) = out["video_grid_thw"]
@@ -330,10 +382,13 @@ class Qwen3_5DenseModel(MultimodalDecoderModel):
 
     def _image_intake(self, image: torch.Tensor, metadata: dict) -> PreparedMedia:
         merge = self._merge()
-        # uint8, HWC: the processor rescales by default, so floats would be
-        # rescaled twice and the model would see a near-black image
+        # Resized and patchified here, still bytes: the vision encoder
+        # rescales and normalizes on the device (`pixel_normalizer`). That is
+        # a quarter of the bytes to ship, and the float work was most of this
+        # call (43 of 52 ms for a 2560 px image).
         out = self.image_processor(
-            images=[as_uint8_chw(image).permute(1, 2, 0).numpy()], return_tensors="pt",
+            images=[as_uint8_chw(image, truncate=True).permute(1, 2, 0).numpy()], return_tensors="pt",
+            do_rescale=False, do_normalize=False,
         )
         grid = out["image_grid_thw"][0]
         return PreparedMedia({"pixel_values": out["pixel_values"]}, [int(grid.prod()) // merge ** 2], [grid])
@@ -347,26 +402,6 @@ class Qwen3_5DenseModel(MultimodalDecoderModel):
         return PreparedMedia(
             {"pixel_values": video.pixel_values}, [int(group.prod()) // merge ** 2] * t, [group] * t,
         )
-
-    def process_prompt(
-        self,
-        prompt: str | None,
-        input_modalities: list[str],
-        output_modalities: list[str],
-        tensors: NameToTensorList | None = None,
-        prompt_parts: list[PromptPart] | None = None,
-        **kwargs,
-    ) -> ProcessPromptOutput:
-        """The shared intake: ``text_inputs`` is the whole prompt, one pad per
-        merged vision token, and ``pixel_values`` the images and videos in
-        prompt order; ``MEDIA_LAYOUT`` gives each image and video frame
-        group's offset, tokens and grid, for the tower's grid maths and the
-        LLM's MRoPE positions."""
-        out = super().process_prompt(prompt, input_modalities, output_modalities, tensors, prompt_parts, **kwargs)
-        if (tensors or {}).get("video_inputs"):
-            # the decoded frames are spent; don't hold them for the request's life
-            out.new_input_tensors["video_inputs"] = []
-        return out
 
     def kv_layout(self, layout: dict, length: int, advance: int | None = None) -> dict:
         # an image spans max(h', w') MRoPE positions, not its t * h' * w' tokens
@@ -413,7 +448,7 @@ class Qwen3_5DenseModel(MultimodalDecoderModel):
             tower.requires_grad_(False).eval()
             logger.info("Loaded Qwen3.5 vision tower onto %s", device)
             return VisionEncoderSubmodule(
-                tower, self.vision_config, self.encoder(node_name),
+                tower, self.vision_config, self.encoder(node_name).output, self.pixel_normalizer(),
             )
 
         from mstar.model.qwen3_5.weight_loader import load_qwen3_5_weights
@@ -424,4 +459,7 @@ class Qwen3_5DenseModel(MultimodalDecoderModel):
         load_qwen3_5_weights(model, weights_dir, device=device)
         model.requires_grad_(False).eval()
         logger.info("Loaded Qwen3.5 LLM submodule onto %s", device)
-        return LLMSubmodule(model, self.config, self.vision_config, self.encoders)
+        return LLMSubmodule(
+            model, self.config, self.vision_config, self.encoders,
+            prefill_token_buckets=self.prefill_token_buckets,
+        )

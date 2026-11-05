@@ -50,7 +50,7 @@ def test_build_takes_the_mla_backend_on_a_paged_cache():
                        kv_lora_rank=32, qk_rope_head_dim=0)
     info = SimpleNamespace(
         dependency=lambda key: SimpleNamespace(config=kv),
-        device=torch.device("cpu"), kv_dtype=torch.float32, joint_comm_group=None,
+        device=torch.device("cpu"), kv_dtype=torch.float32, joint_comm_group=None, head_shards=1,
     )
     spec = AttentionSpec(
         resource_key="attn", nodes={"LLM"},
