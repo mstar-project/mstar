@@ -985,12 +985,37 @@ def test_a_step_of_a_node_that_never_chains_repeats_where_the_scheduler_picks_it
     worker = Worker.__new__(Worker)
     worker._step_repeats = StepRepeats({"n": RepeatConfig(max=8)}, {("n", WALK): edges})
     worker._step_repeats.settle(lambda *key: None, lambda *key: None)
-    worker.parallel_nodes = set()
     asked = []
     worker._graph_runtime = SimpleNamespace(loop_room=lambda *args: asked.append(args) or 3)
     batch = ScheduledBatch(node_name="n", graph_walk=WALK, request_to_worker_graph=dict(rows))
     assert worker._unchained_repeats(batch) == (1 if chained else 3)
     assert asked == ([] if chained else [("n", WALK, "loop", [0, 1], 0, False)])
+
+
+@pytest.mark.parametrize("state, why", [
+    (dict(parallel_nodes={"n"}), "TP group"),
+    (dict(streamed=frozenset({"chunk"})), "stream window"),
+    (dict(_ring_signals={"n": {"codes"}}), "ring"),
+    (dict(_signal_consumer={"t": "codec"}, _walk_drivers={"codec": object()}), "consumer"),
+])
+def test_a_node_that_never_chains_says_why_it_cant_repeat(state, why):
+    """Its ask has only the Loop's room to go on, so a walk that needs a chain's
+    other caps says so on its line rather than overrunning them, or reading
+    "on" while it runs one iteration (review-r2 F16)."""
+    streamed = state.pop("streamed", frozenset())
+    worker = Worker.__new__(Worker)
+    worker.parallel_nodes, worker._ring_signals, worker._signal_consumer, worker._walk_drivers = set(), {}, {}, {}
+    worker.__dict__.update(state)
+    worker.engine_manager = SimpleNamespace(get_engine=lambda node: SimpleNamespace(
+        streamed_iteration_inputs=lambda node: streamed,
+    ))
+    worker._graph_runtime = SimpleNamespace(get_output_signals=lambda node, walk: ["t"])
+    assert why in worker._unchained_refusal("n", WALK)
+    worker.__dict__.update(
+        parallel_nodes=set(), _ring_signals={}, _signal_consumer={}, _walk_drivers={},
+    )
+    streamed = frozenset()
+    assert worker._unchained_refusal("n", WALK) is None
 
 
 def test_a_row_declaring_another_stream_than_its_walk_stops_the_worker():

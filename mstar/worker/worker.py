@@ -3045,9 +3045,10 @@ class Worker:
     def _unchained_repeats(self, batch: ScheduledBatch) -> int:
         """The ask for a step the scheduler picked: more than one iteration only
         for a node whose steps never chain (`StepRepeats.unchained_ceiling`), up
-        to its Loop's room with nothing of it in flight. A TP group's step takes
-        its leader's ask."""
-        if self._step_repeats is None or not self._step_repeats.asked or batch.node_name in self.parallel_nodes:
+        to its Loop's room with nothing of it in flight. What the chain's ask
+        caps besides that room, such a walk doesn't repeat with
+        (`_unchained_refusal`)."""
+        if self._step_repeats is None or not self._step_repeats.asked:
             return 1
         key = (batch.node_name, batch.graph_walk)
         edges = self._step_repeats.edges.get(key)
@@ -3094,10 +3095,30 @@ class Worker:
         ctx.fwd_info = None
         return max(1, repeats)
 
+    def _unchained_refusal(self, node_name: str, graph_walk: str) -> str | None:
+        """Why a walk whose steps never chain can't repeat, or None: its ask is
+        made on a step the scheduler picked, which has only the Loop's room to
+        go on (`_unchained_repeats`), not what `_stamp_repeats` also caps."""
+        engine = self.engine_manager.get_engine(node_name)
+        if node_name in self.parallel_nodes:
+            return "deployment: its steps never chain, and only a chain's step carries a TP group's ask"
+        if engine.streamed_iteration_inputs(node_name):
+            return "node: its steps never chain, and only a chain's step is cut to its stream window"
+        if self._ring_signals.get(node_name):
+            return "node: its steps never chain, and only a chain's step is cut to its ring's room"
+        signals = self._graph_runtime.get_output_signals(node_name, graph_walk)
+        if any(self._signal_consumer.get(signal) in self._walk_drivers for signal in signals):
+            return "node: its steps never chain, and only a chain's step keeps its consumer's walk steady"
+        return None
+
     def _repeat_refusal(self, node_name: str, graph_walk: str) -> str | None:
         """Why no step of this walk can stand for several iterations, or None:
         something about its rows has to reach the host every iteration."""
         engine = self.engine_manager.get_engine(node_name)
+        if not self._step_repeats.edges[(node_name, graph_walk)].chained:
+            refusal = self._unchained_refusal(node_name, graph_walk)
+            if refusal is not None:
+                return refusal
         if (node_name, graph_walk) not in self._stop_token_signal:
             # a count stop is the loop's cap, which a run never passes (`loop_room`)
             return "node: the runtime doesn't check its stop: its own check_stop decides"
