@@ -45,6 +45,8 @@ class RepeatConfig:
     refill_at: float | None = None
     # on: the run goes on the device (the WHILE run), with device_stop off taken as skip
     device_launch: str = "off"
+    # send a run's tokens to the client as its replays finish, not when it lands
+    stream_tokens: bool = False
 
     DEVICE_STOPS: ClassVar[tuple[str, ...]] = ("off", "skip", "drop_rows")
 
@@ -69,6 +71,10 @@ class RepeatConfig:
             )
         if config.device_launch == "on" and config.device_stop == "off":
             config = replace(config, device_stop="skip")
+        if type(config.stream_tokens) is not bool:
+            raise ValueError(
+                f"step_repeats for {node!r}: stream_tokens is {config.stream_tokens!r}; it must be a boolean"
+            )
         if config.refill_at is not None and not 0 < config.refill_at <= 1:
             raise ValueError(f"step_repeats for {node!r}: refill_at is {config.refill_at!r}; it must be in (0, 1]")
         default = cls()

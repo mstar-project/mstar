@@ -755,8 +755,14 @@ class RustGraphRuntime(GraphRuntime):
             inline_ptr=iptr, inline_rows=irows, inline_stride=istride, inline_dtype=idtype,
             partition_done=list(request.partition_done), python_send=request.python_send,
             loop_strides=request.loop_strides, token_width=request.token_width,
+            emit_skip=None if request.emit_skip is None else dict(request.emit_skip),
         )
         return self._postprocess_step(out)
+
+    def send_tokens(self, rids: list[int], values: list[int], signal: str, modality: str) -> None:
+        """Send a step's landed tokens ahead of its postprocess, which skips
+        them (``PostprocessRequest.emit_skip``)."""
+        self._rust.send_tokens(rids, values, signal, modality)
 
     def resume_postprocess(
         self, stops: Mapping[int, set[str]] | None = None, dropped: Iterable[int] = (),

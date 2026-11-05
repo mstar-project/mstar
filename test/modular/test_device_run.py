@@ -8,7 +8,7 @@ import torch
 
 from mstar.engine import accelerator_graph_runner as runner_mod
 from mstar.engine.accelerator_graph_runner import AcceleratorGraphRunner
-from mstar.engine.device_run import RUN_REPLAYS, CudaWhile, RunAsk
+from mstar.engine.device_run import RUN_REPLAYS, CudaWhile, RunAsk, TokenStream
 from mstar.engine.resources.step import BucketKey
 from mstar.model.submodule_base import BatchedModelOutput, CarryPair
 
@@ -48,7 +48,7 @@ class _Loop:
                 return
 
 
-def _runner(monkeypatch, loop, tokens, bs=2, limit=6, refill_at=None, carries=None):
+def _runner(monkeypatch, loop, tokens, bs=2, limit=6, refill_at=None, carries=None, stream_tokens=False):
     """A runner holding a captured run whose forward samples ``tokens[iteration]``."""
     monkeypatch.setattr(torch.accelerator, "is_available", lambda: False)
     runner = AcceleratorGraphRunner.__new__(AcceleratorGraphRunner)
@@ -61,7 +61,7 @@ def _runner(monkeypatch, loop, tokens, bs=2, limit=6, refill_at=None, carries=No
         current_stream=lambda: SimpleNamespace(cuda_stream=0),
     )
     runner.ask_run(WALK, RunAsk("new_token", frozenset({EOS}), False, limit, carries or {}, ("frame",), ("cond",),
-                                refill_at))
+                                refill_at, stream_tokens))
     static = {"cond": torch.zeros(bs), "h": torch.zeros(bs)}
     calls = []
 
@@ -189,6 +189,59 @@ def test_a_run_refuses_a_generator_draw_and_a_walk_with_no_while_node():
     assert "torch generator" in runner.run_refusal(WALK)
     runner._graph_backend = SimpleNamespace(while_refusal=lambda: "no node")
     assert runner.run_refusal(WALK) == "backend: no node"
+
+
+def test_a_runs_tokens_land_as_its_replays_finish_and_a_row_ends_at_its_stop(monkeypatch):
+    """What leaves during the run is what the landing would have sent: a row
+    that stops in its first column sends nothing after it."""
+    seen = []
+
+    def to_stop(rid, column, token):
+        return True, token == EOS
+
+    loop = _Loop(on_iteration=lambda i: seen.append(run.state.stream.take(to_stop)))
+    runner, run, _, _ = _runner(monkeypatch, loop, [[EOS, 1], [5, 2], [6, 3]], limit=3, stream_tokens=True)
+    run.state.stream.begin([10, 11])
+    _run(run, 2, 3)
+    assert seen == [([], []), ([10, 11], [EOS, 1]), ([11], [2])]
+    assert run.state.stream.take(lambda rid, column, token: (True, False)) == ([11], [3])
+    assert run.state.stream.sent == {10: 1, 11: 3}
+
+
+def test_the_worker_sends_a_runs_tokens_for_live_rows_up_to_their_limits():
+    """A row that stopped before the wait sends nothing, one that asked for
+    log-probs waits for the landing, and an iteration limit ends a row as the
+    landing's stop would."""
+    from mstar.model.submodule_base import StopKind, StopPolicy
+    from mstar.worker.worker import Worker
+
+    worker = Worker.__new__(Worker)
+    sent = []
+    worker._graph_runtime = SimpleNamespace(send_tokens=lambda *args: sent.append(args))
+    policy = StopPolicy(StopKind.AR, "t", {EOS}, sampler="s", withhold=("text",))
+    worker._streamed = {("n", WALK): (policy, "text", "text")}
+    worker._innermost_loop_by_node = {(WALK, "n"): "loop"}
+
+    def info(count, max_tokens, **config):
+        return SimpleNamespace(
+            max_tokens=max_tokens, dynamic_loop_iter_counts={"loop": count},
+            resource_configs={"s": SimpleNamespace(ignore_eos=False, **config)},
+        )
+
+    stream = TokenStream(4, 3, CPU)
+    stream.begin([1, 2, 3, 4])
+    stream.tokens.copy_(torch.tensor([[5, 6, 7], [8, 9, 10], [11, 12, 13], [14, EOS, 15]]))
+    stream.landed[0] = 3
+    done = iter([False, True])
+    worker._stream_tokens(SimpleNamespace(
+        node_name="n", graph_walk=WALK,
+        node_batch=SimpleNamespace(
+            token_stream=stream, request_ids=[1, 3, 4], completion_event=SimpleNamespace(query=lambda: next(done)),
+            per_request_info_wrapped={1: info(8, 10), 3: info(0, 9, return_logprobs=True), 4: info(0, 9)},
+        ),
+    ))
+    # row 1 is at 8 of 10; the end token is withheld, as the landing does
+    assert sent == [([1, 4, 1], [5, 14, 6], "text", "text")] and stream.sent == {1: 2, 4: 1}
 
 
 def test_the_worker_settles_a_run_that_ended_short():

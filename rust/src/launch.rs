@@ -14,8 +14,8 @@ type Memcpy2D = unsafe extern "C" fn(
 const OP_LAUNCH: u64 = 0;
 const OP_COPY: u64 = 1;
 const COPY_WORDS: usize = 6;
-// cudaMemcpyDeviceToDevice
-const DEVICE_TO_DEVICE: i32 = 3;
+// cudaMemcpyDefault: a copy may land in pinned host memory (`stream_tokens`)
+const COPY_DEFAULT: i32 = 4;
 
 /// `ops`, flat: a launch is `[0]`, a copy
 /// `[1, dst, dst_pitch, src, src_pitch, width, height]`, in bytes.
@@ -35,7 +35,7 @@ fn run(launch: GraphLaunch, copy: Memcpy2D, exec: usize, stream: usize, ops: &[u
                 unsafe {
                     copy(
                         args[0] as *mut c_void, args[1] as usize, args[2] as *const c_void, args[3] as usize,
-                        args[4] as usize, args[5] as usize, DEVICE_TO_DEVICE, stream,
+                        args[4] as usize, args[5] as usize, COPY_DEFAULT, stream,
                     )
                 }
             }

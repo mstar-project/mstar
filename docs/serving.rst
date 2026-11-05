@@ -352,8 +352,10 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        its stop left them; it needs a resident walk. ``device_launch: on`` asks for that run
        by itself (``device_stop: skip`` unless set). Both need a token stop, one rank, CUDA
        12.4 and up, ``libcudadevrt.a`` under ``CUDA_HOME``, and a capture of kernels and
-       copies alone. At startup the worker logs one line per Loop walk with each capability
-       (``resident``, ``repeats``, ``rows``, ``device stop``, ``launch loop``) ``on``,
+       copies alone. ``stream_tokens: true`` sends a run's tokens to the client as its replays
+       finish rather than when it ends; a row that asked for log-probs still waits for the end.
+       At startup the worker logs one line per Loop walk with each capability
+       (``resident``, ``repeats``, ``rows``, ``device stop``, ``launch loop``, ``stream tokens``) ``on``,
        ``off: not asked for``, or ``off: <owner>: <reason>``. ``launch loop``: a run's launches
        and copies go out from one Rust call with the GIL released; a capture that draws from
        a torch generator, or a backend other than CUDA, keeps the Python loop. ``rows``: a node asked for

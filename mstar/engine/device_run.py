@@ -36,10 +36,13 @@ extern "C" __device__ __cudart_builtin__ void cudaGraphSetConditional(cudaGraphC
 extern "C" __global__ void run_stop(
     const long long* tokens, int stride, int rows, const long long* stop_ids, int num_ids,
     const unsigned char* immune, unsigned char* marks, long long* index, const long long* limit,
-    const long long* refill, const volatile int* yield_word, const unsigned long long* handle
+    const long long* refill, const volatile int* yield_word, const unsigned long long* handle,
+    long long* host_tokens, volatile int* landed, int host_width
 ) {
     int done = 0;
+    long long at = *index;
     for (int row = 0; row < rows; ++row) {
+        if (host_tokens) host_tokens[row * host_width + at] = tokens[row * stride];
         if (!marks[row] && !immune[row]) {
             for (int i = 0; i < num_ids; ++i) {
                 if (tokens[row * stride] == stop_ids[i]) marks[row] = 1;
@@ -47,8 +50,12 @@ extern "C" __global__ void run_stop(
         }
         done += marks[row];
     }
-    long long next = *index + 1;
+    long long next = at + 1;
     *index = next;
+    if (host_tokens) {
+        __threadfence_system();
+        *landed = (int)next;
+    }
     bool go = done < rows && next < *limit && *yield_word == 0 && (*refill == 0 || done < *refill);
     cudaGraphSetConditional(*handle, go ? 1u : 0u);
 }
@@ -70,6 +77,54 @@ class RunAsk(NamedTuple):
     # the static inputs that take a column a replay
     iteration: Collection[str]
     refill_at: float | None = None
+    stream_tokens: bool = False
+
+
+class TokenStream:
+    """A run's tokens in pinned memory as its replays finish
+    (``step_repeats: stream_tokens``): the device writes a column, then
+    ``landed``, and the host sends what has landed while it waits. What it
+    sent, by request, the landing skips."""
+
+    def __init__(self, rows: int, limit: int, device: torch.device):
+        pinned = device.type != "cpu"
+        self.tokens = torch.zeros(rows, limit, dtype=torch.long, pin_memory=pinned)
+        self.landed = torch.zeros(1, dtype=torch.int32, pin_memory=pinned)
+        # what ``landed`` takes after each replay of a host loop
+        self.counts = torch.arange(1, limit + 1, dtype=torch.int32, device=device)
+        self.rids: Sequence[int] = ()
+        self.sent: dict[int, int] = {}
+        self.done: set[int] = set()
+        self.columns = 0
+
+    def begin(self, rids: Sequence[int]) -> None:
+        """Before a run, on the host."""
+        self.landed.zero_()
+        self.rids, self.sent, self.done, self.columns = rids, {}, set(), 0
+
+    def take(self, decide: Callable[[int, int, int], tuple[bool, bool]]) -> tuple[list[int], list[int]]:
+        """What landed since the last call, as rows and tokens in order.
+        ``decide(rid, column, token)`` says whether the token goes and whether
+        it is the row's last: nothing of the row goes after that."""
+        landed = int(self.landed[0])
+        rids: list[int] = []
+        values: list[int] = []
+        if landed == self.columns:
+            return rids, values
+        rows = self.tokens[:len(self.rids), self.columns:landed].tolist()
+        for offset in range(landed - self.columns):
+            for rid, row in zip(self.rids, rows, strict=True):
+                if rid in self.done:
+                    continue
+                send, last = decide(rid, self.columns + offset, row[offset])
+                if send:
+                    rids.append(rid)
+                    values.append(row[offset])
+                    self.sent[rid] = self.sent.get(rid, 0) + 1
+                if last:
+                    self.done.add(rid)
+        self.columns = landed
+        return rids, values
 
 
 class RunState:
@@ -79,9 +134,11 @@ class RunState:
 
     def __init__(
         self, bs: int, token_signal: str, stop_ids: Collection[int], device: torch.device,
-        dropping: Any = None, yield_word: torch.Tensor | None = None,
+        dropping: Any = None, yield_word: torch.Tensor | None = None, stream: TokenStream | None = None,
     ):
         self.token_signal = token_signal
+        # where its tokens land as it goes, for a walk that streams them
+        self.stream = stream
         # a capture that also sends a stopped row's reads and writes to the trash slot
         self.dropping = dropping
         self.index = torch.zeros(1, dtype=torch.long, device=device)
@@ -122,6 +179,9 @@ class RunState:
         """``run_stop``: after a replay, this replay's stops and whether the run goes on."""
         token = tokens.reshape(len(self.marks), -1)[:, 0]
         self.marks |= (token.unsqueeze(-1) == self.stop_ids).any(-1) & ~self.immune
+        if self.stream is not None:
+            self.stream.tokens[:, int(self.index)] = token.cpu()
+            self.stream.landed[0] = int(self.index) + 1
         self.index += 1
         done = self.marks.sum()
         go = ~self.marks.all() & (self.index[0] < self.limit[0]) & (self.yield_word.to(self.index.device)[0] == 0)
@@ -204,6 +264,9 @@ class CudaWhile:
             ctypes.c_void_p(state.index.data_ptr()), ctypes.c_void_p(state.limit.data_ptr()),
             ctypes.c_void_p(state.refill.data_ptr()), ctypes.c_void_p(state.yield_word.data_ptr()),
             ctypes.c_void_p(handle.data_ptr()),
+            ctypes.c_void_p(state.stream.tokens.data_ptr() if state.stream else None),
+            ctypes.c_void_p(state.stream.landed.data_ptr() if state.stream else None),
+            ctypes.c_int(state.stream.tokens.shape[1] if state.stream else 0),
         ]
         args = (ctypes.c_void_p * len(values))(*(ctypes.cast(ctypes.byref(v), ctypes.c_void_p) for v in values))
         self._driver_call(

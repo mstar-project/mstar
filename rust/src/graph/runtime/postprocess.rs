@@ -146,6 +146,8 @@ pub(super) struct Postprocess {
     kept: FxHashMap<u32, u32>,
     /// The iterations the step ran (`PostprocessRequest.token_width`)
     width: usize,
+    /// rid -> the inline values `send_tokens` already sent during the step
+    emit_skip: FxHashMap<u32, u32>,
     phase: Phase,
     stops: Option<Vec<(u32, Vec<String>)>>,
     stopped: Vec<u32>,
@@ -161,11 +163,12 @@ impl Postprocess {
         known_stops: Vec<(u32, Vec<String>)>, runtime_stops: bool,
         tokens: Option<TokenColumn>, row_rids: Vec<u32>, inline: Option<(String, TokenColumn)>,
         partition_done: Vec<u32>, python_send: bool, loop_strides: Option<Vec<u32>>, width: usize,
+        emit_skip: FxHashMap<u32, u32>,
     ) -> Self {
         Postprocess {
             partition, node_name, graph_walk, output_signals, rids, walks, rid_walk_idx,
             known_stops, runtime_stops, tokens, row_rids, inline, partition_done, python_send,
-            loop_strides, kept: FxHashMap::default(), width,
+            loop_strides, kept: FxHashMap::default(), width, emit_skip,
             phase: Phase::Stops, stops: None, stopped: Vec::new(), stored: None, completion_id: 0,
         }
     }
@@ -225,6 +228,7 @@ impl Postprocess {
             inline_signal: s.inline_signal,
             inline_values: s.inline_values,
             inline_tails: s.inline_tails,
+            emit_skip: self.emit_skip.clone(),
             logprobs: s.logprobs,
             walks: if self.rid_walk_idx.is_some() { self.walks.clone() } else { None },
             rid_walk_idx: self.rid_walk_idx.clone(),

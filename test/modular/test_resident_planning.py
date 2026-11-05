@@ -20,7 +20,7 @@ import torch
 sys.path.insert(0, ".")
 
 from mstar.engine.accelerator_graph_runner import AcceleratorGraphRunner  # noqa: E402
-from mstar.engine.device_run import RunState  # noqa: E402
+from mstar.engine.device_run import RunState, TokenStream  # noqa: E402
 from mstar.engine.resources import resident as resident_mod  # noqa: E402
 from mstar.engine.resources.attn.config import AttentionConfig, AttentionSpec  # noqa: E402
 from mstar.engine.resources.attn.flashinfer import FlashInferManager  # noqa: E402
@@ -431,7 +431,7 @@ def _raw_backend(slot):
         ctypes.c_size_t, ctypes.c_int, ctypes.c_void_p,
     )
     def copy(dst, dst_pitch, src, src_pitch, width, height, kind, stream):
-        assert kind == 3 and stream == 2
+        assert kind == 4 and stream == 2
         calls.append("copy")
         for row in range(height):
             ctypes.memmove(dst + row * dst_pitch, src + row * src_pitch, width)
@@ -477,10 +477,13 @@ def test_a_repeat_carries_every_loop_back_signal_and_keeps_a_column_per_replay(r
     runner = AcceleratorGraphRunner.__new__(AcceleratorGraphRunner)
     runner.slot_for = lambda lease: slot
     runner._graph_backend, calls = _raw_backend(slot)
-    wide, rows, _ = runner.repeat(None, carries, 3, (), ["frame"])
+    landing = TokenStream(2, 3, torch.device("cpu"))
+    wide, rows, _ = runner.repeat(None, carries, 3, (), ["frame"], stream=(landing, "new_token"))
     if raw:
         # each replay's columns out, then the next one's carries in and its launch
-        assert calls == ["copy"] * 2 + (["copy"] * 3 + ["launch"] + ["copy"] * 2) * 2
+        assert calls == ["copy"] * 4 + (["copy"] * 3 + ["launch"] + ["copy"] * 4) * 2
+    # a replay's tokens land behind it, and ``landed`` behind them
+    assert landing.tokens.tolist() == wide["new_token"].tolist() and landing.landed.item() == 3
     assert wide["new_token"].tolist() == [[5, 6, 7], [7, 8, 9]]
     assert wide["text_inputs"] is wide["new_token"]
     # the last replay's outputs, each from the replay before's

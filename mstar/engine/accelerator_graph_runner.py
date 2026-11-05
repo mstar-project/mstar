@@ -26,7 +26,7 @@ from mstar.engine.accelerator_graph_config import (
     PiecewiseCaptureShape,
     PiecewiseConfigType,
 )
-from mstar.engine.device_run import DeviceRun, RunAsk, RunState, column_in
+from mstar.engine.device_run import DeviceRun, RunAsk, RunState, TokenStream, column_in
 from mstar.engine.node_dtype import node_scope
 from mstar.engine.resources import BucketKey, CGSlotSpec, Resource, SlotLease, StepContext, StepRunner
 from mstar.engine.resources.loopback_rows import LoopbackRows
@@ -738,6 +738,8 @@ class AcceleratorGraphSlot:
     run: DeviceRun | None = None
     # whether a run of it launches through ``mstar_rust.launch_run``
     raw_launch: bool = False
+    # where a run of it leaves its tokens as they land, for a walk that streams them
+    token_stream: TokenStream | None = None
     # loop-back signal -> the static input this capture reads it into, off the
     # node's rows, at its head
     row_heads: Mapping[str, str] = MappingProxyType({})
@@ -1359,7 +1361,10 @@ class AcceleratorGraphRunner:
             dropping = self._resident.drop_rows(spec.bucket, spec.slot)
         cuda = backend.while_runtime()
         outer, handle, device_handle = cuda.new_loop(self._device)
-        state = RunState(spec.bucket.bs, ask.token_signal, ask.stop_ids, self._device, dropping, self._yield_word)
+        stream = TokenStream(spec.bucket.bs, ask.limit, self._device) if ask.stream_tokens else None
+        state = RunState(
+            spec.bucket.bs, ask.token_signal, ask.stop_ids, self._device, dropping, self._yield_word, stream,
+        )
         inputs = {
             name: torch.zeros(value.shape[0], ask.limit, *value.shape[1:], dtype=value.dtype, device=value.device)
             for name, value in warmed.static_inputs.items() if name in ask.iteration
@@ -1895,6 +1900,7 @@ class AcceleratorGraphRunner:
         self, lease: SlotLease, carries: Mapping[str, CarryPair], repeats: int,
         replay_columns: Collection[tuple[torch.Tensor, torch.Tensor]] = (),
         columns: Collection[str] = (), iteration: Mapping[str, torch.Tensor] | None = None,
+        stream: tuple[TokenStream, str] | None = None,
     ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor], dict[str, torch.Tensor]]:
         """The rest of a step that repeats, after its first replay: before
         each replay, every loop-back signal's output is copied into the static
@@ -1906,7 +1912,8 @@ class AcceleratorGraphRunner:
         replay (``[rows, repeats, ...]``): a replay overwrites what the last
         one left, so each is copied out on the stream before the next one.
         Third, the spans of the spanned ones among ``columns``
-        (``[rows, repeats, 2]``)."""
+        (``[rows, repeats, 2]``). ``stream``: where each replay's tokens land
+        as it finishes, and the stop buffer that holds them."""
         slot = self.slot_for(lease)
         buffers = slot.static_outputs.check_stop_buffers
         rows_out = {name: slot.static_outputs.row_outputs[name] for name in columns}
@@ -1931,12 +1938,27 @@ class AcceleratorGraphRunner:
                 ops.extend((target, column[:, i]) for column, target in replay_columns)
                 ops.append(None)
             ops.extend((wide[key][:, i], tensor) for key, tensor in unique.items())
+            if stream is not None:
+                landing, name = stream
+                token = buffers[name].reshape(buffers[name].shape[0], -1)[:, 0]
+                ops.append((landing.tokens[:token.shape[0], i], token))
+                ops.append((landing.landed, landing.counts[i:i + 1]))
         self._run(slot, ops)
         return (
             {key: wide[id(t)] for key, t in buffers.items()},
             {key: wide[id(t)] for key, t in rows_out.items()},
             {key: wide[id(t)] for key, t in spans_out.items()},
         )
+
+    def token_stream(self, lease: SlotLease, signal: str, limit: int) -> TokenStream:
+        """Where a run on this slot leaves ``signal``'s tokens as they land."""
+        slot = self.slot_for(lease)
+        if slot.run is not None:
+            return slot.run.state.stream
+        if slot.token_stream is None:
+            rows = slot.static_outputs.check_stop_buffers[signal].shape[0]
+            slot.token_stream = TokenStream(rows, limit, self._device)
+        return slot.token_stream
 
     def _run(self, slot: AcceleratorGraphSlot, ops: Sequence[tuple[torch.Tensor, torch.Tensor] | None]) -> None:
         """A run's launches and copies, in order: from one Rust call with the
@@ -1951,7 +1973,7 @@ class AcceleratorGraphRunner:
             if op is None:
                 slot.graph.replay()
             else:
-                op[0].copy_(op[1])
+                op[0].copy_(op[1], non_blocking=True)
 
     def launch_refusal(self, walk: str) -> str | None:
         """After capture: why a run of ``walk`` can't launch from one Rust call,

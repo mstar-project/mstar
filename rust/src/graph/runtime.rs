@@ -1256,6 +1256,8 @@ pub struct RouteArg {
     /// A repeated step's values after each row's first, in `rids` order, or
     /// empty for a step that ran once.
     inline_tails: Vec<Vec<i64>>,
+    /// rid -> how many of its inline values `send_tokens` already sent.
+    emit_skip: FxHashMap<u32, u32>,
     /// The log-prob of the token row i sampled (None without one): it rides
     /// with the row's client emits, inline or in a tensor emit's metadata.
     /// Empty (or absent) when no row has one.
@@ -1294,6 +1296,7 @@ impl<'py> FromPyObject<'py> for RouteArg {
             inline_signal: optional_item(ob, "inline_signal")?,
             inline_values: optional_item(ob, "inline_values")?.unwrap_or_default(),
             inline_tails: optional_item(ob, "inline_tails")?.unwrap_or_default(),
+            emit_skip: FxHashMap::default(),
             logprobs: optional_item(ob, "logprobs")?.unwrap_or_default(),
             walks: r.walks,
             rid_walk_idx: r.rid_walk_idx,
@@ -1388,6 +1391,8 @@ pub struct Completion {
     pub emit_inline: FxHashMap<u32, (Sym, Sym, i64)>,
     /// Per rid: the values after `emit_inline`'s of a repeated step.
     pub emit_inline_tails: FxHashMap<u32, Vec<i64>>,
+    /// Per rid: how many of those values `send_tokens` already sent.
+    pub emit_skip: FxHashMap<u32, u32>,
     /// Per rid: the log-prob its client emits carry (`RouteArg::logprobs`).
     pub logprobs: FxHashMap<u32, f64>,
 }
@@ -3325,10 +3330,38 @@ impl GraphRuntime {
                 nested: nested_snapshot,
                 emit_inline,
                 emit_inline_tails,
+                emit_skip: input.emit_skip,
                 logprobs,
             },
         );
         Ok(out)
+    }
+
+    /// Sends each of `rids`' `values` to the client ahead of its step's landing,
+    /// as that landing's inline emit would: the tokens of a replay that has
+    /// finished (`step_repeats: stream_tokens`). The landing skips them
+    /// (`begin_postprocess`'s `emit_skip`).
+    fn send_tokens(
+        &mut self, py: Python<'_>, rids: Vec<u32>, values: Vec<i64>, signal: String, modality: String,
+    ) -> PyResult<()> {
+        let sig = self.interner.intern(&signal);
+        let mut request_ids = Vec::with_capacity(rids.len());
+        for &rid in &rids {
+            request_ids.push(self.rid_name(rid)?);
+            if let Some(info) = self.requests[rid as usize].as_mut() {
+                info.pending.output_signals.push(sig);
+            }
+        }
+        let bytes = frames::ResultTokens {
+            request_ids: &request_ids,
+            values: &values,
+            loop_indices: &vec![None; rids.len()],
+            signal: &signal,
+            modality: &modality,
+            logprobs: &[],
+        }
+        .encode(&self.interner);
+        self.send_frames(py, vec![("api_server".to_string(), bytes)])
     }
 
     /// Declares (node, walk)'s stop rules, as `NodeSubmodule.get_stop_policies`
@@ -3423,7 +3456,7 @@ impl GraphRuntime {
         stop_rids, stop_loops, runtime_stops,
         token_ptr, token_rows, token_stride, token_dtype, row_rids,
         inline_signal, inline_ptr, inline_rows, inline_stride, inline_dtype,
-        partition_done, python_send, loop_strides = None, token_width = 1,
+        partition_done, python_send, loop_strides = None, token_width = 1, emit_skip = None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn begin_postprocess(
@@ -3436,7 +3469,7 @@ impl GraphRuntime {
         inline_signal: Option<String>, inline_ptr: usize, inline_rows: usize,
         inline_stride: usize, inline_dtype: &str,
         partition_done: Vec<u32>, python_send: bool, loop_strides: Option<Vec<u32>>,
-        token_width: usize,
+        token_width: usize, emit_skip: Option<FxHashMap<u32, u32>>,
     ) -> PyResult<postprocess::PostprocessOut> {
         let tokens = postprocess::TokenColumn::new(token_ptr, token_rows, token_stride, token_dtype)
             .map(|col| col.wide(token_width));
@@ -3448,6 +3481,7 @@ impl GraphRuntime {
             partition, node_name, graph_walk, output_signals, rids, walks, rid_walk_idx,
             stop_rids.into_iter().zip(stop_loops).collect(), runtime_stops,
             tokens, row_rids, inline, partition_done, python_send, loop_strides, token_width,
+            emit_skip.unwrap_or_default(),
         );
         self.postprocess = None;
         self.pp_run(py, pp)
@@ -3682,6 +3716,7 @@ impl GraphRuntime {
         // spans a combined walk has no single `c.wg`.
         let emit_inline = std::mem::take(&mut c.emit_inline);
         let mut emit_inline_tails = std::mem::take(&mut c.emit_inline_tails);
+        let emit_skip = std::mem::take(&mut c.emit_skip);
         let mut plan = SendPlan {
             partition: c.partition.clone(),
             nested: c.nested.clone(),
@@ -3730,19 +3765,16 @@ impl GraphRuntime {
                 match e.dest {
                     Dest::EmitToClient => match emit_inline.get(&rid) {
                         Some(&(sig, modality, value)) if sig == e.name => {
-                            plan.emit_inline.push((
-                                rid,
-                                name.clone(),
-                                self.interner.name(modality).to_string(),
-                                value,
-                            ));
-                            // one row of the frame per iteration, in order
-                            for tail in emit_inline_tails.remove(&rid).unwrap_or_default() {
+                            // one row of the frame per iteration, in order,
+                            // past those `send_tokens` sent during the step
+                            let tails = emit_inline_tails.remove(&rid).unwrap_or_default();
+                            let sent = emit_skip.get(&rid).copied().unwrap_or(0) as usize;
+                            for item in std::iter::once(value).chain(tails).skip(sent) {
                                 plan.emit_inline.push((
                                     rid,
                                     name.clone(),
                                     self.interner.name(modality).to_string(),
-                                    tail,
+                                    item,
                                 ));
                             }
                         }

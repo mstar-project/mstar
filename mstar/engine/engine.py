@@ -28,7 +28,7 @@ from mstar.engine.accelerator_graph_runner import (
     plan_captures,
 )
 from mstar.engine.chunking import DEFAULT_MIN_CHUNK_TOKENS, ChunkingManagement, ChunkRange
-from mstar.engine.device_run import RunAsk
+from mstar.engine.device_run import RunAsk, TokenStream
 from mstar.engine.fp32_precision import Fp32Precision, cudnn_benchmark, fp32_precision_scope, node_fp32_precision
 from mstar.engine.node_dtype import resolve_node_dtype
 from mstar.engine.resources import (
@@ -222,6 +222,8 @@ class SubmoduleManagement:
     device_stops: dict[str, StopPolicy] = field(default_factory=dict)
     # walk -> a run's share of its rows done that ends it, where asked
     refills: dict[str, float | None] = field(default_factory=dict)
+    # walk -> the stop buffer whose tokens go to the client as they land, and a run's limit
+    device_stream_tokens: dict[str, tuple[str, int]] = field(default_factory=dict)
 
     # Rotated globally, not per runner: slot-keyed buffers are shared across
     # buckets and regions, so per-runner counters let consecutive steps collide
@@ -473,6 +475,8 @@ class ExecutingBatch:
     loopback_rids: frozenset = frozenset()
     # per row, whether its last step here kept its loop-back values on the device
     kept_rows: list[bool] | None = None
+    # where a run streaming its tokens leaves them as they land
+    token_stream: TokenStream | None = None
 
     # This step's outputs, published as soon as the forward has been
     # submitted — the tensors exist then, even though their values land later.
@@ -1693,7 +1697,13 @@ class Engine:
             {signal: pair for signal, pair in carries.items() if signal not in heads},
             mgmt.run_columns.get(graph_walk, frozenset()),
             frozenset(getattr(mgmt.submodule, "ITERATION_INPUTS", None) or ()), config.refill_at,
+            config.stream_tokens,
         ))
+
+    def stream_tokens(self, node_name: str, graph_walk: str, signal: str, limit: int) -> None:
+        """A walk's runs, up to ``limit`` long, leave ``signal``, a stop
+        buffer, where the host can send it as it lands."""
+        self._submodules[node_name].device_stream_tokens[graph_walk] = (signal, limit)
 
     def yield_runs(self, node_name: str) -> None:
         """Other work is ready: the node's run in flight ends at its next iteration."""
@@ -2550,6 +2560,10 @@ class Engine:
                     ctx.repeats, submodule_mgmt.refills[graph_walk],
                 )
                 slot.run.stage_columns(batch.iteration_columns)
+            streamed = submodule_mgmt.device_stream_tokens.get(graph_walk)
+            if streamed is not None and ctx.repeats > 1:
+                batch.token_stream = cg_runner.token_stream(lease, *streamed)
+                batch.token_stream.begin(request_ids)
             out = cg_runner.run_forward(
                 lease, preprocessed,
                 plan_done_event=batch.preplan_event,
@@ -2568,6 +2582,7 @@ class Engine:
                 stops, rows, spans = cg_runner.repeat(
                     lease, carries, ctx.repeats,
                     self._runner.replay_columns(step, ctx.repeats), columns, batch.iteration_columns,
+                    None if batch.token_stream is None else (batch.token_stream, streamed[0]),
                 )
                 out = dataclasses.replace(
                     out, check_stop_buffers=stops, row_outputs={**(out.row_outputs or {}), **rows},

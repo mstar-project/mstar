@@ -263,20 +263,27 @@ def test_each_rows_loop_stride_advances_its_loop(tmp_path, drop):
     assert iters["native"] == ([[2, 0, 3], [3, 0]] if drop else [[2, 1, 3], [3, 2, 0]])
 
 
-def test_a_repeated_step_stops_a_row_at_its_iteration_and_emits_up_to_it(tmp_path):
+@pytest.mark.parametrize("landed_first", [False, True])
+def test_a_repeated_step_stops_a_row_at_its_iteration_and_emits_up_to_it(tmp_path, landed_first):
     """A step that ran three iterations hands over a token per iteration: a row
     stops at the first that stops it, and the client gets its tokens up to that
-    one, in order; what the device ran past the stop goes nowhere."""
+    one, in order; what the device ran past the stop goes nowhere. What a run
+    sent as it landed the landing doesn't send again."""
     box = ZmqCommunicator("api_server", str(tmp_path))
     rt = _runtime(rust_runtime.RustGraphRuntime, str(tmp_path))
     rids = _start(rt, 2)
     assert rt.pop_rids(NODE, WALK, rids) is not None
     wide = torch.tensor([[1, 2, 3], [4, EOS, 5]], dtype=torch.int64)
+    emit_skip = None
+    if landed_first:
+        rt.send_tokens(rids, [1, 4], SIG, "text")
+        rt.send_tokens(rids[:1], [2], SIG, "text")
+        emit_skip = {rids[0]: 2, rids[1]: 1}
     trace = _drive(rt, PostprocessRequest(
         partition=PART, node_name=NODE, graph_walk=WALK, output_signals=[SIG],
         wg_ids=ParallelList(list(rids), [0, 0]), runtime_stops=True,
         tokens=wide[:, 0], row_rids=rids, inline=InlineColumn(SIG, wide[:, 0]),
-        loop_strides=[3, 3], token_width=3,
+        loop_strides=[3, 3], token_width=3, emit_skip=emit_skip,
     ), {}, model_stops={})
     assert trace[-1][2] == [rids[1]]
     sent = {}

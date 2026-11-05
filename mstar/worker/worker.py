@@ -36,7 +36,7 @@ from mstar.distributed.base import ShardingConfig
 from mstar.distributed.communication import WorkerParallelGroups
 from mstar.engine import apply_dynamo_config
 from mstar.engine.chunking import ChunkRange
-from mstar.engine.device_run import RUN_REPLAYS
+from mstar.engine.device_run import RUN_REPLAYS, TokenStream
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import AdmitFailedReason, AllocationFailed
 from mstar.engine.resources.kv.config import without_layouts
@@ -63,6 +63,7 @@ from mstar.graph.runtime.base import (
     SpeculationPrepInput,
 )
 from mstar.graph.runtime.utils import require_rust_extension
+from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import Model, WorkerGraph
 from mstar.model.submodule_base import (
     EMITTED_COUNT,
@@ -151,6 +152,9 @@ _HOLD_LOG_INTERVAL = 5.0
 # How often ``_await_admit_settled`` warns while a step has yet to admit. It
 # never gives up; see there.
 _ADMIT_FENCE_WARN_S = 10.0
+
+# How often a wait on a run that streams its tokens looks for new ones.
+_LANDED_POLL_S = 1e-4
 
 # How many torn-down request keys a worker remembers, so that a message landing
 # after the teardown (a duplicate REMOVE, a peer's late stream chunk or
@@ -895,7 +899,9 @@ class Worker:
             self._innermost_loop_by_node = self._build_innermost_loop_cache(
                 model.get_graph_walk_graphs(),
             )
-        walk_graphs = model.get_graph_walk_graphs() if model else {}
+        walk_graphs = self._walk_graphs = model.get_graph_walk_graphs() if model else {}
+        # (node, walk) -> the stop, signal and modality of what it streams
+        self._streamed: dict[tuple[str, str], tuple] = {}
         self._step_repeats = StepRepeats(
             parse_step_repeats(
                 (model_config or {}).get("step_repeats"),
@@ -3036,6 +3042,31 @@ class Worker:
         edges = self._step_repeats.edges[(node_name, graph_walk)]
         engine.keep_run_columns(node_name, graph_walk, run_columns(edges, inline))
 
+    def _stream_refusal(self, node_name: str, graph_walk: str) -> str | None:
+        """Why this walk's runs don't send their tokens as they land, or None,
+        having set them to."""
+        if not self._step_repeats.config(node_name).stream_tokens:
+            return NOT_ASKED
+        if not self._step_repeats.may_repeat(node_name, graph_walk):
+            return "repeats: the walk doesn't repeat"
+        if not self._graph_runtime.supports_inline_emit:
+            return "graph runtime: it has no inline emit"
+        engine = self.engine_manager.get_engine(node_name)
+        client = engine.inline_client_signals(node_name, graph_walk)
+        policy = next(
+            (p for p in (engine.get_stop_policies(node_name, graph_walk) or {}).values() if p.reads_token), None,
+        )
+        if not client or policy is None:
+            return "node: its tokens don't ride inline"
+        signal, buffer = next(iter(client.items()))
+        section = self._walk_graphs[graph_walk]
+        edge = next(
+            e for e in section.get_nodes()[node_name].outputs if e.name == signal and e.next_node == EMIT_TO_CLIENT
+        )
+        self._streamed[(node_name, graph_walk)] = (policy, signal, edge.output_modality)
+        engine.stream_tokens(node_name, graph_walk, buffer, self._step_repeats.config(node_name).max)
+        return None
+
     def _launch_refusal(self, node_name: str, graph_walk: str) -> str | None:
         """Why this walk's runs stay on the host's launch loop, or None."""
         if not self._step_repeats.may_repeat(node_name, graph_walk):
@@ -3848,10 +3879,45 @@ class Worker:
             return
         if batch_N.node_batch.completion_event is not None:
             with self._span("worker.postprocess.event_sync"):
+                if batch_N.node_batch.token_stream is not None:
+                    self._stream_tokens(batch_N)
                 batch_N.node_batch.completion_event.synchronize()
         else:
             with self._span("worker.postprocess.device_sync"):
                 torch.accelerator.synchronize(self.device)
+
+    def _stream_tokens(self, batch_N: PendingBatch) -> None:
+        """While a run is in flight, send the client what it has landed. The
+        step's rows are those still live: a row that stopped, failed or
+        drained after it was built sends nothing."""
+        node_batch = batch_N.node_batch
+        stream: TokenStream = node_batch.token_stream
+        walk = batch_N.graph_walk
+        policy, signal, modality = self._streamed[(batch_N.node_name, walk)]
+        infos = node_batch.per_request_info_wrapped
+        loop = self._innermost_loop_by_node.get((walk, batch_N.node_name))
+        rows = {
+            rid: (policy.limits(infos[rid]), infos[rid].dynamic_loop_iter_counts.get(loop, 0))
+            for rid in node_batch.request_ids
+            # its log-probs are only read at the landing, so its tokens wait for it
+            if not getattr(infos[rid].resource_configs.get(policy.sampler), "return_logprobs", False)
+        }
+        withheld = signal in policy.withhold
+
+        def decide(rid: int, column: int, token: int) -> tuple[bool, bool]:
+            if rid not in rows:
+                return False, True
+            limits, count = rows[rid]
+            return not (withheld and token in policy.eos_tokens), policy.stops(count + column, token, limits)
+
+        while True:
+            finished = node_batch.completion_event.query()
+            rids, values = stream.take(decide)
+            if rids:
+                self._graph_runtime.send_tokens(rids, values, signal, modality)
+            if finished:
+                return
+            time.sleep(_LANDED_POLL_S)
 
     def _postprocess_batch(
         self, batch_N: PendingBatch,
@@ -4177,6 +4243,7 @@ class Worker:
             python_send=self.enable_prof,
             loop_strides=batch.loop_strides(rids),
             token_width=batch.repeats,
+            emit_skip=stream.sent if (stream := batch_N.node_batch.token_stream) is not None else None,
         )
 
     def _check_stops(
@@ -5362,7 +5429,7 @@ class Worker:
                 self.engine_manager.engine.resident_refusal, self._repeat_refusal,
                 {
                     "rows": self._rows_refusal, "device stop": self._device_stop_refusal,
-                    "launch loop": self._launch_refusal,
+                    "launch loop": self._launch_refusal, "stream tokens": self._stream_refusal,
                 },
                 self.engine_manager.engine.repeat_note,
             )

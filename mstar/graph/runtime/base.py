@@ -620,6 +620,8 @@ class PostprocessRequest(NamedTuple):
     python_send: bool = False
     # wg_ids.keys[i]'s ``RouteInput.loop_strides``; None, 1 each
     loop_strides: list[int] | None = None
+    # rid -> the inline values already sent, during the step (``send_tokens``)
+    emit_skip: Mapping[int, int] | None = None
     # values per row of ``tokens`` and ``inline``: one per iteration of a
     # repeated step, side by side
     token_width: int = 1
