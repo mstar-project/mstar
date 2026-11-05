@@ -318,12 +318,16 @@ class DeviceRun:
     """A slot's run: its state, its static columns, and what launches it.
     ``inputs``: static input -> its iteration input's column, staged before
     the run; ``stops``, ``rows``, ``spans``: the outputs kept per replay,
-    ``[rows, limit, ...]`` each. ``launch`` is the host's one call."""
+    ``[rows, limit, ...]`` each. ``launch`` is the host's one call.
+    ``handle``: the WHILE condition's handle on the device, which the graph
+    reads by address, so the run holds it as long as the graph lives."""
 
     def __init__(
         self, state: RunState, inputs: Mapping[str, torch.Tensor], launch: Callable[[], None], limit: int,
+        handle: torch.Tensor,
     ):
         self.state = state
+        self.handle = handle
         self.inputs = inputs
         self.limit = limit
         self.launch = launch

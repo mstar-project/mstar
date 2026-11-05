@@ -1379,7 +1379,7 @@ class AcceleratorGraphRunner:
         }
         graph_exec: list[int] = []
         run = DeviceRun(
-            state, inputs, lambda: cuda.launch(graph_exec[0], backend.raw_stream()), ask.limit,
+            state, inputs, lambda: cuda.launch(graph_exec[0], backend.raw_stream()), ask.limit, device_handle,
         )
 
         def body() -> Any:

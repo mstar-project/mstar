@@ -282,6 +282,27 @@ def test_only_a_landing_that_rides_inline_streams(routed, withholding, why):
     assert asked == ([] if why else [("n", WALK, "new_token", 4)])
 
 
+def test_a_run_holds_the_device_handle_its_graph_reads(monkeypatch):
+    """The stop kernel reads the WHILE handle by address: freed after capture,
+    its block went to the next allocation and the kernel trapped on the GPU."""
+    import gc
+    import weakref
+
+    handles = []
+
+    class Kept(_Loop):
+        def new_loop(self, device):
+            outer, handle, on_device = super().new_loop(device)
+            handles.append(weakref.ref(on_device))
+            return outer, handle, on_device
+
+    loop = Kept()
+    _, run, _, _ = _runner(monkeypatch, loop, [[1, 2]])
+    loop.body = None  # a real capture keeps no Python body
+    gc.collect()
+    assert handles[0]() is not None and run is not None
+
+
 def test_a_failed_while_capture_settles_its_walk_and_a_plain_capture_serves(monkeypatch):
     """One failure is the walk's answer: trying each bucket cost a second capture
     of every one of them."""
