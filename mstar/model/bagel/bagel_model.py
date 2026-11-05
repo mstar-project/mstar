@@ -298,10 +298,14 @@ class BagelModel(Model):
         model_path_hf: str,
         cache_dir: str | None = None,
         accelerator_graph: bool | None = None,
+        denoise_capture_sizes: list | None = None,
         **kwargs
     ):
         if accelerator_graph is not None and not isinstance(accelerator_graph, bool):
             raise ValueError("accelerator_graph must be a boolean")
+        sizes = tuple(tuple(size) for size in (denoise_capture_sizes or ()))
+        if any(len(size) != 2 or not all(isinstance(v, int) and v > 0 for v in size) for size in sizes):
+            raise ValueError(f"denoise_capture_sizes takes [height, width] pairs, not {denoise_capture_sizes!r}")
         self.cache_dir = cache_dir
 
         config_path = hf_hub_download(
@@ -312,6 +316,7 @@ class BagelModel(Model):
             self.config = load_bagel_config(json.load(f))
         if accelerator_graph is not None:
             self.config.accelerator_graph = accelerator_graph
+        self.config.denoise_capture_sizes = sizes
 
         self.model_path_hf = model_path_hf
 

@@ -38,7 +38,7 @@ from mstar.model.bagel.submodules import (
     image_gen_phases,
     image_gen_timestep,
 )
-from mstar.model.submodule_base import ARNodeInputs
+from mstar.model.submodule_base import ARNodeInputs, CarryPair
 
 IMAGE_GEN_LOOP = denoise_loop(IMAGE_GEN)
 
@@ -380,3 +380,28 @@ def test_a_guided_request_publishes_only_the_kv_its_cfg_walk_reads(kwargs, cfg_p
     kv = model.get_request_resource_configs({DEFAULT_PARTITION: fwd}, model_kwargs)["kv"]
     assert kv.publish_labels_per_node_walk == published
     assert kv.final_publish_labels_per_node_walk == final
+
+
+@pytest.mark.parametrize("walk", ["image_gen", "image_gen_head", "image_gen_guided2", "image_gen_guided3"])
+def test_a_denoise_step_leases_and_declares_the_bucket_its_capture_was_made_under(walk):
+    """With denoise captures asked for (``denoise_capture_sizes``), a request at a
+    captured size and the default guidance lands on the capture's key from
+    ``cg_key_info`` and from its own ``declare_step``; other guidance lands on
+    none; its latents carry into the next replay's input_embeds; and without
+    the setting the key is the guidance flag it always was."""
+    import dataclasses
+
+    llm = _llm()
+    llm.config = dataclasses.replace(CONFIG, denoise_capture_sizes=((256, 256),))
+    tokens = (256 // CONFIG.latent_downsample) ** 2
+    template = llm._denoise_key((), tokens)
+    meta = {"height": 256, "width": 256}
+    rows = {0: _info(walk, step_metadata=meta)}
+    assert llm.cg_key_info(walk, rows) == template
+    row = _image_gen_row(tokens + 2)
+    assert llm.declare_step(walk, [0], [row], per_request_info=rows).cg_key_info == template
+    other = {0: _info(walk, step_metadata={**meta, "cfg_text_scale": 7.5})}
+    assert llm.cg_key_info(walk, other) != template
+    assert llm.repeat_carry(walk, {"latents", "time_index"})["latents"] == CarryPair("latents", "input_embeds")
+    llm.config = CONFIG
+    assert llm.cg_key_info(walk, rows) is False
