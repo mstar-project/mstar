@@ -230,6 +230,7 @@ def test_a_dropped_request_admitted_again_isnt_chosen_before_its_rebuild_lands()
     victims = _preempt(kv, "r", short, droppable=lambda rid: True)
 
     assert "v" not in victims.to_ask, "v gave back the allotment its rebuild runs on"
+    assert victims.waits and not victims.to_drop, "r dropped its history for room that only newer requests take"
 
 
 def test_a_request_holding_a_served_walk_in_its_lease_isnt_chosen():
@@ -283,22 +284,19 @@ def test_a_victim_whose_move_fails_comes_off_the_earmark():
     assert "r" not in kv._earmarks and not kv._victims, "v's failed move left r's earmark open, so r can't choose again"
 
 
-@pytest.mark.parametrize("then", ["drops itself", "waits", "waits, then is dropped"])
-def test_the_oldest_request_drops_itself_or_waits_for_room(then):
+@pytest.mark.parametrize("then", ["waits", "waits, then is dropped"])
+def test_a_request_with_nothing_newer_to_move_and_no_older_one_waiting_waits_for_room(then):
+    """A request that ran short with nothing newer to move dropped itself, though no older request waited for the
+    room. The room went to newer prompts, or back to the request itself, which ran short again."""
     kv = _pool()
     _running(kv, "older", 5, arrival=0)
     _running(kv, "r", 5, arrival=1)
 
-    victims = _preempt(kv, "r", _short(kv, "r"), droppable=lambda rid: then == "drops itself")
+    victims = _preempt(kv, "r", _short(kv, "r"), droppable=lambda rid: True)
 
-    drops = then == "drops itself"
-    assert victims == Victims([], ["r"] if drops else [], [], waits=0 if drops else 1), (
-        "r waits only when it can't drop itself"
-    )
-    assert not kv._earmarks, "nothing newer frees a page"
-    if not drops:
-        _runner(kv).readmit("r", NODE)
-        assert _returns(kv) == ["r"] and not _admitted(kv, "r"), "r didn't wait for its shortage"
+    assert victims == Victims([], [], [], waits=1), "r moved itself, though no older request waits for the room"
+    _runner(kv).readmit("r", NODE)
+    assert _returns(kv) == ["r"] and not _admitted(kv, "r"), "r didn't wait for its shortage"
     if then == "waits, then is dropped":
         _drop(kv, "r")
         returns = kv._dropped["r"].returns
@@ -308,6 +306,26 @@ def test_the_oldest_request_drops_itself_or_waits_for_room(then):
     elif then == "waits":
         _remove(kv, "older")
         assert _admitted(kv, "r") and _step(kv, "r", 1).ok, "r kept waiting after the room grew"
+
+
+def test_a_request_moves_itself_only_to_let_an_older_waiting_request_in():
+    """With nothing newer to move, r drops itself because the room it frees lets o, older and dropped, return. o takes
+    that room as r's drop lands, so r can't take it back first."""
+    kv = _pool()
+    _running(kv, "x", 2, arrival=0)
+    _running(kv, "o", 3, arrival=1)
+    _running(kv, "r", 5, arrival=2)
+    kv._streams["r"]["main"].step_in_flight = True
+    assert _preempt(kv, "x", _short(kv, "x"), droppable=lambda rid: True).to_drop == ["o"]
+    kv._streams["r"]["main"].step_in_flight = False
+    _drop(kv, "o")
+    assert _step(kv, "r", 2 * PAGE_SIZE).ok, "r grows into what room is left"
+
+    assert _preempt(kv, "r", _short(kv, "r"), droppable=lambda rid: True).to_drop == ["r"]
+    _drop(kv, "r")
+
+    assert "o" in kv._allotments, "the room r's drop freed wasn't set aside for o"
+    assert _admitted(kv, "o") and not _admitted(kv, "r")
 
 
 def test_a_request_no_move_covers_waits_in_the_queue_until_its_whole_shortage_fits():

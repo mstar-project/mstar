@@ -264,12 +264,14 @@ def test_a_victim_whose_rebuild_wouldnt_write_what_its_kv_holds_isnt_chosen(why)
         w.scheduler.prefilling = lambda node, rid, walk: Prefilling(POLICY.walk, 5 * PAGE_SIZE - 1, 8 * PAGE_SIZE) if (
             rid == "v") else None
     batch = ScheduledBatch(node_name=NODE, graph_walk="decode", request_to_worker_graph={"r": 0})
-    node_batch = SimpleNamespace(node_name=NODE, admit_error=reason, failed_resource="kv")
+    node_batch = SimpleNamespace(
+        node_name=NODE, admit_error=reason, failed_resource="kv", step_context=SimpleNamespace(graph_walk="decode"),
+    )
 
     Worker._handle_allocation_failure(w, batch, node_batch)
 
     assert kv.residency("v") is Residency.RESIDENT, "v was chosen though its rebuild doesn't write what its KV holds"
-    assert kv.residency("r") is Residency.DROPPED, "r neither dropped itself nor left v alone"
+    assert kv.residency("r") is Residency.RESIDENT and _returns(kv) == ["r"], "r didn't wait for room beside v"
 
 
 def test_a_dropped_request_that_waits_for_room_is_unparked_and_rebuilt():
