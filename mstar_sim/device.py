@@ -1400,7 +1400,7 @@ def install() -> None:
     bootstrap = threading.Thread._bootstrap_inner
 
     def bootstrap_inner(self):
-        SimMode().__enter__()
-        bootstrap(self)
+        with SimMode():  # left while the thread can still run Python: past that, the mode stack's
+            bootstrap(self)  # thread-local teardown needs the GIL, which an exiting process won't give
 
     threading.Thread._bootstrap_inner = bootstrap_inner

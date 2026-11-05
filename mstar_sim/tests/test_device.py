@@ -635,8 +635,12 @@ def test_an_event_on_an_idle_stream_holds_no_thread_back():
         torch.cuda.synchronize()
         with clock.computing():
             time.sleep(1)
+        from mstar_sim.device import SimMode
+        left, leave = [], SimMode.__exit__
+        SimMode.__exit__ = lambda self, *exc: (left.append(self), leave(self, *exc))[1]
         recorder = threading.Thread(target=event.record)
         recorder.start(); recorder.join()
+        assert left  # a thread drops its mode before it ends: at process exit, after, that hangs or aborts
         with torch.cuda.stream(stream):
             start.record(); stream.wait_event(event); torch.empty(8, device="cuda").add_(1); end.record()
         end.synchronize()
