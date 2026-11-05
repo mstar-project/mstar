@@ -2556,13 +2556,13 @@ axis 0 (a packed split can leave a rank none of a row); a linear ``ulysses`` who
 heads (Mamba-2's heads, or B/C groups neither dividing nor divided by ``sp_size``) per TP rank
 don't divide by ``sp_size`` (use ``state_passing``); a ``state_passing`` with unequal key and value
 head dims at ``sp_size`` 3 or more; a linear layer under a shard on axis 1 or a ring's; a
-``kv_gather`` attention under a ring's (it plans contiguous pieces); a window page that doesn't
-split ``sp_size`` ways; expert parallelism; piecewise captures; a capture replayed under listed
-and unlisted walks; and a packed capture of a listed walk unless the shard lists one label on axis
-0 (its padding joins that label). When the engine builds an MLA attention that plans each rank's
-own lengths (a placed pool, or ``kv_gather``) on FlashInfer's FA planner, it also refuses query
-heads per TP rank that don't divide 64. Each attention resource of a splitting node logs at load
-how it takes split steps.
+``kv_gather`` attention under a ring's or a shard on axis 1 (it plans contiguous pieces of a packed
+row); a window page that doesn't split ``sp_size`` ways; expert parallelism; piecewise captures;
+a capture replayed under listed and unlisted walks; and a packed capture of a listed walk unless
+the shard lists one label on axis 0 (its padding joins that label). When the engine builds an MLA
+attention that plans each rank's own lengths (a placed pool, or ``kv_gather``) on FlashInfer's FA
+planner, it also refuses query heads per TP rank that don't divide 64. Each attention resource of
+a splitting node logs at load how it takes split steps.
 
 **Choosing the exchange.** ``exchange`` on the node's ``SeqShardSpec`` ``resources:`` block picks
 how its split steps' tokens reach its paged attentions, from where their KV is stored. ``auto``
