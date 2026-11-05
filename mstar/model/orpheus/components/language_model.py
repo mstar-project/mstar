@@ -104,6 +104,9 @@ class OrpheusForCausalLM(nn.Module):
             output_size=config.vocab_size,
             bias=False,
             gather_output=True,
+            # Orpheus only ever emits ``<custom_token_*>`` ids (SNAC codes and
+            # the speech/turn markers), about 18% of the head
+            output_start=config.custom_token_base_id,
         )
 
     def forward(

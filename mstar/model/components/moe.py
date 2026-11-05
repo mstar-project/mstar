@@ -34,7 +34,8 @@ Router contract
 ---------------
 
 Each block computes its expert assignment with a router. The block keeps
-the router in ``self.gate``. The default router is :class:`TopKRouter`.
+the router in ``self.gate``. The default router is :class:`TopKRouter`;
+:class:`NoAuxTcRouter` is DeepSeek-V3's sigmoid ``noaux_tc`` one (GLM-5.x).
 
 A router is an ``nn.Module``. A router does not extend a base class. The
 ``forward`` method of the router must obey this contract::
@@ -74,8 +75,12 @@ from torch import nn
 
 from mstar.distributed.communication import CommGroup
 from mstar.distributed.utils import divide
+from mstar.utils.fp8_block import FP8_DTYPE
 
 logger = logging.getLogger(__name__)
+
+# bf16 x bf16 -> fp32 mm (aten::mm.dtype); older torch lacks the overload
+_MM_OUT_DTYPE = hasattr(torch.ops.aten.mm, "dtype")
 
 
 # Optional fused Triton MoE path. Imports succeed wherever triton is
@@ -83,7 +88,10 @@ logger = logging.getLogger(__name__)
 # (or falls back to a torch impl), so no extra kernel package is needed. The
 # actual kernels only run on CUDA -- guarded by the ``is_cuda`` check below.
 try:
+    from mstar.utils.fused_moe import MoeAlignment, moe_block_m
     from mstar.utils.fused_moe import fused_experts as _fused_experts
+    from mstar.utils.fused_moe.route import ROUTE_ALIGN_MAX_SLOTS, route_align
+    from mstar.utils.fused_moe.runner import runs_per_pair
 
     _HAS_FUSED = True
 except Exception as e:  # pragma: no cover -- exercised only when triton missing
@@ -106,6 +114,11 @@ class TopKRouter(nn.Module):
             to (top-k).
         norm_topk_prob: if True, renormalize the top-k probabilities so
             they sum to 1.
+        fused_softmax_topk: on CUDA, route through Triton kernels instead
+            of softmax, ``torch.topk`` and the renormalize (see :meth:`route`).
+            Equal probabilities go to the lower expert id, where ``torch.topk``
+            may pick another; bf16 logits tie often, so a model opts in once it
+            has checked how often its outputs diverge.
     """
 
     def __init__(
@@ -114,11 +127,13 @@ class TopKRouter(nn.Module):
         num_experts: int,
         num_experts_per_tok: int,
         norm_topk_prob: bool = True,
+        fused_softmax_topk: bool = False,
     ) -> None:
         super().__init__()
         self.top_k = num_experts_per_tok
         self.num_experts = num_experts
         self.norm_topk_prob = norm_topk_prob
+        self.fused_softmax_topk = fused_softmax_topk
         self.weight = nn.Parameter(torch.zeros(num_experts, hidden_size))
 
     def forward(
@@ -138,8 +153,45 @@ class TopKRouter(nn.Module):
             selected_experts: ``(tokens, top_k)`` int64 indices.
             router_states_next: always ``None`` (stateless).
         """
+        routing_weights, router_indices, _ = self.route(hidden_states)
+        return routing_weights, router_indices, None
+
+    def route(
+        self, hidden_states: torch.Tensor, align_w1: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, "MoeAlignment | None"]:
+        """The weights and experts, plus the block alignment when one kernel can do both.
+
+        With ``fused_softmax_topk`` on CUDA, a batch of up to ``ROUTE_ALIGN_MAX_SLOTS``
+        renormalized slots whose block can consume an alignment (it passes its
+        ``gate_up_proj`` as ``align_w1``, and its flat batch) takes ``route_align``,
+        unless ``fused_experts`` runs it as per-pair GEMVs, which read no alignment.
+        Any other batch takes ``router_topk``, and with the flag off it's softmax,
+        ``torch.topk`` and the renormalize.
+        """
+        fused = self.fused_softmax_topk and hidden_states.is_cuda
+        tokens = hidden_states.shape[0]
+        if (
+            fused and _HAS_FUSED and align_w1 is not None and self.norm_topk_prob
+            and tokens * self.top_k <= ROUTE_ALIGN_MAX_SLOTS
+            and not runs_per_pair(hidden_states, align_w1)
+        ):
+            router_logits = F.linear(hidden_states, self.weight)
+            # int: the kernel's block sizes are constants, and a compile that keeps the
+            # token count symbolic specializes on it here, for at most these few counts
+            tokens = int(tokens)
+            return route_align(
+                router_logits, self.top_k, moe_block_m(tokens, align_w1, self.top_k),
+                router_logits.dtype, softmax=True,
+            )
         hidden_states = hidden_states.reshape(-1, hidden_states.shape[-1])
         router_logits = F.linear(hidden_states, self.weight)
+        if fused:
+            from mstar.utils.fused_moe.decode import router_topk
+
+            routing_weights, router_indices = router_topk(
+                router_logits, None, self.top_k, 1.0, self.norm_topk_prob, softmax=True,
+            )
+            return routing_weights, router_indices, None
         router_logits = F.softmax(router_logits, dtype=torch.float, dim=-1)
 
         router_top_value, router_indices = torch.topk(router_logits, self.top_k, dim=-1)
@@ -148,6 +200,100 @@ class TopKRouter(nn.Module):
 
         routing_weights = router_top_value.to(router_logits.dtype)
         return routing_weights, router_indices, None
+
+
+class NoAuxTcRouter(nn.Module):
+    """DeepSeek-V3's ``noaux_tc`` router, groupless (``n_group=1``), as GLM-5.x routes.
+
+    Sigmoid scores in fp32; each token's top-k by score + ``e_score_correction_bias``; weights
+    are the unbiased scores of those experts, renormalized if ``norm_topk_prob``, times
+    ``routed_scaling_factor``. Stateless (see the router contract above).
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        n_routed_experts: int,
+        num_experts_per_tok: int,
+        routed_scaling_factor: float,
+        norm_topk_prob: bool = True,
+    ) -> None:
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.n_routed_experts = n_routed_experts
+        self.top_k = num_experts_per_tok
+        self.routed_scaling_factor = routed_scaling_factor
+        self.norm_topk_prob = norm_topk_prob
+
+        self.weight = nn.Parameter(torch.zeros(n_routed_experts, hidden_size))
+        self.e_score_correction_bias = nn.Parameter(
+            torch.zeros(n_routed_experts, dtype=torch.float32)
+        )
+        # fused_moe's router ops, from ``finalize_weights(topk_kernel=True)``: the decode
+        # router (logits and top-k) for up to ``_route_rows`` tokens, its top-k program on
+        # GEMM logits past them; both (..., bias, top_k, scale, renormalize) -> (weights, ids)
+        self._route_op = None
+        self._route_rows = 0
+        self._topk_op = None
+        # fp32 copy of ``weight``, built once by ``finalize_weights``: the
+        # forward needs fp32 and the router never changes, so casting it once
+        # per layer per step is pure waste. A plain attribute, not a buffer,
+        # so model.to(bf16) cannot downcast it.
+        self._weight_fp32: torch.Tensor | None = None
+
+    def finalize_weights(self, topk_kernel: bool = False) -> None:
+        """Cache the fp32 router weight; call after the weights are loaded. ``topk_kernel``
+        routes CUDA tokens through fused_moe's router kernels, whose ids can differ from
+        torch's at exact ties. Up to its MAX_ROUTER_TOKENS rows that is the decode router
+        itself, the one a fused decode chain runs, so a block's gate and its decode kernels
+        give the same weights bit for bit (a GEMM sums the logits in another order)."""
+        self._weight_fp32 = self.weight.detach().float()
+        self._route_op = self._topk_op = None
+        if topk_kernel:
+            from mstar.utils.fused_moe import decode  # registers the ops
+
+            self._route_op, self._topk_op = decode.route_op, decode.router_topk
+            self._route_rows = decode.MAX_ROUTER_TOKENS
+
+    def forward(
+        self, hidden_states: torch.Tensor, router_states: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, None]:
+        flat = hidden_states.reshape(-1, self.hidden_size)
+        if self._route_op is not None and flat.is_cuda and flat.shape[0] <= self._route_rows:
+            topk_weights, topk_ids = self._route_op(
+                flat.contiguous(), self.weight, self.e_score_correction_bias, self.top_k,
+                self.routed_scaling_factor, self.norm_topk_prob)
+            return topk_weights, topk_ids, None
+        # the engine's bf16 autocast would run F.linear in bf16 and round the logits
+        with torch.autocast(flat.device.type, enabled=False):
+            if _MM_OUT_DTYPE and flat.is_cuda and flat.dtype == self.weight.dtype == torch.bfloat16:
+                # bf16 x bf16 products are exact in fp32: the fp32 router in another
+                # summation order, without an fp32 copy of the tokens
+                logits = torch.mm(flat, self.weight.t(), out_dtype=torch.float32)
+            else:
+                w = self._weight_fp32
+                if w is None or w.device != self.weight.device:
+                    w = self.weight.float()
+                logits = F.linear(flat.float(), w)
+        if self._topk_op is not None and logits.is_cuda:
+            topk_weights, topk_ids = self._topk_op(
+                logits, self.e_score_correction_bias, self.top_k, self.routed_scaling_factor,
+                self.norm_topk_prob)
+            return topk_weights, topk_ids, None
+        scores = logits.sigmoid()  # (T, E)
+
+        biased = scores + self.e_score_correction_bias.unsqueeze(0)
+        topk_ids = torch.topk(biased, k=self.top_k, dim=-1, sorted=False)[1]
+        topk_weights = scores.gather(1, topk_ids)
+
+        if self.norm_topk_prob:
+            # HF's 1e-20, as the fused kernel adds: it guards an all-zero top-k and rounds
+            # away for any sum above 2^-42
+            topk_weights = topk_weights / (topk_weights.sum(dim=-1, keepdim=True) + 1e-20)
+        if self.routed_scaling_factor != 1.0:
+            topk_weights = topk_weights * self.routed_scaling_factor
+
+        return topk_weights, topk_ids, None
 
 
 def dispatch_experts_fused(
@@ -226,12 +372,13 @@ def _dispatch(
     selected_experts: torch.Tensor,
     routing_weights: torch.Tensor,
     skip_invalid: bool = False,
+    alignment: "MoeAlignment | None" = None,
 ) -> torch.Tensor:
     """Pick fused-Triton if available, otherwise the naive loop."""
     if _HAS_FUSED and hidden_states.is_cuda:
         return _fused_experts(
             hidden_states, gate_up_proj, down_proj,
-            routing_weights, selected_experts, skip_invalid=skip_invalid,
+            routing_weights, selected_experts, skip_invalid=skip_invalid, alignment=alignment,
         )
     return dispatch_experts_fused(
         hidden_states, gate_up_proj, down_proj,
@@ -239,19 +386,33 @@ def _dispatch(
     )
 
 
+def _route(
+    gate: nn.Module, flat: torch.Tensor, align_w1: torch.Tensor | None, router_states: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, "MoeAlignment | None"]:
+    """``gate``'s output plus the alignment ``fused_experts`` would otherwise
+    compute, which a :class:`TopKRouter` may give a block that passes ``align_w1``."""
+    if type(gate) is TopKRouter:
+        weights, experts, alignment = gate.route(flat, align_w1)
+        return weights, experts, None, alignment
+    return (*gate(flat, router_states), None)
+
+
 def _sync_routing(
     comm_group: CommGroup,
     routing_weights: torch.Tensor,
     selected_experts: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Make every rank use group rank 0's top-k.
+    """Make every rank use group rank 0's top-k. Expert parallelism only.
 
     Ranks compile the router separately, so a near-tie can resolve
-    differently per rank; sharded dispatch would then give a token more or
-    fewer than k experts. Both tensors travel in one fp32 tensor, which holds
-    expert ids below 2**24 and bf16/fp16/fp32 weights exactly. Other ranks
-    send zeros, so the all-reduce is an exact broadcast; a plain
-    ``dist.broadcast`` is not dynamo-traceable and would break the graph.
+    differently per rank; EP dispatch would then give a token more or fewer
+    than k experts. Under tensor parallelism each rank runs all k slots on its
+    slice of every expert, so a disagreement only mixes two experts' slices in
+    one slot, and the all-reduce after the experts has the same shape either
+    way: not worth an all-reduce per MoE layer. Both tensors travel in one fp32
+    tensor, which holds expert ids below 2**24 and bf16/fp16/fp32 weights
+    exactly. Other ranks send zeros, so the all-reduce is an exact broadcast; a
+    plain ``dist.broadcast`` is not dynamo-traceable and would break the graph.
     """
     top_k = selected_experts.shape[-1]
     packed = torch.cat([selected_experts.float(), routing_weights.float()], dim=-1)
@@ -431,6 +592,58 @@ def _down_proj_weight_loader(
     param.data[expert_idx, :, :] = loaded_weight[:, start:start + shard_inter]
 
 
+def _gate_up_fp8_weight_loader(
+    tp_rank: int, tp_size: int, full_inter: int, row_unit: int,
+    param: nn.Parameter, loaded_weight: torch.Tensor,
+    loaded_shard_id: str | int | None = None,
+):
+    """:func:`_gate_up_weight_loader` for an fp8 block-scale checkpoint's experts (a stacked
+    ``(E, 2 * rows, cols)`` uint8 param): one expert's gate or up weight, ``row_unit`` = 1, or its
+    ``weight_scale_inv``, ``row_unit`` = the scale block's rows. The full tensor or this rank's slice."""
+    assert loaded_shard_id is not None
+    kind, expert_str = str(loaded_shard_id).split(":")
+    expert_idx = int(expert_str)
+    rows = divide(divide(full_inter, tp_size), row_unit)
+    full_rows = divide(full_inter, row_unit)
+    if loaded_weight.dtype == FP8_DTYPE:
+        loaded_weight = loaded_weight.view(torch.uint8)
+    if loaded_weight.shape[0] == full_rows:
+        start = tp_rank * rows
+        loaded_weight = loaded_weight[start:start + rows, :]
+    elif loaded_weight.shape[0] != rows:
+        raise ValueError(
+            f"expert gate/up tensor has {loaded_weight.shape[0]} rows; expected "
+            f"the full {full_rows} or the per-rank {rows}"
+        )
+    if kind == "gate":
+        param.data[expert_idx, :rows, :] = loaded_weight
+    else:
+        param.data[expert_idx, rows:2 * rows, :] = loaded_weight
+
+
+def _down_proj_fp8_weight_loader(
+    tp_rank: int, tp_size: int, full_inter: int, col_unit: int,
+    param: nn.Parameter, loaded_weight: torch.Tensor,
+    loaded_shard_id: str | int | None = None,
+):
+    """Column (contraction-dim) sharding twin of :func:`_gate_up_fp8_weight_loader`."""
+    assert loaded_shard_id is not None
+    expert_idx = int(str(loaded_shard_id).split(":")[1])
+    cols = divide(divide(full_inter, tp_size), col_unit)
+    full_cols = divide(full_inter, col_unit)
+    if loaded_weight.dtype == FP8_DTYPE:
+        loaded_weight = loaded_weight.view(torch.uint8)
+    if loaded_weight.shape[1] == full_cols:
+        start = tp_rank * cols
+        loaded_weight = loaded_weight[:, start:start + cols]
+    elif loaded_weight.shape[1] != cols:
+        raise ValueError(
+            f"expert down tensor has {loaded_weight.shape[1]} cols; expected "
+            f"the full {full_cols} or the per-rank {cols}"
+        )
+    param.data[expert_idx, :, :] = loaded_weight
+
+
 class ParallelSparseMoeBlock(nn.Module):
     """TP-aware Top-K sparse MoE.
 
@@ -509,8 +722,12 @@ class ParallelSparseMoeBlock(nn.Module):
         input_shape = hidden_states.shape
         hidden_dim = hidden_states.shape[-1]
         flat = hidden_states.view(-1, hidden_dim).contiguous()
-        routing_weights, selected_experts, router_states_next = self.gate(flat, router_states)
         skip = token_valid is not None
+        # the mask below moves experts after routing, and TP's dispatch aligns for itself
+        can_align = not skip and self.comm_group.world_size == 1
+        routing_weights, selected_experts, router_states_next, alignment = _route(
+            self.gate, flat, self.experts.gate_up_proj if can_align else None, router_states,
+        )
         if skip:
             selected_experts, routing_weights = _mask_padding(
                 selected_experts, routing_weights, token_valid, self.num_experts,
@@ -519,12 +736,9 @@ class ParallelSparseMoeBlock(nn.Module):
         if self.comm_group.world_size == 1:
             out = _dispatch(
                 flat, self.experts.gate_up_proj, self.experts.down_proj,
-                self.num_experts, selected_experts, routing_weights, skip_invalid=skip,
+                self.num_experts, selected_experts, routing_weights, skip_invalid=skip, alignment=alignment,
             )
         else:
-            routing_weights, selected_experts = _sync_routing(
-                self.comm_group, routing_weights, selected_experts,
-            )
             out = self._dispatch_tp(flat, routing_weights, selected_experts, skip_invalid=skip)
         out = out.view(input_shape)
         return (out, router_states_next) if return_router_states else out
@@ -629,16 +843,15 @@ class ParallelSparseMoeBlockWithSharedExpert(nn.Module):
 
         shared = self.shared_expert(flat)
 
-        routing_weights, selected_experts, router_states_next = self.gate(flat, router_states)
+        routing_weights, selected_experts, router_states_next, alignment = _route(
+            self.gate, flat, self.experts.gate_up_proj if self.comm_group.world_size == 1 else None, router_states,
+        )
         if self.comm_group.world_size == 1:
             routed = _dispatch(
                 flat, self.experts.gate_up_proj, self.experts.down_proj,
-                self.num_experts, selected_experts, routing_weights,
+                self.num_experts, selected_experts, routing_weights, alignment=alignment,
             )
         else:
-            routing_weights, selected_experts = _sync_routing(
-                self.comm_group, routing_weights, selected_experts,
-            )
             routed = self._dispatch_tp(flat, routing_weights, selected_experts)
         shared_gate = torch.sigmoid(self.shared_expert_gate(flat))
         out = (routed + shared_gate * shared).view(input_shape)

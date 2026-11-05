@@ -1,13 +1,11 @@
+from typing import NamedTuple
+
 import torch
 
 from mstar.engine.resources.attn.base import AttentionManager
-from mstar.engine.resources.attn.ragged.base import (
-    RaggedAttnManager,
-    RaggedBlockCausalAttnManager,
-    RaggedCrossAttnManager,
-)
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.linear_attn.base import LinearAttnManager
+from mstar.engine.resources.linear_attn.kda import KDAManager, KDAParams, KDAPlan, SpecBlocks
 from mstar.engine.resources.recurrent.pool import RecurrentStatePool
 
 
@@ -26,7 +24,8 @@ class AttentionCallable:
     varies its label per layer today; one that needs to should thread the label
     explicitly rather than use this.
 
-    For a cacheless attention, see :class:`RaggedAttentionCallable`.
+    A cacheless (ragged) attention needs no callable: call the resource's
+    ``run(q, k, v, label=...)`` with the span's label bound.
     """
 
     def __init__(self, kv: KVManager, attn: AttentionManager | None=None):
@@ -65,6 +64,70 @@ class AttentionCallable:
         if self.attn.requires_kv_write:
             self.kv.write_kv(k, v)
         return self.attn.run(q, kv_cache_layer=self.kv.layer_view(), k=k, v=v)
+
+    @torch.compiler.disable
+    def norm_rope_attend(
+        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, q_norm: torch.nn.Module, k_norm: torch.nn.Module,
+        pos_ids: torch.Tensor, rope_theta: float,
+    ) -> torch.Tensor:
+        """Per-head q/k RMSNorm (``q_norm``, ``k_norm``), plain RoPE at
+        ``pos_ids`` and ``rope_theta``, and attention, on CUDA (a layer off it
+        rotates through its position resource instead). For a backend that
+        reads K/V from the paged cache, the step's KV write rides in the
+        norm/RoPE kernel (``qk_norm_rope_kv_write``) rather than a launch of its
+        own; a backend that takes fresh K/V gets them normed and rotated."""
+        from mstar.utils.attention import qk_norm_rope_inplace, qk_norm_rope_kv_write
+
+        eps = _norm_eps(q_norm, k_norm)
+        if not self.attn.requires_kv_write:
+            qk_norm_rope_inplace(q, k, q_norm.weight, k_norm.weight, pos_ids, *eps, rope_theta)
+            return self(q, k, v)
+        layer, page_idx, slot_idx, n = self.kv.write_target()
+        qk_norm_rope_kv_write(
+            q, k, v, q_norm.weight, k_norm.weight, pos_ids, layer, page_idx, slot_idx, min(n, q.shape[0]),
+            *eps, rope_theta,
+        )
+        return self.attn.run(q, kv_cache_layer=self.kv.layer_view())
+
+    @torch.compiler.disable
+    def norm_rope_table_attend(
+        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, q_norm: torch.nn.Module, k_norm: torch.nn.Module,
+        cos_sin: tuple[torch.Tensor, torch.Tensor],
+    ) -> torch.Tensor:
+        """``norm_rope_attend`` rotating by each token's rotate-half ``cos_sin``
+        rows (both halves equal), for a multimodal RoPE whose position grids one
+        position can't express. The KV write rides in the kernel
+        (``qk_norm_rope_table_kv_write``) on CUDA with a paged backend; anywhere
+        else the norm and rotation run unfused."""
+        from mstar.utils.attention import qk_norm_rope_table_kv_write
+
+        eps = _norm_eps(q_norm, k_norm)
+        if not (q.is_cuda and self.attn.requires_kv_write):
+            cos, sin = (t[: q.shape[0], None] for t in cos_sin)
+            q, k = (
+                _rotate_half_rope(norm(x.reshape(-1, x.shape[-1])).view(x.shape), cos, sin)
+                for x, norm in ((q, q_norm), (k, k_norm))
+            )
+            return self(q, k, v)
+        layer, page_idx, slot_idx, n = self.kv.write_target()
+        qk_norm_rope_table_kv_write(
+            q, k, v, q_norm.weight, k_norm.weight, *cos_sin, layer, page_idx, slot_idx, min(n, q.shape[0]), *eps,
+        )
+        return self.attn.run(q, kv_cache_layer=self.kv.layer_view())
+
+
+def _norm_eps(q_norm: torch.nn.Module, k_norm: torch.nn.Module) -> tuple[float, float]:
+    """The q and k norms' epsilons. The fused kernels scale by ``weight``, so a
+    Gemma-style norm (scale ``1 + weight``) is refused rather than mis-scaled."""
+    if getattr(q_norm, "gemma_mode", False) or getattr(k_norm, "gemma_mode", False):
+        raise ValueError("the fused q/k norm kernels scale by weight; a gemma_mode RMSNorm needs its own path")
+    return float(q_norm.variance_epsilon), float(k_norm.variance_epsilon)
+
+
+def _rotate_half_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    """``x * cos + rotate_half(x) * sin``, the unfused rotation by rotate-half tables."""
+    half = x.shape[-1] // 2
+    return x * cos + torch.cat((-x[..., half:], x[..., :half]), dim=-1) * sin
 
 
 class LinearAttnCallable:
@@ -128,43 +191,89 @@ class LinearAttnCallable:
         )
 
 
-class RaggedAttentionCallable:
-    """`AttentionCallable` for a cacheless attention: ``(q, k, v) -> out`` over
-    one declared span of a `RaggedAttnManager`.
+class _KDALayerBlocks(NamedTuple):
+    conv: torch.Tensor
+    state: torch.Tensor
+    spec: SpecBlocks | None  # the speculative blocks, on a pool that keeps them
 
-    No ``kv`` and no layer cursor, because there is neither to carry: a ragged
-    plan is keyed by the segment label, and the wrapper behind it is per
-    (bucket, slot, label) rather than per layer. The label is therefore bound
-    here at construction instead of being a cursor on the resource -- which is
-    what lets one stack attend over several spans at once (a refiner over the
-    image tokens next to a pass over all of them), the case `AttentionCallable`
-    says to thread explicitly. A cross-attention pair of a
-    ``RaggedCrossAttentionSpec`` resource is bound the same way, under
-    ``cross_label(q_label, kv_label)``; its ``k`` / ``v`` are then the key span's
-    tokens, packed in the same request order as ``q``. A
-    ``RaggedBlockCausalAttentionSpec`` resource binds like a self-attention one.
 
-    One instance per label, held for the life of the resource binding: a
-    compiled transformer region guards on the identity of the callables it is
-    handed, so handing it a fresh one per step retraces that frame every step
-    until Dynamo gives up.
+class KDACallable:
+    """:class:`LinearAttnCallable` for Kimi delta attention. The layer passes its
+    projections and ``KDAParams``; this resolves the layer's conv, state and, for a
+    verify step, speculative blocks, so neither the layer nor the manager holds the
+    pool. The same cursor protocol, counting KDA layers only; a ``layer_idx``
+    argument overrides the cursor.
     """
 
-    def __init__(
-        self,
-        attn: RaggedAttnManager | RaggedCrossAttnManager | RaggedBlockCausalAttnManager,
-        label: str,
-    ):
+    def __init__(self, pool: RecurrentStatePool, attn: KDAManager | None = None):
+        self.pool = pool
         self.attn = attn
-        self.label = label
+        self._layer_idx = 0
+        # layer -> its block views: the pool's tensors never move, so once per layer
+        self._blocks: dict[int, _KDALayerBlocks] = {}
+
+    @torch.compiler.disable
+    def bind_step(self, label: str, attn: KDAManager | None = None) -> None:
+        if attn is not None:
+            self.attn = attn
+        assert self.attn is not None, (
+            "no KDA resource: pass `attn` here or at construction"
+        )
+        self.attn.set_default_label(label)
+
+    @property
+    def label(self) -> str:
+        return self.attn.default_label
+
+    @property
+    def conv_dtype(self) -> torch.dtype:
+        """The conv window's dtype in the pool. The kernels read the window beside
+        the projected activations, so a layer checks its projections against it."""
+        return self.pool.block("conv", 0).dtype
+
+    @torch.compiler.disable
+    def set_layer_idx(self, layer_idx: int) -> None:
+        self._layer_idx = layer_idx
+        self.attn.set_default_layer_idx(layer_idx)
+
+    @torch.compiler.disable
+    def current_plan(self) -> KDAPlan:
+        """This step's plan under the bound label: whether it decodes or verifies."""
+        return self.attn.current_plan()
 
     @torch.compiler.disable
     def __call__(
-        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+        self,
+        qkv: torch.Tensor, g: torch.Tensor, beta: torch.Tensor, params: KDAParams,
+        gate: torch.Tensor | None = None, layer_idx: int | None = None,
     ) -> torch.Tensor:
-        return self.attn.run(q, k, v, label=self.label)
+        """``KDAManager.run`` on this layer's blocks; see it for the shapes."""
+        layer = self._layer_idx if layer_idx is None else layer_idx
+        blocks = self._blocks.get(layer)
+        if blocks is None:
+            blocks = self._blocks[layer] = _KDALayerBlocks(
+                self.pool.block("conv", layer), self.pool.block("state", layer),
+                SpecBlocks.of(self.pool, layer) if self.attn.speculative_tokens else None,
+            )
+        return self.attn.run(
+            qkv, g, beta, blocks.conv, blocks.state, params, gate=gate, spec=blocks.spec,
+        )
 
-
+    @torch.compiler.disable
+    def set_prefix_len(self, accepted: torch.Tensor) -> None:
+        """After a verify step, ``accepted [rows]`` each row's accepted drafts: its
+        first ``accepted + 1`` tokens (the drafts and the token after them) are the
+        prefix the next step replays, from the side this step wrote. Device ops at
+        the plan's slot ids, so a captured step records them; padding rows write
+        the sink. Every layer shares the count and the side. Once per verify step, which the
+        resource checks."""
+        plan = self.attn.settle_verify()
+        rows = plan.num_rows
+        slots = plan.slot_ids[:rows].long()
+        count = (accepted[:rows] + 1).to(torch.int32).unsqueeze(1)
+        prefix_len, side = self.pool.block("spec_len"), self.pool.block("spec_side")
+        prefix_len.index_copy_(0, slots, count)
+        side.index_copy_(0, slots, 1 - side.index_select(0, slots))
 class Mamba2Callable:
     """``LinearAttnCallable`` for a Mamba-2 layer: the conv, then the SSD
     recurrence, each handed this layer's block of the pool as a plain tensor.

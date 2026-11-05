@@ -2,10 +2,13 @@
 
 has ownership of per-(request,label) position counter"""
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field, fields
+from typing import TYPE_CHECKING
 
 import torch
 
+from mstar.engine.node_dtype import warn_implicit_downcast
 from mstar.engine.resources.base import (
     CachedPrefix,
     CGSlotKey,
@@ -26,7 +29,15 @@ from mstar.engine.resources.position.config import (
 from mstar.engine.resources.position.rope import (
     rope_apply_qk_inplace,  # noqa: F401  (registers mstar::rope_apply_qk_inplace)
 )
+from mstar.engine.resources.resident import gather_column
 from mstar.engine.resources.step import ADMIT_OK, AdmitOutcome, AdmitRuntimeError, StepContext
+
+if TYPE_CHECKING:
+    from mstar.engine.resources.resident import (
+        CapturedResidentStep,
+        ResidentPlanner,
+        ResidentWrites,
+    )
 
 
 @dataclass
@@ -129,6 +140,12 @@ class RopeManager(PositionManager):
             rotary_dim = config.rotary_dim or head_dim
             if rotary_dim is None:
                 raise ValueError("rope_table_dtype needs PositionConfig.rotary_dim or the KV cache's head_dim")
+            if device.type == "cuda" and rotary_dim % 16:
+                # FlashInfer's cos/sin-cache kernel moves 16 elements a thread: a narrower
+                # rotation reads past each head and returns garbage, without an error
+                raise ValueError(
+                    f"rope_table_dtype needs a rotary_dim that is a multiple of 16 on CUDA, "
+                    f"not {rotary_dim}")
             self._rope_table = self._build_rope_cache(
                 rotary_dim,
                 config.rope_scale,
@@ -207,8 +224,7 @@ class RopeManager(PositionManager):
 
     def ingest_request(self, rid: str, overrides=None):
         del overrides
-        # setdefault: a worker serving two partitions ingests the rid twice
-        self._counters.setdefault(rid, {})
+        self._counters[rid] = {}
 
     def remove_request(self, rid: str):
         self._counters.pop(rid, None)
@@ -227,6 +243,12 @@ class RopeManager(PositionManager):
                     return AdmitOutcome(ok=False, ready=False, reason=AdmitRuntimeError(
                         f"{segment.request_id!r} reaches position {end}; RoPE covers {self._max_seq_len}"))
         return ADMIT_OK
+
+    def correct_len(self, rid: str, label: str, delta: int) -> None:
+        """Move a stream's position by ``delta``, as ``KVManager.correct_len`` moves its KV
+        length after a speculative verify step."""
+        counters = self._counters.setdefault(rid, {})
+        counters[label] = max(0, counters.get(label, 0) + delta)
 
     def apply_cached_prefix(
         self, rid: str, node_name: str, graph_walk: str, inputs,
@@ -324,6 +346,9 @@ class RopeManager(PositionManager):
             "position preplan is already pending; clear_preplan before "
             "planning a different step ahead"
         )
+        if ctx.resident is not None:
+            # the replay fills the slot's buffer from the tables itself
+            return self._current_pos_ids
         if self._preplanned:
             # staged a step early against this same step's KV plan
             self._current_pos_ids = self._preplan_pos_ids
@@ -351,7 +376,7 @@ class RopeManager(PositionManager):
         # a stream forked off another starts at the source's position, so
         # mirror the forks KV just applied before any counter is read below
         self._apply_forks(
-            plan_outputs.pre_forks, ctx.padded_request_ids,
+            plan_outputs.pre_forks, self._forking_rids(plan_outputs, ctx),
             undo=self._preplan_fork_undo if ctx.is_preplan else None,
         )
 
@@ -368,19 +393,66 @@ class RopeManager(PositionManager):
         self._preplanned = ctx.is_preplan
         return pos_ids_out
 
+    # Resident planning: a stream's position runs ahead of its stored length by a
+    # fixed amount between host-planned steps, so a row keeps that offset
+
+    def resident_refusal(self) -> str | None:
+        if self._config.scheme != PosScheme.SEQUENTIAL:
+            return f"position scheme {self._config.scheme} doesn't advance with the stream"
+        return None
+
+    def bind_resident(self, planner: "ResidentPlanner", key: str) -> None:
+        self._resident_store = planner
+        self._resident_key = key
+        self._resident_delta = planner.table()
+
+    def resident_row(self, rid: int, slot: int, row: list[int], writes: "ResidentWrites") -> None:
+        # the KV pool binds ahead of this, its dependent, and sets its length first
+        label = writes.streams[self._resident_key].label
+        row[self._resident_delta.col] = self.position(rid, label) - writes.kv_len[self._kv_cache_name]
+
+    def resident_gather(self, step: "CapturedResidentStep") -> None:
+        own, pool = step.streams[self._resident_key], step.streams[self._kv_cache_name]
+        if own.label != pool.label or own.reads or pool.reads:
+            # the offset holds only while both advance a token a step, as one stream
+            raise ValueError(
+                f"positions on stream {own.label!r} over {self._kv_cache_name!r}'s {pool.label!r}: "
+                "a resident step's positions advance with the stream their KV cache appends to"
+            )
+        key = CGSlotKey(bucket=step.bucket, slot=step.slot, label=own.label)
+        table = self._resident_delta
+        gather_column(
+            self._resident_store.store, step.slots, table.stride, table.col,
+            self._static_buffer(key, step.bucket.num_tokens), plus=step.buffers.kv_len[self._kv_cache_name],
+        )
+
     def commit(self, step: PositionStep, ctx: StepContext):
+        all_counters = self._counters
         for segment, advance in zip(
             step.segments, self._advances(step), strict=True
         ):
             if advance:
-                counters = self._counters.setdefault(segment.request_id, {})
+                counters = all_counters.get(segment.request_id)
+                if counters is None:
+                    counters = all_counters[segment.request_id] = {}
                 counters[segment.label] = counters.get(segment.label, 0) + advance
 
         # post-forks copy the source after this step advanced it, matching
         # where KV applies them
         plan_outputs = ctx.plan_results.get(self._kv_cache_name)
         if plan_outputs is not None:
-            self._apply_forks(plan_outputs.post_forks, ctx.padded_request_ids)
+            self._apply_forks(plan_outputs.post_forks, self._forking_rids(plan_outputs, ctx))
+
+    @staticmethod
+    def _forking_rids(plan_outputs: KVPlanOutputs, ctx: StepContext) -> Sequence[int]:
+        """The rows KV forked: a step's forks may cover only some of its rows.
+        A chunked prompt forks on some of its chunks only (BAGEL's pre-forks on
+        its first), and a later chunk re-forking the target's counter would
+        restart its positions."""
+        fork_rids = plan_outputs.fork_rids
+        if fork_rids is None:
+            return ctx.padded_request_ids
+        return [rid for rid in ctx.padded_request_ids if rid in fork_rids]
 
     def _apply_forks(
         self, forks: tuple[tuple[str, str], ...], request_ids: tuple[str, ...],
@@ -445,13 +517,18 @@ class RopeManager(PositionManager):
         eager path has no slot to key a buffer by, so allocates plainly.
         """
         block = self._config.scheme == PosScheme.BLOCK
+        counters = self._counters
         pos_ids: list[int] = []
+        append, extend = pos_ids.append, pos_ids.extend
         for rid, label, to_compute in rows:
-            start = self.position(rid, label)
-            if block:
-                pos_ids.extend([start] * to_compute)
+            labels = counters.get(rid)
+            start = labels.get(label, 0) if labels is not None else 0
+            if to_compute == 1:
+                append(start)  # a decode row
+            elif block:
+                extend([start] * to_compute)
             else:
-                pos_ids.extend(range(start, start + to_compute))
+                extend(range(start, start + to_compute))
         if lease is None:
             return torch.tensor(pos_ids, dtype=torch.long)
         key = CGSlotKey(
@@ -495,6 +572,18 @@ class RopeManager(PositionManager):
 
     def pos_ids(self, label: str) -> torch.Tensor | None:
         return self._current_pos_ids.get(label)
+
+    @property
+    def cos_sin_table(self) -> torch.Tensor | None:
+        """The ``(max_seq_len, rotary_dim)`` table ``rope_table_dtype`` builds, each row
+        ``rotary_dim / 2`` cosines then as many sines, for a kernel that rotates inside a
+        larger fusion; None without ``rope_table_dtype``."""
+        return self._rope_table
+
+    @property
+    def interleave(self) -> bool:
+        """Whether RoPE turns adjacent pairs ``(2i, 2i + 1)`` (GPT-J), else the halves (NeoX)."""
+        return self._config.interleave
 
     def _check_rope_table_args(
         self,
@@ -587,25 +676,35 @@ class RopeManager(PositionManager):
             out = torch.cat([x1 * cos - x2 * sin, x2 * cos + x1 * sin, xf[..., 2 * half:]], dim=-1)
             return out.to(x.dtype)
 
-        return rotate(q), rotate(k)
+        return rotate(q), rotate(k) if k is not None else None
 
     def apply_qk(
         self,
         q: torch.Tensor,
-        k: torch.Tensor,
-        label: str,
+        k: torch.Tensor | None,
+        label: str | None = None,
         rotary_dim: int | None = None,
         interleave: bool | None = None,
         rope_scale: float | None = None,
         rope_theta: float | None = None,
         rope_dtype: torch.dtype | None = None,
+        pos_ids: torch.Tensor | None = None,
         **kwargs,
     ):
-        pos_ids = self._current_pos_ids[label]
+        """Rotate ``q`` and ``k`` at ``label``'s planned positions, or at ``pos_ids``, one per
+        row, for a model that threads positions itself (an offset, or a slice of the step).
+        ``k=None`` rotates ``q`` alone and returns ``(q, None)``."""
+        if pos_ids is None:
+            pos_ids = self._current_pos_ids[label]
         config = self._config
         if config.fused and q.device.type == "cuda":
             self._check_fused_args(rotary_dim, interleave, rope_scale, rope_theta, rope_dtype, kwargs)
             return self._apply_qk_fused(q, k, pos_ids[:q.shape[0]])
+
+        alone = k is None
+        if alone:
+            # the kernel rotates a (q, k) pair; a one-head scratch key stands in
+            k = q.new_zeros(q.shape[0], 1, q.shape[-1])
 
         orig_dtype = q.dtype
         rope_dtype = rope_dtype if rope_dtype is not None else config.rope_dtype
@@ -615,6 +714,7 @@ class RopeManager(PositionManager):
             dtype = torch.get_autocast_dtype(q.device.type)
             q, k = q.to(dtype), k.to(dtype)
         elif q.dtype == torch.float32:
+            warn_implicit_downcast("RoPE", q.dtype, torch.bfloat16)
             q, k = q.to(torch.bfloat16), k.to(torch.bfloat16)
 
         llama31_params = {
@@ -668,7 +768,7 @@ class RopeManager(PositionManager):
             rope_theta,
             **llama31_params,
         )
-        return q.to(orig_dtype), k.to(orig_dtype)
+        return q.to(orig_dtype), None if alone else k.to(orig_dtype)
 
 
 # TODO: mrope / 3D positions (qwen omni, cosmos), learned position embeddings

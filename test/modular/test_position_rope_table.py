@@ -2,6 +2,7 @@
 table built once from the config, so per-call RoPE arguments the table does
 not encode are refused instead of silently ignored."""
 
+import dataclasses
 from types import SimpleNamespace
 
 import pytest
@@ -83,6 +84,33 @@ def test_llama31_scaling_is_refused_at_runtime_unless_it_is_a_no_op(kernel_calls
     with pytest.raises(NotImplementedError, match="Llama 3.1"):
         scaled.apply_qk(*qk(), "main", **ATTENTION_LLAMA31_DEFAULTS)
     assert len(kernel_calls) == 1
+
+
+def test_explicit_positions_and_a_lone_q(monkeypatch):
+    """``pos_ids`` rotates at the caller's positions instead of the label's plan; ``k=None``
+    rotates ``q`` alone, with a one-head scratch key for the kernel's pair."""
+    calls = []
+
+    def record(q, k, pos_ids, *args, **kwargs):
+        calls.append((tuple(q.shape), tuple(k.shape), pos_ids.tolist()))
+
+    monkeypatch.setattr(torch.ops.mstar, "rope_apply_qk_inplace", record)
+    manager = table_manager()
+    q = torch.ones((2, 3, 8), dtype=torch.bfloat16)
+    manager.apply_qk(q, q[:, :1].clone(), "main")
+    rotated, none = manager.apply_qk(q, None, pos_ids=torch.tensor([7, 3]))
+    assert none is None and rotated.shape == q.shape
+    assert calls == [((2, 3, 8), (2, 1, 8), [0, 1]), ((2, 3, 8), (2, 1, 8), [7, 3])]
+
+
+def test_cuda_refuses_a_table_narrower_than_the_kernels_vector(monkeypatch):
+    """FlashInfer's cos/sin-cache kernel moves 16 elements a thread: at a width of 8 it rotated
+    garbage instead of failing."""
+    monkeypatch.setattr(RopeManager, "_build_rope_cache", lambda self, *args: torch.zeros(1))
+    config = PositionConfig(kv_cache="kv", interleave=True, rotary_dim=8, rope_table_dtype=torch.float32)
+    with pytest.raises(ValueError, match="multiple of 16"):
+        RopeManager(config, torch.device("cuda"), max_seq_len=64, head_dim=8)
+    RopeManager(dataclasses.replace(config, rotary_dim=16), torch.device("cuda"), max_seq_len=64)
 
 
 def test_llama31_config_is_refused_at_build():

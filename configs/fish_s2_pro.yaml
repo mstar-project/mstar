@@ -5,6 +5,8 @@
 # the Codec node streams 44.1 kHz audio whose chunks stitch into one decode.
 model: "fish_s2_pro"
 max_seq_len: 32768
+# A request holds one of the codec's 64 streams until it ends; later ones queue here.
+max_concurrent_requests: 64
 # The supported deployment image cannot build FlashInfer's Hopper FA3 JIT
 # kernels yet. Keep the model default on "auto" and pin this deployment to FA2.
 resources:

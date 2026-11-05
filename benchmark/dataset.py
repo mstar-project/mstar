@@ -637,13 +637,14 @@ class UCF101Dataset(BaseDataset):
 # ---------------------------------------------------------------------------
 # Robotics – lerobot/droid_100 (DROID)
 #
-# lerobot v2 format: images are NOT parquet columns.  Each episode's frames
-# for each camera are stored as a separate mp4 at:
-#   videos/{video_key}/episode_{episode_id:06d}.mp4
+# lerobot v3.0 format: images are NOT parquet columns.  Each camera's frames
+# for all 100 episodes are in one mp4 (videos/{video_key}/chunk-000/file-000.mp4),
+# and meta/episodes gives each episode's file and time range per camera.
 # Camera keys and their dtypes are declared in meta/info.json.
-# Language instructions live in meta/tasks.jsonl, indexed by task_index.
-# The parquet only carries: action, observation.state, task_index,
-# episode_index, frame_index, timestamp.
+# Language instructions live in meta/tasks.parquet, indexed by task_index.
+# The data parquet carries action, observation.state, task_index,
+# episode_index and frame_index (and timestamp, next.reward, next.done and
+# index, which the loader doesn't read).
 # ---------------------------------------------------------------------------
 
 
@@ -658,6 +659,27 @@ def _to_float_list(raw, target_dim: int) -> list[float]:
     if len(vals) >= target_dim:
         return [float(v) for v in vals[:target_dim]]
     return [float(v) for v in vals] + [0.0] * (target_dim - len(vals))
+
+
+def _task_strings(tasks_df) -> dict[int, str]:
+    """task_index -> instruction from a lerobot v3.0 meta/tasks.parquet, which keeps the strings in the index."""
+    return dict(zip(tasks_df["task_index"].astype(int), tasks_df.index.astype(str), strict=True))
+
+
+def _episode_video(info: dict, episode: dict, cam_key: str, frames: list) -> tuple[str, list[int]]:
+    """An episode's video file and its frames' positions in it, from a lerobot v3.0 meta/episodes row.
+
+    v3.0 concatenates many episodes into each video file: the row names the file
+    (``chunk_index``, ``file_index``) and where the episode starts in it (``from_timestamp``).
+    """
+    col = f"videos/{cam_key}/"
+    path = info["video_path"].format(
+        video_key=cam_key,
+        chunk_index=int(episode[col + "chunk_index"]),
+        file_index=int(episode[col + "file_index"]),
+    )
+    start = round(float(episode[col + "from_timestamp"]) * info["fps"])
+    return path, [start + int(f["frame_index"]) for f in frames]
 
 
 def _decode_frames_to_png_and_video(
@@ -693,15 +715,20 @@ def _decode_frames_to_png_and_video(
 class DROIDDataset(BaseDataset):
     """DROID robotics dataset for evaluating pi0.5 and V-JEPA 2-AC.
 
-    Uses ``lerobot/droid_100`` — a 100-episode subset (~4 GB) of the DROID
-    robot-manipulation dataset.  The dataset is in lerobot v2 format: images
-    are stored as per-episode mp4 files (one per camera), not as parquet
-    columns.  ``hf_hub_download`` is used to fetch individual episode videos
-    on demand; they are cached by HuggingFace and not re-downloaded.
+    Uses ``lerobot/droid_100`` — a 100-episode subset (0.46 GB) of the DROID
+    robot-manipulation dataset.  The dataset is in lerobot v3.0 format: images
+    are stored in mp4 files (one series per camera) that each hold many
+    episodes, and ``meta/episodes`` says where each episode is.
+    ``hf_hub_download`` fetches the videos on demand; they are cached by
+    HuggingFace and not re-downloaded.
 
     For vjepa2_ac the downloaded mp4 is passed directly to the server — no
     re-encoding.  For pi05 only the first frame of each camera video is
-    decoded to a PNG.
+    decoded to a PNG, and a request carries what openpi's pi05_droid policy
+    takes (configs/pi05_droid.yaml): the exterior_image_1_left and
+    wrist_image_left frames and the recorded state, unpadded. droid_100 records
+    the end-effector pose and gripper rather than joint positions, so the state
+    has the right width for a DROID request but not the right meaning.
 
     Args:
         local_file_dir:  directory for extracted PNGs (created if absent).
@@ -709,7 +736,7 @@ class DROIDDataset(BaseDataset):
         num_requests:    number of episodes to use.
         task:            ``"pi05"`` or ``"vjepa2_ac"``.
         rollout_horizon: H for vjepa2_ac; actions/states shape is [H, dim].
-        action_dim:      target dim; defaults to 32 (pi05) or 7 (vjepa2_ac).
+        action_dim:      vjepa2_ac's action/state width (default 7).
         cache_dir:       HuggingFace cache root (None → HF default).
     """
 
@@ -730,13 +757,13 @@ class DROIDDataset(BaseDataset):
         import json as _json
 
         from datasets import load_dataset
-        from huggingface_hub import hf_hub_download
+        from huggingface_hub import hf_hub_download, snapshot_download
 
         os.makedirs(local_file_dir, exist_ok=True)
         self.local_file_dir  = local_file_dir
         self.task            = task
         self._num_requests   = num_requests
-        self.action_dim      = action_dim if action_dim is not None else (32 if task == "pi05" else 7)
+        self.action_dim      = action_dim if action_dim is not None else 7
         self.rollout_horizon = rollout_horizon
         self.cache_dir       = cache_dir
         # Number of video frames to extract per vjepa2_ac request. Default 8
@@ -751,9 +778,7 @@ class DROIDDataset(BaseDataset):
                 self.HF_REPO, filename, repo_type="dataset", cache_dir=cache_dir
             )
 
-        # Read meta/info.json for camera keys and chunks_size.
-        # lerobot v2 layout: videos/{key}/chunk-{C:03d}/file-{F:03d}.mp4
-        # where C = episode_index // chunks_size, F = episode_index % chunks_size.
+        # meta/info.json gives the camera keys, fps and the video path template.
         with open(_dl("meta/info.json")) as f:
             info = _json.load(f)
         features_info = info.get("features", {})
@@ -766,17 +791,22 @@ class DROIDDataset(BaseDataset):
                 f"No video keys found in {self.HF_REPO}/meta/info.json. "
                 f"Top-level keys: {list(info.keys())}"
             )
-        chunks_size: int = info.get("chunks_size", info.get("chunk_size", 1000))
         print(f"  camera keys : {camera_keys}")
-        print(f"  chunks_size : {chunks_size}")
+        import pandas as _pd
+        # A snapshot, not a file listing: it serves from the cache offline too.
+        snapshot = snapshot_download(
+            self.HF_REPO, repo_type="dataset", allow_patterns="meta/episodes/*", cache_dir=cache_dir
+        )
+        episode_meta = {
+            int(row["episode_index"]): row
+            for f in sorted(glob.glob(os.path.join(snapshot, "meta", "episodes", "**", "*.parquet"), recursive=True))
+            for row in _pd.read_parquet(f).to_dict("records")
+        }
 
-        # Load language instructions from meta/tasks.parquet (lerobot v2).
+        # Load language instructions from meta/tasks.parquet (lerobot v3.0).
         tasks: dict[int, str] = {}
         try:
-            import pandas as _pd
-            tasks_df = _pd.read_parquet(_dl("meta/tasks.parquet"))
-            tasks = dict(zip(tasks_df["task_index"].astype(int),
-                             tasks_df["task"].astype(str), strict=False))
+            tasks = _task_strings(_pd.read_parquet(_dl("meta/tasks.parquet")))
             print(f"  tasks loaded: {len(tasks)}")
         except Exception as e:
             print(f"  [warn] could not load tasks.parquet: {e}")
@@ -811,20 +841,21 @@ class DROIDDataset(BaseDataset):
         print(f"  using {len(ep_ids)} of {len(episodes)} episodes")
 
         self.items: list[RequestInput] = []
-        for i, ep_id in enumerate(ep_ids):
+        for ep_id in ep_ids:
             frames = episodes[ep_id]
             language = ""
             if task_idx_col and tasks:
                 tidx = int(frames[0].get(task_idx_col, 0))
                 language = tasks.get(tidx, "")
             try:
+                videos = {
+                    k: _episode_video(info, episode_meta[ep_id], k, frames) for k in camera_keys
+                }
                 item = (
-                    self._make_pi05(i, ep_id, frames, camera_keys, state_col,
-                                    action_col, language, _dl, chunks_size)
+                    self._make_pi05(ep_id, frames, videos, state_col, language, _dl)
                     if task == "pi05"
-                    else self._make_vjepa2_ac(i, ep_id, frames, camera_keys,
-                                              action_col, state_col, language,
-                                              _dl, chunks_size)
+                    else self._make_vjepa2_ac(ep_id, frames, videos,
+                                              action_col, state_col, language, _dl)
                 )
             except Exception as exc:
                 print(f"  [warn] ep{ep_id}: {exc}")
@@ -836,42 +867,24 @@ class DROIDDataset(BaseDataset):
 
     # ------------------------------------------------------------------
 
-    def _chunk_video_path(self, ep_id: int, cam_key: str, chunks_size: int) -> str:
-        """lerobot v2: videos/{key}/chunk-{C:03d}/file-000.mp4
-        Each chunk file contains chunks_size episodes concatenated."""
-        chunk = ep_id // chunks_size
-        return f"videos/{cam_key}/chunk-{chunk:03d}/file-000.mp4"
-
-    def _local_frame_indices(self, frames: list) -> list[int]:
-        """Convert global `index` values to positions within the chunk file.
-        The chunk file starts at min(index) for the first episode in the chunk."""
-        global_indices = [int(row["index"]) for row in frames]
-        chunk_start = global_indices[0] - int(frames[0].get("frame_index", 0))
-        return [g - chunk_start for g in global_indices]
-
-    def _make_pi05(self, idx, ep_id, frames, camera_keys, state_col,
-                   action_col, language, download_fn, chunks_size) -> RequestInput:
-        # Compute frame positions within the chunk video once
-        local_indices = self._local_frame_indices(frames)
-        first_local   = local_indices[0]
-
+    def _make_pi05(self, ep_id, frames, videos, state_col, language, download_fn) -> RequestInput:
+        # openpi's DroidInputs: the first exterior camera, then the wrist camera.
+        camera_keys = list(videos)
+        exterior = next((k for k in camera_keys if "exterior_image_1" in k), camera_keys[0])
+        wrist = next((k for k in camera_keys if "wrist" in k), camera_keys[-1])
         image_paths: list[str] = []
-        for cam_key in camera_keys[:3]:
-            chunk_video = download_fn(self._chunk_video_path(ep_id, cam_key, chunks_size))
+        for cam_key in (exterior, wrist):
+            video_path, local_indices = videos[cam_key]
             png_path    = os.path.join(self.local_file_dir, f"ep{ep_id}_cam{len(image_paths)}.png")
             _decode_frames_to_png_and_video(
-                chunk_video, [first_local], png_path=png_path, mp4_path=None
+                download_fn(video_path), local_indices[:1], png_path=png_path, mp4_path=None
             )
             image_paths.append(png_path)
 
-        if not image_paths:
-            raise ValueError("no camera videos found")
-        while len(image_paths) < 3:
-            image_paths.append(image_paths[0])
-
-        state = _to_float_list(
-            frames[0].get(state_col) if state_col else None, self.action_dim
-        )
+        raw_state = frames[0].get(state_col) if state_col else None
+        if raw_state is None:
+            raise ValueError("no state column")
+        state = [float(v) for v in raw_state]
         return RequestInput(
             req_type=RequestType.VLA,
             prompt=language or "manipulate the object",
@@ -880,8 +893,8 @@ class DROIDDataset(BaseDataset):
             model_kwargs={"robot_state": state},
         )
 
-    def _make_vjepa2_ac(self, idx, ep_id, frames, camera_keys, action_col,
-                        state_col, language, download_fn, chunks_size) -> RequestInput:
+    def _make_vjepa2_ac(self, ep_id, frames, videos, action_col,
+                        state_col, language, download_fn) -> RequestInput:
         # The model requires T_total >= t_ctx + rollout_horizon - 1 actions.
         # t_ctx = grid_depth = frames_per_clip // tubelet_size = 64 // 2 = 32.
         t_ctx     = 32
@@ -892,9 +905,9 @@ class DROIDDataset(BaseDataset):
                 f"(t_ctx={t_ctx} + rollout_horizon={self.rollout_horizon} - 1)"
             )
 
-        # Extract the episode's own frames from the chunk video so the server
-        # subsamples from the right clip instead of the whole dataset.
-        local_indices = self._local_frame_indices(frames)
+        # Extract the episode's own frames from the shared video file so the
+        # server subsamples from the right clip instead of the whole dataset.
+        video_path, local_indices = next(iter(videos.values()))
         # Sample N evenly-spaced frames from the episode for the video input.
         # N defaults to 8, matching upstream's published DROID training config
         # (configs/train/vitg16/droid-256px-8f.yaml: dataset_fpcs: 8).
@@ -902,12 +915,9 @@ class DROIDDataset(BaseDataset):
         step    = max(1, len(local_indices) // n_video)
         video_local_indices = local_indices[::step][:n_video]
 
-        chunk_video = download_fn(
-            self._chunk_video_path(ep_id, camera_keys[0], chunks_size)
-        )
         mp4_path = os.path.join(self.local_file_dir, f"ep{ep_id}.mp4")
         _decode_frames_to_png_and_video(
-            chunk_video, video_local_indices, png_path=None, mp4_path=mp4_path
+            download_fn(video_path), video_local_indices, png_path=None, mp4_path=mp4_path
         )
 
         actions = [_to_float_list(f.get(action_col), self.action_dim)

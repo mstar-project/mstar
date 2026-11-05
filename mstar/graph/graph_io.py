@@ -87,15 +87,16 @@ class WorkerGraphIO:
         )
 
     def mark_node_complete(
-        self, node_name: str
+        self, node_name: str, loop_stride: int = 1,
     ) -> NodeCompletionOutput:
-        """Signal that a node has finished executing.
+        """Signal that a node has finished executing. ``loop_stride``: see
+        ``GraphNode.complete``.
 
         The caller must route each edge in output_edges, skipping any in filtered_signals.
         """
         prev_done_val = self.wg_state_registry.is_done
         node = self.nodes[node_name]
-        completion = node.complete()
+        completion = node.complete(loop_stride)
         # apply filtering, if needed
         completion.output_edges = [
             edge for edge in completion.output_edges \
@@ -183,6 +184,21 @@ class WorkerGraphIO:
 
     def clear(self):
         self.wg_state_registry.clear()
+
+    def is_idle(self) -> bool:
+        """No node holds an input or is in flight, and no loop is mid-run:
+        the state a pass leaves behind once the graph completes and resets."""
+        if self.wg_state_registry._num_completed_entities:
+            return False
+        for node in self.nodes.values():
+            if (node._in_flight or node.ready_signals.ready_names
+                    or node.ready_next_iter.ready_names
+                    or node.speculative_signals.ready_names):
+                return False
+        return all(
+            loop.curr_iter == 0 and not loop._ingested_external_inputs
+            for loop in self.loops.values()
+        )
 
     def register_communication_info(self, communication_manager, request_id: int):
         for loop in self.loops.values():

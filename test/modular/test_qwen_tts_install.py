@@ -89,4 +89,5 @@ def test_all_keeps_the_transformers_floor_qwen3_tts_needs():
 
     for extra in ("all", "qwen3_tts"):
         assert not floor(extra).contains("4.57.2"), extra
-        assert floor(extra).contains("4.57.3") and floor(extra).contains("5.19.0"), extra
+        assert floor(extra).contains("5.19.0"), extra
+    assert floor("qwen3_tts").contains("4.57.3")

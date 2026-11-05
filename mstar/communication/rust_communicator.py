@@ -1,7 +1,5 @@
-"""``ZMQCommunicator`` over the Rust transport vendored in
-``rust/`` (``mstar_rust.ZmqCommunicator``) — drop-in for the pyzmq class:
-same constructor, methods, endpoints, and wire, so wrapped and unwrapped
-entities interoperate and migration can proceed one process at a time. The
+"""The control-mesh communicator: the Rust ZeroMQ transport vendored in
+``rust/`` (``mstar_rust.ZmqCommunicator``) behind ``BaseCommunicator``. The
 codec is a :class:`Codec` (typed msgpack by default, so an edge can
 terminate in a Rust process); ``register_event_for_poll`` forwards the eventfd to
 the Rust poller; a readiness poll buffers any consumed message so nothing is
@@ -42,7 +40,7 @@ logger = logging.getLogger(__name__)
 BLOCKING_POLL_SLICE_MS = 50
 
 class RustZMQCommunicator(BaseCommunicator):
-    """The pyzmq ``ZMQCommunicator`` surface over the Rust transport."""
+    """``BaseCommunicator`` over the Rust transport."""
 
     def __init__(
         self,
@@ -82,8 +80,7 @@ class RustZMQCommunicator(BaseCommunicator):
         else:
             raise NotImplementedError(f"Protocol {protocol} not yet supported yet")
 
-    # endpoint scheme: `_endpoint` / `_tcp_port` come from BaseCommunicator
-    # (shared with the pyzmq ZMQCommunicator).
+    # endpoint scheme: `_endpoint` / `_tcp_port` come from BaseCommunicator.
 
     def _register(self, entity_id: str) -> None:
         if entity_id not in self._registered:
@@ -98,8 +95,7 @@ class RustZMQCommunicator(BaseCommunicator):
 
     def _poll_once(self, timeout_ms: int) -> str:
         """One wake-aware poll; returns ``"msg"`` / ``"wake"`` / ``"timeout"``.
-        A consumed message goes to the buffer; a wakeup drains the event
-        (same place the pyzmq path drains it)."""
+        A consumed message goes to the buffer; a wakeup drains the event."""
         kind, payload = self._inner.recv_or_wake(timeout_ms)
         if kind == "msg":
             self._buffered.append(payload)
@@ -139,10 +135,9 @@ class RustZMQCommunicator(BaseCommunicator):
         self, blocking: bool = False, timeout_s: float | None = None,
     ) -> list:
         if blocking and not self._buffered:
-            # Wait until a message is readable before draining — same
-            # semantics as the pyzmq communicator: a registered wakeup
-            # event also ends the wait, so a completed compute future can
-            # interrupt a blocking receive. `timeout_s` bounds the wait
+            # Wait until a message is readable before draining. A
+            # registered wakeup event also ends the wait, so a completed
+            # compute future can interrupt a blocking receive. `timeout_s` bounds the wait
             # (None = wait indefinitely); on expiry, drain whatever is there.
             deadline = None if timeout_s is None else (
                 time.monotonic() + timeout_s)

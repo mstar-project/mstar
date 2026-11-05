@@ -18,6 +18,7 @@ import yaml
 sys.path.insert(0, ".")
 
 from mstar.engine.resources import KVSpec  # noqa: E402
+from mstar.engine.resources.step import Segment  # noqa: E402
 from mstar.graph.special_destinations import EMIT_TO_CLIENT  # noqa: E402
 from mstar.model.components.audio_features import (  # noqa: E402
     LogMelSpectrogram,
@@ -44,7 +45,6 @@ from mstar.model.whisper.config import (  # noqa: E402
 )
 from mstar.model.whisper.submodules import WhisperDecoderSubmodule, WhisperEncoderSubmodule  # noqa: E402
 from mstar.model.whisper.whisper_model import WhisperDetokenizer, WhisperModel  # noqa: E402
-from mstar.utils.h2d import PinnedStager  # noqa: E402
 
 REPO = Path(__file__).resolve().parents[2]
 
@@ -319,16 +319,7 @@ def test_encoder_submodule_batches_and_declares_one_capture_per_batch_size():
 
 
 def _decoder_submodule(cfg: WhisperModelConfig) -> WhisperDecoderSubmodule:
-    sub = object.__new__(WhisperDecoderSubmodule)
-    torch.nn.Module.__init__(sub)
-    sub.request_states = {}
-    sub.node_resources = {}
-    sub.config = cfg
-    sub.stop_token_ids = frozenset({cfg.eos_token_id})
-    sub._suppress_ids = sub._begin_suppress_ids = sub._language_mask = None
-    sub._stager = PinnedStager(torch.long)
-    sub._inactive = None
-    return sub
+    return WhisperDecoderSubmodule(None, cfg)
 
 
 def _fwd(rid_handle: int, wire: str = "wire", **step_metadata):
@@ -454,7 +445,7 @@ def test_decoder_align_walk_uses_the_detected_language():
     sub.register_parameter("anchor", torch.nn.Parameter(torch.zeros(1)))
     for walk, token in ((DETECT_LANGUAGE_WALK, DE), (PREFILL_PROMPT_WALK, 7)):
         stops = sub.check_stop_batched(
-            ["r"], {"r": _stop_info(walk, 7)}, HostRows(("r",), {"new_token": torch.tensor([token])}), step_walk=walk,
+            ["r"], {"r": _stop_info(walk, 7)}, HostRows(("r",), {"new_token": torch.tensor([token])}),
         )
         assert stops == {}
     sub.check_stop_batched(
@@ -560,7 +551,7 @@ def test_decoder_logit_rules():
     assert torch.isinf(later[0, [1, 2]]).all() and torch.isfinite(later[0, EOT])
 
 
-def test_decoder_check_stop_honors_eos_and_max_tokens():
+def test_decoder_check_stop_honors_eos():
     cfg = _tiny_config()
     sub = _decoder_submodule(cfg)
 
@@ -579,7 +570,8 @@ def test_decoder_check_stop_honors_eos_and_max_tokens():
     assert sub.check_stop("r", info(PREFILL_WALK, 0), eos) == set()
     assert sub.check_stop("r", info(DECODE_WALK, 0), eos) == {"decode_loop"}
     assert sub.check_stop("r", info(DECODE_WALK, 0), word) == set()
-    assert sub.check_stop("r", info(DECODE_WALK, 3, max_tokens=4), word) == {"decode_loop"}
+    # the budget is the loop cap's to end
+    assert sub.check_stop("r", info(DECODE_WALK, 3, max_tokens=4), word) == set()
 
 
 def test_decoder_check_stop_batched_agrees_with_per_request():
@@ -600,7 +592,7 @@ def test_decoder_check_stop_batched_agrees_with_per_request():
         "eos": info(DECODE_WALK, 0, 0),                       # stops
         "word": info(DECODE_WALK, 0, 1),                      # keeps going
         "ignored": info(DECODE_WALK, 0, 2, ignore_eos=True),  # EOS ignored
-        "budget": info(DECODE_WALK, 3, 3, max_tokens=4),      # out of budget
+        "budget": info(DECODE_WALK, 3, 3, max_tokens=4),      # at its budget: the cap ends it
         "prefill": info(PREFILL_WALK, 0, 4),                  # never stops the loop
     }
     check = ["prefill", "budget", "ignored", "word", "eos"]  # not forward order
@@ -610,15 +602,14 @@ def test_decoder_check_stop_batched_agrees_with_per_request():
         got = sub.check_stop(rid, infos[rid], {"new_token": [tokens[i:i + 1]]})
         if got:
             per_request[rid] = got
-    assert batched == per_request == {"eos": {"decode_loop"}, "budget": {"decode_loop"}}
+    assert batched == per_request == {"eos": {"decode_loop"}}
     # no token buffer: the engine falls back to the per-request path
     assert sub.check_stop_batched(["eos"], infos, HostRows(("eos",), {})) is None
 
 
-@pytest.mark.parametrize("request_walks", [None, {"eos": DECODE_WALK, "word": DECODE_WALK}])
-def test_engine_stop_check_takes_the_batched_path(request_walks):
-    """The engine passes ``step_walk``; a signature without it raised, and the
-    engine silently fell back to one ``check_stop`` per row."""
+def test_engine_stop_check_takes_the_batched_path():
+    """The engine's stop check reaches the batched path rather than falling
+    back to one ``check_stop`` per row."""
     from types import SimpleNamespace
 
     from mstar.engine.engine import Engine
@@ -641,7 +632,6 @@ def test_engine_stop_check_takes_the_batched_path(request_walks):
     batch = SimpleNamespace(
         node_name="decoder", request_ids=["eos", "word"], per_request_info_wrapped=infos,
         register_failure=failures.setdefault,
-        step_context=SimpleNamespace(graph_walk=DECODE_WALK, request_walks=request_walks),
     )
     engine = SimpleNamespace(_submodules={"decoder": SimpleNamespace(submodule=sub)})
     tokens = torch.tensor([EOT, 1234, 0])  # a padding row past the real ones
@@ -678,7 +668,6 @@ def test_a_batched_stop_check_that_raises_partway_records_each_token_once():
     batch = SimpleNamespace(
         node_name="decoder", request_ids=["a", "b"], per_request_info_wrapped=_RaisesOnce(infos),
         register_failure=failures.setdefault,
-        step_context=SimpleNamespace(graph_walk=DECODE_WALK, request_walks=None),
     )
     engine = SimpleNamespace(_submodules={"decoder": SimpleNamespace(submodule=sub)})
     tokens = torch.tensor([1234, 99])
@@ -992,7 +981,10 @@ def test_decoder_align_walk_emits_the_alignment_and_postprocess_times_the_words(
         "encoder_states": [enc],
     })
     assert row.input_ids.tolist() == [SOT, EN, TRANSCRIBE, NOTS, 7, 33, EOT]
-    assert sub.declare_step(ALIGN_WALK, ["r"], [row]) is None and sub.max_batch_size(ALIGN_WALK) == 1
+    # one segment over the rows the projections see, which a LoRA pool lays its rows out from
+    step = sub.declare_step(ALIGN_WALK, ["r"], [row])
+    assert step.segments == [Segment("r", "main", row.input_ids.shape[0])] and not step.steps
+    assert sub.max_batch_size(ALIGN_WALK) == 1
     batch = sub.preprocess(ALIGN_WALK, _engine_inputs(["r"]), [row])
     with torch.no_grad():
         out = sub.forward_batched(ALIGN_WALK, _engine_inputs(["r"]), **batch)
@@ -1073,7 +1065,7 @@ def test_decode_tokens_are_recorded_for_the_align_walk_until_the_stop():
     infos = {"r": _stop_info(PREFILL_WALK, 9), "plain": _stop_info(PREFILL_WALK, 10, word_timestamps=False)}
     # the prefill's token starts the transcript, only for a word-timestamp request
     sub.check_stop_batched(
-        ["r", "plain"], infos, HostRows(("r", "plain"), {"new_token": torch.tensor([10, 10])}), step_walk=PREFILL_WALK,
+        ["r", "plain"], infos, HostRows(("r", "plain"), {"new_token": torch.tensor([10, 10])}),
     )
     for info in infos.values():
         info.graph_walk = DECODE_WALK

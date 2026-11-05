@@ -13,8 +13,9 @@ sys.path.insert(0, ".")
 
 from mstar.engine.resources.step import FULL_ADMIT_OK
 from mstar.graph.runtime.base import ColumnarEdgeSpecs, PopRidsOutput, ReadyNodeSpec
+from mstar.model.submodule_base import StepOrder
 from mstar.utils.containers import ParallelList
-from mstar.worker.micro_scheduler import MicroScheduler
+from mstar.worker.micro_scheduler import MicroScheduler, ScheduledBatch
 
 NODE = "LLM"
 
@@ -29,6 +30,8 @@ class _Runtime:
     def get_ready_nodes(self, exclude_rids, target=None, exclude_target=None):
         grouped: dict[str, list[str]] = {}
         for rid in self.walks:  # arrival order
+            if target is not None and self.walks[rid] != target[1]:
+                continue
             if rid in self.ready and rid not in exclude_rids:
                 grouped.setdefault(self.walks[rid], []).append(rid)
         return [ReadyNodeSpec(NODE, walk, rids) for walk, rids in grouped.items()]
@@ -71,14 +74,26 @@ class _State:
 
 
 class _Engine:
-    def __init__(self, max_bs):
+    def __init__(self, max_bs, varies=()):
         self.max_bs = max_bs  # an int for every walk, or walk -> int
+        self.varies = set(varies)  # the walks whose cap moves
+        self.asked = 0
 
     def get_max_batch_size(self, node_name, graph_walk):
+        self.asked += 1
         return self.max_bs.get(graph_walk) if isinstance(self.max_bs, dict) else self.max_bs
+
+    def batch_cap_varies(self, node_name, graph_walk):
+        return graph_walk in self.varies
 
     def get_max_rows_in_combined(self, node_name, graph_walk):
         return None
+
+    def get_max_batch_tokens(self, node_name, graph_walk):
+        return None  # no chunking
+
+    def get_step_order(self, node_name, graph_walk):
+        return StepOrder.ARRIVAL
 
     def splits_by_capture_key(self, node_name, graph_walk):
         return False
@@ -90,14 +105,15 @@ class _Engine:
         return FULL_ADMIT_OK
 
 
-def _setup(walks, max_bs):
-    engine = _Engine(max_bs)
+def _setup(walks, max_bs, varies=()):
+    engine = _Engine(max_bs, varies)
     runtime = _Runtime(walks)
     sched = MicroScheduler(
         engine_manager=SimpleNamespace(get_engine=lambda name: engine),
         parallel_leader_nodes={NODE},
     )
     sched.runtime = runtime
+    sched.engine = engine
     return sched, runtime, _State(runtime)
 
 
@@ -118,9 +134,40 @@ def test_a_walk_with_no_room_does_not_starve_the_others():
     assert "p0" in runtime.ready, "the prefill stays ready for when a slot frees"
 
 
-def test_a_full_caller_batch_still_takes_nothing():
-    """The other zero: a caller already holding a full batch for its target gets
-    None, not a batch of some other walk."""
-    sched, _, state = _setup(dict.fromkeys(("d0", "d1"), "decode"), max_bs=2)
+def test_a_chain_holding_its_full_step_still_takes_nothing():
+    """The other zero: a speculation chain whose rows hold the whole step gets
+    no rows, not a batch of some other walk."""
+    sched, _, state = _setup({"d0": "decode", "d1": "decode", "p0": "prefill"}, max_bs=2)
+    sched.note_ran(ScheduledBatch(NODE, "decode", request_to_worker_graph={"c0": 0, "c1": 0}))
 
-    assert sched.get_next_batch(state, target=(NODE, "decode"), pre_existing_batch_size=2) is None
+    chain = sched.pick_chain_step(state, (NODE, "decode"), ["c0", "c1"])
+
+    assert chain.pick.room == 2
+    assert sched.take_chain_step(state, chain) is None
+
+
+def test_a_cap_that_moves_is_read_on_every_pass():
+    """A cap the engine says varies, as one following the free slots does, is read on every
+    pass: a stale one would hand prefill rows no slot holds, a divergence on a TP follower."""
+    max_bs = {"prefill": 2}
+    sched, _, state = _setup({f"p{i}": "prefill" for i in range(4)}, max_bs=max_bs, varies={"prefill"})
+
+    assert _rids(sched.get_next_batch(state)) == ["p0", "p1"]
+    max_bs["prefill"] = 1
+    assert _rids(sched.get_next_batch(state)) == ["p2"]
+    max_bs["prefill"] = 0
+    assert sched.get_next_batch(state) is None
+    max_bs["prefill"] = 1  # a slot frees
+    assert _rids(sched.get_next_batch(state)) == ["p3"]
+
+
+def test_a_static_cap_is_asked_once():
+    """Any other cap is fixed once the graphs are captured, so the scheduler asks once."""
+    max_bs = {"decode": 2}
+    sched, _, state = _setup({f"d{i}": "decode" for i in range(4)}, max_bs=max_bs)
+
+    assert _rids(sched.get_next_batch(state)) == ["d0", "d1"]
+    asked = sched.engine.asked
+    max_bs["decode"] = 1  # not the engine's to move: the scheduler keeps 2
+    assert _rids(sched.get_next_batch(state)) == ["d2", "d3"]
+    assert sched.engine.asked == asked

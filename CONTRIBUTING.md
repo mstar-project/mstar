@@ -18,9 +18,17 @@ General questions are welcome too — a plain issue or an email to <atindra@cs.s
 3. Run `ruff check .` (CI enforces it).
 4. Open a PR against `main`. It runs CI and gets a review before merging.
 
+### Documentation
+
+During the Mintlify migration, `docs/*.rst` remains the canonical source. If a guide
+has a counterpart in `docs/mintlify/`, update its `.rst` and `.mdx` files in the
+same PR, including model, resource, installation, and environment-variable changes.
+See [the Mintlify contributor guide](docs/mintlify/CONTRIBUTING.md) for preview and
+validation commands. The generated Python API reference remains on Sphinx.
+
 ### Automated review
 
-A bot posts an advisory review when a contributor (the team, or anyone who has had a PR merged here) opens a non-draft PR, from a fork or not. It checks the invariants in [AGENTS.md](AGENTS.md) (the model/engine boundary, resource declarations, rank lockstep, Python/Rust parity, documented environment variables) and cites them by number. It is not a merge gate and a maintainer still reviews your PR. It doesn't rerun on every push: a contributor can comment `/review` on their own PR for a re-review, and someone with write access can do so on any PR, or comment `/review thorough` for the thorough mode. Reply to disagree; apply the `skip-ai-review` label to turn the automatic review off for a PR. Details in [.github/review/](.github/review/).
+A bot posts an advisory review when someone comments `/review` on a PR, from a fork or not; it never runs on its own when a PR is opened or pushed to. A contributor (the team, or anyone who has had a PR merged here) can comment `/review` on their own PR, and someone with write access can do so on any PR, or comment `/review thorough` for the thorough mode. It checks the invariants in [AGENTS.md](AGENTS.md) (the model/engine boundary, resource declarations, rank lockstep, Python/Rust parity, documented environment variables) and cites them by number. It is not a merge gate and a maintainer still reviews your PR. Comment `/review` again for a re-review after pushes. Reply to disagree. Details in [.github/review/](.github/review/).
 
 ### AI-assisted contributions
 
@@ -142,7 +150,7 @@ selected. Within the selected directories:
   `pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason=...)`;
 - a module that imports an optional package at module level calls
   `pytest.importorskip("<module>")` with the import name (`flashinfer`,
-  `misaki`, `qwen_tts`, `mstar_rust`, ...) before that import;
+  `misaki`, `qwen_tts`, ...) before that import;
 - a single test that needs one makes the same call at its top, and a
   real-weights test skips when the checkpoint isn't cached;
 - a test that is broken on `main` gets `@pytest.mark.skip(reason=...)` in its
@@ -164,6 +172,9 @@ compatibility before extending the Mac exclusion list. CI prints the slowest
 tests and retains JUnit reports for seven days. Making
 **CPU Core** a required merge check is a separate repository ruleset or branch
 protection setting.
+
+The randomized tests in `test/modular/test_kv_page_ownership.py` add their seed
+and recent operations to a failure; rerun one with the node id pytest prints.
 
 ## Adding a model
 
