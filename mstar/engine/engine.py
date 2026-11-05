@@ -93,6 +93,7 @@ from mstar.utils.profiler import (
 )
 
 if TYPE_CHECKING:
+    from mstar.engine.resources.admission import Refusal
     from mstar.engine.resources.kv.manager import KVManager
     from mstar.engine.resources.lora.pool import LoraAdapterPool
     from mstar.model.base import Model
@@ -3171,8 +3172,12 @@ class Engine:
         """The requests the conductor numbered after the request, newest first; see `Admission.newer_than`."""
         return self._runner.newer_than(request_id)
 
+    def oldest_refusal(self) -> "Refusal | None":
+        """The oldest waiting request that didn't fit; see `Admission.oldest_refusal`."""
+        return self._runner.oldest_refusal()
+
     def readmit_request(self, node_name: str, request_id: int) -> None:
-        """Ask the node's resources again for the request, which then waits in their queues at its arrival; see
+        """Ask the node's resources again for the request, which then waits until they fit it; see
         `Admission.readmit`."""
         self._runner.readmit(request_id, node_name)
 
