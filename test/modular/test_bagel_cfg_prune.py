@@ -461,3 +461,40 @@ def test_a_captured_branch_step_hands_combine_cfg_the_eager_velocity(node, walk)
         walk, _info(walk), {**rows, "latents": [torch.zeros(tokens, channels)], "time_index": [torch.zeros(tokens)]},
     )
     assert torch.equal(combine.tensor_inputs[label], eager)
+
+
+@pytest.mark.parametrize("walk", sorted(CFG_WALKS))
+def test_a_captured_combine_step_is_keyed_by_its_guidance_and_hands_on_the_eager_step(walk):
+    """combine_cfg captures each split walk at a captured size with the default
+    guidance, which a request lands on unless its guidance differs; its
+    captured step (``forward_batched``) hands on the eager step's latents and
+    time_index as rows, which its next step reads back."""
+    import dataclasses
+
+    from mstar.model.bagel.submodules import CombineCFGSubmodule
+    from mstar.model.submodule_base import ModelInputsFromEngine
+
+    combine = CombineCFGSubmodule(dataclasses.replace(CONFIG, denoise_capture_sizes=((256, 256),)))
+    tokens = (256 // CONFIG.latent_downsample) ** 2
+    meta = {"height": 256, "width": 256}
+    configs = {c.capture_graph_walk: c for c in combine.get_accelerator_graph_configs("cpu")}
+    assert set(configs) == set(CFG_WALKS)
+    rows = {0: _info(walk, step_metadata=meta)}
+    assert combine.cg_key_info(walk, rows) == configs[walk].additional_key_info
+    assert combine.cg_key_info(walk, {0: _info(walk, step_metadata={**meta, "cfg_text_scale": 7.5})}) \
+        != configs[walk].additional_key_info
+
+    template = configs[walk].single_request_inputs.tensor_inputs
+    g = torch.Generator().manual_seed(0)
+    inputs = {name: [torch.randn(t.shape, generator=g)] for name, t in template.items() if name != "time_index"}
+    inputs["time_index"] = [torch.full((tokens,), 5.0)]
+    prepared = combine.prepare_inputs(walk, _info(walk, step_metadata=meta), inputs)
+    engine = ModelInputsFromEngine(request_ids=["r0"], per_request_info=rows)
+    eager = combine.forward(walk, engine, **prepared.tensor_inputs, **prepared.kwargs)
+    captured = combine.forward_batched(walk, engine, **prepared.tensor_inputs).row_outputs
+    assert torch.equal(captured["latents"][0], eager["latents"][0])
+    again = combine.prepare_inputs(walk, _info(walk, step_metadata=meta), {
+        **inputs, "latents": [captured["latents"]], "time_index": [captured["time_index"]],
+    })
+    assert again.tensor_inputs["latents"].shape == eager["latents"][0].shape
+    assert again.tensor_inputs["time_index"].tolist() == [6.0] * tokens

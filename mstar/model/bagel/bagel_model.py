@@ -491,7 +491,7 @@ class BagelModel(Model):
                 node_name=node_name,
             )
         elif node_name == "combine_cfg":
-            return CombineCFGSubmodule(config=self.config)
+            return CombineCFGSubmodule(config=self.config, dtype=autocast_dtype)
         elif node_name == "vit_encoder":
             self._init_vit_components(device, autocast_dtype=autocast_dtype)
             return ViTEncoderSubmodule(
