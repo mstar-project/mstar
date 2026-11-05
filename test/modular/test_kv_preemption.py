@@ -3,9 +3,9 @@
 A new prompt waits in the runner's queue for room, since a pool admits only its oldest waiting request.
 A request that grows past what it was allotted can't wait that way: every request beside it
 may be growing too, and nothing would ever finish. The newest requests go to the host when the host holds
-them whole, and are otherwise dropped if they can be rebuilt from their token ids. They wait outside the queue and are
-tried ahead of it, oldest first. A request on the host returns once its pages and one more page fit, and a dropped
-request once its whole history and one more page fit.
+them whole, and are otherwise dropped if they can be rebuilt from their token ids. A request on the host waits outside
+the queue and is tried ahead of it, oldest first, and returns once its pages and one more page fit. A dropped request
+waits in the queue at its arrival and returns once its whole history and one more page fit.
 So the oldest request always gets its page and finishes.
 """
 
@@ -82,13 +82,13 @@ def _ready(kv, rid: str) -> bool:
 
 def _drop(kv, rid: str) -> int:
     freed = kv.drop(rid, kv._laid_out_tokens(rid))
-    _runner(kv).readmit(rid, NODE)
+    _runner(kv).readmit(rid, NODE, queued=True)
     return freed
 
 
 def _offload(kv, rid: str) -> int:
     freed = kv.offload(rid)
-    _runner(kv).readmit(rid, NODE)
+    _runner(kv).readmit(rid, NODE, queued=False)
     return freed
 
 
@@ -137,14 +137,28 @@ def test_a_dropped_request_returns_ahead_of_the_queue():
     assert _step(kv, "a", 3 * PAGE_SIZE).ok and _step(kv, "b", 2 * PAGE_SIZE).ok
     kv.drop("b", 2 * PAGE_SIZE)
     assert "b" not in kv._allotments and kv._unused == 0, "the drop kept part of b's allotment"
-    _runner(kv).readmit("b", NODE)
+    _runner(kv).readmit("b", NODE, queued=True)
 
     assert not _ready(kv, "c") and "b" in kv._allotments, "c took the room the request dropped ahead of it returns into"
 
 
-def test_a_request_that_asks_again_holds_up_no_newer_prompt():
-    """A dropped request returns with its whole history and a page, which can take long to fit. Waiting at its
+def test_a_request_on_the_host_holds_up_no_newer_prompt():
+    """A request on the host returns with its history and a page, which can take long to fit. Waiting at its
     arrival, it held back every newer prompt, though they fit."""
+    kv = _pool()
+    kv._cpu_pool = host._HostPool(64)
+    _running(kv, "r", 5, arrival=1)
+    _running(kv, "v", 5, arrival=2)
+    assert _preempt(kv, "r", _short(kv, "r"), droppable=lambda rid: False).to_host == ["v"]
+    _offload(kv, "v")
+    _request(kv, "c", 1, arrival=3)
+
+    assert _ready(kv, "c") and not _admitted(kv, "v"), "c waited behind v, which can't return yet"
+
+
+def test_a_dropped_request_keeps_its_place_ahead_of_newer_prompts():
+    """A dropped request returns with its whole history and a page. Waiting outside the queue for that, it was passed
+    by every newer prompt that fit, and a steady stream of small ones kept it waiting until it timed out."""
     kv = _pool()
     _running(kv, "r", 5, arrival=1)
     _running(kv, "v", 5, arrival=2)
@@ -152,7 +166,9 @@ def test_a_request_that_asks_again_holds_up_no_newer_prompt():
     _drop(kv, "v")
     _request(kv, "c", 1, arrival=3)
 
-    assert _ready(kv, "c") and not _admitted(kv, "v"), "c waited behind v, which can't return yet"
+    assert not _ready(kv, "c") and _queue(kv) == ["v", "c"], "c passed v, which waits to return"
+    _remove(kv, "r")
+    assert _admitted(kv, "v") and _ready(kv, "c")
 
 
 def test_the_engine_orders_requests_by_the_arrival_their_request_info_carries():
@@ -317,10 +333,11 @@ def test_a_request_with_nothing_newer_to_move_waits_for_room(then):
     victims = _preempt(kv, "r", _short(kv, "r"), droppable=lambda rid: True)
 
     assert victims == Victims([], [], [], waits=1), "r moved itself"
-    _runner(kv).readmit("r", NODE)
+    _runner(kv).readmit("r", NODE, queued=False)
     assert _returns(kv) == ["r"] and not _admitted(kv, "r"), "r didn't wait for its shortage"
     if then == "waits, then is dropped":
         _drop(kv, "r")
+        assert _queue(kv) == ["r"] and not _returns(kv), "r, dropped, kept waiting outside the queue"
         returns = kv._dropped["r"].returns
         assert kv._need("r", NODE, WALK, None) == returns, "r's wait for its shortage outlived its drop"
         _remove(kv, "older")
@@ -330,10 +347,59 @@ def test_a_request_with_nothing_newer_to_move_waits_for_room(then):
         assert _admitted(kv, "r") and _step(kv, "r", 1).ok, "r kept waiting after the room grew"
 
 
+def test_a_request_with_nothing_newer_to_move_waits_on_the_host_when_it_fits_there():
+    """Waiting holding its pages, r kept them from the requests beside it. On the host it frees them, as main's
+    offload-and-hold does, and it never drops itself."""
+    kv = _pool()
+    kv._cpu_pool = host._HostPool(64)
+    _running(kv, "older", 5, arrival=0)
+    _running(kv, "r", 5, arrival=1)
+
+    victims = _preempt(kv, "r", _short(kv, "r"), droppable=lambda rid: True)
+
+    assert victims == Victims(["r"], [], []), "r didn't move itself to the host"
+    assert _offload(kv, "r") == 5 and _returns(kv) == ["r"] and "r" not in kv._allotments
+    _remove(kv, "older")
+    assert _ready(kv, "r") and _step(kv, "r", 1).ok, "r didn't return once its history and a page fit"
+
+
+def test_a_request_the_host_cant_take_whole_waits_holding_its_pages():
+    kv = _pool()
+    kv._cpu_pool = host._HostPool(4)
+    _running(kv, "older", 5, arrival=0)
+    _running(kv, "r", 5, arrival=1)
+
+    victims = _preempt(kv, "r", _short(kv, "r"), droppable=lambda rid: True)
+
+    assert victims == Victims([], [], [], waits=1), "r moved to a host that can't hold it"
+
+
+def test_a_request_back_from_the_host_runs_the_grant_it_moved_for():
+    """r's grant needs two pages past its allotment, and one is free. Returning with its history and one page, r went
+    to the host and straight back on every pass, and its grant ran short again each time. It returns only once its
+    history and both pages fit."""
+    kv = _pool()
+    kv._cpu_pool = host._HostPool(64)
+    _running(kv, "a", 4, arrival=0)
+    _running(kv, "r", 5, arrival=1)
+    short = _step(kv, "r", PAGE_SIZE + 1).reason.pages_short
+    assert _preempt(kv, "r", short, droppable=lambda rid: False).to_host == ["r"]
+    _offload(kv, "r")
+
+    assert not _admitted(kv, "r"), "r came straight back into the room it freed, short of its grant"
+    _remove(kv, "a")
+    assert _ready(kv, "r") and _step(kv, "r", PAGE_SIZE + 1).ok, "r came back without the pages its grant needed"
+
+
 def _make_room(kv, droppable) -> Victims | None:
-    """`KVManager.make_room` for the oldest waiting request the pool refused, as the worker calls it."""
-    refusal = _runner(kv).oldest_refusal()
-    return kv.make_room(refusal.mark, _runner(kv).newer_than(refusal.rid), droppable)
+    """`KVManager.make_room` for the oldest waiting request the pool refused that moves can let in, as the worker
+    calls it."""
+    runner = _runner(kv)
+    for refusal in runner.refusals():
+        victims = kv.make_room(refusal.mark, runner.newer_than(refusal.rid), droppable)
+        if victims is not None:
+            return victims
+    return None
 
 
 def test_an_older_waiting_request_moves_a_newer_one_that_waits_holding_pages():
@@ -350,7 +416,7 @@ def test_an_older_waiting_request_moves_a_newer_one_that_waits_holding_pages():
     _drop(kv, "o")
     assert _step(kv, "r", 2 * PAGE_SIZE).ok, "r grows into what room is left"
     assert _preempt(kv, "r", _short(kv, "r"), droppable=lambda rid: True).waits, "r moved itself"
-    _runner(kv).readmit("r", NODE)
+    _runner(kv).readmit("r", NODE, queued=False)
     assert not _admitted(kv, "o")
 
     assert _make_room(kv, droppable=lambda rid: True).to_drop == ["r"]
@@ -375,7 +441,7 @@ def test_requests_each_short_by_several_pages_dont_wait_on_each_other_for_good()
         assert _preempt(kv, rid, short, droppable=lambda rid: True).waits
         for other in rids[i + 1:]:
             kv._streams[other]["main"].step_in_flight = False
-        _runner(kv).readmit(rid, NODE)
+        _runner(kv).readmit(rid, NODE, queued=False)
     assert not any(_admitted(kv, rid) for rid in ("w0", "w1", "w2"))
 
     assert _make_room(kv, droppable=lambda rid: True).to_drop == ["w2", "w1"]
@@ -399,7 +465,7 @@ def test_a_waiting_request_admitted_before_its_last_victim_moves_takes_no_more_r
         assert _preempt(kv, rid, short, droppable=lambda rid: True).waits
         for other in rids[i + 1:]:
             kv._streams[other]["main"].step_in_flight = False
-        _runner(kv).readmit(rid, NODE)
+        _runner(kv).readmit(rid, NODE, queued=False)
     assert not any(_admitted(kv, rid) for rid in rids)
     assert _make_room(kv, droppable=lambda rid: True).to_drop == ["w2", "w1"]
 
@@ -411,6 +477,34 @@ def test_a_waiting_request_admitted_before_its_last_victim_moves_takes_no_more_r
     assert _admitted(kv, "w0") and _step(kv, "w0", 4 * PAGE_SIZE).ok
 
 
+def test_a_waiting_request_the_runner_admits_before_its_victims_land_takes_no_more_room():
+    """w0 waits for 4 pages and moves w2 and w1. x's removal frees those 4 pages first, and the runner admits w0 into
+    them. The pages w2 and w1 freed then went into w0's allotment too."""
+    kv = _pool()
+    rids = ["w0", "w1", "w2"]
+    _running(kv, "x", 4, arrival=0)
+    for arrival, rid in enumerate(rids, start=1):
+        _running(kv, rid, 2, arrival)
+    for i, rid in enumerate(rids):
+        short = _step(kv, rid, 4 * PAGE_SIZE).reason.pages_short
+        for other in rids[i + 1:]:
+            kv._streams[other]["main"].step_in_flight = True
+        assert _preempt(kv, rid, short, droppable=lambda rid: True).waits
+        for other in rids[i + 1:]:
+            kv._streams[other]["main"].step_in_flight = False
+        _runner(kv).readmit(rid, NODE, queued=False)
+    assert not any(_admitted(kv, rid) for rid in rids)
+    assert _make_room(kv, droppable=lambda rid: True).to_drop == ["w2", "w1"]
+    _remove(kv, "x")
+    assert _admitted(kv, "w0")
+    pages = kv._allotments["w0"].pages
+
+    _drop(kv, "w2")
+    _drop(kv, "w1")
+
+    assert kv._allotments["w0"].pages == pages, "the victims' moves grew the allotment of a request already admitted"
+
+
 def test_a_request_no_move_covers_waits_in_the_queue_until_its_whole_shortage_fits():
     kv = _pool()
     _running(kv, "a", 1, arrival=0)
@@ -418,7 +512,7 @@ def test_a_request_no_move_covers_waits_in_the_queue_until_its_whole_shortage_fi
     _running(kv, "r", 5, arrival=2)
     short = _step(kv, "r", PAGE_SIZE + 1).reason.pages_short
     assert _preempt(kv, "r", short, droppable=lambda rid: False).waits
-    _runner(kv).readmit("r", NODE)
+    _runner(kv).readmit("r", NODE, queued=False)
 
     _remove(kv, "a")
     assert not _admitted(kv, "r"), f"r was let go once one page freed, though it was short by {short}"
@@ -434,7 +528,7 @@ def test_a_waiting_request_asks_for_the_room_its_grant_counted_too():
     _running(kv, "r", 5, arrival=1)
     short = _step(kv, "r", PAGE_SIZE + 1).reason.pages_short
     assert _preempt(kv, "r", short, droppable=lambda rid: False).waits == 2, "r asked for less than its grant needs"
-    _runner(kv).readmit("r", NODE)
+    _runner(kv).readmit("r", NODE, queued=False)
 
     assert not _admitted(kv, "r"), "r was let go into the one free page, though its grant needs two"
 
@@ -775,15 +869,18 @@ def _back_from_the_host_and_short(kv) -> int:
     return outcome.reason.pages_short
 
 
-def test_a_request_back_from_the_host_waits_for_its_shortage_rather_than_moving_itself_again():
-    """A request came back from the host once its pages and one more page fit. On its next page the pool had no
-    room, so the request, the newest holding pages, moved to the host again, and again for every page after."""
+def test_a_request_back_from_the_host_and_short_again_waits_there_for_its_shortage():
+    """A request came back from the host once its pages and one more page fit, and its next page found no room. It
+    moves to the host again, and comes back only once its history and that page fit, not into the room it freed."""
     kv = _pool()
     short = _back_from_the_host_and_short(kv)
 
-    assert _preempt(kv, "z", short, droppable=lambda rid: False) == Victims([], [], [], waits=1), (
-        "z moved to the host again for its own page"
-    )
+    assert _preempt(kv, "z", short, droppable=lambda rid: False) == Victims(["z"], [], [])
+    _offload(kv, "z")
+
+    assert not _admitted(kv, "z"), "z came straight back into the room it freed"
+    _remove(kv, "y")
+    assert _ready(kv, "z") and _step(kv, "z", PAGE_SIZE).ok
 
 
 def test_a_request_back_from_the_host_moves_again_for_an_older_request_waiting_in_the_queue():
@@ -793,8 +890,11 @@ def test_a_request_back_from_the_host_moves_again_for_an_older_request_waiting_i
     short = _back_from_the_host_and_short(kv)
     _request(kv, "p", 3, arrival=2)
     assert not _ready(kv, "p")
+    # another request's pages fill the host while z runs short
+    filled = kv._cpu_pool.arena.acquire(kv._cpu_pool.room())
     assert _preempt(kv, "z", short, droppable=lambda rid: False).waits
-    _runner(kv).readmit("z", NODE)
+    kv._cpu_pool.arena.release(filled)
+    _runner(kv).readmit("z", NODE, queued=False)
 
     assert _make_room(kv, droppable=lambda rid: False) == Victims(["z"], [], []), (
         "z waited for its shortage behind p, which waits for z's pages"
@@ -869,9 +969,9 @@ def test_a_guaranteed_request_is_never_moved_to_the_host():
     _running(kv, "g", 2, arrival=1, guaranteed=True)
     short = _step(kv, "r", 2 * PAGE_SIZE).reason.pages_short
 
-    assert _preempt(kv, "r", short, droppable=lambda rid: False) == Victims([], [], [], waits=2), (
-        "a guaranteed request was moved to the host"
-    )
+    victims = _preempt(kv, "r", short, droppable=lambda rid: False)
+
+    assert "g" not in victims.to_host, "a guaranteed request was moved to the host"
 
 
 @pytest.mark.parametrize("host_pages, guaranteed", [(None, True), (1, True), (64, False)], ids=[
@@ -1038,11 +1138,7 @@ def test_a_request_neither_the_host_nor_the_device_can_cover_is_short_of_its_foo
 
     # the 4 pages it grows into, less the 1 page of room
     assert not outcome.ok and outcome.reason.pages_short == 3, "r took a page its move had no room for"
-    assert _preempt(kv, "r", 3, droppable=lambda rid: False).waits
-    _runner(kv).readmit("r", NODE)
-    _request(kv, "p", 2, arrival=0)
-    assert not _ready(kv, "p")
-    assert _make_room(kv, droppable=lambda rid: False) == Victims(["r"], [], []) and _offload(kv, "r"), (
+    assert _preempt(kv, "r", 3, droppable=lambda rid: False) == Victims(["r"], [], []) and _offload(kv, "r"), (
         "r had no way off the device"
     )
 
@@ -1059,7 +1155,7 @@ def test_a_waiting_request_the_full_host_turns_guaranteed_moves_more_newer_reque
     for rid, tokens in (("z2", 1), ("z1", 5 * PAGE_SIZE)):
         short = _step(kv, rid, tokens).reason.pages_short
         assert _preempt(kv, rid, short, droppable=lambda rid: False).waits
-        _runner(kv).readmit(rid, NODE)
+        _runner(kv).readmit(rid, NODE, queued=False)
     _request(kv, "p", 2, arrival=1, rebuildable=False)
     assert not _ready(kv, "p")
     assert _make_room(kv, droppable=lambda rid: True).to_drop == ["z2"]
@@ -1083,7 +1179,7 @@ def test_a_waiting_request_that_turns_guaranteed_as_one_victim_lands_isnt_admitt
     for rid in ("z2", "z1"):
         short = _step(kv, rid, 1).reason.pages_short
         assert _preempt(kv, rid, short, droppable=lambda rid: False).waits
-        _runner(kv).readmit(rid, NODE)
+        _runner(kv).readmit(rid, NODE, queued=False)
     _request(kv, "p", 2, arrival=1, rebuildable=False)
     assert not _ready(kv, "p")
     assert _make_room(kv, droppable=lambda rid: True).to_drop == ["z2", "z1"]

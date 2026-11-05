@@ -216,7 +216,8 @@ class _Engine:
             "node": SimpleNamespace(resources={"kv": self.resource}, resident=None)
         }
         self._runner = SimpleNamespace(
-            admit_retrieve=lambda **kw: FULL_ADMIT_OK, admit_request=lambda *args: None, readmit=lambda *args: None,
+            admit_retrieve=lambda **kw: FULL_ADMIT_OK, admit_request=lambda *args: None,
+            readmit=lambda *args, queued: None,
         )
         self._resident_delta = (
             {"node": OffloadDelta.new()} if role == "leader" else {}

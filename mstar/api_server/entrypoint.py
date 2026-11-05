@@ -1912,8 +1912,8 @@ class WarmupRequest:
 
 class DataParallelReplicas(NamedTuple):
     """The most and fewest replicas any worker graph is served by. ``most`` is
-    how many copies of a request it takes for the conductor's placement to
-    reach them all."""
+    how many copies of a request it takes for the conductor's pick to reach
+    them all."""
 
     most: int
     fewest: int
@@ -1941,11 +1941,13 @@ def _run_warmup_requests(
     the server from coming up.
 
     Each spec runs as ``replicas.most`` concurrent copies, which warm every
-    replica of a data-parallel deployment, since the conductor sends
-    concurrent requests to different replicas (the least-loaded one each).
-    When some worker graph has fewer replicas than that, each spec first runs
-    once alone, since that graph would batch the copies and miss its
-    one-request shape. Past one copy, they run with ``prefix_cache=False``
+    replica of a data-parallel deployment: with nothing else routed, the
+    conductor's pick sends each copy to the least-loaded replica, ties to the
+    one picked longest ago, so a group with ``n`` replicas runs the first
+    ``n`` copies on ``n`` different ones however the earlier copies were
+    queued or finished. When some worker graph has fewer replicas than that,
+    each spec first runs once alone, since that graph would batch the copies
+    and miss its one-request shape. Past one copy, they run with ``prefix_cache=False``
     unless the spec sets it, so no predicted hit (``routing_weights.prefix``)
     gathers them on one replica; the cost is that they leave a prefill from
     cached pages unwarmed.
