@@ -7,6 +7,7 @@ and handing to next. (in fact, maybe `plan` should do this and runner only moves
 
 from __future__ import annotations
 
+import itertools
 import logging
 from collections.abc import Callable, Collection, Mapping
 from contextlib import AbstractContextManager, nullcontext
@@ -153,6 +154,9 @@ class StepRunner:
         # the step whose pre-plan is staged across the pre-planning resources,
         # as `_step_key` describes it; None when nothing is staged
         self._staged: tuple | None = None
+        # rid -> the generation of the request its handle names (``ingest_request``)
+        self._generations: dict[int, int] = {}
+        self._generation = itertools.count()
         # (step key, ready) of the last pre_admit whose stage is still up
         self._pre_admitted: tuple | None = None
         # Resources a lane off the chain holds (``mstar.worker.lanes``), each with
@@ -382,6 +386,9 @@ class StepRunner:
     ) -> None:
         """open state on all resources; `overrides` are per-resource. All or
         nothing: a resource that raises leaves the request on none of them."""
+        # a handle names another request once this one is gone: a run that lands
+        # after that must not take back the new one's counts (``rewind_run``)
+        self._generations[rid] = next(self._generation)
         for i, key in enumerate(self._order):
             try:
                 with self._on_lane_of(key):
@@ -406,6 +413,7 @@ class StepRunner:
             self._resources[key].ingest_capture_row(rid)
 
     def remove_request(self, rid: str) -> None:
+        self._generations.pop(rid, None)
         self._admission.remove_request(rid)
         for key in self._order:
             with self._on_lane_of(key):
@@ -571,9 +579,14 @@ class StepRunner:
         ))
 
     def rewind_run(self, step: SubmoduleStep, replays: int) -> None:
-        """A run landed ``replays`` iterations short: each resource takes them back."""
+        """A run landed ``replays`` iterations short: each resource takes them
+        back, from the rows whose request is still the one the run counted for.
+        A row torn down since (its request done, its handle maybe another's by
+        now) or a padding row has nothing to take back."""
+        live = self._generations
+        rows = frozenset(rid for rid, gen in step.ctx.counted.items() if gen is not None and live.get(rid) == gen)
         for key in self._keys_for(step):
-            self._resources[key].rewind_run(step.get(key), step.ctx, replays)
+            self._resources[key].rewind_run(step.get(key), step.ctx, replays, rows)
 
     def replay_columns(self, step: SubmoduleStep, repeats: int) -> list[tuple[torch.Tensor, torch.Tensor]]:
         """Every resource's ``Resource.replay_columns`` for this step."""
@@ -728,6 +741,9 @@ class StepRunner:
 
     def commit(self, step: SubmoduleStep) -> None:
         """record step consumption"""
+        if step.ctx.repeats > 1:
+            # the requests this run counted for, should it land short (``rewind_run``)
+            step.ctx.counted = {rid: self._generations.get(rid) for rid in step.ctx.request_ids}
         for key in self._keys_for(step):
             if self._nvtx:
                 range_push(f"res.commit.{key}")

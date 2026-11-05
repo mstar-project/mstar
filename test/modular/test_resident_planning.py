@@ -365,21 +365,10 @@ def test_a_run_that_ends_short_gives_back_what_its_commit_counted():
     stream = live["kv"]._streams[1]["main"]
     assert stream.stored_len == 6
     for key, step in (("kv", s.kv), ("pool", s.pool), ("rope", s.rope)):
-        live[key].rewind_run(step, s.ctx, 2)
+        live[key].rewind_run(step, s.ctx, 2, {1})
     assert stream.stored_len == 4
     assert live["kv"]._resident.host_len[planner.slot_of(1)] == 4
     assert live["pool"]._slots[1]["main"].tokens == 4
-
-
-def test_a_run_that_ends_short_takes_nothing_back_from_its_padding_rows():
-    """A padding row goes back to rest right after its step (``release``), so
-    by the time the run lands it holds no count to take back."""
-    live, _, planner = _setup({1: 3})
-    s = _captured_step(live, planner, [1], slot=0, bs=2, repeats=3)
-    counted = live["rope"]._counters[1]["main"]
-    live["rope"].reset_request(-1)
-    live["rope"].rewind_run(s.rope, s.ctx, 2)
-    assert live["rope"]._counters[1]["main"] == counted - 2 and live["rope"]._counters[-1] == {}
 
 
 @pytest.mark.parametrize(("world_size", "policies", "why"), [

@@ -390,7 +390,7 @@ def test_a_short_run_takes_back_a_decode_snapshot_past_where_it_ended():
     pool._unkeyed = {(1, "main")}
     freed = []
     pool._drop_decode = lambda key, decode: (pool._unkeyed.discard(key), freed.append(decode.slot))
-    pool.rewind_run(SimpleNamespace(segments=[SimpleNamespace(request_id=1, label="main", span=1)]), None, 2)
+    pool.rewind_run(SimpleNamespace(segments=[SimpleNamespace(request_id=1, label="main", span=1)]), None, 2, {1})
     assert held.tokens == 10 and freed == [4] and pool._decode[(1, "main")] is earlier
 
 

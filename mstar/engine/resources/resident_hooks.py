@@ -1,7 +1,7 @@
 """What a resource overrides to take part in resident planning (`resident.py`)."""
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -51,9 +51,10 @@ class ResidentHooks:
         only narrow."""
         return ANY_REPEATS
 
-    def rewind_run(self, step, ctx, replays: int) -> None:
+    def rewind_run(self, step, ctx, replays: int, rows: Collection) -> None:
         """A run landed ``replays`` iterations short of what its commit counted
-        (``device_run``): take them back from what is counted per iteration."""
+        (``device_run``): take them back from what is counted per iteration,
+        for ``rows`` only (the step's rows still the requests it counted for)."""
         return
 
     def replay_columns(self, step, ctx, repeats: int) -> list[tuple[torch.Tensor, torch.Tensor]]:

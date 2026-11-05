@@ -127,6 +127,9 @@ class StepContext:
     # step counts for this many iterations. The worker asks, and `StepRunner`
     # narrows it to what the step's resources allow (`Resource.max_repeats`).
     repeats: int = 1
+    # a run's real rows -> the generation of the request each named when it
+    # committed (``StepRunner.commit``), so a short landing rewinds only those
+    counted: Mapping[int, int | None] = field(default_factory=dict)
     # the node's `ResidentPlanner` when this step's capture reads the resident
     # tables: a resource then stages nothing per row (see `resources/resident.py`)
     resident: Any = None

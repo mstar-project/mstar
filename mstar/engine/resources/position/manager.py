@@ -368,12 +368,10 @@ class RopeManager(PositionManager):
             return "a host-planned step that advances positions moves past what one plan holds"
         return None
 
-    def rewind_run(self, step, ctx, replays: int) -> None:
+    def rewind_run(self, step, ctx, replays: int, rows) -> None:
         for segment, advance in zip(step.segments, self._advances(step), strict=True):
-            # a padding row went back to rest after its step (``release``): nothing to take back
-            counters = None if ctx.is_padding_row(segment.request_id) else self._counters.get(segment.request_id)
-            if advance and counters is not None:
-                counters[segment.label] -= advance * replays
+            if advance and segment.request_id in rows:
+                self._counters[segment.request_id][segment.label] -= advance * replays
 
     def resident_refusal(self, key: str, streams: Mapping[str, "ResidentStream"]) -> str | None:
         if self._config.scheme != PosScheme.SEQUENTIAL:

@@ -611,3 +611,24 @@ def test_a_refused_pre_admit_gives_back_what_it_reserved():
 
     assert kv.calls.count("rollback") == 1
     assert attn.calls.count("rollback") == 1, "the refusing resource too"
+
+
+def test_a_run_landing_short_takes_back_only_from_rows_still_its_requests():
+    """A row's request can be done and torn down before the run it rode in
+    lands (its handle then names a newcomer), and a padding row is put back to
+    rest after its step: only the step's live rows give back what wasn't run."""
+    kv = _Stub("kv")
+    rewound = []
+    kv.rewind_run = lambda step, ctx, replays, rows: rewound.append((replays, rows))
+    runner = StepRunner({"kv": kv})
+    for rid in ("r1", "r2"):
+        runner.ingest_request(rid, None)
+    ctx = _ctx(("r1", "r2"))
+    ctx.repeats = 4
+    ctx.set_padded_rids(("r1", "r2", "pad"))
+    step = _step(["kv"], segments=(("r1", "main", 1), ("r2", "main", 1), ("pad", "main", 1)), ctx=ctx)
+    runner.commit(step)
+    runner.remove_request("r2")
+    runner.ingest_request("r2", None)  # the handle now names another request
+    runner.rewind_run(step, 3)
+    assert rewound == [(3, frozenset({"r1"}))]

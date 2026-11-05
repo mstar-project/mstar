@@ -615,6 +615,7 @@ class Engine:
     # node -> its lane, for nodes off the chain, and each such lane's stream;
     # set at construction and load, empty for an engine with no lanes
     _node_lanes: Mapping[str, int] = MappingProxyType({})
+    _stage_lock: "threading.Lock | None" = None
     # (node, walk) -> the Loop it runs in; set at warmup
     _loops: Mapping[tuple[str, str], str] = MappingProxyType({})
     _lane_streams: Mapping[int, Any] = MappingProxyType({})
@@ -644,7 +645,7 @@ class Engine:
         self._node_lanes = dict(node_lanes or {})
         # the plan thread's stage of the chain's next step, against a step off the
         # chain that plans the same resources on the GPU thread (``_beside_chain``)
-        self._stage_lock = threading.Lock()
+        self._stage_lock = threading.Lock() if self._node_lanes else None
         self._autocast_dtype = autocast_dtype
         # the share of the device this worker's allocations may hold once
         # capture is done, None for whatever is free
@@ -3617,7 +3618,7 @@ class Engine:
         lease = batch.step_context.slot_lease
         if cg_runner is None or lease is None:
             return False
-        with self._stage_lock:
+        with self._stage_lock or nullcontext():
             return self._pre_plan_staged(batch, submodule_mgmt, cg_runner, lease)
 
     def _beside_chain(self, node_name: str) -> bool:
