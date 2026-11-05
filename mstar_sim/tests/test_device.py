@@ -436,20 +436,27 @@ def test_flashinfers_planner_runs_short_of_a_small_workspace():
         # a plan's Python is the emulator's time, not the host's: FlashInfer's own is a C++ loop
         import time
         from mstar_sim import clock
+
+        def counted_share(call):  # the largest share of call's wall time the emulator counted
+            # as its own, over a few tries: on a loaded box a preemption outside the count lowers one
+            shares = []
+            for _ in range(5):
+                counted, began = clock.STATS["host_compute"], time.perf_counter()
+                call()
+                shares.append((clock.STATS["host_compute"] - counted) / (time.perf_counter() - began))
+            return max(shares)
+
         batch = torch.arange(257, dtype=torch.int32)
-        counted, began = clock.STATS["host_compute"], time.perf_counter()
-        get_batch_prefill_module("fa2").plan(
+        share = counted_share(lambda: get_batch_prefill_module("fa2").plan(
             torch.empty(1 << 30, dtype=torch.uint8, device="cuda"), None, None, batch, batch * 64,
-            torch.full((256,), 1024, dtype=torch.int32), 256, 256, 8, 8, 16, False, 64, 64, True, -1, -1, False, 0, 0)
-        elapsed = time.perf_counter() - began
-        assert clock.STATS["host_compute"] - counted > elapsed / 2, (clock.STATS, elapsed)
+            torch.full((256,), 1024, dtype=torch.int32), 256, 256, 8, 8, 16, False, 64, 64, True, -1, -1, False, 0, 0))
+        assert share > 1 / 2, share
         rows = torch.arange(4097, dtype=torch.int32)  # a ragged wrapper prices in its own plan
         wide = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
             torch.empty(1 << 30, dtype=torch.uint8, device="cuda"), "NHD", backend="fa2")
-        counted, began = clock.STATS["host_compute"], time.perf_counter()
-        wide.plan(rows, rows * 64, 8, 8, 64, causal=True, q_data_type=torch.bfloat16, disable_split_kv=True)
-        elapsed = time.perf_counter() - began
-        assert clock.STATS["host_compute"] - counted > 0.9 * elapsed, (clock.STATS, elapsed)
+        share = counted_share(lambda: wide.plan(rows, rows * 64, 8, 8, 64, causal=True, q_data_type=torch.bfloat16,
+                                                disable_split_kv=True))
+        assert share > 0.9, share
         # what FlashInfer's plan refuses: a group size with no kernel, a negative length, and
         # several queries a row where the kernels take one
         one_row = torch.tensor([0, 1], **i32), torch.zeros(1, **i32), torch.tensor([3], **i32)
