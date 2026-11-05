@@ -5,6 +5,7 @@ import threading
 from contextlib import contextmanager
 from dataclasses import dataclass, field, is_dataclass, replace
 from functools import cache, partial
+from types import MappingProxyType
 from typing import Any, Callable, Collection, Iterator, Mapping, NamedTuple, Sequence
 
 import torch
@@ -32,6 +33,7 @@ from mstar.engine.resources.resident import ResidentPlanner
 from mstar.engine.resources.step import PIECEWISE_WALK, SubmoduleStep
 from mstar.model.submodule_base import (
     BatchedModelOutput,
+    CarryPair,
     ModelInputsFromEngine,
     NodeInputs,
     NodeSubmodule,
@@ -639,6 +641,40 @@ class DummyRowPool:
             self.reset(rids, free=True)
 
 
+def _carried(slot: "AcceleratorGraphSlot", name: str) -> torch.Tensor | None:
+    """The buffer a replay leaves ``name`` in: a row output, else a stop buffer."""
+    outputs = slot.static_outputs
+    for buffers in (outputs.row_outputs, outputs.check_stop_buffers):
+        value = (buffers or {}).get(name)
+        if isinstance(value, torch.Tensor):
+            return value
+    return None
+
+
+def _probe_rows(
+    inputs: Sequence[NodeInputs], carries: Mapping[str, CarryPair],
+) -> tuple[list[NodeInputs], dict[str, list[torch.Tensor]]]:
+    """``inputs`` with each row's tensor input of a carried signal replaced
+    by a probe value of its own (floats only: an integer may index a table),
+    and the values, by signal, for the signals every row carries."""
+    rows = list(inputs)
+    probed: dict[str, list[torch.Tensor]] = {}
+    gen = torch.Generator().manual_seed(0)
+    for signal in carries:
+        values = [(getattr(row, "tensor_inputs", None) or {}).get(signal) for row in rows]
+        if not rows or not all(isinstance(v, torch.Tensor) for v in values):
+            continue
+        values = [
+            torch.randn(v.shape, generator=gen).to(v.device, v.dtype) if v.is_floating_point() else v
+            for v in values
+        ]
+        rows = [
+            replace(row, tensor_inputs={**row.tensor_inputs, signal: v}) for row, v in zip(rows, values, strict=True)
+        ]
+        probed[signal] = values
+    return rows, probed
+
+
 @dataclass
 class AcceleratorGraphSlot:
     """One captured graph + the buffers its replay reads and writes.
@@ -823,16 +859,33 @@ class AcceleratorGraphRunner:
         """The step ``walk``'s widest capture declares."""
         return self._template(self._widest(walk)).step
 
-    def prepare_template(self, walk: str) -> None:
+    def prepare_template(self, walk: str, carries: Mapping[str, CarryPair] = MappingProxyType({})) -> str | None:
         """Admit, plan and preprocess ``walk``'s widest capture on its padding
         rows, as its capture will, then free them. Before any capture, so the
-        engine can watch what this ``preprocess`` reads (`resident.table_read`)."""
+        engine can watch what this ``preprocess`` reads (`resident.table_read`).
+
+        Returns why ``preprocess`` doesn't hand a loop-back signal of
+        ``carries`` to the forward unchanged, or None: a replay that repeats
+        skips it, so its input must be the carried output as is. Each
+        template row's value is replaced by a probe first, so a transform
+        can't hide behind a template of zeros. A signal the rows don't carry
+        as a tensor input (a token read off the sampler) isn't checked."""
         spec = self._widest(walk)
         template = self._template(spec)
+        rows, probed = _probe_rows(template.inputs, carries)
+        template = template._replace(inputs=rows)
         try:
-            self._prepare(spec, template)
+            preprocessed = self._prepare(spec, template)
         finally:
             self._dummy_rows.reset(template.rids, free=True)
+        for signal, rows in probed.items():
+            value = preprocessed.get(carries[signal].input)
+            expected = torch.cat([row.reshape(-1) for row in rows])
+            if not isinstance(value, torch.Tensor) or value.numel() != expected.numel() or not torch.equal(
+                value.reshape(-1).to(expected.device, expected.dtype), expected,
+            ):
+                return f"its preprocess changes loop-back {signal!r} on its way to {carries[signal].input!r}"
+        return None
 
     def _widest(self, walk: str) -> CGSlotSpec:
         return next(s for s in self.prepare_for_capture() if s.bucket.graph_walk == walk and s.slot == 0)
@@ -1639,27 +1692,28 @@ class AcceleratorGraphRunner:
         return slot.static_outputs
 
     def repeat(
-        self, lease: SlotLease, carry: tuple[str, str], repeats: int, next_replay: Callable[[], None],
+        self, lease: SlotLease, carries: Mapping[str, CarryPair], repeats: int, next_replay: Callable[[], None],
         columns: Collection[str] = (),
     ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
-        """The rest of a step that repeats, after its first replay: each replay
-        takes ``carry``'s stop buffer as its static input. Returns the stop
-        buffers, one value a row each, and the row outputs named in
-        ``columns``, ``[rows, ...]`` each, both with a column per replay
-        (``[rows, repeats, ...]``): a replay overwrites what the last one
-        left, so each is copied out on the stream before the next one."""
+        """The rest of a step that repeats, after its first replay: before
+        each replay, every loop-back signal's output is copied into the static
+        input it feeds (``carries``). Returns the stop buffers, one value a
+        row each, and the row outputs named in ``columns``, ``[rows, ...]``
+        each, both with a column per replay (``[rows, repeats, ...]``): a
+        replay overwrites what the last one left, so each is copied out on the
+        stream before the next one."""
         slot = self.slot_for(lease)
         buffers = slot.static_outputs.check_stop_buffers
         rows_out = {name: slot.static_outputs.row_outputs[name] for name in columns}
-        out, name = carry
-        target = slot.static_inputs[name]
+        copies = [(_carried(slot, pair.output), slot.static_inputs[pair.input]) for pair in carries.values()]
         # two names can share a buffer
         unique = {id(t): t.reshape(t.shape[0], -1)[:, 0] for t in buffers.values()}
         unique.update((id(t), t) for t in rows_out.values())
         wide = {key: t.new_empty(t.shape[0], repeats, *t.shape[1:]) for key, t in unique.items()}
         for i in range(repeats):
             if i:
-                target.copy_(buffers[out].reshape(target.shape))
+                for source, target in copies:
+                    target.copy_(source.reshape(target.shape))
                 next_replay()
                 slot.graph.replay()
             for key, tensor in unique.items():
@@ -1668,6 +1722,26 @@ class AcceleratorGraphRunner:
             {key: wide[id(t)] for key, t in buffers.items()},
             {key: wide[id(t)] for key, t in rows_out.items()},
         )
+
+    def carry_refusal(self, walk: str, carries: Mapping[str, CarryPair]) -> str | None:
+        """Why a run of ``walk``'s captures can't carry each loop-back signal
+        between replays, or None: its output and the static input it feeds
+        must both be buffers the capture holds, the same size."""
+        for bucket in self._buckets.values():
+            if bucket.config.capture_graph_walk != walk:
+                continue
+            for slot in bucket.slots:
+                for signal, pair in sorted(carries.items()):
+                    source = _carried(slot, pair.output)
+                    target = slot.static_inputs.get(pair.input)
+                    if source is None or not isinstance(target, torch.Tensor):
+                        return f"its capture holds no {pair.output!r} -> {pair.input!r} to carry loop-back {signal!r}"
+                    if source.numel() != target.numel():
+                        return (
+                            f"loop-back {signal!r} leaves {tuple(source.shape)} in {pair.output!r}, "
+                            f"but its input {pair.input!r} is {tuple(target.shape)}"
+                        )
+        return None
 
     def run_column_refusal(self, walk: str, signals: Collection[str]) -> str | None:
         """Why a run of ``walk``'s captures can't keep a column per replay of

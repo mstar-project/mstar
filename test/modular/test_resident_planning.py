@@ -303,31 +303,72 @@ def test_a_repeated_step_addresses_each_replay_as_host_plans_would(repeats):
         assert tables.host_len[planner.slot_of(rid)] == live["kv"]._streams[rid]["main"].stored_len
 
 
-def test_a_repeat_feeds_each_replay_the_last_one_s_token_and_keeps_a_column_per_replay():
-    """A replay overwrites its stop buffers and reads its static input, so a step
-    that repeats hands each replay the token before it and keeps every one."""
-    tokens = torch.tensor([5, 7])
-    ids = torch.zeros(2, 1, dtype=torch.long)
+def test_a_repeat_carries_every_loop_back_signal_and_keeps_a_column_per_replay():
+    """A replay overwrites its outputs and reads its static inputs, so a step
+    that repeats hands each replay what the one before left of every
+    loop-back signal (a token, a float embedding under another name, a long
+    counter) and keeps a column of each per-iteration output."""
+    from mstar.model.submodule_base import CarryPair
+
+    tokens, ids = torch.tensor([5, 7]), torch.zeros(2, 1, dtype=torch.long)
+    embeds, embeds_in = torch.tensor([[0.5], [1.5]]), torch.zeros(2, 1)
+    step, step_in = torch.tensor([10, 20]), torch.zeros(2, dtype=torch.long)
     frames = torch.tensor([[5.0, -5.0], [7.0, -7.0]])
 
     class Graph:
         def replay(self):
             tokens.copy_(ids.reshape(-1) + 1)
+            embeds.copy_(embeds_in * 2)
+            step.copy_(step_in + 1)
             frames.copy_(tokens[:, None] * torch.tensor([1.0, -1.0]))
 
     slot = SimpleNamespace(
-        graph=Graph(), static_inputs={"input_ids": ids},
+        graph=Graph(), static_inputs={"input_ids": ids, "input_embeds": embeds_in, "step": step_in},
         static_outputs=SimpleNamespace(
-            check_stop_buffers={"new_token": tokens, "text_inputs": tokens}, row_outputs={"frame": frames},
+            check_stop_buffers={"new_token": tokens, "text_inputs": tokens},
+            row_outputs={"frame": frames, "embeds": embeds, "step": step},
         ),
     )
+    carries = {
+        "text_inputs": CarryPair("new_token", "input_ids"), "embeds": CarryPair("embeds", "input_embeds"),
+        "step": CarryPair("step", "step"),
+    }
     runner = AcceleratorGraphRunner.__new__(AcceleratorGraphRunner)
     runner.slot_for = lambda lease: slot
-    wide, rows = runner.repeat(None, ("new_token", "input_ids"), 3, lambda: None, ["frame"])
+    wide, rows = runner.repeat(None, carries, 3, lambda: None, ["frame"])
     assert wide["new_token"].tolist() == [[5, 6, 7], [7, 8, 9]]
     assert wide["text_inputs"] is wide["new_token"]
+    # the last replay's outputs, each from the replay before's
+    assert embeds.reshape(-1).tolist() == [2.0, 6.0] and step.tolist() == [12, 22]
     # a per-iteration output keeps each replay's rows: [rows, replays, ...]
     assert rows["frame"].tolist() == [[[5, -5], [6, -6], [7, -7]], [[7, -7], [8, -8], [9, -9]]]
+
+
+@pytest.mark.parametrize(("preprocess", "refused"), [
+    (torch.cat, False),
+    (lambda rows: torch.cat(rows) * 2, True),
+    # a zero condition added to a template of zeros would pass without a probe value
+    (lambda rows: torch.cat(rows) + torch.zeros(1), False),
+    (lambda rows: torch.cat(rows) + 1.0, True),
+], ids=["identity", "scaled", "zero_add", "condition_add"])
+def test_a_preprocess_that_changes_a_loop_back_signal_keeps_its_walk_from_repeating(preprocess, refused):
+    """A run skips ``preprocess`` between replays, so at load the engine feeds
+    each loop-back signal a probe value through the capture template's
+    ``preprocess`` and refuses a walk that changes it on the way."""
+    from mstar.engine.accelerator_graph_runner import CaptureTemplate
+    from mstar.model.submodule_base import CarryPair, NodeInputs
+
+    rows = [NodeInputs(tensor_inputs={"embeds": torch.zeros(1, 4)}) for _ in range(2)]
+    runner = AcceleratorGraphRunner.__new__(AcceleratorGraphRunner)
+    runner._widest = lambda walk: SimpleNamespace(bucket=SimpleNamespace(graph_walk=walk))
+    runner._template = lambda spec: CaptureTemplate([0, 1], rows, None, None)
+    runner._dummy_rows = SimpleNamespace(reset=lambda rids, free: None)
+    runner._submodule = SimpleNamespace(preprocess=lambda graph_walk, engine_inputs, inputs: {
+        "input_embeds": preprocess([row.tensor_inputs["embeds"] for row in inputs]),
+    })
+    refusal = runner.prepare_template(WALK, {"embeds": CarryPair("embeds", "input_embeds")})
+    assert (refusal is not None) is refused
+    assert refusal is None or "changes loop-back 'embeds'" in refusal
 
 
 @pytest.mark.parametrize(("in_chain", "fresh", "same_node", "room", "want"), [
@@ -362,8 +403,8 @@ def test_the_startup_line_names_the_owner_that_refuses_each_capability(caplog, l
     engine._submodules = {node: SimpleNamespace(
         resident=SimpleNamespace(walks={WALK} - refused.keys()), resident_refusals=refused,
         joint_comm_group=SimpleNamespace(world_size=1),
-        submodule=SimpleNamespace(repeat_carry=lambda walk: ("t", "i")),
-        resources=resources,
+        submodule=SimpleNamespace(repeat_carry=lambda walk, signals: {}),
+        resources=resources, carry_refusals={}, carries={}, accelerator_graph_runner=None,
     ) for node, resources, refused in (
         ("a", {"kv": willing}, {}), ("b", {"kv": willing, "pool": ResidentHooks()}, {}),
         ("c", {"kv": willing}, {WALK: "resource 'kv': why"}),
@@ -413,18 +454,17 @@ def _frames(streaming: bool):
     return GraphEdge("codec", "frame", is_streaming=streaming)
 
 
-@pytest.mark.parametrize(("loop", "carried", "why"), [
-    (_token_loop(), {"t"}, None),
-    (_token_loop(_frames(streaming=True)), {"t"}, None),
-    (_token_loop(), set(), "runner: its loop-back 't' -> 'n' isn't carried on the device"),
-    (_token_loop(_frames(streaming=False)), {"t"}, "graph runtime: 'frame' -> 'codec' is read once an iteration"),
-    (_token_loop(streamed=("chunk",)), {"t"}, "stream buffer: its input 'chunk' is streamed"),
-], ids=["served", "streamed_out", "uncarried", "next_node", "streamed_in"])
-def test_a_walk_repeats_only_if_a_run_serves_each_of_its_edges(loop, carried, why):
+@pytest.mark.parametrize(("loop", "why"), [
+    (_token_loop(), None),
+    (_token_loop(_frames(streaming=True)), None),
+    (_token_loop(_frames(streaming=False)), "graph runtime: 'frame' -> 'codec' is read once an iteration"),
+    (_token_loop(streamed=("chunk",)), "stream buffer: its input 'chunk' is streamed"),
+], ids=["served", "streamed_out", "next_node", "streamed_in"])
+def test_a_walk_repeats_only_if_a_run_serves_each_of_its_edges(loop, why):
     from mstar.graph.base import loop_edges
     from mstar.worker.step_repeats import edge_refusal
 
-    refusal = edge_refusal(loop_edges(loop, "n"), carried)
+    refusal = edge_refusal(loop_edges(loop, "n"))
     assert refusal is None if why is None else refusal.startswith(why)
 
 
@@ -469,7 +509,8 @@ def _attention(*wrappers):
     (_sampler, False),
     (lambda: _sampler(_history=object()), True),
     (lambda: _sampler(_decides=False), True),  # above one rank: scattered on the host
-    (lambda: _sampler(_loopback_state={"s": object()}), True),
+    # loop-back state is carried between replays like any loop-back signal
+    (lambda: _sampler(_loopback_state={"s": object()}), False),
     (lambda: _attention(_TensorCoreDecode), False),
     (lambda: _attention(_CudaCoreDecode, _CudaCoreDecode), True),
 ], ids=["sampler", "history", "no_scatter", "loopback_state", "tensor_core", "cuda_core"])

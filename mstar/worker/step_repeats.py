@@ -66,20 +66,23 @@ def parse_step_repeats(block: object, nodes: Collection[str]) -> dict[str, Repea
     return {node: RepeatConfig.parse(node, settings) for node, settings in block.items()}
 
 
-def edge_refusal(edges: LoopEdges, carried: Collection[str]) -> str | None:
-    """Why a run can't serve one of ``edges``, or None. ``carried``: the
-    loop-back signals the device carries from one replay to the next. A
+def edge_refusal(edges: LoopEdges) -> str | None:
+    """Why a run can't serve one of ``edges``, or None. A loop-back signal is
+    carried between replays (``NodeSubmodule.repeat_carry``), and a
     per-iteration output is served by a column per replay (``run_columns``),
     as items of its own."""
     for name, kind in sorted(edges.inputs.items()):
         if kind is EdgeKind.PER_ITERATION:
             return f"stream buffer: its input {name!r} is streamed, an item each iteration"
     for (signal, dest), kind in sorted(edges.outputs.items()):
-        if kind is EdgeKind.LOOP_BACK and signal not in carried:
-            return f"runner: its loop-back {signal!r} -> {dest!r} isn't carried on the device"
         if kind is EdgeKind.PER_ITERATION and dest != EMPTY_DESTINATION and (signal, dest) not in edges.items:
             return f"graph runtime: {signal!r} -> {dest!r} is read once an iteration by its node"
     return None
+
+
+def loop_back(edges: LoopEdges) -> frozenset[str]:
+    """The signals ``edges`` loop back."""
+    return frozenset(signal for (signal, _), kind in edges.outputs.items() if kind is EdgeKind.LOOP_BACK)
 
 
 def run_columns(edges: LoopEdges, inline: Collection[str]) -> frozenset[str]:
@@ -111,6 +114,11 @@ class StepRepeats:
     def asked(self) -> bool:
         """Whether any Loop walk here may stand for more than one iteration."""
         return any(self.limit(node) > 1 for node, _ in self.edges)
+
+    def carried(self) -> dict[tuple[str, str], frozenset[str]]:
+        """The loop-back signals of each walk asked to repeat, which a run
+        carries between replays."""
+        return {key: loop_back(edges) for key, edges in self.edges.items() if self.limit(key[0]) > 1}
 
     def settle(
         self, resident_refusal: Callable[[str, str], str | None], repeat_refusal: Callable[[str, str], str | None],

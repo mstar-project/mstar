@@ -129,7 +129,14 @@ from mstar.worker.speculation import (
     SpeculationContext,
     SpeculationPreparer,
 )
-from mstar.worker.step_repeats import StepRepeats, edge_refusal, parse_step_repeats, run_columns, walk_edges
+from mstar.worker.step_repeats import (
+    StepRepeats,
+    edge_refusal,
+    loop_back,
+    parse_step_repeats,
+    run_columns,
+    walk_edges,
+)
 from mstar.worker.stream_buffers import StreamBufferManager
 from mstar.worker.worker_metrics import WorkerMetrics
 
@@ -2926,14 +2933,14 @@ class Worker:
         if self._stop_token_signal.get((node_name, graph_walk)) is None:
             return "node: the runtime doesn't check its stop: it declares no token stop"
         edges = self._step_repeats.edges[(node_name, graph_walk)]
-        refusal = edge_refusal(edges, engine.device_loopback_signals(node_name, graph_walk))
+        refusal = edge_refusal(edges)
         if refusal is None:
             # the client's copy of a token rides the step's token column
             inline = (
                 engine.inline_client_signals(node_name, graph_walk) if self._graph_runtime.supports_inline_emit else {}
             )
             refusal = engine.keep_run_columns(node_name, graph_walk, run_columns(edges, inline))
-        return refusal if refusal is not None else engine.repeat_refusal(node_name, graph_walk)
+        return refusal if refusal is not None else engine.repeat_refusal(node_name, graph_walk, loop_back(edges))
 
     def _can_speculate(self, batch: ScheduledBatch) -> bool:
         if not self._async_schedulable(batch):
@@ -5187,7 +5194,10 @@ class Worker:
         self._verify_tp_async_sched_agrees()
 
         # CUDA graph capture before entering the main loop
-        self.engine_manager.warmup_all({(node, walk) for walk, node in self._innermost_loop_by_node})
+        self.engine_manager.warmup_all(
+            {(node, walk) for walk, node in self._innermost_loop_by_node},
+            self._step_repeats.carried() if self._step_repeats is not None else {},
+        )
         if self._step_repeats is not None:
             # after capture: an attention decides repeats from the kernels it captured
             self._step_repeats.settle(self.engine_manager.engine.resident_refusal, self._repeat_refusal)

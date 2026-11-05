@@ -1666,8 +1666,12 @@ of the row, so a resident step stages none of them, while the RNG offset, the la
 and the repetition-penalty mask stay by the sampler's own row of each request.
 
 A resident step can also stand for several iterations of its Loop (``step_repeats``
-per node in the serving config): the host plans once and the capture replays, the token carried
-from one replay to the next by ``repeat_carry``, which ``DeviceLoopback`` supplies. Whether
+per node in the serving config): the host plans once and the capture replays, each loop-back
+signal carried from one replay to the next by copying the output it left into the static input
+it feeds (``NodeSubmodule.repeat_carry``: both named as the signal by default; a
+``DeviceLoopback`` token goes from its stop buffer to its input). A run skips ``preprocess``
+between replays, so at load the engine feeds each carried signal a probe value through the
+capture template's ``preprocess`` and refuses a walk that changes it on the way. Whether
 a walk may repeat is settled once, after capture, and the worker logs it per walk with the
 reason when it can't: the walk must be resident, have a runtime token stop, run on one rank, and each of
 its node's edges in the Loop (``mstar.graph.base.loop_edges``: constant, loop-back,

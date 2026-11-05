@@ -410,8 +410,6 @@ class SamplerResource(Resource):
             return "it scatters its RNG offsets and last tokens outside the graph"
         if self._history is not None:
             return "its repetition window is kept per step outside the graph"
-        if self._loopback_state:
-            return "it loops back state besides the token, written per step"
         return None
 
     def max_repeats(self, step, ctx) -> int:

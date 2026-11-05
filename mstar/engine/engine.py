@@ -61,6 +61,7 @@ from mstar.model.submodule_base import (
     ARNodeInputs,
     ARNodeSubmodule,
     BatchedModelOutput,
+    CarryPair,
     ChunkingPolicy,
     HostRows,
     InputMetadata,
@@ -196,6 +197,10 @@ class SubmoduleManagement:
     resident_refusals: dict[str, str] = field(default_factory=dict)
     # walk -> the row outputs a step that repeats keeps a column of per replay
     run_columns: dict[str, frozenset[str]] = field(default_factory=dict)
+    # walk -> how a step that repeats carries each loop-back signal between replays
+    carries: dict[str, dict[str, CarryPair]] = field(default_factory=dict)
+    # walk -> why its preprocess can't be skipped between replays (checked at load)
+    carry_refusals: dict[str, str] = field(default_factory=dict)
 
     # Rotated globally, not per runner: slot-keyed buffers are shared across
     # buckets and regions, so per-runner counters let consecutive steps collide
@@ -871,9 +876,14 @@ class Engine:
         """This node's resolved dtype, or None for one that opted out."""
         return self._submodules[node_name].node_dtype
 
-    def warmup(self, looped: Collection[tuple[str, str]] = ()) -> None:
+    def warmup(
+        self, looped: Collection[tuple[str, str]] = (),
+        carried: Mapping[tuple[str, str], Collection[str]] = MappingProxyType({}),
+    ) -> None:
         """Capture every node's graphs. ``looped``: the (node, walk) pairs whose
-        walk runs the node inside a Loop, which may run on resident tables."""
+        walk runs the node inside a Loop, which may run on resident tables;
+        ``carried``: the loop-back signals of each such pair whose steps may
+        repeat, whose ``preprocess`` is checked here (``probe_carries``)."""
         # before capture: a region inside a captured graph compiles in its warm-up
         self._compile_regions()
         ag_runners: dict[str, AcceleratorGraphRunner] = {}
@@ -909,6 +919,9 @@ class Engine:
             self._build_resident_planner(
                 node_name, ag_runners[node_name], {walk for node, walk in looped if node == node_name},
             )
+        for (node_name, walk), signals in carried.items():
+            if node_name in self._submodules:
+                self._probe_carries(node_name, ag_runners[node_name], walk, signals)
 
         # every bucket sized before any is captured, so one plan weighs them all
         # against the largest eager step on the device
@@ -2259,10 +2272,10 @@ class Engine:
                 launch_started_event=release_event,
             )
             if ctx.repeats > 1:
-                carry = submodule_mgmt.submodule.repeat_carry(graph_walk)
                 columns = submodule_mgmt.run_columns.get(graph_walk, frozenset())
                 stops, rows = cg_runner.repeat(
-                    lease, carry, ctx.repeats, partial(self._runner.next_replay, step), columns,
+                    lease, submodule_mgmt.carries[graph_walk], ctx.repeats,
+                    partial(self._runner.next_replay, step), columns,
                 )
                 out = dataclasses.replace(
                     out, check_stop_buffers=stops, row_outputs={**(out.row_outputs or {}), **rows},
@@ -2874,21 +2887,41 @@ class Engine:
         mgmt.run_columns[graph_walk] = frozenset(signals)
         return None
 
-    def repeat_refusal(self, node_name: str, graph_walk: str) -> str | None:
+    def _probe_carries(
+        self, node_name: str, runner: AcceleratorGraphRunner, walk: str, signals: Collection[str],
+    ) -> None:
+        """Before capture: whether ``walk``'s ``preprocess`` hands each
+        loop-back signal to the forward unchanged, which a run skips between
+        replays (``AcceleratorGraphRunner.prepare_template``)."""
+        mgmt = self._submodules[node_name]
+        if runner.resident_refusal(walk) is not None:
+            return  # no batched capture of it: its steps never repeat
+        refusal = runner.prepare_template(walk, mgmt.submodule.repeat_carry(walk, signals))
+        if refusal is not None:
+            mgmt.carry_refusals[walk] = f"node: {refusal}"
+
+    def repeat_refusal(self, node_name: str, graph_walk: str, signals: Collection[str] = ()) -> str | None:
         """Why a step of this walk can't replay with no host work between, or
-        None if it may: the deployment, the walk's step and every resource of
-        the node each answer. After capture, which some resources decide at."""
+        None if it may: the deployment, the walk's step, its capture and every
+        resource of the node each answer. ``signals``: the walk's loop-back
+        signals, each carried between replays (``NodeSubmodule.repeat_carry``).
+        After capture, which some resources decide at."""
         if self.resident_refusal(node_name, graph_walk) is not None:
             return "engine: it plans on the host"
         mgmt = self._submodules[node_name]
         if mgmt.joint_comm_group.world_size > 1:
             # every rank would have to replay the same count, which one rank settles
             return "deployment: it runs on more than one rank"
-        if mgmt.submodule.repeat_carry(graph_walk) is None:
-            return "node: it names nothing that carries a replay's token on"
+        if (refusal := mgmt.carry_refusals.get(graph_walk)) is not None:
+            return refusal
+        carries = mgmt.submodule.repeat_carry(graph_walk, signals)
+        runner = mgmt.accelerator_graph_runner
+        if runner is not None and (refusal := runner.carry_refusal(graph_walk, carries)) is not None:
+            return f"runner: {refusal}"
         for key, resource in mgmt.resources.items():
             if (refusal := resource.repeat_refusal()) is not None:
                 return f"resource {key!r}: {refusal}"
+        mgmt.carries[graph_walk] = carries
         return None
 
     def get_max_batch_tokens(self, node_name: str, graph_walk: str) -> int | None:

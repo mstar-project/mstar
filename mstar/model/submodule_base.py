@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections import defaultdict
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field, fields, replace
 from enum import Enum
 from types import MappingProxyType
@@ -94,6 +94,14 @@ class TokenStop:
         return walk is None or graph_walk == walk or (isinstance(walk, frozenset) and graph_walk in walk)
 
 
+class CarryPair(NamedTuple):
+    """A loop-back signal between two replays of a step that repeats."""
+    # the output (a row output or ``check_stop_buffers`` entry) a replay leaves it in
+    output: str
+    # the static input (a key of ``preprocess``'s output) the next replay reads
+    input: str
+
+
 class DeviceLoopback(NamedTuple):
     """A decode walk whose rows read their last sampled token off the
     sampler's slot masters instead of a routed tensor
@@ -108,10 +116,8 @@ class DeviceLoopback(NamedTuple):
     synchronous host-to-device copy per step, which a node that reads its
     tokens on the host would pay for nothing.
 
-    It is also what carries a step that repeats (``step_repeats``) from one
-    replay to the next (``repeat_carry``), and only the token moves between
-    replays. So every other input of the walk must be the same each iteration:
-    ``preprocess`` stages no per-iteration value, ``step_metadata`` included.
+    It also names the token's pair for a step that repeats
+    (``repeat_carry``): from ``buffer`` to ``input`` between replays.
     """
 
     walk: str
@@ -1096,12 +1102,16 @@ class NodeSubmodule(torch.nn.Module, ABC):
         del graph_walk, has_loopback
         return None
 
-    def repeat_carry(self, graph_walk: str) -> tuple[str, str] | None:
-        """What carries a replay of this walk's capture to the next, as (stop
-        buffer, static input); None when the walk's step can't repeat.
-        ``ARNodeSubmodule`` derives it from ``DeviceLoopback``."""
+    def repeat_carry(self, graph_walk: str, signals: Collection[str]) -> dict[str, CarryPair]:
+        """How each loop-back signal of this walk (``signals``, from the graph)
+        moves from one replay of its capture to the next: the output the
+        replay leaves it in, and the static input the next one reads it from.
+        By default both are named as the signal; ``ARNodeSubmodule`` carries
+        its ``DeviceLoopback`` token from its stop buffer to its input. The
+        engine checks at load that ``preprocess`` hands each one to the forward
+        unchanged."""
         del graph_walk
-        return None
+        return {signal: CarryPair(signal, signal) for signal in signals}
 
     def step_is_input_free(self, graph_walk: str) -> bool:
         """Whether ``declare_step`` for this walk reads nothing from the inputs
@@ -1548,8 +1558,12 @@ class ARNodeSubmodule(NodeSubmodule):
             return frozenset({self.device_loopback.signal})
         return super().device_loopback_signals(graph_walk)
 
-    def repeat_carry(self, graph_walk: str) -> tuple[str, str] | None:
-        return (self.device_loopback.buffer, self.device_loopback.input) if self._loops_back(graph_walk) else None
+    def repeat_carry(self, graph_walk: str, signals: Collection[str]) -> dict[str, CarryPair]:
+        pairs = super().repeat_carry(graph_walk, signals)
+        loopback = self.device_loopback
+        if self._loops_back(graph_walk) and loopback.signal in pairs:
+            pairs[loopback.signal] = CarryPair(loopback.buffer, loopback.input)
+        return pairs
 
     def inline_client_signals(self, graph_walk: str) -> dict[str, str]:
         # the client's copy of the token the stop check already has on the host
