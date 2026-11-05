@@ -20,6 +20,8 @@ sys.path.insert(0, ".")
 from mstar.engine.accelerator_graph_runner import AcceleratorGraphRunner  # noqa: E402
 from mstar.engine.resources import resident as resident_mod  # noqa: E402
 from mstar.engine.resources.attn.config import AttentionConfig, AttentionSpec  # noqa: E402
+from mstar.engine.resources.attn.flashinfer import FlashInferManager  # noqa: E402
+from mstar.engine.resources.attn.wrappers import FlashInferDecodeWrapper  # noqa: E402
 from mstar.engine.resources.base import CGSlotKey, Resource  # noqa: E402
 from mstar.engine.resources.kv import manager as manager_mod  # noqa: E402
 from mstar.engine.resources.kv.config import KVLayout, KVReqConfig, KVSpec, KVStep, PagedKVConfig  # noqa: E402
@@ -313,6 +315,17 @@ def test_a_step_repeats_only_when_its_rows_all_continue(in_chain, fresh, same_no
         continuing_rids={0, 1}, is_new_iter=True, is_same_node=same_node,
     )
     assert StepRepeats(8).ceiling(speculation, in_chain, lambda *key: True, lambda: room) == want
+
+
+def test_a_step_with_no_plan_of_its_own_leaves_the_last_steps_wrappers_alone():
+    """A bucket whose kernels read the tables plans nothing, so the wrappers the
+    manager still holds are an earlier step's, on another slot or eager."""
+    bucket = BucketKey(graph_walk=WALK, bs=1, num_tokens=1)
+    manager = FlashInferManager.__new__(FlashInferManager)
+    manager._current_plan_states = {"main": FlashInferDecodeWrapper.__new__(FlashInferDecodeWrapper)}
+    manager.next_replay(None, SimpleNamespace(
+        slot_lease=SlotLease(slot=0, bucket=bucket), resident=SimpleNamespace(host_plan_free={bucket}),
+    ))
 
 
 def test_a_row_a_host_step_moved_does_not_rewind_on_each_replay():

@@ -115,6 +115,8 @@ class FlashInferManager(AttentionManager):
         return ANY_REPEATS if planned_ahead else 1
 
     def next_replay(self, step, ctx) -> None:
+        if ctx.slot_lease.bucket in ctx.resident.host_plan_free:
+            return  # planned nothing, so what's held is an earlier step's
         for wrapper in self._current_plan_states.values():
             if isinstance(wrapper, FlashInferDecodeWrapper):
                 wrapper.next_replay()
