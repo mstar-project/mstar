@@ -3056,13 +3056,16 @@ class Worker:
         policy = next(
             (p for p in (engine.get_stop_policies(node_name, graph_walk) or {}).values() if p.reads_token), None,
         )
-        if not client or policy is None:
+        edges = self._walk_graphs[graph_walk].get_nodes()[node_name].outputs
+        signals = list(dict.fromkeys(edge.name for edge in edges))
+        signal = next((s for s in client if s in signals), None)
+        # only an inline landing can skip what went ahead of it
+        if signal is None or policy is None or not self._all_on_device(engine, node_name, graph_walk, signals):
             return "node: its tokens don't ride inline"
-        signal, buffer = next(iter(client.items()))
-        section = self._walk_graphs[graph_walk]
-        edge = next(
-            e for e in section.get_nodes()[node_name].outputs if e.name == signal and e.next_node == EMIT_TO_CLIENT
-        )
+        if (node_name, graph_walk) in self._withholding:
+            return "node: it withholds an output, so its landing doesn't ride inline"
+        buffer = client[signal]
+        edge = next(e for e in edges if e.name == signal and e.next_node == EMIT_TO_CLIENT)
         self._streamed[(node_name, graph_walk)] = (policy, signal, edge.output_modality)
         engine.stream_tokens(node_name, graph_walk, buffer, self._step_repeats.config(node_name).max)
         return None
@@ -3899,16 +3902,13 @@ class Worker:
         rows = {
             rid: (policy.limits(infos[rid]), infos[rid].dynamic_loop_iter_counts.get(loop, 0))
             for rid in node_batch.request_ids
-            # its log-probs are only read at the landing, so its tokens wait for it
-            if not getattr(infos[rid].resource_configs.get(policy.sampler), "return_logprobs", False)
         }
-        withheld = signal in policy.withhold
 
         def decide(rid: int, column: int, token: int) -> tuple[bool, bool]:
             if rid not in rows:
                 return False, True
             limits, count = rows[rid]
-            return not (withheld and token in policy.eos_tokens), policy.stops(count + column, token, limits)
+            return True, policy.stops(count + column, token, limits)
 
         while True:
             finished = node_batch.completion_event.query()

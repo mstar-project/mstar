@@ -209,39 +209,73 @@ def test_a_runs_tokens_land_as_its_replays_finish_and_a_row_ends_at_its_stop(mon
 
 
 def test_the_worker_sends_a_runs_tokens_for_live_rows_up_to_their_limits():
-    """A row that stopped before the wait sends nothing, one that asked for
-    log-probs waits for the landing, and an iteration limit ends a row as the
-    landing's stop would."""
+    """A row that stopped before the wait sends nothing, and an iteration
+    limit or an end token ends a row as the landing's stop would."""
     from mstar.model.submodule_base import StopKind, StopPolicy
     from mstar.worker.worker import Worker
 
     worker = Worker.__new__(Worker)
     sent = []
     worker._graph_runtime = SimpleNamespace(send_tokens=lambda *args: sent.append(args))
-    policy = StopPolicy(StopKind.AR, "t", {EOS}, sampler="s", withhold=("text",))
+    policy = StopPolicy(StopKind.AR, "t", {EOS}, sampler="s")
     worker._streamed = {("n", WALK): (policy, "text", "text")}
     worker._innermost_loop_by_node = {(WALK, "n"): "loop"}
 
-    def info(count, max_tokens, **config):
+    def info(count, max_tokens):
         return SimpleNamespace(
             max_tokens=max_tokens, dynamic_loop_iter_counts={"loop": count},
-            resource_configs={"s": SimpleNamespace(ignore_eos=False, **config)},
+            resource_configs={"s": SimpleNamespace(ignore_eos=False)},
         )
 
-    stream = TokenStream(4, 3, CPU)
-    stream.begin([1, 2, 3, 4])
-    stream.tokens.copy_(torch.tensor([[5, 6, 7], [8, 9, 10], [11, 12, 13], [14, EOS, 15]]))
+    stream = TokenStream(3, 3, CPU)
+    stream.begin([1, 2, 4])
+    stream.tokens.copy_(torch.tensor([[5, 6, 7], [8, 9, 10], [14, EOS, 15]]))
     stream.landed[0] = 3
     done = iter([False, True])
     worker._stream_tokens(SimpleNamespace(
         node_name="n", graph_walk=WALK,
         node_batch=SimpleNamespace(
-            token_stream=stream, request_ids=[1, 3, 4], completion_event=SimpleNamespace(query=lambda: next(done)),
-            per_request_info_wrapped={1: info(8, 10), 3: info(0, 9, return_logprobs=True), 4: info(0, 9)},
+            token_stream=stream, request_ids=[1, 4], completion_event=SimpleNamespace(query=lambda: next(done)),
+            per_request_info_wrapped={1: info(8, 10), 4: info(0, 9)},
         ),
     ))
-    # row 1 is at 8 of 10; the end token is withheld, as the landing does
-    assert sent == [([1, 4, 1], [5, 14, 6], "text", "text")] and stream.sent == {1: 2, 4: 1}
+    # row 1 is at 8 of 10
+    assert sent == [([1, 4, 1, 4], [5, 14, 6, EOS], "text", "text")] and stream.sent == {1: 2, 4: 2}
+
+
+@pytest.mark.parametrize("routed, withholding, why", [
+    ({"hidden"}, {}, "node: its tokens don't ride inline"),
+    (set(), {("n", WALK): object()}, "node: it withholds an output, so its landing doesn't ride inline"),
+    (set(), {}, None),
+])
+def test_only_a_landing_that_rides_inline_streams(routed, withholding, why):
+    """Only the inline landing skips what a run sent, so any other would send
+    it twice."""
+    from mstar.graph.special_destinations import EMIT_TO_CLIENT
+    from mstar.model.submodule_base import StopKind, StopPolicy
+    from mstar.worker.step_repeats import RepeatConfig
+    from mstar.worker.worker import Worker
+
+    worker = Worker.__new__(Worker)
+    edges = [SimpleNamespace(name="text", next_node=EMIT_TO_CLIENT, output_modality="text")]
+    edges += [SimpleNamespace(name=name, next_node="other", output_modality=None) for name in routed]
+    node = SimpleNamespace(outputs=edges)
+    worker._walk_graphs = {WALK: SimpleNamespace(get_nodes=lambda: {"n": node})}
+    worker._withholding, worker._streamed, worker._device_loopback = withholding, {}, {}
+    worker._graph_runtime = SimpleNamespace(supports_inline_emit=True)
+    worker._step_repeats = SimpleNamespace(
+        config=lambda name: RepeatConfig(max=4, stream_tokens=True), may_repeat=lambda name, walk: True,
+    )
+    asked = []
+    engine = SimpleNamespace(
+        inline_client_signals=lambda name, walk: {"text": "new_token"},
+        get_stop_policies=lambda name, walk: {"loop": StopPolicy(StopKind.AR, "new_token", {EOS})},
+        device_loopback_signals=lambda name, walk: ["text"],
+        stream_tokens=lambda *args: asked.append(args),
+    )
+    worker.engine_manager = SimpleNamespace(get_engine=lambda name: engine)
+    assert worker._stream_refusal("n", WALK) == why
+    assert asked == ([] if why else [("n", WALK, "new_token", 4)])
 
 
 def test_the_worker_settles_a_run_that_ended_short():

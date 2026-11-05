@@ -353,7 +353,7 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        by itself (``device_stop: skip`` unless set). Both need a token stop, one rank, CUDA
        12.4 and up, ``libcudadevrt.a`` under ``CUDA_HOME``, and a capture of kernels and
        copies alone. ``stream_tokens: true`` sends a run's tokens to the client as its replays
-       finish rather than when it ends; a row that asked for log-probs still waits for the end.
+       finish rather than when it ends, where its landing rides inline.
        At startup the worker logs one line per Loop walk with each capability
        (``resident``, ``repeats``, ``rows``, ``device stop``, ``launch loop``, ``stream tokens``) ``on``,
        ``off: not asked for``, or ``off: <owner>: <reason>``. ``launch loop``: a run's launches
