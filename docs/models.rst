@@ -1966,6 +1966,11 @@ Concurrent requests share LM and decoder steps, up to
 run alone, so a greedy response can depend on what else is being served;
 ``max_batch_size: 1`` runs every request alone.
 
+Each request's delayed token cache lives in the ``lm_cache`` recurrent state pool,
+so the generate step reads and updates it inside its captured graph.
+``resources: {lm_cache: {max_slots: N}}`` sizes the pool for N - 1 requests (one
+slot is the pool's sink); 255 requests by default.
+
 The agent's audio streams from the LM to a codec partition one frame at a
 time. The first chunk holds 4 frames (320 ms of audio), then 8, 16 and 25
 frames (2 s) each, a ramp like Qwen3-TTS's for its 12 Hz codec, so a running

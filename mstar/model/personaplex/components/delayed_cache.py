@@ -25,11 +25,19 @@
 # 3428dfd95309a7f3c84fd93259ded0f810d1ff91: independent integer cache component.
 """Integer state of LMGen, independent of transformers and M* resources.
 
-``prepare`` returns False only for token-frame priming (no forward). Otherwise
-read ``model_input``, ``target`` and ``target_provided``, run the model, and
-``commit`` its raw sampled text/audio. Forced depth inputs must use the live
-target mask. Commit returns the delayed output and advances the offset.
+``DelayedTokenCache`` mirrors the reference one request at a time. ``prepare``
+returns False only for token-frame priming (no forward). Otherwise read
+``model_input``, ``target`` and ``target_provided``, run the model, and ``commit``
+its raw sampled text/audio. Forced depth inputs must use the live target mask.
+Commit returns the delayed output and advances the offset.
+
+``prepare_rows`` and ``commit_rows`` are one generate frame of the same logic over
+a batch whose rows sit at different offsets, with no host reads, so they can run
+inside a captured graph. A generate frame is always past the initial-token refill,
+because conditioning runs more than ``MAX_DELAY`` frames first.
 """
+
+from typing import NamedTuple
 
 import torch
 
@@ -45,6 +53,64 @@ from ..config import (
     TEXT_PAD_TOKEN_ID,
     UNGENERATED_TOKEN_ID,
 )
+
+_USER_CODEBOOKS = 1 + AUDIO_CODEBOOKS_PER_STREAM
+
+
+class CacheRows(NamedTuple):
+    """The caches of B requests: tokens and forced mask ``[B, 17, 4]``, offsets ``[B]``."""
+
+    tokens: torch.Tensor
+    provided: torch.Tensor
+    offset: torch.Tensor
+
+
+class PreparedRows(NamedTuple):
+    """One generate frame's inputs: ``model_input`` is ``[B, 17, 1]``, ``target`` and ``forced`` ``[B, 17]``."""
+
+    rows: CacheRows
+    model_input: torch.Tensor
+    target: torch.Tensor
+    forced: torch.Tensor
+
+
+def _column(offset: torch.Tensor) -> torch.Tensor:
+    return (offset % CACHE_SIZE).view(-1, 1, 1).expand(-1, NUM_CODEBOOKS, 1)
+
+
+def prepare_rows(rows: CacheRows, user: torch.Tensor, delays: torch.Tensor) -> PreparedRows:
+    """Write each row's user codes ``[B, 8]`` and read its input and target columns.
+
+    ``delays`` is ``DELAYS`` as a tensor on the rows' device, since a captured graph
+    must not build one from host data.
+    """
+    columns = ((rows.offset[:, None] + delays[_USER_CODEBOOKS:]) % CACHE_SIZE)[:, :, None]
+    tokens, provided = rows.tokens.clone(), rows.provided.clone()
+    tokens[:, _USER_CODEBOOKS:].scatter_(2, columns, user[:, :, None])
+    provided[:, _USER_CODEBOOKS:].scatter_(2, columns, True)
+    target_column = _column(rows.offset)
+    return PreparedRows(
+        CacheRows(tokens, provided, rows.offset),
+        tokens.gather(2, _column(rows.offset - 1)),
+        tokens.gather(2, target_column)[:, :, 0],
+        provided.gather(2, target_column)[:, :, 0],
+    )
+
+
+def commit_rows(
+    prepared: PreparedRows, sampled_text: torch.Tensor, sampled_audio: torch.Tensor, delays: torch.Tensor,
+) -> tuple[CacheRows, torch.Tensor]:
+    """Keep forced values, clear the consumed mask and gather each row's delayed output ``[B, 17, 1]``.
+
+    Same order as ``DelayedTokenCache.commit``: delay-0 tokens from offset-1 and delay-1 from offset.
+    """
+    rows = prepared.rows
+    samples = torch.cat((sampled_text[:, None], sampled_audio), dim=1)
+    kept = torch.where(prepared.forced, prepared.target, samples)
+    tokens = rows.tokens.scatter(2, _column(rows.offset), kept[:, :, None])
+    provided = rows.provided.scatter(2, _column(rows.offset - 1), False)
+    output = tokens.gather(2, ((rows.offset[:, None] - MAX_DELAY + delays) % CACHE_SIZE)[:, :, None])
+    return CacheRows(tokens, provided, rows.offset + 1), output
 
 
 class DelayedTokenCache:
@@ -175,35 +241,12 @@ class DelayedTokenCache:
         self._prepared = False
         return output
 
-    def state_tensor(self, step: int) -> torch.Tensor:
-        """Pack cache, mask, offset and a walk step counter as ``[B, 2*17*4 + 2]`` int64.
-
-        This is the LM's ``lm_state`` graph edge; a prepared-but-uncommitted
-        cache is never packed.
-        """
+    def to_rows(self) -> "CacheRows":
+        """A copy of this cache as ``CacheRows``; a prepared-but-uncommitted cache is never copied."""
         if self._prepared:
-            raise RuntimeError("commit the prepared step before packing the cache")
-        batch = self.cache.shape[0]
-        scalars = torch.tensor([self.offset, step], dtype=torch.long, device=self.cache.device).expand(batch, 2)
-        return torch.cat((self.cache.flatten(1), self.provided.long().flatten(1), scalars), dim=1)
-
-    @classmethod
-    def from_state_tensor(cls, state: torch.Tensor) -> tuple["DelayedTokenCache", int]:
-        """Inverse of ``state_tensor``; returns the cache and the step counter."""
-        size = NUM_CODEBOOKS * CACHE_SIZE
-        if state.dim() != 2 or state.shape[1] != 2 * size + 2 or state.dtype != torch.long:
-            raise ValueError(f"lm_state must be int64 [B, {2 * size + 2}], got {state.dtype} {tuple(state.shape)}")
-        scalars = state[:, 2 * size :]
-        if not torch.equal(scalars, scalars[:1].expand_as(scalars)) or bool((scalars < 0).any()):
-            raise ValueError("lm_state rows disagree on offset/step or hold negative values")
-        cache = cls(state.shape[0], device=state.device)
-        cache.cache.copy_(state[:, :size].view_as(cache.cache))
-        provided = state[:, size : 2 * size]
-        if bool(((provided != 0) & (provided != 1)).any()):
-            raise ValueError("lm_state provided mask must be 0/1")
-        cache.provided.copy_(provided.view_as(cache.provided).bool())
-        cache.offset = int(scalars[0, 0])
-        return cache, int(scalars[0, 1])
+            raise RuntimeError("commit the prepared step before copying the cache")
+        offset = torch.full((self.cache.shape[0],), self.offset, dtype=torch.long, device=self.cache.device)
+        return CacheRows(self.cache.clone(), self.provided.clone(), offset)
 
     def load(self, cache: torch.Tensor) -> None:
         """Restore only voice tokens ([PP] lm.py:1031-1038), retaining offset/mask.

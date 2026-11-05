@@ -9,8 +9,8 @@ Nodes:
 Walks, stepped through ``kwargs["walk_schedule"]`` (Wan2.2 pattern):
     encode_user_audio - MimiEncoder; persists ``user_audio_codes``
     conditioning      - Loop over LM: voice embeddings, 6 silence, persona text,
-                        6 silence ([PP] models/lm.py:1110-1121); persists the
-                        final ``lm_state`` (token cache, mask, offset, step)
+                        6 silence ([PP] models/lm.py:1110-1121); each frame
+                        writes the request's token cache to the ``LM_CACHE`` pool
     generate[_audio]  - Loop over LM, one iteration per user frame; each
                         ``agent_frame`` streams to the codec partition, and
                         ``generate`` also sends each frame's ``text_frame`` to
@@ -21,10 +21,8 @@ Two async partitions: ``LM`` runs the first three walks in order and streams
 ``agent_frame`` to ``Codec``, which decodes it in chunks while generation goes on.
 
 The LM is one node name in two walks (``Sequential`` keys a walk's nodes by name).
-Its loop-backs are consumed and seeded empty at iteration 0, and async
-scheduling is off because an overshoot iteration would append to the temporal
-KV. Loops stop by finish signal from the LM submodule; ``max_iters`` is the
-budget ceiling.
+Its loop-backs are consumed and seeded empty at iteration 0. Each loop's cap is its
+exact frame count, and the runtime ends it there; ``max_iters`` is the budget ceiling.
 """
 
 from __future__ import annotations
@@ -41,6 +39,7 @@ from mstar.engine.resources import NodeResourceSpec, ResourceReqConfig
 from mstar.engine.resources.attn.config import AttentionConfig, AttentionSpec
 from mstar.engine.resources.kv.config import KVSpec, PagedKVConfig
 from mstar.engine.resources.position.config import PositionConfig, PositionSpec
+from mstar.engine.resources.recurrent import RecurrentBlockConfig, RecurrentStateConfig, RecurrentStateSpec
 from mstar.engine.resources.sampler.config import SamplerSpec, SamplingReqConfig
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
@@ -59,8 +58,8 @@ LM_CHECKPOINT_NAME = "model.safetensors"  # [PP] models/loaders.py:43
 MIMI_CHECKPOINT_NAME = "tokenizer-e351c8d8-checkpoint125.safetensors"  # [PP] models/loaders.py:44
 GENERATE_AUDIO_WALK = cfg.GENERATE_AUDIO_WALK
 LM_LOOP_BACKS = {
-    cfg.CONDITIONING_WALK: ("lm_state",),
-    cfg.GENERATE_WALK: ("lm_state", "agent_frame", "text_frame"),
+    cfg.CONDITIONING_WALK: (cfg.CONDITIONING_TICK,),
+    cfg.GENERATE_WALK: ("agent_frame", "text_frame"),
 }
 # 128 pages x 128 tokens x 512 KiB a token (32 layers x 32 heads x 128 dims, K+V, bf16) = 8 GiB
 DEFAULT_KV_PAGES = 128
@@ -100,7 +99,7 @@ class PersonaPlexModel(Model):
     # ------------------------------------------------------------------
 
     def get_node_resources(self) -> list[NodeResourceSpec]:
-        """Paged temporal KV, RoPE and the two samplers, all on the LM node.
+        """Paged temporal KV, RoPE, the two samplers and the token cache pool, all on the LM node.
 
         The depformer's 16-step KV is frame-local scratch inside the LM
         submodule, not a resource: the reference rebuilds it every frame
@@ -127,6 +126,14 @@ class PersonaPlexModel(Model):
             SamplerSpec(resource_key=cfg.TEXT_SAMPLER, nodes=lm, vocab_size=c.text_card,
                         enable_repetion_penalty=False),
             SamplerSpec(resource_key=cfg.DEPTH_SAMPLER, nodes=lm, vocab_size=c.card, enable_repetion_penalty=False),
+            RecurrentStateSpec(
+                resource_key=cfg.LM_CACHE, nodes=lm,
+                config=RecurrentStateConfig(num_layers=1, blocks={
+                    "tokens": RecurrentBlockConfig((cfg.NUM_CODEBOOKS, cfg.CACHE_SIZE), torch.int64),
+                    "provided": RecurrentBlockConfig((cfg.NUM_CODEBOOKS, cfg.CACHE_SIZE), torch.int64),
+                    "offset": RecurrentBlockConfig((), torch.int64),
+                }, labels=(cfg.KV_LABEL,)),
+            ),
         ]
 
     def _request_kv_pages(self, page_size: int) -> int:
@@ -152,6 +159,13 @@ class PersonaPlexModel(Model):
         overrides = (config.get("resources") or {}).get(cfg.LM_KV) or {}
         page_size = int(overrides.get("page_size") or kv.tokens_per_page)
         max_num_pages = int(overrides.get("max_num_pages", kv.max_num_pages))
+        cache = next(s for s in self.get_node_resources() if s.resource_key == cfg.LM_CACHE).config
+        slots = int(((config.get("resources") or {}).get(cfg.LM_CACHE) or {}).get("max_slots", cache.max_slots))
+        if int(cap) > slots - 1:  # the pool's sink takes one slot
+            raise ValueError(
+                f"{config_path}: {cap} concurrent requests (max_concurrent_requests) need {int(cap) + 1} slots of "
+                f"resources.{cfg.LM_CACHE}, which has {slots}; raise max_slots or lower max_concurrent_requests"
+            )
         need = 1 + int(cap) * self._request_kv_pages(page_size)
         if need > max_num_pages:
             raise ValueError(
@@ -162,8 +176,8 @@ class PersonaPlexModel(Model):
 
     def _lm_node(self, walk: str) -> GraphNode:
         inputs = {
-            cfg.CONDITIONING_WALK: ["lm_state", "voice_embeddings", "voice_cache", "persona_tokens"],
-            cfg.GENERATE_WALK: ["lm_state", "agent_frame", "text_frame", "user_audio_codes"],
+            cfg.CONDITIONING_WALK: [cfg.CONDITIONING_TICK, "voice_embeddings", "voice_cache", "persona_tokens"],
+            cfg.GENERATE_WALK: ["agent_frame", "text_frame", "user_audio_codes"],
         }[walk]
         return GraphNode(
             name=cfg.LM_NODE, input_names=inputs,
@@ -192,8 +206,7 @@ class PersonaPlexModel(Model):
         conditioning = Loop(
             name=cfg.CONDITIONING_LOOP, section=self._lm_node(cfg.CONDITIONING_WALK),
             max_iters=cfg.MAX_TEMPORAL_FORWARDS,
-            # The final iteration's token-cache state carries into the generate walk.
-            outputs=[GraphEdge(next_node=EMPTY_DESTINATION, name="lm_state", persist=True)],
+            outputs=[],
         )
         # The decoder keeps each request's code context in its own state and
         # updates it in the forward, so a step must not be prepared ahead of the
@@ -393,7 +406,7 @@ class PersonaPlexModel(Model):
         return {cfg.LM_KV: {cfg.KV_LABEL: KVLabel(growth=growth)}}
 
     def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
-        # Each loop's stop check ends it after exactly this many frames, so the cap is that count.
+        # Each loop runs exactly this many frames, and the runtime ends it at its cap (no stop check reads a row).
         return dict(model_kwargs.get(LOOP_FRAMES_KWARG) or {})
 
     def postprocess(self, output: torch.Tensor, modality: str, request_kwargs: dict | None = None) -> bytes:
@@ -562,9 +575,9 @@ class PersonaPlexModel(Model):
             if walk == cfg.CONDITIONING_WALK:
                 inputs = self._signals(persist_signals, cfg.LM_NODE,
                                        ["voice_embeddings", "voice_cache", "persona_tokens"])
-                inputs.append(GraphEdge(next_node=cfg.LM_NODE, name="lm_state"))
+                inputs.append(GraphEdge(next_node=cfg.LM_NODE, name=cfg.CONDITIONING_TICK))
             else:
-                inputs = self._signals(persist_signals, cfg.LM_NODE, ["lm_state", "user_audio_codes"])
+                inputs = self._signals(persist_signals, cfg.LM_NODE, ["user_audio_codes"])
                 inputs += [GraphEdge(next_node=cfg.LM_NODE, name=n) for n in ("agent_frame", "text_frame")]
         # Each persisted tensor is used for the last time in the walk it feeds.
         return ForwardPassArgs(

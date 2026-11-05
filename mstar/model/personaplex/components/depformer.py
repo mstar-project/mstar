@@ -161,9 +161,10 @@ class Depformer(nn.Module):
         sampled tokens ``[B, 16]`` (forcing is applied to the next input only;
         the cache commit preserves forced values).
 
-        Only the first ``steps`` steps run (see ``depth_steps_needed``); the
-        rest return their targets, which must all be forced. ``return_logits``
-        runs every step, for reference comparisons.
+        Only the first ``steps`` steps run; the rest return their targets, which
+        must all be forced. A step after the last free one changes nothing: a
+        forced sample is never committed, and attention never looks ahead.
+        ``return_logits`` runs every step, for reference comparisons.
         """
         batch = text_token.shape[0]
         if return_logits:
@@ -181,22 +182,3 @@ class Depformer(nn.Module):
                 logits.append(step_logits)
         tokens = torch.cat([torch.stack(tokens, dim=1), target_audio[:, steps:]], dim=1) if tokens else target_audio
         return (tokens, torch.stack(logits, dim=1)) if return_logits else tokens
-
-
-def depth_steps_needed(provided_audio: torch.Tensor) -> int:
-    """How many depth steps a batch must run: through the last step any row samples.
-
-    A step's sample matters only when its target is free: a forced sample is
-    never committed, the next step reads the forced target instead, and
-    attention never looks ahead, so the steps after the last free one change
-    nothing (with greedy sampling the outputs are identical; with sampling the
-    sampler is simply called fewer times). Forced steps before a free one still
-    run, because the free step attends to their keys. In the generate walk the
-    user's codebooks (steps 8-15) are always forced, so this is 8, or 1 on the
-    first frame, whose agent acoustic codebooks are still forced.
-
-    ``provided_audio`` is ``[B, 16]``. One fixed-shape reduction and one scalar
-    read, a host sync, so the LM computes it in ``preprocess``, not ``forward``.
-    """
-    free = ~provided_audio.all(dim=0)
-    return int((free * torch.arange(1, DEP_Q + 1, device=provided_audio.device)).max())

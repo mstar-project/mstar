@@ -20,7 +20,7 @@ from mstar.communication.tensors import SharedMemoryCommunicationManager, Tensor
 from mstar.graph.base import GraphEdge, Loop, TensorPointerInfo
 from mstar.graph.graph_io import WorkerGraphIO
 from mstar.graph.runtime.base import ColumnarEdgeSpecs, RouteInput, SendInput
-from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
+from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.personaplex import config as cfg
 from mstar.model.personaplex.personaplex_model import GENERATE_AUDIO_WALK, PersonaPlexModel
 from mstar.model.personaplex.voice import load_voice_preset, resolve_voice_path
@@ -92,14 +92,14 @@ def test_walks_instantiate_with_one_lm_per_walk_and_async_off():
 
 def test_lm_loop_backs_are_consumed_and_outputs_routed():
     walks = _model().get_graph_walk_graphs()
-    for walk, loop_backs in ((cfg.CONDITIONING_WALK, {"lm_state"}),
-                             (cfg.GENERATE_WALK, {"lm_state", "agent_frame", "text_frame"})):
+    for walk, loop_backs in ((cfg.CONDITIONING_WALK, {cfg.CONDITIONING_TICK}),
+                             (cfg.GENERATE_WALK, {"agent_frame", "text_frame"})):
         lm = walks[walk].get_nodes()["LM"]
         assert {e.name for e in lm.outputs if e.next_node == "LM"} == loop_backs
         assert loop_backs <= set(lm.input_names)  # consumed, never rejected
     cond = walks[cfg.CONDITIONING_WALK]
     assert isinstance(cond, Loop) and cond.max_iters == cfg.MAX_TEMPORAL_FORWARDS
-    assert [(e.name, e.next_node, e.persist) for e in cond.outputs] == [("lm_state", EMPTY_DESTINATION, True)]
+    assert cond.outputs == []  # the token cache carries into the generate walk in the pool
     encode = walks[cfg.ENCODE_USER_AUDIO_WALK]
     assert [(e.name, e.persist) for e in encode.outputs] == [("user_audio_codes", True)]
     for walk in (cfg.GENERATE_WALK, GENERATE_AUDIO_WALK):
@@ -171,19 +171,18 @@ def test_schedule_encode_condition_generate_done_with_persisted_state():
     cond = _step(model, meta, persist)
     assert cond.full_metadata.graph_walk == cfg.CONDITIONING_WALK and not cond.request_done
     by_name = {e.name: e for e in cond.inputs}
-    assert set(by_name) == {"voice_embeddings", "voice_cache", "persona_tokens", "lm_state"}
-    assert all(e.next_node == "LM" for e in cond.inputs) and by_name["lm_state"].tensor_info == []
+    assert set(by_name) == {"voice_embeddings", "voice_cache", "persona_tokens", cfg.CONDITIONING_TICK}
+    assert all(e.next_node == "LM" for e in cond.inputs) and by_name[cfg.CONDITIONING_TICK].tensor_info == []
     assert {i.uuid for i in cond.unpersist_tensors} == {"uuid-voice_embeddings", "uuid-voice_cache",
                                                        "uuid-persona_tokens"}
 
-    persist = {"user_audio_codes": persist["user_audio_codes"], "lm_state": [_info("lm_state", [1, 137])]}
+    persist = {"user_audio_codes": persist["user_audio_codes"]}
     gen = _step(model, cond.full_metadata, persist)
     assert gen.full_metadata.graph_walk == cfg.GENERATE_WALK
     by_name = {e.name: e for e in gen.inputs}
-    assert set(by_name) == {"lm_state", "user_audio_codes", "agent_frame", "text_frame"}
-    assert by_name["lm_state"].tensor_info == persist["lm_state"]
+    assert set(by_name) == {"user_audio_codes", "agent_frame", "text_frame"}
     assert by_name["agent_frame"].tensor_info == [] and by_name["text_frame"].tensor_info == []
-    assert {i.uuid for i in gen.unpersist_tensors} == {"uuid-lm_state", "uuid-codes"}
+    assert {i.uuid for i in gen.unpersist_tensors} == {"uuid-codes"}
 
     done = _step(model, gen.full_metadata, {})
     assert done.request_done and done.inputs == []
@@ -297,7 +296,7 @@ def triton_int64(monkeypatch):
         monkeypatch.setattr(language, "int64", int, raising=False)
 
 
-def _personaplex_runtime(tmp_path, bookkeeping=None):
+def _personaplex_runtime(tmp_path, bookkeeping=None, caps=None):
     """The split PersonaPlex worker graphs on the graph runtime, one request admitted."""
     pytest.importorskip("mstar_rust")
     from rust_runtime import Inboxes, build_runtime
@@ -319,7 +318,7 @@ def _personaplex_runtime(tmp_path, bookkeeping=None):
     generate_ids = [wg.worker_graph_id for wg in graphs if cfg.GENERATE_WALK in wg.graph_walks]
     mapping = ParallelList([wg.worker_graph_id for wg in graphs], [["worker_0"] for _ in graphs])
     # What the conductor sends when a request names no caps: every loop at its max_iters.
-    caps = {name: loop.max_iters for wg in graphs for name, loop in wg.section.get_loops().items()}
+    caps = caps or {name: loop.max_iters for wg in graphs for name, loop in wg.section.get_loops().items()}
     rid = runtime.add_request("request", cfg.LM_PARTITION, cfg.GENERATE_WALK, generate_ids, mapping, caps)
     return runtime, rid, inboxes
 
@@ -328,7 +327,7 @@ def test_graph_runtime_admits_personaplex_generate_walk(tmp_path, triton_int64):
     """The runtime must accept the split PersonaPlex worker graphs."""
     runtime, rid, _ = _personaplex_runtime(tmp_path)
     assert runtime.get_rid_string(rid) == "request"
-    assert {"lm_state", "agent_frame", "text_frame"} <= set(
+    assert {"agent_frame", "text_frame"} <= set(
         runtime.get_output_signals("LM", cfg.GENERATE_WALK))
     assert runtime.get_output_signals("MimiDecoder", cfg.CODEC_WALK) == ["audio_output"]
     runtime.remove_request(rid)
@@ -347,7 +346,7 @@ def test_graph_runtime_streams_agent_frames_and_emits_text(tmp_path, triton_int6
     runtime, rid, inboxes = _personaplex_runtime(tmp_path, manager.tensor_store.bookkeeping)
     manager.register_request(rid, runtime.get_sharding_config(rid))
     block = ColumnarEdgeSpecs.empty()
-    for name in ("lm_state", "user_audio_codes", "agent_frame", "text_frame"):
+    for name in ("user_audio_codes", "agent_frame", "text_frame"):
         block.add_edge(rid, GraphEdge(next_node="LM", name=name))
     assert runtime.ingest_inputs_batch(block) == []
     lm_wg = runtime.get_worker_graph_id_for_node("LM", cfg.GENERATE_WALK)
@@ -360,7 +359,6 @@ def test_graph_runtime_streams_agent_frames_and_emits_text(tmp_path, triton_int6
             )
         stored = manager.store_and_return_tensor_info_batch(
             [rid], {rid: {
-                "lm_state": [torch.tensor([frame])],
                 "agent_frame": [torch.full((8,), frame)],
                 "text_frame": [torch.tensor([frame + 4])],
             }}, outputs,
@@ -489,7 +487,6 @@ def _drive(walk, initial, *, finish_after=None, rid=1):
 
 def _generate_inputs():
     return [GraphEdge(next_node="LM", name="user_audio_codes", tensor_info=["external"]),
-            GraphEdge(next_node="LM", name="lm_state", tensor_info=["external"]),
             GraphEdge(next_node="LM", name="agent_frame"), GraphEdge(next_node="LM", name="text_frame")]
 
 
@@ -504,7 +501,50 @@ def test_generate_streams_frames_in_order_and_completes(finish_after):
     assert all(r >= 0 for r in refs.values())
     # Every tensor of every non-final iteration is released.
     assert {k: r for k, r in refs.items() if r and k[1] != finish_after - 1} == {}
-    assert refs[("lm_state", finish_after - 1)] == 0
+
+
+def test_generate_loop_ends_at_its_cap_with_no_stop_check(tmp_path, triton_int64):
+    """The declared stop reads no row: nothing calls stop_loops, and the frame-count cap ends the walk."""
+    pytest.importorskip("mstar_rust")
+    from mstar.utils.ipc_format import WorkerGraphsDone
+
+    frames = 3
+    manager = SharedMemoryCommunicationManager(
+        my_entity_id="worker_0", hostname="localhost", device="cpu",
+        communicator=types.SimpleNamespace(send=lambda *a, **kw: None), shm_dir=str(tmp_path),
+    )
+    runtime, rid, inboxes = _personaplex_runtime(
+        tmp_path, manager.tensor_store.bookkeeping, caps={cfg.CONDITIONING_LOOP: 2, cfg.DECODE_LOOP: frames})
+    manager.register_request(rid, runtime.get_sharding_config(rid))
+    runtime.set_stop_policies("LM", cfg.GENERATE_WALK, {})
+    block = ColumnarEdgeSpecs.empty()
+    for name in ("user_audio_codes", "agent_frame", "text_frame"):
+        block.add_edge(rid, GraphEdge(next_node="LM", name=name))
+    assert runtime.ingest_inputs_batch(block) == []
+    lm_wg = runtime.get_worker_graph_id_for_node("LM", cfg.GENERATE_WALK)
+    outputs = runtime.get_output_signals("LM", cfg.GENERATE_WALK)
+    done = []
+    for frame in range(frames):
+        assert runtime.check_stops(cfg.LM_PARTITION, "LM", cfg.GENERATE_WALK, [rid], None, []) == {}
+        stored = manager.store_and_return_tensor_info_batch(
+            [rid], {rid: {
+                "agent_frame": [torch.full((8,), frame)],
+                "text_frame": [torch.tensor([frame + 4])],
+            }}, outputs,
+        )
+        manager.increment_ref_batch_uniform(stored.flat_uuids, 1)
+        routed = runtime.complete_and_route_batch(RouteInput(
+            partition=cfg.LM_PARTITION, graph_walk=cfg.GENERATE_WALK, node_name="LM",
+            output_signals=outputs, wg_ids=ParallelList([rid], [lm_wg]),
+            tensors=stored.flat_uuids, num_tensors=stored.num_tensors,
+        ))
+        runtime.send_outputs(SendInput(
+            completion_id=routed.completion_id, per_request_info=ParallelList([rid], [None]),
+            new_token_counts=ParallelList([rid], [{}]),
+        ))
+        done.append(sum(isinstance(message.body, WorkerGraphsDone)
+                        for peer, message in inboxes.take() if peer == "conductor"))
+    assert done == [0, 0, 1], "only the frame at the cap reports the walk finished"
 
 
 def test_generate_runs_to_max_iters_without_a_finish_signal():
@@ -523,16 +563,15 @@ def test_final_iteration_streamed_tensors_are_released():
     assert refs[("agent_frame", 6)] == 0 and refs[("text_frame", 6)] == 0
 
 
-def test_conditioning_persists_only_the_final_lm_state():
+def test_conditioning_loops_on_its_tick_and_persists_nothing():
     walk = _model().get_graph_walk_graphs()[cfg.CONDITIONING_WALK]
     initial = [GraphEdge(next_node="LM", name=n, tensor_info=["external"])
                for n in ("voice_embeddings", "voice_cache", "persona_tokens")]
-    initial.append(GraphEdge(next_node="LM", name="lm_state"))
+    initial.append(GraphEdge(next_node="LM", name=cfg.CONDITIONING_TICK))
     out, runs, refs = _drive(walk, initial, finish_after=25)
     assert runs == {"LM": 25}
-    assert out["persisted"] == [("lm_state", [("lm_state", 24)])]
-    assert out["rejected"] == [] and out["client"] == []
-    assert {k: r for k, r in refs.items() if r and k != ("lm_state", 24)} == {}
+    assert out["persisted"] == [] and out["rejected"] == [] and out["client"] == []
+    assert {k: r for k, r in refs.items() if r} == {}
 
 
 # --------------------------------------------------------------------------- request validation
@@ -740,7 +779,7 @@ def test_dummy_mode_builds_without_submodules_or_network():
     assert model.tokenizer is None and model.model_path_hf == "nvidia/personaplex-7b-v1"
     assert all(model.get_submodule(node) is None for node in model.nodes)
     specs = {spec.resource_key: spec for spec in model.get_node_resources()}
-    assert set(specs) == {cfg.LM_KV, cfg.LM_ATTN, cfg.LM_POS, cfg.TEXT_SAMPLER, cfg.DEPTH_SAMPLER}
+    assert set(specs) == {cfg.LM_KV, cfg.LM_ATTN, cfg.LM_POS, cfg.TEXT_SAMPLER, cfg.DEPTH_SAMPLER, cfg.LM_CACHE}
     assert all(spec.nodes == {"LM"} for spec in specs.values())
     kv = specs[cfg.LM_KV].config
     assert (kv.num_layers, kv.num_kv_heads, kv.num_qo_heads, kv.head_dim, kv.max_seq_len) == (32, 32, 32, 128, 2999)
@@ -953,6 +992,9 @@ def test_shipped_yaml_fits_its_request_cap_in_the_kv_pool(caplog):
     with pytest.raises(ValueError, match=r"6 concurrent requests .* need 145 pages of resources\.lm_kv, which has 128"):
         model.validate_config_yaml({**deployment, "max_concurrent_requests": 6}, CONFIG_PATH)
     model.validate_config_yaml({k: v for k, v in deployment.items() if k != "max_concurrent_requests"}, CONFIG_PATH)
+    too_few = {**deployment, "resources": {**deployment["resources"], cfg.LM_CACHE: {"max_slots": 5}}}
+    with pytest.raises(ValueError, match="raise max_slots"):
+        model.validate_config_yaml(too_few, CONFIG_PATH)  # 5 requests + the sink need 6
     assert "sets no max_concurrent_requests" in caplog.text
 
 

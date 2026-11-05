@@ -188,6 +188,8 @@ STREAM_CONTEXT_FRAMES = 500
 SEANET_MARGIN_FRAMES = 4
 KV_LABEL = "main"  # the LM's one paged KV label
 LM_KV, LM_ATTN, LM_POS = "lm_kv", "lm_attn", "lm_pos"
+LM_CACHE = "lm_cache"  # the recurrent state pool holding each request's delayed token cache
+CONDITIONING_TICK = "conditioning_tick"  # the conditioning loop's loop-back; nothing reads its value
 TEXT_SAMPLER, DEPTH_SAMPLER = "text_sampler", "depth_sampler"
 
 TEXT_TEMPERATURE = 0.7  # [PP] models/lm.py:653; offline.py:363-374

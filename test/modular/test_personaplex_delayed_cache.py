@@ -9,7 +9,9 @@ import pytest
 import torch
 
 from mstar.model.personaplex import config as cfg
-from mstar.model.personaplex.components.delayed_cache import DelayedTokenCache
+from mstar.model.personaplex.components.delayed_cache import CacheRows, DelayedTokenCache, commit_rows, prepare_rows
+
+DELAYS = torch.tensor(cfg.DELAYS)
 
 
 def _audio(batch, base):
@@ -323,3 +325,59 @@ def test_production_embedding_replay(reference_trace, batch, monkeypatch):
         _assert_state(cache, event["state"], context)
         cursor += 1
     assert helper_calls == sum(e["op"] == "commit" and e["phase"].startswith("embedding_") for e in events)
+
+
+def _past_refill(generator, offset):
+    """A cache at ``offset``, past the initial-token refill, with random tokens and masks."""
+    cache = DelayedTokenCache(1)
+    cache.offset = offset
+    cache.cache = torch.randint(0, 2048, cache.cache.shape, generator=generator)
+    cache.provided = torch.randint(0, 2, cache.provided.shape, generator=generator).bool()
+    return cache
+
+
+@pytest.mark.parametrize("seed", range(8))
+def test_vector_rows_match_one_cache_per_row_at_mixed_offsets(seed):
+    """Every input, target, mask, output and state of a batch equals separate reference caches, over many frames."""
+    generator = torch.Generator().manual_seed(seed)
+    batch = 5
+    caches = [_past_refill(generator, offset) for offset in
+              torch.randint(cfg.MAX_DELAY + 1, 500, (batch,), generator=generator).tolist()]
+    rows = CacheRows(*(torch.cat(parts) for parts in zip(*(c.to_rows() for c in caches), strict=True)))
+    for _ in range(9):
+        user = torch.randint(0, 2048, (batch, 8), generator=generator)
+        text = torch.randint(0, 32000, (batch,), generator=generator)
+        audio = torch.randint(0, 2048, (batch, 16), generator=generator)
+        prepared = prepare_rows(rows, user, DELAYS)
+        rows, output = commit_rows(prepared, text, audio, DELAYS)
+        for row, cache in enumerate(caches):
+            assert cache.prepare(user=user[row : row + 1, :, None])
+            assert torch.equal(prepared.model_input[row : row + 1], cache.model_input)
+            assert torch.equal(prepared.target[row : row + 1], cache.target[:, :, 0])
+            assert torch.equal(prepared.forced[row : row + 1], cache.target_provided[:, :, 0])
+            want = cache.commit(text[row : row + 1], audio[row : row + 1])
+            assert torch.equal(output[row : row + 1], want)
+            assert torch.equal(rows.tokens[row : row + 1], cache.cache)
+            assert torch.equal(rows.provided[row : row + 1], cache.provided)
+            assert int(rows.offset[row]) == cache.offset
+
+
+def test_prepare_rows_leaves_the_rows_it_was_given_unchanged():
+    cache = _past_refill(torch.Generator().manual_seed(0), cfg.MAX_DELAY + 3)
+    rows = cache.to_rows()
+    before = [field.clone() for field in rows]
+    prepared = prepare_rows(rows, torch.full((1, 8), 7), DELAYS)
+    commit_rows(prepared, torch.zeros(1, dtype=torch.long), torch.zeros(1, 16, dtype=torch.long), DELAYS)
+    assert all(torch.equal(field, was) for field, was in zip(rows, before, strict=True))
+
+
+def test_conditioning_always_passes_the_initial_token_refill():
+    """``prepare_rows`` has no refill: it relies on conditioning running past every delay."""
+    assert 2 * cfg.SILENCE_FRAMES > cfg.MAX_DELAY
+
+
+def test_to_rows_refuses_an_uncommitted_cache():
+    cache = DelayedTokenCache(1)
+    cache.prepare_embedding()
+    with pytest.raises(RuntimeError, match="commit"):
+        cache.to_rows()

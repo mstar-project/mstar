@@ -1,8 +1,9 @@
 """Submodule checks for PersonaPlex (LM, MimiEncoder, MimiDecoder).
 
 The LM's per-iteration logic is driven engine-free with the dense CPU attention
-backend and greedy samplers; the paged-KV/FlashInfer path is only checked for
-its wiring here (fake resources). Fixture-backed tests replay the NVIDIA fixtures of
+backend and greedy samplers, and through the engine hooks over a real recurrent
+state pool; the paged-KV/FlashInfer path is only checked for its wiring here (fake
+resources). Fixture-backed tests replay the NVIDIA fixtures of
 test_personaplex_components.py and test_personaplex_mimi.py.
 """
 
@@ -15,13 +16,21 @@ from types import SimpleNamespace
 import pytest
 import torch
 from personaplex_fixture_utils import load_binary_fixture
+from torch.utils._python_dispatch import TorchDispatchMode
 
 from mstar.engine.node_dtype import resolve_node_dtype
+from mstar.engine.resources import Segment, SubmoduleStep
+from mstar.engine.resources.base import EngineResourceInfo
+from mstar.engine.resources.recurrent import RecurrentStep
+from mstar.engine.resources.recurrent.pool import RecurrentStatePool
+from mstar.engine.resources.runner import StepRunner
+from mstar.engine.resources.step import BucketKey, SlotLease, StepContext
 from mstar.model.personaplex import config as cfg
-from mstar.model.personaplex.components.delayed_cache import DelayedTokenCache
+from mstar.model.personaplex.components.delayed_cache import CacheRows
 from mstar.model.personaplex.components.temporal import DenseTemporalCache, apply_rope_adjacent
 from mstar.model.personaplex.personaplex_model import PersonaPlexModel
 from mstar.model.personaplex.submodules import (
+    LM_WALKS,
     LMSubmodule,
     MimiDecoderSubmodule,
     MimiEncoderSubmodule,
@@ -29,13 +38,14 @@ from mstar.model.personaplex.submodules import (
     _sampled_token_ids,
 )
 from mstar.model.personaplex.weights import PersonaPlexLM, build_lm, reference_lm_key
-from mstar.model.submodule_base import BatchedModelOutput
+from mstar.model.submodule_base import BatchedModelOutput, ModelInputsFromEngine
 
 FIXTURES = Path(__file__).parent / "fixtures/personaplex"
 TINY = cfg.LMArchConfig(
     dim=32, num_heads=4, num_layers=2, ffn_hidden=40, depformer_dim=16, depformer_heads=2,
     depformer_layers=2, depformer_ffn_hidden=24,
 )
+EIGHT = cfg.AUDIO_CODEBOOKS_PER_STREAM
 
 
 def _greedy_text(logits):
@@ -60,57 +70,48 @@ def _fixture(env, name):
 
 
 class _Run:
-    """Drive LMSubmodule frames the way the conditioning and generate walks do."""
+    """Drive one request's LM frames engine-free, the way the conditioning and generate walks do."""
 
     def __init__(self, sub, meta, voice, persona, user_codes):
-        self.sub, self.meta = sub, meta
+        self.sub, self.meta, self.codes = sub, meta, user_codes
         self.backend = DenseTemporalCache(sub.lm.config.num_layers, sub.lm.config.rope_theta)
         self.static = {"voice_embeddings": [voice["embeddings"]], "voice_cache": [voice["cache"]],
                        "persona_tokens": [persona], "user_audio_codes": [user_codes]}
+        self.progress = sub.start_conditioning(meta, self.static)
+        self.rows, self.index = None, 0
 
-    def walk(self, walk, state, on_frame=None):
-        outputs = []
-        loop = cfg.CONDITIONING_LOOP if walk == cfg.CONDITIONING_WALK else cfg.DECODE_LOOP
-        while True:
-            inputs = {**self.static, "lm_state": [] if state is None else [state]}
-            frame = self.sub.prepare_frame(walk, self.meta, inputs)
-            assert frame is not None
-            if on_frame:
-                on_frame(frame)
-            out = self.sub.run_frame(frame, self.backend, _greedy_text, _greedy_depth)
-            self.backend.advance()
-            outputs.append(out)
-            state = out["lm_state"][0]
-            info = SimpleNamespace(graph_walk=walk, step_metadata=self.meta)
-            if self.sub.check_stop("r", info, out) == {loop}:
-                break
-            assert self.sub.check_stop("r", info, out) == set()
-        # One more iteration would be an overshoot: vetoed, not run.
-        assert self.sub.prepare_frame(walk, self.meta, {**self.static, "lm_state": [state]}) is None
-        return outputs, state
+    @property
+    def conditioning(self):
+        return self.index < self.meta["conditioning_frames"]
 
+    @property
+    def total(self):
+        return self.meta["conditioning_frames"] + self.meta["num_user_frames"]
 
-# --------------------------------------------------------------------------- fixture-free
+    def user(self):
+        return self.codes[:, :, self.index - self.meta["conditioning_frames"]]
 
+    def step(self):
+        """One frame; returns the frame's emitted outputs (none while conditioning)."""
+        if self.conditioning:
+            frame = self.sub.conditioning_frame(self.progress, self.meta, self.static)
+            self.sub.lm.temporal.forward_embeddings(frame.embeds, self.backend, text_logits=False)
+            self.rows, out = frame.rows, {}
+        else:
+            frame = self.sub.generate_frame(self.rows, self.user(), self.backend, _greedy_text, _greedy_depth)
+            self.rows = frame.rows
+            out = {"agent_frame": [frame.agent_frame], "text_frame": [frame.text_frame]}
+        self.backend.advance()
+        self.index += 1
+        return out
 
-def test_lm_state_round_trips_and_rejects_corruption():
-    cache = DelayedTokenCache(1)
-    cache.prepare_embedding()
-    cache.commit(torch.tensor([5]), torch.arange(16).view(1, 16))
-    state = cache.state_tensor(7)
-    assert state.shape == (1, 2 * 17 * 4 + 2) and state.dtype == torch.long
-    again, step = DelayedTokenCache.from_state_tensor(state)
-    assert step == 7 and again.offset == cache.offset
-    assert torch.equal(again.cache, cache.cache) and torch.equal(again.provided, cache.provided)
-    bad = state.clone()
-    bad[0, 68] = 2
-    with pytest.raises(ValueError, match="0/1"):
-        DelayedTokenCache.from_state_tensor(bad)
-    with pytest.raises(ValueError, match="int64"):
-        DelayedTokenCache.from_state_tensor(state.int())
-    cache.prepare(user=torch.zeros(1, 8, 1, dtype=torch.long))
-    with pytest.raises(RuntimeError, match="commit"):
-        cache.state_tensor(8)
+    def run_conditioning(self):
+        while self.conditioning:
+            self.step()
+        return self
+
+    def run(self):
+        return [self.step() for _ in range(self.total - self.index)]
 
 
 def _tiny_submodule(seed=0):
@@ -127,48 +128,11 @@ def _random_inputs(n_emb=3, n_text=4, n_user=5, seed=1):
     return voice, persona, codes, _meta(n_emb, n_text, n_user)
 
 
-@torch.no_grad()
-def test_shared_lm_interleaved_request_state_matches_isolated_runs():
-    """Check model-local state isolation; dense per-request KV is supplied explicitly.
-
-    This exercises real tiny LM/depth computation and packed cache transitions,
-    including different voice/persona lengths. It does not exercise production
-    engine admission, paged KV, cancellation or worker resource cleanup.
-    """
-    sub = _tiny_submodule(seed=31)
-    cases = [_random_inputs(n_emb=1, n_text=2, n_user=3, seed=32),
-             _random_inputs(n_emb=2, n_text=1, n_user=4, seed=33)]
-    expected = []
-    runs = []
-    for voice, persona, codes, meta in cases:
-        isolated = _Run(sub, meta, voice, persona, codes)
-        conditioning, state = isolated.walk(cfg.CONDITIONING_WALK, None)
-        generated, _ = isolated.walk(cfg.GENERATE_WALK, state)
-        expected.append(conditioning + generated)
-        runs.append(_Run(sub, meta, voice, persona, codes))
-
-    states = [None, None]
-    actual = [[], []]
-    # Alternate requests; the shorter one finishes while the other continues.
-    for index in range(max(len(outputs) for outputs in expected)):
-        for request, run in enumerate(runs):
-            if index >= len(expected[request]):
-                continue
-            walk = cfg.CONDITIONING_WALK if index < run.meta["conditioning_frames"] else cfg.GENERATE_WALK
-            frame = sub.prepare_frame(walk, run.meta, {
-                **run.static, "lm_state": [] if states[request] is None else [states[request]],
-            })
-            output = sub.run_frame(frame, run.backend, _greedy_text, _greedy_depth)
-            run.backend.advance()
-            states[request] = output["lm_state"][0]
-            actual[request].append(output)
-
-    for request in range(2):
-        for step, (got, want) in enumerate(zip(actual[request], expected[request], strict=True)):
-            assert got.keys() == want.keys(), (request, step)
-            for name in want:
-                for value, reference in zip(got[name], want[name], strict=True):
-                    assert torch.equal(value, reference), (request, step, name)
+def _assert_same_outputs(got, want, what):
+    assert got.keys() == want.keys(), what
+    for name in want:
+        for value, reference in zip(got[name], want[name], strict=True):
+            assert torch.equal(value, reference), (what, name)
 
 
 class _RowBackends:
@@ -188,88 +152,224 @@ class _RowBackends:
         return torch.cat([b.attend(layer_idx, q[i : i + 1], k[i : i + 1], v[i : i + 1])
                           for i, b in enumerate(self.backends)])
 
-
-def _engine_step(sub, walk, engine_inputs, node_inputs, batched=True):
-    """preprocess -> forward(_batched) -> the engine's row collection -> postprocess, per request."""
-    rids = engine_inputs.request_ids
-    staged = sub.preprocess(walk, engine_inputs, node_inputs)
-    if batched:
-        raw = sub.forward_batched(walk, engine_inputs, **staged)
-        # The stop check must read the lm_state postprocess adds, not a buffer of the forward's.
-        assert isinstance(raw, BatchedModelOutput) and raw.check_stop_buffers is None
-        rows = raw.clone_row_outputs(len(rids))
-        outputs = {rid: {name: [tensor[i : i + 1]] for name, tensor in rows.items()} for i, rid in enumerate(rids)}
-    else:
-        outputs = {rids[0]: sub.forward(walk, engine_inputs, **staged)}
-    for rid, inp in zip(rids, node_inputs, strict=True):
-        sub.postprocess(rid, None, outputs[rid], inp)
-    return outputs
+    def advance(self):
+        for backend in self.backends:
+            backend.advance()
 
 
-def _needed(sub, frames):
-    return sub.depth_steps(cfg.GENERATE_WALK, sub._target_rows(frames)[1])
+class _GreedySampler:
+    def sample(self, request_ids, logits):
+        return logits.float().argmax(-1)
 
 
-def _assert_same_outputs(got, want, what):
-    assert got.keys() == want.keys(), what
-    for name in want:
-        for value, reference in zip(got[name], want[name], strict=True):
-            assert torch.equal(value, reference), (what, name)
+def _cat_rows(rows):
+    return CacheRows(*(torch.cat(parts) for parts in zip(*rows, strict=True)))
+
+
+class _Engine:
+    """The engine's path for the LM over a real state pool: prepare_inputs -> preprocess -> forward -> commit.
+
+    Temporal attention stays per-request dense KV, since that resource needs a GPU.
+    """
+
+    def __init__(self, sub, max_slots=16):
+        self.sub = sub
+        spec = next(s for s in PersonaPlexModel(skip_weight_loading=True).get_node_resources()
+                    if s.resource_key == cfg.LM_CACHE)
+        spec.config.max_slots = max_slots
+        self.pool = RecurrentStatePool.build(spec, EngineResourceInfo(device=torch.device("cpu")))
+        self.runner = StepRunner({cfg.LM_CACHE: self.pool})
+        self.added, self.iters, self.handles, self.backends = set(), {}, {}, {}
+        self.dense = (TINY.num_layers, TINY.rope_theta)
+
+    def add(self, rid):
+        self.pool.ingest_request(rid)
+        self.added.add(rid)
+        self.iters[rid] = {}
+        self.handles[rid] = len(self.handles)
+        self.backends[rid] = DenseTemporalCache(*self.dense)
+
+    def remove(self, rid):
+        self.pool.remove_request(rid)
+        self.added.remove(rid)
+
+    def info(self, rid, meta):
+        return SimpleNamespace(step_metadata=meta, dynamic_loop_iter_counts=self.iters[rid],
+                               rid_handle=self.handles[rid])
+
+    def prepare(self, walk, rid, meta, inputs):
+        return self.sub.prepare_inputs(walk, self.info(rid, meta), inputs)
+
+    def step(self, walk, rids, node_inputs, batched=None, bucket=None, text=None, depth=None):
+        """Run one step. ``bucket`` pads it to a captured size with the capture config's template rows."""
+        loop = cfg.CONDITIONING_LOOP if walk == cfg.CONDITIONING_WALK else cfg.DECODE_LOOP
+        ctx = StepContext(request_ids=tuple(rids), graph_walk=walk, slot=0, capture=False)
+        rows, inputs = list(rids), list(node_inputs)
+        backends = [self.backends[rid] for rid in rids]
+        if bucket is not None:
+            (config,) = self.sub.get_accelerator_graph_configs(torch.device("cpu"))
+            padding = config.get_node_inputs(bucket - len(rids), 0)
+            rows += [f"pad{i}" for i in range(len(padding))]
+            inputs += padding
+            backends += [DenseTemporalCache(*self.dense) for _ in padding]
+            ctx.slot_lease = SlotLease(slot=0, bucket=BucketKey(walk, bucket, bucket, 0))
+            ctx.set_padded_rids(tuple(rows))
+        step = SubmoduleStep(segments=[Segment(request_id=rid, label=cfg.KV_LABEL, span=1) for rid in rows],
+                             steps={cfg.LM_CACHE: RecurrentStep()})
+        step.set_ctx(ctx)
+        assert self.runner.admit(step).ok
+        self.runner.plan(step)
+        self.sub._backend = _RowBackends(backends)
+        engine_inputs = ModelInputsFromEngine(
+            request_ids=rows, per_request_info={}, step=step,
+            resources={cfg.LM_CACHE: self.pool, cfg.TEXT_SAMPLER: text or _GreedySampler(),
+                       cfg.DEPTH_SAMPLER: depth or _GreedySampler()},
+        )
+        staged = self.sub.preprocess(walk, engine_inputs, inputs)
+        if batched if batched is not None else len(rows) > 1:
+            raw = self.sub.forward_batched(walk, engine_inputs, **staged)
+            assert isinstance(raw, BatchedModelOutput) and raw.check_stop_buffers is None
+            produced = raw.clone_row_outputs(len(rids))
+            outputs = {rid: {name: [tensor[i : i + 1]] for name, tensor in produced.items()}
+                       for i, rid in enumerate(rids)}
+        else:
+            outputs = {rids[0]: self.sub.forward(walk, engine_inputs, **staged)}
+        self.runner.commit(step)
+        for rid in rids:
+            self.iters[rid][loop] = self.iters[rid].get(loop, 0) + 1
+            self.backends[rid].advance()
+        return outputs
+
+
+def _class_reference_frame(sub, cache, user, backend):
+    """A generate frame through ``DelayedTokenCache`` with only the depth steps it needs: an independent control."""
+    assert cache.prepare(user=user[:, :, None])
+    dtype = sub.lm.temporal.text_emb.weight.dtype
+    embeds = sub.lm.temporal.embed_codes(cache.model_input)[:, 0].to(dtype)
+    target, forced = cache.target[:, :, 0].clone(), cache.target_provided[:, :, 0].clone()
+    hidden, logits = sub.lm.temporal.forward_embeddings(embeds, backend)
+    text = _greedy_text(logits)
+    free = (~forced[0, 1:]).nonzero()
+    steps = int(free.max()) + 1 if len(free) else 0
+    audio = sub.lm.depth.run_frame(torch.where(forced[:, 0], target[:, 0], text), hidden, target[:, 1:], forced[:, 1:],
+                                   _greedy_depth, steps=steps)
+    output = cache.commit(text, audio)
+    return {"agent_frame": [output[:, 1 : 1 + EIGHT]], "text_frame": [output[:, 0, 0]]}
+
+
+# --------------------------------------------------------------------------- fixture-free
 
 
 @torch.no_grad()
-def test_batched_frames_match_isolated_runs():
-    """Rows at different frame offsets share a step and still match each request run alone.
-
-    The second request starts two frames late, so the batches hold caches at
-    different offsets, and for some steps the requests are in different walks
-    and run separately. Three requests cover voice, persona and user lengths
-    that differ.
-    """
-    sub = _tiny_submodule(seed=41)
-    cases = [_random_inputs(n_emb=1, n_text=2, n_user=3, seed=42),
-             _random_inputs(n_emb=2, n_text=1, n_user=4, seed=43),
-             _random_inputs(n_emb=1, n_text=3, n_user=2, seed=44)]
-    expected = []
-    for voice, persona, codes, meta in cases:
-        isolated = _Run(sub, meta, voice, persona, codes)
-        conditioning, state = isolated.walk(cfg.CONDITIONING_WALK, None)
-        generated, _ = isolated.walk(cfg.GENERATE_WALK, state)
-        expected.append(conditioning + generated)
-
+def test_shared_lm_interleaved_requests_match_isolated_runs():
+    """Cache state stays per request, including different voice and persona lengths."""
+    sub = _tiny_submodule(seed=31)
+    cases = [_random_inputs(n_emb=1, n_text=2, n_user=3, seed=32),
+             _random_inputs(n_emb=2, n_text=1, n_user=4, seed=33)]
+    expected = [_Run(sub, meta, voice, persona, codes).run() for voice, persona, codes, meta in cases]
     runs = [_Run(sub, meta, voice, persona, codes) for voice, persona, codes, meta in cases]
-    starts = [0, 2, 2]
-    states, actual = [None] * len(runs), [[] for _ in runs]
-    batch_sizes = []
-    for tick in range(max(start + len(want) for start, want in zip(starts, expected, strict=True))):
-        by_walk = {}
+    actual = [[], []]
+    # Alternate requests; the shorter one finishes while the other continues.
+    for index in range(max(run.total for run in runs)):
         for request, run in enumerate(runs):
-            index = tick - starts[request]
-            if not 0 <= index < len(expected[request]):
-                continue
-            walk = cfg.CONDITIONING_WALK if index < run.meta["conditioning_frames"] else cfg.GENERATE_WALK
-            by_walk.setdefault(walk, []).append(request)
-        for walk, requests in by_walk.items():
-            frames = [sub.prepare_frame(walk, runs[r].meta, {
-                **runs[r].static, "lm_state": [] if states[r] is None else [states[r]],
-            }) for r in requests]
-            backend = _RowBackends([runs[r].backend for r in requests])
-            outputs = sub.run_frames(frames, backend, _greedy_text, _greedy_depth)
-            batch_sizes.append(len(requests))
-            for r, output in zip(requests, outputs, strict=True):
-                runs[r].backend.advance()
-                states[r] = output["lm_state"][0]
-                actual[r].append(output)
-
-    assert max(batch_sizes) == 3 and 1 in batch_sizes
-    for request in range(len(runs)):
-        assert len(actual[request]) == len(expected[request])
+            if index < run.total:
+                actual[request].append(run.step())
+    for request in range(2):
         for step, (got, want) in enumerate(zip(actual[request], expected[request], strict=True)):
             _assert_same_outputs(got, want, (request, step))
 
 
 @torch.no_grad()
-def test_forward_batched_returns_each_request_its_own_rows():
+def test_batched_generate_frames_match_isolated_runs():
+    """Rows at different offsets share a step and still match each request run alone."""
+    sub = _tiny_submodule(seed=41)
+    cases = [_random_inputs(n_emb=1, n_text=2, n_user=3, seed=42),
+             _random_inputs(n_emb=2, n_text=1, n_user=4, seed=43),
+             _random_inputs(n_emb=1, n_text=3, n_user=2, seed=44)]
+    expected = [_Run(sub, c[3], *c[:3]).run_conditioning().run() for c in cases]
+    runs = [_Run(sub, meta, voice, persona, codes).run_conditioning() for voice, persona, codes, meta in cases]
+    assert len({int(run.rows.offset) for run in runs}) > 1
+    for tick in range(max(len(want) for want in expected)):
+        live = [i for i in range(3) if tick < len(expected[i])]
+        rows = _cat_rows([runs[i].rows for i in live])
+        user = torch.cat([runs[i].user() for i in live])
+        backend = _RowBackends([runs[i].backend for i in live])
+        frame = sub.generate_frame(rows, user, backend, _greedy_text, _greedy_depth)
+        for row, i in enumerate(live):
+            runs[i].backend.advance()
+            runs[i].index += 1
+            runs[i].rows = CacheRows(*(field[row : row + 1] for field in frame.rows))
+            got = {"agent_frame": [frame.agent_frame[row : row + 1]], "text_frame": [frame.text_frame[row : row + 1]]}
+            _assert_same_outputs(got, expected[i][tick], (tick, i))
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("batch", [1, 3])
+def test_engine_path_over_the_pool_matches_the_class_reference_over_whole_requests(batch):
+    """prepare_inputs -> preprocess -> forward over the real pool, every frame, vs ``DelayedTokenCache``.
+
+    Requests start at different frames, so batches hold rows at different offsets.
+    """
+    sub = _tiny_submodule(seed=71)
+    cases = [_random_inputs(n_emb=1 + i % 2, n_text=2 + i, n_user=6, seed=171 + i) for i in range(batch)]
+    engine = _Engine(sub)
+    refs = [_Run(sub, meta, voice, persona, codes) for voice, persona, codes, meta in cases]
+    rids = [f"r{i}" for i in range(batch)]
+    for rid in rids:
+        engine.add(rid)
+    starts = [2 * i for i in range(batch)]
+    for tick in range(max(start + run.total for start, run in zip(starts, refs, strict=True))):
+        for walk in (cfg.CONDITIONING_WALK, cfg.GENERATE_WALK):
+            conditioning = walk == cfg.CONDITIONING_WALK
+            live = [i for i in range(batch) if 0 <= tick - starts[i] < refs[i].total
+                    and (tick - starts[i] < refs[i].meta["conditioning_frames"]) == conditioning]
+            if not live:
+                continue
+            inputs = [engine.prepare(walk, rids[i], refs[i].meta, refs[i].static) for i in live]
+            got = engine.step(walk, [rids[i] for i in live], inputs)
+            for i in live:
+                run = refs[i]
+                if conditioning:
+                    run.step()
+                    assert set(got[rids[i]]) == {cfg.CONDITIONING_TICK}
+                else:
+                    want = _class_reference_frame(sub, run.progress.cache, run.user(), run.backend)
+                    run.backend.advance()
+                    run.index += 1
+                    _assert_same_outputs(got[rids[i]], want, f"tick {tick} request {i}")
+    for i, rid in enumerate(rids):
+        # An overshoot iteration is skipped without reading anything from the device.
+        assert engine.prepare(cfg.GENERATE_WALK, rid, refs[i].meta, refs[i].static) is None
+
+
+@torch.no_grad()
+def test_a_recycled_slot_starts_from_the_new_request_alone():
+    sub = _tiny_submodule(seed=74)
+    first, second = _random_inputs(n_emb=1, n_text=1, n_user=3, seed=174), _random_inputs(n_emb=2, n_text=2, seed=175)
+    engine = _Engine(sub, max_slots=2)
+
+    def serve(rid, case):
+        voice, persona, codes, meta = case
+        run = _Run(sub, meta, voice, persona, codes)
+        engine.add(rid)
+        outputs = []
+        for index in range(run.total):
+            walk = cfg.CONDITIONING_WALK if index < meta["conditioning_frames"] else cfg.GENERATE_WALK
+            inputs = engine.prepare(walk, rid, meta, run.static)
+            outputs.append(engine.step(walk, [rid], [inputs], batched=False)[rid])
+        engine.remove(rid)
+        return outputs[meta["conditioning_frames"]:]
+
+    serve("first", first)
+    got = serve("second", second)
+    voice, persona, codes, meta = second
+    want = _Run(sub, meta, voice, persona, codes).run_conditioning().run()
+    for step, (actual, expected) in enumerate(zip(got, want, strict=True)):
+        _assert_same_outputs(actual, expected, step)
+
+
+@torch.no_grad()
+def test_forward_batched_gives_each_request_its_own_rows_and_samples_every_depth_step():
     class Sampler:
         def __init__(self):
             self.shapes, self.tokens = [], []
@@ -282,47 +382,24 @@ def test_forward_batched_returns_each_request_its_own_rows():
 
     sub = _tiny_submodule(seed=31)
     cases = [_random_inputs(n_emb=1, n_text=1, n_user=2, seed=52), _random_inputs(n_emb=2, n_text=3, n_user=2, seed=53)]
-    runs, states, want = [], [], []
-    for voice, persona, codes, meta in cases:
-        run = _Run(sub, meta, voice, persona, codes)
-        _, state = run.walk(cfg.CONDITIONING_WALK, None)
-        reference = _Run(sub, meta, voice, persona, codes)
-        _, reference_state = reference.walk(cfg.CONDITIONING_WALK, None)
-        frame = sub.prepare_frame(cfg.GENERATE_WALK, meta, {**reference.static, "lm_state": [reference_state]})
-        want.append(sub.run_frame(frame, reference.backend, _greedy_text, _greedy_depth))
-        runs.append(run)
-        states.append(state)
-    node_inputs = [sub.prepare_inputs(cfg.GENERATE_WALK, SimpleNamespace(step_metadata=run.meta),
-                                      {**run.static, "lm_state": [state]})
-                   for run, state in zip(runs, states, strict=True)]
-    sub._backend = _RowBackends([run.backend for run in runs])
-    text_sampler, depth_sampler = Sampler(), Sampler()
-    engine_inputs = SimpleNamespace(request_ids=["a", "b"], resources={
-        cfg.TEXT_SAMPLER: text_sampler, cfg.DEPTH_SAMPLER: depth_sampler,
-    })
-    got = _engine_step(sub, cfg.GENERATE_WALK, engine_inputs, node_inputs)
-    assert set(got) == {"a", "b"}
+    engine = _Engine(sub)
+    runs = dict(zip("ab", (_Run(sub, c[3], *c[:3]) for c in cases), strict=True))
+    want = {rid: _Run(sub, c[3], *c[:3]).run_conditioning().step()
+            for rid, c in zip("ab", cases, strict=True)}
+    for rid, run in runs.items():
+        engine.add(rid)
+        for _ in range(run.meta["conditioning_frames"]):
+            inputs = engine.prepare(cfg.CONDITIONING_WALK, rid, run.meta, run.static)
+            engine.step(cfg.CONDITIONING_WALK, [rid], [inputs], batched=False)
+    inputs = [engine.prepare(cfg.GENERATE_WALK, rid, run.meta, run.static) for rid, run in runs.items()]
+    text, depth = Sampler(), Sampler()
+    got = engine.step(cfg.GENERATE_WALK, ["a", "b"], inputs, text=text, depth=depth)
     # The rows sample different text, so handing one row the other's tokens would show.
-    assert text_sampler.tokens[0][0] != text_sampler.tokens[0][1]
-    # First generate frame: only depth step 0 samples (the agent acoustic codebooks are still forced).
-    assert text_sampler.shapes == [(2, TINY.text_card)] and depth_sampler.shapes == [(2, TINY.card)]
-    _assert_same_outputs(got["a"], want[0], "a")
-    _assert_same_outputs(got["b"], want[1], "b")
-    for output in got.values():
-        assert output["agent_frame"][0].shape == (1, 8, 1) and output["text_frame"][0].shape == (1,)
-
-
-@torch.no_grad()
-def test_a_batch_must_hold_one_walk():
-    sub = _tiny_submodule()
-    voice, persona, codes, meta = _random_inputs(n_emb=1, n_text=1, n_user=1)
-    run = _Run(sub, meta, voice, persona, codes)
-    conditioning = sub.prepare_frame(cfg.CONDITIONING_WALK, meta, {**run.static, "lm_state": []})
-    _, state = _Run(sub, meta, voice, persona, codes).walk(cfg.CONDITIONING_WALK, None)
-    generate = sub.prepare_frame(cfg.GENERATE_WALK, meta, {**run.static, "lm_state": [state]})
-    with pytest.raises(ValueError, match="one walk"):
-        sub.run_frames([conditioning, generate], _RowBackends([run.backend, run.backend]),
-                       _greedy_text, _greedy_depth)
+    assert text.tokens[0][0] != text.tokens[0][1]
+    assert text.shapes == [(2, TINY.text_card)] and depth.shapes == [(2, TINY.card)] * EIGHT
+    for rid in "ab":
+        _assert_same_outputs(got[rid], want[rid], rid)
+        assert got[rid]["agent_frame"][0].shape == (1, 8, 1) and got[rid]["text_frame"][0].shape == (1,)
 
 
 @torch.no_grad()
@@ -332,267 +409,93 @@ def test_generated_text_frame_serializes_for_worker_transfer():
 
     sub = _tiny_submodule()
     voice, persona, codes, meta = _random_inputs(n_user=1)
-    run = _Run(sub, meta, voice, persona, codes)
-    _, state = run.walk(cfg.CONDITIONING_WALK, None)
-    generated, _ = run.walk(cfg.GENERATE_WALK, state)
-    text = generated[0]["text_frame"][0]
+    text = _Run(sub, meta, voice, persona, codes).run_conditioning().step()["text_frame"][0]
     assert text.shape == (1,) and text.dtype == torch.long
     assert _serialize_tensor(text) == torch.tensor([text.item()], dtype=torch.long).numpy().tobytes()
 
 
 @torch.no_grad()
-def test_conditioning_frames_are_fully_forced_and_generate_reads_the_mask_each_frame():
+def test_conditioning_is_fully_forced_and_generate_reads_the_mask_each_frame(monkeypatch):
     sub = _tiny_submodule()
     voice, persona, codes, meta = _random_inputs()
     run = _Run(sub, meta, voice, persona, codes)
-    masks = []
+    commit, masks = run.progress.cache.commit, []
     original = sub.lm.depth.run_frame
+
+    def checked_commit(*args):
+        assert run.progress.cache.target_provided.all(), "conditioning commits only forced values"
+        return commit(*args)
 
     def spy(text, hidden, target, provided, sample, **kw):
         masks.append(provided.clone())
         return original(text, hidden, target, provided, sample, **kw)
 
-    sub.lm.depth.run_frame = spy
-    cond, state = run.walk(cfg.CONDITIONING_WALK, None)
-    assert len(cond) == meta["conditioning_frames"] and masks == []  # no depformer while conditioning
-    assert all(set(out) == {"lm_state"} for out in cond)
-    gen, state = run.walk(cfg.GENERATE_WALK, state)
-    assert len(gen) == meta["num_user_frames"] == len(masks)
+    monkeypatch.setattr(run.progress.cache, "commit", checked_commit)
+    monkeypatch.setattr(sub.lm.depth, "run_frame", spy)
+    run.run_conditioning()
+    assert masks == []  # no depformer while conditioning
+    run.run()
+    assert len(masks) == meta["num_user_frames"]
     # First user step: agent acoustic (delay 1) still forced by the last conditioning frame,
     # agent semantic sampled. Later steps sample all agent channels.
-    acoustic = torch.zeros(16, dtype=torch.bool)
-    acoustic[1:8] = True
-    acoustic[8:] = True  # user channels are always provided
-    assert torch.equal(masks[0][0], acoustic)
+    first = torch.zeros(16, dtype=torch.bool)
+    first[1:] = True
+    assert torch.equal(masks[0][0], first)
     for mask in masks[1:]:
         assert not mask[0, :8].any() and mask[0, 8:].all()
-    assert DelayedTokenCache.from_state_tensor(state)[1] == meta["conditioning_frames"] + meta["num_user_frames"]
-
-
-class _CountingDepth:
-    """Counts the depformer steps and depth-sampler calls a frame actually makes."""
-
-    def __init__(self, sub):
-        self.depth, self.steps, self.samples = sub.lm.depth, [], []
-        self._step = self.depth.step
-
-    def __enter__(self):
-        def step(index, *args, **kwargs):
-            self.steps.append(index)
-            return self._step(index, *args, **kwargs)
-
-        self.depth.step = step
-        return self
-
-    def __exit__(self, *exc):
-        self.depth.step = self._step
-
-    def sample(self, logits, step):
-        self.samples.append(step)
-        return _greedy_depth(logits, step)
-
-
-def _conditioned_pair(sub, case):
-    """Two identical runs after conditioning: one to step with every depth step, one with the shortened depformer."""
-    voice, persona, codes, meta = case
-    runs = [_Run(sub, meta, voice, persona, codes) for _ in range(2)]
-    states = [run.walk(cfg.CONDITIONING_WALK, None)[1] for run in runs]
-    return runs, states
 
 
 @torch.no_grad()
-@pytest.mark.parametrize("seed", [61, 62, 63])
-def test_shortened_depformer_matches_every_depth_step_and_skips_the_forced_suffix(seed):
-    sub = _tiny_submodule(seed=seed)
-    case = _random_inputs(n_emb=2, n_text=3, n_user=12, seed=seed + 100)
-    (full, short), (full_state, short_state) = _conditioned_pair(sub, case)
-    meta = case[3]
-    for j in range(meta["num_user_frames"]):
-        frames = [sub.prepare_frame(cfg.GENERATE_WALK, meta, {**run.static, "lm_state": [state]})
-                  for run, state in ((full, full_state), (short, short_state))]
-        want = sub.run_frames([frames[0]], full.backend, _greedy_text, _greedy_depth, depth_steps=cfg.DEP_Q)[0]
-        with _CountingDepth(sub) as counted:
-            got = sub.run_frames([frames[1]], short.backend, _greedy_text, counted.sample)[0]
-        full.backend.advance()
-        short.backend.advance()
-        # User codebooks (steps 8-15) are always forced; the first frame also forces the agent's acoustic codes.
-        expected = 1 if j == 0 else cfg.AUDIO_CODEBOOKS_PER_STREAM
-        assert counted.steps == list(range(expected)) and counted.samples == list(range(expected)), j
-        _assert_same_outputs(got, want, f"generate frame {j}")
-        full_state, short_state = want["lm_state"][0], got["lm_state"][0]
+def test_generate_runs_eight_depth_steps_on_every_frame():
+    sub = _tiny_submodule(seed=61)
+    voice, persona, codes, meta = _random_inputs(n_emb=1, n_text=2, n_user=3, seed=161)
+    run = _Run(sub, meta, voice, persona, codes).run_conditioning()
+    steps, samples = [], []
+    original = sub.lm.depth.step
 
+    def step(index, *args, **kwargs):
+        steps.append(index)
+        return original(index, *args, **kwargs)
 
-@torch.no_grad()
-def test_stopping_one_depth_step_early_changes_the_committed_state():
-    """The step count is tight: dropping the last sampled step loses a committed agent code."""
-    sub = _tiny_submodule(seed=64)
-    case = _random_inputs(n_emb=1, n_text=2, n_user=4, seed=164)
-    (full, short), (full_state, short_state) = _conditioned_pair(sub, case)
-    meta = case[3]
-    changed = []
+    def sample(logits, index):
+        samples.append(index)
+        return _greedy_depth(logits, index)
+
+    sub.lm.depth.step = step
     for _ in range(meta["num_user_frames"]):
-        frames = [sub.prepare_frame(cfg.GENERATE_WALK, meta, {**run.static, "lm_state": [state]})
-                  for run, state in ((full, full_state), (short, short_state))]
-        needed = _needed(sub, [frames[1]])
-        want = sub.run_frames([frames[0]], full.backend, _greedy_text, _greedy_depth, depth_steps=cfg.DEP_Q)[0]
-        got = sub.run_frames([frames[1]], short.backend, _greedy_text, _greedy_depth, depth_steps=needed - 1)[0]
-        full.backend.advance()
-        short.backend.advance()
-        changed.append(not torch.equal(got["lm_state"][0], want["lm_state"][0]))
-        # Continue both runs from the correct state, so each frame is checked on its own.
-        full_state = short_state = want["lm_state"][0]
-    assert all(changed), changed
-
-
-def test_depth_steps_needed_runs_through_the_last_free_step_of_any_row():
-    from mstar.model.personaplex.components.depformer import depth_steps_needed
-
-    forced = torch.ones(2, cfg.DEP_Q, dtype=torch.bool)
-    assert depth_steps_needed(forced) == 0
-    holes = forced.clone()
-    holes[0, 2] = holes[1, 5] = False  # forced steps between free ones still run
-    assert depth_steps_needed(holes) == 6
-    free_last = forced.clone()
-    free_last[1, cfg.DEP_Q - 1] = False  # an unexpectedly free user codebook is not skipped
-    assert depth_steps_needed(free_last) == cfg.DEP_Q
+        frame = sub.generate_frame(run.rows, run.user(), run.backend, _greedy_text, sample)
+        run.rows, run.index = frame.rows, run.index + 1
+        run.backend.advance()
+    assert steps == samples == list(range(EIGHT)) * meta["num_user_frames"]
 
 
 @torch.no_grad()
-def test_batch_of_first_and_later_generate_frames_runs_the_longer_depformer():
-    """A row on its first generate frame next to a later one: 8 steps for both, each row still its solo result."""
-    sub = _tiny_submodule(seed=65)
-    cases = [_random_inputs(n_emb=1, n_text=2, n_user=3, seed=165),
-             _random_inputs(n_emb=2, n_text=1, n_user=3, seed=166)]
-    rows, want = [], []
-    for skip_frames, case in zip((0, 1), cases, strict=True):
-        voice, persona, codes, meta = case
-        solo, batched = _Run(sub, meta, voice, persona, codes), _Run(sub, meta, voice, persona, codes)
-        states = [solo.walk(cfg.CONDITIONING_WALK, None)[1], batched.walk(cfg.CONDITIONING_WALK, None)[1]]
-        for _ in range(skip_frames):  # advance both copies past the first generate frame
-            for k, run in enumerate((solo, batched)):
-                frame = sub.prepare_frame(cfg.GENERATE_WALK, meta, {**run.static, "lm_state": [states[k]]})
-                states[k] = sub.run_frame(frame, run.backend, _greedy_text, _greedy_depth)["lm_state"][0]
-                run.backend.advance()
-        frame = sub.prepare_frame(cfg.GENERATE_WALK, meta, {**solo.static, "lm_state": [states[0]]})
-        want.append(sub.run_frames([frame], solo.backend, _greedy_text, _greedy_depth, depth_steps=cfg.DEP_Q)[0])
-        rows.append((batched, sub.prepare_frame(cfg.GENERATE_WALK, meta, {**batched.static, "lm_state": [states[1]]})))
-    frames = [frame for _, frame in rows]
-    assert [_needed(sub, [frame]) for frame in frames] == [1, cfg.AUDIO_CODEBOOKS_PER_STREAM]
-    with _CountingDepth(sub) as counted:
-        got = sub.run_frames(frames, _RowBackends([run.backend for run, _ in rows]), _greedy_text, counted.sample)
-    assert counted.steps == list(range(cfg.AUDIO_CODEBOOKS_PER_STREAM))
-    for row in range(2):
-        _assert_same_outputs(got[row], want[row], f"row {row}")
+def test_generate_frame_reads_nothing_back_from_tensors():
+    """A host read in the step would break capture and serialize the async worker."""
+    reads = []
 
+    class Reads(TorchDispatchMode):
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            if func.__name__.split(".")[0] in ("_local_scalar_dense", "item", "is_nonzero"):
+                reads.append(func.__name__)
+            return func(*args, **(kwargs or {}))
 
-@torch.no_grad()
-def test_preprocess_passes_the_depth_step_count_to_forward():
-    sub = _tiny_submodule(seed=66)
-    voice, persona, codes, meta = _random_inputs(n_emb=1, n_text=1, n_user=2, seed=167)
-    run = _Run(sub, meta, voice, persona, codes)
-    _, state = run.walk(cfg.CONDITIONING_WALK, None)
-    inputs = sub.prepare_inputs(cfg.GENERATE_WALK, SimpleNamespace(step_metadata=meta),
-                                {**run.static, "lm_state": [state]})
-    assert sub.preprocess(cfg.GENERATE_WALK, None, [inputs])["depth_steps"] == 1
-    conditioning = sub.prepare_inputs(cfg.CONDITIONING_WALK, SimpleNamespace(step_metadata=meta),
-                                      {**run.static, "lm_state": []})
-    assert sub.preprocess(cfg.CONDITIONING_WALK, None, [conditioning])["depth_steps"] == 0
+    sub = _tiny_submodule(seed=62)
+    voice, persona, codes, meta = _random_inputs(n_emb=1, n_text=1, n_user=2, seed=162)
+    run = _Run(sub, meta, voice, persona, codes).run_conditioning()
 
+    class Silent:
+        """Temporal attention without the test backend's own bookkeeping reads."""
 
-def _reference_run_frames(sub, frames, backend):
-    """The LM frame step before it was split for capture (12c009973), kept as an independent control (greedy)."""
-    from mstar.model.personaplex.components.depformer import depth_steps_needed
+        def rope(self, q, k):
+            return q, k
 
-    walk = frames[0].walk
-    conditioning = walk == cfg.CONDITIONING_WALK
-    embeds = torch.cat([frame.embeds for frame in frames])
-    hidden, text_logits = sub.lm.temporal.forward_embeddings(embeds, backend, text_logits=not conditioning)
-    target = torch.cat([frame.cache.target[:, :, 0] for frame in frames])
-    provided = torch.cat([frame.cache.target_provided[:, :, 0] for frame in frames])
-    if conditioning:
-        sampled_text, audio = target[:, 0], target[:, 1:]
-    else:
-        sampled_text = _greedy_text(text_logits)
-        next_text = torch.where(provided[:, 0], target[:, 0], sampled_text)
-        audio = sub.lm.depth.run_frame(next_text, hidden, target[:, 1:], provided[:, 1:], _greedy_depth,
-                                       steps=depth_steps_needed(provided[:, 1:]))
-    results = []
-    for row, frame in enumerate(frames):
-        cache = frame.cache
-        output = cache.commit(sampled_text[row : row + 1], audio[row : row + 1])
-        if frame.restore_cache is not None:
-            cache.load(frame.restore_cache)
-        outputs = {"lm_state": [cache.state_tensor(frame.frame + 1)]}
-        if not conditioning:
-            outputs["agent_frame"] = [output[:, 1 : 1 + cfg.AUDIO_CODEBOOKS_PER_STREAM].contiguous()]
-            outputs["text_frame"] = [output[:, 0, 0].clone(memory_format=torch.contiguous_format)]
-        results.append(outputs)
-    return results
+        def attend(self, layer_idx, q, k, v):
+            return v
 
-
-class _GreedySampler:
-    def sample(self, request_ids, logits):
-        return logits.float().argmax(-1)
-
-
-@torch.no_grad()
-@pytest.mark.parametrize("batch", [1, 3])
-def test_engine_step_matches_the_pre_capture_frame_step_over_whole_requests(batch):
-    """prepare_inputs -> preprocess -> forward -> row collection -> postprocess, every frame, vs the old step.
-
-    Requests start at different frames, so batches mix walks' first and later frames.
-    """
-    sub = _tiny_submodule(seed=71)
-    cases = [_random_inputs(n_emb=1 + i % 2, n_text=2 + i, n_user=6, seed=171 + i) for i in range(batch)]
-    engine_runs = [_Run(sub, meta, voice, persona, codes) for voice, persona, codes, meta in cases]
-    reference_runs = [_Run(sub, meta, voice, persona, codes) for voice, persona, codes, meta in cases]
-    states = {"engine": [None] * batch, "reference": [None] * batch}
-    starts = [2 * i for i in range(batch)]
-    totals = [run.meta["conditioning_frames"] + run.meta["num_user_frames"] for run in engine_runs]
-    for tick in range(max(start + total for start, total in zip(starts, totals, strict=True))):
-        for walk in (cfg.CONDITIONING_WALK, cfg.GENERATE_WALK):
-            conditioning = walk == cfg.CONDITIONING_WALK
-            rows = [i for i in range(batch) if 0 <= tick - starts[i] < totals[i]
-                    and (tick - starts[i] < engine_runs[i].meta["conditioning_frames"]) == conditioning]
-            if not rows:
-                continue
-            node_inputs = [sub.prepare_inputs(walk, SimpleNamespace(step_metadata=engine_runs[i].meta), {
-                **engine_runs[i].static, "lm_state": [] if states["engine"][i] is None else [states["engine"][i]]})
-                for i in rows]
-            sub._backend = _RowBackends([engine_runs[i].backend for i in rows])
-            rids = [f"r{i}" for i in rows]
-            engine_inputs = SimpleNamespace(request_ids=rids, resources={
-                cfg.TEXT_SAMPLER: _GreedySampler(), cfg.DEPTH_SAMPLER: _GreedySampler()})
-            got = _engine_step(sub, walk, engine_inputs, node_inputs, batched=len(rows) > 1)
-            frames = [sub.prepare_frame(walk, reference_runs[i].meta, {
-                **reference_runs[i].static,
-                "lm_state": [] if states["reference"][i] is None else [states["reference"][i]]}) for i in rows]
-            want = _reference_run_frames(sub, frames, _RowBackends([reference_runs[i].backend for i in rows]))
-            for i in rows:
-                engine_runs[i].backend.advance()
-                reference_runs[i].backend.advance()
-            for k, i in enumerate(rows):
-                _assert_same_outputs(got[rids[k]], want[k], f"tick {tick} request {i} {walk}")
-                states["engine"][i] = got[rids[k]]["lm_state"][0]
-                states["reference"][i] = want[k]["lm_state"][0]
-
-
-@torch.no_grad()
-def test_captured_eight_step_depformer_matches_the_exact_count_on_first_and_later_frames():
-    sub = _tiny_submodule(seed=72)
-    case = _random_inputs(n_emb=1, n_text=2, n_user=4, seed=172)
-    (exact, fixed), (exact_state, fixed_state) = _conditioned_pair(sub, case)
-    meta = case[3]
-    for j in range(meta["num_user_frames"]):
-        frames = [sub.prepare_frame(cfg.GENERATE_WALK, meta, {**run.static, "lm_state": [state]})
-                  for run, state in ((exact, exact_state), (fixed, fixed_state))]
-        want = sub.run_frames([frames[0]], exact.backend, _greedy_text, _greedy_depth)[0]
-        got = sub.run_frames([frames[1]], fixed.backend, _greedy_text, _greedy_depth,
-                             depth_steps=cfg.AUDIO_CODEBOOKS_PER_STREAM)[0]
-        exact.backend.advance()
-        fixed.backend.advance()
-        _assert_same_outputs(got, want, f"generate frame {j}")
-        exact_state, fixed_state = want["lm_state"][0], got["lm_state"][0]
+    with Reads():
+        sub.generate_frame(run.rows, run.user(), Silent(), _greedy_text, _greedy_depth)
+    assert reads == []
 
 
 def test_capture_config_covers_both_generate_walks_up_to_the_batch_cap():
@@ -605,68 +508,45 @@ def test_capture_config_covers_both_generate_walks_up_to_the_batch_cap():
         assert isinstance(config, BatchedAcceleratorGraphConfig) and config.capture_batch_sizes == sizes
         assert config.capture_graph_walk == cfg.GENERATE_WALK
         assert set(config.replay_graph_walks) == {cfg.GENERATE_WALK, cfg.GENERATE_AUDIO_WALK}
-        assert config.input_seq_dims == {"input_embeds": 0, "target": 0, "provided": 0}
+        assert config.input_seq_dims == {"user_frame": 0}
 
 
 @torch.no_grad()
 @pytest.mark.parametrize("real", [1, 3, 5])
-def test_padding_rows_from_the_capture_template_leave_real_rows_unchanged(real):
-    """Pad a real batch with the config's own template rows (as the runner does) and run the 8-step step."""
+def test_padding_rows_on_the_pool_sink_leave_real_rows_unchanged(real):
+    """Pad real steps with the config's own template rows, as a replay does, for two frames in a row."""
     sub = _tiny_submodule(seed=73)
     (config,) = sub.get_accelerator_graph_configs(torch.device("cpu"))
     bucket = next(size for size in config.capture_batch_sizes if size >= real)
     cases = [_random_inputs(n_emb=1, n_text=1 + i, n_user=3, seed=173 + i) for i in range(real)]
-    padded_runs, solo_runs, node_inputs, frames = [], [], [], []
-    for voice, persona, codes, meta in cases:
-        for runs in (padded_runs, solo_runs):
-            run = _Run(sub, meta, voice, persona, codes)
-            _, state = run.walk(cfg.CONDITIONING_WALK, None)
-            runs.append((run, state))
-        run, state = padded_runs[-1]
-        node_inputs.append(sub.prepare_inputs(cfg.GENERATE_WALK, SimpleNamespace(step_metadata=meta),
-                                              {**run.static, "lm_state": [state]}))
-        run, state = solo_runs[-1]
-        frames.append(sub.prepare_frame(cfg.GENERATE_WALK, meta, {**run.static, "lm_state": [state]}))
-    padding = config.get_node_inputs(bucket - real, 0)
-    assert all("frame" not in inp.kwargs for inp in padding)
-    staged = sub.preprocess(cfg.GENERATE_WALK, None, [*node_inputs, *padding])
-    # Every row is on its first generate frame (1 step); template rows need the 8 the capture records.
-    assert staged["input_embeds"].shape[0] == bucket
-    assert staged["depth_steps"] == (cfg.AUDIO_CODEBOOKS_PER_STREAM if padding else 1)
-    staged["depth_steps"] = cfg.AUDIO_CODEBOOKS_PER_STREAM  # a replay runs the captured step
-    sub._backend = _RowBackends([run.backend for run, _ in padded_runs]
-                                + [DenseTemporalCache(TINY.num_layers, TINY.rope_theta) for _ in padding])
-    rids = [f"r{i}" for i in range(bucket)]
-    engine_inputs = SimpleNamespace(request_ids=rids, resources={
-        cfg.TEXT_SAMPLER: _GreedySampler(), cfg.DEPTH_SAMPLER: _GreedySampler()})
-    raw = sub.forward_batched(cfg.GENERATE_WALK, engine_inputs, **staged)
-    rows = raw.clone_row_outputs(real)  # the engine keeps only the real rows
-    assert all(tensor.shape[0] == real for tensor in rows.values())
-    want = [sub.run_frame(frame, run.backend, _greedy_text, _greedy_depth)
-            for frame, (run, _) in zip(frames, solo_runs, strict=True)]
-    for i, inp in enumerate(node_inputs):
-        outputs = {name: [tensor[i : i + 1]] for name, tensor in rows.items()}
-        sub.postprocess(rids[i], None, outputs, inp)
-        _assert_same_outputs(outputs, want[i], f"row {i} of {bucket}")
+    engine = _Engine(sub)
+    rids = [f"r{i}" for i in range(real)]
+    runs = [_Run(sub, c[3], *c[:3]) for c in cases]
+    want = [_Run(sub, c[3], *c[:3]).run_conditioning().run() for c in cases]
+    for rid, run in zip(rids, runs, strict=True):
+        engine.add(rid)
+        for _ in range(run.meta["conditioning_frames"]):
+            engine.step(cfg.CONDITIONING_WALK, [rid],
+                        [engine.prepare(cfg.CONDITIONING_WALK, rid, run.meta, run.static)], batched=False)
+    for j in range(3):
+        inputs = [engine.prepare(cfg.GENERATE_WALK, rid, run.meta, run.static)
+                  for rid, run in zip(rids, runs, strict=True)]
+        got = engine.step(cfg.GENERATE_WALK, rids, inputs, batched=True, bucket=bucket)
+        for i, rid in enumerate(rids):
+            _assert_same_outputs(got[rid], want[i][j], f"row {i} of {bucket}, frame {j}")
 
 
-def test_a_generate_frame_with_a_free_user_codebook_is_refused():
-    """The captured step runs 8 depth steps; a frame needing more must fail loudly, not replay short."""
-    provided = torch.ones(2, cfg.NUM_CODEBOOKS, dtype=torch.bool)
-    provided[:, 1 : 1 + cfg.AUDIO_CODEBOOKS_PER_STREAM] = False
-    assert LMSubmodule.depth_steps(cfg.GENERATE_WALK, provided) == cfg.AUDIO_CODEBOOKS_PER_STREAM
-    provided[1, cfg.NUM_CODEBOOKS - 1] = False
-    with pytest.raises(RuntimeError, match="user codebook"):
-        LMSubmodule.depth_steps(cfg.GENERATE_WALK, provided)
-    assert LMSubmodule.depth_steps(cfg.CONDITIONING_WALK, provided) == 0
+def test_sampler_adapter_rejects_malformed_tokens():
+    expected = torch.zeros(1, dtype=torch.long)
+    with pytest.raises(ValueError, match="text sampler must return shape \\(1,\\)"):
+        _sampled_token_ids(torch.zeros(1, 1, dtype=torch.int32), expected, "text sampler")
+    with pytest.raises(ValueError, match="depth sampler step 0 must return int32 or int64"):
+        _sampled_token_ids(torch.zeros(1), expected, "depth sampler step 0")
 
 
 @torch.no_grad()
 def test_forward_accepts_eager_int32_sampler_tokens():
     """Eager FlashInfer returns int32 IDs; both PersonaPlex samplers feed an int64 cache."""
-    class DenseForwardBackend(DenseTemporalCache):
-        def begin(self):
-            pass
 
     class Int32Sampler:
         def __init__(self):
@@ -679,36 +559,18 @@ def test_forward_accepts_eager_int32_sampler_tokens():
 
     sub = _tiny_submodule()
     voice, persona, codes, meta = _random_inputs(n_emb=1, n_text=1, n_user=1)
+    want = _Run(sub, meta, voice, persona, codes).run_conditioning().step()
     run = _Run(sub, meta, voice, persona, codes)
-    run.backend = DenseForwardBackend(TINY.num_layers, TINY.rope_theta)
-    _, state = run.walk(cfg.CONDITIONING_WALK, None)
-    node_inputs = sub.prepare_inputs(cfg.GENERATE_WALK, SimpleNamespace(step_metadata=meta),
-                                     {**run.static, "lm_state": [state]})
-    sub._backend = run.backend
-    text_sampler, depth_sampler = Int32Sampler(), Int32Sampler()
-    engine_inputs = SimpleNamespace(request_ids=["request"], resources={
-        cfg.TEXT_SAMPLER: text_sampler, cfg.DEPTH_SAMPLER: depth_sampler,
-    })
-    got = _engine_step(sub, cfg.GENERATE_WALK, engine_inputs, [node_inputs], batched=False)["request"]
-    assert (text_sampler.calls, depth_sampler.calls) == (1, 1)  # first generate frame: depth step 0 only
-
-    reference = _Run(sub, meta, voice, persona, codes)
-    _, reference_state = reference.walk(cfg.CONDITIONING_WALK, None)
-    reference_frame = sub.prepare_frame(cfg.GENERATE_WALK, meta, {
-        **reference.static, "lm_state": [reference_state],
-    })
-    want = sub.run_frame(reference_frame, reference.backend, _greedy_text, _greedy_depth)
-    assert got.keys() == want.keys()
-    for name in got:
-        assert all(torch.equal(actual, expected) for actual, expected in zip(got[name], want[name], strict=True))
-
-
-def test_sampler_adapter_rejects_malformed_tokens():
-    expected = torch.zeros(1, dtype=torch.long)
-    with pytest.raises(ValueError, match="text sampler must return shape \\(1,\\)"):
-        _sampled_token_ids(torch.zeros(1, 1, dtype=torch.int32), expected, "text sampler")
-    with pytest.raises(ValueError, match="depth sampler step 0 must return int32 or int64"):
-        _sampled_token_ids(torch.zeros(1), expected, "depth sampler step 0")
+    engine = _Engine(sub)
+    engine.add("request")
+    for _ in range(meta["conditioning_frames"]):
+        engine.step(cfg.CONDITIONING_WALK, ["request"],
+                    [engine.prepare(cfg.CONDITIONING_WALK, "request", meta, run.static)], batched=False)
+    text, depth = Int32Sampler(), Int32Sampler()
+    got = engine.step(cfg.GENERATE_WALK, ["request"], [engine.prepare(cfg.GENERATE_WALK, "request", meta, run.static)],
+                      batched=False, text=text, depth=depth)["request"]
+    assert (text.calls, depth.calls) == (1, EIGHT)
+    _assert_same_outputs(got, want, "int32")
 
 
 def test_bf16_kv_hint_does_not_autocast_lm_or_mimi():
@@ -719,59 +581,52 @@ def test_bf16_kv_hint_does_not_autocast_lm_or_mimi():
     assert resolve_node_dtype(_tiny_submodule(), model.get_autocast_dtype()) is None
 
 
-def test_declare_step_declares_samplers_only_on_generate_walks():
+def test_declare_step_addresses_the_cache_on_every_walk_and_samplers_only_on_generate():
     sub = _tiny_submodule()
     inputs = [SimpleNamespace(input_seq_len=1)]
     cond = sub.declare_step(cfg.CONDITIONING_WALK, ["r"], inputs)
-    assert set(cond.steps) == {cfg.LM_KV, cfg.LM_ATTN, cfg.LM_POS}
+    assert set(cond.steps) == {cfg.LM_KV, cfg.LM_ATTN, cfg.LM_POS, cfg.LM_CACHE}
     assert cond.steps[cfg.LM_ATTN].causal is True
     for walk in (cfg.GENERATE_WALK, cfg.GENERATE_AUDIO_WALK):
         gen = sub.declare_step(walk, ["r"], inputs)
-        assert set(gen.steps) == {cfg.LM_KV, cfg.LM_ATTN, cfg.LM_POS, cfg.TEXT_SAMPLER, cfg.DEPTH_SAMPLER}
+        assert set(gen.steps) == {cfg.LM_KV, cfg.LM_ATTN, cfg.LM_POS, cfg.LM_CACHE, cfg.TEXT_SAMPLER, cfg.DEPTH_SAMPLER}
         assert [(s.request_id, s.label, s.span) for s in gen.segments] == [("r", "main", 1)]
 
 
 @torch.no_grad()
-def test_conditioning_rejects_an_unforced_target():
+def test_prepare_inputs_validation_and_engine_hooks():
     sub = _tiny_submodule()
     voice, persona, codes, meta = _random_inputs()
-    frame = sub.prepare_frame(cfg.CONDITIONING_WALK, meta, {
-        "voice_embeddings": [voice["embeddings"]], "voice_cache": [voice["cache"]],
-        "persona_tokens": [persona], "lm_state": []})
-    frame.cache.provided[:, 3, frame.cache.offset % cfg.CACHE_SIZE] = False
-    with pytest.raises(RuntimeError, match="unprovided"):
-        sub.run_frame(frame, DenseTemporalCache(2, 10000), _greedy_text, _greedy_depth)
-
-
-@torch.no_grad()
-def test_lm_frame_validation_and_engine_hooks():
-    sub = _tiny_submodule()
-    voice, persona, codes, meta = _random_inputs()
-    with pytest.raises(ValueError, match="needs the conditioning lm_state"):
-        sub.prepare_frame(cfg.GENERATE_WALK, meta, {"user_audio_codes": [codes], "lm_state": []})
-    early = DelayedTokenCache(1).state_tensor(2)
-    with pytest.raises(ValueError, match="before this walk's first frame"):
-        sub.prepare_frame(cfg.GENERATE_WALK, meta, {"user_audio_codes": [codes], "lm_state": [early]})
-    with pytest.raises(ValueError, match="disagree"):
-        sub.prepare_frame(cfg.CONDITIONING_WALK, {**meta, "num_text_tokens": 9}, {
-            "voice_embeddings": [voice["embeddings"]], "voice_cache": [voice["cache"]],
-            "persona_tokens": [persona], "lm_state": []})
-    with pytest.raises(ValueError, match="unknown"):
-        sub.prepare_frame("decode", meta, {})
-    fwd_info = SimpleNamespace(step_metadata=meta)
+    engine = _Engine(sub)
+    engine.add("r")
     inputs = {"voice_embeddings": [voice["embeddings"]], "voice_cache": [voice["cache"]],
-              "persona_tokens": [persona], "lm_state": []}
-    node_inputs = sub.prepare_inputs(cfg.CONDITIONING_WALK, fwd_info, inputs)
+              "persona_tokens": [persona], "user_audio_codes": [codes]}
+    with pytest.raises(ValueError, match="unknown"):
+        engine.prepare("decode", "r", meta, inputs)
+    with pytest.raises(ValueError, match="disagree"):
+        engine.prepare(cfg.CONDITIONING_WALK, "r", {**meta, "num_text_tokens": 9}, inputs)
+    node_inputs = engine.prepare(cfg.CONDITIONING_WALK, "r", meta, inputs)
     assert node_inputs.input_seq_len == 1 and node_inputs.input_embeds.shape == (1, TINY.dim)
-    frame = node_inputs.kwargs["frame"]
-    # preprocess hands the forward tensors only; the cache stays on the request's inputs for postprocess.
-    assert node_inputs.tensor_inputs["target"].shape == node_inputs.tensor_inputs["provided"].shape == (1, 17)
+    # The engine may prepare a frame again; the host cache must not advance twice.
+    assert engine.prepare(cfg.CONDITIONING_WALK, "r", meta, inputs) is node_inputs
     staged = sub.preprocess(cfg.CONDITIONING_WALK, None, [node_inputs, node_inputs])
-    assert set(staged) == {"input_embeds", "target", "provided", "depth_steps"} and staged["depth_steps"] == 0
-    assert staged["input_embeds"].shape == (2, TINY.dim) and staged["target"].shape == (2, 17)
-    assert torch.equal(staged["target"][1], frame.cache.target[0, :, 0])
+    assert set(staged) == {"input_embeds", "tokens", "provided", "offset"}
+    assert staged["input_embeds"].shape == (2, TINY.dim) and staged["tokens"].shape == (2, 17, 4)
     with pytest.raises(RuntimeError, match="not bound"):
         sub.forward(cfg.CONDITIONING_WALK, None, **staged)
+    engine.iters["r"][cfg.CONDITIONING_LOOP] = 2
+    with pytest.raises(RuntimeError, match="prepared after"):
+        engine.prepare(cfg.CONDITIONING_WALK, "r", meta, inputs)
+    engine.iters["r"][cfg.CONDITIONING_LOOP] = meta["conditioning_frames"]
+    assert engine.prepare(cfg.CONDITIONING_WALK, "r", meta, inputs) is None  # an overshoot is skipped
+    state = sub.request_state(engine.handles["r"])
+    assert sub.PROGRESS_KEY in state
+    generate = engine.prepare(cfg.GENERATE_WALK, "r", meta, inputs)
+    assert sub.PROGRESS_KEY not in state  # conditioning is over
+    assert torch.equal(generate.tensor_inputs["user_frame"], codes[:, :, 0])
+    assert set(sub.preprocess(cfg.GENERATE_WALK, None, [generate])) == {"user_frame"}
+    with pytest.raises(ValueError, match="user_audio_codes"):
+        engine.prepare(cfg.GENERATE_WALK, "r", {**meta, "num_user_frames": 9}, inputs)
     # One row takes the unbatched forward; the cap is the model kwarg.
     assert sub.can_batch(None, [node_inputs]) is False
     assert sub.can_batch(None, [node_inputs, node_inputs]) is True
@@ -854,17 +709,10 @@ def test_resource_backend_wires_label_layers_and_interleaved_rope(monkeypatch):
     assert {(label, kw["interleave"], kw["rope_theta"]) for label, kw in pos.calls} == {("main", True, 10000.0)}
 
 
-def test_check_stop_ignores_other_walks_and_missing_state():
+def test_stop_is_declared_on_the_lm_walks_only():
     sub = _tiny_submodule()
-    meta = _meta(3, 4, 5)
-    state = DelayedTokenCache(1).state_tensor(meta["conditioning_frames"])
-    info = SimpleNamespace(graph_walk=cfg.CONDITIONING_WALK, step_metadata=meta)
-    assert sub.check_stop("r", info, {"lm_state": [state]}) == {cfg.CONDITIONING_LOOP}
-    assert sub.check_stop("r", info, {}) == set()
-    gen = SimpleNamespace(graph_walk=cfg.GENERATE_AUDIO_WALK, step_metadata=meta)
-    assert sub.check_stop("r", gen, {"lm_state": [state]}) == set()
-    end = DelayedTokenCache(1).state_tensor(meta["conditioning_frames"] + 5)
-    assert sub.check_stop("r", gen, {"lm_state": [end]}) == {cfg.DECODE_LOOP}
+    assert all(sub.get_stop_policies(walk) == {} for walk in LM_WALKS)
+    assert sub.get_stop_policies(cfg.CODEC_WALK) is None
 
 
 def test_build_lm_loads_strictly_in_bf16():
@@ -913,9 +761,9 @@ def test_lm_submodule_conditioning_and_generate_match_nvidia_lmgen():
         return hidden, logits
 
     lm.temporal.forward_embeddings = record_forward
-    cond, state = run.walk(cfg.CONDITIONING_WALK, None)
-    gen, state = run.walk(cfg.GENERATE_WALK, state)
-    assert len(cond) + len(gen) == len(records) == len(seen)
+    gen = run.run_conditioning().run()
+    cond_frames = meta["conditioning_frames"]
+    assert cond_frames + len(gen) == len(records) == len(seen)
     for index, (record, (hidden, logits)) in enumerate(zip(records, seen, strict=True)):
         what = f"forward {index} {record['phase']}"
         torch.testing.assert_close(hidden, record["transformer_out"][:, 0], rtol=1e-5, atol=1e-5, msg=what)
@@ -923,7 +771,7 @@ def test_lm_submodule_conditioning_and_generate_match_nvidia_lmgen():
             torch.testing.assert_close(logits, record["text_logits"][:, 0, 0], rtol=1e-5, atol=1e-5, msg=what)
         else:
             assert logits is None, what  # conditioning skips the text head
-    for out, record in zip(gen, records[len(cond):], strict=True):
+    for out, record in zip(gen, records[cond_frames:], strict=True):
         assert torch.equal(out["agent_frame"][0], record["output"][:, 1:9]), record["phase"]
         assert torch.equal(out["text_frame"][0], record["output"][:, 0, 0]), record["phase"]
 
@@ -1320,9 +1168,7 @@ def test_offline_components_match_nvidia_with_reference_user_codes():
 
     # This is component parity, not uninterrupted M* encoder-to-LM parity: the
     # near-tie above changes a code, so downstream stages use NVIDIA's codes.
-    run = _Run(LMSubmodule(lm), meta, preset, persona, reference_codes)
-    _, state = run.walk(cfg.CONDITIONING_WALK, None)
-    generated, _ = run.walk(cfg.GENERATE_WALK, state)
+    generated = _Run(LMSubmodule(lm), meta, preset, persona, reference_codes).run_conditioning().run()
     assert [int(out["text_frame"][0]) for out in generated] == data["text_tokens"]
 
     decoder = MimiDecoderSubmodule(codec)
