@@ -108,6 +108,16 @@ def local_indptrs(placement: ContextParallel, indptrs: PagedIndptrs, page_size: 
     ), valid
 
 
+def _check_kernel(kernel, contract: str):
+    """``kernel``, refused at construction unless it subclasses the ``attn.wrappers`` ``contract``
+    (imported here: placement validation reads this module without attention's kernels)."""
+    from mstar.engine.resources.attn import wrappers
+
+    if not isinstance(kernel, getattr(wrappers, contract)):
+        raise ValueError(f"attention over a placed pool needs a {contract}, not a {type(kernel).__name__}")
+    return kernel
+
+
 def _masked(out: torch.Tensor, lse: torch.Tensor, valid: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """A partial over this rank's slots with each query row ``valid`` (``[N]``) marks as holding none
     of them set to out 0, lse -inf, whatever the kernel left there (a select, so a NaN cannot
@@ -266,12 +276,13 @@ class ContextParallelWrapper(ABC):
         placement: ContextParallel,
         page_size: int,
         dtype: torch.dtype,
-        context,
-        new,
+        context: "PagedKernel",
+        new: "WholeRowsKernel | ZigzagWrapper | None",
         device: torch.device,
         batch_size: int | None = None,
         max_total_tokens: int | None = None,
     ):
+        _check_kernel(context, "PagedKernel")
         self._placement, self._page_size, self._dtype = placement, page_size, dtype
         self.context = context
         # None for a one-token-a-row step
@@ -446,7 +457,7 @@ class TPContextParallelWrapper(ContextParallelWrapper):
 
     @classmethod
     def own_tokens(cls, kernels, placement, device, dtype, workspace, kwargs, max_total_tokens):
-        return kernels.whole_rows_kernel(workspace, kwargs, max_total_tokens)
+        return _check_kernel(kernels.whole_rows_kernel(workspace, kwargs, max_total_tokens), "WholeRowsKernel")
 
     @classmethod
     def rank_plans(cls, placement, qo_indptr, num_qo_heads, own_kernel, bucket):
@@ -587,6 +598,8 @@ class ZigzagWrapper:
     ``run`` drops."""
 
     def __init__(self, placement: SPPlacement, kernel: OwnTokensKernel, device: torch.device):
+        if not isinstance(kernel, OwnTokensKernel):
+            raise ValueError(f"a zigzag share runs on an OwnTokensKernel, not a {type(kernel).__name__}")
         self._placement, self.kernel, self._device = placement, kernel, device
         self._stager = PinnedStager(torch.int64)
         self._bucket_tokens = 0 if kernel.captured is None else kernel.captured.tokens

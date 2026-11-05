@@ -36,6 +36,7 @@ from mstar.engine.resources.attn.wrappers import PagedKernel
 from mstar.engine.resources.base import EngineResourceInfo, Resource
 from mstar.engine.resources.context_parallel import (
     OneSlotPages,
+    SPContextParallelWrapper,
     SPPlacement,
     ZigzagWrapper,
     local_indptrs,
@@ -665,6 +666,16 @@ def test_zigzag_rows_split_a_steps_tokens_over_the_ranks_with_equal_causal_work(
             assert len(work) == 1, work
 
 
+class _IdleContext(PagedKernel):
+    """A context kernel for a test of the own-token part alone."""
+
+    def plan(self, **kwargs):
+        pass
+
+    def run(self, *parts, return_lse=False):
+        raise AssertionError("the context isn't run here")
+
+
 class _OneSlotPrefill(PagedKernel):
     """A paged prefill as ``OneSlotPages`` plans it, as torch math over its pages of one token."""
 
@@ -679,6 +690,17 @@ class _OneSlotPrefill(PagedKernel):
             for (a, b), (c, d) in zip(itertools.pairwise(self.qo), itertools.pairwise(self.kv), strict=True)
         ]
         return torch.cat([out for out, _ in parts]), torch.cat([lse for _, lse in parts])
+
+
+def test_placed_attention_refuses_a_kernel_outside_its_contract():
+    """A backend's kernels are checked when they are built, not when a step first runs them."""
+    placement = SPPlacement(P, 0, CommGroup.trivial())
+    with pytest.raises(TypeError, match="abstract"):
+        type("NoRun", (PagedKernel,), {"plan": lambda self, **kwargs: None})()
+    with pytest.raises(ValueError, match="PagedKernel"):
+        SPContextParallelWrapper(placement, CP_PAGE, torch.float32, types.SimpleNamespace(), None, CPU)
+    with pytest.raises(ValueError, match="OwnTokensKernel"):
+        ZigzagWrapper(placement, _OneSlotPrefill(), CPU)
 
 
 @pytest.mark.parametrize("causal", [True, False], ids=["causal", "noncausal"])
@@ -811,7 +833,7 @@ def test_a_captured_buckets_padding_merges_to_0_and_reaches_no_real_row(monkeypa
     monkeypatch.setenv("MSTAR_WORKSPACE_BUFFER_MB", "1")
     monkeypatch.setitem(sys.modules, "flashinfer", _reference_flashinfer())
     # the captured context wrapper stages its plan through a CUDA event; this needs only the own part
-    context = types.SimpleNamespace(plan=lambda **kwargs: None, _qo_indptr_buf=None)
+    context = _IdleContext()
     monkeypatch.setattr(fi_mod, "FlashInferPrefillWrapper", lambda **kwargs: context)
     joint = JointGroups(tp_group=_group(0, P), sp_group=CommGroup.trivial())
     attn, placement = _cp_attention(joint, CPU, torch.float32)
@@ -844,7 +866,7 @@ def test_a_dropped_preplan_leaves_its_own_token_wrappers_nothing_to_skip(monkeyp
     monkeypatch.setattr(fi.BatchPrefillWithRaggedKVCacheWrapper, "plan", counted)
     monkeypatch.setitem(sys.modules, "flashinfer", fi)
     # the captured context wrapper stages its plan through a CUDA event; this needs only the own part
-    context = types.SimpleNamespace(plan=lambda **kwargs: None, _qo_indptr_buf=None)
+    context = _IdleContext()
     monkeypatch.setattr(fi_mod, "FlashInferPrefillWrapper", lambda **kwargs: context)
     joint = JointGroups(tp_group=_group(0, P), sp_group=CommGroup.trivial())
     attn, _ = _cp_attention(joint, CPU, torch.float32)
