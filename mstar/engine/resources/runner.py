@@ -456,8 +456,8 @@ class StepRunner:
             rid, node_name, graph_walk, published, self._sweep(self._node_ask_order, self._ask_order, node_name),
         )
 
-    def readmit(self, rid: str, node_name: str) -> None:
-        self._admission.readmit(rid, node_name, self._sweep(self._node_ask_order, self._ask_order, node_name))
+    def readmit(self, rid: str, node_name: str, queued: bool) -> None:
+        self._admission.readmit(rid, node_name, self._sweep(self._node_ask_order, self._ask_order, node_name), queued)
 
     def newer_than(self, rid: str) -> list[str] | None:
         return self._admission.newer_than(rid)

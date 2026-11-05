@@ -74,13 +74,13 @@ def _worker(kv):
     """The real handlers over one pool, with the engine's drop going straight to the pool and its runner."""
     def drop_request(node, rid, tokens):
         freed = kv.drop(rid, tokens)
-        _runner(kv).readmit(rid, node)
+        _runner(kv).readmit(rid, node, queued=True)
         return freed
 
     engine = _Engine(
         drop_refusal=lambda node, rid, tokens: kv.check_drop(rid, tokens), drop_request=drop_request,
         offload_request=lambda node, rid: _offload(kv, rid),
-        readmit_request=lambda node, rid: _runner(kv).readmit(rid, node),
+        readmit_request=lambda node, rid, queued: _runner(kv).readmit(rid, node, queued),
         newer_than=lambda rid: _runner(kv).newer_than(rid),
         oldest_refusal=lambda: _runner(kv).oldest_refusal(),
         paged_kv_caches=lambda: [PagedKVCache("kv", frozenset({NODE}), kv)],
@@ -289,7 +289,7 @@ def test_an_older_request_that_asks_after_a_newer_one_parks_moves_it():
     _running(kv, "o", 4, arrival=1)
     _running(kv, "z", 6, arrival=3)
     assert _preempt(kv, "z", _short(kv, "z"), droppable=lambda rid: False).waits
-    _runner(kv).readmit("z", NODE)
+    _runner(kv).readmit("z", NODE, queued=False)
     _request(kv, "p", 5, arrival=2)
     assert not _ready(kv, "p") and not _admitted(kv, "z")
     _remove(kv, "x")
