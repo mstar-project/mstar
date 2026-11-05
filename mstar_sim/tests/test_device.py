@@ -620,6 +620,19 @@ def test_timing_only_holds_shapes_not_values():
             assert never_computed(out._data)
         else:
             raise AssertionError("multinomial of zeros passed")
+        # so does one refused at a replay, whose probe runs under the caller's default device
+        from mstar_sim import device as emulated
+        zeros, eight, graph = stand_in().long(), torch.full((2, 4), 8, device="cuda"), torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            eight // zeros
+        refused = emulated.VALUE_SHAPES[0]
+        with torch.device("meta"):
+            try:
+                graph.replay()
+                raise AssertionError("a divide by zeros replayed")
+            except RuntimeError as e:
+                assert "ZeroDivision" in str(e), e
+        assert emulated.VALUE_SHAPES[0] == refused + 1
         # a computed mask selects its rows of a value-less tensor, each mask its own
         rows = torch.empty(8192, 16, device="cuda")
         for step in (2, 4):

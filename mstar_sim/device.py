@@ -624,8 +624,8 @@ def _passes_on_other_values(func, args, kwargs) -> bool:
             old = spans.get(key(x), (lo, hi))
             spans[key(x)] = (min(lo, old[0]), max(hi, old[1]))
     for fill in (0, 1):
-        buffers = {k: torch.rand(hi - lo).to(k[1]) if _floating(torch.empty(0, dtype=k[1]))
-                   else torch.full((hi - lo,), fill, dtype=k[1]) for k, (lo, hi) in spans.items()}
+        buffers = {k: torch.rand(hi - lo, device="cpu").to(k[1]) if k[1].is_floating_point or k[1].is_complex
+                   else torch.full((hi - lo,), fill, dtype=k[1], device="cpu") for k, (lo, hi) in spans.items()}
 
         def other(x, buffers=buffers):
             if not isinstance(x, torch.Tensor) or not never_computed(x):
