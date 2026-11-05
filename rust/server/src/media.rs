@@ -758,6 +758,48 @@ pub fn check_audio_format(fmt: &str, stream: bool) -> Result<String, String> {
     ))
 }
 
+/// Is `response_format` one this frontend can stream — `media_io.audio_formats
+/// (stream=True)`, which is `("wav", "pcm")` on both frontends? Read by the
+/// speech route to answer Python's `stream_format` rule: the switch only forces
+/// streaming for a format that is actually streamable, so the SDK's default mp3
+/// still falls back to one whole body.
+pub fn is_streamable_audio_format(fmt: &str) -> bool {
+    let fmt = if fmt.is_empty() { "wav".to_string() } else { fmt.to_lowercase() };
+    matches!(fmt.as_str(), "wav" | "pcm")
+}
+
+/// Python's `repr` of a JSON value, for a refusal that quotes a client's value
+/// of whatever type as the Python frontend's `{value!r}` does (`stream_format`
+/// reaches `create_speech` as whatever pydantic parsed into `model_extra`).
+pub fn py_repr_json(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::Null => "None".to_string(),
+        serde_json::Value::Bool(true) => "True".to_string(),
+        serde_json::Value::Bool(false) => "False".to_string(),
+        // Python's repr of a float always carries a point; serde keeps the
+        // integer/float split JSON made, so an int prints as an int.
+        serde_json::Value::Number(n) => match n.as_f64() {
+            Some(f) if n.as_i64().is_none() && n.as_u64().is_none() => {
+                let s = format!("{f}");
+                if s.contains(['.', 'e', 'E', 'n', 'i']) { s } else { format!("{s}.0") }
+            }
+            _ => n.to_string(),
+        },
+        serde_json::Value::String(s) => py_repr(s),
+        serde_json::Value::Array(items) => format!(
+            "[{}]",
+            items.iter().map(py_repr_json).collect::<Vec<_>>().join(", ")
+        ),
+        serde_json::Value::Object(map) => format!(
+            "{{{}}}",
+            map.iter()
+                .map(|(k, v)| format!("{}: {}", py_repr(k), py_repr_json(v)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
 /// Python's `repr` of a str, for a refusal that quotes the client's value as
 /// the Python frontend's does.
 fn py_repr(s: &str) -> String {
@@ -1264,5 +1306,40 @@ mod tests {
     fn connection_failure_does_not_echo_transport_details() {
         let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
         refused(&format!("http://127.0.0.1:{port}/a.png"), &local(), "connection failed");
+    }
+    /// `media_io.audio_formats(stream=True)` is `("wav", "pcm")`; an unset
+    /// `response_format` reads as `wav`, as `(req.response_format or "wav")` does.
+    #[test]
+    fn only_wav_and_pcm_can_be_streamed() {
+        for fmt in ["wav", "WAV", "pcm", "PCM", ""] {
+            assert!(is_streamable_audio_format(fmt), "{fmt:?}");
+        }
+        for fmt in ["mp3", "MP3", "flac", "opus", "aac", "ogg", "nonsense"] {
+            assert!(!is_streamable_audio_format(fmt), "{fmt:?}");
+        }
+    }
+
+    /// `repr` of a value of any JSON type, for a 400 that quotes what the
+    /// client sent the way Python's `{value!r}` does.
+    #[test]
+    fn repr_of_a_json_value_reads_as_pythons() {
+        for (body, want) in [
+            ("null", "None"),
+            ("true", "True"),
+            ("false", "False"),
+            ("7", "7"),
+            ("-7", "-7"),
+            ("1.5", "1.5"),
+            ("1.0", "1.0"),
+            ("1e3", "1000.0"),
+            (r#""sse""#, "'sse'"),
+            (r#"["sse",1,null]"#, "['sse', 1, None]"),
+            ("[]", "[]"),
+            (r#"{"a":1,"b":[true]}"#, "{'a': 1, 'b': [True]}"),
+            ("{}", "{}"),
+        ] {
+            let v: serde_json::Value = serde_json::from_str(body).unwrap();
+            assert_eq!(py_repr_json(&v), want, "{body}");
+        }
     }
 }

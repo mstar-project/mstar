@@ -10,6 +10,7 @@ input), the status and body of each refusal, and the response bytes, headers
 and HTTP chunks. Skipped unless the ``mstar_rust`` extension, the server
 binary and fastapi are installed."""
 import asyncio
+import base64
 import json
 import random
 import re
@@ -177,6 +178,15 @@ SPEECH_CASES = {
     # frontends cut here in the same place only while both read the
     # interpreter's (see rust/server/src/unicode_marks.rs)
     "mark-on-an-even-cut": {"input": "a" * 267 + "\u0897" + "b" * 533, "sentence_chunking": True},
+    # OpenAI's own streaming switch, which its SDK (and so LiveKit's TTS
+    # plugin) sends instead of ``stream``: it streams on its own, and ``"sse"``
+    # wraps the bytes in ``speech.audio.delta`` events. An explicit ``null`` is
+    # "not sent" on both frontends.
+    "stream-format-sse": {"input": "Hi there, friend.", "voice": "ryan", "stream_format": "sse"},
+    "stream-format-sse-pcm": {"input": LONG, "stream_format": "sse", "response_format": "pcm", "seed": 3},
+    "stream-format-audio": {"input": "Hi.", "voice": "ryan", "stream_format": "audio"},
+    "stream-format-audio-pcm": {"input": LONG, "stream_format": "audio", "response_format": "pcm"},
+    "stream-format-null": {"input": "Hi.", "stream_format": None},
 }
 
 
@@ -212,6 +222,15 @@ REFUSALS = {
                                     "sentence_chunking": "yes", "stream": True}),
     "engine-refusal-stream": ("qwen3_tts_1p7b", {"input": "please refuse", "stream": True}),
     "engine-refusal": ("qwen3_tts_1p7b", {"input": "please refuse"}),
+    # stream_format takes "audio" and "sse"; anything else is refused before
+    # any work, quoting what the client sent the way Python's `{!r}` does
+    "stream-format-wav": ("qwen3_tts_1p7b", {"input": "Hi.", "stream_format": "wav"}),
+    "stream-format-case": ("qwen3_tts_1p7b", {"input": "Hi.", "stream_format": "SSE"}),
+    "stream-format-empty": ("qwen3_tts_1p7b", {"input": "Hi.", "stream_format": ""}),
+    "stream-format-true": ("qwen3_tts_1p7b", {"input": "Hi.", "stream_format": True}),
+    "stream-format-int": ("qwen3_tts_1p7b", {"input": "Hi.", "stream_format": 1}),
+    "stream-format-list": ("qwen3_tts_1p7b", {"input": "Hi.", "stream_format": ["sse"]}),
+    "stream-format-quote": ("orpheus", {"input": "Hi.", "stream_format": "it's"}),
     "second-piece-refused": ("qwen3_tts_1p7b", {"input": LONG + " Now refuse this one."}),
     "no-speech": ("qwen3_5_0.8b", {"input": "Hi."}),
 }
@@ -262,6 +281,84 @@ def test_a_streamed_speech_is_framed_as_the_python_route_frames_it(text, fmt, tm
     if fmt == "wav":
         assert python[0] == (b"RIFF\xff\xff\xff\xffWAVEfmt \x10\x00\x00\x00\x01\x00\x01\x00"
                              b"\xc0\x5d\x00\x00\x80\xbb\x00\x00\x02\x00\x10\x00data\xff\xff\xff\xff")
+
+
+@pytest.mark.parametrize("fmt", ["wav", "pcm"])
+@pytest.mark.parametrize("text", ["Short.", LONG], ids=["one-piece", "three-pieces"])
+def test_an_sse_speech_stream_is_framed_as_the_python_route_frames_it(text, fmt, tmp_path):
+    """``stream_format="sse"``: one ``speech.audio.delta`` per piece the raw
+    stream writes (the open-ended WAV header among them, which is a piece of its
+    own), then ``speech.audio.done``, each its own HTTP chunk."""
+    body = {"input": text, "stream_format": "sse", "response_format": fmt, "voice": "ryan"}
+    stub = _RustSpeechStub()
+    with _model_stack("qwen3_tts_1p7b", stub) as (port, _upload):
+        status, headers, chunks = _http(port, body)
+    python = asyncio.run(_python_pieces("qwen3_tts_1p7b", dict(body), tmp_path))
+    assert (status, headers.get("content-type")) == (200, "text/event-stream; charset=utf-8")
+    assert chunks == [piece.encode() for piece in python]
+    events = [json.loads(c.removeprefix(b"data: ")) for c in chunks]
+    assert [e["type"] for e in events] == ["speech.audio.delta"] * (len(events) - 1) + ["speech.audio.done"]
+    # the deltas carry exactly what the un-wrapped stream would have written
+    raw = {**{k: v for k, v in body.items() if k != "stream_format"}, "stream": True}
+    assert b"".join(base64.b64decode(e["audio"]) for e in events[:-1]) == b"".join(
+        asyncio.run(_python_pieces("qwen3_tts_1p7b", raw, tmp_path)))
+
+
+def test_an_sse_speech_stream_ends_a_failure_with_an_in_band_error_event(tmp_path):
+    """A refusal on a later piece arrives after the 200, so both frontends end
+    the stream with an ``error`` event and no ``speech.audio.done``."""
+    body = {"input": LONG + " Now please refuse this one.", "stream_format": "sse"}
+    stub = _RustSpeechStub()
+    with _model_stack("qwen3_tts_1p7b", stub) as (port, _upload):
+        status, headers, chunks = _http(port, body)
+    python = asyncio.run(_python_pieces("qwen3_tts_1p7b", dict(body), tmp_path))
+    assert (status, headers.get("content-type")) == (200, "text/event-stream; charset=utf-8")
+    assert chunks == [piece.encode() for piece in python]
+    events = [json.loads(c.removeprefix(b"data: ")) for c in chunks]
+    assert events[-1] == {"type": "error", "error": {
+        "message": "input refused by the model", "type": "invalid_request_error", "code": 400}}
+    assert [e["type"] for e in events[:-1]] == ["speech.audio.delta"] * (len(events) - 1)
+
+
+@pytest.mark.parametrize("sf", ["audio", "sse"])
+def test_stream_format_does_not_stream_a_compressed_container(sf, tmp_path, monkeypatch):
+    """``stream_format`` forces a stream only for a format that can be streamed,
+    so the OpenAI SDK's default mp3 still answers as one whole body. Neither
+    frontend encodes mp3, so what each says is its own non-streaming refusal —
+    the very answer it gives with the field left out, and not the "cannot be
+    streamed" one ``stream: true`` draws, which is how the branch each took
+    shows. The two agree on the streamed refusal's wording."""
+    plain = {"input": "Hi.", "response_format": "mp3"}
+    switched, streamed = {**plain, "stream_format": sf}, {**plain, "stream": True}
+    stub = _RustSpeechStub()
+    with _model_stack("qwen3_tts_1p7b", stub) as (port, _upload):
+        rust = [_rust_answer(port, stub, b) for b in (plain, switched, streamed)]
+    python = [_python_answer("qwen3_tts_1p7b", b, tmp_path, monkeypatch)
+              for b in (plain, switched, streamed)]
+    for frontend in (rust, python):
+        was_plain, was_switched, was_streamed = frontend
+        assert was_switched == was_plain, "stream_format changed a compressed answer"
+        assert (was_switched[0], was_streamed[0]) == (400, 400), frontend
+        assert "cannot be streamed" in json.loads(was_streamed[3])["error"]["message"]
+        assert "cannot be streamed" not in json.loads(was_switched[3])["error"]["message"]
+        assert was_switched[4] == [], "a format it cannot write must not reach the engine"
+    assert json.loads(rust[2][3]) == json.loads(python[2][3])
+
+
+def test_stream_format_is_not_forwarded_as_a_model_kwarg(tmp_path, monkeypatch):
+    """Both frontends keep OpenAI's switch out of the engine's kwargs: the
+    Python route pops it from ``model_extra`` before the adapter maps the
+    request, and the Rust ``SpeechRequest`` declares it, so it never lands in
+    the flattened ``extra`` that becomes ``model_kwargs``."""
+    body = {"input": "Hi.", "stream_format": "sse", "voice": "ryan", "seed": 4, "top_k": 30}
+    stub = _RustSpeechStub()
+    with _model_stack("qwen3_tts_1p7b", stub) as (port, _upload):
+        rust = _rust_answer(port, stub, body)
+    python = _python_answer("qwen3_tts_1p7b", body, tmp_path, monkeypatch)
+    assert rust == python and rust[0] == 200, rust
+    assert rust[4] and all(s["streaming"] for s in rust[4])
+    assert all("stream_format" not in s["mk"] for s in rust[4] + python[4])
+    assert [s["mk"] for s in rust[4]] == [{"seed": 4, "top_k": 30, "voice": "ryan"}]
 
 
 def test_split_sentences_matches_python_on_random_long_inputs(tmp_path, monkeypatch):
