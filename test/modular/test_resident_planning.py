@@ -327,7 +327,7 @@ def test_a_repeat_carries_every_loop_back_signal_and_keeps_a_column_per_replay()
         graph=Graph(), static_inputs={"input_ids": ids, "input_embeds": embeds_in, "step": step_in},
         static_outputs=SimpleNamespace(
             check_stop_buffers={"new_token": tokens, "text_inputs": tokens},
-            row_outputs={"frame": frames, "embeds": embeds, "step": step}, output_spans=None,
+            row_outputs={"frame": frames, "embeds": embeds, "step": step}, output_spans=None, packed_outputs={},
         ),
     )
     carries = {

@@ -3,7 +3,8 @@
 ``replay_run`` runs ``forward`` once as the first replay a step stages, then
 ``AcceleratorGraphRunner.repeat`` for the rest: each replay reads its static
 inputs (what the last replay carried in, its iteration inputs' column) and
-writes its outputs in place, as a captured graph does. A model's test runs
+writes its outputs in place, as a captured graph does. An output named
+``__name__`` is a packed output (one row a request), the rest row outputs. A model's test runs
 the same forward N times by hand and compares.
 """
 from __future__ import annotations
@@ -22,7 +23,7 @@ def replay_run(
 ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
     """``forward(**static) -> {name: [rows, ...]}`` replayed ``repeats``
     times; the stop buffers and the ``columns``' outputs, a column a replay."""
-    first = {name: value.clone() for name, value in static.items()}
+    first = {name: value.clone() if isinstance(value, torch.Tensor) else value for name, value in static.items()}
     for name, column in (iteration or {}).items():
         first[name] = column[:, 0].clone()
     static.update(first)
@@ -34,7 +35,9 @@ def replay_run(
                 outputs[name].copy_(tensor)
 
     slot = SimpleNamespace(graph=Graph(), static_inputs=static, static_outputs=SimpleNamespace(
-        check_stop_buffers={name: outputs[name] for name in stop_buffers}, row_outputs=outputs, output_spans=None,
+        check_stop_buffers={name: outputs[name] for name in stop_buffers}, output_spans=None,
+        row_outputs={name: value for name, value in outputs.items() if not name.startswith("__")},
+        packed_outputs={name: value for name, value in outputs.items() if name.startswith("__")},
     ))
     runner = AcceleratorGraphRunner.__new__(AcceleratorGraphRunner)
     runner.slot_for = lambda lease: slot

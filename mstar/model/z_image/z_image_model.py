@@ -146,6 +146,10 @@ class ZImageModel(Model):
             )
         ]
 
+    def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
+        # the denoise loop runs the request's step count, known at ingest
+        return {DENOISE_LOOP: self._resolve_steps(model_kwargs)}
+
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         encode_text = GraphNode(
             name="text_encoder", input_names=[TEXT_INPUTS], enable_async_scheduling=self.async_scheduling,

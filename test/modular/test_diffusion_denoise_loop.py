@@ -94,6 +94,11 @@ def _staged(sub, infos):
     return {name: column[:, 0] for name, column in _cut(sub, infos).items()}
 
 
+def _rows(sub, out, rids):
+    """A batched step's outputs per request, as the engine cuts its rows."""
+    return sub.unpack_packed_outputs(out.packed_outputs, rids, [], [], {})
+
+
 def _inputs(latents=None):
     d = {"cond": [torch.zeros(3)]}
     if latents is not None:
@@ -130,31 +135,16 @@ def test_later_iterations_take_the_loop_back_latents_and_step_k():
 
 
 def test_missing_loop_back_latents_past_iteration_zero_raises():
+    """Iteration 0 is the one nothing is routed back to, told by what arrived
+    (a step prepared again after a refused admit reseeds to the same draw);
+    a walk that carried its edges and loses them has hit a routing bug."""
     sub = ToyDenoise()
-    sub.prepare_inputs(WALK, _info("r0", 0), _inputs())
-    with pytest.raises(RuntimeError, match=r"\['latents'\] missing at iteration 2 of request r0"):
+    a = sub.prepare_inputs(WALK, _info("r0", 0), _inputs())
+    again = sub.prepare_inputs(WALK, _info("r0", 0), _inputs())
+    assert torch.equal(again.tensor_inputs[LATENTS], a.tensor_inputs[LATENTS])
+    sub.prepare_inputs(WALK, _info("r0", 1), _inputs(torch.ones(8, 4)))
+    with pytest.raises(RuntimeError, match=r"missing past iteration 0 of request r0"):
         sub.prepare_inputs(WALK, _info("r0", 2), _inputs())
-
-
-def test_a_step_without_the_loop_counter_raises():
-    """Read as 0, it would reseed from noise every iteration and run to max_iters."""
-    sub = ToyDenoise()
-    with pytest.raises(KeyError, match=LOOP):
-        sub.prepare_inputs(WALK, dataclasses_replace(_info("r0", 1), dynamic_loop_iter_counts={}), _inputs())
-
-
-def test_overshoot_iteration_is_vetoed():
-    sub = ToyDenoise()
-    sub.prepare_inputs(WALK, _info("r0", 0, steps=2), _inputs())
-    assert sub.prepare_inputs(WALK, _info("r0", 2, steps=2), _inputs(torch.ones(8, 4))) is None
-
-
-@pytest.mark.parametrize("steps,k,expect", [(1, 0, True), (4, 2, False), (4, 3, True), (4, 4, True)])
-def test_check_stop_boundary(steps, k, expect):
-    sub = ToyDenoise()
-    sub.prepare_inputs(WALK, _info("r0", 0, steps=steps), _inputs())
-    assert (LOOP in sub.check_stop(_handle("r0"), _info("r0", k, steps=steps), {})) is expect
-    assert sub.check_stop(_handle("unknown"), _info("unknown", k), {}) == set()
 
 
 def test_can_batch_only_equal_shapes():
@@ -178,7 +168,7 @@ def test_preprocess_stacks_and_forward_batched_splits_rows():
     assert kwargs[LATENTS].shape == (2, 8, 4) and kwargs["cond"].shape == (2, 3)
     assert kwargs["sigma"].shape == (2, 1, 1) and kwargs["timestep"].shape == (2,)
     assert kwargs["bucket_key"] == (8, 3)
-    out = sub.forward_batched(WALK, engine_inputs, **kwargs)
+    out = _rows(sub, sub.forward_batched(WALK, engine_inputs, **kwargs), ["a", "b"])
     assert set(out) == {"a", "b"}
     assert out["a"][LATENTS][0].shape == (8, 4)
     # row b took its own sigma pair (step 1 of a 6-step schedule)
@@ -310,7 +300,7 @@ def test_every_loop_back_edge_is_seeded_then_carried():
     assert later.tensor_inputs["history"] is carried["history"][0]
 
     # solver state lost on the way back is an error, not a fresh seed
-    with pytest.raises(RuntimeError, match=r"\['history'\] missing at iteration 1"):
+    with pytest.raises(RuntimeError, match=r"\['history'\] missing for request r0"):
         sub.prepare_inputs(WALK, _info("r0", 1), {"cond": [torch.zeros(3)], LATENTS: [torch.ones(8, 4)]})
 
 
@@ -320,7 +310,8 @@ def test_a_mapping_from_denoise_is_split_across_rows_and_edges():
     b = sub.prepare_inputs(WALK, _info("b", 0, tokens=8), _inputs())
     engine_inputs = ModelInputsFromEngine(request_ids=["a", "b"], per_request_info={})
     staged = _staged(sub, [_info("a", 0, tokens=8), _info("b", 0, tokens=8)])
-    out = sub.forward_batched(WALK, engine_inputs, **sub.preprocess(WALK, engine_inputs, [a, b]), **staged)
+    kwargs = {**sub.preprocess(WALK, engine_inputs, [a, b]), **staged}
+    out = _rows(sub, sub.forward_batched(WALK, engine_inputs, **kwargs), ["a", "b"])
 
     assert set(out) == {"a", "b"}
     for rid in ("a", "b"):
@@ -382,7 +373,7 @@ def test_a_declared_iteration_input_is_cut_shaped_and_popped():
     engine_inputs = ModelInputsFromEngine(request_ids=["a", "b"], per_request_info={})
     kwargs = {**sub.preprocess(WALK, engine_inputs, [a, b]), **staged}
     assert kwargs["guidance"].shape == (2,)  # shape () stays [B]
-    out = sub.forward_batched(WALK, engine_inputs, **kwargs)
+    out = _rows(sub, sub.forward_batched(WALK, engine_inputs, **kwargs), ["a", "b"])
     assert sub.calls[-1] == (2,)  # reached denoise by name, not left in **cond
     assert out["a"][LATENTS][0].shape == (8, 4)
 
@@ -508,25 +499,6 @@ def test_cg_key_info_accepts_the_contract_the_engine_calls_it_with():
     ) == (8, 3)
 
 
-def test_check_stop_finds_the_schedule_under_the_engines_key():
-    """The loop's state must be keyed by the integer rid_handle, because that is
-    what the engine hands check_stop. Keyed by request_id instead, check_stop
-    missed, returned "do not stop", and the loop ran forever -- which hung every
-    served request on both klein and Z-Image."""
-    sub = ToyDenoise()
-    info = _info("r0", 0, steps=4)
-    sub.prepare_inputs(WALK, info, _inputs())
-
-    # the engine calls check_stop with batch.request_ids, i.e. the handle
-    assert info.rid_handle in sub.request_states
-    assert sub.check_stop(info.rid_handle, _info("r0", 3, steps=4), {}) == {LOOP}
-    assert sub.check_stop(info.rid_handle, _info("r0", 2, steps=4), {}) == set()
-
-    # the wire string is NOT the key: a lookup by it finds nothing, and the
-    # scaffold warns rather than silently declining to stop
-    assert info.request_id not in sub.request_states
-
-
 class ToyRefine(ToyDenoise):
     """A loop that starts from the latents routed to it (a refinement stage)."""
 
@@ -566,7 +538,6 @@ def test_a_second_walk_through_the_node_gets_its_own_shape_and_schedule():
     state = sub.request_state(_handle("rs"))
     assert state["num_steps"] == 2 and state["bucket_key"] == (16, 3)
     assert out.tensor_inputs[LATENTS].shape == (16, 4)
-    assert sub.check_stop(_handle("rs"), dataclasses_replace(refine, dynamic_loop_iter_counts={LOOP: 1}), {}) == {LOOP}
 
 
 def dataclasses_replace(info, **changes):
@@ -696,3 +667,26 @@ def test_iteration_zero_stages_its_schedule_and_seeds_without_a_host_sync():
     want = PrefetchingToy().prepare_inputs(WALK, _info("s1", 0, seed=4), _inputs())
     for name in (LATENTS, "sigma", "timestep"):
         assert torch.equal(got.tensor_inputs[name].cpu(), want.tensor_inputs[name].cpu()), name
+
+
+def test_a_run_of_four_denoise_steps_equals_four_one_step_steps():
+    """The latents carry back as a packed output and each replay reads its
+    own column of the schedule, so four replays of one step reach the latents
+    four steps do, for rows with different step counts."""
+    from run_parity import replay_run
+
+    sub = ToyDenoise()
+    infos = [_info("a", 0), _info("b", 0, steps=6)]
+    prepared = [sub.prepare_inputs(WALK, info, _inputs()) for info in infos]
+    engine_inputs = ModelInputsFromEngine(request_ids=["a", "b"], per_request_info={})
+    static = sub.preprocess(WALK, engine_inputs, prepared)
+
+    def forward(**inputs):
+        return sub.forward_batched(WALK, engine_inputs, **inputs).packed_outputs
+
+    latents = static[LATENTS]
+    for k in range(4):
+        step = {name: column[:, 0] for name, column in _cut(sub, [_info("a", k), _info("b", k, steps=6)]).items()}
+        latents = forward(**{**static, **step, LATENTS: latents})[f"__{LATENTS}__"]
+    replay_run(forward, static, sub.repeat_carry(WALK, {LATENTS}), 4, iteration=_cut(sub, infos, repeats=4))
+    assert torch.equal(forward(**static)[f"__{LATENTS}__"], latents)

@@ -150,18 +150,8 @@ def test_wan22_step_prep_reads_no_tensor():
         with _HostReads() as host:
             got = prepare(k)
         assert host.reads == [], f"step {k}: host reads {host.reads}"
-        assert got.tensor_inputs.keys() == {*_wan22_loop_inputs(shape, k), "timestep"}
+        assert got.tensor_inputs.keys() == set(_wan22_loop_inputs(shape, k))
         assert torch.equal(got.tensor_inputs["latents"], torch.full(shape, float(k)))
-    with _HostReads() as host:
-        assert prepare(steps) is None  # overshoot vetoed
-    assert host.reads == []
-
-
-def test_wan22_step_prep_fails_without_the_loop_counter():
-    sub = _wan22_sub()
-    info = _fwd("r", "video_gen", _WAN22_META)
-    with pytest.raises(KeyError, match=DENOISE_LOOP_NAME):
-        sub.prepare_inputs("video_gen", info, _wan22_loop_inputs((1, 4, 2, 2, 2), 1))
 
 
 class _WanStubTransformer(nn.Module):

@@ -643,10 +643,14 @@ class DummyRowPool:
 
 
 def _carried(slot: "AcceleratorGraphSlot", name: str) -> torch.Tensor | None:
-    """The buffer a replay leaves ``name`` in: a row output, else a stop buffer."""
+    """The buffer a replay leaves ``name`` in: a row output, a stop buffer, or
+    a packed output under ``__name__``, row i request i."""
     outputs = slot.static_outputs
-    for buffers in (outputs.row_outputs, outputs.check_stop_buffers):
-        value = (buffers or {}).get(name)
+    for buffers, key in (
+        (outputs.row_outputs, name), (outputs.check_stop_buffers, name),
+        (outputs.packed_outputs, f"__{name}__"),
+    ):
+        value = (buffers or {}).get(key)
         if isinstance(value, torch.Tensor):
             return value
     return None

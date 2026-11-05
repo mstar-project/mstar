@@ -29,6 +29,7 @@ from mstar.model.components.diffusion.qwen3.weight_loading import (  # noqa: E40
     text_encoder_skip,
 )
 from mstar.model.components.diffusion.weight_loading import load_native  # noqa: E402
+from mstar.model.submodule_base import iteration_columns  # noqa: E402
 from mstar.model.z_image.components.transformer import (  # noqa: E402
     ZImageDiT,
     ZImageRoPE,
@@ -299,18 +300,23 @@ def test_denoise_node_steps_a_batch_row_by_row(pair):
             request_id=rid, graph_walk="image_gen", fwd_index=k, random_seed=7, max_tokens=0,
             step_metadata={"height": height, "width": width, "num_inference_steps": steps, "cap_len": cap_len,
                            "text_len": text_len},
-            dynamic_loop_iter_counts={"denoise_loop": k},
+            dynamic_loop_iter_counts={"denoise_loop": k}, rid_handle=rid,
         )
+
+    def step(rids):
+        columns = iteration_columns(node, [(rid, 0) for rid in rids], 1, "cpu")
+        return {name: column[:, 0] for name, column in columns.items()}
 
     with torch.no_grad():
         # batched: both requests at step 0 (different seeds are irrelevant: the noise is per request)
         rows = [node.prepare_inputs("image_gen", info(rid, 0, n), {TEXT_EMBEDS: [e]})
                 for rid, n, e in (("a", 7, embeds[0]), ("b", 5, embeds[1]))]
-        out = node.forward_batched("image_gen", eng, **node.preprocess("image_gen", eng, rows))
+        out = node.forward_batched("image_gen", eng, **node.preprocess("image_gen", eng, rows), **step(["a", "b"]))
+        out = node.unpack_packed_outputs(out.packed_outputs, ["a", "b"], [], [], {})
         # one request at a time, from the same prepared rows
         for rid, row in zip(("a", "b"), rows, strict=True):
             single = node.forward("image_gen", ModelInputsFromEngine(request_ids=[rid], per_request_info={}),
-                                  **node.preprocess("image_gen", eng, [row]))[LATENTS][0]
+                                  **node.preprocess("image_gen", eng, [row]), **step([rid]))[LATENTS][0]
             assert out[rid][LATENTS][0].shape == single.shape == (config.transformer.in_channels, h * 2, w * 2)
             torch.testing.assert_close(out[rid][LATENTS][0], single, rtol=1e-4, atol=1e-4)
     assert CAP_PAD_MASK in rows[0].tensor_inputs

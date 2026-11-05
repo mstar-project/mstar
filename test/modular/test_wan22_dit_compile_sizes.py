@@ -12,6 +12,7 @@ import pytest
 import torch
 from torch import nn
 
+from mstar.model.submodule_base import iteration_columns
 from mstar.model.wan22.config import Wan22Config
 from mstar.model.wan22.submodules import DENOISE_LOOP_NAME, Wan22DitSubmodule
 from mstar.model.wan22.wan22_model import Wan22Model
@@ -70,7 +71,8 @@ def _step(node: Wan22DitSubmodule, width: int, height: int, frames: int, guidanc
     })
     engine_inputs = SimpleNamespace(request_ids=["r"], per_request_info={"r": info})
     stacked = node.preprocess("video_gen", engine_inputs, [prepared])
-    return node.forward("video_gen", engine_inputs=engine_inputs, **stacked)["latents"][0]
+    step = {name: column[:, 0] for name, column in iteration_columns(node, [("r", 1)], 1, "cpu").items()}
+    return node.forward("video_gen", engine_inputs=engine_inputs, **stacked, **step)["latents"][0]
 
 
 def _stub_compile(monkeypatch) -> tuple[list[tuple], list[int]]:

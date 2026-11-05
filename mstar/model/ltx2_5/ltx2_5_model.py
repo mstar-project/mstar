@@ -166,8 +166,8 @@ class LTX25Model(Model):
         # self-attention is quadratic in it, so an unbounded request could hold a worker
         # for minutes. 64k tokens is ~2x the 1080p, 121-frame grid.
         self.max_video_tokens = int(max_video_tokens)
-        # The denoise loop knows its step count at ingestion, so the speculated step past
-        # the last is vetoed in prepare_inputs (DenoiseLoopSubmodule) at no GPU cost.
+        # The denoise loop's max_iters is its fixed schedule, so no step is speculated
+        # past the last.
         self.async_scheduling = bool(async_scheduling)
         self._snapshot = None
         self._config: LTX25Config | None = None

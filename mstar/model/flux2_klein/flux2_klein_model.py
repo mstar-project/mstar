@@ -21,7 +21,7 @@ through ``metadata.kwargs["walk_step"]``:
     edit: encode_text -> encode_image -> image_edit
 
 The denoise loop is dynamic: ``Loop.max_iters`` is the config ceiling and the
-request's ``num_inference_steps`` stops it through the dit's ``check_stop``.
+request's ``num_inference_steps`` caps it (``get_loop_caps``).
 
 Per-request knobs (``model_kwargs``): ``width``, ``height`` (multiples of 16),
 ``num_inference_steps`` (default 4), ``seed`` (honoured by the conductor). The
@@ -149,8 +149,8 @@ class Flux2KleinModel(Model):
         # loop counter) and merges requests that became ready meanwhile, so requests at different steps share a
         # forward. On by default since 2026-09-23: same-GPU rows put klein-4B at 0.365-0.372 s vs 0.377-0.390 s
         # lockstep at B=1 and +3% images/s at 4 and 16 concurrent requests (9B +2%), with the served images
-        # unchanged (>= 53 dB from the eager path on all 100 protocol prompts). One speculated step per request
-        # overshoots the schedule and is vetoed by the denoise loop before any forward. `false` restores lockstep
+        # unchanged (>= 53 dB from the eager path on all 100 protocol prompts). The loop's cap keeps it from
+        # speculating past a request's last step. `false` restores lockstep
         # (wait for the step, then batch everything ready), which is within a few percent.
         self.async_scheduling = bool(async_scheduling)
         # LoRA adapters folded into the transformer at load time (static merge).
@@ -206,6 +206,10 @@ class Flux2KleinModel(Model):
                 ),
             )
         ]
+
+    def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
+        # the denoise loop runs the request's step count, known at ingest
+        return {DENOISE_LOOP: self._resolve_steps(model_kwargs)}
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         encode_text = GraphNode(
