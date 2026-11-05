@@ -5224,10 +5224,11 @@ class Worker:
 
         while True:
             from mstar.utils.profiler import range_pop, range_push
-            # Whether a TP leader's decision on N+1 (a head or a marker) went out
-            # (``_build_speculation`` always sends one); until it has, the error
-            # handler below owes the followers the marker.
-            decided = False
+            # The step whose decision on the next one (a head from it, or its
+            # marker) ``_build_speculation`` settled, for a TP-async lead step.
+            # The error handler owes the followers a marker for any other lead
+            # step it drops.
+            decided: PendingBatch | None = None
             try:
                 batch = None
                 spec_pending = None
@@ -5295,7 +5296,7 @@ class Worker:
                 speculation, yield_away_from_target = self._build_speculation(
                     pending, consecutive_spec_steps, fair,
                 )
-                decided = True
+                decided = pending
                 # inclusive of `speculate` and `worker.schedule_yield_away`
                 laps.lap("build_speculation")
                 if speculation is not None:
@@ -5567,14 +5568,17 @@ class Worker:
                 # FIFO front with failed rids.
                 if pending is not None and self._is_tp_follow_pending(pending):
                     self._close_tp_follow_step(pending)
-                # Leader: a raise before N's decision went out (in the
-                # speculation build, or before it) leaves the followers
-                # awaiting it, and a drain deferred behind N with them.
-                elif (
-                    pending is not None and not decided
-                    and self._can_speculate(pending.batch) and self._is_tp_lead_pending(pending)
-                ):
-                    self._broadcast_tp_nospec(pending)
+                # Leader: a dropped step whose decision never went out (the
+                # raise came before or in the speculation build, or N+1 was
+                # already submitted) leaves the followers awaiting it, and a
+                # drain deferred behind it with them.
+                else:
+                    for dropped in (pending, spec_pending if spec_pending is not pending else None):
+                        if (
+                            dropped is not None and dropped is not decided
+                            and self._can_speculate(dropped.batch) and self._is_tp_lead_pending(dropped)
+                        ):
+                            self._broadcast_tp_nospec(dropped)
                 # Clear the in-flight step. Without this the next iteration
                 # calls .result() on the same completed-with-exception future
                 # and re-raises forever, wedging the worker on one bad batch.
