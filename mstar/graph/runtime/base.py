@@ -1403,9 +1403,12 @@ class GraphRuntime(PhasedPostprocess, ABC):
         pass
 
     @abstractmethod
-    def loop_room(self, node_name: str, graph_walk: str, loop_name: str, rids: list[int], stride: int) -> int:
+    def loop_room(
+        self, node_name: str, graph_walk: str, loop_name: str, rids: list[int], stride: int, past_cap: bool = False,
+    ) -> int:
         """How many more iterations of ``loop_name`` every row of ``rids`` can
-        take after the ``stride`` each has in flight; 0 if a row isn't here."""
+        take after the ``stride`` each has in flight (``past_cap``: its longest
+        row can); 0 if a row isn't here."""
         pass
 
     @abstractmethod

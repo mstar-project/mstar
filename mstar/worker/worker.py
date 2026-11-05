@@ -2586,7 +2586,7 @@ class Worker:
                     if self._phase_period:
                         self._gpu_spans.append((gpu_start, gpu_end, _step_key(batch.node_name, batch.graph_walk)))
                         self._drain_gpu_spans()
-                    if self._auto_spans is not None:
+                    if self._auto_spans is not None and lane == CHAIN_LANE:  # a lane's step isn't the walk's gap
                         self._auto_spans.append((
                             gpu_start, gpu_end, (batch.node_name, batch.graph_walk), node_batch.step_context.repeats,
                         ))
@@ -6254,7 +6254,8 @@ class Worker:
                     if busy:
                         finish_first_to_land(busy)
                         continue
-                    self.communicator.wait_for_work(10)
+                    if not self._held_messages:  # what a run's wait drained is work already
+                        self.communicator.wait_for_work(10)
                     continue
 
                 if self.enable_nvtx:

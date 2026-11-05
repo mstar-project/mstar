@@ -2830,8 +2830,10 @@ def test_a_node_resident_by_default_is_resident_with_no_knob(monkeypatch, settin
     mgmt = SimpleNamespace(submodule=SimpleNamespace(resident_by_default=by_default), resident_refusals={})
     engine._submodules = {"n": mgmt}
     runner = SimpleNamespace(resident_refusal=lambda walk: "probed")
-    engine._build_resident_planner("n", runner, {"decode"})
-    knobs.configure(None)
+    try:
+        engine._build_resident_planner("n", runner, {"decode"})
+    finally:
+        knobs.configure(None)
     assert mgmt.resident_refusals["decode"] == ("runner: probed" if asked else NOT_ASKED)
 
 
