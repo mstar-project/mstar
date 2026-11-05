@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from mstar.engine.resources.spec import NodeResourceSpec
+from mstar.engine.resources.spec import NodeResourceSpec, check_sizes
 from mstar.engine.resources.step import ResourceStep
 
 if TYPE_CHECKING:
@@ -318,6 +318,8 @@ class RecurrentStateConfig:
     def check_slots(self) -> None:
         """A pool must hold at least one request's state, a slot per label, or
         every admit waits forever."""
+        check_sizes({"max_slots": self.max_slots})
+        check_sizes({"prefix_slots": self.prefix_slots}, smallest=0)
         if self.usable_slots < len(self.labels):
             raise ValueError(
                 f"max_slots={self.max_slots} cannot hold one request's {len(self.labels)} "
@@ -371,11 +373,9 @@ class RecurrentStateSpec(NodeResourceSpec):
         """
         if max_slots is not None:
             self.config.max_slots = max_slots
-            self.config.check_slots()
         if prefix_slots is not None:
-            if prefix_slots < 0:
-                raise ValueError(f"prefix_slots={prefix_slots} must be >= 0")
             self.config.prefix_slots = prefix_slots
+        self.config.check_slots()
         if state_dtype is not None:
             try:
                 dtype = getattr(torch, state_dtype)
