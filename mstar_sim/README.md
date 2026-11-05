@@ -181,7 +181,8 @@ the roofline.
   GPU's, never smaller. MLA plans as fa2/fa3's planner does on any GPU, and a backend other than
   fa2 and fa3 asks for no workspace. `auto` chooses between fa2 and fa3 as FlashInfer does; on
   Blackwell a ragged `auto` stays fa2 here, where FlashInfer can upgrade it to cudnn or cutlass.
-  Decode of 2 to 4 queries a row, where FlashInfer's `auto` can go to cuDNN, stays on fa2 here
-  with tensor cores, and is refused without them from 2 queries up.
+  Decode `auto` never moves to cuDNN here, where FlashInfer's can on SM100/SM103: tensor-core
+  decode of 2 to 4 queries a row stays on fa2, and CUDA-core decode of 2 or more is refused,
+  which FlashInfer serves on cuDNN at head dim 128 or 256.
 - A FlashInfer API the stand-in lacks raises `NotImplementedError("mstar_sim: flashinfer.<name>
   has no stand-in yet")` when called.
