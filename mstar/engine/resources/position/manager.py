@@ -30,7 +30,6 @@ from mstar.engine.resources.position.rope import (
     rope_apply_qk_inplace,  # noqa: F401  (registers mstar::rope_apply_qk_inplace)
 )
 from mstar.engine.resources.resident import gather_column
-from mstar.engine.resources.resident_hooks import ANY_REPEATS
 from mstar.engine.resources.step import ADMIT_OK, AdmitOutcome, StepContext
 
 if TYPE_CHECKING:
@@ -362,8 +361,8 @@ class RopeManager(PositionManager):
     # Resident planning: a stream's position runs ahead of its stored length by a
     # fixed amount between host-planned steps, so a row keeps that offset
 
-    def max_repeats(self, step: PositionStep, ctx: StepContext) -> int:
-        return ANY_REPEATS  # a resident row's position is its length plus a fixed offset
+    def repeat_refusal(self) -> str | None:
+        return None  # a resident row's position is its length plus a fixed offset
 
     def resident_refusal(self) -> str | None:
         if self._config.scheme != PosScheme.SEQUENTIAL:

@@ -99,11 +99,20 @@ class FlashInferManager(AttentionManager):
     def depends_on(self):
         return {self._kv_cache_name}
 
+    def repeat_refusal(self) -> str | None:
+        """Decided from the captured decode wrappers, so after capture: which
+        kernel FlashInfer's backend "auto" resolves to is known only once planned."""
+        if any(
+            isinstance(w, FmhaDecodeWrapper) or (isinstance(w, FlashInferDecodeWrapper) and w.lengths_move)
+            for w in self._cg_plan_states.values()
+        ):
+            return None
+        return "no captured decode kernel of it reads a row's length per replay (CUDA-core, fa3 or cuDNN decode)"
+
     def max_repeats(self, step, ctx) -> int:
         """A kernel that reads the tables sees each replay's lengths. So does one
-        planned for the step's last replay, whose lengths move in `next_replay`."""
-        if ctx.resident is None:
-            return 1
+        planned for the step's last replay, whose lengths move in `next_replay`.
+        Per bucket: each captured its own wrapper."""
         lease = ctx.slot_lease
         if lease.bucket in ctx.resident.host_plan_free:
             return ANY_REPEATS

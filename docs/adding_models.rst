@@ -1661,10 +1661,15 @@ and the repetition-penalty mask stay by the sampler's own row of each request.
 
 A resident step can also stand for several iterations of its Loop (``max_step_repeats``
 in the serving config): the host plans once and the capture replays, the token carried
-from one replay to the next by ``repeat_carry``, which ``DeviceLoopback`` supplies. Every
-resource the step declares answers ``Resource.max_repeats`` at admit, and the step runs
-the smallest answer; the default is 1, so a resource takes part only once it says how far
-its capture advances itself. Whatever it counts per step (stored lengths, positions,
+from one replay to the next by ``repeat_carry``, which ``DeviceLoopback`` supplies. Whether
+a walk may repeat is settled once, after capture, and the worker logs it per walk with the
+reason when it can't: the walk must sit in a Loop, read no streamed input, have an
+input-free step (``step_is_input_free``), a runtime token stop and its outputs on the
+device, run on one rank, and every resource of the node must answer
+``Resource.repeat_refusal`` with None. The default refuses, so a resource takes part only
+once it says how far its capture advances itself. At admit each resource can narrow a
+step with ``Resource.max_repeats``, for what only that step decides (free pages, a live
+penalty), and the step runs the smallest answer. Whatever it counts per step (stored lengths, positions,
 recurrent token counts) it counts with ``StepContext.run_span``, not the declared
 ``span``. What a replay reads that its capture doesn't advance moves in
 ``Resource.next_replay``, between replays.

@@ -332,13 +332,14 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        stops are read when the step lands. The next step is already running by then, so a
        row that stops inside a step runs up to 2N-1 iterations past its stop, against 1
        at N=1. A step repeats only inside a speculated chain (async scheduling on), with
-       no new rows, on one rank, for a walk on resident tables with a declared token stop
-       and its outputs on the device, and at most a KV page's worth of iterations. Its
-       resources can narrow any step to 1 (``Resource.max_repeats``): FlashInfer decode
-       other than tensor-core (CUDA-core, fa3, cuDNN), a sampler with a repetition window
-       or without in-graph scatter, and, for every step on the node while one is live, a
-       request with a repetition penalty or log-probs. The worker log says why a walk
-       can't repeat.
+       no new rows, on one rank, for a Loop on resident tables that reads no streamed
+       input, with a declared token stop and its outputs on the device, and at most a KV
+       page's worth of iterations. Its resources can refuse the walk
+       (``Resource.repeat_refusal``): FlashInfer decode other than tensor-core (CUDA-core,
+       fa3, cuDNN), a sampler with a repetition window, loop-back state or no in-graph
+       scatter. They can narrow a step to 1 (``Resource.max_repeats``), for every step on
+       the node while a request with a repetition penalty or log-probs is live. At startup
+       the worker logs, per walk, that it repeats or why it can't.
    * - ``batch_builder``
      - *(optional, default* ``fifo`` *)* How the worker composes a step under a token
        budget (``max_batch_tokens``). ``fifo`` serves prompts in the order they started:

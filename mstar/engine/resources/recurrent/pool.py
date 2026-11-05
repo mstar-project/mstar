@@ -31,7 +31,6 @@ from mstar.engine.resources.recurrent.config import (
     RecurrentStep,
 )
 from mstar.engine.resources.resident import gather_column
-from mstar.engine.resources.resident_hooks import ANY_REPEATS
 from mstar.engine.resources.spec import ResourceReqConfig
 from mstar.engine.resources.step import (
     ADMIT_OK,
@@ -1135,8 +1134,8 @@ class RecurrentStatePool(Resource):
 
     # Resident planning
 
-    def max_repeats(self, step, ctx) -> int:
-        return ANY_REPEATS  # a row's state is updated in place, at its slot
+    def repeat_refusal(self) -> str | None:
+        return None  # a row's state is updated in place, at its slot
 
     def resident_refusal(self) -> str | None:
         if self.config.disable_sink_slot:

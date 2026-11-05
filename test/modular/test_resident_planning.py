@@ -315,7 +315,68 @@ def test_a_step_repeats_only_when_its_rows_all_continue(in_chain, fresh, same_no
         ),
         continuing_rids={0, 1}, is_new_iter=True, is_same_node=same_node,
     )
-    assert StepRepeats(8).ceiling(speculation, in_chain, lambda *key: None, lambda: room) == want
+    repeats = StepRepeats(8)
+    repeats.settle([("n", WALK)], lambda *key: None)
+    assert repeats.ceiling(speculation, in_chain, lambda: room) == want
+
+
+def test_the_startup_line_names_the_resource_that_refuses_a_walk(caplog):
+    """Each resource answers for itself at load; the engine names the one that
+    refused, and the worker says so once, at startup."""
+    from mstar.engine.engine import Engine
+    from mstar.engine.resources.resident_hooks import ResidentHooks
+
+    willing = SimpleNamespace(repeat_refusal=lambda: None)
+    engine = Engine.__new__(Engine)
+    engine._submodules = {node: SimpleNamespace(
+        resident=SimpleNamespace(walks={WALK}), joint_comm_group=SimpleNamespace(world_size=1),
+        submodule=SimpleNamespace(repeat_carry=lambda walk: ("t", "i"), step_is_input_free=lambda walk: True),
+        resources=resources,
+    ) for node, resources in (("a", {"kv": willing}), ("b", {"kv": willing, "pool": ResidentHooks()}))}
+    with caplog.at_level("INFO", logger="mstar.worker.step_repeats"):
+        StepRepeats(4).settle([("a", WALK), ("b", WALK)], engine.repeat_refusal)
+    assert f"steps of a/{WALK} repeat up to 4" in caplog.text
+    assert f"steps of b/{WALK} run once: resource 'pool': ResidentHooks keeps no per-replay support" in caplog.text
+
+
+class _CudaCoreDecode(FlashInferDecodeWrapper):
+    lengths_move = False
+
+
+class _TensorCoreDecode(FlashInferDecodeWrapper):
+    lengths_move = True
+
+
+def _sampler(**attrs):
+    from mstar.engine.resources.sampler.resource import SamplerResource
+
+    sampler = SamplerResource.__new__(SamplerResource)
+    for name, value in {
+        "_keep_last_token": True, "_decides": True, "_history": None, "_loopback_state": {}, **attrs,
+    }.items():
+        setattr(sampler, name, value)
+    return sampler
+
+
+def _attention(*wrappers):
+    manager = FlashInferManager.__new__(FlashInferManager)
+    bucket = BucketKey(graph_walk=WALK, bs=1, num_tokens=1)
+    manager._cg_plan_states = {
+        CGSlotKey(bucket=bucket, slot=slot, label="main"): cls.__new__(cls) for slot, cls in enumerate(wrappers)
+    }
+    return manager
+
+
+@pytest.mark.parametrize(("resource", "refuses"), [
+    (_sampler, False),
+    (lambda: _sampler(_history=object()), True),
+    (lambda: _sampler(_decides=False), True),  # above one rank: scattered on the host
+    (lambda: _sampler(_loopback_state={"s": object()}), True),
+    (lambda: _attention(_TensorCoreDecode), False),
+    (lambda: _attention(_CudaCoreDecode, _CudaCoreDecode), True),
+], ids=["sampler", "history", "no_scatter", "loopback_state", "tensor_core", "cuda_core"])
+def test_a_resource_refuses_repeats_at_load_for_what_it_knows_at_load(resource, refuses):
+    assert (resource().repeat_refusal() is not None) is refuses
 
 
 @pytest.mark.parametrize("limit", [2.5, True, "4", 0])
@@ -354,7 +415,7 @@ def test_a_step_its_resources_held_to_one_iteration_moves_its_rows_by_one():
     ctx = SimpleNamespace(repeats=1)
     worker = Worker.__new__(Worker)
     worker._step_repeats = StepRepeats(8)
-    worker._repeat_refusal = lambda *key: None
+    worker._step_repeats.settle([("n", WALK)], lambda *key: None)
     worker._graph_runtime = SimpleNamespace(loop_room=lambda *args: 100)
     speculation = SimpleNamespace(
         scheduled_batch=batch, node_batch=SimpleNamespace(step_context=ctx), loop_name="loop",

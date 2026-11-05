@@ -2834,15 +2834,21 @@ class Engine:
 
     def repeat_refusal(self, node_name: str, graph_walk: str) -> str | None:
         """Why a step of this walk can't replay with no host work between, or
-        None if its resources may let it."""
+        None if it may: the deployment, the walk's step and every resource of
+        the node each answer. After capture, which some resources decide at."""
         mgmt = self._submodules.get(node_name)
         if mgmt is None or mgmt.resident is None or graph_walk not in mgmt.resident.walks:
             return "it doesn't run on resident tables"
         if mgmt.joint_comm_group.world_size > 1:
             # every rank would have to replay the same count, which one rank settles
             return "it runs on more than one rank"
+        if not mgmt.submodule.step_is_input_free(graph_walk):
+            return "its step reads its inputs, which a replay doesn't renew"
         if mgmt.submodule.repeat_carry(graph_walk) is None:
             return "its submodule names nothing that carries a replay's token on"
+        for key, resource in mgmt.resources.items():
+            if (refusal := resource.repeat_refusal()) is not None:
+                return f"resource {key!r}: {refusal}"
         return None
 
     def get_max_batch_tokens(self, node_name: str, graph_walk: str) -> int | None:
