@@ -2390,8 +2390,9 @@ class Engine:
         request_ids: list[int],
     ) -> None:
         """Publish state that must include the last iteration of a stopped loop."""
-        # A row that ran nothing this step -- one the prefix cache served whole
-        # -- has no iteration here to publish, though its loop still stops.
+        # A row that ran nothing this step -- one the prefix cache served whole,
+        # or one that declined its final chunk -- has no iteration here to
+        # publish, though its loop still stops.
         request_ids = [rid for rid in request_ids if rid in batch.per_request_info]
         if not request_ids:
             return
@@ -2403,10 +2404,7 @@ class Engine:
         )
         for rid in request_ids:
             rid_published = published.get(rid, {})
-            # a row that declined its final chunk has no forward-pass info
-            info = batch.per_request_info.get(rid)
-            if info is not None:
-                info.update_publish_info(rid_published)
+            batch.per_request_info[rid].update_publish_info(rid_published)
             merge_publish_info(
                 batch.resource_publish_info.setdefault(rid, {}),
                 rid_published,
