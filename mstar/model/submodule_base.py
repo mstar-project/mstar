@@ -1431,11 +1431,14 @@ class NodeSubmodule(torch.nn.Module, ABC):
         loop it can stop, if it is only these, so the graph runtime can run
         them without calling it.
 
-        None (the default) means ``check_stop`` decides; an empty dict means
-        it never stops a loop on this walk. Asked once per walk, at startup.
-        Every policy must agree with ``check_stop`` for every row.
+        None means ``check_stop`` decides; an empty dict means it never stops
+        a loop on this walk, which is the base's answer for a class keeping
+        the base's ``check_stop`` (the loop's cap or its stream's end stops
+        it). Asked once per walk, at startup. Every policy must agree with
+        ``check_stop`` for every row.
         """
-        return None
+        del graph_walk
+        return {} if _keeps(self, NodeSubmodule, _STOP_CHECK) else None
 
     def check_stop_batched(
         self, request_ids: list[str],
@@ -1489,8 +1492,14 @@ def engine_step(submodule, *args, **kwargs) -> SubmoduleStep | None:
     return lora_rows(submodule.declare_step(*args, **kwargs), getattr(submodule, "lora_keys", ()))
 
 
-# What the runtime's EOS policy stands in for: a class overriding any keeps check_stop.
-_TOKEN_STOP_CHECK = ("check_stop", "check_stop_batched", "_token_stops")
+# What a declared stop policy stands in for: a class overriding any keeps check_stop.
+_STOP_CHECK = ("check_stop", "check_stop_batched")
+_TOKEN_STOP_CHECK = (*_STOP_CHECK, "_token_stops")
+
+
+def _keeps(submodule, base: type, names: tuple[str, ...]) -> bool:
+    """Whether ``submodule`` runs ``base``'s own method for each of ``names``."""
+    return all(getattr(getattr(submodule, name), "__func__", None) is getattr(base, name) for name in names)
 
 
 class ARNodeSubmodule(NodeSubmodule):
@@ -1590,14 +1599,17 @@ class ARNodeSubmodule(NodeSubmodule):
 
     def get_stop_policies(self, graph_walk: str) -> dict[str, StopPolicy] | None:
         stop = self.token_stop
+        if stop is None:
+            # no token to check: the loop's cap stops it, unless the class checks more
+            return {} if _keeps(self, ARNodeSubmodule, _STOP_CHECK) else None
         if (
-            stop is None or graph_walk in stop.prefill_walks
+            graph_walk in stop.prefill_walks
             # the runtime's check never calls check_stop, which is what withholds
             or stop.withhold
             # a class that overrides the token's stop check answers for it
-            or any(getattr(type(self), name) is not getattr(ARNodeSubmodule, name) for name in _TOKEN_STOP_CHECK)
+            or not _keeps(self, ARNodeSubmodule, _TOKEN_STOP_CHECK)
         ):
-            return super().get_stop_policies(graph_walk)
+            return None
         if not stop.stops_on(graph_walk):
             return {}  # as `_token_stops`: only a row of ``walk`` ends the loop
         # the budget is the loop's cap, which the runtime enforces

@@ -1534,9 +1534,10 @@ methods are:
    one reaches ``max_iters`` (``info.max_tokens`` unless given). ``StopKind.ITER`` checks
    only the count, and ``StopKind.EOS`` only the token, for a loop whose cap is its budget.
    The limits are computed from the request's forward-pass info whenever
-   the worker receives it, not per step. Return ``{}`` for a
-   walk on which ``check_stop`` never stops a loop, and ``None`` (the default) to keep
-   calling ``check_stop``. The policies must agree with ``check_stop`` for every row;
+   the worker receives it, not per step. ``{}`` means ``check_stop`` never stops a loop
+   on the walk, and is the default for a class that doesn't override ``check_stop`` or
+   ``check_stop_batched`` (its loop's cap or its stream's end stops it); ``None``, the
+   default for one that does, keeps calling ``check_stop``. The policies must agree with ``check_stop`` for every row;
    ``test/modular/test_stop_policies.py`` checks the models that declare them. A
    ``TokenStop`` declares them for you: its loop's stop ids, as ``StopKind.EOS``, on
    ``walk``. Its ``prefill_walks`` keep ``check_stop``, and so does every walk of a stop

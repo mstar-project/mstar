@@ -104,3 +104,19 @@ def test_a_token_stop_keeps_check_stop_where_check_stop_does_more(owner):
         withhold=("codes",) if owner == "withhold" else (),
     )
     assert sub.get_stop_policies("decode") is None
+
+
+@pytest.mark.parametrize(("module", "name", "policies"), [
+    # a count-only node: the loop's cap (or no loop) stops it
+    ("mstar.model.orpheus.submodules", "SNACDecoderSubmodule", {}),
+    # an AR node with no token stop
+    ("mstar.model.qwen3_asr.submodules", "Qwen3ASRLLMSubmodule", {}),
+    # its own check_stop decides
+    ("mstar.model.z_image.submodules", "ZImageDenoiseSubmodule", None),
+    ("mstar.model.vjepa2.submodules", "VJepa2RolloutPredictorSubmodule", None),
+])
+def test_a_class_without_its_own_stop_check_declares_no_stops(module, name, policies):
+    cls = getattr(__import__(module, fromlist=[name]), name)
+    sub = cls.__new__(cls)
+    torch.nn.Module.__init__(sub)
+    assert sub.get_stop_policies("decode") == policies
