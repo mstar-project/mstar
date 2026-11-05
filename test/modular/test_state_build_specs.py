@@ -276,11 +276,6 @@ NO_LAYOUT = {
         lambda: [_kv(entry=Entry({"k": TensorType((4, 16), dtype=None), "v": TensorType((4, 16), dtype=None)}))],
         "sharded on",
     ),
-    "a host field": (
-        "kv",
-        lambda: [_kv(entry=Entry(KVEntry(heads=4, head_dim=16).tensors, host={"done": bool}))],
-        "no host field",
-    ),
     "a rewritable log": ("kv", lambda: [_kv(rewritable=True)], "rewritable"),
     "a read on a value": ("gdn", lambda: [_kv(), Array(
         "gdn", nodes={"llm"}, layers={0}, entry=_gdn_entry(), max_len=1, rewritable=True,

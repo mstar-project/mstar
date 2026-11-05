@@ -119,6 +119,7 @@ class Read:
     op: Attend | None = None
     layers: frozenset[int] | None = None    # None: all of the array's layers
     walks: frozenset[str] | None = None     # None: all walks
+    queries: str | None = None              # the array whose segments lay out the queries; None: this array
 
     def __post_init__(self):
         for name in ("layers", "walks"):
@@ -165,6 +166,7 @@ class Array:
     rewritable: bool = False
     labels: frozenset[str] = frozenset({"main"})
     positions: Positions | None = None
+    seq_sharded: bool = False    # under sequence parallelism, each rank's calls carry its share of every segment
 
     def __post_init__(self):
         object.__setattr__(self, "nodes", frozenset(self.nodes))
@@ -200,6 +202,8 @@ class Array:
                 raise ValueError(f"{where}.shape must be a non-empty tuple of ints >= {least}, got {tensor.shape!r}")
             if tensor.shard is not None and not (type(tensor.shard) is int and 0 <= tensor.shard < len(tensor.shape)):
                 raise ValueError(f"{where}.shard must be None or an axis of shape {tensor.shape}, got {tensor.shard!r}")
+        if self.entry.host and not is_value(self):
+            raise ValueError(f"Array {self.name!r}.entry.host: only a Value (rewritable, max_len 1) holds host fields")
         for name, kind in self.entry.host.items():
             if not _is_host_type(kind):
                 raise ValueError(f"Array {self.name!r}.entry.host[{name!r}] must be int, float, bool, str, bytes or a "
@@ -216,6 +220,9 @@ class Array:
             raise ValueError(f"{where}.layers has {sorted(read.layers - self.layers)}, outside the array's layers")
         if isinstance(read.mask, Window) and not _is_positive(read.mask.size):
             raise ValueError(f"{where}.mask.size must be a positive int, got {read.mask.size!r}")
+        if read.queries is not None and not isinstance(read.mask, Block):
+            raise ValueError(f"{where}.queries: a read of another array's queries takes a mask that uses no query "
+                             f"position, and {type(read.mask).__name__} does")
         if not isinstance(read.op, Attend):
             return
         if not _is_positive(read.op.q_heads):
@@ -313,6 +320,7 @@ class ArrayStep:
     eager_add: bool = False                        # this step's adds run outside the captured graph
     advance: tuple[int, ...] | None = None         # positions per row; None: the span
     position_ids: torch.Tensor | None = None       # explicit ids, (tokens,) in segment order
+    host: Mapping[tuple[int, str, int], Mapping[str, object]] = EMPTY    # (row, label, layer) -> fields, at commit
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -332,6 +340,28 @@ class Layout:
     spans: tuple[Span, ...] = ()
     growth: tuple[tuple[str, int], ...] = ()    # (loop, entries per iteration)
     scratch: int = 0                            # most one scratch step writes past the kept length
+
+
+@dataclass(frozen=True, kw_only=True)
+class PagedNHD:
+    """A storage format a state op can address: pages of (tokens, heads, head_dim)."""
+
+    dtypes: frozenset[torch.dtype] | None = None    # None: any
+    devices: frozenset[str] | None = None           # None: any
+
+    def __post_init__(self):
+        for name in ("dtypes", "devices"):
+            if getattr(self, name) is not None:
+                object.__setattr__(self, name, frozenset(getattr(self, name)))
+
+
+class PagedNHDTarget(NamedTuple):
+    """Where a state op writes this step's entries on one layer of a `PagedNHD` array."""
+
+    cache: torch.Tensor
+    page_of_token: torch.Tensor
+    slot_of_token: torch.Tensor
+    count: int    # tokens to write
 
 
 class Reached(NamedTuple):

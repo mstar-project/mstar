@@ -37,6 +37,8 @@ def state_declaration_problems(model: "Model") -> list[str]:
         problems += _read_problems(array, walks, combined)
         problems += _array_problems(array)
     problems += _kv_label_problems(model.kv_labels(), arrays)
+    problems += _cross_read_problems(arrays)
+    problems += _host_problems(arrays, model.kv_labels())
     for sampler in samplers:
         problems += _sampler_problems(sampler, nodes)
     return problems
@@ -103,6 +105,42 @@ def _kv_label_problems(kv_labels: Mapping[str, Mapping[str, object]], arrays: Se
             for label in sorted(labels.keys() - by_name[key].labels)
         ]
     return problems
+
+
+def _cross_read_problems(arrays: Sequence[Array]) -> list[str]:
+    by_name = {array.name: array for array in arrays}
+    problems: list[str] = []
+    for array in arrays:
+        for key, read in array.reads.items():
+            if read.queries is None:
+                continue
+            where = f"Array {array.name!r}.reads[{key!r}].queries"
+            queried = by_name.get(read.queries)
+            if queried is None:
+                problems.append(f"{where}: {read.queries!r} is not a declared array, of {sorted(by_name)}")
+            elif not array.nodes <= queried.nodes:
+                problems.append(f"{where}: {read.queries!r} isn't on nodes {sorted(array.nodes - queried.nodes)}, so a "
+                                "step there has no segments to lay the queries out by")
+            elif queried.max_len:
+                problems.append(f"{where}: {read.queries!r} keeps entries, and queries are laid out by the segments "
+                                "of an array with max_len 0")
+    return problems
+
+
+def _host_problems(arrays: Sequence[Array], kv_labels: Mapping[str, Mapping[str, object]]) -> list[str]:
+    """A prefix hit restores a Value's snapshot, and a snapshot doesn't carry host fields yet."""
+    holders = [array for array in arrays if array.entry.host]
+    if not holders:
+        return []
+    keyed = {
+        node for array in arrays if any(label.keys is not None for label in kv_labels.get(array.name, {}).values())
+        for node in array.nodes
+    }
+    return [
+        f"Array {array.name!r}.entry.host: nodes {sorted(array.nodes & keyed)} have prefix keys, and a prefix hit "
+        "wouldn't restore host fields"
+        for array in holders if array.nodes & keyed
+    ]
 
 
 def _sampler_problems(sampler: Sampler, nodes: Sequence[str]) -> list[str]:

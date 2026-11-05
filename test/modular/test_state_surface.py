@@ -20,7 +20,7 @@ from mstar.engine import state
 from mstar.engine.state.calls import ArrayHandle, WithinStepHandle
 
 # Today's types the surface re-exports, and a NamedTuple, whose fields stay positional.
-_POSITIONAL = {"Reached", "Segment", "SlotLease", "Span"}
+_POSITIONAL = {"PagedNHDTarget", "Reached", "Segment", "SlotLease", "Span"}
 # The calls take the handle first, then what every call names, and only then keywords.
 _CALLS = {
     "at_last_token", "causal_conv", "gated_delta_net", "last_sampled", "position", "positions",
@@ -39,6 +39,7 @@ SNAPSHOT = {
         ["rewritable", "KEYWORD_ONLY", 'False'],
         ["labels", "KEYWORD_ONLY", "frozenset({'main'})"],
         ["positions", "KEYWORD_ONLY", 'None'],
+        ["seq_sharded", "KEYWORD_ONLY", 'False'],
     ],
     "ArrayStep": [
         ["segments", "KEYWORD_ONLY", 'None'],
@@ -48,6 +49,7 @@ SNAPSHOT = {
         ["eager_add", "KEYWORD_ONLY", 'False'],
         ["advance", "KEYWORD_ONLY", 'None'],
         ["position_ids", "KEYWORD_ONLY", 'None'],
+        ["host", "KEYWORD_ONLY", '{}'],
     ],
     "Attend": [
         ["q_heads", "POSITIONAL_OR_KEYWORD", None],
@@ -80,6 +82,16 @@ SNAPSHOT = {
         ["growth", "KEYWORD_ONLY", '()'],
         ["scratch", "KEYWORD_ONLY", '0'],
     ],
+    "PagedNHD": [
+        ["dtypes", "KEYWORD_ONLY", 'None'],
+        ["devices", "KEYWORD_ONLY", 'None'],
+    ],
+    "PagedNHDTarget": [
+        ["cache", "POSITIONAL_OR_KEYWORD", None],
+        ["page_of_token", "POSITIONAL_OR_KEYWORD", None],
+        ["slot_of_token", "POSITIONAL_OR_KEYWORD", None],
+        ["count", "POSITIONAL_OR_KEYWORD", None],
+    ],
     "Positions": [
         ["rope", "KEYWORD_ONLY", 'None'],
     ],
@@ -92,6 +104,7 @@ SNAPSHOT = {
         ["op", "KEYWORD_ONLY", 'None'],
         ["layers", "KEYWORD_ONLY", 'None'],
         ["walks", "KEYWORD_ONLY", 'None'],
+        ["queries", "KEYWORD_ONLY", 'None'],
     ],
     "Rope": [
         ["theta", "KEYWORD_ONLY", '10000.0'],

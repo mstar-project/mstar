@@ -89,7 +89,7 @@ def _kv_shape(array: Array) -> tuple[int, ...]:
     k = array.entry.tensors.get("k")
     if k is None or len(k.shape) != 2 or array.entry != KVEntry(heads=k.shape[0], head_dim=k.shape[1]):
         raise _no_layout(array, "entry must be a KVEntry, all PagedKVConfig holds: k and v of one shape, sharded on "
-                                "their heads, with no dtype and no host field")
+                                "their heads, with no dtype")
     return k.shape
 
 
