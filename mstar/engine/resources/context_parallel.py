@@ -343,10 +343,10 @@ class TPContextParallelWrapper(ContextParallelWrapper):
         # over this rank's slots, with the rows holding any of them
         out, lse = self.context.run(*parts, kv_cache_layer, return_lse=True)
         outs, lses = self._exchange_partials(out, lse, self._valid[: parts[0].shape[0]])
-        if new is not None:
-            outs = torch.cat([outs, new[0].to(outs.dtype).unsqueeze(0)])
-            lses = torch.cat([lses, new[1].float().unsqueeze(0)])
-        return merge(outs, lses)
+        if new is None:
+            return merge(outs, lses)
+        # the own tokens' part beside the partners', with no copy of theirs
+        return merge([*outs, new[0]], torch.cat([lses, new[1].float()[None]]))
 
     def _exchange_queries(self, queries: tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, ...]:
         """The query parts this rank attends its slots for, from its own (each ``[N, H, *]``): every
