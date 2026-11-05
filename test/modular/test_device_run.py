@@ -58,7 +58,7 @@ def _runner(monkeypatch, loop, tokens, bs=2, limit=6, refill_at=None, carries=No
     runner._yield_word = None
     runner._graph_backend = SimpleNamespace(
         while_refusal=lambda: None, while_runtime=lambda: loop,
-        current_stream=lambda: SimpleNamespace(cuda_stream=0),
+        raw_stream=lambda: 0,
     )
     runner.ask_run(WALK, RunAsk("new_token", frozenset({EOS}), False, limit, carries or {}, ("frame",), ("cond",),
                                 refill_at, stream_tokens))
@@ -276,6 +276,40 @@ def test_only_a_landing_that_rides_inline_streams(routed, withholding, why):
     worker.engine_manager = SimpleNamespace(get_engine=lambda name: engine)
     assert worker._stream_refusal("n", WALK) == why
     assert asked == ([] if why else [("n", WALK, "new_token", 4)])
+
+
+def test_a_failed_while_capture_settles_its_walk_and_a_plain_capture_serves(monkeypatch):
+    """One failure is the walk's answer: trying each bucket cost a second capture
+    of every one of them."""
+    class Failing(_Loop):
+        loops = 0
+
+        def new_loop(self, device):
+            Failing.loops += 1
+            return super().new_loop(device)
+
+        def stop(self, state, tokens, handle, stream):
+            raise RuntimeError("no such stream")
+
+    monkeypatch.setattr(torch.accelerator, "is_available", lambda: False)
+    runner, run, _, _ = _runner(monkeypatch, Failing(), [[1, 2]])
+    assert run is None and "no such stream" in runner.run_refusal(WALK)
+    spec = SimpleNamespace(bucket=BucketKey(WALK, 2, 2), slot=1, config=SimpleNamespace(get_config_type=lambda: None))
+    assert runner._capture_run(spec, None) == (None, None, None) and Failing.loops == 1
+
+
+def test_a_raw_launch_takes_the_cuda_handle_torch_stream_doesnt_have(monkeypatch):
+    """``torch.accelerator.current_stream`` gives a ``torch.Stream``, which has
+    no ``cuda_stream``."""
+    from mstar.engine.accelerator_graph_backend import CUDAGraphBackend
+
+    backend = CUDAGraphBackend.__new__(CUDAGraphBackend)
+    backend.device = torch.device("cuda:0")
+    backend._runtime = SimpleNamespace(current_stream=lambda device: SimpleNamespace(cuda_stream=77))
+    backend._runtime_entry = lambda name: 5
+    monkeypatch.setattr(torch.accelerator, "current_stream", lambda device: SimpleNamespace())
+    graph = SimpleNamespace(raw_cuda_graph_exec=lambda: 9)
+    assert backend.raw_launch(graph) == (5, 5, 9, 77)
 
 
 def test_the_worker_settles_a_run_that_ended_short():

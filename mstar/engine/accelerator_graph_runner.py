@@ -1348,7 +1348,8 @@ class AcceleratorGraphRunner:
         walk = spec.bucket.graph_walk
         ask = self._run_asks.get(walk)
         backend = self._graph_backend
-        if ask is None or _is_packed(spec.config) or backend.while_refusal() is not None:
+        # one failure settles the walk: every other bucket would capture twice for it
+        if ask is None or walk in self._run_failures or _is_packed(spec.config) or backend.while_refusal() is not None:
             return None, None, None
         if walk in self._generator_walks:
             self._run_failures[walk] = "runner: its forward draws from a torch generator, which a raw launch repeats"
@@ -1371,7 +1372,7 @@ class AcceleratorGraphRunner:
         }
         graph_exec: list[int] = []
         run = DeviceRun(
-            state, inputs, lambda: cuda.launch(graph_exec[0], backend.current_stream().cuda_stream), ask.limit,
+            state, inputs, lambda: cuda.launch(graph_exec[0], backend.raw_stream()), ask.limit,
         )
 
         def body() -> Any:
@@ -1390,7 +1391,7 @@ class AcceleratorGraphRunner:
                 target = warmed.static_inputs[pair.input]
                 target.copy_(output_named(output, pair.output).reshape(target.shape))
             tokens = output_named(output, ask.token_signal).to(torch.long)
-            cuda.stop(state, tokens, device_handle, backend.current_stream().cuda_stream)
+            cuda.stop(state, tokens, device_handle, backend.raw_stream())
             return raw
 
         try:

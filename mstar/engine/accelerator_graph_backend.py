@@ -236,8 +236,12 @@ class CUDAGraphBackend(_TorchGraphBackend):
     def raw_launch(self, graph: CapturedGraph) -> RawLaunch:
         return RawLaunch(
             self._runtime_entry("cudaGraphLaunch"), self._runtime_entry("cudaMemcpy2DAsync"),
-            int(graph.raw_cuda_graph_exec()), int(self.current_stream().cuda_stream),
+            int(graph.raw_cuda_graph_exec()), self.raw_stream(),
         )
+
+    def raw_stream(self) -> int:
+        """The current ``cudaStream_t``, which ``torch.Stream`` doesn't expose."""
+        return int(self._runtime.current_stream(self.device).cuda_stream)
 
     def generator_offset(self) -> int:
         return torch.cuda.default_generators[self.device.index or 0].get_offset()
