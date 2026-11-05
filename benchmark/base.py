@@ -480,7 +480,7 @@ class MiniCPMO45(Model):
         return self._tokenizer
 
     def get_model_kwargs(self, request_type: RequestType):
-        speech =request_type.get_output_modalities() == "audio"
+        speech = request_type.get_output_modalities() == "audio"
         # Greedy LLM, capped, no repetition penalty: vllm-omni's stage-0
         # defaults. The TTS keeps each system's own sampling defaults (both
         # upstream's temperature 0.8 / top-p 0.85 / top-k 25), since
