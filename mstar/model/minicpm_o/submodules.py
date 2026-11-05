@@ -112,8 +112,12 @@ class LLMSubmodule(ARNodeSubmodule):
     PREFILL_TOKEN_BUCKETS = [32, 64, 128, 256, 512, 1024, 2048]
     PREFILL_CAPTURE_BATCH_SIZES = [1, 2, 4, 8]
     DECODE_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64]
-    # off, as on the other Qwen3DenseLM nodes: compiled, Canary-Qwen's
-    # throughput was 7-15% lower (its H100 A/B)
+    # Off for the eager path only (a shape no capture holds), as on the other
+    # Qwen3DenseLM nodes: compiled, Canary-Qwen's throughput was 7-15% lower
+    # (its H100 A/B). The captures below keep `compile=True`: uncompiled, text
+    # was 8% slower at c=1 and 3% at c=32 (H200). Inductor picks its kernels
+    # per process, so greedy text can differ between boots with an empty
+    # compile cache.
     disable_torch_compile = True
 
     def __init__(self, model: Qwen3DenseLM, config: MiniCPMOConfig):
