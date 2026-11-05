@@ -9,10 +9,11 @@ resized) aborts with every rank's, where NCCL would hang or corrupt data. A
 captured graph meets once per group at each replay, on its collectives over that
 group's ranks. The data moves (over gloo) only if every rank holds values (a vote,
 lengths); otherwise its outputs are never computed. Point to point has no group to meet
-on: its two ranks swap their values bits before the payload, so both decide alike. Either way it is charged its
-NCCL time (:func:`mstar_sim.cost.collective_seconds`, measured tables where
-they exist) on the current stream, on every rank alike, so timing stays
-symmetric, as SGLang's simulator and Maya assume.
+on: a send's descriptor travels one way to its receive, ahead of a payload if the sender
+holds values (:func:`_send`, :func:`_receive`). Either way it is charged its NCCL time
+(:func:`mstar_sim.cost.collective_seconds`, measured tables where they exist) on the
+current stream, on every rank alike, so timing stays symmetric, as SGLang's simulator and
+Maya assume.
 """
 
 from __future__ import annotations
@@ -20,12 +21,14 @@ from __future__ import annotations
 import functools
 import hashlib
 import inspect
+import itertools
 import operator
 import os
 import resource
 import sys
 import threading
 import time
+from contextlib import contextmanager
 
 import torch
 import torch.distributed as dist
@@ -62,7 +65,7 @@ def _sim_tensors(args, kwargs) -> list[torch.Tensor]:
 # receives from i. The sixth is bits, ANDed across ranks: HELD, whether the data moves (every
 # rank holds values), and COMPUTED, whether what it writes is (every rank's were).
 _PRIMITIVES = ("AllReduce", "Broadcast", "Reduce", "AllGather", "ReduceScatter", "AllToAll",
-               "AllReduceFusion", "Graph", "Barrier")
+               "AllReduceFusion", "Graph", "Barrier", "PointToPoint")
 _DTYPES = tuple(dict.fromkeys(v for v in vars(torch).values() if isinstance(v, torch.dtype)))
 _VALUES = 5  # the index of the values field
 HELD, COMPUTED = 1, 2
@@ -101,35 +104,48 @@ def _abort() -> None:
     os.abort()
 
 
+@contextmanager
+def _waiting():
+    """The host waits for its peers: not the emulator's work, and the device's clock stands still."""
+    with clock.computing():
+        began = time.perf_counter()
+        yield
+        waited = time.perf_counter() - began
+        clock.STATS["host_compute"] -= waited
+        clock.STATS["host_wait"] += waited
+
+
+def _watched(wait, where: str, mine: list[int], replay: bool = False) -> None:
+    """``wait``, a call into gloo for a peer. One that never comes within the group's timeout
+    aborts an eager call, as NCCL's watchdog does, and hangs a replay, whose collectives
+    nothing watches. ``kill -USR1`` a peer for its stack."""
+    try:
+        wait()
+    except RuntimeError as e:
+        print(f"{where}: {_describe(mine)} met no peer ({e}). "
+              + ("A replayed graph's collectives are unwatched: this rank hangs, as on a GPU." if replay else
+                 "NCCL's watchdog aborts here (or the emulator's host-side meet hung: README Limits)."),
+              file=sys.stderr, flush=True)
+        if replay:
+            threading.Event().wait()
+        _abort()
+
+
 def _meet(group, mine: list[int], replay: bool = False) -> list[list[int]]:
     """Meet the group's other ranks at a collective (``replay``: a graph's replay) and return
-    every rank's descriptor. Blocks until they all come, as the GPU's kernel does. A
-    mismatch aborts (NCCL's behaviour there is undefined: a hang or corrupt data, and a
-    raise would be caught and served past). A peer that never comes within the group's
-    timeout aborts an eager call, as NCCL's watchdog does, and hangs a replay, whose
-    collectives nothing watches. ``kill -USR1`` a peer for its stack."""
+    every rank's descriptor. Blocks until they all come, as the GPU's kernel does
+    (:func:`_watched`). A mismatch aborts (NCCL's behaviour there is undefined: a hang or
+    corrupt data, and a raise would be caught and served past)."""
     ranks = dist.get_process_group_ranks(group)
     me = dist.get_rank()
     seq = group._get_sequence_number_for_group()  # torch's count of the group's gloo ops
     where = f"mstar_sim: rank {me}, torch sequence number {seq} (meets included) on the group of ranks {ranks}"
-    with clock.computing():  # the device's clock stands still while ranks meet
-        gathered = torch.empty(len(ranks) * len(mine), dtype=torch.int64, device="cpu")  # whatever the default
-        began = time.perf_counter()
-        try:
-            # straight to the backend: torch's public function logs a failure through the group's
-            # registry entry, which the fused-AR channel hasn't, and turns the timeout into a ValueError
-            group._allgather_base(gathered, torch.tensor(mine, dtype=torch.int64, device="cpu")).wait()
-            waited = time.perf_counter() - began  # for its peers: a wait, not the emulator's work
-            clock.STATS["host_compute"] -= waited
-            clock.STATS["host_wait"] += waited
-        except RuntimeError as e:
-            print(f"{where}: {_describe(mine)} met no peer ({e}). "
-                  + ("A replayed graph's collectives are unwatched: this rank hangs, as on a GPU." if replay else
-                     "NCCL's watchdog aborts here (or the emulator's host-side meet hung: README Limits)."),
-                  file=sys.stderr, flush=True)
-            if replay:
-                threading.Event().wait()
-            _abort()
+    gathered = torch.empty(len(ranks) * len(mine), dtype=torch.int64, device="cpu")  # whatever the default
+    with _waiting():
+        # straight to the backend: torch's public function logs a failure through the group's
+        # registry entry, which the fused-AR channel hasn't, and turns the timeout into a ValueError
+        _watched(lambda: group._allgather_base(gathered, torch.tensor(mine, dtype=torch.int64, device="cpu")).wait(),
+                 where, mine, replay)
     rows = gathered.view(len(ranks), -1).tolist()
     if not _pairs(rows):
         lines = "".join(f"\n  rank {r}: {_describe(d)}{'  <- this rank' if r == me else ''}"
@@ -161,14 +177,84 @@ def collective(family: str, group, nbytes: int, desc: list[int] | None) -> int:
     return functools.reduce(operator.and_, (r[_VALUES] for r in _meet(group, desc)))
 
 
-def _swap(peer: int, group, mine: int) -> int:
-    """Point to point: swap values bits (:func:`row`) with rank ``peer`` and return its. The
-    lower rank sends first, so a send against a send pairs too, as ``isend`` pairs."""
-    out, back = torch.tensor([mine], device="cpu"), torch.empty(1, dtype=torch.int64, device="cpu")
-    with clock.computing():
-        for step in ("send", "recv") if dist.get_rank() < peer else ("recv", "send"):
-            getattr(dist, step)(out if step == "send" else back, peer, group=group)
-    return int(back)
+# --- point to point. A send's descriptor (:func:`row`, its ``op`` the tag its payload follows
+# on) is the call's own message: on the call's tag and to the call's peer, so it pairs as the
+# call would, whoever names whom. Only the sender decides whether a payload follows, so nothing
+# flows back. Payload tags are fresh, above any a caller uses, so a receive finds its payload
+# whichever of its rank's receives finishes first.
+_PAYLOAD_TAGS = itertools.count(1 << 30)
+
+
+class _Posted(_Done):
+    """The ``Work`` of a point-to-point call. ``finish``, which returns the rank (in the group)
+    it heard from, runs on its own thread, as gloo's progress does: a receive has to post for
+    its payload once the descriptor comes, and its peer's ``wait`` can't hang on this rank's."""
+
+    def __init__(self, finish):
+        def run():
+            self._source = finish()
+
+        self._source = None
+        self._thread = threading.Thread(target=run, name="mstar_sim-point-to-point", daemon=True)
+        self._thread.start()
+
+    def wait(self, timeout=None):
+        with _waiting():
+            self._thread.join()
+        return True
+
+    def is_completed(self):
+        return not self._thread.is_alive()
+
+    def get_future(self):
+        self.wait()
+        return super().get_future()
+
+    def _source_rank(self):
+        return self._source
+
+
+def _send(a: dict, group, tensor: torch.Tensor, mine: int) -> _Posted:
+    """Post ``tensor``'s descriptor, and its data if this rank holds it."""
+    tag = next(_PAYLOAD_TAGS)
+    desc = row("PointToPoint", tensor.numel(), tensor.dtype, op=tag, values=mine)
+    to = {"dst": a["dst"], "group": group, "group_dst": a["group_dst"]}
+    posted = [dist.isend(torch.tensor(desc, dtype=torch.int64, device="cpu"), tag=a["tag"], **to)]
+    if mine & HELD:
+        posted.append(dist.isend(tensor._data, tag=tag, **to))
+    where = f"mstar_sim: rank {dist.get_rank()}"
+
+    def finish():
+        for work in posted:
+            _watched(work.wait, where, desc)
+
+    return _Posted(finish)
+
+
+def _receive(a: dict, group, tensor: torch.Tensor, mine: int) -> _Posted:
+    """Post for a sender's descriptor, then take what follows it: into ``tensor``, or dropped
+    if this rank holds no values. What it leaves is computed only if both ranks' were."""
+    desc = row("PointToPoint", tensor.numel(), tensor.dtype, values=mine)
+    frame = torch.empty(len(desc), dtype=torch.int64, device="cpu")
+    into = tensor._data if mine & HELD else torch.empty(tensor.shape, dtype=tensor.dtype, device="cpu")
+    posted = dist.irecv(frame, a["src"], group, a["tag"], a["group_src"])
+    where = f"mstar_sim: rank {dist.get_rank()}"
+
+    def finish():
+        _watched(posted.wait, where, desc)
+        theirs = frame.tolist()
+        if theirs[1:3] != desc[1:3]:
+            print(f"{where}: the ranks' sends don't pair (NCCL would hang or corrupt data): {_describe(desc)} "
+                  f"received {_describe(theirs)}", file=sys.stderr, flush=True)
+            _abort()
+        source, values = posted._source_rank(), theirs[_VALUES] & mine
+        if theirs[_VALUES] & HELD:
+            _watched(lambda: dist.recv(into, group=group, group_src=source, tag=theirs[3]), where, desc)
+        if mine & HELD:
+            device.set_never_computed(into, not (values & HELD and values & COMPUTED))
+        return source
+
+    return _Posted(finish)
 
 
 def seal(tape: clock.Tape) -> None:
@@ -205,6 +291,8 @@ _ONLY_READS = {"send", "isend"}
 _ONLY_READS_AT = {"broadcast": "root", "reduce": "others"}
 # and all but these leave nothing of what was there (a broadcast's other ranks read nothing)
 _READS_WHAT_IT_WRITES = {"all_reduce", "reduce"}
+# these return a ``Work`` whether or not they take ``async_op``
+_RETURN_WORK = {"isend", "irecv"}
 
 
 def _splits(t: torch.Tensor, sizes, size: int) -> list[int]:
@@ -244,7 +332,6 @@ def _collective(name: str, family: str, primitive: str | None):
                 | COMPUTED * (not any(device.never_computed(t._data) for t in tensors
                                       if not any(t is c for c in covered))))
         desc = None  # point to point (mstar sends none)
-        peer = next((a[k] for k in ("dst", "src") if a.get(k) is not None), None)
         if primitive is not None:
             size = dist.get_world_size(group) if dist.is_initialized() else 1
             send = recv = None
@@ -255,10 +342,17 @@ def _collective(name: str, family: str, primitive: str | None):
             desc = row(primitive, 0 if send else sum(t.numel() for t in outputs), (outputs or tensors)[0].dtype,
                        op=int(op) if op is not None else 0, root=root, values=mine, send=send, recv=recv, size=size)
         values = collective(family, group, nbytes, desc) & mine
-        if desc is None and peer is not None and clock.capturing() is None:
-            values &= _swap(peer, group, mine)
+        if primitive is None and clock.capturing() is None:
+            with clock.computing():
+                work = (_send if name in _ONLY_READS else _receive)(a, group, a[first], mine)
+            if name in _RETURN_WORK:
+                return work
+            work.wait()
+            return None if name == "send" else dist.get_global_rank(group or dist.group.WORLD, work._source_rank())
         moved = bool(values & HELD)
-        work = _Done() if kwargs.get("async_op") else None
+        work = _Done() if kwargs.get("async_op") or name in _RETURN_WORK else None
+        if name == "recv":  # captured, it hears from nobody yet: its rank is the one it names
+            work = a["src"] if a["group_src"] is None else dist.get_global_rank(group, a["group_src"])
         if moved:
             # every rank holds values (a vote, lengths): send them for real, so
             # what ranks agree on device is what they agreed on

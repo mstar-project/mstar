@@ -740,17 +740,49 @@ def test_tensor_parallel_ranks_meet_at_each_collective():
             assert never_computed(out._data) if r == 0 else out._data.device.type == "meta"
             # point to point moves only if both ranks hold values: a value-less send against a
             # kept receive moves nothing, where the receive alone would wait for it forever
+            kept, valueless = torch.zeros(4, device="cuda"), torch.empty(1 << 14, device="cuda")[:4] * 2
             if r == 0:
-                dist.send(torch.empty(1 << 14, device="cuda")[:4] * 2, dst=1)
+                dist.send(valueless, dst=1)
+                dist.isend(valueless, dst=1).wait()
             else:
-                kept = torch.zeros(4, device="cuda")
-                dist.recv(kept, src=0)
+                assert dist.recv(kept, src=0) == 0 and never_computed(kept._data)
+                dist.irecv(kept, src=0).wait()
                 assert never_computed(kept._data)
+            # and a kept send's payload against a value-less receive has nowhere to land
+            if r == 0:
+                dist.send(torch.ones(4, device="cuda"), dst=1)
+            else:
+                dist.recv(valueless, src=0)
+            # kept on both, each isend before its irecv, whichever way the peer is named
+            mine, theirs = torch.full((4,), float(r), device="cuda"), torch.zeros(4, device="cuda")
+            sends = dist.isend(mine, 1 - r), dist.isend(mine * 3, group_dst=1 - r, group=dist.group.WORLD, tag=7)
+            late = torch.zeros(4, device="cuda")
+            recvs = dist.irecv(theirs, 1 - r), dist.irecv(late, 1 - r, tag=7)
+            for work in (*recvs[::-1], *sends):  # the waits needn't follow the posts
+                work.wait()
+            assert theirs.tolist() == [1.0 - r] * 4 and late.tolist() == [3.0 - 3 * r] * 4
+            assert not never_computed(theirs._data)
+            # a receive from any source takes its sender's frame and returns its rank
+            if r == 0:
+                dist.send(mine + 5, dst=1)
+            else:
+                assert dist.recv(theirs) == 0 and theirs.tolist() == [5.0] * 4
+            # tags pair apart from the order they're posted in, even when only one payload moves
+            a, b = torch.zeros(4, device="cuda"), torch.zeros(4, device="cuda")
+            if r == 0:
+                works = dist.isend(valueless, dst=1, tag=1), dist.isend(mine + 2, dst=1, tag=2)
+            else:
+                works = dist.irecv(b, src=0, tag=2), dist.irecv(a, src=0, tag=1)
+            for work in works:
+                work.wait()
+            assert r == 0 or (b.tolist() == [2.0] * 4 and never_computed(a._data) and not never_computed(b._data))
             # captured, nothing moves, at each replay
             y, graph = torch.zeros(4, device="cuda"), torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
                 y.copy_(src * 2)
                 dist.all_reduce(y)
+                dist.isend(y, 1 - r).wait()
+                assert dist.recv(y, 1 - r) == 1 - r
             graph.replay()
             assert never_computed(y._data)
             # a rank's wait for a late peer is a host wait, not the emulator's own time
@@ -759,6 +791,9 @@ def test_tensor_parallel_ranks_meet_at_each_collective():
             emulator = clock.STATS["host_compute"]
             time.sleep(r)
             dist.all_reduce(y)
+            assert clock.STATS["host_compute"] - emulator < 0.5, clock.STATS
+            time.sleep(r)
+            dist.recv(kept, src=1) if r == 0 else dist.send(mine, dst=0)
             assert clock.STATS["host_compute"] - emulator < 0.5, clock.STATS
             dist.destroy_process_group()
 
@@ -786,6 +821,16 @@ def test_tensor_parallel_ranks_meet_at_each_collective():
             # a reduce writes only its destination's: rank 1's stale tensor taints rank 0's sum, and the
             # others' buffers stay as they were (gloo's reduce can leave partial sums in them)
             from mstar_sim.device import never_computed, set_never_computed
+            # a ring of isends and irecvs: no rank waits for its peer to post
+            nxt, prv = torch.full((4,), float(r), device="cuda"), torch.zeros(4, device="cuda")
+            for work in (dist.isend(nxt, (r + 1) % 4), dist.irecv(prv, (r - 1) % 4)):
+                work.wait()
+            assert prv.tolist() == [float((r - 1) % 4)] * 4
+            # in a group: its rank names the peer, and a receive returns the global one
+            if r % 2:
+                dist.send(nxt, group_dst=0, group=tp)
+            else:
+                assert dist.recv(prv, group=tp) == r + 1 and prv.tolist() == [r + 1.0] * 4
             summed = torch.full((4,), r + 1.0, device="cuda")
             set_never_computed(summed._data, r == 1)
             dist.reduce(summed, dst=0)
@@ -817,13 +862,15 @@ def test_tensor_parallel_ranks_meet_at_each_collective():
     assert out.strip().endswith("ok")
 
 
-@pytest.mark.parametrize("case", ["mismatch", "graph_vs_eager", "bucket", "extra_replay", "skip", "fused_skip"])
+@pytest.mark.parametrize("case", ["mismatch", "graph_vs_eager", "bucket", "extra_replay", "skip", "fused_skip",
+                                  "send_size", "recv_skip"])
 def test_ranks_whose_collectives_dont_pair_abort(case):
     """A rank whose collective doesn't pair with its peer's (a barrier against an all-reduce,
     a graph replayed against eager calls or against one that captured another size) aborts
     with both ranks' descriptors; one whose peer never comes (to a collective, or to a fused
     all-reduce on its own channel) aborts at the group's timeout, as NCCL's watchdog does, or
-    hangs in a replay."""
+    hangs in a replay. So for point to point: a receive of another size, whose rank has both
+    descriptors, and a receive with no sender."""
     out = run_sim(f"""
         import datetime, os, tempfile, time, torch, torch.distributed as dist, torch.multiprocessing as mp
 
@@ -839,6 +886,10 @@ def test_ranks_whose_collectives_dont_pair_abort(case):
                 space = comm.create_allreduce_fusion_workspace(world_size=2, rank=r)
             if "{case}" == "mismatch":
                 dist.all_reduce(x) if r else dist.barrier()
+            elif "{case}" == "send_size":  # value-less sides: gloo's own size check never sees it
+                dist.recv(x, src=0) if r else dist.send(x[:8] * 2, dst=1)
+            elif "{case}" == "recv_skip":
+                dist.recv(x, src=1) if r == 0 else time.sleep(7)
             elif "{case}" in ("graph_vs_eager", "bucket", "extra_replay"):
                 graph = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(graph):
@@ -872,8 +923,10 @@ def test_ranks_whose_collectives_dont_pair_abort(case):
             for p in ctx.processes:
                 p.kill()
     """)
-    if case in ("skip", "fused_skip"):
+    if case in ("skip", "fused_skip", "recv_skip"):
         assert "exits [-6, 0]" in out, out
+    elif case == "send_size":
+        assert "exits [0, -6]" in out and "numel=16384" in out and "numel=8" in out, out
     elif case == "extra_replay":
         assert "exits [0, None]" in out and "rank 1 passed" not in out, out
     else:

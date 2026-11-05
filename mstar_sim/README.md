@@ -162,9 +162,10 @@ the roofline.
   enqueues it. Device times are unchanged, but the host waits for its slowest peer to launch, and
   host-side gloo traffic (an `agree` on a CPU group) or another stream's collectives, interleaved
   with device collectives in a different order on different ranks, hang here where a GPU wouldn't.
-  `send`/`recv` (and `isend`/`irecv`) swap their two ranks' held bits before the payload, so both
-  move it or neither does; that swap blocks too. One that names no peer (`recv` from any source, or
-  `group_dst`/`group_src`) moves data only if this rank holds it.
+  `send`/`recv` (and `isend`/`irecv`) aren't met: a send posts its descriptor, then its data if it
+  holds values, so what pairs on a gloo group pairs here. A receive keeps that data only if it
+  holds values too, and aborts on a size or dtype that doesn't pair, or a sender that never comes,
+  as a collective does.
 - A skipped eager collective shifts its group's pairing, which shows at the next collective of
   another shape: between identical ones (per-layer all-reduces outside a graph) it is silent
   until then, as NCCL's corruption is. Inside a graph, the replay's sequence hash catches it.
