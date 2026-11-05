@@ -376,6 +376,11 @@ def test_flashinfers_planner_runs_short_of_a_small_workspace():
             raise SystemExit("a fixed split kept no partials")
         except RuntimeError as e:
             assert "batch_prefill_tmp_v" in str(e), e
+            try:  # and leaves the wrapper unplanned
+                ragged.run(torch.zeros(8192, 8, 64, device="cuda"), None, None)
+                raise SystemExit("ragged run() after a failed plan")
+            except RuntimeError as e:
+                assert "plan() must be called" in str(e), e
         workspace.data = torch.empty(need, dtype=torch.uint8, device="cuda")
         plan()
         workspace.data = torch.empty(need - 1, dtype=torch.uint8, device="cuda")  # and a failed re-plan undoes one
