@@ -6,8 +6,8 @@ free, and once the pool is full a follower can refuse an admit rank 0 grants. Ra
 forwards each teardown stamped with the last step it has broadcast. A follower holds it
 until it has popped that step, and reads no message between popping a step and the admit
 fence at the top of the next pass, so it lands after that admit. Rank 0 lands it there too.
-When the follower drops a step it popped, it tears the held ones down before it takes the
-next. A removal deferred behind step N is retried once N is post-processed, when N+1 is
+When the follower drops a step, popped or dropped on arrival, it tears the held ones down
+before it takes the next. A removal deferred behind step N is retried once N is post-processed, when N+1 is
 speculated, broadcast and maybe not yet admitted; but ``_remove_request`` defers it again
 while N is still the step in flight, and the next pass tears it down behind N+1's admit
 fence. A removal that reaches rank 0 once N is done, with nothing in flight, lands before
@@ -34,7 +34,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from mstar.engine.resources.kv.cache import PageAllocator  # noqa: E402
 from mstar.utils.containers import RecentSet  # noqa: E402
-from mstar.utils.ipc_format import MessageSource, RemoveRequest, WorkerMessageType  # noqa: E402
+from mstar.utils.ipc_format import (  # noqa: E402
+    MessageSource,
+    RemoveRequest,
+    ScheduleTPNode,
+    WorkerMessageType,
+)
 from mstar.worker import worker as worker_mod  # noqa: E402
 from mstar.worker.stream_buffers import StreamBufferManager  # noqa: E402
 from mstar.worker.worker import Worker  # noqa: E402
@@ -97,7 +102,10 @@ class _Scheduler:
         return self.heads[0] if self.heads else None
 
     def pop_tp_follow_head(self):
-        self.last_consumed_tp_seq = self.heads.pop(0).spec_seq
+        self.consume_tp_follow(self.heads.pop(0))
+
+    def consume_tp_follow(self, message):
+        self.last_consumed_tp_seq = message.spec_seq
 
     def take_admit_errors(self):
         return {}
@@ -370,6 +378,58 @@ def test_a_follower_that_drops_a_step_tears_down_before_it_takes_the_next(monkey
     w._drop_failed_rids = lambda *args: None
     w._reset_skip_plan_flags = lambda node_batch: None
     w._graph_runtime.push_back_node = lambda *args: None
+    _run(w)
+
+    assert log.index(("teardown", "gone")) < log.index(("admit", 2)), log
+
+
+def test_a_follower_counts_a_head_it_drops_on_arrival(monkeypatch):
+    """N raises, and rank 0's head from it lands after that, so this rank drops it unqueued.
+    Rank 0 stamped "gone" with that head, and the row "gone" gave up let it send N+2 for a
+    waiting request. N+2 can't take its row here until "gone" goes, so the teardown can't
+    wait for a step past the dropped one: both ranks would sit there for good."""
+    head = ScheduleTPNode(
+        node_name=NODE, graph_walk=WALK, request_ids=["kept"],
+        speculative=True, spec_seq=1, spec_from_seq=0,
+    )
+    removal = RemoveRequest(request_id="gone", source=MessageSource.TP_RANK_0, after_tp_seq=1)
+    w, log = _rank(monkeypatch, tp_rank=1, inbox=[])
+    w.tp_async_sched, w.tp_async_nodes, w._tp_repeats = True, None, None
+    w.scheduler.heads.clear()
+    w.scheduler.steps += [None, [HANDLES["kept"]]]
+    gpu, next_batch = w._execute_on_gpu_thread, w.scheduler.get_next_batch
+
+    def _raise_on_n(batch, node_batch, plan_future=None):
+        gpu(batch, node_batch, plan_future)
+        if batch.tp_seq == 0:
+            raise RuntimeError("forward failed")
+        return {}
+
+    def _row_waits_on_the_teardown(request_state, **kwargs):
+        if w.scheduler.last_consumed_tp_seq < 0 or ("teardown", "gone") in log:
+            return next_batch(request_state, **kwargs)
+        return None
+
+    passes = iter(range(50))
+    undelivered = [head, removal]
+
+    def _process_messages():
+        if next(passes, None) is None:
+            raise _Stop  # the hang: nothing will ever move
+        if 0 in w._tp_nospec and undelivered:
+            w._register_tp_follow(undelivered.pop(0))
+            w._remove_request(undelivered.pop(0))
+
+    def _speculation_or_stop(pending, consecutive, fair):
+        if pending is not None and pending.tp_seq == 2:
+            raise _Stop
+        return None, None
+
+    w._execute_on_gpu_thread = _raise_on_n
+    w.scheduler.get_next_batch = _row_waits_on_the_teardown
+    w._process_messages = _process_messages
+    w._build_speculation = _speculation_or_stop
+    w._handle_main_loop_error = lambda *args: None
     _run(w)
 
     assert log.index(("teardown", "gone")) < log.index(("admit", 2)), log

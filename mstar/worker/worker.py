@@ -3689,6 +3689,8 @@ class Worker(RepeatingSteps):
                 "Worker %s: dropped speculative head seq %d (parent %d closed)",
                 self.worker_id, message.spec_seq, message.spec_from_seq,
             )
+            # Rank 0 sends nothing between a step and its head, so no earlier head is queued.
+            self.scheduler.consume_tp_follow(message)
             return
         if message.from_repeats and self._tp_repeats is not None:
             self._settle_tp_repeats(message.spec_from_seq, leader=message.from_repeats)

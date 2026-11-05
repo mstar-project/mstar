@@ -871,8 +871,7 @@ class MicroScheduler:
         # and the async follower's build / drop / void paths) pops here, so the
         # drain refcount is discharged in one place.
         message = self.tp_batches_pending_schedule.popleft()
-        self._apply_delta_from_message(message)
-        self._last_popped_tp_seq = max(self._last_popped_tp_seq, message.spec_seq)
+        self.consume_tp_follow(message)
         for rid in message.request_ids:
             if rid not in self.pending_tp_follow_count:
                 continue
@@ -880,6 +879,12 @@ class MicroScheduler:
             if self.pending_tp_follow_count[rid] <= 0:
                 self.pending_tp_follow_count.pop(rid, None)
         return message
+
+    def consume_tp_follow(self, message: ScheduleTPNode) -> None:
+        """Count a leader step as taken, queued or not: a removal stamped with it
+        waits on nothing else, and only this message carries its resident moves."""
+        self._apply_delta_from_message(message)
+        self._last_popped_tp_seq = max(self._last_popped_tp_seq, message.spec_seq)
 
     def pop_ready_rids(
         self, request_state: RequestStateManager,

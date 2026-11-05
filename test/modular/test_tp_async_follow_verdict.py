@@ -274,8 +274,16 @@ def test_nospec_marker_is_recorded_and_never_queued():
 def test_head_for_a_closed_step_is_dropped_on_arrival():
     s = _stub()
     s._close_tp_follow_step(_pending(4))
-    s._register_tp_follow(_head(["r0"], seq=5, from_seq=4))
+    head = _head(["r0"], seq=5, from_seq=4)
+    head.resident_delta.add_offloaded("r1")
+    replayed = []
+    s.engine_manager.get_engine = lambda node: types.SimpleNamespace(
+        apply_resident_delta=lambda node, delta: replayed.extend(delta.rids) or True,
+    )
+    s._register_tp_follow(head)
     assert s.scheduler.peek_tp_follow() is None
+    # rank 0 made the head's moves and stamps removals with it, dropped or not
+    assert s.scheduler.last_consumed_tp_seq == 5 and replayed == ["r1"]
 
 
 def test_close_drops_an_already_queued_head_for_that_step_only():
