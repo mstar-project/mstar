@@ -201,10 +201,6 @@ def prefill_allocations(qo: list[int], kv: list[int], total_num_rows: int, batch
     return out
 
 
-# shared memory per SM by compute capability (CUDA's table), for the decode kernel's occupancy
-_SMEM_PER_SM = {(8, 0): 167936, (8, 6): 102400, (8, 9): 102400, (9, 0): 233472, (10, 0): 233472}
-
-
 def decode_allocations(kv: list[int], batch: int, num_qo_heads: int, num_kv_heads: int, page_size: int,
                        cuda_graph: bool, head_dim: int, kv_dtype) -> list:
     """What FlashInfer's CUDA-core decode planner (``DecodePlanImpl`` over its work
@@ -221,8 +217,8 @@ def decode_allocations(kv: list[int], batch: int, num_qo_heads: int, num_kv_head
     props = torch.cuda.get_device_properties()
     stages = 2  # every GPU the emulator offers is 8.0 or newer
     smem = 2 * stages * tile * gqa * bdz * head_dim * kv_bytes + max(tile * threads * 8, 2 * gqa * bdz * 4)
-    per_sm = _SMEM_PER_SM[torch.cuda.get_device_capability()]
-    blocks = min(32, props.max_threads_per_multi_processor // threads, per_sm // (smem + 1024))
+    blocks = min(32, props.max_threads_per_multi_processor // threads,
+                 props.shared_memory_per_multiprocessor // (smem + 1024))
     max_grid = blocks * props.multi_processor_count
     pages = [kv[i + 1] - kv[i] for i in range(batch)]
     if batch * num_kv_heads >= max_grid:

@@ -37,7 +37,7 @@ def _spec() -> Spec:
         gpu = gpus.lookup(os.environ.get("MSTAR_SIM_GPU", "h100"))
     except (ImportError, AttributeError):  # the spec table is optional for the device itself
         gpu = SimpleNamespace(name="NVIDIA H100 80GB HBM3", capability=(9, 0), sm_count=132,
-                              memory_bytes=80 << 30)
+                              memory_bytes=80 << 30, smem_per_sm=233472)
     mem_gb = os.environ.get("MSTAR_SIM_MEMORY_GB")
     total = int(float(mem_gb) * (1 << 30)) if mem_gb else gpu.memory_bytes
     return Spec(gpu=gpu, total=total)
@@ -121,6 +121,7 @@ def get_device_properties(device=None):
         multi_processor_count=gpu.sm_count, is_integrated=False, is_multi_gpu_board=False,
         L2_cache_size=getattr(gpu, "l2_bytes", 50 << 20), warp_size=32,
         max_threads_per_multi_processor=2048, regs_per_multiprocessor=65536,
+        shared_memory_per_multiprocessor=gpu.smem_per_sm,
         uuid=f"mstar-sim-{index}", pci_bus_id=index, pci_device_id=0,
         pci_domain_id=0, gcnArchName="",
     )
