@@ -30,6 +30,11 @@ window. Running, a thread that reads the clock more than W past the bound waits 
 (:func:`read`), blocked, until the bound rises. A thread at a collective's meet stands still,
 as NCCL's host doesn't wait: its process stands aside from the bound and takes no moves.
 
+A native process no patch reaches (the Rust frontend) counts as one more thread of the process
+that started it (:func:`watch`): running while any of its threads uses or waits for a CPU,
+sampled at half the settle window while a move is pending. So no one passes its work, which takes real time on the
+clock, and idle it holds no one back. It reads real time itself, and is never held.
+
 Threads named ``mstar_sim-*`` are the emulator's own and never counted. ``--fast`` installs
 none of this.
 """
@@ -73,6 +78,7 @@ _ahead = [math.inf]  # past this a clock read looks at the bound
 _quiet = [0, 0.0]  # the deployment's state, and the real time it last changed
 _wakefd = [-1]  # the mover's wake for a select or a poll, which no lock can end
 _poked: set[Wait] = set()
+_watched: list = []  # a native process: its pid, its last CPU time, whether it counts as running
 REPORT = {"slept_s": 0.0, "late_resumes": 0, "jump_blockers": {}, "ahead_stalls": 0, "settle_overruns": 0,
           "meet_skew_s": 0.0}
 
@@ -254,6 +260,8 @@ def _move() -> float:
     if any(w.kind is MEET for w in pending):
         return _MAX_SLEEP  # a rank at a meet takes no moves, and its deadlines wait for the meet's end
     timeout = _MAX_SLEEP
+    if _watched:
+        timeout = _sample(pending)
     idle = _running[0] == 0
     if idle:
         device = min((w.deadline for w in pending if w.kind is DEVICE), default=math.inf)
@@ -288,6 +296,48 @@ def _move() -> float:
             if w.release is not None:
                 w.release()
     return timeout
+
+
+def watch(pid: int) -> None:
+    """Count native process ``pid`` as a thread of this one, running while it uses a CPU."""
+    with LOCK:
+        _watched[:] = [pid, _activity(pid)[0], False]
+
+
+def _activity(pid: int) -> tuple[int, bool]:
+    """Native process ``pid``'s CPU time, over all its threads (``/proc/<pid>/schedstat`` is its
+    first thread's alone, and a tokio server works on the others), and whether one is runnable:
+    a thread the box has descheduled is working, though its CPU time stands still."""
+    cpu, runnable = 0, False
+    try:
+        tasks = os.listdir(f"/proc/{pid}/task")
+    except OSError:
+        return 0, False
+    for task in tasks:
+        try:
+            with open(f"/proc/{pid}/task/{task}/schedstat") as f:
+                cpu += int(f.read().split()[0])
+            with open(f"/proc/{pid}/task/{task}/stat") as f:
+                runnable = runnable or f.read().rsplit(")", 1)[1].split()[0] == "R"
+        except (OSError, IndexError, ValueError):
+            pass  # a thread that has just gone
+    return cpu, runnable
+
+
+def _sample(pending: list[Wait]) -> float:
+    """Look at the watched process if a move could be pending, and return how soon to look
+    again. Under LOCK."""
+    pid, last, busy = _watched
+    if not busy and (_running[0] or not any(w.deadline is not None for w in pending)):
+        return _MAX_SLEEP
+    cpu, runnable = _activity(pid)
+    working = runnable or cpu != last
+    if working and not busy:
+        _run_one()
+    elif busy and not working:
+        _block_one()
+    _watched[1:] = [cpu, working]
+    return SETTLE / 2
 
 
 def _settled() -> float:

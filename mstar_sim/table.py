@@ -72,8 +72,11 @@ class Table:
         self._d = memoryview(self._map).cast("d")
         self._word = ctypes.addressof(ctypes.c_char.from_buffer(self._map))
         self.me = self._claim()
-        self._q[1] = max(self._q[1], self.me + 1)
         self._mine = _HEADER + self.me * _WORDS
+        self._q[1] = SLOTS
+        if not self._live():
+            self._map[:] = bytes(_SIZE)  # a dead run's table: a restart on its port starts clean
+        self._q[1] = max(self._q[1], self.me + 1)
         self.live: list[int] = []  # as of the last bound
         self._peers: dict[str, int] = {}
         self._names = 0
@@ -128,6 +131,7 @@ class Table:
 
     def publish(self, clock: float, running: bool, next_event: float = math.inf, meet: bool = False) -> None:
         """This slot's state changed: tell the others (a new epoch, and every mover wakes)."""
+        self._q[1] = max(self._q[1], self.me + 1)
         self._d[self._mine + _CLOCK] = clock
         self._d[self._mine + _NEXT] = next_event
         self._q[self._mine + _MEET] = meet

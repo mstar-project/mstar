@@ -785,7 +785,7 @@ def test_a_blocked_process_follows_the_deployments_time():
         barrier()
         start = wall = time.perf_counter(), time.clock_gettime(time.CLOCK_MONOTONIC)
         while time.perf_counter() - start[0] < 2.0:
-            time.sleep(0.01)
+            time.sleep(0.05)
         print(time.perf_counter() - start[0], time.clock_gettime(time.CLOCK_MONOTONIC) - start[1])
     """)
     moved, wall = map(float, follower.split())
@@ -793,27 +793,23 @@ def test_a_blocked_process_follows_the_deployments_time():
 
 
 def test_two_blocked_processes_move_together_to_the_earlier_deadline():
-    """Every process blocked: the earlier deadline moves them both. The later one, woken at that
-    moment by something the emulator can't see (a pipe), finds its clock there too."""
+    """Both blocked on host deadlines: the clock goes to the earlier one, then the later, each
+    on time on the deployment's clock, in far less wall time than the deadlines are apart."""
     early, late = run_deployment("""
         barrier()
         start = time.perf_counter()
-        threading.Event().wait(0.3)
+        time.sleep(1.0)
         print(time.perf_counter() - start, time.perf_counter())
-        os.write(os.open(TMP + "/fifo", os.O_WRONLY), b"x")
-        time.sleep(0.2)  # stays a peer: one that dies wakes no mover, which then looks within 50 ms
+        time.sleep(3.0)  # a peer until the other is done
     """, """
-        import selectors
-        os.mkfifo(TMP + "/fifo")
-        fd = os.open(TMP + "/fifo", os.O_RDONLY | os.O_NONBLOCK)
-        selector = selectors.DefaultSelector()
-        selector.register(fd, selectors.EVENT_READ)
         barrier()
-        selector.select(5.0)
-        print(time.perf_counter())
+        start, wall = time.perf_counter(), time.clock_gettime(time.CLOCK_MONOTONIC)
+        time.sleep(2.0)
+        print(time.perf_counter() - start, time.perf_counter(), time.clock_gettime(time.CLOCK_MONOTONIC) - wall)
     """)
-    span, moved = map(float, early.split())
-    assert 0.3 <= span < 0.4 and -0.001 < float(late) - moved < 0.05, (span, moved, late)  # (-0.001: 2 W)
+    first, woke = map(float, early.split())
+    second, ended, wall = map(float, late.split())
+    assert 1.0 <= first < 1.05 and 2.0 <= second < 2.05 and woke < ended and wall < 1, (first, second, wall)
 
 
 def test_a_fixed_rate_client_keeps_up_with_a_worker_a_message_is_in_flight_to():
@@ -869,6 +865,42 @@ def test_a_collective_starts_at_the_latest_ranks_stream():
     rows = [line.split() for line in out.splitlines() if line.startswith("rank")]
     spans, ends = {r[1]: float(r[2]) for r in rows}, [float(r[3]) for r in rows]
     assert len(rows) == 2 and 1.0 <= spans["0"] < 1.2 and abs(ends[0] - ends[1]) < 1e-6, out
+
+
+def test_a_native_process_holds_the_deployment_only_while_it_works():
+    """The Rust frontend's shape: a child no patch reaches, watched by the process that started
+    it. Its work takes real time on the deployment's clock, a peer's deadline can't pass it,
+    and a wait for the device costs no wall time once it is idle."""
+    owner, peer = run_deployment("""
+        import subprocess
+        work = "import sys, time; sys.stdin.readline(); end = time.process_time() + 0.3\\n" \\
+               "while time.process_time() < end: pass\\nsys.stdin.readline()"
+        child = subprocess.Popen([sys.executable, "-S", "-c", work], stdin=subprocess.PIPE, env={})
+        waits.watch(child.pid)
+        barrier()
+        start, real = time.perf_counter(), time.clock_gettime(time.CLOCK_MONOTONIC)
+        idle = waits._activity(child.pid)[0]
+        child.stdin.write(b"go\\n")
+        child.stdin.flush()
+        while waits._activity(child.pid)[0] == idle:  # (its onset can beat a sample: README Limits)
+            waits._real_sleep(0.0001)
+        time.sleep(0.05)  # a host deadline: a move is pending, so the child is looked at
+        while waits._watched[2]:
+            time.sleep(0.01)
+        print(time.perf_counter() - start, time.clock_gettime(time.CLOCK_MONOTONIC) - real)
+        wall = time.clock_gettime(time.CLOCK_MONOTONIC)
+        clock.charge(1.0)
+        torch.cuda.synchronize()
+        print(time.clock_gettime(time.CLOCK_MONOTONIC) - wall)
+        child.kill()
+    """, """
+        barrier()
+        start = time.perf_counter()
+        time.sleep(0.1)
+        print(time.perf_counter() - start)
+    """)
+    worked, real, wall = map(float, owner.split())
+    assert 0.3 <= worked <= real and wall < 0.2 and 0.1 <= float(peer) < 0.2, (worked, real, wall, peer)
 
 
 def test_timing_only_holds_shapes_not_values():

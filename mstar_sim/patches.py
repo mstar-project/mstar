@@ -14,6 +14,8 @@ from outside.
 - ``worker_flag``: a model built on the CPU in a worker allocates nothing.
 - ``rust_poll``: mstar's poll for other processes is a wait the clock knows
   (:mod:`mstar_sim.waits`).
+- ``rust_frontend``: the Rust frontend's work takes time on the deployment's clock.
+- ``no_uvloop``: uvloop's loop waits where the clock can't see, so asyncio's stands in.
 - ``swap_or_assign``, ``relax_blockwise_scaled_mm_meta``: torch's own (every process, mstar
   or not; ``mstar_sim.device.install`` applies them).
 
@@ -398,6 +400,43 @@ def rust_poll() -> None:
     communicator.try_send_bytes = sending_bytes
 
 
+def rust_frontend() -> None:
+    """The Rust frontend is a native process no patch reaches: the process that starts it counts
+    it as a thread of its own while it uses a CPU (:func:`mstar_sim.waits.watch`)."""
+    frontend = importlib.import_module("mstar.api_server.rust_frontend")
+    _require(frontend, "launch_rust_server")
+    from mstar_sim import clock, waits
+
+    if clock.FAST:
+        return
+    launch = frontend.launch_rust_server
+
+    def launched(*args, **kwargs):
+        proc = launch(*args, **kwargs)
+        waits.watch(proc.pid)
+        return proc
+
+    frontend.launch_rust_server = launched
+
+
+def no_uvloop() -> None:
+    """libuv's own epoll wait is invisible to the registry, and its clock to the patches: under
+    the emulator ``uvloop`` hands back asyncio's loop, which they cover."""
+    from mstar_sim import clock
+
+    try:
+        uvloop = importlib.import_module("uvloop")
+    except ImportError:
+        return
+    if clock.FAST:
+        return
+    import asyncio
+
+    uvloop.install = lambda: None
+    uvloop.new_event_loop = asyncio.new_event_loop
+    uvloop.run = lambda main, **kwargs: asyncio.run(main, debug=kwargs.get("debug"))
+
+
 def swap_or_assign() -> None:
     """Moving a module swaps its parameters in place (so tied weights stay tied), but a
     swap refuses a tensor something else holds (weight_norm's hooks): that module alone
@@ -490,4 +529,5 @@ def install() -> None:
 SKIPPED: list[tuple[str, str]] = []
 
 
-PATCHES = (cap_captures, no_graphs, kv_scatter, conv_kernels, header_only_weights, worker_flag, rust_poll)
+PATCHES = (cap_captures, no_graphs, kv_scatter, conv_kernels, header_only_weights, worker_flag, rust_poll,
+           rust_frontend, no_uvloop)
