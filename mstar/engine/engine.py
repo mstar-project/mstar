@@ -1999,6 +1999,8 @@ class Engine:
             if batch.admit_error is None:
                 self._record_loopback(batch)
                 batch.outputs.loopback_rids = batch.loopback_rids
+                if batch.step_context.repeats > 1:
+                    batch.outputs.run_columns = self.run_columns(batch.node_name, batch.step_context.graph_walk)
             batch.outputs_ready.set()
             laps.lap("record_loopback")
             return batch.outputs

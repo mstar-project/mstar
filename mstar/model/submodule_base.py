@@ -309,6 +309,8 @@ class BatchedModelOutput:
     # A mixed step's rows whose own walk keeps every output signal on the
     # device (see ``ExecutingBatch.loopback_rids``)
     loopback_rids: frozenset = frozenset()
+    # outputs that hold a column per iteration of a step that repeated
+    run_columns: frozenset = frozenset()
     # output name -> [bs, 2] int64 on the forward's device: row i holds the
     # first and one-past-last index of the valid part of request i's output
     # along its last dim. The worker cuts the rows to it once the step has

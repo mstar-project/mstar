@@ -3445,6 +3445,7 @@ class Worker:
         ran = frozenset(outputs_N.row_request_ids or ()) if rows_only else None
         # a mixed N's rows that looped back on the device arrive empty too
         loopback = getattr(outputs_N, "loopback_rids", frozenset())
+        wide = getattr(outputs_N, "run_columns", frozenset())
         chunked = speculation.scheduled_batch.chunk_ranges
         for rid in list(speculation.node_batch.request_ids):
             if rid not in speculation.continuing_rids:
@@ -3475,6 +3476,10 @@ class Worker:
                 if not tensors:
                     ok = False
                     break
+                if input_name in wide:
+                    # a signal that also leaves the Loop: a run kept it a column an
+                    # iteration, of which the loop-back reads the last
+                    tensors = [tensor[:, -1] for tensor in tensors]
                 speculation.node_batch.per_request_input_tensors[rid][input_name] \
                     = list(tensors)
             if ok:
