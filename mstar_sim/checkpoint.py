@@ -110,6 +110,16 @@ class _HubSource:
             return list(pool.map(read, spans))
 
 
+def _write_over_hole(path: Path, size: int, pieces) -> None:
+    """A file of ``size`` bytes, unallocated but for ``pieces`` [(offset, bytes)]."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "wb") as f:
+        for offset, data in pieces:
+            f.seek(offset)
+            f.write(data)
+        f.truncate(size)
+
+
 def _write_sparse(src, rel: str, path: Path) -> int:
     """``rel`` as its header, verbatim (every tensor at its own offset), over a hole holding
     only its small tensors' bytes; returns its parameter count."""
@@ -127,16 +137,16 @@ def _write_sparse(src, rel: str, path: Path) -> int:
             spans.append([start, stop])
     base = 8 + n
     chunks = src.ranges(rel, [(base + start, base + stop) for start, stop in spans])
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "wb") as f:
-        f.write(blob)
-        f.truncate(base + max((v["data_offsets"][1] for v in header.values()), default=0))
+
+    def pieces():
+        yield 0, blob
         span = 0
         for start, stop in small:  # only the small tensors: a large one between stays a hole
             while stop > spans[span][1]:
                 span += 1
-            f.seek(base + start)
-            f.write(chunks[span][start - spans[span][0]:stop - spans[span][0]])
+            yield base + start, chunks[span][start - spans[span][0]:stop - spans[span][0]]
+
+    _write_over_hole(path, base + max((v["data_offsets"][1] for v in header.values()), default=0), pieces())
     return sum(math.prod(v["shape"]) for v in header.values())
 
 
@@ -227,14 +237,8 @@ def _shapes_only_onnx(path: Path, dest: Path) -> int | None:
                     holes.append(data)
         except (StopIteration, ValueError, IndexError):
             return None
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        with open(dest, "wb") as out:
-            pos = 0
-            for start, stop in [*holes, (len(buf), len(buf))]:
-                out.seek(pos)
-                out.write(buf[pos:start])
-                pos = stop
-            out.truncate(len(buf))
+        kept = zip([0, *(stop for _, stop in holes)], [*(start for start, _ in holes), len(buf)], strict=True)
+        _write_over_hole(dest, len(buf), ((start, buf[start:stop]) for start, stop in kept))
     return params
 
 
