@@ -16,6 +16,12 @@ class ResultChunk:
     modality: str  # "text" | "image" | "audio" | "video" | "video_frame"
     data: bytes  # raw payload (text encoded as utf-8)
     metadata: dict = field(default_factory=dict)
+    # --log-stats only: when the output tensor was read (None for a value
+    # sent inline), and the seconds spent postprocessing it
+    # (``Model.postprocess``, or its share of the step's
+    # ``postprocess_inline`` call for a value sent inline)
+    read_time: float | None = None
+    postprocess_s: float = 0.0
 
 
 @dataclass

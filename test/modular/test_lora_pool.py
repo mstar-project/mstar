@@ -170,9 +170,8 @@ def test_admit_refcount_lru_evict_and_the_zero_slot(adapters):
     for a, b in (pool.weights("qkv", 0), pool.weights("o", 1)):
         assert not a[ZERO_SLOT].any() and not b[ZERO_SLOT].any()
     assert pool.scalings[ZERO_SLOT] == 0
-    for rid, name in [("base", None), ("r1", "a1"), ("r2", "a2"), ("r3", "a3"), ("r4", "a2"), ("r5", "a1"),
-                      ("r1", "a1")]:
-        ingest(pool, rid, name)  # a repeated ingest is a no-op
+    for rid, name in [("base", None), ("r1", "a1"), ("r2", "a2"), ("r3", "a3"), ("r4", "a2"), ("r5", "a1")]:
+        ingest(pool, rid, name)
     with pytest.raises(ValueError):
         ingest(pool, "bad", "nope")
     assert run_step(pool, ["base", "r1", "r2"]).ok

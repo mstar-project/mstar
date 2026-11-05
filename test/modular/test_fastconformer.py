@@ -449,6 +449,7 @@ class _Encoder:
         self.node.bind_node_resources(self.resources)
         self.runner = StepRunner(self.resources)
         self.regions = {}       # the piecewise runners, captured on CPU, by label, when a test sets them
+        self.opened = set()     # streams whose resources are open: once per request, as the worker does
 
     def prepare(self, handle, chunk, final=False):
         inputs = {"audio_in": [chunk]} if chunk is not None else {"audio_in": []}
@@ -477,8 +478,10 @@ class _Encoder:
 
     def _step(self, rids, inputs) -> BatchedModelOutput:
         for rid in rids:
-            for resource in self.resources.values():
-                resource.ingest_request(rid)
+            if rid not in self.opened:
+                self.opened.add(rid)
+                for resource in self.resources.values():
+                    resource.ingest_request(rid)
         step = self.declare(rids, inputs)
         if step is not None:
             step.set_ctx(StepContext(request_ids=tuple(rids), graph_walk="encode", slot=0, capture=False))

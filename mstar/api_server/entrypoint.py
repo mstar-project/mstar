@@ -74,7 +74,7 @@ from mstar.utils.client_errors import client_error_text, scrub_paths
 from mstar.utils.exitcode import describe_exitcode
 from mstar.utils.gc_freeze import freeze_after_setup
 from mstar.utils.generation_kwargs import normalize_generation_kwargs
-from mstar.utils.logging_config import quiet_noisy_loggers
+from mstar.utils.logging_config import log_off_thread, quiet_noisy_loggers
 from mstar.utils.orphan import watch_parent
 from mstar.utils.socket_prefix import per_port_socket_prefix
 from mstar.utils.threads import Thread, pin_thread
@@ -147,6 +147,7 @@ def _conductor_process_target(
         force=True,
     )
     quiet_noisy_loggers()
+    log_off_thread()
     # A server started as a background job of a non-interactive shell inherits
     # SIGINT ignored, and Python keeps an inherited ignore, so the graceful stop
     # below (and _shutdown_conductor_process's) would be a no-op. Make it real.
@@ -577,8 +578,11 @@ class APIServer:
         plan = cpus.plan()
         self._result_cpu, self._process_cpus = plan.result, plan.mask
         if plan.result is not None:
-            logger.info("API server: message thread and frontend bridge on CPU %d (%s; mask %s)",
-                        plan.result, plan.why, cpus.format_cpu_list(plan.mask))
+            locked = f"; lock held on cores {plan.locked}" if plan.locked else ""
+            logger.info("API server: message thread and frontend bridge on CPU %d (%s%s; mask %s)",
+                        plan.result, plan.why, locked, cpus.format_cpu_list(plan.mask))
+        elif plan.declined:
+            logger.info("API server: result threads not pinned (%s)", plan.why)
         elif knobs.step_thread_core() != "off":
             logger.warning("API server: result threads not pinned (%s)", plan.why)
 
@@ -1060,6 +1064,7 @@ class APIServer:
         self.pin_result_thread()
         next_liveness_check = 0.0
         self.communicator.register_event_for_poll(self.preprocess_worker.results_wakeup)
+        failed_passes = 0  # in a row
         while self.running:
             now = time.monotonic()
             if now >= next_liveness_check:
@@ -1241,6 +1246,9 @@ class APIServer:
                         if req.profile.timing.first_chunk_time is None:
                             req.profile.timing.first_chunk_time = now
                         req.profile.timing.last_chunk_time = now
+                        if result_chunk.read_time is not None:
+                            req.profile.timing.last_output_read_time = result_chunk.read_time
+                        req.profile.timing.output_postprocess_s += result_chunk.postprocess_s
                         if metrics is not None and result_chunk.modality != "error":
                             req.first_chunk_times.setdefault(result_chunk.modality, now)
                         if req.request_id is not None:
@@ -1298,20 +1306,30 @@ class APIServer:
                 with self.request_lock:
                     if self.recently_completed:
                         next_expiry = self._prune_recently_completed()
+                # Everything else that changes what a pass reads signals the poll:
+                # a message, the data worker's flush (``ResultQueue``) and a
+                # request handler (``_wake_message_loop``). Only the liveness
+                # check and the delivery TTL are on a timer. Inside the try: a
+                # transport error from the wait is a failed pass, not the end of
+                # the thread that delivers every request's results.
+                wait_s = next_liveness_check - time.monotonic()
+                if next_expiry is not None:
+                    wait_s = min(wait_s, next_expiry - time.time())
+                self.communicator.poll_for_messages(timeout_ms=max(0, math.ceil(wait_s * 1000)))
+                if failed_passes:
+                    logger.warning("Message processing loop recovered after %d failed passes", failed_passes)
+                    failed_passes = 0
             except Exception:
+                # the next pass goes after the back-off, without a wait: the
+                # prune may not have run. A transport that stays broken logs
+                # its traceback once, then a count, backing off to 1 s a pass.
                 if self.running:
-                    logger.exception("Error in message processing loop")
-                    time.sleep(0.01)
-                # the prune may not have run: the next pass goes after the back-off
-                next_expiry = time.time()
-            # Everything else that changes what a pass reads signals the poll:
-            # a message, the data worker's flush (``ResultQueue``) and a
-            # request handler (``_wake_message_loop``). Only the liveness
-            # check and the delivery TTL are on a timer.
-            wait_s = next_liveness_check - time.monotonic()
-            if next_expiry is not None:
-                wait_s = min(wait_s, next_expiry - time.time())
-            self.communicator.poll_for_messages(timeout_ms=max(0, math.ceil(wait_s * 1000)))
+                    failed_passes += 1
+                    if failed_passes == 1:
+                        logger.exception("Error in message processing loop")
+                    elif failed_passes % 100 == 0:
+                        logger.error("Message processing loop: %d failed passes in a row", failed_passes)
+                    time.sleep(min(0.01 * 2 ** min(failed_passes - 1, 7), 1.0))
 
     def _wake_message_loop(self) -> None:
         """End the message thread's wait: a request handler changed what its
@@ -2770,8 +2788,10 @@ async def shutdown_event():
 def deployment_cpu_plan(config: dict) -> cpus.CpuPlan:
     """The deployment's CPU plan, as each worker builds it from the conductor's
     device list: the config's ``step_thread_core`` and ``deployment_workers``.
-    Under ``auto`` this also takes the GPUs' locks, and a server that finds one
-    held pins nothing, here or in its workers. A bad knob value is left for the
+    Placing by rank (``always``, ``siblings``) also takes the GPUs' locks, and
+    any plan that pins takes its cores' locks, moving to the next core set
+    the mask holds when one is held; a server that finds a GPU held, or no set
+    free, pins nothing, here or in its workers. A bad knob value is left for the
     conductor's deployment check to report; a CPU number the mask can't honour
     raises ``CpuPlanError``."""
     try:
@@ -2782,13 +2802,17 @@ def deployment_cpu_plan(config: dict) -> cpus.CpuPlan:
     if setting == "off":
         return cpus.deployment_plan(setting, [])
     devices = deployment_workers(config, accelerator_type()).devices
-    plan = cpus.devices_plan(setting, devices)
-    if setting != "auto" or not plan.pinned:
+    plan = cpus.devices_plan(setting, devices, knobs.idle_hold(), slot=0)
+    if not plan.pinned:
         return plan
-    refused = cpus.claim_gpus(cpus.device_addresses(devices))
+    refused = cpus.claim_gpus(cpus.device_addresses(devices)) if setting in cpus.PLACED else None
     if refused is None:
-        return plan
-    logger.warning("step_thread_core auto: nothing pinned, %s", refused)
+        plan = cpus.claim_cores(plan, lambda slot: cpus.devices_plan(setting, devices, knobs.idle_hold(), slot=slot))
+        if plan.pinned:
+            os.environ[cpus.CORE_SET_ENV] = str(plan.slot)
+            return plan
+        refused = plan.why.removeprefix("not pinned: ")
+    logger.warning("step_thread_core %s: nothing pinned, %s", setting, refused)
     # the workers read the knob when they build their plan
     os.environ[knobs.KNOBS["step_thread_core"]] = "off"
     return cpus.CpuPlan(plan.mask, plan.usable, why=f"not pinned: {refused}")
@@ -2797,9 +2821,10 @@ def deployment_cpu_plan(config: dict) -> cpus.CpuPlan:
 def _uvicorn_config(app, host: str, port: int, config: dict) -> uvicorn.Config:
     # Per-message deflate is negotiated server-wide, for every WebSocket route,
     # so it is the deployment's to turn off (see ws_per_message_deflate in
-    # docs/serving.rst); on by default, as uvicorn's.
+    # docs/serving.rst); on by default, as uvicorn's. With no log config of its
+    # own, uvicorn's records reach the root logger and its writer thread.
     return uvicorn.Config(
-        app, host=host, port=port, access_log=False,
+        app, host=host, port=port, access_log=False, log_config=None,
         ws_per_message_deflate=bool(config.get("ws_per_message_deflate", True)),
     )
 
@@ -2912,6 +2937,7 @@ def main(argv: list[str] | None = None):
         format="%(asctime)s %(levelname)s [api_server] %(name)s: %(message)s",
     )
     quiet_noisy_loggers()
+    log_off_thread()
     api_key = resolve_api_key(args.api_key)
     api_key_guard.set(api_key)
     # The Rust frontend gets the key explicitly.
@@ -2928,6 +2954,11 @@ def main(argv: list[str] | None = None):
             "LoRA adapters (`resources: lora:` in the serving config) are served by the "
             "Python frontend only; drop --rust-frontend"
         )
+    if args.rust_frontend:
+        from mstar.api_server.rust_frontend import find_server_binary
+
+        # Before anything loads, so a missing or stale binary fails fast.
+        rust_frontend_bin = find_server_binary(args.rust_frontend_bin)
 
     model_name = config.get("model", "dummy")
     # Forward yaml-level model_kwargs to the API-server-side lightweight
@@ -2942,11 +2973,13 @@ def main(argv: list[str] | None = None):
         cache_dir=args.cache_dir,
         **{**model_init_kwargs(model_name), **yaml_model_kwargs},
     )
-    # before any thread: the pools are sized from the CPUs it leaves unpinned
+    # before any pool thread: the pools are sized from the CPUs it leaves unpinned
     try:
         cpus.install(deployment_cpu_plan(config))
     except cpus.CpuPlanError as e:
         raise SystemExit(f"mstar: {e}") from None
+    if knobs.idle_hold() == "qos":
+        logger.info(cpus.hold_idle())
     _set_preprocess_threads(model, config)
 
     global api_server
@@ -3021,7 +3054,6 @@ def main(argv: list[str] | None = None):
 
             from mstar.api_server.rust_frontend import (
                 RustFrontendBridge,
-                find_server_binary,
                 launch_rust_server,
             )
 
@@ -3030,7 +3062,7 @@ def main(argv: list[str] | None = None):
             # default; --host 0.0.0.0 for the multi-node / container case).
             os.environ.setdefault("MSTAR_SERVER_HOST", args.host)
             rust_proc = launch_rust_server(
-                find_server_binary(args.rust_frontend_bin), model_name,
+                rust_frontend_bin, model_name,
                 args.port, bridge_dir, args.upload_dir, api_key=api_key)
             logger.info("Starting mstar API server (Rust frontend) on port %s",
                         args.port)

@@ -72,6 +72,12 @@ mod flex {
         }
     }
 
+    /// [`opt_f64`] for a field whose presence matters: serde calls this only
+    /// for a field the request sent, so an absent one stays `None` (the default).
+    pub fn sent_f64<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Option<f64>>, D::Error> {
+        opt_f64(d).map(Some)
+    }
+
     pub fn opt_bool<'de, D: Deserializer<'de>>(d: D) -> Result<Option<bool>, D::Error> {
         match Option::<Value>::deserialize(d)? {
             None | Some(Value::Null) => Ok(None),
@@ -164,11 +170,11 @@ pub struct SpeechRequest {
     pub voice: Option<String>,
     #[serde(default = "default_wav")]
     pub response_format: String,
-    /// Accepted for OpenAI compatibility (kept out of `extra`); playback-rate
-    /// adjustment is not applied, as in mstar.
-    #[allow(dead_code)]
-    #[serde(default, deserialize_with = "flex::opt_f64")]
-    pub speed: Option<f64>,
+    /// Kept out of `extra`. `None` when the request did not send it,
+    /// `Some(None)` for an explicit `null`: an adapter forwards a sent speed
+    /// (pydantic's `model_fields_set`) and leaves an unsent one out.
+    #[serde(default, deserialize_with = "flex::sent_f64")]
+    pub speed: Option<Option<f64>>,
     /// `bool | None` in Python (default False); accept an explicit `null`
     /// instead of hard-erroring. Absent / null / false all mean non-streaming.
     #[serde(default, deserialize_with = "flex::opt_bool")]
@@ -357,6 +363,15 @@ mod tests {
         assert_eq!(max_tokens("-9223372036854775808.0").unwrap(), Some(i64::MIN));
         let seed = r#"{"messages":[],"seed":1e20}"#;
         assert!(serde_json::from_str::<ChatCompletionRequest>(seed).is_err());
+    }
+
+    #[test]
+    fn speech_speed_tells_unsent_from_null() {
+        let speed = |body: &str| serde_json::from_str::<SpeechRequest>(body).unwrap().speed;
+        assert_eq!(speed(r#"{"input":"x"}"#), None);
+        assert_eq!(speed(r#"{"input":"x","speed":null}"#), Some(None));
+        assert_eq!(speed(r#"{"input":"x","speed":"1.5"}"#), Some(Some(1.5)));
+        assert!(serde_json::from_str::<SpeechRequest>(r#"{"input":"x","speed":"fast"}"#).is_err());
     }
 
     #[test]
