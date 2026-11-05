@@ -604,15 +604,33 @@ def _shaped_by_never_computed(func, args) -> bool:
 
 def _passes_on_other_values(func, args, kwargs) -> bool:
     """Whether what an aten op refused was its never-computed operands' values, not their
-    shapes or dtypes: it passes with other values in their place. A float takes random
-    values. An integer tries zeros, then ones: what it holds may be either (zeros from a
-    stand-in, a nonzero linalg ``info`` derived from them), and a divisor needs ones. An op
-    that these values break too reads as refusing shapes, the loud side."""
+    shapes, dtypes or layouts: it passes with other values in their place. A float takes
+    random values. An integer tries zeros, then ones: what it holds may be either (zeros from
+    a stand-in, a nonzero linalg ``info`` derived from them), and a divisor needs ones. Each
+    never-computed storage becomes one host buffer that its operands view with their own
+    sizes, strides and offsets, so an overlap torch refuses (an in-place write to an
+    expanded view) is still refused. An op that these values break too reads as refusing
+    shapes, the loud side."""
+    def key(x):
+        return x.untyped_storage()._cdata, x.dtype
+
+    spans: dict = {}  # each never-computed storage's elements its operands reach
+    for x in tree_flatten((args, kwargs))[0]:
+        if isinstance(x, torch.Tensor) and never_computed(x) and x.numel():
+            lo = x.storage_offset()
+            hi = lo + sum((n - 1) * st for n, st in zip(x.shape, x.stride(), strict=True)) + 1
+            old = spans.get(key(x), (lo, hi))
+            spans[key(x)] = (min(lo, old[0]), max(hi, old[1]))
     for fill in (0, 1):
-        def other(x, fill=fill):
+        buffers = {k: torch.rand(hi - lo).to(k[1]) if _floating(torch.empty(0, dtype=k[1]))
+                   else torch.full((hi - lo,), fill, dtype=k[1]) for k, (lo, hi) in spans.items()}
+
+        def other(x, buffers=buffers):
             if not isinstance(x, torch.Tensor) or not never_computed(x):
                 return x
-            return torch.rand_like(x) if _floating(x) else torch.full_like(x, fill)
+            if not x.numel():
+                return torch.empty_like(x, device="cpu")
+            return buffers[key(x)].as_strided(x.shape, x.stride(), x.storage_offset() - spans[key(x)][0])
 
         try:
             func(*tree_map(other, args), **tree_map(other, kwargs))

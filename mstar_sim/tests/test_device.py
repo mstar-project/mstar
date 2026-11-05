@@ -1011,6 +1011,9 @@ def test_plugin_files_gpu_errors_as_mstar_failures_and_missing_stand_ins_as_gaps
             import flashinfer
             rows = flashinfer.top_k_renorm_probs(torch.ones(2, 4, device="cuda"), 1)
             assert rows[torch.tensor([0], device="cuda")].shape == (2, 4)
+        def test_inplace_on_an_expanded_stand_ins_output():  # an overlap, which a GPU refuses too
+            import flashinfer
+            flashinfer.top_k_renorm_probs(torch.ones(4, 4, device="cuda"), 1)[:, :1].expand(4, 4).add_(1)
         def test_passing_value_check():
             assert (torch.arange(3, device="cuda") + 1).tolist() == [1, 2, 3]
         def test_dynamo_traces_a_device():
@@ -1042,6 +1045,7 @@ def test_plugin_files_gpu_errors_as_mstar_failures_and_missing_stand_ins_as_gaps
                         "test_dtype_mistake_on_a_stand_ins_output": "FAILED",
                         "test_cpu_kernel_limit": "XFAIL",
                         "test_assert_after_an_integer_index_of_a_never_computed_value": "FAILED",
+                        "test_inplace_on_an_expanded_stand_ins_output": "FAILED",
                         "test_passing_value_check": "PASSED", "test_dynamo_traces_a_device": "XFAIL"}, out
 
 
