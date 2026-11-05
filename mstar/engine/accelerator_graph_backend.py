@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from contextlib import AbstractContextManager
+from collections.abc import Iterator
+from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass, field
 from types import ModuleType
 from typing import Any, Protocol
@@ -100,6 +101,15 @@ class AcceleratorGraphBackend(ABC):
     def recover_failed_capture(self, pool: AcceleratorGraphPool, stream: Any) -> None:
         pass
 
+    def conditional_refusal(self) -> str | None:
+        """Why a capture can't hold a conditional node (``conditional``), or None."""
+        return f"{type(self).__name__} has no conditional graph nodes"
+
+    def conditional(self, graph: CapturedGraph, pred: torch.Tensor) -> AbstractContextManager:
+        """Inside a capture of ``graph``: what is captured in this context runs
+        on each replay only while the device bool scalar ``pred`` is true."""
+        raise NotImplementedError(self.conditional_refusal())
+
 
 class _TorchGraphBackend(AcceleratorGraphBackend):
 
@@ -190,6 +200,25 @@ class CUDAGraphBackend(_TorchGraphBackend):
 
     def create_graph(self, keep_graph: bool = False) -> CapturedGraph:
         return self._runtime.CUDAGraph(keep_graph=keep_graph)
+
+    def conditional_refusal(self) -> str | None:
+        # torch binds the IF node from 2.12, on CUDA 12.4 and up, never on ROCm
+        if not hasattr(torch.cuda.CUDAGraph, "begin_capture_to_if_node"):
+            return f"torch {torch.__version__} binds no conditional graph node"
+        if torch.version.hip is not None:
+            return "torch builds no conditional graph node on ROCm"
+        cuda = tuple(int(part) for part in (torch.version.cuda or "0.0").split(".")[:2])
+        if cuda < (12, 4):
+            return f"CUDA {torch.version.cuda} has no conditional graph node (12.4 and up)"
+        return None
+
+    @contextmanager
+    def conditional(self, graph: CapturedGraph, pred: torch.Tensor) -> Iterator[None]:
+        graph.begin_capture_to_if_node(pred)
+        try:
+            yield
+        finally:
+            graph.end_capture_to_conditional_node()
 
 
 class XPUGraphBackend(_TorchGraphBackend):

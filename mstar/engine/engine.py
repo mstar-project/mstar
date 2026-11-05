@@ -218,6 +218,8 @@ class SubmoduleManagement:
     # walk -> loop-back signal -> the output holding it, kept in those rows
     # beside a ``DeviceLoopback``'s, for each walk whose config asks
     row_signals: dict[str, dict[str, str]] = field(default_factory=dict)
+    # walk -> the token stop whose stopped rows its captures skip, where asked
+    device_stops: dict[str, StopPolicy] = field(default_factory=dict)
 
     # Rotated globally, not per runner: slot-keyed buffers are shared across
     # buckets and regions, so per-runner counters let consecutive steps collide
@@ -930,12 +932,15 @@ class Engine:
     def warmup(
         self, looped: Collection[tuple[str, str]] = (),
         carried: Mapping[tuple[str, str], Collection[str]] = MappingProxyType({}),
+        device_stops: Collection[tuple[str, str]] = (),
     ) -> None:
         """Capture every node's graphs. ``looped``: the (node, walk) pairs whose
         walk runs the node inside a Loop, which may run on resident tables, by
         the Loop (a mapping) when its iteration inputs read the Loop's counter;
         ``carried``: the loop-back signals of each such pair whose steps may
-        repeat, whose ``preprocess`` is checked here (``probe_carries``)."""
+        repeat, whose ``preprocess`` is checked here (``probe_carries``);
+        ``device_stops``: the pairs whose captures should skip a replay whose
+        rows have all stopped (``step_repeats: device_stop``)."""
         # the Loop each (node, walk) runs in, whose counter its iteration inputs read
         self._loops = dict(looped) if isinstance(looped, Mapping) else {}
         # before capture: a region inside a captured graph compiles in its warm-up
@@ -961,6 +966,10 @@ class Engine:
             piecewise[node_name] = self._build_piecewise_runners(
                 node_name, submodule_mgmt, capture_stream,
             )
+
+        for node_name, walk in device_stops:
+            if node_name in self._submodules:
+                self._ask_device_stop(node_name, ag_runners[node_name], walk)
 
         # Every runner claims its static buffers before any of them captures:
         # nodes share resources, so a build driven by a later node would move
@@ -1605,6 +1614,31 @@ class Engine:
         out = dict(loopback.outputs()) if loopback is not None and loopback.walk == graph_walk else {}
         out.update(mgmt.row_signals.get(graph_walk, {}))
         return out
+
+    def _ask_device_stop(self, node_name: str, runner: AcceleratorGraphRunner, graph_walk: str) -> None:
+        """Before capture: have ``graph_walk``'s captures skip a stopped replay,
+        where its stop reads a token and it runs on one rank."""
+        mgmt = self._submodules[node_name]
+        if mgmt.joint_comm_group.world_size > 1:
+            return  # one rank would skip a body holding a collective the other runs
+        policy = next(
+            (p for p in (self.get_stop_policies(node_name, graph_walk) or {}).values() if p.reads_token), None,
+        )
+        if policy is not None:
+            mgmt.device_stops[graph_walk] = policy
+            runner.ask_device_stop(graph_walk, policy.token_signal, policy.eos_tokens)
+
+    def device_stop_refusal(self, node_name: str, graph_walk: str) -> str | None:
+        """After capture: why ``graph_walk``'s captures don't skip a replay
+        whose rows have all stopped, or None."""
+        mgmt = self._submodules[node_name]
+        if mgmt.joint_comm_group.world_size > 1:
+            return "deployment: it runs on more than one rank"
+        if graph_walk not in mgmt.device_stops:
+            return "graph: its stop reads no token"
+        if mgmt.accelerator_graph_runner is None:
+            return "runner: the node captures no graphs"
+        return mgmt.accelerator_graph_runner.device_stop_refusal(graph_walk)
 
     def keep_loopback_rows(self, node_name: str, graph_walk: str, signals: Collection[str]) -> str | None:
         """Keep each loop-back signal of this walk (``signals``) in the node's
@@ -2397,6 +2431,11 @@ class Engine:
             ctx = batch.step_context
             if ctx.resident is not None:
                 ctx.resident.flush(ctx.resident_plan)
+            stop = cg_runner.slot_for(lease).device_stop
+            if stop is not None:
+                policy = submodule_mgmt.device_stops[graph_walk]
+                infos = engine_inputs.per_request_info
+                stop.stage(len(request_ids), [policy.limits(infos[rid]).ignore_eos for rid in request_ids])
             out = cg_runner.run_forward(
                 lease, preprocessed,
                 plan_done_event=batch.preplan_event,

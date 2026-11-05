@@ -659,7 +659,7 @@ def _worker(rank, scenario, comm, graph, engine, tm, group):
     w.tensor_manager = tm
     w._graph_runtime = graph
     w.engine_manager = SimpleNamespace(
-        get_engine=lambda node: engine, warmup_all=lambda looped, carried: None,
+        get_engine=lambda node: engine, warmup_all=lambda looped, carried, device_stops: None,
         remove_request=engine.remove_request,
     )
     w.request_state = graph

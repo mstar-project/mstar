@@ -8,6 +8,7 @@ set of resources plans the same requests on the host as the reference.
 """
 from __future__ import annotations
 
+import contextlib
 import random
 import sys
 from functools import partial
@@ -47,7 +48,7 @@ from mstar.engine.resources.step import (  # noqa: E402
     SubmoduleStep,
 )
 from mstar.graph.base import EdgeKind, LoopEdges  # noqa: E402
-from mstar.model.submodule_base import IterationInput  # noqa: E402
+from mstar.model.submodule_base import BatchedModelOutput, IterationInput  # noqa: E402
 from mstar.utils import knobs  # noqa: E402
 from mstar.utils.ipc_format import OffloadDelta  # noqa: E402
 from mstar.worker.micro_scheduler import ScheduledBatch  # noqa: E402
@@ -304,6 +305,114 @@ def test_a_repeated_step_addresses_each_replay_as_host_plans_would(repeats):
         assert tables.host_len[planner.slot_of(rid)] == live["kv"]._streams[rid]["main"].stored_len
 
 
+def _stop(bs=3, real=2, immune=()):
+    from mstar.engine.accelerator_graph_runner import DeviceStop
+
+    stop = DeviceStop(bs, "t", {9}, CPU)
+    stop.stage(real, list(immune) or [False] * real)
+    return stop
+
+
+def _stopped_replay(stop, tokens):
+    """One replay's captured ops around a body that samples ``tokens``; whether
+    the body ran."""
+    stop.head()
+    ran = bool(stop.live)
+    if ran:
+        stop.mark(torch.tensor(tokens))
+    stop.tail()
+    return ran
+
+
+def test_a_replay_runs_only_while_a_row_of_the_run_has_not_stopped():
+    """The marks say what ``StopPolicy.stops`` says of each row's tokens within
+    the run; padding rows never keep a replay alive."""
+    from mstar.model.submodule_base import StopKind, StopLimits, StopPolicy
+
+    policy = StopPolicy(StopKind.EOS, token_signal="t", eos_tokens=frozenset({9}))
+    columns = [[1, 2, 9], [9, 3, 9], [4, 9, 9], [5, 5, 5]]
+    stop = _stop()
+    assert [_stopped_replay(stop, column) for column in columns] == [True, True, True, False]
+    for row in range(2):
+        stopped = any(policy.stops(0, column[row], StopLimits(0, False)) for column in columns[:3])
+        assert bool(stop.marks[row]) == stopped
+
+
+def test_an_earlier_stop_doesnt_stop_a_run_and_ignore_eos_never_marks():
+    stop = _stop(real=1)
+    _stopped_replay(stop, [9, 0, 0])
+    stop.head()
+    assert not stop.live, "the row stopped"
+    # the next run: its first replay clears what came before
+    stop.tail()
+    stop.stage(1, [False])
+    assert _stopped_replay(stop, [1, 0, 0])
+    immune = _stop(real=1, immune=[True])
+    assert _stopped_replay(immune, [9, 0, 0]) and _stopped_replay(immune, [9, 0, 0])
+
+
+def test_a_capture_puts_the_body_alone_in_the_conditional_and_only_when_asked():
+    calls = []
+
+    class Backend:
+        def conditional_refusal(self):
+            return None
+
+        @contextlib.contextmanager
+        def conditional(self, graph, pred):
+            calls.append(("if", graph, pred))
+            yield
+            calls.append(("end",))
+
+    runner = AcceleratorGraphRunner.__new__(AcceleratorGraphRunner)
+    runner._graph_backend = Backend()
+    runner._device = CPU
+    runner._device_stops = {}
+    config = SimpleNamespace(get_config_type=lambda: None)
+    spec = SimpleNamespace(bucket=BucketKey(WALK, 3, 3), config=config)
+    assert runner._device_stop_for(spec) is None, "not asked: nothing captured"
+    runner.ask_device_stop(WALK, "t", {9})
+    stop = runner._device_stop_for(spec)
+    stop.stage(2, [False, False])
+    out = {"t": torch.tensor([9, 9, 0])}
+
+    def body():
+        calls.append(("body",))
+        return BatchedModelOutput(row_outputs=out)
+
+    runner.stopped_run(stop, body, "graph")
+    assert [call[0] for call in calls] == ["if", "body", "end"] and calls[0][2] is stop.live
+    assert stop.marks.tolist() == [True, True, True] and stop.index.item() == 1
+
+
+@pytest.mark.parametrize(("world_size", "policies", "why"), [
+    (2, {}, "deployment: it runs on more than one rank"),
+    (1, {}, "graph: its stop reads no token"),
+])
+def test_a_walk_says_why_it_doesnt_skip_a_stopped_replay(world_size, policies, why):
+    from mstar.engine.engine import Engine
+
+    engine = Engine.__new__(Engine)
+    mgmt = SimpleNamespace(
+        joint_comm_group=SimpleNamespace(world_size=world_size), device_stops={}, accelerator_graph_runner=None,
+        submodule=SimpleNamespace(get_stop_policies=lambda walk: policies),
+    )
+    engine._submodules = {"n": mgmt}
+    engine._ask_device_stop("n", None, WALK)
+    assert engine.device_stop_refusal("n", WALK) == why
+
+
+def test_a_backend_without_conditional_nodes_says_so():
+    from mstar.engine.accelerator_graph_backend import CUDAGraphBackend
+
+    backend = CUDAGraphBackend.__new__(CUDAGraphBackend)
+    if not hasattr(torch.cuda.CUDAGraph, "begin_capture_to_if_node"):
+        assert "binds no conditional graph node" in backend.conditional_refusal()
+    runner = AcceleratorGraphRunner.__new__(AcceleratorGraphRunner)
+    runner._graph_backend = SimpleNamespace(conditional_refusal=lambda: "no IF node")
+    assert runner.device_stop_refusal(WALK) == "backend: no IF node"
+
+
 @pytest.mark.parametrize("captured", [True, False])
 def test_a_step_with_no_capture_for_its_batch_runs_one_iteration(captured):
     """Only a replay repeats: a batch that leases no graph (a size or shape
@@ -436,7 +545,7 @@ def test_the_startup_line_names_the_owner_that_refuses_each_capability(caplog, l
     with caplog.at_level("INFO", logger="mstar.worker.step_repeats"):
         _repeats(limit, "abc").settle(
             engine.resident_refusal, engine.repeat_refusal,
-            lambda node, walk: NOT_ASKED if limit == 1 else engine.keep_loopback_rows(node, walk, {"t"}),
+            {"rows": lambda node, walk: NOT_ASKED if limit == 1 else engine.keep_loopback_rows(node, walk, {"t"})},
         )
     lines = {line.split(":", 1)[0]: line for line in caplog.messages}
     want = (

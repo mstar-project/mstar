@@ -351,12 +351,14 @@ class EngineManager:
     def warmup_all(
         self, looped: Collection[tuple[str, str]] = (),
         carried: Mapping[tuple[str, str], Collection[str]] = MappingProxyType({}),
+        device_stops: Collection[tuple[str, str]] = (),
     ) -> None:
         """CUDA graph capture, for the whole forward and any piecewise region.
         ``looped``: the (node, walk) pairs whose walk runs the node in a Loop;
-        ``carried``: the loop-back signals of those whose steps may repeat."""
+        ``carried``: the loop-back signals of those whose steps may repeat;
+        ``device_stops``: those whose captures skip a stopped replay."""
         with torch.no_grad():
-            self.engine.warmup(looped, carried)
+            self.engine.warmup(looped, carried, device_stops)
         # warmup ran side-stream work beside graph replays; start serving from
         # a clean scheduling state (see reset_device_scheduling)
         reset_device_scheduling(self.engine._device)

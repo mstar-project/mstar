@@ -183,11 +183,12 @@ def dummy_metadata(
 def capture_into_graph(
     run, pool: AcceleratorGraphPool, device, autocast_dtype, keep_graph: bool = False,
     node_name: str | None = None,
-    stream: Any = None,
+    stream: Any = None, takes_graph: bool = False,
 ):
     """Capture ``run`` into a new CUDA graph allocated from ``pool``.
 
-    Returns the graph and what ``run`` returned. A capture that fails part
+    Returns the graph and what ``run`` returned; ``run`` is handed the graph
+    being captured with ``takes_graph`` (to capture a conditional node in it). A capture that fails part
     way leaves two things behind that would sink every later capture on the
     same pool: the caching allocator keeps routing this thread's allocations
     into the pool (the next capture_begin fails with "already recording to
@@ -215,7 +216,7 @@ def capture_into_graph(
         with torch.compiler.set_stance("fail_on_recompile"), \
                 autocast_scope(autocast_dtype, backend.device_type, node_name):
             with backend.capture(graph, pool=pool, stream=stream):
-                output = run()
+                output = run(graph) if takes_graph else run()
     except BaseException:
         pool.on_failure(graph)
         backend.recover_failed_capture(pool, prev_stream)
@@ -698,6 +699,55 @@ class AcceleratorGraphSlot:
     dummy_rids: list[int]
     dummy_metadata: dict[int, CurrentForwardPassInfo]
     config_idx: int
+    # the run's stop marks, where the capture skips a replay whose rows all stopped
+    device_stop: "DeviceStop | None" = None
+
+
+class DeviceStop:
+    """A slot's stop marks for one run (``step_repeats: device_stop``): which
+    of its rows' tokens were a stop id since the run began. Captured around
+    each replay, so a replay whose rows have all stopped skips its body
+    (``AcceleratorGraphBackend.conditional``). The run's first replay clears
+    them, so a stop from before the run (a prefill's EOS) doesn't skip it, and
+    padding rows count as stopped, so they never keep a replay alive."""
+
+    def __init__(self, bs: int, token_signal: str, stop_ids: Collection[int], device: torch.device):
+        self.token_signal = token_signal
+        # the replay of the run, staged 0 before each run and counted in the graph
+        self.index = torch.zeros((), dtype=torch.long, device=device)
+        # the step's real rows, and those whose request ignores its stop ids
+        self.real = torch.zeros((), dtype=torch.long, device=device)
+        self.immune = torch.zeros(bs, dtype=torch.bool, device=device)
+        self.marks = torch.zeros(bs, dtype=torch.bool, device=device)
+        # the conditional's predicate: some real row hasn't stopped
+        self.live = torch.ones((), dtype=torch.bool, device=device)
+        self._rows = torch.arange(bs, device=device)
+        self._stop_ids = torch.tensor(sorted(stop_ids), dtype=torch.long, device=device)
+        self._staged: tuple | None = None
+
+    def stage(self, real: int, immune: Sequence[bool]) -> None:
+        """Before a run, on the host: its real rows and which ignore their stop ids."""
+        self.index.zero_()
+        key = (real, tuple(immune))
+        if key != self._staged:
+            self._staged = key
+            self.real.fill_(real)
+            self.immune.zero_()
+            if any(immune):
+                self.immune[:len(immune)].copy_(torch.tensor(immune, dtype=torch.bool))
+
+    def head(self) -> None:
+        """Before a replay's body: replay 0 clears the marks, then ``live``."""
+        torch.where(self.index == 0, self._rows >= self.real, self.marks, out=self.marks)
+        torch.logical_not(self.marks.all(), out=self.live)
+
+    def mark(self, tokens: torch.Tensor) -> None:
+        """In the body, after the forward: rows whose token is a stop id."""
+        token = tokens.reshape(len(self.marks), -1)[:, 0]
+        self.marks |= (token.unsqueeze(-1) == self._stop_ids).any(-1) & ~self.immune
+
+    def tail(self) -> None:
+        self.index += 1
 
 
 @dataclass
@@ -754,6 +804,10 @@ class AcceleratorGraphRunner:
         self._submodule = submodule
         self._comm_group = joint_comm_group
         self._resident: ResidentPlanner | None = None
+        # walk -> (token signal, stop ids) of the walks that skip a stopped replay
+        self._device_stops: dict[str, tuple[str, frozenset[int]]] = {}
+        # walk -> why its captures don't skip one, once one was asked for and failed
+        self._device_stop_failures: dict[str, str] = {}
 
         self._capture_configs: list[AcceleratorGraphConfig] = (
             submodule.get_accelerator_graph_configs(
@@ -1233,11 +1287,27 @@ class AcceleratorGraphRunner:
             # what preparing it left cached in the allocator is out of the
             # capture pool's reach
             torch.accelerator.empty_cache()
-            graph, output = capture_into_graph(
-                warmed.run, self._memory_pool, self._device, self._autocast_dtype,
-                node_name=self._submodule_name, stream=self._capture_stream,
-            )
-            return self._build_slot_from_capture(
+            stop = self._device_stop_for(spec)
+            graph, output = None, None
+            if stop is not None:
+                try:
+                    graph, output = capture_into_graph(
+                        partial(self.stopped_run, stop, warmed.run), self._memory_pool, self._device,
+                        self._autocast_dtype, node_name=self._submodule_name, stream=self._capture_stream,
+                        takes_graph=True,
+                    )
+                except Exception as error:
+                    # a body the conditional node can't hold: plain replays, said at startup
+                    why = f"its capture into a conditional failed: {error}"
+                    self._device_stop_failures[spec.bucket.graph_walk] = why
+                    logger.warning("AcceleratorGraphRunner[%s]: %s", self._submodule_name, error)
+                    stop = None
+            if graph is None:
+                graph, output = capture_into_graph(
+                    warmed.run, self._memory_pool, self._device, self._autocast_dtype,
+                    node_name=self._submodule_name, stream=self._capture_stream,
+                )
+            slot = self._build_slot_from_capture(
                 output=BatchedModelOutput.coerce(output),
                 graph=graph,
                 static_inputs=warmed.static_inputs,
@@ -1246,6 +1316,41 @@ class AcceleratorGraphRunner:
                 dummy_metadata=warmed.dummy_metadata,
                 config_idx=spec.config_idx,
             )
+            slot.device_stop = stop
+            return slot
+
+    def ask_device_stop(self, walk: str, token_signal: str, stop_ids: Collection[int]) -> None:
+        """Before capture: ``walk``'s batched captures skip a replay whose rows
+        have all stopped on one of ``stop_ids`` in ``token_signal``."""
+        self._device_stops[walk] = (token_signal, frozenset(stop_ids))
+
+    def device_stop_refusal(self, walk: str) -> str | None:
+        """After capture: why ``walk``'s captures don't skip a stopped replay, or None."""
+        if (refusal := self._graph_backend.conditional_refusal()) is not None:
+            return f"backend: {refusal}"
+        if (failure := self._device_stop_failures.get(walk)) is not None:
+            return f"runner: {failure}"
+        slots = [slot for bucket in self._buckets.values() if bucket.config.capture_graph_walk == walk
+                 for slot in bucket.slots]
+        if not slots or any(slot.device_stop is None for slot in slots):
+            return "runner: it has no batched capture"
+        return None
+
+    def _device_stop_for(self, spec: CGSlotSpec) -> DeviceStop | None:
+        asked = self._device_stops.get(spec.bucket.graph_walk)
+        if asked is None or _is_packed(spec.config) or self._graph_backend.conditional_refusal() is not None:
+            return None
+        return DeviceStop(spec.bucket.bs, *asked, self._device)
+
+    def stopped_run(self, stop: DeviceStop, run: Callable[[], Any], graph: CapturedGraph) -> Any:
+        """``run``'s capture as one replay of a run that skips its body once
+        every row of the run has stopped."""
+        stop.head()
+        with self._graph_backend.conditional(graph, stop.live):
+            output = run()
+            stop.mark(output_named(BatchedModelOutput.coerce(output), stop.token_signal))
+        stop.tail()
+        return output
 
     @contextmanager
     def _warmed(self, spec: CGSlotSpec, forwards: int) -> Iterator[WarmedSpec]:

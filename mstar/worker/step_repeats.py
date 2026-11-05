@@ -18,7 +18,8 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable, Collection, Iterable, Mapping
 from dataclasses import dataclass, fields
-from typing import TYPE_CHECKING
+from types import MappingProxyType
+from typing import TYPE_CHECKING, ClassVar
 
 from mstar.engine.resources.resident import NOT_ASKED
 from mstar.graph.base import EdgeKind, LoopEdges, loop_edges
@@ -37,6 +38,10 @@ class RepeatConfig:
     error."""
     # the most iterations one step may stand for
     max: int = 1
+    # off, or skip: a replay whose rows have all stopped skips its body on the device
+    device_stop: str = "off"
+
+    DEVICE_STOPS: ClassVar[tuple[str, ...]] = ("off", "skip")
 
     @classmethod
     def parse(cls, node: str, block: object) -> RepeatConfig:
@@ -48,6 +53,11 @@ class RepeatConfig:
         config = cls(**block)
         if type(config.max) is not int or config.max < 1:
             raise ValueError(f"step_repeats for {node!r}: max is {config.max!r}; it must be an integer of at least 1")
+        if config.device_stop not in cls.DEVICE_STOPS:
+            raise ValueError(
+                f"step_repeats for {node!r}: device_stop is {config.device_stop!r}; "
+                f"it must be one of {cls.DEVICE_STOPS}"
+            )
         default = cls()
         needs = [k for k in block if k != "max" and getattr(config, k) != getattr(default, k)]
         if config.max == 1 and needs:
@@ -125,6 +135,17 @@ class StepRepeats:
             if any(kind is EdgeKind.PER_ITERATION for kind in self.edges[(node, walk)].inputs.values())
         }
 
+    def config(self, node: str) -> RepeatConfig:
+        return self._configs.get(node, RepeatConfig())
+
+    def may_repeat(self, node: str, walk: str) -> bool:
+        """Whether ``settle`` let this walk repeat."""
+        return (node, walk) in self._walks
+
+    def device_stops(self) -> list[tuple[str, str]]:
+        """The walks asked to skip a replay whose rows have all stopped."""
+        return sorted(key for key in self.edges if self.config(key[0]).device_stop != "off")
+
     def carried(self) -> dict[tuple[str, str], frozenset[str]]:
         """The loop-back signals of each walk asked to repeat, which a run
         carries between replays."""
@@ -132,24 +153,24 @@ class StepRepeats:
 
     def settle(
         self, resident_refusal: Callable[[str, str], str | None], repeat_refusal: Callable[[str, str], str | None],
-        rows_refusal: Callable[[str, str], str | None] = lambda node, walk: NOT_ASKED,
+        others: Mapping[str, Callable[[str, str], str | None]] = MappingProxyType({}),
     ) -> None:
-        """Which walks may repeat, and the line for each. ``rows_refusal``:
-        why a walk's loop-back values can't stay in device rows between its
-        steps (``Engine.keep_loopback_rows``)."""
+        """Which walks may repeat, and the line for each. ``others``: each
+        further capability's refusal, asked after the walk's repeats settled."""
         for key in sorted(self.edges):
             limit = self.limit(key[0])
             resident = resident_refusal(*key)
             repeats = NOT_ASKED if limit == 1 else repeat_refusal(*key)
             if repeats is None:
                 self._walks.add(key)
-            rows = rows_refusal(*key)
-            logger.info(
-                "%s/%s: resident %s | repeats %s | rows %s", *key,
-                "on" if resident is None else f"off: {resident}",
-                f"on, up to {limit}" if repeats is None else f"off: {repeats}",
-                "on" if rows is None else f"off: {rows}",
-            )
+            parts = [
+                f"resident {'on' if resident is None else f'off: {resident}'}",
+                f"repeats {f'on, up to {limit}' if repeats is None else f'off: {repeats}'}",
+            ]
+            for name, refusal in others.items():
+                why = refusal(*key)
+                parts.append(f"{name} {'on' if why is None else f'off: {why}'}")
+            logger.info("%s/%s: %s", *key, " | ".join(parts))
 
     def ceiling(self, speculation: Speculation, in_chain: int, loop_room) -> int:
         """The most ``speculation``'s step can repeat. Only a chain's step

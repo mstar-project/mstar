@@ -342,9 +342,13 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        resources can refuse the walk (``Resource.repeat_refusal``): FlashInfer decode
        other than tensor-core (CUDA-core, fa3, cuDNN), or a sampler without the in-graph
        scatter. They can narrow a step to 1 (``Resource.max_repeats``), for every step on
-       the node while a request with log-probs is live. At startup the worker logs one line per
-       Loop walk with each capability (``resident``, ``repeats``, ``rows``) ``on``,
-       ``off: not asked for``, or ``off: <owner>: <reason>``. ``rows``: a node asked for
+       the node while a request with log-probs is live. ``device_stop`` (default ``off``):
+       ``skip`` captures each replay's body in a conditional node, so once every row of a run
+       has stopped on a stop id its later replays skip their forward. It needs a token stop,
+       one rank, and a backend with conditional graph nodes (torch 2.12 and up, CUDA 12.4 and
+       up). At startup the worker logs one line per Loop walk with each capability
+       (``resident``, ``repeats``, ``rows``, ``device stop``) ``on``, ``off: not asked for``,
+       or ``off: <owner>: <reason>``. ``rows``: a node asked for
        resident planning or repeats keeps its fixed-shape loop-back values in device rows
        between steps (``mstar.engine.loopback_rows``), so a step whose every output stays on
        the device routes no tensor. A setting other than ``max`` on a node whose ``max`` is
