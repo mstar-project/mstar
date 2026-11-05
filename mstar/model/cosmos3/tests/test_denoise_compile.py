@@ -93,7 +93,8 @@ def test_warmup_compiles_runs_the_real_step_and_a_served_row_reuses_its_compile(
     default size with the layer stack compiled, so no request pays for it: a
     row of another size, and an action row with and without guidance, against
     the attention a served step binds, run what the warmup built."""
-    sub, model, cfg, res = _tiny(compile_denoise=True, video_size_default=(64, 64), num_frames_video=9)
+    # 13 frames: a warm-up pack as long as the hidden size, as Nano's default 1024x1024 is
+    sub, model, cfg, res = _tiny(compile_denoise=True, video_size_default=(64, 64), num_frames_video=13)
     step, calls = model.denoise_step_batched, []
 
     def recording_step(requests, label, attn):
@@ -105,8 +106,9 @@ def test_warmup_compiles_runs_the_real_step_and_a_served_row_reuses_its_compile(
     with torch.no_grad():  # as the engine calls it
         sub.warmup_compiles()
     [(requests, label, results)] = calls
-    latent_size = sub._latent_shape(64, 64, 9)
+    latent_size = sub._latent_shape(64, 64, 13)
     assert len(requests) == 2 and label == CFG_BATCHED_LABEL and requests[0]["latents"].shape == latent_size
+    assert 4 * requests[0]["rotary_cond"][0].shape[0] == cfg.hidden_size
     assert [v.shape for branches in results for v in branches] == [latent_size] * 4
 
     static = sub._build_static(list(range(5)), 32, 64, 5, 24.0, False, "cpu")

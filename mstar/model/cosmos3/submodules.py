@@ -51,6 +51,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 
 import torch
+from torch.fx.experimental import _config as fx_config
 
 from mstar.engine.accelerator_graph_config import (
     BatchedAcceleratorGraphConfig,
@@ -470,8 +471,10 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             static["rotary"],
         )
         t0 = time.perf_counter()
-        # as `forward_batched` runs it: native dtype, no autocast
-        with torch.autocast(device_type=device.type, enabled=False):
+        # as `forward_batched` runs it: native dtype, no autocast. Without duck sizing, which would
+        # tie a pack as long as the hidden size (Nano's default, 4096) to that static size and
+        # compile again at the first other length.
+        with torch.autocast(device_type=device.type, enabled=False), fx_config.patch(use_duck_shape=False):
             self.transformer.denoise_step_batched([row, row], CFG_BATCHED_LABEL, _WarmupAttention())
         logger.info(
             "Cosmos3 cross-request layer stack compiled in %.1f s (%dx%dx%d, two requests)",
