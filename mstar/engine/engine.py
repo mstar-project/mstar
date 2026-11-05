@@ -52,6 +52,7 @@ from mstar.engine.resources.step import (
     PerReqSetting,
 )
 from mstar.engine.state.adapters import node_handles
+from mstar.engine.state.host import HostFields
 from mstar.graph.runtime.base import GraphRuntime
 from mstar.model.base import keyed_labels
 from mstar.model.submodule_base import (
@@ -567,6 +568,7 @@ class Engine:
         self._side_stream_nodes = frozenset(side_stream_nodes)
         # nodes whose reads of arrays with max_len 0 run SDPA (``attention_backend``)
         self._sdpa_nodes = frozenset(sdpa_nodes)
+        self._host_fields = HostFields()
         self._autocast_dtype = autocast_dtype
         # the share of the device this worker's allocations may hold once
         # capture is done, None for whatever is free
@@ -703,7 +705,7 @@ class Engine:
             submodule.bind_node_resources(resources)
             handles = {} if model is None else node_handles(
                 model, node_name, resources, sp_group=parallel_groups.get_sp_config_for_node(node_name),
-                sdpa=node_name in self._sdpa_nodes,
+                sdpa=node_name in self._sdpa_nodes, host_fields=self._host_fields,
             )
             if handles:
                 submodule.bind_node_state(handles)
@@ -2129,6 +2131,7 @@ class Engine:
             t0 = phase_start()
             try:
                 self._runner.commit(step)
+                step.commit_calls()
                 batch.committed = step
                 if submodule_mgmt.resident is not None:
                     submodule_mgmt.resident.commit(step, ctx)
@@ -3358,6 +3361,7 @@ class Engine:
         """Open the request on every resource, then tell each submodule. All or
         nothing: a raise leaves the request on none of them."""
         self._runner.ingest_request(request_id, overrides)
+        self._host_fields.open(request_id)
         if request_info is None:
             return
         try:
@@ -3391,6 +3395,7 @@ class Engine:
             if resource.reclaimable(request_id)
         }
         self._runner.remove_request(request_id)
+        self._host_fields.remove_request(request_id)
         self._chunking.forget_request(request_id)
         for submodule_mgmt in self._submodules.values():
             submodule_mgmt.submodule.cleanup_request(request_id)

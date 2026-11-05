@@ -204,12 +204,14 @@ def _engine_with(submodule, policies=None):
 
     from mstar.engine.chunking import ChunkingManagement
     from mstar.engine.engine import Engine
+    from mstar.engine.state.host import HostFields
 
     engine = Engine.__new__(Engine)
     engine._submodules = {"LLM": SimpleNamespace(submodule=submodule, resources={}, resident=None)}
     engine._keyed_walks = {}
     engine._resources = {}
     engine._chunking = ChunkingManagement(engine._submodules)
+    engine._host_fields = HostFields()
     engine._chunking.set_policies(policies or {})
     return engine
 

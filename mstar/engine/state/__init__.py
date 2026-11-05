@@ -10,6 +10,7 @@ from mstar.engine.state.calls import (
     at_last_token,
     causal_conv,
     gated_delta_net,
+    host,
     kernel_setting,  # noqa: F401
     last_sampled,
     position,
@@ -76,6 +77,7 @@ __all__ = [
     "at_last_token",
     "causal_conv",
     "gated_delta_net",
+    "host",
     "last_sampled",
     "position",
     "positions",

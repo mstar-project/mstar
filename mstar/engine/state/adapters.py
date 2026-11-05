@@ -52,6 +52,7 @@ from mstar.engine.state.contract import (
     Window,
     is_value,
 )
+from mstar.engine.state.host import HostFields
 from mstar.engine.state.within_step import WithinStepHandle
 
 if TYPE_CHECKING:
@@ -208,6 +209,9 @@ def _sampler_spec(sampler: Sampler) -> SamplerSpec:
 def _value_specs(array: Array, arrays: Sequence[Array]) -> list[NodeResourceSpec]:
     if not is_value(array):
         raise _no_layout(array, "a rewritable array longer than one entry has no spec")
+    if array.entry.host and not array.entry.tensors:
+        # the engine holds a host field, so no resource does
+        return []
     if array.reads:
         raise _no_layout(array, "reads must be empty, since RecurrentStateConfig has no read")
     if array.seq_sharded:
@@ -301,9 +305,10 @@ def _apply_kernel_settings(
 
 def node_handles(
     model: "Model", node: str, resources: Mapping[str, Any], *, sp_group: CommGroup | None = None, sdpa: bool = False,
+    host_fields: HostFields | None = None,
 ) -> dict[str, ArrayHandle | SamplerHandle]:
     """``node``'s handles, by declared name, over its built ``resources``. With ``sdpa``, its reads of arrays with
-    ``max_len`` 0 have no resource and run SDPA."""
+    ``max_len`` 0 have no resource and run SDPA. ``host_fields`` holds the fields of the Values that declare them."""
     declarations = model.declare_state()
     arrays = {declared.name: declared for declared in declarations if isinstance(declared, Array)}
     by_read = _within_step_specs(list(arrays.values()))
@@ -313,6 +318,9 @@ def node_handles(
             continue
         if isinstance(declared, Sampler):
             handles[declared.name] = SamplerHandle(declared, resources[declared.name])
+        elif declared.entry.host:
+            host_fields.declare(declared)
+            handles[declared.name] = ArrayHandle(declared, resources, None, host_fields)
         elif declared.max_len or declared.rewritable:
             key = None if declared.positions is None else position_key(declared)
             handles[declared.name] = ArrayHandle(declared, resources, key)
@@ -412,6 +420,8 @@ def _array_steps(handle: ArrayHandle, declared: ArrayStep, step: SubmoduleStep, 
     array, segments = handle.array, declared.segments
     pre, post, rows = _forks(array, declared)
     if is_value(array):
+        if not array.entry.tensors:
+            return
         steps[array.name] = RecurrentStep(segments=segments, pre_forks=pre, post_forks=post, fork_rids=rows)
         for key, update in array.updates.items():
             if isinstance(update, GatedDeltaNet):

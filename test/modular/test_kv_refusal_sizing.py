@@ -367,11 +367,12 @@ def _engine_manager(**pools: KVManager) -> SimpleNamespace:
     """The worker's engine manager over the real ``Engine.remove_request``,
     with these KV pools as the engine's resources."""
     from mstar.engine.chunking import ChunkingManagement
+    from mstar.engine.state.host import HostFields
 
     engine = SimpleNamespace(
         _loopback_steps={}, _resources=pools, _submodules={},
-        # the real remove_request purges chunk state too (rid_table.py)
-        _chunking=ChunkingManagement({}),
+        # the real remove_request purges chunk state and host fields too (rid_table.py)
+        _chunking=ChunkingManagement({}), _host_fields=HostFields(),
         _runner=SimpleNamespace(
             remove_request=lambda rid: [pool.remove_request(rid) for pool in pools.values()],
         ),
