@@ -33,3 +33,31 @@ def test_a_threads_phases_are_also_recorded_under_its_step_key(monkeypatch):
     assert buf["gpu_exec"] == [2.0]
     assert "step.decoder.decode.gpu_exec" in buf and buf["step.decoder.decode.gpu_exec"] == [3.0]
     assert not any(name.startswith("step.decoder.decode.step.") for name in buf)
+
+
+def test_the_device_idle_before_a_step_is_its_gap():
+    """What a phase table needs to tell a step whose host work is exposed from
+    one whose GPU work is long: the device's idle time before it."""
+    from collections import deque
+
+    from mstar.utils.profiler import phase_buffer
+    from mstar.worker.worker import Worker
+
+    class Mark:
+        def __init__(self, t):
+            self.t = t
+
+        def query(self):
+            return True
+
+        def elapsed_time(self, later):
+            return later.t - self.t
+
+    worker = Worker.__new__(Worker)
+    worker._phase_buf = phase_buffer()
+    worker._gpu_spans = deque([
+        (Mark(0.0), Mark(5.0), "step.n.decode"), (Mark(7.0), Mark(15.0), "step.n.mixed"),
+    ])
+    worker._drain_gpu_spans()
+    assert worker._phase_buf["step.n.mixed.gpu_gap"] == [0.002]
+    assert "step.n.decode.gpu_gap" not in worker._phase_buf

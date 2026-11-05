@@ -503,6 +503,8 @@ class Worker:
     # length (``step_repeats: auto``); None while none does
     _auto_spans: deque | None = None
     _auto_prev_end = None
+    # the last phase-timed step's end event, for the gap before the next
+    _phase_prev_end = None
     # nodes that keep their landed tokens (``NodeSubmodule.record_tokens``)
     _token_readers: frozenset[str] = frozenset()
 
@@ -2450,6 +2452,12 @@ class Worker:
             # drained while another step runs: not that step's sample
             self._phase_buf.unkeyed("gpu_exec").append(elapsed)
             self._phase_buf.unkeyed(f"{key}.gpu_exec").append(elapsed)
+            if self._phase_prev_end is not None:
+                # the device idle before the step: host time no step hid
+                gap = max(self._phase_prev_end.elapsed_time(start) / 1000, 0.0)
+                self._phase_buf.unkeyed("gpu_gap").append(gap)
+                self._phase_buf.unkeyed(f"{key}.gpu_gap").append(gap)
+            self._phase_prev_end = end
 
     def _execute_on_gpu_thread(
         self,
