@@ -52,7 +52,7 @@ class _Engine(_RoomEngine):
     def __init__(self, max_bs=8, budget=None, chunkable=True, cached=0, dropped=()):
         super().__init__(max_bs)
         self.budget, self.chunkable, self.cached, self.dropped = budget, chunkable, cached, set(dropped)
-        self.asked, self.prepared = [], []
+        self.readied, self.prepared = [], []
 
     def get_max_batch_tokens(self, node_name, graph_walk):
         return self.budget
@@ -71,7 +71,7 @@ class _Engine(_RoomEngine):
         return InputSeqLenInfo(tokens - self.cached, cached_prefix=self.cached)
 
     def check_ready(self, node_name, rid, fwd_info, allow_reload=True):
-        self.asked.append(rid)
+        self.readied.append(rid)
         return FULL_ADMIT_REBUILD if rid in self.dropped else FULL_ADMIT_OK
 
     def prepare_rebuild(self, node_name, rid, rebuild):
@@ -107,14 +107,14 @@ def test_a_dropped_requests_decode_row_waits_and_starts_one_rebuild():
 
     assert engine.prepared == [("d0", [1, 2, 3, 4])], "the KV would lay the stream out twice, or not at all"
     assert sched.rebuilds.rebuilding("d0", NODE) and "d0" in runtime.ready, "the decode row ran before its KV"
-    assert engine.asked.count("d0") == 1, "a waiting decode row asks the engine on every pass"
+    assert engine.readied.count("d0") == 1, "a waiting decode row asks the engine on every pass"
 
 
 def test_a_decode_row_runs_once_its_rebuild_lands():
     sched, runtime, state, engine = _scheduler({"d0": DECODE})
     _rebuilding(sched, "d0")
 
-    assert sched.get_next_batch(state).rebuild_rids == {"d0"} and not engine.asked
+    assert sched.get_next_batch(state).rebuild_rids == {"d0"} and not engine.readied
     sched.rebuilds.land_chunk("d0", NODE, None)
 
     assert _rids(sched.get_next_batch(state)) == ["d0"], "the rebuilt request would never decode again"
@@ -128,7 +128,7 @@ def test_a_request_let_back_in_for_room_mid_rebuild_starts_no_second_rebuild():
 
     batch = sched.get_next_batch(state)
 
-    assert batch.rebuild_rids == {"d0"} and not engine.asked, "the decode row would run before its KV is back"
+    assert batch.rebuild_rids == {"d0"} and not engine.readied, "the decode row would run before its KV is back"
 
 
 def test_a_rebuild_row_shares_a_step_with_its_walks_decode_rows():
