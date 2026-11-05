@@ -340,9 +340,12 @@ _HOST_SPANS_PURPOSE = tuple(f"output_spans{slot}" for slot in range(_HOST_ROWS_R
 
 def run_item(column: torch.Tensor, iteration: int) -> torch.Tensor:
     """One iteration of a row's column of a step that repeated, as what leaves
-    the step: a tensor of its own. A view keeps the run's stride, which
-    ``contiguous`` keeps too on one element, and a byte view refuses."""
-    return column[:, iteration].clone(memory_format=torch.contiguous_format)
+    the step. A view of the row, which is the step's own clone, unless its
+    last dim strides by the run's width (a one-element item): ``contiguous``
+    keeps that stride and a byte view refuses it, so that one is copied. A
+    copy per item was most of a Talker step's host time at N=4."""
+    item = column[:, iteration]
+    return item if item.dim() and item.stride(-1) == 1 else item.clone(memory_format=torch.contiguous_format)
 
 
 def _host_column(host_rows: HostRows | None, name: str) -> torch.Tensor | None:

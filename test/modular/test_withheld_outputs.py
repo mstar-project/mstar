@@ -247,3 +247,7 @@ def test_a_runs_column_hands_on_a_tensor_of_its_own():
     item = run_item(column, 2)
     assert item.tolist() == [7] and item.stride() == (1,)
     assert _serialize_tensor(item) == _serialize_tensor(torch.tensor([7]))
+    # a frame per iteration is a view: a copy each was a Talker step's host time
+    frames = torch.arange(24).reshape(1, 4, 6)
+    frame = run_item(frames, 2)
+    assert frame.data_ptr() == frames[:, 2].data_ptr() and _serialize_tensor(frame) == _serialize_tensor(frames[0, 2])
