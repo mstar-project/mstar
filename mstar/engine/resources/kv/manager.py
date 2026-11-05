@@ -4623,12 +4623,16 @@ class KVManager(AttentionResource):
 
     def unreserve(self, rid: str) -> None:
         with self._lock:
-            allotment = self._allotments.pop(rid)
+            self._unreserve(rid)
+
+    def _unreserve(self, rid: str) -> None:
+        allotment = self._allotments.pop(rid, None)
+        if allotment is not None:
             self._unused -= allotment.remaining
             self._asks[rid] = allotment.prompt
-            # a request that holds nothing waits in the queue with no room set aside on the host
-            if self._cpu_pool is not None and self._unwritten(rid) and not self._on_host(rid):
-                self._cpu_pool.unreserve(rid)
+        # a request that holds nothing waits in the queue with no room set aside on the host
+        if self._cpu_pool is not None and self._unwritten(rid) and not self._on_host(rid):
+            self._cpu_pool.unreserve(rid)
 
     def _guarantee(self, rid: str) -> None:
         """Make ``rid`` guaranteed, since the host has no room to set aside for its move."""
@@ -4882,10 +4886,7 @@ class KVManager(AttentionResource):
         to the host has freed its pages. ``room`` is `_room` as it was before the drop or the move."""
         for stream in self._streams[rid].values():
             self._release_lease(rid, stream)
-        allotment = self._allotments.pop(rid, None)
-        if allotment is not None:
-            self._unused -= allotment.remaining
-            self._asks[rid] = allotment.prompt
+        self._unreserve(rid)
         if self._returning(rid):
             self._returned.add(rid)
         self._ran_short.pop(rid, None)
