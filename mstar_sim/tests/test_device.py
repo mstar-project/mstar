@@ -750,10 +750,11 @@ def test_tensor_parallel_ranks_meet_at_each_collective():
     assert out.strip().endswith("ok")
 
 
-@pytest.mark.parametrize("case", ["mismatch", "graph_vs_eager", "extra_replay", "skip"])
+@pytest.mark.parametrize("case", ["mismatch", "graph_vs_eager", "bucket", "extra_replay", "skip"])
 def test_ranks_whose_collectives_dont_pair_abort(case):
     """A rank whose collective doesn't pair with its peer's (a barrier against an all-reduce,
-    a graph replayed against eager calls) aborts with both ranks' descriptors; one whose peer never
+    a graph replayed against eager calls or against one that captured another size) aborts
+    with both ranks' descriptors; one whose peer never
     comes aborts at the group's timeout, as NCCL's watchdog does, or hangs in a replay."""
     out = run_sim(f"""
         import datetime, os, tempfile, time, torch, torch.distributed as dist, torch.multiprocessing as mp
@@ -767,14 +768,14 @@ def test_ranks_whose_collectives_dont_pair_abort(case):
             x = torch.empty(1 << 14, device="cuda")
             if "{case}" == "mismatch":
                 dist.all_reduce(x) if r else dist.barrier()
-            elif "{case}" in ("graph_vs_eager", "extra_replay"):
+            elif "{case}" in ("graph_vs_eager", "bucket", "extra_replay"):
                 graph = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(graph):
-                    dist.all_reduce(x)
+                    dist.all_reduce(x[: 1 << 13] if r and "{case}" == "bucket" else x)  # a wrong bucket
                 graph.replay()
                 if "{case}" == "graph_vs_eager":  # the same all-reduces, which NCCL would pair
                     graph.replay() if r else dist.all_reduce(x)
-                elif r:
+                elif "{case}" == "extra_replay" and r:
                     open(path + ".again", "w").close()
                     graph.replay()
             elif r == 0:
