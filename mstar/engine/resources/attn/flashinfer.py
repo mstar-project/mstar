@@ -424,7 +424,7 @@ class FlashInferManager(AttentionManager):
         if label is None:
             label = self._default_label
         if self._placement is not None:
-            return self._attend_placed(label, (q,), kv_cache_layer, (k, v))
+            return self._attend_placed(label, q, kv_cache_layer, k, v)
         return self._attend(q, label, kv_cache_layer, layer_idx)
 
     @torch.compiler.disable

@@ -174,8 +174,7 @@ class ContextParallelWrapper:
             # page-locked plan indices (MSTAR_KV_PINNED_INDPTRS) stay page-locked once trimmed, so
             # FlashInfer copies them asynchronously on every rank alike, whichever rows a rank trims
             local = local._replace(paged_kv_indices=self._pin(local.paged_kv_indices))
-        # not causal whatever the step: every query sees all of it (a one-token row's own key
-        # included), and FA MLA's causal tile check reads each rank's KV lengths
+        # not causal whatever the step: every query sees all of it (a one-token row's own key included)
         try:
             self.context.plan(causal=False, dtype=self._dtype, **local.to_kwargs_dict())
         finally:
@@ -212,44 +211,40 @@ class ContextParallelWrapper:
         return self._pinned_indices[:n].copy_(indices)
 
     def attend(
-        self, queries: tuple[torch.Tensor, ...], kv_cache_layer: torch.Tensor,
-        new_keys: tuple[torch.Tensor | None, ...],
+        self, q: torch.Tensor, kv_cache_layer: torch.Tensor, k: torch.Tensor | None, v: torch.Tensor | None,
     ) -> torch.Tensor:
-        """Attention over the whole placed pool, in the query's dtype (merged in fp32): ``queries``
-        and ``new_keys`` are the query parts (each ``[N, H, *]``) and the step's own keys as this
-        backend's ``run`` takes them (``new_keys`` read only on a step that isn't one token a row).
-        Every rank runs the same collectives."""
-        if self.new is not None and any(key is None for key in new_keys):
+        """Attention over the whole placed pool, in the query's dtype (merged in fp32): ``q``
+        ``[N, H, D]``, and the step's own keys as this backend's ``run`` takes them (read only on a
+        step that isn't one token a row). Every rank runs the same collectives."""
+        if self.new is not None and (k is None or v is None):
             raise ValueError(
-                "attention over a context-parallel KV pool attends a step's own tokens from the keys "
-                "run is passed (k and v, or MLA's latents as k); this step has more than one token "
-                "a row and got none"
+                "attention over a context-parallel KV pool attends a step's own tokens from the k and v "
+                "run is passed; this step has more than one token a row and got none"
             )
-        new = None if self.new is None else self.new.run(*queries, *new_keys, return_lse=True)
-        parts = self._exchange_queries(queries)
+        new = None if self.new is None else self.new.run(q, k, v, return_lse=True)
+        queries = self._exchange_queries(q)
         # over this rank's slots, with the rows holding any of them
-        out, lse = self.context.run(*parts, kv_cache_layer, return_lse=True)
-        outs, lses = self._exchange_partials(out, lse, self._valid[: parts[0].shape[0]])
+        out, lse = self.context.run(queries, kv_cache_layer, return_lse=True)
+        outs, lses = self._exchange_partials(out, lse, self._valid[: queries.shape[0]])
         if new is not None:
             outs = torch.cat([outs, new[0].to(outs.dtype).unsqueeze(0)])
             lses = torch.cat([lses, new[1].float().unsqueeze(0)])
-        return merge(outs, lses).to(queries[0].dtype)
+        return merge(outs, lses).to(q.dtype)
 
-    def _exchange_queries(self, queries: tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, ...]:
-        """The query parts this rank attends its slots for, from its own (each ``[N, H, *]``). SP
-        partners hold the same heads, so they are its own; TP partners hold different query heads
-        of one KV head, so each gets every partner's, ``[N, P * H, *]`` partner-major, the parts
-        sent as one tensor."""
+    def _exchange_queries(self, q: torch.Tensor) -> torch.Tensor:
+        """The queries this rank attends its slots for, from its own ``[N, H, D]``. SP partners hold
+        the same heads, so they are its own; TP partners hold different query heads of one KV head,
+        so each gets every partner's, ``[N, P * H, D]`` partner-major."""
         placement = self._placement
         if placement.over_sp:
-            return queries
-        q = (queries[0] if len(queries) == 1 else torch.cat(queries, dim=-1)).unsqueeze(0)
+            return q
+        q = q.unsqueeze(0)
         if placement.size == placement.group.world_size:
-            # every rank of the group is a partner (MLA's always are): the same block goes to each
+            # every rank of the group is a partner: the same block goes to each
             q = placement.group.all_gather(q.contiguous(), dim=0)
         else:
             q = placement.group.to_partners(q.expand(placement.size, *q.shape[1:]), placement.partners)
-        return q.transpose(0, 1).flatten(1, 2).split([part.shape[-1] for part in queries], dim=-1)
+        return q.transpose(0, 1).flatten(1, 2)
 
     def _exchange_partials(
         self, out: torch.Tensor, lse: torch.Tensor, valid: torch.Tensor,
