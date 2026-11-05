@@ -50,9 +50,6 @@ class AttentionManager(AttentionResource):
     # the KV pool's placement, and the attention it takes (`bind_dependencies`)
     _placement: "ContextParallel | None" = None
     _placed: "type[ContextParallelWrapper] | None" = None
-    # a backend's refusal of a placed plan its planner may refuse on one rank alone
-    # (`ContextParallelWrapper`'s ``check``)
-    _plan_check = None
 
     # Remains abstract except for build; will build based
     # on the attention backend
@@ -111,7 +108,7 @@ class AttentionManager(AttentionResource):
         new = None if decode else self._placed.own_tokens(self, workspace, kwargs, max_total_tokens)
         return self._placed(
             self._placement, self._kv_config.tokens_per_page, self._dtype, context, new, self._device,
-            kwargs.get("batch_size"), max_total_tokens, check=self._plan_check,
+            kwargs.get("batch_size"), max_total_tokens,
         )
 
     @torch.compiler.disable

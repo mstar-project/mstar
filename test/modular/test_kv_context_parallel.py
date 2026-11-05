@@ -913,17 +913,17 @@ def _emulate_fa_planner(monkeypatch, refuses) -> None:
     monkeypatch.setattr(fm.FlashInferMLAWrapper, "plan", planner)
 
 
-def _refusals(ranks, case, check: str) -> list[bool]:
-    """Per rank, whether it refuses to plan ``case``, by mstar's ``check`` and not the planner's."""
+def _admitted(ranks, case) -> list[bool]:
+    """Per rank, whether it admits ``case``, planning it where it does: FlashInfer's planner (as
+    emulated) never refuses what admission let through."""
+    views = case.plan["main"].views
+    step = AttentionStep(segments=tuple(Segment(v.request_id, "main", v.to_compute) for v in views))
+    ctx = StepContext(request_ids=tuple(v.request_id for v in views), graph_walk="w", slot=0, capture=False)
     decisions = []
     for attn in ranks:
-        try:
+        decisions.append(attn.admit(step, ctx).ok)
+        if decisions[-1]:
             _plan(attn, case)
-        except ValueError as error:
-            assert check in str(error)
-            decisions.append(True)
-        else:
-            decisions.append(False)
     return decisions
 
 
@@ -944,8 +944,9 @@ def _fa_work_items(q_lens, kv_lens, heads) -> int:
 def test_mla_ranks_refuse_the_same_steps_past_the_fa_planners_work_item_cap(monkeypatch, over_sp, rows):
     """FlashInfer's FA MLA planner counts the lengths each rank plans, which differ over a placed
     pool (its context slots, and under SP placement its zigzag share of the own tokens), so its own
-    refusal could come on one rank alone and hang the others in the exchange. The refusal before it
-    is the same on every rank, whatever the cap."""
+    refusal could come on one rank alone and hang the others in the exchange. Admission refuses
+    first, the same steps on every rank whatever the cap, and the planner never refuses a step it
+    admits."""
     case = _Case.build(rows, CPU, torch.float32, mla=True)
     with monkeypatch.context() as m:
         _emulate_fa_planner(m, lambda q, kv, heads, causal: _fa_work_items(q, kv, heads) > fm._FA_MAX_WORK_ITEMS)
@@ -961,7 +962,7 @@ def test_mla_ranks_refuse_the_same_steps_past_the_fa_planners_work_item_cap(monk
         decisions = []
         for cap in range(1, 400):
             m.setattr(fm, "_FA_MAX_WORK_ITEMS", cap)
-            decisions.append(_refusals([attn for attn, _ in ranks], case, "work items"))
+            decisions.append(_admitted([attn for attn, _ in ranks], case))
         assert all(a == b for a, b in decisions) and {a for a, _ in decisions} == {False, True}
     # the torch fallback runs no FA planner, so nothing is refused for it
     monkeypatch.setattr(fm, "_sm_count", lambda device: 132)
@@ -1025,8 +1026,10 @@ def test_mla_attention_refuses_at_admit_a_step_past_the_fa_planners_cap_so_the_w
 def test_sp_placed_mla_attention_admits_a_captured_step_only_if_its_padded_shares_fit(monkeypatch):
     """A capture pads each partner's zigzag share to its bucket (a row of the spare queries, then
     empty rows), which can take the FA planner's bound past the real rows'. Admit bounds the shares
-    the plan checks, so a step it admits is never refused at plan, where it couldn't be retried."""
-    _fa_kernel(monkeypatch)
+    the plan makes, so the planner never refuses a step it admits, where it couldn't be retried."""
+    # a planner refusing every plan whose bound passes the cap
+    _emulate_fa_planner(monkeypatch, lambda q, kv, heads, causal: fm.fa_work_items_bound(
+        np.concatenate([[0], np.cumsum(q)]), heads, 132) > fm._FA_MAX_WORK_ITEMS)
     rows = ((0, 1), (3, 56))
     case = _Case.build(rows, CPU, torch.float32, mla=True)
     attn, _ = _cp_attention(JointGroups(tp_group=CommGroup.trivial(), sp_group=_group(0, P)), CPU, torch.float32,

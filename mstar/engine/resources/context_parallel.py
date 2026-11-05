@@ -13,7 +13,7 @@ exactly.
 
 import math
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from typing import NamedTuple, Protocol
 
@@ -145,11 +145,9 @@ class ContextParallelWrapper(ABC):
     (not causal) on ``context`` and its own tokens, from the keys the layer passes to ``run``, on
     ``new``. ``page_size`` is the logical one.
 
-    ``check(what, qo_indptr)``, before anything is planned, is the backend's refusal of a plan its
-    kernel's planner may refuse on one rank of the lockstep instance alone. It sees every plan whose
-    lengths differ by rank: the context's here, and under SP placement every partner's zigzag share
-    of the own tokens (``ZigzagWrapper``). TP mode's own-token plan has the same lengths on every
-    rank, so a refusal of it is symmetric already."""
+    A plan's lengths differ by rank, so a planner that refuses on lengths could refuse on one rank
+    of the lockstep instance alone; the backend's admission refuses, on every rank alike, the steps
+    whose plans it may (``rank_plans``), before any is planned."""
 
     def __init__(
         self,
@@ -161,10 +159,8 @@ class ContextParallelWrapper(ABC):
         device: torch.device,
         batch_size: int | None = None,
         max_total_tokens: int | None = None,
-        check: Callable[[str, np.ndarray], None] | None = None,
     ):
         self._placement, self._page_size, self._dtype = placement, page_size, dtype
-        self._check = check
         self.context = context
         # None for a one-token-a-row step
         self.new = new
@@ -197,10 +193,7 @@ class ContextParallelWrapper(ABC):
         context = kv_out.cpu_indptrs
         if self.new is not None:
             context = context.context_only(self._page_size)
-        if self._check is not None:
-            self._check("the context", context.qo_indptr.numpy())
         if self.new is not None:
-            # before the context, so a share's refusal (``ZigzagWrapper``) comes before anything is planned
             qo = context.qo_indptr
             own = None if real_rows is None else _leading_rows(kv_out, real_rows)
             self.new.plan(qo if own is None else qo[: own + 1], causal=causal)
@@ -399,14 +392,13 @@ class SPContextParallelWrapper(ContextParallelWrapper):
         placement, tokens = backend._placement, max_total_tokens or 0
         if not tokens:
             paged = backend._context_wrapper(workspace, False, {**kwargs, "page_size": 1}, None)
-            kernel = OneSlotPages(paged, backend._dtype)
-            return ZigzagWrapper(placement, kernel, backend._device, check=backend._plan_check)
+            return ZigzagWrapper(placement, OneSlotPages(paged, backend._dtype), backend._device)
         rows, queries = zigzag_capture(placement.size, kwargs.get("batch_size") or 0, tokens)
         paged = backend._context_wrapper(
             workspace, False, {**kwargs, "page_size": 1, "batch_size": rows, "max_num_pages": 2 * tokens}, queries,
         )
         kernel = OneSlotPages(paged, backend._dtype, captured=(rows, queries))
-        return ZigzagWrapper(placement, kernel, backend._device, queries, tokens, check=backend._plan_check)
+        return ZigzagWrapper(placement, kernel, backend._device, queries, tokens)
 
     @staticmethod
     def rank_plans(placement, qo_indptr, num_qo_heads, captured):
@@ -557,8 +549,7 @@ class ZigzagWrapper:
     """A step's own tokens under SP placement, attended for this rank's zigzag chunks alone on
     ``kernel``, out 0 and lse -inf off them. Captured for a bucket of ``tokens`` tokens, it gathers
     a fixed ``queries`` queries (``zigzag_capture``): its share, then padding, which gathers token 0
-    and scatters to a row ``run`` drops. ``check`` is ``ContextParallelWrapper``'s, which ``plan``
-    applies to every partner's share, as each rank can lay out every partner's."""
+    and scatters to a row ``run`` drops."""
 
     def __init__(
         self,
@@ -567,10 +558,8 @@ class ZigzagWrapper:
         device: torch.device,
         queries: int = 0,
         tokens: int = 0,
-        check: Callable[[str, np.ndarray], None] | None = None,
     ):
         self._placement, self.kernel, self._device = placement, kernel, device
-        self._check = check
         self._stager = PinnedStager(torch.int64)
         self._bucket_tokens = tokens
         # the step's token count the last plan was for
@@ -586,14 +575,6 @@ class ZigzagWrapper:
     @torch.compiler.disable
     def plan(self, qo_indptr: torch.Tensor, causal: bool = True) -> None:
         step = qo_indptr.numpy()
-        if self._check is not None:
-            # every partner's share, as its kernel plans it
-            for index in range(self._placement.size):
-                share = zigzag_share(step, self._placement.size, index)
-                if self._bucket_tokens:
-                    share = OneSlotPages.padded(share, *self.kernel._captured)
-                if len(share) > 1:
-                    self._check(f"partner {index}'s own tokens", share)
         tokens, rows = zigzag_rows(step, self._placement.size, self._placement.index, causal)
         self._step_tokens = int(qo_indptr[-1])
         if self._bucket_tokens:

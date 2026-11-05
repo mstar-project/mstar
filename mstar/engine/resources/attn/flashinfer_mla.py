@@ -388,9 +388,6 @@ class FlashInferMLAManager(AttentionManager):
                     "use a TP size that gives each rank a head count dividing 64, or turn context_parallel off"
                 )
             self._fa_sm_count = _sm_count(self._device)
-            if self._fa_sm_count is not None:
-                # only where the FA planner plans: elsewhere there is nothing to refuse
-                self._plan_check = self._refuse_unplannable
 
     @property
     def uses_kernel(self) -> bool:
@@ -459,8 +456,8 @@ class FlashInferMLAManager(AttentionManager):
         return True
 
     def admit(self, step: AttentionStep, ctx: StepContext) -> AdmitOutcome:
-        """Over a placed pool on the FA planner, refuses a step its planner may not hold
-        (``_refuse_unplannable``) before it is planned, so the worker retries it smaller:
+        """Over a placed pool on the FA planner, refuses a step its planner may not hold before it is
+        planned (``_fits``), so the worker retries it smaller:
         sized by how many of its requests, in its order, fit, or terminal for a request that
         doesn't fit alone (or alone in its capture's bucket, whose padding counts). The bound reads
         query lengths alone, so every rank refuses alike."""
@@ -569,22 +566,6 @@ class FlashInferMLAManager(AttentionManager):
                 wrapper.plan(causal=step.causal, dtype=self._dtype, **indptrs.to_kwargs_dict())
             plan_states[label] = wrapper
         self._preplanned = ctx.is_preplan
-
-    def _refuse_unplannable(self, what: str, qo_indptr: np.ndarray) -> None:
-        """Refuses, before FlashInfer can, a plan past its FA planner's work-item cap
-        (``ContextParallelWrapper``'s ``check``). The planner counts the KV lengths a rank plans,
-        which differ by rank over a placed pool, so its refusal could come on one rank alone; the
-        bound reads the query lengths alone. Under SP placement the context's and the own tokens'
-        heads are the same. A backstop: ``admit`` bounds the same plans, a capture's padding
-        included (``_fits``), and refuses such a step first."""
-        heads = self._wrapper_kwargs["num_qo_heads"]
-        bound = fa_work_items_bound(qo_indptr, heads, self._fa_sm_count)
-        if bound > _FA_MAX_WORK_ITEMS:
-            raise ValueError(
-                f"{what}, {int(qo_indptr[-1])} queries at {heads} heads, can take FlashInfer's "
-                f"FA MLA planner up to {bound} work items over context-parallel KV pool "
-                f"{self._kv_cache_name!r}, past its cap of {_FA_MAX_WORK_ITEMS}.{self._cap_hint()}"
-            )
 
     def clear_preplan(self):
         self._preplanned = False
