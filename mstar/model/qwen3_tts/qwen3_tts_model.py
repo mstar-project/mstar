@@ -470,22 +470,20 @@ class Qwen3TTSModel(Model):
     # Model ABC: resources
     # -----------------------------------------------------------------------
 
-    def get_lora_specs(self) -> list[LoraSpec]:
+    def _lora_spec(self) -> LoraSpec:
         """Per-request adapters on the Talker: every linear of its stack and the
         codec-group-0 head (one row per request: the last token's), named as the
         checkpoint does (``talker.*``) or as the Talker alone does. The text projection
         takes none: it runs in ``prepare_inputs``, outside the step. The CodePredictor's
         depth loop and the speaker / codec models are not served."""
-        from mstar.engine.resources.lora import LORA_RESOURCE_KEY
-        from mstar.model.components.lora.modules import PER_SEGMENT, meta_root, module_lora_spec
+        from mstar.model.components.lora.modules import PER_SEGMENT, module_lora_spec
         from mstar.model.qwen3_tts.components.talker import Qwen3TTSTalkerModel
-
-        root = meta_root(lambda group: Qwen3TTSTalkerModel(self.config, comm_group=group))
-        return [module_lora_spec(
-            root, resource_key=LORA_RESOURCE_KEY, nodes={"Talker"}, root_path="model",
+        return module_lora_spec(
+            lambda group: Qwen3TTSTalkerModel(self.config, comm_group=group),
+            nodes={"Talker"}, root_path="model",
             rows={"codec_head": PER_SEGMENT},
             exclude={"text_projection": "runs in prepare_inputs, outside the planned step"},
-        )]
+        )
 
     def get_node_resources(self) -> list[NodeResourceSpec]:
         """Talker paged KV + attention/position/sampler resources, and the
@@ -536,6 +534,7 @@ class Qwen3TTSModel(Model):
                     max_slots=self.MAX_CODEC_STREAMS + 1,
                 ),
             ),
+            self._lora_spec(),
         ]
 
     # -----------------------------------------------------------------------

@@ -115,7 +115,7 @@ from mstar.worker.batch_builder import BatchBuilderType
 from mstar.worker.chunk_loops import ChunkLoops
 from mstar.worker.engine_manager import EngineManager, refuse_combined_walks_across_tp_groups
 from mstar.worker.executing_batch import input_metadata_and_fwd_info, make_executing_batch
-from mstar.worker.lora_loads import LoraLoads
+from mstar.worker.lora_loads import LoraLoads, lora_pools
 from mstar.worker.micro_scheduler import (
     CHAIN_LANE,
     MicroScheduler,
@@ -1579,7 +1579,7 @@ class Worker:
             self._lora_loads = LoraLoads()
         elif self._lora_loads.defer(body):
             return
-        self._lora_loads.start(body, self.engine_manager.engine.lora_pools())
+        self._lora_loads.start(body, lora_pools(self.engine_manager.engine.resources))
         self._finish_lora_loads()
 
     def _finish_lora_loads(self) -> None:
@@ -1601,7 +1601,7 @@ class Worker:
             return
         error = None
         try:
-            for pool in self.engine_manager.engine.lora_pools():
+            for pool in lora_pools(self.engine_manager.engine.resources):
                 pool.unload_adapter(body.lora_name)
         except Exception as exc:  # noqa: BLE001
             logger.exception("Worker %s: LoRA adapter %s failed to unload", self.worker_id, body.lora_name)

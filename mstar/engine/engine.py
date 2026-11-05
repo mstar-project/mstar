@@ -44,7 +44,6 @@ from mstar.engine.resources.base import EngineResourceInfo, KeyedWalks, build_re
 from mstar.engine.resources.kv.config import instance_size, opening_prefix_caches, unrestorable
 from mstar.engine.resources.kv.keys import fingerprint
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
-from mstar.engine.resources.lora.config import LoraBaseOnly, node_capture_key
 from mstar.engine.resources.resident import ResidentPlanner, build_planner
 from mstar.engine.resources.spec import resolve_spec_dependencies
 from mstar.engine.resources.step import (
@@ -92,7 +91,6 @@ from mstar.utils.profiler import (
 
 if TYPE_CHECKING:
     from mstar.engine.resources.kv.manager import KVManager
-    from mstar.engine.resources.lora.pool import LoraAdapterPool
     from mstar.model.base import Model
 
 logger = logging.getLogger(__name__)
@@ -134,11 +132,11 @@ def _search_cap(submodule_mgmt, fraction: float | None, device) -> Iterator[None
 
 @contextmanager
 def _outside_steps(submodule_mgmt) -> Iterator[None]:
-    """A node's forwards run outside any step (compile warm-ups), with each of its LoRA
-    pools as in a base-only step (``LoraAdapterPool.base_only``)."""
+    """A node's forwards run outside any step (compile warm-ups), with its idle-capable
+    resources sitting them out (``Resource.outside_step``)."""
     with ExitStack() as stack:
-        for pool in submodule_mgmt.lora_pools:
-            stack.enter_context(pool.base_only())
+        for key in submodule_mgmt.idle_keys:
+            stack.enter_context(submodule_mgmt.resources[key].outside_step())
         yield
 
 
@@ -210,10 +208,14 @@ class SubmoduleManagement:
     piecewise_runners: dict[str, PiecewiseAcceleratorGraphRunner] = field(
         default_factory=dict
     )
-    # the LoRA pools bound to the node's modules, set at bind
-    lora_pools: tuple = ()
+    # the keys of the node's idle-capable resources (`Resource.idle_capture`)
+    idle_keys: tuple[str, ...] = field(init=False, default=())
 
     def __post_init__(self):
+        self.idle_keys = tuple(key for key, res in self.resources.items() if res.idle_capture)
+        if len(self.idle_keys) > 1:
+            # a step is idle or not as a whole, so one idle twin can't serve two resources
+            raise ValueError(f"a node takes at most one idle-capable resource; got {list(self.idle_keys)}")
         # Two hazards want a second slot, both of them the host running ahead of
         # the GPU: pre-plan needs plan(N+1) to write buffers replay(N) isn't
         # reading, and ``force_double_buffer`` is the same for a resource
@@ -268,6 +270,16 @@ class SubmoduleManagement:
             slot = self._next_slot
             self._next_slot = (self._next_slot + 1) % self._num_slots
             return slot
+
+    def rows_idle(self, rids) -> bool:
+        """Whether none of ``rids`` uses the node's idle-capable resources, which then sit
+        the step out (``Resource.idle_for``). False at once for a node with none. Each
+        resource answers from its ingests, the same on every rank, except for a row
+        removed while the plan thread leases: one rank can then replay the idle graph and
+        another the plain one, which is safe only because an idle-capable resource's
+        kernels hold no collective (``Resource.idle_capture``)."""
+        keys = self.idle_keys
+        return bool(keys) and all(self.resources[key].idle_for(rids) for key in keys)
 
     def set_piecewise_slot(self, slot: int) -> None:
         """Point the region runners at this batch's slot, on the GPU thread just
@@ -699,9 +711,6 @@ class Engine:
                 fp32_precision=node_fp32_precision(node_name, submodule),
             )
             submodule.bind_node_resources(resources)
-            self._submodules[node_name].lora_pools = tuple(
-                resources[key] for key in getattr(submodule, "lora_keys", ())
-            )
             loopback = submodule.device_loopback if isinstance(submodule, ARNodeSubmodule) else None
             if loopback is not None:
                 # the sampler keeps its slot masters only for a node that
@@ -740,11 +749,10 @@ class Engine:
             if isinstance(resource, KVManager)
         ]
 
-    def lora_pools(self) -> list["LoraAdapterPool"]:
-        """Every LoRA adapter pool this engine built, for runtime adapter loads."""
-        from mstar.engine.resources.lora.pool import LoraAdapterPool
-
-        return [r for r in self._resources.values() if isinstance(r, LoraAdapterPool)]
+    @property
+    def resources(self) -> Mapping[str, Resource]:
+        """Every resource this engine built, by key."""
+        return self._resources
 
     def _compile_submodules(self) -> None:
         """Apply torch.compile to submodule forward paths.
@@ -1064,7 +1072,7 @@ class Engine:
                 memory_pool=memory_pool,
                 device_capability=self.device_capability,
                 capture_stream=capture_stream,
-                lora_keys=getattr(submodule_mgmt.submodule, "lora_keys", ()),
+                segment_keys=getattr(submodule_mgmt.submodule, "segment_keys", ()),
             )
             runners[label] = runner
         return runners
@@ -1774,6 +1782,7 @@ class Engine:
                 request_ids=(rid,),
                 graph_walk=batch.step_context.graph_walk,
                 slot=slot, capture=False,
+                idle=submodule_mgmt.rows_idle((rid,)),
             )
             if i != len(batch.request_ids) - 1:
                 slot = submodule_mgmt.lease_slot()
@@ -2019,7 +2028,7 @@ class Engine:
         rids = list(ctx.padded_request_ids)
 
         if step is not None:
-            if lease is not None and step.cg_key_info != node_capture_key(lease.bucket.cg_key_info):
+            if lease is not None and step.cg_key_info != lease.bucket.cg_key_info:
                 # The slot was leased from `cg_key_info` before the step was
                 # declared. If the two disagree the replay runs a graph that
                 # was planned for a different declaration — silently wrong
@@ -2876,6 +2885,8 @@ class Engine:
         if batch.slot is None:
             batch.set_slot(submodule_mgmt.lease_slot())
 
+        idle = submodule_mgmt.rows_idle(batch.request_ids)
+        batch.step_context.idle = idle
         cg_runner = submodule_mgmt.accelerator_graph_runner
         if cg_runner is None:
             return None
@@ -2892,22 +2903,13 @@ class Engine:
             None if batch.inputs is None
             else sum(inp.input_seq_len for inp in batch.inputs)
         )
-        lease = None
-        pools = submodule_mgmt.lora_pools
-        if pools and not any(pool.runs_adapters(batch.request_ids) for pool in pools):
-            # no row names an adapter: the graph captured without LoRA kernels, when
-            # there is one (the pool checks the rows again at plan)
-            batch.cg_key_info = LoraBaseOnly(key)
-            lease = cg_runner.lease_slot(
-                graph_walk=batch.step_context.graph_walk, bs=len(batch.request_ids),
-                slot=batch.slot, num_tokens=num_tokens, cg_key_info=batch.cg_key_info,
-            )
-        if lease is None:
-            batch.cg_key_info = key
-            lease = cg_runner.lease_slot(
-                graph_walk=batch.step_context.graph_walk, bs=len(batch.request_ids),
-                slot=batch.slot, num_tokens=num_tokens, cg_key_info=key,
-            )
+        batch.cg_key_info = key
+        # an idle step replays the bucket's twin captured without the idle resources'
+        # kernels, else the plain one, under which they run on rows that address nothing
+        lease = cg_runner.lease_slot(
+            graph_walk=batch.step_context.graph_walk, bs=len(batch.request_ids),
+            slot=batch.slot, num_tokens=num_tokens, cg_key_info=key, idle=idle,
+        )
         planner = submodule_mgmt.resident
         ctx = batch.step_context
         ctx.resident = planner if lease is not None and planner is not None and planner.covers(lease.bucket) else None
@@ -2915,6 +2917,7 @@ class Engine:
         if lease is not None:
             batch.lease_slot(lease)
             ctx.force_prefill = cg_runner.is_packed(lease)
+            ctx.idle = lease.bucket.idle
         return lease
 
     def can_pre_plan(self, node_name: str) -> bool:

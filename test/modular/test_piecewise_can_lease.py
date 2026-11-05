@@ -73,7 +73,7 @@ def _packed_runner(one_row):
         replay_seq_lens=lambda shape, seq_lens, real_bs: list(seq_lens),
     )
     runner._label, runner._current_slot, runner._capture_batch_sizes = "region", 0, sizes
-    runner._lora_keys = ()
+    runner._idle_keys = ()
     runner._graphs = {
         PiecewiseGraphKey(bs=bs, seq_len=256, slot=0): SimpleNamespace(
             bucket=(bs, 256), shape=SimpleNamespace(bs=bs), dummy_rids=list(range(bs)),

@@ -806,14 +806,15 @@ class VisionEncoderSubmodule(NodeSubmodule):
         **kwargs,
     ) -> SubmoduleStep | None:
         # Leased, the captured block loop plans its own attention per replay. No row of a
-        # leased step runs a vision adapter (the base-only loop refuses them in
+        # leased step runs a vision adapter (the idle loop refuses them in
         # `can_lease`), but a node serving adapters still declares its frames: the engine
-        # adds their LoRA rows (`lora_rows`), so the bound patch embed and merger outside
-        # the loop have a planned step to run base-only against.
+        # adds the pool's step of them (`engine_step`), so the bound patch embed and merger
+        # outside the loop have a planned step to run idle against.
         leased = bool((piecewise_leases or {}).get(VISION_BLOCK_LOOP))
-        if leased and not self.lora_keys:
+        if leased and not self.segment_keys:
             return None
-        # one segment per frame: a frame attends to itself alone
+        # one segment per frame: a frame attends to itself alone, and the frames, in
+        # order, are the rows the tower's linears see (the merger's folded)
         segments = [
             Segment(request_id=rid, label="main", span=span)
             for rid, inp in zip(request_ids, inputs, strict=True)
