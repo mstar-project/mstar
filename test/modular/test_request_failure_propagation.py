@@ -76,6 +76,8 @@ def _worker(known_rids=("r1", "r2")):
         scheduler=scheduler, admission=scheduler.admission, lockstep=scheduler.lockstep,
     )
     w.sent = sent
+    for rid in known_rids:
+        w.lifecycle.add(rid, rid)
     return w
 
 
@@ -87,7 +89,7 @@ def test_fail_requests_reports_per_rid_errors_once():
     assert entity == "conductor"
     assert msg.message_type == ConductorMessageType.FAIL_REQUESTS
     assert msg.body == FailRequests(errors={"r1": "boom", "r2": "bang"})
-    assert w.scheduler.failed_rids == {"r1", "r2"}
+    assert w.lifecycle.failed_rids == {"r1", "r2"}
 
 
 def test_fail_requests_ignores_rids_the_worker_already_dropped():
@@ -97,7 +99,7 @@ def test_fail_requests_ignores_rids_the_worker_already_dropped():
     w = _worker(known_rids=("r1",))
     w._fail_requests({"gone": "boom"})
     assert w.sent == []
-    assert w.scheduler.failed_rids == set()
+    assert w.lifecycle.failed_rids == set()
 
 
 def _pending_batch(rids, future=None):

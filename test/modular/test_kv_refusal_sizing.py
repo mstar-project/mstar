@@ -34,7 +34,8 @@ from mstar.engine.resources.kv.config import KVSpec, KVStep, PagedKVConfig
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.spec import resolve_spec_dependencies
 from mstar.engine.resources.step import AdmitRuntimeError, AllocationFailed, Segment, StepContext
-from mstar.utils.ipc_format import RemoveRequest
+from mstar.testing_utils.worker import deliver
+from mstar.utils.ipc_format import RemoveRequest, WorkerMessage, WorkerMessageType
 from mstar.worker.micro_scheduler import ScheduledBatch
 from mstar.worker.worker import Worker
 
@@ -366,14 +367,14 @@ def _engine_manager(**pools: KVManager) -> SimpleNamespace:
 
 def _teardown_over(sched, known_rids, engine_manager):
     worker = _teardown_worker(known_rids=known_rids)
-    worker.scheduler, worker.admission, worker.lockstep = sched, sched.admission, sched.lockstep
+    worker.scheduler, worker.admission = sched, sched.admission
     worker.engine_manager = engine_manager
     return worker
 
 
 def _remove(worker, *rids: str) -> None:
     for rid in rids:
-        Worker._remove_request(worker, RemoveRequest(request_id=rid))
+        deliver(worker, WorkerMessage(WorkerMessageType.REMOVE_REQUEST, RemoveRequest(request_id=rid)))
 
 
 def test_a_teardown_that_frees_pages_lifts_a_cap_a_busy_walk_never_steps_under():

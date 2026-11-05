@@ -22,6 +22,7 @@ from mstar.worker.batch_builder import (
     make_batch_builder,
 )
 from mstar.worker.lockstep import Lockstep
+from mstar.worker.request_lifecycle import RequestLifecycle
 from mstar.worker.scheduled_batch import (  # noqa: F401 (re-exported)
     REMOVED_RID,
     ContinuingRows,
@@ -98,13 +99,14 @@ class MicroScheduler:
 
     def __init__(
         self, services: WorkerServices, layout: WorkerLayout,
-        lockstep: Lockstep, admission: Admission, model_config: dict | None = None,
-        sched_type=SchedulingType.ROUND_ROBIN,
+        lifecycle: RequestLifecycle, lockstep: Lockstep, admission: Admission,
+        model_config: dict | None = None, sched_type=SchedulingType.ROUND_ROBIN,
         max_consec_tp_follower_batches: int = 1,
     ):
         model_config = model_config or {}
         self.engine_manager = services.engine_manager
         self.request_state = services.request_state
+        self.lifecycle = lifecycle
         self.lockstep = lockstep
         self.admission = admission
         self._orders: dict[tuple[str, str], StepOrder] = {}
@@ -148,9 +150,6 @@ class MicroScheduler:
         self.cached_prefix: dict[tuple[int, str], int] = {}
         self.sched_type = sched_type
 
-        # RIDs that have failed but have not gone through the cleanup procedure;
-        # these cannot be scheduled (unless this is a TP follower node)
-        self.failed_rids: set[int] = set()
         # lockstep-parallel (TP / SP instance) scheduling
         self.parallel_leader_nodes = layout.parallel_leader_nodes
         self.num_consec_tp_follower_batches = 0
@@ -173,12 +172,6 @@ class MicroScheduler:
         # scheduling key -> the first turn of its latest admitted step: the
         # rows at or past it hold the key's step
         self._latest_step: dict[tuple[str, str], int] = {}
-        # rid -> the order requests arrived at this worker in (`note_arrival`)
-        self.arrival: dict[int, int] = {}
-        self._arrivals = 0
-        # Rids with a deferred remove; stop initiating new work for them.
-        # Shared by reference with Worker._pending_removes.
-        self.pending_removes: dict[int, None] = {}
 
     def _parse_speculation_mixes_walks(
         self, setting: Mapping[str, Any],
@@ -272,13 +265,6 @@ class MicroScheduler:
         reach last: the line a capped step's pick reads."""
         return max(rids, key=self._line_order(self._key(node_name, graph_walk)).key)
 
-    def note_arrival(self, rid: int) -> None:
-        """A request reached this worker; a request with several partitions
-        here keeps its first arrival."""
-        if rid not in self.arrival:
-            self._arrivals += 1
-            self.arrival[rid] = self._arrivals
-
     def _order_of(self, key: tuple[str, str]) -> StepOrder:
         """``key``'s `StepOrder`, as its submodule declares it. A combined
         walk's step holds its walks' rows, so it takes turns if any of its
@@ -295,7 +281,7 @@ class MicroScheduler:
     def _line_order(self, key: tuple[str, str]) -> LineOrder:
         """``StepCandidates.line_order`` for ``key``."""
         turns = self.last_ran.get(key, {})
-        arrived = self.arrival.get
+        arrived = self.lifecycle.arrivals.get
         if self._order_of(key) is StepOrder.TURNS:
             # longest-waiting first; a row new to the key ahead of every row
             # that ran here, the earliest request first
@@ -335,7 +321,8 @@ class MicroScheduler:
         key = self._key(node_name, graph_walk)
         if self._live_backlog(key) - batch_rids:
             return True
-        exclude = self.failed_rids.union(self.pending_removes, self.admission.held_until, batch_rids)
+        lifecycle = self.lifecycle
+        exclude = lifecycle.failed_rids.union(lifecycle.pending_removes, self.admission.held_until, batch_rids)
         engine = self.engine_manager.get_engine(node_name)
         return any(
             not engine.is_offloaded(spec.node_name, rid)
@@ -486,7 +473,8 @@ class MicroScheduler:
         # Do not schedule a request that was removed between scheduling
         # cycles, has its remove deferred for in-flight safety, is in OOM
         # backoff, or recently failed.
-        exclude = self.failed_rids.union(self.pending_removes, self.admission.held_until)
+        lifecycle = self.lifecycle
+        exclude = lifecycle.failed_rids.union(lifecycle.pending_removes, self.admission.held_until)
         check_ready = self.admission.check_ready
         # only rank 0 can initiate scheduling: a followed node's head is
         # served by _try_schedule_tp_follow
@@ -703,7 +691,8 @@ class MicroScheduler:
         specs = []
         # a chain holding every request here has nothing waiting on the queues
         if len(self.request_state.per_request_info) > len(continuing) + len(mid):
-            exclude = self.failed_rids.union(self.pending_removes, self.admission.held_until)
+            lifecycle = self.lifecycle
+            exclude = lifecycle.failed_rids.union(lifecycle.pending_removes, self.admission.held_until)
             specs = [
                 spec for spec in self._rows_here(self._ready_specs(
                     exclude, target if own_walk is not None else key, None,
@@ -869,9 +858,10 @@ class MicroScheduler:
             return set()
         now = time.monotonic()
         held = self.admission.held_until
+        failed, removing = self.lifecycle.failed_rids, self.lifecycle.pending_removes
         return {
             r for r in waiting.request_to_worker_graph
-            if r not in self.failed_rids and r not in self.pending_removes
+            if r not in failed and r not in removing
             and held.get(r, 0.0) <= now
         }
 
@@ -971,7 +961,8 @@ class MicroScheduler:
         # engine, as on the fresh path: asking reloads an offloaded row, which
         # would OOM it again straight away.
         now = time.monotonic()
-        held, removing, failed = self.admission.held_until, self.pending_removes, self.failed_rids
+        held = self.admission.held_until
+        removing, failed = self.lifecycle.pending_removes, self.lifecycle.failed_rids
         rows = [
             rid for rid in batch.request_to_worker_graph
             if rid not in removing and rid not in failed and held.get(rid, 0.0) <= now
@@ -1258,6 +1249,7 @@ class MicroScheduler:
         under ``exclude_target`` are outside it."""
         now = time.monotonic()
         held = self.admission.held_until
+        failed, removing = self.lifecycle.failed_rids, self.lifecycle.pending_removes
         for node_walk, batch in self.backlog.items():
             if self._lane(node_walk) != CHAIN_LANE:
                 continue
@@ -1271,7 +1263,7 @@ class MicroScheduler:
             for rid in batch.request_to_worker_graph:
                 if only_other and batch.walk_of(rid) == exclude_walk:
                     continue
-                if rid in self.failed_rids or rid in self.pending_removes:
+                if rid in failed or rid in removing:
                     continue
                 if held.get(rid, 0.0) > now:
                     continue
@@ -1331,7 +1323,7 @@ class MicroScheduler:
         # next_batch call will refresh.
         now = time.monotonic()
         exclude = {
-            rid for rid in self.failed_rids if rid not in tp_pend_rids
+            rid for rid in self.lifecycle.failed_rids if rid not in tp_pend_rids
         } | {
             rid for rid, t in self.admission.held_until.items() if t > now
         }
@@ -1357,7 +1349,7 @@ class MicroScheduler:
         its backlog, and graph-ready rows still on the queues. Read-only and
         graph-level (no engine readiness check, which can reload), so a held
         or not yet reloaded row counts; a failed or removed one does not."""
-        exclude = self.failed_rids.union(self.pending_removes)
+        exclude = self.lifecycle.failed_rids.union(self.lifecycle.pending_removes)
         rows: Counter[str] = Counter()
         for (node, _), waiting in self.backlog.items():
             rows[node] += sum(1 for rid in waiting.request_to_worker_graph if rid not in exclude)
@@ -1365,21 +1357,17 @@ class MicroScheduler:
             rows[spec.node_name] += len(spec.rids)
         return rows
 
-    def fail_rids(self, rids: set[int]) -> None:
-        """Stop scheduling new work for requests reported to the conductor as
-        failed. Cleared by ``clear_rid`` when the removal comes back."""
-        self.failed_rids.update(rids)
+    def drop_backlogged(self, rids: Iterable[int]) -> None:
+        """Requests that failed or are draining: nothing waiting for them runs."""
         for rid in rids:
             self._drop_backlogged_rid(rid)
 
     def clear_rid(self, rid: int) -> None:
         """Forget all per-request scheduler state; called on REMOVE_REQUEST."""
-        self.failed_rids.discard(rid)
         for key in [key for key in self.chunk_started if key[0] == rid]:
             del self.chunk_started[key]
         for key in [key for key in self.cached_prefix if key[0] == rid]:
             del self.cached_prefix[key]
         for turns in self.last_ran.values():
             turns.pop(rid, None)
-        self.arrival.pop(rid, None)
         self._drop_backlogged_rid(rid)

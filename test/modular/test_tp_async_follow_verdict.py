@@ -62,7 +62,7 @@ class _FakeEngineManager:
 
 class _Communicator:
     """wait_for_work delivers one queued message batch per call; the test
-    pushes messages via ``inbox`` (drained by the next ``_process_messages``)
+    pushes messages via ``inbox`` (drained by the next ``process_messages``)
     or schedules them in ``deliveries`` (wait number -> messages that land on
     that wait). Raises if the follower keeps waiting after everything was
     delivered — that would be a hang."""
@@ -92,8 +92,8 @@ def _stub(cache_open: bool = False, async_sched=(True, None)):
         admission=scheduler.admission, engine_manager=engine_manager,
         communicator=_Communicator(),
     )
-    stub._check_ready_tensors = lambda: None
-    stub._poll_stream_buffers = lambda: None
+    stub.ingest.check_ready_tensors = lambda: None
+    stub.ingest.poll_stream_buffers = lambda: None
     stub.build_results = []   # what _try_follow_speculation returns, in order
 
     def _process_messages():
@@ -113,7 +113,7 @@ def _stub(cache_open: bool = False, async_sched=(True, None)):
             return res
         return None
 
-    stub._process_messages = _process_messages
+    stub.ingest.process_messages = _process_messages
     stub._try_follow_speculation = _try_follow
     return stub
 

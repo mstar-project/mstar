@@ -34,10 +34,6 @@ def _fake_worker() -> Worker:
     w._reset_skip_plan_flags = w.resets.append
     w._rid_str = str
     w.despeculated = []
-    w._pending_removes = {}
-    w._pending_drains = set()
-    w._draining_rids = set()
-    w.scheduler = SimpleNamespace(failed_rids=set())
     w.settled = []
     w._graph_runtime = SimpleNamespace(
         push_back_node=lambda node_name, rids, wg_ids: w.pushed_back.extend(rids),

@@ -357,7 +357,8 @@ def _scheduler(engine: _Engine) -> MicroScheduler:
 
 
 def _clear(rid, sched: MicroScheduler) -> None:
-    """A teardown's three clears, by rid in a test where handle and wire id are one."""
+    """A teardown's four clears, by rid in a test where handle and wire id are one."""
+    sched.lifecycle.removed(rid, rid)
     sched.clear_rid(rid)
     sched.admission.clear(rid)
     sched.lockstep.clear(rid, rid)
@@ -612,7 +613,7 @@ def test_a_held_or_removed_backlog_row_waits_without_a_readiness_check(park):
     if park == "held":
         sched.admission.hold(["r0"])
     else:
-        sched.pending_removes["r0"] = None
+        sched.lifecycle.pending_removes["r0"] = -1
     sched.backlog[(NODE, WALK)] = _batch(["r0", "r1"])
 
     batch = _next_batch(sched, _Manager([]))
@@ -706,8 +707,8 @@ def test_a_row_holding_the_step_keeps_it_over_a_backlog_that_fills_it():
     own. The holder goes first; skipping the scan would hand it the step."""
     engine = _Engine(max_bs=1, order=StepOrder.ARRIVAL)
     sched = _scheduler(engine)
-    sched.note_arrival("h")
-    sched.note_arrival("b")
+    sched.lifecycle.add("h", "h")
+    sched.lifecycle.add("b", "b")
     _turns(sched, ["h"])
     sched.backlog[(NODE, WALK)] = _batch(["b"])
     manager = _Manager(["h"])
@@ -877,8 +878,8 @@ def test_an_earlier_request_waits_for_the_holder_under_arrival():
     """First come, first served to completion: a request that arrived first
     but reaches the node later doesn't take the step from the one holding it."""
     sched = _scheduler(_Engine(max_bs=1, order=StepOrder.ARRIVAL))
-    sched.note_arrival("w0")
-    sched.note_arrival("c0")
+    sched.lifecycle.add("w0", "w0")
+    sched.lifecycle.add("c0", "c0")
     _turns(sched, ["c0"])
 
     pick, batch = _chain(sched, _Manager(["w0"]), ["c0"])
@@ -890,7 +891,7 @@ def test_with_nobody_holding_the_step_the_earliest_request_goes_first():
     """Under ARRIVAL, not the handle order the runtime scans in."""
     sched = _scheduler(_Engine(max_bs=1, order=StepOrder.ARRIVAL))
     for rid in ["r2", "r0", "r1"]:
-        sched.note_arrival(rid)
+        sched.lifecycle.add(rid, str(rid))
 
     batch = _next_batch(sched, _Manager(["r0", "r1", "r2"]))
 
@@ -1001,7 +1002,7 @@ def test_under_arrival_no_row_passes_one_of_another_capture_group():
     engine = _Engine(max_bs=2, groups={"c0": "g", "u0": "u", "g1": "g"}, order=StepOrder.ARRIVAL)
     sched = _scheduler(engine)
     for rid in ["c0", "u0", "g1"]:
-        sched.note_arrival(rid)
+        sched.lifecycle.add(rid, str(rid))
     _turns(sched, ["c0"])
     manager = _Manager(["u0", "g1"])
 
@@ -1069,7 +1070,7 @@ def test_last_in_line_is_the_row_the_pick_would_reach_last(order, last):
     r2 arrived last."""
     sched = _scheduler(_Engine(order=order))
     for rid in ("r0", "r1", "r2"):
-        sched.note_arrival(rid)
+        sched.lifecycle.add(rid, str(rid))
     _turns(sched, ["r0"], ["r1"])
     sched.note_ran(_batch(["r2"], node="talker", walk="stream"))
 
@@ -1111,14 +1112,14 @@ def test_clear_rid_forgets_the_rids_turn_and_arrival():
     """Handles are recycled: the next request given this one must not
     inherit its place in line, at any node."""
     sched = _scheduler(_Engine(max_bs=1))
-    sched.note_arrival("r0")
+    sched.lifecycle.add("r0", "r0")
     sched.note_ran(_batch(["r0", "r1"]))
     sched.note_ran(_batch(["r0"], node="talker", walk="stream"))
 
-    sched.clear_rid("r0")
+    _clear("r0", sched)
 
     assert sched.last_ran == {(NODE, WALK): {"r1": 2}, ("talker", "stream"): {}}
-    assert sched.arrival == {}
+    assert sched.lifecycle.arrivals == {}
 
 
 def test_the_room_left_is_exactly_what_the_backlog_then_fills():
@@ -1148,7 +1149,7 @@ def test_the_peek_ignores_the_speculated_walks_own_backlog():
 def test_the_peek_ignores_a_backlog_of_failed_rids():
     sched = _scheduler(_Engine(max_bs=8))
     sched.backlog[("other", "prefill")] = _batch(["b0"], node="other", walk="prefill")
-    sched.failed_rids.add("b0")
+    sched.lifecycle.failed_rids.add("b0")
 
     assert _has_ready(sched, _Manager([]), (NODE, WALK)) is False
 
@@ -1246,7 +1247,8 @@ def test_a_chain_keeps_going_over_its_own_groups_backlog():
 def test_a_chain_does_not_yield_to_a_failed_rid():
     sched = _scheduler(_Engine(max_bs=16, groups={**_MIXED, "c0": True}))
     sched.backlog[(NODE, WALK)] = _batch(["u0"])
-    sched.fail_rids({"u0"})
+    sched.lifecycle.failed_rids.add("u0")
+    sched.drop_backlogged({"u0"})
 
     assert bound(sched, _Manager([])).backlog_splits_from((NODE, WALK), "c0") is False
 
@@ -1408,7 +1410,8 @@ def test_an_unservable_rid_leaves_the_backlog_when_the_worker_fails_it():
     errors = sched.admission.take_admit_errors()
     assert set(errors) == {"r0"}
     # what ``Worker._fail_requests`` does with them, at the top of the next pass
-    sched.fail_rids(set(errors))
+    sched.lifecycle.failed_rids.update(errors)
+    sched.drop_backlogged(errors)
     assert sched.backlog == {}
 
 
@@ -1419,7 +1422,7 @@ def test_clearing_a_rid_forgets_its_undelivered_admit_error():
     _clear("r0", sched)
 
     assert sched.admission.take_admit_errors() == {}
-    assert sched.failed_rids == set()
+    assert sched.lifecycle.failed_rids == set()
 
 
 # ── engine capture-group gate ───────────────────────────────────────────
@@ -2033,7 +2036,7 @@ def test_a_mixed_steps_row_cap_takes_the_prompts_first_in_line(order):
         max_bs={MIXED: 8, WALK: 8, "prefill": 8}, row_caps={"prefill": 2}, order=order,
     ))
     for rid in ["p2", "p1", "d0", "d1", "p0"]:
-        sched.note_arrival(rid)
+        sched.lifecycle.add(rid, str(rid))
     sched.note_ran(_batch(["d0", "d1"], walk=WALK))  # decode holds the step
     manager = _Manager(
         ["d0", "p0", "p1", "p2", "d1"], walks={"p0": "prefill", "p1": "prefill", "p2": "prefill"},
@@ -2228,7 +2231,7 @@ def test_under_a_budget_a_row_mid_prefill_lines_up_ahead_of_older_unstarted_prom
     started would otherwise take a mixed step's prompt rows ahead of it."""
     sched = _combined_scheduler(_BudgetedEngine(max_bs=8))
     for rid in ("o0", "o1", "o2", "o3", "p0", "h0"):
-        sched.note_arrival(rid)
+        sched.lifecycle.add(rid, str(rid))
     sched.chunk_started[("p0", NODE)] = 0
     sched.note_ran(ScheduledBatch(node_name=NODE, graph_walk=WALK, request_to_worker_graph={"h0": 0}))
     line = sched._line_order(sched._key(NODE, WALK))
@@ -2237,7 +2240,7 @@ def test_under_a_budget_a_row_mid_prefill_lines_up_ahead_of_older_unstarted_prom
     assert sorted(["o0", "o1", "o2", "o3", "p0", "h0"], key=line.key)[:3] == ["h0", "p0", "o0"]
     unbudgeted = _combined_scheduler(_Engine(max_bs=8))
     for rid in ("o0", "p0"):
-        unbudgeted.note_arrival(rid)
+        unbudgeted.lifecycle.add(rid, str(rid))
     unbudgeted.chunk_started[("p0", NODE)] = 0
     plain = unbudgeted._line_order(unbudgeted._key(NODE, WALK))
     assert sorted(["p0", "o0"], key=plain.key) == ["o0", "p0"], "without a budget, arrival order"
@@ -2782,7 +2785,7 @@ def test_a_row_mid_prefill_the_merge_leaves_out_is_neither_parked_nor_readied():
     assert _next_batch(sched, manager).chunk_ranges == {"p0": (0, 2, 10, 2), "p1": (0, 2, 10, 2)}
     # the step takes the chain's row, which holds the step, then the earliest prompt
     for rid in ("c0", "p0", "p1"):
-        sched.note_arrival(rid)
+        sched.lifecycle.add(rid, str(rid))
     sched.note_ran(ScheduledBatch(node_name=NODE, graph_walk=WALK, request_to_worker_graph={"c0": 0}))
 
     merged = _chain(

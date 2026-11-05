@@ -8,14 +8,15 @@ from types import SimpleNamespace
 
 import pytest
 
-from mstar.testing_utils.worker import make_scheduler, make_worker
-from mstar.utils.containers import RecentSet
+from mstar.testing_utils.worker import deliver, make_scheduler, make_worker
 from mstar.utils.ipc_format import (
     ConductorMessageType,
     MessageSource,
     RemoveRequest,
     ScheduleTPNode,
     TensorReceived,
+    WorkerMessage,
+    WorkerMessageType,
 )
 from mstar.worker.lockstep import Lockstep
 from mstar.worker.micro_scheduler import REMOVED_RID
@@ -114,24 +115,27 @@ def test_follow_refcount_counts_rids_this_rank_cannot_resolve():
 # ── the worker's boundary ──────────────────────────────────────────────────
 
 
-def _worker(*rids: str) -> tuple[Worker, RidTable]:
+def _worker(
+    *rids: str, tensor_manager=None, engine_manager=None, connections=(),
+) -> tuple[Worker, RidTable]:
     """A worker whose graph runtime is only the rid table: the boundary is
     what these tests are about, and the runtime owns the table."""
     t = RidTable()
     sent = []
     runtime = SimpleNamespace()
     request_state = SimpleNamespace()
+    tensor_manager = tensor_manager or SimpleNamespace()
     scheduler = make_scheduler(graph_runtime=runtime, request_state=request_state)
     w = make_worker(
         communicator=SimpleNamespace(send=lambda e, m: sent.append((e, m))),
         _graph_runtime=runtime, request_state=request_state,
+        tensor_manager=tensor_manager, engine_manager=engine_manager or SimpleNamespace(),
+        streams=StreamBufferManager(request_state, tensor_manager, list(connections)),
+        wakeup_event=SimpleNamespace(register_futures=lambda f: None),
         scheduler=scheduler, admission=scheduler.admission, lockstep=scheduler.lockstep,
     )
     w.sent = sent
     w.removed_in_runtime = []
-    w._removed_rids = RecentSet(16)
-    w._unprocessed_messages = {}
-    w._pending_drains, w._draining_rids, w._reads_done_sent = set(), set(), set()
 
     def _runtime_remove(h):
         # The handle must be freed only after every worker-side map dropped it.
@@ -146,6 +150,8 @@ def _worker(*rids: str) -> tuple[Worker, RidTable]:
     runtime.get_sharding_config = lambda h: SimpleNamespace(groups=[])
     runtime.remove_request = _runtime_remove
     request_state.per_request_info = {t.intern(r): SimpleNamespace() for r in rids}
+    for r in rids:
+        w.lifecycle.add(t.handle(r), r)
     request_state.remove_request = lambda h: request_state.per_request_info.pop(h)  # noqa: PLW0108
     return w, t
 
@@ -158,23 +164,23 @@ def test_failures_leave_the_worker_as_wire_strings():
     assert msg.message_type == ConductorMessageType.FAIL_REQUESTS
     assert msg.body.errors == {"req-a": "boom"}
     # ...while the scheduler gate stays on the handle.
-    assert w.scheduler.failed_rids == {t.handle("req-a")}
+    assert w.lifecycle.failed_rids == {t.handle("req-a")}
 
 
 def test_remove_purges_handle_keyed_state_then_frees_the_handle():
-    w, t = _worker("req-a", "req-b")
+    w, t = _worker(
+        "req-a", "req-b", engine_manager=SimpleNamespace(remove_request=lambda h: None),
+        tensor_manager=SimpleNamespace(force_cleanup_request=lambda h: None),
+    )
     a, b = t.handle("req-a"), t.handle("req-b")
     w._in_flight_rids = set()
-    w._pending_removes = {}
-    w._pending_drains, w._draining_rids, w._reads_done_sent = set(), set(), set()
-    w.engine_manager = SimpleNamespace(remove_request=lambda h: None)
-    w.tensor_manager = SimpleNamespace(force_cleanup_request=lambda h: None)
-    w.streams = StreamBufferManager(w.request_state, w.tensor_manager, [])
     w.streams._rids.add(a)
     w.profile_info = SimpleNamespace(pop_request=lambda h: None)
     w.scheduler.admission.held_until[a] = float("inf")
 
-    w._remove_request(RemoveRequest(request_id="req-a", source=MessageSource.SELF))
+    deliver(w, WorkerMessage(
+        WorkerMessageType.REMOVE_REQUEST, RemoveRequest(request_id="req-a", source=MessageSource.SELF),
+    ))
 
     assert not w.streams.possible(), "the stream manager forgets the handle"
 
@@ -188,7 +194,8 @@ def test_remove_purges_handle_keyed_state_then_frees_the_handle():
 
 def test_remove_for_an_unknown_request_is_a_no_op():
     w, _ = _worker("req-a")
-    w._remove_request(RemoveRequest(request_id="gone", source=MessageSource.SELF))
+    w.ingest._remove_request(RemoveRequest(request_id="gone", source=MessageSource.SELF))
+    w._teardown(set())
     assert len(w.request_state.per_request_info) == 1
 
 
@@ -196,12 +203,11 @@ def test_tensor_ack_is_keyed_by_uuid_alone():
     """Uuids are global, so an ack -- even a late one for a request this worker
     already removed -- needs no rid lookup; an untracked uuid is a no-op in the
     store."""
-    w, _ = _worker()
     acked = []
-    w.tensor_manager = SimpleNamespace(
+    w, _ = _worker(tensor_manager=SimpleNamespace(
         dereference_batch=lambda uuids, counts: acked.append((uuids, counts)),
-    )
-    w._handle_tensor_received(TensorReceived(
+    ))
+    w.ingest._handle_tensor_received(TensorReceived(
         successful_tensors={1: 2, 3: 1}, failed_tensor_ids=[],
     ))
     assert acked == [([1, 3], [2, 1])]
@@ -211,8 +217,17 @@ def test_add_new_request_hands_the_handle_to_every_subsystem():
     """The one place a handle is minted. Nothing below NEW_REQUEST sees the
     wire string, so a subsystem handed ``body.request_id`` instead would key
     its state under something no later message resolves to."""
-    w, t = _worker()
     got: dict[str, object] = {}
+    w, t = _worker(
+        engine_manager=SimpleNamespace(
+            engine=SimpleNamespace(publisher_nodes={}, skip_publish=lambda rid, keys: None),
+            add_request=lambda rid, cfgs, info: got.__setitem__("engine", rid),
+        ),
+        tensor_manager=SimpleNamespace(
+            register_request=lambda rid, sc: got.__setitem__("tensors", rid),
+            start_read_tensors=lambda rid, inputs, graph_walk=None: [],
+        ),
+    )
     cfg = SimpleNamespace(sharding_config="cfg", stream_buffers={})
 
     def _state_add(request_id, request_info):
@@ -220,18 +235,6 @@ def test_add_new_request_hands_the_handle_to_every_subsystem():
         w.request_state.per_request_info[request_id] = cfg
 
     w.request_state.add_request = _state_add
-    w.engine_manager = SimpleNamespace(
-        engine=SimpleNamespace(publisher_nodes={}, skip_publish=lambda rid, keys: None),
-        add_request=lambda rid, cfgs, info: got.__setitem__("engine", rid),
-    )
-    w.tensor_manager = SimpleNamespace(
-        register_request=lambda rid, sc: got.__setitem__("tensors", rid),
-        start_read_tensors=lambda rid, inputs, graph_walk=None: [],
-    )
-    w._draining_rids = set()
-    w.streams = StreamBufferManager(w.request_state, w.tensor_manager, [])
-    w.wakeup_event = SimpleNamespace(register_futures=lambda f: None)
-    w._unprocessed_messages = {}
     info = SimpleNamespace(
         rid_handle=-1, resource_configs={}, graph_walk="decode",
         partition_name="p",
@@ -241,7 +244,7 @@ def test_add_new_request_hands_the_handle_to_every_subsystem():
         partition_worker_graph_ids={}, worker_graph_to_workers={},
         initial_inputs=[], loop_caps={},
     )
-    Worker._add_new_request(w, body)
+    w.ingest._add_new_request(body)
 
     handle = t.handle("wire-1")
     assert handle is not None
@@ -259,23 +262,22 @@ def test_add_new_request_keeps_the_stream_buffer_and_primes_it_for_its_consumer(
     from mstar.streaming.chunk_policy import ScheduledLeftContextChunkPolicy
     from mstar.streaming.topology import Connection
 
-    w, _ = _worker()
+    w, _ = _worker(
+        engine_manager=SimpleNamespace(
+            engine=SimpleNamespace(publisher_nodes={}, skip_publish=lambda rid, keys: None),
+            add_request=lambda rid, cfgs, info: None,
+        ),
+        tensor_manager=SimpleNamespace(
+            register_request=lambda rid, sc: None, start_read_tensors=lambda rid, inputs, graph_walk=None: [],
+        ),
+        connections=[Connection(
+            from_partition="Talker", to_partition="Codec", edge_name="codec_tokens",
+            chunk_policy_factory=lambda: ScheduledLeftContextChunkPolicy(schedule=(1,), chunk=2, left_context=3),
+        )],
+    )
     req = SimpleNamespace(stream_buffers={}, stream_buffers_by_consumer={})
     w.request_state.add_request = lambda request_id, request_info: None
     w.request_state.per_request_info = collections.defaultdict(lambda: req)
-    w.engine_manager = SimpleNamespace(
-        engine=SimpleNamespace(publisher_nodes={}, skip_publish=lambda rid, keys: None),
-        add_request=lambda rid, cfgs, info: None,
-    )
-    w.tensor_manager = SimpleNamespace(
-        register_request=lambda rid, sc: None, start_read_tensors=lambda rid, inputs, graph_walk=None: [],
-    )
-    w._draining_rids, w._unprocessed_messages = set(), {}
-    w.wakeup_event = SimpleNamespace(register_futures=lambda f: None)
-    w.streams = StreamBufferManager(w.request_state, w.tensor_manager, [Connection(
-        from_partition="Talker", to_partition="Codec", edge_name="codec_tokens",
-        chunk_policy_factory=lambda: ScheduledLeftContextChunkPolicy(schedule=(1,), chunk=2, left_context=3),
-    )])
     w.streams.consumer_node = {"codec_tokens": "Codec"}
 
     def new(partition, lead):
@@ -287,7 +289,7 @@ def test_add_new_request_keeps_the_stream_buffer_and_primes_it_for_its_consumer(
             request_id="wire-1", request_info=info, partition_worker_graph_ids={},
             worker_graph_to_workers={}, initial_inputs=[], loop_caps={},
         )
-        Worker._add_new_request(w, body)
+        w.ingest._add_new_request(body)
 
     new("Talker", {})
     sbuf = next(iter(req.stream_buffers.values()))
