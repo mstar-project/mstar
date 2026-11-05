@@ -401,6 +401,8 @@ def test_timing_only_holds_shapes_not_values():
         rows = torch.empty(8192, 16, device="cuda")
         for step in (2, 4):
             assert rows[torch.arange(8192, device="cuda") % step == 0].shape == (8192 // step, 16)
+        # an integer index shapes nothing: a kept table read through a value-less one has no values
+        assert never_computed(pos[torch.empty(8192, device="cuda").long()]._data)
         # a stand-in's write in place flags what it writes, and only that
         import types
         from flashinfer import comm
