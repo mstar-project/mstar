@@ -1724,11 +1724,12 @@ def test_a_follower_whose_counts_cant_take_rank_0s_move_stops(monkeypatch):
         scheduler.settle_tp_follow_delta(None, caught_up=True)
 
 
-def _make_room(kv):
-    """Rank 0's choice of victims for the oldest waiting request its runner refused, none of them droppable."""
+def _make_room(kv, droppable: bool = False):
+    """Rank 0's choice of victims for the oldest waiting request its runner refused, droppable only if
+    ``droppable``."""
     runner = _ENGINES[id(kv)]._runner
     refusal = runner.oldest_refusal()
-    return kv.make_room(refusal.mark, runner.newer_than(refusal.rid), lambda other: False)
+    return kv.make_room(refusal.mark, runner.newer_than(refusal.rid), lambda other: droppable)
 
 
 @pytest.mark.parametrize("rebuildable", [True, False])
@@ -1797,6 +1798,72 @@ def test_a_follower_grows_a_request_waiting_for_its_shortage_once_as_rank_0s_mov
     assert follow.apply_resident_delta(lead.take_resident_delta(), _rebuilds_none)
 
     assert _counts(follower) == _counts(leader), "o's allotment here isn't the one rank 0 grew it to"
+
+
+def _v1_hosted_and_v2_dropped_for_o(monkeypatch, rebuildable: bool):
+    """v1 and v2 hold the 4 pages f leaves. v1 runs short while v2 has a step in flight, and then v2 runs short, so
+    both wait holding their pages. o, older, then asks for its 2 pages. The host has room only for v1, which can move
+    only there, so rank 0 moves v1 to the host and drops v2 for o, and v1's 3 pages alone cover o."""
+    (leader, lead), (follower, follow) = _pool_rank(monkeypatch, 0), _pool_rank(monkeypatch, 1)
+    for kv in (leader, follower):
+        kv._cpu_pool = host._HostPool(4)
+    _ingest((leader, follower), "f", 6, arrival=0)
+    _ingest((leader, follower), "v1", 3, arrival=2, rebuildable=False)
+    _ingest((leader, follower), "v2", 1, arrival=3)
+    assert _admits(leader, "f") and _admits(leader, "v1") and _admits(leader, "v2")
+    assert follow.apply_resident_delta(lead.take_resident_delta(), _rebuilds_none)
+    for rid, pages in (("f", 6), ("v1", 3), ("v2", 1)):
+        assert _step(leader, rid, pages * PAGE_SIZE).ok and _step(follower, rid, pages * PAGE_SIZE).ok
+    assert not _step(leader, "v1", 1).ok and not _step(follower, "v1", 1).ok
+    leader._streams["v2"]["main"].step_in_flight = True
+    assert _preempt(leader, "v1", droppable=False).waits
+    leader._streams["v2"]["main"].step_in_flight = False
+    lead.readmit_request(NODE, "v1")
+    assert not _step(leader, "v2", 1).ok and not _step(follower, "v2", 1).ok
+    assert _preempt(leader, "v2", droppable=False).waits
+    lead.readmit_request(NODE, "v2")
+    _ingest((leader, follower), "o", 2, arrival=1, rebuildable=rebuildable)
+    assert not _admits(leader, "o")
+    victims = _make_room(leader, droppable=True)
+    assert victims.to_host == ["v1"] and victims.to_drop == ["v2"]
+    return (leader, lead), (follower, follow)
+
+
+def test_a_waiting_request_admitted_before_its_last_victim_lands_takes_no_more_room_on_any_rank(monkeypatch):
+    """A host move lands before a drop, so v1's move admits o before v2 is dropped. v2's drop then grew o's allotment
+    past its 2 pages, on every rank."""
+    (leader, lead), (follower, follow) = _v1_hosted_and_v2_dropped_for_o(monkeypatch, rebuildable=True)
+    lead.offload_request(NODE, "v1")
+    assert "o" in leader._allotments, "v1's move didn't admit o"
+    assert follow.apply_resident_delta(lead.take_resident_delta(), _rebuilds_none)
+    assert _counts(follower) == _counts(leader), "o's allotment here isn't the one rank 0 admitted it with"
+
+    lead.drop_request(NODE, "v2", PAGE_SIZE)
+    assert follow.apply_resident_delta(lead.take_resident_delta(), _rebuilds_none)
+
+    assert leader._allotments["o"].pages == 2, "v2's drop grew the allotment of a request v1's move admitted"
+    assert _counts(follower) == _counts(leader), "o's allotment here isn't the one rank 0 left it with"
+
+
+def test_a_waiting_request_that_turns_guaranteed_as_one_victim_lands_waits_for_its_footprint_on_every_rank(
+    monkeypatch,
+):
+    """v1's move covers o's prompt, but the host v1 filled has no room for it, so o, which no drop can free, turns
+    guaranteed and asks for its 6-page footprint on every rank. v2's drop then covered the prompt again, and every
+    rank admitted o, guaranteed, with 2 pages."""
+    (leader, lead), (follower, follow) = _v1_hosted_and_v2_dropped_for_o(monkeypatch, rebuildable=False)
+    lead.offload_request(NODE, "v1")
+    assert "o" in leader._guaranteed and "o" not in leader._allotments
+    assert follow.apply_resident_delta(lead.take_resident_delta(), _rebuilds_none)
+    assert follower._guaranteed == leader._guaranteed, "o is preemptible here and guaranteed on rank 0"
+    assert _counts(follower) == _counts(leader), "o's earmark here waits for other than its footprint"
+
+    lead.drop_request(NODE, "v2", PAGE_SIZE)
+    assert follow.apply_resident_delta(lead.take_resident_delta(), _rebuilds_none)
+
+    for kv in (leader, follower):
+        assert "o" not in kv._allotments, "o was admitted guaranteed with less than its footprint"
+    assert _counts(follower) == _counts(leader), "the follower holds other room for o than rank 0"
 
 
 def test_an_unreserve_cancels_no_reservation_that_moves_victims():
