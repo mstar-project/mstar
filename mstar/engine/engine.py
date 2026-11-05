@@ -519,8 +519,10 @@ class ExecutingBatch:
         # A row that failed must not end its streams on this step: the worker
         # would stop its loop and finalize a row it no longer has. A declined
         # row still does: it completes its node without a forward, so a
-        # consumer needs no dummy step to end on an empty final chunk.
-        ended = rids - self.skipped_rids
+        # consumer needs no dummy step to end on an empty final chunk. A row
+        # the cache served does not: its walk completes without one (its chunk
+        # Loop's stride, ``complete_cached_walk``).
+        ended = rids - (self.skipped_rids - self.cached_rids)
         self.final_stream_rids.difference_update(ended)
         self.partition_done_rids.difference_update(ended)
         self.per_request_info = {
