@@ -2519,7 +2519,8 @@ def test_a_walk_that_isnt_one_token_a_row_in_one_stream_is_refused_at_load(segme
 def _capture_runner(max_bs=4, refusal=None, step=_ONE_TOKEN):
     bound = {}
     return SimpleNamespace(
-        resident_refusal=lambda walk: refusal, template_step=lambda walk: step, prepare_template=lambda walk: None,
+        resident_refusal=lambda walk: refusal, template_step=lambda walk: step,
+        keyed_template_steps=lambda walk: {None: step}, prepare_template=lambda walk: None,
         max_capture_bs=lambda walks: max_bs, bind_resident=lambda planner: bound.update(p=planner), bound=bound,
     )
 
