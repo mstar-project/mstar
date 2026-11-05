@@ -560,27 +560,45 @@ def test_eager_rounding_is_live_while_tracing_and_does_not_leak(monkeypatch, tor
     assert _make_model(compile_eager_rounding=False).compile_eager_rounding is False
 
 
-def test_recompile_limit_holds_for_the_forward_on_every_supported_torch(monkeypatch, torch_flag):
-    """torch.compile takes ``recompile_limit`` only since torch 2.12; passing it (even None) to the
-    supported floor, 2.10, failed every compiled DiT's build with a TypeError."""
+def test_the_recompile_limit_reaches_torch_compile_only_where_it_exists(monkeypatch):
+    """``torch.compile`` takes ``recompile_limit`` from 2.12. CI's 2.10 and the H200 boxes' 2.11 raised a
+    TypeError on the keyword, which took klein, Z-Image and LTX-2.5 down at load. Without a limit nothing is
+    passed; with one, it is passed where it exists and raises the process-wide limit where it doesn't."""
+    import torch._dynamo.config as dynamo_config
+
     from mstar.model.components.diffusion.compile_utils import compile_transformer_forward
 
-    compiles, real_compile = [], torch.compile
-    monkeypatch.setattr(
-        torch, "compile", lambda fn, **kw: real_compile(fn, backend=lambda gm, _: compiles.append(1) or gm, **kw)
-    )
-    torch_flag(torch._dynamo.config, "recompile_limit", 1)
+    calls = []
 
+    def old_compile(fn, *, fullgraph=False, dynamic=None, backend="inductor", mode=None, options=None,
+                    disable=False):
+        calls.append({"fullgraph": fullgraph, "dynamic": dynamic})
+        return fn
+
+    monkeypatch.setattr(torch, "compile", old_compile)
     module = torch.nn.Linear(2, 2)
-    # nn.Linear.forward's code is shared by the process: no other test's cache entries count
-    torch._dynamo.reset()
-    try:
-        compile_transformer_forward(module, eager_rounding=False, recompile_limit=3)
-        for rows in (1, 2, 3):
-            module(torch.randn(rows, 2))
-        assert len(compiles) == 3
-    finally:
-        torch._dynamo.reset()
+    compile_transformer_forward(module)
+    assert calls[-1] == {"fullgraph": False, "dynamic": False}
+    before = dynamo_config.recompile_limit
+    # torch's own patch() restores by assignment. pytest's monkeypatch restores a module entry that is not in
+    # __dict__ by deleting it, which torch's config module turns into a hidden key for the rest of the session.
+    with dynamo_config.patch(recompile_limit=8):
+        compile_transformer_forward(module, recompile_limit=96)
+        assert dynamo_config.recompile_limit == 96
+        compile_transformer_forward(module, recompile_limit=10)
+        assert dynamo_config.recompile_limit == 96, "the process-wide limit never falls"
+    assert dynamo_config.recompile_limit == before
+
+    def new_compile(fn, *, fullgraph=False, dynamic=None, backend="inductor", mode=None, options=None,
+                    disable=False, recompile_limit=None):
+        calls.append({"recompile_limit": recompile_limit})
+        return fn
+
+    monkeypatch.setattr(torch, "compile", new_compile)
+    compile_transformer_forward(module, recompile_limit=96)
+    assert calls[-1]["recompile_limit"] == 96
+    compile_transformer_forward(module)
+    assert calls[-1]["recompile_limit"] is None
 
 
 def test_the_vae_decode_asks_for_its_own_rounding_instead_of_inheriting(monkeypatch, torch_flag):

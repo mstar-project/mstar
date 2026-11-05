@@ -429,6 +429,9 @@ class Qwen3TTSModel(Model):
         self.audio_watermark = AudioWatermarkConfig.parse(kwargs.get("audio_watermark"))
         if self.audio_watermark.enabled:
             import_audioseal()
+        # Server-init knob: the 1.7B CodePredictor's depth loop as one persistent kernel on Hopper
+        # (``mstar.model.qwen3_tts.components.depth_frame``). Its codes can differ from the loop's in the last bits.
+        self.depth_kernel = bool(kwargs.get("depth_kernel", False))
 
         # The lightweight API-side object needs config and tokenizer only.
         self.local_dir = _resolve_model_metadata(model_path_hf, cache_dir)
@@ -1276,7 +1279,7 @@ class Qwen3TTSModel(Model):
         # the depth loop reads the loaded weights folded and stacked
         code_predictor.consolidate_stacked_weights()
         code_predictor.eval()
-        return TalkerSubmodule(talker, code_predictor, self.config)
+        return TalkerSubmodule(talker, code_predictor, self.config, depth_kernel=self.depth_kernel)
 
     def _create_codec_submodule(self, device: str) -> NodeSubmodule:
         """Build the official speech-tokenizer decoder from its sub-checkpoint."""
