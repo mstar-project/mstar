@@ -462,7 +462,7 @@ class FlashInferMLAManager(AttentionManager):
         sized by how many of its requests, in its order, fit, or terminal for a request that
         doesn't fit alone (or alone in its capture's bucket, whose padding counts). The bound reads
         query lengths alone, so every rank refuses alike."""
-        if self._fa_sm_count is None:
+        if self._fa_sm_count is None or self._decode_fits(step, ctx):
             return ADMIT_OK
         # request -> label -> its queries this step
         rows: dict[str, dict[str, int]] = {}
@@ -495,6 +495,17 @@ class FlashInferMLAManager(AttentionManager):
             rows_fit_alone=fit,
             rows_sized=len(real),
         ))
+
+    def _decode_fits(self, step: AttentionStep, ctx: StepContext) -> bool:
+        """Whether ``step`` plans as decode (``_fits`` by the same rule) and, at a tile a row per 64
+        heads, can't reach the cap, sparing a decode step the per-row bound."""
+        lease = ctx.slot_lease
+        if lease is None:
+            decode = not ctx.force_prefill and all(segment.span == 1 for segment in step.segments)
+        else:
+            decode = one_token_rows(lease.bucket.bs, lease.bucket.num_tokens, ctx.force_prefill)
+        tiles = -(-self._wrapper_kwargs["num_qo_heads"] // 64)
+        return decode and len(step.segments) * tiles + self._fa_sm_count <= _FA_MAX_WORK_ITEMS
 
     def _fits(self, rows: list[dict[str, int]], ctx: StepContext | None = None) -> bool:
         """Whether each label's plans over ``rows`` (label -> queries, a request each) stay within

@@ -33,7 +33,7 @@ from mstar.engine.resources.attn import flashinfer_mla as fm
 from mstar.engine.resources.attn.base import AttentionManager
 from mstar.engine.resources.attn.config import AttentionConfig, AttentionSpec, AttentionStep, AttnBackend
 from mstar.engine.resources.attn.wrappers import PagedKernel
-from mstar.engine.resources.base import EngineResourceInfo, Resource
+from mstar.engine.resources.base import CGSlotKey, EngineResourceInfo, Resource
 from mstar.engine.resources.context_parallel import (
     OneSlotPages,
     SPPlacement,
@@ -1088,6 +1088,32 @@ def test_sp_placed_mla_attention_bounds_a_packed_bucket_of_one_token_rows_as_its
     assert fm.fa_work_items_bound(padded, 64, 132) > fm._FA_MAX_WORK_ITEMS >= fm.fa_work_items_bound(qo, 64, 132)
     assert attn.admit(step, ctx(rows, force_prefill=False)).ok
     assert not attn.admit(step, ctx(tokens, force_prefill=True)).ok
+
+
+def test_sp_placed_mla_attention_pads_a_leased_step_for_the_rows_its_wrapper_was_captured_with(monkeypatch):
+    """A leased step's own-token plans are padded to the rows its label's wrapper was captured with,
+    more than the step's where a request has no segment in the label, and a capture's empty rows
+    raise the planner's bound: admission bounds that plan, not one padded to the step's rows."""
+    _fa_kernel(monkeypatch)
+    attn, placement = _cp_attention(JointGroups(tp_group=CommGroup.trivial(), sp_group=_group(0, P)), CPU,
+                                    torch.float32, mla=True, flashinfer_backend="fa2")
+    tokens, spans = 64, (3, 3)
+    bucket = BucketKey(graph_walk="w", bs=4, num_tokens=tokens)
+    attn._cg_plan_states[CGSlotKey(bucket=bucket, slot=0, label="main")] = types.SimpleNamespace(captured_rows=4)
+    step = AttentionStep(segments=tuple(Segment(f"r{i}", "main", span) for i, span in enumerate(spans)))
+    ctx = StepContext(request_ids=tuple(seg.request_id for seg in step.segments), graph_walk="w", slot=0,
+                      capture=False, slot_lease=SlotLease(0, bucket))
+    heads, qo = attn._wrapper_kwargs["num_qo_heads"], np.cumsum([0, *spans])
+
+    def bound(rows):
+        return max(fm.fa_work_items_bound(plan, h, 132)
+                   for plan, h in attn._placed.rank_plans(placement, qo, heads, (rows, tokens)))
+
+    assert bound(4) > bound(len(spans))
+    monkeypatch.setattr(fm, "_FA_MAX_WORK_ITEMS", bound(len(spans)))
+    assert not attn.admit(step, ctx).ok
+    monkeypatch.setattr(fm, "_FA_MAX_WORK_ITEMS", bound(4))
+    assert attn.admit(step, ctx).ok
 
 
 def test_tp_mla_decode_plans_its_context_where_the_causal_tile_check_cannot_refuse_it(monkeypatch):
