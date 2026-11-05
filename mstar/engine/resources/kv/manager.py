@@ -96,20 +96,20 @@ _DEBUG_ASSERTS = os.environ.get("MSTAR_KV_DEBUG_ASSERTS", "0") == "1"
 
 class RoomMark(NamedTuple):
     """A request `reserve` couldn't fit, and what it was measured against: the room, and the pages the
-    index had filed and requests had taken out of the evictable set."""
+    index had filed and requests had taken out of the evictable set, or None for both when no page the index
+    files can lower what the request needs."""
     rid: str
     node_name: str
     graph_walk: str
     published: "PublishedKVInfo | None"
     room: int
-    filed: int
-    taken: int
+    filed: int | None
+    taken: int | None
 
 
 class PassMark(NamedTuple):
     """What `reserve_past` refused a request against: the room less `KVManager._kept`, and the index counts
-    when the refusal read the index. A refusal on the request's growth alone reads none, so a filed page
-    doesn't retry it."""
+    when a page the index files could still make the request fit."""
     room: int
     filed: int | None
     taken: int | None
@@ -4718,6 +4718,8 @@ class KVManager(AttentionResource):
             counts = self._index_counts()
             pages, room = self._need(rid, node_name, graph_walk, published), self._room()
             if pages > room or not self._admit(rid, pages, self.journal):
+                if self._fixed_need(rid) is not None:
+                    counts = None, None
                 return RoomMark(rid, node_name, graph_walk, published, room, *counts)
             return None
 
@@ -4729,7 +4731,10 @@ class KVManager(AttentionResource):
         waits for its shortage in order."""
         with self._lock:
             room = self._room() - self._kept
-            if rid in self._allotments or self._footprint(rid) - self._asks[rid] > room:
+            # When even the fewest pages ``rid`` can take don't fit, no page the index files helps, so only the room
+            # moves the mark.
+            least = (self._fixed_need(rid) or 0) + self._footprint(rid) - self._asks[rid]
+            if rid in self._allotments or least > room:
                 return PassMark(room, None, None)
             chains = [] if self._index is None or self._returning(rid) else [
                 stream.chain for stream in self._streams[rid].values()
@@ -4877,19 +4882,26 @@ class KVManager(AttentionResource):
         that page of the allotment is left for the request's growth. No hit covers the shortage a request
         that holds an allotment asks for.
         """
+        fixed = self._fixed_need(rid)
+        if fixed is not None:
+            return fixed
+        if self._on_host(rid):
+            return self._reload_pages(rid) + self._return_pages(rid)
+        whole, charged = self._hit(rid, node_name, graph_walk, published)
+        return self._asks[rid] - whole + charged
+
+    def _fixed_need(self, rid: str) -> int | None:
+        """`_need` for a request whose need no page the index files can lower, or None."""
         if rid in self._allotments:
             return self._asks[rid]
         dropped = self._dropped.get(rid)
         if dropped is not None:
             return dropped.returns
-        if self._on_host(rid):
-            return self._reload_pages(rid) + self._return_pages(rid)
-        if rid in self._guaranteed:
+        if rid in self._guaranteed and not self._on_host(rid):
             # A guaranteed request takes no cache hit off its allotment, since the request holding a hit page can
             # release it and the index evict it before the lease.
             return self._asks[rid]
-        whole, charged = self._hit(rid, node_name, graph_walk, published)
-        return self._asks[rid] - whole + charged
+        return None
 
     def _on_host(self, rid: str) -> bool:
         return self._cpu_pool is not None and self._cpu_pool.is_offloaded(rid)
