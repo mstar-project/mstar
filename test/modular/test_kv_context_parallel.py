@@ -613,9 +613,13 @@ def _over_ranks(rank, world, backend, store, over_sp, rows, mla, captured=False,
             out.fill_(math.nan)
             graph.replay()
             torch.cuda.synchronize()
-        # a padding row's own output may be NaN (a padded decode's row attends the NaN sink); a real
-        # row's may not
-        assert torch.isfinite(out[:n]).all()
+        if rows == PREFILL_ROWS and not mla:
+            # a GQA prefill's padding merges to 0: its own-token part plans the real rows alone
+            assert torch.isfinite(out).all() and not out[n:].any()
+        else:
+            # a padding row's output may be NaN (a padded decode's row attends the NaN sink, MLA's
+            # own-token part attends a padding row's NaN latents); a real row's may not
+            assert torch.isfinite(out[:n]).all()
         torch.testing.assert_close(out[:n].float(), case.want()[:, heads], **tol)
         if rows == PREFILL_ROWS and not captured:
             # a first prefill: no row holds stored context on any rank, so every partial is masked
@@ -719,7 +723,7 @@ def test_two_gpus_attend_a_placed_pool_like_one(tmp_path, over_sp, rows, capture
 def test_a_captured_buckets_padding_merges_to_0_and_reaches_no_real_row(monkeypatch, padding):
     """The own-token part of a bucket larger than its step: the kernel writes only the planned rows,
     and the padding's context partials are masked (out 0, lse -inf). So only the part's own out 0
-    and lse -inf past its plan keep the padding finite (``_over_ranks`` captures this on GPU). The
+    and lse -inf past its plan keep the padding finite (``_over_ranks`` checks it on GPU for GQA). The
     padding's keys are whatever the model's layers left in those rows, NaN included, and the kernel
     reads keys past each row's end (FA3), so the part plans the real rows alone and zeroes every key
     past them, the padding rows' included."""
