@@ -2173,7 +2173,7 @@ class Engine:
             with fp32_precision_scope(submodule_mgmt.fp32_precision):
                 raw = self._forward(
                     batch, submodule_mgmt, cg_runner, engine_inputs, preprocessed,
-                    lease, running_batched, request_ids, release_event, step,
+                    lease, running_batched, request_ids, step, release_event,
                 )
         finally:
             phase_end("engine.forward", t0)
@@ -2205,8 +2205,8 @@ class Engine:
         lease: SlotLease | None,
         running_batched: bool,
         request_ids: list[str],
+        step: SubmoduleStep,
         release_event: "threading.Event | None" = None,
-        step: SubmoduleStep | None = None,
     ) -> BatchedModelOutput:
         """Replay the leased slot, or run the eager forward.
 

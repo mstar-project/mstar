@@ -1166,7 +1166,7 @@ class KVManager(AttentionResource):
 
     def _index_filled_pages(
         self, segment: Segment, stream: CacheStream, ctx: StepContext,
-        touched: list[tuple[int, int]], span: int,
+        touched: list[tuple[int, int]], committed: int,
     ) -> None:
         """Offer every page this commit filled to the index. ``touched`` holds
         ``(index, end)`` for each span of the layout this commit wrote into.
@@ -1196,7 +1196,7 @@ class KVManager(AttentionResource):
             self._chain_pending.get(segment.request_id, 0) * self._chain_backlog_width
             if self._chain_backlog else 0
         )
-        if stream.released or stream.stored_len - span > chain.covered_len + lag:
+        if stream.released or stream.stored_len - committed > chain.covered_len + lag:
             stream.chain = None
             return
         ended = None
