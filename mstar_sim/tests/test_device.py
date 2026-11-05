@@ -477,6 +477,78 @@ def test_flashinfers_planner_runs_short_of_a_small_workspace():
     """)
 
 
+def test_flashinfers_planner_port_answers_as_flashinfers_own():
+    """The stand-in's planner port answers every case FlashInfer's own planner answered on each
+    emulated GPU's properties (``tests/planner_golden.json``, from ``python -m
+    mstar_sim.planner_golden``): the same workspace bytes, the same overflow one byte short of
+    each, the same refusals. The golden is of the stand-in's FlashInfer version."""
+    golden = os.path.join(ROOT, "mstar_sim", "tests", "planner_golden.json")
+    out = run_sim(f"""
+        import json, types, torch, flashinfer
+        from flashinfer._paged import allocate, decode_allocations, fa3_allocations, prefill_allocations
+        from flashinfer.mla import mla_allocations
+        golden = json.load(open({golden!r}))
+        assert golden["flashinfer"] == flashinfer.__version__, (golden["flashinfer"], flashinfer.__version__)
+        kv_dtype = {{1: torch.float8_e4m3fn, 2: torch.bfloat16}}
+
+        def allocations(c):
+            batch = len(c["kv"]) - 1
+            if c["planner"] == "fa2":
+                return prefill_allocations(c["qo"], c["kv"], c["rows"], batch, *c["heads"], c["page"], c["graph"],
+                                           *c["hd"], c["window"], c["fixed"], c["disable"], c["colocated"],
+                                           c["uniform"], kv_bytes=c["kv_bytes"])
+            if c["planner"] == "fa3":
+                return fa3_allocations(c["qo"], c["rows"], batch, c["heads"][0], c["graph"], c["hd"][1])
+            if c["planner"] == "mla":
+                return mla_allocations(c["qo"], batch, c["heads"], c["hd_o"])
+            return decode_allocations(c["kv"], batch, *c["heads"], c["page"], c["graph"], c["head_dim"],
+                                      kv_dtype[c["kv_bytes"]], regs=c["regs"])
+
+        def short_of(out, float_bytes, int_bytes):
+            try:
+                allocate(out, float_bytes, int_bytes)
+                return "no overflow"
+            except RuntimeError as e:
+                return str(e)
+
+        wrong = []
+        for gpu, props in golden["devices"].items():
+            torch.cuda.get_device_properties = lambda device=None, p=props: types.SimpleNamespace(**p)
+            for c in golden["cases"]:
+                want = c["answers"][gpu]
+                try:
+                    out = allocations(c)
+                except RuntimeError as e:
+                    got = {{"error": str(e)}}
+                else:
+                    got = dict(zip(("float", "int"), allocate(out, None, None)))
+                    if got["float"]:
+                        got["float_short"] = short_of(out, got["float"] - 1, None)
+                    if got["int"]:
+                        got["int_short"] = short_of(out, None, got["int"] - 1)
+                if "error" in want and "error" in got and want["error"] in got["error"]:
+                    continue
+                if got != want:
+                    wrong.append(f"{{c['name']}} on {{gpu}} ({{c['pins']}}): port {{got}}, FlashInfer {{want}}")
+        print(len(wrong), "wrong")
+        print("\\n".join(wrong[:20]))
+    """)
+    assert out.startswith("0 wrong"), out
+    # the golden's properties are its own: this emulated Ada SM holds its 1536 threads, 12 of 128,
+    # and a module plans by its own KV size: 1-byte KV fits the tile 2-byte KV doesn't on 99 KiB
+    run_sim("""
+        import torch
+        from flashinfer._paged import blocks_per_sm
+        from flashinfer.prefill import get_batch_prefill_module
+        assert blocks_per_sm(128, 0) == 12, blocks_per_sm(128, 0)
+        qo, kv = torch.tensor([0, 1, 2], dtype=torch.int32), torch.tensor([0, 50, 100], dtype=torch.int32)
+        floats = [get_batch_prefill_module("fa2", torch.bfloat16, dtype).workspace_size(
+            None, qo, kv, None, 2, 2, 16, 16, 16, False, 448, 256, True, -1, -1, False, 0, 0)[0]
+            for dtype in (torch.bfloat16, torch.float8_e4m3fn)]
+        assert floats[0] == 4 * floats[1], floats
+    """, gpu="l40s")
+
+
 def test_a_jit_built_cuda_extension_registers_capturable_ops(tmp_path):
     """``cpp_extension.load`` of CUDA sources registers their ``TORCH_LIBRARY`` ops as
     kernels that write their mutable arguments, which a graph captures, whichever of its

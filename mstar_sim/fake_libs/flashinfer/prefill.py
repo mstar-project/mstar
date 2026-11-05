@@ -33,9 +33,10 @@ def _check_plan_extras(custom_mask, packed_custom_mask, pos_encoding_mode, **ext
 
 
 def get_batch_prefill_module(backend: str, *args) -> PrefillPlanner:
-    """FlashInfer's batch prefill module for ``backend`` (its dtypes and head dims, ``args``,
-    don't change the planner): its ``plan`` and ``workspace_size``."""
-    return PrefillPlanner(backend)
+    """FlashInfer's batch prefill module for ``backend`` and ``args`` (q, KV and output dtypes,
+    index dtype, head dims, ...): its ``plan`` and ``workspace_size``. Of the arguments, only the
+    KV dtype changes a plan."""
+    return PrefillPlanner(backend, kv_dtype=args[1] if len(args) > 1 else None)
 
 
 def _resolve_backend(backend: str, device, use_fp16_qk_reduction: bool, q_data_type, kv_data_type, head_dim_qk: int,
@@ -246,7 +247,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
 
         self._backend = _resolve_backend(self._requested_backend, self.device, use_fp16_qk_reduction, q_data_type,
                                          kv_data_type, head_dim_qk, head_dim_vo)
-        self._cached_module = PrefillPlanner(self._backend)
+        self._cached_module = PrefillPlanner(self._backend, kv_dtype=kv_data_type or q_data_type)
         self._planned = False
         fa2_args = [fixed_split_size or -1, disable_split_kv, 0, 0] if self._backend == "fa2" else []
         lens = torch.tensor([kv_host[r + 1] - kv_host[r] for r in range(batch)], dtype=torch.int32)

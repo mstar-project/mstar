@@ -44,8 +44,10 @@ class GPU:
     int8: float | None
     l2_bytes: int
     smem_per_sm: int  # shared memory per SM, bytes (CUDA programming guide's table by capability)
+    smem_optin_per_block: int  # the most shared memory one block can opt in to, bytes (the same table)
     compute_eff: float  # fraction of peak a large GEMM reaches
     memory_eff: float  # fraction of hbm_bw a large copy reaches
+    max_threads_per_sm: int = 2048  # resident threads per SM (the same table: 1536 on 8.6 and 8.9)
     launch_s: float = 1.0e-6  # device gap per eager stream launch
     graph_node_s: float = 0.5e-6  # device gap per kernel node in a CUDA-graph replay
     min_kernel_s: float = 2.0e-6  # fixed time of the smallest kernel
@@ -70,21 +72,21 @@ GPUS: dict[str, GPU] = {
         GPU(
             "NVIDIA H100 80GB HBM3", (9, 0), 132, 81559 * MiB, 3.35 * TB, _PCIE5,
             fp64=34e12, fp32=67e12, tf32=494.7e12, bf16=989.4e12, fp8=1978.9e12, int8=1978.9e12,
-            l2_bytes=50 * MiB, smem_per_sm=233472, compute_eff=0.75, memory_eff=0.85,
+            l2_bytes=50 * MiB, smem_per_sm=233472, smem_optin_per_block=232448, compute_eff=0.75, memory_eff=0.85,
         ),
         # H100 PCIe (original datasheet PCIe column): FP64 26 TF, FP32 51 TF, TF32 756 TF*,
         # BF16 1513 TF*, FP8 3026 TF*, INT8 3026 TOPS*, 80 GB HBM2e at 2.0 TB/s, 114 SMs, 350 W.
         GPU(
             "NVIDIA H100 PCIe", (9, 0), 114, 81559 * MiB, 2.0 * TB, _PCIE5,
             fp64=26e12, fp32=51e12, tf32=378e12, bf16=756e12, fp8=1513e12, int8=1513e12,
-            l2_bytes=50 * MiB, smem_per_sm=233472, compute_eff=0.7, memory_eff=0.85,
+            l2_bytes=50 * MiB, smem_per_sm=233472, smem_optin_per_block=232448, compute_eff=0.7, memory_eff=0.85,
         ),
         # H200 datasheet (nvidia.com/en-us/data-center/h200): same compute as H100 SXM,
         # 141 GB HBM3e at 4.8 TB/s.
         GPU(
             "NVIDIA H200", (9, 0), 132, 143771 * MiB, 4.8 * TB, _PCIE5,
             fp64=34e12, fp32=67e12, tf32=494.7e12, bf16=989.4e12, fp8=1978.9e12, int8=1978.9e12,
-            l2_bytes=50 * MiB, smem_per_sm=233472, compute_eff=0.75, memory_eff=0.85,
+            l2_bytes=50 * MiB, smem_per_sm=233472, smem_optin_per_block=232448, compute_eff=0.75, memory_eff=0.85,
         ),
         # HGX B200 datasheet (nvidia.com/en-us/data-center/hgx), 8-GPU totals / 8: FP8 72 PF*,
         # INT8 72 POPS*, FP16/BF16 36 PF*, TF32 18 PF*, FP32 600 TF, FP64 296 TF, 1440 GB HBM3e,
@@ -92,7 +94,7 @@ GPUS: dict[str, GPU] = {
         GPU(
             "NVIDIA B200", (10, 0), 148, 183359 * MiB, 8.0 * TB, _PCIE5,
             fp64=37e12, fp32=75e12, tf32=1125e12, bf16=2250e12, fp8=4500e12, int8=4500e12,
-            l2_bytes=126 * MiB, smem_per_sm=233472, compute_eff=0.7, memory_eff=0.8,
+            l2_bytes=126 * MiB, smem_per_sm=233472, smem_optin_per_block=232448, compute_eff=0.7, memory_eff=0.8,
         ),
         # A100 datasheet (nvidia.com/en-us/data-center/a100), 80GB SXM: FP64 9.7 TF (19.5 TC),
         # FP32 19.5 TF, TF32 156 TF, BF16/FP16 312 TF, INT8 624 TOPS, 80 GB HBM2e at 2039 GB/s;
@@ -100,7 +102,7 @@ GPUS: dict[str, GPU] = {
         GPU(
             "NVIDIA A100-SXM4-80GB", (8, 0), 108, 81920 * MiB, 2.039 * TB, _PCIE4,
             fp64=19.5e12, fp32=19.5e12, tf32=156e12, bf16=312e12, fp8=None, int8=624e12,
-            l2_bytes=40 * MiB, smem_per_sm=167936, compute_eff=0.8, memory_eff=0.87,
+            l2_bytes=40 * MiB, smem_per_sm=167936, smem_optin_per_block=166912, compute_eff=0.8, memory_eff=0.87,
         ),
         # L40S datasheet: FP32 91.6 TF, TF32 366 TF*, BF16/FP16 733 TF*, FP8 1466 TF*,
         # INT8 1466 TOPS*, 48 GB GDDR6 at 864 GB/s; AD102 with 142 SMs. FP64 is 1/64 of FP32.
@@ -108,7 +110,8 @@ GPUS: dict[str, GPU] = {
         GPU(
             "NVIDIA L40S", (8, 9), 142, 46068 * MiB, 0.864 * TB, _PCIE4,
             fp64=1.43e12, fp32=91.6e12, tf32=183e12, bf16=362e12, fp8=733e12, int8=733e12,
-            l2_bytes=96 * MiB, smem_per_sm=102400, compute_eff=0.6, memory_eff=0.85,
+            l2_bytes=96 * MiB, smem_per_sm=102400, smem_optin_per_block=101376, compute_eff=0.6, memory_eff=0.85,
+            max_threads_per_sm=1536,
         ),
         # Ada Lovelace whitepaper, RTX 4090 column: 128 SMs, FP32 82.6 TF, FP16/BF16 tensor with
         # FP32 accumulate 165.2 TF (GeForce runs fp32-accumulate at half rate), FP8 (fp32 acc)
@@ -116,7 +119,8 @@ GPUS: dict[str, GPU] = {
         GPU(
             "NVIDIA GeForce RTX 4090", (8, 9), 128, 24564 * MiB, 1.008 * TB, _PCIE4,
             fp64=1.29e12, fp32=82.6e12, tf32=82.6e12, bf16=165.2e12, fp8=330.3e12, int8=660.6e12,
-            l2_bytes=72 * MiB, smem_per_sm=102400, compute_eff=0.85, memory_eff=0.9,
+            l2_bytes=72 * MiB, smem_per_sm=102400, smem_optin_per_block=101376, compute_eff=0.85, memory_eff=0.9,
+            max_threads_per_sm=1536,
         ),
     ]
 }

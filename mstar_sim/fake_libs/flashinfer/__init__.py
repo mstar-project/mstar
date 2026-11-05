@@ -49,7 +49,8 @@ from .sampling import (
 from .topk import TopKTieBreak, top_k_page_table_transform
 
 # mstar's pin: the contract test in tests/test_device.py holds them together. A new pin means porting
-# the planners' sizing again (``_paged.py``, ``mla.py``), which copies this version's ``scheduler.cuh``
+# the planners' sizing again (``_paged.py``, ``mla.py``), which copies this version's ``scheduler.cuh``,
+# and regenerating the golden it is checked against (``python -m mstar_sim.planner_golden``)
 __version__ = "0.7.2"
 
 __all__ = [

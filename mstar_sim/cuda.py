@@ -116,14 +116,20 @@ def get_device_properties(device=None):
         from mstar_sim.device import gpu_error
 
         raise gpu_error(AssertionError("Invalid device id")) from None
-    gpu = spec().gpu
+    return properties(spec().gpu, index, spec().total)
+
+
+def properties(gpu, index: int = 0, total: int | None = None) -> SimpleNamespace:
+    """``torch.cuda.get_device_properties`` of ``gpu`` (the emulated one, or any other: the
+    planner golden stores what each GPU's planners read)."""
     major, minor = gpu.capability
     return SimpleNamespace(
-        name=gpu.name, total_memory=spec().total, major=major, minor=minor,
+        name=gpu.name, total_memory=gpu.memory_bytes if total is None else total, major=major, minor=minor,
         multi_processor_count=gpu.sm_count, is_integrated=False, is_multi_gpu_board=False,
         L2_cache_size=getattr(gpu, "l2_bytes", 50 << 20), warp_size=32,
-        max_threads_per_multi_processor=2048, regs_per_multiprocessor=65536,
-        shared_memory_per_multiprocessor=gpu.smem_per_sm,
+        max_threads_per_multi_processor=gpu.max_threads_per_sm, regs_per_multiprocessor=65536,
+        shared_memory_per_multiprocessor=gpu.smem_per_sm, shared_memory_per_block=48 << 10,
+        shared_memory_per_block_optin=gpu.smem_optin_per_block,
         uuid=f"mstar-sim-{index}", pci_bus_id=index, pci_device_id=0,
         pci_domain_id=0, gcnArchName="",
     )
