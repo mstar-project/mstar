@@ -72,6 +72,7 @@ def _step(rids, landed=True, done=True, failed=None, lane=LANE):
     return PendingBatch(
         batch=_batch(rids), node_batch=SimpleNamespace(
             completion_event=SimpleNamespace(query=lambda: landed), failed_requests=dict(failed or {}),
+            token_stream=None,
             admit_error=None,
         ),
         node_name=CODEC[0], partition="Codec", graph_walk=CODEC[1], future=future, lane=lane,

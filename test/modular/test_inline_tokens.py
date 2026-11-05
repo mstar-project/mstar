@@ -352,7 +352,7 @@ def _inline_step(withholds=False):
     batch.batch.output_signals = ["text_inputs"]
     batch.batch.request_to_worker_graph = {7: 0}
     batch.node_batch = SimpleNamespace(
-        final_stream_rids=(), partition_done_rids=(),
+        final_stream_rids=(), partition_done_rids=(), token_stream=None,
     )
     batch.batch.rids_by_walk = lambda: {"decode": [7]}
     return w, engine, batch

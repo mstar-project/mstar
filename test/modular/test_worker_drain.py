@@ -183,7 +183,7 @@ def test_stopped_speculative_batch_still_waits_for_its_gpu_work(monkeypatch, has
         node_batch=SimpleNamespace(
             request_ids=[7], per_request_info={7: object()}, cached_rids=set(),
             final_stream_rids=set(), partition_done_rids=set(),
-            completion_event=event,
+            completion_event=event, token_stream=None,
         ),
         speculative_new_iter=True, graph_walk="decode", loop_name="decode",
     )
