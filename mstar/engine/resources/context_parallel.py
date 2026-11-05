@@ -147,6 +147,8 @@ class ContextParallelWrapper:
         self.new = new
         self._device = device
         self._qo_indptr_buf = None
+        # the planned step's rows hold no stored context, so it attends its own tokens alone (`plan`)
+        self._own_only = False
         # per query token, whether its row holds any of this rank's slots. A captured wrapper's
         # holds its bucket's every token (a row's at least, and the bucket's) and is never
         # reallocated, so a replay reads the address it was captured with
@@ -172,13 +174,18 @@ class ContextParallelWrapper:
         context = kv_out.cpu_indptrs
         if self.new is not None:
             context = context.context_only(self._page_size)
+        # a step whose rows store no context (a first prefill) has no partial to exchange; from the
+        # logical indptrs, so every rank alike. A captured step exchanges whatever it stores, as its
+        # replays issue its capture's collectives
+        self._own_only = (
+            self.new is not None and not self._captured and int(context.paged_kv_indptr[-1]) == 0
+        )
         local, valid_rows = self.local_indptrs(self._placement, context, self._page_size)
         if kv_out.cpu_indptrs.paged_kv_indices.is_pinned() and not local.paged_kv_indices.is_pinned():
             # page-locked plan indices (MSTAR_KV_PINNED_INDPTRS) stay page-locked once trimmed, so
             # FlashInfer copies them asynchronously on every rank alike, whichever rows a rank trims
             local = local._replace(paged_kv_indices=self._pin(local.paged_kv_indices))
-        # not causal whatever the step: every query sees all of it (a one-token row's own key
-        # included), and FA MLA's causal tile check reads each rank's KV lengths
+        # not causal whatever the step: every query sees all of it (a one-token row's own key included)
         try:
             self.context.plan(causal=False, dtype=self._dtype, **local.to_kwargs_dict())
         finally:
@@ -215,43 +222,42 @@ class ContextParallelWrapper:
         return self._pinned_indices[:n].copy_(indices)
 
     def attend(
-        self, queries: tuple[torch.Tensor, ...], kv_cache_layer: torch.Tensor,
-        new_keys: tuple[torch.Tensor | None, ...],
+        self, q: torch.Tensor, kv_cache_layer: torch.Tensor, k: torch.Tensor | None, v: torch.Tensor | None,
     ) -> torch.Tensor:
-        """Attention over the whole placed pool, in the query's dtype (merged in fp32): ``queries``
-        and ``new_keys`` are the query parts (each ``[N, H, *]``) and the step's own keys as this
-        backend's ``run`` takes them (``new_keys`` read only on a step that isn't one token a row).
-        Every rank runs the same collectives."""
-        if self.new is not None and any(key is None for key in new_keys):
+        """Attention over the whole placed pool, in the query's dtype (merged in fp32): ``q``
+        ``[N, H, D]``, and the step's own keys as this backend's ``run`` takes them (read only on a
+        step that isn't one token a row). Every rank runs the same collectives."""
+        if self.new is not None and (k is None or v is None):
             raise ValueError(
-                "attention over a context-parallel KV pool attends a step's own tokens from the keys "
-                "run is passed (k and v, or MLA's latents as k); this step has more than one token "
-                "a row and got none"
+                "attention over a context-parallel KV pool attends a step's own tokens from the k and v "
+                "run is passed; this step has more than one token a row and got none"
             )
-        new = None if self.new is None else self.new.run(*queries, *new_keys, return_lse=True)
-        parts = self._exchange_queries(queries)
+        new = None if self.new is None else self.new.run(q, k, v, return_lse=True)
+        if self._own_only:
+            # every partial would be masked (a first prefill): no exchange, no merge
+            return new[0].to(q.dtype)
+        queries = self._exchange_queries(q)
         # over this rank's slots, with the rows holding any of them
-        out, lse = self.context.run(*parts, kv_cache_layer, return_lse=True)
-        outs, lses = self._exchange_partials(out, lse, self._valid[: parts[0].shape[0]])
+        out, lse = self.context.run(queries, kv_cache_layer, return_lse=True)
+        outs, lses = self._exchange_partials(out, lse, self._valid[: queries.shape[0]])
         if new is not None:
             outs, lses = (*outs, new[0].to(outs.dtype)), (*lses, new[1])
-        return merge(outs, lses).to(queries[0].dtype)
+        return merge(outs, lses).to(q.dtype)
 
-    def _exchange_queries(self, queries: tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, ...]:
-        """The query parts this rank attends its slots for, from its own (each ``[N, H, *]``). SP
-        partners hold the same heads, so they are its own; TP partners hold different query heads
-        of one KV head, so each gets every partner's, ``[N, P * H, *]`` partner-major, the parts
-        sent as one tensor."""
+    def _exchange_queries(self, q: torch.Tensor) -> torch.Tensor:
+        """The queries this rank attends its slots for, from its own ``[N, H, D]``. SP partners hold
+        the same heads, so they are its own; TP partners hold different query heads of one KV head,
+        so each gets every partner's, ``[N, P * H, D]`` partner-major."""
         placement = self._placement
         if placement.over_sp:
-            return queries
-        q = (queries[0] if len(queries) == 1 else torch.cat(queries, dim=-1)).unsqueeze(0)
+            return q
+        q = q.unsqueeze(0)
         if placement.size == placement.group.world_size:
-            # every rank of the group is a partner (MLA's always are): the same block goes to each
+            # every rank of the group is a partner: the same block goes to each
             q = placement.group.all_gather(q.contiguous(), dim=0)
         else:
             q = placement.group.to_partners(q.expand(placement.size, *q.shape[1:]), placement.partners)
-        return q.transpose(0, 1).flatten(1, 2).split([part.shape[-1] for part in queries], dim=-1)
+        return q.transpose(0, 1).flatten(1, 2)
 
     def _exchange_partials(
         self, out: torch.Tensor, lse: torch.Tensor, valid: torch.Tensor,

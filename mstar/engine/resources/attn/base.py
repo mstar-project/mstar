@@ -79,7 +79,7 @@ class AttentionManager(AttentionResource):
 
     def _own_tokens_wrapper(self, workspace: torch.Tensor, kwargs: dict, max_total_tokens: int | None):
         """The wrapper a multi-token step attends its own tokens on, from the keys ``run`` is
-        passed: ``run(*queries, *keys, return_lse=True)``, out 0 and lse -inf on a captured
+        passed: ``run(q, k, v, return_lse=True)``, out 0 and lse -inf on a captured
         bucket's padding."""
         raise NotImplementedError
 
@@ -105,12 +105,10 @@ class AttentionManager(AttentionResource):
 
     @torch.compiler.disable
     def _attend_placed(
-        self, label: str, queries: tuple[torch.Tensor, ...], kv_cache_layer: torch.Tensor,
-        new_keys: tuple[torch.Tensor | None, ...],
+        self, label: str, q: torch.Tensor, kv_cache_layer: torch.Tensor, k: torch.Tensor | None, v: torch.Tensor | None,
     ) -> torch.Tensor:
-        """``run`` over a placed pool, ``queries`` and ``new_keys`` as this backend's ``run`` takes
-        them (``ContextParallelWrapper.attend``)."""
-        return self._current_plan_states[label].attend(queries, kv_cache_layer, new_keys)
+        """``run`` over a placed pool (``ContextParallelWrapper.attend``)."""
+        return self._current_plan_states[label].attend(q, kv_cache_layer, k, v)
 
     def fingerprint(self) -> bytes:
         # the class, not the declared backend: `build` moves dense to another
