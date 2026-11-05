@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+import copy
 import os
 import random
 import time
@@ -461,9 +462,13 @@ class Benchmark:
         if (lo is None) != (hi is None):
             raise ValueError("output_len_min and output_len_max must be set together")
         rng = random.Random(cfg.output_len_seed)
-        for req in requests:
+        for i, req in enumerate(requests):
             if req.req_type.get_output_modalities() not in ("text", "audio"):
                 continue
+            # A dataset resized past its length repeats the same RequestInput
+            # objects; stamp a copy so each request keeps its own length.
+            requests[i] = req = copy.copy(req)
+            req.model_kwargs = dict(req.model_kwargs)
             if lo is not None:
                 length = rng.randint(lo, hi)
                 req.model_kwargs["max_tokens"] = length
@@ -472,20 +477,24 @@ class Benchmark:
                 req.model_kwargs["ignore_eos"] = True
 
     async def run(self) -> tuple[list[RequestMetrics], AggregateMetrics]:
-        dataset = self._get_dataset()
         if self.config.profiling_type == ProfilingType.OFFLINE:
             bs = self.config.batch_size
-            # make even multiple of batch size
+            # make even multiple of batch size, before the dataset is sized
             self.config.num_requests = ((self.config.num_requests + bs - 1) // bs) * bs
+        dataset = self._get_dataset()
         requests = dataset.get_requests()[: self.config.num_requests]
         self._assign_output_lengths(requests)
 
-        # Bump the connection-pool cap so closed-loop runs at high
-        # max_concurrency don't bottleneck on aiohttp's default 100/host limit.
-        connector_limit = max(100, (self.config.max_concurrency or 1) + 10)
+        # No connection-pool cap (limit=0): the profiling mode alone sets how
+        # many requests are in flight. A capped pool would hold an offline
+        # batch or an online burst back on the client, and that wait would be
+        # counted as server latency.
         async with aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=300),
-            connector=aiohttp.TCPConnector(limit=connector_limit),
+            # Bound a stalled read, not the whole request: every baseline
+            # overrides `total` per request, so M* must not be the only system
+            # cut at 300 s.
+            timeout=aiohttp.ClientTimeout(total=None, sock_read=300),
+            connector=aiohttp.TCPConnector(limit=0),
             read_bufsize=5 * 2**20,  # 1MB read buffer
         ) as session:
             await self._warmup(session, requests)
