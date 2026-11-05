@@ -936,10 +936,8 @@ class _StubHostRefusingB(host._HostPool):
         return None if label == "b" else super().place(rid, label, *args, **kwargs)
 
 
-def test_a_victim_the_host_took_only_part_of_keeps_its_allotment():
-    """A victim whose second stream the host refused was still vacated, so it asked again for its footprint on top
-    of the pages that stream held, and never came back even alone."""
-    kv = _pool()
+def _moved_in_part(kv) -> None:
+    """o runs short, and v, whose stream ``b`` the host refuses, moves its other stream there for o."""
     kv._cpu_pool = _StubHostRefusingB(64)
     _running(kv, "o", 3, arrival=0)
     layout = StreamLayout(spans=(PrefixSpan(3 * PAGE_SIZE, 3 * PAGE_SIZE, WALK),), growth=(("decode", 1),))
@@ -956,9 +954,28 @@ def test_a_victim_the_host_took_only_part_of_keeps_its_allotment():
     assert _preempt(kv, "o", _short(kv, "o"), droppable=lambda rid: False) == Victims(["v"], [], [])
     assert _offload(kv, "v") and kv._streams["v"]["b"].pages()
 
+
+def test_a_victim_the_host_took_only_part_of_keeps_its_allotment():
+    """A victim whose second stream the host refused was still vacated, so it asked again for its footprint on top
+    of the pages that stream held, and never came back even alone."""
+    kv = _pool()
+    _moved_in_part(kv)
+
     _remove(kv, "o")
 
     assert _ready(kv, "v"), "v, still holding b's pages, never came back even alone"
+
+
+def test_a_victim_the_host_took_only_part_of_sets_what_it_freed_aside_for_the_request_it_moved_for():
+    """`offload` settled such a victim with nothing freed, so the head of the queue could take the room its move
+    made before the request it moved for grew into it."""
+    kv = _pool()
+    _moved_in_part(kv)
+    _request(kv, "p", 3, arrival=2)
+
+    _admitted(kv, "p")
+
+    assert _step(kv, "o", 1).ok, "p took the room v's move made for o, and o ran short again"
 
 
 def test_a_request_short_of_its_guarantee_asks_for_every_page_it_grows_into():
