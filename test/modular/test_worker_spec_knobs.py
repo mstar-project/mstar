@@ -37,7 +37,7 @@ class _StopError(Exception):
 
 def _build(monkeypatch) -> Worker:
     """Run ``Worker.__init__`` until just after it reads the knobs."""
-    def stop(*args, **kwargs):
+    def stop(*args):
         raise _StopError
 
     monkeypatch.setattr(worker_mod, "PhaseTimer", stop)

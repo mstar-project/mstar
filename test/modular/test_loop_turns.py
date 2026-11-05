@@ -4,7 +4,7 @@ Wan2.2's DiT takes one request per step and loops it for every denoising
 step. The worker builds step N+1 while N runs, so the row N serves is not on
 the ready queue when N+1 is chosen: the speculation chain either continues it
 or gives the step to a row waiting there (``pick_chain_step``), and without a
-chain the scheduler picks from the queue and backlog (``get_next_batch``).
+chain the scheduler picks from the queue and backlog (``next_batch``).
 With the chain blind to rows on the queue, whichever row a backlog drained
 last ran to the end of its loop while the others waited on the queue, and a
 request holding a low handle got one step per drain.
@@ -40,9 +40,8 @@ from mstar.graph.runtime.base import (  # noqa: E402
 from mstar.model.submodule_base import StepOrder  # noqa: E402
 from mstar.utils.containers import ParallelList  # noqa: E402
 from mstar.worker.batch_builder import StepPick  # noqa: E402
-from mstar.worker.chunk_loops import ChunkLoops
 from mstar.worker.micro_scheduler import ChainPick, MicroScheduler, ScheduledBatch  # noqa: E402
-from mstar.worker.testing import make_worker
+from mstar.worker.testing import bound, make_scheduler, make_worker
 from mstar.worker.worker import SpeculationTarget, Worker  # noqa: E402
 
 NODE, WALK = "dit", "video_gen"
@@ -96,11 +95,11 @@ def _scheduler(runtime: _Runtime, order: StepOrder) -> tuple[MicroScheduler, Sim
             runtime.checked.append(rid) or FULL_ADMIT_OK
         ),
     )
-    sched = MicroScheduler(
+    sched = make_scheduler(
         engine_manager=SimpleNamespace(get_engine=lambda name: engine),
         parallel_leader_nodes={NODE},
     )
-    sched.runtime = runtime
+    bound(sched, runtime=runtime)
     state = SimpleNamespace(
         per_request_info=runtime.requests,
         get_partition_for_node=lambda node: "default",
@@ -146,16 +145,16 @@ def _run(
         step = None
         chained = running is not None and bool(left[running])
         if chained:
-            chain = sched.pick_chain_step(state, KEY, [running])
+            chain = bound(sched, state).pick_chain_step(KEY, [running])
             assert chain.pick.room in (0, 1), "the runtime takes the room unsigned"
             if chain.pick.room == 0:
-                step = sched.take_chain_step(state, chain)  # the chain gave its step away
+                step = bound(sched, state).take_chain_step(chain)  # the chain gave its step away
             else:
                 # prep keeps the chain's row; at a cap of one no waiting row joins
-                assert sched.take_chain_step(state, chain) is None
+                assert bound(sched, state).take_chain_step(chain) is None
                 step = ScheduledBatch(NODE, WALK, request_to_worker_graph={running: 0})
         if step is None:
-            step = sched.get_next_batch(state)
+            step = bound(sched, state).next_batch()
         if checks is not None:
             checks.append((chained, list(runtime.checked)))
         # N lands: a row the chain did not continue goes back on the queue
@@ -293,17 +292,16 @@ def test_a_refusal_under_turns_keeps_the_next_row_in_line_on_the_device():
             _admitted(sched, ScheduledBatch(NODE, WALK, request_to_worker_graph={rid: 0}))
     runtime.ready |= {0, 1, 2, 3}
 
-    refused = sched.get_next_batch(state)
+    refused = bound(sched, state).next_batch()
     assert list(refused.request_to_worker_graph) == [3]
     _admitted(sched, refused, refused=True)
-    worker = SimpleNamespace(scheduler=sched)
-    assert Worker._select_eviction_victim(worker, NODE, WALK, [0, 1, 2]) == 2
+    assert sched.last_in_line(NODE, WALK, [0, 1, 2]) == 2
 
     runtime.ready.add(3)
-    retry = sched.get_next_batch(state)
+    retry = bound(sched, state).next_batch()
     assert list(retry.request_to_worker_graph) == [3]
     _admitted(sched, retry)
-    assert list(sched.get_next_batch(state).request_to_worker_graph) == [0]
+    assert list(bound(sched, state).next_batch().request_to_worker_graph) == [0]
 
 
 def test_a_refusal_under_arrival_takes_the_row_last_in_line():
@@ -314,7 +312,7 @@ def test_a_refusal_under_arrival_takes_the_row_last_in_line():
         sched.note_arrival(rid)
         _admitted(sched, ScheduledBatch(NODE, WALK, request_to_worker_graph={rid: 0}))
 
-    assert Worker._select_eviction_victim(SimpleNamespace(scheduler=sched), NODE, WALK, [0, 1, 2]) == 1
+    assert sched.last_in_line(NODE, WALK, [0, 1, 2]) == 1
 
 
 class _StopLoopError(BaseException):
@@ -324,7 +322,7 @@ class _StopLoopError(BaseException):
 def _looping_worker(monkeypatch, sched, state, refuse=frozenset()) -> Worker:
     """The real ``Worker.run`` over this real scheduler, and everything else
     it calls stubbed: nothing speculates, so each step comes from
-    ``get_next_batch``, and the loop ends when the scheduler has nothing left.
+    ``next_batch``, and the loop ends when the scheduler has nothing left.
     The steps of the rows in ``refuse`` have their admit refused."""
     monkeypatch.setenv("MSTAR_PRE_PLAN_SPEC", "0")
     monkeypatch.setattr(worker_mod, "gc", SimpleNamespace(
@@ -356,15 +354,18 @@ def _looping_worker(monkeypatch, sched, state, refuse=frozenset()) -> Worker:
         communicator=SimpleNamespace(send=stub, wait_for_work=idle),
         wakeup_event=SimpleNamespace(register_future=stub),
         scheduler=sched,
+        admission=sched.admission,
+        lockstep=sched.lockstep,
         request_state=state,
     )
-    for name in ("_verify_tp_async_sched_agrees", "_pin_step_thread", "_init_engine_thread",
+    bound(sched, state)
+    for name in ("_pin_step_thread", "_init_engine_thread",
                  "_apply_pending_removes_safe_to_drop", "_fail_requests", "_apply_pending_drains",
                  "_process_messages", "_apply_removes_whose_step_landed", "_check_ready_tensors",
                  "_poll_stream_buffers", "_set_in_flight_flag", "_clear_in_flight_flag",
                  "_drop_rows_whose_loop_stopped", "_handle_admit_failure", "_postprocess_batch"):
         setattr(w, name, stub)
-    w.maybe_send_zmq_to_tp_followers = lambda node_batch: -1
+    w.lockstep.broadcast = lambda node_batch: -1
     w._build_executing_batch = executing
     w._build_speculation = lambda pending, consecutive, fair: (None, None)
     w._execute_on_gpu_thread = gpu
@@ -400,41 +401,37 @@ def test_a_lone_request_keeps_its_chain_without_a_scan():
     runtime.get_ready_nodes = None  # a scan would raise
     sched, state = _scheduler(runtime, TURNS)
 
-    assert sched.pick_chain_step(state, KEY, [7]).pick.room == 1
+    assert bound(sched, state).pick_chain_step(KEY, [7]).pick.room == 1
 
 
 # ── the worker's side ───────────────────────────────────────────────────
 
 
-def _worker(chain: ChainPick, prep, taken=None, asked=None) -> SimpleNamespace:
+def _worker(chain: ChainPick, prep, taken=None, asked=None) -> Worker:
     asked = {} if asked is None else asked
 
-    def pick_chain_step(state, target, continuing, mid_prefill=(), next_iter_of=None):
+    def pick_chain_step(target, continuing, mid_prefill=(), next_iter_of=None):
         asked["pick"] = next_iter_of
         return chain
 
-    def backlog_splits_from(state, target, rid, next_iter_of=None):
+    def backlog_splits_from(target, rid, next_iter_of=None):
         asked["yield"] = next_iter_of
         return False
 
-    worker = SimpleNamespace(
-        worker_id="w0",
+    worker = make_worker(
         scheduler=SimpleNamespace(
             backlog_splits_from=backlog_splits_from,
             pick_chain_step=pick_chain_step,
-            take_chain_step=lambda state, chain, *_: taken,
+            take_chain_step=lambda chain, *_: taken,
+            failed_rids=set(),
         ),
-        _spec_preparer=SimpleNamespace(prepare=prep),
         tensor_manager=SimpleNamespace(get_tensor=lambda uuid: None),
         request_state=SimpleNamespace(),
-        _is_tearing_down=lambda rid: False,
-        _teardowns_pending=lambda: False,
-        chunk_loops=ChunkLoops(),
-        _yield_away_speculation=lambda batch, gave_way=False: SimpleNamespace(
-            scheduled_batch=batch, gave_way=gave_way,
-        ),
     )
-    worker._try_speculate_next = Worker._try_speculate_next.__get__(worker)
+    worker._spec_preparer = SimpleNamespace(prepare=prep)
+    worker._yield_away_speculation = lambda batch, gave_way=False: SimpleNamespace(
+        scheduled_batch=batch, gave_way=gave_way,
+    )
     return worker
 
 

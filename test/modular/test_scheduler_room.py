@@ -15,7 +15,8 @@ from mstar.engine.resources.step import FULL_ADMIT_OK
 from mstar.graph.runtime.base import ColumnarEdgeSpecs, PopRidsOutput, ReadyNodeSpec
 from mstar.model.submodule_base import StepOrder
 from mstar.utils.containers import ParallelList
-from mstar.worker.micro_scheduler import MicroScheduler, ScheduledBatch
+from mstar.worker.micro_scheduler import ScheduledBatch
+from mstar.worker.testing import bound, make_scheduler
 
 NODE = "LLM"
 
@@ -102,11 +103,11 @@ class _Engine:
 def _setup(walks, max_bs):
     engine = _Engine(max_bs)
     runtime = _Runtime(walks)
-    sched = MicroScheduler(
+    sched = make_scheduler(
         engine_manager=SimpleNamespace(get_engine=lambda name: engine),
         parallel_leader_nodes={NODE},
     )
-    sched.runtime = runtime
+    bound(sched, runtime=runtime)
     return sched, runtime, _State(runtime)
 
 
@@ -121,7 +122,7 @@ def test_a_walk_with_no_room_does_not_starve_the_others():
     walks = {"p0": "prefill", "d0": "decode", "d1": "decode"}
     sched, runtime, state = _setup(walks, max_bs={"prefill": 0, "decode": 16})
 
-    batch = sched.get_next_batch(state)
+    batch = bound(sched, state).next_batch()
 
     assert (batch.graph_walk, _rids(batch)) == ("decode", ["d0", "d1"])
     assert "p0" in runtime.ready, "the prefill stays ready for when a slot frees"
@@ -133,7 +134,7 @@ def test_a_chain_holding_its_full_step_still_takes_nothing():
     sched, _, state = _setup({"d0": "decode", "d1": "decode", "p0": "prefill"}, max_bs=2)
     sched.note_ran(ScheduledBatch(NODE, "decode", request_to_worker_graph={"c0": 0, "c1": 0}))
 
-    chain = sched.pick_chain_step(state, (NODE, "decode"), ["c0", "c1"])
+    chain = bound(sched, state).pick_chain_step((NODE, "decode"), ["c0", "c1"])
 
     assert chain.pick.room == 2
-    assert sched.take_chain_step(state, chain) is None
+    assert bound(sched, state).take_chain_step(chain) is None

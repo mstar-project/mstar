@@ -16,10 +16,11 @@ from mstar.utils.ipc_format import (
     ScheduleTPNode,
     TensorReceived,
 )
-from mstar.worker.micro_scheduler import REMOVED_RID, MicroScheduler
+from mstar.worker.lockstep import Lockstep
+from mstar.worker.micro_scheduler import REMOVED_RID
 from mstar.worker.rid_table import RidTable
 from mstar.worker.stream_buffers import StreamBufferManager
-from mstar.worker.testing import make_worker
+from mstar.worker.testing import make_scheduler, make_worker
 from mstar.worker.worker import Worker
 
 # ── the table ──────────────────────────────────────────────────────────────
@@ -76,10 +77,8 @@ def test_release_is_idempotent():
 # ── TP-follow messages carry strings ───────────────────────────────────────
 
 
-def _scheduler(table: RidTable) -> MicroScheduler:
-    s = MicroScheduler(engine_manager=None)
-    s.rid_of = table.handle
-    return s
+def _lockstep(table: RidTable) -> Lockstep:
+    return make_scheduler(graph_runtime=SimpleNamespace(get_rid_handle=table.handle)).lockstep
 
 
 def _follow(*rids: str) -> ScheduleTPNode:
@@ -90,13 +89,13 @@ def test_tp_rids_resolve_to_this_ranks_handles_in_wire_order():
     t = RidTable()
     t.intern("pad")  # so this rank's handles differ from the leader's order
     b, a = t.intern("b"), t.intern("a")
-    assert _scheduler(t).tp_rids(_follow("a", "b")) == [a, b]
+    assert _lockstep(t).tp_rids(_follow("a", "b")) == [a, b]
 
 
 def test_tp_rid_this_rank_does_not_know_is_the_removed_sentinel():
     t = RidTable()
     a = t.intern("a")
-    assert _scheduler(t).tp_rids(_follow("a", "gone")) == [a, REMOVED_RID]
+    assert _lockstep(t).tp_rids(_follow("a", "gone")) == [a, REMOVED_RID]
 
 
 def test_follow_refcount_counts_rids_this_rank_cannot_resolve():
@@ -105,11 +104,11 @@ def test_follow_refcount_counts_rids_this_rank_cannot_resolve():
     drain would ACK while its batch sat at the head of the TP FIFO."""
     t = RidTable()
     t.intern("a")
-    s = _scheduler(t)
-    s.register_tp_follow(_follow("a", "gone"))
-    assert dict(s.pending_tp_follow_count) == {"a": 1, "gone": 1}
-    s.pop_tp_follow_head()
-    assert dict(s.pending_tp_follow_count) == {}
+    s = _lockstep(t)
+    s.enqueue_follow(_follow("a", "gone"))
+    assert (s.pending_follow_count("a"), s.pending_follow_count("gone")) == (1, 1)
+    s.pop_follow_head()
+    assert (s.pending_follow_count("a"), s.pending_follow_count("gone")) == (0, 0)
 
 
 # ── the worker's boundary ──────────────────────────────────────────────────
@@ -119,9 +118,16 @@ def _worker(*rids: str) -> tuple[Worker, RidTable]:
     """A worker whose graph runtime is only the rid table: the boundary is
     what these tests are about, and the runtime owns the table."""
     t = RidTable()
-    w = make_worker()
-    w.sent = []
-    w.communicator = SimpleNamespace(send=lambda e, m: w.sent.append((e, m)))
+    sent = []
+    runtime = SimpleNamespace()
+    request_state = SimpleNamespace()
+    scheduler = make_scheduler(graph_runtime=runtime, request_state=request_state)
+    w = make_worker(
+        communicator=SimpleNamespace(send=lambda e, m: sent.append((e, m))),
+        _graph_runtime=runtime, request_state=request_state,
+        scheduler=scheduler, admission=scheduler.admission, lockstep=scheduler.lockstep,
+    )
+    w.sent = sent
     w.removed_in_runtime = []
     w._removed_rids = RecentSet(16)
     w._unprocessed_messages = {}
@@ -133,21 +139,14 @@ def _worker(*rids: str) -> tuple[Worker, RidTable]:
         w.removed_in_runtime.append(h)
         t.release(h)
 
-    w._graph_runtime = SimpleNamespace(
-        # The runtime mints the handle now; interning is still the whole of it.
-        add_request=lambda request_id, **kw: t.intern(request_id),
-        register_stop_limits=lambda rid, info: None,
-        get_rid_handle=t.handle, get_rid_string=t.name,
-        get_sharding_config=lambda h: SimpleNamespace(groups=[]),
-        remove_request=_runtime_remove,
-    )
-    w.scheduler = MicroScheduler(engine_manager=None)
-    w.scheduler.rid_of = t.handle
-    handles = [t.intern(r) for r in rids]
-    w.request_state = SimpleNamespace(
-        per_request_info={h: SimpleNamespace() for h in handles},
-        remove_request=lambda h: w.request_state.per_request_info.pop(h),  # noqa: PLW0108
-    )
+    # The runtime mints the handle now; interning is still the whole of it.
+    runtime.add_request = lambda request_id, **kw: t.intern(request_id)
+    runtime.register_stop_limits = lambda rid, info: None
+    runtime.get_rid_handle, runtime.get_rid_string = t.handle, t.name
+    runtime.get_sharding_config = lambda h: SimpleNamespace(groups=[])
+    runtime.remove_request = _runtime_remove
+    request_state.per_request_info = {t.intern(r): SimpleNamespace() for r in rids}
+    request_state.remove_request = lambda h: request_state.per_request_info.pop(h)  # noqa: PLW0108
     return w, t
 
 
@@ -173,7 +172,7 @@ def test_remove_purges_handle_keyed_state_then_frees_the_handle():
     w.streams = StreamBufferManager(w.request_state, w.tensor_manager, [])
     w.streams._rids.add(a)
     w.profile_info = SimpleNamespace(pop_request=lambda h: None)
-    w.scheduler.held_until[a] = float("inf")
+    w.scheduler.admission.held_until[a] = float("inf")
 
     w._remove_request(RemoveRequest(request_id="req-a", source=MessageSource.SELF))
 
@@ -181,7 +180,7 @@ def test_remove_purges_handle_keyed_state_then_frees_the_handle():
 
     assert w.removed_in_runtime == [a]
     assert b in w.request_state.per_request_info
-    assert a not in w.scheduler.held_until
+    assert a not in w.scheduler.admission.held_until
     # Freed last, and reused by the next request: nothing of req-a's may remain.
     assert t.handle("req-a") is None
     assert t.intern("req-c") == a

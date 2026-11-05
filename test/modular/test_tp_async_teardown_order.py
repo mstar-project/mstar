@@ -33,7 +33,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from mstar.engine.resources.kv.cache import PageAllocator  # noqa: E402
 from mstar.utils.containers import RecentSet  # noqa: E402
-from mstar.utils.ipc_format import MessageSource, RemoveRequest, WorkerMessageType  # noqa: E402
+from mstar.utils.ipc_format import (  # noqa: E402
+    MessageSource,
+    RemoveRequest,
+    ScheduleTPNode,
+    WorkerMessageType,
+)
 from mstar.worker import worker as worker_mod  # noqa: E402
 from mstar.worker.stream_buffers import StreamBufferManager  # noqa: E402
 from mstar.worker.testing import make_worker
@@ -75,31 +80,23 @@ def _speculation(seq: int, rids: list[int]):
     )
 
 
+def _step_message(seq: int, **kwargs) -> ScheduleTPNode:
+    return ScheduleTPNode(node_name=NODE, graph_walk=WALK, request_ids=["kept"], spec_seq=seq, **kwargs)
+
+
 class _Scheduler:
-    """N comes off the serial path. N+1 is the speculative head rank 0 sends from N, or
-    with ``serial`` a step it sends after N, off the serial path too."""
+    """Takes each plain step off the real FIFO, the rows of ``steps[seq]``."""
 
-    def __init__(self, serial: bool = False):
-        self.heads = [] if serial else [SimpleNamespace(
-            node_name=NODE, graph_walk=WALK, speculative=True, spec_seq=1, spec_from_seq=0,
-        )]
+    def __init__(self, lockstep, serial: bool = False):
+        self.lockstep = lockstep
         self.steps = [STEP_N] + ([[HANDLES["kept"]]] if serial else [])
-        self.last_consumed_tp_seq = -1
 
-    def get_next_batch(self, request_state, **kwargs):
-        if self.last_consumed_tp_seq + 1 >= len(self.steps):
+    def next_batch(self, **kwargs):
+        head = self.lockstep.follow_head()
+        if head is None or head.speculative:
             return None
-        self.last_consumed_tp_seq += 1
-        return _batch(self.last_consumed_tp_seq, self.steps[self.last_consumed_tp_seq])[0]
-
-    def peek_tp_follow(self):
-        return self.heads[0] if self.heads else None
-
-    def pop_tp_follow_head(self):
-        self.last_consumed_tp_seq = self.heads.pop(0).spec_seq
-
-    def take_admit_errors(self):
-        return {}
+        self.lockstep.pop_follow_head()
+        return _batch(head.spec_seq, self.steps[head.spec_seq])[0]
 
     def note_ran(self, batch):
         del batch
@@ -107,14 +104,7 @@ class _Scheduler:
     def remember_ready(self):
         return contextlib.nullcontext()
 
-    def clear_batch_limit(self, node_name, graph_walk, rows, walks=()):
-        # an admitted step lifts its refusal limit; this stub has none
-        del node_name, graph_walk, rows, walks
-
-    def clear_rid(self, rid, wire_rid):
-        pass
-
-    def clear_wire_rid(self, wire_rid):
+    def clear_rid(self, rid):
         pass
 
 
@@ -130,24 +120,8 @@ def _rank(
     ))
     log: list[tuple] = []
     torn_down = threading.Event()
-    w = make_worker(worker_id=f"rank{tp_rank}", is_tp_follower=tp_rank > 0)
-    w._max_consecutive_spec, w._launch_wait_s, w._metrics = 1024, 0.0, None
-    w._in_flight_rids, w._pending_removes, w._removes_awaiting_step = set(), {}, {}
-    w._pending_drains, w._draining_rids, w._reads_done_sent = set(), set(), set()
-    w._removed_rids, w._unprocessed_messages = RecentSet(16), {}
-    w._tp_broadcast_seq = 0
-    w._tp_nospec = RecentSet(16)
-    if serial:
-        w._tp_nospec.add(0)
-    w.scheduler = _Scheduler(serial)
-
     group = SimpleNamespace(tp_size=2, _tp_rank=tp_rank, _workers=["rank0", "rank1"])
     wire = {handle: rid for rid, handle in HANDLES.items()}
-    w._graph_runtime = SimpleNamespace(
-        get_rid_handle=HANDLES.get, get_rid_string=wire.get,
-        get_sharding_config=lambda rid: SimpleNamespace(groups=[group]),
-        remove_request=lambda rid: None,
-    )
 
     def _tear_down(handle):
         log.append(("teardown", wire[handle]))
@@ -157,26 +131,43 @@ def _rank(
         if msg.message_type == WorkerMessageType.REMOVE_REQUEST:
             log.append(("forward", msg.body.request_id, msg.body.after_tp_seq))
 
-    w.engine_manager = SimpleNamespace(
-        warmup_all=lambda: None, remove_request=_tear_down,
+    w = make_worker(
+        worker_id=f"rank{tp_rank}", is_tp_follower=tp_rank > 0,
+        _graph_runtime=SimpleNamespace(
+            get_rid_handle=HANDLES.get, get_rid_string=wire.get,
+            get_sharding_config=lambda rid: SimpleNamespace(groups=[group]),
+            remove_request=lambda rid: None,
+        ),
+        engine_manager=SimpleNamespace(warmup_all=lambda: None, remove_request=_tear_down),
+        communicator=SimpleNamespace(send=_send, wait_for_work=lambda timeout: None),
+        request_state=SimpleNamespace(
+            remove_request=lambda rid: None, get_partition_for_node=lambda node: "p",
+        ),
+        tensor_manager=SimpleNamespace(force_cleanup_request=lambda rid: None),
+        parallel_groups=SimpleNamespace(
+            barrier_all=lambda: None, restore_default_timeout=lambda: None,
+        ),
     )
-    w.communicator = SimpleNamespace(send=_send, wait_for_work=lambda timeout: None)
-    w.request_state = SimpleNamespace(
-        remove_request=lambda rid: None, get_partition_for_node=lambda node: "p",
-    )
-    w.tensor_manager = SimpleNamespace(force_cleanup_request=lambda rid: None)
+    w._max_consecutive_spec, w._launch_wait_s, w._metrics = 1024, 0.0, None
+    w._in_flight_rids, w._pending_removes, w._removes_awaiting_step = set(), {}, {}
+    w._pending_drains, w._draining_rids, w._reads_done_sent = set(), set(), set()
+    w._removed_rids, w._unprocessed_messages = RecentSet(16), {}
+    w.scheduler = _Scheduler(w.lockstep, serial)
+    w.lockstep.enqueue_follow(_step_message(0))
+    if serial:
+        w.lockstep._no_spec.add(0)
+        w.lockstep.enqueue_follow(_step_message(1))
+    elif tp_rank:
+        w.lockstep.enqueue_follow(_step_message(1, speculative=True, spec_from_seq=0))
     w.streams = StreamBufferManager(w.request_state, w.tensor_manager, [])
     w.profile_info = SimpleNamespace(pop_request=lambda rid: None)
-    w.parallel_groups = SimpleNamespace(
-        barrier_all=lambda: None, restore_default_timeout=lambda: None,
-    )
     w.wakeup_event = SimpleNamespace(register_future=lambda future: None)
 
     def _broadcast(node_batch, **kwargs):
         if tp_rank:
             return -1
-        w._tp_broadcast_seq += 1
-        return w._tp_broadcast_seq - 1
+        w.lockstep._broadcast_seq += 1
+        return w.lockstep._broadcast_seq - 1
 
     def _build_speculation(pending, consecutive, fair):
         if pending is not None and pending.tp_seq == 1:
@@ -188,7 +179,7 @@ def _rank(
         return spec, None
 
     def _follow(pending):
-        w.scheduler.pop_tp_follow_head()
+        w.lockstep.pop_follow_head()
         w._in_flight_rids |= {HANDLES["kept"]}
         return _speculation(1, [HANDLES["kept"]])
 
@@ -210,14 +201,14 @@ def _rank(
     w._process_messages = _process_messages
     w._build_executing_batch = lambda batch: _batch(
         batch.tp_seq, list(batch.request_to_worker_graph))[1]
-    w.maybe_send_zmq_to_tp_followers = _broadcast
+    w.lockstep.broadcast = _broadcast
     w._build_speculation = _build_speculation
     w._try_follow_speculation = _follow
     w._is_tp_follow_pending = lambda pending: bool(tp_rank)
     w._execute_on_gpu_thread = _gpu
     w._preplan_spec = lambda pending, spec: False
     for name in (
-        "_verify_tp_async_sched_agrees", "_init_engine_thread", "_fail_requests",
+        "_init_engine_thread", "_fail_requests",
         "_check_ready_tensors", "_poll_stream_buffers", "_set_in_flight_flag",
         "_clear_in_flight_flag", "_thread_outputs_to_speculative", "_settle_speculation",
         "_postprocess_batch",
@@ -339,6 +330,7 @@ def test_a_follower_that_drops_a_step_tears_down_before_it_takes_the_next(monkey
     )
     # N+1 is dropped, so the serial path's next step is N+2
     w.scheduler.steps += [None, [HANDLES["kept"]]]
+    w.lockstep.enqueue_follow(_step_message(2))
     build_executing, build_speculation = w._build_executing_batch, w._build_speculation
 
     def _executing(batch):

@@ -20,7 +20,7 @@ from mstar.model.cosmos3.submodules import (  # noqa: E402
 )
 from mstar.model.lingbot_world.submodules import ROLLOUT_WALK, LingBotDitSubmodule  # noqa: E402
 from mstar.model.wan22.submodules import Wan22DitSubmodule  # noqa: E402
-from mstar.worker.micro_scheduler import MicroScheduler  # noqa: E402
+from mstar.worker.testing import make_scheduler
 
 
 def _order_of(submodule_class: type[NodeSubmodule], walk: str) -> StepOrder:
@@ -31,7 +31,7 @@ def _order_of(submodule_class: type[NodeSubmodule], walk: str) -> StepOrder:
         _submodules={"node": SimpleNamespace(submodule=submodule)},
         get_step_order=lambda node, graph_walk: Engine.get_step_order(engine, node, graph_walk),
     )
-    sched = MicroScheduler(engine_manager=SimpleNamespace(get_engine=lambda name: engine))
+    sched = make_scheduler(engine_manager=SimpleNamespace(get_engine=lambda name: engine))
     return sched._order_of(("node", walk))
 
 

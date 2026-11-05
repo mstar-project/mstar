@@ -68,9 +68,9 @@ def _worker(graphs=((WG_ID, NODE, WALK, "default"),)):
     all_loops = {wg_id: set() for wg_id, *_ in graphs}
     node_to_partition = {node: partition for _, node, _, partition in graphs}
 
-    w = make_worker(worker_id=WORKER, tensor_manager=_StubTensorManager())
-    w._graph_runtime = build_runtime(
-        bookkeeping=w.tensor_manager.tensor_store.bookkeeping,
+    tensor_manager = _StubTensorManager()
+    runtime = build_runtime(
+        bookkeeping=tensor_manager.tensor_store.bookkeeping,
         my_worker_id=WORKER,
         my_worker_graphs=worker_graphs,
         all_wg_ids_to_graph_walks=all_walks,
@@ -79,16 +79,15 @@ def _worker(graphs=((WG_ID, NODE, WALK, "default"),)):
         node_to_partition=node_to_partition,
         sharding_config=_sharding_config(),
     )
-    w.request_state = RequestStateManager(node_to_partition=node_to_partition)
-    w.engine_manager = SimpleNamespace(
-        engine=SimpleNamespace(publisher_nodes={}, skip_publish=lambda rid, keys: None),
-        add_request=lambda rid, cfgs, info: None,
-        remove_request=lambda rid: None,
-    )
-    w.scheduler = SimpleNamespace(
-        clear_rid=lambda rid, rid_str: None,
-        clear_wire_rid=lambda rid_str: None,
-        note_arrival=lambda rid: None,
+    w = make_worker(
+        worker_id=WORKER, tensor_manager=tensor_manager, _graph_runtime=runtime,
+        request_state=RequestStateManager(node_to_partition=node_to_partition),
+        engine_manager=SimpleNamespace(
+            engine=SimpleNamespace(publisher_nodes={}, skip_publish=lambda rid, keys: None),
+            add_request=lambda rid, cfgs, info: None,
+            remove_request=lambda rid: None,
+        ),
+        scheduler=SimpleNamespace(clear_rid=lambda rid: None, note_arrival=lambda rid: None),
     )
     w.profile_info = SimpleNamespace(pop_request=lambda rid: None)
     w.communicator = SimpleNamespace(send=lambda *a, **k: None)

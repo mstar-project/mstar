@@ -97,10 +97,8 @@ def _worker():
     worker._execute_on_gpu_thread = lambda *a: log.append("execute") or _OUTPUTS
     worker.wakeup_event = SimpleNamespace(register_future=lambda future: None)
     worker.request_state = SimpleNamespace(get_partition_for_node=lambda node: node)
-    worker.scheduler = SimpleNamespace(
-        clear_batch_limit=lambda *a, **k: log.append("clear limit"),
-        get_next_batch=lambda state, lane=CHAIN_LANE: None,
-    )
+    worker.admission.clear_batch_limit = lambda *a, **k: log.append("clear limit")
+    worker.scheduler = SimpleNamespace(next_batch=lambda lane=CHAIN_LANE: None)
     return worker
 
 
@@ -126,7 +124,7 @@ def test_the_window_collates_on_the_lane_stream_before_the_step_is_submitted(mon
     worker.log = backend.log
     worker._build_executing_batch = lambda batch: backend.log.append("build") or SimpleNamespace()
     worker._submit_gpu_step = lambda *a, **k: backend.log.append("submit") or Future()
-    worker.scheduler.get_next_batch = lambda state, lane=CHAIN_LANE: _batch([1])
+    worker.scheduler.next_batch = lambda lane=CHAIN_LANE: _batch([1])
     lane = SideStepLane(worker)
 
     lane.launch(None)
@@ -137,7 +135,7 @@ def test_the_window_collates_on_the_lane_stream_before_the_step_is_submitted(mon
 def test_every_step_shares_one_stream(monkeypatch):
     backend = _StreamBackend(monkeypatch)
     worker = _worker()
-    worker.scheduler.get_next_batch = lambda state, lane=CHAIN_LANE: _batch([1])
+    worker.scheduler.next_batch = lambda lane=CHAIN_LANE: _batch([1])
     lane = SideStepLane(worker)
 
     lane.launch(None)
@@ -229,7 +227,7 @@ def test_rows_in_flight_are_every_lanes_and_an_error_fails_the_chains():
 def test_one_step_in_flight():
     worker = _worker()
     asked = []
-    worker.scheduler.get_next_batch = lambda state, lane=CHAIN_LANE: asked.append(lane) or _batch([len(asked)])
+    worker.scheduler.next_batch = lambda lane=CHAIN_LANE: asked.append(lane) or _batch([len(asked)])
     lane = SideStepLane(worker)
 
     lane.launch(None)
@@ -329,7 +327,7 @@ def _chain_worker():
 
     w._graph_runtime.clear_pending_loop_stops = clear
     w._graph_runtime.pending_loop_stop_rids = lambda walks, loop_name: set(stops)
-    w.scheduler.clear_batch_limit = lambda *a, **k: None
+    w.admission.clear_batch_limit = lambda *a, **k: None
     return w
 
 
@@ -385,7 +383,7 @@ def test_a_step_that_raised_fails_its_own_rows_and_clears_out():
 
 def test_a_step_that_could_not_launch_fails_its_rows():
     worker = _worker()
-    worker.scheduler.get_next_batch = lambda state, lane=CHAIN_LANE: _batch([3])
+    worker.scheduler.next_batch = lambda lane=CHAIN_LANE: _batch([3])
 
     def refuse(batch):
         raise RuntimeError("boom")
