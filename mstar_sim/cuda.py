@@ -416,6 +416,10 @@ class CUDAGraph:
     def capture_end(self):
         clock.set_capturing(self._prev)
         _end_allocate_to_pool(self._device, self._pool)
+        if self.tape.collectives:
+            from mstar_sim import dist
+
+            dist.seal(self.tape)
 
     def instantiate(self):
         pass

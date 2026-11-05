@@ -697,6 +697,29 @@ def test_tensor_parallel_ranks_meet_at_each_collective():
             print("ok")
     """)
     assert out.strip().endswith("ok")
+    # a TP x SP mesh, its groups made as init_dist makes them: a graph's replay meets each
+    # group on the collectives over that group's ranks, though its peers hold other groups
+    out = run_sim("""
+        import tempfile, torch, torch.distributed as dist, torch.multiprocessing as mp
+
+        def rank(r, path):
+            dist.init_process_group("nccl", init_method=f"file://{path}", rank=r, world_size=4)
+            torch.cuda.set_device(r)
+            tp = [dist.new_group(ranks) for ranks in ([0, 1], [2, 3])][r // 2]
+            sp = [dist.new_group(ranks) for ranks in ([0, 2], [1, 3])][r % 2]
+            x, y = torch.empty(1 << 14, device="cuda"), torch.empty(1 << 14, device="cuda")
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                dist.all_reduce(x, group=tp)
+                dist.all_to_all_single(y, x, group=sp)
+            graph.replay()
+            dist.destroy_process_group()
+
+        if __name__ == "__main__":
+            mp.spawn(rank, args=(tempfile.mkdtemp() + "/group",), nprocs=4)
+            print("ok")
+    """)
+    assert out.strip().endswith("ok")
 
 
 @pytest.mark.parametrize("case", ["mismatch", "extra_replay", "skip"])

@@ -6,8 +6,8 @@ real). Ranks meet at each collective over simulated-GPU tensors, as NCCL's do
 (:func:`_meet`): each rank's description of the call is gathered on its group,
 and a rank whose call doesn't pair with its peers' (skipped, reordered,
 resized) aborts with every rank's, where NCCL would hang or corrupt data. A
-captured graph meets once per group at each replay, on its whole collective
-sequence. The data moves (over gloo) only if every rank holds values (a vote,
+captured graph meets once per group at each replay, on its collectives over that
+group's ranks. The data moves (over gloo) only if every rank holds values (a vote,
 lengths); otherwise its outputs are never computed. Either way it is charged its
 NCCL time (:func:`mstar_sim.cost.collective_seconds`, measured tables where
 they exist) on the current stream, on every rank alike, so timing stays
@@ -149,15 +149,31 @@ def collective(family: str, group, nbytes: int, desc: list[int] | None) -> bool:
     return all(r[_HELD] for r in _meet(group, desc))
 
 
+def seal(tape: clock.Tape) -> None:
+    """At the end of a capture, fold the tape's collectives into what each replay meets on:
+    one row per group (in first-use order) with the count and a hash of the captured
+    collectives over its ranks, on it or on another group of the same ranks (a device group
+    and its fused-AR channel). Every rank of a group holds each of those groups, so the rows
+    agree unless the ranks captured differently (a wrong bucket, an order inversion across
+    those groups); a replay is one host call, so nothing sits between them. Groups of other
+    ranks meet on their own, in first-use order, as NCCL's communicators do."""
+    ranks = {group: tuple(sorted(dist.get_process_group_ranks(group))) for group, _ in tape.collectives}
+    over: dict[tuple[int, ...], list[list[int]]] = {}
+    for group, desc in tape.collectives:
+        over.setdefault(ranks[group], []).append(desc)
+    meets = []
+    for group, key in ranks.items():
+        digest = hashlib.blake2b(repr(over[key]).encode(), digest_size=8).digest()
+        meets.append((group, row("Graph", len(over[key]), op=int.from_bytes(digest, "little", signed=True),
+                                 size=len(key))))
+    tape.collectives = meets
+
+
 def meet_replay(tape: clock.Tape) -> None:
-    """A replay of a graph that captured collectives meets once per group it touches, on
-    their count and a hash of its whole collective sequence across groups (a replay is one
-    host call: nothing can sit between its collectives, so a wrong bucket, an extra replay,
-    an order inversion across groups or a graph against eager calls all show here)."""
-    sequence = repr([(group.group_name, *desc) for group, desc in tape.collectives]).encode()
-    digest = int.from_bytes(hashlib.blake2b(sequence, digest_size=8).digest(), "little", signed=True)
-    for group in dict.fromkeys(group for group, _ in tape.collectives):
-        _meet(group, row("Graph", len(tape.collectives), op=digest, size=dist.get_world_size(group)), replay=True)
+    """A replay of a graph that captured collectives: meet on each row :func:`seal` left."""
+    with clock.computing():
+        for group, mine in tape.collectives:
+            _meet(group, mine, replay=True)
 
 
 # each collective writes its first argument, but for these
