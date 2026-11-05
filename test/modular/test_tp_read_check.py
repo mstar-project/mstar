@@ -14,7 +14,7 @@ committed or sent, and every rank runs the same collectives.
   with a step whose every row failed.
 - TP4 and TP2 x SP2: four real gloo ranks run the check itself.
 - The follower's scheduling (serial and ``MSTAR_TP_ASYNC_SCHED``) and rank 0's
-  marking run the real ``MicroScheduler`` and ``Worker`` methods on stubs.
+  marking run the real ``MicroScheduler``, ``Lockstep`` and ``Worker`` methods on stubs.
 """
 
 from __future__ import annotations
@@ -41,9 +41,9 @@ from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources.step import StepContext
 from mstar.graph.base import GraphEdge, TensorPointerInfo
 from mstar.graph.runtime.base import ColumnarEdgeSpecs, SpeculationPrepOutput
-from mstar.testing_utils.worker import make_worker
+from mstar.testing_utils.worker import make_scheduler, make_worker
 from mstar.utils.ipc_format import OffloadDelta, ScheduleTPNode, WorkerMessageType
-from mstar.worker.micro_scheduler import MicroScheduler, ScheduledBatch
+from mstar.worker.micro_scheduler import ScheduledBatch
 from mstar.worker.stream_buffers import StreamBufferManager
 from mstar.worker.worker import Speculation, Worker
 
@@ -192,11 +192,11 @@ def _check_rank(rank, layout, failed_here, store, out):
         tp, sp = _groups(rank, layout)
         w = make_worker(
             streams=StreamBufferManager(SimpleNamespace(per_request_info={}), None, []),
-            scheduler=SimpleNamespace(read_failed_rids=set(failed_here)),
             parallel_groups=SimpleNamespace(
-            get_joint_group_for_node=lambda node: JointGroups(tp_group=tp, sp_group=sp),
-        ),
+                get_joint_group_for_node=lambda node: JointGroups(tp_group=tp, sp_group=sp),
+            ),
         )
+        w.lockstep.read_failed_rids.update(failed_here)
         # a follower that could not read a row left it out; the others hold it
         rows = [r for r in ROWS if r not in failed_here]
         batch = ExecutingBatch(
@@ -204,7 +204,7 @@ def _check_rank(rank, layout, failed_here, store, out):
             step_context=StepContext(request_ids=tuple(rows), graph_walk=WALK, slot=0, capture=False),
         )
         batch.read_check_rids = ROWS
-        w._drop_rows_whose_read_failed(batch)
+        w.lockstep.drop_rows_whose_read_failed(batch)
         out.put((rank, list(batch.request_ids), sorted(batch.failed_requests)))
         dist.destroy_process_group()
     except BaseException:
@@ -249,12 +249,11 @@ def test_every_rank_takes_out_the_rows_any_rank_could_not_read(tmp_path, layout)
 def _follower_scheduler(ready, read_failed=()):
     manager = _Manager(["r0", "r1"])
     manager.queues["wg0"]._ready = {rid: {NODE} for rid in ready}
-    sched = MicroScheduler(
+    sched = make_scheduler(
         engine_manager=SimpleNamespace(get_engine=lambda n: _Engine()),
-        parallel_leader_nodes=set(),
+        parallel_leader_nodes=set(), request_state=manager, graph_runtime=manager.runtime,
     )
-    sched.runtime = manager.runtime
-    sched.read_failed_rids.update(read_failed)
+    sched.lockstep.read_failed_rids.update(read_failed)
     return sched, manager
 
 
@@ -271,40 +270,40 @@ def test_a_follower_builds_a_read_checked_step_with_the_row_it_could_not_read_em
     has rank 0's rows, in its order, until the check takes r1 out. The head no
     longer holds r1's drain."""
     sched, manager = _follower_scheduler(ready=["r0"], read_failed=["r1"])
-    sched.register_tp_follow(_head(read_check=True, rids=("r1", "r0")))
+    sched.lockstep.enqueue_follow(_head(read_check=True, rids=("r1", "r0")))
 
-    batch = sched.get_next_batch(manager)
+    batch = sched.next_batch()
 
     assert list(batch.request_to_worker_graph) == ["r1", "r0"]
     assert batch.read_check_rids == ("r1", "r0")
     assert manager.pops[-1][1] == ["r0"]
     assert list(batch.input_edges.rids) == ["r0"]
-    assert sched.peek_tp_follow() is None
-    assert "r1" not in sched.pending_tp_follow_count
+    assert sched.lockstep.follow_head() is None
+    assert "r1" not in sched.lockstep._follow_count
 
 
 def test_a_follower_takes_a_step_whose_every_row_it_could_not_read():
     """The step still has rank 0's rows, so this rank submits it and joins its
     check, as rank 0 does."""
     sched, manager = _follower_scheduler(ready=[], read_failed=["r0", "r1"])
-    sched.register_tp_follow(_head(read_check=True))
+    sched.lockstep.enqueue_follow(_head(read_check=True))
 
-    batch = sched.get_next_batch(manager)
+    batch = sched.next_batch()
 
     assert list(batch.request_to_worker_graph) == ["r0", "r1"]
     assert batch.read_check_rids == ("r0", "r1")
-    assert sched.peek_tp_follow() is None
+    assert sched.lockstep.follow_head() is None
 
 
 def test_a_follower_waits_on_a_row_whose_read_is_still_running():
     sched, manager = _follower_scheduler(ready=["r0"])
-    sched.register_tp_follow(_head(read_check=True))
+    sched.lockstep.enqueue_follow(_head(read_check=True))
 
-    assert sched.get_next_batch(manager) is None
-    assert sched.peek_tp_follow() is not None
+    assert sched.next_batch() is None
+    assert sched.lockstep.follow_head() is not None
 
     manager.ingest("r1")
-    batch = sched.get_next_batch(manager)
+    batch = sched.next_batch()
     assert list(batch.request_to_worker_graph) == ["r0", "r1"]
 
 
@@ -313,16 +312,16 @@ def test_without_a_read_check_a_follower_pops_the_row_like_any_other(caplog):
     whose failed read was another step's input runs; one whose input never
     lands waits, as before the check, and says why once."""
     sched, manager = _follower_scheduler(ready=["r0", "r1"], read_failed=["r1"])
-    sched.register_tp_follow(_head(read_check=False))
-    batch = sched.get_next_batch(manager)
+    sched.lockstep.enqueue_follow(_head(read_check=False))
+    batch = sched.next_batch()
     assert list(batch.request_to_worker_graph) == ["r0", "r1"]
     assert batch.read_check_rids is None
 
     sched, manager = _follower_scheduler(ready=["r0"], read_failed=["r1"])
-    sched.register_tp_follow(_head(read_check=False))
+    sched.lockstep.enqueue_follow(_head(read_check=False))
     with caplog.at_level("ERROR"):
-        assert sched.get_next_batch(manager) is None
-        assert sched.get_next_batch(manager) is None
+        assert sched.next_batch() is None
+        assert sched.next_batch() is None
     assert sum("no read check" in r.getMessage() for r in caplog.records) == 1
 
 
@@ -339,6 +338,8 @@ def test_a_read_that_fails_after_its_request_failed_still_goes_to_the_check(tmp_
     w = make_worker(
         streams=StreamBufferManager(SimpleNamespace(per_request_info={}), tm, []),
         scheduler=sched,
+        lockstep=sched.lockstep,
+        admission=sched.admission,
         request_state=manager,
         tensor_manager=tm,
         wakeup_event=SimpleNamespace(drain=lambda: None),
@@ -348,10 +349,10 @@ def test_a_read_that_fails_after_its_request_failed_still_goes_to_the_check(tmp_
     tm.pending.append(_read("r1", _input(17, "text_inputs"), _failed_future()))
     w._check_ready_tensors()
     assert reported == [], "r1 was already reported failed"
-    assert sched.read_failed_rids == {"r1"}
+    assert sched.lockstep.read_failed_rids == {"r1"}
 
-    sched.register_tp_follow(_head(read_check=True))
-    batch = sched.get_next_batch(manager)
+    sched.lockstep.enqueue_follow(_head(read_check=True))
+    batch = sched.next_batch()
 
     assert batch is not None, "the follower waits on r1, which never readies"
     assert list(batch.request_to_worker_graph) == ["r0", "r1"]
@@ -362,8 +363,8 @@ def test_a_read_that_fails_after_its_request_failed_still_goes_to_the_check(tmp_
 def test_a_removed_requests_read_failure_is_forgotten():
     """The flag is keyed by the handle, which a later request can get."""
     sched, _ = _follower_scheduler(ready=[], read_failed=["r1"])
-    sched.clear_rid("r1", "r1")
-    assert "r1" not in sched.read_failed_rids
+    sched.lockstep.clear("r1", "r1")
+    assert "r1" not in sched.lockstep.read_failed_rids
 
 
 def _spec_follower(read_failed, continuing, fresh, head_rids):
@@ -374,7 +375,7 @@ def _spec_follower(read_failed, continuing, fresh, head_rids):
     sched, manager = _follower_scheduler(
         ready=[r for r in fresh if r not in read_failed], read_failed=read_failed,
     )
-    w = make_worker(scheduler=sched, request_state=manager)
+    w = make_worker(scheduler=sched, lockstep=sched.lockstep, admission=sched.admission, request_state=manager)
     w.preps, w.assembled = [], []
 
     def prep(prep_input):
@@ -426,7 +427,7 @@ def _spec_follower(read_failed, continuing, fresh, head_rids):
                              request_to_worker_graph=dict.fromkeys(continuing, "wg0")),
         node_batch=SimpleNamespace(commit_done=SimpleNamespace(is_set=lambda: True)),
     )
-    sched.register_tp_follow(ScheduleTPNode(
+    w.lockstep.enqueue_follow(ScheduleTPNode(
         node_name=NODE, graph_walk=WALK, request_ids=list(head_rids), spec_seq=1,
         speculative=True, spec_from_seq=0, read_check=True,
     ))
@@ -454,7 +455,7 @@ def test_an_async_follower_builds_a_read_checked_head_with_the_row_empty(unread)
     assert w.continuing == [["c0", "c1"]]
     assert all(w.inputs[-1][r] == {} for r in failed)
     assert spec.node_batch.read_check_rids == tuple(head)
-    assert w.scheduler.peek_tp_follow() is None
+    assert w.lockstep.follow_head() is None
     # a read-checked step is admitted and planned inline on every rank, after the check
     assert not Worker._plans_ahead(w, spec)
 
@@ -475,7 +476,7 @@ def test_an_async_follower_that_cannot_prep_gives_back_only_the_rows_it_popped()
 
     assert Worker._try_follow_speculation(w, pending) is None
     assert w.pushed_back == ["f0"]
-    assert w.scheduler.peek_tp_follow() is not None
+    assert w.lockstep.follow_head() is not None
 
 
 def test_a_voided_speculations_unread_row_stays_out_of_the_next_read_checked_head():
@@ -500,13 +501,13 @@ def test_a_voided_speculations_unread_row_stays_out_of_the_next_read_checked_hea
     assert NODE in manager.queues["wg0"]._ready["f1"]
 
     manager.ingest("c0")  # N's routing readies its continuing row
-    w.scheduler.register_tp_follow(_head(read_check=True, rids=("c0", "f0", "f1")))
-    batch = w.scheduler.get_next_batch(manager)
+    w.lockstep.enqueue_follow(_head(read_check=True, rids=("c0", "f0", "f1")))
+    batch = w.scheduler.next_batch()
     assert list(batch.request_to_worker_graph) == ["c0", "f0", "f1"]
     assert manager.pops[-1][1] == ["c0", "f0"]
 
-    w.scheduler.register_tp_follow(_head(read_check=False, rids=("f1",)))
-    assert w.scheduler.get_next_batch(manager) is not None
+    w.lockstep.enqueue_follow(_head(read_check=False, rids=("f1",)))
+    assert w.scheduler.next_batch() is not None
     assert manager.pops[-1][1] == ["f1"]
 
 
@@ -515,39 +516,39 @@ def test_a_voided_speculations_unread_row_stays_out_of_the_next_read_checked_hea
 FOLLOWERS = ["w0", "w1"]
 
 
-def _leader(tmp_path, streamed=(), nodes=(NODE,), consumed=None):
-    """Rank 0 leading ``nodes``; ``consumed[(source, dest)]`` names the signals
-    an edge carries from ``source`` to ``dest``."""
+def _leader(tmp_path, streamed=(), nodes=(NODE,), consumed=None, leads=True):
+    """Rank 0 leading ``nodes``, or with ``leads`` off a rank in them that leads
+    nothing; ``consumed[(source, dest)]`` names the signals an edge carries from
+    ``source`` to ``dest``."""
     consumed = consumed or {}
     tm, _ = _shm_manager(tmp_path)
-    w = make_worker(
-        streams=StreamBufferManager(SimpleNamespace(per_request_info={}), tm, []),
-        parallel_nodes=set(nodes),
-        parallel_leader_nodes=set(nodes),
-    )
-    w.sent = []
-    w.communicator = SimpleNamespace(
-        send=lambda dest, msg=None: w.sent.append((dest, decode(encode(msg)))),
-    )
+    sent = []
     group = SimpleNamespace(nodes={NODE}, tp_size=2, _tp_rank=0, _workers=FOLLOWERS)
     sharding = SimpleNamespace(groups=[group], get_sharding_group=lambda n, g: group)
-    w._graph_runtime = SimpleNamespace(
-        get_sharding_config=lambda r: sharding, get_rid_string=lambda h: h,
-        get_rid_handle=lambda r: r, ingest_inputs_batch=lambda block, can_buffer: None,
-        get_consumed_edges=lambda source, dest, walk: {(sig, dest) for sig in consumed.get((source, dest), ())},
-    )
-    w.engine_manager = SimpleNamespace(get_engine=lambda n: SimpleNamespace(
+    engine_manager = SimpleNamespace(get_engine=lambda n: SimpleNamespace(
         take_resident_delta=lambda n: OffloadDelta.new(),
         decide_cached_prefix=lambda b: {}, page_trails=lambda n: {},
     ))
-    w.tensor_manager = tm
-    w.scheduler = MicroScheduler(
-        engine_manager=w.engine_manager, parallel_leader_nodes={NODE},
+    w = make_worker(
+        streams=StreamBufferManager(SimpleNamespace(per_request_info={}), tm, []),
+        parallel_nodes=set(nodes),
+        parallel_leader_nodes=set(nodes) if leads else set(),
+        _streaming_edge_names=set(streamed),
+        communicator=SimpleNamespace(
+            send=lambda dest, msg=None: sent.append((dest, decode(encode(msg)))),
+        ),
+        _graph_runtime=SimpleNamespace(
+            get_sharding_config=lambda r: sharding, get_rid_string=lambda h: h,
+            get_rid_handle=lambda r: r, ingest_inputs_batch=lambda block, can_buffer: None,
+            get_consumed_edges=lambda source, dest, walk: {(sig, dest) for sig in consumed.get((source, dest), ())},
+        ),
+        engine_manager=engine_manager,
+        tensor_manager=tm,
+        scheduler=make_scheduler(engine_manager=engine_manager, parallel_leader_nodes={NODE}),
+        request_state=SimpleNamespace(per_request_info={"r0": None, "r1": None}),
+        wakeup_event=SimpleNamespace(drain=lambda: None),
     )
-    w.request_state = SimpleNamespace(per_request_info={"r0": None, "r1": None})
-    w.wakeup_event = SimpleNamespace(drain=lambda: None)
-    w._streaming_edge_names = set(streamed)
-    w._setup_tp_read_check()
+    w.sent = sent
     return w
 
 
@@ -583,7 +584,7 @@ def _step(rows, node=NODE):
 
 
 def _broadcast(w, batch):
-    w.maybe_send_zmq_to_tp_followers(batch)
+    w.lockstep.broadcast(batch)
     (msg,) = [m for d, m in w.sent if m.message_type == WorkerMessageType.SCHEDULE_TP]
     w.sent.clear()
     return msg.body.read_check, batch.read_check_rids
@@ -602,7 +603,7 @@ def test_a_step_taking_an_input_read_from_elsewhere_is_checked_until_it_runs(tmp
     assert _broadcast(w, _step(rows)) == (True, ("r0", "r1"))
     ran = _step(rows)
     assert _broadcast(w, ran) == (True, ("r0", "r1"))
-    w._consume_lockstep_reads(ran)
+    w.lockstep.consume_reads(ran)
     assert _broadcast(w, _step(rows)) == (False, None)
 
 
@@ -623,15 +624,15 @@ def test_a_colocated_encoders_output_is_a_followers_read(tmp_path):
     read; each follower reads it. Another led node it is not routed to has
     nothing to spend, so once the step taking it ran nothing is left pending."""
     w = _leader(tmp_path, nodes=(NODE, "Talker"), consumed={("vision_encoder", NODE): {"vision_embeds"}})
-    w._note_local_lockstep_inputs(
+    w.lockstep.note_local_inputs(
         StoredOutputs(flat_uuids=[21], flat_rids=["r1"], signal_idxs=[0], num_tensors=[1]),
         ["vision_embeds"], "vision_encoder", ["r1"], [WALK], None,
     )
 
     ran = _step({"r0": [], "r1": ["vision_embeds"]})
     assert _broadcast(w, ran) == (True, ("r0", "r1"))
-    w._consume_lockstep_reads(ran)
-    assert not w._lockstep_unread
+    w.lockstep.consume_reads(ran)
+    assert not w.lockstep._unread
 
 
 def test_one_lockstep_node_taking_an_input_leaves_another_nodes_copy_checked(tmp_path):
@@ -642,13 +643,13 @@ def test_one_lockstep_node_taking_an_input_leaves_another_nodes_copy_checked(tmp
     w = _leader(tmp_path, nodes=(NODE, other), consumed={
         ("producer", NODE): {"latents"}, ("producer", other): {"latents"},
     })
-    w._note_local_lockstep_inputs(
+    w.lockstep.note_local_inputs(
         StoredOutputs(flat_uuids=[22], flat_rids=["r1"], signal_idxs=[0], num_tensors=[1]),
         ["latents"], "producer", ["r1"], [WALK], None,
     )
     ran = _step({"r1": ["latents"]})
     assert _broadcast(w, ran) == (True, ("r1",))
-    w._consume_lockstep_reads(ran)
+    w.lockstep.consume_reads(ran)
 
     assert _broadcast(w, _step({"r1": ["latents"]}, node=other)) == (True, ("r1",))
     assert _broadcast(w, _step({"r1": ["latents"]})) == (False, None)
@@ -666,15 +667,13 @@ def test_rank_0_records_its_own_failed_reads_for_the_check(tmp_path):
     w._fail_requests = lambda errors: None
     w.tensor_manager.pending.append(_read("r1", _input(15, "text_inputs"), _failed_future()))
     w._check_ready_tensors()
-    assert w.scheduler.read_failed_rids == {"r1"}
+    assert w.lockstep.read_failed_rids == {"r1"}
 
 
 def test_single_rank_workers_mark_nothing(tmp_path):
-    w = _leader(tmp_path)
-    w.parallel_leader_nodes = set()
-    w._setup_tp_read_check()
+    w = _leader(tmp_path, leads=False)
     _land(w, "r1", _input(16, "text_inputs"))
-    assert not w._lockstep_unread
+    assert not w.lockstep._unread
 
 
 if __name__ == "__main__":  # pragma: no cover

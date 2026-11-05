@@ -28,6 +28,7 @@ from mstar.utils.ipc_format import (
     InputSignals,
     MessageSource,
     RemoveRequest,
+    ScheduleTPNode,
 )
 from mstar.worker.micro_scheduler import ScheduledBatch
 from mstar.worker.rid_table import RidTable
@@ -46,22 +47,10 @@ def _worker(
     known_rids=("X",), in_flight=(), draining=(), reads_done=(),
     pending_drains=(), inflight_reads=False, is_follower=False, tp_follow=(),
 ):
-    w = make_worker(is_tp_follower=is_follower)
-    w.sent = []
-    w.cleared = []
-    w.failed = set()
-    w.forced = []
-    w.communicator = SimpleNamespace(send=lambda e, m: w.sent.append((e, m)))
-    w._in_flight_rids = set(in_flight)
-    w._pending_drains = set(pending_drains)
-    w._draining_rids = set(draining)
-    w._reads_done_sent = set(reads_done)
-    w._removed_rids = RecentSet(16)
-    w._unprocessed_messages = {}
-    w._pending_removes = {}
+    sent = []
     # Identity interning: these tests use the rid string as its own handle, so
     # the string/handle split is exercised without a real runtime.
-    w._graph_runtime = _StubRuntime(
+    runtime = _StubRuntime(
         get_rid_handle=lambda r: r if r in known_rids else None,
         register_stop_limits=lambda rid, info: None,
         get_rid_string=lambda h: h,
@@ -72,12 +61,27 @@ def _worker(
             SimpleNamespace(groups=[]) if r in known_rids else None
         ),
     )
+    w = make_worker(
+        is_tp_follower=is_follower, _graph_runtime=runtime,
+        communicator=SimpleNamespace(send=lambda e, m: sent.append((e, m))),
+    )
+    w.sent = sent
+    w.cleared = []
+    w.failed = set()
+    w.forced = []
+    for rid in tp_follow:
+        w.lockstep.enqueue_follow(ScheduleTPNode(node_name="n", graph_walk="w", request_ids=[rid]))
+    w._in_flight_rids = set(in_flight)
+    w._pending_drains = set(pending_drains)
+    w._draining_rids = set(draining)
+    w._reads_done_sent = set(reads_done)
+    w._removed_rids = RecentSet(16)
+    w._unprocessed_messages = {}
+    w._pending_removes = {}
     w.scheduler = SimpleNamespace(
-        clear_rid=lambda rid, rid_str: w.cleared.append(rid),
-        clear_wire_rid=w.cleared.append,
+        clear_rid=w.cleared.append,
         fail_rids=lambda rids: w.failed.update(rids),  # noqa: PLW0108
         failed_rids=w.failed,
-        pending_tp_follow_count=dict.fromkeys(tp_follow, 1),
     )
     w.request_state = SimpleNamespace(
         per_request_info={
@@ -124,7 +128,7 @@ def test_stopped_speculative_batch_cleans_inputs_without_unmatched_nvtx(
             node_name="LLM", graph_walk="decode", request_to_worker_graph={7: 0},
         ),
         node_batch=SimpleNamespace(
-            request_ids=[7], per_request_info={7: object()}, cached_rids=set(),
+            node_name="LLM", request_ids=[7], per_request_info={7: object()}, cached_rids=set(),
             final_stream_rids={7}, partition_done_rids={7},
         ),
         speculative_new_iter=True, graph_walk="decode", loop_name="decode",
@@ -175,7 +179,7 @@ def test_stopped_speculative_batch_still_waits_for_its_gpu_work(monkeypatch, has
             node_name="LLM", graph_walk="decode", request_to_worker_graph={7: 0},
         ),
         node_batch=SimpleNamespace(
-            request_ids=[7], per_request_info={7: object()}, cached_rids=set(),
+            node_name="LLM", request_ids=[7], per_request_info={7: object()}, cached_rids=set(),
             final_stream_rids=set(), partition_done_rids=set(),
             completion_event=event,
         ),
@@ -292,7 +296,7 @@ def test_drain_waits_for_committed_tp_follow_batches():
     assert "X" in w._draining_rids and not _reads_done(w)
 
     # The follow batch gets scheduled; count drops to 0.
-    w.scheduler.pending_tp_follow_count.pop("X")
+    w.lockstep.pop_follow_head()
     Worker._apply_pending_drains(w, set())
     assert len(_reads_done(w)) == 1
 
@@ -307,7 +311,7 @@ def test_drain_waits_for_a_follow_that_arrived_before_new_request():
     assert "X" in w._draining_rids and not _reads_done(w)
 
     # NEW_REQUEST lands, the batch runs, the count drops.
-    w.scheduler.pending_tp_follow_count.pop("X")
+    w.lockstep.pop_follow_head()
     Worker._apply_pending_drains(w, set())
     assert len(_reads_done(w)) == 1
 
@@ -322,8 +326,9 @@ def test_remove_of_a_never_admitted_rid_clears_its_wire_keyed_state():
     """No handle to clear anything else with, but the TP-follow count is keyed
     by the string and nothing else would ever pop it."""
     w = _worker(known_rids=(), tp_follow=("X",))
+    assert w.lockstep.pending_follow_count("X") == 1
     Worker._remove_request(w, RemoveRequest(request_id="X"))
-    assert w.cleared == ["X"]
+    assert w.lockstep.pending_follow_count("X") == 0
 
 
 def test_drain_deferred_behind_inflight_gpu_step():
@@ -434,7 +439,7 @@ def test_a_follower_draining_before_its_input_arrives_still_reads_it(streaming):
     assert reads == [[1]] and [tid for tid, _walk in sbuf._tensor_ids_in_order] == ([1] if streaming else [])
 
     # the step runs on it, READS_DONE goes, and no read starts after it
-    w.scheduler.pending_tp_follow_count.pop("X")
+    w.lockstep.pop_follow_head()
     Worker._apply_pending_drains(w, set())
     assert len(_reads_done(w)) == 1
     Worker._process_new_inputs(w, _input(2, streaming))
@@ -472,7 +477,7 @@ def test_a_new_request_behind_the_drain_is_admitted_until_reads_done():
     assert not [m for _e, m in w.sent if m.message_type == ConductorMessageType.FAIL_REQUESTS]
 
     # the step runs, and READS_DONE goes once
-    w.scheduler.pending_tp_follow_count.pop("X")
+    w.lockstep.pop_follow_head()
     Worker._apply_pending_drains(w, set())
     assert len(_reads_done(w)) == 1
 

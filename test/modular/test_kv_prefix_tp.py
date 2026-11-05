@@ -25,9 +25,8 @@ from mstar.engine.resources.kv.config import KVSpec, KVStep, PagedKVConfig, open
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.step import Segment, StepContext
 from mstar.model.submodule_base import ARNodeInputs, ARNodeSubmodule
-from mstar.testing_utils.worker import make_worker
+from mstar.testing_utils.worker import make_scheduler, make_worker
 from mstar.utils.ipc_format import ScheduleTPNode
-from mstar.worker.micro_scheduler import MicroScheduler
 from mstar.worker.worker import Worker
 
 WALKS = {"main": KeyedWalks((WALK, IMAGE_WALK), ("decode",))}
@@ -135,11 +134,11 @@ def _send(leader: KVManager, rid: str) -> ScheduleTPNode:
 
 def _follow(follower: KVManager, head: ScheduleTPNode, caught_up: bool = True) -> bool:
     engine = _engine(follower)
-    scheduler = MicroScheduler(
+    scheduler = make_scheduler(
         engine_manager=SimpleNamespace(get_engine=lambda node: engine), parallel_leader_nodes=set(),
     )
-    scheduler.register_tp_follow(head)
-    return scheduler.settle_tp_follow_delta(caught_up)
+    scheduler.lockstep.enqueue_follow(head)
+    return scheduler.lockstep.settle_delta(caught_up)
 
 
 def _abandon(kv: KVManager, rid: str, walk: str = WALK) -> None:
@@ -157,10 +156,11 @@ def _abandon(kv: KVManager, rid: str, walk: str = WALK) -> None:
 
 def _follower_worker(follower: KVManager) -> Worker:
     engine = _engine(follower)
-    worker = make_worker(engine_manager=SimpleNamespace(get_engine=lambda node: engine))
-    worker.scheduler = MicroScheduler(engine_manager=worker.engine_manager, parallel_leader_nodes=set())
-    worker._tp_nospec = set()
-    return worker
+    engine_manager = SimpleNamespace(get_engine=lambda node: engine)
+    sched = make_scheduler(engine_manager=engine_manager, parallel_leader_nodes=set())
+    return make_worker(
+        engine_manager=engine_manager, scheduler=sched, lockstep=sched.lockstep, admission=sched.admission,
+    )
 
 
 def test_a_follower_takes_rank_0s_hit_and_never_probes_itself():
@@ -226,9 +226,9 @@ def test_a_head_that_wont_run_leaves_both_ranks_evicting_alike():
     head = _send(leader, "b")
     head.speculative, head.spec_from_seq = True, 4
     worker = _follower_worker(follower)
-    worker.scheduler.register_tp_follow(head)
-    assert worker.scheduler.settle_tp_follow_delta(caught_up=False)
-    worker._close_tp_follow_step(SimpleNamespace(tp_seq=4))
+    worker.lockstep.enqueue_follow(head)
+    assert worker.lockstep.settle_delta(caught_up=False)
+    worker.lockstep.close_follow_step(SimpleNamespace(tp_seq=4))
     _abandon(leader, "b")
 
     big = _tokens(8 * PAGE_SIZE, seed=36)
@@ -255,9 +255,9 @@ def test_ranks_evict_alike_when_a_lease_straddles_a_commit_that_files_under_a_pa
     for kv in ranks:
         kv.commit(steps[kv][1], _ctx("z"))
     worker = _follower_worker(follower)
-    worker.scheduler.register_tp_follow(head)
-    assert worker.scheduler.settle_tp_follow_delta(caught_up=True)
-    worker._close_tp_follow_step(SimpleNamespace(tp_seq=4))
+    worker.lockstep.enqueue_follow(head)
+    assert worker.lockstep.settle_delta(caught_up=True)
+    worker.lockstep.close_follow_step(SimpleNamespace(tp_seq=4))
     _abandon(leader, "h")
     for kv in ranks:
         kv.remove_request("z")
@@ -340,7 +340,7 @@ def _diverged() -> tuple[KVManager, KVManager]:
 def test_a_follower_whose_adopt_raises_stops_the_worker(monkeypatch):
     leader, follower = _diverged()
     worker, _ = _rank(monkeypatch, tp_rank=1, inbox=[])
-    worker.scheduler.get_next_batch = lambda request_state, **kwargs: _follow(follower, _send(leader, "b"))
+    worker.scheduler.next_batch = lambda **kwargs: _follow(follower, _send(leader, "b"))
 
     def _caught(error, *args):
         raise _Stop
@@ -365,7 +365,7 @@ def test_the_async_path_stops_a_follower_that_lost_a_page_once_n_commits():
     follower, head = _lost_page()
     head.speculative, head.spec_from_seq = True, 4
     worker = _follower_worker(follower)
-    worker.scheduler.register_tp_follow(head)
+    worker.lockstep.enqueue_follow(head)
     step_n = SimpleNamespace(
         tp_seq=4, node_name=NODE, graph_walk=WALK, node_batch=SimpleNamespace(commit_done=threading.Event()),
     )
