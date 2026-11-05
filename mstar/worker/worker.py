@@ -10,7 +10,7 @@ import time as _time
 from collections import defaultdict, deque
 from collections.abc import Callable, Collection, Iterable, Mapping
 from concurrent.futures import Future
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
 from functools import cache, cached_property, partial
@@ -36,7 +36,7 @@ from mstar.distributed.base import ShardingConfig
 from mstar.distributed.communication import WorkerParallelGroups
 from mstar.engine import apply_dynamo_config
 from mstar.engine.chunking import ChunkRange
-from mstar.engine.device_run import RUN_REPLAYS, TokenStream
+from mstar.engine.device_run import RUN_REPLAYS, TokenStream, run_item
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import AdmitFailedReason, AllocationFailed
 from mstar.engine.resources.kv.config import without_layouts
@@ -338,20 +338,6 @@ class SpeculationTarget(NamedTuple):
 
 # pinned host-row buffers in flight at once (see Worker._stage_host_rows)
 _HOST_ROWS_RING = 4
-
-
-def run_item(column: torch.Tensor, iteration: int, copies: "torch.cuda.Stream | None" = None) -> torch.Tensor:
-    """One iteration of a row's column of a step that repeated, as what leaves
-    the step. A view of the row, which is the step's own clone, unless its
-    last dim strides by the run's width (a one-element item): ``contiguous``
-    keeps that stride and a byte view refuses it, so that one is copied, on
-    ``copies`` if given (``Worker._run_copies``). A copy per item was most of
-    a Talker step's host time at N=4."""
-    item = column[:, iteration]
-    if item.dim() and item.stride(-1) == 1:
-        return item
-    with torch.cuda.stream(copies) if copies is not None else nullcontext():
-        return item.clone(memory_format=torch.contiguous_format)
 
 
 def _host_column(host_rows: HostRows | None, name: str) -> torch.Tensor | None:

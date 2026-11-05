@@ -260,9 +260,7 @@ class OrpheusLLMSubmodule(ARNodeSubmodule):
         # moved to check_stop so the GPU thread doesn't sync on .item() here.
         if "new_token" not in outputs:
             return
-        # a run's row holds a token a replay, of which the next step reads the last
-        token = outputs["new_token"][-1]
-        outputs["text_inputs"] = [token if token.numel() == 1 else token.reshape(-1)[-1:]]
+        outputs["text_inputs"] = outputs["new_token"]
 
 class SNACDecoderSubmodule(NodeSubmodule):
     """SNAC 24kHz streaming decoder submodule.

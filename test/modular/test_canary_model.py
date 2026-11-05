@@ -379,9 +379,5 @@ def test_decoder_node_caps_captures_and_names(snapshot):
     outputs = {"new_token": [torch.tensor([5])]}
     node.postprocess("a", None, outputs)
     assert outputs["text_inputs"][0].tolist() == [5]
-    # a run's row holds a token a replay, and the next step reads only the last
-    run = {"new_token": [torch.tensor([[5, 6, 7]])]}
-    node.postprocess("a", None, run)
-    assert run["text_inputs"][0].tolist() == [7]
     walks = CanaryModel(str(snapshot)).get_graph_walk_graphs()
     assert walks[node.DECODE_WALK].name == node.DECODE_LOOP and node.SAMPLER == SAMPLER

@@ -121,16 +121,3 @@ def test_a_mixed_step_reads_a_loop_back_rows_token_off_the_rows_beside_a_prompt(
     engine_inputs = ModelInputsFromEngine(request_ids=[1, 2], per_request_info={}, loopback_rows=kept)
     rows = [ARNodeInputs(input_seq_len=1), ARNodeInputs(input_ids=torch.tensor([7, 8, 9]), input_seq_len=3)]
     assert llm.preprocess("mixed", engine_inputs, rows)["text_inputs"].tolist() == [41, 7, 8, 9]
-
-
-def test_the_llm_feeds_back_a_runs_last_token():
-    """After a run a row's new_token holds a token a replay; its next step reads one."""
-    import torch
-
-    from mstar.model.orpheus.submodules import OrpheusLLMSubmodule
-
-    llm = OrpheusLLMSubmodule.__new__(OrpheusLLMSubmodule)
-    for tokens, fed in ((torch.tensor([5]), [5]), (torch.tensor([[5, 6, 7]]), [7])):
-        outputs = {"new_token": [tokens]}
-        llm.postprocess("a", None, outputs)
-        assert outputs["text_inputs"][0].tolist() == fed

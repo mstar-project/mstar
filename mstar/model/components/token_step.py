@@ -70,8 +70,6 @@ class TokenStepNode:
         outputs: dict[str, list[torch.Tensor]],
         **kwargs,
     ):
-        # the decode loop feeds the sampled token back in as text_inputs: a
-        # run's row holds a token a replay, of which the next step reads the last
+        # the decode loop feeds the sampled token back in as text_inputs
         if "new_token" in outputs:
-            token = outputs["new_token"][-1]
-            outputs["text_inputs"] = [token if token.numel() == 1 else token.reshape(-1)[-1:]]
+            outputs["text_inputs"] = outputs["new_token"]

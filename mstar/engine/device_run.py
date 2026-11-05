@@ -20,6 +20,7 @@ from __future__ import annotations
 import ctypes
 import os
 from collections.abc import Callable, Collection, Mapping, Sequence
+from contextlib import nullcontext
 from typing import Any, NamedTuple
 
 import torch
@@ -380,3 +381,17 @@ def column_in(state: RunState, column: torch.Tensor, target: torch.Tensor) -> No
 def column_out(state: RunState, tensor: torch.Tensor, column: torch.Tensor) -> None:
     """Inside a body: ``tensor`` into this replay's column of ``column``."""
     column.index_copy_(1, state.index, tensor.unsqueeze(1).to(column.dtype))
+
+
+def run_item(column: torch.Tensor, iteration: int, copies: "torch.cuda.Stream | None" = None) -> torch.Tensor:
+    """One iteration of a row's column of a step that repeated, as what leaves
+    the step. A view of the row, which is the step's own clone, unless its
+    last dim strides by the run's width (a one-element item): ``contiguous``
+    keeps that stride and a byte view refuses it, so that one is copied, on
+    ``copies`` if given (``Worker._run_copies``). A copy per item was most of
+    a Talker step's host time at N=4."""
+    item = column[:, iteration]
+    if item.dim() and item.stride(-1) == 1:
+        return item
+    with torch.cuda.stream(copies) if copies is not None else nullcontext():
+        return item.clone(memory_format=torch.contiguous_format)

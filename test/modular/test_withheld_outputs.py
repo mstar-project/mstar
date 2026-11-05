@@ -241,7 +241,7 @@ def test_a_runs_column_hands_on_a_tensor_of_its_own():
     a routed edge's byte view refused it (Canary at N=4), and the step after
     the run took the whole row (Orpheus)."""
     from mstar.communication.tensors import _serialize_tensor
-    from mstar.worker.worker import run_item
+    from mstar.engine.device_run import run_item
 
     column = torch.tensor([[5, 6, 7, 8]])
     item = run_item(column, 2)

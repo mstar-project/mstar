@@ -28,7 +28,7 @@ from mstar.engine.accelerator_graph_runner import (
     plan_captures,
 )
 from mstar.engine.chunking import DEFAULT_MIN_CHUNK_TOKENS, ChunkingManagement, ChunkRange
-from mstar.engine.device_run import RunAsk, TokenStream
+from mstar.engine.device_run import RunAsk, TokenStream, run_item
 from mstar.engine.fp32_precision import Fp32Precision, cudnn_benchmark, fp32_precision_scope, node_fp32_precision
 from mstar.engine.node_dtype import resolve_node_dtype
 from mstar.engine.resources import (
@@ -152,6 +152,18 @@ def _outside_steps(submodule_mgmt) -> Iterator[None]:
         for pool in submodule_mgmt.lora_pools:
             stack.enter_context(pool.base_only())
         yield
+
+
+def _last_iteration_loops_back(outputs: dict, columns: Collection[str], loop_back: Collection[str]) -> None:
+    """A step that repeated keeps each of ``columns`` a column an iteration; a
+    loop-back signal its node named after one hands on that column's last
+    iteration, the one the next step continues from (a short device run's
+    columns repeat its last, ``DeviceRun.results``)."""
+    kept = {id(t) for name in columns for t in outputs.get(name, ())}
+    for signal in loop_back:
+        values = outputs.get(signal)
+        if values and all(id(t) in kept for t in values):
+            outputs[signal] = [run_item(t, -1) for t in values]
 
 
 def node_lanes_of(walk_lanes: Mapping[tuple[str, str], int]) -> dict[str, int]:
@@ -2771,20 +2783,28 @@ class Engine:
         submodule_mgmt = self._submodules[batch.node_name]
         submodule = submodule_mgmt.submodule
         failed = batch.failed_requests
+        walk = batch.graph_walk
+        columns = submodule_mgmt.run_columns.get(walk, frozenset()) if batch.step_context.repeats > 1 else ()
+        # loop-back signals a node may name after a run column (``text_inputs = new_token``)
+        loop_back = [s for s in submodule_mgmt.carries.get(walk, {}) if s not in columns] if columns else ()
         for rid, node_inputs in zip(batch.request_ids, batch.inputs, strict=True):
             if failed and rid in failed:
                 # its per-request forward raised: nothing to finish, and a
                 # second raise here would replace the error the client gets
                 continue
+            rid_outputs = outputs.get(rid, {})
             try:
                 submodule.postprocess(
                     request_id=rid,
                     request_info=batch.per_request_info_wrapped[rid],
-                    outputs=outputs.get(rid, {}),
+                    outputs=rid_outputs,
                     inputs=node_inputs,
                 )
             except Exception as error:
                 batch.register_failure(rid, error)
+                continue
+            if loop_back:
+                _last_iteration_loops_back(rid_outputs, columns, loop_back)
         if type(submodule).batch_postprocess is not NodeSubmodule.batch_postprocess:
             live = [
                 (rid, node_inputs)

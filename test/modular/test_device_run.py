@@ -546,3 +546,37 @@ def test_a_request_arriving_while_a_run_streams_its_tokens_still_ends_the_run(mo
         )
     )
     assert yielded == ["n"]
+
+
+def test_a_loop_back_aliasing_a_run_column_goes_on_as_its_last_iteration():
+    """A node whose postprocess loops its sampled token back by name
+    (``text_inputs = new_token``) would hand a run's whole column on as the
+    next input; the engine hands on the last iteration, for every model
+    (review-r2 F5)."""
+    from mstar.engine.engine import Engine
+    from mstar.model.submodule_base import BatchedModelOutput, CarryPair, NodeSubmodule
+
+    class _Aliasing(NodeSubmodule):
+        prepare_inputs = forward = None
+
+        def postprocess(self, request_id, request_info, outputs, **kwargs):
+            outputs["text_inputs"] = outputs["new_token"]
+
+    engine = Engine.__new__(Engine)
+    engine._submodules = {"n": SimpleNamespace(
+        submodule=_Aliasing(), run_columns={WALK: frozenset({"new_token"})},
+        carries={WALK: {"text_inputs": CarryPair("new_token", "input_ids")}},
+    )}
+    ctx = SimpleNamespace(repeats=3)
+    batch = SimpleNamespace(
+        node_name="n", graph_walk=WALK, request_ids=[1], inputs=[None], failed_requests={},
+        per_request_info_wrapped={1: None}, step_context=ctx,
+    )
+    outputs = BatchedModelOutput(per_rid_outputs={1: {"new_token": [torch.tensor([[4, 5, 6]])]}})
+    engine._postprocess_batch(batch, outputs)
+    assert outputs.get(1)["text_inputs"][0].tolist() == [6]
+    assert outputs.get(1)["new_token"][0].tolist() == [[4, 5, 6]], "the client's items are the whole column"
+    ctx.repeats = 1
+    outputs = BatchedModelOutput(per_rid_outputs={1: {"new_token": [torch.tensor([7])]}})
+    engine._postprocess_batch(batch, outputs)
+    assert outputs.get(1)["text_inputs"][0].tolist() == [7]
