@@ -759,6 +759,9 @@ class LoopEdges(NamedTuple):
     # of their own (the client, a streaming edge, an accumulated output),
     # rather than once an iteration by the next node
     items: frozenset[tuple[str, str]] = frozenset()
+    # the node's signals the Loop hands on when it ends (its outputs), whatever
+    # the node's own edge for them inside it
+    leaving: frozenset[str] = frozenset()
 
 
 def loop_edges(section: GraphSection, node_name: str) -> LoopEdges | None:
@@ -798,7 +801,8 @@ def loop_edges(section: GraphSection, node_name: str) -> LoopEdges | None:
         if outputs[(edge.name, edge.next_node)] is EdgeKind.PER_ITERATION
         and (edge.is_streaming or edge.name in accumulated or edge.next_node in SPECIAL_DESTINATIONS)
     )
-    return LoopEdges(inner.name, inputs, outputs, items)
+    leaving = frozenset(name for name, _ in outputs if name in terminal)
+    return LoopEdges(inner.name, inputs, outputs, items, leaving)
 
 
 class GraphStateRegistry(ABC):

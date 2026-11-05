@@ -3098,3 +3098,19 @@ def test_iteration_inputs_cut_each_row_from_its_padded_table_once(repeats):
             iteration_columns(node, rows, repeats, CPU)
         counts.append(ops.kernels)
     assert counts[0] == counts[1] - 3, "only a padding row's fill (once a spec) grows with the rows"
+
+
+def test_a_loop_back_that_also_leaves_the_loop_is_not_kept_in_rows():
+    """BAGEL's latents loop back and, when the Loop ends, go to the VAE: a step
+    that kept them on the device would hand the VAE nothing."""
+    from mstar.graph.base import GraphEdge, GraphNode, Loop, loop_edges
+    from mstar.worker.step_repeats import StepRepeats
+
+    node = GraphNode(name="n", input_names={"x", "t"}, outputs=[GraphEdge("n", "x"), GraphEdge("n", "t")])
+    loop = Loop(section=node, max_iters=8, outputs=[GraphEdge("vae", "x")], name="loop")
+    edges = loop_edges(loop, "n")
+    assert edges.leaving == {"x"}
+    repeats = StepRepeats.__new__(StepRepeats)
+    repeats.edges = {("n", "w"): edges}
+    repeats.limit = lambda node: 4
+    assert repeats.kept_rows(resident=False) == {("n", "w"): {"t"}}
