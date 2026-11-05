@@ -950,6 +950,10 @@ def test_the_field_is_read_per_walk_and_must_agree():
     split = [{"node_names": ["Codec"], "graph_walks": ["codec_warm"]},
              {"node_names": ["Codec"], "graph_walks": ["codec_chunk"], "lane": 1}]
     assert walk_lanes(split, walks) == {CODEC: 1, ("Codec", "codec_warm"): 0}
+    # another worker's decode is no chain here: this worker's only walk of the node is on the lane
+    assert walk_lanes(split, {"Codec": {"codec_chunk"}}) == {CODEC: 1}
+    with pytest.raises(ValueError, match="no chain to run beside"):
+        _placed(nodes=("Codec",), submodules={"Codec": _Codec()}, lanes=walk_lanes(split, {"Codec": {"codec_chunk"}}))
     with pytest.raises(ValueError, match="different lanes"):
         walk_lanes(groups + [{"node_names": ["Codec"], "graph_walks": ["codec_chunk"], "lane": 2}], walks)
     for bad in ("yes", True, -1):
@@ -1152,6 +1156,7 @@ def test_a_cpu_build_that_asks_for_the_lane_fails_at_startup():
             transfer_engine_info=TransferEngineInfo(my_entity_id="t", my_session_id="t", transfer_engine=None),
             model=Model(),
             graph_runtime=SimpleNamespace(),
+            my_walks={CODEC, ("Talker", "talker_decode")},
         )
 
 

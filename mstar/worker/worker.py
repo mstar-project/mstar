@@ -709,6 +709,7 @@ class Worker:
                 shm_dir_factory=kv_shm_dir_factory,
             ),
             graph_runtime=self._graph_runtime,
+            my_walks=my_walks,
             model=model,
             enable_nvtx=self.enable_nvtx,
             enable_prof=self.enable_prof,

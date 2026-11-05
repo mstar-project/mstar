@@ -124,11 +124,12 @@ def _refuse_unroutable_withholds(submodules: dict, model: Model) -> None:
 
 
 def walk_lanes(node_groups: list[dict], walks: Mapping[str, Collection[str]]) -> dict[tuple[str, str], int]:
-    """The lane each (node, walk) runs on, from its node groups' ``lane`` (0,
-    the chain, where unset); a group without ``graph_walks`` places every walk
-    of ``walks`` (node -> its walks) of its nodes. Listed: every walk of each
-    node with a walk off the chain. A walk placed by two groups must get the
-    same lane from each."""
+    """The lane each (node, walk) of this worker runs on, from its node groups'
+    ``lane`` (0, the chain, where unset): ``walks`` is this worker's, node ->
+    its walks, and a group without ``graph_walks`` places every one of its
+    nodes'. A walk another worker runs is no chain beside this worker's lane.
+    Listed: every walk of each node with a walk off the chain. A walk placed
+    by two groups must get the same lane from each."""
     asked: dict[tuple[str, str], int] = {}
     for group in node_groups:
         if "side_stream" in group:
@@ -137,7 +138,8 @@ def walk_lanes(node_groups: list[dict], walks: Mapping[str, Collection[str]]) ->
         if not isinstance(lane, int) or isinstance(lane, bool) or lane < 0:
             raise ValueError(f"lane takes a lane id, 0 (the chain) or more, not {lane!r}")
         for node in group["node_names"]:
-            for walk in group.get("graph_walks") or sorted(walks.get(node, ())):
+            here = walks.get(node, ())
+            for walk in sorted(here) if not group.get("graph_walks") else set(group["graph_walks"]) & set(here):
                 if asked.setdefault((node, walk), lane) != lane:
                     raise ValueError(f"walk {walk!r} of node {node!r} gets different lanes from two node_groups")
     off = {node for (node, _), lane in asked.items() if lane}
@@ -261,6 +263,7 @@ class EngineManager:
         transfer_engine_info: TransferEngineInfo,
         model: Model,
         graph_runtime: GraphRuntime,
+        my_walks: Collection[tuple[str, str]],
         enable_nvtx: bool = False,
         enable_prof: bool=False,
         device_capability: DeviceCapability | None = None,
@@ -313,8 +316,7 @@ class EngineManager:
         _refuse_unroutable_withholds(submodules, model)
         lanes = _refuse_unservable_lanes(
             submodules, model, node_names, walk_lanes(model_config["node_groups"], {
-                node: {walk for walk, graph in model.get_graph_walk_graphs().items() if node in graph.get_nodes()}
-                for node in submodules
+                node: {walk for name, walk in my_walks if name == node} for node in submodules
             }),
             # a lane's stream comes from the graph backend (``Engine.on_lane``)
             parallel_groups, (device_capability or DeviceCapability.of(device)).graph_backend is not None,

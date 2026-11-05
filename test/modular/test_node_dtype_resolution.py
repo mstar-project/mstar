@@ -81,6 +81,7 @@ def _build(model) -> EngineManager:
         ),
         model=model,
         graph_runtime=types.SimpleNamespace(),
+        my_walks=(),
     )
 
 
