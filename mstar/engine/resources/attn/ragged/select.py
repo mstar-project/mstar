@@ -77,8 +77,9 @@ class _CudnnDense:
     packed rows are viewed as ``[B, H, S, D]``, which cuDNN reads by stride, and its output comes back
     in the packed order."""
 
-    def __init__(self, sm_scale: float):
+    def __init__(self, sm_scale: float, dtype: torch.dtype):
         self.sm_scale = sm_scale
+        self.dtype = dtype
         self.layout: tuple[int, int, bool] | None = None
 
     def run(self, q, k, v, return_lse=False):
@@ -88,7 +89,7 @@ class _CudnnDense:
         rows, heads, dim = q.shape
         if rows != bsz * seq:
             raise ValueError(f"cuDNN ragged attention planned {bsz} x {seq} rows, got {rows}")
-        qb, kb, vb = (t.reshape(bsz, seq, t.shape[1], dim).transpose(1, 2) for t in (q, k, v))
+        qb, kb, vb = (t.to(self.dtype).reshape(bsz, seq, t.shape[1], dim).transpose(1, 2) for t in (q, k, v))
         if return_lse:
             out, lse = torch.ops.aten._scaled_dot_product_cudnn_attention(
                 qb, kb, vb, None, True, 0.0, causal, False, scale=self.sm_scale,
@@ -101,10 +102,10 @@ class _CudnnDense:
 
 
 @functools.cache
-def _warn_uneven(label: str) -> None:
+def _warn_uneven() -> None:
     logger.warning(
-        "ragged attention %s declares uniform segments but planned segments of different lengths; "
-        "running FlashInfer for them", label,
+        "a ragged attention that declares uniform segments planned segments of different lengths; "
+        "running FlashInfer for them"
     )
 
 
@@ -125,7 +126,7 @@ class SelectedRaggedPrefillWrapper(RaggedPrefillWrapper):
         self._fi_args = dict(num_qo_heads=num_qo_heads, num_kv_heads=num_kv_heads, head_dim=head_dim,
                              backend=backend, **kwargs)
         self._flashinfer: dict[str, FlashInferRaggedPrefillWrapper] = {}
-        self._dense = _CudnnDense(self.sm_scale)
+        self._dense = _CudnnDense(self.sm_scale, self.q_data_type)
         self._active: _CudnnDense | FlashInferRaggedPrefillWrapper | None = None
         self._captured: Choice | None = None
 
@@ -157,7 +158,7 @@ class SelectedRaggedPrefillWrapper(RaggedPrefillWrapper):
         even = n > 0 and all(x == seq for x in lens)
         choice = self._captured or RAGGED_ATTENTION.row_for(self._rows, seq)
         if choice.impl == "cudnn" and not even:
-            _warn_uneven(type(self).__name__)
+            _warn_uneven()
             if self._captured is not None:
                 raise ValueError(
                     f"{type(self).__name__}: captured on cuDNN for one layout, planned segments of "
