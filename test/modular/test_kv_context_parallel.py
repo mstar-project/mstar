@@ -713,6 +713,10 @@ def test_placed_attention_refuses_a_kernel_outside_its_contract(monkeypatch):
     monkeypatch.setattr(attn, "own_tokens_kernel", lambda *args: whole_only())
     with pytest.raises(ValueError, match="whole rows"):
         attn._context_parallel_wrapper("main", 0, False, dict(attn._wrapper_kv_kwargs))
+    # a kernel built for a capture that doesn't say what for
+    monkeypatch.setattr(attn, "own_tokens_kernel", lambda *args: _GatheredKeys())
+    with pytest.raises(ValueError, match="captured shape"):
+        attn._context_parallel_wrapper("main", 0, False, dict(attn._wrapper_kv_kwargs, batch_size=2), 16)
 
 
 class _GatheredKeys(OwnTokensKernel):
