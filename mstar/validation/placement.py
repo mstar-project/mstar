@@ -18,7 +18,7 @@ if TYPE_CHECKING:
     from mstar.model.components.moe_parallel import MoeParallelConfig
 
 # MAX_INPUTS in rust/src/graph/spec.rs: the Rust runtime keeps a node's
-# readiness in a u64 mask. Checked for both runtimes, since AUTO may pick either.
+# readiness in a u64 mask.
 MAX_NODE_INPUTS = 64
 
 

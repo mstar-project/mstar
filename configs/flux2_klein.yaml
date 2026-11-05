@@ -5,20 +5,20 @@ model: "flux2_klein"
 max_seq_len: 512
 
 # FLUX.2 [klein] 4B, single GPU, all four nodes colocated. Serving knobs (forwarded to
-# Flux2KleinModel.__init__): attention_backend flashinfer|sdpa, torch.compile of the
+# Flux2KleinModel.__init__): attention_backend sdpa|flashinfer, torch.compile of the
 # transformer per shape, CUDA-graph capture of the denoise step for the listed
 # (height, width) shapes and batch sizes (other shapes run the eager batched path).
 model_kwargs:
-  # sdpa (cuDNN on H100) served as fast as FlashInfer FA3 (0.349 vs 0.355 s at B=1) and is the
-  # reference kernel; flashinfer stays available
+  # sdpa (cuDNN on H100) is the reference kernel; flashinfer stays available
   attention_backend: sdpa
   compile: true
   # inductor rounds intermediates where eager PyTorch does (and fuses no FMAs); on its own the compiled
-  # transformer still lands at a median 37.6 dB from the eager path over the 100 protocol prompts (67 of 100 below 40 dB)
+  # transformer is still not bit-exact with the eager path (measured PSNR: compile_exact_ops in docs/models.rst)
   compile_eager_rounding: true
-  # op classes kept on the eager kernels inside the compiled forward: with the norms eager the compiled transformer
-  # is bit-exact with the eager one (the activations add nothing but graph breaks); every served image is then
-  # >= 53 dB from the eager path on all 100 protocol prompts (the compiled VAE) — [norms] 0.371 s at B=1 vs 0.356 plain and 0.383 with the activations too; 0.461 without compile
+  # op classes kept on the eager result inside the compiled forward: with the norms kept the compiled
+  # transformer was bit-exact with the eager one (measured while the q/k norms were graph breaks; the
+  # activations add nothing but graph breaks), and with vae_compile: false so was every served image
+  # (see compile_exact_ops in docs/models.rst)
   compile_exact_ops: [norms]
   accelerator_graph: true
   capture_sizes: [[1024, 1024]]
@@ -27,11 +27,15 @@ model_kwargs:
   # (one graph each)
   capture_batch_sizes: [1, 2, 3, 4, 5, 6, 7, 8]
   max_batch_size: 8
-  # compiled VAE decode (max-autotune): 3x faster at 1024^2, ~56 dB from the eager decode; the autotuner may pick
-  # other conv kernels in another server process (~64 dB apart). vae_compile: false for bit-exact, repeatable output
+  # compiled VAE decode (max-autotune), not bit-exact with the eager decode: before the folded upsample and split
+  # GroupNorm it was 3x faster at 1024^2 and ~56 dB from eager, and the autotuner may pick other conv kernels in another
+  # server process (~64 dB apart). vae_compile: false for bit-exact, repeatable output
   vae_compile: true
   # async_scheduling (default true): the worker assembles the next denoise step while the current one runs and merges
   # newly ready requests into it; `false` = lockstep, within a few percent (see docs/models.rst)
+  # linear_dtype: bf16 (default), mxfp8 or nvfp4 runs the block linears through a block-scaled GEMM, faster and
+  # further from the bf16 image of the same seed; linear_keep_bf16 and linear_dtype_steps keep some linears or steps
+  # in bf16. See docs/models.rst before turning it on
   # LoRA adapters folded into the transformer at load (diffusers / PEFT or BFL-layout
   # safetensors; ``scale`` multiplies the adapter). Example:
   # lora:

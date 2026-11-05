@@ -216,8 +216,8 @@ class LTX25Model(Model):
                     # one span per label (or per pair) per request
                     max_segments_per_request=1,
                     dtype=torch.bfloat16,
-                    # six labels x two slots: at the 512 MB default, 6 GB the split-KV
-                    # partials of these shapes never come near
+                    # six labels x two slots: 6 GB at the 512 MB default. A floor; the
+                    # labels whose plans want more than this grow to what they ask for
                     workspace_mb=128,
                 ),
                 **({"sp_exchange": "ulysses"} if key == VIDEO_ATTN else {}),

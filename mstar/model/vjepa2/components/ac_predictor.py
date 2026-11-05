@@ -235,47 +235,28 @@ class ACRoPEAttention(nn.Module):
         hd = self.head_dim
 
         qkv: torch.Tensor = self.qkv(x).view(b, n, 3, self.num_heads, hd)
-        q, k, v = qkv.unbind(dim=2)
+        # q and k rotate together ([B, L, 2, H, D]); v is untouched
+        qk, v = qkv[:, :, :2], qkv[:, :, 2]
 
-        if action_tokens > 0:
-            q_action = q[:, :action_tokens]
-            k_action = k[:, :action_tokens]
-            v_action = v[:, :action_tokens]
-            q_spatial = q[:, action_tokens:]
-            k_spatial = k[:, action_tokens:]
-            v_spatial = v[:, action_tokens:]
-        else:
-            q_spatial, k_spatial, v_spatial = q, k, v
-
-        # 3-axis RoPE for spatial tokens
-        s = 0
-        qd = apply_rope_BNHD(q_spatial[..., s:s + self.d_dim], *rope.d)
-        kd = apply_rope_BNHD(k_spatial[..., s:s + self.d_dim], *rope.d)
-        s += self.d_dim
-        qh = apply_rope_BNHD(q_spatial[..., s:s + self.h_dim], *rope.h)
-        kh = apply_rope_BNHD(k_spatial[..., s:s + self.h_dim], *rope.h)
-        s += self.h_dim
-        qw = apply_rope_BNHD(q_spatial[..., s:s + self.w_dim], *rope.w)
-        kw = apply_rope_BNHD(k_spatial[..., s:s + self.w_dim], *rope.w)
-        s += self.w_dim
-        if s < hd:
-            q_spatial = torch.cat([qd, qh, qw, q_spatial[..., s:]], dim=-1)
-            k_spatial = torch.cat([kd, kh, kw, k_spatial[..., s:]], dim=-1)
-        else:
-            q_spatial = torch.cat([qd, qh, qw], dim=-1)
-            k_spatial = torch.cat([kd, kh, kw], dim=-1)
+        # 3-axis RoPE for spatial tokens, as one rotation over the whole head
+        # dim: each element sees exactly the arithmetic of the per-axis
+        # rotation (pairs never straddle two axes), in a fraction of the kernels
+        emb_sin, emb_cos = rope.spatial
+        qk_spatial = apply_rope_BNHD(qk[:, action_tokens:], emb_sin.unsqueeze(2), emb_cos.unsqueeze(2))
 
         # Temporal RoPE for action tokens
-        if action_tokens > 0 and rope.time is not None:
-            qd = apply_rope_BNHD(q_action[..., :self.d_dim], *rope.time)
-            kd = apply_rope_BNHD(k_action[..., :self.d_dim], *rope.time)
-            q_action = torch.cat([qd, q_action[..., self.d_dim:]], dim=-1)
-            k_action = torch.cat([kd, k_action[..., self.d_dim:]], dim=-1)
-            q = torch.cat([q_action, q_spatial], dim=1)
-            k = torch.cat([k_action, k_spatial], dim=1)
-            v = torch.cat([v_action, v_spatial], dim=1)
+        if action_tokens > 0:
+            if rope.time is None:
+                raise ValueError("action tokens need time_pos")
+            t_sin, t_cos = rope.time
+            qk_action = qk[:, :action_tokens]
+            qkd = apply_rope_BNHD(qk_action[..., :self.d_dim], t_sin.unsqueeze(2), t_cos.unsqueeze(2))
+            qk = torch.cat([torch.cat([qkd, qk_action[..., self.d_dim:]], dim=-1), qk_spatial], dim=1)
         else:
-            q, k, v = q_spatial, k_spatial, v_spatial
+            qk = qk_spatial
+        q = qk[:, :, 0].contiguous()
+        k = qk[:, :, 1].contiguous()
+        v = v.contiguous()
 
         # [B, L, H, D] -> [B*L, H, D] for FlashInfer
         q = q.reshape(b * n, self.num_heads, hd)
@@ -290,12 +271,19 @@ class ACRoPEAttention(nn.Module):
         self, d_pos: torch.Tensor, h_pos: torch.Tensor, w_pos: torch.Tensor, time_pos: torch.Tensor | None,
         dtype: torch.dtype,
     ) -> RopeTables:
-        """``forward_cached``'s sin/cos for one step's positions, in the queries' ``dtype``."""
+        """``forward_cached``'s sin/cos for one step's positions, in the queries'
+        ``dtype``: the d/h/w tables side by side over the head dim, cos 1 / sin 0
+        on the unrotated tail."""
         device = d_pos.device
+        parts = [
+            rope_tables_BNHD(pos, dim, dtype, device)
+            for pos, dim in ((d_pos, self.d_dim), (h_pos, self.h_dim), (w_pos, self.w_dim))
+        ]
+        tail = (1, d_pos.numel(), 1, self.head_dim - self.d_dim - self.h_dim - self.w_dim)
+        sin = torch.cat([p[0] for p in parts] + [torch.zeros(tail, dtype=dtype, device=device)], dim=-1)
+        cos = torch.cat([p[1] for p in parts] + [torch.ones(tail, dtype=dtype, device=device)], dim=-1)
         return RopeTables(
-            d=rope_tables_BNHD(d_pos, self.d_dim, dtype, device),
-            h=rope_tables_BNHD(h_pos, self.h_dim, dtype, device),
-            w=rope_tables_BNHD(w_pos, self.w_dim, dtype, device),
+            spatial=(sin, cos),
             time=None if time_pos is None else rope_tables_BNHD(time_pos, self.d_dim, dtype, device),
         )
 

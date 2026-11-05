@@ -18,7 +18,8 @@ pytest.importorskip("transformers")
 from transformers import Qwen3Config, Qwen3ForCausalLM  # noqa: E402
 
 from mstar.distributed.communication import CommGroup  # noqa: E402
-from mstar.model.components.qwen3_lm import Qwen3Attention, Qwen3DenseLM, Qwen3LMConfig  # noqa: E402
+from mstar.engine.resources.convenience import AttentionCallable  # noqa: E402
+from mstar.model.components.qwen3_lm import Qwen3DenseLM, Qwen3LMConfig  # noqa: E402
 
 ATTN, KV, POS = "attn", "kv", "rope"
 
@@ -294,7 +295,6 @@ def test_a_layer_whose_steps_may_split_writes_its_kv_through_the_exchange(monkey
             return q
 
     norm = types.SimpleNamespace(variance_epsilon=1e-6, weight=None)
-    layer = types.SimpleNamespace(q_norm=norm, k_norm=norm, _rope_theta=1e6, attend=Attend())
     x = torch.zeros(4, 2, 8)
-    Qwen3Attention._norm_rope_attend(layer, x, x, x, None)
+    AttentionCallable.norm_rope_attend(Attend(), x, x, x, norm, norm, None, 1e6)
     assert calls == (["rotate", "attend"] if splits else ["fused_write"])

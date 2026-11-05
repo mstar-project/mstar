@@ -1,0 +1,30 @@
+model: "qwen3_omni"
+max_seq_len: 32768
+# qwen3omni_2gpu.yaml adapted to 80 GB GPUs such as the H100. The Thinker's GPU holds
+# every prefill capture bucket. 512 pages were sized on an H100 when the encoders shared
+# the Thinker's GPU and its text ladder ran to 8192: beside 1,024 pages 27 Thinker
+# captures, all among those of 4096+ tokens (text and vision), ran eager, and 640 still
+# left two vision buckets out. Chunked prefill now caps a Thinker step at 1,024 tokens,
+# so the large buckets no longer replay, but they are still captured and still take
+# that memory; whether 1,024 pages fit with today's ladders and encoder placement is
+# unmeasured.
+# Host pages give a full pool a request to move; see the Qwen3-Omni notes in
+# docs/models.rst for when to set max_concurrent_requests.
+resources:
+  thinker_kv:
+    max_num_pages: 512
+    cpu_offload_pages: 1024
+node_groups:
+  # The encoders run on the Talker's GPU (idle for text replies). Beside the Thinker
+  # they shared its worker, so under load each encoder step waited behind a Thinker
+  # step. The handoff across GPUs costs a little TTFT for a lone short request.
+  - node_names: [audio_encoder, vision_encoder]
+    ranks: [0]
+  - node_names: [Thinker]
+    ranks: [1]
+
+  - node_names: [Talker]
+    ranks: [0]
+
+  - node_names: [Code2Wav]
+    ranks: [0]

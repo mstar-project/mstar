@@ -138,7 +138,7 @@ class _Dense:
             SequenceView(request_id=f"r{i}", label="main", page_idxs=[i], length=3 + span, to_compute=span)
             for i, span in enumerate(spans)
         ]
-        outputs = {"kv": {"main": KVPlanOutput(cpu_indptrs=None, cuda_indptrs=None, views=views)}}
+        outputs = {"kv": {"main": KVPlanOutput(cpu_indptrs=None, views=views)}}
         self.manager.plan(AttentionStep(causal=causal), _ctx(segments_rids(spans), slot=slot, plan_results=outputs))
 
     def wrapper(self):

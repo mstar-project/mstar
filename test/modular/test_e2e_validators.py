@@ -398,12 +398,13 @@ def test_nohup_keeps_sighup_ignored_and_a_plain_run_stops_on_it():
     if nohup is None:
         pytest.skip("no nohup")
 
-    def probe(*prefix):
+    def probe(*prefix, preexec_fn=None):
         return subprocess.run([*prefix, sys.executable, "-c", NOHUP_PROBE], cwd=REPO, capture_output=True,
-                              text=True, timeout=60, check=False).stdout.strip()
+                              text=True, timeout=60, check=False, preexec_fn=preexec_fn).stdout.strip()
 
     assert probe(nohup) == "survived"
-    assert probe() == "interrupted"
+    # A plain run inherits SIGHUP's disposition, and the suite itself may run under nohup.
+    assert probe(preexec_fn=lambda: signal.signal(signal.SIGHUP, signal.SIG_DFL)) == "interrupted"
 
 
 # On SIGINT, stops its child (the conductor) with SIGINT, as the entrypoint does.

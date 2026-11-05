@@ -18,21 +18,16 @@ import numpy as np
 import torch
 
 from mstar.engine.resources.attn.base import (
-    AttentionManager,
     EagerSlotKey,
-    WorkspacePool,
+    PlacedAttention,
     captured_page_capacity,
     one_token_rows,
 )
 from mstar.engine.resources.attn.config import AttentionStep
+from mstar.engine.resources.attn.workspace import Workspace
+from mstar.engine.resources.attn.wrappers import PagedKernel, WholeRowsKernel
 from mstar.engine.resources.base import CGSlotKey
-from mstar.engine.resources.context_parallel import (
-    ContextParallel,
-    one_slot_pages,
-    padded_share,
-    zigzag_capture,
-    zigzag_share,
-)
+from mstar.engine.resources.context_parallel import one_slot_pages
 from mstar.engine.resources.kv.config import KVConfig, KVLayout
 from mstar.engine.resources.kv.plan import KVPlanOutputs
 from mstar.engine.resources.step import (
@@ -100,7 +95,7 @@ def _flashinfer_at_least(version: str) -> bool:
     return Version(flashinfer.__version__) >= Version(version)
 
 
-class FlashInferMLAWrapper:
+class FlashInferMLAWrapper(PagedKernel):
     """Thin wrapper over ``flashinfer.mla.BatchMLAPagedAttentionWrapper``.
 
     Args:
@@ -114,7 +109,7 @@ class FlashInferMLAWrapper:
 
     def __init__(
         self,
-        workspace_buffer: torch.Tensor,
+        workspace_buffer: Workspace,
         num_qo_heads: int,
         kv_lora_rank: int,
         qk_rope_head_dim: int,
@@ -150,6 +145,7 @@ class FlashInferMLAWrapper:
             return
         import flashinfer
 
+        self._workspace = workspace_buffer
         if use_cuda_graph:
             assert batch_size is not None and max_num_pages is not None
             self._qo_indptr_buf = torch.zeros(batch_size + 1, dtype=torch.int32, device=device)
@@ -160,14 +156,14 @@ class FlashInferMLAWrapper:
             )
             self._kv_len_buf = torch.zeros(batch_size, dtype=torch.int32, device=device)
             self.attn_wrapper = flashinfer.mla.BatchMLAPagedAttentionWrapper(
-                workspace_buffer, use_cuda_graph=True,
+                self._workspace.tensor, use_cuda_graph=True,
                 qo_indptr=self._qo_indptr_buf, kv_indptr=self._kv_indptr_buf,
                 kv_indices=self._kv_indices_buf, kv_len_arr=self._kv_len_buf,
                 backend=backend,
             )
         else:
             self.attn_wrapper = flashinfer.mla.BatchMLAPagedAttentionWrapper(
-                workspace_buffer, backend=backend,
+                self._workspace.tensor, backend=backend,
             )
 
     def plan(
@@ -199,7 +195,8 @@ class FlashInferMLAWrapper:
                 kv_len_arr.tolist(), bool(causal),
             )
             return
-        self.attn_wrapper.plan(
+        self._workspace.plan(
+            self.attn_wrapper.plan,
             qo_indptr=qo_indptr.to(torch.int32),
             kv_indptr=paged_kv_indptr.to(torch.int32),
             kv_indices=paged_kv_indices.to(torch.int32),
@@ -264,36 +261,34 @@ class FlashInferMLAWrapper:
         return (out, lse) if return_lse else out
 
 
-class FlashInferMLAOwnTokensWrapper(FlashInferMLAWrapper):
+class FlashInferMLAOwnTokensWrapper(WholeRowsKernel):
     """A step's own tokens attending each other from the latents ``run`` is passed (``[T, latent]``),
     with no copy: the MLA kernel over pages of one slot, page ``i`` the step's token ``i``, so each
     row's keys are its own queries' tokens."""
 
-    def __init__(self, workspace_buffer: torch.Tensor, dtype: torch.dtype, **kwargs):
-        super().__init__(workspace_buffer, page_size=1, **kwargs)
+    def __init__(self, workspace_buffer: Workspace, dtype: torch.dtype, **kwargs):
+        self._kernel = FlashInferMLAWrapper(workspace_buffer, page_size=1, **kwargs)
         self._plan_dtype = dtype
         self._out_buf = self._lse_buf = None
-        if self.use_cuda_graph and not self.fallback:
+        if self._kernel.use_cuda_graph and not self._kernel.fallback:
             # as the ragged wrapper's (`_FlashInferRaggedPrefillBase`): the kernel writes only the
             # planned rows, so ``plan`` resets a captured bucket's padding to out 0, lse -inf, which
             # merges to 0. ``run`` returns these buffers themselves (no clone, unlike the ragged out):
             # read them before the next ``run``. A page a token, so the pages are the bucket's tokens
-            rows = (kwargs["max_num_pages"], self.num_qo_heads)
-            self._out_buf = torch.zeros(*rows, self.kv_lora_rank, dtype=dtype, device=self.device)
-            self._lse_buf = torch.full(rows, -math.inf, dtype=torch.float32, device=self.device)
+            rows = (kwargs["max_num_pages"], self._kernel.num_qo_heads)
+            device = self._kernel.device
+            self._out_buf = torch.zeros(*rows, self._kernel.kv_lora_rank, dtype=dtype, device=device)
+            self._lse_buf = torch.full(rows, -math.inf, dtype=torch.float32, device=device)
 
     def plan(self, qo_indptr: torch.Tensor, causal: bool = True):
         tokens = int(qo_indptr[-1])
-        super().plan(
+        self._kernel.plan(
             qo_indptr, qo_indptr, torch.arange(tokens, dtype=torch.int32),
             torch.ones(qo_indptr.shape[0] - 1, dtype=torch.int32), causal=causal, dtype=self._plan_dtype,
         )
         if self._out_buf is not None:
             self._out_buf[tokens:].zero_()
             self._lse_buf[tokens:].fill_(-math.inf)
-
-    def forget_plan(self) -> None:
-        """Every ``plan`` plans its kernel, so there is nothing to forget."""
 
     def run(self, q_nope: torch.Tensor, q_pe: torch.Tensor, latent: torch.Tensor, return_lse: bool = False):
         owned = {}
@@ -304,13 +299,10 @@ class FlashInferMLAOwnTokensWrapper(FlashInferMLAWrapper):
                 f"{self._out_buf.shape[0]} this graph-mode wrapper was built for"
             )
             owned = dict(out=self._out_buf[:n], lse=self._lse_buf[:n] if return_lse else None)
-        return super().run(q_nope, q_pe, one_slot_pages(latent), return_lse=return_lse, **owned)
+        return self._kernel.run(q_nope, q_pe, one_slot_pages(latent), return_lse=return_lse, **owned)
 
 
-class FlashInferMLAManager(AttentionManager):
-    supports_context_parallel = True
-    # q_nope, q_pe
-    _query_parts = 2
+class FlashInferMLAManager(PlacedAttention):
 
     def __init__(
         self,
@@ -328,15 +320,9 @@ class FlashInferMLAManager(AttentionManager):
             # it defaulted to the one latent KV head, and the kernel planned a single head
             raise ValueError(f"MLA attention over {kv_cache!r} needs the cache's num_qo_heads, "
                              "the model's query heads")
-        self._kv_cache_name = kv_cache
-        self._device = device
-        self._dtype = dtype
-        self._kv_config = kv_config
-        self._current_plan_states: dict[str, FlashInferMLAWrapper] = {}
+        super().__init__(kv_cache, device, dtype, kv_config)
         self._eager_plan_states: dict[EagerSlotKey, FlashInferMLAWrapper] = {}
         self._cg_plan_states: dict[CGSlotKey, FlashInferMLAWrapper] = {}
-        self._preplan_states: dict[str, FlashInferMLAWrapper] = {}
-        self._preplanned = False
         if sm_scale is None:
             raise ValueError(
                 "AttentionConfig.sm_scale must be set for MLA: the kernel scores the absorbed "
@@ -352,14 +338,12 @@ class FlashInferMLAManager(AttentionManager):
             device=device,
             backend=backend,
         )
-        self._workspaces = WorkspacePool(device)
         # over a placed pool on the FA planner (the kernel in use), the device's SMs, for its work-item cap
         self._fa_sm_count: int | None = None
 
-    def _bind_placement(self, placement: ContextParallel) -> None:
+    def _bind_placement(self, geometry: dict[str, int]) -> None:
         # the latent is every TP rank's, so under TP placement it is attended for every partner's heads
-        cfg = self._kv_config
-        self._wrapper_kwargs.update(placement.local_geometry(cfg.tokens_per_page, cfg.num_qo_heads))
+        self._wrapper_kwargs.update(geometry)
         # the merge reads the natural-log lse fa2 and fa3 are known to return (`AttentionManager.build`
         # refuses the others); under auto a plan they refuse would fall through to another backend
         if self._wrapper_kwargs["backend"] == "auto" and torch.device(self._device).type == "cuda":
@@ -394,9 +378,6 @@ class FlashInferMLAManager(AttentionManager):
                     "use a TP size that gives each rank a head count dividing 64, or turn context_parallel off"
                 )
             self._fa_sm_count = _sm_count(self._device)
-            if self._fa_sm_count is not None:
-                # only where the FA planner plans: elsewhere there is nothing to refuse
-                self._plan_check = self._refuse_unplannable
 
     @property
     def uses_kernel(self) -> bool:
@@ -443,11 +424,11 @@ class FlashInferMLAManager(AttentionManager):
         self._eager_plan_states[key] = wrapper
         return wrapper
 
-    def _context_wrapper(self, workspace, decode, kwargs, max_total_tokens):
+    def paged_kernel(self, workspace, decode, kwargs, max_total_tokens):
         # one wrapper takes either kind of step
         return FlashInferMLAWrapper(workspace_buffer=workspace, **kwargs)
 
-    def _own_tokens_wrapper(self, workspace, kwargs, max_total_tokens):
+    def whole_rows_kernel(self, workspace, kwargs, max_total_tokens):
         own = {**kwargs, "num_qo_heads": self._kv_config.num_qo_heads}
         del own["page_size"]
         if max_total_tokens is not None:
@@ -465,21 +446,20 @@ class FlashInferMLAManager(AttentionManager):
         return True
 
     def admit(self, step: AttentionStep, ctx: StepContext) -> AdmitOutcome:
-        """Over a placed pool on the FA planner, refuses a step its planner may not hold
-        (``_refuse_unplannable``) before it is planned, so the worker retries it smaller:
+        """Over a placed pool on the FA planner, refuses a step its planner may not hold before it is
+        planned (``_fits``), so the worker retries it smaller:
         sized by how many of its requests, in its order, fit, or terminal for a request that
         doesn't fit alone (or alone in its capture's bucket, whose padding counts). The bound reads
         query lengths alone, so every rank refuses alike."""
-        # a step of one query a row (decode) is about a work item a row, far under the cap
-        if self._fa_sm_count is None or all(segment.span == 1 for segment in step.segments):
+        if self._fa_sm_count is None or self._decode_fits(step, ctx):
             return ADMIT_OK
         # request -> label -> its queries this step
         rows: dict[str, dict[str, int]] = {}
         for segment in step.segments:
             rows.setdefault(segment.request_id, {})[segment.label] = segment.span
         spans = list(rows.values())
-        # a captured step's own-token plans are padded to its bucket's tokens, and bounded so at plan
-        if self._fits(spans, None if ctx.slot_lease is None else ctx.slot_lease.bucket.num_tokens):
+        # bounded as the step's wrappers plan it, a captured one's own-token plans padded
+        if self._fits(spans, ctx):
             return ADMIT_OK
         where = f"FlashInfer's FA MLA planner past its cap of {_FA_MAX_WORK_ITEMS} work items over " \
                 f"context-parallel KV pool {self._kv_cache_name!r}"
@@ -490,8 +470,9 @@ class FlashInferMLAManager(AttentionManager):
         fit = next((n for n in range(len(real) - 1, 0, -1) if self._fits([rows[rid] for rid in real[:n]])), None)
         if alone or fit is None:
             # (no fit: one real row, which its capture's padding takes past the cap)
+            hint = self._placed.cap_hint(self._placement)
             return AdmitOutcome(ok=False, reason=AdmitRuntimeError(
-                message=f"The request's prompt takes {where} in one step; shorten it.{self._cap_hint()}",
+                message=f"The request's prompt takes {where} in one step; shorten it.{hint}",
                 request_ids=alone or frozenset(real),
             ))
         return AdmitOutcome(ok=False, reason=AllocationFailed(
@@ -505,29 +486,42 @@ class FlashInferMLAManager(AttentionManager):
             rows_sized=len(real),
         ))
 
-    def _fits(self, rows: list[dict[str, int]], captured_tokens: int | None = None) -> bool:
+    def _decode_fits(self, step: AttentionStep, ctx: StepContext) -> bool:
+        """Whether ``step`` plans as decode (``_fits`` by the same rule) and, at a tile a row per 64
+        heads, can't reach the cap, sparing a decode step the per-row bound."""
+        lease = ctx.slot_lease
+        if lease is None:
+            decode = not ctx.force_prefill and all(segment.span == 1 for segment in step.segments)
+        else:
+            decode = one_token_rows(lease.bucket.bs, lease.bucket.num_tokens, ctx.force_prefill)
+        tiles = -(-self._wrapper_kwargs["num_qo_heads"] // 64)
+        return decode and len(step.segments) * tiles + self._fa_sm_count <= _FA_MAX_WORK_ITEMS
+
+    def _fits(self, rows: list[dict[str, int]], ctx: StepContext | None = None) -> bool:
         """Whether each label's plans over ``rows`` (label -> queries, a request each) stay within
-        the FA planner's work-item cap: its context's, and under SP placement every partner's
-        zigzag share of its own tokens, padded as a capture of ``captured_tokens`` pads it."""
-        heads, size = self._wrapper_kwargs["num_qo_heads"], self._placement.size
+        the FA planner's work-item cap, as ``plan`` makes them for a step of ``ctx`` (an eager one
+        when None): a decode step's context alone, any other step's context and own tokens
+        (``rank_plans``), padded as the leased capture's wrapper pads them. Its kind comes from the
+        rule ``plan`` picks the wrapper by (``one_token_rows``)."""
+        heads = self._wrapper_kwargs["num_qo_heads"]
+        lease = None if ctx is None else ctx.slot_lease
+        force_prefill = ctx is not None and ctx.force_prefill
         for label in {label for row in rows for label in row}:
             qo = np.cumsum([0, *(row[label] for row in rows if label in row)])
-            plans = [qo]
-            if self._placement.over_sp:
-                shares = [zigzag_share(qo, size, index) for index in range(size)]
-                if captured_tokens is not None:
-                    shape = zigzag_capture(size, len(qo) - 1, captured_tokens)
-                    shares = [padded_share(share, *shape) for share in shares]
-                plans += shares
-            if any(fa_work_items_bound(plan, heads, self._fa_sm_count) > _FA_MAX_WORK_ITEMS for plan in plans):
+            shape = None
+            if lease is None:
+                decode = one_token_rows(len(qo) - 1, int(qo[-1]), force_prefill)
+            else:
+                decode = one_token_rows(lease.bucket.bs, lease.bucket.num_tokens, force_prefill)
+                # the rows the label's wrapper was captured with, which its own-token part pads to
+                wrapper = self._cg_plan_states.get(CGSlotKey(bucket=lease.bucket, slot=lease.slot, label=label))
+                shape = (len(qo) - 1 if wrapper is None else wrapper.captured_rows, lease.bucket.num_tokens)
+            plans = [(qo, heads)]
+            if not decode:
+                plans = self._placed.rank_plans(self._placement, qo, heads, self.own_kernel, shape)
+            if any(fa_work_items_bound(plan, h, self._fa_sm_count) > _FA_MAX_WORK_ITEMS for plan, h in plans):
                 return False
         return True
-
-    def _cap_hint(self) -> str:
-        if self._placement.over_sp:
-            return ""
-        return (f" Under TP placement each rank plans every partner's query heads, so a step reaches the cap "
-                f"{self._placement.size}x sooner; placing positions over SP ranks avoids that.")
 
     def plan(self, step: AttentionStep, ctx: StepContext):
         if step.context_only and self._placement is not None:
@@ -566,40 +560,18 @@ class FlashInferMLAManager(AttentionManager):
                 )
                 wrapper = self._eager_wrapper(label, ctx.slot, is_decode)
             if self._placement is not None:
+                # every row, padding included: the own-token kernel reads each row's own pages alone,
+                # so a padding row's latents reach no real row
                 wrapper.plan(kv_out, causal=step.causal)
             else:
                 wrapper.plan(causal=step.causal, dtype=self._dtype, **indptrs.to_kwargs_dict())
             plan_states[label] = wrapper
         self._preplanned = ctx.is_preplan
 
-    def _refuse_unplannable(self, what: str, qo_indptr: np.ndarray) -> None:
-        """Refuses, before FlashInfer can, a plan past its FA planner's work-item cap
-        (``ContextParallelWrapper``'s ``check``). The planner counts the KV lengths a rank plans,
-        which differ by rank over a placed pool, so its refusal could come on one rank alone; the
-        bound reads the query lengths alone. Under SP placement the context's and the own tokens'
-        heads are the same. A backstop: ``admit`` bounds the same plans, a capture's padding
-        included (``_fits``), and refuses such a step first."""
-        heads = self._wrapper_kwargs["num_qo_heads"]
-        bound = fa_work_items_bound(qo_indptr, heads, self._fa_sm_count)
-        if bound > _FA_MAX_WORK_ITEMS:
-            raise ValueError(
-                f"{what}, {int(qo_indptr[-1])} queries at {heads} heads, can take FlashInfer's "
-                f"FA MLA planner up to {bound} work items over context-parallel KV pool "
-                f"{self._kv_cache_name!r}, past its cap of {_FA_MAX_WORK_ITEMS}.{self._cap_hint()}"
-            )
-
-    def clear_preplan(self):
-        self._preplanned = False
-        self._preplan_states = {}
-
     @torch.compiler.disable
     def qo_indptr_buf(self, label: str = "main") -> torch.Tensor | None:
         wrapper = self._current_plan_states.get(label)
         return None if wrapper is None else wrapper._qo_indptr_buf
-
-    def select_last_hidden(self, hidden: torch.Tensor, label: str = "main") -> torch.Tensor:
-        last = (self.qo_indptr_buf(label)[1:] - 1).long()
-        return hidden.index_select(0, last)
 
     def run(
         self, q: torch.Tensor, label: str | None = None,

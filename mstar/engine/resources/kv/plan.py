@@ -79,15 +79,6 @@ class PagedIndptrs(NamedTuple):
     # rebuild it with torch ops.
     kv_lens: torch.Tensor | None = None
 
-    def to_device(self, device: torch.device):
-        return PagedIndptrs(
-            qo_indptr=self.qo_indptr.to(device, non_blocking=True),
-            paged_kv_indptr=self.paged_kv_indptr.to(device, non_blocking=True),
-            paged_kv_indices=self.paged_kv_indices.to(device, non_blocking=True),
-            paged_kv_last_page_len=self.paged_kv_last_page_len.to(device, non_blocking=True),
-            kv_lens=self.kv_lens,
-        )
-
     def context_only(self, page_size: int, qo_indptr: torch.Tensor | None = None) -> "PagedIndptrs":
         """Each row's KV cut to its stored context (its KV before the tokens the step appends at the
         row's end), the pages past it dropped, for attention over the stored context alone
@@ -273,12 +264,15 @@ class KVPlanOutput:
     Output of KVManager.plan for a single label
     """
 
-    __slots__ = ("cpu_indptrs", "_views", "_view_builder", "cuda_indptrs", "decode_pages", "decode_offsets", "rows")
+    __slots__ = (
+        "cpu_indptrs", "_views", "_view_builder", "decode_pages", "decode_offsets",
+        "rows", "_decode", "columns",
+    )
 
     def __init__(
         self, cpu_indptrs: PagedIndptrs, views: "list[SequenceView] | None" = None,
-        cuda_indptrs: "PagedIndptrs | None" = None, decode_pages=None, decode_offsets=None,
-        rows=None, view_builder=None,
+        decode_pages=None, decode_offsets=None,
+        rows=None, view_builder=None, decode: bool | None = None, columns=None,
     ):
         self.cpu_indptrs = cpu_indptrs
         # packing in plan order w/h 1 view per segment covered by plan; a plan
@@ -286,9 +280,6 @@ class KVPlanOutput:
         # made on first use (the FlashInfer path never asks for them)
         self._views = views
         self._view_builder = view_builder
-        # only the packed write addressing needs these on device, and only the
-        # resource that builds them reads them; see KVManager._setup_plan_states
-        self.cuda_indptrs = cuda_indptrs
         # a decode step planned off the previous one (KVManager's plan cache):
         # each row's write page and offset in it, so staging need not walk the views
         self.decode_pages = decode_pages
@@ -296,6 +287,13 @@ class KVPlanOutput:
         # (request_id, label, to_compute) per view, for consumers that need no
         # pages or lengths (the position resource); None means read the views
         self.rows = rows
+        # whether every row computes one token, when the plan already knows;
+        # None reads the views
+        self._decode = decode
+        # the plan's host arrays (``PlanColumns``), when it was built from
+        # columns. Unlike ``cpu_indptrs``, which may sit in a pinned ring a
+        # later plan rewrites, they stay valid as long as the output does.
+        self.columns = columns
 
     @property
     def views(self) -> "list[SequenceView]":
@@ -314,6 +312,8 @@ class KVPlanOutput:
     def is_decode(self) -> bool:
         if self.decode_pages is not None:
             return True
+        if self._decode is not None:
+            return self._decode
         return all(view.to_compute == 1 for view in self.views)
 
 

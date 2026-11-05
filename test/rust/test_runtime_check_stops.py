@@ -1,9 +1,9 @@
-"""Each graph runtime's stop check (``GraphRuntime.check_stops``), over the
+"""The graph runtime's stop check (``GraphRuntime.check_stops``), over the
 token column the worker's ``PostprocessRequest`` hands it, stops what the
 declared policy does (``StopPolicy.stops``) on the loop count the step was
 built with, through the worker's async decode loop.
 
-A runtime reads each loop's count from its walk state at postprocess time, by
+The runtime reads each loop's count from its walk state at postprocess time, by
 when step N+1 has been speculated; this drives a speculated decode loop in the
 worker's stage order and compares at every step's stop check.
 """
@@ -13,7 +13,6 @@ import numpy as np
 import pytest
 import torch
 from test_spec_rows import (
-    KINDS,
     LOOP,
     NODE,
     PART,
@@ -39,8 +38,8 @@ _ENGINE = SimpleNamespace(
 )
 
 
-def _declared_worker(kind, policy=POLICY):
-    w = _worker(kind)
+def _declared_worker(policy=POLICY):
+    w = _worker()
     w._graph_runtime.set_stop_policies(NODE, WALK, {LOOP: policy})
     w._stop_token_signal = {(NODE, WALK): policy.token_signal}
     w._device_loopback = {}
@@ -60,11 +59,10 @@ def _expected(nb, host_rows) -> dict[int, set[str]]:
     return out
 
 
-@pytest.mark.parametrize("kind", KINDS)
 @pytest.mark.parametrize("seed", range(4))
-def test_the_runtime_stops_what_the_policy_does_through_a_speculated_loop(kind, seed, monkeypatch):
+def test_the_runtime_stops_what_the_policy_does_through_a_speculated_loop(seed, monkeypatch):
     rng = np.random.default_rng(seed)
-    w = _declared_worker(kind)
+    w = _declared_worker()
     rids = _admit(w, 6)
     for i, rid in enumerate(rids):
         info = w.request_state.get_fwd_info(rid, PART)
@@ -99,9 +97,8 @@ def test_the_runtime_stops_what_the_policy_does_through_a_speculated_loop(kind, 
     assert stopped, "the limits are small enough that rows reach them"
 
 
-@pytest.mark.parametrize("kind", KINDS)
-def test_limits_are_dropped_with_the_request(kind):
-    w = _declared_worker(kind, StopPolicy(StopKind.ITER, max_iters=lambda info: 3))
+def test_limits_are_dropped_with_the_request():
+    w = _declared_worker(StopPolicy(StopKind.ITER, max_iters=lambda info: 3))
     rt = w._graph_runtime
     (rid,) = _admit(w, 1)
     rt.register_stop_limits(rid, w.request_state.get_fwd_info(rid, PART))

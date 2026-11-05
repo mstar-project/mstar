@@ -29,9 +29,9 @@ def reference_attention(q, k, v, causal=True):
 def reference_flashinfer() -> types.ModuleType:
     """FlashInfer's paged prefill/decode and ragged wrappers, with their lse bases. A paged plan
     refuses a row FlashInfer's split-KV planner would miscount: no pages, or a last page holding no
-    slot (see ``ContextParallel.local_indptrs``); and a causal row with more queries than keys,
-    whose first queries FlashInfer's bottom-right mask leaves none. The ragged one attends each
-    row's queries over its own keys (``kv_indptr``), and reads keys past its plan as FA3 does."""
+    slot (see ``local_indptrs``); and a causal row with more queries than keys, whose first queries
+    FlashInfer's bottom-right mask leaves none. The ragged one attends each row's queries over its
+    own keys (``kv_indptr``), and reads keys past each row's end as FA3 does."""
     fi = types.ModuleType("flashinfer")
     # a spec, as an imported module has: importlib.util.find_spec (diffusers probes for
     # flashinfer when first imported) raises on a module in sys.modules whose __spec__ is None
@@ -92,16 +92,15 @@ def reference_flashinfer() -> types.ModuleType:
                     buf.copy_(indptr)
 
         def run(self, q, k, v, out=None, lse=None, return_lse=False, lse_base="log2"):
-            parts = [
-                reference_attention(q[a:b], k[c:d], v[c:d], self.causal)
-                for (a, b), (c, d) in zip(itertools.pairwise(self.qo), itertools.pairwise(self.kv), strict=True)
-            ]
-            # FA3 reads the keys past the last row to its 128-key tile and masks them additively:
-            # nothing from a finite key, NaN in the last rows from a NaN one
-            end = self.kv[-1]
-            over = slice(end, min(k.shape[0], -(-end // 128) * 128))
-            poison = (k[over].float().sum() + v[over].float().sum()) * 0
-            parts[-1] = (parts[-1][0] + poison, parts[-1][1] + poison)
+            parts = []
+            for (a, b), (c, d) in zip(itertools.pairwise(self.qo), itertools.pairwise(self.kv), strict=True):
+                part = reference_attention(q[a:b], k[c:d], v[c:d], self.causal)
+                # FA3 reads the keys past a row's end, the next rows' and past the plan, to its last
+                # 128-key tile and masks them additively: nothing from a finite key, NaN in the row
+                # from a NaN one
+                over = slice(d, min(k.shape[0], c + -(-(d - c) // 128) * 128))
+                poison = (k[over].float().sum() + v[over].float().sum()) * 0
+                parts.append((part[0] + poison, part[1] + poison))
             o, got = torch.cat([p[0] for p in parts]).to(q.dtype), torch.cat([p[1] for p in parts])
             got = got if lse_base == "ln" else got / math.log(2)
             # the planned rows alone, into the caller's buffers or q-sized ones of its own (FlashInfer's

@@ -1,29 +1,22 @@
-"""``try_send_bytes`` on both control-mesh transports (pyzmq and the Rust
-binding): it never blocks, says False with nothing sent while the peer is at
-its high-water mark, and loses or reorders nothing. The API server's
-preprocess thread sends everything through it (``OutboxCommunicator``). The
-Rust case is skipped unless the ``mstar_rust`` extension is installed."""
+"""``try_send_bytes`` on the control-mesh transport: it never blocks, says
+False with nothing sent while the peer is at its high-water mark, and loses or
+reorders nothing. The API server's preprocess thread sends everything through
+it (``OutboxCommunicator``). Skipped unless the ``mstar_rust`` extension is
+installed."""
 import tempfile
 import time
 
 import pytest
 
-from mstar.communication.communicator import ZMQCommunicator
+pytest.importorskip("mstar_rust")
+
+from mstar.communication.rust_communicator import RustZMQCommunicator
 
 
-def _sender(kind, prefix):
-    if kind == "pyzmq":
-        return ZMQCommunicator("src", push_ids=["dst"], ipc_socket_path_prefix=prefix)
-    pytest.importorskip("mstar_rust")
-    from mstar.communication.rust_communicator import RustZMQCommunicator
-    return RustZMQCommunicator("src", push_ids=["dst"], ipc_socket_path_prefix=prefix)
-
-
-@pytest.mark.parametrize("kind", ["pyzmq", "rust"])
-def test_try_send_bytes_refuses_a_full_peer_and_loses_nothing(kind):
+def test_try_send_bytes_refuses_a_full_peer_and_loses_nothing():
     prefix = tempfile.mkdtemp(prefix="mstar_ts_", dir="/tmp")
-    dst = ZMQCommunicator("dst", push_ids=[], ipc_socket_path_prefix=prefix)  # reads only when asked
-    src = _sender(kind, prefix)
+    dst = RustZMQCommunicator("dst", push_ids=[], ipc_socket_path_prefix=prefix)  # reads only when asked
+    src = RustZMQCommunicator("src", push_ids=["dst"], ipc_socket_path_prefix=prefix)
     encode = src.codec.encode
 
     # the connection comes up asynchronously; until it does the peer can't take anything
