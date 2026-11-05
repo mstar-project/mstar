@@ -28,8 +28,8 @@ def _failed(source: str, why: str):
     raise RuntimeError(f"Error building extension: mstar_sim: {source}: {why} (no nvcc here)")
 
 
-def _defs(source: str) -> list[tuple[str, str]]:
-    """``(namespace, schema)`` of each op the source defines."""
+def _defs(source: str) -> list[tuple[str, str, str]]:
+    """``(namespace, schema, source)`` of each op the source defines."""
     with open(source) as f:
         text = re.sub(r"//[^\n]*|/\*.*?\*/", "", f.read(), flags=re.S)
     found = []
@@ -47,9 +47,7 @@ def _defs(source: str) -> list[tuple[str, str]]:
             schema = "".join(re.findall(r'"((?:[^"\\]|\\.)*)"', literals.group(1))) if literals else ""
             if "(" not in schema:
                 _failed(source, f"{ns}'s m.def({schema or '...'!r}, ...) infers its schema from C++")
-            found.append((ns, schema))
-    if not found:
-        _failed(source, "no TORCH_LIBRARY op")
+            found.append((ns, schema, source))
     return found
 
 
@@ -86,10 +84,11 @@ def install() -> None:
             return real(*args, **kwargs)
         if a.arguments["is_python_module"] or a.arguments["is_standalone"]:
             _failed(a.arguments["name"], "a CUDA extension built as a Python module or an executable")
-        for source in sources:
-            if source.endswith((".cu", ".cuh", ".cpp", ".cc", ".cxx")):
-                for ns, schema in _defs(source):
-                    _register(ns, schema, source)
+        defs = [d for s in sources if s.endswith((".cu", ".cuh", ".cpp", ".cc", ".cxx")) for d in _defs(s)]
+        if not defs:
+            _failed(a.arguments["name"], "no TORCH_LIBRARY op")
+        for ns, schema, source in defs:
+            _register(ns, schema, source)
         return None
 
     cpp_extension.load = load

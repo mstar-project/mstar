@@ -283,19 +283,21 @@ def test_graph_replay_costs_its_kernels_and_reprices_value_dependent_ones():
 
 def test_a_jit_built_cuda_extension_registers_capturable_ops(tmp_path):
     """``cpp_extension.load`` of CUDA sources registers their ``TORCH_LIBRARY`` ops as
-    kernels that write their mutable arguments, which a graph captures; an op whose schema
-    comes from C++ fails the build, so mstar keeps its fallback."""
+    kernels that write their mutable arguments, which a graph captures, whichever of its
+    sources defines them; an op whose schema comes from C++ fails the build, so mstar keeps
+    its fallback."""
     (tmp_path / "op.cu").write_text('''
         TORCH_LIBRARY(mstar_sim_jit, m) {
           m.def("fill(Tensor x, int n, "
                 "Tensor! out) -> ()");  // a schema in literals, as mstar's moe_align_block_size
         }''')
     (tmp_path / "inferred.cu").write_text("TORCH_LIBRARY(mstar_sim_inferred, m) { m.def(\"f\", &f); }")
+    (tmp_path / "kernel.cu").write_text("__global__ void fill_kernel(float* x) {}")  # the ops' kernels, apart
     run_sim(f"""
         import torch
         from torch.utils.cpp_extension import load
         from mstar_sim.device import never_computed
-        load(name="jit", sources=["{tmp_path}/op.cu"], is_python_module=False)
+        load(name="jit", sources=["{tmp_path}/op.cu", "{tmp_path}/kernel.cu"], is_python_module=False)
         x, out = torch.ones(4, device="cuda"), torch.zeros(8, dtype=torch.int32, device="cuda")
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
