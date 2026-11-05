@@ -253,6 +253,7 @@ class Glm5NextModel(Model):
                     topk=self.config.index_topk,
                     kpool=self.config.index_kpool,
                     sm_scale=self.config.qk_head_dim ** -0.5,
+                    index_head_dim=self.config.index_head_dim,
                 ),
             ))
         return specs

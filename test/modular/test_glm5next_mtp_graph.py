@@ -123,6 +123,9 @@ class _Engine:
             info = EngineResourceInfo(device=DEV, dependencies={
                 key: by_key[key] for key in spec.depends_on()})
             self.resources[spec.resource_key] = build_resource(spec, info)
+        for spec in specs:  # as the engine binds them (the DSA resource reads its KV pool)
+            self.resources[spec.resource_key].bind_dependencies(
+                {key: self.resources[key] for key in spec.depends_on()})
         self.runner = StepRunner(self.resources, node_resources={"LLM": list(self.resources)})
         self.sub = Glm5NextLLMSubmodule(self.lm, cfg)
         self.sub.bind_node_resources(self.resources)

@@ -270,7 +270,8 @@ class Glm52Model(Model):
                 resource_key=DSA_RESOURCE, nodes=nodes,
                 config=DSAConfig(
                     kv_cache=KV_RESOURCE, topk=self.config.index_topk,
-                    sm_scale=self.config.qk_head_dim ** -0.5, dense_below_topk=True),
+                    sm_scale=self.config.qk_head_dim ** -0.5, dense_below_topk=True,
+                    index_head_dim=self.config.index_head_dim),
             ))
         return specs
 

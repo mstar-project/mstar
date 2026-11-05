@@ -90,3 +90,26 @@ def test_an_eager_plan_queued_behind_other_work_keeps_its_own_plan():
     got = two_windows()
     torch.cuda.synchronize()
     assert torch.equal(got, want)
+
+
+@pytest.mark.parametrize("max_rows", [8192, 3])  # one launch; row chunks of 3
+def test_reused_eager_plans_keep_each_windows_plan(max_rows, monkeypatch):
+    """The resource's eager plans (two sets of wrappers taken in turn, re-planned without a
+    stream sync): windows queued behind other work each attend with their own plan."""
+    monkeypatch.setattr(sparse_mla, "MAX_ROWS", max_rows)
+    cases = [_case(rows, 64, seed) for rows, seed in ((4, 7), (2, 8), (5, 9))]
+    scale = 192 ** -0.5
+    plans = sparse_mla.EagerSparsePlans(DEV)
+
+    def windows():
+        return [plans.plan(lens, WIDTH, HEADS, CKV, 64, scale).attend(q_nope, q_pe, latent, slots)
+                for latent, lens, slots, q_nope, q_pe in cases]
+
+    windows()  # the first plans allocate: no cudaMalloc (a device sync) below
+    torch.cuda.synchronize()
+    torch.cuda._sleep(2_000_000_000)  # ~1 s of GPU work ahead of the plans' copies
+    got = windows()
+    torch.cuda.synchronize()
+    for (latent, lens, slots, q_nope, q_pe), out in zip(cases, got, strict=True):
+        ref = _reference(latent, lens, slots, q_nope, q_pe, scale)
+        torch.testing.assert_close(out.float(), ref, rtol=2e-2, atol=2e-2)

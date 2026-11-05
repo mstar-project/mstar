@@ -168,6 +168,9 @@ class _Serve:
             )
             for spec in specs
         }
+        for spec in specs:  # as the engine binds them (the DSA resource reads its KV pool)
+            self.resources[spec.resource_key].bind_dependencies(
+                {key: self.resources[key] for key in spec.depends_on()})
         self.runner = StepRunner(self.resources, node_resources={NODE: list(self.resources)})
         submodule.requires_grad_(False)
         submodule.bind_node_resources(self.resources)
@@ -254,7 +257,7 @@ def _generate_greedy(model, submodule, prompt_ids, max_tokens):
                     ended = "stop"
                     break
         stored = _stored_rows(serve.resources[KV_RESOURCE], serve.rid)
-        assert dsa.ctx is None  # each forward closed the context it opened on the resource
+        assert dsa.current() is not None  # the engine planned the declared DSA step
     finally:
         serve.close()
     return generated, ended, stored

@@ -33,14 +33,14 @@ PREFILL_SCORE_BYTES = 256 << 20
 
 @dataclass
 class DSAContext:
-    """Per-forward DSA state, from the inputs the resource staged (``DSAManager.step_inputs``).
+    """A step's DSA rows, as ``DSAManager.plan`` builds them from the KV plan.
 
     Device, per step row: ``pos`` its position (keys it sees are ``[0, pos]``), ``row_req`` its
     request. Per request: ``page_start`` its first entry in ``pages``, the flat page list of
     the step's requests. Host, when the step runs eager: ``host_pos``, ``spans`` ((first row,
     rows, request) per request, in row order) and ``host_page_start``. ``max_pools`` is the
     score width (the step's most pools, or a CUDA graph's fixed width); ``sparse_plan`` the
-    graph slot's plan, or the eager one the first layer builds.
+    graph slot's plan, or the eager one the first layer builds through ``eager``.
 
     ``needs_selection``: some row sees more than ``topk`` keys (below, dense MLA is the same
     computation). ``decode_rows``: every row scores on its own, the capturable launch (decode,
@@ -66,6 +66,10 @@ class DSAContext:
     valid: torch.Tensor | None = None
     pad_slot: int | None = None
     last_selection: torch.Tensor | None = None
+    # the resource's reused eager plans, which an eager step plans through
+    eager: sparse_mla.EagerSparsePlans | None = None
+    # planned under a capture lease (its rows are the slot's buffers)
+    captured: bool = False
     # row_meta's, for the rows it was built from
     _row_meta: tuple | None = field(default=None, init=False, repr=False, compare=False)
 
@@ -332,9 +336,10 @@ def sparse_attend(q_nope: torch.Tensor, q_pe: torch.Tensor, latent: torch.Tensor
             ctx.pos.tolist(), ctx.topk, ctx.kpool)
         return sparse_mla.reference(q_nope, q_pe, latent, slots, lens, sm_scale)
     if ctx.sparse_plan is None:  # eager: every layer of the forward shares one plan
-        ctx.sparse_plan = sparse_mla.EagerSparsePlan(
-            ctx.attn_lens(), ctx.width, q_nope.shape[1], q_nope.shape[-1], q_pe.shape[-1],
-            sm_scale, q_nope.device)
+        args = (ctx.attn_lens(), ctx.width, q_nope.shape[1], q_nope.shape[-1], q_pe.shape[-1],
+                sm_scale)
+        ctx.sparse_plan = (ctx.eager.plan(*args) if ctx.eager is not None
+                           else sparse_mla.EagerSparsePlan(*args, q_nope.device))
     if ctx.valid is not None:
         return ctx.sparse_plan.attend(q_nope, q_pe, latent, slots, ctx.valid, ctx.pad_slot)
     return ctx.sparse_plan.attend(q_nope, q_pe, latent, slots)
