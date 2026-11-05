@@ -55,7 +55,7 @@ class Timeline:
 
 _LOCK = threading.Lock()
 DEFAULT = Timeline("default")
-STATS = {"host_wait": 0.0, "host_compute": 0.0, "replays": 0}
+STATS = {"host_wait": 0.0, "host_compute": 0.0, "replays": 0, "calls": 0}
 
 
 # --- host time spent in the emulator.
@@ -104,6 +104,7 @@ def computing():
 
 def wait_until(t: float) -> None:
     """Sleep the host until device time ``t``, then settle the thread's debt."""
+    did_more()
     delay = t - time.perf_counter()
     if delay > 0:
         STATS["host_wait"] += delay
@@ -127,18 +128,52 @@ def in_kernel() -> bool:
     return getattr(_tls, "in_kernel", 0) > 0
 
 
-def charge(seconds: float, launched: float | None = None) -> float:
-    """Queue ``seconds`` of device work, launched at host time ``launched`` (now
-    by default), on the current stream; returns its end. While capturing, the
-    work goes on the tape instead."""
+def charge(seconds: float, launched: float | None = None, kernels: int = 1) -> float:
+    """Queue ``kernels`` kernels whose bodies take ``seconds`` of device time in all, launched
+    at host time ``launched`` (now by default), on the current stream: each adds the GPU's
+    eager launch gap. Returns their end. While capturing, they go on the tape instead (a
+    replay adds its own gaps)."""
+    recording = getattr(_tls, "recording", None)
+    if recording is not None:
+        recording[0] += seconds
+        recording[1] += kernels
     if FAST:
         return time.perf_counter()
     tape = capturing()
     if tape is not None:  # unscaled: its replay is charged here
-        tape.nodes.append((seconds, None))
+        tape.seconds += seconds
+        tape.kernels += kernels
         return time.perf_counter()
+    from mstar_sim import cost
+
     with _LOCK:
-        return current_timeline().launch(seconds * TIME_SCALE, launched)
+        return current_timeline().launch((seconds + kernels * cost.launch_seconds()) * TIME_SCALE, launched)
+
+
+@contextmanager
+def recording():
+    """What this thread charges inside: ``[seconds, kernels, more]``, where ``more`` says it
+    did more than queue kernels of fixed cost (:func:`did_more`), so charging the same
+    again can't stand for a repeat of it. Nested, the outer one sees the inner's too."""
+    outer = getattr(_tls, "recording", None)
+    mine = _tls.recording = [0.0, 0, False]
+    try:
+        yield mine
+    finally:
+        _tls.recording = outer
+        if outer is not None:
+            outer[0] += mine[0]
+            outer[1] += mine[1]
+            outer[2] = outer[2] or mine[2]
+
+
+def did_more() -> None:
+    """The call being recorded did more than queue kernels: it left work for a graph's
+    replays (an effect, a kernel priced at replay), waited for the device, or checked
+    for a capture."""
+    recording = getattr(_tls, "recording", None)
+    if recording is not None:
+        recording[2] = True
 
 
 # --------------------------------------------------------------------- capture
@@ -146,17 +181,19 @@ def charge(seconds: float, launched: float | None = None) -> float:
 
 @dataclass
 class Tape:
-    """What a captured graph launches, in order. Each node is ``(cost, effect)``: a
-    kernel's cost in seconds, or a callable pricing it at replay time (a kernel whose
-    cost depends on the values in its arguments, such as attention over the latest
-    plan), or None; and the work it does on values the emulator keeps (small tensors, host
-    copies to and from them), re-run at each replay, or None. A replay runs the nodes in
-    order, so a cost reads the values the nodes before it left. ``collectives``: what it
-    launches on other ranks' groups, in order, as ``(group, descriptor)``; at the capture's
-    end, what each replay meets on instead (:func:`mstar_sim.dist.seal`)."""
+    """What a captured graph launches. ``seconds`` and ``kernels``: the bodies and count of
+    its kernels whose cost is fixed at capture, summed as they are captured. Each node is
+    ``(cost, effect)``: a callable pricing a kernel at replay time (one whose cost depends
+    on the values in its arguments, such as attention over the latest plan), or None; and
+    the work it does on values the emulator keeps (small tensors, host copies to and from
+    them), re-run at each replay, or None. A replay runs the nodes in order, so a cost reads
+    the values the nodes before it left. ``collectives``: what it launches on other ranks'
+    groups, in order, as ``(group, descriptor)``; at the capture's end, what each replay
+    meets on instead (:func:`mstar_sim.dist.seal`)."""
 
-    nodes: list[tuple[float | Callable[[], float] | None, Callable[[], None] | None]] = field(
-        default_factory=list)
+    seconds: float = 0.0
+    kernels: int = 0
+    nodes: list[tuple[Callable[[], float] | None, Callable[[], None] | None]] = field(default_factory=list)
     collectives: list[tuple[object, list[int]]] = field(default_factory=list)
 
 
@@ -164,6 +201,7 @@ def on_replay(effect: Callable[[], None]) -> None:
     """While capturing, re-run ``effect`` at each replay of the graph."""
     tape = capturing()
     if tape is not None:
+        did_more()
         tape.nodes.append((None, effect))
 
 
@@ -250,24 +288,14 @@ def kernel_fn(name: str, cost: Callable[..., tuple | Callable[[], tuple]] | None
             tape = capturing()
             with computing():
                 terms = cost(*args, **kwargs) if cost is not None else (0.0, 0.0)
-                if tape is None:
-                    charge(price(terms() if callable(terms) else terms), launched)
-                elif callable(terms):
+                if tape is not None and callable(terms):
+                    did_more()
                     tape.nodes.append((lambda: price(terms()), None))
                 else:
-                    tape.nodes.append((graph_node_seconds(lambda: price(terms)), None))
+                    charge(price(terms() if callable(terms) else terms), launched)
             return out
 
         wrapper.__mstar_sim_kernel__ = name
         return wrapper
 
     return decorate
-
-
-def graph_node_seconds(seconds: Callable[[], float]) -> float:
-    """``seconds()`` priced as a graph node (no eager launch gap)."""
-    previous = set_capturing(Tape())
-    try:
-        return seconds()
-    finally:
-        set_capturing(previous)

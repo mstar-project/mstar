@@ -75,7 +75,7 @@ def test_kv_cache_write_costs_the_slot_not_the_cache():
 def test_profile_db_overrides_and_scales_the_roofline(tmp_path):
     trace = tmp_path / "trace.jsonl"
     cost.start_trace(str(trace))
-    roofline = _seconds(aten.mm.default, _meta(128, 4096), _meta(4096, 4096))
+    _seconds(aten.mm.default, _meta(128, 4096), _meta(4096, 4096))
     cost.stop_trace()
     (entry,) = [json.loads(line) for line in trace.read_text().splitlines()]
     db = tmp_path / "h100.json"
@@ -84,13 +84,12 @@ def test_profile_db_overrides_and_scales_the_roofline(tmp_path):
         "format": cost.FORMAT, "gpu": gpus.lookup("h100").name,
         "entries": {entry["key"]: {"seconds": measured, "roofline": entry["seconds"], "spec": entry["spec"]}},
     }))
-    launch = roofline - entry["seconds"]
     other_shape = _seconds(aten.mm.default, _meta(512, 4096), _meta(4096, 4096))
     cost.configure("h100", profile_db=str(db))
-    assert _seconds(aten.mm.default, _meta(128, 4096), _meta(4096, 4096)) == pytest.approx(measured + launch)
+    assert _seconds(aten.mm.default, _meta(128, 4096), _meta(4096, 4096)) == pytest.approx(measured)
     # an unmeasured token count of the same family takes the measured/roofline ratio
     scaled = _seconds(aten.mm.default, _meta(512, 4096), _meta(4096, 4096))
-    assert scaled == pytest.approx(2 * (other_shape - launch) + launch)
+    assert scaled == pytest.approx(2 * other_shape)
 
 
 # --- measured AIConfigurator tables ------------------------------------------
@@ -116,18 +115,17 @@ def _decode_attention(batch, kv_len, heads=8, kv_heads=2, head_dim=256):
     flops = 4.0 * batch * kv_len * heads * head_dim
     nbytes = batch * (4 * heads * head_dim + 4 * kv_len * kv_heads * head_dim)
     return cost.kernel_seconds("flashinfer.batch_paged_attention", flops=flops, bytes=nbytes,
-                               features=features) - cost._S.gpu.launch_s
+                               features=features)
 
 
 @needs_tables
 def test_tables_return_a_measured_gemm_exactly_and_blend_between_grid_points():
     cost.configure("h100", model="tables")
-    launch = gpus.lookup("h100").launch_s
     # m = 1025 is a measured tile cliff (~13% over m = 1024): kept, not smoothed
-    exact = _seconds(aten.mm.default, _meta(1025, 1024), _meta(1024, 1024)) - launch
+    exact = _seconds(aten.mm.default, _meta(1025, 1024), _meta(1024, 1024))
     assert exact == pytest.approx(_gemm_row(1025, 1024, 1024), rel=1e-9)
     lo, hi = sorted((_gemm_row(257, 1024, 1024), _gemm_row(512, 1024, 1024)))
-    assert lo <= _seconds(aten.mm.default, _meta(384, 1024), _meta(1024, 1024)) - launch <= hi
+    assert lo <= _seconds(aten.mm.default, _meta(384, 1024), _meta(1024, 1024)) <= hi
 
 
 @needs_tables

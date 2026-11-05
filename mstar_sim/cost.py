@@ -1,18 +1,19 @@
 """How long each kernel takes on the simulated GPU.
 
 Every aten op the simulated device runs costs ``op_seconds``; a stand-in for a
-fused kernel (FlashInfer, Triton) costs ``kernel_seconds``. Both charge
+fused kernel (FlashInfer, Triton) costs ``kernel_seconds``. Both price a kernel's body
 
-    min_kernel_s + max(flops / (peak[mode] * eff_c) + ramp_s, bytes / (bw * eff_m)) + launch
+    min_kernel_s + max(flops / (peak[mode] * eff_c) + ramp_s, bytes / (bw * eff_m))
 
 where ``peak``, ``bw``, ``min_kernel_s`` and the launch gap come from the GPU's
 spec (:mod:`mstar_sim.gpus`), ``eff_c``/``eff_m`` are the GPU's efficiency
 factors times the kernel's (``KERNEL_EFFICIENCY``, matched by substring of the
 op or kernel name), and ``ramp_s`` is the time a compute-bound kernel loses
-filling and draining its tile pipeline. ``launch`` is the GPU's eager gap
-between stream-launched kernels; while a CUDA graph is being captured it is 0,
-since a replay adds ``graph_node_seconds()`` per node and
-``graph_launch_seconds()`` once. This is the roofline of
+filling and draining its tile pipeline. A price never holds a launch gap:
+:func:`mstar_sim.clock.charge` adds the GPU's eager gap (``launch_seconds()``) per
+kernel launched on a stream, and a graph replay ``graph_node_seconds()`` per node
+and ``graph_launch_seconds()`` once, so a price means the same eagerly and
+captured. This is the roofline of
 ``torch.utils._runtime_estimation`` (PyTorch's ``RuntimeEstimator``) with a
 latency floor and a ramp added; unlike it, FLOPs are not halved (the
 ``flop_registry`` counts 2 per multiply-add, as datasheet peaks do) and bytes
@@ -50,13 +51,15 @@ simulator charges, with what is needed to replay it, to a JSONL file that the
 profiler reads.
 
 ``op_seconds`` runs for every op the simulated device launches, so its result
-is cached per (op, input and output shapes and dtypes, non-numeric arguments);
-the numeric value of a scalar argument does not change a kernel's cost.
+is cached per (op, input and output shapes and dtypes, non-numeric arguments),
+in a cache of at most ``CACHE_ENTRIES`` (least recently used out first); the
+numeric value of a scalar argument does not change a kernel's cost.
 """
 
 from __future__ import annotations
 
 import bisect
+import collections
 import json
 import os
 import threading
@@ -158,7 +161,29 @@ class _State:
 
 _S = _State()
 _INFO: dict = {}
-_CACHE: dict = {}
+# a model whose shapes change step to step (a TTS, a prefill mix) keeps adding keys: bounded,
+# so a long run's memory stays flat
+CACHE_ENTRIES = 1 << 13
+
+
+class Cache(collections.OrderedDict):
+    """A memo of at most ``CACHE_ENTRIES``, the least recently used out first."""
+
+    def get(self, key, default=None):
+        try:
+            self.move_to_end(key)
+        except KeyError:
+            return default
+        return self[key]
+
+    def put(self, key, value):
+        self[key] = value
+        if len(self) > CACHE_ENTRIES:
+            self.popitem(last=False)
+        return value
+
+
+_CACHE = Cache()
 _TRACE: _Trace | None = None
 
 
@@ -210,7 +235,7 @@ def kernel_seconds(name: str, *, flops: float = 0.0, bytes: float = 0.0, dtype=N
             _TRACE.record(key, spec, body)
         if _S.db is not None and key in _S.db:
             measured = _S.db[key]
-    return (body if measured is None else measured) + _launch(gpu)
+    return body if measured is None else measured
 
 
 def op_seconds(func, args, kwargs, out) -> float:
@@ -232,8 +257,13 @@ def op_seconds(func, args, kwargs, out) -> float:
     )
     body = _CACHE.get(key)
     if body is None:
-        body = _CACHE[key] = _measured_or_roofline(func, info, args, kwargs, out)
-    return body + _launch(_S.gpu)
+        body = _CACHE.put(key, _measured_or_roofline(func, info, args, kwargs, out))
+    return body
+
+
+def launch_seconds() -> float:
+    """The device gap before each kernel launched on a stream (eagerly)."""
+    return _S.gpu.launch_s
 
 
 def graph_node_seconds() -> float:
@@ -250,9 +280,9 @@ def copy_seconds(nbytes: int, kind: str) -> float:
     """Device time of a ``cudaMemcpyAsync`` of ``nbytes``; ``kind`` is "h2d", "d2h" or "d2d"."""
     gpu = _S.gpu
     if kind == "d2d":  # reads and writes HBM
-        return gpu.min_kernel_s + 2 * nbytes / (gpu.hbm_bw * gpu.memory_eff) + _launch(gpu)
+        return gpu.min_kernel_s + 2 * nbytes / (gpu.hbm_bw * gpu.memory_eff)
     if kind in ("h2d", "d2h"):
-        return gpu.copy_latency_s + nbytes / (gpu.host_link_bw * gpu.memory_eff) + _launch(gpu)
+        return gpu.copy_latency_s + nbytes / (gpu.host_link_bw * gpu.memory_eff)
     raise ValueError(f"copy kind must be h2d, d2h or d2d, not {kind!r}")
 
 
@@ -330,10 +360,6 @@ def _op_info(func) -> _OpInfo:
 
 def _efficiency(name: str) -> Efficiency:
     return next((e for pattern, e in KERNEL_EFFICIENCY.items() if pattern in name), _DEFAULT_EFFICIENCY)
-
-
-def _launch(gpu: gpus.GPU) -> float:
-    return 0.0 if clock.capturing() is not None else gpu.launch_s
 
 
 def _roofline(gpu: gpus.GPU, eff: Efficiency, flops: float, nbytes: float, mode: str) -> float:
@@ -522,7 +548,7 @@ def collective_seconds(op: str, num_gpus: int, nbytes: int, graph: bool = True) 
         link = tables.LINK_BW.get(_S.gpu.name, _S.gpu.host_link_bw)
         share = 2.0 * (num_gpus - 1) / num_gpus if op == "all_reduce" else (num_gpus - 1) / num_gpus
         t = _S.gpu.min_kernel_s + share * nbytes / link
-    return t + _launch(_S.gpu)
+    return t
 
 
 def _keyify(x, lead):

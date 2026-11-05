@@ -48,7 +48,7 @@ def _value(x):
 def _graph_nodes(graph_ptr, nodes, count) -> int:
     graph = GRAPHS.get(_value(graph_ptr))
     tape = getattr(graph, "tape", None)
-    _write(count, 0 if tape is None else max(1, sum(cost is not None for cost, _ in tape.nodes)))
+    _write(count, 0 if tape is None else max(1, tape.kernels + sum(cost is not None for cost, _ in tape.nodes)))
     return 0
 
 

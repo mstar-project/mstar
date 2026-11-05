@@ -201,6 +201,8 @@ def _report_at_exit(path: str) -> None:
             "device_busy_s": round(clock.DEFAULT.busy, 3),
             "kernels": clock.DEFAULT.kernels,
             "graph_replays": clock.STATS["replays"],
+            # torch calls on cuda tensors outside graphs: per replay, a decode step's eager work
+            "eager_calls": clock.STATS["calls"],
             "host_wait_s": round(clock.STATS["host_wait"], 3),
             "emulator_host_s": round(clock.STATS["host_compute"], 3),
         }

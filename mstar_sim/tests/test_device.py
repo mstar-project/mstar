@@ -232,6 +232,18 @@ def test_graph_replay_costs_its_kernels_and_reprices_value_dependent_ones():
         long = timed(g.replay)
         gemm = timed(lambda: a @ a)
         assert 3.5 < (long - gemm) / (short - gemm) < 4.5, (long, short, gemm)
+        # a node costs no eager launch gap, though its op was priced eagerly first (a warmup
+        # forward); and a composite's later calls charge what its first did (rms_norm: 8 kernels)
+        for warm, cold, op in ((a[:2048], a.view(8192, 2048)[:4096], lambda x: x + x),  # cold: same bytes
+                               (a[:512], a[512:1024], lambda x: torch.rms_norm(x, (4096,)))):
+            first, again = timed(lambda: op(warm)), timed(lambda: op(warm))
+            assert abs(again - first) < 1e-9, (again, first)  # (a launch gap is 1e-6)
+            graphs = [torch.cuda.CUDAGraph(), torch.cuda.CUDAGraph()]
+            for graph, x in zip(graphs, (warm, cold)):
+                with torch.cuda.graph(graph):
+                    op(x)
+            nodes = [timed(graph.replay) for graph in graphs]
+            assert abs(nodes[0] - nodes[1]) < 1e-9, nodes
         # values the emulator keeps (small ints) run at replay, not at capture, as on CUDA:
         # an in-graph counter, a staged H2D and a D2H into a host mailbox
         step = torch.zeros(1, dtype=torch.int64, device="cuda")
@@ -888,6 +900,8 @@ def test_graph_capture_reserves_its_pool_and_the_card_runs_out():
         del slots
 
         total = torch.cuda.get_device_properties().total_memory
+        x = torch.empty(total // 16 // 4096, 4096, device="cuda")  # a quarter of the card
+        torch.rms_norm(x, (4096,))  # its output, a quarter more, comes and goes
         big = torch.empty(total // 6, device="cuda")  # two thirds of the card
         del big
         again = torch.empty(total // 6, device="cuda")  # reuses the cached block
@@ -897,8 +911,39 @@ def test_graph_capture_reserves_its_pool_and_the_card_runs_out():
                 raise SystemExit("an allocation past the card succeeded")
             except torch.cuda.OutOfMemoryError as e:
                 assert "Tried to allocate" in str(e)
+        try:  # a call seen before still allocates its output, past the card now
+            torch.rms_norm(x, (4096,))
+            raise SystemExit("a repeated call's output past the card succeeded")
+        except torch.cuda.OutOfMemoryError:
+            pass
         print("ok")
     """, MSTAR_SIM_MEMORY_GB="80")
+    assert out.strip() == "ok"
+
+
+def test_a_long_run_over_changing_shapes_holds_the_emulators_memory_flat():
+    """The emulator's caches are bounded: a model whose shapes change step to step (a TTS, a
+    prefill mix) doesn't grow the worker for as long as it serves."""
+    out = run_sim("""
+        import tracemalloc, torch
+        from mstar_sim import cost
+        cost.CACHE_ENTRIES = 256  # small, so this run outgrows it
+        w = torch.randn(1024, 1024, device="cuda", dtype=torch.bfloat16)
+
+        def step(tokens):
+            x = torch.randn(tokens, 1024, device="cuda", dtype=torch.bfloat16)
+            torch.rms_norm(torch.nn.functional.linear(x, w) + x, (1024,))
+
+        tracemalloc.start()
+        for tokens in range(8, 208):  # until every cache entry is one tracemalloc saw made
+            step(tokens)
+        before = tracemalloc.get_traced_memory()[0]
+        for tokens in range(208, 408):
+            step(tokens)
+        grown = tracemalloc.get_traced_memory()[0] - before
+        assert grown < 100_000, grown
+        print("ok")
+    """)
     assert out.strip() == "ok"
 
 

@@ -4,6 +4,7 @@ API (:mod:`mstar_sim.cuda`) reads these figures."""
 
 from __future__ import annotations
 
+import atexit
 import threading
 import weakref
 
@@ -117,10 +118,10 @@ def _segment(nbytes: int) -> int:
     return -(-nbytes // (2 << 20)) * (2 << 20)
 
 
-def track(wrapper, data: torch.Tensor) -> None:
-    """Count ``data``'s storage while it lives. The finalizer hangs on the payload,
-    not the wrapper: module moves swap wrappers, and a swap refuses weakrefs. A
-    storage opened from another process (CUDA IPC) is that process's memory."""
+def track(data: torch.Tensor, index: int) -> None:
+    """Count ``data``'s storage, on device ``index``, while it lives. The weak reference
+    hangs on the payload, not the wrapper: module moves swap wrappers, and a swap refuses
+    weakrefs. A storage opened from another process (CUDA IPC) is that process's memory."""
     if data._base is not None or getattr(data, "_sim_tracked", False):
         return  # a view: its base holds (and counts) the storage
     storage = data.untyped_storage()
@@ -132,11 +133,29 @@ def track(wrapper, data: torch.Tensor) -> None:
             nbytes = -(-storage.nbytes() // 512) * 512
             entry = [nbytes, 0, _fake_range(nbytes), None]
             if not getattr(storage, "_sim_imported", False) and not clock.in_kernel():
-                _count(entry, wrapper.device.index)  # out of memory: no storage to remember
+                _count(entry, index)  # out of memory: no storage to remember
             _STORAGES[key] = entry
         entry[1] += 1
     data._sim_tracked = True
-    weakref.finalize(data, _release, key)
+    _LIVE[weakref.ref(data, _released)] = key
+
+
+# each tracked payload's weak reference, to the storage it counts: what a dead one releases
+# (emptied at exit, before the modules a release reads are torn down)
+_LIVE: dict = {}
+atexit.register(_LIVE.clear)
+
+
+def _released(ref, live=_LIVE, begin=clock.compute_begin, end=clock.compute_end) -> None:
+    """A tracked payload is gone (a free): the emulator's work, not the host's."""
+    key = live.pop(ref, None)
+    if key is None:
+        return
+    depth = begin()
+    try:
+        _release(key)
+    finally:
+        end(depth)
 
 
 def _count(entry: list, index: int) -> None:

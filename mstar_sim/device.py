@@ -42,7 +42,7 @@ from torch.overrides import TorchFunctionMode
 from torch.utils import _pytree
 from torch.utils._python_dispatch import TorchDispatchMode
 
-from mstar_sim import clock, cuda, memory
+from mstar_sim import clock, cost, cuda, memory
 
 
 def tree_flatten(obj):
@@ -165,9 +165,11 @@ def is_cuda_device(device) -> bool:
 
 
 class SimTensor(torch.Tensor):
-    """A tensor on the emulated GPU; its payload is ``self._data``."""
+    """A tensor on the emulated GPU; its payload is ``self._data``, its device index
+    ``self._index`` (read directly: ``.device`` is a torch-function call)."""
 
     _data: torch.Tensor
+    _index: int
 
     @staticmethod
     def __new__(cls, data: torch.Tensor, index: int = 0):
@@ -177,7 +179,8 @@ class SimTensor(torch.Tensor):
             requires_grad=data.requires_grad,
         )
         out._data = data
-        memory.track(out, data)
+        out._index = index
+        memory.track(data, index)
         return out
 
     def __repr__(self, *, tensor_contents=None):
@@ -202,7 +205,7 @@ def count_storages(out) -> None:
     inside are not counted, as the real kernel has none."""
     for t in tree_flatten(out)[0]:
         if isinstance(t, SimTensor):
-            memory.count_storage(t._data, t.device.index)
+            memory.count_storage(t._data, t._index)
 
 
 # torch.cuda.set_sync_debug_mode: 0 default, 1 warn, 2 error
@@ -302,6 +305,7 @@ def gpu_error(error: BaseException) -> BaseException:
 
 def refuse_while_capturing(what: str) -> None:
     """CUDA refuses a synchronizing call (``what``) on a capturing stream."""
+    clock.did_more()
     if clock.capturing() is not None:
         raise gpu_error(RuntimeError(
             f"CUDA error: operation not permitted when stream is capturing (mstar_sim: {what})"))
@@ -328,9 +332,9 @@ def _check_devices(func, args, kwargs, flat=None) -> int:
     for x in (flat if flat is not None else tree_flatten((args, kwargs))[0]):
         if isinstance(x, SimTensor):
             if index is None:
-                index = x.device.index
-            elif x.device.index != index:
-                other = f"cuda:{x.device.index}"
+                index = x._index
+            elif x._index != index:
+                other = f"cuda:{x._index}"
         elif isinstance(x, torch.Tensor) and x.dim() > 0 and x.device.type == "cpu":
             other = other or "cpu"
     if other and index is not None and func is not None and func not in _MIXED_OK:
@@ -391,13 +395,9 @@ class _Observe(TorchDispatchMode):
                 out = func(*args, **kwargs).zero_()
         if clock.FAST or func.is_view or clock.in_kernel():
             return out  # unpriced, or inside a stand-in (its own cost is charged)
-        from mstar_sim import cost
 
         seconds = cost.op_seconds(func, args, kwargs, out)
-        tape = clock.capturing()
-        if tape is not None:
-            tape.nodes.append((seconds, None))
-        elif seconds:
+        if seconds:
             clock.charge(seconds, launched)
         return out
 
@@ -488,8 +488,6 @@ def _istft(input, n_fft, hop_length=None, win_length=None, window=None, center=T
     n = length if length is not None else n_fft + hop * (frames - 1) - (2 * (n_fft // 2) if center else 0)
     dtype = input.dtype if return_complex else (input.real.dtype if input.is_complex() else input.dtype)
     out = torch.empty((*input.shape[:-2], n), dtype=dtype, device=META)
-    from mstar_sim import cost
-
     clock.charge(cost.kernel_seconds("torch.istft", flops=0.0,
                                      bytes=float(input.numel() * input.element_size() * 2)))
     return out
@@ -683,10 +681,14 @@ _ALLOCATES = {
 
 # ---------------------------------------------------------------- shape cache
 # A value-less op still costs torch's meta kernel, which for elementwise and
-# indexing ops is Python (~150-250 us). Its result depends only on the input
-# shapes, strides, dtypes and the non-tensor arguments, so each signature is
-# run once and later calls build the outputs (~2 us each).
-_SHAPES: dict = {}
+# indexing ops is Python (~150-250 us), and a value-less torch function its whole
+# decomposition through the dispatch mode. Their results depend only on the input
+# shapes, strides, dtypes and the non-tensor arguments, so each signature is run
+# once and later calls build the outputs (~2 us each). One cache, of an aten op's
+# outputs (:func:`meta_call`) and of a value-less torch function's outputs and what
+# it charged (:func:`_call`), bounded (``cost.CACHE_ENTRIES``, least recently used
+# out first): a model whose shapes change step to step keeps adding signatures.
+_SHAPES = cost.Cache()
 _UNCACHEABLE = object()
 
 
@@ -758,8 +760,112 @@ def meta_call(func, uargs, ukwargs, tensors):
     if key is not None:
         desc = _describe(raw, tensors)
         if desc is not _UNCACHEABLE:
-            _SHAPES[key] = desc
+            _SHAPES.put(key, desc)
     return raw
+
+
+def _call(func, args, kwargs):
+    """A torch function over cuda tensors. Over value-less ones (and kept floats beside them,
+    a norm's weight, which join them), a signature seen before builds its outputs from the
+    shape cache and charges what its first call did: its kernels' bodies and count. Its
+    outputs are allocated as the first call's were, so an out of memory fires as it did (a
+    function runs on the payloads, so its intermediates were never allocated on the card).
+    A call that did more than queue kernels (a stand-in, a value-dependent shape, a host
+    read, work for a graph's replays, a write to a kept operand) or that returns an input, or
+    a view or another tensor over an input's storage, is never cached."""
+    clock.STATS["calls"] += 1
+    key, kept = _call_key(func, args, kwargs)
+    if key is None:
+        return func(*args, **kwargs)
+    entry = _SHAPES.get(key)
+    if entry is not None:
+        descs, seconds, kernels = entry
+        out = _build_call(descs)
+        if kernels:
+            clock.charge(seconds, kernels=kernels)
+        return out
+    ran, shaped, versions = KERNELS_RUN[0], VALUE_SHAPES[0], [t._version for t in kept]
+    with clock.recording() as charged:
+        out = func(*args, **kwargs)
+    if (charged[2] or KERNELS_RUN[0] != ran or VALUE_SHAPES[0] != shaped
+            or versions != [t._version for t in kept]):
+        return out
+    inputs = [x for x in tree_flatten((args, kwargs))[0] if type(x) is SimTensor]
+    descs = _describe_call(out, inputs, {t._data.untyped_storage()._cdata for t in inputs})
+    if descs is not _UNCACHEABLE:
+        _SHAPES.put(key, (descs, charged[0], charged[1]))
+    return out
+
+
+# torch functions never answered from the shape cache: they read or move values, wait for the
+# device, or check for a capture, whatever their operands
+_NOT_CACHED: set = set()
+
+
+def _call_key(func, args, kwargs):
+    """The shape cache's key for a call over value-less cuda operands, kept floating ones
+    beside them (none of whose values can shape an output) and none on an autograd tape, with
+    those kept payloads; else ``(None, None)``. The key is the call's structure with each
+    operand's shape, strides, dtype, device and whether it keeps values, and the CUDA autocast
+    state."""
+    if FAULT[0] or func in _NOT_CACHED or getattr(func, "__name__", "") in ("__get__", "__set__") \
+            or _is_custom_op(func) or clock.in_kernel():
+        return None, None
+    grad = torch.is_grad_enabled()
+    kept, operands = [], [0]
+
+    def sig(x):
+        t = type(x)
+        if t is SimTensor:
+            data = x._data
+            if grad and x.requires_grad:
+                return _UNCACHEABLE
+            if data.device.type != "meta":
+                if not _floating(data):
+                    return _UNCACHEABLE  # an index, a mask, a count: its values can shape the output
+                kept.append(data)
+            operands[0] += 1
+            return (data.shape, data.stride(), data.dtype, x._index, data.device.type)
+        if t is tuple or t is list:
+            parts = tuple(map(sig, x))
+            return _UNCACHEABLE if _UNCACHEABLE in parts else (t, parts)
+        if t is dict:
+            parts = tuple((k, sig(v)) for k, v in x.items())
+            return _UNCACHEABLE if any(v is _UNCACHEABLE for _, v in parts) else (dict, parts)
+        if t is slice:
+            return ("slice", x.start, x.stop, x.step)
+        return x if t in _LEAVES else _UNCACHEABLE
+
+    shape = sig((args, kwargs))
+    if shape is _UNCACHEABLE or len(kept) == operands[0]:  # no value-less operand: it computes
+        return None, None
+    autocast = torch.get_autocast_dtype("cuda") if torch.is_autocast_enabled("cuda") else None
+    return (func, shape, autocast), kept
+
+
+def _describe_call(out, inputs, storages):
+    t = type(out)
+    if t is SimTensor:
+        data = out._data
+        if (any(out is i for i in inputs) or data.device.type != "meta" or data._base is not None
+                or data.storage_offset() or data.untyped_storage()._cdata in storages):
+            return _UNCACHEABLE
+        return ("t", tuple(data.shape), data.stride(), data.dtype, out._index)
+    if t is tuple or t is list:
+        parts = [_describe_call(o, inputs, storages) for o in out]
+        return _UNCACHEABLE if any(p is _UNCACHEABLE for p in parts) else (t, parts)
+    if out is None or t in (int, float, bool):
+        return ("v", out)
+    return _UNCACHEABLE
+
+
+def _build_call(desc):
+    kind = desc[0]
+    if kind == "t":
+        return SimTensor(torch.empty_strided(desc[1], desc[2], dtype=desc[3], device=META), desc[4])
+    if kind == "v":
+        return desc[1]
+    return desc[0](_build_call(d) for d in desc[1])
 
 
 # the most input bytes an op without a shape-only kernel is run on, as zeros
@@ -810,7 +916,6 @@ _ONE_KERNEL = {
 }
 # ones whose result dtype CUDA autocast changes: under it, priced per aten op
 _AUTOCAST_FN = {T.exp, T.log, T.rsqrt, T.pow, T.__pow__, T.sum, torch.sum, T.cumsum, torch.cumsum}
-_FAST_COST: dict = {}
 
 
 def _is_view_index(index) -> bool:
@@ -843,15 +948,8 @@ def _fast(func, args, kwargs, flat, index):
             raw.zero_()
     if not _is_view(func, args) and func not in _UNINITIALIZED and not clock.FAST:
         outs = [o for o in (raw if type(raw) in (tuple, list) else (raw,)) if isinstance(o, torch.Tensor)]
-        key = (func, tuple((t.shape, t.dtype) for t in tensors), tuple((o.shape, o.dtype) for o in outs))
-        seconds = _FAST_COST.get(key)
-        if seconds is None:
-            from mstar_sim import cost
-
-            nbytes = sum(t.numel() * t.element_size() for t in (*tensors, *outs))
-            seconds = _FAST_COST[key] = cost.kernel_seconds(
-                f"torch.{getattr(func, '__name__', 'op')}", flops=0.0, bytes=float(nbytes))
-        clock.charge(seconds)
+        nbytes = sum(t.numel() * t.element_size() for t in (*tensors, *outs))
+        clock.charge(cost.kernel_seconds(f"torch.{getattr(func, '__name__', 'op')}", flops=0.0, bytes=float(nbytes)))
     return _rewrap(raw, [x for x in flat if isinstance(x, torch.Tensor)], index)
 
 
@@ -1027,8 +1125,6 @@ def replay(tape: clock.Tape) -> None:
     """Run a captured graph's nodes in order (their work on kept values, and the
     pricing of each kernel on the values before it), as one launch charging its
     kernels' time back to back."""
-    from mstar_sim import cost
-
     check_fault()
     if tape.collectives:
         from mstar_sim import dist
@@ -1036,18 +1132,17 @@ def replay(tape: clock.Tape) -> None:
         dist.meet_replay(tape)
     clock.STATS["replays"] += 1
     launched = clock.vnow()  # re-running the work on kept values is the emulator's time, not the host's
-    total, kernels = 0.0, 0
+    total, kernels = tape.seconds, tape.kernels
     with contextlib.nullcontext() if clock.FAST else clock.computing(), torch.inference_mode():
         for seconds, effect in tape.nodes:
             if effect is not None and not FAULT[0]:  # the device faulted: nothing after it runs
                 effect()
-            if seconds is None or clock.FAST:
-                continue
-            priced = seconds if type(seconds) is float else clock.graph_node_seconds(seconds)
-            total += priced
-            kernels += priced > 0 or type(seconds) is not float
+            if seconds is not None and not clock.FAST:
+                total += seconds()
+                kernels += 1
         if not clock.FAST:
-            clock.charge(total + kernels * cost.graph_node_seconds() + cost.graph_launch_seconds(), launched)
+            clock.charge(total + kernels * cost.graph_node_seconds() + cost.graph_launch_seconds(), launched,
+                         kernels=0)
 
 
 # ------------------------------------------------------------ special methods
@@ -1056,8 +1151,6 @@ def replay(tape: clock.Tape) -> None:
 def _copy_seconds(nbytes: int, kind: str) -> float:
     if clock.FAST:
         return 0.0
-    from mstar_sim import cost
-
     return cost.copy_seconds(nbytes, kind)
 
 
@@ -1197,6 +1290,7 @@ _METHODS = {
     torch._has_compatible_shallow_copy_type: lambda a, b: type(a) is type(b),
 }
 _HOST_READS = {torch.equal}
+_NOT_CACHED.update(_METHODS, _COMPOSITE_STAND_INS)
 _DATA_DESCRIPTOR = torch._C.TensorBase.__dict__["data"]
 # functions that answer the host with a Python value: computed on the host values
 # (zeros for what was never computed), since a meta tensor has none
@@ -1287,7 +1381,7 @@ class SimMode(TorchFunctionMode):
         device = kwargs.get("device")
         if func in _PASSTHROUGH or any(type(a) is SimTensor for a in _shallow(args, kwargs)):
             # a call over cuda tensors: SimTensor handles it, devices included
-            return _emulated(func, args, kwargs)
+            return _emulated(_call, (func, args, kwargs), {})
         if args and _is_meta(args[0]) and (func in _READS or func in _HOST_VALUED):
             return func(*tree_map(_host_arg, args), **tree_map(_host_arg, kwargs))
         if func in _PLAIN:
