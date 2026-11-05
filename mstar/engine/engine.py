@@ -932,7 +932,7 @@ class Engine:
     def warmup(
         self, looped: Collection[tuple[str, str]] = (),
         carried: Mapping[tuple[str, str], Collection[str]] = MappingProxyType({}),
-        device_stops: Collection[tuple[str, str]] = (),
+        device_stops: Mapping[tuple[str, str], str] = MappingProxyType({}),
     ) -> None:
         """Capture every node's graphs. ``looped``: the (node, walk) pairs whose
         walk runs the node inside a Loop, which may run on resident tables, by
@@ -940,7 +940,7 @@ class Engine:
         ``carried``: the loop-back signals of each such pair whose steps may
         repeat, whose ``preprocess`` is checked here (``probe_carries``);
         ``device_stops``: the pairs whose captures should skip a replay whose
-        rows have all stopped (``step_repeats: device_stop``)."""
+        rows have all stopped, by their ``step_repeats: device_stop``."""
         # the Loop each (node, walk) runs in, whose counter its iteration inputs read
         self._loops = dict(looped) if isinstance(looped, Mapping) else {}
         # before capture: a region inside a captured graph compiles in its warm-up
@@ -967,10 +967,6 @@ class Engine:
                 node_name, submodule_mgmt, capture_stream,
             )
 
-        for node_name, walk in device_stops:
-            if node_name in self._submodules:
-                self._ask_device_stop(node_name, ag_runners[node_name], walk)
-
         # Every runner claims its static buffers before any of them captures:
         # nodes share resources, so a build driven by a later node would move
         # buffers an earlier node's graphs already recorded the address of.
@@ -985,6 +981,10 @@ class Engine:
         for (node_name, walk), signals in carried.items():
             if node_name in self._submodules:
                 self._probe_carries(node_name, ag_runners[node_name], walk, signals)
+        # after the planners bind: dropping rows writes the row their captures read
+        for (node_name, walk), mode in device_stops.items():
+            if node_name in self._submodules:
+                self._ask_device_stop(node_name, ag_runners[node_name], walk, mode)
 
         # every bucket sized before any is captured, so one plan weighs them all
         # against the largest eager step on the device
@@ -1615,7 +1615,7 @@ class Engine:
         out.update(mgmt.row_signals.get(graph_walk, {}))
         return out
 
-    def _ask_device_stop(self, node_name: str, runner: AcceleratorGraphRunner, graph_walk: str) -> None:
+    def _ask_device_stop(self, node_name: str, runner: AcceleratorGraphRunner, graph_walk: str, mode: str) -> None:
         """Before capture: have ``graph_walk``'s captures skip a stopped replay,
         where its stop reads a token and it runs on one rank."""
         mgmt = self._submodules[node_name]
@@ -1626,7 +1626,7 @@ class Engine:
         )
         if policy is not None:
             mgmt.device_stops[graph_walk] = policy
-            runner.ask_device_stop(graph_walk, policy.token_signal, policy.eos_tokens)
+            runner.ask_device_stop(graph_walk, policy.token_signal, policy.eos_tokens, mode == "drop_rows")
 
     def device_stop_refusal(self, node_name: str, graph_walk: str) -> str | None:
         """After capture: why ``graph_walk``'s captures don't skip a replay

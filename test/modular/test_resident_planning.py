@@ -190,8 +190,9 @@ def _promote(res, planner, s):
     res["rope"].plan(s.rope, ctx)
 
 
-def _replay(res, planner, s, promote=True):
-    """What the GPU thread does from the promote on."""
+def _replay(res, planner, s, promote=True, head=None):
+    """What the GPU thread does from the promote on. ``head``: the capture's
+    ops before each replay's gather, given the replay's index."""
     ctx, bucket, lease = s.ctx, s.ctx.slot_lease.bucket, s.ctx.slot_lease
     if planner is not None:
         if promote:
@@ -200,7 +201,9 @@ def _replay(res, planner, s, promote=True):
     state = res["kv"]._static_plan_state(lease.slot, ("main", 0), bucket.num_tokens)
     ck = CGSlotKey(bucket=bucket, slot=lease.slot, label="main")
     s.replays = []
-    for _ in range(ctx.repeats):
+    for replay in range(ctx.repeats):
+        if head is not None:
+            head(replay)
         if planner is not None:
             planner.gather(s.captured)
         s.pages = state.token_to_page[: bucket.bs].tolist()
@@ -383,6 +386,48 @@ def test_a_capture_puts_the_body_alone_in_the_conditional_and_only_when_asked():
     runner.stopped_run(stop, body, "graph")
     assert [call[0] for call in calls] == ["if", "body", "end"] and calls[0][2] is stop.live
     assert stop.marks.tolist() == [True, True, True] and stop.index.item() == 1
+    # dropping stopped rows needs a resident walk
+    runner.ask_device_stop(WALK, "t", {9}, drop_rows=True)
+    runner._resident, runner._device_stop_failures = None, {}
+    assert runner._device_stop_for(spec) is None
+    assert runner.device_stop_refusal(WALK).startswith("planner: the walk isn't resident")
+
+
+def test_a_stopped_row_leaves_its_kv_and_recurrent_state_where_its_stop_left_them():
+    """``device_stop: drop_rows``: from the replay after its stop column a row
+    reads and writes the trash slot, so its stream length, page and recurrent
+    slot stay where the stop left them, while the others advance; the next
+    run reads the rows the host staged."""
+    from mstar.engine.accelerator_graph_runner import DeviceStop
+
+    live, _, planner = _setup({1: 3, 2: 5})
+    s = _captured_step(live, planner, [1, 2], slot=0, bs=2, run=False, repeats=3)
+    bucket = s.ctx.slot_lease.bucket
+    stop = DeviceStop(2, "t", {9}, CPU, planner.drop_rows(bucket, 0))
+    stop.stage(2, [False, False])
+    tokens = [[9, 1], [1, 1], [1, 1]]  # row 0 stops in the first column
+
+    def head(replay):
+        if replay:
+            stop.mark(torch.tensor(tokens[replay - 1]))
+            stop.tail()
+        stop.head()
+
+    _replay(live, planner, s, head=head)
+    assert [replay.pool_slots[0] == s.replays[0].pool_slots[0] for replay in s.replays] == [True, False, False]
+    assert s.replays[0].pool_slots[1] == s.replays[2].pool_slots[1], "the other row keeps its slot"
+    lengths = live["kv"]._resident.kv_len
+    row, other = planner.slot_of(1), planner.slot_of(2)
+
+    def stored(slot):
+        return planner.store[slot * lengths.stride + lengths.col].item()
+
+    assert stored(row) == 3 + 1, "the row stopped in the first replay"
+    assert stored(other) == 5 + 3
+    # the next run's first replay reads every row again
+    stop.stage(2, [False, False])
+    stop.head()
+    assert planner.buffers(bucket, 0).slots.tolist() == [row, other]
 
 
 @pytest.mark.parametrize(("world_size", "policies", "why"), [
@@ -398,7 +443,7 @@ def test_a_walk_says_why_it_doesnt_skip_a_stopped_replay(world_size, policies, w
         submodule=SimpleNamespace(get_stop_policies=lambda walk: policies),
     )
     engine._submodules = {"n": mgmt}
-    engine._ask_device_stop("n", None, WALK)
+    engine._ask_device_stop("n", None, WALK, "skip")
     assert engine.device_stop_refusal("n", WALK) == why
 
 
@@ -681,6 +726,8 @@ def test_a_resource_refuses_repeats_at_load_for_what_it_knows_at_load(resource, 
     ({"n": {"max": 2, "maxx": 3}}, "not settings"),
     ({"m": {"max": 2}}, "not nodes of the model"),
     ({"n": 4}, "must be a mapping"),
+    ({"n": {"max": 2, "device_stop": "maybe"}}, "must be one of"),
+    ({"n": {"device_stop": "skip"}}, "need max above 1"),
 ])
 def test_a_step_repeats_block_that_asks_for_nothing_real_is_refused(block, why):
     with pytest.raises(ValueError, match=why):

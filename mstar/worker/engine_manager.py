@@ -351,7 +351,7 @@ class EngineManager:
     def warmup_all(
         self, looped: Collection[tuple[str, str]] = (),
         carried: Mapping[tuple[str, str], Collection[str]] = MappingProxyType({}),
-        device_stops: Collection[tuple[str, str]] = (),
+        device_stops: Mapping[tuple[str, str], str] = MappingProxyType({}),
     ) -> None:
         """CUDA graph capture, for the whole forward and any piecewise region.
         ``looped``: the (node, walk) pairs whose walk runs the node in a Loop;

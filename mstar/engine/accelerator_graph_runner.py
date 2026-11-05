@@ -29,7 +29,7 @@ from mstar.engine.accelerator_graph_config import (
 from mstar.engine.node_dtype import node_scope
 from mstar.engine.resources import BucketKey, CGSlotSpec, Resource, SlotLease, StepContext, StepRunner
 from mstar.engine.resources.lora.config import LoraBaseOnly
-from mstar.engine.resources.resident import ResidentPlanner, watched_counts
+from mstar.engine.resources.resident import TRASH_SLOT, ResidentBuffers, ResidentPlanner, watched_counts
 from mstar.engine.resources.step import PIECEWISE_WALK, SubmoduleStep
 from mstar.model.submodule_base import (
     BatchedModelOutput,
@@ -711,8 +711,13 @@ class DeviceStop:
     them, so a stop from before the run (a prefill's EOS) doesn't skip it, and
     padding rows count as stopped, so they never keep a replay alive."""
 
-    def __init__(self, bs: int, token_signal: str, stop_ids: Collection[int], device: torch.device):
+    def __init__(
+        self, bs: int, token_signal: str, stop_ids: Collection[int], device: torch.device,
+        dropping: "ResidentBuffers | None" = None,
+    ):
         self.token_signal = token_signal
+        # a capture that also sends a stopped row's reads and writes to the trash slot
+        self.dropping = dropping
         # the replay of the run, staged 0 before each run and counted in the graph
         self.index = torch.zeros((), dtype=torch.long, device=device)
         # the step's real rows, and those whose request ignores its stop ids
@@ -740,6 +745,9 @@ class DeviceStop:
         """Before a replay's body: replay 0 clears the marks, then ``live``."""
         torch.where(self.index == 0, self._rows >= self.real, self.marks, out=self.marks)
         torch.logical_not(self.marks.all(), out=self.live)
+        if self.dropping is not None:
+            rows = self.dropping.rows
+            torch.where(self.marks, torch.full_like(rows, TRASH_SLOT), rows, out=self.dropping.slots)
 
     def mark(self, tokens: torch.Tensor) -> None:
         """In the body, after the forward: rows whose token is a stop id."""
@@ -804,8 +812,9 @@ class AcceleratorGraphRunner:
         self._submodule = submodule
         self._comm_group = joint_comm_group
         self._resident: ResidentPlanner | None = None
-        # walk -> (token signal, stop ids) of the walks that skip a stopped replay
-        self._device_stops: dict[str, tuple[str, frozenset[int]]] = {}
+        # walk -> (token signal, stop ids, whether stopped rows drop) of the
+        # walks that skip a stopped replay
+        self._device_stops: dict[str, tuple[str, frozenset[int], bool]] = {}
         # walk -> why its captures don't skip one, once one was asked for and failed
         self._device_stop_failures: dict[str, str] = {}
 
@@ -1298,7 +1307,7 @@ class AcceleratorGraphRunner:
                     )
                 except Exception as error:
                     # a body the conditional node can't hold: plain replays, said at startup
-                    why = f"its capture into a conditional failed: {error}"
+                    why = f"runner: its capture into a conditional failed: {error}"
                     self._device_stop_failures[spec.bucket.graph_walk] = why
                     logger.warning("AcceleratorGraphRunner[%s]: %s", self._submodule_name, error)
                     stop = None
@@ -1319,17 +1328,20 @@ class AcceleratorGraphRunner:
             slot.device_stop = stop
             return slot
 
-    def ask_device_stop(self, walk: str, token_signal: str, stop_ids: Collection[int]) -> None:
+    def ask_device_stop(
+        self, walk: str, token_signal: str, stop_ids: Collection[int], drop_rows: bool = False,
+    ) -> None:
         """Before capture: ``walk``'s batched captures skip a replay whose rows
-        have all stopped on one of ``stop_ids`` in ``token_signal``."""
-        self._device_stops[walk] = (token_signal, frozenset(stop_ids))
+        have all stopped on one of ``stop_ids`` in ``token_signal``, and with
+        ``drop_rows`` send each stopped row to the trash slot until then."""
+        self._device_stops[walk] = (token_signal, frozenset(stop_ids), drop_rows)
 
     def device_stop_refusal(self, walk: str) -> str | None:
         """After capture: why ``walk``'s captures don't skip a stopped replay, or None."""
         if (refusal := self._graph_backend.conditional_refusal()) is not None:
             return f"backend: {refusal}"
         if (failure := self._device_stop_failures.get(walk)) is not None:
-            return f"runner: {failure}"
+            return failure
         slots = [slot for bucket in self._buckets.values() if bucket.config.capture_graph_walk == walk
                  for slot in bucket.slots]
         if not slots or any(slot.device_stop is None for slot in slots):
@@ -1337,10 +1349,19 @@ class AcceleratorGraphRunner:
         return None
 
     def _device_stop_for(self, spec: CGSlotSpec) -> DeviceStop | None:
-        asked = self._device_stops.get(spec.bucket.graph_walk)
+        walk = spec.bucket.graph_walk
+        asked = self._device_stops.get(walk)
         if asked is None or _is_packed(spec.config) or self._graph_backend.conditional_refusal() is not None:
             return None
-        return DeviceStop(spec.bucket.bs, *asked, self._device)
+        token_signal, stop_ids, drop_rows = asked
+        dropping = None
+        if drop_rows:
+            planner = self._resident
+            if planner is None or not planner.covers(spec.bucket):
+                self._device_stop_failures[walk] = "planner: the walk isn't resident, which dropping rows needs"
+                return None
+            dropping = planner.drop_rows(spec.bucket, spec.slot)
+        return DeviceStop(spec.bucket.bs, token_signal, stop_ids, self._device, dropping)
 
     def stopped_run(self, stop: DeviceStop, run: Callable[[], Any], graph: CapturedGraph) -> Any:
         """``run``'s capture as one replay of a run that skips its body once

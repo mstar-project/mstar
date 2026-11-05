@@ -344,9 +344,11 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        scatter. They can narrow a step to 1 (``Resource.max_repeats``), for every step on
        the node while a request with log-probs is live. ``device_stop`` (default ``off``):
        ``skip`` captures each replay's body in a conditional node, so once every row of a run
-       has stopped on a stop id its later replays skip their forward. It needs a token stop,
-       one rank, and a backend with conditional graph nodes (torch 2.12 and up, CUDA 12.4 and
-       up). At startup the worker logs one line per Loop walk with each capability
+       has stopped on a stop id its later replays skip their forward. ``drop_rows`` does that
+       and sends a stopped row's reads and writes to the trash slot until the run ends, so
+       its KV and recurrent state stay where its stop left them; it needs a resident walk.
+       Both need a token stop, one rank, and a backend with conditional graph nodes (torch
+       2.12 and up, CUDA 12.4 and up). At startup the worker logs one line per Loop walk with each capability
        (``resident``, ``repeats``, ``rows``, ``device stop``) ``on``, ``off: not asked for``,
        or ``off: <owner>: <reason>``. ``rows``: a node asked for
        resident planning or repeats keeps its fixed-shape loop-back values in device rows

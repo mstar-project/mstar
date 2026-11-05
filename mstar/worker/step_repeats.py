@@ -38,10 +38,11 @@ class RepeatConfig:
     error."""
     # the most iterations one step may stand for
     max: int = 1
-    # off, or skip: a replay whose rows have all stopped skips its body on the device
+    # off; skip: a replay whose rows have all stopped skips its body on the
+    # device; drop_rows: a stopped row also reads and writes the trash slot
     device_stop: str = "off"
 
-    DEVICE_STOPS: ClassVar[tuple[str, ...]] = ("off", "skip")
+    DEVICE_STOPS: ClassVar[tuple[str, ...]] = ("off", "skip", "drop_rows")
 
     @classmethod
     def parse(cls, node: str, block: object) -> RepeatConfig:
@@ -142,9 +143,12 @@ class StepRepeats:
         """Whether ``settle`` let this walk repeat."""
         return (node, walk) in self._walks
 
-    def device_stops(self) -> list[tuple[str, str]]:
-        """The walks asked to skip a replay whose rows have all stopped."""
-        return sorted(key for key in self.edges if self.config(key[0]).device_stop != "off")
+    def device_stops(self) -> dict[tuple[str, str], str]:
+        """The walks asked to skip a replay whose rows have all stopped, by mode."""
+        return {
+            key: self.config(key[0]).device_stop for key in sorted(self.edges)
+            if self.config(key[0]).device_stop != "off"
+        }
 
     def carried(self) -> dict[tuple[str, str], frozenset[str]]:
         """The loop-back signals of each walk asked to repeat, which a run

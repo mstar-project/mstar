@@ -5297,7 +5297,7 @@ class Worker:
         self.engine_manager.warmup_all(
             {(node, walk): loop for (walk, node), loop in self._innermost_loop_by_node.items()},
             self._step_repeats.carried() if self._step_repeats is not None else {},
-            self._step_repeats.device_stops() if self._step_repeats is not None else (),
+            self._step_repeats.device_stops() if self._step_repeats is not None else {},
         )
         if self._step_repeats is not None:
             # after capture: an attention decides repeats from the kernels it captured

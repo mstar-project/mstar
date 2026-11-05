@@ -243,6 +243,9 @@ class ResidentBuffers:
     to cell zero, a trash cell, and ``dirty`` says whether any entry is in use."""
     slots: torch.Tensor
     cells: torch.Tensor
+    # the row the host stages: ``slots``, unless a capture that drops stopped
+    # rows (``ResidentPlanner.drop_rows``) writes ``slots`` from it each replay
+    rows: torch.Tensor
     # each KV pool's stored lengths of the rows this step, by resource key: the
     # graph writes them, for what reads them after
     kv_len: dict[str, torch.Tensor]
@@ -481,12 +484,22 @@ class ResidentPlanner:
         found = self._buffers.get(key)
         if found is None:
             bs, device = bucket.bs, self.device
+            slots = torch.full((bs,), TRASH_SLOT, dtype=torch.long, device=device)
             found = self._buffers[key] = ResidentBuffers(
-                slots=torch.full((bs,), TRASH_SLOT, dtype=torch.long, device=device),
+                slots=slots, rows=slots,
                 cells=torch.zeros((2, self._cells_width(bs)), dtype=torch.long, device=device),
                 kv_len={pool: torch.zeros(bs, dtype=torch.long, device=device) for pool in self._length_keys},
             )
         return found
+
+    def drop_rows(self, bucket: BucketKey, slot: int) -> ResidentBuffers:
+        """A capture of ``bucket`` that sends a stopped row's reads and writes to
+        the trash slot: the host stages ``rows``, and the capture writes
+        ``slots``, which every owner reads, from it each replay."""
+        buffers = self.buffers(bucket, slot)
+        if buffers.rows is buffers.slots:
+            buffers.rows = buffers.slots.clone()
+        return buffers
 
     def plan(self, step: SubmoduleStep, ctx) -> None:
         """Stage this step's rows; on the plan thread for a pre-plan. Its admit
@@ -571,7 +584,7 @@ class ResidentPlanner:
             laps.lap("rewrites")
             buffers = self.buffers(lease.bucket, lease.slot)
             if buffers.staged is not slots:
-                self._stager.copy_(buffers.slots, slots, pad_value=TRASH_SLOT)
+                self._stager.copy_(buffers.rows, slots, pad_value=TRASH_SLOT)
                 buffers.staged = slots
             laps.lap("slot_row")
             for resource in self._owners:
