@@ -11,7 +11,7 @@ from torch import nn
 from mstar.model.submodule_base import HostRows
 from mstar.model.whisper.config import PREFILL_WALK, WhisperModelConfig
 from mstar.model.whisper.submodules import WhisperDecoderSubmodule
-from mstar.worker.worker import _LazyHostOutputs
+from mstar.worker.host_copies import _LazyHostOutputs
 
 
 def _node():

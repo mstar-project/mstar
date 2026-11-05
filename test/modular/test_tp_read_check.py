@@ -14,7 +14,7 @@ committed or sent, and every rank runs the same collectives.
   does in its forward, and with a step whose every row failed.
 - TP4 and TP2 x SP2: four real gloo ranks run the check itself.
 - The follower's scheduling (serial and ``MSTAR_TP_ASYNC_SCHED``) and rank 0's
-  marking run the real ``MicroScheduler``, ``Lockstep`` and ``Worker`` methods on stubs.
+  marking run the real ``MicroScheduler``, ``Lockstep`` and ``Speculator`` on stubs.
 """
 
 from __future__ import annotations
@@ -44,8 +44,8 @@ from mstar.graph.runtime.base import ColumnarEdgeSpecs, SpeculationPrepOutput
 from mstar.testing_utils.worker import make_scheduler, make_worker
 from mstar.utils.ipc_format import OffloadDelta, ScheduleTPNode, WorkerMessageType
 from mstar.worker.micro_scheduler import ScheduledBatch
+from mstar.worker.speculation import Speculation
 from mstar.worker.stream_buffers import StreamBufferManager
-from mstar.worker.worker import Speculation, Worker
 
 # ── two ranks through Worker.run (the acceptance harness) ─────────────────
 
@@ -370,35 +370,33 @@ def _spec_follower(read_failed, continuing, fresh, head_rids):
     sched, manager = _follower_scheduler(
         ready=[r for r in fresh if r not in read_failed], read_failed=read_failed,
     )
-    w = make_worker(scheduler=sched, lockstep=sched.lockstep, admission=sched.admission, request_state=manager)
-    w.preps, w.assembled = [], []
 
     def prep(prep_input):
         w.preps.append(list(prep_input.rids))
         return SpeculationPrepOutput([], list(prep_input.rids), ["wg0"] * len(prep_input.rids),
                                      ColumnarEdgeSpecs.empty())
 
-    w._graph_runtime = SimpleNamespace(
-        get_spec_target=lambda *a: SimpleNamespace(),
-        prep_follow_spec_rids=prep,
-        push_back_node=lambda node, rids, wg_ids: (
-            w.pushed_back.extend(rids), manager.runtime.push_back_node(node, rids, wg_ids),
-        ),
-        commit_speculation=lambda *a, **k: None,
-        get_worker_graph_id_for_node=manager.runtime.get_worker_graph_id_for_node,
-    )
-    w.pushed_back = []
-    w.released = []
-    w.engine_manager = SimpleNamespace(get_engine=lambda n: SimpleNamespace(
-        release_cached_prefix=lambda batch: w.released.extend(batch.request_ids),
-    ))
-    w.tensor_manager = SimpleNamespace(
+    tensor_manager = SimpleNamespace(
         get_tensor=lambda uuid: torch.zeros(1),
         get_tensors=lambda uuids: [torch.zeros(1) for _ in uuids],
     )
-    w.streams = StreamBufferManager(SimpleNamespace(per_request_info={}), w.tensor_manager, [])  # no streams
-
-    w.continuing, w.inputs = [], []
+    w = make_worker(
+        scheduler=sched, request_state=manager, tensor_manager=tensor_manager,
+        graph_runtime=SimpleNamespace(
+            get_spec_target=lambda *a: SimpleNamespace(),
+            prep_follow_spec_rids=prep,
+            push_back_node=lambda node, rids, wg_ids: (
+                w.pushed_back.extend(rids), manager.runtime.push_back_node(node, rids, wg_ids),
+            ),
+            commit_speculation=lambda *a, **k: None,
+            get_worker_graph_id_for_node=manager.runtime.get_worker_graph_id_for_node,
+        ),
+        engine_manager=SimpleNamespace(get_engine=lambda n: SimpleNamespace(
+            release_cached_prefix=lambda batch: w.released.extend(batch.request_ids),
+        )),
+        streams=StreamBufferManager(SimpleNamespace(per_request_info={}), tensor_manager, []),  # no streams
+    )
+    w.preps, w.assembled, w.pushed_back, w.released, w.continuing, w.inputs = [], [], [], [], [], []
 
     def assemble(pending, info, rows, inputs, streamed, continuing, fresh_final, **kwargs):
         w.assembled.append(list(rows))
@@ -415,7 +413,7 @@ def _spec_follower(read_failed, continuing, fresh, head_rids):
             is_new_iter=False, is_same_node=True,
         )
 
-    w._spec_builder = SimpleNamespace(assemble=assemble)
+    w.speculator._spec_builder = SimpleNamespace(assemble=assemble)
     pending = SimpleNamespace(
         tp_seq=0, node_name=NODE, graph_walk=WALK,
         batch=ScheduledBatch(node_name=NODE, graph_walk=WALK,
@@ -442,7 +440,7 @@ def test_an_async_follower_builds_a_read_checked_head_with_the_row_empty(unread)
         read_failed=failed, continuing=["c0", "c1"], fresh=["f0", "f1"], head_rids=head,
     )
 
-    spec = Worker._try_follow_speculation(w, pending)
+    spec = w.speculator.follow(pending)
 
     assert spec is not None, "the head waits on a row this rank will never read"
     assert w.preps == [[r for r in ("c0", "c1") if r not in failed]]
@@ -452,11 +450,11 @@ def test_an_async_follower_builds_a_read_checked_head_with_the_row_empty(unread)
     assert spec.node_batch.read_check_rids == tuple(head)
     assert w.lockstep.follow_head() is None
     # a read-checked step is admitted and planned inline on every rank, after the check
-    assert not Worker._plans_ahead(w, spec)
+    assert not w.speculator.plans_ahead(spec)
 
     # N's verdict voids the head: rank 0 gives back the leases of every row it
     # sent, and so does this rank, the unread rows' included
-    Worker._settle_speculation(w, spec, success=False)
+    w.speculator.settle(spec, success=False)
     assert sorted(w.released) == sorted(head)
 
 
@@ -469,14 +467,14 @@ def test_an_async_follower_that_cannot_prep_gives_back_only_the_rows_it_popped()
     )
     w._graph_runtime.prep_follow_spec_rids = lambda prep_input: None
 
-    assert Worker._try_follow_speculation(w, pending) is None
+    assert w.speculator.follow(pending) is None
     assert w.pushed_back == ["f0"]
     assert w.lockstep.follow_head() is not None
 
 
 def test_a_voided_speculations_unread_row_stays_out_of_the_next_read_checked_head():
     """f1's read failed here and f1 is not in N, so it is no continuing row of
-    the speculation: voiding it (``_maybe_clear_spec``) pushes f1 back with the
+    the speculation: voiding it (``StepPipeline._clear_speculation``) pushes f1 back with the
     fresh rows, though it was never popped, and the graph then holds f1 as
     ready with no input. Rank 0 sends the step again, read-checked, since it
     never ran: the follower still pops only the rows it read. Only the read
@@ -484,11 +482,11 @@ def test_a_voided_speculations_unread_row_stays_out_of_the_next_read_checked_hea
     w, pending = _spec_follower(
         read_failed=["f1"], continuing=["c0"], fresh=["f0", "f1"], head_rids=["c0", "f0", "f1"],
     )
-    spec = Worker._try_follow_speculation(w, pending)
+    spec = w.speculator.follow(pending)
     spec.continuing_rids = set(w.continuing[-1])  # as ``SpeculationBuilder.assemble`` sets it
     manager = w.request_state
 
-    # what ``_maybe_clear_spec`` gives back
+    # what ``_clear_speculation`` gives back
     sb = spec.scheduled_batch
     fresh = [rid for rid in sb.request_to_worker_graph if rid not in spec.continuing_rids]
     assert fresh == ["f0", "f1"]
@@ -528,18 +526,17 @@ def _leader(tmp_path, streamed=(), nodes=(NODE,), consumed=None, leads=True):
         streams=StreamBufferManager(SimpleNamespace(per_request_info={}), tm, []),
         parallel_nodes=set(nodes),
         parallel_leader_nodes=set(nodes) if leads else set(),
-        _streaming_edge_names=set(streamed),
+        streaming_edge_names=set(streamed),
         communicator=SimpleNamespace(
             send=lambda dest, msg=None: sent.append((dest, decode(encode(msg)))),
         ),
-        _graph_runtime=SimpleNamespace(
+        graph_runtime=SimpleNamespace(
             get_sharding_config=lambda r: sharding, get_rid_string=lambda h: h,
             get_rid_handle=lambda r: r, ingest_inputs_batch=lambda block, can_buffer: None,
             get_consumed_edges=lambda source, dest, walk: {(sig, dest) for sig in consumed.get((source, dest), ())},
         ),
         engine_manager=engine_manager,
         tensor_manager=tm,
-        scheduler=make_scheduler(engine_manager=engine_manager, parallel_leader_nodes={NODE}),
         request_state=SimpleNamespace(per_request_info={"r0": None, "r1": None}),
         wakeup_event=SimpleNamespace(drain=lambda: None),
     )

@@ -1,4 +1,5 @@
-"""Side lanes: a node's steps beside the worker's main chain (``mstar.worker.side_steps``).
+"""Side lanes: a node's steps beside the worker's main chain (``StepPipeline._launch_side``,
+``StepPipeline._finish_side``).
 
 The stream and event backends are mocked, so these run without a GPU; what they
 pin is where a side step's kernels and its window's collate go, when a step may
@@ -25,11 +26,10 @@ from mstar.testing_utils.engine import make_engine
 from mstar.testing_utils.model import StubModel
 from mstar.testing_utils.worker import make_worker
 from mstar.utils.threads import ThreadPool
-from mstar.worker import side_steps
+from mstar.worker import step_executor, step_pipeline
 from mstar.worker.engine_manager import EngineManager, _side_lane_keys, side_stream_nodes
-from mstar.worker.micro_scheduler import CHAIN_LANE, ScheduledBatch
-from mstar.worker.side_steps import SIDE_LANE, SideStepLane
-from mstar.worker.worker import PendingBatch, Worker
+from mstar.worker.micro_scheduler import CHAIN_LANE, SIDE_LANE, ScheduledBatch
+from mstar.worker.step_executor import PendingBatch
 
 SIDE = ("Codec", "codec_chunk")
 _OUTPUTS = SimpleNamespace(host_rows=None, host_spans=None)
@@ -56,7 +56,7 @@ class _StreamBackend:
             def __exit__(self, *exc):
                 backend.log.append("exit side")
 
-        monkeypatch.setattr(side_steps.torch, "Stream", Stream)
+        monkeypatch.setattr(step_executor.torch, "Stream", Stream)
 
 
 def _batch(rids, node="Codec", walk="codec_chunk"):
@@ -78,28 +78,34 @@ def _step(rids, landed=True, done=True, failed=None, lane=SIDE_LANE):
     )
 
 
-def _worker():
-    """A real ``Worker`` with what the lane calls around it recorded."""
+def _stub_build(monkeypatch, build):
+    monkeypatch.setattr(step_pipeline, "build_executing_batch", lambda services, batch: build(batch))
+
+
+def _worker(monkeypatch=None):
+    """A real ``Worker`` with what the lane calls around it recorded. Given
+    ``monkeypatch``, its batch build is recorded too."""
     log: list = []
-    worker = make_worker()
+    worker = make_worker(
+        device=torch.device("cpu"),
+        wakeup_event=SimpleNamespace(register_future=lambda future: None),
+        request_state=SimpleNamespace(get_partition_for_node=lambda node: node),
+    )
     worker.log = log
-    worker.worker_id = "w0"
-    worker.device = torch.device("cpu")
-    worker._in_flight_rids = set()
-    worker._wait_for_step = lambda step: log.append("wait for step")
-    worker._clear_in_flight_flag = lambda batch: log.append("clear in flight")
-    worker._set_in_flight_flag = lambda batch, value: log.append(f"in flight {value}")
-    worker._drop_failed_rids = lambda step, outputs, failed: log.append(("drop", sorted(failed)))
-    worker._fail_requests = lambda failed: log.append(("fail", sorted(failed)))
-    worker._postprocess_batch = lambda step, outputs, **kw: log.append(("postprocess", outputs, kw))
-    worker._count_turn = lambda step: None
-    worker._build_executing_batch = lambda batch: log.append("build") or SimpleNamespace(completion_event=None)
-    worker._submit_gpu_step = lambda *a, **k: log.append("submit") or Future()
-    worker._execute_on_gpu_thread = lambda *a: log.append("execute") or _OUTPUTS
-    worker.wakeup_event = SimpleNamespace(register_future=lambda future: None)
-    worker.request_state = SimpleNamespace(get_partition_for_node=lambda node: node)
+    executor, pipeline = worker.executor, worker.pipeline
+    executor.wait_for_step = lambda step: log.append("wait for step")
+    executor.clear_in_flight = lambda batch: log.append("clear in flight")
+    executor._set_in_flight = lambda batch, value: log.append(f"in flight {value}")
+    executor.drop_failed_rids = lambda step, outputs, failed: log.append(("drop", sorted(failed)))
+    executor.postprocess = lambda step, outputs, **kw: log.append(("postprocess", outputs, kw))
+    executor._submit_gpu_step = lambda *a, **k: log.append("submit") or Future()
+    executor._body = lambda *a: log.append("execute") or _OUTPUTS
+    pipeline._fail_requests = lambda failed: log.append(("fail", sorted(failed)))
+    pipeline._count_turn = lambda step: None
     worker.admission.clear_batch_limit = lambda *a, **k: log.append("clear limit")
-    worker.scheduler = SimpleNamespace(next_batch=lambda lane=CHAIN_LANE: None)
+    worker.scheduler.next_batch = lambda lane=CHAIN_LANE: None
+    if monkeypatch is not None:
+        _stub_build(monkeypatch, lambda batch: log.append("build") or SimpleNamespace(completion_event=None))
     return worker
 
 
@@ -108,11 +114,11 @@ def _worker():
 def test_a_step_runs_on_the_lane_stream_with_no_fence_behind_the_main_one(monkeypatch):
     backend = _StreamBackend(monkeypatch)
     worker = _worker()
-    worker._execute_on_gpu_thread = lambda *a: backend.log.append("execute") or _OUTPUTS
-    lane = SideStepLane(worker)
-    lane._stream = side_steps.torch.Stream(worker.device)
+    executor = worker.executor
+    executor._body = lambda *a: backend.log.append("execute") or _OUTPUTS
+    executor.lane_stream(SIDE_LANE)
 
-    assert lane.execute(_batch([1]), object(), None) is _OUTPUTS
+    assert executor._execute_on_lane(SIDE_LANE, _batch([1]), object(), None) is _OUTPUTS
 
     assert backend.log == ["enter side", "execute", "exit side"]
 
@@ -122,27 +128,25 @@ def test_the_window_collates_on_the_lane_stream_before_the_step_is_submitted(mon
     the window, runs on its own stream."""
     backend = _StreamBackend(monkeypatch)
     worker = _worker()
-    worker.log = backend.log
-    worker._build_executing_batch = lambda batch: backend.log.append("build") or SimpleNamespace()
-    worker._submit_gpu_step = lambda *a, **k: backend.log.append("submit") or Future()
+    _stub_build(monkeypatch, lambda batch: backend.log.append("build") or SimpleNamespace())
+    worker.executor._submit_gpu_step = lambda *a, **k: backend.log.append("submit") or Future()
     worker.scheduler.next_batch = lambda lane=CHAIN_LANE: _batch([1])
-    lane = SideStepLane(worker)
 
-    lane.launch(None)
+    worker.pipeline._launch_side()
 
     assert backend.log == ["enter side", "build", "exit side", "submit"]
 
 
 def test_every_step_shares_one_stream(monkeypatch):
     backend = _StreamBackend(monkeypatch)
-    worker = _worker()
+    worker = _worker(monkeypatch)
+    pipeline = worker.pipeline
     worker.scheduler.next_batch = lambda lane=CHAIN_LANE: _batch([1])
-    lane = SideStepLane(worker)
 
-    lane.launch(None)
-    lane.pending = _step([1])
-    lane.finish()
-    lane.launch(None)
+    pipeline._launch_side()
+    pipeline.side_pending = _step([1])
+    pipeline._finish_side()
+    pipeline._launch_side()
 
     assert backend.streams == 1
 
@@ -152,22 +156,23 @@ def test_a_step_that_staged_host_rows_fails(monkeypatch):
     side step lands; the startup refusal can't see an undeclared stop buffer."""
     _StreamBackend(monkeypatch)
     worker = _worker()
-    worker._execute_on_gpu_thread = lambda *a: SimpleNamespace(host_rows=object(), host_spans=None)
-    lane = SideStepLane(worker)
-    lane._stream = side_steps.torch.Stream(worker.device)
+    executor = worker.executor
+    executor._body = lambda *a: SimpleNamespace(host_rows=object(), host_spans=None)
+    executor.lane_stream(SIDE_LANE)
 
     with pytest.raises(RuntimeError, match="stop buffers or output spans"):
-        lane.execute(_batch([1]), object(), None)
+        executor._execute_on_lane(SIDE_LANE, _batch([1]), object(), None)
 
 
 def test_the_submitted_step_takes_the_lane_body_and_lifts_the_launch_fence(monkeypatch):
     _StreamBackend(monkeypatch)
-    worker = make_worker(device=torch.device("cpu"), _execute_on_gpu_thread=lambda *a: _OUTPUTS)
-    lane = SideStepLane(worker)
-    lane._stream = side_steps.torch.Stream(worker.device)
+    executor = make_worker(device=torch.device("cpu")).executor
+    executor._body = lambda *a: _OUTPUTS
+    executor.lane_stream(SIDE_LANE)
     node_batch = SimpleNamespace(launch_started_event=None)
     with ThreadPool(max_workers=1) as pool:
-        future = Worker._submit_gpu_step(worker, pool, _batch([1]), node_batch, None, execute=lane.execute)
+        executor._gpu_pool = pool
+        future = executor._submit_gpu_step(_batch([1]), node_batch, None, SIDE_LANE)
         assert future.result() is _OUTPUTS
     assert node_batch.launch_started_event.wait(timeout=5)
 
@@ -177,7 +182,7 @@ def test_the_submitted_step_takes_the_lane_body_and_lifts_the_launch_fence(monke
 def test_a_side_step_is_submitted_as_its_lane_and_flagged_in_flight():
     worker = _worker()
 
-    step = worker._submit_step(None, _batch([1]), SimpleNamespace(), lane=SIDE_LANE, execute=print)
+    step = worker.executor.submit(_batch([1]), SimpleNamespace(), lane=SIDE_LANE)
 
     assert step.lane == SIDE_LANE and step.partition == "Codec"
     assert worker.log == ["in flight True", "submit"]
@@ -187,8 +192,8 @@ def test_a_speculated_chain_step_is_not_flagged_again():
     """Its speculation flagged it in flight when it settled."""
     worker = _worker()
 
-    step = worker._submit_step(
-        None, _batch([1]), SimpleNamespace(), speculated=True, partition="p", loop_name="decode",
+    step = worker.executor.submit(
+        _batch([1]), SimpleNamespace(), speculated=True, partition="p", loop_name="decode",
     )
 
     assert step.lane == CHAIN_LANE and step.partition == "p" and step.loop_name == "decode"
@@ -198,8 +203,8 @@ def test_a_speculated_chain_step_is_not_flagged_again():
 def test_finishing_a_step_lifts_its_limit_then_postprocesses():
     worker = _worker()
 
-    worker._finish_step(_step([1]), "outputs")
-    worker._finish_step(_step([2], lane=CHAIN_LANE), "outputs")
+    worker.pipeline._finish_step(_step([1]), "outputs")
+    worker.pipeline._finish_step(_step([2], lane=CHAIN_LANE), "outputs")
 
     assert worker.log == [
         "clear limit", ("postprocess", "outputs", {"clear_loop_stops": False}),
@@ -208,46 +213,45 @@ def test_finishing_a_step_lifts_its_limit_then_postprocesses():
 
 
 def test_rows_in_flight_are_every_lanes_and_an_error_fails_the_chains():
-    worker = _worker()
+    pipeline = _worker().pipeline
     failed = []
-    worker._fail_requests = failed.append
+    pipeline._fail_requests = failed.append
 
-    worker._hold_rows(CHAIN_LANE, {1, 2})
-    worker._hold_rows(SIDE_LANE, {2, 3})
-    assert worker._in_flight_rids == {1, 2, 3} and worker._held_beside(CHAIN_LANE) == {2, 3}
+    pipeline._hold_rows(CHAIN_LANE, {1, 2})
+    pipeline._hold_rows(SIDE_LANE, {2, 3})
+    assert pipeline.in_flight_rids == {1, 2, 3} and pipeline._held_beside(CHAIN_LANE) == {2, 3}
 
-    worker._handle_main_loop_error(RuntimeError("boom"), (None, None), None)
+    pipeline._handle_error(RuntimeError("boom"), (None, None), None)
     assert set(failed[0]) == {1, 2}
 
-    worker._hold_rows(SIDE_LANE, ())
-    assert worker._in_flight_rids == {1, 2}
+    pipeline._hold_rows(SIDE_LANE, ())
+    assert pipeline.in_flight_rids == {1, 2}
 
 
 # ----- one step in flight ---------------------------------------------------
 
-def test_one_step_in_flight():
-    worker = _worker()
+def test_one_step_in_flight(monkeypatch):
+    worker = _worker(monkeypatch)
+    pipeline = worker.pipeline
     asked = []
     worker.scheduler.next_batch = lambda lane=CHAIN_LANE: asked.append(lane) or _batch([len(asked)])
-    lane = SideStepLane(worker)
 
-    lane.launch(None)
-    lane.launch(None)
-    assert asked == [SIDE_LANE] and worker._in_flight_rids == {1}
+    pipeline._launch_side()
+    pipeline._launch_side()
+    assert asked == [SIDE_LANE] and pipeline.in_flight_rids == {1}
 
-    lane.pending = _step([1])
-    lane.finish()
-    lane.launch(None)
-    assert asked == [SIDE_LANE, SIDE_LANE] and worker._in_flight_rids == {2}
+    pipeline.side_pending = _step([1])
+    pipeline._finish_side()
+    pipeline._launch_side()
+    assert asked == [SIDE_LANE, SIDE_LANE] and pipeline.in_flight_rids == {2}
 
 
 def test_nothing_ready_launches_nothing():
     worker = _worker()
-    lane = SideStepLane(worker)
 
-    lane.launch(None)
+    worker.pipeline._launch_side()
 
-    assert lane.pending is None and worker.log == []
+    assert worker.pipeline.side_pending is None and worker.log == []
 
 
 # ----- finishing a step -----------------------------------------------------
@@ -255,50 +259,47 @@ def test_nothing_ready_launches_nothing():
 @pytest.mark.parametrize("step", [_step([1], landed=False), _step([1], done=False)], ids=["running", "launching"])
 def test_a_step_still_running_is_left_alone(step):
     worker = _worker()
-    lane = SideStepLane(worker)
-    lane.pending = step
+    worker.pipeline.side_pending = step
 
-    lane.finish()
+    worker.pipeline._finish_side()
 
-    assert lane.pending is step and worker.log == []
+    assert worker.pipeline.side_pending is step and worker.log == []
 
 
 def test_postprocess_runs_after_the_step_has_landed_and_its_flags_are_down():
     worker = _worker()
-    lane = SideStepLane(worker)
-    lane.pending = _step([1, 2])
-    worker._hold_rows(SIDE_LANE, {1, 2})
-    worker._hold_rows(CHAIN_LANE, {9})
+    pipeline = worker.pipeline
+    pipeline.side_pending = _step([1, 2])
+    pipeline._hold_rows(SIDE_LANE, {1, 2})
+    pipeline._hold_rows(CHAIN_LANE, {9})
 
-    lane.finish()
+    pipeline._finish_side()
 
     assert worker.log == [
         "wait for step", "clear in flight", "clear limit",
         ("postprocess", "outputs of [1, 2]", {"clear_loop_stops": False}),
     ]
-    assert lane.pending is None and worker._in_flight_rids == {9}
+    assert pipeline.side_pending is None and pipeline.in_flight_rids == {9}
 
 
 def test_a_row_the_chain_still_holds_stays_in_flight():
-    worker = _worker()
-    lane = SideStepLane(worker)
-    lane.pending = _step([1, 2])
-    worker._hold_rows(SIDE_LANE, {1, 2})
-    worker._hold_rows(CHAIN_LANE, {2})
+    pipeline = _worker().pipeline
+    pipeline.side_pending = _step([1, 2])
+    pipeline._hold_rows(SIDE_LANE, {1, 2})
+    pipeline._hold_rows(CHAIN_LANE, {2})
 
-    lane.finish()
+    pipeline._finish_side()
 
-    assert worker._in_flight_rids == {2}
+    assert pipeline.in_flight_rids == {2}
 
 
 def test_block_waits_for_a_step_still_running():
     """Postprocess frees the step's inputs, main-stream allocations a
     main-stream step could reuse while this one still reads them."""
     worker = _worker()
-    lane = SideStepLane(worker)
-    lane.pending = _step([1], landed=False)
+    worker.pipeline.side_pending = _step([1], landed=False)
 
-    lane.finish(block=True)
+    worker.pipeline._finish_side(block=True)
 
     assert worker.log[0] == "wait for step"
     assert ("postprocess", "outputs of [1]", {"clear_loop_stops": False}) in worker.log
@@ -306,10 +307,9 @@ def test_block_waits_for_a_step_still_running():
 
 def test_failed_rows_are_reported_before_the_step_routes():
     worker = _worker()
-    lane = SideStepLane(worker)
-    lane.pending = _step([1, 2], failed={2: "boom"})
+    worker.pipeline.side_pending = _step([1, 2], failed={2: "boom"})
 
-    lane.finish()
+    worker.pipeline._finish_side()
 
     assert worker.log.index(("fail", [2])) < worker.log.index(
         ("postprocess", "outputs of [1, 2]", {"clear_loop_stops": False}),
@@ -319,7 +319,7 @@ def test_failed_rows_are_reported_before_the_step_routes():
 # ----- the chain's postprocess order ----------------------------------------
 
 def _chain_worker():
-    """A real ``_postprocess_batch`` whose runtime keeps pending stops as the real ones do."""
+    """A real ``StepExecutor.postprocess`` whose runtime keeps pending stops as the real ones do."""
     w = _postprocess_worker(refuse=set())
     stops = {0}
 
@@ -346,8 +346,8 @@ def test_a_side_step_between_two_chain_steps_leaves_the_loop_stop_in_place():
     past_the_stop, outputs = _lane_step([0, 1], CHAIN_LANE)
     past_the_stop.speculative_new_iter = True
 
-    w._finish_step(side, side_outputs)
-    w._finish_step(past_the_stop, outputs)
+    w.pipeline._finish_step(side, side_outputs)
+    w.pipeline._finish_step(past_the_stop, outputs)
 
     assert w.log.routed == [[5], [1]]
 
@@ -356,7 +356,7 @@ def test_the_chain_still_clears_its_stops():
     w = _chain_worker()
     step, outputs = _lane_step([1], CHAIN_LANE)
 
-    w._finish_step(step, outputs)
+    w.pipeline._finish_step(step, outputs)
 
     assert w._graph_runtime.pending_loop_stop_rids([], "decode") == set()
 
@@ -371,56 +371,54 @@ def _raising_step(rids):
 
 def test_a_step_that_raised_fails_its_own_rows_and_clears_out():
     worker = _worker()
-    lane = SideStepLane(worker)
-    lane.pending = _raising_step([3])
-    worker._hold_rows(SIDE_LANE, {3})
-    worker._hold_rows(CHAIN_LANE, {9})
+    pipeline = worker.pipeline
+    pipeline.side_pending = _raising_step([3])
+    pipeline._hold_rows(SIDE_LANE, {3})
+    pipeline._hold_rows(CHAIN_LANE, {9})
 
-    lane.finish()
+    pipeline._finish_side()
 
     assert ("fail", [3]) in worker.log and "clear in flight" in worker.log
-    assert lane.pending is None and worker._in_flight_rids == {9}
+    assert pipeline.side_pending is None and pipeline.in_flight_rids == {9}
 
 
-def test_a_step_that_could_not_launch_fails_its_rows():
+def test_a_step_that_could_not_launch_fails_its_rows(monkeypatch):
     worker = _worker()
     worker.scheduler.next_batch = lambda lane=CHAIN_LANE: _batch([3])
 
     def refuse(batch):
         raise RuntimeError("boom")
 
-    worker._build_executing_batch = refuse
-    lane = SideStepLane(worker)
+    _stub_build(monkeypatch, refuse)
+    pipeline = worker.pipeline
 
-    lane.launch(None)
+    pipeline._launch_side()
 
-    assert ("fail", [3]) in worker.log and lane.pending is None and worker._in_flight_rids == set()
+    assert ("fail", [3]) in worker.log and pipeline.side_pending is None and pipeline.in_flight_rids == set()
 
 
 def test_a_main_loop_error_leaves_the_side_step_to_finish():
-    w = _worker()
+    pipeline = _worker().pipeline
     failed = []
-    w._fail_requests = failed.append
-    lane = w._side_steps = SideStepLane(w)
-    side = lane.pending = _step([3])
-    w._hold_rows(SIDE_LANE, {3})
-    w._hold_rows(CHAIN_LANE, {1})
+    pipeline._fail_requests = failed.append
+    side = pipeline.side_pending = _step([3])
+    pipeline._hold_rows(SIDE_LANE, {3})
+    pipeline._hold_rows(CHAIN_LANE, {1})
 
-    w._handle_main_loop_error(RuntimeError("boom"), (_step([1], lane=CHAIN_LANE), None), None)
+    pipeline._handle_error(RuntimeError("boom"), (_step([1], lane=CHAIN_LANE), None), None)
 
-    assert set(failed[0]) == {1} and lane.pending is side and w._in_flight_rids == {1, 3}
+    assert set(failed[0]) == {1} and pipeline.side_pending is side and pipeline.in_flight_rids == {1, 3}
 
 
 def test_a_row_in_both_steps_fails_with_the_chain():
-    w = _worker()
+    pipeline = _worker().pipeline
     failed = []
-    w._fail_requests = failed.append
-    lane = w._side_steps = SideStepLane(w)
-    lane.pending = _step([1])
-    w._hold_rows(SIDE_LANE, {1})
-    w._hold_rows(CHAIN_LANE, {1})
+    pipeline._fail_requests = failed.append
+    pipeline.side_pending = _step([1])
+    pipeline._hold_rows(SIDE_LANE, {1})
+    pipeline._hold_rows(CHAIN_LANE, {1})
 
-    w._handle_main_loop_error(RuntimeError("boom"), (_step([1], lane=CHAIN_LANE), None), None)
+    pipeline._handle_error(RuntimeError("boom"), (_step([1], lane=CHAIN_LANE), None), None)
 
     assert set(failed[0]) == {1}
 
