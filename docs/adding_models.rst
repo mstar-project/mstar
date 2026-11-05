@@ -2102,8 +2102,8 @@ For example, the Orpheus LLM submodule captures a batched ``decode`` graph and a
 An ``ARNodeSubmodule`` takes a ``prefill_token_buckets`` constructor argument, which
 replaces its class's ``PREFILL_TOKEN_BUCKETS`` for that instance: a model passes a
 deployment's ``model_kwargs.prefill_token_buckets`` through to it (Qwen3.5, Muse
-Glimmer, Qwen3-Omni and GLM-5.2 do). It must be a non-empty list of distinct positive token counts, or the
-submodule raises ``ValueError`` when it is built.
+Glimmer, Qwen3-Omni and GLM-5.2 do). It must be a non-empty list of distinct positive
+token counts, or the submodule raises ``ValueError`` when it is built.
 
 BAGEL shows the case of two captures for one walk. It captures ``decode`` twice, once with
 ``additional_key_info=False`` and once with ``additional_key_info=True``. A decode step
@@ -3064,8 +3064,8 @@ submodule cache and where the files come from. A model sets ``NAME`` and
 ``config``, ``tokenizer`` and ``media``), its resources (the sampler from
 ``_sampler_spec``; ``MIXED_SPLIT`` is the attention
 resources' split of a mixed step), ``_prompt_ids`` and ``_create_submodule``, which
-hands the LLM node ``self.prefill_token_buckets`` (``model_kwargs.prefill_token_buckets``). ``media`` holds a ``MediaIntake`` per attachment modality: its
-``MediaEncoder`` (modalities may share one), its placeholder ``pad`` id, the sentinels
+hands the LLM node ``self.prefill_token_buckets`` (``model_kwargs.prefill_token_buckets``).
+``media`` holds a ``MediaIntake`` per attachment modality: its ``MediaEncoder`` (modalities may share one), its placeholder ``pad`` id, the sentinels
 a template leaves to its processor, how many placeholders an attachment fills
 (``runs``, one by default; a Qwen3.5 video fills one per temporal group), and
 ``prepare``, which turns an attachment into the encoder's input tensors and each
@@ -3073,11 +3073,10 @@ placeholder's tokens (a ``PreparedMedia``). ``_prompt_ids`` renders and tokenize
 whole prompt once. ``intake`` then refuses a prompt whose placeholders don't match its
 attachments, prepares each attachment in prompt order, expands each placeholder to one
 pad per token with ``expand_media_pads``, and ``process_prompt`` returns the pads'
-layout as ``MEDIA_LAYOUT`` metadata and ``"kv_layout": self.kv_layout(layout, length,
-advance)``. The layout's runs say which encoders the prompt runs (``media_encoders``), for
+layout as ``MEDIA_LAYOUT`` metadata and ``"kv_layout": self.kv_layout(layout, length)``. The layout's runs say which encoders the prompt runs (``media_encoders``), for
 the prefill schedule's walk and the KV layout's alike.
-``advance``, how far the prompt moves the position counter, defaults to the prompt's
-length; under Qwen-style MRoPE it is the positions' extent instead, an image spanning
+``kv_layout``'s ``advance``, how far the prompt moves the position counter, defaults to
+the prompt's length; under Qwen-style MRoPE it is the positions' extent instead, an image spanning
 ``max(h', w')`` positions rather than its tokens, which Qwen3.5 computes from the
 runs' grids in its ``kv_layout`` override. ``process_prompt`` also empties each sent
 attachment's raw ``<modality>_inputs``, spent once prepared. The encoders' inputs are

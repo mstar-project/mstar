@@ -240,7 +240,9 @@ def test_vision_frames_and_deepstack_match_hf(vision_pair, grid, replayed):
 
 def test_two_requests_in_one_vision_step_each_get_their_rows(vision_pair):
     """Packed in one step, each request gets its own slice of the embeddings
-    and of every deepstack feature."""
+    and of every deepstack feature. Qwen3-Omni serves one request a step; this
+    pins the shared encoder's split (Qwen3.5 packs eight) on the outputs a
+    tower with deepstack adds."""
     hf, sub, ragged = vision_pair
     patch_numel = 3 * VISION["temporal_patch_size"] * VISION["patch_size"] ** 2
     grids = [torch.tensor([[1, 4, 6]]), torch.tensor([[1, 2, 2], [1, 4, 4]])]
