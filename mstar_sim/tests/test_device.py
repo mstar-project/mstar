@@ -943,7 +943,8 @@ def test_tensor_parallel_ranks_meet_at_each_collective():
         def rank(r, path):
             dist.init_process_group("nccl", init_method=f"file://{path}", rank=r, world_size=4)
             torch.cuda.set_device(r)
-            tp = [dist.new_group(ranks) for ranks in ([0, 1], [2, 3])][r // 2]
+            tps = [dist.new_group(ranks) for ranks in ([0, 1], [2, 3])]
+            tp = tps[r // 2]
             sp = [dist.new_group(ranks) for ranks in ([0, 2], [1, 3])][r % 2]
             x, y = torch.empty(1 << 14, device="cuda"), torch.empty(1 << 14, device="cuda")
             graph = torch.cuda.CUDAGraph()
@@ -964,6 +965,20 @@ def test_tensor_parallel_ranks_meet_at_each_collective():
                 dist.send(nxt, group_dst=0, group=tp)
             else:
                 assert dist.recv(prv, group=tp) == r + 1 and prv.tolist() == [r + 1.0] * 4
+            # on a group this rank isn't in nothing runs, and torch answers
+            outside = tps[1 - r // 2]
+            assert dist.irecv(prv, group_src=0, group=outside) is None
+            assert dist.recv(prv, group_src=0, group=outside) == -1
+            assert dist.isend(prv, group_dst=0, group=outside) is None
+            assert dist.all_reduce(prv, group=outside) is None
+            # what a call's thread raises reaches its wait, not just stderr
+            from mstar_sim.dist import _Posted
+            failed = _Posted(lambda: 1 // 0)
+            try:
+                failed.wait()
+                raise SystemExit("a failed call reported success")
+            except ZeroDivisionError:
+                assert not failed.is_success()
             summed = torch.full((4,), r + 1.0, device="cuda")
             set_never_computed(summed._data, r == 1)
             dist.reduce(summed, dst=0)

@@ -188,23 +188,32 @@ _PAYLOAD_TAGS = itertools.count(1 << 30)
 class _Posted(_Done):
     """The ``Work`` of a point-to-point call. ``finish``, which returns the rank (in the group)
     it heard from, runs on its own thread, as gloo's progress does: a receive has to post for
-    its payload once the descriptor comes, and its peer's ``wait`` can't hang on this rank's."""
+    its payload once the descriptor comes, and its peer's ``wait`` can't hang on this rank's.
+    What it raises is raised at the wait."""
 
     def __init__(self, finish):
         def run():
-            self._source = finish()
+            try:
+                self._source = finish()
+            except Exception as e:  # noqa: BLE001 - for the caller's thread
+                self._error = e
 
-        self._source = None
+        self._source = self._error = None
         self._thread = threading.Thread(target=run, name="mstar_sim-point-to-point", daemon=True)
         self._thread.start()
 
     def wait(self, timeout=None):
         with _waiting():
             self._thread.join()
+        if self._error is not None:
+            raise self._error
         return True
 
     def is_completed(self):
         return not self._thread.is_alive()
+
+    def is_success(self):
+        return self._error is None
 
     def get_future(self):
         self.wait()
@@ -317,6 +326,8 @@ def _collective(name: str, family: str, primitive: str | None):
         bound.apply_defaults()
         a = bound.arguments
         group = a.get("group")
+        if dist.distributed_c10d._rank_not_in_group(group):
+            return real(*args, **kwargs)  # nothing runs on this rank: torch's own answer
         nbytes = max(t.numel() * t.element_size() for t in tensors)
         outputs = [] if name in _ONLY_READS else _sim_tensors((a[first],), {})
         root = next((a[k] for k in ("src", "dst", "group_src", "group_dst") if a.get(k) is not None), -1)
