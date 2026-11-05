@@ -555,9 +555,9 @@ def test_a_retry_after_a_timeout_runs_behind_the_slow_workers_rollback(paths):
         ["worker_0", "worker_1"], send, clock=lambda: clock.now,
     )
     gate, store = threading.Event(), d.pools["worker_1"].store
-    read = store._read
-    store._read = lambda name, path: (gate.wait(30), read(name, path))[1]
-    digest = LoraAdapterStore(make_spec({}), pin=False).read("a1", paths["a1"]).digest.hex()
+    read = store.read
+    store.read = lambda name, path, digest: (gate.wait(30), read(name, path, digest))[1]
+    digest = adapter_digest(read_lora_file(paths["a1"])).hex()
     d.ops.load(LoadLoraAdapter(op_id="op1", lora_name="a1", lora_path=paths["a1"], lora_digest=digest))
     _finish_when_read(d.workers["worker_0"])
     clock.now = 10.0

@@ -370,7 +370,7 @@ def test_a_runtime_load_keeps_no_copy_until_a_request_names_it(adapters):
         adapter = read(*args)
         copies.append(weakref.ref(adapter))
         return adapter
-    digests = {n: LoraAdapterStore(pool.spec, pin=False).read(n, paths[n]).digest for n in ("a1", "a2", "a3")}
+    digests = {n: adapter_digest(read_lora_file(paths[n])) for n in ("a1", "a2", "a3")}
     pool.store.read = tracked
     for name in ("a1", "a2", "a3"):
         pool.load_adapter(name, paths[name], digests[name])
@@ -736,8 +736,8 @@ def test_a_request_on_a_resident_adapter_waits_for_its_host_copy(adapters):
     runner.remove_request("h")
     ingest(pool, "x", "a2")  # drops a1 from the tier
     settle_reads(pool)
-    gate, read = threading.Event(), pool.store._read
-    pool.store._read = lambda name, path: gate.wait(10) and read(name, path)
+    gate, read = threading.Event(), pool.store.read
+    pool.store.read = lambda name, path, digest: gate.wait(10) and read(name, path, digest)
     ingest(pool, "r", "a1")
     assert pool.resident_slot("a1") is not None and "a1" not in pool.store
     assert runner.admit_retrieve("r", "LLM", "decode").queued
@@ -752,14 +752,14 @@ def test_a_request_whose_read_fails_fails_without_waiting_for_a_slot(adapters):
     _, paths = adapters
     pool = make_pool(paths, max_slots=1, cpu_capacity=1)
     runner = lora_runner(pool)
-    gate, read = threading.Event(), pool.store._read
+    gate, read = threading.Event(), pool.store.read
 
-    def unreadable(name, path):
+    def unreadable(name, path, digest):
         if name == "a2":
             gate.wait(10)
             raise OSError("a2 is unreadable")
-        return read(name, path)
-    pool.store._read = unreadable
+        return read(name, path, digest)
+    pool.store.read = unreadable
     for rid, name in [("r1", "a1"), ("r2", "a2")]:
         ingest(pool, rid, name)
     assert admitted(runner, "r1") and run_step(pool, ["r1"]).ok
@@ -777,14 +777,14 @@ def test_a_request_let_through_on_a_failed_read_takes_no_slot_a_counted_one_need
     _, paths = adapters
     pool = make_pool(paths, max_slots=2, cpu_capacity=1)
     runner = lora_runner(pool)
-    gate, read = threading.Event(), pool.store._read
+    gate, read = threading.Event(), pool.store.read
 
-    def unreadable(name, path):
+    def unreadable(name, path, digest):
         if name == "a2":
             gate.wait(10)
             raise OSError("a2 is unreadable")
-        return read(name, path)
-    pool.store._read = unreadable
+        return read(name, path, digest)
+    pool.store.read = unreadable
     for rid, name in [("r1", "a1"), ("rB", "a3")]:
         ingest(pool, rid, name)
     settle_reads(pool)
@@ -811,13 +811,13 @@ def test_a_request_on_a_resident_adapter_whose_read_failed_still_counts_a_slot(a
     runner.remove_request("h")
     ingest(pool, "x", "a2")  # drops a1 from the tier
     settle_reads(pool)
-    read = pool.store._read
+    read = pool.store.read
 
-    def unreadable(name, path):
+    def unreadable(name, path, digest):
         if name == "a1":
             raise OSError("a1 is unreadable")
-        return read(name, path)
-    pool.store._read = unreadable
+        return read(name, path, digest)
+    pool.store.read = unreadable
     for rid, name in [("r", "a1"), ("y", "a3")]:
         ingest(pool, rid, name)
     settle_reads(pool)
