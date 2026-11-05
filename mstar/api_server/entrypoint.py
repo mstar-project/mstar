@@ -2050,7 +2050,9 @@ app.add_middleware(BodyLimitMiddleware)
 # answers browser preflights (which carry no credentials) and still stamps its
 # headers on a 401, and an unauthenticated request is refused before its body
 # is read.
-api_key_guard = APIKeyGuard(resolve_api_key())
+api_key_guard = APIKeyGuard(
+    resolve_api_key(), serves_openpi=lambda: getattr(api_server, "openpi_policy", None) is not None,
+)
 app.add_middleware(APIKeyMiddleware, guard=api_key_guard)
 # Outside the key check and the body limit, which refuse before routing, and
 # inside CORS, so a browser preflight is not counted. ``routes`` must list
@@ -2773,7 +2775,10 @@ async def health_check():
 
 @app.get("/healthz", include_in_schema=False)
 async def healthz():
-    """``/health`` as openpi's policy server answers its probe."""
+    """``/health`` as openpi's policy server answers its probe, on a server that
+    serves the openpi socket; elsewhere there is no such route."""
+    if getattr(api_server, "openpi_policy", None) is None:
+        raise HTTPException(status_code=404, detail="Not Found")
     await health_check()
     return PlainTextResponse("OK\n")
 

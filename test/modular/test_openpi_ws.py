@@ -318,21 +318,51 @@ def test_healthz_answers_as_openpi_does(served):
     assert r.status_code == 200 and r.text == "OK\n"
 
 
-def test_api_key_scheme_of_openpi_client(served):
+def test_healthz_is_not_served_without_an_openpi_block(monkeypatch):
+    monkeypatch.setattr(entrypoint, "api_server", _FakeServer(None))
+    assert TestClient(entrypoint.app).get("/healthz").status_code == 404
+
+
+@pytest.fixture
+def keyed():
     entrypoint.api_key_guard.set("k3y")
-    try:
-        client = TestClient(entrypoint.app)
-        assert client.get("/healthz").status_code == 200
-        with pytest.raises(WebSocketDisconnect):
-            with client.websocket_connect("/"):
-                pass
-        with client.websocket_connect("/", headers={"Authorization": "Api-Key k3y"}) as ws:
+    yield TestClient(entrypoint.app)
+    entrypoint.api_key_guard.set(auth.resolve_api_key())
+
+
+API_KEY = {"Authorization": "Api-Key k3y"}
+
+
+def test_openpi_client_conventions_where_the_socket_is_served(served, keyed):
+    assert keyed.get("/healthz").status_code == 200  # no key, as openpi's server probes
+    with pytest.raises(WebSocketDisconnect):
+        with keyed.websocket_connect("/"):
+            pass
+    for headers in (API_KEY, {"Authorization": "Bearer k3y"}):
+        with keyed.websocket_connect("/", headers=headers) as ws:
             assert _openpi_unpack(ws.receive_bytes()) == {}
-        guard = auth.APIKeyGuard("k3y")
-        assert guard.accepts([(b"authorization", b"api-key k3y")])
-        assert not guard.accepts([(b"authorization", b"Api-Key wrong")])
-    finally:
-        entrypoint.api_key_guard.set(auth.resolve_api_key())
+    with pytest.raises(WebSocketDisconnect):
+        with keyed.websocket_connect("/", headers={"Authorization": "Api-Key wrong"}):
+            pass
+
+
+def test_the_api_key_scheme_stays_on_the_openpi_socket(served, keyed):
+    """Every other route takes only Bearer, on a server with the socket too."""
+    assert keyed.get("/v1/models", headers=API_KEY).status_code == 401
+    assert keyed.post("/generate", headers=API_KEY).status_code == 401
+    with pytest.raises(WebSocketDisconnect) as refused:
+        with keyed.websocket_connect("/generate/ws", headers=API_KEY):
+            pass
+    assert refused.value.code == 1008
+
+
+def test_without_an_openpi_block_neither_convention_applies(monkeypatch, keyed):
+    monkeypatch.setattr(entrypoint, "api_server", _FakeServer(None))
+    assert keyed.get("/healthz").status_code == 401
+    with pytest.raises(WebSocketDisconnect) as refused:
+        with keyed.websocket_connect("/", headers=API_KEY):
+            pass
+    assert refused.value.code == 1008 and refused.value.reason == "invalid API key"
 
 
 def _free_port() -> int:

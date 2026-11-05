@@ -114,7 +114,7 @@ A deployment whose config has an `openpi:` block (`configs/pi05_droid.yaml`) als
 - A call that fails is answered with a text frame holding the error, which the client raises, and the socket closes with `1011`.
 - An observation may carry `seed` (an int), which openpi does not have. It pins the call's noise, as `seed` in `/generate`'s `model_kwargs` does. Without it each call gets a fresh seed.
 
-`GET /healthz` answers `OK` as openpi's server does, and with `--api-key` the handshake takes `Authorization: Api-Key <key>` (what the client sends for `api_key`) as well as `Bearer`. A server without an `openpi:` block refuses the handshake. Only the Python frontend serves this route; `--rust-frontend` logs a warning and serves without it.
+On a server with the block, `GET /healthz` answers `OK` without a key, as openpi's server does, and with `--api-key` the handshake takes `Authorization: Api-Key <key>` (what the client sends for `api_key`) as well as `Bearer`. Every other route still takes only `Bearer`. A server without the block has none of this: it refuses the handshake and has no `/healthz`. Only the Python frontend serves this route; `--rust-frontend` logs a warning and serves without it.
 
 ```python
 from openpi_client import websocket_client_policy

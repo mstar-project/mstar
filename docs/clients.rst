@@ -241,11 +241,12 @@ as M*'s is. The protocol:
   call's noise, as ``seed`` in ``/generate``'s ``model_kwargs`` does. Without it each call
   gets a fresh seed.
 
-``GET /healthz`` answers ``OK`` as openpi's server does, and with ``--api-key`` the
-handshake takes ``Authorization: Api-Key <key>`` (what the client sends for ``api_key``)
-as well as ``Bearer``. A server without an ``openpi:`` block refuses the handshake. Only
-the Python frontend serves this route; ``--rust-frontend`` logs a warning and serves
-without it.
+On a server with the block, ``GET /healthz`` answers ``OK`` without a key, as openpi's
+server does, and with ``--api-key`` the handshake takes ``Authorization: Api-Key <key>``
+(what the client sends for ``api_key``) as well as ``Bearer``. Every other route still
+takes only ``Bearer``. A server without the block has none of this: it refuses the
+handshake and has no ``/healthz``. Only the Python frontend serves this route;
+``--rust-frontend`` logs a warning and serves without it.
 
 .. code-block:: python
 
