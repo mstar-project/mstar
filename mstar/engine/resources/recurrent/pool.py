@@ -659,8 +659,9 @@ class RecurrentStatePool(Resource):
                         # the backend already wrote the pool; a later step resumes
                         slot.has_state = True
                         self._version += 1
-                    slot.tokens += segment.span
-                    # a row too short to checkpoint that ends on a page (a decode step) is saved here, after its forward
+                    slot.tokens += ctx.run_span(segment.span)
+                    # a row too short to checkpoint that ends on a page (a decode step) is saved here, after its
+                    # forward. A step that repeats saves only the page it ends on: the state between is gone
                     if page and segment.span < page and not slot.tokens % page:
                         self._save_decode(segment.request_id, segment.label, slot)
             if self._snap_writes:

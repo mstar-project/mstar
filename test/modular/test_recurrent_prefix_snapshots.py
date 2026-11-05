@@ -601,10 +601,11 @@ def test_a_prefill_that_never_commits_gives_its_snapshot_slots_back(release):
     assert not pool._snap_writes and len(pool._snap_free) == 2
 
 
-def _decode(pool: RecurrentStatePool, rid: str, steps: int, value: float = 0.0) -> None:
-    """Run ``steps`` one-token steps, each leaving ``value`` in the request's state."""
+def _decode(pool: RecurrentStatePool, rid: str, steps: int, value: float = 0.0, repeats: int = 1) -> None:
+    """Run ``steps`` one-token steps of ``repeats`` iterations, each leaving ``value`` in the request's state."""
     for _ in range(steps):
         step, ctx = _step(rid, 1), _ctx(rid)
+        ctx.repeats = repeats
         assert pool.admit(step, ctx).ok
         pool.plan(step, ctx)
         _state(pool, rid).fill_(value)
@@ -626,6 +627,20 @@ def test_a_decode_step_onto_a_page_boundary_saves_its_state():
     assert decode.tokens == 4 and decode.key == pool._kv.chain_key("a", "main", 1)
     assert pool._snap_by_key[decode.key] == decode.slot
     assert bool((pool._blocks["state"][:, decode.slot] == 3.0).all()), "the snapshot is not the state at 4"
+
+
+def test_a_repeated_step_saves_its_state_under_the_length_it_reached():
+    """A later prompt resumes from a snapshot at the length it is filed under,
+    so a run counts every iteration, and saves only if it ends on a page."""
+    pool = _pool()
+    _reply(pool)
+    _decode(pool, "a", 1, repeats=3)
+    assert pool._slots["a"]["main"].tokens == 6
+    assert not pool._decode, "a run that ended past a page saved a state that isn't the page's"
+    _decode(pool, "a", 1, value=3.0, repeats=2)
+    decode = pool._decode[("a", "main")]
+    assert decode.tokens == 8 and decode.key == pool._kv.chain_key("a", "main", 2)
+    assert bool((pool._blocks["state"][:, decode.slot] == 3.0).all()), "the snapshot is not the state at 8"
 
 
 def test_a_decode_snapshot_is_filed_once_the_chain_keys_its_page():

@@ -2006,7 +2006,7 @@ class KVManager(AttentionResource):
         # reservation covers them.
         # only a post-fork reads the growth, so a decode step does not build it
         growth = (
-            self._label_growth(step) if step.commit and step.post_forks else {}
+            self._label_growth(step, ctx) if step.commit and step.post_forks else {}
         )
         forks = [(pre, 0) for pre in step.pre_forks] + [
             (post, growth) for post in step.post_forks
@@ -2089,8 +2089,7 @@ class KVManager(AttentionResource):
             # chunked row reserves ahead, so those steps take every row here.
             ready: list[CacheStream] = []
             rows = step.segments
-            repeats = ctx.repeats
-            if not ctx.capture and not ahead and repeats == 1 and len(self._groups) == 1:
+            if not ctx.capture and not ahead and ctx.repeats == 1 and len(self._groups) == 1:
                 ready, slow = self._arena.admit_rows(streams, rows, ctx.real_rows(), sink or None, page_size)
                 rows = [rows[i] for i in slow]
             for segment in rows:
@@ -2109,7 +2108,7 @@ class KVManager(AttentionResource):
                     stream = self._ensure_label(rid, label)
                 marked.append((segment, stream))
                 # a chunked row reserves the rest of its walk up front, in every group
-                span = segment.span * repeats
+                span = ctx.run_span(segment.span)
                 if ahead and reserve_ahead.holds_for(rid):
                     span += ahead.get(rid, 0)
                 seq_len = span + stream.stored_len
@@ -2194,7 +2193,7 @@ class KVManager(AttentionResource):
                 pages = () if part is None else part.page_indices
                 stored = 0 if part is None else part.stored_len
                 # as `admit` reserves it: a chunked row's whole walk
-                more = -(-(stored + segment.span + walk_ahead) // group.page_size) - len(pages)
+                more = -(-(stored + ctx.run_span(segment.span) + walk_ahead) // group.page_size) - len(pages)
                 key = (rid, segment.label, g)
                 needed[key] = max(needed.get(key, 0), more)
         extra: dict[str, int] = {}
@@ -3268,7 +3267,7 @@ class KVManager(AttentionResource):
                 # tokens (image_gen, action_gen) still read these pages, and
                 # leaving the mark set would make the request unevictable
                 stream.step_in_flight = False
-                span = segment.span * repeats
+                span = ctx.run_span(segment.span)
                 if step.commit and span > 0:
                     # an offload beat the mark (claimed before this step's
                     # admit). the host copy predates the span, so writing the
@@ -3316,7 +3315,7 @@ class KVManager(AttentionResource):
                         # pages changed (`_fast_decode_plan`): this touches no epoch.
                         self._apply_retention(segment.request_id, stream, group.retention, g, touch=False)
                     if windows and segment.request_id in self._allotments:
-                        self._settle_window_allotment(segment, stream)
+                        self._settle_window_allotment(segment, stream, span)
                     # The step's retention, if it declared one: drop what aged
                     # past the context budget now that this step's tokens
                     # count. Here, under the lock and before `commit_done`
@@ -3428,7 +3427,7 @@ class KVManager(AttentionResource):
             self._touch_plan_cache(rid)
         return self._release_oldest_locked(rid, stream, excess, policy.protected_prefix, group)
 
-    def _settle_window_allotment(self, segment: Segment, stream: CacheStream) -> None:
+    def _settle_window_allotment(self, segment: Segment, stream: CacheStream, span: int) -> None:
         """On the commit that writes the last of a stream's prompt, drop its window groups' share of
         the allotment to the pages they hold. The allotment covers the prompt, and the pages a window
         released while the prompt filled stayed in it for the prompt's later steps; past the prompt a
@@ -3442,7 +3441,7 @@ class KVManager(AttentionResource):
         prompt = sum(span.length for span in layout.spans)
         written = stream.stored_len + stream.released
         overrides = self._overrides[rid]
-        if not written - segment.span < prompt <= written or segment.label not in overrides.opened_labels(self._nodes):
+        if not written - span < prompt <= written or segment.label not in overrides.opened_labels(self._nodes):
             return
         caps = dict.fromkeys(overrides.loop_caps or (), 0)
         allotment = self._allotments[rid]
@@ -4507,12 +4506,12 @@ class KVManager(AttentionResource):
         return not stream.read_pending, None
 
     @staticmethod
-    def _label_growth(step: KVStep) -> dict[tuple[str, str], int]:
+    def _label_growth(step: KVStep, ctx: StepContext) -> dict[tuple[str, str], int]:
         """(rid, label) -> what this step's commit adds to that stream."""
         growth: dict[tuple[str, str], int] = {}
         for segment in step.segments:
             key = (segment.request_id, segment.label)
-            growth[key] = growth.get(key, 0) + segment.span
+            growth[key] = growth.get(key, 0) + ctx.run_span(segment.span)
         return growth
 
     def _reserve_fork(

@@ -137,6 +137,11 @@ class StepContext:
     # before reserving by ``chunk_tokens_after``.
     reserve_whole_prefill: PerReqSetting = ALL_SET
 
+    def run_span(self, span: int) -> int:
+        """What ``span`` a replay comes to over the step: read this, not
+        ``span``, for anything counted per step rather than per replay."""
+        return span * self.repeats
+
     def walk_of(self, rid: int) -> str:
         return self.request_walks.get(rid, self.graph_walk)
 
