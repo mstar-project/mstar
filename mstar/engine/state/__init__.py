@@ -43,6 +43,7 @@ from mstar.engine.state.contract import (
     Value,
     Window,
 )
+from mstar.engine.state.state_op import state_op
 
 # `kernel_setting` and `SubmoduleStep` stay out of `__all__`, whose names can't be removed after release.
 # `kernel_setting` is temporary. `SubmoduleStep` is the engine's own dataclass, and the rebuild after release replaces
@@ -83,4 +84,5 @@ __all__ = [
     "positions",
     "rope",
     "sample",
+    "state_op",
 ]

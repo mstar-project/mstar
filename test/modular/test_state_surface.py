@@ -226,6 +226,14 @@ SNAPSHOT = {
         ["q", "POSITIONAL_OR_KEYWORD", None],
         ["k", "POSITIONAL_OR_KEYWORD", None],
     ],
+    "state_op": [
+        ["adds", "KEYWORD_ONLY", "()"],
+        ["writes", "KEYWORD_ONLY", "()"],
+        ["reads", "KEYWORD_ONLY", "()"],
+        ["mutates", "KEYWORD_ONLY", "()"],
+        ["formats", "KEYWORD_ONLY", None],
+        ["reference", "KEYWORD_ONLY", None],
+    ],
     "sample": [
         ["s", "POSITIONAL_OR_KEYWORD", None],
         ["logits", "POSITIONAL_OR_KEYWORD", None],

@@ -29,6 +29,8 @@ class ArrayHandle(StepHandle):
     ):
         self.array = array
         self.host_fields = host_fields
+        # the state ops whose fused kernel can write this array's pages (`bind_state_ops`)
+        self.fused_ops: frozenset[str] = frozenset()
         self.name = array.name
         self.label = "main"
         self.reads = {key: resources[key] for key in array.reads}
@@ -62,6 +64,7 @@ class ArrayHandle(StepHandle):
         # and `_updated` the update calls run.
         self._open = False
         self._keep = True
+        self._capturing = False
         self._held: tuple[torch.Tensor, torch.Tensor] | None = None
         self._held_layer: int | None = None
         self._kept: set[int] = set()
@@ -94,6 +97,7 @@ class ArrayHandle(StepHandle):
             self.label = segments[0].label
         # on a replay too, whose `eager_add` adds still run
         self._keep = declared.keep
+        self._capturing = step.ctx.capture
         for calls in (self._kept, self._scratch, self._read, self._updated):
             calls.clear()
         # before the replay's return, since a captured step's writes reach this on a replay

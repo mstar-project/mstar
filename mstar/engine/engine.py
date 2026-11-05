@@ -53,6 +53,7 @@ from mstar.engine.resources.step import (
 )
 from mstar.engine.state.adapters import node_handles
 from mstar.engine.state.host import HostFields
+from mstar.engine.state.state_op import bind_state_ops
 from mstar.graph.runtime.base import GraphRuntime
 from mstar.model.base import keyed_labels
 from mstar.model.submodule_base import (
@@ -708,6 +709,7 @@ class Engine:
                 sdpa=node_name in self._sdpa_nodes, host_fields=self._host_fields,
             )
             if handles:
+                bind_state_ops(handles)
                 submodule.bind_node_state(handles)
             self._submodules[node_name].lora_pools = tuple(
                 resources[key] for key in getattr(submodule, "lora_keys", ())
