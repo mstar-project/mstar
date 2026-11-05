@@ -9,6 +9,10 @@ rank_devices: {0: 0, 1: 0, 2: 0}
 # The three workers' kernels overlap as clients of one MPS daemon, rather than
 # time-slicing the GPU.
 mps: true
+# Text and spoken replies decode in one step (`decode_mixed`) rather than taking
+# turns. Mixing is on by default only where the LLM has a token budget, and it
+# has none.
+speculation_mixes_walks: {LLM: true}
 node_groups:
   - node_names: [LLM, vision_encoder, audio_encoder]
     ranks: [0]
