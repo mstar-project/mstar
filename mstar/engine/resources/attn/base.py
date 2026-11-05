@@ -1,9 +1,10 @@
 """The attention resource's shared machinery: the spec-time factory and the
 custom op every backend attends through.
 
-The backends are sibling modules (`flashinfer`, `aiter`, `cross`, `dense`,
-`flex`), and `AttentionManager.build` reaches them by deferred import, so
-naming a backend in a spec does not load the others.
+The backends themselves live beside this — `flashinfer`, `aiter`, `cross`,
+`dense`, `flex` — and `AttentionManager.build` reaches them through the table in
+`backends`, which imports a backend only when it is built, so naming a
+backend in a spec does not load the others.
 """
 
 import logging
@@ -11,25 +12,17 @@ from typing import NamedTuple
 
 import torch
 
+from mstar.engine.resources.attn.backends import ATTN_BACKENDS
 from mstar.engine.resources.attn.config import AttentionSpec, AttnBackend
 from mstar.engine.resources.attn.wrappers import (
     FlashInferDecodeWrapper,
     FlashInferPrefillWrapper,
 )
 from mstar.engine.resources.base import AttentionResource, EngineResourceInfo
-from mstar.engine.resources.kv.config import KVConfig, KVGroup, PagedKVConfig, RingKVConfig
+from mstar.engine.resources.kv.config import KVGroup, PagedKVConfig
 from mstar.engine.resources.kv.keys import fingerprint
-from mstar.platforms import current_platform
 
 logger = logging.getLogger(__name__)
-_BACKEND_KV_CONFIG: dict[AttnBackend, type[KVConfig]] = {
-    AttnBackend.DENSE: PagedKVConfig,
-    AttnBackend.FLASHINFER: PagedKVConfig,
-    AttnBackend.FLASHINFER_MLA: PagedKVConfig,
-    AttnBackend.FLEX: RingKVConfig,
-    AttnBackend.XPU_PAGED: PagedKVConfig,
-    AttnBackend.AITER: PagedKVConfig,
-}
 
 
 def resolve_attn_backend(
@@ -37,62 +30,11 @@ def resolve_attn_backend(
 ) -> AttnBackend:
     """The concrete backend for ``backend`` on ``device``.
 
-    ``AUTO`` becomes the platform's default. A backend named in the spec or
-    YAML is returned as is. ``page_size``, the paged cache's if there is one,
-    decides between AITER and FlashInfer on ROCm (see ``_rocm_paged_backend``).
+    ``AUTO`` becomes the platform's default (``backends.ATTN_BACKENDS``), which
+    may depend on the paged cache's ``page_size``. A backend named in the spec
+    or YAML is returned as is.
     """
-    if backend is not AttnBackend.AUTO:
-        return backend
-    if current_platform.is_rocm():
-        return _rocm_paged_backend(page_size)
-    return AttnBackend.FLASHINFER
-
-
-def _rocm_paged_backend(page_size: int | None) -> AttnBackend:
-    """AITER's unified attention, unless AITER reads page tails unmasked at this
-    page size and AMD's FlashInfer build (which masks them) is installed."""
-    from mstar.engine.resources.attn import aiter as rocm
-
-    aiter_reason = rocm.aiter_paged_unavailable_reason()
-    flashinfer_reason = rocm.flashinfer_rocm_unavailable_reason()
-    tails_safe = page_size is None or rocm.nan_safe_page_size(page_size)
-    if aiter_reason is None and (tails_safe or flashinfer_reason is not None):
-        return AttnBackend.AITER
-    if flashinfer_reason is None:
-        return AttnBackend.FLASHINFER
-    raise RuntimeError(
-        "No paged attention backend on this ROCm install: AITER's unified "
-        f"attention is not importable ({aiter_reason}), nor is AMD's FlashInfer "
-        f"build ({flashinfer_reason}). Install amd-aiter (AITER) or amd-flashinfer."
-    )
-
-
-def flashinfer_kwargs(kv_config: KVConfig, backend: str, decode_tensor_cores: bool = True) -> dict:
-    """The FlashInfer managers' platform arguments for a spec naming ``backend``
-    and ``decode_tensor_cores`` (``AttentionConfig``'s choice of decode kernel).
-
-    On ROCm only AMD's FlashInfer build runs. Its ``auto`` can't use an AITER
-    kernel at page 128 (it falls back to fa2 after a failed attempt, or gathers
-    per token for prefill), so ``auto`` is pinned to fa2 there. Decode skips
-    tensor cores, the faster path on ROCm, for the GQA groups that kernel
-    dispatches, whatever the spec asked for.
-    """
-    if not current_platform.is_rocm():
-        return {"backend": backend, "decode_tensor_cores": decode_tensor_cores}
-    from mstar.engine.resources.attn import aiter as rocm
-
-    reason = rocm.flashinfer_rocm_unavailable_reason()
-    if reason is not None:
-        raise RuntimeError(
-            "attention backend 'flashinfer' on ROCm needs AMD's FlashInfer build "
-            f"(amd-flashinfer), which is not importable ({reason}); name backend "
-            "'aiter' or 'auto' instead"
-        )
-    group = kv_config.num_qo_heads // kv_config.num_kv_heads
-    return {
-        "backend": "fa2" if backend == "auto" else backend,
-        "decode_tensor_cores": group not in rocm.FLASHINFER_ROCM_DECODE_GROUPS,
-    }
+    return ATTN_BACKENDS.resolve(backend, page_size)
 
 
 class AttentionManager(AttentionResource):
@@ -110,195 +52,16 @@ class AttentionManager(AttentionResource):
 
     @staticmethod
     def _check_window_pool(spec: AttentionSpec, device: torch.device) -> str:
-        """The FlashInfer kernel to read a pool that keeps a window with. Only the kernels that
-        take any page size read its per-group page sizes and strided pages: FA2, and FA3 on
-        SM90 only. ``auto`` picks one of them below SM100, and from SM100 can send short rows
-        without a window to cuDNN, so there it becomes FA2. What doesn't depend on the device
-        is refused before any build (`derive_kv_groups`)."""
-        kernel = spec.config.flashinfer_backend
-        capability = current_platform.cuda_capability(device)
-        sm100 = capability is not None and capability >= (10, 0)
-        # FlashInfer has fa3 for SM90 only
-        fa3 = capability is not None and capability[0] == 9
-        allowed = ("auto", "fa2", "fa3") if fa3 else ("auto", "fa2")
-        if kernel not in allowed:
-            raise ValueError(
-                f"KV {spec.config.kv_cache!r} keeps a window, whose pages only FlashInfer's fa2 and fa3 "
-                f"(SM90 only) kernels read, so flashinfer_backend={kernel!r} can't on this GPU; "
-                f"use {' or '.join(allowed)}"
-            )
-        return "fa2" if sm100 and kernel == "auto" else kernel
+        """The FlashInfer kernel to read a pool that keeps a window with (`backends.window_pool_kernel`)."""
+        from mstar.engine.resources.attn.backends import window_pool_kernel
+
+        return window_pool_kernel(spec, device)
 
     @classmethod
     def build(cls, spec: AttentionSpec, info: EngineResourceInfo):
-        backend = resolve_attn_backend(spec.config.backend, info.device)
-        if spec.config.sliding_window is not None and backend != AttnBackend.FLASHINFER:
-            raise ValueError(
-                f"sliding_window is unsupported for attention backend {backend!r}; "
-                "use the flashinfer backend"
-            )
-        # the KV resource's own config, not a copy; per-rank head counts, and
-        # `shard` is idempotent so both builders can call it
-        kv_config = info.dependency(spec.config.kv_cache).config
-        # AUTO on ROCm picks by the cache's page size (see `_rocm_paged_backend`)
-        backend = resolve_attn_backend(
-            spec.config.backend, info.device, getattr(kv_config, "tokens_per_page", None),
-        )
-        windowed = isinstance(kv_config, PagedKVConfig) and len(kv_config.groups) > 1
-        window = spec.config.sliding_window
-        keeps_window = isinstance(kv_config, PagedKVConfig) and window is not None and window < kv_config.max_seq_len
-        if keeps_window and not windowed:
-            # the pool derives its window from its attentions, which resolving the specs does
-            raise ValueError(
-                f"attention {spec.resource_key!r} declares a sliding_window, but KV {spec.config.kv_cache!r} "
-                "keeps no window: resolve the specs (resolve_spec_dependencies) before building them"
-            )
-        flashinfer_backend = spec.config.flashinfer_backend
-        if windowed:
-            # the backend as resolved for this device; `derive_kv_groups` refuses a declared one
-            # earlier, so validation reports it
-            if backend != AttnBackend.FLASHINFER:
-                raise ValueError(
-                    f"KV {spec.config.kv_cache!r} keeps a window, whose pages only the flashinfer "
-                    f"backend reads, not attention {spec.resource_key!r}'s {backend.value}"
-                )
-            flashinfer_backend = cls._check_window_pool(spec, info.device)
-            if flashinfer_backend != spec.config.flashinfer_backend:
-                logger.info(
-                    "attention %r reads KV %r, which keeps a window: flashinfer_backend=%r "
-                    "runs as %r on this GPU",
-                    spec.resource_key, spec.config.kv_cache, spec.config.flashinfer_backend, flashinfer_backend,
-                )
-        # Before `shard`, so a mismatch is reported rather than half-applied to
-        # a config the KV resource also holds.
-        if backend not in _BACKEND_KV_CONFIG:
-            raise ValueError(f"Unknown attention backend {backend!r}")
-        required = _BACKEND_KV_CONFIG[backend]
-        if not isinstance(kv_config, required):
-            raise TypeError(
-                f"attention backend {backend.value!r} requires a "
-                f"{required.__name__}, but KV resource {spec.config.kv_cache!r} "
-                f"holds a {type(kv_config).__name__}. "
-            )
-        if spec.config.sm_scale is not None and backend != AttnBackend.FLASHINFER_MLA:
-            raise ValueError(
-                f"attention backend {backend.value!r} ignores sm_scale; only "
-                f"{AttnBackend.FLASHINFER_MLA.value!r} reads it"
-            )
-        # `shard` lives on the KVConfig base, so this is unchanged for both.
-        kv_config.shard(info.head_shards)
-        if backend == AttnBackend.DENSE:
-            # A dense backend runs on FlashAttention-3 (AITER on ROCm). Where
-            # that has no kernel for the GPU or does not import, the same pass
-            # runs on FlashInfer's ragged prefill, and where FlashInfer cannot
-            # run either it degrades to the paged backend AUTO picks rather
-            # than failing to serve.
-            # All three are drop-in for each other: the step declaration is
-            # identical (see DenseAttentionManager) and `requires_kv_write`
-            # tells the layer which one it is talking to.
-            from mstar.engine.resources.attn.dense import (
-                DenseAttentionManager,
-                _dense_unavailable_reason,
-                _warn_dense_fallback,
-            )
-            from mstar.engine.resources.attn.ragged.base import dense_or_flashinfer
-            from mstar.engine.resources.attn.ragged.dense_wrappers import DensePrefixedPrefillWrapper
-            from mstar.engine.resources.attn.ragged.wrappers import FlashInferPrefixedPrefillWrapper
-
-            reason = _dense_unavailable_reason(info.device)
-            if reason is None:
-                return DenseAttentionManager(
-                    kv_cache=spec.config.kv_cache,
-                    device=info.device,
-                    dtype=info.kv_dtype,
-                    kv_config=kv_config,
-                    wrapper_class=dense_or_flashinfer(
-                        info.device, DensePrefixedPrefillWrapper, FlashInferPrefixedPrefillWrapper, "Attention",
-                    ),
-                    flashinfer_backend=spec.config.flashinfer_backend,
-                )
-            backend = resolve_attn_backend(
-                AttnBackend.AUTO, info.device, kv_config.tokens_per_page,
-            )
-            _warn_dense_fallback(reason, backend)
-
-        if backend == AttnBackend.FLASHINFER_MLA:
-            from mstar.engine.resources.attn.flashinfer_mla import FlashInferMLAManager
-
-            return FlashInferMLAManager(
-                kv_cache=spec.config.kv_cache,
-                device=info.device,
-                dtype=info.kv_dtype,
-                kv_config=kv_config,
-                backend=spec.config.flashinfer_backend,
-                sm_scale=spec.config.sm_scale,
-            )
-        if backend == AttnBackend.FLASHINFER:
-            from mstar.engine.resources.attn.flashinfer import FlashInferManager
-
-            return FlashInferManager(
-                kv_cache=spec.config.kv_cache,
-                device=info.device,
-                dtype=info.kv_dtype,
-                kv_config=kv_config,
-                splits=spec.config.splits,
-                max_rows_in_combined=info.max_rows_in_combined,
-                sliding_window=spec.config.sliding_window,
-                decode_fmha=spec.config.decode_fmha,
-                layers=spec.config.layers,
-                **flashinfer_kwargs(
-                    kv_config, flashinfer_backend, spec.config.decode_tensor_cores,
-                ),
-            )
-
-        if backend == AttnBackend.AITER:
-            if not current_platform.is_rocm():
-                raise RuntimeError(
-                    "attention backend 'aiter' runs on AMD GPUs (ROCm); this "
-                    f"process runs on {current_platform.name}"
-                )
-            from mstar.engine.resources.attn.aiter import AiterPagedAttentionManager
-
-            return AiterPagedAttentionManager(
-                kv_cache=spec.config.kv_cache,
-                device=info.device,
-                dtype=info.kv_dtype,
-                kv_config=kv_config,
-            )
-
-        if backend == AttnBackend.FLEX:
-            from mstar.engine.resources.attn.flex import FlexAttentionManager
-
-            return FlexAttentionManager(
-                kv_cache=spec.config.kv_cache,
-                device=info.device,
-                dtype=info.kv_dtype,
-                kv_config=kv_config,
-            )
-
-        if backend == AttnBackend.XPU_PAGED:
-            from mstar.engine.resources.attn.xpu import (
-                XPUPagedAttentionManager,
-                _xpu_paged_unavailable_reason,
-            )
-
-            if info.device.type != "xpu":
-                raise RuntimeError(
-                    "attention backend 'xpu_paged' requires an XPU device; "
-                    f"got {info.device}"
-                )
-            reason = _xpu_paged_unavailable_reason()
-            if reason is not None:
-                raise RuntimeError(
-                    "attention backend 'xpu_paged' requires a working "
-                    f"vllm-xpu-kernels installation ({reason})"
-                )
-            return XPUPagedAttentionManager(
-                kv_cache=spec.config.kv_cache,
-                device=info.device,
-                kv_config=kv_config,
-            )
-        raise ValueError(f"Unknown attention backend {backend!r}")
+        # checks the spec against the backend it resolves to, then builds it
+        # (`AttnBackendRegistry.build`)
+        return ATTN_BACKENDS.build(spec, info)
 
     @property
     def requires_kv_write(self) -> bool:
@@ -345,7 +108,8 @@ class EagerSlotKey(NamedTuple):
     same reason (FlashInfer's plan stages into a pinned buffer per wrapper)."""
     label: str
     slot: int
-    # decode and prefill take different wrapper classes
+    # decode and prefill take different wrapper classes; cross-attention plans
+    # one wrapper per label either way and leaves this False
     is_decode: bool = False
 
 

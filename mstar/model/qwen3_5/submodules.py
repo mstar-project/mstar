@@ -36,6 +36,7 @@ from mstar.engine.resources.position.config import PositionStep
 from mstar.engine.resources.recurrent.config import RecurrentStep
 from mstar.engine.resources.sampler.config import SamplerStep
 from mstar.engine.resources.sampler.resource import SamplerResource
+from mstar.engine.resources.sampler.unfiltered import with_unfiltered_sampling
 from mstar.engine.resources.step import Segment, SlotLease, SubmoduleStep
 from mstar.model.components.mrope import mrope_position_ids
 from mstar.model.components.qwen3_vit import (
@@ -214,7 +215,8 @@ class LLMSubmodule(ARNodeSubmodule):
         # the cost and that guarantee sit on this graph.
         decode_compile_mode = DETERMINISTIC_COMPILE_MODE if compile_deterministic() else None
 
-        return [
+        # decode also captures once more for batches that filter nothing
+        return with_unfiltered_sampling([
             BatchedAcceleratorGraphConfig(
                 capture_graph_walk="decode",
                 single_request_inputs=dummy(1),
@@ -244,7 +246,17 @@ class LLMSubmodule(ARNodeSubmodule):
                 capture_batch_sizes=self.PREFILL_VISION_CAPTURE_BATCH_SIZES,
                 compile_mode=DETERMINISTIC_COMPILE_MODE,
             ),
-        ]
+        ], walks=("decode",))
+
+    def cg_key_info(
+        self, graph_walk: str,
+        per_request_info: dict[str, CurrentForwardPassInfo],
+        per_request_input_metadata=None,
+        **kwargs: Any,
+    ) -> Any:
+        if graph_walk != "decode":
+            return None
+        return self.node_resources[SAMPLER].unfiltered_key(graph_walk, per_request_info.keys())
 
     # ------------------------------------------------------------------
     # Step declaration
@@ -460,16 +472,30 @@ class LLMSubmodule(ARNodeSubmodule):
     ) -> dict[str, torch.Tensor | Any]:
         out: dict[str, torch.Tensor | Any] = {}
         in_graph = self._rope_in_graph(engine_inputs, graph_walk)
+        sampler: SamplerResource = engine_inputs.resources[SAMPLER]
+        if in_graph and graph_walk == "decode" and sampler.loopback_in_graph:
+            # The captured forward reads each row's last token off the slot
+            # masters itself (`_forward`), so nothing is staged. A row that
+            # brought its token has it written there first; a capture's rows
+            # bring dummies the graph never reads.
+            routed = [
+                i for i, inp in enumerate(inputs)
+                if inp.input_ids is not None and inp.input_seq_len
+            ]
+            if routed and not engine_inputs.synthetic:
+                sampler.write_loopback_tokens(
+                    routed, torch.cat([inputs[i].input_ids for i in routed]),
+                )
+            return out
         first = inputs[0]
         if first.input_embeds is None and (
             first.input_ids is None or any(inp.input_ids is None for inp in inputs)
         ):
             # device loop-back: every row of a decode step is its request's
             # last sampled token, read by slot (padding rows read slot 0)
-            sampler: SamplerResource = engine_inputs.resources[SAMPLER]
             t0 = perf_counter() if PHASE_PERIOD else 0.0
             laps = PhaseLaps("engine.preprocess.loopback.")
-            ids = sampler.loopback_tokens(engine_inputs.request_ids)
+            ids = sampler.loopback_tokens()
             laps.lap("tokens")
             decode = graph_walk == "decode"
             # rows whose last step ran elsewhere brought their token
@@ -550,7 +576,10 @@ class LLMSubmodule(ARNodeSubmodule):
                 int(inp.tensor_inputs["mrope_advance"]) for inp in inputs
             )
 
+        # the leased bucket's key, which `cg_key_info` chose (or the capture's)
+        lease = kwargs.get("slot_lease")
         return SubmoduleStep(
+            cg_key_info=lease.bucket.cg_key_info if lease is not None else None,
             segments=[
                 Segment(
                     request_id=rid,
@@ -589,7 +618,7 @@ class LLMSubmodule(ARNodeSubmodule):
         attn: AttentionManager = engine_inputs.resources[ATTN]
         sampler: SamplerResource = engine_inputs.resources[SAMPLER]
         if input_ids is None and input_embeds is None:
-            input_ids = sampler.loopback_tokens(engine_inputs.request_ids)
+            input_ids = sampler.loopback_tokens()
         if self._rope_in_graph(engine_inputs, graph_walk) or cos_3d is None or sin_3d is None:
             # the tables come from the planned positions, inside the graph
             # (off a captured decode's per-step critical path); the static
@@ -608,7 +637,7 @@ class LLMSubmodule(ARNodeSubmodule):
             # only the last token of each prefill row feeds the head
             hidden = attn.select_last_hidden(hidden)
         logits = self.model.lm_head(hidden)
-        return sampler.sample(engine_inputs.request_ids, logits=logits)
+        return sampler.sample(logits)
 
     def forward(
         self,

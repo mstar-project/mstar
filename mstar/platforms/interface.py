@@ -9,6 +9,7 @@ from pathlib import Path
 
 import torch
 
+from mstar.platforms.facts import DeviceFacts, device_facts
 from mstar.platforms.ptxas import blackwell_ptxas_env
 
 logger = logging.getLogger(__name__)
@@ -84,11 +85,19 @@ class Platform:
     def has_block_scaled_gemm(self, device=None) -> bool:
         """cuBLASLt's MXFP8 and NVFP4 GEMMs (``torch._scaled_mm``) run on this GPU."""
         return False
+    def device_facts(self, device=None) -> DeviceFacts:
+        """The GPU's architecture, product, compute units, caches and peak
+        bandwidth and throughput, for kernel heuristics and the kernel harness
+        (see ``mstar.platforms.facts``); never for model code. Unknown fields
+        are None."""
+        return device_facts(self, device)
 
-    def inductor_overrides(self, num_tokens: int | None = None) -> dict[str, object]:
+    def inductor_overrides(
+        self, num_tokens: int | None = None, rows: int | None = None,
+    ) -> dict[str, object]:
         """``torch._inductor.config`` values to patch in while the engine
-        compiles a forward for ``num_tokens`` tokens, a capture bucket's count,
-        or ``None`` when the forward serves any count.
+        compiles a forward for ``num_tokens`` tokens in ``rows`` rows, a
+        capture bucket's counts, or ``None`` when the forward serves any count.
 
         Meant for inductor codegen settings on this stack (say, which GEMM
         backends to autotune at small sizes), not for picking kernels. Empty
@@ -125,6 +134,12 @@ class Platform:
         platform doesn't report an address."""
         return frozenset(a for i in range(torch.accelerator.device_count())
                          if (a := self.pci_address(i)) is not None)
+    def knob_defaults(self) -> dict[str, str]:
+        """This platform's defaults for engine knobs (``mstar.utils.knobs``), by
+        ``knobs:`` key, as strings in the env vars' format. A deployment config's
+        ``knobs:`` block and an exported variable both override them."""
+        return {}
+
     def visible_devices_env(
         self, devices: str | None, environ: Mapping[str, str],
     ) -> dict[str, str]:
@@ -187,8 +202,9 @@ class CudaPlatform(Platform):
         return None if capability is None else f"sm_{capability[0]}{capability[1]}"
 
     def cuda_capability(self, device=None) -> tuple[int, int] | None:
-        # a CPU device (tests that drive GPU resources with stand-ins) has none
-        if device is not None and torch.device(device).type != "cuda":
+        # a CPU device (tests that drive GPU resources with stand-ins) has none; an
+        # index names a cuda device, and torch.device(index) refuses on a CPU-only build
+        if device is not None and not isinstance(device, int) and torch.device(device).type != "cuda":
             return None
         return torch.cuda.get_device_capability(device)
 
@@ -225,17 +241,52 @@ class RocmPlatform(Platform):
 
     # captured buckets up to this many tokens autotune GEMMs over ATen (hipBLASLt) only
     ATEN_GEMM_MAX_TOKENS = 32
+    # and one-token-per-row (decode) buckets up to this many rows
+    ATEN_GEMM_MAX_DECODE_ROWS = 128
 
-    def inductor_overrides(self, num_tokens: int | None = None) -> dict[str, object]:
+    def inductor_overrides(
+        self, num_tokens: int | None = None, rows: int | None = None,
+    ) -> dict[str, object]:
         # At decode sizes inductor's autotuner can't reliably pick between its
         # Triton GEMM templates and hipBLASLt on MI300X. Its timings (12-17 us)
         # sit above the real kernel time in a graph (6-13 us) and move up to 30%
         # between compiles, so different compiles pick different kernels. On
         # orpheus a bad pick cost 10% of the decode step at concurrency 4.
-        # hipBLASLt alone was the same or better at 1, 4, 16 and 64.
-        if num_tokens is not None and num_tokens <= self.ATEN_GEMM_MAX_TOKENS:
-            return {"max_autotune_gemm_backends": "ATEN"}
-        return {}
+        # hipBLASLt alone was the same or better at 1, 4, 16 and 64. Decode
+        # buckets of 48-128 rows also lose with Triton: it fuses silu*mul into
+        # the down projection's template, 40% slower than hipBLASLt there (9B
+        # c=64: +7.7% tok/s on ATen). Packed prefill buckets keep the Triton
+        # templates, which win there.
+        if num_tokens is None:
+            return {}
+        decode = rows is not None and rows == num_tokens
+        limit = self.ATEN_GEMM_MAX_DECODE_ROWS if decode else self.ATEN_GEMM_MAX_TOKENS
+        if num_tokens > limit:
+            return {}
+        overrides: dict[str, object] = {"max_autotune_gemm_backends": "ATEN"}
+        from mstar.platforms.rocm_gemm import (
+            DECODE_GEMV_MAX_ROWS,
+            DECODE_LINEAR_MAX_ROWS,
+            SKINNY_MAX_ROWS,
+            ChainedGraphPass,
+            decode_linear_pass,
+            skinny_gemm_passes,
+        )
+
+        post = None
+        if num_tokens <= DECODE_GEMV_MAX_ROWS and (passes := skinny_gemm_passes()) is not None:
+            # linears of up to 16 rows on AITER's skinny GEMM or the Triton
+            # weight stream, as the device's tuned config picks per shape
+            overrides["pre_grad_custom_pass"], post = passes
+        if (
+            decode and SKINNY_MAX_ROWS < num_tokens <= DECODE_LINEAR_MAX_ROWS
+            and (tuned := decode_linear_pass()) is not None
+        ):
+            # decode linears still on hipBLASLt take its tuned solution, where the device has one
+            post = tuned if post is None else ChainedGraphPass(post, tuned)
+        if post is not None:
+            overrides["post_grad_custom_post_pass"] = post
+        return overrides
 
     def process_env_defaults(self) -> dict[str, str]:
         return {
@@ -248,6 +299,10 @@ class RocmPlatform(Platform):
 
     def pci_address(self, device_index: int) -> str | None:
         return _torch_pci_address(device_index)
+
+    def knob_defaults(self) -> dict[str, str]:
+        # the AMD-specific knob defaults, as measured on MI300X / MI325X
+        return {}
     def visible_devices_env(
         self, devices: str | None, environ: Mapping[str, str],
     ) -> dict[str, str]:

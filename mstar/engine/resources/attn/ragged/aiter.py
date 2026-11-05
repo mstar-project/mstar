@@ -82,7 +82,11 @@ class _AiterRaggedBase:
         device: torch.device,
         dtype: torch.dtype,
         config: RaggedAttentionConfig,
+        key: str | None = None,
     ):
+        # the resource key `_build_ragged` hands every ragged manager; these run their
+        # kernel directly rather than through the compiled `mstar::ragged_attention` op
+        self._key = key
         if config.head_dim > _MAX_HEAD_DIM:
             raise ValueError(
                 f"ragged attention backend 'aiter': head_dim {config.head_dim} is "
@@ -110,6 +114,12 @@ class _AiterRaggedBase:
         """Segments one request may bring to a captured plan, as configured
         (after YAML overrides); a captured plan holds this many per row."""
         return self._config.max_segments_per_request
+
+    @property
+    def max_segments_per_step(self) -> int | None:
+        """Segments a one-row replay's plan holds for its whole step, as
+        configured; None for a resource sized per request."""
+        return self._config.max_segments_per_step
 
     @property
     def supports_preplan(self):
@@ -242,7 +252,7 @@ class _AiterRaggedBase:
     @torch.compiler.disable
     def run(
         self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
-        label: str | None = None,
+        label: str | None = None, return_lse: bool = False,
     ) -> torch.Tensor:
         """One layer's attention with the plan for ``label``.
 
@@ -252,6 +262,8 @@ class _AiterRaggedBase:
         FlashInfer's. In a captured step, rows past the planned tokens read
         back zero.
         """
+        if return_lse:
+            raise NotImplementedError("ragged attention backend 'aiter' returns no log-sum-exp")
         plan = self._plan(label)
         qk, kk, vk = (t if t.dtype == self._dtype else t.to(self._dtype) for t in (q, k, v))
         if plan.out is None:

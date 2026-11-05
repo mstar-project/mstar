@@ -84,7 +84,7 @@ def _run(res: SamplerResource, rid: int, modes: str, step: SamplerStep = Sampler
     for mode in modes:
         ctx = _ctx(rid, captured=mode == "C")
         res.plan(step, ctx)
-        res.sample([rid], logits)
+        res.sample(logits)
         res.commit(step, ctx)
 
 
@@ -153,11 +153,11 @@ def test_consecutive_draws_are_independent(ingraph, monkeypatch, first_step):
     side.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(side):
         for _ in range(2):  # Triton autotune and FlashInfer JIT outside capture
-            res.sample([pad], static_logits)
+            res.sample(static_logits)
     torch.cuda.current_stream().wait_stream(side)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        static_out = res.sample([pad], static_logits)
+        static_out = res.sample(static_logits)
     res.commit(step, capture_ctx)
 
     logits = 0.1 * torch.randn(1, V, generator=torch.Generator().manual_seed(0)).to(device)
@@ -176,7 +176,7 @@ def test_consecutive_draws_are_independent(ingraph, monkeypatch, first_step):
         if first_step == "eager":
             ctx = _ctx(i, captured=False)
             res.plan(step, ctx)
-            first = res.sample([i], logits).item()
+            first = res.sample(logits).item()
             res.commit(step, ctx)
         else:
             first = captured(i)

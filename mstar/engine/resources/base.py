@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, NamedTuple
 
@@ -527,6 +527,13 @@ class Resource(ResidentHooks, ABC):
         state, so every rank refuses the same buckets.
         """
         return None
+
+    def buckets_captured(self, buckets: Collection[BucketKey]) -> None:
+        """The buckets one runner capturing against this node kept: what every
+        rank captured in full, so replays can lease them. Called once per
+        runner after its captures, possibly more than once; the same on every
+        rank."""
+        return
 
     def post_warmup_validate(self):
         """

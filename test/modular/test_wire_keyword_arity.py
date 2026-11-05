@@ -15,26 +15,35 @@ sys.path.insert(0, ".")
 
 import mstar.communication.wire_types  # noqa: F401  (imports the wire dataclasses)
 
+# both kernel registries define a KernelOp; with only one loaded, the other's call sites would be checked against it
+import mstar.kernels.ops  # noqa: F401
+import mstar.kernels.registry  # noqa: F401
+
 ROOT = pathlib.Path("mstar")
 
 
 def _known_dataclasses() -> dict[str, set[str]]:
     """Every dataclass reachable from the loaded mstar modules, by class name."""
     fields: dict[str, set[str]] = {}
+    classes: dict[str, type] = {}
+    ambiguous: set[str] = set()
     for name, module in list(sys.modules.items()):
         if not name.startswith("mstar") or module is None:
             continue
         for attr in vars(module).values():
-            if not (dataclasses.is_dataclass(attr) and isinstance(attr, type)):
-                continue
             # Only our own types: third-party configs (HF PretrainedConfig and
             # friends) take **kwargs, so their fields do not describe what
             # __init__ accepts and every extra kwarg would read as an error.
-            if not getattr(attr, "__module__", "").startswith("mstar"):
+            if not (isinstance(attr, type) and getattr(attr, "__module__", "").startswith("mstar")):
                 continue
-            fields.setdefault(
-                attr.__name__, {f.name for f in dataclasses.fields(attr)}
-            )
+            if classes.setdefault(attr.__name__, attr) is not attr:
+                # two classes of one name (the kernel registries' KernelOp, one of them a
+                # dataclass): a call site cannot be resolved by name, so neither is checked
+                ambiguous.add(attr.__name__)
+            if dataclasses.is_dataclass(attr):
+                fields.setdefault(attr.__name__, {f.name for f in dataclasses.fields(attr)})
+    for name in ambiguous:
+        fields.pop(name, None)
     return fields
 
 
