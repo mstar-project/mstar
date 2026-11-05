@@ -1684,6 +1684,23 @@ def test_a_follower_allots_the_room_rank_0_counted_for_a_short_grant(monkeypatch
     assert _counts(follower) == _counts(leader), "r's allotment here lacks the room rank 0 counted for its grant"
 
 
+def test_a_short_grant_with_no_room_to_claim_leaves_the_allotment_alike_on_every_rank(monkeypatch):
+    """r ran short with no room left, so rank 0 claims nothing for r as it chooses v. Allotting r nothing still raised
+    r's allotment to the pages r held past it, on rank 0 alone, since a claim of nothing goes unjournaled."""
+    (leader, lead), (follower, follow) = _pool_rank(monkeypatch, 0), _pool_rank(monkeypatch, 1)
+    _ingest((leader, follower), "r", 3, arrival=1)
+    _ingest((leader, follower), "v", 5, arrival=2)
+    assert _admits(leader, "r") and _admits(leader, "v")
+    assert follow.apply_resident_delta(lead.take_resident_delta(), _rebuilds_none)
+    for rid, tokens in (("r", 3 * PAGE_SIZE), ("v", 5 * PAGE_SIZE), ("r", 2 * PAGE_SIZE), ("r", 1)):
+        assert _step(leader, rid, tokens).ok == _step(follower, rid, tokens).ok
+    assert _preempt(leader, "r", droppable=True).to_drop == ["v"]
+
+    assert follow.apply_resident_delta(lead.take_resident_delta(), _rebuilds_none)
+
+    assert _counts(follower) == _counts(leader), "r's allotment here isn't the one rank 0 holds"
+
+
 def test_an_allotment_undone_in_the_sweep_that_made_it_never_reaches_the_followers(monkeypatch):
     """A node's second pool can hold a request back on every readiness check, undoing the first pool's allotment."""
     leader, lead = _pool_rank(monkeypatch, 0)
