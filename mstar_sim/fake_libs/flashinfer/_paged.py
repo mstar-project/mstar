@@ -311,11 +311,10 @@ class PrefillPlanner:
     def __init__(self, backend: str, wrapper=None, kv_dtype=None):
         self._backend = backend
         self._wrapper = wrapper
-        self._kv_dtype = kv_dtype  # a module is built for one KV dtype; a wrapper's is its plan's
+        self._kv_dtype = kv_dtype  # a module is built for one KV dtype
 
     def _kv_bytes(self) -> int:
-        dtype = self._wrapper._cached_kv_data_type if self._wrapper is not None else self._kv_dtype
-        return 2 if dtype is None else element_size(canonical_dtype(dtype))  # the binding's default: 2
+        return 2 if self._kv_dtype is None else element_size(canonical_dtype(self._kv_dtype))  # the binding's default
 
     def _allocations(self, qo, kv_pages, total_num_rows, batch_size, num_qo_heads, num_kv_heads, page_size,
                      enable_cuda_graph, head_dim_qk, head_dim_vo, window_left, fa2_args) -> list:
@@ -511,7 +510,7 @@ class PagedAttention:
                 self._use_cuda_graph, self._window_left, self._logits_soft_cap, head_dim_qk, self._head_dim_vo,
                 torch.empty(0, dtype=self._cached_q_data_type), torch.empty(0, dtype=self._cached_kv_data_type))
         else:
-            self._cached_module = self._cached_module or PrefillPlanner(self._backend, self)
+            self._cached_module = PrefillPlanner(self._backend, self, self._cached_kv_data_type)
             args = [*workspaces, as_tensor(qo_host), as_tensor(kv_host), as_tensor(lens),
                     self._max_total_num_rows or total_rows, batch, num_qo_heads, num_kv_heads, page_size,
                     self._use_cuda_graph, head_dim_qk, self._head_dim_vo, self._causal, self._window_left]
