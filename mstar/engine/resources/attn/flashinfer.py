@@ -437,13 +437,12 @@ class _WholeRows(OwnTokensKernel):
     (``KeyRows.whole``): their keys are contiguous runs of the step's, which it reads in place. It
     takes no other rows, whose keys would have to be gathered."""
 
+    whole_rows_only = True
+
     def __init__(self, ragged, captured: "ShareCapture | None"):
         self._ragged, self.captured = ragged, captured
 
     def plan(self, rows: KeyRows, causal: bool) -> None:
-        if rows.kv_indptr is not rows.qo_indptr:
-            # each row over its own tokens, as only KeyRows.whole lays them out
-            raise ValueError("FlashInfer's ragged own-token kernel takes whole rows, each over its own tokens")
         self._ragged.plan(torch.from_numpy(rows.qo_indptr.astype(np.int32)), causal=causal)
 
     def run(self, queries, keys):

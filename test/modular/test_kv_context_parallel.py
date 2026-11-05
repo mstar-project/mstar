@@ -707,6 +707,12 @@ def test_placed_attention_refuses_a_kernel_outside_its_contract(monkeypatch):
         monkeypatch.setattr(attn, "own_tokens_kernel", lambda *args, wrong=wrong: wrong)
         with pytest.raises(ValueError, match="OwnTokensKernel"):
             attn._context_parallel_wrapper("main", 0, False, kwargs)
+    # a kernel for whole rows alone, where SP's zigzag share would plan other rows on it
+    attn, _ = _cp_attention(JointGroups(tp_group=CommGroup.trivial(), sp_group=_group(0, P)), CPU, torch.float32)
+    whole_only = type("WholeOnly", (_GatheredKeys,), {"whole_rows_only": True})
+    monkeypatch.setattr(attn, "own_tokens_kernel", lambda *args: whole_only())
+    with pytest.raises(ValueError, match="whole rows"):
+        attn._context_parallel_wrapper("main", 0, False, dict(attn._wrapper_kv_kwargs))
 
 
 class _GatheredKeys(OwnTokensKernel):
@@ -1060,15 +1066,15 @@ def test_mla_attention_refuses_at_admit_a_step_past_the_fa_planners_cap_so_the_w
     assert not admit(fm.fa_work_items_bound(qo, heads, 132)).ok
 
 
-def test_mla_attention_over_a_placed_pool_never_admits_a_step_its_planner_refuses(monkeypatch):
-    """A capture pads its own-token kernel's plan to its bucket (a row of the spare queries, then empty
-    rows), which can take the FA planner's bound past the real rows'. A bucket that could is refused
-    at capture, and admission bounds the real rows, so the planner never refuses a step admitted
-    to a captured bucket, where it couldn't be retried."""
+@pytest.mark.parametrize("rows, tokens", [(((0, 1), (3, 56)), 64), (DECODE_ROWS, 3)], ids=["prefill", "decode"])
+def test_mla_attention_over_a_placed_pool_never_admits_a_step_its_planner_refuses(monkeypatch, rows, tokens):
+    """A captured bucket's plans are bounded once, at capture: the context's at its rows and tokens,
+    and its own-token kernel's padded to the bucket (a row of the spare queries, then empty rows),
+    whatever the step. A bucket the planner could refuse a plan of is refused at capture, so it
+    never refuses a step leased to a captured bucket, where it couldn't be retried."""
     # a planner refusing every plan whose bound passes the cap
     _emulate_fa_planner(monkeypatch, lambda q, kv, heads, causal: fm.fa_work_items_bound(
         np.concatenate([[0], np.cumsum(q)]), heads, 132) > fm._FA_MAX_WORK_ITEMS)
-    rows = ((0, 1), (3, 56))
     case = _Case.build(rows, CPU, torch.float32, mla=True)
     views = case.plan["main"].views
     step = AttentionStep(segments=tuple(Segment(v.request_id, "main", v.to_compute) for v in views))
@@ -1077,7 +1083,7 @@ def test_mla_attention_over_a_placed_pool_never_admits_a_step_its_planner_refuse
         joint = (JointGroups(tp_group=CommGroup.trivial(), sp_group=_group(0, P)) if over_sp
                  else JointGroups(tp_group=_group(0, P), sp_group=CommGroup.trivial()))
         attn, _ = _cp_attention(joint, CPU, torch.float32, mla=True, flashinfer_backend="fa2")
-        bucket = BucketKey(graph_walk="w", bs=len(rows), num_tokens=64)
+        bucket = BucketKey(graph_walk="w", bs=len(rows), num_tokens=tokens)
         ctx = StepContext(request_ids=tuple(v.request_id for v in views), graph_walk="w", slot=0, capture=False,
                           slot_lease=SlotLease(0, bucket))
         for cap in range(1, 400):
@@ -1089,12 +1095,10 @@ def test_mla_attention_over_a_placed_pool_never_admits_a_step_its_planner_refuse
                 assert "capture bucket" in str(refused)
                 outcomes.add("capture refused")
                 continue
-            if attn.admit(step, ctx).ok:
-                _plan(attn, case, bucket=bucket)
-                outcomes.add("planned")
-            else:
-                outcomes.add("admission refused")
-    assert {"capture refused", "planned"} <= outcomes
+            assert attn.admit(step, ctx).ok
+            _plan(attn, case, bucket=bucket)
+            outcomes.add("planned")
+    assert outcomes == {"capture refused", "planned"}
 
 
 def test_sp_placed_mla_attention_admits_a_step_only_if_every_partners_zigzag_share_fits(monkeypatch):
@@ -1124,11 +1128,7 @@ def test_mla_attention_refuses_a_bucket_its_padded_own_tokens_take_past_the_plan
     attn, _ = _cp_attention(JointGroups(tp_group=CommGroup.trivial(), sp_group=_group(0, P)), CPU, torch.float32,
                             mla=True, num_qo_heads=64, flashinfer_backend="fa2")
     rows, tokens = 8, 65536
-    step = AttentionStep(segments=tuple(Segment(f"r{i}", "main", 1) for i in range(rows)))
     lease = SlotLease(0, BucketKey(graph_walk="w", bs=rows, num_tokens=tokens))
-    ctx = StepContext(request_ids=tuple(seg.request_id for seg in step.segments), graph_walk="w", slot=0,
-                      capture=False, slot_lease=lease, force_prefill=True)
-    assert attn.admit(step, ctx).ok
     with pytest.raises(ValueError, match="capture bucket"):
         attn._cg_wrapper(lease, "main", rows, force_prefill=True)
     attn._cg_wrapper(SlotLease(0, BucketKey(graph_walk="w", bs=rows, num_tokens=rows)), "main", rows)

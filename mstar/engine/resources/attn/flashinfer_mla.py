@@ -364,8 +364,8 @@ class FlashInferMLAManager(PlacedAttention):
                 num_rows, bucket.num_tokens, self._kv_config), "batch_size": num_rows, "use_cuda_graph": True}
             if self._placement is not None:
                 decode = one_token_rows(bucket.bs, bucket.num_tokens, force_prefill)
-                self._refuse_capture_past_cap(bucket, num_rows, decode)
                 wrapper = self._context_parallel_wrapper(label, lease.slot, decode, kwargs, bucket.num_tokens)
+                self._refuse_capture_past_cap(bucket, num_rows, wrapper)
             else:
                 wrapper = FlashInferMLAWrapper(workspace_buffer=self._workspaces.get(label, lease.slot), **kwargs)
             self._cg_plan_states[key] = wrapper
@@ -460,17 +460,17 @@ class FlashInferMLAManager(PlacedAttention):
                 return False
         return True
 
-    def _refuse_capture_past_cap(self, bucket, rows: int, decode: bool) -> None:
-        """Refuses, at capture, a bucket whose plans the FA planner could refuse on one rank alone: a
-        captured wrapper plans at most its ``rows`` rows and its bucket's tokens over this rank's
-        slots, and its own-token kernel a fixed count of queries over fixed rows whatever the step
-        (``share_capture``), and no plan of those passes ``fa_work_items_ceiling``. Admission then
-        has nothing to bound for a leased step."""
+    def _refuse_capture_past_cap(self, bucket, rows: int, wrapper) -> None:
+        """Refuses, at capture, a bucket whose plans the FA planner could refuse on one rank alone. A
+        captured ``wrapper`` plans at most its ``rows`` rows and its bucket's tokens over this rank's
+        slots, and its own-token kernel the fixed rows and queries it was built for whatever the step
+        (``captured``); no plan of those passes ``fa_work_items_ceiling``. Admission then has nothing
+        to bound for a leased step."""
         if self._fa_sm_count is None:
             return
         plans = [("context", bucket.num_tokens, rows, self._wrapper_kwargs["num_qo_heads"])]
-        if not decode:
-            shape = self._placed.share_capture(self._placement, rows, bucket.num_tokens)
+        if wrapper.new is not None:
+            shape = wrapper.new.captured
             plans.append(("own-token", shape.queries, shape.rows, self._kv_config.num_qo_heads))
         for what, queries, plan_rows, heads in plans:
             ceiling = fa_work_items_ceiling(queries, plan_rows, heads, self._fa_sm_count)

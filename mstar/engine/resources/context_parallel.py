@@ -145,7 +145,7 @@ class KeyRows(NamedTuple):
 
 
 class ShareCapture(NamedTuple):
-    """What the kernel of a captured step's own tokens is sized for (``share_capture``)."""
+    """What the kernel of a captured step's own tokens is sized for."""
 
     # the kernel's fixed rows and queries
     rows: int
@@ -163,11 +163,13 @@ class OwnTokensKernel(ABC):
     ``kv_tokens``.
 
     A captured kernel is run on ``captured.queries`` queries every replay, however few its plan has
-    (``ZigzagWrapper`` gathers that many; TP passes the bucket's). A kernel the backend built for
-    whole rows (``PlacedAttention.own_tokens_kernel``) may refuse any other rows."""
+    (``ZigzagWrapper`` gathers that many; TP passes the bucket's). A kernel that declares
+    ``whole_rows_only`` is refused where any other rows would be planned on it."""
 
     # what a captured kernel is sized for; None on an eager one
     captured: ShareCapture | None = None
+    # a kernel that takes only whole rows, each over its own tokens (``KeyRows.whole``)
+    whole_rows_only: bool = False
 
     @abstractmethod
     def plan(self, rows: KeyRows, causal: bool) -> None:
@@ -239,8 +241,9 @@ class ContextParallelWrapper(ABC):
     ``new``. ``page_size`` is the logical one.
 
     A plan's lengths differ by rank, so a planner that refuses on lengths could refuse on one rank
-    of the lockstep instance alone; the backend's admission refuses, on every rank alike, the steps
-    whose plans it may (``rank_plans``), before any is planned."""
+    of the lockstep instance alone. The backend refuses, on every rank alike and before anything is
+    planned, an eager step whose plans it may (admission, ``rank_plans``) and a captured bucket whose
+    every plan it may (at capture, from the kernels' fixed sizes)."""
 
     def __init__(
         self,
@@ -333,12 +336,6 @@ class ContextParallelWrapper(ABC):
         slots a page it stores, and its own query heads."""
         return dict(page_size=page_size // placement.size, num_qo_heads=num_qo_heads)
 
-    @staticmethod
-    @abstractmethod
-    def share_capture(placement: ContextParallel, rows: int, tokens: int) -> ShareCapture:
-        """What the own-token kernel of a wrapper captured for ``rows`` rows and ``tokens`` tokens is
-        sized for."""
-
     @classmethod
     @abstractmethod
     def own_tokens(
@@ -355,8 +352,8 @@ class ContextParallelWrapper(ABC):
     ) -> list[tuple[np.ndarray, int]]:
         """Every plan a multi-token step of ``qo_indptr``'s rows makes on any rank of the placement,
         as ``(qo_indptr, query heads)``: the context's at the local geometry's ``num_qo_heads``, and
-        the own tokens'. What admission bounds a planner's refusals by, the same on every rank (a
-        capture's padding is bounded once a bucket, ``share_capture``)."""
+        the own tokens'. What admission bounds an eager step's planner refusals by, the same on every
+        rank; a captured bucket's plans are bounded at capture."""
 
     @abstractmethod
     def _plan_own(self, qo_indptr: torch.Tensor, causal: bool) -> None:
@@ -429,15 +426,12 @@ class TPContextParallelWrapper(ContextParallelWrapper):
         geometry = ContextParallelWrapper.local_geometry(placement, page_size, num_qo_heads)
         return {**geometry, "num_qo_heads": num_qo_heads * placement.size}
 
-    @staticmethod
-    def share_capture(placement, rows, tokens):
-        # every row whole, and one more row for the queries past a plan
-        return ShareCapture(rows + 1, tokens, tokens)
-
     @classmethod
     def own_tokens(cls, kernels, placement, device, workspace, kwargs, max_total_tokens):
-        captured = None if not max_total_tokens else cls.share_capture(
-            placement, kwargs.get("batch_size") or 0, max_total_tokens)
+        # captured: every row whole, and one more row for the queries past a plan
+        captured = None
+        if max_total_tokens:
+            captured = ShareCapture((kwargs.get("batch_size") or 0) + 1, max_total_tokens, max_total_tokens)
         return _own_tokens_kernel(kernels, workspace, kwargs, captured, whole=True)
 
     @staticmethod
@@ -498,15 +492,12 @@ class SPContextParallelWrapper(ContextParallelWrapper):
     _placement: SPPlacement
     new: "ZigzagWrapper | None"
 
-    @staticmethod
-    def share_capture(placement, rows, tokens):
-        return zigzag_capture(placement.size, rows, tokens)
-
     @classmethod
     def own_tokens(cls, kernels, placement, device, workspace, kwargs, max_total_tokens):
         # its zigzag share of the own tokens, whose two chunks' keys overlap
-        captured = None if not max_total_tokens else cls.share_capture(
-            placement, kwargs.get("batch_size") or 0, max_total_tokens)
+        captured = None
+        if max_total_tokens:
+            captured = zigzag_capture(placement.size, kwargs.get("batch_size") or 0, max_total_tokens)
         return ZigzagWrapper(placement, _own_tokens_kernel(kernels, workspace, kwargs, captured, whole=False), device)
 
     @staticmethod
@@ -537,6 +528,8 @@ def _own_tokens_kernel(kernels, workspace, kwargs, captured: ShareCapture | None
     kernel = kernels.own_tokens_kernel(workspace, kwargs, captured, whole)
     if not isinstance(kernel, OwnTokensKernel):
         raise ValueError(f"a placed pool's own tokens run on an OwnTokensKernel, not a {type(kernel).__name__}")
+    if kernel.whole_rows_only and not whole:
+        raise ValueError(f"{type(kernel).__name__} takes whole rows alone, and this placement's own tokens aren't")
     return kernel
 
 
@@ -627,6 +620,11 @@ class ZigzagWrapper:
 
     def forget_plan(self) -> None:
         self.kernel.forget_plan()
+
+    @property
+    def captured(self) -> ShareCapture | None:
+        """What its kernel is sized for."""
+        return self.kernel.captured
 
     def run(
         self, queries: tuple[torch.Tensor, ...], keys: tuple[torch.Tensor, ...],
