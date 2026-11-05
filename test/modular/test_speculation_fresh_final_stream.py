@@ -81,6 +81,7 @@ def _worker(scheduler, runtime):
         ) for rid in (CONTINUING, FRESH)
     }
     worker = SimpleNamespace(
+        _ring_signals={},
         worker_id="w0",
         scheduler=scheduler,
         _graph_runtime=runtime,

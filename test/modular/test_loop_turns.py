@@ -444,6 +444,7 @@ def _worker(chain: ChainPick, prep, taken=None, asked=None) -> SimpleNamespace:
         _is_tearing_down=lambda rid: False,
         _teardowns_pending=lambda: False,
         chunk_loops=ChunkLoops(),
+        _ring_signals={},
         _yield_away_speculation=lambda batch, gave_way=False: SimpleNamespace(
             scheduled_batch=batch, gave_way=gave_way,
         ),
