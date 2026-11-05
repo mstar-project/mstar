@@ -87,6 +87,7 @@ class _Runtime:
 def _scheduler(runtime: _Runtime, order: StepOrder) -> tuple[MicroScheduler, SimpleNamespace]:
     engine = SimpleNamespace(
         get_max_batch_size=lambda node, walk: 1,
+        batch_cap_varies=lambda node, walk: False,
         get_max_batch_tokens=lambda node, walk: None,
         get_max_rows_in_combined=lambda node, walk: None,
         get_step_order=lambda node, walk: order,
