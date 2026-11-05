@@ -762,6 +762,9 @@ class LoopEdges(NamedTuple):
     # the node's signals the Loop hands on when it ends (its outputs), whatever
     # the node's own edge for them inside it
     leaving: frozenset[str] = frozenset()
+    # whether the node's next iteration is speculated (it opts into async
+    # scheduling); one that isn't runs every iteration as a step the scheduler picks
+    chained: bool = True
 
 
 def loop_edges(section: GraphSection, node_name: str) -> LoopEdges | None:
@@ -802,7 +805,7 @@ def loop_edges(section: GraphSection, node_name: str) -> LoopEdges | None:
         and (edge.is_streaming or edge.name in accumulated or edge.next_node in SPECIAL_DESTINATIONS)
     )
     leaving = frozenset(name for name, _ in outputs if name in terminal)
-    return LoopEdges(inner.name, inputs, outputs, items, leaving)
+    return LoopEdges(inner.name, inputs, outputs, items, leaving, node.enable_async_scheduling)
 
 
 class GraphStateRegistry(ABC):

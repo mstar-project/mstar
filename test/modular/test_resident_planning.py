@@ -928,6 +928,25 @@ def test_a_step_its_resources_held_to_one_iteration_moves_its_rows_by_one():
     assert batch.loop_strides(list(rows)) in (None, [1, 1])
 
 
+@pytest.mark.parametrize("chained", [False, True])
+def test_a_step_of_a_node_that_never_chains_repeats_where_the_scheduler_picks_it(chained):
+    """A node that opts out of async scheduling has no speculated next step, so
+    the step the scheduler picks is where it repeats: as far as its Loop's room
+    with nothing of it in flight. A chained node's picked step stays one
+    iteration (its chain's next step repeats)."""
+    rows = {0: 0, 1: 0}
+    edges = LoopEdges("loop", {"t": EdgeKind.LOOP_BACK}, {("t", "n"): EdgeKind.LOOP_BACK}, chained=chained)
+    worker = Worker.__new__(Worker)
+    worker._step_repeats = StepRepeats({"n": RepeatConfig(max=8)}, {("n", WALK): edges})
+    worker._step_repeats.settle(lambda *key: None, lambda *key: None)
+    worker.parallel_nodes = set()
+    asked = []
+    worker._graph_runtime = SimpleNamespace(loop_room=lambda *args: asked.append(args) or 3)
+    batch = ScheduledBatch(node_name="n", graph_walk=WALK, request_to_worker_graph=dict(rows))
+    assert worker._unchained_repeats(batch) == (1 if chained else 3)
+    assert asked == ([] if chained else [("n", WALK, "loop", [0, 1], 0, False)])
+
+
 def test_a_row_declaring_another_stream_than_its_walk_stops_the_worker():
     """A resident step, and each replay of one, advances every row on the walk's
     streams; a row whose declared label differs would be read and written on

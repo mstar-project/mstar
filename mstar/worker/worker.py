@@ -2015,7 +2015,7 @@ class Worker:
             request_walks=batch.request_walks,
             chunk_ranges=batch.chunk_ranges,
             engine=self.engine_manager.get_engine(batch.node_name) if batch.request_walks else None,
-            repeats=batch.repeats,
+            repeats=max(batch.repeats, self._unchained_repeats(batch)),
         )
         node_batch.read_check_rids = batch.read_check_rids
         for rid in unresolved:
@@ -3053,6 +3053,22 @@ class Worker:
         if repeats > 1 and self._walk_drivers:
             repeats = self._steady_consumer_walks(speculation, repeats)
         speculation.node_batch.step_context.repeats = repeats
+
+    def _unchained_repeats(self, batch: ScheduledBatch) -> int:
+        """The ask for a step the scheduler picked: more than one iteration only
+        for a node whose steps never chain (`StepRepeats.unchained_ceiling`), up
+        to its Loop's room with nothing of it in flight. A TP group's step takes
+        its leader's ask."""
+        if self._step_repeats is None or not self._step_repeats.asked or batch.node_name in self.parallel_nodes:
+            return 1
+        key = (batch.node_name, batch.graph_walk)
+        edges = self._step_repeats.edges.get(key)
+        if edges is None:
+            return 1
+        return self._step_repeats.unchained_ceiling(batch, lambda: self._graph_runtime.loop_room(
+            batch.node_name, batch.graph_walk, edges.loop, list(batch.request_to_worker_graph), 0,
+            self._step_repeats.config(batch.node_name).past_cap,
+        ))
 
     def _steady_consumer_walks(self, speculation: Speculation, repeats: int) -> int:
         """How far a run may go while every row's streamed items keep their

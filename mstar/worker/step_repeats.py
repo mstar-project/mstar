@@ -28,6 +28,7 @@ from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 
 if TYPE_CHECKING:
     from mstar.engine.resources.step import StepContext
+    from mstar.worker.micro_scheduler import ScheduledBatch
     from mstar.worker.speculation import Speculation
 
 logger = logging.getLogger(__name__)
@@ -322,9 +323,20 @@ class StepRepeats:
             return 1
         if (batch.node_name, batch.graph_walk) not in self._walks:
             return 1
+        return self._most((batch.node_name, batch.graph_walk), loop_room)
+
+    def unchained_ceiling(self, batch: ScheduledBatch, loop_room) -> int:
+        """The most a step the scheduler picked can repeat: one of a node whose
+        steps never chain (``LoopEdges.chained``), for which this is the only
+        step there is, whole rows of the one walk."""
         key = (batch.node_name, batch.graph_walk)
+        if key not in self._walks or self.edges[key].chained or batch.chunk_ranges or batch.request_walks:
+            return 1
+        return self._most(key, loop_room)
+
+    def _most(self, key: tuple[str, str], loop_room) -> int:
         auto = self.auto.get(key)
-        limit = self.limit(batch.node_name) if auto is None else auto.n
+        limit = self.limit(key[0]) if auto is None else auto.n
         limit = min(limit, self._odds_caps.get(key, limit))
         return max(1, min(limit, loop_room()))
 
