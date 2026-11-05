@@ -1556,7 +1556,8 @@ window.runMermaid = runMermaid;</script>
 <a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.runner.html#mstar.engine.resources.StepRunner.admit">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">admit</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">step</span><span class="p">:</span> <span class="n">SubmoduleStep</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">FullAdmitOutcome</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">"""Reserve capacity for step. A refused admit gives back everything</span>
-<span class="sd">        the step reserved.</span>
+<span class="sd">        the step reserved, and drops its stage, whose plan addresses what it</span>
+<span class="sd">        gave back.</span>
 <span class="sd">        """</span>
         <span class="n">staged_key</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_drop_stale_preplan</span><span class="p">(</span><span class="n">step</span><span class="p">)</span>
         <span class="c1"># A step whose ``pre_admit`` ran a step ahead, and whose stage is still</span>

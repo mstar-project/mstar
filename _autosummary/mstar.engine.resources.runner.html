@@ -781,7 +781,8 @@ and handing to next. (in fact, maybe <cite>plan</cite> should do this and runner
 <dt class="sig sig-object py" id="mstar.engine.resources.runner.StepRunner.admit">
 <span class="sig-name descname"><span class="pre">admit</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">step</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/runner.html#StepRunner.admit"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.runner.StepRunner.admit" title="Link to this definition">#</a></dt>
 <dd><p>Reserve capacity for step. A refused admit gives back everything
-the step reserved.</p>
+the step reserved, and drops its stage, whose plan addresses what it
+gave back.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><p><strong>step</strong> (<a class="reference internal" href="mstar.engine.resources.step.html#mstar.engine.resources.step.SubmoduleStep" title="mstar.engine.resources.step.SubmoduleStep"><em>SubmoduleStep</em></a>)</p>

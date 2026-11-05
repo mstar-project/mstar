@@ -1519,7 +1519,26 @@ no saved state (a request’s first step, or a padding row) reads <code class="d
 when none is given. <code class="docutils literal notranslate"><span class="pre">gather</span></code> / <code class="docutils literal notranslate"><span class="pre">scatter_</span></code> need the sink, so leave
 <code class="docutils literal notranslate"><span class="pre">disable_sink_slot</span></code> unset. Parakeet’s transducer decode is the example.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">LoraSpec</span></code> (built by <code class="docutils literal notranslate"><span class="pre">module_lora_spec</span></code>)</p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">LinearAttnSpec(config=LinearAttnConfig(recurrent_state=...,</span> <span class="pre">variant=...))</span></code></p></td>
+<td><p>Linear attention planned against a <code class="docutils literal notranslate"><span class="pre">RecurrentStateSpec</span></code> pool that holds its
+state: gated DeltaNet (<code class="docutils literal notranslate"><span class="pre">LinearAttnVariant.GDN</span></code>), Kimi delta attention (<code class="docutils literal notranslate"><span class="pre">KDA</span></code>:
+fused Triton kernels on CUDA, a torch reference elsewhere) or Mamba-2. A layer
+calls it through <code class="docutils literal notranslate"><span class="pre">LinearAttnCallable</span></code>, <code class="docutils literal notranslate"><span class="pre">KDACallable</span></code> or <code class="docutils literal notranslate"><span class="pre">Mamba2Callable</span></code>
+(<code class="docutils literal notranslate"><span class="pre">mstar/engine/resources/convenience.py</span></code>), which hand the kernels the layer’s
+blocks of the pool, so the layer never names one. A KDA pool built with
+<code class="docutils literal notranslate"><span class="pre">DeltaNetGeometry.to_blocks(speculative_tokens=k)</span></code> also runs verify steps
+(<code class="docutils literal notranslate"><span class="pre">LinearAttnStep(speculative=True)</span></code>), and <code class="docutils literal notranslate"><span class="pre">KDACallable.set_prefix_len</span></code>
+settles each one’s accepted drafts. The layers are shared:
+<code class="docutils literal notranslate"><span class="pre">ParallelGatedDeltaNet</span></code> and <code class="docutils literal notranslate"><span class="pre">ParallelKimiDeltaAttention</span></code>
+(<code class="docutils literal notranslate"><span class="pre">mstar/model/components/distributed/</span></code>, over <code class="docutils literal notranslate"><span class="pre">KDAConfig</span></code>). A KDA layer tells
+the resource its gates as it binds: with Kimi K3’s full-rank output gate
+(<code class="docutils literal notranslate"><span class="pre">full_rank_output_gate</span></code>) the resource runs the torch reference. Where the fused
+kernels run, activations other than bf16 or a forget-gate bound below -5 are a
+ValueError at load. The torch reference’s prefill can’t be captured
+(<code class="docutils literal notranslate"><span class="pre">KDAManager.prefill_capturable</span></code> is False), so the resource refuses a prefill
+bucket on it and the model leaves those buckets out.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">LoraSpec</span></code> (built by <code class="docutils literal notranslate"><span class="pre">module_lora_spec</span></code>)</p></td>
 <td><p>Per-request LoRA adapters on the node’s LoRA-capable linears: a pool of device
 slots, a pinned host tier, and the per-step addressing a LoRA kernel reads.
 Returned from <code class="docutils literal notranslate"><span class="pre">get_lora_specs</span></code> (one per node), not this list, and built only
@@ -1594,7 +1613,8 @@ plus a <code class="docutils literal notranslate"><span class="pre">DSASpec</spa
 </tr>
 <tr class="row-odd"><td><p>A node that carries per-request state between steps of a loop (an RNN-T
 decoder, recurrent attention)</p></td>
-<td><p>A <code class="docutils literal notranslate"><span class="pre">RecurrentStateSpec</span></code>, read and written with <code class="docutils literal notranslate"><span class="pre">gather</span></code> / <code class="docutils literal notranslate"><span class="pre">scatter_</span></code>.</p></td>
+<td><p>A <code class="docutils literal notranslate"><span class="pre">RecurrentStateSpec</span></code>, read and written with <code class="docutils literal notranslate"><span class="pre">gather</span></code> / <code class="docutils literal notranslate"><span class="pre">scatter_</span></code>, and for
+a linear-attention layer stack a <code class="docutils literal notranslate"><span class="pre">LinearAttnSpec</span></code> over it.</p></td>
 </tr>
 <tr class="row-even"><td><p>A node that samples with two different sets of parameters</p></td>
 <td><p>Two <code class="docutils literal notranslate"><span class="pre">SamplerSpec</span></code> objects that both name the node, under different keys.</p></td>

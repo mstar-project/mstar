@@ -1001,9 +1001,10 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">the tensor store's rid -&gt; uuids ownership, held in the Rust bookkeeper under</span>
 <span class="sd">RustTensorStore; purged by force_cleanup_request), RecurrentStatePool.{_keyed,</span>
 <span class="sd">_leases, _restores, _snap_writes, _decode, _unkeyed, _admit_restores,</span>
-<span class="sd">_admit_snaps} (purged by remove_request), ResidentPlanner.{_slot_of, _stale,</span>
-<span class="sd">_moved} (purged by release), SamplerCells._cells (purged by the sampler's</span>
-<span class="sd">remove_request), and WorkerProfileInfo.</span>
+<span class="sd">_admit_snaps, _admit_taken, _preplan_taken, _reserved} and KDAManager._verifying</span>
+<span class="sd">(purged by remove_request), ResidentPlanner.{_slot_of, _stale, _moved} (purged by</span>
+<span class="sd">release), SamplerCells._cells (purged by the sampler's remove_request), and</span>
+<span class="sd">WorkerProfileInfo.</span>
 
 <span class="sd">MicroScheduler.pending_tp_follow_count is the one deliberate exception: a</span>
 <span class="sd">ScheduleTPNode can arrive before the NEW_REQUEST that mints the handle, so it</span>
