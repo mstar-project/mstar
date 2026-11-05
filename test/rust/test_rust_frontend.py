@@ -1254,4 +1254,5 @@ def test_the_running_environment_s_binary_wins_over_one_on_path(tmp_path, monkey
     monkeypatch.delenv("MSTAR_SERVER_BIN", raising=False)
     monkeypatch.setenv("PATH", str(elsewhere))
     monkeypatch.setattr(sysconfig, "get_path", lambda name: str(scripts))
-    assert find_server_binary() == str(scripts / "mstar-server")
+    # Not a checkout's rust/, so the empty stand-ins are not run.
+    assert find_server_binary(rust_dir=tmp_path) == str(scripts / "mstar-server")
