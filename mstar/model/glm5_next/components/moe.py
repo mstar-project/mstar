@@ -1,0 +1,338 @@
+"""GLM-5.3-Flash MLP/MoE: sigmoid-router sparse MoE + the SwiGLU clamp."""
+from __future__ import annotations
+
+import torch
+import torch.nn.functional as F
+from torch import nn
+
+from mstar.distributed.communication import CommGroup
+from mstar.distributed.utils import divide
+from mstar.model.components.distributed import ParallelGatedMLP
+from mstar.model.components.moe import (
+    NoAuxTcRouter,
+    _down_proj_fp8_weight_loader,
+    _down_proj_weight_loader,
+    _gate_up_fp8_weight_loader,
+    _gate_up_weight_loader,
+)
+from mstar.model.glm5_next import fused_decode
+from mstar.model.glm5_next.config import Glm5NextModelConfig
+from mstar.platforms import current_platform
+from mstar.utils.fp8_block import dequantize_fp8_block_weight
+
+MOE_QUANT_KERNELS = ("reference", "triton", "auto")
+
+# Up to this many tokens the router and experts take the moe_decode kernels; larger
+# batches share enough experts for the grouped-GEMM runner to win.
+_DECODE_MAX_TOKENS = 64
+
+
+def _ceil_div(a: int, b: int) -> int:
+    return -(-a // b)
+
+
+class Glm5NextGatedMLP(ParallelGatedMLP):
+    """``ParallelGatedMLP`` with the GLM-5.3 SwiGLU clamp."""
+
+    def __init__(self, *args, swiglu_limit: float = 10.0, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.swiglu_limit = swiglu_limit
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        gate_up = self.gate_up_proj(x)
+        if (self.act is F.silu and gate_up.dtype == torch.bfloat16
+                and fused_decode.fused_available(gate_up)):
+            return self.down_proj(fused_decode.swiglu(gate_up, self.swiglu_limit))
+        gate, up = gate_up.split(self.intermediate_size_per_partition, dim=-1)
+        gate = gate.clamp(max=self.swiglu_limit)
+        up = up.clamp(min=-self.swiglu_limit, max=self.swiglu_limit)
+        return self.down_proj(self.act(gate) * up)
+
+
+class Glm5NextSparseMoeBlock(nn.Module):
+    """288 routed + 1 shared expert with the clamp on every path."""
+
+    def __init__(
+        self, config: Glm5NextModelConfig, comm_group: CommGroup | None = None
+    ) -> None:
+        super().__init__()
+        if comm_group is None:
+            comm_group = CommGroup.trivial()
+        self.comm_group = comm_group
+        self.tp_size = comm_group.world_size
+        self.tp_rank = comm_group.rank
+        self.hidden_size = config.hidden_size
+        self.num_experts = config.n_routed_experts
+        self.moe_intermediate_size = config.moe_intermediate_size
+        self.swiglu_limit = config.swiglu_limit
+        shard_inter = divide(config.moe_intermediate_size, self.tp_size)
+
+        self.fp8_experts = (
+            config.quantization_config is not None and config.moe_fp8_resident
+        )
+        self.quant_kernel = getattr(config, "moe_quant_kernel", "reference")
+        if self.quant_kernel not in MOE_QUANT_KERNELS:
+            # an unknown value would otherwise serve the eager reference loop silently
+            raise ValueError(
+                f"moe_quant_kernel={self.quant_kernel!r} is not one of {MOE_QUANT_KERNELS}"
+            )
+        # set by process_weights_after_loading; without it (CPU tests) the reference path runs
+        self._use_fused = False
+
+        self.gate = NoAuxTcRouter(
+            hidden_size=config.hidden_size,
+            n_routed_experts=config.n_routed_experts,
+            num_experts_per_tok=config.num_experts_per_tok,
+            routed_scaling_factor=config.routed_scaling_factor,
+            norm_topk_prob=config.norm_topk_prob,
+        )
+
+        self.experts = nn.Module()
+        if self.fp8_experts:
+            bo, bi = config.quantization_config.weight_block_size
+            self.block_size = (bo, bi)
+            hidden, E = config.hidden_size, config.n_routed_experts
+            assert shard_inter % bo == 0 and shard_inter % bi == 0, (
+                f"per-rank intermediate {shard_inter} must be a multiple of the "
+                f"fp8 scale block {self.block_size} for clean TP slicing (full "
+                f"model: 2048/8=256 per rank, 2 blocks of 128)"
+            )
+            # fp8 bytes in uint8 containers; e4m3 view happens at dispatch.
+            self.experts.gate_up_proj_fp8 = nn.Parameter(
+                torch.empty(E, 2 * shard_inter, hidden, dtype=torch.uint8),
+                requires_grad=False,
+            )
+            self.experts.gate_up_proj_scale_inv = nn.Parameter(
+                torch.empty(
+                    E, 2 * (shard_inter // bo), _ceil_div(hidden, bi),
+                    dtype=torch.float32,
+                ),
+                requires_grad=False,
+            )
+            self.experts.down_proj_fp8 = nn.Parameter(
+                torch.empty(E, hidden, shard_inter, dtype=torch.uint8),
+                requires_grad=False,
+            )
+            self.experts.down_proj_scale_inv = nn.Parameter(
+                torch.empty(
+                    E, _ceil_div(hidden, bo), shard_inter // bi,
+                    dtype=torch.float32,
+                ),
+                requires_grad=False,
+            )
+        else:
+            self.experts.gate_up_proj = nn.Parameter(
+                torch.empty(
+                    config.n_routed_experts, 2 * shard_inter, config.hidden_size,
+                )
+            )
+            self.experts.down_proj = nn.Parameter(
+                torch.empty(
+                    config.n_routed_experts, config.hidden_size, shard_inter,
+                )
+            )
+        self._attach_expert_weight_loaders()
+
+        self.shared_expert = Glm5NextGatedMLP(
+            hidden_size=config.hidden_size,
+            intermediate_size=config.moe_intermediate_size * config.n_shared_experts,
+            comm_group=comm_group,
+            activation=config.hidden_act,
+            bias=False,
+            swiglu_limit=config.swiglu_limit,
+        )
+        # Summed with the routed output and reduced once in forward.
+        self.shared_expert.down_proj.reduce_results = False
+
+    def _attach_expert_weight_loaders(self) -> None:
+        """Reattach per-shard loaders after ``_apply`` rebuilds parameters."""
+        from functools import partial
+
+        full_inter = self.moe_intermediate_size
+        if self.fp8_experts:
+            bo, bi = self.block_size
+            self.experts.gate_up_proj_fp8.weight_loader = partial(
+                _gate_up_fp8_weight_loader, self.tp_rank, self.tp_size, full_inter, 1,
+            )
+            self.experts.gate_up_proj_scale_inv.weight_loader = partial(
+                _gate_up_fp8_weight_loader, self.tp_rank, self.tp_size, full_inter, bo,
+            )
+            self.experts.down_proj_fp8.weight_loader = partial(
+                _down_proj_fp8_weight_loader, self.tp_rank, self.tp_size, full_inter, 1,
+            )
+            self.experts.down_proj_scale_inv.weight_loader = partial(
+                _down_proj_fp8_weight_loader, self.tp_rank, self.tp_size, full_inter, bi,
+            )
+        else:
+            self.experts.gate_up_proj.weight_loader = partial(
+                _gate_up_weight_loader, self.tp_rank, self.tp_size, full_inter,
+            )
+            self.experts.down_proj.weight_loader = partial(
+                _down_proj_weight_loader, self.tp_rank, self.tp_size, full_inter,
+            )
+
+    def _apply(self, fn, recurse=True):
+        result = super()._apply(fn, recurse=recurse)
+        self._attach_expert_weight_loaders()
+        return result
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        input_shape = hidden_states.shape
+        flat = hidden_states.view(-1, self.hidden_size).contiguous()
+
+        # topk_weights stay fp32 into every dispatch: the reference loop downcasts once, at
+        # index_add_, and the fused kernels fold them into their fp32 accumulator.
+        if self._use_decode(flat):
+            out = self._forward_decode(flat)
+        else:
+            topk_weights, topk_ids, _ = self.gate(flat)
+            if self._use_fused:  # the shared add rides the top-k sum
+                out = self._dispatch_fused(
+                    flat, topk_weights, topk_ids, shared=self.shared_expert(flat))
+            else:
+                routed = self._dispatch_clamped(flat, topk_weights, topk_ids)
+                out = routed + self.shared_expert(flat)
+        if self.tp_size > 1:
+            out = self.comm_group.all_reduce(out)
+        return out.view(input_shape)
+
+    def _expert_weights(self, expert_idx, out_dtype):
+        """One expert's (gate_up, down) weights, dequantized if fp8-resident."""
+        if not self.fp8_experts:
+            return (
+                self.experts.gate_up_proj[expert_idx],
+                self.experts.down_proj[expert_idx],
+            )
+        gate_up = dequantize_fp8_block_weight(
+            self.experts.gate_up_proj_fp8[expert_idx],
+            self.experts.gate_up_proj_scale_inv[expert_idx],
+            block_size=self.block_size, out_dtype=out_dtype,
+        )
+        down = dequantize_fp8_block_weight(
+            self.experts.down_proj_fp8[expert_idx],
+            self.experts.down_proj_scale_inv[expert_idx],
+            block_size=self.block_size, out_dtype=out_dtype,
+        )
+        return gate_up, down
+
+    def _dispatch_clamped(
+        self,
+        flat: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Clamped per-expert loop over the experts this batch hit."""
+        final = torch.zeros_like(flat)
+
+        with torch.no_grad():
+            expert_mask = F.one_hot(topk_ids, num_classes=self.num_experts)
+            expert_mask = expert_mask.permute(2, 1, 0)
+            expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
+
+        for expert_idx_t in expert_hit:
+            e = expert_idx_t[0]
+            top_k_pos, token_idx = torch.where(expert_mask[e])
+            tokens = flat[token_idx]
+
+            gate_up_w, down_w = self._expert_weights(e, flat.dtype)
+            gate, up = torch.mm(tokens, gate_up_w.T).chunk(2, dim=-1)
+            gate = gate.clamp(max=self.swiglu_limit)
+            up = up.clamp(min=-self.swiglu_limit, max=self.swiglu_limit)
+            out = torch.mm(F.silu(gate) * up, down_w.T)
+            out = out * topk_weights[token_idx, top_k_pos, None]
+            final.index_add_(0, token_idx, out.to(final.dtype))
+
+        return final
+
+    def _dispatch_fused(
+        self,
+        flat: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        shared: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """The clamped fp8 fused dispatch, which captures; ``shared``, the shared expert's
+        output, is added in the top-k sum."""
+        from mstar.utils.fused_moe import prefill as moe_prefill
+
+        return moe_prefill.experts(
+            flat,
+            self.experts.gate_up_proj_fp8,
+            self.experts.down_proj_fp8,
+            self.experts.gate_up_proj_scale_inv,
+            self.experts.down_proj_scale_inv,
+            topk_weights,
+            topk_ids,
+            block_size=self.block_size,
+            swiglu_limit=self.swiglu_limit,
+            shared=shared,
+        )
+
+    def _use_decode(self, flat: torch.Tensor) -> bool:
+        """Small fp8 batches take the moe_decode kernels, which need bf16 activations and
+        the shared expert in the routed experts' shape and dtype."""
+        shared = self.shared_expert.down_proj.weight
+        return (
+            self._use_fused
+            and flat.shape[0] <= _DECODE_MAX_TOKENS
+            and shared.shape[1] == self.experts.down_proj_fp8.shape[2]
+            and shared.dtype == flat.dtype == torch.bfloat16
+            and fused_decode.fused_available(flat)
+        )
+
+    def _dispatch_decode(
+        self,
+        flat: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Routed + shared experts in the moe_decode kernels, launched unchained."""
+        from mstar.utils.fused_moe import decode as moe_decode
+
+        exp, shared = self.experts, self.shared_expert
+        return moe_decode.experts(
+            flat, exp.gate_up_proj_fp8, exp.gate_up_proj_scale_inv,
+            exp.down_proj_fp8, exp.down_proj_scale_inv,
+            shared.gate_up_proj.weight, shared.down_proj.weight, topk_weights, topk_ids,
+            block_size=self.block_size, swiglu_limit=self.swiglu_limit)
+
+    def _forward_decode(self, flat: torch.Tensor) -> torch.Tensor:
+        """Router, routed and shared experts as one moe_decode launch chain; under TP the
+        output goes straight into the all-reduce buffer."""
+        from mstar.utils.fused_moe import decode as moe_decode
+
+        out = None
+        if self.tp_size > 1:
+            out = self.comm_group.all_reduce_buffer(flat.shape, flat.dtype, flat.device)
+        gate, exp, shared = self.gate, self.experts, self.shared_expert
+        return moe_decode.forward(
+            flat, gate.weight, gate.e_score_correction_bias,
+            exp.gate_up_proj_fp8, exp.gate_up_proj_scale_inv,
+            exp.down_proj_fp8, exp.down_proj_scale_inv,
+            shared.gate_up_proj.weight, shared.down_proj.weight,
+            top_k=gate.top_k, scale=gate.routed_scaling_factor, normalize=gate.norm_topk_prob,
+            block_size=self.block_size, swiglu_limit=self.swiglu_limit, out=out)
+
+    def process_weights_after_loading(self, device) -> None:
+        """Finalize the fp32 router copy and resolve reference-vs-fused."""
+        if not self.fp8_experts:
+            self._use_fused = False
+            self.gate.finalize_weights()
+            return
+        dev = torch.device(device) if device is not None else torch.device("cpu")
+        kernel = self.quant_kernel
+        # fp8 tensor-core dots need sm89 (Ada / Hopper) or newer
+        fused_ok = dev.type == "cuda" and current_platform.has_cuda_capability(8, 9, device=dev)
+        if fused_ok:
+            try:
+                from mstar.utils.fused_moe import fused_experts_fp8  # noqa: F401
+            except Exception:
+                fused_ok = False
+        if kernel == "triton" and not fused_ok:
+            raise RuntimeError(
+                "moe_quant_kernel='triton' requested but the fused fp8 kernel "
+                "is unavailable (it needs CUDA sm89+). Use 'reference' for the "
+                "clamped reference dispatch."
+            )
+        self._use_fused = kernel == "triton" or (kernel == "auto" and fused_ok)
+        self.gate.finalize_weights(topk_kernel=self._use_fused)
