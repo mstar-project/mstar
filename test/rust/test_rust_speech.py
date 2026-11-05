@@ -28,7 +28,7 @@ from test_rust_openai_adapters import NOT_PORTED, _classes, _model_of, _post
 
 from mstar.api_server import entrypoint
 from mstar.api_server.entrypoint import APIServer
-from mstar.api_server.openai import serving_speech
+from mstar.api_server.openai import _util, serving_speech
 from mstar.api_server.openai.adapters import ADAPTER_REGISTRY
 from mstar.api_server.openai.protocol import SpeechRequest
 from mstar.api_server.served_models import ServedModels
@@ -93,6 +93,37 @@ class _PythonSpeechServer:
 
 
 _RID = re.compile(r"^speech-[0-9a-f]{32}")
+
+# Does the Python frontend write compact SSE JSON? ``_util.sse`` prefers orjson
+# and falls back to ``json.dumps``, which spaces its separators. orjson is not a
+# declared dependency, so the frames are byte-identical to the Rust frontend's
+# (which always writes compact JSON) only where it is installed; everywhere else
+# the two still agree on the events, their order and their HTTP framing.
+_COMPACT_SSE = _util.sse({"a": 1}) == 'data: {"a":1}\n\n'
+
+
+SSE_TYPE = "text/event-stream; charset=utf-8"
+
+
+def _sse_frames(body) -> list[dict]:
+    """The JSON of each ``data: ...\\n\\n`` frame of one SSE body, checking that
+    framing. Takes the whole body, or the pieces (bytes or str) it came in."""
+    raw = body if isinstance(body, bytes) else b"".join(
+        piece if isinstance(piece, bytes) else piece.encode() for piece in body)
+    assert raw.endswith(b"\n\n"), raw
+    frames = []
+    for frame in raw.split(b"\n\n")[:-1]:
+        assert frame.startswith(b"data: "), frame
+        frames.append(json.loads(frame[len(b"data: "):]))
+    return frames
+
+
+def _comparable(answer: tuple) -> tuple:
+    """An answer with an SSE body reduced to its frames, where the Python
+    frontend has no orjson and so writes the same events with wider JSON."""
+    if _COMPACT_SSE or answer[1] != SSE_TYPE:
+        return answer
+    return (*answer[:3], _sse_frames(answer[3]), answer[4])
 
 
 def _python_submits(submitted: list[dict]) -> list[dict]:
@@ -195,7 +226,7 @@ def test_both_frontends_submit_and_answer_a_speech_the_same_way(cls, case, strea
     with _model_stack(model, stub) as (port, _upload):
         rust = _rust_answer(port, stub, body)
     python = _python_answer(model, body, tmp_path, monkeypatch)
-    assert rust == python
+    assert _comparable(rust) == _comparable(python)
     assert rust[0] == 200, rust
 
 
@@ -224,8 +255,15 @@ REFUSALS = {
     "stream-format-empty": ("qwen3_tts_1p7b", {"input": "Hi.", "stream_format": ""}),
     "stream-format-true": ("qwen3_tts_1p7b", {"input": "Hi.", "stream_format": True}),
     "stream-format-int": ("qwen3_tts_1p7b", {"input": "Hi.", "stream_format": 1}),
-    "stream-format-list": ("qwen3_tts_1p7b", {"input": "Hi.", "stream_format": ["sse"]}),
+    "stream-format-bigint": ("qwen3_tts_1p7b", {"input": "Hi.", "stream_format": 2**63}),
+    "stream-format-float": ("qwen3_tts_1p7b", {"input": "Hi.", "stream_format": 1e-5}),
+    "stream-format-float-big": ("qwen3_tts_1p7b", {"input": "Hi.", "stream_format": 1e16}),
+    "stream-format-list": ("qwen3_tts_1p7b", {"input": "Hi.", "stream_format": ["sse", 1, None]}),
     "stream-format-quote": ("orpheus", {"input": "Hi.", "stream_format": "it's"}),
+    # a format no stream carries is still refused as a stream when `stream` asks
+    # for one, whatever stream_format says
+    "stream-sse-mp3": ("qwen3_tts_1p7b", {"input": "Hi.", "stream": True,
+                                          "stream_format": "sse", "response_format": "mp3"}),
     "second-piece-refused": ("qwen3_tts_1p7b", {"input": LONG + " Now refuse this one."}),
     "no-speech": ("qwen3_5_0.8b", {"input": "Hi."}),
 }
@@ -289,9 +327,12 @@ def test_an_sse_speech_stream_is_framed_as_the_python_route_frames_it(text, fmt,
     with _model_stack("qwen3_tts_1p7b", stub) as (port, _upload):
         status, headers, chunks = _http(port, body)
     python = asyncio.run(_python_pieces("qwen3_tts_1p7b", dict(body), tmp_path))
-    assert (status, headers.get("content-type")) == (200, "text/event-stream; charset=utf-8")
-    assert chunks == [piece.encode() for piece in python]
-    events = [json.loads(c.removeprefix(b"data: ")) for c in chunks]
+    assert (status, headers.get("content-type")) == (200, SSE_TYPE)
+    events = _sse_frames(chunks)
+    assert events == _sse_frames(python)
+    assert len(chunks) == len(python), "one HTTP chunk per event on both frontends"
+    if _COMPACT_SSE:
+        assert chunks == [piece.encode() for piece in python]
     assert [e["type"] for e in events] == ["speech.audio.delta"] * (len(events) - 1) + ["speech.audio.done"]
     # the deltas carry exactly what the un-wrapped stream would have written
     raw = {**{k: v for k, v in body.items() if k != "stream_format"}, "stream": True}
@@ -307,9 +348,11 @@ def test_an_sse_speech_stream_ends_a_failure_with_an_in_band_error_event(tmp_pat
     with _model_stack("qwen3_tts_1p7b", stub) as (port, _upload):
         status, headers, chunks = _http(port, body)
     python = asyncio.run(_python_pieces("qwen3_tts_1p7b", dict(body), tmp_path))
-    assert (status, headers.get("content-type")) == (200, "text/event-stream; charset=utf-8")
-    assert chunks == [piece.encode() for piece in python]
-    events = [json.loads(c.removeprefix(b"data: ")) for c in chunks]
+    assert (status, headers.get("content-type")) == (200, SSE_TYPE)
+    events = _sse_frames(chunks)
+    assert events == _sse_frames(python)
+    if _COMPACT_SSE:
+        assert chunks == [piece.encode() for piece in python]
     assert events[-1] == {"type": "error", "error": {
         "message": "input refused by the model", "type": "invalid_request_error", "code": 400}}
     assert [e["type"] for e in events[:-1]] == ["speech.audio.delta"] * (len(events) - 1)
@@ -318,11 +361,13 @@ def test_an_sse_speech_stream_ends_a_failure_with_an_in_band_error_event(tmp_pat
 @pytest.mark.parametrize("sf", ["audio", "sse"])
 def test_stream_format_does_not_stream_a_compressed_container(sf, tmp_path, monkeypatch):
     """``stream_format`` forces a stream only for a format that can be streamed,
-    so the OpenAI SDK's default mp3 still answers as one whole body. Neither
-    frontend encodes mp3, so what each says is its own non-streaming refusal —
-    the very answer it gives with the field left out, and not the "cannot be
-    streamed" one ``stream: true`` draws, which is how the branch each took
-    shows. The two agree on the streamed refusal's wording."""
+    so the OpenAI SDK's default mp3 still answers as one whole body, which those
+    clients read too. The branch each frontend took is visible whatever it makes
+    of mp3: a stream sets ``Cache-Control: no-cache`` and submits its pieces
+    with ``streaming``, and ``stream: true`` is refused with the "cannot be
+    streamed" text both frontends share. (What a non-streamed mp3 itself gets
+    differs: the Rust frontend has no encoder, and the Python one answers by
+    whether the optional ``soundfile`` is installed.)"""
     plain = {"input": "Hi.", "response_format": "mp3"}
     switched, streamed = {**plain, "stream_format": sf}, {**plain, "stream": True}
     stub = _RustSpeechStub()
@@ -333,10 +378,12 @@ def test_stream_format_does_not_stream_a_compressed_container(sf, tmp_path, monk
     for frontend in (rust, python):
         was_plain, was_switched, was_streamed = frontend
         assert was_switched == was_plain, "stream_format changed a compressed answer"
-        assert (was_switched[0], was_streamed[0]) == (400, 400), frontend
+        assert was_switched[2] is None, "a streamed answer would set Cache-Control"
+        assert all(not s["streaming"] for s in was_switched[4]), was_switched
+        if was_switched[0] != 200:  # no encoder for it either way
+            assert "cannot be streamed" not in json.loads(was_switched[3])["error"]["message"]
+        assert was_streamed[0] == 400, frontend
         assert "cannot be streamed" in json.loads(was_streamed[3])["error"]["message"]
-        assert "cannot be streamed" not in json.loads(was_switched[3])["error"]["message"]
-        assert was_switched[4] == [], "a format it cannot write must not reach the engine"
     assert json.loads(rust[2][3]) == json.loads(python[2][3])
 
 
@@ -350,7 +397,7 @@ def test_stream_format_is_not_forwarded_as_a_model_kwarg(tmp_path, monkeypatch):
     with _model_stack("qwen3_tts_1p7b", stub) as (port, _upload):
         rust = _rust_answer(port, stub, body)
     python = _python_answer("qwen3_tts_1p7b", body, tmp_path, monkeypatch)
-    assert rust == python and rust[0] == 200, rust
+    assert _comparable(rust) == _comparable(python) and rust[0] == 200, rust
     assert rust[4] and all(s["streaming"] for s in rust[4])
     assert all("stream_format" not in s["mk"] for s in rust[4] + python[4])
     assert [s["mk"] for s in rust[4]] == [{"seed": 4, "top_k": 30, "voice": "ryan"}]

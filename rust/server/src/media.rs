@@ -289,18 +289,22 @@ pub fn is_streamable_audio_format(fmt: &str) -> bool {
 /// Python's `repr` of a JSON value, for a refusal that quotes a client's value
 /// of whatever type as the Python frontend's `{value!r}` does (`stream_format`
 /// reaches `create_speech` as whatever pydantic parsed into `model_extra`).
+///
+/// Two limits, both only reachable through a container or an absurd number in
+/// a field whose every accepted value is a short string: an integer outside
+/// `i64`/`u64` arrives as an `f64` here (serde_json carries no
+/// `arbitrary_precision`, and turning it on would restyle every number this
+/// server writes), where Python would still hold it exactly; and an object's
+/// keys come out sorted, since `serde_json::Value` is a `BTreeMap` without
+/// `preserve_order`, where Python keeps the order the client sent.
 pub fn py_repr_json(v: &serde_json::Value) -> String {
     match v {
         serde_json::Value::Null => "None".to_string(),
         serde_json::Value::Bool(true) => "True".to_string(),
         serde_json::Value::Bool(false) => "False".to_string(),
-        // Python's repr of a float always carries a point; serde keeps the
-        // integer/float split JSON made, so an int prints as an int.
-        serde_json::Value::Number(n) => match n.as_f64() {
-            Some(f) if n.as_i64().is_none() && n.as_u64().is_none() => {
-                let s = format!("{f}");
-                if s.contains(['.', 'e', 'E', 'n', 'i']) { s } else { format!("{s}.0") }
-            }
+        // serde keeps the integer/float split JSON made, so an int prints as an int
+        serde_json::Value::Number(n) => match (n.as_i64(), n.as_u64(), n.as_f64()) {
+            (None, None, Some(f)) => py_repr_f64(f),
             _ => n.to_string(),
         },
         serde_json::Value::String(s) => py_repr(s),
@@ -316,6 +320,48 @@ pub fn py_repr_json(v: &serde_json::Value) -> String {
                 .join(", ")
         ),
     }
+}
+
+/// Python's `repr` of a float: the shortest digits that round-trip (what
+/// Rust's `{:e}` gives too), positional while the decimal exponent is in
+/// `-4..16` and always with a point, otherwise `<mantissa>e<sign><2+ digits>`.
+/// `{}` alone diverges — it writes `0.00001` for Python's `1e-05` and
+/// `10000000000000000` for its `1e+16`.
+fn py_repr_f64(f: f64) -> String {
+    if f.is_nan() {
+        return "nan".to_string();
+    }
+    if f.is_infinite() {
+        return if f < 0.0 { "-inf".to_string() } else { "inf".to_string() };
+    }
+    let formatted = format!("{f:e}"); // "1.5e0", "1e-5", "-1.25e16"
+    let (mantissa, exponent) = formatted.split_once('e').expect("{:e} writes an exponent");
+    let exponent: i32 = exponent.parse().expect("{:e} writes a decimal exponent");
+    let (sign, mantissa) = match mantissa.strip_prefix('-') {
+        Some(rest) => ("-", rest),
+        None => ("", mantissa),
+    };
+    if exponent < -4 || exponent >= 16 {
+        let e_sign = if exponent < 0 { '-' } else { '+' };
+        return format!("{sign}{mantissa}e{e_sign}{:02}", exponent.abs());
+    }
+    let digits: String = mantissa.chars().filter(|c| *c != '.').collect();
+    let mut out = String::from(sign);
+    if exponent < 0 {
+        out.push_str("0.");
+        out.push_str(&"0".repeat((-exponent - 1) as usize));
+        out.push_str(&digits);
+    } else if digits.len() > exponent as usize + 1 {
+        let (whole, fraction) = digits.split_at(exponent as usize + 1);
+        out.push_str(whole);
+        out.push('.');
+        out.push_str(fraction);
+    } else {
+        out.push_str(&digits);
+        out.push_str(&"0".repeat(exponent as usize + 1 - digits.len()));
+        out.push_str(".0");
+    }
+    out
 }
 
 /// Python's `repr` of a str, for a refusal that quotes the client's value as
@@ -439,9 +485,8 @@ mod tests {
             ("false", "False"),
             ("7", "7"),
             ("-7", "-7"),
-            ("1.5", "1.5"),
-            ("1.0", "1.0"),
-            ("1e3", "1000.0"),
+            ("9223372036854775807", "9223372036854775807"),
+            ("18446744073709551615", "18446744073709551615"),
             (r#""sse""#, "'sse'"),
             (r#"["sse",1,null]"#, "['sse', 1, None]"),
             ("[]", "[]"),
@@ -450,6 +495,35 @@ mod tests {
         ] {
             let v: serde_json::Value = serde_json::from_str(body).unwrap();
             assert_eq!(py_repr_json(&v), want, "{body}");
+        }
+    }
+
+    /// `repr(float)`: the switch between positional and exponent form, and the
+    /// signed two-digit exponent, both of which `{}` gets wrong.
+    #[test]
+    fn repr_of_a_float_reads_as_pythons() {
+        for (f, want) in [
+            (1.0, "1.0"),
+            (-1.0, "-1.0"),
+            (0.0, "0.0"),
+            (-0.0, "-0.0"),
+            (1.5, "1.5"),
+            (1e3, "1000.0"),
+            (1234.5, "1234.5"),
+            (0.0001, "0.0001"),
+            (1e-5, "1e-05"),
+            (1.5e-7, "1.5e-07"),
+            (1e15, "1000000000000000.0"),
+            (1e16, "1e+16"),
+            (1.25e16, "1.25e+16"),
+            (-1e16, "-1e+16"),
+            (1e100, "1e+100"),
+            (1e-100, "1e-100"),
+            (0.1 + 0.2, "0.30000000000000004"),
+            (f64::MAX, "1.7976931348623157e+308"),
+            (f64::MIN_POSITIVE, "2.2250738585072014e-308"),
+        ] {
+            assert_eq!(py_repr_f64(f), want, "{f}");
         }
     }
 }
