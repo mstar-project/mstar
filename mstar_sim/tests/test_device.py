@@ -738,8 +738,8 @@ def test_tensor_parallel_ranks_meet_at_each_collective():
 
 @pytest.mark.parametrize("case", ["mismatch", "graph_vs_eager", "extra_replay", "skip"])
 def test_ranks_whose_collectives_dont_pair_abort(case):
-    """A rank whose collective doesn't pair with its peer's (another primitive, a graph
-    replayed against eager calls) aborts with both ranks' descriptors; one whose peer never
+    """A rank whose collective doesn't pair with its peer's (a barrier against an all-reduce,
+    a graph replayed against eager calls) aborts with both ranks' descriptors; one whose peer never
     comes aborts at the group's timeout, as NCCL's watchdog does, or hangs in a replay."""
     out = run_sim(f"""
         import datetime, os, tempfile, time, torch, torch.distributed as dist, torch.multiprocessing as mp
@@ -752,7 +752,7 @@ def test_ranks_whose_collectives_dont_pair_abort(case):
             torch.cuda.set_device(r)
             x = torch.empty(1 << 14, device="cuda")
             if "{case}" == "mismatch":
-                dist.all_reduce(x) if r else dist.all_gather_into_tensor(x, x[:1 << 13])
+                dist.all_reduce(x) if r else dist.barrier()
             elif "{case}" in ("graph_vs_eager", "extra_replay"):
                 graph = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(graph):

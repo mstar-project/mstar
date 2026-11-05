@@ -60,7 +60,7 @@ def _sim_tensors(args, kwargs) -> list[torch.Tensor]:
 # from each). The first five must be equal on every rank, and what rank i sends rank j is
 # what j receives from i; the AND of the sixth says whether the data moves.
 _PRIMITIVES = ("AllReduce", "Broadcast", "Reduce", "AllGather", "ReduceScatter", "AllToAll",
-               "AllReduceFusion", "Graph")
+               "AllReduceFusion", "Graph", "Barrier")
 _DTYPES = tuple(dict.fromkeys(v for v in vars(torch).values() if isinstance(v, torch.dtype)))
 _HELD = 5
 
@@ -244,6 +244,15 @@ def _collective(name: str, family: str, primitive: str | None):
     return call
 
 
+def _barrier(group=None, async_op=False, device_ids=None):
+    """A barrier meets as a collective (a meet is a barrier): NCCL's, a one-element all-reduce
+    on a device group, pairs against its peers' collectives; on a host group it waits as
+    gloo's does, aborting at the group's timeout where gloo's raises."""
+    if dist.get_world_size(group) > 1:
+        _meet(group or dist.group.WORLD, row("Barrier", size=dist.get_world_size(group)))
+    return _Done() if async_op else None
+
+
 # name -> (cost family, NCCL primitive, or None for point to point)
 _COLLECTIVES = {
     "all_reduce": ("all_reduce", "AllReduce"),
@@ -299,3 +308,4 @@ def install() -> None:
     for name, (family, primitive) in _COLLECTIVES.items():
         if hasattr(dist, name):
             setattr(dist, name, _collective(name, family, primitive))
+    dist.barrier = functools.wraps(dist.barrier)(_barrier)
