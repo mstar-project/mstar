@@ -370,7 +370,8 @@ class RopeManager(PositionManager):
 
     def rewind_run(self, step, ctx, replays: int) -> None:
         for segment, advance in zip(step.segments, self._advances(step), strict=True):
-            counters = self._counters.get(segment.request_id)
+            # a padding row went back to rest after its step (``release``): nothing to take back
+            counters = None if ctx.is_padding_row(segment.request_id) else self._counters.get(segment.request_id)
             if advance and counters is not None:
                 counters[segment.label] -= advance * replays
 
