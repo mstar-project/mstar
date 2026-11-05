@@ -153,7 +153,7 @@ def _refuse_unservable_lanes(
     speculated, planned ahead or lockstep, landing between two chain steps.
     So such a node needs a chain beside it, a graph backend's stream,
     rank-local timing, and walks of its own that no chain speculation reaches
-    into and that stage no host rows. Which resources it may hold is the
+    into. Which resources it may hold is the
     engine's to decide (``Engine._lane_contexts``).
     """
     walks = model.get_graph_walk_graphs()
@@ -182,9 +182,6 @@ def _refuse_unservable_lanes(
             if (name, walk) in combined:
                 raise refuse(f"walk {walk!r} is part of combined walk {combined[name, walk]!r}, "
                              "which the chain schedules")
-            if submodule.spanned_outputs(walk) or _stops_on_a_token(submodule, walk):
-                raise refuse(f"walk {walk!r} has output spans or a stop check, whose host rows stage "
-                             "through a ring the chain's next steps reuse before a step off it lands")
     return placed
 
 
@@ -199,15 +196,6 @@ def _row_nodes(model: Model, model_config: Mapping) -> set[str]:
         return repeating
     loops = (loop for section in model.get_graph_walk_graphs().values() for loop in section.get_loops().values())
     return repeating | {node for loop in loops for node in loop.get_nodes()}
-
-
-def _stops_on_a_token(submodule: NodeSubmodule, walk: str) -> bool:
-    """Whether ``walk``'s steps hand the worker row buffers for a stop check."""
-    stop = getattr(submodule, "token_stop", None)
-    loopback = getattr(submodule, "device_loopback", None)
-    return (
-        stop is not None and (stop.walk in (None, walk) or walk in stop.prefill_walks)
-    ) or (loopback is not None and loopback.walk == walk)
 
 
 def _tp_group_of(sharding: ShardingConfig, node: str, walk: str) -> ShardingGroup | None:

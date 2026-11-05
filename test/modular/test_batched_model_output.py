@@ -245,7 +245,6 @@ class _StagingWorker(_StubWorker):
     """The gpu-thread side of the host rows: stage behind the step, hand
     the landed rows to the stop check without a sync of its own."""
 
-    _host_rows_slot = 0
     _d2h_stream = None
     _stage_host_rows = Worker._stage_host_rows
     _copy_to_pinned = Worker._copy_to_pinned
@@ -253,6 +252,7 @@ class _StagingWorker(_StubWorker):
 
     def __init__(self, device=torch.device("cpu")):
         super().__init__(device)
+        self._host_rows_slots = {}
 
 
 def test_landed_host_rows_skip_the_side_stream_copy():

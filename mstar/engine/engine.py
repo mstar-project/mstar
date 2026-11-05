@@ -1204,8 +1204,8 @@ class Engine:
         stream too (``StepRunner._on_lane_of``). What only the chain does stays
         on the chain: a prefix cache, state the main thread moves outside the
         step (``Resource.journals_resident_moves``: eviction, prefix leases,
-        page trails), and host rows, which stage through a ring the chain's next
-        steps reuse before a step off it lands.
+        page trails). Host rows stage through a ring of the lane's own
+        (``Worker._stage_host_rows``).
 
         Nothing fences a lane's admit and plan against the main thread, so a
         resource a lane holds must keep them safe against its ingest, readiness
@@ -1244,9 +1244,6 @@ class Engine:
             if type(resource).journals_resident_moves():
                 raise refuse("the main thread moves its state outside the step (eviction, prefix leases or "
                              "page trails)")
-            if type(resource).step_host_rows is not Resource.step_host_rows:
-                raise refuse("its host rows stage through a ring the chain's next steps reuse before a step "
-                             "off it lands")
             (lane,) = holds
             contexts[key] = partial(backend.stream_context, self._lane_streams[lane])
         return contexts

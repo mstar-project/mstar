@@ -368,7 +368,7 @@ def test_gpu_thread_stages_spans_to_the_host_behind_the_step():
     worker = Worker.__new__(Worker)
     worker.device = torch.device("cuda", torch.cuda.current_device())
     worker.device_capability = DeviceCapability(worker.device)
-    worker._host_rows_slot = 0
+    worker._host_rows_slots = {}
     worker._pinned_d2h_buffers = __import__("collections").defaultdict(list)
     spans = torch.tensor([[3, 9], [0, 5]], device=worker.device)
     outputs = BatchedModelOutput(output_spans={"audio": spans}, span_request_ids=(1, 2))

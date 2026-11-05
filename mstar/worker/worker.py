@@ -338,7 +338,6 @@ class SpeculationTarget(NamedTuple):
 
 # pinned host-row buffers in flight at once (see Worker._stage_host_rows)
 _HOST_ROWS_RING = 4
-_HOST_SPANS_PURPOSE = tuple(f"output_spans{slot}" for slot in range(_HOST_ROWS_RING))
 
 
 def run_item(column: torch.Tensor, iteration: int) -> torch.Tensor:
@@ -594,7 +593,9 @@ class Worker:
             )
         # (node, walk) -> the loop-back signals the node keeps on the device
         self._device_loopback: dict[tuple[str, str], frozenset[str]] = {}
-        self._host_rows_slot = 0
+        # each lane's own ring of pinned host-row buffers: a lane's step lands
+        # after the chain's next steps have reused the chain's (``_stage_host_rows``)
+        self._host_rows_slots: dict[int, int] = {}
 
         # Per-phase wall-clock timing (MSTAR_PHASE_TIMING). On the worker
         # rather than in run()'s scope because the GPU and plan threads
@@ -2579,7 +2580,7 @@ class Worker:
                 outputs = engine.exec_and_postprocess(node_batch)
             laps.skip()
             if execution_stream is not None:
-                self._stage_host_rows(outputs)
+                self._stage_host_rows(outputs, self.scheduler.lane_of.get(batch.node_name, CHAIN_LANE))
                 laps.lap("stage_host_rows")
                 event = torch.Event(device=self.device)
                 event.record(execution_stream)
@@ -5065,7 +5066,7 @@ class Worker:
         out = [None if math.isnan(v := values.get(rid, math.nan)) else v for rid in rids]
         return out if any(v is not None for v in out) else []
 
-    def _stage_host_rows(self, outputs: "BatchedModelOutput") -> None:
+    def _stage_host_rows(self, outputs: "BatchedModelOutput", lane: int = CHAIN_LANE) -> None:
         """Start the device-to-host copy of the step's row-addressed stop
         buffers here on the gpu thread, on the execution stream right behind
         the clone that made them, so the completion event recorded next
@@ -5084,15 +5085,17 @@ class Worker:
         rows = bool(buffers) and outputs.row_request_ids is not None
         if not rows and not outputs.output_spans:
             return
-        slot = self._host_rows_slot = (self._host_rows_slot + 1) % _HOST_ROWS_RING
+        slot = self._host_rows_slots[lane] = (self._host_rows_slots.get(lane, 0) + 1) % _HOST_ROWS_RING
+        # a lane's ring is its own: with one step in flight it is never reused before that step lands
+        ring = "" if lane == CHAIN_LANE else f"_lane{lane}_"
         if rows:
             outputs.host_rows = HostRows(
                 tuple(outputs.row_request_ids),
-                self._copy_to_pinned(buffers, f"host_rows{slot}"),
+                self._copy_to_pinned(buffers, f"host_rows{ring}{slot}"),
             )
         if outputs.output_spans:
             outputs.host_spans = self._copy_to_pinned(
-                outputs.output_spans, _HOST_SPANS_PURPOSE[slot],
+                outputs.output_spans, f"output_spans{ring}{slot}",
             )
 
     def _copy_to_pinned(self, buffers: dict, purpose: str) -> dict:

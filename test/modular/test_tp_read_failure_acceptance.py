@@ -640,7 +640,7 @@ def _worker(rank, scenario, comm, graph, engine, tm, group):
     w._launch_wait_s = 1.0
     w._max_consecutive_spec = 1
     w._device_loopback = {}
-    w._host_rows_slot = 0
+    w._host_rows_slots = {}
     w._phase_period = 0
     w._phase_buf = {}
     w._gpu_spans = []

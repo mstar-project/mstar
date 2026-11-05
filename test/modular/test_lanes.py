@@ -33,7 +33,7 @@ from mstar.engine.resources.runner import StepRunner
 from mstar.engine.resources.step import ADMIT_OK, AllocationFailed, Segment, StepContext, SubmoduleStep
 from mstar.graph.base import GraphEdge, GraphNode, Loop
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
-from mstar.model.submodule_base import BatchedModelOutput, DeviceLoopback, NodeSubmodule, TokenStop
+from mstar.model.submodule_base import BatchedModelOutput, NodeSubmodule
 from mstar.utils.device import DeviceCapability
 from mstar.utils.threads import ThreadPool
 from mstar.worker.engine_manager import EngineManager, _refuse_unservable_lanes, node_lanes
@@ -135,15 +135,21 @@ def test_the_window_collates_on_the_lane_stream_before_the_step_is_submitted():
     assert worker.log == ["enter lane 1", "build", "exit lane 1", "in flight True", "submit"]
 
 
-def test_a_step_that_staged_host_rows_fails():
-    """Host rows stage through a ring the chain's next steps reuse before a
-    step off the chain lands; the startup refusal can't see an undeclared stop buffer."""
-    worker = _worker()
-    worker._execute_on_gpu_thread = lambda *a: SimpleNamespace(host_rows=object(), host_spans=None)
-    lane = Lane(worker, LANE)
+def test_a_lanes_host_rows_stage_through_a_ring_of_its_own():
+    """The chain's next steps reuse the chain's ring before a lane's step lands,
+    so a lane's stop buffers and spans stage through its own."""
+    from mstar.worker.worker import Worker
 
-    with pytest.raises(RuntimeError, match="stop buffers or output spans"):
-        lane.execute(_batch([1]), object(), None)
+    worker = Worker.__new__(Worker)
+    worker._host_rows_slots = {}
+    staged = []
+    worker._copy_to_pinned = lambda buffers, purpose: staged.append(purpose) or dict(buffers)
+    for lane in (CHAIN_LANE, LANE, CHAIN_LANE, CHAIN_LANE, CHAIN_LANE, CHAIN_LANE):
+        worker._stage_host_rows(SimpleNamespace(
+            check_stop_buffers={"tok": torch.zeros(1)}, row_request_ids=[1], output_spans=None,
+        ), lane)
+    lane_ring = {p for p in staged if "lane" in p}
+    assert lane_ring == {f"host_rows_lane{LANE}_1"} and not lane_ring & (set(staged) - lane_ring)
 
 
 def test_the_submitted_step_takes_the_lane_body_and_lifts_the_launch_fence():
@@ -888,19 +894,6 @@ def test_the_field_is_read_per_node_and_must_agree():
         node_lanes([{"node_names": ["Codec"], "side_stream": True}])
 
 
-class _Spans(_Codec):
-    def spanned_outputs(self, walk):
-        return frozenset({"audio_chunk"})
-
-
-class _Stops(_Codec):
-    token_stop = TokenStop(loop="decode", buffer="tok", stop_ids=frozenset({0}), sampler="s")
-
-
-class _Loops(_Codec):
-    device_loopback = DeviceLoopback(walk="codec_chunk", signal="tok", buffer="tok")
-
-
 _LOOP = Loop(name="decode_loop", section=_codec_node(), max_iters=4, outputs=[])
 
 
@@ -911,9 +904,6 @@ _LOOP = Loop(name="decode_loop", section=_codec_node(), max_iters=4, outputs=[])
     (dict(model=_Model({"codec_chunk": _codec_node(), "codec_warm": _LOOP})), "speculate into"),
     (dict(model=_Model({"codec_chunk": _LOOP})), "speculate into"),
     (dict(model=_Model(combined={CODEC: "codec_mixed"})), "combined walk"),
-    (dict(submodules={"Codec": _Spans(), "Talker": object()}), "output spans or a stop check"),
-    (dict(submodules={"Codec": _Stops(), "Talker": object()}), "output spans or a stop check"),
-    (dict(submodules={"Codec": _Loops(), "Talker": object()}), "output spans or a stop check"),
 ])
 def test_what_a_lane_cannot_serve_is_refused_naming_the_field(kwargs, reason):
     with pytest.raises(ValueError, match=reason) as raised:
@@ -943,11 +933,6 @@ class _Evicting(_Owned):
     @property
     def supports_eviction(self):
         return True
-
-
-class _HostRows(_Owned):
-    def step_host_rows(self, repeats=1):  # pragma: no cover - never called
-        return {}
 
 
 class _Dependent(_Owned):
@@ -992,7 +977,6 @@ def test_a_lane_holds_the_resources_of_its_nodes_alone_whatever_their_kind():
                                                                  "state": {"Codec"}}, {}, "depends on .'state'"),
     ({"state": _Owned()}, {"state": {"Codec"}}, dict(prefix_caches={"state"}), "prefix cache"),
     ({"state": _Evicting()}, {"state": {"Codec"}}, {}, "moves its state outside the step"),
-    ({"state": _HostRows()}, {"state": {"Codec"}}, {}, "host rows"),
 ])
 def test_a_resource_a_lane_cannot_hold_alone_is_refused(resources, declared_by, kwargs, reason):
     with pytest.raises(ValueError, match=reason):
