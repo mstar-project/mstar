@@ -180,6 +180,7 @@ the roofline.
   (a fact of the compiled kernel), so a mixed wrapper's decode workspace can come out larger than a
   GPU's, never smaller. MLA plans as fa2/fa3's planner does on any GPU, and a backend other than
   fa2 and fa3 asks for no workspace. `auto` chooses between fa2 and fa3 as FlashInfer does; on
-  Blackwell a ragged `auto` stays fa2 here, where FlashInfer can upgrade it to cudnn or cutlass.
+  Blackwell a ragged `auto` stays fa2 here, where FlashInfer can upgrade it to cudnn or cutlass,
+  and decode with 2 to 4 queries a row stays off cuDNN, which FlashInfer's `auto` can move it to.
 - A FlashInfer API the stand-in lacks raises `NotImplementedError("mstar_sim: flashinfer.<name>
   has no stand-in yet")` when called.
