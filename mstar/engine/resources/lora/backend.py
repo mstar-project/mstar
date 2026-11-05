@@ -27,6 +27,7 @@ import torch
 
 if TYPE_CHECKING:
     from mstar.engine.resources.lora.pool import LoraAddressing
+    from mstar.utils.fused_moe import MoeAlignment
 
 
 class LoraBackend(ABC):
@@ -88,23 +89,22 @@ class LoraBackend(ABC):
         h = self.shrink(x, a, addressing, ranks, len(out_slices))
         self.expand_fused(h, b, addressing, ranks, scalings, y, out_slices)
 
-    def align_experts(self, ids: torch.Tensor, num_ids: int):
+    @abstractmethod
+    def align_experts(self, ids: torch.Tensor, num_ids: int) -> "MoeAlignment | None":
         """What ``apply_experts_`` reads to group the rows of ``ids`` (``[tokens, top_k]``
         combined ids, ``num_ids`` meaning none) by id, shared by every call over them;
         None where nothing groups them (``experts_reference_``)."""
-        return None
 
+    @abstractmethod
     def apply_experts_(
         self, x: torch.Tensor, y: torch.Tensor, a: torch.Tensor, b: torch.Tensor,
         ids: torch.Tensor, row_weight: torch.Tensor, top_k: int, out_slices: tuple[int, ...],
-        alignment=None,
+        alignment: "MoeAlignment | None" = None,
     ) -> None:
         """``y[m, slice i] += row_weight[m] * (x[m // top_k] @ a[id, slice i]^T) @ b[id,
         slice i]^T`` for each row ``m`` of ``y``, ``id = ids.flatten()[m]``; a row whose id
         is past ``a``'s (``a.shape[0]``) gets nothing. ``a [ids, slices * R, in]``, ``b [ids,
         out, R]``; ``alignment`` is ``align_experts``' for ``ids``."""
-        del alignment
-        experts_reference_(x, y, a, b, ids, row_weight, top_k, list(out_slices))
 
 
 def experts_reference_(

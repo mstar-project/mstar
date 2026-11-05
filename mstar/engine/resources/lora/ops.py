@@ -132,6 +132,13 @@ def experts_alignment(ids: torch.Tensor, num_ids: int):
     return MoeAlignment(*moe_align_block_size(ids, block_m, num_ids), block_m)
 
 
+@torch.compiler.assume_constant_result
+def _grouped_on_cuda() -> bool:
+    """Whether ``triton_backend`` registered ``lora_experts_apply_``'s CUDA kernel, the one
+    reader of an alignment (not under ``backend: torch``). A constant to dynamo."""
+    return torch._C._dispatch_has_kernel_for_dispatch_key("mstar::lora_experts_apply_", "CUDA")
+
+
 class LoraOpsBackend(LoraBackend):
     """The custom ops: on CUDA the Triton kernels once ``triton_backend`` is imported,
     elsewhere the reference above, so a CPU test runs exactly the graph a GPU compiles."""
@@ -158,7 +165,7 @@ class LoraOpsBackend(LoraBackend):
 
     def align_experts(self, ids, num_ids):
         # the CUDA kernel groups rows by id; the reference reads them in order
-        return experts_alignment(ids, num_ids) if ids.is_cuda else None
+        return experts_alignment(ids, num_ids) if ids.is_cuda and _grouped_on_cuda() else None
 
     def apply_experts_(self, x, y, a, b, ids, row_weight, top_k, out_slices, alignment=None):
         sorted_ids, expert_ids, num_post_padded, block_m = alignment or (None, None, None, 0)

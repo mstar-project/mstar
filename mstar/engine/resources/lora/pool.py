@@ -66,7 +66,7 @@ from collections.abc import Callable, Iterator, Sequence
 from concurrent.futures import Future
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, NamedTuple
+from typing import TYPE_CHECKING, NamedTuple
 
 import numpy as np
 import torch
@@ -93,6 +93,9 @@ from mstar.engine.resources.step import (
 )
 from mstar.utils.h2d import H2DMirror, PinnedStager
 from mstar.utils.threads import ThreadPool
+
+if TYPE_CHECKING:
+    from mstar.utils.fused_moe import MoeAlignment
 
 logger = logging.getLogger(__name__)
 
@@ -170,7 +173,7 @@ class ExpertRows(NamedTuple):
 
     ids: torch.Tensor     # [tokens, top_k] int32 combined ids; past every factor for none
     scale: torch.Tensor   # [tokens], each token's slot's scaling
-    alignment: Any        # LoraBackend.align_experts of ids, shared by every GEMM over them
+    alignment: MoeAlignment | None  # LoraBackend.align_experts of ids, shared by every GEMM over them
 
 
 class LoraLayerDelta:
@@ -237,7 +240,7 @@ class LoraLayerDelta:
 
     def grouped_(
         self, x: torch.Tensor, y: torch.Tensor, ids: torch.Tensor, row_weight: torch.Tensor,
-        top_k: int, alignment=None,
+        top_k: int, alignment: MoeAlignment | None = None,
     ) -> None:
         """An experts target's delta, ``LoraBackend.apply_experts_`` over this layer's
         factors: ``y [rows, out]`` += ``row_weight`` times each row's delta of ``x [rows
