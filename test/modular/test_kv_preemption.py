@@ -182,36 +182,6 @@ def test_each_victim_sets_aside_what_it_frees_before_the_next_one_moves():
     assert kv._room() >= 0, f"the pool promises {kv._unused} pages, {-kv._room()} more than free and evictable"
 
 
-def test_a_victim_still_to_move_is_chosen_for_no_other_request():
-    kv = _pool()
-    _running(kv, "r1", 3, arrival=1)
-    _running(kv, "r2", 3, arrival=2)
-    _running(kv, "v", 4, arrival=3)
-    assert _preempt(kv, "r1", _short(kv, "r1"), droppable=lambda rid: True).to_drop == ["v"]
-
-    waits = _preempt(kv, "r2", _short(kv, "r2"), droppable=lambda rid: True)
-    assert waits == Victims([], [], [], waits=1), "r2 took r1's victim or moved itself"
-    _runner(kv).readmit("r2", NODE)
-    assert _preempt(kv, "r1", _short(kv, "r1"), droppable=lambda rid: True) == Victims([], [], []), "r1 chose again"
-    _drop(kv, "v")
-
-    assert not kv._earmarks and not kv._victims, "v's move didn't settle r1's earmark"
-    assert _step(kv, "r1", 1).ok, "r1 didn't get the page its victim freed"
-    assert _admitted(kv, "r2") and _step(kv, "r2", 1).ok, "r2 didn't get a page from the room v's move made"
-
-
-def test_a_request_waiting_on_its_own_victims_isnt_chosen_as_a_victim():
-    kv = _pool()
-    _running(kv, "r", 3, arrival=1)
-    _running(kv, "m", 3, arrival=2)
-    _running(kv, "v", 4, arrival=3)
-    assert _preempt(kv, "m", _short(kv, "m"), droppable=lambda rid: True).to_drop == ["v"]
-
-    victims = _preempt(kv, "r", _short(kv, "r"), droppable=lambda rid: True)
-
-    assert "m" not in victims.to_drop, "m, which waits on the room its own victim frees, was chosen as a victim"
-
-
 @pytest.mark.parametrize("flight", ["step_in_flight", "read_pending"])
 def test_a_request_with_a_step_or_read_in_flight_isnt_chosen(flight):
     kv = _pool()

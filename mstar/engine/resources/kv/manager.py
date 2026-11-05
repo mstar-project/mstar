@@ -4658,11 +4658,10 @@ class KVManager(AttentionResource):
         its grant counted goes into its allotment with them, so its next grant can't fail. A victim the host can
         take whole moves there, and any other is dropped, once ``droppable`` says its launched steps allow it.
 
-        Returns the victims, or ``rid`` itself when only moving ``rid`` frees pages, or none while ``rid`` waits
-        for its earlier victims to move or once the room covers its grant. When no move covers the shortage,
-        ``rid`` keeps its allotment and asks for every page its grant needed past it, and waits for them in the
-        pool's queue once the runner asks again. None when the pool doesn't decide or ``newer`` is None, as it
-        is for a request the conductor gave no number.
+        Returns the victims, or ``rid`` itself when only moving ``rid`` frees pages, or none once the room covers its
+        grant. When no move covers the shortage, ``rid`` keeps its allotment and asks for every page its grant needed
+        past it, and waits for them in the pool's queue once the runner asks again. None when the pool doesn't decide
+        or ``newer`` is None, as it is for a request the conductor gave no number.
         """
         if not self._decides or newer is None:
             return None
@@ -4673,20 +4672,14 @@ class KVManager(AttentionResource):
             counted = short.pages - pages_short + room - short.room
             claim = max(0, min(short.pages, counted, room))
             pages_short = short.pages - claim
-            if rid in self._earmarks or rid in self._victims:
-                return Victims([], [], [])
             if pages_short <= 0:
                 self._allot(rid, claim)
                 return Victims([], [], [])
             on_host = 0 if self._cpu_pool is None else self._cpu_pool.room()
-            left, hosted, asking, moving = on_host, set(), set(), False
+            left, hosted, asking = on_host, set(), set()
             victims: list[str] = []
             for other in newer:
                 if not self._holds(other):
-                    continue
-                if other in self._victims:
-                    # a victim not yet moved frees its pages for the request it was chosen for
-                    moving = True
                     continue
                 if not self._movable(other):
                     continue
@@ -4703,7 +4696,7 @@ class KVManager(AttentionResource):
             else:
                 pages = self._host_pages(rid)
                 to_host = pages is not None and pages <= on_host
-                if not moving and self._movable(rid) and (to_host or droppable(rid)) and self._frees([rid]) > 0:
+                if self._movable(rid) and (to_host or droppable(rid)) and self._frees([rid]) > 0:
                     self._victims[rid] = None
                     if to_host:
                         self._hosted.add(rid)
@@ -4737,11 +4730,11 @@ class KVManager(AttentionResource):
         )
 
     def _movable(self, rid: str) -> bool:
-        """Whether a move can take ``rid`` as soon as it is chosen: no room is set aside for it, no step or read is in
-        flight on its pages, and it isn't dropped with a rebuild still to land, since the rebuild runs on its
-        allotment. A move releases ``rid``'s leases, and a walk the cache served keeps its KV only in the lease, so
-        ``rid`` also stays until a later walk's admit takes the lease over."""
-        return rid not in self._earmarks and rid not in self._dropped and not any(
+        """Whether a move can take ``rid`` as soon as it is chosen: no step or read is in flight on its pages, and it
+        isn't dropped with a rebuild still to land, since the rebuild runs on its allotment. A move releases ``rid``'s
+        leases, and a walk the cache served keeps its KV only in the lease, so ``rid`` also stays until a later walk's
+        admit takes the lease over."""
+        return rid not in self._dropped and not any(
             stream.step_in_flight or stream.read_pending or (stream.lease is not None and stream.span_cursor.done)
             for stream in self._streams[rid].values()
         )
