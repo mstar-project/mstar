@@ -3114,3 +3114,25 @@ def test_a_loop_back_that_also_leaves_the_loop_is_not_kept_in_rows():
     repeats.edges = {("n", "w"): edges}
     repeats.limit = lambda node: 4
     assert repeats.kept_rows(resident=False) == {("n", "w"): {"t"}}
+
+
+def test_a_walk_with_a_capture_key_that_cant_be_resident_is_refused_at_load_not_at_capture():
+    """BAGEL's decode captures twice, without and with guidance, and only the
+    guided step declares a KV sink: the walk is refused on the verdict line,
+    where before the second capture stopped the worker."""
+    from mstar.engine.engine import Engine
+
+    segments = (Segment(1, "main", 1),)
+
+    def step(sink):
+        kv = KVStep(segments=segments, sink=frozenset({(1, "main")}) if sink else frozenset())
+        return SubmoduleStep(steps={"kv": kv}, segments=list(segments))
+
+    engine = Engine.__new__(Engine)
+    engine._runner = SimpleNamespace(order=("kv",))
+    mgmt = SimpleNamespace(resources={"kv": object()})
+    runner = SimpleNamespace(keyed_template_steps=lambda walk: {False: step(False), True: step(True)})
+    why = engine._keyed_resident_refusal(mgmt, runner, WALK, step(False))
+    assert why is not None and why.startswith("its capture keyed True:") and "sink" in why
+    runner.keyed_template_steps = lambda walk: {False: step(False)}
+    assert engine._keyed_resident_refusal(mgmt, runner, WALK, step(False)) is None

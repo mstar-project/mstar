@@ -933,6 +933,17 @@ class AcceleratorGraphRunner:
         """The step ``walk``'s widest capture declares."""
         return self._template(self._widest(walk)).step
 
+    def keyed_template_steps(self, walk: str) -> dict[Any, SubmoduleStep | None]:
+        """The step each of ``walk``'s capture keys declares (its widest bucket),
+        by key: two keys of one walk can declare different steps (BAGEL's
+        decode with and without guidance)."""
+        steps: dict[Any, SubmoduleStep | None] = {}
+        for spec in self.prepare_for_capture():
+            key = spec.bucket.cg_key_info
+            if spec.bucket.graph_walk == walk and spec.slot == 0 and key not in steps:
+                steps[key] = self._template(spec).step
+        return steps
+
     def prepare_template(self, walk: str, carries: Mapping[str, CarryPair] = MappingProxyType({})) -> str | None:
         """Admit, plan and preprocess ``walk``'s widest capture on its padding
         rows, as its capture will, then free them. Before any capture, so the

@@ -54,6 +54,8 @@ from mstar.engine.resources.resident import (
     NOT_ASKED,
     ResidentPlanner,
     build_planner,
+    declared_streams,
+    step_refusal,
     watch_table_reads,
     watched_counts,
 )
@@ -828,7 +830,10 @@ class Engine:
             refusal = runner.resident_refusal(walk)
             if refusal is None:
                 steps[walk] = runner.template_step(walk)
-            else:
+                refusal = self._keyed_resident_refusal(submodule_mgmt, runner, walk, steps[walk])
+                if refusal is not None:
+                    del steps[walk]
+            if refusal is not None:
                 refusals[walk] = f"runner: {refusal}"
 
         def probe(walk: str) -> str | None:
@@ -848,6 +853,24 @@ class Engine:
         )
         refusals.update(refused)
         runner.bind_resident(submodule_mgmt.resident)
+
+    def _keyed_resident_refusal(
+        self, mgmt: SubmoduleManagement, runner: AcceleratorGraphRunner, walk: str, widest: SubmoduleStep | None,
+    ) -> str | None:
+        """Why a capture key of ``walk`` other than its widest bucket's can't run
+        resident, or None: each key's captures declare their own step, and every
+        one has to be a resident step over the same streams (a capture that
+        isn't stops the worker when it is made)."""
+        keys = [key for key in self._runner.order if key in mgmt.resources]
+        if widest is None or step_refusal(keys, widest) is not None:
+            return None  # the planner refuses the walk on its widest step itself
+        want = declared_streams(keys, widest)
+        for cg_key, step in runner.keyed_template_steps(walk).items():
+            if (why := step_refusal(keys, step)) is not None:
+                return f"its capture keyed {cg_key!r}: {why}"
+            if declared_streams(keys, step) != want:
+                return f"its capture keyed {cg_key!r} declares other streams than its widest"
+        return None
 
     def resident_refusal(self, node_name: str, graph_walk: str) -> str | None:
         """Why steps of ``graph_walk`` on ``node_name`` plan on the host, or
