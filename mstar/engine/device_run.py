@@ -12,8 +12,8 @@ when the run lands.
 
 torch binds no WHILE node, so ``CudaWhile`` calls the runtime through ctypes, as
 ``kv/page_copier.py`` does; ``cudaGraphSetConditional`` needs a kernel of ours,
-compiled with NVRTC and linked against ``libcudadevrt``. ``RunState.advance``
-is the same rule in torch, for a backend with no such kernel.
+compiled with NVRTC and linked against ``libcudadevrt``. ``run_stop`` is the
+one definition of a run's stop.
 """
 from __future__ import annotations
 
@@ -148,7 +148,6 @@ class RunState:
         self.refill = torch.zeros(1, dtype=torch.long, device=device)
         self.immune = torch.zeros(bs, dtype=torch.bool, device=device)
         self.marks = torch.zeros(bs, dtype=torch.bool, device=device)
-        self.live = torch.ones((), dtype=torch.bool, device=device)
         self.replays = torch.zeros(bs, dtype=torch.long, device=device)
         self.yield_word = yield_word if yield_word is not None else torch.zeros(1, dtype=torch.int32)
         self.stop_ids = torch.tensor(sorted(stop_ids), dtype=torch.long, device=device)
@@ -175,18 +174,6 @@ class RunState:
         if self.dropping is not None:
             rows = self.dropping.rows
             torch.where(self.marks, torch.full_like(rows, TRASH_SLOT), rows, out=self.dropping.slots)
-
-    def advance(self, tokens: torch.Tensor) -> None:
-        """``run_stop``: after a replay, this replay's stops and whether the run goes on."""
-        token = tokens.reshape(len(self.marks), -1)[:, 0]
-        self.marks |= (token.unsqueeze(-1) == self.stop_ids).any(-1) & ~self.immune
-        if self.stream is not None:
-            self.stream.tokens[:, int(self.index)] = token.cpu()
-            self.stream.landed[0] = int(self.index) + 1
-        self.index += 1
-        done = self.marks.sum()
-        go = ~self.marks.all() & (self.index[0] < self.limit[0]) & (self.yield_word.to(self.index.device)[0] == 0)
-        self.live.copy_(go & ((self.refill[0] == 0) | (done < self.refill[0])))
 
 
 class CudaWhile:

@@ -336,8 +336,8 @@ def test_a_stopped_row_leaves_its_kv_and_recurrent_state_where_its_stop_left_the
     tokens = [[9, 1], [1, 1], [1, 1]]  # row 0 stops in the first column
 
     def head(replay):
-        if replay:
-            state.advance(torch.tensor(tokens[replay - 1]))
+        if replay:  # the stop kernel's mark
+            state.marks |= (torch.tensor(tokens[replay - 1]).unsqueeze(-1) == state.stop_ids).any(-1)
         state.head()
 
     _replay(live, planner, s, head=head)

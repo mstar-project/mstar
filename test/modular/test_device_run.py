@@ -30,8 +30,19 @@ class _Loop:
         return 1, 2, torch.zeros(1)
 
     def stop(self, state, tokens, handle, stream):
+        """The test double of the ``run_stop`` kernel, which only CUDA can run."""
         self.state = state
-        state.advance(tokens)
+        token = tokens.reshape(len(state.marks), -1)[:, 0]
+        state.marks |= (token.unsqueeze(-1) == state.stop_ids).any(-1) & ~state.immune
+        if state.stream is not None:
+            state.stream.tokens[:, int(state.index)] = token
+            state.stream.landed[0] = int(state.index) + 1
+        state.index += 1
+        done = int(state.marks.sum())
+        self.go = (
+            done < len(state.marks) and int(state.index) < int(state.limit) and int(state.yield_word[0]) == 0
+            and (int(state.refill) == 0 or done < int(state.refill))
+        )
 
     def node_refusal(self, graph):
         return None
@@ -45,7 +56,7 @@ class _Loop:
             self.on_iteration(i)
             self.body()
             i += 1
-            if not self.state.live:
+            if not self.go:
                 return
 
 
