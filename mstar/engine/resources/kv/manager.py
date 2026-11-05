@@ -4891,8 +4891,11 @@ class KVManager(AttentionResource):
             del self._earmarks[earmark.rid]
         if earmark.rid in self._asks:
             if earmark.pages <= self._room():
-                self._admit(earmark.rid, earmark.pages)
-                earmark.granted = earmark.pages
+                if self._admit(earmark.rid, earmark.pages):
+                    earmark.granted = earmark.pages
+                else:
+                    # turned guaranteed, so the later moves count toward its footprint
+                    earmark.pages = self._asks[earmark.rid]
             return
         granted = min(earmark.pages - earmark.granted, freed)
         if granted:
