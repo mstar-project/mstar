@@ -2,6 +2,7 @@ import gc
 import logging
 import math
 import os
+import re
 import sys
 import threading
 import time
@@ -12,16 +13,18 @@ from concurrent.futures import Future
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
-from functools import cached_property, partial
+from functools import cache, cached_property, partial
 from time import sleep
 from types import MappingProxyType
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 import torch
 from torch.distributed import ReduceOp
 
 from mstar.communication.codec import WireCodec
 from mstar.communication.communicator import CommProtocol, make_communicator
+from mstar.communication.edge_items import frame_dtypes, row_infos, row_input_signals
+from mstar.communication.edge_items import rows as stream_rows
 from mstar.communication.event import EventWakeup
 from mstar.communication.tensors import (
     LocalTransferEngine,
@@ -32,6 +35,7 @@ from mstar.communication.tensors import (
 from mstar.distributed.base import ShardingConfig
 from mstar.distributed.communication import WorkerParallelGroups
 from mstar.engine import apply_dynamo_config
+from mstar.engine.chunking import ChunkRange
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import AdmitFailedReason, AllocationFailed
 from mstar.engine.resources.kv.config import without_layouts
@@ -44,7 +48,6 @@ from mstar.graph.base import GraphEdge, GraphSection
 from mstar.graph.graph_io import format_graph_edge_list
 from mstar.graph.runtime.base import (
     ColumnarEdgeSpecs,
-    EdgeSpec,
     GraphRuntime,
     InlineColumn,
     PostprocessNeed,
@@ -57,8 +60,7 @@ from mstar.graph.runtime.base import (
     SpeculationOutput,
     SpeculationPrepInput,
 )
-from mstar.graph.runtime.python import PythonGraphRuntime
-from mstar.graph.runtime.utils import GraphRuntimeType, resolve_graph_runtime_type
+from mstar.graph.runtime.utils import require_rust_extension
 from mstar.model.base import Model, WorkerGraph
 from mstar.model.submodule_base import (
     END_PARTITION,
@@ -77,6 +79,7 @@ from mstar.utils.ipc_format import (
     ConductorMessage,
     ConductorMessageType,
     DrainRequest,
+    EdgeItems,
     FailRequests,
     InputSignals,
     MessageSource,
@@ -101,6 +104,7 @@ from mstar.utils.profiler import (
     phase_start,
     range_pop,
     range_push,
+    set_step_key,
 )
 from mstar.utils.threads import ThreadPool, pin_thread
 from mstar.worker.batch_builder import BatchBuilderType
@@ -108,10 +112,14 @@ from mstar.worker.chunk_loops import ChunkLoops
 from mstar.worker.engine_manager import EngineManager, refuse_combined_walks_across_tp_groups
 from mstar.worker.executing_batch import input_metadata_and_fwd_info, make_executing_batch
 from mstar.worker.micro_scheduler import (
+    CHAIN_LANE,
     MicroScheduler,
     ScheduledBatch,
+    tp_chunk_ranges,
+    unfinished_chunk_rids,
 )
 from mstar.worker.node_manager_utils import RequestStateManager
+from mstar.worker.side_steps import SIDE_LANE, SideStepLane
 from mstar.worker.spec_rows import DeferredRowInputs
 from mstar.worker.speculation import (
     Speculation,
@@ -141,6 +149,9 @@ _ADMIT_FENCE_WARN_S = 10.0
 # remembered key never gets another NEW_REQUEST.
 _REMOVED_RIDS_KEEP = 4096
 
+# a ScheduleTPNode row the leader did not chunk
+_UNCHUNKED = ChunkRange(-1, -1, -1, -1)
+
 
 # worker_phases span per message type handled in _process_message_list
 _MSG_SPANS = {t: f"worker.msg.{t.name.lower()}" for t in WorkerMessageType}
@@ -161,40 +172,33 @@ def _make_graph_runtime(
     tensor_manager,
     **kwargs,
 ) -> GraphRuntime:
-    """The runtime ``MSTAR_RUST_GRAPH`` selects (see
-    ``resolve_graph_runtime_type``).
+    """The Rust graph runtime.
 
-    Rust requires the Rust communicator and the Rust bookkeeper: it sends
+    It requires the Rust communicator and the Rust bookkeeper: it sends
     WORKER_GRAPHS_DONE and INPUT_SIGNALS itself on an Arc to the same
     transport, and settles refcounts on a share of the same bookkeeper, rather
-    than hopping back into Python for either. A Python one of either has no
-    such object to share, so asking for Rust with one raises.
+    than hopping back into Python for either. Anything else has no such object
+    to share, so this raises on it.
     """
-    if resolve_graph_runtime_type(log=True) == GraphRuntimeType.PYTHON:
-        return PythonGraphRuntime(
-            communicator=communicator,
-            tensor_manager=tensor_manager,
-            **kwargs,
-        )
+    require_rust_extension()
 
     from mstar.communication.rust_communicator import RustZMQCommunicator
     from mstar.graph.runtime.rust import RustGraphRuntime
 
     if not isinstance(communicator, RustZMQCommunicator):
         raise ValueError(
-            "MSTAR_RUST_GRAPH=1 needs the Rust communicator, but this worker "
-            f"built a {type(communicator).__name__}. Set MSTAR_RUST_ZMQ=1."
+            "The graph runtime needs the Rust communicator, but this worker "
+            f"built a {type(communicator).__name__}."
         )
     if not issubclass(communicator.codec, WireCodec):
         raise ValueError(
-            "MSTAR_RUST_GRAPH=1 needs the msgpack codec, but this worker "
-            f"built a {communicator.codec.__name__}. Set "
-            "MSTAR_WIRE_CODEC=msgpack."
+            "The graph runtime needs the msgpack codec, but this worker "
+            f"built a {communicator.codec.__name__}."
         )
     bookkeeping = tensor_manager.tensor_store.bookkeeping
     if not hasattr(bookkeeping, "_rust"):
         raise ValueError(
-            "MSTAR_RUST_GRAPH=1 needs the Rust TensorBookkeeping: the runtime "
+            "The graph runtime needs the Rust TensorBookkeeping: it "
             "holds a share of it, so a Python one cannot be handed over. "
             f"Got {type(bookkeeping).__name__}."
         )
@@ -288,6 +292,8 @@ class PendingBatch:
     # speculated step is handed off before the step it follows finishes, so
     # its step time starts at that finish anyway (see WorkerMetrics.step_done)
     submitted_at: float = 0.0
+    # the chain's step, or a side lane's (``mstar.worker.side_steps``)
+    lane: int = CHAIN_LANE
 
 
 class EvictionPolicy(Enum):
@@ -324,7 +330,7 @@ def _host_column(host_rows: HostRows | None, name: str) -> torch.Tensor | None:
     return buf.reshape(buf.shape[0], -1)[:, 0]
 
 
-class _LazyPerRid:
+class _LazyPerRid(Mapping):
     """``Worker._rows_to_per_rid`` on demand: the per-rid host dicts are built
     the first time a consumer reads them. The batched stop check, the row store
     and the inline emit read the rows directly, so in the common decode step
@@ -342,14 +348,8 @@ class _LazyPerRid:
             self._built = Worker._rows_to_per_rid(self._host, self._request_ids)
         return self._built
 
-    def get(self, key, default=None):
-        return self._dict().get(key, default)
-
     def __getitem__(self, key):
         return self._dict()[key]
-
-    def __contains__(self, key) -> bool:
-        return key in self._dict()
 
     def __iter__(self):
         return iter(self._dict())
@@ -357,9 +357,7 @@ class _LazyPerRid:
     def __len__(self) -> int:
         return len(self._request_ids)
 
-    def __bool__(self) -> bool:
-        return bool(self._request_ids)
-
+    # the built dict's own views, rather than Mapping's per-key lookups
     def items(self):
         return self._dict().items()
 
@@ -370,6 +368,88 @@ class _LazyPerRid:
         return self._dict().values()
 
 
+@cache  # (node, walk) pairs are few
+def _step_key(node_name: str, graph_walk: str) -> str:
+    """``step.<node>.<walk>``, as a phase name (``benchmark/worker_phases``
+    reads names of word characters and dots)."""
+    return "step." + re.sub(r"\W", "_", node_name) + "." + re.sub(r"\W", "_", graph_walk)
+
+
+class _LazyHostOutputs(Mapping):
+    """Per-rid host copies of a step's outputs, copied by output name on first
+    read (``copy_names(names) -> {name: {rid: host value}}``, one sync per call).
+
+    The stop check reads at most the sampled token, and a loop that stops on
+    its iteration count reads nothing, so copying every output down each step
+    paid for transfers nobody read. Outputs that leave by a host transport are
+    copied by the send instead; ``landed`` hands it what was copied here.
+    """
+
+    __slots__ = ("_source", "_copy_names", "_landed")
+
+    def __init__(self, source: dict, copy_names: Callable[[list[str]], dict]):
+        self._source = source
+        self._copy_names = copy_names
+        self._landed: dict[str, dict] = {}
+
+    def _copy(self, names) -> None:
+        missing = [n for n in dict.fromkeys(names) if n not in self._landed]
+        if missing:
+            self._landed.update(self._copy_names(missing))
+
+    def _host(self, name: str) -> dict:
+        self._copy((name,))
+        return self._landed[name]
+
+    def landed(self, names=()) -> dict[int, NameToTensorList]:
+        """What was copied, ``names`` first copied too, in one batched copy
+        and one sync for a host transport, which would otherwise copy each
+        tensor on its own."""
+        self._copy(names)
+        out: dict[int, NameToTensorList] = {}
+        for name, by_rid in self._landed.items():
+            for rid, value in by_rid.items():
+                out.setdefault(rid, {})[name] = value
+        return out
+
+    def get(self, rid, default=None):
+        row = self._source.get(rid)
+        if row is None:
+            return default
+        return _LazyHostRow(self, rid, row) if isinstance(row, dict) else row
+
+    def __getitem__(self, rid):
+        row = self._source[rid]
+        return _LazyHostRow(self, rid, row) if isinstance(row, dict) else row
+
+    def __iter__(self):
+        return iter(self._source)
+
+    def __len__(self) -> int:
+        return len(self._source)
+
+
+class _LazyHostRow(Mapping):
+    """One request's view of ``_LazyHostOutputs``: reading a name copies it."""
+
+    __slots__ = ("_parent", "_rid", "_row")
+
+    def __init__(self, parent: _LazyHostOutputs, rid, row: dict):
+        self._parent, self._rid, self._row = parent, rid, row
+
+    def __getitem__(self, name):
+        value = self._row[name]
+        # only a list of tensors has anything to copy
+        return self._parent._host(name)[self._rid] if isinstance(value, list) else value
+
+    def __contains__(self, name) -> bool:
+        return name in self._row
+
+    def __iter__(self):
+        return iter(self._row)
+
+    def __len__(self) -> int:
+        return len(self._row)
 
 
 class Worker:
@@ -398,6 +478,11 @@ class Worker:
     # The CPUs the main, GPU and plan threads share (None: not pinned) and
     # the process mask everything else keeps; see ``mstar.utils.cpus``.
     _step_cpus: cpus.StepCpus | None = None
+    # Walks that run beside the main chain, when this worker has any
+    _side_steps: SideStepLane | None = None
+    # lane -> the rows its step in flight holds (``_hold_rows``); replaced,
+    # never updated in place
+    _rows_by_lane: Mapping[int, frozenset[int]] = MappingProxyType({})
     _process_cpus: frozenset[int] = frozenset()
 
     @cached_property
@@ -542,6 +627,7 @@ class Worker:
         if model is not None:
             refuse_combined_walks_across_tp_groups(model, sharding_config, my_walks)
 
+        topology = model.get_partition_topology() if model else None
         # The graph runtime owns the per-request queues and the graph state.
         self._graph_runtime = _make_graph_runtime(
             my_worker_id=self.worker_id,
@@ -554,6 +640,10 @@ class Worker:
             tensor_manager=self.tensor_manager,
             communicator=self.communicator,
             combined_walk_of=model.combined_walk_of() if model is not None else None,
+            walk_driven_signals=frozenset(
+                conn.edge_name for conn in topology.connections
+                if conn.consumer_walk is not None
+            ) if topology is not None else frozenset(),
         )
 
         self.engine_manager = EngineManager.build(
@@ -640,6 +730,13 @@ class Worker:
             speculation_mixes_walks=(model_config or {}).get("speculation_mixes_walks"),
             batch_builder_type=BatchBuilderType((model_config or {}).get("batch_builder", "fifo")),
         )
+        if self.engine_manager.side_keys:
+            self.scheduler.lane_of = dict.fromkeys(self.engine_manager.side_keys, SIDE_LANE)
+            self._side_steps = SideStepLane(self, SIDE_LANE)
+            logger.info(
+                "Worker %s: %s run beside the chain on a side stream",
+                worker_id, list(self.engine_manager.side_keys),
+            )
 
         # Request ids are strings on the wire and ints (handles) inside this
         # worker; the runtime holds the table where the two meet.
@@ -666,7 +763,8 @@ class Worker:
         # run()) because _remove_request — which can be invoked indirectly
         # from _process_messages on any iter — reads/writes them.
         # _in_flight_rids: rids referenced by an in-flight GPU step or its
-        #   speculation; REMOVE_REQUEST for these is deferred.
+        #   speculation, on any lane (see ``_hold_rows``); REMOVE_REQUEST for
+        #   these is deferred.
         # _pending_removes: deferred REMOVE_REQUESTs, in the order they were
         #   deferred (a dict for that order: a follower's is rank 0's).
         self._in_flight_rids: set[int] = set()
@@ -707,7 +805,7 @@ class Worker:
         self.streaming_buffers: dict[int, dict[str, list[torch.Tensor]]] = {}
 
         # New streaming path: PartitionTopology + StreamBuffer on consumer worker
-        self.partition_topology = model.get_partition_topology() if model else None
+        self.partition_topology = topology
 
         # Determine which partition this worker serves (by checking which node names
         # appear in my_worker_graphs vs the topology connections)
@@ -762,8 +860,7 @@ class Worker:
         # (graph_walk, node) -> innermost enclosing loop, for ending a
         # stream-terminated loop and refusing an END_PARTITION from inside a
         # loop in _postprocess_batch. Structural, so it is derived from the
-        # model here rather than asked of the graph runtime per step -- which
-        # also keeps it identical under both runtimes.
+        # model here rather than asked of the graph runtime per step.
         self._innermost_loop_by_node: dict[tuple[str, str], str] = {}
         if model:
             self._innermost_loop_by_node = self._build_innermost_loop_cache(
@@ -911,29 +1008,36 @@ class Worker:
             self.scheduler.fail_rids({request_id})
         laps.lap("runtime_add")
 
+        # One NewRequest comes per partition this worker serves, and a later one
+        # can land after a step already ran. The tensor manager and the engine
+        # hold request-wide state, so only the first opens it. Opening it again
+        # would reset that state under the partition that is running.
+        first = request_id not in self.request_state.per_request_info
         self.request_state.add_request(request_id, body.request_info)
         self.scheduler.note_arrival(request_id)
         self._graph_runtime.register_stop_limits(request_id, body.request_info)
-        self.tensor_manager.register_request(
-            request_id, self._graph_runtime.get_sharding_config(request_id),
-        )
+        if first:
+            self.tensor_manager.register_request(
+                request_id, self._graph_runtime.get_sharding_config(request_id),
+            )
         laps.lap("worker_state")
-        try:
-            self.engine_manager.add_request(
-                request_id, body.request_info.resource_configs, body.request_info,
-            )
-            laps.lap("engine_add")
-            self._skip_unshared_publish(request_id, body.worker_graph_to_workers)
-            laps.lap("skip_publish")
-        except Exception as err:
-            # the engine rolled the ingest back; the conductor's REMOVE tears down the rest
-            text, _ = client_error_text(
-                err, f"Worker {self.worker_id}: ingest of request {body.request_id} failed",
-                log=logger,
-            )
-            self._fail_requests({request_id: f"Error in worker: {text}"})
-            self._process_unprocessed(body.request_id)
-            return
+        if first:
+            try:
+                self.engine_manager.add_request(
+                    request_id, body.request_info.resource_configs, body.request_info,
+                )
+                laps.lap("engine_add")
+                self._skip_unshared_publish(request_id, body.worker_graph_to_workers)
+                laps.lap("skip_publish")
+            except Exception as err:
+                # the engine rolled the ingest back; the conductor's REMOVE tears down the rest
+                text, _ = client_error_text(
+                    err, f"Worker {self.worker_id}: ingest of request {body.request_id} failed",
+                    log=logger,
+                )
+                self._fail_requests({request_id: f"Error in worker: {text}"})
+                self._process_unprocessed(body.request_id)
+                return
         body.request_info.resource_configs = without_layouts(body.request_info.resource_configs)
 
         self.streams.add_request(request_id, body.request_info)
@@ -986,9 +1090,7 @@ class Worker:
             self.worker_id, message.message_type.value, message.body.request_id,
         )
         if message.message_type == WorkerMessageType.INPUT_SIGNALS:
-            self.tensor_manager.ack_unread_tensors(
-                message.body.request_id, message.body.inputs,
-            )
+            self.tensor_manager.ack_unread_tensors(message.body.inputs)
 
 
     def _remove_request(self, body: RemoveRequest) -> None:
@@ -1088,7 +1190,10 @@ class Worker:
         self._pending_removes.pop(request_id, None)
 
         laps.lap("misc")
-        logger.info("Request cleanup complete: %s", body.request_id)
+        # DEBUG: once per request on the main thread, it cost as much as the
+        # engine's own removal (test/waypoint/serve_rollout.py, which waits on
+        # it, runs the server at DEBUG)
+        logger.debug("Request cleanup complete: %s", body.request_id)
         laps.lap("log")
 
         # Last: frees the handle for reuse, so nothing above may run after it.
@@ -1255,14 +1360,7 @@ class Worker:
             if edge.is_streaming and edge.tensor_info:
                 (streaming_with_tensors if edge.name in buffers else unbuffered).append(edge)
         if unbuffered:
-            # Nothing here will consume it: ack it unread so the producer frees
-            # it. Expected when the request's ingest failed on this worker.
-            if request_id not in self.scheduler.failed_rids:
-                logger.warning(
-                    "Worker %s: no stream buffer for %s of request %s; dropping it",
-                    self.worker_id, [edge.name for edge in unbuffered], body.request_id,
-                )
-            self.tensor_manager.ack_unread_tensors(body.request_id, unbuffered)
+            self._ack_unbuffered(request_id, body.request_id, unbuffered)
 
         # Only update fwd_info when there are non-streaming edges (i.e., this is
         # a conductor-triggered forward pass, not just streaming data from another
@@ -1289,7 +1387,9 @@ class Worker:
         if self.enable_nvtx:
             range_pop(synchronize=False)
             range_push("process_new_inputs.start_read")
-        # Start RDMA reads for non-streaming edges with tensor_info
+        # Start RDMA reads for non-streaming edges with tensor_info; a
+        # streamed row of an EDGE_ITEMS replayed from the park has none, and
+        # no forward-pass info either
         if non_streaming:
             futures = self.tensor_manager.start_read_tensors(
                 request_id, non_streaming,
@@ -1302,7 +1402,9 @@ class Worker:
                 request_id, streaming_with_tensors,
             )
             self.wakeup_event.register_futures(futures)
-            # a client stream's chunks come with no forward-pass info, and drive no walk
+            # no forward-pass info comes with a client stream's chunks, nor with
+            # a stream whose walk the producer does not decide (see
+            # `walk_driven_signals`)
             walks = body.request_info.stream_consumer_walks if body.request_info is not None else {}
             for edge in streaming_with_tensors:
                 stream_buf = req_info.stream_buffers[edge.name]
@@ -1325,6 +1427,49 @@ class Worker:
             )
         if self.enable_nvtx:
             range_pop()
+
+    def _process_edge_items(self, frame: EdgeItems) -> None:
+        """A step's streamed tensors from one producer (EDGE_ITEMS): each
+        row is what one INPUT_SIGNALS of a single streamed edge did, and the
+        frame's reads start in one call."""
+        reads: list[tuple[int, list[GraphEdge]]] = []
+        dtypes = frame_dtypes(frame)
+        for row in stream_rows(frame):
+            rid = self._rid(row.request_id)
+            if rid is None or rid not in self.request_state.per_request_info:
+                # not here yet, or removed: parked or dropped as the
+                # INPUT_SIGNALS it replaces
+                self._process_message_list([WorkerMessage(
+                    message_type=WorkerMessageType.INPUT_SIGNALS,
+                    body=row_input_signals(frame, row),
+                )])
+                continue
+            if not self._takes_input(row.request_id):
+                continue  # as _process_new_inputs: nothing read after READS_DONE
+            edge = GraphEdge(
+                next_node=row.next_node, name=row.signal,
+                tensor_info=row_infos(frame, row, dtypes), is_streaming=True,
+            )
+            stream_buf = self.request_state.per_request_info[rid].stream_buffers.get(row.signal)
+            if stream_buf is None:
+                self._ack_unbuffered(rid, row.request_id, [edge])
+                continue
+            # a row is one edge's items: a chunked producer's pieces join
+            stream_buf.pre_read_register_joined(frame.uuids[row.start:row.start + row.count])
+            reads.append((rid, [edge]))
+        if reads:
+            self.wakeup_event.register_futures(self.tensor_manager.start_read_tensors_multi(reads))
+
+    def _ack_unbuffered(self, rid: int, request_id: str, edges: list[GraphEdge]) -> None:
+        """Streamed edges of a known request with no stream buffer here:
+        nothing will consume them, so ack them unread for the producer to
+        free. Expected when the request's ingest failed on this worker."""
+        if rid not in self.scheduler.failed_rids:
+            logger.warning(
+                "Worker %s: no stream buffer for %s of request %s; dropping it",
+                self.worker_id, [edge.name for edge in edges], request_id,
+            )
+        self.tensor_manager.ack_unread_tensors(edges)
 
     def _unpersist_tensors(self, body: UnpersistTensors):
         for (uuid, ref_cnt) in body.uuid_to_ref_count.items():
@@ -1380,6 +1525,8 @@ class Worker:
                 self._remove_request(message.body)
             elif message.message_type == WorkerMessageType.INPUT_SIGNALS:
                 self._process_new_inputs(message.body)
+            elif message.message_type == WorkerMessageType.EDGE_ITEMS:
+                self._process_edge_items(message.body)
             elif message.message_type == WorkerMessageType.TENSOR_RECEIVED:
                 self._handle_tensor_received(message.body)
             elif message.message_type == WorkerMessageType.UNPERSIST_TENSORS:
@@ -1450,7 +1597,9 @@ class Worker:
         """Check all active StreamBuffers; when a chunk is ready, feed it as a normal input."""
         # Every ready chunk is popped first and ingested in one call (and one
         # Python <> Rust roundtrip)
+        laps = PhaseLaps("worker.main.poll_stream_buffers.")
         polled = self.streams.poll()
+        laps.lap("scan_and_pop")
         if not polled:
             return
 
@@ -1461,7 +1610,7 @@ class Worker:
         # in _postprocess_batch — NOT here, where an earlier in-flight pass's
         # WGD could read it before the final output chunk is emitted.
         refused = set(self._graph_runtime.ingest_inputs_batch(
-            self._edge_block((rid, [se.edge]) for rid, se in polled),
+            self.streams.edge_block(polled),
             # important: only ingest for this loop iter!
             can_buffer=False,
             is_streaming=True,
@@ -1472,6 +1621,7 @@ class Worker:
                 self.streams.return_edge(rid, se)
             else:
                 self.streams.mark_ingested(rid, se)
+        laps.lap("ingest")
 
 
     # ------------------------------------------------------------------
@@ -1665,7 +1815,9 @@ class Worker:
         reclaimed.
         """
         engine = self.engine_manager.get_engine(node_name)
-        if not engine.evictable(node_name):
+        # quietly: a resource that never evicts (a LoRA pool) ran out, which is
+        # backpressure for the scheduler, not a working set that does not fit
+        if not engine.evictable(node_name, affected_resources):
             return None
 
         active = [
@@ -1746,8 +1898,8 @@ class Worker:
         # sessions for one bad chunk. Take out just that rid and report it, so
         # the failure is attributed and loud.
         per_request_inputs, final_edges, unresolved = (
-            batch.input_edges.to_input_tensors(
-                self.tensor_manager.get_tensor, batch.request_to_worker_graph,
+            self.streams.input_tensors(
+                batch.input_edges, batch.node_name, batch.request_to_worker_graph,
                 skip_missing=True,
             )
         )
@@ -1828,6 +1980,18 @@ class Worker:
                 node_batch.request_ids, [ctx.walk_of(r) for r in node_batch.request_ids],
             )
             walks, walk_idx = rows.walks, rows.walk_idx
+        # the leader alone cuts chunks: a follower's own cut could differ
+        chunk_starts: list[int] = []
+        chunk_ends: list[int] = []
+        chunk_totals: list[int] = []
+        chunk_strides: list[int] = []
+        if node_batch.chunk_ranges:
+            for rid in node_batch.request_ids:
+                start, end, total, stride = node_batch.chunk_ranges.get(rid, _UNCHUNKED)
+                chunk_starts.append(start)
+                chunk_ends.append(end)
+                chunk_totals.append(total)
+                chunk_strides.append(stride)
         for worker in workers:
             self.communicator.send(
                 worker, msg=WorkerMessage(
@@ -1845,6 +2009,10 @@ class Worker:
                         prefix_hits=prefix_hits,
                         page_trails=page_trails,
                         read_check=read_check,
+                        chunk_starts=chunk_starts,
+                        chunk_ends=chunk_ends,
+                        chunk_totals=chunk_totals,
+                        chunk_strides=chunk_strides,
                     )
                 )
             )
@@ -2029,6 +2197,9 @@ class Worker:
 
         if not engine.can_pre_plan(spec_batch.node_name):
             return False
+        if self._phase_period:
+            sb = speculation.scheduled_batch
+            set_step_key(_step_key(sb.node_name, sb.graph_walk))
         try:
             if pending is not None:
                 # A step N this slow (a long admit, say) skips the pre-plan
@@ -2054,6 +2225,9 @@ class Worker:
             logger.exception("Worker %s: plan_executor pre-plan failed", self.worker_id)
             self._reset_skip_plan_flags(spec_batch)
             return False
+        finally:
+            if self._phase_period:
+                set_step_key(None)
 
     def _continuing_seq_lens(
         self, pending: PendingBatch, node_name: str, graph_walk: str,
@@ -2114,13 +2288,15 @@ class Worker:
         """
         devices = local_worker_devices or [str(self.device)]
         slot = worker_ids.index(self.worker_id) if local_worker_devices else 0
-        plan = cpus.devices_plan(knobs.step_thread_core(), devices)
+        plan = cpus.devices_plan(knobs.step_thread_core(), devices, knobs.idle_hold())
         cpus.install(plan)
         self._process_cpus = plan.mask
         self._step_cpus = plan.workers[slot] if plan.workers else None
         step = self._step_cpus
         if step is None:
-            logger.info("Worker %s: step threads not pinned (%s)", self.worker_id, plan.why)
+            # a host that doesn't call for pinning is the API server's one line
+            if not plan.declined:
+                logger.info("Worker %s: step threads not pinned (%s)", self.worker_id, plan.why)
         else:
             logger.info(
                 "Worker %s: step threads (main, GPU, plan) on CPUs %s (%s; %s, worker %d of %d, mask %s)",
@@ -2186,12 +2362,15 @@ class Worker:
         """Record the GPU times whose events have landed, leaving the rest:
         reading a pair still in flight would block the host on the GPU."""
         while self._gpu_spans:
-            start, end = self._gpu_spans[0]
+            start, end, key = self._gpu_spans[0]
             if not end.query():
                 return
             self._gpu_spans.popleft()
             # elapsed_time is ms; the phase buffer holds seconds
-            self._phase_record("gpu_exec", start.elapsed_time(end) / 1000)
+            elapsed = start.elapsed_time(end) / 1000
+            # drained while another step runs: not that step's sample
+            self._phase_buf.unkeyed("gpu_exec").append(elapsed)
+            self._phase_buf.unkeyed(f"{key}.gpu_exec").append(elapsed)
 
     def _execute_on_gpu_thread(
         self,
@@ -2214,6 +2393,8 @@ class Worker:
         timed = self._phase_period
         t_start = _time.perf_counter() if timed else 0.0
         c_start = _time.thread_time() if timed else 0.0
+        if timed:
+            set_step_key(_step_key(batch.node_name, batch.graph_walk))
         laps = PhaseLaps("worker.gpu_thread.")
         engine = self.engine_manager.get_engine(batch.node_name)
         if self.enable_nvtx:
@@ -2302,7 +2483,7 @@ class Worker:
                 if gpu_start is not None:
                     gpu_end = torch.Event(device=self.device, enable_timing=True)
                     gpu_end.record(execution_stream)
-                    self._gpu_spans.append((gpu_start, gpu_end))
+                    self._gpu_spans.append((gpu_start, gpu_end, _step_key(batch.node_name, batch.graph_walk)))
                     self._drain_gpu_spans()
                     laps.lap("gpu_exec_events")
             return outputs
@@ -2329,6 +2510,7 @@ class Worker:
                 self._phase_record(
                     "worker.gpu_thread.total.cpu", _time.thread_time() - c_start,
                 )
+                set_step_key(None)
             if self.enable_nvtx:
                 range_pop(synchronize=False)
 
@@ -2370,6 +2552,7 @@ class Worker:
         batch: ScheduledBatch,
         node_batch: ExecutingBatch,
         plan_future: Future | None,
+        execute: Callable | None = None,
     ) -> Future:
         """Submit a step to the GPU thread with a fresh launch event.
 
@@ -2380,10 +2563,80 @@ class Worker:
         batch.chunk_loop_walks = self.chunk_loops.walks_by_node.get(batch.node_name, frozenset())
         event = node_batch.launch_started_event = threading.Event()
         future = gpu_executor.submit(
-            self._execute_on_gpu_thread, batch, node_batch, plan_future,
+            execute or self._execute_on_gpu_thread, batch, node_batch, plan_future,
         )
         future.add_done_callback(lambda _f: event.set())
         return future
+
+    def _submit_step(
+        self,
+        gpu_executor: ThreadPool,
+        batch: ScheduledBatch,
+        node_batch: ExecutingBatch,
+        *,
+        lane: int = CHAIN_LANE,
+        plan_future: Future | None = None,
+        speculated: bool = False,
+        execute: Callable | None = None,
+        **step: Any,
+    ) -> PendingBatch:
+        """Hand a step to the GPU thread as ``lane``'s, through ``execute`` if
+        the lane runs it its own way. A ``speculated`` step was flagged in flight
+        when its speculation settled, and is not timed from here (see
+        ``PendingBatch.submitted_at``). Which rows the lane holds is the
+        caller's to record (``_hold_rows``): the chain's step N+1 takes over
+        only once N is postprocessed."""
+        if not speculated:
+            self._set_in_flight_flag(batch, True)
+        submitted_at = _time.perf_counter() if self._metrics is not None and not speculated else 0.0
+        future = self._submit_gpu_step(gpu_executor, batch, node_batch, plan_future, execute=execute)
+        self.wakeup_event.register_future(future)
+        step.setdefault("partition", self.request_state.get_partition_for_node(batch.node_name))
+        return PendingBatch(
+            batch=batch, node_batch=node_batch, node_name=batch.node_name,
+            graph_walk=batch.graph_walk, future=future, submitted_at=submitted_at,
+            lane=lane, **step,
+        )
+
+    def _hold_rows(self, lane: int, rids: Iterable[int]) -> None:
+        """The rows ``lane``'s step in flight holds are now ``rids``. Teardown
+        defers for every lane's (``_in_flight_rids``); a main-loop error fails
+        the chain's."""
+        rows = self._rows_by_lane = {**self._rows_by_lane, lane: frozenset(rids)}
+        self._in_flight_rids = set().union(*rows.values())
+
+    def _held_beside(self, lane: int) -> set[int]:
+        """The rows the other lanes' steps in flight hold."""
+        return set().union(*(rows for other, rows in self._rows_by_lane.items() if other != lane))
+
+    def _fail_step_rows(self, step: PendingBatch, outputs: BatchedModelOutput) -> None:
+        """Fail the rows a per-rid stage (prepare_inputs, a per-request
+        forward, postprocess) blamed; the rest of the step still postprocesses
+        and routes."""
+        failed = dict(step.node_batch.failed_requests)
+        self._drop_failed_rids(step, outputs, failed)
+        self._fail_requests(failed)
+
+    def _finish_step(self, step: PendingBatch, outputs: BatchedModelOutput) -> None:
+        """A step that ran, on any lane: its batch limit lifts, its outputs
+        are postprocessed and routed, and metrics count it."""
+        self.scheduler.clear_batch_limit(
+            step.node_name, step.graph_walk, len(step.batch.request_to_worker_graph),
+            walks=step.batch.rids_by_walk(),
+        )
+        chain = step.lane == CHAIN_LANE
+        span = "worker.postprocess_batch" if chain else "worker.postprocess_side"
+        keyed = self._phase_period > 0
+        if keyed:
+            set_step_key(_step_key(step.node_name, step.graph_walk))
+        try:
+            with self._span(span, cpu=f"{span}.cpu"):
+                self._postprocess_batch(step, outputs, clear_loop_stops=chain)
+        finally:
+            if keyed:
+                set_step_key(None)
+        if self._metrics is not None:
+            self._metrics.step_done(step.node_name, step.graph_walk, step.node_batch.inputs, step.submitted_at)
 
     def _count_turn(self, pending: "PendingBatch | None") -> None:
         """Once ``pending``'s admit has settled (``_await_admit_settled``): if
@@ -2845,8 +3098,11 @@ class Worker:
         spec_node_name = spec_target_info.node_name
         spec_target = (spec_node_name, graph_walk)
         # The merge below takes only this chain's capture group; another
-        # group's backlog runs only once the chain yields to it.
-        if self.scheduler.backlog_splits_from(self.request_state, spec_target, rid):
+        # group's backlog runs only once the chain yields to it. The chain's
+        # rows run this step one loop iteration on, and their group is the
+        # one they have there.
+        next_iter_of = spec_target_info.loop_name if spec_target_info.is_new_loop_iter else None
+        if self.scheduler.backlog_splits_from(self.request_state, spec_target, rid, next_iter_of):
             return None
         # Removes, aborts and failures are filtered here; prep_spec_rids
         # assumes that. A rid is also filtered when the target node isn't ready
@@ -2872,7 +3128,7 @@ class Worker:
         # rows waiting at its target (backlogged, or on its queues) get the
         # step here or not at all while it runs. Nothing is popped yet.
         chain = self.scheduler.pick_chain_step(
-            self.request_state, spec_target, candidates, mid_prefill,
+            self.request_state, spec_target, candidates, mid_prefill, next_iter_of,
         )
         laps.lap("pick_step")
         mid_prefill = chain.mid_prefill
@@ -2916,8 +3172,8 @@ class Worker:
                 f"Speculation asked for {spec_node_name!r} but the "
                 f"scheduler returned {fresh_batch.node_name!r}"
             )
-            fresh_inputs, fresh_final, _ = fresh_batch.input_edges.to_input_tensors(
-                self.tensor_manager.get_tensor,
+            fresh_inputs, fresh_final, _ = self.streams.input_tensors(
+                fresh_batch.input_edges, spec_node_name,
                 fresh_batch.request_to_worker_graph,
             )
             in_flight = set(continuing)
@@ -3108,6 +3364,8 @@ class Worker:
         batch_N = pending.batch
         # The leader names its rids by wire string; these are this rank's handles.
         head_rids = self.scheduler.tp_rids(head)
+        # before anything is popped: lists that do not match the rows raise
+        chunk_ranges = tp_chunk_ranges(head, head_rids)
         # rows whose input read failed here: built without, as on the serial path
         unread = self.scheduler.unread_rows(head, head_rids)
         head_walk_idx = dict(zip(head_rids, head.walk_idx, strict=True)) if head.walks else None
@@ -3115,7 +3373,12 @@ class Worker:
         # rows read here: prepped (continuing) or popped (fresh); every row,
         # unread ones included, runs the leader's continuation of N
         in_n = [r for r in head_rids if r in in_batch]
-        continuing = [r for r in in_n if r not in unread]
+        # N's rows mid-prefill loop back on nothing of N's: as on the leader,
+        # their next chunk is cut from the input held since their first. N's
+        # chunks came from the leader, so every rank splits these out alike.
+        held = batch_N.incomplete_node_rids
+        mid_prefill = {r for r in in_n if r in held} if held else set()
+        continuing = [r for r in in_n if r not in unread and r not in mid_prefill]
         fresh = [r for r in head_rids if r not in in_batch and r not in unread]
         if not in_n:
             return None
@@ -3169,13 +3432,7 @@ class Worker:
             graph_walk=spec_walk,
             rids=continuing,
             room_for_continuing=None,
-            streaming_edges=[
-                EdgeSpec(
-                    signal=e.name, next_node=e.next_node,
-                    uuids=[i.uuid for i in e.tensor_info],
-                    is_final_streaming_chunk=e._final_stream_chunk,
-                ) for _r, (e, _chunk) in polled
-            ],
+            streaming_edges=self.streams.edge_specs(polled),
             streaming_edges_per_rid=per_rid_counts,
         ))
         if prep is None:
@@ -3199,12 +3456,11 @@ class Worker:
         # Both seeded with their rid lists, so the `in prep_inputs` test below
         # still separates prepped rids from fresh ones -- a ready rid with no
         # prepped edge gets an empty mapping, as a zero-length slice used to.
-        get_tensor = self.tensor_manager.get_tensor
-        prep_inputs = prep.input_edges.to_input_tensors(
-            get_tensor, prep.ready_rids,
+        prep_inputs = self.streams.input_tensors(
+            prep.input_edges, head.node_name, prep.ready_rids,
         ).by_rid
-        fresh_inputs, fresh_final_edges, _ = fresh_edges.to_input_tensors(
-            get_tensor, list(fresh_wg),
+        fresh_inputs, fresh_final_edges, _ = self.streams.input_tensors(
+            fresh_edges, head.node_name, list(fresh_wg),
         )
         prep_wg = dict(zip(prep.ready_rids, prep.wg_ids, strict=True))
 
@@ -3215,6 +3471,9 @@ class Worker:
                 new_request_to_worker_graph[rid] = prep_wg[rid]
                 per_request_inputs[rid] = prep_inputs[rid]
             elif rid in unread:
+                per_request_inputs[rid] = {}
+            elif rid in mid_prefill:
+                new_request_to_worker_graph[rid] = in_batch[rid]
                 per_request_inputs[rid] = {}
             else:
                 new_request_to_worker_graph[rid] = fresh_wg[rid]
@@ -3237,7 +3496,7 @@ class Worker:
         self.scheduler.pop_tp_follow_head()
         # Its rids count as in flight now, so a remove landing before submit is
         # deferred like any other; ``_set_pending`` re-derives the set on submit.
-        self._in_flight_rids |= set(head_rids)
+        self._hold_rows(CHAIN_LANE, self._rows_by_lane.get(CHAIN_LANE, frozenset()) | set(head_rids))
         logger.debug(
             "Follow-speculating: %s %s (seq %d from %d)",
             head.node_name, head_rids, head.spec_seq, head.spec_from_seq,
@@ -3245,11 +3504,20 @@ class Worker:
         speculation = self._spec_builder.assemble(
             pending, spec_target_info,
             new_request_to_worker_graph, per_request_inputs,
-            consumed_streaming_edges, in_n, fresh_final_edges,
+            consumed_streaming_edges,
+            [r for r in in_n if r not in mid_prefill] if mid_prefill else in_n,
+            fresh_final_edges,
             is_same_node=True, spec_id=prep.spec_id, tp_seq=head.spec_seq,
             request_walks=request_walks,
+            chunk_ranges=chunk_ranges,
+            incomplete_node_rids=unfinished_chunk_rids(chunk_ranges),
         )
-        if head.read_check and speculation is not None:
+        # N's rows, as on the leader: N's settle readies them, not a cleared speculation
+        speculation.continuing_rids.update(mid_prefill)
+        if chunk_ranges:
+            # a fresh row's first chunk caps its Loop, as the leader's merge did
+            self.scheduler.cap_chunk_loops(speculation.scheduled_batch)
+        if head.read_check:
             speculation.node_batch.read_check_rids = tuple(head_rids)
         return speculation
 
@@ -3399,6 +3667,7 @@ class Worker:
     def _postprocess_batch(
         self, batch_N: PendingBatch,
         outputs: BatchedModelOutput,
+        clear_loop_stops: bool = True,
     ):
         # Stage stopwatch named like the NVTX ranges below; a clock stamp, not
         # a nested `_span`, because of the two early returns.
@@ -3462,8 +3731,11 @@ class Worker:
                 range_pop(synchronize=False)
             return
 
-        # pending stops are only needed for one iteration, so can be cleared now
-        self._graph_runtime.clear_pending_loop_stops()
+        # pending stops are only needed for one iteration of the chain, so can
+        # be cleared now; not by a side lane's step (``_finish_step``), which
+        # lands between two chain steps: the chain's next one has yet to read them.
+        if clear_loop_stops:
+            self._graph_runtime.clear_pending_loop_stops()
 
         # A rid failed or drained after this step was built is torn down, so
         # none of its outputs may leave: the step can already be in flight
@@ -3751,7 +4023,7 @@ class Worker:
         # trustworthy stop decision: routing it would either run its loop
         # forever or end it early. Only ever the ones this stop stage just
         # added: the caller already reported (and cleared) the rids that
-        # failed in prepare_inputs / postprocess.
+        # failed in prepare_inputs / their forward / postprocess.
         failed = dict(batch_N.node_batch.failed_requests)
         self._drop_failed_rids(batch_N, outputs, failed)
         self._fail_requests(failed)
@@ -3836,7 +4108,10 @@ class Worker:
                     node_name=batch_N.node_name,
                     graph_walk=graph_walk,
                     skip_cuda_sync=True,
-                    cpu_tensors=cpu_outputs,
+                    cpu_tensors=(
+                        cpu_outputs.landed(signals if self.tensor_manager.needs_cpu_tensor else ())
+                        if isinstance(cpu_outputs, _LazyHostOutputs) else cpu_outputs
+                    ),
                     ready_event=batch_N.node_batch.completion_event,
                 )
             return stored
@@ -3922,22 +4197,19 @@ class Worker:
                 batch_N.node_batch.request_ids,
                 batch_N.node_batch.exec_timings,
             )
-        # Before the local-streaming dereference below: numel() needs the
-        # tensors, and a new_token whose only other destination is a local
-        # stream holds a single reference, which that dereference drops to zero
-        # -- collecting the tensor this count is about to read.
+        laps = PhaseLaps("worker.postprocess.stream_send.")
         new_token_counts = self._count_new_tokens(
             route_output.new_token_output_idxs,
             stored.flat_rids, stored.flat_uuids, signals, stored.signal_idxs,
         )
+        laps.lap("count_tokens")
 
         # Before the sends below: remote consumers read the walks off the
         # fwd_info that rides with the streamed edges.
         self._assign_consumer_walks(batch_N)
 
-        # Local streaming stays here: a StreamBuffer holds real tensors, so it
-        # cannot move behind the runtime's contract.
-        streamed: list[int] = []
+        # The buffer holds each item by its uuid, taking over the routing
+        # reference the runtime counted for the local stream destination.
         for signal, per_signal in route_output.local_streaming_by_signal.items():
             consumer = self._walk_driven_edges.get(signal)
             by_rid: dict[int, list[int]] = {}
@@ -3951,12 +4223,8 @@ class Worker:
                     uuids, walks.get(consumer) if consumer else None,
                 )
                 for uuid in uuids:
-                    tensor = self.tensor_manager.get_tensor(uuid)
-                    stream_buf.put(uuid, tensor.clone())
-                    streamed.append(uuid)
-        # After the loop: one crossing for the batch rather than one per
-        # streamed tensor.
-        self.tensor_manager.dereference_batch_uniform(streamed)
+                    stream_buf.put(uuid, uuid)
+        laps.lap("local_streams")
 
         send_rids = [rid for rid in rids if rid not in failed_rids] if failed_rids else list(rids)
         needs_info = route_output.rids_needing_request_info
@@ -3982,6 +4250,7 @@ class Worker:
                         rid, batch_N.partition, published,
                     )
                     buffered_publish.add(rid)
+        laps.lap("publish")
         # Only the rids with something to report cross: a decode step has no
         # new-token counts (the inline token is not counted) and no stream
         # buffers, and an empty entry per rid cost a dict each to build and to
@@ -3989,6 +4258,7 @@ class Worker:
         # which is what an empty entry did.
         ntc_rids = [rid for rid in send_rids if new_token_counts.get(rid)]
         consumed = self.streams.consumption_batch(send_rids)
+        laps.lap("consumption")
         return SendInput(
             completion_id=route_output.completion_id,
             per_request_info=ParallelList(
@@ -4308,22 +4578,20 @@ class Worker:
         outputs: "BatchedModelOutput",
         completion_event: torch.Event | None,
         request_ids: list[int] | None = None,
-    ) -> tuple[dict[int, NameToTensorList], HostRows | None]:
-        """Side-stream D→H of every CUDA tensor in ``outputs`` so the subsequent
+    ) -> tuple[Mapping[int, Mapping[str, list[torch.Tensor]]], HostRows | None]:
+        """Side-stream D→H of the CUDA tensors in ``outputs`` so the subsequent
         ``check_stop`` reads (typically ``.item()`` on the sampled token)
         don't trigger a default-stream sync. With same-thread async,
         GPU(N+1)'s kernels are already queued on default stream behind
         N's outputs by the time we get here — a default-stream sync would
         block waiting for N+1 to finish, defeating the overlap.
 
-        Returns per-rid outputs with the CUDA tensors replaced by CPU
-        copies, plus ``HostRows`` when the submodule handed over row-addressed
-        buffers, for a batched stop check. Skipped (returns ``outputs`` unchanged) when there's no completion
-        event (CPU execution) or when CUDA is unavailable.
-
-        AR engines emit small per-rid output dicts (sampled token + maybe
-        a code) so the cost is negligible. If a future engine emits large
-        tensors here (e.g. activations), revisit.
+        Returns per-rid host outputs, plus ``HostRows`` when the submodule
+        handed over row-addressed buffers, for a batched stop check. Without
+        those, the outputs are a ``_LazyHostOutputs``, which copies an output
+        name for every rid the first time it is read. Skipped (returns
+        ``outputs`` unchanged) when there's no completion event (CPU execution)
+        or when CUDA is unavailable.
 
         The host tensors are views of pinned buffers the next step reuses. Their
         one other reader, a ``needs_cpu_tensor`` transport, gets them through
@@ -4368,36 +4636,41 @@ class Worker:
                 HostRows(tuple(row_rids), host),
             )
 
-        cpu_per_rid: dict = {}
+        # Shared by every name copied this step, so two names never land in
+        # one pinned buffer.
         buffer_indices: dict[tuple[str, torch.dtype, int], int] = defaultdict(int)
-        with side:
-            for rid, name_to_list in source.items():
-                if not isinstance(name_to_list, dict):
-                    cpu_per_rid[rid] = name_to_list
-                    continue
-                cpu_per_rid[rid] = {}
-                for name, tensors in name_to_list.items():
-                    if not isinstance(tensors, list):
-                        cpu_per_rid[rid][name] = tensors
-                        continue
-                    new_list = []
-                    for t in tensors:
-                        if torch.is_tensor(t) and t.device.type == self.device.type:
-                            # by size class, not shape: a per-shape count gives two shapes in one class the same buffer
-                            key = ("check_stop", t.dtype, self._pinned_size(t.numel()))
-                            idx = buffer_indices[key]
-                            buffer_indices[key] += 1
-                            cpu_t = self._get_pinned_d2h_buffer(
-                                "check_stop", t.shape, t.dtype, idx,
-                            )
-                            cpu_t.copy_(t, non_blocking=True)
-                            new_list.append(cpu_t)
-                        else:
-                            new_list.append(t)
-                    cpu_per_rid[rid][name] = new_list
-        side.synchronize()
 
-        return cpu_per_rid, None
+        def copy_names(names: list[str]) -> dict[str, dict]:
+            host: dict[str, dict] = {name: {} for name in names}
+            with side:
+                for name in names:
+                    for rid, name_to_list in source.items():
+                        if not isinstance(name_to_list, dict) or name not in name_to_list:
+                            continue
+                        tensors = name_to_list[name]
+                        if not isinstance(tensors, list):
+                            host[name][rid] = tensors
+                            continue
+                        new_list = []
+                        for t in tensors:
+                            if torch.is_tensor(t) and t.device.type == self.device.type:
+                                # by size class, not shape: a per-shape count gives
+                                # two shapes in one class the same buffer
+                                key = ("check_stop", t.dtype, self._pinned_size(t.numel()))
+                                idx = buffer_indices[key]
+                                buffer_indices[key] += 1
+                                cpu_t = self._get_pinned_d2h_buffer(
+                                    "check_stop", t.shape, t.dtype, idx,
+                                )
+                                cpu_t.copy_(t, non_blocking=True)
+                                new_list.append(cpu_t)
+                            else:
+                                new_list.append(t)
+                        host[name][rid] = new_list
+            side.synchronize()
+            return host
+
+        return _LazyHostOutputs(source, copy_names), None
 
     def _removal_step_reached(self, body: RemoveRequest) -> bool:
         """Whether this rank has consumed the step rank 0 released these pages
@@ -4445,14 +4718,15 @@ class Worker:
     ) -> None:
         """Excise ``failed_requests`` (rids, or a rid -> error map) from a finished batch.
 
-        A rid that raised in ``postprocess`` is still carried in the batch (the
-        engine only recorded the error), and one that raised in
-        ``prepare_inputs`` is already out of ``node_batch.request_ids`` but not
-        out of the worker-side ``ScheduledBatch``. Either way we must not route
-        its outputs or mark its node complete — that's how a request that blew
-        up mid-walk ends up reported to the client as a successful empty
-        response. ``_postprocess_batch`` reconciles the remaining structures
-        from ``node_batch.request_ids``.
+        A rid that raised in its per-request forward or in ``postprocess`` is
+        still carried in the batch (the engine only recorded the error), and one
+        that raised in ``prepare_inputs`` is already out of
+        ``node_batch.request_ids`` but not out of the worker-side
+        ``ScheduledBatch``. Either way we must not route its outputs or mark its
+        node complete — that's how a request that blew up mid-walk ends up
+        reported to the client as a successful empty response.
+        ``_postprocess_batch`` reconciles the remaining structures from
+        ``node_batch.request_ids``.
         """
         for rid in failed_requests:
             outputs.pop(rid, None)
@@ -4498,7 +4772,8 @@ class Worker:
             exc, f"Worker {self.worker_id} error in main loop", log=logger,
         )
 
-        failed_rids: set[int] = set(self._in_flight_rids)
+        # the chain's rows: a side lane's step fails on its own (``SideStepLane``)
+        failed_rids: set[int] = set(self._rows_by_lane.get(CHAIN_LANE, ()))
         for stale in in_flight:
             if stale is None:
                 continue
@@ -4850,6 +5125,8 @@ class Worker:
         consecutive_spec_steps = 0
         yield_away_from_target: tuple[str, str] | None = None
 
+        side_steps = self._side_steps
+
         def _arm_speculation(spec: Speculation) -> None:
             # Hand N+1 to the plan thread NOW. It waits on N's
             # commit event, then reserves a slot and pre-plans —
@@ -4863,7 +5140,7 @@ class Worker:
         def _set_pending(p: PendingBatch):
             nonlocal pending
             pending = p
-            self._in_flight_rids = set(p.batch.request_to_worker_graph) if p else set()
+            self._hold_rows(CHAIN_LANE, p.batch.request_to_worker_graph if p else ())
 
         # Per-phase wall-clock instrumentation, gated by MSTAR_PHASE_TIMING.
         # When enabled, every Nth speculative iter logs a histogram so we can
@@ -4970,6 +5247,12 @@ class Worker:
                 if self.enable_nvtx:
                     range_pop(synchronize=False)
                 laps.lap("poll_stream_buffers")
+
+                if side_steps is not None:
+                    if pending is None:
+                        side_steps.finish()
+                    side_steps.launch(gpu_executor)
+                    laps.lap("side_steps")
 
                 # Reads only: whether a rank sends this changes nothing it runs.
                 if metrics is not None:
@@ -5079,15 +5362,11 @@ class Worker:
                         )
 
                     if pending.node_batch.failed_requests:
-                        # A per-rid stage (prepare_inputs / postprocess) blamed
-                        # specific requests. Drop the speculation: it was built
-                        # from pending's rids and may thread outputs that the
-                        # failed rids never produced. The rest of the batch
-                        # still post-processes and routes normally below.
+                        # Drop the speculation: it was built from pending's
+                        # rids and may thread outputs that the failed rids
+                        # never produced.
                         _maybe_clear_spec()
-                        failed = dict(pending.node_batch.failed_requests)
-                        self._drop_failed_rids(pending, outputs, failed)
-                        self._fail_requests(failed)
+                        self._fail_step_rows(pending, outputs)
 
                     if speculation is not None:
                         spec_batch = speculation.scheduled_batch
@@ -5120,15 +5399,18 @@ class Worker:
 
                             # Hold the main thread off the GIL until the GPU
                             # thread reaches the forward launch; see exec.
-                            spec_future = self._submit_gpu_step(
+                            spec_pending = self._submit_step(
                                 gpu_executor, spec_batch, spec_node_batch,
-                                speculation.plan_future,
+                                plan_future=speculation.plan_future, speculated=True,
+                                partition=speculation.partition,
+                                speculative_new_iter=speculation.is_new_iter,
+                                loop_name=speculation.loop_name,
+                                tp_seq=speculation.tp_seq,
                             )
                             # the GPU thread owns the pre-plan and the rids
                             # from here; see _handle_main_loop_error
                             speculation.plan_future = None
                             speculation.submitted = True
-                            self.wakeup_event.register_future(spec_future)
                             if self.enable_nvtx:
                                 range_pop(synchronize=False)
                                 range_push("worker.gpu_submit_queued", synchronize=False)
@@ -5140,17 +5422,6 @@ class Worker:
                                 _phase_record("submit_spec", _time.perf_counter() - _t0)
                             if self.enable_nvtx:
                                 range_pop(synchronize=False)
-                            spec_pending = PendingBatch(
-                                batch=spec_batch,
-                                node_batch=spec_node_batch,
-                                node_name=spec_batch.node_name,
-                                partition=speculation.partition,
-                                graph_walk=spec_batch.graph_walk,
-                                future=spec_future,
-                                speculative_new_iter=speculation.is_new_iter,
-                                loop_name=speculation.loop_name,
-                                tp_seq=speculation.tp_seq,
-                            )
                         elif speculation.plan_future is not None:
                             # All continuing rids were dropped, so no spec
                             # batch was submitted. Drop the orphaned pre-plan
@@ -5169,27 +5440,19 @@ class Worker:
                     # failed rids upstream.
                     laps.skip()
                     if pending.node_batch.admit_error is None:
-                        self.scheduler.clear_batch_limit(
-                            pending.node_name, pending.graph_walk,
-                            len(pending.batch.request_to_worker_graph),
-                            walks=pending.batch.rids_by_walk(),
-                        )
-                        with self._span(
-                            "worker.postprocess_batch",
-                            cpu="worker.postprocess_batch.cpu",
-                        ):
-                            self._postprocess_batch(pending, outputs)
+                        self._finish_step(pending, outputs)
                         laps.skip()
-                        if metrics is not None:
-                            metrics.step_done(
-                                pending.node_name, pending.graph_walk,
-                                pending.node_batch.inputs, pending.submitted_at,
-                            )
 
-                    # Removes for any rid not in the in-flight spec step
-                    # are safe to apply now.
+                    # After N, while N+1 runs: the same thread, but not ahead of
+                    # the step the chain is about to speculate.
+                    if side_steps is not None:
+                        side_steps.finish()
+                    # Removes for any rid not in the in-flight spec step, or
+                    # another lane's, are safe to apply now.
                     laps.lap("step_done")
-                    in_flight = set(spec_pending.batch.request_to_worker_graph) if spec_pending else set()
+                    in_flight = self._held_beside(CHAIN_LANE)
+                    if spec_pending is not None:
+                        in_flight.update(spec_pending.batch.request_to_worker_graph)
                     self._apply_pending_removes_safe_to_drop(in_flight)
                     self._apply_pending_drains(in_flight)
                     laps.lap("post_removes")
@@ -5230,6 +5493,9 @@ class Worker:
                     if batch is None:
                         batch = self.scheduler.get_next_batch(self.request_state)
                 if batch is None:
+                    if side_steps is not None and side_steps.pending is not None:
+                        side_steps.finish(block=True)
+                        continue
                     self.communicator.wait_for_work(10)
                     continue
 
@@ -5252,21 +5518,12 @@ class Worker:
                 # Unlike the spec submit, this path doesn't hold off the GIL for
                 # the launch — but it still has to be fenceable, or the next
                 # iteration schedules against an admit that hasn't run.
-                self._set_in_flight_flag(batch, True)
-                submitted_at = _time.perf_counter() if metrics is not None else 0.0
-                future = self._submit_gpu_step(gpu_executor, batch, node_batch, None)
-                self.wakeup_event.register_future(future)
+                step = self._submit_step(
+                    gpu_executor, batch, node_batch,
+                    partition=batch_partition, tp_seq=fallthrough_tp_seq,
+                )
                 logger.debug("Scheduling: %s %s", batch.node_name, node_batch.request_ids)
-                _set_pending(PendingBatch(
-                    batch=batch,
-                    node_batch=node_batch,
-                    node_name=batch.node_name,
-                    partition=batch_partition,
-                    graph_walk=batch.graph_walk,
-                    future=future,
-                    tp_seq=fallthrough_tp_seq,
-                    submitted_at=submitted_at,
-                ))
+                _set_pending(step)
                 # Same accounting as the speculative path above
                 if phase_period:
                     _phase_record("iter_total", _time.perf_counter() - _iter_start)

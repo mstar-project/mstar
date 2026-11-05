@@ -78,8 +78,7 @@ class _Queue:
 class _Runtime:
     """Graph-level ready scan, over the manager's queues.
 
-    The real PythonGraphRuntime owns the queues and RequestStateManager shares
-    the same dict; this mirrors that by reading the manager's.
+    The real runtime owns the queues; this stand-in reads the manager's.
     """
 
     def __init__(self, manager: _Manager):
@@ -1236,6 +1235,62 @@ def test_a_chain_does_not_yield_to_a_failed_rid():
     assert sched.backlog_splits_from(_Manager([]), (NODE, WALK), "c0") is False
 
 
+
+class _StepScheduleEngine(_Engine):
+    """A capture group by denoise step, as a step schedule's dtype is: step 0 one group, the rest another."""
+
+    def capture_group(self, node_name, graph_walk, rid, fwd_info, input_metadata=None):
+        del node_name, graph_walk
+        loops = fwd_info.dynamic_loop_iter_counts
+        if input_metadata is not None and "loop" in input_metadata.dynamic_loop_iter_counts:
+            loops = input_metadata.dynamic_loop_iter_counts
+        return "first" if loops["loop"] < 1 else "rest"
+
+
+class _StepManager(_Manager):
+    def __init__(self, rids, steps):
+        super().__init__(rids)
+        self.steps = steps
+
+    def get_fwd_info(self, rid, partition):
+        del partition
+        return SimpleNamespace(dynamic_loop_iter_counts={"loop": self.steps[rid]})
+
+
+def _step_chain(continuing, waiting, steps, next_iter_of="loop"):
+    sched = _scheduler(_StepScheduleEngine(max_bs=16))
+    manager = _StepManager(waiting, steps)
+    sched.runtime = manager.runtime
+    manager.runtime.combined_walk_of = sched.combined_walk_of
+    manager.per_request_info.update(dict.fromkeys(continuing, object()))
+    chain = sched.pick_chain_step(manager, (NODE, WALK), list(continuing), (), next_iter_of)
+    return sched, chain.pick, sched.take_chain_step(manager, chain, len(continuing))
+
+
+def test_a_chain_crossing_into_another_group_leaves_the_rows_of_its_old_one():
+    """The chain's rows run its step one iteration on, at step 1; fresh rows at step 0 would mix the two."""
+    sched, pick, batch = _step_chain(["c0", "c1"], ["f0", "f1"], {"c0": 0, "c1": 0, "f0": 0, "f1": 0})
+    assert pick.taken == ["c0", "c1"] and batch is None
+    assert list(sched.backlog[(NODE, WALK)].request_to_worker_graph) == ["f0", "f1"]
+    # read at the step in flight, the chain's group was the fresh rows'
+    _, pick, batch = _step_chain(["c0", "c1"], ["f0", "f1"], {"c0": 0, "c1": 0, "f0": 0, "f1": 0}, next_iter_of=None)
+    assert list(batch.request_to_worker_graph) == ["f0", "f1"]
+
+
+def test_a_chain_crossing_into_another_group_takes_that_groups_rows():
+    _, pick, batch = _step_chain(["c0"], ["f0", "w2"], {"c0": 0, "f0": 0, "w2": 2})
+    assert pick.taken == ["c0", "w2"] and list(batch.request_to_worker_graph) == ["w2"]
+
+
+def test_a_chain_yields_by_the_group_it_crosses_into():
+    sched = _scheduler(_StepScheduleEngine(max_bs=16))
+    steps = {"c0": 0, "f0": 0, "w2": 2}
+    sched.backlog[(NODE, WALK)] = _batch(["f0"])
+    assert sched.backlog_splits_from(_StepManager([], steps), (NODE, WALK), "c0", "loop") is True
+    assert sched.backlog_splits_from(_StepManager([], steps), (NODE, WALK), "c0") is False
+    sched.backlog[(NODE, WALK)] = _batch(["w2"])
+    assert sched.backlog_splits_from(_StepManager([], steps), (NODE, WALK), "c0", "loop") is False
+
 # ── round robin ─────────────────────────────────────────────────────────
 
 
@@ -1368,10 +1423,11 @@ def _capture_group(split=True, captured=(WALK,)):
     from mstar.engine.engine import Engine
 
     runner = SimpleNamespace(captures_walk=lambda walk: walk in captured)
-    engine = SimpleNamespace(_submodules={
-        NODE: SimpleNamespace(submodule=_Submodule(split), accelerator_graph_runner=runner),
-    })
-    return Engine.capture_group(engine, NODE, WALK, 0, SimpleNamespace(guided=True))
+    engine = Engine.__new__(Engine)
+    engine._submodules = {
+        NODE: SimpleNamespace(submodule=_Submodule(split), accelerator_graph_runner=runner, piecewise_runners={}),
+    }
+    return engine.capture_group(NODE, WALK, 0, SimpleNamespace(guided=True))
 
 
 def test_an_opted_in_submodule_groups_by_its_capture_key():
@@ -1407,7 +1463,7 @@ def _stream_engine():
     runner = SimpleNamespace(captures_walk=lambda walk: walk == WALK)
     engine = _Engine(max_bs=16)  # readiness and the cap; the grouping is the real Engine's
     engine._submodules = {
-        NODE: SimpleNamespace(submodule=_StreamKeyedSubmodule(), accelerator_graph_runner=runner),
+        NODE: SimpleNamespace(submodule=_StreamKeyedSubmodule(), accelerator_graph_runner=runner, piecewise_runners={}),
     }
     engine.splits_by_capture_key = lambda node, walk: Engine.splits_by_capture_key(engine, node, walk)
     engine.capture_group = lambda *a, **kw: Engine.capture_group(engine, *a, **kw)
@@ -2347,10 +2403,10 @@ def _chunking_scheduler(engine, mixes=None) -> MicroScheduler:
     return sched
 
 
-def _cap_of(manager, rid):
+def _cap_of(manager, rid, walk="prefill"):
     from mstar.model.submodule_base import chunk_loop_name
 
-    return manager.loops.get((rid, chunk_loop_name(NODE, "prefill")), [0, None])[1]
+    return manager.loops.get((rid, chunk_loop_name(NODE, walk)), [0, None])[1]
 
 
 @pytest.mark.usefixtures("no_chunk_floor")
@@ -2788,3 +2844,55 @@ def test_removal_forgets_a_parked_request():
     sched.clear_rid("b", "b")
 
     assert not any(sched.parked.values()), "a recycled handle would start parked"
+
+
+def test_a_follower_runs_the_leaders_chunks():
+    """The leader alone cuts chunks; a follower takes them off the head, so
+    its chunk Loop ends on the same step as the leader's."""
+    from mstar.utils.ipc_format import ScheduleTPNode
+
+    sched = _scheduler(_Engine(max_bs=8))
+    sched.register_tp_follow(ScheduleTPNode(
+        node_name=NODE, graph_walk=WALK, request_ids=["t0", "t1", "t2"],
+        chunk_starts=[0, -1, 6], chunk_ends=[8, -1, 10], chunk_totals=[10, -1, 10],
+        chunk_strides=[8, -1, 4],
+    ))
+    manager = _Manager(["t0", "t1", "t2"])
+    sched.chunk_loop_walks = {NODE: frozenset({WALK})}
+
+    batch = _next_batch(sched, manager)
+
+    assert batch.chunk_ranges == {"t0": (0, 8, 10, 8), "t2": (6, 10, 10, 4)}
+    assert batch.incomplete_node_rids == {"t0"}
+    assert _cap_of(manager, "t0", WALK) == 10, "t0's first chunk caps its Loop, as on the leader"
+    assert _cap_of(manager, "t2", WALK) is None, "t2 was capped on its first chunk"
+
+
+def test_a_follower_step_without_chunks_takes_no_ranges():
+    from mstar.utils.ipc_format import ScheduleTPNode
+
+    sched = _scheduler(_Engine(max_bs=8))
+    sched.register_tp_follow(ScheduleTPNode(node_name=NODE, graph_walk=WALK, request_ids=["t0", "t1"]))
+
+    batch = _next_batch(sched, _Manager(["t0", "t1"]))
+
+    assert (batch.chunk_ranges, batch.incomplete_node_rids) == ({}, set())
+
+
+def test_a_follower_refuses_chunk_lists_that_do_not_match_its_rows():
+    """The ranks disagree on the step: it raises before any row is popped."""
+    from mstar.utils.ipc_format import ScheduleTPNode
+
+    sched = _scheduler(_Engine(max_bs=8))
+    head = ScheduleTPNode(
+        node_name=NODE, graph_walk=WALK, request_ids=["t0", "t1"],
+        chunk_starts=[4], chunk_ends=[8], chunk_totals=[10], chunk_strides=[4],
+    )
+    sched.register_tp_follow(head)
+    manager = _Manager(["t0", "t1"])
+
+    with pytest.raises(ValueError):
+        _next_batch(sched, manager)
+
+    assert sched.peek_tp_follow() is head
+    assert set(manager.queues["wg0"].get_ready_node_names()) == {"t0", "t1"}

@@ -1,19 +1,22 @@
+import tempfile
 import time
 
 import torch
 import torch.multiprocessing as mp
-import zmq
 from torch.multiprocessing.reductions import rebuild_cuda_tensor
 
-PORT = 5555
+from mstar.communication.codec import MsgpackCodec
+from mstar.communication.rust_communicator import RustZMQCommunicator
 
 NUM_REQUESTS = 5
 
 
-def sender():
-    ctx = zmq.Context()
-    sock = ctx.socket(zmq.PUSH)
-    sock.bind(f"tcp://127.0.0.1:{PORT}")
+def _comm(my_id, push_ids, prefix):
+    return RustZMQCommunicator(my_id, push_ids, ipc_socket_path_prefix=prefix, codec=MsgpackCodec)
+
+
+def sender(prefix):
+    comm = _comm("sender", ["receiver"], prefix)
 
     device = "cuda:0"
 
@@ -56,21 +59,22 @@ def sender():
 
         print(f"[Sender] Sending metadata for iter {i}...")
 
-        sock.send_pyobj((cuda_share, meta))
+        comm.send("receiver", (cuda_share, meta))
 
     print("[Sender] Done. Sleeping to keep storage alive...")
     time.sleep(10)  # keep process alive so IPC memory is valid
 
 
-def receiver():
-    ctx = zmq.Context()
-    sock = ctx.socket(zmq.PULL)
-    sock.connect(f"tcp://127.0.0.1:{PORT}")
+def receiver(prefix):
+    comm = _comm("receiver", [], prefix)
+    received = []
 
     for i in range(NUM_REQUESTS):
         start_total = time.perf_counter()
 
-        cuda_share, meta = sock.recv_pyobj()
+        while not received:
+            received = comm.get_all_new_messages(blocking=True)
+        cuda_share, meta = received.pop(0)
         recv_time = time.perf_counter()
 
         (
@@ -134,9 +138,10 @@ def receiver():
 
 if __name__ == "__main__":
     mp.set_start_method("spawn")
+    prefix = tempfile.mkdtemp(prefix="mstar_cuda_ipc_")
 
-    p1 = mp.Process(target=sender)
-    p2 = mp.Process(target=receiver)
+    p1 = mp.Process(target=sender, args=(prefix,))
+    p2 = mp.Process(target=receiver, args=(prefix,))
 
     p2.start()
     time.sleep(1)  # ensure receiver is ready

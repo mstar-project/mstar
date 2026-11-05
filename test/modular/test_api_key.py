@@ -161,6 +161,8 @@ def test_serve_main_applies_the_key_and_keeps_it_from_child_processes(monkeypatc
     else:
         monkeypatch.setenv(auth.API_KEY_ENV, KEY)
     monkeypatch.setattr("sys.argv", ["mstar", "serve", "kokoro", f"--api-key={KEY}", "--api-key", KEY])
+    # main() would hand pytest's log handlers to a writer thread, which repeats every later record
+    monkeypatch.setattr(entrypoint, "log_off_thread", lambda: None)
     try:
         # The config is read right after the key is applied; a missing one stops
         # main() before it spawns anything.

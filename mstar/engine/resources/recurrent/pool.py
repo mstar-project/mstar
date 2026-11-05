@@ -30,6 +30,7 @@ from mstar.engine.resources.recurrent.config import (
     RecurrentStateSpec,
     RecurrentStep,
 )
+from mstar.engine.resources.resident import gather_column
 from mstar.engine.resources.spec import ResourceReqConfig
 from mstar.engine.resources.step import (
     ADMIT_OK,
@@ -44,6 +45,12 @@ from mstar.utils.h2d import H2DMirror, PinnedStager
 
 if TYPE_CHECKING:
     from mstar.engine.resources.kv.manager import KVManager
+    from mstar.engine.resources.resident import (
+        CapturedResidentStep,
+        ResidentPlanner,
+        ResidentTable,
+        ResidentWrites,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -132,6 +139,10 @@ class RecurrentAddressing:
 
 
 class RecurrentStatePool(Resource):
+    # the node's planner and this pool's table of slots, once bound
+    _resident: "ResidentPlanner | None" = None
+    _resident_table: "ResidentTable | None" = None
+
     @classmethod
     def build(
         cls, spec: RecurrentStateSpec, info: EngineResourceInfo,
@@ -174,6 +185,8 @@ class RecurrentStatePool(Resource):
             )
             for name, block in config.blocks.items()
         }
+        # slot -> its views of every block, a list per dtype (`_zero_slot`)
+        self._slot_views: dict[int, list[list[torch.Tensor]]] = {}
 
         # rid -> label -> slot. Mirrors `KVManager._streams`.
         self._slots: dict[str, dict[str, SlotState]] = {}
@@ -223,13 +236,14 @@ class RecurrentStatePool(Resource):
 
         # Snapshots:
         # `_kv` is the KV cache whose page keys name them, None while they are off.
-        # `_snap_meta` maps a filed slot to its key, least recently filed or restored first.
+        # `_snap_meta` maps a filed slot to its key and whether it is a decode snapshot (a reply's),
+        # least recently filed or restored first. Eviction takes a reply's first.
         # `_snap_refs` counts the leases and restores holding a slot, which eviction skips.
         self._kv: KVManager | None = None
         first = config.max_slots
         self._snap_free = list(reversed(range(first, first + config.prefix_slots)))
         self._snap_by_key: dict[bytes, int] = {}
-        self._snap_meta: OrderedDict[int, bytes] = OrderedDict()
+        self._snap_meta: OrderedDict[int, tuple[bytes, bool]] = OrderedDict()
         self._snap_refs: dict[int, int] = {}
         # Handle-keyed, purged by `remove_request`.
         # `_keyed` holds the (rid, label) streams the KV cache keys.
@@ -329,9 +343,7 @@ class RecurrentStatePool(Resource):
     def ingest_request(self, rid: str, overrides: ResourceReqConfig | None = None):
         del overrides
         with self._lock:
-            # Idempotent: the conductor sends one NewRequest per partition, so
-            # a worker serving two ingests twice.
-            self._slots.setdefault(rid, {})
+            self._slots[rid] = {}
             self._version += 1
 
     def remove_request(self, rid: str):
@@ -380,8 +392,21 @@ class RecurrentStatePool(Resource):
             self._version += 1
 
     def _zero_slot(self, index: int) -> None:
-        for tensor in self._blocks.values():
-            tensor[:, index].zero_()
+        # One _foreach_zero_ call per dtype rather than a Python zero_ per
+        # block, over views built once per slot: a Qwen3-TTS codec stream's
+        # state is 38 blocks, and zeroing them one by one cost ~0.25 ms of the
+        # main thread per teardown. The fused kernel takes only dense views of
+        # one dtype; a block of more than one layer (GDN's conv and ssm) gives
+        # a strided ``[:, index]`` view, which still launches once per block,
+        # just from C++.
+        groups = self._slot_views.get(index)
+        if groups is None:
+            by_dtype: dict[torch.dtype, list[torch.Tensor]] = {}
+            for tensor in self._blocks.values():
+                by_dtype.setdefault(tensor.dtype, []).append(tensor[:, index])
+            groups = self._slot_views[index] = list(by_dtype.values())
+        for views in groups:
+            torch._foreach_zero_(views)
 
     def _alloc(self, rid: str, label: str) -> SlotState | None:
         with self._lock:
@@ -573,6 +598,10 @@ class RecurrentStatePool(Resource):
             "recurrent preplan is already pending; clear_preplan before "
             "planning a different step ahead"
         )
+        if ctx.resident is not None:
+            # the replay's kernels read the buffers its graph fills from the
+            # table; the addressing memo is left to host-planned steps
+            return self._current
         if self._preplanned:
             # Promotion: apply the fork copies staging left undone; see
             # `_pending_fork_state`.
@@ -861,27 +890,37 @@ class RecurrentStatePool(Resource):
                     slot.has_state = True
                     slot.tokens = restore.tokens
                     self._version += 1
-                    self._snap_meta.move_to_end(restore.slot)
+                    # last to evict now, and a reply's snapshot that served a hit is kept like a prompt's
+                    key, _ = self._snap_meta.pop(restore.slot)
+                    self._snap_meta[restore.slot] = (key, False)
                 self._unref(restore.slot)
 
     def _reserve_snapshot(self) -> int | None:
         """A free snapshot slot, else the least recently used one nothing
-        holds. Caller holds the lock."""
+        holds, a decode snapshot before a prompt's.
+
+        A prompt's snapshot serves every resend and later turn of its chat; a
+        decode snapshot only a prompt that repeats the reply token for token.
+        Every request files one of each, so one LRU over both would hold half
+        as many prompts as slots. Caller holds the lock."""
         if self._snap_free:
             return self._snap_free.pop()
-        snap = next((snap for snap in self._snap_meta if snap not in self._snap_refs), None)
+        refs = self._snap_refs
+        snap = next((snap for snap, (_, reply) in self._snap_meta.items() if reply and snap not in refs), None)
+        if snap is None:
+            snap = next((snap for snap in self._snap_meta if snap not in refs), None)
         if snap is not None:
-            del self._snap_by_key[self._snap_meta.pop(snap)]
+            del self._snap_by_key[self._snap_meta.pop(snap)[0]]
         return snap
 
-    def _index(self, snap: int, key: bytes) -> bool:
+    def _index(self, snap: int, key: bytes, reply: bool = False) -> bool:
         """File ``snap`` under ``key`` and return True, or free it and return
         False if an earlier copy stands. Caller holds the lock."""
         if key in self._snap_by_key:
             self._snap_free.append(snap)
             return False
         self._snap_by_key[key] = snap
-        self._snap_meta[snap] = key
+        self._snap_meta[snap] = (key, reply)
         return True
 
     def _save_decode(self, rid: str, label: str, slot: SlotState) -> None:
@@ -930,7 +969,7 @@ class RecurrentStatePool(Resource):
             self._unkeyed.discard(key)
             if decode.replaces is not None:
                 self._drop_decode(key, decode.replaces)
-            if self._index(decode.slot, name):
+            if self._index(decode.slot, name, reply=True):
                 self._decode[key] = DecodeSnapshot(decode.slot, decode.tokens, name)
             else:
                 del self._decode[key]
@@ -1092,6 +1131,30 @@ class RecurrentStatePool(Resource):
             )
         return found
 
+    # Resident planning
+
+    def resident_refusal(self) -> str | None:
+        if self.config.disable_sink_slot:
+            return "a pool with no sink slot has nowhere for a padding row"
+        return None
+
+    def bind_resident(self, planner: "ResidentPlanner", key: str) -> None:
+        self._resident = planner
+        self._resident_key = key
+        self._resident_table = planner.table()
+
+    def resident_row(self, rid: int, slot: int, row: list[int], writes: "ResidentWrites") -> None:
+        row[self._resident_table.col] = self._slots[rid][writes.streams[self._resident_key].label].index
+
+    def resident_gather(self, step: "CapturedResidentStep") -> None:
+        stream = step.streams[self._resident_key]
+        if stream.reads:
+            raise ValueError(f"recurrent pool {self._resident_key!r}: a resident step advances its state, not reads it")
+        key = CGSlotKey(bucket=step.bucket, slot=step.slot, label=stream.label)
+        table = self._resident_table
+        # a padding row reads the trash row's zero, which is SINK_SLOT
+        gather_column(self._resident.store, step.slots, table.stride, table.col, self._cg_addressing[key].slot_indices)
+
     # Engine lifecycle
 
     def build_accelerator_graph_buffers(
@@ -1105,6 +1168,7 @@ class RecurrentStatePool(Resource):
 
     def cleanup(self):
         self._blocks.clear()
+        self._slot_views.clear()
         self._cg_addressing.clear()
         self._cg_mirrors.clear()
         self._eager_addressing.clear()

@@ -87,6 +87,12 @@ class Wan22Config:
     # own compiled graph, on top of the shapes above.
     dit_max_batch_size: int = 1
 
+    # The DiT's self-attention kernel: "flashinfer" runs it through the engine's
+    # ragged resource (FlashInfer's ragged prefill, FA3 on Hopper); "sdpa" runs
+    # torch SDPA, the reference pipeline's kernel. The cross-attention always
+    # runs SDPA.
+    attention_backend: str = "flashinfer"
+
     # VAE-decode tiling policy: "auto" decodes untiled when free VRAM comfortably
     # exceeds the estimated untiled peak for the output size and tiles otherwise;
     # "tiled"/"untiled" force a path. WAN22_VAE_DECODE_TILING overrides at runtime.
@@ -107,6 +113,10 @@ class Wan22Config:
         # rather than read as on.
         if not isinstance(self.vae_decode_fast, bool):
             raise ValueError(f"Wan2.2 vae_decode_fast must be true or false, got {self.vae_decode_fast!r}.")
+        if self.attention_backend not in ("flashinfer", "sdpa"):
+            raise ValueError(
+                f"Wan2.2 attention_backend must be 'flashinfer' or 'sdpa', got {self.attention_backend!r}."
+            )
         self.fast_decode_sizes()
 
     def fast_decode_sizes(self) -> frozenset[tuple[int, int]]:

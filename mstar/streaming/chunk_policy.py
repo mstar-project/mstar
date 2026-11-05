@@ -46,6 +46,13 @@ class ChunkPolicy(ABC):
         """
         ...
 
+    def allow_partial_input(self) -> bool:
+        """Whether the consumer takes a chunked prefill a chunk at a time, each
+        chunk's piece an item of its own (``ChunkingPolicy.per_chunk_outputs``).
+        Default ``False``: a stream that does so into this consumer is refused
+        at load, since the consumer would read a piece as the whole input."""
+        return False
+
     def continue_after_producer_done(self) -> bool:
         """Whether the buffer should keep producing (empty) chunks after the
         producer signals done and all buffered items have been consumed.
@@ -150,14 +157,18 @@ class FixedChunkPolicy(ChunkPolicy):
             the producer finishes and all buffered items are consumed. A set
             of consumer walks does so only while the consumer is in one of
             them; in its other walks the stream just waits.
+        allow_partial: if True, take a chunked prefill's pieces as they
+            land (``ChunkPolicy.allow_partial_input``).
     """
 
     def __init__(
         self, chunk_size: int, continue_after_done: bool | frozenset[str] = False,
+        allow_partial: bool = False,
     ):
         super().__init__()
         self._chunk_size = chunk_size
         self._continue_after_done = continue_after_done
+        self._allow_partial = allow_partial
 
     def is_ready(self, buffer_len) -> bool:
         return buffer_len >= self._chunk_size
@@ -175,6 +186,9 @@ class FixedChunkPolicy(ChunkPolicy):
         if isinstance(self._continue_after_done, frozenset):
             return consumer_walk in self._continue_after_done
         return self._continue_after_done
+
+    def allow_partial_input(self) -> bool:
+        return self._allow_partial
 
 
 class RampChunkPolicy(ChunkPolicy):

@@ -45,7 +45,7 @@ Kernel-free, since the conductor builds it.
 from collections.abc import Collection, Sequence
 from typing import TYPE_CHECKING, NamedTuple
 
-from mstar.engine.resources.kv.arena import PageArena
+from mstar.engine.resources.kv.arena import PageArena, PythonPageArena
 from mstar.engine.resources.kv.prefix_index import PrefixIndex
 from mstar.engine.resources.spec import RoutingFacts
 
@@ -105,7 +105,7 @@ class KVRoutingMirror:
     def __init__(self, num_replicas: int, num_pages: int, page_size: int, labels: Collection[str]):
         self._page_size = page_size
         self._labels = labels
-        self._arenas = [PageArena(kv_cache=None, allocator=_FreePages(num_pages)) for _ in range(num_replicas)]
+        self._arenas = [PythonPageArena(num_pages, _FreePages(num_pages)) for _ in range(num_replicas)]
         self._indexes = [PrefixIndex(arena) for arena in self._arenas]
         for arena, index in zip(self._arenas, self._indexes, strict=True):
             # as `KVManager.enable_prefix_cache` at one rank, the only size a mirror is built for

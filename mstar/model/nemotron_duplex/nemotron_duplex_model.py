@@ -65,7 +65,6 @@ from mstar.engine.resources import (
     ResourceReqConfig,
     SamplerSpec,
     SamplingReqConfig,
-    apply_yaml_overrides,
 )
 from mstar.engine.resources.kv.bounded import BoundedKVSpec
 from mstar.engine.resources.kv.config import DEFAULT_PAGE_SIZE
@@ -73,7 +72,15 @@ from mstar.engine.resources.linear_attn.config import LinearAttnConfig, LinearAt
 from mstar.engine.resources.recurrent import Mamba2Geometry, RecurrentStateConfig, RecurrentStateSpec
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
-from mstar.model.base import ForwardPassArgs, KVLabel, LabelLayout, Model, ProcessPromptOutput, Span
+from mstar.model.base import (
+    ForwardPassArgs,
+    KVLabel,
+    LabelLayout,
+    Model,
+    ProcessPromptOutput,
+    Span,
+    serving_resources,
+)
 from mstar.model.components.audio_features import NemoLogMel
 from mstar.model.components.fastconformer_stream import stream_node_resources
 from mstar.model.multimodal import PromptPart
@@ -304,9 +311,8 @@ class NemotronDuplexModel(Model):
             return
         if not isinstance(cap, int) or isinstance(cap, bool) or cap < 1:
             raise ValueError(f"{config_path}: max_concurrent_requests must be a positive int; got {cap!r}")
-        specs = self.get_node_resources()
         try:
-            apply_yaml_overrides(specs, config)
+            specs = serving_resources(self, config)
         except ValueError:
             return  # a `resources:` block the validation's resource checks report
         for spec in specs:

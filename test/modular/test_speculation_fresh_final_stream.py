@@ -84,12 +84,16 @@ def _worker(scheduler, runtime):
         worker_id="w0",
         scheduler=scheduler,
         _graph_runtime=runtime,
-        tensor_manager=SimpleNamespace(get_tensor=lambda uuid: torch.tensor([uuid])),
+        tensor_manager=SimpleNamespace(
+            get_tensor=lambda uuid: torch.tensor([uuid]),
+            get_tensors=lambda uuids: [torch.tensor([u]) for u in uuids],
+        ),
         request_state=SimpleNamespace(
             per_request_info={rid: stream_state() for rid in fwd},
             get_fwd_info=lambda rid, partition: fwd[rid],
         ),
         _in_flight_rids=set(),
+        _rows_by_lane={},
         chunk_loops=ChunkLoops(),
         _is_tearing_down=lambda rid: False,
         _teardowns_pending=lambda: False,
@@ -101,7 +105,7 @@ def _worker(scheduler, runtime):
     streams.poll_for = lambda rid, node: []
     streams.chunks_for = lambda rid, node, inputs: None
     worker.streams = streams
-    for name in ("_try_speculate_next", "_try_follow_speculation"):
+    for name in ("_try_speculate_next", "_try_follow_speculation", "_hold_rows"):
         setattr(worker, name, getattr(Worker, name).__get__(worker))
     ctx = SpeculationContext(
         graph_runtime=runtime, tensor_manager=worker.tensor_manager,
@@ -143,7 +147,7 @@ def _leader_speculation(final: bool):
     )
     scheduler = SimpleNamespace(
         backlog_splits_from=lambda *a: False,
-        pick_chain_step=lambda state, target, continuing, mid_prefill=(): ChainPick(target, StepPick(
+        pick_chain_step=lambda state, target, continuing, mid_prefill=(), next_iter_of=None: ChainPick(target, StepPick(
             taken=[*continuing, FRESH], continuing=list(continuing), room=None,
             held_back=set(), ordered=False,
         ), []),
@@ -158,6 +162,7 @@ def _follower_speculation(final: bool):
     head = SimpleNamespace(
         speculative=True, spec_from_seq=5, spec_seq=6, node_name=NODE, graph_walk=WALK,
         walks=[], walk_idx=[], request_ids=[CONTINUING, FRESH], read_check=False,
+        chunk_starts=[], chunk_ends=[], chunk_totals=[], chunk_strides=[],
     )
     scheduler = SimpleNamespace(
         peek_tp_follow=lambda: head,

@@ -158,7 +158,7 @@ class ColumnarEdgeSpecs:
         is_streaming: bool,
         next_node: str | None = None,
     ) -> list[GraphEdge]:
-        """Rebuild real ``GraphEdge`` objects, for the Python runtime's ingest.
+        """Rebuild real ``GraphEdge`` objects.
 
         ``next_node`` overrides the column, for a caller whose whole batch
         shares one destination.
@@ -185,7 +185,7 @@ class ColumnarEdgeSpecs:
 
     def to_input_tensors(
         self, get_tensor, rids: list[int] | None = None,
-        skip_missing: bool = False,
+        skip_missing: bool = False, get_tensors=None,
     ) -> InputTensors:
         """One walk for both things a batch build needs: each rid's inputs as
         ``{signal: [tensor]}``, and per rid the edges that carried a stream's
@@ -202,6 +202,11 @@ class ColumnarEdgeSpecs:
         rid fails every other request in the step with it. Off by default: the
         speculative preps roll back and retry serially, so for them raising is
         the better answer.
+
+        ``get_tensors``, when given, resolves the whole uuid column in one call
+        (None for a uuid not held) -- one crossing for a store that lives in
+        Rust, rather than one per uuid. A miss falls back to ``get_tensor`` for
+        that edge, so it raises or is skipped exactly as above.
         """
         by_rid: dict[int, NameToTensorList] = (
             {} if rids is None else {rid: {} for rid in rids}
@@ -210,6 +215,10 @@ class ColumnarEdgeSpecs:
         unresolved: set[int] = set()
         names = self.signal_names
         uuids = self.uuids
+        fetched = None
+        if get_tensors is not None and uuids:
+            fetched = get_tensors(uuids)
+            any_missing = any(t is None for t in fetched)
         at = 0
         for i, rid in enumerate(self.rids):
             end = at + self.tensors_per_edge[i]
@@ -218,7 +227,12 @@ class ColumnarEdgeSpecs:
                 slot = by_rid[rid] = {}
             name = names[self.signal_name_idxs[i]]
             try:
-                tensors = [get_tensor(uuids[j]) for j in range(at, end)]
+                if fetched is not None:
+                    tensors = fetched[at:end]
+                    if any_missing and any(t is None for t in tensors):
+                        tensors = [get_tensor(uuids[j]) for j in range(at, end)]
+                else:
+                    tensors = [get_tensor(uuids[j]) for j in range(at, end)]
             except KeyError:
                 if not skip_missing:
                     raise
@@ -239,9 +253,8 @@ class ColumnarEdgeSpecs:
 
         For tests and debugging; production walks the columns. Comparing two
         blocks field by field would be sensitive to ``signal_names`` ORDER,
-        which is an implementation detail -- the Python runtime discovers names
-        in ``ready_inputs`` order and Rust in the node's input order -- so a
-        parity check wants this instead.
+        which is an implementation detail (Rust discovers names in the node's
+        input order), so a check on a block wants this instead.
         """
         out = []
         at = 0
@@ -678,8 +691,8 @@ class PhasedPostprocess:
     over a runtime's three phases: the stops (``check_stops``, then
     ``stop_loops_batched``), the route (``complete_and_route_batch``) and the
     send (``send_outputs``). It stops for the worker where a phase needs
-    Python (``PostprocessNeed``). The Python runtime's postprocess, and the
-    reference the Rust runtime's own follows."""
+    Python (``PostprocessNeed``). The reference the Rust runtime's native
+    postprocess (``rust/src/graph/runtime/postprocess.rs``) follows."""
 
     _postprocess: _Postprocess | None = None
 
@@ -1000,9 +1013,8 @@ class GraphRuntime(PhasedPostprocess, ABC):
     ):
         """Drop stale output tensor_info before a pass writes new ones.
 
-        Internal to the Python runtime, which calls it from its own
-        completion; no worker call site. A no-op in Rust, which derives
-        outputs from the tensors it is handed and caches nothing to drop.
+        No worker call site. A no-op in Rust, which derives outputs from the
+        tensors it is handed and caches nothing to drop.
         """
         pass
 

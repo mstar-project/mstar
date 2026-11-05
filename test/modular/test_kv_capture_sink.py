@@ -98,6 +98,7 @@ def test_the_captured_attention_wrapper_holds_every_page_the_capture_names(monke
     from unittest.mock import Mock
 
     from mstar.engine.resources.attn.flashinfer import FlashInferManager
+    from mstar.engine.resources.attn.workspace import Workspace
     from mstar.engine.resources.attn.wrappers import FlashInferPrefillWrapper
 
     native = Mock(return_value=SimpleNamespace(plan=Mock()))
@@ -122,7 +123,8 @@ def test_the_captured_attention_wrapper_holds_every_page_the_capture_names(monke
     named = len(kv.plan(step, ctx)["main"].cpu_indptrs.paged_kv_indices)
 
     attn = FlashInferManager(kv_cache="kv", device=torch.device("cpu"), dtype=torch.bfloat16, kv_config=cfg)
-    attn._workspaces = SimpleNamespace(get=lambda label, slot=None: torch.empty(8, dtype=torch.uint8))
+    workspace = Workspace(torch.empty(8, dtype=torch.uint8), "test")
+    attn._workspaces = SimpleNamespace(get=lambda label, slot=None: workspace)
     wrapper = attn._cg_wrapper(ctx.slot_lease, "main", num_rows=1, force_prefill=True)
 
     assert isinstance(wrapper, FlashInferPrefillWrapper)

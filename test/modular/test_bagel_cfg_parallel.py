@@ -10,6 +10,7 @@ import yaml
 from mstar.communication import tensors
 from mstar.communication.tensors import LocalTransferEngine
 from mstar.conductor.request_info import CurrentForwardConductorMetadata, CurrentForwardPassInfo
+from mstar.engine.resources.kv.arena import new_page_arena
 from mstar.engine.resources.kv.cache import KVCache
 from mstar.engine.resources.kv.config import KVReqConfig, PagedKVConfig
 from mstar.engine.resources.kv.manager import (
@@ -35,7 +36,7 @@ from mstar.model.submodule_base import END_PARTITION
 
 
 def test_offload_reset_preserves_remote_content_epoch():
-    stream = CacheStream(remote_reset_generation=7)
+    stream = CacheStream(page_indices=new_page_arena(1).new_stream(), remote_reset_generation=7)
     stream.reset(content_reset=False)
     assert stream.remote_reset_generation == 7
     stream.reset()
@@ -65,13 +66,13 @@ def test_cfg_graph_is_reused_for_tp_branches():
 
     assert set(walks) == {
         "prefill_text", "prefill_vit", "prefill_vae", "decode",
-        "image_gen", "image_gen_cfg",
+        "image_gen", "image_gen_head", "image_gen_cfg2", "image_gen_cfg3", "image_decode",
     }
     assert model.get_default_sharding_config().tp_enabled_nodes == {
         "LLM", "LLM_cfg_text", "LLM_cfg_img",
     }
-    assert set(walks["image_gen_cfg"].get_nodes()) == {
-        "LLM", "LLM_cfg_text", "LLM_cfg_img", "combine_cfg", "vae_decoder",
+    assert set(walks["image_gen_cfg3"].get_nodes()) == {
+        "LLM", "LLM_cfg_text", "LLM_cfg_img", "combine_cfg",
     }
 
 
@@ -88,7 +89,9 @@ def test_xpu_cfg_replicas_match_main_tp_and_walk():
 
     assert len(cfg_groups) == 2
     assert all(group["tp_size"] == main["tp_size"] for group in cfg_groups)
-    assert all(group.get("graph_walks") == ["image_gen_cfg"] for group in cfg_groups)
+    assert [group.get("graph_walks") for group in cfg_groups] == [
+        ["image_gen_cfg2", "image_gen_cfg3"], ["image_gen_cfg3"],
+    ]
 
 
 def test_pd_disaggregation_publishes_main_only_at_handoff_boundaries():
@@ -608,13 +611,13 @@ def test_shm_read_failure_is_latched_to_one_request(tmp_path):
     )
 
     broken = manager.admit_retrieve(
-        "broken", "LLM_cfg_text", "image_gen_cfg", broken_publish,
+        "broken", "LLM_cfg_text", "image_gen_cfg2", broken_publish,
     )
     broken_again = manager.admit_retrieve(
-        "broken", "LLM_cfg_text", "image_gen_cfg", broken_publish,
+        "broken", "LLM_cfg_text", "image_gen_cfg2", broken_publish,
     )
     healthy = manager.admit_retrieve(
-        "healthy", "LLM_cfg_text", "image_gen_cfg", healthy_publish,
+        "healthy", "LLM_cfg_text", "image_gen_cfg2", healthy_publish,
     )
 
     healthy_page = manager._streams["healthy"]["main"].page_indices[0]
