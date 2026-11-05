@@ -249,14 +249,15 @@ def test_the_worker_sends_a_runs_tokens_for_live_rows_up_to_their_limits():
     assert sent == [([1, 4, 1, 4], [5, 14, 6, EOS], "text", "text")] and stream.sent == {1: 2, 4: 2}
 
 
-@pytest.mark.parametrize("routed, withholding, why", [
-    ({"hidden"}, {}, "node: its tokens don't ride inline"),
-    (set(), {("n", WALK): object()}, "node: it withholds an output, so its landing doesn't ride inline"),
-    (set(), {}, None),
+@pytest.mark.parametrize("routed, withholding, follower, why", [
+    ({"hidden"}, {}, False, "node: its tokens don't ride inline"),
+    (set(), {("n", WALK): object()}, False, "node: it withholds an output, so its landing doesn't ride inline"),
+    (set(), {}, True, "TP: the leader sends the tokens"),
+    (set(), {}, False, None),
 ])
-def test_only_a_landing_that_rides_inline_streams(routed, withholding, why):
+def test_only_a_landing_that_rides_inline_streams(routed, withholding, follower, why):
     """Only the inline landing skips what a run sent, so any other would send
-    it twice."""
+    it twice; a TP follower's landing sends nothing, so its stream would."""
     from mstar.graph.special_destinations import EMIT_TO_CLIENT
     from mstar.model.submodule_base import StopKind, StopPolicy
     from mstar.worker.step_repeats import RepeatConfig
@@ -269,6 +270,7 @@ def test_only_a_landing_that_rides_inline_streams(routed, withholding, why):
     worker._walk_graphs = {WALK: SimpleNamespace(get_nodes=lambda: {"n": node})}
     worker._withholding, worker._streamed, worker._device_loopback = withholding, {}, {}
     worker._graph_runtime = SimpleNamespace(supports_inline_emit=True)
+    worker.parallel_nodes, worker.parallel_leader_nodes = ({"n"}, set()) if follower else (set(), set())
     worker._step_repeats = SimpleNamespace(
         config=lambda name: RepeatConfig(max=4, stream_tokens=True), may_repeat=lambda name, walk: True,
     )

@@ -3125,6 +3125,9 @@ class Worker:
             return "repeats: the walk doesn't repeat"
         if not self._graph_runtime.supports_inline_emit:
             return "graph runtime: it has no inline emit"
+        if self._is_tp_follower_node(node_name):
+            # its landing sends the client nothing either
+            return "TP: the leader sends the tokens"
         engine = self.engine_manager.get_engine(node_name)
         client = engine.inline_client_signals(node_name, graph_walk)
         policy = next(
