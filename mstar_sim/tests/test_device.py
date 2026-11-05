@@ -915,7 +915,7 @@ def test_tensor_parallel_ranks_meet_at_each_collective():
                 y.copy_(src * 2)
                 dist.all_reduce(y)
                 dist.isend(y, 1 - r).wait()
-                assert dist.recv(y, 1 - r) == 1 - r
+                assert dist.recv(y, 1 - r) == dist.recv(y, group_src=1 - r) == 1 - r
             graph.replay()
             assert never_computed(y._data)
             # a rank's wait for a late peer is a host wait, not the emulator's own time

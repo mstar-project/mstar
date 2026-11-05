@@ -351,8 +351,9 @@ def _collective(name: str, family: str, primitive: str | None):
             return None if name == "send" else dist.get_global_rank(group or dist.group.WORLD, work._source_rank())
         moved = bool(values & HELD)
         work = _Done() if kwargs.get("async_op") or name in _RETURN_WORK else None
-        if name == "recv":  # captured, it hears from nobody yet: its rank is the one it names
-            work = a["src"] if a["group_src"] is None else dist.get_global_rank(group, a["group_src"])
+        if name == "recv":  # captured, it hears from nobody yet: its rank is the one it names (any source: None)
+            work = (a["src"] if a["group_src"] is None
+                    else dist.get_global_rank(group or dist.group.WORLD, a["group_src"]))
         if moved:
             # every rank holds values (a vote, lengths): send them for real, so
             # what ranks agree on device is what they agreed on
