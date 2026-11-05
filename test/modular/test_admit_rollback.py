@@ -287,6 +287,7 @@ def _engine(resources: dict) -> Engine:
     eng._enable_nvtx = False
     eng._enable_profile = False
     eng._device = torch.device("cpu")
+    eng._tp_follower_nodes = set()
     eng._pre_plan_done = {}
     eng._submodules = {"n": SubmoduleManagement(
         submodule=_Sub(list(resources)), forward=None, forward_batched=None,

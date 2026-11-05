@@ -174,9 +174,10 @@ def _groups(rank, layout):
         g.device_group = g.cpu_group = pg
         return g
 
+    timeout = datetime.timedelta(seconds=10)
     if layout == "tp4":
-        return group([0, 1, 2, 3], dist.group.WORLD), CommGroup.trivial()
-    pgs = {m: dist.new_group(list(m)) for m in ((0, 1), (2, 3), (0, 2), (1, 3))}
+        return group([0, 1, 2, 3], dist.new_group([0, 1, 2, 3], timeout=timeout)), CommGroup.trivial()
+    pgs = {m: dist.new_group(list(m), timeout=timeout) for m in ((0, 1), (2, 3), (0, 2), (1, 3))}
     tp = next(m for m in ((0, 1), (2, 3)) if rank in m)
     sp = next(m for m in ((0, 2), (1, 3)) if rank in m)
     return group(list(tp), pgs[tp]), group(list(sp), pgs[sp])
@@ -189,7 +190,7 @@ def _check_rank(rank, layout, failed_here, store, out):
     try:
         dist.init_process_group(
             "gloo", init_method=f"file://{store}", rank=rank, world_size=4,
-            timeout=datetime.timedelta(seconds=10),
+            timeout=datetime.timedelta(seconds=acc.RENDEZVOUS_S),
         )
         tp, sp = _groups(rank, layout)
         w = Worker.__new__(Worker)
@@ -233,7 +234,7 @@ def test_every_rank_takes_out_the_rows_any_rank_could_not_read(tmp_path, layout)
     results = {}
     try:
         for _ in procs:
-            rank, *rest = out.get(timeout=60)
+            rank, *rest = out.get(timeout=acc.RENDEZVOUS_S + acc.DEADLINE_S)
             results[rank] = rest
     except queue.Empty:
         pass
