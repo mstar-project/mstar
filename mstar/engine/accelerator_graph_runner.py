@@ -1602,23 +1602,23 @@ class AcceleratorGraphRunner:
     ) -> dict[str, torch.Tensor]:
         """The rest of a step that repeats, after its first replay: each replay
         takes ``carry``'s stop buffer as its static input. Returns the stop
-        buffers with a column per replay: a replay overwrites what the last one
-        left, so each is copied out on the stream before the next one."""
+        buffers, one value a row each, with a column per replay: a replay
+        overwrites what the last one left, so each is copied out on the stream
+        before the next one."""
         slot = self.slot_for(lease)
         buffers = slot.static_outputs.check_stop_buffers
         out, name = carry
         target = slot.static_inputs[name]
-        columns: dict[int, torch.Tensor] = {}
-        for tensor in buffers.values():
-            if id(tensor) not in columns:
-                columns[id(tensor)] = tensor.new_empty(tensor.shape[0], repeats)
+        # two names can share a buffer
+        unique = {id(t): t for t in buffers.values()}
+        columns = {key: tensor.new_empty(tensor.shape[0], repeats) for key, tensor in unique.items()}
         for i in range(repeats):
             if i:
                 target.copy_(buffers[out].reshape(target.shape))
                 next_replay()
                 slot.graph.replay()
-            for tensor in {id(t): t for t in buffers.values()}.values():
-                columns[id(tensor)][:, i].copy_(tensor.reshape(-1))
+            for key, tensor in unique.items():
+                columns[key][:, i].copy_(tensor.reshape(-1))
         return {key: columns[id(tensor)] for key, tensor in buffers.items()}
 
     def run_forward(

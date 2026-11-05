@@ -93,6 +93,11 @@ class StepRunner:
             key for key in self._order
             if type(self._resources[key]).publish is not Resource.publish
         ]
+        # and the ones with something to do between the replays of a step that repeats
+        self._next_replay_order = [
+            key for key in self._order
+            if type(self._resources[key]).next_replay is not Resource.next_replay
+        ]
         # Same for admit_retrieve, which check_ready drives per ready request
         # per scheduler scan — the hottest sweep here. The base returns
         # ADMIT_OK, the identity for both the short-circuit and the `ready`
@@ -561,8 +566,9 @@ class StepRunner:
         ))
 
     def next_replay(self, step: SubmoduleStep) -> None:
-        for key in self._keys_for(step):
-            self._resources[key].next_replay(step.get(key), step.ctx)
+        for key in self._next_replay_order:
+            if (resource_step := step.get(key)) is not None:
+                self._resources[key].next_replay(resource_step, step.ctx)
 
     def admit(self, step: SubmoduleStep) -> FullAdmitOutcome:
         """Reserve capacity for step. A refused admit gives back everything

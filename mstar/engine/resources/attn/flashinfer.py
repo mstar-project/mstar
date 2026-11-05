@@ -107,12 +107,10 @@ class FlashInferManager(AttentionManager):
         lease = ctx.slot_lease
         if lease.bucket in ctx.resident.host_plan_free:
             return ANY_REPEATS
-        wrappers = [
-            wrapper for key, wrapper in self._cg_plan_states.items()
-            if key.bucket == lease.bucket and key.slot == lease.slot
-        ]
-        planned_ahead = wrappers and all(isinstance(w, FlashInferDecodeWrapper) and w.lengths_move for w in wrappers)
-        return ANY_REPEATS if planned_ahead else 1
+        # a resident walk plans one stream, under its segments' label
+        key = CGSlotKey(bucket=lease.bucket, slot=lease.slot, label=step.segments[0].label)
+        wrapper = self._cg_plan_states.get(key)
+        return ANY_REPEATS if isinstance(wrapper, FlashInferDecodeWrapper) and wrapper.lengths_move else 1
 
     def next_replay(self, step, ctx) -> None:
         if ctx.slot_lease.bucket in ctx.resident.host_plan_free:
