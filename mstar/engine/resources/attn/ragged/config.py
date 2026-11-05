@@ -24,7 +24,8 @@ def cross_label(q_label: str, kv_label: str) -> str:
 
 
 class RaggedAttnBackend(Enum):
-    # the platform's default, decided when the resource is built
+    # the platform's choice, made when the resource is built: FlashInfer, or for
+    # `uniform_segments` the `ragged_attention` op's table (attn.ragged.select)
     AUTO = "auto"
     FLASHINFER = "flashinfer"
     # FA3 (AITER on ROCm) varlen; YAML name matches AttnBackend.DENSE
@@ -78,6 +79,13 @@ class RaggedAttentionConfig:
 
     backend: RaggedAttnBackend = RaggedAttnBackend.AUTO
     flashinfer_backend: str = "auto"
+
+    # Every step lays out B segments of one length under each label, and a
+    # capture bucket's replays repeat the layout it was captured with (as a
+    # DiT's bucket key fixes its spans for every row, padding rows included).
+    # Lets ``auto`` run a dense batched kernel the GPU's table picks for these
+    # heads, which bakes B and S into a capture; see ``attn.ragged.select``.
+    uniform_segments: bool = False
 
     # Whether a compiled caller keeps the attention in its graph, as the
     # ``mstar::ragged_attention`` op, rather than breaking there per layer. For

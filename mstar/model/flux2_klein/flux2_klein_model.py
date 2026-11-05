@@ -201,6 +201,8 @@ class Flux2KleinModel(Model):
                     head_dim=tcfg.attention_head_dim,
                     # one request == one bidirectional segment over [txt | img | ref]
                     max_segments_per_request=1,
+                    # a batch shares one bucket key, which fixes every row's spans
+                    uniform_segments=True,
                     # the DiT's activation dtype: there is no KV cache to inherit one from
                     dtype=torch.bfloat16,
                 ),

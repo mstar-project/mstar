@@ -32,6 +32,7 @@ from mstar.kernels.table import TABLE_DIR, Rows, TableEntry, dtype_name, file_st
 OP_SWEEPS = {
     "moe_gemm": "benchmark.kernels.moe_gemm:MoeGemmSweep",
     "moe_decode": "benchmark.kernels.moe_decode:MoeDecodeSweep",
+    "ragged_attention": "benchmark.kernels.ragged_attention:RaggedAttentionSweep",
 }
 
 

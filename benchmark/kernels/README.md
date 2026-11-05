@@ -79,3 +79,8 @@ gets faster on a GPU without a change to model code.
 - `moe_decode`: the small-batch fp8 MoE's per-pair kernels (`--dtype float8_e4m3fn --shape
   H=...,E=...,I=...,K=...`: hidden, experts, one rank's intermediate, top-k). Its rows are the
   per-pair tiles by token count, then the grouped `"*"` row.
+- `ragged_attention`: the ragged resource's kernel for layouts of equal-length segments
+  (`--shape H=...,H_kv=...,D=...`: one rank's query and key heads, head dim), rows by segment length
+  (`S`), each `flashinfer` (optionally `{"backend": ...}`) or `cudnn` (torch SDPA). It times the
+  resource's own captured wrapper at one segment and at a batch, against fp32 attention. Tables are
+  per architecture (`sm_103.json`): the choice holds for every GPU of it.

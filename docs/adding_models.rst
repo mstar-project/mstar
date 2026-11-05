@@ -723,8 +723,8 @@ The spec types are:
        ``flashinfer_backend``, the
        two CUDA-graph ceilings ``max_segments_per_request`` (``max_segments_per_step``
        for a ``one_row_per_step`` region) and
-       ``max_tokens_per_request``, ``compile_op``, ``shard_over_sp`` and
-       ``workspace_mb``. ``DENSE`` runs FA3
+       ``max_tokens_per_request``, ``compile_op``, ``shard_over_sp``,
+       ``workspace_mb`` and ``uniform_segments``. ``DENSE`` runs FA3
        ``flash_attn_varlen`` (AITER on ROCm) and falls back to FlashInfer if that kernel is
        missing. By default the heads are split across all TP × SP ranks of the node;
        ``shard_over_sp=False`` splits them across the TP ranks only, for an attention
@@ -734,9 +734,10 @@ The spec types are:
        ``MSTAR_WORKSPACE_BUFFER_MB``, 512, which doesn't apply once it is declared): a plan that
        asks for more at startup grows it. A node with many labels can declare less, since a
        ragged prefill only uses it for split-KV partials. ``compile_op``,
-       ``shard_over_sp`` and ``workspace_mb`` are the model's declaration; the serving
-       config's ``resources:`` overrides take only the backends and the ceilings. See
-       `Cacheless attention (encoder towers)`_ for ``compile_op``.
+       ``shard_over_sp``, ``workspace_mb`` and ``uniform_segments`` are the model's
+       declaration; the serving config's ``resources:`` overrides take only the backends and
+       the ceilings. See `Cacheless attention (encoder towers)`_ for ``compile_op`` and
+       ``uniform_segments``.
    * - ``RaggedCrossAttentionSpec(config=RaggedAttentionConfig(...))``
      - The cross-attention counterpart: one span of each request attends another
        (``RaggedCrossAttentionStep(pairs=...)``). Same config. See `Cross-attention
@@ -970,6 +971,20 @@ no page scatter. If that kernel is not importable, or the spec is a
 the factory logs a warning and builds FlashInfer. The fallback does not cover a GPU or
 dtype the kernel lacks: ``fa3-fwd`` 0.0.3 is built for Hopper (``sm_90a``) and runs bf16
 but not fp16.
+
+A resource whose every step lays out ``B`` segments of one length per label, with a
+capture bucket's replays repeating the layout it was captured with, declares
+``uniform_segments=True`` (the DiT scaffold's buckets fix every row's spans, so klein and
+Z-Image do). ``AUTO`` may then run a dense batched kernel instead: torch SDPA on cuDNN over
+``[B, H, S, D]`` views of the packed rows, which bakes ``B`` and ``S`` into a capture where
+FlashInfer reads the layout from its buffers at replay. Which one runs is the GPU's measured
+table for the ``ragged_attention`` kernel op (``mstar/kernels/tables/ragged_attention/``),
+keyed by one rank's heads and head dim, with rows by segment length; a GPU or head geometry
+with no entry, a varlen layout, or an explicit ``backend`` / ``flashinfer_backend`` in the
+serving config keeps FlashInfer. ``python -m benchmark.kernels.sweep ragged_attention``
+writes the table (``benchmark/kernels/README.md``). On B300 (``sm_103``) the table picks
+cuDNN for the image DiTs: captured, FlashInfer's ``auto`` lands on its FA2 kernels there,
+3.4x slower at 4608 tokens.
 
 BAGEL's SigLIP2 tower is the reference implementation. The spec stands alone, over the
 encoder node only, and names no cache:

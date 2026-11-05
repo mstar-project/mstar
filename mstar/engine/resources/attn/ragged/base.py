@@ -85,6 +85,10 @@ class RaggedAttnManager(AttentionResource):
 
     @classmethod
     def build(cls, spec: RaggedAttentionSpec, info: EngineResourceInfo):
+        if spec.config.backend is RaggedAttnBackend.AUTO:
+            from mstar.engine.resources.attn.ragged.select import build_auto
+
+            return _build_ragged(spec, info, build_auto)
         backend = resolve_ragged_attn_backend(spec.config.backend, info.device)
         if backend is RaggedAttnBackend.DENSE:
             from mstar.engine.resources.attn.ragged.dense import DenseRaggedManager

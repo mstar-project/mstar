@@ -37,6 +37,7 @@ logger = logging.getLogger(__name__)
 _OP_MODULES = {
     "moe_gemm": "mstar.utils.fused_moe.kernels",
     "moe_decode": "mstar.utils.fused_moe.decode",
+    "ragged_attention": "mstar.engine.resources.attn.ragged.select",
 }
 
 _OPS: dict[str, KernelOp] = {}
