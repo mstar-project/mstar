@@ -7,10 +7,8 @@ row-parallel ``o`` target. Other LoRA test modules import the helpers defined he
 
 from __future__ import annotations
 
-import gc
 import threading
 import time
-import weakref
 
 import pytest
 import torch
@@ -359,26 +357,25 @@ def test_store_shards_for_its_rank_and_keeps_an_lru(adapters):
     assert store.get("a3").digest != whole.digest == store.get("a1").digest
 
 
-def test_a_runtime_load_keeps_no_copy_until_a_request_names_it(adapters):
-    """Loads past ``cpu_capacity`` pin nothing outside the host tier's bound: a load's read
-    checks the file and is dropped, and the first request on the adapter reads it again."""
+def test_a_runtime_load_stages_no_copy_until_a_request_names_it(adapters):
+    """Loads past ``cpu_capacity`` pin nothing outside the host tier's bound: a load checks
+    the file and stages no copy (an experts target's is GBs, pinned), and the first request
+    on the adapter reads it in."""
     _, paths = adapters
     pool = make_pool({}, cpu_capacity=1)
-    copies, read = [], pool.store.read
+    reads, read = [], pool.store.read
 
-    def tracked(*args):
-        adapter = read(*args)
-        copies.append(weakref.ref(adapter))
-        return adapter
+    def tracked(name, path, digest):
+        reads.append(name)
+        return read(name, path, digest)
     digests = {n: adapter_digest(read_lora_file(paths[n])) for n in ("a1", "a2", "a3")}
     pool.store.read = tracked
     for name in ("a1", "a2", "a3"):
         pool.load_adapter(name, paths[name], digests[name])
-    gc.collect()
-    assert len(copies) == 3 and not any(ref() for ref in copies)
+    assert reads == [] and all(pool.serves(n) for n in ("a1", "a2", "a3"))
     ingest(pool, "r", "a2")
     settle_reads(pool)
-    assert "a2" in pool.store and len(copies) == 4
+    assert "a2" in pool.store and reads == ["a2"]
 
 
 # --- numerics and compile ------------------------------------------------------------------------

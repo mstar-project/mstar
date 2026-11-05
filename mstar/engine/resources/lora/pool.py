@@ -631,8 +631,8 @@ class LoraAdapterPool(Resource):
     def load_adapter_async(self, name: str, path: str, digest: bytes) -> Future:
         """Serve ``name`` from ``path``: read it on the reader thread, hold it to ``digest``
         (of the weights the API server checked against the spec), and only then make it
-        servable. The read is not kept, since the host tier holds only what requests name:
-        the first request on it reads it again as it is ingested. The future fails if it
+        servable. The read stages no copy, since the host tier holds only what requests
+        name: the first request on it reads it in as it is ingested. The future fails if it
         is served already, is still retiring from an unload, or cannot be read; a refusal
         visible now raises here. A request that names it takes a slot on its first admit,
         as for an adapter configured at startup."""
@@ -641,10 +641,10 @@ class LoraAdapterPool(Resource):
             return self._executor().submit(self._load, name, path, digest)
 
     def _load(self, name: str, path: str, digest: bytes) -> None:
-        adapter = self._store.read(name, path, digest)
+        rank = self._store.check(name, path, digest)
         with self._lock:
             self._refuse_reload(name)
-            if adapter.rank == 0:
+            if rank == 0:
                 # no request can name it before it is served, below
                 self._empty.add(name)
             self._serving[name] = _Served(path, digest)

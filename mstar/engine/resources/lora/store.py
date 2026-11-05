@@ -14,6 +14,7 @@ from dataclasses import dataclass
 import torch
 
 from mstar.engine.resources.lora.checkpoint import (
+    LoraAdapter,
     normalize_lora_key,
     parse_lora_key,
     read_lora_file,
@@ -241,14 +242,17 @@ class LoraAdapterStore:
             self.put(adapter)
         return adapter
 
-    def read(self, name: str, path: str, digest: bytes) -> LoadedAdapter:
-        """``path`` read and sharded for this rank, without holding it: a caller can read
-        outside whatever lock guards ``put``. ``digest`` is of the weights
-        ``check_adapter_file`` checked against the spec, so a read that digests the same
-        holds checked weights; one that digests otherwise is refused before anything is
-        staged: the file changed since the adapter was checked and keyed, and serving it
-        would put other weights under the same prefix-cache root, or different weights
-        on different ranks."""
+    def check(self, name: str, path: str, digest: bytes) -> int:
+        """``path``'s rank for this spec, read and held to ``digest`` as ``read`` does, with
+        nothing staged: all a runtime load needs."""
+        return self._checked(name, path, digest)[2]
+
+    def _checked(self, name: str, path: str, digest: bytes) -> tuple[LoraAdapter, list[str], int]:
+        """``path`` read, its modules for this spec and its rank. ``digest`` is of the
+        weights ``check_adapter_file`` checked against the spec, so a read that digests the
+        same holds checked weights; one that digests otherwise is refused: the file changed
+        since the adapter was checked and keyed, and serving it would put other weights
+        under the same prefix-cache root, or different weights on different ranks."""
         spec = self._spec
         raw = read_lora_file(path, convert_keys=spec.convert_keys)
         read_digest = adapter_digest(raw)
@@ -259,7 +263,14 @@ class LoraAdapterStore:
             )
         # modules another node's pool loads (or the deployment never runs) are not this one's
         modules = sorted(m for m in raw.layers if not _ignored(spec, m))
-        rank = max((raw.layers[m].a.shape[0] for m in modules), default=0)
+        return raw, modules, max((raw.layers[m].a.shape[0] for m in modules), default=0)
+
+    def read(self, name: str, path: str, digest: bytes) -> LoadedAdapter:
+        """``path`` read and sharded for this rank, without holding it: a caller can read
+        outside whatever lock guards ``put``. Held to ``digest`` as ``check`` is, before
+        anything is staged."""
+        spec = self._spec
+        raw, modules, rank = self._checked(name, path, digest)
         # One scaling per slot; a module whose alpha / r differs has the ratio folded
         # into its B (PEFT's rank_pattern / alpha_pattern, Kohya's per-module alphas).
         # The slot's is the first nonzero one, so the fold never divides by zero (an
@@ -323,7 +334,7 @@ class LoraAdapterStore:
         )
         return LoadedAdapter(
             name=name,
-            digest=read_digest,
+            digest=digest,
             rank=rank,
             scaling=scaling,
             a=a_host,
