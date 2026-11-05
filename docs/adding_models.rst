@@ -2427,11 +2427,13 @@ page. Attention runs on each rank's slots and merges the partials across the par
 - **TP mode (no SP ranks).** The partners are the TP ranks sharing a KV head,
   ``P = tp / num_kv_heads``, so TP must be a larger multiple of the KV heads. They are the contiguous blocks ``kv_head_replicas``
   (``mstar/distributed/utils.py``) gives, as ``QKVParallelLinear`` loads them; a model that
-  shards K and V itself must match. Each layer exchanges queries and partials over the TP group.
+  shards K and V itself must match. Each layer exchanges queries and partials over the TP group,
+  though an eager step with no stored context attends its own tokens alone, with no exchange.
 - **SP mode.** The partners are the node's SP ranks, ``P = sp_size``. Heads shard over TP alone
   and the node loads without its SP group, so every layer but attention runs replicated across
   SP; prefer TP mode where it applies. Every paged pool of the node must set the key, and the
-  node must not be in the model's ``sp_enabled_nodes``. Each layer all-gathers the partials.
+  node must not be in the model's ``sp_enabled_nodes``. Each layer all-gathers the partials,
+  bar that same eager step.
   Chunked prefill stays off on SP ranks (``_unchunkable_nodes``), as for the model's own SP, so
   SP mode prefills a prompt in one step; chunking an SP-placed pool's prompts is not supported yet.
   TP mode chunks prompts as without placement.
