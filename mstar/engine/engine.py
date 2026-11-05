@@ -94,6 +94,7 @@ from mstar.utils.profiler import (
 )
 
 if TYPE_CHECKING:
+    from mstar.engine.resources.admission import Refusal
     from mstar.engine.resources.kv.manager import KVManager
     from mstar.engine.resources.lora.pool import LoraAdapterPool
     from mstar.model.base import Model
@@ -3186,30 +3187,34 @@ class Engine:
         """The requests the conductor numbered after the request, newest first; see `Admission.newer_than`."""
         return self._runner.newer_than(request_id)
 
+    def oldest_refusal(self) -> "Refusal | None":
+        """The oldest waiting request that didn't fit; see `Admission.oldest_refusal`."""
+        return self._runner.oldest_refusal()
+
     def readmit_request(self, node_name: str, request_id: int) -> None:
-        """Ask the node's resources again for the request, which then waits in their queues at its arrival; see
+        """Ask the node's resources again for the request, which then waits until they fit it; see
         `Admission.readmit`."""
         self._runner.readmit(request_id, node_name)
 
-    def drop_request(self, node_name: str, request_id: int, kept: int) -> int:
+    def drop_request(self, node_name: str, request_id: int, tokens: int) -> int:
         """Discard the request's state on this node that can be recomputed from
-        its token ids, and return the pages freed. ``kept`` is how many of those ids
-        this rank keeps, which rank 0 journals for its followers to check."""
+        the ``tokens`` token ids its rebuild writes, and return the pages freed. Rank 0
+        journals ``tokens`` for its followers to drop with."""
         # check every resource before dropping any, so a refusal changes nothing,
         # as `reload_request` checks `can_reload`
-        refusal = self.drop_refusal(node_name, request_id)
+        refusal = self.drop_refusal(node_name, request_id, tokens)
         if refusal is not None:
             raise RuntimeError(refusal)
-        freed = sum(resource.drop(request_id) for resource in self._submodules[node_name].resources.values())
+        freed = sum(resource.drop(request_id, tokens) for resource in self._submodules[node_name].resources.values())
         if node_name in self._tp_leader_nodes:
-            self._journal(MoveKind.DROP, request_id, kept, node=node_name)
+            self._journal(MoveKind.DROP, request_id, tokens, node=node_name)
         self._runner.readmit(request_id, node_name)
         return freed
 
-    def drop_refusal(self, node_name: str, request_id: int) -> str | None:
+    def drop_refusal(self, node_name: str, request_id: int, tokens: int) -> str | None:
         """Why `drop_request` would refuse the request on this node, or None."""
         for resource in self._submodules[node_name].resources.values():
-            refusal = resource.check_drop(request_id)
+            refusal = resource.check_drop(request_id, tokens)
             if refusal is not None:
                 return refusal
         return None

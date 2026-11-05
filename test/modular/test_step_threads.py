@@ -1636,6 +1636,7 @@ def test_run_moves_the_main_gpu_and_plan_threads_to_their_cpus(monkeypatch, intr
                  "_settle_speculation", "_drop_rows_whose_loop_stopped", "_handle_admit_failure",
                  "_thread_outputs_to_speculative", "_postprocess_batch"):
         setattr(w, name, stub)
+    w._preemption = SimpleNamespace(make_room=stub)
     w.maybe_send_zmq_to_tp_followers = lambda node_batch: -1
     w._build_executing_batch = executing
     w._build_speculation = build_speculation

@@ -13,8 +13,9 @@ class RebuildPolicy:
     The rows recompute the request's prompt and every id it has sampled since, except the last, which the next
     decode step reads.
 
-    ``ids_input`` is the input that carries the prompt's ids, and a row's ids go under it. Whatever else the node
-    reads in a walk, such as the encoder's output for a prompt with images, the worker copies to the host when the
+    ``ids_input`` is the input a row's ids go under, and the ids sampled since the prompt follow it in the last row.
+    It needn't carry all the prompt's ids. Whatever else the node reads in a walk, such as the encoder's output for a
+    prompt with images, or the text before the audio in a Higgs Audio prompt, the worker copies to the host when the
     walk prefills a request, and the rebuild row reads it again. ``copy_width`` gives, for each such walk, how many
     values its copies hold per KV slot, each in the dtype the node runs in.
     ``sample_output`` is the output that carries the one id a row samples, and ``loop`` the loop each of

@@ -20,14 +20,16 @@ import torch
 from test_kv_admission import _remove, _runner
 from test_kv_preemption import (  # noqa: F401
     PAGE_SIZE,
+    _admitted,
     _ctx,
-    _drop,
     _offload,
     _pool,
-    _queue,
+    _preempt,
     _ready,
     _request,
+    _returns,
     _running,
+    _short,
     _step,
     _stub_transfer,
 )
@@ -72,11 +74,18 @@ def _kept(tokens: int) -> KeptIds:
 
 def _worker(kv):
     """The real handlers over one pool, with the engine's drop going straight to the pool and its runner."""
+    def drop_request(node, rid, tokens):
+        freed = kv.drop(rid, tokens)
+        _runner(kv).readmit(rid, node)
+        return freed
+
     engine = _Engine(
-        drop_refusal=lambda node, rid: kv.check_drop(rid), drop_request=lambda node, rid, kept: _drop(kv, rid),
+        drop_refusal=lambda node, rid, tokens: kv.check_drop(rid, tokens), drop_request=drop_request,
         offload_request=lambda node, rid: _offload(kv, rid),
         readmit_request=lambda node, rid: _runner(kv).readmit(rid, node),
         newer_than=lambda rid: _runner(kv).newer_than(rid),
+        oldest_refusal=lambda: _runner(kv).oldest_refusal(),
+        paged_kv_caches=lambda: [PagedKVCache("kv", frozenset({NODE}), kv)],
         admit_request=lambda node, rid, info: _runner(kv).admit_request(rid, node, info.graph_walk),
         admit_waiting=lambda published_of: _runner(kv).admit_waiting(published_of),
     )
@@ -98,8 +107,7 @@ def _worker(kv):
             graph_walk="decode", dynamic_loop_iter_counts={"decode": 0}, resource_publish_info=None,
         ),
     )
-    caches = SimpleNamespace(paged_kv_caches=lambda: [PagedKVCache("kv", frozenset({NODE}), kv)])
-    w.engine_manager = SimpleNamespace(get_engine=lambda node: engine, engine=caches)
+    w.engine_manager = SimpleNamespace(get_engine=lambda node: engine, engine=engine)
     _preemption(w)
     w._graph_runtime = SimpleNamespace(push_back_node=lambda node, rids, wgs: None)
     w._apply_removes_whose_step_landed = lambda: None
@@ -132,7 +140,7 @@ def _preempting(case: str = "deciding kv pool", in_flight: tuple[str, ...] = ())
     elif case == "a node where no request keeps ids":
         w._rebuilds._kept[NODE] = {}
     elif case == "nothing to drop":
-        w.engine_manager.get_engine(NODE).drop_refusal = lambda node, rid: "refused"
+        w.engine_manager.get_engine(NODE).drop_refusal = lambda node, rid, tokens: "refused"
     rows = dict.fromkeys(("r", *in_flight), 0)
     batch = ScheduledBatch(node_name=NODE, graph_walk="decode", request_to_worker_graph=rows)
     node_batch = SimpleNamespace(
@@ -157,7 +165,7 @@ def test_only_a_deciding_kv_pool_preempts(case):
         assert w._preemption.counts[NODE] == PreemptionCounts(victims=1, drops=1), "the drop went uncounted"
     elif case == "a node where no request keeps ids":
         # the node's policy decides how it preempts, whichever requests keep ids now
-        assert not w.tried and not w.held and _queue(kv) == ["r"] and kv.residency("v") is Residency.RESIDENT, (
+        assert not w.tried and not w.held and _returns(kv) == ["r"] and kv.residency("v") is Residency.RESIDENT, (
             "a node that rebuilds requests switched to the offload and the hold while none kept ids"
         )
     else:
@@ -190,12 +198,29 @@ def test_a_victim_the_host_takes_whole_goes_there_and_its_pages_to_the_request_t
     assert _step(kv, "r", 1).ok
 
 
-def test_a_request_that_can_only_wait_waits_in_the_queue_and_is_logged(caplog):
+def test_a_victim_the_host_takes_keeps_its_log_for_a_later_drop():
+    """A request moved to the host comes back preemptible, so a later drop rebuilds it from its log."""
+    kv = _pool()
+    kv._cpu_pool = host._HostPool(16)
+    _running(kv, "r", 5, arrival=1)
+    _running(kv, "v", 5, arrival=2)
+    reason = _step(kv, "r", 1).reason
+    w = _worker(kv)
+    batch = ScheduledBatch(node_name=NODE, graph_walk="decode", request_to_worker_graph={"r": 0})
+    node_batch = SimpleNamespace(node_name=NODE, admit_error=reason, failed_resource="kv")
+
+    Worker._handle_allocation_failure(w, batch, node_batch)
+
+    assert kv.residency("v") is Residency.ON_HOST
+    assert w._rebuilds.kept("v", NODE) is not None, "a drop after its return would find no log to rebuild it from"
+
+
+def test_a_request_that_can_only_wait_waits_and_is_logged(caplog):
     with caplog.at_level(logging.WARNING, logger="mstar.worker.worker"):
         kv, w = _preempting("nothing to drop")
 
-    assert _queue(kv) == ["r"] and "r" in kv._allotments and not w.held
-    assert "r waits in the queue" in caplog.text, "a request that can only wait left no line"
+    assert _returns(kv) == ["r"] and "r" in kv._allotments and not w.held
+    assert "r waits for" in caplog.text, "a request that can only wait left no line"
 
 
 def test_a_victim_in_the_refused_step_drops_in_the_same_call():
@@ -246,6 +271,74 @@ def test_an_older_decode_short_by_a_page_drops_the_newest_request_mid_prefill_no
     assert _step(kv, "r", 1).ok
 
 
+@pytest.mark.parametrize("why", ["kept ids", "mid-prefill"])
+def test_a_victim_whose_rebuild_wouldnt_write_what_its_kv_holds_isnt_chosen(why):
+    """v's KV holds 5 pages, but its kept ids, or the chunks its prompt ran, rebuild a token less. Chosen anyway,
+    v either fails its drop in the move or comes back one token short."""
+    kv = _pool()
+    _running(kv, "r", 5, arrival=1)
+    _running(kv, "v", 5, arrival=2)
+    reason = _step(kv, "r", 1).reason
+    w = _worker(kv)
+    if why == "kept ids":
+        w._rebuilds._kept[NODE]["v"] = _kept(5 * PAGE_SIZE - 1)
+    else:
+        del w._rebuilds._kept[NODE]["v"]
+        w.scheduler.prefilling = lambda node, rid, walk: Prefilling("prefill", 5 * PAGE_SIZE - 1, 8 * PAGE_SIZE) if (
+            rid == "v") else None
+    batch = ScheduledBatch(node_name=NODE, graph_walk="decode", request_to_worker_graph={"r": 0})
+    node_batch = SimpleNamespace(
+        node_name=NODE, admit_error=reason, failed_resource="kv", step_context=SimpleNamespace(graph_walk="decode"),
+    )
+
+    Worker._handle_allocation_failure(w, batch, node_batch)
+
+    assert kv.residency("v") is Residency.RESIDENT, "v was chosen though its rebuild doesn't write what its KV holds"
+    assert kv.residency("r") is Residency.RESIDENT and _returns(kv) == ["r"], "r didn't wait for room beside v"
+
+
+@pytest.mark.parametrize("guaranteed", [False, True])
+def test_an_older_request_that_asks_after_a_newer_one_parks_moves_it(guaranteed):
+    """z ran short with nothing newer to move and waits holding its pages. p, older, asks only afterwards, as a
+    request held in an encoder does, and doesn't fit. z runs no step that could run short again, so nothing moved
+    it and both waited for good."""
+    kv = _pool()
+    kv._cpu_pool = host._HostPool(16)
+    _running(kv, "o", 4, arrival=0)
+    _running(kv, "z", 6, arrival=2)
+    assert _preempt(kv, "z", _short(kv, "z"), droppable=lambda rid: False).waits
+    _runner(kv).readmit("z", NODE)
+    # either way p asks for 5 pages, a guaranteed p for its prompt page and 4 of decode
+    _request(kv, "p", 1 if guaranteed else 5, arrival=1, guaranteed=guaranteed)
+    assert not _ready(kv, "p") and not _admitted(kv, "z")
+    w = _worker(kv)
+
+    w._preemption.make_room()
+
+    assert kv.is_offloaded("z") and _ready(kv, "p"), "z, newer and waiting, kept the pages p needs"
+
+
+def test_a_request_whose_kept_ids_dont_rebuild_its_kv_waits_rather_than_dropping_itself():
+    """v keeps no ids, so only r could move, and r's kept ids rebuild a token less than its KV holds. Dropping
+    itself, r would fail its own drop in the move."""
+    kv = _pool()
+    _running(kv, "r", 5, arrival=1)
+    _running(kv, "v", 5, arrival=2)
+    reason = _step(kv, "r", 1).reason
+    w = _worker(kv)
+    w._rebuilds._kept[NODE] = {"r": _kept(5 * PAGE_SIZE - 1)}
+    batch = ScheduledBatch(node_name=NODE, graph_walk="decode", request_to_worker_graph={"r": 0})
+    node_batch = SimpleNamespace(
+        node_name=NODE, admit_error=reason, failed_resource="kv", step_context=SimpleNamespace(graph_walk="decode"),
+    )
+
+    Worker._handle_allocation_failure(w, batch, node_batch)
+
+    assert kv.residency("r") is Residency.RESIDENT and _returns(kv) == ["r"], (
+        "r dropped itself with ids short of its KV"
+    )
+
+
 def test_a_dropped_request_that_waits_for_room_is_unparked_and_rebuilt():
     """A dropped request asks again at its drop, so its next readiness check parks it in the queue. Once the pool
     admits it, the check starts its rebuild, and the rebuild's landing lets it run. A second path that readmitted
@@ -286,8 +379,7 @@ def test_a_request_on_the_host_without_a_step_of_its_own_holds_back_no_newer_req
     node_batch = SimpleNamespace(node_name=NODE, admit_error=reason, failed_resource="kv")
     Worker._handle_allocation_failure(w, batch, node_batch)
     _remove(kv, "r")
-    # v comes back with its footprint, 9 of the 10 pages
-    _request(kv, "x", 1, arrival=3)
+    _request(kv, "x", 2, arrival=3)
 
     assert _ready(kv, "x"), "x waited behind v on the host"
     assert kv.is_offloaded("v") and "v" in kv._allotments, "v wasn't admitted ahead of x"
@@ -366,26 +458,39 @@ def test_the_worker_keeps_ids_only_for_a_request_whose_output_can_pause(unpausab
     assert (1 in w._rebuilds._droppable[NODE]) is not unpausable, "the conductor's mark didn't reach the kept ids"
 
 
-@pytest.mark.parametrize("prefix_cache", [True, False])
-def test_a_request_keyed_over_part_of_its_prompt_is_rebuildable_only_with_its_prefix_cache_off(prefix_cache):
-    """With the cache off a request keys nothing, so the keys a model lays out for part of its prompt don't stand in
-    the way of a rebuild."""
+def _rebuildable_keyed_over_part(**conductor) -> bool:
+    """Whether a drop can free a request whose text is two spans of one step, keyed over the first, once the
+    conductor has applied ``conductor`` with the layout."""
     kv = _pool()
     w = _worker(kv)
     model = SimpleNamespace(kv_labels=lambda: {"kv": {"main": KVLabel(growth=(("decode", "decode"),))}})
     w._set_kv_writes(model, {(NODE, "prefill"), (NODE, "decode")})
     text = [4 * PAGE_SIZE, 4 * PAGE_SIZE, "prefill", 0, None, None]
-    # text in two spans of one step, keyed over the first, as the conductor sends a layout
+    # as the conductor sends a layout
     layout = [[[*text, True, "ids"], [*text, False, "ids"]], [["decode", 1]], 0, None, 1]
     config = KVReqConfig()
-    config.apply_conductor_config(
-        prefix_keys={"main": [b"k"]}, prefix_cache=prefix_cache, kv_layout={"main": layout}, loop_caps={"decode": 64},
-    )
+    config.apply_conductor_config(kv_layout={"main": layout}, loop_caps={"decode": 64}, **conductor)
     configs = {"kv": config}
 
     w._set_rebuildable(1, configs)
 
-    assert configs["kv"].rebuildable is not prefix_cache, "a request would be refused a drop for keys nothing reads"
+    return configs["kv"].rebuildable
+
+
+@pytest.mark.parametrize("prefix_cache", [True, False])
+def test_a_request_keyed_over_part_of_its_prompt_is_rebuildable_only_with_its_prefix_cache_off(prefix_cache):
+    """With the cache off a request keys nothing, so the keys a model lays out for part of its prompt don't stand in
+    the way of a rebuild."""
+    rebuildable = _rebuildable_keyed_over_part(prefix_keys={"main": [b"k"]}, prefix_cache=prefix_cache)
+
+    assert rebuildable is not prefix_cache, "a request would be refused a drop for keys nothing reads"
+
+
+def test_a_request_sent_no_keys_is_rebuildable_though_its_layout_keys_part_of_its_prompt():
+    """With the cache off for the whole server, the conductor sends no keys and leaves the request's ``prefix_cache``
+    on. The layout still said the request keyed part of its prompt, so no Qwen3-Omni video or Bagel edit could be
+    dropped."""
+    assert _rebuildable_keyed_over_part(), "a request would be refused a drop for keys it was never sent"
 
 
 @pytest.mark.parametrize("layout", ["two labels", "two loops"])
@@ -409,17 +514,20 @@ def test_a_pool_whose_layout_its_rebuild_rows_cant_write_again_isnt_rebuildable(
     assert not configs["kv"].rebuildable, "a request its rebuild couldn't bring back could be dropped"
 
 
-def test_an_older_request_drops_itself_rather_than_a_newer_guaranteed_one():
+def test_an_older_request_waits_rather_than_moving_a_newer_guaranteed_one():
     kv = _pool()
     _running(kv, "r", 5, arrival=1)
     _running(kv, "v", 1, arrival=2, guaranteed=True)
     w = _worker(kv)
     batch = ScheduledBatch(node_name=NODE, graph_walk="decode", request_to_worker_graph={"r": 0})
-    node_batch = SimpleNamespace(node_name=NODE, admit_error=_step(kv, "r", 1).reason, failed_resource="kv")
+    node_batch = SimpleNamespace(
+        node_name=NODE, admit_error=_step(kv, "r", 1).reason, failed_resource="kv",
+        step_context=SimpleNamespace(graph_walk="decode"),
+    )
 
     Worker._handle_allocation_failure(w, batch, node_batch)
 
-    assert (kv.residency("r"), kv.residency("v")) == (Residency.DROPPED, Residency.RESIDENT), (
+    assert kv.residency("v") is Residency.RESIDENT and _returns(kv) == ["r"], (
         "a guaranteed request was dropped for an older page"
     )
 

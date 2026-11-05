@@ -10,6 +10,7 @@ flight is offered again only as its step's continuation.
 
 from __future__ import annotations
 
+import math
 import sys
 from array import array
 from types import SimpleNamespace
@@ -203,6 +204,21 @@ def test_a_prompt_dropped_mid_prefill_runs_its_chunks_again_up_to_where_its_loop
     assert (R, NODE) in sched.chunk_started, "the prompt's next chunk would lose its place ahead of newer prompts"
 
 
+def test_a_prompt_rebuilt_mid_prefill_keeps_its_place_ahead_of_prompts_that_started_after_it():
+    sched, _, _, _ = _scheduler({}, budget=8, dropped={R})
+    sched.runtime = runtime = _Prefilling({R: PREFILL})
+    sched.chunk_loop_walks = {NODE: frozenset({PREFILL})}
+    sched.rebuilds._kept[NODE][R] = _kept(range(10))
+    for rid in (R, "p"):
+        sched.chunk_started[(rid, NODE)] = next(sched._chunk_starts)
+
+    sched.get_next_batch(_State(runtime))
+
+    assert sched.chunk_started[(R, NODE)] < sched.chunk_started[("p", NODE)], (
+        "the rebuild's first chunk put R's prompt behind p's, which started after it"
+    )
+
+
 def test_a_chunk_in_flight_is_offered_only_as_its_steps_continuation():
     sched, _, state, _ = _scheduler({}, budget=8)
     _rebuilding(sched, total=20, done=8)
@@ -220,7 +236,7 @@ def test_a_rebuild_whose_request_the_scheduler_wouldnt_run_waits(why):
     sched, _, state, _ = _scheduler({})
     _rebuilding(sched)
     if why == "held":
-        sched.hold_requests([R])
+        sched.held_until[R] = math.inf
     elif why == "failed":
         sched.failed_rids.add(R)
     else:

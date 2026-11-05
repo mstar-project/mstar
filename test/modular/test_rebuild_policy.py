@@ -10,19 +10,22 @@ keeps host copies of them once the request's prefill row has run.
 
 from __future__ import annotations
 
+import logging
 from array import array
 from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
+import test_kv_drop as kv_drop
 import torch
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.chunking import ChunkRange
 from mstar.engine.resources import Rebuild, SamplerStep, StepContext
-from mstar.engine.resources.kv.config import KVReqConfig, PrefixSpan, StreamLayout
+from mstar.engine.resources.kv.config import KVReqConfig, KVStep, PrefixSpan, StreamLayout
 from mstar.engine.resources.kv.host_writes import StepAllowance
 from mstar.engine.resources.sampler.resource import SamplerResource
+from mstar.engine.resources.step import Segment
 from mstar.graph.base import GraphEdge, GraphNode, Loop
 from mstar.model.bagel.bagel_model import BagelModel
 from mstar.model.orpheus.orpheus_model import OrpheusModel
@@ -270,19 +273,33 @@ def test_only_the_rows_that_ran_are_recorded():
     """The engine takes a row it skipped or failed out of the step's rows and their infos, but not out of its
     inputs."""
     rebuilds = _rebuilds()
-    step = _ran(PREFILL, _rows(R, A, B))
-    step.cached_rids.add(B)  # the prefix cache served B's step whole
-    for rid in (A, B):
-        step.request_ids.remove(rid)
-        del step.per_request_info[rid]
+    step = _ran(PREFILL, _rows(R, A))
+    step.request_ids.remove(A)
+    del step.per_request_info[A]
 
     rebuilds.record(step)
 
     kept = rebuilds._kept[NODE]
     assert len(kept[R].records) == 1 and not kept[A].records, "a row that never ran would be recorded"
-    assert "keeps no log" in rebuilds.refusal(B, NODE, DECODE, {}, None), (
-        "a request whose step the cache served would be rebuilt from a log missing that step"
-    )
+
+
+def test_a_step_the_prefix_cache_served_whole_is_recorded():
+    """Three Bagel requests with the same image and question lost their logs, since the cache served their step
+    whole, and the pool still counted on dropping them. Once it ran short nothing could be dropped, and nothing
+    moved."""
+    rebuilds = _rebuilds()
+    step = _ran(PREFILL, _rows(R, B))
+    # the engine takes a row the cache served out of the step's rows and their infos
+    step.cached_rids.add(B)
+    step.request_ids.remove(B)
+    info = step.per_request_info.pop(B)
+
+    rebuilds.record(step, {B: info})
+    rebuilds.keep_samples(_batch((B,)), {B: {"new_token": [torch.tensor([9])]}}, None)
+
+    [record] = rebuilds._kept[NODE][B].records
+    assert record.inputs["text_inputs"][0].tolist() == [9, 10, 11], "the rebuild would prefill other ids"
+    assert rebuilds.refusal(B, NODE, DECODE, {}, None) is None, "a request the pool counts on dropping can't be dropped"
 
 
 def test_a_request_the_full_pool_cant_hold_is_not_rebuildable():
@@ -292,6 +309,19 @@ def test_a_request_the_full_pool_cant_hold_is_not_rebuildable():
     assert not _ingest(rebuilds, R, (PrefixSpan(2, 2, PREFILL),)), "two requests' ids would share host memory"
     rebuilds.record(_ran(PREFILL, {A: {"text_inputs": [torch.arange(4)]}, R: {"text_inputs": [torch.arange(2)]}}))
     assert A in rebuilds._kept[NODE] and R not in rebuilds._kept[NODE]
+
+
+def test_a_full_pool_is_logged_once_and_not_per_request(caplog):
+    rebuilds = Rebuilds({NODE: POLICY}, _graphs(), HostPool(32, torch.device("cpu")))
+
+    with caplog.at_level(logging.WARNING, logger="mstar.worker.rebuild"):
+        for rid in (R, A, B):
+            _ingest(rebuilds, rid, (PrefixSpan(8, 8, PREFILL),))
+
+    lines = [record.getMessage() for record in caplog.records]
+    assert len(lines) == 1 and "the 64 bytes a request's ids and host copies take, with 0 of 32 bytes" in lines[0], (
+        "requests that can never be dropped would go unnoticed, or log a line each"
+    )
 
 
 def test_removing_a_request_gives_its_slice_back():
@@ -437,6 +467,24 @@ def test_a_media_copy_past_the_steps_allowance_waits_for_the_next_steps():
     rebuilds.flush()
     assert record.ready() and record.inputs["embeds"][0].tolist() == list(range(8)), "the split copy lost bytes"
     assert allowance.left == 24 - 8, "the cached pages' writes would get less than the copies left them"
+
+
+def test_an_empty_input_queues_no_copy_and_holds_back_none_behind_it():
+    """`flush` took a copy off the queue only once it spent some of the step's allowance. A row that read an empty
+    tensor queued a copy that spent nothing, so it stayed at the head of the queue and no copy behind it ever
+    started."""
+    rebuilds = _copying(R)
+    step = _vision_step((R,), {}, completion_event=None)
+    step.per_request_input_tensors[R]["embeds"] = [torch.zeros(0, 2), torch.ones(2, 2)]
+
+    rebuilds.record(step)
+    rebuilds.flush()
+
+    [record] = rebuilds._kept[NODE][R].records
+    assert record.ready(), "the request's image would never land, so it could never be dropped"
+    assert [view.shape for view in record.inputs["embeds"]] == [(0, 2), (2, 2)], (
+        "the rebuild row would read other inputs than its prefill row"
+    )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
@@ -719,6 +767,17 @@ def test_a_request_mid_prefill_is_rebuilt_from_its_prompts_input_up_to_where_its
     )
 
 
+@pytest.mark.parametrize("prefilling", [None, Prefilling(PREFILL, 4, 10)], ids=["kept ids", "mid-prefill"])
+def test_a_drop_is_checked_against_the_tokens_its_rebuild_writes(prefilling):
+    rebuilds = _rebuilds()
+    rebuilds._kept[NODE][R] = _kept([1, 2, 3], 4, 5)
+
+    tokens = rebuilds.tokens(R, NODE, prefilling)
+    rebuilds.start(R, NODE, prefilling)
+
+    assert tokens == rebuilds.cursor(R, NODE).total, "the drop would check one count and the rebuild write another"
+
+
 def test_the_sampler_commits_no_draw_of_a_rebuild_row_whatever_the_model_declared():
     ctx = StepContext(request_ids=(R, A), graph_walk=PREFILL, slot=0, capture=False, rebuild_rids=frozenset({R}))
     for kept_rids in (None, frozenset({R, A})):
@@ -782,6 +841,113 @@ def test_every_rebuild_row_runs_under_its_own_prefill_steps_metadata_and_reads_o
     assert image_info.graph_walk == VISION and image_info.step_metadata == {"prefill_order": ("image",)}
     assert rebuilds._pool.copied_in == 1 and image["text_inputs"][0].tolist() == [4, 5, 6], (
         "the samples would follow another step's text, or the image would stay on the host"
+    )
+
+
+def _write_kv(kv, rid: int, walk: str, *spans: int) -> None:
+    """Write ``rid``'s next slots in steps of ``walk``, ``spans[i]`` of them in step ``i``."""
+    for span in spans:
+        step = KVStep(segments=(Segment(rid, "main", span),))
+        ctx = StepContext(request_ids=(rid,), graph_walk=walk, slot=0, capture=False)
+        assert kv.admit(step, ctx).ok
+        kv.plan(step, ctx)
+        kv.commit(step, ctx)
+
+
+# a prompt of text alone, of text and an image in one step, and of text and then an image in a step of its own,
+# each as the steps its layout lays out: their walks, what they read and the slots they write
+PROMPTS = {
+    "text": ((PrefixSpan(11, 11, PREFILL),), [(PREFILL, {"text_inputs": [torch.arange(11)]}, 11)]),
+    "image": (IMAGE_CHAT, [(VISION, {**IMAGE_STEP, "text_inputs": [torch.arange(3), torch.arange(2)]}, 11)]),
+    "two steps": (TWO_STEPS, [(PREFILL, TEXT_STEP, 3), (VISION, IMAGE_STEP, 8)]),
+}
+
+
+@pytest.mark.parametrize("prompt", list(PROMPTS))
+@pytest.mark.parametrize("mid_prefill", [False, True], ids=["mid-decode", "mid-prefill"])
+def test_a_drop_takes_the_slots_its_rebuild_writes_and_the_rebuild_writes_them(prompt, mid_prefill):
+    """The drop counted only a request's kept ids, or for a prompt mid-prefill only the chunks of the step in
+    progress, so it refused a prompt with an image, whose rebuild also writes the image's slots and reruns the steps
+    before the one in progress. A count kept apart from the one the rebuild runs could also pass the drop and then
+    write other slots than the KV held, which the KV caught only at the rebuild."""
+    spans, steps = PROMPTS[prompt]
+    rebuilds = Rebuilds({NODE: MEDIA}, _graphs(), HostPool(1 << 10, torch.device("cpu")), node_dtypes=DTYPES)
+    assert _ingest(rebuilds, R, spans)
+    kv = kv_drop._manager()
+    layout = StreamLayout(spans=spans, growth=(("decode_loop", 1),))
+    kv.ingest_request(R, KVReqConfig(kv_layout={"main": layout}, loop_caps={"decode_loop": 50}))
+    # a request dropped mid-prefill stops two slots short of its last step's end
+    walk, length = steps[-1][0], steps[-1][2]
+    done = length - 2 if mid_prefill else length
+    for step_walk, inputs, step_length in steps:
+        ran = done if step_walk == walk else step_length
+        step = _ran(step_walk, {R: inputs})
+        if ran < step_length:
+            step.chunk_ranges = {R: ChunkRange(0, ran, step_length, ran)}
+        rebuilds.record(step)
+        _write_kv(kv, R, step_walk, ran)
+    rebuilds.flush()
+    if mid_prefill:
+        prefilling, iters = Prefilling(walk, done, length), {}
+    else:
+        # the prefill's sample and one per decode step
+        _write_kv(kv, R, DECODE, 1, 1)
+        rebuilds._kept[NODE][R].sampled.extend([100, 101, 102])
+        prefilling, iters = None, {"decode_loop": 2}
+    assert rebuilds.refusal(R, NODE, walk if mid_prefill else DECODE, iters, prefilling) is None
+
+    tokens = rebuilds.tokens(R, NODE, prefilling)
+    assert kv.check_drop(R, tokens) is None, f"the drop refused {tokens} slots for a KV that holds them"
+    kv.drop(R, tokens)
+    held = kv._dropped[R].held
+    rebuild = rebuilds.start(R, NODE, prefilling)
+    if rebuild is not None:
+        kv.prepare_rebuild(R, rebuild)
+    while rebuilds.rebuilding(R, NODE):
+        cursor = rebuilds.cursor(R, NODE)
+        _write_kv(kv, R, cursor.walk, cursor.total)
+        rebuilds.land_chunk(R, NODE, None)
+    kv.land_rebuild(R)
+
+    assert kv._streams[R]["main"].stored_len == held, "the rebuild wrote other slots than the drop checked"
+    # the rest of the prompt, or the next decode step
+    _write_kv(kv, R, *((walk, 2) if mid_prefill else (DECODE, 1)))
+
+
+def test_a_request_dropped_again_after_its_rebuild_is_laid_out_past_what_that_rebuild_wrote():
+    """A request back from a drop can be dropped again, since its pool returns it preemptible. Its log holds every
+    id it sampled since its prompt, but its first rebuild had already laid out the ids sampled before it, and sending
+    them all again laid the label out past what it held."""
+    kv, rebuilds = kv_drop._manager(), Rebuilds({NODE: POLICY}, _graphs(), HostPool(1 << 10, torch.device("cpu")))
+    prompt = list(range(20))
+    assert _ingest(rebuilds, R, (PrefixSpan(20, 20, PREFILL),))
+    rebuilds.record(_ran(PREFILL, {R: {"text_inputs": [torch.tensor(prompt)]}}))
+    sampled = rebuilds._kept[NODE][R].sampled
+    kv.ingest_request(R, kv_drop._config(prompt))
+    # the prefill's sample and two decode steps, then the drop and the rebuild
+    sampled.extend([100, 101, 102])
+    kv_drop._write(kv, R, 20, 1, 1)
+    kv.drop(R, rebuilds.tokens(R, NODE, None))
+    kv.prepare_rebuild(R, rebuilds.start(R, NODE, None))
+    rebuilds.land_chunk(R, NODE, None)
+    kv_drop._write(kv, R, 22)
+    kv.land_rebuild(R)
+    # two more decode steps, then the second drop
+    sampled.extend([103, 104])
+    kv_drop._write(kv, R, 1, 1)
+    kv.drop(R, rebuilds.tokens(R, NODE, None))
+
+    kv.prepare_rebuild(R, rebuilds.start(R, NODE, None))
+
+    assert [(row.walk, row.total) for row in rebuilds.cursor(R, NODE).rows] == [(PREFILL, 24)], (
+        "the rebuild row would leave out the ids sampled before the first drop"
+    )
+    fresh = kv_drop._manager()
+    fresh.ingest_request("f", kv_drop._config(prompt + [100, 101, 102, 103]))
+    fresh._streams["f"]["main"].chain.extend([104], kv_drop.PAGE_SIZE)
+    rebuilt, want = kv._streams[R]["main"].chain, fresh._streams["f"]["main"].chain
+    assert (rebuilt.keys, rebuilt.unkeyed) == (want.keys, want.unkeyed), (
+        "the rebuilt pages would be filed under keys another request with these ids can't match"
     )
 
 

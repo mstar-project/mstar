@@ -393,7 +393,8 @@ class KVReqConfig(ResourceReqConfig):
     loop_caps: dict[str, int] | None = None
     # `unpausable`: the request streams an output that can't pause, set by the conductor.
     # `rebuildable`: a drop on this worker can free its pages, set by the worker before ingest.
-    # A pool that decides admission reads both at the request's first `KVManager.ask`.
+    # A pool that decides admission reads both at the request's first `KVManager.ask` and at its admission. A request
+    # no drop can free can still turn guaranteed later, at the first page the host pool has no room for.
     unpausable: bool = False
     rebuildable: bool = True
 
@@ -427,8 +428,9 @@ class KVReqConfig(ResourceReqConfig):
                     growth=tuple((loop, slots) for loop, slots in growth),
                     scratch=scratch,
                     retention=None if retention is None else RetentionPolicy(*retention),
-                    # a request with the prefix cache off keys none of its spans
-                    keyed_spans=keyed_spans if self.prefix_cache else 0,
+                    # a request with no keys for the label, as with the prefix cache off for it or for the server,
+                    # keys none of its spans
+                    keyed_spans=keyed_spans if self.keys_of(label) else 0,
                     max_growth=max_growth[0] if max_growth else None,
                 )
                 # a row may leave out the growth bound, as a span row may leave out its later fields
@@ -779,9 +781,10 @@ class StreamLayout:
             start = end
         return tuple(steps)
 
-    def rebuilt(self, grown: int) -> "StreamLayout":
-        """This layout once a rebuild has written ``grown`` ids sampled since it was laid out at the end of its
-        last span, which `rebuild_refusal` requires to be ids."""
+    def rebuilt(self, slots: int) -> "StreamLayout":
+        """This layout once a rebuild has written ``slots`` slots into it: the last span, which `rebuild_refusal`
+        requires to be ids, grows by the slots past the layout, the ids sampled since it was laid out."""
+        grown = slots - sum(span.length for span in self.spans)
         *spans, last = self.spans
         return replace(self, spans=(*spans, replace(last, length=last.length + grown, advance=last.advance + grown)))
 

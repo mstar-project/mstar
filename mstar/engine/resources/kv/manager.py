@@ -3,7 +3,7 @@ import logging
 import os
 import threading
 from collections import Counter
-from collections.abc import Callable, Collection, Iterable, Sequence
+from collections.abc import Callable, Collection, Sequence
 from concurrent.futures import Future, wait
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, NamedTuple
@@ -369,20 +369,34 @@ class Allotment:
     kept: int = 0
 
 
+class Dropped(NamedTuple):
+    """A dropped request until its rebuild lands: the pages it asks to return with, and the tokens its
+    laid-out label held, which its rebuild must write again."""
+    returns: int
+    held: int
+
+
 class Victims(NamedTuple):
     """The requests `KVManager.preempt` chose to move off the device: to the host, dropped, or, holding no page of
-    their own, already given back their leases and allotment to ask again. ``waits`` is set when no move covers
-    the shortage, and the request that ran short asks the pool for it instead."""
+    their own, already given back their allotment to ask again. When no move covers the shortage,
+    ``waits`` is the pages the request that ran short asks the pool for instead, and 0 otherwise."""
     to_host: list[str]
     to_drop: list[str]
     to_ask: list[str]
-    waits: bool = False
+    waits: int = 0
+
+
+class ShortGrant(NamedTuple):
+    """A grant that ran short: the room then, and the pages it needed past what its request's allotment had left."""
+    room: int
+    pages: int
 
 
 @dataclass(slots=True)
 class Earmark:
-    """The pages ``rid`` ran short of, which the moves of ``victims`` free for it. ``granted`` counts the pages
-    the moves applied so far added to ``rid``'s allotment."""
+    """The pages ``rid``'s grant needed past its allotment, which the room it counted and the moves of ``victims``
+    add to the allotment. ``granted`` counts the pages added so far. For a request that waits, ``pages`` is all it
+    asks for, which it takes whole."""
     rid: str
     pages: int
     victims: set[str]
@@ -650,8 +664,8 @@ class KVManager(AttentionResource):
             )
         self._streams: dict[str, LabelToStream] = {}
         self._overrides: dict[str, KVReqConfig] = {}
-        # dropped request, until its rebuild lands -> the tokens its laid-out label held, which the rebuild writes again
-        self._dropped: dict[str, int] = {}
+        # dropped request -> what it returns with, until its rebuild lands
+        self._dropped: dict[str, Dropped] = {}
         # A stream holds its pages in group g at `CacheStream.groups[g]`, and a plan's at
         # `KVPlanOutputs.groups[g]`; write addressing is keyed (label, g).
         self._groups: tuple[KVGroup, ...] = cfg.groups
@@ -711,12 +725,13 @@ class KVManager(AttentionResource):
         # `local_loops` holds the loops that grow KV on `_nodes` in a walk this worker runs, set by the worker.
         # `_unused` counts the pages admitted requests were allotted and haven't used yet.
         # `_guaranteed` holds the requests that reserve what they grow into and are never preempted, decided at their
-        #   first `ask` or when a drop or a move takes them off the device.
+        #   first `ask`, or later when the host has no room to set aside for their move.
         # `_snapshots` holds the pools that restore a hit's recurrent state. A prefill hit counts only as far as they
         #   restore it.
         # `_footprints` holds each request's `_footprint` as it was at intake.
-        # `_kept` counts the pages that passers freed while the head waited. Later passers can't take them, but
-        #   admitted requests can, and the head's allotment takes them.
+        # `_kept` counts the room kept for a waiting request: the pages passers freed while it waited, and the pages
+        #   moves made for it freed before they covered it. Passers can't take them, but admitted requests can, and
+        #   a request admitted in order takes them first.
         self._nodes = nodes
         self.local_loops: Collection[str] = frozenset()
         self._asks: dict[str, int] = {}
@@ -728,13 +743,13 @@ class KVManager(AttentionResource):
         self._kept = 0
         # Preemption state.
         # `_earmarks`: request -> the earmark it holds until its victims have moved.
-        # `_victims`: a victim not yet moved -> its earmark, or None when the victim is the request that ran short.
+        # `_victims`: a victim not yet moved -> its earmark.
         # `_hosted`: the victims that move to the host, decided when they are chosen.
-        # `_ran_short`: request -> the room when its last grant ran short.
+        # `_ran_short`: request -> its last grant that ran short.
         self._earmarks: dict[str, Earmark] = {}
-        self._victims: dict[str, Earmark | None] = {}
+        self._victims: dict[str, Earmark] = {}
         self._hosted: set[str] = set()
-        self._ran_short: dict[str, int] = {}
+        self._ran_short: dict[str, ShortGrant] = {}
         if _DEBUG_ASSERTS and tp_cache:
             self._arena.trail = (0, 0)
         self._device = device
@@ -1150,11 +1165,11 @@ class KVManager(AttentionResource):
     def _leased(self, rid: str, stream: CacheStream) -> int:
         """The tokens ``stream``'s lease holds, or for a dropped request at most a page under the tokens its KV
         held: its rebuild writes only those, and runs at least one."""
-        held = self._dropped.get(rid)
-        if held is None:
+        dropped = self._dropped.get(rid)
+        if dropped is None:
             return stream.lease_len
         page = self.config.tokens_per_page
-        return min(stream.lease_len, max(held - 1, 0) // page * page)
+        return min(stream.lease_len, max(dropped.held - 1, 0) // page * page)
 
     @staticmethod
     def _answer(
@@ -2376,11 +2391,11 @@ class KVManager(AttentionResource):
                 # so an offload that claimed this stream mid-admit notices its
                 # host copy no longer describes it and aborts
                 part.generation += 1
-            # Record the room again after the rollback. Otherwise `preempt` would count the pages the step's other
-            # rows gave back as released since the grant ran short.
-            for segment in step.segments:
-                if segment.request_id in self._ran_short:
-                    self._ran_short[segment.request_id] = self._room()
+            # Record the room again after the rollback. Otherwise `preempt` would count the pages given back here as
+            # released since a grant ran short. Run row by row, that grant's row has already rolled back on its own.
+            room = self._room()
+            for rid, short in self._ran_short.items():
+                self._ran_short[rid] = short._replace(room=room)
             if _DEBUG_ASSERTS:
                 self.assert_pages_conserved()
 
@@ -3640,7 +3655,7 @@ class KVManager(AttentionResource):
         with self._lock:
             return any(stream.step_in_flight or stream.read_pending for stream in self._streams[rid].values())
 
-    def check_drop(self, rid: str) -> str | None:
+    def check_drop(self, rid: str, tokens: int) -> str | None:
         if self._world_size > 1 and not self._counts:
             return (
                 f"KV {self.name}: dropping {rid} on one of {self._world_size} ranks "
@@ -3654,35 +3669,52 @@ class KVManager(AttentionResource):
         with self._lock:
             if not self._movable(rid):
                 return (
-                    f"KV {self.name}: {rid} is guaranteed, waits on room set aside for it, or has a step or a read "
-                    "in flight on its pages"
+                    f"KV {self.name}: {rid} is guaranteed, has a step or a read in flight on its pages, or holds a "
+                    "lease no walk's admit has taken over"
                 )
             if not self._overrides[rid].rebuildable:
                 return f"KV {self.name}: {rid} can't be rebuilt on this worker"
+            held = self._laid_out_tokens(rid)
+            if any(layout.spans for layout in (self._overrides[rid].kv_layout or {}).values()) and held != tokens:
+                return f"KV {self.name}: {rid}'s rebuild would write {tokens} tokens, but its label holds {held}"
         return None
 
-    def drop(self, rid: str) -> int:
+    def _laid_out_tokens(self, rid: str) -> int:
+        # `check_drop` allows at most one laid-out label
+        laid_out = [label for label, layout in (self._overrides[rid].kv_layout or {}).items() if layout.spans]
+        return sum(self._streams[rid][label].stored_len for label in laid_out)
+
+    def drop(self, rid: str, tokens: int) -> int:
         """Take ``rid``'s KV off the device without a host copy, and return the
         number of pages freed. Pages the index also holds stay cached, where they
         can be evicted, and the rest go back to the free list."""
         with self._lock:
-            refusal = self.check_drop(rid)
+            refusal = self.check_drop(rid, tokens)
             if refusal is not None:
                 raise RuntimeError(refusal)
             # under the lock, so no other step allocates between the two counts
             free, room = self._arena.num_free, self._room()
-            # `check_drop` allows at most one laid-out label
-            laid_out = [label for label, layout in (self._overrides[rid].kv_layout or {}).items() if layout.spans]
-            held = sum(self._streams[rid][label].stored_len for label in laid_out)
+            # It returns with the larger of its prompt and its history (the tokens its KV held, released
+            # ones included, and the sample its next step writes) and one page more, at most its footprint.
+            # A request dropped partway through its prompt still writes the rest.
+            streams = self._streams[rid].values()
+            written = max(stream.stored_len + stream.released for stream in streams)
+            history = -(-(written + 1) // self.config.tokens_per_page)
+            allotment = self._allotments.get(rid)
+            returns = max(
+                0 if allotment is None else allotment.prompt,
+                sum(self._one_more(stream.groups, history, stream.footprint) for stream in streams),
+            )
+            held = self._laid_out_tokens(rid)
             self.reset_request(rid, free=True)
-            self._dropped[rid] = held
+            self._dropped[rid] = Dropped(returns, held)
             self._vacate(rid, room)
             return self._arena.num_free - free
 
     def prepare_rebuild(self, rid: str, rebuild: Rebuild) -> None:
-        """Lay ``rid``'s label out again as its rebuild writes it: the label's spans, the last grown by the ids
-        sampled since but the newest (`StreamLayout.rebuilt`). A keyed label extends its keys by those ids, as
-        the decode steps that sampled them did.
+        """Lay ``rid``'s label out again to hold the slots its drop checked, which its rebuild writes: the label's
+        spans, the last grown by the ids sampled since but the newest (`StreamLayout.rebuilt`). A keyed label
+        extends its keys by those ids, as the decode steps that sampled them did.
 
         The growth loop's cap and the layout's ``max_growth`` drop by what the last span grew, so the
         footprint stays the one at intake. The decode step that samples an id keys it, so a label that keys
@@ -3693,11 +3725,12 @@ class KVManager(AttentionResource):
         if not laid_out:
             return
         (label,) = laid_out
-        layout, grown = overrides.kv_layout[label], len(rebuild.sampled) - 1
-        rebuilt = layout.rebuilt(grown)
-        written, held = sum(span.length for span in rebuilt.spans), self._dropped[rid]
-        if written != held:
-            raise RuntimeError(f"KV {self.name}: {rid}'s rebuild writes {written} slots, but its label held {held}")
+        layout, held = overrides.kv_layout[label], self._dropped[rid].held
+        rebuilt, grown = layout.rebuilt(held), held - sum(span.length for span in layout.spans)
+        assert len(rebuild.sampled) - 1 == grown, (
+            f"KV {self.name}: {rid}'s rebuild writes {len(rebuild.sampled) - 1} ids past its layout, but its drop "
+            f"checked {grown} slots past it"
+        )
         # hashed before the lock, as `resolve_cached_prefix` hashes outside it
         keys = self._rebuilt_keys(overrides, label, layout, rebuild.sampled[:-1])
         with self._lock:
@@ -3895,11 +3928,12 @@ class KVManager(AttentionResource):
                 stream.reset(freed=True, content_reset=False)
                 if claim.keys:
                     self._cpu_pool.insert_keys(rid, claim.label)
-            if rid in self._hosted:
+            # a stream the host couldn't take keeps its pages, and so its allotment
+            if rid in self._hosted and self._unwritten(rid):
                 self._vacate(rid, room)
             else:
                 self._recount(rid)
-                self._keep_for_head(self._allotments.get(rid), room)
+                self._settle(rid, self._room() - room, self._allotments.get(rid))
             return freed, {claim.label for claim in moved}
 
     def _reusable(self, page: int) -> bool:
@@ -3968,9 +4002,21 @@ class KVManager(AttentionResource):
         return needed
 
     def _return_pages(self, rid: str) -> int:
-        """Pages a request asking to return from the host may take beyond its reload: the footprint it asks for,
-        less its pages on the host."""
-        return max(0, self._asks[rid] - sum(len(state.host_pages) for state in self._cpu_pool.offloaded[rid].values()))
+        """Pages a request asking to return from the host may take beyond its reload: the larger of its prompt and
+        its reload plus a page per stream (`_one_more`, as a drop counts a history), less the reload."""
+        reloaded = grown = 0
+        for label, state in self._cpu_pool.offloaded[rid].items():
+            reloaded += len(state.host_pages)
+            first = len(state.groups[0].page_indices)
+            grown += self._one_more(state.groups, first, self._streams[rid][label].footprint)
+        return max(self._asks[rid], grown, reloaded) - reloaded
+
+    @staticmethod
+    def _one_more(groups: Sequence[GroupPages], first: int, footprint: int | None) -> int:
+        """``first`` pages in the first of ``groups`` and one page more, at most ``footprint``, and the pages the later
+        groups hold, which have no footprint of their own."""
+        later = sum(len(part.page_indices) for part in groups[1:])
+        return later + (first + 1 if footprint is None else min(first + 1, footprint))
 
     def reload(self, rid: str) -> bool:
         """Bring every offloaded stream of ``rid`` back on device.
@@ -4032,7 +4078,7 @@ class KVManager(AttentionResource):
         with self._lock:
             for label, state in states.items():
                 # released with the copy still queued, since the next write to a host page queues behind it
-                self._cpu_pool.arena.release(self._cpu_pool.pop(rid, label).host_pages)
+                self._cpu_pool.discard(rid, label)
                 self._streams[rid][label].offloaded = False
                 run = runs[label]
                 if len(run) < len(state.keys):
@@ -4359,8 +4405,7 @@ class KVManager(AttentionResource):
             self._dropped.pop(rid, None)
             self._chain_lookup.pop(rid, None)
             self._transfer.remove_request(rid)
-            self._settle(rid, self._room() - room)
-            self._keep_for_head(allotment, room)
+            self._settle(rid, self._room() - room, allotment)
             earmark = self._earmarks.pop(rid, None)
             if earmark is not None:
                 # its victims run on without being dropped
@@ -4575,12 +4620,11 @@ class KVManager(AttentionResource):
             return None
         overrides = self._overrides[rid]
         prompt = overrides.pages(self._nodes, dict.fromkeys(overrides.loop_caps or (), 0), self.config)
-        footprint = self._footprint(rid)
-        # A request that no drop here can free, and that the host can't set room aside for, would wait
-        # holding its pages once it ran short, so it reserves what it grows into.
-        if overrides.unpausable or not (overrides.rebuildable or self._sets_aside(rid, footprint)):
+        # A request that no drop here can free, and that no host can take, would wait holding its pages once
+        # it ran short, so it reserves what it grows into.
+        if overrides.unpausable or not (overrides.rebuildable or self._cpu_pool is not None):
             self._guaranteed.add(rid)
-        pages = footprint if rid in self._guaranteed else prompt
+        pages = self._footprint(rid) if rid in self._guaranteed else prompt
         capacity = self.config.request_pages
         if pages > capacity:
             return AdmitOutcome(ok=False, ready=False, reason=AdmitRuntimeError(
@@ -4589,20 +4633,6 @@ class KVManager(AttentionResource):
             ))
         self._asks[rid] = pages
         return None
-
-    def _sets_aside(self, rid: str, pages: int) -> bool:
-        """Whether the host sets ``pages`` aside for ``rid``'s move there. A pool that decides asks the host and
-        journals the answer. The other ranks replay it, since they ask for ``rid`` only as they replay its
-        reservation, by when other moves can have changed the host's room."""
-        if self._cpu_pool is None:
-            return False
-        if not self._decides:
-            return rid in self._cpu_pool.reserved
-        if not self._cpu_pool.reserve(rid, pages):
-            return False
-        if self.journal is not None:
-            self.journal(MoveKind.SET_ASIDE, rid, pages)
-        return True
 
     def _footprint(self, rid: str) -> int:
         """The pages ``rid`` would hold once the loops this worker runs reach their caps."""
@@ -4629,28 +4659,24 @@ class KVManager(AttentionResource):
         for prefix_chain in chains:
             self._root_chain(prefix_chain)
         with self._lock:
+            if rid not in self._asks:
+                # the moves `make_room` chose for ``rid`` admitted it (`_settle`)
+                return None
             pages, room = self._need(rid, node_name, graph_walk, published), self._room()
-            if pages > room:
+            if pages > room or not self._admit(rid, pages, self.journal):
                 return RoomMark(rid, node_name, graph_walk, published, room, *self._index_counts())
-            self._reserve(rid, pages)
-            # only the head of the queue reserves without passing, so the pages kept for it are its own
-            self._allotments[rid].kept, self._kept = self._kept, 0
             return None
 
     def reserve_past(
         self, rid: str, node_name: str, graph_walk: str, published: PublishedKVInfo | None,
     ) -> PassMark | None:
         """Allot ``rid`` past the first request in the queue, when what its own admission would take and the
-        growth that admission leaves to the room fit in the room less `_kept`.
-
-        For a guaranteed request and one returning from a drop or the host, its admission already takes its
-        footprint, so passing costs it nothing more. A request that holds an allotment waits for its shortage
-        in order.
-        """
+        growth that admission leaves to the room fit in the room less `_kept`. A request that holds an allotment
+        waits for its shortage in order."""
         with self._lock:
-            room = self._room()
-            if rid in self._allotments or self._footprint(rid) - self._asks[rid] > room - self._kept:
-                return PassMark(room - self._kept, None, None)
+            room = self._room() - self._kept
+            if rid in self._allotments or self._footprint(rid) - self._asks[rid] > room:
+                return PassMark(room, None, None)
             chains = [] if self._index is None or self._returning(rid) else [
                 stream.chain for stream in self._streams[rid].values()
                 if stream.chain is not None and stream.chain.rooted is None
@@ -4659,43 +4685,109 @@ class KVManager(AttentionResource):
             self._root_chain(prefix_chain)
         with self._lock:
             pages = self._need(rid, node_name, graph_walk, published) + self._footprint(rid) - self._asks[rid]
-            room = self._room()
-            if pages > room - self._kept:
-                return PassMark(room - self._kept, *self._index_counts())
+            room = self._room() - self._kept
+            if pages > room:
+                return PassMark(room, *self._index_counts())
             # The room kept for the head is never lent. A passer that runs short past this allotment is the newest
             # request holding pages, so preemption takes it first.
-            self._reserve(rid, pages, passed=True)
+            if not self._admit(rid, pages, self.journal, passed=True):
+                return PassMark(room, None, None)
             return None
+
+    def _admit(
+        self, rid: str, pages: int, journal: Callable[..., None] | None = None, passed: bool = False,
+    ) -> bool:
+        """Allot ``rid`` the ``pages`` it asks for, which the room covers, or return False when ``rid`` turns
+        guaranteed here and the room doesn't cover its footprint. ``journal`` takes the reservation for the
+        other ranks to replay, and ``passed`` is set for a request admitted past the first one in the queue,
+        whose room leaves out `_kept`. Caller holds the lock."""
+        # The host sets room aside for the prompt of a request that can move only there, and `_cover_move`
+        # grows it page by page. With no room for even that, the request reserves what it grows into.
+        if (
+            rid not in self._allotments and not self._overrides[rid].rebuildable and rid not in self._guaranteed
+            and rid not in self._cpu_pool.reserved and not self._cpu_pool.reserve(rid, self._asks[rid])
+        ):
+            self._guarantee(rid)
+            pages = self._asks[rid] = self._footprint(rid)
+            if pages > self._room() - (self._kept if passed else 0):
+                return False
+        self._reserve(rid, pages, passed)
+        if journal is not None:
+            journal(MoveKind.RESERVE, rid, pages)
+        return True
 
     def _reserve(self, rid: str, pages: int, passed: bool = False) -> None:
         """Allot ``rid`` ``pages``, or grow the allotment it holds by them. A request on the host is allotted its
-        reload as well, which then leaves `_return_pages` on top of what it holds."""
+        reload as well, which then leaves `_return_pages` on top of what it holds. A request admitted in order
+        takes `_kept` first."""
+        kept = 0 if passed else min(self._kept, pages)
+        self._kept -= kept
         if rid in self._allotments:
+            self._allotments[rid].kept += kept
             self._allot(rid, pages)
             del self._asks[rid]
         else:
             returning = self._return_pages(rid) if self._on_host(rid) else None
             self._allotments[rid] = Allotment(
-                pages=pages, prompt=self._asks.pop(rid), returning=returning, passed=passed,
+                pages=pages, prompt=self._asks.pop(rid), returning=returning, passed=passed, kept=kept,
             )
             self._recount(rid)
-        if self.journal is not None:
-            self.journal(MoveKind.RESERVE, rid, pages)
 
     def unreserve(self, rid: str) -> None:
         with self._lock:
-            allotment = self._allotments.pop(rid)
-            self._unused -= allotment.remaining
-            self._asks[rid] = allotment.prompt
-            self._kept += allotment.kept
+            # the room kept for a waiting request goes back to it
+            self._kept += self._allotments[rid].kept
+            self._unreserve(rid)
             if self.journal is not None:
                 self.journal(MoveKind.UNRESERVE, rid, 0)
+
+    def _unreserve(self, rid: str) -> None:
+        allotment = self._allotments.pop(rid, None)
+        if allotment is not None:
+            self._unused -= allotment.remaining
+            self._asks[rid] = allotment.prompt
+        # a request that holds nothing waits with no room set aside on the host
+        if self._cpu_pool is not None and self._unwritten(rid) and not self._on_host(rid):
+            self._cpu_pool.unreserve(rid)
+
+    def _guarantee(self, rid: str) -> None:
+        """Make ``rid`` guaranteed, since the host has no room to set aside for its move."""
+        self._guaranteed.add(rid)
+        self._cpu_pool.unreserve(rid)
+        self._cpu_pool.count_guaranteed(rid)
+
+    def _cover_move(self, rid: str, n: int) -> int:
+        """Grow the room the host sets aside for ``rid`` by the ``n`` pages it is about to take, or guarantee ``rid``
+        when the host has no room for them. Returns the pages its guarantee is short of, before which ``rid`` takes
+        nothing."""
+        reserved = None if self._cpu_pool is None else self._cpu_pool.reserved.get(rid)
+        if reserved is None:
+            return 0
+        # a lease, and the pages held for a copy from the host, become a stream's pages without a grant
+        held = sum(
+            len(stream.pages()) + len(stream.lease or ()) + len(stream.hold or ())
+            for stream in self._streams[rid].values()
+        )
+        if held + n <= reserved or self._cpu_pool.reserve(rid, held + n):
+            return 0
+        allotment = self._allotments[rid]
+        # a lease's lent pages stay in a guaranteed allotment until `_adopt` takes them off
+        grows = max(0, self._footprint(rid) - held) + sum(
+            len(stream.lent.intersection(stream.lease or ())) for stream in self._streams[rid].values()
+        )
+        short = grows - allotment.remaining - self._room()
+        if short > 0:
+            return short
+        self._guarantee(rid)
+        allotment.pages = self._held(rid) + grows
+        self._recount(rid)
+        return 0
 
     def grew_since(self, mark: RoomMark | PassMark) -> bool:
         """A newly filed page can raise a waiting request's hit, and a hit page another request
         takes from the evictable set comes out of that request's allotment, not this one's. Neither
         moves the room, so the index counts both. The counts only rise, so two changes between passes
-        can't cancel out."""
+        can't cancel out. A request that moves admitted (`_settle`) asks for nothing more."""
         if not _DEBUG_ASSERTS:
             return self._grew_since(mark)
         # under the lock, so a page freed on the GPU thread between the two reads can't trip it
@@ -4710,21 +4802,30 @@ class KVManager(AttentionResource):
             return grew
 
     def _grew_since(self, mark: RoomMark | PassMark) -> bool:
-        # pages freed into `_kept` are no room for a passer
-        room = self._room() - self._kept if isinstance(mark, PassMark) else self._room()
-        if room > mark.room:
+        if isinstance(mark, PassMark):
+            # pages kept for a waiting request are no room for a passer
+            room = self._room() - self._kept
+        elif mark.rid not in self._asks:
             return True
-        return mark.filed is not None and (mark.filed, mark.taken) != self._index_counts()
+        else:
+            room = self._room()
+        return room > mark.room or (mark.filed is not None and (mark.filed, mark.taken) != self._index_counts())
 
     def _need(
         self, rid: str, node_name: str, graph_walk: str, published: PublishedKVInfo | None,
     ) -> int:
         """The pages ``rid``'s allotment would take now. Caller holds the lock.
 
-        No hit covers the shortage a request that holds an allotment asks for.
+        A dropped request is charged every cache hit as a fresh page, since nothing is leased before its
+        rebuild. When the rebuild's probe hits a page another request holds, the hit costs nothing, so
+        that page of the allotment is left for the request's growth. No hit covers the shortage a request
+        that holds an allotment asks for.
         """
         if rid in self._allotments:
             return self._asks[rid]
+        dropped = self._dropped.get(rid)
+        if dropped is not None:
+            return dropped.returns
         if self._on_host(rid):
             return self._reload_pages(rid) + self._return_pages(rid)
         if rid in self._guaranteed:
@@ -4748,93 +4849,107 @@ class KVManager(AttentionResource):
             return 0, 0
         return self._index.filed + sum(pool.filed for pool in self._snapshots), self._index.taken
 
-    def _keep_for_head(self, allotment: Allotment | None, room: int) -> None:
-        """When ``allotment`` belongs to a request that passed a head, and a request waits, keep for the head
-        the pages freed since ``room`` was read."""
-        if allotment is not None and allotment.passed and self._asks:
-            self._kept += self._room() - room
-
     # Preemption
 
     def preempt(
-        self, rid: str, pages_short: int, newer: Iterable[str] | None, droppable: Callable[[str], bool],
+        self, rid: str, pages_short: int, newer: Collection[str] | None, droppable: Callable[[str], bool],
     ) -> Victims | None:
         """Choose requests from ``newer``, the requests that arrived after ``rid``, newest first, to move off the
-        device for ``rid``'s shortage of ``pages_short`` pages, and earmark what they free for ``rid``. A victim
-        the host can take whole moves there, and any other is dropped, once ``droppable`` says its launched
-        steps allow it.
+        device for ``rid``'s shortage of ``pages_short`` pages, and earmark what they free for ``rid``. The room
+        its grant counted goes into its allotment with them, so its next grant can't fail. A victim the host can
+        take whole moves there, and any other is dropped, once ``droppable`` says its launched steps allow it.
 
-        Returns the victims, or ``rid`` itself when only moving ``rid`` frees pages, or none while ``rid`` waits
-        for its earlier victims to move. When no move covers the shortage, ``rid`` keeps its allotment and asks
-        for the shortage, and waits for it in the pool's queue once the runner asks again. None when the pool
-        doesn't decide or ``newer`` is None, as it is for a request the conductor gave no number.
+        Returns the victims, or none once the room covers its grant. When no move covers the shortage, ``rid`` keeps
+        its allotment and asks for every page its grant needed past it, and waits for them once the runner asks again.
+        None when the pool doesn't decide or ``newer`` is None, as it is for a request the conductor gave no number.
         """
         if not self._decides or newer is None:
             return None
         with self._lock:
-            room, then = self._room(), self._ran_short.pop(rid, None)
-            if then is not None:
-                pages_short -= max(0, room - then)
-            if pages_short <= 0 or rid in self._earmarks or rid in self._victims:
+            room = self._room()
+            short = self._ran_short.pop(rid, ShortGrant(room, pages_short))
+            # the room the grant counted when it ran short, as the room has grown or shrunk since
+            counted = short.pages - pages_short + room - short.room
+            claim = max(0, min(short.pages, counted, room))
+            pages_short = short.pages - claim
+            if pages_short <= 0:
+                self._allot(rid, claim)
                 return Victims([], [], [])
-            on_host = 0 if self._cpu_pool is None else self._cpu_pool.room()
-            left, hosted, asking, moving = on_host, set(), set(), False
-            victims: list[str] = []
-            for other in newer:
-                if not self._holds(other):
-                    continue
-                if other in self._victims:
-                    # a victim not yet moved frees its pages for the request it was chosen for
-                    moving = True
-                    continue
-                if not self._movable(other):
-                    continue
-                if self._unwritten(other):
-                    asking.add(other)
-                elif (pages := self._host_pages(other)) is not None and pages <= left:
-                    left -= pages
-                    hosted.add(other)
-                elif not droppable(other):
-                    continue
-                victims.append(other)
-                if self._frees(victims) >= pages_short:
-                    break
-            else:
-                pages = self._host_pages(rid)
-                to_host = pages is not None and pages <= on_host
-                if not moving and self._movable(rid) and (to_host or droppable(rid)) and self._frees([rid]) > 0:
-                    self._victims[rid] = None
-                    if to_host:
-                        self._host(rid, [rid])
-                    return Victims([rid], [], []) if to_host else Victims([], [rid], [])
-                self._asks[rid] = pages_short
-                return Victims([], [], [], waits=True)
-            freed = self._frees(victims)
-            for victim in list(victims):
-                rest = [other for other in victims if other != victim]
-                if self._frees(rest) == freed:
-                    victims = rest
-            to_ask = self._earmark(rid, pages_short, victims)
-            self._host(rid, [victim for victim in victims if victim in hosted])
-            return Victims(
-                [victim for victim in victims if victim in hosted],
-                [victim for victim in victims if victim not in hosted and victim not in to_ask],
-                to_ask,
-            )
+            victims = self._choose(pages_short, newer, droppable)
+            if victims is None:
+                self._asks[rid] = short.pages
+                return Victims([], [], [], waits=short.pages)
+            self._allot(rid, claim)
+            return self._earmark(Earmark(rid, short.pages, set(), claim), victims)
 
-    def _earmark(self, rid: str, pages: int, victims: list[str]) -> list[str]:
-        """Earmark ``pages`` for ``rid`` on ``victims``, and return the victims that hold no page of their own,
-        which give back their allotment at once and ask again."""
-        earmark = Earmark(rid, pages, set(victims))
+    def make_room(self, mark: RoomMark, newer: Collection[str], droppable: Callable[[str], bool]) -> Victims | None:
+        """Choose requests from ``newer`` that wait holding pages, newest first, to move off the device for
+        ``mark.rid``, a waiting request the room doesn't fit, and earmark what they free for it. It takes that room
+        as their moves land, once the room covers all it asks for. None when the pool doesn't decide, ``mark.rid``
+        fits, or no such moves cover it."""
+        if not self._decides:
+            return None
+        with self._lock:
+            parked = [other for other in newer if other in self._asks and other in self._allotments]
+            if not parked or mark.rid not in self._asks:
+                return None
+            pages = self._need(mark.rid, mark.node_name, mark.graph_walk, mark.published)
+            victims = self._choose(pages - self._room(), parked, droppable) if pages > self._room() else None
+            return None if victims is None else self._earmark(Earmark(mark.rid, pages, set()), victims)
+
+    def _choose(self, pages_short: int, newer: Collection[str], droppable: Callable[[str], bool]) -> Victims | None:
+        """The fewest leading requests of ``newer`` whose moves free ``pages_short`` pages, or None when moving every
+        one a move can take frees less. Caller holds the lock."""
+        left = 0 if self._cpu_pool is None else self._cpu_pool.room()
+        hosted, asking = set(), set()
+        victims: list[str] = []
+        for other in newer:
+            if not self._holds(other):
+                continue
+            if not self._movable(other):
+                continue
+            if self._unwritten(other):
+                asking.add(other)
+            elif (pages := self._host_pages(other)) is not None and pages <= left:
+                left -= pages
+                hosted.add(other)
+            elif not droppable(other):
+                continue
+            victims.append(other)
+            if self._frees(victims) >= pages_short:
+                break
+        else:
+            return None
+        freed = self._frees(victims)
+        for victim in list(victims):
+            rest = [other for other in victims if other != victim]
+            if self._frees(rest) == freed:
+                victims = rest
+        return Victims(
+            [victim for victim in victims if victim in hosted],
+            [victim for victim in victims if victim not in hosted and victim not in asking],
+            [victim for victim in victims if victim in asking],
+        )
+
+    def _earmark(self, earmark: Earmark, victims: Victims) -> Victims:
+        """Set aside what ``victims`` free for ``earmark.rid``. Caller holds the lock."""
+        moving = [*victims.to_host, *victims.to_drop, *victims.to_ask]
+        if self.journal is not None:
+            self.journal(MoveKind.EARMARK, earmark.rid, earmark.pages, moving)
+        self._mark_victims(earmark, moving)
+        self._host(earmark.rid, victims.to_host)
+        return victims
+
+    def _mark_victims(self, earmark: Earmark, victims: list[str]) -> None:
+        """Earmark what ``victims`` free for ``earmark.rid``. A victim that holds no page of its own gives back its
+        allotment at once and asks again."""
+        earmark.victims = set(victims)
         for victim in victims:
             self._victims[victim] = earmark
-        self._earmarks[rid] = earmark
-        if self.journal is not None:
-            self.journal(MoveKind.EARMARK, rid, pages, victims)
-        to_ask = [victim for victim in victims if self._unwritten(victim)]
-        for victim in to_ask:
-            self._vacate(victim, self._room())
-        return to_ask
+        self._earmarks[earmark.rid] = earmark
+        for victim in victims:
+            if self._unwritten(victim):
+                self._vacate(victim, self._room())
 
     def _host(self, rid: str, victims: list[str]) -> None:
         self._hosted.update(victims)
@@ -4851,10 +4966,14 @@ class KVManager(AttentionResource):
         )
 
     def _movable(self, rid: str) -> bool:
-        """Whether a move can take ``rid`` as soon as it is chosen: it isn't guaranteed, no room is set aside for
-        it, and no step or read is in flight on its pages."""
-        return rid not in self._guaranteed and rid not in self._earmarks and not any(
-            stream.step_in_flight or stream.read_pending for stream in self._streams[rid].values()
+        """Whether a move can take ``rid`` as soon as it is chosen: it isn't guaranteed, no step or read is in flight on
+        its pages, and it isn't dropped with a rebuild still to land, since the rebuild runs on its allotment. ``rid``
+        also stays while it holds a lease, until a walk's admit takes the lease over. The probe that took the lease
+        moved the position counter, which a smaller hit after a move couldn't move back, and a walk the cache served
+        keeps its KV only in the lease."""
+        return rid not in self._guaranteed and rid not in self._dropped and not any(
+            stream.step_in_flight or stream.read_pending or stream.lease is not None
+            for stream in self._streams[rid].values()
         )
 
     def _unwritten(self, rid: str) -> bool:
@@ -4879,56 +4998,57 @@ class KVManager(AttentionResource):
         return max(0, pages - self._cpu_pool.reserved.get(rid, 0))
 
     def _frees(self, rids: Collection[str]) -> int:
-        """The room moving ``rids`` off the device would make: the pages of their streams and leases that would
-        reach the free list or the evictable set, and their unused allotments."""
+        """The room moving ``rids`` off the device would make: the pages of their streams that would reach the free
+        list or the evictable set, and their unused allotments."""
         released: Counter = Counter()
         for rid in rids:
             for stream in self._streams[rid].values():
                 released.update(stream.pages())
-                released.update(stream.lease or ())
         held = list(released)
         pages = sum(owners == released[page] for page, owners in zip(held, self._arena.owners_of(held), strict=True))
         if self._index is not None:
             pages += self._index.evictable_after(released)
         return pages + sum(self._allotments[rid].remaining for rid in rids if rid in self._allotments)
 
-    def _settle(self, rid: str, freed: int) -> None:
+    def _settle(self, rid: str, freed: int, allotment: Allotment | None = None) -> None:
         """Take ``rid`` off the earmark it is a victim of, now that its move or removal made ``freed`` room, and
         grow the allotment of the request that ran short by that room, up to what its shortage still lacks. A
-        victim that asks again at once is then measured against the room without it."""
+        victim that asks again at once is then measured against the room without it. A waiting request the moves
+        were for takes the room as soon as it covers all it asks for, before a victim can take it back, and the moves
+        that land after that add nothing. Until then, `_kept` keeps the room for it.
+
+        When ``rid``'s ``allotment`` passed the first request in the queue, `_kept` also keeps what the earmark
+        doesn't take while a request waits."""
         self._hosted.discard(rid)
         earmark = self._victims.pop(rid, None)
-        if earmark is None:
-            return
-        granted = min(earmark.pages - earmark.granted, freed)
-        earmark.granted += granted
-        earmark.victims.discard(rid)
-        if not earmark.victims:
-            del self._earmarks[earmark.rid]
-        self._allot(earmark.rid, granted)
+        if earmark is not None:
+            earmark.victims.discard(rid)
+            if not earmark.victims:
+                del self._earmarks[earmark.rid]
+            if earmark.rid in self._asks:
+                if earmark.pages <= self._room():
+                    if self._admit(earmark.rid, earmark.pages):
+                        earmark.granted = earmark.pages
+                        return
+                    # turned guaranteed, so the later moves count toward its footprint
+                    earmark.pages = self._asks[earmark.rid]
+                self._kept += freed
+                return
+            granted = min(earmark.pages - earmark.granted, freed)
+            if granted:
+                earmark.granted += granted
+                self._allot(earmark.rid, granted)
+            freed -= granted
+        if allotment is not None and allotment.passed and self._asks:
+            self._kept += freed
 
     def _vacate(self, rid: str, room: int) -> None:
-        """Release ``rid``'s leases and give up its allotment, so that ``rid`` asks again, once a drop or a move
-        to the host has freed its pages. ``room`` is `_room` as it was before the drop or the move.
-
-        A request a drop or a move took off the device comes back guaranteed, once its footprint fits. A request
-        that came back with less than its footprint would run short on its next page, and as the newest request
-        holding pages it would move again.
-        """
-        for stream in self._streams[rid].values():
-            self._release_lease(rid, stream)
-        allotment = self._allotments.pop(rid, None)
-        if allotment is not None:
-            self._unused -= allotment.remaining
-            self._asks[rid] = allotment.prompt
-        if self._returning(rid):
-            self._guaranteed.add(rid)
-            self._asks[rid] = self._footprint(rid)
-            if self._cpu_pool is not None:
-                self._cpu_pool.unreserve(rid)
+        """Give up ``rid``'s allotment, so that ``rid`` asks again, once a drop or a move to the host has freed its
+        pages. ``room`` is `_room` as it was before the drop or the move."""
+        allotment = self._allotments.get(rid)
+        self._unreserve(rid)
         self._ran_short.pop(rid, None)
-        self._settle(rid, self._room() - room)
-        self._keep_for_head(allotment, room)
+        self._settle(rid, self._room() - room, allotment)
 
     def _allot(self, rid: str, pages: int) -> None:
         # A request past its allotment holds more than ``allotment.pages``, so ``pages`` add to what it holds.
@@ -4948,7 +5068,7 @@ class KVManager(AttentionResource):
                         f"KV {self.name}: rank 0 earmarked {count} pages for {rid} on victims {victims}, but here "
                         f"{stale} aren't live or hold nothing, or {rid} holds no allotment"
                     )
-                self._earmark(rid, count, victims)
+                self._mark_victims(Earmark(rid, count, set()), victims)
             elif kind == MoveKind.RESERVE:
                 # a request that holds an allotment asks only for the shortage it waited on in `preempt`
                 if rid in self._allotments:
@@ -5219,14 +5339,18 @@ class KVManager(AttentionResource):
             # nothing for ``rollback_admit`` to give back
             new_pages: list[int] = []
             if num_new_pages > 0:
+                short = self._cover_move(request_id, num_new_pages)
                 allotment = self._allotments.get(request_id)
                 within = 0 if allotment is None else min(num_new_pages, allotment.remaining)
-                new_pages = self._grant(request_id, label, num_new_pages, num_new_pages - within)
+                new_pages = None if short else self._grant(request_id, label, num_new_pages, num_new_pages - within)
                 if new_pages is None:
                     available = self._allowance(request_id)
-                    pages_short = num_new_pages - available
+                    pages_short = short or num_new_pages - available
                     if self._decides:
-                        self._ran_short[request_id] = self._room()
+                        # The grant needed the room and `pages_short` past the allotment, which for a guarantee
+                        # `_cover_move` found short is every page the request grows into.
+                        room = self._room()
+                        self._ran_short[request_id] = ShortGrant(room, room + pages_short)
                     return AllocResult(
                         success=False,
                         error=AllocationFailed(

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import logging
 from array import array
 from collections import defaultdict, deque
 from collections.abc import Collection, ItemsView, Iterable, Mapping, MutableMapping
@@ -28,12 +29,15 @@ if TYPE_CHECKING:
     from mstar.model.base import KVLabel
     from mstar.model.submodule_base import HostRows
 
-# The serving config's ``rebuild_host_mb`` unless it sets one: 16M prompt ids
-# at 4 B each.
+logger = logging.getLogger(__name__)
+
+# The serving config's ``rebuild_host_mb`` unless it sets one: 8M prompt ids
+# at 8 B each.
 DEFAULT_REBUILD_HOST_MB = 64
 # The serving config's ``rebuild_media_host_mb`` unless it sets one, added to the host pool only when a node copies
-# what a walk reads besides the ids. A 1024-token image at hidden size 4096 is 8 MiB of bf16 encoder output.
-DEFAULT_REBUILD_MEDIA_HOST_MB = 1024
+# what a walk reads besides the ids. A 1024-token image at hidden size 4096 is 8 MiB of bf16 encoder output. With
+# ``rebuild_host_mb``'s default that makes the pool 1 GiB, a power of two, so it isn't rounded up to 2 GiB.
+DEFAULT_REBUILD_MEDIA_HOST_MB = 960
 
 
 class LayoutRow(NamedTuple):
@@ -60,11 +64,13 @@ class RowRecord:
 @dataclass(slots=True)
 class KeptIds:
     """A request's log on one node: the rows of its layout's prefill steps, a record of each step that has run, in
-    order, and each id sampled once the last has. ``used`` counts the bytes of its slice the records take."""
+    order, and each id sampled once the last has. ``used`` counts the bytes of its slice the records take, and
+    ``laid_out`` the samples its KV's layout already holds, which its last rebuild wrote."""
     rows: tuple[LayoutRow, ...]
     records: list[RowRecord] = field(default_factory=list)
     sampled: array = field(default_factory=lambda: array("i"))
     used: int = 0
+    laid_out: int = 0
 
     def __len__(self) -> int:
         """The slots the log writes again: those of the steps it recorded, and the ids sampled since."""
@@ -210,6 +216,12 @@ class Rebuilds:
         self._allowance = StepAllowance() if allowance is None else allowance
         # the copies to the host not yet started, oldest first
         self._queued: deque[QueuedCopy] = deque()
+        # nodes that have logged a request the pool couldn't hold
+        self._logged_full: set[str] = set()
+
+    @property
+    def pool(self) -> HostPool | None:
+        return self._pool
 
     @property
     def nodes(self) -> frozenset[str]:
@@ -250,11 +262,21 @@ class Rebuilds:
         dtype, width = self._node_dtypes.get(node), self._policies[node].copy_width
         if dtype is None and any(span.kind != SpanKind.IDS for span in spans):
             return None
-        return self._pool.take(sum(
+        nbytes = sum(
             aligned(span.length * torch.long.itemsize) if span.kind == SpanKind.IDS
             else span.length * width[span.walk] * dtype.itemsize
             for span in spans
-        ))
+        )
+        piece = self._pool.take(nbytes)
+        if piece is None and node not in self._logged_full:
+            self._logged_full.add(node)
+            logger.warning(
+                "%s: the rebuild host pool has no room for the %d bytes a request's ids and host copies take, with %d "
+                "of %d bytes in use, so the request can't be dropped there. Only the first on each node is logged, "
+                "and the serving config's rebuild_host_mb and rebuild_media_host_mb size the pool.",
+                node, nbytes, self._pool.nbytes_used(), self._pool.nbytes,
+            )
+        return piece
 
     def ingest_request(
         self, rid: int, writes: Mapping[str, Mapping[str, NodeWrites]],
@@ -301,15 +323,20 @@ class Rebuilds:
                 self._pool.give(piece)
         return rebuildable
 
-    def record(self, node_batch: ExecutingBatch) -> None:
+    def record(
+        self, node_batch: ExecutingBatch, cached_infos: Mapping[int, CurrentForwardPassInfo] = MappingProxyType({}),
+    ) -> None:
         """Record each row of the step that runs the next prefill step of a request still prefilling here, on the
         row's first chunk, which carries the step's whole input: its ids into the request's slice once the step
         completes, its other inputs queued to follow them (`flush`), and its step metadata. Once the last step is
         recorded the request keeps its samples, and the slice's unused tail goes back to the pool.
 
+        A row the prefix cache served whole ran no forward, but a rebuild may find its pages evicted, so it is
+        recorded from its inputs and its info in ``cached_infos``, which the engine takes out of the step.
+
         A step other than the one the request's layout says comes next, by walk or by length, or one missing an input
         the node reads, as a row the prefix cache served past its encoder, leaves the request with no log, so it is
-        never dropped. So does a step the prefix cache served whole, which never ran."""
+        never dropped."""
         node = node_batch.node_name
         prefilling = self._prefilling.get(node)
         if not prefilling:
@@ -319,11 +346,9 @@ class Rebuilds:
         if ctx.graph_walk not in walks and walks.keys().isdisjoint(ctx.request_walks.values()):
             return
         ids_input = self._policies[node].ids_input
-        for rid in [rid for rid in node_batch.cached_rids if rid in prefilling and ctx.walk_of(rid) in walks]:
-            self._forget(node, rid)
-        # The rows that ran: the engine takes a row it skipped or failed out of the step's rows and their infos,
-        # but not out of its inputs.
-        for rid in node_batch.request_ids:
+        # The rows that ran or that the cache served: the engine takes a row it skipped or failed out of the step's
+        # rows and their infos, but not out of its inputs.
+        for rid in (*node_batch.request_ids, *node_batch.cached_rids):
             if rid not in prefilling or rid in ctx.rebuild_rids:
                 continue
             inputs = node_batch.per_request_input_tensors.get(rid)
@@ -349,7 +374,8 @@ class Rebuilds:
             assert kept.used + nbytes <= piece.nbytes, (
                 f"{node} read more in {walk!r} than its rebuild policy's copy_width says"
             )
-            record = RowRecord({name: [] for name in names}, dict(node_batch.per_request_info[rid].step_metadata))
+            info = cached_infos[rid] if rid in node_batch.cached_rids else node_batch.per_request_info[rid]
+            record = RowRecord({name: [] for name in names}, dict(info.step_metadata))
             for name, tensor in tensors:
                 into = HostSlice(piece.offset + kept.used, tensor.nbytes)
                 # The ids are few, so they go now. The copies of the other inputs share the step's host-write allowance.
@@ -359,6 +385,9 @@ class Rebuilds:
                     record.landed = copy.landed
                 else:
                     record.inputs[name].append(self._pool.view(into, tensor.dtype, tensor.shape))
+                    if not tensor.nbytes:
+                        # an empty copy spends no allowance, so `flush` would never take it off the queue
+                        continue
                     self._queued.append(QueuedCopy(
                         tensor.reshape(-1).view(torch.uint8), into, node_batch.completion_event, record,
                     ))
@@ -481,12 +510,10 @@ class Rebuilds:
             return f"its {len(kept.sampled)} kept samples don't cover its KV"
         return None
 
-    def start(self, rid: int, node: str, prefilling: Prefilling | None) -> Rebuild | None:
-        """Open ``rid``'s rebuild on ``node``, one row per prefill step from its records, and return what it writes
-        past its layout. A prompt ``prefilling`` its step in progress reruns that step's chunks last, and changes
-        nothing the layout says, so this returns None for it."""
-        assert (node, rid) not in self._cursors, f"{rid}'s rebuild on {node} starts once per drop"
-        kept = self._kept[node][rid]
+    def _plan(self, kept: KeptIds, prefilling: Prefilling | None) -> list[PlannedRow]:
+        """The rows of a rebuild from ``kept``: one per prefill step recorded before the one in progress, from its
+        record, then the chunks its prompt was ``prefilling`` ran. With no step in progress, one per prefill step
+        its layout lays out, the last also writing every sample but the newest."""
         records = kept.records if prefilling is None else kept.records[:-1]
         rows = [
             PlannedRow(row.walk, row.length, row.length, record)
@@ -497,8 +524,23 @@ class Rebuilds:
         else:
             grown = len(kept.sampled) - 1
             rows[-1] = rows[-1]._replace(total=rows[-1].total + grown, length=rows[-1].length + grown)
-        self._cursors[(node, rid)] = RebuildCursor(tuple(rows), kept.sampled)
-        return None if prefilling is not None else Rebuild(kept.sampled)
+        return rows
+
+    def tokens(self, rid: int, node: str, prefilling: Prefilling | None) -> int:
+        """How many slots ``rid``'s rebuild on ``node`` writes, over every row `start` opens it with."""
+        return sum(row.total for row in self._plan(self._kept[node][rid], prefilling))
+
+    def start(self, rid: int, node: str, prefilling: Prefilling | None) -> Rebuild | None:
+        """Open ``rid``'s rebuild on ``node`` over the slots `tokens` counts, which its drop checked, and return
+        what it writes past its layout. A prompt ``prefilling`` its step in progress reruns that step's chunks
+        last, and changes nothing the layout says, so this returns None for it."""
+        assert (node, rid) not in self._cursors, f"{rid}'s rebuild on {node} starts once per drop"
+        kept = self._kept[node][rid]
+        self._cursors[(node, rid)] = RebuildCursor(tuple(self._plan(kept, prefilling)), kept.sampled)
+        if prefilling is not None:
+            return None
+        rebuild, kept.laid_out = Rebuild(kept.sampled[kept.laid_out:]), len(kept.sampled) - 1
+        return rebuild
 
     def rebuilding(self, rid: int, node: str) -> bool:
         return (node, rid) in self._cursors

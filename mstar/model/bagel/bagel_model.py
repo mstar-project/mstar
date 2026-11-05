@@ -1101,7 +1101,8 @@ class BagelModel(Model):
 
     def rebuild_policies(self) -> dict[str, RebuildPolicy]:
         # Understanding and a think-mode edit decode, and an image is rebuilt from host copies of the ViT's or the
-        # VAE's output, one embedding per slot. The CFG nodes run only image generation.
+        # VAE's output, one embedding per slot. A think-mode edit keys only part of its prompt, so it's rebuilt only
+        # with the prefix cache off for the request or the server. The CFG nodes run only image generation.
         return {"LLM": RebuildPolicy(
             walks=frozenset({"prefill_text", "prefill_vit", "prefill_vae"}), ids_input="text_inputs",
             sample_output="new_token", loop="decode_loop",

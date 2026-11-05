@@ -893,8 +893,8 @@ def test_a_rebuilt_image_prompt_holds_the_slots_and_positions_of_an_uninterrupte
         write(walk, row)
     stream = kv._streams[R]["main"]
     held = (stream.stored_len, len(stream.page_indices), rope.position(R, "main"))
-    kv.drop(R)
-    rope.drop(R)
+    kv.drop(R, held[0])
+    rope.drop(R, held[0])
     w, eng = _worker()
     w._rebuilds = Rebuilds(
         model.rebuild_policies(), model.get_graph_walk_graphs(), HostPool(1 << 20, torch.device("cpu")),

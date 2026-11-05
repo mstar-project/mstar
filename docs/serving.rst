@@ -345,16 +345,21 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        chunked walk. See *Chunked prefill budgets* below.
    * - ``rebuild_host_mb``
      - *(optional, default 64)* MiB of pinned host memory a worker serving a node whose model
-       declares a rebuild policy sets aside at startup for its requests' prompt ids, 4 B a token,
-       which a request dropped from the KV cache is rebuilt from. A request takes its room when it
-       arrives, and one the pool can't hold then is never dropped on that node, though it can
-       still move to the host with ``cpu_offload_pages``. A non-negative int, and 0 keeps no ids.
+       declares a rebuild policy sets aside at startup for its requests' prompt ids, which a
+       request dropped from the KV cache is rebuilt from. A request takes its room when it
+       arrives, 8 B a token (int64), and gives back what its ids don't use once its prompt is kept. One
+       the pool can't hold then is never dropped on that node, though it can still move to the
+       host with ``cpu_offload_pages``. A tensor or sequence parallel node never drops a request, so it
+       keeps no ids and sets no memory aside. A non-negative int, and 0 keeps no ids. The pool is this plus
+       ``rebuild_media_host_mb`` where that applies, rounded up to a power of two, as the pinned allocator
+       would round it anyway.
    * - ``rebuild_media_host_mb``
-     - *(optional, default 1024)* MiB added to that pool on a worker where a node's rebuild policy
+     - *(optional, default 960)* MiB added to that pool on a worker where a node's rebuild policy
        copies what a walk reads besides the ids, such as Qwen3.5's encoder output for a prompt
        with images or video, at one rank. A request takes room for its ids and copies together,
        at the values per slot the policy declares in the node's dtype, and gives back what its copies didn't use once
-       they are taken. A non-negative int, and 0 with ``rebuild_host_mb: 0`` keeps nothing.
+       they are taken. A non-negative int, and 0 with ``rebuild_host_mb: 0`` keeps nothing. With both defaults
+       the pool is 1 GiB.
    * - ``warmup_requests``
      - *(optional)* Requests the server runs after the workers are ready and before it
        binds, so no client pays a shape's first-request cost (torch.compile of a step,
@@ -470,41 +475,46 @@ prompt, so a decode step can find no page outside the reservations. The worker t
 from the newest requests, those that arrived after the request that ran short, until they cover
 its shortage. Each moves to the host when the host pool (``cpu_offload_pages``) can hold all of
 its pages, and is otherwise dropped if it can be rebuilt from its token ids. The request that
-ran short gets the pages freed, up to its shortage, unless it moved or was dropped itself. A
-request on the host or dropped waits at its place in the queue until its whole footprint fits,
-and comes back guaranteed, so it is never preempted again. A request on the host then has its
-pages copied back, and a dropped one recomputes its KV in prefill chunks cut by its walk's
-chunk budget. A request that streams an output in
+ran short gets the pages freed, up to its shortage, and waits holding its pages when the newer
+requests can't cover it. A request on the host, a dropped request and one waiting for pages wait
+outside the queue, so a new prompt that fits still starts. They are tried oldest first, before
+the queue. The oldest waiting request that doesn't fit moves newer requests that wait holding
+pages, to the host or by a drop as above. A request on the host returns once its pages and one
+more page fit, and its pages are then copied back. A dropped request returns once its prompt, or
+its history and one more page if that is larger, fits, then recomputes its KV in prefill chunks
+cut by its walk's chunk budget. A request that streams an output in
 ``unpausable_outputs`` reserves its whole footprint in every pool, with every cache hit counted,
 and is never dropped or moved to the host. Voice requests then queue when the pool is short and
 are never preempted mid-stream. A request with images, video or audio can be dropped at one rank
 when its node's rebuild policy names the walks its prompt runs in: the worker keeps a host copy of
 what each prefill step read, the encoder's output included, and rebuilds the request by running
 those steps again in order: a Qwen3.5 chat with images or a video, a Bagel image chat, a
-Qwen3-Omni request with audio, images or video in and text out, or a Higgs Audio transcription. A
-request no drop can free, because it holds KV made from another node's outputs or from media it
-keeps no copies of, or a node that keeps no token ids writes its KV, moves only to the host: when
-it is admitted the host pool sets room for its whole footprint aside, and it reserves only its
-prompt. Bagel generations, which write a label per guidance, and requests with media above one rank
-are such requests. When the host pool can't set the room aside, the
-request reserves its whole footprint in that pool, as a voice request does. So
-``cpu_offload_pages`` also sets how many such requests run at once with only their prompt reserved.
+Qwen3-Omni request with audio or images in and text out, or a Higgs Audio transcription. A Qwen3-Omni
+request with video in and text out and a Bagel think-mode edit with no guidance key only part of their
+prompt, which a rebuild can't key again, so they are rebuilt only with the prefix cache off for the
+request or the server. A request no drop can free, because it holds KV made from another node's outputs or from
+media it keeps no copies of, or a node that keeps no token ids writes its KV, moves only to the host: when
+it is admitted the host pool sets room aside for its prompt, and it reserves only its prompt. The room
+grows with each page the request takes after that, so its move always fits. Bagel generations, which
+write a label per guidance, and requests with media above one rank are such requests. When the host
+pool has no room for it, at admission or later, the request reserves its whole footprint in that pool,
+as a voice request does, and the host pool logs it. So ``cpu_offload_pages`` also sets how many pages
+such requests can hold with only their prompt reserved.
 
 Above one rank, rank 0 makes each of these decisions, and the other ranks apply them before the
 step that follows, so every rank admits each step from the same reservations. On a node with a
 second paged KV cache, such as Whisper's decoder, a decode step that finds no page and nothing to
 offload holds its requests until they time out. Elsewhere, a request that runs short and can
-neither move to the host nor be dropped waits in its pool's queue, at its arrival, until its
-shortage fits, when moving or dropping the newer requests wouldn't cover it. Several such
-requests can wait on each other. ``max_concurrent_requests`` prevents both. It caps how many
-requests run at once, and the pool's pages divided by the pages one request needs, prompt and
-output together, is a safe value. ``cpu_offload_pages`` lets a full pool move a request to the
-host instead of dropping it. An offload frees only the device pages no other running request
-reads, though, so a request that shares most of its prompt frees little. Offload helps a pool
-that runs short now and then. It doesn't replace the cap. With a host pool and the prefix cache
-on, a cached page is copied to the host once no request holds it, and a later request whose
-prefix the device evicted copies it back from there. So the host pool should hold more pages
-than the device's prefix cache.
+neither move to the host nor be dropped waits holding its pages until its shortage fits, when
+moving or dropping the newer requests wouldn't cover it. Several such requests can wait on each
+other. ``max_concurrent_requests`` prevents both. It caps how many requests run at once, and the
+pool's pages divided by the pages one request needs, prompt and output together, is a safe value.
+``cpu_offload_pages`` lets a full pool move a request to the host instead of dropping it. An
+offload frees only the device pages no other running request reads, though, so a request that
+shares most of its prompt frees little. Offload helps a pool that runs short now and then. It
+doesn't replace the cap. With a host pool and the prefix cache on, a cached page is copied to the
+host once no request holds it, and a later request whose prefix the device evicted copies it back
+from there. So the host pool should hold more pages than the device's prefix cache.
 
 **Chunked prefill budgets.** A walk that supports chunked prefill runs at most its token
 budget per step, and a longer prompt is split across steps. Each model sets its own
@@ -1090,6 +1100,10 @@ or ``increase()``.
 - ``mstar_kv_pages_cached{model_name, component, resource}``: pages the prefix cache
   names. Some may also be in use by running requests; the cache frees the others when a
   request needs the room.
+- ``mstar_rebuild_host_bytes_used{model_name, component}``,
+  ``mstar_rebuild_host_bytes_total{model_name, component}``: bytes of the worker's
+  rebuild host pool (``rebuild_host_mb``) that hold kept prompt ids, and the pool's size.
+  A prompt the pool has no room for keeps no ids, so its request is never dropped.
 - ``mstar_step_seconds{model_name, component, graph_walk}``: histogram over engine
   steps that ran a forward. A step counts from when the worker hands it to its GPU
   thread, or from the end of the previous step if that was later, to the end of its
