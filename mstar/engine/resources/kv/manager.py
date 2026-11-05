@@ -4646,7 +4646,11 @@ class KVManager(AttentionResource):
             return None
 
     def _admit(self, rid: str, pages: int) -> None:
-        """Allot ``rid`` the ``pages`` it asks for, which the room covers. Caller holds the lock."""
+        """Allot ``rid`` the ``pages`` it asks for, which the room covers, so the moves still to land for an earmark
+        ``rid`` holds add nothing. Caller holds the lock."""
+        earmark = self._earmarks.get(rid)
+        if earmark is not None:
+            earmark.granted = earmark.pages
         if rid in self._allotments:
             self._parked.discard(rid)
             self._allot(rid, self._asks.pop(rid))
@@ -4891,7 +4895,6 @@ class KVManager(AttentionResource):
         if earmark.rid in self._asks:
             if earmark.pages <= self._room():
                 self._admit(earmark.rid, earmark.pages)
-                earmark.granted = earmark.pages
             return
         granted = min(earmark.pages - earmark.granted, freed)
         if granted:
