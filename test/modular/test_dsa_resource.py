@@ -17,24 +17,28 @@ KV = "kv"
 PAGE, TOPK, HEADS, MAX_SEQ_LEN = 4, 4, 16, 64
 
 
+D = 16  # index_head_dim
+
+
 def _spec(topk=TOPK, **config) -> DSASpec:
+    config.setdefault("index_head_dim", D)
     return DSASpec(resource_key="dsa", nodes={"LLM"},
                    config=DSAConfig(kv_cache=KV, topk=topk, **config))
 
 
-def _kv_spec(index_planes: bool = True) -> KVSpec:
+def _kv_spec(index_planes: bool = True, width: int = D) -> KVSpec:
     return KVSpec(resource_key=KV, nodes={"LLM"}, config=PagedKVConfig(
         num_layers=2, num_kv_heads=1, head_dim=48, max_seq_len=MAX_SEQ_LEN,
         max_num_pages=32, page_size=PAGE, num_qo_heads=HEADS, layout=KVLayout.MLA,
         kv_lora_rank=32, qk_rope_head_dim=16,
-        aux_planes={INDEX_PLANES: AuxPlanes(num_layers=2, width=16)} if index_planes else {}))
+        aux_planes={INDEX_PLANES: AuxPlanes(num_layers=2, width=width)} if index_planes else {}))
 
 
 def _manager(world_size: int = 1, kpool: int = 1, topk: int = TOPK) -> DSAManager:
     """The resource as the engine builds it, from its spec and its cache's spec."""
     info = EngineResourceInfo(
         device=torch.device("cpu"), joint_comm_group=SimpleNamespace(world_size=world_size),
-        dependencies={KV: _kv_spec()})
+        dependencies={KV: _kv_spec(width=D if kpool == 1 else 3 * D)})
     return build_resource(_spec(topk=topk, kpool=kpool, sm_scale=0.1), info)
 
 
@@ -66,6 +70,19 @@ def _prefill(dsa: DSAManager, pages=([0], [5, 6, 7])) -> dict:
 
 def test_the_resource_plans_this_ranks_query_heads():
     assert _manager(world_size=2).num_heads == HEADS // 2
+
+
+@pytest.mark.parametrize("kpool, width, head_dim", [
+    (1, 3 * D, D),      # kpool 1: a row is one key
+    (4, D, D),          # kpool 4: [key | gate | pool key]
+    (4, 3 * D, None),   # the key width undeclared
+])
+def test_index_planes_of_another_width_are_refused_at_build(kpool, width, head_dim):
+    """A mis-sized INDEX_PLANES row booted, then failed on the first prefill."""
+    info = EngineResourceInfo(device=torch.device("cpu"), joint_comm_group=None,
+                              dependencies={KV: _kv_spec(width=width)})
+    with pytest.raises(ValueError, match="wide"):
+        build_resource(_spec(kpool=kpool, index_head_dim=head_dim), info)
 
 
 def test_a_cache_without_index_planes_is_refused():

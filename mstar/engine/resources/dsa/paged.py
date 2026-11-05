@@ -62,6 +62,8 @@ class DSAContext:
     decode_rows: bool = False
     sparse_plan: sparse_mla.SparseGraphPlan | sparse_mla.EagerSparsePlan | None = None
     last_selection: torch.Tensor | None = None
+    # the resource's reused eager plans, which an eager step plans through
+    eager: sparse_mla.EagerSparsePlans | None = None
     # row_meta's, for the rows it was built from
     _row_meta: tuple | None = field(default=None, init=False, repr=False, compare=False)
 
@@ -322,7 +324,8 @@ def sparse_attend(q_nope: torch.Tensor, q_pe: torch.Tensor, latent: torch.Tensor
             ctx.pos.tolist(), ctx.topk, ctx.kpool)
         return sparse_mla.reference(q_nope, q_pe, latent, slots, lens, sm_scale)
     if ctx.sparse_plan is None:  # eager: every layer of the forward shares one plan
-        ctx.sparse_plan = sparse_mla.EagerSparsePlan(
-            ctx.attn_lens(), ctx.width, q_nope.shape[1], q_nope.shape[-1], q_pe.shape[-1],
-            sm_scale, q_nope.device)
+        args = (ctx.attn_lens(), ctx.width, q_nope.shape[1], q_nope.shape[-1], q_pe.shape[-1],
+                sm_scale)
+        ctx.sparse_plan = (ctx.eager.plan(*args) if ctx.eager is not None
+                           else sparse_mla.EagerSparsePlan(*args, q_nope.device))
     return ctx.sparse_plan.attend(q_nope, q_pe, latent, slots)

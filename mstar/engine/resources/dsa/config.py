@@ -30,6 +30,9 @@ class DSAConfig:
     # attend densely while no row sees more than topk keys (there, the same computation): such
     # a step plans no sparse attention
     dense_below_topk: bool = False
+    # the indexer's key width: an INDEX_PLANES row is one key wide, or with kpool > 1 three
+    # (key, gate, the key of the pool ending there)
+    index_head_dim: int | None = None
 
 
 @dataclass

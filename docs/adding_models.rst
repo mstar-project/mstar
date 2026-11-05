@@ -713,9 +713,11 @@ The spec types are:
      - DeepSeek sparse attention (DSA) over the named ``KVLayout.MLA`` cache: past ``topk``
        keys, each query row attends only the ``topk`` tokens its indexer scores highest.
        The index keys sit on the cache's pages, in the aux planes ``INDEX_PLANES`` the
-       model declares on its ``PagedKVConfig``, so they share its page table. Each step
-       the submodule stages its rows from the KV plan (``step_inputs``, preprocess outputs
-       a CUDA graph interns) and opens the forward's context (``context``, then ``use``);
+       model declares on its ``PagedKVConfig``, so they share its page table; a row is
+       ``index_head_dim`` wide, three times that with ``kpool`` above 1 (checked at build).
+       Each step the submodule stages its rows from the KV plan (``step_inputs``,
+       preprocess outputs a CUDA graph interns) and opens the forward's context
+       (``context``, then ``use``);
        the layers write their keys, select and attend through ``dsa.paged``
        (``write_index``, ``select``, ``sparse_attend``), on device and under CUDA graphs.
        A pass over some of a step's rows writes at their own slots inside

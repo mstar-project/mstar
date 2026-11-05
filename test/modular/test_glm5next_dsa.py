@@ -26,7 +26,7 @@ from mstar.engine.resources.kv import manager as kv_mod
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.engine.resources.step import StepContext
 from mstar.model.glm5_next.components.causal_lm import Glm5NextForCausalLM
-from mstar.model.glm5_next.config import ATTN, KV_CACHE, SAMPLER, Glm5NextModelConfig
+from mstar.model.glm5_next.config import KV_CACHE, SAMPLER, Glm5NextModelConfig
 from mstar.model.glm5_next.glm5_next_model import Glm5NextModel, process_weights_after_loading
 from mstar.model.glm5_next.submodules import Glm5NextLLMSubmodule
 from mstar.model.submodule_base import InputMetadata
@@ -424,15 +424,16 @@ def test_long_context_refuses_a_flashinfer_without_page_size(monkeypatch, versio
         cfg.check_long_context()
 
 
-def test_a_non_bf16_cache_captures_nothing_in_long_mode():
-    """The DSA kernels take a bf16 cache; the torch paths sync with the host, so no capture."""
+def test_a_non_bf16_cache_on_cuda_is_refused_at_load():
+    """The DSA kernels take a bf16 cache; on another the torch paths sync with the host and
+    nothing captures, so the node refuses it when it binds rather than serving slow."""
     sub = object.__new__(Glm5NextLLMSubmodule)
     sub.config = Glm5NextModelConfig.reduced_long_context()
-    sub._moe_capture_blocked = lambda tp_world_size: False
-    sub.node_resources = {ATTN: types.SimpleNamespace(uses_kernel=True),
-                          KV_CACHE: types.SimpleNamespace(layer_view=lambda *a: torch.empty(0))}
-    assert sub.get_accelerator_graph_configs(torch.device("cuda")) == []
-    assert sub._prefill_captured is False
+    cache = types.SimpleNamespace(dtype=torch.float16, device=torch.device("cuda"))
+    kv = types.SimpleNamespace(kv_cache=types.SimpleNamespace(page_size=128),
+                               layer_view=lambda *a: cache)
+    with pytest.raises(ValueError, match="bf16"):
+        sub.bind_node_resources({KV_CACHE: kv})
 
 
 def _admits(engine, rid, token, it) -> bool:

@@ -755,6 +755,16 @@ def _fused_sample_kernel(
 FUSED_SAMPLE_MAX_VOCAB = 4096
 
 
+class FusedDrawArgs(NamedTuple):
+    """A step's per-row ``fused_sample`` parameters, for a kernel that draws as it does."""
+
+    temperature: torch.Tensor
+    top_k: torch.Tensor
+    top_p: torch.Tensor
+    seed: torch.Tensor
+    offset: torch.Tensor
+
+
 def fused_sample(
     logits: torch.Tensor, temperature: torch.Tensor, top_k: torch.Tensor, top_p: torch.Tensor,
     seed: torch.Tensor, offset: torch.Tensor,
@@ -1953,6 +1963,23 @@ class AcceleratorGraphableSampler(BaseSampler):
     # Set during graph capture, and used by the cuda graph runner to determine
     # whether requests' seen token buffers should be synced post-replay
     applied_penalty_in_graph: bool = False
+
+    def fused_draw_args(self, apply_filters: bool) -> FusedDrawArgs | None:
+        """What `sample` hands `fused_sample`, or None when `sample` does more than that one draw. The copy to
+        ``last_token_buf`` is left out: the resource decides whether anything reads it."""
+        if (
+            self.offset_buf.device.type != "cuda" or self.min_p_buf is not None or self.history is not None
+            or self.order is not None or self.ingraph_scatter or self.logprob_buf is not None
+            or (self.tp_group is not None and self.tp_group.world_size > 1)
+        ):
+            return None
+        top_k, top_p = self.top_k_buf, self.top_p_buf
+        if not apply_filters:
+            top_k, top_p = torch.zeros_like(top_k), torch.ones_like(top_p)
+        return FusedDrawArgs(self.temperature_buf, top_k, top_p, self.seed_buf, self.offset_buf)
+
+    def advance_offsets(self, draws: int) -> None:
+        self.offset_buf.add_(draws)  # a fused draw runs on CUDA, where a draw takes one offset
 
     def gather_in_graph(self) -> None:
         """Offsets of this step's rows off the master, inside the graph."""

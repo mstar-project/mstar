@@ -27,10 +27,18 @@ class DSAManager(Resource):
     def build(cls, spec: DSASpec, info: EngineResourceInfo):
         # `dependency` hands back the SPEC; its `.config` is the KV config, sharded once
         kv_config = info.dependency(spec.config.kv_cache).config
-        if INDEX_PLANES not in kv_config.aux_planes:
+        planes = kv_config.aux_planes.get(INDEX_PLANES)
+        if planes is None:
             raise ValueError(
                 f"DSA keeps its index keys on {spec.config.kv_cache}'s pages: declare its "
                 f"aux_planes[{INDEX_PLANES!r}]")
+        d = spec.config.index_head_dim
+        width = None if d is None else (d if spec.config.kpool == 1 else 3 * d)
+        if planes.width != width:
+            # a row is the key, or with kpool > 1 [key | gate | key of the pool ending there]
+            raise ValueError(f"DSA's {INDEX_PLANES} rows are {width} wide (index_head_dim "
+                             f"{d}, kpool {spec.config.kpool}); {spec.config.kv_cache} "
+                             f"declares {planes.width}")
         if info.joint_comm_group is not None:
             kv_config.shard(info.joint_comm_group.world_size)
         return cls(spec.config, kv_config, info.device)
@@ -50,6 +58,8 @@ class DSAManager(Resource):
         # (walk, capture slot) the workspace and index buffer its plans share
         self._sparse_plans: dict[tuple[str, int, int], sparse_mla.SparseGraphPlan] = {}
         self._sparse_buffers: dict[tuple[str, int], tuple[torch.Tensor, torch.Tensor]] = {}
+        # an eager step's sparse plans, reused (one workspace)
+        self._eager = sparse_mla.EagerSparsePlans(device) if device.type == "cuda" else None
 
     def depends_on(self) -> set[str]:
         return {self.config.kv_cache}
@@ -167,7 +177,7 @@ class DSAManager(Resource):
             max_pools=meta["max_pools"], page_size=meta["page_size"],
             topk=self.config.topk, kpool=self.config.kpool,
             needs_selection=meta["needs_selection"], decode_rows=meta["decode_rows"],
-            sparse_plan=meta["sparse_plan"])
+            sparse_plan=meta["sparse_plan"], eager=self._eager)
 
     @contextmanager
     def use(self, ctx: DSAContext | None) -> Iterator[None]:
