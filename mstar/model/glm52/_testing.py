@@ -298,6 +298,7 @@ def build_cpu_resources(
                       sm_scale=config.qk_head_dim ** -0.5, dense_below_topk=True),
             kv_cfg, device,
         )
+        resources[DSA_RESOURCE].bind_dependencies({KV_RESOURCE: kv})
     runner = StepRunner(resources, node_resources={"LLM": list(resources)})
     for rid in request_ids:
         runner.ingest_request(rid)
