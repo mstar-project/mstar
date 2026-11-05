@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import threading
 from collections.abc import Hashable, Mapping, Sequence
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar
 
@@ -105,6 +106,8 @@ class LoopbackRows(Resource):
         self._consumed: dict[tuple[str, Hashable], int] = {}
         # positions reserved but never handed to the consumer, which it moves past unread
         self._skipped: dict[tuple[str, Hashable], set[int]] = {}
+        # the side stream a consumer's ring reads run on (``ring_read``)
+        self._reads: torch.cuda.Stream | None = None
 
     @classmethod
     def build(cls, spec: LoopbackRowsSpec, info: EngineResourceInfo) -> LoopbackRows:
@@ -227,11 +230,27 @@ class LoopbackRows(Resource):
         table.index_put_((at[:n], at[n:]), items[:len(rids)].reshape(-1, *table.shape[2:]).to(table.dtype))
 
     def ring_read(self, name: str, rid: Hashable, positions: Sequence[int]) -> torch.Tensor:
-        """``[len(positions), *item]``: ``rid``'s ring of ``name`` at ``positions``."""
+        """``[len(positions), *item]``: ``rid``'s ring of ``name`` at ``positions``,
+        complete on return. The main thread reads it for a consumer that runs
+        on another stream (a codec's lane), which nothing orders after this
+        read, so it runs on a side stream and the host waits for it alone: the
+        positions were written by a step that has already landed."""
         depth = self._depths[name]
-        at = torch.empty(len(positions), dtype=torch.long, device=self._device)
-        self._stager.copy_(at, [position % depth for position in positions])
-        return self._tables[name][self._row_of[rid]].index_select(0, at)
+        stream = self._read_stream()
+        with torch.cuda.stream(stream) if stream is not None else nullcontext():
+            at = torch.empty(len(positions), dtype=torch.long, device=self._device)
+            self._stager.copy_(at, [position % depth for position in positions])
+            window = self._tables[name][self._row_of[rid]].index_select(0, at)
+        if stream is not None:
+            stream.synchronize()
+        return window
+
+    def _read_stream(self) -> "torch.cuda.Stream | None":
+        if self._device.type != "cuda":
+            return None
+        if self._reads is None:
+            self._reads = torch.cuda.Stream(device=self._device)
+        return self._reads
 
     def ring_release(self, name: str, rid: Hashable, until: int) -> None:
         """The consumer has moved past every position before ``until``."""
