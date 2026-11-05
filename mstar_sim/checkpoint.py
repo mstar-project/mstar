@@ -181,40 +181,12 @@ def _shapes_only_torch_file(path: Path, dest: Path) -> int | None:
     return sum(x.numel() for x in tree_flatten(obj)[0] if isinstance(x, torch.Tensor))
 
 
-def _varint(buf, pos: int) -> tuple[int, int]:
-    value = shift = 0
-    while True:
-        byte = buf[pos]
-        pos += 1
-        value |= (byte & 0x7F) << shift
-        if byte < 0x80:
-            return value, pos
-        shift += 7
-
-
-def _fields(buf, start: int, end: int):
-    """A protobuf message's ``(field, wire type, value)``; a length-delimited value is its
-    ``(start, end)`` in ``buf``."""
-    pos = start
-    while pos < end:
-        key, pos = _varint(buf, pos)
-        wire = key & 7
-        if wire == 0:
-            value, pos = _varint(buf, pos)
-        elif wire in (1, 5):
-            value, pos = None, pos + (8 if wire == 1 else 4)
-        elif wire == 2:
-            length, pos = _varint(buf, pos)
-            value, pos = (pos, pos + length), pos + length
-        else:
-            raise ValueError(f"protobuf wire type {wire}")
-        yield key >> 3, wire, value
-
-
 def _shapes_only_onnx(path: Path, dest: Path) -> int | None:
     """An ONNX model (CosyVoice3's speech tokenizer, whose weights mstar reads into torch
     modules) copied byte for byte over a hole where each large initializer's data was: its
     graph and small tensors as they are. Returns its parameter count; None if not ONNX."""
+    from mstar.model.cosyvoice3.components.onnx_weights import _fields, _packed_varints
+
     holes, params = [], 0
     with open(path, "rb") as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as buf:
         try:
@@ -224,13 +196,8 @@ def _shapes_only_onnx(path: Path, dest: Path) -> int | None:
                     continue
                 dims, data = [], None
                 for field, wire, value in _fields(buf, *span):
-                    if field == 1 and wire == 0:
-                        dims.append(value)
-                    elif field == 1:  # packed
-                        pos, end = value
-                        while pos < end:
-                            dim, pos = _varint(buf, pos)
-                            dims.append(dim)
+                    if field == 1:
+                        dims.extend(_packed_varints(buf, value) if wire == 2 else [value])
                     elif field in (4, 9) and wire == 2:  # float_data or raw_data
                         data = value
                 params += math.prod(dims)
