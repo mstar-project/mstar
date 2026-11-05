@@ -49,8 +49,10 @@ class KVConfig(ABC):
             raise ValueError(f"a KV cache must declare a layer; got num_layers={self.num_layers}")
         if self.num_qo_heads is None:
             self.num_qo_heads = self.num_kv_heads
-        if self.num_kv_heads < 1 or self.num_qo_heads % self.num_kv_heads:
-            raise ValueError(f"num_qo_heads={self.num_qo_heads} must be a multiple of num_kv_heads={self.num_kv_heads}")
+        if self.num_kv_heads < 1 or self.num_qo_heads < 1 or self.num_qo_heads % self.num_kv_heads:
+            raise ValueError(
+                f"num_qo_heads={self.num_qo_heads} must be a positive multiple of num_kv_heads={self.num_kv_heads}"
+            )
         self._unsharded_kv_heads = self.num_kv_heads
         self._unsharded_qo_heads = self.num_qo_heads
 

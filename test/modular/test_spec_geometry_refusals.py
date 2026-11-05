@@ -32,7 +32,7 @@ def test_a_kv_cache_with_no_layers_is_refused():
 
 @pytest.mark.parametrize("qo, kv", [(16, 3), (4, 8)])
 def test_query_heads_that_are_not_a_multiple_of_kv_heads_are_refused(qo, kv):
-    with pytest.raises(ValueError, match=f"num_qo_heads={qo} must be a multiple of num_kv_heads={kv}"):
+    with pytest.raises(ValueError, match=f"num_qo_heads={qo} must be a positive multiple of num_kv_heads={kv}"):
         _paged(num_qo_heads=qo, num_kv_heads=kv)
 
 
