@@ -5022,7 +5022,9 @@ class KVManager(AttentionResource):
                 self._host(rid, victims)
             elif kind == MoveKind.UNRESERVE:
                 if rid not in self._allotments:
-                    raise RuntimeError(f"KV {self.name}: rank 0 gave back {rid}'s allotment, which this rank doesn't hold")
+                    raise RuntimeError(
+                        f"KV {self.name}: rank 0 gave back {rid}'s allotment, which this rank doesn't hold"
+                    )
                 self.unreserve(rid)
             elif kind == MoveKind.GUARANTEE:
                 self._guarantee(rid)
