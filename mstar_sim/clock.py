@@ -215,10 +215,12 @@ def kernel_fn(name: str, cost: Callable[..., tuple | Callable[[], tuple]] | None
     which (a Triton launch)."""
 
     def decorate(fn):
+        sig = inspect.signature(fn)
+
         def written(args, kwargs) -> tuple:
             if isinstance(writes_args, bool):
                 return args if writes_args else ()
-            bound = inspect.signature(fn).bind(*args, **kwargs).arguments
+            bound = sig.bind(*args, **kwargs).arguments
             return tuple(bound.get(name) for name in writes_args)
 
         @functools.wraps(fn)
