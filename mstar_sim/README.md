@@ -1,9 +1,9 @@
 # mstar_sim: run mstar without a GPU, for correctness testing
 
 Run mstar on a box with no GPU and test that it behaves correctly. **Use it for
-correctness, not performance: its timing is a model, not a measurement, and has
-not been validated against a real GPU, so don't quote its throughput or latency
-numbers, or compare two changes by them.** It computes no kernels, so it can't
+correctness, not performance: kernel times come from numbers recorded on real
+GPUs, but the host overhead here is too different from a real run, so don't quote
+its throughput or latency numbers, or compare two changes by them.** It computes no kernels, so it can't
 check model output either. What it does find is bugs in mstar's own code: crashes,
 hangs, lifecycle and admission errors, bad indices, out-of-memory, API mistakes.
 
