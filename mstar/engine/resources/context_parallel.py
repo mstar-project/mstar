@@ -620,7 +620,12 @@ class RingAttentionWrapper:
     masked the same way. A row this partner holds no query of is left out of its plan.
 
     ``paged`` is one eager kernel over this rank's slots per partner, all planned per step.
-    Eager only: a striped shard plans a leased step copied."""
+    Eager only: a striped shard plans a leased step copied. The partner plans differ by rank and
+    sit outside admission's ``rank_plans``: FlashInfer's paged manager, the one that plans a ring
+    (``AttentionManager.build`` refuses ``exchange: ring`` on any other backend), bounds no plan
+    at admission, as no refusal of its planner on lengths is known. A backend whose planner may
+    refuse on lengths (MLA's FA planner) would have to bound every rank's partner plans at
+    admission before it could plan a ring, or one rank alone could refuse a lockstep step."""
 
     # the step attends its own tokens from the pages, written first (`PlacedAttention.reads_step_kv`)
     reads_step_kv = False
