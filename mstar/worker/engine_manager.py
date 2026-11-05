@@ -17,6 +17,7 @@ from mstar.graph.base import GraphNode
 from mstar.graph.runtime.base import GraphRuntime
 from mstar.model.base import Model, node_moe_parallel_configs, parse_autocast_dtype, serving_resources
 from mstar.model.submodule_base import NodeSubmodule
+from mstar.utils import knobs
 from mstar.utils.device import DeviceCapability
 from mstar.utils.streams import reset_device_scheduling
 
@@ -187,6 +188,19 @@ def _refuse_unservable_lanes(
     return placed
 
 
+def _row_nodes(model: Model, model_config: Mapping) -> set[str]:
+    """The nodes whose config asks to keep loop-back values in device rows:
+    those it asks to repeat, or every node in a Loop under resident planning."""
+    repeating = {
+        node for node, block in (model_config.get("step_repeats") or {}).items()
+        if isinstance(block, Mapping) and block.get("max", 1) != 1
+    }
+    if knobs.resident_planning() != "on":
+        return repeating
+    loops = (loop for section in model.get_graph_walk_graphs().values() for loop in section.get_loops().values())
+    return repeating | {node for loop in loops for node in loop.get_nodes()}
+
+
 def _stops_on_a_token(submodule: NodeSubmodule, walk: str) -> bool:
     """Whether ``walk``'s steps hand the worker row buffers for a stop check."""
     stop = getattr(submodule, "token_stop", None)
@@ -326,6 +340,7 @@ class EngineManager:
             transfer_engine_info=transfer_engine_info,
             kv_cache_type=autocast_dtype,
             model=model,
+            row_nodes=_row_nodes(model, model_config),
         )
         budgets = model_config.get("max_batch_tokens") or {}
         override_mixed = model_config.get("can_override_mixed_max_tokens") or {}
@@ -352,13 +367,15 @@ class EngineManager:
         self, looped: Collection[tuple[str, str]] = (),
         carried: Mapping[tuple[str, str], Collection[str]] = MappingProxyType({}),
         device_stops: Mapping[tuple[str, str], str] = MappingProxyType({}),
+        kept_rows: Mapping[tuple[str, str], Collection[str]] = MappingProxyType({}),
     ) -> None:
         """CUDA graph capture, for the whole forward and any piecewise region.
         ``looped``: the (node, walk) pairs whose walk runs the node in a Loop;
         ``carried``: the loop-back signals of those whose steps may repeat;
-        ``device_stops``: those whose captures skip a stopped replay."""
+        ``device_stops``: those whose captures skip a stopped replay;
+        ``kept_rows``: the loop-back signals kept in device rows."""
         with torch.no_grad():
-            self.engine.warmup(looped, carried, device_stops)
+            self.engine.warmup(looped, carried, device_stops, kept_rows)
         # warmup ran side-stream work beside graph replays; start serving from
         # a clean scheduling state (see reset_device_scheduling)
         reset_device_scheduling(self.engine._device)

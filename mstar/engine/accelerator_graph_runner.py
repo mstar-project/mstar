@@ -28,6 +28,7 @@ from mstar.engine.accelerator_graph_config import (
 )
 from mstar.engine.node_dtype import node_scope
 from mstar.engine.resources import BucketKey, CGSlotSpec, Resource, SlotLease, StepContext, StepRunner
+from mstar.engine.resources.loopback_rows import LoopbackRows
 from mstar.engine.resources.lora.config import LoraBaseOnly
 from mstar.engine.resources.resident import TRASH_SLOT, ResidentBuffers, ResidentPlanner, watched_counts
 from mstar.engine.resources.step import PIECEWISE_WALK, SubmoduleStep
@@ -737,6 +738,9 @@ class AcceleratorGraphSlot:
     device_stop: "DeviceStop | None" = None
     # whether a run of it launches through ``mstar_rust.launch_run``
     raw_launch: bool = False
+    # loop-back signal -> the static input this capture reads it into, off the
+    # node's rows, at its head
+    row_heads: Mapping[str, str] = MappingProxyType({})
 
 
 class DeviceStop:
@@ -821,6 +825,8 @@ class WarmedSpec(NamedTuple):
     peak: int
     # bytes of what it returned
     returned: int
+    # what its capture reads off the node's rows (``AcceleratorGraphSlot.row_heads``)
+    row_heads: Mapping[str, str] = MappingProxyType({})
 
 
 class AcceleratorGraphRunner:
@@ -848,6 +854,9 @@ class AcceleratorGraphRunner:
         self._submodule = submodule
         self._comm_group = joint_comm_group
         self._resident: ResidentPlanner | None = None
+        # the node's loop-back rows, and what a walk's captures read and write of them
+        self._rows: LoopbackRows | None = None
+        self._row_pairs: Callable[[str], tuple[dict[str, str], dict[str, str]]] | None = None
         # walk -> (token signal, stop ids, whether stopped rows drop) of the
         # walks that skip a stopped replay
         self._device_stops: dict[str, tuple[str, frozenset[int], bool]] = {}
@@ -1362,7 +1371,12 @@ class AcceleratorGraphRunner:
                 config_idx=spec.config_idx,
             )
             slot.device_stop = stop
+            slot.row_heads = warmed.row_heads
             return slot
+
+    def bind_rows(self, rows: LoopbackRows, pairs: Callable[[str], tuple[dict[str, str], dict[str, str]]]) -> None:
+        """Before capture: read and write the node's rows inside each capture."""
+        self._rows, self._row_pairs = rows, pairs
 
     def ask_device_stop(
         self, walk: str, token_signal: str, stop_ids: Collection[int], drop_rows: bool = False,
@@ -1444,14 +1458,30 @@ class AcceleratorGraphRunner:
                 else None
             )
 
+            rows = self._rows
+            heads, tails = self._row_pairs(walk) if rows is not None else ({}, {})
+            if _is_packed(config) or set(config.replay_graph_walks) - {walk}:
+                heads = {}  # one row a request, of one walk
+            row_heads: dict[str, str] = {}
+
             def run_forward():
                 if resident is not None:
                     planner.gather(resident)
+                for signal, name in heads.items():
+                    target = static_inputs.get(name)
+                    if isinstance(target, torch.Tensor) and rows.head(spec.bucket, spec.slot, signal, target):
+                        row_heads[signal] = name
                 out = forward(
                     graph_walk=walk,
                     engine_inputs=engine_inputs,
                     **static_inputs,
                 )
+                if tails:
+                    outputs = BatchedModelOutput.coerce(out)
+                    for signal, name in tails.items():
+                        value = output_named(outputs, name)
+                        if value is not None:
+                            rows.tail(spec.bucket, spec.slot, signal, value)
                 if resident is not None:
                     planner.commit_in_graph(resident)
                 return out
@@ -1480,6 +1510,7 @@ class AcceleratorGraphRunner:
                 dummy_metadata=engine_inputs.per_request_info,
                 peak=peak,
                 returned=returned,
+                row_heads=row_heads,
             )
         finally:
             # Capture ran the dummy rows as real requests; free their storage

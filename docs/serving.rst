@@ -355,7 +355,7 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        and copies go out from one Rust call with the GIL released; a capture that draws from
        a torch generator, or a backend other than CUDA, keeps the Python loop. ``rows``: a node asked for
        resident planning or repeats keeps its fixed-shape loop-back values in device rows
-       between steps (``mstar.engine.loopback_rows``), so a step whose every output stays on
+       between steps (``mstar.engine.resources.loopback_rows``), so a step whose every output stays on
        the device routes no tensor. A setting other than ``max`` on a node whose ``max`` is
        1, a name that is no node of the model, and an unknown setting fail loading.
    * - ``batch_builder``

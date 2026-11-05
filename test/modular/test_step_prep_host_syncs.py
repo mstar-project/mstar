@@ -630,7 +630,7 @@ def test_higgs_loopback_decode_prep_copies_no_pageable_index(monkeypatch):
     this path), and its prep makes no pageable host-to-device copy of its own. The meta
     device stands in for the accelerator; on it the index stager takes its host branch, so
     the pinned upload itself is not exercised here."""
-    from mstar.engine.loopback_rows import LoopbackRows
+    from mstar.engine.resources.loopback_rows import LoopbackRows
     from mstar.model.higgs_audio.config import HiggsAudioModelConfig
     from mstar.model.higgs_audio.submodules import HiggsAudioLLMSubmodule
     from mstar.model.submodule_base import ARNodeInputs
@@ -639,7 +639,8 @@ def test_higgs_loopback_decode_prep_copies_no_pageable_index(monkeypatch):
     rows = LoopbackRows(torch.device("meta"))
     for rid in ("fresh", "looped"):
         rows.add(rid)
-    engine_inputs = SimpleNamespace(loopback_rows=rows, request_ids=["fresh", "looped"])
+    rows.write("text_inputs", ["fresh", "looped"], torch.zeros(2, dtype=torch.long, device="meta"))
+    engine_inputs = SimpleNamespace(loopback_rows=rows, rows_in_graph=False, request_ids=["fresh", "looped"])
     inputs = [
         ARNodeInputs(input_ids=torch.zeros(1, dtype=torch.long, device="meta"), input_seq_len=1),
         ARNodeInputs(input_seq_len=1),

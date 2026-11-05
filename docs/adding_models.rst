@@ -1889,13 +1889,16 @@ inductor specialize on that integer. The frame is then retraced once per layer.
 **Device loop-back.** A decode loop normally routes its sampled token back to itself as a
 tensor per request. An AR node that sets ``self.device_loopback = DeviceLoopback(walk,
 signal, buffer)`` instead keeps each request's last token on the device, in the node's
-loop-back rows (``mstar.engine.loopback_rows``, ``MSTAR_DEVICE_LOOPBACK``): each step's tail
-writes the token from its stop buffer ``buffer`` into the rows, the worker routes the signal
-without a tensor and sends the client's copy inline, ``prepare_inputs`` returns
-``self.uniform_row_inputs(...)`` for such a row, and ``preprocess`` reads the tokens with
-``self.loopback_inputs(engine_inputs, inputs)``. A row whose last step did not keep its
-value there (its first decode step, after the prefill) brings it routed, and that read
-writes it into the row first. Qwen3.5, Higgs Audio, Qwen3-ASR, Qwen3-Omni, Orpheus and
+loop-back rows (``mstar.engine.resources.loopback_rows``, a resource the engine declares;
+``MSTAR_DEVICE_LOOPBACK``): each capture reads the rows at its head and writes the token from
+its stop buffer ``buffer`` at its tail, inside the graph, through a device row of table
+indices (the planner's on a resident step, staged by ``plan`` on a host-planned one), so a
+replay needs nothing from the host. The worker routes the signal without a tensor and sends
+the client's copy inline, ``prepare_inputs`` returns ``self.uniform_row_inputs(...)`` for such
+a row, and ``preprocess`` calls ``self.loopback_inputs(engine_inputs, inputs)``. A row whose
+last step did not keep its value there (its first decode step, after the prefill) brings it
+routed, which goes into the row first. A request takes a row at admission; the tables never
+grow, ``knobs: sampler_slots`` rows at most. Qwen3.5, Higgs Audio, Qwen3-ASR, Qwen3-Omni, Orpheus and
 Whisper declare it. Only a captured node keeps the rows.
 
 A captured sampler writes each row's RNG offset back to the request's row inside the graph

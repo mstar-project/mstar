@@ -179,10 +179,10 @@ def test_other_steps_pad_with_template_clones():
 
 
 def test_a_row_the_node_kept_reads_its_kept_signal_off_its_row():
-    """A loop-back signal kept in the node's rows (``Engine.keep_loopback_rows``)
+    """A loop-back signal kept in the node's rows (``Engine.rows_refusal``)
     arrives empty on a row whose last step here kept it; the engine hands
     ``prepare_inputs`` its row as the routed value would be."""
-    from mstar.engine.loopback_rows import LoopbackRows
+    from mstar.engine.resources.loopback_rows import LoopbackRows
 
     rows = LoopbackRows(torch.device("cpu"))
     for rid in (1, 2):

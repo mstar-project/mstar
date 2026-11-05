@@ -29,7 +29,6 @@ from mstar.engine.accelerator_graph_runner import (
 )
 from mstar.engine.chunking import DEFAULT_MIN_CHUNK_TOKENS, ChunkingManagement, ChunkRange
 from mstar.engine.fp32_precision import Fp32Precision, cudnn_benchmark, fp32_precision_scope, node_fp32_precision
-from mstar.engine.loopback_rows import LoopbackRows
 from mstar.engine.node_dtype import resolve_node_dtype
 from mstar.engine.resources import (
     AdmitFailedReason,
@@ -47,6 +46,7 @@ from mstar.engine.resources.base import EngineResourceInfo, KeyedWalks, build_re
 from mstar.engine.resources.kv.config import instance_size, opening_prefix_caches, unrestorable
 from mstar.engine.resources.kv.keys import fingerprint
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
+from mstar.engine.resources.loopback_rows import LoopbackRows, LoopbackRowsSpec, rows_key
 from mstar.engine.resources.lora.config import LoraBaseOnly, node_capture_key
 from mstar.engine.resources.resident import (
     LOOP_COUNTER,
@@ -68,7 +68,6 @@ from mstar.model.base import keyed_labels
 from mstar.model.submodule_base import (
     EMPTY_INPUT_METADATA,
     ARNodeInputs,
-    ARNodeSubmodule,
     BatchedModelOutput,
     CarryPair,
     ChunkingPolicy,
@@ -215,9 +214,9 @@ class SubmoduleManagement:
     template_steps: dict[str, SubmoduleStep | None] = field(default_factory=dict)
     # the node's loop-back values kept on the device by request, where it keeps any
     loopback_rows: LoopbackRows | None = None
-    # walk -> loop-back signal -> the output holding it, kept in those rows
-    # beside a ``DeviceLoopback``'s, for each walk whose config asks
-    row_signals: dict[str, dict[str, str]] = field(default_factory=dict)
+    # walk -> loop-back signal -> its pair, kept in those rows beside a
+    # ``DeviceLoopback``'s, for each walk whose config asks
+    row_signals: dict[str, dict[str, CarryPair]] = field(default_factory=dict)
     # walk -> the token stop whose stopped rows its captures skip, where asked
     device_stops: dict[str, StopPolicy] = field(default_factory=dict)
 
@@ -469,6 +468,8 @@ class ExecutingBatch:
     # device: such a row loops back as it would in a step of its walk alone,
     # while the step's other rows route tensors.
     loopback_rids: frozenset = frozenset()
+    # per row, whether its last step here kept its loop-back values on the device
+    kept_rows: list[bool] | None = None
 
     # This step's outputs, published as soon as the forward has been
     # submitted — the tensors exist then, even though their values land later.
@@ -668,7 +669,10 @@ class Engine:
         transfer_engine_info: TransferEngineInfo,
         kv_cache_type=None,
         model: "Model | None" = None,
+        row_nodes: Collection[str] = (),
     ):
+        """``row_nodes``: the nodes whose config asks to keep their loop-back
+        signals in device rows, beside those that declare a ``DeviceLoopback``."""
         self._device = device
         if self._device_capability is None or self._device_capability.device != device:
             self._device_capability = DeviceCapability.of(device)
@@ -680,6 +684,7 @@ class Engine:
         node_to_resources = {}
         # resource -> every node declaring it, on this worker or another
         declared_by: dict[str, frozenset[str]] = {}
+        specs = [*specs, *self._row_specs(submodules, row_nodes)]
         specs_by_key = resolve_spec_dependencies(specs)
         instance = {node: parallel_groups.get_joint_group_for_node(node).world_size for node in node_names}
         checkpoint = model.checkpoint_path() if model is not None else None
@@ -772,10 +777,20 @@ class Engine:
             self._submodules[node_name].lora_pools = tuple(
                 resources[key] for key in getattr(submodule, "lora_keys", ())
             )
-            loopback = submodule.device_loopback if isinstance(submodule, ARNodeSubmodule) else None
-            if loopback is not None and knobs.device_loopback_enabled():
-                # a node that reads its token back on the device (see DeviceLoopback)
-                self._submodules[node_name].loopback_rows = LoopbackRows(self._device)
+            if (key := rows_key(node_name)) in resources:
+                self._submodules[node_name].loopback_rows = resources[key]
+                submodule.loopback_rows_key = key
+
+    @staticmethod
+    def _row_specs(submodules: Mapping[str, NodeSubmodule], row_nodes: Collection[str]) -> list[LoopbackRowsSpec]:
+        """The rows of each node that reads its token back on the device
+        (see DeviceLoopback) or whose config asks; a model declares none."""
+        if not knobs.device_loopback_enabled():
+            return []
+        return [
+            LoopbackRowsSpec(resource_key=rows_key(name), nodes={name}) for name, submodule in submodules.items()
+            if name in row_nodes or getattr(submodule, "device_loopback", None) is not None
+        ]
 
     def _build_resident_planner(self, node_name: str, runner: AcceleratorGraphRunner, looped: Collection[str]) -> None:
         """Put each walk in ``looped`` (those that loop ``node_name``) on
@@ -933,6 +948,7 @@ class Engine:
         self, looped: Collection[tuple[str, str]] = (),
         carried: Mapping[tuple[str, str], Collection[str]] = MappingProxyType({}),
         device_stops: Mapping[tuple[str, str], str] = MappingProxyType({}),
+        kept_rows: Mapping[tuple[str, str], Collection[str]] = MappingProxyType({}),
     ) -> None:
         """Capture every node's graphs. ``looped``: the (node, walk) pairs whose
         walk runs the node inside a Loop, which may run on resident tables, by
@@ -940,7 +956,9 @@ class Engine:
         ``carried``: the loop-back signals of each such pair whose steps may
         repeat, whose ``preprocess`` is checked here (``probe_carries``);
         ``device_stops``: the pairs whose captures should skip a replay whose
-        rows have all stopped, by their ``step_repeats: device_stop``."""
+        rows have all stopped, by their ``step_repeats: device_stop``;
+        ``kept_rows``: the loop-back signals of the pairs whose config asks to
+        keep them in device rows."""
         # the Loop each (node, walk) runs in, whose counter its iteration inputs read
         self._loops = dict(looped) if isinstance(looped, Mapping) else {}
         for node_name, walk in carried:
@@ -970,6 +988,15 @@ class Engine:
             piecewise[node_name] = self._build_piecewise_runners(
                 node_name, submodule_mgmt, capture_stream,
             )
+
+        for (node_name, walk), signals in kept_rows.items():
+            if node_name in self._submodules:
+                self._ask_rows(node_name, walk, signals)
+        for node_name, submodule_mgmt in self._submodules.items():
+            if submodule_mgmt.loopback_rows is not None:
+                ag_runners[node_name].bind_rows(
+                    submodule_mgmt.loopback_rows, partial(self._row_pairs, submodule_mgmt),
+                )
 
         # Every runner claims its static buffers before any of them captures:
         # nodes share resources, so a build driven by a later node would move
@@ -1410,7 +1437,7 @@ class Engine:
         keyed_walks = (getattr(self, "_keyed_walks", None) or {}).get(
             batch.node_name, (),
         )
-        loopback = self._loopback_rows(batch)
+        loopback = batch.kept_rows = self._loopback_rows(batch)
         # a kept signal no model hook reads: its row, as if routed
         kept = mgmt.row_signals.get(walk, {}) if loopback is not None and not mixed else {}
         # a chunked row is cut from its whole input, so no uniform path
@@ -1616,8 +1643,26 @@ class Engine:
         """Each signal of ``graph_walk`` the node's rows keep -> its output."""
         loopback = getattr(mgmt.submodule, "device_loopback", None)
         out = dict(loopback.outputs()) if loopback is not None and loopback.walk == graph_walk else {}
-        out.update(mgmt.row_signals.get(graph_walk, {}))
+        out.update((signal, pair.output) for signal, pair in mgmt.row_signals.get(graph_walk, {}).items())
         return out
+
+    @staticmethod
+    def _row_pairs(mgmt: SubmoduleManagement, graph_walk: str) -> tuple[dict[str, str], dict[str, str]]:
+        """What a capture of ``graph_walk`` reads at its head (signal -> static
+        input) and writes at its tail (signal -> output). A ``DeviceLoopback``'s
+        token at the tail of every capture: a mixed step's decode rows read it next."""
+        heads: dict[str, str] = {}
+        tails: dict[str, str] = {}
+        loopback = getattr(mgmt.submodule, "device_loopback", None)
+        if loopback is not None:
+            tails.update(loopback.outputs())
+            if loopback.walk == graph_walk:
+                heads[loopback.signal] = loopback.input
+                heads.update((name, name) for name in loopback.states)
+        for signal, pair in mgmt.row_signals.get(graph_walk, {}).items():
+            heads[signal] = pair.input
+            tails[signal] = pair.output
+        return heads, tails
 
     def _ask_device_stop(self, node_name: str, runner: AcceleratorGraphRunner, graph_walk: str, mode: str) -> None:
         """Before capture: have ``graph_walk``'s captures skip a stopped replay,
@@ -1649,42 +1694,62 @@ class Engine:
         loop, or None."""
         return self._submodules[node_name].accelerator_graph_runner.launch_refusal(graph_walk)
 
-    def keep_loopback_rows(self, node_name: str, graph_walk: str, signals: Collection[str]) -> str | None:
-        """Keep each loop-back signal of this walk (``signals``) in the node's
-        loop-back rows, beside a ``DeviceLoopback``'s; why it can't, or None.
-        After capture: each value must be a buffer of every capture of the
-        walk, one fixed-shape row per request."""
+    def _ask_rows(self, node_name: str, graph_walk: str, signals: Collection[str]) -> None:
+        """Before capture: keep each loop-back signal of this walk in the node's
+        rows, beside a ``DeviceLoopback``'s, where it runs on one rank."""
+        mgmt = self._submodules[node_name]
+        if mgmt.loopback_rows is None or mgmt.joint_comm_group.world_size > 1:
+            return
+        loopback = getattr(mgmt.submodule, "device_loopback", None)
+        own = set(loopback.outputs()) if loopback is not None and loopback.walk == graph_walk else set()
+        mgmt.row_signals[graph_walk] = mgmt.submodule.repeat_carry(graph_walk, set(signals) - own)
+
+    def rows_refusal(self, node_name: str, graph_walk: str) -> str | None:
+        """After capture: why this walk's loop-back signals don't stay in the
+        node's rows between steps, or None: each must be a buffer of every
+        capture of the walk, one fixed-shape row per request. One that isn't
+        goes back to being routed, which its captures' heads read just the same."""
         mgmt = self._submodules[node_name]
         if mgmt.joint_comm_group.world_size > 1:
             return "deployment: it runs on more than one rank"
         runner = mgmt.accelerator_graph_runner
         if runner is None:
             return "runner: the node captures no graphs"
-        loopback = getattr(mgmt.submodule, "device_loopback", None)
-        own = set(loopback.outputs()) if loopback is not None and loopback.walk == graph_walk else set()
-        pairs = mgmt.submodule.repeat_carry(graph_walk, set(signals) - own)
-        outputs = {signal: pair.output for signal, pair in pairs.items()}
-        if (refusal := runner.row_refusal(graph_walk, outputs)) is not None:
+        pairs = mgmt.row_signals.get(graph_walk, {})
+        refusal = runner.row_refusal(graph_walk, {signal: pair.output for signal, pair in pairs.items()})
+        if refusal is not None:
+            mgmt.row_signals.pop(graph_walk, None)
             return f"runner: {refusal}"
-        if mgmt.loopback_rows is None:
-            mgmt.loopback_rows = LoopbackRows(self._device)
-        mgmt.row_signals[graph_walk] = outputs
         return None
+
+    @staticmethod
+    def _write_routed_rows(
+        batch: ExecutingBatch, mgmt: SubmoduleManagement, slot, engine_inputs: ModelInputsFromEngine,
+        preprocessed: Mapping[str, Any],
+    ) -> None:
+        """A capture reads its rows at its head, so what a row brought routed
+        (its first step here) goes into them first: a row's one host write."""
+        kept = batch.kept_rows
+        real = len(batch.request_ids)
+        routed = list(range(real)) if kept is None else [i for i in range(real) if not kept[i]]
+        if not routed:
+            return
+        rids = [engine_inputs.request_ids[i] for i in routed]
+        for signal, name in slot.row_heads.items():
+            value = preprocessed.get(name)
+            if isinstance(value, torch.Tensor):
+                mgmt.loopback_rows.write_rows(signal, rids, value, routed)
 
     def _keep_rows(
         self, mgmt: SubmoduleManagement, graph_walk: str, rids: Sequence, outputs,
     ) -> None:
-        """A step's tail: each loop-back value the node keeps on the device,
-        out of ``outputs`` (the step's, or its capture's static ones), into the
-        rows of ``rids`` (padding rows into the trash row)."""
+        """An eager step's tail, which a capture does itself: each loop-back
+        value the node keeps on the device, out of ``outputs``, into the rows
+        of ``rids``."""
         rows = mgmt.loopback_rows
         if rows is None or mgmt.accelerator_graph_runner is None:
             return  # an eager-only node reads none back (``device_loopback_signals``)
-        # a DeviceLoopback's token on every step that samples one: a mixed
-        # step's decode rows read it next under their own walk
-        loopback = getattr(mgmt.submodule, "device_loopback", None)
-        kept = {**(loopback.outputs() if loopback is not None else {}), **mgmt.row_signals.get(graph_walk, {})}
-        for signal, output in kept.items():
+        for signal, output in self._row_pairs(mgmt, graph_walk)[1].items():
             value = output_named(outputs, output)
             if value is not None:
                 rows.write(signal, rids, value)
@@ -2349,6 +2414,7 @@ class Engine:
             step=step,
             per_request_input_metadata=batch.per_request_input_metadata,
             loopback_rows=submodule_mgmt.loopback_rows,
+            rows_in_graph=lease is not None and bool(cg_runner.slot_for(lease).row_heads),
         )
         laps.lap("engine_inputs")
         if nvtx:
@@ -2440,7 +2506,10 @@ class Engine:
             ctx = batch.step_context
             if ctx.resident is not None:
                 ctx.resident.flush(ctx.resident_plan)
-            stop = cg_runner.slot_for(lease).device_stop
+            slot = cg_runner.slot_for(lease)
+            if slot.row_heads:
+                self._write_routed_rows(batch, submodule_mgmt, slot, engine_inputs, preprocessed)
+            stop = slot.device_stop
             if stop is not None:
                 policy = submodule_mgmt.device_stops[graph_walk]
                 infos = engine_inputs.per_request_info
@@ -2452,18 +2521,16 @@ class Engine:
             )
             if ctx.repeats > 1:
                 columns = submodule_mgmt.run_columns.get(graph_walk, frozenset())
+                # a signal in the rows moves through them, in the graph
+                carries = {s: pair for s, pair in submodule_mgmt.carries[graph_walk].items() if s not in slot.row_heads}
                 stops, rows, spans = cg_runner.repeat(
-                    lease, submodule_mgmt.carries[graph_walk], ctx.repeats,
+                    lease, carries, ctx.repeats,
                     self._runner.replay_columns(step, ctx.repeats), columns, batch.iteration_columns,
                 )
                 out = dataclasses.replace(
                     out, check_stop_buffers=stops, row_outputs={**(out.row_outputs or {}), **rows},
                     output_spans={**(out.output_spans or {}), **spans} or None,
                 )
-            # the last replay's values, which its static outputs still hold
-            self._keep_rows(
-                submodule_mgmt, graph_walk, engine_inputs.request_ids, cg_runner.slot_for(lease).static_outputs,
-            )
             return out
         if release_event is not None:
             release_event.set()
@@ -3792,9 +3859,6 @@ class Engine:
         """Open the request on every resource, then tell each submodule. All or
         nothing: a raise leaves the request on none of them."""
         self._runner.ingest_request(request_id, overrides)
-        for submodule_mgmt in self._submodules.values():
-            if submodule_mgmt.loopback_rows is not None:
-                submodule_mgmt.loopback_rows.add(request_id)
         if request_info is None:
             return
         try:
@@ -3834,8 +3898,6 @@ class Engine:
                 submodule_mgmt.submodule.cleanup_request(request_id)
             if submodule_mgmt.resident is not None:
                 submodule_mgmt.resident.release(request_id)
-            if submodule_mgmt.loopback_rows is not None:
-                submodule_mgmt.loopback_rows.drop(request_id)
         return freed
 
     def shutdown(self):

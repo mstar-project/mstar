@@ -1023,7 +1023,7 @@ def test_decode_loopback_contract():
     row = sub.prepare_inputs(DECODE_WALK, _fwd(1), {}, has_loopback=True)
     assert row.input_ids is None and row.input_seq_len == 1
     # the rule state rides beside the token: a routed row writes both first
-    from mstar.engine.loopback_rows import LoopbackRows
+    from mstar.engine.resources.loopback_rows import LoopbackRows
 
     kept = LoopbackRows(torch.device("cpu"))
     for rid in (1, 2):

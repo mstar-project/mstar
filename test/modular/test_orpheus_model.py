@@ -108,7 +108,7 @@ def test_an_llm_run_of_four_tokens_equals_four_one_token_steps():
 def test_a_mixed_step_reads_a_loop_back_rows_token_off_the_rows_beside_a_prompt():
     import torch
 
-    from mstar.engine.loopback_rows import LoopbackRows
+    from mstar.engine.resources.loopback_rows import LoopbackRows
     from mstar.model.orpheus.submodules import OrpheusLLMSubmodule
     from mstar.model.submodule_base import ARNodeInputs, DeviceLoopback, ModelInputsFromEngine
 

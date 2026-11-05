@@ -125,7 +125,7 @@ class CarryPair(NamedTuple):
 
 class DeviceLoopback(NamedTuple):
     """A decode walk whose rows read their last sampled token off the node's
-    device loop-back rows (``mstar.engine.loopback_rows``) instead of a routed
+    device loop-back rows (``mstar.engine.resources.loopback_rows``) instead of a routed
     tensor (``MSTAR_DEVICE_LOOPBACK``), while the client edge carries the
     token inline, off the stop check's host copy.
 
@@ -158,7 +158,7 @@ if TYPE_CHECKING:
     from mstar.engine.accelerator_graph_config import AcceleratorGraphConfig, PiecewiseAcceleratorGraphConfig
     from mstar.engine.accelerator_graph_runner import PiecewiseAcceleratorGraphRunner
     from mstar.engine.engine import ExecutingBatch
-    from mstar.engine.loopback_rows import LoopbackRows
+    from mstar.engine.resources.loopback_rows import LoopbackRows
     from mstar.streaming.stream_buffer import StreamChunkInfo
 
 
@@ -826,6 +826,8 @@ class ModelInputsFromEngine:
     # The node's device loop-back rows, where the engine keeps them; a
     # ``DeviceLoopback`` walk reads its token there (``loopback_inputs``).
     loopback_rows: "LoopbackRows | None" = None
+    # whether this step's capture reads them itself, at its head
+    rows_in_graph: bool = False
 
     @property
     @torch.compiler.disable
@@ -1565,7 +1567,13 @@ def engine_step(submodule, *args, **kwargs) -> SubmoduleStep | None:
     pools' rows added (``lora_rows``), so a model serving LoRA from its modules writes
     no LoRA step."""
     # the engine drives duck-typed submodules too
-    return lora_rows(submodule.declare_step(*args, **kwargs), getattr(submodule, "lora_keys", ()))
+    step = lora_rows(submodule.declare_step(*args, **kwargs), getattr(submodule, "lora_keys", ()))
+    key = getattr(submodule, "loopback_rows_key", None)
+    if step is not None and key is not None and key not in step.steps:
+        from mstar.engine.resources.loopback_rows import LoopbackRowsStep
+
+        step.steps[key] = LoopbackRowsStep(segments=step.segments)
+    return step
 
 
 # What a declared stop policy stands in for: a class overriding any keeps check_stop.
@@ -1642,8 +1650,12 @@ class ARNodeSubmodule(NodeSubmodule):
 
     def loopback_tokens(self, engine_inputs: ModelInputsFromEngine) -> torch.Tensor:
         """Each row's last sampled token, off the node's loop-back rows
-        (padding rows read the trash row)."""
-        return engine_inputs.loopback_rows.read(self.device_loopback.signal, engine_inputs.request_ids)
+        (padding rows read the trash row): nothing to read for a capture that
+        does it at its head."""
+        rows, signal = engine_inputs.loopback_rows, self.device_loopback.signal
+        if engine_inputs.rows_in_graph:
+            return rows.placeholder(signal, len(engine_inputs.request_ids))
+        return rows.read(signal, engine_inputs.request_ids)
 
     def loopback_inputs(
         self, engine_inputs: ModelInputsFromEngine, inputs: list[ARNodeInputs],
@@ -1662,8 +1674,11 @@ class ARNodeSubmodule(NodeSubmodule):
             rows.write(loopback.signal, first, torch.cat([inputs[i].input_ids for i in routed]))
             for name in loopback.states:
                 rows.write(name, first, torch.stack([inputs[i].tensor_inputs[name] for i in routed]))
-        out = {loopback.input: rows.read(loopback.signal, rids)}
-        out.update((name, rows.read(name, rids)) for name in loopback.states)
+        # a capture reads them at its head, routed rows included: those go in first
+        read = rows.placeholder if engine_inputs.rows_in_graph and not routed else rows.read
+        arg = len(rids) if read == rows.placeholder else rids
+        out = {loopback.input: read(loopback.signal, arg)}
+        out.update((name, read(name, arg)) for name in loopback.states)
         return out
 
     def get_stop_policies(self, graph_walk: str) -> dict[str, StopPolicy] | None:

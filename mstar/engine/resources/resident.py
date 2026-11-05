@@ -752,6 +752,8 @@ def _row_refusal(
 
 def _segments(key: str, step: SubmoduleStep) -> list:
     resource_step = step.steps.get(key)
+    if getattr(resource_step, "streamless", False):
+        return []
     return list((resource_step.segments if resource_step is not None else None) or step.segments or ())
 
 

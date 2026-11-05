@@ -664,6 +664,7 @@ def test_the_startup_line_names_the_owner_that_refuses_each_capability(caplog, l
         joint_comm_group=SimpleNamespace(world_size=1),
         submodule=SimpleNamespace(repeat_carry=lambda walk, signals: {}),
         resources=resources, carry_refusals={}, carries={}, accelerator_graph_runner=None, template_steps={},
+        row_signals={},
     ) for node, resources, refused in (
         ("a", {"kv": willing}, {}), ("b", {"kv": willing, "pool": ResidentHooks()}, {}),
         ("c", {"kv": willing}, {WALK: "resource 'kv': why"}),
@@ -671,7 +672,7 @@ def test_the_startup_line_names_the_owner_that_refuses_each_capability(caplog, l
     with caplog.at_level("INFO", logger="mstar.worker.step_repeats"):
         _repeats(limit, "abc").settle(
             engine.resident_refusal, engine.repeat_refusal,
-            {"rows": lambda node, walk: NOT_ASKED if limit == 1 else engine.keep_loopback_rows(node, walk, {"t"})},
+            {"rows": lambda node, walk: NOT_ASKED if limit == 1 else engine.rows_refusal(node, walk)},
         )
     lines = {line.split(":", 1)[0]: line for line in caplog.messages}
     want = (

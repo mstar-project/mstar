@@ -150,6 +150,11 @@ class StepRepeats:
             if self.config(key[0]).device_stop != "off"
         }
 
+    def kept_rows(self, resident: bool) -> dict[tuple[str, str], frozenset[str]]:
+        """The loop-back signals of each walk whose config asks for resident
+        planning or repeats, kept in device rows between its steps."""
+        return {key: loop_back(edges) for key, edges in self.edges.items() if resident or self.limit(key[0]) > 1}
+
     def carried(self) -> dict[tuple[str, str], frozenset[str]]:
         """The loop-back signals of each walk asked to repeat, which a run
         carries between replays."""

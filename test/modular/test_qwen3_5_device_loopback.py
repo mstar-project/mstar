@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import torch
 
-from mstar.engine.loopback_rows import LoopbackRows
+from mstar.engine.resources.loopback_rows import LoopbackRows
 from mstar.model.qwen3_5.config import SAMPLER
 from mstar.model.qwen3_5.submodules import LLMSubmodule
 
@@ -33,6 +33,7 @@ def _prepare(sub, walk, inputs, has_loopback=True):
 def _engine_inputs(rows, request_ids, captured=False, **resources):
     return SimpleNamespace(
         resources={SAMPLER: None, **resources}, request_ids=request_ids, captured=captured, loopback_rows=rows,
+        rows_in_graph=False,
     )
 
 

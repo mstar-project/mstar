@@ -3018,8 +3018,7 @@ class Worker:
         for resident planning or repeats."""
         if self._step_repeats.limit(node_name) == 1 and knobs.resident_planning() != "on":
             return NOT_ASKED
-        edges = self._step_repeats.edges[(node_name, graph_walk)]
-        return self.engine_manager.get_engine(node_name).keep_loopback_rows(node_name, graph_walk, loop_back(edges))
+        return self.engine_manager.get_engine(node_name).rows_refusal(node_name, graph_walk)
 
     def _launch_refusal(self, node_name: str, graph_walk: str) -> str | None:
         """Why this walk's runs stay on the host's launch loop, or None."""
@@ -5311,6 +5310,7 @@ class Worker:
             {(node, walk): loop for (walk, node), loop in self._innermost_loop_by_node.items()},
             self._step_repeats.carried() if self._step_repeats is not None else {},
             self._step_repeats.device_stops() if self._step_repeats is not None else {},
+            self._step_repeats.kept_rows(knobs.resident_planning() == "on") if self._step_repeats is not None else {},
         )
         if self._step_repeats is not None:
             # after capture: an attention decides repeats from the kernels it captured

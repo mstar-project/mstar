@@ -163,7 +163,7 @@ def _rank(
             log.append(("forward", msg.body.request_id, msg.body.after_tp_seq))
 
     w.engine_manager = SimpleNamespace(
-        warmup_all=lambda looped, carried, device_stops: None, remove_request=_tear_down,
+        warmup_all=lambda *args: None, remove_request=_tear_down,
     )
     w.communicator = SimpleNamespace(send=_send, wait_for_work=lambda timeout: None)
     w.request_state = SimpleNamespace(

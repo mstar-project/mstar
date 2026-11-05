@@ -681,8 +681,8 @@ Worker scheduling
      - config's ``knobs: device_loopback``, else ``1``
      - Whether a decode node may keep its loop-back token on the device:
        each step writes each request's last token into the node's loop-back
-       rows (``mstar.engine.loopback_rows``) and the next step reads its input
-       ids from them, so the worker routes the signal with no tensor (no
+       rows (``mstar.engine.resources.loopback_rows``), inside its capture, and
+       the next step reads its input ids from them at its head, so the worker routes the signal with no tensor (no
        per-request store, hold or cleanup per step). Only captured nodes that
        declare the read (``DeviceLoopback``: the decode walks of Qwen3.5,
        Higgs Audio, Qwen3-ASR, Qwen3-Omni, Orpheus and Whisper, which also
