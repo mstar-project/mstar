@@ -65,7 +65,7 @@ def _sim_tensors(args, kwargs) -> list[torch.Tensor]:
 _PRIMITIVES = ("AllReduce", "Broadcast", "Reduce", "AllGather", "ReduceScatter", "AllToAll",
                "AllReduceFusion", "Graph", "Barrier")
 _DTYPES = tuple(dict.fromkeys(v for v in vars(torch).values() if isinstance(v, torch.dtype)))
-_HELD = 5  # the values field
+_VALUES = 5  # the index of the values field
 HELD, COMPUTED = 1, 2
 
 
@@ -80,18 +80,18 @@ def _describe(r: list[int]) -> str:
     name = _PRIMITIVES[r[0]]
     if name == "Graph":
         return f"a graph replay of {r[1]} collectives (sequence hash {r[3] & (2**64 - 1):016x})"
-    size = (len(r) - _HELD - 1) // 2
+    size = (len(r) - _VALUES - 1) // 2
     text = f"{name}(numel={r[1]}, dtype={_DTYPES[r[2]] if r[2] >= 0 else None}, op={r[3]}, root={r[4]}"
     if name == "AllToAll":
-        text += f", sends={r[_HELD + 1:_HELD + 1 + size]}, receives={r[_HELD + 1 + size:]}"
+        text += f", sends={r[_VALUES + 1:_VALUES + 1 + size]}, receives={r[_VALUES + 1 + size:]}"
     return text + ")"
 
 
 def _pairs(rows: list[list[int]]) -> bool:
     size = len(rows)
-    send = [r[_HELD + 1:_HELD + 1 + size] for r in rows]
-    recv = [r[_HELD + 1 + size:] for r in rows]
-    return (all(r[:_HELD] == rows[0][:_HELD] for r in rows)
+    send = [r[_VALUES + 1:_VALUES + 1 + size] for r in rows]
+    recv = [r[_VALUES + 1 + size:] for r in rows]
+    return (all(r[:_VALUES] == rows[0][:_VALUES] for r in rows)
             and all(send[i][j] == recv[j][i] for i in range(size) for j in range(size)))
 
 
@@ -155,9 +155,9 @@ def collective(family: str, group, nbytes: int, desc: list[int] | None) -> int:
         return -1 if tape is None else 0
     group = group or dist.group.WORLD
     if tape is not None:
-        tape.collectives.append((group, desc[:_HELD]))
+        tape.collectives.append((group, desc[:_VALUES]))
         return 0
-    return functools.reduce(operator.and_, (r[_HELD] for r in _meet(group, desc)))
+    return functools.reduce(operator.and_, (r[_VALUES] for r in _meet(group, desc)))
 
 
 def seal(tape: clock.Tape) -> None:
