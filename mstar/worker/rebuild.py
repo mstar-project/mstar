@@ -485,19 +485,19 @@ class Rebuilds:
         return kept.prompt.view.numel() + len(kept.sampled) - 1 + (0 if kept.copies is None else kept.copies.slots)
 
     def start(self, rid: int, node: str, prefilling: Prefilling | None) -> Rebuild | None:
-        """Open ``rid``'s rebuild on ``node``, and return what it writes from its kept ids, or None when it runs
-        the chunks its prompt was ``prefilling`` again, which the request's layout already describes."""
+        """Open ``rid``'s rebuild on ``node`` over the slots `tokens` counts, which its drop checked, and return what
+        it writes from its kept ids, or None when it runs the chunks its prompt was ``prefilling`` again, which the
+        request's layout already describes."""
         assert (node, rid) not in self._cursors, f"{rid}'s rebuild on {node} starts once per drop"
+        total = self.tokens(rid, node, prefilling)
         if prefilling is not None:
-            self._cursors[(node, rid)] = RebuildCursor(prefilling.walk, prefilling.done, prefilling.total)
+            self._cursors[(node, rid)] = RebuildCursor(prefilling.walk, total, prefilling.total)
             return None
         kept = self._kept[node][rid]
         ids = array("i", kept.prompt.view.to(torch.int32).numpy().tobytes())
         ids.extend(kept.sampled)
-        # the row writes every id but the last, and the slots its host copies fill
-        slots = len(ids) - 1 + (0 if kept.copies is None else kept.copies.slots)
         cursor = RebuildCursor(
-            kept.walk, slots, slots, ids, kept.prompt.view.dtype, kept.lengths, kept.copies, kept.step_metadata,
+            kept.walk, total, total, ids, kept.prompt.view.dtype, kept.lengths, kept.copies, kept.step_metadata,
         )
         self._cursors[(node, rid)] = cursor
         return Rebuild(cursor.walk, ids)

@@ -33,6 +33,7 @@ from mstar.engine.resources.kv.config import (
     PagedKVConfig,
     PrefixSpan,
     RetentionPolicy,
+    SpanKind,
     StreamLayout,
 )
 from mstar.engine.resources.kv.cpu_page_pool import CPUPagePool, PageCopies
@@ -3680,11 +3681,11 @@ class KVManager(AttentionResource):
             return self._arena.num_free - free
 
     def prepare_rebuild(self, rid: str, rebuild: Rebuild) -> None:
-        """Lay ``rid``'s label out again as its rebuild row writes it over the rebuild's ids without the last
-        one: the label's spans, the last grown by the ids sampled since (`StreamLayout.rebuilt`). A label of
-        one ids span is keyed as a prompt of those ids would be.
+        """Lay ``rid``'s label out again to hold the slots its drop checked, which its rebuild row writes: the
+        label's spans, the last grown by the ids sampled since (`StreamLayout.rebuilt`). A label of one ids span
+        is keyed as a prompt of the rebuild's ids without the last one would be.
 
-        The growth loop's cap and the layout's ``max_growth`` drop by what the last span now covers, so the
+        The growth loop's cap and the layout's ``max_growth`` drop by what the last span grew, so the
         footprint stays the one at intake. The decode step that samples an id keys it, so a label that keys
         generation also extends its chain by the last id.
         """
@@ -3693,19 +3694,21 @@ class KVManager(AttentionResource):
         if not laid_out:
             return
         (label,) = laid_out
-        ids, layout = rebuild.ids, overrides.kv_layout[label]
+        ids, layout, held = rebuild.ids, overrides.kv_layout[label], self._dropped[rid].held
         prompt, page_size = ids[:-1], self.config.tokens_per_page
-        length = len(prompt)
-        rebuilt = layout.rebuilt(length)
-        written, held = sum(span.length for span in rebuilt.spans), self._dropped[rid].held
-        assert written == held, f"KV {self.name}: {rid}'s rebuild writes {written} slots, but its drop checked {held}"
+        length, rebuilt = len(prompt), layout.rebuilt(held)
+        laid_out_ids = sum(span.length for span in rebuilt.spans if span.kind == SpanKind.IDS)
+        assert length == laid_out_ids, (
+            f"KV {self.name}: {rid}'s rebuild writes {length} ids, but the {held} slots its drop checked hold "
+            f"{laid_out_ids}"
+        )
         pages = [prompt[start:start + page_size] for start in range(0, length, page_size)]
         keyed = bool((overrides.prefix_keys or {}).get(label))
         # hashed before the lock, as `resolve_cached_prefix` hashes outside it
         keys = chain(pages, root=overrides.prefix_root) if keyed else None
         with self._lock:
             ((loop, slots),) = layout.growth
-            grown = written - sum(span.length for span in layout.spans)
+            grown = held - sum(span.length for span in layout.spans)
             changes = {}
             if keyed:
                 changes["prefix_keys"] = {**overrides.prefix_keys, label: keys}

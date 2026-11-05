@@ -760,10 +760,11 @@ class StreamLayout:
         grown = sum(slots * caps[loop] for loop, slots in self.growth)
         return grown if self.max_growth is None else min(grown, self.max_growth)
 
-    def rebuilt(self, ids: int) -> "StreamLayout":
-        """This layout once a rebuild row has written ``ids`` ids into it: the last span, which
-        `rebuild_refusal` requires to be ids, grows by the ids sampled since the layout was laid out."""
-        grown = ids - sum(span.length for span in self.spans if span.kind == SpanKind.IDS)
+    def rebuilt(self, slots: int) -> "StreamLayout":
+        """This layout once a rebuild row has written ``slots`` slots into it: the last span, which
+        `rebuild_refusal` requires to be ids, grows by the slots past the layout, the ids sampled since it was
+        laid out."""
+        grown = slots - sum(span.length for span in self.spans)
         *spans, last = self.spans
         return replace(self, spans=(*spans, replace(last, length=last.length + grown, advance=last.advance + grown)))
 
