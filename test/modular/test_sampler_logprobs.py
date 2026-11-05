@@ -246,9 +246,30 @@ def test_a_sample_scores_each_rows_stop_ids_greedy_or_not():
     from mstar.engine.resources.sampler.config import STOP_ODDS
 
     res = _resource(enable=False)
-    res.ask_stop_odds({2, 3})
+    res.ask_stop_odds("w", {2, 3})
     for rid in (0, 1):
         res.ingest_request(rid, SamplingReqConfig(temperature=0.0))
     logits = torch.tensor([[0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 10.0, -100.0]])
-    _step(res, [0, 1], logits)
-    assert res.step_host_rows(4)[STOP_ODDS][:2].tolist() == pytest.approx([0.5, 1.0], abs=1e-3)
+    assert _step(res, [0, 1], logits)[STOP_ODDS][:2].tolist() == pytest.approx([0.5, 1.0], abs=1e-3)
+
+
+def test_stop_odds_are_only_the_asked_walks_and_an_eager_steps_rows_only_its_own():
+    """A walk that wasn't asked hands over no odds (its forward may hand over no
+    stop buffers), and a replay after a step too wide for the capture reads the
+    capture's rows, not that step's."""
+    from mstar.engine.resources.sampler.config import STOP_ODDS
+
+    res = _resource(graph=True, enable=False)
+    res.ask_stop_odds("w", {2})
+    res._odds = torch.zeros(2)  # the capture's rows: 2
+    for rid in range(3):
+        res.ingest_request(rid, SamplingReqConfig(temperature=0.0))
+    wide = torch.tensor([[0.0, 0.0, 10.0, -100.0]] * 3)
+    assert _step(res, [0, 1, 2], wide)[STOP_ODDS].tolist() == pytest.approx([1.0] * 3, abs=1e-3)
+    # a replay: plan only, the graph wrote the capture's rows
+    res.plan(SamplerStep(apply_penalty=False), StepContext(request_ids=(0,), graph_walk="w", slot=0, capture=False))
+    assert res.step_host_rows(1)[STOP_ODDS] is res._odds
+    other = StepContext(request_ids=(0,), graph_walk="prefill", slot=0, capture=False)
+    res.plan(SamplerStep(apply_penalty=False), other)
+    res.sample([0], wide[:1])
+    assert STOP_ODDS not in res.step_host_rows(1)

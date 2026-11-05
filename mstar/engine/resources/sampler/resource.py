@@ -112,11 +112,13 @@ class SamplerResource(Resource):
         self._cg_buffers: SamplerBuffers | None = None
         self._cg_max_bs = 0
         self._cg_slots = 1
-        # ``ask_stop_odds``: the stop ids, the rows a capture writes, and an
-        # eager step's own rows
+        # ``ask_stop_odds``: the walks and stop ids it scores, the rows a
+        # capture writes, an eager step's own rows, and whether this step scores
+        self._odds_walks: set[str] = set()
         self._odds_ids: torch.Tensor | None = None
         self._odds: torch.Tensor | None = None
         self._odds_eager: torch.Tensor | None = None
+        self._odds_this_step = False
 
         # This is set during plan in the cuda graph case
         self._cg_sampler: AcceleratorGraphableSampler | None = None
@@ -503,6 +505,7 @@ class SamplerResource(Resource):
         if not ctx.is_preplan:
             self._kept_rids = self._kept_rids_of(step, ctx)
             self._sampled_this_step = False
+            self._odds_this_step = ctx.graph_walk in self._odds_walks
         if not ctx.is_preplan and self._penalty_live:
             configs = self._sampler._sampling_config
             for rid, tokens in step.prefill_tracked_tokens.items():
@@ -659,7 +662,7 @@ class SamplerResource(Resource):
         which is what the graph sampler's per-row params were gathered for.
         The eager sampler keys off request ids and sees the real batch only.
         """
-        if self._odds_ids is not None:
+        if self._odds_this_step:
             self._score_stops(logits)
         if self._enable_logprobs:
             # under capture this fires once, at capture; a replay never calls in
@@ -696,8 +699,10 @@ class SamplerResource(Resource):
             )
         return tokens
 
-    def ask_stop_odds(self, stop_ids) -> None:
-        """Before capture: score each row's stop ids at every sample (``STOP_ODDS``)."""
+    def ask_stop_odds(self, walk: str, stop_ids) -> None:
+        """Before capture: score each row's stop ids at every sample of ``walk``
+        (``STOP_ODDS``)."""
+        self._odds_walks.add(walk)
         self._odds_ids = torch.tensor(sorted(stop_ids), dtype=torch.long, device=self._device)
 
     def _score_stops(self, logits: torch.Tensor) -> None:
@@ -720,8 +725,10 @@ class SamplerResource(Resource):
         step that repeats has none: no row of it asked, or it would have
         settled at 1. Its odds are its last iteration's."""
         out = {}
-        if self._odds_ids is not None:
+        if self._odds_this_step:
+            # an eager step's rows are its own; a replay wrote the capture's
             out[STOP_ODDS] = self._odds_eager if self._odds_eager is not None else self._odds
+            self._odds_this_step, self._odds_eager = False, None
         if not self._logprob_rids or repeats > 1:
             return out
         # a replay never calls `sample`: its rows are the slot's static ones

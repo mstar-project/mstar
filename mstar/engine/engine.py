@@ -2809,7 +2809,7 @@ class Engine:
         sampler = self._submodules[node_name].resources.get(policy.sampler)
         if not hasattr(sampler, "ask_stop_odds"):
             return "node: its stop names no sampler"
-        sampler.ask_stop_odds(policy.eos_tokens)
+        sampler.ask_stop_odds(graph_walk, policy.eos_tokens)
         return None
 
     def get_stop_policies(self, node_name: str, graph_walk: str) -> dict[str, StopPolicy] | None:
