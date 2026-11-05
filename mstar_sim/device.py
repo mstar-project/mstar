@@ -1053,6 +1053,11 @@ def _copy_seconds(nbytes: int, kind: str) -> float:
 
 def _to(self, *args, **kwargs):
     kwargs = dict(kwargs)
+    other = args[0] if args else kwargs.pop("tensor", None)
+    if isinstance(other, SimTensor):  # to(other): its device and dtype (torch would read its payload's)
+        args = (other.device, other.dtype, *args[1:])
+    elif other is not None and not args:
+        kwargs["tensor"] = other
     copy = kwargs.pop("copy", False)
     if len(args) >= 4 and isinstance(args[3], bool):  # to(device, dtype, non_blocking, copy)
         args, copy = args[:3], args[3]

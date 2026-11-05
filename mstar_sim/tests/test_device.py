@@ -47,6 +47,8 @@ def test_cuda_semantics():
         host = torch.arange(3)
         dev = host.to(device="cuda", dtype=torch.int32, copy=True)
         assert dev.is_cuda and dev.dtype == torch.int32 and dev.tolist() == [0, 1, 2]
+        like = torch.tensor(1.0).to(dev), torch.tensor(1.0).to(tensor=dev, non_blocking=True)  # as torchaudio does
+        assert all(t.is_cuda and t.dtype == torch.int32 for t in like), like
         staged = torch.zeros_like(dev, device="cpu", pin_memory=True)  # a host staging buffer
         assert type(staged) is torch.Tensor and staged.device.type == "cpu"
         try:
