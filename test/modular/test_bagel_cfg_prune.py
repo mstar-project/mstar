@@ -182,11 +182,14 @@ def _info(graph_walk: str = "image_gen", **fields) -> CurrentForwardPassInfo:
 def _image_gen_row(span: int = 6) -> ARNodeInputs:
     row = ARNodeInputs(input_seq_len=span)
     row.resource_step_info = True  # requires_cfg
-    row.custom_pos_ids = {
-        label: torch.full((span,), 10 + i, dtype=torch.int32)
-        for i, label in enumerate(("main", "cfg_text", "cfg_img"))
-    }
     return row
+
+
+def _with_positions(llm: LLMSubmodule) -> LLMSubmodule:
+    """Each stream at its own position, 10 and up, as the position resource holds them."""
+    offset = {"main": 0, "cfg_text": 1, "cfg_img": 2}
+    llm.node_resources = {"rope": types.SimpleNamespace(position=lambda rid, label: 10 + offset[label])}
+    return llm
 
 
 @pytest.mark.parametrize("walk,labels", [
@@ -196,8 +199,11 @@ def _image_gen_row(span: int = 6) -> ARNodeInputs:
     (IMAGE_GEN_HEAD, ("main",)),
 ])
 def test_declared_step_plans_exactly_the_branches_run(walk, labels):
+    """The row's positions come from the position resource, not its inputs: a
+    pre-plan declares over the capture's template rows, whose positions aren't
+    the request's, and the step that runs takes what it staged (GPU finding 16)."""
     span = 6
-    step = _llm().declare_step(walk, ["r0"], [_image_gen_row(span)])
+    step = _with_positions(_llm()).declare_step(walk, ["r0"], [_image_gen_row(span)])
     kv: KVStep = step.steps["kv"]
     rope: PositionStep = step.steps["rope"]
     assert tuple(seg.label for seg in kv.segments) == labels
@@ -397,7 +403,7 @@ def test_a_denoise_step_leases_and_declares_the_bucket_its_capture_was_made_unde
     the key is the guidance flag it always was."""
     import dataclasses
 
-    llm = _llm()
+    llm = _with_positions(_llm())
     llm.node_name = node
     llm.config = dataclasses.replace(CONFIG, denoise_capture_sizes=((256, 256),))
     tokens = (256 // CONFIG.latent_downsample) ** 2

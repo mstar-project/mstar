@@ -170,6 +170,7 @@ class _BagelPool:
         for rid, config in configs.items():
             self.runner.ingest_request(rid, {"kv": config})
         self.llm = _llm()
+        self.llm.node_resources = {"rope": SimpleNamespace(position=lambda rid, label: 0)}
 
     def step(self, walk: str, rows: dict, guided: dict) -> None:
         from mstar.engine.resources import StepContext

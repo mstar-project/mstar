@@ -1150,11 +1150,6 @@ class LLMSubmodule(ARNodeSubmodule):
             },
             # a guided walk's rows run the guidance branches (requires_cfg)
             resource_step_info=DENOISE_WALKS[walk].branches > 1,
-            # a request's own positions are staged at each step; a capture's are any
-            custom_pos_ids={
-                label: torch.zeros(frame.shape[0], dtype=torch.int32, device=device)
-                for label in ("main", "cfg_text", "cfg_img")
-            },
         )
         return BatchedAcceleratorGraphConfig(
             capture_graph_walk=walk, single_request_inputs=single,
@@ -1248,12 +1243,8 @@ class LLMSubmodule(ARNodeSubmodule):
             tensor_inputs["empty_combined_emb"] = self._sentinel_frame(
                 node_inputs.input_embeds.shape[0], node_inputs.input_embeds.dtype, device,
             )
-            labels = ["main", "cfg_text", "cfg_img"]
             seq_len = tensor_inputs["empty_combined_emb"].shape[0]
             node_inputs.input_seq_len = seq_len
-            node_inputs.custom_pos_ids = self._get_image_pos_ids(
-                labels, fwd_info.rid_handle, device, seq_len
-            )
             node_inputs.tensor_inputs = {
                 **tensor_inputs,
                 "text_indexes": shape_inputs["text_indexes"],
@@ -1355,12 +1346,24 @@ class LLMSubmodule(ARNodeSubmodule):
             for label in labels
             for rid, span in zip(request_ids, spans, strict=True)
         )
-        per_label_pos_ids = {
-            label: [
-                inp.custom_pos_ids[label] for inp in inputs
-                if isinstance(inp.custom_pos_ids, dict) and label in inp.custom_pos_ids
-            ] for label in labels
-        }
+        if graph_walk in DENOISE_WALKS:
+            # Every latent sits at its stream's current position, read here: a
+            # pre-plan declares over the capture's template rows, and the step
+            # that runs takes what it staged.
+            positions = self.node_resources["rope"]
+            per_label_pos_ids = {
+                label: [
+                    torch.full((span,), positions.position(rid, label), dtype=torch.int32)
+                    for rid, span in zip(request_ids, spans, strict=True)
+                ] for label in labels
+            }
+        else:
+            per_label_pos_ids = {
+                label: [
+                    inp.custom_pos_ids[label] for inp in inputs
+                    if isinstance(inp.custom_pos_ids, dict) and label in inp.custom_pos_ids
+                ] for label in labels
+            }
 
         if graph_walk in SINGLE_NODE_DENOISE_WALKS and len(labels) > 1:
             # Batched CFG: one combined plan across the active branch labels
