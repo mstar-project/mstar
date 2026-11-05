@@ -40,7 +40,7 @@ def test_the_device_idle_before_a_step_is_its_gap():
     one whose GPU work is long: the device's idle time before it."""
     from collections import deque
 
-    from mstar.utils.profiler import phase_buffer
+    from mstar.utils.profiler import _PhaseBuffer
     from mstar.worker.worker import Worker
 
     class Mark:
@@ -54,7 +54,7 @@ def test_the_device_idle_before_a_step_is_its_gap():
             return later.t - self.t
 
     worker = Worker.__new__(Worker)
-    worker._phase_buf = phase_buffer()
+    worker._phase_buf = _PhaseBuffer(list)  # the process-wide one holds what other tests recorded
     worker._gpu_spans = deque([
         (Mark(0.0), Mark(5.0), "step.n.decode"), (Mark(7.0), Mark(15.0), "step.n.mixed"),
     ])
