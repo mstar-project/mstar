@@ -75,8 +75,8 @@ DEFAULT_CONFIGS: dict[str, str] = {
     "ltx2_5": "ltx2_5.yaml",
     # bf16 fits one 141 GB GPU; muse_glimmer_tp2.yaml for two 80 GB ones
     "muse_glimmer": "muse_glimmer.yaml",
-    # bf16 on two 141 GB GPUs; ripple_65b_tp4.yaml for four 80 GB ones
-    "ripple_65b": "ripple_65b_tp2.yaml",
+    # bf16 on four 80 GB GPUs; ripple_65b_tp2.yaml for two 141 GB ones
+    "ripple_65b": "ripple_65b_tp4.yaml",
     "flux2_klein_9b": "flux2_klein_9b.yaml",
     "z_image_turbo": "z_image_turbo.yaml",
     "glm52": "glm52_tp8.yaml",

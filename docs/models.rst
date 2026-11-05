@@ -294,11 +294,11 @@ Ripple-65B (``ripple_65b``)
 
 .. code-block:: bash
 
-    mstar serve ripple_65b --gpus 0,1
-    mstar serve ripple_65b --config configs/ripple_65b_tp4.yaml --gpus 0,1,2,3
+    mstar serve ripple_65b --gpus 0,1,2,3
+    mstar serve ripple_65b --config configs/ripple_65b_tp2.yaml --gpus 0,1
 
-- ``configs/ripple_65b_tp2.yaml`` needs two 141 GB GPUs and ``configs/ripple_65b_tp4.yaml``
-  four 80 GB ones. TP can't pass the model's 8 KV heads. Both serve 131072 tokens a request.
+- ``configs/ripple_65b_tp4.yaml``, the default, needs four 80 GB GPUs and
+  ``configs/ripple_65b_tp2.yaml`` two 141 GB ones, which hasn't run on GPUs yet. TP can't pass the model's 8 KV heads. Both serve 131072 tokens a request.
   For more, raise ``resources.kv_cache.max_seq_len`` and ``max_num_pages`` together: a prompt
   holds all 80 layers' K/V until its prefill commits, so the shipped pool runs out near 260K
   tokens and two 128K prompts can't prefill at once.
