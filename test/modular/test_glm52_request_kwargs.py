@@ -1,6 +1,8 @@
 """What GLM-5.2 takes of a request's kwargs: an unset one is the default, and one it cannot
 read is refused at the conductor's intake, the client's 400, before any rank runs the request."""
 
+from types import SimpleNamespace
+
 import pytest
 
 from mstar.conductor.conductor import Conductor
@@ -24,12 +26,16 @@ def _intake(model: Glm52Model, kwargs: dict) -> int:
         name: loop.max_iters for walk in model.get_graph_walk_graphs().values()
         for name, loop in walk.get_loops().items()
     }
+    # one worker that runs every node
+    nodes = {name for walk in model.get_graph_walk_graphs().values() for name in walk.get_nodes()}
+    conductor._per_worker_graphs = {"worker": [SimpleNamespace(section=SimpleNamespace(get_nodes=lambda: nodes))]}
     # in the order _admit_request runs them
     max_output_tokens = conductor._max_output_tokens(kwargs)
     conductor._loop_caps(kwargs)
-    specs = conductor._resource_specs()
-    for key, cfg in conductor._get_resource_configs(kwargs, {}).items():
-        cfg.validate(specs.get(key))
+    configs = conductor._get_resource_configs(kwargs, {})
+    for specs in conductor._resource_specs():
+        for key, cfg in configs.items():
+            cfg.validate(specs.get(key))
     return max_output_tokens
 
 
@@ -68,6 +74,13 @@ def test_strings_that_are_not_the_knobs_type_are_refused(kwargs):
     # one meaning per knob on every model (mstar/utils/generation_kwargs.py)
     with pytest.raises(ValueError, match=next(iter(kwargs))):
         _intake(_model(), kwargs)
+
+
+def test_return_logprobs_is_refused_where_the_sampler_never_sees_it():
+    # GLM-5.2 builds its sampler config from its own keys, which leave it out
+    with pytest.raises(ValueError, match="does not report logprobs"):
+        _intake(_model(), {"return_logprobs": True})
+    _intake(_model(), {"return_logprobs": False})
 
 
 def test_min_p_is_refused_at_intake():

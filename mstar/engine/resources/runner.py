@@ -9,9 +9,9 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable, Collection, Mapping
-from contextlib import nullcontext
 from typing import Any
 
+from mstar.engine.resources.admission import Admission
 from mstar.engine.resources.base import CachedPrefix, CGSlotSpec, PublishedInfo, Resource
 from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig
 from mstar.engine.resources.step import (
@@ -58,26 +58,6 @@ def topo_sort(resources: Mapping[str, Resource | NodeResourceSpec]) -> tuple[str
     return tuple(order)
 
 
-_NO_SCOPE = nullcontext()
-
-
-class _ComputeScope:
-    """``StepRunner.compute_scope`` over the resources that track compute."""
-
-    __slots__ = ("_resources",)
-
-    def __init__(self, resources: list[Resource]):
-        self._resources = resources
-
-    def __enter__(self):
-        for resource in self._resources:
-            resource.enter_compute()
-
-    def __exit__(self, *exc):
-        for resource in reversed(self._resources):
-            resource.exit_compute()
-
-
 class StepRunner:
     """drives resources through per-step cycle"""
 
@@ -85,6 +65,7 @@ class StepRunner:
         self, resources: Mapping[str, Resource],
         node_resources: Mapping[str, Collection[str]] | None = None,
         enable_nvtx: bool = False,
+        declared_by: Mapping[str, Collection[str]] | None = None,
     ):
         # Per-resource NVTX. `engine.plan.promoted` only reports that the sweep
         # was slow; these say WHICH resource ate it. Gated because range_push
@@ -116,18 +97,14 @@ class StepRunner:
             if type(self._resources[key]).admit_retrieve
             is not Resource.admit_retrieve
         ]
-        # resources that track the planned step's compute (`compute_scope`), and the
-        # share of them each step's resource set holds
-        self._compute_order = [
-            key for key in self._order
-            if type(self._resources[key]).enter_compute is not Resource.enter_compute
-        ]
-        self._compute_keys_cache: dict[frozenset[str], list[str]] = {}
         # Both sweeps run on behalf of one node and have no step to filter by,
         # so settle each node's share of them up front. `node_resources` must
         # name every node, including one that owns nothing — an absent node
         # falls back to the full sweep, which is the un-scoped behaviour.
         self._node_retrieve_order = self._per_node(node_resources, self._retrieve_order)
+        self._ask_order = [key for key in self._order if type(self._resources[key]).ask is not Resource.ask]
+        self._node_ask_order = self._per_node(node_resources, self._ask_order)
+        self._admission = Admission(self._resources, self._ask_order)
         self._node_publish_order = self._per_node(node_resources, self._publish_order)
         self._trail_order = [
             key for key in self._order if self._resources[key].page_trail() is not None
@@ -138,6 +115,25 @@ class StepRunner:
         ]
         self._node_cap_order = self._per_node(node_resources, self._cap_order)
         self._node_trail_order = self._per_node(node_resources, self._trail_order)
+        self._after_output_copy_keys = frozenset(
+            key for key in self._order
+            if type(self._resources[key]).after_output_copy is not Resource.after_output_copy
+        )
+        # publisher key -> every node of the deployment that declares it
+        # (``declared_by``): a replica on another worker, under another node
+        # name, reads what this one publishes. This runner's own nodes when
+        # not given.
+        declared_by = declared_by or {}
+        self._publisher_nodes: dict[str, frozenset[str]] = {
+            key: frozenset(declared_by[key]) if key in declared_by else frozenset(
+                node for node, keys in (node_resources or {}).items() if key in keys
+            )
+            for key in self._publish_order
+        }
+        # publisher key -> the rids not to publish it for: those whose every
+        # declaring node runs on this lockstep instance, so no other instance
+        # can retrieve their state (``skip_publish``)
+        self._unpublished: dict[str, set] = {key: set() for key in self._publish_order}
         # capture-time buffer allocation, likewise scoped: a node's runner has
         # no business sizing a resource it never plans against
         self._node_order = self._per_node(node_resources, list(self._order))
@@ -258,11 +254,16 @@ class StepRunner:
                 continue
             for rid in request_ids:
                 per_rid = outputs.get(rid)
-                if isinstance(per_rid, dict):
+                if isinstance(per_rid, Mapping):
                     resource.extend_prefix_chain(
                         rid, node_name,
                         walk_of if isinstance(walk_of, str) else walk_of(rid), per_rid,
                     )
+
+    def after_output_copy(self, step: SubmoduleStep) -> None:
+        for key in self._keys_for(step):
+            if key in self._after_output_copy_keys:
+                self._resources[key].after_output_copy(step.get(key))
 
     def complete_cached_walk(self, rid: str, node_name: str, graph_walk: str) -> None:
         """Tell the node's resources that the cache served this walk whole."""
@@ -370,14 +371,47 @@ class StepRunner:
             self._resources[key].ingest_capture_row(rid)
 
     def remove_request(self, rid: str) -> None:
+        self._admission.remove_request(rid)
         for key in self._order:
             self._resources[key].remove_request(rid)
+        for rids in self._unpublished.values():
+            rids.discard(rid)
+
+    @property
+    def publisher_nodes(self) -> Mapping[str, frozenset[str]]:
+        """Each publishing resource's declaring nodes, across the deployment."""
+        return self._publisher_nodes
+
+    def skip_publish(self, rid, keys) -> None:
+        """Never publish ``keys`` for ``rid``: no other lockstep instance runs
+        a node that declares them for this request. Purged on removal."""
+        for key in keys:
+            self._unpublished[key].add(rid)
+
+    def never_publish(self, keys) -> None:
+        """``skip_publish`` for every request: ``keys`` leave the publish
+        order, so a step pays nothing for them."""
+        keys = set(keys)
+        self._publish_order = [k for k in self._publish_order if k not in keys]
+        if self._node_publish_order is not None:
+            self._node_publish_order = {
+                node: [k for k in order if k not in keys]
+                for node, order in self._node_publish_order.items()
+            }
+        for key in keys:
+            self._publisher_nodes.pop(key, None)
+            self._unpublished.pop(key, None)
+
+    def _publishing(self, order: list[str], request_ids) -> list[str]:
+        """``order`` minus the resources none of ``request_ids`` publishes."""
+        skip = self._unpublished
+        return [key for key in order if not (skip[key] and skip[key].issuperset(request_ids))]
 
     def admit_retrieve(
         self, rid: str, node_name: str, graph_walk: str,
         published: Mapping[str, PublishedInfo] | None = None,
     ) -> FullAdmitOutcome:
-        """bring published state in
+        """bring published state in, once `node_name`'s resources have admitted the request
 
         gives `ready=False` when still has inflights; shortcircuit on failure
 
@@ -387,6 +421,13 @@ class StepRunner:
         node ends up gated on — and able to allocate against — another node's
         cache.
         """
+        if not self._admission.admitted(rid, node_name):
+            waits = self._admission.admit(
+                rid, node_name, graph_walk, published,
+                self._sweep(self._node_ask_order, self._ask_order, node_name),
+            )
+            if waits is not None:
+                return waits
         ready = True
         for key in self._sweep(
             self._node_retrieve_order, self._retrieve_order, node_name
@@ -404,7 +445,10 @@ class StepRunner:
             ready = ready and outcome.ready
         return FULL_ADMIT_OK if ready else FULL_ADMIT_NOT_READY
 
-
+    def admit_waiting(
+        self, published_of: Callable[[str, str], Mapping[str, PublishedInfo] | None],
+    ) -> list[tuple[str, str]]:
+        return self._admission.admit_waiting(published_of)
 
     # ── Pre-plan bookkeeping ─────────────────────────────────────────────
     #
@@ -499,6 +543,9 @@ class StepRunner:
                     key, outcome.reason.message
                 )
                 self._unwind(step, [*covered, *admitted, key])
+                # the unwind gave back the stage's pages, so a retry must plan afresh
+                if self._staged is not None:
+                    self.clear_preplan()
                 return FullAdmitOutcome(outcome, key)
             admitted.append(key)
             ready = ready and outcome.ready
@@ -515,7 +562,7 @@ class StepRunner:
         for key in reversed(keys):
             self._resources[key].rollback_admit(step.get(key), step.ctx)
 
-    def plan(self, step: SubmoduleStep) -> dict[str, Any]:
+    def plan(self, step: SubmoduleStep, phase: str = "res.plan") -> dict[str, Any]:
         """plan in dependency order
 
         place plan in `step.ctx.plan_results` before next plan runs
@@ -528,33 +575,19 @@ class StepRunner:
             self._pre_admitted = None
         results = step.ctx.plan_results
         results.clear()
+        step.ctx.plan_phase = phase
         for key in self._keys_for(step):
             if self._nvtx:
-                range_push(f"res.plan.{key}")
+                range_push(f"{phase}.{key}")
             t0 = phase_start()
             try:
                 results[key] = self._resources[key].plan(step.get(key), step.ctx)
             finally:
                 if t0 is not None:
-                    phase_end(f"res.plan.{key}", t0)
+                    phase_end(f"{phase}.{key}", t0)
                 if self._nvtx:
                     range_pop()
         return results
-
-    def compute_scope(self, step: SubmoduleStep | None):
-        """A context manager around a planned step's ``preprocess`` and forward: the
-        resources that track it (``Resource.enter_compute``) know model code is
-        addressing this step. A shared no-op when the step has none of them, so a node
-        without one pays a dict lookup at most."""
-        if step is None or not self._compute_order:
-            return _NO_SCOPE
-        keyset = frozenset(step.keys())
-        keys = self._compute_keys_cache.get(keyset)
-        if keys is None:
-            keys = self._compute_keys_cache[keyset] = [k for k in self._compute_order if k in keyset]
-        if not keys:
-            return _NO_SCOPE
-        return _ComputeScope([self._resources[k] for k in keys])
 
     def pre_admit(self, step: SubmoduleStep) -> FullAdmitOutcome:
         """admit over the pre-planning subset, a step ahead
@@ -597,6 +630,7 @@ class StepRunner:
         than the live one; the later full `plan` promotes it. Results are left
         in `ctx.plan_results` for the dependents in this same subset."""
         results = step.ctx.plan_results
+        step.ctx.plan_phase = "res.pre_plan"
         for key in self._preplan_keys_for(step):
             if self._nvtx:
                 range_push(f"res.pre_plan.{key}")
@@ -638,14 +672,19 @@ class StepRunner:
 
         Scoped to the node whose step just ran; no other node's state moved,
         and `merge_publish_info` keeps the entry it already published."""
-        order = self._sweep(self._node_publish_order, self._publish_order, node_name)
+        order = self._publishing(
+            self._sweep(self._node_publish_order, self._publish_order, node_name),
+            request_ids,
+        )
         if not order:
             return {rid: {} for rid in request_ids}
-        publishers = [(key, self._resources[key]) for key in order]
+        publishers = [(key, self._resources[key], self._unpublished[key]) for key in order]
         out: dict[str, dict[str, PublishedInfo]] = {}
         for rid in request_ids:
             per_key: dict[str, PublishedInfo] = {}
-            for key, resource in publishers:
+            for key, resource, skip in publishers:
+                if rid in skip:
+                    continue
                 info = resource.publish_for_step(
                     rid, node_name=node_name,
                     graph_walk=request_walks.get(rid, graph_walk) if request_walks else graph_walk,
@@ -668,7 +707,10 @@ class StepRunner:
         with nothing to publish has no entry. Under a combined walk each rid
         is snapshotted under its own walk (``request_walks``), as ``publish``
         does: a publisher may key what it publishes on the walk."""
-        order = self._sweep(self._node_publish_order, self._publish_order, node_name)
+        order = self._publishing(
+            self._sweep(self._node_publish_order, self._publish_order, node_name),
+            request_ids,
+        )
         if not order:
             return {}
         if request_walks:
@@ -691,7 +733,7 @@ class StepRunner:
                 per_key: dict[str, Any] = {}
                 for key, snaps in columns:
                     snap = snaps[i]
-                    if snap is not None:
+                    if snap is not None and rid not in self._unpublished[key]:
                         per_key[key] = snap
                 if per_key:
                     out[rid] = per_key
@@ -731,14 +773,19 @@ class StepRunner:
         request_walks: Mapping[int, str] | None = None,
     ) -> dict[str, dict[str, PublishedInfo]]:
         """Publish resources configured for the end of a dynamic loop."""
-        order = self._sweep(self._node_publish_order, self._publish_order, node_name)
+        order = self._publishing(
+            self._sweep(self._node_publish_order, self._publish_order, node_name),
+            request_ids,
+        )
         if not order:
             return {rid: {} for rid in request_ids}
-        publishers = [(key, self._resources[key]) for key in order]
+        publishers = [(key, self._resources[key], self._unpublished[key]) for key in order]
         out: dict[str, dict[str, PublishedInfo]] = {}
         for rid in request_ids:
             per_key: dict[str, PublishedInfo] = {}
-            for key, resource in publishers:
+            for key, resource, skip in publishers:
+                if rid in skip:
+                    continue
                 info = resource.publish_after_stop(
                     rid, node_name=node_name,
                     graph_walk=request_walks.get(rid, graph_walk) if request_walks else graph_walk,

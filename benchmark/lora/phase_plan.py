@@ -52,6 +52,8 @@ def _config(model: str, workdir: Path, mode: str, adapters: dict[str, str]) -> P
     config = yaml.safe_load((REPO / "configs" / f"{model}.yaml").read_text())
     # text-only load; the vision warmup is not what is measured
     config.pop("warmup_requests", None)
+    # the load repeats its prompts, which the prefix cache would serve unevenly by mode
+    config.setdefault("resources", {}).setdefault("kv_cache", {})["prefix_cache"] = False
     if mode != "off":
         config.setdefault("resources", {})["lora"] = {
             "max_slots": len(adapters), "max_rank": 16,

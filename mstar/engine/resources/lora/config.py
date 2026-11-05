@@ -295,16 +295,14 @@ class LoraSpec(NodeResourceSpec):
 
     ``max_slots`` adapters are resident on the device at once, beside a zero adapter that
     base-model rows use, and up to ``cpu_capacity`` are kept pinned on the host.
-    ``adapters`` maps the names requests ask for to safetensors paths. ``slot_wait_steps``
-    bounds how long a request waits for a device slot while others keep slots busy: past
-    it, requests on other adapters are held back until a slot drains (counted in the
-    pool's steps). ``module_map`` places each checkpoint module on a target; a node's
-    spec comes from ``module_lora_spec`` (``mstar.model.components.lora.modules``), whose
-    ``LoraMap`` is what binds the node's modules, and a pool built with any other
-    resolver is refused at bind. ``convert_keys`` rewrites a model-native checkpoint
-    layout first. ``declare`` gives ``num_layers``, ``targets``, ``module_map`` and
-    ``ignored_modules`` in place of passing them, on their first read: ``module_lora_spec``
-    walks a node's modules there, which a deployment that never builds the spec skips.
+    ``adapters`` maps the names requests ask for to safetensors paths. ``module_map``
+    places each checkpoint module on a target; a node's spec comes from
+    ``module_lora_spec`` (``mstar.model.components.lora.modules``), whose ``LoraMap`` is
+    what binds the node's modules, and a pool built with any other resolver is refused at
+    bind. ``convert_keys`` rewrites a model-native checkpoint layout first. ``declare``
+    gives ``num_layers``, ``targets``, ``module_map`` and ``ignored_modules`` in place of
+    passing them, on their first read: ``module_lora_spec`` walks a node's modules there,
+    which a deployment that never builds the spec skips.
 
     Opt-in (``NodeResourceSpec.opt_in``): built only for a deployment whose serving config
     has a ``resources: lora:`` block. One spec covers every node an adapter reaches (an
@@ -324,7 +322,6 @@ class LoraSpec(NodeResourceSpec):
     max_slots: int = 4
     max_rank: int = 16
     cpu_capacity: int = 16
-    slot_wait_steps: int = 256
     adapters: dict[str, str] = field(default_factory=dict)
     # serve /v1/load_lora_adapter and /v1/unload_lora_adapter, which make the server read
     # client-named paths; off, they answer 404 as vLLM's do without its opt-in
@@ -339,7 +336,9 @@ class LoraSpec(NodeResourceSpec):
     # the slot weights' dtype; None takes the nodes' compute dtype (the serving config's
     # ``autocast_dtype``), which is what their base linears run in
     dtype: torch.dtype | None = None
-    # "auto" picks Triton on CUDA and the torch reference elsewhere
+    # the kernels behind the custom ops: "auto" registers Triton's on CUDA and leaves the
+    # torch reference elsewhere; "torch" registers none, so the reference runs unless
+    # something else in the process registered Triton's (registration is process-wide)
     backend: Literal["auto", "torch", "triton"] = "auto"
     convert_keys: Callable | None = None
     # checkpoint modules this spec neither loads nor refuses: the deployment never runs
@@ -422,23 +421,21 @@ class LoraSpec(NodeResourceSpec):
         max_rank: int | None = None,
         cpu_capacity: int | None = None,
         adapters: dict[str, str] | None = None,
-        slot_wait_steps: int | None = None,
         adapter_digests: dict[str, str] | None = None,
         runtime_updates: bool | None = None,
         runtime_update_timeout_s: float | None = None,
         targets: list[str] | None = None,
     ):
-        """How many adapters stay resident, the largest rank served, which adapters this
-        deployment serves, and how long a request may wait for a slot before others are
-        held back. ``targets`` keeps only those of the model's targets: dropping the LM
-        head and embedding saves their vocabulary-sized slots, a node left with none gets
-        no pool, and an adapter that touches a dropped target is refused.
+        """How many adapters stay resident, the largest rank served, and which adapters
+        this deployment serves. ``targets`` keeps only those of the model's targets:
+        dropping the LM head and embedding saves their vocabulary-sized slots, a node left
+        with none gets no pool, and an adapter that touches a dropped target is refused.
 
         Every value is checked before any is set, so a refused override leaves the spec
         as declared."""
         sizes = {
             name: value
-            for name, value in zip(_SIZES, (max_slots, max_rank, cpu_capacity, slot_wait_steps), strict=True)
+            for name, value in zip(_SIZES, (max_slots, max_rank, cpu_capacity), strict=True)
             if value is not None
         }
         _check_sizes(sizes)
@@ -543,7 +540,7 @@ def _ignoring(
     return ignored
 
 
-_SIZES = ("max_slots", "max_rank", "cpu_capacity", "slot_wait_steps")
+_SIZES = ("max_slots", "max_rank", "cpu_capacity")
 
 
 def _check_sizes(sizes: Mapping[str, Any]) -> None:

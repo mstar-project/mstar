@@ -20,10 +20,10 @@ import torch
 from mstar.engine.engine import Engine, ExecutingBatch, SubmoduleManagement
 from mstar.engine.resources.base import EngineResourceInfo
 from mstar.engine.resources.kv import manager as manager_mod
-from mstar.engine.resources.kv.cache import PageAllocator
+from mstar.engine.resources.kv.arena import new_page_arena
 from mstar.engine.resources.kv.config import KVStep, PagedKVConfig
 from mstar.engine.resources.kv.cpu_page_pool import CPUPagePool
-from mstar.engine.resources.kv.manager import KVManager, PageArena
+from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.kv.prefix_index import PrefixIndex
 from mstar.engine.resources.recurrent.config import (
     RecurrentBlockConfig,
@@ -39,6 +39,7 @@ from mstar.engine.resources.step import (
     StepContext,
     SubmoduleStep,
 )
+from mstar.model.submodule_base import NodeSubmodule
 
 PAGE = 16
 
@@ -68,12 +69,12 @@ class _HostPoolStub(CPUPagePool):
     succeeds, so ``offload`` is gated only by the manager's own claim."""
 
     def __init__(self):
-        self.arena = PageArena(kv_cache=None, allocator=PageAllocator(64))
+        self.arena = new_page_arena(64)
         self.index = PrefixIndex(self.arena)
         self.offloaded = {}
         self._refused_logged_at = None
         self._refused_unlogged = 0
-        self.dropped = 0
+        self.dropped = self.written = self.cancelled = 0
         self._dropped_logged_at = None
 
     def copy_out(self, gpu_kv_cache, copies):
@@ -108,6 +109,7 @@ def _pool(max_slots: int) -> RecurrentStatePool:
             num_layers=1,
             blocks={"state": RecurrentBlockConfig(shape=(2, 4), dtype=torch.float32)},
             max_slots=max_slots,
+            labels=("main", "fork"),
         ),
     )
     return RecurrentStatePool.build(spec, EngineResourceInfo(device=torch.device("cpu")))
@@ -252,6 +254,7 @@ def _engine(resources: dict) -> Engine:
     eng._enable_nvtx = False
     eng._enable_profile = False
     eng._device = torch.device("cpu")
+    eng._pre_plan_done = {}
     eng._submodules = {"n": SubmoduleManagement(
         submodule=_Sub(list(resources)), forward=None, forward_batched=None,
         joint_comm_group=None, resources=resources,
@@ -303,6 +306,63 @@ def test_a_per_request_refusal_unwinds_every_resource_of_the_earlier_rows():
     assert batch.admit_error is not None
     assert pool.num_free_slots == slots, "row 1 kept its recurrent slot"
     assert pool._slots[1] == {} and pool._slots[2] == {}
+
+
+# --- a forward that raises fails its own row, on real resources --------------
+
+
+class _RaisingSub(NodeSubmodule):
+    """``_Sub``'s declaration, through the engine's own plan, preprocess,
+    forward, commit and collect."""
+
+    _keys = ("kv",)
+    declare_step = _Sub.declare_step
+
+    def prepare_inputs(self, *a, **kw):  # pragma: no cover - the test builds inputs
+        raise NotImplementedError
+
+    def forward(self, *a, **kw):  # pragma: no cover - SubmoduleManagement.forward runs
+        raise NotImplementedError
+
+
+def _forward_raising_on(row):
+    def forward(graph_walk, engine_inputs, **kwargs):
+        del graph_walk, kwargs
+        if engine_inputs.request_ids == [row]:
+            raise RuntimeError(f"forward failed for row {row}")
+        return {"token": torch.zeros(1)}
+    return forward
+
+
+def test_a_per_request_forward_that_raises_fails_only_its_row():
+    """Rows 1 and 3 commit; row 2 is failed, and holds what its admit took
+    until its removal frees it."""
+    kv = _kv("kv", pages=16)
+    eng = _engine({"kv": kv})
+    mgmt = eng._submodules["n"]
+    mgmt.submodule = _RaisingSub.__new__(_RaisingSub)
+    mgmt.forward = _forward_raising_on(2)
+    for rid in (1, 2, 3):
+        kv.ingest_request(rid, None)
+    free = kv._arena.num_free
+
+    batch = _per_request_batch([1, 2, 3], 2 * PAGE)
+    batch.inputs = [SimpleNamespace(input_seq_len=2 * PAGE, tensor_inputs={}, kwargs={})] * 3
+    out = eng._exec_per_request(batch)
+
+    assert batch.admit_error is None
+    assert set(batch.failed_requests) == {2}
+    assert set(out.per_rid_outputs[1]) == {"token"} and set(out.per_rid_outputs[3]) == {"token"}
+    assert out.per_rid_outputs[2] == {}
+    for rid in (1, 3):
+        stream = kv._streams[rid]["main"]
+        assert stream.stored_len == 2 * PAGE and not stream.step_in_flight, rid
+    failed = kv._streams[2]["main"]
+    assert failed.stored_len == 0 and failed.step_in_flight
+
+    kv.remove_request(2)
+    assert kv._arena.num_free == free - 4, "only rows 1 and 3 hold pages"
+    assert not any(rid == 2 for rid, _ in kv._admit_reserved_pages)
 
 
 # --- the recurrent pool gives back the slots a refused step took --------------

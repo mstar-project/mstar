@@ -72,7 +72,10 @@ _MM_OUT_DTYPE = hasattr(torch.ops.aten.mm, "dtype")
 # (or falls back to a torch impl), so no extra kernel package is needed. The
 # actual kernels only run on CUDA -- guarded by the ``is_cuda`` check below.
 try:
+    from mstar.utils.fused_moe import MoeAlignment, moe_block_m
     from mstar.utils.fused_moe import fused_experts as _fused_experts
+    from mstar.utils.fused_moe.route import ROUTE_ALIGN_MAX_SLOTS, route_align
+    from mstar.utils.fused_moe.runner import runs_per_pair
 
     _HAS_FUSED = True
 except Exception as e:  # pragma: no cover -- exercised only when triton missing
@@ -95,6 +98,11 @@ class TopKRouter(nn.Module):
             to (top-k).
         norm_topk_prob: if True, renormalize the top-k probabilities so
             they sum to 1.
+        fused_softmax_topk: on CUDA, route through Triton kernels instead
+            of softmax, ``torch.topk`` and the renormalize (see :meth:`route`).
+            Equal probabilities go to the lower expert id, where ``torch.topk``
+            may pick another; bf16 logits tie often, so a model opts in once it
+            has checked how often its outputs diverge.
     """
 
     def __init__(
@@ -103,11 +111,13 @@ class TopKRouter(nn.Module):
         num_experts: int,
         num_experts_per_tok: int,
         norm_topk_prob: bool = True,
+        fused_softmax_topk: bool = False,
     ) -> None:
         super().__init__()
         self.top_k = num_experts_per_tok
         self.num_experts = num_experts
         self.norm_topk_prob = norm_topk_prob
+        self.fused_softmax_topk = fused_softmax_topk
         self.weight = nn.Parameter(torch.zeros(num_experts, hidden_size))
 
     def forward(
@@ -127,8 +137,45 @@ class TopKRouter(nn.Module):
             selected_experts: ``(tokens, top_k)`` int64 indices.
             router_states_next: always ``None`` (stateless).
         """
+        routing_weights, router_indices, _ = self.route(hidden_states)
+        return routing_weights, router_indices, None
+
+    def route(
+        self, hidden_states: torch.Tensor, align_w1: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, "MoeAlignment | None"]:
+        """The weights and experts, plus the block alignment when one kernel can do both.
+
+        With ``fused_softmax_topk`` on CUDA, a batch of up to ``ROUTE_ALIGN_MAX_SLOTS``
+        renormalized slots whose block can consume an alignment (it passes its
+        ``gate_up_proj`` as ``align_w1``, and its flat batch) takes ``route_align``,
+        unless ``fused_experts`` runs it as per-pair GEMVs, which read no alignment.
+        Any other batch takes ``router_topk``, and with the flag off it's softmax,
+        ``torch.topk`` and the renormalize.
+        """
+        fused = self.fused_softmax_topk and hidden_states.is_cuda
+        tokens = hidden_states.shape[0]
+        if (
+            fused and _HAS_FUSED and align_w1 is not None and self.norm_topk_prob
+            and tokens * self.top_k <= ROUTE_ALIGN_MAX_SLOTS
+            and not runs_per_pair(hidden_states, align_w1)
+        ):
+            router_logits = F.linear(hidden_states, self.weight)
+            # int: the kernel's block sizes are constants, and a compile that keeps the
+            # token count symbolic specializes on it here, for at most these few counts
+            tokens = int(tokens)
+            return route_align(
+                router_logits, self.top_k, moe_block_m(tokens, align_w1, self.top_k),
+                router_logits.dtype, softmax=True,
+            )
         hidden_states = hidden_states.reshape(-1, hidden_states.shape[-1])
         router_logits = F.linear(hidden_states, self.weight)
+        if fused:
+            from mstar.utils.fused_moe.decode import router_topk
+
+            routing_weights, router_indices = router_topk(
+                router_logits, None, self.top_k, 1.0, self.norm_topk_prob, softmax=True,
+            )
+            return routing_weights, router_indices, None
         router_logits = F.softmax(router_logits, dtype=torch.float, dim=-1)
 
         router_top_value, router_indices = torch.topk(router_logits, self.top_k, dim=-1)
@@ -256,19 +303,33 @@ def dispatch_experts_fused(
     return final_hidden_states
 
 
+def _route(
+    gate: nn.Module, flat: torch.Tensor, align_w1: torch.Tensor | None, router_states: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, "MoeAlignment | None"]:
+    """``gate``'s output plus the alignment ``fused_experts`` would otherwise
+    compute, which a :class:`TopKRouter` may give a block that passes ``align_w1``."""
+    if type(gate) is TopKRouter:
+        weights, experts, alignment = gate.route(flat, align_w1)
+        return weights, experts, None, alignment
+    return (*gate(flat, router_states), None)
+
+
 def _sync_routing(
     comm_group: CommGroup,
     routing_weights: torch.Tensor,
     selected_experts: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Make every rank use group rank 0's top-k.
+    """Make every rank use group rank 0's top-k. Expert parallelism only.
 
     Ranks compile the router separately, so a near-tie can resolve
-    differently per rank; sharded dispatch would then give a token more or
-    fewer than k experts. Both tensors travel in one fp32 tensor, which holds
-    expert ids below 2**24 and bf16/fp16/fp32 weights exactly. Other ranks
-    send zeros, so the all-reduce is an exact broadcast; a plain
-    ``dist.broadcast`` is not dynamo-traceable and would break the graph.
+    differently per rank; EP dispatch would then give a token more or fewer
+    than k experts. Under tensor parallelism each rank runs all k slots on its
+    slice of every expert, so a disagreement only mixes two experts' slices in
+    one slot, and the all-reduce after the experts has the same shape either
+    way: not worth an all-reduce per MoE layer. Both tensors travel in one fp32
+    tensor, which holds expert ids below 2**24 and bf16/fp16/fp32 weights
+    exactly. Other ranks send zeros, so the all-reduce is an exact broadcast; a
+    plain ``dist.broadcast`` is not dynamo-traceable and would break the graph.
     """
     top_k = selected_experts.shape[-1]
     packed = torch.cat([selected_experts.float(), routing_weights.float()], dim=-1)
@@ -374,6 +435,7 @@ class FusedExperts(nn.Module):
         routing_weights: torch.Tensor,
         selected_experts: torch.Tensor,
         token_valid: torch.Tensor | None = None,
+        alignment: "MoeAlignment | None" = None,
     ) -> torch.Tensor:
         """This rank's ``(tokens, hidden)`` share of the routing-weighted expert sum.
 
@@ -381,6 +443,11 @@ class FusedExperts(nn.Module):
         CUDA-graph padding rows False. Their slots, and under EP the slots routed to other
         ranks' experts, go to the local sentinel ``num_local_experts`` and reach no GEMM.
         Every shape is static, so this stays torch.compile and CUDA-graph safe.
+
+        ``alignment`` is a :class:`TopKRouter`'s alignment of ``selected_experts`` against
+        ``gate_up_proj`` (see :meth:`TopKRouter.route`), which the kernel then skips
+        computing. It holds only while no slot moves to the sentinel: without
+        ``token_valid``, with every expert local.
         """
         keep = None if token_valid is None else token_valid[:, None]
         if self.num_local_experts != self.num_experts:
@@ -388,10 +455,12 @@ class FusedExperts(nn.Module):
             owned = (selected_experts >= 0) & (selected_experts < self.num_local_experts)
             keep = owned if keep is None else keep & owned
         if keep is not None:
+            if alignment is not None:
+                raise ValueError("an alignment of the router's experts is stale once slots move to the sentinel")
             selected_experts = torch.where(keep, selected_experts, self.num_local_experts)
             # skipped slots never reach a GEMM; zeroing their weight is belt-and-braces
             routing_weights = torch.where(keep, routing_weights, 0)
-        return self._dispatch(hidden_states, routing_weights, selected_experts, keep is not None)
+        return self._dispatch(hidden_states, routing_weights, selected_experts, keep is not None, alignment)
 
     def _dispatch(
         self,
@@ -399,12 +468,13 @@ class FusedExperts(nn.Module):
         routing_weights: torch.Tensor,
         selected_experts: torch.Tensor,
         skip_invalid: bool,
+        alignment: "MoeAlignment | None" = None,
     ) -> torch.Tensor:
         """The fused Triton kernel on a GPU, else the naive loop, over local ids."""
         if _HAS_FUSED and hidden_states.is_cuda:
             return _fused_experts(
                 hidden_states, self.gate_up_proj, self.down_proj,
-                routing_weights, selected_experts, skip_invalid=skip_invalid,
+                routing_weights, selected_experts, skip_invalid=skip_invalid, alignment=alignment,
             )
         return dispatch_experts_fused(
             hidden_states, self.gate_up_proj, self.down_proj, self.num_local_experts,
@@ -531,11 +601,11 @@ def _down_proj_fp8_weight_loader(
 class ParallelSparseMoeBlock(nn.Module):
     """Top-K sparse MoE over a tensor-parallel group, with an optional shared expert.
 
-    The router is replicated; over several ranks :func:`_sync_routing` makes every rank
-    use rank 0's top-k, the experts (:class:`FusedExperts`) compute each rank's partial
-    sum, and one all-reduce adds them up. With ``tp_size == 1`` there is no
+    The router is replicated, the experts (:class:`FusedExperts`) compute each rank's
+    partial sum, and one all-reduce adds them up. With ``tp_size == 1`` there is no
     communication. With ``expert_parallel`` each rank holds whole experts instead of a
-    slice of every expert.
+    slice of every expert, and :func:`_sync_routing` first makes every rank use rank 0's
+    top-k.
 
     With a ``shared_expert`` (any ``hidden -> hidden`` module, a ``ParallelGatedMLP`` on
     the same group reducing its own output) the output is::
@@ -571,6 +641,7 @@ class ParallelSparseMoeBlock(nn.Module):
         self.num_experts = num_experts
         self.num_experts_per_tok = num_experts_per_tok
         self.moe_intermediate_size = moe_intermediate_size
+        self.expert_parallel = expert_parallel
 
         self.gate = router if router is not None else TopKRouter(
             hidden_size=hidden_size,
@@ -622,7 +693,11 @@ class ParallelSparseMoeBlock(nn.Module):
         flat = hidden_states.view(-1, hidden_dim).contiguous()
         shared = None if self.shared_expert is None else self.shared_expert(flat)
 
-        routing_weights, selected_experts, router_states_next = self.gate(flat, router_states)
+        # the experts move slots to the sentinel under a mask or EP, and TP > 1 doesn't align
+        can_align = token_valid is None and self.comm_group.world_size == 1
+        routing_weights, selected_experts, router_states_next, alignment = _route(
+            self.gate, flat, self.experts.gate_up_proj if can_align else None, router_states,
+        )
         if self.track_expert_load:
             ids = selected_experts.flatten()
             if token_valid is None:
@@ -630,11 +705,11 @@ class ParallelSparseMoeBlock(nn.Module):
             else:
                 ones = token_valid[:, None].expand_as(selected_experts).flatten().to(torch.int64)
             self.expert_load.index_add_(0, ids, ones)
-        if self.comm_group.world_size > 1:
+        if self.expert_parallel and self.comm_group.world_size > 1:
             routing_weights, selected_experts = _sync_routing(
                 self.comm_group, routing_weights, selected_experts,
             )
-        out = self.experts(flat, routing_weights, selected_experts, token_valid=token_valid)
+        out = self.experts(flat, routing_weights, selected_experts, token_valid=token_valid, alignment=alignment)
         if self.comm_group.world_size > 1:
             out = self.comm_group.all_reduce(out)
         if shared is not None:

@@ -41,6 +41,7 @@ from pathlib import Path
 
 import torch
 
+from mstar.engine.resources.lora.checkpoint import LoraFile
 from mstar.model.components.diffusion.lora import apply_loras
 from mstar.model.components.diffusion.qwen3.encoder import Qwen3EncoderConfig, Qwen3HiddenStateEncoder
 from mstar.model.components.diffusion.qwen3.weight_loading import (
@@ -55,7 +56,6 @@ from mstar.model.components.diffusion.weight_loading import (
     load_native,
     materialize,
 )
-from mstar.model.components.lora import LoraFile
 from mstar.model.flux2_klein.components.transformer import Flux2DiT
 from mstar.model.flux2_klein.components.vae import Flux2VAE, remap_flux2_vae_key
 from mstar.model.flux2_klein.config import Flux2KleinConfig

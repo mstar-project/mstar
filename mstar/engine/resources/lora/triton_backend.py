@@ -32,7 +32,7 @@ import torch
 import triton
 import triton.language as tl
 
-from mstar.engine.resources.lora.ops import LoraOpsBackend, lora_apply_, lora_expand_, lora_shrink
+from mstar.engine.resources.lora.ops import lora_apply_, lora_expand_, lora_shrink
 
 # fused slices the expand kernel takes in one launch (q/k/v, gate/up, a delta-net's
 # q / k / v / z / a / b)
@@ -300,6 +300,3 @@ lora_shrink.register_kernel("cuda")(_shrink_cuda)
 lora_expand_.register_kernel("cuda")(_expand_cuda)
 lora_apply_.register_kernel("cuda")(_apply_cuda)
 
-
-class TritonLoraBackend(LoraOpsBackend):
-    """The custom ops with the kernels above registered for CUDA."""

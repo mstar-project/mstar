@@ -9,10 +9,12 @@ protocol are untouched):
 
     frontend -> bridge:  {t:"submit", rid, sub, text, file_paths,
                           input_modalities, output_modalities, model_kwargs,
-                          prompt_parts, streaming} | {t:"abort", rid, sub}
+                          prompt_parts, streaming, accepts_chunks}
+                       | {t:"abort", rid, sub}
                        | {t:"ping", rid, sub}
                        | {t:"metrics", rid, sub, refusals:{route, status, count}}
     bridge -> frontend:  {t:"chunk", rid, sub, modality, data(bin), metadata}
+                       | {t:"chunks", subs, modalities, payloads(bin), metadatas}
                        | {t:"err", rid, sub, msg} | {t:"done", rid, sub}
                        | {t:"pong", rid, sub}
                        | {t:"metrics", rid, sub, data(bin), metadata}
@@ -23,6 +25,14 @@ exports as ``mstar_http_refusals_total``. The reply is what ``GET /metrics``
 serves on the Python frontend: the text rendered from ``APIServer.metrics``
 with its ``content_type`` in ``metadata``, or empty ``metadata`` when metrics
 are off (a 404; the counts are then ignored).
+
+``chunks`` carries many submissions' chunks as parallel lists, in order:
+the API server's message thread hands the bridge every chunk it drained in
+one pass (``APIServer.relay_chunks_to``), so a decode step costs one message
+rather than one per request. Only a submit that sets ``accepts_chunks`` gets
+them, so a frontend binary older than this bridge still gets ``chunk``s. A
+submission's error chunk, and anything its handler finds unrelayed at the
+end, always goes out as ``chunk``.
 
 ``sub`` names one submission and is never reused. A client may resubmit its
 ``rid`` as soon as it drops a stream, and that stream's ``done`` or late
@@ -49,6 +59,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sysconfig
@@ -60,8 +71,10 @@ from mstar.communication.rust_communicator import (
     MsgpackCodec,
     RustZMQCommunicator,
 )
+from mstar.graph.runtime.utils import CHECKOUT_RUST, is_mstar_rust_crate, require_rust_extension
 from mstar.model.multimodal import PromptPart
 from mstar.utils.client_errors import client_error_text
+from mstar.utils.threads import ThreadPool
 
 logger = logging.getLogger(__name__)
 
@@ -86,26 +99,68 @@ def openai_adapter_class(model_name: str) -> str:
 
 
 
-def find_server_binary(explicit: str | None = None) -> str:
+def find_server_binary(explicit: str | None = None, rust_dir: Path = CHECKOUT_RUST) -> str:
     """Resolve the ``mstar-server`` binary: explicit arg, ``MSTAR_SERVER_BIN``,
     the running environment's scripts directory (where a Linux wheel installs
     it, also when the venv is not activated), ``$PATH``, then the in-repo
     release build. The scripts directory goes before ``$PATH`` so another
-    environment's older binary never serves this one's bridge."""
-    for candidate in (
-        explicit,
-        os.getenv("MSTAR_SERVER_BIN"),
-        str(Path(sysconfig.get_path("scripts")) / "mstar-server"),
-        shutil.which("mstar-server"),
-        str(Path(__file__).resolve().parents[2]
-            / "rust" / "server" / "target" / "release" / "mstar-server"),
+    environment's older binary never serves this one's bridge.
+
+    In a checkout, a binary built from other sources than ``rust_dir`` is
+    skipped, or used with a warning when named by the arg or the variable.
+    Raises FileNotFoundError when there is none, RuntimeError when all are
+    stale."""
+    checkout = is_mstar_rust_crate(rust_dir)
+    if checkout:
+        require_rust_extension()  # its source_hash is what binaries are compared with
+    stale = []
+    for candidate, named in (
+        (explicit, True),
+        (os.getenv("MSTAR_SERVER_BIN"), True),
+        (str(Path(sysconfig.get_path("scripts")) / "mstar-server"), False),
+        (shutil.which("mstar-server"), False),
+        (str(rust_dir / "server" / "target" / "release" / "mstar-server"), False),
     ):
-        if candidate and Path(candidate).is_file():
+        if not (candidate and Path(candidate).is_file()):
+            continue
+        problem = _stale_server(candidate, rust_dir) if checkout else None
+        if problem is None:
             return candidate
+        if named:
+            logger.warning("Using mstar-server %s, which %s", candidate, problem)
+            return candidate
+        stale.append(f"{candidate} {problem}")
+    if stale:
+        # Both touches, for the reason in require_rust_extension.
+        server = rust_dir / "server"
+        raise RuntimeError(
+            f"No mstar-server built from {rust_dir}: {'; '.join(stale)}. Rebuild it with "
+            f"`touch {rust_dir / 'build.rs'} {server / 'build.rs'} && "
+            f"cargo build --release --manifest-path {server / 'Cargo.toml'}`.")
     raise FileNotFoundError(
         "mstar-server binary not found: build it with "
         "`cargo build --release` in rust/server/, put it on $PATH, or set "
         "MSTAR_SERVER_BIN")
+
+
+def _stale_server(binary: str, rust_dir: Path) -> str | None:
+    """Why ``binary`` was not built from the sources in ``rust_dir``, or None."""
+    import mstar_rust
+
+    # No arguments, which every mstar-server exits on (an older one would
+    # serve `--source-hash` as a model name); a newer one prints its sources.
+    try:
+        ran = subprocess.run([binary], capture_output=True, text=True, errors="replace", timeout=30, check=False)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return f"could not be run ({e})"
+    built = re.search(r"built from sources ([0-9a-f]{16}) ([0-9a-f]{16})", ran.stdout + ran.stderr)
+    if built is None:
+        return "predates the source check"
+    current = (mstar_rust.source_hash(str(rust_dir)), mstar_rust.source_hash(str(rust_dir / "server")))
+    if built.groups() == current:
+        return None
+    return (f"was built from sources hashing to {' '.join(built.groups())}, "
+            f"but {rust_dir} and its server/ hash to {' '.join(current)}")
 
 
 def launch_rust_server(binary: str, model_name: str, port: int,
@@ -146,6 +201,8 @@ class RustFrontendBridge:
         self.running = True
         # sub -> its submission's key, until its relay ends.
         self._keys: dict[int, str] = {}
+        # set by _serve; the API server's message thread schedules relay() on it
+        self.loop: asyncio.AbstractEventLoop | None = None
 
     # -- outbound ----------------------------------------------------------
 
@@ -154,6 +211,15 @@ class RustFrontendBridge:
 
     def _err(self, rid: str, sub: int | None, detail: str) -> None:
         self._send({"t": "err", "rid": rid, "sub": sub, "msg": detail})
+
+    def relay(self, tags: list[int], chunks: list) -> None:
+        """``ChunkSink.relay``: one ``chunks`` message for a message pass."""
+        self._send({
+            "t": "chunks", "subs": tags,
+            "modalities": [c.modality for c in chunks],
+            "payloads": [bytes(c.data) for c in chunks],
+            "metadatas": [c.metadata for c in chunks],
+        })
 
     # -- request lifecycle ---------------------------------------------------
 
@@ -206,7 +272,9 @@ class RustFrontendBridge:
             return
         # Bound to this submission now, not when the task first runs: a later
         # submit in the same receive batch may reuse the rid.
-        self._keys[sub] = self.server.submission_key(rid)
+        key = self._keys[sub] = self.server.submission_key(rid)
+        if msg.get("accepts_chunks"):
+            self.server.relay_chunks_to(key, self, sub)
         chunks = self.server.iter_result_chunks(rid)
         asyncio.get_running_loop().create_task(self._relay(rid, sub, chunks))
 
@@ -273,7 +341,11 @@ class RustFrontendBridge:
 
     async def _serve(self) -> None:
         logger.info("Rust-frontend bridge serving")
-        loop = asyncio.get_running_loop()
+        loop = self.loop = asyncio.get_running_loop()
+        # asyncio would start its default pool from this thread, and so on
+        # the result CPU when the bridge is pinned; handlers' to_thread work
+        # (audio planning, request decoding) belongs on the process mask
+        loop.set_default_executor(ThreadPool(thread_name_prefix="mstar-bridge"))
         # Blocking receive on an executor thread: the wait happens inside the
         # transport (GIL released), so an arriving submit is picked up
         # immediately instead of on the next tick of a sleep/poll loop — and
@@ -300,6 +372,12 @@ class RustFrontendBridge:
 
     def run(self) -> None:
         """Blocking serve loop (the ``uvicorn.run`` replacement)."""
+        # with the message thread: tokens pass from it to this loop. The Rust
+        # process is already running, so it keeps the process mask. Test doubles
+        # stand in for the server without the pin.
+        pin = getattr(self.server, "pin_result_thread", None)
+        if pin is not None:
+            pin()
         try:
             asyncio.run(self._serve())
         except KeyboardInterrupt:

@@ -8,25 +8,25 @@ reports emitting (``WorkerGraphsDone.output_signal_names``, one name per
 chunk, from every rank), and the API server compares that with what it has
 received.
 
-These drive the real Python graph runtime, the conductor's report handling and
-the API server's bookkeeping; ``test/rust/test_delivery_chunk_counts_rust.py``
-runs the same request on the Rust runtime.
+These drive the real graph runtime, the conductor's report handling and the
+API server's bookkeeping, reading the frames off real inboxes;
+``test/rust/test_delivery_chunk_counts_rust.py`` has the inline-token script.
 """
 from types import SimpleNamespace
 
 import pytest
 import torch
+from api_server_helpers import StandInSocket
+from rust_runtime import Inboxes, build_runtime
 
-from mstar.api_server.data_worker import PreprocessWorker
+from mstar.api_server.data_worker import InlineTokens, PreprocessWorker
 from mstar.api_server.request_types import ResultTensors, ResultTokens
-from mstar.communication.tensor_store import TensorStore
-from mstar.communication.tensors import TensorCommunicationManager
+from mstar.communication.event import EventWakeup
 from mstar.conductor.conductor import Conductor, RequestData
 from mstar.conductor.request_info import CurrentForwardConductorMetadata, PartitionState
 from mstar.distributed.base import ShardingConfig
 from mstar.graph.base import GraphEdge, GraphNode, Loop, TensorPointerInfo
 from mstar.graph.runtime.base import ColumnarEdgeSpecs, RouteInput, SendInput
-from mstar.graph.runtime.python import PythonGraphRuntime
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import WorkerGraph
 from mstar.utils.containers import ParallelList
@@ -85,7 +85,7 @@ def drive(runtime, put, prefills: int, decode_steps: int, inline: bool = False) 
 
     ``put(uuid)`` registers a produced tensor with the runtime's store, as the
     worker's prologue does. ``inline`` sends the decode tokens as inline values
-    (the Rust runtime's RESULT_TOKENS path).
+    (the RESULT_TOKENS path).
     """
     rid = runtime.add_request(
         request_id="r1", partition="default", graph_walk=PREFILL,
@@ -164,10 +164,7 @@ def api_server() -> PreprocessWorker:
 def deliver(worker: PreprocessWorker, chunk) -> None:
     """One chunk message as the API server's message loop hands it over."""
     if isinstance(chunk, ResultTokens):
-        for i, rid in enumerate(chunk.request_ids):
-            worker.new_result_token(
-                rid, chunk.values[i], chunk.loop_indices[i], chunk.signal, chunk.modality,
-            )
+        worker.new_result_tokens(chunk.request_ids, chunk.values, chunk.signal, chunk.modality)
     else:
         assert isinstance(chunk, ResultTensors)
         worker.new_result_tensors(chunk)
@@ -185,73 +182,47 @@ def assert_holds_until_last_chunk(chunks: list, reports: list[WorkerGraphsDone])
     assert worker.received_final_chunks("r1", counts)
 
 
-class _Recorder:
-    def __init__(self):
-        self.sent = []
-
-    def send(self, entity_id, msg):
-        self.sent.append((entity_id, msg))
-
-    def chunks(self):
-        return [m.body for e, m in self.sent if e == "api_server"]
-
-    def reports(self):
-        return [m.body for e, m in self.sent
-                if e == "conductor" and m.message_type == ConductorMessageType.WORKER_GRAPHS_DONE]
-
-
-class _TensorManager:
-    """What the Python runtime needs of the manager: a real store underneath."""
-
-    stamps_shm_placement = False
-    refresh_shm_placement = TensorCommunicationManager.refresh_shm_placement
-    set_output_ref_counts = TensorCommunicationManager.set_output_ref_counts
-
-    def __init__(self):
-        self.tensor_store = TensorStore()
-
-    def set_persist(self, uuid, persist):
-        self.tensor_store.set_metadata(uuid, persist=persist)
-
-    def increment_ref(self, uuid, n=1):
-        self.tensor_store.increment_ref(uuid, n=n)
-
-    def dereference_batch(self, uuids, counts):
-        self.tensor_store.dereference_batch(uuids, counts)
-
-    def dereference_batch_uniform(self, uuids, n=1):
-        pass
-
-
-def python_runtime(decode_steps: int):
-    manager = _TensorManager()
-    recorder = _Recorder()
-    runtime = PythonGraphRuntime(
-        my_worker_graphs=worker_graphs(decode_steps), tensor_manager=manager,
-        communicator=recorder, **RUNTIME_KWARGS,
-    )
+def new_runtime(decode_steps: int, path, **overrides):
+    """The runtime, its ``put``, and a read of what it sent: the chunks to the
+    API server and the WORKER_GRAPHS_DONE reports."""
+    kwargs = {**RUNTIME_KWARGS, **overrides}
+    inboxes = Inboxes(kwargs["my_worker_id"], path)
+    runtime = build_runtime(my_worker_graphs=worker_graphs(decode_steps), inboxes=inboxes, **kwargs)
+    book = runtime.tensor_store.bookkeeping
 
     def put(uuid):
-        manager.tensor_store.put_tensor("r1", uuid, torch.ones(1), tensor_info(uuid))
+        book.put_tensor(uuid, tensor_info(uuid))
+        book.increment_ref(uuid, 1)  # the worker's safety hold
 
-    return runtime, put, recorder
+    def sent():
+        reports = [
+            m.body for e, m in inboxes.sent
+            if e == "conductor" and m.message_type == ConductorMessageType.WORKER_GRAPHS_DONE
+        ]
+        return inboxes.bodies("api_server"), reports
+
+    return runtime, put, sent
 
 
+@pytest.mark.parametrize("inline", [False, True], ids=["tensor", "inline"])
 @pytest.mark.parametrize("shape", list(SHAPES))
-def test_request_is_held_until_its_last_chunk(shape):
+def test_request_is_held_until_its_last_chunk(shape, inline, tmp_path):
     prefills, decode_steps = SHAPES[shape]
-    runtime, put, recorder = python_runtime(decode_steps)
-    drive(runtime, put, prefills, decode_steps)
-    assert len(recorder.chunks()) == prefills + decode_steps
-    assert_holds_until_last_chunk(recorder.chunks(), recorder.reports())
+    runtime, put, sent = new_runtime(decode_steps, tmp_path)
+    drive(runtime, put, prefills, decode_steps, inline=inline)
+    chunks, reports = sent()
+    assert len(chunks) == prefills + decode_steps
+    assert sum(isinstance(c, ResultTokens) for c in chunks) == (decode_steps if inline else 0)
+    assert_holds_until_last_chunk(chunks, reports)
 
 
-class _ScriptedApiComm:
+class _ScriptedApiComm(StandInSocket):
     """The API server's inbox: one scripted batch per loop pass, stopping the
     loop when the script runs out. Records whether the client had been
     released before each pass."""
 
     def __init__(self, server, batches, req):
+        super().__init__()
         self.server, self.batches, self.req = server, list(batches), req
         self.released_before = []
 
@@ -263,7 +234,8 @@ class _ScriptedApiComm:
         return self.batches.pop(0)
 
 
-def test_completion_that_overtakes_the_last_chunks_waits_for_them():
+@pytest.mark.parametrize("inline", [False, True], ids=["tensor", "inline"])
+def test_completion_that_overtakes_the_last_chunks_waits_for_them(inline, tmp_path):
     """Through the API server's real message loop: ``request_complete``
     arrives after two of the five chunks, the rest a pass later each. The
     client is released only once the fifth has been read, never with a
@@ -276,11 +248,11 @@ def test_completion_that_overtakes_the_last_chunks_waits_for_them():
     from mstar.api_server.request_types import APIServerMessage, RequestComplete, ResultChunk
     from mstar.profile.format import RequestProfile
 
-    runtime, put, recorder = python_runtime(SHAPES["text_image_text"][1])
-    drive(runtime, put, *SHAPES["text_image_text"])
-    chunks = recorder.chunks()
+    runtime, put, sent = new_runtime(SHAPES["text_image_text"][1], tmp_path)
+    drive(runtime, put, *SHAPES["text_image_text"], inline=inline)
+    chunks, reports = sent()
     complete = APIServerMessage(message_type="request_complete", body=RequestComplete(
-        request_id="r1", output_chunk_counts=expected_counts(recorder.reports()),
+        request_id="r1", output_chunk_counts=expected_counts(reports),
         conductor_ingest_time=0.0, conductor_finish_time=0.0,
     ))
 
@@ -291,10 +263,14 @@ def test_completion_that_overtakes_the_last_chunks_waits_for_them():
     worker.profile_queue = queue.Queue()
     worker.reads_done_queue = queue.Queue()
     worker._signal = lambda: None
-    # the data worker's thread, collapsed: a queued read completes at once
-    worker.result_tensor_input_queue = SimpleNamespace(put=lambda item: worker.output_queue.put(
-        ResultChunk(request_id=item.request_id, modality="text", data=b"x", metadata={}),
-    ))
+    worker.results_wakeup = EventWakeup()
+
+    # the data worker's thread, collapsed: a queued read completes at once, and
+    # a frame's inline values (one InlineTokens per frame) give a chunk per request
+    def complete_at_once(item):
+        for rid in item.request_ids if isinstance(item, InlineTokens) else [item.request_id]:
+            worker.output_queue.put(ResultChunk(request_id=rid, modality="text", data=b"x", metadata={}))
+    worker.result_tensor_input_queue = SimpleNamespace(put=complete_at_once)
 
     server = object.__new__(APIServer)
     server.running = True
@@ -312,7 +288,8 @@ def test_completion_that_overtakes_the_last_chunks_waits_for_them():
     server.pending_requests = {"r1": req}
 
     def msg(body):
-        return APIServerMessage(message_type="result_tensors", body=body)
+        kind = "result_tokens" if isinstance(body, ResultTokens) else "result_tensors"
+        return APIServerMessage(message_type=kind, body=body)
 
     batches = [[msg(chunks[0]), msg(chunks[1])], [complete], []] + [[msg(c)] for c in chunks[2:]] + [[]]
     server.communicator = _ScriptedApiComm(server, batches, req)
@@ -320,9 +297,9 @@ def test_completion_that_overtakes_the_last_chunks_waits_for_them():
 
     assert req.event.is_set() and req.error is None
     assert len(req.chunks) == len(chunks)
-    # Not released until the pass after the one that read the last chunk (the
-    # loop prunes at the top of a pass); before the fix it was released right
-    # after request_complete.
+    # Released by the pass that read the last chunk (the loop prunes at the
+    # end of a pass), so the next pass is the first to see it; before the fix
+    # it was released right after request_complete.
     released = server.communicator.released_before
     last_chunk_pass = len(batches) - 2
     assert released.index(True) == last_chunk_pass + 1, released

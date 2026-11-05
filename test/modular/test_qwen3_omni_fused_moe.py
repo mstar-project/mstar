@@ -60,15 +60,21 @@ def _seed():
 # ------------------------------------------------------------------
 
 
+# 1 and 4 tokens take the per-pair GEMV path (fused_moe.decode) where its tiles fit, 16 and 64
+# the grouped GEMMs; reduce_results=False is the TP path, summed after the all-reduce.
 @pytest.mark.parametrize("num_tokens", [1, 4, 16, 64])
 @pytest.mark.parametrize(
     "hidden,inter,num_experts,top_k",
     [
         (2048, 768, 128, 8),  # Thinker
         (1024, 384, 128, 8),  # Talker routed experts
+        (1024, 192, 128, 8),  # Talker at TP2: the per-pair tiles don't divide it
+        (1024, 96, 128, 8),  # Talker at TP4: a tile clamped to 96 isn't a power of two
     ],
 )
-def test_fused_experts_numerical_parity(num_tokens, hidden, inter, num_experts, top_k):
+@pytest.mark.parametrize("reduce_results", [True, False])
+def test_fused_experts_numerical_parity(num_tokens, hidden, inter, num_experts, top_k,
+                                        reduce_results):
     from mstar.utils.fused_moe import fused_experts
 
     device = torch.device("cuda")
@@ -85,7 +91,11 @@ def test_fused_experts_numerical_parity(num_tokens, hidden, inter, num_experts, 
         norm_topk_prob=True,
     )
 
-    fused_out = fused_experts(hidden_states, w1, w2, topk_weights, topk_ids)
+    fused_out = fused_experts(hidden_states, w1, w2, topk_weights, topk_ids,
+                              reduce_results=reduce_results)
+    if not reduce_results:
+        assert fused_out.shape == (num_tokens, top_k, hidden)
+        fused_out = fused_out.float().sum(1).to(dtype)
     naive_out = _dispatch_experts_fused(
         hidden_states,
         w1,
@@ -100,6 +110,30 @@ def test_fused_experts_numerical_parity(num_tokens, hidden, inter, num_experts, 
     # bf16 accumulation -> loose tolerance; sglang uses atol=2e-2 in its
     # own parity tests so match that here.
     torch.testing.assert_close(fused_out, naive_out, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize("num_tokens", [1, 4])
+@pytest.mark.parametrize("hidden,inter", [(2048, 768), (1024, 384)])  # Thinker, Talker
+@pytest.mark.parametrize("reduce_results", [True, False])
+def test_fused_experts_compiled_matches_eager(num_tokens, hidden, inter, reduce_results):
+    """The Thinker and Talker forwards are compiled, so ``fused_experts``' few-token path
+    (the per-pair GEMV kernels) runs traced by Inductor."""
+    from mstar.utils.fused_moe import fused_experts
+
+    torch._dynamo.reset()
+    device, dtype, num_experts, top_k = torch.device("cuda"), torch.bfloat16, 128, 8
+    hidden_states = torch.randn(num_tokens, hidden, device=device, dtype=dtype)
+    w1 = torch.randn(num_experts, 2 * inter, hidden, device=device, dtype=dtype) * 0.02
+    w2 = torch.randn(num_experts, hidden, inter, device=device, dtype=dtype) * 0.02
+    topk_weights, topk_ids = _random_router_output(hidden_states, num_experts, top_k, norm_topk_prob=True)
+
+    def run(x, w):
+        return fused_experts(x, w1, w2, w, topk_ids, reduce_results=reduce_results)
+
+    eager = run(hidden_states, topk_weights)
+    compiled = torch.compile(run)(hidden_states, topk_weights)
+
+    torch.testing.assert_close(compiled, eager, atol=1e-3, rtol=1e-3)
 
 
 # ------------------------------------------------------------------

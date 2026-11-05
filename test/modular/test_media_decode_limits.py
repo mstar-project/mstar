@@ -21,6 +21,7 @@ from mstar.model.media_limits import (
     probe_video,
     read_image,
 )
+from mstar.utils.cpus import CpuPlan
 
 # by path: importing the package would import the Qwen3-Omni model, which needs flashinfer
 _spec = importlib.util.spec_from_file_location(
@@ -189,12 +190,13 @@ def test_unreadable_image_is_a_client_error_without_the_path(tmp_path):
     assert "secret-name" not in str(info.value)
 
 
-def test_waypoint_and_flux2_loaders_check_the_header(tmp_path, no_decode):
+def test_model_image_loaders_check_the_header(tmp_path, no_decode):
     from mstar.model.flux2_klein.flux2_klein_model import Flux2KleinModel
+    from mstar.model.lingbot_world.lingbot_world_model import LingBotWorldModel
     from mstar.model.waypoint.waypoint_model import WaypointModel
 
     path = _png(tmp_path / "bomb.png", 30_000, 30_000, rows=0)
-    for cls in (WaypointModel, Flux2KleinModel):
+    for cls in (WaypointModel, Flux2KleinModel, LingBotWorldModel):
         with pytest.raises(ValueError, match="limit"):
             cls.load_image(None, path, "cpu")
 
@@ -223,9 +225,10 @@ class _Metadata:
     average_fps: float = 30.0
 
 
-def _fake_torchcodec(monkeypatch, pulled, metadata=None, opened=None):
+def _fake_torchcodec(monkeypatch, pulled, metadata=None, opened=None, key_frames=None):
     class FakeDecoder:
-        def __init__(self, *_args, **kwargs):
+        def __init__(self, source=None, *_args, **kwargs):
+            self.source = source
             self.metadata = metadata or _Metadata()
             if opened is not None:
                 opened.append(kwargs)
@@ -243,9 +246,20 @@ def _fake_torchcodec(monkeypatch, pulled, metadata=None, opened=None):
             return torch.zeros(3, 64, 64, dtype=torch.uint8)
 
         def get_frames_at(self, indices):
+            if isinstance(self.source, str):
+                pathlib.Path(self.source).read_bytes()  # a decoder on a path reads the file to decode
             pulled.extend(indices)
-            return torch.zeros(len(indices), 3, self.metadata.height, self.metadata.width, dtype=torch.uint8)
+            # every pixel of a frame holds its index (mod 256), to tell the frames apart
+            frames = (torch.tensor(indices, dtype=torch.int64) % 256).to(torch.uint8)
+            return frames.view(-1, 1, 1, 1).expand(-1, 3, self.metadata.height, self.metadata.width)
 
+    if key_frames is not None:  # what _get_key_frame_indices returns, or the exception it raises
+        def _get_key_frame_indices(self):
+            if isinstance(key_frames, Exception):
+                raise key_frames
+            return key_frames
+
+        FakeDecoder._get_key_frame_indices = _get_key_frame_indices
     decoders = types.ModuleType("torchcodec.decoders")
     decoders.VideoDecoder = FakeDecoder
     monkeypatch.setitem(sys.modules, "torchcodec", types.ModuleType("torchcodec"))
@@ -272,6 +286,70 @@ def test_vjepa2_refuses_sampled_frames_over_the_budget_before_decoding(monkeypat
     with pytest.raises(ValueError, match="MSTAR_MAX_VIDEO_PIXELS"):
         model.load_video("clip.mp4", "cpu")
     assert pulled == []
+
+
+def test_vjepa2_refuses_a_video_without_load_video_metadata():
+    """A video tensor it can't decode is an error, not a request without a video."""
+    from mstar.model.vjepa2.vjepa2_model import VJepa2Model
+
+    model = VJepa2Model("unused", skip_weight_loading=True)
+    with pytest.raises(ValueError, match="load_video"):
+        model.process_prompt(None, ["video"], ["video"], tensors={"video_inputs": [torch.zeros(8, 3, 64, 64)]})
+
+
+@pytest.mark.parametrize("kwargs, decoded", [
+    ({"rollout_horizon": 0}, 64),
+    ({"rollout_horizon": 4}, 8),
+    # the encoder-only walk encodes the whole clip, whatever horizon the request names
+    ({"rollout_horizon": 4, "skip_predictor": True}, 64),
+])
+def test_vjepa2_ac_decodes_only_the_frames_its_walk_encodes(monkeypatch, tmp_path, kwargs, decoded):
+    from mstar.model.vjepa2.vjepa2_model import VJepa2Model
+
+    pulled = []
+    _fake_torchcodec(monkeypatch, pulled, _Metadata(num_frames=1000, height=64, width=64))
+    model = VJepa2Model("unused", skip_weight_loading=True, predictor_kind="ac")
+    upload = tmp_path / "clip.mp4"
+    upload.write_bytes(b"not decoded by the fake")
+    loaded = model.load_video(str(upload), "cpu")
+    assert pulled == []
+    upload.unlink()  # the API server deletes an upload on a timer that doesn't wait for the decode
+    out = model.process_prompt(
+        None, ["video"], ["video"],
+        tensors={"video_inputs": [loaded.data]}, input_metadata={"video_inputs": [loaded.metadata]},
+        actions=[[0.0] * 7] * 4, states=[[0.0] * 7] * 4, **kwargs,
+    ).new_input_tensors
+    assert pulled == loaded.metadata["sampled_indices"][:decoded]
+    assert out["video_frames"][0].shape[0] == decoded
+    assert out["video_inputs"] == []
+
+
+@pytest.mark.parametrize("key_frames, decoders", [
+    (torch.tensor([0, 10, 20, 30, 40]), 3),  # one per group of GOPs; the index's decoder decodes the first
+    ([0, 10, 20, 30, 40], 3),  # the list torchcodec's annotation promises
+    (RuntimeError("private API changed"), 1),  # an unusable index: one decoder, not an error
+])
+def test_gop_split_decode_returns_the_frames_in_the_order_asked(monkeypatch, key_frames, decoders):
+    """Sampled frames grouped by keyframe interval decode on separate decoders, each frame
+    once, and come back in the order asked for, duplicates included; without a usable
+    keyframe index they decode on one decoder."""
+    from mstar.model.components import video_decode
+
+    pulled, opened = [], []
+    _fake_torchcodec(monkeypatch, pulled, opened=opened, key_frames=key_frames)
+    monkeypatch.setattr(video_decode, "_max_decoders", lambda: 3)
+    indices = [41, 3, 22, 3, 15, 0, 35, 22, 8]
+    frames = video_decode.decode_frames_at(torch.zeros(16, dtype=torch.uint8), indices)
+    assert frames[:, 0, 0, 0].tolist() == indices
+    assert sorted(pulled) == sorted(set(indices) if decoders > 1 else indices)
+    assert len(opened) == decoders
+
+
+def test_the_installed_torchcodec_still_has_the_keyframe_index():
+    """The GOP split reads a private torchcodec method and falls back to one decoder
+    without it, so a torchcodec bump that drops it would only show as slower decodes."""
+    VideoDecoder = pytest.importorskip("torchcodec.decoders").VideoDecoder
+    assert callable(getattr(VideoDecoder, "_get_key_frame_indices", None))
 
 
 def _mp4(path, frames, side=64):
@@ -610,6 +688,32 @@ def test_vjepa2_without_frame_size_in_the_header_decodes_one_frame_to_check(monk
     with pytest.raises(ValueError, match="MSTAR_MAX_VIDEO_PIXELS"):
         model.load_video("clip.mp4", "cpu")
     assert pulled == [0]
+
+
+@pytest.mark.parametrize("plan,expected", [
+    (CpuPlan(frozenset(range(1)), 1), 1),
+    (CpuPlan(frozenset(range(3)), 3), 3),
+    (CpuPlan(frozenset(range(64)), 64), 8),
+    # step_thread_core pinned the API server's result thread to CPU 0
+    (CpuPlan(frozenset(range(8)), 8, result=0), 7),
+])
+def test_video_decodes_thread_within_the_cpus_the_plan_leaves(monkeypatch, plan, expected):
+    """FFmpeg threads per decode follow the CPUs the process's plan leaves
+    unpinned, at most 8, and not the API server's small preprocessing pool."""
+    from mstar.model.vjepa2.vjepa2_model import VJepa2Model
+    from mstar.utils import cpus as cpu_plan
+
+    monkeypatch.setattr(torch, "get_num_threads", lambda: 1)
+    monkeypatch.setattr(cpu_plan, "_plan", plan)
+    monkeypatch.setenv("MSTAR_MAX_VIDEO_PIXELS", str(64 * 64 * 4))
+    opened = []
+    _fake_torchcodec(monkeypatch, [], opened=opened)
+    vjepa2 = object.__new__(VJepa2Model)
+    vjepa2.config = types.SimpleNamespace(frames_per_clip=64)
+    for load in (lambda: Model.load_video(None, "clip.mp4", "cpu"), lambda: vjepa2.load_video("clip.mp4", "cpu")):
+        with pytest.raises(ValueError, match="MSTAR_MAX_VIDEO_PIXELS"):
+            load()
+    assert [kw["num_ffmpeg_threads"] for kw in opened] == [expected, expected]
 
 
 def test_probe_reads_torchcodec_metadata_without_a_scan(monkeypatch):

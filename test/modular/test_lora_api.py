@@ -52,7 +52,7 @@ from mstar.engine.resources.lora import (  # noqa: E402
     LORA_RESOURCE_KEY,
     LoraReqConfig,
 )
-from mstar.engine.resources.lora.config import ADAPTER_WEIGHTS_FILE  # noqa: E402
+from mstar.engine.resources.lora.config import ADAPTER_WEIGHTS_FILE, describe_load_error  # noqa: E402
 from mstar.engine.resources.lora.identity import adapter_prefix_root  # noqa: E402
 from mstar.engine.resources.lora.pool import LoraAdapterPool  # noqa: E402
 from mstar.engine.resources.lora.store import LoraAdapterStore, check_adapters  # noqa: E402
@@ -116,9 +116,11 @@ class _StubAPI:
         self.upload_dir = Path(tempfile.mkdtemp())
         self.last_submit = None
 
+    # the real APIServer's adapter selection, on this stub's ServedModels
+    lora_kwargs = APIServer.lora_kwargs
+
     def submit_request(self, **kw):
-        # the real APIServer's adapter selection, on this stub's ServedModels
-        kw["model_kwargs"] = APIServer.lora_kwargs(self, kw.pop("model", None), kw.get("model_kwargs")).model_kwargs
+        kw["model_kwargs"] = self.lora_kwargs(kw.pop("model", None), kw.get("model_kwargs")).model_kwargs
         self.last_submit = kw
         return kw["request_id"]
 
@@ -187,8 +189,10 @@ def test_every_route_maps_the_model_field_to_an_adapter(monkeypatch, route):
         assert response.json()["model"] == "sql"
     refused = [{"model": "nope"}]
     if route in ("chat", "speech"):  # an extra-body adapter is checked like the model field
-        post(client, {LORA_ADAPTER_KWARG: "sql"})
+        response = post(client, {LORA_ADAPTER_KWARG: "sql"})
         assert stub.last_submit["model_kwargs"][LORA_ADAPTER_KWARG] == "sql"
+        if route == "chat":
+            assert response.json()["model"] == "sql"
         refused += [{LORA_ADAPTER_KWARG: "nope"}, {"model": "sql", LORA_ADAPTER_KWARG: "other"}]
     for body in refused:
         stub.last_submit = None
@@ -531,6 +535,42 @@ def test_a_runtime_load_and_unload_end_to_end(paths):
     assert adapter_prefix_root(d.served.check("a1")) != root
 
 
+def test_a_retry_after_a_timeout_runs_behind_the_slow_workers_rollback(paths):
+    """worker_1's read outlasts the timeout: the 504 rolls the load back everywhere, and
+    the client retries at once. worker_1 applies load, rollback and retry in order, so
+    the retry is served on both workers."""
+    d = _Deployment(paths)
+    answers, clock = [], SimpleNamespace(now=0.0)
+
+    def send(peer, message):
+        message = _wire(message)
+        if peer == "api_server":
+            answers.append(message.body)
+        else:
+            d.workers[peer]._process_message_list([message])
+
+    d.ops = LoraAdapterOps(
+        make_spec({}, runtime_updates=True, runtime_update_timeout_s=10.0),
+        ["worker_0", "worker_1"], send, clock=lambda: clock.now,
+    )
+    gate, store = threading.Event(), d.pools["worker_1"].store
+    read = store._read
+    store._read = lambda name, path: (gate.wait(30), read(name, path))[1]
+    digest = LoraAdapterStore(make_spec({}), pin=False).read("a1", paths["a1"]).digest.hex()
+    d.ops.load(LoadLoraAdapter(op_id="op1", lora_name="a1", lora_path=paths["a1"], lora_digest=digest))
+    _finish_when_read(d.workers["worker_0"])
+    clock.now = 10.0
+    d.ops.expire()
+    assert answers[-1].status == 504
+    d.ops.load(LoadLoraAdapter(op_id="op2", lora_name="a1", lora_path=paths["a1"], lora_digest=digest))
+    _finish_when_read(d.workers["worker_0"])
+    gate.set()
+    while d.workers["worker_1"]._lora_loads:
+        _finish_when_read(d.workers["worker_1"])
+    assert answers[-1] == LoraAdapterResult(op_id="op2", status=200)
+    assert all(pool.serves("a1") for pool in d.pools.values())
+
+
 def test_a_failed_read_on_one_worker_is_undone_everywhere_without_leaking_the_io_error(paths):
     d = _Deployment(paths, fail_on="worker_1")
     with pytest.raises(REFUSED) as err:
@@ -546,14 +586,19 @@ def test_a_refused_path_tells_the_client_nothing_about_the_servers_files(paths, 
     d = _Deployment(paths)
     other = tmp_path / "notes.txt"
     other.write_text("not an adapter")
+    model = tmp_path / "model.safetensors"
+    save_file({"model.layers.0.self_attn.q_proj.weight": torch.zeros(2, 2)}, str(model))
     answers = set()
-    for path in (str(tmp_path / "missing.safetensors"), str(other), str(tmp_path)):
+    for path in (str(tmp_path / "missing.safetensors"), str(other), str(tmp_path), str(model)):
         with pytest.raises(REFUSED) as err:
             d.load("x", path)
         assert _status(err.value) == 400 and str(tmp_path) not in _message(err.value)
         answers.add(_message(err.value))
-    # a missing file, a file of another kind and a directory read the same
+    # a missing file, a file of another kind, a directory and a model's weights read the same
     assert len(answers) == 1 and "could not be read" in answers.pop()
+    # as they do on a worker, should the file change after the API server's check
+    read = LoraAdapterPool(make_spec({}), "cpu").load_adapter_async("x", str(model), bytes(32))
+    assert "could not be read" in describe_load_error(read.exception(timeout=30))
     # an adapter the deployment cannot serve is refused with its reason, before any worker
     wide = tmp_path / "wide.safetensors"
     write_adapter(wide, rank=8, seed=9)  # above make_spec's max_rank of 4
