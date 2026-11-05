@@ -103,7 +103,9 @@ Exported by the API server, recorded where a request leaves it, the same way for
    Counter. Requests that left the API server. ``success``: the result went to the
    HTTP layer. ``error``: the request failed in the engine, preprocessing or result
    delivery, or the conductor went away. ``abort``: the client went away, or its
-   finished result was dropped unread. ``timeout``: ``--timeout`` expired.
+   finished result was dropped unread. ``timeout``: ``--timeout`` expired. A chat
+   reply the API server ends itself (at a stop string, or at the one tool call
+   ``parallel_tool_calls: false`` allows) is a ``success``.
 
 ``mstar_requests_in_flight{model_name}``
    Gauge, read at scrape time. Requests the API server holds: submitted and not yet
@@ -124,7 +126,8 @@ Request stages
 
 Exported by the API server, for successful requests, from the timestamps every request
 carries. The conductor's timestamps are compared with the API server's, which assumes
-both run on one host.
+both run on one host. A reply the API server ended itself before the engine finished it
+has none of the conductor's, so only its preprocess stage is observed.
 
 ``mstar_request_preprocess_seconds{model_name, output_modalities}``
    Histogram, seconds. From submission to the data worker handing the preprocessed

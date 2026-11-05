@@ -69,10 +69,13 @@ def test_decode_joined():
 # ----------------------------------------------------------------------
 
 class _BatchAPI:
-    """Just enough APIServer to feed ``serving_chat._stream_events``."""
+    """Just enough APIServer for ``reply.reply_events``."""
 
     def __init__(self, batches):
         self._batches = batches
+
+    def submission_key(self, request_id):
+        return request_id
 
     async def iter_result_chunk_batches(self, request_id):
         for batch in self._batches:
@@ -90,10 +93,11 @@ def _sse_events(frames):
 
 def _stream_chat(batches):
     pytest.importorskip("fastapi")
+    from mstar.api_server.openai import reply
     from mstar.api_server.openai.serving_chat import _stream_events
 
     async def run():
-        return [f async for f in _stream_events(_BatchAPI(batches).iter_result_chunk_batches("r"), "m", "r", 24000)]
+        return [f async for f in _stream_events(reply.reply_events(_BatchAPI(batches), "r"), "m", "r")]
 
     events = _sse_events(asyncio.run(run()))
     content = "".join(e["choices"][0]["delta"].get("content") or "" for e in events)

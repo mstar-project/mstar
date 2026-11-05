@@ -306,7 +306,7 @@ def test_text_chat_coerces_numeric_extra_body(tmp_path):
 
 
 @pytest.mark.parametrize("field", [
-    {"n": 2}, {"stop": "\n"}, {"stop": ["END"]}, {"logprobs": True}, {"top_logprobs": 5},
+    {"n": 2}, {"stop": ["a", "b", "c", "d", "e"]}, {"stop": ["END", ""]}, {"logprobs": True}, {"top_logprobs": 5},
     {"logit_bias": {"100": -100}}, {"presence_penalty": 1.5}, {"frequency_penalty": 0.5},
     {"best_of": 2}, {"response_format": {"type": "json_object"}}, {"stop_token_ids": [2]},
 ])

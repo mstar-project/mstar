@@ -72,7 +72,7 @@ class Glm52Model(Model):
     prebuild_fused_moe = True
     # read only by process_prompt's template, and kept off the conductor's wire,
     # which cannot carry every number a tool schema may hold (2**64)
-    PREPROCESS_ONLY_KWARGS = ("messages", "tools", "chat_template_kwargs")
+    PREPROCESS_ONLY_KWARGS = ("messages", "tools", "chat_template_kwargs", "reply_prefix")
 
     def __init__(
         self,
@@ -108,7 +108,7 @@ class Glm52Model(Model):
             if key in kwargs and (isinstance(kwargs[key], bool) or not isinstance(kwargs[key], int)):
                 raise ValueError(f"{key} must be an integer, got {kwargs[key]!r}")
         if kwargs.get("dsa_long_context", False):
-            # Opt-in DSA engine path (configs/glm52_tp8_longctx.yaml). Sparse
+            # Opt-in DSA engine path (the long-context override in docs/models.rst). Sparse
             # attention reads the paged latent cache, so the naive
             # (mla_absorb=False) backend cannot host it.
             if not self.config.mla_absorb:
@@ -427,6 +427,13 @@ class Glm52Model(Model):
             input_ids = render_chat_template(self.tokenizer, prompt, prompt_parts, kwargs, TEMPLATE_KWARGS)
         else:
             input_ids = self.tokenizer(prompt, return_tensors="pt").input_ids[0]
+        if prefix := kwargs.get("reply_prefix"):
+            # what the reply opens with, after the generation prompt (a forced tool call)
+            if self._tokenizer_mode == "byte":
+                prefix_ids = [min(b, self.config.vocab_size - 1) for b in prefix.encode("utf-8")]
+            else:
+                prefix_ids = self.tokenizer.encode(prefix, add_special_tokens=False)
+            input_ids = torch.cat([input_ids, torch.tensor(prefix_ids, dtype=input_ids.dtype)])
 
         # here, in the data worker, a ValueError reaches the client as a 400
         if input_ids.numel() > self.config.max_prompt_tokens:
