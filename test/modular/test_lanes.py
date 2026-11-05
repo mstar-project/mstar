@@ -1202,6 +1202,20 @@ def test_a_node_with_a_walk_on_the_chain_is_the_chains_and_its_lane_walk_runs_be
     assert not engine._beside_chain("m", "chunk")
 
 
+def test_a_lane_walk_beside_the_chain_refuses_a_node_with_piecewise_regions():
+    """A slot past the rotation wraps onto one of the chain's in a region
+    (review-r2 F17). A node wholly on its lane keeps its own rotation."""
+    from mstar.engine.engine import node_lanes_of
+
+    engine = Engine.__new__(Engine)
+    engine._walk_lanes = {("n", "prefill"): 1, ("n", "decode"): 0, ("m", "chunk"): 2}
+    engine._node_lanes = node_lanes_of(engine._walk_lanes)
+    with pytest.raises(ValueError, match="piecewise regions"):
+        engine._refuse_regions_beside_chain("n", {"encoder": object()})
+    engine._refuse_regions_beside_chain("n", {})
+    engine._refuse_regions_beside_chain("m", {"encoder": object()})
+
+
 def test_a_step_beside_the_chain_takes_a_slot_of_its_lanes_and_runs_eager():
     """Every per-step buffer is keyed by slot (attention workspaces, KV's static
     plan buffers, position and sampler rows), and the chain holds its rotation:

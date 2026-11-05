@@ -1066,6 +1066,7 @@ class Engine:
             piecewise[node_name] = self._build_piecewise_runners(
                 node_name, submodule_mgmt, capture_stream,
             )
+            self._refuse_regions_beside_chain(node_name, piecewise[node_name])
 
         for (node_name, walk), signals in kept_rows.items():
             if node_name in self._submodules:
@@ -3703,6 +3704,20 @@ class Engine:
             return False
         with self._stage_lock or nullcontext():
             return self._pre_plan_staged(batch, submodule_mgmt, cg_runner, lease)
+
+    def _refuse_regions_beside_chain(self, node_name: str, regions: Collection[str]) -> None:
+        """A step beside the chain takes a slot past the node's rotation, which
+        a piecewise region wraps back onto a slot of the chain's: the two would
+        replay one graph on one set of buffers."""
+        beside = sorted(
+            walk for (node, walk), lane in self._walk_lanes.items()
+            if node == node_name and lane and self._node_lanes.get(node) != lane
+        )
+        if regions and beside:
+            raise ValueError(
+                f"{node_name!r} walks {beside} are placed on a lane beside the node's walks on the chain, "
+                f"but the node has piecewise regions {sorted(regions)}, which a lane has no slot of"
+            )
 
     def _beside_chain(self, node_name: str, graph_walk: str) -> bool:
         """Whether a step of this walk runs off the chain on what the chain
