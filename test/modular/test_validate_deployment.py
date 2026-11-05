@@ -322,10 +322,10 @@ def _cross() -> RaggedCrossAttentionSpec:
     return RaggedCrossAttentionSpec("xattn", {"llm"}, RaggedAttentionConfig(4, 4, 8))
 
 
-def _mla_llm(q_heads=4) -> _Model:
+def _mla_llm() -> _Model:
     """A model whose ``llm`` attends an MLA pool, and declares a shard to split its steps."""
     kv = KVSpec(resource_key="kv", nodes={"llm"}, config=PagedKVConfig(
-        num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=64, num_qo_heads=q_heads, page_size=16,
+        num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=64, num_qo_heads=4, page_size=16,
         layout=KVLayout.MLA, kv_lora_rank=8, qk_rope_head_dim=4,
     ))
     attn = AttentionSpec("attn", {"llm"}, AttentionConfig(kv_cache="kv", backend=AttnBackend.FLASHINFER_MLA,
