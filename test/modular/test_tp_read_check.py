@@ -261,6 +261,9 @@ class _DroppedHere(_Engine):
     def residency(self, node_name, rid):
         return Residency.DROPPED if rid in self.dropped else Residency.RESIDENT
 
+    def in_step(self, node_name, rid):
+        return False
+
     def check_ready(self, node_name, rid, fwd_info, allow_reload=True):
         if rid in self.dropped:
             return FULL_ADMIT_REBUILD
