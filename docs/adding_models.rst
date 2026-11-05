@@ -1486,7 +1486,8 @@ methods are:
    rows are read, so a step with none costs nothing.
 
 ``check_stop(...) -> set[str]`` (optional)
-   Runs off the GPU thread, and may read tensor values. Return the names of the ``Loop``
+   Runs off the GPU thread, and may read tensor values. A class that defines it sets
+   ``checks_own_stop = True``, or the runtime never calls it. Return the names of the ``Loop``
    objects to stop, for example after seeing the EOS token. This is how a decode loop
    terminates. An AR submodule whose loop ends on a stop token sets
    ``self.token_stop = TokenStop(...)`` in ``__init__`` instead of writing one; that also
@@ -1537,13 +1538,13 @@ methods are:
    only the count, and ``StopKind.EOS`` only the token, for a loop whose cap is its budget.
    The limits are computed from the request's forward-pass info whenever
    the worker receives it, not per step. ``{}`` means ``check_stop`` never stops a loop
-   on the walk, and is the default for a class that doesn't override ``check_stop`` or
-   ``check_stop_batched`` (its loop's cap or its stream's end stops it); ``None``, the
-   default for one that does, keeps calling ``check_stop``. The policies must agree with ``check_stop`` for every row;
+   on the walk, and is the default for a class without ``checks_own_stop`` (its loop's
+   cap or its stream's end stops it); ``None``, the default for one with it, keeps
+   calling ``check_stop``. The policies must agree with ``check_stop`` for every row;
    ``test/modular/test_stop_policies.py`` checks the models that declare them. A
    ``TokenStop`` declares them for you: its loop's stop ids, as ``StopKind.EOS``, on
    ``walk``. Its ``prefill_walks`` keep ``check_stop``, and so does every walk of a class
-   that overrides the token's stop check. A policy's ``withhold`` names outputs whose
+   with ``checks_own_stop``. A policy's ``withhold`` names outputs whose
    item of a step whose token is a stop id is not routed (``TokenStop.withhold``).
 
 ``cleanup_request(self, request_id)`` (optional)
@@ -1673,8 +1674,9 @@ and the repetition-penalty mask stay by the sampler's own row of each request.
 A resident step can also stand for several iterations of its Loop (``step_repeats``
 per node in the serving config): the host plans once and the capture replays, each loop-back
 signal carried from one replay to the next by copying the output it left into the static input
-it feeds (``NodeSubmodule.repeat_carry``: both named as the signal by default; a
-``DeviceLoopback`` token goes from its stop buffer to its input). A run skips ``preprocess``
+it feeds (``NodeSubmodule.repeat_carry``: both named as the signal by default, or as
+``NodeSubmodule.REPEAT_CARRIES`` declares; a ``DeviceLoopback`` token goes from its stop
+buffer to its input). A run skips ``preprocess``
 between replays, so at load the engine feeds each carried signal a probe value through the
 capture template's ``preprocess`` and refuses a walk that changes it on the way. Whether
 a walk may repeat is settled once, after capture, and the worker logs it per walk with the

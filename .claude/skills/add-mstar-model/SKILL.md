@@ -78,7 +78,7 @@ Keep resident capacity separate from one-step batching: a pool may retain many s
 
 ## Phase 4 — Write it, register it, prove eager parity
 
-`mstar/model/<name>/<name>_model.py` with the graph, resource and partition declarations, prompt/input processing and output processing. Per submodule: `prepare_inputs` (set `input_seq_len`), `preprocess`, `forward`, `postprocess`, `check_stop`, `declare_step`. Write forwards tensor-in/tensor-out from the start (invariant 3) — retrofitting that is far more work than doing it once.
+`mstar/model/<name>/<name>_model.py` with the graph, resource and partition declarations, prompt/input processing and output processing. Per submodule: `prepare_inputs` (set `input_seq_len`), `preprocess`, `forward`, `postprocess`, `check_stop` (with `checks_own_stop = True`), `declare_step`. Write forwards tensor-in/tensor-out from the start (invariant 3) — retrofitting that is far more work than doing it once.
 
 **Register it: [registration.md](references/registration.md) is the checklist.** `test/modular/test_model_registration.py` enforces the registry, the CLI default config and the docs row, so CI catches those three. Forgetting the CLI entry means `mstar serve <model>` exits `unknown model` no matter how correct the code is.
 

@@ -1457,6 +1457,7 @@ class NodeSubmodule(torch.nn.Module, ABC):
     ) -> set[str]:
         """
         Return the set of dynamic-loop names that should stop after this step.
+        A class that defines this sets ``checks_own_stop``, or it is never called.
 
         Runs on the worker's slow-postprocess path *after* ``execute_batch``
         returns — never inside ``execute_batch``. **Allowed** to read tensor
@@ -1489,10 +1490,10 @@ class NodeSubmodule(torch.nn.Module, ABC):
         loop it can stop, if it is only these, so the graph runtime can run
         them without calling it.
 
-        None means ``check_stop`` decides; an empty dict means it never stops
-        a loop on this walk, which is the base's answer for a class keeping
-        the base's ``check_stop`` (the loop's cap or its stream's end stops
-        it). Asked once per walk, at startup. Every policy must agree with
+        None means ``check_stop`` decides, the base's answer for a class
+        with ``checks_own_stop``; an empty dict means it never stops a loop
+        on this walk, the base's answer for any other (the loop's cap or its
+        stream's end stops it). Asked once per walk, at startup. Every policy must agree with
         ``check_stop`` for every row.
         """
         del graph_walk
