@@ -40,7 +40,7 @@ class Admission:
     overrides `Resource.reserve_past`, while that request can't start (`_pass`). A request that asks again
     (`readmit`) holding something to return to waits in no queue, so it holds up no newer request, and
     `admit_waiting` tries it, oldest first, whenever what it didn't fit has grown. One that holds nothing waits in
-    the queues at its arrival, as a prompt does, so newer prompts can't keep passing it.
+    the queues at its arrival, as a prompt does, and no request passes it, so newer prompts can't keep passing it.
     """
 
     def __init__(self, resources: Mapping[str, Resource], ask_order: Collection[str]) -> None:
@@ -61,6 +61,7 @@ class Admission:
         # `_refused` maps each waiting request a resource refused while it passed to that resource and the mark it
         # didn't fit against. It can't start until that mark grows, so the requests behind it may pass it.
         # `_refusals` maps each such resource and mark to the requests refused against it.
+        # `_placed` holds the waiting requests that asked again in their queues, which no request passes.
         self._arrivals = itertools.count()
         self._arrival: dict[str, tuple[bool, int]] = {}
         self._numbered: list[str] = []
@@ -74,6 +75,7 @@ class Admission:
         self._passes = {key for key in ask_order if type(resources[key]).reserve_past is not Resource.reserve_past}
         self._refused: dict[str, tuple[str, object]] = {}
         self._refusals: dict[tuple[str, object], set[str]] = {}
+        self._placed: set[str] = set()
 
     def set_arrival(self, rid: str, arrival: int) -> None:
         """Order ``rid`` by the conductor's arrival number. A worker serving two of the request's partitions
@@ -148,6 +150,8 @@ class Admission:
             self._untried = True
         elif rid not in self._waiting:
             self._returns.pop(rid, None)
+        if queued and rid in self._waiting:
+            self._placed.add(rid)
 
     def refusals(self) -> list[Refusal]:
         """The waiting requests that have been tried and didn't fit, oldest first."""
@@ -303,10 +307,12 @@ class Admission:
         return nodes
 
     def _blocked(self, rids: Iterable[str]) -> set[str]:
-        """Those of the waiting ``rids`` that can't start now: a resource refused each, first in its queue or
-        passing, and hasn't grown since."""
+        """Those of the waiting ``rids`` that can't start now and may be passed: a resource refused each, first in
+        its queue or passing, and hasn't grown since, and none asked again in its queues."""
         blocked = set()
         for rid in rids:
+            if rid in self._placed:
+                continue
             held = self._refused.get(rid) or next(
                 ((key, mark) for key, mark in self._short.items() if self._queues[key][0] == rid), None,
             )
@@ -317,6 +323,7 @@ class Admission:
     def _leave(self, rid: str, keys: Collection[str]) -> None:
         """Take ``rid`` out of the queues of ``keys``. A queue it was first in drops its mark,
         which measured ``rid``, and its next request is left for `admit_waiting` to try."""
+        self._placed.discard(rid)
         if rid in self._returns:
             del self._returns[rid]
             return
