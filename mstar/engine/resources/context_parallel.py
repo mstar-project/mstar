@@ -524,12 +524,12 @@ class SPContextParallelWrapper(ContextParallelWrapper):
 
 def _own_tokens_kernel(kernels, workspace, kwargs, captured: ShareCapture | None, whole: bool) -> OwnTokensKernel:
     """The backend's own-token kernel (``PlacedAttention.own_tokens_kernel``), refused at build unless
-    it is an ``OwnTokensKernel``, one built for a capture saying so."""
+    it is an ``OwnTokensKernel`` sized for the capture it was built for."""
     kernel = kernels.own_tokens_kernel(workspace, kwargs, captured, whole)
     if not isinstance(kernel, OwnTokensKernel):
         raise ValueError(f"a placed pool's own tokens run on an OwnTokensKernel, not a {type(kernel).__name__}")
-    if captured is not None and kernel.captured is None:
-        raise ValueError(f"{type(kernel).__name__} was built for a capture and leaves its captured shape unset")
+    if kernel.captured != captured:
+        raise ValueError(f"{type(kernel).__name__} was built for {captured} and says it is sized for {kernel.captured}")
     if kernel.whole_rows_only and not whole:
         raise ValueError(f"{type(kernel).__name__} takes whole rows alone, and this placement's own tokens aren't")
     return kernel
