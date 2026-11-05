@@ -450,3 +450,53 @@ def test_a_request_that_arrives_mid_run_ends_the_run_and_is_processed_in_order(m
     assert [getattr(m, "message_type", m) for m in processed] == [
         WorkerMessageType.INPUT_SIGNALS, WorkerMessageType.NEW_REQUEST, "later",
     ]
+
+
+@pytest.mark.parametrize("slots, why", [(1, "one capture slot"), (2, None)])
+def test_a_single_capture_slot_does_not_stream_tokens(slots, why):
+    """A slot's landing area is the slot's: with one slot the next step resets
+    it while this one's tokens are still being sent."""
+    from mstar.engine.engine import Engine
+
+    engine = Engine.__new__(Engine)
+    mgmt = SimpleNamespace(accelerator_graph_runner=SimpleNamespace(num_slots=slots), device_stream_tokens={})
+    engine._submodules = {"n": mgmt}
+    refusal = engine.stream_tokens("n", WALK, "new_token", 4)
+    assert (refusal is None) is (why is None) and (why is None or why in refusal)
+    assert bool(mgmt.device_stream_tokens) is (why is None)
+
+
+def test_a_request_arriving_while_a_run_streams_its_tokens_still_ends_the_run(monkeypatch):
+    from mstar.model.submodule_base import StopKind, StopPolicy
+    from mstar.utils.ipc_format import WorkerMessageType
+    from mstar.worker.worker import Worker
+
+    worker = Worker.__new__(Worker)
+    yielded = []
+    worker._graph_runtime = SimpleNamespace(
+        send_tokens=lambda *args: None,
+        loop_progress=lambda node, rids, walks, loops: ([0] * len(rids), [9] * len(rids)),
+    )
+    worker._streamed = {("n", WALK): (StopPolicy(StopKind.AR, "t", {EOS}), "text", "text")}
+    worker._innermost_loop_by_node = {}
+    worker._device_runs = frozenset({("n", WALK)})
+    arrivals = iter([[], [SimpleNamespace(message_type=WorkerMessageType.NEW_REQUEST)]])
+    worker.communicator = SimpleNamespace(get_all_new_messages=lambda: next(arrivals, []))
+    worker.engine_manager = SimpleNamespace(get_engine=lambda node: SimpleNamespace(yield_runs=yielded.append))
+    monkeypatch.setattr("mstar.worker.worker.time.sleep", lambda s: None)
+    stream = TokenStream(1, 4, CPU)
+    stream.begin([1])
+    done = iter([False, False, False, True])
+    worker._stream_tokens(
+        SimpleNamespace(
+            node_name="n",
+            graph_walk=WALK,
+            node_batch=SimpleNamespace(
+                token_stream=stream,
+                request_ids=[1],
+                completion_event=SimpleNamespace(query=lambda: next(done)),
+                per_request_info_wrapped={1: SimpleNamespace(max_tokens=9, resource_configs={})},
+            ),
+        )
+    )
+    assert yielded == ["n"]

@@ -16,10 +16,12 @@ request (``read``, ``write``).
 
 A streamed signal whose consumer is on this GPU (``step_repeats: stream_queue``)
 keeps its items in a ring of the same rows, ``[rows, depth, *item]``: the node's
-steps write each row's items at its write count (``ring_write``), its consumer
-gathers a chunk by position (``ring_read``) and gives positions back as it moves
-past them (``ring_release``). A row whose ring is full is not ready
-(``admit_retrieve``) and caps no step it is in (``ring_room``).
+steps reserve each row's positions before they launch (``ring_reserve``) and
+write the items there behind the step (``ring_write``); its consumer gathers a
+chunk by position (``ring_read``) and gives positions back as it moves past them
+(``ring_release``), over any it was never handed (``ring_skip``: a run that ended
+short, a withheld item). A row whose ring is full is not ready
+(``admit_retrieve``) and caps each step it is in (``ring_room``).
 """
 from __future__ import annotations
 
@@ -101,6 +103,8 @@ class LoopbackRows(Resource):
         self._depths: dict[str, int] = {}
         self._written: dict[tuple[str, Hashable], int] = {}
         self._consumed: dict[tuple[str, Hashable], int] = {}
+        # positions reserved but never handed to the consumer, which it moves past unread
+        self._skipped: dict[tuple[str, Hashable], set[int]] = {}
 
     @classmethod
     def build(cls, spec: LoopbackRowsSpec, info: EngineResourceInfo) -> LoopbackRows:
@@ -130,6 +134,7 @@ class LoopbackRows(Resource):
             for name in self._depths:
                 self._written.pop((name, rid), None)
                 self._consumed.pop((name, rid), None)
+                self._skipped.pop((name, rid), None)
 
     def has_row(self, rid: Hashable) -> bool:
         return rid in self._row_of
@@ -178,23 +183,40 @@ class LoopbackRows(Resource):
         with self._lock:
             return self._depths[name] - self._written.get((name, rid), 0) + self._consumed.get((name, rid), 0)
 
-    def ring_write(self, name: str, rids: Sequence[Hashable], items: torch.Tensor) -> list[int]:
-        """Row ``i`` of ``items`` (``[rows, width, *item]``) into ``rids[i]``'s
-        ring at its write count; each rid's first position. One copy for the
-        step, on the stream behind it."""
+    def ring_table(self, name: str, item: torch.Tensor) -> str | None:
+        """Before serving, from a capture's output: allocate ``name``'s ring for
+        items like ``item``'s rows; why it can't, or None. It takes as many
+        rows as the other tables and never fewer."""
         depth = self._depths[name]
-        width = items.shape[1]
-        table = self._tables.get(name)
-        if table is None:
-            row_bytes = max(depth * items[0, 0].numel() * items.element_size(), 1)
-            self.capacity = max(min(self.capacity, _TABLE_BYTES // row_bytes), self._max_bs)
-            table = self._tables[name] = torch.zeros(
-                (self.capacity + 1, depth, *items.shape[2:]), dtype=items.dtype, device=self._device,
+        rows = self.capacity + 1
+        size = rows * depth * item[0].numel() * item.element_size()
+        if size > _TABLE_BYTES:
+            return (
+                f"rows: a ring {depth} deep for {rows} rows is {size >> 20} MiB, over the "
+                f"{_TABLE_BYTES >> 20} MiB a table may take"
             )
+        self._tables[name] = torch.zeros((rows, depth, *item.shape[1:]), dtype=item.dtype, device=self._device)
+        return None
+
+    def ring_reserve(self, name: str, rids: Sequence[Hashable], width: int) -> list[int]:
+        """Before a step launches: ``width`` positions for each of ``rids``,
+        each rid's first. Reserved first, so a step built while this one runs
+        sees the room it takes."""
         with self._lock:
             bases = [self._written.get((name, rid), 0) for rid in rids]
             for rid, base in zip(rids, bases, strict=True):
                 self._written[(name, rid)] = base + width
+        return bases
+
+    def ring_write(
+        self, name: str, rids: Sequence[Hashable], items: torch.Tensor, bases: Sequence[int],
+    ) -> None:
+        """Row ``i`` of ``items`` (``[rows, width, *item]``) into ``rids[i]``'s
+        ring from ``bases[i]``. One copy for the step, on the stream behind it."""
+        depth = self._depths[name]
+        width = items.shape[1]
+        table = self._tables[name]
+        with self._lock:
             rows = [self._row_of.get(rid, TRASH_ROW) for rid in rids]
         n = len(rids) * width
         at = torch.empty(2 * n, dtype=torch.long, device=self._device)
@@ -203,7 +225,6 @@ class LoopbackRows(Resource):
             *((base + i) % depth for base in bases for i in range(width)),
         ])
         table.index_put_((at[:n], at[n:]), items[:len(rids)].reshape(-1, *table.shape[2:]).to(table.dtype))
-        return bases
 
     def ring_read(self, name: str, rid: Hashable, positions: Sequence[int]) -> torch.Tensor:
         """``[len(positions), *item]``: ``rid``'s ring of ``name`` at ``positions``."""
@@ -218,6 +239,28 @@ class LoopbackRows(Resource):
             key = (name, rid)
             if key in self._written:
                 self._consumed[key] = max(self._consumed.get(key, 0), until)
+                self._past_skipped(key)
+
+    def ring_skip(self, name: str, rid: Hashable, positions: Sequence[int]) -> None:
+        """Reserved positions the consumer is never handed: it moves past them
+        as it reaches them, so they hold no room."""
+        if not positions:
+            return
+        with self._lock:
+            key = (name, rid)
+            if key in self._written:
+                self._skipped.setdefault(key, set()).update(positions)
+                self._past_skipped(key)
+
+    def _past_skipped(self, key: tuple[str, Hashable]) -> None:
+        skipped = self._skipped.get(key)
+        consumed = self._consumed.get(key, 0)
+        if skipped:
+            skipped.difference_update([p for p in skipped if p < consumed])
+        while skipped and consumed in skipped:
+            skipped.discard(consumed)
+            consumed += 1
+        self._consumed[key] = consumed
 
     # Steps
 

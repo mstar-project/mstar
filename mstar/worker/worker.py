@@ -3137,9 +3137,10 @@ class Worker:
             return "node: it withholds an output, so its landing doesn't ride inline"
         buffer = client[signal]
         edge = next(e for e in edges if e.name == signal and e.next_node == EMIT_TO_CLIENT)
-        self._streamed[(node_name, graph_walk)] = (policy, signal, edge.output_modality)
-        engine.stream_tokens(node_name, graph_walk, buffer, self._step_repeats.config(node_name).max)
-        return None
+        refusal = engine.stream_tokens(node_name, graph_walk, buffer, self._step_repeats.config(node_name).max)
+        if refusal is None:
+            self._streamed[(node_name, graph_walk)] = (policy, signal, edge.output_modality)
+        return refusal
 
     def _ask_rings(self) -> None:
         """``step_repeats: stream_queue``: each streamed signal of an asking
@@ -3219,6 +3220,8 @@ class Worker:
         if not signals or not bases_of:
             return
         width = batch_N.batch.repeats
+        reserved = batch_N.node_batch.ring_width
+        rows = self.engine_manager.get_engine(batch_N.node_name).ring_rows(batch_N.node_name)
         withhold, withheld = withheld
         for signal in signals:
             bases = bases_of.get(signal)
@@ -3226,14 +3229,18 @@ class Worker:
                 continue
             skipped = withheld if signal in withhold else ()
             consumer = self._walk_driven_edges.get(signal)
-            for rid in step.wg_ids.keys:
+            routed = set(step.wg_ids.keys)
+            for rid, base in bases.items():
                 rid_outputs = outputs.get(rid)
-                if not rid_outputs or signal not in rid_outputs or rid not in bases:
+                positions = []
+                if rid_outputs and signal in rid_outputs and rid in routed:
+                    del rid_outputs[signal]
+                    positions = [base + i for i in range(step.kept.get(rid, width)) if (rid, i) not in skipped]
+                # what the step reserved and the consumer never gets: a run that
+                # ended short, a withheld item, a row that routed none
+                rows.ring_skip(signal, rid, sorted(set(range(base, base + reserved)) - set(positions)))
+                if not positions:
                     continue
-                del rid_outputs[signal]
-                positions = [
-                    bases[rid] + i for i in range(step.kept.get(rid, width)) if (rid, i) not in skipped
-                ]
                 walk = None
                 if consumer:
                     req_info = self.request_state.per_request_info[rid]
@@ -4109,13 +4116,20 @@ class Worker:
         ``_process_messages``, in order."""
         event = batch_N.node_batch.completion_event
         while not event.query():
-            arrived = self.communicator.get_all_new_messages()
-            if arrived:
-                self._held_messages = (*self._held_messages, *arrived)
-                if any(m.message_type == WorkerMessageType.NEW_REQUEST for m in arrived):
-                    self.engine_manager.get_engine(batch_N.node_name).yield_runs(batch_N.node_name)
-                    return
+            if self._yields_on_arrival(batch_N):
+                return
             time.sleep(_LANDED_POLL_S)
+
+    def _yields_on_arrival(self, batch_N: PendingBatch) -> bool:
+        """Takes in what arrived, held for ``_process_messages``; on a new
+        request, ends the run in flight at its next iteration and says so."""
+        arrived = self.communicator.get_all_new_messages()
+        if arrived:
+            self._held_messages = (*self._held_messages, *arrived)
+            if any(m.message_type == WorkerMessageType.NEW_REQUEST for m in arrived):
+                self.engine_manager.get_engine(batch_N.node_name).yield_runs(batch_N.node_name)
+                return True
+        return False
 
     def _stream_tokens(self, batch_N: PendingBatch) -> None:
         """While a run is in flight, send the client what it has landed. The
@@ -4144,6 +4158,8 @@ class Worker:
             limits, count, cap = rows[rid]
             return True, count + column + 1 >= cap or policy.stops(count + column, token, limits)
 
+        # a run on the device still ends early for a new request (``_await_run``)
+        watch = bool(self._device_runs) and (batch_N.node_name, walk) in self._device_runs
         while True:
             finished = node_batch.completion_event.query()
             rids, values = stream.take(decide)
@@ -4151,6 +4167,8 @@ class Worker:
                 self._graph_runtime.send_tokens(rids, values, signal, modality)
             if finished:
                 return
+            if watch and self._yields_on_arrival(batch_N):
+                watch = False
             time.sleep(_LANDED_POLL_S)
 
     def _postprocess_batch(

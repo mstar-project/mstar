@@ -250,6 +250,7 @@ def test_a_device_queue_hands_its_consumer_the_chunks_the_host_queue_does(policy
     streams.consumer_node = {EDGE: NODE}
     ring = LoopbackRows(torch.device("cpu"), capacity=2)
     ring.ask_ring(EDGE, depth=12)
+    ring.ring_table(EDGE, frames[:1])
     ring.add(RID)
     written = 0
     chunks = {"host": [], "device": []}
@@ -272,7 +273,8 @@ def test_a_device_queue_hands_its_consumer_the_chunks_the_host_queue_does(policy
             tm.tensor_store.increment_ref(uuid, 1)
             host.pre_read_register(uuid)
             host.put(uuid, uuid)
-        base = ring.ring_write(EDGE, [RID], batch[None])[0]
+        (base,) = ring.ring_reserve(EDGE, [RID], step)
+        ring.ring_write(EDGE, [RID], batch[None], [base])
         device.put_positions(list(range(base, base + step)))
         written += step
         pop("host", host)

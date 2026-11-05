@@ -179,20 +179,31 @@ def test_a_walk_keeps_a_loop_back_in_rows_only_at_a_fixed_shape_on_one_rank(shap
         assert mgmt.row_signals == {} and engine.device_loopback_signals("n", WALK) == frozenset()
 
 
+def _ring(depth, rids=(1, 2)):
+    rows = LoopbackRows(torch.device("cpu"), capacity=4)
+    rows.ask_ring("frames", depth=depth)
+    assert rows.ring_table("frames", torch.zeros(2, 2, dtype=torch.long)) is None
+    for rid in rids:
+        rows.add(rid)
+    return rows
+
+
+def _write(rows, rids, items):
+    rows.ring_write("frames", rids, items, rows.ring_reserve("frames", rids, items.shape[1]))
+
+
 def test_a_ring_wraps_and_a_full_one_holds_its_row_back_until_its_consumer_moves_on():
     """``stream_queue``: a row's items go into its ring at its write count; a
     full ring caps the row at 0 and keeps it out of a step, and its consumer
     moving past positions gives the room back."""
-    rows = LoopbackRows(torch.device("cpu"), capacity=4)
-    rows.ask_ring("frames", depth=4)
-    for rid in (1, 2):
-        rows.add(rid)
+    rows = _ring(depth=4)
     items = torch.arange(2 * 3 * 2).reshape(2, 3, 2)  # two rows, a run of 3, frames of 2
-    assert rows.ring_write("frames", [1, 2], items) == [0, 0]
+    _write(rows, [1, 2], items)
     assert rows.ring_room("frames", 1) == 1 and rows.admit_retrieve(1, "n", "w").ready
     rows.ring_release("frames", 1, 2)
     # wraps: positions 3, 4 and 5 are slots 3, 0 and 1
-    assert rows.ring_write("frames", [1], items[1:]) == [3]
+    assert rows.ring_reserve("frames", [1], 3) == [3]
+    rows.ring_write("frames", [1], items[1:], [3])
     assert rows.ring_read("frames", 1, [2, 3, 4, 5]).tolist() == [[4, 5], [6, 7], [8, 9], [10, 11]]
     assert rows.ring_room("frames", 1) == 0 and not rows.admit_retrieve(1, "n", "w").ready
     rows.ring_release("frames", 1, 4)
@@ -200,4 +211,37 @@ def test_a_ring_wraps_and_a_full_one_holds_its_row_back_until_its_consumer_moves
     # torn down mid-stream: its counts go with its row, and the next rid on it starts empty
     rows.drop(1)
     rows.add(3)
-    assert rows.ring_room("frames", 3) == 4 and rows.ring_write("frames", [3], items[:1]) == [0]
+    assert rows.ring_room("frames", 3) == 4 and rows.ring_reserve("frames", [3], 1) == [0]
+
+
+def test_a_steps_positions_are_held_from_before_its_launch():
+    """The next step is built while this one runs: the room it reads has to
+    count this step's items already, or its run wraps over unread ones."""
+    rows = _ring(depth=8)
+    bases = rows.ring_reserve("frames", [1], 4)  # the step in flight, not yet written
+    assert rows.ring_room("frames", 1) == 4
+    rows.ring_write("frames", [1], torch.ones(1, 4, 2, dtype=torch.long), bases)
+    assert rows.ring_room("frames", 1) == 4
+
+
+def test_positions_a_short_run_never_handed_on_hold_no_room():
+    """A run that ended short reserved more than it wrote; the consumer moves
+    past those positions unread, so a ring of gaps can't fill and hang."""
+    rows = _ring(depth=16)
+    for _ in range(4):
+        (base,) = rows.ring_reserve("frames", [1], 4)
+        rows.ring_skip("frames", 1, [base + 1, base + 2, base + 3])  # ran 1 of 4
+    assert rows.ring_room("frames", 1) == 0
+    rows.ring_release("frames", 1, 1)  # past the first real item
+    assert rows.ring_room("frames", 1) == 4
+    rows.ring_release("frames", 1, 13)
+    assert rows.ring_room("frames", 1) == 16
+
+
+def test_a_ring_is_sized_at_load_and_never_shrinks_the_rows():
+    """Allocated mid-serve, it took up to 1 GiB after the KV pool was sized
+    and lowered the row count under rows already handed out."""
+    rows = LoopbackRows(torch.device("cpu"), capacity=4096)
+    rows.ask_ring("frames", depth=1024)
+    assert "over the 1024 MiB" in rows.ring_table("frames", torch.zeros(1, 512, dtype=torch.long))
+    assert rows.capacity == 4096

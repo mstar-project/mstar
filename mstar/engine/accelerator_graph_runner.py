@@ -1982,6 +1982,19 @@ class AcceleratorGraphRunner:
             {key: wide[id(t)] for key, t in spans_out.items()},
         )
 
+    def captured_output(self, name: str) -> torch.Tensor | None:
+        """A capture's static output ``name``, row i request i; None if no capture has one."""
+        for bucket in self._buckets.values():
+            for slot in bucket.slots:
+                found = output_named(slot.static_outputs, name)
+                if found is not None:
+                    return found
+        return None
+
+    @property
+    def num_slots(self) -> int:
+        return self._num_slots
+
     def token_stream(self, lease: SlotLease, signal: str, limit: int) -> TokenStream:
         """Where a run on this slot leaves ``signal``'s tokens as they land."""
         slot = self.slot_for(lease)

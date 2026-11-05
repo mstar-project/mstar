@@ -479,8 +479,10 @@ class ExecutingBatch:
     kept_rows: list[bool] | None = None
     # where a run streaming its tokens leaves them as they land
     token_stream: TokenStream | None = None
-    # streamed signal -> rid -> the ring position its first item of the step took
+    # streamed signal -> rid -> the ring position its first item of the step took,
+    # and the positions each took (``Engine._reserve_rings``)
     ring_bases: dict[str, dict[int, int]] = field(default_factory=dict)
+    ring_width: int = 1
 
     # This step's outputs, published as soon as the forward has been
     # submitted — the tensors exist then, even though their values land later.
@@ -1705,14 +1707,25 @@ class Engine:
         ))
 
     def ask_ring(self, node_name: str, signal: str, depth: int, walks: Collection[str]) -> LoopbackRows | str:
-        """Keep ``signal``'s items, which ``walks`` stream to a consumer on this
-        GPU, in a ring of the node's rows ``depth`` deep; the rows, or why not."""
+        """After capture: keep ``signal``'s items, which ``walks`` stream to a
+        consumer on this GPU, in a ring of the node's rows ``depth`` deep,
+        allocated now from a capture's output; the rows, or why not."""
         mgmt = self._submodules[node_name]
-        if mgmt.loopback_rows is None:
+        rows, runner = mgmt.loopback_rows, mgmt.accelerator_graph_runner
+        if rows is None:
             return "node: it keeps no loop-back rows (asked for by repeats or resident planning)"
-        mgmt.loopback_rows.ask_ring(signal, depth)
+        item = None if runner is None else runner.captured_output(signal)
+        if item is None:
+            return f"runner: no capture of the node outputs {signal!r}, to size its ring by"
+        rows.ask_ring(signal, depth)
+        if (refusal := rows.ring_table(signal, item)) is not None:
+            return refusal
         mgmt.rings[signal] = frozenset(walks)
-        return mgmt.loopback_rows
+        return rows
+
+    def ring_rows(self, node_name: str) -> LoopbackRows | None:
+        """The rows that hold the node's rings."""
+        return self._submodules[node_name].loopback_rows
 
     def ring_room(self, node_name: str, rids: Collection[int]) -> int | None:
         """The fewest items any of ``rids``' rings takes now; None for a node with none."""
@@ -1722,33 +1735,49 @@ class Engine:
         rows = mgmt.loopback_rows
         return min((rows.ring_room(signal, rid) for signal in mgmt.rings for rid in rids), default=None)
 
+    def _reserve_rings(self, mgmt: SubmoduleManagement, batch: ExecutingBatch) -> None:
+        """Before the launch: the ring positions each row's items of each ringed
+        signal take. A row whose walk streams none, or whose prompt is still in
+        chunks, takes none."""
+        ctx = batch.step_context
+        chunks = batch.chunk_ranges
+        rids = [
+            rid for rid in batch.request_ids
+            if rid not in chunks or chunks[rid].is_final
+        ]
+        batch.ring_width = ctx.repeats
+        for signal, walks in mgmt.rings.items():
+            mine = [rid for rid in rids if ctx.walk_of(rid) in walks]
+            if mine:
+                bases = mgmt.loopback_rows.ring_reserve(signal, mine, ctx.repeats)
+                batch.ring_bases[signal] = dict(zip(mine, bases, strict=True))
+
     def _write_rings(self, mgmt: SubmoduleManagement, batch: ExecutingBatch, raw: BatchedModelOutput) -> None:
         """Right behind the step, on its stream: each row's items of each ringed
-        signal into its ring, one copy a signal. A row whose walk streams none,
-        or whose prompt is still in chunks, takes no room."""
-        ctx = batch.step_context
-        rids = batch.request_ids
-        for signal, walks in mgmt.rings.items():
+        signal into the positions reserved for it, one copy a signal."""
+        index_of = {rid: i for i, rid in enumerate(batch.request_ids)}
+        for signal, bases in batch.ring_bases.items():
             items = output_named(raw, signal)
             if items is None:
                 continue
-            if ctx.repeats == 1:
+            if batch.ring_width == 1:
                 items = items.reshape(items.shape[0], 1, *items.shape[1:])
-            chunks = batch.chunk_ranges
-            rows = [
-                i for i, rid in enumerate(rids)
-                if ctx.walk_of(rid) in walks and (rid not in chunks or chunks[rid].is_final)
-            ]
-            if not rows:
-                continue
-            picked = items if len(rows) == len(rids) else items[torch.tensor(rows, device=items.device)]
-            bases = mgmt.loopback_rows.ring_write(signal, [rids[i] for i in rows], picked)
-            batch.ring_bases[signal] = dict(zip((rids[i] for i in rows), bases, strict=True))
+            rids = list(bases)
+            rows = [index_of[rid] for rid in rids]
+            picked = items if rows == list(range(len(rows))) else items[torch.tensor(rows, device=items.device)]
+            mgmt.loopback_rows.ring_write(signal, rids, picked[:, :batch.ring_width], [bases[rid] for rid in rids])
 
-    def stream_tokens(self, node_name: str, graph_walk: str, signal: str, limit: int) -> None:
+    def stream_tokens(self, node_name: str, graph_walk: str, signal: str, limit: int) -> str | None:
         """A walk's runs, up to ``limit`` long, leave ``signal``, a stop
-        buffer, where the host can send it as it lands."""
-        self._submodules[node_name].device_stream_tokens[graph_walk] = (signal, limit)
+        buffer, where the host can send it as it lands; why they can't, or None.
+        A slot's landing area is the slot's: with one slot, the next step would
+        reset it while this one's tokens are still being sent."""
+        mgmt = self._submodules[node_name]
+        runner = mgmt.accelerator_graph_runner
+        if runner is None or runner.num_slots < 2:
+            return "runner: one capture slot, which the next step's tokens would land in while this one's go out"
+        mgmt.device_stream_tokens[graph_walk] = (signal, limit)
+        return None
 
     def yield_runs(self, node_name: str) -> None:
         """Other work is ready: the node's run in flight ends at its next iteration."""
@@ -2116,6 +2145,9 @@ class Engine:
                 return BatchedModelOutput(
                     per_rid_outputs={rid: {} for rid in batch.request_ids}
                 )
+            if submodule_mgmt.rings:
+                # before the launch, which lets the next step be built against this one's room
+                self._reserve_rings(submodule_mgmt, batch)
 
             raw, batch.step = self._drive_step(
                 batch, submodule_mgmt, batch.request_ids, inputs, req_info,

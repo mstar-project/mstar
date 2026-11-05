@@ -226,6 +226,7 @@ def test_a_stalled_consumer_caps_its_producer_to_one_then_takes_the_row_out():
 
     rows = LoopbackRows(torch.device("cpu"), capacity=4)
     rows.ask_ring("frames", depth=6)
+    rows.ring_table("frames", torch.zeros(2, 1))
     for rid in (0, 1):
         rows.add(rid)
     engine = SimpleNamespace(ring_room=lambda node, rids: min(rows.ring_room("frames", rid) for rid in rids))
@@ -245,10 +246,10 @@ def test_a_stalled_consumer_caps_its_producer_to_one_then_takes_the_row_out():
     in_flight = SimpleNamespace(batch=SimpleNamespace(repeats=1))
     worker._stamp_repeats(speculation, in_flight, 1)
     assert ctx.repeats == 6
-    rows.ring_write("frames", [0, 1], torch.zeros(2, 5, 1))
+    rows.ring_write("frames", [0, 1], torch.zeros(2, 5, 1), rows.ring_reserve("frames", [0, 1], 5))
     worker._stamp_repeats(speculation, in_flight, 1)
     assert ctx.repeats == 1
-    rows.ring_write("frames", [0], torch.zeros(1, 1, 1))
+    rows.ring_write("frames", [0], torch.zeros(1, 1, 1), rows.ring_reserve("frames", [0], 1))
     assert worker._with_ring_room("LLM", [0, 1]) == [1]
     rows.ring_release("frames", 0, 3)
     assert worker._with_ring_room("LLM", [0, 1]) == [0, 1]
