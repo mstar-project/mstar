@@ -552,7 +552,9 @@ reply holds a slot of each ``t2w_*`` resource (~0.4 GiB in all) while it speaks,
 three ``t2w_*_kv`` (its sink); startup refuses counts that disagree. The slots don't hold
 back the TTS, which keeps a spoken reply's ``tts_kv`` pages (up to 32) until its last code,
 so ``max_concurrent_requests`` caps the requests in flight and startup refuses a ``tts_kv``
-that can't hold that many full replies: overfilled, the TTS would stall.
+that can't hold that many full replies: overfilled, the TTS would stall. A reply's LLM
+pages have no such bound, so ``llm_kv`` has host pages (``cpu_offload_pages``) instead: a
+full pool moves a request to the host rather than stall.
 
 Command A+ (``command_a_plus``)
 -------------------------------
