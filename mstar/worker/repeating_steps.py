@@ -8,7 +8,6 @@ are the ones that need the worker's runtime, engine and streams, kept out of
 """
 from __future__ import annotations
 
-import logging
 import time
 from typing import TYPE_CHECKING
 
@@ -26,8 +25,6 @@ if TYPE_CHECKING:
     from mstar.worker.micro_scheduler import ScheduledBatch
     from mstar.worker.speculation import Speculation
     from mstar.worker.worker import PendingBatch
-
-logger = logging.getLogger(__name__)
 
 # How often a wait on a run that streams its tokens looks for new ones.
 _LANDED_POLL_S = 1e-4

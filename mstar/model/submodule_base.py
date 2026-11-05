@@ -1539,14 +1539,7 @@ def iteration_columns(
     the row's items of the stream this step, ``[items, ...]``, read from 0."""
     specs = submodule.ITERATION_INPUTS
     kept = {name: spec for name, spec in specs.items() if not spec.streamed}
-    out: dict[str, torch.Tensor] = {}
-    if kept:
-        from mstar.engine.resources.iteration_tables import IterationTables
-
-        tables = getattr(submodule, "iteration_tables", None)
-        if tables is None:
-            tables = submodule.iteration_tables = IterationTables(device)
-        out = tables.read(kept, rows, submodule.request_states, repeats)
+    out = submodule.iteration_tables.read(kept, rows, submodule.request_states, repeats) if kept else {}
     states = submodule.request_states
     for name, spec in specs.items():
         if not spec.streamed:

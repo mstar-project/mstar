@@ -20,6 +20,7 @@ transformers = pytest.importorskip("transformers")
 
 from diffusers import ZImageTransformer2DModel  # noqa: E402
 
+from mstar.engine.resources.iteration_tables import IterationTables  # noqa: E402
 from mstar.model.components.diffusion.flow_match import euler_step  # noqa: E402
 from mstar.model.components.diffusion.qwen3.encoder import Qwen3EncoderConfig  # noqa: E402
 from mstar.model.components.diffusion.qwen3.weight_loading import (  # noqa: E402
@@ -304,6 +305,7 @@ def test_denoise_node_steps_a_batch_row_by_row(pair):
         )
 
     def step(rids):
+        node.__dict__.setdefault("iteration_tables", IterationTables(torch.device("cpu")))
         columns = iteration_columns(node, [(rid, 0) for rid in rids], 1, "cpu")
         return {name: column[:, 0] for name, column in columns.items()}
 

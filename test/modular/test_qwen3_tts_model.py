@@ -19,6 +19,7 @@ from mstar.engine.resources.attn.wrappers import (
     FlashInferDecodeWrapper,
     FlashInferPrefillWrapper,
 )
+from mstar.engine.resources.iteration_tables import IterationTables
 from mstar.engine.resources.kv.config import KVSpec
 from mstar.engine.resources.position.config import PositionConfig
 from mstar.engine.resources.sampler.config import SamplerSpec
@@ -870,6 +871,7 @@ def test_qwen3_tts_talker_builds_official_streaming_prefill():
 def _cut(submodule, rows, repeats=1):
     """The rows' iteration inputs as the engine cuts them: ``(rid, k)`` each,
     None for a padding row."""
+    submodule.__dict__.setdefault("iteration_tables", IterationTables(torch.device("cpu")))
     return iteration_columns(submodule, rows, repeats, torch.device("cpu"))
 
 

@@ -3,8 +3,9 @@
 Each input (``IterationInput``) keeps one table for every request: a request's
 rows and their pad go in once, when a step first reads them, and a step reads
 its rows' iterations with one gather an input, on one staged index, however
-many rows it has. Cutting a view a row and stacking them was the largest host
-cost of a Qwen3-TTS step at c=64.
+many rows it has. A view a row and a stack took about 5x as long at 64 rows in
+a CPU microbench (results/f6, 1082 us against 193 us); no GPU timing says what
+share of a step that is.
 
 Row 0 of a table is the input's ``capture_fill``, which padding rows read. Read
 past its rows, a request reads its last: that is the pad's repeat.
@@ -59,6 +60,9 @@ class _Extent(NamedTuple):
 
 
 class _Table:
+    """Doubles as requests need and never shrinks, outside any memory budget: its
+    high-water mark stays, as a long-running server's concurrency peak."""
+
     def __init__(self, spec: IterationInput, device: torch.device):
         self.rows = torch.empty(1 + _EXTENT_ROWS, *spec.shape, dtype=spec.dtype, device=device)
         self.rows[0].fill_(spec.capture_fill)
@@ -97,9 +101,6 @@ class IterationTables(Resource):
 
     def resident_refusal(self, key: str, streams: Mapping[str, ResidentStream]) -> str | None:
         return None
-
-    def ingest_request(self, rid: Hashable, overrides=None) -> None:
-        return
 
     def remove_request(self, rid: Hashable) -> None:
         with self._lock:

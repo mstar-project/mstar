@@ -8,6 +8,7 @@ import pytest
 import torch
 from diffusers import UniPCMultistepScheduler
 
+from mstar.engine.resources.iteration_tables import IterationTables
 from mstar.model.components.diffusion.denoise_loop import UniPCDenoiseLoopSubmodule
 from mstar.model.components.diffusion.flow_match import FlowMatchSchedule
 from mstar.model.components.diffusion.unipc import (
@@ -130,6 +131,7 @@ def _step(sub, rows):
     engine_inputs = SimpleNamespace(
         request_ids=list(rows), per_request_info={rid: row[0] for rid, row in rows.items()},
     )
+    sub.__dict__.setdefault("iteration_tables", IterationTables(torch.device("cpu")))
     cut = iteration_columns(
         sub, [(rid, info.dynamic_loop_iter_counts["loop"]) for rid, (info, _) in rows.items()], 1, torch.device("cpu"),
     )

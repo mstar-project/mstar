@@ -18,6 +18,7 @@ import torch
 sys.path.insert(0, ".")
 
 from mstar.conductor.request_info import CurrentForwardPassInfo  # noqa: E402
+from mstar.engine.resources.iteration_tables import IterationTables
 from mstar.model.components.diffusion.denoise_loop import (  # noqa: E402
     LATENTS,
     DenoiseLoopSubmodule,
@@ -86,6 +87,7 @@ def _info(rid: str, k: int, steps: int = 4, tokens: int = 8, seed: int = 0) -> C
 def _cut(sub, infos, repeats=1):
     """The rows' iteration inputs as the engine stages them, a column a replay."""
     rows = [None if info is None else (info.rid_handle, info.dynamic_loop_iter_counts[LOOP]) for info in infos]
+    sub.__dict__.setdefault("iteration_tables", IterationTables(torch.device("cpu")))
     return iteration_columns(sub, rows, repeats, torch.device("cpu"))
 
 

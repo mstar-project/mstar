@@ -26,6 +26,7 @@ from mstar.engine.resources.attn.config import AttentionConfig, AttentionSpec  #
 from mstar.engine.resources.attn.flashinfer import FlashInferManager  # noqa: E402
 from mstar.engine.resources.attn.wrappers import FlashInferDecodeWrapper  # noqa: E402
 from mstar.engine.resources.base import CGSlotKey, Resource  # noqa: E402
+from mstar.engine.resources.iteration_tables import IterationTables  # noqa: E402
 from mstar.engine.resources.kv import manager as manager_mod  # noqa: E402
 from mstar.engine.resources.kv.config import KVLayout, KVReqConfig, KVSpec, KVStep, PagedKVConfig  # noqa: E402
 from mstar.engine.resources.kv.manager import KVManager  # noqa: E402
@@ -905,8 +906,7 @@ def test_cached_pages_are_room_for_a_step_that_repeats():
 def test_under_tp_a_steps_repeats_never_narrow_on_a_ranks_own_free_pages():
     """Each rank of a lockstep instance frees pages when its own teardown runs,
     so its free count is its own: narrowing on it would settle the ranks at
-    different counts of the same collectives (review-r2 F3). The leader's admit
-    still refuses a step the pool can't give, alike on every rank."""
+    different counts of the same collectives (review-r2 F3)."""
     kv = KVManager.__new__(KVManager)
     kv._arena = SimpleNamespace(num_free=1)
     kv._groups = [SimpleNamespace(page_size=PAGE)]
@@ -2945,6 +2945,7 @@ def test_a_mixed_step_stages_each_rows_iteration_of_its_own_walk():
         rid: ForwardPassInfoWrapper(SimpleNamespace(), InputMetadata(dynamic_loop_iter_counts={"loop": k}))
         for rid, k in ((1, 3), (2, 0))
     }
+    node.iteration_tables = IterationTables(CPU)
     cond = engine._iteration_columns("n", node, ctx, [1, 2, -1], info)["cond"]
     assert cond[:, 0].tolist() == [[106.0, 107.0], [200.0, 201.0], [-1.0, -1.0]]
 
@@ -3174,6 +3175,7 @@ def test_iteration_inputs_read_each_row_from_its_table_with_one_gather(repeats):
             self.request_states = {}
 
     node = Node()
+    node.iteration_tables = IterationTables(CPU)
     for rid, (n, floor) in enumerate([(5, 3), (2, 0)], start=1):
         state = node.request_states[rid] = PerRequestState()
         state.add("trailing", torch.arange(2.0 * n).reshape(n, 2) + 100 * rid)
@@ -3218,8 +3220,6 @@ def test_iteration_inputs_read_each_row_from_its_table_with_one_gather(repeats):
 def test_a_removed_requests_rows_of_an_iteration_table_go_to_the_next_request():
     """A table grows past its rows and never refuses, and what a request held
     is handed on (a long-running server's table stops growing)."""
-    from mstar.engine.resources.iteration_tables import IterationTables
-
     spec = {"cond": IterationInput("t", shape=(2,), pad=0.0, capture_fill=-1.0)}
     tables = IterationTables(CPU)
     states = {rid: {"t": torch.full((100, 2), float(rid))} for rid in (1, 2, 3)}
