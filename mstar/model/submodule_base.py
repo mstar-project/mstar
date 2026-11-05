@@ -888,6 +888,10 @@ class NodeSubmodule(torch.nn.Module, ABC):
     # setting, so a new eager shape never searches.
     capture_cudnn_benchmark: bool = False
 
+    # A loop-back signal whose replay output or next static input isn't named as
+    # the signal: signal -> the pair (``repeat_carry``).
+    REPEAT_CARRIES: Mapping[str, CarryPair] = MappingProxyType({})
+
     # Set True on a class whose own ``check_stop`` or ``check_stop_batched`` decides
     # its stops: the runtime then calls them rather than a declared policy
     # (``get_stop_policies``), and a step of the node doesn't repeat.
@@ -1181,12 +1185,12 @@ class NodeSubmodule(torch.nn.Module, ABC):
         """How each loop-back signal of this walk (``signals``, from the graph)
         moves from one replay of its capture to the next: the output the
         replay leaves it in, and the static input the next one reads it from.
-        By default both are named as the signal; ``ARNodeSubmodule`` carries
-        its ``DeviceLoopback`` token from its stop buffer to its input. The
-        engine checks at load that ``preprocess`` hands each one to the forward
-        unchanged."""
+        Both are named as the signal unless ``REPEAT_CARRIES`` says otherwise;
+        ``ARNodeSubmodule`` carries its ``DeviceLoopback`` token from its stop
+        buffer to its input. The engine checks at load that ``preprocess``
+        hands each one to the forward unchanged."""
         del graph_walk
-        return {signal: CarryPair(signal, signal) for signal in signals}
+        return {signal: self.REPEAT_CARRIES.get(signal, CarryPair(signal, signal)) for signal in signals}
 
     def step_is_input_free(self, graph_walk: str) -> bool:
         """Whether ``declare_step`` for this walk reads nothing from the inputs

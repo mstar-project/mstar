@@ -27,6 +27,7 @@ import logging
 import math
 from collections import OrderedDict
 from collections.abc import Mapping
+from types import MappingProxyType
 from typing import Any
 
 import torch
@@ -88,6 +89,8 @@ class ARSubmodule(ARNodeSubmodule):
     sqrt(11)``, computed here and carried on the recurrent edge.
     """
 
+    # the frame's next-input embedding goes back in as the next input_embeds
+    REPEAT_CARRIES = MappingProxyType({"ar_input_embeds": CarryPair("ar_input_embeds", "input_embeds")})
     disable_torch_compile = True
     # The top decode bucket is also the cap on rows per AR step; a step
     # costs about the same at 64 rows as at 32, so 64 streams do not run as
@@ -118,13 +121,6 @@ class ARSubmodule(ARNodeSubmodule):
         self._decode_last_token_indices: torch.Tensor | None = None
         self._flag_stager = PinnedStager(torch.bool, numel=self.MAX_BATCH_SIZE)
         self._index_stager = PinnedStager(torch.long, numel=self.MAX_BATCH_SIZE)
-
-    def repeat_carry(self, graph_walk: str, signals) -> dict[str, CarryPair]:
-        # the frame's next-input embedding goes back in as the next input_embeds
-        pairs = super().repeat_carry(graph_walk, signals)
-        if "ar_input_embeds" in pairs:
-            pairs["ar_input_embeds"] = CarryPair("ar_input_embeds", "input_embeds")
-        return pairs
 
     def _get_fast_kv(self, batch_size: int) -> torch.Tensor:
         """Frame-local Fast AR KV scratch, overwritten every step (stable graph addresses)."""

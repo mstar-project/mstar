@@ -14,8 +14,9 @@ from __future__ import annotations
 
 import functools
 import logging
-from collections.abc import Collection, Mapping
+from collections.abc import Mapping
 from dataclasses import replace
+from types import MappingProxyType
 from typing import Any
 
 import torch
@@ -1371,6 +1372,9 @@ def talker_token_stop(config: Qwen3OmniModelConfig) -> TokenStop | None:
 class TalkerSubmodule(ARNodeSubmodule):
     MAX_BATCH_SIZE = 32
 
+    # the forward reads the codec embedding sum as ``input_embeds``
+    REPEAT_CARRIES = MappingProxyType({"talker_input_embeds": CarryPair("talker_input_embeds", "input_embeds")})
+
     def __init__(
         self,
         talker_model: Qwen3OmniTalkerModel,
@@ -1647,13 +1651,6 @@ class TalkerSubmodule(ARNodeSubmodule):
                 streamed=True,
             )}
         return specs
-
-    def repeat_carry(self, graph_walk: str, signals: Collection[str]) -> dict[str, CarryPair]:
-        pairs = super().repeat_carry(graph_walk, signals)
-        # the forward reads the codec embedding sum as ``input_embeds``
-        if "talker_input_embeds" in pairs:
-            pairs["talker_input_embeds"] = CarryPair("talker_input_embeds", "input_embeds")
-        return pairs
 
     def _add_text_conditioning(
         self, input_embeds: torch.Tensor, text_raw: torch.Tensor | None,

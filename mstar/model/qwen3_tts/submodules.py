@@ -38,6 +38,7 @@ import itertools
 import logging
 from collections import OrderedDict
 from collections.abc import Callable, Mapping, Sequence
+from types import MappingProxyType
 from typing import Any
 
 import torch
@@ -140,6 +141,8 @@ class TalkerSubmodule(ARNodeSubmodule):
     # transformer. It introduces graph breaks and showed no steady-state win
     # for this path. The whole decode forward (CodePredictor loop included) is
     # still CUDA-graph captured.
+    # the frame's summed codec embedding goes back in as the next input_embeds
+    REPEAT_CARRIES = MappingProxyType({"talker_input_embeds": CarryPair("talker_input_embeds", "input_embeds")})
     disable_torch_compile = True
     # The largest decode bucket is also the cap on rows per Talker step. Near
     # capacity more streams are live than a step takes, and the rest wait in
@@ -225,13 +228,6 @@ class TalkerSubmodule(ARNodeSubmodule):
                 "suppress_eos": IterationInput("eos_floor", pad=False, capture_fill=True, dtype=torch.bool),
             }
         return specs
-
-    def repeat_carry(self, graph_walk: str, signals) -> dict[str, CarryPair]:
-        # the frame's summed codec embedding goes back in as the next input_embeds
-        pairs = super().repeat_carry(graph_walk, signals)
-        if "talker_input_embeds" in pairs:
-            pairs["talker_input_embeds"] = CarryPair("talker_input_embeds", "input_embeds")
-        return pairs
 
     def _prompt_eos_floor(self, rows: int) -> torch.Tensor:
         """A prompt row's EOS floor: its frame is the reply's first, so it is

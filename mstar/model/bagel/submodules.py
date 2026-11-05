@@ -8,6 +8,7 @@ import logging
 import os
 from collections.abc import Collection, Mapping
 from dataclasses import replace
+from types import MappingProxyType
 from typing import Any, NamedTuple
 
 import torch
@@ -937,6 +938,8 @@ class LLMSubmodule(ARNodeSubmodule):
     """
 
     checks_own_stop = True
+    # a denoise step's latents go back in as its input_embeds
+    REPEAT_CARRIES = MappingProxyType({"latents": CarryPair("latents", "input_embeds")})
 
     # Plan label the three CFG branches share when they run as one
     # combined plan; see declare_step.
@@ -1159,13 +1162,6 @@ class LLMSubmodule(ARNodeSubmodule):
             compile=False, capture_batch_sizes=[1], caps_eager_batch_size=False,
             total_tokens_multiplier=1 if DENOISE_WALKS[walk].split else DENOISE_WALKS[walk].branches,
         )
-
-    def repeat_carry(self, graph_walk: str, signals) -> dict[str, CarryPair]:
-        # a denoise step's latents go back in as its input_embeds
-        pairs = super().repeat_carry(graph_walk, signals)
-        if graph_walk in SINGLE_NODE_DENOISE_WALKS and "latents" in pairs:
-            pairs["latents"] = CarryPair("latents", "input_embeds")
-        return pairs
 
     def cg_key_info(
         self, graph_walk: str,
