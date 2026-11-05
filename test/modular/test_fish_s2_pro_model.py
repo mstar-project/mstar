@@ -723,3 +723,51 @@ def test_the_shipped_request_cap_fits_the_codec_streams():
     small = {**cfg, "resources": {CODEC_STATE: {"max_slots": cfg["max_concurrent_requests"]}}}
     with pytest.raises(ValueError, match="max_concurrent_requests"):
         model.validate_config_yaml(small, str(CONFIG_PATH))
+
+
+def test_an_ar_run_of_four_frames_equals_four_one_frame_steps():
+    """A step that repeats replays the decode capture on one plan: each replay
+    reads the frame embedding the last one left (``ar_input_embeds`` into
+    ``input_embeds``), so four replays give the frames four steps do. The
+    Slow AR's transformer is a stand-in; its heads and the Fast AR are real."""
+    from run_parity import replay_run
+
+    from mstar.model.submodule_base import ModelInputsFromEngine
+
+    ar = tiny_ar()
+    slow = ar.slow_ar
+
+    class Transformer(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.inner = slow
+
+        def forward(self, x, label):
+            return torch.tanh(x * 1.5)
+
+        def __getattr__(self, name):
+            try:
+                return super().__getattr__(name)
+            except AttributeError:
+                return getattr(self.inner, name)
+
+    ar.slow_ar = Transformer()
+    sampler = SimpleNamespace(sample=lambda rids, logits: logits.argmax(-1))
+    engine_inputs = ModelInputsFromEngine(request_ids=["a", "b"], per_request_info={}, resources={AR_SAMPLER: sampler})
+    torch.manual_seed(1)
+    first = torch.randn(2, ar.config.slow_ar.dim, dtype=torch.float64)
+    static = {"last_token_indices": torch.arange(2), "suppress_eos": torch.tensor([False, True])}
+
+    def forward(**inputs):
+        return ar.forward_batched("ar_decode", engine_inputs, **inputs).row_outputs
+
+    x, frames = first, []
+    for _ in range(4):
+        out = forward(input_embeds=x, **static)
+        frames.append(out["codec_tokens"])
+        x = out["ar_input_embeds"]
+    _, columns = replay_run(
+        forward, {"input_embeds": first, **static}, ar.repeat_carry("ar_decode", {"ar_input_embeds"}), 4,
+        ["codec_tokens"],
+    )
+    assert torch.equal(columns["codec_tokens"], torch.stack(frames, dim=1))

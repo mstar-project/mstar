@@ -61,6 +61,7 @@ from mstar.model.submodule_base import (
     ARNodeInputs,
     ARNodeSubmodule,
     BatchedModelOutput,
+    CarryPair,
     InputMetadata,
     ModelInputsFromEngine,
     NodeInputs,
@@ -117,6 +118,13 @@ class ARSubmodule(ARNodeSubmodule):
         self._decode_last_token_indices: torch.Tensor | None = None
         self._flag_stager = PinnedStager(torch.bool, numel=self.MAX_BATCH_SIZE)
         self._index_stager = PinnedStager(torch.long, numel=self.MAX_BATCH_SIZE)
+
+    def repeat_carry(self, graph_walk: str, signals) -> dict[str, CarryPair]:
+        # the frame's next-input embedding goes back in as the next input_embeds
+        pairs = super().repeat_carry(graph_walk, signals)
+        if "ar_input_embeds" in pairs:
+            pairs["ar_input_embeds"] = CarryPair("ar_input_embeds", "input_embeds")
+        return pairs
 
     def _get_fast_kv(self, batch_size: int) -> torch.Tensor:
         """Frame-local Fast AR KV scratch, overwritten every step (stable graph addresses)."""

@@ -2498,7 +2498,7 @@ def test_a_talker_run_of_four_frames_equals_four_one_frame_steps():
     condition in the forward, so four replays give the frames four steps do.
     The transformer and depth loop are stand-ins; the frame's plumbing is real.
     The default repetition penalty (1.05) keeps the step's sampler live."""
-    from mstar.engine.accelerator_graph_runner import AcceleratorGraphRunner
+    from run_parity import replay_run
 
     config = _tiny_model_config()
     assert config.generation.repetition_penalty == 1.05
@@ -2545,27 +2545,12 @@ def test_a_talker_run_of_four_frames_equals_four_one_frame_steps():
         steps.append(out["codec_tokens"])
         x = out["talker_input_embeds"]
 
-    static = {
-        "input_embeds": first.clone(), "last_token_indices": indices,
-        "suppress_eos": floors[:, 0].clone(), "text_condition": conditions[:, 0].clone(),
-    }
-    outputs = {name: tensor.clone() for name, tensor in frame(first, 0).items()}
+    def forward(**static):
+        return talker.forward_batched("talker_decode", engine_inputs, **static).row_outputs
 
-    class Graph:
-        def replay(self):
-            out = talker.forward_batched("talker_decode", engine_inputs, **static).row_outputs
-            for name, tensor in out.items():
-                outputs[name].copy_(tensor)
-
-    Graph().replay()
-    slot = SimpleNamespace(graph=Graph(), static_inputs=static, static_outputs=SimpleNamespace(
-        check_stop_buffers={"layer0_codes": outputs["layer0_codes"]}, row_outputs=outputs, output_spans=None,
-    ))
-    runner = AcceleratorGraphRunner.__new__(AcceleratorGraphRunner)
-    runner.slot_for = lambda lease: slot
-    carries = talker.repeat_carry("talker_decode", {"talker_input_embeds"})
-    _, columns, _ = runner.repeat(
-        None, carries, 4, lambda: None, ["codec_tokens"],
-        {"text_condition": conditions, "suppress_eos": floors},
+    _, columns = replay_run(
+        forward, {"input_embeds": first, "last_token_indices": indices}, talker.repeat_carry(
+            "talker_decode", {"talker_input_embeds"},
+        ), 4, ["codec_tokens"], {"text_condition": conditions, "suppress_eos": floors},
     )
     assert torch.equal(columns["codec_tokens"], torch.stack(steps, dim=1))
