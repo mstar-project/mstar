@@ -187,13 +187,14 @@ class ContextParallelWrapper(ABC):
 
         ``real_rows``: a replay's real requests when it has padding rows (``StepContext.real_rows``),
         which follow the real rows in each label. The own-token part then plans the real rows alone,
-        so the padding's keys lie past its plan, where ``run`` zeroes them: the kernel reads keys
-        past a row's end to its KV tile's, and a NaN the model's layers left in a padding row's
-        keys would reach the real rows before it."""
+        so the padding's queries come out 0, lse -inf, and its keys lie past the plan: FA3's ragged
+        kernel (FlashInfer's TP own tokens) reads keys past a row's end to its KV tile's, where
+        ``run`` zeroes them, so a NaN the model's layers left in a padding row's keys would
+        otherwise reach the real rows before it. (FlashInfer passes them; MLA's own tokens read
+        each row's own pages alone.)"""
         context = kv_out.cpu_indptrs
         if self.new is not None:
             context = context.context_only(self._page_size)
-        if self.new is not None:
             qo = context.qo_indptr
             own = None if real_rows is None else _leading_rows(kv_out, real_rows)
             self.new.plan(qo if own is None else qo[: own + 1], causal=causal)
@@ -421,7 +422,7 @@ class SPContextParallelWrapper(ContextParallelWrapper):
         out, lse = self.context.run(*queries, kv_cache_layer, return_lse=True)
         out, lse = _masked(out, lse, self._valid[: queries[0].shape[0]])
         if new is not None:
-            merged, lse = _merged((out, new[0]), torch.stack([lse, new[1]]), with_lse=True)
+            merged, lse = merge_lse((out, new[0]), torch.stack([lse, new[1]]))
             out = merged.to(out.dtype)
         return gather_merge(self._placement.group, out, lse)
 
@@ -628,16 +629,20 @@ def merge(outs: Sequence[torch.Tensor], lses: torch.Tensor) -> torch.Tensor:
     """Attention over the union of disjoint key sets from each set's partial: each out ``[..., D]``
     (a ``[K, ..., D]`` stack is a sequence too) and their natural-log lses stacked, ``[K, ...]``;
     fp32."""
-    return _merged(outs, lses)[0]
+    return _weighted(outs, lses)[0]
 
 
-def _merged(
-    outs: Sequence[torch.Tensor], lses: torch.Tensor, with_lse: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """``merge``, and with ``with_lse`` the union's lse: every part's weight relative to its row's
-    largest lse, then one fp32 ``[..., D]`` accumulated a part at a time. A partial with lse -inf and
-    a finite out adds nothing, and a query no partial has a key for (a captured bucket's padding)
-    comes out 0, -inf."""
+def merge_lse(outs: Sequence[torch.Tensor], lses: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """``merge``, and the union's natural-log lse, fp32, to merge again."""
+    out, total, top = _weighted(outs, lses)
+    return out, total.log_().add_(top)
+
+
+def _weighted(outs: Sequence[torch.Tensor], lses: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """``merge``'s out, from every part's weight relative to its row's largest lse, one fp32
+    ``[..., D]`` accumulated a part at a time; and the weights' sum and that largest lse. A partial
+    with lse -inf and a finite out adds nothing, and a query no partial has a key for (a captured
+    bucket's padding) comes out 0 (lse -inf)."""
     lses = lses.float()
     # finite on a row with no key, so its every weight is 0
     top = lses.amax(0).clamp_min(torch.finfo(torch.float32).min)
@@ -647,7 +652,7 @@ def _merged(
     for weight, part in zip(weights[1:], outs[1:], strict=True):
         out.addcmul_(weight.unsqueeze(-1), part)
     out.div_(total.clamp_min(torch.finfo(torch.float32).tiny).unsqueeze(-1))
-    return out, total.log_().add_(top) if with_lse else None
+    return out, total, top
 
 
 @torch.compiler.disable
@@ -659,7 +664,6 @@ def gather_merge(group: CommGroup, out: torch.Tensor, lse: torch.Tensor) -> torc
         return out
     gathered = _unpack(group.all_gather(_pack(out, lse).unsqueeze(0), dim=0), out.dtype)
     return merge(*gathered).to(out.dtype)
-
 
 
 def _position_pools(specs: Iterable[NodeResourceSpec], node: str) -> dict[str, bool]:
