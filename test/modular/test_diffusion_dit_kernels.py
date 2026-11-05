@@ -130,13 +130,15 @@ def test_ada_layer_norm_kernel_matches_eager(case):
 
 @needs_kernels
 @pytest.mark.parametrize("residual", [False, True], ids=["plain", "residual"])
-def test_ada_layer_norm_kernel_compiles_with_a_float_eps(monkeypatch, caplog, residual):
+def test_ada_layer_norm_kernel_compiles_with_a_float_eps(monkeypatch, caplog, torch_flag, residual):
     """torch 2.11 gives Triton every non-tensor argument as a Python constant, and 2.12
     only the constexpr ones, so a kernel that calls ``eps.to`` fails to compile on 2.11
     alone. torch catches that error and treats every input as mutated, and the output
     still matches eager."""
     # caplog listens on the root logger, which torch's loggers don't propagate to
     monkeypatch.setattr(logging.getLogger("torch._dynamo"), "propagate", True)
+    # a graph cached by an earlier compile of these shapes would skip the analysis
+    torch_flag(torch._inductor.config, "fx_graph_cache", False)
     x, y, (shift, scale, *_), *_ = _stream("cuda")
     kwargs = dict(shift=shift, scale=scale, residual=y if residual else None)
     want_x, want = modulation.reference_ada_layer_norm(x, eps=EPS, **kwargs)
