@@ -119,6 +119,7 @@ class PagedKVConfig(KVConfig):
     groups: tuple["KVGroup", ...] = field(default=(), init=False, repr=False, compare=False)
 
     def __post_init__(self):
+        self._check_max_seq_len()
         if self.layout == KVLayout.MLA:
             if self.kv_lora_rank is None or self.qk_rope_head_dim is None:
                 raise ValueError("KVLayout.MLA needs kv_lora_rank and qk_rope_head_dim")
@@ -129,6 +130,14 @@ class PagedKVConfig(KVConfig):
             self.head_dim = self.kv_lora_rank + self.qk_rope_head_dim
         super().__post_init__()
         self.keep_window(None, ())
+
+    def _check_max_seq_len(self) -> None:
+        if (
+            not isinstance(self.max_seq_len, int)
+            or isinstance(self.max_seq_len, bool)
+            or self.max_seq_len < 1
+        ):
+            raise ValueError(f"max_seq_len must be a positive int; got {self.max_seq_len!r}")
 
     def keep_window(self, window: int | None, layers: tuple[int, ...]) -> None:
         """Keep about ``window`` tokens per request of ``layers``, some of the pool's, and every
@@ -247,6 +256,7 @@ class PagedKVConfig(KVConfig):
         ):
             if value is not None:
                 setattr(self, name, value)
+        self._check_max_seq_len()
         if prefix_cache is not None:
             self.prefix_cache_given = prefix_cache
         if page_size is not None:
