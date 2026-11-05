@@ -189,8 +189,10 @@ def meet_replay(tape: clock.Tape) -> None:
 
 # each collective writes its first argument, but for these
 _ONLY_READS = {"send", "isend"}
-# and all but these leave nothing of what was there
-_READS_WHAT_IT_WRITES = {"all_reduce", "reduce", "broadcast"}
+# and these at the root (True: a broadcast's) or at the other ranks (False: a reduce's)
+_ONLY_READS_AT_ROOT = {"broadcast": True, "reduce": False}
+# and all but these leave nothing of what was there (a broadcast's other ranks read nothing)
+_READS_WHAT_IT_WRITES = {"all_reduce", "reduce"}
 
 
 def _splits(t: torch.Tensor, sizes, size: int) -> list[int]:
@@ -216,7 +218,14 @@ def _collective(name: str, family: str, primitive: str | None):
         a = bound.arguments
         group = a.get("group")
         nbytes = max(t.numel() * t.element_size() for t in tensors)
-        written = [] if name in _ONLY_READS else _sim_tensors((a[first],), {})
+        outputs = [] if name in _ONLY_READS else _sim_tensors((a[first],), {})
+        root = next((a[k] for k in ("src", "dst", "group_src", "group_dst") if a.get(k) is not None), -1)
+        written = outputs
+        if name in _ONLY_READS_AT_ROOT:
+            by_group = a.get("group_src") is not None or a.get("group_dst") is not None
+            at_root = root == (dist.get_rank(group) if by_group else dist.get_rank())
+            if _ONLY_READS_AT_ROOT[name] == at_root:
+                written = []
         covered = [] if name in _READS_WHAT_IT_WRITES else [t for t in written if device._covers(t._data)]
         # what it writes is computed if all it reads was, on every rank
         mine = (HELD * all(t._data.device.type != "meta" for t in tensors)
@@ -229,9 +238,8 @@ def _collective(name: str, family: str, primitive: str | None):
             if primitive == "AllToAll":
                 send = _splits(a["input"], a["input_split_sizes"], size)
                 recv = _splits(a["output"], a["output_split_sizes"], size)
-            root = next((a[k] for k in ("src", "dst", "group_src", "group_dst") if a.get(k) is not None), -1)
             op = a.get("op")
-            desc = row(primitive, 0 if send else sum(t.numel() for t in written), (written or tensors)[0].dtype,
+            desc = row(primitive, 0 if send else sum(t.numel() for t in outputs), (outputs or tensors)[0].dtype,
                        op=int(op) if op is not None else 0, root=root, values=mine, send=send, recv=recv, size=size)
         values = collective(family, group, nbytes, desc) & mine
         moved = bool(values & HELD)

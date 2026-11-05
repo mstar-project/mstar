@@ -676,6 +676,15 @@ def test_tensor_parallel_ranks_meet_at_each_collective():
             whole = torch.zeros(2, 4, device="cuda")
             dist.all_gather_into_tensor(whole, flashinfer.top_k_renorm_probs(part, 1) if r else part)
             assert never_computed(whole._data)
+            # a broadcast reads only its root's tensor and a reduce writes only its destination's:
+            # a peer's stale buffer leaves the root's as it was and is overwritten from it
+            stale = flashinfer.top_k_renorm_probs(torch.ones(1, 4, device="cuda"), 1).view(4)
+            cast = torch.arange(4, device="cuda").float() if r == 0 else stale
+            dist.broadcast(cast, src=0)
+            assert not never_computed(cast._data) and cast.tolist() == [0, 1, 2, 3]
+            summed = torch.ones(4, device="cuda") if r else stale
+            dist.reduce(summed, dst=0)
+            assert never_computed(summed._data) == (r == 0)
             # it reads its source and writes its destination: a whole write of computed values
             # ends the fact there, and what didn't move leaves a source computed
             src = torch.arange(4, device="cuda").float()
