@@ -1734,7 +1734,7 @@ this step. Such a region declares, plans and commits its own work. Any resource 
 region owns must therefore be excluded from the outer declaration. See
 `Piecewise CUDA graphs (capturing an inner loop)`_.
 
-**Advanced ``KVStep`` fields.** These fields cover cases that the engine previously
+**Advanced** ``KVStep`` **fields.** These fields cover cases that the engine previously
 handled as special cases. BAGEL uses all of them, in
 ``mstar/model/bagel/submodules.py``:
 

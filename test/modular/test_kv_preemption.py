@@ -372,6 +372,32 @@ def test_requests_each_short_by_several_pages_dont_wait_on_each_other_for_good()
     assert _admitted(kv, "w0") and _step(kv, "w0", 4 * PAGE_SIZE).ok, "w0 didn't get the pages w1 and w2 freed"
 
 
+def test_a_waiting_request_admitted_before_its_last_victim_moves_takes_no_more_room():
+    """w0 waits for 4 pages and moves w2 and w1. A host move lands before a drop, so w1's 5 pages can admit w0 before
+    w2 moves. w2's page then went into w0's allotment too, past what w0 asked for."""
+    kv = _pool()
+    rids = ["w0", "w1", "w2"]
+    for arrival, (rid, pages) in enumerate(zip(rids, (4, 5, 1), strict=True)):
+        _running(kv, rid, pages, arrival)
+    for i, rid in enumerate(rids):
+        short = _step(kv, rid, 4 * PAGE_SIZE).reason.pages_short
+        for other in rids[i + 1:]:
+            kv._streams[other]["main"].step_in_flight = True
+        assert _preempt(kv, rid, short, droppable=lambda rid: True).waits
+        for other in rids[i + 1:]:
+            kv._streams[other]["main"].step_in_flight = False
+        _runner(kv).readmit(rid, NODE)
+    assert not any(_admitted(kv, rid) for rid in rids)
+    assert _make_room(kv, droppable=lambda rid: True).to_drop == ["w2", "w1"]
+
+    _drop(kv, "w1")
+    pages = kv._allotments["w0"].pages
+    _drop(kv, "w2")
+
+    assert kv._allotments["w0"].pages == pages, "w2's move grew the allotment of a request it already admitted"
+    assert _admitted(kv, "w0") and _step(kv, "w0", 4 * PAGE_SIZE).ok
+
+
 def test_a_request_no_move_covers_waits_in_the_queue_until_its_whole_shortage_fits():
     kv = _pool()
     _running(kv, "a", 1, arrival=0)
@@ -1029,6 +1055,33 @@ def test_a_waiting_request_the_full_host_turns_guaranteed_moves_more_newer_reque
 
     assert _make_room(kv, droppable=lambda rid: True).to_drop == ["z1"], "p waited for good once it turned guaranteed"
     _drop(kv, "z1")
+    assert _admitted(kv, "p") and kv._allotments["p"].pages == 6
+
+
+def test_a_waiting_request_that_turns_guaranteed_as_one_victim_lands_isnt_admitted_short_by_the_next():
+    """p asks for its 2-page prompt and moves z2 and z1. z1's move lands first and covers the prompt, but the host has
+    no room for it, so p turns guaranteed and asks for its 6-page footprint. z2's move then covered the prompt again,
+    and p was admitted, guaranteed, with 2 pages."""
+    kv = _pool()
+    kv._cpu_pool = host._HostPool(0)
+    _running(kv, "o", 7, arrival=0)
+    _running(kv, "z1", 2, arrival=2)
+    _running(kv, "z2", 1, arrival=3)
+    for rid in ("z2", "z1"):
+        short = _step(kv, rid, 1).reason.pages_short
+        assert _preempt(kv, rid, short, droppable=lambda rid: False).waits
+        _runner(kv).readmit(rid, NODE)
+    _request(kv, "p", 2, arrival=1, rebuildable=False)
+    assert not _ready(kv, "p")
+    assert _make_room(kv, droppable=lambda rid: True).to_drop == ["z2", "z1"]
+
+    _drop(kv, "z1")
+    assert "p" in kv._guaranteed and not _admitted(kv, "p")
+    _drop(kv, "z2")
+
+    assert "p" not in kv._allotments, "p was admitted guaranteed with less than its footprint"
+    for rid in ("o", "z1", "z2"):
+        _remove(kv, rid)
     assert _admitted(kv, "p") and kv._allotments["p"].pages == 6
 
 
