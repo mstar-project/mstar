@@ -936,6 +936,8 @@ class LLMSubmodule(ARNodeSubmodule):
     forward call names its label.
     """
 
+    checks_own_stop = True
+
     # Plan label the three CFG branches share when they run as one
     # combined plan; see declare_step.
     CFG_BATCHED_LABEL = "_cfg_batched"

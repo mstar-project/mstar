@@ -2903,11 +2903,10 @@ class Engine:
         )
         if policy is None or not policy.eos_tokens:
             return "node: its stop reads no token"
-        sampler = self._submodules[node_name].resources.get(policy.sampler)
-        if not hasattr(sampler, "ask_stop_odds"):
+        resource = self._submodules[node_name].resources.get(policy.sampler)
+        if resource is None:
             return "node: its stop names no sampler"
-        sampler.ask_stop_odds(graph_walk, policy.eos_tokens)
-        return None
+        return resource.ask_stop_odds(graph_walk, policy.eos_tokens)
 
     def get_stop_policies(self, node_name: str, graph_walk: str) -> dict[str, StopPolicy] | None:
         """The node's declared stop policies on ``graph_walk``

@@ -162,3 +162,26 @@ def test_a_bagel_denoise_walk_stops_by_its_count_where_the_runtime_checks_it():
     for walk in DENOISE_WALKS:
         assert llm.get_stop_policies(walk) == {}
         assert llm.check_stop("r", SimpleNamespace(graph_walk=walk), {"latents": [torch.zeros(1)]}) == set()
+
+
+def test_a_class_with_its_own_stop_check_declares_it():
+    """The runtime calls a node's ``check_stop`` only where it says so
+    (``checks_own_stop``): one that forgets would never stop on it."""
+    import ast
+    from pathlib import Path
+
+    from mstar.model import submodule_base
+
+    root = Path(submodule_base.__file__).parent
+    undeclared = []
+    for path in root.rglob("*.py"):
+        for cls in (n for n in ast.walk(ast.parse(path.read_text())) if isinstance(n, ast.ClassDef)):
+            methods = {n.name for n in cls.body if isinstance(n, ast.FunctionDef)}
+            declared = any(
+                isinstance(n, ast.Assign) and getattr(n.targets[0], "id", None) == "checks_own_stop" for n in cls.body
+            )
+            base = cls.name in ("NodeSubmodule", "ARNodeSubmodule")
+            if methods & {"check_stop", "check_stop_batched"} and not declared and not base:
+                undeclared.append(f"{path.name}:{cls.name}")
+    assert sorted(undeclared) == []
+

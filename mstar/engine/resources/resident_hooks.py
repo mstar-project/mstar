@@ -31,6 +31,10 @@ class ResidentHooks:
         build what serves that if there is a choice."""
         return
 
+    def ask_stop_odds(self, walk: str, stop_ids) -> str | None:
+        """Before capture: score ``stop_ids`` on each sample of ``walk``; why it can't, or None."""
+        return f"resource: {type(self).__name__} samples nothing"
+
     def repeat_note(self, walk: str) -> str | None:
         """After capture: what ``ask_repeats`` changed for ``walk``, for its line."""
         return None

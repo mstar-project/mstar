@@ -888,6 +888,11 @@ class NodeSubmodule(torch.nn.Module, ABC):
     # setting, so a new eager shape never searches.
     capture_cudnn_benchmark: bool = False
 
+    # Set True on a class whose own ``check_stop`` or ``check_stop_batched`` decides
+    # its stops: the runtime then calls them rather than a declared policy
+    # (``get_stop_policies``), and a step of the node doesn't repeat.
+    checks_own_stop: bool = False
+
     # Set True where this node's looping walks run on resident tables when the
     # config leaves ``knobs: resident_planning`` at its default (``auto``); which
     # walks still comes from every owner agreeing at load. ``on`` asks every
@@ -1487,7 +1492,7 @@ class NodeSubmodule(torch.nn.Module, ABC):
         ``check_stop`` for every row.
         """
         del graph_walk
-        return {} if _keeps(self, NodeSubmodule, _STOP_CHECK) else None
+        return None if self.checks_own_stop else {}
 
     def check_stop_batched(
         self, request_ids: list[str],
@@ -1607,16 +1612,6 @@ def engine_step(submodule, *args, **kwargs) -> SubmoduleStep | None:
     return step
 
 
-# What a declared stop policy stands in for: a class overriding any keeps check_stop.
-_STOP_CHECK = ("check_stop", "check_stop_batched")
-_TOKEN_STOP_CHECK = (*_STOP_CHECK, "_token_stops")
-
-
-def _keeps(submodule, base: type, names: tuple[str, ...]) -> bool:
-    """Whether ``submodule`` runs ``base``'s own method for each of ``names``."""
-    return all(getattr(getattr(submodule, name), "__func__", None) is getattr(base, name) for name in names)
-
-
 class ARNodeSubmodule(NodeSubmodule):
     # Set True on a submodule whose `split_inputs` cuts its own ``tensor_inputs``.
     # The engine probes the prefix cache for a walk that carries them only then.
@@ -1716,12 +1711,8 @@ class ARNodeSubmodule(NodeSubmodule):
         stop = self.token_stop
         if stop is None:
             # no token to check: the loop's cap stops it, unless the class checks more
-            return {} if _keeps(self, ARNodeSubmodule, _STOP_CHECK) else None
-        if (
-            graph_walk in stop.prefill_walks
-            # a class that overrides the token's stop check answers for it
-            or not _keeps(self, ARNodeSubmodule, _TOKEN_STOP_CHECK)
-        ):
+            return None if self.checks_own_stop else {}
+        if graph_walk in stop.prefill_walks or self.checks_own_stop:
             return None
         if not stop.stops_on(graph_walk):
             return {}  # as `_token_stops`: only a row of ``walk`` ends the loop
