@@ -13,7 +13,8 @@ import torch
 from mstar_sim import clock
 
 
-def _traffic(*args, **kwargs) -> tuple[float, float]:
+def traffic(*args, **kwargs) -> tuple[float, float]:
+    """A kernel's cost by the tensor arguments it touches: ``(0 flops, their bytes)``."""
     nbytes = sum(
         a.numel() * a.element_size()
         for a in (*args, *kwargs.values())
@@ -32,7 +33,7 @@ def install() -> None:
     def launch(self, *args, grid, warmup, **kwargs):
         name = f"triton.{getattr(self.fn, '__name__', 'kernel')}"
 
-        @clock.kernel_fn(name, cost=_traffic, writes_args=True)
+        @clock.kernel_fn(name, cost=traffic, writes_args=True)
         def body(*a, **k):
             return None  # its outputs are value-less: nothing to run
 

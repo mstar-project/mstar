@@ -45,6 +45,9 @@ def install() -> None:
     from mstar_sim import triton_launch
 
     triton_launch.install()
+    from mstar_sim import cpp_extension
+
+    cpp_extension.install()
     from mstar_sim import patches
 
     patches.install()

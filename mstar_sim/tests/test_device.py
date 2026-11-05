@@ -281,6 +281,36 @@ def test_graph_replay_costs_its_kernels_and_reprices_value_dependent_ones():
     assert out.strip() == "ok"
 
 
+def test_a_jit_built_cuda_extension_registers_capturable_ops(tmp_path):
+    """``cpp_extension.load`` of CUDA sources registers their ``TORCH_LIBRARY`` ops as
+    kernels that write their mutable arguments, which a graph captures; an op whose schema
+    comes from C++ fails the build, so mstar keeps its fallback."""
+    (tmp_path / "op.cu").write_text('''
+        TORCH_LIBRARY(mstar_sim_jit, m) {
+          m.def("fill(Tensor x, int n, "
+                "Tensor! out) -> ()");  // a schema in literals, as mstar's moe_align_block_size
+        }''')
+    (tmp_path / "inferred.cu").write_text("TORCH_LIBRARY(mstar_sim_inferred, m) { m.def(\"f\", &f); }")
+    run_sim(f"""
+        import torch
+        from torch.utils.cpp_extension import load
+        from mstar_sim.device import never_computed
+        load(name="jit", sources=["{tmp_path}/op.cu"], is_python_module=False)
+        x, out = torch.ones(4, device="cuda"), torch.zeros(8, dtype=torch.int32, device="cuda")
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            torch.ops.mstar_sim_jit.fill(x, 3, out)
+        assert not never_computed(out._data)  # capture runs nothing
+        graph.replay()
+        assert never_computed(out._data) and not never_computed(x._data)
+        try:
+            load(name="inferred", sources=["{tmp_path}/inferred.cu"], is_python_module=False)
+            raise SystemExit("a schema inferred from C++ was accepted")
+        except RuntimeError as e:
+            assert "Error building extension" in str(e)
+    """)
+
+
 @pytest.mark.parametrize("gpu", ["h100", "b200"])
 def test_device_time_follows_the_cost_model_not_the_host(gpu):
     """A big GEMM takes its simulated time on the device, while the host that
