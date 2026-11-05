@@ -15,6 +15,7 @@ class RequestType(Enum):
     T2T = "text_to_text"
     T2I = "text_to_image"
     T2S = "text_to_speech"
+    T2V = "text_to_video"            # generated clip, saved as mp4
 
     # Robotics
     VLA = "vision_language_action"   # images + text → action  (pi0.5)
@@ -24,6 +25,7 @@ class RequestType(Enum):
     I2T = "image_to_text"
     I2I = "image_to_image"
     I2S = "image_to_speech"
+    I2V = "image_to_video"           # first frame + text → clip, saved as mp4
 
     # Audio input
     A2T = "audio_to_text"
@@ -42,10 +44,12 @@ class RequestType(Enum):
             return "action"
         if self == RequestType.V2V:
             return "video"
+        if self in [RequestType.T2V, RequestType.I2V]:
+            return "video_file"
         return "text"
 
     def get_input_modalities(self):
-        if self in [RequestType.I2I, RequestType.I2T, RequestType.I2S]:
+        if self in [RequestType.I2I, RequestType.I2T, RequestType.I2S, RequestType.I2V]:
             return "image"
         if self in [RequestType.V2T, RequestType.V2S, RequestType.V2V]:
             return "video"
@@ -446,6 +450,53 @@ class HiggsAudio(Model):
         }
 
 
+class DiffusionModel(Model):
+    """Image and video generators on the OpenAI image and video routes. Steps, guidance, size and frame
+    count travel with each request (benchmark.amd passes them with --request-kwargs)."""
+
+    HF_URL = ""
+    MODALITIES: frozenset = frozenset()
+
+    def get_hf_url(self):
+        return self.HF_URL
+
+    def get_supported_modalities(self):
+        return set(self.MODALITIES)
+
+    def get_tokenizer(self):
+        return None
+
+
+class Flux2Klein(DiffusionModel):
+    HF_URL = "black-forest-labs/FLUX.2-klein-4B"
+    MODALITIES = frozenset({RequestType.T2I})
+
+
+class Flux2Klein9b(DiffusionModel):
+    HF_URL = "black-forest-labs/FLUX.2-klein-9B"
+    MODALITIES = frozenset({RequestType.T2I})
+
+
+class ZImageTurbo(DiffusionModel):
+    HF_URL = "Tongyi-MAI/Z-Image-Turbo"
+    MODALITIES = frozenset({RequestType.T2I})
+
+
+class Wan22(DiffusionModel):
+    HF_URL = "Wan-AI/Wan2.2-TI2V-5B-Diffusers"
+    MODALITIES = frozenset({RequestType.T2V, RequestType.I2V})
+
+
+class Cosmos3Nano(DiffusionModel):
+    HF_URL = "nvidia/Cosmos3-Nano"
+    MODALITIES = frozenset({RequestType.T2V, RequestType.T2I, RequestType.I2V})
+
+
+class Cosmos3Edge(DiffusionModel):
+    HF_URL = "nvidia/Cosmos3-Edge"
+    MODALITIES = frozenset({RequestType.T2V})
+
+
 class _FastConformerAsr(Model):
     """NVIDIA's FastConformer speech recognizers: audio in, a transcript out, greedy."""
 
@@ -495,6 +546,12 @@ class ModelType(Enum):
     NEMOTRON_ASR = "nemotron_asr"
     QWEN3_5 = "qwen3.5"
     QWEN3_8 = "qwen3.8"
+    FLUX2_KLEIN = "flux2_klein"
+    FLUX2_KLEIN_9B = "flux2_klein_9b"
+    Z_IMAGE_TURBO = "z_image_turbo"
+    WAN22 = "wan22"
+    COSMOS3_NANO = "cosmos3_nano"
+    COSMOS3_EDGE = "cosmos3_edge"
 
     def inst(self, **kwargs) -> Model:
         if self == ModelType.BAGEL:
@@ -539,4 +596,9 @@ class ModelType(Enum):
             return Qwen3_5_Dense(**kwargs)
         if self == ModelType.QWEN3_8:
             return Qwen3_8_Dense(**kwargs)
+        diffusion = {ModelType.FLUX2_KLEIN: Flux2Klein, ModelType.FLUX2_KLEIN_9B: Flux2Klein9b,
+                     ModelType.Z_IMAGE_TURBO: ZImageTurbo, ModelType.WAN22: Wan22, ModelType.COSMOS3_NANO: Cosmos3Nano,
+                     ModelType.COSMOS3_EDGE: Cosmos3Edge}
+        if self in diffusion:
+            return diffusion[self](**kwargs)
         raise NotImplementedError(f"Unknown model type {self}")
