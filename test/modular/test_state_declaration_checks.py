@@ -185,6 +185,21 @@ def _declarations() -> list[Array]:
     ]
 
 
+def _empty_value() -> Array:
+    entry = Entry({"state": TensorType((4, 8, 8), dtype=torch.float32, shard=0)})
+    return Value("gdn", nodes={"LLM"}, layers=set(), entry=entry, updates={"delta": GatedDeltaNet()})
+
+
+def test_a_value_with_no_layers_has_no_problems():
+    assert state_declaration_problems(_StubModel(_array(), _empty_value())) == []
+
+
+def test_the_digest_tells_a_value_with_no_layers_from_one_with_a_layer():
+    empty = _empty_value()
+    with_layer = Value(empty.name, nodes=empty.nodes, layers={0}, entry=empty.entry, updates=empty.updates)
+    assert declaration_digest([empty]) != declaration_digest([with_layer])
+
+
 def test_the_digest_ignores_the_order_of_arrays_and_keys():
     a, b = _declarations()
     swapped = Array(a.name, nodes=a.nodes, layers=a.layers, entry=a.entry, max_len=a.max_len,

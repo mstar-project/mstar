@@ -122,6 +122,22 @@ def test_a_value_may_declare_no_conv_update():
     assert set(_by_key(_kv(), _gdn(updates={"delta": GatedDeltaNet()}))) == {"kv", "attn", "gdn", "delta"}
 
 
+def test_a_value_with_no_layers_builds_a_pool_of_no_layers_and_its_linear_attention():
+    specs = _by_key(_kv(), _gdn(layers=set()), kernel_settings={"delta": {"splits": (_SPLIT,)}})
+    assert specs["gdn"].config.num_layers == 0 and specs["gdn"].config.kv_cache == "kv"
+    assert specs["delta"].config.recurrent_state == "gdn" and specs["delta"].config.splits == (_SPLIT,), (
+        "a model's kernel settings don't depend on its having linear layers"
+    )
+
+
+def test_a_pool_built_with_no_layers_stores_nothing_and_still_fingerprints():
+    entry = Entry({"state": _gdn_entry().tensors["state"], "conv": TensorType((1024, 0), dtype=None, shard=0)})
+    config = replace(_by_key(_kv(), _gdn(layers=set(), entry=entry))["gdn"].config, max_slots=4)
+    pool = RecurrentStatePool(torch.device("cpu"), config, kv_dtype=torch.bfloat16)
+    assert pool._blocks["conv"].numel() == 0 and pool._blocks["conv"].dtype is torch.bfloat16
+    assert pool.fingerprint(), "the fingerprint reads each block's dtype, which a pool with no layers still has"
+
+
 def test_a_pool_links_to_the_one_append_only_array_on_its_nodes():
     config = _by_key(_kv(), _gdn())["gdn"].config
     assert config.num_layers == 3 and config.kv_cache == "kv"

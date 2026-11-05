@@ -78,7 +78,19 @@ REFUSALS = {
                                             "Array 'kv'.reads['r'].layers"),
     "a mask as a read": (lambda: _array(reads={"r": Causal()}), "Array 'kv'.reads['r']"),
     "no nodes": (lambda: _array(nodes=set()), "Array 'kv'.nodes"),
-    "no layers": (lambda: _array(layers=set()), "Array 'kv'.layers"),
+    "no layers": (lambda: _array(layers=set()), "Array 'kv'.layers is empty, and only a Value"),
+    "no layers on a rewritable log": (lambda: _array(layers=set(), rewritable=True),
+                                      "Array 'kv'.layers is empty, and only a Value"),
+    "no layers on one append-only entry": (lambda: _array(layers=set(), max_len=1),
+                                           "Array 'kv'.layers is empty, and only a Value"),
+    "negative axis with no layers": (
+        lambda: _value(layers=set(), entry=Entry({"conv": TensorType((32, -1), dtype=None)})),
+        "Array 'gdn'.entry.tensors['conv'].shape",
+    ),
+    "float axis with no layers": (
+        lambda: _value(layers=set(), entry=Entry({"conv": TensorType((32, 0.0), dtype=None)})),
+        "Array 'gdn'.entry.tensors['conv'].shape",
+    ),
     "negative layer": (lambda: _array(layers={-1}), "Array 'kv'.layers"),
     "max_len of zero": (lambda: _array(max_len=0), "Array 'kv'.max_len"),
     "read layer outside": (lambda: _array(reads={"r": _read(layers={7})}), "Array 'kv'.reads['r'].layers"),
@@ -184,6 +196,17 @@ def test_a_declaration_cannot_be_assigned_to():
 def test_a_value_is_a_rewritable_array_of_one_entry():
     value = _value()
     assert value.rewritable and value.max_len == 1
+
+
+def test_a_value_may_declare_no_layers():
+    assert _value(layers=set()).layers == frozenset(), "main builds a recurrent pool no layer reads"
+
+
+def test_a_value_with_no_layers_may_hold_an_empty_axis():
+    conv = TensorType((32, 0), dtype=None, shard=0)
+    assert _value(layers=set(), entry=Entry({"conv": conv})).entry.tensors["conv"] == conv, (
+        "a pool with no layers stores nothing, so main serves a conv kernel of 1 on a model with no linear layers"
+    )
 
 
 def test_kv_entry_is_k_and_v_sharded_on_the_heads():

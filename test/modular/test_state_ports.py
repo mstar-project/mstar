@@ -219,6 +219,34 @@ def test_qwen3_5_conv_follows_the_engine_dtype_and_its_state_does_not():
     assert blocks["state"].resolved_dtype(torch.float16) is torch.float32, "the state's dtype comes from the checkpoint"
 
 
+# Qwen/Qwen3.5-9B cut to 4 layers, all full attention. `main` serves this shape, at either kernel, with a pool no layer
+# reads, and no published config has it.
+_ALL_FULL = {**QWEN3_5["9B"], "num_hidden_layers": 4, "layer_types": [FULL_ATTENTION] * 4}
+_ALL_FULL_KERNELS = pytest.mark.parametrize("kernel", [4, 1], ids=["kernel 4", "kernel 1"])
+
+
+@_ALL_FULL_KERNELS
+def test_qwen3_5_all_full_specs_equal_the_hand_written_ones(kernel):
+    model = _qwen3_5(**{**_ALL_FULL, "linear_conv_kernel_dim": kernel})
+    specs = node_resources(model)
+    _assert_equal_per_key(specs, _qwen3_5_reference(model.config))
+    pool = {spec.resource_key: spec for spec in specs}[GDN_STATE].config
+    assert pool.num_layers == 0 and pool.blocks["conv"].shape == (8192, kernel - 1), "not the all-full shape"
+
+
+@_ALL_FULL_KERNELS
+def test_qwen3_5_all_full_specs_equal_the_hand_written_ones_after_yaml_overrides(kernel):
+    model = _qwen3_5(**{**_ALL_FULL, "linear_conv_kernel_dim": kernel})
+    reference = _qwen3_5_reference(model.config)
+    apply_yaml_overrides(reference, QWEN3_5_OVERRIDES)
+    _assert_equal_per_key(serving_resources(model, QWEN3_5_OVERRIDES), reference)
+
+
+@_ALL_FULL_KERNELS
+def test_qwen3_5_all_full_declarations_have_no_problems(kernel):
+    assert state_declaration_problems(_qwen3_5(**{**_ALL_FULL, "linear_conv_kernel_dim": kernel})) == []
+
+
 @pytest.mark.parametrize("overrides, where", [
     ({"layer_types": [LINEAR_ATTENTION] * 32}, "Array 'kv_cache'.layers"),
     ({"linear_conv_kernel_dim": 1}, "Array 'gdn_state'.entry.tensors['conv'].shape"),
