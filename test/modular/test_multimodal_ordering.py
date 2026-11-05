@@ -575,9 +575,7 @@ def test_bagel_spans_come_from_one_tokenization(bagel):
         PromptPart(modality="image", index=0),
         PromptPart(modality="text", text="B"),
     ]
-    rendered = bagel._render_prompt(
-        parts, is_understanding=True, system_prompt=bagel.BAGEL_DEFAULT_SYSTEM_PROMPT
-    )
+    rendered = bagel._render_role_turns(parts, think_mode=False)
     assert bagel.IMAGE_PLACEHOLDER in rendered
     spans = bagel.process_prompt(
         "A\nB", [p.modality for p in parts], ["text"], prompt_parts=parts
