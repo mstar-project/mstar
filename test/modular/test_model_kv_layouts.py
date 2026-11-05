@@ -457,6 +457,17 @@ def test_higgs_lays_out_the_prefill_step_it_runs():
     assert sum(span.length for span in layout.spans) == text + audio
 
 
+@pytest.mark.parametrize("drafts", [0, 3])
+def test_qwen3_5_keys_its_prompts_only_without_speculation(drafts):
+    # a speculative node keeps no prefix, and the deployment check refuses a keyed label there
+    from mstar.model.base import keyed_labels
+    from mstar.model.qwen3_5.qwen3_5_model import Qwen3_5DenseModel
+
+    model = object.__new__(Qwen3_5DenseModel)
+    model.num_draft_tokens = drafts
+    assert bool(keyed_labels(model)) == (drafts == 0)
+
+
 def _omni_submodule():
     return SimpleNamespace(config=SimpleNamespace(im_end_token_id=0, talker=SimpleNamespace(codec_eos_token_id=0)))
 

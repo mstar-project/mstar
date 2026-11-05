@@ -122,6 +122,8 @@ class AiterGDNKernels(GDNKernels):
         self._dt_bias: dict[int, tuple[torch.Tensor, int, torch.Tensor]] = {}
         # [0, 1, ..., n] for one-token rows, grown outside capture
         self._row_offsets: torch.Tensor | None = None
+        # verify outputs by shape and dtype; see `verify_output`
+        self._verify_out: dict[tuple, torch.Tensor] = {}
 
     @classmethod
     def build(
@@ -219,6 +221,11 @@ class AiterGDNKernels(GDNKernels):
             return FlyDSLDecode(self)
         return AiterSequentialDecode(self)
 
+    def verify(self) -> GDNPrefillKernel:
+        if self.flydsl_decode:
+            return FlyDSLVerify(self)
+        return AiterVerify(self)
+
     # Shared state
 
     def dt_bias_as(self, dt_bias: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
@@ -256,6 +263,30 @@ class AiterGDNKernels(GDNKernels):
                 max(rows, 128) + 1, dtype=torch.int32, device=device,
             )
         return self._row_offsets[: rows + 1]
+
+    def verify_output(
+        self, rows: int, tokens: int, dtype: torch.dtype, device: torch.device,
+    ) -> torch.Tensor:
+        """``[rows, tokens, V heads, V]`` for FlyDSL's verify kernel to write.
+
+        The kernel skips padding rows without writing them, so a zeroed buffer
+        kept across steps leaves them finite with no fill per layer. Layers run
+        one after another on one stream, so they all share it. Allocated
+        outside capture, like ``dt_bias_as``.
+        """
+        key = (rows, tokens, dtype, device)
+        out = self._verify_out.get(key)
+        if out is None:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "gdn verify first saw this shape inside graph capture; "
+                    "capture must follow an eager warmup"
+                )
+            geometry = self.geometry
+            out = self._verify_out[key] = torch.zeros(
+                (rows, tokens, geometry.num_v_heads, geometry.head_v_dim), dtype=dtype, device=device,
+            )
+        return out
 
 
 class AiterChunkedPrefill(GDNPrefillKernel):
@@ -466,6 +497,74 @@ class AiterSequentialDecode(GDNDecodeKernel):
             cu_seqlens=self._kernels.row_offsets(n, q.device),
             # one token per row, so a 1-D map is each row's read and write slot
             ssm_state_indices=plan.slots,
+            use_qk_l2norm_in_kernel=self._kernels.qk_l2norm,
+            core_attn_out=out,
+        )
+        return out
+
+
+class FlyDSLVerify(GDNPrefillKernel):
+    """FlyDSL's delta rule over a linear draft chain, for a speculative verify
+    step: each row's k + 1 tokens from the state its last step accepted, the
+    state after every token kept in its own slot (see ``GDNVerifyPlan``).
+    q/k/v/a/b are read as the projection's column views, so unlike the
+    sequential kernel nothing is packed or copied per layer.
+
+    Compiled on first call per launch shape, in each bucket's eager warmup.
+    """
+
+    takes_strided_inputs = True
+
+    def __init__(self, kernels: AiterGDNKernels):
+        self._kernels = kernels
+        self.qk_l2norm_in_kernel = kernels.qk_l2norm
+
+    def run(self, plan, q, k, v, a, b, state, a_log, dt_bias):
+        from aiter.ops.flydsl.linear_attention_kernels import flydsl_gdr_mtp
+
+        chain = (plan.num_rows, plan.tokens_per_row)
+        out = self._kernels.verify_output(*chain, q.dtype, q.device)
+        flydsl_gdr_mtp(
+            q.unflatten(0, chain), k.unflatten(0, chain), v.unflatten(0, chain),
+            a.unflatten(0, chain), b.unflatten(0, chain),
+            self._kernels.dt_bias_as(dt_bias, q.dtype), a_log, state, out,
+            plan.slot_map, plan.num_accepted,
+            use_qk_l2norm=self._kernels.qk_l2norm,
+        )
+        return out.flatten(0, 1)
+
+
+class AiterVerify(GDNPrefillKernel):
+    """The sequential kernel over a speculative verify step: each row's k + 1
+    tokens from the state its last step accepted (``num_accepted_tokens``
+    picks the column of the row's slot map), the state after every token kept
+    in its own slot (see ``GDNVerifyPlan``)."""
+
+    takes_strided_inputs = True
+
+    def __init__(self, kernels: AiterGDNKernels):
+        self._kernels = kernels
+        self.qk_l2norm_in_kernel = kernels.qk_l2norm
+
+    def run(self, plan, q, k, v, a, b, state, a_log, dt_bias):
+        from aiter.ops.triton.gated_delta_net import (
+            fused_rearrange_sigmoid_gated_delta_rule,
+        )
+
+        n = q.shape[0]
+        qkv = torch.cat((q.reshape(n, -1), k.reshape(n, -1), v.reshape(n, -1)), dim=-1)
+        # skipped (padding) rows are never written; zeros keep them finite
+        out = torch.zeros((n, v.shape[1], v.shape[2]), dtype=q.dtype, device=q.device)
+        fused_rearrange_sigmoid_gated_delta_rule(
+            A_log=a_log, a=a, b=b, dt_bias=dt_bias, qkv=qkv,
+            key_dim=q.shape[1] * q.shape[2], value_dim=v.shape[1] * v.shape[2],
+            head_k_dim=q.shape[2], head_v_dim=v.shape[2],
+            scale=self._kernels.scale,
+            initial_state=state,
+            inplace_final_state=True,
+            cu_seqlens=plan.cu_seqlens,
+            ssm_state_indices=plan.slot_map,
+            num_accepted_tokens=plan.num_accepted,
             use_qk_l2norm_in_kernel=self._kernels.qk_l2norm,
             core_attn_out=out,
         )

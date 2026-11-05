@@ -544,6 +544,21 @@ supported yet. On any deployment,
 ``"return_token_ids": true`` adds each text chunk's sampled ids
 (``{"token_ids": [...]}``), stop tokens included, so a trainer need not
 re-tokenize the text.
+Speculative decoding with the checkpoints' MTP head (AMD GPUs): serve
+``configs/qwen3_5_{0.8b,9b}_mtp{2,3}.yaml``, which set ``model_kwargs:
+{num_draft_tokens: k}``. Each decode step verifies ``k`` drafts of the head and
+drafts the next ``k``, in one captured graph, and streams the 1 to ``k + 1``
+tokens it accepts as one chunk. A request holds ``k + 1`` recurrent-state slots,
+so ``gdn_state.max_slots`` is ``1 + concurrency * (k + 1)`` (the configs: 64
+requests); the KV cache gains one layer for the head. The ``mtp3`` configs verify
+greedily and refuse ``temperature > 0``; the ``mtp2`` ones set ``spec_sampling:
+true`` and also sample (temperature, ``top_p``, ``top_k``; a second decode capture),
+seeded by the request but not reproducing the plain path's draws. Neither takes
+``repetition_penalty``. The configs set ``draft_head: fp8``: drafts read an fp8 copy
+of ``lm_head`` (one rank; ``draft_head: bf16`` keeps one head), which gives up about
+1 % of the accepted drafts for a step about 6 % cheaper at 9B c=1 on MI325X, and the
+verify always reads the full head. They need
+AITER's attention (device-side KV lengths) and are checked on text prompts. See "Speculative decoding" in :doc:`adding_models` for the design.
 
 Qwen3.8-27B (``qwen3_8_27b``) is the Qwen3.5 architecture and runs on the same
 code, served from ``configs/qwen3_8_27b_tp4.yaml`` (TP4)::

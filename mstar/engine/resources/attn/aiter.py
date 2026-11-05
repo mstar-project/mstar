@@ -418,6 +418,13 @@ class _UnifiedPlans:
 _DELEGATED = object()
 
 
+# The context a captured decode step's kernel variant is chosen for. The cache's whole
+# context (32768) launches 128 segments a row for keys that rarely fill two. MI325X, 4
+# K/V heads: 1 row 13.2 -> 11.0 us at 200 keys, 19.4 -> 16.2 at 4k, 105 -> 98 at 32k, 16
+# rows 20.5 -> 17.2, 64 rows level, 4 rows at 16k the one loss (177 -> 189).
+DECODE_SEGMENT_PIN = 4096
+
+
 class AiterPagedAttentionManager(_UnifiedPlans, AttentionManager):
     """Paged attention on AITER's unified attention (see the module docstring).
 
@@ -457,6 +464,10 @@ class AiterPagedAttentionManager(_UnifiedPlans, AttentionManager):
         self._preplan_delegated = False
         # FlashInfer manager for non-causal steps with multi-query rows
         self._fallback: AttentionManager | None = None
+        # [0, 1, ..., rows], for a step that attends one query a row off a plan
+        # staged with more (`attend_rows`); grown when planning, never in a graph
+        self._row_starts: torch.Tensor | None = None
+        self._retired_row_starts: list[torch.Tensor | None] = []
 
     def depends_on(self):
         return {self._kv_cache_name}
@@ -512,7 +523,7 @@ class AiterPagedAttentionManager(_UnifiedPlans, AttentionManager):
             self._preplan_plans = {}
             self._preplanned = False
             self._preplan_delegated = False
-            return
+            return self._current_plans
 
         plan_outputs: KVPlanOutputs = ctx.plan_results.get(self._kv_cache_name)
         assert plan_outputs is not None, (
@@ -534,7 +545,9 @@ class AiterPagedAttentionManager(_UnifiedPlans, AttentionManager):
             plans = dict.fromkeys(rows, _DELEGATED)
         elif lease is not None:
             plans = {
-                label: self._stage_captured(label, r, lease, ctx.force_prefill)
+                label: self._stage_captured(
+                    label, r, lease, ctx.force_prefill, step.row_queries,
+                )
                 for label, r in rows.items()
             }
         else:
@@ -546,6 +559,9 @@ class AiterPagedAttentionManager(_UnifiedPlans, AttentionManager):
             self._preplanned = True
         else:
             self._current_plans = plans
+        # label -> `_Staged` (or the fallback's marker): the device views a
+        # speculative step rewrites in-graph (`SpecDecodeResource`)
+        return plans
 
     def _check_kind(self, lease: SlotLease, label: str, kind: object) -> None:
         key = CGSlotKey(bucket=lease.bucket, slot=lease.slot, label=label)
@@ -559,6 +575,7 @@ class AiterPagedAttentionManager(_UnifiedPlans, AttentionManager):
 
     def _stage_captured(
         self, label: str, rows: _Rows, lease: SlotLease, force_prefill: bool,
+        row_queries: int | None = None,
     ) -> _Staged:
         num_rows = rows.qo_indptr.shape[0] - 1
         # a decode bucket always has one token per row, while one row of a
@@ -566,6 +583,15 @@ class AiterPagedAttentionManager(_UnifiedPlans, AttentionManager):
         # as many rows as tokens and replays mixed steps (`force_prefill`)
         num_tokens = lease.bucket.num_tokens
         max_q = 1 if num_rows == num_tokens and not force_prefill else num_tokens
+        if row_queries is not None and not force_prefill:
+            # every row declared the same query count (a verify step)
+            max_q = row_queries
+            self._reserve_row_starts(num_rows)
+            if num_rows and int(np.diff(rows.qo_indptr).max()) > row_queries:
+                raise RuntimeError(
+                    f"AITER attention: bucket {lease.bucket} planned a row with "
+                    f"more than the {row_queries} queries its step declared"
+                )
         if max_q == 1 and not single_query_rows(rows.qo_indptr):
             raise RuntimeError(
                 f"AITER attention: decode bucket {lease.bucket} planned a row "
@@ -573,13 +599,24 @@ class AiterPagedAttentionManager(_UnifiedPlans, AttentionManager):
             )
         self._check_kind(lease, label, (num_rows, max_q))
         image = self._cg_image(lease, label, _image_numel(num_rows, self._cg_width))
+        # A decode row's pin only picks how many segments split its keys, and the
+        # kernel covers a longer row by widening them, so a row past this still reads
+        # every key.
+        max_k = self._kv_config.max_seq_len
         return stage_plan(
             image, rows, self._cg_width, self._pad_cols,
-            max_q, self._kv_config.max_seq_len,
+            max_q, min(max_k, DECODE_SEGMENT_PIN) if max_q == 1 else max_k,
         )
+
+    def _reserve_row_starts(self, rows: int) -> None:
+        if self._row_starts is None or self._row_starts.numel() <= rows:
+            # captured graphs keep reading the buffer they recorded
+            self._retired_row_starts.append(self._row_starts)
+            self._row_starts = torch.arange(max(rows, 128) + 1, dtype=torch.int32, device=self._device)
 
     def _stage_eager(self, label: str, rows: _Rows, slot: int) -> _Staged:
         num_rows = rows.qo_indptr.shape[0] - 1
+        self._reserve_row_starts(num_rows)
         counts = np.diff(rows.kv_indptr)
         width = (int(counts.max()) if num_rows else 0) + self._pad_cols
         image = self._eager_image(label, slot, _image_numel(num_rows, width))
@@ -635,6 +672,19 @@ class AiterPagedAttentionManager(_UnifiedPlans, AttentionManager):
         if plan is _DELEGATED:
             return self._fallback.run(q, label, kv_cache_layer)
         return self._unified(q, plan, kv_cache_layer)
+
+    @torch.compiler.disable
+    def attend_rows(
+        self, q: torch.Tensor, kv_cache_layer: torch.Tensor, kv_lens: torch.Tensor,
+        label: str = "main",
+    ) -> torch.Tensor:
+        """One query a row over this step's block table, each row reading
+        ``kv_lens`` keys, whatever query count the step was planned for."""
+        rows = q.shape[0]
+        plan = self._current_plans[label]
+        return self._unified(q, plan._replace(
+            cu_seqlens_q=self._row_starts[: rows + 1], seqused_k=kv_lens, max_seqlen_q=1, num_tokens=rows,
+        ), kv_cache_layer)
 
 
 class AiterCrossManager(_UnifiedPlans, CrossAttentionManager):

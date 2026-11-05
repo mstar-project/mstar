@@ -74,6 +74,11 @@ class AcceleratorGraphConfig(ABC):
         # which can pick the wrong dim when an unrelated axis happens to
         # match the bucket's token count.
         input_seq_dims: dict[str, int] | None = None,
+        # Compile one graph whose bucket-varying dims are dynamic, rather than
+        # one per bucket (size 1 still gets its own). For forwards whose
+        # kernels gain little from a fixed size, e.g. an encoder over
+        # fixed-size windows; each bucket is still captured on its own.
+        compile_dynamic: bool = False,
     ):
         self.capture_graph_walk = capture_graph_walk
         self.replay_graph_walks = replay_graph_walks or [capture_graph_walk]
@@ -90,6 +95,7 @@ class AcceleratorGraphConfig(ABC):
         # scales by this. Subclasses that support it set it.
         self.total_tokens_multiplier = 1
         self.input_seq_dims = input_seq_dims
+        self.compile_dynamic = compile_dynamic
 
     @abstractmethod
     def get_config_type(self) -> AcceleratorGraphConfigType:
@@ -118,6 +124,8 @@ class BatchedAcceleratorGraphConfig(AcceleratorGraphConfig):
         total_tokens_multiplier: int = 1,
         compile_mode: str | None = None,
         input_seq_dims: dict[str, int] | None = None,
+        compile_dynamic: bool = False,
+        decode_rows: bool = False,
     ):
         super().__init__(
             capture_graph_walk=capture_graph_walk,
@@ -129,8 +137,12 @@ class BatchedAcceleratorGraphConfig(AcceleratorGraphConfig):
             capture_forward_method=capture_forward_method,
             caps_eager_batch_size=caps_eager_batch_size,
             input_seq_dims=input_seq_dims,
+            compile_dynamic=compile_dynamic,
         )
         self.single_request_inputs = single_request_inputs
+        # A few tokens a row that are decode all the same (a speculative verify
+        # row): the platform compiles the bucket by its rows, as decode.
+        self.decode_rows = decode_rows
         # ``single_request_inputs.input_seq_len`` is also read per-label by the
         # submodule's own ``declare_step`` (e.g. replicated across cond/uncond
         # labels for a combined guidance step), so it must stay a per-label
