@@ -483,8 +483,8 @@ how many pages such requests can hold with only their prompt reserved.
 
 Above one rank, and on a node with a second paged KV cache, such as Whisper's decoder, a decode
 step that finds no page and nothing to offload holds its requests until they time out. Elsewhere
-at one rank, a request that runs short and can neither move to the host nor be dropped waits in
-its pool's queue, at its arrival, until its shortage fits, when moving or dropping the newer
+at one rank, a request that runs short and can neither move to the host nor be dropped waits
+holding its pages until its shortage fits, when moving or dropping the newer
 requests wouldn't cover it. Several such requests can wait on each other.
 ``max_concurrent_requests`` prevents both. It caps how many requests run at once, and the pool's
 pages divided by the pages one request needs, prompt and output together, is a safe value.

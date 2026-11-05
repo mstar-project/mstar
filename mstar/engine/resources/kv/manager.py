@@ -4880,7 +4880,8 @@ class KVManager(AttentionResource):
         """Take ``rid`` off the earmark it is a victim of, now that its move or removal made ``freed`` room, and
         grow the allotment of the request that ran short by that room, up to what its shortage still lacks. A
         victim that asks again at once is then measured against the room without it. A waiting request the moves
-        were for takes the room as soon as it covers all it asks for, before a victim can take it back."""
+        were for takes the room as soon as it covers all it asks for, before a victim can take it back, and the moves
+        that land after that add nothing."""
         self._hosted.discard(rid)
         earmark = self._victims.pop(rid, None)
         if earmark is None:
@@ -4891,10 +4892,12 @@ class KVManager(AttentionResource):
         if earmark.rid in self._asks:
             if earmark.pages <= self._room():
                 self._admit(earmark.rid, earmark.pages)
+                earmark.granted = earmark.pages
             return
         granted = min(earmark.pages - earmark.granted, freed)
-        earmark.granted += granted
-        self._allot(earmark.rid, granted)
+        if granted:
+            earmark.granted += granted
+            self._allot(earmark.rid, granted)
 
     def _vacate(self, rid: str, room: int) -> None:
         """Give up ``rid``'s allotment, so that ``rid`` asks again, once a drop or a move to the host has freed its
