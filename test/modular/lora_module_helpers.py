@@ -747,7 +747,7 @@ def _qwen3_tts():
             num_hidden_layers=2, text_hidden_size=8, text_vocab_size=32, **dims,
             code_predictor=Qwen3TTSCodePredictorConfig(num_hidden_layers=1, **dims),
         )),
-        lora_spec=lambda c: _declared(model_object(Qwen3TTSModel, c)),
+        lora_spec=lambda c: _declared(model_object(Qwen3TTSModel, c, codec_dtype=torch.float32)),
         # the code predictor sits beside the Talker, with relative paths of the same shape
         build=lambda c, group, w: TalkerSubmodule(
             _loaded(Qwen3TTSTalkerModel(c, comm_group=group).to(DTYPE), w),
@@ -759,7 +759,7 @@ def _qwen3_tts():
         run=_ids_run(lambda s: s.model, lambda s, ids: s.model.model.codec_embedding(ids),
                      lambda s, x: s.model(x, label="main"), lambda s, x: s.model.codec_head(x)),
         declare=_declare("talker_prefill"), inputs=_tokens(lambda c: c.talker.vocab_size),
-        released=lambda: (model_object(Qwen3TTSModel, Qwen3TTSModelConfig()),
+        released=lambda: (model_object(Qwen3TTSModel, Qwen3TTSModelConfig(), codec_dtype=torch.float32),
                           lambda c, g: Qwen3TTSTalkerModel(c, comm_group=g)),
         a1_rename=lambda m: f"talker.{m}",
     )

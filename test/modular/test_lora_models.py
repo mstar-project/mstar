@@ -486,10 +486,9 @@ def test_qwen3_5_vision_rows_match_the_merged_tower(tmp_path, mode, adapter):
 
 
 def test_qwen3_5_compiled_patch_embed_with_an_adapter_row_matches_eager(tmp_path):
-    """The bound conv patch embed cuts its patches and adds its delta through views that
-    Inductor traces inside the ``model.embed`` region, compiled as ``compile_regions``
-    compiles it (dynamic in the patch count): equal to eager with an adapter row, at two
-    patch counts."""
+    """The bound patch projection (its GEMM plus the delta) compiled inside the
+    ``model.embed`` region, as ``compile_regions`` compiles it (dynamic in the patch
+    count): equal to eager with an adapter row, at two patch counts."""
     path, _ = write_vision_adapter(tmp_path / "v")
     lora_pool = _vision_pool({"v": path})
     sub = _vision_node(tower(), {VISION_POOL: lora_pool})
