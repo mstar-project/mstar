@@ -338,6 +338,7 @@ class OffloadDelta:
 
 - Every rank checks each grant against the reservations. Only rank 0 queues, runs the fit check, chooses victims and makes a request wait.
 - Rank 0 moves a victim in the call that chose it, as at one rank, and tears no request down while its journal holds moves.
+- The victims a waiting request chooses (§3.3) go out as its reservation, naming them, since only rank 0 knows the request waits. Every rank then admits it as their moves land, and turns it guaranteed there when the host has no room left. Rank 0 journals nothing from inside a move, which a follower would replay before the move frees the room.
 - A follower drops a request with the tokens rank 0's rebuild writes, which its own KV refuses unless it holds as many.
 - A rebuild row rides `ScheduleTPNode` as any row mid-prefill does, with its chunk range. A follower knows the row from its own KV, which replayed rank 0's drop, starts the rebuild at its first row, and builds its input from its own kept ids, which match, since every rank samples rank 0's token.
 - A follower whose counts can't take a move exits.
