@@ -3,6 +3,7 @@
 import json
 import types
 
+import numpy as np
 import pytest
 import torch
 from safetensors import safe_open
@@ -37,7 +38,7 @@ def test_copy_keeps_every_tensor_header_and_only_small_tensors_data(tmp_path):
 
     out = tmp_path / "out"
     manifest = synthesize(str(src), out)
-    assert manifest["param_count"] == 4096 * 1024 + 1024 * 1024 + 1024
+    assert manifest["param_count"] == 4096 * 1024 + 1024 * 1024 + 1024 + 2 * (3 << 20) + 1  # torch assets too
     for name, tensors in shards.items():
         with safe_open(str(out / name), framework="pt") as f:
             assert {k: (f.get_slice(k).get_shape(), f.get_slice(k).get_dtype()) for k in f.keys()} == {
@@ -57,6 +58,50 @@ def test_copy_keeps_every_tensor_header_and_only_small_tensors_data(tmp_path):
     stamp = (out / "config.json").stat().st_mtime_ns
     synthesize(str(src), out)  # the same source: reused
     assert (out / "config.json").stat().st_mtime_ns == stamp
+
+
+def _protobuf(*fields) -> bytes:
+    """A protobuf message of ``(number, value)`` fields: an int is a varint, bytes are
+    length-delimited."""
+    def varint(n):
+        out = b""
+        while True:
+            out += bytes([n & 0x7F | (0x80 if n > 0x7F else 0)])
+            n >>= 7
+            if not n:
+                return out
+    return b"".join(varint(n << 3) + varint(v) if isinstance(v, int) else varint(n << 3 | 2) + varint(len(v)) + v
+                    for n, v in fields)
+
+
+def test_a_checkpoint_of_torch_and_onnx_weights_copies_shapes_only(tmp_path):
+    """Weights with no safetensors (Kokoro's ``.pth``, CosyVoice3's speech tokenizer ``.onnx``,
+    which mstar reads into torch modules) are copied shapes-only: the ONNX file byte for byte
+    over a hole where its large initializer's data was, which mstar's reader reads unchanged."""
+    from mstar.model.cosyvoice3.components.onnx_weights import read_onnx
+
+    src = tmp_path / "src"
+    src.mkdir()
+    torch.save({"w": torch.zeros(3 << 20), "bias": torch.ones(4)}, src / "kokoro.pth")
+    big = (4096, 4096)  # float32: 64 MiB of data, over the asset size the copy skips
+
+    def initializer(name, dims, raw):
+        return _protobuf(*[(1, d) for d in dims], (2, 1), (8, name.encode()), (9, raw))
+
+    graph = _protobuf((1, _protobuf((1, b"x"), (1, b"w"), (2, b"y"), (4, b"MatMul"))),
+                      (5, initializer("w", big, bytes(4 * 4096 * 4096))),
+                      (5, initializer("scale", (2,), np.array([0.5, 2.0], dtype=np.float32).tobytes())))
+    (src / "speech_tokenizer.onnx").write_bytes(_protobuf((1, 8), (7, graph)))
+
+    manifest = synthesize(str(src), tmp_path / "out")
+    assert manifest["param_count"] == (3 << 20) + 4 + 4096 * 4096 + 2
+    assert torch.load(tmp_path / "out" / "kokoro.pth", weights_only=True)["w"].shape == (3 << 20,)
+    copy = tmp_path / "out" / "speech_tokenizer.onnx"
+    assert copy.stat().st_size == (src / "speech_tokenizer.onnx").stat().st_size
+    assert copy.stat().st_blocks * 512 < 1 << 20  # sparse: the large initializer's data is a hole
+    onnx = read_onnx(copy)
+    assert onnx.tensors["w"].shape == big and onnx.tensors["scale"].tolist() == [0.5, 2.0]
+    assert [node.op_type for node in onnx.nodes] == ["MatMul"]
 
 
 def test_the_emulated_loader_reads_what_the_copy_kept(tmp_path):

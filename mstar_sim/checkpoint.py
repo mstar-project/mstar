@@ -5,7 +5,10 @@
 directory) and writes each file as its header, verbatim, over a sparse
 (unallocated) data region holding only the bytes of its small tensors (under
 ``SMALL_WEIGHT`` elements: norms, scales, a rotary table's inputs), next to
-copies of the configs, tokenizer and other small files. Every model's own loader
+copies of the configs, tokenizer and other small files. Weights in other formats
+are copied shapes-only too: a ``torch.load`` file saved again with its large
+tensors value-less, an ONNX model byte for byte over a hole where its large
+initializers' data was. Every model's own loader
 reads it unchanged; the simulator reads the small tensors for real and the rest
 from the headers only (``mstar_sim.patches.header_only_weights``), so a model of
 any size costs a few MB of disk.
@@ -23,6 +26,7 @@ import fnmatch
 import json
 import logging
 import math
+import mmap
 import os
 import shutil
 import struct
@@ -33,7 +37,7 @@ from pathlib import Path
 log = logging.getLogger(__name__)
 
 MANIFEST = "mstar_sim_checkpoint.json"
-VERSION = 3
+VERSION = 4
 # tensors this small are read for real (a norm, an fp8 scale, a LoRA alpha, a test's
 # fixture): cheap, and host code reads their values; only larger weights go value-less
 SMALL_WEIGHT = 1 << 16
@@ -144,9 +148,10 @@ def _weight_copy(rel: str, files) -> bool:
         os.path.dirname(f) == where and f.endswith(".safetensors") for f in files)
 
 
-def _shapes_only_torch_file(path: Path, dest: Path) -> bool:
-    """A ``torch.load``-able asset (a vocoder's ``hift.pt``) saved again with every tensor but
-    the small ones value-less: a few KB, and ``torch.load`` gives back the same structure."""
+def _shapes_only_torch_file(path: Path, dest: Path) -> int | None:
+    """A ``torch.load``-able asset (a vocoder's ``hift.pt``, Kokoro's weights) saved again with
+    every tensor but the small ones value-less: a few KB, and ``torch.load`` gives back the same
+    structure. Returns its parameter count; None if it isn't a plain tensor file."""
     import torch
 
     try:
@@ -155,13 +160,81 @@ def _shapes_only_torch_file(path: Path, dest: Path) -> bool:
         except RuntimeError:  # a legacy (non-zip) file can't be mapped: read it
             obj = torch.load(path, map_location="cpu", weights_only=True)
     except Exception:  # noqa: BLE001 - not a plain tensor file: keep nothing, say so
-        return False
-    from torch.utils._pytree import tree_map
+        return None
+    from torch.utils._pytree import tree_flatten, tree_map
 
     dest.parent.mkdir(parents=True, exist_ok=True)
     torch.save(tree_map(lambda x: (x.clone() if x.numel() < SMALL_WEIGHT else torch.empty_like(x, device="meta"))
                         if isinstance(x, torch.Tensor) else x, obj), dest)
-    return True
+    return sum(x.numel() for x in tree_flatten(obj)[0] if isinstance(x, torch.Tensor))
+
+
+def _varint(buf, pos: int) -> tuple[int, int]:
+    value = shift = 0
+    while True:
+        byte = buf[pos]
+        pos += 1
+        value |= (byte & 0x7F) << shift
+        if byte < 0x80:
+            return value, pos
+        shift += 7
+
+
+def _fields(buf, start: int, end: int):
+    """A protobuf message's ``(field, wire type, value)``; a length-delimited value is its
+    ``(start, end)`` in ``buf``."""
+    pos = start
+    while pos < end:
+        key, pos = _varint(buf, pos)
+        wire = key & 7
+        if wire == 0:
+            value, pos = _varint(buf, pos)
+        elif wire in (1, 5):
+            value, pos = None, pos + (8 if wire == 1 else 4)
+        elif wire == 2:
+            length, pos = _varint(buf, pos)
+            value, pos = (pos, pos + length), pos + length
+        else:
+            raise ValueError(f"protobuf wire type {wire}")
+        yield key >> 3, wire, value
+
+
+def _shapes_only_onnx(path: Path, dest: Path) -> int | None:
+    """An ONNX model (CosyVoice3's speech tokenizer, whose weights mstar reads into torch
+    modules) copied byte for byte over a hole where each large initializer's data was: its
+    graph and small tensors as they are. Returns its parameter count; None if not ONNX."""
+    holes, params = [], 0
+    with open(path, "rb") as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as buf:
+        try:
+            graph = next(v for n, w, v in _fields(buf, 0, len(buf)) if n == 7 and w == 2)
+            for n, w, span in _fields(buf, *graph):
+                if n != 5 or w != 2:  # not an initializer (a TensorProto)
+                    continue
+                dims, data = [], None
+                for field, wire, value in _fields(buf, *span):
+                    if field == 1 and wire == 0:
+                        dims.append(value)
+                    elif field == 1:  # packed
+                        pos, end = value
+                        while pos < end:
+                            dim, pos = _varint(buf, pos)
+                            dims.append(dim)
+                    elif field in (4, 9) and wire == 2:  # float_data or raw_data
+                        data = value
+                params += math.prod(dims)
+                if data is not None and math.prod(dims) >= SMALL_WEIGHT:
+                    holes.append(data)
+        except (StopIteration, ValueError, IndexError):
+            return None
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        with open(dest, "wb") as out:
+            pos = 0
+            for start, stop in [*holes, (len(buf), len(buf))]:
+                out.seek(pos)
+                out.write(buf[pos:start])
+                pos = stop
+            out.truncate(len(buf))
+    return params
 
 
 def _build(src, out: Path) -> dict:
@@ -169,9 +242,13 @@ def _build(src, out: Path) -> dict:
     for rel, size in src.files.items():
         if rel.endswith(".safetensors"):
             params += _write_sparse(src, rel, out / rel)
-        elif size > SMALL_WEIGHT_FILE and rel.endswith((".pt", ".pth", ".bin")) and not _weight_copy(rel, src.files):
-            if not _shapes_only_torch_file(src.fetch(rel), out / rel):
-                notes.append(f"skipped {rel}: not a plain tensor file")
+        elif size > SMALL_WEIGHT_FILE and rel.endswith((".pt", ".pth", ".bin", ".onnx")) and not _weight_copy(
+                rel, src.files):
+            shapes_only = _shapes_only_onnx if rel.endswith(".onnx") else _shapes_only_torch_file
+            count = shapes_only(src.fetch(rel), out / rel)
+            if count is None:
+                notes.append(f"skipped {rel}: not a plain tensor file or ONNX model")
+            params += count or 0
         elif size > MAX_ASSET_BYTES or (size > SMALL_WEIGHT_FILE and any(
                 fnmatch.fnmatch(os.path.basename(rel), pat) for pat in _DUPLICATE_WEIGHTS)):
             notes.append(f"skipped {rel} ({size / 2**20:.0f} MB)")
@@ -179,7 +256,7 @@ def _build(src, out: Path) -> dict:
             (out / rel).parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(src.fetch(rel), out / rel)
     if not params:
-        raise ValueError("the source has no safetensors files")
+        raise ValueError("the source has no weights (safetensors, torch or ONNX files)")
     return {"param_count": params, "notes": notes, "revision": src.revision}
 
 
