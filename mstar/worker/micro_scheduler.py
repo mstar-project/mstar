@@ -41,7 +41,7 @@ from mstar.worker.services import WorkerLayout, WorkerServices
 logger = logging.getLogger(__name__)
 
 # The lane of the worker's main chain of steps, and of the one side lane, which
-# runs its keys' steps beside it (``mstar.worker.side_steps``)
+# runs its keys' steps beside it (``StepPipeline._launch_side``)
 CHAIN_LANE = 0
 SIDE_LANE = 1
 

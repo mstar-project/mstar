@@ -10,7 +10,7 @@ forward) and then hangs in the collective. So:
 
 * the leader ALWAYS sends one of {speculative head from N, ``TPNoSpeculation``
   marker for N} for every lockstep step it looked at speculating from;
-* the follower's ``_await_tp_follow_step`` — one loop that both waits for N
+* the follower's ``StepPipeline._await_tp_follow_step`` — one loop that both waits for N
   and watches the FIFO — builds a head the moment it lands (during N, the
   point of the flag), and once N has finished does not return without a
   decision: builds the head from N's real outputs, or goes serial on the
@@ -23,7 +23,7 @@ forward) and then hangs in the collective. So:
   is dropped, queued or arriving.
 
 Drives a real ``Worker`` and its real ``Lockstep``, which holds the FIFO.
-``_try_follow_speculation`` is stubbed per test — its own build logic
+``Speculator.follow`` is stubbed per test — its own build logic
 is exercised against the graph API elsewhere; here we pin the protocol.
 """
 
@@ -94,7 +94,7 @@ def _stub(cache_open: bool = False, async_sched=(True, None)):
     )
     stub.ingest.check_ready_tensors = lambda: None
     stub.ingest.poll_stream_buffers = lambda: None
-    stub.build_results = []   # what _try_follow_speculation returns, in order
+    stub.build_results = []   # what ``Speculator.follow`` returns, in order
 
     def _process_messages():
         while stub.communicator.inbox:
@@ -114,7 +114,7 @@ def _stub(cache_open: bool = False, async_sched=(True, None)):
         return None
 
     stub.ingest.process_messages = _process_messages
-    stub._try_follow_speculation = _try_follow
+    stub.speculator.follow = _try_follow
     return stub
 
 
@@ -125,8 +125,8 @@ def _leader(leads: bool = True, async_nodes=None, async_sched: bool = True):
     group = types.SimpleNamespace(_workers=["w0", "w1"])
     return types.SimpleNamespace(sent=sent, lockstep=make_worker(
         parallel_nodes={NODE}, parallel_leader_nodes={NODE} if leads else set(), is_tp_follower=not leads,
-        tp_async_sched=async_sched, tp_async_nodes=async_nodes,
-        _graph_runtime=types.SimpleNamespace(get_sharding_config=lambda rid: types.SimpleNamespace(
+        async_sched=(async_sched, async_nodes),
+        graph_runtime=types.SimpleNamespace(get_sharding_config=lambda rid: types.SimpleNamespace(
             get_sharding_group=lambda node, walk: group,
         )),
         communicator=types.SimpleNamespace(send=lambda dest, msg: sent.append((dest, msg))),
@@ -152,6 +152,13 @@ def _pending(tp_seq, future=None, admit_error=None, failed_requests=()):
             failed_requests={rid: "boom" for rid in failed_requests},
         ),
     )
+
+
+def _spec():
+    """What a successful ``Speculator.follow`` builds; the wait holds its rows."""
+    return types.SimpleNamespace(scheduled_batch=ScheduledBatch(
+        node_name=NODE, graph_walk=WALK, request_to_worker_graph={"r0": "wg0"},
+    ))
 
 
 def _future(stub, output, done_after=0):
@@ -314,12 +321,13 @@ def test_nospec_store_is_bounded():
 # ------------------------------------------------------------------- await
 
 def _await(s, pending, arm=None):
-    return s._await_tp_follow_step(pending, arm or (lambda sp: None))
+    s.pipeline._arm = arm or (lambda sp: None)
+    return s.pipeline._await_tp_follow_step(pending)
 
 
 def test_await_builds_a_queued_head_and_arms_it():
     s = _stub()
-    spec = object()
+    spec = _spec()
     s.build_results = [spec]
     s.lockstep.enqueue_follow(_head(["r0"], seq=5, from_seq=4))
     armed = []
@@ -341,7 +349,7 @@ def test_await_builds_a_head_that_lands_while_N_runs():
     """The point of the flag: the head is built DURING N. The call returns
     (output None) so the caller awaits N with the speculation already armed."""
     s = _stub()
-    spec = object()
+    spec = _spec()
     s.build_results = [spec]
     s.communicator.deliveries = {1: [_head(["r0"], seq=5, from_seq=4)]}
     armed = []
@@ -362,7 +370,7 @@ def test_await_keeps_waiting_after_N_finished_until_a_decision():
     """N finished first (fast rank, slow leader build). No guessing: wait for
     the head, then build it from N's real outputs."""
     s = _stub()
-    spec = object()
+    spec = _spec()
     s.build_results = [spec]
     out = _output()
     s.communicator.deliveries = {4: [_head(["r0"], seq=5, from_seq=4)]}
@@ -410,7 +418,7 @@ def test_await_has_no_verdict_to_apply_while_N_still_runs():
     shared clear-or-thread flow after N voids it on both ranks alike). The
     verdict is only read once ``future.done()``, never before."""
     s = _stub()
-    spec = object()
+    spec = _spec()
     s.build_results = [spec]
     s.communicator.deliveries = {1: [_head(["r0"], seq=5, from_seq=4)]}
     pending = _pending(
@@ -424,7 +432,7 @@ def test_await_has_no_verdict_to_apply_while_N_still_runs():
 ])
 def test_with_the_prefix_cache_open_await_builds_and_arms_a_head_its_step_voids(verdict):
     s = _stub(cache_open=True)
-    spec = object()
+    spec = _spec()
     s.build_results = [spec]
     s.lockstep.enqueue_follow(_head(["r0"], seq=5, from_seq=4))
     armed = []
@@ -437,7 +445,7 @@ def test_await_retries_until_the_head_is_buildable():
     """Fresh rid not ready on this rank yet: keep polling readiness, do not
     go serial (the leader will run that composition)."""
     s = _stub()
-    spec = object()
+    spec = _spec()
     s.build_results = [None, None, spec]
     s.lockstep.enqueue_follow(_head(["r0", "f1"], seq=5, from_seq=4))
     out = _output()

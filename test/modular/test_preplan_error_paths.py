@@ -19,44 +19,37 @@ import torch
 
 from mstar.engine.engine import Engine
 from mstar.testing_utils.worker import make_worker
-from mstar.worker import worker as worker_mod
 from mstar.worker.micro_scheduler import CHAIN_LANE, ScheduledBatch
+from mstar.worker.speculation import Speculation
 from mstar.worker.stream_buffers import StreamBufferManager
 from mstar.worker.worker import Worker
 
 
-def _fake_worker() -> Worker:
-    w = make_worker(worker_id=0, device=torch.device("cpu"))
-    w.failed = []
-    w.resets = []
-    w.pushed_back = []
-    w._fail_requests = lambda errors: w.failed.append(dict(errors))
-    w._reset_skip_plan_flags = w.resets.append
-    w._rid_str = str
-    w.despeculated = []
-    w.settled = []
-    w._graph_runtime = SimpleNamespace(
-        push_back_node=lambda node_name, rids, wg_ids: w.pushed_back.extend(rids),
-        set_in_flight=(
-            lambda node_name, rids, wg_ids, value: w.despeculated.extend(rids)
-        ),
-        commit_speculation=(
-            lambda spec_id, success, dropped, **kw: w.settled.append(
-                (success, dropped)
-            )
-        ),
-    )
+def _fake_worker(engine=None) -> Worker:
+    failed, resets, pushed_back, despeculated, settled = [], [], [], [], []
     # No stream buffers in the fake, so returning a chunk is a no-op.
-    w.request_state = SimpleNamespace(per_request_info={})
-    w.streams = StreamBufferManager(w.request_state, None, [])
-    w.engine_manager = SimpleNamespace(
-        get_engine=lambda node: SimpleNamespace(release_cached_prefix=lambda batch: None),
+    request_state = SimpleNamespace(per_request_info={})
+    w = make_worker(
+        worker_id=0, device=torch.device("cpu"),
+        graph_runtime=SimpleNamespace(
+            push_back_node=lambda node_name, rids, wg_ids: pushed_back.extend(rids),
+            set_in_flight=lambda node_name, rids, wg_ids, value: despeculated.extend(rids),
+            commit_speculation=lambda spec_id, success, dropped, **kw: settled.append((success, dropped)),
+        ),
+        request_state=request_state,
+        streams=StreamBufferManager(request_state, None, []),
+        engine_manager=SimpleNamespace(
+            get_engine=lambda node: engine or SimpleNamespace(release_cached_prefix=lambda batch: None),
+        ),
     )
+    w.failed, w.resets, w.pushed_back, w.despeculated, w.settled = failed, resets, pushed_back, despeculated, settled
+    w.pipeline._fail_requests = lambda errors: w.failed.append(dict(errors))
+    w.executor.reset_skip_plan_flags = w.resets.append
     return w
 
 
-def _speculation(plan_future, *rids: str, continuing=()) -> worker_mod.Speculation:
-    return worker_mod.Speculation(
+def _speculation(plan_future, *rids: str, continuing=()) -> Speculation:
+    return Speculation(
         scheduled_batch=ScheduledBatch(
             node_name="dit", graph_walk="w",
             request_to_worker_graph={rid: 0 for rid in rids},
@@ -88,9 +81,9 @@ def test_main_loop_error_drops_an_armed_unsubmitted_speculation() -> None:
     the plan future is drained, the stage dropped through the engine, the
     fresh rid goes back to its queue and the continuing rid fails with N."""
     w = _fake_worker()
-    w._hold_rows(CHAIN_LANE, {"a"})
+    w.pipeline._hold_rows(CHAIN_LANE, {"a"})
     spec = _speculation(_done_future(), "a", "b", continuing=("a",))
-    Worker._handle_main_loop_error(w, RuntimeError("boom"), (None, None), None, spec)
+    w.pipeline._handle_error(RuntimeError("boom"), (None, None), None, spec)
     assert w.resets == [spec.node_batch]
     assert spec.plan_future is None
     assert sorted(w.despeculated) == ["a", "b"]
@@ -109,20 +102,19 @@ def test_main_loop_error_leaves_a_submitted_speculation_alone() -> None:
     w = _fake_worker()
     spec = _speculation(None, "a")
     spec.submitted = True
-    Worker._handle_main_loop_error(w, RuntimeError("boom"), (None, None), None, spec)
+    w.pipeline._handle_error(RuntimeError("boom"), (None, None), None, spec)
     assert w.resets == [] and w.pushed_back == []
     assert w.despeculated == []  # nothing de-speculated: not this handler's batch
 
 
 def test_gpu_thread_drops_the_stage_when_prepare_inputs_raises() -> None:
-    w = _fake_worker()
     resets = []
     engine = SimpleNamespace(
         prepare_inputs=_raiser(RuntimeError("bad inputs")),
         reset_pre_plan_for_batch=resets.append,
         finalize_batch=lambda nb, **kw: None,
     )
-    w.engine_manager = SimpleNamespace(get_engine=lambda name: engine)
+    w = _fake_worker(engine)
     released = []
     node_batch = SimpleNamespace(
         node_name="dit", launch_started_event=None, preplanned_rids=("a",), read_check_rids=None,
@@ -132,7 +124,7 @@ def test_gpu_thread_drops_the_stage_when_prepare_inputs_raises() -> None:
     batch = SimpleNamespace(node_name="dit", graph_walk="decode", output_signals=(),
                             request_walks={})
     with pytest.raises(RuntimeError, match="bad inputs"):
-        Worker._execute_on_gpu_thread(w, batch, node_batch, _done_future())
+        w.executor._body(batch, node_batch, _done_future())
     assert resets == [node_batch]
     assert released == [True]
 
@@ -140,7 +132,7 @@ def test_gpu_thread_drops_the_stage_when_prepare_inputs_raises() -> None:
     resets.clear()
     node_batch.preplanned_rids = None
     with pytest.raises(RuntimeError):
-        Worker._execute_on_gpu_thread(w, batch, node_batch, None)
+        w.executor._body(batch, node_batch, None)
     assert resets == []
 
     # A plan that raised fails the step before prepare_inputs. It still releases
@@ -150,7 +142,8 @@ def test_gpu_thread_drops_the_stage_when_prepare_inputs_raises() -> None:
     failed_plan: Future = Future()
     failed_plan.set_exception(RuntimeError("plan failed"))
     with ThreadPoolExecutor(max_workers=1) as gpu:
-        future = Worker._submit_gpu_step(w, gpu, batch, node_batch, failed_plan)
+        w.executor._gpu_pool = gpu
+        future = w.executor._submit_gpu_step(batch, node_batch, failed_plan, CHAIN_LANE)
         with pytest.raises(RuntimeError, match="plan failed"):
             future.result()
     assert node_batch.launch_started_event.is_set()
@@ -166,7 +159,8 @@ def test_a_step_the_executor_never_runs_still_lifts_the_fence() -> None:
     node_batch = SimpleNamespace(node_name="dit", launch_started_event=None)
     batch = SimpleNamespace(node_name="dit", graph_walk="decode")
     with ThreadPoolExecutor(max_workers=1, initializer=_raiser(RuntimeError("init"))) as gpu:
-        future = Worker._submit_gpu_step(w, gpu, batch, node_batch, None)
+        w.executor._gpu_pool = gpu
+        future = w.executor._submit_gpu_step(batch, node_batch, None, CHAIN_LANE)
         assert isinstance(future.exception(), BrokenThreadPool)
     assert node_batch.launch_started_event.is_set()
 

@@ -219,7 +219,7 @@ def _consumer(policy):
         request_state=request_state,
         wakeup_event=SimpleNamespace(register_futures=lambda futures: None),
         tensor_manager=tensor_manager,
-        _graph_runtime=SimpleNamespace(get_rid_handle=lambda wire: 1),
+        graph_runtime=SimpleNamespace(get_rid_handle=lambda wire: 1),
         streams=streams,
     )
     return w, buf

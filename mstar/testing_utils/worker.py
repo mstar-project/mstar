@@ -1,12 +1,11 @@
 """Workers and their components for tests, built with no process groups, sockets
 or engines.
 
-``make_worker`` skips ``Worker.__init__`` and starts from what it would leave
-behind: the step-to-step state (``Worker._init_step_state``, the method
-``__init__`` itself uses), a timer that is off, and a worker that leads nothing.
-A test supplies the collaborators the code under test reaches (usually a
-``SimpleNamespace`` of what it calls), so one it forgot is an ``AttributeError``
-rather than a stub answering for it.
+``make_worker`` skips ``Worker.__init__`` and builds what it would: the real
+components, over the collaborators the test names (usually a ``SimpleNamespace``
+of what the code under test calls), so one it forgot is an ``AttributeError``
+rather than a stub answering for it. Components read their collaborators when
+they are built, so pass them to ``make_worker`` rather than setting them after.
 """
 from types import SimpleNamespace
 
@@ -21,14 +20,16 @@ from mstar.worker.micro_scheduler import MicroScheduler
 from mstar.worker.phase_timer import PhaseTimer
 from mstar.worker.request_lifecycle import RequestLifecycle
 from mstar.worker.services import WorkerLayout, WorkerServices
+from mstar.worker.speculation import Speculator
+from mstar.worker.step_executor import StepExecutor
+from mstar.worker.step_pipeline import StepPipeline
 from mstar.worker.worker import Worker
 
-# Built by ``__init__`` from the deployment; no default stands in for them.
-_COLLABORATORS = frozenset({
-    "communicator", "wakeup_event", "tensor_manager", "_graph_runtime", "engine_manager",
-    "request_state", "scheduler", "admission", "lockstep", "lifecycle", "ingest", "layout", "streams",
-    "parallel_groups", "partition_topology", "_my_consumer_connections", "_all_wg_nodes",
-})
+# What ``Worker.__init__`` builds from the deployment. No default stands in for a
+# collaborator, and a component left out is built, real, over the others.
+_COLLABORATORS = ("communicator", "tensor_manager", "engine_manager", "request_state", "streams", "parallel_groups")
+_COMPONENTS = ("lifecycle", "admission", "lockstep", "scheduler", "ingest", "executor", "speculator", "pipeline")
+_LAYOUT = frozenset(WorkerLayout.__dataclass_fields__)
 
 
 def make_services(**overrides) -> WorkerServices:
@@ -101,38 +102,78 @@ class _AllNodes(frozenset):
         return frozenset(other)
 
 
-def make_worker(**overrides) -> Worker:
-    """A ``Worker`` with no threads, sockets or engines. ``overrides`` replace
-    fields and methods by name; a name ``Worker`` does not have raises
-    ``TypeError``, so a test cannot go on setting a field that has moved."""
-    worker = Worker.__new__(Worker)
-    worker._init_step_state()
-    worker.worker_id = "w0"
-    worker.device = torch.device("cpu")
-    worker.enable_nvtx = False
-    worker.enable_prof = False
-    worker.profile_info = WorkerProfileInfo()
-    worker.timer = PhaseTimer(worker_id="w0", period=0)
-    worker.chunk_loops = ChunkLoops()
-    worker._launch_wait_s = 0.0
-    worker._max_consecutive_spec = 1024
-    # a worker that leads and follows nothing
-    worker.parallel_nodes = set()
-    worker.parallel_leader_nodes = set()
-    worker.is_tp_follower = False
-    # no streams, no loops, no declared stop policies
-    worker._streaming_edge_names = set()
-    worker._innermost_loop_by_node = {}
-    worker._stop_token_signal = {}
+def make_worker(
+    *, graph_runtime=None, worker_id="w0", device=torch.device("cpu"), wakeup_event=None, metrics=None,
+    profile_info=None, timer=None, launch_wait_s=0.0, max_consecutive_spec=1024, peek=True,
+    enable_nvtx=False, enable_prof=False, async_sched=(False, None), **named,
+) -> Worker:
+    """A ``Worker`` with no threads, sockets or engines, leading and following
+    nothing. ``named`` holds the collaborators, the components to replace and the
+    ``WorkerLayout`` fields; any other name raises ``TypeError``, so a test cannot
+    go on setting a field that has moved."""
+    unknown = named.keys() - _LAYOUT - set(_COLLABORATORS) - set(_COMPONENTS) - {"partition_topology"}
+    if unknown:
+        raise TypeError(f"make_worker has no field {sorted(unknown)}")
+    layout_fields = {name: named.pop(name) for name in named.keys() & _LAYOUT}
+    for name in ("parallel_nodes", "parallel_leader_nodes", "streaming_edge_names", "side_keys"):
+        if name in layout_fields:
+            layout_fields[name] = frozenset(layout_fields[name])
+    layout = WorkerLayout(**layout_fields)
 
-    async_sched = (overrides.pop("tp_async_sched", False), overrides.pop("tp_async_nodes", None))
-    for name, value in overrides.items():
-        if name not in _COLLABORATORS and not hasattr(worker, name):
-            raise TypeError(f"Worker has no field {name!r}")
-        setattr(worker, name, value)
-    if "enable_nvtx" in overrides:
-        worker.timer.enable_nvtx = overrides["enable_nvtx"]
-    _build_components(worker, async_sched)
+    worker = Worker.__new__(Worker)
+    worker.worker_id, worker.device, worker.layout = worker_id, device, layout
+    worker.enable_nvtx, worker.enable_prof = enable_nvtx, enable_prof
+    worker.profile_info = profile_info if profile_info is not None else WorkerProfileInfo()
+    worker.timer = timer if timer is not None else PhaseTimer(worker_id=worker_id, enable_nvtx=enable_nvtx, period=0)
+    worker.wakeup_event = wakeup_event
+    worker._metrics = metrics
+    worker._graph_runtime = graph_runtime
+    worker.partition_topology = named.pop("partition_topology", None)
+    for name in _COLLABORATORS:
+        setattr(worker, name, named.get(name))
+    if worker.tensor_manager is None:
+        worker.tensor_manager = SimpleNamespace(get_tensor=None)
+    services = WorkerServices(
+        worker_id=worker_id, device=device, graph_runtime=graph_runtime,
+        **{name: getattr(worker, name) for name in _COLLABORATORS},
+    )
+
+    # a scheduler the test built brings the components under it
+    under_scheduler = named.get("scheduler")
+
+    def component(name, build):
+        given = named.get(name, getattr(under_scheduler, name, None))
+        setattr(worker, name, given if given is not None else build())
+
+    component("lifecycle", lambda: RequestLifecycle(layout=layout))
+    component("admission", lambda: Admission(services=services, layout=layout))
+    component("lockstep", lambda: Lockstep(
+        services=services, layout=layout, admission=worker.admission, async_sched=async_sched,
+    ))
+    component("scheduler", lambda: MicroScheduler(
+        services=services, layout=layout, lifecycle=worker.lifecycle, lockstep=worker.lockstep,
+        admission=worker.admission, model_config={},
+    ))
+    component("ingest", lambda: InputIngest(
+        services=services, layout=layout, lifecycle=worker.lifecycle, lockstep=worker.lockstep,
+        wakeup_event=wakeup_event, metrics=metrics, enable_nvtx=enable_nvtx,
+    ))
+    component("executor", lambda: StepExecutor(
+        services=services, layout=layout, timer=worker.timer, lockstep=worker.lockstep,
+        lifecycle=worker.lifecycle, wakeup_event=wakeup_event, metrics=metrics,
+        profile_info=worker.profile_info, enable_nvtx=enable_nvtx, enable_prof=enable_prof,
+    ))
+    component("speculator", lambda: Speculator(
+        services=services, layout=layout, scheduler=worker.scheduler, lifecycle=worker.lifecycle,
+        lockstep=worker.lockstep, admission=worker.admission, timer=worker.timer,
+        max_consecutive=max_consecutive_spec, peek=peek, enable_nvtx=enable_nvtx,
+    ))
+    component("pipeline", lambda: StepPipeline(
+        services=services, layout=layout, timer=worker.timer, lifecycle=worker.lifecycle,
+        lockstep=worker.lockstep, admission=worker.admission, scheduler=worker.scheduler,
+        executor=worker.executor, ingest=worker.ingest, speculator=worker.speculator, metrics=metrics,
+        profile_info=worker.profile_info, launch_wait_s=launch_wait_s, enable_nvtx=enable_nvtx,
+    ))
     return worker
 
 
@@ -140,41 +181,5 @@ def deliver(worker: Worker, *messages) -> None:
     """Messages through ``InputIngest``, then what the main loop does at the end
     of its preamble: report recorded failures and run the teardowns now ready."""
     worker.ingest._dispatch(list(messages))
-    worker._report_failures()
-    worker._teardown(worker._in_flight_rids)
-
-
-def _build_components(worker: Worker, async_sched) -> None:
-    """The components the test did not supply, real, over the worker's collaborators."""
-    services = WorkerServices(
-        worker_id=worker.worker_id, device=worker.device,
-        graph_runtime=getattr(worker, "_graph_runtime", None),
-        engine_manager=getattr(worker, "engine_manager", None),
-        tensor_manager=getattr(worker, "tensor_manager", None),
-        request_state=getattr(worker, "request_state", None),
-        communicator=getattr(worker, "communicator", None),
-        parallel_groups=getattr(worker, "parallel_groups", None),
-        streams=getattr(worker, "streams", None),
-    )
-    parallel, leaders = frozenset(worker.parallel_nodes), frozenset(worker.parallel_leader_nodes)
-    layout = WorkerLayout(
-        parallel_nodes=parallel, parallel_leader_nodes=leaders, is_tp_follower=worker.is_tp_follower,
-        chunk_loops=worker.chunk_loops, streaming_edge_names=frozenset(worker._streaming_edge_names),
-        all_wg_nodes=getattr(worker, "_all_wg_nodes", None) or {},
-    )
-    if "lifecycle" not in worker.__dict__:
-        worker.lifecycle = getattr(getattr(worker, "scheduler", None), "lifecycle", None) or RequestLifecycle(
-            layout=layout,
-        )
-    if "admission" not in worker.__dict__:
-        worker.admission = Admission(services=services, layout=layout)
-    if "lockstep" not in worker.__dict__:
-        worker.lockstep = Lockstep(
-            services=services, layout=layout, admission=worker.admission, async_sched=async_sched,
-        )
-    if "ingest" not in worker.__dict__:
-        worker.ingest = InputIngest(
-            services=services, layout=layout, lifecycle=worker.lifecycle, lockstep=worker.lockstep,
-            wakeup_event=getattr(worker, "wakeup_event", None), metrics=worker._metrics,
-            enable_nvtx=worker.enable_nvtx,
-        )
+    worker.pipeline._report_failures()
+    worker.pipeline._teardown(worker.pipeline.in_flight_rids)

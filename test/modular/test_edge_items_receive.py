@@ -60,10 +60,11 @@ def _worker(join_dim=None):
     })
     w = make_worker(
         worker_id="w1",
-        _graph_runtime=SimpleNamespace(get_rid_handle=HANDLES.get),
+        graph_runtime=SimpleNamespace(get_rid_handle=HANDLES.get),
         request_state=request_state,
         streams=StreamBufferManager(request_state, None, []),
         tensor_manager=SimpleNamespace(
+            get_tensor=None,
             start_read_tensors=start_read_tensors,
             start_read_tensors_multi=start_read_tensors_multi,
             ack_unread_tensors=lambda edges: acked.append(
