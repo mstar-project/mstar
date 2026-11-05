@@ -30,7 +30,7 @@ from mstar.engine.resources.recurrent.config import (
     RecurrentStateSpec,
     RecurrentStep,
 )
-from mstar.engine.resources.resident import gather_column
+from mstar.engine.resources.resident import advance_column, gather_column
 from mstar.engine.resources.spec import ResourceReqConfig
 from mstar.engine.resources.step import (
     ADMIT_OK,
@@ -143,6 +143,8 @@ class RecurrentStatePool(Resource):
     # the node's planner and this pool's table of slots, once bound
     _resident: "ResidentPlanner | None" = None
     _resident_table: "ResidentTable | None" = None
+    # a cell a row: non-zero once its slot holds state, counted up in the graph
+    _resident_saved: "ResidentTable | None" = None
 
     @classmethod
     def build(
@@ -223,6 +225,8 @@ class RecurrentStatePool(Resource):
         # (slot_indices, has_state) mirrors per captured buffer: a steady batch
         # addresses the same slots every step, so its copies are skipped
         self._cg_mirrors: dict[CGSlotKey, tuple[H2DMirror, H2DMirror]] = {}
+        # per captured buffer: the rows' saved-state cells, which a resident step gathers
+        self._cg_saved: dict[CGSlotKey, torch.Tensor] = {}
         # copy-only H2D for the addressing, see `_build_addressing`
         self._index_stager = PinnedStager(torch.int32)
         self._state_stager = PinnedStager(torch.bool)
@@ -659,6 +663,8 @@ class RecurrentStatePool(Resource):
                         # the backend already wrote the pool; a later step resumes
                         slot.has_state = True
                         self._version += 1
+                        if self._resident is not None and ctx.resident is None:
+                            self._resident.mark_stale(segment.request_id)
                     slot.tokens += ctx.run_span(segment.span)
                     # a row too short to checkpoint that ends on a page (a decode step) is saved here, after its
                     # forward. A step that repeats saves only the page it ends on: the state between is gone
@@ -1107,6 +1113,7 @@ class RecurrentStatePool(Resource):
             size = max(self._cg_max_bs, lease.bucket.bs, num_rows)
             buf = self._cg_addressing[key] = self._new_buffers(size)
             self._cg_mirrors[key] = (H2DMirror(), H2DMirror())
+            self._cg_saved[key] = torch.zeros(size, dtype=torch.long, device=self._device)
         assert buf.slot_indices.numel() >= num_rows, (
             f"recurrent addressing for {key} holds "
             f"{buf.slot_indices.numel()} rows but this step planned {num_rows}"
@@ -1149,16 +1156,28 @@ class RecurrentStatePool(Resource):
         self._resident = planner
         self._resident_key = key
         self._resident_table = planner.table()
+        self._resident_saved = planner.table()
 
     def resident_row(self, rid: int, slot: int, row: list[int], writes: "ResidentWrites") -> None:
-        row[self._resident_table.col] = self._slots[rid][writes.streams[self._resident_key].label].index
+        held = self._slots[rid][writes.streams[self._resident_key].label]
+        row[self._resident_table.col] = held.index
+        row[self._resident_saved.col] = int(held.has_state)
 
     def resident_gather(self, step: "CapturedResidentStep") -> None:
         stream = step.streams[self._resident_key]
         key = CGSlotKey(bucket=step.bucket, slot=step.slot, label=stream.label)
-        table = self._resident_table
+        table, store, addressing = self._resident_table, self._resident.store, self._cg_addressing[key]
         # a padding row reads the trash row's zero, which is SINK_SLOT
-        gather_column(self._resident.store, step.slots, table.stride, table.col, self._cg_addressing[key].slot_indices)
+        gather_column(store, step.slots, table.stride, table.col, addressing.slot_indices)
+        # and no saved state: `gather` reads its ``start``
+        saved = self._cg_saved[key]
+        gather_column(store, step.slots, self._resident_saved.stride, self._resident_saved.col, saved)
+        addressing.has_state.copy_(saved != 0)
+
+    def resident_commit(self, step: "CapturedResidentStep") -> None:
+        # a row's next iteration, replay or step, resumes what this one wrote
+        table = self._resident_saved
+        advance_column(self._resident.store, step.slots, table.stride, table.col)
 
     # Engine lifecycle
 
@@ -1176,5 +1195,6 @@ class RecurrentStatePool(Resource):
         self._slot_views.clear()
         self._cg_addressing.clear()
         self._cg_mirrors.clear()
+        self._cg_saved.clear()
         self._eager_addressing.clear()
         self._current.clear()

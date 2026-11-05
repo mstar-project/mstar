@@ -213,6 +213,7 @@ def _replay(res, planner, s, promote=True, head=None):
         s.pool_slots = res["pool"]._cg_addressing[ck].slot_indices[: bucket.bs].tolist()
         s.replays.append(SimpleNamespace(
             pages=s.pages, offsets=s.offsets, positions=s.positions, pool_slots=s.pool_slots,
+            has_state=res["pool"]._cg_addressing[ck].has_state[: bucket.bs].tolist(),
         ))
         if planner is not None:
             planner.commit_in_graph(s.captured)
@@ -392,6 +393,19 @@ def test_a_capture_puts_the_body_alone_in_the_conditional_and_only_when_asked():
     runner._resident, runner._device_stop_failures = None, {}
     assert runner._device_stop_for(spec) is None
     assert runner.device_stop_refusal(WALK).startswith("planner: the walk isn't resident")
+
+
+def test_a_resident_step_resumes_the_state_its_last_step_left():
+    """``RecurrentStatePool.gather`` reads ``start`` for a row with no saved
+    state, so a resident row must read as saved from its second iteration on,
+    replays included (a transducer's state, restarted each step, repeats its
+    first tokens); a fresh row and a padding row read ``start``."""
+    live, _, planner = _setup({1: 3})
+    _ingest(live, 2)
+    a = _captured_step(live, planner, [1, 2], slot=0, bs=4, repeats=2)
+    assert [r.has_state for r in a.replays] == [[True, False, False, False], [True, True, False, False]]
+    b = _captured_step(live, planner, [1, 2], slot=1, bs=4)
+    assert b.replays[0].has_state == [True, True, False, False]
 
 
 def test_a_stopped_row_leaves_its_kv_and_recurrent_state_where_its_stop_left_them():
