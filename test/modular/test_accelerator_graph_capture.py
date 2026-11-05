@@ -7,7 +7,8 @@ slots — registering a partial one would hand both to the same buffers, and
 under a lower index than the one it captured under.
 
 Capture failure is also a per-rank event, so the barrier count must not depend
-on whether a capture succeeded.
+on whether a capture succeeded. The batch sizes a bucket list is built from
+(``geometric_batch_sizes``) are checked here too.
 """
 
 from __future__ import annotations
@@ -28,6 +29,7 @@ from mstar.engine.accelerator_graph_config import (
     AcceleratorGraphConfigType,
     PiecewiseConfigType,
     PiecewisePackedConfig,
+    geometric_batch_sizes,
 )
 from mstar.engine.accelerator_graph_runner import (
     AcceleratorGraphRunner,
@@ -37,7 +39,7 @@ from mstar.engine.accelerator_graph_runner import (
     capture_into_graph,
     fail_if_graphs_required,
 )
-from mstar.engine.resources import BucketKey, CGSlotSpec
+from mstar.engine.resources import BucketKey, CGSlotSpec, SlotLease
 
 requires_cuda = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="capture allocates a graph pool"
@@ -354,6 +356,36 @@ def test_a_smaller_bucket_along_the_hoisted_axis_still_reslices_the_shared_buffe
     assert torch.equal(shared_view[:, :4], small)
 
 
+def _staging_runner(buffers: dict[str, torch.Tensor], seq_dims: dict[str, int]):
+    """The real `_stage` on the smallest runner it reads: one bucket of one slot."""
+    runner = AcceleratorGraphRunner.__new__(AcceleratorGraphRunner)
+    runner._submodule_name = "node"
+    bucket = BucketKey(graph_walk="prefill", bs=1, num_tokens=8)
+    slot = SimpleNamespace(static_inputs=buffers, static_input_keys=tuple(buffers), config_idx=0)
+    runner._buckets = {bucket: SimpleNamespace(slots=[slot])}
+    runner._static_buffer_seq_dims = {(0, key): dim for key, dim in seq_dims.items()}
+    return runner, SlotLease(slot=0, bucket=bucket)
+
+
+def test_stage_fills_a_shorter_input_along_its_seq_dim():
+    embeds, mrope = torch.zeros(8, 4), torch.zeros(3, 8)
+    runner, lease = _staging_runner({"embeds": embeds, "mrope": mrope}, {"embeds": 0, "mrope": 1})
+    runner._stage(lease, {"embeds": torch.ones(5, 4), "mrope": torch.ones(3, 5)})
+    assert embeds[:5].eq(1).all() and embeds[5:].eq(0).all()
+    assert mrope[:, :5].eq(1).all() and mrope[:, 5:].eq(0).all()
+
+
+@pytest.mark.parametrize("shape", [(1, 1, 3, 4, 4), (1, 2, 3, 4, 4), (3, 3, 4, 4)])
+def test_stage_refuses_an_input_that_differs_outside_its_seq_dim(shape):
+    """copy_ broadcasts one camera into all three slots of a captured
+    (bs, cameras, C, H, W) buffer without a word, and fails only for two."""
+    pixels = torch.zeros(1, 3, 3, 4, 4)
+    runner, lease = _staging_runner({"pixel_values": pixels}, {"pixel_values": 0})
+    with pytest.raises(RuntimeError, match="only dim 0 may be shorter"):
+        runner._stage(lease, {"pixel_values": torch.ones(shape)})
+    assert pixels.eq(0).all()
+
+
 def test_a_dropped_bucket_is_listed_and_logged_as_an_error(caplog):
     """A bucket that runs eagerly is a 10-20x latency cliff, so it has to be
     visible in the log and to the engine's strict mode."""
@@ -464,6 +496,30 @@ def test_a_recompile_during_capture_fails_with_the_guard_that_broke():
 
 
 @pytest.mark.parametrize(
+    "max_batch_size, expected",
+    [
+        (1, [1]),
+        (2, [1, 2]),
+        (3, [1, 2, 3]),
+        (4, [1, 2, 4]),
+        (6, [1, 2, 4, 6]),
+        (8, [1, 2, 4, 8]),
+        (16, [1, 2, 4, 8, 16]),
+    ],
+)
+def test_geometric_batch_sizes(max_batch_size, expected):
+    """Powers of two below B, then B itself -- so startup grows with log B, not
+    B. B that is itself a power of two ends on it once (no duplicate); a B that
+    is not appends the odd top bucket the padding path rounds up to."""
+    assert geometric_batch_sizes(max_batch_size) == expected
+
+
+def test_geometric_batch_sizes_refuses_a_max_under_one():
+    with pytest.raises(ValueError, match="at least 1"):
+        geometric_batch_sizes(0)
+
+
+@pytest.mark.parametrize(
     ("value_dtype", "buffer_dtype", "refused"),
     [
         (torch.float32, torch.bfloat16, True),
@@ -505,7 +561,7 @@ def test_a_packed_replay_pads_each_label_s_spans_as_its_seq_lens():
     the padding rows' zero-length spans, as ``seq_lens`` has them."""
     declared = []
     runner = object.__new__(PiecewiseAcceleratorGraphRunner)
-    runner._label, runner._current_slot = "region", 0
+    runner._label, runner._current_slot, runner._lora_keys = "region", 0, ()
     runner._config = PiecewisePackedConfig(
         capture_fn=lambda call: {}, make_static_inputs=lambda shape: {}, total_tokens=[8],
         declare_step=lambda rids, seq_lens, label_seq_lens=None: declared.append((seq_lens, label_seq_lens)),

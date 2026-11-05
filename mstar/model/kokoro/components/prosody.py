@@ -11,9 +11,10 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from mstar.model.components.masking import length_mask
 from mstar.model.kokoro.components.adain import LEAKY_SLOPE, AdainResBlk1d
 from mstar.model.kokoro.components.lstm import MaskedBiLSTM
-from mstar.model.kokoro.components.masking import length_mask, mask_channels, mask_features
+from mstar.model.kokoro.components.masking import mask_channels, mask_features
 from mstar.model.kokoro.config import KokoroModelConfig
 
 LAYER_NORM_EPS = 1e-5

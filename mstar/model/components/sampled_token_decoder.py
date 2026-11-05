@@ -70,22 +70,21 @@ from mstar.model.submodule_base import (
     ARNodeInputs,
     ARNodeSubmodule,
     BatchedModelOutput,
+    DeviceLoopback,
     InputSeqLenInfo,
     ModelInputsFromEngine,
     TokenStop,
-    device_loopback_enabled,
 )
 from mstar.utils.profiler import PHASE_PERIOD, PhaseLaps, phase_record
 
 
 class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
     SAMPLER = SAMPLER
-    # the decode walk reads its input ids off the sampler's slot masters
-    reads_device_loopback = True
 
     # Total tokens of a packed text-prefill step, one captured graph per
     # (bucket, batch size); a longer step prefills eagerly. Static buffers are
-    # sized by the largest bucket.
+    # sized by the largest bucket. `prefill_token_buckets` replaces it per
+    # instance.
     PREFILL_TOKEN_BUCKETS = [32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]
     PREFILL_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16]
     # A mixed step carries the decode batch beside its prompt rows, so its
@@ -124,10 +123,11 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
         model: torch.nn.Module,
         config: Any,
         encoders: Sequence[MediaEncoder] = (),
+        prefill_token_buckets: Sequence[int] | None = None,
     ):
         """``encoders`` are the model's media encoders, as its walks declare
         them; a text-only node passes none."""
-        super().__init__()
+        super().__init__(prefill_token_buckets)
         self.model = model
         self.config = config
         self._encoders = tuple(encoders)
@@ -141,6 +141,10 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
             # the graph runtime checks a decode row's stop ids itself, without
             # calling check_stop (measured on Qwen3.5; see TokenStop.runtime_check)
             runtime_check=True,
+        )
+        # the decode walk reads its input ids off the sampler's slot masters
+        self.device_loopback = DeviceLoopback(
+            walk=self.DECODE_WALK, signal="text_inputs", sampler=self.SAMPLER, buffer="new_token",
         )
 
     # ------------------------------------------------------------------
@@ -306,10 +310,10 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
     ) -> ARNodeInputs:
         if graph_walk in self._media_walks:
             return self._media_inputs(fwd_info, inputs)
-        if graph_walk == "decode" and has_loopback and self._device_loopback():
+        if (row := self.uniform_row_inputs(graph_walk, has_loopback)) is not None:
             # one token per row, read off the sampler's slot master in
             # `preprocess`; the routed signal is empty (or ignored) here
-            return ARNodeInputs(input_seq_len=1)
+            return row
         input_ids = inputs["text_inputs"][0]
         return ARNodeInputs(input_seq_len=input_ids.shape[0], input_ids=input_ids)
 
@@ -331,24 +335,8 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
             return 1
         return super().speculative_input_seq_len(graph_walk, fwd_info, prev_seq_len)
 
-    def uniform_row_inputs(
-        self, graph_walk: str, has_loopback: bool = False,
-    ) -> ARNodeInputs | None:
-        # the loop-back decode row above, built once for the step's rows
-        if graph_walk == "decode" and has_loopback and self._device_loopback():
-            return ARNodeInputs(input_seq_len=1)
-        return None
-
-    def _device_loopback(self) -> bool:
-        return device_loopback_enabled() and self.node_resources[SAMPLER].has_slot_masters
-
-    def device_loopback_signals(self, graph_walk: str) -> frozenset[str]:
-        if graph_walk == "decode" and self._device_loopback():
-            return frozenset({"text_inputs"})
-        return frozenset()
-
     @staticmethod
-    def _reads_loopback(inputs: Sequence[ARNodeInputs]) -> bool:
+    def _has_loopback_rows(inputs: Sequence[ARNodeInputs]) -> bool:
         """Whether the step's ids come off the sampler: a row without ids is a
         loop-back decode row."""
         return any(inp.input_ids is None for inp in inputs)
@@ -387,7 +375,7 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
         engine_inputs: ModelInputsFromEngine,
         inputs: list[ARNodeInputs],
     ) -> dict[str, torch.Tensor | Any]:
-        if self._reads_loopback(inputs):
+        if self._has_loopback_rows(inputs):
             # every row's last sampled token, read by slot (padding rows read
             # slot 0); a row whose last step ran elsewhere brought its own
             sampler: SamplerResource = engine_inputs.resources[SAMPLER]
@@ -513,9 +501,4 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
         # decode rows are one token each; the prefill walks feed
         # `prefill_tokens` from the inputs
         return graph_walk == "decode"
-
-    def inline_client_signals(self, graph_walk: str) -> dict[str, str]:
-        # the decode loop's client edge carries the sampled token the stop
-        # check already has on the host; prefill's new_token edge is persisted
-        return {"text_inputs": "new_token"} if graph_walk == "decode" else {}
 

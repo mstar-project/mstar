@@ -13,6 +13,7 @@ import torch
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.resources import Resource, SlotLease, SubmoduleStep
+from mstar.engine.resources.lora.config import LoraStep
 from mstar.utils.knobs import device_loopback_enabled  # noqa: F401  (re-export)
 
 # What ``check_stop`` returns, besides loop names, for a stop no loop can carry:
@@ -46,7 +47,8 @@ class HostRows(NamedTuple):
         return ((rid, value) for rid in request_ids if (value := value_of.get(rid)) is not None)
 
 
-class TokenStop(NamedTuple):
+@dataclass(frozen=True)
+class TokenStop:
     """When an AR submodule's sampled token ends its decode loop: on a stop
     id, unless the request's sampler config sets ``ignore_eos``. The token
     budget is the loop's cap (``Model.get_loop_caps``), which the runtime
@@ -62,8 +64,8 @@ class TokenStop(NamedTuple):
     stop_ids: frozenset[int]
     # resource key of the sampler whose request config carries ``ignore_eos``
     sampler: str
-    # the only walk whose rows can stop the loop; None for every walk
-    walk: str | None = None
+    # the only walk, or walks, whose rows can stop the loop; None for every walk
+    walk: str | frozenset[str] | None = None
     # walks that sample the reply's first token before the loop exists. That
     # token counts toward the budget, so ``get_loop_caps`` gives the loop
     # ``max(1, max_output_tokens - 1)``. A stop id there, or a budget of one
@@ -72,10 +74,48 @@ class TokenStop(NamedTuple):
     # for a prompt prefilled over several passes: the ``step_metadata`` flag of
     # the pass whose token is the reply's (earlier passes' tokens are not)
     last_prefill_flag: str | None = None
+    # outputs left unrouted on a row whose token is a stop id, ``ignore_eos``
+    # or not (``StopCheck.withheld``): a frame streamed beside the stop token
+    # is loop control, and only the stop check's host copy tells it from data
+    withhold: tuple[str, ...] = ()
     # the graph runtime checks ``walk``'s stop ids itself, without calling
     # check_stop (``ARNodeSubmodule.get_stop_policies``); the prompt walks keep
     # check_stop, which can end the partition
     runtime_check: bool = False
+
+    def __post_init__(self):
+        if self.withhold and self.runtime_check:
+            # the runtime's check never calls check_stop, which is what withholds
+            raise ValueError("a TokenStop that withholds outputs needs check_stop: drop runtime_check")
+
+    def stops_on(self, graph_walk: str) -> bool:
+        """Whether a row of ``graph_walk`` can stop the loop."""
+        walk = self.walk
+        return walk is None or graph_walk == walk or (isinstance(walk, frozenset) and graph_walk in walk)
+
+
+class DeviceLoopback(NamedTuple):
+    """A decode walk whose rows read their last sampled token off the
+    sampler's slot masters instead of a routed tensor
+    (``MSTAR_DEVICE_LOOPBACK``), while the client edge carries the token
+    inline, off the stop check's host copy.
+
+    Declared as ``ARNodeSubmodule.device_loopback``; the loop-back hooks
+    (``uniform_row_inputs``, ``device_loopback_signals``,
+    ``inline_client_signals``) and the read in ``preprocess``
+    (``loopback_inputs``) follow from it. The sampler keeps the masters only
+    for a node that declares this: their eager step write is a small
+    synchronous host-to-device copy per step, which a node that reads its
+    tokens on the host would pay for nothing.
+    """
+
+    walk: str
+    # the input signal the walk's token loops back to
+    signal: str
+    # resource key of the sampler keeping the slot masters
+    sampler: str
+    # the row-addressed output (``check_stop_buffers`` entry) holding the token
+    buffer: str
 
 
 class StopCheck(NamedTuple):
@@ -517,7 +557,7 @@ NO_CHUNKING = ChunkingPolicy()
 
 # A chunk Loop's count before its prompt's first chunk sets the real cap (the
 # prompt's length), and the stride of a row that runs whole: it ends the Loop.
-# Within the u32 both runtimes hold loop counters in.
+# Within the u32 the runtime holds loop counters in.
 CHUNK_LOOP_END = 2**31 - 1
 
 
@@ -791,6 +831,15 @@ class NodeSubmodule(torch.nn.Module, ABC):
     # params to the autocast dtype nor wraps its forward (or capture) in
     # autocast, and explicitly disables any ambient one.
     disable_autocast: bool = False
+    # Walks whose steps may run beside the worker's main chain, on a second
+    # stream (``mstar.worker.side_steps``); they do where the node's group in
+    # the serving config sets ``side_stream: true``. For a stream-fed walk that
+    # no chain step waits on. Where the config asks, ``EngineManager.build``
+    # (``_side_lane_keys``) refuses a TP or SP node, a node alone on its
+    # worker, a device without streams, a node that also has chain walks or
+    # holds resources, and a side walk that is not the node's alone, is part
+    # of a combined walk, or has output spans or a stop check.
+    side_stream_walks: frozenset[str] = frozenset()
 
     # Float32 math for this node's forward, where the process default (TF32
     # matmuls and cuDNN, see ``mstar.engine.apply_torch_config``) is too coarse:
@@ -802,13 +851,21 @@ class NodeSubmodule(torch.nn.Module, ABC):
     float32_matmul_precision: str | None = None
     cudnn_allow_tf32: bool | None = None
 
-    # Set True on a submodule whose decode walk may read its last sampled
-    # tokens back off the sampler's slot masters (``device_loopback_signals``).
-    # The sampler keeps the masters only for a node that says so: the eager
-    # step write behind them is a small synchronous host-to-device copy per
-    # step, which a node that reads its tokens on the host (Whisper's decoder)
-    # would pay for nothing.
-    reads_device_loopback: bool = False
+    # Set True to let cuDNN time its conv algorithms in this node's capture
+    # warm-up (once per captured shape, then cached) instead of taking its
+    # heuristic pick. The engine applies it around capture sizing, which runs
+    # the warm-up forwards; the capture itself turns it off
+    # (``accelerator_graph_runner``), and eager steps keep the process
+    # setting, so a new eager shape never searches.
+    capture_cudnn_benchmark: bool = False
+
+    # The LoRA pools bound to this node's modules (``module_lora_spec``); set by
+    # `bind_node_resources`. The engine adds each pool's ``LoraStep`` to the node's step,
+    # and to each piecewise region's (``lora_rows``), from its segments: in order, the
+    # rows the adapted linears see, each a request's span of tokens (a request may have
+    # several, as CFG's cond and uncond copies). A step that lays its rows out otherwise
+    # declares its own ``LoraStep`` under the pool's key.
+    lora_keys: tuple[str, ...] = ()
 
     def __init__(self):
         super().__init__()
@@ -839,6 +896,9 @@ class NodeSubmodule(torch.nn.Module, ABC):
             bind = getattr(module, "bind_resources", None)
             if bind is not None and module is not self:
                 bind(resources)
+        from mstar.model.components.lora.modules import bind_module_lora
+
+        self.lora_keys = bind_module_lora(self, resources)
 
     def cg_key_info(
         self, graph_walk: str,
@@ -863,6 +923,10 @@ class NodeSubmodule(torch.nn.Module, ABC):
         on ``ModelInputsFromEngine``), e.g. for a bucket that follows a stream chunk.
 
         None (the default) means the walk has a single capture.
+
+        On a node whose only capture is a piecewise region, no forward
+        replays by this key: it only groups the scheduler's rows
+        (``split_batches_by_capture_key``) and need not name a bucket.
         """
         del graph_walk, per_request_info, per_request_input_metadata, kwargs
         return None
@@ -884,7 +948,10 @@ class NodeSubmodule(torch.nn.Module, ABC):
 
         A batch spanning two groups matches no capture. Opt in when that batch
         runs worse than two captured ones, e.g. per-request eager; leave it off
-        when a batched eager forward handles the mix well.
+        when a batched eager forward handles the mix well. On a node whose only
+        capture is a piecewise region, the key only groups the scheduler's
+        rows (e.g. Qwen3.5's vision node puts a request too large for one
+        replay in a group of its own).
         """
         del graph_walk
         return False
@@ -1048,6 +1115,15 @@ class NodeSubmodule(torch.nn.Module, ABC):
         del graph_walk, has_loopback
         return None
 
+    def resident_walks(self) -> frozenset[str]:
+        """Walks whose captured steps may read their rows off the resident
+        tables (`mstar.engine.resources.resident`). A walk here runs, for each
+        resource, one stream that takes one token a row or one it only reads
+        (span 0), with no forks or retention, and its `preprocess` reads no
+        planned position or KV location: the forward's graph fills those in.
+        The engine still refuses if a resource can't."""
+        return frozenset()
+
     def step_is_input_free(self, graph_walk: str) -> bool:
         """Whether ``declare_step`` for this walk reads nothing from the inputs
         but their spans, and every real row has the span of the template row.
@@ -1137,6 +1213,22 @@ class NodeSubmodule(torch.nn.Module, ABC):
     def max_batch_size(self, graph_walk: str):
         return None
 
+    def compile_regions(self) -> Mapping[str, Sequence[tuple]]:
+        """Parts of this node the engine compiles on their own, for a node
+        whose ``forward`` is not compiled whole (``disable_torch_compile``, or
+        start-up raises): ``torch.compile`` with dynamic shapes in its default
+        mode, under the platform's inductor settings, before capture, so a
+        region inside a captured graph is compiled there too. Skipped without
+        an accelerator.
+
+        Maps an attribute path from the submodule (a module, whose ``forward``
+        is compiled, or a method: ``"model.merger"``, ``"model.embed"``) to the
+        argument tuples it is called with once at start-up, so its compile
+        does not land on a live request; with none, it compiles on its first
+        call.
+        """
+        return {}
+
     def max_rows_in_combined(self, graph_walk: str) -> int | None:
         """How many rows of this real walk a step mixing it with another walk
         of its combined walk may hold; None is uncapped. For a backend whose
@@ -1211,7 +1303,9 @@ class NodeSubmodule(torch.nn.Module, ABC):
         precision; the node's resources are bound but nothing is admitted or
         planned, so it must not read or change resource state. On a lockstep
         node every rank calls it in the same order, so it may run the
-        collectives its forward runs. Default: nothing."""
+        collectives its forward runs. A node serving LoRA adapters runs its
+        adapted linears here as in a step whose rows name no adapter. Default:
+        nothing."""
 
     def can_use_accelerator_graphs(
         self,
@@ -1308,7 +1402,7 @@ class NodeSubmodule(torch.nn.Module, ABC):
     def check_stop(
         self, request_id: str,
         request_info: CurrentForwardPassInfo,
-        outputs: dict[str, list[torch.Tensor]],
+        outputs: Mapping[str, list[torch.Tensor]],
     ) -> set[str] | StopCheck:
         """
         Return the set of dynamic-loop names that should stop after this step.
@@ -1335,6 +1429,9 @@ class NodeSubmodule(torch.nn.Module, ABC):
         A ``StopCheck`` also names outputs of this step that are not routed
         (``StopCheck.withheld``), decided off the same read; it may withhold
         without stopping.
+
+        ``outputs`` is read-only, and each name's host copy is made when the
+        check first reads it.
 
         Default: no stops.
         """
@@ -1382,6 +1479,27 @@ class NodeSubmodule(torch.nn.Module, ABC):
         self.request_states.pop(request_id, None)
 
 
+def lora_rows(step: SubmoduleStep | None, lora_keys: Sequence[str]) -> SubmoduleStep | None:
+    """``step`` with a ``LoraStep`` under each of ``lora_keys`` that it does not declare
+    itself, its rows the step's segments, as a new step (a declaration reused across
+    calls keeps its own). A step without segments gets none: an adapted module it runs
+    refuses for want of a plan (``LoraLayerDelta``)."""
+    if lora_keys and step is not None and step.segments is not None:
+        segments = tuple(step.segments)
+        added = {key: LoraStep(segments=segments) for key in lora_keys if key not in step.steps}
+        if added:
+            step = replace(step, steps={**step.steps, **added})
+    return step
+
+
+def engine_step(submodule, *args, **kwargs) -> SubmoduleStep | None:
+    """What the engine calls for a node's step: its ``declare_step``, with the LoRA
+    pools' rows added (``lora_rows``), so a model serving LoRA from its modules writes
+    no LoRA step."""
+    # the engine drives duck-typed submodules too
+    return lora_rows(submodule.declare_step(*args, **kwargs), getattr(submodule, "lora_keys", ()))
+
+
 class ARNodeSubmodule(NodeSubmodule):
     # Set True on a submodule whose `split_inputs` cuts its own ``tensor_inputs``.
     # The engine probes the prefix cache for a walk that carries them only then.
@@ -1391,11 +1509,93 @@ class ARNodeSubmodule(NodeSubmodule):
     # sampled token ends a dynamic loop; the stop checks below follow from it.
     token_stop: TokenStop | None = None
 
+    # Set by a submodule whose decode walk reads its last sampled token back on
+    # the device; the loop-back hooks below follow from it.
+    device_loopback: DeviceLoopback | None = None
+
+    # The packed token counts a prefill capture is built at, which
+    # ``__init__``'s ``prefill_token_buckets`` replaces per instance. A
+    # submodule that takes that kwarg must read its capture ladder off
+    # ``self.PREFILL_TOKEN_BUCKETS``, or the override is silently ignored.
+    PREFILL_TOKEN_BUCKETS: list[int]
+
+    def __init__(self, prefill_token_buckets: Sequence[int] | None = None):
+        """``prefill_token_buckets``: a deployment's own captured prefill ladder
+        (``model_kwargs.prefill_token_buckets``), in place of the class's
+        ``PREFILL_TOKEN_BUCKETS``."""
+        super().__init__()
+        if prefill_token_buckets is not None:
+            buckets = prefill_token_buckets
+            if (
+                not isinstance(buckets, (list, tuple)) or not buckets
+                or not all(isinstance(n, int) and not isinstance(n, bool) and n > 0 for n in buckets)
+                or len(set(buckets)) < len(buckets)
+            ):
+                raise ValueError(
+                    f"prefill_token_buckets must be a non-empty list of distinct positive token counts, got {buckets!r}"
+                )
+            self.PREFILL_TOKEN_BUCKETS = sorted(buckets)
+
+    def _loops_back(self, graph_walk: str) -> bool:
+        """Whether this walk's token loops back on the device."""
+        loopback = self.device_loopback
+        return loopback is not None and graph_walk == loopback.walk
+
+    def _reads_loopback(self, graph_walk: str) -> bool:
+        """Whether this walk's rows read their token off the slot masters: a
+        loop-back walk, the knob on, and a sampler that keeps masters."""
+        return (
+            self._loops_back(graph_walk) and device_loopback_enabled()
+            and self.node_resources[self.device_loopback.sampler].has_slot_masters
+        )
+
+    def uniform_row_inputs(
+        self, graph_walk: str, has_loopback: bool = False,
+    ) -> "NodeInputs | None":
+        # the loop-back decode row: one token, read in ``preprocess``
+        if has_loopback and self._reads_loopback(graph_walk):
+            return ARNodeInputs(input_seq_len=1)
+        return super().uniform_row_inputs(graph_walk, has_loopback)
+
+    def device_loopback_signals(self, graph_walk: str) -> frozenset[str]:
+        if self._reads_loopback(graph_walk):
+            return frozenset({self.device_loopback.signal})
+        return super().device_loopback_signals(graph_walk)
+
+    def inline_client_signals(self, graph_walk: str) -> dict[str, str]:
+        # the client's copy of the token the stop check already has on the host
+        if self._loops_back(graph_walk):
+            return {self.device_loopback.signal: self.device_loopback.buffer}
+        return super().inline_client_signals(graph_walk)
+
+    def loopback_inputs(
+        self, engine_inputs: ModelInputsFromEngine, inputs: list[ARNodeInputs],
+        states: tuple[str, ...] = (),
+    ) -> dict[str, torch.Tensor]:
+        """A loop-back step's ``input_ids``, and each of the sampler's declared
+        loop-back ``states``, one row per row of the step, read by slot
+        (padding rows read the trash row). A row whose last step did not keep
+        them on the device (its first decode step, after the prefill) brings
+        them routed, in ``input_ids`` and ``tensor_inputs[state]``, and they
+        override its slot's."""
+        sampler = engine_inputs.resources[self.device_loopback.sampler]
+        rids = engine_inputs.request_ids
+        out = {"input_ids": sampler.loopback_tokens(rids)}
+        out.update((name, sampler.loopback_state(name, rids)) for name in states)
+        routed = [i for i, inp in enumerate(inputs) if inp.input_ids is not None and inp.input_seq_len]
+        if routed:
+            sampler.overwrite_rows(
+                routed,
+                (out["input_ids"], torch.cat([inputs[i].input_ids for i in routed])),
+                *((out[name], torch.stack([inputs[i].tensor_inputs[name] for i in routed])) for name in states),
+            )
+        return out
+
     def get_stop_policies(self, graph_walk: str) -> dict[str, StopPolicy] | None:
         stop = self.token_stop
         if stop is None or not stop.runtime_check or graph_walk in stop.prefill_walks:
             return super().get_stop_policies(graph_walk)
-        if stop.walk is not None and graph_walk != stop.walk:
+        if not stop.stops_on(graph_walk):
             return {}  # as `_token_stops`: only a row of ``walk`` ends the loop
         # the budget is the loop's cap, which the runtime enforces
         return {stop.loop: StopPolicy(
@@ -1405,7 +1605,7 @@ class ARNodeSubmodule(NodeSubmodule):
     def check_stop(
         self, request_id: str,
         request_info: CurrentForwardPassInfo,
-        outputs: dict[str, list[torch.Tensor]],
+        outputs: Mapping[str, list[torch.Tensor]],
     ) -> set[str] | StopCheck:
         stop = self.token_stop
         if stop is None:
@@ -1414,9 +1614,10 @@ class ARNodeSubmodule(NodeSubmodule):
             return set()
         # a row's first element, as ``HostRows.first_values`` reads it
         token = outputs[stop.buffer][0].reshape(-1)[0].item()
-        if not self._token_stops(request_id, token, request_info):
-            return set()
-        return self._stop_names(request_info)
+        stops = self._stop_names(request_info) if self._token_stops(request_id, token, request_info) else set()
+        if stop.withhold and token in stop.stop_ids:
+            return StopCheck(stops, withheld=stop.withhold)
+        return stops
 
     def check_stop_batched(
         self, request_ids: list[str],
@@ -1430,10 +1631,19 @@ class ARNodeSubmodule(NodeSubmodule):
         if pairs is None:
             return None
         verdict, names = self._token_stops, self._stop_names
-        return {
-            rid: names(info) for rid, token in pairs
-            if verdict(rid, token, info := request_infos[rid])
-        }
+        if not stop.withhold:
+            return {
+                rid: names(info) for rid, token in pairs
+                if verdict(rid, token, info := request_infos[rid])
+            }
+        stops: dict[str, set[str]] = {}
+        withheld: dict[str, tuple[str, ...]] = {}
+        for rid, token in pairs:
+            if verdict(rid, token, info := request_infos[rid]):
+                stops[rid] = names(info)
+            if token in stop.stop_ids:
+                withheld[rid] = stop.withhold
+        return BatchedStopCheck(stops, withheld) if withheld else stops
 
     def _token_stops(self, request_id: str, token: int, info: CurrentForwardPassInfo) -> bool:
         """Both stop checks' verdict on one row: whether its sampled
@@ -1447,7 +1657,7 @@ class ARNodeSubmodule(NodeSubmodule):
             if walk in prefill_walks:
                 return self._is_reply_token(info)
             # only a row of ``walk`` ends the loop
-            return stop.walk is None or walk == stop.walk
+            return stop.stops_on(walk)
         # the loop's cap is at least 1, so a one-token budget ends at the prefill
         return bool(prefill_walks) and info.max_tokens <= 1 and (
             info.graph_walk in prefill_walks and self._is_reply_token(info)

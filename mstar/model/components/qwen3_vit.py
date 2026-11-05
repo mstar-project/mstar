@@ -17,7 +17,6 @@ from __future__ import annotations
 from typing import Protocol
 
 import torch
-import torch.nn.functional as F
 from torch import nn
 
 from mstar.model.components.linear import FusedColumnLinear
@@ -55,30 +54,44 @@ def vision_seq_lengths(grid: list[tuple[int, int, int]]) -> tuple[int, ...]:
     return tuple(h * w for t, h, w in grid for _ in range(t))
 
 
+def _tile_frames(frames: list[tuple[torch.Tensor, int]]) -> torch.Tensor:
+    """Each ``(rows, t)`` entry's rows repeated ``t`` times, end to end, on the
+    host. Filled through numpy on the calling thread: torch's ``repeat`` and
+    ``cat`` split these small copies over the intra-op pool, where under a
+    loaded server a descheduled thread holds up the GPU thread (as in
+    ``to_device_nonblocking``)."""
+    first = frames[0][0]
+    total = sum(rows.shape[0] * t for rows, t in frames)
+    out = torch.empty((total, first.shape[1]), dtype=first.dtype)
+    dst, start = out.numpy(), 0
+    for rows, t in frames:
+        n = rows.shape[0]
+        dst[start:start + n * t].reshape(t, n, -1)[:] = rows.numpy()
+        start += n * t
+    return out
+
+
 def vision_position_ids(
-    grid: list[tuple[int, int, int]],
-    spatial_merge_size: int,
-    device: torch.device,
+    grid: list[tuple[int, int, int]], spatial_merge_size: int,
 ) -> torch.Tensor:
-    """``[total_patches, 2]`` (h, w) indices in spatial-merge-block order.
+    """``[total_patches, 2]`` (h, w) indices in spatial-merge-block order, on
+    the host.
 
     Block-major, so the rotary sees the order the merger will fold.
     """
-    out = []
-    for t, h, w in grid:
-        hpos, wpos = torch.meshgrid(
-            torch.arange(h, device=device),
-            torch.arange(w, device=device),
-            indexing="ij",
-        )
+    frames: dict[tuple[int, int], torch.Tensor] = {}
+    for _, h, w in grid:
+        if (h, w) in frames:
+            continue
+        hpos, wpos = torch.meshgrid(torch.arange(h), torch.arange(w), indexing="ij")
         block = (
             h // spatial_merge_size, spatial_merge_size,
             w // spatial_merge_size, spatial_merge_size,
         )
         hpos = hpos.reshape(block).transpose(1, 2).flatten()
         wpos = wpos.reshape(block).transpose(1, 2).flatten()
-        out.append(torch.stack([hpos, wpos], dim=-1).repeat(t, 1))
-    return torch.cat(out, dim=0)
+        frames[h, w] = torch.stack([hpos, wpos], dim=-1)
+    return _tile_frames([(frames[h, w], t) for t, h, w in grid])
 
 
 def _axis_taps(src: torch.Tensor, side: int, zero_pad: bool) -> tuple[torch.Tensor, torch.Tensor]:
@@ -108,55 +121,52 @@ def bilinear_table_taps(
     return indices, weights
 
 
-def _align_corners_src(index: torch.Tensor, size: torch.Tensor, side: int) -> torch.Tensor:
+def _align_corners_src(index: torch.Tensor, size: int, side: int) -> torch.Tensor:
     """Where positions on an axis of length ``size`` sample a ``side``-long
     table with ``align_corners=True``, as the ``F.interpolate`` call upstream
     reproduces: the closed form of ``linspace(0, side - 1, size)[index]``; the
-    clamp avoids a divide-by-zero at size == 1, where index is 0 anyway."""
-    return index.to(torch.float32) * (side - 1) / torch.clamp(size - 1, min=1)
+    max avoids a divide-by-zero at size == 1, where index is 0 anyway."""
+    return index.to(torch.float32) * (side - 1) / max(size - 1, 1)
 
 
-def vision_interpolation(
-    grid: list[tuple[int, int, int]],
-    num_grid_per_side: int,
-    spatial_merge_size: int,
-    device: torch.device,
+def _frame_interpolation(
+    h: int, w: int, side: int, merge: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Gather indices and weights that resample the square learned position
-    table onto each image's ``(h, w)`` grid.
-
-    Returns ``[total_patches, 4]`` each — the 2x2 bilinear neighbourhood per
-    patch, as the outer product of the two axes' taps.
-    """
-    side, merge = num_grid_per_side, spatial_merge_size
-
-    grid_thw = torch.tensor(grid, dtype=torch.long, device=device)
-    counts = grid_thw[:, 0] * grid_thw[:, 1] * grid_thw[:, 2]
-    heights = torch.repeat_interleave(grid_thw[:, 1], counts)
-    widths = torch.repeat_interleave(grid_thw[:, 2], counts)
-    starts = torch.repeat_interleave(
-        F.pad(counts.cumsum(0)[:-1], (1, 0)), counts,
-    )
-    # position within one frame's flat patch run, repeating across frames;
-    # the total comes off the host grid to avoid a device read
-    total_patches = sum(t * h * w for t, h, w in grid)
-    within = (
-        torch.arange(total_patches, device=device) - starts
-    ) % (heights * widths)
-
+    """``[h * w, 4]`` gather indices and weights for one ``(h, w)`` frame, in
+    spatial-merge-block order."""
+    within = torch.arange(h * w)
     # undo the spatial-merge-block ordering to recover (row, col)
-    blocks_w = widths // merge
     in_col = within % merge
     in_row = (within // merge) % merge
-    block_col = (within // (merge * merge)) % blocks_w
-    block_row = within // (merge * merge * blocks_w)
+    block_col = (within // (merge * merge)) % (w // merge)
+    block_row = within // (merge * merge * (w // merge))
     row = block_row * merge + in_row
     col = block_col * merge + in_col
 
     # border padding: a tap past the table reads its edge
     return bilinear_table_taps(
-        _align_corners_src(row, heights, side), _align_corners_src(col, widths, side), side, zero_pad=False,
+        _align_corners_src(row, h, side), _align_corners_src(col, w, side), side, zero_pad=False,
     )
+
+
+def vision_interpolation(
+    grid: list[tuple[int, int, int]], num_grid_per_side: int, spatial_merge_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Gather indices and weights that resample the square learned position
+    table onto each image's ``(h, w)`` grid, on the host.
+
+    Returns ``[total_patches, 4]`` each — the 2x2 bilinear neighbourhood per
+    patch, as the outer product of the two axes' taps. Built once per frame
+    shape and repeated over a video's frames: per patch, a 60 s video's maths
+    took ~130 ms of the GPU thread's host time under a loaded server.
+    """
+    frames: dict[tuple[int, int], tuple[torch.Tensor, torch.Tensor]] = {}
+    for _, h, w in grid:
+        if (h, w) not in frames:
+            frames[h, w] = _frame_interpolation(h, w, num_grid_per_side, spatial_merge_size)
+    indices = _tile_frames([(frames[h, w][0], t) for t, h, w in grid])
+    weights = _tile_frames([(frames[h, w][1], t) for t, h, w in grid])
+    return indices, weights
 
 
 # ----------------------------------------------------------------------------
@@ -213,6 +223,8 @@ class VisionRotaryEmbedding(nn.Module):
 
 
 class VisionPatchEmbed(nn.Module):
+    lora_unservable = {"proj": "run as a matmul over its weight, never its own forward"}
+
     def __init__(self, config: ViTConfig):
         super().__init__()
         self.in_channels = config.in_channels
@@ -226,11 +238,12 @@ class VisionPatchEmbed(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x.view(
-            -1, self.in_channels, self.temporal_patch_size,
-            self.patch_size, self.patch_size,
-        )
-        return self.proj(x.to(self.proj.weight.dtype)).view(-1, self.embed_dim)
+        # The conv's stride is its kernel, so it is one GEMM over flattened
+        # patches. On Qwen3.5's tower, cuDNN ran it as a legacy implicit-GEMM
+        # kernel at ~17 ms for a 60 s video's patches, ~1 ms as a matmul.
+        weight = self.proj.weight
+        x = x.reshape(-1, weight[0].numel()).to(weight.dtype)
+        return nn.functional.linear(x, weight.view(self.embed_dim, -1), self.proj.bias)
 
 
 class VisionMLP(nn.Module):

@@ -368,6 +368,28 @@ def test_message_loop_runs_while_the_conductor_lives():
     assert server.fatal_error is None
 
 
+def test_a_failed_message_wait_does_not_end_the_message_loop(monkeypatch, caplog):
+    """A transport error from the idle wait is a failed pass, not the end of
+    the thread that delivers every request's results, and failed passes in a
+    row back off rather than spinning, with one traceback between them."""
+    server = _api_server(_Proc(5))
+    waits, sleeps = [], []
+    monkeypatch.setattr(time, "sleep", sleeps.append)
+
+    def poll(timeout_ms):
+        waits.append(timeout_ms)
+        if len(waits) <= 3:
+            raise RuntimeError("socket closed")
+        server.running = False
+        return False
+    server.communicator.poll_for_messages = poll
+    server._process_messages()
+    assert len(waits) == 4
+    assert sleeps == [0.01, 0.02, 0.04], "a failed pass went straight into the next one"
+    assert sum(r.exc_info is not None for r in caplog.records) == 1
+    assert server.fatal_error is None
+
+
 def test_dead_conductor_releases_pending_requests_and_stops_the_server():
     stopped = []
     server = _api_server(_Proc(5, alive=False, exitcode=-9))
@@ -456,6 +478,8 @@ def test_dynamo_worker_exits_nonzero_when_conductor_dies():
                           return_value=(server, conductor, "whisper_large")),
         mock.patch.object(dynamo_worker, "serve"),
         mock.patch("mstar.api_server.entrypoint._shutdown_conductor_process"),
+        # main() would hand pytest's log handlers to a writer thread, which repeats every later record
+        mock.patch("mstar.utils.logging_config.log_off_thread"),
         pytest.raises(SystemExit) as exc,
     ):
         dynamo_worker.main(argv)

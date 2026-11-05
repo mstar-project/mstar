@@ -18,6 +18,7 @@ Read the [add-mstar-model skill](../add-mstar-model/SKILL.md) for the port as a 
 - **It is not just shape.** The latent grid and the text length belong in it, but so does anything that changes the forward: whether guidance is on, the conditioning layout, which recipe stage is running.
 - **Too fine a key means no batching, too coarse means wrong output.** Two requests that differ in something the key leaves out are stacked into one forward and one of them is computed with the other's layout. A row-independence test (each row of a batched forward equals that request run alone) catches this.
 - **The key comes from host values.** Request geometry decided in `process_prompt` travels in `step_metadata` / `kwargs`; nothing in `bucket_key_for` should read a device tensor.
+- **A per-step variant is the base's, not the key's.** Something that changes with the step index rather than the request (the linears' dtype under `linear_dtype_steps`) goes through `step_key`: the base wraps the key in a `StepBucket` for `prepare_inputs` and `cg_key_info` alike, captures each bucket per variant, turns on `split_batches_by_capture_key`, and `denoise` reads `self.step_dtype`. Overriding the two methods separately lets them disagree, and a mixed step runs a row at a time.
 
 Batching rarely buys throughput for a large video DiT: one 544×960×121 row is already ~8k tokens and saturates the GEMMs, so two rows cost two steps' time. It still matters for smaller image models and costs nothing to keep correct.
 

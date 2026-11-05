@@ -16,7 +16,7 @@ import types
 
 import pytest
 
-from mstar.communication.communicator import ZMQCommunicator
+from mstar.communication.rust_communicator import RustZMQCommunicator
 from mstar.utils import socket_prefix
 
 
@@ -48,6 +48,8 @@ def _entrypoint_prefix(monkeypatch, tmp_path, *argv) -> str:
     monkeypatch.setattr(entrypoint, "APIServer", fake_api_server)
     # sizing torch's pool would outlive the test in this process
     monkeypatch.setattr(entrypoint, "_set_preprocess_threads", lambda model, config: None)
+    # and so would handing pytest's log handlers to a writer thread, which repeats every later record
+    monkeypatch.setattr(entrypoint, "log_off_thread", lambda: None)
     with pytest.raises(_StopError):
         entrypoint.main(["--config", str(cfg), *argv])
     return seen["socket_path_prefix"]
@@ -91,6 +93,8 @@ def _dynamo_prefix(monkeypatch, *argv) -> dict:
         raise _StopError
 
     monkeypatch.setattr(worker, "build_server", fake_build_server)
+    # main() would hand pytest's log handlers to a writer thread, which repeats every later record
+    monkeypatch.setattr("mstar.utils.logging_config.log_off_thread", lambda: None)
     with pytest.raises(_StopError):
         worker.main(["--config", "c.yaml", "--model-path", "/m", *argv])
     return seen
@@ -118,9 +122,9 @@ def test_two_servers_on_their_default_prefixes_keep_their_own_inboxes():
     comms = []
     try:
         for prefix in (a, b):
-            comms.append(ZMQCommunicator(
+            comms.append(RustZMQCommunicator(
                 my_id="api_server", push_ids=["conductor"], ipc_socket_path_prefix=prefix))
-            comms.append(ZMQCommunicator(
+            comms.append(RustZMQCommunicator(
                 my_id="conductor", push_ids=["api_server"], ipc_socket_path_prefix=prefix))
         a_api, a_cond, b_api, _ = comms
         a_cond.send("api_server", {"reply": "a"})
@@ -132,10 +136,6 @@ def test_two_servers_on_their_default_prefixes_keep_their_own_inboxes():
         assert got == [{"reply": "a"}]
         assert b_api.get_all_new_messages() == []
     finally:
-        for c in comms:
-            c.pull_socket.close()
-            for s in c.push_sockets.values():
-                s.close()
         for prefix in (a, b):
             shutil.rmtree(prefix, ignore_errors=True)
 

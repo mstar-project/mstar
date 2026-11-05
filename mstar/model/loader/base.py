@@ -23,6 +23,7 @@ import logging
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import NamedTuple
 
 import torch
 from torch import nn
@@ -51,6 +52,33 @@ class StackedParamRule:
     target_suffix: str
     source_suffix: str
     shard_id: str | int
+
+
+class CheckpointRules(NamedTuple):
+    """How a checkpoint's tensors land on a module's parameters: the prefix the
+    checkpoint names them under (stripped before anything else), then ``remap``, then
+    the stacked-shard rules. A weights root states its rules once
+    (``checkpoint_rules()``), for its weight loader and for anything else that must
+    place checkpoint names the same way (LoRA adapters: ``module_lora_spec``)."""
+
+    stacked_params: tuple[StackedParamRule, ...] = ()
+    remap: Callable[[str], str | None] | None = None
+    prefix: str = ""
+
+    def native(self, name: str) -> str | None:
+        """The checkpoint name ``name`` (prefix included) as the module's parameter
+        name, before the stacked rules; None for a name the remap drops."""
+        if self.prefix:
+            if not name.startswith(self.prefix):
+                return None
+            name = name[len(self.prefix):]
+        return name if self.remap is None else self.remap(name)
+
+    def load(self, module: nn.Module, weights: Iterable[tuple[str, torch.Tensor]], **kw) -> set[str]:
+        """``load_hf_weights`` under these rules (names already stripped of ``prefix``)."""
+        return load_hf_weights(
+            module, weights, stacked_params=list(self.stacked_params), name_remapper=self.remap, **kw,
+        )
 
 
 def default_weight_loader(
@@ -86,7 +114,7 @@ def _dispatch_loader(
         loader(param, loaded_weight, shard_id)
 
 
-def _apply_stacked(
+def apply_stacked(
     name: str, stacked: list[StackedParamRule],
 ) -> tuple[str, str | int | None]:
     """Return ``(target_name, shard_id)`` after applying stacked rules,
@@ -98,7 +126,7 @@ def _apply_stacked(
 
 
 class _StackedMatcher:
-    """``_apply_stacked`` without trying every rule on every name.
+    """``apply_stacked`` without trying every rule on every name.
 
     Per-expert rule lists run to thousands of rules. A suffix with a token
     between two dots (``.experts.gate_proj.__expert7__.weight``) can only
@@ -166,7 +194,7 @@ def load_weights_into(
     Returns: set of parameter paths that received a tensor.
     """
     stacked = stacked_params or []
-    apply_stacked = _StackedMatcher(stacked)
+    match_stacked = _StackedMatcher(stacked)
     params_dict = dict(module.named_parameters())
     loaded: set[str] = set()
     # each stacked parameter's shards that got a tensor
@@ -184,7 +212,7 @@ def load_weights_into(
             if name is None:
                 continue
 
-        target, shard_id = apply_stacked(name)
+        target, shard_id = match_stacked(name)
         if target not in params_dict:
             # Not an error unless strict: the checkpoint may carry extra
             # keys (lm_head ties, kv-scale, etc.). Caller can verify

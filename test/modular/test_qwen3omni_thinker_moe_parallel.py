@@ -1,4 +1,5 @@
-"""TP/EP selection from a node group's ``ep_config``, exercised on the Thinker.
+"""TP/EP selection from a node group's ``ep_config``, exercised on the Thinker, and
+that its forward leaves its input embeddings unwritten.
 
 Uses a shrunken Thinker config on CPU; no checkpoint or GPU needed.
 """
@@ -214,3 +215,28 @@ def test_engine_inputs_default_to_real_unpadded():
     inputs = ModelInputsFromEngine(request_ids=["r"], per_request_info={})
     assert not inputs.synthetic
     assert inputs.real_seq_len is None
+
+
+class _Through(torch.nn.Module):
+    """A layer's attention or MLP that hands its input on."""
+
+    attend = SimpleNamespace(bind_step=lambda label: None, set_layer_idx=lambda i: None)
+
+    def forward(self, hidden_states, **kwargs):
+        return hidden_states
+
+
+def test_the_forward_leaves_its_input_embeds_as_staged():
+    """The fused add + norms update the residual stream in place; started from
+    ``input_embeds`` itself, they would write into a captured graph's static
+    input. ``layer_0_embed`` is that input as staged."""
+    model = Qwen3OmniThinkerModel(_config(num_layers=2))
+    for layer in model.model.layers:
+        layer.self_attn, layer.mlp = _Through(), _Through()
+    input_embeds = torch.randn(3, model.hidden_size)
+    staged = input_embeds.clone()
+
+    _, layer_0_embed, _ = model(input_embeds)
+
+    assert torch.equal(input_embeds, staged), "the forward wrote into its input embeddings"
+    assert torch.equal(layer_0_embed, staged)

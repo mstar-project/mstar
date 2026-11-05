@@ -254,7 +254,7 @@ class StepRunner:
                 continue
             for rid in request_ids:
                 per_rid = outputs.get(rid)
-                if isinstance(per_rid, dict):
+                if isinstance(per_rid, Mapping):
                     resource.extend_prefix_chain(
                         rid, node_name,
                         walk_of if isinstance(walk_of, str) else walk_of(rid), per_rid,

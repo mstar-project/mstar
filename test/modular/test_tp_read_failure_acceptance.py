@@ -263,18 +263,11 @@ def _submodule_class():
             self.requires_grad_(False)
             self.bind_node_resources({ROPE: _Rope()})
             self.group, self.rank = group, rank
+            # the stand-in's decode reads routed tokens, not the sampler's
+            self.device_loopback = None
 
-        # the real model's step, stop and emit settings, which read state this
+        # the real model's step and stop settings, which read state this
         # stand-in doesn't have
-        def _device_loopback(self):
-            return False
-
-        def uniform_row_inputs(self, graph_walk, has_loopback=False):
-            return None
-
-        def device_loopback_signals(self, graph_walk):
-            return frozenset()
-
         def max_batch_size(self, graph_walk):
             return None
 
@@ -292,9 +285,6 @@ def _submodule_class():
 
         def step_is_input_free(self, graph_walk):
             return False
-
-        def inline_client_signals(self, graph_walk):
-            return {}
 
         def can_batch(self, batch, model_inputs):
             return True

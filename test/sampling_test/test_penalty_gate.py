@@ -69,7 +69,7 @@ class _RecordingBuffers:
     def sampler_for(self, padded_bs, cg_slot):
         return self.sampler
 
-    def scatter_offset(self, cg_slot=0, keep=None):
+    def scatter_offset(self, cg_slot=0, keep=None, index=None):
         self.offset_scatters += 1
 
     def keep_mask(self, keep):

@@ -50,6 +50,23 @@ def _batch(rids):
     return outputs, host_rows, cpu_per_rid
 
 
+def test_a_withheld_output_stays_out_of_the_row_store(tmp_path):
+    """The worker pops a withheld output (``StopCheck.withheld``) from the row's
+    outputs before storing; the row store must read those outputs, not the row
+    views, or a Talker's EOS frame would reach its codec."""
+    rids = [3, 5]
+    outputs, host_rows, _ = _batch(rids)
+    outputs.per_rid_outputs[5].pop("new_token")
+    mgr = _columnar(_manager(tmp_path))
+    stored = mgr.store_row_outputs_batch(
+        rids, outputs, SIGNALS, outputs.row_views, outputs.row_request_ids,
+        node_name="text", graph_walk="decode", host_rows=host_rows,
+    )
+    assert stored is not None
+    # request-major, SIGNALS order: rid 5's new_token is the last slot
+    assert stored.num_tensors == [1, 1, 1, 0]
+
+
 def test_row_store_matches_the_general_path(tmp_path):
     rids = [3, 5, 8, 13]
     outputs, host_rows, cpu_per_rid = _batch(rids)

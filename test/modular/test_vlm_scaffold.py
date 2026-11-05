@@ -180,7 +180,7 @@ def test_qwen3_5_floors_a_float_images_levels():
     model.vision_config = SimpleNamespace(spatial_merge_size=2)
     seen = []
 
-    def processor(images, return_tensors):
+    def processor(images, return_tensors, **kwargs):
         seen.extend(images)
         return {"pixel_values": torch.zeros(4, 8), "image_grid_thw": torch.tensor([[1, 2, 2]])}
 
@@ -312,7 +312,7 @@ def test_qwen_media_capture_stages_every_media_buffer():
     ]
     for n in config.capture_token_lengths:
         rows = [config.make_node_input(n)]
-        engine_inputs = SimpleNamespace(resources={}, request_ids=[0])
+        engine_inputs = SimpleNamespace(resources={}, request_ids=[0], captured=True)
         out = type(llm).preprocess(llm, "prefill_vision", engine_inputs, rows)
         assert list(out) == ["input_ids", "vision_embeds", "cos_3d", "sin_3d"]
         assert out["vision_embeds"].shape == (n, 8) and out["vision_embeds"].dtype == torch.bfloat16

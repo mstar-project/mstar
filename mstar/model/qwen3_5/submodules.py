@@ -7,7 +7,9 @@ resource steps, and the rotation, interleaved 3D MRoPE
 counter here; the 3D ids are built in this module and passed in as cos/sin.
 """
 
+import logging
 import os
+from collections.abc import Sequence
 from typing import Any
 
 import torch
@@ -49,8 +51,17 @@ from mstar.model.qwen3_5.config import (
     Qwen3_5VisionConfig,
 )
 from mstar.model.submodule_base import ARNodeInputs, ModelInputsFromEngine, NodeInputs
+from mstar.utils.h2d import to_device_nonblocking
 from mstar.utils.knobs import compile_deterministic, ingraph_decode_rope
 from mstar.utils.profiler import PhaseLaps
+
+logger = logging.getLogger(__name__)
+
+
+def _mixed_token_buckets(prefill_buckets) -> list[int]:
+    """The prefill ladder up to 2176, then its powers of two (see
+    ``LLMSubmodule.MIXED_TOKEN_BUCKETS``)."""
+    return [b for b in prefill_buckets if b <= 2176 or b & (b - 1) == 0]
 
 
 class LLMSubmodule(SampledTokenDecoder):
@@ -62,27 +73,24 @@ class LLMSubmodule(SampledTokenDecoder):
     # up to a power of two long fills one exactly. 2176, 4352 and 8704 add 1/16
     # above them for the decode rows a mixed step carries beside four prompts
     # and for batches a few tokens over, which would otherwise pad to twice the
-    # width. MSTAR_QWEN35_PREFILL_TOKEN_BUCKETS narrows or extends it (static
-    # buffers are sized by the largest bucket).
-    PREFILL_TOKEN_BUCKETS = [
-        int(x) for x in os.environ.get(
-            "MSTAR_QWEN35_PREFILL_TOKEN_BUCKETS", "32,64,128,256,512,1024,2048,2176,4096,4352,8192,8704",
-        ).split(",")
-    ]
+    # width. A deployment sets its own with `model_kwargs.prefill_token_buckets`
+    # (static buffers are sized by the largest bucket).
+    PREFILL_TOKEN_BUCKETS = [32, 64, 128, 256, 512, 1024, 2048, 2176, 4096, 4352, 8192, 8704]
     # Four prompts and their decode rows reach 2176, the only slack bucket a
     # mixed step needs. Every (rows, tokens) pair here is one more recompile of
     # the forward all these captures share, and past Dynamo's limit the buckets
     # compiled last run uncompiled inside their graphs.
-    MIXED_TOKEN_BUCKETS = [b for b in PREFILL_TOKEN_BUCKETS if b <= 2176 or b & (b - 1) == 0]
+    MIXED_TOKEN_BUCKETS = _mixed_token_buckets(PREFILL_TOKEN_BUCKETS)
     # Capture rows and a replay's padding rows address the pool's sink and
     # hold no slot, so these buckets do not size `gdn_state.max_slots`; that is
     # set by the concurrency a deployment wants (see configs/qwen3_5_*.yaml).
     # The ladder runs to 128 because the largest bucket is also the scheduler's
     # cap on rows per decode step: with 32 as the top, 64 requests in flight
     # ran as two alternating batches of 32 and each paid the whole per-step
-    # host cost. MSTAR_QWEN35_DECODE_BUCKETS overrides MSTAR_DECODE_BUCKETS for
-    # this model alone; both are read here, so a reload of this module sees
-    # the environment it runs under.
+    # host cost. A step above 32 rows pads to the next bucket.
+    # MSTAR_DECODE_BUCKETS="1,2,4,8,16,32" narrows the ladder for every model
+    # that reads it (less graph memory, or the pre-#258 ladder for an A/B);
+    # MSTAR_QWEN35_DECODE_BUCKETS overrides it for this model alone.
     DECODE_CAPTURE_BATCH_SIZES = [
         int(x) for x in (
             os.environ.get("MSTAR_QWEN35_DECODE_BUCKETS")
@@ -102,8 +110,16 @@ class LLMSubmodule(SampledTokenDecoder):
         config: Qwen3_5Config,
         vision_config: Qwen3_5VisionConfig | None = None,
         encoders: tuple[MediaEncoder, ...] = (),
+        prefill_token_buckets: list[int] | None = None,
     ):
-        super().__init__(model, config, encoders)
+        super().__init__(model, config, encoders, prefill_token_buckets)
+        if "MSTAR_QWEN35_PREFILL_TOKEN_BUCKETS" in os.environ:
+            logger.warning(
+                "MSTAR_QWEN35_PREFILL_TOKEN_BUCKETS is no longer read; set the ladder "
+                "with `model_kwargs.prefill_token_buckets` in the serving config",
+            )
+        # follows a deployment's own prefill ladder
+        self.MIXED_TOKEN_BUCKETS = _mixed_token_buckets(self.PREFILL_TOKEN_BUCKETS)
         # patches per merged token along each axis, for the MRoPE grids
         self._merge_size = vision_config.spatial_merge_size if vision_config is not None else None
 
@@ -147,31 +163,34 @@ class LLMSubmodule(SampledTokenDecoder):
         for offset, tokens, grid in zip(
             layout.get("offset", ()), layout.get("tokens", ()), layout.get("grid", ()), strict=True,
         ):
+            # built on the host, copied once below
             if offset > cursor:
-                pos_ids.append(text_position_ids(offset - cursor, pos, device))
+                pos_ids.append(text_position_ids(offset - cursor, pos))
                 pos += offset - cursor
             grid = torch.tensor(grid)
-            pos_ids.append(vision_position_ids(grid, merge, pos, device))
+            pos_ids.append(vision_position_ids(grid, merge, pos))
             pos += vision_position_advance(grid, merge)
             cursor = offset + tokens
         if num_tokens > cursor:
-            pos_ids.append(text_position_ids(num_tokens - cursor, pos, device))
+            pos_ids.append(text_position_ids(num_tokens - cursor, pos))
             pos += num_tokens - cursor
-        return torch.cat(pos_ids, dim=1), pos - start
+        return to_device_nonblocking(torch.cat(pos_ids, dim=1), device), pos - start
+
+    def resident_walks(self) -> frozenset[str]:
+        # a captured decode step builds its rope inside the graph on every config
+        # (`_rope_in_graph`), so its `preprocess` reads nothing the tables fill
+        return frozenset({"decode"})
 
     @staticmethod
     def _rope_in_graph(engine_inputs: ModelInputsFromEngine, graph_walk: str) -> bool:
         """A step of a text walk replayed on a leased slot, or being captured
-        for one, with ``ingraph_decode_rope`` on: its rotary tables come from
-        the planned positions inside the graph. The caller's walk decides (a
-        capture's own context carries the piecewise walk), the lease says the
-        slot's static buffers are in play. Only media walks' rows bring their
-        own 3D positions."""
-        if graph_walk not in ("decode", "prefill_text", MIXED) or not ingraph_decode_rope():
+        for one, whose rotary tables come from the planned positions inside
+        the graph: always for decode, with ``ingraph_decode_rope`` on for text
+        prefill and mixed steps. Only media walks' rows bring their own 3D
+        positions."""
+        if not engine_inputs.captured:
             return False
-        step = getattr(engine_inputs, "step", None)
-        ctx = getattr(step, "ctx", None) if step is not None else None
-        return ctx is not None and getattr(ctx, "slot_lease", None) is not None
+        return graph_walk == "decode" or (graph_walk in ("prefill_text", MIXED) and ingraph_decode_rope())
 
     def _decode_cos_sin(
         self, engine_inputs: ModelInputsFromEngine, num_tokens: int,
@@ -197,7 +216,7 @@ class LLMSubmodule(SampledTokenDecoder):
     ) -> dict[str, torch.Tensor | Any]:
         out = super().preprocess(graph_walk, engine_inputs, inputs)
         if self._rope_in_graph(engine_inputs, graph_walk):
-            assert self._reads_loopback(inputs) or all(inp.custom_pos_ids is None for inp in inputs), (
+            assert self._has_loopback_rows(inputs) or all(inp.custom_pos_ids is None for inp in inputs), (
                 "a text walk's rows take the planned 1D positions"
             )
             # the captured forward builds the rotary tables itself
@@ -223,8 +242,9 @@ class LLMSubmodule(SampledTokenDecoder):
         **tensors: torch.Tensor,
     ) -> dict[str, Any]:
         if self._rope_in_graph(engine_inputs, graph_walk) or cos_3d is None or sin_3d is None:
-            # MSTAR_INGRAPH_DECODE_ROPE: the tables come from the planned
-            # positions, inside the graph; the static cos/sin stay unread
+            # the tables come from the planned positions, inside the graph
+            # (off a captured decode's per-step critical path); the static
+            # cos/sin stay unread
             cos_3d, sin_3d = self._decode_cos_sin(engine_inputs, num_tokens)
         return {"cos_sin": (cos_3d, sin_3d)}
 
@@ -234,12 +254,39 @@ class VisionEncoderSubmodule(PackedBlockLoopEncoder):
 
     Grid maths runs in `prepare_inputs`, and each frame is its own attention
     segment, so the compiled tower's only symbolic shape is its token count.
-    The resource's segment ceiling is one per image (and per video frame
-    group); see `Qwen3_5DenseModel._vision_resources`.
+    A step's requests replay together as one packed row: every image and
+    video frame group of every request is its own attention segment, and the
+    resource's ceiling counts them per step; see
+    `Qwen3_5DenseModel._vision_resources`. A request too large for a replay
+    (a long video) runs the block loop uncaptured; while the block loop is
+    captured for other steps, it gets a step of its own (`cg_key_info`).
     """
 
-    # 16384 patches merge to the LLM's 4096 `prefill_vision` bucket
-    BLOCK_LOOP_PATCH_BUCKETS = [256, 512, 1024, 2048, 4096, 8192, 16384]
+    # 16384 patches merge to the LLM's 4096 media-walk bucket; a larger step
+    # runs uncaptured. 12288 holds a 30 s video at 2 fps (~11.8k patches),
+    # which 16384 pads by 39%.
+    BLOCK_LOOP_PATCH_BUCKETS = [256, 512, 1024, 2048, 4096, 8192, 12288, 16384]
+    # They share one replay, so a burst of image requests pays the per-step
+    # host cost once per this many, not per image.
+    MAX_BATCH_SIZE = 8
+
+    # The engine would compile `forward_batched` whole, and its per-step
+    # bookkeeping (each request's slice of the output, the segment lengths)
+    # guards on the batch size: every new size recompiled (~0.6 s, on a live
+    # request). The tensor stages are compiled on their own instead
+    # (`compile_regions`), dynamic in the patch count, so one graph serves
+    # every capture bucket and the uncaptured steps past the top one.
+    # Uncompiled, the blocks' fp32 rope, norms and activations were over half
+    # the tower's GPU time on long videos.
+    disable_torch_compile = True
+
+    def __init__(
+        self, model: torch.nn.Module, config: Qwen3_5VisionConfig, output: str,
+        pixel_normalizer: tuple[torch.Tensor, torch.Tensor],
+    ):
+        super().__init__(model, config, output)
+        # per-column (mean, std) for byte patches; see `Qwen3_5DenseModel.pixel_normalizer`
+        self._pixel_normalizer = pixel_normalizer
 
     def prepare_inputs(
         self,
@@ -253,19 +300,86 @@ class VisionEncoderSubmodule(PackedBlockLoopEncoder):
         # a video's runs are its temporal groups, each a one-frame grid
         grid = self.grids(fwd_info)
         # Built here, not in the compiled forward: a `.tolist()` there breaks
-        # the graph and makes h, w symints inductor cannot codegen from.
-        indices, weights = vision_interpolation(
-            grid, self.config.num_grid_per_side, merge, device,
-        )
+        # the graph and makes h, w symints inductor cannot codegen from. And
+        # built on the host: on the device, the grid upload and the
+        # `repeat_interleave`s each block on the stream.
+        indices, weights = vision_interpolation(grid, self.config.num_grid_per_side, merge)
         return NodeInputs(
             # what the engine leases the captured block loop's bucket by
             input_seq_len=sum(t * h * w for t, h, w in grid),
             tensor_inputs={
                 "pixel_values": torch.cat(inputs["pixel_values"], dim=0),
-                "indices": indices,
-                "weights": weights,
-                "position_ids": vision_grid_position_ids(grid, merge, device),
+                "indices": to_device_nonblocking(indices, device),
+                "weights": to_device_nonblocking(weights, device),
+                "position_ids": to_device_nonblocking(vision_grid_position_ids(grid, merge), device),
             },
             # one segment per frame: a frame attends to itself alone
             resource_step_info={"main": vision_seq_lengths(grid)},
         )
+
+    def split_batches_by_capture_key(self, graph_walk: str) -> bool:
+        return True
+
+    def cg_key_info(
+        self, graph_walk: str, per_request_info: dict, **kwargs: Any,
+    ) -> Any:
+        """The scheduler's group (``split_batches_by_capture_key``): requests
+        that each fit a replay alone pack together (None); one too large for
+        a replay (a long video) is a group of its own, so it gets a step of
+        its own. Beside others it would run back to back with them in one
+        step (`can_batch`), which holds every request's embeddings, and so
+        their prefills, until the last one is encoded."""
+        def too_large(info: CurrentForwardPassInfo) -> bool:
+            grid = self.grids(info)
+            return not self._fits_replay(sum(t * h * w for t, h, w in grid), sum(t for t, _, _ in grid))
+
+        return tuple(rid for rid, info in per_request_info.items() if too_large(info)) or None
+
+    def compile_regions(self) -> dict[str, list[tuple]]:
+        """Warmed at start-up on the smallest image the processor makes (256 x
+        256 pixels), in the dtypes a step brings: float32 pixels out of
+        `_normalize`, merger rows in the tower's dtype. Dynamic in the patch
+        count from that call, so no image compiles them on a live request. The
+        blocks take no example (they need a planned attention step): they
+        compile in the block loop's capture warm-up, or on the first image when
+        capture is off. Each block compiles on its own rather than the whole
+        block loop: every block runs one code object, so Dynamo traces it once
+        and the others reuse the graph, where tracing the unrolled loop took
+        ~80 s of every start."""
+        device, merge = self.get_device(), self.config.spatial_merge_size
+        grid = [(1, 16, 16)]
+        indices, weights = vision_interpolation(grid, self.config.num_grid_per_side, merge)
+        position_ids = vision_grid_position_ids(grid, merge)
+        patch = self.config.in_channels * self.config.temporal_patch_size * self.config.patch_size ** 2
+        pixels = torch.zeros(16 * 16, patch, device=device)
+        rows = torch.zeros(16 * 16, self.config.hidden_size, dtype=next(self.model.merger.parameters()).dtype,
+                           device=device)
+        blocks = {f"model.blocks.{i}": [] for i in range(len(self.model.blocks))}
+        return {
+            "model.embed": [(pixels, indices.to(device), weights.to(device), position_ids.to(device))],
+            **blocks,
+            "model.merger": [(rows,)],
+        }
+
+    def preprocess(
+        self,
+        graph_walk: str,
+        engine_inputs: ModelInputsFromEngine,
+        inputs: Sequence[NodeInputs],
+    ) -> dict[str, Any]:
+        out = super().preprocess(graph_walk, engine_inputs, inputs)
+        out["pixel_values"] = self._normalize(out["pixel_values"])
+        return out
+
+    def _normalize(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        """Byte patches to the processors' float pixels. Eager, not in the
+        compiled embed, so the arithmetic (a subtract, a true divide) is the
+        processors' exactly."""
+        if pixel_values.dtype != torch.uint8:
+            # the intake ships bytes; anything else would skip normalization
+            raise ValueError(f"vision patches must be uint8, got {pixel_values.dtype}")
+        mean, std = self._pixel_normalizer
+        if mean.device != pixel_values.device:
+            mean, std = mean.to(pixel_values.device), std.to(pixel_values.device)
+            self._pixel_normalizer = (mean, std)
+        return (pixel_values.to(torch.float32) - mean) / std

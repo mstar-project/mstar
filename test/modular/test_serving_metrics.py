@@ -1311,6 +1311,8 @@ def _config(monkeypatch, tmp_path, text="model: fake\n") -> str:
     monkeypatch.setattr(entrypoint, "model_init_kwargs", lambda name: {})
     # sizing torch's pool would outlive the test in this process
     monkeypatch.setattr(entrypoint, "_set_preprocess_threads", lambda model, config: None)
+    # and so would handing pytest's log handlers to a writer thread, which repeats every later record
+    monkeypatch.setattr(entrypoint, "log_off_thread", lambda: None)
     return str(cfg)
 
 
@@ -1336,6 +1338,7 @@ def test_metrics_start_after_the_warmup_requests_and_before_the_bind(monkeypatch
 
     class _Server:
         fatal_error = None
+        lora_adapter_digests: dict = {}
 
         def __init__(self, **kwargs):
             pass
@@ -1391,6 +1394,7 @@ def _conductor_spawn_kwargs(monkeypatch, tmp_path, *argv) -> dict:
 
     class _Server:
         fatal_error = None
+        lora_adapter_digests: dict = {}
 
         def __init__(self, **kwargs):
             pass
@@ -1415,7 +1419,8 @@ def _conductor_spawn_kwargs(monkeypatch, tmp_path, *argv) -> dict:
 
 
 def test_the_conductor_gets_a_status_interval_only_with_metrics_on(monkeypatch, tmp_path):
-    assert _conductor_spawn_kwargs(monkeypatch, tmp_path, "--enable-metrics") == {"status_interval_s": 1.0}
+    assert _conductor_spawn_kwargs(monkeypatch, tmp_path, "--enable-metrics") == {
+        "status_interval_s": 1.0, "lora_adapter_digests": {}}
     assert _conductor_spawn_kwargs(monkeypatch, tmp_path).get("status_interval_s") is None
 
 
@@ -1451,7 +1456,11 @@ def test_enable_metrics_without_the_package_stops_before_anything_starts(monkeyp
 
 
 def test_enable_metrics_with_the_rust_frontend_starts(monkeypatch, tmp_path):
+    from mstar.api_server import rust_frontend
+
     monkeypatch.setattr(entrypoint, "MISSING_DEPENDENCY", None)
+    # main() resolves the binary before loading anything; CI builds none.
+    monkeypatch.setattr(rust_frontend, "find_server_binary", lambda explicit=None: "mstar-server")
     assert _main_until_api_server(monkeypatch, tmp_path, "--enable-metrics", "--rust-frontend")
 
 

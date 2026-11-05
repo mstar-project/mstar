@@ -15,6 +15,7 @@ import torch
 from mstar.model.multimodal import vision_encoder
 from mstar.model.muse.submodules import LLMSubmodule as GlimmerLLMSubmodule
 from mstar.model.orpheus.submodules import OrpheusLLMSubmodule
+from mstar.model.orpheus.submodules import token_stop as orpheus_token_stop
 from mstar.model.qwen3_5.submodules import LLMSubmodule
 
 LOOP = "decode_loop"
@@ -26,7 +27,8 @@ MODELS = {
                 ("decode", "prefill_text", "prefill_vision"),
                 LLMSubmodule(None, SimpleNamespace(stop_token_ids=frozenset(EOS)),
                              encoders=(vision_encoder((5,)),)).token_stop),
-    "orpheus": (OrpheusLLMSubmodule, SimpleNamespace(stop_token_id=EOS[0]), ("prefill", "decode"), None),
+    "orpheus": (OrpheusLLMSubmodule, SimpleNamespace(stop_token_id=EOS[0]), ("prefill", "decode"),
+                orpheus_token_stop(EOS[0])),
     # the shared VLM decoder's stop, as Muse Glimmer serves it
     "muse_glimmer": (GlimmerLLMSubmodule, SimpleNamespace(stop_token_ids=frozenset(EOS)),
                      ("decode", "prefill_text", "prefill_vision"),
@@ -75,3 +77,24 @@ def test_declared_policies_stop_the_rows_check_stop_does(model, seed):
             }
             assert declared == set(expected), (walk, rid)
     assert declared_walks
+
+
+def test_a_token_stop_names_the_walks_that_end_its_loop():
+    from mstar.model.submodule_base import TokenStop
+
+    def stop(walk):
+        return TokenStop(loop=LOOP, buffer="new_token", stop_ids=frozenset(EOS), sampler="s", walk=walk)
+
+    assert stop(None).stops_on("a")
+    assert stop("a").stops_on("a") and not stop("a").stops_on("b")
+    both = stop(frozenset({"a", "b"}))
+    assert both.stops_on("a") and both.stops_on("b") and not both.stops_on("c")
+
+
+def test_a_withholding_token_stop_refuses_the_runtime_check():
+    """The runtime's check never calls ``check_stop``, which is what withholds."""
+    from mstar.model.submodule_base import TokenStop
+
+    with pytest.raises(ValueError, match="runtime_check"):
+        TokenStop(loop=LOOP, buffer="new_token", stop_ids=frozenset(EOS), sampler="s",
+                  withhold=("codes",), runtime_check=True)
