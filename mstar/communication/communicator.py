@@ -2,6 +2,7 @@ import collections
 import fcntl
 import logging
 import os
+import time
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
 from enum import Enum
@@ -194,9 +195,14 @@ class OutboxCommunicator:
     communicator's.
     """
 
+    #: How often a peer that stays behind is reported.
+    BEHIND_WARN_S = 10.0
+
     def __init__(self, inner: BaseCommunicator):
         self._inner = inner
         self._outbox: dict[str, collections.deque[bytes]] = {}
+        # peer -> (when its backlog started, when it was last reported)
+        self._behind: dict[str, tuple[float, float]] = {}
 
     def send(self, entity_id: str, msg) -> None:
         self.send_each((entity_id,), msg)
@@ -217,7 +223,10 @@ class OutboxCommunicator:
 
         A queued message whose send fails outright (not just a full peer) is
         dropped and logged: there is no caller left to raise to, and keeping
-        it would stop every message behind it."""
+        it would stop every message behind it. Nothing bounds the queue, since
+        blocking or dropping would hang the requests behind it, so a peer that
+        stays behind is logged with its depth every ``BEHIND_WARN_S``."""
+        now = time.monotonic()
         for entity_id, backlog in self._outbox.items():
             while backlog:
                 try:
@@ -226,6 +235,16 @@ class OutboxCommunicator:
                 except Exception:  # noqa: BLE001 — that message's failure alone
                     logger.exception("Dropping a queued message to %s that failed to send", entity_id)
                 backlog.popleft()
+            if not backlog:
+                self._behind.pop(entity_id, None)
+                continue
+            since, reported = self._behind.setdefault(entity_id, (now, now))
+            if now - reported >= self.BEHIND_WARN_S:
+                self._behind[entity_id] = (since, now)
+                logger.warning(
+                    "%s has taken less than it was sent for %.0f s: %d messages queued for it",
+                    entity_id, now - since, len(backlog),
+                )
         return any(self._outbox.values())
 
     def __getattr__(self, name):

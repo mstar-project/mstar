@@ -77,6 +77,29 @@ def test_a_queued_message_that_fails_to_send_is_dropped_not_retried():
     assert [msg for _, msg in peer.delivered] == ["first", "last"]
 
 
+def test_a_peer_that_stays_behind_is_reported_with_its_depth(monkeypatch, caplog):
+    """Nothing bounds the outbox, so a peer that stays behind is logged, every
+    BEHIND_WARN_S, and one that catches up resets its clock."""
+    now = [100.0]
+    monkeypatch.setattr(time, "monotonic", lambda: now[0])
+    peer = _Peer(full={"worker_0": 10**6, "worker_1": 1})
+    out = OutboxCommunicator(peer)
+    for i in range(3):
+        out.send("worker_0", i)
+    out.send("worker_1", "x")
+    with caplog.at_level("WARNING", logger="mstar.communication.communicator"):
+        out.flush()                                 # worker_1 catches up here
+        now[0] += out.BEHIND_WARN_S - 1
+        out.flush()
+        assert not caplog.records
+        now[0] += 1
+        out.flush()
+        now[0] += 1
+        out.flush()                                 # reported once per interval
+    (record,) = caplog.records
+    assert record.args[0] == "worker_0" and record.args[2] == 3
+
+
 class _Model:
     def get_partition_topology(self):
         return PartitionTopology(partitions=["default"])
