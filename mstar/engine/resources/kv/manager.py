@@ -366,7 +366,7 @@ class Dropped(NamedTuple):
 
 class Victims(NamedTuple):
     """The requests `KVManager.preempt` chose to move off the device: to the host, dropped, or, holding no page of
-    their own, already given back their leases and allotment to ask again. When no move covers the shortage,
+    their own, already given back their allotment to ask again. When no move covers the shortage,
     ``waits`` is the pages the request that ran short asks the pool for instead, and 0 otherwise."""
     to_host: list[str]
     to_drop: list[str]
@@ -4758,11 +4758,12 @@ class KVManager(AttentionResource):
 
     def _movable(self, rid: str) -> bool:
         """Whether a move can take ``rid`` as soon as it is chosen: no step or read is in flight on its pages, and it
-        isn't dropped with a rebuild still to land, since the rebuild runs on its allotment. A move releases ``rid``'s
-        leases, and a walk the cache served keeps its KV only in the lease, so ``rid`` also stays until a later walk's
-        admit takes the lease over."""
+        isn't dropped with a rebuild still to land, since the rebuild runs on its allotment. ``rid`` also stays while
+        it holds a lease, until a walk's admit takes the lease over. The probe that took the lease moved the position
+        counter, which a smaller hit after a move couldn't move back, and a walk the cache served keeps its KV only in
+        the lease."""
         return rid not in self._dropped and not any(
-            stream.step_in_flight or stream.read_pending or (stream.lease is not None and stream.span_cursor.done)
+            stream.step_in_flight or stream.read_pending or stream.lease is not None
             for stream in self._streams[rid].values()
         )
 
@@ -4788,13 +4789,12 @@ class KVManager(AttentionResource):
         return pages
 
     def _frees(self, rids: Collection[str]) -> int:
-        """The room moving ``rids`` off the device would make: the pages of their streams and leases that would
-        reach the free list or the evictable set, and their unused allotments."""
+        """The room moving ``rids`` off the device would make: the pages of their streams that would reach the free
+        list or the evictable set, and their unused allotments."""
         released: Counter = Counter()
         for rid in rids:
             for stream in self._streams[rid].values():
                 released.update(stream.pages())
-                released.update(stream.lease or ())
         held = list(released)
         pages = sum(owners == released[page] for page, owners in zip(held, self._arena.owners_of(held), strict=True))
         if self._index is not None:
@@ -4822,10 +4822,8 @@ class KVManager(AttentionResource):
         self._allot(earmark.rid, granted)
 
     def _vacate(self, rid: str, room: int) -> None:
-        """Release ``rid``'s leases and give up its allotment, so that ``rid`` asks again, once a drop or a move
-        to the host has freed its pages. ``room`` is `_room` as it was before the drop or the move."""
-        for stream in self._streams[rid].values():
-            self._release_lease(rid, stream)
+        """Give up ``rid``'s allotment, so that ``rid`` asks again, once a drop or a move to the host has freed its
+        pages. ``room`` is `_room` as it was before the drop or the move."""
         allotment = self._allotments.pop(rid, None)
         if allotment is not None:
             self._unused -= allotment.remaining

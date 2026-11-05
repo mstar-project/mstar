@@ -252,6 +252,24 @@ def test_a_request_holding_a_served_walk_in_its_lease_isnt_chosen():
     assert answers == [len(TEXT), IMAGE, 4 * PAGE_SIZE - len(TEXT) - IMAGE], "a move released the served walk's KV"
 
 
+def test_a_request_whose_probe_holds_a_lease_isnt_chosen():
+    """A probe moves the position counter as it takes its lease, before its walk's step admits. A newer request whose
+    step was refused in between gave the lease back and came back to a smaller hit, and its walk wrote from where the
+    first probe had moved the counter, which never moves back."""
+    node = _LayoutNode()
+    kv = node.kv
+    _request(kv, "o", 1, arrival=0)
+    assert _ready(kv, "o") and _ready(kv, RID)
+    node.probe(TEXT_WALK, len(TEXT))
+    node.runner.remove_request("seed")
+
+    kv.preempt("o", 1, [RID], droppable=lambda rid: False)
+    kv._evict(len(kv._index.evictable()))
+    node.walk(TEXT_WALK, len(TEXT))
+
+    assert node.rope.position(RID, "main") == len(TEXT), "the walk wrote past where its probe had moved the counter"
+
+
 def test_a_request_holding_a_served_walk_in_its_lease_doesnt_move_itself():
     """With nothing newer to move, a request that ran short goes to the host itself, and the move releases its
     leases. A page on another label made it look movable while its lease held a served walk's KV."""
