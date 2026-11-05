@@ -27,7 +27,7 @@ from mstar.engine.resources.base import KeyedWalks
 from mstar.engine.resources.kv import manager as manager_mod
 from mstar.engine.resources.kv.config import KVSpec, KVStep, PagedKVConfig, opening_prefix_caches
 from mstar.engine.resources.kv.manager import KVManager
-from mstar.engine.resources.step import Segment, StepContext
+from mstar.engine.resources.step import Segment, StepContext, SubmoduleStep
 from mstar.model.submodule_base import ARNodeInputs, ARNodeSubmodule
 from mstar.utils.ipc_format import MoveKind, ScheduleTPNode
 from mstar.worker.micro_scheduler import MicroScheduler
@@ -274,6 +274,30 @@ def test_ranks_evict_alike_when_a_lease_straddles_a_commit_that_files_under_a_pa
         _run(kv, "big", big)
 
     assert _pages(leader, "big") == _pages(follower, "big"), "the ranks linked z's page differently and evicted apart"
+
+
+def test_a_pre_plan_rank_0_throws_away_evicts_no_cached_page_a_follower_keeps():
+    """Rank 0 pre-plans r's next page with no page free, and throws the stage away. A follower never planned the
+    step. Undoing the admit gives the page back to the free list, so a cached page evicted for it left rank 0's index
+    without a key the follower still holds, and a later hit on that key stopped the follower."""
+    ranks = leader, follower = _manager(0, max_num_pages=8), _manager(1, max_num_pages=8)
+    r = _tokens(4 * PAGE_SIZE, seed=53)
+    _cache(ranks, "x", _tokens(3 * PAGE_SIZE, seed=52))
+    for kv in ranks:
+        kv.remove_request("x")
+        kv.ingest_request("r", _config([r], decode=PAGE_SIZE))
+        _run(kv, "r", r)
+    assert not leader._arena.num_free, "a page is free, so the test checks nothing"
+    runner = StepRunner({"kv": leader}, node_resources={NODE: ["kv"]})
+    step = SubmoduleStep({"kv": KVStep()}, segments=[Segment("r", "main", 1)])
+    step.set_ctx(StepContext(["r"], "decode", 0, False, is_preplan=True))
+
+    runner.pre_admit(step)
+    runner.clear_preplan()
+
+    assert sorted(leader._index.pages()) == sorted(follower._index.pages()), (
+        "rank 0 evicted a cached page for a stage it threw away, which the follower still holds"
+    )
 
 
 def test_a_served_walks_lease_stays_when_the_next_walk_wont_run():
