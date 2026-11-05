@@ -130,6 +130,11 @@ def _cta_tile_q(packed_qo_len: int, head_dim_vo: int, head_dim_qk: int) -> int:
     return 64 if packed_qo_len > 16 else 16
 
 
+def _check_length(name: str, indptr: list[int], i: int) -> None:
+    if indptr[i + 1] < indptr[i]:
+        raise gpu_error(RuntimeError(f"{name}[{i + 1}]{indptr[i + 1]} - {name}[{i}]{indptr[i]} should be non-negative"))
+
+
 def prefill_allocations(qo: list[int], kv: list[int], total_num_rows: int, batch: int, num_qo_heads: int,
                         num_kv_heads: int, page_size: int, cuda_graph: bool, head_dim_qk: int,
                         head_dim_vo: int, window_left: int, fixed_split_size: int = -1,
@@ -141,6 +146,9 @@ def prefill_allocations(qo: list[int], kv: list[int], total_num_rows: int, batch
     gqa = num_qo_heads // num_kv_heads
     max_grid = max(0, 2 * torch.cuda.get_device_properties().multi_processor_count - num_colocated_ctas)
     max_batch_if_split = max_grid // num_kv_heads
+    for i in range(batch):
+        _check_length("qo_indptr", qo, i)
+        _check_length("kv_indptr", kv, i)
     packed = [(qo[i + 1] - qo[i]) * gqa for i in range(batch)]
     kv_len = [kv[i + 1] - kv[i] for i in range(batch)]
     if cuda_graph and uniform_q_len > 0:
@@ -207,6 +215,8 @@ def fa3_allocations(qo: list[int], total_num_rows: int, batch: int, num_qo_heads
     """What FlashInfer's fa3 prefill planner (``PrefillSM90Plan``) allocates for ``qo`` rows per
     request: it splits no KV, so only work arrays, one work a query tile of one head (past 4096
     tiles a head, the heads share a schedule)."""
+    for i in range(batch):
+        _check_length("qo_indptr", qo, i)
     tile = 192 if head_dim_vo == 64 else 128
     per_head = _ceil(total_num_rows, tile) + batch - 1
     heads = 1 if per_head > 4096 else num_qo_heads
@@ -224,6 +234,8 @@ def decode_allocations(kv: list[int], batch: int, num_qo_heads: int, num_kv_head
     kernel's occupancy, approximated: shared memory and threads bound the blocks per SM, its
     registers (a fact of the compiled kernel) don't, so the grid can only come out larger."""
     gqa = num_qo_heads // num_kv_heads
+    if gqa not in (1, 2, 3, 4, 6, 8, 16):  # the group sizes its kernels are built for
+        raise gpu_error(RuntimeError(f"Unsupported group_size: {gqa}"))
     kv_bytes = element_size(canonical_dtype(kv_dtype))
     vec = max(16 // kv_bytes, head_dim // 32)
     bdx = head_dim // vec

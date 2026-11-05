@@ -411,6 +411,23 @@ def test_flashinfers_planner_runs_short_of_a_small_workspace():
             raise SystemExit("CUDA-core decode took a fixed split")
         except ValueError as e:
             assert "tensor core decode" in str(e), e
+        # what FlashInfer's plan refuses: a group size with no kernel, a negative length, and
+        # several queries a row where the kernels take one
+        one_row = torch.tensor([0, 1], **i32), torch.zeros(1, **i32), torch.tensor([3], **i32)
+        backwards = torch.tensor([0, 8, 4], dtype=torch.int32)
+        refused = ((lambda: cores.plan(*one_row, 7, 1, 128, 16), RuntimeError, "Unsupported group_size: 7"),
+                   (lambda: get_batch_prefill_module("fa2").plan(
+                       workspace, None, None, backwards, kv, torch.tensor([16, 16], dtype=torch.int32), 8, 2, 8, 8, 16,
+                       False, 64, 64, True, -1, -1, False, 0, 0), RuntimeError, "qo_indptr[2]4 - qo_indptr[1]8"),
+                   (lambda: cores.plan(*one_row, 8, 8, 128, 16, q_len_per_req=2), ValueError, "requires tensor-core"),
+                   (lambda: decode.plan(*one_row, 8, 8, 128, 16, q_data_type=dtype, q_len_per_req=2),
+                    NotImplementedError, "fa2 tensor-core"))
+        for call, kind, text in refused:
+            try:
+                call()
+                raise SystemExit(f"nothing refused it: {text}")
+            except kind as e:
+                assert text in str(e), e
     """)
 
 

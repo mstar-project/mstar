@@ -33,7 +33,7 @@ class BatchDecodeWithPagedKVCacheWrapper(PagedAttention):
             float_workspace_buffer, kv_layout, use_cuda_graph, None, paged_kv_indptr_buffer,
             paged_kv_indices_buffer, paged_kv_last_page_len_buffer, backend,
         )
-        self._use_tensor_cores = use_tensor_cores
+        self._use_tensor_cores = use_tensor_cores or backend in ("trtllm-gen", "cute-dsl")
 
     @property
     def use_tensor_cores(self) -> bool:
@@ -80,12 +80,18 @@ class BatchDecodeWithPagedKVCacheWrapper(PagedAttention):
             raise gpu_error(ValueError(f"q_len_per_req must be >= 1, got {q_len_per_req}"))
         if fixed_split_size is not None and not self._use_tensor_cores:
             raise gpu_error(ValueError("fixed_split_size is only supported by tensor core decode for now."))
+        if q_len_per_req > 1 and not self._use_tensor_cores and self._backend != "cudnn":
+            raise gpu_error(ValueError("q_len_per_req > 1 requires tensor-core decode (use_tensor_cores=True "
+                                       "or the trtllm-gen/cute-dsl/cudnn backend)."))
         if data_type is not None:
             q_data_type = kv_data_type = data_type
         if self._use_tensor_cores and self._backend == "auto":  # plans with the prefill module: fa2 unless fp8
             dtypes = canonical_dtype(q_data_type), canonical_dtype(kv_data_type or q_data_type)
             fp8 = {torch.float8_e4m3fn, torch.float8_e5m2} & set(dtypes)
             self._backend = determine_attention_backend(self.device, 0, False, False, *dtypes) if fp8 else "fa2"
+        if q_len_per_req > 1 and self._use_tensor_cores and self._backend == "fa3":
+            raise gpu_error(NotImplementedError(
+                "q_len_per_req > 1 is currently only supported on the fa2 tensor-core backend."))
         self._logits_soft_cap = logits_soft_cap or 0.0
         self._set_plan(
             None, indptr, indices, last_page_len, num_qo_heads=num_qo_heads,
