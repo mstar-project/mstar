@@ -139,6 +139,19 @@ dynamo = [
     "uvloop",
 ]
 
+# MiniCPM-o 4.5: the voice-prompt tokenizer and speaker encoder load from the
+# checkpoint's ONNX files without onnxruntime, as CosyVoice3's do.
+minicpm_o = [
+    "flashinfer-python>=0.6.14",
+    "huggingface-hub",
+    "Pillow",
+    "safetensors",
+    "soundfile",
+    "torchaudio",
+    "torchcodec",
+    "transformers",
+]
+
 bagel = [
     "einops",
     "flashinfer-python==0.7.2",

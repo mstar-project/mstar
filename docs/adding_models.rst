@@ -763,7 +763,12 @@ The spec types are:
        selects GPT-J pairing, ``rotary_dim`` a partial rotation, and ``rope_table_dtype``
        a cos/sin table built once (GLM-5.2 uses float32); ``cos_sin_table`` hands it to a
        kernel that rotates inside a larger fusion, and ``interleave`` says which pairs that
-       kernel must turn. A model with learned position
+       kernel must turn. ``fused=True`` rotates with torch ops over the float32 table
+       ``rope_table_dtype=torch.float32`` builds, instead of FlashInfer's kernel, so a
+       compiled forward fuses the rotation into the kernels around it (it adds no kernel of
+       its own), for small models whose steps are a few kernels a layer (MiniCPM-o's TTS);
+       a Qwen3 layer then keeps its unfused path. It takes standard non-interleaved float32
+       RoPE on CUDA only and refuses other configs. A model with learned position
        embeddings also declares this spec, because it needs the position counter. Such a
        model never applies RoPE.
    * - ``SamplerSpec(vocab_size=..., enable_repetion_penalty=...)``
@@ -2064,7 +2069,8 @@ Both types share the base ``CudaGraphConfig`` fields:
 - ``capture_graph_walk`` is the walk to capture.
 - ``replay_graph_walks`` lists the walks that may replay this capture. One capture can
   therefore serve several walks, for example ``prefill_audio`` reusing ``prefill_text``.
-- ``capture_batch_sizes`` lists the batch sizes to record.
+- ``capture_batch_sizes`` lists the batch sizes to record. ``None`` uses the runner
+  default; ``[]`` records none.
 - ``additional_key_info`` is an extra hashable component of the capture bucket key. Use it
   when one walk must be captured more than once because the batch shape alone does not
   identify the capture. Its value must equal both the value returned by the submodule's
@@ -2225,7 +2231,12 @@ Both types share the base ``PiecewiseCudaGraphConfig`` fields:
   none, since its replay would address every request's tokens to the first request's
   adapter.
 - ``capture_batch_sizes`` lists the batch sizes to record. ``None`` uses the runner
-  default.
+  default; ``[]`` records none, for an eager-only region (below).
+- ``eager_fallback`` runs a shape with no graph eagerly through ``run`` instead of
+  raising: the runner declares, plans and commits the region's step over the real rows
+  (as a replay declares it, without padding), so the caller has one path for captured
+  and uncaptured shapes. Off, the caller checks ``can_run`` first. MiniCPM-o's vocoder
+  uses it, with eager-only regions for the shapes it never captures.
 - ``compile`` runs ``torch.compile`` on ``capture_fn`` before capture. The default is
   ``False``.
 - ``compile_mode`` is that ``torch.compile``'s mode, as on ``AcceleratorGraphConfig``.

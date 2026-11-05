@@ -41,6 +41,13 @@ class PositionConfig:
     rope_scale: float = 1.0
     rope_theta: float = 10000.0
     rope_dtype: torch.dtype | None = None
+    # Apply RoPE as torch ops over the float32 cos/sin table rope_table_dtype=float32
+    # would build, instead of FlashInfer's kernel. "Fused" because a compiled forward
+    # fuses those ops into the kernels around them; the option adds no kernel of its
+    # own, and a layer's fused RoPE kernel (fusable_rope_theta) doesn't stand in for
+    # it. Can be faster for small models. Standard non-interleaved float32 RoPE on
+    # CUDA only; other configs are refused.
+    fused: bool = False
     # Rotate with a cos/sin table rounded to this dtype (math stays float32),
     # for checkpoints trained with a low-precision table (Fish S2-Pro:
     # bfloat16). None computes the angles in the kernel with its fast sin/cos,
