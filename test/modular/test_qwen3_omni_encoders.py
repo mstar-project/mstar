@@ -195,8 +195,10 @@ class RegionRunner:
 
     def __init__(self, sub):
         self.sub = sub
+        self.calls = []
 
     def run(self, static_inputs, **kwargs):
+        self.calls.append(kwargs)
         out = self.sub._capture_block_loop(SimpleNamespace(static_inputs=static_inputs))
         return SimpleNamespace(get_view=out.__getitem__)
 
@@ -220,12 +222,16 @@ def test_vision_frames_and_deepstack_match_hf(vision_pair, grid, replayed):
     assert step.steps[VISION_ATTN].causal is False
     ragged.plan(step)
     with torch.no_grad():
-        engine_inputs = _engine_inputs("v")
+        engine_inputs, runner = _engine_inputs("v"), RegionRunner(sub)
+        engine_inputs.piecewise_runners = {VISION_BLOCK_LOOP: runner}
         if replayed:
-            engine_inputs.piecewise_runners = {VISION_BLOCK_LOOP: RegionRunner(sub)}
             engine_inputs.piecewise_leases = {VISION_BLOCK_LOOP: object()}
         out = sub.forward("prefill_vision", engine_inputs, **sub.preprocess("prefill_vision", None, [row]))
         want = hf(pixels, grid_thw=grid_thw)
+    # one replay of the request's frames when leased, none otherwise
+    assert [(c["request_ids"], c["seq_lens"]) for c in runner.calls] == (
+        [(["v"], [s.span for s in step.segments])] if replayed else []
+    )
     torch.testing.assert_close(out["vision_embeds"][0], want.pooler_output, atol=1e-4, rtol=1e-4)
     assert len(out["deepstack"]) == len(VISION["deepstack_visual_indexes"])
     for got, ref in zip(out["deepstack"], want.deepstack_features, strict=True):

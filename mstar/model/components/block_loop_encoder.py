@@ -67,8 +67,10 @@ class PackedBlockLoopEncoder(NodeSubmodule):
     # Patch-count buckets of one replay; a larger step runs eagerly.
     BLOCK_LOOP_PATCH_BUCKETS = [256, 512, 1024, 2048, 4096, 8192, 16384]
     # Requests per encoder step. Above one, every tensor of ``tensor_inputs``
-    # must pack by concatenation, and ``config`` has ``spatial_merge_size``,
-    # which cuts the output back apart.
+    # must pack by concatenation (an index into a request's own patches, as
+    # Muse Glimmer's window and output orders are, does not, so it stays at
+    # one), and ``config`` has ``spatial_merge_size``, which cuts the output
+    # back apart.
     MAX_BATCH_SIZE = 1
     # The ragged layouts a step plans over its patches, one label each.
     SEGMENT_LABELS: tuple[str, ...] = ("main",)
@@ -256,17 +258,18 @@ class PackedBlockLoopEncoder(NodeSubmodule):
         replayed = self._replay_block_loop(engine_inputs, hidden, cos, sin, segment_lengths)
         encoded = self.model.encode(hidden, cos, sin) if replayed is None else replayed.get_view("hidden")
         embeds = self.model.project(encoded, **tensors)
-        return self._split_rows(engine_inputs.request_ids, embeds, row_patches)
+        return self._split_rows(engine_inputs.request_ids, {self.output: [embeds]}, row_patches)
 
     def _split_rows(
-        self, request_ids: list[str], embeds: torch.Tensor, row_patches: tuple[int, ...],
+        self, request_ids: list[str], outputs: NameToTensorList, row_patches: tuple[int, ...],
     ) -> dict[str, NameToTensorList]:
-        """Each request's slice of the packed output."""
+        """Each request's slice of every packed output, one merged row per
+        ``spatial_merge_size ** 2`` patches."""
         if len(request_ids) == 1:
-            return {request_ids[0]: {self.output: [embeds]}}
+            return {request_ids[0]: outputs}
         out, start = {}, 0
         for rid, patches in zip(request_ids, row_patches, strict=True):
             n = patches // self.config.spatial_merge_size ** 2
-            out[rid] = {self.output: [embeds[start:start + n]]}
+            out[rid] = {name: [t[start:start + n] for t in tensors] for name, tensors in outputs.items()}
             start += n
         return out

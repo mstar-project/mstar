@@ -232,8 +232,9 @@ class VisionEncoderSubmodule(PackedBlockLoopEncoder):
             taps = [out.get_view(f"deepstack_{i}") for i in range(len(self.config.deepstack_visual_indexes))]
             encoded = out.get_view("hidden"), taps
         embeds, deepstack = tower.merge(*encoded)
-        # one request a step (`MAX_BATCH_SIZE`)
-        return {engine_inputs.request_ids[0]: {self.output: [embeds], "deepstack": deepstack}}
+        return self._split_rows(
+            engine_inputs.request_ids, {self.output: [embeds], "deepstack": deepstack}, row_patches,
+        )
 
 
 # ===================================================================
