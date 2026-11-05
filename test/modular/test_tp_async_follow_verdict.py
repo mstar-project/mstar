@@ -97,7 +97,6 @@ def _stub(cache_open: bool = False):
     stub.communicator = _Communicator(stub)
     stub._check_ready_tensors = lambda: None
     stub._poll_stream_buffers = lambda: None
-    stub._apply_removes_whose_step_landed = lambda: None
     stub.request_state = None
     stub.build_results = []   # what _try_follow_speculation returns, in order
 
@@ -350,20 +349,29 @@ def test_await_builds_a_queued_head_and_arms_it():
     assert s.communicator.waits == 0
 
 
-def test_await_lets_a_parked_head_row_back_once_a_held_removal_frees_it():
+def test_await_unparks_a_head_row_whose_capacity_freed():
     """A follower can't leave this wait without a decision, so nothing else
-    unparks a row of its head: the poll applies the removals whose step it
-    reached and asks again (review-r4 F2)."""
+    unparks a row of its head. A parked row never reads ready, so the head
+    builds only once this poll has let it back."""
     s = _stub()
-    order = []
-    s._apply_removes_whose_step_landed = lambda: order.append("removes")
-    s.scheduler.let_rows_back = lambda state: order.append("rows")
+    s.request_state = types.SimpleNamespace(
+        get_partition_for_node=lambda node: "p",
+        get_fwd_info=lambda rid, partition: types.SimpleNamespace(resource_publish_info=None),
+    )
+    s.scheduler.parked[NODE] = {"r0"}
+    class _Engine:
+        def admit_waiting(self, published_of):
+            return [(NODE, "r0")]
+
+    s.engine_manager.get_engine = lambda node: _Engine()
     spec = object()
-    s.build_results = [None, spec]
+
+    def _build(pending):
+        return None if "r0" in s.scheduler.parked[NODE] else spec
+
+    s._try_follow_speculation = _build
     s.scheduler.register_tp_follow(_head(["r0"], seq=5, from_seq=4))
-    out = _output()
-    assert _await(s, _pending(4, _future(s, out)))[1] is spec
-    assert order == ["removes", "rows"]
+    assert _await(s, _pending(4, _future(s, _output())))[1] is spec
 
 
 def test_await_goes_serial_on_the_marker_without_waiting():
