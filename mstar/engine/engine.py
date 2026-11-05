@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from functools import partial
 from itertools import repeat
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Collection, Iterator, Mapping, NamedTuple, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Collection, Iterator, Mapping, NamedTuple, Protocol, Sequence
 
 import torch
 
@@ -96,7 +96,6 @@ if TYPE_CHECKING:
     from mstar.engine.resources.kv.manager import KVManager
     from mstar.engine.resources.lora.pool import LoraAdapterPool
     from mstar.model.base import Model
-    from mstar.worker.rebuild import Rebuilds
 
 logger = logging.getLogger(__name__)
 
@@ -113,6 +112,13 @@ _ENGINE_STEP_SYNC = os.environ.get("MSTAR_ENGINE_STEP_SYNC", "0") == "1"
 # stops, and it was a quarter of the gpu thread's host time at batch 32.
 _LAZY_PUBLISH = os.environ.get("MSTAR_LAZY_PUBLISH", "1") == "1"
 
+
+class RankRebuilds(Protocol):
+    """What a follower's resident delta asks of this rank's rebuilds (`mstar.worker.rebuild.Rebuilds`)."""
+
+    def kept(self, rid: int, node: str) -> object | None: ...
+
+    def rebuilding(self, rid: int, node: str) -> bool: ...
 
 
 @contextmanager
@@ -3341,7 +3347,7 @@ class Engine:
     def owes_moves(self) -> bool:
         return bool(self._resident_delta)
 
-    def apply_resident_delta(self, delta: OffloadDelta, rebuilds: "Rebuilds") -> bool:
+    def apply_resident_delta(self, delta: OffloadDelta, rebuilds: RankRebuilds) -> bool:
         """Match the leader's resident set on each node a move names. Mutates OffloadDelta
         by popping off the steps that have already landed. False means not all
         has landed and the caller must retry before trying the next step.
