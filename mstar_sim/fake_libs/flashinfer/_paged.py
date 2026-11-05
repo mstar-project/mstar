@@ -11,8 +11,9 @@ on a checked FlashInfer version, prices the same step. ``run`` is one kernel
 prices whatever the last plan was.
 
 A planner lays its scratch out as FlashInfer's does (``allocate``), sized by FlashInfer's own
-arithmetic (``prefill_allocations``, ``decode_allocations``; 0.7.2's ``scheduler.cuh``), so a
-float workspace too small for a plan raises FlashInfer's overflow where FlashInfer would.
+arithmetic (``prefill_allocations``, ``fa3_allocations``, ``decode_allocations``; 0.7.2's
+``scheduler.cuh``), so a workspace too small for a plan raises FlashInfer's overflow where
+FlashInfer would.
 
 FlashInfer's conventions, which the pricing follows: a paged request's length
 is ``(num_pages - 1) * page_size + last_page_len``, and a request with ``n``
@@ -201,6 +202,21 @@ def prefill_allocations(qo: list[int], kv: list[int], total_num_rows: int, batch
     return out
 
 
+def fa3_allocations(qo: list[int], total_num_rows: int, batch: int, num_qo_heads: int, cuda_graph: bool,
+                    head_dim_vo: int) -> list:
+    """What FlashInfer's fa3 prefill planner (``PrefillSM90Plan``) allocates for ``qo`` rows per
+    request: it splits no KV, so only work arrays, one work a query tile of one head (past 4096
+    tiles a head, the heads share a schedule)."""
+    tile = 192 if head_dim_vo == 64 else 128
+    per_head = _ceil(total_num_rows, tile) + batch - 1
+    heads = 1 if per_head > 4096 else num_qo_heads
+    works = heads * (per_head if cuda_graph else sum(_ceil(qo[i + 1] - qo[i], tile) for i in range(batch)))
+    num_sm = torch.cuda.get_device_properties().multi_processor_count
+    return [("int", f"batch_prefill_sm90_{name}", 4 * count, 16) for name, count in (
+        ("qo_tile_indices", works), ("qo_offset", works), ("kv_offset", works), ("qo_len", works),
+        ("kv_len", works), ("head_indices", works), ("work_indptr", num_sm + 1), ("batch_indices", works))]
+
+
 def decode_allocations(kv: list[int], batch: int, num_qo_heads: int, num_kv_heads: int, page_size: int,
                        cuda_graph: bool, head_dim: int, kv_dtype) -> list:
     """What FlashInfer's CUDA-core decode planner (``DecodePlanImpl`` over its work
@@ -267,11 +283,14 @@ class PrefillPlanner:
 
     def _allocations(self, qo, kv_pages, total_num_rows, batch_size, num_qo_heads, num_kv_heads, page_size,
                      enable_cuda_graph, head_dim_qk, head_dim_vo, window_left, fa2_args) -> list:
-        if self._backend != "fa2":
-            return []  # fa3 (SM90) splits no KV: no float workspace (its int layout isn't modelled)
-        return prefill_allocations(
-            qo, kv_pages, int(total_num_rows), int(batch_size), num_qo_heads, num_kv_heads, page_size,
-            bool(enable_cuda_graph), head_dim_qk, head_dim_vo, int(window_left), *fa2_args)
+        if self._backend == "fa2":
+            return prefill_allocations(
+                qo, kv_pages, int(total_num_rows), int(batch_size), num_qo_heads, num_kv_heads, page_size,
+                bool(enable_cuda_graph), head_dim_qk, head_dim_vo, int(window_left), *fa2_args)
+        if self._backend == "fa3":
+            return fa3_allocations(qo, int(total_num_rows), int(batch_size), num_qo_heads, bool(enable_cuda_graph),
+                                   head_dim_vo)
+        return []  # another backend's planner (cudnn, trtllm-gen) isn't laid out
 
     def plan(self, float_workspace, int_workspace, pinned_int_workspace, qo_indptr, kv_indptr, kv_len_arr,
              total_num_rows, batch_size, num_qo_heads, num_kv_heads, page_size, enable_cuda_graph,

@@ -391,6 +391,19 @@ def test_flashinfers_planner_runs_short_of_a_small_workspace():
             decode.plan(torch.tensor([0, 1], **i32), torch.zeros(1, **i32), torch.tensor([3], **i32), 8, 8, 128, 16,
                         q_data_type=dtype, kv_data_type=dtype)
             assert decode._backend == expected, decode._backend
+        # fa3's work arrays are int, one set per head under a graph: many heads overrun the int workspace
+        fa3 = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+            workspace, "NHD", use_cuda_graph=True, qo_indptr_buf=torch.zeros(2, **i32),
+            paged_kv_indptr_buf=torch.zeros(2, **i32), paged_kv_indices_buf=torch.zeros(1, **i32),
+            paged_kv_last_page_len_buf=torch.ones(1, **i32), backend="fa3")
+        for heads, overflows in ((8, False), (80, True)):
+            try:
+                fa3.plan(torch.tensor([0, 500_000], dtype=torch.int32), torch.tensor([0, 1], dtype=torch.int32),
+                         torch.zeros(1, dtype=torch.int32), torch.tensor([16], dtype=torch.int32), heads, 8, 128, 16,
+                         q_data_type=torch.bfloat16)
+                assert not overflows, heads
+            except RuntimeError as e:
+                assert overflows and "batch_prefill_sm90" in str(e), e
         cores = flashinfer.BatchDecodeWithPagedKVCacheWrapper(workspace, "NHD", use_tensor_cores=False)
         try:
             cores.plan(torch.tensor([0, 1], **i32), torch.zeros(1, **i32), torch.tensor([3], **i32), 8, 8, 128, 16,
