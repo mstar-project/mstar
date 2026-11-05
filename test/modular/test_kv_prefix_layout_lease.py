@@ -339,6 +339,21 @@ def test_the_mark_reaches_the_manager_on_a_keyed_span():
     assert [span.digest for span in spans] == [None, DIGEST, None, OTHER_DIGEST, None]
 
 
+def test_a_step_that_changes_walk_fails_where_its_layout_is_built():
+    # `next_step` ends a step at a change of walk, so the image would be looked up as a step of its own
+    def layout(text_walk: str, opens_step: bool = True) -> LabelLayout:
+        return LabelLayout(spans=(
+            Span("ids", text_walk, len(TEXT), len(TEXT), "text_inputs", opens_step=opens_step),
+            Span("digest", IMAGE_WALK, IMAGE, 1, DIGEST, opens_step=False),
+        ))
+
+    with pytest.raises(ValueError, match=f"span 1 of walk '{IMAGE_WALK}'.*span 0 before it is of walk '{TEXT_WALK}'"):
+        layout(TEXT_WALK).row()
+    with pytest.raises(ValueError, match="span 0 .* no span comes before it"):
+        layout(IMAGE_WALK, opens_step=False).row()
+    assert [row[-1] for row in layout(IMAGE_WALK).row()[0]] == [True, False]
+
+
 _DISAGREEING = {
     # one slot more than its span
     "a probe": lambda node: node.probe(IMAGE_WALK, IMAGE + 1),

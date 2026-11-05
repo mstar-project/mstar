@@ -202,12 +202,6 @@ class XPUPagedAttentionManager(AttentionManager):
         plan = self._current_plans.get(label)
         return None if plan is None else plan.cu_q
 
-    def select_last_hidden(
-        self, hidden: torch.Tensor, label: str = "main",
-    ) -> torch.Tensor:
-        last_token_indices = (self.qo_indptr_buf(label)[1:] - 1).long()
-        return hidden.index_select(0, last_token_indices)
-
     def run(
         self,
         q: torch.Tensor,

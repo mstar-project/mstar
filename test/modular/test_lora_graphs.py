@@ -537,6 +537,7 @@ def test_an_idle_lease_checks_the_models_key():
 
     engine = object.__new__(Engine)
     engine._enable_nvtx, engine._runner = False, SimpleNamespace(plan=plan)
+    engine._pre_plan_done = {}
     lease = SlotLease(slot=0, bucket=BucketKey("decode", 1, 1, "cfg", idle=True))
     ctx = StepContext(request_ids=[1], graph_walk="decode", slot=0, capture=False, slot_lease=lease, idle=True)
 

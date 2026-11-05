@@ -302,8 +302,7 @@ producer. Workers report through the conductor (up to two seconds old); the API 
 adds what its data worker read since metrics were enabled, which the data worker
 publishes once a second. ``src`` is the node that produced the tensors, ``dst``
 the node that reads them, and ``api_server`` stands for the request's inputs (as
-``src``) and its results (as ``dst``). The Python and Rust runtimes report the same
-series.
+``src``) and its results (as ``dst``).
 
 ``mstar_transfer_bytes_total{model_name, src, dst, transport}``
    Counter, bytes. Tensor bytes read over the edge.

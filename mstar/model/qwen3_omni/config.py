@@ -36,6 +36,8 @@ TALKER_POS = "talker_pos"
 THINKER_SAMPLER = "thinker_sampler"
 # combined walk of the Thinker's text/audio prefill and decode
 THINKER_MIXED = "thinker_mixed"
+# the decode walk of a request with no audio output: no states for the Talker
+THINKER_TEXT_DECODE = "thinker_text_decode"
 TALKER_SAMPLER = "talker_sampler"
 CODE_PRED_SAMPLER = "code_sampler"
 

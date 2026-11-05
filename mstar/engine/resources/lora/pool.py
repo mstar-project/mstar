@@ -504,9 +504,6 @@ class LoraAdapterPool(Resource):
         config = overrides if isinstance(overrides, LoraReqConfig) else None
         adapter = None if config is None else config.adapter
         with self._lock:
-            # idempotent: one NewRequest per partition
-            if rid in self._adapter_of:
-                return
             if adapter is not None:
                 served = self._serving.get(adapter)
                 if served is None:

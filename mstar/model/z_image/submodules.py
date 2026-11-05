@@ -24,7 +24,10 @@ from torch import nn
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.accelerator_graph_config import geometric_batch_sizes
-from mstar.model.components.diffusion.compile_utils import compile_transformer_forward
+from mstar.model.components.diffusion.compile_utils import (
+    compile_transformer_forward,
+    step_schedule_recompile_limit,
+)
 from mstar.model.components.diffusion.decode_utils import (
     VAE_MAX_DECODE_BATCH,
     compile_vae_decode,
@@ -34,6 +37,7 @@ from mstar.model.components.diffusion.denoise_loop import LATENTS, DenoiseLoopSu
 from mstar.model.components.diffusion.flow_match import FlowMatchSchedule, euler_step
 from mstar.model.components.diffusion.image_io import pixels_to_uint8
 from mstar.model.components.diffusion.qwen3.submodule import TEXT_EMBEDS, Qwen3TextEncoderSubmodule
+from mstar.model.components.quant_linear import BF16, StepDtypes
 from mstar.model.submodule_base import NodeInputs, NodeSubmodule
 from mstar.model.z_image.components.transformer import (
     ATTENTION_SPANS,
@@ -112,7 +116,7 @@ class ZImageDenoiseSubmodule(DenoiseLoopSubmodule):
 
     Loop state is the fp32 latent ``[16, H/8, W/8]`` (the reference keeps latents fp32 and
     casts to bf16 only for the transformer). Per-shape layout: image-token pad mask and the
-    complex rotary tables for the image and caption spans.
+    rotary tables (``ZImageRoPE``) for the image and caption spans.
     """
 
     # the noise is a function of the latent grid and the seed alone
@@ -123,20 +127,26 @@ class ZImageDenoiseSubmodule(DenoiseLoopSubmodule):
         compile_transformer: bool = True, compile_eager_rounding: bool = True,
         compile_exact_ops: bool | Sequence[str] = False, max_batch_size: int = 8,
         capture_buckets=(), capture_batch_sizes=(1, 2, 4, 8),
+        step_dtypes: StepDtypes | None = None, bf16_transformer: nn.Module | None = None,
     ):
         super().__init__(
             loop_name=loop_name, max_batch_size=max_batch_size, attn_resource_key=attn_resource_key,
-            capture_buckets=capture_buckets, capture_batch_sizes=capture_batch_sizes,
+            capture_buckets=capture_buckets, capture_batch_sizes=capture_batch_sizes, step_dtypes=step_dtypes,
         )
         self.transformer = transformer
+        # A low-precision transformer's bf16 twin, for the steps a schedule runs in bf16.
+        self.bf16_transformer = bf16_transformer
         self.config = config
         tcfg = config.transformer
         self.rope = ZImageRoPE(tcfg.rope_theta, tcfg.axes_dims, tcfg.axes_lens)
         self._compile = bool(compile_transformer) and transformer is not None
         if self._compile:
-            compile_transformer_forward(
-                transformer, eager_rounding=compile_eager_rounding, exact_ops=compile_exact_ops,
-            )
+            for module in (transformer, bf16_transformer):
+                if module is not None:
+                    compile_transformer_forward(
+                        module, eager_rounding=compile_eager_rounding, exact_ops=compile_exact_ops,
+                        recompile_limit=step_schedule_recompile_limit(step_dtypes),
+                    )
 
     def bucket_key_for(self, fwd_info: CurrentForwardPassInfo) -> ZShape:
         return shape_from_metadata(self.config, fwd_info.step_metadata)
@@ -211,7 +221,8 @@ class ZImageDenoiseSubmodule(DenoiseLoopSubmodule):
             tokens = torch.cat([tokens, tokens[:, -1:].expand(-1, n_pad, -1)], dim=1)
         # the reference conditions on (1000 - t) / 1000 with the scheduler's fp32 timestep
         t_cond = (1000.0 - timestep) / 1000.0
-        out = self.transformer(
+        transformer = self.bf16_transformer if self.step_dtype == BF16 else self.transformer
+        out = transformer(
             tokens, cond[TEXT_EMBEDS], cond[CAP_PAD_MASK], layout["image_pad_mask"].expand(tokens.shape[0], -1),
             t_cond, layout["image_freqs"], layout["caption_freqs"], ragged=self._ragged_spans(),
         )

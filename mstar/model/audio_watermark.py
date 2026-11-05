@@ -30,7 +30,9 @@ module keeps each request's stream state itself, as one flat row of tensors,
 and runs the generator's layers as a function of it: the same ops AudioSeal's
 streaming layers run, with the state passed in and out. That lets requests
 at the same point share one batched call, and lets the engine capture that
-call per (batch, chunk length) bucket.
+call per (batch, chunk length) bucket. AudioSeal 0.2.1 fixes the propagation,
+but keeps the state on its modules for one batch of streams that start
+together, so this module keeps its own.
 
 The generator works on whole 320-sample frames (its total stride). A chunk
 that is not a whole number of frames leaves its tail pending until the next
