@@ -1487,8 +1487,9 @@ methods are:
 
 ``check_stop(...) -> set[str]`` (optional)
    Runs off the GPU thread, and may read tensor values. A class that defines it sets
-   ``checks_own_stop = True``, or the runtime never calls it. Return the names of the ``Loop``
-   objects to stop, for example after seeing the EOS token. This is how a decode loop
+   ``checks_own_stop = True``, or the runtime calls it at most on a ``TokenStop``'s prefill
+   walks. Return the names of the ``Loop`` objects to stop, for example after seeing the EOS
+   token. This is how a decode loop
    terminates. An AR submodule whose loop ends on a stop token sets
    ``self.token_stop = TokenStop(...)`` in ``__init__`` instead of writing one; that also
    gives it ``check_stop_batched``, which checks a whole step off one host copy of its

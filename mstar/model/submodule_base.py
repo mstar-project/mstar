@@ -1457,7 +1457,8 @@ class NodeSubmodule(torch.nn.Module, ABC):
     ) -> set[str]:
         """
         Return the set of dynamic-loop names that should stop after this step.
-        A class that defines this sets ``checks_own_stop``, or it is never called.
+        A class that defines this sets ``checks_own_stop``, or it is called at
+        most on a ``TokenStop``'s prefill walks.
 
         Runs on the worker's slow-postprocess path *after* ``execute_batch``
         returns — never inside ``execute_batch``. **Allowed** to read tensor
