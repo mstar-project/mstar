@@ -341,6 +341,9 @@ impl Adapter {
         match self {
             // Each Talker request stays near the lengths the model was trained on.
             Adapter::Qwen3TTS => SpeechChunking { min_chars: Some(600), ..SPEECH_CHUNKING },
+            // 2,048 output tokens are about 25 s of speech (some 350 characters),
+            // and a longer input is cut off there
+            Adapter::Orpheus => SpeechChunking { min_chars: Some(250), max_chars: 200, ..SPEECH_CHUNKING },
             _ => SPEECH_CHUNKING,
         }
     }
@@ -373,13 +376,13 @@ impl Adapter {
         upload_dir: &Path,
         allow_remote: bool,
     ) -> Result<SubmitArgs, String> {
-        refuse_tool_calls(req)?;
+        refuse_unserved_chat(req)?;
         match self {
             // BAGEL reads temperature / top_p from its model config; only
             // max_output_tokens and seed are honored.
-            Adapter::Bagel | Adapter::Qwen3_5 => text_chat(req, upload_dir, allow_remote),
-            Adapter::Cosmos3Edge => {
-                // How the vLLM recipe toggles thinking; a flat enable_thinking wins.
+            Adapter::Bagel => text_chat(req, upload_dir, allow_remote),
+            Adapter::Qwen3_5 | Adapter::Cosmos3Edge => {
+                // How vLLM-style clients toggle thinking; a flat enable_thinking wins.
                 // Read before the attachments are saved, since a malformed value
                 // refuses the request.
                 let thinking = template_enable_thinking(req.extra.get("chat_template_kwargs"))?;
@@ -693,7 +696,7 @@ fn text_chat(
     })
 }
 
-/// `chat_template_kwargs.enable_thinking` read as `Cosmos3EdgeAdapter` does:
+/// `chat_template_kwargs.enable_thinking` read as `_template_enable_thinking` does:
 /// `(kwargs or {})`, then `bool(kwargs["enable_thinking"])` when it has the
 /// key. A falsy value is no kwargs; a value Python cannot look the key up in
 /// is the `TypeError` that answers 400 there.
@@ -720,7 +723,7 @@ fn template_enable_thinking(kwargs: Option<&Value>) -> Result<Option<bool>, Stri
 }
 
 /// Python's `bool()` of a JSON value.
-fn truthy(v: &Value) -> bool {
+pub(crate) fn truthy(v: &Value) -> bool {
     match v {
         Value::Null => false,
         Value::Bool(b) => *b,
@@ -731,9 +734,18 @@ fn truthy(v: &Value) -> bool {
     }
 }
 
-/// Refuse a chat that asks the model to call a tool. The rules are
-/// `_refuse_tool_calls` in `api_server/openai/adapters.py`.
-fn refuse_tool_calls(req: &ChatCompletionRequest) -> Result<(), String> {
+/// Refuse a chat that asks for more than one choice, stop sequences, or a
+/// tool call. The rules are `_refuse_unserved_chat` in
+/// `api_server/openai/adapters.py`.
+fn refuse_unserved_chat(req: &ChatCompletionRequest) -> Result<(), String> {
+    if let Some(n) = req.n.filter(|&n| n != 1) {
+        return Err(format!("n={n}: this model returns one choice"));
+    }
+    if req.stop.as_ref().is_some_and(truthy) {
+        return Err(
+            "stop sequences are not supported; the reply ends at a stop token or max_tokens".to_string(),
+        );
+    }
     let listed = |field: &str| match req.extra.get(field) {
         None | Some(Value::Null) => false,
         Some(Value::Array(t)) => !t.is_empty(),
@@ -928,13 +940,17 @@ mod tests {
     }
 
     #[test]
-    fn only_qwen3_tts_chunks_long_speech_by_default() {
+    fn qwen3_tts_and_orpheus_chunk_long_speech_by_default() {
         assert_eq!(Adapter::Qwen3TTS.speech_chunking().min_chars, Some(600));
-        assert_eq!(Adapter::Orpheus.speech_chunking().min_chars, None);
-        for adapter in [Adapter::Qwen3TTS, Adapter::Orpheus, Adapter::Qwen3Omni] {
+        assert_eq!(Adapter::Qwen3Omni.speech_chunking().min_chars, None);
+        for adapter in [Adapter::Qwen3TTS, Adapter::Qwen3Omni] {
             let c = adapter.speech_chunking();
             assert_eq!((c.max_chars, c.lookahead, c.max_pieces), (400, 2, 32), "{adapter:?}");
         }
+        // 2,048 output tokens are about 25 s of speech: a longer input came back cut short with a 200
+        let text = "The quick brown fox jumps over the lazy dog. ".repeat(22);
+        let pieces = crate::speech_chunking::plan_chunks(None, &Adapter::Orpheus.speech_chunking(), &text).unwrap();
+        assert!(pieces.len() > 1, "{pieces:?}");
     }
 
     #[test]
@@ -957,8 +973,14 @@ mod tests {
     }
 
     #[test]
-    fn a_cosmos3_edge_chat_reads_enable_thinking_from_the_template_kwargs() {
-        let chat = |fields: &str| Adapter::Cosmos3Edge.chat_to_request(&chat_with(fields), Path::new("/unused"), false);
+    fn a_thinking_chat_reads_enable_thinking_from_the_template_kwargs() {
+        for adapter in [Adapter::Qwen3_5, Adapter::Cosmos3Edge] {
+            template_kwargs_cases(adapter);
+        }
+    }
+
+    fn template_kwargs_cases(adapter: Adapter) {
+        let chat = |fields: &str| adapter.chat_to_request(&chat_with(fields), Path::new("/unused"), false);
         let thinking = |fields: &str| chat(fields).unwrap().model_kwargs.get("enable_thinking").cloned();
         for (fields, want) in [
             (r#""chat_template_kwargs":{"enable_thinking":false}"#, Some(Value::Bool(false))),
@@ -1009,8 +1031,26 @@ mod tests {
     }
 
     #[test]
+    fn a_chat_asking_for_choices_or_stop_strings_is_refused() {
+        for (fields, err) in [
+            (r#""n":2"#, "n=2: this model returns one choice"),
+            (r#""stop":".""#, "stop sequences are not supported"),
+            (r#""stop":["END"]"#, "stop sequences are not supported"),
+        ] {
+            for adapter in CHAT_ADAPTERS {
+                let got = adapter.chat_to_request(&chat_with(fields), Path::new("/unused"), false).unwrap_err();
+                assert!(got.starts_with(err), "{fields} on {adapter:?}: {got}");
+            }
+        }
+    }
+
+    #[test]
     fn the_tool_fields_clients_send_by_default_pass() {
         for fields in [
+            r#""n":1"#,
+            r#""n":null"#,
+            r#""stop":null"#,
+            r#""stop":[]"#,
             r#""tools":[]"#,
             r#""tools":null"#,
             r#""tool_choice":"none""#,

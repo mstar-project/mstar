@@ -42,6 +42,7 @@ import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from mstar.api_server.openai._util import check_inline_result
 from mstar.api_server.openai.adapters import OpenAIAdapter, SubmitArgs
 from mstar.api_server.openai.protocol import (
     ChatCompletionRequest,
@@ -71,7 +72,7 @@ _STRIP_KEYS = {
     # Dynamo envelope / bookkeeping
     "routing", "output_options", "sampling_options", "stop_conditions",
     "token_ids", "batch_token_ids", "bootstrap_info", "multi_modal_data",
-    "guided_decoding", "chat_template_kwargs", "chat_template_args",
+    "guided_decoding",
     "nvext", "extra_args", "annotations", "trace", "disaggregated_params",
     "backend_instance_id",
     # OpenAI-standard, no M* mapping today
@@ -193,6 +194,10 @@ class RequestBridge:
 
     async def _chat(self, request: dict, context):
         body = _clean(request)
+        # Dynamo reads a client's chat_template_kwargs into chat_template_args and
+        # forwards it under that name; Qwen3.5 and Cosmos3-Edge read enable_thinking from it
+        if "chat_template_args" in body:
+            body.setdefault("chat_template_kwargs", body.pop("chat_template_args"))
         modalities = body.get("modalities")
         if modalities and set(modalities) != {"text"}:
             # Dynamo's chat stream delta carries no audio/image fields, so
@@ -259,13 +264,17 @@ class RequestBridge:
         reference = body.get("input_reference")
         if reference:
             from mstar.api_server import media_io
+            # one engine request, as on the native route, which refuses an n it would drop
+            try:
+                check_inline_result(None, req.n)
+            except ValueError as exc:
+                raise _BadRequestError(str(exc)) from exc
             _, path = media_io.resolve_media_ref(reference, self.server.upload_dir)
             extra = dict(req.model_extra or {})
             extra.pop("input_reference", None)
             # seed is a declared field, so model_extra never carries it; the
             # edit adapter expects it in extra_kwargs (the native multipart
-            # route feeds it from a form field). Edits are single-submit on
-            # the native path too, so n does not apply here.
+            # route feeds it from a form field).
             if req.seed is not None:
                 extra.setdefault("seed", req.seed)
             submits = [self.adapter.image_edit_to_request(req.prompt, path, extra)]
@@ -398,7 +407,9 @@ class RequestBridge:
                 from mstar.api_server import media_io
                 audio = audios[i]
                 try:
-                    video = media_io.mux_mp4_with_pcm16(
+                    # ffprobe + ffmpeg, up to minutes: off the event loop every request shares
+                    video = await asyncio.to_thread(
+                        media_io.mux_mp4_with_pcm16,
                         video,
                         audio.data,
                         sample_rate=int((audio.metadata or {}).get("sample_rate", 48000)),

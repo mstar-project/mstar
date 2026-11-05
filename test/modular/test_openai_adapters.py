@@ -13,6 +13,7 @@ from mstar.api_server.openai.protocol import (  # noqa: E402
     ChatCompletionRequest,
     ImageGenerationRequest,
     SpeechRequest,
+    VideoGenerationRequest,
 )
 
 
@@ -38,6 +39,14 @@ def test_bagel_chat_decodes_image_input(tmp_path):
     assert "image" in sa.file_paths
     assert Path(sa.file_paths["image"][0]).read_bytes() == raw
     assert "image" in sa.input_modalities and "text" in sa.input_modalities
+
+
+@pytest.mark.parametrize("ptype", ["image_url", "video_url", "audio_url"])
+def test_an_untyped_attachment_takes_its_part_s_modality(tmp_path, ptype):
+    """An application/octet-stream data URL (or object-store URL) was modality "unknown", a 400."""
+    url = "data:application/octet-stream;base64," + base64.b64encode(b"\x89PNG").decode()
+    req = ChatCompletionRequest(messages=[{"role": "user", "content": [{"type": ptype, ptype: {"url": url}}]}])
+    assert adapters.Qwen3_5Adapter().chat_to_request(req, tmp_path).input_modalities == [ptype[:-4]]
 
 
 def test_a_chat_request_keeps_each_message_role(tmp_path):
@@ -107,7 +116,12 @@ def test_qwen3_tts_speech_maps_voice_instructions_and_extra_body(tmp_path):
     # Long inputs are sentence-chunked by the speech handler; short ones are not.
     assert adapters.Qwen3TTSAdapter.speech_chunk_min_chars == 600
     assert adapters.Qwen3TTSAdapter.speech_chunk_max_chars == 400
-    assert adapters.OrpheusAdapter.speech_chunk_min_chars is None
+
+
+def test_omnivoice_speech_maps_instructions_onto_instruct(tmp_path):
+    req = SpeechRequest(input="hello", instructions="a calm female voice")
+    mk = adapters.OmniVoiceAdapter().speech_to_request(req, tmp_path).model_kwargs
+    assert mk["instruct"] == "a calm female voice" and "instructions" not in mk
 
 
 def test_qwen3_tts_speech_reference_audio_becomes_audio_input(tmp_path, monkeypatch):
@@ -149,6 +163,18 @@ def test_extra_body_non_standard_knobs_pass_through(tmp_path):
     )
     mk = adapters.Qwen3OmniAdapter().chat_to_request(req, tmp_path).model_kwargs
     assert mk["talker_top_k"] == 50 and mk["talker_repetition_penalty"] == 1.05
+
+
+@pytest.mark.parametrize("adapter", [adapters.Qwen3_5Adapter, adapters.Cosmos3EdgeAdapter], ids=lambda a: a.__name__)
+@pytest.mark.parametrize(("template_kwargs", "want"), [
+    ({"enable_thinking": False}, {"enable_thinking": False}),
+    # bool(), as the Rust frontend reads it (Qwen3.5's template thinks only on a real true)
+    ({"enable_thinking": 1}, {"enable_thinking": True}),
+], ids=["false", "truthy"])
+def test_a_thinking_chat_reads_enable_thinking_from_the_template_kwargs(adapter, template_kwargs, want, tmp_path):
+    req = ChatCompletionRequest(messages=[{"role": "user", "content": "hi"}], chat_template_kwargs=template_kwargs)
+    mk = adapter().chat_to_request(req, tmp_path).model_kwargs
+    assert mk == want
 
 
 def test_text_chat_maps_text_and_sampling(tmp_path):
@@ -216,7 +242,17 @@ def test_a_chat_that_asks_for_a_tool_call_is_refused(tmp_path, adapter, fields):
 
 
 @pytest.mark.parametrize("adapter", _CHAT_ADAPTERS, ids=lambda a: a.__name__)
+@pytest.mark.parametrize("fields", [{"n": 2}, {"stop": "."}, {"stop": ["END"]}], ids=str)
+def test_a_chat_asking_for_choices_or_stop_strings_is_refused(tmp_path, adapter, fields):
+    """Every chat adapter returns one choice and has no stop strings; dropping them was a 200."""
+    req = ChatCompletionRequest(messages=[{"role": "user", "content": "hi"}], **fields)
+    with pytest.raises(ValueError, match="n=2" if "n" in fields else "stop sequences"):
+        adapter().chat_to_request(req, tmp_path)
+
+
+@pytest.mark.parametrize("adapter", _CHAT_ADAPTERS, ids=lambda a: a.__name__)
 @pytest.mark.parametrize("fields", [
+    {"n": 1}, {"n": None}, {"stop": None}, {"stop": []},
     {"tools": []}, {"tools": None}, {"tool_choice": "none"}, {"tool_choice": "auto"}, {"tool_choice": None},
     {"functions": []}, {"functions": None}, {"function_call": "none"}, {"function_call": "auto"},
     {"function_call": None},
@@ -251,6 +287,16 @@ def test_bagel_image_edit(tmp_path):
     assert sa.input_modalities == ["image", "text"]
     assert sa.output_modalities == ["image"]
     assert sa.model_kwargs == {"cfg_img_scale": 2.0}
+
+
+@pytest.mark.parametrize("audio", ["false", 0])
+def test_ltx2_5_refuses_an_audio_toggle_that_is_not_a_boolean(tmp_path, audio):
+    req = VideoGenerationRequest(prompt="a cat", audio=audio)
+    with pytest.raises(ValueError, match="audio must be true or false"):
+        adapters.LTX25Adapter().video_to_request(req, tmp_path)
+    # null is unset: the default, sound
+    req = VideoGenerationRequest(prompt="a cat", audio=None)
+    assert adapters.LTX25Adapter().video_to_request(req, tmp_path).output_modalities == ["video", "audio"]
 
 
 def test_registry():

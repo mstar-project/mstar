@@ -58,6 +58,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import os
 import re
 import shutil
@@ -165,7 +166,8 @@ def _stale_server(binary: str, rust_dir: Path) -> str | None:
 
 def launch_rust_server(binary: str, model_name: str, port: int,
                        bridge_dir: str, upload_dir: str,
-                       api_key: str | None = None) -> subprocess.Popen:
+                       api_key: str | None = None,
+                       timeout: float | None = None) -> subprocess.Popen:
     # The key goes through the environment, not argv, which any local user
     # can read from the process list. ``api_key`` is the resolved setting, so
     # an inherited MSTAR_API_KEY must not override it.
@@ -173,6 +175,12 @@ def launch_rust_server(binary: str, model_name: str, port: int,
     if api_key:
         env[API_KEY_ENV] = api_key
     env[OPENAI_ADAPTER_ENV] = openai_adapter_class(model_name)
+    if timeout is not None:
+        # ``--timeout`` in the whole seconds the frontend reads. inf and nan never time out
+        # on the Python frontend, so they get a deadline past any request (~31 years); a
+        # negative one times every request out there, as 0 does here.
+        seconds = 0 if timeout <= 0 else (math.ceil(timeout) if timeout < 1e9 else 10**9)
+        env.setdefault("MSTAR_REQUEST_TIMEOUT_S", str(seconds))
     proc = subprocess.Popen([binary, model_name, str(port), bridge_dir,
                              upload_dir], env=env)
     logger.info("Rust frontend started (pid=%d, port=%d)", proc.pid, port)

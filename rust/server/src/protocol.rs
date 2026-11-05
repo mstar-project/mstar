@@ -132,13 +132,10 @@ pub struct ChatCompletionRequest {
     pub max_tokens: Option<i64>,
     #[serde(default, deserialize_with = "flex::opt_i64")]
     pub max_completion_tokens: Option<i64>,
-    /// Accepted for OpenAI compatibility (declared so it does NOT leak into
-    /// `extra` -> model_kwargs); single-choice responses only, as in mstar.
-    #[allow(dead_code)]
+    /// Single-choice responses only: anything but 1 is refused.
     #[serde(default, deserialize_with = "flex::opt_i64")]
     pub n: Option<i64>,
-    /// Accepted for OpenAI compatibility; stop sequences are not applied.
-    #[allow(dead_code)]
+    /// Stop sequences are not applied, so a non-empty one is refused.
     #[serde(default)]
     pub stop: Option<Value>, // str | [str]
     #[serde(default, deserialize_with = "flex::opt_i64")]
@@ -203,7 +200,6 @@ pub struct ImageGenerationRequest {
     pub n: Option<i64>,
     #[serde(default)]
     pub size: Option<String>,
-    #[allow(dead_code)]
     #[serde(default)]
     pub response_format: Option<String>,
     #[serde(default, deserialize_with = "flex::opt_i64")]
@@ -224,12 +220,10 @@ pub struct VideoGenerationRequest {
     #[allow(dead_code)] // accepted for OpenAI compatibility; the loaded model is fixed
     #[serde(default)]
     pub model: Option<String>,
-    #[allow(dead_code)]
     #[serde(default, deserialize_with = "flex::opt_i64")]
     pub n: Option<i64>,
     #[serde(default)]
     pub size: Option<String>,
-    #[allow(dead_code)]
     #[serde(default)]
     pub response_format: Option<String>,
     #[serde(default, deserialize_with = "flex::opt_i64")]
