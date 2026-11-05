@@ -372,16 +372,6 @@ class FlashInferManager(PlacedAttention):
 
         self._preplanned = ctx.is_preplan
 
-    def clear_preplan(self):
-        if self._placement is not None:
-            # the dropped plan's H2Ds went on the plan stream, which the step that runs instead
-            # waits on no event from, so its own-token wrappers must not skip their plans
-            for wrapper in self._preplan_states.values():
-                wrapper.forget_plan()
-        # rebind rather than clear: a consumed preplan dict is the live one
-        self._preplanned = False
-        self._preplan_states = {}
-
     ### Submodule-level functionality
     @torch.compiler.disable
     def qo_indptr_buf(self, label: str="main") -> torch.Tensor | None:

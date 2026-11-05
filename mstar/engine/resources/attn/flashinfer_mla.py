@@ -516,17 +516,17 @@ class FlashInferMLAManager(PlacedAttention):
         force_prefill = ctx is not None and ctx.force_prefill
         for label in {label for row in rows for label in row}:
             qo = np.cumsum([0, *(row[label] for row in rows if label in row)])
-            bucket = None
+            shape = None
             if lease is None:
                 decode = one_token_rows(len(qo) - 1, int(qo[-1]), force_prefill)
             else:
                 decode = one_token_rows(lease.bucket.bs, lease.bucket.num_tokens, force_prefill)
                 # the rows the label's wrapper was captured with, which its own-token part pads to
                 wrapper = self._cg_plan_states.get(CGSlotKey(bucket=lease.bucket, slot=lease.slot, label=label))
-                bucket = (len(qo) - 1 if wrapper is None else wrapper.captured_rows, lease.bucket.num_tokens)
+                shape = (len(qo) - 1 if wrapper is None else wrapper.captured_rows, lease.bucket.num_tokens)
             plans = [(qo, heads)]
             if not decode:
-                plans = self._placed.rank_plans(self._placement, qo, heads, self.own_kernel, bucket)
+                plans = self._placed.rank_plans(self._placement, qo, heads, self.own_kernel, shape)
             if any(fa_work_items_bound(plan, h, self._fa_sm_count) > _FA_MAX_WORK_ITEMS for plan, h in plans):
                 return False
         return True
@@ -575,10 +575,6 @@ class FlashInferMLAManager(PlacedAttention):
                 wrapper.plan(causal=step.causal, dtype=self._dtype, **indptrs.to_kwargs_dict())
             plan_states[label] = wrapper
         self._preplanned = ctx.is_preplan
-
-    def clear_preplan(self):
-        self._preplanned = False
-        self._preplan_states = {}
 
     @torch.compiler.disable
     def qo_indptr_buf(self, label: str = "main") -> torch.Tensor | None:

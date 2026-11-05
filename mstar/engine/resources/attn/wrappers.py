@@ -133,7 +133,7 @@ def _decode_direct_variant(w) -> str | None:
 
 class PagedKernel(ABC):
     """A paged attention kernel as attention over a context-parallel pool plans and runs it
-    (``AttentionManager.paged_kernel``): over this rank's slots of the pool, or over pages of one
+    (``PlacedAttention.paged_kernel``): over this rank's slots of the pool, or over pages of one
     slot (``context_parallel.OneSlotPages``)."""
 
     # the plan's query layout on the device, where a kernel keeps one (``select_last_hidden``)
@@ -160,7 +160,7 @@ class WholeRowsKernel(ABC):
     TP-placed pool plans and runs them (``PlacedAttention.whole_rows_kernel``)."""
 
     @abstractmethod
-    def plan(self, qo_indptr: torch.Tensor, causal: bool = True) -> None:
+    def plan(self, qo_indptr: torch.Tensor, /, causal: bool) -> None:
         """Plans the rows ``qo_indptr`` lays out."""
 
     @abstractmethod

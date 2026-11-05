@@ -380,12 +380,12 @@ class ContextParallelWrapper(ABC):
     @abstractmethod
     def rank_plans(
         cls, placement: ContextParallel, qo_indptr: np.ndarray, num_qo_heads: int,
-        own_kernel: type[OwnTokensKernel], bucket: tuple[int, int] | None,
+        own_kernel: type[OwnTokensKernel], capture_shape: tuple[int, int] | None,
     ) -> list[tuple[np.ndarray, int]]:
         """Every plan a multi-token step of ``qo_indptr``'s rows makes on any rank of the
         placement, as ``(qo_indptr, query heads)``: the context's at the local geometry's
         ``num_qo_heads``, and the own tokens', on the backend's ``own_kernel``. A wrapper captured
-        for ``bucket``, ``(captured_rows, its tokens)``, pads them as it plans them. What admission
+        for ``capture_shape``, ``(captured_rows, its bucket's tokens)``, pads them as it plans them. What admission
         bounds a planner's refusals by, the same on every rank."""
 
     @staticmethod
@@ -460,7 +460,7 @@ class TPContextParallelWrapper(ContextParallelWrapper):
         return _check_kernel(kernels.whole_rows_kernel(workspace, kwargs, max_total_tokens), "WholeRowsKernel")
 
     @classmethod
-    def rank_plans(cls, placement, qo_indptr, num_qo_heads, own_kernel, bucket):
+    def rank_plans(cls, placement, qo_indptr, num_qo_heads, own_kernel, capture_shape):
         # the own tokens, whole, at this rank's own heads: the same lengths on every rank
         return [(qo_indptr, num_qo_heads), (qo_indptr, num_qo_heads // placement.size)]
 
@@ -521,14 +521,18 @@ class SPContextParallelWrapper(ContextParallelWrapper):
         captured = None
         if max_total_tokens:
             captured = zigzag_capture(placement.size, kwargs.get("batch_size") or 0, max_total_tokens)
-        return ZigzagWrapper(placement, kernels.own_kernel.build(kernels, workspace, kwargs, dtype, captured), device)
+        kernel = kernels.own_kernel.build(kernels, workspace, kwargs, dtype, captured)
+        if kernel.captured != captured:
+            # the share's fixed buffers are sized from it, and a replay reads their addresses
+            raise ValueError(f"{type(kernel).__name__} was built for {captured} and holds {kernel.captured}")
+        return ZigzagWrapper(placement, kernel, device)
 
     @classmethod
-    def rank_plans(cls, placement, qo_indptr, num_qo_heads, own_kernel, bucket):
+    def rank_plans(cls, placement, qo_indptr, num_qo_heads, own_kernel, capture_shape):
         # and every partner's zigzag share of the own tokens, which differ by rank, at the same heads
         shares = [zigzag_share(qo_indptr, placement.size, index) for index in range(placement.size)]
-        if bucket is not None:
-            captured = zigzag_capture(placement.size, *bucket)
+        if capture_shape is not None:
+            captured = zigzag_capture(placement.size, *capture_shape)
             shares = [own_kernel.padded(share, captured) for share in shares]
         return [(plan, num_qo_heads) for plan in (qo_indptr, *shares)]
 

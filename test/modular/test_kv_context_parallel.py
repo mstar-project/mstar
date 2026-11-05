@@ -36,6 +36,7 @@ from mstar.engine.resources.attn.wrappers import PagedKernel
 from mstar.engine.resources.base import EngineResourceInfo, Resource
 from mstar.engine.resources.context_parallel import (
     OneSlotPages,
+    OwnTokensKernel,
     SPContextParallelWrapper,
     SPPlacement,
     ZigzagWrapper,
@@ -1115,14 +1116,15 @@ def test_sp_placed_mla_attention_bounds_a_packed_bucket_of_one_token_rows_as_its
 
 def test_sp_placed_mla_attention_pads_a_leased_step_for_the_rows_its_wrapper_was_captured_with(monkeypatch):
     """A leased step's own-token plans are padded to the rows its label's wrapper was captured with,
-    more than the step's where a request has no segment in the label, and a capture's empty rows
-    raise the planner's bound: admission bounds that plan, not one padded to the step's rows."""
+    more than the step's or the bucket's where a request has no segment in the label, and a
+    capture's empty rows raise the planner's bound: admission bounds that plan, not one padded to
+    the step's rows."""
     _fa_kernel(monkeypatch)
     attn, placement = _cp_attention(JointGroups(tp_group=CommGroup.trivial(), sp_group=_group(0, P)), CPU,
                                     torch.float32, mla=True, flashinfer_backend="fa2")
-    tokens, spans = 64, (3, 3)
+    tokens, spans, captured_rows = 64, (5, 9), 8
     bucket = BucketKey(graph_walk="w", bs=4, num_tokens=tokens)
-    attn._cg_wrapper(SlotLease(0, bucket), "main", bucket.bs)
+    attn._cg_wrapper(SlotLease(0, bucket), "main", captured_rows)
     step = AttentionStep(segments=tuple(Segment(f"r{i}", "main", span) for i, span in enumerate(spans)))
     ctx = StepContext(request_ids=tuple(seg.request_id for seg in step.segments), graph_walk="w", slot=0,
                       capture=False, slot_lease=SlotLease(0, bucket))
@@ -1132,11 +1134,56 @@ def test_sp_placed_mla_attention_pads_a_leased_step_for_the_rows_its_wrapper_was
         plans = attn._placed.rank_plans(placement, qo, heads, attn.own_kernel, (rows, tokens))
         return max(fm.fa_work_items_bound(plan, h, 132) for plan, h in plans)
 
-    assert bound(4) > bound(len(spans))
-    monkeypatch.setattr(fm, "_FA_MAX_WORK_ITEMS", bound(len(spans)))
+    assert bound(captured_rows) > max(bound(len(spans)), bound(bucket.bs))
+    monkeypatch.setattr(fm, "_FA_MAX_WORK_ITEMS", max(bound(len(spans)), bound(bucket.bs)))
     assert not attn.admit(step, ctx).ok
-    monkeypatch.setattr(fm, "_FA_MAX_WORK_ITEMS", bound(4))
+    monkeypatch.setattr(fm, "_FA_MAX_WORK_ITEMS", bound(captured_rows))
     assert attn.admit(step, ctx).ok
+
+
+def test_a_backend_plugs_in_its_own_kernel_for_a_share_of_the_own_tokens(monkeypatch):
+    """``own_kernel`` is where a backend whose keys aren't one-slot pages plugs in: its share runs on
+    the kernel, sized by its capture, admission bounds its padding, and one that drops its capture,
+    which a replay's fixed buffers are sized from, is refused when it is built."""
+    _fa_kernel(monkeypatch)
+    calls = []
+
+    class Ragged(OwnTokensKernel):
+        def __init__(self, captured):
+            self.captured = captured
+
+        @classmethod
+        def build(cls, kernels, workspace, kwargs, dtype, captured):
+            calls.append("build")
+            return cls(captured)
+
+        @staticmethod
+        def padded(qo_indptr, captured):
+            calls.append("padded")
+            return qo_indptr
+
+        def plan(self, rows, causal):
+            pass
+
+        def run(self, queries, keys):
+            raise AssertionError("nothing runs here")
+
+    class Forgetful(Ragged):
+        def __init__(self, captured):
+            self.captured = None
+
+    attn, _ = _cp_attention(JointGroups(tp_group=CommGroup.trivial(), sp_group=_group(0, P)), CPU, torch.float32,
+                            mla=True, flashinfer_backend="fa2")
+    bucket = BucketKey(graph_walk="w", bs=2, num_tokens=64)
+    attn.own_kernel = Ragged
+    assert isinstance(attn._cg_wrapper(SlotLease(0, bucket), "main", 2).new.kernel, Ragged)
+    step = AttentionStep(segments=(Segment("r0", "main", 5), Segment("r1", "main", 9)))
+    ctx = StepContext(request_ids=("r0", "r1"), graph_walk="w", slot=0, capture=False,
+                      slot_lease=SlotLease(0, bucket))
+    assert attn.admit(step, ctx).ok and calls == ["build", "padded", "padded"]
+    attn.own_kernel = Forgetful
+    with pytest.raises(ValueError, match="built for"):
+        attn._cg_wrapper(SlotLease(1, bucket), "main", 2)
 
 
 def test_tp_mla_decode_plans_its_context_where_the_causal_tile_check_cannot_refuse_it(monkeypatch):

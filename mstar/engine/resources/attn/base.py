@@ -20,7 +20,13 @@ from mstar.engine.resources.attn.wrappers import (
     WholeRowsKernel,
 )
 from mstar.engine.resources.base import AttentionResource, EngineResourceInfo
-from mstar.engine.resources.context_parallel import OneSlotPages
+from mstar.engine.resources.context_parallel import (
+    OneSlotPages,
+    SPContextParallelWrapper,
+    SPPlacement,
+    TPContextParallelWrapper,
+    TPPlacement,
+)
 from mstar.engine.resources.kv.config import KVConfig, KVGroup, PagedKVConfig, RingKVConfig
 from mstar.engine.resources.kv.keys import fingerprint
 from mstar.platforms import current_platform
@@ -51,9 +57,6 @@ def resolve_attn_backend(backend: AttnBackend, device: torch.device) -> AttnBack
 
 class AttentionManager(AttentionResource):
     prefix_skip_safe = True
-    # the KV pool's placement, and the attention it takes (`bind_dependencies`)
-    _placement: "ContextParallel | None" = None
-    _placed: "type[ContextParallelWrapper] | None" = None
 
     # Remains abstract except for build; will build based
     # on the attention backend
@@ -62,25 +65,6 @@ class AttentionManager(AttentionResource):
 
     def depends_on(self):
         return {self._kv_cache_name}
-
-    def bind_dependencies(self, resources) -> None:
-        from mstar.engine.resources.context_parallel import (
-            SPContextParallelWrapper,
-            SPPlacement,
-            TPContextParallelWrapper,
-            TPPlacement,
-        )
-
-        placement = resources[self._kv_cache_name].placement
-        if placement is not None:
-            self._placement = placement
-            wrappers = {SPPlacement: SPContextParallelWrapper, TPPlacement: TPContextParallelWrapper}
-            self._placed = wrappers[type(placement)]
-            self._bind_placement(placement)
-
-    def _bind_placement(self, placement: "ContextParallel") -> None:
-        """This rank's share of a context-parallel pool. Reached only for a backend that supports
-        one (``supports_context_parallel``): the engine refuses the others at load."""
 
     def fingerprint(self) -> bytes:
         # the class, not the declared backend: `build` moves dense to another
@@ -295,12 +279,9 @@ class AttentionManager(AttentionResource):
         fused kernel writes the K/V but leaves ``k`` unrotated rotates it in place first when this
         is True.
 
-        Every step of a backend that takes the fresh K/V straight into the kernel; on a paged
-        backend over a context-parallel pool, a step that attends its own tokens apart from the
-        pool. Fixed once the step is planned, so a captured bucket replays the same answer.
+        Every step of a backend that takes the fresh K/V straight into the kernel. Fixed once the
+        step is planned, so a captured bucket replays the same answer.
         """
-        if self._placement is not None:
-            return self._current_plan_states[label or self._default_label].reads_step_kv
         return not self.requires_kv_write
 
     def qo_indptr_buf(self, label: str = "main") -> torch.Tensor | None:
@@ -322,10 +303,28 @@ class PlacedAttention(AttentionManager):
     """What a backend supplies to attend a placed pool, the one object placed attention builds its
     kernels from: its paged kernel, its whole-rows kernel, and the kernel a share of the own tokens
     runs on, a paged backend's one-slot pages unless it says otherwise. The rest (the split of the
-    own tokens, the exchanges, the merge) is ``ContextParallelWrapper``'s."""
+    own tokens, the exchanges, the merge) is ``ContextParallelWrapper``'s. A backend sets
+    ``_workspaces``, ``_kv_config``, ``_dtype`` and ``_device``, which the wrappers are built with,
+    and keeps its plans in ``_current_plan_states`` and ``_preplan_states``."""
 
     supports_context_parallel = True
     own_kernel: "type[OwnTokensKernel]" = OneSlotPages
+    # the KV pool's placement, and the attention it takes (`bind_dependencies`)
+    _placement: "ContextParallel | None" = None
+    _placed: "type[ContextParallelWrapper] | None" = None
+
+    def bind_dependencies(self, resources) -> None:
+        placement = resources[self._kv_cache_name].placement
+        if placement is not None:
+            self._placement = placement
+            wrappers = {SPPlacement: SPContextParallelWrapper, TPPlacement: TPContextParallelWrapper}
+            self._placed = wrappers[type(placement)]
+            self._bind_placement(placement)
+
+    @abstractmethod
+    def _bind_placement(self, placement: "ContextParallel") -> None:
+        """This rank's share of the pool: the wrappers' arguments take the placed geometry
+        (``local_geometry``)."""
 
     @abstractmethod
     def paged_kernel(
@@ -361,6 +360,23 @@ class PlacedAttention(AttentionManager):
             self._placement, self._kv_config.tokens_per_page, self._dtype, context, new, self._device,
             kwargs.get("batch_size"), max_total_tokens,
         )
+
+    @torch.compiler.disable
+    def reads_step_kv(self, label: str | None = None) -> bool:
+        # over a placed pool, a step that attends its own tokens apart from the pool
+        if self._placement is not None:
+            return self._current_plan_states[label or self._default_label].reads_step_kv
+        return super().reads_step_kv(label)
+
+    def clear_preplan(self):
+        if self._placement is not None:
+            # the dropped plan's H2Ds went on the plan stream, which the step that runs instead
+            # waits on no event from, so its own-token wrappers must not skip their plans
+            for wrapper in self._preplan_states.values():
+                wrapper.forget_plan()
+        # rebind rather than clear: a consumed preplan dict is the live one
+        self._preplanned = False
+        self._preplan_states = {}
 
     @torch.compiler.disable
     def _attend_placed(
