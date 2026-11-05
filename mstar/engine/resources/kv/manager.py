@@ -3209,6 +3209,58 @@ class KVManager(AttentionResource):
         self._preplan_states = {}
         self._cached_plan_output = None
 
+    def correct_len(self, rid: str, label: str, delta: int) -> None:
+        """Move a stream's stored length by ``delta`` tokens, pages kept: a
+        speculative verify step commits its whole block and its rejected tail
+        is taken back here once the acceptance is known. The generation moves
+        so an offload claimed against the old length fails its guard."""
+        with self._lock:
+            stream = self._streams.get(rid, {}).get(label)
+            if stream is None:
+                raise KeyError(f"KV {self.name}: no stream {label!r} for request {rid}")
+            if len(self._groups) > 1:
+                # each group would rewind its own pages; no grouped cache serves MTP yet
+                raise NotImplementedError(f"KV {self.name}: correct_len on a cache with KV groups")
+            # an admitted step's addressing was planned from the old length
+            assert not stream.step_in_flight, (
+                f"KV {self.name}: correct_len on {rid}/{label} between admit and commit"
+            )
+            if delta == 0:
+                return
+            stream.stored_len = max(0, stream.stored_len + delta)
+            stream.generation += 1
+            # the plan caches assume the stream moved by a commit
+            self._touch_plan_cache(rid)
+            if delta < 0:
+                self._drop_sealed_tail(rid, label, stream)
+            if _DEBUG_ASSERTS:
+                self.assert_pages_conserved()
+
+    def _drop_sealed_tail(self, rid: str, label: str, stream: CacheStream) -> None:
+        """After a rewind the next write must not land on a sealed page other owners
+        still read: the pages from the write position on leave through `_release`, and
+        the one the length ends inside is replaced by a copy."""
+        page_size = self.config.tokens_per_page
+        first = stream.stored_len // page_size
+        tail = stream.page_indices[first:]
+        if not self._arena.any_sealed(tail):
+            return
+        keep: list[int] = []
+        if stream.stored_len % page_size:
+            keep = self._arena.acquire(1)
+            if keep is None:
+                raise RuntimeError(
+                    f"KV {self.name}: no free page to copy the sealed page "
+                    f"{rid}/{label} rewound into"
+                )
+            self.kv_cache.copy_pages(tail[:1], keep)
+        del stream.page_indices[first:]
+        stream.page_indices.extend(keep)
+        self._release(rid, stream, tail)
+        # its keys and cursor name pages this stream no longer holds
+        stream.chain = None
+        self._recount(rid)
+
     def commit(self, step: KVStep, ctx: StepContext):
         streams = self._streams
         retention = step.retention
