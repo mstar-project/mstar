@@ -55,3 +55,66 @@ def test_orpheus_decode_eos_marks_done():
 
     assert result.request_done is True
     assert result.full_metadata.kwargs["decode_finished"] is True
+
+
+def test_an_llm_run_of_four_tokens_equals_four_one_token_steps():
+    """Decode reads its token off the sampler's slot masters (``DeviceLoopback``),
+    and a run carries it from the sampled ``new_token`` into the next
+    replay's ``text_inputs``: four replays give the tokens four steps do. The
+    transformer is a stand-in; the embedding, head and plumbing are real."""
+    from types import SimpleNamespace
+
+    import torch
+    from run_parity import replay_run
+
+    from mstar.model.orpheus.submodules import ATTN, SAMPLER, OrpheusLLMSubmodule
+    from mstar.model.submodule_base import CarryPair, ModelInputsFromEngine
+
+    torch.manual_seed(0)
+    vocab, hidden = 32, 8
+
+    class LanguageModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = torch.nn.Module()
+            self.model.embed_tokens = torch.nn.Embedding(vocab, hidden)
+            self.lm_head = torch.nn.Linear(hidden, vocab)
+
+        def forward(self, x, label):
+            return torch.tanh(x * 1.5)
+
+    llm = OrpheusLLMSubmodule(LanguageModel(), SimpleNamespace(stop_token_id=vocab - 1, custom_token_base_id=0))
+    assert llm.repeat_carry("decode", {"text_inputs"}) == {"text_inputs": CarryPair("new_token", "text_inputs")}
+    sampler = SimpleNamespace(sample=lambda rids, logits: logits.argmax(-1))
+    engine_inputs = ModelInputsFromEngine(
+        request_ids=["a", "b"], per_request_info={}, resources={SAMPLER: sampler, ATTN: None},
+    )
+
+    def forward(**inputs):
+        return llm.forward_batched("decode", engine_inputs, **inputs).row_outputs
+
+    first = torch.tensor([3, 5])
+    tokens, steps = first, []
+    with torch.no_grad():
+        for _ in range(4):
+            tokens = forward(text_inputs=tokens)["new_token"]
+            steps.append(tokens)
+        _, columns = replay_run(
+            forward, {"text_inputs": first}, llm.repeat_carry("decode", {"text_inputs"}), 4, ["new_token"],
+        )
+    assert torch.equal(columns["new_token"], torch.stack(steps, dim=1))
+
+
+def test_a_mixed_step_reads_a_loop_back_rows_token_by_slot_beside_a_prompt():
+    from types import SimpleNamespace
+
+    import torch
+
+    from mstar.model.orpheus.submodules import SAMPLER, OrpheusLLMSubmodule
+    from mstar.model.submodule_base import ARNodeInputs, ModelInputsFromEngine
+
+    llm = OrpheusLLMSubmodule.__new__(OrpheusLLMSubmodule)
+    sampler = SimpleNamespace(loopback_tokens=lambda rids: torch.tensor([41, 42, 43])[: len(rids)])
+    engine_inputs = ModelInputsFromEngine(request_ids=[1, 2], per_request_info={}, resources={SAMPLER: sampler})
+    rows = [ARNodeInputs(input_seq_len=1), ARNodeInputs(input_ids=torch.tensor([7, 8, 9]), input_seq_len=3)]
+    assert llm.preprocess("mixed", engine_inputs, rows)["text_inputs"].tolist() == [41, 7, 8, 9]
