@@ -779,6 +779,13 @@ def _rank_main(rank, scenario, inbox, outbox):
             healthy_prefix = _prompt_tokens(kind, "r0")[:2 * PAGE_SIZE] + _ids(9, 78)
             final["probe_failed_prefix"] = _probe(engine, "p1", failed_prefix)
             final["probe_healthy_prefix"] = _probe(engine, "p0", healthy_prefix)
+        # Gloo's threads let go of a collective's tensors after its wait()
+        # returns, taking the GIL to do it, and one that does so while the
+        # interpreter finalizes aborts the process. A group joins its threads
+        # only when its last reference goes: one left over keeps them running
+        # past destroy_process_group.
+        group.device_group = group.cpu_group = group._all_reduce = None
+        dist.destroy_process_group()
         report(("final", rank, final))
     except BaseException:
         report(("crash", rank, traceback.format_exc()))
@@ -921,16 +928,25 @@ def _run(tmp_path, scenario: Scenario) -> Run:
             run.final[item[1]] = item[2]
         elif tag == "crash":
             run.crashed[item[1]] = item[2]
-    for p in procs:
-        p.join(timeout=2)
+    run.elapsed = time.monotonic() - start
+    # A loaded host can take seconds over an exit that is going fine.
+    killed = set()
+    for r, p in enumerate(procs):
+        p.join(timeout=COLLECTIVE_S)
         if p.is_alive():
+            killed.add(r)
             p.kill()
             p.join(timeout=2)
     run.exitcodes = {r: p.exitcode for r, p in enumerate(procs)}
     for r, code in run.exitcodes.items():
-        if code not in (0, None) and r not in run.crashed:
+        if r in run.crashed:
+            continue
+        if r in killed:
+            run.crashed[r] = f"still running {COLLECTIVE_S:.0f} s after the run stopped, so the harness killed it"
+        elif code not in (0, None):
             run.crashed[r] = f"exit code {code} (a gloo abort is a collective with another shape)"
-    run.elapsed = time.monotonic() - start
+        elif r not in run.final:
+            run.crashed[r] = "exited without its final report reaching the parent"
     return run
 
 
