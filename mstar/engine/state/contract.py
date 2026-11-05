@@ -157,13 +157,14 @@ class Array:
             self._check_update(key, update)
 
     def _check_entry(self) -> None:
-        # with no layers nothing is stored or read, so an axis may be 0
-        least = 1 if self.layers else 0
+        # a layer reads nothing from an array with no layers and no reads, so an axis may be 0
+        least = 1 if self.layers or self.reads else 0
         for name, tensor in self.entry.tensors.items():
             where = f"Array {self.name!r}.entry.tensors[{name!r}]"
-            shape = tensor.shape
-            if not (isinstance(shape, tuple) and shape and all(type(axis) is int and axis >= least for axis in shape)):
-                raise ValueError(f"{where}.shape must be a non-empty tuple of ints >= {least}, got {shape!r}")
+            if not (isinstance(tensor.shape, tuple) and tensor.shape and all(
+                type(axis) is int and axis >= least for axis in tensor.shape
+            )):
+                raise ValueError(f"{where}.shape must be a non-empty tuple of ints >= {least}, got {tensor.shape!r}")
             if tensor.shard is not None and not (type(tensor.shard) is int and 0 <= tensor.shard < len(tensor.shape)):
                 raise ValueError(f"{where}.shard must be None or an axis of shape {tensor.shape}, got {tensor.shard!r}")
         for name, kind in self.entry.host.items():
