@@ -1293,7 +1293,7 @@ impl<'py> FromPyObject<'py> for RouteArg {
             num_tensors: r.num_tensors,
             inline_signal: optional_item(ob, "inline_signal")?,
             inline_values: optional_item(ob, "inline_values")?.unwrap_or_default(),
-            inline_tails: Vec::new(),
+            inline_tails: optional_item(ob, "inline_tails")?.unwrap_or_default(),
             logprobs: optional_item(ob, "logprobs")?.unwrap_or_default(),
             walks: r.walks,
             rid_walk_idx: r.rid_walk_idx,
@@ -1348,6 +1348,9 @@ struct StopRule {
     lp: Sym,
     ar: bool,
     eos: Vec<i64>,
+    /// an iteration whose token is one of `eos` drops its item of the
+    /// policy's withheld signals, whether or not it stops the row
+    withhold: bool,
 }
 
 /// Routing parked between complete_and_route_batch and send_outputs.
@@ -3324,17 +3327,20 @@ impl GraphRuntime {
 
     /// Declares (node, walk)'s stop rules, as `NodeSubmodule.get_stop_policies`
     /// gives them, one column entry per rule.
+    #[pyo3(signature = (node_name, graph_walk, loops, ar, eos, withhold = Vec::new()))]
     fn set_stop_rules(
         &mut self, node_name: &str, graph_walk: &str,
-        loops: Vec<String>, ar: Vec<bool>, eos: Vec<Vec<i64>>,
+        loops: Vec<String>, ar: Vec<bool>, eos: Vec<Vec<i64>>, withhold: Vec<bool>,
     ) -> PyResult<()> {
-        if loops.len() != ar.len() || loops.len() != eos.len() {
+        let withhold_ok = withhold.is_empty() || withhold.len() == loops.len();
+        if loops.len() != ar.len() || loops.len() != eos.len() || !withhold_ok {
             return Err(PyValueError::new_err("set_stop_rules: columns differ in length"));
         }
         let key = (self.interner.intern(node_name), self.interner.intern(graph_walk));
         let mut rules = Vec::with_capacity(loops.len());
-        for ((name, ar), eos) in loops.iter().zip(ar).zip(eos) {
-            rules.push(StopRule { lp: self.interner.intern(name), ar, eos });
+        for (k, ((name, ar), eos)) in loops.iter().zip(ar).zip(eos).enumerate() {
+            let withhold = withhold.get(k).copied().unwrap_or(false);
+            rules.push(StopRule { lp: self.interner.intern(name), ar, eos, withhold });
         }
         self.stop_rules.insert(key, rules);
         Ok(())
@@ -3371,13 +3377,16 @@ impl GraphRuntime {
     ///
     /// At a step's stop check its loop counts are the ones the step ran at:
     /// they move when the step is routed, which comes after. Returns
-    /// `(stop_rids, stop_rules, missing)`: a stop per (rid, rule index), and
-    /// the rids with no limits for this walk yet, which the caller registers
-    /// with `set_stop_limits` and checks again. A rid with no token row is
-    /// skipped, as `check_stop` skips a request with no output.
+    /// `(stop_rids, stop_rules, kept, missing, withheld_rids, withheld_iters)`:
+    /// a stop per (rid, rule index) with the iterations it kept, the rids with
+    /// no limits for this walk yet, which the caller registers with
+    /// `set_stop_limits` and checks again, and each (rid, iteration) whose
+    /// item a withholding rule drops. A rid with no token row is skipped, as
+    /// `check_stop` skips a request with no output. `token_width`: values per
+    /// row, one per iteration of a step that repeated.
     #[pyo3(signature = (
         partition, node_name, graph_walk, rids,
-        token_ptr, token_rows, token_stride, token_dtype, row_rids,
+        token_ptr, token_rows, token_stride, token_dtype, row_rids, token_width = 1,
     ))]
     #[allow(clippy::too_many_arguments, clippy::type_complexity)]
     fn check_stops_inline(
@@ -3391,10 +3400,13 @@ impl GraphRuntime {
         token_stride: usize,
         token_dtype: &str,
         row_rids: Vec<u32>,
-    ) -> PyResult<(Vec<u32>, Vec<u32>, Vec<u32>)> {
-        let tokens = postprocess::TokenColumn::new(token_ptr, token_rows, token_stride, token_dtype);
+        token_width: usize,
+    ) -> PyResult<(Vec<u32>, Vec<u32>, Vec<u32>, Vec<u32>, Vec<u32>, Vec<u32>)> {
+        let tokens = postprocess::TokenColumn::new(token_ptr, token_rows, token_stride, token_dtype)
+            .map(|col| col.wide(token_width));
         let found = self.stops_over(partition, node_name, graph_walk, &rids, tokens.as_ref(), &row_rids)?;
-        Ok((found.rids, found.rules, found.missing))
+        let (w_rids, w_iters) = found.withheld.into_iter().unzip();
+        Ok((found.rids, found.rules, found.kept, found.missing, w_rids, w_iters))
     }
 
 
@@ -3449,13 +3461,17 @@ impl GraphRuntime {
     }
 
     /// Resume a step parked for its stored outputs (STORE): `RouteTensors`.
-    #[pyo3(signature = (tensors, num_tensors, inline_signal, inline_values, logprobs = Vec::new()))]
+    #[pyo3(signature = (
+        tensors, num_tensors, inline_signal, inline_values, logprobs = Vec::new(), inline_tails = Vec::new(),
+    ))]
+    #[allow(clippy::too_many_arguments)]
     fn resume_postprocess_store(
         &mut self, py: Python<'_>, tensors: Vec<u64>, num_tensors: Vec<usize>,
         inline_signal: Option<String>, inline_values: Vec<i64>, logprobs: Vec<Option<f64>>,
+        inline_tails: Vec<Vec<i64>>,
     ) -> PyResult<postprocess::PostprocessOut> {
         let stored = postprocess::Stored {
-            tensors, num_tensors, inline_signal, inline_values, inline_tails: Vec::new(), logprobs,
+            tensors, num_tensors, inline_signal, inline_values, inline_tails, logprobs,
         };
         self.pp_resume_store(py, stored)
     }

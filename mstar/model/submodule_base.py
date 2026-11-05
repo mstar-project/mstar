@@ -47,6 +47,13 @@ class HostRows(NamedTuple):
         return ((rid, value) for rid in request_ids if (value := value_of.get(rid)) is not None)
 
 
+# A ``check_stop_buffers`` entry, one integer a row: how many items of each
+# per-iteration output the step (each replay of a run) emitted, the first that
+# many along the output's dim 1. Absent, each emits one, the whole row. What a
+# step emitting a variable count (a speculative one) composes through.
+EMITTED_COUNT = "emitted_count"
+
+
 @dataclass(frozen=True)
 class TokenStop:
     """When an AR submodule's sampled token ends its decode loop: on a stop
@@ -57,8 +64,7 @@ class TokenStop:
     Declared as ``ARNodeSubmodule.token_stop``; ``check_stop`` and
     ``check_stop_batched`` follow from it, and the graph runtime checks the
     stop itself (``ARNodeSubmodule.get_stop_policies``) on every walk but the
-    prefill walks, unless the stop withholds outputs or the class overrides
-    the check.
+    prefill walks, unless the class overrides the check.
     """
 
     loop: str
@@ -78,7 +84,7 @@ class TokenStop:
     # the pass whose token is the reply's (earlier passes' tokens are not)
     last_prefill_flag: str | None = None
     # outputs left unrouted on a row whose token is a stop id, ``ignore_eos``
-    # or not (``StopCheck.withheld``): a frame streamed beside the stop token
+    # or not (``StopPolicy.withhold``): a frame streamed beside the stop token
     # is loop control, and only the stop check's host copy tells it from data
     withhold: tuple[str, ...] = ()
 
@@ -216,10 +222,15 @@ class StopPolicy:
     # the request's iteration limit for this loop; evaluated once per request
     # and walk, not per step. None is ``info.max_tokens``.
     max_iters: Callable[[CurrentForwardPassInfo], int] | None = None
+    # AR, EOS: output signals whose item of an iteration whose token is one of
+    # ``eos_tokens`` is not routed, ``ignore_eos`` or not (``TokenStop.withhold``)
+    withhold: tuple[str, ...] = ()
 
     def __post_init__(self):
         if self.reads_token and self.token_signal is None:
             raise ValueError(f"a {self.kind.name} StopPolicy needs a token_signal")
+        if self.withhold and not self.reads_token:
+            raise ValueError("an ITER StopPolicy reads no token, so it can't withhold on one")
         object.__setattr__(self, "eos_tokens", frozenset(self.eos_tokens))
 
     @property
@@ -1604,8 +1615,6 @@ class ARNodeSubmodule(NodeSubmodule):
             return {} if _keeps(self, ARNodeSubmodule, _STOP_CHECK) else None
         if (
             graph_walk in stop.prefill_walks
-            # the runtime's check never calls check_stop, which is what withholds
-            or stop.withhold
             # a class that overrides the token's stop check answers for it
             or not _keeps(self, ARNodeSubmodule, _TOKEN_STOP_CHECK)
         ):
@@ -1615,6 +1624,7 @@ class ARNodeSubmodule(NodeSubmodule):
         # the budget is the loop's cap, which the runtime enforces
         return {stop.loop: StopPolicy(
             StopKind.EOS, token_signal=stop.buffer, eos_tokens=stop.stop_ids, sampler=stop.sampler,
+            withhold=stop.withhold,
         )}
 
     def check_stop(

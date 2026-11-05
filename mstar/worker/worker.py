@@ -63,6 +63,7 @@ from mstar.graph.runtime.base import (
 from mstar.graph.runtime.utils import require_rust_extension
 from mstar.model.base import Model, WorkerGraph
 from mstar.model.submodule_base import (
+    EMITTED_COUNT,
     END_PARTITION,
     BatchedModelOutput,
     HostRows,
@@ -127,7 +128,7 @@ from mstar.worker.speculation import (
     SpeculationContext,
     SpeculationPreparer,
 )
-from mstar.worker.step_repeats import StepRepeats, edge_refusal, parse_step_repeats, walk_edges
+from mstar.worker.step_repeats import StepRepeats, edge_refusal, parse_step_repeats, run_columns, walk_edges
 from mstar.worker.stream_buffers import StreamBufferManager
 from mstar.worker.worker_metrics import WorkerMetrics
 
@@ -468,6 +469,8 @@ class Worker:
     # Set at load; None, every step runs once, so a worker built without it --
     # any test fake -- never repeats.
     _step_repeats: StepRepeats | None = None
+    # (node, walk) -> the signals its stop policies withhold; set at load
+    _withheld_signals: Mapping[tuple[str, str], frozenset[str]] = MappingProxyType({})
 
     # Metrics are off unless __init__ gets a status interval; class-level so a
     # worker built without __init__ reads them as off too.
@@ -2921,13 +2924,14 @@ class Worker:
         engine = self.engine_manager.get_engine(node_name)
         if self._stop_token_signal.get((node_name, graph_walk)) is None:
             return "node: the runtime doesn't check its stop: it declares no token stop"
-        # the client's copy of a token rides the step's token column
-        inline = self._graph_runtime.supports_inline_emit
-        columns = engine.inline_client_signals(node_name, graph_walk) if inline else {}
-        refusal = edge_refusal(
-            self._step_repeats.edges[(node_name, graph_walk)],
-            engine.device_loopback_signals(node_name, graph_walk), columns,
-        )
+        edges = self._step_repeats.edges[(node_name, graph_walk)]
+        refusal = edge_refusal(edges, engine.device_loopback_signals(node_name, graph_walk))
+        if refusal is None:
+            # the client's copy of a token rides the step's token column
+            inline = (
+                engine.inline_client_signals(node_name, graph_walk) if self._graph_runtime.supports_inline_emit else {}
+            )
+            refusal = engine.keep_run_columns(node_name, graph_walk, run_columns(edges, inline))
         return refusal if refusal is not None else engine.repeat_refusal(node_name, graph_walk)
 
     def _can_speculate(self, batch: ScheduledBatch) -> bool:
@@ -3917,6 +3921,7 @@ class Worker:
                         if rid_outputs:
                             for name in names:
                                 rid_outputs.pop(name, None)
+                self._cut_run_items(batch_N, outputs, step, host_rows, engine)
                 stored, route_tensors = self._store_outputs(
                     batch_N, outputs, request, step, cpu_outputs, host_rows, engine,
                 )
@@ -4102,6 +4107,7 @@ class Worker:
         keeps ``check_stop``."""
         # (node, walk) -> the token signal its policies read, or None
         self._stop_token_signal: dict[tuple[str, str], str | None] = {}
+        self._withheld_signals = {}
         for node, walk in sorted(walks):
             policies = self.engine_manager.get_engine(node).get_stop_policies(node, walk)
             if policies is None:
@@ -4115,6 +4121,9 @@ class Worker:
                 continue
             self._graph_runtime.set_stop_policies(node, walk, policies)
             self._stop_token_signal[(node, walk)] = next(iter(signals), None)
+            withheld = frozenset(name for p in policies.values() for name in p.withhold)
+            if withheld:
+                self._withheld_signals[(node, walk)] = withheld
 
     def _buffer_publish(self, batch_N: PendingBatch) -> set[int]:
         """Buffer this step's publication for the conductor; the rids that
@@ -4126,6 +4135,51 @@ class Worker:
                 self.request_state.buffer_publish_info(rid, batch_N.partition, published)
                 buffered.add(rid)
         return buffered
+
+    def _cut_run_items(
+        self, batch_N: PendingBatch, outputs: BatchedModelOutput, step: PostprocessStep,
+        host_rows: "HostRows | None", engine,
+    ) -> None:
+        """Each row's per-iteration outputs as the items it routes: a step that
+        repeated holds a column per replay of each (``Engine.keep_run_columns``),
+        of which a row routes the iterations its stop kept (``step.kept``);
+        an iteration the stop check withheld (``StopPolicy.withhold``) routes
+        none of the withheld signals; and a replay that emitted a count
+        (``EMITTED_COUNT``) routes that many of each, along dim 1."""
+        key = (batch_N.node_name, batch_N.graph_walk)
+        width = batch_N.batch.repeats
+        withhold = self._withheld_signals.get(key, ()) if step.withheld else ()
+        emitted = None if host_rows is None else host_rows.buffers.get(EMITTED_COUNT)
+        if width == 1 and not withhold and emitted is None:
+            return
+        signals = set(withhold)
+        if width > 1 or emitted is not None:
+            signals |= engine.run_columns(*key)
+        row_of = {} if emitted is None else {rid: i for i, rid in enumerate(host_rows.request_ids)}
+        emitted = None if emitted is None else emitted.reshape(emitted.shape[0], -1).tolist()
+        for rid in step.wg_ids.keys:
+            rid_outputs = outputs.get(rid)
+            if not rid_outputs:
+                continue
+            counts = None if emitted is None else emitted[row_of[rid]]
+            kept = step.kept.get(rid, width)
+            for name in signals & rid_outputs.keys():
+                (column,) = rid_outputs[name]
+                items = []
+                for i in range(kept):
+                    if name in withhold and (rid, i) in step.withheld:
+                        continue
+                    replay = column[:, i] if width > 1 else column
+                    if counts is None:
+                        items.append(replay)
+                    else:
+                        items.extend(replay[:, j] for j in range(counts[i]))
+                if items:
+                    rid_outputs[name] = items
+                else:
+                    del rid_outputs[name]
+        # the entries are no longer row views of the step's batch clones
+        outputs.row_views = None
 
     def _store_outputs(
         self, batch_N: PendingBatch, outputs: BatchedModelOutput,
@@ -4155,6 +4209,13 @@ class Worker:
         inline_signal, inline_values = self._inline_emit_values(
             engine, batch_N, host_rows, rids, signals,
         )
+        inline_tails = ()
+        if inline_signal is not None and batch_N.batch.repeats > 1:
+            # each row's values after its first, up to the iteration its stop kept
+            buf = host_rows.buffers[engine.inline_client_signals(batch_N.node_name, batch_N.graph_walk)[inline_signal]]
+            row_of = {rid: i for i, rid in enumerate(host_rows.request_ids)}
+            wide = buf.reshape(buf.shape[0], -1).tolist()
+            inline_tails = [wide[row_of[rid]][1:step.kept.get(rid, batch_N.batch.repeats)] for rid in rids]
         logprobs = self._row_logprobs(host_rows, rids)
 
         def store(rids):
@@ -4222,7 +4283,7 @@ class Worker:
         if flat_uuids:
             self.tensor_manager.increment_ref_batch_uniform(flat_uuids, 1)
 
-        return stored, RouteTensors(flat_uuids, num_tensors, inline_signal, inline_values, logprobs)
+        return stored, RouteTensors(flat_uuids, num_tensors, inline_signal, inline_values, logprobs, inline_tails)
 
     def _send_input(
         self, batch_N: PendingBatch, request: PostprocessRequest, step: PostprocessStep,

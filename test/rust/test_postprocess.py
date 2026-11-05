@@ -286,12 +286,11 @@ def test_a_repeated_step_stops_a_row_at_its_iteration_and_emits_up_to_it(tmp_pat
     assert sent == {"r0": [1, 2, 3], "r1": [4, EOS]}
 
 
-@pytest.mark.parametrize("limits", [True, False], ids=["store", "stops"])
-def test_a_repeated_step_refuses_the_worker_paths_that_read_one_iteration(tmp_path, limits):
-    """Only the runtime's own check and the inline route read every iteration:
-    a store or a model check would drop the rest of a row's tokens unseen."""
+def test_a_repeated_step_refuses_the_model_check_that_reads_one_iteration(tmp_path):
+    """Only the runtime's own check reads every iteration: the model's would
+    drop the rest of a row's tokens unseen."""
     rt = _runtime(rust_runtime.RustGraphRuntime, str(tmp_path))
-    rids = _start(rt, 2, limits=limits)
+    rids = _start(rt, 2, limits=False)
     assert rt.pop_rids(NODE, WALK, rids) is not None
     wide = torch.tensor([[1, 2, 3], [4, 5, 6]], dtype=torch.int64)
     with pytest.raises(RuntimeError):
@@ -300,6 +299,31 @@ def test_a_repeated_step_refuses_the_worker_paths_that_read_one_iteration(tmp_pa
             wg_ids=ParallelList(list(rids), [0, 0]), runtime_stops=True,
             tokens=wide[:, 0], row_rids=rids, loop_strides=[3, 3], token_width=3,
         ))
+
+
+@pytest.mark.parametrize("cls", [rust_runtime.RustGraphRuntime, _Reference], ids=["native", "reference"])
+def test_a_repeated_step_hands_the_store_what_each_row_kept(tmp_path, cls):
+    """At STORE a step that ran three iterations says, per row, the iterations
+    its stop kept and which iteration's item a withholding policy drops: only
+    an EOS column's (ignore_eos or not), never a loop cap's, and nothing past
+    the stop. In order: row 0 runs on, row 1 stops on EOS at iteration 1, row
+    2 reaches its cap at iteration 1."""
+    rt = _runtime(cls, str(tmp_path))
+    withholding = StopPolicy(StopKind.AR, token_signal=SIG, eos_tokens=(EOS,), withhold=(SIG,))
+    rt.set_stop_policies(NODE, WALK, {LOOP: withholding})
+    rids = _start(rt, 3)
+    rt.register_stop_limits(rids[2], SimpleNamespace(max_tokens=2, resource_configs={}))
+    assert rt.pop_rids(NODE, WALK, rids) is not None
+    wide = torch.tensor([[1, 2, 3], [4, EOS, EOS], [6, 8, 9]], dtype=torch.int64)
+    step = rt.begin_postprocess(PostprocessRequest(
+        partition=PART, node_name=NODE, graph_walk=WALK, output_signals=[SIG],
+        wg_ids=ParallelList(list(rids), [0, 0, 0]), runtime_stops=True,
+        tokens=wide[:, 0], row_rids=rids, loop_strides=[3, 3, 3], token_width=3,
+    ))
+    assert step.need is PostprocessNeed.STORE
+    assert dict(step.kept) == {rids[1]: 2, rids[2]: 2}
+    assert step.withheld == {(rids[1], 1)}
+    assert sorted(step.stopped_rids) == [rids[1], rids[2]]
 
 
 def test_loop_room_is_what_every_row_has_left_past_what_it_has_in_flight(tmp_path):

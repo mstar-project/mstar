@@ -89,21 +89,24 @@ def test_a_token_stop_names_the_walks_that_end_its_loop():
     assert both.stops_on("a") and both.stops_on("b") and not both.stops_on("c")
 
 
-@pytest.mark.parametrize("owner", ["withhold", "override"])
-def test_a_token_stop_keeps_check_stop_where_check_stop_does_more(owner):
-    """The runtime's check never calls ``check_stop``: not for a stop that
-    withholds outputs, nor for a class whose own check does more (Whisper keeps
-    each token for its align walk)."""
+def test_a_token_stop_keeps_check_stop_where_check_stop_does_more():
+    """The runtime's check never calls ``check_stop``: not for a class whose
+    own check does more (Whisper keeps each token for its align walk)."""
     from mstar.model.whisper.submodules import WhisperDecoderSubmodule
 
-    cls = WhisperDecoderSubmodule if owner == "override" else Qwen3ASRLLMSubmodule
-    sub = cls.__new__(cls)
+    sub = WhisperDecoderSubmodule.__new__(WhisperDecoderSubmodule)
+    torch.nn.Module.__init__(sub)
+    sub.token_stop = TokenStop(loop=LOOP, buffer="new_token", stop_ids=frozenset(EOS), sampler="s")
+    assert sub.get_stop_policies("decode") is None
+
+
+def test_a_withholding_token_stop_is_the_runtimes_too():
+    sub = Qwen3ASRLLMSubmodule.__new__(Qwen3ASRLLMSubmodule)
     torch.nn.Module.__init__(sub)
     sub.token_stop = TokenStop(
-        loop=LOOP, buffer="new_token", stop_ids=frozenset(EOS), sampler="s",
-        withhold=("codes",) if owner == "withhold" else (),
+        loop=LOOP, buffer="new_token", stop_ids=frozenset(EOS), sampler="s", withhold=("codes",),
     )
-    assert sub.get_stop_policies("decode") is None
+    assert sub.get_stop_policies("decode")[LOOP].withhold == ("codes",)
 
 
 @pytest.mark.parametrize(("module", "name", "policies"), [

@@ -6,6 +6,8 @@ from uuid import uuid4
 
 import torch
 
+from mstar.graph.special_destinations import SPECIAL_DESTINATIONS
+
 
 @dataclass(frozen=True)
 class NodeAndGraphWalk:
@@ -753,6 +755,10 @@ class LoopEdges(NamedTuple):
     inputs: dict[str, EdgeKind]
     # (signal, destination) -> kind
     outputs: dict[tuple[str, str], EdgeKind]
+    # the per-iteration outputs that take each iteration's value as an item
+    # of their own (the client, a streaming edge, an accumulated output),
+    # rather than once an iteration by the next node
+    items: frozenset[tuple[str, str]] = frozenset()
 
 
 def loop_edges(section: GraphSection, node_name: str) -> LoopEdges | None:
@@ -778,7 +784,13 @@ def loop_edges(section: GraphSection, node_name: str) -> LoopEdges | None:
         else EdgeKind.PER_ITERATION
         for edge in node.outputs
     }
-    return LoopEdges(inner.name, inputs, outputs)
+    accumulated = {edge.name for edge in inner.accumulated_outputs}
+    items = frozenset(
+        (edge.name, edge.next_node) for edge in node.outputs
+        if outputs[(edge.name, edge.next_node)] is EdgeKind.PER_ITERATION
+        and (edge.is_streaming or edge.name in accumulated or edge.next_node in SPECIAL_DESTINATIONS)
+    )
+    return LoopEdges(inner.name, inputs, outputs, items)
 
 
 class GraphStateRegistry(ABC):

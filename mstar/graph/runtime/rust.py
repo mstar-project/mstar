@@ -50,6 +50,7 @@ from mstar.graph.runtime.base import (
     RouteInput,
     RouteOutput,
     RouteTensors,
+    RuntimeStops,
     SendInput,
     SpecRows,
     SpeculationOutput,
@@ -662,6 +663,7 @@ class RustGraphRuntime(GraphRuntime):
             "walks": input.walks,
             "rid_walk_idx": input.rid_walk_idx,
             "loop_strides": input.loop_strides,
+            "inline_tails": [list(t) for t in input.inline_tails],
         })
         return self._route_output(out)
 
@@ -697,6 +699,7 @@ class RustGraphRuntime(GraphRuntime):
             node_name, graph_walk, list(policies),
             [p.reads_token for p in policies.values()],
             [sorted(p.eos_tokens) for p in policies.values()],
+            [bool(p.withhold) for p in policies.values()],
         )
 
     def loop_room(self, node_name: str, graph_walk: str, loop_name: str, rids: list[int], stride: int) -> int:
@@ -716,14 +719,14 @@ class RustGraphRuntime(GraphRuntime):
 
     def check_stops(
         self, partition: str, node_name: str, graph_walk: str, rids: list[int],
-        tokens: torch.Tensor | None, row_rids: list[int],
-    ) -> dict[int, set[str]] | None:
+        tokens: torch.Tensor | None, row_rids: list[int], token_width: int = 1,
+    ) -> RuntimeStops | None:
         policies = self._stop_policies[(node_name, graph_walk)]
         if not policies:
-            return {}
+            return RuntimeStops({}, {}, frozenset())
         ptr, rows, stride, dtype = _column(tokens)
-        stop_rids, stop_rules, missing = self._rust.check_stops_inline(
-            partition, node_name, graph_walk, rids, ptr, rows, stride, dtype, row_rids,
+        stop_rids, stop_rules, kept, missing, w_rids, w_iters = self._rust.check_stops_inline(
+            partition, node_name, graph_walk, rids, ptr, rows, stride, dtype, row_rids, token_width,
         )
         if missing:
             return None
@@ -731,7 +734,10 @@ class RustGraphRuntime(GraphRuntime):
         stops: dict[int, set[str]] = {}
         for rid, k in zip(stop_rids, stop_rules, strict=True):
             stops.setdefault(rid, set()).add(loops[k])
-        return stops
+        return RuntimeStops(
+            stops, dict(zip(stop_rids, kept, strict=True)) if token_width > 1 else {},
+            frozenset(zip(w_rids, w_iters, strict=True)),
+        )
 
     def begin_postprocess(self, request: PostprocessRequest) -> PostprocessStep:
         """Natively (``postprocess.rs``)."""
@@ -768,7 +774,7 @@ class RustGraphRuntime(GraphRuntime):
             out = self._rust.resume_postprocess_store(
                 tensors=list(stored.tensors), num_tensors=list(stored.num_tensors),
                 inline_signal=stored.inline_signal, inline_values=list(stored.inline_values),
-                logprobs=list(stored.logprobs),
+                logprobs=list(stored.logprobs), inline_tails=[list(t) for t in stored.inline_tails],
             )
         elif send is not None:
             # The parked step's own route output carries the completion id.
@@ -795,9 +801,14 @@ class RustGraphRuntime(GraphRuntime):
         wg_of = dict(zip(wg_ids.keys, wg_ids.values, strict=True))
         rids = out.rids
         route = out.take_route()
+        kept = withheld = ()
+        if need is PostprocessNeed.STORE:
+            kept, withheld = out.kept_rids, out.withheld_rids
         return PostprocessStep(
             need, ParallelList(rids, [wg_of[r] for r in rids]), out.rid_walk_idx,
             out.stopped_rids, None if route is None else self._route_output(route),
+            kept=dict(zip(kept, out.kept, strict=True)) if kept else {},
+            withheld=frozenset(zip(withheld, out.withheld_iters, strict=True)) if withheld else frozenset(),
         )
 
     def stop_loops_batched(

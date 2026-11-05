@@ -66,22 +66,31 @@ def parse_step_repeats(block: object, nodes: Collection[str]) -> dict[str, Repea
     return {node: RepeatConfig.parse(node, settings) for node, settings in block.items()}
 
 
-def edge_refusal(edges: LoopEdges, carried: Collection[str], columns: Collection[str]) -> str | None:
+def edge_refusal(edges: LoopEdges, carried: Collection[str]) -> str | None:
     """Why a run can't serve one of ``edges``, or None. ``carried``: the
-    loop-back signals the device carries from one replay to the next;
-    ``columns``: the per-iteration signals a run keeps one column of per replay."""
+    loop-back signals the device carries from one replay to the next. A
+    per-iteration output is served by a column per replay (``run_columns``),
+    as items of its own."""
     for name, kind in sorted(edges.inputs.items()):
         if kind is EdgeKind.PER_ITERATION:
             return f"stream buffer: its input {name!r} is streamed, an item each iteration"
     for (signal, dest), kind in sorted(edges.outputs.items()):
         if kind is EdgeKind.LOOP_BACK and signal not in carried:
             return f"runner: its loop-back {signal!r} -> {dest!r} isn't carried on the device"
-        if (
-            kind is EdgeKind.PER_ITERATION and dest != EMPTY_DESTINATION
-            and not (dest == EMIT_TO_CLIENT and signal in columns)
-        ):
-            return f"graph runtime: {signal!r} -> {dest!r} takes each iteration's value, which a run doesn't keep"
+        if kind is EdgeKind.PER_ITERATION and dest != EMPTY_DESTINATION and (signal, dest) not in edges.items:
+            return f"graph runtime: {signal!r} -> {dest!r} is read once an iteration by its node"
     return None
+
+
+def run_columns(edges: LoopEdges, inline: Collection[str]) -> frozenset[str]:
+    """The per-iteration output signals a step that repeats keeps a column of
+    per replay: all but a client copy that rides the step's token column
+    (``inline``: the node's inline client signals)."""
+    return frozenset(
+        signal for (signal, dest), kind in edges.outputs.items()
+        if kind is EdgeKind.PER_ITERATION and dest != EMPTY_DESTINATION
+        and not (dest == EMIT_TO_CLIENT and signal in inline)
+    )
 
 
 class StepRepeats:

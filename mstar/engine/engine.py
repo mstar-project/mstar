@@ -196,6 +196,8 @@ class SubmoduleManagement:
     resident: ResidentPlanner | None = None
     # walk -> why it stays host-planned, for each walk that loops the node and isn't resident
     resident_refusals: dict[str, str] = field(default_factory=dict)
+    # walk -> the row outputs a step that repeats keeps a column of per replay
+    run_columns: dict[str, frozenset[str]] = field(default_factory=dict)
 
     # Rotated globally, not per runner: slot-keyed buffers are shared across
     # buckets and regions, so per-runner counters let consecutive steps collide
@@ -2263,9 +2265,13 @@ class Engine:
             )
             if ctx.repeats > 1:
                 carry = submodule_mgmt.submodule.repeat_carry(graph_walk)
-                out = dataclasses.replace(out, check_stop_buffers=cg_runner.repeat(
-                    lease, carry, ctx.repeats, partial(self._runner.next_replay, step),
-                ))
+                columns = submodule_mgmt.run_columns.get(graph_walk, frozenset())
+                stops, rows = cg_runner.repeat(
+                    lease, carry, ctx.repeats, partial(self._runner.next_replay, step), columns,
+                )
+                out = dataclasses.replace(
+                    out, check_stop_buffers=stops, row_outputs={**(out.row_outputs or {}), **rows},
+                )
             return out
         if release_event is not None:
             release_event.set()
@@ -2870,6 +2876,22 @@ class Engine:
             )
         capped = [cap for cap in caps if cap is not None]
         return min(capped) if capped else None
+
+    def run_columns(self, node_name: str, graph_walk: str) -> frozenset[str]:
+        """The per-iteration outputs a step of this walk that repeats keeps a
+        column of per replay (``keep_run_columns``)."""
+        return self._submodules[node_name].run_columns.get(graph_walk, frozenset())
+
+    def keep_run_columns(self, node_name: str, graph_walk: str, signals: Collection[str]) -> str | None:
+        """Have a step of this walk that repeats keep a column per replay of
+        each of ``signals`` (its per-iteration outputs); why it can't, or None."""
+        mgmt = self._submodules[node_name]
+        runner = mgmt.accelerator_graph_runner
+        if signals and runner is not None:
+            if (refusal := runner.run_column_refusal(graph_walk, signals)) is not None:
+                return f"runner: {refusal}"
+        mgmt.run_columns[graph_walk] = frozenset(signals)
+        return None
 
     def repeat_refusal(self, node_name: str, graph_walk: str) -> str | None:
         """Why a step of this walk can't replay with no host work between, or

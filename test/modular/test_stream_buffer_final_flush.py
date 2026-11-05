@@ -22,13 +22,15 @@ from mstar.streaming.chunk_policy import (
 from mstar.streaming.stream_buffer import StreamBuffer
 
 
-def _drive(policy, total_frames, drain_before_done):
+def _drive(policy, total_frames, drain_before_done, burst=1):
     """Feed ``total_frames`` one-frame items through a StreamBuffer and return
     the ``is_final`` flag of every popped chunk.
 
     ``drain_before_done`` models a consumer that keeps up with the producer,
     popping every ready chunk as items arrive — the timing that empties the
-    buffer before ``signal_done`` and triggered the hang.
+    buffer before ``signal_done`` and triggered the hang. ``burst`` items land
+    between the consumer's looks, as a producer step that repeated delivers
+    them.
     """
     sb = StreamBuffer(
         request_id="r", edge_name="new_token",
@@ -49,7 +51,7 @@ def _drive(policy, total_frames, drain_before_done):
         uid = f"t{i}"
         sb.pre_read_register(uid)
         sb.put(uid, torch.zeros(1, 4))
-        if drain_before_done:
+        if drain_before_done and (i + 1) % burst == 0:
             poll()
     sb.signal_done()
     poll()
@@ -61,8 +63,9 @@ def _drive(policy, total_frames, drain_before_done):
     "total_frames",
     [0, 1, 29, 30, 31, 60, 90, 100],  # 30/60/90 are exact multiples of chunk
 )
-def test_fixed_policy_emits_exactly_one_final(total_frames, drain_before_done):
-    finals = _drive(FixedChunkPolicy(chunk_size=30), total_frames, drain_before_done)
+@pytest.mark.parametrize("burst", [1, 4], ids=["one_a_step", "a_run_of_4"])
+def test_fixed_policy_emits_exactly_one_final(total_frames, drain_before_done, burst):
+    finals = _drive(FixedChunkPolicy(chunk_size=30), total_frames, drain_before_done, burst)
     # Exactly one terminal chunk, regardless of how the frame count lines up
     # with the chunk size or how eagerly the consumer drained.
     assert sum(finals) == 1, finals
@@ -70,11 +73,12 @@ def test_fixed_policy_emits_exactly_one_final(total_frames, drain_before_done):
     assert finals[-1] is True, finals
 
 
+@pytest.mark.parametrize("burst", [1, 4], ids=["one_a_step", "a_run_of_4"])
 @pytest.mark.parametrize("drain_before_done", [True, False])
 @pytest.mark.parametrize("total_frames", [0, 7, 14, 28, 35, 56])
-def test_sliding_window_policy_emits_exactly_one_final(total_frames, drain_before_done):
+def test_sliding_window_policy_emits_exactly_one_final(total_frames, drain_before_done, burst):
     finals = _drive(
-        SlidingWindowChunkPolicy(window=28, stride=7), total_frames, drain_before_done
+        SlidingWindowChunkPolicy(window=28, stride=7), total_frames, drain_before_done, burst
     )
     assert sum(finals) == 1, finals
     assert finals[-1] is True, finals
@@ -114,8 +118,9 @@ def test_continue_after_producer_done_never_marks_final():
 
 @pytest.mark.parametrize("drain_before_done", [True, False])
 @pytest.mark.parametrize("total_frames", [0, 1, 3, 4, 7, 8, 9, 12])
-def test_ramp_policy_emits_exactly_one_final(total_frames, drain_before_done):
-    finals = _drive(RampChunkPolicy(first_chunk=3, chunk_size=4), total_frames, drain_before_done)
+@pytest.mark.parametrize("burst", [1, 4], ids=["one_a_step", "a_run_of_4"])
+def test_ramp_policy_emits_exactly_one_final(total_frames, drain_before_done, burst):
+    finals = _drive(RampChunkPolicy(first_chunk=3, chunk_size=4), total_frames, drain_before_done, burst)
     assert finals.count(True) == 1
     assert finals[-1] is True
 

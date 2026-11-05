@@ -1540,8 +1540,9 @@ methods are:
    default for one that does, keeps calling ``check_stop``. The policies must agree with ``check_stop`` for every row;
    ``test/modular/test_stop_policies.py`` checks the models that declare them. A
    ``TokenStop`` declares them for you: its loop's stop ids, as ``StopKind.EOS``, on
-   ``walk``. Its ``prefill_walks`` keep ``check_stop``, and so does every walk of a stop
-   that withholds outputs or of a class that overrides the token's stop check.
+   ``walk``. Its ``prefill_walks`` keep ``check_stop``, and so does every walk of a class
+   that overrides the token's stop check. A policy's ``withhold`` names outputs whose
+   item of a step whose token is a stop id is not routed (``TokenStop.withhold``).
 
 ``cleanup_request(self, request_id)`` (optional)
    Free per-request state held inside the submodule when a request finishes: buffers,
@@ -1679,7 +1680,12 @@ step with ``Resource.max_repeats``, for what only that step decides (free pages,
 penalty), and the step runs the smallest answer. Whatever it counts per step (stored lengths, positions,
 recurrent token counts) it counts with ``StepContext.run_span``, not the declared
 ``span``. What a replay reads that its capture doesn't advance moves in
-``Resource.next_replay``, between replays.
+``Resource.next_replay``, between replays. Each per-iteration output of the node in its
+Loop (a client, streaming or accumulated edge) keeps a column per replay, which must be
+a row output of the capture; at STORE each row routes the iterations its stop kept, one
+item each, less an EOS iteration's item of a withheld output. A step that emits a count of
+items per row per replay (``EMITTED_COUNT`` in its ``check_stop_buffers``) holds them along
+dim 1 of each such output, and each row routes that many.
 
 A ``SubmoduleStep`` contains a list of ``Segment`` objects and one ``ResourceStep`` per
 resource key:

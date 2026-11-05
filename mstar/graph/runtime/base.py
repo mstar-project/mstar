@@ -3,6 +3,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from enum import IntEnum
+from types import MappingProxyType
 from typing import TYPE_CHECKING, NamedTuple
 
 from mstar.communication.tensors import NameToTensorList, TensorStore
@@ -501,6 +502,9 @@ class RouteInput(NamedTuple):
     # its iteration, in wg_ids.keys() order; None, one each. A chunk loop
     # counts tokens, so its row's stride is the chunk's.
     loop_strides: list[int] | None = None
+    # A repeated step's inline values after each row's first, in wg_ids.keys()
+    # order; empty for a step that ran once.
+    inline_tails: tuple[list[int], ...] | list[list[int]] = ()
 
 
 class RouteOutput(NamedTuple):
@@ -629,6 +633,19 @@ class RouteTensors(NamedTuple):
     inline_signal: str | None = None
     inline_values: tuple[int, ...] | list[int] = ()
     logprobs: tuple[float | None, ...] | list[float | None] = ()
+    inline_tails: tuple[list[int], ...] | list[list[int]] = ()
+
+
+class RuntimeStops(NamedTuple):
+    """``check_stops``' answer over a step's rows."""
+    # rid -> the loops it stops
+    stops: dict[int, set[str]]
+    # rid -> the iterations that count, for a row that stopped inside a step
+    # that repeated; a row not here keeps all of them
+    kept: dict[int, int]
+    # (rid, iteration) whose item of a withholding policy's signals
+    # (``StopPolicy.withhold``) is not routed: its token is a stop id
+    withheld: frozenset[tuple[int, int]]
 
 
 class PostprocessStep(NamedTuple):
@@ -643,6 +660,9 @@ class PostprocessStep(NamedTuple):
     route_output: RouteOutput | None = None
     # the rids a WORKER_GRAPHS_DONE went out for (DONE)
     completed_rids: list[int] | tuple[()] = ()
+    # STORE: what the stop check kept of each row (``RuntimeStops``)
+    kept: Mapping[int, int] = MappingProxyType({})
+    withheld: frozenset[tuple[int, int]] = frozenset()
 
 
 class _PostprocessPhase(IntEnum):
@@ -665,11 +685,15 @@ class _Postprocess:
     stored: RouteTensors | None = None
     route: RouteOutput | None = None
     send: SendInput | None = None
+    kept: dict[int, int] = field(default_factory=dict)
+    withheld: frozenset[tuple[int, int]] = frozenset()
 
     def step(self, need: PostprocessNeed, completed: list[int] | None = None) -> PostprocessStep:
         if need is PostprocessNeed.DONE:
             return PostprocessStep(need, stopped_rids=self.stopped, completed_rids=completed or [])
-        return PostprocessStep(need, self.wg_ids, self.rid_walk_idx, self.stopped, self.route)
+        return PostprocessStep(
+            need, self.wg_ids, self.rid_walk_idx, self.stopped, self.route, kept=self.kept, withheld=self.withheld,
+        )
 
 
 def _merged_stops(*parts: Mapping[int, set[str]] | None) -> dict[int, set[str]]:
@@ -678,6 +702,16 @@ def _merged_stops(*parts: Mapping[int, set[str]] | None) -> dict[int, set[str]]:
         for rid, loops in (part or {}).items():
             out.setdefault(rid, set()).update(loops)
     return out
+
+
+def _refuse_repeated(request: PostprocessRequest, path: str) -> None:
+    """The worker's stop check reads one value a row, so on a step that
+    repeated the rest of each row's iterations would go unseen."""
+    if request.token_width > 1:
+        raise RuntimeError(
+            f"{request.node_name}/{request.graph_walk}: a step of {request.token_width} "
+            f"iterations can't take the worker's {path} path"
+        )
 
 
 def _route_needs_python(route: RouteOutput) -> bool:
@@ -700,8 +734,6 @@ class PhasedPostprocess:
     _postprocess: _Postprocess | None = None
 
     def begin_postprocess(self, request: PostprocessRequest) -> PostprocessStep:
-        # a step that repeats needs inline emit, which only the native path has
-        assert request.token_width == 1, "PhasedPostprocess reads one iteration a row"
         self._postprocess = _Postprocess(request, partition_done=list(request.partition_done))
         return self._run_postprocess()
 
@@ -729,6 +761,7 @@ class PhasedPostprocess:
         if pp.phase is _PostprocessPhase.STOPS:
             if pp.stops is None and not req.runtime_stops:
                 # checked by the worker: the request's stops are all of them
+                _refuse_repeated(req, "check_stop")
                 pp.stops = _merged_stops(req.stops)
                 self._keep_rows(pp, set())
             if pp.stops is None:
@@ -739,14 +772,16 @@ class PhasedPostprocess:
                     try:
                         found = self.check_stops(
                             req.partition, req.node_name, req.graph_walk,
-                            list(req.wg_ids.keys), req.tokens, list(req.row_rids),
+                            list(req.wg_ids.keys), req.tokens, list(req.row_rids), req.token_width,
                         )
                     except Exception:
                         logger.debug("runtime stop check failed (node=%s)", req.node_name,
                                      exc_info=True)
                 if found is None:
+                    _refuse_repeated(req, "check_stop")
                     return pp.step(PostprocessNeed.STOPS)
-                pp.stops = _merged_stops(req.stops, found)
+                pp.stops = _merged_stops(req.stops, found.stops)
+                pp.kept, pp.withheld = found.kept, found.withheld
                 self._keep_rows(pp, set())
             pp.stopped = self._stop_step_loops(pp)
             pp.phase = _PostprocessPhase.ROUTE
@@ -754,11 +789,15 @@ class PhasedPostprocess:
             if not pp.wg_ids.keys:
                 self._postprocess = None  # every row was dropped
                 return pp.step(PostprocessNeed.DONE)
-            inline_values = None if req.inline is None else self._inline_values(pp)
+            # a withheld item has to be left out of the store
+            inline_values = None if req.inline is None or pp.withheld else self._inline_values(pp)
             if inline_values is None and pp.stored is None:
                 return pp.step(PostprocessNeed.STORE)
             n = len(pp.wg_ids.keys) * len(req.output_signals)
-            stored = pp.stored or RouteTensors([], [0] * n, req.inline.signal, inline_values)
+            stored = pp.stored or RouteTensors(
+                [], [0] * n, req.inline.signal, inline_values,
+                inline_tails=self._inline_tails(pp) if req.token_width > 1 else (),
+            )
             loop_strides = req.loop_strides
             if loop_strides is not None and len(pp.wg_ids.keys) != len(loop_strides):
                 stride_of = dict(zip(req.wg_ids.keys, loop_strides, strict=True))
@@ -771,6 +810,7 @@ class PhasedPostprocess:
                 logprobs=stored.logprobs,
                 walks=req.walks if pp.rid_walk_idx is not None else None,
                 rid_walk_idx=pp.rid_walk_idx, loop_strides=loop_strides,
+                inline_tails=stored.inline_tails,
             ))
             pp.phase = _PostprocessPhase.SEND
         if pp.send is None:
@@ -821,6 +861,17 @@ class PhasedPostprocess:
                 loop_names=ParallelList(list(walk_stops), [list(v) for v in walk_stops.values()]),
             )
         return stopped
+
+    @staticmethod
+    def _inline_tails(pp: _Postprocess) -> list[list[int]]:
+        """A repeated step's inline values after each row's first, up to the
+        iteration it stopped at, in route order."""
+        req = pp.request
+        column = req.inline.column
+        width = req.token_width
+        rows = column.as_strided((column.shape[0], width), (column.stride(0), 1)).tolist()
+        row_of = {rid: i for i, rid in enumerate(req.row_rids)}
+        return [rows[row_of[rid]][1:pp.kept.get(rid, width)] for rid in pp.wg_ids.keys]
 
     @staticmethod
     def _inline_values(pp: _Postprocess) -> list[int] | None:
@@ -986,11 +1037,13 @@ class GraphRuntime(PhasedPostprocess, ABC):
     @abstractmethod
     def check_stops(
         self, partition: str, node_name: str, graph_walk: str, rids: list[int],
-        tokens: "torch.Tensor | None", row_rids: list[int],
-    ) -> dict[int, set[str]] | None:
+        tokens: "torch.Tensor | None", row_rids: list[int], token_width: int = 1,
+    ) -> RuntimeStops | None:
         """(node, walk)'s declared stop policies over a step's rows: per rid,
-        the loops it stops (``StopPolicy.stops``); None when a row has no
-        limits for the walk, and the worker's ``check_stop`` decides.
+        the loops it stops (``StopPolicy.stops``), at its first iteration that
+        stops it when the step repeated (``token_width`` values a row), and
+        the items a withholding policy drops; None when a row has no limits
+        for the walk, and the worker's ``check_stop`` decides.
 
         Each loop's count is this runtime's as of the step: counts move when
         the step is routed, which comes after. ``tokens`` is the step's token

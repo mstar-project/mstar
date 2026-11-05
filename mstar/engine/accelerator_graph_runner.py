@@ -1640,27 +1640,48 @@ class AcceleratorGraphRunner:
 
     def repeat(
         self, lease: SlotLease, carry: tuple[str, str], repeats: int, next_replay: Callable[[], None],
-    ) -> dict[str, torch.Tensor]:
+        columns: Collection[str] = (),
+    ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
         """The rest of a step that repeats, after its first replay: each replay
         takes ``carry``'s stop buffer as its static input. Returns the stop
-        buffers, one value a row each, with a column per replay: a replay
-        overwrites what the last one left, so each is copied out on the stream
-        before the next one."""
+        buffers, one value a row each, and the row outputs named in
+        ``columns``, ``[rows, ...]`` each, both with a column per replay
+        (``[rows, repeats, ...]``): a replay overwrites what the last one
+        left, so each is copied out on the stream before the next one."""
         slot = self.slot_for(lease)
         buffers = slot.static_outputs.check_stop_buffers
+        rows_out = {name: slot.static_outputs.row_outputs[name] for name in columns}
         out, name = carry
         target = slot.static_inputs[name]
         # two names can share a buffer
-        unique = {id(t): t for t in buffers.values()}
-        columns = {key: tensor.new_empty(tensor.shape[0], repeats) for key, tensor in unique.items()}
+        unique = {id(t): t.reshape(t.shape[0], -1)[:, 0] for t in buffers.values()}
+        unique.update((id(t), t) for t in rows_out.values())
+        wide = {key: t.new_empty(t.shape[0], repeats, *t.shape[1:]) for key, t in unique.items()}
         for i in range(repeats):
             if i:
                 target.copy_(buffers[out].reshape(target.shape))
                 next_replay()
                 slot.graph.replay()
             for key, tensor in unique.items():
-                columns[key][:, i].copy_(tensor.reshape(-1))
-        return {key: columns[id(tensor)] for key, tensor in buffers.items()}
+                wide[key][:, i].copy_(tensor)
+        return (
+            {key: wide[id(t)] for key, t in buffers.items()},
+            {key: wide[id(t)] for key, t in rows_out.items()},
+        )
+
+    def run_column_refusal(self, walk: str, signals: Collection[str]) -> str | None:
+        """Why a run of ``walk``'s captures can't keep a column per replay of
+        each of ``signals``, or None: each must be a row output, row i for
+        request i."""
+        for bucket in self._buckets.values():
+            if bucket.config.capture_graph_walk != walk:
+                continue
+            for slot in bucket.slots:
+                rows = slot.static_outputs.row_outputs or {}
+                missing = sorted(name for name in signals if not isinstance(rows.get(name), torch.Tensor))
+                if missing:
+                    return f"its capture returns {missing} other than as row outputs"
+        return None
 
     def run_forward(
         self, lease: SlotLease, preprocessed: dict[str, Any],

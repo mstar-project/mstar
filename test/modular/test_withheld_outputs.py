@@ -231,3 +231,47 @@ def test_the_worker_routes_no_tensor_for_a_withheld_output(tmp_path):
     # (KEEP: token, frame), (DROP: token, frame): the stop step's frame carries nothing
     assert route.num_tensors == [1, 1, 1, 0]
     assert len(route.tensors) == 3
+
+
+def _cut(width, kept=None, withheld=frozenset(), emitted=None, columns=("frame",)):
+    """``Worker._cut_run_items`` over two rows whose "frame" holds a column
+    per replay: KEEP's values 0.., DROP's 10.."""
+    from mstar.graph.runtime.base import PostprocessNeed, PostprocessStep
+    from mstar.utils.containers import ParallelList
+
+    def column(base):
+        if emitted is not None:  # two items a replay along dim 1, as many as it emitted real
+            return torch.arange(base, base + width * 2, dtype=torch.float32).reshape(1, width, 2)
+        values = torch.arange(base, base + width, dtype=torch.float32).reshape(1, width, 1)
+        return values if width > 1 else values[:, 0]
+
+    w = Worker.__new__(Worker)
+    w._withheld_signals = {(NODE, WALK): frozenset({"frame"})}
+    outputs = BatchedModelOutput(per_rid_outputs={KEEP: {"frame": [column(0)]}, DROP: {"frame": [column(10)]}})
+    host_rows = None if emitted is None else HostRows((KEEP, DROP), {"emitted_count": torch.tensor(emitted)})
+    pending = SimpleNamespace(node_name=NODE, graph_walk=WALK, batch=SimpleNamespace(repeats=width))
+    step = PostprocessStep(
+        PostprocessNeed.STORE, ParallelList([KEEP, DROP], [0, 0]), kept=kept or {}, withheld=withheld,
+    )
+    engine = SimpleNamespace(run_columns=lambda node, walk: frozenset(columns))
+    Worker._cut_run_items(w, pending, outputs, step, host_rows, engine)
+    return {
+        rid: [t.reshape(-1)[0].item() for t in outs.get("frame", [])]
+        for rid, outs in outputs.per_rid_outputs.items()
+    }
+
+
+def test_a_run_routes_each_row_its_kept_iterations_less_the_withheld_eos_column():
+    """A row that stopped on an EOS at iteration 1 routes iteration 0 alone:
+    the run past its stop goes nowhere, and the EOS column's frame is withheld."""
+    assert _cut(3, kept={DROP: 2}, withheld={(DROP, 1)}) == {KEEP: [0, 1, 2], DROP: [10]}
+    # a stop by the loop's cap withholds nothing: its last frame is data
+    assert _cut(3, kept={DROP: 2}) == {KEEP: [0, 1, 2], DROP: [10, 11]}
+    # one iteration: the withheld row routes no frame
+    assert _cut(1, withheld={(DROP, 0)}) == {KEEP: [0], DROP: []}
+
+
+def test_a_replay_that_emits_two_items_routes_both():
+    """``EMITTED_COUNT`` says how many of a replay's items along dim 1 are
+    real: KEEP emits 2 then 1, DROP 1 then 2."""
+    assert _cut(2, emitted=[[2, 1], [1, 2]]) == {KEEP: [0, 1, 2], DROP: [10, 12, 13]}

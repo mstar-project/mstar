@@ -308,20 +308,26 @@ def test_a_repeat_feeds_each_replay_the_last_one_s_token_and_keeps_a_column_per_
     that repeats hands each replay the token before it and keeps every one."""
     tokens = torch.tensor([5, 7])
     ids = torch.zeros(2, 1, dtype=torch.long)
+    frames = torch.tensor([[5.0, -5.0], [7.0, -7.0]])
 
     class Graph:
         def replay(self):
             tokens.copy_(ids.reshape(-1) + 1)
+            frames.copy_(tokens[:, None] * torch.tensor([1.0, -1.0]))
 
     slot = SimpleNamespace(
         graph=Graph(), static_inputs={"input_ids": ids},
-        static_outputs=SimpleNamespace(check_stop_buffers={"new_token": tokens, "text_inputs": tokens}),
+        static_outputs=SimpleNamespace(
+            check_stop_buffers={"new_token": tokens, "text_inputs": tokens}, row_outputs={"frame": frames},
+        ),
     )
     runner = AcceleratorGraphRunner.__new__(AcceleratorGraphRunner)
     runner.slot_for = lambda lease: slot
-    wide = runner.repeat(None, ("new_token", "input_ids"), 3, lambda: None)
+    wide, rows = runner.repeat(None, ("new_token", "input_ids"), 3, lambda: None, ["frame"])
     assert wide["new_token"].tolist() == [[5, 6, 7], [7, 8, 9]]
     assert wide["text_inputs"] is wide["new_token"]
+    # a per-iteration output keeps each replay's rows: [rows, replays, ...]
+    assert rows["frame"].tolist() == [[[5, -5], [6, -6], [7, -7]], [[7, -7], [8, -8], [9, -9]]]
 
 
 @pytest.mark.parametrize(("in_chain", "fresh", "same_node", "room", "want"), [
@@ -401,18 +407,34 @@ def test_each_edge_of_a_loop_has_its_own_kind():
     assert loop_edges(_token_loop(), "absent") is None
 
 
-@pytest.mark.parametrize(("loop", "carried", "columns", "why"), [
-    (_token_loop(), {"t"}, {"t"}, None),
-    (_token_loop(), set(), {"t"}, "runner: its loop-back 't' -> 'n' isn't carried on the device"),
-    (_token_loop(), {"t"}, set(), "graph runtime: 't' -> 'emit_to_client' takes each iteration's value"),
-    (_token_loop(streamed=("chunk",)), {"t"}, {"t"}, "stream buffer: its input 'chunk' is streamed"),
-], ids=["served", "uncarried", "client_without_column", "streamed"])
-def test_a_walk_repeats_only_if_a_run_serves_each_of_its_edges(loop, carried, columns, why):
+def _frames(streaming: bool):
+    from mstar.graph.base import GraphEdge
+
+    return GraphEdge("codec", "frame", is_streaming=streaming)
+
+
+@pytest.mark.parametrize(("loop", "carried", "why"), [
+    (_token_loop(), {"t"}, None),
+    (_token_loop(_frames(streaming=True)), {"t"}, None),
+    (_token_loop(), set(), "runner: its loop-back 't' -> 'n' isn't carried on the device"),
+    (_token_loop(_frames(streaming=False)), {"t"}, "graph runtime: 'frame' -> 'codec' is read once an iteration"),
+    (_token_loop(streamed=("chunk",)), {"t"}, "stream buffer: its input 'chunk' is streamed"),
+], ids=["served", "streamed_out", "uncarried", "next_node", "streamed_in"])
+def test_a_walk_repeats_only_if_a_run_serves_each_of_its_edges(loop, carried, why):
     from mstar.graph.base import loop_edges
     from mstar.worker.step_repeats import edge_refusal
 
-    refusal = edge_refusal(loop_edges(loop, "n"), carried, columns)
+    refusal = edge_refusal(loop_edges(loop, "n"), carried)
     assert refusal is None if why is None else refusal.startswith(why)
+
+
+def test_a_run_keeps_a_column_of_each_per_iteration_output_the_token_column_doesnt_carry():
+    from mstar.graph.base import loop_edges
+    from mstar.worker.step_repeats import run_columns
+
+    edges = loop_edges(_token_loop(_frames(streaming=True)), "n")
+    assert run_columns(edges, inline={"t"}) == {"frame"}
+    assert run_columns(edges, inline=()) == {"frame", "t"}
 
 
 class _CudaCoreDecode(FlashInferDecodeWrapper):
