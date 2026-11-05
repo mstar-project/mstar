@@ -23,8 +23,8 @@ logger = logging.getLogger(__name__)
 
 class StepRepeats:
     def __init__(self, limit: int = 1):
-        if limit < 1:
-            raise ValueError(f"max_step_repeats is {limit}; it must be at least 1")
+        if type(limit) is not int or limit < 1:
+            raise ValueError(f"max_step_repeats is {limit!r}; it must be an integer of at least 1")
         self.limit = limit
         self._walks: dict[tuple[str, str], bool] = {}
 

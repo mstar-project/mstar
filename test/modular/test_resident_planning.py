@@ -318,6 +318,12 @@ def test_a_step_repeats_only_when_its_rows_all_continue(in_chain, fresh, same_no
     assert StepRepeats(8).ceiling(speculation, in_chain, lambda *key: None, lambda: room) == want
 
 
+@pytest.mark.parametrize("limit", [2.5, True, "4", 0])
+def test_a_repeat_limit_that_isnt_a_positive_integer_is_refused(limit):
+    with pytest.raises(ValueError, match="max_step_repeats"):
+        StepRepeats(limit)
+
+
 def test_a_step_with_no_plan_of_its_own_leaves_the_last_steps_wrappers_alone():
     """A bucket whose kernels read the tables plans nothing, so the wrappers the
     manager still holds are an earlier step's, on another slot or eager."""
