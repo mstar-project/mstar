@@ -537,6 +537,11 @@ class StepRunner:
         return key
 
     @property
+    def lane_held(self) -> frozenset[str]:
+        """The resources a lane off the chain holds, each that lane's alone."""
+        return frozenset(self._on_lane)
+
+    @property
     def staged(self) -> bool:
         """A pre-plan is staged and not yet promoted."""
         return self._staged is not None

@@ -642,6 +642,9 @@ class Engine:
         self._device_capability = device_capability
         # the lanes off the chain, as ``EngineManager.build`` placed them
         self._node_lanes = dict(node_lanes or {})
+        # the plan thread's stage of the chain's next step, against a step off the
+        # chain that plans the same resources on the GPU thread (``_beside_chain``)
+        self._stage_lock = threading.Lock()
         self._autocast_dtype = autocast_dtype
         # the share of the device this worker's allocations may hold once
         # capture is done, None for whatever is free
@@ -2767,7 +2770,8 @@ class Engine:
         ``prepare_inputs`` and the stop check stay outside — the worker has to
         place those itself.
         """
-        outputs = self.exec(batch)
+        with self._stage_lock if self._beside_chain(batch.node_name) else nullcontext():
+            outputs = self.exec(batch)
         laps = PhaseLaps("engine.")
         # A failed admit means no forward ran and every rid's outputs are empty,
         # so the tail has nothing to consume; the worker re-drives the step.
@@ -3608,6 +3612,20 @@ class Engine:
         lease = batch.step_context.slot_lease
         if cg_runner is None or lease is None:
             return False
+        with self._stage_lock:
+            return self._pre_plan_staged(batch, submodule_mgmt, cg_runner, lease)
+
+    def _beside_chain(self, node_name: str) -> bool:
+        """Whether a step of this node runs off the chain on resources the
+        chain plans too: its admit, plan and commit then must not overlap the
+        plan thread staging the chain's next step on them (``_stage_lock``).
+        Its arrival drops that stage, as any step the stage wasn't for does."""
+        if not self._node_lanes.get(node_name):
+            return False
+        held = self._runner.lane_held
+        return any(key not in held for key in self._submodules[node_name].resources)
+
+    def _pre_plan_staged(self, batch: ExecutingBatch, submodule_mgmt, cg_runner, lease) -> bool:
         if self._enable_nvtx:
             range_push(f"engine.pre_plan.bs{len(batch.request_ids)}")
         try:

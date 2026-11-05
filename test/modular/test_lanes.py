@@ -1102,3 +1102,28 @@ def test_a_cpu_build_that_asks_for_the_lane_fails_at_startup():
             model=Model(),
             graph_runtime=SimpleNamespace(),
         )
+
+
+@pytest.mark.parametrize("held", [frozenset(), frozenset({"kv"})])
+def test_a_step_off_the_chain_on_the_chains_resources_waits_out_the_plan_threads_stage(held):
+    """The plan thread stages the chain's next step on the node's resources while
+    the GPU thread runs a lane's step; if the lane's node plans those resources
+    too, its step must not overlap that stage. A lane that holds its resources
+    alone doesn't wait."""
+    import threading
+
+    engine = Engine.__new__(Engine)
+    engine._node_lanes = {"n": 1}
+    engine._stage_lock = threading.Lock()
+    engine._submodules = {"n": SimpleNamespace(resources={"kv": object()})}
+    engine._runner = SimpleNamespace(lane_held=held)
+    ran = threading.Event()
+    engine.exec = lambda batch: ran.set()
+    batch = SimpleNamespace(node_name="n", admit_error=None, rows_only=True, cached_rids=())
+    engine._submodules["n"].submodule = SimpleNamespace()
+    with engine._stage_lock:  # the plan thread, mid-stage
+        step = threading.Thread(target=engine.exec_and_postprocess, args=(batch,))
+        step.start()
+        assert ran.wait(0.2) is bool(held)
+    step.join(2)
+    assert ran.is_set()
