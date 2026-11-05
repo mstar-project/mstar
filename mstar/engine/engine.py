@@ -1724,6 +1724,13 @@ class Engine:
         mgmt = self._submodules[node_name]
         if mgmt.joint_comm_group.world_size > 1:
             return  # the stop must match on every rank, and NCCL in a WHILE body is untested
+        if getattr(mgmt.submodule, "ITERATION_INPUTS", None):
+            # the step speculated during a run is cut on the host for the run's asked count
+            runner.refuse_run(graph_walk, (
+                "node: its iteration inputs (and stream windows) are cut on the host for a run's asked count, "
+                "and a run on the device can end short of it"
+            ))
+            return
         policy = next(
             (p for p in (self.get_stop_policies(node_name, graph_walk) or {}).values() if p.reads_token), None,
         )

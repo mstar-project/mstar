@@ -415,6 +415,50 @@ def test_a_walk_that_drops_rows_refuses_a_prefix_chain():
     assert len(asked) == 1 and "prefix" in asked[0]
 
 
+def test_a_run_that_ends_short_repeats_its_last_iteration_in_the_columns_it_never_wrote():
+    """A run on the device can end before its count (a stop, a yield): whatever
+    reads a column's last (the step speculated meanwhile, a node's postprocess)
+    reads the last iteration that ran, not a column nothing wrote (GPU finding
+    14, review-r2 F2)."""
+    from mstar.engine.device_run import RUN_REPLAYS, DeviceRun, RunState
+
+    state = RunState(1, "t", {9}, CPU)
+    run = DeviceRun(state, {}, lambda: None, 4, torch.zeros(1, dtype=torch.long))
+    run.rows["t"] = torch.tensor([[5, 6, 1 << 40, 1 << 40]])
+    run.stops["t"] = run.rows["t"].clone()
+    state.index.fill_(2)
+    stops, rows, _ = run.results(4)
+    assert rows["t"].tolist() == [[5, 6, 6, 6]] and stops["t"].tolist() == [[5, 6, 6, 6]]
+    assert stops[RUN_REPLAYS].tolist() == [2]
+    state.index.fill_(4)
+    run.rows["t"] = torch.tensor([[1, 2, 3, 4]])
+    assert run.results(4)[1]["t"].tolist() == [[1, 2, 3, 4]]
+
+
+def test_a_walk_with_iteration_inputs_stays_off_the_device():
+    """A run on the device can end short of its count, and the step speculated
+    during it took iteration inputs cut on the host for the whole count
+    (review-r2 F2): such a walk keeps the host's loop, with the reason."""
+    from mstar.engine.engine import Engine
+
+    asked = []
+    engine = Engine.__new__(Engine)
+    engine._submodules = {"n": SimpleNamespace(
+        joint_comm_group=SimpleNamespace(world_size=1), device_stops={}, refills={}, loopback_rows=None,
+        submodule=SimpleNamespace(repeat_carry=lambda walk, signals: {}, ITERATION_INPUTS={"x": object()}),
+        run_columns={},
+    )}
+    engine.get_stop_policies = lambda node, walk: {"loop": SimpleNamespace(
+        reads_token=True, token_signal="t", eos_tokens=frozenset({9}),
+    )}
+    runner = SimpleNamespace(
+        ask_run=lambda walk, ask: asked.append(ask), refuse_run=lambda walk, why: asked.append(why),
+    )
+    engine._ask_run("n", runner, WALK, SimpleNamespace(device_stop="skip", max=4, refill_at=None), ())
+    assert len(asked) == 1 and "iteration inputs" in asked[0]
+    assert "n" in engine._submodules and WALK not in engine._submodules["n"].device_stops
+
+
 def test_a_decode_wrapper_reads_its_lengths_off_the_table():
     """A plan for longer rows serves what's there: the next step after a short run."""
     from mstar.engine.resources.attn.wrappers import FlashInferDecodeWrapper

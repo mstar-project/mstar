@@ -332,6 +332,8 @@ class DeviceRun:
         self.sealed = False
         self.inputs = inputs
         self.limit = limit
+        # a column index per iteration (``results``)
+        self._columns = torch.arange(limit, device=handle.device)
         self.launch = launch
         self.stops: dict[str, torch.Tensor] = {}
         self.rows: dict[str, torch.Tensor] = {}
@@ -352,9 +354,16 @@ class DeviceRun:
 
     def results(self, repeats: int) -> tuple[dict, dict, dict]:
         """After the launch: what ``AcceleratorGraphRunner.repeat`` returns, and
-        the iterations that ran under ``RUN_REPLAYS``."""
+        the iterations that ran under ``RUN_REPLAYS``. A run that ended short
+        of ``repeats`` (a stop, a yield, ``refill_at``) never wrote its columns
+        past them: each repeats its last written one there, so whatever reads
+        a column's last (the loop-back of the step speculated meanwhile, a
+        node's ``postprocess``) reads the last iteration that ran."""
         state = self.state
         state.replays.copy_(state.index.expand_as(state.replays))
+        ran = torch.minimum(self._columns[:repeats], state.index - 1)
+        for column in (*self.rows.values(), *self.stops.values()):
+            column[:, :repeats] = column.index_select(1, ran)
         stops = {name: column[:, :repeats] for name, column in self.stops.items()}
         stops[RUN_REPLAYS] = state.replays
         return (
