@@ -89,6 +89,8 @@ class FlashInferManager(AttentionManager):
             backend=backend
         )
         self._decode_tensor_cores = decode_tensor_cores
+        # walks asked to repeat: only tensor-core decode reads a row's length per replay
+        self._repeat_walks: set[str] = set()
         self._decode_fmha = (
             decode_fmha and dtype == torch.bfloat16 and sliding_window is None
             and fmha_decode_applies(device)
@@ -98,6 +100,14 @@ class FlashInferManager(AttentionManager):
 
     def depends_on(self):
         return {self._kv_cache_name}
+
+    def ask_repeats(self, walk: str) -> None:
+        self._repeat_walks.add(walk)
+
+    def repeat_note(self, walk: str) -> str | None:
+        if walk in self._repeat_walks and not self._decode_tensor_cores:
+            return "tensor-core decode for it"
+        return None
 
     def repeat_refusal(self, walk: str, host_step=None) -> str | None:
         """Decided from the walk's captured decode wrappers, so after capture:
@@ -111,7 +121,7 @@ class FlashInferManager(AttentionManager):
             for key, w in self._cg_plan_states.items() if key.bucket.graph_walk == walk
         ):
             return None
-        return "no captured decode kernel of it reads a row's length per replay (CUDA-core, fa3 or cuDNN decode)"
+        return "no captured decode kernel of it reads a row's length per replay (fa3 or cuDNN decode)"
 
     def max_repeats(self, step, ctx) -> int:
         """A kernel that reads the tables sees each replay's lengths. So does one
@@ -217,7 +227,7 @@ class FlashInferManager(AttentionManager):
                 workspace_buffer=workspace,
                 batch_size=num_rows,
                 accelerator_graph=True,
-                use_tensor_cores=self._decode_tensor_cores,
+                use_tensor_cores=self._decode_tensor_cores or bucket.graph_walk in self._repeat_walks,
                 **kv_kwargs,
             )
         else:

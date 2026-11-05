@@ -5313,6 +5313,7 @@ class Worker:
                     "rows": self._rows_refusal, "device stop": self._device_stop_refusal,
                     "launch loop": self._launch_refusal,
                 },
+                self.engine_manager.engine.repeat_note,
             )
             self.streams.windows = self._step_repeats.windows()
 

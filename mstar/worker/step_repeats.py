@@ -158,18 +158,23 @@ class StepRepeats:
     def settle(
         self, resident_refusal: Callable[[str, str], str | None], repeat_refusal: Callable[[str, str], str | None],
         others: Mapping[str, Callable[[str, str], str | None]] = MappingProxyType({}),
+        repeat_note: Callable[[str, str], str | None] = lambda node, walk: None,
     ) -> None:
         """Which walks may repeat, and the line for each. ``others``: each
-        further capability's refusal, asked after the walk's repeats settled."""
+        further capability's refusal, asked after the walk's repeats settled;
+        ``repeat_note``: what changed so a walk that repeats can."""
         for key in sorted(self.edges):
             limit = self.limit(key[0])
             resident = resident_refusal(*key)
             repeats = NOT_ASKED if limit == 1 else repeat_refusal(*key)
             if repeats is None:
                 self._walks.add(key)
+            on = f"on, up to {limit}"
+            if repeats is None and (note := repeat_note(*key)):
+                on = f"{on} ({note})"
             parts = [
                 f"resident {'on' if resident is None else f'off: {resident}'}",
-                f"repeats {f'on, up to {limit}' if repeats is None else f'off: {repeats}'}",
+                f"repeats {on if repeats is None else f'off: {repeats}'}",
             ]
             for name, refusal in others.items():
                 why = refusal(*key)

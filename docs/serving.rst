@@ -339,9 +339,10 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        node in its Loop must be one a run serves: a loop-back (carried between replays),
        a constant input, a Loop output, an iteration input, a stream window, or a
        per-iteration output to the client, a stream or an accumulated output. Its
-       resources can refuse the walk (``Resource.repeat_refusal``): FlashInfer decode
-       other than tensor-core (CUDA-core, fa3, cuDNN), or a sampler without the in-graph
-       scatter. They can narrow a step to 1 (``Resource.max_repeats``), for every step on
+       resources can refuse the walk (``Resource.repeat_refusal``): fa3 or cuDNN FlashInfer
+       decode, or a sampler without the in-graph scatter. A walk that asks for repeats gets
+       tensor-core captured decode wrappers whatever ``decode_tensor_cores`` says; the line
+       says so. They can narrow a step to 1 (``Resource.max_repeats``), for every step on
        the node while a request with log-probs is live. ``device_stop`` (default ``off``):
        ``skip`` captures each replay's body in a conditional node, so once every row of a run
        has stopped on a stop id its later replays skip their forward. ``drop_rows`` does that

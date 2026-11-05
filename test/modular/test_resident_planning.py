@@ -760,8 +760,8 @@ def test_a_run_keeps_a_column_of_each_per_iteration_output_the_token_column_does
     assert run_columns(edges, inline=()) == {"frame", "t"}
 
 
-class _CudaCoreDecode(FlashInferDecodeWrapper):
-    lengths_move = False
+class _LengthsFixedDecode(FlashInferDecodeWrapper):
+    lengths_move = False  # fa3 or cuDNN
 
 
 class _TensorCoreDecode(FlashInferDecodeWrapper):
@@ -773,7 +773,7 @@ def _sampler(**attrs):
 
     sampler = SamplerResource.__new__(SamplerResource)
     for name, value in {
-        "_keep_last_token": True, "_decides": True, "_history": None, "_loopback_state": {}, **attrs,
+        "_decides": True, "_history": None, **attrs,
     }.items():
         setattr(sampler, name, value)
     return sampler
@@ -793,13 +793,32 @@ def _attention(*wrappers):
     # the repetition window moves in the graph each replay, like the offset
     (lambda: _sampler(_history=object()), False),
     (lambda: _sampler(_decides=False), True),  # above one rank: scattered on the host
-    # loop-back state is carried between replays like any loop-back signal
-    (lambda: _sampler(_loopback_state={"s": object()}), False),
     (lambda: _attention(_TensorCoreDecode), False),
-    (lambda: _attention(_CudaCoreDecode, _CudaCoreDecode), True),
-], ids=["sampler", "history", "no_scatter", "loopback_state", "tensor_core", "cuda_core"])
+    (lambda: _attention(_LengthsFixedDecode, _LengthsFixedDecode), True),
+], ids=["sampler", "history", "no_scatter", "tensor_core", "lengths_fixed"])
 def test_a_resource_refuses_repeats_at_load_for_what_it_knows_at_load(resource, refuses):
     assert (resource().repeat_refusal(WALK) is not None) is refuses
+
+
+@pytest.mark.parametrize(("walk", "tensor_cores", "note"), [
+    (WALK, True, "tensor-core decode for it"),
+    ("other", False, None),  # a walk that doesn't ask keeps the config's choice
+])
+def test_a_walk_that_asks_for_repeats_gets_tensor_core_decode(monkeypatch, walk, tensor_cores, note):
+    from mstar.engine.resources.attn import flashinfer
+
+    built = {}
+    monkeypatch.setattr(flashinfer, "FlashInferDecodeWrapper", lambda **kw: built.update(kw) or object())
+    manager = FlashInferManager.__new__(FlashInferManager)
+    manager._cg_plan_states, manager._splits, manager._decode_fmha = {}, {}, False
+    manager._decode_tensor_cores, manager._repeat_walks = False, set()
+    manager._wrapper_kv_kwargs, manager._kv_config, manager._group = {}, None, None
+    manager._workspaces = SimpleNamespace(get=lambda label, slot: "workspace")
+    monkeypatch.setattr(flashinfer, "captured_page_capacity", lambda *args: 8)
+    manager.ask_repeats(WALK)
+    lease = SlotLease(slot=0, bucket=BucketKey(graph_walk=walk, bs=4, num_tokens=4))
+    manager._cg_wrapper(lease, "main", 4, False)
+    assert built["use_tensor_cores"] is tensor_cores and manager.repeat_note(walk) == note
 
 
 @pytest.mark.parametrize(("block", "why"), [

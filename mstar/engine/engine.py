@@ -943,6 +943,10 @@ class Engine:
         rows have all stopped, by their ``step_repeats: device_stop``."""
         # the Loop each (node, walk) runs in, whose counter its iteration inputs read
         self._loops = dict(looped) if isinstance(looped, Mapping) else {}
+        for node_name, walk in carried:
+            if node_name in self._submodules:
+                for resource in self._submodules[node_name].resources.values():
+                    resource.ask_repeats(walk)
         # before capture: a region inside a captured graph compiles in its warm-up
         self._compile_regions()
         ag_runners: dict[str, AcceleratorGraphRunner] = {}
@@ -3142,6 +3146,11 @@ class Engine:
                 return f"resource {key!r}: {refusal}"
         mgmt.carries[graph_walk] = carries
         return None
+
+    def repeat_note(self, node_name: str, graph_walk: str) -> str | None:
+        """What the node's resources changed so this walk can repeat, or None."""
+        notes = (r.repeat_note(graph_walk) for r in self._submodules[node_name].resources.values())
+        return "; ".join(note for note in notes if note) or None
 
     def get_max_batch_tokens(self, node_name: str, graph_walk: str) -> int | None:
         return self._chunking.max_batch_tokens(node_name, graph_walk)

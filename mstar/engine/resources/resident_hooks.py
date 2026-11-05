@@ -26,6 +26,15 @@ class ResidentHooks:
     each owner of that state keeps its own table. A resource overrides these
     only once it has one."""
 
+    def ask_repeats(self, walk: str) -> None:
+        """Before capture: the config asks steps of ``walk`` to repeat, so
+        build what serves that if there is a choice."""
+        return
+
+    def repeat_note(self, walk: str) -> str | None:
+        """After capture: what ``ask_repeats`` changed for ``walk``, for its line."""
+        return None
+
     def repeat_refusal(self, walk: str, host_step=None) -> str | None:
         """Why no step of ``walk`` may replay with no host work between
         replays, from what is fixed by the end of capture, or None if steps
