@@ -1658,7 +1658,8 @@ pool of the node keeps its own block table and lengths; positions read the pool 
 ``PositionConfig.kv_cache`` names. The worker logs one line per Loop walk saying whether
 it is resident and repeats, or which owner refused; ``knobs: resident_planning: off``
 turns it off. A resident ``preprocess`` that reads such a buffer on a branch the capture
-didn't take stops the worker. Steps of other walks, and eager steps, keep the host plan and leave the row
+didn't take stops the worker, and so does a row that declares other streams than its walk's
+capture: the tables advance every row on the walk's streams. Steps of other walks, and eager steps, keep the host plan and leave the row
 stale, so the first resident step after them writes it. The sampler takes part on its
 own: its per-request scalars (temperature, top-k, top-p, seed, penalties) become cells
 of the row, so a resident step stages none of them, while the RNG offset, the last token
@@ -1668,9 +1669,8 @@ A resident step can also stand for several iterations of its Loop (``max_step_re
 in the serving config): the host plans once and the capture replays, the token carried
 from one replay to the next by ``repeat_carry``, which ``DeviceLoopback`` supplies. Whether
 a walk may repeat is settled once, after capture, and the worker logs it per walk with the
-reason when it can't: the walk must sit in a Loop, read no streamed input, have an
-input-free step (``step_is_input_free``), a runtime token stop and its outputs on the
-device, run on one rank, and every resource of the node must answer
+reason when it can't: the walk must be resident, read no streamed input, have a runtime
+token stop and its outputs on the device, run on one rank, and every resource of the node must answer
 ``Resource.repeat_refusal`` with None. The default refuses, so a resource takes part only
 once it says how far its capture advances itself. At admit each resource can narrow a
 step with ``Resource.max_repeats``, for what only that step decides (free pages, a live

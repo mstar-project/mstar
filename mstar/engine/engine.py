@@ -2881,8 +2881,6 @@ class Engine:
         if mgmt.joint_comm_group.world_size > 1:
             # every rank would have to replay the same count, which one rank settles
             return "it runs on more than one rank"
-        if not mgmt.submodule.step_is_input_free(graph_walk):
-            return "its step reads its inputs, which a replay doesn't renew"
         if mgmt.submodule.repeat_carry(graph_walk) is None:
             return "its submodule names nothing that carries a replay's token on"
         for key, resource in mgmt.resources.items():

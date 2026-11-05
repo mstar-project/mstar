@@ -2550,7 +2550,7 @@ class KVManager(AttentionResource):
             stream = streams[s.request_id][s.label].group(group)
             sids.append(stream.page_indices.sid)
             # a step that repeats plans its last replay: every page it reaches
-            lens.append(span * ctx.repeats + stream.stored_len)
+            lens.append(ctx.run_span(span) + stream.stored_len)
             gens.append(stream.generation)
         if sink_rows:
             sink_pages = self._sink_pages

@@ -343,7 +343,7 @@ def test_the_startup_line_names_the_owner_that_refuses_each_capability(caplog, l
     engine._submodules = {node: SimpleNamespace(
         resident=SimpleNamespace(walks={WALK} - refused.keys()), resident_refusals=refused,
         joint_comm_group=SimpleNamespace(world_size=1),
-        submodule=SimpleNamespace(repeat_carry=lambda walk: ("t", "i"), step_is_input_free=lambda walk: True),
+        submodule=SimpleNamespace(repeat_carry=lambda walk: ("t", "i")),
         resources=resources,
     ) for node, resources, refused in (
         ("a", {"kv": willing}, {}), ("b", {"kv": willing, "pool": ResidentHooks()}, {}),
@@ -450,6 +450,20 @@ def test_a_step_its_resources_held_to_one_iteration_moves_its_rows_by_one():
     ))
     worker._await_admit_settled(pending)
     assert batch.loop_strides(list(rows)) in (None, [1, 1])
+
+
+def test_a_row_declaring_another_stream_than_its_walk_stops_the_worker():
+    """A resident step, and each replay of one, advances every row on the walk's
+    streams; a row whose declared label differs would be read and written on
+    the wrong stream."""
+    live, _, planner = _setup({1: 3, 2: 3})
+    _captured_step(live, planner, [1], slot=0, bs=2)
+    padded = (1, 2)
+    lease = SlotLease(slot=0, bucket=BucketKey(graph_walk=WALK, bs=2, num_tokens=2))
+    ctx = StepContext(request_ids=padded, graph_walk=WALK, slot=0, capture=False, slot_lease=lease, repeats=4)
+    step = SubmoduleStep(steps={}, segments=[Segment(1, "main", 1), Segment(2, "aux", 1)])
+    with pytest.raises(SystemExit, match="row 2 declares 'aux'"):
+        planner.plan(step, ctx)
 
 
 def test_a_row_a_host_step_moved_does_not_rewind_on_each_replay():

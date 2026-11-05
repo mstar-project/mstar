@@ -461,7 +461,7 @@ class ResidentPlanner:
                 return
             # the step it was for never ran, or something ran first
             self._restore(staged)
-        plan = self._build(rids, key, self._streams[lease.bucket], ctx)
+        plan = self._build(rids, key, self._streams[lease.bucket], step, ctx)
         ctx.resident_plan = plan
         if ctx.is_preplan:
             self._staged = plan
@@ -486,7 +486,9 @@ class ResidentPlanner:
         if buffers is not None:
             buffers.staged = None
 
-    def _build(self, rids: tuple[int, ...], key: tuple, streams: Mapping[str, ResidentStream], ctx) -> ResidentPlan:
+    def _build(
+        self, rids: tuple[int, ...], key: tuple, streams: Mapping[str, ResidentStream], step: SubmoduleStep, ctx,
+    ) -> ResidentPlan:
         lease = ctx.slot_lease
         laps = PhaseLaps(f"{ctx.plan_phase}.resident.")
         with self._lock:
@@ -515,6 +517,9 @@ class ResidentPlanner:
             refreshed -= taken
             self._last_read[slots] = seq
             rows = [(rid, self._slot_of[rid]) for rid in taken]
+        if taken and (refusal := _row_refusal(self._keys, step, streams, taken)) is not None:
+            # the tables advance each row on its walk's streams, every replay
+            raise SystemExit(f"resident walk {ctx.graph_walk!r} on {self.node}: {refusal}")
         plan = ResidentPlan(
             key, rids, slots, seq, self._commits, ResidentWrites(streams, ctx.repeats), taken, refreshed,
         )
@@ -667,6 +672,23 @@ def declared_streams(keys: Collection[str], step: SubmoduleStep) -> dict[str, Re
         segments = _segments(key, step)
         streams[key] = ResidentStream(segments[0].label, reads=segments[0].span == 0)
     return streams
+
+
+def _row_refusal(
+    keys: Collection[str], step: SubmoduleStep, streams: Mapping[str, ResidentStream], rids: Collection[int],
+) -> str | None:
+    """Why a row of ``rids`` in ``step`` declares other than its walk's
+    ``streams``. Asked of the rows a step writes whole, which every row is once."""
+    for key in keys:
+        want = streams[key]
+        span = 0 if want.reads else 1
+        for seg in _segments(key, step):
+            if seg.request_id in rids and (seg.label != want.label or seg.span != span):
+                return (
+                    f"row {seg.request_id} declares {seg.label!r} at span {seg.span} on resource {key!r}, "
+                    f"not its walk's {want.label!r} at span {span}"
+                )
+    return None
 
 
 def _segments(key: str, step: SubmoduleStep) -> list:
