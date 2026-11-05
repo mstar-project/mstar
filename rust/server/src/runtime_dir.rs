@@ -50,59 +50,104 @@ fn passwd_name() -> Option<String> {
 }
 
 /// Create `path` with mode 0700 if it is missing, then require a real
-/// directory owned by this user and not writable by group or others.
+/// directory owned by this user and leave it at mode 0700.
 ///
 /// The default locations sit in a shared `/tmp` under predictable names, so an
-/// existing directory is only accepted after this check; anything else is a
-/// `PermissionDenied` error naming the path. Only the final component has to
-/// be ours; missing parents are created 0700 too, so a parent that is itself a
-/// runtime dir (a socket dir holding the upload dir) passes its own check under
-/// any umask.
+/// existing directory is only accepted after this check. A symlink, a
+/// non-directory and a directory owned by anyone else are a `PermissionDenied`
+/// error naming the path; a real directory of our own is tightened to 0700
+/// instead of being refused, because the dirs earlier releases created with
+/// `create_dir_all` are 0775 under Ubuntu's default umask 002 and refusing
+/// those would stop every upgrade. Tightening it also keeps the sockets and
+/// files written inside from being reachable by the group under that umask.
+/// Only the final component has to be ours; missing parents are created 0700
+/// too, so a parent that is itself a runtime dir (a socket dir holding the
+/// upload dir) passes its own check under any umask.
+///
+/// The check and the `fchmod` both run on one descriptor opened
+/// `O_DIRECTORY | O_NOFOLLOW`, so the mode is only ever changed on the very
+/// object whose owner was read: there is no window in which the name could be
+/// pointed at something else. `O_NOFOLLOW` covers the final component only, as
+/// `lstat` did; a parent that untrusted accounts can write is still theirs to
+/// redirect, which is why only trusted accounts should be able to write one.
 pub fn ensure_private_dir(path: &Path) -> io::Result<PathBuf> {
     // SAFETY: geteuid has no preconditions and cannot fail.
     ensure_private_dir_for(path, unsafe { libc::geteuid() })
 }
 
+/// Open the final component itself: never a symlink at it, never a non-dir.
+fn open_dir(path: &Path) -> io::Result<std::fs::File> {
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+}
+
 fn ensure_private_dir_for(path: &Path, uid: u32) -> io::Result<PathBuf> {
-    // Rebuilding from components drops a trailing slash, without which lstat
-    // would follow a symlink.
+    // Rebuilding from components drops a trailing slash, without which the
+    // open would follow a symlink.
     let path: PathBuf = path.components().collect();
-    let meta = match std::fs::symlink_metadata(&path) {
-        Ok(m) => m,
+    let dir = match open_dir(&path) {
+        Ok(f) => f,
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            let uncreatable =
+                |e: &io::Error| format!("it could not be created ({})", reason(e));
             if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-                DirBuilder::new().recursive(true).mode(0o700).create(parent)?;
+                DirBuilder::new().recursive(true).mode(0o700).create(parent)
+                    .map_err(|e| refusal(&path, &uncreatable(&e), uid))?;
             }
             match DirBuilder::new().mode(0o700).create(&path) {
-                Err(e) if e.kind() != io::ErrorKind::AlreadyExists => return Err(e),
+                Err(e) if e.kind() != io::ErrorKind::AlreadyExists => {
+                    return Err(refusal(&path, &uncreatable(&e), uid));
+                }
                 _ => {}
             }
-            std::fs::symlink_metadata(&path)?
+            open_dir(&path).map_err(|e| refusal(&path, &why_unopenable(&path, &e), uid))?
         }
-        Err(e) => return Err(e),
+        Err(e) => return Err(refusal(&path, &why_unopenable(&path, &e), uid)),
     };
-    let kind = meta.file_type();
-    let mode = meta.permissions().mode() & 0o7777;
-    let problem = if kind.is_symlink() {
-        "it is a symlink".to_string()
-    } else if !kind.is_dir() {
-        "it is not a directory".to_string()
-    } else if meta.uid() != uid {
-        format!("it is owned by uid {}", meta.uid())
-    } else if mode & 0o022 != 0 {
-        format!("its mode is {mode:o}")
-    } else {
-        return Ok(path);
-    };
-    Err(io::Error::new(
+    let meta = dir.metadata()?;
+    if meta.uid() != uid {
+        return Err(refusal(&path, &format!("it is owned by uid {}", meta.uid()), uid));
+    }
+    if meta.permissions().mode() & 0o7777 != 0o700 {
+        dir.set_permissions(std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(path)
+}
+
+/// Why the open failed, for the refusal text. A second look at the path is
+/// racy, so it only ever words a refusal already decided on the open itself.
+/// `O_DIRECTORY | O_NOFOLLOW` reports a symlink as ENOTDIR, so the
+/// `symlink_metadata` comes first to tell the two apart.
+fn why_unopenable(path: &Path, err: &io::Error) -> String {
+    let kind = std::fs::symlink_metadata(path).ok().map(|m| m.file_type());
+    if kind.is_some_and(|k| k.is_symlink()) || err.raw_os_error() == Some(libc::ELOOP) {
+        return "it is a symlink".to_string();
+    }
+    if kind.is_some_and(|k| !k.is_dir()) || err.raw_os_error() == Some(libc::ENOTDIR) {
+        return "it is not a directory".to_string();
+    }
+    format!("it could not be opened ({})", reason(err))
+}
+
+/// The OS reason alone, as Python's `exc.strerror` gives it: `Display` adds
+/// " (os error N)", which the twin's text does not have.
+fn reason(err: &io::Error) -> String {
+    let text = err.to_string();
+    text.split(" (os error ").next().unwrap_or(&text).to_string()
+}
+
+fn refusal(path: &Path, problem: &str, uid: u32) -> io::Error {
+    io::Error::new(
         io::ErrorKind::PermissionDenied,
         format!(
             "refusing {}: {problem}. It must be a directory owned by this user \
-             (uid {uid}) and not writable by group or others; remove it, or pass \
-             another path with --socket-path-prefix / --upload-dir.",
+             (uid {uid}); remove it, or pass another path with \
+             --socket-path-prefix / --upload-dir.",
             path.display()
         ),
-    ))
+    )
 }
 
 /// Write `data` to a new file at `path`, mode 0600; an existing file or
@@ -204,37 +249,62 @@ mod tests {
     #[test]
     fn foreign_owner_is_refused() {
         let root = scratch("owner");
+        // 0775 as `create_dir_all` under umask 002 leaves it: ours would be
+        // tightened, another uid's is refused and left alone.
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o775)).unwrap();
         let err = ensure_private_dir_for(&root, uid() + 1).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
         let msg = err.to_string();
         assert!(msg.contains(&format!("owned by uid {}", uid())), "{msg}");
         assert!(msg.contains("--upload-dir"), "{msg}");
+        // the owner is read from the descriptor the chmod would use, so a dir
+        // we do not own is never chmoded
+        assert_eq!(mode_of(&root), 0o775);
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
         std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
-    fn symlink_is_refused_even_with_a_trailing_slash() {
+    fn symlink_is_refused_even_with_a_trailing_slash_and_pointing_at_our_own_dir() {
         let root = scratch("link");
         let target = root.join("target");
         DirBuilder::new().mode(0o700).create(&target).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o775)).unwrap();
         let link = root.join("link");
         symlink(&target, &link).unwrap();
         let mut with_slash = link.clone().into_os_string();
         with_slash.push("/");
-        let err = ensure_private_dir(Path::new(&with_slash)).unwrap_err();
-        assert!(err.to_string().contains("is a symlink"), "{err}");
+        for path in [link.clone().into_os_string(), with_slash] {
+            let err = ensure_private_dir(Path::new(&path)).unwrap_err();
+            assert!(err.to_string().contains("is a symlink"), "{err}");
+        }
+        // the target is ours and would be tightened on its own name; through
+        // the link nothing is opened, so it is untouched
+        assert_eq!(mode_of(&target), 0o775);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The migration case: `create_dir_all` under umask 002 left 0775 dirs, and
+    /// refusing those would stop the first start after this lands.
+    #[test]
+    fn a_dir_we_own_is_tightened_to_0700_whatever_its_mode() {
+        let root = scratch("mode");
+        for mode in [0o777, 0o775, 0o770, 0o755, 0o702, 0o2775] {
+            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(mode)).unwrap();
+            assert_eq!(ensure_private_dir(&root).unwrap(), root, "{mode:o}");
+            assert_eq!(mode_of(&root), 0o700, "{mode:o}");
+        }
         std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
-    fn group_or_world_writable_dir_is_refused() {
-        let root = scratch("mode");
-        for mode in [0o777, 0o770, 0o702] {
-            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(mode)).unwrap();
-            let err = ensure_private_dir(&root).unwrap_err();
-            assert!(err.to_string().contains(&format!("mode is {mode:o}")), "{err}");
-        }
-        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+    fn a_non_directory_is_refused() {
+        let root = scratch("notdir");
+        let file = root.join("plain");
+        std::fs::write(&file, b"x").unwrap();
+        let err = ensure_private_dir(&file).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        assert!(err.to_string().contains("is not a directory"), "{err}");
         std::fs::remove_dir_all(&root).unwrap();
     }
 

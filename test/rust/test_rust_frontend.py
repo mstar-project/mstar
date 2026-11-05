@@ -512,11 +512,12 @@ def test_upload_filename_traversal_is_contained(tmp_path):
 
 
 @pytest.mark.parametrize("which", ["upload", "bridge"])
-@pytest.mark.parametrize("kind", ["symlink", "mode_777"])
+@pytest.mark.parametrize("kind", ["symlink", "not_a_dir"])
 def test_server_refuses_a_shared_runtime_dir(tmp_path, which, kind):
     """The frontend exits at startup, naming the path, when its upload or
-    bridge socket dir is a symlink or writable by others, as the Python
-    server does."""
+    bridge socket dir is a symlink or not a directory, as the Python server
+    does. The symlink points at a directory of our own, which would be
+    accepted under its own name."""
     import subprocess
 
     good = {d: tmp_path / d for d in ("upload", "bridge")}
@@ -526,8 +527,7 @@ def test_server_refuses_a_shared_runtime_dir(tmp_path, which, kind):
     if kind == "symlink":
         bad.symlink_to(good[which])
     else:
-        bad.mkdir()
-        bad.chmod(0o777)
+        bad.write_bytes(b"not a dir")
     dirs = {**good, which: bad}
     proc = subprocess.run(
         [BINARY, "qwen3_omni", str(_free_port()), f"{dirs['bridge']}/", f"{dirs['upload']}/"],
@@ -535,6 +535,36 @@ def test_server_refuses_a_shared_runtime_dir(tmp_path, which, kind):
     assert proc.returncode == 1, proc.stderr
     assert f"refusing {bad}: " in proc.stderr
     assert "--upload-dir" in proc.stderr
+
+
+def test_server_tightens_an_upload_dir_an_earlier_release_left_0775(tmp_path):
+    """``mstar-server``'s half of #617's upgrade gap: before this it refused
+    the 0775 directories the old ``create_dir_all`` left under umask 002, so
+    the first start after the change failed. Now it chmods them 0700. The
+    bridge socket dir is the same code path, and the Python bridge thread
+    checks that one too, so only the upload dir is asserted here."""
+    import os
+    import stat
+    import subprocess
+
+    dirs = {d: tmp_path / d for d in ("upload", "bridge")}
+    for d in dirs.values():
+        d.mkdir(mode=0o700)
+    dirs["upload"].chmod(0o775)
+    port = _free_port()
+    proc = subprocess.Popen([BINARY, "qwen3_omni", str(port), f"{dirs['bridge']}/", f"{dirs['upload']}/"])
+    try:
+        stub = _StubAPIServer()
+        bridge = RustFrontendBridge(stub, str(dirs["bridge"]))
+        threading.Thread(target=bridge.run, daemon=True).start()
+        try:
+            assert _wait_healthy(port), "the server did not start on a 0775 upload dir"
+            assert stat.S_IMODE(os.lstat(dirs["upload"]).st_mode) == 0o700
+        finally:
+            bridge.stop()
+    finally:
+        proc.terminate()
+        proc.wait(timeout=10)
 
 
 def _swap_upload_dir(upload_dir: str) -> None:

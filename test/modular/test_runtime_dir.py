@@ -1,8 +1,10 @@
 """The IPC socket directory and the upload directory default to predictable
 names under the shared ``/tmp``. Startup must refuse one that already exists
-as a symlink, belongs to another uid, or is writable by group or others; a
-fresh one is created 0700. Uploaded media is written to new 0600 files, never
-through an existing file at the name.
+as a symlink, as a non-directory, or under another uid; a fresh one is created
+0700, and an existing one of our own is tightened to 0700 rather than refused,
+because earlier releases made these directories with ``makedirs`` and left
+them 0775 under Ubuntu's default umask 002. Uploaded media is written to new
+0600 files, never through an existing file at the name.
 
 Another uid's directory is simulated by reporting a different euid, since a
 test cannot chown without root.
@@ -26,22 +28,23 @@ def _mode(path) -> int:
     return stat.S_IMODE(os.lstat(path).st_mode)
 
 
-@pytest.fixture(params=["other_uid", "symlink", "mode_777"])
+@pytest.fixture(params=["other_uid", "symlink", "not_a_dir"])
 def bad_dir(request, tmp_path, monkeypatch):
     """A directory startup must refuse, as a path with the trailing slash the
-    ``mstar serve`` defaults carry."""
+    ``mstar serve`` defaults carry. The symlink points at a directory of our
+    own, which would be accepted under its own name: it is the name that is
+    refused, so the target is never opened or tightened."""
     path = tmp_path / "run"
     if request.param == "symlink":
         target = tmp_path / "elsewhere"
         target.mkdir(mode=0o700)
         path.symlink_to(target)
+    elif request.param == "not_a_dir":
+        path.write_bytes(b"not a dir")
     else:
-        path.mkdir(mode=0o700)
-        if request.param == "mode_777":
-            path.chmod(0o777)
-        else:
-            uid = os.geteuid()
-            monkeypatch.setattr(os, "geteuid", lambda: uid + 1)
+        path.mkdir(mode=0o775)
+        uid = os.geteuid()
+        monkeypatch.setattr(os, "geteuid", lambda: uid + 1)
     return f"{path}/"
 
 
@@ -164,14 +167,92 @@ def test_a_parent_created_for_a_nested_dir_passes_its_own_check(umask, tmp_path)
 
 def test_a_subdir_of_a_shared_mount_is_accepted(umask, tmp_path):
     """A volume mounted group-writable and setgid (e.g. Kubernetes ``fsGroup``)
-    is refused as the directory itself, but works as the parent of one."""
+    works as the parent of the directory. Passed as the directory itself it is
+    tightened to 0700, which is why the docs say to pass a subdirectory: the
+    mount would stop being shared. A restart finds the subdirectory already
+    there and keeps it 0700, setgid included."""
     mount = tmp_path / "mount"
     mount.mkdir()
     mount.chmod(0o2777)
-    with pytest.raises(PermissionError, match="refusing"):
-        ensure_private_dir(mount)
     made = ensure_private_dir(mount / "uploads")
-    assert _mode(made) & 0o077 == 0
+    assert _mode(made) == 0o700
+    assert ensure_private_dir(mount / "uploads") == made and _mode(made) == 0o700
+    assert ensure_private_dir(mount) == mount and _mode(mount) == 0o700
+
+
+def test_a_dir_we_own_is_tightened_to_0700_whatever_its_mode(umask, tmp_path):
+    """The upgrade case: before this, main made these directories with
+    ``makedirs``/``create_dir_all``, which Ubuntu's default umask 002 leaves at
+    0775. Refusing those would stop the first start after this lands, so a real
+    directory of our own is chmoded 0700 instead."""
+    for mode in (0o775, 0o777, 0o770, 0o755, 0o702, 0o2775):
+        path = tmp_path / f"m{mode:o}"
+        path.mkdir()
+        path.chmod(mode)
+        assert ensure_private_dir(path) == path, f"{mode:o}"
+        assert _mode(path) == 0o700, f"{mode:o}"
+
+
+def test_a_dir_another_uid_owns_is_refused_without_being_chmoded(tmp_path, monkeypatch):
+    """The owner is read from the descriptor the chmod would use, so the chmod
+    can never reach a directory that is not ours: no stat-then-chmod window."""
+    path = tmp_path / "theirs"
+    path.mkdir(mode=0o775)
+    uid = os.geteuid()
+    monkeypatch.setattr(os, "geteuid", lambda: uid + 1)
+    with pytest.raises(PermissionError, match=f"owned by uid {uid}"):
+        ensure_private_dir(path)
+    assert _mode(path) == 0o775
+
+
+def test_a_symlink_to_a_dir_we_own_is_refused_without_tightening_its_target(tmp_path):
+    """``O_DIRECTORY | O_NOFOLLOW`` never opens through the name, so the target
+    is not chmoded even though it would be accepted under its own name."""
+    target = tmp_path / "target"
+    target.mkdir(mode=0o775)
+    link = tmp_path / "link"
+    link.symlink_to(target)
+    for path in (str(link), f"{link}/"):
+        with pytest.raises(PermissionError, match="it is a symlink"):
+            ensure_private_dir(path)
+    assert _mode(target) == 0o775
+    assert ensure_private_dir(target) == target and _mode(target) == 0o700
+
+
+def test_the_entry_points_start_on_dirs_an_earlier_release_left_0775(tmp_path, monkeypatch):
+    """#617's upgrade gap, on the three paths that refused: the API server, the
+    communicator and the conductor, on directories made exactly as main made
+    them (``makedirs(exist_ok=True)``) under umask 002. The Rust frontend's own
+    case is ``mstar-server`` in ``test/rust/test_rust_frontend.py``."""
+    pytest.importorskip("mstar_rust")
+    from mstar.api_server import entrypoint
+    from mstar.communication.rust_communicator import RustZMQCommunicator
+
+    old = os.umask(0o002)
+    try:
+        sockets = tmp_path / "mstar_user_8000"
+        uploads = tmp_path / "mstar_uploads_user"
+        os.makedirs(sockets, exist_ok=True)
+        uploads.mkdir(parents=True, exist_ok=True)
+        assert _mode(sockets) == _mode(uploads) == 0o775
+
+        monkeypatch.setattr(entrypoint, "PreprocessWorker", lambda **_: (_ for _ in ()).throw(_ReachedError))
+        with pytest.raises(_ReachedError):
+            entrypoint.APIServer(upload_dir=f"{uploads}/")
+        assert _mode(uploads) == 0o700
+
+        comm = RustZMQCommunicator(DEPLOYMENT_ANCHOR_ENTITY, push_ids=[], protocol=CommProtocol.IPC,
+                                   ipc_socket_path_prefix=f"{sockets}/")
+        try:
+            assert _mode(sockets) == 0o700
+            # the reason to tighten rather than accept: libzmq makes its socket
+            # files under the umask, so in a 0775 dir the group could write them
+            socks = [sockets / n for n in os.listdir(sockets) if n.endswith(".ipc")]
+            assert socks and all(_mode(s) & 0o022 for s in socks)
+        finally:
+            os.close(comm._deployment_lock_fd)
+    finally:
+        os.umask(old)
 
 
 def test_upload_files_are_0600(umask, tmp_path):
@@ -427,7 +508,7 @@ def test_the_upload_dir_default_holds_the_user_name_only_when_short_and_ascii(mo
     assert socket_prefix.default_upload_dir() == f"/tmp/mstar_uploads_{name if kept else os.getuid()}/"
 
 
-@pytest.fixture(params=["other_uid", "symlink", "mode_777"])
+@pytest.fixture(params=["other_uid", "symlink", "not_a_dir"])
 def swapped_upload_dir(request, tmp_path, monkeypatch):
     """An upload dir that passed the startup check, then was removed (a /tmp
     cleaner) and recreated by someone else; returns (path, where a symlink
@@ -439,18 +520,22 @@ def swapped_upload_dir(request, tmp_path, monkeypatch):
         target = tmp_path / "theirs"
         target.mkdir(mode=0o700)
         path.symlink_to(target)
+    elif request.param == "not_a_dir":
+        path.write_bytes(b"not a dir")
     else:
-        path.mkdir(mode=0o700)
-        if request.param == "mode_777":
-            path.chmod(0o777)
-        else:
-            uid = os.geteuid()
-            monkeypatch.setattr(os, "geteuid", lambda: uid + 1)
+        path.mkdir(mode=0o775)
+        uid = os.geteuid()
+        monkeypatch.setattr(os, "geteuid", lambda: uid + 1)
     return path, target
 
 
 def _written(path, target) -> list:
-    return sorted(os.listdir(target if target is not None else path))
+    """What the refused upload left at the directory's name: its entries, or
+    nothing for the non-directory planted there, which keeps its own bytes."""
+    where = target if target is not None else path
+    if not where.is_dir():
+        return [] if where.read_bytes() == b"not a dir" else ["written through"]
+    return sorted(os.listdir(where))
 
 
 def test_generate_rechecks_the_upload_dir_per_request(swapped_upload_dir, monkeypatch):
