@@ -540,8 +540,9 @@ class KVManager(AttentionResource):
     # this pool's resident tables, once a node's planner bound them
     _resident: "KVResidentTables | None" = None
     # tokens a commit can run ahead of what has been read back and keyed: the
-    # run in flight and the one being committed, past the one a step always has
+    # extra iterations of the step before it, still in flight, and its own
     _run_lag: int = 0
+    _prev_extra: int = 0
 
     def __init__(
         self,
@@ -3252,8 +3253,7 @@ class KVManager(AttentionResource):
             sink = step.sink
             rows = () if ctx.capture else step.segments
             repeats = ctx.repeats
-            # a repeated step's stored spans are `repeats` of what it declared
-            self._run_lag = max(self._run_lag, 2 * (repeats - 1))
+            self._run_lag, self._prev_extra = self._prev_extra + repeats - 1, repeats - 1
             if rows and repeats == 1 and self._index is None and not retention and not windows and not _DEBUG_ASSERTS:
                 # nothing to index, adopt, retain or check: the arena moves
                 # every row's counts in one call, and hands back the ones it can't

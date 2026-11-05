@@ -99,10 +99,10 @@ def _ingest(kv: KVManager, rid: str, prompt: list[int] = PROMPT, decode: int = 0
     ))
 
 
-def _step(kv: KVManager, rid: str, span: int) -> None:
+def _step(kv: KVManager, rid: str, span: int, repeats: int = 1) -> None:
     step = KVStep(segments=(Segment(rid, "main", span),))
     ctx = StepContext(
-        request_ids=(rid,), graph_walk=WALK, slot=0, capture=False,
+        request_ids=(rid,), graph_walk=WALK, slot=0, capture=False, repeats=repeats,
     )
     assert kv.admit(step, ctx).ok
     kv.plan(step, ctx)
@@ -120,8 +120,16 @@ def _indexed(kv: KVManager) -> int:
 # ── what the chain never saw ────────────────────────────────────────────
 
 
-def test_an_image_after_the_text_leaves_the_chain_at_the_text():
+@pytest.mark.parametrize("earlier_run", [False, True], ids=["alone", "after_a_run"])
+def test_an_image_after_the_text_leaves_the_chain_at_the_text(earlier_run):
+    """A step that repeats commits ahead of its rows' chains by its run, which
+    loosens the check for the commit after it and no later one."""
     kv = _manager()
+    if earlier_run:
+        _ingest(kv, "r1", prompt=list(range(200, 236)), decode=30)
+        _step(kv, "r1", 36)
+        _step(kv, "r1", 1, repeats=8)
+    before = _indexed(kv)
     _ingest(kv, "r0", decode=30, image=IMAGE)
     _step(kv, "r0", len(PROMPT))
     # the image is the last thing prefilled, so its step samples the first token
@@ -134,7 +142,7 @@ def test_an_image_after_the_text_leaves_the_chain_at_the_text():
         _sampled(kv, "r0", token)
     kv.assert_pages_conserved()
 
-    assert _indexed(kv) == len(PROMPT) // PAGE_SIZE, (
+    assert _indexed(kv) - before == len(PROMPT) // PAGE_SIZE, (
         "a page holding the image was filed under a key over sampled text"
     )
     assert kv._streams["r0"]["main"].chain is None, (
