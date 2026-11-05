@@ -642,8 +642,9 @@ class UCF101Dataset(BaseDataset):
 # and meta/episodes gives each episode's file and time range per camera.
 # Camera keys and their dtypes are declared in meta/info.json.
 # Language instructions live in meta/tasks.parquet, indexed by task_index.
-# The parquet only carries: action, observation.state, task_index,
-# episode_index, frame_index, timestamp.
+# The data parquet carries action, observation.state, task_index,
+# episode_index and frame_index (and timestamp, next.reward, next.done and
+# index, which the loader doesn't read).
 # ---------------------------------------------------------------------------
 
 
