@@ -502,3 +502,24 @@ def test_a_request_arriving_while_a_run_streams_its_tokens_still_ends_the_run(mo
         )
     )
     assert yielded == ["n"]
+
+
+@pytest.mark.parametrize("on_device, inline", [({"text", "h"}, {"text": "new_token"}), ({"text"}, {})])
+def test_a_runs_client_copy_rides_the_token_column_only_when_its_landing_does(on_device, inline):
+    """A landing rides inline only when every output stays on the device; else
+    the client's copy is routed like any per-iteration output, and a run that
+    kept no column of it would hand on one item for all its replays (Canary
+    at N>1 lost pieces of words on the GPU)."""
+    from mstar.graph.special_destinations import EMIT_TO_CLIENT
+    from mstar.worker.worker import Worker
+
+    worker = Worker.__new__(Worker)
+    worker._graph_runtime = SimpleNamespace(supports_inline_emit=True)
+    worker._device_loopback = {}
+    edges = [SimpleNamespace(name="text", next_node=EMIT_TO_CLIENT), SimpleNamespace(name="h", next_node="n")]
+    worker._walk_graphs = {WALK: SimpleNamespace(get_nodes=lambda: {"n": SimpleNamespace(outputs=edges)})}
+    engine = SimpleNamespace(
+        device_loopback_signals=lambda node, walk: on_device,
+        inline_client_signals=lambda node, walk: {"text": "new_token"},
+    )
+    assert worker._rides_inline(engine, "n", WALK) == inline

@@ -3094,10 +3094,7 @@ class Worker:
         edges = self._step_repeats.edges[(node_name, graph_walk)]
         refusal = edge_refusal(edges, engine.streamed_iteration_inputs(node_name), node_name in self.parallel_nodes)
         if refusal is None:
-            # the client's copy of a token rides the step's token column
-            inline = (
-                engine.inline_client_signals(node_name, graph_walk) if self._graph_runtime.supports_inline_emit else {}
-            )
+            inline = self._rides_inline(engine, node_name, graph_walk)
             refusal = engine.keep_run_columns(node_name, graph_walk, run_columns(edges, inline))
         return refusal if refusal is not None else engine.repeat_refusal(node_name, graph_walk, loop_back(edges))
 
@@ -3111,11 +3108,22 @@ class Worker:
 
     def _ask_run_columns(self, node_name: str, graph_walk: str) -> None:
         engine = self.engine_manager.get_engine(node_name)
-        inline = (
-            engine.inline_client_signals(node_name, graph_walk) if self._graph_runtime.supports_inline_emit else {}
-        )
         edges = self._step_repeats.edges[(node_name, graph_walk)]
+        inline = self._rides_inline(engine, node_name, graph_walk)
         engine.keep_run_columns(node_name, graph_walk, run_columns(edges, inline))
+
+    def _rides_inline(self, engine, node_name: str, graph_walk: str) -> dict[str, str]:
+        """The client signals whose copy rides a landing's token column, which
+        a run then keeps no column of: none unless the walk's landing rides
+        inline, every output staying on the device (``_all_on_device``).
+        Otherwise the client copy is routed like any per-iteration output,
+        and a run needs a column of it a replay."""
+        if not self._graph_runtime.supports_inline_emit:
+            return {}
+        signals = [edge.name for edge in self._walk_graphs[graph_walk].get_nodes()[node_name].outputs]
+        if not self._all_on_device(engine, node_name, graph_walk, signals):
+            return {}
+        return engine.inline_client_signals(node_name, graph_walk)
 
     def _stream_refusal(self, node_name: str, graph_walk: str) -> str | None:
         """Why this walk's runs don't send their tokens as they land, or None,
