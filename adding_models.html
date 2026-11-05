@@ -1384,7 +1384,7 @@ workspace, taken at build.
 (default <code class="docutils literal notranslate"><span class="pre">True</span></code>) runs one-token decode rows on FlashInfer’s tensor-core
 kernel; <code class="docutils literal notranslate"><span class="pre">False</span></code> picks the CUDA-core decode kernel, which can be faster for
 MHA and narrow GQA (few query heads per KV head). Measure before changing it:
-Whisper and Qwen3-ASR declare <code class="docutils literal notranslate"><span class="pre">False</span></code>. <code class="docutils literal notranslate"><span class="pre">decode_fmha</span></code> (default <code class="docutils literal notranslate"><span class="pre">False</span></code>) runs
+Whisper, Qwen3-ASR and Qwen3-TTS declare <code class="docutils literal notranslate"><span class="pre">False</span></code>. <code class="docutils literal notranslate"><span class="pre">decode_fmha</span></code> (default <code class="docutils literal notranslate"><span class="pre">False</span></code>) runs
 captured one-token decode rows on FlashInfer’s trtllm-gen fmha kernel on Blackwell,
 with no FlashInfer plan per step; a geometry trtllm-gen has no kernel for keeps
 the paged kernel, with a warning. Eager steps and prompt rows stay on the paged
