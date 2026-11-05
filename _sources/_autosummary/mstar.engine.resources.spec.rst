@@ -14,6 +14,7 @@ mstar.engine.resources.spec
    .. autosummary::
    
       apply_yaml_overrides
+      check_sizes
       derive_specs
       resolve_spec_dependencies
       spec_dependency_problems
