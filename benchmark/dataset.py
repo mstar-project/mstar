@@ -637,11 +637,11 @@ class UCF101Dataset(BaseDataset):
 # ---------------------------------------------------------------------------
 # Robotics – lerobot/droid_100 (DROID)
 #
-# lerobot v2 format: images are NOT parquet columns.  Each episode's frames
-# for each camera are stored as a separate mp4 at:
-#   videos/{video_key}/episode_{episode_id:06d}.mp4
+# lerobot v3.0 format: images are NOT parquet columns.  Each camera's frames
+# for all 100 episodes are in one mp4 (videos/{video_key}/chunk-000/file-000.mp4),
+# and meta/episodes gives each episode's file and time range per camera.
 # Camera keys and their dtypes are declared in meta/info.json.
-# Language instructions live in meta/tasks.jsonl, indexed by task_index.
+# Language instructions live in meta/tasks.parquet, indexed by task_index.
 # The parquet only carries: action, observation.state, task_index,
 # episode_index, frame_index, timestamp.
 # ---------------------------------------------------------------------------
@@ -714,7 +714,7 @@ def _decode_frames_to_png_and_video(
 class DROIDDataset(BaseDataset):
     """DROID robotics dataset for evaluating pi0.5 and V-JEPA 2-AC.
 
-    Uses ``lerobot/droid_100`` — a 100-episode subset (~4 GB) of the DROID
+    Uses ``lerobot/droid_100`` — a 100-episode subset (0.46 GB) of the DROID
     robot-manipulation dataset.  The dataset is in lerobot v3.0 format: images
     are stored in mp4 files (one series per camera) that each hold many
     episodes, and ``meta/episodes`` says where each episode is.
@@ -802,7 +802,7 @@ class DROIDDataset(BaseDataset):
             for row in _pd.read_parquet(f).to_dict("records")
         }
 
-        # Load language instructions from meta/tasks.parquet (lerobot v2).
+        # Load language instructions from meta/tasks.parquet (lerobot v3.0).
         tasks: dict[int, str] = {}
         try:
             tasks = _task_strings(_pd.read_parquet(_dl("meta/tasks.parquet")))
