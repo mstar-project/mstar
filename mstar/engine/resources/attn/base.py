@@ -18,7 +18,6 @@ from mstar.engine.resources.attn.wrappers import (
     FlashInferDecodeWrapper,
     FlashInferPrefillWrapper,
     PagedKernel,
-    WholeRowsKernel,
 )
 from mstar.engine.resources.base import AttentionResource, EngineResourceInfo
 from mstar.engine.resources.context_parallel import (
@@ -27,7 +26,6 @@ from mstar.engine.resources.context_parallel import (
     SPPlacement,
     TPContextParallelWrapper,
     TPPlacement,
-    ZigzagWrapper,
 )
 from mstar.engine.resources.kv.config import KVConfig, KVGroup, PagedKVConfig, RingKVConfig
 from mstar.engine.resources.kv.keys import fingerprint
@@ -35,7 +33,12 @@ from mstar.engine.resources.sequence_shard import SequenceShard, check_shard_pla
 from mstar.platforms import current_platform
 
 if TYPE_CHECKING:
-    from mstar.engine.resources.context_parallel import ContextParallel, ContextParallelWrapper, OwnTokensKernel
+    from mstar.engine.resources.context_parallel import (
+        ContextParallel,
+        ContextParallelWrapper,
+        OwnTokensKernel,
+        ShareCapture,
+    )
 
 logger = logging.getLogger(__name__)
 _BACKEND_KV_CONFIG: dict[AttnBackend, type[KVConfig]] = {
@@ -357,12 +360,11 @@ class AttentionManager(AttentionResource):
 
 class PlacedAttention(AttentionManager):
     """What a backend supplies to attend a placed pool, the one object placed attention builds its
-    kernels from: its paged kernel, its whole-rows kernel, and the kernel a share of the own tokens
-    runs on, a paged backend's one-slot pages unless it says otherwise. The rest (the split of the
-    own tokens, the exchanges, the merge) is ``ContextParallelWrapper``'s."""
+    kernels from: its paged kernel, and the kernel a step's own tokens run on, one-slot pages over
+    it unless the backend has a better one for the rows. The rest (the split of the own tokens, the
+    exchanges, the merge) is ``ContextParallelWrapper``'s."""
 
     supports_context_parallel = True
-    own_kernel: "type[OwnTokensKernel]" = OneSlotPages
     # the KV pool's placement, and the attention it takes (`bind_dependencies`)
     _placement: "ContextParallel | None" = None
     _placed: "type[ContextParallelWrapper] | None" = None
@@ -398,11 +400,20 @@ class PlacedAttention(AttentionManager):
         over pages of one slot. A captured one's sizes are ``batch_size``, ``max_num_pages`` and
         ``max_total_tokens``."""
 
-    @abstractmethod
-    def whole_rows_kernel(
-        self, workspace: torch.Tensor, kwargs: dict, max_total_tokens: int | None,
-    ) -> WholeRowsKernel:
-        """The kernel a multi-token step attends its own tokens on under TP placement."""
+    def own_tokens_kernel(
+        self, workspace: torch.Tensor, kwargs: dict, captured: "ShareCapture | None", whole: bool,
+    ) -> "OwnTokensKernel":
+        """The kernel a multi-token step attends its own tokens on, at this rank's own heads: for
+        rows ``whole`` (each over its own tokens, TP placement) or not (SP's zigzag share, whose two
+        chunks' keys overlap), sized for ``captured``. One-slot pages over ``paged_kernel``, which
+        take any rows with no copy."""
+        kwargs = {**kwargs, "page_size": 1, "num_qo_heads": self._kv_config.num_qo_heads}
+        if captured is None:
+            return OneSlotPages(self.paged_kernel(workspace, False, kwargs, None), self._dtype)
+        # a row's keys are at most the bucket's, and a zigzag row has two chunks; the padding and
+        # leftover rows' one key each fit in the batch_size spare indices the kernel adds
+        kwargs.update(batch_size=captured.rows, max_num_pages=2 * captured.tokens)
+        return OneSlotPages(self.paged_kernel(workspace, False, kwargs, captured.queries), self._dtype, captured)
 
     def _context_parallel_wrapper(
         self, label: str, slot: int, decode: bool, kwargs: dict, max_total_tokens: int | None = None,
@@ -416,16 +427,11 @@ class PlacedAttention(AttentionManager):
         the other on one stream."""
         workspace = self._workspaces.get(label, slot)
         context = self.paged_kernel(workspace, decode, kwargs, max_total_tokens)
-        new = None if decode else self._placed.own_tokens(
-            self, self._placement, self._device, self._dtype, workspace, kwargs, max_total_tokens,
-        )
         if not isinstance(context, PagedKernel):
             raise ValueError(f"attention over a placed pool takes a PagedKernel, not a {type(context).__name__}")
-        if not (decode or isinstance(new, (WholeRowsKernel, ZigzagWrapper))):
-            raise ValueError(
-                f"a multi-token step over a placed pool attends its own tokens on a WholeRowsKernel or a "
-                f"ZigzagWrapper, not a {type(new).__name__}"
-            )
+        new = None if decode else self._placed.own_tokens(
+            self, self._placement, self._device, workspace, kwargs, max_total_tokens,
+        )
         return self._placed(
             self._placement, self._kv_config.tokens_per_page, self._dtype, context, new, self._device,
             kwargs.get("batch_size"), max_total_tokens,
@@ -450,12 +456,10 @@ class PlacedAttention(AttentionManager):
 
     @torch.compiler.disable
     def _attend_placed(
-        self, label: str, queries: tuple[torch.Tensor, ...], kv_cache_layer: torch.Tensor,
-        new_keys: tuple[torch.Tensor | None, ...],
+        self, label: str, q: torch.Tensor, kv_cache_layer: torch.Tensor, k: torch.Tensor | None, v: torch.Tensor | None,
     ) -> torch.Tensor:
-        """``run`` over a placed pool, ``queries`` and ``new_keys`` as this backend's ``run`` takes
-        them (``ContextParallelWrapper.attend``)."""
-        return self._current_plan_states[label].attend(queries, kv_cache_layer, new_keys)
+        """``run`` over a placed pool (``ContextParallelWrapper.attend``)."""
+        return self._current_plan_states[label].attend(q, kv_cache_layer, k, v)
 
 
 class PlanCacheKey(NamedTuple):

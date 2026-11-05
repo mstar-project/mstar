@@ -10,7 +10,6 @@ from abc import ABC, abstractmethod
 import torch
 
 from mstar.engine.resources.attn.workspace import Workspace
-from mstar.engine.resources.attn.wrappers import WholeRowsKernel
 
 # Head dims the FlashInfer prefill kernels are instantiated for. An unsupported
 # one fails to BUILD (SM90: static_assert in hopper/prefill_sm90.cuh).
@@ -358,7 +357,7 @@ class _FlashInferRaggedPrefillBase(_RaggedPrefillBase):
         return (out, lse) if return_lse else out
 
 
-class FlashInferRaggedPrefillWrapper(_FlashInferRaggedPrefillBase, RaggedPrefillWrapper, WholeRowsKernel):
+class FlashInferRaggedPrefillWrapper(_FlashInferRaggedPrefillBase, RaggedPrefillWrapper):
     """Ragged self-attention through FlashInfer."""
 
 
