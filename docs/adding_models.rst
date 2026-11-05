@@ -2547,12 +2547,13 @@ on the GPU inside its forward, so ``postprocess`` hands the tensor it reads stra
 encoder: ``[T, C, H, W]`` for torchcodec's ``VideoEncoder`` (Cosmos3) and ``[T, H, W, 3]``
 rgb24 frames for PyAV (Wan2.2, LTX-2.5) or a raw ``video_frame`` stream (LingBot-World).
 A permute in ``postprocess`` costs a host copy of the whole clip, or a slower copy of each
-frame inside PyAV. A PyAV mux should go through
-``mstar.model.components.video_encode.mux_rgb_frames``, which converts the frames to the
-encoder's pixel format on a thread ahead of the encoder: the bytes are the plain loop's,
-and Wan2.2's 33-frame 832x480 clip muxes about a fifth faster. The arena's CPU read of an output (``MSTAR_SHM_ARENA``) slices a large
-copy over threads of its own (``mstar.utils.host_copy.HostCopier``), one encode's share of
-the CPUs.
+frame inside PyAV. A PyAV mp4 should be written with
+``mstar.model.components.video_encode.encode_mp4``, which takes the model's x264 options,
+rate and padding, and converts the frames to the encoder's pixel format on a thread a few
+frames ahead of the encoder: the bytes are the plain ``stream.encode`` loop's, and
+Wan2.2's 33-frame 832x480 clip muxes about a fifth faster. The arena's CPU read of an
+output (``MSTAR_SHM_ARENA``) slices a large copy over threads of its own
+(``mstar.utils.host_copy.HostCopier``), one encode's share of the CPUs.
 
 .. _tensor-parallelism:
 
