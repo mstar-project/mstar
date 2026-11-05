@@ -107,8 +107,8 @@ def _meet(group, mine: list[int], replay: bool = False) -> list[list[int]]:
     collectives nothing watches. ``kill -USR1`` a peer for its stack."""
     ranks = dist.get_process_group_ranks(group)
     me = dist.get_rank()
-    seq = group._get_sequence_number_for_group()  # torch's own count of the group's collectives
-    where = f"mstar_sim: rank {me}, call {seq} on the group of ranks {ranks}"
+    seq = group._get_sequence_number_for_group()  # torch's count of the group's gloo ops
+    where = f"mstar_sim: rank {me}, torch sequence number {seq} (meets included) on the group of ranks {ranks}"
     with clock.computing():  # the device's clock stands still while ranks meet
         gathered = torch.empty(len(ranks) * len(mine), dtype=torch.int64)
         try:
