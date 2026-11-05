@@ -23,7 +23,13 @@ from mstar.engine.accelerator_graph_config import (  # noqa: E402
 )
 from mstar.engine.resources.base import EngineResourceInfo, Resource  # noqa: E402
 from mstar.engine.resources.lora import LORA_RESOURCE_KEY, LoraReqConfig  # noqa: E402
-from mstar.engine.resources.lora.ops import LoraOpsBackend, lora_apply_, lora_expand_, lora_shrink  # noqa: E402
+from mstar.engine.resources.lora.ops import (  # noqa: E402
+    LoraOpsBackend,
+    lora_apply_,
+    lora_expand_,
+    lora_experts_apply_,
+    lora_shrink,
+)
 from mstar.engine.resources.lora.pool import ZERO_SLOT, LoraAdapterPool, _Layout  # noqa: E402
 from mstar.engine.resources.runner import StepRunner  # noqa: E402
 from mstar.engine.resources.step import (  # noqa: E402
@@ -62,7 +68,7 @@ def _llm(paths, with_pool=True):
 
 def test_custom_ops_pass_opcheck():
     """Schemas (``lora_expand_`` declares the ``y`` it writes), fake shapes and the
-    functionalized path, on addressing with a capture bucket's tail."""
+    functionalized path, on addressing with a capture bucket's tail; and the experts op's."""
     widths, ranks, scalings = [6, 3, 5], torch.tensor([0, 1, 4, 3], dtype=torch.int32), torch.tensor([0, 0.5, 2, -1.0])
     token_slots = torch.tensor([2, 0, 1, 3, 2, 2, 1], dtype=torch.int32)
     order = torch.cat([torch.argsort(token_slots, stable=True).to(torch.int32), torch.zeros(3, dtype=torch.int32)])
@@ -77,6 +83,11 @@ def test_custom_ops_pass_opcheck():
     h = lora_shrink(x, a, *common, len(widths))
     torch.library.opcheck(lora_expand_, (y, h, b, *common, scalings, widths))
     torch.library.opcheck(lora_apply_, (y, x, a, b, *common, scalings, widths))
+    # an experts target's, with no alignment (off CUDA); ids past `a`'s 6 rows get nothing
+    ids = torch.tensor([[0, 5], [2, 6], [6, 1]], dtype=torch.int32)
+    a, b = torch.randn(6, 2 * 4, 12, generator=g, dtype=F64), torch.randn(6, 9, 4, generator=g, dtype=F64)
+    y, weight = torch.randn(6, 9, generator=g, dtype=F64), torch.rand(3, 2, generator=g, dtype=F64)
+    torch.library.opcheck(lora_experts_apply_, (x[:3], y, a, b, ids, weight, None, None, None, 2, [4, 5], 0))
 
 
 def test_qwen3_5_stack_with_adapters_compiles_and_matches_eager(qwen_adapters):
