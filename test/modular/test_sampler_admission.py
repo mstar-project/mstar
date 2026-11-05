@@ -70,15 +70,23 @@ def test_a_row_taken_for_a_request_another_resource_holds_back_is_given_back(mon
 
 
 def test_without_fixed_rows_the_sampler_admits_every_request(monkeypatch):
-    # knob off, and above one rank, where no resource decides admission
-    for kwargs in (dict(ingraph=False), dict(comm_group=SimpleNamespace(world_size=2))):
-        res = _resource(monkeypatch, slots=2, max_bs=1, **kwargs)
-        bufs = res._cg_buffers
-        assert not bufs.ingraph_scatter
-        for rid in ("a", "b", "c"):
-            res.ingest_request(rid)
-            assert res.ask(rid, NODE, WALK) is None and bufs.has_slot(rid), kwargs
-        assert bufs._master_capacity >= 3, "the growing masters didn't grow"
+    res = _resource(monkeypatch, slots=2, max_bs=1, ingraph=False)
+    bufs = res._cg_buffers
+    assert not bufs.ingraph_scatter
+    for rid in ("a", "b", "c"):
+        res.ingest_request(rid)
+        assert res.ask(rid, NODE, WALK) is None and bufs.has_slot(rid)
+    assert bufs._master_capacity >= 3, "the growing masters didn't grow"
+
+
+def test_every_rank_of_a_tp_group_admits_into_fixed_rows(monkeypatch):
+    """A follower runs its leader's steps, so it admits the same rows in the
+    same order; the offsets then move in the graph on every rank, as a step
+    that repeats needs."""
+    res = _resource(monkeypatch, slots=2, max_bs=1, comm_group=SimpleNamespace(world_size=2))
+    assert res._cg_buffers.ingraph_scatter and res.repeat_refusal(WALK) is None
+    res.ingest_request("a")
+    assert res.ask("a", NODE, WALK) is ASKS
 
 
 def test_a_dropped_rows_offset_stays_uncommitted_through_plan_and_commit(monkeypatch):

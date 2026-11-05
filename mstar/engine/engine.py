@@ -3289,9 +3289,6 @@ class Engine:
                 return f"runner: {why or 'its captures were not probed'}"
             # None: the step touches no resource, so there is nothing to plan
             host_planned, host_step = True, mgmt.template_steps[graph_walk]
-        if mgmt.joint_comm_group.world_size > 1:
-            # every rank would have to replay the same count, which one rank settles
-            return "deployment: it runs on more than one rank"
         if (refusal := mgmt.carry_refusals.get(graph_walk)) is not None:
             return refusal
         carries = mgmt.submodule.repeat_carry(graph_walk, signals)

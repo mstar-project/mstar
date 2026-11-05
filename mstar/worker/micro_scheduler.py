@@ -1000,6 +1000,8 @@ class MicroScheduler:
             # the leader's chunks, so the chunk Loop ends on the same step here
             chunk_ranges=chunk_ranges,
             incomplete_node_rids=unfinished_chunk_rids(chunk_ranges),
+            # its ask until admit settles it, as the leader's (``step_repeats``)
+            repeats=first_tp_node.repeats,
         )
         self.cap_chunk_loops(batch)
         return batch

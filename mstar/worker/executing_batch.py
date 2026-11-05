@@ -57,6 +57,7 @@ def make_executing_batch(
     request_walks: dict[int, str] | None = None,
     engine: Engine | None = None,
     chunk_ranges: dict[int, ChunkRange] | None = None,
+    repeats: int = 1,
 ) -> ExecutingBatch:
     """One step's batch, with the step context the engine drives it through.
 
@@ -86,5 +87,7 @@ def make_executing_batch(
             slot=0,
             capture=False,
             request_walks=request_walks or {},
+            # the ask: a TP follower takes its leader's, which admit narrows alike
+            repeats=repeats,
         ),
     )

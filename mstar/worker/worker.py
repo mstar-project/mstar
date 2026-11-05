@@ -505,6 +505,9 @@ class Worker:
     _auto_prev_end = None
     # the last phase-timed step's end event, for the gap before the next
     _phase_prev_end = None
+    # a TP follower's settled iterations by step seq, its own and the leader's
+    # (``_settle_tp_repeats``); set at init
+    _tp_repeats: "tuple[dict[int, int], dict[int, int]] | None" = None
     # nodes that keep their landed tokens (``NodeSubmodule.record_tokens``)
     _token_readers: frozenset[str] = frozenset()
 
@@ -750,6 +753,7 @@ class Worker:
         )
         # Leader: monotonic seq stamped on every ScheduleTPNode it sends.
         self._tp_broadcast_seq = 0
+        self._tp_repeats = ({}, {})
         # Follower: leader steps that will NOT be followed by a head; the
         # leader said so (TPNoSpeculation) or this rank closed the step.
         self._tp_nospec: RecentSet[int] = RecentSet(self._TP_NOSPEC_KEEP)
@@ -1995,6 +1999,7 @@ class Worker:
             request_walks=batch.request_walks,
             chunk_ranges=batch.chunk_ranges,
             engine=self.engine_manager.get_engine(batch.node_name) if batch.request_walks else None,
+            repeats=batch.repeats,
         )
         node_batch.read_check_rids = batch.read_check_rids
         for rid in unresolved:
@@ -2013,7 +2018,7 @@ class Worker:
 
     def maybe_send_zmq_to_tp_followers(
         self, node_batch: ExecutingBatch,
-        *, speculative: bool = False, spec_from_seq: int = -1,
+        *, speculative: bool = False, spec_from_seq: int = -1, from_repeats: int = 0,
     ) -> int:
         """Broadcast this batch as a ``ScheduleTPNode``. Returns its seq, or
         ``-1`` when this worker does not lead the node (nothing sent)."""
@@ -2079,6 +2084,8 @@ class Worker:
                         chunk_ends=chunk_ends,
                         chunk_totals=chunk_totals,
                         chunk_strides=chunk_strides,
+                        repeats=ctx.repeats,
+                        from_repeats=from_repeats,
                     )
                 )
             )
@@ -2641,6 +2648,8 @@ class Worker:
                         self.worker_id, pending.node_name, pending.graph_walk, waited,
                     )
         pending.batch.repeats = repeats = pending.node_batch.step_context.repeats
+        if self._tp_repeats is not None and pending.batch.tp_seq >= 0 and self._is_tp_follower_node(pending.node_name):
+            self._settle_tp_repeats(pending.batch.tp_seq, follower=repeats)
         if self._step_repeats is not None and self._step_repeats.asked:
             # before anything pops the stream again: this pass's speculation
             for rid, edges in pending.node_batch.stream_windows.items():
@@ -3794,6 +3803,9 @@ class Worker:
         )
         # N's rows, as on the leader: N's settle readies them, not a cleared speculation
         speculation.continuing_rids.update(mid_prefill)
+        if head.repeats > 1:
+            # the leader's ask, which admit narrows here as it did there
+            speculation.node_batch.step_context.repeats = head.repeats
         if chunk_ranges:
             # a fresh row's first chunk caps its Loop, as the leader's merge did
             self.scheduler.cap_chunk_loops(speculation.scheduled_batch)
@@ -3808,6 +3820,24 @@ class Worker:
         """The leader sends no head from its step ``spec_from_seq``."""
         if self._tp_async_for(message.node_name):
             self._tp_nospec.add(message.spec_from_seq)
+
+    def _settle_tp_repeats(self, seq: int, *, follower: int = 0, leader: int = 0) -> None:
+        """A TP step's settled iterations, as this follower settled them or as
+        the leader says it did (on the head after it), whichever comes second
+        checks the other. Every rank's resources narrow alike; if one didn't,
+        the ranks would run different counts of the same collectives."""
+        mine, theirs = self._tp_repeats
+        if follower:
+            mine[seq] = follower
+        if leader:
+            theirs[seq] = leader
+        if seq in mine and seq in theirs:
+            if mine[seq] != theirs[seq]:
+                raise SystemExit(
+                    f"Worker {self.worker_id}: TP step {seq} settled at {mine.pop(seq)} iterations here and "
+                    f"{theirs.pop(seq)} on the leader; the ranks would split"
+                )
+            del mine[seq], theirs[seq]
 
     def _register_tp_follow(self, message: ScheduleTPNode) -> None:
         """Queue a ScheduleTPNode; drop a head for a step this rank closed."""
@@ -3827,6 +3857,8 @@ class Worker:
                 self.worker_id, message.spec_seq, message.spec_from_seq,
             )
             return
+        if message.from_repeats and self._tp_repeats is not None:
+            self._settle_tp_repeats(message.spec_from_seq, leader=message.from_repeats)
         self.scheduler.register_tp_follow(message)
 
     def _close_tp_follow_step(self, pending: PendingBatch) -> None:
@@ -5416,7 +5448,7 @@ class Worker:
                     # followers build it during theirs (-1: not parallel).
                     speculation.tp_seq = self.maybe_send_zmq_to_tp_followers(
                         speculation.node_batch,
-                        speculative=True, spec_from_seq=pending.tp_seq,
+                        speculative=True, spec_from_seq=pending.tp_seq, from_repeats=pending.batch.repeats,
                     )
             if self._tp_lead_needs_marker(pending, speculation):
                 self._broadcast_tp_nospec(pending)

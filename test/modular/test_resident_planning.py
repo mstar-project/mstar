@@ -693,7 +693,7 @@ def _sampler(**attrs):
 
     sampler = SamplerResource.__new__(SamplerResource)
     for name, value in {
-        "_decides": True, "_history": None, **attrs,
+        "_history": None, **attrs,
     }.items():
         setattr(sampler, name, value)
     return sampler
@@ -712,10 +712,9 @@ def _attention(*wrappers):
     (_sampler, False),
     # the repetition window moves in the graph each replay, like the offset
     (lambda: _sampler(_history=object()), False),
-    (lambda: _sampler(_decides=False), True),  # above one rank: scattered on the host
     (lambda: _attention(_TensorCoreDecode), False),
     (lambda: _attention(_LengthsFixedDecode, _LengthsFixedDecode), True),
-], ids=["sampler", "history", "no_scatter", "tensor_core", "lengths_fixed"])
+], ids=["sampler", "history", "tensor_core", "lengths_fixed"])
 def test_a_resource_refuses_repeats_at_load_for_what_it_knows_at_load(resource, refuses):
     assert (resource().repeat_refusal(WALK) is not None) is refuses
 
@@ -812,6 +811,24 @@ def test_a_run_whose_rows_near_a_stop_shortens_the_next_one():
     for odds, cap in [(0.05, None), (0.3, 3), (0.6, 1), (0.1, None)]:
         repeats.observe_odds(key, odds)
         assert repeats._odds_caps.get(key) == cap
+
+
+@pytest.mark.parametrize("leader_first", [True, False])
+def test_a_tp_follower_that_settles_a_step_otherwise_than_its_leader_stops(leader_first):
+    """Each rank's resources narrow the leader's ask alike; a rank that didn't
+    would run a different count of the same collectives and hang the rest.
+    The leader says what a step settled at on the head after it, which can
+    land before or after the follower's own admit."""
+    worker = Worker.__new__(Worker)
+    worker.worker_id = "w1"
+    worker._tp_repeats = ({}, {})
+    order = [("leader", 4), ("follower", 4)] if leader_first else [("follower", 4), ("leader", 4)]
+    for side, n in order:
+        worker._settle_tp_repeats(7, **{side: n})
+    assert worker._tp_repeats == ({}, {})
+    with pytest.raises(SystemExit, match="settled at 1 iterations here and 4 on the leader"):
+        for side, n in (order if leader_first else order[::-1]):
+            worker._settle_tp_repeats(8, **{side: 1 if side == "follower" else n})
 
 
 def test_device_launch_means_the_while_run():

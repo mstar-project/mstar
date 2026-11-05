@@ -109,11 +109,6 @@ class SamplerResource(Resource):
         self._sampled_this_step = False
         self._device = device
         self._comm_group = comm_group
-        # Admission decides at one rank only, as in `RecurrentStatePool`: the ranks
-        # of a lockstep instance could otherwise hold a request back on one rank and
-        # run it on another. The in-graph rows are fixed, so they need admission;
-        # above one rank the masters grow and the scatter runs after the replay.
-        self._decides = comm_group is None or comm_group.world_size == 1
         self._cg_buffers: SamplerBuffers | None = None
         self._cg_max_bs = 0
         self._cg_slots = 1
@@ -195,7 +190,9 @@ class SamplerResource(Resource):
             cg_slots=self._cg_slots,
             # every deciding sampler moves its own RNG offset rows in the graph,
             # a node reading its tokens back or not
-            ingraph_scatter=sampler_ingraph_scatter() and self._decides,
+            # every rank of a lockstep instance runs the leader's steps, so each
+            # admits the same rows and moves its offsets in the graph alike
+            ingraph_scatter=sampler_ingraph_scatter(),
             **self._scalar_options(),
         )
         self._cg_buffers.cells = self._cells
@@ -405,7 +402,7 @@ class SamplerResource(Resource):
         moves in the graph too, each replay: the seen-token mask, the
         repetition window and the ``min_tokens`` count, gathered once a step
         and kept after its last replay."""
-        if not (sampler_ingraph_scatter() and self._decides):
+        if not sampler_ingraph_scatter():
             return "it scatters its RNG offsets outside the graph"
         return None
 
