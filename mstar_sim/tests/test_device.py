@@ -482,7 +482,8 @@ def test_flashinfers_planner_port_answers_as_flashinfers_own():
     """The stand-in's planner port answers every case FlashInfer's own planner answered on each
     emulated GPU's properties (``tests/planner_golden.json``, from ``python -m
     mstar_sim.planner_golden``): the same workspace bytes, the same overflow one byte short of
-    each, the same refusals. The golden is of the stand-in's FlashInfer version."""
+    each, the same refusals; and never less than it answered for a kernel of a given register
+    count, which the port doesn't take. The golden is of the stand-in's FlashInfer version."""
     golden = os.path.join(ROOT, "mstar_sim", "tests", "planner_golden.json")
     out = run_sim(f"""
         import json, types, torch, flashinfer
@@ -503,7 +504,7 @@ def test_flashinfers_planner_port_answers_as_flashinfers_own():
             if c["planner"] == "mla":
                 return mla_allocations(c["qo"], batch, c["heads"], c["hd_o"])
             return decode_allocations(c["kv"], batch, *c["heads"], c["page"], c["graph"], c["head_dim"],
-                                      kv_dtype[c["kv_bytes"]], regs=c["regs"])
+                                      kv_dtype[c["kv_bytes"]])
 
         def short_of(out, float_bytes, int_bytes):
             try:
@@ -523,6 +524,10 @@ def test_flashinfers_planner_port_answers_as_flashinfers_own():
                     got = {{"error": str(e)}}
                 else:
                     got = dict(zip(("float", "int"), allocate(out, None, None)))
+                    if c.get("regs"):  # the port sizes without registers, which only shrink the grid
+                        if got["float"] < want["float"] or got["int"] < want["int"]:
+                            wrong.append(f"{{c['name']}} on {{gpu}}: port {{got}} under FlashInfer's {{want}}")
+                        continue
                     if got["float"]:
                         got["float_short"] = short_of(out, got["float"] - 1, None)
                     if got["int"]:

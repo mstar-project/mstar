@@ -16,9 +16,10 @@ with ``-cudart none`` into one library, linked with ``-Bsymbolic`` against a sta
 runtime of its own (so a CUDA torch's ``libcudart``, loaded globally, can't answer for it). That
 runtime answers device attributes from the case's GPU, copies nothing, and answers the decode
 planner's occupancy query with NVIDIA's own calculator (``cuda_occupancy.h``) for the case's
-register count: a case input, since the stand-in's decode sizing takes none (0, the bound with
-no register limit). A planner's answer is the smallest float and int workspace it plans in, and
-the overflow it raises one byte short of each; or the error it raises however large they are.
+register count. A planner's answer is the smallest float and int workspace it plans in, and the
+overflow it raises one byte short of each; or the error it raises however large they are. The
+stand-in's decode sizing takes no register count, which holds it to a case of none exactly and
+bounds it by a case of some: such a case keeps only its sizes.
 """
 
 from __future__ import annotations
@@ -468,6 +469,8 @@ def answer(lib, case: dict) -> dict:
     float_bytes = _smallest(lambda n: _call(lib, case, n, room, pinned)[0] == 0, big_float)
     int_bytes = _smallest(lambda n: _call(lib, case, big_float, n, pinned)[0] == 0, room)
     out = {"float": float_bytes, "int": int_bytes}
+    if case.get("regs"):
+        return out
     if float_bytes:
         out["float_short"] = _call(lib, case, float_bytes - 1, room, pinned)[1]
     if int_bytes:

@@ -232,19 +232,13 @@ def fa3_allocations(qo: list[int], total_num_rows: int, batch: int, num_qo_heads
         ("kv_len", works), ("head_indices", works), ("work_indptr", num_sm + 1), ("batch_indices", works))]
 
 
-def blocks_per_sm(threads: int, smem: int, regs: int = 0) -> int:
+def blocks_per_sm(threads: int, smem: int) -> int:
     """How many blocks of ``threads`` threads and ``smem`` bytes of dynamic shared memory one SM
-    holds: NVIDIA's occupancy calculator (``cuda_occupancy.h``) for a kernel of ``regs`` registers
-    a thread and no static shared memory, as a fresh process plans it (no shared-memory opt-in
-    yet). ``regs`` 0 bounds nothing; the block cap never binds at 128 threads or more."""
+    holds: NVIDIA's occupancy calculator (``cuda_occupancy.h``) for a kernel no register count
+    bounds, with no static shared memory, as a fresh process plans it (no shared-memory opt-in
+    yet). The block cap never binds at 128 threads or more."""
     props = torch.cuda.get_device_properties()
-    warps = _ceil(threads, 32)
-    limit = props.max_threads_per_multi_processor // 32 // warps
-    if regs > 256:
-        return 0
-    if regs:  # allocated a warp at a time, 256 registers at a time, in 4 sub-partitions
-        per_warp = _ceil(regs * 32, 256) * 256
-        limit = min(limit, props.regs_per_multiprocessor // 4 // per_warp * 4 // warps)
+    limit = props.max_threads_per_multi_processor // 32 // _ceil(threads, 32)
     block_smem = _ceil(smem + 1024, 128) * 128  # the driver reserves 1 KiB a block
     if block_smem > props.shared_memory_per_block + 1024:
         return 0
@@ -252,12 +246,11 @@ def blocks_per_sm(threads: int, smem: int, regs: int = 0) -> int:
 
 
 def decode_allocations(kv: list[int], batch: int, num_qo_heads: int, num_kv_heads: int, page_size: int,
-                       cuda_graph: bool, head_dim: int, kv_dtype, regs: int = 0) -> list:
+                       cuda_graph: bool, head_dim: int, kv_dtype) -> list:
     """What FlashInfer's CUDA-core decode planner (``DecodePlanImpl`` over its work
     estimation) allocates for ``kv`` pages per request. The grid it sizes for is the decode
-    kernel's occupancy (:func:`blocks_per_sm`) for ``regs`` registers a thread: the stand-in
-    passes none, as the count is a fact of the compiled kernel, so its grid can only come out
-    larger than a GPU's. A kernel past the 48 KiB a block gets before opting in (head dim 512)
+    kernel's occupancy (:func:`blocks_per_sm`) without its register count, a fact of the
+    compiled kernel, so its grid can only come out larger than a GPU's. A kernel past the 48 KiB a block gets before opting in (head dim 512)
     has no stand-in: its grid on a GPU depends on whether a run came before the plan."""
     gqa = num_qo_heads // num_kv_heads
     if gqa not in (1, 2, 3, 4, 6, 8, 16):  # the group sizes its kernels are built for
@@ -274,8 +267,7 @@ def decode_allocations(kv: list[int], batch: int, num_qo_heads: int, num_kv_head
     if smem > props.shared_memory_per_block:
         _not_supported(f"BatchDecodeWithPagedKVCacheWrapper (CUDA-core decode) of head dim {head_dim}, whose "
                        f"kernel needs {smem} bytes of shared memory")
-    blocks = blocks_per_sm(threads, smem, regs)
-    max_grid = blocks * props.multi_processor_count
+    max_grid = blocks_per_sm(threads, smem) * props.multi_processor_count
     pages = [kv[i + 1] - kv[i] for i in range(batch)]
     if batch * num_kv_heads >= max_grid:
         split, new_batch = False, batch
