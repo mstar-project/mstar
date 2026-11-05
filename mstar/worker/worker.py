@@ -581,6 +581,10 @@ class Worker:
         self._phase_buf = phase_buffer()
         # (start, end) CUDA events per step, drained once they land
         self._gpu_spans: deque = deque(maxlen=64)
+        # (start, end, (node, walk), repeats) per step while a walk picks its
+        # run length (``step_repeats: auto``); None while none does
+        self._auto_spans: deque | None = None
+        self._auto_prev_end = None
 
         self.enable_prof = enable_prof
         self.profile_info = WorkerProfileInfo()
@@ -2410,6 +2414,21 @@ class Worker:
         if self._phase_period > 0:
             self._phase_buf[name].append(dt)
 
+    def _drain_auto_spans(self) -> None:
+        """Each landed step's GPU time and the idle gap before it, to its walk's
+        ``AutoRepeats``. Every step is timed, so a gap is the time since the
+        step before it on the stream, whichever walk that was."""
+        while self._auto_spans:
+            start, end, key, repeats = self._auto_spans[0]
+            if not end.query():
+                return
+            self._auto_spans.popleft()
+            gap = 0.0 if self._auto_prev_end is None else max(self._auto_prev_end.elapsed_time(start) / 1000, 0.0)
+            self._auto_prev_end = end
+            auto = self._step_repeats.auto.get(key)
+            if auto is not None:
+                auto.observe(gap, start.elapsed_time(end) / 1000, repeats)
+
     def _drain_gpu_spans(self) -> None:
         """Record the GPU times whose events have landed, leaving the rest:
         reading a pair still in flight would block the host on the GPU."""
@@ -2510,7 +2529,7 @@ class Worker:
             # Device time of the step; the phase timers only see host submit
             # time, and both are needed to tell a starved iter from a busy one.
             gpu_start = None
-            if self._phase_period and execution_stream is not None:
+            if (self._phase_period or self._auto_spans is not None) and execution_stream is not None:
                 gpu_start = torch.Event(device=self.device, enable_timing=True)
                 gpu_start.record(execution_stream)
             if self._phase_period:
@@ -2535,8 +2554,14 @@ class Worker:
                 if gpu_start is not None:
                     gpu_end = torch.Event(device=self.device, enable_timing=True)
                     gpu_end.record(execution_stream)
-                    self._gpu_spans.append((gpu_start, gpu_end, _step_key(batch.node_name, batch.graph_walk)))
-                    self._drain_gpu_spans()
+                    if self._phase_period:
+                        self._gpu_spans.append((gpu_start, gpu_end, _step_key(batch.node_name, batch.graph_walk)))
+                        self._drain_gpu_spans()
+                    if self._auto_spans is not None:
+                        self._auto_spans.append((
+                            gpu_start, gpu_end, (batch.node_name, batch.graph_walk), node_batch.step_context.repeats,
+                        ))
+                        self._drain_auto_spans()
                     laps.lap("gpu_exec_events")
             return outputs
         finally:
@@ -5454,6 +5479,8 @@ class Worker:
                 self.engine_manager.engine.repeat_note,
             )
             self.streams.windows = self._step_repeats.windows()
+            if self._step_repeats.auto:
+                self._auto_spans = deque(maxlen=64)
 
         # Sync every worker before the main loop opens. Per-batch-size
         # captures inside CudaGraphRunner are already barriered on the

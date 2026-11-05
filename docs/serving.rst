@@ -361,6 +361,9 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        longest row: a row reaches its iteration cap inside the run and stops there, as at an
        end token. Set it only where nothing the capture reads is sized by that cap (a learned
        position table is); the KV pool still keeps a run inside the row's context.
+       ``auto: true`` picks each walk's run length under ``max`` from what its steps measure on
+       the device: an idle gap before a step raises the next run at once to what would have
+       hidden it, and eight steps with none lower it by one.
        At startup the worker logs one line per Loop walk with each capability
        (``resident``, ``repeats``, ``rows``, ``device stop``, ``launch loop``, ``stream tokens``) ``on``,
        ``off: not asked for``, or ``off: <owner>: <reason>``. ``launch loop``: a run's launches

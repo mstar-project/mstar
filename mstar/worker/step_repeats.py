@@ -16,6 +16,7 @@ by its resources (``Resource.max_repeats``), which can only narrow it.
 from __future__ import annotations
 
 import logging
+import math
 from collections.abc import Callable, Collection, Iterable, Mapping
 from dataclasses import dataclass, fields, replace
 from types import MappingProxyType
@@ -56,6 +57,8 @@ class RepeatConfig:
     # and stops there, as at an end token. Only for a node nothing in whose capture
     # is sized by the cap: the row's replays past it still run
     past_cap: bool = False
+    # pick each walk's run length under max from measured times (``AutoRepeats``)
+    auto: bool = False
 
     DEVICE_STOPS: ClassVar[tuple[str, ...]] = ("off", "skip", "drop_rows")
 
@@ -84,7 +87,9 @@ class RepeatConfig:
             raise ValueError(
                 f"step_repeats for {node!r}: ready_waits is {config.ready_waits!r}; it must be true or at least 1"
             )
-        for name in ("stream_tokens", "past_cap") + (("ready_waits",) if type(config.ready_waits) is not int else ()):
+        for name in ("stream_tokens", "past_cap", "auto") + (
+            ("ready_waits",) if type(config.ready_waits) is not int else ()
+        ):
             if type(getattr(config, name)) is not bool:
                 raise ValueError(
                     f"step_repeats for {node!r}: {name} is {getattr(config, name)!r}; it must be a boolean"
@@ -141,6 +146,46 @@ def run_columns(edges: LoopEdges, inline: Collection[str]) -> frozenset[str]:
     )
 
 
+class AutoRepeats:
+    """A walk's run length from what its steps measure on the device
+    (``step_repeats: auto``): the GPU's idle gap before each step, which is
+    host time the run didn't hide, and the step's GPU time per iteration (a
+    moving average). A gap raises the length at once to what would have
+    hidden it; eight steps in a row with none lower it by one, which finds out
+    whether less still hides the host. Never above ``max``."""
+
+    # a gap shorter than this is the launch itself, not host time
+    QUIET_S = 20e-6
+    CALM_STEPS = 8
+    ALPHA = 0.25
+
+    def __init__(self, limit: int):
+        self.limit = limit
+        self.n = 1
+        self._per_iteration: float | None = None
+        self._calm = 0
+
+    def observe(self, gap_s: float, gpu_s: float, repeats: int) -> int:
+        """One step's measurements; the length the next run takes."""
+        per_iteration = gpu_s / max(repeats, 1)
+        a = self.ALPHA
+        self._per_iteration = (
+            per_iteration if self._per_iteration is None else (1 - a) * self._per_iteration + a * per_iteration
+        )
+        if gap_s > self.QUIET_S and self._per_iteration > 0:
+            # the host's period was this step's GPU time plus the gap: as many
+            # iterations as fill it
+            want = repeats + math.ceil(gap_s / self._per_iteration)
+            if want > self.n:
+                self.n = min(self.limit, want)
+            self._calm = 0
+            return self.n
+        self._calm += 1
+        if self._calm >= self.CALM_STEPS:
+            self.n, self._calm = max(1, self.n - 1), 0
+        return self.n
+
+
 class StepRepeats:
     """``configs``: the serving config's settings per node; ``edges``: this
     worker's (node, walk) pairs whose walk runs the node in a Loop, with the
@@ -150,6 +195,8 @@ class StepRepeats:
         self._configs = configs
         self.edges = edges
         self._walks: set[tuple[str, str]] = set()
+        # (node, walk) -> its run length, for a node whose config asks for auto
+        self.auto: dict[tuple[str, str], AutoRepeats] = {}
 
     def limit(self, node: str) -> int:
         config = self._configs.get(node)
@@ -203,7 +250,9 @@ class StepRepeats:
             repeats = NOT_ASKED if limit == 1 else repeat_refusal(*key)
             if repeats is None:
                 self._walks.add(key)
-            on = f"on, up to {limit}"
+                if self.config(key[0]).auto:
+                    self.auto[key] = AutoRepeats(limit)
+            on = f"on, up to {limit}" + (", auto" if key in self.auto else "")
             if repeats is None and (note := repeat_note(*key)):
                 on = f"{on} ({note})"
             parts = [
@@ -237,7 +286,9 @@ class StepRepeats:
             return 1
         if (batch.node_name, batch.graph_walk) not in self._walks:
             return 1
-        return max(1, min(self.limit(batch.node_name), loop_room()))
+        auto = self.auto.get((batch.node_name, batch.graph_walk))
+        limit = self.limit(batch.node_name) if auto is None else auto.n
+        return max(1, min(limit, loop_room()))
 
 
 def walk_edges(walks: Mapping[str, object], pairs: Iterable[tuple[str, str]]) -> dict[tuple[str, str], LoopEdges]:

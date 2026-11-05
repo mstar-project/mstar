@@ -776,10 +776,31 @@ def test_a_walk_that_asks_for_repeats_gets_tensor_core_decode(monkeypatch, walk,
     ({"n": {"max": 2, "device_launch": "maybe"}}, "must be on or off"),
     ({"n": {"max": 2, "ready_waits": "yes"}}, "must be a boolean"),
     ({"n": {"ready_waits": True}}, "need max above 1"),
+    ({"n": {"auto": True}}, "need max above 1"),
 ])
 def test_a_step_repeats_block_that_asks_for_nothing_real_is_refused(block, why):
     with pytest.raises(ValueError, match=why):
         parse_step_repeats(block, {"n"})
+
+
+def test_auto_raises_the_run_at_once_and_lowers_it_after_eight_quiet_steps():
+    """A gap is host time the run didn't hide: the next run is long enough to
+    fill it, under ``max``. Quiet steps lower it one at a time, to see whether
+    less still hides the host."""
+    from mstar.worker.step_repeats import AutoRepeats
+
+    auto = AutoRepeats(limit=8)
+    ms = 1e-3
+    # 1 ms of GPU an iteration, a 2.5 ms gap: the host's period is 3.5 iterations
+    assert auto.observe(2.5 * ms, 1 * ms, 1) == 4
+    # a longer gap than the max fills: capped
+    assert auto.observe(40 * ms, 4 * ms, 4) == 8
+    for _ in range(7):
+        assert auto.observe(0.0, 8 * ms, 8) == 8
+    assert auto.observe(0.0, 8 * ms, 8) == 7
+    # a launch's own gap is no host time
+    assert all(auto.observe(5e-6, 7 * ms, 7) == 7 for _ in range(7))
+    assert auto.observe(5e-6, 7 * ms, 7) == 6
 
 
 def test_device_launch_means_the_while_run():
