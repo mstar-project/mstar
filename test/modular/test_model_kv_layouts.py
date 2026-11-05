@@ -43,6 +43,7 @@ def _bagel():
         cfg_renorm_type="global", cfg_renorm_min=0.0, vit_config=SimpleNamespace(patch_size=14),
         vit_max_num_patch_per_side=70, latent_downsample=16, max_latent_size=64,
         temperature=0.0, top_k=-1, top_p=1.0, repetition_penalty=1.0, ignore_eos=False, vocab_size=1000,
+        denoise_capture_sizes=(),
     )
     model.tokenizer = _StubTokenizer()
     model.boi_token_id = _StubTokenizer.SPECIALS["<|vision_start|>"]

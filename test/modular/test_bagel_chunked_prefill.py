@@ -3,6 +3,7 @@ a guided prompt forks main -> cfg_text on its first chunk only (cfg_text keeps
 the pre-text context). Only the last chunk's sampled token leaves the chunk
 Loop, which the runtimes test (test/rust/test_runtime_parity.py)."""
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -15,6 +16,7 @@ from mstar.model.submodule_base import ARNodeInputs
 def llm():
     llm = object.__new__(LLMSubmodule)
     llm.__dict__["node_name"] = "LLM"
+    llm.__dict__["config"] = SimpleNamespace(denoise_capture_sizes=())
     return llm
 
 
