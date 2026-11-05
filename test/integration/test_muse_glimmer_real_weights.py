@@ -16,10 +16,11 @@ REPO = "meta-models/Muse-Glimmer-30B"
 DEVICE = torch.device("cuda:0")
 WALK, RID = "prefill_vision", 1
 # rel L2 on this image (3,072 patches). On an H200 the replay matches the
-# inline loop bit for bit only from about 196 patches: below that, inline's
-# fc2 GEMM picks another cuBLAS kernel than the captured one (5e-3 for a
-# 1x1-pixel image, 2.5e-2 at 16 patches), and the replay is as close to HF's
-# fp32 tower as the inline loop is. So this bound holds for large images only.
+# inline loop bit for bit only from about 196 patches. Not below it: at 16
+# patches and for a 1x1-pixel image, inline's fc2 GEMM picks another cuBLAS
+# kernel than the captured one (2.5e-2 and 5e-3), and the replay is as close
+# to HF's fp32 tower as the inline loop is. So this bound holds from about
+# 196 patches only.
 TOLERANCE = 1e-3
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="captures CUDA graphs")
@@ -40,7 +41,7 @@ def _snapshot() -> str:
 
 
 def test_the_replayed_block_loop_matches_the_inline_one():
-    """The replay runs the inline loop's numerics: `embed` ends on `ln_pre`,
+    """On this image the replay runs the inline loop's numerics: `embed` ends on `ln_pre`,
     which autocast returns in fp32, so the replay's buffers are fp32
     (`BLOCK_LOOP_DTYPE`; the runner refuses buffers that would round it)."""
     from mstar.engine.accelerator_graph_runner import PiecewiseAcceleratorGraphRunner, autocast_scope
