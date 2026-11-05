@@ -998,7 +998,9 @@ Dynamo’s frontend or a gateway in front of it.</p>
 <td><p>Registry key of the model (see <a class="reference internal" href="models.html"><span class="doc">Supported Models</span></a>).</p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">max_seq_len</span></code></p></td>
-<td><p>Maximum sequence length (sizes the KV cache).</p></td>
+<td><p>Required, but nothing reads it: it neither sizes the KV cache nor caps context.
+A KV cache’s length limit is its own <code class="docutils literal notranslate"><span class="pre">max_seq_len</span></code>, set by the model or under
+<code class="docutils literal notranslate"><span class="pre">resources:</span> <span class="pre">&lt;kv&gt;:</span></code> (see the resource overrides below).</p></td>
 </tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">node_groups</span></code></p></td>
 <td><p>List of placements. Each entry assigns <code class="docutils literal notranslate"><span class="pre">node_names</span></code> to <code class="docutils literal notranslate"><span class="pre">ranks</span></code>, optionally
