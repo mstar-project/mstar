@@ -4,11 +4,8 @@
       <stop offset="0" stop-color="#7b61ff"/>
       <stop offset="1" stop-color="#22d3ee"/>
     </linearGradient>
-    <filter id="mstarGlow" x="-30%" y="-30%" width="160%" height="160%">
-      <feDropShadow dx="0" dy="0" stdDeviation="4" flood-color="#7b61ff" flood-opacity="0.45"/>
-    </filter>
   </defs>
-  <g filter="url(#mstarGlow)">
+  <g>
     <!-- M : a bold monoline letterform -->
     <path d="M40 162 L40 54 L124 142 L208 54 L208 162"
           stroke="url(#mstarGrad)" stroke-width="30" stroke-linecap="round" stroke-linejoin="round"/>
