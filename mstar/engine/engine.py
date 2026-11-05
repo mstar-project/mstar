@@ -2243,6 +2243,11 @@ class Engine:
             range_push("engine.preprocess")
         t0 = phase_start()
         try:
+            columns = None
+            if getattr(submodule, "ITERATION_INPUTS", None):
+                batch.iteration_columns = engine_inputs.iteration_inputs = columns = self._iteration_columns(
+                    batch.node_name, submodule, ctx, rids, req_info, batch.per_request_input_tensors,
+                )
             if ctx.resident is None and ctx.repeats == 1:
                 preprocessed = submodule.preprocess(ctx.graph_walk, engine_inputs=engine_inputs, inputs=inputs)
             else:
@@ -2256,11 +2261,8 @@ class Engine:
                         "which its graph fills after it; serve it with resident_planning: off"
                     )
                 _refuse_counter_read(batch.node_name, ctx, reads, "preprocess")
-            if getattr(submodule, "ITERATION_INPUTS", None):
-                batch.iteration_columns = self._iteration_columns(
-                    batch.node_name, submodule, ctx, rids, req_info, batch.per_request_input_tensors,
-                )
-                preprocessed.update((name, column[:, 0]) for name, column in batch.iteration_columns.items())
+            for name, column in (columns or {}).items():
+                preprocessed.setdefault(name, column[:, 0])
         finally:
             phase_end("engine.preprocess", t0)
             if nvtx:

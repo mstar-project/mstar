@@ -816,6 +816,11 @@ class ModelInputsFromEngine:
     # rid -> this step's InputMetadata; rids without any are absent
     per_request_input_metadata: Mapping[str, InputMetadata] = field(default_factory=dict)
 
+    # The step's ``ITERATION_INPUTS``, ``[rows, repeats, ...]`` each, cut
+    # before ``preprocess``: the engine stages each one ``preprocess`` doesn't
+    # return itself (a walk that packs its rows its own way, say).
+    iteration_inputs: Mapping[str, torch.Tensor] = field(default_factory=dict)
+
     @property
     @torch.compiler.disable
     def single_request_info(self):
@@ -877,10 +882,11 @@ class NodeSubmodule(torch.nn.Module, ABC):
     lora_keys: tuple[str, ...] = ()
 
     # static input -> its value per iteration of the node's Loop, cut per row
-    # from the row's request state (``IterationInput``). The engine stages these
-    # after ``preprocess``, for every walk; ``prepare_inputs`` and ``preprocess``
-    # don't read the loop counter for them, and a step that repeats may not read
-    # it at all: its later replays would see the first one's.
+    # from the row's request state (``IterationInput``). The engine cuts these
+    # for every walk before ``preprocess`` (``ModelInputsFromEngine.iteration_inputs``)
+    # and stages each one ``preprocess`` doesn't return itself; ``prepare_inputs``
+    # and ``preprocess`` don't read the loop counter for them, and a step that
+    # repeats may not read it at all: its later replays would see the first one's.
     ITERATION_INPUTS: Mapping[str, IterationInput] = MappingProxyType({})
 
     def __init__(self):

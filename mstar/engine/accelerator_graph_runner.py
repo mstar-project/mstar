@@ -1351,13 +1351,16 @@ class AcceleratorGraphRunner:
             if not outcome.ok:
                 raise RuntimeError(f"capture admit failed for {spec.bucket}: {outcome.reason}")
             self._step_runner.plan(template.step)
-        preprocessed = self._submodule.preprocess(
-            graph_walk=spec.bucket.graph_walk, engine_inputs=template.engine_inputs, inputs=template.inputs,
-        )
+        columns = {}
         if getattr(self._submodule, "ITERATION_INPUTS", None):
             # padding rows all: each takes its capture_fill
             columns = iteration_columns(self._submodule, [None] * len(template.inputs), 1, self._device)
-            preprocessed.update((name, column[:, 0]) for name, column in columns.items())
+            template.engine_inputs.iteration_inputs = columns
+        preprocessed = self._submodule.preprocess(
+            graph_walk=spec.bucket.graph_walk, engine_inputs=template.engine_inputs, inputs=template.inputs,
+        )
+        for name, column in columns.items():
+            preprocessed.setdefault(name, column[:, 0])
         return preprocessed
 
     def _forward_for(self, spec: CGSlotSpec):
