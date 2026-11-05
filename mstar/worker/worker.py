@@ -43,6 +43,7 @@ from mstar.engine.resources.kv.transfer import (
     TransferEngineInfo,
     make_deployment_kv_shm_dir,
 )
+from mstar.engine.resources.lora.config import describe_load_error
 from mstar.engine.resources.sampler.config import SAMPLED_LOGPROB
 from mstar.graph.base import GraphEdge, GraphSection
 from mstar.graph.graph_io import format_graph_edge_list
@@ -82,6 +83,8 @@ from mstar.utils.ipc_format import (
     EdgeItems,
     FailRequests,
     InputSignals,
+    LoadLoraAdapter,
+    LoraAdapterAck,
     MessageSource,
     NewRequest,
     ReadsDone,
@@ -91,6 +94,7 @@ from mstar.utils.ipc_format import (
     StopLoops,
     TensorReceived,
     TPNoSpeculation,
+    UnloadLoraAdapter,
     UnpersistTensors,
     WorkerMessage,
     WorkerMessageType,
@@ -111,6 +115,7 @@ from mstar.worker.batch_builder import BatchBuilderType
 from mstar.worker.chunk_loops import ChunkLoops
 from mstar.worker.engine_manager import EngineManager, refuse_combined_walks_across_tp_groups
 from mstar.worker.executing_batch import input_metadata_and_fwd_info, make_executing_batch
+from mstar.worker.lora_loads import LoraLoads
 from mstar.worker.micro_scheduler import (
     CHAIN_LANE,
     MicroScheduler,
@@ -463,6 +468,10 @@ class Worker:
     # without one -- any test fake -- chunks nowhere rather than raising from
     # postprocess.
     chunk_loops: ChunkLoops = ChunkLoops()
+
+    # Runtime LoRA loads still being read; made on the first load, so a bare instance
+    # (and a worker that never loads one) checks a None per message pass.
+    _lora_loads: LoraLoads | None = None
 
     # Metrics are off unless __init__ gets a status interval; class-level so a
     # worker built without __init__ reads them as off too.
@@ -1550,11 +1559,65 @@ class Worker:
             elif message.message_type == WorkerMessageType.ENABLE_METRICS:
                 # sent only with metrics on, so _metrics is set
                 self._metrics.start_counting()
+            elif message.message_type == WorkerMessageType.LOAD_LORA_ADAPTER:
+                self._load_lora_adapter(message.body)
+            elif message.message_type == WorkerMessageType.UNLOAD_LORA_ADAPTER:
+                self._unload_lora_adapter(message.body)
             if t0 is not None:
                 phase_end(_MSG_SPANS[message.message_type], t0)
 
+    def _load_lora_adapter(self, body: LoadLoraAdapter) -> None:
+        """Start reading a runtime-loaded adapter into this rank's host tier; it is
+        acknowledged from the main loop once every pool has it (``_finish_lora_loads``).
+
+        Applied as the message arrives: a load touches no slot state an admit decides
+        from (``LoraAdapterPool``'s docstring), so the ranks of a lockstep instance need
+        not apply it at the same step. A pool that fails rolls back the ones that loaded,
+        and the conductor rolls back the other workers. A load of a name still being read
+        waits for that load's ack, as an unload does."""
+        if self._lora_loads is None:
+            self._lora_loads = LoraLoads()
+        elif self._lora_loads.defer(body):
+            return
+        self._lora_loads.start(body, self.engine_manager.engine.lora_pools())
+        self._finish_lora_loads()
+
+    def _finish_lora_loads(self) -> None:
+        """Acknowledge the runtime loads whose reads completed, then apply the loads and
+        unloads that arrived behind them, in order."""
+        for load in self._lora_loads.finish():
+            self._ack_lora_adapter(load.body.op_id, load.error)
+            for body in load.behind:
+                if isinstance(body, LoadLoraAdapter):
+                    self._load_lora_adapter(body)
+                else:
+                    self._unload_lora_adapter(body)
+
+    def _unload_lora_adapter(self, body: UnloadLoraAdapter) -> None:
+        """Stop serving an adapter to new requests; running ones keep it until they end.
+        Any moment will do, for the reason ``_load_lora_adapter`` gives, except while a
+        load of the name is still being read: it waits for that load's ack."""
+        if self._lora_loads and self._lora_loads.defer(body):
+            return
+        error = None
+        try:
+            for pool in self.engine_manager.engine.lora_pools():
+                pool.unload_adapter(body.lora_name)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Worker %s: LoRA adapter %s failed to unload", self.worker_id, body.lora_name)
+            error = describe_load_error(exc)
+        self._ack_lora_adapter(body.op_id, error)
+
+    def _ack_lora_adapter(self, op_id: str, error: str | None) -> None:
+        self.communicator.send("conductor", ConductorMessage(
+            message_type=ConductorMessageType.LORA_ADAPTER_ACK,
+            body=LoraAdapterAck(op_id=op_id, worker_id=self.worker_id, error=error),
+        ))
+
     def _process_messages(self) -> None:
         self._process_message_list(self.communicator.get_all_new_messages())
+        if self._lora_loads:
+            self._finish_lora_loads()
 
     # ------------------------------------------------------------------
     # Tensor readiness

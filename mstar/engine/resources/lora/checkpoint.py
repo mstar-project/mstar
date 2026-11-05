@@ -177,6 +177,15 @@ def parse_lora_key(key: str) -> tuple[str, str]:
     raise ValueError(_unsupported(key))
 
 
+def refuse_non_adapter(keys) -> None:
+    """A checkpoint none of whose keys is a ``lora_A`` / ``lora_B`` tensor is not a LoRA
+    adapter (a model's weights, say). Raised as an ``OSError``, as an unreadable file is,
+    so a client that names a server path learns nothing of what the file holds
+    (``describe_load_error``)."""
+    if not any(_AB_KEY.match(normalize_lora_key(key)) for key in keys):
+        raise OSError("not a LoRA adapter: the file holds no lora_A / lora_B tensors")
+
+
 # what a PEFT checkpoint holds besides plain LoRA, and why it cannot be served per request
 _UNSUPPORTED = (
     ("lora_magnitude_vector", "a DoRA adapter (use_dora=True), whose magnitude rescales "
@@ -209,6 +218,7 @@ def normalize_lora_state_dict(
     default_alpha: Callable[[str, int], float] | None = None,
 ) -> LoraAdapter:
     """Group raw LoRA tensors into per-module ``(A, B, alpha)`` triples in reference-library naming."""
+    refuse_non_adapter(state_dict)
     sd = {normalize_lora_key(key): value for key, value in state_dict.items()}
     if convert_keys is not None:
         sd = convert_keys(sd)

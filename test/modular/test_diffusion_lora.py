@@ -167,7 +167,10 @@ def test_error_paths_and_spec_parsing():
     with pytest.raises(ValueError, match="missing lora_B"):
         normalize_lora_state_dict({"transformer.x_embedder.lora_A.weight": torch.zeros(2, 16)})
     with pytest.raises(ValueError, match="unrecognized"):
-        normalize_lora_state_dict({"transformer.x_embedder.weight": torch.zeros(2, 16)})
+        normalize_lora_state_dict({
+            "transformer.x_embedder.lora_A.weight": torch.zeros(2, 16),
+            "transformer.x_embedder.weight": torch.zeros(2, 16),
+        })
     adapter = normalize_lora_state_dict({
         "transformer.nowhere.lora_A.weight": torch.zeros(2, 16), "transformer.nowhere.lora_B.weight": torch.zeros(8, 2),
     })

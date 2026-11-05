@@ -91,7 +91,8 @@ DEFAULT_ADAPTERS = {
         "pinocchio": "KevinDavidHayes/pinocchio-0.8b",
     },
 }
-# also on the delta-net projections; parity only (`phase_plan` keeps the three above)
+# also on the delta-net projections; parity only (`phase_plan` and `runtime_load` keep the
+# three above)
 DELTA_NET_ADAPTERS = {
     "qwen3_5_0.8b": {
         "transaction": "indrapurnayasa/transaction-qwen3.5-0.8b-lora",
