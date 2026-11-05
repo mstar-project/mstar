@@ -116,8 +116,9 @@ def test_a_withholding_token_stop_is_the_runtimes_too():
     ("mstar.model.qwen3_asr.submodules", "Qwen3ASRLLMSubmodule", {}),
     # a denoise loop: the request's step cap stops it
     ("mstar.model.z_image.submodules", "ZImageDenoiseSubmodule", {}),
+    ("mstar.model.vjepa2.submodules", "VJepa2RolloutPredictorSubmodule", {}),
     # its own check_stop decides
-    ("mstar.model.vjepa2.submodules", "VJepa2RolloutPredictorSubmodule", None),
+    ("mstar.model.waypoint.submodules", "WaypointDitSubmodule", None),
 ])
 def test_a_class_without_its_own_stop_check_declares_no_stops(module, name, policies):
     cls = getattr(__import__(module, fromlist=[name]), name)

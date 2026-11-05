@@ -186,9 +186,7 @@ class VJepa2Model(Model):
     # K-way action-candidate MPC (AC variant only).
     PREFILL_VIDEO_MPC = "prefill_video_mpc"
 
-    # Rollout loop name — referenced by
-    # ``VJepa2RolloutPredictorSubmodule.forward`` via
-    # ``request_info.dynamic_loop_iter_counts[...]``.
+    # Rollout loop name, capped per request by ``get_loop_caps``.
     ROLLOUT_LOOP_NAME = "rollout_loop"
 
     def __init__(
@@ -198,11 +196,16 @@ class VJepa2Model(Model):
         skip_weight_loading: bool = False,
         predictor_kind: str = "masked",
         ac_predictor_config: dict | None = None,
+        rollout_capture_batch_sizes: list[int] | None = None,
         **kwargs,
     ):
         self.model_path_hf = model_path_hf
         self.cache_dir = cache_dir
         self.skip_weight_loading = skip_weight_loading
+        # Batch sizes the masked rollout step captures at, for a full clip.
+        # Off by default: a capture holds a graph's memory beside the
+        # predictor, and pays off when the step repeats (``step_repeats``).
+        self.rollout_capture_batch_sizes = list(rollout_capture_batch_sizes or ())
 
         self.config = self._load_config(predictor_kind, ac_predictor_config)
         # here and not on the first video, so a bad checkpoint is refused at startup
@@ -481,15 +484,13 @@ class VJepa2Model(Model):
 
         # -- Batched (masked + AC): accumulated_outputs, one message at
         # -- loop completion.  ``max_iters`` is a config-level upper bound
-        # -- baked in at graph-build time; the per-request horizon is
-        # -- enforced inside the submodule via ``check_stop`` when
-        # -- iter_idx + 1 reaches it.
+        # -- baked in at graph-build time; ``get_loop_caps`` caps a request
+        # -- at its horizon, so async scheduling never runs past it.
         rollout_section_batched = GraphNode(
             name="rollout_predictor",
             input_names=rollout_inputs,
             outputs=list(rollout_loopback_outputs),
-            # dynamic rollout loop; don't want async scheduling to overshoot by one
-            enable_async_scheduling=False
+            enable_async_scheduling=True,
         )
         rollout_loop_batched = Loop(
             name=self.ROLLOUT_LOOP_NAME,
@@ -522,8 +523,7 @@ class VJepa2Model(Model):
                     output_modality="video",
                 ),
             ],
-            # dynamic rollout loop; don't want async scheduling to overshoot by one
-            enable_async_scheduling=False
+            enable_async_scheduling=True,
         )
         rollout_loop_streaming = Loop(
             name=self.ROLLOUT_LOOP_NAME,
@@ -942,13 +942,6 @@ class VJepa2Model(Model):
             # The encoder's capture bucket is chosen before its inputs exist
             # (VJepa2EncoderSubmodule.cg_key_info), so the clip shape rides here.
             step_metadata["video_shape"] = tuple(int(d) for d in input_signals["video_frames"][0].dims)
-        if walk in (self.PREFILL_VIDEO_ROLLOUT, self.PREFILL_VIDEO_ROLLOUT_STREAMING):
-            # Per-request horizon enforced by ``VJepa2RolloutPredictorSubmodule``
-            # via ``check_stop`` once iter_idx + 1 reaches it.  The
-            # graph's Loop is always built with ``max_iters=config.max_rollout_horizon``.
-            # Streaming variant uses the same horizon logic — the submodule
-            # doesn't distinguish walks.
-            step_metadata["rollout_horizon"] = self._rollout_horizon(model_kwargs or {})
 
         unpersist_tensors = sum([inp.tensor_info for inp in inputs], start=[])
         return ForwardPassArgs(
@@ -1020,6 +1013,7 @@ class VJepa2Model(Model):
                 num_output_frames=self.config.rollout_num_output_frames,
                 frames_per_second=self.config.rollout_frames_per_second,
                 anticipation_seconds=self.config.rollout_anticipation_seconds,
+                capture_batch_sizes=self.rollout_capture_batch_sizes,
             )
         # MPC predictor + scorer (AC only).  Predictor shares
         # the VisionTransformerPredictorAC nn.Module with ``predictor``.

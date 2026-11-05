@@ -769,24 +769,32 @@ def loop_edges(section: GraphSection, node_name: str) -> LoopEdges | None:
     inner = next((loop for loop in loops if not set(loop.section.get_loops()) & {lp.name for lp in loops}), None)
     if inner is None:
         return None
-    node = inner.get_nodes()[node_name]
+    nodes = inner.get_nodes()
+    node = nodes[node_name]
     back = inner._loop_back_inputs or set()
     terminal = {edge.name for edge in inner.outputs}
+    accumulated = {edge.name for edge in inner.accumulated_outputs}
     inputs = {
         name: EdgeKind.LOOP_BACK if (name, node_name) in back
         else EdgeKind.PER_ITERATION if name in node._streaming_inputs
         else EdgeKind.CONSTANT
         for name in node.input_names
     }
+    # A loop-back its node never reads only feeds the loop's accumulated
+    # outputs: an iteration's item when the loop accumulates it, else nothing.
+    unread = {(name, dest) for name, dest in back if dest not in nodes or name not in nodes[dest].input_names}
+    edges = [
+        edge for edge in node.outputs
+        if (edge.name, edge.next_node) not in unread or edge.name in accumulated
+    ]
     outputs = {
-        (edge.name, edge.next_node): EdgeKind.LOOP_BACK if (edge.name, edge.next_node) in back
+        (edge.name, edge.next_node): EdgeKind.LOOP_BACK if (edge.name, edge.next_node) in back - unread
         else EdgeKind.TERMINAL if edge.name in terminal
         else EdgeKind.PER_ITERATION
-        for edge in node.outputs
+        for edge in edges
     }
-    accumulated = {edge.name for edge in inner.accumulated_outputs}
     items = frozenset(
-        (edge.name, edge.next_node) for edge in node.outputs
+        (edge.name, edge.next_node) for edge in edges
         if outputs[(edge.name, edge.next_node)] is EdgeKind.PER_ITERATION
         and (edge.is_streaming or edge.name in accumulated or edge.next_node in SPECIAL_DESTINATIONS)
     )

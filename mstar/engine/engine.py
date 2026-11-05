@@ -3142,6 +3142,7 @@ class Engine:
 
         cg_runner = submodule_mgmt.accelerator_graph_runner
         if cg_runner is None:
+            batch.step_context.repeats = 1  # an eager step runs one iteration
             return None
         # Which of the walk's captures this batch belongs to. The engine can't
         # derive it — what separates two captures of one walk is the model's
@@ -3179,6 +3180,9 @@ class Engine:
         if lease is not None:
             batch.lease_slot(lease)
             ctx.force_prefill = cg_runner.is_packed(lease)
+        else:
+            # an eager step runs one iteration: only a replay repeats
+            ctx.repeats = 1
         return lease
 
     def can_pre_plan(self, node_name: str) -> bool:

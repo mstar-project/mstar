@@ -561,18 +561,10 @@ def _vjepa2(predictor_kind: str = "ac", extrinsics: bool = False):
     return model
 
 
-@pytest.mark.parametrize("horizon", [2, 40])
-def test_vjepa2_caps_the_rollout_where_its_stop_check_ends_it(horizon):
-    from mstar.model.vjepa2.submodules import VJepa2ACRolloutPredictorSubmodule
-
-    model = _vjepa2()
-    kwargs = {"rollout_horizon": horizon}
-    step_metadata = model.get_initial_forward_pass_args("p0", ["video"], ["video"], {}, kwargs).step_metadata
-
-    assert model.get_loop_caps(**kwargs)["rollout_loop"] == _stops_after(
-        VJepa2ACRolloutPredictorSubmodule(None, model.config).check_stop, "rollout_loop", "prefill_video_rollout",
-        64, {}, max_tokens=1, step_metadata=step_metadata,
-    ), "the cap and the stop check end the rollout on different iterations"
+@pytest.mark.parametrize(("horizon", "cap"), [(2, 2), (40, 16)])
+def test_vjepa2_caps_the_rollout_at_the_request_horizon(horizon, cap):
+    # the cap is the rollout's only stop: the horizon, clamped to max_iters
+    assert _vjepa2().get_loop_caps(rollout_horizon=horizon)["rollout_loop"] == cap
 
 
 @pytest.mark.parametrize("extrinsics", [False, True])

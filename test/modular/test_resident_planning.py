@@ -304,6 +304,29 @@ def test_a_repeated_step_addresses_each_replay_as_host_plans_would(repeats):
         assert tables.host_len[planner.slot_of(rid)] == live["kv"]._streams[rid]["main"].stored_len
 
 
+@pytest.mark.parametrize("captured", [True, False])
+def test_a_step_with_no_capture_for_its_batch_runs_one_iteration(captured):
+    """Only a replay repeats: a batch that leases no graph (a size or shape
+    the node didn't capture) runs its eager forward once."""
+    from mstar.engine.engine import Engine
+
+    def lease_slot(graph_walk, bs, slot, num_tokens=None, cg_key_info=None):
+        return SlotLease(slot, BucketKey(graph_walk, bs, bs)) if captured else None
+
+    engine = object.__new__(Engine)
+    engine._submodules = {"n": SimpleNamespace(
+        submodule=SimpleNamespace(cg_key_info=lambda walk, info, **kw: None), lora_pools=(), resident=None,
+        accelerator_graph_runner=SimpleNamespace(lease_slot=lease_slot, is_packed=lambda lease: False),
+    )}
+    batch = SimpleNamespace(
+        node_name="n", slot=0, request_ids=["a", "b"], inputs=None, per_request_info_wrapped={},
+        per_request_input_metadata={}, step_context=SimpleNamespace(graph_walk=WALK, repeats=4),
+        lease_slot=lambda lease: None,
+    )
+    engine.reserve_replay_slot(batch)
+    assert batch.step_context.repeats == (4 if captured else 1)
+
+
 def test_a_repeat_carries_every_loop_back_signal_and_keeps_a_column_per_replay():
     """A replay overwrites its outputs and reads its static inputs, so a step
     that repeats hands each replay what the one before left of every
@@ -447,6 +470,24 @@ def test_each_edge_of_a_loop_has_its_own_kind():
         ("latent", "vae"): EdgeKind.TERMINAL,
     }
     assert loop_edges(_token_loop(), "absent") is None
+
+
+@pytest.mark.parametrize("accumulated", [True, False])
+def test_a_loop_back_its_node_never_reads_is_an_item_only_of_what_the_loop_accumulates(accumulated):
+    """It routes nothing to the next iteration, so a run carries none of it:
+    an accumulated one keeps a column a replay, else it is no edge at all."""
+    from mstar.graph.base import GraphEdge, GraphNode, Loop, loop_edges
+    from mstar.graph.special_destinations import EMIT_TO_CLIENT
+    from mstar.worker.step_repeats import loop_back, run_columns
+
+    node = GraphNode(name="n", input_names={"h"}, outputs=[GraphEdge("n", "h"), GraphEdge("n", "p")])
+    loop = Loop(section=node, max_iters=8, outputs=[], name="loop", accumulated_outputs=(
+        [GraphEdge(EMIT_TO_CLIENT, "p")] if accumulated else []
+    ))
+    edges = loop_edges(loop, "n")
+    assert loop_back(edges) == {"h"}
+    assert run_columns(edges, inline=()) == ({"p"} if accumulated else set())
+    assert (("p", "n") in edges.outputs) == accumulated
 
 
 def _frames(streaming: bool):
