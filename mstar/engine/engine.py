@@ -2769,7 +2769,8 @@ class Engine:
         ``prepare_inputs`` and the stop check stay outside — the worker has to
         place those itself.
         """
-        with self._stage_lock if self._beside_chain(batch.node_name) else nullcontext():
+        beside = self._stage_lock is not None and self._beside_chain(batch.node_name)
+        with self._stage_lock if beside else nullcontext():
             outputs = self.exec(batch)
         laps = PhaseLaps("engine.")
         # A failed admit means no forward ran and every rid's outputs are empty,

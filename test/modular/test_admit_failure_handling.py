@@ -65,6 +65,7 @@ class _FakeEngine:
     """Just enough engine to exercise the ``exec``/``postprocess`` branch."""
 
     exec_and_postprocess = Engine.exec_and_postprocess
+    _stage_lock = None  # no lanes
 
     def __init__(self, admit_error):
         self._admit_error = admit_error

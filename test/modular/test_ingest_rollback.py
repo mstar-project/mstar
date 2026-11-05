@@ -28,6 +28,7 @@ def _runner(resources):
     runner._resources = {r.name: r for r in resources}
     runner._order = [r.name for r in resources]
     runner._on_lane = {}
+    runner._generations, runner._generation = {}, iter(range(100))
     return runner
 
 
