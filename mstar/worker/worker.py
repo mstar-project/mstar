@@ -5356,6 +5356,11 @@ class Worker:
             # The error handler owes the followers a marker for any other lead
             # step it drops.
             decided: PendingBatch | None = None
+            # The seq of a lockstep step this leader broadcast and has not
+            # submitted: the followers run it unless N's verdict voids it on
+            # every rank, so a raise that drops it must stop this rank (see the
+            # handler below). A follower's own raises are not covered.
+            committed: int | None = None
             try:
                 batch = None
                 spec_pending = None
@@ -5424,6 +5429,8 @@ class Worker:
                     pending, consecutive_spec_steps, fair,
                 )
                 decided = pending
+                if speculation is not None and speculation.tp_seq >= 0 and not self.is_tp_follower:
+                    committed = speculation.tp_seq
                 # inclusive of `speculate` and `worker.schedule_yield_away`
                 laps.lap("build_speculation")
                 if speculation is not None:
@@ -5460,6 +5467,8 @@ class Worker:
                         if self.enable_nvtx:
                             range_pop(synchronize=False)
 
+                    if speculation is not None and not speculation.is_yield_away and self._step_voids_head(pending):
+                        committed = None  # every rank voids the head on this verdict
                     laps.skip()
                     # set node._in_flight to false, since
                     # the node has just completed
@@ -5568,6 +5577,7 @@ class Worker:
                             # from here; see _handle_main_loop_error
                             speculation.plan_future = None
                             speculation.submitted = True
+                            committed = None
                             if self.enable_nvtx:
                                 range_pop(synchronize=False)
                                 range_push("worker.gpu_submit_queued", synchronize=False)
@@ -5579,16 +5589,19 @@ class Worker:
                                 _phase_record("submit_spec", _time.perf_counter() - _t0)
                             if self.enable_nvtx:
                                 range_pop(synchronize=False)
-                        elif speculation.plan_future is not None:
-                            # All continuing rids were dropped, so no spec
-                            # batch was submitted. Drop the orphaned pre-plan
-                            # so the next step to lease that slot doesn't
-                            # promote it. Await first: this batch never reaches
-                            # the GPU thread, so nothing else joins the future,
-                            # and resetting under a running plan races it.
-                            speculation.plan_future.result()
-                            self._reset_skip_plan_flags(speculation.node_batch)
-                            speculation.plan_future = None
+                        else:
+                            # Every rank drops the same rows, so none runs it.
+                            committed = None
+                            if speculation.plan_future is not None:
+                                # All continuing rids were dropped, so no spec
+                                # batch was submitted. Drop the orphaned pre-plan
+                                # so the next step to lease that slot doesn't
+                                # promote it. Await first: this batch never reaches
+                                # the GPU thread, so nothing else joins the future,
+                                # and resetting under a running plan races it.
+                                speculation.plan_future.result()
+                                self._reset_skip_plan_flags(speculation.node_batch)
+                                speculation.plan_future = None
 
                     # Post-process N (routing stage) — runs concurrently with
                     # GPU(N+1) if we submitted one above. Skipped on any admit
@@ -5670,6 +5683,8 @@ class Worker:
                 # A leader stamps the seq it sends; a follower's batch keeps
                 # the one it came off the FIFO with; everyone else -1.
                 broadcast_seq = self.maybe_send_zmq_to_tp_followers(node_batch)
+                if broadcast_seq >= 0:
+                    committed = broadcast_seq
                 fallthrough_tp_seq = broadcast_seq if broadcast_seq >= 0 else batch.tp_seq
 
                 # Unlike the spec submit, this path doesn't hold off the GIL for
@@ -5679,6 +5694,7 @@ class Worker:
                     gpu_executor, batch, node_batch,
                     partition=batch_partition, tp_seq=fallthrough_tp_seq,
                 )
+                committed = None
                 logger.debug("Scheduling: %s %s", batch.node_name, node_batch.request_ids)
                 _set_pending(step)
                 # Same accounting as the speculative path above
@@ -5690,6 +5706,15 @@ class Worker:
                     _phase_flush()
             except Exception as e:
                 self._handle_main_loop_error(e, (pending, spec_pending), batch, speculation)
+                if committed is not None:
+                    # Failing the step's rows is all this rank can do: the followers
+                    # are in its collectives, or will be, and no marker releases
+                    # them. Stop, and the conductor's dead-worker check fails the
+                    # rest instead of the group hanging.
+                    raise SystemExit(
+                        f"Worker {self.worker_id}: dropped lockstep step seq {committed} "
+                        f"that the followers run ({e!r})"
+                    ) from e
                 # Follower: a head from a step that raised must not sit at the
                 # FIFO front with failed rids.
                 if pending is not None and self._is_tp_follow_pending(pending):
@@ -5705,9 +5730,8 @@ class Worker:
                             and self._can_speculate(dropped.batch) and self._is_tp_lead_pending(dropped)
                         ):
                             self._broadcast_tp_nospec(dropped)
-                # Clear the in-flight step. Without this the next iteration
-                # calls .result() on the same completed-with-exception future
-                # and re-raises forever, wedging the worker on one bad batch.
+                # Clear the in-flight step: its rows are failed and its future
+                # drained, and it must not be post-processed again.
                 _set_pending(None)
                 consecutive_spec_steps = 0
                 sleep(0.01)
