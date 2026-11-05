@@ -902,3 +902,42 @@ def test_pi05_droid_config_serves_the_droid_checkpoint_with_its_stats():
     # 7 joint positions + gripper for the state, 7 joint velocities + gripper for the actions
     assert model.norm_stats.state.q01.numel() == model.norm_stats.state.q99.numel() == 8
     assert model.norm_stats.actions.q01.numel() == model.norm_stats.actions.q99.numel() == 8
+
+
+def test_an_action_run_of_four_steps_equals_four_one_step_steps():
+    """``action_gen`` returns its rows as static rows of the batch, so a run
+    carries ``noisy_actions`` and ``timestep_index`` into its next replay and
+    four replays reach the actions four steps do; a row the next step reads
+    back has its own shape. The Euler step is a stand-in."""
+    from run_parity import replay_run
+
+    config = Pi05Config(hidden_size=16)
+    llm = Pi05LLMSubmodule(torch.nn.Embedding(10, 16), torch.nn.Identity(), torch.nn.Identity(), torch.nn.Identity(),
+                           torch.nn.Identity(), torch.nn.Identity(), config)
+    llm._euler_step = lambda noisy, idx, **kw: (
+        noisy * 0.9 + idx.repeat_interleave(config.action_horizon)[:, None].to(noisy.dtype), idx + 1,
+    )
+    llm._get_timestep_emb_fraction = lambda: None
+    llm._get_time_emb_buffer = lambda n: None
+    engine_inputs = ModelInputsFromEngine(request_ids=["a", "b"], per_request_info={})
+    torch.manual_seed(0)
+    first = torch.randn(2 * config.action_horizon, config.action_dim)
+    static = {"noisy_actions": first, "timestep_index": torch.zeros(2, dtype=torch.long)}
+
+    def forward(**inputs):
+        out = llm.forward_batched("action_gen", engine_inputs, fraction=None, time_emb_buffer=None, **inputs)
+        return out.row_outputs
+
+    actions, index = first, static["timestep_index"]
+    for _ in range(4):
+        # as the next step packs its rows back
+        out = forward(noisy_actions=actions.reshape(-1, config.action_dim), timestep_index=index.reshape(-1))
+        actions, index = out["noisy_actions"], out["timestep_index"]
+    # what a later step's row reads back: one request's horizon of actions
+    row = llm.prepare_inputs("action_gen", None, {"noisy_actions": [actions[1:2]], "timestep_index": [index[1:2]]})
+    assert row.tensor_inputs["noisy_actions"].shape == (config.action_horizon, config.action_dim)
+    carries = llm.repeat_carry("action_gen", {"noisy_actions", "timestep_index"})
+    replay_run(forward, static, carries, 4)
+    assert torch.equal(static["timestep_index"], torch.full((2,), 3))
+    final = forward(**static)
+    assert torch.equal(final["noisy_actions"], actions) and torch.equal(final["timestep_index"], index)
