@@ -652,10 +652,10 @@ def test_tensor_parallel_ranks_meet_at_each_collective():
     a value-less GPU tensor moves nothing but costs its NCCL time. Data moves only
     if every rank holds it."""
     out = run_sim("""
-        import os, torch, torch.distributed as dist, torch.multiprocessing as mp
+        import os, tempfile, torch, torch.distributed as dist, torch.multiprocessing as mp
 
-        def rank(r):
-            dist.init_process_group("nccl", init_method="tcp://127.0.0.1:29573", rank=r,
+        def rank(r, path):
+            dist.init_process_group("nccl", init_method=f"file://{path}", rank=r,
                                     world_size=2, device_id=torch.device("cuda", r))
             torch.cuda.set_device(r)
             x = torch.empty(2**30, dtype=torch.bfloat16, device="cuda")  # 2 GiB, no data
@@ -714,7 +714,7 @@ def test_tensor_parallel_ranks_meet_at_each_collective():
             dist.destroy_process_group()
 
         if __name__ == "__main__":
-            mp.spawn(rank, nprocs=2)
+            mp.spawn(rank, args=(tempfile.mkdtemp() + "/group",), nprocs=2)
             print("ok")
     """)
     assert out.strip().endswith("ok")
@@ -735,7 +735,7 @@ def test_tensor_parallel_ranks_meet_at_each_collective():
                 dist.all_to_all_single(y, x, group=sp)
             graph.replay()
             # a reduce writes only its destination's: rank 1's stale tensor taints rank 0's sum, and the
-            # others' buffers stay as they were (gloo's, past two ranks, leaves partial sums in them)
+            # others' buffers stay as they were (gloo's reduce can leave partial sums in them)
             from mstar_sim.device import never_computed, set_never_computed
             summed = torch.full((4,), r + 1.0, device="cuda")
             set_never_computed(summed._data, r == 1)
