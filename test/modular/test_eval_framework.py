@@ -364,6 +364,7 @@ class H(BaseHTTPRequestHandler):
                 if "STALL" in req["input"] and i == 2:
                     time.sleep(0.3)
                 if "SLOW" in req["input"] and i == 1:
+                    open(sys.argv[2] + ".slow", "w").close()  # the test's signal may go now
                     time.sleep(30)
                 time.sleep(0.005)
                 self.wfile.write(tone(0.05)); self.wfile.flush()
@@ -427,21 +428,100 @@ def test_managed_server_lifecycle(fake_cmd):
             pass
 
 
-def test_sigterm_to_the_runner_stops_the_managed_server(tmp_path, fake_cmd):
-    pidfile = tmp_path / "server.pid"
-    (tmp_path / "s.txt").write_text("SLOW one two\n")
+@pytest.mark.parametrize("sig, end, inherited_ignored, status", [
+    ("SIGTERM", "pass", False, 128 + 15),
+    ("SIGTERM", "raise SystemExit(0)", False, 128 + 15),
+    ("SIGINT", "pass", True, -2),                        # a background launch: SIGINT is still ours
+])
+def test_a_signal_held_by_an_import_sets_the_exit_status_of_a_block_that_ends_first(
+        tmp_path, sig, end, inherited_ignored, status):
+    import signal
+
+    (tmp_path / "signalling.py").write_text(f"import os, signal\nos.kill(os.getpid(), signal.{sig})\n")
+    code = ("from benchmark.eval.server import exit_on_signals\n"
+            f"with exit_on_signals():\n    import signalling\n    {end}\n")
+    ignore_sigint = (lambda: signal.signal(signal.SIGINT, signal.SIG_IGN)) if inherited_ignored else None
+    done = subprocess.run([sys.executable, "-c", code], env={**os.environ, "PYTHONPATH": str(tmp_path)},
+                          preexec_fn=ignore_sigint, capture_output=True, text=True, timeout=60, check=False)
+    assert done.returncode == status, done.stderr
+
+
+def test_a_signal_during_stop_does_not_cut_the_teardown_short(tmp_path):
+    import signal
+    import threading
+
+    from benchmark.eval.server import ManagedServer, _exit_on_signal
+
+    ready = tmp_path / "ready"
+    srv = ManagedServer("stubborn", command=[sys.executable, "-c", "import signal, time; "
+                                             "signal.signal(signal.SIGINT, signal.SIG_IGN); "
+                                             f"open({str(ready)!r}, 'w').close(); time.sleep(60)"])
+    srv.start()
+    pid = srv.pid
+    deadline = time.monotonic() + 20
+    while not ready.exists() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    old = signal.signal(signal.SIGTERM, _exit_on_signal)
+    timer = threading.Timer(0.2, os.kill, (os.getpid(), signal.SIGTERM))   # while stop() waits out SIGINT
+    try:
+        timer.start()
+        with pytest.raises(SystemExit):
+            srv.stop(grace_s=2.0)
+    finally:
+        timer.cancel()
+        timer.join()
+        signal.signal(signal.SIGTERM, old)
+    with pytest.raises(ProcessLookupError):
+        os.kill(pid, 0)
+
+
+# A torch that sends the runner a SIGTERM (or SIGINT) inside its import (the real import runs Python from C++, where the
+# SystemExit aborts the process, and import-lock weakref callbacks, which drop it), or in a finalizer after the
+# import (which drops it too).
+SIGNALLING_TORCH = """
+import os, signal
+class _Signal:
+    def __del__(self):
+        os.kill(os.getpid(), signal.SIGTERM)
+        sum(range(1000))
+class _Version:
+    @property
+    def cuda(self):
+        {finalizer}_Signal()
+        return None
+__version__, version = "0.0", _Version()
+{import_}os.kill(os.getpid(), signal.{sig})
+open(__file__ + ".imported", "w").close()
+"""
+
+
+@pytest.mark.parametrize("where, sig", [("request in flight", "SIGTERM"), ("inside an import", "SIGTERM"),
+                                       ("inside an import", "SIGINT"), ("in a finalizer", "SIGTERM")])
+def test_sigterm_to_the_runner_stops_the_managed_server(tmp_path, fake_cmd, where, sig):
+    pidfile, env = tmp_path / "server.pid", dict(os.environ)
+    (tmp_path / "s.txt").write_text("SLOW one two\n" if where == "request in flight" else "one two\n")
+    if where != "request in flight":
+        (tmp_path / "site" / "torch").mkdir(parents=True)
+        (tmp_path / "site" / "torch" / "__init__.py").write_text(SIGNALLING_TORCH.format(
+            import_="" if where == "inside an import" else "# ", finalizer="" if where == "in a finalizer" else "# ",
+            sig=sig))
+        (tmp_path / "site" / "torch-0.0.dist-info").mkdir()
+        (tmp_path / "site" / "torch-0.0.dist-info" / "METADATA").write_text("Name: torch\nVersion: 0.0\n")
+        env["PYTHONPATH"] = os.pathsep.join([str(tmp_path / "site"), env.get("PYTHONPATH", "")])
     runner = subprocess.Popen(
         [sys.executable, "-m", "benchmark.eval", "run", "tts", "--serve-cmd", f"{fake_cmd} {pidfile}",
          "--data", str(tmp_path / "s.txt"), "--repeats", "1", "--warmup", "0", "--asr-judge", "none",
          "--out", str(tmp_path / "out")],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env,
     )
-    deadline = time.monotonic() + 20
-    while not pidfile.exists() and time.monotonic() < deadline:
-        time.sleep(0.05)
-    time.sleep(1.0)  # the slow request is in flight
-    runner.terminate()
-    assert runner.wait(timeout=30) == 128 + 15
+    if where == "request in flight":
+        deadline = time.monotonic() + 30
+        while not os.path.exists(f"{pidfile}.slow") and time.monotonic() < deadline:
+            time.sleep(0.05)
+        runner.terminate()
+    assert runner.wait(timeout=30) == (-2 if sig == "SIGINT" else 128 + 15)   # an unhandled Ctrl-C dies by SIGINT
+    if where == "inside an import":
+        assert (tmp_path / "site" / "torch" / "__init__.py.imported").exists()  # the import was not cut short
     pid = int(pidfile.read_text())
     deadline = time.monotonic() + 10
     while time.monotonic() < deadline:
