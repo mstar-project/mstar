@@ -1049,13 +1049,15 @@ class RealtimeConversation:
             tasks = [task for task in (self.clock_task, self.relay_task) if task is not None]
             for task in tasks:
                 task.cancel()
-            if tasks:
-                # wait, not gather: if the server cancels this handler meanwhile, the
-                # CancelledError it raises is its own, not the relay's (which gather
-                # passes on, and the server's cancel scope then doesn't recognise)
-                await asyncio.wait(tasks)
-            if self.key is not None:
-                self.api.abort_submission(self.key)
+            try:
+                if tasks:
+                    # wait, not gather: if the server cancels this handler meanwhile, the
+                    # CancelledError it raises is its own, not a task's (which gather
+                    # passes on, and the server's cancel scope then doesn't recognise)
+                    await asyncio.wait(tasks)
+            finally:   # the call ends even if the server cancels the wait
+                if self.key is not None:
+                    self.api.abort_submission(self.key)
 
     async def handle(self, event: dict) -> None:
         kind = event.get("type")
