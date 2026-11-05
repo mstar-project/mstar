@@ -30,6 +30,7 @@ from mstar.engine.resources import NodeResourceSpec, RaggedAttentionConfig, Ragg
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import ForwardPassArgs, Model
+from mstar.model.components.diffusion.attention import uses_ragged_attention
 from mstar.model.components.diffusion.image_io import encode_image, image_output_format
 from mstar.model.components.diffusion.qwen3.submodule import TEXT_INPUTS
 from mstar.model.components.quant_linear import (
@@ -57,8 +58,6 @@ logger = logging.getLogger(__name__)
 
 ENCODE_TEXT_WALK = "encode_text"
 IMAGE_GEN_WALK = "image_gen"
-ATTENTION_BACKENDS = ("flashinfer", "sdpa")
-
 
 class ZImageModel(Model):
     def __init__(
@@ -66,7 +65,7 @@ class ZImageModel(Model):
         model_path_hf: str = Z_IMAGE_TURBO,
         cache_dir: str | None = None,
         skip_weight_loading: bool = False,
-        attention_backend: str = "flashinfer",
+        attention_backend: str = "auto",
         compile: bool = True,
         compile_eager_rounding: bool = True,
         compile_exact_ops: bool | list[str] = False,
@@ -83,8 +82,8 @@ class ZImageModel(Model):
         linear_dtype_steps: int | list[str] | None = None,
         **kwargs,
     ):
-        if attention_backend not in ATTENTION_BACKENDS:
-            raise ValueError(f"attention_backend must be one of {ATTENTION_BACKENDS}, got {attention_backend!r}")
+        # the DiT's attention: the engine's ragged resource (the platform's kernel), or torch's SDPA inline
+        self.use_ragged_attention = uses_ragged_attention(attention_backend)
         self.model_path_hf = model_path_hf
         self.cache_dir = cache_dir
         self.skip_weight_loading = skip_weight_loading
@@ -130,7 +129,7 @@ class ZImageModel(Model):
 
     # ------------------------------------------------------------ structure
     def get_node_resources(self) -> list[NodeResourceSpec]:
-        if self.attention_backend != "flashinfer":
+        if not self.use_ragged_attention:
             return []
         tcfg = self.config.transformer
         return [
@@ -337,7 +336,7 @@ class ZImageModel(Model):
             quantize_linears(transformer, selection)
             return ZImageDenoiseSubmodule(
                 transformer, self.config, loop_name=DENOISE_LOOP,
-                attn_resource_key=DIT_ATTN if self.attention_backend == "flashinfer" else None,
+                attn_resource_key=DIT_ATTN if self.use_ragged_attention else None,
                 compile_transformer=self.compile_transformer,
                 compile_eager_rounding=self.compile_eager_rounding, compile_exact_ops=self.compile_exact_ops,
                 max_batch_size=self.max_batch_size,

@@ -554,7 +554,10 @@ requests); the KV cache gains one layer for the head. The ``mtp3`` configs verif
 greedily and refuse ``temperature > 0``; the ``mtp2`` ones set ``spec_sampling:
 true`` and also sample (temperature, ``top_p``, ``top_k``; a second decode capture),
 seeded by the request but not reproducing the plain path's draws. Neither takes
-``repetition_penalty``. They need
+``repetition_penalty``. The configs set ``draft_head: fp8``: drafts read an fp8 copy
+of ``lm_head`` (one rank; ``draft_head: bf16`` keeps one head), which gives up about
+1 % of the accepted drafts for a step about 6 % cheaper at 9B c=1 on MI325X, and the
+verify always reads the full head. They need
 AITER's attention (device-side KV lengths) and are checked on text prompts. See "Speculative decoding" in :doc:`adding_models` for the design.
 
 Qwen3.8-27B (``qwen3_8_27b``) is the Qwen3.5 architecture and runs on the same
@@ -1618,6 +1621,12 @@ Text-to-video and image-to-video on **Wan2.2-TI2V-5B** — the dense 5B variant
 encoder and the Wan2.2-VAE, all four nodes stateless. The A14B (MoE dual-DiT)
 variants are **not** supported; ``wan22`` rejects any other variant explicitly.
 
+The DiT's attention — self-attention over each guidance branch's video tokens and
+cross-attention over the text — runs on the engine's ragged attention resources with
+the platform's default kernel (``model_kwargs.attention_backend: auto``: FlashInfer
+FA3 on an H100, AITER's asm flash attention on MI300X/MI325X); ``sdpa`` keeps torch's
+kernel inline, the reference pipeline's, for parity runs.
+
 Install and serve on one GPU:
 
 .. code-block:: bash
@@ -1767,8 +1776,9 @@ ported yet.
 
 Five nodes: ``text_encoder`` (native Gemma-4 + the text connectors), ``dit`` (the
 DiT scaffold's denoise loop; video and audio latents carried in fp32; every attention
-through two ragged attention resources), ``latent_upsampler`` (two-stage recipe only),
-``vae_decoder`` and ``audio_decoder``. The walk follows the requested output
+through two ragged attention resources on the platform's default kernel,
+``attention_backend: auto``, or ``sdpa`` for parity runs), ``latent_upsampler`` (two-stage
+recipe only), ``vae_decoder`` and ``audio_decoder``. The walk follows the requested output
 modalities, so ``["video"]`` skips the audio decode (the model still denoises both).
 
 .. code-block:: bash
@@ -1846,9 +1856,13 @@ conditioning tokens, in order).
 Deployment knobs live under ``model_kwargs`` in ``configs/flux2_klein.yaml``:
 
 ``attention_backend``
-   ``sdpa`` (default) is the reference kernel, cuDNN on an H100. ``flashinfer`` runs the
-   DiT's joint attention on the engine's ragged FlashInfer resource; both are CUDA-graph
-   replayable.
+   ``sdpa`` (default) is the reference kernel, cuDNN on an H100. ``auto`` runs the DiT's
+   joint attention on the engine's ragged attention resource with the platform's default
+   kernel: FlashInfer FA3 on an H100, where it served as fast as SDPA (0.355 vs 0.349 s at
+   B=1), and AITER's asm flash attention on MI300X/MI325X, where torch's SDPA is AOTriton's
+   Triton kernel and well short of it. Both are graph-replayable. ``resources: dit_attn:
+   backend: flashinfer|aiter`` in the YAML pins a kernel; ``flashinfer`` as the value of
+   this knob is the earlier spelling of ``auto`` and means the same.
 
 ``compile``
    ``torch.compile`` of the transformer, one trace per shape.
@@ -1881,6 +1895,14 @@ Deployment knobs live under ``model_kwargs`` in ``configs/flux2_klein.yaml``:
      prompts (measured with the earlier compiled VAE decode), because a 4- or 8-step
      distilled sampler amplifies the last bit of inductor's own reductions and
      activation decompositions.
+   * On AMD GPUs the setting is not applied unless the deployment asks for it
+     (``knobs: dit_exact_ops: true``, see :doc:`environment_variables`). hipBLASLt picks
+     GEMM kernels per M, so the eager norms do not make the output match the reference
+     there either, and the bar is the reference's own cross-seed spread. On MI325X the
+     compiled norms take klein-4B from 0.406 to 0.384 s at B=1 and 2.97 to 3.32 images/s
+     at concurrency 16, klein-9B from 0.709 to 0.660 s and 1.54 to 1.68 images/s, with
+     both models' images closer to the reference (24.2 and 26.8 dB median, floors 22.4
+     and 25.5).
 
 ``cuda_graph``, ``capture_sizes``, ``capture_batch_sizes``
    The denoise step, Euler update included, is captured per listed ``[height, width]``
@@ -1921,7 +1943,7 @@ Deployment knobs live under ``model_kwargs`` in ``configs/flux2_klein.yaml``:
    36 to 44 GiB compiled.
 
 ``linear_dtype``
-   ``bf16`` (default), ``mxfp8`` or ``nvfp4``; klein 4B, 9B and Z-Image. Runs the block linears
+   ``bf16`` (default), ``fp8``, ``mxfp8`` or ``nvfp4``; klein 4B, 9B and Z-Image. Runs the block linears
    the model declares (``QUANTIZABLE_LINEARS`` beside each transformer) in that format: a
    ``QuantLinear`` holding the weight quantized once at load, after any ``lora``, whose forward
    is one op (``mstar::mxfp8_linear`` / ``mstar::nvfp4_linear``) that quantizes the activation
@@ -1946,6 +1968,36 @@ Deployment knobs live under ``model_kwargs`` in ``configs/flux2_klein.yaml``:
    and images per second at 8 concurrent requests rise 25% or 39%. Device memory after 8
    concurrent requests falls by 2.3 GiB on klein 4B with MXFP8 (5.1 GiB with NVFP4), 7.6 GiB on
    9B and 6.9 GiB on Z-Image (MXFP8, each model's shipped config with ``attention_backend: sdpa``).
+
+   ``fp8`` is the format every fp8 GEMM takes natively (MI300X/MI325X, Hopper and up;
+   ``mstar.model.components.fp8_rowwise``): e4m3 weights in the GPU's own variant
+   (``Platform.fp8_dtype``: FNUZ on gfx942, OCP elsewhere) with one scale per output channel,
+   activations quantised per token in plain torch so the compiled forward fuses that into the
+   producing norm, and the product on ``mstar::fp8_rowwise_mm`` (hipBLASLt / cuBLASLt). It
+   needs N and K multiples of 16. The text stream's linears (512 rows, where fp8 is no faster
+   on MI325X) are worth keeping bf16 with ``linear_keep_bf16``; the shipped AMD configs do.
+   On one MI325X (three server launches per setting) klein-9B serves 1.34 times the images
+   per second at one request and 1.39 times at 16 (0.71 to 0.53 s per 1024² image), klein-4B
+   1.19 and 1.21 times. The images move by e4m3 rounding: against the diffusers reference over
+   the 40 ``image_v1`` images, klein-9B goes from a median 26.6 to 23.1 dB PSNR and klein-4B
+   from 23.9 to 22.6 dB. Both stay far closer to the reference than another seed is
+   (normalized distance median 0.09 and 0.10, where 0 is a kernel change and 1 another seed),
+   but klein-9B falls under the ROCm floor of 3 dB below the reference's own kernel spread, so
+   it stays opt-in, a quality trade to make per deployment. Z-Image-Turbo's longer sampler
+   carries the error further (two of 40 images half-way or more to another seed), so ``fp8``
+   is not recommended there. Which linears to keep bf16 under ``fp8`` is a per-model
+   measurement: ``configs/flux2_klein_9b.yaml`` keeps the 51 of klein-9B's 80 fp8 linears with
+   the most image error per millisecond saved (every double block's, most single blocks' output
+   projections and two early fused projections); in a one-GPU MI325X A/B it serves at a median
+   26.5 dB from the diffusers reference, over the ROCm floor, at about 1.18 times the bf16
+   images per second (1.39 times with every linear in fp8). Lists giving back 20% and 30% of
+   the saving instead of 40% measured 25.2 dB, under the floor.
+   On AMD GPUs, fp8 needs ``knobs: dit_exact_ops: true`` too. The numbers above were
+   measured with the norms eager. The platform default compiles them, and then the 9B
+   keep-list scores 25.4 to 25.8 dB (floor 25.5) and klein-4B 22.5 to 22.7 (floor 22.4). With
+   the knob on they repeat across launches at 26.5 and 22.6 dB. At one request the knob
+   costs 8% and 7% of the fp8 images per second, which leaves 1.1 times bf16 with the knob
+   off (one MI325X, shared node).
 
 ``linear_keep_bf16``
    A list of module-name patterns over the transformer's linears to keep in bf16 for one

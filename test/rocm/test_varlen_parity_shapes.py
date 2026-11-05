@@ -346,10 +346,11 @@ def test_patch_embed_conv(case, worker_env):
 
     cin, cout, kernel, shape, dtype, tol = _PATCH_CONVS[case]
     env = dict(os.environ)
-    for key in _built_for().process_env_defaults():
+    defaults = _built_for().process_env_defaults()
+    for key in defaults:
         env.pop(key, None)
     if worker_env:
-        env.update(_built_for().process_env_defaults())
+        env.update({k: v(None) if callable(v) else v for k, v in defaults.items()})
     res = subprocess.run(
         [sys.executable, "-c", _CONV_CHECK, json.dumps([cin, cout, kernel, shape, dtype])],
         env=env, capture_output=True, text=True, timeout=300, check=True,

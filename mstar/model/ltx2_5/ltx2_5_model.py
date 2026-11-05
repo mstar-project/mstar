@@ -49,6 +49,7 @@ from mstar.engine.resources import (
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Parallel, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import ForwardPassArgs, Model
+from mstar.model.components.diffusion.attention import uses_ragged_attention
 from mstar.model.ltx2_5.config import (
     AUDIO_DECODER_NODE,
     DENOISE_LOOP,
@@ -110,7 +111,6 @@ REFINE_WALKS = {
     frozenset({"audio"}): REFINE_AUDIO_WALK,
 }
 RECIPES = ("single", "two_stage")
-ATTENTION_BACKENDS = ("flashinfer", "sdpa")
 
 
 class LTX25Model(Model):
@@ -121,7 +121,7 @@ class LTX25Model(Model):
         model_path_hf: str = LTX25_REPO,
         cache_dir: str | None = None,
         skip_weight_loading: bool = False,
-        attention_backend: str = "flashinfer",
+        attention_backend: str = "auto",
         compile: bool = True,
         compile_eager_rounding: bool = True,
         accelerator_graph: bool = True,
@@ -135,8 +135,8 @@ class LTX25Model(Model):
         async_scheduling: bool = True,
         **kwargs,
     ):
-        if attention_backend not in ATTENTION_BACKENDS:
-            raise ValueError(f"attention_backend must be one of {ATTENTION_BACKENDS}, got {attention_backend!r}")
+        # the DiT's attentions: the engine's ragged resources (the platform's kernel), or torch's SDPA inline
+        self.use_ragged_attention = uses_ragged_attention(attention_backend)
         self.model_path_hf = model_path_hf
         self.cache_dir = cache_dir
         # Dummy mode: get_submodule returns None for every node (CPU tests).
@@ -202,7 +202,7 @@ class LTX25Model(Model):
         self-attention exchanges tokens for heads; the rest run whole on each rank (see
         ``LTX2Block``), so keep all their heads. Nothing here is cached; ``"sdpa"``
         declares nothing."""
-        if self.attention_backend != "flashinfer":
+        if not self.use_ragged_attention:
             return []
         cfg = self.config.transformer
         return [
@@ -581,7 +581,7 @@ class LTX25Model(Model):
             return LTXDenoiseSubmodule(
                 weight_loader.build_transformer(self.config, snapshot, device, comm_group=tp_group, sp_group=sp_group),
                 self.config,
-                loop_name=DENOISE_LOOP, use_ragged_attention=self.attention_backend == "flashinfer",
+                loop_name=DENOISE_LOOP, use_ragged_attention=self.use_ragged_attention,
                 refine_walks=frozenset(REFINE_WALKS.values()),
                 compile_transformer=self.compile_transformer, compile_eager_rounding=self.compile_eager_rounding,
                 max_batch_size=self.max_batch_size, capture_buckets=self.capture_buckets(),
