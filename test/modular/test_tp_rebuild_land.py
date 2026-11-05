@@ -163,3 +163,22 @@ def test_a_follower_whose_rebuild_cant_start_stops(monkeypatch):
 
     with pytest.raises(SystemExit, match="TP ranks diverged"):
         sched.settle_tp_follow_delta(request_state, caught_up=True)
+
+
+def test_a_follower_starts_the_rebuild_of_a_request_busy_on_another_node(monkeypatch):
+    """v's drop here waits only for a step of this node, so v can be in a step of another node as rank 0 starts its
+    rebuild. A follower that skipped every request in flight on any node didn't start v's rebuild, and missed the keys
+    the rebuild lays out before it took rank 0's lease."""
+    (leader, lead), (follower, follow) = _both_short_then_drop(monkeypatch)
+    zero, one = _Rank(leader, lead), _Rank(follower, follow)
+    sched, request_state = one.scheduler, one.worker.request_state
+    sched.register_tp_follow(_head(lead, 0))
+    assert sched.settle_tp_follow_delta(request_state, caught_up=True)
+    sched.pop_tp_follow_head()
+    zero.scheduler._start_rebuild(NODE, "v", "decode")
+    sched.register_tp_follow(_head(lead, 1, ["v"]))
+    sched.in_flight_rids.add("v")
+
+    assert sched.settle_tp_follow_delta(request_state, caught_up=True)
+
+    assert one.rebuilds.rebuilding("v", NODE), "the follower didn't start v's rebuild at rank 0's row of it"
