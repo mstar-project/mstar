@@ -19,10 +19,11 @@ import pytest
 import torch
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
+from mstar.engine.state.adapters import node_resources
 from mstar.graph.base import GraphNode, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.submodule_base import ModelInputsFromEngine, NodeSubmodule
-from mstar.model.wan22.config import WAN22_VARIANT_TI2V_5B, Wan22Config
+from mstar.model.wan22.config import DIT_TOKENS, SELF_ATTN, WAN22_VARIANT_TI2V_5B, Wan22Config
 from mstar.model.wan22.submodules import (
     _DECODE_TILING_ENV,
     _DECODE_UNTILED_SAFETY_MARGIN,
@@ -110,13 +111,12 @@ def test_wan22_declares_expected_nodes():
 
 def test_wan22_declares_only_dit_attention_resources():
     """Nothing here is cached across steps: the only resource is the dit's
-    cacheless self-attention, and the sdpa backend declares none."""
+    cacheless self-attention, and the sdpa backend builds none."""
     model = _make_model()
-    specs = model.get_node_resources()
-    assert [spec.resource_key for spec in specs] == [Wan22DitSubmodule.SELF_ATTN]
+    specs = node_resources(model)
+    assert [spec.resource_key for spec in specs] == [SELF_ATTN]
     assert all(spec.nodes == {"dit"} for spec in specs)
-    model.config = Wan22Config(attention_backend="sdpa")
-    assert model.get_node_resources() == []
+    assert node_resources(model, sdpa_nodes={"dit"}) == []
     assert model.get_request_resource_configs(partition_fwd_args={}) == {}
 
 
@@ -995,15 +995,14 @@ def _dit_info(guidance: float) -> CurrentForwardPassInfo:
 def test_wan22_dit_attends_one_segment_per_branch(guidance, branches):
     submodule = Wan22DitSubmodule(transformer=None, config=Wan22Config())
     key = submodule.bucket_key_for(_dit_info(guidance))
-    assert submodule.attention_segments(key) == ((submodule.MAIN_SPAN, submodule.num_tokens(key)),) * branches
+    segments = ((submodule.MAIN_SPAN, submodule.num_tokens(key)),) * branches
+    assert submodule.attention_segments(key) == {DIT_TOKENS: segments}
 
 
-def test_wan22_dit_declares_its_attention_on_the_ragged_resource():
+def test_wan22_dit_declares_its_attention_on_its_array():
     submodule = _dit()
     node_inputs = submodule.prepare_inputs(
         graph_walk=Wan22Model.VIDEO_GEN_WALK, fwd_info=_dit_info(5.0), inputs=_dit_loop_inputs(),
     )
     step = submodule.declare_step(Wan22Model.VIDEO_GEN_WALK, ["r0"], [node_inputs])
-    assert set(step.steps) == {Wan22DitSubmodule.SELF_ATTN}
-    sdpa = Wan22DitSubmodule(transformer=None, config=Wan22Config(attention_backend="sdpa"))
-    assert sdpa.declare_step(Wan22Model.VIDEO_GEN_WALK, ["r0"], [node_inputs]) is None
+    assert set(step.state) == {DIT_TOKENS}

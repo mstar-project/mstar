@@ -3,7 +3,7 @@
 Structural behaviour only — no weights, no GPU: seeded noise at iteration 0, the step
 index from the engine's loop counter, the async-overshoot veto, equal-shape batching,
 stacked preprocess and per-row outputs, the stop boundary, the CUDA-graph bucket key
-and the ragged-attention step declaration.
+and the step's arrays and segments.
 """
 
 from __future__ import annotations
@@ -38,6 +38,8 @@ WALK = "image_gen"
 class ToyDenoise(DenoiseLoopSubmodule):
     """Velocity = -latents scaled by a learned-free constant; shape key = token count."""
 
+    ARRAYS: tuple[str, ...] = ()
+
     def __init__(self, **kwargs):
         super().__init__(loop_name=LOOP, **kwargs)
         self.scale = torch.nn.Parameter(torch.tensor(0.5))  # gives the module a device
@@ -57,6 +59,9 @@ class ToyDenoise(DenoiseLoopSubmodule):
 
     def num_tokens(self, bucket_key):
         return bucket_key[0] + bucket_key[1]
+
+    def attention_segments(self, bucket_key):
+        return {name: ((self.MAIN_SPAN, self.num_tokens(bucket_key)),) for name in self.ARRAYS}
 
     def capture_request_inputs(self, bucket_key, device):
         return {LATENTS: torch.zeros(bucket_key[0], 4, device=device), "cond": torch.zeros(3, device=device)}
@@ -178,8 +183,12 @@ def test_preprocess_stacks_and_forward_batched_splits_rows():
     assert single[LATENTS][0].shape == (8, 4)
 
 
+class OneArrayDenoise(ToyDenoise):
+    ARRAYS = ("tokens",)
+
+
 def test_cg_key_info_and_declare_step_agree():
-    sub = ToyDenoise(attn_resource_key="dit_attn")
+    sub = OneArrayDenoise()
     infos = {"a": _info("a", 0), "b": _info("b", 3)}
     assert sub.cg_key_info(WALK, infos) == (8, 3)
     infos["c"] = _info("c", 0, tokens=16)
@@ -192,8 +201,8 @@ def test_cg_key_info_and_declare_step_agree():
     step = sub.declare_step(WALK, ["a", "b"], [a, b])
     assert step.cg_key_info == (8, 3)
     assert [(s.request_id, s.label, s.span) for s in step.segments] == [("a", "main", 11), ("b", "main", 11)]
-    assert set(step.steps) == {"dit_attn"} and step.steps["dit_attn"].causal is False
-    assert ToyDenoise().declare_step(WALK, ["a"], [a]) is None  # no resource declared -> nothing to plan
+    assert set(step.state) == {"tokens"} and step.state["tokens"].segments == tuple(step.segments)
+    assert ToyDenoise().declare_step(WALK, ["a"], [a]) is None  # no array declared -> nothing to plan
 
 
 def test_accelerator_graph_configs_one_bucket_per_shape():
@@ -235,24 +244,24 @@ def test_captured_layouts_are_kept_and_the_rest_are_lru_bounded():
 
 
 class TwoSpanDenoise(ToyDenoise):
-    """A model whose refiner layers attend over the image tokens alone."""
+    """A model whose refiner layers attend over the image tokens alone, through an array of their own."""
 
     def attention_segments(self, bucket_key):
-        return (("image", bucket_key[0]), ("main", self.num_tokens(bucket_key)))
+        return {"image_tokens": (("image", bucket_key[0]),), "tokens": (("main", self.num_tokens(bucket_key)),)}
 
 
 def test_declare_step_lists_every_attention_span_per_row():
-    sub = TwoSpanDenoise(attn_resource_key="dit_attn")
+    sub = TwoSpanDenoise()
     a = sub.prepare_inputs(WALK, _info("a", 0), _inputs())
     b = sub.prepare_inputs(WALK, _info("b", 1), _inputs(torch.ones(8, 4)))
     step = sub.declare_step(WALK, ["a", "b"], [a, b])
     assert [(s.request_id, s.label, s.span) for s in step.segments] == [
         ("a", "image", 8), ("a", "main", 11), ("b", "image", 8), ("b", "main", 11),
     ]
+    assert [(s.request_id, s.span) for s in step.state["image_tokens"].segments] == [("a", 8), ("b", 8)]
+    assert [(s.request_id, s.span) for s in step.state["tokens"].segments] == [("a", 11), ("b", 11)]
     # a capture bucket's rows carry the shape key, so their spans match the real rows'
-    cfg = TwoSpanDenoise(attn_resource_key="dit_attn", capture_buckets=[(WALK, (8, 3))]).get_accelerator_graph_configs(
-        torch.device("cpu"),
-    )[0]
+    cfg = TwoSpanDenoise(capture_buckets=[(WALK, (8, 3))]).get_accelerator_graph_configs(torch.device("cpu"))[0]
     pad = cfg.single_request_inputs
     assert [(s.label, s.span) for s in sub.declare_step(WALK, ["pad"], [pad]).segments] == [("image", 8), ("main", 11)]
 
@@ -398,30 +407,6 @@ def test_a_step_scalar_too_short_for_its_offset_says_so():
 
     with pytest.raises(ValueError, match="needing 5 entries for 4 steps, but timesteps has 4"):
         OffsetPastTheEnd().prepare_inputs(WALK, _info("a", 0), _inputs())
-
-
-def test_ragged_for_binds_the_label():
-    class Resource:
-        def run(self, q, k, v, label=None):
-            return self, label
-
-    sub = TwoSpanDenoise(attn_resource_key="dit_attn")
-    resource = Resource()
-    sub.bind_node_resources({"dit_attn": resource})
-    image = sub.ragged_for("image")
-    assert image(None, None, None) == (resource, "image")
-    assert sub._ragged()(None, None, None) == (resource, "main")
-    # built once per label for the binding, not per step
-    assert sub.ragged_for("image") is image and sub._ragged() is sub._ragged()
-    # a rebinding starts over: a callable holding the old resource would attend
-    # through a plan nothing writes to any more
-    new_resource = Resource()
-    sub.bind_node_resources({"dit_attn": new_resource})
-    assert sub.ragged_for("image")(None, None, None) == (new_resource, "image")
-    assert sub.ragged_for("main")(None, None, None) == (new_resource, "main")
-    assert ToyDenoise().ragged_for("image") is None  # no resource declared -> SDPA
-    unbound = TwoSpanDenoise(attn_resource_key="dit_attn")
-    assert unbound.ragged_for("image") is None  # declared but not bound yet -> SDPA
 
 
 def test_cg_key_info_accepts_the_contract_the_engine_calls_it_with():

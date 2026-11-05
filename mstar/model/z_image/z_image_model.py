@@ -1,6 +1,6 @@
 """ZImageModel: Z-Image-Turbo text-to-image (8 steps, no CFG) on the DiT scaffold.
 
-Architecture (3 nodes; the dit optionally owns one ragged attention resource):
+Architecture (3 nodes; the dit declares the arrays its attentions read):
 
     text_encoder  Qwen3-4B hidden states after layer 35 for the real prompt tokens
     dit           single-stream flow transformer (2 + 2 refiner blocks, 30 blocks), fp32 Euler
@@ -26,10 +26,11 @@ import torch
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardConductorMetadata, StreamingConnectionState
-from mstar.engine.resources import NodeResourceSpec, RaggedAttentionConfig, RaggedAttentionSpec
+from mstar.engine.state import Array, Attend, Block, Read
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import ForwardPassArgs, Model
+from mstar.model.components.diffusion.attention import dit_entry, refuse_attention_backend_kwarg
 from mstar.model.components.diffusion.image_io import encode_image, image_output_format
 from mstar.model.components.diffusion.qwen3.submodule import TEXT_INPUTS
 from mstar.model.components.quant_linear import (
@@ -40,8 +41,19 @@ from mstar.model.components.quant_linear import (
     select_linears,
 )
 from mstar.model.submodule_base import NodeSubmodule
-from mstar.model.z_image.components.transformer import QUANTIZABLE_LINEARS
-from mstar.model.z_image.config import DENOISE_LOOP, DIT_ATTN, Z_IMAGE_TURBO, ZImageConfig, resolve_snapshot_dir
+from mstar.model.z_image.components.transformer import CAPTION_SPAN, IMAGE_SPAN, MAIN_SPAN, QUANTIZABLE_LINEARS
+from mstar.model.z_image.config import (
+    CAPTION_ATTN,
+    CAPTION_TOKENS,
+    DENOISE_LOOP,
+    DIT_ATTN,
+    IMAGE_ATTN,
+    IMAGE_TOKENS,
+    JOINT_TOKENS,
+    Z_IMAGE_TURBO,
+    ZImageConfig,
+    resolve_snapshot_dir,
+)
 from mstar.model.z_image.submodules import (
     IMAGE_OUTPUT,
     LATENTS,
@@ -57,7 +69,6 @@ logger = logging.getLogger(__name__)
 
 ENCODE_TEXT_WALK = "encode_text"
 IMAGE_GEN_WALK = "image_gen"
-ATTENTION_BACKENDS = ("flashinfer", "sdpa")
 
 
 class ZImageModel(Model):
@@ -66,7 +77,6 @@ class ZImageModel(Model):
         model_path_hf: str = Z_IMAGE_TURBO,
         cache_dir: str | None = None,
         skip_weight_loading: bool = False,
-        attention_backend: str = "flashinfer",
         compile: bool = True,
         compile_eager_rounding: bool = True,
         compile_exact_ops: bool | list[str] = False,
@@ -83,12 +93,10 @@ class ZImageModel(Model):
         linear_dtype_steps: int | list[str] | None = None,
         **kwargs,
     ):
-        if attention_backend not in ATTENTION_BACKENDS:
-            raise ValueError(f"attention_backend must be one of {ATTENTION_BACKENDS}, got {attention_backend!r}")
+        refuse_attention_backend_kwarg(kwargs)
         self.model_path_hf = model_path_hf
         self.cache_dir = cache_dir
         self.skip_weight_loading = skip_weight_loading
-        self.attention_backend = attention_backend
         self.compile_transformer = bool(compile)
         self.compile_eager_rounding = bool(compile_eager_rounding)
         # True: every norm / activation class stays eager inside the compiled forward; a list picks classes
@@ -129,21 +137,22 @@ class ZImageModel(Model):
         self._config = config
 
     # ------------------------------------------------------------ structure
-    def get_node_resources(self) -> list[NodeResourceSpec]:
-        if self.attention_backend != "flashinfer":
-            return []
-        tcfg = self.config.transformer
-        return [
-            RaggedAttentionSpec(
-                resource_key=DIT_ATTN, nodes={"dit"},
-                config=RaggedAttentionConfig(
-                    num_qo_heads=tcfg.n_heads, num_kv_heads=tcfg.n_heads, head_dim=tcfg.head_dim,
-                    # per label (image / caption / main span) one segment per request
-                    max_segments_per_request=1,
-                    # the DiT's activation dtype: there is no KV cache to inherit one from
-                    dtype=torch.bfloat16,
-                ),
+    def declare_state(self) -> list[Array]:
+        """The dit's three attentions, one array per token set, each with its own label on the one resource."""
+        t = self.config.transformer
+        noise, context, joint = t.layer_ids()
+
+        def tokens(name: str, read: str, label: str, layers: range) -> Array:
+            return Array(
+                name, nodes={"dit"}, layers=frozenset(layers), labels={label}, max_len=0,
+                entry=dit_entry(t.n_heads, t.head_dim),
+                reads={read: Read(mask=Block(), op=Attend(q_heads=t.n_heads))},
             )
+
+        return [
+            tokens(JOINT_TOKENS, DIT_ATTN, MAIN_SPAN, joint),
+            tokens(IMAGE_TOKENS, IMAGE_ATTN, IMAGE_SPAN, noise),
+            tokens(CAPTION_TOKENS, CAPTION_ATTN, CAPTION_SPAN, context),
         ]
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
@@ -337,7 +346,6 @@ class ZImageModel(Model):
             quantize_linears(transformer, selection)
             return ZImageDenoiseSubmodule(
                 transformer, self.config, loop_name=DENOISE_LOOP,
-                attn_resource_key=DIT_ATTN if self.attention_backend == "flashinfer" else None,
                 compile_transformer=self.compile_transformer,
                 compile_eager_rounding=self.compile_eager_rounding, compile_exact_ops=self.compile_exact_ops,
                 max_batch_size=self.max_batch_size,

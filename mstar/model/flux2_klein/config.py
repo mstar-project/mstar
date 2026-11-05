@@ -22,6 +22,8 @@ from mstar.model.components.diffusion.qwen3.encoder import Qwen3EncoderConfig
 
 # Resource key the dit node declares its ragged joint attention under.
 DIT_ATTN = "dit_attn"
+# The array the dit's joint attention reads, over one segment per request of [txt | img | ref].
+JOINT_TOKENS = "joint_tokens"
 # Loop name the model file and the dit submodule's check_stop agree on.
 DENOISE_LOOP = "denoise_loop"
 

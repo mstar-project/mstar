@@ -5,12 +5,10 @@ model: "flux2_klein"
 max_seq_len: 512
 
 # FLUX.2 [klein] 4B, single GPU, all four nodes colocated. Serving knobs (forwarded to
-# Flux2KleinModel.__init__): attention_backend sdpa|flashinfer, torch.compile of the
+# Flux2KleinModel.__init__): torch.compile of the
 # transformer per shape, CUDA-graph capture of the denoise step for the listed
 # (height, width) shapes and batch sizes (other shapes run the eager batched path).
 model_kwargs:
-  # sdpa (cuDNN on H100) is the reference kernel; flashinfer stays available
-  attention_backend: sdpa
   compile: true
   # inductor rounds intermediates where eager PyTorch does (and fuses no FMAs); on its own the compiled
   # transformer is still not bit-exact with the eager path (measured PSNR: compile_exact_ops in docs/models.rst)
@@ -48,3 +46,5 @@ node_groups:
     ranks: [0]
   - node_names: [dit]
     ranks: [0]
+    # sdpa (cuDNN on H100) is the reference kernel; leave it out to run FlashInfer
+    attention_backend: sdpa

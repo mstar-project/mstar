@@ -233,7 +233,7 @@ class LTXDenoiseSubmodule(DenoiseLoopSubmodule):
         sp_group: CommGroup | None = None,
     ):
         super().__init__(
-            loop_name=loop_name, max_batch_size=max_batch_size, attn_resource_key=None,
+            loop_name=loop_name, max_batch_size=max_batch_size,
             capture_buckets=capture_buckets, capture_batch_sizes=capture_batch_sizes, replay_walks=replay_walks,
         )
         self.transformer = transformer

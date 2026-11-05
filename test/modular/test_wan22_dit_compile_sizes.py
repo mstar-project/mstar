@@ -37,7 +37,7 @@ class _TinyTransformer(nn.Module):
     def dtype(self) -> torch.dtype:
         return torch.float32
 
-    def forward(self, hidden_states, timestep, encoder_hidden_states, self_attn_fn=None):
+    def forward(self, hidden_states, timestep, encoder_hidden_states):
         text = self.text(encoder_hidden_states).mean(1)[:, :, None, None, None]
         t = timestep.float().mean(1)[:, None, None, None, None] * 1e-3
         return self.proj(hidden_states) + text + t
@@ -78,15 +78,12 @@ def _stub_compile(monkeypatch) -> tuple[list[tuple], list[int]]:
     compiles, calls = [], []
 
     def compile(fn, **kwargs):
-        def run(*, hidden_states, timestep, encoder_hidden_states, self_attn_fn=None):
+        def run(*, hidden_states, timestep, encoder_hidden_states):
             key = (tuple(hidden_states.shape), tuple(timestep.shape), tuple(encoder_hidden_states.shape))
             calls.append(1)
             if key not in compiles:
                 compiles.append(key)
-            return fn(
-                hidden_states=hidden_states, timestep=timestep, encoder_hidden_states=encoder_hidden_states,
-                self_attn_fn=self_attn_fn,
-            )
+            return fn(hidden_states=hidden_states, timestep=timestep, encoder_hidden_states=encoder_hidden_states)
 
         return run
 

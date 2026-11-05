@@ -14,8 +14,8 @@ leaves the model-specific parts to a handful of hooks:
   stacked preprocess / per-row outputs            num_tokens(key)               -> int
   stop after the request's own step count         denoise(engine_inputs, key, latents, timestep,
   per-key CUDA-graph buckets (Euler inside)               sigma, sigma_next, **cond) -> [B, L, C]
-  ragged-attention step declaration               capture_request_inputs(key, device) -> {name: [..]}
-                                                  attention_segments(key) -> ((label, span), ...)
+  the step's arrays and their segments            capture_request_inputs(key, device) -> {name: [..]}
+                                                  attention_segments(key) -> {array: ((label, span), ...)}
 
 Conventions the base fixes:
 
@@ -37,11 +37,9 @@ Conventions the base fixes:
   CUDA-graph bucket key. It need not be shape alone: anything that has to match
   for two rows to share a forward belongs in it (the latent grid, text length
   and conditioning layout, but equally whether CFG is on).
-* Every span a forward attends over must be declared: the default is one
-  ``"main"`` segment of all the request's tokens; a model whose layers also
-  attend over a sub-span (a refiner over the image tokens alone, say) lists
-  each span with its own label in :meth:`attention_segments` and threads
-  :meth:`ragged_for` that label to those layers.
+* Every span a forward attends over is a segment of a declared array: a model
+  whose layers also attend over a sub-span (a refiner over the image tokens
+  alone, say) declares an array for it and lists it in :meth:`attention_segments`.
 * A step schedule (``step_dtypes``, a model's ``linear_dtype_steps``) is the
   base's alone: a step's key is then a :class:`StepBucket` (:meth:`step_key`),
   so rows batch and capture per dtype, the scheduler batches each dtype apart,
@@ -64,8 +62,7 @@ import torch
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.engine.resources import AttentionStep, Segment, SlotLease, SubmoduleStep
-from mstar.model.components.diffusion.attention import RaggedAttentionFn
+from mstar.engine.state import ArrayStep, Segment, SlotLease, SubmoduleStep
 from mstar.model.components.diffusion.flow_match import FlowMatchSchedule
 from mstar.model.components.diffusion.unipc import (
     LAST_SAMPLE,
@@ -157,7 +154,6 @@ class DenoiseLoopSubmodule(NodeSubmodule):
         *,
         loop_name: str,
         max_batch_size: int = 8,
-        attn_resource_key: str | None = None,
         capture_buckets: Sequence[tuple[str, Hashable]] = (),
         capture_batch_sizes: Sequence[int] = (1, 2, 4, 8),
         replay_walks: Mapping[str, Sequence[str]] | None = None,
@@ -167,7 +163,6 @@ class DenoiseLoopSubmodule(NodeSubmodule):
         super().__init__()
         self.loop_name = loop_name
         self._max_batch_size = int(max_batch_size)
-        self.attn_resource_key = attn_resource_key
         # (graph_walk, bucket_key) pairs to capture; the same key on another walk
         # replays only if ``replay_walks`` says so.
         self.capture_buckets = list(capture_buckets)
@@ -191,9 +186,6 @@ class DenoiseLoopSubmodule(NodeSubmodule):
         # and the solver stage the second, so the main thread never touches the device.
         self._schedules = functools.lru_cache(_MEMO_ENTRIES)(self.schedule_for)
         self._staged_schedules = functools.lru_cache(_MEMO_ENTRIES)(self._stage_schedule)
-        # One callable per attention label for the life of a binding; see
-        # :meth:`ragged_for`.
-        self._ragged_fns: dict[str, RaggedAttentionFn] = {}
         # The dtype each step runs (``step_key``), and the one the step in ``denoise`` runs: None without a schedule.
         self.step_dtypes = step_dtypes
         self.step_dtype: str | None = None
@@ -309,10 +301,10 @@ class DenoiseLoopSubmodule(NodeSubmodule):
         """Derived per-key state (e.g. rotary tables); cached by :meth:`layout`."""
         return None
 
-    def attention_segments(self, bucket_key: Hashable) -> Sequence[tuple[str, int]]:
-        """``(label, span)`` for every span one request's layers attend over, in
-        declaration order. Default: one ``"main"`` segment of all its tokens."""
-        return ((self.MAIN_SPAN, self.num_tokens(bucket_key)),)
+    def attention_segments(self, bucket_key: Hashable) -> Mapping[str, Sequence[tuple[str, int]]]:
+        """``(label, span)`` for each segment one request brings to each array its layers attend through. Whole on every
+        rank, since the engine cuts each read's share. Default: none, for a loop with no declared arrays."""
+        return {}
 
     # --------------------------------------------------------------- helpers
     def layout(self, bucket_key: Hashable, device: torch.device) -> Any:
@@ -352,29 +344,6 @@ class DenoiseLoopSubmodule(NodeSubmodule):
 
     def _bucket_of(self, step_key: Hashable) -> Hashable:
         return step_key.bucket if isinstance(step_key, StepBucket) else step_key
-
-    def _ragged(self) -> RaggedAttentionFn | None:
-        """The attention callable for the ``"main"`` span, or None (SDPA)."""
-        return self.ragged_for(self.MAIN_SPAN)
-
-    def bind_node_resources(self, resources) -> None:
-        super().bind_node_resources(resources)
-        self._ragged_fns.clear()  # the memoized callables hold the old resource
-
-    def ragged_for(self, label: str) -> RaggedAttentionFn | None:
-        """``(q, k, v) -> out`` over the segments declared under ``label``, or None
-        when no ragged resource is bound (layers then fall back to SDPA).
-
-        The resource's ``run`` with the label bound, built once per label for the life
-        of the binding rather than per step."""
-        if self.attn_resource_key is None:
-            return None
-        if label not in self._ragged_fns:
-            resource = self.node_resources.get(self.attn_resource_key)
-            if resource is None:
-                return None
-            self._ragged_fns[label] = functools.partial(resource.run, label=label)
-        return self._ragged_fns[label]
 
     # --------------------------------------------------------- engine contract
     def prepare_inputs(
@@ -562,18 +531,26 @@ class DenoiseLoopSubmodule(NodeSubmodule):
         self, graph_walk: str, request_ids: list[str], inputs: list[NodeInputs],
         slot_lease: SlotLease | None = None, piecewise_leases=None, **kwargs,
     ) -> SubmoduleStep | None:
-        if self.attn_resource_key is None:
-            return None
         # every row (padding rows included) carries its bucket key, so the spans are
         # identical between a bucket's capture and its replays
-        segments = [
-            Segment(request_id=rid, label=label, span=span)
+        rows = [
+            (rid, self.attention_segments(self._bucket_of(inp.resource_step_info)))
             for rid, inp in zip(request_ids, inputs, strict=True)
-            for label, span in self.attention_segments(self._bucket_of(inp.resource_step_info))
         ]
+        if not rows[0][1]:
+            return None
         return SubmoduleStep(
-            segments=segments,
-            steps={self.attn_resource_key: AttentionStep(causal=False)},
+            segments=[
+                Segment(request_id=rid, label=label, span=span)
+                for rid, arrays in rows for spans in arrays.values() for label, span in spans
+            ],
+            state={
+                name: ArrayStep(segments=tuple(
+                    Segment(request_id=rid, label=label, span=span)
+                    for rid, arrays in rows for label, span in arrays[name]
+                ))
+                for name in rows[0][1]
+            },
             cg_key_info=self._uniform_key(inp.resource_step_info for inp in inputs),
         )
 

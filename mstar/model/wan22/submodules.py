@@ -1,4 +1,4 @@
-"""Wan2.2-TI2V-5B node submodules (nothing is cached; the dit declares a ragged attention resource).
+"""Wan2.2-TI2V-5B node submodules (nothing is cached; the dit declares the array its self-attention reads).
 
     text_encoder -> Wan22TextEncoderSubmodule (UMT5-XXL, thin HF wrapper)
     vae_encoder  -> Wan22VaeEncoderSubmodule  (Wan2.2-VAE encode, I2V only)
@@ -32,7 +32,7 @@ from mstar.model.components.diffusion.denoise_loop import UniPCDenoiseLoopSubmod
 from mstar.model.components.diffusion.flow_match import FlowMatchSchedule
 from mstar.model.components.diffusion.unipc import make_unipc_tables
 from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs, NodeSubmodule
-from mstar.model.wan22.config import Wan22Config
+from mstar.model.wan22.config import DIT_TOKENS, Wan22Config
 
 logger = logging.getLogger(__name__)
 
@@ -346,14 +346,8 @@ class Wan22DitSubmodule(_Fp32IslandMixin, UniPCDenoiseLoopSubmodule):
     # circular import.
     _I2V_WALK = "video_gen_i2v"
 
-    # The ragged self-attention resource (Wan22Model.get_node_resources).
-    SELF_ATTN = "dit_self_attn"
-
     def __init__(self, transformer: nn.Module, config: Wan22Config):
-        super().__init__(
-            loop_name=DENOISE_LOOP_NAME, max_batch_size=config.dit_max_batch_size,
-            attn_resource_key=self.SELF_ATTN if config.attention_backend == "flashinfer" else None,
-        )
+        super().__init__(loop_name=DENOISE_LOOP_NAME, max_batch_size=config.dit_max_batch_size)
         self.transformer = transformer
         self.config = config
         self._record_fp32_islands()
@@ -399,7 +393,7 @@ class Wan22DitSubmodule(_Fp32IslandMixin, UniPCDenoiseLoopSubmodule):
 
     def attention_segments(self, bucket_key: WanStepKey):
         # one segment per guidance branch, all the same span
-        return ((self.MAIN_SPAN, self.num_tokens(bucket_key)),) * (2 if bucket_key.guidance > 1.0 else 1)
+        return {DIT_TOKENS: ((self.MAIN_SPAN, self.num_tokens(bucket_key)),) * (2 if bucket_key.guidance > 1.0 else 1)}
 
     def seed_latents(self, bucket_key: WanStepKey, generator: torch.Generator) -> torch.Tensor:
         shape = (1, self.config.in_channels, bucket_key.frames, bucket_key.height, bucket_key.width)
@@ -511,7 +505,6 @@ class Wan22DitSubmodule(_Fp32IslandMixin, UniPCDenoiseLoopSubmodule):
             hidden_states=hidden_states,
             timestep=timestep,
             encoder_hidden_states=encoder_hidden_states,
-            self_attn_fn=self._ragged(),
         )
         if not do_cfg:
             return out

@@ -1,6 +1,6 @@
 """Flux2KleinModel: FLUX.2 [klein] text-to-image and multi-reference image editing.
 
-Architecture (4 nodes; the dit optionally owns one ragged attention resource):
+Architecture (4 nodes; the dit declares the array its joint attention reads):
 
     text_encoder  Qwen3 (4B / 8B) hidden-state taps -> [1, 512, joint_dim] prompt embeddings
     vae_encoder   FLUX.2 VAE encode of the reference images -> packed normalized tokens (edits)
@@ -41,11 +41,12 @@ import torch
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardConductorMetadata, StreamingConnectionState
-from mstar.engine.resources import NodeResourceSpec, RaggedAttentionConfig, RaggedAttentionSpec
 from mstar.engine.resources.lora.checkpoint import LoraFile
+from mstar.engine.state import Array, Attend, Block, Read
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import ForwardPassArgs, Model, TensorAndMetadata
+from mstar.model.components.diffusion.attention import dit_entry, refuse_attention_backend_kwarg
 from mstar.model.components.diffusion.image_io import encode_image, image_output_format
 from mstar.model.components.diffusion.qwen3.submodule import (
     TEXT_EMBEDS,
@@ -65,6 +66,7 @@ from mstar.model.flux2_klein.config import (
     DENOISE_LOOP,
     DIT_ATTN,
     FLUX2_KLEIN_4B,
+    JOINT_TOKENS,
     Flux2KleinConfig,
 )
 from mstar.model.flux2_klein.submodules import (
@@ -88,7 +90,6 @@ ENCODE_IMAGE_WALK = "encode_image"
 IMAGE_GEN_WALK = "image_gen"
 IMAGE_EDIT_WALK = "image_edit"
 
-ATTENTION_BACKENDS = ("flashinfer", "sdpa")
 
 
 class Flux2KleinModel(Model):
@@ -99,7 +100,6 @@ class Flux2KleinModel(Model):
         model_path_hf: str = FLUX2_KLEIN_4B,
         cache_dir: str | None = None,
         skip_weight_loading: bool = False,
-        attention_backend: str = "flashinfer",
         compile: bool = True,
         compile_eager_rounding: bool = True,
         compile_exact_ops: bool | list[str] = False,
@@ -117,14 +117,12 @@ class Flux2KleinModel(Model):
         linear_dtype_steps: int | list[str] | None = None,
         **kwargs,
     ):
-        if attention_backend not in ATTENTION_BACKENDS:
-            raise ValueError(f"attention_backend must be one of {ATTENTION_BACKENDS}, got {attention_backend!r}")
+        refuse_attention_backend_kwarg(kwargs)
         self.model_path_hf = model_path_hf
         self.cache_dir = cache_dir
         # Dummy mode: get_submodule returns None for every node, so the engine runs
         # the graph without weights, GPU or network (CPU tests).
         self.skip_weight_loading = skip_weight_loading
-        self.attention_backend = attention_backend
         self.compile_transformer = bool(compile)
         self.compile_eager_rounding = bool(compile_eager_rounding)
         # True: every norm / activation class stays eager inside the compiled forward; a list picks classes
@@ -186,26 +184,14 @@ class Flux2KleinModel(Model):
         self._config = config
 
     # ------------------------------------------------------------ structure
-    def get_node_resources(self) -> list[NodeResourceSpec]:
-        """The dit's joint attention through the engine's ragged (cacheless) resource,
-        when the FlashInfer backend is selected; nothing else here keeps state."""
-        if self.attention_backend != "flashinfer":
-            return []
-        tcfg = self.config.transformer
-        return [
-            RaggedAttentionSpec(
-                resource_key=DIT_ATTN, nodes={"dit"},
-                config=RaggedAttentionConfig(
-                    num_qo_heads=tcfg.num_attention_heads,
-                    num_kv_heads=tcfg.num_attention_heads,
-                    head_dim=tcfg.attention_head_dim,
-                    # one request == one bidirectional segment over [txt | img | ref]
-                    max_segments_per_request=1,
-                    # the DiT's activation dtype: there is no KV cache to inherit one from
-                    dtype=torch.bfloat16,
-                ),
-            )
-        ]
+    def declare_state(self) -> list[Array]:
+        """The dit's joint attention over each request's tokens; nothing else here keeps state."""
+        t = self.config.transformer
+        return [Array(
+            JOINT_TOKENS, nodes={"dit"}, layers=frozenset(range(t.num_layers + t.num_single_layers)), max_len=0,
+            entry=dit_entry(t.num_attention_heads, t.attention_head_dim),
+            reads={DIT_ATTN: Read(mask=Block(), op=Attend(q_heads=t.num_attention_heads))},
+        )]
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         encode_text = GraphNode(
@@ -517,7 +503,6 @@ class Flux2KleinModel(Model):
             quantize_linears(transformer, selection)
             return KleinDenoiseSubmodule(
                 transformer, self.config, loop_name=DENOISE_LOOP,
-                attn_resource_key=DIT_ATTN if self.attention_backend == "flashinfer" else None,
                 compile_transformer=self.compile_transformer,
                 compile_eager_rounding=self.compile_eager_rounding, compile_exact_ops=self.compile_exact_ops,
                 max_batch_size=self.max_batch_size,
