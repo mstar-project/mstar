@@ -168,6 +168,9 @@ the roofline.
 - A peer that never comes aborts an eager collective at the group's timeout (gloo's 30 min, or
   mstar's `dist_timeout_s` while loading), as NCCL's watchdog does; a replay hangs, as an
   unwatched one does on a GPU. `kill -USR1` prints the peers' stacks.
+- `torch.compile` runs its function eagerly: Dynamo's guards, recompiles and graph breaks on
+  mstar's compiled paths aren't exercised. A test that calls `torch._dynamo.explain` itself
+  traces, but CPU torch's Dynamo can't see the emulated GPU, which the plugin reports as a gap.
 - Nothing checks numerics: a port's wrong math (a transposed weight, a bad mask) still serves.
 - A FlashInfer API the stand-in lacks raises `NotImplementedError("mstar_sim: flashinfer.<name>
   has no stand-in yet")` when called.
