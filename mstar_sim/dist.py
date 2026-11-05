@@ -115,8 +115,9 @@ def _meet(group, mine: list[int], replay: bool = False) -> list[list[int]]:
             _all_gather(gathered, torch.tensor(mine, dtype=torch.int64), group=group)
         except RuntimeError as e:
             print(f"{where}: {_describe(mine)} met no peer ({e}). "
-                  + ("A replayed graph's collectives are unwatched: this rank hangs, as on a GPU."
-                     if replay else "NCCL's watchdog aborts here."), file=sys.stderr, flush=True)
+                  + ("A replayed graph's collectives are unwatched: this rank hangs, as on a GPU." if replay else
+                     "NCCL's watchdog aborts here (or the emulator's host-side meet hung: README Limits)."),
+                  file=sys.stderr, flush=True)
             if replay:
                 threading.Event().wait()
             _abort()

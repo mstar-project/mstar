@@ -45,7 +45,7 @@ Then drive it with mstar's own harnesses (`benchmark.runner`, `benchmark/worker_
 | Autocast | The engine runs forwards under CUDA autocast, which never sees the emulated tensors' payloads; its cast policy is applied by hand, so matmuls run (and are priced) in the autocast dtype. | `device.py` |
 | Weights | Small tensors (under 65,536 elements: norms, fp8 scales) are read for real; the rest from safetensors headers only. A model built on the CPU in a worker allocates nothing. | `patches.py`, `checkpoint.py` |
 | Kernel stand-ins | A `flashinfer` package, mstar's GDN and causal-conv kernels, Triton launches, the ops of a CUDA extension `cpp_extension.load` builds (their `TORCH_LIBRARY` schemas): each is one priced kernel that returns its outputs' shapes (`clock.kernel_fn`). A JIT-built op's outputs are never computed, where a CPU box's torch fallback would compute them (the fused MoE's sorted ids, expert ids and padded count). | `fake_libs/`, `kernels.py`, `triton_launch.py`, `cpp_extension.py` |
-| Multi-GPU | One process per emulated GPU, as on a node. NCCL groups become gloo. Ranks meet at each collective over GPU tensors, as NCCL's do, and a rank whose collective doesn't pair with its peers' (skipped, reordered, another size) aborts, printing every rank's; a captured graph meets once per group at each replay, on its collectives over that group's ranks. Data moves only if every rank holds values; each collective is charged its NCCL time on every rank. | `dist.py` |
+| Multi-GPU | One process per emulated GPU, as on a node. NCCL groups become gloo. Ranks meet at each collective over GPU tensors and at each barrier, as NCCL's do, and a rank whose collective doesn't pair with its peers' (skipped, reordered, another size) aborts, printing every rank's; a captured graph meets once per group at each replay, on its collectives over that group's ranks. Data moves only if every rank holds values; each collective is charged its NCCL time on every rank. | `dist.py` |
 | Bootstrap | A `sitecustomize` the launcher puts on `PYTHONPATH` installs the emulator in every process. The launcher also puts the driver's `nvidia-cuda-mps-control` on `PATH`, a stand-in that runs mstar's MPS daemon lifecycle (`mps: true`). | `_site/`, `_bin/`, `install.py`, `__main__.py` |
 
 Prior art it follows: SGLang's simulator (real scheduler, predicted forward, fake tokens),
@@ -157,7 +157,10 @@ the roofline.
   here are not validated and not accurate (see the top of this file).
 - Collective timing assumes symmetric ranks: no rank's device waits on a slower one's.
 - A host blocks at an eager collective's call until its peers come, where a GPU's host only
-  enqueues it. Device times are unchanged, but the host waits for its slowest peer to launch.
+  enqueues it. Device times are unchanged, but the host waits for its slowest peer to launch, and
+  host-side gloo traffic (an `agree` on a CPU group) or another stream's collectives, interleaved
+  with device collectives in a different order on different ranks, hang here where a GPU wouldn't.
+  `send`/`recv` aren't met: each moves data only if this rank holds it.
 - A skipped eager collective shifts its group's pairing, which shows at the next collective of
   another shape: between identical ones (per-layer all-reduces outside a graph) it is silent
   until then, as NCCL's corruption is. Inside a graph, the replay's sequence hash catches it.
