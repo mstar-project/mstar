@@ -614,7 +614,8 @@ def _over_ranks(rank, world, backend, store, over_sp, rows, captured=False, padd
             torch.testing.assert_close(first.runner(attn, placement, heads)().float(), first.want()[:, heads], **tol)
             context.run = attend_slots
             assert len(calls) == exchanged + over_sp, "a step with no stored context ran the exchange"
-            # one stored token, which one rank alone holds: every rank attends and exchanges alike
+            # one stored token, which one rank alone holds: TP's exchange would otherwise run on that
+            # rank alone; SP gathers either way
             one = _Case.build(((1, 3),), device, dtype)
             _plan(attn, one)
             torch.testing.assert_close(one.runner(attn, placement, heads)().float(), one.want()[:, heads], **tol)

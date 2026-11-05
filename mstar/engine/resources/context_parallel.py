@@ -349,7 +349,7 @@ class ContextParallelWrapper(ABC):
         kwargs: dict, max_total_tokens: int | None,
     ) -> "OwnTokensKernel | ZigzagWrapper":
         """The part a multi-token step attends its own tokens on, from the backend's ``kernels``
-        (``_plan_own`` plans it, ``_merged_over_ranks`` runs it)."""
+        (``_plan_own`` plans it, ``attend`` runs it)."""
 
     @abstractmethod
     def _plan_own(self, qo_indptr: torch.Tensor, causal: bool) -> None:
