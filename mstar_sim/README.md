@@ -5,8 +5,9 @@ correctness, not performance: kernel times come from numbers measured on real GP
 where tables cover a kernel and a roofline elsewhere, the end-to-end timing hasn't
 been checked against a real GPU, and the host overhead here is too different from a
 real run, so don't quote its throughput or latency numbers, or compare two changes
-by them.** It computes no kernels, so it can't check model output either. What it does find is bugs in mstar's own code: crashes,
-hangs, lifecycle and admission errors, bad indices, out-of-memory, API mistakes.
+by them.** It computes no kernels, so it can't check model output either. What it
+does find is bugs in mstar's own code: crashes, hangs, lifecycle and admission
+errors, bad indices, out-of-memory, API mistakes.
 
 `mstar_sim` is an add-on: it
 changes no mstar file. mstar believes it is on CUDA (an H100 by default) and
