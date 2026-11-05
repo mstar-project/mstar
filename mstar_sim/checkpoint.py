@@ -190,9 +190,6 @@ class _Pages:
     def __init__(self, src, rel: str, size: int):
         self._src, self._rel, self._size, self._pages = src, rel, size, {}
 
-    def __len__(self) -> int:
-        return self._size
-
     def _page(self, n: int) -> bytes:
         if n not in self._pages:
             start = n * self.SIZE

@@ -71,8 +71,7 @@ class device:  # noqa: N801  (torch.cuda.device)
 
     def __enter__(self):
         self.prev = current_device()
-        if self.idx >= 0:
-            set_device(self.idx)
+        set_device(self.idx)
 
     def __exit__(self, *exc):
         set_device(self.prev)

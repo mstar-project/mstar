@@ -240,8 +240,6 @@ def blocks_per_sm(threads: int, smem: int) -> int:
     props = torch.cuda.get_device_properties()
     limit = props.max_threads_per_multi_processor // 32 // _ceil(threads, 32)
     block_smem = _ceil(smem + 1024, 128) * 128  # the driver reserves 1 KiB a block
-    if block_smem > props.shared_memory_per_block + 1024:
-        return 0
     return min(limit, props.shared_memory_per_multiprocessor // block_smem)
 
 

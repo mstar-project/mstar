@@ -28,7 +28,6 @@ import argparse
 import ctypes
 import itertools
 import json
-import os
 import re
 import shutil
 import subprocess
@@ -47,12 +46,12 @@ STUB = r"""
 #include <cuda_runtime_api.h>
 #include <cuda_occupancy.h>
 
-static int g_sm, g_major, g_minor, g_threads, g_smem, g_optin, g_regs_sm, g_regs;
+static int g_sm, g_major, g_minor, g_threads, g_smem, g_smem_block, g_optin, g_regs_sm, g_regs;
 
-extern "C" void golden_set_device(int sm, int major, int minor, int threads, int smem, int optin,
+extern "C" void golden_set_device(int sm, int major, int minor, int threads, int smem, int smem_block, int optin,
                                   int regs_sm, int regs) {
-  g_sm = sm; g_major = major; g_minor = minor; g_threads = threads; g_smem = smem; g_optin = optin;
-  g_regs_sm = regs_sm; g_regs = regs;
+  g_sm = sm; g_major = major; g_minor = minor; g_threads = threads; g_smem = smem; g_smem_block = smem_block;
+  g_optin = optin; g_regs_sm = regs_sm; g_regs = regs;
 }
 
 extern "C" {
@@ -81,7 +80,7 @@ cudaError_t cudaOccupancyMaxActiveBlocksPerMultiprocessorWithFlags(int* blocks, 
   prop.regsPerBlock = 65536;
   prop.regsPerMultiprocessor = g_regs_sm;
   prop.warpSize = 32;
-  prop.sharedMemPerBlock = 49152;
+  prop.sharedMemPerBlock = g_smem_block;
   prop.sharedMemPerMultiprocessor = g_smem;
   prop.numSms = g_sm;
   prop.sharedMemPerBlockOptin = g_optin;
@@ -90,7 +89,7 @@ cudaError_t cudaOccupancyMaxActiveBlocksPerMultiprocessorWithFlags(int* blocks, 
   attributes.maxThreadsPerBlock = 1024;
   attributes.numRegs = g_regs;
   attributes.sharedSizeBytes = 0;
-  attributes.maxDynamicSharedSizeBytes = 49152;
+  attributes.maxDynamicSharedSizeBytes = g_smem_block;
   cudaOccDeviceState state;
   cudaOccResult result;
   if (cudaOccMaxActiveBlocksPerMultiprocessor(&result, &prop, &attributes, &state, block_size, dynamic_smem)
@@ -196,10 +195,6 @@ def _dispatch() -> str:
 
 
 # --------------------------------------------------------------------------- cases
-
-def _uniform(rows: int, n: int) -> list[int]:
-    return [i * n for i in range(rows + 1)]
-
 
 def _indptr(lengths) -> list[int]:
     out = [0]
@@ -507,8 +502,8 @@ def main(argv: list[str] | None = None) -> None:
             for case in CASES:
                 lib.golden_set_device(p["multi_processor_count"], p["major"], p["minor"],
                                       p["max_threads_per_multi_processor"], p["shared_memory_per_multiprocessor"],
-                                      p["shared_memory_per_block_optin"], p["regs_per_multiprocessor"],
-                                      case.get("regs", 0))
+                                      p["shared_memory_per_block"], p["shared_memory_per_block_optin"],
+                                      p["regs_per_multiprocessor"], case.get("regs", 0))
                 answers.setdefault(case["name"], {})[alias] = answer(lib, case)
     nvcc = subprocess.run([shutil.which("nvcc") or "/usr/local/cuda/bin/nvcc", "--version"], capture_output=True,
                           text=True, check=True).stdout.strip().splitlines()[-1]
@@ -521,5 +516,4 @@ def main(argv: list[str] | None = None) -> None:
 
 
 if __name__ == "__main__":
-    os.environ.setdefault("MSTAR_SIM", "0")
     main()
