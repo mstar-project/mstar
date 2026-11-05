@@ -67,9 +67,8 @@ class PackedBlockLoopEncoder(NodeSubmodule):
     # Patch-count buckets of one replay; a larger step runs eagerly.
     BLOCK_LOOP_PATCH_BUCKETS = [256, 512, 1024, 2048, 4096, 8192, 16384]
     # Requests per encoder step. Above one, every tensor of ``tensor_inputs``
-    # must pack by concatenation (an index into a request's own patches, as
-    # Muse Glimmer's window and output orders are, does not, so it stays at
-    # one), and ``config`` has ``spatial_merge_size``, which cuts the output
+    # must pack by concatenation (an index into a request's own patches does
+    # not), and ``config`` has ``spatial_merge_size``, which cuts the output
     # back apart.
     MAX_BATCH_SIZE = 1
     # The ragged layouts a step plans over its patches, one label each.

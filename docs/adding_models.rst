@@ -2101,8 +2101,8 @@ For example, the Orpheus LLM submodule captures a batched ``decode`` graph and a
 
 An ``ARNodeSubmodule`` takes a ``prefill_token_buckets`` constructor argument, which
 replaces its class's ``PREFILL_TOKEN_BUCKETS`` for that instance: a model passes a
-deployment's ``model_kwargs.prefill_token_buckets`` through to it (Qwen3.5, Qwen3-Omni
-and GLM-5.2 do). It must be a non-empty list of distinct positive token counts, or the
+deployment's ``model_kwargs.prefill_token_buckets`` through to it (Qwen3.5, Muse
+Glimmer, Qwen3-Omni and GLM-5.2 do). It must be a non-empty list of distinct positive token counts, or the
 submodule raises ``ValueError`` when it is built.
 
 BAGEL shows the case of two captures for one walk. It captures ``decode`` twice, once with
@@ -3063,7 +3063,8 @@ submodule cache and where the files come from. A model sets ``NAME`` and
 ``METADATA_FILES`` and writes ``__init__`` (setting
 ``config``, ``tokenizer`` and ``media``), its resources (the sampler from
 ``_sampler_spec``; ``MIXED_SPLIT`` is the attention
-resources' split of a mixed step), ``_prompt_ids`` and ``_create_submodule``. ``media`` holds a ``MediaIntake`` per attachment modality: its
+resources' split of a mixed step), ``_prompt_ids`` and ``_create_submodule``, which
+hands the LLM node ``self.prefill_token_buckets`` (``model_kwargs.prefill_token_buckets``). ``media`` holds a ``MediaIntake`` per attachment modality: its
 ``MediaEncoder`` (modalities may share one), its placeholder ``pad`` id, the sentinels
 a template leaves to its processor, how many placeholders an attachment fills
 (``runs``, one by default; a Qwen3.5 video fills one per temporal group), and
@@ -3078,7 +3079,8 @@ the prefill schedule's walk and the KV layout's alike.
 ``advance``, how far the prompt moves the position counter, defaults to the prompt's
 length; under Qwen-style MRoPE it is the positions' extent instead, an image spanning
 ``max(h', w')`` positions rather than its tokens, which Qwen3.5 computes from the
-runs' grids in its own ``process_prompt`` over ``intake``. The encoders' inputs are
+runs' grids in its ``kv_layout`` override. ``process_prompt`` also empties each sent
+attachment's raw ``<modality>_inputs``, spent once prepared. The encoders' inputs are
 lists in prompt order, as their outputs fill the pads. Each run's patch grid (the
 ``grids`` of its ``PreparedMedia``) rides ``MEDIA_LAYOUT`` rather than a tensor, so a
 tower's grid maths in ``prepare_inputs`` reads host values (``PackedBlockLoopEncoder.grids``)

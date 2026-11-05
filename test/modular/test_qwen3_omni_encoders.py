@@ -238,6 +238,28 @@ def test_vision_frames_and_deepstack_match_hf(vision_pair, grid, replayed):
         torch.testing.assert_close(got, ref, atol=1e-4, rtol=1e-4)
 
 
+def test_two_requests_in_one_vision_step_each_get_their_rows(vision_pair):
+    """Packed in one step, each request gets its own slice of the embeddings
+    and of every deepstack feature."""
+    hf, sub, ragged = vision_pair
+    patch_numel = 3 * VISION["temporal_patch_size"] * VISION["patch_size"] ** 2
+    grids = [torch.tensor([[1, 4, 6]]), torch.tensor([[1, 2, 2], [1, 4, 4]])]
+    pixels = [torch.randn(int(g.prod(-1).sum()), patch_numel) for g in grids]
+    rows = [
+        sub.prepare_inputs("prefill_vision", _fwd(), {"pixel_values": [p], "image_grid_thw": [g]})
+        for p, g in zip(pixels, grids, strict=True)
+    ]
+    ragged.plan(sub.declare_step("prefill_vision", ["a", "b"], rows))
+    with torch.no_grad():
+        packed = sub.preprocess("prefill_vision", None, rows)
+        out = sub.forward_batched("prefill_vision", _engine_inputs("ab"), **packed)
+        for rid, p, g in zip("ab", pixels, grids, strict=True):
+            want = hf(p, grid_thw=g)
+            torch.testing.assert_close(out[rid]["vision_embeds"][0], want.pooler_output, atol=1e-4, rtol=1e-4)
+            for got, ref in zip(out[rid]["deepstack"], want.deepstack_features, strict=True):
+                torch.testing.assert_close(got, ref, atol=1e-4, rtol=1e-4)
+
+
 def test_vision_capture_refuses_more_frames_than_a_replay_plans(vision_pair):
     """A request with more frames than the resource's per-step ceiling
     takes no lease, so its block loop runs eagerly."""

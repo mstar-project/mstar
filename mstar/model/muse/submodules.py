@@ -50,6 +50,9 @@ class VisionEncoderSubmodule(PackedBlockLoopEncoder):
     """
 
     SEGMENT_LABELS = (VISION_WINDOW, VISION_FULL)
+    # One request a step: ``window_index`` and ``output_index`` index a
+    # request's own patches, so two requests' do not pack by concatenation.
+    MAX_BATCH_SIZE = 1
 
     def prepare_inputs(
         self,
