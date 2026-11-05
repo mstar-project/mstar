@@ -15,7 +15,7 @@ from mstar.communication.tensors import NameToTensorList, TensorCommunicationMan
 from mstar.graph.base import GraphEdge, GraphSection
 from mstar.graph.runtime.base import ColumnarEdgeSpecs, EdgeSpec, InputTensors
 from mstar.streaming.stream_buffer import StreamBuffer, StreamChunkInfo, StreamingEdge, collate
-from mstar.streaming.topology import Connection
+from mstar.streaming.topology import Connection, PartitionTopology, ProducerWalkCtx
 from mstar.worker.node_manager_utils import RequestStateManager
 
 
@@ -51,13 +51,27 @@ class StreamBufferManager:
         walks: dict[str, GraphSection] | None = None,
         *,
         graph_runtime=None,
-        walk_driven_edges: dict[str, str] | None = None,
+        topology: PartitionTopology | None = None,
     ):
         self._request_state = request_state
         self._tensor_manager = tensor_manager
         self._graph_runtime = graph_runtime
-        # walk-driven edge here -> the producer-triggered partition it feeds
-        self._walk_driven_edges = walk_driven_edges or {}
+        # producer-triggered partition -> the connection that decides its walk
+        self._walk_drivers: dict[str, Connection] = topology.walk_drivers() if topology else {}
+        # consumer side: walk-driven edge here -> its consumer partition
+        self.walk_driven_edges = {
+            conn.edge_name: conn.to_partition for conn in connections
+            if conn.to_partition in self._walk_drivers
+        }
+        # producer side: streamed signal -> its consumer partition, and
+        # (node, walk) -> the walk drivers it emits for
+        self._signal_consumer = {
+            conn.edge_name: conn.to_partition
+            for conn in (topology.connections if topology else [])
+        }
+        self._emitted_walk_drivers: dict[tuple[str, str], list[Connection]] = {}
+        # refilled for every walk-hook call rather than built per request per step
+        self._walk_ctx = ProducerWalkCtx()
         self.connections = connections
         # edge name -> the node that consumes it
         self.consumer_node: dict[str, str] = (
@@ -123,6 +137,49 @@ class StreamBufferManager:
     def remove_request(self, request_id: int) -> None:
         self._rids.discard(request_id)
 
+    def assign_consumer_walks(self, batch_N) -> None:
+        """Decide the consumer walk of this pass's streamed items, per rid and
+        producer-triggered consumer partition, and stamp it on the fwd_info
+        that rides with the remote sends. Asked per real walk: a mixed step's
+        combined label is no walk of the graph's. Runs on every emitting step,
+        so it allocates nothing per row."""
+        if not self._walk_drivers:
+            return
+        ctx = None
+        input_metadata = batch_N.node_batch.per_request_input_metadata
+        for walk, walk_rids in batch_N.batch.rids_by_walk().items():
+            key = (batch_N.node_name, walk)
+            drivers = self._emitted_walk_drivers.get(key)
+            if drivers is None:
+                consumers = {
+                    self._signal_consumer[signal]
+                    for signal in self._graph_runtime.get_output_signals(*key)
+                    if signal in self._signal_consumer
+                }
+                drivers = [
+                    self._walk_drivers[partition] for partition in consumers
+                    if partition in self._walk_drivers
+                ]
+                self._emitted_walk_drivers[key] = drivers
+            if not drivers:
+                continue
+            ctx = self._walk_ctx
+            ctx.producer_walk = walk
+            ctx.node = batch_N.node_name
+            for rid in walk_rids:
+                req_info = self._request_state.per_request_info.get(rid)
+                if req_info is None:
+                    continue
+                fwd_info = req_info.per_partition_info[batch_N.partition].current_fwd_info
+                meta = input_metadata.get(rid)
+                ctx.loop_iters = meta.dynamic_loop_iter_counts if meta else {}
+                ctx.fwd_info = fwd_info
+                for conn in drivers:
+                    fwd_info.stream_consumer_walks[conn.to_partition] = conn.consumer_walk(ctx)
+        if ctx is not None:
+            ctx.fwd_info = None
+            ctx.loop_iters = {}
+
     # -- items in, chunks out -------------------------------------------------
 
     def route_tensor(self, request_id: int, edge: GraphEdge) -> None:
@@ -150,7 +207,7 @@ class StreamBufferManager:
         walk = sbuf.peek_walk()
         if walk is None:
             return True
-        partition = self._walk_driven_edges[edge_name]
+        partition = self.walk_driven_edges[edge_name]
         if walk == self._partition_walk(request_id, partition):
             return True
         if not allow_walk_change or not self._graph_runtime.is_partition_idle(
@@ -174,7 +231,7 @@ class StreamBufferManager:
         waiting = sbuf.pop_waiting_edge()
         if waiting is not None:
             return waiting
-        partition = self._walk_driven_edges.get(edge_name)
+        partition = self.walk_driven_edges.get(edge_name)
         consumer_walk = (
             self._partition_walk(request_id, partition) if partition else None
         )

@@ -15,16 +15,18 @@ import torch
 from mstar.profile.worker import WorkerProfileInfo
 from mstar.worker.admission import Admission
 from mstar.worker.chunk_loops import ChunkLoops
+from mstar.worker.input_ingest import InputIngest
 from mstar.worker.lockstep import Lockstep
 from mstar.worker.micro_scheduler import MicroScheduler
 from mstar.worker.phase_timer import PhaseTimer
+from mstar.worker.request_lifecycle import RequestLifecycle
 from mstar.worker.services import WorkerLayout, WorkerServices
 from mstar.worker.worker import Worker
 
 # Built by ``__init__`` from the deployment; no default stands in for them.
 _COLLABORATORS = frozenset({
     "communicator", "wakeup_event", "tensor_manager", "_graph_runtime", "engine_manager",
-    "request_state", "scheduler", "admission", "lockstep", "layout", "streams",
+    "request_state", "scheduler", "admission", "lockstep", "lifecycle", "ingest", "layout", "streams",
     "parallel_groups", "partition_topology", "_my_consumer_connections", "_all_wg_nodes",
 })
 
@@ -66,7 +68,9 @@ def make_scheduler(
     )
     admission = Admission(services, layout)
     lockstep = Lockstep(services, layout, admission, async_sched)
-    return MicroScheduler(services, layout, lockstep, admission, model_config, **scheduler_kwargs)
+    return MicroScheduler(
+        services, layout, RequestLifecycle(layout), lockstep, admission, model_config, **scheduler_kwargs,
+    )
 
 
 def bound(scheduler: MicroScheduler, request_state=None, *, runtime=None) -> MicroScheduler:
@@ -116,9 +120,6 @@ def make_worker(**overrides) -> Worker:
     worker.parallel_leader_nodes = set()
     worker.is_tp_follower = False
     # no streams, no loops, no declared stop policies
-    worker._walk_drivers = {}
-    worker._walk_driven_edges = {}
-    worker._signal_consumer = {}
     worker._streaming_edge_names = set()
     worker._innermost_loop_by_node = {}
     worker._stop_token_signal = {}
@@ -136,8 +137,6 @@ def make_worker(**overrides) -> Worker:
 
 def _build_components(worker: Worker, async_sched) -> None:
     """The components the test did not supply, real, over the worker's collaborators."""
-    if "lockstep" in worker.__dict__ and "admission" in worker.__dict__:
-        return
     services = WorkerServices(
         worker_id=worker.worker_id, device=worker.device,
         graph_runtime=getattr(worker, "_graph_runtime", None),
@@ -146,13 +145,21 @@ def _build_components(worker: Worker, async_sched) -> None:
         request_state=getattr(worker, "request_state", None),
         communicator=getattr(worker, "communicator", None),
         parallel_groups=getattr(worker, "parallel_groups", None),
+        streams=getattr(worker, "streams", None),
     )
     parallel, leaders = frozenset(worker.parallel_nodes), frozenset(worker.parallel_leader_nodes)
     layout = WorkerLayout(
         parallel_nodes=parallel, parallel_leader_nodes=leaders, is_tp_follower=worker.is_tp_follower,
         chunk_loops=worker.chunk_loops, streaming_edge_names=frozenset(worker._streaming_edge_names),
     )
+    if "lifecycle" not in worker.__dict__:
+        worker.lifecycle = getattr(getattr(worker, "scheduler", None), "lifecycle", None) or RequestLifecycle(layout)
     if "admission" not in worker.__dict__:
         worker.admission = Admission(services, layout)
     if "lockstep" not in worker.__dict__:
         worker.lockstep = Lockstep(services, layout, worker.admission, async_sched)
+    if "ingest" not in worker.__dict__:
+        worker.ingest = InputIngest(
+            services, layout, worker.lifecycle, worker.lockstep, getattr(worker, "wakeup_event", None),
+            metrics=worker._metrics, enable_nvtx=worker.enable_nvtx,
+        )

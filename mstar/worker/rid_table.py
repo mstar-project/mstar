@@ -9,10 +9,11 @@ Handles are RECYCLED once a request is removed, so anything keyed by one must
 be purged on the same REMOVE_REQUEST that releases it. A leaked string key was
 harmless -- the string never recurred -- but a leaked handle silently attaches
 to whichever request gets that handle next. Known handle-keyed state:
-MicroScheduler.{failed_rids, admit_errors, held_until, parked, backlog, last_ran,
-arrival, chunk_started, cached_prefix} (purged by clear_rid),
-Worker.{_pending_removes, _pending_loop_stops,
-_lockstep_unread}, RequestStateManager.{per_request_info, _fwd_by_partition}
+RequestLifecycle.{failed_rids, arrivals, pending_removes, _wires, _unreported}
+(purged by removed), MicroScheduler.{backlog, last_ran, chunk_started,
+cached_prefix} (purged by clear_rid), Admission.{admit_errors, held_until,
+parked} (purged by clear), Lockstep.read_failed_rids (purged by clear),
+Worker._pending_loop_stops, RequestStateManager.{per_request_info, _fwd_by_partition}
 and StreamBufferManager._rids (purged by remove_request), the engine's and
 tensor manager's per-request state (including ChunkingManagement.prepared, and
 the tensor store's rid -> uuids ownership, held in the Rust bookkeeper under
@@ -22,7 +23,7 @@ _admit_snaps} (purged by remove_request), ResidentPlanner.{_slot_of, _stale,
 _moved} (purged by release), SamplerCells._cells (purged by the sampler's
 remove_request), and WorkerProfileInfo.
 
-MicroScheduler.pending_tp_follow_count is the one deliberate exception: a
+Lockstep's follow count is the one deliberate exception: a
 ScheduleTPNode can arrive before the NEW_REQUEST that mints the handle, so it
 stays keyed by the wire string and is purged by clear_wire_rid.
 """
