@@ -180,3 +180,43 @@ def test_whatever_can_ready_a_chunk_marks_the_buffer_for_the_poll():
     streams.pop_edge(buf, EDGE, RID)
     buf.signal_done(2)
     assert buf.maybe_ready, "the producer's done signal"
+
+
+def _window_consumer():
+    tm = _TM(_bookkeeping("python"))
+    buf = StreamBuffer(RID, EDGE, "LLM", FixedChunkPolicy(1))
+    req_info = SimpleNamespace(stream_buffers={EDGE: buf}, ended_streams=set())
+    streams = StreamBufferManager(SimpleNamespace(per_request_info={RID: req_info}), tm, [])
+    streams.consumer_node = {EDGE: NODE}
+    return streams, tm, buf
+
+
+def test_a_stream_window_takes_every_ready_item_up_to_a_runs_count_and_ends_drained():
+    """A loop that reads an item a stream each iteration: a run takes as many
+    as are ready (up to its count), one an iteration, and the window that
+    drains a done stream is its final chunk."""
+    streams, tm, buf = _window_consumer()
+    _produce(tm, buf, [10, 11, 12])
+    se = streams.pop_edge(buf, EDGE, RID, window=4)
+    assert se.chunk.num_items == 3 and not se.chunk.is_final
+    assert _consume(streams, tm, se)[0].flatten().tolist() == [10, 11, 12]
+    uuids = _produce(tm, buf, [13, 14], first_uuid=200)
+    buf.signal_done(5)
+    se = streams.pop_edge(buf, EDGE, RID, window=4)
+    assert se.uuids == uuids and se.chunk.is_final
+    assert streams.pop_edge(buf, EDGE, RID, window=4) is None
+
+
+def test_a_window_a_run_ran_short_of_goes_back_first():
+    """A step that settled on fewer iterations than its window hands the rest
+    back ahead of anything newer, so the next step reads them in order."""
+    streams, tm, buf = _window_consumer()
+    _produce(tm, buf, [10, 11, 12])
+    window = streams.pop_edge(buf, EDGE, RID, window=3)
+    _produce(tm, buf, [13], first_uuid=200)
+    assert not streams.return_unread(RID, window, used=1)
+    assert _consume(streams, tm, window)[0].flatten().tolist() == [10, 11, 12]
+    rest = streams.pop_edge(buf, EDGE, RID, window=3)
+    assert rest.chunk.start_offset == 1 and rest.chunk.num_items == 2
+    assert _consume(streams, tm, rest)[0].flatten().tolist() == [11, 12]
+    assert _consume(streams, tm, streams.pop_edge(buf, EDGE, RID))[0].tolist() == [13]

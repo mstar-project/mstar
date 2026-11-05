@@ -2572,7 +2572,14 @@ class Worker:
                         "%.0f s; scheduling and teardowns wait for it",
                         self.worker_id, pending.node_name, pending.graph_walk, waited,
                     )
-        pending.batch.repeats = pending.node_batch.step_context.repeats
+        pending.batch.repeats = repeats = pending.node_batch.step_context.repeats
+        if self._step_repeats is not None and self._step_repeats.asked:
+            # before anything pops the stream again: this pass's speculation
+            for rid, edges in pending.node_batch.stream_windows.items():
+                for edge in edges:
+                    if edge.chunk.num_items > repeats and self.streams.return_unread(rid, edge, repeats):
+                        pending.node_batch.final_stream_rids.discard(rid)
+            pending.node_batch.stream_windows = {}
 
     def _submit_gpu_step(
         self,
@@ -2918,13 +2925,24 @@ class Worker:
         if self._step_repeats is None or not self._step_repeats.asked:
             return
         batch = speculation.scheduled_batch
-        speculation.node_batch.step_context.repeats = self._step_repeats.ceiling(
+        repeats = self._step_repeats.ceiling(
             speculation, in_chain,
             lambda: self._graph_runtime.loop_room(
                 batch.node_name, batch.graph_walk, speculation.loop_name,
                 list(speculation.continuing_rids), pending.batch.repeats,
             ),
         )
+        # a stream window: as many iterations as every row has items for, and
+        # what a row took past the step's own count goes back after its admit
+        windows = {
+            rid: [e for e in edges if e.chunk.num_items > 1 and e.next_node == batch.node_name]
+            for rid, edges in speculation.consumed_streaming_edges.items()
+        }
+        windows = {rid: edges for rid, edges in windows.items() if edges}
+        if windows:
+            repeats = min(repeats, *(e.chunk.num_items for edges in windows.values() for e in edges))
+            speculation.node_batch.stream_windows = windows
+        speculation.node_batch.step_context.repeats = repeats
 
     def _repeat_refusal(self, node_name: str, graph_walk: str) -> str | None:
         """Why no step of this walk can stand for several iterations, or None:
@@ -2934,7 +2952,7 @@ class Worker:
             # a count stop is the loop's cap, which a run never passes (`loop_room`)
             return "node: the runtime doesn't check its stop: its own check_stop decides"
         edges = self._step_repeats.edges[(node_name, graph_walk)]
-        refusal = edge_refusal(edges)
+        refusal = edge_refusal(edges, engine.streamed_iteration_inputs(node_name))
         if refusal is None:
             # the client's copy of a token rides the step's token column
             inline = (
@@ -5202,6 +5220,7 @@ class Worker:
         if self._step_repeats is not None:
             # after capture: an attention decides repeats from the kernels it captured
             self._step_repeats.settle(self.engine_manager.engine.resident_refusal, self._repeat_refusal)
+            self.streams.windows = self._step_repeats.windows()
 
         # Sync every worker before the main loop opens. Per-batch-size
         # captures inside CudaGraphRunner are already barriered on the

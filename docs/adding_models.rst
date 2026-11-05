@@ -1704,6 +1704,11 @@ k to k+N-1. ``prepare_inputs`` and ``preprocess`` then never read the loop count
 and a step that repeats may not read the counter at all: the engine watches
 ``dynamic_loop_iter_counts`` there, refuses a walk whose captured ``preprocess`` reads it at
 load, and stops the worker if a repeating step's ``prepare_inputs`` or ``preprocess`` does.
+An input streamed in an item an iteration (a one-item chunk policy) is declared the same
+way with ``streamed=True``: its table is the row's items of that stream for the step, a
+window of as many ready items as the step repeats, and the stream answers how far a run
+may go (the fewest items any row has). Items of a window that a step's resources cut short
+go back to the stream ahead of anything newer.
 
 A ``SubmoduleStep`` contains a list of ``Segment`` objects and one ``ResourceStep`` per
 resource key:

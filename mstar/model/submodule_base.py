@@ -111,6 +111,9 @@ class IterationInput(NamedTuple):
     # a padding row's value, which has no request state
     capture_fill: float = 0.0
     dtype: torch.dtype = torch.float32
+    # the table is the step's items of the streamed input ``source`` (a stream
+    # window), iteration i of the step reading item i, not the request state
+    streamed: bool = False
 
 
 class CarryPair(NamedTuple):
@@ -1492,28 +1495,34 @@ class NodeSubmodule(torch.nn.Module, ABC):
 
 
 def iteration_columns(
-    submodule: NodeSubmodule, rows: Sequence[tuple[Any, int] | None], repeats: int, device,
+    submodule: NodeSubmodule, rows: Sequence[tuple | None], repeats: int, device,
 ) -> dict[str, torch.Tensor]:
     """``submodule``'s ``ITERATION_INPUTS`` for a step's rows, ``[B, repeats,
-    *shape]`` each: row i's ``(rid handle, its iteration)``, or None for a
-    padding row, which takes ``capture_fill`` and gets no state."""
+    *shape]`` each: row i's ``(rid handle, its iteration[, its streamed
+    tables])``, or None for a padding row, which takes ``capture_fill`` and
+    gets no state. A streamed table (``IterationInput.streamed``) is the
+    row's items of the stream this step, ``[items, ...]``, read from 0."""
     out: dict[str, torch.Tensor] = {}
     states = submodule.request_states
     for name, spec in submodule.ITERATION_INPUTS.items():
         values = []
         fill = None
         for row in rows:
+            streamed = row[2] if row is not None and len(row) > 2 else {}
             state = None if row is None else states.get(row[0])
-            if state is None:
+            table = streamed.get(spec.source) if spec.streamed else None
+            if table is None and (state is None or spec.streamed):
                 if fill is None:
                     fill = torch.full((repeats, *spec.shape), spec.capture_fill, dtype=spec.dtype, device=device)
                 values.append(fill)
                 continue
-            table = state[spec.source]
-            start = row[1] + spec.offset
+            if table is None:
+                table = state[spec.source]
+            start = (0 if spec.streamed else row[1]) + spec.offset
             value = table[start:start + repeats]
             if value.shape[0] < repeats:
-                value = torch.cat([value, _iteration_pad(spec, state, table, repeats - value.shape[0], name)])
+                pad = _iteration_pad(spec, state or PerRequestState(), table, repeats - value.shape[0], name)
+                value = torch.cat([value, pad])
             values.append(value.reshape(repeats, *spec.shape))
         out[name] = torch.stack(values)
     return out

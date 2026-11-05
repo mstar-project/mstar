@@ -295,13 +295,28 @@ class SubmoduleManagement:
         for runner in self.piecewise_runners.values():
             runner.set_slot(slot)
 
-def _refuse_counter_read(batch: "ExecutingBatch", reads: Collection[str], stage: str) -> None:
+def _window_tables(specs, inputs: Mapping[str, list] | None, metadata) -> dict[str, torch.Tensor]:
+    """A row's stream windows: each streamed iteration input's items this
+    step, ``[items, ...]`` (one item is collated as itself)."""
+    if not specs or not inputs:
+        return {}
+    chunks = getattr(metadata, "stream_chunks", {}) or {}
+    out = {}
+    for spec in specs:
+        tensors = inputs.get(spec.source)
+        chunk = chunks.get(spec.source)
+        if tensors and chunk is not None and chunk.num_items:
+            out[spec.source] = tensors[0].reshape(chunk.num_items, *spec.shape)
+    return out
+
+
+def _refuse_counter_read(node_name: str, ctx: StepContext, reads: Collection[str], stage: str) -> None:
     """A step that repeats runs its ``prepare_inputs`` and ``preprocess``
     once, so a value they derive from the loop counter would hold for every
     replay; an iteration's value belongs in ``ITERATION_INPUTS``."""
-    if batch.step_context.repeats > 1 and LOOP_COUNTER in reads:
+    if ctx.repeats > 1 and LOOP_COUNTER in reads:
         raise SystemExit(
-            f"{batch.node_name}/{batch.step_context.graph_walk}: a repeating step's {stage} read "
+            f"{node_name}/{ctx.graph_walk}: a repeating step's {stage} read "
             f"{LOOP_COUNTER}, which its later replays don't renew; declare the value in ITERATION_INPUTS"
         )
 
@@ -414,6 +429,9 @@ class ExecutingBatch:
     # the step's iteration inputs (``NodeSubmodule.ITERATION_INPUTS``), a
     # column a replay: ``[rows, repeats, ...]``, staged after ``preprocess``
     iteration_columns: dict[str, torch.Tensor] | None = None
+    # rid -> the stream windows its row took (an item a replay), whose items
+    # past the step's settled count go back to their streams
+    stream_windows: dict[int, list] = field(default_factory=dict)
     # rids the submodule declined this step — e.g. a speculatively scheduled
     # flow step for a request already past its own max iters
     skipped_rids: set[int] = field(default_factory=set)
@@ -1345,7 +1363,7 @@ class Engine:
             if batch.step_context.repeats > 1:
                 with watch_table_reads() as reads:
                     self._prepare_inputs(batch)
-                _refuse_counter_read(batch, reads, "prepare_inputs")
+                _refuse_counter_read(batch.node_name, batch.step_context, reads, "prepare_inputs")
             else:
                 self._prepare_inputs(batch)
         finally:
@@ -2237,9 +2255,11 @@ class Engine:
                         f"{batch.node_name}/{ctx.graph_walk}: a resident step's preprocess read {table}, "
                         "which its graph fills after it; serve it with resident_planning: off"
                     )
-                _refuse_counter_read(batch, reads, "preprocess")
+                _refuse_counter_read(batch.node_name, ctx, reads, "preprocess")
             if getattr(submodule, "ITERATION_INPUTS", None):
-                batch.iteration_columns = self._iteration_columns(batch.node_name, submodule, ctx, rids, req_info)
+                batch.iteration_columns = self._iteration_columns(
+                    batch.node_name, submodule, ctx, rids, req_info, batch.per_request_input_tensors,
+                )
                 preprocessed.update((name, column[:, 0]) for name, column in batch.iteration_columns.items())
         finally:
             phase_end("engine.preprocess", t0)
@@ -2911,6 +2931,13 @@ class Engine:
         capped = [cap for cap in caps if cap is not None]
         return min(capped) if capped else None
 
+    def streamed_iteration_inputs(self, node_name: str) -> frozenset[str]:
+        """The streamed inputs ``node_name`` reads an item a replay of
+        (``IterationInput.streamed``)."""
+        submodule = self._submodules[node_name].submodule
+        specs = getattr(submodule, "ITERATION_INPUTS", {})
+        return frozenset(spec.source for spec in specs.values() if spec.streamed)
+
     def run_columns(self, node_name: str, graph_walk: str) -> frozenset[str]:
         """The per-iteration outputs a step of this walk that repeats keeps a
         column of per replay (``keep_run_columns``)."""
@@ -2918,11 +2945,12 @@ class Engine:
 
     def _iteration_columns(
         self, node_name: str, submodule: NodeSubmodule, ctx: StepContext, rids: Sequence[int],
-        req_info: Mapping[int, Any],
+        req_info: Mapping[int, Any], inputs: Mapping[int, Mapping[str, list]] = MappingProxyType({}),
     ) -> dict[str, torch.Tensor]:
         """The step's iteration inputs, a column a replay: each row at its own
         iteration of its walk's Loop (0 outside one), a padding row at its
         ``capture_fill``."""
+        streamed = [spec for spec in submodule.ITERATION_INPUTS.values() if spec.streamed]
         rows = []
         for rid in rids:
             info = req_info.get(rid)
@@ -2930,7 +2958,7 @@ class Engine:
             # the counter as the engine reads it, not watched
             counts = getattr(info, "metadata", info)
             k = 0 if loop is None or counts is None else counts.dynamic_loop_iter_counts.get(loop, 0)
-            rows.append((rid, k))
+            rows.append((rid, k, _window_tables(streamed, inputs.get(rid), getattr(info, "metadata", None))))
         return iteration_columns(submodule, rows, ctx.repeats, self._device)
 
     def keep_run_columns(self, node_name: str, graph_walk: str, signals: Collection[str]) -> str | None:

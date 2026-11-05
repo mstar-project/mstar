@@ -321,8 +321,44 @@ class StreamBuffer:
         self._chunks_popped += 1
         return chunk
 
-    def store_uningested_edge(self, streaming_edge: StreamingEdge):
-        self._waiting_graph_edges.append(streaming_edge)
+    def pop_window(self, n: int) -> StreamChunk:
+        """Up to ``n`` ready chunks as one, for a step that repeats and takes
+        an item each iteration: only a stream of one-item chunks merges, and
+        never across a walk change or past the final chunk. Only call when
+        ``has_chunk_ready()``."""
+        walk = self.peek_walk()
+        first = self.pop_chunk()
+        if n == 1 or first.num_items != 1 or first.is_final or self.policy.window_size() != 1:
+            return first
+        chunks = [first]
+        while len(chunks) < n and self.has_chunk_ready() and self.peek_walk() == walk:
+            chunk = self.pop_chunk()
+            chunks.append(chunk)
+            if chunk.is_final or chunk.num_items != 1:
+                break
+        if len(chunks) == 1:
+            return first
+        data = [chunk.data.get("data") for chunk in chunks]
+        held = [d for d in data if d is not None]
+        if held and isinstance(held[0], torch.Tensor):
+            # a one-item chunk holds its item as itself (`collate`)
+            merged = {"data": collate(held)}
+        else:
+            merged = {"data": [u for d in held for u in d]}
+        last = chunks[-1]
+        return StreamChunk(
+            data=merged, chunk_index=first.chunk_index, start_offset=first.start_offset, is_final=last.is_final,
+            context_items=first.context_items, num_items=sum(c.num_items for c in chunks),
+            released=[item for c in chunks for item in c.released],
+        )
+
+    def store_uningested_edge(self, streaming_edge: StreamingEdge, first: bool = False):
+        """Hand back a chunk the graph didn't take; ``first`` ahead of any
+        other waiting one (the rest of a window a step ran short of)."""
+        if first:
+            self._waiting_graph_edges.appendleft(streaming_edge)
+        else:
+            self._waiting_graph_edges.append(streaming_edge)
         self.maybe_ready = True
 
     def _collate(self, items: list) -> dict[str, torch.Tensor | None]:

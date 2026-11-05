@@ -66,14 +66,16 @@ def parse_step_repeats(block: object, nodes: Collection[str]) -> dict[str, Repea
     return {node: RepeatConfig.parse(node, settings) for node, settings in block.items()}
 
 
-def edge_refusal(edges: LoopEdges) -> str | None:
+def edge_refusal(edges: LoopEdges, windowed: Collection[str] = ()) -> str | None:
     """Why a run can't serve one of ``edges``, or None. A loop-back signal is
-    carried between replays (``NodeSubmodule.repeat_carry``), and a
-    per-iteration output is served by a column per replay (``run_columns``),
-    as items of its own."""
+    carried between replays (``NodeSubmodule.repeat_carry``), a streamed input
+    the node reads an item an iteration of (``windowed``: a streamed
+    ``IterationInput``) is a window of its ready items, and a per-iteration
+    output is served by a column per replay (``run_columns``), as items of its
+    own."""
     for name, kind in sorted(edges.inputs.items()):
-        if kind is EdgeKind.PER_ITERATION:
-            return f"stream buffer: its input {name!r} is streamed, an item each iteration"
+        if kind is EdgeKind.PER_ITERATION and name not in windowed:
+            return f"node: its streamed input {name!r} isn't an iteration input it reads an item of a replay"
     for (signal, dest), kind in sorted(edges.outputs.items()):
         if kind is EdgeKind.PER_ITERATION and dest != EMPTY_DESTINATION and (signal, dest) not in edges.items:
             return f"graph runtime: {signal!r} -> {dest!r} is read once an iteration by its node"
@@ -114,6 +116,14 @@ class StepRepeats:
     def asked(self) -> bool:
         """Whether any Loop walk here may stand for more than one iteration."""
         return any(self.limit(node) > 1 for node, _ in self.edges)
+
+    def windows(self) -> dict[str, int]:
+        """Consumer node -> the items a step may take of each stream into it:
+        a walk that repeats and reads streamed inputs, its limit."""
+        return {
+            node: self.limit(node) for node, walk in self._walks
+            if any(kind is EdgeKind.PER_ITERATION for kind in self.edges[(node, walk)].inputs.values())
+        }
 
     def carried(self) -> dict[tuple[str, str], frozenset[str]]:
         """The loop-back signals of each walk asked to repeat, which a run

@@ -68,6 +68,10 @@ class StreamBufferManager:
         # the rids that own a buffer; empty for a text model, so a speculation
         # skips its per-row stream polls
         self._rids: set[int] = set()
+        # consumer node -> the most items a speculated step may take of each
+        # stream into it, one an iteration of a step that repeats (a stream
+        # window); a node not here takes a chunk a step
+        self.windows: dict[str, int] = {}
 
     def possible(self) -> bool:
         """Whether any live request owns a stream buffer."""
@@ -164,12 +168,14 @@ class StreamBufferManager:
 
     def pop_edge(
         self, sbuf: StreamBuffer, edge_name: str, request_id: int,
-        allow_walk_change: bool = True,
+        allow_walk_change: bool = True, window: int = 1,
     ) -> StreamingEdge | None:
         """The buffer's next chunk as a graph edge into its consumer: one a
         step refused earlier first, else a newly ready one; None when there
         is neither. A producer-triggered consumer first enters the chunk's
-        walk, if ``allow_walk_change`` and nothing of it is mid-pass."""
+        walk, if ``allow_walk_change`` and nothing of it is mid-pass. With a
+        ``window``, up to that many one-item chunks as one
+        (``StreamBuffer.pop_window``)."""
         consumer_node = self.consumer_node.get(edge_name, "")
         waiting = sbuf.pop_waiting_edge()
         if waiting is not None:
@@ -186,7 +192,7 @@ class StreamBufferManager:
             return None
         if not self._enter_chunk_walk(sbuf, edge_name, request_id, allow_walk_change):
             return None
-        chunk = sbuf.pop_chunk()
+        chunk = sbuf.pop_window(window) if window > 1 else sbuf.pop_chunk()
         # The chunk's items as the buffer holds them: their uuids, or none for
         # an empty chunk (producer done, nothing left). The edge carries every
         # item; ``input_tensors`` stacks them when the consuming batch is built.
@@ -221,8 +227,9 @@ class StreamBufferManager:
         if req_info is None:
             return []
         result = []
+        window = self.windows.get(node_name, 1)
         for edge_name, sbuf in req_info.stream_buffers_by_consumer.get(node_name, {}).items():
-            edge = self.pop_edge(sbuf, edge_name, request_id, allow_walk_change=False)
+            edge = self.pop_edge(sbuf, edge_name, request_id, allow_walk_change=False, window=window)
             if edge is not None:
                 result.append(edge)
         return result
@@ -240,6 +247,27 @@ class StreamBufferManager:
         # The step that took the final chunk will not run; the stream is live again.
         if streaming_edge.chunk.is_final:
             req_info.ended_streams.discard(streaming_edge.name)
+
+    def return_unread(self, request_id: int, streaming_edge: StreamingEdge, used: int) -> bool:
+        """Hand back what a step that took ``streaming_edge``'s window didn't
+        run: its items past the first ``used``, ahead of anything else
+        waiting, before any later step pops the stream. Whether the final
+        chunk went back with them (the step then ends no stream)."""
+        req_info = self._request_state.per_request_info.get(request_id)
+        sbuf = None if req_info is None else req_info.stream_buffers.get(streaming_edge.name)
+        if sbuf is None:
+            return False
+        chunk = streaming_edge.chunk
+        rest = streaming_edge.uuids[used:]
+        if rest:
+            # the step's edge drops its references when its node consumes it
+            self._tensor_manager.increment_ref_batch_uniform(rest)
+        sbuf.store_uningested_edge(streaming_edge._replace(
+            uuids=rest, chunk=StreamChunkInfo(chunk.start_offset + used, 0, len(rest), chunk.is_final),
+        ), first=True)
+        if chunk.is_final:
+            req_info.ended_streams.discard(streaming_edge.name)
+        return chunk.is_final
 
     def mark_ingested(self, request_id: int, streaming_edge: StreamingEdge) -> None:
         """Remember the chunk the graph accepted, for the batch that consumes it.

@@ -459,7 +459,7 @@ def _frames(streaming: bool):
     (_token_loop(), None),
     (_token_loop(_frames(streaming=True)), None),
     (_token_loop(_frames(streaming=False)), "graph runtime: 'frame' -> 'codec' is read once an iteration"),
-    (_token_loop(streamed=("chunk",)), "stream buffer: its input 'chunk' is streamed"),
+    (_token_loop(streamed=("chunk",)), "node: its streamed input 'chunk' isn't an iteration input"),
 ], ids=["served", "streamed_out", "next_node", "streamed_in"])
 def test_a_walk_repeats_only_if_a_run_serves_each_of_its_edges(loop, why):
     from mstar.graph.base import loop_edges
@@ -569,14 +569,14 @@ def test_a_step_its_resources_held_to_one_iteration_moves_its_rows_by_one():
     worker._graph_runtime = SimpleNamespace(loop_room=lambda *args: 100)
     speculation = SimpleNamespace(
         scheduled_batch=batch, node_batch=SimpleNamespace(step_context=ctx), loop_name="loop",
-        continuing_rids={0, 1}, is_new_iter=True, is_same_node=True,
+        continuing_rids={0, 1}, is_new_iter=True, is_same_node=True, consumed_streaming_edges={},
     )
     in_flight = SimpleNamespace(batch=SimpleNamespace(repeats=1))
     worker._stamp_repeats(speculation, in_flight, 1)
     assert ctx.repeats == 8
     ctx.repeats = 1  # what its resources allowed, at admit
     pending = SimpleNamespace(batch=batch, node_batch=SimpleNamespace(
-        step_context=ctx, launch_started_event=SimpleNamespace(is_set=lambda: True),
+        step_context=ctx, launch_started_event=SimpleNamespace(is_set=lambda: True), stream_windows={},
     ))
     worker._await_admit_settled(pending)
     assert batch.loop_strides(list(rows)) in (None, [1, 1])
@@ -2505,12 +2505,12 @@ def test_a_repeating_step_that_reads_the_loop_counter_stops_the_worker(repeats):
     with watch_table_reads() as reads:
         assert info.dynamic_loop_iter_counts.get("loop") == 4
     assert reads == [LOOP_COUNTER]
-    batch = SimpleNamespace(node_name="n", step_context=SimpleNamespace(repeats=repeats, graph_walk=WALK))
+    ctx = SimpleNamespace(repeats=repeats, graph_walk=WALK)
     if repeats == 1:
-        _refuse_counter_read(batch, reads, "preprocess")
+        _refuse_counter_read("n", ctx, reads, "preprocess")
     else:
         with pytest.raises(SystemExit, match="preprocess read the loop counter"):
-            _refuse_counter_read(batch, reads, "preprocess")
+            _refuse_counter_read("n", ctx, reads, "preprocess")
 
 
 def test_a_captured_preprocess_that_reads_the_loop_counter_keeps_its_walk_from_repeating():
@@ -2541,3 +2541,34 @@ def test_a_captured_preprocess_that_reads_the_loop_counter_keeps_its_walk_from_r
     assert mgmt.carry_refusals[WALK] == (
         "node: its captured preprocess reads the loop counter, which a run's later replays don't renew"
     )
+
+
+def test_a_step_that_reads_a_stream_window_repeats_as_far_as_every_row_has_items():
+    """The stream answers how far a step may run: the fewest items any row's
+    window holds; a row's window is cut an item a replay."""
+    from mstar.engine.engine import _window_tables
+    from mstar.streaming.stream_buffer import StreamChunkInfo, StreamingEdge
+
+    rows = {0: 0, 1: 0}
+    batch = ScheduledBatch(node_name="n", graph_walk=WALK, request_to_worker_graph=dict(rows))
+    ctx = SimpleNamespace(repeats=1)
+
+    def window(items):
+        return [StreamingEdge("chunk", "n", list(range(items)), StreamChunkInfo(0, 0, items, False))]
+
+    node_batch = SimpleNamespace(step_context=ctx)
+    worker = Worker.__new__(Worker)
+    worker._step_repeats = _repeats(8)
+    worker._step_repeats.settle(lambda *key: None, lambda *key: None)
+    worker._graph_runtime = SimpleNamespace(loop_room=lambda *args: 100)
+    speculation = SimpleNamespace(
+        scheduled_batch=batch, node_batch=node_batch, loop_name="loop", continuing_rids={0, 1},
+        is_new_iter=True, is_same_node=True, consumed_streaming_edges={0: window(3), 1: window(5)},
+    )
+    worker._stamp_repeats(speculation, SimpleNamespace(batch=SimpleNamespace(repeats=1)), 1)
+    assert ctx.repeats == 3 and set(node_batch.stream_windows) == {0, 1}
+
+    spec = IterationInput("chunk", shape=(2,), streamed=True)
+    items = torch.arange(6.0).reshape(3, 2)
+    metadata = SimpleNamespace(stream_chunks={"chunk": StreamChunkInfo(0, 0, 3, False)})
+    assert torch.equal(_window_tables([spec], {"chunk": [items]}, metadata)["chunk"], items)
