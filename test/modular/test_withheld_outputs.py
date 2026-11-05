@@ -234,6 +234,28 @@ def test_a_device_run_that_ended_after_one_iteration_routes_one_item_a_row():
     assert _cut(2, [[1, 2], [3, 4]], asked=4, whole=True) == {KEEP: [[0], [1]], DROP: [[10], [11]]}
 
 
+def test_a_step_that_withholds_a_row_keeps_the_batchs_row_views():
+    """A step of one iteration with a stop row is most steps of a busy node:
+    dropping the views sent every row down the per-tensor store, which was
+    Qwen3-TTS's store time at c=64 (run21)."""
+    w = Worker.__new__(Worker)
+    w._withholding = WITHHOLDING
+    views = {"frame": (torch.zeros(1), torch.ones(1))}
+    outputs = BatchedModelOutput(
+        per_rid_outputs={KEEP: {"frame": [views["frame"][0]]}, DROP: {"frame": [views["frame"][1]]}},
+        row_views=views,
+    )
+    pending = SimpleNamespace(
+        node_name=NODE, graph_walk=WALK,
+        batch=ScheduledBatch(node_name=NODE, graph_walk=WALK, request_to_worker_graph={KEEP: 0, DROP: 0}),
+    )
+    step = PostprocessStep(PostprocessNeed.STORE, ParallelList([KEEP, DROP], [0, 0]), kept={})
+    buffers = {"token": torch.tensor([[1], [STOP_TOKEN]])}
+    Worker._cut_run_items(w, pending, outputs, step, HostRows((KEEP, DROP), buffers), None, SimpleNamespace())
+    assert outputs.row_views is views
+    assert "frame" in outputs.per_rid_outputs[KEEP] and "frame" not in outputs.per_rid_outputs[DROP]
+
+
 def test_a_replay_that_emits_two_items_routes_both():
     """``EMITTED_COUNT`` says how many of a replay's items along dim 1 are
     real: KEEP emits 2 then 1, DROP 1 then 2."""

@@ -458,6 +458,13 @@ class RepeatingSteps:
         emitted = None if host_rows is None else host_rows.buffers.get(EMITTED_COUNT)
         if not columns and not withhold and emitted is None:
             return
+        if not columns and emitted is None:
+            # one iteration a row: a withheld row just has no item, and the batch's
+            # row views still describe the rest
+            for rid, _ in withheld:
+                for name in withhold:
+                    outputs.get(rid, {}).pop(name, None)
+            return
         signals = set(withhold) | columns
         if emitted is not None:
             # a step that emits a count splits its outputs, run or not

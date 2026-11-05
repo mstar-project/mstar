@@ -4271,12 +4271,14 @@ class Worker(RepeatingSteps):
             rids = set(walk_rids)
             buf = None if host_rows is None else host_rows.buffers.get(policy.token_signal)
             if torch.is_tensor(buf) and buf.dim():
-                eos = torch.tensor(sorted(policy.eos_tokens), dtype=buf.dtype)
-                hits = torch.isin(buf.reshape(buf.shape[0], -1), eos).nonzero().tolist()
-                out.update(
-                    (host_rows.request_ids[row], i) for row, i in hits
-                    if row < len(host_rows.request_ids) and host_rows.request_ids[row] in rids
-                )
+                tokens = buf.reshape(-1).tolist()
+                if not policy.eos_tokens.isdisjoint(tokens):  # most steps have no stop row
+                    width = len(tokens) // buf.shape[0]
+                    hits = (divmod(k, width) for k, token in enumerate(tokens) if token in policy.eos_tokens)
+                    out.update(
+                        (host_rows.request_ids[row], i) for row, i in hits
+                        if row < len(host_rows.request_ids) and host_rows.request_ids[row] in rids
+                    )
                 continue
             # a step with no stop buffers: each row's own host copy
             for rid in rids:
