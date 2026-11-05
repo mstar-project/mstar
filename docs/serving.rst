@@ -457,10 +457,14 @@ page outside the admitted prompts. The worker then takes pages from the newest r
 that arrived after the request that ran short, until they cover its shortage. Each moves to the
 host when the host pool (``cpu_offload_pages``) can hold all of its pages, and is otherwise
 dropped if it can be rebuilt from its token ids. The request that ran short gets the pages
-freed, up to its shortage, unless it moved or was dropped itself. A request on the host waits
-at its place in the queue until its pages and one more page fit, and its pages are then copied
-back. A dropped request waits until its prompt, or its history and one more page if that is
-larger, fits, then recomputes its KV in prefill chunks cut by its walk's chunk budget.
+freed, up to its shortage, and waits holding its pages when the newer requests can't cover it.
+A request on the host, a dropped request and one waiting for pages wait outside the queue, so a
+new prompt that fits still starts. They are tried oldest first, before the queue. The oldest
+waiting request that doesn't fit moves newer requests that wait holding pages, to the host or
+by a drop as above. A request on the host returns once its pages and one more page fit, and its
+pages are then copied back. A dropped request returns once its prompt, or its history and one
+more page if that is larger, fits, then recomputes its KV in prefill chunks cut by its walk's
+chunk budget.
 
 Above one rank, on a worker that runs only some of a node's walks, on a node with a second
 paged KV cache, such as Whisper's decoder, and on a node with no rebuild policy and no host
