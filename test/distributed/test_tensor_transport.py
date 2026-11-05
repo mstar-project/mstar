@@ -9,6 +9,7 @@ Parametrized over SHM and TCP-via-Mooncake; the latter skips when
 mooncake isn't installed.
 """
 from copy import deepcopy
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -19,8 +20,14 @@ from mstar.communication.tensors import (
     SharedMemoryCommunicationManager,
     create_tensor_communication_manager,
 )
+from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.distributed.base import ShardingConfig, ShardingGroup
 from mstar.graph.base import GraphEdge, NodeAndGraphWalk
+from mstar.utils.ipc_format import NewRequest
+from mstar.worker.node_manager_utils import RequestStateManager
+from mstar.worker.rid_table import RidTable
+from mstar.worker.stream_buffers import StreamBufferManager
+from mstar.worker.worker import Worker
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -233,6 +240,77 @@ def test_fanin_buffers_partial_then_completes(make_manager, protocol):
         receiver.get_tensor(out_uuid),
         torch.cat([shard0, shard1], dim=0),
     )
+
+
+def _receiving_worker(manager, sharding_config: ShardingConfig) -> Worker:
+    """The real ``Worker._add_new_request`` over ``manager``, the rest cut down."""
+    rids = RidTable()
+    w = Worker.__new__(Worker)
+    w.worker_id = manager.my_entity_id
+    w._draining_rids, w._reads_done_sent, w._unprocessed_messages = set(), set(), {}
+    w._graph_runtime = SimpleNamespace(
+        add_request=lambda request_id, **kw: rids.intern(request_id),
+        get_rid_handle=rids.handle,
+        get_sharding_config=lambda rid: sharding_config,
+        register_stop_limits=lambda rid, info: None,
+    )
+    w.request_state = RequestStateManager()
+    w.scheduler = SimpleNamespace(note_arrival=lambda rid: None)
+    w.tensor_manager = manager
+    w.engine_manager = SimpleNamespace(
+        engine=SimpleNamespace(publisher_nodes={}), add_request=lambda rid, configs, info: None,
+    )
+    w.streams = StreamBufferManager(w.request_state, manager, [])
+    w.wakeup_event = SimpleNamespace(register_futures=lambda futures: None)
+    return w
+
+
+def _new_request(request_id: str, partition: str) -> NewRequest:
+    return NewRequest(
+        request_id=request_id,
+        request_info=CurrentForwardPassInfo(
+            request_id=request_id, graph_walk="decode", fwd_index=0, random_seed=0,
+            max_tokens=1, partition_name=partition,
+        ),
+        partition_worker_graph_ids=[], worker_graph_to_workers={}, initial_inputs=[], loop_caps={},
+    )
+
+
+@pytest.mark.parametrize("protocol", _PROTOCOLS)
+def test_a_second_partition_keeps_a_partial_fanin(make_manager, protocol):
+    """A worker serving two partitions of a request gets a NewRequest for
+    each. A shard that arrived between the two must still be buffered after
+    the second, or the edge waits for it forever."""
+    sender0 = make_manager("w0", protocol)
+    sender1 = make_manager("w1", protocol)
+    receiver = make_manager("w2", protocol)
+    a_grp = ShardingGroup(nodes={"A"}, tp_size=2, graph_walks={"decode"})
+    a_grp.register_workers(["w0", "w1"], my_tp_rank=0)
+    cfg = ShardingConfig(tp_enabled_nodes=set(), groups=[a_grp], shard_dim={"x": 0})
+    cfg.setup({
+        NodeAndGraphWalk("A", "decode"): ["w0", "w1"],
+        NodeAndGraphWalk("B", "decode"): ["w2"],
+    })
+    for m in (sender0, sender1):
+        m.register_request("req1", cfg)
+    worker = _receiving_worker(receiver, cfg)
+    worker._add_new_request(_new_request("req1", "P0"))
+    rid = worker._rid("req1")
+
+    shard0 = torch.randn(3, 4)
+    shard1 = torch.randn(3, 4)
+    edge0 = _send(sender0, "req1", "x", "B", shard0, 0, 2, fanin=2, shard_dim=0)
+    edge1 = _send(sender1, "req1", "x", "B", shard1, 1, 2, fanin=2, shard_dim=0)
+    _drain_reads(receiver, rid, [deepcopy(edge0)], graph_walk="decode")
+    assert receiver.get_ready_tensors(graph_walk="decode").get(rid, []) == []
+
+    worker._add_new_request(_new_request("req1", "P1"))
+
+    _drain_reads(receiver, rid, [deepcopy(edge1)], graph_walk="decode")
+    ready = receiver.get_ready_tensors(graph_walk="decode")
+    assert rid in ready and len(ready[rid]) == 1
+    out_uuid = ready[rid][0].tensor_info[0].uuid
+    assert torch.equal(receiver.get_tensor(out_uuid), torch.cat([shard0, shard1], dim=0))
 
 
 @pytest.mark.parametrize("protocol", _PROTOCOLS)

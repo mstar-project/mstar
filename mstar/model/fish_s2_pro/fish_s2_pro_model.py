@@ -15,10 +15,10 @@ Architecture (two asynchronous partitions):
     Codec      - DAC decoder producing PCM chunks
 
 Streaming topology:
-    AR --[codec_tokens, ScheduledLeftContextChunkPolicy((4, 8, 16), 32, 1026)]--> Codec
+    AR --[codec_tokens, ScheduledLeftContextChunkPolicy((4, 8, 16), 32, 0)]--> Codec
 
-Each codec window carries the decoder's whole receptive field as context, so
-the streamed audio is sample for sample the audio of one decode of the
+The codec decodes each chunk's new frames from its stream's decoder state
+(``CODEC_STATE``), so the streamed audio is the audio of one decode of the
 stream (other S2-Pro serving implementations stream with shorter overlaps).
 
 Request state machine:
@@ -54,6 +54,7 @@ from mstar.engine.resources import (
     SamplerSpec,
     SamplingReqConfig,
 )
+from mstar.engine.resources.recurrent import RecurrentStateConfig, RecurrentStateSpec
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import ForwardPassArgs, KVLabel, LabelLayout, Model, ProcessPromptOutput, Span, TensorAndMetadata
@@ -65,6 +66,7 @@ from mstar.model.fish_s2_pro.config import (
     AR_SAMPLER,
     CLONE_SPEECH_TEXT,
     CLONE_SYSTEM_TEXT,
+    CODEC_STATE,
     IM_END,
     IM_START,
     PROMPT_LAYOUT_KEY,
@@ -84,7 +86,7 @@ METADATA_FILES = (
 )
 CODEC_FILE = "codec.pth"
 # Deployment ``model_kwargs`` that override codec streaming controls.
-CODEC_KWARGS = ("chunk_schedule", "chunk_frames", "left_context_frames", "conv_context_frames")
+CODEC_KWARGS = ("chunk_schedule", "chunk_frames")
 
 
 def _resolve_snapshot(repo_id: str, cache_dir: str | None, allow_patterns: list[str] | None) -> str:
@@ -117,14 +119,21 @@ class FishS2ProModel(Model):
     PREFILL_INPUTS = ("prompt_ids",)
     REF_ENCODER_INPUTS = ("audio_inputs",)
     LENGTH_KWARGS = ("max_output_tokens", "max_new_tokens")
+    # Streams the codec state pool holds (about 8.5 MiB each, fp32): as many
+    # as the AR decodes in one step (``ARSubmodule.MAX_BATCH_SIZE``). A request
+    # holds its stream until it ends, so the deployment caps concurrent requests
+    # at this (``max_concurrent_requests``, checked in ``validate_config_yaml``)
+    # and later ones queue before the AR. Size it with
+    # ``resources: {codec_state: {max_slots: ...}}``.
+    MAX_CODEC_STREAMS = 64
 
     def __init__(self, model_path_hf: str, cache_dir: str | None = None, **kwargs: Any) -> None:
         self.model_path_hf = model_path_hf
         self.cache_dir = cache_dir
         # Server-init knob: decode the codec with TF32 off (the reference's fp32).
-        # Off by default: in exact fp32 the codec's conv stack is most of the GPU
-        # time once requests overlap, TF32 halves it, and the audio stays within
-        # ~60 dB SNR of the exact decode.
+        # Off by default: TF32 speeds up the codec's conv stack, most of the GPU
+        # time once requests overlap, for a small SNR cost (measured on the
+        # earlier windowed codec; see the Fish S2-Pro notes in docs/models.rst).
         self.codec_exact_fp32 = bool(kwargs.get("codec_exact_fp32", False))
         self.local_dir = _resolve_snapshot(model_path_hf, cache_dir, list(METADATA_FILES))
         logger.info(LICENSE_NOTICE)
@@ -153,10 +162,13 @@ class FishS2ProModel(Model):
     # -----------------------------------------------------------------------
 
     def get_node_resources(self) -> list[NodeResourceSpec]:
-        """Slow AR paged KV, attention, interleaved bf16-table RoPE, semantic sampler.
+        """Slow AR paged KV, attention, interleaved bf16-table RoPE, semantic
+        sampler; the codec's per-stream decoder state.
 
         The Fast AR's frame-local KV scratch is owned by the AR submodule.
         """
+        from mstar.model.fish_s2_pro.components.incremental_dac import codec_state_blocks
+
         slow = self.config.slow_ar
         kv = PagedKVConfig(
             num_layers=slow.n_layer,
@@ -185,7 +197,31 @@ class FishS2ProModel(Model):
                 vocab_size=self.config.semantic_head_size,
                 enable_repetion_penalty=True,
             ),
+            RecurrentStateSpec(
+                resource_key=CODEC_STATE,
+                nodes={"Codec"},
+                config=RecurrentStateConfig(
+                    num_layers=1,
+                    blocks=codec_state_blocks(self.config.codec),
+                    # streams being decoded at once, + 1 for the pool's sink slot
+                    max_slots=self.MAX_CODEC_STREAMS + 1,
+                ),
+            ),
         ]
+
+    def validate_config_yaml(self, config: dict, config_path: str) -> None:
+        """Refuse a request cap the codec state pool cannot hold: a request takes
+        a codec stream at admission and keeps it until it ends, so requests past
+        the pool wait a whole request for their first audio while their AR rows
+        slow everyone streaming."""
+        cap = config.get("max_concurrent_requests")
+        overrides = (config.get("resources") or {}).get(CODEC_STATE) or {}
+        streams = int(overrides.get("max_slots") or self.MAX_CODEC_STREAMS + 1) - 1
+        if cap is not None and int(cap) > streams:
+            raise ValueError(
+                f"{config_path}: max_concurrent_requests={cap} but resources.{CODEC_STATE} holds "
+                f"{streams} streams (max_slots minus the sink); raise max_slots or lower the cap"
+            )
 
     # -----------------------------------------------------------------------
     # Model ABC: walk graph declaration
@@ -223,7 +259,7 @@ class FishS2ProModel(Model):
             "ar_decode": Loop(
                 name="ar_decode_loop",
                 section=ar_node(["ar_input_embeds"], prefill=False),
-                # the largest per-request max_new_tokens; check_stop ends each request's own
+                # runaway guard: the per-request budget is the loop cap (get_loop_caps), from max_new_tokens
                 max_iters=self.config.codec.max_frames,
                 outputs=[],
             ),
@@ -251,8 +287,7 @@ class FishS2ProModel(Model):
         ]
 
     def get_partition_topology(self) -> PartitionTopology:
-        """Codec windows: a ramp of small chunks, then ``chunk_frames``, each behind
-        ``left_context_frames`` of already-decoded frames."""
+        """Codec chunks: a ramp of small chunks, then ``chunk_frames``; new frames only."""
         codec = self.config.codec
         return PartitionTopology(
             partitions=["AR", "Codec"],
@@ -264,7 +299,7 @@ class FishS2ProModel(Model):
                     chunk_policy_factory=lambda: ScheduledLeftContextChunkPolicy(
                         schedule=codec.chunk_schedule,
                         chunk=codec.chunk_frames,
-                        left_context=codec.left_context_frames,
+                        left_context=0,
                     ),
                 ),
             ],
@@ -530,7 +565,7 @@ class FishS2ProModel(Model):
         return requested
 
     def get_loop_caps(self, **model_kwargs: Any) -> dict[str, int]:
-        # the stop check counts the prefill's frame, so decode runs one iteration fewer than max tokens
+        # the prefill samples the first frame, so decode runs one iteration fewer than max tokens
         return {"ar_decode_loop": max(1, self.get_max_output_tokens(**model_kwargs) - 1)}
 
     def kv_labels(self) -> dict[str, dict[str, KVLabel]]:

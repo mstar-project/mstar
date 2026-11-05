@@ -20,6 +20,7 @@ from torch import nn
 
 from mstar.engine.resources.lora.config import LoraTarget
 from mstar.model.components.lora.capable import LoraCapable, LoraOutputAdd
+from mstar.model.components.quant_linear import QuantCapability
 
 
 class FusedColumnLinear(nn.Module, LoraCapable):
@@ -105,6 +106,10 @@ class FusedColumnLinear(nn.Module, LoraCapable):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return F.linear(x, self.weight, self.bias)
+
+    def quant_capability(self) -> QuantCapability:
+        # one weight, quantized whole; the shards stay slices of the output
+        return QuantCapability(True)
 
     def lora_target(self) -> LoraTarget:
         # a slice per shard, named by the shard ids the stacked rules route by

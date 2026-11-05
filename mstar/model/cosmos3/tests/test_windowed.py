@@ -295,6 +295,22 @@ def test_chained_window_head_layout(ctx, monkeypatch) -> None:
     assert not torch.allclose(head, window[:, :, -2:])
 
 
+def test_chained_window_head_encodes_in_the_encode_vaes_dtype(monkeypatch) -> None:
+    """The head encodes in the encode VAE's own dtype (bf16 as built) and never
+    casts it: the instance is the encoder node's when the two share a process."""
+    from mstar.model.cosmos3.submodules import ChainedWindowHead
+
+    monkeypatch.setenv("COSMOS3_VAE_DECODE_FP32", "1")
+    monkeypatch.setenv("COSMOS3_COMPILE_VAE", "0")
+    cfg = Cosmos3Model(model_path_hf="unused", skip_weight_loading=True).config
+    encode_vae = _CausalVAE(cfg.latent_channel).to(torch.bfloat16)
+    window = torch.zeros(1, cfg.latent_channel, 8, 4, 4)
+    head = ChainedWindowHead(_CausalVAE(cfg.latent_channel), encode_vae, cfg)(window, 2)
+    assert encode_vae.encoded[0].dtype == torch.bfloat16
+    assert encode_vae.weight.dtype == torch.bfloat16
+    assert head.dtype == window.dtype
+
+
 def test_windowed_kv_prefill_state_and_pacing(monkeypatch) -> None:
     """A kv request runs steps + 1 loop iterations per window (the +1 is the
     commit pass); the prefill records the pacing, the schedule and the
@@ -488,6 +504,20 @@ def test_windowed_can_batch_and_batched_boundary(monkeypatch) -> None:
     batch = SimpleNamespace(graph_walk=C.VIDEO_GEN_AR_WALK, request_ids=["a", "b"])
     inp = lambda commit=False: SimpleNamespace(resource_step_info=SimpleNamespace(commit=commit))  # noqa: E731
     assert sub.can_batch(batch, [inp(), inp()])  # at any two steps, in any two windows
+
+    # With a cap set (an H100 deployment's 16384), a step whose requests total
+    # more vision tokens than it runs request by request, even when each is
+    # under it. Without one (the default) they batch.
+    cap = 16384
+    for rid, n in (("q1", cap // 4), ("q2", cap // 4), ("h1", cap // 2 + 1), ("h2", cap // 2 + 1)):
+        add_windowed(rid)["cond"]["num_vision_tokens"] = n
+    pair = lambda *rids: SimpleNamespace(graph_walk=C.VIDEO_GEN_AR_WALK, request_ids=list(rids))  # noqa: E731
+    assert sub.config.max_batched_vision_tokens is None
+    assert sub.can_batch(pair("h1", "h2"), [inp(), inp()])
+    sub.config.max_batched_vision_tokens = cap
+    assert sub.can_batch(pair("q1", "q2"), [inp(), inp()])
+    assert not sub.can_batch(pair("h1", "h2"), [inp(), inp()])
+    sub.config.max_batched_vision_tokens = None
 
     # A kv request at its commit iteration vetoes the batch.
     st_kv = add_windowed("c")

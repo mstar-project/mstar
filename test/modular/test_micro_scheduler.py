@@ -78,8 +78,7 @@ class _Queue:
 class _Runtime:
     """Graph-level ready scan, over the manager's queues.
 
-    The real PythonGraphRuntime owns the queues and RequestStateManager shares
-    the same dict; this mirrors that by reading the manager's.
+    The real runtime owns the queues; this stand-in reads the manager's.
     """
 
     def __init__(self, manager: _Manager):
@@ -1235,6 +1234,62 @@ def test_a_chain_does_not_yield_to_a_failed_rid():
 
     assert sched.backlog_splits_from(_Manager([]), (NODE, WALK), "c0") is False
 
+
+
+class _StepScheduleEngine(_Engine):
+    """A capture group by denoise step, as a step schedule's dtype is: step 0 one group, the rest another."""
+
+    def capture_group(self, node_name, graph_walk, rid, fwd_info, input_metadata=None):
+        del node_name, graph_walk
+        loops = fwd_info.dynamic_loop_iter_counts
+        if input_metadata is not None and "loop" in input_metadata.dynamic_loop_iter_counts:
+            loops = input_metadata.dynamic_loop_iter_counts
+        return "first" if loops["loop"] < 1 else "rest"
+
+
+class _StepManager(_Manager):
+    def __init__(self, rids, steps):
+        super().__init__(rids)
+        self.steps = steps
+
+    def get_fwd_info(self, rid, partition):
+        del partition
+        return SimpleNamespace(dynamic_loop_iter_counts={"loop": self.steps[rid]})
+
+
+def _step_chain(continuing, waiting, steps, next_iter_of="loop"):
+    sched = _scheduler(_StepScheduleEngine(max_bs=16))
+    manager = _StepManager(waiting, steps)
+    sched.runtime = manager.runtime
+    manager.runtime.combined_walk_of = sched.combined_walk_of
+    manager.per_request_info.update(dict.fromkeys(continuing, object()))
+    chain = sched.pick_chain_step(manager, (NODE, WALK), list(continuing), (), next_iter_of)
+    return sched, chain.pick, sched.take_chain_step(manager, chain, len(continuing))
+
+
+def test_a_chain_crossing_into_another_group_leaves_the_rows_of_its_old_one():
+    """The chain's rows run its step one iteration on, at step 1; fresh rows at step 0 would mix the two."""
+    sched, pick, batch = _step_chain(["c0", "c1"], ["f0", "f1"], {"c0": 0, "c1": 0, "f0": 0, "f1": 0})
+    assert pick.taken == ["c0", "c1"] and batch is None
+    assert list(sched.backlog[(NODE, WALK)].request_to_worker_graph) == ["f0", "f1"]
+    # read at the step in flight, the chain's group was the fresh rows'
+    _, pick, batch = _step_chain(["c0", "c1"], ["f0", "f1"], {"c0": 0, "c1": 0, "f0": 0, "f1": 0}, next_iter_of=None)
+    assert list(batch.request_to_worker_graph) == ["f0", "f1"]
+
+
+def test_a_chain_crossing_into_another_group_takes_that_groups_rows():
+    _, pick, batch = _step_chain(["c0"], ["f0", "w2"], {"c0": 0, "f0": 0, "w2": 2})
+    assert pick.taken == ["c0", "w2"] and list(batch.request_to_worker_graph) == ["w2"]
+
+
+def test_a_chain_yields_by_the_group_it_crosses_into():
+    sched = _scheduler(_StepScheduleEngine(max_bs=16))
+    steps = {"c0": 0, "f0": 0, "w2": 2}
+    sched.backlog[(NODE, WALK)] = _batch(["f0"])
+    assert sched.backlog_splits_from(_StepManager([], steps), (NODE, WALK), "c0", "loop") is True
+    assert sched.backlog_splits_from(_StepManager([], steps), (NODE, WALK), "c0") is False
+    sched.backlog[(NODE, WALK)] = _batch(["w2"])
+    assert sched.backlog_splits_from(_StepManager([], steps), (NODE, WALK), "c0", "loop") is False
 
 # ── round robin ─────────────────────────────────────────────────────────
 

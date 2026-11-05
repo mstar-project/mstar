@@ -351,7 +351,7 @@ def _looping_worker(monkeypatch, schedule, speculate, refuse):
     w._build_executing_batch = executing
     w._build_speculation = build_speculation
     w._execute_on_gpu_thread = gpu
-    w._postprocess_batch = lambda pending, outputs: postprocessed.append(pending.graph_walk)
+    w._postprocess_batch = lambda pending, outputs, **_: postprocessed.append(pending.graph_walk)
 
     def fail_loudly(error, *args):
         raise error

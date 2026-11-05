@@ -1,5 +1,11 @@
 model: "vjepa2"
 max_seq_len: 8192
+# Requests the data worker prepares at once (VJepa2Model.PREPROCESS_PARALLEL):
+# a request's video decode is most of its wall time and holds no GIL. 8 was
+# measured on an H200 host. The pool runs 8 x CpuPlan.preprocess_threads (at
+# most 4) intra-op threads and is taken as given, so on a smaller host lower it,
+# or drop the key and the data worker sizes the pool to the CPUs left.
+preprocess_workers: 8
 
 # Default checkpoint is facebook/vjepa2-vitl-fpc64-256 (~300M), set in
 # HF_MODELS["vjepa2"] in mstar/model/registry.py.  To swap to vith / vitg /
