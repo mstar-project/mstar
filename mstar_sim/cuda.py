@@ -105,10 +105,12 @@ def get_device_capability(device=None) -> tuple[int, int]:
 def get_device_properties(device=None):
     try:
         index = device_index(device)
-    except torch.AcceleratorError:  # torch's own check, before CUDA would see the index
+    except torch.AcceleratorError:
+        index = -1
+    if index < 0:  # torch's own check, before CUDA would see the index
         from mstar_sim.device import gpu_error
 
-        raise gpu_error(AssertionError("Invalid device id")) from None
+        raise gpu_error(AssertionError("Invalid device id"))
     return properties(spec().gpu, index, spec().total)
 
 
@@ -131,9 +133,19 @@ def properties(gpu, index: int = 0, total: int | None = None) -> SimpleNamespace
 # ------------------------------------------------------------------ memory
 
 
+def _allocator_index(device) -> int:
+    """``device``'s index for the caching allocator's figures, which take no negative one."""
+    index = device_index(device)
+    if index < 0:
+        from mstar_sim.device import gpu_error
+
+        raise gpu_error(RuntimeError(f"Invalid device argument {index}: did you call init?"))
+    return index
+
+
 def _used(device) -> list[int]:
     """``[current, peak]`` bytes of a simulated device's live tensors (their storages)."""
-    return memory.ALLOCATED.setdefault(device_index(device), [0, 0])
+    return memory.ALLOCATED.setdefault(_allocator_index(device), [0, 0])
 
 
 def memory_allocated(device=None) -> int:
@@ -147,11 +159,11 @@ def max_memory_allocated(device=None) -> int:
 def memory_reserved(device=None) -> int:
     """What the caching allocator holds from the card: every pool's high-water mark
     (``mstar_sim.memory.Pool``)."""
-    return memory.reserved(device_index(device))
+    return memory.reserved(_allocator_index(device))
 
 
 def max_memory_reserved(device=None) -> int:
-    return memory.RESERVED_PEAK.get(device_index(device), 0)
+    return memory.RESERVED_PEAK.get(_allocator_index(device), 0)
 
 
 def reset_peak_memory_stats(device=None) -> None:

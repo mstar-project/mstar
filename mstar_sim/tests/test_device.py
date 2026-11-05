@@ -36,7 +36,7 @@ def run_sim(code: str, gpu: str = "h100", **extra_env: str) -> str:
 
 def test_cuda_semantics():
     out = run_sim("""
-        import subprocess, sys, torch, torch.distributed as dist
+        import itertools, subprocess, sys, torch, torch.distributed as dist
         assert torch.cuda.is_available() and torch.cuda.get_device_name().startswith("NVIDIA H100")
         m = torch.nn.Linear(8, 4, device="meta").to_empty(device="cuda")
         x = torch.randn(3, 8, device="cuda")
@@ -80,12 +80,19 @@ def test_cuda_semantics():
                 pass
         torch.cuda.set_device(-1)  # a negative index is ignored, as torch ignores it
         assert torch.cuda.current_device() == 0 and torch.zeros(1, device="cuda").device == torch.device("cuda", 0)
-        for past in (torch.cuda.get_device_name, torch.cuda.get_device_capability, torch.cuda.get_device_properties):
+        properties = torch.cuda.get_device_name, torch.cuda.get_device_capability, torch.cuda.get_device_properties
+        for past, index in itertools.product(properties, (8, -1)):
             try:
-                past(8)
+                past(index)
                 raise SystemExit("a past index's properties were read")
             except AssertionError as e:
                 assert str(e) == "Invalid device id"
+        for figure in (torch.cuda.memory_allocated, torch.cuda.memory_reserved, torch.cuda.max_memory_reserved):
+            try:
+                figure(-1)
+                raise SystemExit("a negative index's memory was read")
+            except RuntimeError as e:
+                assert "Invalid device argument -1" in str(e)
         from mstar_sim.device import _rebuild
         try:
             _rebuild(torch.ones(1), 8)
