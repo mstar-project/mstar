@@ -57,13 +57,29 @@ def test_cuda_semantics():
         except RuntimeError as e:
             assert "same device" in str(e)
         assert x.to("cuda:1").device == torch.device("cuda", 1)  # a peer copy lands on the peer
+        # a device argument beside a cuda operand wins over the operand's
+        assert torch.zeros_like(x, device="cuda:1").device == x.new_zeros(2, device="cuda:1").device == x.to("cuda:1").device
         for past in (lambda: torch.zeros(2, device="cuda:8"), lambda: x.to("cuda:8"),  # 8 emulated GPUs
-                     lambda: torch.cuda.set_device(8), lambda: torch.cuda.Stream(8)):
+                     lambda: torch.cuda.set_device(8), lambda: torch.cuda.Stream(8),
+                     lambda: torch.zeros_like(x, device="cuda:8"), lambda: x.new_zeros(2, device="cuda:8"),
+                     lambda: torch.cuda.synchronize(8), lambda: torch.cuda.current_stream(8)):
             try:
                 past()
                 raise SystemExit("an index past the emulated devices was accepted")
             except torch.AcceleratorError:
                 pass
+        for past in (torch.cuda.get_device_name, torch.cuda.get_device_capability, torch.cuda.get_device_properties):
+            try:
+                past(8)
+                raise SystemExit("a past index's properties were read")
+            except AssertionError as e:
+                assert str(e) == "Invalid device id"
+        from mstar_sim.device import _rebuild
+        try:
+            _rebuild(torch.ones(1), 8)
+            raise SystemExit("a tensor from a device past the emulated ones was rebuilt")
+        except torch.AcceleratorError:
+            pass
         assert (x + torch.tensor(1.0)).is_cuda          # CPU scalars are fine
         assert x[torch.tensor([0, 2])].shape == (2, 8)  # so is a CPU index
         # indices CUDA accepts raise no device-side assert: negative ones where the kernel wraps

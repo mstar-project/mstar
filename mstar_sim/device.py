@@ -959,7 +959,7 @@ def _function_body(func, args, kwargs):
                 return impl(*args, **kwargs)
     flat = tree_flatten((args, kwargs))[0]
     index = _check_devices(func, args, kwargs, flat)
-    return _run(func, args, kwargs, index, flat)
+    return _run(func, args, kwargs, index if device is None else cuda.device_index(device), flat)
 
 
 # ---------------------------------------------------------------- graph replay
@@ -1212,7 +1212,7 @@ def _host_arg(x):
 
 
 def _rebuild(data, index):
-    return SimTensor(data, index)
+    return SimTensor(data, cuda.device_index(index))
 
 
 _PLAIN = {T.to, T.cuda, T.copy_, T.module_load, T.pin_memory, T.is_pinned}
@@ -1377,7 +1377,7 @@ def install() -> None:
     rebuild = reductions.rebuild_cuda_tensor
 
     def rebuild_cuda_tensor(*args):  # a tensor on the exporter's device, opened from its handle
-        return SimTensor(rebuild(*args), args[6])
+        return SimTensor(rebuild(*args), cuda.device_index(args[6]))
 
     # before mstar binds the name (``from ... import rebuild_cuda_tensor``)
     reductions.rebuild_cuda_tensor = rebuild_cuda_tensor

@@ -98,14 +98,21 @@ def device_index(device) -> int:
 
 
 def get_device_name(device=None) -> str:
-    return spec().gpu.name
+    return get_device_properties(device).name
 
 
 def get_device_capability(device=None) -> tuple[int, int]:
-    return tuple(spec().gpu.capability)
+    props = get_device_properties(device)
+    return props.major, props.minor
 
 
 def get_device_properties(device=None):
+    try:
+        index = device_index(device)
+    except torch.AcceleratorError:  # torch's own check, before CUDA would see the index
+        from mstar_sim.device import gpu_error
+
+        raise gpu_error(AssertionError("Invalid device id")) from None
     gpu = spec().gpu
     major, minor = gpu.capability
     return SimpleNamespace(
@@ -113,7 +120,7 @@ def get_device_properties(device=None):
         multi_processor_count=gpu.sm_count, is_integrated=False, is_multi_gpu_board=False,
         L2_cache_size=getattr(gpu, "l2_bytes", 50 << 20), warp_size=32,
         max_threads_per_multi_processor=2048, regs_per_multiprocessor=65536,
-        uuid=f"mstar-sim-{device_index(device)}", pci_bus_id=device_index(device), pci_device_id=0,
+        uuid=f"mstar-sim-{index}", pci_bus_id=index, pci_device_id=0,
         pci_domain_id=0, gcnArchName="",
     )
 
@@ -232,7 +239,7 @@ class Stream:
     """A stream of the emulated GPU: a :class:`clock.Timeline`."""
 
     def __init__(self, device=None, priority: int = 0, **_):
-        self.device = torch.device("cuda", device_index(device) if device is not None else current_device())
+        self.device = torch.device("cuda", device_index(device))
         self.device_index = self.device.index
         self.device_type = "cuda"
         self.priority = priority
@@ -296,8 +303,9 @@ def default_stream(device=None) -> Stream:
 
 
 def current_stream(device=None) -> Stream:
+    index = device_index(device)
     s = getattr(_tls, "stream", None)
-    return s if s is not None else default_stream(device)
+    return s if s is not None else default_stream(index)
 
 
 def set_stream(s: Stream | None) -> None:
@@ -362,6 +370,7 @@ class Event:
 
 
 def synchronize(device=None) -> None:
+    device_index(device)
     streams = [s.timeline.free_at for s in _all_streams()]
     clock.wait_until(max([clock.DEFAULT.free_at, *streams]))
     _check_fault()
