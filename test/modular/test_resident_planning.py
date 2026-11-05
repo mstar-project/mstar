@@ -47,6 +47,7 @@ from mstar.engine.resources.step import (  # noqa: E402
 )
 from mstar.utils import knobs  # noqa: E402
 from mstar.utils.ipc_format import OffloadDelta  # noqa: E402
+from mstar.worker.micro_scheduler import ScheduledBatch  # noqa: E402
 from mstar.worker.step_repeats import StepRepeats  # noqa: E402
 from mstar.worker.worker import Worker  # noqa: E402
 
@@ -314,7 +315,7 @@ def test_a_step_repeats_only_when_its_rows_all_continue(in_chain, fresh, same_no
         ),
         continuing_rids={0, 1}, is_new_iter=True, is_same_node=same_node,
     )
-    assert StepRepeats(8).ceiling(speculation, in_chain, lambda *key: True, lambda: room) == want
+    assert StepRepeats(8).ceiling(speculation, in_chain, lambda *key: None, lambda: room) == want
 
 
 def test_a_step_with_no_plan_of_its_own_leaves_the_last_steps_wrappers_alone():
@@ -337,6 +338,31 @@ def test_cached_pages_are_room_for_a_step_that_repeats():
     kv._index = SimpleNamespace(evictable=lambda: {5, 6})
     assert kv.max_repeats(None, SimpleNamespace(request_ids=(1, 2, 3), resident=object())) == PAGE
     assert kv.max_repeats(None, SimpleNamespace(request_ids=(1, 2, 3, 4), resident=object())) == 1
+
+
+def test_a_step_its_resources_held_to_one_iteration_moves_its_rows_by_one():
+    """The worker asks for a ceiling, and the step's resources settle what it
+    runs. Once it has admitted, its rows' Loops move by what it runs."""
+    rows = {0: 0, 1: 0}
+    batch = ScheduledBatch(node_name="n", graph_walk=WALK, request_to_worker_graph=dict(rows))
+    ctx = SimpleNamespace(repeats=1)
+    worker = Worker.__new__(Worker)
+    worker._step_repeats = StepRepeats(8)
+    worker._repeat_refusal = lambda *key: None
+    worker._graph_runtime = SimpleNamespace(loop_room=lambda *args: 100)
+    speculation = SimpleNamespace(
+        scheduled_batch=batch, node_batch=SimpleNamespace(step_context=ctx), loop_name="loop",
+        continuing_rids={0, 1}, is_new_iter=True, is_same_node=True,
+    )
+    in_flight = SimpleNamespace(batch=SimpleNamespace(repeats=1))
+    worker._stamp_repeats(speculation, in_flight, 1)
+    assert ctx.repeats == 8
+    ctx.repeats = 1  # what its resources allowed, at admit
+    pending = SimpleNamespace(batch=batch, node_batch=SimpleNamespace(
+        step_context=ctx, launch_started_event=SimpleNamespace(is_set=lambda: True),
+    ))
+    worker._await_admit_settled(pending)
+    assert batch.loop_strides(list(rows)) in (None, [1, 1])
 
 
 def test_a_row_a_host_step_moved_does_not_rewind_on_each_replay():
@@ -1065,7 +1091,7 @@ def test_a_stream_wider_than_a_row_raises():
     with pytest.raises(ValueError, match="fit a block table row"):
         tables.row(9, [1, 2, 3], 1, [0] * planner.narrow_cols, writes)
     plan = SimpleNamespace(
-        repeats=1, slots=torch.tensor([1]).numpy(), rids=(7,), taken=set(), writes=writes, crossed={}, moved=set(),
+        slots=torch.tensor([1]).numpy(), rids=(7,), taken=set(), writes=writes, crossed={}, moved=set(),
     )
     tables.host_len[1], tables.host_cols[1] = 8, 2
     with pytest.raises(ValueError, match="fit a block table row"):

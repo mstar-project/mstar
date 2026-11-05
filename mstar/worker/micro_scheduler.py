@@ -126,8 +126,8 @@ class ScheduledBatch:
     # the step is submitted (``Worker._submit_gpu_step``): the graphs say,
     # not the scheduler, and every step that runs passes through there.
     chunk_loop_walks: frozenset[str] = frozenset()
-    # How many iterations of its Loop this step stands for. The speculator's
-    # ceiling until the step has run, then what it really ran.
+    # How many iterations of its Loop this step stands for, once its resources
+    # have settled it at admit (`StepContext.repeats` holds the ask until then)
     repeats: int = 1
 
 

@@ -12,10 +12,13 @@ twice: here against its rows and its Loop, then by its resources
 """
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from mstar.worker.speculation import Speculation
+
+logger = logging.getLogger(__name__)
 
 
 class StepRepeats:
@@ -25,7 +28,7 @@ class StepRepeats:
         self.limit = limit
         self._walks: dict[tuple[str, str], bool] = {}
 
-    def ceiling(self, speculation: Speculation, in_chain: int, walk_can_repeat, loop_room) -> int:
+    def ceiling(self, speculation: Speculation, in_chain: int, repeat_refusal, loop_room) -> int:
         """The most ``speculation``'s step can repeat. Only a chain's step
         whose rows all continue: a fresh row needs a plan of its own, and until
         the chain has run a step, other ready work hasn't had its look in."""
@@ -38,5 +41,8 @@ class StepRepeats:
         key = (batch.node_name, batch.graph_walk)
         allowed = self._walks.get(key)
         if allowed is None:
-            allowed = self._walks[key] = walk_can_repeat(*key)
+            refusal = repeat_refusal(*key)
+            if refusal is not None:
+                logger.info("max_step_repeats=%d: steps of %s/%s run once each: %s", self.limit, *key, refusal)
+            allowed = self._walks[key] = refusal is None
         return max(1, min(self.limit, loop_room())) if allowed else 1

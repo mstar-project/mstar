@@ -62,7 +62,7 @@ def _batch(seq: int, rids: list[int]):
     )
     executing = SimpleNamespace(
         node_name=NODE, request_ids=list(rids), admit_error=None, failed_requests={},
-        launch_started_event=None, read_check_rids=None,
+        launch_started_event=None, read_check_rids=None, step_context=SimpleNamespace(repeats=1),
     )
     return scheduled, executing
 
@@ -392,10 +392,10 @@ def test_the_admit_fence_waits_out_a_slow_admit(monkeypatch):
     w = Worker.__new__(Worker)
     w.worker_id = "rank0"
     w._span = lambda name: nullcontext()
-    _, executing = _batch(tp_seq, [HANDLES["kept"]])
+    scheduled, executing = _batch(tp_seq, [HANDLES["kept"]])
     executing.launch_started_event = admitted
     pending = SimpleNamespace(
-        tp_seq=tp_seq, node_name=NODE, graph_walk=WALK, node_batch=executing,
+        tp_seq=tp_seq, node_name=NODE, graph_walk=WALK, batch=scheduled, node_batch=executing,
     )
 
     w._await_admit_settled(pending)

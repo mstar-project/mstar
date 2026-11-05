@@ -2530,21 +2530,24 @@ class Worker:
         and this thread blocks on the step's result later in the pass anyway.
         Separate from the submitter's ``MSTAR_LAUNCH_WAIT_MS`` wait on the same
         event, a GIL throttle that is meant to expire.
+
+        Admitted, its resources have settled how many iterations it runs, so
+        the batch takes that from here on.
         """
         if pending is None:
             return
         event = pending.node_batch.launch_started_event
-        if event is None or event.is_set():
-            return
-        waited = 0.0
-        with self._span("worker.await_admit_settled"):
-            while not event.wait(timeout=_ADMIT_FENCE_WARN_S):
-                waited += _ADMIT_FENCE_WARN_S
-                logger.warning(
-                    "Worker %s: still waiting for node=%s walk=%s to admit after "
-                    "%.0f s; scheduling and teardowns wait for it",
-                    self.worker_id, pending.node_name, pending.graph_walk, waited,
-                )
+        if event is not None and not event.is_set():
+            waited = 0.0
+            with self._span("worker.await_admit_settled"):
+                while not event.wait(timeout=_ADMIT_FENCE_WARN_S):
+                    waited += _ADMIT_FENCE_WARN_S
+                    logger.warning(
+                        "Worker %s: still waiting for node=%s walk=%s to admit after "
+                        "%.0f s; scheduling and teardowns wait for it",
+                        self.worker_id, pending.node_name, pending.graph_walk, waited,
+                    )
+        pending.batch.repeats = pending.node_batch.step_context.repeats
 
     def _submit_gpu_step(
         self,
@@ -2885,28 +2888,28 @@ class Worker:
         )
 
     def _stamp_repeats(self, speculation: Speculation, pending: PendingBatch, in_chain: int) -> None:
-        """Ask for as many iterations as the step can have; its resources narrow it."""
+        """Ask for as many iterations as the step can have; its resources narrow
+        it at admit (`_await_admit_settled` takes the answer)."""
         batch = speculation.scheduled_batch
-        repeats = self._step_repeats.ceiling(
-            speculation, in_chain, self._walk_can_repeat,
+        speculation.node_batch.step_context.repeats = self._step_repeats.ceiling(
+            speculation, in_chain, self._repeat_refusal,
             lambda: self._graph_runtime.loop_room(
                 batch.node_name, batch.graph_walk, speculation.loop_name,
                 list(speculation.continuing_rids), pending.batch.repeats,
             ),
         )
-        batch.repeats = speculation.node_batch.step_context.repeats = repeats
 
-    def _walk_can_repeat(self, node_name: str, graph_walk: str) -> bool:
-        """A walk's token stop runs in the runtime and all it routes stays on the
-        device: nothing about a step's rows has to reach the host per iteration."""
+    def _repeat_refusal(self, node_name: str, graph_walk: str) -> str | None:
+        """Why no step of this walk can stand for several iterations, or None:
+        something about its rows has to reach the host every iteration."""
         engine = self.engine_manager.get_engine(node_name)
-        return (
-            self._stop_token_signal.get((node_name, graph_walk)) is not None
-            and self._all_on_device(
-                engine, node_name, graph_walk, self._graph_runtime.get_output_signals(node_name, graph_walk),
-            )
-            and engine.can_repeat(node_name, graph_walk)
-        )
+        if self._stop_token_signal.get((node_name, graph_walk)) is None:
+            return "the runtime doesn't check its stop: it declares no token stop"
+        if not self._all_on_device(
+            engine, node_name, graph_walk, self._graph_runtime.get_output_signals(node_name, graph_walk),
+        ):
+            return "it routes outputs off the device"
+        return engine.repeat_refusal(node_name, graph_walk)
 
     def _can_speculate(self, batch: ScheduledBatch) -> bool:
         if not self._async_schedulable(batch):
@@ -3855,8 +3858,6 @@ class Worker:
             # routes without stopping for it
             checked = self._check_stops(batch_N, outputs, cpu_outputs, host_rows, engine).stops
             _pp_stage("check_stop")
-        # what the step's resources let it run, which only it knows
-        batch_N.batch.repeats = outputs.repeats
         request = self._get_postprocess_request(
             batch_N, host_rows, engine, runtime_stops, tokens, checked,
         )
@@ -5509,7 +5510,7 @@ class Worker:
                     if speculation.is_yield_away and not speculation.gave_way:
                         consecutive_spec_steps = 0
                     else:
-                        consecutive_spec_steps += spec_pending.batch.repeats
+                        consecutive_spec_steps += 1
                     if phase_period:
                         _phase_record("iter_total", _time.perf_counter() - _iter_start)
                         _phase_record("iter_total.cpu", _time.thread_time() - _iter_cpu)

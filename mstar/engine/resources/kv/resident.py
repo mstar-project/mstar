@@ -93,7 +93,7 @@ class KVResidentTables:
             return
         slots = plan.slots
         cols = self.host_cols[slots]
-        need = (self.host_len[slots] + plan.repeats - 1) // self.page_size + 1
+        need = (self.host_len[slots] + plan.writes.repeats - 1) // self.page_size + 1
         rows = np.flatnonzero(need > cols)
         if not rows.size:
             return
@@ -111,7 +111,7 @@ class KVResidentTables:
     def advance(self, plan: ResidentPlan) -> None:
         if plan.writes.streams[self.key].reads:
             return
-        self.host_len[plan.slots] += plan.repeats
+        self.host_len[plan.slots] += plan.writes.repeats
         crossed = plan.crossed.get(self.key)
         if crossed is not None:
             rows, need = crossed

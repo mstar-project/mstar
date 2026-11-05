@@ -1702,7 +1702,6 @@ class Engine:
             if batch.admit_error is None:
                 self._record_loopback(batch)
                 batch.outputs.loopback_rids = batch.loopback_rids
-                batch.outputs.repeats = batch.step_context.repeats
             batch.outputs_ready.set()
             laps.lap("record_loopback")
             return batch.outputs
@@ -2833,14 +2832,18 @@ class Engine:
         capped = [cap for cap in caps if cap is not None]
         return min(capped) if capped else None
 
-    def can_repeat(self, node_name: str, graph_walk: str) -> bool:
-        """Whether a step of this walk can replay with no host work between:
-        its node runs on resident tables and says what carries a replay on."""
+    def repeat_refusal(self, node_name: str, graph_walk: str) -> str | None:
+        """Why a step of this walk can't replay with no host work between, or
+        None if its resources may let it."""
         mgmt = self._submodules.get(node_name)
-        return (
-            mgmt is not None and mgmt.resident is not None and graph_walk in mgmt.resident.walks
-            and mgmt.submodule.repeat_carry(graph_walk) is not None
-        )
+        if mgmt is None or mgmt.resident is None or graph_walk not in mgmt.resident.walks:
+            return "it doesn't run on resident tables"
+        if mgmt.joint_comm_group.world_size > 1:
+            # every rank would have to replay the same count, which one rank settles
+            return "it runs on more than one rank"
+        if mgmt.submodule.repeat_carry(graph_walk) is None:
+            return "its submodule names nothing that carries a replay's token on"
+        return None
 
     def get_max_batch_tokens(self, node_name: str, graph_walk: str) -> int | None:
         return self._chunking.max_batch_tokens(node_name, graph_walk)

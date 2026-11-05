@@ -294,9 +294,6 @@ class BatchedModelOutput:
     # along its last dim. The worker cuts the rows to it once the step has
     # run (see ``NodeSubmodule.spanned_outputs``).
     output_spans: dict[str, torch.Tensor] | None = None
-    # How many times the step's capture replayed (`StepContext.repeats`): each
-    # stop buffer then holds one column per replay.
-    repeats: int = 1
     # The request each row of ``output_spans`` belongs to, stamped by the
     # engine like ``row_request_ids``.
     span_request_ids: tuple | None = None
