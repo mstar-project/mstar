@@ -36,8 +36,9 @@ from test_kv_preemption import (  # noqa: F401
 
 from mstar.engine.engine import Engine, PagedKVCache
 from mstar.engine.resources import Residency
+from mstar.engine.resources.admission import Admission
 from mstar.engine.resources.kv.config import KVStep
-from mstar.engine.resources.step import Segment
+from mstar.engine.resources.step import ASKS, Segment
 from mstar.graph.base import GraphEdge, GraphNode, Loop
 from mstar.model.rebuild import RebuildPolicy
 from mstar.observability.recorders import EdgeTransfers
@@ -298,6 +299,77 @@ def test_an_older_request_that_asks_after_a_newer_one_parks_moves_it():
     w._preemption.make_room()
 
     assert kv.is_offloaded("z") and _ready(kv, "p"), "z, newer and waiting, kept the pages p needs"
+
+
+def test_make_room_helps_the_oldest_refused_request_moves_can_let_in():
+    """o, the oldest, waits for 9 pages, which y and p, the newer requests that wait holding pages, can't free
+    together. Looking only at the oldest refusal, nothing moved for anyone, though dropping p lets y in."""
+    kv = _pool()
+    _running(kv, "x", 4, arrival=0)
+    _running(kv, "y", 3, arrival=2)
+    _running(kv, "p", 3, arrival=3)
+    kv._streams["p"]["main"].step_in_flight = True
+    assert _preempt(kv, "y", _short(kv, "y"), droppable=lambda rid: False).waits
+    kv._streams["p"]["main"].step_in_flight = False
+    assert _preempt(kv, "p", _short(kv, "p"), droppable=lambda rid: False).waits
+    for rid in ("y", "p"):
+        _runner(kv).readmit(rid, NODE, queued=False)
+    _request(kv, "o", 9, arrival=1)
+    assert not _ready(kv, "o") and not _admitted(kv, "y")
+    w = _worker(kv)
+    w._rebuilds._kept[NODE]["p"] = _kept(3 * PAGE_SIZE)
+
+    w._preemption.make_room()
+
+    assert kv.residency("p") is Residency.DROPPED and _admitted(kv, "y"), "y waited behind o, which no move lets in"
+
+
+def test_make_room_asks_nothing_while_no_request_waits_holding_its_allotment():
+    """make_room runs every pass. With no request waiting holding its allotment there is nothing it could move."""
+    kv = _pool()
+    _running(kv, "r", 5, arrival=1)
+    _request(kv, "c", 6, arrival=2)
+    assert not _ready(kv, "c")
+    w = _worker(kv)
+    read = []
+    w.engine_manager.engine.refusals = lambda: read.append(True) or []
+    # a locked section raises
+    kv._lock = None
+
+    w._preemption.make_room()
+
+    assert not read, "make_room read the refusals with no request it could move"
+
+
+class _Pool:
+    """A pool that asks for every request and fits it."""
+
+    def ask(self, rid, node_name, graph_walk):
+        return ASKS
+
+    def reserve(self, rid, node_name, graph_walk, published):
+        return None
+
+
+def test_a_request_admitted_on_a_node_it_never_parked_on_is_unparked():
+    """Bagel's CFG nodes share one pool, so a move asks each of them again for the request, and its admission starts
+    all of them. The request parked only on the node whose readiness check ran, and unparking it raised a KeyError
+    on the others."""
+    admission = Admission({"kv": _Pool()}, ["kv"])
+    nodes = ("LLM", "LLM_cfg")
+    assert all(admission.admit("q", node, "decode", None, ["kv"]) is None for node in nodes)
+    for node in nodes:
+        admission.readmit("q", node, ["kv"], queued=False)
+    engine = _Engine(admit_waiting=admission.admit_waiting)
+    scheduler = SimpleNamespace(parked={"LLM": {"q"}}, engine_manager=SimpleNamespace(get_engine=lambda node: engine))
+    request_state = SimpleNamespace(
+        get_partition_for_node=lambda node: "p",
+        get_fwd_info=lambda rid, p: SimpleNamespace(resource_publish_info=None),
+    )
+
+    MicroScheduler._unpark(scheduler, request_state)
+
+    assert scheduler.parked == {"LLM": set()}, "q stayed parked on the node its check waited on"
 
 
 def test_a_dropped_request_that_waits_for_room_is_unparked_and_rebuilt():
