@@ -263,11 +263,14 @@ def test_only_the_leader_of_a_lockstep_node_owes_a_marker():
     assert not ld._tp_lead_needs_marker(_pending(4), None)
 
 
-def test_a_leader_whose_iteration_raises_before_its_decision_still_sends_the_marker(monkeypatch):
-    """The real run loop on a TP leader: step 0 runs, the yield-away step 1
-    built beside it runs next, and building step 2 raises. No head went out
-    for step 1, so the marker must, or the followers await step 1 for good
-    (and a drain deferred behind it with them)."""
+@pytest.mark.parametrize("raise_in", ["build", "finish_step"])
+def test_a_leader_sends_the_marker_for_a_step_it_drops_before_its_decision(monkeypatch, raise_in):
+    """The real run loop on a TP leader: step 0 runs and the yield-away step 1
+    is built beside it. Then building step 1's successor raises (``build``),
+    or post-processing step 0 raises with step 1 already submitted
+    (``finish_step``). Either way no decision for step 1 went out, so its
+    marker must, or the followers await step 1 for good (and a drain deferred
+    behind it with them)."""
     runtime = _Runtime()
     sched, state = _scheduler(runtime, StepOrder.TURNS)
     for rid in (0, 1):
@@ -279,11 +282,15 @@ def test_a_leader_whose_iteration_raises_before_its_decision_still_sends_the_mar
     w.tp_async_sched, w.tp_async_nodes = True, None
     w.parallel_nodes, w.parallel_leader_nodes = {node}, {node}
     w._graph_runtime = types.SimpleNamespace(is_async_schedulable=lambda node, walk: True)
-    w._settle_speculation = w._finish_step = lambda *a, **k: None
+    w._settle_speculation = lambda *a, **k: None
     w.maybe_send_zmq_to_tp_followers = lambda node_batch, **k: 0  # step 0's seq
     markers, errors = [], []
     w._broadcast_tp_nospec = lambda pending: markers.append(pending.tp_seq)
     w._handle_main_loop_error = lambda exc, *a: errors.append(exc)
+
+    def finish_step(pending, outputs):
+        if raise_in == "finish_step":
+            raise RuntimeError("boom")
 
     def build(pending, consecutive, fair):
         if pending is None:
@@ -292,13 +299,13 @@ def test_a_leader_whose_iteration_raises_before_its_decision_still_sends_the_mar
             spec = w._yield_away_speculation(sched.get_next_batch(state))
             spec.tp_seq = 1  # broadcast as step 1, after step 0's marker
             return spec, None
-        raise RuntimeError("take_chain_step raised")
+        raise RuntimeError("boom")
 
-    w._build_speculation = build
+    w._finish_step, w._build_speculation = finish_step, build
     with pytest.raises(_StopLoopError):
         w.run()
 
-    assert [str(e) for e in errors] == ["take_chain_step raised"]
+    assert [str(e) for e in errors] == ["boom"]
     assert markers == [1]
 
 
