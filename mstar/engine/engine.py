@@ -819,7 +819,8 @@ class Engine:
             return
         submodule_mgmt = self._submodules[node_name]
         refusals = submodule_mgmt.resident_refusals
-        if knobs.resident_planning() == "off":
+        mode = knobs.resident_planning()
+        if mode == "off" or (mode == "auto" and not submodule_mgmt.submodule.resident_by_default):
             refusals.update(dict.fromkeys(looped, NOT_ASKED))
             return
         steps = {}

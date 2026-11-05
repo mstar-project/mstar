@@ -888,6 +888,12 @@ class NodeSubmodule(torch.nn.Module, ABC):
     # setting, so a new eager shape never searches.
     capture_cudnn_benchmark: bool = False
 
+    # Set True where this node's looping walks run on resident tables when the
+    # config leaves ``knobs: resident_planning`` at its default (``auto``); which
+    # walks still comes from every owner agreeing at load. ``on`` asks every
+    # node, ``off`` none.
+    resident_by_default: bool = False
+
     # The LoRA pools bound to this node's modules (``module_lora_spec``); set by
     # `bind_node_resources`. The engine adds each pool's ``LoraStep`` to the node's step,
     # and to each piecewise region's (``lora_rows``), from its segments: in order, the

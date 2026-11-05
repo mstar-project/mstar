@@ -65,9 +65,9 @@ def check(settings: Mapping[str, object] | None) -> dict[str, str]:
 def _resident_planning_value(value: object) -> str:
     # yaml reads a bare ``on`` / ``off`` as a bool
     text = ("on" if value else "off") if isinstance(value, bool) else str(value).strip().lower()
-    if text in ("on", "off"):
+    if text in ("on", "off", "auto"):
         return text
-    raise ValueError(f"`knobs: resident_planning` must be on or off, got {value!r}")
+    raise ValueError(f"`knobs: resident_planning` must be on, off or auto, got {value!r}")
 
 
 def _step_thread_core_value(value: object) -> str:
@@ -241,11 +241,12 @@ def idle_hold() -> str:
         return value
     raise ValueError(f"MSTAR_IDLE_HOLD must be qos or off, got {value!r}")
 def resident_planning() -> str:
-    """``resident_planning`` / ``MSTAR_RESIDENT_PLANNING`` (default ``off``):
+    """``resident_planning`` / ``MSTAR_RESIDENT_PLANNING`` (default ``auto``):
     ``on`` has a captured step read its rows off per-request tables held on
     the device instead of having them rebuilt on the plan thread
     (``mstar.engine.resources.resident``), on each walk that runs a node in a
     Loop where every owner of a fact it needs agrees (its capture, its declared
     step, each resource, its ``preprocess``); one line per such walk at startup
-    says which. ``off`` keeps the host plan everywhere."""
-    return _resident_planning_value(_setting("resident_planning", "off"))
+    says which. ``off`` keeps the host plan everywhere. ``auto`` is ``on`` for
+    a node whose submodule sets ``resident_by_default`` and ``off`` elsewhere."""
+    return _resident_planning_value(_setting("resident_planning", "auto"))

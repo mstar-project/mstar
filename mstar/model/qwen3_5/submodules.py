@@ -101,6 +101,9 @@ def _mixed_token_buckets(prefill_buckets) -> list[int]:
 
 
 class LLMSubmodule(ARNodeSubmodule):
+    # resident by default before the walks were derived at load (#1192)
+    resident_by_default = True
+
     # Total tokens of a packed text-prefill (and mixed) step, one captured
     # graph per (bucket, batch size). A prompt past the top bucket prefills
     # eagerly, and an eager 8k prefill is launch-bound (~1,100 kernel

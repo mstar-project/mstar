@@ -1649,7 +1649,8 @@ and evict other requests. Without a declaration, the same situation raises a
 Returning ``None`` means that the submodule manages its own resources. This is the legacy
 path, kept for submodules that have not been migrated.
 
-With ``knobs: resident_planning: on`` in the serving config, a walk that runs a node
+With ``knobs: resident_planning: on`` in the serving config (or the default, ``auto``,
+for a submodule that sets ``resident_by_default = True``), a walk that runs a node
 inside a ``Loop`` runs its captured steps off per-request tables on the device instead of
 a plan rebuilt per step (``mstar/engine/resources/resident.py``), with nothing for the
 model to declare. The engine decides at load, before capture, from

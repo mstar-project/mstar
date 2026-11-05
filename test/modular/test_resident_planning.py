@@ -2713,21 +2713,35 @@ def test_a_capture_runner_answers_for_the_walks_it_captures():
 
 # ---- the knob ----
 
-def test_the_knob_takes_on_and_off():
+def test_the_knob_takes_on_off_and_auto():
     assert knobs.check({"resident_planning": "on"}) == {"resident_planning": "on"}
     # yaml reads a bare on/off as a bool
     assert knobs.check({"resident_planning": True}) == {"resident_planning": "on"}
     assert knobs.check({"resident_planning": False}) == {"resident_planning": "off"}
-    with pytest.raises(ValueError, match="on or off"):
-        knobs.check({"resident_planning": "auto"})
+    assert knobs.check({"resident_planning": "auto"}) == {"resident_planning": "auto"}
+    with pytest.raises(ValueError, match="on, off or auto"):
+        knobs.check({"resident_planning": "maybe"})
 
 
-def test_resident_planning_is_off_unless_asked_for(monkeypatch):
+@pytest.mark.parametrize(("setting", "by_default", "asked"), [
+    (None, True, True), (None, False, False), ("on", False, True), ("off", True, False),
+])
+def test_a_node_resident_by_default_is_resident_with_no_knob(monkeypatch, setting, by_default, asked):
+    """#1192 ran Qwen3.5's decode resident by default: a user who sets nothing
+    keeps it (``resident_by_default``), and the knob still turns it on or off."""
+    from mstar.engine.engine import Engine
+    from mstar.model.qwen3_5.submodules import LLMSubmodule
+
+    assert LLMSubmodule.resident_by_default
     monkeypatch.delenv("MSTAR_RESIDENT_PLANNING", raising=False)
+    knobs.configure(None if setting is None else {"resident_planning": setting})
+    engine = Engine.__new__(Engine)
+    mgmt = SimpleNamespace(submodule=SimpleNamespace(resident_by_default=by_default), resident_refusals={})
+    engine._submodules = {"n": mgmt}
+    runner = SimpleNamespace(resident_refusal=lambda walk: "probed")
+    engine._build_resident_planner("n", runner, {"decode"})
     knobs.configure(None)
-    assert knobs.resident_planning() == "off"
-    monkeypatch.setenv("MSTAR_RESIDENT_PLANNING", "on")
-    assert knobs.resident_planning() == "on"
+    assert mgmt.resident_refusals["decode"] == ("runner: probed" if asked else NOT_ASKED)
 
 
 def test_the_slot_count_is_no_knob():
