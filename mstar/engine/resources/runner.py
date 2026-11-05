@@ -564,8 +564,11 @@ class StepRunner:
             self._resources[key].clear_preplan()
 
     def _beside_stage(self, step: SubmoduleStep) -> bool:
-        """A step off the chain, which leaves the chain's stage alone."""
-        return bool(self._on_lane) and bool(step.keys()) and self._on_lane.keys() >= step.keys()
+        """A step that leaves the chain's stage alone: one off the chain, or one
+        that declares no resource (BAGEL's combine_cfg), which touches nothing
+        the stage holds."""
+        keys = step.keys()
+        return not keys or (bool(self._on_lane) and self._on_lane.keys() >= keys)
 
     def _settle_repeats(self, step: SubmoduleStep) -> None:
         """Narrow the step's replays to what its resources allow, before any
@@ -575,22 +578,27 @@ class StepRunner:
         if ctx.repeats == 1:
             return
         ctx.repeats = max(1, min(
-            ctx.repeats, *(self._resources[key].max_repeats(step.get(key), ctx) for key in self._keys_for(step)),
+            [ctx.repeats, *(self._resources[key].max_repeats(step.get(key), ctx) for key in self._keys_for(step))],
         ))
 
-    def rewind_run(self, step: SubmoduleStep, replays: int) -> None:
+    def rewind_run(self, step: SubmoduleStep | None, replays: int) -> None:
         """A run landed ``replays`` iterations short: each resource takes them
         back, from the rows whose request is still the one the run counted for.
         A row torn down since (its request done, its handle maybe another's by
         now) or a padding row has nothing to take back."""
+        if step is None:
+            return  # a node that declares no step counted nothing
         live = self._generations
         rows = frozenset(rid for rid, gen in step.ctx.counted.items() if gen is not None and live.get(rid) == gen)
         for key in self._keys_for(step):
             self._resources[key].rewind_run(step.get(key), step.ctx, replays, rows)
 
-    def replay_columns(self, step: SubmoduleStep, repeats: int) -> list[tuple[torch.Tensor, torch.Tensor]]:
-        """Every resource's ``Resource.replay_columns`` for this step."""
+    def replay_columns(self, step: SubmoduleStep | None, repeats: int) -> list[tuple[torch.Tensor, torch.Tensor]]:
+        """Every resource's ``Resource.replay_columns`` for this step; none for
+        a node that declares no step."""
         columns = []
+        if step is None:
+            return columns
         for key in self._replay_column_order:
             if (resource_step := step.get(key)) is not None:
                 columns.extend(self._resources[key].replay_columns(resource_step, step.ctx, repeats))

@@ -637,6 +637,30 @@ def test_a_lane_step_leaves_the_chains_staged_pre_plan_alone():
     assert eng._runner.plan(chain)["talker_state"] is staged, "the chain's step planned afresh"
 
 
+def test_a_step_with_no_resources_leaves_the_chains_staged_pre_plan_alone():
+    """A step that declares no resource (BAGEL's combine_cfg) touches nothing the
+    stage holds, so it neither drops it nor promotes it; and a run of it has no
+    replay columns and nothing to take back."""
+    pool, talker = _pool(), _pool("talker_state", "Talker")
+    eng = _state_engine(pool, talker)
+    eng.add_request(9)
+    chain = SubmoduleStep(segments=[Segment(9, "main", 1)], steps={"talker_state": RecurrentStep()})
+    chain.set_ctx(StepContext(request_ids=(9,), graph_walk="talker_decode", slot=0, capture=False))
+    chain.ctx.is_preplan = True
+    assert eng._runner.pre_admit(chain).ok
+    eng._runner.pre_plan(chain)
+    chain.ctx.is_preplan = False
+    empty = SubmoduleStep(segments=[], steps={})
+    empty.set_ctx(StepContext(request_ids=(5,), graph_walk="combine", slot=0, capture=False, repeats=4))
+
+    assert eng._runner.admit(empty).ok
+    eng._runner.plan(empty)
+
+    assert eng._runner.staged and talker._preplanned, "a step with no resources dropped the chain's stage"
+    assert eng._runner.replay_columns(empty, 4) == [] and eng._runner.replay_columns(None, 4) == []
+    eng._runner.rewind_run(None, 2)
+
+
 @pytest.mark.parametrize("stage", ["admit", "plan"])
 def test_a_raise_in_a_lane_steps_admit_or_plan_fails_its_own_rows(monkeypatch, stage):
     pool, talker = _pool(), _pool("talker_state", "Talker")
