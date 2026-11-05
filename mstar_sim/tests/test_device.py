@@ -78,6 +78,8 @@ def test_cuda_semantics():
                 raise SystemExit("an index past the emulated devices was accepted")
             except torch.AcceleratorError:
                 pass
+        torch.cuda.set_device(-1)  # a negative index is ignored, as torch ignores it
+        assert torch.cuda.current_device() == 0 and torch.zeros(1, device="cuda").device == torch.device("cuda", 0)
         for past in (torch.cuda.get_device_name, torch.cuda.get_device_capability, torch.cuda.get_device_properties):
             try:
                 past(8)

@@ -66,7 +66,9 @@ def current_device() -> int:
 
 
 def set_device(device) -> None:
-    _tls.device = device_index(device)
+    index = device_index(device)
+    if index >= 0:  # torch ignores a negative index
+        _tls.device = index
 
 
 class device:  # noqa: N801  (torch.cuda.device)
