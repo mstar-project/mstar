@@ -9,6 +9,7 @@ test cannot chown without root.
 """
 
 import base64
+import logging
 import os
 import stat
 
@@ -278,6 +279,10 @@ def _upload_dirs(monkeypatch, tmp_path) -> dict:
         m.setattr(registry, "get_model_class", lambda name: _Model)
         m.setattr(entrypoint, "model_init_kwargs", lambda name: {})
         m.setattr(entrypoint, "APIServer", fake_api_server)
+        # sizing torch's pool would outlive the test in this process
+        m.setattr(entrypoint, "_set_preprocess_threads", lambda model, config: None)
+        # and so would handing pytest's log handlers to a writer thread, which repeats every later record
+        m.setattr(entrypoint, "log_off_thread", lambda: None)
         with pytest.raises(_StopError):
             entrypoint.main(["--config", str(cfg)])
 
@@ -296,6 +301,8 @@ def _upload_dirs(monkeypatch, tmp_path) -> dict:
 
     with monkeypatch.context() as m:
         m.setattr(worker, "build_server", fake_build_server)
+        # main() would hand pytest's log handlers to a writer thread, which repeats every later record
+        m.setattr("mstar.utils.logging_config.log_off_thread", lambda: None)
         with pytest.raises(_StopError):
             worker.main(["--config", "c.yaml", "--model-path", "/m", "--socket-path-prefix", str(tmp_path)])
 
@@ -316,6 +323,23 @@ def test_every_entry_point_defaults_to_a_per_user_upload_dir(monkeypatch, tmp_pa
         ("mstar-serve", "APIServer", "dynamo worker", "mstar serve"), "/tmp/mstar_uploads_alice/")
     monkeypatch.setattr(socket_prefix.getpass, "getuser", lambda: "bob")
     assert set(_upload_dirs(monkeypatch, tmp_path).values()) == {"/tmp/mstar_uploads_bob/"}
+
+
+def test_reading_the_entry_points_defaults_leaves_no_log_writer_behind(monkeypatch, tmp_path):
+    """``_upload_dirs`` runs the real ``main()`` of two entry points. Without
+    patching ``log_off_thread`` out, each takes the root logger's handlers (so
+    pytest's) off onto a writer thread that outlives the test and repeats every
+    later record, which made ``test_startup_warmup`` see each warmup line more
+    than once on the same worker."""
+    import threading
+
+    before = {t for t in threading.enumerate()}
+    root = logging.getLogger()
+    handlers = root.handlers[:]
+    _upload_dirs(monkeypatch, tmp_path)
+    left = [t.name for t in threading.enumerate() if t not in before]
+    assert left == [], left
+    assert root.handlers == handlers
 
 
 @pytest.mark.parametrize("name, kept", [("alice", True), ("a" * 32, True), ("a" * 33, False),
