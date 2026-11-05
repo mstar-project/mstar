@@ -120,6 +120,7 @@ class LoopbackRows(Resource):
                     raise RuntimeError(f"loop-back rows: all {self.capacity} are held (MSTAR_SAMPLER_SLOTS)")
                 self._row_of[rid] = self._free.pop() if self._free else self._next_row()
             self._last = None
+            self._staged.clear()  # a handle is reused: one tuple of rids can name other rows
 
     def _next_row(self) -> int:
         row, self._rows = self._rows, self._rows + 1
@@ -131,6 +132,7 @@ class LoopbackRows(Resource):
             if row is not None:
                 self._free.append(row)
             self._last = None
+            self._staged.clear()  # a handle is reused: one tuple of rids can name other rows
             for name in self._depths:
                 self._written.pop((name, rid), None)
                 self._consumed.pop((name, rid), None)

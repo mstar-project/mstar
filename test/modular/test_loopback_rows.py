@@ -132,7 +132,7 @@ def test_a_resident_step_gathers_its_rows_index_from_the_planners_slots():
     assert rows.indices(bucket, 0).tolist() == [rows._row_of[7], TRASH_ROW]
 
 
-def test_a_request_waits_for_a_row_and_the_ranks_of_a_lockstep_node_never_do():
+def test_a_request_waits_for_a_row():
     rows = LoopbackRows(CPU, capacity=1)
     assert rows.ask(1, "n", WALK) is not None and rows.reserve(1, "n", WALK, None) is None
     assert rows.ask(1, "n", WALK) is None, "it holds its row"
@@ -142,15 +142,32 @@ def test_a_request_waits_for_a_row_and_the_ranks_of_a_lockstep_node_never_do():
     assert rows.grew_since(mark) and rows.reserve(2, "n", WALK, None) is None
 
 
+def test_a_reused_handle_reads_its_own_row_at_the_next_host_planned_step():
+    """Handles are reused, so one tuple of rids can name other rows than the
+    step that staged them (review-r4)."""
+    rows = LoopbackRows(CPU, capacity=4)
+    bucket = BucketKey(WALK, 2, 2)
+    rows.build_accelerator_graph_buffers(1, 2, 2)
+    ctx = SimpleNamespace(slot_lease=SlotLease(slot=0, bucket=bucket), resident=None, padded_request_ids=(1, 2))
+    for rid in (1, 2):
+        rows.add(rid)
+    rows.plan(None, ctx)
+    first = rows.indices(bucket, 0).tolist()
+    for rid in (2, 1):
+        rows.drop(rid)
+    for rid in (2, 1):
+        rows.add(rid)
+    rows.plan(None, ctx)
+    assert rows.indices(bucket, 0).tolist() == [rows._row_of[1], rows._row_of[2]] != first
+
+
 def test_a_rank_with_no_free_row_parks_a_request_another_rank_already_runs():
     """Under TP each rank frees a row at its own REMOVE, so one can be full while
     another's step has started: it waits for its own REMOVE at Admission, as the
     sampler does, and never refuses a step (review-r3 F1). Ingest takes nothing,
     and a capture's padding reads the trash row."""
-    info = SimpleNamespace(device=CPU, joint_comm_group=SimpleNamespace(world_size=2))
-    leader, follower = LoopbackRows.build(None, info), LoopbackRows.build(None, info)
+    leader, follower = LoopbackRows(CPU, capacity=1), LoopbackRows(CPU, capacity=1)
     for rank in (leader, follower):
-        rank.capacity = 1
         rank.ingest_request(1, None)
         assert rank.reserve(1, "n", WALK, None) is None
         rank.ingest_request(2, None)
