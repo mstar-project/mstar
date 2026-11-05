@@ -136,13 +136,13 @@ class TalkerSubmodule(ARNodeSubmodule):
     the complete code vector is streamed independently to ``CodecSubmodule``.
     """
 
+    # the frame's summed codec embedding goes back in as the next input_embeds
+    REPEAT_CARRIES = MappingProxyType({"talker_input_embeds": CarryPair("talker_input_embeds", "input_embeds")})
     # Compiling the entire engine-facing forward traces request sampling,
     # residual-code control flow, and recurrent routing in addition to the
     # transformer. It introduces graph breaks and showed no steady-state win
     # for this path. The whole decode forward (CodePredictor loop included) is
     # still CUDA-graph captured.
-    # the frame's summed codec embedding goes back in as the next input_embeds
-    REPEAT_CARRIES = MappingProxyType({"talker_input_embeds": CarryPair("talker_input_embeds", "input_embeds")})
     disable_torch_compile = True
     # The largest decode bucket is also the cap on rows per Talker step. Near
     # capacity more streams are live than a step takes, and the rest wait in

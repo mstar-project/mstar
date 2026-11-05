@@ -4,7 +4,7 @@ Each input (``IterationInput``) keeps one table for every request: a request's
 rows and their pad go in once, when a step first reads them, and a step reads
 its rows' iterations with one gather an input, on one staged index, however
 many rows it has. A view a row and a stack took about 5x as long at 64 rows in
-a CPU microbench (results/f6, 1082 us against 193 us); no GPU timing says what
+a CPU microbench (1082 us against 193 us); no GPU timing says what
 share of a step that is.
 
 Row 0 of a table is the input's ``capture_fill``, which padding rows read. Read
