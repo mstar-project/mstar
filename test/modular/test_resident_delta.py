@@ -1579,6 +1579,55 @@ def test_a_follower_moves_rank_0s_victim_to_the_host_and_takes_it_back_as_rank_0
     assert _counts(leader) == _counts(follower), "the follower holds another allotment for the return"
 
 
+def test_a_follower_moves_a_request_with_nothing_newer_to_move_to_the_host_and_takes_it_back_as_rank_0_did(
+    monkeypatch,
+):
+    """r's grant needs two pages past its allotment, and only one is free. With nothing newer to move, rank 0 moves r
+    itself to the host, as any other victim, and r returns with both pages. Only rank 0 counts the grant's shortage,
+    so a follower that didn't replay r's wait returned r with one page."""
+    (leader, lead), (follower, follow) = _pool_rank(monkeypatch, 0), _pool_rank(monkeypatch, 1)
+    leader._cpu_pool, follower._cpu_pool = host._HostPool(64), host._HostPool(64)
+    _ingest((leader, follower), "a", 4, arrival=1)
+    _ingest((leader, follower), "r", 5, arrival=2)
+    assert _admits(leader, "a") and _admits(leader, "r")
+    assert follow.apply_resident_delta(lead.take_resident_delta(), _rebuilds_none)
+    for rid, tokens in (("a", 4 * PAGE_SIZE), ("r", 5 * PAGE_SIZE)):
+        assert _step(leader, rid, tokens).ok and _step(follower, rid, tokens).ok
+    assert not _step(leader, "r", PAGE_SIZE + 1).ok and not _step(follower, "r", PAGE_SIZE + 1).ok
+    assert _preempt(leader, "r", droppable=False).to_host == ["r"]
+    lead.offload_request(NODE, "r")
+    delta = lead.take_resident_delta()
+    assert delta.kinds == [MoveKind.WAIT, MoveKind.OFFLOAD, MoveKind.OFFLOAD], "r's wait or its move went unjournaled"
+
+    assert follow.apply_resident_delta(delta, _rebuilds_none)
+    assert follower.residency("r") is Residency.ON_HOST and _counts(leader) == _counts(follower)
+    for engine in (lead, follow):
+        engine.remove_request("a")
+    assert _returns(leader, "r") and lead.reload_request(NODE, "r")
+    assert follow.apply_resident_delta(lead.take_resident_delta(), _rebuilds_none)
+    assert _counts(leader) == _counts(follower), "the follower returned r with another allotment"
+    assert all(_step(kv, "r", PAGE_SIZE + 1).ok for kv in (leader, follower)), "r came back short of its grant"
+
+
+def test_only_rank_0_moves_requests_for_the_ones_that_wait(monkeypatch):
+    """A follower replays rank 0's waits, so it holds the same requests waiting with their allotments, but only rank 0
+    chooses moves for them, and a follower's pass walks no refusals."""
+    (leader, lead), (follower, follow) = _pool_rank(monkeypatch, 0), _pool_rank(monkeypatch, 1)
+    _ingest((leader, follower), "r", 5, arrival=1)
+    _ingest((leader, follower), "v", 5, arrival=2)
+    assert _admits(leader, "r") and _admits(leader, "v")
+    assert follow.apply_resident_delta(lead.take_resident_delta(), _rebuilds_none)
+    for rid in ("r", "v"):
+        assert _step(leader, rid, 5 * PAGE_SIZE).ok and _step(follower, rid, 5 * PAGE_SIZE).ok
+    assert not _step(leader, "v", 1).ok and not _step(follower, "v", 1).ok
+    _waits(leader, "v")
+
+    assert follow.apply_resident_delta(lead.take_resident_delta(), _rebuilds_none)
+
+    assert follower._parked == leader._parked == {"v"}, "the follower holds other requests waiting with allotments"
+    assert leader.any_parked() and not follower.any_parked(), "a follower would walk the refusals for make_room"
+
+
 def test_a_follower_takes_the_host_room_rank_0_set_aside_and_so_each_requests_class(monkeypatch):
     """Rank 0 sets host room aside for a request that can move only there as it admits the request, and guarantees
     the request when the host has none left. A follower sets the room aside as it replays the reservation, and replays
