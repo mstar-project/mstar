@@ -242,7 +242,7 @@ class LoraAdapterStore:
             self.put(adapter)
         return adapter
 
-    def pinned_rank(self, name: str, path: str, digest: bytes) -> int:
+    def checked_rank(self, name: str, path: str, digest: bytes) -> int:
         """``path``'s rank for this spec, read and held to ``digest`` as ``read`` does, with
         nothing staged: all a runtime load needs."""
         _, _, rank = self._checked(name, path, digest)
@@ -268,7 +268,7 @@ class LoraAdapterStore:
 
     def read(self, name: str, path: str, digest: bytes) -> LoadedAdapter:
         """``path`` read and sharded for this rank, without holding it: a caller can read
-        outside whatever lock guards ``put``. Held to ``digest`` as ``check`` is, before
+        outside whatever lock guards ``put``. Held to ``digest`` as ``checked_rank`` is, before
         anything is staged."""
         spec = self._spec
         raw, modules, rank = self._checked(name, path, digest)

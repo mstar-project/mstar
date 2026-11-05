@@ -644,7 +644,7 @@ class LoraAdapterPool(Resource):
             return self._executor().submit(self._load, name, path, digest)
 
     def _load(self, name: str, path: str, digest: bytes) -> None:
-        rank = self._store.pinned_rank(name, path, digest)
+        rank = self._store.checked_rank(name, path, digest)
         with self._lock:
             self._refuse_reload(name)
             if rank == 0:
