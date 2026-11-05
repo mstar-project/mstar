@@ -96,6 +96,9 @@ class _HubSource:
         def read(span):
             reply = get_session().get(url, headers={**headers, "Range": f"bytes={span[0]}-{span[1] - 1}"})
             hf_raise_for_status(reply)
+            if reply.status_code != 206 or len(reply.content) != span[1] - span[0]:
+                raise ValueError(f"{url}: bytes {span[0]}-{span[1] - 1} came back as {reply.status_code} with "
+                                 f"{len(reply.content)} bytes: does the endpoint (HF_ENDPOINT) honour Range?")
             return reply.content
 
         with ThreadPoolExecutor(16) as pool:
@@ -109,7 +112,8 @@ def _write_sparse(src, rel: str, path: Path) -> int:
     blob = src.ranges(rel, [(0, 8 + n)])[0]
     header = json.loads(blob[8:])
     header.pop("__metadata__", None)
-    small = sorted(tuple(v["data_offsets"]) for v in header.values() if math.prod(v["shape"]) < SMALL_WEIGHT)
+    small = sorted(tuple(v["data_offsets"]) for v in header.values()  # an empty one has no bytes to keep
+                   if 0 < math.prod(v["shape"]) < SMALL_WEIGHT)
     spans: list[list[int]] = []  # the small tensors' ranges, merged where they lie close
     for start, stop in small:
         if spans and start - spans[-1][1] < _MERGE_GAP:

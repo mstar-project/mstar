@@ -1,6 +1,7 @@
 """``mstar_sim.checkpoint.synthesize``: a shapes-only copy a loader reads unchanged."""
 
 import json
+import types
 
 import pytest
 import torch
@@ -88,6 +89,21 @@ def test_the_emulated_loader_reads_what_the_copy_kept(tmp_path):
         print("ok")
     """)
     assert out.strip() == "ok"
+
+
+def test_hub_range_reads_refuse_a_reply_that_ignored_the_range(monkeypatch):
+    """A mirror that ignores ``Range`` answers 200 with the whole file, whose first bytes
+    would be written as the range's."""
+    import huggingface_hub
+
+    from mstar_sim import checkpoint
+
+    reply = types.SimpleNamespace(status_code=200, content=bytes(64), raise_for_status=lambda: None)
+    monkeypatch.setattr(huggingface_hub, "get_session", lambda: types.SimpleNamespace(get=lambda *a, **k: reply))
+    hub = object.__new__(checkpoint._HubSource)
+    hub.name, hub.revision = "org/model", "main"
+    with pytest.raises(ValueError):
+        hub.ranges("model.safetensors", [(8, 16)])
 
 
 def test_hf_cache_copy_refuses_a_local_directory(tmp_path):
