@@ -1352,7 +1352,10 @@ size with its aspect ratio kept, center-cropped and rounded to 8 bits, as in
 NVIDIA's cosmos-framework and diffusers 0.40 and later. Setting
 ``conditioning_resize: stretch`` under the config YAML's ``model_kwargs``
 resizes it to the output size instead (antialiased bilinear, aspect ratio not
-kept), as diffusers 0.39 did. Action requests ignore the setting.
+kept), as diffusers 0.39 did. Action requests ignore the setting. The image
+pins the first latent frame, so the request must ask for a video of more than
+one latent frame (``num_frames`` above 4); an image output, or a shorter video,
+is refused with a 400.
 
 Cosmos3-Edge reasoner and action loop
 -------------------------------------

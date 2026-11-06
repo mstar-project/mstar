@@ -59,7 +59,7 @@ def _ctx(*rids: str, is_preplan: bool = False) -> StepContext:
     )
 
 
-def _make_manager() -> KVManager:
+def _make_manager(device: str = "cuda") -> KVManager:
     cfg = PagedKVConfig(
         num_layers=2,
         num_kv_heads=1,
@@ -71,7 +71,7 @@ def _make_manager() -> KVManager:
     )
     return KVManager(
         cfg=cfg, name="kv", joint_comm_group=None, transfer_engine_info=None,
-        device=torch.device("cuda"), dtype=torch.float32,
+        device=torch.device(device), dtype=torch.float32,
     )
 
 
@@ -173,3 +173,18 @@ def test_staged_addressing_accounts_for_the_pending_fork():
     # and promotion keeps it that way
     promoted = staged.plan(staged_step, _ctx("r0"))
     assert promoted["cfg"].views == want["cfg"].views
+
+
+def test_an_abandoned_stage_drops_a_label_its_admit_made():
+    """A pre-planned admit that opens a label (not by a fork) owns that stream
+    until the stage is promoted: abandoned, the stream and its pages go."""
+    mgr = _make_manager("cpu")
+    mgr.ingest_request("r0")
+    free = mgr._arena.num_free
+    step = KVStep(segments=(Segment("r0", "cfg", 2 * PAGE_SIZE + 4),))
+    assert mgr.admit(step, _ctx("r0", is_preplan=True)).ok
+    assert "cfg" in mgr._streams["r0"]
+
+    mgr.clear_preplan()
+    assert "cfg" not in mgr._streams["r0"]
+    assert mgr._arena.num_free == free
