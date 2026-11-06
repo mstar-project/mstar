@@ -5635,6 +5635,7 @@ class Worker:
                     if side_steps is not None and side_steps.pending is not None:
                         side_steps.finish(block=True)
                         continue
+                    self._rebuilds.flush_idle()
                     self.communicator.wait_for_work(10)
                     continue
 

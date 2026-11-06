@@ -391,6 +391,12 @@ class Rebuilds:
             self._queued.popleft()
             queued.copies.queued -= 1
 
+    def flush_idle(self) -> None:
+        """`flush` with a step's allowance on a pass of the worker's loop that runs no step. A drop waits for the
+        queued copies, so with every request waiting, no step would ever start them."""
+        self._allowance.refill()
+        self.flush()
+
     def _trim(self, node: str, rid: int, used: int) -> None:
         """Give back what ``rid``'s slice on ``node`` holds past its first ``used`` bytes."""
         room = self._droppable[node][rid]
