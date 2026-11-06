@@ -659,8 +659,8 @@ class _FakeMgmt(SubmoduleManagement):
         slot_raise_at: int | None = None,
     ):
         super().__init__(submodule=submodule, forward=None, forward_batched=None, joint_comm_group=None, resources={})
-        self._num_slots = num_slots
-        self._next_slot = next_slot
+        self._slots.num_slots = num_slots
+        self._slots.next_slot = next_slot
         self._seen = seen
         self._slot_raise_at = slot_raise_at
 
