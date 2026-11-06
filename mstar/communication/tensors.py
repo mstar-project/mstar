@@ -1405,7 +1405,7 @@ class TensorCommunicationManager(ABC):
 
     #: Whether this transport writes placement onto a descriptor AFTER routing
     #: has already copied it. Only the SHM arena does (``shm_segment`` /
-    #: ``shm_offset``); the per-uuid file and Mooncake paths derive everything
+    #: ``shm_offset``); a spilled tensor and Mooncake derive everything
     #: a consumer needs from ``uuid`` and ``address``, so they leave this off
     #: and ``refresh_shm_placement`` stays free for them.
     stamps_shm_placement: bool = False

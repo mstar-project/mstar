@@ -119,9 +119,8 @@ Communication
        backpressures on a full arena before failing.
    * - ``MSTAR_SHM_ARENA_SPILL``
      - ``1``
-     - Degrade gracefully at the segment cap: stage the tensor through the
-       per-uuid file protocol instead — slower, never fails, matching the
-       file transport's saturation behavior. ``0`` restores strict
+     - Degrade gracefully at the segment cap: spill the tensor to its own
+       file instead — slower, never fails. ``0`` restores strict
        backpressure + timeout — only meaningful where ANOTHER thread
        drains consumer ACKs (the threaded api-server); on a worker the
        ACKs arrive on the very thread that would be waiting. An entity

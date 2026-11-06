@@ -140,7 +140,7 @@ pub struct ShmArena {
 unsafe impl Send for ShmArena {}
 unsafe impl Sync for ShmArena {}
 
-fn shm_path(name: &str) -> String {
+pub(crate) fn shm_path(name: &str) -> String {
     if Path::new("/dev/shm").is_dir() {
         format!("/dev/shm/{name}")
     } else {
@@ -311,7 +311,7 @@ impl Drop for ShmArena {
     }
 }
 
-fn our_uid() -> u32 {
+pub(crate) fn our_uid() -> u32 {
     unsafe { libc::getuid() }
 }
 
@@ -337,7 +337,7 @@ fn check_ours(meta: &std::fs::Metadata, our_uid: u32) -> std::io::Result<()> {
 /// Create `path` 0600, never through a symlink. A file already there is
 /// replaced only if [`check_ours`] passes (a dead run's residue): unlinked,
 /// then created exclusively again, as `_create_shm_file` does.
-fn create_exclusive(path: &str, our_uid: u32) -> std::io::Result<std::fs::File> {
+pub(crate) fn create_exclusive(path: &str, our_uid: u32) -> std::io::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
     let create = || {
         OpenOptions::new()

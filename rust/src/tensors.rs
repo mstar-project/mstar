@@ -506,20 +506,23 @@ impl Bookkeeping {
     }
 
     /// A staged tensor is registered and its descriptor names its slot, in one
-    /// step. Fails only for a segment the store was never told about.
-    pub fn publish_staged(&mut self, uuid: u64, segment: usize, offset: i64) -> Result<(), String> {
-        let sym = self
-            .shm_segments
-            .get(segment)
-            .copied()
-            .filter(|&s| s != Sym::MAX)
-            .ok_or_else(|| format!("segment {segment} was never registered with the store"))?;
+    /// step. `name` names a segment this store has not met.
+    pub fn publish_staged(
+        &mut self,
+        uuid: u64,
+        segment: usize,
+        offset: i64,
+        name: impl FnOnce() -> String,
+    ) {
+        if self.shm_segments.get(segment).is_none_or(|&s| s == Sym::MAX) {
+            self.register_shm_segment(segment, &name());
+        }
+        let sym = self.shm_segments[segment];
         if let Some(info) = self.tensor_info.get_mut(&uuid) {
             info.shm_segment = Some(sym);
             info.shm_offset = offset;
         }
         self.set_mem_registered(uuid, true);
-        Ok(())
     }
 
     /// A tensor just read: its record, its object and its first references, as

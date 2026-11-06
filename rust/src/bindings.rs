@@ -135,12 +135,8 @@ pub(crate) struct PyShmArena {
 }
 
 impl PyShmArena {
-    /// For the copier, whose reads keep the mapping alive by this share.
-    pub(crate) fn share(&self) -> Arc<ShmArena> {
-        self.arena.clone()
-    }
-
-    /// A mapping the copier holds, for a read to keep until its copies land.
+    /// A view of a mapping the transport holds: for the torch-call read path, and
+    /// for a read to keep until its copies land.
     pub(crate) fn of(arena: Arc<ShmArena>) -> Self {
         Self { arena }
     }
@@ -355,8 +351,7 @@ fn mstar_rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<crate::tensors::TensorBookkeeping>()?;
     m.add_class::<crate::tensors::TensorInfoOut>()?;
     crate::torch_abi::register(m)?;
-    m.add_class::<crate::arena_copy::PyArenaSlots>()?;
-    m.add_class::<crate::arena_copy::PyArenaCopier>()?;
+    m.add_class::<crate::arena_copy::PyArenaTransport>()?;
     m.add_class::<crate::arena_copy::StageOut>()?;
     m.add_class::<crate::arena_copy::ReadOut>()?;
     Ok(())

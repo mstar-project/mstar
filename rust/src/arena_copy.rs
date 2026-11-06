@@ -1,12 +1,12 @@
 //! The per-tensor hot paths of `ArenaShmCommunicationManager`
 //! (`mstar/communication/arena.py`) with no Python call per tensor: staging a
-//! batch into the arena and reading a batch out of peers' segments.
+//! batch into the arena and reading a batch out of peers' segments, plus the
+//! Python surface of [`Capacity`], which decides where the bytes go.
 //!
 //! Each runs in three passes: read the Python objects and claim the work with
-//! the GIL, copy without it, then publish with it. Whatever this cannot do comes
-//! back to the manager as a row index for its Python path: a segment growth, a
-//! non-contiguous source, a tensor on another device. So this module never pins,
-//! grows, spills or backpressures, and those stay in one place.
+//! the GIL, copy without it, then publish with it. Whatever needs torch's own
+//! calls comes back to the manager as a row index: a non-contiguous source, a
+//! tensor on another device.
 //!
 //! Device copies use cudart's `cudaMemcpyAsync` from function pointers the
 //! manager resolved with `_cudart()`, and only where it says the platform is
@@ -15,17 +15,20 @@
 //! stream event and trailing sync cover them as they do torch's own copies.
 
 use std::os::raw::{c_char, c_void};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 
 use pyo3::exceptions::{PyKeyError, PyRuntimeError, PyValueError};
 use pyo3::intern;
 use pyo3::prelude::*;
-use pyo3::types::{PyList, PyString, PyTuple};
+use pyo3::types::{PyDict, PyList, PyString, PyTuple};
 use rustc_hash::FxHashMap;
 
+use crate::arena_capacity::{
+    monotonic_now, slot_counts, Capacity, CapacityPolicy, Reserved, Slot, StageError, SpillFiles,
+    IN_FILE, PENDING,
+};
 use crate::bindings::{PySegmentedShmArena, PyShmArena};
-use crate::shm::{SegmentedShmArena, ShmArena};
+use crate::shm::ShmArena;
 use crate::tensors::{RidKey, TensorBookkeeping, TensorPointerInfo};
 use crate::torch_abi::{
     abi, AbiError, OwnedTensor, TensorFacts, TensorSpec, TorchAbi, DEVICE_CPU, DEVICE_CUDA,
@@ -78,112 +81,19 @@ impl Cudart {
             why.to_string_lossy()
         ))
     }
-}
 
-/// Where a staged uuid's bytes are. `seg == PENDING` is a claim: some thread is
-/// staging it now and has yet to publish.
-#[derive(Clone, Copy)]
-struct Slot {
-    seg: u32,
-    offset: u64,
-    staged_at: f64,
-}
-
-const PENDING: u32 = u32::MAX;
-
-#[derive(Default)]
-struct SlotTable(Mutex<FxHashMap<u64, Slot>>);
-
-impl SlotTable {
-    fn lock(&self) -> std::sync::MutexGuard<'_, FxHashMap<u64, Slot>> {
-        self.0.lock().expect("slot table lock")
-    }
-}
-
-/// The manager's `_arena_locs`: uuid -> `(segment_idx, offset)` for sender-side
-/// reclaim. Here so a staged batch records its slots with no Python object per
-/// tensor. A uuid still being staged counts as present, and freeing one only
-/// drops the claim: its stager finds that out and frees the slot itself.
-#[pyclass(name = "ArenaSlots", frozen)]
-pub struct PyArenaSlots {
-    /// None for an entity with no arena of its own: it stages nothing.
-    arena: Option<Arc<SegmentedShmArena>>,
-    table: Arc<SlotTable>,
-}
-
-#[pymethods]
-impl PyArenaSlots {
-    #[new]
-    #[pyo3(signature = (arena))]
-    fn new(arena: Option<PyRef<'_, PySegmentedShmArena>>) -> Self {
-        Self {
-            arena: arena.map(|a| a.share()),
-            table: Arc::new(SlotTable::default()),
+    /// Wait for everything queued on `stream`.
+    fn synchronize(&self, stream: usize) -> Result<(), String> {
+        let rc = unsafe { (self.stream_synchronize)(stream) };
+        if rc == 0 {
+            return Ok(());
         }
-    }
-
-    fn __len__(&self) -> usize {
-        self.table.lock().len()
-    }
-
-    fn __contains__(&self, uuid: u64) -> bool {
-        self.table.lock().contains_key(&uuid)
-    }
-
-    fn __getitem__(&self, uuid: u64) -> PyResult<(u32, u64)> {
-        match self.table.lock().get(&uuid) {
-            Some(s) if s.seg != PENDING => Ok((s.seg, s.offset)),
-            _ => Err(PyKeyError::new_err(uuid)),
-        }
-    }
-
-    /// Record a slot the Python path reserved. False if `uuid` already has one
-    /// or is being staged, and the caller gives its slot back.
-    fn claim(&self, uuid: u64, segment: u32, offset: u64, staged_at: f64) -> bool {
-        let mut table = self.table.lock();
-        if table.contains_key(&uuid) {
-            return false;
-        }
-        let slot = Slot {
-            seg: segment,
-            offset,
-            staged_at,
-        };
-        table.insert(uuid, slot);
-        true
-    }
-
-    /// Back to the arena, for each of `uuids` that has a slot. GIL released: a
-    /// growth holds the segments lock across an mmap.
-    fn free(&self, py: Python<'_>, uuids: Vec<u64>) {
-        py.detach(|| {
-            let mut slots = Vec::with_capacity(uuids.len());
-            {
-                let mut table = self.table.lock();
-                for uuid in &uuids {
-                    if let Some(s) = table.remove(uuid) {
-                        if s.seg != PENDING {
-                            slots.push(s);
-                        }
-                    }
-                }
-            }
-            if let Some(arena) = &self.arena {
-                for s in slots {
-                    arena.free(s.seg as usize, s.offset as usize);
-                }
-            }
-        });
-    }
-
-    /// The slots staged before `cutoff`, for the TTL backstop.
-    fn older_than(&self, cutoff: f64) -> Vec<u64> {
-        let table = self.table.lock();
-        table
-            .iter()
-            .filter(|(_, s)| s.seg != PENDING && s.staged_at < cutoff)
-            .map(|(u, _)| *u)
-            .collect()
+        unsafe { (self.get_last_error)() };
+        let why = unsafe { std::ffi::CStr::from_ptr((self.error_string)(rc)) };
+        Err(format!(
+            "cudaStreamSynchronize failed: {} (rc={rc})",
+            why.to_string_lossy()
+        ))
     }
 }
 
@@ -194,6 +104,7 @@ struct StageRow {
     src: *const u8,
     nbytes: usize,
     on_device: bool,
+    /// `(segment, offset)`, or `(IN_FILE, 0)` for a row spilled to its file.
     placed: Option<(u32, u64)>,
 }
 
@@ -202,7 +113,12 @@ unsafe impl Send for StageRow {}
 
 /// One tensor being read, once its Python descriptor has been read.
 struct ReadRow {
+    /// Null for a row read from a file, or with no bytes.
     src: *const u8,
+    /// The row's spill file, when the producer had no room in its arena.
+    file: Option<String>,
+    /// Where in the file: a TP slice starts past its tensor's first byte.
+    file_offset: u64,
     nbytes: usize,
     dtype: i32,
     dims_at: u32,
@@ -234,7 +150,7 @@ struct ReadInfo<'py> {
     offset: i64,
     source_tp_size: u32,
     source_tp_rank: u32,
-    segment: Bound<'py, PyString>,
+    segment: Option<Bound<'py, PyString>>,
     shm_offset: i64,
     node: Option<Bound<'py, PyString>>,
     walk: Option<Bound<'py, PyString>>,
@@ -277,7 +193,7 @@ fn read_info<'py>(info: &Bound<'py, PyAny>, abi: &dyn TorchAbi) -> PyResult<Read
         offset: info.getattr(intern!(py, "offset"))?.extract()?,
         source_tp_size: info.getattr(intern!(py, "source_tp_size"))?.extract()?,
         source_tp_rank: info.getattr(intern!(py, "source_tp_rank"))?.extract()?,
-        segment: info.getattr(intern!(py, "shm_segment"))?.downcast_into()?,
+        segment: opt_str(info.getattr(intern!(py, "shm_segment"))?)?,
         shm_offset: info.getattr(intern!(py, "shm_offset"))?.extract()?,
         node: opt_str(info.getattr(intern!(py, "_source_node_name"))?)?,
         walk: opt_str(info.getattr(intern!(py, "_source_graph_walk"))?)?,
@@ -296,8 +212,12 @@ pub struct StageOut {
     deferred: Vec<u32>,
     #[pyo3(get)]
     error: Option<String>,
-    /// Columns parallel to the call's uuids, `-1` where nothing was staged;
-    /// present only when asked for.
+    /// The errno of a failed spill write, which the caller raises as `OSError`.
+    #[pyo3(get)]
+    errno: Option<i32>,
+    /// Columns parallel to the call's uuids, `-1` where nothing was staged and
+    /// `-2` in `segments` for a row spilled to a file; present only when asked
+    /// for.
     #[pyo3(get)]
     segments: Option<Vec<i64>>,
     #[pyo3(get)]
@@ -311,29 +231,20 @@ pub struct StageOut {
     sources: Vec<Py<PyAny>>,
 }
 
-/// What a read did. Either `missing` names peer segments to map and the call
-/// did nothing, or the rows are in the store but for `deferred`. `keep` must
+/// What a read did: the rows are in the store but for `deferred`. `keep` must
 /// outlive the batch's device copies.
 #[pyclass(get_all)]
 pub struct ReadOut {
-    missing: Vec<String>,
     did_work: bool,
     deferred: Vec<u32>,
     keep: Vec<Py<PyAny>>,
 }
 
-/// The copies themselves, with their streams and the peer mappings. One per
-/// manager; every method takes the GIL only for its first and last pass.
-#[pyclass(name = "ArenaCopier", frozen)]
-pub struct PyArenaCopier {
-    /// None for an entity with no arena of its own: it reads, and defers every
-    /// stage to the manager's spill.
-    arena: Option<Arc<SegmentedShmArena>>,
-    slots: Arc<SlotTable>,
-    /// Segments the manager has pinned and named: one a concurrent growth has
-    /// only just added is not used until then.
-    usable_segments: AtomicUsize,
-    peers: RwLock<FxHashMap<String, Arc<ShmArena>>>,
+/// One manager's transport. Every method takes the GIL only for its first and
+/// last pass.
+#[pyclass(name = "ArenaTransport", frozen)]
+pub struct PyArenaTransport {
+    capacity: Capacity,
     cuda: Option<Cudart>,
     /// The manager's device index, or -1 with no device. Device rows on another
     /// device go to the Python path, which picks that device's stream.
@@ -345,21 +256,30 @@ pub struct PyArenaCopier {
 }
 
 #[pymethods]
-impl PyArenaCopier {
+impl PyArenaTransport {
     #[new]
-    #[pyo3(signature = (slots, usable_segments, device_index, gather_item_bytes, cuda=None, d2h_stream=None, h2d_stream=None))]
+    #[pyo3(signature = (
+        arena, spill_dir, spill_prefix, entity, spill, spill_after_s, full_timeout_s, slot_ttl_s,
+        shm_total=None, device_index=-1, gather_item_bytes=0, cuda=None, d2h_stream=None,
+        h2d_stream=None,
+    ))]
+    #[allow(clippy::too_many_arguments)]
     fn new(
-        slots: PyRef<'_, PyArenaSlots>,
-        usable_segments: usize,
+        arena: Option<PyRef<'_, PySegmentedShmArena>>,
+        spill_dir: String,
+        spill_prefix: String,
+        entity: String,
+        spill: bool,
+        spill_after_s: f64,
+        full_timeout_s: f64,
+        slot_ttl_s: f64,
+        shm_total: Option<usize>,
         device_index: i32,
         gather_item_bytes: usize,
         cuda: Option<(usize, usize, usize, usize)>,
         d2h_stream: Option<usize>,
         h2d_stream: Option<usize>,
-    ) -> PyResult<Self> {
-        if abi().is_none() {
-            return Err(PyRuntimeError::new_err("torch_abi_load has not run"));
-        }
+    ) -> Self {
         // The addresses are ctypes function pointers of libcudart's own symbols.
         let cuda = cuda.map(|(memcpy, last_error, error_string, sync)| unsafe {
             use std::mem::transmute as t;
@@ -370,30 +290,186 @@ impl PyArenaCopier {
                 stream_synchronize: t::<usize, StreamSyncFn>(sync),
             }
         });
-        Ok(Self {
-            arena: slots.arena.clone(),
-            slots: slots.table.clone(),
-            usable_segments: AtomicUsize::new(usable_segments),
-            peers: RwLock::new(FxHashMap::default()),
+        let policy = CapacityPolicy {
+            spill,
+            spill_after_s,
+            full_timeout_s,
+            slot_ttl_s,
+        };
+        Self {
+            capacity: Capacity::new(
+                arena.map(|a| a.share()),
+                SpillFiles::new(spill_dir, spill_prefix, entity),
+                policy,
+                shm_total,
+            ),
             cuda,
             device_index,
             d2h_stream,
             h2d_stream,
             gather_item_bytes,
             dtype_names: Mutex::new(FxHashMap::default()),
-        })
+        }
     }
 
-    fn set_usable_segments(&self, n: usize) {
-        self.usable_segments.store(n, Ordering::Release);
+    /// Turn page-locking on, from the runtime's `(register, unregister,
+    /// get_last_error)` addresses, and pin the segments already there.
+    fn set_pins(&self, py: Python<'_>, fns: (usize, usize, usize), budget: usize) {
+        py.detach(|| self.capacity.set_pins(fns.0, fns.1, fns.2, budget));
+        self.flush_notes(py);
     }
 
-    fn add_peer(&self, name: String, arena: PyRef<'_, PyShmArena>) {
-        self.peers.write().expect("peers lock").insert(name, arena.share());
+    /// Unregister everything pinned; what is mapped later stays unpinned. Must
+    /// run before the mappings go.
+    fn release_pins(&self, py: Python<'_>) {
+        py.detach(|| self.capacity.release_pins());
+        self.flush_notes(py);
     }
 
-    fn remove_peer(&self, name: &str) {
-        self.peers.write().expect("peers lock").remove(name);
+    #[getter]
+    fn pinned_bytes(&self, py: Python<'_>) -> usize {
+        py.detach(|| self.capacity.pinned_bytes())
+    }
+
+    /// Base addresses of the own segments that are registered.
+    #[getter]
+    fn pinned_own(&self, py: Python<'_>) -> Vec<usize> {
+        py.detach(|| self.capacity.pinned_own())
+    }
+
+    /// `(uuids with an arena slot, spill files)`.
+    fn live(&self) -> (usize, usize) {
+        slot_counts(&self.capacity.slots.lock())
+    }
+
+    /// Whether a uuid has a slot or file, or is being staged.
+    fn has_slot(&self, uuid: u64) -> bool {
+        self.capacity.slots.lock().contains_key(&uuid)
+    }
+
+    /// `(segment, offset)` of a uuid's slot. `KeyError` while it has none.
+    fn slot(&self, uuid: u64) -> PyResult<(u32, u64)> {
+        match self.capacity.slots.lock().get(&uuid) {
+            Some(s) if s.seg != PENDING && s.seg != IN_FILE => Ok((s.seg, s.offset)),
+            _ => Err(PyKeyError::new_err(uuid)),
+        }
+    }
+
+    /// The path of a uuid this entity spilled, or None if it did not.
+    fn spilled_path(&self, entity: &str, uuid: u64) -> Option<String> {
+        let spilled = self.capacity.slots.lock().get(&uuid).is_some_and(|s| s.seg == IN_FILE);
+        spilled.then(|| self.capacity.spill.path(entity, uuid))
+    }
+
+    fn spill_path(&self, entity: &str, uuid: u64) -> String {
+        self.capacity.spill.path(entity, uuid)
+    }
+
+    /// A place for `nbytes`, by every layer but the file: None when it has to
+    /// spill. `RuntimeError` past a strict wait. GIL released: it can grow, pin
+    /// and wait for ACKs.
+    fn reserve(&self, py: Python<'_>, nbytes: usize) -> PyResult<Option<(usize, usize)>> {
+        let got = py.detach(|| match self.capacity.reserve(nbytes) {
+            Reserved::Slot { seg, offset, .. } => Ok(Some((seg, offset))),
+            Reserved::Spill => Ok(None),
+            Reserved::Failed(why) => Err(why),
+        });
+        self.flush_notes(py);
+        got.map_err(PyRuntimeError::new_err)
+    }
+
+    /// Record a slot `reserve` gave. False if `uuid` already has one or is being
+    /// staged: the caller gives its slot back with `return_slot`.
+    fn claim(&self, uuid: u64, segment: u32, offset: u64) -> bool {
+        let mut slots = self.capacity.slots.lock();
+        if slots.contains_key(&uuid) {
+            return false;
+        }
+        let slot = Slot {
+            seg: segment,
+            offset,
+            staged_at: monotonic_now(),
+        };
+        slots.insert(uuid, slot);
+        true
+    }
+
+    fn return_slot(&self, py: Python<'_>, segment: u32, offset: u64) {
+        py.detach(|| self.capacity.return_slot(segment, offset));
+    }
+
+    /// Spill a tensor's bytes to its own file, recording it for `free`. False if
+    /// `uuid` already has a slot or file or is being staged, which writes nothing.
+    fn spill_write(&self, py: Python<'_>, uuid: u64, data: &[u8]) -> PyResult<bool> {
+        let now = monotonic_now();
+        {
+            let mut slots = self.capacity.slots.lock();
+            if slots.contains_key(&uuid) {
+                return Ok(false);
+            }
+            let slot = Slot {
+                seg: PENDING,
+                offset: 0,
+                staged_at: now,
+            };
+            slots.insert(uuid, slot);
+        }
+        let written = py.detach(|| self.capacity.spill.write(uuid, data));
+        let mut slots = self.capacity.slots.lock();
+        if let Err(e) = written {
+            slots.remove(&uuid);
+            return Err(spill_pyerr(py, e));
+        }
+        match slots.get_mut(&uuid) {
+            Some(slot) => slot.seg = IN_FILE,
+            None => {
+                // Torn down while it was written: its reclaim found only the claim.
+                drop(slots);
+                self.capacity.spill_unlink(uuid);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Give back each uuid's slot or file. GIL released: a growth holds the
+    /// segments lock across an mmap.
+    fn free(&self, py: Python<'_>, uuids: Vec<u64>) {
+        py.detach(|| self.capacity.free(uuids));
+    }
+
+    /// The TTL backstop; how many slots and files it freed.
+    fn reclaim_expired(&self, py: Python<'_>) -> usize {
+        let n = py.detach(|| self.capacity.reclaim_expired());
+        self.flush_notes(py);
+        n
+    }
+
+    /// The spill files, then this arena's own segments, for a process that is
+    /// stopping. A second call finds nothing left.
+    fn unlink_owned(&self, py: Python<'_>) {
+        py.detach(|| self.capacity.unlink_owned());
+    }
+
+    fn unlink_segments(&self, py: Python<'_>) {
+        py.detach(|| self.capacity.unlink_segments());
+    }
+
+    /// A peer's segment as a buffer, mapped and pinned the first time.
+    fn peer(&self, py: Python<'_>, name: &str) -> PyResult<PyShmArena> {
+        let mapped = py.detach(|| self.capacity.map_peer(name));
+        self.flush_notes(py);
+        Ok(PyShmArena::of(mapped.map_err(PyRuntimeError::new_err)?))
+    }
+
+    fn has_peer(&self, name: &str) -> bool {
+        self.capacity.peer(name).is_some()
+    }
+
+    /// Drop the peer mappings whose file is gone. The caller makes sure no copy
+    /// still reads one.
+    fn evict_dead_peers(&self, py: Python<'_>) {
+        py.detach(|| self.capacity.evict_dead_peers());
+        self.flush_notes(py);
     }
 
     /// Stage `uuids` from `store`: reserve, copy, publish the placement. Run it
@@ -404,18 +480,18 @@ impl PyArenaCopier {
         py: Python<'_>,
         store: PyRef<'_, TensorBookkeeping>,
         uuids: Vec<u64>,
-        now: f64,
         columns: bool,
     ) -> PyResult<StageOut> {
         let abi = abi().ok_or_else(|| PyRuntimeError::new_err("torch_abi_load has not run"))?;
         let store = store.share();
+        let now = monotonic_now();
         let mut rows = Vec::with_capacity(uuids.len());
         let mut keep = Vec::with_capacity(uuids.len());
         let mut deferred = Vec::new();
         let (mut any_device, mut host_bytes) = (false, 0usize);
         {
             let bk = store.lock().expect("bookkeeping lock");
-            let mut slots = self.slots.lock();
+            let mut slots = self.capacity.slots.lock();
             let mut facts = TensorFacts::default();
             for (i, &uuid) in uuids.iter().enumerate() {
                 // Already staged, or being staged by another thread: claiming
@@ -456,17 +532,21 @@ impl PyArenaCopier {
             }
         }
 
-        let (queued, error) = if any_device || host_bytes > KEEP_GIL_MAX_BYTES {
-            py.detach(|| self.copy_stages(&mut rows))
-        } else {
-            self.copy_stages(&mut rows)
-        };
+        // With the GIL only for a small host batch that fits as it is: growing,
+        // waiting and writing files all happen without it.
+        let mut pass = StagePass::default();
+        if !any_device && host_bytes <= KEEP_GIL_MAX_BYTES {
+            self.copy_stages(&mut rows, &mut pass, false);
+        }
+        if pass.next < rows.len() && pass.error.is_none() {
+            py.detach(|| self.copy_stages(&mut rows, &mut pass, true));
+        }
+        self.flush_notes(py);
 
         let mut loose = Vec::new();
-        let mut publish_error = None;
         {
             let mut bk = store.lock().expect("bookkeeping lock");
-            let mut slots = self.slots.lock();
+            let mut slots = self.capacity.slots.lock();
             for row in &rows {
                 let Some((seg, offset)) = row.placed else {
                     slots.remove(&row.uuid);
@@ -477,33 +557,47 @@ impl PyArenaCopier {
                 let held = bk.has_tensor(row.uuid);
                 let Some(slot) = slots.get_mut(&row.uuid).filter(|_| held) else {
                     slots.remove(&row.uuid);
-                    loose.push((seg, offset));
+                    loose.push((row.uuid, seg, offset));
                     continue;
                 };
                 slot.seg = seg;
                 slot.offset = offset;
-                if let Err(e) = bk.publish_staged(row.uuid, seg as usize, offset as i64) {
-                    publish_error = Some(e);
+                if seg == IN_FILE {
+                    bk.set_mem_registered(row.uuid, true);
+                    continue;
+                }
+                if let Some(arena) = &self.capacity.arena {
+                    bk.publish_staged(row.uuid, seg as usize, offset as i64, || {
+                        arena.segment_name(seg as usize)
+                    });
                 }
             }
         }
-        if let (false, Some(arena)) = (loose.is_empty(), &self.arena) {
+        if !loose.is_empty() {
             py.detach(|| {
                 // A queued copy could land in a slot given to someone else.
-                if let (true, Some(cuda), Some(stream)) = (queued, &self.cuda, self.d2h_stream) {
-                    unsafe { (cuda.stream_synchronize)(stream) };
-                    unsafe { (cuda.get_last_error)() };
+                if let (true, Some(cuda), Some(stream)) = (pass.queued, &self.cuda, self.d2h_stream) {
+                    let _ = cuda.synchronize(stream);
                 }
-                for (seg, offset) in loose {
-                    arena.free(seg as usize, offset as usize);
+                for (uuid, seg, offset) in loose {
+                    if seg == IN_FILE {
+                        self.capacity.spill_unlink(uuid);
+                    } else {
+                        self.capacity.return_slot(seg, offset);
+                    }
                 }
             });
         }
 
+        let (error, errno) = match pass.error {
+            Some(e) => (Some(e.message), e.errno),
+            None => (None, None),
+        };
         let mut out = StageOut {
-            queued,
+            queued: pass.queued,
             deferred,
-            error: error.or(publish_error),
+            error,
+            errno,
             segments: None,
             offsets: None,
             nbytes: None,
@@ -515,17 +609,12 @@ impl PyArenaCopier {
             let mut nbytes = vec![-1i64; uuids.len()];
             for row in &rows {
                 if let Some((seg, offset)) = row.placed {
-                    segments[row.index as usize] = i64::from(seg);
+                    segments[row.index as usize] = if seg == IN_FILE { -2 } else { i64::from(seg) };
                     offsets[row.index as usize] = offset as i64;
                     nbytes[row.index as usize] = row.nbytes as i64;
                 }
             }
             (out.segments, out.offsets, out.nbytes) = (Some(segments), Some(offsets), Some(nbytes));
-        }
-        for row in &rows {
-            if row.placed.is_none() && out.error.is_none() {
-                out.deferred.push(row.index);
-            }
         }
         Ok(out)
     }
@@ -533,8 +622,10 @@ impl PyArenaCopier {
     /// Read `infos` from peers' segments into new tensors on the manager's
     /// device and put them in `store`, each with `refs` references. Run it in
     /// the H2D stream's context, which tags the new device blocks. `host_max`:
-    /// a host-device row at least this big is left to the caller's HostCopier.
-    #[pyo3(signature = (store, rids, infos, refs, device_type, host_max=None))]
+    /// a segment row at least this big on a host device is left to the caller's
+    /// HostCopier. `origins`: local uuid -> the producer's, for a slice re-pointed
+    /// to a uuid of this process, whose file is under the producer's.
+    #[pyo3(signature = (store, rids, infos, refs, device_type, origins, host_max=None))]
     #[allow(clippy::too_many_arguments)]
     fn read<'py>(
         &self,
@@ -544,6 +635,7 @@ impl PyArenaCopier {
         infos: &Bound<'py, PyList>,
         refs: i64,
         device_type: i32,
+        origins: &Bound<'py, PyDict>,
         host_max: Option<usize>,
     ) -> PyResult<ReadOut> {
         let abi = abi().ok_or_else(|| PyRuntimeError::new_err("torch_abi_load has not run"))?;
@@ -554,91 +646,33 @@ impl PyArenaCopier {
             _ => return Err(PyRuntimeError::new_err("no CUDA copy stream to read onto")),
         };
 
-        // First pass: the descriptors, and which segment each one reads.
-        let mut parsed = Vec::with_capacity(infos.len());
-        let mut rows = Vec::with_capacity(infos.len());
-        let mut dims_flat = Vec::with_capacity(infos.len());
-        let mut owners = Vec::with_capacity(infos.len());
-        let mut deferred = Vec::new();
-        let mut missing: Vec<String> = Vec::new();
-        let mut segments: Vec<Arc<ShmArena>> = Vec::new();
-        let (mut did_work, mut host_bytes) = (false, 0usize);
-        {
-            let mut last: Option<(*mut pyo3::ffi::PyObject, u32)> = None;
-            let mut rids = rids.into_iter();
-            for (i, info) in infos.iter().enumerate() {
-                let rid = rids
-                    .next()
-                    .ok_or_else(|| PyValueError::new_err("rids and infos must be parallel"))?;
-                let info = read_info(&info, abi)?;
-                let nbytes = usize::try_from(info.nbytes)
-                    .map_err(|_| PyValueError::new_err("a descriptor's nbytes is negative"))?;
-                if !on_device && host_max.is_some_and(|max| nbytes >= max) {
-                    deferred.push(i as u32);
-                    continue;
-                }
-                let segment = match last {
-                    Some((ptr, at)) if ptr == info.segment.as_ptr() => at,
-                    _ => {
-                        let name = info.segment.to_str()?;
-                        let found = self.peers.read().expect("peers lock").get(name).cloned();
-                        let Some(arena) = found else {
-                            if !missing.iter().any(|m| m == name) {
-                                missing.push(name.to_string());
-                            }
-                            continue;
-                        };
-                        let at = match segments.iter().position(|s| Arc::ptr_eq(s, &arena)) {
-                            Some(at) => at,
-                            None => {
-                                segments.push(arena);
-                                segments.len() - 1
-                            }
-                        } as u32;
-                        last = Some((info.segment.as_ptr(), at));
-                        at
-                    }
-                };
-                let arena = &segments[segment as usize];
-                let start = info.shm_offset + info.offset;
-                let end = start.checked_add(info.nbytes);
-                if nbytes > 0
-                    && (start < 0 || end.is_none_or(|end| end as usize > arena.size()))
-                {
-                    return Err(PyValueError::new_err(format!(
-                        "descriptor for {}: {} bytes at {start} run past its {} byte segment",
-                        info.uuid,
-                        info.nbytes,
-                        arena.size(),
-                    )));
-                }
-                did_work |= nbytes > 0;
-                host_bytes += nbytes;
-                rows.push(ReadRow {
-                    src: if nbytes > 0 {
-                        unsafe { arena.as_mut_ptr().add(start as usize).cast_const() }
-                    } else {
-                        std::ptr::null()
-                    },
-                    nbytes,
-                    dtype: info.scalar,
-                    dims_at: dims_flat.len() as u32,
-                    ndim: info.dims.len() as u32,
-                    segment,
-                });
-                dims_flat.extend_from_slice(&info.dims);
-                owners.push(rid);
-                parsed.push(info);
+        // First pass: the descriptors, and which segment each one reads. A peer
+        // segment met for the first time is mapped without the GIL (pinning takes
+        // tens of ms), then the pass runs again.
+        let parsed = loop {
+            let pass = self.parse_reads(&rids, infos, on_device, origins, host_max, abi)?;
+            if pass.missing.is_empty() {
+                break pass;
             }
-        }
-        if !missing.is_empty() {
-            return Ok(ReadOut {
-                missing,
-                did_work: false,
-                deferred: Vec::new(),
-                keep: Vec::new(),
+            let missing = pass.missing;
+            let mapped = py.detach(|| {
+                missing.iter().try_for_each(|name| self.capacity.map_peer(name).map(|_| ()))
             });
-        }
+            self.flush_notes(py);
+            mapped.map_err(PyRuntimeError::new_err)?;
+        };
+        let ParsedReads {
+            infos: parsed,
+            rows,
+            dims_flat,
+            owners,
+            deferred,
+            did_work,
+            host_bytes,
+            any_file,
+            segments,
+            ..
+        } = parsed;
 
         // Second pass: allocate and copy.
         let groups = if on_device {
@@ -655,7 +689,7 @@ impl PyArenaCopier {
             device_index,
             stream,
         };
-        let copied = if on_device || host_bytes > KEEP_GIL_MAX_BYTES {
+        let copied = if on_device || any_file || host_bytes > KEEP_GIL_MAX_BYTES {
             py.detach(|| job.run(abi))
         } else {
             job.run(abi)
@@ -706,7 +740,7 @@ impl PyArenaCopier {
                     offset: info.offset,
                     source_tp_size: info.source_tp_size,
                     source_tp_rank: info.source_tp_rank,
-                    shm_segment: Some(sym(&info.segment)?),
+                    shm_segment: info.segment.as_ref().map(&mut sym).transpose()?,
                     shm_offset: info.shm_offset,
                     source_node_name: info.node.as_ref().map(&mut sym).transpose()?,
                     source_graph_walk: info.walk.as_ref().map(&mut sym).transpose()?,
@@ -722,7 +756,6 @@ impl PyArenaCopier {
         }
         drop(displaced);
         Ok(ReadOut {
-            missing: Vec::new(),
             did_work,
             deferred,
             keep,
@@ -730,7 +763,146 @@ impl PyArenaCopier {
     }
 }
 
-impl PyArenaCopier {
+/// The first pass of a read.
+struct ParsedReads<'py> {
+    infos: Vec<ReadInfo<'py>>,
+    rows: Vec<ReadRow>,
+    dims_flat: Vec<i64>,
+    owners: Vec<RidKey>,
+    deferred: Vec<u32>,
+    /// Peer segments to map before the rows mean anything.
+    missing: Vec<String>,
+    /// Keeps each row's source mapped across the copies.
+    segments: Vec<Arc<ShmArena>>,
+    did_work: bool,
+    host_bytes: usize,
+    any_file: bool,
+}
+
+impl PyArenaTransport {
+    fn flush_notes(&self, py: Python<'_>) {
+        let notes = self.capacity.notes.take();
+        if notes.is_empty() {
+            return;
+        }
+        let logger = py
+            .import("logging")
+            .and_then(|m| m.getattr("getLogger"))
+            .and_then(|f| f.call1(("mstar.communication.arena",)));
+        if let Ok(logger) = logger {
+            for (level, message) in notes {
+                let _ = logger.call_method1("log", (level, message));
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn parse_reads<'py>(
+        &self,
+        rids: &[RidKey],
+        infos: &Bound<'py, PyList>,
+        on_device: bool,
+        origins: &Bound<'py, PyDict>,
+        host_max: Option<usize>,
+        abi: &dyn TorchAbi,
+    ) -> PyResult<ParsedReads<'py>> {
+        if rids.len() != infos.len() {
+            return Err(PyValueError::new_err("rids and infos must be parallel"));
+        }
+        let mut out = ParsedReads {
+            infos: Vec::with_capacity(infos.len()),
+            rows: Vec::with_capacity(infos.len()),
+            dims_flat: Vec::with_capacity(infos.len()),
+            owners: Vec::with_capacity(infos.len()),
+            deferred: Vec::new(),
+            missing: Vec::new(),
+            segments: Vec::new(),
+            did_work: false,
+            host_bytes: 0,
+            any_file: false,
+        };
+        let mut last: Option<(*mut pyo3::ffi::PyObject, u32)> = None;
+        for (i, (info, rid)) in infos.iter().zip(rids).enumerate() {
+            let info = read_info(&info, abi)?;
+            let nbytes = usize::try_from(info.nbytes)
+                .map_err(|_| PyValueError::new_err("a descriptor's nbytes is negative"))?;
+            let (src, file, segment) = match &info.segment {
+                None => {
+                    let uuid = match origins.get_item(info.uuid)? {
+                        Some(producer) => producer.extract()?,
+                        None => info.uuid,
+                    };
+                    out.any_file = true;
+                    let path = self.capacity.spill.path(info.entity.to_str()?, uuid);
+                    (std::ptr::null(), Some(path), u32::MAX)
+                }
+                Some(name) => {
+                    if !on_device && host_max.is_some_and(|max| nbytes >= max) {
+                        out.deferred.push(i as u32);
+                        continue;
+                    }
+                    let segment = match last {
+                        Some((ptr, at)) if ptr == name.as_ptr() => at,
+                        _ => {
+                            let name_str = name.to_str()?;
+                            let Some(arena) = self.capacity.peer(name_str) else {
+                                if !out.missing.iter().any(|m| m == name_str) {
+                                    out.missing.push(name_str.to_string());
+                                }
+                                continue;
+                            };
+                            let at = out
+                                .segments
+                                .iter()
+                                .position(|s| Arc::ptr_eq(s, &arena))
+                                .unwrap_or_else(|| {
+                                    out.segments.push(arena);
+                                    out.segments.len() - 1
+                                }) as u32;
+                            last = Some((name.as_ptr(), at));
+                            at
+                        }
+                    };
+                    let arena = &out.segments[segment as usize];
+                    let start = info.shm_offset + info.offset;
+                    let end = start.checked_add(info.nbytes);
+                    if nbytes > 0
+                        && (start < 0 || end.is_none_or(|end| end as usize > arena.size()))
+                    {
+                        return Err(PyValueError::new_err(format!(
+                            "descriptor for {}: {} bytes at {start} run past its {} byte segment",
+                            info.uuid,
+                            info.nbytes,
+                            arena.size(),
+                        )));
+                    }
+                    let src = if nbytes > 0 {
+                        unsafe { arena.as_mut_ptr().add(start as usize).cast_const() }
+                    } else {
+                        std::ptr::null()
+                    };
+                    (src, None, segment)
+                }
+            };
+            out.did_work |= nbytes > 0;
+            out.host_bytes += nbytes;
+            out.rows.push(ReadRow {
+                src,
+                file,
+                file_offset: info.offset as u64,
+                nbytes,
+                dtype: info.scalar,
+                dims_at: out.dims_flat.len() as u32,
+                ndim: info.dims.len() as u32,
+                segment,
+            });
+            out.dims_flat.extend_from_slice(&info.dims);
+            out.owners.push(rid.clone());
+            out.infos.push(info);
+        }
+        Ok(out)
+    }
+
     fn can_copy_from(&self, facts: &TensorFacts) -> bool {
         match facts.device_type {
             DEVICE_CPU => true,
@@ -755,37 +927,104 @@ impl PyArenaCopier {
         Ok(())
     }
 
-    /// Reserve and copy each row. Stops at a failed copy; a row with nothing
-    /// reserved stays unplaced, for the manager's growth and spill path.
-    fn copy_stages(&self, rows: &mut [StageRow]) -> (bool, Option<String>) {
-        let Some(arena) = &self.arena else {
-            return (false, None);
-        };
-        let usable = self.usable_segments.load(Ordering::Acquire);
-        let mut queued = false;
-        for row in rows.iter_mut() {
-            let Some((seg, offset, base)) = arena.reserve_existing(row.nbytes, usable) else {
-                continue;
+    /// Place and copy the rows from `pass.next`, stopping at a failure, which
+    /// leaves the rest unplaced. `may_block` false stops at the first row that
+    /// needs more than an existing segment's free space, for the caller to run
+    /// again without the GIL.
+    fn copy_stages(&self, rows: &mut [StageRow], pass: &mut StagePass, may_block: bool) {
+        while pass.next < rows.len() {
+            let row = &mut rows[pass.next];
+            let place = match self.capacity.reserve_now(row.nbytes) {
+                Some((seg, offset, base)) => Reserved::Slot { seg, offset, base },
+                None if !may_block => return,
+                None => self.capacity.reserve(row.nbytes),
             };
-            if row.nbytes > 0 {
-                let dst = unsafe { base.add(offset) };
-                if row.on_device {
-                    let cuda = self.cuda.as_ref().expect("checked by can_copy_from");
-                    let stream = self.d2h_stream.expect("checked by can_copy_from");
-                    if let Err(e) = cuda.copy(dst, row.src, row.nbytes, CUDA_DEVICE_TO_HOST, stream)
-                    {
-                        arena.free(seg, offset);
-                        return (queued, Some(e));
-                    }
-                    queued = true;
-                } else {
-                    unsafe { std::ptr::copy_nonoverlapping(row.src, dst, row.nbytes) };
-                }
+            pass.next += 1;
+            let done = match place {
+                Reserved::Slot { seg, offset, base } => self
+                    .copy_to_slot(row, unsafe { base.add(offset) })
+                    .map(|queued| {
+                        pass.queued |= queued;
+                        row.placed = Some((seg as u32, offset as u64));
+                    })
+                    .inspect_err(|_| self.capacity.return_slot(seg as u32, offset as u64)),
+                Reserved::Spill => self.spill_row(row).map(|()| row.placed = Some((IN_FILE, 0))),
+                Reserved::Failed(message) => Err(StageError {
+                    errno: None,
+                    message,
+                }),
+            };
+            if let Err(e) = done {
+                pass.error = Some(e);
+                return;
             }
-            row.placed = Some((seg as u32, offset as u64));
         }
-        (queued, None)
     }
+
+    fn copy_to_slot(&self, row: &StageRow, dst: *mut u8) -> Result<bool, StageError> {
+        if row.nbytes == 0 {
+            return Ok(false);
+        }
+        if row.on_device {
+            let cuda = self.cuda.as_ref().expect("checked by can_copy_from");
+            let stream = self.d2h_stream.expect("checked by can_copy_from");
+            cuda.copy(dst, row.src, row.nbytes, CUDA_DEVICE_TO_HOST, stream)
+                .map_err(|message| StageError {
+                    errno: None,
+                    message,
+                })?;
+            return Ok(true);
+        }
+        unsafe { std::ptr::copy_nonoverlapping(row.src, dst, row.nbytes) };
+        Ok(false)
+    }
+
+    /// Slower, never fails for lack of an arena: a device source comes down first
+    /// and waits for its copy, then the bytes go to the row's own file.
+    fn spill_row(&self, row: &StageRow) -> Result<(), StageError> {
+        if !row.on_device {
+            let data = if row.nbytes == 0 {
+                &[][..]
+            } else {
+                unsafe { std::slice::from_raw_parts(row.src, row.nbytes) }
+            };
+            return self.capacity.spill.write(row.uuid, data);
+        }
+        let cuda = self.cuda.as_ref().expect("checked by can_copy_from");
+        let stream = self.d2h_stream.expect("checked by can_copy_from");
+        let mut data = vec![0u8; row.nbytes];
+        if row.nbytes > 0 {
+            let copied = cuda
+                .copy(data.as_mut_ptr(), row.src, row.nbytes, CUDA_DEVICE_TO_HOST, stream)
+                .and_then(|()| cuda.synchronize(stream));
+            copied.map_err(|message| StageError {
+                errno: None,
+                message,
+            })?;
+        }
+        self.capacity.spill.write(row.uuid, &data)
+    }
+}
+
+fn spill_pyerr(py: Python<'_>, e: StageError) -> PyErr {
+    match e.errno {
+        Some(errno) => {
+            let class = py.get_type::<pyo3::exceptions::PyOSError>();
+            match class.call1((errno, e.message.clone())) {
+                Ok(err) => PyErr::from_value(err),
+                Err(_) => PyRuntimeError::new_err(e.message),
+            }
+        }
+        None => PyRuntimeError::new_err(e.message),
+    }
+}
+
+/// How far a stage has got, across its pass with the GIL and the one without.
+#[derive(Default)]
+struct StagePass {
+    next: usize,
+    queued: bool,
+    error: Option<StageError>,
 }
 
 /// Which rows read as one copy: at least two of one shape, dtype and segment,
@@ -794,7 +1033,7 @@ fn gather_groups(rows: &[ReadRow], dims_flat: &[i64], item_bytes: usize) -> Vec<
     let dims = |r: &ReadRow| &dims_flat[r.dims_at as usize..(r.dims_at + r.ndim) as usize];
     let mut groups: Vec<GatherGroup> = Vec::new();
     for (i, row) in rows.iter().enumerate() {
-        if row.nbytes == 0 || row.nbytes > item_bytes {
+        if row.nbytes == 0 || row.nbytes > item_bytes || row.file.is_some() {
             continue;
         }
         let found = groups.iter().position(|g| {
@@ -814,6 +1053,35 @@ fn gather_groups(rows: &[ReadRow], dims_flat: &[i64], item_bytes: usize) -> Vec<
     }
     groups.retain(|g| g.rows.len() >= 2);
     groups
+}
+
+/// Why a read's copies could not run.
+enum ReadError {
+    Abi(AbiError),
+    Copy(String),
+    File(std::io::Error),
+}
+
+impl From<AbiError> for ReadError {
+    fn from(e: AbiError) -> Self {
+        ReadError::Abi(e)
+    }
+}
+
+impl From<std::io::Error> for ReadError {
+    fn from(e: std::io::Error) -> Self {
+        ReadError::File(e)
+    }
+}
+
+impl ReadError {
+    fn into_pyerr(self, py: Python<'_>) -> PyErr {
+        match self {
+            ReadError::Abi(e) => e.into_pyerr(py),
+            ReadError::Copy(message) => PyRuntimeError::new_err(message),
+            ReadError::File(e) => e.into(),
+        }
+    }
 }
 
 struct ReadCopied {
@@ -837,22 +1105,19 @@ impl ReadJob<'_> {
         &self.dims_flat[row.dims_at as usize..(row.dims_at + row.ndim) as usize]
     }
 
-    fn check_size(row: &ReadRow, got: i64) -> Result<(), AbiError> {
+    fn check_size(row: &ReadRow, got: i64) -> Result<(), ReadError> {
         if got == row.nbytes as i64 {
             return Ok(());
         }
-        Err(AbiError {
-            out_of_memory: false,
-            message: format!(
-                "a descriptor says {} bytes, but its dims and dtype make {got}",
-                row.nbytes
-            ),
-        })
+        Err(ReadError::Copy(format!(
+            "a descriptor says {} bytes, but its dims and dtype make {got}",
+            row.nbytes
+        )))
     }
 
     /// Every allocation happens before the first copy, so a failed allocation
     /// leaves nothing in flight into a tensor about to be dropped.
-    fn run(&self, abi: &dyn TorchAbi) -> Result<ReadCopied, AbiError> {
+    fn run(&self, abi: &dyn TorchAbi) -> Result<ReadCopied, ReadError> {
         let mut out: Vec<Option<OwnedTensor>> = Vec::new();
         out.resize_with(self.rows.len(), || None);
         let mut in_group = vec![false; self.rows.len()];
@@ -918,16 +1183,37 @@ impl ReadJob<'_> {
             copies.push((device, host.data.cast_const()));
             hosts.push(host);
         }
-        if let Err(message) = self.queue_copies(&copies, &out, &in_group) {
+        // A file row on a device comes to a host buffer first, which its queued
+        // copy then reads. On a host device it goes straight to the tensor.
+        let mut from_file = vec![std::ptr::null(); self.rows.len()];
+        for (i, row) in self.rows.iter().enumerate() {
+            let Some(path) = row.file.as_deref().filter(|_| row.nbytes > 0) else {
+                continue;
+            };
+            if self.stream.is_some() {
+                let host = abi.empty(TensorSpec {
+                    dims: &[row.nbytes as i64],
+                    dtype: SCALAR_UINT8,
+                    device_type: DEVICE_CPU,
+                    device_index: -1,
+                    pinned: false,
+                })?;
+                let dst = unsafe { std::slice::from_raw_parts_mut(host.data, row.nbytes) };
+                SpillFiles::read(path, row.file_offset, dst)?;
+                from_file[i] = host.data.cast_const();
+                hosts.push(host);
+            } else {
+                let data = out[i].as_ref().expect("allocated above").data;
+                let dst = unsafe { std::slice::from_raw_parts_mut(data, row.nbytes) };
+                SpillFiles::read(path, row.file_offset, dst)?;
+            }
+        }
+        if let Err(message) = self.queue_copies(&copies, &out, &in_group, &from_file) {
             // Some copies may be in flight into tensors the error is about to free.
             if let Some((cuda, stream)) = self.stream {
-                unsafe { (cuda.stream_synchronize)(stream) };
-                unsafe { (cuda.get_last_error)() };
+                let _ = cuda.synchronize(stream);
             }
-            return Err(AbiError {
-                out_of_memory: false,
-                message,
-            });
+            return Err(ReadError::Copy(message));
         }
         Ok(ReadCopied {
             tensors: out.into_iter().map(|t| t.expect("every row filled")).collect(),
@@ -940,6 +1226,7 @@ impl ReadJob<'_> {
         gathers: &[(OwnedTensor, *const u8)],
         out: &[Option<OwnedTensor>],
         in_group: &[bool],
+        from_file: &[*const u8],
     ) -> Result<(), String> {
         if let Some((cuda, stream)) = self.stream {
             for (device, src) in gathers {
@@ -947,16 +1234,16 @@ impl ReadJob<'_> {
                 cuda.copy(device.data, *src, n, CUDA_HOST_TO_DEVICE, stream)?;
             }
         }
-        for ((row, t), grouped) in self.rows.iter().zip(out).zip(in_group) {
+        for (i, ((row, t), grouped)) in self.rows.iter().zip(out).zip(in_group).enumerate() {
             if *grouped || row.nbytes == 0 {
                 continue;
             }
             let dst = t.as_ref().expect("allocated above").data;
+            let src = if row.file.is_some() { from_file[i] } else { row.src };
             match self.stream {
-                Some((cuda, stream)) => {
-                    cuda.copy(dst, row.src, row.nbytes, CUDA_HOST_TO_DEVICE, stream)?
-                }
-                None => unsafe { std::ptr::copy_nonoverlapping(row.src, dst, row.nbytes) },
+                Some((cuda, stream)) => cuda.copy(dst, src, row.nbytes, CUDA_HOST_TO_DEVICE, stream)?,
+                None if row.file.is_some() => {} // read straight into `dst`
+                None => unsafe { std::ptr::copy_nonoverlapping(src, dst, row.nbytes) },
             }
         }
         Ok(())
@@ -970,6 +1257,8 @@ mod tests {
     fn row(nbytes: usize, dtype: i32, segment: u32, dims_at: u32) -> ReadRow {
         ReadRow {
             src: std::ptr::null(),
+            file: None,
+            file_offset: 0,
             nbytes,
             dtype,
             dims_at,
