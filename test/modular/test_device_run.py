@@ -603,7 +603,7 @@ def test_a_row_ready_with_nothing_landing_is_still_seen(monkeypatch):
     # N+1's stage used to clear this one's yield; a row ready since the speculation gets its ask here
     ([{OTHER}], 1),
 ])
-def test_rows_ready_as_a_run_waits_end_it_only_if_they_can_use_the_room(monkeypatch, ready, yields):
+def test_rows_ready_as_a_run_waits_end_it_unless_its_walk_had_rows_waiting(monkeypatch, ready, yields):
     worker, log = _waiting_on_a_run(monkeypatch, ready)
     worker._hold_rows = lambda lane, rows: None
     worker._await_run(_run_step([1], 3, token_stream=None), None, [], None)

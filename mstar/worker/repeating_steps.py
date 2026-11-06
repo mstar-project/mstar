@@ -393,9 +393,12 @@ class RepeatingSteps:
         ready tensors, the lanes. Before ``_finish_step``, so a lane's postprocess
         doesn't nest in N's. A row can't join a run, so it ends the run, and N+1
         behind it, at the next iteration, as the speculation's own yield does:
-        for other work at once, a prefill on a lane doing that as it lands; for a
-        row of the run's walk once it turns ready here, since rows of that walk
-        ready already are ones the step had no room for."""
+        for other work at once; for a row of the run's walk, as a prefill on a
+        lane readies one when it lands, once it turns ready here with none of
+        that walk waiting, since rows of it ready already are ones the step had
+        no room for. Whether N+1 has room for the new row isn't asked: one that
+        doesn't fit costs the two runs' rest once, and the next wait sees it
+        waiting."""
         rows = set(batch_N.batch.request_to_worker_graph)
         if spec_pending is not None:
             # the loop's admit fence, for what follows: N+1's launch needs nothing of N's postprocess

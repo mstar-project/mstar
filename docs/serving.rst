@@ -349,7 +349,7 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        row that asks for log-probs. ``device_stop`` (default ``off``):
        ``skip`` puts a run on the device, one host launch of a WHILE node around the step,
        ending on the first of: every row done, the run's count, other work ready on the worker,
-       which a prefill on a lane is once it lands, a row of the run's own walk turning ready
+       a row of the run's own walk turning ready (as a prefill on a lane does when it lands)
        when none was waiting as the run began, or ``refill_at`` (a share of the run's rows done;
        default off, and it needs ``device_stop``). A live row hands on to the
        next run where it stands. ``drop_rows`` does that and sends a stopped row's reads and
