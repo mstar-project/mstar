@@ -1281,13 +1281,13 @@ def _returns(kv, rid: str) -> bool:
     return runner.admit_request(rid, NODE, "decode") is None
 
 
-def _pool_rank(monkeypatch, rank: int) -> tuple[KVManager, Engine]:
-    """Rank ``rank`` of two: a pool of 10 pages for requests, under the `Engine` methods that journal
+def _pool_rank(monkeypatch, rank: int, cfg: PagedKVConfig | None = None) -> tuple[KVManager, Engine]:
+    """Rank ``rank`` of two: a pool of 10 pages for requests, or of ``cfg``, under the `Engine` methods that journal
     (rank 0) and replay (rank 1) its moves."""
     monkeypatch.setattr(manager_mod, "KVTransferManager", _StubTransfer)
     kv = KVManager(
-        cfg=PagedKVConfig(num_layers=1, num_kv_heads=2, head_dim=8, max_seq_len=4096, max_num_pages=11,
-                          page_size=PAGE_SIZE),
+        cfg=cfg or PagedKVConfig(num_layers=1, num_kv_heads=2, head_dim=8, max_seq_len=4096, max_num_pages=11,
+                                 page_size=PAGE_SIZE),
         name="kv", joint_comm_group=SimpleNamespace(rank=rank, world_size=2), transfer_engine_info=None,
         device=torch.device("cpu"), dtype=torch.float32,
     )
@@ -1830,6 +1830,52 @@ def test_a_follower_admits_the_request_rank_0_moved_a_newer_one_for_as_the_move_
     assert follower._cpu_pool.reserved == leader._cpu_pool.reserved, "the follower set other host room aside"
 
 
+def _windowed() -> PagedKVConfig:
+    """A pool of one full and one sliding layer, whose window keeps a page."""
+    cfg = PagedKVConfig(
+        num_layers=2, num_kv_heads=2, head_dim=8, max_seq_len=4096, max_num_pages=8, page_size=PAGE_SIZE,
+    )
+    cfg.keep_window(PAGE_SIZE, (1,))
+    return cfg
+
+
+def test_a_follower_admits_the_request_rank_0_moved_a_newer_one_for_whatever_room_it_holds_as_the_move_lands(
+    monkeypatch,
+):
+    """Both ranks admit w's last prompt chunk, and its commit gives the room the window no longer holds back. Rank 0
+    commits it before it moves v to the host for o, and the follower replays the move before its own commit. o fits
+    rank 0's room as v's move lands and not yet the follower's, so a follower that admitted o itself never did."""
+    (leader, lead), (follower, follow) = (_pool_rank(monkeypatch, rank, _windowed()) for rank in (0, 1))
+    for kv in (leader, follower):
+        kv._cpu_pool = host._HostPool(64)
+    _ingest((leader, follower), "w", 3, arrival=0)
+    _ingest((leader, follower), "v", 4, arrival=3)
+    assert _admits(leader, "w") and _admits(leader, "v")
+    assert follow.apply_resident_delta(lead.take_resident_delta(), _rebuilds_none)
+    for rid, tokens in (("w", 2 * PAGE_SIZE), ("v", 4 * PAGE_SIZE), *[("v", PAGE_SIZE)] * 3):
+        assert _step(leader, rid, tokens).ok and _step(follower, rid, tokens).ok
+    assert not _step(leader, "v", PAGE_SIZE).ok and not _step(follower, "v", PAGE_SIZE).ok
+    _waits(leader, "v")
+    lead.readmit_request(NODE, "v", queued=False)
+    assert follow.apply_resident_delta(lead.take_resident_delta(), _rebuilds_none)
+    step, ctx = KVStep(segments=(Segment("w", "main", PAGE_SIZE),)), _ctx("w")
+    for kv in (leader, follower):
+        assert kv.admit(step, ctx).ok
+        kv.plan(step, ctx)
+    leader.commit(step, ctx)
+    _ingest((leader, follower), "o", 5, arrival=2)
+    assert not lead._runner.admit_retrieve("o", NODE, "prefill").ready
+
+    assert _make_room(leader).to_host == ["v"]
+    lead.offload_request(NODE, "v")
+    assert "o" in leader._allotments, "v's move didn't make room for o"
+    assert follow.apply_resident_delta(lead.take_resident_delta(), _rebuilds_none)
+    follower.commit(step, ctx)
+
+    # the free lists differ, since w's window and v's move gave their pages back in another order on each rank
+    assert _counts(follower)[:-1] == _counts(leader)[:-1], "the follower holds another allotment for o than rank 0"
+
+
 def test_a_follower_grows_a_request_waiting_for_its_shortage_once_as_rank_0s_moves_cover_it(monkeypatch):
     """o runs short while v has a step in flight, so o waits for its page holding its allotment, and then v runs short
     with nothing newer to move. Rank 0 moves v to the host for o, and o takes its page once v's move covers it. A
@@ -1935,6 +1981,30 @@ def test_an_unreserve_cancels_no_reservation_that_moves_victims():
     delta.add(MoveKind.RESERVE, "o", "kv", 2, ["v"])
 
     assert not delta.cancel("o", MoveKind.RESERVE, "kv"), "the followers would never move v"
+
+
+def test_an_unreserve_cancels_no_reservation_that_grew_an_allotment(monkeypatch):
+    """o waits holding its allotment for a page, and once v is removed rank 0 grows o's allotment by the page. A second
+    pool on the node then holds o back in the same sweep, which gives back o's whole allotment on rank 0. Cancelling the
+    two moves left the follower holding o's allotment."""
+    (leader, lead), (follower, follow) = _pool_rank(monkeypatch, 0), _pool_rank(monkeypatch, 1)
+    _ingest((leader, follower), "o", 5, arrival=1)
+    _ingest((leader, follower), "v", 5, arrival=2)
+    assert _admits(leader, "o") and _admits(leader, "v")
+    assert follow.apply_resident_delta(lead.take_resident_delta(), _rebuilds_none)
+    for rid in ("o", "v"):
+        assert _step(leader, rid, 5 * PAGE_SIZE).ok and _step(follower, rid, 5 * PAGE_SIZE).ok
+    assert not _step(leader, "o", 1).ok and not _step(follower, "o", 1).ok
+    _waits(leader, "o")
+    lead.readmit_request(NODE, "o", queued=False)
+    for engine in (lead, follow):
+        engine.remove_request("v")
+    assert _returns(leader, "o")
+
+    leader.unreserve("o")
+    assert follow.apply_resident_delta(lead.take_resident_delta(), _rebuilds_none)
+
+    assert _counts(follower) == _counts(leader), "the follower holds the allotment rank 0 gave back"
 
 
 def _follower_of(follow) -> MicroScheduler:
