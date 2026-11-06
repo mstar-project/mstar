@@ -60,7 +60,6 @@ class Qwen3TTSTalkerLayer(DecoderLayer):
                 num_heads=config.num_attention_heads,
                 num_kv_heads=config.num_key_value_heads,
                 head_dim=config.head_dim,
-                rope_theta=config.rope_theta,
                 qk_norm=True,
                 rms_norm_eps=config.rms_norm_eps,
                 comm_group=comm_group,

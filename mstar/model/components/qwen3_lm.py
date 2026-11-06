@@ -5,7 +5,7 @@ MLP and plain RoPE (``rope_theta`` 1e6, no Llama-3 scaling). Several
 audio-LLM checkpoints ship one as their text decoder (Qwen3-ASR, Higgs-Audio,
 Qwen3-Omni's dense layers); this is the one place to build it from
 ``ParallelAttention`` / ``ParallelGatedMLP`` / ``RMSNorm``, bound to the
-KV, attention and position resources of the node that owns it.
+array of the node that owns it.
 
 Parameter paths mirror HF's ``Qwen3ForCausalLM`` with the ``model.`` prefix
 dropped (``embed_tokens.*``, ``layers.N.*``, ``norm.*``, ``lm_head.*``); a
@@ -72,39 +72,15 @@ class Qwen3Attention(ParallelAttention):
     rotation and the step's K/V write run in one kernel (`qk_norm_rope_kv_write`): at decode width a step is a few small
     kernels per layer, and these three were a sizeable share of it. Anything else rotates through the array."""
 
-    _fuse_qk = False
     _fuse = False
-
-    def bind_resources(self, resources: dict) -> None:
-        super().bind_resources(resources)
-        if self.pos is None:
-            return
-        # the kernel is plain non-interleaved RoPE over the whole head dim;
-        # anything else the position resource would apply stays unfused
-        self._rope_theta = self.pos.fusable_rope_theta(self.head_dim)
-        self._fuse_qk = (
-            self._rope_theta is not None and self.q_norm is not None and self.rope_scale == 1.0
-        )
 
     def bind_state(self, handles: dict) -> None:
         super().bind_state(handles)
         declared = None if self.state is None else self.state.array.positions
         self._theta = None if declared is None else _plain_theta(declared.rope, self.head_dim)
-        self._fuse = self._theta is not None and self.q_norm is not None
+        self._fuse = self._theta is not None
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if self.state is not None:
-            return self._forward_state(hidden_states)
-        pos_ids = self.pos.pos_ids(self.attend.label) if self._fuse_qk else None
-        if pos_ids is None or not hidden_states.is_cuda:
-            return super().forward(hidden_states)
-        num_tokens = hidden_states.shape[0]
-        q, k, v = self._project_qkv(hidden_states)
-        attn_output = self.attend.norm_rope_attend(q, k, v, self.q_norm, self.k_norm, pos_ids, self._rope_theta)
-        attn_output = attn_output.reshape(num_tokens, self.num_heads * self.head_dim)
-        return self.o_proj(attn_output)
-
-    def _forward_state(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if not self._fuse:
             return super().forward(hidden_states)
         num_tokens = hidden_states.shape[0]
@@ -144,18 +120,13 @@ class Qwen3DenseLM(nn.Module):
         self,
         config: Qwen3LMConfig,
         *,
-        attn_key: str | None = None,
-        kv_key: str | None = None,
-        pos_key: str | None = None,
-        array: str | None = None,
+        array: str,
         comm_group: CommGroup | None = None,
     ):
-        """``array`` is what the layers attend through on a model on the state contract, and the keys are the resources
-        a model still on resources names."""
+        """``array`` is what the layers attend through."""
         super().__init__()
         self.config = config
         comm_group = comm_group or CommGroup.trivial()
-        keys = {"attn_key": attn_key, "kv_key": kv_key, "pos_key": pos_key} if array is None else {"kv_key": array}
         self.embed_tokens = VocabParallelEmbedding(
             num_embeddings=config.vocab_size,
             embedding_dim=config.hidden_size,
@@ -171,10 +142,9 @@ class Qwen3DenseLM(nn.Module):
                     head_dim=config.head_dim,
                     qk_norm=True,
                     rms_norm_eps=config.rms_norm_eps,
-                    rope_theta=config.rope_theta,
                     input_hidden_size=config.hidden_size,
-                    layer=None if array is None else i,
-                    **keys,
+                    kv_key=array,
+                    layer=i,
                 ),
                 mlp=ParallelGatedMLP(
                     comm_group=comm_group,
@@ -220,17 +190,9 @@ class Qwen3DenseLM(nn.Module):
     def embed(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
-    def forward(self, input_embeds: torch.Tensor, *, label: str | None = None) -> torch.Tensor:
-        """``(tokens, hidden)`` -> ``(tokens, hidden)`` after the final norm.
-
-        On resources, the label and layer index are cursors on the shared
-        resources: bind the label once, advance the index per layer. Passing
-        them as arguments instead would make inductor specialize on the int.
-        """
-        if label is None:
-            return run_layers(self.layers, input_embeds, self.norm, no_cursor)
-        self.layers[0].self_attn.attend.bind_step(label)
-        return run_layers(self.layers, input_embeds, self.norm)
+    def forward(self, input_embeds: torch.Tensor) -> torch.Tensor:
+        """``(tokens, hidden)`` -> ``(tokens, hidden)`` after the final norm."""
+        return run_layers(self.layers, input_embeds, self.norm, no_cursor)
 
     def logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.lm_head(hidden_states)

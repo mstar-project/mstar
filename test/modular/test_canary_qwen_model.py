@@ -302,9 +302,9 @@ def test_llm_loads_from_the_checkpoints_names(tmp_path):
     model = object.__new__(CanaryQwenModel)
     model.local_dir, model.config = tmp_path, SimpleNamespace(lora_scale=2.0)
     config = Qwen3LMConfig.from_hf(tiny)
-    from_checkpoint = Qwen3DenseLM(config, attn_key="attn", kv_key="kv", pos_key="rope")
+    from_checkpoint = Qwen3DenseLM(config, array="kv")
     from_checkpoint.load_weights(model._llm_weights("cpu"))
-    from_merged = Qwen3DenseLM(config, attn_key="attn", kv_key="kv", pos_key="rope")
+    from_merged = Qwen3DenseLM(config, array="kv")
     from_merged.load_weights(merged.items())
     expected = dict(from_merged.named_parameters())
     for name, param in from_checkpoint.named_parameters():
@@ -321,7 +321,7 @@ def test_llm_node_caps_captures_and_names():
 
     config = Qwen3LMConfig.from_hf(dict(hidden_size=16, num_hidden_layers=1, num_attention_heads=2,
                                         num_key_value_heads=1, head_dim=8, intermediate_size=32, vocab_size=20))
-    llm = Qwen3DenseLM(config, attn_key="attn", kv_key="kv", pos_key="rope")
+    llm = Qwen3DenseLM(config, array="kv")
     node = CanaryQwenLLMSubmodule(llm, audio_token_id=19, stop_token_ids={11, 12})
     assert node.max_batch_size("prefill") == 16 and node.max_batch_size("decode") is None
     (capture,) = node.get_accelerator_graph_configs(torch.device("cpu"))
