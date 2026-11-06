@@ -562,9 +562,10 @@ def test_a_run_serves_the_lanes_and_ends_once_a_row_turns_ready(monkeypatch):
 
 
 def test_a_pass_where_nothing_happened_scans_nothing(monkeypatch):
-    """A row turns ready only as a message, a read or a lane's step lands, so the
+    """A row mostly turns ready as a message, a read or a lane's step lands, so the
     other 100 us passes of a run's wait pay for those three looks alone."""
     worker, log = _waiting_on_a_run(monkeypatch, [set()])
+    monkeypatch.setattr("mstar.worker.repeating_steps.time.monotonic", lambda: 0.0)  # no quiet scan due
     worker._hold_rows = lambda lane, rows: None
     worker._process_messages = lambda: False
     woke, landed = iter([False, True, False, False]), iter([False, False, True, False])
@@ -573,6 +574,25 @@ def test_a_pass_where_nothing_happened_scans_nothing(monkeypatch):
     lane = SimpleNamespace(finish=lambda: next(landed), launch=lambda pool: log.append("launch"))
     worker._await_run(_run_step([1], 4, token_stream=None), None, [lane], None)
     assert log == ["tensors", "launch"] * 2
+
+
+def test_a_row_ready_with_nothing_landing_is_still_seen(monkeypatch):
+    """A KV copy from the host tier, or an OOM hold running out, readies a row only as a
+    scan looks; nothing wakes the wait for either, so a slower tick scans anyway."""
+    worker, log = _waiting_on_a_run(monkeypatch, [set()])
+    worker._hold_rows = lambda lane, rows: None
+    passes = iter(range(100))
+
+    def _quiet():
+        if next(passes) == 3:
+            worker.scheduler.ready = {OTHER}  # a copy landed, unannounced
+        return False
+
+    worker._process_messages = _quiet
+    clock = iter(range(0, 10**6, 300))
+    monkeypatch.setattr("mstar.worker.repeating_steps.time.monotonic", lambda: next(clock) * 1e-6)
+    worker._await_run(_run_step([1], 12, token_stream=None), None, [], None)
+    assert log == ["yield"]
 
 
 @pytest.mark.parametrize("ready, yields", [

@@ -32,6 +32,8 @@ if TYPE_CHECKING:
 
 # How often a wait on a run that streams its tokens looks for new ones.
 _LANDED_POLL_S = 1e-4
+# How often a run's wait scans for ready rows when nothing landed to say so
+_QUIET_SCAN_S = 10 * _LANDED_POLL_S
 # a TP step's settled count waits this many later seqs for the other side's
 # (``_settle_tp_repeats``): a chain's last step never gets the leader's
 _TP_REPEATS_KEPT = 256
@@ -412,13 +414,20 @@ class RepeatingSteps:
                 yielded = True
                 engine.yield_runs(batch_N.node_name)
 
+        scanned = time.monotonic()
+
         def serve() -> None:
-            # a row turns ready only as one of these lands: a run's wait is mostly none of them
+            # Mostly a row turns ready as one of these lands, and a run's wait is mostly none
+            # of them. Not only: a KV copy from the host tier or an OOM hold running out show
+            # only to a scan, so one runs every _QUIET_SCAN_S whatever landed.
+            nonlocal scanned
             arrived = self._process_messages()
             arrived |= self.wakeup_event.drain()
             arrived |= any([lane.finish() for lane in lanes])
-            if not arrived:
+            now = time.monotonic()
+            if not arrived and now - scanned < _QUIET_SCAN_S:
                 return
+            scanned = now
             self._check_ready_tensors()
             self._poll_stream_buffers()
             for lane in lanes:
