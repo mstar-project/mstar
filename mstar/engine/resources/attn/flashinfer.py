@@ -115,8 +115,10 @@ class FlashInferManager(AttentionManager):
                 "attention over context-parallel KV pool %r decodes on FlashInfer's paged kernel although "
                 "decode_fmha is on: the merge needs each partial's lse", self._kv_cache_name,
             )
-        sm100 = current_platform.has_cuda_capability(10, 0, device=self._device)
-        if sm100 and self._wrapper_kv_kwargs["backend"] == "auto":
+        capability = current_platform.cuda_capability(self._device)
+        # FlashInfer has fa3 for SM90 only (`_check_window_pool`)
+        fa3 = capability is not None and capability[0] == 9
+        if capability is not None and capability >= (10, 0) and self._wrapper_kv_kwargs["backend"] == "auto":
             # from SM100 auto can send short rows to cuDNN, whose lse the merge isn't known to
             # read right (`_check_window_pool` resolves it the same way)
             self._wrapper_kv_kwargs["backend"] = "fa2"
@@ -124,18 +126,19 @@ class FlashInferManager(AttentionManager):
                 "attention over context-parallel KV pool %r plans on fa2 for flashinfer_backend 'auto'",
                 self._kv_cache_name,
             )
-        if placement.over_sp and self._wrapper_kv_kwargs["backend"] == "fa2":
-            # one such server hung at its first 32k prefill and the cause isn't known. Read from the
-            # config and the GPU, so every rank of the node decides alike
-            if not sm100:
-                raise ValueError(
-                    f"attention over KV pool {self._kv_cache_name!r}: flashinfer_backend 'fa2' is refused "
-                    "over an SP-placed pool below SM100 after an unexplained one-off lockstep hang; use "
-                    "'auto', or 'fa3' on SM90"
-                )
+        # one SP-placed server hung at its first 32k prefill on fa2 and the cause isn't known. Read
+        # from the config and the GPU, so every rank of the node decides alike
+        if placement.over_sp and self._wrapper_kv_kwargs["backend"] == "fa2" and fa3:
+            raise ValueError(
+                f"attention over KV pool {self._kv_cache_name!r}: flashinfer_backend 'fa2' is refused over an "
+                "SP-placed pool on SM90 after an unexplained one-off lockstep hang in its prefill; use 'auto' "
+                "or 'fa3'"
+            )
+        if placement.over_sp and self._wrapper_kv_kwargs["backend"] in ("auto", "fa2") and not fa3:
             logger.warning(
-                "attention over SP-placed KV pool %r runs FlashInfer's fa2 kernel, the only one it has "
-                "from SM100; an unexplained one-off lockstep hang on fa2 is still open", self._kv_cache_name,
+                "attention over SP-placed KV pool %r prefills on FlashInfer's fa2 kernel, the only one it has "
+                "off SM90; an unexplained one-off lockstep hang in an fa2 prefill is still open",
+                self._kv_cache_name,
             )
         cfg = self._kv_config
         self._wrapper_kv_kwargs.update(
