@@ -348,9 +348,10 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        says so. They can narrow a step to 1 (``Resource.max_repeats``), as for a step with a
        row that asks for log-probs. ``device_stop`` (default ``off``):
        ``skip`` puts a run on the device, one host launch of a WHILE node around the step,
-       ending on the first of: every row done, the run's count, a row turning ready on the
-       chain while it runs, which a prefill on a lane does as it lands, or ``refill_at`` (a share
-       of the run's rows done; default off, and it needs ``device_stop``). A live row hands on to the
+       ending on the first of: every row done, the run's count, other work ready on the worker,
+       which a prefill on a lane is once it lands, a row of the run's own walk turning ready
+       when none was waiting as the run began, or ``refill_at`` (a share of the run's rows done;
+       default off, and it needs ``device_stop``). A live row hands on to the
        next run where it stands. ``drop_rows`` does that and sends a stopped row's reads and
        writes to the trash slot until the run ends, so its KV and recurrent state stay where
        its stop left them; it needs a resident walk. Both need a token stop, one rank, CUDA

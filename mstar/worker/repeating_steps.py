@@ -389,16 +389,26 @@ class RepeatingSteps:
     ) -> None:
         """Serve what a run on the device leaves free until it lands: messages,
         ready tensors, the lanes. Before ``_finish_step``, so a lane's postprocess
-        doesn't nest in N's. A row can't join a run, so one that turns ready on
-        the chain ends it, and N+1 behind it, at the next iteration; a prefill on
-        a lane does that as it lands, not as its request arrives. Rows ready
-        already had their look at the speculation, which a full step leaves out."""
+        doesn't nest in N's. A row can't join a run, so it ends the run, and N+1
+        behind it, at the next iteration, as the speculation's own yield does:
+        for other work at once, a prefill on a lane doing that as it lands; for a
+        row of the run's walk once it turns ready here, since rows of that walk
+        ready already are ones the step had no room for."""
         rows = set(batch_N.batch.request_to_worker_graph)
         if spec_pending is not None:
             rows.update(spec_pending.batch.request_to_worker_graph)
         self._hold_rows(CHAIN_LANE, rows)
-        waiting = self.scheduler.has_ready_excluding(self.request_state, None)
         engine = self.engine_manager.get_engine(batch_N.node_name)
+        has_ready = self.scheduler.has_ready_excluding
+        state, chain = self.request_state, (batch_N.node_name, batch_N.graph_walk)
+        waiting = has_ready(state, None)
+        yielded = False
+
+        def end_for_ready_rows() -> None:
+            nonlocal yielded
+            if not yielded and (has_ready(state, chain) or (not waiting and has_ready(state, None))):
+                yielded = True
+                engine.yield_runs(batch_N.node_name)
 
         def serve() -> None:
             self._process_messages()
@@ -407,9 +417,9 @@ class RepeatingSteps:
             for lane in lanes:
                 lane.finish()
                 lane.launch(gpu_executor)
-            if not waiting and self.scheduler.has_ready_excluding(self.request_state, None):
-                engine.yield_runs(batch_N.node_name)
+            end_for_ready_rows()
 
+        end_for_ready_rows()
         node_batch = batch_N.node_batch
         if node_batch.token_stream is not None:
             self._stream_tokens(batch_N, serve)

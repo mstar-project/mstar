@@ -495,20 +495,30 @@ def test_a_decode_wrapper_reads_its_lengths_off_the_table():
     assert wrapper._paged_kv_last_page_len_buf.tolist()[:2] == [2, 3]
 
 
+CHAIN, OTHER = ("n", WALK), ("n", "prefill")
+
+
 def _waiting_on_a_run(monkeypatch, ready):
-    """A worker in ``_await_run``, and what it did. ``ready``: what each look at the
-    chain's ready rows answers, the first before the wait starts."""
+    """A worker in ``_await_run``, and what it did. ``ready``: the (node, walk) keys
+    ready as the wait starts, then after each pass's messages; the last stay."""
     from mstar.worker.worker import Worker
 
     worker = Worker.__new__(Worker)
     log = []
-    answers = iter(ready)
-    worker.scheduler = SimpleNamespace(has_ready_excluding=lambda state, key: next(answers))
+    looks = iter(ready)
+    scheduler = SimpleNamespace(ready=next(looks))
+    scheduler.has_ready_excluding = lambda state, key: bool(scheduler.ready - {key})
+    worker.scheduler = scheduler
     worker.request_state = None
     worker.engine_manager = SimpleNamespace(
         get_engine=lambda node: SimpleNamespace(yield_runs=lambda node: log.append("yield")),
     )
-    worker._process_messages = lambda: log.append("messages")
+
+    def _messages():
+        log.append("messages")
+        scheduler.ready = next(looks, scheduler.ready)
+
+    worker._process_messages = _messages
     worker._check_ready_tensors = lambda: None
     worker._poll_stream_buffers = lambda: None
     monkeypatch.setattr("mstar.worker.repeating_steps.time.sleep", lambda s: None)
@@ -525,9 +535,9 @@ def _run_step(rows, looks, **node_batch):
 
 def test_a_run_serves_the_lanes_and_ends_once_a_row_turns_ready(monkeypatch):
     """The request that arrives mid-run ends nothing: its prefill goes on a lane beside
-    the run, and the run ends when the row it readies does. Every look after that asks
-    again, since N+1 clears the word as it stages. N+1's rows count as in flight."""
-    worker, log = _waiting_on_a_run(monkeypatch, [False, False, True, True])
+    the run, and the run ends when the row it readies does, one ask for the two runs
+    it reaches. N+1's rows count as in flight."""
+    worker, log = _waiting_on_a_run(monkeypatch, [set(), set(), {CHAIN}])
     held = {}
     worker._hold_rows = held.__setitem__
     lane = SimpleNamespace(finish=lambda: log.append("finish"), launch=lambda pool: log.append("launch"))
@@ -535,23 +545,29 @@ def test_a_run_serves_the_lanes_and_ends_once_a_row_turns_ready(monkeypatch):
         _run_step([1], 3, token_stream=None), _run_step([2], 0), [lane], None,
     )
     served = ["messages", "finish", "launch"]
-    assert log == [*served, *served, "yield", *served, "yield"]
+    assert log == [*served, *served, "yield", *served]
     assert held == {0: {1, 2}}
 
 
-def test_rows_ready_before_the_wait_leave_the_run_alone(monkeypatch):
-    """They had their look at the speculation. A step too full to take them would
-    otherwise end every run after its first iteration."""
-    worker, log = _waiting_on_a_run(monkeypatch, [True])
+@pytest.mark.parametrize("ready, yields", [
+    # a step too full to take its own walk's rows would otherwise end every run early
+    ([{CHAIN}], 0),
+    # that row hides nothing else, and other work needs no room in the step
+    ([{CHAIN}, {CHAIN}, {CHAIN, OTHER}], 1),
+    # N+1's stage used to clear this one's yield; a row ready since the speculation gets its ask here
+    ([{OTHER}], 1),
+])
+def test_rows_ready_as_a_run_waits_end_it_only_if_they_can_use_the_room(monkeypatch, ready, yields):
+    worker, log = _waiting_on_a_run(monkeypatch, ready)
     worker._hold_rows = lambda lane, rows: None
-    worker._await_run(_run_step([1], 2, token_stream=None), None, [], None)
-    assert log == ["messages", "messages"]
+    worker._await_run(_run_step([1], 3, token_stream=None), None, [], None)
+    assert log.count("yield") == yields
 
 
 def test_a_run_that_streams_its_tokens_serves_between_looks(monkeypatch):
     from mstar.model.submodule_base import StopKind, StopPolicy
 
-    worker, log = _waiting_on_a_run(monkeypatch, [False, True])
+    worker, log = _waiting_on_a_run(monkeypatch, [set(), {CHAIN}])
     worker._hold_rows = lambda lane, rows: None
     worker._graph_runtime = SimpleNamespace(
         send_tokens=lambda *args: None,
