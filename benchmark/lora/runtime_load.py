@@ -106,15 +106,14 @@ class _BaseTraffic:
 
     def _run(self, i: int) -> None:
         from benchmark.lora.load import PROMPTS as LOAD_PROMPTS
-        from benchmark.lora.load import _chat as chat_tokens
+        from benchmark.lora.load import _chat as load_chat
 
         n = 0
         while not self._stop.is_set():
             t0 = time.monotonic()
             error = None
             try:
-                chat_tokens(self._url, self._model, LOAD_PROMPTS[(i + n) % len(LOAD_PROMPTS)],
-                            self._max_tokens, 300.0)
+                load_chat(self._url, self._model, LOAD_PROMPTS[(i + n) % len(LOAD_PROMPTS)], self._max_tokens, 300.0)
             except (urllib.error.URLError, OSError, ValueError) as exc:
                 error = str(exc)
             with self._lock:

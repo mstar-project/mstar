@@ -32,7 +32,7 @@ from pathlib import Path
 import yaml
 
 from benchmark.lora.load import closed_loop
-from benchmark.lora.qwen3_5_parity import DEFAULT_ADAPTERS, _adapter_dir
+from benchmark.lora.qwen3_5_parity import DEFAULT_ADAPTERS, HF_REPOS, _adapter_dir
 
 REPO = Path(__file__).resolve().parents[2]
 EAGER_SITE = Path(__file__).resolve().parent / "eager_site"
@@ -90,7 +90,8 @@ def run_one(args, mode: str, graphs: str, pass_: str) -> None:
         with server:
             for c in args.concurrency:
                 stats = closed_loop(
-                    server.url, models, c, REQUESTS.get(c, 8 * c), args.max_tokens, warmup=c,
+                    server.url, HF_REPOS[args.model], models, c, REQUESTS.get(c, 8 * c), args.max_tokens,
+                    warmup=c,
                 )
                 (cell / f"load_c{c}.json").write_text(json.dumps(stats, indent=1))
                 results[c] = stats
@@ -139,7 +140,7 @@ def summary(args) -> str:
 
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--model", default="qwen3_5_0.8b")
+    p.add_argument("--model", default="qwen3_5_0.8b", choices=sorted(HF_REPOS))
     p.add_argument("--adapter", action="append", default=[], metavar="NAME=REPO_OR_DIR")
     p.add_argument("--out", type=Path, required=True)
     p.add_argument("--concurrency", type=int, nargs="+", default=[1, 32, 64])
