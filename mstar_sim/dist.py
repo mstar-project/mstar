@@ -131,6 +131,15 @@ def _watched(wait, where: str, mine: list[int], replay: bool = False) -> None:
         _abort()
 
 
+def _let_go(*tensors: torch.Tensor) -> None:
+    """Hold ``tensors``, which this module made and handed to gloo, until gloo's worker has
+    dropped the work that holds them, a moment after its wait returns. A tensor Python lets go of
+    first is freed by that worker, which takes the GIL to free its Python object: in a process
+    that is exiting, Python ends the thread there, inside gloo's C++, which aborts the process."""
+    while any(t._use_count() > 1 for t in tensors):
+        time.sleep(0)
+
+
 def _meet(group, mine: list[int], replay: bool = False) -> list[list[int]]:
     """Meet the group's other ranks at a collective (``replay``: a graph's replay) and return
     every rank's descriptor. Blocks until they all come, as the GPU's kernel does
@@ -141,11 +150,12 @@ def _meet(group, mine: list[int], replay: bool = False) -> list[list[int]]:
     seq = group._get_sequence_number_for_group()  # torch's count of the group's gloo ops
     where = f"mstar_sim: rank {me}, torch sequence number {seq} (meets included) on the group of ranks {ranks}"
     gathered = torch.empty(len(ranks) * len(mine), dtype=torch.int64, device="cpu")  # whatever the default
+    sent = torch.tensor(mine, dtype=torch.int64, device="cpu")
     with _waiting():
         # straight to the backend: torch's public function logs a failure through the group's
         # registry entry, which the fused-AR channel hasn't, and turns the timeout into a ValueError
-        _watched(lambda: group._allgather_base(gathered, torch.tensor(mine, dtype=torch.int64, device="cpu")).wait(),
-                 where, mine, replay)
+        _watched(lambda: group._allgather_base(gathered, sent).wait(), where, mine, replay)
+        _let_go(gathered, sent)
     rows = gathered.view(len(ranks), -1).tolist()
     if not _pairs(rows):
         lines = "".join(f"\n  rank {r}: {_describe(d)}{'  <- this rank' if r == me else ''}"
@@ -374,6 +384,8 @@ def _collective(name: str, family: str, primitive: str | None):
                 a[first] = a[first]._data.clone()
                 args, kwargs = bound.args, bound.kwargs
             work = real(*device.tree_map(device._unwrap, args), **device.tree_map(device._unwrap, kwargs))
+            if work is None and outputs and not written:
+                _let_go(a[first])
         # what didn't move, or a captured one at each replay, wasn't computed
         never = not (moved and values & COMPUTED)
         kept = [t._data for t in written if t._data.device.type != "meta"]
