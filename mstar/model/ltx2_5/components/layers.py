@@ -21,13 +21,14 @@ import torch.nn.functional as F
 from torch import nn
 
 from mstar.distributed.communication import CommGroup
+from mstar.engine.resources.context_parallel import gather_merge
 from mstar.model.components.distributed.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
 )
-from mstar.model.components.distributed.sequence_parallel import attention_over_sharded_keys, ulysses_attention
+from mstar.model.components.distributed.sequence_parallel import ulysses_attention
 
 # ``(q, k, v) -> out`` over ``[B, L, H, D]`` tensors (``k``/``v`` may have their own
 # ``L``); see ``mstar.model.components.diffusion.attention``.
@@ -61,8 +62,10 @@ class SeqParallel(NamedTuple):
     def attend(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, run: Attend) -> torch.Tensor:
         return ulysses_attention(self.group, q, k, v, run, self.sizes, seq_dim=1, head_dim=2)
 
+    @torch.compiler.disable
     def attend_shards(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, run: Attend) -> torch.Tensor:
-        return attention_over_sharded_keys(self.group, q, k, v, run)
+        # eager like the gather, so a compiled block doesn't trace the SDPA fallback's fp32 lse
+        return gather_merge(self.group, *run(q, k, v, return_lse=True))
 
 
 def rms_norm_no_weight(x: torch.Tensor, eps: float) -> torch.Tensor:

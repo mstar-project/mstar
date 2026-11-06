@@ -46,8 +46,11 @@ def _manager(
         max_num_pages=max_num_pages, page_size=PAGE_SIZE, prefix_cache_tp=opt_in,
     )
     cfg.update(overrides)
+    cfg = PagedKVConfig(**cfg)
+    # what `KVManager.build` does first
+    cfg.shard(world_size)
     kv = KVManager(
-        cfg=PagedKVConfig(**cfg),
+        cfg=cfg,
         name="kv", joint_comm_group=SimpleNamespace(rank=rank, world_size=world_size),
         transfer_engine_info=None, device=torch.device("cpu"), dtype=torch.float32,
         needs_remote_transfer=shared,

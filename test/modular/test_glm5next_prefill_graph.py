@@ -181,7 +181,7 @@ class _Engine:
         self.cg = AcceleratorGraphRunner(
             submodule_name="LLM", submodule=self.sub, resources=self.resources,
             step_runner=self.runner, device=DEV, autocast_dtype=None,
-            joint_comm_group=trivial, num_slots=1,
+            joint_comm_group=trivial, num_slots=1, head_shards=1,
         )
         self.cg.warmup_and_capture(None)
 

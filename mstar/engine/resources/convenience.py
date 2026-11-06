@@ -75,11 +75,14 @@ class AttentionCallable:
         rotates through its position resource instead). For a backend that
         reads K/V from the paged cache, the step's KV write rides in the
         norm/RoPE kernel (``qk_norm_rope_kv_write``) rather than a launch of its
-        own; a backend that takes fresh K/V gets them normed and rotated."""
+        own; a step that attends the fresh K/V (``reads_step_kv``) gets them
+        normed and rotated."""
         from mstar.utils.attention import qk_norm_rope_inplace, qk_norm_rope_kv_write
 
         eps = _norm_eps(q_norm, k_norm)
-        if not self.attn.requires_kv_write:
+        # the fused kernel leaves k as it was, so a step that attends its k and v needs them
+        # normed and rotated in place
+        if self.attn.reads_step_kv():
             qk_norm_rope_inplace(q, k, q_norm.weight, k_norm.weight, pos_ids, *eps, rope_theta)
             return self(q, k, v)
         layer, page_idx, slot_idx, n = self.kv.write_target()
@@ -102,7 +105,7 @@ class AttentionCallable:
         from mstar.utils.attention import qk_norm_rope_table_kv_write
 
         eps = _norm_eps(q_norm, k_norm)
-        if not (q.is_cuda and self.attn.requires_kv_write):
+        if not q.is_cuda or self.attn.reads_step_kv():
             cos, sin = (t[: q.shape[0], None] for t in cos_sin)
             q, k = (
                 _rotate_half_rope(norm(x.reshape(-1, x.shape[-1])).view(x.shape), cos, sin)

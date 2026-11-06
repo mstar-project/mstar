@@ -404,7 +404,7 @@ def test_a_teardown_inside_a_two_miss_admit_does_not_split_the_ranks(tmp_path, p
 
 # --- the agreement over real gloo ----------------------------------------------------------
 
-def _gloo_worker(rank: int, store: str, out_dir: str, lora_paths: dict):
+def _gloo_worker(rank: int, store: str, out_dir: str, lora_paths: dict, axis: str):
     import torch.distributed as dist
 
     from mstar.distributed.communication import CommGroup, JointGroups
@@ -412,13 +412,19 @@ def _gloo_worker(rank: int, store: str, out_dir: str, lora_paths: dict):
 
     dist.init_process_group("gloo", init_method=f"file://{store}", rank=rank, world_size=2,
                             timeout=timedelta(seconds=60))
-    tp = CommGroup(my_global_rank=rank, my_group_rank=rank, group_members=[0, 1])
-    tp.device_group = tp.cpu_group = dist.group.WORLD
-    tp.initialized = True
-    tp.init_all_reduce()
-    joint = JointGroups(tp_group=tp, sp_group=CommGroup.trivial())
-    pool = LoraAdapterPool.build(make_spec(lora_paths, max_slots=2, cpu_capacity=1),
-                                 EngineResourceInfo(device=torch.device("cpu"), joint_comm_group=joint))
+    group = CommGroup(my_global_rank=rank, my_group_rank=rank, group_members=[0, 1])
+    group.device_group = group.cpu_group = dist.group.WORLD
+    group.initialized = True
+    group.init_all_reduce()
+    if axis == "tp":
+        info = EngineResourceInfo(device=torch.device("cpu"),
+                                  joint_comm_group=JointGroups(tp_group=group, sp_group=CommGroup.trivial()))
+    else:
+        # a node placing its KV positions over its 2 SP ranks: heads over TP alone (1), and every
+        # SP rank runs every row
+        info = EngineResourceInfo(device=torch.device("cpu"), head_shards=1,
+                                  joint_comm_group=JointGroups(tp_group=CommGroup.trivial(), sp_group=group))
+    pool = LoraAdapterPool.build(make_spec(lora_paths, max_slots=2, cpu_capacity=1), info)
     if rank == 1:
         read = pool.store._read
 
@@ -435,11 +441,13 @@ def _gloo_worker(rank: int, store: str, out_dir: str, lora_paths: dict):
     dist.destroy_process_group()
 
 
-def test_gloo_a_load_failing_on_one_rank_is_refused_on_both(tmp_path):
+@pytest.mark.parametrize("axis", ["tp", "cp_over_sp"])
+def test_gloo_a_load_failing_on_one_rank_is_refused_on_both(axis, tmp_path):
+    """Over TP ranks, and over the SP ranks of a node that places its KV positions over them."""
     import torch.multiprocessing as mp
 
     lora_paths = _write_adapters(tmp_path, ("a1", "a2"))
-    mp.spawn(_gloo_worker, args=(str(tmp_path / "store"), str(tmp_path), lora_paths), nprocs=2, join=True)
+    mp.spawn(_gloo_worker, args=(str(tmp_path / "store"), str(tmp_path), lora_paths, axis), nprocs=2, join=True)
     for r in range(2):
         result = torch.load(tmp_path / f"rank{r}.pt")
         assert result["agree"] == ["ok", ("load", ("bad",))]

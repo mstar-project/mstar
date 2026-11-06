@@ -12,7 +12,7 @@ from collections.abc import Mapping
 from typing import Any, NamedTuple
 
 from mstar.distributed.base import ShardingConfig
-from mstar.engine.resources.lora.config import LORA_RESOURCE_KEY, lora_enabled
+from mstar.engine.resources.lora.config import LORA_RESOURCE_KEY, LoraSpec, lora_enabled
 from mstar.engine.resources.lora.serving import declared_lora_specs, size_lora_specs
 from mstar.model.base import Model, WorkerGraph, built_resources, parse_autocast_dtype
 from mstar.validation.client_streams import check_client_streams
@@ -150,7 +150,8 @@ def validate_deployment(
             specs = built_resources(specs)
         except (ValueError, OSError) as e:
             problems.append(f"building the node resources failed: {type(e).__name__}: {e}")
-            specs = None
+            # the placement checks still see the specs the build would have kept
+            specs = [spec for spec in specs if not (isinstance(spec, LoraSpec) and not spec.targets)]
     # after get_worker_graphs too: a model may shape its walks from the deployment (BAGEL)
     problems += _checked(
         "checking the client streams", check_client_streams,
