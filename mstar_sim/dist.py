@@ -351,14 +351,18 @@ def _collective(name: str, family: str, primitive: str | None):
     @functools.wraps(real)
     def call(*args, **kwargs):
         tensors = _sim_tensors(args, kwargs)
-        if not tensors:
-            return real(*args, **kwargs)
         bound = sig.bind(*args, **kwargs)
         bound.apply_defaults()
         a = bound.arguments
         group = a.get("group")
         if dist.distributed_c10d._rank_not_in_group(group):
             return real(*args, **kwargs)  # nothing runs on this rank: torch's own answer
+        if not tensors:
+            if primitive is None or not dist.is_initialized():
+                return real(*args, **kwargs)
+            # a CPU group's (``agree``): gloo is its own transport here, but the wait is as at a meet
+            with _waiting(dist.get_process_group_ranks(group or dist.group.WORLD)):
+                return real(*args, **kwargs)
         if name in ("recv", "irecv") and a["src"] is None and a["group_src"] is None:
             # gloo, under the stand-in, would serve it
             raise device.gpu_error(NotImplementedError("ProcessGroupNCCL does not support recvAnysource"))

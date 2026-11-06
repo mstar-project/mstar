@@ -1180,6 +1180,26 @@ def test_a_slot_names_the_meet_of_a_wait_still_in_it():
     assert out.strip() == "5", out
 
 
+def test_a_host_collective_is_a_wait_for_the_peers():
+    """A gloo collective on a CPU group, as ``agree`` makes: its rank waits there, as at a meet, so
+    a late peer doesn't show as host time on its clock."""
+    code = """
+        import datetime
+        import torch.distributed as dist
+        dist.init_process_group("nccl", init_method="file://" + TMP + "/group", rank=%d, world_size=2)
+        barrier()
+        start = time.perf_counter()
+        late = clock._real() + 0.5
+        while %d and clock._real() < late:
+            pass
+        dist.all_reduce(torch.zeros(1))
+        print(time.perf_counter() - start)
+        dist.destroy_process_group()
+    """
+    waiter, _ = run_deployment(code % (0, 0), code % (1, 1))
+    assert float(waiter.split()[-1]) < 0.25, waiter
+
+
 def test_a_read_held_behind_a_rising_bound_doesnt_abort():
     """The limit is on a bound that stands still, not on a hold: a device wait can put a process
     far past a peer that runs at real rate, and it then waits for the peer to get there."""
