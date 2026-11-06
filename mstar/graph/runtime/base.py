@@ -1001,6 +1001,11 @@ class GraphRuntime(PhasedPostprocess, ABC):
         pass
 
     @abstractmethod
+    def graph_passes(self, request_to_worker_graph: Mapping[int, int]) -> list[int]:
+        """Actual worker-graph pass counters, in submitted row order."""
+        pass
+
+    @abstractmethod
     def get_dynamic_loop_iters(
         self, request_ids: list[int],
         partition: str,

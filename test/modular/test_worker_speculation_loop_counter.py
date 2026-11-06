@@ -146,3 +146,28 @@ def test_an_outer_restart_resets_inner_inputs_in_both_speculation_paths():
         assert spec.node_batch.per_request_info_wrapped[rid].dynamic_loop_iter_counts == expected
         assert columns.dynamic_loop_iter_counts == expected
     assert shared[1].dynamic_loop_iter_counts == {"outer": 0, LOOP: 3}
+
+
+def test_actual_graph_passes_are_snapshotted_only_for_iteration_input_rows():
+    from mstar.engine.engine import Engine
+    from mstar.model.submodule_base import InputMetadata
+    from mstar.worker.executing_batch import stamp_graph_passes
+
+    engine = Engine.__new__(Engine)
+    engine._loops = {("dit", "t2i"): LoopLayout(LOOP)}
+    engine._submodules = {"dit": SimpleNamespace(
+        submodule=SimpleNamespace(ITERATION_INPUTS={"sigma": object()}), device_stops={"t2i": object()},
+    )}
+    calls = []
+    def passes(selected):
+        calls.append(selected)
+        return [7]
+    runtime = SimpleNamespace(graph_passes=passes)
+    metadata = {rid: InputMetadata(dynamic_loop_iter_counts={LOOP: 2}) for rid in (1, 2)}
+    stamp_graph_passes(runtime, engine, "dit", "mixed", metadata, {1: 10, 2: 20}, {1: "t2i", 2: "prefill"})
+    assert calls == [{1: 10}]
+    assert metadata[1].graph_pass == 7 and metadata[2].graph_pass is None
+    assert metadata[1].dynamic_loop_iter_counts == {LOOP: 2}
+    engine._submodules["dit"].device_stops.clear()
+    stamp_graph_passes(runtime, engine, "dit", "t2i", metadata, {1: 10, 2: 20})
+    assert calls == [{1: 10}], "repeats off must not query graph state"

@@ -159,6 +159,7 @@ def _worker(max_iters: int = 1 << 20, pair: bool = False, mixed: bool = False) -
     w.streams = StreamBufferManager(w.request_state, tm, [])
     # no resource splits a walk here, so a mixed step keeps its rows' order
     w.engine_manager = SimpleNamespace(get_engine=lambda node: SimpleNamespace(
+        iteration_layouts=lambda node: None,
         order_split_rows=lambda node, walk, rids, walks: rids,
     ))
     w._pending_removes = {}

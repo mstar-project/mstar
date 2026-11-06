@@ -360,10 +360,15 @@ def test_a_capped_loop_ends_at_its_cap_on_every_pass(decode):
     capped = _admit(rt, "r1", loop_caps={"ar_loop": 2})
     free = _admit(rt, "r2")
 
-    first = _run_pass(rt, book, capped, uuids)
-    second = _run_pass(rt, book, capped, uuids)
+    passes = []
+    def observe():
+        passes.append(rt.graph_passes({capped: WG_ID, free: WG_ID}))
+    first = _run_pass(rt, book, capped, uuids, on_decode=observe)
+    second = _run_pass(rt, book, capped, uuids, on_decode=observe)
     other = _run_pass(rt, book, free, uuids)
 
+    assert passes == [[0, 0], [0, 0], [1, 0], [1, 0]]
+    assert rt.graph_passes({free: WG_ID, capped: WG_ID}) == [1, 2]
     assert first.count("ar_decode") == second.count("ar_decode") == 2
     assert other.count("ar_decode") == 4, "the cap leaked to the next request"
 

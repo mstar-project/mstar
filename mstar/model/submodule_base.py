@@ -185,6 +185,8 @@ class InputMetadata(NamedTuple):
     # input_name -> where that streamed input's chunk sits in its stream
     stream_chunks: Mapping[str, StreamChunkInfo] = MappingProxyType({})
     dynamic_loop_iter_counts: Mapping[str, int] = MappingProxyType({})
+    # Snapshotted only for a node whose device run reads iteration inputs.
+    graph_pass: int | None = None
 
     # TODO: fold in prepare_inputs' is_final_stream_chunk kwarg once the Chatterbox work settles.
     # TODO: move step_metadata and dynamic_loop_iter_counts here off CurrentForwardPassInfo (move, don't copy).

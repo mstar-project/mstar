@@ -474,6 +474,9 @@ class RustGraphRuntime(GraphRuntime):
     def loop_layout(self, graph_walk: str, loop_name: str) -> LoopLayout:
         return self._loop_layouts[(graph_walk, loop_name)]
 
+    def graph_passes(self, request_to_worker_graph: Mapping[int, int]) -> list[int]:
+        return self._rust.graph_passes(list(request_to_worker_graph), list(request_to_worker_graph.values()))
+
     def get_dynamic_loop_iters(
         self, request_ids: list[int], partition: str,
     ) -> ParallelList[int, dict[str, int]]:

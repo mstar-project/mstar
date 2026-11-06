@@ -410,6 +410,10 @@ class StepRunner:
                         )
                 raise
 
+    def request_generation(self, rid: int) -> int:
+        """The existing admission identity; a recycled handle gets a new one."""
+        return self._generations[rid]
+
     def ingest_capture_row(self, rid: str) -> None:
         """open a capture padding row on all resources"""
         for key in self._order:

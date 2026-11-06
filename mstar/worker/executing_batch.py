@@ -2,12 +2,15 @@
 worker's own batches and its speculative ones."""
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.chunking import ChunkRange
 from mstar.engine.engine import Engine, ExecutingBatch
 from mstar.engine.resources import StepContext
 from mstar.graph.loop_indices import LoopLayout
+from mstar.graph.runtime.base import GraphRuntime
 from mstar.model.submodule_base import InputMetadata
 from mstar.worker.node_manager_utils import RequestStateManager
 from mstar.worker.stream_buffers import StreamBufferManager
@@ -43,6 +46,30 @@ def input_metadata_and_fwd_info(
         )
         meta[rid] = InputMetadata(stream_chunks=stream_chunks, dynamic_loop_iter_counts=projected)
     return meta, fwd_info
+
+
+def stamp_graph_passes(
+    runtime: GraphRuntime, engine: Engine, node: str, walk: str,
+    metadata: dict[int, InputMetadata], request_to_worker_graph: Mapping[int, int],
+    request_walks: Mapping[int, str] | None = None,
+) -> None:
+    """Snapshot the graph's actual pass before an immutable step is submitted.
+
+    A speculative ancestor transition already projected the Loop counters;
+    it remains in the same worker-graph pass. Ordinary and speculative input
+    preparation share this boundary. Nodes without actual cursors query no state.
+    """
+    layouts = engine.iteration_layouts(node)
+    if not layouts:
+        return
+    walks = request_walks or {}
+    selected = {
+        rid: request_to_worker_graph[rid] for rid in metadata
+        if walks.get(rid, walk) in layouts
+    }
+    if selected:
+        for rid, graph_pass in zip(selected, runtime.graph_passes(selected), strict=True):
+            metadata[rid] = metadata[rid]._replace(graph_pass=graph_pass)
 
 
 def make_executing_batch(

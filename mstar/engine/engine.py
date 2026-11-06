@@ -68,6 +68,7 @@ from mstar.engine.resources.step import (
     AdmitOutcome,
     PerReqSetting,
 )
+from mstar.graph.loop_indices import LoopLayout
 from mstar.graph.runtime.base import GraphRuntime
 from mstar.model.base import keyed_labels
 from mstar.model.submodule_base import (
@@ -648,7 +649,7 @@ class Engine:
     _node_lanes: Mapping[str, int] = MappingProxyType({})
     _stage_lock: "threading.Lock | None" = None
     # (node, walk) -> the Loop it runs in; set at warmup
-    _loops: Mapping[tuple[str, str], str] = MappingProxyType({})
+    _loops: Mapping[tuple[str, str], LoopLayout] = MappingProxyType({})
     _lane_streams: Mapping[int, Any] = MappingProxyType({})
 
     @property
@@ -3408,6 +3409,14 @@ class Engine:
         capped = [cap for cap in caps if cap is not None]
         return min(capped) if capped else None
 
+    def iteration_layouts(self, node_name: str) -> Mapping[str, LoopLayout] | None:
+        """Graph-owned contexts for walks whose device runs need actual progress."""
+        mgmt = self._submodules[node_name]
+        if not mgmt.device_stops or not getattr(mgmt.submodule, "ITERATION_INPUTS", None):
+            return None
+        return {walk: self._loops[(node_name, walk)] for walk in mgmt.device_stops
+                if (node_name, walk) in self._loops}
+
     def streamed_iteration_inputs(self, node_name: str) -> frozenset[str]:
         """The streamed inputs ``node_name`` reads an item a replay of
         (``IterationInput.streamed``)."""
@@ -3434,7 +3443,7 @@ class Engine:
             loop = self._loops.get((node_name, ctx.walk_of(rid)))
             # the counter as the engine reads it, not watched
             counts = getattr(info, "metadata", info)
-            k = 0 if loop is None or counts is None else counts.dynamic_loop_iter_counts.get(loop, 0)
+            k = 0 if loop is None or counts is None else counts.dynamic_loop_iter_counts.get(loop.name, 0)
             # a stream window is items of the node's Loop; a row outside it has none
             if streamed:
                 window = {} if loop is None else _window_tables(

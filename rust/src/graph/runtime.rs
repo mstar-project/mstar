@@ -2197,6 +2197,20 @@ impl GraphRuntime {
         Ok(uningested)
     }
 
+    /// The pass of the exact worker graph selected for each submitted row.
+    /// A conductor forward index is not a worker-graph execution counter.
+    fn graph_passes(&self, rids: Vec<u32>, wg_ids: Vec<u32>) -> PyResult<Vec<u32>> {
+        if rids.len() != wg_ids.len() {
+            return Err(PyValueError::new_err("request and worker-graph columns differ in length"));
+        }
+        rids.into_iter().zip(wg_ids).map(|(rid, wg_id)| {
+            let wg = self.wg_index(wg_id)
+                .ok_or_else(|| PyValueError::new_err("unknown worker graph"))?;
+            self.state(wg, rid).map(|state| state.num_times_run)
+                .ok_or_else(|| PyValueError::new_err("request has no live worker-graph state"))
+        }).collect()
+    }
+
     /// Per rid, loop name -> current iteration, for the partition's live
     /// worker graphs.
     fn get_dynamic_loop_iters(

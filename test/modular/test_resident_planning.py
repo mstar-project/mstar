@@ -1067,6 +1067,7 @@ def test_a_step_its_resources_held_to_one_iteration_moves_its_rows_by_one():
     worker = Worker.__new__(Worker)
     worker._step_repeats = _repeats(8)
     worker._step_repeats.settle(lambda *key: None, lambda *key: None)
+    worker._innermost_loop_by_node = {(WALK, "n"): "loop"}
     worker._graph_runtime = SimpleNamespace(loop_room=lambda *args: 100)
     speculation = SimpleNamespace(
         scheduled_batch=batch, node_batch=SimpleNamespace(step_context=ctx), loop_name="loop",
@@ -3106,7 +3107,8 @@ def test_a_mixed_step_stages_each_rows_iteration_of_its_own_walk():
         node.request_states[rid] = PerRequestState()
         node.request_states[rid].add("trailing", torch.arange(10.0).reshape(5, 2) + 100 * rid)
     engine = Engine.__new__(Engine)
-    engine._device, engine._loops = CPU, {("n", "decode"): "loop"}
+    from mstar.graph.loop_indices import LoopLayout
+    engine._device, engine._loops = CPU, {("n", "decode"): LoopLayout("loop")}
     ctx = StepContext(request_ids=(1, 2), graph_walk="mixed", slot=0, capture=False, repeats=1)
     ctx.request_walks = {1: "decode", 2: "prefill"}
     info = {
@@ -3209,6 +3211,7 @@ def test_a_step_that_reads_a_stream_window_repeats_as_far_as_every_row_has_items
     worker = Worker.__new__(Worker)
     worker._step_repeats = _repeats(8)
     worker._step_repeats.settle(lambda *key: None, lambda *key: None)
+    worker._innermost_loop_by_node = {(WALK, "n"): "loop"}
     worker._graph_runtime = SimpleNamespace(loop_room=lambda *args: 100)
     speculation = SimpleNamespace(
         scheduled_batch=batch, node_batch=node_batch, loop_name="loop", continuing_rids={0, 1},
@@ -3279,6 +3282,7 @@ def test_a_run_stops_short_of_the_iteration_whose_items_run_another_consumer_wal
     hook.consumer_walk = lambda ctx: "late" if ctx.loop_iters["loop"] >= 3 else "early"
     worker = Worker.__new__(Worker)
     worker._walk_drivers = {"talker": hook}
+    worker._innermost_loop_by_node = {(WALK, "n"): "loop"}
     worker._signal_consumer = {"states": "talker"}
     worker._graph_runtime = SimpleNamespace(get_output_signals=lambda node, walk: ["states"])
     speculation = SimpleNamespace(

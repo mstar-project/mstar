@@ -112,7 +112,7 @@ from mstar.utils.threads import ThreadPool, pin_thread
 from mstar.worker.batch_builder import BatchBuilderType
 from mstar.worker.chunk_loops import ChunkLoops
 from mstar.worker.engine_manager import EngineManager, refuse_combined_walks_across_tp_groups
-from mstar.worker.executing_batch import input_metadata_and_fwd_info, make_executing_batch
+from mstar.worker.executing_batch import input_metadata_and_fwd_info, make_executing_batch, stamp_graph_passes
 from mstar.worker.lanes import Lane, finish_first_to_land
 from mstar.worker.micro_scheduler import (
     CHAIN_LANE,
@@ -1986,6 +1986,12 @@ class Worker(RepeatingSteps):
             self.request_state, self.streams,
             node_name=batch.node_name, batch_partition=batch_partition,
             per_request_inputs=per_request_inputs,
+        )
+
+        stamp_graph_passes(
+            self._graph_runtime, self.engine_manager.get_engine(batch.node_name),
+            batch.node_name, batch.graph_walk, per_request_input_metadata,
+            batch.request_to_worker_graph, batch.request_walks,
         )
 
         node_batch = make_executing_batch(
@@ -5296,7 +5302,8 @@ class Worker(RepeatingSteps):
                 self._odds_refusals[key] = self.engine_manager.get_engine(key[0]).ask_stop_odds(*key)
         # CUDA graph capture before entering the main loop
         self.engine_manager.warmup_all(
-            {(node, walk): loop for (walk, node), loop in self._innermost_loop_by_node.items()},
+            {(node, walk): self._graph_runtime.loop_layout(walk, loop)
+             for (walk, node), loop in self._innermost_loop_by_node.items()},
             self._step_repeats.carried() if self._step_repeats is not None else {},
             self._step_repeats.device_stops() if self._step_repeats is not None else {},
             self._step_repeats.kept_rows(self.engine_manager.engine.resident_nodes())

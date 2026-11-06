@@ -29,7 +29,7 @@ from mstar.graph.runtime.base import (
 )
 from mstar.streaming.stream_buffer import StreamingEdge
 from mstar.utils.profiler import PhaseLaps
-from mstar.worker.executing_batch import input_metadata_and_fwd_info, make_executing_batch
+from mstar.worker.executing_batch import input_metadata_and_fwd_info, make_executing_batch, stamp_graph_passes
 from mstar.worker.micro_scheduler import MicroScheduler, ScheduledBatch
 from mstar.worker.node_manager_utils import RequestStateManager
 from mstar.worker.spec_rows import DeferredRowInputs, loop_counter_snapshots
@@ -340,6 +340,12 @@ class SpeculationBuilder:
             engine=ctx.engine_manager.get_engine(spec_node) if request_walks else None,
             chunk_ranges=chunk_ranges,
         )
+        if self._ctx.engine_manager is not None:
+            stamp_graph_passes(
+                self._ctx.graph_runtime, self._ctx.engine_manager.get_engine(spec_node),
+                spec_node, spec_batch.graph_walk, spec_node_batch.per_request_input_metadata,
+                request_to_worker_graph, spec_batch.request_walks,
+            )
         return Speculation(
             scheduled_batch=spec_batch,
             node_batch=spec_node_batch,
@@ -409,6 +415,12 @@ class SpeculationBuilder:
                 capture=False, request_walks={},
             ),
         )
+        if self._ctx.engine_manager is not None:
+            stamp_graph_passes(
+                self._ctx.graph_runtime, self._ctx.engine_manager.get_engine(spec_node),
+                spec_node, spec_batch.graph_walk, spec_node_batch.per_request_input_metadata,
+                request_to_worker_graph, spec_batch.request_walks,
+            )
         return Speculation(
             scheduled_batch=spec_batch,
             node_batch=spec_node_batch,
