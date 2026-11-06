@@ -638,3 +638,17 @@ def test_kernel_settings_sizes_a_plain_value_and_yaml_overrides_it():
 def test_a_plain_value_refuses_what_a_pool_cant_hold(build, cause):
     with pytest.raises(ValueError, match=cause):
         build_specs([build()])
+
+
+def test_kernel_settings_picks_a_kept_reads_decode_kernel_and_yaml_overrides_it():
+    specs = build_specs([_kv()], kernel_settings={"attn": {"decode_tensor_cores": False}})
+    assert specs[1].config.decode_tensor_cores is False, "Qwen3-TTS's two query heads per KV head want the CUDA kernel"
+    apply_yaml_overrides(specs, {"resources": {"attn": {"decode_tensor_cores": True}}})
+    assert specs[1].config.decode_tensor_cores is True, "YAML wins over the hook"
+
+
+def test_decode_tensor_cores_on_a_within_step_read_is_refused():
+    array = Array("a", nodes={"llm"}, layers={0}, entry=KVEntry(heads=4, head_dim=16), max_len=0,
+                  reads={"r": _read(mask=Block(), op=Attend(q_heads=4))})
+    with pytest.raises(ValueError, match=r"Array 'a': kernel_settings\['r'\] sets \['decode_tensor_cores'\]"):
+        build_specs([array], kernel_settings={"r": {"decode_tensor_cores": False}})

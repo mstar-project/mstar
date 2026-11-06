@@ -7,6 +7,7 @@ cause, in eager steps and at capture. A replay runs no Python, so it skips all o
 
 from __future__ import annotations
 
+import subprocess
 import sys
 from dataclasses import replace
 from functools import partial
@@ -19,6 +20,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from mstar.engine import state
 from mstar.engine.resources.recurrent.config import RecurrentStep
 from mstar.engine.resources.recurrent.pool import RecurrentStatePool
 from mstar.engine.resources.sampler import utils as sampler_utils
@@ -45,6 +47,8 @@ from mstar.engine.state import (
     Value,
     at_last_token,
     causal_conv,
+    drew,
+    fused_draw_args,
     gated_delta_net,
     kernel_setting,
     last_sampled,
@@ -1179,3 +1183,137 @@ def test_a_replay_skips_the_write_check():
     step = _begin(h, segments=[Segment(1, "main", 1)], ctx=_ctx(leased=True))
     h.check_step(step)
     h.end_step(step)
+
+
+class _StubDrawing:
+    """Answers `fused_draw_args` and counts the offsets' advance, as a leased graph sampler does."""
+
+    def __init__(self, args="args"):
+        self.args = args
+        self.advanced = []
+
+    def fused_draw_args(self):
+        return self.args
+
+    def advance_offsets(self, n):
+        self.advanced.append(n)
+
+    def sample(self, rows, logits):
+        self.advanced.append("sample")
+        return logits
+
+
+def _drawing(resource=None, vocab_size=2048, draws=15) -> SamplerHandle:
+    sampler = Sampler("draws", nodes={"LLM"}, vocab_size=vocab_size, draws=draws)
+    return SamplerHandle(sampler, resource or _StubDrawing())
+
+
+def test_fused_draw_args_hands_out_the_samplers_answer():
+    s = _drawing()
+    _begin(s)
+    assert fused_draw_args(s) == "args"
+
+
+def test_no_arguments_from_the_sampler_means_the_model_samples():
+    s = _drawing(_StubDrawing(args=None))
+    _begin(s)
+    assert fused_draw_args(s) is None, "an eager step or a penalty draws through `sample`"
+
+
+@pytest.mark.parametrize("vocab_size, fused", [(2048, True), (2049, False), (4096, False)])
+def test_fused_draws_stop_where_fused_sample_leaves_the_layout_draw_row_assumes(vocab_size, fused, monkeypatch):
+    launched = {}
+    monkeypatch.setattr(sampler_utils, "_fused_sample_kernel", {(1,): lambda *args, **kw: launched.update(kw)})
+    logits = torch.zeros(1, vocab_size)
+    no_draw = (torch.zeros(1), torch.zeros(1, dtype=torch.int32), torch.ones(1), torch.zeros(1, dtype=torch.int64),
+               torch.zeros(1, dtype=torch.int64))
+    sampler_utils.fused_sample(logits, *no_draw)
+    s = _drawing(vocab_size=vocab_size)
+    _begin(s)
+    assert (fused_draw_args(s) is not None) == fused
+    assert (launched["num_warps"] == 4) == fused, "draw_row_layout is the 4-warp layout, so the cap has to follow it"
+
+
+def test_a_vocabulary_above_the_cap_draws_through_sample():
+    s = _drawing(vocab_size=2049, draws=1)
+    _begin(s)
+    assert fused_draw_args(s) is None
+    _refused(r"Sampler 'draws': drew, and no fused_draw_args this step returned arguments", lambda: drew(s, 1))
+    sample(s, torch.zeros(1, 2049))
+    s.check_step(_step(s))
+
+
+def test_drew_advances_the_offsets_after_the_launch_and_counts_toward_draws():
+    s = _drawing()
+    step = _begin(s)
+    assert fused_draw_args(s) == "args"
+    assert s.resource.advanced == [], "handing out arguments must not move the offsets the kernel is about to read"
+    drew(s, 15)
+    assert s.resource.advanced == [15], "the advance is one per draw, what 15 sample calls would move"
+    s.check_step(step)
+
+
+def test_sample_and_drew_mix_in_one_step_in_order():
+    s = _drawing()
+    step = _begin(s)
+    fused_draw_args(s)
+    drew(s, 14)
+    sample(s, torch.zeros(1, 2048))
+    assert s.resource.advanced == [14, "sample"]
+    s.check_step(step)
+
+
+def test_a_forgotten_drew_fails_the_step():
+    s = _drawing()
+    step = _begin(s)
+    fused_draw_args(s)
+    _refused(r"Sampler 'draws': a step listing it sampled 0 times, and draws is 15", lambda: s.check_step(step))
+
+
+@pytest.mark.parametrize("n", [0, -1, 16, 1.0, True])
+def test_drew_refuses_a_count_outside_the_steps_draws(n):
+    s = _drawing()
+    _begin(s)
+    fused_draw_args(s)
+    _refused(rf"Sampler 'draws': drew\({n!r}\) after 0 draws, and draws is 15", lambda: drew(s, n))
+
+
+def test_drew_refuses_past_the_steps_draws_after_a_sample():
+    s = _drawing()
+    _begin(s)
+    fused_draw_args(s)
+    sample(s, torch.zeros(1, 2048))
+    _refused(r"Sampler 'draws': drew\(15\) after 1 draws", lambda: drew(s, 15))
+
+
+def test_drew_with_no_arguments_handed_out_is_refused():
+    s = _drawing()
+    _begin(s)
+    _refused(r"Sampler 'draws': drew, and no fused_draw_args", lambda: drew(s, 1))
+
+
+def test_arguments_from_one_step_dont_carry_to_the_next():
+    s = _drawing()
+    step = _begin(s)
+    fused_draw_args(s)
+    s.end_step(step)
+    _begin(s)
+    _refused(r"Sampler 'draws': drew, and no fused_draw_args", lambda: drew(s, 1))
+
+
+def test_fused_draw_args_in_a_step_that_doesnt_list_the_sampler_is_refused():
+    _refused(r"Sampler 'draws': fused_draw_args in a step that doesn't list the sampler",
+             lambda: fused_draw_args(_drawing()))
+
+
+def test_importing_the_contract_leaves_gluon_unimported():
+    script = "import sys, mstar.engine.state; sys.exit('triton.experimental.gluon' in sys.modules)"
+    assert subprocess.run([sys.executable, "-c", script], check=False).returncode == 0, "the contract imported Gluon"
+
+
+def test_the_contract_exports_the_draw_a_kernel_calls_outside_its_surface():
+    from mstar.engine.resources.sampler import fused_draw
+    from mstar.engine.state import draw_row, draw_row_layout
+
+    assert draw_row is fused_draw.draw_row and draw_row_layout is fused_draw.layout
+    assert {"draw_row", "draw_row_layout"}.isdisjoint(state.__all__), "they can change with the kernel"
