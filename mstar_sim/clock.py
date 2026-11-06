@@ -56,6 +56,9 @@ class Timeline:
 
 _LOCK = threading.Lock()
 DEFAULT = Timeline("default")
+# a GPU's copy engines, one each way over its one PCIe link: copies each way queue on it, whatever
+# their stream, and overlap compute on other streams
+ENGINES = {"h2d": Timeline("h2d"), "d2h": Timeline("d2h")}
 STATS = {"replays": 0, "calls": 0, "emulator_s": 0.0, "run_delay_s": 0.0, "blocked_s": 0.0, "jumped_s": 0.0,
          "device_waited_s": 0.0, "thread_time_faster": 0}
 
@@ -268,10 +271,11 @@ def in_kernel() -> bool:
     return getattr(_tls, "in_kernel", 0) > 0
 
 
-def charge(seconds: float, launched: float | None = None, kernels: int = 1) -> float:
+def charge(seconds: float, launched: float | None = None, kernels: int = 1, engine: Timeline | None = None) -> float:
     """Queue ``kernels`` kernels whose bodies take ``seconds`` of device time in all, launched
     at host time ``launched`` (now by default), on the current stream: each adds the GPU's
-    eager launch gap. Returns their end. While capturing, they go on the tape instead (a
+    eager launch gap. Returns their end. ``engine``: a copy engine (:data:`ENGINES`) it also
+    needs, so it waits for what is on that too. While capturing, they go on the tape instead (a
     replay adds its own gaps)."""
     recording = getattr(_tls, "recording", None)
     if recording is not None:
@@ -287,7 +291,13 @@ def charge(seconds: float, launched: float | None = None, kernels: int = 1) -> f
     from mstar_sim import cost
 
     with _LOCK:
-        return current_timeline().launch((seconds + kernels * cost.launch_seconds()) * TIME_SCALE, launched)
+        timeline = current_timeline()
+        if engine is not None:
+            timeline.free_at = max(timeline.free_at, engine.free_at)
+        end = timeline.launch((seconds + kernels * cost.launch_seconds()) * TIME_SCALE, launched)
+        if engine is not None:
+            engine.free_at = end
+        return end
 
 
 @contextmanager

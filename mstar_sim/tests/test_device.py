@@ -904,6 +904,72 @@ def test_a_native_process_holds_the_deployment_only_while_it_works():
     assert 0.3 <= worked <= real + 0.06 and wall < 0.2 and 0.1 <= float(peer) < 0.2, (worked, real, wall, peer)
 
 
+def test_a_blocking_h2d_holds_the_host_until_the_copy_is_done():
+    """As ``cudaMemcpy``: after what is queued on the stream, and for the copy itself."""
+    out = run_sim("""
+        import time, torch
+        from mstar_sim import clock
+        host = torch.zeros(1 << 30, dtype=torch.uint8)
+        device = torch.empty(1 << 30, dtype=torch.uint8, device="cuda")
+        for blocking in (host.cuda, lambda: device.copy_(host)):
+            torch.cuda.synchronize()
+            clock.charge(0.1)
+            t0 = time.perf_counter()
+            blocking()
+            print(time.perf_counter() - t0, clock.DEFAULT.free_at - t0)
+    """)
+    for line in out.splitlines():
+        span, done = map(float, line.split())
+        assert done > 0.1 and done <= span < done + 0.01, (span, done)
+
+
+def test_a_copy_from_pageable_memory_blocks_the_host_and_is_slower_than_from_pinned():
+    out = run_sim("""
+        import time, torch
+        from mstar_sim import clock
+        pageable = torch.zeros(1 << 30, dtype=torch.uint8)
+        pinned = torch.zeros(1 << 30, dtype=torch.uint8, pin_memory=True)
+        assert pinned.is_pinned() and not pageable.is_pinned() and pageable.pin_memory().is_pinned()
+        assert pinned[8:].is_pinned() and not pageable.clone().is_pinned()
+        for source in (pinned, pageable):
+            torch.cuda.synchronize()
+            busy, t0 = clock.ENGINES["h2d"].free_at, time.perf_counter()
+            source.to("cuda", non_blocking=True)
+            print(time.perf_counter() - t0, clock.DEFAULT.free_at - t0)
+    """)
+    (host_pinned, device_pinned), (host_pageable, device_pageable) = (map(float, l.split()) for l in out.splitlines())
+    assert host_pinned < 0.1 * device_pinned, (host_pinned, device_pinned)
+    assert host_pageable >= 0.9 * device_pageable and device_pageable > 1.5 * device_pinned, out
+
+
+def test_concurrent_copies_share_a_copy_engine_and_overlap_compute():
+    """Two H2D copies on two streams take twice one; a kernel on a third stream runs beside them,
+    and a D2H has an engine of its own."""
+    out = run_sim("""
+        import torch
+        from mstar_sim import clock, cost
+        host = torch.zeros(1 << 30, dtype=torch.uint8, pin_memory=True)
+        one = cost.copy_seconds(1 << 30, "h2d")
+        streams = [torch.cuda.Stream() for _ in range(3)]
+        out = torch.empty(1 << 30, dtype=torch.uint8, device="cuda")
+        torch.cuda.synchronize()
+        start = clock.now()
+        for stream in streams[:2]:
+            with torch.cuda.stream(stream):
+                host.to("cuda", non_blocking=True)
+        with torch.cuda.stream(streams[2]):
+            clock.charge(one)  # compute beside the copies
+        print((streams[1].timeline.free_at - start) / one, (streams[2].timeline.free_at - start) / one)
+        with torch.cuda.stream(streams[2]):
+            torch.cuda.synchronize()
+            start = clock.now()
+            host.copy_(out, non_blocking=True)
+        print((streams[2].timeline.free_at - start) / one)
+    """)
+    (both, compute), (d2h,) = (map(float, line.split()) for line in out.splitlines())
+    assert 1.95 < both < 2.1 and compute < 1.1 and d2h < 1.1, out
+
+
 def test_timing_only_holds_shapes_not_values():
     """Nothing is computed: a 40 GB tensor costs no host memory
     but counts against the card; small integer tensors (what mstar plans with)

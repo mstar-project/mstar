@@ -276,13 +276,19 @@ def graph_launch_seconds() -> float:
     return _S.gpu.graph_launch_s
 
 
-def copy_seconds(nbytes: int, kind: str) -> float:
-    """Device time of a ``cudaMemcpyAsync`` of ``nbytes``; ``kind`` is "h2d", "d2h" or "d2d"."""
+# a copy through pageable memory goes by way of a pinned bounce buffer: an estimate of what
+# that leaves of the link, not a measurement
+PAGEABLE_BW = 0.5
+
+
+def copy_seconds(nbytes: int, kind: str, pinned: bool = True) -> float:
+    """Device time of a ``cudaMemcpyAsync`` of ``nbytes``; ``kind`` is "h2d", "d2h" or "d2d".
+    ``pinned``: whether the host side is pinned memory."""
     gpu = _S.gpu
     if kind == "d2d":  # reads and writes HBM
         return gpu.min_kernel_s + 2 * nbytes / (gpu.hbm_bw * gpu.memory_eff)
     if kind in ("h2d", "d2h"):
-        return gpu.copy_latency_s + nbytes / (gpu.host_link_bw * gpu.memory_eff)
+        return gpu.copy_latency_s + nbytes / (gpu.host_link_bw * gpu.memory_eff * (1.0 if pinned else PAGEABLE_BW))
     raise ValueError(f"copy kind must be h2d, d2h or d2d, not {kind!r}")
 
 

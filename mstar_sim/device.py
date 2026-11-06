@@ -1148,10 +1148,38 @@ def replay(tape: clock.Tape) -> None:
 # ------------------------------------------------------------ special methods
 
 
-def _copy_seconds(nbytes: int, kind: str) -> float:
+def _copy_seconds(nbytes: int, kind: str, pinned: bool = True) -> float:
     if clock.FAST:
         return 0.0
-    return cost.copy_seconds(nbytes, kind)
+    return cost.copy_seconds(nbytes, kind, pinned)
+
+
+def is_pinned(t: torch.Tensor) -> bool:
+    """Whether host tensor ``t`` is pinned: made by ``pin_memory()`` or ``pin_memory=True``."""
+    return getattr(t.untyped_storage(), "_sim_pinned", False)
+
+
+def _pin(out):
+    """Mark the host tensors of ``out`` pinned (their storages: views share it)."""
+    for t in tree_flatten(out)[0]:
+        if type(t) is T:
+            t.untyped_storage()._sim_pinned = True
+    return out
+
+
+def _h2d(src: torch.Tensor, nbytes: int, non_blocking: bool) -> None:
+    """A host-to-device copy, on the current stream and the H2D copy engine. A blocking one
+    returns once it is done, after what is queued on the stream. A ``non_blocking`` one from
+    pageable memory goes through a bounce buffer: slower, and the host blocks while it is
+    staged, whatever the stream has queued. From pinned memory the host goes on at once."""
+    pinned = is_pinned(src)
+    seconds = _copy_seconds(nbytes, "h2d", pinned)
+    end = clock.charge(seconds, engine=clock.ENGINES["h2d"])
+    if clock.capturing() is None:
+        if not non_blocking:
+            clock.wait_until(end)
+        elif not pinned:
+            clock.wait_until(clock.now() + seconds)
 
 
 def _to(self, *args, **kwargs):
@@ -1175,11 +1203,12 @@ def _to(self, *args, **kwargs):
                 opts["copy"] = True
             return _run(T.to, (self,), opts, index)  # a cast is a kernel, captured as one
         if device.type == "cpu":
-            _d2h(self)
+            _d2h(self, non_blocking)  # torch pins a non_blocking copy's output
             if not non_blocking:
                 host_wait()
             value = host_value(self._data)
-            return value.to(copy=True, **{k: v for k, v in opts.items() if k != "copy"})
+            out = value.to(copy=True, **{k: v for k, v in opts.items() if k != "copy"})
+            return _pin(out) if non_blocking else out
         return self._data.to(device, **opts)
     if is_cuda_device(device):
         check_fault()
@@ -1192,7 +1221,7 @@ def _to(self, *args, **kwargs):
         data = to_device_storage(src)
         if data.device.type == "cpu":  # captured: reads its host buffer at each replay, not now
             clock.on_replay(lambda: data.copy_(self))
-        clock.charge(_copy_seconds(data.numel() * data.element_size(), "h2d"))
+        _h2d(src, data.numel() * data.element_size(), non_blocking)
         return SimTensor(data, cuda.device_index(device))
     if _is_meta(self) and (device is None or device.type in ("cpu", "meta")):
         # a header-only weight cast or moved on the host stays value-less
@@ -1201,9 +1230,10 @@ def _to(self, *args, **kwargs):
         return T.to(self, *args, copy=copy, **kwargs)
 
 
-def _d2h(src) -> None:
-    """A device-to-host copy runs on the current stream, after what is queued there."""
-    clock.charge(_copy_seconds(src.numel() * src.element_size(), "d2h"))
+def _d2h(src, pinned: bool = False) -> None:
+    """A device-to-host copy runs on the current stream, after what is queued there, and on the
+    D2H copy engine."""
+    clock.charge(_copy_seconds(src.numel() * src.element_size(), "d2h", pinned), engine=clock.ENGINES["d2h"])
 
 
 def _cuda(self, device=None, non_blocking=False, memory_format=torch.preserve_format):
@@ -1239,7 +1269,7 @@ def _copy_(self, src, non_blocking=False):
         if not isinstance(src, SimTensor):
             if not non_blocking:
                 refuse_while_capturing("a blocking host-to-device copy")
-            clock.charge(_copy_seconds(src.numel() * src.element_size(), "h2d"))
+            _h2d(src, src.numel() * src.element_size(), non_blocking)
             if not _is_meta(self._data):
                 dst, host = self._data, _zeros(src)
 
@@ -1254,8 +1284,9 @@ def _copy_(self, src, non_blocking=False):
         return _run(T.copy_, (self, src), {"non_blocking": non_blocking}, self.device.index)
     # device-to-host into a CPU tensor
     check_fault()
-    _d2h(src)
-    if not non_blocking:
+    pinned = is_pinned(self)
+    _d2h(src, pinned)
+    if not non_blocking or (not pinned and clock.capturing() is None):  # into pageable memory it syncs
         host_wait()
     if not _is_meta(self):
         if clock.capturing() is None:
@@ -1328,9 +1359,9 @@ def _plain(func, args, kwargs):
             and not (kwargs.get("assign") or (len(args) > 2 and args[2])):
         return args[0].detach()  # the same, through load_state_dict's parameter swap
     if func is T.pin_memory:
-        return args[0]
+        return args[0] if is_pinned(args[0]) else _pin(args[0].clone())
     if func is T.is_pinned:
-        return True
+        return is_pinned(args[0])
     return NotImplemented
 
 
@@ -1361,7 +1392,7 @@ def _create(func, args, kwargs, device):
     if target is CPU and func in _UNINITIALIZED:
         out.zero_()  # what no one wrote reads as zeros, not as the host heap's garbage
     if from_host and isinstance(out, T):
-        clock.charge(_copy_seconds(out.numel() * out.element_size(), "h2d"))
+        _h2d(out, out.numel() * out.element_size(), False)  # a synchronous copy of host data
     return tree_map(
         lambda x: SimTensor(x, index) if isinstance(x, T) and not isinstance(x, SimTensor) else x, out)
 
@@ -1376,8 +1407,8 @@ class SimMode(TorchFunctionMode):
         kwargs = kwargs or {}
         if func is torch.device and len(args) == 1 and type(args[0]) is int and not kwargs:
             return torch.device("cuda", args[0])  # a bare index names the accelerator: the emulated GPU
-        if kwargs.get("pin_memory"):  # no pinned allocator without a real accelerator
-            kwargs = dict(kwargs, pin_memory=False)
+        if kwargs.get("pin_memory"):  # no pinned allocator without a real accelerator: only the mark
+            return _pin(self.__torch_function__(func, types, args, dict(kwargs, pin_memory=False)))
         device = kwargs.get("device")
         if func in _PASSTHROUGH or any(type(a) is SimTensor for a in _shallow(args, kwargs)):
             # a call over cuda tensors: SimTensor handles it, devices included
