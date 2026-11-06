@@ -20,6 +20,7 @@ import contextlib
 import functools
 import inspect
 import os
+import resource
 import threading
 import time
 from collections.abc import Callable
@@ -83,13 +84,15 @@ LOCK = threading.RLock()
 # (S closed + B - J, the real time all threads blocked or None): swapped whole, under LOCK
 _base: tuple[float, float | None] = (0.0, None)
 RUNNING = [0]  # counted threads not in a known wait (mstar_sim.waits)
+PARKED = [False]  # those threads are all off CPU, so the process counts as blocked (mstar_sim.waits)
+UNPARK: list = [None]  # what ends that, on any sign of life
+READS = [0]  # clock reads and regions since the mover last looked
 # each thread inside a region: its CPU clock, its CPU time at entry, and the real time at entry
 # if it was the only thread running then, else None
 _OPEN: dict[int, tuple[int, float, float | None]] = {}
 _last = [0.0]
 # a region whose wall time passed its CPU time by more than this was likely descheduled
 _DESCHEDULED = 20e-6
-_MAX_LOST = 0.05
 
 
 def now() -> float:
@@ -109,6 +112,9 @@ def now() -> float:
 
 
 def _open() -> None:
+    READS[0] += 1
+    if PARKED[0]:
+        UNPARK[0]()
     clk = getattr(_tls, "clk", None)
     if clk is None:
         clk = _tls.clk = time.pthread_getcpuclockid(threading.get_ident())
@@ -123,7 +129,7 @@ def _close() -> None:
     wall = _real() - _tls.wall
     delay = 0.0
     if alone is None or RUNNING[0] > 1:
-        lost = wall - (_real_thread_time() - entered) + getattr(_tls, "lost", 0.0)
+        lost = wall - (_real_thread_time() - entered)
         delay = _run_delay(lost) if lost > _DESCHEDULED else 0.0
     with LOCK:  # S grows before the open entry goes: a reader between sees less, not more
         cpu = _real_thread_time() - entered  # last: this bookkeeping is the emulator's too
@@ -165,9 +171,7 @@ def resume() -> None:
 
 def _run_delay(lost: float) -> float:
     """The time this thread waited for a CPU since it last asked (``run_delay`` in
-    ``/proc/thread-self/schedstat``), up to ``lost``: waiting for the GIL is not in it. The
-    kernel books a wait when the thread next runs, so what a region lost may show only at a
-    later one: the rest of ``lost`` carries over, up to ``_MAX_LOST``."""
+    ``/proc/thread-self/schedstat``), up to ``lost``: waiting for the GIL is not in it."""
     try:
         fd = os.open("/proc/thread-self/schedstat", os.O_RDONLY)
         try:
@@ -178,9 +182,7 @@ def _run_delay(lost: float) -> float:
         return 0.0
     last = getattr(_tls, "run_delay", delay)
     _tls.run_delay = delay
-    claimed = max(0.0, min(lost, delay - last))
-    _tls.lost = min(lost - claimed, _MAX_LOST)
-    return claimed
+    return max(0.0, min(lost, delay - last))
 
 
 @contextmanager
@@ -198,6 +200,22 @@ def start_at(t: float) -> None:
     global _base
     _base = (_real() - t, None)
     _last[0] = t
+
+
+def abort() -> None:
+    """Abort, after the stacks ``faulthandler`` prints: without a core file, which would hold
+    only the emulator."""
+    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+    os.abort()
+
+
+def spent(cpu: float) -> None:
+    """The emulator's own thread took ``cpu`` from the process (the GIL, LOCK): S, if a thread
+    was running to lose it (a frozen clock has lost nothing). Under LOCK."""
+    global _base
+    if _base[1] is None:
+        _base = (_base[0] + cpu, None)
+        STATS["emulator_s"] += cpu
 
 
 def freeze() -> None:

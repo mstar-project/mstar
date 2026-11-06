@@ -142,20 +142,23 @@ the roofline.
   moves host-bound results. A loaded box moves them less: time the box took from the emulator
   isn't counted, but time it took from mstar's own code is. Device time is unaffected.
 - A thread in a wait the emulator doesn't know (a plain lock, `Thread.join`, a socket) counts as
-  running, so its process sleeps for the device instead of jumping: `--report` counts that time
-  (`slept_s`) and names the call sites (`jump_blockers`).
+  running, so while another thread of the process works, a device wait ends by a real-time timer
+  instead of a jump: `--report` counts that time (`slept_s`) and names the call sites
+  (`jump_blockers`). A process with no thread doing anything is parked (it counts as blocked)
+  after a look of up to 50 ms; work done with no clock read can hide for that long
+  (`unparks_by_look`).
 - Processes agree on one time through a table named by the server's port, so run a client with
   `python -m mstar_sim -- -m benchmark.runner --url ...` for it to read that time (`MSTAR_SIM_NODE`
-  names the table when no port can be read). They agree only so far. Ranks at a collective stand
-  aside from the bound, and at TP2 workers were measured 1.7 s behind the API server, so don't
-  read client latencies under TP from this clock. The Rust runtime's own sends are counted by
-  neither side, and an unseen channel (HTTP, a pipe) relies on a 200 us settle window that a
-  loaded box overruns: a blocked receiver can be moved past a message on its way.
-- A real run takes longer in wall time than the old clock did: holding processes to one time cost
-  2-9x on a loaded box (TP2 client 37 s to 81 s, Rust frontend client 15 s to 135 s).
+  names the table when no port can be read). A process is held within 0.5 ms of the others at its
+  clock reads. Between reads it isn't, and nothing bounds rank against rank: ranks can differ by
+  their skew at collectives (`meet_skew_s`). A message on its way has a runnable thread on its
+  path, so a process isn't moved past one; a third process can read the receiver's old next event
+  just before, which a 200 us settle window covers but a loaded box can overrun
+  (`late_deliveries`).
 - The Rust frontend reads real time, so its safety timeouts fire on real time. It counts as running
-  while a thread of its own works, sampled at 100 us while a move is pending, so the start of its
-  work can be missed. uvloop's stand-in hasn't been run.
+  while a thread of its own works, looked at every 400 us while a move is pending, so the start of
+  its work can be missed. Other native children (ffmpeg) count the same way. uvloop's stand-in
+  hasn't been run.
 - `--eager-nodes A,B` runs just those nodes eagerly. Use it for a node whose capture needs a real
   Triton build.
 - `--no-graphs` changes admission: without capture buffers the sampler never asks admission for

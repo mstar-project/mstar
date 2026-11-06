@@ -24,16 +24,23 @@ two clauses. Blocked, a process follows the bound (how far the others let it go)
 next deadline: mstar's sleep loops poll what other processes write, so no host deadline goes
 past it, though a device deadline needs no one. With nothing to bound it, a host deadline
 becomes a move only once its timeout has passed in real time (it is then due: :func:`_until`),
-so idle processes keep real time rather than spin ahead. Unknown channels (HTTP, a pipe) have
-no counter, so a move on the bound waits for the deployment's state to stay still for a settle
-window. Running, a thread that reads the clock more than W past the bound waits there
-(:func:`read`), blocked, until the bound rises. A thread at a collective's meet stands still,
-as NCCL's host doesn't wait: its process stands aside from the bound and takes no moves.
+so idle processes keep real time rather than spin ahead. Running, a thread that reads the clock
+more than W past the bound waits there (:func:`read`), blocked, until the bound rises. A thread at
+a collective's meet stands still, as NCCL's host doesn't wait: it takes no moves, and stands aside
+from the bound until its group has all come (:meth:`mstar_sim.table.Table.bound`).
 
-A native process no patch reaches (the Rust frontend) counts as one more thread of the process
-that started it (:func:`watch`): running while any of its threads uses or waits for a CPU,
-sampled at half the settle window while a move is pending. So no one passes its work, which takes real time on the
-clock, and idle it holds no one back. It reads real time itself, and is never held.
+The kernel says what the registry can't. A process whose threads are in waits it doesn't know is
+*parked* (counts as blocked) when, between two of the mover's looks, nothing read the clock, no
+CPU time was used, and no task is on a CPU or waiting for one (:func:`_look`), so no such wait
+paces the deployment. And a process says it is blocked, and takes a move on the bound, only once
+its mover has seen no task of its own on a CPU (:func:`_quiet`): a message on its way always has
+a runnable thread on its path, so nothing is moved past one in flight. The settle window is left
+for a third process that read the receiver's next event just before that.
+
+A native child no patch reaches (the Rust frontend, ffmpeg: :func:`watch`) counts as one more
+thread of the process that started it, running while it uses or waits for a CPU, so no one passes
+its work, which takes real time on the clock, and idle it holds no one back. It reads real time
+itself, and is never held.
 
 Threads named ``mstar_sim-*`` are the emulator's own and never counted. ``--fast`` installs
 none of this.
@@ -43,10 +50,14 @@ from __future__ import annotations
 
 import _queue
 import _thread
+import atexit
+import ctypes
 import math
 import os
 import queue
 import selectors
+import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -58,14 +69,13 @@ LOCK = clock.LOCK
 DEVICE, HOST, MEET, AHEAD = "device", "host", "meet", "ahead"
 W = 0.5e-3  # how far past the bound a running process may read the clock
 SETTLE = 200e-6  # how long the deployment's state stays still before a move on the bound
-_MAX_SLEEP = 0.05  # the mover looks at least this often
+_MAX_SLEEP = 0.05  # the mover looks at least this often: a peer's death wakes no one
+HELD_LIMIT = 60.0  # real seconds a thread may wait for the bound before the emulator gives up
 _real_lock = _thread.allocate_lock
 _real_sleep = time.sleep
 _real_eventfd_write = os.eventfd_write
 # a device wait woken this much after its time by the mover's timer counts as a late resume
 _LATE = 1e-3
-# how often a due wait the mover can't end (a select, a poll) looks at the clock
-_SLICE = 1e-3
 OWN = "mstar_sim-"  # the emulator's own threads' names start with this
 
 _counted: set[int] = set()  # threads the registry counts
@@ -75,12 +85,20 @@ _fds: dict[int, Wait] = {}  # an fd a poll waits on: its eventfd_write wakes the
 _installed = [False]
 TABLE: table.Table
 _ahead = [math.inf]  # past this a clock read looks at the bound
-_quiet = [0, 0.0]  # the deployment's state, and the real time it last changed
+_seen = [-1]  # the deployment's state when _ahead was last worked out
+_settling = [0, 0.0]  # the deployment's state, and the real time it last changed
 _wakefd = [-1]  # the mover's wake for a select or a poll, which no lock can end
 _poked: set[Wait] = set()
-_watched: list = []  # a native process: its pid, its last CPU time, whether it counts as running
-REPORT = {"slept_s": 0.0, "late_resumes": 0, "jump_blockers": {}, "ahead_stalls": 0, "settle_overruns": 0,
-          "meet_skew_s": 0.0}
+_told_blocked = [False]  # the table says this process is blocked
+_native: dict = {}  # each watched child: its CPU clock, its last CPU time, its tasks
+_native_busy = [False]  # one is working, which counts as a running thread
+_looked = [0.0, 0.0]  # the mover's last look: when, and what the process's other threads had used
+_moved = [0.0, 0.0]  # the last move on the bound: when, and how far
+_CPU_ALLOWANCE = 1e-3  # CPU time a look lets pass as nothing: zmq's and gloo's own threads ticking over
+_meet = [0]  # the group word of the meet a thread of this process is in (dist)
+REPORT = {"slept_s": 0.0, "late_resumes": 0, "jump_blockers": {}, "ahead_stalls": 0, "late_deliveries": 0,
+          "meet_skew_s": 0.0, "mover_s": 0.0, "scan_s": 0.0, "scans": 0, "settle_deferrals": 0, "gate_waits": 0,
+          "parks": 0, "unparks_by_look": 0}
 
 
 class Wait:
@@ -100,45 +118,53 @@ def _block_one() -> None:
     _running[0] -= 1
     if _running[0] == 0:
         clock.freeze()
-        _publish()
+        kick()  # the mover tells the table, once no task of this process is on a CPU
 
 
-def _run_one() -> None:
+def _run_one(thaw: bool = True) -> None:
+    """A thread runs. ``thaw`` False: the mover's delivery, whose thread has yet to get a CPU. It
+    counts as running, so nothing jumps over it, but the clock waits for it (:func:`leave`):
+    how long the box takes to run it is no host time of mstar's."""
     _running[0] += 1
-    if _running[0] == 1:
+    if thaw:
         clock.thaw()
+    if _running[0] == 1 and _told_blocked[0] and not clock.PARKED[0]:
+        _told_blocked[0] = False
         _publish()
 
 
 def _publish() -> None:
     """This process's state changed: its next event is the earliest deadline it holds."""
     pending = [w for w in _waits if not w.woken]
-    TABLE.publish(clock.now(), _running[0] > 0, min((w.deadline for w in pending if w.deadline is not None),
-                                                    default=math.inf), any(w.kind is MEET for w in pending))
+    TABLE.publish(clock.now(), not _told_blocked[0], min((w.deadline for w in pending if w.deadline is not None),
+                                                         default=math.inf),
+                  _meet[0] if any(w.kind is MEET for w in pending) else 0)
 
 
-def enter(kind, deadline=None, release=None, fd=None, counts=True) -> Wait | None:
+def enter(kind, deadline=None, release=None, fd=None) -> Wait | None:
     """This thread enters a wait (None when the registry isn't installed). ``release`` ends it
-    early (the mover's delivery); ``fd``, an fd whose ``eventfd_write`` wakes it; ``counts``
-    False for a wait whose thread is counted blocked elsewhere (a queue's getters)."""
+    early (the mover's delivery); ``fd``, an fd whose ``eventfd_write`` wakes it."""
     if not _installed[0]:
         return None
-    w = Wait(kind, deadline, counts and threading.get_ident() in _counted, release, fd)
+    w = Wait(kind, deadline, threading.get_ident() in _counted, release, fd)
     clock.pause()
     with LOCK:
+        clock.READS[0] += 1
+        if clock.PARKED[0]:
+            _unpark()
         _waits.add(w)
         if fd is not None:
             _fds[fd] = w
         if w.counts:
             _block_one()
-        if kind is MEET:
+        if kind is MEET or (deadline is not None and _told_blocked[0]):
             _publish()
         if kind is DEVICE or kind is MEET:
             kick()
     return w
 
 
-def wake(w: Wait) -> bool:
+def wake(w: Wait, thaw: bool = True) -> bool:
     """Mark ``w``'s thread running (a waker, before it can block itself). False if something
     woke it already."""
     with LOCK:
@@ -146,7 +172,7 @@ def wake(w: Wait) -> bool:
             return False
         w.woken = True
         if w.counts:
-            _run_one()
+            _run_one(thaw)
         return True
 
 
@@ -165,12 +191,16 @@ def leave(w: Wait | None) -> None:
                     os.eventfd_read(_wakefd[0])
                 except BlockingIOError:
                     pass
+        if clock.PARKED[0]:
+            _unpark()
         if not w.woken:
             w.woken = True
             if w.counts:
                 _run_one()
-        if w.kind is MEET:
-            _publish()
+        if w.kind is MEET or (w.deadline is not None and _told_blocked[0]):
+            _publish()  # a blocked process's next event went with it: peers' bounds hang on that
+        if _running[0]:
+            clock.thaw()
     clock.resume()
 
 
@@ -178,8 +208,7 @@ def _until(w: Wait | None, timeout, attempt):
     """``attempt(seconds)``, a wait ending in real time (falsy if it timed out), for wait ``w``:
     retried until it ends or the clock reaches ``w``'s deadline (none: tried once). After its
     real timeout the deadline is due (the mover may then move the clock to it, bound or no
-    bound). The mover ends it (``w.release``, ``w.timed_out``) when the clock gets there; a wait
-    it can't end looks every ``_SLICE``."""
+    bound). The mover ends it (``w.release``, ``w.timed_out``) when the clock gets there."""
     result = attempt(timeout)
     while not result and w is not None and w.deadline is not None:
         with LOCK:
@@ -189,14 +218,16 @@ def _until(w: Wait | None, timeout, attempt):
             if not w.due:
                 w.due = True
                 kick()
-        result = attempt(w.deadline - t if w.release is not None else min(w.deadline - t, _SLICE))
+        result = attempt(w.deadline - t)
     return result
 
 
 @contextmanager
-def blocked(kind=None, deadline=None, fd=None, release=None):
+def blocked(kind=None, deadline=None, fd=None, release=None, group: int = 0):
     """A wait whose waker this module doesn't see (a gloo collective, a Rust poll): the thread
-    counts as blocked until it returns."""
+    counts as blocked until it returns. ``group``: a meet's (:func:`mstar_sim.table.group_word`)."""
+    if group:
+        _meet[0] = group
     w = enter(kind, deadline, release, fd)
     try:
         yield w
@@ -205,8 +236,8 @@ def blocked(kind=None, deadline=None, fd=None, release=None):
 
 
 def kick() -> None:
-    """Have the mover look again."""
-    TABLE.kick()
+    """Have this process's mover look again."""
+    TABLE.kick_me()
 
 
 def _poke() -> None:
@@ -238,45 +269,68 @@ def device_wait(t: float) -> None:
 
 
 def _mover() -> None:
+    _mover_tid[0] = str(threading.get_native_id())
     while True:
         word = TABLE.word()  # before it looks: a change while it does ends the wait at once
         with LOCK:
+            began = clock._real_thread_time()
             timeout = _move()
+            spent = clock._real_thread_time() - began
+            if _running[0] > _native_busy[0]:  # it took the GIL from a Python thread (not from a child)
+                clock.spent(spent)
+            REPORT["mover_s"] += spent
         TABLE.wait(word, timeout)
 
 
 def _move() -> float:
-    """Release the threads the bound has caught up with; with every counted thread blocked,
-    move the clock to the process's next event; end the waits that are due. Returns how long
-    in real time it may sleep, the deployment's changes aside. Under LOCK."""
+    """Release the threads the bound has caught up with; look at whether the process is as idle as
+    the registry can't tell; with no thread running, tell the table so, and move the clock to the
+    process's next event; end the waits that are due. Returns how long in real time it may
+    sleep, the deployment's changes aside. Under LOCK."""
     pending = [w for w in _waits if not w.woken]
-    if _running[0]:
+    if not _told_blocked[0]:
         TABLE.tick(clock.now())  # a thread busy in native code (an import) reads no clock
     bound = TABLE.bound()
     _ahead[0] = bound + W
     for w in pending:
         if w.kind is AHEAD and bound + W >= w.deadline and wake(w):
             w.release()
-    if any(w.kind is MEET for w in pending):
-        return _MAX_SLEEP  # a rank at a meet takes no moves, and its deadlines wait for the meet's end
+    meet = any(w.kind is MEET for w in pending)  # a rank at a meet takes no moves; what is due still ends
     timeout = _MAX_SLEEP
-    if _watched:
-        timeout = _sample(pending)
-    idle = _running[0] == 0
+    _look()
+    if _native:
+        _watch_children()
+    idle = _running[0] == 0 or clock.PARKED[0]
+    if _native and (idle or _native_busy[0]):
+        timeout = 2 * SETTLE  # a move may be pending on a child: look often
     if idle:
+        quiet = _quiet()
+        if quiet and not _told_blocked[0]:
+            _told_blocked[0] = True
+            _publish()
+        elif not quiet:
+            REPORT["gate_waits"] += 1
+            timeout = SETTLE
+    if idle and not meet:
         device = min((w.deadline for w in pending if w.kind is DEVICE), default=math.inf)
         hosts = [w for w in pending if w.kind is HOST and w.deadline is not None]
         host = min((w.deadline for w in hosts), default=math.inf)
-        target = device
+        target = device  # a device deadline needs no one
         if device > host or device == math.inf:
             due = min((w.deadline for w in hosts if w.due), default=math.inf)
             target = min(host, bound) if bound < math.inf else due
+            if bound < host < math.inf:  # the bound, running, wakes no one as it rises
+                timeout = min(timeout, max(host - bound, SETTLE))
             if target < math.inf and target > clock.now():
                 waited = _settled()
-                if waited < SETTLE:
+                if not quiet:
+                    target = math.inf
+                elif waited < SETTLE:
+                    REPORT["settle_deferrals"] += 1
                     target = math.inf
                     timeout = SETTLE - waited
         if target < math.inf and target > clock.now():
+            _moved[:] = [clock._real(), target - clock.now()]
             clock.jump(target)
             TABLE.moved(target)
     t = clock.now()
@@ -286,7 +340,7 @@ def _move() -> float:
         if w.deadline > t:
             if w.kind is DEVICE:
                 timeout = min(timeout, w.deadline - t)
-        elif wake(w):
+        elif wake(w, thaw=False):
             if w.kind is HOST:
                 w.timed_out = True
             elif not idle:
@@ -298,65 +352,161 @@ def _move() -> float:
     return timeout
 
 
-def watch(pid: int) -> None:
-    """Count native process ``pid`` as a thread of this one, running while it uses a CPU."""
-    with LOCK:
-        _watched[:] = [pid, _activity(pid)[0], False]
+class _Tasks:
+    """A process's tasks: is one on a CPU, or waiting for one, or in the kernel? A task the box
+    has descheduled reads R, so the answer doesn't depend on load. A cached fd a task."""
 
+    def __init__(self, pid):
+        self.root, self.fds = f"/proc/{pid}/task", {}
 
-def _activity(pid: int) -> tuple[int, bool]:
-    """Native process ``pid``'s CPU time, over all its threads (``/proc/<pid>/schedstat`` is its
-    first thread's alone, and a tokio server works on the others), and whether one is runnable:
-    a thread the box has descheduled is working, though its CPU time stands still."""
-    cpu, runnable = 0, False
-    try:
-        tasks = os.listdir(f"/proc/{pid}/task")
-    except OSError:
-        return 0, False
-    for task in tasks:
+    def on_cpu(self, skip: str | None = None) -> bool:
         try:
-            with open(f"/proc/{pid}/task/{task}/schedstat") as f:
-                cpu += int(f.read().split()[0])
-            with open(f"/proc/{pid}/task/{task}/stat") as f:
-                runnable = runnable or f.read().rsplit(")", 1)[1].split()[0] == "R"
-        except (OSError, IndexError, ValueError):
-            pass  # a thread that has just gone
-    return cpu, runnable
+            tids = os.listdir(self.root)
+        except OSError:
+            return False
+        for tid in self.fds.keys() - set(tids):
+            os.close(self.fds.pop(tid))
+        found = False
+        for tid in tids:
+            if tid == skip or found:
+                continue
+            try:
+                fd = self.fds.get(tid)
+                if fd is None:
+                    fd = self.fds[tid] = os.open(f"{self.root}/{tid}/stat", os.O_RDONLY)
+                stat = os.pread(fd, 128, 0)
+                found = stat[stat.rindex(b")") + 2] in b"RD"
+            except (OSError, ValueError, IndexError):
+                pass  # a task that has just gone
+        return found
 
 
-def _sample(pending: list[Wait]) -> float:
-    """Look at the watched process if a move could be pending, and return how soon to look
-    again. Under LOCK."""
-    pid, last, busy = _watched
-    if not busy and (_running[0] or not any(w.deadline is not None for w in pending)):
-        return _MAX_SLEEP
-    cpu, runnable = _activity(pid)
-    working = runnable or cpu != last
-    if working and not busy:
-        _run_one()
-    elif busy and not working:
-        _block_one()
-    _watched[1:] = [cpu, working]
-    return SETTLE / 2
+_own = _Tasks("self")
+_mover_tid = [""]
+_libc = ctypes.CDLL(None)
+
+
+def _quiet() -> bool:
+    """The gate: nothing of this process can be on its way to a peer. A send wakes the next thread
+    on its path inside the syscall, so a message in flight has a runnable thread until the receiver
+    has it."""
+    began = clock._real()
+    working = _own.on_cpu(_mover_tid[0])
+    REPORT["scans"] += 1
+    REPORT["scan_s"] += clock._real() - began
+    return not working
+
+
+def _watch_children() -> None:
+    """A child at a CPU counts as a running thread of this process. Under LOCK."""
+    began = clock._real()
+    working = any(child[2].on_cpu() for child in list(_native.values()))
+    REPORT["scan_s"] += clock._real() - began
+    if working != _native_busy[0]:
+        _native_busy[0] = working
+        _run_one() if working else _block_one()
+
+
+def _others_cpu() -> float:
+    """The CPU time this process's other threads and its children have used: the mover asks."""
+    cpu = time.clock_gettime(time.CLOCK_PROCESS_CPUTIME_ID) - clock._real_thread_time()
+    for pid, child in list(_native.items()):
+        try:
+            child[1] = time.clock_gettime(child[0])
+        except OSError:  # it has gone
+            del _native[pid]
+            if not _native and _native_busy[0]:
+                _native_busy[0] = False
+                _block_one()
+            continue
+        cpu += child[1]
+    return cpu
+
+
+def _look() -> None:
+    """At most once a ``_MAX_SLEEP``: a process with running threads that has shown no sign of life
+    since the last look is parked; a parked one showing any is not. It takes all three signs: a
+    Python thread gives the GIL up for the mover to look, so at that moment it is off CPU in a
+    busy process, and only the CPU time it used since says so. Under LOCK."""
+    real = clock._real()
+    if real - _looked[0] < _MAX_SLEEP or _running[0] == 0:
+        return
+    reads, clock.READS[0] = clock.READS[0], 0
+    cpu = _others_cpu()
+    used = cpu - _looked[1]
+    _looked[:] = [real, cpu]
+    busy = reads or used > _CPU_ALLOWANCE or clock._OPEN or not _quiet()
+    if busy and clock.PARKED[0]:
+        REPORT["unparks_by_look"] += 1
+        _unpark()
+    elif not busy and not clock.PARKED[0]:
+        REPORT["parks"] += 1
+        clock.PARKED[0] = True
+        clock.freeze()
+
+
+def _unpark() -> None:
+    """A parked process shows a sign of life: its threads are running after all. Under LOCK."""
+    _catch_up()
+    clock.PARKED[0] = False
+    clock.thaw()
+    if _told_blocked[0]:
+        _told_blocked[0] = False
+        _publish()
+
+
+def _catch_up() -> None:
+    """A process about to run with no thread awake moves up to the others' latest clock (no further
+    than the bound or its own earliest deadline), as something it can't see may have woken it,
+    and what it was sent then doesn't land in its past. Under LOCK."""
+    latest = TABLE.latest()
+    if not latest:
+        return  # no other process: nothing it could have missed
+    pending = min((w.deadline for w in _waits if not w.woken and w.deadline is not None and w.kind is not AHEAD),
+                  default=math.inf)
+    clock.jump(min(TABLE.bound(), latest, pending))
+
+
+def delivered() -> None:
+    """A poll found a message. Within a millisecond of a move past W, it may have been passed."""
+    if clock._real() - _moved[0] < 1e-3 and _moved[1] > W:
+        REPORT["late_deliveries"] += 1
+
+
+def watch(pid: int) -> None:
+    """Count native child ``pid`` as a thread of this process, running while it uses a CPU."""
+    clk = ctypes.c_int()
+    if _libc.clock_getcpuclockid(pid, ctypes.byref(clk)) == 0:
+        with LOCK:
+            _native[pid] = [clk.value, 0.0, _Tasks(pid)]
 
 
 def _settled() -> float:
     """The real time the deployment's state has stood still."""
     epochs, real = TABLE.epochs(), clock._real()
-    if epochs != _quiet[0]:
-        if real - _quiet[1] < SETTLE:
-            REPORT["settle_overruns"] += 1
-        _quiet[:] = [epochs, real]
-    return real - _quiet[1]
+    if epochs != _settling[0]:
+        _settling[:] = [epochs, real]
+    return real - _settling[1]
 
 
 def read() -> float:
     """A clock read by mstar: publishes a running clock, and holds a thread that has got more
     than W past the bound, until the bound rises (clause 2). It is blocked meanwhile, so its
-    process's clock stands still once every thread is, and the slowest process is never held."""
+    process's clock stands still once every thread is, and the slowest process is never held.
+    Not a read made inside this module's own bookkeeping (a GC callback that runs while LOCK is
+    held): the mover needs LOCK to let it go."""
+    clock.READS[0] += 1
+    if clock.PARKED[0] and not LOCK._is_owned():
+        with LOCK:
+            _unpark()
     t = clock.now()
     TABLE.tick(t)
-    if t > _ahead[0] and threading.get_ident() in _counted and not getattr(clock._tls, "computing", 0):
+    epochs = TABLE.epochs()  # a change of state anywhere can lower the bound: look again (0.6 us)
+    if epochs != _seen[0]:
+        _seen[0] = epochs
+        _ahead[0] = TABLE.bound() + W
+    if (t > _ahead[0] and threading.get_ident() in _counted and not getattr(clock._tls, "computing", 0)
+            and not LOCK._is_owned()):
         bound = TABLE.bound()
         _ahead[0] = bound + W
         if t > bound + W:
@@ -364,12 +514,23 @@ def read() -> float:
             lock.acquire()
             w = enter(AHEAD, t, release=lock.release)
             REPORT["ahead_stalls"] += 1
-            try:
-                lock.acquire()
+            try:  # the mover lets it go; it looks too, as the mover is gone at interpreter exit
+                end = clock._real() + HELD_LIMIT
+                while not lock.acquire(True, _MAX_SLEEP) and TABLE.bound() + W < t:
+                    if clock._real() > end:
+                        _held_too_long(t)
             finally:
                 leave(w)
             t = clock.now()
     return t
+
+
+def _held_too_long(t: float) -> None:
+    """The deployment's clock has stopped: an emulator stall, which is never wrong timing and
+    never a hang. Abort as a rank whose collectives don't pair does, saying who holds the bound."""
+    print(f"mstar_sim: pid {os.getpid()} held {HELD_LIMIT:.0f} s at clock {t:.6f}, past the bound "
+          f"{TABLE.bound():.6f}; the deployment's processes:\n{TABLE.describe()}", file=sys.stderr, flush=True)
+    clock.abort()
 
 
 def _slept(w: Wait, t: float) -> None:
@@ -462,23 +623,14 @@ class SimpleQueue(_queue.SimpleQueue):
         self.put(item)
 
     def get(self, block=True, timeout=None):
-        counts = block and _installed[0] and threading.get_ident() in _counted
+        # (a timed get is a wait this module doesn't know: nothing in mstar makes one)
+        counts = block and timeout is None and _installed[0] and threading.get_ident() in _counted
         if counts:
             with LOCK:
                 self._getters += 1
                 self._recount()
         try:
-            if counts and timeout is not None:
-                w = enter(HOST, clock.now() + timeout, counts=False)  # (counted blocked as a getter)
-                try:
-                    got = _until(w, timeout, self._get_within)
-                finally:
-                    leave(w)
-                if not got:
-                    raise queue.Empty
-                item = got[0]
-            else:
-                item = super().get(block, timeout)
+            item = super().get(block, timeout)
         except BaseException:
             if counts:
                 with LOCK:
@@ -494,12 +646,6 @@ class SimpleQueue(_queue.SimpleQueue):
 
     def get_nowait(self):
         return self.get(False)
-
-    def _get_within(self, seconds):
-        try:
-            return (super().get(True, seconds),)
-        except queue.Empty:
-            return None
 
 
 def sleep(seconds) -> None:
@@ -538,21 +684,18 @@ def _selecting(select):
         with blocked(HOST if timeout is not None else None, None if timeout is None else clock.now() + timeout,
                      release=_poke) as w:
             ready = _until(w, timeout, lambda seconds: select(self, seconds))
-            _caught_up(w, ready)
+            _woken_unseen(ready)
             return ready
 
     return wrapped
 
 
-def _caught_up(w: Wait | None, ready) -> None:
-    """A wait ended by a channel the emulator can't see may beat the mover's settle window: the
-    sender's clock may be past this one's, so it moves up to the others' latest clock (no further
-    than the bound or its deadline) before it runs, and what it was sent doesn't land in its past."""
-    if ready and w is not None:
+def _woken_unseen(ready) -> None:
+    """A channel the emulator can't see ended a wait, with no other thread awake."""
+    if ready:
         with LOCK:
             if _running[0] == 0:
-                bound = TABLE.bound()
-                clock.jump(min(bound, TABLE.latest(), math.inf if w.deadline is None else w.deadline))
+                _catch_up()
 
 
 def polling(poll, fd, timeout: float):
@@ -560,13 +703,8 @@ def polling(poll, fd, timeout: float):
     timeout. ``fd``, the eventfd it also wakes on, if any (:func:`eventfd_write`)."""
     with blocked(HOST, clock.now() + timeout, fd=fd, release=_poke) as w:
         ready = _until(w, timeout, poll)
-        _caught_up(w, ready)
+        _woken_unseen(ready)
         return ready
-
-
-def poked() -> bool:
-    """Whether a poll's wake was the mover's, not its owner's."""
-    return bool(_poked)
 
 
 
@@ -583,15 +721,15 @@ def install() -> None:
     _installed[0] = True
     _counted.add(threading.get_ident())
     _running[0] = 1
-    # a helper of the interpreter's that sits in a read of its own would hold the deployment back
-    helper = "multiprocessing.resource_tracker" in " ".join(sys.orig_argv)
-    TABLE = table.Table(None if helper else table.path_for(os.environ.get("MSTAR_SIM_NODE")))
+    TABLE = table.Table(table.path_for(os.environ.get("MSTAR_SIM_NODE")))
     _wakefd[0] = os.eventfd(0, os.EFD_NONBLOCK | os.EFD_CLOEXEC)
     epoch = time.time() - clock._real()  # the same in every process: wall time is one time
     start = TABLE.start_at()
     if start is not None:
         clock.start_at(start)
     TABLE.publish(clock.now(), True)
+    clock.UNPARK[0] = _unpark_now
+    atexit.register(_leave)
     for name, fn in {
         "perf_counter": read, "monotonic": read, "time": lambda: epoch + read(),
         "thread_time": clock.thread_time, "process_time": clock.process_time, "sleep": sleep,
@@ -634,10 +772,30 @@ def install() -> None:
                     _counted.discard(threading.get_ident())
                     _block_one()
 
+    popen = subprocess.Popen.__init__
+
+    def popen_watched(self, args, *rest, **kwargs):
+        popen(self, args, *rest, **kwargs)
+        command = args if isinstance(args, (str, bytes, os.PathLike)) else args[0]
+        path = shutil.which(os.fsdecode(command)) or os.fsdecode(command)
+        if os.path.realpath(path) != os.path.realpath(sys.executable):  # a Python has a slot of its own
+            watch(self.pid)
+
+    subprocess.Popen.__init__ = popen_watched
     threading.Thread.start = start_counted
     threading.Thread._bootstrap_inner = bootstrap_counted
     os.register_at_fork(after_in_child=_after_fork)
     threading.Thread(target=_mover, name=OWN + "mover", daemon=True).start()
+
+
+def _unpark_now() -> None:
+    with LOCK:
+        if clock.PARKED[0]:
+            _unpark()
+
+
+def _leave() -> None:
+    TABLE.leave()  # (this process's table, after a fork)
 
 
 def _after_fork() -> None:
@@ -649,7 +807,9 @@ def _after_fork() -> None:
     _counted.add(threading.get_ident())
     _waits.clear()
     _fds.clear()
+    _native.clear()
     _running[0] = 1
+    _told_blocked[0] = _native_busy[0] = clock.PARKED[0] = False
     for ident in list(clock._OPEN):
         if ident != threading.get_ident():
             del clock._OPEN[ident]

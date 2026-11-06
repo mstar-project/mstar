@@ -8,37 +8,36 @@ slot, and every field is one aligned word: a reader needs no snapshot, as a cloc
 and a deadline is written before the flag that says to read it.
 
 A slot publishes its clock, its next event (the earliest deadline of a blocked process, ``inf``
-if none), whether it runs, whether it is in a meet, what it sent each peer, and the sum it had
-taken of what was sent to it. Messages in flight to slot *j* are what the live slots sent it
-less what it took: per receiver, so a message to one process freezes no other, and a dead
-receiver's go with it. Sends the emulator can't see (the Rust runtime's own) are in neither
-number: a receiver takes all it was sent so far each time a poll finds its socket empty.
+if none), whether it runs, and whether a thread of it is at a meet.
 
 :meth:`Table.bound` is how far this process may go: the minimum over the other live slots of
-their clock if running or if a message is in flight to them, else their next event. A slot in
-a meet stands aside. One futex word wakes every process's mover on any change of state.
+their clock if running, else their next event. Each slot's mover has a futex word of its own in
+its slot; a change of state wakes every live slot's.
 """
 
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import fcntl
 import math
 import mmap
 import os
 import struct
+import time
+import zlib
 
 SLOTS = 64
-NAMES = 8  # communicator ids a process can answer to
-_WORDS = 8 + NAMES + SLOTS  # a slot's 64-bit words
-_CLOCK, _NEXT, _RUNNING, _MEET, _EPOCH, _TAKEN = range(6)
-_NAME, _SENT = 8, 8 + NAMES
-_HEADER = 8  # words before the first slot: the futex word, then how many slots were ever used
+_WORDS = 8  # a slot's 64-bit words
+_CLOCK, _NEXT, _RUNNING, _MEET, _EPOCH, _RANK, _WAKE = range(7)
+_HEADER = 8  # words before the first slot: the second is how many slots were ever used
+_LIVE_FOR = 0.05  # real seconds a look at who is alive stands: a peer's death takes this long to see
+_real = time.perf_counter  # (bound here, before the emulator patches it)
 _SIZE = (_HEADER + SLOTS * _WORDS) * 8
 _SYS_FUTEX, _FUTEX_WAIT, _FUTEX_WAKE = 202, 0, 1
 _libc = ctypes.CDLL(None, use_errno=True)
 _libc.syscall.restype = ctypes.c_long
-_F_OFD_GETLK, _F_OFD_SETLK = 36, 37
+_F_OFD_GETLK, _F_OFD_SETLK, _F_OFD_SETLKW = 36, 37, 38
 
 
 class _Timespec(ctypes.Structure):
@@ -49,18 +48,11 @@ def _flock(kind: int, start: int) -> bytes:
     return struct.pack("hhqqi", kind, os.SEEK_SET, start, 1, 0)
 
 
-def name_hash(name: str) -> int:
-    """FNV-1a, odd so never an empty field: the same in every process (``hash`` isn't)."""
-    h = 1469598103934665603
-    for b in name.encode():
-        h = ((h ^ b) * 1099511628211) & (2**64 - 1)
-    return h | 1
-
-
 class Table:
     """This process's view of the table (``path`` None: private to it)."""
 
     def __init__(self, path: str | None):
+        self.path = path
         if path is None:
             self._fd = -1
             self._map = mmap.mmap(-1, _SIZE)
@@ -70,26 +62,27 @@ class Table:
             self._map = mmap.mmap(self._fd, _SIZE)
         self._q = memoryview(self._map).cast("Q")
         self._d = memoryview(self._map).cast("d")
-        self._word = ctypes.addressof(ctypes.c_char.from_buffer(self._map))
-        self.me = self._claim()
-        self._mine = _HEADER + self.me * _WORDS
-        self._q[1] = SLOTS
-        if not self._live():
-            self._map[:] = bytes(_SIZE)  # a dead run's table: a restart on its port starts clean
-        self._q[1] = max(self._q[1], self.me + 1)
-        self.live: list[int] = []  # as of the last bound
-        self._peers: dict[str, int] = {}
-        self._names = 0
-        self._d[self._mine + _CLOCK] = 0.0
-        self._d[self._mine + _NEXT] = math.inf
-        self._q[self._mine + _RUNNING] = 1
-        self._q[self._mine + _MEET] = 0
-        for i in range(NAMES):
-            self._q[self._mine + _NAME + i] = 0
-        for i in range(SLOTS):
-            self._q[self._mine + _SENT + i] = 0
-        self.live = self._live()
-        self.take(self.sent_to_me())  # a respawn starts level with what its senders sent before
+        self._base = ctypes.addressof(ctypes.c_char.from_buffer(self._map))
+        self._looked = -math.inf
+        self.live: list[int] = []  # the others, as of the last look
+        if self._fd >= 0:  # one process at a time claims, and resets a dead run's table
+            fcntl.fcntl(self._fd, _F_OFD_SETLKW, _flock(fcntl.F_WRLCK, 0))
+        try:
+            self.me = self._claim()
+            self._mine = _HEADER + self.me * _WORDS
+            self._q[1] = SLOTS
+            self.live = self._live()
+            if not self.live:
+                self._map[:] = bytes(_SIZE)  # a dead run's table: a restart on its port starts clean
+            self._q[1] = max(self._q[1], self.me + 1)
+            self._d[self._mine + _CLOCK] = 0.0
+            self._d[self._mine + _NEXT] = math.inf
+            self._q[self._mine + _RUNNING] = 1
+            self._q[self._mine + _MEET] = 0
+            self._q[self._mine + _RANK] = 0
+        finally:
+            if self._fd >= 0:
+                fcntl.fcntl(self._fd, _F_OFD_SETLK, _flock(fcntl.F_UNLCK, 0))
 
     def _claim(self) -> int:
         if self._fd < 0:
@@ -107,9 +100,13 @@ class Table:
         return (_HEADER + slot * _WORDS) * 8
 
     def _live(self) -> list[int]:
-        """The other processes' slots: a held lock is a live process."""
+        """The other processes' slots: a held lock is a live process. (One ``fcntl`` a slot, so a
+        look stands for ``_LIVE_FOR``, by which time a mover looks again anyway.)"""
         if self._fd < 0:
             return []
+        if _real() - self._looked < _LIVE_FOR:
+            return self.live
+        self._looked = _real()
         found = []
         for slot in range(self._q[1]):
             if slot != self.me:
@@ -128,15 +125,26 @@ class Table:
         """The latest clock among the others (0.0: none has published)."""
         return max((self._d[_HEADER + slot * _WORDS + _CLOCK] for slot in self.live), default=0.0)
 
-    def publish(self, clock: float, running: bool, next_event: float = math.inf, meet: bool = False) -> None:
-        """This slot's state changed: tell the others (a new epoch, and every mover wakes)."""
+    def publish(self, clock: float, running: bool, next_event: float = math.inf, meet: int = 0) -> None:
+        """This slot's state changed: tell the others (a new epoch, and every mover wakes).
+        ``meet``: the group word (:func:`group_word`) of a meet a thread of it is in, or 0. Each
+        field is one word, read without a snapshot: so a slot claims running before anything
+        else changes, and claims blocked only after its next event is in place, and a reader
+        between two stores errs low."""
         self._q[1] = max(self._q[1], self.me + 1)
+        if running:
+            self._q[self._mine + _RUNNING] = 1
         self._d[self._mine + _CLOCK] = clock
         self._d[self._mine + _NEXT] = next_event
         self._q[self._mine + _MEET] = meet
-        self._q[self._mine + _RUNNING] = running
+        if not running:
+            self._q[self._mine + _RUNNING] = 0
         self._q[self._mine + _EPOCH] += 1
         self.kick()
+
+    def rank(self) -> None:
+        """This process is a rank of collectives (:meth:`bound`)."""
+        self._q[self._mine + _RANK] = 1
 
     def tick(self, clock: float) -> None:
         """A running clock's latest reading: no change of state, so no one is woken."""
@@ -152,71 +160,82 @@ class Table:
         return sum(self._q[_HEADER + slot * _WORDS + _EPOCH] for slot in range(self._q[1]))
 
     def bound(self) -> float:
+        """How far this process may go. A rank at a meet whose group has yet to all arrive
+        stands aside, as it may wait on someone this process holds back; once all have, it
+        needs no one, and counts at its clock (one still running counts anyway). To another
+        rank, a rank at a meet always stands aside: nothing bounds rank against rank."""
         bound = math.inf
         live = self.live = self._live()
+        rank = self._q[self._mine + _RANK]
         for slot in live:
             base = _HEADER + slot * _WORDS
-            if self._q[base + _MEET] or not self._d[base + _CLOCK]:  # (0: it has yet to publish)
+            if not self._d[base + _CLOCK]:  # (0: it has yet to publish)
                 continue
-            if self._q[base + _RUNNING] or self._in_flight(slot, base, live):
+            meet = self._q[base + _MEET]
+            if meet:
+                arrived = sum(self._q[_HEADER + s * _WORDS + _MEET] == meet for s in live)
+                if rank or not (self._q[base + _RUNNING] or arrived >= meet & 0xFF):
+                    continue
+                bound = min(bound, self._d[base + _CLOCK])
+            elif self._q[base + _RUNNING]:
                 bound = min(bound, self._d[base + _CLOCK])
             else:
                 bound = min(bound, self._d[base + _NEXT])
         return bound
 
-    def _in_flight(self, slot: int, base: int, live: list[int]) -> bool:
-        sent = self._q[self._mine + _SENT + slot]
-        for other in live:
-            sent += self._q[_HEADER + other * _WORDS + _SENT + slot]
-        return sent > self._q[base + _TAKEN]
+    def describe(self) -> str:
+        """Every live slot's state, for a stall that has to be reported."""
+        lines = []
+        for slot in [self.me, *self._live()]:
+            base = _HEADER + slot * _WORDS
+            lines.append(f"  slot {slot}{' (this process)' if slot == self.me else ''}: clock "
+                         f"{self._d[base + _CLOCK]:.6f}, {'running' if self._q[base + _RUNNING] else 'blocked'}, next "
+                         f"event {self._d[base + _NEXT]:.6f}{', at a meet' if self._q[base + _MEET] else ''}")
+        return "\n".join(lines)
 
-    def answer_to(self, name: str) -> None:
-        """Messages to communicator id ``name`` come here."""
-        if self._names < NAMES:
-            self._q[self._mine + _NAME + self._names] = name_hash(name)
-            self._names += 1
+    def leave(self) -> None:
+        """A clean exit: the last slot out takes the table with it (whoever claims a table
+        with no live slot resets it, should a death leave one)."""
+        if self._fd >= 0:
+            fcntl.fcntl(self._fd, _F_OFD_SETLK, _flock(fcntl.F_UNLCK, self._lock_byte(self.me)))
+            self._looked = -math.inf
+            if not self._live():
+                with contextlib.suppress(FileNotFoundError):
+                    os.unlink(self.path)
 
-    def sent(self, name: str) -> None:
-        """A message to communicator id ``name`` is on its way."""
-        slot = self._peers.get(name)
-        if slot is None:
-            wanted = name_hash(name)
-            for other in self.live:
-                base = _HEADER + other * _WORDS + _NAME
-                if wanted in (self._q[base + i] for i in range(NAMES)):
-                    slot = self._peers[name] = other
-                    break
-            else:
-                return  # not (yet) a process of this deployment
-        self._q[self._mine + _SENT + slot] += 1
-        self._q[self._mine + _EPOCH] += 1
-
-    def sent_to_me(self) -> int:
-        return sum(self._q[_HEADER + slot * _WORDS + _SENT + self.me] for slot in self.live)
-
-    def take(self, sent: int) -> None:
-        """All of ``sent`` (:meth:`sent_to_me`, read before a poll found nothing) has arrived."""
-        if sent != self._q[self._mine + _TAKEN]:
-            self._q[self._mine + _TAKEN] = sent
-            self._q[self._mine + _EPOCH] += 1
+    def _wake(self, slot: int) -> None:
+        """Wake a slot's mover. Its word moves by an amount of this slot's, so two writers racing
+        can't leave it where its mover last read it."""
+        word = _HEADER + slot * _WORDS + _WAKE
+        self._q[word] = (self._q[word] + 1 + (self.me << 16)) & 0xFFFFFFFF
+        _libc.syscall(_SYS_FUTEX, ctypes.c_void_p(self._base + word * 8), _FUTEX_WAKE, 1 << 30, None, None, 0)
 
     def kick(self) -> None:
-        """Wake every mover. Each slot steps the word by a different amount, so two writers
-        racing can't leave it where a waiter last read it."""
-        self._q[0] = (self._q[0] + 1 + (self.me << 16)) & 0xFFFFFFFF
-        _libc.syscall(_SYS_FUTEX, ctypes.c_void_p(self._word), _FUTEX_WAKE, 1 << 30, None, None, 0)
+        """Wake every mover."""
+        for slot in (self.me, *self.live):
+            self._wake(slot)
+
+    def kick_me(self) -> None:
+        """Wake this process's mover."""
+        self._wake(self.me)
 
     def word(self) -> int:
-        return self._q[0]
+        return self._q[self._mine + _WAKE]
 
     def wait(self, word: int, timeout: float | None) -> None:
-        """Sleep until the word moves on from ``word`` (read before looking at the state), or
-        for ``timeout`` real seconds."""
+        """Sleep until this slot's word moves on from ``word`` (read before looking at the state),
+        or for ``timeout`` real seconds."""
         spec = None
         if timeout is not None:
             spec = _Timespec(int(timeout), int((timeout % 1) * 1e9))
-        _libc.syscall(_SYS_FUTEX, ctypes.c_void_p(self._word), _FUTEX_WAIT, word & 0xFFFFFFFF,
-                      None if spec is None else ctypes.byref(spec), None, 0)
+        _libc.syscall(_SYS_FUTEX, ctypes.c_void_p(self._base + (self._mine + _WAKE) * 8), _FUTEX_WAIT,
+                      word & 0xFFFFFFFF, None if spec is None else ctypes.byref(spec), None, 0)
+
+
+def group_word(ranks) -> int:
+    """A meet's group, the same in every process: its ranks' checksum, and their count in the
+    low byte."""
+    return (zlib.crc32(repr(sorted(ranks)).encode()) << 8) | min(len(ranks), 0xFF)
 
 
 def path_for(name: str | None) -> str | None:

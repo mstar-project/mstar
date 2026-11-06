@@ -182,7 +182,7 @@ def _no_compile(torch) -> None:
 
 
 def _report_at_exit(path: str) -> None:
-    """At exit, append one JSON line per process that drove a GPU: its device's busy time, and
+    """At exit, append one JSON line per process: its device's busy time (if it drove one), and
     how its clock was made (``mstar_sim.clock``, ``mstar_sim.waits``). ``clock_s`` is the time
     mstar saw pass; ``wall_s`` the box's. ``device_waited_s`` near zero means the run was
     host-bound (mstar's own CPU work, the emulator's is not in it). ``slept_s`` is device waits
@@ -190,8 +190,11 @@ def _report_at_exit(path: str) -> None:
     that ran; ``late_resumes`` those ended over a millisecond late; ``thread_time_faster`` reads
     of ``time.thread_time`` that ran ahead of the clock (an op that released the GIL inside the
     emulator); ``run_delay_s`` the emulator's time the box descheduled; ``ahead_stalls`` the times
-    a thread waited for the deployment's bound; ``settle_overruns`` state changes that broke a
-    settle window; ``meet_skew_s`` the widest gap between ranks' streams at a collective."""
+    a thread waited for the deployment's bound; ``late_deliveries`` messages polled within 1 ms
+    of a move past W, so maybe moved past; ``meet_skew_s`` the widest gap between ranks' streams
+    at a collective; ``parks`` the times the process counted as blocked with threads in waits
+    unknown to the emulator, and ``unparks_by_look`` those a look ended, its work having run
+    hidden for up to that look; ``gate_waits`` looks that found its own tasks still on a CPU."""
     import atexit
     import json
 
@@ -200,10 +203,14 @@ def _report_at_exit(path: str) -> None:
     start, real = clock.now(), clock._real()
 
     def write():
-        if clock.DEFAULT.kernels == 0:
-            return  # a process that drove no GPU (API server, conductor)
+        if clock.FAST and clock.DEFAULT.kernels == 0:
+            return  # nothing to say of a process that drove no GPU on the real clock
+        import multiprocessing
+
+        role = (multiprocessing.current_process().name if "spawn_main" in " ".join(sys.orig_argv)
+                else " ".join(a for a in sys.orig_argv[1:4] if not a.startswith("/"))[:80])
         row = {
-            "pid": os.getpid(), "gpu": os.environ.get("MSTAR_SIM_GPU"),
+            "pid": os.getpid(), "process": role, "gpu": os.environ.get("MSTAR_SIM_GPU"),
             "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
             "wall_s": round(clock._real() - real, 3), "clock_s": round(clock.now() - start, 3),
             "device_busy_s": round(clock.DEFAULT.busy, 3),
@@ -214,8 +221,11 @@ def _report_at_exit(path: str) -> None:
             **{k: round(v, 3) if isinstance(v, float) else v for k, v in clock.STATS.items()
                if k not in ("replays", "calls")},
             "slept_s": round(waits.REPORT["slept_s"], 3), "late_resumes": waits.REPORT["late_resumes"],
-            "ahead_stalls": waits.REPORT["ahead_stalls"], "settle_overruns": waits.REPORT["settle_overruns"],
-            "meet_skew_s": round(waits.REPORT["meet_skew_s"], 6),
+            "ahead_stalls": waits.REPORT["ahead_stalls"], "late_deliveries": waits.REPORT["late_deliveries"],
+            "meet_skew_s": round(waits.REPORT["meet_skew_s"], 6), "mover_s": round(waits.REPORT["mover_s"], 3),
+            "scan_s": round(waits.REPORT["scan_s"], 3), "scans": waits.REPORT["scans"],
+            "settle_deferrals": waits.REPORT["settle_deferrals"], "gate_waits": waits.REPORT["gate_waits"],
+            "parks": waits.REPORT["parks"], "unparks_by_look": waits.REPORT["unparks_by_look"],
             "jump_blockers": dict(sorted(waits.REPORT["jump_blockers"].items(), key=lambda kv: -kv[1])[:8]),
         }
         with open(path, "a") as f:

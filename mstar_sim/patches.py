@@ -14,7 +14,6 @@ from outside.
 - ``worker_flag``: a model built on the CPU in a worker allocates nothing.
 - ``rust_poll``: mstar's poll for other processes is a wait the clock knows
   (:mod:`mstar_sim.waits`).
-- ``rust_frontend``: the Rust frontend's work takes time on the deployment's clock.
 - ``no_uvloop``: uvloop's loop waits where the clock can't see, so asyncio's stands in.
 - ``swap_or_assign``, ``relax_blockwise_scaled_mm_meta``: torch's own (every process, mstar
   or not; ``mstar_sim.device.install`` applies them).
@@ -351,8 +350,8 @@ def rust_poll() -> None:
     """The Rust communicator on the deployment's clock (:mod:`mstar_sim.waits`). Its poll is a
     wait on other processes: its thread counts as blocked, a write to its eventfd
     (``EventWakeup``) wakes it, the mover's eventfd can end it, and its timeout is a host
-    deadline that holds until the clock reaches it. Its sends count as in flight to their
-    receiver until a poll there finds nothing."""
+    deadline that holds until the clock reaches it. A send reads the clock, so a thread past
+    the bound waits before it sends."""
     communicator = importlib.import_module("mstar.communication.rust_communicator").RustZMQCommunicator
     for name in ("__init__", "_poll_once", "send", "try_send_bytes"):
         _require(communicator, name)
@@ -363,60 +362,36 @@ def rust_poll() -> None:
     init, poll_once = communicator.__init__, communicator._poll_once
     send, try_send = communicator.send, communicator.try_send_bytes
 
-    def initialized(self, my_id, *args, **kwargs):
-        init(self, my_id, *args, **kwargs)
+    def initialized(self, *args, **kwargs):
+        init(self, *args, **kwargs)
         self._inner.register_wakeup_fd(waits._wakefd[0])
-        waits.TABLE.answer_to(my_id)
 
     def polled(self, timeout_ms):
-        sent = waits.TABLE.sent_to_me()
-        kind = poll_once(self, 0)
-        if kind != "timeout" and not (kind == "wake" and waits.poked()):
-            return kind
-        waits.TABLE.take(sent)
         if timeout_ms <= 0:
-            return "timeout"
+            return poll_once(self, timeout_ms)
 
         def poll(seconds):
             kind = poll_once(self, max(1, math.ceil(seconds * 1000)))
-            return None if kind == "timeout" or (kind == "wake" and waits.poked()) else kind
+            return None if kind == "timeout" or (kind == "wake" and waits._poked) else kind  # (the mover's)
 
         event = getattr(self, "event", None)
-        return waits.polling(poll, event.fd if event is not None else None, timeout_ms / 1000) or "timeout"
+        kind = waits.polling(poll, event.fd if event is not None else None, timeout_ms / 1000)
+        if kind == "msg":
+            waits.delivered()
+        return kind or "timeout"
 
     def sending(self, entity_id, msg):
         waits.read()
-        waits.TABLE.sent(entity_id)
         send(self, entity_id, msg)
 
     def sending_bytes(self, entity_id, data):
         waits.read()
-        waits.TABLE.sent(entity_id)
         return try_send(self, entity_id, data)
 
     communicator.__init__ = initialized
     communicator._poll_once = polled
     communicator.send = sending
     communicator.try_send_bytes = sending_bytes
-
-
-def rust_frontend() -> None:
-    """The Rust frontend is a native process no patch reaches: the process that starts it counts
-    it as a thread of its own while it uses a CPU (:func:`mstar_sim.waits.watch`)."""
-    frontend = importlib.import_module("mstar.api_server.rust_frontend")
-    _require(frontend, "launch_rust_server")
-    from mstar_sim import clock, waits
-
-    if clock.FAST:
-        return
-    launch = frontend.launch_rust_server
-
-    def launched(*args, **kwargs):
-        proc = launch(*args, **kwargs)
-        waits.watch(proc.pid)
-        return proc
-
-    frontend.launch_rust_server = launched
 
 
 def no_uvloop() -> None:
@@ -530,4 +505,4 @@ SKIPPED: list[tuple[str, str]] = []
 
 
 PATCHES = (cap_captures, no_graphs, kv_scatter, conv_kernels, header_only_weights, worker_flag, rust_poll,
-           rust_frontend, no_uvloop)
+           no_uvloop)

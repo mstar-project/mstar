@@ -24,8 +24,6 @@ import hashlib
 import inspect
 import itertools
 import operator
-import os
-import resource
 import sys
 import threading
 import time
@@ -98,21 +96,19 @@ def _pairs(rows: list[list[int]]) -> bool:
             and all(send[i][j] == recv[j][i] for i in range(size) for j in range(size)))
 
 
-def _abort() -> None:
-    """Abort, as NCCL's watchdog does, after the stacks ``faulthandler`` prints: without a
-    core file, which would hold only the emulator."""
-    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
-    os.abort()
-
-
 @contextmanager
-def _waiting():
+def _waiting(ranks=None):
     """The host waits for its peers, as NCCL's host doesn't: the wait is blocked time, so the
-    clock stands still through it (:func:`mstar_sim.waits.blocked`)."""
-    from mstar_sim import waits
+    clock stands still through it (:func:`mstar_sim.waits.blocked`). At a meet of ``ranks`` it
+    stands aside from the deployment's bound until they have all come (:meth:`Table.bound`)."""
+    from mstar_sim import table, waits
 
-    with waits.blocked(waits.MEET):
-        yield
+    if ranks is None:
+        with waits.blocked():
+            yield
+    else:
+        with waits.blocked(waits.MEET, group=table.group_word(ranks)):
+            yield
 
 
 def _watched(wait, where: str, mine: list[int], replay: bool = False) -> None:
@@ -128,7 +124,7 @@ def _watched(wait, where: str, mine: list[int], replay: bool = False) -> None:
               file=sys.stderr, flush=True)
         if replay:
             threading.Event().wait()
-        _abort()
+        clock.abort()
 
 
 def _timeout(group) -> datetime.timedelta:
@@ -151,7 +147,7 @@ def _let_go(group, *tensors: torch.Tensor) -> None:
             print(f"mstar_sim: rank {dist.get_rank()}: gloo's worker still holds a finished collective's tensors"
                   f" at the group's timeout ({_timeout(group)}): this torch's gloo keeps its work past the wait.",
                   file=sys.stderr, flush=True)
-            _abort()
+            clock.abort()
         time.sleep(0)
 
 
@@ -169,7 +165,7 @@ def _meet(group, mine: list[int], replay: bool = False) -> list[list[int]]:
     timeline = clock.current_timeline()
     sent = torch.tensor([*mine, int(timeline.free_at * 1e9)], dtype=torch.int64, device="cpu")  # (a row is integers)
     gathered = torch.empty(len(ranks) * len(sent), dtype=torch.int64, device="cpu")  # whatever the default
-    with _waiting():
+    with _waiting(ranks):
         # straight to the backend: torch's public function logs a failure through the group's
         # registry entry, which the fused-AR channel hasn't, and turns the timeout into a ValueError
         _watched(lambda: group._allgather_base(gathered, sent).wait(), where, mine, replay)
@@ -188,7 +184,7 @@ def _meet(group, mine: list[int], replay: bool = False) -> list[list[int]]:
                " inside one by one, so it may run on, hang or corrupt data"
                if any(_PRIMITIVES[d[0]] == "Graph" for d in rows) else "NCCL would hang or corrupt data")
         print(f"{where}: the ranks' collectives don't pair ({why}):{lines}", file=sys.stderr, flush=True)
-        _abort()
+        clock.abort()
     return rows
 
 
@@ -290,7 +286,7 @@ def _receive(a: dict, group, tensor: torch.Tensor, mine: int) -> _Posted:
         if theirs[1:3] != desc[1:3]:
             print(f"{where}: the ranks' sends don't pair (NCCL would hang or corrupt data): {_describe(desc)} "
                   f"received {_describe(theirs)}", file=sys.stderr, flush=True)
-            _abort()
+            clock.abort()
         values = theirs[_VALUES] & mine
         if theirs[_VALUES] & HELD:
             _watched(lambda: dist.recv(into, a["src"], group, theirs[3], a["group_src"]), where, desc)
@@ -407,7 +403,8 @@ def _collective(name: str, family: str, primitive: str | None):
                 with clock.computing():
                     a[first] = a[first]._data.clone()
                 args, kwargs = bound.args, bound.kwargs
-            with _waiting():  # for the peers, where NCCL's host call returns at enqueue
+            # for the peers, as at a meet, where NCCL's host call returns at enqueue
+            with _waiting(dist.get_process_group_ranks(group or dist.group.WORLD)):
                 work = real(*device.tree_map(device._unwrap, args), **device.tree_map(device._unwrap, kwargs))
                 if work is None and outputs and not written:
                     _let_go(group or dist.group.WORLD, a[first])
@@ -473,6 +470,10 @@ def install() -> None:
         if "backend" in kwargs:
             kwargs["backend"] = _gloo(kwargs["backend"])
         cuda.device_index(kwargs.pop("device_id", None))  # refused as CUDA would; no device to bind a gloo group to
+        if not clock.FAST:
+            from mstar_sim import waits
+
+            waits.TABLE.rank()
         return init(*args, **kwargs)
 
     dist.init_process_group = init_process_group
