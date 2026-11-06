@@ -874,7 +874,13 @@ A resource can also store in a different dtype from the one its nodes compute in
 in fp32 with ``PagedKVConfig(..., dtype=torch.bfloat16)`` gets bf16 pages, and its
 attention is planned in bf16. ``dtype`` is a plain storage dtype (float32, bfloat16 or
 float16): an fp8 or fp4 cache needs scales and a kernel that reads them, so a quantized
-dtype is a load error here.
+dtype is a load error here. A quantized KV cache is
+``PagedKVConfig(..., quant=KVQuantConfig(...))``, with ``dtype`` still the dtype of the K/V
+entering it; :doc:`serving` describes the formats and scales. A layer reads such pages
+through ``KVManager.read_kv``, which dequantizes, and writes them through ``write_kv``:
+``write_target`` and ``write_slots`` refuse a quantized cache, since a fused kernel would
+store raw values. With static scales, attention needs the layer it runs (``set_layer_idx``,
+or ``run(layer_idx=)``) to apply them.
 
 RoPE has no storage dtype on CUDA. Its ``rope_dtype`` and ``rope_table_dtype`` set the
 rotation's math and table; on XPU, the cos/sin cache is stored in ``rope_dtype``, else in
@@ -2473,7 +2479,8 @@ that a misspelled setting is never silently ignored:
      - Accepts
    * - ``KVSpec`` with ``PagedKVConfig``
      - ``max_num_pages``, ``page_size``, ``max_seq_len``, ``cpu_offload_pages``,
-       ``prefix_cache``, ``prefix_cache_salt``, ``dtype``
+       ``prefix_cache``, ``prefix_cache_salt``, ``dtype``, ``quant`` (fp8 pages; see
+       :doc:`serving`)
    * - ``KVSpec`` with ``RingKVConfig``
      - ``num_sessions``, ``dtype``
    * - ``BoundedKVSpec``

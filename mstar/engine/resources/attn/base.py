@@ -19,6 +19,7 @@ from mstar.engine.resources.attn.wrappers import (
 from mstar.engine.resources.base import AttentionResource, EngineResourceInfo
 from mstar.engine.resources.kv.config import KVConfig, KVGroup, PagedKVConfig, RingKVConfig
 from mstar.engine.resources.kv.keys import fingerprint
+from mstar.engine.resources.kv.quant import kv_scales_for
 from mstar.platforms import current_platform
 
 logger = logging.getLogger(__name__)
@@ -29,6 +30,15 @@ _BACKEND_KV_CONFIG: dict[AttnBackend, type[KVConfig]] = {
     AttnBackend.FLEX: RingKVConfig,
     AttnBackend.XPU_PAGED: PagedKVConfig,
 }
+
+
+def refuse_quantized_kv(kv_config: KVConfig, what: str) -> None:
+    """Raise if ``kv_config`` is quantized: ``what`` reads no quantized pages."""
+    if kv_config.quant is not None:
+        raise ValueError(
+            f"{what} reads no quantized KV, but the cache stores {kv_config.quant.format!r}; "
+            "use the flashinfer or dense backend, or drop the KV quant"
+        )
 
 
 def resolve_attn_backend(backend: AttnBackend, device: torch.device) -> AttnBackend:
@@ -165,11 +175,13 @@ class AttentionManager(AttentionResource):
                         info.device, DensePrefixedPrefillWrapper, FlashInferPrefixedPrefillWrapper, "Attention",
                     ),
                     flashinfer_backend=spec.config.flashinfer_backend,
+                    kv_scales=kv_scales_for(kv_config, info),
                 )
             backend = resolve_attn_backend(AttnBackend.AUTO, info.device)
             _warn_dense_fallback(reason, backend)
 
         if backend == AttnBackend.FLASHINFER_MLA:
+            refuse_quantized_kv(kv_config, "MLA attention")
             from mstar.engine.resources.attn.flashinfer_mla import FlashInferMLAManager
 
             return FlashInferMLAManager(
@@ -195,9 +207,11 @@ class AttentionManager(AttentionResource):
                 sliding_window=spec.config.sliding_window,
                 decode_fmha=spec.config.decode_fmha,
                 layers=spec.config.layers,
+                kv_scales=kv_scales_for(kv_config, info),
             )
 
         if backend == AttnBackend.FLEX:
+            refuse_quantized_kv(kv_config, "flex attention")
             from mstar.engine.resources.attn.flex import FlexAttentionManager
 
             return FlexAttentionManager(
@@ -208,6 +222,7 @@ class AttentionManager(AttentionResource):
             )
 
         if backend == AttnBackend.XPU_PAGED:
+            refuse_quantized_kv(kv_config, "xpu_paged attention")
             from mstar.engine.resources.attn.xpu import (
                 XPUPagedAttentionManager,
                 _xpu_paged_unavailable_reason,

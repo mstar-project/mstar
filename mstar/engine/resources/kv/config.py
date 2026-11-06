@@ -9,10 +9,11 @@ from abc import ABC, abstractmethod
 from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from enum import Enum
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
 
+from mstar.engine.resources.kv.quant import KVQuantConfig, parse_yaml_kv_quant
 from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig, RoutingContext, parse_yaml_dtype
 from mstar.engine.resources.step import ResourceStep
 
@@ -26,6 +27,10 @@ class KVLayout(Enum):
     # ``[num_layers, max_num_pages, page_size, kv_lora_rank + qk_rope_head_dim]``.
     # No K/V axis and a single (replicated) KV head; only query heads shard.
     MLA = "MLA"
+
+
+# tells an omitted YAML key from an explicit null
+_UNSET = object()
 
 
 @dataclass(kw_only=True)
@@ -45,8 +50,11 @@ class KVConfig(ABC):
     num_kv_heads: int
     head_dim: int
     num_qo_heads: int | None = None
-    # storage dtype of the pages or ring; None takes the nodes' resolved dtype
+    # dtype of the K/V entering the cache, and of the pages unless ``quant`` stores them
+    # otherwise; None takes the nodes' resolved dtype
     dtype: torch.dtype | None = None
+    # how the pages store K/V (`KVQuantConfig`); None stores them in ``dtype``
+    quant: KVQuantConfig | None = None
 
     def __post_init__(self):
         if self.num_qo_heads is None:
@@ -235,10 +243,14 @@ class PagedKVConfig(KVConfig):
         prefix_cache: bool | None = None,
         prefix_cache_tp: bool | None = None,
         dtype: str | torch.dtype | None = None,
+        quant: Any = _UNSET,
     ) -> None:
-        """How much cache this deployment gets, how it is cut up, and its dtype."""
+        """How much cache this deployment gets, how it is cut up, its dtype and quantization."""
         if dtype is not None:
             self.dtype = parse_yaml_dtype(dtype)
+        if quant is not _UNSET:
+            # null removes the model's
+            self.quant = parse_yaml_kv_quant("kv", quant)
         for name, value in (
             ("max_num_pages", max_num_pages),
             ("page_size", page_size),
@@ -312,6 +324,8 @@ class RingKVConfig(KVConfig):
         self, num_sessions: int | None = None, dtype: str | torch.dtype | None = None, **kwargs,
     ) -> None:
         """``num_sessions`` and ``dtype`` only. Nothing else here is a deployment knob."""
+        if "quant" in kwargs:
+            raise ValueError("ring KV cannot be quantized: no ring attention backend reads a quantized cache")
         if kwargs:
             raise TypeError(
                 "ring KV geometry is a checkpoint fact, not a deployment tunable; "
@@ -638,6 +652,9 @@ class KVSpec(NodeResourceSpec):
     def apply_yaml_overrides(self, **kwargs):
         """Forwarded to the config: which keys are legal is a property of the
         storage strategy, so the config answers for them."""
+        if "quant" in kwargs:
+            # parsed here so an error names the resource
+            kwargs["quant"] = parse_yaml_kv_quant(self.resource_key, kwargs["quant"])
         self.config.apply_yaml_overrides(**kwargs)
 
     def keeps_prefix_cache(self, world_size: int, checkpoint_named: bool) -> bool:

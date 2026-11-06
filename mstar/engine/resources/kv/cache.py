@@ -10,6 +10,7 @@ import triton
 import triton.language as tl
 
 from mstar.engine.resources.kv.config import KVLayout, PagedKVConfig
+from mstar.engine.resources.kv.quant import KVQuantConfig, KVScales, dequantize_kv, quantize_kv
 
 
 class PageAllocator:
@@ -86,10 +87,12 @@ def on_pages(groups: Sequence[GroupPages], pages: list[int]) -> tuple[GroupPages
 @triton.jit
 def _kv_scatter_nhd_kernel(
     layer_ptr, k_ptr, v_ptr, page_idx_ptr, cache_idx_ptr,
+    k_scale_ptr, v_scale_ptr,
     stride_page, stride_kv, stride_slot,
     stride_kt, stride_kh, stride_vt, stride_vh,
     num_pages, page_size,
     HEADS: tl.constexpr, HEAD_DIM: tl.constexpr, BLOCK: tl.constexpr,
+    QUANT: tl.constexpr, HAS_SCALE: tl.constexpr, QMAX: tl.constexpr,
 ):
     token = tl.program_id(0).to(tl.int64)
     page = tl.load(page_idx_ptr + token).to(tl.int64)
@@ -103,6 +106,15 @@ def _kv_scatter_nhd_kernel(
     dst = layer_ptr + page * stride_page + slot * stride_slot + offs
     k = tl.load(k_ptr + token * stride_kt + head * stride_kh + dim, mask=mask)
     v = tl.load(v_ptr + token * stride_vt + head * stride_vh + dim, mask=mask)
+    if QUANT:
+        # as quantize_kv: fp32 divide by the head's scale, saturate, round to nearest
+        k = k.to(tl.float32)
+        v = v.to(tl.float32)
+        if HAS_SCALE:
+            k = k / tl.load(k_scale_ptr + head, mask=mask, other=1.0)
+            v = v / tl.load(v_scale_ptr + head, mask=mask, other=1.0)
+        k = tl.minimum(tl.maximum(k, -QMAX), QMAX)
+        v = tl.minimum(tl.maximum(v, -QMAX), QMAX)
     tl.store(dst, k.to(layer_ptr.dtype.element_ty), mask=mask)
     tl.store(dst + stride_kv, v.to(layer_ptr.dtype.element_ty), mask=mask)
 
@@ -121,7 +133,11 @@ def _kv_scatter_nhd_eager(
     layer: torch.Tensor,
     k: torch.Tensor, v: torch.Tensor,
     page_idx: torch.Tensor, cache_idx: torch.Tensor,
+    quant: bool = False,
+    k_scale: torch.Tensor | None = None, v_scale: torch.Tensor | None = None,
 ) -> None:
+    """``quant``: the pages store a quantized format, written as ``quantize_kv`` would, with
+    this layer's per-head ``k_scale``/``v_scale`` or unit scales when None."""
     tokens, heads, head_dim = k.shape
     if (
         layer.is_cuda and tokens > 0
@@ -134,19 +150,29 @@ def _kv_scatter_nhd_eager(
         and all(t.device == layer.device for t in (k, v, page_idx, cache_idx))
     ):
         block = triton.next_power_of_2(heads * head_dim)
+        has_scale = k_scale is not None
         # One launch for K and V instead of two index_put kernels.
         _kv_scatter_nhd_kernel[(tokens,)](
             layer, k, v, page_idx, cache_idx,
+            k_scale if has_scale else k, v_scale if has_scale else v,
             layer.stride(0), layer.stride(1), layer.stride(2),
             k.stride(0), k.stride(1), v.stride(0), v.stride(1),
             layer.shape[0], layer.shape[2],
             HEADS=heads, HEAD_DIM=head_dim, BLOCK=block,
+            QUANT=quant, HAS_SCALE=has_scale,
+            QMAX=float(torch.finfo(layer.dtype).max) if quant else 0.0,
             # On H100, more warps only pay off past a 2048-wide block (32+ KV heads).
             num_warps=max(4, min(16, block // 512)),
         )
         return
-    layer[page_idx, 0, cache_idx] = k.to(layer.dtype)
-    layer[page_idx, 1, cache_idx] = v.to(layer.dtype)
+    if not quant:
+        layer[page_idx, 0, cache_idx] = k.to(layer.dtype)
+        layer[page_idx, 1, cache_idx] = v.to(layer.dtype)
+        return
+    # as bytes: fp8 has no index_put on CPU
+    pages = layer.view(torch.uint8)
+    pages[page_idx, 0, cache_idx] = quantize_kv(k, k_scale, layer.dtype).view(torch.uint8)
+    pages[page_idx, 1, cache_idx] = quantize_kv(v, v_scale, layer.dtype).view(torch.uint8)
 
 
 class KVCache:
@@ -157,9 +183,25 @@ class KVCache:
         self,
         cfg: PagedKVConfig,
         device: torch.device,
-        dtype=torch.bfloat16
+        dtype=torch.bfloat16,
+        quant: KVQuantConfig | None = None,
+        scales: KVScales | None = None,
     ):
+        """``dtype`` is the K/V's unquantized dtype; ``quant`` stores them in its format, with
+        ``scales`` when its scales are static."""
         self.config = cfg
+        self.quant = quant
+        self.scales = scales
+        # what writes take and reads return
+        self.value_dtype = dtype
+        if (quant is not None and quant.scales == "static") != (scales is not None):
+            raise ValueError("static KV quantization needs scales, and only it takes them")
+        if quant is not None and cfg.layout != KVLayout.NHD:
+            raise ValueError(f"a {cfg.layout.value} KV cache cannot be quantized: its kernels read no scales")
+        # the pages' element type
+        dtype = quant.value_dtype if quant is not None else dtype
+        # computed once: it hashes the scales file
+        self._storage_id = str(dtype) if quant is None else f"{dtype}/{quant.digest()}"
         # layer -> its view; set only when the pool has groups of two page sizes
         self._layers: list[torch.Tensor] | None = None
         if len(cfg.groups) > 1:
@@ -226,7 +268,19 @@ class KVCache:
 
     @property
     def dtype(self) -> torch.dtype:
+        """The pages' storage dtype."""
         return self.tensor.dtype
+
+    @property
+    def storage_id(self) -> str:
+        """Names how the pages encode K/V (dtype, quantization, scales), so a prefix
+        cache never matches, and a transfer refuses, pages encoded otherwise."""
+        return self._storage_id
+
+    def _layer_scales(self, layer_idx: int) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        if self.scales is None:
+            return None, None
+        return self.scales.k[layer_idx], self.scales.v[layer_idx]
 
     @property
     def nbytes(self) -> int:
@@ -308,7 +362,15 @@ class KVCache:
             raise NotImplementedError(
                 f"read_tokens is not implemented for layout {self.layout}."
             )
-        return self.layer_view(layer_idx)[page_idx, :, cache_idx]
+        if self.quant is None:
+            return self.layer_view(layer_idx)[page_idx, :, cache_idx]
+        # gathered as bytes, as fp8 has no indexing on CPU, then dequantized
+        out = self.layer_view(layer_idx).view(torch.uint8)[page_idx, :, cache_idx].view(self.dtype)
+        k_scale, v_scale = self._layer_scales(layer_idx)
+        return torch.stack([
+            dequantize_kv(out[:, 0], k_scale, self.value_dtype),
+            dequantize_kv(out[:, 1], v_scale, self.value_dtype),
+        ], dim=1)
 
     def write_tokens(
         self, layer_idx: int,
@@ -332,6 +394,7 @@ class KVCache:
             )
         _kv_scatter_nhd_eager(
             self.layer_view(layer_idx), k, v, page_idx, cache_idx,
+            self.quant is not None, *self._layer_scales(layer_idx),
         )
         if return_tensor:
             return self.read_tokens(layer_idx, page_idx, cache_idx)
@@ -378,15 +441,17 @@ class KVCache:
         src = torch.as_tensor(src_pages, dtype=torch.long, device=self.device)
         dst = torch.as_tensor(dst_pages, dtype=torch.long, device=self.device)
         # The gather is materialized before the scatter, so pages may appear
-        # in both src and dst.
-        self.tensor[:, dst] = self.tensor[:, src]
+        # in both src and dst. Moved as bytes: fp8 has no indexing on CPU.
+        pages = self.tensor.view(torch.uint8) if self.quant is not None else self.tensor
+        pages[:, dst] = pages[:, src]
 
     def copy_slots(self, src_page: int, dst_page: int, end: int) -> None:
         """Copy tokens [0, end) of one page onto another, every layer, both K and V."""
         self._check_ungrouped("copy_slots")
         # Index with slices rather than tensors. Slices need no copy from the host,
         # so the copy doesn't wait on the stream.
-        self.tensor[:, dst_page, :, :end] = self.tensor[:, src_page, :, :end]
+        pages = self.tensor.view(torch.uint8) if self.quant is not None else self.tensor
+        pages[:, dst_page, :, :end] = pages[:, src_page, :, :end]
 
     def chunk_view(
         self, layer_idx: int, page_idx: int,

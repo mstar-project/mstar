@@ -1,5 +1,6 @@
 """Paged attention through FlashInfer's prefill/decode wrappers."""
 
+import logging
 from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
@@ -24,9 +25,12 @@ from mstar.engine.resources.attn.wrappers import (
 from mstar.engine.resources.base import CGSlotKey
 from mstar.engine.resources.kv.config import PagedKVConfig
 from mstar.engine.resources.kv.plan import KVPlanOutputs
+from mstar.engine.resources.kv.quant import KVScales, layer_kv_scales
 from mstar.engine.resources.spec import CombinedSplit
 from mstar.engine.resources.step import SlotLease, StepContext
 from mstar.utils.profiler import PhaseLaps
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from mstar.engine.resources.resident import CapturedResidentStep
@@ -46,7 +50,11 @@ class FlashInferManager(AttentionManager):
         sliding_window: int | None = None,
         decode_fmha: bool = False,
         layers: tuple[int, ...] | None = None,
+        kv_scales: KVScales | None = None,
     ):
+        """A quantized ``kv_config`` (``PagedKVConfig.quant``) is read by FlashInfer's kernels
+        for q in ``dtype`` over pages in the format's dtype, with the static ``kv_scales``
+        (`kv_scales_for`) folded in around them."""
         self._kv_cache_name = kv_cache
         self._splits = {split.combined_walk: split for split in splits}
         self._max_rows_in_combined = max_rows_in_combined or {}
@@ -77,6 +85,8 @@ class FlashInferManager(AttentionManager):
         self._preplanned = False
 
         self._kv_config = kv_config
+        # per layer, K's scales folded into q and V's into the output; None for unit scales
+        self._layer_scales = layer_kv_scales(kv_scales, kv_config.num_qo_heads)
         check_flashinfer_head_dim(kv_config.head_dim, device)     # at load, not at the first plan
         self._wrapper_kv_kwargs = dict(
             num_qo_heads=kv_config.num_qo_heads,
@@ -85,12 +95,17 @@ class FlashInferManager(AttentionManager):
             page_size=self._group.page_size,
             max_num_pages=kv_config.num_units,
             device=device,
-            backend=backend
+            backend=backend,
+            # the pages' dtype when quantized; FlashInfer then runs its kernels that take
+            # q in `dtype` over fp8 pages (FA2 prefill, paged decode) on Hopper and Blackwell
+            kv_dtype=kv_config.quant.value_dtype if kv_config.quant is not None else None,
         )
         self._decode_tensor_cores = decode_tensor_cores
+        if decode_fmha and kv_config.quant is not None:
+            logger.info("attention over KV %s: quantized pages decode on the paged kernel, not fmha", kv_cache)
         self._decode_fmha = (
             decode_fmha and dtype == torch.bfloat16 and sliding_window is None
-            and fmha_decode_applies(device)
+            and kv_config.quant is None and fmha_decode_applies(device)
         )
 
         self._workspaces = WorkspacePool(device, owner=kv_cache)
@@ -368,7 +383,21 @@ class FlashInferManager(AttentionManager):
                     f"KV {self._kv_cache_name!r} has more than one group, so its attention needs the "
                     "layer it runs: set_layer_idx, or run(layer_idx=)"
                 )
+        scales = None
+        if self._layer_scales is not None:
+            if layer_idx is None:
+                layer_idx = self._default_layer_idx
+            if layer_idx is None:
+                raise ValueError(
+                    f"KV {self._kv_cache_name!r} has static scales per layer, so its attention needs "
+                    "the layer it runs: set_layer_idx, or run(layer_idx=)"
+                )
+            scales = self._layer_scales[layer_idx]
+            # q . (k_stored * s) == (q * s) . k_stored, per KV head; V's scale moves to the output
+            q = (q.float() * scales.k_qo).to(q.dtype)
         o = self._current_plan_states[label].run(q, kv_cache_layer)
+        if scales is not None:
+            o = o.float() * scales.v_qo
         if o.dtype != q.dtype:
             o = o.to(q.dtype)
         return o

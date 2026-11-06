@@ -48,6 +48,7 @@ from mstar.engine.resources.kv.plan import (
     group_by_plan_label,
 )
 from mstar.engine.resources.kv.prefix_index import PrefixIndex
+from mstar.engine.resources.kv.quant import KVObserver, KVScales, kv_scales_for, observe_dir
 from mstar.engine.resources.kv.transfer import KVTransferInfo, KVTransferManager, TransferEngineInfo
 from mstar.engine.resources.step import (
     ADMIT_OK,
@@ -551,7 +552,10 @@ class KVManager(AttentionResource):
         needs_remote_transfer: bool = False,
         leads: bool = True,
         nodes: Collection[str] | None = None,
+        kv_scales: KVScales | None = None,
     ):
+        """``dtype`` is the K/V's unquantized dtype; a ``cfg.quant`` cache stores them in its
+        format, with ``kv_scales`` (`kv_scales_for`) when its scales are static."""
         self.config = cfg
         if len(cfg.groups) > 1 and needs_remote_transfer:
             raise ValueError(
@@ -576,10 +580,23 @@ class KVManager(AttentionResource):
                     "and a read from another group would take pages outside rank 0's order. Serve "
                     "the nodes from one group or set prefix_cache_tp to false."
                 )
-        self.kv_cache = KVCache(
-            cfg, device, dtype
-        )
+        self.kv_cache = KVCache(cfg, device, dtype, quant=cfg.quant, scales=kv_scales)
         self.name = name
+        if cfg.quant is not None:
+            logger.info(
+                "KV %s: %s pages, %s scales, %.2f GiB (%.2f GiB unquantized)", name, cfg.quant.format,
+                cfg.quant.scales, self.kv_cache.nbytes / 2**30,
+                self.kv_cache.tensor.numel() * dtype.itemsize / 2**30,
+            )
+        self._observer = None
+        if (out_dir := observe_dir()) is not None:
+            tp = joint_comm_group.tp_group if joint_comm_group is not None else None
+            if joint_comm_group is not None and joint_comm_group.sp_group.world_size > 1:
+                raise ValueError(f"KV {name}: MSTAR_KV_OBSERVE records per TP slice of the heads; SP is not supported")
+            self._observer = KVObserver(
+                out_dir, name, cfg.num_layers, cfg.num_kv_heads, cfg._unsharded_kv_heads,
+                tp.rank if tp is not None else 0, tp.world_size if tp is not None else 1, device,
+            )
         self._needs_remote_transfer = needs_remote_transfer
 
         self._arena = new_page_arena(cfg.num_units)
@@ -747,6 +764,7 @@ class KVManager(AttentionResource):
             joint_comm_group=info.joint_comm_group,
             transfer_engine_info=info.transfer_engine_info,
             dtype=info.resolve_dtype(spec.config.dtype, spec.resource_key),
+            kv_scales=kv_scales_for(spec.config, info),
             needs_remote_transfer=info.needs_remote_transfer,
             leads=spec.leader is None or spec.leader in info.nodes,
             nodes=info.nodes,
@@ -1696,7 +1714,7 @@ class KVManager(AttentionResource):
     def fingerprint(self) -> bytes:
         return fingerprint(
             self.config.layout.value, self.config.tokens_per_page,
-            self.kv_cache.tensor.dtype, self._world_size,
+            self.kv_cache.storage_id, self._world_size,
             self.config.prefix_cache_salt,
         )
 
@@ -4113,6 +4131,8 @@ class KVManager(AttentionResource):
 
     def remove_request(self, rid: str):
         self._touch_plan_cache(rid)
+        if self._observer is not None:
+            self._observer.save()
         with self._lock:
             # its waiting tokens first, before the handle can name another request
             self._drain_chain_backlog(rid)
@@ -4297,7 +4317,20 @@ class KVManager(AttentionResource):
             )
 
     def cleanup(self):
+        if self._observer is not None:
+            self._observer.save(force=True)
         self._transfer.cleanup()
+
+    def seal_capture_buffers(self) -> None:
+        if self._observer is not None:
+            # capture sizing and warmup wrote dummy inputs
+            self._observer.reset()
+        super().seal_capture_buffers()
+
+    @property
+    def quantized(self) -> bool:
+        """Whether the pages store a quantized format (``PagedKVConfig.quant``)."""
+        return self.kv_cache.quant is not None
 
     def _ensure_label(self, rid: str, label: str) -> CacheStream:
             if label not in self._streams[rid]:
@@ -4813,6 +4846,9 @@ class KVManager(AttentionResource):
             label = self._default_label
         if self.kv_cache.layout != KVLayout.NHD:
             raise NotImplementedError(f"write_target is not implemented for layout {self.kv_cache.layout}")
+        if self.quantized:
+            # a fused kernel would store unscaled, unsaturated values; `write_kv` quantizes
+            raise NotImplementedError(f"KV {self.name} is quantized: write through write_kv")
         state = self._current_plan_states[label, self._layer_group[layer_idx]]
         if state.ready is not None:
             torch.cuda.current_stream().wait_event(state.ready)
@@ -4856,6 +4892,8 @@ class KVManager(AttentionResource):
         are the slot's static buffers, so a graph replays with the next step's slots."""
         if len(self._groups) > 1:
             raise ValueError(f"KV {self.name}: a pool with full and sliding layers writes through write_kv only")
+        if self.quantized:
+            raise NotImplementedError(f"KV {self.name} is quantized: write through write_kv")
         if label is None:
             label = self._default_label
         plan_state = self._current_plan_states[label, 0]
@@ -4883,6 +4921,8 @@ class KVManager(AttentionResource):
         # an eager write may carry only the real rows; the padding rows' tokens
         # come last in the plan (on SINK_PAGE) and are skipped
         n = min(plan_state.total_tokens, k.shape[0])
+        if self._observer is not None and v is not None:
+            self._observer.observe(layer_idx, k[:n], v[:n])
         return self.kv_cache.write_tokens(
             layer_idx=layer_idx,
             k=k[:n], v=None if v is None else v[:n],

@@ -735,6 +735,13 @@ Worker scheduling
      - ``0``
      - ``N > 0``: every N iterations log per-phase p50/p95/mean of the
        worker main loop (speculate, await_gpu, submit_spec, ...).
+   * - ``MSTAR_KV_OBSERVE``
+     - unset
+     - A directory: every paged KV cache records the per-layer, per-head amax of the K/V
+       it stores, into ``<dir>/<resource>.rank<r>.pt`` (``observe_dir`` in
+       ``mstar.engine.resources.kv.quant``), for
+       ``python -m mstar.engine.resources.kv.calibrate`` to turn into static fp8 KV scales
+       (see :doc:`serving`). Calibration only: it adds a reduction per layer per step.
    * - ``MSTAR_KV_DEBUG_ASSERTS``
      - ``0``
      - ``1``: after every ``admit``, ``commit``, ``reset_request``, ``remove_request``
