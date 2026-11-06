@@ -2663,8 +2663,8 @@ page. Attention runs on each rank's slots and merges the partials across the par
   ``P = tp / num_kv_heads``, so TP must be a larger multiple of the KV heads. They are the
   contiguous blocks ``kv_head_replicas`` (``mstar/distributed/utils.py``) gives, as
   ``QKVParallelLinear`` loads them; a model that
-  shards K and V itself must match. Each layer exchanges queries and partials over the TP group,
-  except for a plan label of an eager step that isn't one token a row and has no stored context
+  shards K and V itself must match. Each placed layer exchanges queries and partials over the TP
+  group, except for a plan label of an eager step that isn't one token a row and has no stored context
   on any row, which attends its own tokens alone.
 - **SP mode.** The partners are the node's SP ranks, ``P = sp_size``. Heads shard over TP alone.
   Without a ``SeqShardSpec`` every layer but attention runs copied across SP; prefer TP mode
