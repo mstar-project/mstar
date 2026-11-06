@@ -1142,6 +1142,30 @@ def test_a_process_alone_sees_the_real_time_of_a_wait_it_cant_see_the_end_of():
     assert 0.25 < float(out) < 5, out
 
 
+def test_the_mover_waits_on_no_lock_of_threadings():
+    """It holds the emulator's lock, and a thread holding ``threading``'s can run a free that wants
+    that one."""
+    out = run_sim("""
+        import threading
+        from mstar_sim import clock, waits
+        go, done = waits._real_lock(), waits._real_lock()
+        go.acquire()
+        done.acquire()
+        w = waits.Wait(waits.DEVICE, 0.0, True, None, None)
+
+        def report():
+            go.acquire()
+            waits._slept(w, 0.0)
+            done.release()
+
+        threading.Thread(target=report, name=waits.OWN + "report", daemon=True).start()
+        with threading._active_limbo_lock:
+            go.release()
+            print(done.acquire(True, 2.0))
+    """)
+    assert out.strip() == "True", out
+
+
 def test_a_read_held_behind_a_rising_bound_doesnt_abort():
     """The limit is on a bound that stands still, not on a hold: a device wait can put a process
     far past a peer that runs at real rate, and it then waits for the peer to get there."""

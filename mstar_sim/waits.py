@@ -582,7 +582,7 @@ def _slept(w: Wait, t: float) -> None:
     if t - w.deadline > _LATE:
         REPORT["late_resumes"] += 1
     blocked = {x.thread for x in _waits if x.counts and not x.woken}
-    names = {th.ident: th.name for th in threading.enumerate()}
+    names = {ident: th.name for ident, th in list(threading._active.items())}  # (not enumerate: it takes a lock)
     for ident, frame in sys._current_frames().items():
         if (ident in _counted and ident not in blocked and ident != w.thread
                 and frame.f_code is not SimpleQueue.get.__code__):  # (a queue counts its own getters)
