@@ -216,6 +216,17 @@ def _value_specs(array: Array, arrays: Sequence[Array]) -> list[NodeResourceSpec
         raise _no_layout(array, "reads must be empty, since RecurrentStateConfig has no read")
     if array.seq_sharded:
         raise _no_layout(array, "seq_sharded takes max_len 0, and a Value's entries stay whole on each rank")
+    labels = tuple(sorted(array.labels))
+    if array.entry.tensors and not array.updates:
+        # one block per field, read and written whole by the model, linked to no KV
+        return [RecurrentStateSpec(
+            resource_key=array.name, nodes=array.nodes,
+            config=RecurrentStateConfig(
+                num_layers=len(array.layers),
+                blocks={name: _block(tensor) for name, tensor in array.entry.tensors.items()},
+                labels=labels,
+            ),
+        )]
     if set(array.entry.tensors) != {"state", "conv"} or array.entry.host:
         raise _no_layout(array, "entry must be exactly state and conv, the blocks DeltaNetGeometry reads")
     deltas = [(key, op) for key, op in array.updates.items() if isinstance(op, GatedDeltaNet)]
@@ -243,6 +254,7 @@ def _value_specs(array: Array, arrays: Sequence[Array]) -> list[NodeResourceSpec
                     "conv": _block(array.entry.tensors["conv"]),
                 },
                 kv_cache=holders[0].name,
+                labels=labels,
             ),
         ),
         LinearAttnSpec(

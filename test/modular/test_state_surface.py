@@ -21,7 +21,7 @@ from mstar.engine.state.calls import ArrayHandle
 from mstar.engine.state.within_step import WithinStepHandle
 
 # Today's types the surface re-exports, and a NamedTuple, whose fields stay positional.
-_POSITIONAL = {"PagedNHDTarget", "Reached", "Segment", "SlotLease", "Span"}
+_POSITIONAL = {"PagedNHDTarget", "Segment", "SlotLease", "Span"}
 # The calls take the handle first, then what every call names, and only then keywords.
 _CALLS = {
     "at_last_token", "causal_conv", "gated_delta_net", "host", "last_sampled", "position", "positions",
@@ -98,7 +98,7 @@ SNAPSHOT = {
     ],
     "Reached": [
         ["fields", "POSITIONAL_OR_KEYWORD", None],
-        ["row_offsets", "POSITIONAL_OR_KEYWORD", None],
+        ["row_offsets", "KEYWORD_ONLY", None],
     ],
     "Read": [
         ["mask", "KEYWORD_ONLY", None],
@@ -252,6 +252,7 @@ HANDLE_SNAPSHOT = {
         ["self", "POSITIONAL_OR_KEYWORD", None],
         ["layer", "POSITIONAL_OR_KEYWORD", None],
         ["q", "POSITIONAL_OR_KEYWORD", "None"],
+        ["start", "KEYWORD_ONLY", "None"],
         ["mask_args", "VAR_KEYWORD", None],
     ],
     "write": [

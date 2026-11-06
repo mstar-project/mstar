@@ -292,7 +292,7 @@ NO_LAYOUT = {
         "entry",
     ),
     "a value with a host field": ("gdn", lambda: [_kv(), _gdn(entry=_gdn_entry(host={"done": bool}))], "entry"),
-    "a value with no update": ("gdn", lambda: [_kv(), _gdn(updates={})], "GatedDeltaNet"),
+    "a value with no fields": ("gdn", lambda: [_gdn(entry=Entry({}), updates={})], "entry"),
     "a value with only a conv": ("gdn", lambda: [_kv(), _gdn(updates={"conv": CausalConv()})], "GatedDeltaNet"),
     "two delta nets": (
         "gdn", lambda: [_kv(), _gdn(updates={"a": GatedDeltaNet(), "b": GatedDeltaNet()})], "GatedDeltaNet",

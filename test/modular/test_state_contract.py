@@ -62,7 +62,6 @@ def _holding(tensor: TensorType) -> Array:
 
 
 REFUSALS = {
-    "empty shape": (lambda: _holding(TensorType((), dtype=None)), "Array 'kv'.entry.tensors['k'].shape"),
     "list shape": (lambda: _holding(TensorType([4, 8], dtype=None)), "Array 'kv'.entry.tensors['k'].shape"),
     "zero in shape": (lambda: _holding(TensorType((4, 0), dtype=None)), "Array 'kv'.entry.tensors['k'].shape"),
     "bool in shape": (lambda: _holding(TensorType((True, 8), dtype=None)), "Array 'kv'.entry.tensors['k'].shape"),

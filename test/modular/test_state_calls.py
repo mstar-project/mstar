@@ -199,13 +199,13 @@ def _kv_handle(array=None, kv=None, attn=None) -> ArrayHandle:
 
 def _value_handle(labels=frozenset({"main"})) -> ArrayHandle:
     entry = Entry({
-        "state": TensorType((HEADS, DIM, DIM), dtype=torch.float32, shard=0),
+        "state": TensorType((HEADS, DIM, DIM + 1), dtype=torch.float32, shard=0),
         "conv": TensorType((3 * HEADS * DIM, 3), dtype=None, shard=0),
     })
     updates = {"c": CausalConv(), "d": GatedDeltaNet()}
     array = replace(Value("gdn", nodes={"LLM"}, layers={1, 5}, entry=entry, updates=updates), labels=frozenset(labels))
     pool = _StubPool({
-        "state": torch.zeros(2, SLOTS, HEADS, DIM, DIM),
+        "state": torch.zeros(2, SLOTS, HEADS, DIM + 1, DIM),
         "conv": torch.zeros(2, SLOTS, 3 * HEADS * DIM, 3),
     })
     return ArrayHandle(array, {"gdn": pool, "c": None, "d": _StubLinear()}, None)
@@ -630,7 +630,7 @@ def test_a_placeholder_row_may_touch_a_label_its_request_did_not_open():
 
 def test_keep_false_on_a_value_with_updates_raises():
     h = _value_handle()
-    _refused(r"Array 'gdn': keep=False on an array with updates", lambda: _begin(h, gdn=ArrayStep(keep=False)))
+    _refused(r"Array 'gdn': keep=False on a Value with tensor fields", lambda: _begin(h, gdn=ArrayStep(keep=False)))
 
 
 def test_a_replay_skips_every_step_check():

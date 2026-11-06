@@ -52,7 +52,7 @@ def _is_host_type(kind) -> bool:
 
 @dataclass(frozen=True)
 class TensorType:
-    shape: tuple[int, ...]       # global, before sharding
+    shape: tuple[int, ...]       # global, before sharding; () is one scalar per entry
     _: KW_ONLY
     dtype: torch.dtype | None    # math dtype, None is the engine's compute dtype
     shard: int | None = None     # axis split across TP ranks, None is replicated
@@ -196,10 +196,10 @@ class Array:
         least = 1 if self.layers or self.reads else 0
         for name, tensor in self.entry.tensors.items():
             where = f"Array {self.name!r}.entry.tensors[{name!r}]"
-            if not (isinstance(tensor.shape, tuple) and tensor.shape and all(
+            if not (isinstance(tensor.shape, tuple) and all(
                 type(axis) is int and axis >= least for axis in tensor.shape
             )):
-                raise ValueError(f"{where}.shape must be a non-empty tuple of ints >= {least}, got {tensor.shape!r}")
+                raise ValueError(f"{where}.shape must be a tuple of ints >= {least}, got {tensor.shape!r}")
             if tensor.shard is not None and not (type(tensor.shard) is int and 0 <= tensor.shard < len(tensor.shape)):
                 raise ValueError(f"{where}.shard must be None or an axis of shape {tensor.shape}, got {tensor.shard!r}")
         if self.entry.host and not is_value(self):
@@ -364,8 +364,11 @@ class PagedNHDTarget(NamedTuple):
     count: int    # tokens to write
 
 
-class Reached(NamedTuple):
-    """What a read with no op returns: each field's reached entries packed by row, and where each row starts."""
+@dataclass(frozen=True)
+class Reached:
+    """What a read with no op returns, tensors the caller owns: writing them changes no state. Each field's reached
+    entries packed by row, and where each row starts. A Value's row r holds its one entry at index r."""
 
-    fields: Mapping[str, torch.Tensor]
-    row_offsets: torch.Tensor
+    fields: Mapping[str, torch.Tensor]    # field -> (entries, *shape on this rank), in the field's declared dtype
+    _: KW_ONLY
+    row_offsets: torch.Tensor             # (rows + 1,) int32 on the device
