@@ -396,11 +396,13 @@ def _collective(name: str, family: str, primitive: str | None):
             # every rank holds values (a vote, lengths): send them for real, so
             # what ranks agree on device is what they agreed on
             if outputs and not written:  # a root, or a reduce's others, which gloo's leaves partial sums in
-                a[first] = a[first]._data.clone()
+                with clock.computing():
+                    a[first] = a[first]._data.clone()
                 args, kwargs = bound.args, bound.kwargs
-            work = real(*device.tree_map(device._unwrap, args), **device.tree_map(device._unwrap, kwargs))
-            if work is None and outputs and not written:
-                _let_go(group or dist.group.WORLD, a[first])
+            with _waiting():  # for the peers, where NCCL's host call returns at enqueue
+                work = real(*device.tree_map(device._unwrap, args), **device.tree_map(device._unwrap, kwargs))
+                if work is None and outputs and not written:
+                    _let_go(group or dist.group.WORLD, a[first])
         # what didn't move, or a captured one at each replay, wasn't computed
         never = not (moved and values & COMPUTED)
         kept = [t._data for t in written if t._data.device.type != "meta"]

@@ -1054,6 +1054,14 @@ def test_tensor_parallel_ranks_meet_at_each_collective():
             time.sleep(r)
             dist.recv(kept, src=1) if r == 0 else dist.send(mine, dst=0)
             assert clock.STATS["host_compute"] - emulator < 0.5, clock.STATS
+            # so is gloo's transfer of held values, which NCCL's enqueue doesn't wait for: a peer late
+            # to it doesn't move mstar's clock
+            if r == 0:
+                pg_broadcast = dist.ProcessGroup.broadcast
+                dist.ProcessGroup.broadcast = lambda *args: (time.sleep(1), pg_broadcast(*args))[1]
+            before = clock.vnow()
+            dist.broadcast(kept, src=0)
+            assert clock.vnow() - before < 0.5, clock.vnow() - before
             dist.destroy_process_group()
 
         if __name__ == "__main__":
