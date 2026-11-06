@@ -3,13 +3,17 @@ client inline, and a batched stop check that agrees with the per-request one."""
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
+from mstar.engine.resources.sampler.resource import SamplerResource
+from mstar.engine.state import Sampler
+from mstar.engine.state.calls import SamplerHandle
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.higgs_audio.config import SAMPLER, HiggsAudioModelConfig
 from mstar.model.higgs_audio.higgs_audio_model import HiggsAudioModel
 from mstar.model.higgs_audio.submodules import HiggsAudioLLMSubmodule
-from mstar.model.submodule_base import END_PARTITION, HostRows
+from mstar.model.submodule_base import END_PARTITION, ARNodeInputs, HostRows
 
 
 def _submodule(slot_masters=True):
@@ -74,3 +78,37 @@ def test_batched_stop_check_agrees_with_the_per_request_one():
     prefill = {rid: SimpleNamespace(**{**vars(info), "graph_walk": "prefill_audio"}) for rid, info in infos.items()}
     assert sub.check_stop("b", prefill["b"], {"new_token": [tokens[1]]}) == {END_PARTITION}
     assert sub.check_stop_batched(list(prefill), prefill, rows) == {"b": {END_PARTITION}}
+
+
+class _SlotMasters:
+    """A row's token is 100 plus its row, and the overlay is the sampler's own."""
+
+    overwrite_rows = SamplerResource.overwrite_rows
+    _row_stager = None
+
+    def loopback_tokens(self, rids):
+        return 100 + torch.arange(len(rids))
+
+
+def _routed(token: int) -> ARNodeInputs:
+    return ARNodeInputs(input_ids=torch.tensor([token]), input_seq_len=1)
+
+
+LOOPED = ARNodeInputs(input_seq_len=1)
+
+
+@pytest.mark.parametrize("inputs, rows", [
+    ([_routed(7), LOOPED], 2),
+    ([LOOPED, _routed(7), LOOPED, _routed(8)], 4),
+    ([LOOPED, _routed(7), _routed(0), _routed(0)], 4),    # padding rows copied from a template that carries ids
+    ([LOOPED, _routed(7)], 4),    # padding rows the slot keeps past the inputs
+    ([LOOPED, ARNodeInputs(input_ids=torch.tensor([9]), input_seq_len=0)], 2),    # a row with nothing to run
+], ids=["fresh-row-first", "mixed", "padded-with-ids", "padded-past-the-inputs", "empty-row"])
+def test_a_decode_step_mixing_routed_and_loop_back_rows_gives_the_ids_loopback_inputs_gave(inputs, rows):
+    sub = _submodule()
+    rids = list(range(rows))
+    want = sub.loopback_inputs(SimpleNamespace(resources={SAMPLER: _SlotMasters()}, request_ids=rids), inputs)
+    sub.sampler = SamplerHandle(Sampler(SAMPLER, nodes={"LLM"}, vocab_size=8), _SlotMasters())
+    sub.sampler.begin_step(SimpleNamespace(ctx=SimpleNamespace(padded_request_ids=rids)))
+    got = sub.preprocess("decode", SimpleNamespace(request_ids=rids), inputs)
+    assert torch.equal(got["input_ids"], want["input_ids"]), "the splice should build the rows the overlay wrote"

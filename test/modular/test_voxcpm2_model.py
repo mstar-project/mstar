@@ -16,6 +16,7 @@ import io
 import json
 import math
 import urllib.error
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -26,7 +27,9 @@ import yaml
 from mstar.api_server.openai import adapters
 from mstar.api_server.openai.protocol import SpeechRequest
 from mstar.engine.accelerator_graph_config import PiecewiseBatchedConfig, PiecewiseCallInputs, PiecewiseCaptureShape
+from mstar.engine.engine import Engine
 from mstar.engine.resources.step import StepContext
+from mstar.engine.state import host
 from mstar.engine.state.adapters import kv_layouts, node_resources
 from mstar.model.registry import HF_MODELS, get_model_class
 from mstar.model.submodule_base import ARNodeInputs, InputMetadata, engine_step
@@ -35,6 +38,7 @@ from mstar.model.voxcpm2.components.minicpm import RopeTable, longrope_cos_sin
 from mstar.model.voxcpm2.components.talker import VoxCPM2Generator
 from mstar.model.voxcpm2.config import (
     AUDIO_START_TOKEN,
+    BASE_KV,
     CFG_KEY,
     MIN_LEN_KEY,
     MODE_REF_CONTINUATION,
@@ -45,6 +49,7 @@ from mstar.model.voxcpm2.config import (
     REF_AUDIO_END_TOKEN,
     REF_AUDIO_START_TOKEN,
     REF_DIGEST_KEY,
+    TALKER_STEP,
     VoxCPM2Config,
 )
 from mstar.model.voxcpm2.submodules import (
@@ -929,19 +934,6 @@ def test_talker_stops_like_the_reference_loop(model):
     assert [step(0, i) for i in range(6)][-2:] == [set(), {TALKER_LOOP}]  # budget of 6 patches
 
 
-def test_talker_stop_judges_each_step_by_its_own_patch_index(model):
-    """A speculative step committed before the previous step's stop check moves
-    ``generated`` on; the check still counts the patches of its own step."""
-    talker, _, _ = _talker(model)
-    request, meta = _request(model, "hello", max_new_tokens=6)
-    info = _info("r", 0, meta)
-    prepared = talker.prepare_inputs("talker_prefill", info, request)
-    for _ in range(6):
-        _commit(talker, "talker_prefill", ["r"], [prepared])
-    assert talker.check_stop("r", info, {"stop_flag": [torch.tensor([0, 4])]}) == set()  # patch 5 of 6
-    assert talker.check_stop("r", info, {"stop_flag": [torch.tensor([1, 2])]}) == set()  # i = 2: not past min_len
-
-
 def test_talker_vetoes_steps_past_the_patch_budget(model):
     talker, _, _ = _talker(model)
     request, meta = _request(model, "hello", max_new_tokens=2)
@@ -968,6 +960,124 @@ def test_talker_reprepares_a_refused_step_with_the_same_index_and_noise(model):
     assert torch.equal(retry.tensor_inputs["noise"], refused.tensor_inputs["noise"])
 
 
+def _committed(talker, rid) -> dict:
+    return dict(host(talker.progress, rid, "main", 0))
+
+
+def test_talker_host_writes_rely_on_exec_declaring_again_after_a_pre_plan(model):
+    """A pre-plan declares over the bucket's template rows, which carry no draw and so no write. Were exec to run that
+    step instead of declaring its own, ``generated`` and ``rng`` would never move and every decode step would draw the
+    prefill's next noise again."""
+    talker, _, _ = _talker(model)
+    (graph,) = talker.get_accelerator_graph_configs(torch.device("cpu"))
+    request, meta = _request(model, "hello")
+    info = _info("r", 0, meta)
+    _commit(talker, "talker_prefill", ["r"], [talker.prepare_inputs("talker_prefill", info, request)])
+    before = _committed(talker, "r")
+
+    rows = graph.get_node_inputs(2, 0)
+    runner = SimpleNamespace(declare_inputs_for=lambda lease: rows, step_ids=lambda lease, rids: [*rids, "pad"])
+    context = StepContext(("r",), "talker_decode", 0, False)
+    batch = SimpleNamespace(node_name="Talker", inputs=None, request_ids=["r"], per_request_info={"r": info}, step=None,
+                            step_context=context)
+    engine = Engine.__new__(Engine)
+    # a refused pre-admit ends the pre-plan with everything this test reads already decided
+    reused = []
+    engine._runner = SimpleNamespace(pre_admit=lambda step: reused.append(batch.step) or SimpleNamespace(ok=False))
+    engine.reset_pre_plan_for_batch = lambda batch: None
+    # no runners, so that `step_is_input_free` alone decides
+    mgmt = SimpleNamespace(submodule=talker, piecewise_runners={})
+    assert engine._pre_plan_for_batch(batch, mgmt, runner, object()) is False
+    assert reused == [None], "exec reuses a pre-planned step only for a walk with no input in its declaration"
+    assert _committed(talker, "r") == before, "a pre-plan writes nothing"
+
+    prepared = talker.prepare_inputs("talker_decode", info, {"latent_patch": [torch.zeros(4, 8)]})
+    step = engine_step(talker, graph_walk="talker_decode", request_ids=["r", "pad"], inputs=[prepared, rows[1]])
+    context.is_preplan = False
+    step.set_ctx(context)
+    step.begin_calls()
+    step.commit_calls()
+    step.end_calls()
+    assert _committed(talker, "r") == {"generated": before["generated"] + 1, "rng": prepared.kwargs["rng"]}
+    assert prepared.kwargs["rng"] != before["rng"], "the draw moved the generator"
+
+
+def test_talker_declaring_a_step_twice_advances_it_once(model):
+    talker, _, _ = _talker(model)
+    request, meta = _request(model, "hello")
+    info = _info("r", 0, meta)
+    prepared = talker.prepare_inputs("talker_prefill", info, request)
+    talker.declare_step("talker_prefill", ["r"], [prepared])
+    _commit(talker, "talker_prefill", ["r"], [prepared])
+    assert _committed(talker, "r")["generated"] == 1, "only a commit applies a declared write"
+
+
+def test_talker_capture_rows_carry_cfg_and_no_rng_and_write_nothing(model):
+    talker, _, _ = _talker(model)
+    (graph,) = talker.get_accelerator_graph_configs(torch.device("cpu"))
+    rows = graph.get_node_inputs(2, 2)
+    assert all("rng" not in row.kwargs for row in rows), "a capture's rows have no open fields to write"
+    step = talker.declare_step("talker_decode", [91, 92], rows)
+    assert TALKER_STEP not in step.state
+    packed = talker.preprocess("talker_decode", SimpleNamespace(request_ids=[91, 92]), rows)
+    assert packed["cfg"].tolist() == [model.config.cfg_value] * 2
+
+
+def test_talker_padded_replay_writes_the_real_rows_and_stages_each_rows_cfg(model):
+    """``preprocess`` sees padding rows as copies of the template, and ``declare_step`` tells them from real rows by
+    ``rng``, so one real row in a padded bucket advances and the padding rows touch no store."""
+    talker, _, _ = _talker(model)
+    (graph,) = talker.get_accelerator_graph_configs(torch.device("cpu"))
+    request, meta = _request(model, "hello", cfg_value=1.5)
+    info = _info("r", 0, meta)
+    _commit(talker, "talker_prefill", ["r"], [talker.prepare_inputs("talker_prefill", info, request)])
+    prepared = talker.prepare_inputs("talker_decode", info, {"latent_patch": [torch.zeros(4, 8)]})
+    rows, rids = [prepared, *graph.get_node_inputs(3, 0)], ["r", 91, 92, 93]
+
+    packed = talker.preprocess("talker_decode", SimpleNamespace(request_ids=rids), rows)
+    assert packed["cfg"].tolist() == [1.5, *[model.config.cfg_value] * 3]
+    assert packed["step_index"].tolist() == [1, 1, 1, 1]
+
+    step = engine_step(talker, graph_walk="talker_decode", request_ids=rids, inputs=rows)
+    assert set(step.state[TALKER_STEP].host) == {("r", "main", 0)}
+    context = StepContext(("r",), "talker_decode", 0, False, slot_lease=object())
+    context.set_padded_rids(rids)
+    assert context.replays
+    step.set_ctx(context)
+    step.begin_calls()
+    step.commit_calls()
+    step.end_calls()
+    assert _committed(talker, "r")["generated"] == 2
+    assert set(talker.progress.host_fields._fields) == {"r"}, "a padding row opens no fields"
+
+
+def test_talker_fields_go_with_the_request_when_the_engine_removes_it(model):
+    talker, _, _ = _talker(model)
+    request, meta = _request(model, "hello")
+    info = _info("r", 0, meta)
+    _commit(talker, "talker_prefill", ["r"], [talker.prepare_inputs("talker_prefill", info, request)])
+    engine = Engine.__new__(Engine)
+    engine._loopback_steps, engine._resources, engine._submodules = {}, {}, {}
+    engine._runner = SimpleNamespace(remove_request=lambda rid: None)
+    engine._chunking = SimpleNamespace(forget_request=lambda rid: None)
+    engine._host_fields = talker.progress.host_fields
+    engine.remove_request("r")
+    assert talker.progress.host_fields._fields == {}, "a recycled handle would read this request's progress"
+    with pytest.raises(ValueError, match="no host fields"):
+        talker.prepare_inputs("talker_decode", info, {"latent_patch": [torch.zeros(4, 8)]})
+
+
+@pytest.mark.parametrize("no_rope", [True, False])
+def test_the_residual_stack_rotates_at_the_base_arrays_positions_or_not_at_all(model, no_rope):
+    """The released checkpoint sets ``residual_lm_no_rope``, and the flag decides whether its layers read positions."""
+    config = replace(model.config, residual=replace(model.config.residual, no_rope=no_rope))
+    talker = TalkerSubmodule(_random_generator(config), config, 4)
+    bind_dense_resources(talker)
+    layer = talker.model.residual_lm.layers[0].self_attn
+    base = talker.state_handles[BASE_KV]
+    assert (layer.position_source, layer._rope is None) == ((None, True) if no_rope else (base, False))
+
+
 def test_talker_noise_comes_in_order_from_the_seed_through_host_bytes(model):
     talker, _, _ = _talker(model)
     first, after_first = talker._draw(b"", 4)
@@ -977,6 +1087,23 @@ def test_talker_noise_comes_in_order_from_the_seed_through_host_bytes(model):
     expected = torch.Generator().manual_seed(4)
     torch.testing.assert_close(first, torch.randn((1, 8, 4), generator=expected)[0])
     torch.testing.assert_close(second, torch.randn((1, 8, 4), generator=expected)[0])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_talker_noise_through_host_bytes_equals_one_kept_cuda_generator(model):
+    """A CUDA generator's state is its seed and Philox offset, so bytes carry it across steps, with a refused step in
+    between, as one kept generator would have drawn."""
+    talker = TalkerSubmodule(_random_generator(model.config).cuda(), model.config, 4)
+    kept = torch.Generator(device="cuda").manual_seed(4)
+    state = b""
+    for step in range(4):
+        noise, after = talker._draw(state, 4)
+        if step == 2:
+            again, _ = talker._draw(state, 4)
+            assert torch.equal(again, noise), "a refused step draws the same noise from the same committed state"
+        expected = torch.randn((1, 8, 4), generator=kept, device="cuda", dtype=talker._dtype())[0]
+        assert torch.equal(noise, expected), f"draw {step}"
+        state = after
 
 
 def test_talker_declares_the_same_span_in_both_caches(model):

@@ -132,5 +132,11 @@ def test_the_lint_lets_a_named_function_keep_its_break_and_no_other():
     assert len(found) == 1 and "at line 3" in found[0]
 
 
+def test_the_lint_reads_the_six_speech_packages():
+    assert {path.parts[2] for path in _sources()} >= {
+        "kokoro", "omnilingual_asr", "omnivoice", "orpheus", "higgs_audio", "voxcpm2",
+    }
+
+
 def test_the_lint_reads_all_five_reference_packages():
     assert {path.parts[2] for path in _sources()} >= {"wan22", "flux2_klein", "z_image", "ltx2_5", "qwen3_omni"}
