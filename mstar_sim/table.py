@@ -70,8 +70,7 @@ class Table:
         try:
             self.me = self._claim()
             self._mine = _HEADER + self.me * _WORDS
-            self._q[1] = SLOTS
-            self.live = self._live()
+            self.live = self._live(SLOTS)  # (a dead run's count can't be trusted)
             if not self.live:
                 self._map[:] = bytes(_SIZE)  # a dead run's table: a restart on its port starts clean
             self._q[1] = max(self._q[1], self.me + 1)
@@ -99,16 +98,17 @@ class Table:
     def _lock_byte(slot: int) -> int:
         return (_HEADER + slot * _WORDS) * 8
 
-    def _live(self) -> list[int]:
-        """The other processes' slots: a held lock is a live process. (One ``fcntl`` a slot, so a
-        look stands for ``_LIVE_FOR``, by which time a mover looks again anyway.)"""
+    def _live(self, slots: int | None = None) -> list[int]:
+        """The other processes' slots, among the first ``slots`` (by default all that were used): a
+        held lock is a live process. (One ``fcntl`` a slot, so a look stands for ``_LIVE_FOR``, by
+        which time a mover looks again anyway.)"""
         if self._fd < 0:
             return []
         if _real() - self._looked < _LIVE_FOR:
             return self.live
         self._looked = _real()
         found = []
-        for slot in range(self._q[1]):
+        for slot in range(slots or self._q[1]):
             if slot != self.me:
                 got = fcntl.fcntl(self._fd, _F_OFD_GETLK, _flock(fcntl.F_WRLCK, self._lock_byte(slot)))
                 if struct.unpack("hhqqi", got)[0] != fcntl.F_UNLCK:

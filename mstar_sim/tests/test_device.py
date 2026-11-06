@@ -858,10 +858,11 @@ def test_a_blocked_process_follows_the_deployments_time():
         start = wall = time.perf_counter(), time.clock_gettime(time.CLOCK_MONOTONIC)
         while time.perf_counter() - start[0] < 2.0:
             time.sleep(0.05)
-        print(time.perf_counter() - start[0], time.clock_gettime(time.CLOCK_MONOTONIC) - start[1])
+        print(time.perf_counter() - start[0], time.clock_gettime(time.CLOCK_MONOTONIC) - start[1], waits.TABLE._q[1])
     """)
-    moved, wall = map(float, follower.split())
+    moved, wall, slots = map(float, follower.split())
     assert 1.99 < float(worker) < 2.1 and 2.0 <= moved < 2.1 and wall < 1, (worker, moved, wall)
+    assert slots == 2, slots  # a read scans what was used, not all 64
 
 
 def test_two_blocked_processes_move_together_to_the_earlier_deadline():
