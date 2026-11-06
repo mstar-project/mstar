@@ -367,16 +367,16 @@ A layout has six fields:
   ``source`` names, ``"digest"`` for KV made from an uploaded file (``source`` is
   ``(modality, index)``), and ``"rows"`` for KV made from anything else, such as another
   node's outputs. A request whose spans are not all ``"ids"`` can be rebuilt at one rank when the
-  node's ``RebuildPolicy`` names their walk in ``walks``, whatever their kind: the worker keeps
-  host copies of what the node reads there besides the ids, and the rebuild row reads them again.
-  The policy's ``copy_width`` gives, for each walk where the node reads more than the ids, how many
-  values those copies hold per KV slot, in the node's dtype, and startup raises without it.
-  One step of that walk must write every span of the label, the last must be an ``"ids"`` span,
-  and the label must key none of them for the prefix cache. Otherwise, in a pool that decides
-  admission, the request can only move to the host, into room the host sets aside for the pages
-  it holds, and reserves its whole footprint when the host can't. The rebuild row gives the walk its
-  ids as the prefill row read them, with the samples appended to the last tensor, under the
-  prefill row's step metadata, so the walk must read its prompt in that shape.
+  node's ``RebuildPolicy`` names their walks in ``walks``, whatever their kind: the worker keeps
+  host copies of what the node reads in each prefill step, and a rebuild row runs each step again
+  from them, in the order the layout's steps say (``opens_step``). The policy's ``copy_width``
+  gives, for each walk where the node reads more than the ids, how many values those copies hold
+  per KV slot, in the node's dtype, and startup raises without it. The last span must be an
+  ``"ids"`` span, and a label the request keys must be keyed over every span. Otherwise, in a pool
+  that decides admission, the request can only move to the host, into room the host sets aside for
+  the pages it holds, and reserves its whole footprint when the host can't. A rebuild row gives its
+  walk what the step read, under the step's metadata, and the last row's ids tensor gets the samples
+  appended, so the walk must read its prompt in that shape.
   ``length`` is the slots the write fills, ``advance`` how far it moves
   the position counter. A span's ``scratch`` is the most one non-committing step writes
   before the span commits into those slots, as a window's denoise steps do.

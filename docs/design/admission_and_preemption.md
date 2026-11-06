@@ -139,7 +139,7 @@ A number set by each worker won't work, since requests reach workers on separate
 
 Say request R's grant is short by `pages_short` pages, one for a decode row. A request frees the pages only it holds, alone or with the index, plus the unused part of its reservation.
 
-- **Candidates.** The preemptible requests that arrived after R, newest first, other than requests with a step or a KV read in flight on their pages, a dropped request whose rebuild hasn't landed, since the rebuild runs on its reservation, and a request holding a lease, until its walk's admit takes the lease over. The probe that took the lease moved the position counter, which never moves back, and a walk the cache served keeps its KV only in the lease. Each holds no page of its own, fits whole in the host pool, or has a drop that isn't refused for a lasting reason (§4). Any other that holds no page only gives back its reservation and the room the host set aside for it, and asks again, whatever the host pool. The host's room is its free pages and the cached pages it can evict, less the room set aside for requests that can only move to the host, and each victim chosen for the host takes from it in turn. A request with room set aside moves into it.
+- **Candidates.** The preemptible requests that arrived after R, newest first, other than requests with a step or a KV read in flight on their pages, a dropped request whose rebuild hasn't landed, since the rebuild runs on its reservation, a rebuilt request until a step writes past its rebuild, so no rebuild is thrown away before it keeps a token, and a request holding a lease, until its walk's admit takes the lease over. The probe that took the lease moved the position counter, which never moves back, and a walk the cache served keeps its KV only in the lease. Each holds no page of its own, fits whole in the host pool, or has a drop that isn't refused for a lasting reason (§4). Any other that holds no page only gives back its reservation and the room the host set aside for it, and asks again, whatever the host pool. The host's room is its free pages and the cached pages it can evict, less the room set aside for requests that can only move to the host, and each victim chosen for the host takes from it in turn. A request with room set aside moves into it.
 - **Victims.** The fewest leading candidates that together free at least `pages_short`, minus any whose move wouldn't change what the set frees.
 
 Then:
@@ -192,8 +192,9 @@ class KVManager:
         """Take rid's KV off the GPU without copying it, and return the number
         of pages that reach the free list. Keyed pages stay in the index as
         evictable pages. Needs no host pool. tokens is the slots rid's rebuild
-        writes: its kept ids but the last and the slots its host copies fill,
-        or the chunks its prompt ran."""
+        writes: every prefill step its layout lays out and its samples but the
+        last, or the steps before the one in progress and the chunks that one
+        ran."""
 
     def residency(self, rid: str) -> Residency:
         """ON_HOST while rid is offloaded, DROPPED from its drop until its
@@ -244,7 +245,7 @@ No field holds the state: residency, the host pool, admission and the log's rebu
 
 Lifecycle:
 
-- A rebuilding request is never chosen again: its residency stays dropped until the rebuild lands, and the KV refuses a second drop until then.
+- A rebuilding request is never chosen again: its residency stays dropped until the rebuild lands, and the KV refuses a second drop until then. Once it lands, it stays unchosen until its next step writes past the rebuild, and that step runs on the page its return reserved, so an older request waits at most until the rebuilt one runs short again or finishes.
 - Removing a request in any state releases its earmark, its pages on the host, its wait to return, its return reservation, its rebuild and its kept ids. A removal during a step that holds a rebuild row waits for the step.
 
 ### 5.2 The return check
@@ -276,8 +277,8 @@ Why this shape:
 @dataclass(frozen=True)
 class RebuildPolicy:
     """How a node rebuilds a dropped request's KV, as its model declares it."""
-    walks: frozenset[str]   # the prefill walks a rebuild row runs, the one the request prefilled in
-    ids_input: str          # the input that carries the prompt's ids
+    walks: frozenset[str]   # the prefill walks its rebuild rows run, those the request prefilled in
+    ids_input: str          # the input a row's ids go under, which the ids sampled since follow
     sample_output: str      # the output that carries each sampled id
     loop: str               # the loop each of whose iterations samples one id
     copy_width: Mapping[str, int]           # a walk that reads more than the ids -> values its copies hold per KV slot
@@ -287,11 +288,11 @@ A model declares a policy per node (`Model.rebuild_policies`), and the worker ch
 
 A rebuild is a reload whose transfer is computed. The readiness check reads the request's residency: a request on the host is reloaded by copying, and a dropped one is answered with a rebuild. The scheduler then has the KV lay the label out again to hold the slots its drop checked, and opens the rebuild over those slots in the worker's log. Readiness answers the request's decode row from the log until the rebuild lands, without asking the engine, even if the request is let back in for room meanwhile.
 
-The rebuild prefills the kept ids minus the last, under the walk the request prefilled in, as rows mid-prefill that nothing popped. The scheduler offers them where it offers a speculation's chunk in flight, so the walk's token budget cuts and counts them as it does a prompt, and they share steps with the walk's decode rows. Their inputs come from the log, which also advances their progress as each chunk lands. The step context names them (`StepContext.rebuild_rids`), so the sampler throws their samples away and leaves the request's last token and RNG offset alone. Postprocess takes them off the step before the graph runtime reads it. Decoding resumes from the last kept id once the last chunk lands.
+The rebuild runs one row per prefill step the request's layout lays out (`StreamLayout.steps`), in order, the last also writing the ids sampled since minus the last, as rows mid-prefill that nothing popped. Each row runs in its step's walk, cut by that walk's budget, and a walk the model doesn't chunk rebuilds whole. The scheduler offers them where it offers a speculation's chunk in flight, so the walk's token budget cuts and counts them as it does a prompt, and they share steps with the walk's decode rows. Their inputs come from the log, which also advances their progress as each chunk lands. The step context names them (`StepContext.rebuild_rids`), so the sampler throws their samples away and leaves the request's last token and RNG offset alone. Postprocess takes them off the step before the graph runtime reads it. Decoding resumes from the last kept id once the last chunk lands.
 
-A request dropped between two chunks of its prompt is rebuilt from its prompt instead. Its chunk Loop still stands where the prompt stopped, and the engine still holds the input it prepared for the prompt, so the rebuild runs the prompt's chunks again up to that point, cut from that input, over the layout the request already has. The prompt's next chunk waits until the rebuild lands and then starts where the Loop stands. Another request may have cached more of the prompt meanwhile, so the KV answers a dropped request's probe with at most a page under what it held.
+A request dropped between two chunks of a prompt step reruns the steps before it from the log, then that step's chunks up to where it stood. Its chunk Loop still stands there, and the engine still holds the input it prepared for the step, which waits aside while the earlier rows prepare theirs, so the last row is cut from that input, over the layout the request already has. The prompt's next chunk waits until the rebuild lands and then starts where the Loop stands. Another request may have cached more of the prompt meanwhile, so the KV answers a dropped request's probe with at most a page under what it held.
 
-The worker keeps a request's prompt ids from the policy's input the first time a step runs one of the policy's prefill walks, copied as the walk read them to a pinned host pool (`rebuild_host_mb`) once that step completes, and appends each sample from the stop check's host copy. A walk can read more than the ids, such as the encoder's output a Qwen3.5 prompt with images reads. Once the request's prefill step has run, the worker copies those inputs to the same pool (`rebuild_media_host_mb` more), after the step's outputs and within the bytes #876 lets a step copy to the host. The copies go back to the device when the row's step is built, on a stream of the pool's apart from its copies to the host, and only that step waits for them. The prefill row's step metadata stays out of the pool, in a dict on `KeptIds`, and every rebuild row runs under it. A request takes one slice of the pool for its ids and copies when it arrives. Its size comes from the layout: 8 B for each id, and for each copied slot the values the policy declares, in the node's dtype. A request the pool can't hold is then known before it is admitted, and takes the class of one no drop can free. The worker keeps all of this per node and per handle, and lists it in `rid_table.py`.
+The worker records each prefill step of a request on the step's first chunk, which carries its whole input: the ids, copied as the step read them to a pinned host pool (`rebuild_host_mb`) once that step completes, every other input the node reads there, such as the encoder's output a Qwen3.5 prompt with images reads (`rebuild_media_host_mb` more, after the step's outputs and within the bytes #876 lets a step copy to the host), and the step's metadata, which the step's rebuild row runs under. A step other than the one the layout says comes next leaves the request with nothing kept, so it is never dropped. Once the last step is recorded, the worker appends each sample from the stop check's host copy. They go back to the device when the row's step is built, on a stream of the pool's apart from its copies to the host, and only that step waits for them. A request takes one slice of the pool for all of it when it arrives, sized from its layout and the values per slot the policy declares in the node's dtype, so a request the pool can't hold is known before it is admitted and takes the class of one no drop can free. The worker keeps all of this per node and per handle, and lists it in `rid_table.py`.
 
 Why this shape:
 
@@ -320,7 +321,7 @@ Take the oldest request O that holds pages or waits:
 3. While O waits, on the host or holding its pages, every other request that holds pages is newer. Each one that runs either finishes, which grows the room, or runs short and, with nothing newer to cover its shortage, moves to the host or waits too. O then moves the newer requests that wait, chosen together as one set, and takes the room as their moves land. None of them is guaranteed, since a guaranteed request never runs short, and one no drop can free moves into the room the host set aside for it (§1). O's footprint fits the pool, so those pages and the room cover it once every newer request has finished or waits.
 4. So O runs again each time it waits, and each time it has grown by at least a page. From the host it returns with every page its grant needed, so that grant can't fail again. Its footprint fits the pool, so it finishes.
 
-The next oldest request then takes its place in the argument. Two requests that hold pages and wait can't wait on each other for good, since the older one, or an older request still, moves the newer one. A dropped request returns with its whole history and one more page reserved, so each time it is preempted again it has grown by at least a page, and it waits at its arrival, so no newer prompt passes it.
+The next oldest request then takes its place in the argument. Two requests that hold pages and wait can't wait on each other for good, since the older one, or an older request still, moves the newer one. A dropped request returns with its whole history and one more page reserved, and no move takes it again until a step writes past its rebuild, so each rebuild keeps at least one token, and it waits at its arrival, so no newer prompt passes it.
 
 For example, an older and a newer request hold 5 pages each of a 10-page pool, and the older needs a sixth. The newer one is dropped and needs 6 pages to return, so it waits until the older one finishes. Readmitted once its prompt fit, it would take back its own pages and the older one would fail again. Today both requests end with HTTP 500 at the 600 s timeout.
 

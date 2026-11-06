@@ -101,7 +101,7 @@ class Preemption:
                 return
 
     def rebuilt(self, rid: int, node_name: str, tokens: int) -> None:
-        """Count the ``tokens`` of ``rid``'s rebuild on ``node_name``, which has landed."""
+        """Count the ``tokens`` a row of ``rid``'s rebuild on ``node_name`` ran."""
         self.counts[node_name].rebuild_tokens += tokens
         kept = self._rebuilds.kept(rid, node_name)
         if rid in self._preempted and kept is not None:

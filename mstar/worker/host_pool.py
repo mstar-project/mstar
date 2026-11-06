@@ -29,9 +29,6 @@ class HostCopy(NamedTuple):
     view: torch.Tensor
     landed: torch.Event | None
 
-    def has_landed(self) -> bool:
-        return self.landed is None or self.landed.query()
-
 
 class HostPool:
     """``nbytes`` of host memory allocated once, pinned where ``device`` takes pinned memory, and handed out

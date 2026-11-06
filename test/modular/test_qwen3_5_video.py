@@ -912,10 +912,9 @@ def test_a_rebuilt_image_prompt_holds_the_slots_and_positions_of_an_uninterrupte
         node_name=NODE, request_ids=[R], per_request_info={R: SimpleNamespace(graph_walk="prefill_vision",
                                                                                step_metadata=metadata)},
         per_request_input_tensors=inputs, step_context=StepContext((R,), "prefill_vision", 0, False),
-        cached_rids=set(), completion_event=None,
+        cached_rids=set(), completion_event=None, chunk_ranges={},
     )
-    w._rebuilds.keep_prompts(prefilled)
-    w._rebuilds.keep_copies(prefilled)
+    w._rebuilds.record(prefilled)
     w._rebuilds.flush()
     # the samples before 9 are in the KV, and 9 is the next decode step's input
     w._rebuilds.kept(R, NODE).sampled.extend([*[7, 8][:samples], 9])

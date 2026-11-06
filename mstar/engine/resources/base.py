@@ -124,10 +124,9 @@ class Residency(IntEnum):
 
 
 class Rebuild(NamedTuple):
-    """What a rebuild row writes for a dropped request: ``ids`` without the last one, under ``walk``.
-    The last id is the one the next decode step reads."""
-    walk: str
-    ids: Sequence[int]
+    """What a dropped request's rebuild writes past its layout: the ids it ``sampled`` since the layout was laid out,
+    but the newest, which the next decode step reads."""
+    sampled: Sequence[int]
 
 
 class KeyedWalks(NamedTuple):
