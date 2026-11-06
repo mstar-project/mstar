@@ -275,7 +275,7 @@ def _errors(caplog) -> list[str]:
 def test_a_stop_token_from_the_prefill_ends_the_reply(ignore_eos, caplog):
     # the prefill walk has no decode_loop to stop: its stop ends the partition
     cfg = _cfg(True)
-    eos = min(cfg.stop_token_ids)
+    eos = min(cfg.eos_token_ids)
     driver = _Driver(Glm52LLMSubmodule(_model(cfg), cfg), cfg, ["r0"])
     sampler = driver.resources[SAMPLER_RESOURCE]
     greedy = sampler.sample

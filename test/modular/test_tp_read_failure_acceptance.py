@@ -80,9 +80,13 @@ ROOT = b"tp read failure"
 SIGNALS = ("new_token", "hidden")
 # A rank waiting this long in a collective for its partner is the hang.
 COLLECTIVE_S = 8.0
+# Spawned ranks can reach init_process_group seconds apart on a loaded box;
+# that skew is not a hang, so the rendezvous gets its own, longer timeout.
+RENDEZVOUS_S = 60.0
 # The follower's late read resolves at its first SCHEDULE_TP, or after this.
 TRIGGER_S = 2.0
-# The whole run; a run still going past this hung.
+# The whole run, from when both ranks have rendezvoused; a run still going
+# past this hung.
 DEADLINE_S = 30.0
 # Per-rank setup a fix adds to Worker.__init__ (see the module docstring).
 _DESIGN_SETUP = ("_setup_read_gate", "_setup_tp_read_check")
@@ -644,7 +648,7 @@ def _tp_group(rank):
     from mstar.distributed.communication import CommGroup
 
     group = CommGroup(my_global_rank=rank, my_group_rank=rank, group_members=[0, 1])
-    group.device_group = group.cpu_group = dist.group.WORLD
+    group.device_group = group.cpu_group = dist.new_group([0, 1], timeout=datetime.timedelta(seconds=COLLECTIVE_S))
     group.initialized = True
     group._all_reduce = AllReduce(group.device_group)
     return group
@@ -752,9 +756,10 @@ def _rank_main(rank, scenario, inbox, outbox):
 
         dist.init_process_group(
             "gloo", init_method=f"file://{scenario.store}", rank=rank, world_size=2,
-            timeout=datetime.timedelta(seconds=COLLECTIVE_S),
+            timeout=datetime.timedelta(seconds=RENDEZVOUS_S),
         )
         group = _tp_group(rank)
+        outbox.put(("ready", rank))
         kind = scenario.kind
         report = outbox.put
         graph = _Graph(rank, kind, report)
@@ -865,6 +870,10 @@ def _run(tmp_path, scenario: Scenario) -> Run:
         p.start()
     run = Run()
     start = time.monotonic()
+    # Until both ranks report "ready", a rank that never rendezvouses is the
+    # other's init_process_group timeout (it crashes), not a hang.
+    deadline = start + RENDEZVOUS_S + DEADLINE_S
+    ready = set()
     stopping_since = None
 
     def to_both(message):
@@ -875,7 +884,7 @@ def _run(tmp_path, scenario: Scenario) -> Run:
         now = time.monotonic()
         if stopping_since is None:
             settled = all(run.completed(r) or run.torn_down(r) for r in ("r0", "r1"))
-            if settled or now - start > DEADLINE_S:
+            if settled or now > deadline:
                 run.hung = not settled
                 stopping_since = now
                 for box in inboxes:
@@ -893,7 +902,12 @@ def _run(tmp_path, scenario: Scenario) -> Run:
         except queue.Empty:
             continue
         tag = item[0]
-        if tag == "send":
+        if tag == "ready":
+            ready.add(item[1])
+            if len(ready) == 2:
+                start = time.monotonic()
+                deadline = start + DEADLINE_S
+        elif tag == "send":
             _, src, dest, data = item
             if dest in WORKERS:
                 inboxes[WORKERS.index(dest)].put(data)

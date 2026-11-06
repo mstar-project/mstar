@@ -1,7 +1,6 @@
 """Test-support helpers for the GLM-5.2 fp8-block path and its CPU resources."""
 from __future__ import annotations
 
-import contextlib
 import dataclasses
 
 import torch
@@ -109,11 +108,8 @@ class ReferenceAttentionResource(AttentionResource):
         self.reset_default_cursors()
         self._views = ctx.plan_results[self._kv_name]["main"].views
 
-    # the plan's host views, read outside dynamo as FlashInfer reads its plan
-    @torch.compiler.disable
-    def select_last_hidden(self, hidden: torch.Tensor, label: str = "main") -> torch.Tensor:
-        last = torch.tensor([view.to_compute for view in self._views]).cumsum(0) - 1
-        return hidden.index_select(0, last)
+    def qo_indptr_buf(self, label: str = "main"):
+        return None
 
     @torch.compiler.disable
     def run(self, q, label=None, kv_cache_layer=None, k=None, v=None, layer_idx=None):
@@ -149,23 +145,6 @@ class GreedySampler(Resource):
     def sample(self, request_ids, logits, **kwargs):
         del request_ids, kwargs
         return logits.argmax(dim=-1)
-
-
-@contextlib.contextmanager
-def recorded_logits(sampler: Resource):
-    """The logits each forward hands ``sampler``, in call order."""
-    seen: list[torch.Tensor] = []
-    sample = sampler.sample
-
-    def record(request_ids, logits, **kwargs):
-        seen.append(logits)
-        return sample(request_ids, logits=logits, **kwargs)
-
-    sampler.sample = record
-    try:
-        yield seen
-    finally:
-        del sampler.sample
 
 
 class _StubTransferManager:
@@ -214,7 +193,7 @@ def build_cpu_resources(
         SAMPLER_RESOURCE,
     )
 
-    num_layers = config.num_hidden_layers
+    num_layers = config.num_hidden_layers + (1 if config.mtp_num_draft_tokens > 0 else 0)
     device = torch.device("cpu")
     stub = manager_mod.KVTransferManager
     manager_mod.KVTransferManager = _StubTransferManager
@@ -231,7 +210,14 @@ def build_cpu_resources(
                 cfg=kv_cfg, name=KV_RESOURCE, joint_comm_group=None,
                 transfer_engine_info=None, device=device, dtype=torch.float32,
             )
-            attn = FlashInferMLAManager(
+            class _ReplannedMLA(FlashInferMLAManager):
+                # the CPU tests plan before every call, so a leased fallback plan is
+                # never replayed stale
+                @property
+                def uses_kernel(self) -> bool:
+                    return True
+
+            attn = _ReplannedMLA(
                 kv_cache=KV_RESOURCE, device=device, dtype=torch.float32,
                 kv_config=kv_cfg, sm_scale=config.softmax_scale,
             )

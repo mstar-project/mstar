@@ -51,7 +51,15 @@ from mstar.streaming.topology import Connection, PartitionTopology, StreamingGra
 logger = logging.getLogger(__name__)
 
 
-def _resolve_local_hf_snapshot(repo_id: str, cache_dir: str | None = None) -> str:
+# What the LLM checkpoint is loaded from (configs, tokenizer, safetensors shards).
+# The Orpheus repos also ship optimizer and FSDP state, ~72 GB nobody reads.
+LLM_FILES = ["*.json", "*.safetensors"]
+TOKENIZER_FILES = ["*.json"]
+
+
+def _resolve_local_hf_snapshot(
+    repo_id: str, cache_dir: str | None = None, allow_patterns: list[str] | None = None,
+) -> str:
     from huggingface_hub import snapshot_download
 
     try:
@@ -59,6 +67,7 @@ def _resolve_local_hf_snapshot(repo_id: str, cache_dir: str | None = None) -> st
             repo_id=repo_id,
             cache_dir=cache_dir,
             local_files_only=False,
+            allow_patterns=allow_patterns,
         )
     except Exception as e:
         logger.warning("Error downloading from huggingface: %s", str(e))
@@ -96,6 +105,7 @@ class OrpheusModel(Model):
         tokenizer_source = _resolve_local_hf_snapshot(
             "canopylabs/orpheus-3b-0.1-pretrained",
             cache_dir=cache_dir,
+            allow_patterns=TOKENIZER_FILES,
         )
         self.tokenizer = AutoTokenizer.from_pretrained(
             tokenizer_source,
@@ -285,7 +295,7 @@ class OrpheusModel(Model):
 
     def checkpoint_path(self) -> str:
         return _resolve_local_hf_snapshot(
-            self.model_path_hf, cache_dir=self.cache_dir,
+            self.model_path_hf, cache_dir=self.cache_dir, allow_patterns=LLM_FILES,
         )
 
     def get_node_resources(self) -> list[NodeResourceSpec]:
@@ -410,6 +420,7 @@ class OrpheusModel(Model):
         local_dir = _resolve_local_hf_snapshot(
             self.model_path_hf,
             cache_dir=self.cache_dir,
+            allow_patterns=LLM_FILES,
         )
 
         with torch.device("meta"):

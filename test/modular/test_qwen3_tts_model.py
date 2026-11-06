@@ -256,6 +256,7 @@ def test_qwen3_tts_registry_engines_cache_and_yaml_are_consistent():
     assert attn.config.flashinfer_backend == "auto"
     apply_yaml_overrides(specs, serving_config)
     assert attn.config.flashinfer_backend == "fa2"
+    assert attn.config.decode_tensor_cores is False  # two query heads per KV head: the CUDA-core decode kernel
 
     worker_graphs = model.get_worker_graphs(str(CONFIG_PATH))
     by_walk = {

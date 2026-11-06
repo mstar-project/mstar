@@ -61,6 +61,12 @@ def _make_model(config: Glm52ModelConfig | None = None) -> Glm52Model:
     return model
 
 
+def _make_model_k(k: int) -> Glm52Model:
+    cfg = Glm52ModelConfig()
+    cfg.mtp_num_draft_tokens = k
+    return _make_model(cfg)
+
+
 def test_glm52_registered():
     # The registry is lazy (module path, class name) so importing it pulls
     # no model code; resolve the entry and check it is the class.
@@ -115,6 +121,14 @@ def test_glm52_resources_absorbed_is_mla_latent_layout():
     assert attn.config.sm_scale == cfg.qk_head_dim ** -0.5  # 256**-0.5, no mscale
     assert attn.depends_on() == {KV_RESOURCE}
     assert sampler.vocab_size == cfg.vocab_size
+
+
+def test_glm52_resources_mtp_adds_the_plane_layer():
+    # the draft module's KV is one more layer plane on the trunk's page table
+    kv, _, _ = _specs(_make_model_k(2).config)
+    assert kv.config.num_layers == 79
+    kv0, _, _ = _specs(_make_model_k(0).config)
+    assert kv0.config.num_layers == 78
 
 
 def test_glm52_resources_flag_off_is_naive():
@@ -178,10 +192,15 @@ def test_glm52_request_config_is_the_sampler_config():
     assert over.temperature == cfg.temperature
 
 
-def test_glm52_mtp_is_refused_until_it_lands():
-    with pytest.raises(ValueError, match="mtp_num_draft_tokens"):
-        Glm52Model(model_path_hf="", tokenizer_mode="byte", mtp_num_draft_tokens=2)
-    Glm52Model(model_path_hf="", tokenizer_mode="byte", mtp_num_draft_tokens=0)
+@pytest.mark.parametrize("kwargs, match", [
+    (dict(mtp_num_draft_tokens=2, num_hidden_layers=10), "num_hidden_layers"),
+    (dict(mtp_num_draft_tokens=-1), "mtp_num_draft_tokens"),
+], ids=["shallower-trunk", "negative-k"])
+def test_glm52_refuses_an_mtp_config_it_cannot_serve(kwargs, match):
+    """Every checkpoint layer past a shallower trunk would load as the MTP layer, and a
+    negative draft count reads as off to some checks and on to others."""
+    with pytest.raises(ValueError, match=match):
+        Glm52Model(model_path_hf="", **kwargs)
 
 
 # ── config ──
@@ -409,6 +428,13 @@ def test_indexer_exists_only_on_the_dsa_path():
     assert on.model.layers[1].self_attn.indexer is None      # SHARED
     assert all(n.startswith("model.layers.0.") for n in _indexer_params(on))
 
+    # the MTP layer's indexer follows the same flag (drafting is flag-off
+    # only, so it never carries one in practice)
+    cfg = Glm52ModelConfig.reduced()
+    cfg.num_hidden_layers = 4  # MTP position lands FULL
+    cfg.mtp_num_draft_tokens = 2
+    assert Glm52ForCausalLM(cfg).mtp.transformer_layer.self_attn.indexer is None
+
 
 def test_load_weights_skips_indexer_keys_flag_off_and_demands_them_flag_on():
     from test_glm52_moe import BLOCK, _fabricate_checkpoint
@@ -445,12 +471,12 @@ def _hf_config(cfg: Glm52ModelConfig) -> dict:
     from mstar.model.glm52.components.indexer import is_full_indexer_layer
 
     hf = {f.name: getattr(cfg, f.name) for f in fields(cfg) if f.init}
-    del hf["quantization_config"], hf["rope_theta"], hf["stop_token_ids"]
+    del hf["quantization_config"], hf["rope_theta"], hf["eos_token_ids"]
     n = cfg.num_hidden_layers
     hf.update(
         model_type="glm_moe_dsa", n_group=1, topk_group=1,
         rope_parameters={"rope_theta": int(cfg.rope_theta), "rope_type": "default"},
-        eos_token_id=sorted(cfg.stop_token_ids),
+        eos_token_id=sorted(cfg.eos_token_ids),
         indexer_types=[
             "full" if is_full_indexer_layer(cfg, i) else "shared" for i in range(n)],
         mlp_layer_types=[
@@ -558,7 +584,7 @@ def test_fallback_tokenizer_keeps_turn_tokens_special(tmp_path):
 
     from tokenizers import Tokenizer, decoders, models, pre_tokenizers
 
-    from mstar.model.utils import ByteLevelDetokenizer
+    from mstar.model.utils import ByteLevelDetokenizer, fast_tokenizer_from_snapshot
 
     alphabet = pre_tokenizers.ByteLevel.alphabet()
     raw = Tokenizer(models.BPE(vocab={c: i for i, c in enumerate(sorted(alphabet))}, merges=[]))
@@ -572,7 +598,7 @@ def test_fallback_tokenizer_keeps_turn_tokens_special(tmp_path):
         "eos_token": "<|endoftext|>", "pad_token": "<|endoftext|>",
         "extra_special_tokens": turns, "tokenizer_class": "TokenizersBackend"}))
 
-    tok = Glm52Model._fast_tokenizer_fallback(str(tmp_path))
+    tok = fast_tokenizer_from_snapshot(str(tmp_path))
     assert len(tok) == raw.get_vocab_size()
     assert set(tok.convert_tokens_to_ids(turns)) <= set(tok.all_special_ids)
     think, user = tok.convert_tokens_to_ids(["</think>", "<|user|>"])

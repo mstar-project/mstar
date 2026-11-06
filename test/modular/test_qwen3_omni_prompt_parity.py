@@ -28,8 +28,8 @@ from jinja2 import TemplateError
 
 from mstar.api_server.openai.adapters import flatten_messages
 
-# Qwen3OmniModel's submodules import flashinfer at module level.
-pytest.importorskip("flashinfer")
+# Qwen3OmniModel imports transformers at module level.
+pytest.importorskip("transformers")
 from mstar.model.qwen3_omni.qwen3_omni_model import Qwen3OmniModel  # noqa: E402
 
 SYSTEM_PROMPT = (

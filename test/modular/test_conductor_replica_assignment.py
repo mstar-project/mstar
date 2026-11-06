@@ -2,8 +2,11 @@
 is lowest, the live requests on the replica plus ``routing_cost`` of the facts
 the mirrors predict there (a KV cache: minus the share of the prompt it already
 holds). With no mirror that is the replica serving the fewest live requests, so
-concurrent requests spread over the replicas instead of landing on one at random."""
+concurrent requests spread over the replicas instead of landing on one at random,
+and ties go to the replica picked longest ago, so requests that never overlap take
+turns."""
 import math
+from collections import Counter
 from types import SimpleNamespace
 
 import pytest
@@ -39,10 +42,20 @@ PAGE = 4
 
 @pytest.fixture(autouse=True, params=["first", "last"])
 def tie(request, monkeypatch):
-    """Ties go to the first replica, then to the last, so a case that a tie would
-    pass by luck fails under one of them when what it tests is gone."""
-    pick = (lambda seq: seq[0]) if request.param == "first" else (lambda seq: seq[-1])
-    monkeypatch.setattr("mstar.conductor.routing.random.choice", pick)
+    """A tie between replicas no request has been recorded on goes to the first,
+    then, with each router built as if they had been picked last to first, to the
+    last, so a case that a tie would pass by luck fails under one of them when what
+    it tests is gone."""
+    if request.param == "last":
+        init = ReplicaRouter.__init__
+
+        def last_first(self, *args, **kwargs):
+            init(self, *args, **kwargs)
+            self._last_pick = Counter({
+                (u, i): -1 - i for u, unit in enumerate(self._units) for i in range(len(unit.instances))
+            })
+
+        monkeypatch.setattr(ReplicaRouter, "__init__", last_first)
 
 
 def _wg(group_id, ranks, sp_size=1, nodes=("llm",), walk="prefill"):
@@ -144,9 +157,9 @@ def _kv_spec():
     ))
 
 
-def _kv_conductor(weights=None):
+def _kv_conductor(weights=None, ranks=(0, 1)):
     spec = _kv_spec()
-    conductor = _conductor({0: _wg(0, [0, 1])}, specs=[spec], weights=weights)
+    conductor = _conductor({0: _wg(0, ranks)}, specs=[spec], weights=weights)
     # the model's specs, then each worker's, as `_node_resources` and `_resource_specs` build them
     conductor._node_resources_cache = [spec]
     conductor._resource_specs_cache = [{"kv": spec}]
@@ -249,12 +262,30 @@ def test_a_request_that_ends_before_a_pass_comes_back_leaves_nothing_cached():
     )
 
 
-def test_warmup_copies_of_one_prompt_spread_over_the_replicas():
-    # as the startup warmup sends one copy per replica, before any completes,
-    # with the prefix cache off so that no predicted hit gathers them
-    conductor = _kv_conductor()
-    picks = [_replica(conductor, rid, {**_prompt("P"), "prefix_cache": False}) for rid in "abcd"]
-    assert sorted(picks) == ["worker_0", "worker_0", "worker_1", "worker_1"]
+@pytest.mark.parametrize("ends", [
+    # copy -> the copy that ends just after it is placed
+    {},  # all live at once
+    {"c0": "c0", "c1": "c1", "c2": "c2"},  # one at a time (queued behind max_concurrent_requests)
+    {"c1": "c0"},  # the first ends while the second runs
+    {"c1": "c1", "c2": "c0"},
+])
+def test_warmup_copies_of_one_prompt_reach_every_replica(ends):
+    # as the startup warmup sends one copy per replica, with the prefix cache off
+    # so that no predicted hit gathers them: the copies reach every replica
+    # whether they overlap or end first, spec after spec
+    conductor = _kv_conductor(ranks=(0, 1, 2))
+    for spec in "PQ":
+        picks = []
+        for copy in ("c0", "c1", "c2"):
+            picks.append(_replica(conductor, spec + copy, {**_prompt(spec), "prefix_cache": False}))
+            if copy in ends:
+                conductor._drop_request(spec + ends[copy])
+        assert sorted(picks) == ["worker_0", "worker_1", "worker_2"], f"spec {spec}'s copies stacked: {picks}"
+        for copy in ("c0", "c1", "c2"):
+            conductor._drop_request(spec + copy)
+    # more copies than a group's replicas: they spread evenly
+    picks = [_replica(conductor, f"d{i}", {**_prompt("P"), "prefix_cache": False}) for i in range(6)]
+    assert sorted(picks) == ["worker_0", "worker_0", "worker_1", "worker_1", "worker_2", "worker_2"]
 
 
 def test_a_hit_is_priced_as_its_share_of_the_whole_prompt():
