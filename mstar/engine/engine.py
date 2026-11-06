@@ -3742,6 +3742,19 @@ class Engine:
             ctx.check_tp_repeats()
         return lease
 
+    def reserve_iteration_run(self, batch: ExecutingBatch) -> bool:
+        """Prove a queued successor uses resident addressing and actual progress.
+
+        A capture miss can execute eagerly only after its predecessor settles;
+        its host-built addresses cannot be repaired by the device row mask.
+        """
+        lease = self.reserve_replay_slot(batch)
+        if lease is None or batch.step_context.resident is None:
+            return False
+        runner = self._submodules[batch.node_name].accelerator_graph_runner
+        run = runner.slot_for(lease).run
+        return run is not None and run.window is not None
+
     def can_pre_plan(self, node_name: str) -> bool:
         """Whether pre-planning this node could stage anything at all.
 

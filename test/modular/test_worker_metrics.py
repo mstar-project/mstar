@@ -766,3 +766,76 @@ def test_worker_families_reach_metrics(tmp_path, monkeypatch):
     assert samples[("mstar_step_seconds_bucket", _labels(component=NODE, graph_walk=DECODE, le="0.005"))] == 1
     assert samples[("mstar_step_seconds_bucket", _labels(component=NODE, graph_walk=DECODE, le="0.003"))] == 0
     assert samples[("mstar_batch_size_sum", step)] == 4
+
+
+@pytest.mark.parametrize("preplan", [False, True])
+@pytest.mark.parametrize("captured", [False, True])
+def test_a_dependent_eager_successor_is_rebuilt_after_predecessor_settlement(monkeypatch, preplan, captured):
+    """A completed pre-plan's boolean is not proof of a capture lease. Missing
+    resident runs roll back before submission, even with preplanning disabled.
+    """
+    schedule = [("a", 1), None] if captured else [("a", 1), ("b", 2), None]
+    w, _, postprocessed, _ = _looping_worker(monkeypatch, schedule, {2: ("b", 2)}, set())
+    monkeypatch.setenv("MSTAR_PRE_PLAN_SPEC", "1" if preplan else "0")
+    eng = w.engine_manager.get_engine(NODE)
+    eng.iteration_layouts = lambda node: {"b": object()}
+    eng._submodules[NODE].accelerator_graph_runner = SimpleNamespace(
+        slot_for=lambda lease: SimpleNamespace(run=SimpleNamespace(window=object())),
+    )
+    planned = threading.Event()
+    events, returned = [], []
+    original_build, executing = w._build_speculation, w._build_executing_batch
+
+    def build(*args):
+        spec, away = original_build(*args)
+        if spec is not None:
+            spec.is_yield_away = False
+            spec.continuing_rids = {"a.0"}
+            spec.scheduled_batch.request_to_worker_graph = {"a.0": 0, "b.1": 0}
+            spec.node_batch = executing(spec.scheduled_batch)
+        return spec, away
+
+    def plan(*args):
+        planned.set()
+        return False  # a usable lease can exist even when no resource pre-planned
+
+    def reserve(batch):
+        assert not preplan or planned.is_set()
+        events.append("lease")
+        batch.step_context.resident = object() if captured else None
+        return object() if captured else None
+
+    def rebuild(batch):
+        if batch.graph_walk == "b":
+            assert "a" in postprocessed
+            events.append("rebuild")
+        return executing(batch)
+
+    w._build_speculation, w._build_executing_batch = build, rebuild
+    w._plans_ahead = lambda spec: True
+    w._preplan_spec = plan
+    eng.reserve_replay_slot = reserve
+    w._thread_outputs_to_speculative = lambda *args: None
+    w._reset_skip_plan_flags = lambda batch: events.append("reset")
+    w._settle_speculation = lambda spec, success, **kwargs: events.append("keep" if success else "undo")
+    w._graph_runtime = SimpleNamespace(push_back_node=lambda node, rids, wgs: returned.extend(rids))
+    gpu = w._execute_on_gpu_thread
+
+    def execute(batch, node_batch, plan_future):
+        if batch.graph_walk == "b":
+            assert captured or "a" in postprocessed
+            events.append("forward")
+        return gpu(batch, node_batch, plan_future)
+
+    w._execute_on_gpu_thread = execute
+    with pytest.raises(_StopLoopError):
+        w.run()
+    assert postprocessed == ["a", "b"]
+    assert events.count("forward") == 1
+    if captured:
+        assert "keep" in events and "undo" not in events and "rebuild" not in events
+        assert returned == []
+    else:
+        assert events.index("undo") < events.index("rebuild") < events.index("forward")
+        assert "keep" not in events and returned == ["b.1"]
+        assert ("reset" in events) == preplan

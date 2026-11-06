@@ -2327,6 +2327,23 @@ class Worker(RepeatingSteps):
             if self._phase_period:
                 set_step_key(None)
 
+    def _can_queue_iteration_successor(self, speculation: Speculation) -> bool:
+        """A dependent step with actual-progress inputs must have a resident run.
+
+        Join planning before checking the lease itself: preplanning can be off,
+        or return False despite reserving a usable capture.
+        """
+        if speculation.is_yield_away or not speculation.continuing_rids:
+            return True
+        batch = speculation.node_batch
+        engine = self.engine_manager.get_engine(batch.node_name)
+        layouts = engine.iteration_layouts(batch.node_name)
+        if not layouts or not any(batch.step_context.walk_of(rid) in layouts for rid in speculation.continuing_rids):
+            return True
+        if speculation.plan_future is not None:
+            speculation.plan_future.result()
+        return engine.reserve_iteration_run(batch)
+
     def _continuing_seq_lens(
         self, pending: PendingBatch, node_name: str, graph_walk: str,
         continuing: Collection[int], same_node: bool,
@@ -5675,7 +5692,10 @@ class Worker(RepeatingSteps):
                                 speculation = None
 
                     refused = pending.node_batch.admit_error is not None
-                    if refused or pending.node_batch.failed_requests:
+                    if (refused or pending.node_batch.failed_requests
+                            or (speculation is not None and not self._can_queue_iteration_successor(speculation))):
+                        # A dependent capture miss is rebuilt from actual progress
+                        # after N settles, through the ordinary scheduler path.
                         # Drop the speculation. On a refusal that drops its
                         # pre-plan, releasing pages the eviction would otherwise
                         # go looking for (nothing is speculated on a refusal, so
