@@ -1389,9 +1389,9 @@ request pass a first request that can't start, by overriding
 ``reserve_past(rid, node_name, graph_walk, published)``. It takes the passer's capacity while
 leaving the first request what it needs, so passing can't starve that request, or returns a mark,
 and the runner tries a passing request again only once ``grew_since`` that mark. The runner calls
-it only while the first request didn't fit and the resource hasn't grown since. A
-resource that doesn't override it keeps strict order, and a request waiting in its queue can't pass
-anywhere.
+it only while the first request can't start: a resource that lets requests pass refused it and
+hasn't grown since, and the passing request passes at that resource too. A resource that doesn't
+override it keeps strict order, and a request waiting in its queue can't pass anywhere.
 
 Step 3 — Declare the computation graph
 --------------------------------------
