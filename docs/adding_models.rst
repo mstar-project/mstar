@@ -594,8 +594,11 @@ deployment YAML tunes them under ``resources:`` (see :ref:`Step 6 <config-yaml>`
 - ``Read(mask=, op=, layers=, walks=)``: how a layer reads the array. Each row reads through
   the one read declared for its layer and walk, and loading refuses two reads over one
   layer and walk. ``Causal()`` sees every entry up to the query's own, ``Window(size)`` the
-  last ``size`` of them, its own included. ``Attend(q_heads=)`` is attention with the model's
-  query heads, a multiple of the entry's heads.
+  last ``size`` of them, its own included, and ``Bidirectional()`` every entry the row keeps and
+  every entry this step adds for it. A walk a chunking policy splits can't read through
+  ``Bidirectional()`` or ``Block()``, since splitting a row's adds across steps would change what
+  its tokens see. ``Attend(q_heads=)`` is attention with the model's query heads, a multiple of
+  the entry's heads.
 - ``Value(name, nodes=, layers=, entry=, updates=)``: a rewritable array of one entry, such
   as a recurrent state. ``updates`` names the kernels that read and write one of its fields
   in place: ``CausalConv()`` needs a field ``conv`` of shape ``(channels, kernel - 1)``, and
@@ -645,9 +648,12 @@ missing. Every refusal names the declaration and the field.
 
 A read with ``queries=ARRAY`` is cross-attention: its queries are laid out by that array's
 segments in this step, and each request's k-th segment on one pairs with its k-th on the other.
-It takes ``Block()``, since no query position decides what it sees. Separate token sets are
-separate arrays, and arrays of one kind and geometry on one node share one resource, each under
-its own label.
+It takes a mask that uses no query position: ``Block()`` on an array with ``max_len=0``, and
+``Bidirectional()`` on one that keeps entries, whose context is added on the walk that carries it
+and listed at span 0 afterwards. A cross read on an array that keeps entries is that array's one
+read, over one label, and its queries come from an append-only array that keeps entries. Separate
+token sets are separate arrays, and arrays of one kind and geometry on one node share one resource,
+each under its own label.
 
 An array whose calls carry each rank's share of its tokens under sequence parallelism declares
 ``seq_sharded=True``. Segments always cover the whole sequence, so ``declare_step`` is the same
@@ -665,7 +671,8 @@ never ran changes nothing.
 ``max_segments_per_request``, ``max_segments_per_step``, ``compile_op`` and ``workspace_mb`` on a
 ``Block`` read. Under an array's name it sets the default size of the array's pool, ``max_num_pages``
 on a paged array and ``max_slots`` on a ``Value`` with tensor fields, which a deployment's
-``resources:`` block overrides. It refuses anything else.
+``resources:`` block overrides. A cross read on an array that keeps entries takes no setting yet. It
+refuses anything else.
 
 Resource specs
 ~~~~~~~~~~~~~~
@@ -2455,7 +2462,7 @@ otherwise, which covers the eager fallback path:
                Segment(request_id=rid, label="main", span=inp.input_seq_len)
                for rid, inp in zip(request_ids, inputs, strict=True)
            ],
-           steps={KV_CACHE: KVStep(), ATTN: AttentionStep(causal=False)},
+           state={KV_CACHE: ArrayStep()},
        )
 
 **The capture_fn interface.** The captured callable takes one ``PiecewiseCallInputs``
@@ -2502,7 +2509,7 @@ sequence, and an eager section after the region.
    def _block_loop_capture(self, inp: PiecewiseCallInputs) -> dict[str, torch.Tensor]:
        # READ out of inp.static_inputs; never reassign its entries
        cond_tokens = inp.kwargs.get("cond_tokens")
-       fn = self.predictor.make_block_loop_fn("main", inp.static_inputs, cond_tokens)
+       fn = self.predictor.make_block_loop_fn(cached=True, static_pos_bufs=inp.static_inputs, cond_tokens=cond_tokens)
        return {"x": fn(inp.static_inputs["x"])}
 
    # --- declare the region ---
@@ -2523,7 +2530,7 @@ sequence, and an eager section after the region.
                    Segment(request_id=rid, label="main", span=seq_len)
                    for rid, seq_len in zip(request_ids, seq_lens, strict=True)
                ],
-               steps={KV_CACHE: KVStep(), ATTN: AttentionStep(causal=False)},
+               state={KV_CACHE: ArrayStep()},
            )
 
        return {
@@ -3166,8 +3173,9 @@ overrides, through ``mstar.model.utils.check_kv_pools_fit``, which any model wit
 can call the same way.
 
 The decoder node's ``declare_step`` shows how a write-once context is expressed with spans.
-Canary's comes from ``EncoderDecoderNode`` (``mstar/model/components/encoder_decoder.py``);
-Whisper's declares its own, since it writes the context eagerly and captures prefill. The
+Canary's comes from ``EncoderDecoderNode`` (``mstar/model/components/encoder_decoder.py``), where
+the context is an array with a ``Bidirectional()`` read and ``queries=``; Whisper's declares its
+own, since it writes the context eagerly and captures prefill. The
 context segments have a non-zero span in the prefill step that writes them, and a span of
 0 in every later step. The ``commit`` in the prefill step converts the reservation into
 resident pages that the later steps read.
@@ -3442,7 +3450,7 @@ easy to get wrong, and they run on CPU:
    * - ``test/modular/test_resource_runner.py``
      - The admit, plan and commit lifecycle driven by ``declare_step``.
    * - ``test/modular/vjepa2/fake_resources.py``
-     - Stub resources for testing a submodule's step declaration without a GPU.
+     - A stub array handle for running a submodule's layers without a GPU.
    * - ``test/modular/test_cuda_graph_capture.py``
      - Capture-bucket keys, including ``cg_key_info`` and ``additional_key_info``.
    * - ``test/modular/test_micro_scheduler.py``
