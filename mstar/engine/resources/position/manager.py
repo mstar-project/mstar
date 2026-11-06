@@ -4,8 +4,9 @@ has ownership of per-(request,label) position counter"""
 
 from collections.abc import Sequence
 from dataclasses import dataclass, field, fields
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
+import numpy as np
 import torch
 
 from mstar.engine.node_dtype import warn_implicit_downcast
@@ -39,8 +40,19 @@ if TYPE_CHECKING:
         ResidentWrites,
     )
 
-# a request with no counters yet: every stream of it is at 0
-_NO_COUNTERS: dict[str, int] = {}
+try:  # rust/src/position_plan.rs; an older build has none
+    from mstar_rust import advance_positions as _rust_advance_positions
+    from mstar_rust import position_ids_into as _rust_position_ids_into
+except ImportError:
+    _rust_advance_positions = _rust_position_ids_into = None
+
+
+class _SlotPositions(NamedTuple):
+    """One (bucket, slot, label)'s buffers, so a step finds them with one lookup."""
+    device: torch.Tensor  # what the capture reads
+    pinned: torch.Tensor  # what the step's positions are copied out of
+    host: np.ndarray  # ``pinned``, for the fill
+    capacity: int
 
 
 @dataclass
@@ -164,6 +176,8 @@ class RopeManager(PositionManager):
         # Host side of the same addressing, keyed the same way; see
         # `_pinned_pos_ids_buffer`.
         self._pinned_pos_ids: dict[CGSlotKey, torch.Tensor] = {}
+        # (bucket, slot, label) -> the two together
+        self._slot_positions: dict[tuple, _SlotPositions] = {}
         # plan label -> ids of this step on device
         # to buffer when capture; to fresh tensor when reager
         self._current_pos_ids: dict[str, torch.Tensor] = {}
@@ -362,8 +376,12 @@ class RopeManager(PositionManager):
                 rows = kv_out.rows
                 if rows is None:
                     rows = Segments.from_rows((v.request_id, v.label, v.to_compute) for v in kv_out.views)
-                pos_ids = self._build_pos_ids(rows, plan_label, lease)
-            pos_ids_out[plan_label] = self._place(pos_ids, plan_label, lease)
+                pos_ids_out[plan_label] = (
+                    self._stage_pos_ids(rows, plan_label, lease) if lease is not None
+                    else self._place(self._eager_pos_ids(rows), plan_label, lease)
+                )
+            else:
+                pos_ids_out[plan_label] = self._place(pos_ids, plan_label, lease)
         self._preplanned = ctx.is_preplan
         return pos_ids_out
 
@@ -403,14 +421,20 @@ class RopeManager(PositionManager):
     def commit(self, step: PositionStep, ctx: StepContext):
         all_counters = self._counters
         segments = step.segments
-        for rid, label, advance in zip(
-            segments.request_ids, segments.label_column(), self._advances(step), strict=True
-        ):
-            if advance:
-                counters = all_counters.get(rid)
-                if counters is None:
-                    counters = all_counters[rid] = {}
-                counters[label] = counters.get(label, 0) + advance
+        advances = self._advances(step)
+        if _rust_advance_positions is not None:
+            _rust_advance_positions(all_counters, segments, advances)
+        else:
+            if type(advances) is not tuple:
+                advances = (advances,) * len(segments)
+            for rid, label, advance in zip(
+                segments.request_ids, segments.label_column(), advances, strict=True
+            ):
+                if advance:
+                    counters = all_counters.get(rid)
+                    if counters is None:
+                        counters = all_counters[rid] = {}
+                    counters[label] = counters.get(label, 0) + advance
 
         # post-forks copy the source after this step advanced it, matching
         # where KV applies them
@@ -440,17 +464,17 @@ class RopeManager(PositionManager):
                     undo.append((rid, to_label, counters.get(to_label)))
                 counters[to_label] = counters.get(from_label, 0)
 
-    def _advances(self, step: PositionStep) -> tuple[int, ...]:
-        """how far does each segment move the stream counter?
+    def _advances(self, step: PositionStep) -> "int | tuple[int, ...]":
+        """how far does each segment move the stream counter: one value for
+        every segment, or one each?
 
         `step.advance` does override"""
         if step.advance is not None:
             return step.advance
-        spans = step.segments.span_column()
         if self._config.scheme == PosScheme.BLOCK:
             block_step = self._config.block_step
-            return tuple([block_step if span else 0 for span in spans])
-        return spans
+            return tuple([block_step if span else 0 for span in step.segments.span_column()])
+        return step.segments.spans
 
     def _explicit_pos_ids(
         self, step: PositionStep, plan_label: str, num_plans: int
@@ -480,48 +504,58 @@ class RopeManager(PositionManager):
             )
         return buffer
 
-    def _build_pos_ids(
-        self, rows: Segments, plan_label: str, lease,
-    ) -> torch.Tensor:
-        """step positions in KV plan order from stream counters; ``rows`` holds
-        each view's request, label and to_compute in plan order
-
-        Under a lease these go into pinned memory so `_place`'s `non_blocking`
-        copy is really asynchronous; from pageable memory the host waits. The
-        eager path has no slot to key a buffer by, so allocates plainly.
-        """
+    def _fill_pos_ids(self, rows: Segments, out: np.ndarray) -> int:
+        """Step positions in KV plan order from stream counters, into ``out``:
+        how many there are, and nothing written if that is more than fit.
+        ``rows`` holds each view's request, label and to_compute in plan order."""
         block = self._config.scheme == PosScheme.BLOCK
+        if _rust_position_ids_into is not None:
+            return _rust_position_ids_into(self._counters, rows, block, out)
         counters = self._counters
-        pos_ids: list[int] = []
-        if rows.spans == 1 and type(rows.labels) is not tuple:
-            # every row a decode row on one stream
-            label, get = rows.labels, counters.get
-            pos_ids = [get(rid, _NO_COUNTERS).get(label, 0) for rid in rows.request_ids]
+        num_tokens = sum(rows.span_column())
+        if num_tokens > len(out):
+            return num_tokens
+        at = 0
+        for rid, label, to_compute in rows.rows():
+            labels = counters.get(rid)
+            start = labels.get(label, 0) if labels is not None else 0
+            if block:
+                out[at:at + to_compute] = start
+            else:
+                out[at:at + to_compute] = np.arange(start, start + to_compute)
+            at += to_compute
+        return num_tokens
+
+    def _eager_pos_ids(self, rows: Segments) -> torch.Tensor:
+        """A step with no slot to key a buffer by: a plain new tensor."""
+        out = np.empty(sum(rows.span_column()), np.int64)
+        self._fill_pos_ids(rows, out)
+        return torch.from_numpy(out)
+
+    def _stage_pos_ids(self, rows: Segments, plan_label: str, lease) -> torch.Tensor:
+        """A leased step's positions, in the slot's pinned memory so the
+        ``non_blocking`` copy is really asynchronous; from pageable memory the
+        host waits. The buffer's tail beyond them keeps the previous step's
+        values: padding."""
+        key = (lease.bucket, lease.slot, plan_label)
+        slot = self._slot_positions.get(key)
+        if slot is None:
+            num_tokens = lease.bucket.num_tokens
+            slot_key = CGSlotKey(bucket=lease.bucket, slot=lease.slot, label=plan_label)
+            pinned = self._pinned_pos_ids_buffer(slot_key, num_tokens)
+            slot = self._slot_positions[key] = _SlotPositions(
+                self._static_buffer(slot_key, num_tokens), pinned, pinned.numpy(), num_tokens,
+            )
+        n = self._fill_pos_ids(rows, slot.host)
+        assert n <= slot.capacity, (
+            f"plan label {plan_label!r} carries {n} tokens but its "
+            f"captured bucket holds {slot.capacity}"
+        )
+        if n == slot.capacity:
+            slot.device.copy_(slot.pinned, non_blocking=True)
         else:
-            append, extend = pos_ids.append, pos_ids.extend
-            for rid, label, to_compute in rows.rows():
-                labels = counters.get(rid)
-                start = labels.get(label, 0) if labels is not None else 0
-                if to_compute == 1:
-                    append(start)  # a decode row
-                elif block:
-                    extend([start] * to_compute)
-                else:
-                    extend(range(start, start + to_compute))
-        if lease is None:
-            return torch.tensor(pos_ids, dtype=torch.long)
-        key = CGSlotKey(
-            bucket=lease.bucket, slot=lease.slot, label=plan_label
-        )
-        buffer = self._pinned_pos_ids_buffer(key, lease.bucket.num_tokens)
-        num_tokens = len(pos_ids)
-        assert num_tokens <= buffer.shape[0], (
-            f"plan label {plan_label!r} carries {num_tokens} tokens but its "
-            f"captured bucket holds {buffer.shape[0]}"
-        )
-        # through the numpy view, to avoid allocating a tensor
-        buffer.numpy()[:num_tokens] = pos_ids
-        return buffer[:num_tokens]
+            slot.device[:n].copy_(slot.pinned[:n], non_blocking=True)
+        return slot.device
 
     def _place(
         self, pos_ids: torch.Tensor, plan_label: str, lease
