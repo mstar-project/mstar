@@ -903,9 +903,11 @@ def test_a_blocked_process_follows_the_deployments_time():
     assert slots == 2, slots  # a read scans what was used, not all 64
 
 
-def test_two_blocked_processes_move_together_to_the_earlier_deadline():
-    """Both blocked on host deadlines: the clock goes to the earlier one, then the later, each
-    on time on the deployment's clock, in far less wall time than the deadlines are apart."""
+def test_blocked_processes_with_only_host_deadlines_keep_real_time():
+    """Both blocked on host deadlines, with no device time to jump to: the clock goes to the earlier
+    one, then the later, each on time on the deployment's clock and no sooner in real time. A
+    deployment that is wedged, every process polling on a timeout, shows its timeouts at real time,
+    not faster: idle processes don't leapfrog each other's deadlines."""
     early, late = run_deployment("""
         barrier()
         start = time.perf_counter()
@@ -920,7 +922,35 @@ def test_two_blocked_processes_move_together_to_the_earlier_deadline():
     """)
     first, woke = map(float, early.split())
     second, ended, wall = map(float, late.split())
-    assert 1.0 <= first < 1.2 and 2.0 <= second < 2.2 and woke < ended and wall < 1, (first, second, wall)
+    assert 1.0 <= first < 1.2 and 2.0 <= second < 2.2 and woke < ended and 1.9 < wall < 3, (first, second, wall)
+
+
+def test_a_wait_woken_early_isnt_due_before_its_timeout():
+    """A poll ends early whenever the mover pokes the eventfd every poll of the process shares, to
+    end some other wait: that is no timeout, so its deadline isn't due, and the clock doesn't go
+    there before its time has passed in real time."""
+    out = run_sim("""
+        import selectors, threading, time
+        from mstar_sim import clock, waits
+        stop = threading.Event()
+
+        def poke():
+            while not stop.is_set():
+                waits._poke()  # as the mover ends another wait
+                waits._real_sleep(0.05)
+                try:
+                    waits.os.eventfd_read(waits._wakefd[0])
+                except BlockingIOError:
+                    pass
+
+        threading.Thread(target=poke, name=waits.OWN + "poker", daemon=True).start()
+        selector = selectors.DefaultSelector()
+        wall = clock._real()
+        selector.select(1.0)
+        stop.set()
+        print(clock._real() - wall)
+    """)
+    assert float(out) > 0.9, out
 
 
 def test_a_fixed_rate_client_keeps_up_with_a_worker_a_message_is_in_flight_to():

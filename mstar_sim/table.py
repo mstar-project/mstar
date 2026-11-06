@@ -119,9 +119,10 @@ class Table:
 
     def start_at(self) -> float | None:
         """Where a new process's clock starts: level with the deployment, so a respawn or a late
-        client lands in its present (None: this is the first)."""
-        bound = self.bound()
-        return bound if math.isfinite(bound) else self.latest() or None
+        client lands in its present, the furthest any process has got, but no further than the
+        bound: not at a blocked process's next deadline, which no one has reached (None: this is
+        the first)."""
+        return min(self.bound(), self.latest()) or None
 
     def latest(self) -> float:
         """The latest clock among the others (0.0: none has published)."""

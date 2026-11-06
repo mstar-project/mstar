@@ -24,11 +24,10 @@ two clauses. Blocked, a process follows the bound (how far the others let it go)
 next deadline: mstar's sleep loops poll what other processes write, so no host deadline goes
 past it, though a device deadline needs no one. With nothing to bound it, a host deadline
 becomes a move only once its timeout has passed in real time (it is then due: :func:`_until`),
-so a lone idle process keeps real time rather than spin ahead. Idle processes of one table do
-step event to event, as fast as they settle: a timer on anything outside the table (a client
-that isn't in it, a socket read) can fire early in real time (README Limits). Running, a thread
-that reads the clock more than W past the bound waits there (:func:`read`), blocked, until the
-bound rises. A thread at a collective's meet stands still, as NCCL's host doesn't wait: only a
+and so does one past every clock in the deployment: a blocked process follows what a peer has
+reached, but idle processes don't leapfrog each other's deadlines, so they keep real time.
+Running, a thread that reads the clock more than W past the bound waits there (:func:`read`),
+blocked, until the bound rises. A thread at a collective's meet stands still, as NCCL's host doesn't wait: only a
 device deadline moves it, and it stands aside from the bound until its group has all come
 (:meth:`mstar_sim.table.Table.bound`).
 
@@ -212,20 +211,22 @@ def leave(w: Wait | None) -> None:
 
 
 def _until(w: Wait | None, timeout, attempt):
-    """``attempt(seconds)``, a wait ending in real time (falsy if it timed out), for wait ``w``:
-    retried until it ends or the clock reaches ``w``'s deadline (none: tried once). After its
-    real timeout the deadline is due (with no bound, the mover may then move the clock to it).
-    The mover ends it (``w.release``, ``w.timed_out``) when the clock gets there."""
+    """``attempt(seconds)``, a wait ending in real time (falsy if it timed out, or if it ended
+    early: a poke for another wait of the process), for wait ``w``: retried until it ends or the
+    clock reaches ``w``'s deadline (none: tried once). Once its real timeout has passed the
+    deadline is due (the mover may then move the clock to it, though no peer has got there). The
+    mover ends it (``w.release``, ``w.timed_out``) when the clock gets there."""
     result = attempt(timeout)
     while not result and w is not None and w.deadline is not None:
         with LOCK:
             t = clock.now()
             if w.timed_out or t >= w.deadline:
                 break
-            if not w.due:
+            left = timeout - (clock._real() - w.real)  # of its real timeout
+            if left <= 0 and not w.due:
                 w.due = True
                 kick()
-        result = attempt(w.deadline - t)
+        result = attempt(w.deadline - t if left <= 0 else min(left, w.deadline - t))
     return result
 
 
@@ -332,8 +333,10 @@ def _move() -> float:
         if device < math.inf and (device <= host or bound == math.inf or meet):
             target = min(device, host)  # a device deadline needs no one, and a sleep on its way ends as it passes
         elif not meet:
-            due = min((w.deadline for w in hosts if w.due), default=math.inf)
-            target = min(host, bound) if bound < math.inf else due
+            # a host deadline past every clock in the deployment moves only once it is due in real
+            # time (its wait took its timeout for real): one up to what a peer has reached is following
+            due = min((w.deadline for w in hosts if w.due), default=-math.inf)
+            target = min(host, bound, max(TABLE.latest(), due))
             if bound < host < math.inf:  # the bound, running, wakes no one as it rises
                 timeout = min(timeout, max(host - bound, SETTLE))
             if target < math.inf and target > clock.now():

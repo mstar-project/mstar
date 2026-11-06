@@ -159,11 +159,11 @@ the roofline.
   process isn't moved past one; a third process can read the receiver's old next event just
   before, which a 200 us settle window covers but a loaded box can overrun. Nothing counts that
   case (`late_deliveries` counts only a message a process polls near its own move).
-- Idle processes of one table step from event to event, faster than real time. A timer in it on
-  something outside the table fires early in real time: uvicorn's 5 s keep-alive closes a plain
-  client's idle connection early, and a socket read with a timeout (a remote fetch) can time out
-  falsely. Run clients under the emulator. A process stays in its table until it dies, running at
-  real rate once it begins to exit, so a peer's `join(timeout)` waits out its finalization.
+- Idle processes keep real time: a host deadline (a sleep, a timeout) past every clock in the
+  deployment moves the clock only once it has passed in real time, so a wedged deployment shows
+  its timeouts when they would fire, not sooner. Only device time jumps. A process stays in its
+  table until it dies, running at real rate once it begins to exit, so a peer's `join(timeout)`
+  waits out its finalization.
 - A thread at a collective's meet holds its process's host deadlines (a sleep beside it) until
   the meet ends; device waits beside it end on time.
 - A native task of a process with nothing else running that stays on a CPU (a spin wait) holds
