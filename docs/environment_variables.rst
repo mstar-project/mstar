@@ -41,6 +41,11 @@ Communication
        could not be captured, instead of serving that bucket eagerly at
        10-20x the latency. Off by default: a failed capture is logged at
        ERROR with a per-runner summary and the rest keeps running.
+   * - ``MSTAR_TORCH_DIR``
+     - the build interpreter's torch
+     - Build time only: where ``rust/build.rs`` finds torch's ``include/`` and
+       ``lib/`` to compile the torch ABI shim, for a build isolated from the
+       environment's torch (a wheel build, ``pip install ./rust``).
    * - ``MSTAR_DEPLOYMENT_TOKEN``
      - random per launch
      - Mixed into the namespace of the SHM tensor files and arena segments,

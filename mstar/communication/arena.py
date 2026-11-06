@@ -70,6 +70,7 @@ from mstar.communication.tensors import (
     _nullcontext,
     _serialize_tensor,
 )
+from mstar.communication.torch_abi import require_torch_abi
 from mstar.graph.base import GraphEdge, TensorPointerInfo
 from mstar.platforms import current_platform
 from mstar.utils.containers import ParallelList
@@ -369,6 +370,9 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
             enable_prof=enable_prof,
         )
         from mstar_rust import SegmentedShmArena, ShmArena
+
+        # At startup, not at the first tensor: an unsupported torch is an error here.
+        require_torch_abi(device)
 
         # A CPU consumer's reads (the API server's outputs) copy on these.
         self._host_copier = HostCopier(copy_workers)

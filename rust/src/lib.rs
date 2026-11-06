@@ -6,7 +6,8 @@
 //! new components land as new modules with their own bindings. Also
 //! usable as a plain Rust library (rlib) by Rust-side consumers; without the
 //! `python` feature (rust/server) it builds only the transport and arena and
-//! links no Python, since the bindings, `graph` and `tensors` need pyo3.
+//! links no Python, since the bindings, `graph`, `tensors` and `torch_abi` need
+//! pyo3.
 //! Build: `maturin develop --release` in rust/.
 
 #[cfg(feature = "python")]
@@ -17,6 +18,8 @@ pub mod graph;
 pub mod shm;
 #[cfg(feature = "python")]
 pub mod tensors;
+#[cfg(feature = "python")]
+pub mod torch_abi;
 
 #[cfg(feature = "python")]
 pub use bindings::PyZmqCommunicator;

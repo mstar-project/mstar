@@ -229,6 +229,7 @@ dependencies = [
 name = "mstar-rust"
 version = "0.1.1"
 dependencies = [
+ "cc",
  "libc",
  "memmap2",
  "pyo3",

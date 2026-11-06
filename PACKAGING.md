@@ -61,6 +61,10 @@ mstar but cannot serve until the extension is built (docs/installation.rst).
   unmodified upstream release that the zeromq-src 0.2.6+4.3.4 crate vendors:
   <https://github.com/zeromq/libzmq/releases/tag/v4.3.4>. The build only adds
   defines (`.cargo/config.toml`).
+- **The torch ABI shim.** The extension embeds a small C++ library built against
+  torch's headers (`rust/build.rs`) and dlopens it after torch is imported, so
+  `import mstar_rust` and `rust/server` need no torch. Wheels build it against
+  the oldest supported torch (`MSTAR_TORCH_DIR`, see `.github/workflows/release.yml`).
 - **Two copies of `mstar_rust`.** `maturin develop` (or `pip install ./rust`)
   installs `rust/` as a separate `mstar-rust` distribution, a `mstar_rust/`
   package directory. In an environment that also has a Rust wheel's top-level
