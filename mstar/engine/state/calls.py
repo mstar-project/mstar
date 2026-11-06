@@ -10,7 +10,17 @@ from typing import Any
 import torch
 
 from mstar.engine.resources.step import StepHandle
-from mstar.engine.state.contract import EMPTY, Array, ArrayStep, GatedDeltaNet, Reached, Sampler, is_value
+from mstar.engine.state.contract import (
+    EMPTY,
+    FUSED_DRAW_MAX_VOCAB,
+    Array,
+    ArrayStep,
+    FusedDrawArgs,
+    GatedDeltaNet,
+    Reached,
+    Sampler,
+    is_value,
+)
 from mstar.engine.state.host import HostFields, is_host_value
 
 
@@ -371,6 +381,7 @@ class SamplerHandle(StepHandle):
         self.rows = ()
         self._open = False
         self._drawn = 0
+        self._fused = False
 
     def _refusal(self, cause: str) -> ValueError:
         return ValueError(f"Sampler {self.name!r}: {cause}")
@@ -381,6 +392,7 @@ class SamplerHandle(StepHandle):
         self._open = True
         self.rows = step.ctx.padded_request_ids
         self._drawn = 0
+        self._fused = False
 
     def check_step(self, step) -> None:
         # a step that keeps no row's sample may skip the kernel: an eager prefill short of its last chunk
@@ -394,6 +406,7 @@ class SamplerHandle(StepHandle):
 
     def end_step(self, step) -> None:
         self._open = False
+        self._fused = False
 
 
 @torch.compiler.disable
@@ -456,6 +469,30 @@ def sample(s: SamplerHandle, logits: torch.Tensor) -> torch.Tensor:
     if s._drawn > s.sampler.draws:
         raise s._refusal(f"sample number {s._drawn} in one step, and draws is {s.sampler.draws}")
     return s.resource.sample(list(s.rows), logits=logits)
+
+
+@torch.compiler.disable
+def fused_draw_args(s: SamplerHandle) -> FusedDrawArgs | None:
+    """Each row's sampling parameters, padding rows included, for a kernel in the forward that draws as `sample` would.
+    None when `sample` would draw any other way this step, or the declared vocabulary is past what `draw_row`
+    reproduces, and the model then calls `sample`."""
+    if not s._open:
+        raise s._refusal("fused_draw_args in a step that doesn't list the sampler")
+    args = None if s.sampler.vocab_size > FUSED_DRAW_MAX_VOCAB else s.resource.fused_draw_args()
+    s._fused = args is not None
+    return args
+
+
+@torch.compiler.disable
+def drew(s: SamplerHandle, n: int) -> None:
+    """Count ``n`` draws a kernel made from `fused_draw_args`, and advance each row's sampling state as ``n`` `sample`
+    calls would. Called after the launch, so the advance is ordered after the kernel's reads."""
+    if not s._fused:
+        raise s._refusal("drew, and no fused_draw_args this step returned arguments")
+    if not (type(n) is int and n >= 1 and s._drawn + n <= s.sampler.draws):
+        raise s._refusal(f"drew({n!r}) after {s._drawn} draws, and draws is {s.sampler.draws}")
+    s.resource.advance_offsets(n)
+    s._drawn += n
 
 
 # Eager as a whole, as `AttentionManager.select_last_hidden` explains.

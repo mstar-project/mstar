@@ -27,6 +27,7 @@ import torch
 import triton
 import triton.language as tl
 
+from mstar.engine.state.contract import FUSED_DRAW_MAX_VOCAB, FusedDrawArgs
 from mstar.utils.device import DeviceCapability
 from mstar.utils.h2d import H2DMirror, PinnedStager, to_device_nonblocking
 from mstar.utils.knobs import sampler_slots
@@ -755,16 +756,6 @@ def _fused_sample_kernel(
 FUSED_SAMPLE_MAX_VOCAB = 4096
 
 
-class FusedDrawArgs(NamedTuple):
-    """A step's per-row ``fused_sample`` parameters, for a kernel that draws as it does."""
-
-    temperature: torch.Tensor
-    top_k: torch.Tensor
-    top_p: torch.Tensor
-    seed: torch.Tensor
-    offset: torch.Tensor
-
-
 def fused_sample(
     logits: torch.Tensor, temperature: torch.Tensor, top_k: torch.Tensor, top_p: torch.Tensor,
     seed: torch.Tensor, offset: torch.Tensor,
@@ -783,7 +774,7 @@ def fused_sample(
         rep_penalty if penalty else temperature, seen_tokens if penalty else logits, out,
         V, logits.stride(0),
         seen_tokens.stride(0) if penalty else 0, seen_tokens.stride(1) if penalty else 0,
-        APPLY_PENALTY=penalty, BLOCK=triton.next_power_of_2(V), num_warps=4 if V <= 2048 else 8,
+        APPLY_PENALTY=penalty, BLOCK=triton.next_power_of_2(V), num_warps=4 if V <= FUSED_DRAW_MAX_VOCAB else 8,
     )
     return out
 

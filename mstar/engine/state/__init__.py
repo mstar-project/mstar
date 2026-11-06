@@ -9,6 +9,8 @@ from mstar.engine.resources.step import (
 from mstar.engine.state.calls import (
     at_last_token,
     causal_conv,
+    drew,
+    fused_draw_args,
     gated_delta_net,
     host,
     kernel_setting,  # noqa: F401
@@ -27,6 +29,7 @@ from mstar.engine.state.contract import (
     CausalConv,
     Entry,
     Fork,
+    FusedDrawArgs,
     GatedDeltaNet,
     KVEntry,
     Layout,
@@ -45,9 +48,9 @@ from mstar.engine.state.contract import (
 )
 from mstar.engine.state.state_op import state_op
 
-# `kernel_setting` and `SubmoduleStep` stay out of `__all__`, whose names can't be removed after release.
-# `kernel_setting` is temporary. `SubmoduleStep` is the engine's own dataclass, and the rebuild after release replaces
-# its `steps`, `cg_key_info` and `_ctx`.
+# `kernel_setting`, `SubmoduleStep`, `draw_row` and `draw_row_layout` stay out of `__all__`, whose names can't be
+# removed after release. `kernel_setting` is temporary. `SubmoduleStep` is the engine's own dataclass, and the rebuild
+# after release replaces its `steps`, `cg_key_info` and `_ctx`. `draw_row` is the reference for what a fused draw picks.
 __all__ = [
     "Array",
     "ArrayStep",
@@ -57,6 +60,7 @@ __all__ = [
     "CausalConv",
     "Entry",
     "Fork",
+    "FusedDrawArgs",
     "GatedDeltaNet",
     "KVEntry",
     "Layout",
@@ -77,6 +81,8 @@ __all__ = [
     "Window",
     "at_last_token",
     "causal_conv",
+    "drew",
+    "fused_draw_args",
     "gated_delta_net",
     "host",
     "last_sampled",
@@ -86,3 +92,12 @@ __all__ = [
     "sample",
     "state_op",
 ]
+
+
+def __getattr__(name: str):
+    # imported on first use, so that importing the contract doesn't import Gluon
+    if name in ("draw_row", "draw_row_layout"):
+        from mstar.engine.resources.sampler import fused_draw
+
+        return fused_draw.draw_row if name == "draw_row" else fused_draw.layout
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
