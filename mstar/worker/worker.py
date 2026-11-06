@@ -2866,6 +2866,11 @@ class Worker(RepeatingSteps):
         the requests it names fail instead.
         """
         _drop_unprepared_rows(batch, node_batch)
+        if node_batch.stream_windows:
+            # Admission failed before any forward. Dropped rows will never
+            # retry their retained input; the others keep the runtime's input.
+            keep = set(batch.request_to_worker_graph) - node_batch.failed_requests.keys()
+            self._settle_stream_windows(node_batch, {}, keep)
 
         reason = node_batch.admit_error
         if isinstance(reason, AllocationFailed):
@@ -3903,6 +3908,9 @@ class Worker(RepeatingSteps):
                 request_ids=batch_N.node_batch.request_ids,
             )
             self._settle_run(batch_N, materialized[1], self.engine_manager.get_engine(batch_N.node_name))
+        elif batch_N.node_batch.stream_windows:
+            self._wait_for_step(batch_N)
+            self._settle_stream_windows(batch_N.node_batch, batch_N.node_batch.step_context.run_counts or {})
 
         if self.enable_nvtx:
             range_push("worker.postprocess.cleanup_inputs", synchronize=False)

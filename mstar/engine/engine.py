@@ -2704,6 +2704,14 @@ class Engine:
             if nvtx:
                 range_pop()
 
+        if batch.stream_windows and batch.run_started is None:
+            # Physical execution is known before output collection or a model
+            # tail can fail. Per-request forwards aggregate into the batch's
+            # existing execution facts, not their temporary resource contexts.
+            actual = dict(batch.step_context.run_counts or {})
+            actual.update(dict.fromkeys(request_ids, ctx.repeats))
+            batch.step_context.run_counts = MappingProxyType(actual)
+
         if step is not None:
             if nvtx:
                 range_push("engine.commit")

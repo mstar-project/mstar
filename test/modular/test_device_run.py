@@ -500,7 +500,8 @@ def test_the_worker_settles_each_row_even_if_another_reaches_the_full_bound(monk
     worker = Worker.__new__(Worker)
     ended = []
     engine = SimpleNamespace(settle_run=lambda batch, ran, counts: ended.append((ran, counts)))
-    batch = SimpleNamespace(batch=SimpleNamespace(repeats=4), node_batch=object(), graph_walk=WALK)
+    batch = SimpleNamespace(batch=SimpleNamespace(repeats=4),
+                            node_batch=SimpleNamespace(stream_windows={}), graph_walk=WALK)
     monkeypatch.setattr(profiler, "PHASE_PERIOD", 1)
     profiler.phase_buffer().clear()
     tokens = torch.tensor([[1, 2, 3, 0], [4, 5, 6, 0]])  # the last column was never written
@@ -548,6 +549,7 @@ def _skipped_step(worker, log, words, rows=(1, 2), **node_batch):
         node_batch=SimpleNamespace(**{
             "run_started": Word(), "step_context": SimpleNamespace(repeats=8), "completion_event": None,
             "request_ids": list(rows), "cached_rids": set(), "failed_requests": {}, "ring_bases": {}, "ring_width": 8,
+            "stream_windows": {},
             **node_batch,
         }),
     )
@@ -647,11 +649,21 @@ def test_a_skipped_step_gives_back_only_the_rows_a_refused_one_would():
         worker, log, iter([RUN_SKIPPED]), rows=(1, 2, 3, 4), request_ids=[1, 2, 4], failed_requests={4: "boom"},
     )
     worker._graph_runtime.pending_loop_stop_rids = lambda rids, loop: [2]
+    from mstar.streaming.stream_buffer import StreamChunkInfo, StreamingEdge, StreamReservation
+
+    step.node_batch.stream_windows = {rid: [StreamingEdge("text", "n", [], StreamChunkInfo(
+        0, 0, 8, False, StreamReservation(0, 4, 4),
+    ))] for rid in (1, 2, 3, 4)}
+    retired = []
+    worker._wait_for_step = lambda step: retired.append("completed")
+    worker.streams = SimpleNamespace(settle_window=lambda rid, edge, n: retired.append((rid, n)))
     failed = []
     worker._fail_step_rows = lambda step, outputs: failed.append((dict(step.node_batch.failed_requests), outputs))
     assert worker._landed_skipped(step) is True
     assert ("queued", [1, 4]) in log, log
     assert failed == [({4: "boom"}, "outputs")]
+    assert retired == ["completed", (2, 0), (3, 0), (4, 0)]
+    assert set(step.node_batch.stream_windows) == {1}, "only a retried row retains its original reader"
 
 
 @pytest.mark.parametrize("later_tokens", [0, 4])

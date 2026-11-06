@@ -9,7 +9,7 @@ are the ones that need the worker's runtime, engine and streams, kept out of
 from __future__ import annotations
 
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import TYPE_CHECKING
 
 import torch
@@ -406,6 +406,10 @@ class RepeatingSteps:
             for rid, base in bases.items():
                 engine.ring_rows(step.node_name).ring_skip(signal, rid, range(base, base + node_batch.ring_width))
         self._keep_rows_to_retry(step)
+        if node_batch.stream_windows:
+            self._wait_for_step(step)
+            keep = set(step.batch.request_to_worker_graph) - node_batch.failed_requests.keys()
+            self._settle_stream_windows(node_batch, {}, keep)
         self._push_back_batch(step.batch)
         if node_batch.failed_requests:
             self._fail_step_rows(step, outputs)
@@ -540,7 +544,22 @@ class RepeatingSteps:
         executions = host_rows.buffers.pop(RUN_COUNTS)
         counts = dict(zip(host_rows.request_ids, executions[:len(host_rows.request_ids)].tolist(), strict=True))
         engine.settle_run(batch_N.node_batch, ran, counts)
+        self._settle_stream_windows(batch_N.node_batch, counts)
         batch_N.batch.repeats = ran
+
+    def _settle_stream_windows(self, node_batch, counts: Mapping[int, int], keep=frozenset()) -> None:
+        """Retire source inputs only after their reader completed. A skipped
+        or refused reader pushed back with its graph inputs keeps its snapshot.
+        Graph cleanup independently releases the reader's tensor references.
+        """
+        for rid, edges in node_batch.stream_windows.items():
+            if rid not in keep:
+                for edge in edges:
+                    if edge.chunk.reservation is not None:
+                        self.streams.settle_window(rid, edge, counts.get(rid, 0))
+        node_batch.stream_windows = {
+            rid: edges for rid, edges in node_batch.stream_windows.items() if rid in keep
+        }
 
     def _cut_run_items(
         self, batch_N: PendingBatch, outputs: BatchedModelOutput, step: PostprocessStep,
