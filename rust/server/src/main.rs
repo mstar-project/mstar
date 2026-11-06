@@ -1358,7 +1358,19 @@ async fn generate_finish(
             .or_default()
             .push(json!({"data": media::b64(&c.data), "metadata": c.metadata}));
     }
-    Json(json!({"request_id": request_id, "outputs": outputs})).into_response()
+    let mut body = json!({"request_id": request_id, "outputs": outputs});
+    if let Some(v) = top_level_weight_version(&chunks) {
+        body["weight_version"] = v.clone();
+    }
+    Json(body).into_response()
+}
+
+/// The top-level `weight_version` of a non-streaming `/generate`: the first
+/// chunk that carries one, as the Python frontend reads it. Only once a reload
+/// named a version, which every chunk carries the same; a request that
+/// completed with no output chunks has none on either frontend.
+fn top_level_weight_version(chunks: &[ResultChunk]) -> Option<&Value> {
+    chunks.iter().find_map(|c| c.metadata.get("weight_version"))
 }
 
 /// The Python `/generate`'s refusals for `video_frame`, worded the same: raw
@@ -1400,6 +1412,15 @@ fn ndjson_line(c: &ResultChunk) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_top_level_version_is_the_first_chunk_that_carries_one() {
+        let chunk = |metadata: Value| ResultChunk { modality: "text".into(), data: vec![], metadata };
+        assert_eq!(top_level_weight_version(&[]), None);
+        assert_eq!(top_level_weight_version(&[chunk(json!({}))]), None);
+        let chunks = [chunk(json!({})), chunk(json!({"weight_version": "v3"})), chunk(json!({"weight_version": "v3"}))];
+        assert_eq!(top_level_weight_version(&chunks), Some(&json!("v3")));
+    }
     use mstar_rust::communicator::RawZmqCommunicator;
     use std::sync::atomic::{AtomicBool, Ordering};
 
