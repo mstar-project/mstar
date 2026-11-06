@@ -2421,7 +2421,7 @@ example, ``configs/qwen3tts.yaml`` selects FA2 under ``talker_attn``,
 **Context parallelism.** ``context_parallel: true`` on a paged KV pool stripes each page's slots
 over the ranks that would otherwise store the same KV heads: slot ``s`` lives on partner
 ``s % P``, page ids stay the same on every rank, and each rank holds ``page_size / P`` slots a
-page. Attention runs on each rank's slots and merges the partials across the partners exactly
+page. Attention runs on each rank's slots and merges the partials across the partners
 (``mstar/engine/resources/context_parallel.py``). The model declares nothing.
 
 - **TP mode (no SP ranks).** The partners are the TP ranks sharing a KV head,

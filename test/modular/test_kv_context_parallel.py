@@ -34,7 +34,13 @@ from mstar.engine.resources.attn import flashinfer as fi_mod
 from mstar.engine.resources.attn.base import AttentionManager
 from mstar.engine.resources.attn.config import AttentionConfig, AttentionSpec, AttentionStep, AttnBackend
 from mstar.engine.resources.base import EngineResourceInfo, Resource
-from mstar.engine.resources.context_parallel import ContextParallelWrapper, merge
+from mstar.engine.resources.context_parallel import (
+    ContextParallelWrapper,
+    _merge_states,
+    _merge_states_fits,
+    _merge_states_kernel,
+    merge,
+)
 from mstar.engine.resources.kv import manager as manager_mod
 from mstar.engine.resources.kv.cache import KVCache
 from mstar.engine.resources.kv.config import KVLayout, KVReqConfig, KVSpec, KVStep, PagedKVConfig
@@ -762,6 +768,51 @@ def test_a_capture_combining_labels_over_a_placed_pool_is_refused_at_load_if_it_
         return
     with pytest.raises(ValueError, match=r"t3: the capture of 'decode' at batch size 2 combines labels.*\['kv'\]"):
         runner.prepare_for_capture()
+
+
+def _merge_states_stand_in(v, s):
+    """FlashInfer's ``merge_states``: contiguous ``[N, K, H, D]`` and base-2 ``[N, K, H]`` fp32 in."""
+    assert v.is_contiguous() and s.is_contiguous() and s.dtype == torch.float32 and s.shape == v.shape[:3]
+    weights = torch.exp2(s - s.amax(1, keepdim=True)).nan_to_num_(0)
+    total = weights.sum(1).clamp_min(torch.finfo(torch.float32).tiny).unsqueeze(-1)
+    return ((weights.unsqueeze(-1) * v.float()).sum(1) / total).to(v.dtype), None
+
+
+@pytest.mark.parametrize("shape,k", [((6, 4, 64), 2), ((2, 3, 2, 128), 3), ((2, 4, 128), 2), ((2, 4, 256), 9)],
+                         ids=["K2", "BSHD-K3", "low-batch", "low-batch-large-K"])
+@pytest.mark.parametrize("device", [
+    "cpu", pytest.param("cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")),
+])
+def test_the_fused_merge_is_the_fp32_merge(device, shape, k):
+    """FlashInfer's kernel (a stand-in on CPU) against the merge in torch: parts in bf16, one from a
+    rank holding none of a row's keys and one row no part has a key for. Within one bf16 step of a
+    part, which a batch of at most K rounds partial merges to."""
+    kernel = _merge_states_stand_in if device == "cpu" else _merge_states_kernel()
+    gen = torch.Generator().manual_seed(0)
+    outs = torch.randn(k, *shape, generator=gen).to(device, torch.bfloat16)
+    lses = (4 * torch.randn(k, *shape[:-1], generator=gen)).to(device)
+    lses[0, 0] = -math.inf
+    outs[:, 1], lses[:, 1] = 0, -math.inf
+    got = _merge_states(kernel, outs, lses)
+    assert torch.isfinite(got).all() and not got[1].any()
+    torch.testing.assert_close(got, merge(outs.float(), lses).to(torch.bfloat16), rtol=1.6e-2, atol=2**-7)
+    if device == "cuda":
+        assert torch.equal(merge(outs, lses), got)
+
+
+@pytest.mark.parametrize("dtype,shape,k,fits", [
+    (torch.bfloat16, (8, 32, 256), 2, True),
+    (torch.float32, (8, 32, 256), 2, False),
+    (torch.bfloat16, (8, 32, 72), 2, False),
+    (torch.bfloat16, (8, 33, 256), 2, False),
+    (torch.bfloat16, (8, 128, 64), 2, True),
+    (torch.bfloat16, (0, 32, 256), 2, False),
+    (torch.bfloat16, (2**19 - 1, 16, 256), 2, True),
+    (torch.bfloat16, (2**19, 16, 256), 2, False),
+], ids=["fits", "fp32", "head-dim", "over-a-block", "a-block", "empty", "last-offset", "past-32-bits"])
+def test_the_fused_merge_takes_only_what_its_kernel_can_launch_and_index(dtype, shape, k, fits):
+    """Past these the launch fails, or for 32-bit offsets reads another query's part unnoticed."""
+    assert _merge_states_fits(torch.empty(shape, dtype=dtype, device="meta"), k) is fits
 
 
 def test_a_dropped_preplan_leaves_its_own_token_wrappers_nothing_to_skip(monkeypatch):
