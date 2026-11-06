@@ -99,6 +99,10 @@ impl SpillFiles {
         }
     }
 
+    pub fn entity(&self) -> &str {
+        &self.entity
+    }
+
     pub fn path(&self, entity: &str, uuid: u64) -> String {
         format!("{}/{}{entity}_{uuid}", self.dir, self.prefix)
     }

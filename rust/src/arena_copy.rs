@@ -21,7 +21,7 @@ use pyo3::exceptions::{PyKeyError, PyRuntimeError, PyValueError};
 use pyo3::intern;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyString, PyTuple};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::arena_capacity::{
     monotonic_now, slot_counts, Capacity, CapacityPolicy, Reserved, Slot, StageError, SpillFiles,
@@ -238,6 +238,17 @@ pub struct ReadOut {
     did_work: bool,
     deferred: Vec<u32>,
     keep: Vec<Py<PyAny>>,
+}
+
+/// What `read_edges` did. `other_*` are parallel columns of `(request, edge,
+/// info)` positions that it left for the caller; `keep` as in [`ReadOut`].
+#[pyclass(get_all)]
+pub struct ReadEdgesOut {
+    did_work: bool,
+    keep: Vec<Py<PyAny>>,
+    other_requests: Vec<u32>,
+    other_edges: Vec<u32>,
+    other_infos: Vec<u32>,
 }
 
 /// One manager's transport. Every method takes the GIL only for its first and
@@ -638,6 +649,100 @@ impl PyArenaTransport {
         origins: &Bound<'py, PyDict>,
         host_max: Option<usize>,
     ) -> PyResult<ReadOut> {
+        if rids.len() != infos.len() {
+            return Err(PyValueError::new_err("rids and infos must be parallel"));
+        }
+        let infos: Vec<_> = infos.iter().collect();
+        self.read_rows(py, &store, &rids, &infos, refs, device_type, origins, host_max)
+    }
+
+    /// `read` for the descriptors of `requests`, a list of `(rid, edges)`: every
+    /// one this call can read goes straight through, and what comes back is a
+    /// column of positions for the caller to settle one by one. Those are a
+    /// tensor of this entity's own, one the store already holds, one met earlier
+    /// in the batch, and one left to the HostCopier.
+    #[pyo3(signature = (store, requests, refs, device_type, origins, host_max=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn read_edges<'py>(
+        &self,
+        py: Python<'py>,
+        store: PyRef<'py, TensorBookkeeping>,
+        requests: &Bound<'py, PyList>,
+        refs: i64,
+        device_type: i32,
+        origins: &Bound<'py, PyDict>,
+        host_max: Option<usize>,
+    ) -> PyResult<ReadEdgesOut> {
+        let mut infos = Vec::new();
+        let mut uuids = Vec::new();
+        let mut rids = Vec::new();
+        let mut places: Vec<(u32, u32, u32)> = Vec::new();
+        let mut others: Vec<(u32, u32, u32)> = Vec::new();
+        let own = self.capacity.spill.entity();
+        for (r, request) in requests.iter().enumerate() {
+            let request = request.downcast_into::<PyTuple>()?;
+            let rid: RidKey = request.get_borrowed_item(0)?.extract()?;
+            for (e, edge) in request.get_borrowed_item(1)?.try_iter()?.enumerate() {
+                let tensor_info = edge?.getattr(intern!(py, "tensor_info"))?;
+                for (i, info) in tensor_info.try_iter()?.enumerate() {
+                    let info = info?;
+                    let place = (r as u32, e as u32, i as u32);
+                    let entity = info.getattr(intern!(py, "source_entity"))?;
+                    if entity.downcast::<PyString>()?.to_str()? == own {
+                        others.push(place);
+                        continue;
+                    }
+                    uuids.push(info.getattr(intern!(py, "uuid"))?.extract::<u64>()?);
+                    infos.push(info);
+                    rids.push(rid.clone());
+                    places.push(place);
+                }
+            }
+        }
+        {
+            // Apart from the attribute reads above, which can allocate: a
+            // collection could run a finalizer, which must not find this lock.
+            let bk = store.share_lock();
+            let mut seen = FxHashSet::with_capacity_and_hasher(uuids.len(), Default::default());
+            let kept: Vec<bool> =
+                uuids.iter().map(|&u| !bk.has_tensor(u) && seen.insert(u)).collect();
+            drop(bk);
+            if kept.contains(&false) {
+                let mut k = kept.iter();
+                others.extend(places.iter().zip(&kept).filter(|(_, &keep)| !keep).map(|(p, _)| *p));
+                infos.retain(|_| *k.next().expect("parallel"));
+                let mut k = kept.iter();
+                rids.retain(|_| *k.next().expect("parallel"));
+                let mut k = kept.iter();
+                places.retain(|_| *k.next().expect("parallel"));
+            }
+        }
+        let out = self.read_rows(py, &store, &rids, &infos, refs, device_type, origins, host_max)?;
+        others.extend(out.deferred.iter().map(|&i| places[i as usize]));
+        others.sort_unstable();
+        Ok(ReadEdgesOut {
+            did_work: out.did_work,
+            keep: out.keep,
+            other_requests: others.iter().map(|p| p.0).collect(),
+            other_edges: others.iter().map(|p| p.1).collect(),
+            other_infos: others.iter().map(|p| p.2).collect(),
+        })
+    }
+}
+
+impl PyArenaTransport {
+    #[allow(clippy::too_many_arguments)]
+    fn read_rows<'py>(
+        &self,
+        py: Python<'py>,
+        store: &PyRef<'py, TensorBookkeeping>,
+        rids: &[RidKey],
+        infos: &[Bound<'py, PyAny>],
+        refs: i64,
+        device_type: i32,
+        origins: &Bound<'py, PyDict>,
+        host_max: Option<usize>,
+    ) -> PyResult<ReadOut> {
         let abi = abi().ok_or_else(|| PyRuntimeError::new_err("torch_abi_load has not run"))?;
         let on_device = device_type != DEVICE_CPU;
         let stream = match (on_device, &self.cuda, self.h2d_stream) {
@@ -650,7 +755,7 @@ impl PyArenaTransport {
         // segment met for the first time is mapped without the GIL (pinning takes
         // tens of ms), then the pass runs again.
         let parsed = loop {
-            let pass = self.parse_reads(&rids, infos, on_device, origins, host_max, abi)?;
+            let pass = self.parse_reads(rids, infos, on_device, origins, host_max, abi)?;
             if pass.missing.is_empty() {
                 break pass;
             }
@@ -800,15 +905,12 @@ impl PyArenaTransport {
     fn parse_reads<'py>(
         &self,
         rids: &[RidKey],
-        infos: &Bound<'py, PyList>,
+        infos: &[Bound<'py, PyAny>],
         on_device: bool,
         origins: &Bound<'py, PyDict>,
         host_max: Option<usize>,
         abi: &dyn TorchAbi,
     ) -> PyResult<ParsedReads<'py>> {
-        if rids.len() != infos.len() {
-            return Err(PyValueError::new_err("rids and infos must be parallel"));
-        }
         let mut out = ParsedReads {
             infos: Vec::with_capacity(infos.len()),
             rows: Vec::with_capacity(infos.len()),
@@ -823,7 +925,7 @@ impl PyArenaTransport {
         };
         let mut last: Option<(*mut pyo3::ffi::PyObject, u32)> = None;
         for (i, (info, rid)) in infos.iter().zip(rids).enumerate() {
-            let info = read_info(&info, abi)?;
+            let info = read_info(info, abi)?;
             let nbytes = usize::try_from(info.nbytes)
                 .map_err(|_| PyValueError::new_err("a descriptor's nbytes is negative"))?;
             let (src, file, segment) = match &info.segment {

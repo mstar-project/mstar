@@ -354,5 +354,6 @@ fn mstar_rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<crate::arena_copy::PyArenaTransport>()?;
     m.add_class::<crate::arena_copy::StageOut>()?;
     m.add_class::<crate::arena_copy::ReadOut>()?;
+    m.add_class::<crate::arena_copy::ReadEdgesOut>()?;
     Ok(())
 }

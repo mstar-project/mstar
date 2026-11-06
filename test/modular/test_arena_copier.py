@@ -12,6 +12,7 @@ import torch
 from mstar.communication import arena as arena_mod
 from mstar.communication.arena import ArenaShmCommunicationManager
 from mstar.communication.tensor_store import PythonTensorBookkeeping, TensorStore
+from mstar.distributed.base import ShardingConfig
 from mstar.graph.base import GraphEdge
 from mstar.utils.containers import ParallelList
 
@@ -228,6 +229,48 @@ def test_concurrent_duplicates_leave_no_orphaned_slot(make):
         prod._cleanup_by_uuid(uuid)
         assert _free_bytes(prod) == before, "a slot was orphaned"
     assert prod._transport.live()[0] == 0
+
+
+def _mixed_reads(prod, cons):
+    """A batch with every kind of row a read meets: a plain one, one met twice in
+    the batch, one the store already holds, two slices of one tensor, and one of
+    this entity's own. Returns the tensors the descriptors should read."""
+    a, b, c, d = torch.arange(4.0), torch.arange(4.0) + 10, torch.arange(4.0) + 20, torch.arange(8.0).reshape(4, 2)
+    ia, ib, ic, id_ = _stage(prod, "r", [a, b, c, d])
+    cons.start_read_tensors("r", [_edge([ic.clone()])])  # already in the store below
+    first, second = id_.clone(), id_.clone()
+    first.dims, first.nbytes = [1, 2], 8
+    second.dims, second.nbytes, second.offset = [3, 2], 24, 8
+    (own,) = cons.store_and_return_tensor_info("r", {"y": [torch.ones(2)]})["y"]
+    cons.increment_ref(own.uuid, 1)
+    cons.register_request("r", ShardingConfig(tp_enabled_nodes=set(), groups=[], shard_dim={}))
+    rows = [ia.clone(), ib.clone(), ib.clone(), ic.clone(), first, second, own.clone()]
+    want = [a, b, b, c, d[:1], d[1:], torch.ones(2)]
+    return rows, want
+
+
+def test_a_batch_reads_the_same_through_rust_as_through_the_python_walk(make):
+    """Transfer metrics keep the Python walk over the descriptors, so one manager
+    of each compares them: same tensors, same references, same pending edges."""
+    prod = make("w0")
+    results = []
+    for name, metrics in (("c0", False), ("c1", True)):
+        cons = make(name)
+        if metrics:
+            cons.enable_transfer_metrics()
+        rows, want = _mixed_reads(prod, cons)
+        edges = [_edge(rows[:2]), _edge(rows[2:4]), _edge(rows[4:6]), _edge(rows[6:])]
+        cons.start_read_tensors("r", edges)
+        for info, tensor in zip(rows, want, strict=True):
+            assert torch.equal(cons.tensor_store.get_tensor(info.uuid), tensor)
+        rust = cons.tensor_store._rust
+        relabel = {u: i for i, u in enumerate(dict.fromkeys(i.uuid for i in rows))}
+        results.append((
+            [relabel[i.uuid] for i in rows],
+            [rust.ref_count(i.uuid) for i in rows],
+            [len(fp.graph_edges[0].tensor_info) for fp in cons.pending],
+        ))
+    assert results[0] == results[1]
 
 
 def test_a_large_host_copy_releases_the_gil(make, monkeypatch):
@@ -504,8 +547,28 @@ def test_a_store_that_frees_in_place_during_the_copy_returns_the_slot(make):
     t = torch.ones(16, device=_device())
     infos = prod.store_and_return_tensor_info("r", {"x": [t]}, skip_cuda_sync=True)["x"]
     prod.register_for_send_uuids(ParallelList(["r"], [[infos[0].uuid]]))
-    assert _free_bytes(prod) == before and not prod._arena_locs
+    assert _free_bytes(prod) == before and prod._transport.live()[0] == 0
     del keep
+
+
+@needs_cuda
+def test_a_row_that_fails_after_copies_are_queued_waits_for_them(make, monkeypatch):
+    """Rust queues what it can before the rest are settled, so an error in those
+    must not drop the host buffers under the copies."""
+    prod, cons = make("w0"), make("w1", device=_device())
+    infos = _stage(prod, "r", [torch.ones(4), torch.zeros(4)])
+    (own,) = cons.store_and_return_tensor_info("r", {"y": [torch.ones(2)]})["y"]
+    monkeypatch.setattr(cons, "_slice_existing_tensor", lambda **_: 1 / 0)
+    synced, real = [], torch.cuda.Stream.synchronize
+
+    def synchronize(stream):
+        synced.append(stream)
+        real(stream)
+
+    monkeypatch.setattr(torch.cuda.Stream, "synchronize", synchronize)
+    with pytest.raises(ZeroDivisionError):
+        cons.start_read_tensors("r", [_edge([*infos, own])])
+    assert synced == [cons._h2d_stream]
 
 
 @needs_cuda

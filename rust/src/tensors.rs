@@ -1010,6 +1010,24 @@ impl TensorBookkeeping {
         drop(removed);
     }
 
+    /// `remove_tensor` for a batch. Returns the uuids not held. The objects drop
+    /// after the lock, since a finalizer must not find it.
+    fn remove_tensors(&self, uuids: Vec<u64>) -> Vec<u64> {
+        let mut missing = Vec::new();
+        let mut removed = Vec::with_capacity(uuids.len());
+        {
+            let mut bk = self.inner.lock().unwrap();
+            for uuid in uuids {
+                match bk.remove_tensor(uuid) {
+                    Some(stored) => removed.push(stored),
+                    None => missing.push(uuid),
+                }
+            }
+        }
+        drop(removed);
+        missing
+    }
+
     fn rid_uuids(&self, rid: RidKey) -> Vec<u64> {
         self.inner.lock().unwrap().rid_uuids(&rid)
     }

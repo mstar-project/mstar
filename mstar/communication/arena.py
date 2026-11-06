@@ -939,41 +939,66 @@ class ArenaShmCommunicationManager(TensorCommunicationManager):
             if self._h2d_stream is not None
             else _nullcontext()
         )
-        # arena items are read and stored together after the loop; one met
-        # again before then takes the extra reference after the put
+        # read and stored together once the rest are settled; one met again before
+        # then takes the extra reference after the put
         staged: list[tuple] = []
         taken: dict[int, TensorPointerInfo] = {}
         again: list[int] = []
         keep: list = []
+
+        def settle(request_id, edge, info) -> bool:
+            """Whether this tensor still has to be read."""
+            if info.source_entity == self.my_entity_id:
+                self._slice_existing_tensor(
+                    request_id=request_id, name=edge.name, next_node=edge.next_node,
+                    graph_walk=graph_walk, info=info,
+                )
+                self.tensor_store.increment_ref(info.uuid, 1)
+                return False
+            if self._take_cached_read(request_id, info, taken, again):
+                return False
+            staged.append((request_id, info))
+            taken[info.uuid] = info
+            return True
+
         t0 = time.perf_counter()
+        store = self.tensor_store
         with ctx:
-            for request_id, graph_edges in requests:
-                for graph_edge in graph_edges:
-                    if len(graph_edge.tensor_info) == 0:
-                        continue
-                    fp = FutureAndPointers(
-                        future=None, graph_edges=[graph_edge], request_id=request_id,
-                    )
-                    for info in graph_edge.tensor_info:
-                        if info.source_entity == self.my_entity_id:
-                            self._slice_existing_tensor(
-                                request_id=request_id, name=graph_edge.name,
-                                next_node=graph_edge.next_node,
-                                graph_walk=graph_walk, info=info,
-                            )
-                            self.tensor_store.increment_ref(info.uuid, 1)
-                            continue
-                        if self._take_cached_read(request_id, info, taken, again):
-                            continue
-                        staged.append((request_id, info))
-                        taken[info.uuid] = info
-                        if stats is not None:
-                            fp.count_read(info)
-                    reads.append(fp)
-            if staged:
-                h2d_did_work |= self._read_staged(staged, keep)
-            if again:
-                self.tensor_store.increment_ref_batch_uniform(again, 1)
+            try:
+                if (self._read_device_type is not None and stats is None
+                        and isinstance(store, RustTensorStore)):
+                    # No Python per tensor: Rust reads what it can and names the rest.
+                    done = self._transport.read_edges(
+                        store._rust, requests, 2, self._read_device_type, self.slice_origins,
+                        self._host_copy_from())
+                    h2d_did_work = done.did_work
+                    keep.extend(done.keep)
+                    reads = [
+                        FutureAndPointers(future=None, graph_edges=[edge], request_id=request_id)
+                        for request_id, edges in requests for edge in edges if edge.tensor_info
+                    ]
+                    for r, e, i in zip(done.other_requests, done.other_edges, done.other_infos, strict=True):
+                        request_id, edges = requests[r]
+                        settle(request_id, edges[e], edges[e].tensor_info[i])
+                else:
+                    for request_id, edges in requests:
+                        for edge in edges:
+                            if not edge.tensor_info:
+                                continue
+                            fp = FutureAndPointers(future=None, graph_edges=[edge], request_id=request_id)
+                            for info in edge.tensor_info:
+                                if settle(request_id, edge, info) and stats is not None:
+                                    fp.count_read(info)
+                            reads.append(fp)
+                if staged:
+                    h2d_did_work |= self._read_staged(staged, keep)
+                if again:
+                    self.tensor_store.increment_ref_batch_uniform(again, 1)
+            except BaseException:
+                # Queued copies read ``keep``, which goes with this frame.
+                if self._h2d_stream is not None:
+                    self._h2d_stream.synchronize()
+                raise
         # profiling attributes the call's time to its reads evenly
         rx = (time.perf_counter() - t0) / max(len(reads), 1)
         for fp in reads:
@@ -1001,6 +1026,11 @@ class ArenaShmCommunicationManager(TensorCommunicationManager):
         # poll tick.
         return [self._wake_when_done(future)]
 
+    def _host_copy_from(self) -> int | None:
+        """The size from which a CPU consumer leaves a read to its copier's own threads."""
+        copier = self._host_copier
+        return 2 * copier.min_slice_bytes if copier.workers > 1 else None
+
     def _read_staged(self, staged: list[tuple], keep: list) -> bool:
         """Read the rows into the store, each with its two references: +1 transit
         (released by get_ready_tensors), +1 usage (released by
@@ -1011,11 +1041,9 @@ class ArenaShmCommunicationManager(TensorCommunicationManager):
         store = self.tensor_store
         did_work = False
         if self._read_device_type is not None and isinstance(store, RustTensorStore):
-            # A CPU consumer leaves a large read to its copier's own threads.
-            copier = self._host_copier
-            host_max = 2 * copier.min_slice_bytes if copier.workers > 1 else None
             done = self._transport.read(
-                store._rust, rids, infos, 2, self._read_device_type, self.slice_origins, host_max)
+                store._rust, rids, infos, 2, self._read_device_type, self.slice_origins,
+                self._host_copy_from())
             did_work = done.did_work
             keep.extend(done.keep)
             if not done.deferred:
@@ -1146,33 +1174,20 @@ class ArenaShmCommunicationManager(TensorCommunicationManager):
     def cleanup_collectable(
         self, collectable: list[int], registered: list[bool],
     ):
-        """``_cleanup_by_uuid`` for a batch, inlined: a decode step frees one
-        tensor per request here, and the three-level call chain per uuid was
-        most of the cost. Same steps in the same order as the per-uuid form."""
+        """``_cleanup_by_uuid`` for a batch, in one crossing per table: a decode
+        step frees one tensor per request here."""
         if not collectable:
             return
         del registered  # no transfer engine to unregister from
         store = self.tensor_store
         store.mark_forgotten(collectable)
         self._transport.free(collectable)
-        shard_dims = self.uuid_to_shard_dim
-        edge_names = self.uuid_to_edge_name
-        present = store.check_uuid_presence
-        remove = store.remove_tensor
-        for uuid in collectable:
-            try:
-                shard_dims.pop(uuid, None)
-                edge_names.pop(uuid, None)
-                if present(uuid):
-                    remove(uuid)
-                else:
-                    logger.warning(
-                        "Trying to cleanup tensor %s, but uuid not found", uuid,
-                    )
-            except Exception as e:
-                logger.error(
-                    "Error cleaning up tensor uuid %d: %s, skipping.", uuid, e,
-                )
+        for side in (self.uuid_to_shard_dim, self.uuid_to_edge_name):
+            if side:
+                for uuid in collectable:
+                    side.pop(uuid, None)
+        for uuid in store.remove_tensors(collectable):
+            logger.warning("Trying to cleanup tensor %s, but uuid not found", uuid)
 
     def _cleanup_by_uuid(self, uuid: int, registered: bool | None = None):
         super()._cleanup_by_uuid(uuid, registered)
