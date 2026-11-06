@@ -67,23 +67,31 @@ def _pi05_cpu_threads():
 @pytest.mark.parametrize(
     ("batched", "batch_size"), [(False, 1), (True, 1), (True, 2)],
 )
-def test_pi05_vision_keeps_fp32_under_engine_autocast(_pi05_cpu_threads, batched, batch_size):
+def test_pi05_vision_runs_in_its_own_dtypes_under_engine_autocast(_pi05_cpu_threads, batched, batch_size):
+    """The ViT node opts out of the engine's autocast and runs in openpi's
+    precision: bfloat16 except the patch and position embeddings."""
     from mstar.engine.accelerator_graph_runner import autocast_scope
     from mstar.engine.node_dtype import resolve_node_dtype
 
     class Encoder(torch.nn.Module):
         def __init__(self):
             super().__init__()
-            self.projection = torch.nn.Linear(3, 8)
+            self.embeddings = torch.nn.Module()
+            self.embeddings.patch_embedding = torch.nn.Linear(3, 4)
+            self.projection = torch.nn.Linear(4, 8)
 
         def forward(self, pixels):
-            return self.projection(pixels.mean(dim=(-1, -2))).unsqueeze(1)
+            pooled = pixels.mean(dim=(-1, -2)).to(self.embeddings.patch_embedding.weight.dtype)
+            embedded = self.embeddings.patch_embedding(pooled)
+            return self.projection(embedded.to(self.projection.weight.dtype)).unsqueeze(1)
 
     with torch.random.fork_rng(devices=[]), torch.no_grad():
         torch.manual_seed(19)
         submodule = Pi05ViTEncoderSubmodule(
             Encoder(), Pi05Config(vit_image_size=4, num_cameras=2),
         ).to("cpu").eval()
+        assert submodule.encoder.embeddings.patch_embedding.weight.dtype == torch.float32
+        assert submodule.encoder.projection.weight.dtype == torch.bfloat16
         images = torch.linspace(-1, 1, batch_size * 96).reshape(batch_size, 2, 3, 4, 4)
         engine_inputs = ModelInputsFromEngine(
             request_ids=list(range(batch_size)), per_request_info={},
@@ -99,7 +107,7 @@ def test_pi05_vision_keeps_fp32_under_engine_autocast(_pi05_cpu_threads, batched
                 else:
                     actual = submodule.forward("prefill", engine_inputs, images)["img_emb"][0].unsqueeze(0)
 
-        assert actual.dtype == torch.float32
+        assert actual.dtype == torch.bfloat16
         assert torch.equal(actual, reference)
 
 

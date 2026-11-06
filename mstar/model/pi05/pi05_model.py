@@ -650,9 +650,9 @@ class Pi05Model(Model):
         # NOTE: ``autocast_dtype`` is accepted for interface parity but
         # deliberately NOT applied at param allocation. Pi0.5's submodules
         # (Pi05ViTEncoderSubmodule / Pi05LLMSubmodule) override ``to()`` to
-        # keep precision-sensitive params in fp32 — the SigLIP vision tower
-        # entirely, and the transformer norm params — matching lerobot's
-        # ``to_bfloat16_for_selected_params``. Meta-casting to bf16 before
+        # keep precision-sensitive params in fp32 — SigLIP's patch and
+        # position embeddings and the transformer norms — as
+        # openpi's ``to_bfloat16_for_selected_params`` does. Meta-casting to bf16 before
         # ``to_empty`` would load those weights into bf16 storage and lose
         # precision that the post-load fp32 upcast cannot recover (~0.2 abs
         # delta on final actions). So we load in fp32 and let the submodule

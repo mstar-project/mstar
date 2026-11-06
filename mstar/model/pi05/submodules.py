@@ -53,26 +53,17 @@ class Pi05ViTEncoderSubmodule(NodeSubmodule):
         self.encoder = encoder
         self.config = config
 
-    def to(self, *args, **kwargs):
-        """Override ``to()`` to always keep the SigLIP vision tower and
-        connector in float32, matching lerobot's
-        ``to_bfloat16_for_selected_params`` which explicitly preserves
-        ``vision_tower`` and ``multi_modal_projector`` in fp32.
+    # Kept in float32, as openpi keeps them (to_bfloat16_for_selected_params
+    # in models_pytorch/gemma_pytorch.py); everything else runs in bfloat16.
+    _FLOAT32_PARAM_SELECTORS = ("embeddings.patch_embedding.", "embeddings.position_embedding.")
 
-        Running SigLIP in bf16 produces ~64 abs delta on the image features
-        (27-layer vision transformer accumulates bf16 rounding), which then
-        propagates through the prefix KV cache and causes ~0.2 abs delta on
-        the final actions — too large for production use.
-        """
-        # Move to device but FORCE fp32 for all parameters.
-        # First apply the standard .to() for device placement:
+    def to(self, *args, **kwargs):
+        """Apply ``to()``, then set openpi's SigLIP precision: bfloat16 except
+        the patch and position embeddings."""
         result = super().to(*args, **kwargs)
-        # Then upcast all parameters back to fp32:
-        for param in result.parameters():
-            param.data = param.data.to(torch.float32)
-        for buf in result.buffers():
-            if buf.is_floating_point():
-                buf.data = buf.data.to(torch.float32)
+        for name, param in result.named_parameters():
+            keep = any(sel in name for sel in self._FLOAT32_PARAM_SELECTORS)
+            param.data = param.data.to(torch.float32 if keep else torch.bfloat16)
         return result
 
     def _prepare_one(self, images: torch.Tensor) -> torch.Tensor:
@@ -234,12 +225,10 @@ class Pi05ViTEncoderSubmodule(NodeSubmodule):
     ) -> NameToTensorList:
         # pixel_values: (1, num_cameras, 3, H, W) from stacked preprocess
         # (sequential path always has bs=1). Flatten to (num_cameras, 3, H, W)
-        # before the encoder.
-        # Disable autocast so SigLIP runs in fp32, matching lerobot's
-        # to_bfloat16_for_selected_params which keeps vision_tower +
-        # multi_modal_projector in float32.
+        # before the encoder. Autocast is off: the encoder runs in its
+        # parameters' own dtypes (see ``to``).
         pv = pixel_values.flatten(0, 1)
-        features = self.encoder(pv.float())
+        features = self.encoder(pv)
         # features: [num_cameras, tokens_per_image, hidden]
         # Flatten the camera dimension into the token sequence so the LLM sees
         # a single contiguous sequence of image tokens per request.
@@ -266,7 +255,7 @@ class Pi05ViTEncoderSubmodule(NodeSubmodule):
         bs, num_cameras = pixel_values.shape[:2]
         # Flatten to (bs * num_cameras, 3, H, W) for the HF encoder.
         pv = pixel_values.flatten(0, 1)
-        features = self.encoder(pv.float())
+        features = self.encoder(pv)
         # features: (bs * num_cameras, tokens_per_image, hidden_size)
         tokens_per_image, hidden = features.shape[1], features.shape[2]
         # Reshape to (bs, num_cameras * tokens_per_image, hidden_size) so
@@ -433,7 +422,7 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
                 make_node_input=lambda n: ARNodeInputs(
                     input_seq_len=n,
                     input_embeds=torch.zeros(
-                        n, self.config.hidden_size, device=device
+                        n, self.config.hidden_size, device=device, dtype=torch.float32
                     ),
                 ),
                 capture_token_lengths=self.PREFILL_TOKEN_BUCKETS,
@@ -462,17 +451,16 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
         inputs: NameToTensorList,
         **kwargs
     ) -> ARNodeInputs:
-        # Pi0.5 prefix layout (matches lerobot's embed_prefix):
-        #   [image_tokens, language_tokens]
-        # The robot state is *not* a separate token stream — it has already
-        # been formatted as a decimal-string suffix on the language prompt
-        # by ``Pi05Model.process_prompt``, then tokenized by the PaliGemma
-        # tokenizer. So the LLM only consumes ``img_emb`` + ``text_inputs``.
-
+        # Prefix layout [image_tokens, language_tokens], as openpi's
+        # embed_prefix. The robot state is part of the language tokens:
+        # ``Pi05Model.process_prompt`` writes it into the prompt.
+        # The prefix (and so PaliGemma's residual stream) is float32, the dtype
+        # the prefill capture stages it in, whatever dtypes the ViT and the
+        # embedding table produce.
         img_emb = inputs["img_emb"][0]
         text_ids = inputs["text_inputs"][0]
         text_emb = self._embed_tokens_scaled(text_ids)
-        prefix_emb = torch.cat([img_emb, text_emb], dim=0)
+        prefix_emb = torch.cat([img_emb.float(), text_emb.float()], dim=0)
         seq_len = prefix_emb.shape[0]
 
         return ARNodeInputs(input_embeds=prefix_emb, input_seq_len=seq_len)
