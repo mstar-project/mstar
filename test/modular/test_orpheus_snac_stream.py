@@ -44,7 +44,7 @@ def _tokens(config: OrpheusModelConfig, frames: int, seed: int = 0, eos: bool = 
     codes = torch.randint(0, 4096, (frames, TPF), generator=generator)
     tokens = (codes + 4096 * torch.arange(TPF) + config.custom_token_base_id + 10).flatten()
     if eos:
-        tokens = torch.cat([tokens, torch.tensor([config.stop_token_id])])
+        tokens = torch.cat([tokens, torch.tensor([*config.stop_token_ids])])
     return tokens
 
 

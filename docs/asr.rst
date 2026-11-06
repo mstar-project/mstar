@@ -38,11 +38,13 @@ requests batch together and are captured per batch size (1 to 64).
     sampling restricted to the language tokens; ``prefill_prompt`` then
     appends ``<|task|>[<|notimestamps|>]`` after the detected token.
 ``decode``
-    a dynamic loop, one token per step, until ``<|endoftext|>`` or the
-    448-position table is full. The Whisper timestamp rules (first token a
-    timestamp, timestamps in monotonic pairs, timestamp-vs-text
-    log-probability test) are applied inside the captured forward from a
-    four-integer state that travels with the token, so the worker's
+    a dynamic loop, one token per step, until ``<|endoftext|>``, the
+    request's ``max_tokens`` or the end of the 448-position table.
+    ``max_tokens`` counts the prompt walk's token, so a budget of one, or an
+    ``<|endoftext|>`` sampled there, runs no decode step. The Whisper
+    timestamp rules (first token a timestamp, timestamps in monotonic pairs,
+    timestamp-vs-text log-probability test) are applied inside the captured
+    forward from a four-integer state that travels with the token, so the worker's
     speculative next-step launch never sees a stale history.
 ``align``
     only when word timestamps were asked for: one teacher-forced pass over

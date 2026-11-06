@@ -8,6 +8,7 @@ import pytest
 import torch
 from torch import nn
 
+from mstar.conductor.request_info import FINAL_PREFILL
 from mstar.engine.engine import Engine
 from mstar.engine.resources import PositionStep, Resource, StepContext, StepRunner
 from mstar.engine.resources.base import CachedPrefix
@@ -17,7 +18,14 @@ from mstar.engine.resources.kv.plan import KVPlanOutputs
 from mstar.engine.resources.position.config import PositionConfig
 from mstar.engine.resources.position.manager import RopeManager
 from mstar.model.qwen3_omni.components.rope import get_rope_index_vision
-from mstar.model.qwen3_omni.config import TALKER_KV, THINKER_KV, THINKER_MIXED, THINKER_POS, Qwen3OmniModelConfig
+from mstar.model.qwen3_omni.config import (
+    TALKER_KV,
+    THINKER_KV,
+    THINKER_MIXED,
+    THINKER_POS,
+    THINKER_TEXT_DECODE,
+    Qwen3OmniModelConfig,
+)
 from mstar.model.qwen3_omni.qwen3_omni_model import TEXT_BEFORE, Qwen3OmniModel, image_span
 from mstar.model.qwen3_omni.submodules import AudioEncoderSubmodule, ThinkerSubmodule, VisionEncoderSubmodule
 
@@ -278,14 +286,14 @@ _PROMPTS = {
 def test_the_layout_lists_each_walk_the_schedule_runs_with_the_slots_it_writes(model, modalities, tensors, items):
     out = _prompt(model, modalities, tensors)
     layout = out.metadata["kv_layout"][THINKER_KV]["main"].spans
-    signals = {name: [object()] * len(value) for name, value in out.new_input_tensors.items()}
 
-    ((walk, entry),) = model._build_thinker_prefill_schedule(modalities, signals)
-    segments = out.new_input_tensors["text_inputs"]
-    assert len(entry["text_inputs"]) == len(segments)
+    ((walk, bind, lead),) = model._build_thinker_prefill_schedule(modalities)
+    segments = out.new_input_tensors[bind["text_inputs"]]
+    assert [name for name, value in out.new_input_tensors.items() if name.startswith("text_inputs") and value] == [
+        bind["text_inputs"]
+    ], "the prompt's text is not all in the one step's signal"
     media = next(iter(items))
     # the text before the attachment, the attachment, the text after it, all in one walk
-    lead = entry["text_before"]
     expected = [
         *((walk, len(text), None) for text in segments[:lead]), media,
         *((walk, len(text), None) for text in segments[lead:]),
@@ -293,6 +301,30 @@ def test_the_layout_lists_each_walk_the_schedule_runs_with_the_slots_it_writes(m
     assert [(span.walk, span.length, None if span.kind == "ids" else span.advance) for span in layout] == expected, (
         "the layout disagrees with the walks the schedule runs, so the cache would drop it partway through"
     )
+    assert [span.source for span in layout if span.kind == "ids"] == [bind["text_inputs"]] * len(segments), (
+        "a text span's prefix keys are read off another signal than the one its walk prefills"
+    )
+
+
+@pytest.mark.parametrize("audio", [False, True], ids=["text out", "audio out"])
+def test_the_plan_runs_the_thinker_and_with_audio_out_the_talker_and_the_vocoder(model, audio):
+    outputs = ["text", "audio"] if audio else ["text"]
+    kwargs = {"voice": "Chelsie", "talker_max_output_tokens": 7}
+    plans = {
+        partition: [(s.walk, dict(s.bind), dict(s.step_metadata))
+                    for s in model.walk_plan(partition, ["text"], outputs, {"text_inputs.0": [object()]}, kwargs)]
+        for partition in ("Thinker", "Talker", "Code2Wav")
+    }
+    thinker = {"audio_output": audio}
+    prefill = {**thinker, TEXT_BEFORE: 0, FINAL_PREFILL: True}
+    talker = {"voice": "Chelsie", "talker_max_tokens": 7}
+    assert plans == {
+        "Thinker": [("prefill_text", {"text_inputs": "text_inputs.0"}, prefill),
+                    ("thinker_decode" if audio else THINKER_TEXT_DECODE, {"text_inputs": "new_token"}, thinker)],
+        "Talker": [("talker_prefill", {}, talker), ("talker_last_prefill", {}, talker),
+                   ("talker_decode", {}, {"talker_max_tokens": 7})] if audio else [],
+        "Code2Wav": [("code2wav_chunk", {}, {})] if audio else [],
+    }
 
 
 def _image(height: int = 64) -> torch.Tensor:
@@ -338,16 +370,15 @@ _STEPS = {
 }
 
 
-def _row_slots(model, walk: str, entry: dict) -> list[int]:
+def _row_slots(model, walk: str, bind: dict, lead: int, signals: dict) -> list[int]:
     """What a schedule entry's row writes, piece by piece: its text, and its attachment with two sentinels."""
-    texts = [len(ids) for ids in entry["text_inputs"]]
+    texts = [len(ids) for ids in signals[bind["text_inputs"]]]
     if walk == "prefill_text":
         return texts
     if walk == "prefill_audio":
-        item = model.config.audio_encoder.tokens_for_frames(entry["audio_features"].shape[-1]) + 2
+        item = model.config.audio_encoder.tokens_for_frames(signals[bind["audio_features"]][0].shape[-1]) + 2
     else:
-        item = int(entry["image_grid_thw"].prod()) // model.config.vision.spatial_merge_size ** 2 + 2
-    lead = entry[TEXT_BEFORE]
+        item = int(signals[bind["image_grid_thw"]][0].prod()) // model.config.vision.spatial_merge_size ** 2 + 2
     return [*texts[:lead], item, *texts[lead:]]
 
 
@@ -355,14 +386,14 @@ def _row_slots(model, walk: str, entry: dict) -> list[int]:
 def test_the_layout_says_where_each_step_the_schedule_runs_ends(model, modalities, tensors, kwargs, steps):
     out = _prompt(model, modalities, tensors, **kwargs)
     layout = out.metadata["kv_layout"][THINKER_KV]["main"]
-    schedule = model._build_thinker_prefill_schedule(modalities, out.new_input_tensors)
+    schedule = model._build_thinker_prefill_schedule(modalities)
     cursor = SpanCursor(tuple(PrefixSpan(*row) for row in layout.row()[0]))
 
-    assert [walk for walk, _ in schedule] == [walk for walk, _ in steps]
-    for (walk, entry), (_, count) in zip(schedule, steps, strict=True):
+    assert [walk for walk, _, _ in schedule] == [walk for walk, _ in steps]
+    for (walk, bind, lead), (_, count) in zip(schedule, steps, strict=True):
         step = cursor.next_step(walk)
         assert len(step) == count, f"{walk} would look up {len(step)} spans where its step writes {count}"
-        assert [span.length for span in step] == _row_slots(model, walk, entry), (
+        assert [span.length for span in step] == _row_slots(model, walk, bind, lead, out.new_input_tensors), (
             "the lookup would sum other slots than the row writes, and drop the layout"
         )
         cursor.done += len(step)

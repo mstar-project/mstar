@@ -11,19 +11,9 @@ import json
 from dataclasses import dataclass, field, fields
 from pathlib import Path
 
-# ---------------------------------------------------------------------------
-# Resource label constants (LLM node)
-# ---------------------------------------------------------------------------
-KV_CACHE = "kv_cache"
+# the LLM's attention resource; its KV, position and sampler keys are
+# `mstar.model.keys`', as the shared decoder reads them
 ATTN = "attn"
-ROPE = "rope"
-SAMPLER = "sampler"
-# Each audio chunk's mel frame count (the feature extractor's attention-mask
-# sum), from ``process_prompt`` to the encoder's step metadata: known on the
-# host there, so the encoder node never reads it back from a tensor. The
-# prompt's audio placeholders and the encoder's masking and slicing all count
-# from it.
-AUDIO_FEATURE_LENS_KEY = "audio_feature_lens"
 
 
 @dataclass

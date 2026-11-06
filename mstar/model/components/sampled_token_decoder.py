@@ -7,8 +7,8 @@ multimodal prompt as one row). It owns the engine contract: the capture
 configs, device loop-back of the sampled token, the step declaration around
 the sampler and the position resource, the forward through the sampler, and
 the stop: a `TokenStop` over its prefill and decode walks (a stop id; a
-prefill row's stop, or a one-token budget, ends the partition, and the
-model's loop cap is the decode budget). A model subclasses it with its resource steps
+stop, or a one-token budget, on the step the walk plan marks `FINAL_PREFILL`
+ends the partition, and the model's loop cap is the decode budget). A model subclasses it with its resource steps
 and its attention key, and an MRoPE model adds its own positions.
 
 A media walk's row is the whole prompt's ids, each attachment expanded to
@@ -29,8 +29,7 @@ contract that makes this capture-safe:
 A step that splits a media row (chunked prefill) must slice its media by
 the host pad counts of each piece.
 
-The decoder module (``self.model``) provides (``Qwen3DenseLM`` has the first
-three):
+The decoder module (``self.model``, e.g. ``Qwen3DenseLM``) provides:
 
 - ``embed(ids) -> [tokens, hidden]``
 - ``forward(input_embeds, *, label, **decoder_kwargs) -> [tokens, hidden]``,
@@ -40,10 +39,11 @@ three):
 
 and ``config`` has ``hidden_size`` and ``stop_token_ids`` (and the model's
 ``max_position_embeddings`` bounds the decode loop, see `media_walks`).
-The node's resources are declared under ``mstar.model.keys``' ``SAMPLER`` and
-``ROPE`` keys.
+The node's sampler is declared under ``mstar.model.keys``' ``SAMPLER`` key and
+its positions under ``POS_KEY`` (``ROPE`` by default).
 """
 
+import functools
 import os
 from collections.abc import Mapping, Sequence
 from time import perf_counter
@@ -52,7 +52,7 @@ from typing import Any
 import torch
 
 from mstar.communication.tensors import NameToTensorList
-from mstar.conductor.request_info import CurrentForwardPassInfo
+from mstar.conductor.request_info import FINAL_PREFILL, CurrentForwardPassInfo
 from mstar.engine.accelerator_graph_config import (
     AcceleratorGraphConfig,
     BatchedAcceleratorGraphConfig,
@@ -64,7 +64,7 @@ from mstar.engine.resources.sampler.config import SamplerStep
 from mstar.engine.resources.sampler.resource import SamplerResource
 from mstar.engine.resources.step import ResourceStep, Segment, SubmoduleStep
 from mstar.model.components.token_step import TokenStepNode
-from mstar.model.keys import MIXED, ROPE, SAMPLER
+from mstar.model.keys import MIXED, PREFILL_TEXT, ROPE, SAMPLER
 from mstar.model.multimodal import MEDIA_LAYOUT, MediaEncoder, media_walk_names, splice_media
 from mstar.model.submodule_base import (
     ARNodeInputs,
@@ -80,7 +80,9 @@ from mstar.utils.profiler import PHASE_PERIOD, PhaseLaps, phase_record
 
 class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
     SAMPLER = SAMPLER
-
+    # the text-only prompt's walk; a model whose own graph names it otherwise
+    # sets this
+    PREFILL_WALK = PREFILL_TEXT
     # Total tokens of a packed text-prefill step, one captured graph per
     # (bucket, batch size); a longer step prefills eagerly. Static buffers are
     # sized by the largest bucket. `prefill_token_buckets` replaces it per
@@ -113,37 +115,53 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
 
     # The attention resource whose plan picks each prefill row's last token.
     ATTN_KEY: str
+    # The position resource the step advances (a layer's ``pos_key``)
+    POS_KEY: str = ROPE
+    # False: only decode is captured, and every prefill (text, media, mixed)
+    # runs eagerly, for a model whose prefill captures are unmeasured
+    CAPTURE_PREFILL = True
 
     # set by `__init__`; class defaults keep a text-only node's walks working
     _encoders: tuple[MediaEncoder, ...] = ()
     _media_walks: frozenset[str] = frozenset()
+    _text_prompts = True
 
     def __init__(
         self,
         model: torch.nn.Module,
         config: Any,
         encoders: Sequence[MediaEncoder] = (),
+        text_prompts: bool = True,
+        *,
         prefill_token_buckets: Sequence[int] | None = None,
     ):
         """``encoders`` are the model's media encoders, as its walks declare
-        them; a text-only node passes none."""
+        them; a text-only node passes none. ``text_prompts`` is the model's
+        `MultimodalDecoderModel.TEXT_PROMPTS`: without it there is no text-only
+        prefill walk, so nothing captures one or a mixed step."""
         super().__init__(prefill_token_buckets)
+        self._text_prompts = text_prompts
         self.model = model
         self.config = config
         self._encoders = tuple(encoders)
         self._media_walks = frozenset(media_walk_names(self._encoders))
-        # the prompt is one prefill row, on the text walk or a media walk: its
-        # token is the reply's first
+        # a prefill walk's token is the reply's first only on the step before
+        # decode, which the walk plan marks
+        prefills = self._media_walks | ({self.PREFILL_WALK} if self._text_prompts else set())
         self.token_stop = TokenStop(
             loop=self.DECODE_LOOP, buffer="new_token", stop_ids=frozenset(config.stop_token_ids),
-            sampler=self.SAMPLER, walk=self.DECODE_WALK,
-            prefill_walks=self._media_walks | {"prefill_text"},
+            sampler=self.SAMPLER, walk=self.DECODE_WALK, prefill_walks=frozenset(prefills),
+            last_prefill_flag=FINAL_PREFILL,
             # the graph runtime checks a decode row's stop ids itself, without
             # calling check_stop (measured on Qwen3.5; see TokenStop.runtime_check)
             runtime_check=True,
         )
-        # the decode walk reads its input ids off the sampler's slot masters
-        self.device_loopback = DeviceLoopback(
+
+    @functools.cached_property
+    def device_loopback(self) -> DeviceLoopback | None:
+        """The decode walk reads its input ids off the sampler's slot masters;
+        a model that reads them off the routed token sets this None."""
+        return DeviceLoopback(
             walk=self.DECODE_WALK, signal="text_inputs", sampler=self.SAMPLER, buffer="new_token",
         )
 
@@ -205,19 +223,21 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
                 },
             )
 
-        configs = [
+        configs: list[AcceleratorGraphConfig] = [
             BatchedAcceleratorGraphConfig(
-                capture_graph_walk="decode",
+                capture_graph_walk=self.DECODE_WALK,
                 single_request_inputs=ids(1),
                 capture_batch_sizes=self.DECODE_CAPTURE_BATCH_SIZES,
                 compile_mode=self.capture_compile_mode(self.DECODE_WALK),
             ),
-            PackedAcceleratorGraphConfig(
-                capture_graph_walk="prefill_text",
+        ]
+        if self._text_prompts and self.CAPTURE_PREFILL:
+            configs += [PackedAcceleratorGraphConfig(
+                capture_graph_walk=self.PREFILL_WALK,
                 capture_token_lengths=self.PREFILL_TOKEN_BUCKETS,
                 make_node_input=ids,
                 capture_batch_sizes=self.PREFILL_CAPTURE_BATCH_SIZES,
-                compile_mode=self.capture_compile_mode("prefill_text"),
+                compile_mode=self.capture_compile_mode(self.PREFILL_WALK),
             ),
             PackedAcceleratorGraphConfig(
                 capture_graph_walk=MIXED,
@@ -229,9 +249,8 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
                 compile_mode=self.capture_compile_mode(MIXED),
                 # the layout the resources split; a replay's padding rows stay empty
                 token_layout=decode_rows_then_prompt,
-            ),
-        ]
-        if self._encoders:
+            )]
+        if self._encoders and self.CAPTURE_PREFILL:
             walks = media_walk_names(self._encoders)
             # one capture every media walk replays
             configs.append(PackedAcceleratorGraphConfig(
@@ -256,7 +275,7 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
         return max(self.PREFILL_MEDIA_CAPTURE_BATCH_SIZES) if graph_walk in self._media_walks else None
 
     def max_rows_in_combined(self, graph_walk: str) -> int | None:
-        return self.MIXED_MAX_PREFILL_ROWS if graph_walk == "prefill_text" else None
+        return self.MIXED_MAX_PREFILL_ROWS if graph_walk == self.PREFILL_WALK else None
 
     # ------------------------------------------------------------------
     # Inputs
@@ -324,7 +343,7 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
         # a media row's length depends on its attachments; it is admitted whole
         if graph_walk == self.DECODE_WALK:
             return InputSeqLenInfo(1)
-        if graph_walk == "prefill_text" and "text_inputs" in inputs:
+        if graph_walk == self.PREFILL_WALK and "text_inputs" in inputs:
             return InputSeqLenInfo(inputs["text_inputs"][0].shape[0])
         return None
 
@@ -411,8 +430,8 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
         # decode rows track their token through the sampler as usual.
         prefill_tokens = {
             rid: inp.input_ids for rid, inp in zip(request_ids, inputs, strict=True)
-            if (inp.graph_walk or graph_walk) != "decode"
-        } if graph_walk != "decode" else {}
+            if (inp.graph_walk or graph_walk) != self.DECODE_WALK
+        } if graph_walk != self.DECODE_WALK else {}
 
         # None advances by the span; a media prompt placing its own
         # positions advances by what it says (see `_media_inputs`)
@@ -431,7 +450,7 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
                     apply_penalty=True,
                     prefill_tracked_tokens=prefill_tokens,
                 ),
-                ROPE: PositionStep(advance=advance),
+                self.POS_KEY: PositionStep(advance=advance),
             },
         )
 
@@ -462,7 +481,7 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
             if rows is not None and rows.shape[0]:
                 embeds = splice_media(embeds, e.pads(input_ids), rows)
         hidden = self.model(embeds, label="main", **decoder_kwargs)
-        if graph_walk != "decode":
+        if graph_walk != self.DECODE_WALK:
             # only the last token of each prefill row feeds the head
             hidden = engine_inputs.resources[self.ATTN_KEY].select_last_hidden(hidden)
         return sampler.sample(engine_inputs.request_ids, logits=self.model.logits(hidden))
@@ -500,5 +519,5 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
     def step_is_input_free(self, graph_walk: str) -> bool:
         # decode rows are one token each; the prefill walks feed
         # `prefill_tokens` from the inputs
-        return graph_walk == "decode"
+        return graph_walk == self.DECODE_WALK
 

@@ -161,7 +161,6 @@ def _worker(eng, runtime, in_loop=True, through_send=False, loop=LOOP):
         drop_host_copies=lambda: None,
         dereference_batch_uniform=lambda uuids: None,
     )
-    w.streams = SimpleNamespace(consumption_batch=lambda rids: [])
     w.engine_manager = SimpleNamespace(get_engine=lambda n: eng)
     w._innermost_loop_by_node = {(WALK, NODE): loop} if in_loop else {}
     w.reported: dict[int, str] = {}

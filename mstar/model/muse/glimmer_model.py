@@ -268,4 +268,4 @@ class MuseGlimmerModel(MultimodalDecoderModel):
         weight_loader.load_text_weights(model, weights_dir, device=device)
         model.requires_grad_(False).eval()
         logger.info("Loaded Muse Glimmer LLM onto %s", device)
-        return LLMSubmodule(model, self.config, self.encoders, self.prefill_token_buckets)
+        return LLMSubmodule(model, self.config, self.encoders, prefill_token_buckets=self.prefill_token_buckets)

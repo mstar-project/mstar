@@ -1,7 +1,7 @@
 """A row whose sampled token is dropped must leave no sampler state behind.
 
 Prefill walks that only keep the last prefill's token (BAGEL, the Qwen3-Omni
-Thinker, Higgs Audio) still sample every row under a captured graph. Without
+Thinker) still sample every row under a captured graph. Without
 ``SamplerStep.kept_rids`` the dropped draws advanced the RNG offset and, under a
 repetition penalty, marked the dropped token as seen, so seeded output depended
 on how the prompt was split into steps.

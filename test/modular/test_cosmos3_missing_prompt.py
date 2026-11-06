@@ -9,6 +9,7 @@ import pytest
 import torch
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
+from test_ingest_unpersist import plan_step
 
 from mstar.api_server import entrypoint
 from mstar.graph.base import TensorPointerInfo
@@ -47,12 +48,11 @@ def test_prefill_nodes_ready_without_prompt(prompt, out_mod, kwargs) -> None:
     if isinstance(out, ProcessPromptOutput):
         out = out.new_input_tensors
     tensors.update(out)
-    fpa = model.get_initial_forward_pass_args(
-        "default", in_mods, [out_mod], _signals(tensors), model_kwargs=kwargs,
-    )
+    signals = _signals(tensors)
+    plan = model.walk_plan("default", in_mods, [out_mod], signals, kwargs)
 
-    io = WorkerGraphIO(model.get_graph_walk_graphs()[fpa.full_metadata.graph_walk])
-    for edge in fpa.inputs:
+    io = WorkerGraphIO(model.get_graph_walk_graphs()[plan[0].walk])
+    for edge in plan_step(model, plan, 0, signals).inputs:
         assert io.ingest_input(edge), edge.name
     assert io.ready_node_names == {DIT_NODE, VAE_ENCODER_NODE}
 

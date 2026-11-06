@@ -41,10 +41,9 @@ def _model():
     ])
     walks = {"produce": producer, "consume": consumer_loop, "decode_audio": codec_chunk}
     partitions = [
-        PartitionDefinition(name="A", graph_walks={"produce"}, initial_walk="produce"),
-        PartitionDefinition(name="B", graph_walks={"consume"}, initial_walk="consume", producer_partitions=["A"]),
-        PartitionDefinition(name="C", graph_walks={"decode_audio"}, initial_walk="decode_audio",
-                            producer_partitions=["B"]),
+        PartitionDefinition(name="A", graph_walks={"produce"}),
+        PartitionDefinition(name="B", graph_walks={"consume"}),
+        PartitionDefinition(name="C", graph_walks={"decode_audio"}),
     ]
     return SimpleNamespace(
         get_graph_walk_graphs=lambda: walks,

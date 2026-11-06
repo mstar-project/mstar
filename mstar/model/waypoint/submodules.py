@@ -1,4 +1,3 @@
-import logging
 
 import torch
 
@@ -23,8 +22,6 @@ from mstar.model.waypoint.components.taehv import (
     validate_taehv_architecture,
 )
 from mstar.model.waypoint.config import WaypointConfig
-
-logger = logging.getLogger(__name__)
 
 PRIME_WALK = "prime"
 ROLLOUT_WALK = "rollout"
@@ -60,36 +57,6 @@ def _frame_seed(request_seed: int, frame_pos: int) -> int:
 # The prime-walk capture and the decode compile share this mode. max-autotune
 # until the default compile level (mstar serve -O) is measured on Waypoint.
 _COMPILE_MODE = "max-autotune-no-cudagraphs"
-
-
-class _SingleRequestMixin:
-    """Serve one request per step, through the engine's batched entry point.
-
-    The v1 engine always dispatches to ``forward_batched``, so a submodule
-    that only defines ``forward`` never runs. Copied from the wan22 idiom
-    rather than imported, since the two models share no other code.
-    """
-
-    def max_batch_size(self, graph_walk: str):
-        return 1
-
-    def forward_batched(
-        self,
-        graph_walk: str,
-        engine_inputs: ModelInputsFromEngine,
-        **kwargs,
-    ) -> dict[str, NameToTensorList]:
-        request_ids = engine_inputs.request_ids
-        assert len(request_ids) == 1, (
-            f"{type(self).__name__} does not batch a step; got "
-            f"{len(request_ids)} requests in one step (max_batch_size should "
-            "have capped it at 1)"
-        )
-        return {
-            request_ids[0]: self.forward(
-                graph_walk, engine_inputs=engine_inputs, **kwargs
-            )
-        }
 
 
 class _FunctionalAeMixin:
@@ -197,21 +164,6 @@ class WaypointDitSubmodule(_FunctionalAeMixin, NodeSubmodule):
         # The clock is per request and lives on the host
         state = self.request_state(fwd_info.rid_handle)
 
-        if graph_walk == ROLLOUT_WALK:
-            requested = int(fwd_info.step_metadata.get("num_steps", 0) or 0)
-            rollout_step = int(state.get("rollout_step", 0))
-            if requested and rollout_step >= requested:
-                # Async scheduling can dispatch iteration N+1 before
-                # check_stop(N) registers the loop's finish signal. Veto here,
-                # before any tensor work: None skips the forward, so the
-                # overshoot never commits a frame into the ring.
-                logger.info(
-                    "Waypoint dit: skipping async-overshoot rollout step %d "
-                    "(request %s runs %d steps)",
-                    rollout_step, fwd_info.request_id, requested,
-                )
-                return None
-
         frame_pos = int(state.get("frame_pos", 0))
 
         if graph_walk == PRIME_WALK:
@@ -219,7 +171,8 @@ class WaypointDitSubmodule(_FunctionalAeMixin, NodeSubmodule):
             # client's action zero.
             mouse, button, scroll = self._idle_controller(device, dtype)
         else:
-            action_index = int(state.get("rollout_step", 0))
+            # the loop's cap (num_steps) ends the rollout, so this stays in range
+            action_index = int(fwd_info.dynamic_loop_iter_counts[ROLLOUT_LOOP_NAME])
             mouse, button, scroll = self._controller_slice(
                 inputs, action_index, device, dtype
             )
@@ -589,11 +542,9 @@ class WaypointDitSubmodule(_FunctionalAeMixin, NodeSubmodule):
         same fixed-address tensors ``prepare_inputs`` reads back next call --
         neither syncs.
         """
-        del inputs, kwargs
+        del request_info, inputs, kwargs
         state = self.request_state(request_id)
         state.add("frame_pos", int(state.get("frame_pos", 0)) + 1)
-        if request_info.graph_walk == ROLLOUT_WALK:
-            state.add("rollout_step", int(state.get("rollout_step", 0)) + 1)
         for idx in range(9):
             key = f"{DECODER_HISTORY_PREFIX}{idx}"
             values = outputs.get(key)
@@ -605,28 +556,6 @@ class WaypointDitSubmodule(_FunctionalAeMixin, NodeSubmodule):
             else:
                 target.copy_(values[0])
 
-    def check_stop(
-        self,
-        request_id: str,
-        request_info: CurrentForwardPassInfo,
-        outputs: dict[str, list[torch.Tensor]],
-    ) -> set[str]:
-        """Stop the rollout loop after exactly ``num_steps`` iterations.
-
-        Iteration k (0-based) is still being postprocessed when the loop
-        counter reads k, so N frames means firing at ``k + 1 >= N``. Under
-        async scheduling an overshoot iteration this signal is too late to
-        stop is vetoed instead in ``prepare_inputs``.
-        """
-        del request_id, outputs
-        if request_info.graph_walk != ROLLOUT_WALK:
-            return set()
-        iter_idx = request_info.dynamic_loop_iter_counts.get(ROLLOUT_LOOP_NAME, 0)
-        requested = int(request_info.step_metadata.get("num_steps", 0) or 0)
-        if requested > 0 and iter_idx + 1 >= requested:
-            return {ROLLOUT_LOOP_NAME}
-        return set()
-
     def cleanup_request(self, request_id: str):
         """Drop the request's clock. The ring itself is released by the
         engine's ``remove_request`` sweep (``RingKVManager.remove_request``),
@@ -634,7 +563,7 @@ class WaypointDitSubmodule(_FunctionalAeMixin, NodeSubmodule):
         super().cleanup_request(request_id)
 
 
-class WaypointVaeEncoderSubmodule(_SingleRequestMixin, _FunctionalAeMixin, NodeSubmodule):
+class WaypointVaeEncoderSubmodule(_FunctionalAeMixin, NodeSubmodule):
     """TAEHV encoder: ``temporal_compression`` raw frames -> one latent frame.
 
     ``image_inputs`` ``[4, 720, 1280, 3]`` uint8 -> ``latent``
@@ -651,6 +580,10 @@ class WaypointVaeEncoderSubmodule(_SingleRequestMixin, _FunctionalAeMixin, NodeS
         validate_taehv_architecture(taehv)
         self.taehv = taehv
         self.config = config
+
+    def max_batch_size(self, graph_walk: str):
+        # one seed clip per step: the capture buckets hold a single row
+        return 1
 
     def prepare_inputs(
         self,
@@ -685,6 +618,17 @@ class WaypointVaeEncoderSubmodule(_SingleRequestMixin, _FunctionalAeMixin, NodeS
         # [B, C, h, w] -> [B, 1, C, h, w]: the dit's frame axis, added where the
         # reference adds it (``WorldEngine.append_frame``).
         return {"latent": [latent.unsqueeze(1)]}
+
+    def forward_batched(
+        self,
+        graph_walk: str,
+        engine_inputs: ModelInputsFromEngine,
+        **kwargs,
+    ) -> dict[str, NameToTensorList]:
+        # what the capture config runs: a replayed graph's outputs are mapped
+        # back to requests by row id
+        (rid,) = engine_inputs.request_ids
+        return {rid: self.forward(graph_walk, engine_inputs=engine_inputs, **kwargs)}
 
     @property
     def _capture_hw(self) -> tuple[tuple[int, int], ...]:
@@ -724,7 +668,7 @@ class WaypointVaeEncoderSubmodule(_SingleRequestMixin, _FunctionalAeMixin, NodeS
         """The captured (H, W) bucket for this batch's seed, or None for eager.
 
         The seed shape isn't on ``model_inputs`` at lease time, so it is read
-        off ``step_metadata["seed_hw"]``, set by ``get_initial_forward_pass_args``."""
+        off ``step_metadata["seed_hw"]``, set by ``WaypointModel.walk_plan``."""
         del per_request_input_metadata, kwargs
         if graph_walk != PRIME_WALK:
             return None

@@ -1,14 +1,14 @@
 """Whisper's decoder node on the shared TokenStepNode: HF generate's
 token suppression, applied to the logits the sampler gets; the batched stop
-check, which only a decode step's token answers; the per-request stop check,
-which copies only the token to the host; and the walk and loop names of
-Whisper's graph."""
+check, where EOS ends the loop on a decode step and the request on a prefill;
+the per-request stop check, which copies only the token to the host; and the
+walk and loop names of Whisper's graph."""
 from types import SimpleNamespace
 
 import torch
 from torch import nn
 
-from mstar.model.submodule_base import HostRows
+from mstar.model.submodule_base import END_PARTITION, HostRows
 from mstar.model.whisper.config import PREFILL_WALK, WhisperModelConfig
 from mstar.model.whisper.submodules import WhisperDecoderSubmodule
 from mstar.worker.worker import _LazyHostOutputs
@@ -71,10 +71,10 @@ def test_names_match_whispers_graph():
     assert walks[node.DECODE_WALK].name == node.DECODE_LOOP
 
 
-def test_batched_stop_check_answers_decode_steps_only():
+def test_batched_stop_check_ends_the_loop_or_the_prefill():
     """As the per-request check: EOS ends the loop on a decode step (a row at
-    its token cap is the loop cap's to end), while a prefill walk's EOS runs
-    outside the loop and ends nothing."""
+    its token cap is the loop cap's to end), and a prefill walk's EOS, which
+    runs before the loop exists, ends the request."""
     node = _node()
     infos = {
         rid: SimpleNamespace(graph_walk=walk, resource_configs={"sampler": SimpleNamespace(ignore_eos=False)},
@@ -86,7 +86,7 @@ def test_batched_stop_check_answers_decode_steps_only():
     rows = HostRows(request_ids=("go", "limit", "eos", "prefill_eos"),
                     buffers={"new_token": torch.tensor([[7], [7], [3], [3]])})
     assert node.check_stop_batched(["eos", "limit", "go", "prefill_eos"], infos, rows) == {
-        "eos": {"decode_loop"},
+        "eos": {"decode_loop"}, "prefill_eos": {END_PARTITION},
     }
 
 

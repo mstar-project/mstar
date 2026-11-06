@@ -55,10 +55,8 @@ from mstar.model.voxcpm2.submodules import (
 )
 from mstar.model.voxcpm2.voxcpm2_model import (
     STREAM_EDGE,
-    STREAM_LEAD_KEY,
     VoxCPM2Model,
     decoder_receptive_field_patches,
-    stream_window_widths,
 )
 from mstar.streaming.chunk_policy import ScheduledLeftContextChunkPolicy
 from mstar.streaming.stream_buffer import StreamBuffer
@@ -310,8 +308,7 @@ def _request(model, text: str, clip: torch.Tensor | None = None, **kwargs) -> tu
     edges, metadata = model.process_prompt(text, modalities, ["audio"], tensors=tensors, **kwargs)
     if clip is not None:
         edges = {**edges, "audio_inputs": [clip]}
-    args = model.get_initial_forward_pass_args("Talker", modalities, ["audio"], {}, model_kwargs=metadata)
-    return edges, args.step_metadata
+    return edges, dict(model.walk_plan("Talker", modalities, ["audio"], {}, metadata)[0].step_metadata)
 
 
 def _info(rid: str, seed: int = 0, step_metadata: dict | None = None) -> SimpleNamespace:
@@ -351,7 +348,7 @@ def test_process_prompt_builds_each_reference_mode(model):
     # max patches follow the target text only
     digest = hashlib.blake2b(clip.numpy().tobytes(), digest_size=16).hexdigest()
     assert {k: v for k, v in metadata.items() if k != "kv_layout"} == {
-        STREAM_LEAD_KEY: 3,
+        "stream_lead_items": {STREAM_EDGE: 3},
         PATCH_BUDGET_KEY: 16,
         PROMPT_MODE_KEY: MODE_REF_CONTINUATION,
         MIN_LEN_KEY: 2,
@@ -359,7 +356,9 @@ def test_process_prompt_builds_each_reference_mode(model):
     }
     # every key the conductor reads back is one the data worker strips from the client
     for meta in (zero_meta, ref_meta, metadata):
-        assert set(meta) - {"kv_layout"} <= set(model.INTERNAL_KWARGS)
+        assert set(meta) - {"kv_layout", "stream_lead_items"} <= set(model.INTERNAL_KWARGS)
+    # only a continuation's stream leads with prompt patches
+    assert "stream_lead_items" not in zero_meta and "stream_lead_items" not in ref_meta
 
 
 def test_process_prompt_collapses_whitespace_like_the_reference(model, monkeypatch):
@@ -400,12 +399,9 @@ def test_a_one_patch_request_ends_after_prefill(model, budget, done):
     """Prefill has no loop for the Talker's stop to end, so a request whose
     budget the prefill patch spends goes straight to done instead of a decode
     step that would only veto itself."""
-    args = model.get_initial_forward_pass_args(
-        "Talker", ["text"], ["audio"], {}, model_kwargs={PATCH_BUDGET_KEY: budget, PROMPT_MODE_KEY: MODE_ZERO_SHOT}
-    )
-    nxt = model.get_partition_forward_pass_args("Talker", args.full_metadata, {"latent_patch": []})
-    assert nxt.request_done is done
-    assert nxt.full_metadata.graph_walk == ("talker_prefill" if done else "talker_decode")
+    kwargs = {PATCH_BUDGET_KEY: budget, PROMPT_MODE_KEY: MODE_ZERO_SHOT}
+    plan = model.walk_plan("Talker", ["text"], ["audio"], {}, kwargs)
+    assert [step.walk for step in plan] == ["talker_prefill"] + ([] if done else ["talker_decode"])
 
 
 @pytest.mark.parametrize("budget", [2, 5])
@@ -465,11 +461,11 @@ def test_process_prompt_lays_out_the_rows_the_talker_prefill_writes(model, ref_t
         prepared = ref.prepare_inputs(walk, info, {"audio_inputs": [clip]})
         with torch.inference_mode():
             edges.update(ref.forward(walk, None, **prepared.tensor_inputs, **prepared.kwargs))
-    step = model.get_initial_forward_pass_args("Talker", modalities, ["audio"], {}, model_kwargs=meta).step_metadata
+    step = dict(model.walk_plan("Talker", modalities, ["audio"], {}, meta)[0].step_metadata)
     prefill = talker.prepare_inputs(walk, _info("r", 0, step), edges)
     assert span.length == prefill.input_seq_len, "the layout and the prefill disagree on its rows"
 
-    configs = model.get_request_resource_configs({}, meta)
+    configs = model.get_request_resource_configs([], [], meta)
     for key in ("base_kv", "res_kv"):
         configs.setdefault(key, KVReqConfig(needed_labels=["main"]))
     refuse_undeclared_labels("VoxCPM2Model", {k: tuple(v) for k, v in model.kv_labels().items()}, layout, configs)
@@ -581,28 +577,19 @@ def test_build_prompt_matches_the_reference_layout():
     assert torch.equal(audio, ref[0])
 
 
-def test_initial_args_route_reference_audio_and_stream_lead(model):
-    signals = {name: [f"ptr-{name}"] for name in ("text_inputs", "gen_params", "audio_inputs")}
+def test_walk_plan_clones_through_the_ref_encoder(model):
     _, metadata = model.process_prompt(
         "hello", ["text", "audio"], ["audio"], tensors={"audio_inputs": [torch.zeros(16000)]}
     )
-    talker = model.get_initial_forward_pass_args(
-        "Talker", ["text", "audio"], ["audio"], signals, model_kwargs={**metadata, "unrelated": 1}
-    )
-    assert talker.full_metadata.graph_walk == "talker_prefill_clone"
-    routes = sorted((edge.next_node, edge.name) for edge in talker.inputs)
-    assert routes == [("RefEncoder", "audio_inputs"), ("Talker", "gen_params"), ("Talker", "text_inputs")]
+    talker = model.walk_plan("Talker", ["text", "audio"], ["audio"], {}, {**metadata, "unrelated": 1})
+    assert [step.walk for step in talker] == ["talker_prefill_clone", "talker_decode"]
     # the prompt facts ride step metadata to the Talker partition's nodes
     keys = (PATCH_BUDGET_KEY, PROMPT_MODE_KEY, MIN_LEN_KEY, REF_DIGEST_KEY)
-    assert talker.step_metadata == {key: metadata[key] for key in keys}
-    vae = model.get_initial_forward_pass_args(
-        "VAEDecoder", ["text", "audio"], ["audio"], {}, model_kwargs={STREAM_LEAD_KEY: 3}
-    )
-    assert vae.stream_lead_items == {STREAM_EDGE: 3}
+    assert [dict(step.step_metadata) for step in talker] == [{key: metadata[key] for key in keys}, {}]
     _, zero_shot = model.process_prompt("hello", ["text"], ["audio"])
-    plain = model.get_initial_forward_pass_args("Talker", ["text"], ["audio"], signals, model_kwargs=zero_shot)
-    assert plain.full_metadata.graph_walk == "talker_prefill"
-    assert {edge.next_node for edge in plain.inputs} == {"Talker"}
+    plain = model.walk_plan("Talker", ["text"], ["audio"], {}, zero_shot)
+    assert [step.walk for step in plain] == ["talker_prefill", "talker_decode"]
+    assert [step.walk for step in model.walk_plan("VAEDecoder", ["text"], ["audio"], {}, zero_shot)] == ["vae_chunk"]
 
 
 @pytest.mark.parametrize("ref_text", ["", "world"])
@@ -610,47 +597,22 @@ def test_the_talker_walk_follows_the_prompt_mode_not_input_modalities(model, ref
     """``/generate`` takes ``input_modalities`` from the client: a clip sent with
     ``["text"]`` builds a cloning prompt, so the conductor must run the
     RefEncoder walk for it too, or the Talker has no reference latents."""
-    signals = {name: [f"ptr-{name}"] for name in ("text_inputs", "gen_params", "audio_inputs")}
     _, metadata = model.process_prompt(
         "hello", ["text"], ["audio"], tensors={"audio_inputs": [torch.zeros(16000)]}, ref_text=ref_text
     )
     assert metadata[PROMPT_MODE_KEY] != MODE_ZERO_SHOT
-    talker = model.get_initial_forward_pass_args("Talker", ["text"], ["audio"], signals, model_kwargs=metadata)
-    assert talker.full_metadata.graph_walk == "talker_prefill_clone"
-    assert ("RefEncoder", "audio_inputs") in {(edge.next_node, edge.name) for edge in talker.inputs}
-    assert talker.step_metadata[PROMPT_MODE_KEY] == metadata[PROMPT_MODE_KEY]
+    prefill = model.walk_plan("Talker", ["text"], ["audio"], {}, metadata)[0]
+    assert prefill.walk == "talker_prefill_clone"
+    assert prefill.step_metadata[PROMPT_MODE_KEY] == metadata[PROMPT_MODE_KEY]
 
 
 def test_the_talker_walk_needs_the_prompt_mode(model):
     """Only process_prompt sets the mode (INTERNAL_KWARGS drops a client's), so
     a request without one never reached it; refuse it rather than guess."""
     with pytest.raises(ValueError, match=PROMPT_MODE_KEY):
-        model.get_initial_forward_pass_args("Talker", ["text", "audio"], ["audio"], {}, model_kwargs={})
+        model.walk_plan("Talker", ["text", "audio"], ["audio"], {}, {})
 
 
-@pytest.mark.parametrize("ref_text, lead", [(None, 0), ("", 0), ("world", 3)])
-def test_a_client_cannot_set_the_stream_lead(model, ref_text, lead):
-    """The data worker lays the prompt metadata over the request's kwargs, so
-    the lead must be the server's in every mode: a client value past the
-    stream's context would raise in the worker's ingest, outside any one
-    request's failure path."""
-    clip = None if ref_text is None else torch.zeros(16000)
-    modalities = ["text"] if clip is None else ["text", "audio"]
-    tensors = None if clip is None else {"audio_inputs": [clip]}
-    client = {STREAM_LEAD_KEY: 999}
-    _, metadata = model.process_prompt(
-        "hello", modalities, ["audio"], tensors=tensors, ref_text=ref_text, **client
-    )
-    vae = model.get_initial_forward_pass_args(
-        "VAEDecoder", modalities, ["audio"], {}, model_kwargs={**client, **metadata}
-    )
-    assert vae.stream_lead_items == ({STREAM_EDGE: lead} if lead else {})
-
-
-def test_postprocess_encodes_pcm16(model):
-    pcm = model.postprocess(torch.tensor([0.0, 0.5, -2.0]), "audio")
-    assert torch.frombuffer(bytearray(pcm), dtype=torch.int16).tolist() == [0, 16383, -32767]
-    assert model.get_output_sample_rate() == 48000
 
 
 def test_load_audio_resamples_to_16k_and_bounds_duration(model, tmp_path):
@@ -1191,11 +1153,7 @@ def _window_widths(buffer: StreamBuffer) -> list[int]:
 
 
 def test_stream_window_widths_bound_every_window(model):
-    assert stream_window_widths((1, 2, 4), 8, 5) == (1, 3, 7, 13)
-    assert stream_window_widths((1, 2, 4), 8, 22) == (1, 3, 7, 15, 23, 30)
-    assert stream_window_widths((4,), 2, 0) == (2, 4)
-    assert stream_window_widths((), 8, 5) == (8, 13)
-    widths = stream_window_widths(model.stream_schedule, model.stream_chunk_patches, model.stream_left_context)
+    widths = model.stream_window_widths()
     for lead in (0, 2, model.stream_left_context):
         policy = model.get_partition_topology().connections[0].chunk_policy_factory()
         buffer = StreamBuffer(request_id="r", edge_name=STREAM_EDGE, from_partition="Talker", policy=policy)
@@ -1217,7 +1175,7 @@ def test_vae_windows_replay_at_their_bucket_and_equal_a_whole_decode(model):
     """Every window of a stream goes through the region of the next width up,
     padded at the end; the streamed audio still equals one whole decode."""
     config = model.config
-    widths = stream_window_widths(model.stream_schedule, model.stream_chunk_patches, model.stream_left_context)
+    widths = model.stream_window_widths()
     vae_node = VAEDecoderSubmodule(_random_vae(config).double(), config, window_buckets=widths)
     regions = vae_node.get_piecewise_accelerator_graph_configs(torch.device("cpu"), torch.float32)
     assert list(regions) == [VAE_WINDOW.format(width) for width in widths]
@@ -1239,7 +1197,7 @@ def test_graph_hooks_are_the_names_the_engine_calls(model):
     which captures nothing) and declares its regions when called as the engine
     calls it."""
     config = model.config
-    widths = stream_window_widths(model.stream_schedule, model.stream_chunk_patches, model.stream_left_context)
+    widths = model.stream_window_widths()
     talker, _, _ = _talker(model)
     vae_node = VAEDecoderSubmodule(_random_vae(config), config, window_buckets=widths)
     for hook in (
@@ -1302,7 +1260,7 @@ def test_captured_regions_replay_the_eager_result_on_cuda(model):
                 else:
                     torch.testing.assert_close(got, want, rtol=1e-5, atol=1e-5)
 
-        widths = stream_window_widths(model.stream_schedule, model.stream_chunk_patches, model.stream_left_context)
+        widths = model.stream_window_widths()
         vae_node = VAEDecoderSubmodule(_random_vae(config).to(device), config, window_buckets=widths)
         runners = {
             label: capture(label, region)

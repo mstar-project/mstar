@@ -95,7 +95,7 @@ class _Node:
             for spec in specs
         }
         self.runner = StepRunner(self.resources, node_resources={NODE: list(self.resources)})
-        self.overrides = model.get_request_resource_configs({}, model_kwargs={"do_sample": False})
+        self.overrides = model.get_request_resource_configs([], [], model_kwargs={"do_sample": False})
         self.sub = _submodule(config)
         self.sub.bind_node_resources(self.resources)
         self.hidden: torch.Tensor | None = None

@@ -4273,13 +4273,11 @@ class Worker:
                     buffered_publish.add(rid)
         laps.lap("publish")
         # Only the rids with something to report cross: a decode step has no
-        # new-token counts (the inline token is not counted) and no stream
-        # buffers, and an empty entry per rid cost a dict each to build and to
-        # extract on the runtime side. A rid left out gets nothing added,
+        # new-token counts (the inline token is not counted), and an empty
+        # entry per rid cost a dict each to build and to extract on the
+        # runtime side. A rid left out gets nothing added,
         # which is what an empty entry did.
         ntc_rids = [rid for rid in send_rids if new_token_counts.get(rid)]
-        consumed = self.streams.consumption_batch(send_rids)
-        laps.lap("consumption")
         return SendInput(
             completion_id=route_output.completion_id,
             per_request_info=ParallelList(
@@ -4291,9 +4289,6 @@ class Worker:
             ),
             new_token_counts=ParallelList(
                 ntc_rids, [new_token_counts[rid] for rid in ntc_rids],
-            ),
-            stream_tokens_consumed=ParallelList(
-                [rid for rid, _ in consumed], [c for _, c in consumed],
             ),
             profiling=self._profiling_payloads(send_rids) if self.enable_prof
             else None,

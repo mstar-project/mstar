@@ -82,14 +82,15 @@ def _step(dit, st, inp, k):
 
 
 def test_rollout_steps_every_window_and_commit_unchanged():
-    """A whole two-window kv rollout: a step for each denoise iteration, the kv
-    commit, the next window's fresh solver state, and the loop's one extra
-    dispatched step is still vetoed."""
+    """A whole two-window kv rollout, its loop capped at every window's
+    iterations: a step for each denoise iteration, the kv commit, and the next
+    window's fresh solver state."""
     dit = _dit()
     st = _kv_rollout(dit, 1)
-    inp = _prepare(dit, 1, {})
     kinds = []
+    loop_back = {}
     for k in range(WINDOWS * (STEPS + 1)):
+        inp = _prepare(dit, 1, loop_back, k)
         commit = inp.resource_step_info.commit
         kinds.append("commit" if commit else "gen")
         if commit:
@@ -98,11 +99,8 @@ def test_rollout_steps_every_window_and_commit_unchanged():
             solver = dit._first_solver_state(st, lat)
         else:
             lat, solver = _step(dit, st, inp, k)
-        inp = _prepare(dit, 1, {"latents": [lat], **{n: [t] for n, t in solver.items()}}, k + 1)
-        if inp is None:
-            break
+        loop_back = {"latents": [lat], **{n: [t] for n, t in solver.items()}}
     assert kinds == (["gen"] * STEPS + ["commit"]) * WINDOWS
-    assert inp is None
 
 
 def test_finished_request_re_queued_fails_alone():

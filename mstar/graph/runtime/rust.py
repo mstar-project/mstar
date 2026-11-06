@@ -881,14 +881,6 @@ class RustGraphRuntime(GraphRuntime):
             ],
             ntc_rids=input.new_token_counts.keys,
             new_token_counts=input.new_token_counts.values,
-            consumed_rids=(
-                [] if input.stream_tokens_consumed is None
-                else input.stream_tokens_consumed.keys
-            ),
-            stream_tokens_consumed=(
-                [] if input.stream_tokens_consumed is None
-                else input.stream_tokens_consumed.values
-            ),
             prof_rids=[] if input.profiling is None else input.profiling.keys,
             # encode_fields, not encode: a bare tuple has no wire tag, so
             # encode would wrap it in a data envelope, which Rust cannot
