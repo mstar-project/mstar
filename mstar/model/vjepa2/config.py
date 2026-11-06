@@ -10,7 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-# Constants for resource labels
+# The AC rollout's array and read
 KV_CACHE = "kv"
 ATTN = "attn"
 

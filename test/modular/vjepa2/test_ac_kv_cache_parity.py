@@ -1,6 +1,6 @@
 """Parity test: VisionTransformerPredictorAC cached vs non-cached forward.
 
-The KV-cached path (forward under a plan label, one frame at a time) must
+The KV-cached path (forward with cached=True, one frame at a time) must
 produce the same output per frame as the non-cached path (all T frames at once
 with a causal block attention mask).
 
@@ -9,7 +9,7 @@ Why they must match:
   Cached:     at step t_0 the cache holds K/V for frames 0..t_0 exactly, so
               full (non-causal) attention over the cache equals the masked result.
 
-Uses a fake KV + attention resource pair backed by
+Uses a fake array handle backed by
 F.scaled_dot_product_attention — no FlashInfer or GPU required.
 """
 
@@ -81,7 +81,7 @@ class TestKVCacheParity:
                 act_t = actions[:, t_0 : t_0 + 1, :]
                 st_t  = states[:, t_0 : t_0 + 1, :]
 
-                out_t = model(x_t, act_t, st_t, t_0=t_0, label="main")
+                out_t = model(x_t, act_t, st_t, t_0=t_0, cached=True)
                 # [B, N, embed_dim]
 
                 expected = out_full[:, t_0 * N : (t_0 + 1) * N, :]
@@ -118,7 +118,7 @@ class TestKVCacheParity:
 
                 out_t = model(
                     x_t, act_t, st_t, extrinsics=ext_t,
-                    t_0=t_0, label="main",
+                    t_0=t_0, cached=True,
                 )
 
                 expected = out_full[:, t_0 * N : (t_0 + 1) * N, :]
@@ -160,7 +160,7 @@ class TestKVCacheParity:
 
                 # Mirror what preprocess does in production.
                 cache.plan(seq_lens=[tokens_per_req] * B)
-                out_t = model(x_t, act_t, st_t, t_0=t_0, label="main")
+                out_t = model(x_t, act_t, st_t, t_0=t_0, cached=True)
 
                 expected = out_full[:, t_0 * N : (t_0 + 1) * N, :]
                 torch.testing.assert_close(
@@ -181,7 +181,7 @@ class TestKVCacheParity:
 
         cache = bind_fake_resources(model)
         with torch.no_grad():
-            out = model(x, act, st, t_0=0, label="main")
+            out = model(x, act, st, t_0=0, cached=True)
 
         assert out.shape == (B, N, cfg.embed_dim)
 
@@ -221,7 +221,7 @@ class TestKVCacheParity:
                     x_t   = x_seq[:, t_0 * N : (t_0 + 1) * N, :]
                     act_t = actions[:, t_0 : t_0 + 1, :]
                     st_t  = states[:, t_0 : t_0 + 1, :]
-                    outs.append(model(x_t, act_t, st_t, t_0=t_0, label="main"))
+                    outs.append(model(x_t, act_t, st_t, t_0=t_0, cached=True))
             return outs
 
         base_outs = _run_cached(x_base, act_base, st_base)

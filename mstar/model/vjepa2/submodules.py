@@ -37,14 +37,13 @@ from mstar.engine.accelerator_graph_config import (
     PiecewiseCallInputs,
     PiecewiseCaptureShape,
 )
-from mstar.engine.accelerator_graph_runner import PiecewiseAcceleratorGraphRunner
 from mstar.engine.engine import ExecutingBatch
-from mstar.engine.resources import AttentionStep, KVStep, Segment, SlotLease, SubmoduleStep
+from mstar.engine.state import ArrayStep, Segment, SlotLease, SubmoduleStep
 from mstar.model.submodule_base import ARNodeInputs, ARNodeSubmodule, ModelInputsFromEngine, NodeInputs, NodeSubmodule
 from mstar.model.vjepa2.components.ac_predictor import VisionTransformerPredictorAC
 from mstar.model.vjepa2.components.predictor import VJEPA2Predictor
 from mstar.model.vjepa2.components.vit_encoder import VJEPA2Encoder
-from mstar.model.vjepa2.config import AC_ROLLOUT_NUM_FRAMES, ATTN, KV_CACHE, VJepa2Config
+from mstar.model.vjepa2.config import AC_ROLLOUT_NUM_FRAMES, KV_CACHE, VJepa2Config
 
 # the AC predictor's transformer block loop, as a piecewise capture region
 BLOCK_LOOP_REGION = "block_loop"
@@ -886,6 +885,10 @@ class VJepa2ACRolloutPredictorSubmodule(ARNodeSubmodule):
     semantics.
     """
 
+    # Both forwards only call `_rollout_step`, so compiling them would compile only the glue around the region's replay
+    # and the eager predictor. The region's capture follows its own config, which doesn't compile.
+    disable_torch_compile = True
+
     def __init__(
         self,
         predictor: VisionTransformerPredictorAC,
@@ -909,7 +912,7 @@ class VJepa2ACRolloutPredictorSubmodule(ARNodeSubmodule):
         it around each replay, outside the graph.
         """
         cond_tokens = inp.kwargs.get("cond_tokens")
-        fn = self.predictor.make_block_loop_fn("main", inp.static_inputs, cond_tokens)
+        fn = self.predictor.make_block_loop_fn(cached=True, static_pos_bufs=inp.static_inputs, cond_tokens=cond_tokens)
         return {"x": fn(inp.static_inputs["x"])}
 
     def get_piecewise_accelerator_graph_configs(
@@ -920,8 +923,8 @@ class VJepa2ACRolloutPredictorSubmodule(ARNodeSubmodule):
 
         ``capture_seq_len = cond_tokens + N*N`` is the per-frame token count
         (one rollout step processes one frame). The block loop reads the KV
-        cache, so the region declares its own ``KVStep`` / ``AttentionStep``
-        and takes its slot with ``lease_before_step=True``.
+        cache, so the region declares its own state and takes its slot with
+        ``lease_before_step=True``.
         """
         ac = self.config.ac_predictor
         if ac is None:
@@ -954,10 +957,7 @@ class VJepa2ACRolloutPredictorSubmodule(ARNodeSubmodule):
                     Segment(request_id=rid, label="main", span=seq_len)
                     for rid, seq_len in zip(request_ids, seq_lens, strict=True)
                 ],
-                steps={
-                    KV_CACHE: KVStep(),
-                    ATTN: AttentionStep(causal=False)
-                }
+                state={KV_CACHE: ArrayStep()},
             )
 
         return {
@@ -1036,7 +1036,7 @@ class VJepa2ACRolloutPredictorSubmodule(ARNodeSubmodule):
                 Segment(request_id=rid, label="main", span=inp.input_seq_len)
                 for rid, inp in zip(request_ids, inputs, strict=True)
             ],
-            steps={KV_CACHE: KVStep(), ATTN: AttentionStep(causal=False)},
+            state={KV_CACHE: ArrayStep()},
         )
 
     # ------------------------------------------------------------------
@@ -1132,13 +1132,12 @@ class VJepa2ACRolloutPredictorSubmodule(ARNodeSubmodule):
         return out
 
     @staticmethod
-    def _leased_runner(engine_inputs: ModelInputsFromEngine) -> PiecewiseAcceleratorGraphRunner | None:
+    def _leased_runner(engine_inputs: ModelInputsFromEngine):
         """The block loop's runner when this step leased it, else None."""
         if BLOCK_LOOP_REGION not in engine_inputs.piecewise_leases:
             return None
         return engine_inputs.piecewise_runners[BLOCK_LOOP_REGION]
 
-    @torch.compiler.disable
     def _rollout_step(
         self,
         encoder_hidden: torch.Tensor,            # [B, H*W, D]
@@ -1147,7 +1146,7 @@ class VJepa2ACRolloutPredictorSubmodule(ARNodeSubmodule):
         t_0: int,
         extrinsics: torch.Tensor | None = None,  # [B, 1, action_embed_dim - 1] or None
         request_ids: list[str] | None = None,    # needed by PiecewiseCudaGraphRunner
-        runner: "PiecewiseAcceleratorGraphRunner | None" = None,
+        runner=None,
     ) -> torch.Tensor:
         """One AC rollout step using either the CUDA-graph or eager path.
 
@@ -1191,7 +1190,7 @@ class VJepa2ACRolloutPredictorSubmodule(ARNodeSubmodule):
                 t_0=t_0,
                 # without this every block takes plain SDPA and writes no K/V,
                 # leaving a gap in `main` that the declared span counted
-                label="main",
+                cached=True,
             )
 
         # Per-step LayerNorm — matches the upstream notebook's step_predictor

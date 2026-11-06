@@ -160,8 +160,8 @@ class TestACRolloutForwardBatched:
         encoder_hidden = torch.randn(2, n, d)
         actions = torch.randn(2, 1, 7)
         states = torch.randn(2, 1, 7)
-        # The rollout step attends under a plan label, so the blocks need KV +
-        # attention resources; rebound per call so no history carries over.
+        # The rollout step attends over the array, so the blocks need a handle;
+        # rebound per call so no history carries over.
         tokens_per_req = n + (3 if cfg.ac_predictor.use_extrinsics else 2)
 
         def _run(rids, *, encoder_hidden, actions, states):

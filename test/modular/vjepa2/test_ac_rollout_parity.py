@@ -115,7 +115,7 @@ def _reference_rollout(
 
     Per iter k:
       * Take one timestep of actions/states: ``[..., k : k + 1, :]``.
-      * Run the AC predictor under the ``"main"`` label with ``t_0=k``, so
+      * Run the AC predictor with ``cached=True`` and ``t_0=k``, so
         the step's K/V lands in the cache and the sequence grows.
       * Per-step LayerNorm, matching upstream's ``step_predictor`` body.
       * Feed the result straight back in — the context is the last
@@ -131,7 +131,7 @@ def _reference_rollout(
     loop-back wiring. The cache's own correctness is covered by
     test_ac_kv_cache_parity.py.
     """
-    resources = bind_fake_resources(predictor)
+    handle = bind_fake_resources(predictor)
     eh = encoder_hidden
     new_tgs: list[torch.Tensor] = []
     next_ehs: list[torch.Tensor] = []
@@ -140,9 +140,9 @@ def _reference_rollout(
             acts_k = actions[:, k:k + 1].contiguous()
             sts_k = states[:, k:k + 1].contiguous()
             ext_k = extrinsics[:, k:k + 1].contiguous() if extrinsics is not None else None
-            resources.plan([tokens_per_step])
+            handle.plan([tokens_per_step])
             predicted = predictor(
-                eh, acts_k, sts_k, extrinsics=ext_k, t_0=k, label="main",
+                eh, acts_k, sts_k, extrinsics=ext_k, t_0=k, cached=True,
             )
             new_tg = F.layer_norm(predicted, (predicted.size(-1),))
             eh = new_tg
@@ -157,7 +157,7 @@ def _step(
     encoder_hidden: torch.Tensor,
     actions: torch.Tensor,
     states: torch.Tensor,
-    resources=None,
+    handle=None,
 ) -> NameToTensorList:
     """One engine-shaped rollout step.
 
@@ -166,7 +166,7 @@ def _step(
     actions/states buffers lives in ``prepare_inputs``, so a direct forward
     would hand the predictor the whole trajectory.
 
-    ``resources`` carries the KV/attention history across steps. Pass one to
+    ``handle`` carries the K/V history across steps. Pass one to
     keep the cache growing over a rollout; leave it None for a fresh cache.
     """
     node_inputs = submodule.prepare_inputs(
@@ -183,14 +183,14 @@ def _step(
         engine_inputs=_engine_inputs(info),
         inputs=[node_inputs],
     )
-    # The rollout step attends under a plan label, so the blocks need KV +
-    # attention resources bound before the forward.
+    # The rollout step attends over the array, so the blocks need a handle
+    # bound before the forward.
     cfg = submodule.config
     cond_tokens = 3 if cfg.ac_predictor.use_extrinsics else 2
     tokens_per_req = packed["encoder_hidden"].size(1) + cond_tokens
-    if resources is None:
-        resources = bind_fake_resources(submodule.predictor)
-    resources.plan([tokens_per_req])
+    if handle is None:
+        handle = bind_fake_resources(submodule.predictor)
+    handle.plan([tokens_per_req])
     return submodule.forward(
         _GRAPH_WALK, _engine_inputs(info), **packed
     )
@@ -206,18 +206,18 @@ def _submodule_loop(
     """Drive the submodule H times, threading ``encoder_hidden`` via
     loop-back just like the mstar DynamicLoop does.
 
-    Resources are bound once for the whole rollout so the KV cache grows
+    The handle is bound once for the whole rollout so the KV cache grows
     across iters, as it does in production; rebinding per step would reset
     the history and make every iter look like a fresh step-0.
     """
-    resources = bind_fake_resources(submodule.predictor)
+    handle = bind_fake_resources(submodule.predictor)
     eh = encoder_hidden
     new_tgs: list[torch.Tensor] = []
     next_ehs: list[torch.Tensor] = []
     with torch.no_grad():
         for k in range(num_steps):
             info = _make_request_info(iter_idx=k, rollout_horizon=num_steps)
-            out = _step(submodule, info, eh, actions, states, resources=resources)
+            out = _step(submodule, info, eh, actions, states, handle=handle)
             new_tgs.append(out["predicted_hidden"][0])
             eh = out["encoder_hidden"][0]
             next_ehs.append(eh)
@@ -307,12 +307,12 @@ class TestACRolloutParity:
         cond_tokens = 3 if cfg.ac_predictor.use_extrinsics else 2
         tokens_per_step = n + cond_tokens
         # Bind once so the cache accumulates across iters, as in a real rollout.
-        resources = bind_fake_resources(submodule.predictor)
+        handle = bind_fake_resources(submodule.predictor)
 
         with torch.no_grad():
             for k in range(num_steps):
                 info = _make_request_info(iter_idx=k, rollout_horizon=num_steps)
-                out = _step(submodule, info, eh, actions, states, resources=resources)
+                out = _step(submodule, info, eh, actions, states, handle=handle)
                 predicted = out["predicted_hidden"][0]
                 next_eh = out["encoder_hidden"][0]
 
@@ -323,7 +323,7 @@ class TestACRolloutParity:
                 torch.testing.assert_close(next_eh, predicted)
 
                 # The cache is what grew: k+1 steps' worth of tokens per layer.
-                for layer_kvs in resources._kv.values():
+                for layer_kvs in handle._kv.values():
                     cached = torch.cat(layer_kvs[0][0], dim=0)
                     assert cached.shape[0] == (k + 1) * tokens_per_step
 
