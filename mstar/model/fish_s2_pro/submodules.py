@@ -487,7 +487,7 @@ class CodecSubmodule(ARNodeSubmodule):
         # a fresh stream, and a padding row on the sink, read zeros: the decoder's own left padding
         wav, new = self.incremental(codec_tokens, self.state.read(0).fields, lengths)
         self.state.write(0, **new)
-        return (wav.clamp(-1, 1) * 32767).to(torch.int16)
+        return (wav.float().clamp(-1, 1) * 32767).to(torch.int16)
 
     def forward(
         self,

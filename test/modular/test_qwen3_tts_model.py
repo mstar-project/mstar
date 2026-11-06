@@ -416,6 +416,14 @@ def test_qwen3_tts_process_prompt_matches_official_template():
     }
 
 
+def test_qwen3_tts_process_prompt_drops_leading_whitespace():
+    # the tokenizer merges "assistant\n" with a leading "\n" into one token, which changes the
+    # ChatML prefix the text span is sized from (a 400); leading whitespace carries no speech
+    model = _make_model()
+    model.process_prompt("\n 你好", input_modalities=["text"], output_modalities=["audio"])
+    assert model.tokenizer.last_text == "<|im_start|>assistant\n你好<|im_end|>\n<|im_start|>assistant\n"
+
+
 def test_qwen3_tts_process_prompt_rejects_a_changed_chatml_wrapper(monkeypatch):
     model = _make_model()
     monkeypatch.setattr(

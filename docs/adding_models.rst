@@ -1983,7 +1983,7 @@ The rest are free functions in ``mstar.engine.state``:
 
    qkv  = causal_conv(self.gdn, layer, qkv, weight=w, bias=b)              # reads and writes `conv`
    core = gated_delta_net(self.gdn, layer, q, k, v, a, b, A_log, dt_bias)  # reads and writes `state`
-   p    = position(self.kv, request, label)   # a request's next position, on the host
+   p    = position(self.kv, fwd_info.rid_handle, label)                    # a request's next position, on the host
    ids  = positions(self.kv)                  # this step's ids, on the device
    q, k = rope(self.kv, q, k)                 # rotate at this step's ids with the declared Rope
    tokens = sample(self.sampler, logits)      # one token per row, each a fresh draw
@@ -2772,9 +2772,13 @@ on the GPU inside its forward, so ``postprocess`` hands the tensor it reads stra
 encoder: ``[T, C, H, W]`` for torchcodec's ``VideoEncoder`` (Cosmos3) and ``[T, H, W, 3]``
 rgb24 frames for PyAV (Wan2.2, LTX-2.5) or a raw ``video_frame`` stream (LingBot-World).
 A permute in ``postprocess`` costs a host copy of the whole clip, or a slower copy of each
-frame inside PyAV. The arena's CPU read of an output (``MSTAR_SHM_ARENA``) slices a large
-copy over threads of its own (``mstar.utils.host_copy.HostCopier``), one encode's share of
-the CPUs.
+frame inside PyAV. A PyAV mp4 should be written with
+``mstar.model.components.video_encode.encode_mp4``, which takes the model's x264 options,
+rate and padding, and converts the frames to the encoder's pixel format on a thread a few
+frames ahead of the encoder, so x264 gets the frames the plain ``stream.encode`` loop
+would hand it without waiting on the conversion between them. The arena's CPU read of an
+output (``MSTAR_SHM_ARENA``) slices a large copy over threads of its own
+(``mstar.utils.host_copy.HostCopier``), one encode's share of the CPUs.
 
 .. _tensor-parallelism:
 

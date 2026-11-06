@@ -229,7 +229,7 @@ SNAPSHOT = {
     ],
     "position": [
         ["h", "POSITIONAL_OR_KEYWORD", None],
-        ["request", "POSITIONAL_OR_KEYWORD", None],
+        ["rid_handle", "POSITIONAL_OR_KEYWORD", None],
         ["label", "POSITIONAL_OR_KEYWORD", None],
     ],
     "positions": [
