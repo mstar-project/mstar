@@ -1,4 +1,4 @@
-"""``python -m benchmark.vibesys``: record rounds, decide a round, and tabulate a sweep.
+"""``python -m benchmark.vibesys``: record rounds, decide a round, tabulate a sweep, chart a loop.
 
 Examples::
 
@@ -12,6 +12,8 @@ Examples::
     # a checkpoint sweep, one line per cell
     python -m benchmark.vibesys table results.jsonl --batch h200_1106 --hypothesis "checkpoint: run-base vs 61b95ae05"
 
+    # the loop's best-so-far line on its headline cell, needs matplotlib (the eval extra)
+    python -m benchmark.vibesys chart results.jsonl --model Qwen3.5-0.8B --workload ShareGPT --c 64 --out progress.png
 """
 
 from __future__ import annotations
@@ -21,6 +23,7 @@ import json
 import sys
 from pathlib import Path
 
+from benchmark.vibesys import progress
 from benchmark.vibesys.rows import METRICS, Cell, Row, keep, load, table
 
 
@@ -46,6 +49,12 @@ def _keep(args: argparse.Namespace) -> int:
 def _table(args: argparse.Namespace) -> int:
     rows = [r for r in load(args.file) if r.batch == args.batch and args.hypothesis in (None, r.hypothesis)]
     print(table(rows, args.metric))
+    return 0
+
+
+def _chart(args: argparse.Namespace) -> int:
+    title = args.title or f"{args.model}, {args.workload}, c={args.c}"
+    progress.chart(load(args.file), Cell(args.model, args.workload, args.gpus, args.c), args.out, title, args.metric)
     return 0
 
 
@@ -85,6 +94,13 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--hypothesis", help="only the rows with this hypothesis, when the batch holds several sweeps")
     p.add_argument("--metric", default="throughput", choices=METRICS)
     p.set_defaults(run=_table)
+
+    p = sub.add_parser("chart", allow_abbrev=False, help="draw the best-so-far line of the loop's headline cell")
+    p.add_argument("file", help="a results file")
+    p.add_argument("--out", required=True, help="image file to write")
+    p.add_argument("--title")
+    _add_cell(p)
+    p.set_defaults(run=_chart)
 
     args = parser.parse_args(argv)
     return args.run(args)
