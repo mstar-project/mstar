@@ -269,6 +269,20 @@ def test_a_lockstep_node_keeps_no_ids_and_sets_no_pool_aside():
     )
 
 
+def test_rebuild_host_mb_0_sets_no_pool_aside_on_a_node_that_copies_media():
+    """``rebuild_host_mb: 0`` turned off the ids' room alone, so a worker whose node copies media still pinned
+    ``rebuild_media_host_mb`` at startup and kept every request's ids and copies there."""
+    from test_rebuild_policy import MEDIA, VISION
+    from test_rebuild_policy import _graphs as media_graphs
+
+    model = SimpleNamespace(rebuild_policies=lambda: {NODE: MEDIA}, get_graph_walk_graphs=media_graphs)
+    my_walks = {(NODE, PREFILL), (NODE, VISION), (NODE, DECODE)}
+    engine = SimpleNamespace(host_allowance=None, node_dtype=lambda node: torch.float32)
+    rebuilds = _make_rebuilds(model, {"rebuild_host_mb": 0}, my_walks, set(), torch.device("cpu"), engine)
+
+    assert NODE in rebuilds.nodes and rebuilds.pool is None, "the worker pinned the media pool with rebuilds off"
+
+
 def test_a_step_of_rebuild_rows_alone_routes_nothing_and_makes_them_resident():
     w, eng, batch, node_batch = _rebuilding()
     assert node_batch.step_context.rebuild_rids == {R} and node_batch.per_request_info[R].graph_walk == PREFILL
@@ -490,6 +504,24 @@ def test_a_rebuild_row_leaves_its_requests_loopback_entry(branch):
     Engine._record_loopback(engine, batch)
 
     assert engine._loopback_steps[R] == (NODE, DECODE), "the resumed decode would not read the last kept id"
+
+
+def test_a_pass_that_runs_no_step_starts_the_queued_host_copies(monkeypatch):
+    """Queued host copies started only once a step's outputs were sent, and a drop waits for them. With every request
+    waiting on the pool, no step ran, so no copy started and nothing could be dropped to let one run."""
+    from test_loop_turns import TURNS, _looping_worker, _Runtime, _scheduler, _StopLoopError
+    from test_rebuild_policy import _copying, _vision_step
+
+    rebuilds = _copying(R)
+    rebuilds.keep_copies(_vision_step((R,), {}, completion_event=None))
+    w = _looping_worker(monkeypatch, *_scheduler(_Runtime(), TURNS))
+    w._rebuilds = rebuilds
+
+    # the loop ends on its first idle wait
+    with pytest.raises(_StopLoopError):
+        w.run()
+
+    assert rebuilds._kept[NODE][R].copies.ready(), "the request would wait for its copies with no step to start them"
 
 
 def test_the_scheduler_sees_the_rows_every_lane_holds():
