@@ -1419,6 +1419,16 @@ def test_concurrent_copies_share_a_copy_engine_and_overlap_compute():
     assert 1.95 < both < 2.1 and compute < 1.1 and d2h < 1.1, out
 
 
+def test_a_cached_call_answers_as_the_call_would():
+    """The shape cache tells ``1`` from ``1.0``, whose results differ in dtype."""
+    out = run_sim("""
+        import torch
+        ints = torch.empty(1 << 21, dtype=torch.int64, device="cuda")  # (too many to keep values)
+        print(*((ints * value).dtype for value in (1, 1.0, True)))
+    """)
+    assert out.split() == ["torch.int64", "torch.float32", "torch.int64"], out
+
+
 def test_timing_only_holds_shapes_not_values():
     """Nothing is computed: a 40 GB tensor costs no host memory
     but counts against the card; small integer tensors (what mstar plans with)
@@ -1684,7 +1694,7 @@ def test_a_long_run_over_changing_shapes_holds_the_emulators_memory_flat():
         for tokens in range(208, 408):
             step(tokens)
         grown = tracemalloc.get_traced_memory()[0] - before
-        assert grown < 100_000, grown
+        assert grown < 500_000, grown  # (bounded, it moves +-140 KB; with no bound, 2.9 MB)
         print("ok")
     """)
     assert out.strip() == "ok"

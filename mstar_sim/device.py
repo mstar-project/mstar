@@ -697,9 +697,7 @@ def _signature(func, uargs, ukwargs, tensors):
     for x in tree_flatten((uargs, ukwargs))[0]:
         if isinstance(x, torch.Tensor):
             continue
-        if type(x) is slice:
-            x = ("slice", x.start, x.stop, x.step)
-        leaves.append(x)
+        leaves.append(("slice", x.start, x.stop, x.step) if type(x) is slice else (type(x), x))
     try:
         key = (func, tuple((t.shape, t.stride(), t.dtype, t.device.type) for t in tensors), tuple(leaves))
         hash(key)
@@ -834,7 +832,7 @@ def _call_key(func, args, kwargs):
             return _UNCACHEABLE if any(v is _UNCACHEABLE for _, v in parts) else (dict, parts)
         if t is slice:
             return ("slice", x.start, x.stop, x.step)
-        return x if t in _LEAVES else _UNCACHEABLE
+        return (t, x) if t in _LEAVES else _UNCACHEABLE  # (1 == 1.0 == True, whose results differ)
 
     shape = sig((args, kwargs))
     if shape is _UNCACHEABLE or len(kept) == operands[0]:  # no value-less operand: it computes
