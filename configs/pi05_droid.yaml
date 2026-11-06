@@ -52,5 +52,6 @@ node_groups:
 
   - node_names:
       - LLM
+      - action_expert
     ranks:
       - 0

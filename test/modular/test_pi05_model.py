@@ -16,7 +16,7 @@ import pytest
 import torch
 
 from mstar.engine.resources.kv.config import KVSpec
-from mstar.graph.base import GraphNode, Sequential, TensorPointerInfo
+from mstar.graph.base import Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.pi05.components.flow_matching import (
     discretize_state,
@@ -208,8 +208,7 @@ def test_pi05_prefix_scaling_follows_openpi():
     """openpi's and lerobot's embed_prefix: image tokens unscaled, language embeddings times sqrt(hidden)."""
     config = Pi05Config(hidden_size=16)
     embed = torch.nn.Embedding(10, 16)
-    llm = Pi05LLMSubmodule(embed, torch.nn.Identity(), torch.nn.Identity(), torch.nn.Identity(),
-                           torch.nn.Identity(), torch.nn.Identity(), config)
+    llm = Pi05LLMSubmodule(embed, torch.nn.Identity(), config)
     img = torch.randn(6, 16)
     ids = torch.tensor([1, 4, 7])
     with torch.no_grad():
@@ -242,40 +241,23 @@ def test_pi05_load_image_ships_uint8_with_unchanged_vit_input(tmp_path):
 # ----------------------------------------------------------------------
 
 
-def test_pi05_graph_walks_have_expected_keys():
-    model = _make_model()
-    walks = model.get_graph_walk_graphs()
-    assert set(walks.keys()) == {Pi05Model.PREFILL_WALK, Pi05Model.ACTION_GEN_WALK}
+def test_pi05_runs_one_graph_walk():
+    assert set(_make_model().get_graph_walk_graphs()) == {Pi05Model.CHUNK_WALK}
 
 
-def test_pi05_prefill_is_sequential_vit_then_llm():
-    model = _make_model()
-    walks = model.get_graph_walk_graphs()
-    prefill = walks[Pi05Model.PREFILL_WALK]
-    assert isinstance(prefill, Sequential)
-    assert len(prefill.sections) == 2
-    first, second = prefill.sections
-    assert isinstance(first, GraphNode) and first.name == "vit_encoder"
-    assert isinstance(second, GraphNode) and second.name == "LLM"
-    # vit_encoder must emit img_emb to LLM.
-    assert any(
-        edge.next_node == "LLM" and edge.name == "img_emb"
-        for edge in first.outputs
-    )
-    # LLM consumes img_emb + text_inputs (state is encoded in text_inputs
-    # as a decimal-string suffix per Pi0.5's prompt format).
-    assert set(second.input_names) == {"img_emb", "text_inputs"}
-
-
-def test_pi05_action_gen_is_one_llm_step_emitting_actions():
-    model = _make_model()
-    action_gen = model.get_graph_walk_graphs()[Pi05Model.ACTION_GEN_WALK]
-    # The whole denoising loop runs inside one LLM step, so the walk is a
-    # single node whose only output goes to the client.
-    assert isinstance(action_gen, GraphNode) and action_gen.name == "LLM"
-    assert set(action_gen.input_names) == {"noisy_actions"}
-    assert len(action_gen.outputs) == 1
-    out = action_gen.outputs[0]
+def test_pi05_chunk_walk_is_vit_then_llm_then_action_expert():
+    walk = _make_model().get_graph_walk_graphs()[Pi05Model.CHUNK_WALK]
+    assert isinstance(walk, Sequential)
+    vit, llm, action = walk.sections
+    assert (vit.name, llm.name, action.name) == ("vit_encoder", "LLM", "action_expert")
+    assert [(e.next_node, e.name) for e in vit.outputs] == [("LLM", "img_emb")]
+    # the robot state is part of text_inputs, per Pi0.5's prompt format
+    assert set(llm.input_names) == {"img_emb", "text_inputs"}
+    assert [(e.next_node, e.name) for e in llm.outputs] == [("action_expert", "prefix_done")]
+    assert set(action.input_names) == {"prefix_done"}
+    # the whole denoising loop runs inside this one step
+    assert len(action.outputs) == 1
+    out = action.outputs[0]
     assert out.next_node == EMIT_TO_CLIENT
     assert out.output_modality == "action"
 
@@ -286,7 +268,7 @@ def test_pi05_kv_cache_config_matches_pi05_config():
         spec for spec in model.get_node_resources() if isinstance(spec, KVSpec)
     ]
     assert len(kv_specs) == 1
-    assert kv_specs[0].nodes == {"LLM"}
+    assert kv_specs[0].nodes == {"LLM", "action_expert"}
     kv = kv_specs[0].config
     assert kv.num_layers == model.config.num_layers
     assert kv.num_kv_heads == model.config.num_kv_heads
@@ -302,12 +284,7 @@ def test_pi05_kv_cache_config_matches_pi05_config():
 def test_pi05_worker_graphs_from_yaml():
     model = _make_model()
     worker_graphs = model.get_worker_graphs(CONFIG_PATH)
-    # 2 graph walks * 2 worker graphs apiece... but the prefill walk has both
-    # nodes on rank 0 and they belong to different node_groups, so they remain
-    # 2 separate worker graphs. action_gen has only the LLM node.
-    walks_seen = {tuple(sorted(wg.graph_walks)) for wg in worker_graphs}
-    assert (Pi05Model.PREFILL_WALK,) in walks_seen
-    assert (Pi05Model.ACTION_GEN_WALK,) in walks_seen
+    assert {tuple(sorted(wg.graph_walks)) for wg in worker_graphs} == {(Pi05Model.CHUNK_WALK,)}
 
 
 # ----------------------------------------------------------------------
@@ -324,6 +301,12 @@ def test_pi05_plan_refuses_a_request_without_images():
     # without the images the prefill could never run
     with pytest.raises(ValueError, match="image_inputs"):
         _make_model().walk_plan("default", ["text"], ["action"], {"text_inputs": [_pointer()]}, {})
+
+
+def test_pi05_plan_is_one_chunk_walk():
+    signals = {"image_inputs": [_pointer()], "text_inputs": [_pointer()]}
+    plan = _make_model().walk_plan("default", ["image", "text"], ["action"], signals, {})
+    assert [step.walk for step in plan] == [Pi05Model.CHUNK_WALK]
 
 
 # ----------------------------------------------------------------------

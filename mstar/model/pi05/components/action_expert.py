@@ -4,7 +4,7 @@ The action expert is a Gemma-style transformer that processes action
 suffix tokens during the flow-matching loop. It shares KV-cache
 dimensions with the PaliGemma expert (same num_kv_heads and head_dim)
 so it can attend to the prefix KV cache that PaliGemma wrote during
-the prefill walk.
+the same walk.
 
 Composed from ``mstar.model.components`` — ``AdaRMSNorm`` for the
 conditional norms, ``GatedDecoderLayer`` for the gated-residual block,
