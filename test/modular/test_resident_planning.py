@@ -73,7 +73,7 @@ def _resident_planning_on(monkeypatch):
 
 def _repeats(limit: int, nodes="n") -> StepRepeats:
     """Repeats up to ``limit`` asked of each of ``nodes``' WALK, a token loop."""
-    edges = LoopEdges("loop", {"t": EdgeKind.LOOP_BACK}, {("t", "n"): EdgeKind.LOOP_BACK})
+    edges = LoopEdges({"t": EdgeKind.LOOP_BACK}, {("t", "n"): EdgeKind.LOOP_BACK})
     return StepRepeats({n: RepeatConfig(max=limit) for n in nodes}, {(n, WALK): edges for n in nodes})
 
 
@@ -628,7 +628,6 @@ def test_each_edge_of_a_loop_has_its_own_kind():
     from mstar.graph.special_destinations import EMIT_TO_CLIENT
 
     edges = loop_edges(_token_loop(), "n")
-    assert edges.loop == "loop"
     assert edges.inputs == {"t": EdgeKind.LOOP_BACK, "cond": EdgeKind.CONSTANT}
     assert edges.outputs == {
         ("t", "n"): EdgeKind.LOOP_BACK, ("t", EMIT_TO_CLIENT): EdgeKind.PER_ITERATION,
@@ -1028,7 +1027,7 @@ def test_a_step_of_a_node_that_never_chains_repeats_where_the_scheduler_picks_it
     with nothing of it in flight. A chained node's picked step stays one
     iteration (its chain's next step repeats)."""
     rows = {0: 0, 1: 0}
-    edges = LoopEdges("loop", {"t": EdgeKind.LOOP_BACK}, {("t", "n"): EdgeKind.LOOP_BACK}, chained=chained)
+    edges = LoopEdges({"t": EdgeKind.LOOP_BACK}, {("t", "n"): EdgeKind.LOOP_BACK}, chained=chained)
     worker = Worker.__new__(Worker)
     worker._step_repeats = StepRepeats({"n": RepeatConfig(max=8)}, {("n", WALK): edges})
     worker._step_repeats.settle(lambda *key: None, lambda *key: None)
@@ -1046,7 +1045,7 @@ def test_a_step_cut_to_one_before_admit_says_why(monkeypatch):
     logged once per reason."""
     from mstar.worker import step_repeats as step_repeats_mod
 
-    edges = LoopEdges("loop", {"t": EdgeKind.LOOP_BACK}, {("t", "n"): EdgeKind.LOOP_BACK}, chained=False)
+    edges = LoopEdges({"t": EdgeKind.LOOP_BACK}, {("t", "n"): EdgeKind.LOOP_BACK}, chained=False)
     worker = Worker.__new__(Worker)
     worker._step_repeats = StepRepeats({"n": RepeatConfig(max=8)}, {("n", WALK): edges})
     worker._step_repeats.settle(lambda *key: None, lambda *key: None)

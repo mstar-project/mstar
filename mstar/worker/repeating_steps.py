@@ -98,7 +98,7 @@ class RepeatingSteps:
         if self._step_repeats is None or not self._step_repeats.asked:
             return 1
         key = (batch.node_name, batch.graph_walk)
-        # the runtime's name for the Loop: ``LoopEdges.loop`` is a build of its own
+        # the runtime's name for the Loop: a Loop with no name of its own has one per build
         loop = self._innermost_loop_by_node.get((batch.graph_walk, batch.node_name))
         if loop is None:
             repeats, why = 1, "the runtime holds no Loop of it here"

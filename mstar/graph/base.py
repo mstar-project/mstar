@@ -752,7 +752,6 @@ class EdgeKind(Enum):
 
 class LoopEdges(NamedTuple):
     """Every edge of one node in its innermost Loop, by kind."""
-    loop: str
     # input name -> kind
     inputs: dict[str, EdgeKind]
     # (signal, destination) -> kind
@@ -822,7 +821,7 @@ def loop_edges(section: GraphSection, node_name: str) -> LoopEdges | None:
         and (edge.is_streaming or edge.name in accumulated or edge.next_node in SPECIAL_DESTINATIONS)
     )
     leaving = frozenset(name for name, _ in outputs if name in terminal)
-    return LoopEdges(inner.name, inputs, outputs, items, leaving, node.enable_async_scheduling, made_by)
+    return LoopEdges(inputs, outputs, items, leaving, node.enable_async_scheduling, made_by)
 
 
 class GraphStateRegistry(ABC):
