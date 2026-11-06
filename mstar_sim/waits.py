@@ -387,6 +387,11 @@ class _Tasks:
                 pass  # a task that has just gone
         return found
 
+    def close(self) -> None:
+        for fd in self.fds.values():
+            os.close(fd)
+        self.fds.clear()
+
 
 _own = _Tasks("self")
 _mover_tid = [""]
@@ -421,6 +426,7 @@ def _others_cpu() -> float:
         try:
             child[1] = time.clock_gettime(child[0])
         except OSError:  # it has gone
+            child[2].close()
             del _native[pid]
             if not _native and _native_busy[0]:
                 _native_busy[0] = False

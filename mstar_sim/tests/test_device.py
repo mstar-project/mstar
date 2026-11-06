@@ -1192,6 +1192,25 @@ def test_a_native_process_holds_the_deployment_only_while_it_works():
     assert 0.3 <= worked <= real and wall < 0.2 and 0.1 <= float(peer) < 0.2, (worked, real, wall, peer)
 
 
+def test_a_watched_child_takes_its_fds_with_it():
+    """Each native child's task fds go when it does: a media run starts one per request."""
+    out = run_sim("""
+        import os, subprocess
+        from mstar_sim import waits
+        count = lambda: len(os.listdir("/proc/self/fd")) - len(waits._own.fds)  # (the process's own stay)
+        before = count()
+        for _ in range(10):
+            child = subprocess.Popen(["sleep", "0.02"])
+            while not waits._native[child.pid][2].fds:  # a look has seen it
+                waits._real_sleep(0.001)
+            child.wait()
+            while child.pid in waits._native:
+                waits._real_sleep(0.01)
+        print(count() - before)
+    """)
+    assert int(out) <= 1, out
+
+
 def test_a_blocking_h2d_holds_the_host_until_the_copy_is_done():
     """As ``cudaMemcpy``: after what is queued on the stream, and for the copy itself."""
     out = run_sim("""
