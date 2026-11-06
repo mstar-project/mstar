@@ -15,6 +15,7 @@ import torch
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo, merge_publish_info
 from mstar.distributed.communication import JointGroups, WorkerParallelGroups
+from mstar.engine import with_recompile_limit
 from mstar.engine.accelerator_graph_runner import (
     AcceleratorGraphRunner,
     CapturePlan,
@@ -28,6 +29,7 @@ from mstar.engine.fp32_precision import Fp32Precision, cudnn_benchmark, fp32_pre
 from mstar.engine.node_dtype import resolve_node_dtype
 from mstar.engine.resources import (
     AdmitFailedReason,
+    AllocationFailed,
     FullAdmitOutcome,
     NodeResourceSpec,
     PublishedInfo,
@@ -776,16 +778,16 @@ class Engine:
             dynamic = True if item_encoder and not getattr(submodule, "marks_dynamic_dims", False) else None
             try:
                 # no token count, these serve eager batches of any size
-                submodule_mgmt.forward = with_inductor_overrides(torch.compile(
+                submodule_mgmt.forward = with_recompile_limit(with_inductor_overrides(torch.compile(
                     submodule.forward,
                     fullgraph=False,
                     dynamic=dynamic,
-                ))
-                submodule_mgmt.forward_batched = with_inductor_overrides(torch.compile(
+                )), submodule)
+                submodule_mgmt.forward_batched = with_recompile_limit(with_inductor_overrides(torch.compile(
                     submodule.forward_batched,
                     fullgraph=False,
                     dynamic=dynamic,
-                ))
+                )), submodule)
                 logger.info("Engine: torch.compile applied to %s", node_name)
             except Exception:
                 logger.warning(
@@ -1933,6 +1935,7 @@ class Engine:
                 range_pop()
 
         if not admit_outcome.ok:
+            self._check_follower_refusal(batch, admit_outcome)
             batch.register_admit_error(
                 admit_outcome.reason, admit_outcome.failed_resource,
             )
@@ -1941,6 +1944,29 @@ class Engine:
             for rid in batch.first_chunk_rids:
                 self._chunking.release(rid, batch.node_name)
         return admit_outcome, step
+
+    def _check_follower_refusal(
+        self, batch: ExecutingBatch, outcome: FullAdmitOutcome,
+    ) -> None:
+        """Exit when a TP follower refuses, for capacity, a batch past its own
+        ``get_max_batch_size``. Rank 0 scheduled it within its cap, so the caps
+        differ, and where a cap follows free state, so does the ranks' state.
+        Re-queueing or failing the requests would leave rank 0 in the step's
+        collectives until the watchdog; the micro-scheduler exits the same way
+        on a diverged page trail.
+        """
+        node = batch.node_name
+        if node not in self._tp_follower_nodes or not isinstance(outcome.reason, AllocationFailed):
+            return
+        walk = batch.step_context.graph_walk
+        cap = self.get_max_batch_size(node, walk)
+        rows = len(batch.request_ids)
+        if cap is not None and rows > cap:
+            raise SystemExit(
+                f"TP ranks diverged: a follower refused {rows} requests on {node}/{walk} "
+                f"that rank 0 scheduled, past this rank's cap of {cap}; their "
+                f"{outcome.failed_resource} state differs. {outcome.reason.message}"
+            )
 
     def _maybe_lease_piecewise_regions(
         self, node_name: str, ctx: StepContext, inputs: list[NodeInputs],
@@ -2761,6 +2787,10 @@ class Engine:
             )
         capped = [cap for cap in caps if cap is not None]
         return min(capped) if capped else None
+
+    def batch_cap_varies(self, node_name: str, graph_walk: str) -> bool:
+        """Whether this walk's ``get_max_batch_size`` can move between passes."""
+        return self._submodules[node_name].submodule.batch_cap_varies(graph_walk)
 
     def get_max_batch_tokens(self, node_name: str, graph_walk: str) -> int | None:
         return self._chunking.max_batch_tokens(node_name, graph_walk)
