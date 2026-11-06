@@ -1391,6 +1391,12 @@ class Cosmos3Model(Model):
                 1, int(mk.get("max_sequence_length", constants.DEFAULT_MAX_SEQUENCE_LENGTH))
             ),
         }
+        frames_per_latent = self.config.vae.scale_factor_temporal
+        if params["has_image_condition"] and action_mode is None and num_frames <= frames_per_latent:
+            # the image pins the first latent frame, so one latent frame leaves nothing to denoise
+            raise ValueError(
+                f"Cosmos3 image conditioning requires a video request (num_frames > {frames_per_latent})."
+            )
         # Video-to-video: a non-action video input pins clean conditioning
         # latent frames taken from the request video (reference recipe defaults:
         # indexes (0, 1), keep "first", flow_shift 10.0). Validated here so a

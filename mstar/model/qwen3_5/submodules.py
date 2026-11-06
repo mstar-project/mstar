@@ -294,7 +294,7 @@ class LLMSubmodule(ARNodeSubmodule):
         start_embed, end_embed = self._sentinel_embeds()
 
         pos = self.node_resources[ROPE].position(
-            rid=fwd_info.request_id, label="main",
+            rid=fwd_info.rid_handle, label="main",
         )
         start_pos = pos
         embeds: list[torch.Tensor] = []

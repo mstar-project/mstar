@@ -358,7 +358,9 @@ class DuplexStream:
         wav = audio.squeeze(1)[0]                                       # (samples,)
         new = wav[self._emitted:]
         self._emitted = wav.shape[0]
-        pcm = (new.clamp(-1, 1) * 32767).to(torch.int16).cpu().numpy().tobytes()
+        from mstar.model.nemotron_duplex.submodules import pcm16
+
+        pcm = pcm16(new).cpu().numpy().tobytes()
         return _StreamOutput(audio=pcm, text=self.m.tokenizer.decode([text_tok]))
 
 
