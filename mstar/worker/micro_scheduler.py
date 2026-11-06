@@ -4,7 +4,7 @@ import logging
 import time
 from collections import Counter, defaultdict, deque
 from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any, NamedTuple
 
@@ -354,6 +354,11 @@ class PopReadyResult(NamedTuple):
     walk_output_signals: dict[str, list[str]] = {}
 
 
+def moves_alone(message: ScheduleTPNode) -> ScheduleTPNode:
+    """Return ``message`` without its rows, prefix hits and page trails, so it carries only rank 0's moves."""
+    return replace(message, request_ids=[], speculative=False, prefix_hits={}, page_trails={})
+
+
 class ChainPick(NamedTuple):
     """A speculation chain's next step at its target, as ``pick_chain_step``
     chose it; ``take_chain_step`` pops the rows it took off the queues."""
@@ -549,8 +554,8 @@ class MicroScheduler:
         # exactly the one the drain must wait for. Purged by ``clear_wire_rid``.
         self.pending_tp_follow_count: dict[str, int] = defaultdict(int)
 
-        # pending resident deltas for TP follow nodes
-        self._pending_resident_deltas: dict[str, OffloadDelta] = {}
+        # rank 0's moves this rank has yet to replay, on any of the nodes it follows
+        self._pending_resident_delta = OffloadDelta.new()
         self._last_resident_delta: int = -1
         # popped, not settled: a settled head can still fail to build, and its removals wait for its admit
         self._last_popped_tp_seq: int = -1
@@ -835,25 +840,26 @@ class MicroScheduler:
         return self.tp_batches_pending_schedule[0]
 
     def _apply_resident_delta(self, node_name: str, new_delta: OffloadDelta | None=None) -> bool:
-        if node_name not in self._pending_resident_deltas:
-            self._pending_resident_deltas[node_name] = OffloadDelta.new()
-        delta = self._pending_resident_deltas[node_name]
+        delta = self._pending_resident_delta
         if new_delta is not None:
             delta.extend(new_delta)
 
         if not len(delta):
             return True
 
-        engine = self.engine_manager.get_engine(node_name)
-        return engine.apply_resident_delta(node_name, delta)
+        return self.engine_manager.get_engine(node_name).apply_resident_delta(delta, self.rebuilds)
 
     def _apply_delta_from_message(self, message: ScheduleTPNode) -> bool:
+        new_delta = None
         if self._last_resident_delta < message.spec_seq:
             self._last_resident_delta = message.spec_seq
-            return self._apply_resident_delta(message.node_name, message.resident_delta)
-        return self._apply_resident_delta(message.node_name)
+            new_delta = message.resident_delta
+        try:
+            return self._apply_resident_delta(message.node_name, new_delta)
+        except Exception as exc:
+            raise SystemExit(f"TP ranks diverged: {exc}") from exc
 
-    def settle_tp_follow_delta(self, caught_up: bool) -> bool:
+    def settle_tp_follow_delta(self, request_state: RequestStateManager, caught_up: bool) -> bool:
         """Replay the front head's resident delta; True once every move landed.
 
         The one seam both consumers of this FIFO go through — the serial path
@@ -869,10 +875,11 @@ class MicroScheduler:
             return True
         if not self._apply_delta_from_message(head):
             return False
-        if not head.prefix_hits and not head.page_trails:
-            return True
         engine = self.engine_manager.get_engine(head.node_name)
         try:
+            self._start_follow_rebuilds(request_state, head)
+            if not head.prefix_hits and not head.page_trails:
+                return True
             engine.check_page_trails(head.node_name, head.graph_walk, head.spec_seq, head.page_trails)
             return engine.adopt_cached_prefix(head, caught_up)
         except Exception as exc:
@@ -882,18 +889,29 @@ class MicroScheduler:
 
     def pop_tp_follow_head(self) -> ScheduleTPNode:
         # Sole exit for a queued follow batch: every consumer (the serial path
-        # and the async follower's build / drop / void paths) pops here, so the
-        # drain refcount is discharged in one place.
+        # and the async follower's build path) pops here. `void_tp_follow_head`
+        # discharges the drain refcount of a head this rank won't build.
         message = self.tp_batches_pending_schedule.popleft()
         self._apply_delta_from_message(message)
         self._last_popped_tp_seq = max(self._last_popped_tp_seq, message.spec_seq)
-        for rid in message.request_ids:
+        self._discharge(message.request_ids)
+        return message
+
+    def void_tp_follow_head(self) -> None:
+        """Turn the front head, which this rank won't build, into a step of moves alone. Rank 0 made the head's
+        moves and stamps the removals it makes next with the head's seq, so the seq counts as consumed only when
+        the step is popped, after its moves land."""
+        head = self.tp_batches_pending_schedule[0]
+        self._discharge(head.request_ids)
+        self.tp_batches_pending_schedule[0] = moves_alone(head)
+
+    def _discharge(self, rids: list[str]) -> None:
+        for rid in rids:
             if rid not in self.pending_tp_follow_count:
                 continue
             self.pending_tp_follow_count[rid] -= 1
             if self.pending_tp_follow_count[rid] <= 0:
                 self.pending_tp_follow_count.pop(rid, None)
-        return message
 
     def pop_ready_rids(
         self, request_state: RequestStateManager,
@@ -976,27 +994,33 @@ class MicroScheduler:
             return
         # Check readiness for every rid to pop all-or-none. Use the
         # leader's graph walk. No step of the node is in flight on this path.
-        if not self.settle_tp_follow_delta(caught_up=True):
+        if not self.settle_tp_follow_delta(request_state, caught_up=True):
             return # every pending move has to land before the step is built
+        if not first_tp_node.request_ids:
+            # a step with no rows, so pop it rather than build an empty batch
+            self.pop_tp_follow_head()
+            return
         rids = self.tp_rids(first_tp_node)
         # before anything is popped: lists that do not match the rows raise
         chunk_ranges = tp_chunk_ranges(first_tp_node, rids)
         unread = self.unread_rows(first_tp_node, rids)
+        rebuild = self.follow_rebuilds(first_tp_node.node_name, rids)
+        unpopped = unread | rebuild
         popped = self.pop_ready_rids(
             request_state, first_tp_node.node_name, first_tp_node.graph_walk,
-            [r for r in rids if r not in unread],
+            [r for r in rids if r not in unpopped],
             walks=first_tp_node.walks,
             walk_idx=[
-                w for r, w in zip(rids, first_tp_node.walk_idx, strict=True) if r not in unread
+                w for r, w in zip(rids, first_tp_node.walk_idx, strict=True) if r not in unpopped
             ] if first_tp_node.walks else None,
         )
         if popped is None:
             self.warn_unchecked_read_failure(first_tp_node, rids)
             return
         request_to_worker_graph, input_edges, output_signals, request_walks, walk_signals = popped
-        if unread:
-            request_to_worker_graph, request_walks = self.with_unread_rows(
-                first_tp_node, rids, unread, request_to_worker_graph, request_walks,
+        if unpopped:
+            request_to_worker_graph, request_walks = self.with_unpopped_rows(
+                first_tp_node, rids, unpopped, request_to_worker_graph, request_walks,
             )
 
         self.pop_tp_follow_head()
@@ -1010,6 +1034,7 @@ class MicroScheduler:
             tp_seq=first_tp_node.spec_seq,
             request_walks=request_walks,
             walk_output_signals=walk_signals,
+            rebuild_rids=rebuild,
             read_check_rids=tuple(rids) if first_tp_node.read_check else None,
             # the leader's chunks, so the chunk Loop ends on the same step here
             chunk_ranges=chunk_ranges,
@@ -1017,6 +1042,35 @@ class MicroScheduler:
         )
         self.cap_chunk_loops(batch)
         return batch
+
+    def follow_rebuilds(self, node_name: str, rids: Iterable[int]) -> frozenset[int]:
+        """The rows of rank 0's step that rebuild a request dropped on ``node_name``, which
+        `_start_follow_rebuilds` started when the step settled."""
+        return frozenset(rid for rid in rids if self.rebuilds.rebuilding(rid, node_name))
+
+    def _start_follow_rebuilds(self, request_state: RequestStateManager, head: ScheduleTPNode) -> None:
+        """Start the rebuild of each request of ``head`` dropped on its node, from the same source as rank 0's,
+        since the request's chunk Loop is lockstep. Rank 0 started it before it sent the step, so rank 0 leased the
+        request's cached prefix under the keys the rebuild lays out, and this rank starts it before it takes that
+        lease."""
+        node_name = head.node_name
+        if node_name not in self.rebuilds.nodes:
+            return
+        engine = self.engine_manager.get_engine(node_name)
+        partition = request_state.get_partition_for_node(node_name)
+        for rid in self.tp_rids(head):
+            # A row a step on the node holds is resident or rebuilding already, since a drop there waits only for that
+            # step.
+            if (
+                rid != REMOVED_RID and not self.rebuilds.rebuilding(rid, node_name)
+                and engine.residency(node_name, rid) is Residency.DROPPED and not engine.in_step(node_name, rid)
+            ):
+                self._start_rebuild(node_name, rid, request_state.get_fwd_info(rid, partition).graph_walk)
+
+    def _start_rebuild(self, node_name: str, rid: int, graph_walk: str) -> None:
+        rebuild = self.rebuilds.start(rid, node_name, self.prefilling(node_name, rid, graph_walk))
+        if rebuild is not None:
+            self.engine_manager.get_engine(node_name).prepare_rebuild(node_name, rid, rebuild)
 
     def unread_rows(self, head: ScheduleTPNode, rids: list[int]) -> set[int]:
         """The rows of ``head`` whose input read failed on this rank, which a
@@ -1029,19 +1083,20 @@ class MicroScheduler:
             return set()
         return {r for r in rids if r in failed}
 
-    def with_unread_rows(
-        self, head: ScheduleTPNode, rids: list[int], unread: set[int],
+    def with_unpopped_rows(
+        self, head: ScheduleTPNode, rids: list[int], unpopped: Collection[int],
         request_to_worker_graph: dict[int, int], request_walks: dict[int, str],
     ) -> tuple[dict[int, int], dict[int, str]]:
-        """``request_to_worker_graph`` and ``request_walks`` with ``unread``'s
-        rows put back, in the leader's order: the step has rank 0's rows on
-        every rank until its read check, so it is built, submitted, voided and
-        settled alike. The unread rows were never popped."""
+        """``request_to_worker_graph`` and ``request_walks`` with the rows
+        nothing popped put back, in the leader's order: rows whose read failed
+        here, which the step carries on every rank until its read check takes
+        them out, so it is built, submitted, voided and settled alike, and
+        rebuild rows, which the graph runtime holds no node of."""
         walk_of = dict(zip(rids, (head.walks[w] for w in head.walk_idx), strict=True)) if head.walks else {}
         request_walks = dict(request_walks)
         rows = {}
         for rid in rids:
-            if rid not in unread:
+            if rid not in unpopped:
                 rows[rid] = request_to_worker_graph[rid]
                 continue
             walk = walk_of.get(rid, head.graph_walk)
@@ -1760,9 +1815,14 @@ class MicroScheduler:
         being removed, or in a step in flight."""
         now = time.monotonic()
         held, removing, failed, in_flight = self.held_until, self.pending_removes, self.failed_rids, self.in_flight_rids
-        for (node, rid), cursor in self.rebuilds.cursors():
+        for (node, rid), cursor in self._cursors_here():
             if rid not in in_flight and rid not in removing and rid not in failed and held.get(rid, 0.0) <= now:
                 yield node, rid, cursor
+
+    def _cursors_here(self) -> Iterator[tuple[tuple[str, int], RebuildCursor]]:
+        """The rebuilds this rank schedules: a follower's rebuild on a node rank 0 leads runs as rank 0 sends it."""
+        leads = self.parallel_leader_nodes
+        return ((key, cursor) for key, cursor in self.rebuilds.cursors() if leads is None or key[0] in leads)
 
     def _rebuild_rows(
         self, key: tuple[str, str], only_walk: str | None = None, skip_walk: str | None = None,
@@ -2255,9 +2315,12 @@ class MicroScheduler:
             self.parked.setdefault(node_name, set()).add(rid)
             return False
         if outcome.rebuild:
-            rebuild = self.rebuilds.start(rid, node_name, self.prefilling(node_name, rid, fwd_info.graph_walk))
-            if rebuild is not None:
-                engine.prepare_rebuild(node_name, rid, rebuild)
+            # A follower starts a rebuild only at its first row in rank 0's step, in `_start_follow_rebuilds`. The
+            # request stays dropped here from the rebuild's last chunk until this rank replays the rebuild landing on
+            # rank 0, and starting a rebuild then would run it a second time on this rank alone.
+            leads = self.parallel_leader_nodes
+            if leads is None or node_name in leads:
+                self._start_rebuild(node_name, rid, fwd_info.graph_walk)
             return False
         if outcome.reason is not None and outcome.reason.terminal:
             logger.error(
@@ -2282,7 +2345,7 @@ class MicroScheduler:
         rows: Counter[str] = Counter()
         for (node, _), waiting in self.backlog.items():
             rows[node] += sum(1 for rid in waiting.request_to_worker_graph if rid not in exclude)
-        for (node, rid), _ in self.rebuilds.cursors():
+        for (node, rid), _ in self._cursors_here():
             rows[node] += rid not in exclude and rid not in self.in_flight_rids
         for spec in self._rows_here(self.runtime.get_ready_nodes(exclude)):
             rows[spec.node_name] += len(spec.rids)

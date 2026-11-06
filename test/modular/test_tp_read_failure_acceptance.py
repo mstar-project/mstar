@@ -60,7 +60,7 @@ import pytest
 import torch
 
 from mstar.graph.runtime.base import PhasedPostprocess
-from mstar.utils.ipc_format import WorkerMessageType
+from mstar.utils.ipc_format import OffloadDelta, WorkerMessageType
 from mstar.worker.rebuild import Rebuilds
 
 HERE = Path(__file__).resolve().parent
@@ -352,7 +352,7 @@ def _engine(rank, group, kv, prefix_cache, graph_runtime):
     sub = _submodule_class()(group, rank)
     engine = Engine(graph_runtime=graph_runtime, autocast_dtype=None)
     if rank == 0:
-        engine._tp_leader_nodes = {NODE}
+        engine._tp_leader_nodes, engine._resident_delta = {NODE}, OffloadDelta.new()
     else:
         engine._tp_follower_nodes = {NODE}
     engine._resources = {KV: kv}
@@ -672,7 +672,7 @@ def _worker(rank, scenario, comm, graph, engine, tm, group):
     w.parallel_leader_nodes = {NODE} if rank == 0 else set()
     w.is_tp_follower = rank != 0
     w.tp_async_sched, w.tp_async_nodes = False, None
-    w._tp_broadcast_seq = 0
+    w._tp_broadcast_seq, w._tp_followers = 0, {NODE: list(WORKERS[1:])} if rank == 0 else {}
     w._tp_nospec = RecentSet(64)
     w._tp_leader_gap_warned = False
     w.scheduler = MicroScheduler(w.engine_manager, parallel_leader_nodes=w.parallel_leader_nodes)
@@ -716,7 +716,7 @@ def _probe(engine, rid, tokens):
     )
     hits = engine.decide_cached_prefix(batch)
     leases = hits.get(rid, {})
-    return {label: list(pages) for label, pages in leases.items()}
+    return {label: list(lease.pages) for label, lease in leases.items()}
 
 
 def _reporting_failures(all_reduce, rank, outbox):

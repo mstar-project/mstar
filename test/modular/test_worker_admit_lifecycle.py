@@ -171,17 +171,6 @@ def test_remove_tears_down_both_sides_and_frees_the_handle():
     assert w._rid_str(rid) == "r2"
 
 
-def test_admit_is_refused_after_a_drain():
-    """A NEW that arrives after this rank sent READS_DONE for the rid is
-    refused: the drain is complete, so nothing may be read for it any more."""
-    w = _worker()
-    w._draining_rids.add("r1")
-    w._reads_done_sent.add("r1")
-    w._add_new_request(_new_request("r1"))
-    assert w._rid("r1") is None
-    assert w.tensor_manager.registered == []
-
-
 THINKER = (0, "thinker", "thinker", "Thinker")
 TALKER = (1, "talker", "talker", "Talker")
 

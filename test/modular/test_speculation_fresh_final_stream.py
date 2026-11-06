@@ -168,7 +168,7 @@ def _follower_speculation(final: bool):
     )
     scheduler = SimpleNamespace(
         peek_tp_follow=lambda: head,
-        settle_tp_follow_delta=lambda caught_up: True,
+        settle_tp_follow_delta=lambda request_state, caught_up: True,
         unread_rows=lambda h, rids: set(),
         tp_rids=lambda h: list(h.request_ids),
         pop_ready_rids=lambda *a, **k: PopReadyResult(
@@ -177,6 +177,7 @@ def _follower_speculation(final: bool):
         pop_tp_follow_head=lambda: head,
         combined_walk_of={},
         rebuilds=Rebuilds({}, {}),
+        follow_rebuilds=lambda node, rids: frozenset(),
     )
     scheduler._key = MicroScheduler._key.__get__(scheduler)
     runtime, _ = _runtime()

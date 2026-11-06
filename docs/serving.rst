@@ -350,8 +350,8 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        declares a rebuild policy sets aside at startup for its requests' prompt ids, 8 B a token (int64),
        which a request dropped from the KV cache is rebuilt from. A request the pool can't hold
        keeps no ids, so it is never dropped on that node, though it can still move to the host
-       with ``cpu_offload_pages``. A tensor or sequence parallel node never drops a request, so it
-       keeps no ids and sets no memory aside. A non-negative int, and 0 keeps no ids.
+       with ``cpu_offload_pages``. Every rank of a tensor or sequence parallel node keeps the ids,
+       since each rank rebuilds the requests its first rank drops. A non-negative int, and 0 keeps no ids.
    * - ``warmup_requests``
      - *(optional)* Requests the server runs after the workers are ready and before it
        binds, so no client pays a shape's first-request cost (torch.compile of a step,
@@ -458,11 +458,11 @@ a sliding window (``AttentionConfig.sliding_window``) has no prefix cache yet: i
 ``prefix_cache`` goes off (logged at info), and a serving config that sets
 ``prefix_cache: true`` on it is refused.
 
-On a single rank, a request waits at the head of its pool's queue until its reservation fits
-beside the reservations already admitted, and no request behind it starts first. A cache hit on
-a page only the prefix index holds counts as a page the request takes. A request that can't fit
-in its pool at its full output length gets a 400 if it asked for that length, and otherwise has
-the model's default length cut until it fits. A request that can be rebuilt reserves only its
+A request waits at the head of its pool's queue until its reservation fits beside the
+reservations already admitted, and no request behind it starts first. A cache hit on a page
+only the prefix index holds counts as a page the request takes. A request that can't fit in its
+pool at its full output length gets a 400 if it asked for that length, and otherwise has the
+model's default length cut until it fits. A request that can be rebuilt reserves only its
 prompt, so a decode step can find no page outside the reservations. The worker then takes pages
 from the newest requests, those that arrived after the request that ran short, until they cover
 its shortage. Each moves to the host when the host pool (``cpu_offload_pages``) can hold all of
@@ -487,13 +487,14 @@ host pool has no room for it, at admission or later, the request reserves its wh
 that pool, as a voice request does, and the host pool logs it. So ``cpu_offload_pages`` also sets
 how many pages such requests can hold with only their prompt reserved.
 
-Above one rank, and on a node with a second paged KV cache, such as Whisper's decoder, a decode
-step that finds no page and nothing to offload holds its requests until they time out. Elsewhere
-at one rank, a request that runs short and can neither move to the host nor be dropped waits
-holding its pages until its shortage fits, when moving or dropping the newer
-requests wouldn't cover it. Several such requests can wait on each other.
-``max_concurrent_requests`` prevents both. It caps how many requests run at once, and the pool's
-pages divided by the pages one request needs, prompt and output together, is a safe value.
+Above one rank, rank 0 makes each of these decisions, and the other ranks apply them before the
+step that follows, so every rank admits each step from the same reservations. On a node with a
+second paged KV cache, such as Whisper's decoder, a decode step that finds no page and nothing to
+offload holds its requests until they time out. Elsewhere, a request that runs short and can
+neither move to the host nor be dropped waits holding its pages until its shortage fits, when
+moving or dropping the newer requests wouldn't cover it. Several such requests can wait on each
+other. ``max_concurrent_requests`` prevents both. It caps how many requests run at once, and the
+pool's pages divided by the pages one request needs, prompt and output together, is a safe value.
 ``cpu_offload_pages`` lets a full pool move a request to the host instead of dropping it. An
 offload frees only the device pages no other running request reads, though, so a request that
 shares most of its prompt frees little. Offload helps a pool that runs short now and then. It

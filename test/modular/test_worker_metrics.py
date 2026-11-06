@@ -347,6 +347,7 @@ def _looping_worker(monkeypatch, schedule, speculate, refuse):
     w._phase_period, w._phase_buf = 0, {}
     w._max_consecutive_spec, w._launch_wait_s = 1024, 0.0
     w.tp_async_sched, w.is_tp_follower = False, False
+    w.parallel_nodes, w.parallel_leader_nodes = set(), set()
     w._in_flight_rids = set()
     w._preemption = SimpleNamespace(
         preempt=lambda node_batch: False, remove_request=lambda rid: None, make_room=lambda: None,

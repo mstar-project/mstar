@@ -27,6 +27,7 @@ from mstar.utils.ipc_format import (
     InputSignals,
     MessageSource,
     RemoveRequest,
+    WorkerMessageType,
 )
 from mstar.worker.micro_scheduler import ScheduledBatch
 from mstar.worker.rebuild import Rebuilds
@@ -410,6 +411,43 @@ def _input(uuid, streaming=True):
             request_id="X", graph_walk="listen", fwd_index=0, random_seed=0, max_tokens=0,
         ),
     )
+
+
+def test_a_follower_takes_in_a_new_request_that_follows_rank_0s_drain_without_reading_it():
+    """A TP follower can handle rank 0's DRAIN, and send READS_DONE, before the conductor's NEW_REQUEST. Rank 0's
+    moves for the request wait until the follower holds the request, so the follower takes it in with no read and
+    nothing scheduled. Rank 0's parked REMOVE then tears it down."""
+    w = Worker.__new__(Worker)
+    w.worker_id = "w1"
+    w._draining_rids = w._reads_done_sent = {"wire"}
+    remove = SimpleNamespace(message_type=WorkerMessageType.REMOVE_REQUEST)
+    w._unprocessed_messages = {"wire": [remove]}
+    w._last_active = {}
+    ingested, stopped, processed = [], [], []
+    w._graph_runtime = SimpleNamespace(
+        add_request=lambda **kw: 5, get_sharding_config=lambda rid: None, register_stop_limits=lambda rid, info: None,
+    )
+    w.engine_manager = SimpleNamespace(
+        evictable_nodes=lambda: [], add_request=lambda rid, cfg, info=None: ingested.append(rid),
+        engine=SimpleNamespace(publisher_nodes={}),
+    )
+    w.request_state = SimpleNamespace(add_request=lambda rid, info: None, per_request_info={})
+    w.tensor_manager = SimpleNamespace(
+        register_request=lambda rid, sharding: None,
+        start_read_tensors=lambda *a, **kw: pytest.fail("a drained request started a read"),
+    )
+    w._rebuilds, w._kv_writes = Rebuilds({}, {}), {}
+    w.scheduler = SimpleNamespace(fail_rids=stopped.extend, note_arrival=lambda rid: None)
+    w._process_message_list = processed.extend
+    body = SimpleNamespace(
+        request_id="wire", partition_worker_graph_ids=None, worker_graph_to_workers={}, loop_caps={},
+        request_info=SimpleNamespace(partition_name="p", graph_walk="g", resource_configs={}, rid_handle=None),
+    )
+
+    Worker._add_new_request(w, body)
+
+    assert ingested == [5], "rank 0's moves for a drained request would wait for good"
+    assert stopped == [5] and processed == [remove] and "wire" not in w._unprocessed_messages
 
 
 def _input_worker(**kwargs):

@@ -116,6 +116,7 @@ from mstar.worker.micro_scheduler import (
     CHAIN_LANE,
     MicroScheduler,
     ScheduledBatch,
+    moves_alone,
     tp_chunk_ranges,
     unfinished_chunk_rids,
 )
@@ -213,15 +214,12 @@ def _make_graph_runtime(
 
 
 def _make_rebuilds(
-    model: Model | None, model_config: dict | None, my_walks: set[tuple[str, str]], lockstep_nodes: set[str],
-    device: torch.device,
+    model: Model | None, model_config: dict | None, my_walks: set[tuple[str, str]], device: torch.device,
 ) -> Rebuilds:
     """What a dropped request is rebuilt from, on each node whose model declares how and whose rebuild this worker
     runs: a disaggregated decode node can't run the prefill walk a rebuild needs."""
     graphs = model.get_graph_walk_graphs() if model is not None else {}
     policies = policies_run_here(model.rebuild_policies(), graphs, my_walks) if model is not None else {}
-    # A lockstep node's KV refuses every drop, so its requests keep no ids.
-    policies = {node: policy for node, policy in policies.items() if node not in lockstep_nodes}
     host_mb = (model_config or {}).get("rebuild_host_mb", DEFAULT_REBUILD_HOST_MB)
     if isinstance(host_mb, bool) or not isinstance(host_mb, int) or host_mb < 0:
         raise ValueError(f"rebuild_host_mb: {host_mb!r} is not a non-negative int")
@@ -721,8 +719,10 @@ class Worker:
         self.tp_async_sched, self.tp_async_nodes = _tp_async_sched_setting(
             os.environ.get("MSTAR_TP_ASYNC_SCHED"), model_config.get("tp_async_sched"),
         )
-        # Leader: monotonic seq stamped on every ScheduleTPNode it sends.
+        # Leader: monotonic seq stamped on every ScheduleTPNode it sends, and the
+        # followers it sends them to.
         self._tp_broadcast_seq = 0
+        self._tp_followers = self._instance_followers(all_worker_graph_ids_to_instances)
         # Follower: leader steps that will NOT be followed by a head; the
         # leader said so (TPNoSpeculation) or this rank closed the step.
         self._tp_nospec: RecentSet[int] = RecentSet(self._TP_NOSPEC_KEEP)
@@ -788,7 +788,7 @@ class Worker:
         # (node, walk) -> when its last hold was logged, and the holds since
         self._hold_logged: dict[tuple[str, str], tuple[float, int]] = {}
 
-        self._rebuilds = _make_rebuilds(model, model_config, my_walks, self.parallel_nodes, self.device)
+        self._rebuilds = _make_rebuilds(model, model_config, my_walks, self.device)
         self._preemption = Preemption(
             self.engine_manager, self._rebuilds, self.scheduler, self.request_state, self._log_throttled,
             self._rid_str,
@@ -1007,6 +1007,17 @@ class Worker:
         if keys:
             engine.never_publish(keys)
 
+    def _instance_followers(self, wg_instances: dict[int, list[list[str]]] | None) -> dict[str, list[str]]:
+        """The other ranks of the instance of each lockstep node this rank leads, which rank 0 sends its steps to.
+        Known when the worker starts, so rank 0's moves can go out in a step with no rows before it sends any step."""
+        followers = {}
+        for wg_id, instances in (wg_instances or {}).items():
+            for node in self._all_wg_nodes.get(wg_id, set()) & self._lockstep_led:
+                for instance in instances:
+                    if self.worker_id in instance:
+                        followers[node] = [worker for worker in instance if worker != self.worker_id]
+        return followers
+
     def _skip_unshared_publish(
         self, request_id: int, wg_to_workers: dict[int, list[str]],
     ) -> None:
@@ -1026,8 +1037,10 @@ class Worker:
             engine.skip_publish(request_id, keys)
 
     def _add_new_request(self, body: NewRequest) -> None:
-        if not self._takes_input(body.request_id):
-            return
+        # Any worker can handle a DRAIN before the conductor's NEW_REQUEST, and a TP follower gets rank 0's. After
+        # READS_DONE the worker still takes the request in, without reads, since on a follower rank 0's moves for the
+        # request wait until it holds the request.
+        unread = not self._takes_input(body.request_id)
         logger.debug("Worker %s received request %s", self.worker_id, body.request_id)
         laps = PhaseLaps("worker.msg.new_request.")
         # The one place a handle is minted; a request with several partitions
@@ -1079,6 +1092,16 @@ class Worker:
                 self._process_unprocessed(body.request_id)
                 return
         body.request_info.resource_configs = without_layouts(body.request_info.resource_configs)
+        if unread:
+            # its parked inputs are never read, so they are ACKed unread as for a removed request
+            parked = self._unprocessed_messages.pop(body.request_id, [])
+            for message in parked:
+                if message.message_type == WorkerMessageType.INPUT_SIGNALS:
+                    self._drop_for_removed(message)
+            rest = [message for message in parked if message.message_type != WorkerMessageType.INPUT_SIGNALS]
+            if rest:
+                self._process_message_list(rest)
+            return
 
         self.streams.add_request(request_id, body.request_info)
 
@@ -1113,8 +1136,8 @@ class Worker:
     def _mark_removed(self, wire_rid: str) -> None:
         """Remember a request that will not be admitted here again, and drop
         what was parked for it. Clears the wire-keyed drain state too: a
-        request drained before its NEW_REQUEST, refused after READS_DONE, is
-        never admitted, so no later teardown would."""
+        request whose DRAIN and REMOVE arrive with no NEW_REQUEST between them
+        is never taken in, so no later teardown would."""
         self._draining_rids.discard(wire_rid)
         self._pending_drains.discard(wire_rid)
         self._reads_done_sent.discard(wire_rid)
@@ -1171,12 +1194,14 @@ class Worker:
         # references the rid (see _apply_pending_removes_safe_to_drop in
         # the run loop).
         # A follower tears down in rank 0's order, so never ahead of one it deferred
-        # earlier.
+        # earlier. Rank 0 tears down nothing while its journal holds moves: each
+        # follower replays them with the next step and tears down after the step a
+        # removal is stamped with, so the pages leave in the same order on every rank.
         behind = (
             self.is_tp_follower
             and next(iter(self._pending_removes), request_id) != request_id
         )
-        if request_id in self._in_flight_rids or behind:
+        if request_id in self._in_flight_rids or behind or self._owes_tp_moves():
             self._pending_removes.setdefault(request_id)
             return
 
@@ -1293,8 +1318,8 @@ class Worker:
     def _begin_drain(self, request_id: str) -> None:
         """Takes the wire string: a drain can arrive for a request this worker
         never admitted, and it still has to go into ``_draining_rids``, so a
-        late NEW_REQUEST is refused after READS_DONE, or admitted with its
-        handle failed while a committed TP-follow batch holds READS_DONE back."""
+        late NEW_REQUEST is admitted with its handle failed, and without reads
+        once READS_DONE has gone."""
         handle = self._rid(request_id)
         # Fan the drain to TP followers so each rank drains and ACKs its own
         # READS_DONE (the conductor waits on every rank).
@@ -1382,8 +1407,8 @@ class Worker:
         )
 
     def _takes_input(self, wire_rid: str) -> bool:
-        """Whether this rank still takes NEW_REQUEST and INPUT_SIGNALS for
-        ``wire_rid``: until it sends READS_DONE, draining or not, since a step
+        """Whether this rank still reads the inputs of NEW_REQUEST and INPUT_SIGNALS
+        for ``wire_rid``: until it sends READS_DONE, draining or not, since a step
         rank 0 committed may wait on one that arrives behind the forwarded
         drain. After READS_DONE the producer may free what it sent."""
         return wire_rid not in self._reads_done_sent
@@ -2033,25 +2058,19 @@ class Worker:
         # draining per follower would give the first one everything and the rest
         # nothing. Each gets its own copy because each pops as it replays.
         engine = self.engine_manager.get_engine(node_batch.node_name)
-        resident_delta = engine.take_resident_delta(node_batch.node_name)
-        prefix_hits = engine.decide_cached_prefix(node_batch)
+        resident_delta = engine.take_resident_delta()
+        # taken before the leases, since a follower checks it before it adopts them
         page_trails = engine.page_trails(node_batch.node_name)
+        prefix_hits = engine.decide_cached_prefix(node_batch)
         read_check = self._step_reads(node_batch)
         if read_check:
             node_batch.read_check_rids = tuple(node_batch.request_ids)
-        # this worker is only a part of one TP group for this node,
-        # so, we can just look at the sharding_config for the first
-        # request to get the relevant workers
-        sample_rid = node_batch.request_ids[0]
         ctx = node_batch.step_context
-        workers = self._graph_runtime.get_sharding_config(sample_rid).get_sharding_group(
-            node_batch.node_name, ctx.walk_of(sample_rid)
-        )._workers[1:]
+        workers = self._tp_followers[node_batch.node_name]
+        request_ids = node_batch.request_ids
         walks, walk_idx = [], []
         if ctx.request_walks:
-            rows = RequestWalks.from_walks(
-                node_batch.request_ids, [ctx.walk_of(r) for r in node_batch.request_ids],
-            )
+            rows = RequestWalks.from_walks(request_ids, [ctx.walk_of(r) for r in request_ids])
             walks, walk_idx = rows.walks, rows.walk_idx
         # the leader alone cuts chunks: a follower's own cut could differ
         chunk_starts: list[int] = []
@@ -2059,7 +2078,7 @@ class Worker:
         chunk_totals: list[int] = []
         chunk_strides: list[int] = []
         if node_batch.chunk_ranges:
-            for rid in node_batch.request_ids:
+            for rid in request_ids:
                 start, end, total, stride = node_batch.chunk_ranges.get(rid, _UNCHUNKED)
                 chunk_starts.append(start)
                 chunk_ends.append(end)
@@ -2072,7 +2091,7 @@ class Worker:
                     body=ScheduleTPNode(
                         node_name=node_batch.node_name,
                         graph_walk=node_batch.graph_walk,
-                        request_ids=[self._rid_str(r) for r in node_batch.request_ids],
+                        request_ids=[self._rid_str(r) for r in request_ids],
                         speculative=speculative,
                         spec_seq=seq,
                         spec_from_seq=spec_from_seq,
@@ -2090,6 +2109,34 @@ class Worker:
                 )
             )
         return seq
+
+    def _next_batch(self, yield_away_from_target: tuple[str, str] | None) -> ScheduledBatch | None:
+        """The non-speculative path's step: one away from ``yield_away_from_target`` when given, else any.
+
+        A follower's first call can take a head of rank 0's with no rows, and rank 0 applied the removals
+        stamped with that head before it sent the next step, so this rank applies them before building it."""
+        if yield_away_from_target is not None:
+            batch = self.scheduler.get_next_batch(self.request_state, exclude_target=yield_away_from_target)
+            if batch is not None:
+                return batch
+            self._apply_removes_whose_step_landed()
+        return self.scheduler.get_next_batch(self.request_state)
+
+    def _owes_tp_moves(self) -> bool:
+        """Whether the journal of the lockstep instance this rank leads holds moves no step has carried."""
+        return any(self.engine_manager.get_engine(node).owes_moves() for node in self._lockstep_led)
+
+    def _flush_tp_moves(self, pending: PendingBatch | None = None) -> None:
+        """Send the instance's followers a step with no rows while the journal holds moves, unless ``pending``
+        is a step of the instance's own. That step still waits for its speculation decision, which a step with no
+        rows sent first would read as none. A step of any of the instance's nodes carries every move."""
+        if pending is not None and pending.node_name in self._lockstep_led:
+            return
+        if self._owes_tp_moves():
+            self.maybe_send_zmq_to_tp_followers(make_executing_batch(
+                self.streams, node_name=min(self._lockstep_led), graph_walk="", request_ids=[],
+                per_request_input_tensors={}, per_request_info={},
+            ))
 
     def _broadcast_tp_nospec(self, pending: PendingBatch) -> None:
         """Tell followers no speculative head will follow step ``pending.tp_seq``,
@@ -3438,6 +3485,7 @@ class Worker:
         # returning here makes progress where reading the half-applied state as
         # "not ready" never could.
         if not self.scheduler.settle_tp_follow_delta(
+            self.request_state,
             # Of the steps before the head, only N may still index a page of the head's hit
             caught_up=pending.node_batch.commit_done.is_set(),
         ):
@@ -3451,17 +3499,21 @@ class Worker:
         # rows whose input read failed here: built without, as on the serial path
         unread = self.scheduler.unread_rows(head, head_rids)
         head_walk_idx = dict(zip(head_rids, head.walk_idx, strict=True)) if head.walks else None
-        in_batch = batch_N.request_to_worker_graph
+        in_batch, held = batch_N.request_to_worker_graph, batch_N.incomplete_node_rids
+        # rebuild rows, which the graph runtime holds no node of, so they are never popped. A rebuild whose chunk ran
+        # in N is one of N's rows mid-prefill, which rank 0 stamps a rebuild row from its log too.
+        rebuild = self.scheduler.follow_rebuilds(
+            head.node_name, [r for r in head_rids if r not in in_batch or r in held],
+        )
         # rows read here: prepped (continuing) or popped (fresh); every row,
         # unread ones included, runs the leader's continuation of N
         in_n = [r for r in head_rids if r in in_batch]
         # N's rows mid-prefill loop back on nothing of N's: as on the leader,
         # their next chunk is cut from the input held since their first. N's
         # chunks came from the leader, so every rank splits these out alike.
-        held = batch_N.incomplete_node_rids
         mid_prefill = {r for r in in_n if r in held} if held else set()
         continuing = [r for r in in_n if r not in unread and r not in mid_prefill]
-        fresh = [r for r in head_rids if r not in in_batch and r not in unread]
+        fresh = [r for r in head_rids if r not in in_batch and r not in unread and r not in rebuild]
         if not in_n:
             return None
         spec_walk = head.walks[head_walk_idx[in_n[0]]] if head.walks else head.graph_walk
@@ -3552,7 +3604,7 @@ class Worker:
             if rid in prep_inputs:
                 new_request_to_worker_graph[rid] = prep_wg[rid]
                 per_request_inputs[rid] = prep_inputs[rid]
-            elif rid in unread:
+            elif rid in unread or rid in rebuild:
                 per_request_inputs[rid] = {}
             elif rid in mid_prefill:
                 new_request_to_worker_graph[rid] = in_batch[rid]
@@ -3561,7 +3613,7 @@ class Worker:
                 new_request_to_worker_graph[rid] = fresh_wg[rid]
                 per_request_inputs[rid] = fresh_inputs[rid]
         request_walks = {r: head.walks[w] for r, w in head_walk_idx.items()} if head.walks else None
-        if unread:
+        if unread or rebuild:
             # In with no inputs, as on the serial path: the step has rank 0's
             # rows until its read check takes these out. An unread row not in
             # N is no continuing row, so voiding the speculation
@@ -3570,8 +3622,8 @@ class Worker:
             # so ``unread_rows`` keeps it out of the pop: rank 0 checks each
             # step taking the input until one runs (``_consume_lockstep_reads``),
             # and that step's check takes the row out on every rank.
-            new_request_to_worker_graph, _ = self.scheduler.with_unread_rows(
-                head, head_rids, unread, new_request_to_worker_graph, request_walks or {},
+            new_request_to_worker_graph, _ = self.scheduler.with_unpopped_rows(
+                head, head_rids, unread | rebuild, new_request_to_worker_graph, request_walks or {},
             )
 
         # Committed: the serial path must not see the head any more.
@@ -3593,6 +3645,7 @@ class Worker:
             request_walks=request_walks,
             chunk_ranges=chunk_ranges,
             incomplete_node_rids=unfinished_chunk_rids(chunk_ranges),
+            rebuild_rids=rebuild,
         )
         # N's rows, as on the leader: N's settle readies them, not a cleared speculation
         speculation.continuing_rids.update(mid_prefill)
@@ -3612,14 +3665,7 @@ class Worker:
             self._tp_nospec.add(message.spec_from_seq)
 
     def _register_tp_follow(self, message: ScheduleTPNode) -> None:
-        """Queue a ScheduleTPNode; drop a head for a step this rank closed."""
-        if not message.request_ids:
-            logger.warning(
-                "Worker %s: dropped empty ScheduleTPNode for %s/%s (seq %d)",
-                self.worker_id, message.node_name, message.graph_walk,
-                message.spec_seq,
-            )
-            return
+        """Queue a ScheduleTPNode. A head for a step this rank closed is queued as a step of moves alone."""
         if (
             self._tp_async_for(message.node_name) and message.speculative
             and message.spec_from_seq in self._tp_nospec
@@ -3628,18 +3674,18 @@ class Worker:
                 "Worker %s: dropped speculative head seq %d (parent %d closed)",
                 self.worker_id, message.spec_seq, message.spec_from_seq,
             )
-            return
+            message = moves_alone(message)
         self.scheduler.register_tp_follow(message)
 
     def _close_tp_follow_step(self, pending: PendingBatch) -> None:
         """This step's forward raised (symmetrically on the leader, which never
-        submitted its head): drop a queued head from it, and any arriving later."""
+        submitted its head): a head from it, queued or arriving later, becomes a step of moves alone."""
         self._tp_nospec.add(pending.tp_seq)
         head = self.scheduler.peek_tp_follow()
         if head is not None and head.speculative and head.spec_from_seq == pending.tp_seq:
-            self.scheduler.pop_tp_follow_head()
             # settle may have adopted some of the head's hit, and the leader releases the whole lease
             self.engine_manager.get_engine(head.node_name).drop_cached_prefix(head)
+            self.scheduler.void_tp_follow_head()
 
     @staticmethod
     def _step_voids_head(pending: PendingBatch) -> str | None:
@@ -3671,7 +3717,7 @@ class Worker:
                 void = self._step_voids_head(pending) if outputs is not None else None
                 if void is not None and not self._prefix_cache_open(head.node_name):
                     # The leader clears its speculation on this verdict too.
-                    self.scheduler.pop_tp_follow_head()
+                    self.scheduler.void_tp_follow_head()
                     logger.debug(
                         "Worker %s: dropped speculative head seq %d (parent %d %s)",
                         self.worker_id, head.spec_seq, s, void,
@@ -4825,7 +4871,10 @@ class Worker:
         """Apply ``REMOVE_REQUEST`` for any rid that is not currently held by
         an in-flight GPU step, in the order they were deferred. Removes for
         in-flight rids stay deferred and are reattempted next iter; on a
-        follower, so do the ones after them, which rank 0 tore down later."""
+        follower, so do the ones after them, which rank 0 tore down later. On
+        rank 0, all of them wait while its journal holds moves."""
+        if self._owes_tp_moves():
+            return
         for rid in list(self._pending_removes):
             if rid in in_flight_rids or rid in self._in_flight_rids:
                 if self.is_tp_follower:
@@ -4900,6 +4949,9 @@ class Worker:
 
         # the chain's rows: a side lane's step fails on its own (``SideStepLane``)
         failed_rids: set[int] = set(self._rows_by_lane.get(CHAIN_LANE, ()))
+        if speculation is not None and not speculation.submitted:
+            # a follower's build holds the head's fresh rows with the chain's, and they go back as on rank 0
+            failed_rids -= speculation.scheduled_batch.request_to_worker_graph.keys() - speculation.continuing_rids
         for stale in in_flight:
             if stale is None:
                 continue
@@ -5332,6 +5384,8 @@ class Worker:
                 self._await_admit_settled(pending)
                 self._count_turn(pending)
                 laps.skip()
+                # removals held for the journal would otherwise wait out a chain of another node's steps
+                self._flush_tp_moves(pending)
                 self._apply_pending_removes_safe_to_drop(
                     self._in_flight_rids
                 )
@@ -5604,14 +5658,9 @@ class Worker:
                 # 4. Non-speculative path: no pending or speculation skipped
                 # (e.g., non-AR engine, or loop ended). Run MicroScheduler.
                 with self._span("worker.schedule"):
-                    batch = None
-                    if yield_away_from_target is not None:
-                        batch = self.scheduler.get_next_batch(
-                            self.request_state,
-                            exclude_target=yield_away_from_target,
-                        )
-                    if batch is None:
-                        batch = self.scheduler.get_next_batch(self.request_state)
+                    batch = self._next_batch(yield_away_from_target)
+                if batch is None or batch.node_name not in self._lockstep_led:
+                    self._flush_tp_moves()
                 if batch is None:
                     if side_steps is not None and side_steps.pending is not None:
                         side_steps.finish(block=True)

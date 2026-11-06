@@ -47,6 +47,7 @@ from mstar.worker.host_pool import HostCopy, HostSlice
 from mstar.worker.micro_scheduler import MicroScheduler, ScheduledBatch
 from mstar.worker.preemption import Preemption
 from mstar.worker.rebuild import KeptIds, Prefilling, Rebuilds, policies_run_here
+from mstar.worker.stream_buffers import StreamBufferManager
 from mstar.worker.worker import Worker
 from mstar.worker.worker_metrics import PreemptionCounts
 
@@ -406,8 +407,11 @@ def test_a_dropped_request_that_waits_for_room_is_unparked_and_rebuilt():
     engine._runner, engine.residency = _runner(kv), lambda node, rid: kv.residency(rid)
     engine.prepare_rebuild = lambda node, rid, rebuild: None
     engine.check_ready = lambda node, rid, info, allow_reload=True: Engine.check_ready(engine, node, rid, info)
-    scheduler = SimpleNamespace(parked={}, engine_manager=w.engine_manager, rebuilds=w._rebuilds, chunk_loop_walks={})
-    for name in ("_check_ready", "_unpark", "prefilling"):
+    scheduler = SimpleNamespace(
+        parked={}, engine_manager=w.engine_manager, rebuilds=w._rebuilds, chunk_loop_walks={},
+        parallel_leader_nodes=None,
+    )
+    for name in ("_check_ready", "_start_rebuild", "_unpark", "prefilling"):
         setattr(scheduler, name, getattr(MicroScheduler, name).__get__(scheduler))
     info = w.request_state.get_fwd_info("v", "p")
 
@@ -552,6 +556,51 @@ def test_an_older_request_waits_rather_than_moving_a_newer_guaranteed_one():
     assert kv.residency("v") is Residency.RESIDENT and _returns(kv) == ["r"], (
         "a guaranteed request was dropped for an older page"
     )
+
+
+def test_a_tp_nodes_victim_drops_in_the_call_that_chose_it_and_a_pass_without_a_step_still_sends_the_drop():
+    """Rank 0 drops a TP node's victim in the call that chose it, as at one rank, and journals the drop. A pass
+    that builds no step for the node still sends one with no rows, so the followers replay the drop."""
+    kv = _pool()
+    _running(kv, "r", 5, arrival=1)
+    _running(kv, "v", 5, arrival=2)
+    reason = _step(kv, "r", 1).reason
+    w = _worker(kv)
+    w.parallel_nodes = w.parallel_leader_nodes = {NODE}
+    w._lockstep_led = frozenset({NODE})
+    batch = ScheduledBatch(node_name=NODE, graph_walk="decode", request_to_worker_graph={"r": 0})
+
+    node_batch = SimpleNamespace(
+        node_name=NODE, admit_error=reason, failed_resource="kv", step_context=SimpleNamespace(graph_walk="decode"),
+    )
+    Worker._handle_allocation_failure(w, batch, node_batch)
+    assert kv.residency("v") is Residency.DROPPED, "rank 0 left the victim for a later step"
+
+    sent = []
+    w.maybe_send_zmq_to_tp_followers, w.streams = sent.append, StreamBufferManager(w.request_state, None, [])
+    w._tp_followers = {NODE: ["rank1"]}
+    w.engine_manager.get_engine(NODE).owes_moves = lambda: True
+    Worker._flush_tp_moves(w)
+    assert [(step.node_name, step.request_ids) for step in sent] == [(NODE, ())], (
+        "the drop waits for a step that never comes"
+    )
+
+
+def test_rank_0_sends_its_journal_unless_a_step_of_the_instance_waits_for_its_decision():
+    """At the top of a pass, the step in flight may be the instance's own, whose speculation decision hasn't gone
+    out: a follower would read a step with no rows sent first as no speculation. A step of a node outside the
+    instance waits for no decision, so the journal goes out at once, and the removals held for it don't wait out
+    that node's chain."""
+    w = _worker(_pool())
+    w._lockstep_led, w._tp_followers = frozenset({NODE}), {NODE: ["rank1"]}
+    w.engine_manager.get_engine(NODE).owes_moves = lambda: True
+    sent = []
+    w.maybe_send_zmq_to_tp_followers, w.streams = sent.append, StreamBufferManager(w.request_state, None, [])
+
+    Worker._flush_tp_moves(w, SimpleNamespace(node_name=NODE))
+    assert not sent, "a step of moves alone went out ahead of the instance's speculation decision"
+    Worker._flush_tp_moves(w, SimpleNamespace(node_name="SNAC"))
+    assert [(step.node_name, step.request_ids) for step in sent] == [(NODE, ())], "the journal waits out SNAC's chain"
 
 
 def test_requests_short_of_pages_all_finish_and_each_goes_to_the_host_at_most_twice():

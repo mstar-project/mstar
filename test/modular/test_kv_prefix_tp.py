@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import sys
 import threading
+from array import array
+from dataclasses import replace
 from types import SimpleNamespace
 
 sys.path.insert(0, ".")
@@ -15,17 +17,19 @@ from test_kv_prefix_correctness import NODE, PAGE_SIZE, ROOT, WALK
 from test_kv_prefix_layout_lease import ASK, IMAGE, IMAGE_WALK, OTHER_ASK, TEXT, _config, _walks
 from test_kv_prefix_lease import _StubTransfer
 from test_tp_async_teardown_order import _rank, _Stop
+from test_tp_rebuild_land import _Rank
+from test_worker_rebuild import _kept
 
 import mstar.communication.wire_types  # noqa: F401  (registers the tags)
 from mstar.engine.engine import Engine
-from mstar.engine.resources import StepRunner, apply_yaml_overrides
+from mstar.engine.resources import Rebuild, StepRunner, apply_yaml_overrides
 from mstar.engine.resources.base import KeyedWalks
 from mstar.engine.resources.kv import manager as manager_mod
 from mstar.engine.resources.kv.config import KVSpec, KVStep, PagedKVConfig, opening_prefix_caches
 from mstar.engine.resources.kv.manager import KVManager
-from mstar.engine.resources.step import Segment, StepContext
+from mstar.engine.resources.step import Segment, StepContext, SubmoduleStep
 from mstar.model.submodule_base import ARNodeInputs, ARNodeSubmodule
-from mstar.utils.ipc_format import ScheduleTPNode
+from mstar.utils.ipc_format import MoveKind, ScheduleTPNode
 from mstar.worker.micro_scheduler import MicroScheduler
 from mstar.worker.worker import Worker
 
@@ -106,9 +110,9 @@ class _Submodule:
 
 def _engine(kv: KVManager) -> Engine:
     engine = Engine.__new__(Engine)
-    engine._resources = {"kv": kv}
+    engine._resources, engine._resource_nodes = {"kv": kv}, {"kv": frozenset({NODE})}
     engine._runner = StepRunner(engine._resources, node_resources={NODE: ["kv"]})
-    engine._submodules = {NODE: SimpleNamespace(submodule=_Submodule())}
+    engine._submodules = {NODE: SimpleNamespace(submodule=_Submodule(), resources=engine._resources)}
     engine._keyed_walks = {NODE: {WALK, IMAGE_WALK}}
     engine._prefix_model = "_Model"
     engine._graph_runtime = SimpleNamespace(
@@ -138,7 +142,7 @@ def _follow(follower: KVManager, head: ScheduleTPNode, caught_up: bool = True) -
         engine_manager=SimpleNamespace(get_engine=lambda node: engine), parallel_leader_nodes=set(),
     )
     scheduler.register_tp_follow(head)
-    return scheduler.settle_tp_follow_delta(caught_up)
+    return scheduler.settle_tp_follow_delta(None, caught_up)
 
 
 def _abandon(kv: KVManager, rid: str, walk: str = WALK) -> None:
@@ -160,6 +164,7 @@ def _follower_worker(follower: KVManager) -> Worker:
     worker.engine_manager = SimpleNamespace(get_engine=lambda node: engine)
     worker.scheduler = MicroScheduler(engine_manager=worker.engine_manager, parallel_leader_nodes=set())
     worker._tp_nospec = set()
+    worker.request_state = None   # read only for a dropped row
     return worker
 
 
@@ -227,7 +232,7 @@ def test_a_head_that_wont_run_leaves_both_ranks_evicting_alike():
     head.speculative, head.spec_from_seq = True, 4
     worker = _follower_worker(follower)
     worker.scheduler.register_tp_follow(head)
-    assert worker.scheduler.settle_tp_follow_delta(caught_up=False)
+    assert worker.scheduler.settle_tp_follow_delta(None, caught_up=False)
     worker._close_tp_follow_step(SimpleNamespace(tp_seq=4))
     _abandon(leader, "b")
 
@@ -256,7 +261,7 @@ def test_ranks_evict_alike_when_a_lease_straddles_a_commit_that_files_under_a_pa
         kv.commit(steps[kv][1], _ctx("z"))
     worker = _follower_worker(follower)
     worker.scheduler.register_tp_follow(head)
-    assert worker.scheduler.settle_tp_follow_delta(caught_up=True)
+    assert worker.scheduler.settle_tp_follow_delta(None, caught_up=True)
     worker._close_tp_follow_step(SimpleNamespace(tp_seq=4))
     _abandon(leader, "h")
     for kv in ranks:
@@ -269,6 +274,31 @@ def test_ranks_evict_alike_when_a_lease_straddles_a_commit_that_files_under_a_pa
         _run(kv, "big", big)
 
     assert _pages(leader, "big") == _pages(follower, "big"), "the ranks linked z's page differently and evicted apart"
+
+
+def test_a_pre_plan_rank_0_throws_away_evicts_no_cached_page_a_follower_keeps():
+    """Rank 0 pre-plans r's next page with no page free, and throws the stage away. A follower never planned the
+    step. Undoing the admit gives the page back to the free list, so a cached page evicted for it left rank 0's index
+    without a key the follower still holds, and a later hit on that key stopped the follower."""
+    ranks = leader, follower = _manager(0, max_num_pages=8), _manager(1, max_num_pages=8)
+    r = _tokens(4 * PAGE_SIZE, seed=53)
+    _cache(ranks, "x", _tokens(3 * PAGE_SIZE, seed=52))
+    for kv in ranks:
+        kv.remove_request("x")
+        kv.ingest_request("r", _config([r], decode=PAGE_SIZE))
+        _run(kv, "r", r)
+    assert not leader._arena.num_free, "a page is free, so the test checks nothing"
+    runner = StepRunner({"kv": leader}, node_resources={NODE: ["kv"]})
+    step = SubmoduleStep({"kv": KVStep()}, segments=[Segment("r", "main", 1)])
+    step.set_ctx(StepContext(["r"], "decode", 0, False, is_preplan=True))
+
+    runner.pre_admit(step)
+    runner.clear_preplan()
+
+    assert sorted(leader._index.pages()) == sorted(follower._index.pages()), (
+        "rank 0 evicted a cached page for a stage it threw away, which the follower still holds"
+    )
+    assert "r" not in leader._ran_short, "a refused pre-admit counted as a grant that ran short"
 
 
 def test_a_served_walks_lease_stays_when_the_next_walk_wont_run():
@@ -390,6 +420,69 @@ def test_a_tp_leader_admits_a_yield_away_step_unplanned_as_its_followers_do(cach
     assert Worker._plans_ahead(leader, spec("other", True)), "a node with no followers keeps its pre-plan"
 
 
+@pytest.mark.parametrize("guaranteed", [False, True])
+def test_a_hit_counts_alike_on_rank_0_and_on_the_follower_that_adopts_it(guaranteed):
+    """The follower lends the pages it adopts as rank 0 lent the pages it leased, a guaranteed request's
+    included."""
+    ranks = leader, follower = _manager(0), _manager(1)
+    shared = _tokens(5 * PAGE_SIZE + 3, seed=0)
+    prompt = shared[:5 * PAGE_SIZE] + _tokens(20, seed=1)
+    _cache(ranks, "a", shared)
+    for kv in ranks:
+        kv.ingest_request("b", replace(_config([prompt]), unpausable=guaranteed))
+    assert StepRunner({"kv": leader}, node_resources={NODE: ["kv"]}).admit_retrieve("b", NODE, WALK).ready
+    follower.replay(MoveKind.RESERVE, "b", leader._allotments["b"].pages, [])
+
+    assert _follow(follower, _send(leader, "b"))
+
+    assert leader._streams["b"]["main"].lent, "rank 0 lent nothing, so the test checks nothing"
+    assert follower._streams["b"]["main"].lent == leader._streams["b"]["main"].lent
+    assert follower._unused == leader._unused, "the follower's room differs from rank 0's after the hit"
+
+
+def test_a_follower_lends_the_pages_rank_0_lent_whatever_its_own_owner_counts():
+    """Owner counts can differ between ranks, since above one rank a page is filed under a parent only its
+    stream holds. A follower that worked out the lent pages from its own evictable set would then count other room
+    than rank 0 and could refuse a grant rank 0 makes. Here a cached page has one more owner on the follower."""
+    ranks = leader, follower = _manager(0), _manager(1)
+    shared = _tokens(5 * PAGE_SIZE + 3, seed=0)
+    prompt = shared[:5 * PAGE_SIZE] + _tokens(20, seed=1)
+    _cache(ranks, "a", shared)
+    first = _pages(follower, "a")[0]
+    for kv in ranks:
+        kv.remove_request("a")
+        kv.ingest_request("b", _config([prompt]))
+    follower._arena.retain([first])
+    assert StepRunner({"kv": leader}, node_resources={NODE: ["kv"]}).admit_retrieve("b", NODE, WALK).ready
+    follower.replay(MoveKind.RESERVE, "b", leader._allotments["b"].pages, [])
+
+    assert _follow(follower, _send(leader, "b"))
+
+    assert follower._streams["b"]["main"].lent == leader._streams["b"]["main"].lent == set(), (
+        "the follower lent a page rank 0 charged to b's allotment"
+    )
+    assert follower._unused == leader._unused, "the follower's room differs from rank 0's after the hit"
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+def test_a_commit_above_one_rank_keeps_the_room_when_it_files_under_a_page_only_the_index_holds(rank):
+    """z prefills beside x, so it finds nothing cached and loses x's keys at commit. Its next page goes in with no
+    parent, so the cached pages x left stay evictable and the room the allotments count doesn't drop."""
+    kv = _manager(rank, max_num_pages=12)
+    x = _tokens(2 * PAGE_SIZE + 1, seed=50)
+    z = x[:2 * PAGE_SIZE] + _tokens(PAGE_SIZE + 3, seed=51)
+    _ingest(kv, "x", x)
+    _ingest(kv, "z", z)
+    steps = _step(kv, "x", len(x)), _step(kv, "z", len(z))
+    kv.commit(steps[0], _ctx("x"))
+    kv.remove_request("x")
+    room = kv._room()
+
+    kv.commit(steps[1], _ctx("z"))
+
+    assert kv._room() == room, "the commit pinned cached pages the room counted"
+
+
 def test_a_chunked_row_starts_past_the_prefix_rank_0_measured_on_every_rank():
     """Rank 0 leases the cached prefix a chunked row's chunks start past as it
     sends the step. The lease goes out with the step, so a
@@ -424,3 +517,45 @@ def test_a_chunked_row_starts_past_the_prefix_rank_0_measured_on_every_rank():
     first = engine._prepare_chunk(batch, "b", WALK, ChunkRange(start, end, len(prompt), end))
 
     assert (first.chunk_start, first.input_seq_len) == (start, PAGE_SIZE)
+
+
+def test_a_follower_keys_a_dropped_request_as_rank_0_did_before_it_takes_rank_0s_hit():
+    """Rank 0 starts a dropped request's rebuild before it sends the rebuild's first row, and the rebuild keys the
+    request as a prompt of its prompt and its reply. The hit rank 0 sends with the row is what the cache holds under
+    those keys. A follower that took the hit before it started the rebuild looked it up under the request's old keys,
+    found only the prompt's pages, and stopped."""
+    ranks = leader, follower = _manager(0), _manager(1)
+    prompt, reply = _tokens(2 * PAGE_SIZE + 3, seed=0), _tokens(2 * PAGE_SIZE, seed=1)
+    # an earlier request with the same prompt and reply, whose rebuild cached its pages under the rebuild's keys
+    _cache(ranks, "a", prompt + reply[:-1])
+    for kv in ranks:
+        kv.ingest_request("v", replace(_config([prompt], decode=len(reply)), rebuildable=True))
+        _run(kv, "v", prompt)
+        _write(kv, "v", len(reply) - 1, "decode")
+        kv.drop("v", len(prompt) + len(reply) - 1)
+    assert StepRunner({"kv": leader}, node_resources={NODE: ["kv"]}).admit_retrieve("v", NODE, WALK).ready
+    follower.replay(MoveKind.RESERVE, "v", leader._allotments["v"].pages, [])
+    # as rank 0's readiness check starts the rebuild
+    leader.prepare_rebuild("v", Rebuild(WALK, array("i", prompt + reply)))
+    lead = _engine(leader)
+    head = ScheduleTPNode(
+        NODE, WALK, ["v"], prefix_hits=lead.decide_cached_prefix(_batch("v")), page_trails=lead.page_trails(NODE),
+    )
+    assert len(leader._streams["v"]["main"].lease) > len(prompt) // PAGE_SIZE, "rank 0's hit is the prompt's alone"
+    one = _Rank(follower, _engine(follower))
+    one.rebuilds._kept[NODE]["v"] = _kept(*reply, prompt=prompt)
+    one.scheduler.register_tp_follow(head)
+
+    batch = one.scheduler._try_schedule_tp_follow(one.worker.request_state)
+
+    assert batch.rebuild_rids == {"v"}, "the follower took v's row as one of its own"
+    assert follower._streams["v"]["main"].lease == leader._streams["v"]["main"].lease, (
+        "the follower holds other cached pages for v than rank 0"
+    )
+
+
+def _write(kv: KVManager, rid: str, length: int, walk: str) -> None:
+    step, ctx = KVStep(segments=(Segment(rid, "main", length),)), _ctx(rid, walk)
+    assert kv.admit(step, ctx).ok
+    kv.plan(step, ctx)
+    kv.commit(step, ctx)

@@ -88,7 +88,7 @@ def _write(kv: KVManager, rid: str, *spans: int) -> None:
 def _engine(resources: dict) -> Engine:
     engine = Engine.__new__(Engine)
     engine._runner, engine._submodules = StepRunner(resources), {NODE: SimpleNamespace(resources=resources)}
-    engine._tp_follower_nodes = set()
+    engine._tp_leader_nodes, engine._tp_follower_nodes, engine._resident_delta = set(), set(), None
     return engine
 
 
@@ -123,7 +123,7 @@ def test_a_refused_drop_changes_nothing(refusal):
     kv._overrides["r"].rebuildable = refusal != "not rebuildable"
     assert refusal != "step" or kv.admit(*_step("r", 1)).ok
     kv._streams["r"]["main"].read_pending = refusal == "read"
-    kv._world_size = 2 if refusal == "ranks" else kv._world_size
+    kv._world_size, kv._counts = (2, False) if refusal == "ranks" else (kv._world_size, kv._counts)
     kv._cpu_pool = SimpleNamespace(is_offloaded=lambda rid: refusal == "host")
     pages = list(kv._streams["r"]["main"].page_indices)
 
@@ -160,6 +160,7 @@ def test_the_engine_tells_every_resource_of_the_node_about_a_rebuild():
     first, second = _Recording(), _Recording()
     engine, rebuild = Engine.__new__(Engine), Rebuild(WALK, array("i", [1, 2, 3]))
     engine._submodules = {NODE: SimpleNamespace(resources={"first": first, "second": second})}
+    engine._tp_leader_nodes = engine._tp_follower_nodes = set()
 
     engine.prepare_rebuild(NODE, "r", rebuild)
     engine.land_rebuild(NODE, "r")

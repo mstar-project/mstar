@@ -12,6 +12,7 @@ import pytest
 sys.path.insert(0, ".")
 
 from mstar.engine.chunking import ChunkRange
+from mstar.engine.resources import Residency
 from mstar.graph.runtime.base import ColumnarEdgeSpecs, SpeculationPrepOutput
 from mstar.utils.ipc_format import ScheduleTPNode
 from mstar.worker.micro_scheduler import MicroScheduler, ScheduledBatch
@@ -19,6 +20,7 @@ from mstar.worker.stream_buffers import StreamBufferManager
 from mstar.worker.worker import Worker
 
 NODE, MIXED = "LLM", "mixed"
+_ENGINE = SimpleNamespace(residency=lambda node, rid: Residency.RESIDENT)
 
 
 def _follower(head: ScheduleTPNode) -> Worker:
@@ -27,7 +29,7 @@ def _follower(head: ScheduleTPNode) -> Worker:
     worker = Worker.__new__(Worker)
     worker.worker_id = "worker_1"
     worker.scheduler = MicroScheduler(
-        engine_manager=SimpleNamespace(get_engine=lambda node: None), parallel_leader_nodes=set(),
+        engine_manager=SimpleNamespace(get_engine=lambda node: _ENGINE), parallel_leader_nodes=set(),
     )
     worker.scheduler.register_tp_follow(head)
     worker.scheduler.chunk_loop_walks = {NODE: frozenset({"prefill_text"})}
