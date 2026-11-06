@@ -21,6 +21,7 @@ import torch
 from mstar.engine.state import (
     Array,
     Attend,
+    Bidirectional,
     Block,
     Causal,
     CausalConv,
@@ -39,6 +40,7 @@ from mstar.engine.state.analysis import declaration_digest, state_declaration_pr
 from mstar.engine.state.contract import Mask
 from mstar.graph.base import GraphNode
 from mstar.model.base import KVLabel, PrefixKeys
+from mstar.model.submodule_base import ChunkingPolicy
 
 _ATTEND = Attend(q_heads=8)
 
@@ -311,6 +313,53 @@ def test_a_cross_read_over_an_array_on_its_node_has_no_problems():
 
 def test_a_cross_read_over_an_array_that_keeps_entries_has_no_problems():
     assert state_declaration_problems(_StubModel(_array("video", reads={"r": _read()}), _cross())) == []
+
+
+def test_a_kept_cross_read_over_an_array_that_keeps_entries_has_no_problems():
+    context = _array("context", reads={"context_attn": _read(mask=Bidirectional(), queries="kv")})
+    assert state_declaration_problems(_StubModel(_array(reads={"r": _read()}), context)) == []
+
+
+def test_a_bidirectional_read_needs_an_array_that_keeps_entries():
+    problem = _one_problem(_within("vision", reads={"r": _read(mask=Bidirectional())}))
+    assert "every read of an array with max_len 0 is a Block read, and this one is Bidirectional" in problem
+
+
+def _chunked(*arrays, chunkable=True) -> _StubModel:
+    model = _StubModel(*arrays)
+    model.get_chunking_policies = lambda: {"LLM": (ChunkingPolicy(walks=("prefill",), chunkable=chunkable),)}
+    return model
+
+
+@pytest.mark.parametrize("array, mask", [
+    (_array(reads={"r": _read(mask=Bidirectional())}), "Bidirectional"),
+    (_within("vision", reads={"r": _read(mask=Block())}), "Block"),
+], ids=["kept", "within_step"])
+def test_a_chunked_walk_cant_read_this_steps_adds_as_a_whole(array, mask):
+    """Splitting a row's adds across steps changes what they see, with no error from any kernel."""
+    problems = state_declaration_problems(_chunked(array))
+    assert len(problems) == 1
+    assert problems[0].startswith(f"Array {array.name!r}.reads['r']: {mask} on walk 'prefill'")
+    assert "splitting a row's adds across steps changes what its tokens see" in problems[0]
+
+
+@pytest.mark.parametrize("array", [
+    _array(reads={"r": _read(mask=Bidirectional())}),
+    _within("vision", reads={"r": _read(mask=Block())}),
+], ids=["kept", "within_step"])
+def test_a_policy_that_doesnt_split_rows_can_read_this_steps_adds_as_a_whole(array):
+    assert state_declaration_problems(_chunked(array, chunkable=False)) == []
+
+
+def test_a_chunked_walk_reads_causally_and_another_nodes_reads_stay_free():
+    causal = _array(reads={"r": _read()})
+    vision = _within("vision", nodes={"vision"}, reads={"v": _read(mask=Block())})
+    assert state_declaration_problems(_chunked(causal, vision)) == []
+
+
+def test_a_chunked_walk_outside_a_reads_walks_is_free():
+    array = _array(reads={"r": _read(mask=Bidirectional(), walks={"decode"})})
+    assert state_declaration_problems(_chunked(array)) == []
 
 
 @pytest.mark.parametrize("arrays, where, cause", [

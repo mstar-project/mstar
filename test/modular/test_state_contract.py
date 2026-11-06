@@ -17,6 +17,7 @@ import torch
 from mstar.engine.state import (
     Array,
     Attend,
+    Bidirectional,
     Block,
     Causal,
     CausalConv,
@@ -141,6 +142,10 @@ REFUSALS = {
     "host fields off a Value": (lambda: _array(entry=Entry({}, host={"sent": bool})), "Array 'kv'.entry.host"),
     "queries with a mask that uses the query's position": (
         lambda: _array(reads={"r": _read(queries="video")}), "Array 'kv'.reads['r'].queries",
+    ),
+    "queries with no op": (
+        lambda: _array(reads={"r": Read(mask=Bidirectional(), queries="video")}),
+        "Array 'kv'.reads['r'].queries: a read with no op",
     ),
     "update on one entry that isn't rewritable": (
         lambda: _array(entry=_GDN, max_len=1, updates={"u": CausalConv()}),
