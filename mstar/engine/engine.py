@@ -1861,12 +1861,19 @@ class Engine:
         if runner is not None:
             runner.yield_runs()
 
-    def end_run_early(self, batch: ExecutingBatch, replays: int) -> None:
-        """A run landed ``replays`` iterations in, short of what admit settled:
-        what it counted past them goes back. A live row carries on from there."""
+    def settle_run(
+        self, batch: ExecutingBatch, width: int, counts: Mapping[int, int] | None = None,
+    ) -> None:
+        """Settle row executions separately from the run's output width."""
         ctx = batch.step_context
-        self._runner.rewind_run(batch.step, ctx.repeats - replays)
-        ctx.repeats = replays
+        if type(width) is not int or not 0 <= width <= ctx.repeats:
+            raise ValueError(f"invalid run width {width!r}")
+        if counts is None:
+            counts = dict.fromkeys(ctx.counted or ctx.request_ids, width)
+        if any(type(count) is not int or not 0 <= count <= width for count in counts.values()):
+            raise ValueError("row execution count exceeds the run width")
+        self._runner.settle_run(batch.step, counts)
+        ctx.repeats = width
 
     def device_stop_refusal(self, node_name: str, graph_walk: str) -> str | None:
         """After capture: why ``graph_walk``'s captures don't skip a replay

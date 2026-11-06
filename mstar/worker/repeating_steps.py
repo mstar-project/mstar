@@ -392,7 +392,7 @@ class RepeatingSteps:
         outputs = step.future.result()
         phase_record(f"repeats.ran.{step.graph_walk}#", 0)
         engine = self.engine_manager.get_engine(step.node_name)
-        engine.end_run_early(node_batch, 0)
+        engine.settle_run(node_batch, 0)
         for signal, bases in node_batch.ring_bases.items():
             # what it reserved holds no room: only postprocess gives it back otherwise
             for rid, base in bases.items():
@@ -529,7 +529,7 @@ class RepeatingSteps:
             for name, buffer in host_rows.buffers.items():
                 if buffer.dim() > 1 and buffer.shape[1] == width:
                     host_rows.buffers[name] = buffer[:, :ran]
-            engine.end_run_early(batch_N.node_batch, ran)
+            engine.settle_run(batch_N.node_batch, ran)
             batch_N.batch.repeats = ran
 
     def _cut_run_items(

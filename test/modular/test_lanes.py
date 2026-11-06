@@ -658,7 +658,7 @@ def test_a_step_with_no_resources_leaves_the_chains_staged_pre_plan_alone():
 
     assert eng._runner.staged and talker._preplanned, "a step with no resources dropped the chain's stage"
     assert eng._runner.replay_columns(empty, 4) == [] and eng._runner.replay_columns(None, 4) == []
-    eng._runner.rewind_run(None, 2)
+    eng._runner.settle_run(None, {5: 2})
 
 
 @pytest.mark.parametrize("stage", ["admit", "plan"])

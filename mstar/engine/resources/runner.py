@@ -11,6 +11,7 @@ import itertools
 import logging
 from collections.abc import Callable, Collection, Mapping
 from contextlib import AbstractContextManager, nullcontext
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
 from mstar.engine.resources.admission import Admission
@@ -603,17 +604,34 @@ class StepRunner:
                 walk, key, nodes, key, max(most, 1), asked,
             )
 
-    def rewind_run(self, step: SubmoduleStep | None, replays: int) -> None:
-        """A run landed ``replays`` iterations short: each resource takes them
-        back, from the rows whose request is still the one the run counted for.
-        A row torn down since (its request done, its handle maybe another's by
-        now) or a padding row has nothing to take back."""
+    def settle_run(self, step: SubmoduleStep | None, counts: Mapping[int, int]) -> None:
+        """Replace provisional counts with actual executions, once per row.
+
+        Validate the complete submitted membership before changing any owner.
+        A recycled request handle never receives the old run's adjustment.
+        """
         if step is None:
             return  # a node that declares no step counted nothing
+        counts = dict(counts)
+        ctx = step.ctx
+        members = ctx.counted.keys() if ctx.counted else ctx.request_ids
+        if counts.keys() != set(members):
+            raise ValueError("run counts must cover exactly the submitted requests")
+        deltas: dict[int, set[int]] = {}
         live = self._generations
-        rows = frozenset(rid for rid, gen in step.ctx.counted.items() if gen is not None and live.get(rid) == gen)
+        for rid, count in counts.items():
+            previous = ctx.run_span(1, request_id=rid)
+            if type(count) is not int or count < 0 or count > previous or count > ctx.repeats:
+                raise ValueError(f"invalid execution count {count!r} for request {rid!r}")
+            if count != previous and not ctx.counted:
+                raise ValueError("a shortened run has no committed request generations")
+            gen = ctx.counted.get(rid)
+            if count < previous and gen is not None and live.get(rid) == gen:
+                deltas.setdefault(previous - count, set()).add(rid)
         for key in self._keys_for(step):
-            self._resources[key].rewind_run(step.get(key), step.ctx, replays, rows)
+            for delta, rows in deltas.items():
+                self._resources[key].rewind_run(step.get(key), ctx, delta, frozenset(rows))
+        ctx.run_counts = MappingProxyType(counts)
 
     def replay_columns(self, step: SubmoduleStep | None, repeats: int) -> list[tuple[torch.Tensor, torch.Tensor]]:
         """Every resource's ``Resource.replay_columns`` for this step; none for

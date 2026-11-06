@@ -463,7 +463,7 @@ def test_the_worker_settles_a_run_that_ended_short(monkeypatch):
 
     worker = Worker.__new__(Worker)
     ended = []
-    engine = SimpleNamespace(end_run_early=lambda batch, ran: ended.append(ran))
+    engine = SimpleNamespace(settle_run=lambda batch, ran: ended.append(ran))
     batch = SimpleNamespace(batch=SimpleNamespace(repeats=4), node_batch=object(), graph_walk=WALK)
     monkeypatch.setattr(profiler, "PHASE_PERIOD", 1)
     profiler.phase_buffer().clear()
@@ -492,7 +492,7 @@ def _skipped_step(worker, log, words, rows=(1, 2), **node_batch):
 
     worker._clear_in_flight_flag = lambda batch: log.append(("flag", sorted(batch.request_to_worker_graph)))
     worker.engine_manager = SimpleNamespace(get_engine=lambda node: SimpleNamespace(
-        end_run_early=lambda node_batch, ran: log.append(("rewound", ran)),
+        settle_run=lambda node_batch, ran: log.append(("rewound", ran)),
         ring_rows=lambda node: SimpleNamespace(
             ring_skip=lambda signal, rid, positions: log.append(("ring", signal, rid, list(positions))),
         ),

@@ -415,7 +415,9 @@ class RopeManager(PositionManager):
                 counters = all_counters.get(segment.request_id)
                 if counters is None:
                     counters = all_counters[segment.request_id] = {}
-                counters[segment.label] = counters.get(segment.label, 0) + ctx.run_span(advance)
+                counters[segment.label] = counters.get(segment.label, 0) + ctx.run_span(
+                    advance, request_id=segment.request_id,
+                )
 
         # post-forks copy the source after this step advanced it, matching
         # where KV applies them

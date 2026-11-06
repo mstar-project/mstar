@@ -665,7 +665,7 @@ class RecurrentStatePool(Resource):
                         self._version += 1
                         if self._resident is not None and ctx.resident is None:
                             self._resident.mark_stale(segment.request_id)
-                    slot.tokens += ctx.run_span(segment.span)
+                    slot.tokens += ctx.run_span(segment.span, request_id=segment.request_id)
                     # a row too short to checkpoint that ends on a page (a decode step) is saved here, after its
                     # forward. A step that repeats saves only the page it ends on: the state between is gone
                     if page and segment.span < page and not slot.tokens % page:

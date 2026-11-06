@@ -621,14 +621,34 @@ def test_a_run_landing_short_takes_back_only_from_rows_still_its_requests():
     rewound = []
     kv.rewind_run = lambda step, ctx, replays, rows: rewound.append((replays, rows))
     runner = StepRunner({"kv": kv})
-    for rid in ("r1", "r2"):
+    width = 4
+    rids = ("r1", "r2", "r3", "r4")
+    for rid in rids:
         runner.ingest_request(rid, None)
-    ctx = _ctx(("r1", "r2"))
-    ctx.repeats = 4
-    ctx.set_padded_rids(("r1", "r2", "pad"))
-    step = _step(["kv"], segments=(("r1", "main", 1), ("r2", "main", 1), ("pad", "main", 1)), ctx=ctx)
+    ctx = _ctx(rids)
+    ctx.repeats = width
+    ctx.set_padded_rids((*rids, "pad"))
+    step = _step(["kv"], segments=tuple((rid, "main", 1) for rid in (*rids, "pad")), ctx=ctx)
     runner.commit(step)
     runner.remove_request("r2")
     runner.ingest_request("r2", None)  # the handle now names another request
-    runner.rewind_run(step, 3)
-    assert rewound == [(3, frozenset({"r1"}))]
+    counts = {"r1": width - 1, "r2": 0, "r3": width // 4, "r4": 0}
+    for invalid in ({**counts, "r4": x} for x in (-1, True, 1.5, 5)):
+        with pytest.raises(ValueError):
+            runner.settle_run(step, invalid)
+    for invalid in ({"r1": 3}, {**counts, "pad": 0}):
+        with pytest.raises(ValueError):
+            runner.settle_run(step, invalid)
+    assert rewound == []
+    runner.settle_run(step, counts)
+    assert rewound == [(1, frozenset({"r1"})), (3, frozenset({"r3"})), (4, frozenset({"r4"}))]
+    before = list(rewound)
+    runner.settle_run(step, counts)
+    with pytest.raises(ValueError):
+        runner.settle_run(step, {**counts, "r1": 4})
+    assert rewound == before
+    assert [ctx.run_span(2, request_id=rid) for rid in rids] == [2 * counts[rid] for rid in rids]
+    assert [ctx.run_span(2, keeps=False, request_id=rid) for rid in rids] == [2 * bool(counts[rid]) for rid in rids]
+    assert ctx.run_span(2, request_id="pad") == 0
+    with pytest.raises(ValueError):
+        ctx.run_span(2)

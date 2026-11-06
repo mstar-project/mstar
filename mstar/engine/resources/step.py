@@ -133,6 +133,8 @@ class StepContext:
     # a run's real rows -> the generation of the request each named when it
     # committed (``StepRunner.commit``), so a short landing rewinds only those
     counted: Mapping[int, int | None] = field(default_factory=dict)
+    # Actual executions after settlement, distinct from the submitted bound.
+    run_counts: Mapping[int, int] | None = field(default=None, init=False)
     # the node's `ResidentPlanner` when this step's capture reads the resident
     # tables: a resource then stages nothing per row (see `resources/resident.py`)
     resident: Any = None
@@ -152,12 +154,22 @@ class StepContext:
                 f"but this rank can run {self.repeats}; refusing before forward"
             )
 
-    def run_span(self, span: int, keeps: bool = True) -> int:
+    def run_span(self, span: int, keeps: bool = True, *, request_id: int | None = None) -> int:
         """What ``span`` a replay comes to over the step: read this, not
         ``span``, for anything counted per step rather than per replay. A
         step that ``keeps`` nothing (``KVStep(commit=False)``) rewrites the
-        same tokens each replay, so it reaches one replay's."""
-        return span * self.repeats if keeps else span
+        same tokens each replay, so it reaches one replay's. After settlement,
+        use the request's actual count; a zero-execution row reaches nothing."""
+        count = self.repeats
+        if self.run_counts is not None:
+            if request_id is None:
+                raise ValueError("a settled run span needs its request id")
+            count = self.run_counts.get(request_id)
+            if count is None:
+                if self.is_padding_row(request_id) and request_id in self.padded_request_ids:
+                    return 0
+                raise ValueError(f"request {request_id!r} is not in the settled run")
+        return span * count if keeps else span if count else 0
 
     def walk_of(self, rid: int) -> str:
         return self.request_walks.get(rid, self.graph_walk)

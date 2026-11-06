@@ -2114,7 +2114,7 @@ class KVManager(AttentionResource):
                     stream = self._ensure_label(rid, label)
                 marked.append((segment, stream))
                 # a chunked row reserves the rest of its walk up front, in every group
-                span = ctx.run_span(segment.span, step.commit)
+                span = ctx.run_span(segment.span, step.commit, request_id=segment.request_id)
                 if ahead and reserve_ahead.holds_for(rid):
                     span += ahead.get(rid, 0)
                 seq_len = span + stream.stored_len
@@ -2199,7 +2199,7 @@ class KVManager(AttentionResource):
                 pages = () if part is None else part.page_indices
                 stored = 0 if part is None else part.stored_len
                 # as `admit` reserves it: a chunked row's whole walk
-                reach = stored + ctx.run_span(segment.span, step.commit) + walk_ahead
+                reach = stored + ctx.run_span(segment.span, step.commit, request_id=segment.request_id) + walk_ahead
                 more = -(-reach // group.page_size) - len(pages)
                 key = (rid, segment.label, g)
                 needed[key] = max(needed.get(key, 0), more)
@@ -2557,7 +2557,7 @@ class KVManager(AttentionResource):
             stream = streams[s.request_id][s.label].group(group)
             sids.append(stream.page_indices.sid)
             # a step that repeats plans its last replay: every page it reaches
-            lens.append(ctx.run_span(span, keeps) + stream.stored_len)
+            lens.append(ctx.run_span(span, keeps, request_id=s.request_id) + stream.stored_len)
             gens.append(stream.generation)
         if sink_rows:
             sink_pages = self._sink_pages
@@ -3274,7 +3274,7 @@ class KVManager(AttentionResource):
                 # tokens (image_gen, action_gen) still read these pages, and
                 # leaving the mark set would make the request unevictable
                 stream.step_in_flight = False
-                span = ctx.run_span(segment.span)
+                span = ctx.run_span(segment.span, request_id=segment.request_id)
                 if step.commit and span > 0:
                     # an offload beat the mark (claimed before this step's
                     # admit). the host copy predates the span, so writing the
@@ -4518,7 +4518,7 @@ class KVManager(AttentionResource):
         growth: dict[tuple[str, str], int] = {}
         for segment in step.segments:
             key = (segment.request_id, segment.label)
-            growth[key] = growth.get(key, 0) + ctx.run_span(segment.span)
+            growth[key] = growth.get(key, 0) + ctx.run_span(segment.span, request_id=segment.request_id)
         return growth
 
     def _reserve_fork(
