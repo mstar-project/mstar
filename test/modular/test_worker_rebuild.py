@@ -252,6 +252,20 @@ def test_a_lockstep_node_keeps_no_ids_and_sets_no_pool_aside():
     )
 
 
+def test_rebuild_host_mb_0_sets_no_pool_aside_on_a_node_that_copies_media():
+    """``rebuild_host_mb: 0`` turned off the ids' room alone, so a worker whose node copies media still pinned
+    ``rebuild_media_host_mb`` at startup and kept every request's ids and copies there."""
+    from test_rebuild_policy import MEDIA, VISION
+    from test_rebuild_policy import _graphs as media_graphs
+
+    model = SimpleNamespace(rebuild_policies=lambda: {NODE: MEDIA}, get_graph_walk_graphs=media_graphs)
+    my_walks = {(NODE, PREFILL), (NODE, VISION), (NODE, DECODE)}
+    engine = SimpleNamespace(host_allowance=None, node_dtype=lambda node: torch.float32)
+    rebuilds = _make_rebuilds(model, {"rebuild_host_mb": 0}, my_walks, set(), torch.device("cpu"), engine)
+
+    assert NODE in rebuilds.nodes and rebuilds.pool is None, "the worker pinned the media pool with rebuilds off"
+
+
 def test_a_step_of_rebuild_rows_alone_routes_nothing_and_makes_them_resident():
     w, eng, batch, node_batch = _rebuilding()
     assert node_batch.step_context.rebuild_rids == {R} and node_batch.per_request_info[R].graph_walk == PREFILL
