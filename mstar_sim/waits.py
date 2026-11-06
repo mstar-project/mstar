@@ -98,7 +98,6 @@ _moved = [0.0, 0.0]  # the last move on the bound: when, and how far
 _CPU_ALLOWANCE = 1e-3  # CPU time a look lets pass as nothing: zmq's and gloo's own threads ticking over
 _shut = [0.0]  # the real time the gate found a task on a CPU, with nothing running (0.0: it hasn't)
 _GATE_LIMIT = 1.0  # real seconds a message can't stay on its way, though a loaded box descheduled it
-_meet = [0]  # the group word of the meet a thread of this process is in (dist)
 REPORT = {"slept_s": 0.0, "late_resumes": 0, "jump_blockers": {}, "ahead_stalls": 0, "late_deliveries": 0,
           "meet_skew_s": 0.0, "mover_s": 0.0, "scan_s": 0.0, "scans": 0, "settle_deferrals": 0, "gate_waits": 0,
           "parks": 0, "unparks_by_look": 0}
@@ -106,12 +105,14 @@ REPORT = {"slept_s": 0.0, "late_resumes": 0, "jump_blockers": {}, "ahead_stalls"
 
 class Wait:
     """A blocked thread's entry: what it waits for (``kind``: the device, a host deadline, or
-    None for nothing in particular), its deadline on the clock, and how to end it early."""
+    None for nothing in particular), its deadline on the clock, how to end it early, and at a
+    meet, its group (:func:`mstar_sim.table.group_word`)."""
 
-    __slots__ = ("kind", "deadline", "counts", "woken", "due", "timed_out", "release", "thread", "fd", "real")
+    __slots__ = ("kind", "deadline", "counts", "woken", "due", "timed_out", "release", "thread", "fd", "real", "group")
 
-    def __init__(self, kind, deadline, counts, release, fd):
+    def __init__(self, kind, deadline, counts, release, fd, group=0):
         self.kind, self.deadline, self.counts, self.release, self.fd = kind, deadline, counts, release, fd
+        self.group = group
         self.woken = self.due = self.timed_out = False
         self.thread = threading.get_ident()
         self.real = clock._real()
@@ -141,15 +142,15 @@ def _publish() -> None:
     pending = [w for w in _waits if not w.woken]
     TABLE.publish(clock.now(), not _told_blocked[0], min((w.deadline for w in pending if w.deadline is not None),
                                                          default=math.inf),
-                  _meet[0] if any(w.kind is MEET for w in pending) else 0)
+                  next((w.group for w in pending if w.kind is MEET), 0))
 
 
-def enter(kind, deadline=None, release=None, fd=None) -> Wait | None:
+def enter(kind, deadline=None, release=None, fd=None, group=0) -> Wait | None:
     """This thread enters a wait (None when the registry isn't installed). ``release`` ends it
     early (the mover's delivery); ``fd``, an fd whose ``eventfd_write`` wakes it."""
     if not _installed[0]:
         return None
-    w = Wait(kind, deadline, threading.get_ident() in _counted, release, fd)
+    w = Wait(kind, deadline, threading.get_ident() in _counted, release, fd, group)
     clock.pause()
     with LOCK:
         clock.READS[0] += 1
@@ -228,10 +229,8 @@ def _until(w: Wait | None, timeout, attempt):
 @contextmanager
 def blocked(kind=None, deadline=None, fd=None, release=None, group: int = 0):
     """A wait whose waker this module doesn't see (a gloo collective, a Rust poll): the thread
-    counts as blocked until it returns. ``group``: a meet's (:func:`mstar_sim.table.group_word`)."""
-    if group:
-        _meet[0] = group
-    w = enter(kind, deadline, release, fd)
+    counts as blocked until it returns."""
+    w = enter(kind, deadline, release, fd, group)
     try:
         yield w
     finally:

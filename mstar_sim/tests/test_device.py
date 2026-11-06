@@ -1166,6 +1166,20 @@ def test_the_mover_waits_on_no_lock_of_threadings():
     assert out.strip() == "True", out
 
 
+def test_a_slot_names_the_meet_of_a_wait_still_in_it():
+    """A meet's group belongs to its wait: another thread's meet on another group, over and done,
+    leaves this one's in the slot, or its peers would count arrivals of a group no one is at."""
+    out = run_sim("""
+        from mstar_sim import table, waits
+        with waits.blocked(waits.MEET, group=5):
+            with waits.blocked(waits.MEET, group=9):
+                pass
+            waits._publish()
+            print(waits.TABLE._q[waits.TABLE._mine + table._MEET])
+    """)
+    assert out.strip() == "5", out
+
+
 def test_a_read_held_behind_a_rising_bound_doesnt_abort():
     """The limit is on a bound that stands still, not on a hold: a device wait can put a process
     far past a peer that runs at real rate, and it then waits for the peer to get there."""
