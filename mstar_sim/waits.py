@@ -514,15 +514,16 @@ def _settled() -> float:
 
 def read() -> float:
     """A clock read by mstar: publishes a running clock, and holds a thread that has got more
-    than W past the bound, until the bound rises (clause 2), and reads again: what it returns is
-    always a time it checked. Not a read made inside this module's own bookkeeping (a GC callback
+    than W past the bound, until that observation is permitted (clause 2). Retry validation of
+    the same observation: resampling after a hold can chase a rising clock indefinitely.
+    Not a read made inside this module's own bookkeeping (a GC callback
     that runs while LOCK is held): the mover needs LOCK to let it go."""
     clock.READS[0] += 1
     if clock.PARKED[0] and not LOCK._is_owned():
         _unpark_now()
+    t = clock.now()
     while True:
-        t = clock.now()
-        TABLE.tick(t)
+        TABLE.tick(clock.now())
         epochs = TABLE.epochs()
         if epochs != _seen[0]:  # a change of state anywhere can lower the bound: look again
             _seen[0] = epochs

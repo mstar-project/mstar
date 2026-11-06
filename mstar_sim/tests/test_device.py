@@ -1333,6 +1333,39 @@ def test_a_read_held_behind_a_rising_bound_doesnt_abort():
     assert jumper.strip() == "passed", jumper
 
 
+def test_a_permitted_clock_read_releases_an_application_lock_before_its_peer_exits():
+    _, reader = run_deployment("""
+        barrier()
+        start = clock._real()
+        while not os.path.exists(TMP + "/reader-done") and clock._real() - start < 3.0:
+            with clock.computing():
+                waits._real_sleep(0.09)
+            waits._real_sleep(0.01)
+        open(TMP + "/peer-done", "w").close()
+    """, """
+        barrier()
+        lock = threading.Lock()
+        lock.acquire()
+        def use_lock():
+            with lock:
+                pass
+        thread = threading.Thread(target=use_lock)
+        thread.start()
+        waits._real_sleep(0.1)
+        original = waits._hold
+        def delayed_resume(t):
+            original(t)
+            waits._real_sleep(0.1)  # descheduled after permission; do not observe a new time
+        waits._hold = delayed_resume
+        waits.read()
+        lock.release()
+        thread.join()
+        print(os.path.exists(TMP + "/peer-done"))
+        open(TMP + "/reader-done", "w").close()
+    """)
+    assert reader.strip() == "False", reader
+
+
 def test_a_read_sees_a_bound_only_the_mover_had_stale():
     """The mover stores a bound it read before a change of state, over the one a read just worked
     out: the read after that looks again. And of two reads that see a process parked, the second

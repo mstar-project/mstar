@@ -153,7 +153,8 @@ the roofline.
   names the table when a port can't be read). A client with no port of its own to pair on has a
   table to itself, and shows a wait on the server as the real time it took. A test run is not a
   deployment: `-m pytest` keeps a private table per process. A process is held within 0.5 ms of
-  the others at its clock reads. Between reads it isn't, and nothing bounds rank against rank on
+  the others at its clock reads. A delayed read returns its original observation after validation;
+  application timeout checks can therefore run late. Between reads it isn't, and nothing bounds rank against rank on
   the host: a collective starts once the last rank has launched it (`meet_skew_s`), but a rank's
   clock isn't held to its peers'. A message on its way has a runnable thread on its path, so a
   process isn't moved past one; a third process can read the receiver's old next event just
