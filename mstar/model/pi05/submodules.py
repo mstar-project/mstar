@@ -25,12 +25,12 @@ from mstar.engine.accelerator_graph_config import (
     PackedAcceleratorGraphConfig,
 )
 from mstar.engine.engine import ExecutingBatch
-from mstar.engine.resources import AttentionStep, KVStep, PositionStep, Segment, SlotLease, SubmoduleStep
+from mstar.engine.state import ArrayStep, Segment, SlotLease, SubmoduleStep
 from mstar.model.pi05.components.action_expert import Pi05ActionExpert, Pi05TimeMLP
 from mstar.model.pi05.components.flow_matching import sincos_timestep_embedding
 from mstar.model.pi05.components.paligemma import Pi05PaliGemmaExpert
 from mstar.model.pi05.components.siglip import Pi05SiglipEncoder
-from mstar.model.pi05.config import LLM_ATTN, LLM_KV, LLM_POS, Pi05Config
+from mstar.model.pi05.config import LLM_KV, Pi05Config
 from mstar.model.pi05.kernels.image_normalize import normalize_float_images
 from mstar.model.submodule_base import ARNodeInputs, ARNodeSubmodule, ModelInputsFromEngine, NodeInputs, NodeSubmodule
 
@@ -318,6 +318,7 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
         action_out_proj: nn.Linear,
         time_mlp: Pi05TimeMLP,
         config: Pi05Config,
+        device: torch.device | str,
     ):
         super().__init__()
         self.embed_tokens = embed_tokens
@@ -331,11 +332,15 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
         # language embeddings times sqrt(hidden_size).
         self._text_embed_scale = math.sqrt(config.hidden_size)
 
-        # Lazily allocated on first action Euler step, sized for the largest
-        # captured batch. sincos_timestep_embedding fully overwrites this buffer
-        # every step, so torch.empty suffices (no zeroing needed).
+        # A memo of the config, made on the first action Euler step.
         self._fraction: torch.Tensor | None = None
-        self._time_emb_buffer: torch.Tensor | None = None
+        # Sized for the largest captured batch, and float32 to match noisy_actions.
+        # sincos_timestep_embedding fully overwrites it every step, so torch.empty
+        # suffices (no zeroing needed).
+        self._time_emb_buffer = torch.empty(
+            max(self.ACTION_GEN_CAPTURE_BATCH_SIZES), config.action_hidden_size,
+            device=device, dtype=torch.float32,
+        )
 
     def to(self, *args, **kwargs):
         """Apply standard ``to()`` then upcast norm parameters back to fp32.
@@ -382,22 +387,6 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
             dtype=torch.float64
         )
         return self._fraction
-
-    def _get_time_emb_buffer(self, bs: int) -> torch.Tensor:
-        """Return a pre-allocated slice of shape (bs, action_hidden_size).
-
-        Allocated once at the largest capture batch size (float32, matching
-        noisy_actions dtype). sincos_timestep_embedding fully overwrites it
-        every step, so no zeroing is needed — torch.empty suffices.
-        """
-        max_bs = max(self.ACTION_GEN_CAPTURE_BATCH_SIZES)
-        if self._time_emb_buffer is None:
-            self._time_emb_buffer = torch.empty(
-                max_bs, self.config.action_hidden_size,
-                device=self.get_device(),
-                dtype=torch.float32,
-            )
-        return self._time_emb_buffer[:bs]
 
     def _embed_tokens_scaled(self, ids: torch.Tensor) -> torch.Tensor:
         emb = self.embed_tokens(ids)
@@ -516,30 +505,14 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
         piecewise_leases: Mapping[str, SlotLease] | None = None,
         **kwargs,
     ) -> SubmoduleStep:
-        """Bidirectional (prefix-LM) attention over the packed batch.
-
-        ``prefill`` commits the prefix KV and advances positions. ``action_gen``
-        reads the frozen prefix read-only: the action tokens are written to
-        scratch pages and attended (``KVStep(commit=False)``) but neither the
-        stored length nor the position counter advances, so all denoise
-        iterations reuse the same prefix and the same action positions.
-        """
-        is_prefill = graph_walk == "prefill"
-        segments = [
-            Segment(request_id=rid, label="main", span=inp.input_seq_len)
-            for rid, inp in zip(request_ids, inputs, strict=True)
-        ]
-        pos_step = (
-            PositionStep() if is_prefill
-            else PositionStep(advance=tuple(0 for _ in request_ids))
-        )
+        """Prefix-LM attention over the packed batch. ``prefill`` keeps the prefix. ``action_gen`` adds the action
+        tokens as scratch, so every denoise iteration reads the same prefix at the same positions."""
         return SubmoduleStep(
-            segments=segments,
-            steps={
-                LLM_KV: KVStep(commit=is_prefill),
-                LLM_ATTN: AttentionStep(causal=False),
-                LLM_POS: pos_step,
-            },
+            segments=[
+                Segment(request_id=rid, label="main", span=inp.input_seq_len)
+                for rid, inp in zip(request_ids, inputs, strict=True)
+            ],
+            state={LLM_KV: ArrayStep(keep=graph_walk == "prefill")},
         )
 
     def preprocess(
@@ -582,7 +555,7 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
             "timestep_index": all_ts,
             "seq_lens": [inp.input_seq_len for inp in inputs],
             "fraction": self._get_timestep_emb_fraction(),
-            "time_emb_buffer": self._get_time_emb_buffer(len(inputs))
+            "time_emb_buffer": self._time_emb_buffer[:len(inputs)]
         }
 
     # ------------------------------------------------------------------
@@ -632,7 +605,7 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
         **kwargs,
     ) -> dict[str, NameToTensorList]:
         """Batched prefill: single PaliGemma forward over concatenated prefixes."""
-        self.paligemma(query_sequence=prefix_embs, label="main")
+        self.paligemma(query_sequence=prefix_embs)
         # Prefill produces no graph-edge outputs.
         return {rid: {} for rid in request_ids}
 
@@ -671,7 +644,7 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
         prefix_embs: torch.Tensor,
         **kwargs,
     ) -> NameToTensorList:
-        self.paligemma(query_sequence=prefix_embs, label="main")
+        self.paligemma(query_sequence=prefix_embs)
         return {}
 
     def _forward_action_gen(
@@ -753,7 +726,6 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
         suffix_out = self.action_expert(
             query_sequence=suffix,
             adarms_cond=adarms_cond,
-            label="main",
         )
 
         velocity = self.action_out_proj(suffix_out)

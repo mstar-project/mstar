@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import math
 import sys
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -255,75 +256,51 @@ class RefActionExpertLayer(nn.Module):
 
 
 class MockKVAttention:
-    """Stands in for the KV + attention resources a layer attends through.
+    """Stands in for the array handle a layer attends through: vanilla SDPA over each layer's history, single request,
+    no paged cache. The rotation is the identity, matching the reference attention above, which also skips RoPE."""
 
-    One object serves as both, mirroring how the engine binds them: the
-    ``AttentionCallable`` writes K/V through the KV resource then calls the
-    attention one, and the accumulated per-layer history is the same state
-    either way. Vanilla SDPA, single request, no paged cache.
-
-    RoPE stays out of it — the ``rope`` key is left unbound so
-    ``ParallelAttention._apply_rope`` short-circuits, matching the reference
-    attention above, which also skips RoPE.
-    """
-
-    requires_kv_write = True
+    label = "main"
+    rope_dtype = None
 
     def __init__(self, scale: float):
         self.scale = scale
-        self._layer_idx = 0
-        self._label = "main"
+        self.positions = SimpleNamespace(apply_qk=lambda q, k, **kwargs: (q, k))
         self._store: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
         self._pending: tuple[torch.Tensor, torch.Tensor] | None = None
         self.write_cache = True
 
-    # --- resource cursors
-
-    @property
-    def default_label(self) -> str:
-        return self._label
-
-    def set_default_label(self, label: str) -> None:
-        self._label = label
-
-    def set_default_layer_idx(self, layer_idx: int) -> None:
-        self._layer_idx = layer_idx
-
-    def layer_view(self):
-        return self._layer_idx
+    def _check_open(self, call: str) -> None:
+        pass
 
     def seed_prefix(self, layer_idx: int, k: torch.Tensor, v: torch.Tensor) -> None:
         """Pre-populate a layer's cache, standing in for a prefill pass."""
         self._store[layer_idx] = (k, v)
 
-    # --- the two calls a layer makes
-
-    def write_kv(self, k: torch.Tensor, v: torch.Tensor) -> None:
+    def add(self, layer: torch.Tensor, *, k: torch.Tensor, v: torch.Tensor) -> None:
         self._pending = (k, v)
 
-    def run(self, q: torch.Tensor, kv_cache_layer, k=None, v=None) -> torch.Tensor:
-        del k, v  # taken from the write above, as the paged backends do
-        assert self._pending is not None, "run without a preceding write_kv"
+    def read(self, layer: torch.Tensor, q: torch.Tensor) -> torch.Tensor:
+        assert self._pending is not None, "read without a preceding add"
         k_new, v_new = self._pending
         self._pending = None
 
-        past = self._store.get(kv_cache_layer)
+        past = self._store.get(int(layer))
         if past is not None:
             k_full = torch.cat([past[0], k_new], dim=0)
             v_full = torch.cat([past[1], v_new], dim=0)
         else:
             k_full, v_full = k_new, v_new
         if self.write_cache:
-            self._store[kv_cache_layer] = (k_full, v_full)
+            self._store[int(layer)] = (k_full, v_full)
         return _sdpa(q, k_full, v_full, scale=self.scale)
 
 
-def _bind_mock_resources(module: nn.Module, handle: MockKVAttention) -> None:
-    """Bind the fake as both KV and attention on every ParallelAttention in
-    ``module``, as the engine does with the real resources."""
+def _bind_mock_handle(module: nn.Module, handle: MockKVAttention) -> None:
+    """Bind the fake as the array's handle on every ParallelAttention in ``module``, as the engine does with the real
+    one."""
     for submodule in module.modules():
         if isinstance(submodule, ParallelAttention):
-            submodule.bind_resources({"attn": handle, "kv": handle})
+            submodule.bind_state({"kv": handle})
 
 
 # ----------------------------------------------------------------------
@@ -495,14 +472,14 @@ def test_action_expert_layer_matches_reference_single_request():
     _randomize_adarms(ref_layer.input_layernorm)
     _randomize_adarms(ref_layer.post_attention_layernorm)
 
-    ours = Pi05ActionExpertLayer(config).to(DEVICE, dtype=MSTAR_DTYPE)
+    ours = Pi05ActionExpertLayer(config, 0).to(DEVICE, dtype=MSTAR_DTYPE)
     _copy_layer(ours, ref_layer)
 
     x = torch.randn(config.action_horizon, config.hidden_size, device=DEVICE, dtype=torch.float32)
     cond = torch.randn(config.hidden_size, device=DEVICE, dtype=torch.float32)
 
     handle = MockKVAttention(scale=config.head_dim ** -0.5)
-    _bind_mock_resources(ours, handle)
+    _bind_mock_handle(ours, handle)
     ours_out = ours(
         hidden_states=x.to(MSTAR_DTYPE),
         adarms_cond=cond.unsqueeze(0).to(MSTAR_DTYPE),
@@ -566,14 +543,13 @@ def test_action_expert_full_stack_matches_reference_against_prefix_kv_cache():
     # Read-only prefix: action_gen attends to the frozen prefill KV without
     # committing its own writes (the KVStep(commit=False) contract).
     handle.write_cache = False
-    _bind_mock_resources(ours, handle)
+    _bind_mock_handle(ours, handle)
 
     suffix = torch.randn(config.action_horizon, config.hidden_size, device=DEVICE, dtype=torch.float32)
     cond = torch.randn(config.hidden_size, device=DEVICE, dtype=torch.float32)
     ours_out = ours(
         query_sequence=suffix.to(MSTAR_DTYPE),
         adarms_cond=cond.unsqueeze(0).to(MSTAR_DTYPE),
-        label="main",
     ).to(torch.float32)
 
     # Reference stack on the same suffix using the same prefix KV cache.

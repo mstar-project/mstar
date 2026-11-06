@@ -20,7 +20,7 @@ from torch import nn
 
 from mstar.model.components import AdaRMSNorm, GatedDecoderLayer
 from mstar.model.components.distributed import ParallelAttention, ParallelGatedMLP
-from mstar.model.pi05.config import LLM_ATTN, LLM_KV, LLM_POS, Pi05Config
+from mstar.model.pi05.config import LLM_KV, LLM_POS, Pi05Config
 
 
 class Pi05TimeMLP(nn.Module):
@@ -46,7 +46,7 @@ class Pi05TimeMLP(nn.Module):
         return nn.functional.silu(h)
 
 
-def Pi05ActionExpertLayer(config: Pi05Config) -> GatedDecoderLayer:
+def Pi05ActionExpertLayer(config: Pi05Config, layer: int) -> GatedDecoderLayer:
     """One action expert decoder layer.
 
     Operates in ``config.action_hidden_size`` (1024 for gemma_300m, 2048
@@ -61,10 +61,9 @@ def Pi05ActionExpertLayer(config: Pi05Config) -> GatedDecoderLayer:
             num_kv_heads=config.num_kv_heads,
             head_dim=config.head_dim,
             input_hidden_size=h,
-            rope_theta=config.rope_theta,
-            attn_key=LLM_ATTN,
             kv_key=LLM_KV,
             pos_key=LLM_POS,
+            layer=layer,
         ),
         mlp=ParallelGatedMLP(
             hidden_size=h,
@@ -87,25 +86,12 @@ class Pi05ActionExpert(nn.Module):
         self.config = config
         h = config.action_hidden_size
         self.layers = nn.ModuleList(
-            [Pi05ActionExpertLayer(config) for _ in range(config.num_layers)]
+            [Pi05ActionExpertLayer(config, layer) for layer in range(config.num_layers)]
         )
         self.norm = AdaRMSNorm(h, cond_dim=h, eps=config.rms_norm_eps)
 
-    def forward(
-        self,
-        query_sequence: torch.Tensor,
-        adarms_cond: torch.Tensor,
-        *,
-        label: str,
-    ) -> torch.Tensor:
-        # The label and layer index are cursors on the shared resources: bind
-        # the label once, advance the index per layer. Passing them as
-        # arguments instead would make inductor specialize on the int.
-        self.layers[0].self_attn.attend.bind_step(label)
-        for layer_idx, layer in enumerate(self.layers):
-            layer.self_attn.attend.set_layer_idx(layer_idx)
-            query_sequence = layer(
-                hidden_states=query_sequence, adarms_cond=adarms_cond,
-            )
+    def forward(self, query_sequence: torch.Tensor, adarms_cond: torch.Tensor) -> torch.Tensor:
+        for layer in self.layers:
+            query_sequence = layer(hidden_states=query_sequence, adarms_cond=adarms_cond)
         out, _ = self.norm(query_sequence, adarms_cond)
         return out

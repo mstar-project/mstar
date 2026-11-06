@@ -17,6 +17,7 @@ import torch
 
 from mstar.conductor.request_info import CurrentForwardConductorMetadata
 from mstar.engine.resources.kv.config import KVSpec
+from mstar.engine.state.adapters import node_resources
 from mstar.graph.base import GraphNode, Loop, Sequential
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.pi05.components.flow_matching import (
@@ -202,7 +203,7 @@ def test_pi05_prefix_scaling_follows_openpi():
     config = Pi05Config(hidden_size=16)
     embed = torch.nn.Embedding(10, 16)
     llm = Pi05LLMSubmodule(embed, torch.nn.Identity(), torch.nn.Identity(), torch.nn.Identity(),
-                           torch.nn.Identity(), torch.nn.Identity(), config)
+                           torch.nn.Identity(), torch.nn.Identity(), config, device="cpu")
     img = torch.randn(6, 16)
     ids = torch.tensor([1, 4, 7])
     with torch.no_grad():
@@ -285,7 +286,7 @@ def test_pi05_action_gen_is_loop_with_action_output_emission():
 def test_pi05_kv_cache_config_matches_pi05_config():
     model = _make_model()
     kv_specs = [
-        spec for spec in model.get_node_resources() if isinstance(spec, KVSpec)
+        spec for spec in node_resources(model) if isinstance(spec, KVSpec)
     ]
     assert len(kv_specs) == 1
     assert kv_specs[0].nodes == {"LLM"}
@@ -545,7 +546,7 @@ def test_pi05_process_prompt_tokenizes_openpi_text():
     assert seen == ["Task: Put the Cup away, State: 192 -1 255;\nAction: "]
     assert result.new_input_tensors["text_inputs"][0].tolist() == [2, 7, 9]
     # the KV layout's text span counts the tokens of that text
-    assert result.metadata["kv_layout"][LLM_KV]["main"].spans[1].length == 3
+    assert result.metadata["state_layout"][LLM_KV]["main"].spans[1].length == 3
 
 
 # ----------------------------------------------------------------------
@@ -778,7 +779,7 @@ def test_pi05_droid_yaml_takes_its_horizon_from_the_checkpoint_config(tmp_path, 
 
 
 @pytest.mark.parametrize("num_images", [1, 2, 3])
-def test_pi05_kv_layout_counts_the_cameras_the_request_sent(num_images):
+def test_pi05_layout_counts_the_cameras_the_request_sent(num_images):
     """The ViT drops the tokens of empty camera slots, so the prefix the KV layout
     declares holds 256 image tokens per camera the request sent."""
     from mstar.model.pi05.config import LLM_KV
@@ -789,7 +790,7 @@ def test_pi05_kv_layout_counts_the_cameras_the_request_sent(num_images):
         prompt="pick", input_modalities=["image", "text"], output_modalities=["action"],
         tensors={"image_inputs": [torch.zeros(3, 4, 4)] * num_images},
     )
-    image_span, text_span = out.metadata["kv_layout"][LLM_KV]["main"].spans
+    image_span, text_span = out.metadata["state_layout"][LLM_KV]["main"].spans
     assert (image_span.length, image_span.advance) == (num_images * 256, num_images * 256)
     assert text_span.length == 1
 

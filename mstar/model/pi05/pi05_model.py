@@ -34,15 +34,7 @@ from mstar.conductor.request_info import (
     CurrentForwardConductorMetadata,
     StreamingConnectionState,
 )
-from mstar.engine.resources import (
-    AttentionConfig,
-    AttentionSpec,
-    KVSpec,
-    NodeResourceSpec,
-    PagedKVConfig,
-    PositionConfig,
-    PositionSpec,
-)
+from mstar.engine.state import Array, Attend, Bidirectional, KVEntry, Layout, Positions, Read, Rope, Span
 from mstar.graph.base import (
     GraphEdge,
     GraphNode,
@@ -55,10 +47,8 @@ from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import (
     ForwardPassArgs,
     KVLabel,
-    LabelLayout,
     Model,
     ProcessPromptOutput,
-    Span,
     TensorAndMetadata,
 )
 from mstar.model.loader import LLAMA_STACKED_PARAMS, load_hf_weights
@@ -72,7 +62,6 @@ from mstar.model.pi05.components.tokenization import Pi05Tokenizer, pi05_prompt
 from mstar.model.pi05.config import (
     LLM_ATTN,
     LLM_KV,
-    LLM_POS,
     Pi05Config,
     load_pi05_config,
 )
@@ -430,32 +419,20 @@ class Pi05Model(Model):
     # Model ABC: structure
     # ------------------------------------------------------------------
 
-    def get_node_resources(self) -> list[NodeResourceSpec]:
-        """LLM paged KV + attention/position. vit_encoder is stateless.
-
-        No sampler: actions come from flow matching, not token sampling. The
-        action expert shares this KV cache with PaliGemma (same head dims), and
-        ``action_gen`` reads the frozen prefix read-only via ``KVStep(commit=
-        False)`` while ``prefill`` commits it.
-        """
-        kv_config = PagedKVConfig(
-            num_layers=self.config.num_layers,
-            num_kv_heads=self.config.num_kv_heads,
-            head_dim=self.config.head_dim,
-            max_seq_len=self.config.max_position_embeddings,
-            num_qo_heads=self.config.num_qo_heads,
-        )
-        return [
-            KVSpec(resource_key=LLM_KV, nodes={"LLM"}, config=kv_config),
-            AttentionSpec(
-                resource_key=LLM_ATTN, nodes={"LLM"},
-                config=AttentionConfig(kv_cache=LLM_KV),
-            ),
-            PositionSpec(
-                resource_key=LLM_POS, nodes={"LLM"},
-                config=PositionConfig(kv_cache=LLM_KV),
-            ),
-        ]
+    def declare_state(self) -> list[Array]:
+        """One cache for both experts. PaliGemma keeps the prefix, image rows and text ids in one segment that sees
+        itself whole, and the action expert adds its tokens as scratch, which see the prefix and each other. vit_encoder
+        is stateless, and actions come from flow matching, so there is no sampler."""
+        c = self.config
+        return [Array(
+            LLM_KV, nodes={"LLM"}, layers=frozenset(range(c.num_layers)),
+            entry=KVEntry(heads=c.num_kv_heads, head_dim=c.head_dim), max_len=c.max_position_embeddings,
+            # Factors of 1 scale nothing, and setting them picks flashinfer's Llama 3.1 kernel over its plain one.
+            positions=Positions(rope=Rope(
+                theta=c.rope_theta, low_freq_factor=1.0, high_freq_factor=1.0, old_context_len=8192,
+            )),
+            reads={LLM_ATTN: Read(mask=Bidirectional(), op=Attend(q_heads=c.num_qo_heads))},
+        )]
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         # Pi0.5 encodes the robot state as a decimal-string suffix on the
@@ -562,14 +539,14 @@ class Pi05Model(Model):
         if not images:
             raise ValueError("a pi0.5 request needs at least one camera image")
         image_rows = images * (cfg.vit_image_size // cfg.vit_patch_size) ** 2
-        layout = LabelLayout(
+        layout = Layout(
             spans=(
                 Span("rows", self.PREFILL_WALK, image_rows, image_rows, "img_emb"),
                 Span("ids", self.PREFILL_WALK, text_ids.numel(), text_ids.numel(), "text_inputs"),
             ),
             scratch=cfg.action_horizon,
         )
-        return ProcessPromptOutput({"text_inputs": [text_ids]}, {"kv_layout": {LLM_KV: {"main": layout}}})
+        return ProcessPromptOutput({"text_inputs": [text_ids]}, {"state_layout": {LLM_KV: {"main": layout}}})
 
     def load_image(self, filepath: str, device: str) -> TensorAndMetadata:
         """The decoded RGB camera image, left uint8 ``(C, H, W)``: the ViT step
@@ -707,6 +684,7 @@ class Pi05Model(Model):
                 action_out_proj=self.action_out_proj,
                 time_mlp=self.time_mlp,
                 config=self.config,
+                device=device,
             )
         return None
 
