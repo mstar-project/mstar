@@ -20,6 +20,7 @@ PORTED = (
     "mstar/model/qwen3_5", "mstar/model/command_a_plus", "mstar/model/wan22", "mstar/model/flux2_klein",
     "mstar/model/z_image", "mstar/model/ltx2_5", "mstar/model/qwen3_omni", "mstar/model/canary_qwen",
     "mstar/model/qwen3_asr", "mstar/model/parakeet", "mstar/model/fish_s2_pro",
+    "mstar/model/qwen3_tts",
 )
 FORBIDDEN_ATTRIBUTES = {
     "node_resources", "resources", "request_state", "per_request_states",
@@ -32,8 +33,9 @@ ALLOWED = {
     ("mstar.engine.accelerator_graph_config", name): _CAPTURE
     for name in (
         "AcceleratorGraphConfig", "BatchedAcceleratorGraphConfig", "DETERMINISTIC_COMPILE_MODE",
-        "PackedAcceleratorGraphConfig", "PiecewiseAcceleratorGraphConfig", "PiecewiseCallInputs",
-        "PiecewiseCaptureShape", "PiecewisePackedConfig", "decode_rows_then_prompt", "geometric_batch_sizes",
+        "PackedAcceleratorGraphConfig", "PiecewiseAcceleratorGraphConfig", "PiecewiseBatchedConfig",
+        "PiecewiseCallInputs", "PiecewiseCaptureShape", "PiecewisePackedConfig", "decode_rows_then_prompt",
+        "geometric_batch_sizes",
     )
 } | {
     ("mstar.engine.resources.spec", "CombinedSplit"): "a value of kernel_settings(), until the engine picks kernels",
@@ -44,6 +46,8 @@ ALLOWED = {
 ALLOWED_BREAKS = {
     ("mstar/model/qwen3_omni/submodules.py", "_replay_block_loop"): "a captured region's replay, which is eager whole",
     ("mstar/model/qwen3_omni/components/code2wav.py", "forward"): "the vocoder's transformer, which keeps no state",
+    ("mstar/model/qwen3_tts/components/depth_frame/frame.py", "run"):
+        "the depth kernel's Gluon launch, which a compiled decode can't trace; no state call sits behind it",
 }
 
 
