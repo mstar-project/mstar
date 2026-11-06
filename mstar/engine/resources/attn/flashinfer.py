@@ -105,6 +105,30 @@ class FlashInferManager(PlacedAttention):
         self._group = self._kv_config.groups[self._group_idx]
         self._wrapper_kv_kwargs["page_size"] = self._group.page_size
         super().bind_dependencies(resources)
+        if self._group_idx != 0 and isinstance(resources[self._kv_cache_name].placement, SPPlacement):
+            # a window's layers are whole on every partner, so not placed, but they prefill in the
+            # same SP-placed node's lockstep steps: the same fa2 rule
+            self._check_fa2_over_sp()
+
+    def _check_fa2_over_sp(self) -> None:
+        """Over an SP-placed pool: one such server hung at its first 32k prefill on fa2 and the cause
+        isn't known, so fa2 is refused on SM90, where fa3 runs, and warned of where it is the only
+        kernel. Read from the config and the GPU, so every rank of the node decides alike."""
+        capability = current_platform.cuda_capability(self._device)
+        # FlashInfer has fa3 for SM90 only (`_check_window_pool`)
+        fa3 = capability is not None and capability[0] == 9
+        if self._wrapper_kv_kwargs["backend"] == "fa2" and fa3:
+            raise ValueError(
+                f"attention over KV pool {self._kv_cache_name!r}: flashinfer_backend 'fa2' is refused over an "
+                "SP-placed pool on SM90 after an unexplained one-off lockstep hang in its prefill; use 'auto' "
+                "or 'fa3'"
+            )
+        if capability is not None and not fa3 and self._wrapper_kv_kwargs["backend"] in ("auto", "fa2"):
+            logger.warning(
+                "attention over SP-placed KV pool %r prefills on FlashInfer's fa2 kernel, the only one a placed "
+                "pool allows off SM90; an unexplained one-off lockstep hang in an fa2 prefill is still open",
+                self._kv_cache_name,
+            )
 
     def _bind_placement(self, geometry: dict[str, int]) -> None:
         if geometry["num_qo_heads"] != self._kv_config.num_qo_heads and not self._decode_tensor_cores:
@@ -121,10 +145,7 @@ class FlashInferManager(PlacedAttention):
                 "attention over context-parallel KV pool %r decodes on FlashInfer's paged kernel although "
                 "decode_fmha is on: the merge needs each partial's lse", self._kv_cache_name,
             )
-        over_sp = isinstance(self._placement, SPPlacement)
         capability = current_platform.cuda_capability(self._device)
-        # FlashInfer has fa3 for SM90 only (`_check_window_pool`)
-        fa3 = capability is not None and capability[0] == 9
         if capability is not None and capability >= (10, 0) and self._wrapper_kv_kwargs["backend"] == "auto":
             # from SM100 auto can send short rows to cuDNN, whose lse the merge isn't known to
             # read right (`_check_window_pool` resolves it the same way)
@@ -133,21 +154,8 @@ class FlashInferManager(PlacedAttention):
                 "attention over context-parallel KV pool %r plans on fa2 for flashinfer_backend 'auto'",
                 self._kv_cache_name,
             )
-        # one SP-placed server hung at its first 32k prefill on fa2 and the cause isn't known. Read
-        # from the config and the GPU, so every rank of the node decides alike
-        if over_sp and self._wrapper_kv_kwargs["backend"] == "fa2" and fa3:
-            raise ValueError(
-                f"attention over KV pool {self._kv_cache_name!r}: flashinfer_backend 'fa2' is refused over an "
-                "SP-placed pool on SM90 after an unexplained one-off lockstep hang in its prefill; use 'auto' "
-                "or 'fa3'"
-            )
-        if (over_sp and capability is not None and not fa3
-                and self._wrapper_kv_kwargs["backend"] in ("auto", "fa2")):
-            logger.warning(
-                "attention over SP-placed KV pool %r prefills on FlashInfer's fa2 kernel, the only one a placed "
-                "pool allows off SM90; an unexplained one-off lockstep hang in an fa2 prefill is still open",
-                self._kv_cache_name,
-            )
+        if isinstance(self._placement, SPPlacement):
+            self._check_fa2_over_sp()
         self._wrapper_kv_kwargs.update(geometry)
         cfg = self._kv_config
         self._new_kwargs = dict(

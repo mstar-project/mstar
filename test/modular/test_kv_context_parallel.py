@@ -1538,6 +1538,45 @@ def test_fa2_over_an_sp_placed_pool(monkeypatch, caplog, over_sp, capability, ba
     assert any("fa2" in r.getMessage() for r in caplog.records) == (outcome == "warned")
 
 
+@pytest.mark.parametrize("capability, backend, outcome", [
+    ((9, 0), "fa2", "refused"), ((9, 0), "auto", "quiet"), ((10, 0), "auto", "warned"),
+])
+def test_fa2_over_an_sp_placed_pool_holds_for_a_windows_layers(monkeypatch, caplog, capability, backend, outcome):
+    """A window's layers are whole on every partner, so not placed, but they prefill in the SP-placed
+    node's lockstep steps: the same rule as the placed layers."""
+    monkeypatch.setenv("MSTAR_WORKSPACE_BUFFER_MB", "1")
+    platform = types.SimpleNamespace(cuda_capability=lambda device=None: capability)
+    monkeypatch.setattr(fi_mod, "current_platform", platform)
+    monkeypatch.setattr(AttentionManager, "_check_window_pool", staticmethod(
+        lambda spec, device: "fa2" if capability >= (10, 0) and backend == "auto" else backend,
+    ))
+    joint = JointGroups(tp_group=CommGroup.trivial(), sp_group=_group(0, P))
+    kv = KVSpec(resource_key="kv", nodes={NODE}, config=PagedKVConfig(
+        num_layers=2, num_kv_heads=1, head_dim=HEAD_DIM, max_seq_len=64, num_qo_heads=Q_HEADS,
+        max_num_pages=16, page_size=2 * CP_PAGE, context_parallel=True,
+    ))
+    specs = resolve_spec_dependencies([
+        kv,
+        AttentionSpec(resource_key="full", nodes={NODE}, config=AttentionConfig(kv_cache="kv")),
+        AttentionSpec(resource_key="window", nodes={NODE}, config=AttentionConfig(
+            kv_cache="kv", sliding_window=3, layers=(1,), flashinfer_backend=backend,
+        )),
+    ])
+    window = specs["window"]
+    info = EngineResourceInfo(device=CPU, joint_comm_group=joint, kv_dtype=torch.float32, head_shards=1,
+                              dependencies={"kv": kv})
+    attn = AttentionManager.build(window, info)
+    resources = {"kv": types.SimpleNamespace(placement=kv.config.place(joint, "kv"))}
+    if outcome == "refused":
+        with pytest.raises(ValueError, match="'fa2' is refused over an SP-placed pool on SM90"):
+            attn.bind_dependencies(resources)
+        return
+    with caplog.at_level(logging.WARNING, logger=fi_mod.logger.name):
+        attn.bind_dependencies(resources)
+    assert attn._placement is None
+    assert any("fa2" in r.getMessage() for r in caplog.records) == (outcome == "warned")
+
+
 def test_tp_placed_decode_runs_on_tensor_cores_whatever_decode_tensor_cores_says(monkeypatch):
     """A rank attends every partner's query heads over one KV head, a GQA group FlashInfer's
     CUDA-core decode has no kernel for unless it is one of a few sizes."""

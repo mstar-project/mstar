@@ -2723,7 +2723,8 @@ the same state on every SP partner) do; dense, flex, XPU and MLA (``flashinfer_m
 cross-attention and DSA don't, and a ring or bounded KV pool can't set the key. A
 ``sliding_window`` kept in its own group of layers stays whole on every partner, in pages of
 ``1/P`` its unplaced tokens (which must be whole), while the full layers stripe; a window at
-least ``max_seq_len`` reads the placed layers and is refused there. A decode/prefill ``splits``
+least ``max_seq_len`` reads the placed layers and is refused there. The ``fa2`` rule above holds
+for the window's attention too. A decode/prefill ``splits``
 and ``decode_fmha`` are ignored over a placed pool, and a node over one plans on the host rather
 than resident (``resident_planning``). A node that captures a step combining labels into one plan
 (``KVStep.combined_labels``, as classifier-free guidance does) at a batch size above 1 is refused
