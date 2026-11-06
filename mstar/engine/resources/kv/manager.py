@@ -4727,7 +4727,7 @@ class KVManager(AttentionResource):
                 return 1
         longest = max((
             self._streams[s.request_id][s.label].stored_len for s in step.segments
-            if s.label in self._streams.get(s.request_id, ())
+            if s.span and s.label in self._streams.get(s.request_id, ())
         ), default=0)
         # past max_seq_len a position has no row in a table sized by it, whatever the pages hold
         reach = min(self.config.max_seq_len, self.config.request_pages * page_size)

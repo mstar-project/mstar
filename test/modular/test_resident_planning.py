@@ -939,7 +939,7 @@ def test_a_run_past_a_rows_cap_stays_inside_the_rows_table():
     kv._index = None
     kv.config = SimpleNamespace(max_seq_len=10 * PAGE, request_pages=100)
     kv._streams = {1: {"main": SimpleNamespace(stored_len=10 * PAGE - 5)}}
-    step = SimpleNamespace(segments=[SimpleNamespace(request_id=1, label="main")])
+    step = SimpleNamespace(segments=[SimpleNamespace(request_id=1, label="main", span=1)])
     assert kv.max_repeats(step, SimpleNamespace(request_ids=(1,), repeats=3, resident=object())) == 2
     kv._streams[1]["main"].stored_len = 10 * PAGE
     assert kv.max_repeats(step, SimpleNamespace(request_ids=(1,), repeats=3, resident=object())) == 1
@@ -947,6 +947,10 @@ def test_a_run_past_a_rows_cap_stays_inside_the_rows_table():
     kv.config.max_seq_len = 10 * PAGE - 3
     kv._streams[1]["main"].stored_len = 10 * PAGE - 8
     assert kv.max_repeats(step, SimpleNamespace(request_ids=(1,), repeats=3, resident=object())) == 2
+    # a full stream the step only reads goes nowhere: Whisper's cross KV holds max_seq_len frames
+    kv._streams[1]["main"].stored_len = kv.config.max_seq_len
+    step.segments[0].span = 0
+    assert kv.max_repeats(step, SimpleNamespace(request_ids=(1,), repeats=3, resident=object())) > 3
 
 
 def test_a_step_its_resources_held_to_one_iteration_moves_its_rows_by_one():
