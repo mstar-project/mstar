@@ -91,12 +91,12 @@ class RepeatingSteps:
         (`_unchained_refusal`)."""
         if self._step_repeats is None or not self._step_repeats.asked:
             return 1
-        key = (batch.node_name, batch.graph_walk)
-        edges = self._step_repeats.edges.get(key)
-        if edges is None:
+        # the runtime's name for the Loop: ``LoopEdges.loop`` is a build of its own
+        loop = self._innermost_loop_by_node.get((batch.graph_walk, batch.node_name))
+        if loop is None:
             return 1
         return self._step_repeats.unchained_ceiling(batch, lambda: self._graph_runtime.loop_room(
-            batch.node_name, batch.graph_walk, edges.loop, list(batch.request_to_worker_graph), 0,
+            batch.node_name, batch.graph_walk, loop, list(batch.request_to_worker_graph), 0,
             self._step_repeats.config(batch.node_name).past_cap,
         ))
 

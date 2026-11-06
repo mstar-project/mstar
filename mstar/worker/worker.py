@@ -904,10 +904,11 @@ class Worker(RepeatingSteps):
         # stream-terminated loop and refusing an END_PARTITION from inside a
         # loop in _postprocess_batch. Structural, so it is derived from the
         # model here rather than asked of the graph runtime per step.
-        if model:
-            self._innermost_loop_by_node = self._build_innermost_loop_cache(
-                model.get_graph_walk_graphs(),
-            )
+        # Named as the runtime holds them: it got these worker graphs, and a Loop without a
+        # name of its own draws a fresh one each time the model builds its walks.
+        self._innermost_loop_by_node = self._build_innermost_loop_cache(
+            (walk, wg.section) for wg in my_worker_graphs for walk in wg.graph_walks
+        )
         walk_graphs = self._walk_graphs = model.get_graph_walk_graphs() if model else {}
         # (node, walk) -> the stop, signal and modality of what it streams
         self._streamed: dict[tuple[str, str], tuple] = {}
@@ -939,9 +940,10 @@ class Worker(RepeatingSteps):
 
     @staticmethod
     def _build_innermost_loop_cache(
-        walks: dict[str, GraphSection],
+        walks: Iterable[tuple[str, GraphSection]],
     ) -> dict[tuple[str, str], str]:
-        """Map each ``(graph_walk, node)`` to its innermost enclosing loop.
+        """Map each ``(graph_walk, node)`` of ``walks``' (walk, section) pairs to
+        its innermost enclosing loop.
 
         The innermost one is the candidate with no other candidate strictly
         inside it. Replaces reading ``loop_name_order[-1]`` off the per-request
@@ -949,7 +951,7 @@ class Worker(RepeatingSteps):
         state sits behind the ``GraphRuntime`` contract.
         """
         cache: dict[tuple[str, str], str] = {}
-        for walk_name, section in walks.items():
+        for walk_name, section in walks:
             loops = section.get_loops()
             for node_name in section.get_nodes():
                 enclosing = {

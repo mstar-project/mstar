@@ -1032,11 +1032,40 @@ def test_a_step_of_a_node_that_never_chains_repeats_where_the_scheduler_picks_it
     worker = Worker.__new__(Worker)
     worker._step_repeats = StepRepeats({"n": RepeatConfig(max=8)}, {("n", WALK): edges})
     worker._step_repeats.settle(lambda *key: None, lambda *key: None)
+    worker._innermost_loop_by_node = {(WALK, "n"): "loop"}
     asked = []
     worker._graph_runtime = SimpleNamespace(loop_room=lambda *args: asked.append(args) or 3)
     batch = ScheduledBatch(node_name="n", graph_walk=WALK, request_to_worker_graph=dict(rows))
     assert worker._unchained_repeats(batch) == (1 if chained else 3)
     assert asked == ([] if chained else [("n", WALK, "loop", [0, 1], 0, False)])
+
+
+def test_an_unnamed_loop_is_asked_about_by_the_name_the_runtime_holds():
+    """A Loop without a name draws a fresh one each time the model builds its walks,
+    and the runtime holds the worker graphs' build. pi0.5's action loop is one: its
+    unchained steps asked about a name the runtime didn't know, got no room, and ran
+    one iteration under a "repeats on" line."""
+    from mstar.graph.base import GraphEdge, GraphNode, Loop
+    from mstar.model.base import WorkerGraph
+    from mstar.worker.step_repeats import walk_edges
+
+    def build():
+        node = GraphNode(
+            name="n", input_names=["t"], outputs=[GraphEdge(next_node="n", name="t")], enable_async_scheduling=False,
+        )
+        return {WALK: Loop(section=node, max_iters=10, outputs=[])}
+
+    held = WorkerGraph(section=build()[WALK], graph_walks={WALK})
+    worker = Worker.__new__(Worker)
+    worker._innermost_loop_by_node = Worker._build_innermost_loop_cache(
+        (walk, wg.section) for wg in [held] for walk in wg.graph_walks
+    )
+    worker._step_repeats = StepRepeats({"n": RepeatConfig(max=8)}, walk_edges(build(), [("n", WALK)]))
+    worker._step_repeats.settle(lambda *key: None, lambda *key: None)
+    names = {held.section.name: 10}
+    worker._graph_runtime = SimpleNamespace(loop_room=lambda node, walk, loop, *rest: names.get(loop, 0))
+    batch = ScheduledBatch(node_name="n", graph_walk=WALK, request_to_worker_graph={0: 0})
+    assert worker._unchained_repeats(batch) == 8
 
 
 @pytest.mark.parametrize("state, streamed, why", [
@@ -2800,7 +2829,8 @@ def test_qwen35s_resident_set_is_derived_as_its_decode_walk():
 
     model = object.__new__(Qwen3_5DenseModel)
     model.config = SimpleNamespace(max_position_embeddings=4096)
-    looped = {walk for walk, node in Worker._build_innermost_loop_cache(model.get_graph_walk_graphs()) if node == "LLM"}
+    walks = model.get_graph_walk_graphs().items()
+    looped = {walk for walk, node in Worker._build_innermost_loop_cache(walks) if node == "LLM"}
     _, llm = _qwen35_llm()
     runner = AcceleratorGraphRunner.__new__(AcceleratorGraphRunner)
     runner._capture_configs = object.__new__(llm).get_accelerator_graph_configs(CPU)
