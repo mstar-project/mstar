@@ -168,14 +168,13 @@ class Table:
         bound = math.inf
         live = self.live = self._live()
         rank = self._q[self._mine + _RANK]
-        for slot in live:
+        meets = [self._q[_HEADER + slot * _WORDS + _MEET] for slot in live]  # one reading of them all
+        for slot, meet in zip(live, meets, strict=True):
             base = _HEADER + slot * _WORDS
             if not self._d[base + _CLOCK]:  # (0: it has yet to publish)
                 continue
-            meet = self._q[base + _MEET]
             if meet:
-                arrived = sum(self._q[_HEADER + s * _WORDS + _MEET] == meet for s in live)
-                if rank or not (self._q[base + _RUNNING] or arrived >= meet & 0xFF):
+                if rank or not (self._q[base + _RUNNING] or meets.count(meet) >= meet & 0xFF):
                     continue
                 bound = min(bound, self._d[base + _CLOCK])
             elif self._q[base + _RUNNING]:
