@@ -324,7 +324,8 @@ class Admission:
 
     def _leave(self, rid: str, keys: Collection[str]) -> None:
         """Take ``rid`` out of the queues of ``keys``. A queue it was first in drops its mark,
-        which measured ``rid``, and its next request is left for `admit_waiting` to try."""
+        which measured ``rid``, and its next request is left for `admit_waiting` to try as a first
+        request, even if a resource refused it while it passed."""
         self._placed.discard(rid)
         if rid in self._returns:
             del self._returns[rid]
@@ -336,6 +337,7 @@ class Admission:
                 self._short.pop(key, None)
                 if len(queue) > 1:
                     self._untried = True
+                    self._unrefuse(queue[1])
             queue.remove(rid)
 
     def _unrefuse(self, rid: str) -> None:
