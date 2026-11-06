@@ -925,6 +925,7 @@ class Worker(RepeatingSteps):
             parse_step_repeats(
                 (model_config or {}).get("step_repeats"),
                 {node for section in walk_graphs.values() for node in section.get_nodes()},
+                walks=walk_graphs,
             ),
             walk_edges(
                 walk_graphs, [(node, walk) for walk, node in self._innermost_loop_by_node if (node, walk) in my_walks],

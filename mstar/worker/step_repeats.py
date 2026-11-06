@@ -115,7 +115,9 @@ class RepeatConfig:
         return config
 
 
-def parse_step_repeats(block: object, nodes: Collection[str]) -> dict[str, RepeatConfig]:
+def parse_step_repeats(
+    block: object, nodes: Collection[str], *, walks: Mapping[str, object] | None = None,
+) -> dict[str, RepeatConfig]:
     """The serving config's ``step_repeats:`` block, node -> its settings."""
     if block is None:
         return {}
@@ -123,7 +125,14 @@ def parse_step_repeats(block: object, nodes: Collection[str]) -> dict[str, Repea
         raise ValueError(f"step_repeats must map node names to settings, got {block!r}")
     if unknown := sorted(set(block) - set(nodes)):
         raise ValueError(f"step_repeats names {unknown}, which are not nodes of the model")
-    return {node: RepeatConfig.parse(node, settings) for node, settings in block.items()}
+    configs = {node: RepeatConfig.parse(node, settings) for node, settings in block.items()}
+    if walks is not None:
+        for node, config in configs.items():
+            if config.device_stop != "off" and not any(
+                loop_edges(section, node) is not None for section in walks.values()
+            ):
+                raise ValueError(f"{node}: requested device_stop cannot run: the node has no Loop")
+    return configs
 
 
 def edge_refusal(edges: LoopEdges, windowed: Collection[str] = (), parallel: bool = False) -> str | None:

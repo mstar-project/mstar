@@ -926,6 +926,18 @@ def test_an_eager_tp_fallback_cannot_change_a_broadcast_count(fallback, authorit
         assert ctx.repeats == 1
 
 
+def test_explicit_device_stop_requires_a_loop_in_the_whole_model():
+    from mstar.graph.base import GraphNode, Loop
+
+    node = GraphNode(name="n", input_names=[], outputs=[])
+    config = {"n": {"max": 4, "device_stop": "skip"}}
+    with pytest.raises(ValueError, match="device_stop.*Loop"):
+        parse_step_repeats(config, {"n"}, walks={"prefill": node})
+    # A prefill-only worker still accepts a node whose loop runs elsewhere.
+    walks = {"prefill": node, "decode": Loop(section=node, max_iters=8, outputs=[])}
+    assert parse_step_repeats(config, {"n"}, walks=walks)["n"].device_stop == "skip"
+
+
 def test_each_node_asks_for_its_own_repeats():
     configs = parse_step_repeats({"thinker": {"max": 4}, "talker": {"max": 1}}, {"thinker", "talker", "codec"})
     assert configs == {"thinker": RepeatConfig(max=4), "talker": RepeatConfig()}
