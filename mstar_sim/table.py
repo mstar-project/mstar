@@ -34,7 +34,8 @@ _HEADER = 8  # words before the first slot: the second is how many slots were ev
 _LIVE_FOR = 0.05  # real seconds a look at who is alive stands: a peer's death takes this long to see
 _real = time.perf_counter  # (bound here, before the emulator patches it)
 _SIZE = (_HEADER + SLOTS * _WORDS) * 8
-_SYS_FUTEX, _FUTEX_WAIT, _FUTEX_WAKE = 202, 0, 1
+_SYS_FUTEX = {"x86_64": 202, "aarch64": 98}[os.uname().machine]
+_FUTEX_WAIT, _FUTEX_WAKE = 0, 1
 _libc = ctypes.CDLL(None, use_errno=True)
 _libc.syscall.restype = ctypes.c_long
 _F_OFD_GETLK, _F_OFD_SETLK, _F_OFD_SETLKW = 36, 37, 38
