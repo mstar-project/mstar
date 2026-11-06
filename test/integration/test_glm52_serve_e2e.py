@@ -230,7 +230,7 @@ class _Serve:
             resource.cleanup()
 
 
-def _run_generation(model, submodule, cfg, prompt_ids, max_tokens):
+def _run_generation(model, submodule, prompt_ids, max_tokens):
     """The real serve loop: prefill -> decode to the request's loop cap or a
     stop, all through ``forward_batched`` and the sampler resource (greedy)."""
     serve = _Serve(model, submodule)
@@ -305,7 +305,7 @@ def test_serve_path_prefill_decode_loop_fp8(tmp_path):
     assert torch.isfinite(logits).all()
 
     MAX_TOKENS = 6
-    generated = _run_generation(model, submodule, cfg, prompt_ids, MAX_TOKENS)
+    generated = _run_generation(model, submodule, prompt_ids, MAX_TOKENS)
 
     assert len(generated) == MAX_TOKENS, generated  # max_tokens counts the prefill-emitted token (vLLM semantics)
     assert all(0 <= t < cfg.vocab_size for t in generated), generated
@@ -322,7 +322,7 @@ def test_serve_path_is_deterministic_fp8(tmp_path):
     prompt_ids = model.process_prompt("serve", ["text"], ["text"]).new_input_tensors["text_inputs"][0].to(DEVICE)
 
     runs = [
-        _run_generation(model, submodule, model.config, prompt_ids, max_tokens=5)
+        _run_generation(model, submodule, prompt_ids, max_tokens=5)
         for _ in range(2)
     ]
     assert runs[0] == runs[1], runs

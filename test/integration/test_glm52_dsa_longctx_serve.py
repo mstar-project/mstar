@@ -295,7 +295,7 @@ def test_dsa_longctx_decode_past_topk(tmp_path):
 
     prompt_ids = torch.arange(10, 10 + PROMPT_LEN, device=DEVICE)
 
-    # ---- (1) the sparse path serves and stops cleanly ------------------
+    # ---- (1) the sparse path serves to the loop cap ------------------
     generated, stored, tracked = _generate_greedy(
         model, submodule, prompt_ids, MAX_TOKENS)
     assert len(generated) == MAX_TOKENS, generated  # max_tokens counts the prefill-emitted token (vLLM semantics)
