@@ -391,6 +391,7 @@
 <li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.qwen3_asr.repetition.html">mstar.model.qwen3_asr.repetition</a></li>
 </ul>
 </details></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.model.rebuild.html">mstar.model.rebuild</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.model.submodule_base.html">mstar.model.submodule_base</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.model.utils.html">mstar.model.utils</a></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="../_autosummary/mstar.model.vjepa2.html">mstar.model.vjepa2</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -467,7 +468,9 @@
 <li class="toctree-l2 has-children"><a class="reference internal" href="../_autosummary/mstar.worker.html">mstar.worker</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.worker.batch_builder.html">mstar.worker.batch_builder</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.worker.chunk_loops.html">mstar.worker.chunk_loops</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.worker.host_pool.html">mstar.worker.host_pool</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.worker.node_manager_utils.html">mstar.worker.node_manager_utils</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.worker.rebuild.html">mstar.worker.rebuild</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.worker.rid_table.html">mstar.worker.rid_table</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.worker.side_steps.html">mstar.worker.side_steps</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.worker.spec_rows.html">mstar.worker.spec_rows</a></li>
@@ -814,9 +817,9 @@
 <td><p>its KV comes from an encoder’s output, freed after prefill</p></td>
 </tr>
 <tr class="row-odd"><td><p>4</p></td>
-<td><p>No kept ids on its node</p></td>
+<td><p>No rebuild policy on its node</p></td>
 <td><p>guaranteed there</p></td>
-<td><p>the node has no ids to rebuild from, as when its decode reads embeddings</p></td>
+<td><p>the model declares no way to rebuild the node’s KV, as when its decode reads embeddings</p></td>
 </tr>
 <tr class="row-even"><td><p>5</p></td>
 <td><p>Only <code class="docutils literal notranslate"><span class="pre">ids</span></code> spans</p></td>
@@ -952,14 +955,15 @@
 <section id="the-drop">
 <h2>4. The drop<a class="headerlink" href="#the-drop" title="Link to this heading">#</a></h2>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">class</span><span class="w"> </span><span class="nc">KVManager</span><span class="p">:</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">drop</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">rid</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">drop</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">rid</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">tokens</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">"""Take rid's KV off the GPU without copying it, and return the number</span>
 <span class="sd">        of pages that reach the free list. Keyed pages stay in the index as</span>
-<span class="sd">        evictable pages. Needs no host pool."""</span>
+<span class="sd">        evictable pages. Needs no host pool. tokens is what rid's rebuild</span>
+<span class="sd">        writes from its kept ids."""</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">is_resident</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">rid</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
-<span class="w">        </span><span class="sd">"""False while rid is offloaded, and from its drop until its rebuild</span>
-<span class="sd">        step lands."""</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">residency</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">rid</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Residency</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""ON_HOST while rid is offloaded, DROPPED from its drop until its</span>
+<span class="sd">        rebuild lands, and RESIDENT otherwise."""</span>
 </pre></div>
 </div>
 <p>A drop releases the request’s whole reservation. <code class="docutils literal notranslate"><span class="pre">KVManager.check_drop</span></code> refuses:</p>
@@ -969,6 +973,7 @@
 <li><p>one not yet decoding</p></li>
 <li><p>one with a host copy</p></li>
 <li><p>one with a step, a KV read or a sample in flight, until that lands</p></li>
+<li><p>one whose rebuild would write other than the tokens its KV holds</p></li>
 </ul>
 <p>At a drop, the other resources:</p>
 <div class="pst-scrollable-table-container"><table class="table">
@@ -987,8 +992,14 @@
 <tr class="row-even"><td><p>Qwen3.5’s recurrent state</p></td>
 <td><p>zeroed in place, and the request keeps its slot, so its rebuild never waits for one</p></td>
 </tr>
-<tr class="row-odd"><td><p>Everything else</p></td>
-<td><p>kept, as an offload keeps it</p></td>
+<tr class="row-odd"><td><p>Attention</p></td>
+<td><p>kept, since it holds no state a rebuild writes again</p></td>
+</tr>
+<tr class="row-even"><td><p>LoRA adapter pool</p></td>
+<td><p>kept, so the rebuild runs under the request’s adapter, which keeps its slot</p></td>
+</tr>
+<tr class="row-odd"><td><p>Anything else</p></td>
+<td><p>refused at load: a node with a rebuild policy needs every resource it holds to support a drop (<code class="docutils literal notranslate"><span class="pre">Resource.supports_drop</span></code>)</p></td>
 </tr>
 </tbody>
 </table>
@@ -1021,16 +1032,16 @@
 <td><p>not resident, in the queue at its arrival position, no reservation</p></td>
 </tr>
 <tr class="row-even"><td><p>rebuilding</p></td>
-<td><p>not resident, out of the queue, holding its return reservation, its rebuild row queued or in a step</p></td>
+<td><p>not resident, out of the queue, holding its return reservation, its rebuild under way in the worker’s log</p></td>
 </tr>
 </tbody>
 </table>
 </div>
-<p>No field holds the state: residency, the queue and the rebuild queue tell the three apart.</p>
+<p>No field holds the state: residency, the queue and the log’s rebuilds tell the three apart.</p>
 <p>Lifecycle:</p>
 <ul class="simple">
-<li><p>A rebuilding request can be chosen again. Its queued row leaves the queue, and it gives up its return reservation and waits in the queue again.</p></li>
-<li><p>Removing a request in any state releases its earmark, its place in the queue, its return reservation, its queued rebuild row and its kept ids. A removal during a rebuild step waits for the step.</p></li>
+<li><p>A rebuilding request is never chosen again: its residency stays dropped until the rebuild lands, and the KV refuses a second drop until then.</p></li>
+<li><p>Removing a request in any state releases its earmark, its place in the queue, its return reservation, its rebuild and its kept ids. A removal during a step that holds a rebuild row waits for the step.</p></li>
 </ul>
 </section>
 <section id="the-return-check">
@@ -1043,7 +1054,7 @@
        <span class="k">with</span> <span class="n">every</span> <span class="n">hit</span> <span class="n">charged</span> <span class="k">as</span> <span class="n">fresh</span>
 </pre></div>
 </div>
-<p>When it passes, V reserves <code class="docutils literal notranslate"><span class="pre">need(V)</span></code> and its rebuild row is queued.</p>
+<p>When it passes, V reserves <code class="docutils literal notranslate"><span class="pre">need(V)</span></code> and readiness starts its rebuild.</p>
 <p>Why this shape:</p>
 <ul class="simple">
 <li><p><strong>A whole history and a page, not the prompt.</strong> A victim readmitted once its prompt fit would take back its own pages, and R would fail again.</p></li>
@@ -1053,24 +1064,28 @@
 </section>
 <section id="the-rebuild-row">
 <h3>5.3 The rebuild row<a class="headerlink" href="#the-rebuild-row" title="Link to this heading">#</a></h3>
-<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="nd">@dataclass</span>
-<span class="k">class</span><span class="w"> </span><span class="nc">KeptIds</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">"""A request's token ids as its model consumed them, kept for a rebuild."""</span>
-    <span class="n">prompt</span><span class="p">:</span> <span class="nb">bytes</span>    <span class="c1"># the prompt's ids as int32, from the data worker</span>
-    <span class="n">sampled</span><span class="p">:</span> <span class="n">array</span>   <span class="c1"># array('i'), each kept sample, appended at the stop check</span>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="nd">@dataclass</span><span class="p">(</span><span class="n">frozen</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">RebuildPolicy</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""How a node rebuilds a dropped request's KV, as its model declares it."""</span>
+    <span class="n">walk</span><span class="p">:</span> <span class="nb">str</span>            <span class="c1"># the prefill walk a rebuild row runs</span>
+    <span class="n">ids_input</span><span class="p">:</span> <span class="nb">str</span>       <span class="c1"># the walk's input that carries the prompt's ids</span>
+    <span class="n">sample_output</span><span class="p">:</span> <span class="nb">str</span>   <span class="c1"># the output that carries each sampled id</span>
+    <span class="n">loop</span><span class="p">:</span> <span class="nb">str</span>            <span class="c1"># the loop each of whose iterations samples one id</span>
 </pre></div>
 </div>
-<p>The rebuild is one row of the engine’s batch over the kept ids minus the last, under the node’s prefill walk, in a step of its own. Its sample is discarded, it sends nothing, and its decode loop doesn’t advance. Decoding resumes from the last kept id once the step lands.</p>
-<p>The data worker already reads the prompt’s ids on the host to key the prefix cache, so it sends them with the request’s first frame. They are the ids after templating. The worker keeps them per node and per handle, and lists them in <code class="docutils literal notranslate"><span class="pre">rid_table.py</span></code>. It keeps them only where one prefill row can rebuild the node’s KV. Elsewhere the request is guaranteed (§1).</p>
+<p>A model declares a policy per node (<code class="docutils literal notranslate"><span class="pre">Model.rebuild_policies</span></code>), and the worker checks it against the graphs at startup. A node without one never drops a request.</p>
+<p>A rebuild is a reload whose transfer is computed. The readiness check reads the request’s residency: a request on the host is reloaded by copying, and a dropped one is answered with a rebuild. The scheduler then lays the KV out again over the kept ids, and opens the rebuild in the worker’s log. Readiness answers the request’s decode row from the log until the rebuild lands, without asking the engine, even if the request is let back in for room meanwhile.</p>
+<p>The rebuild prefills the kept ids minus the last, under the policy’s walk, as rows mid-prefill that nothing popped. The scheduler offers them where it offers a speculation’s chunk in flight, so the walk’s token budget cuts and counts them as it does a prompt, and they share steps with the walk’s decode rows. Their inputs come from the log, which also advances their progress as each chunk lands. The step context names them (<code class="docutils literal notranslate"><span class="pre">StepContext.rebuild_rids</span></code>), so the sampler throws their samples away and leaves the request’s last token and RNG offset alone. Postprocess takes them off the step before the graph runtime reads it. Decoding resumes from the last kept id once the last chunk lands.</p>
+<p>The worker keeps a request’s prompt ids from the policy’s input the first time a step runs the policy’s walk, copied in the dtype the walk reads them in (int64, 8 B a token) to a pinned host pool (<code class="docutils literal notranslate"><span class="pre">rebuild_host_mb</span></code>) once that step completes, and appends each sample from the stop check’s host copy. It keeps them per node and per handle, and lists them in <code class="docutils literal notranslate"><span class="pre">rid_table.py</span></code>.</p>
 <p>Why this shape:</p>
 <ul class="simple">
-<li><p><strong>The graph runtime never sees the row.</strong> Switching the request’s runtime walk for one step would touch the runtime, the output edges, <code class="docutils literal notranslate"><span class="pre">WORKER_GRAPHS_DONE</span></code> and the loop-back.</p></li>
+<li><p><strong>The graph runtime never sees the rows.</strong> Switching the request’s runtime walk for one step would touch the runtime, the output edges, <code class="docutils literal notranslate"><span class="pre">WORKER_GRAPHS_DONE</span></code> and the loop-back. Every call that hands a step’s rows to the runtime takes <code class="docutils literal notranslate"><span class="pre">ScheduledBatch.graph_rows</span></code>, which leaves them out.</p></li>
 <li><p><strong>The prefill walk.</strong> Each model’s decode walk breaks a multi-token row in its own way. Bagel’s declares a span of 1, the Qwen3-Omni Thinker’s embeds every id at one position, and Qwen3.5’s with device loop-back reads one token off the sampler.</p></li>
-<li><p><strong>The prompt’s ids from the data worker.</strong> A drop can come at any token, after the prompt tensor is freed. Keeping the ids any other way means a device-to-host copy of every prefill’s input.</p></li>
+<li><p><strong>The prompt’s ids from the walk’s input.</strong> A drop can come at any token, after the prompt tensor is freed, so the worker copies the ids after the step that read them, on a stream of the pool’s own. Sending the ids from the data worker with every request instead added 0.5 to 1.8 ms of TTFT at Bagel c16 and Qwen3.5 c32.</p></li>
 <li><p><strong>Not a remove and re-ingest.</strong> The sampler’s RNG offset and repetition mask would be lost.</p></li>
 </ul>
 <blockquote>
-<div><p>Note: the row’s cache probe serves the kept ids’ cached prefix first, so a rebuild recomputes only what the GPU index doesn’t hold. Qwen3.5 rebuilds its whole history until its prefix caching (P2) lands.</p>
+<div><p>Note: a rebuild’s first chunk starts past its cached prefix, measured as a fresh prompt’s is on each try, so it recomputes only what the GPU index doesn’t hold, and Qwen3.5 restores a recurrent snapshot for the prefix.</p>
 </div></blockquote>
 </section>
 <section id="tokens-after-a-rebuild">
@@ -1137,8 +1152,8 @@
 <h2>8. Trade-offs<a class="headerlink" href="#trade-offs" title="Link to this heading">#</a></h2>
 <ul class="simple">
 <li><p><strong>Drops cost a rebuild.</strong> Once nothing can be offloaded, every victim is dropped and rebuilt. Under sustained overload the newest requests are dropped again and again: on #307’s workload one request was dropped four times, although that was a contrived test.</p></li>
-<li><p><strong>Rebuild steps.</strong> A rebuild runs in a step of its own, so the node’s decode rows wait one step. A long uncached history rebuilds in one step, eager past the capture buckets, until chunked prefill (#365) splits it. One step of delay on decode rows is small next to a request that never finishes.</p></li>
-<li><p><strong>Kept ids.</strong> Every request’s prompt ids ride its first frame to each worker, which keeps them at 4 B per token, 128 KB for a 32K-token request. Carrying them adds 0.5 to 1.8 ms of TTFT per request at Bagel c16 and Qwen3.5 c32. Keeping the ids any other way would mean a d2h copy of every prefill.</p></li>
+<li><p><strong>A lone rebuild isn’t speculated.</strong> Speculation targets come from the graph runtime, which holds no rebuild row, so a step of rebuild rows alone pays one scheduling gap per chunk. A rebuild chunk rides speculation when another row of its step gives a target.</p></li>
+<li><p><strong>Kept ids.</strong> A node with a rebuild policy copies each request’s prompt ids to a pinned host pool, 64 MB by default, and keeps them until the request finishes: 256 KB for a 32K-token request. A request the pool can’t hold is never dropped on that node.</p></li>
 <li><p><strong>Shared prefixes with host offload.</strong> A hit on a page only the index holds is charged as fresh, so prompts sharing a prefix run fewer at once. With host offload on, 32 Bagel requests over four shared prefixes on 96 pages took 1.49x to 1.66x as long as they do today.</p></li>
 <li><p><strong>Guaranteed requests queue.</strong> On Orpheus at c16, streamed TTFA p99 rose from 247 ms to 2.58 s against preemption without classes. But, I am fine with the p99 cost since for voice, a later first chunk is better than a gap in the middle of playback.</p></li>
 </ul>

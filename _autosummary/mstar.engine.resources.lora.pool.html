@@ -391,6 +391,7 @@
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.qwen3_asr.repetition.html">mstar.model.qwen3_asr.repetition</a></li>
 </ul>
 </details></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.model.rebuild.html">mstar.model.rebuild</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.model.submodule_base.html">mstar.model.submodule_base</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.model.utils.html">mstar.model.utils</a></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="mstar.model.vjepa2.html">mstar.model.vjepa2</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -467,7 +468,9 @@
 <li class="toctree-l2 has-children"><a class="reference internal" href="mstar.worker.html">mstar.worker</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.batch_builder.html">mstar.worker.batch_builder</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.chunk_loops.html">mstar.worker.chunk_loops</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.worker.host_pool.html">mstar.worker.host_pool</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.node_manager_utils.html">mstar.worker.node_manager_utils</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.worker.rebuild.html">mstar.worker.rebuild</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.rid_table.html">mstar.worker.rid_table</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.side_steps.html">mstar.worker.side_steps</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.spec_rows.html">mstar.worker.spec_rows</a></li>
@@ -724,6 +727,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.pool.LoraAdapterPool.slot_of"><code class="docutils literal notranslate"><span class="pre">LoraAdapterPool.slot_of()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.pool.LoraAdapterPool.slot_state"><code class="docutils literal notranslate"><span class="pre">LoraAdapterPool.slot_state()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.pool.LoraAdapterPool.store"><code class="docutils literal notranslate"><span class="pre">LoraAdapterPool.store</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.pool.LoraAdapterPool.supports_drop"><code class="docutils literal notranslate"><span class="pre">LoraAdapterPool.supports_drop</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.pool.LoraAdapterPool.unload_adapter"><code class="docutils literal notranslate"><span class="pre">LoraAdapterPool.unload_adapter()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.pool.LoraAdapterPool.unreserve"><code class="docutils literal notranslate"><span class="pre">LoraAdapterPool.unreserve()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.pool.LoraAdapterPool.weights"><code class="docutils literal notranslate"><span class="pre">LoraAdapterPool.weights()</span></code></a></li>
@@ -1200,6 +1204,11 @@ instance.</p>
 <span class="property"><span class="k"><span class="pre">property</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">store</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference internal" href="mstar.engine.resources.lora.store.html#mstar.engine.resources.lora.store.LoraAdapterStore" title="mstar.engine.resources.lora.store.LoraAdapterStore"><span class="pre">LoraAdapterStore</span></a></span><a class="headerlink" href="#mstar.engine.resources.lora.pool.LoraAdapterPool.store" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.resources.lora.pool.LoraAdapterPool.supports_drop">
+<span class="sig-name descname"><span class="pre">supports_drop</span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">True</span></span><a class="headerlink" href="#mstar.engine.resources.lora.pool.LoraAdapterPool.supports_drop" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.engine.resources.lora.pool.LoraAdapterPool.unload_adapter">
 <span class="sig-name descname"><span class="pre">unload_adapter</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">name</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/lora/pool.html#LoraAdapterPool.unload_adapter"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.lora.pool.LoraAdapterPool.unload_adapter" title="Link to this definition">#</a></dt>
@@ -1412,6 +1421,7 @@ once, here; a call reads only the step’s addressing.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.pool.LoraAdapterPool.slot_of"><code class="docutils literal notranslate"><span class="pre">LoraAdapterPool.slot_of()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.pool.LoraAdapterPool.slot_state"><code class="docutils literal notranslate"><span class="pre">LoraAdapterPool.slot_state()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.pool.LoraAdapterPool.store"><code class="docutils literal notranslate"><span class="pre">LoraAdapterPool.store</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.pool.LoraAdapterPool.supports_drop"><code class="docutils literal notranslate"><span class="pre">LoraAdapterPool.supports_drop</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.pool.LoraAdapterPool.unload_adapter"><code class="docutils literal notranslate"><span class="pre">LoraAdapterPool.unload_adapter()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.pool.LoraAdapterPool.unreserve"><code class="docutils literal notranslate"><span class="pre">LoraAdapterPool.unreserve()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.pool.LoraAdapterPool.weights"><code class="docutils literal notranslate"><span class="pre">LoraAdapterPool.weights()</span></code></a></li>

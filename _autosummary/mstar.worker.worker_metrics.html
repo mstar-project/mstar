@@ -391,6 +391,7 @@
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.qwen3_asr.repetition.html">mstar.model.qwen3_asr.repetition</a></li>
 </ul>
 </details></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.model.rebuild.html">mstar.model.rebuild</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.model.submodule_base.html">mstar.model.submodule_base</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.model.utils.html">mstar.model.utils</a></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="mstar.model.vjepa2.html">mstar.model.vjepa2</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -467,7 +468,9 @@
 <li class="toctree-l2 current active has-children"><a class="reference internal" href="mstar.worker.html">mstar.worker</a><details open="open"><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul class="current">
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.batch_builder.html">mstar.worker.batch_builder</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.chunk_loops.html">mstar.worker.chunk_loops</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.worker.host_pool.html">mstar.worker.host_pool</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.node_manager_utils.html">mstar.worker.node_manager_utils</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.worker.rebuild.html">mstar.worker.rebuild</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.rid_table.html">mstar.worker.rid_table</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.side_steps.html">mstar.worker.side_steps</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.spec_rows.html">mstar.worker.spec_rows</a></li>
@@ -742,7 +745,7 @@ Recording never changes what any rank runs.</p>
 </div>
 <dl class="py class">
 <dt class="sig sig-object py" id="mstar.worker.worker_metrics.WorkerMetrics">
-<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.worker.worker_metrics.</span></span><span class="sig-name descname"><span class="pre">WorkerMetrics</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">worker_id</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">interval_s</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">components</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">engine</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">scheduler</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">send</span></span></em>, <em class="sig-param"><span class="keyword-only-separator o"><abbr title="Keyword-only parameters separator (PEP 3102)"><span class="pre">*</span></abbr></span></em>, <em class="sig-param"><span class="n"><span class="pre">enable_transfers</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/worker/worker_metrics.html#WorkerMetrics"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.worker.worker_metrics.WorkerMetrics" title="Link to this definition">#</a></dt>
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.worker.worker_metrics.</span></span><span class="sig-name descname"><span class="pre">WorkerMetrics</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">worker_id</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">interval_s</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">components</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">engine</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">scheduler</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">rebuilds</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">send</span></span></em>, <em class="sig-param"><span class="keyword-only-separator o"><abbr title="Keyword-only parameters separator (PEP 3102)"><span class="pre">*</span></abbr></span></em>, <em class="sig-param"><span class="n"><span class="pre">enable_transfers</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/worker/worker_metrics.html#WorkerMetrics"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.worker.worker_metrics.WorkerMetrics" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
@@ -752,6 +755,7 @@ Recording never changes what any rank runs.</p>
 <li><p><strong>components</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#frozenset" title="(in Python v3.12)"><em>frozenset</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>]</em>)</p></li>
 <li><p><strong>engine</strong> (<em>Engine</em>)</p></li>
 <li><p><strong>scheduler</strong> (<em>MicroScheduler</em>)</p></li>
+<li><p><strong>rebuilds</strong> (<a class="reference internal" href="mstar.worker.rebuild.html#mstar.worker.rebuild.Rebuilds" title="mstar.worker.rebuild.Rebuilds"><em>Rebuilds</em></a>)</p></li>
 <li><p><strong>send</strong> (<em>Callable</em><em>[</em><em>[</em><a class="reference internal" href="mstar.utils.ipc_format.html#mstar.utils.ipc_format.WorkerStatus" title="mstar.utils.ipc_format.WorkerStatus"><em>WorkerStatus</em></a><em>]</em><em>, </em><em>None</em><em>]</em>)</p></li>
 <li><p><strong>enable_transfers</strong> (<em>Callable</em><em>[</em><em>[</em><em>]</em><em>, </em><a class="reference internal" href="mstar.observability.recorders.html#mstar.observability.recorders.EdgeTransfers" title="mstar.observability.recorders.EdgeTransfers"><em>EdgeTransfers</em></a><em>]</em>)</p></li>
 </ul>

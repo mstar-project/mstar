@@ -391,6 +391,7 @@
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.qwen3_asr.repetition.html">mstar.model.qwen3_asr.repetition</a></li>
 </ul>
 </details></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.model.rebuild.html">mstar.model.rebuild</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.model.submodule_base.html">mstar.model.submodule_base</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.model.utils.html">mstar.model.utils</a></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.model.vjepa2.html">mstar.model.vjepa2</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -467,7 +468,9 @@
 <li class="toctree-l2 has-children"><a class="reference internal" href="_autosummary/mstar.worker.html">mstar.worker</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.batch_builder.html">mstar.worker.batch_builder</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.chunk_loops.html">mstar.worker.chunk_loops</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.host_pool.html">mstar.worker.host_pool</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.node_manager_utils.html">mstar.worker.node_manager_utils</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.rebuild.html">mstar.worker.rebuild</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.rid_table.html">mstar.worker.rid_table</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.side_steps.html">mstar.worker.side_steps</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.spec_rows.html">mstar.worker.spec_rows</a></li>
@@ -1128,7 +1131,15 @@ step and all finish late together.</p></td>
 in a step, or the whole budget if that is smaller; with less left, it waits a step. A positive int, for every
 chunked walk. See <em>Chunked prefill budgets</em> below.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">warmup_requests</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">rebuild_host_mb</span></code></p></td>
+<td><p><em>(optional, default 64)</em> MiB of pinned host memory a worker serving a node whose model
+declares a rebuild policy sets aside at startup for its requests’ prompt ids, 8 B a token (int64),
+which a request dropped from the KV cache is rebuilt from. A request the pool can’t hold
+keeps no ids, so it is never dropped on that node, though it can still move to the host
+with <code class="docutils literal notranslate"><span class="pre">cpu_offload_pages</span></code>. A tensor or sequence parallel node never drops a request, so it
+keeps no ids and sets no memory aside. A non-negative int, and 0 keeps no ids.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">warmup_requests</span></code></p></td>
 <td><p><em>(optional)</em> Requests the server runs after the workers are ready and before it
 binds, so no client pays a shape’s first-request cost (torch.compile of a step,
 a cold cache). Each entry is a <code class="docutils literal notranslate"><span class="pre">/generate</span></code> request in yaml form: <code class="docutils literal notranslate"><span class="pre">text</span></code>,
@@ -1148,13 +1159,13 @@ replicated VAE, the entry first runs once alone, so that graph also warms its
 one-request shape before the copies reach it together. A malformed or failing warmup
 is logged and skipped.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">dist_timeout_s</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">dist_timeout_s</span></code></p></td>
 <td><p><em>(optional)</em> Timeout in seconds for the NCCL world group and its parallel
 subgroups during weight load and warmup; serving keeps PyTorch’s default.
 Unset keeps PyTorch’s default throughout. Raise it only where weight load,
 JIT or CUDA-graph capture can exceed that default.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">tp_allreduce</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">tp_allreduce</span></code></p></td>
 <td><p><em>(optional)</em> Small-message all-reduce path of every TP and SP group:
 <code class="docutils literal notranslate"><span class="pre">nccl</span></code> (default), <code class="docutils literal notranslate"><span class="pre">symm_oneshot</span></code>, <code class="docutils literal notranslate"><span class="pre">symm_multimem</span></code> or <code class="docutils literal notranslate"><span class="pre">flashinfer</span></code>;
 any other value fails at startup. <code class="docutils literal notranslate"><span class="pre">flashinfer</span></code> sends 2-D bf16 CUDA messages
@@ -1169,24 +1180,24 @@ differs from NCCL’s, so bf16 results can differ at the last bit. Falls back
 to NCCL, with a warning, where the chosen path cannot be set up on every
 rank of the group.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">tp_allreduce_max_kb</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">tp_allreduce_max_kb</span></code></p></td>
 <td><p><em>(optional)</em> Largest message, in KiB, the non-NCCL path takes;
 larger ones go to NCCL. It is also the size of the buffer each group
 rendezvouses. Default 512.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">tp_async_sched</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">tp_async_sched</span></code></p></td>
 <td><p><em>(optional)</em> Async scheduling for the parallel nodes: <code class="docutils literal notranslate"><span class="pre">true</span></code>
 (default), <code class="docutils literal notranslate"><span class="pre">false</span></code> or a list of node names (see <code class="docutils literal notranslate"><span class="pre">MSTAR_TP_ASYNC_SCHED</span></code>, which
 overrides it).</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">preprocess_workers</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">preprocess_workers</span></code></p></td>
 <td><p><em>(optional)</em> Requests the data worker prepares at once, for a model that
 declares <code class="docutils literal notranslate"><span class="pre">PREPROCESS_PARALLEL</span></code>. Default: as many as fit the CPUs left
 beside the API server’s intra-op threads (<code class="docutils literal notranslate"><span class="pre">preprocess_torch_threads</span></code>),
 at most 8; <code class="docutils literal notranslate"><span class="pre">1</span></code> prepares inline. It must be a positive integer, for any
 model: the server refuses to start on another value. See <a class="reference internal" href="adding_models.html"><span class="doc">Adding a New Model</span></a>.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">knobs</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">knobs</span></code></p></td>
 <td><p><em>(optional)</em> Engine knobs for this deployment, by name: <code class="docutils literal notranslate"><span class="pre">device_loopback</span></code>,
 <code class="docutils literal notranslate"><span class="pre">sampler_ingraph_scatter</span></code>, <code class="docutils literal notranslate"><span class="pre">sampler_slots</span></code>, <code class="docutils literal notranslate"><span class="pre">ingraph_decode_rope</span></code>,
 <code class="docutils literal notranslate"><span class="pre">kv_chain_lazy_steps</span></code>, <code class="docutils literal notranslate"><span class="pre">kv_plan_cache</span></code>, <code class="docutils literal notranslate"><span class="pre">kv_pinned_indptrs</span></code>,
@@ -1806,6 +1817,10 @@ worker share shows under each node.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">mstar_kv_pages_cached{model_name,</span> <span class="pre">component,</span> <span class="pre">resource}</span></code>: pages the prefix cache
 names. Some may also be in use by running requests; the cache frees the others when a
 request needs the room.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">mstar_rebuild_host_bytes_used{model_name,</span> <span class="pre">component}</span></code>,
+<code class="docutils literal notranslate"><span class="pre">mstar_rebuild_host_bytes_total{model_name,</span> <span class="pre">component}</span></code>: bytes of the worker’s
+rebuild host pool (<code class="docutils literal notranslate"><span class="pre">rebuild_host_mb</span></code>) that hold kept prompt ids, and the pool’s size.
+A prompt the pool has no room for keeps no ids, so its request is never dropped.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">mstar_step_seconds{model_name,</span> <span class="pre">component,</span> <span class="pre">graph_walk}</span></code>: histogram over engine
 steps that ran a forward. A step counts from when the worker hands it to its GPU
 thread, or from the end of the previous step if that was later, to the end of its

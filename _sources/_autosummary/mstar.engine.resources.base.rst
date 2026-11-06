@@ -30,6 +30,8 @@ mstar.engine.resources.base
       EngineResourceInfo
       KeyedWalks
       PublishedInfo
+      Rebuild
+      Residency
       Resource
    
    

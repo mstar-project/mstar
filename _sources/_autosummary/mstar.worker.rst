@@ -31,8 +31,10 @@
    chunk_loops
    engine_manager
    executing_batch
+   host_pool
    micro_scheduler
    node_manager_utils
+   rebuild
    rid_table
    side_steps
    spec_rows

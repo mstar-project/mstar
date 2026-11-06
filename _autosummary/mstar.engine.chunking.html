@@ -391,6 +391,7 @@
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.qwen3_asr.repetition.html">mstar.model.qwen3_asr.repetition</a></li>
 </ul>
 </details></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.model.rebuild.html">mstar.model.rebuild</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.model.submodule_base.html">mstar.model.submodule_base</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.model.utils.html">mstar.model.utils</a></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="mstar.model.vjepa2.html">mstar.model.vjepa2</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -467,7 +468,9 @@
 <li class="toctree-l2 has-children"><a class="reference internal" href="mstar.worker.html">mstar.worker</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.batch_builder.html">mstar.worker.batch_builder</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.chunk_loops.html">mstar.worker.chunk_loops</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.worker.host_pool.html">mstar.worker.host_pool</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.node_manager_utils.html">mstar.worker.node_manager_utils</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.worker.rebuild.html">mstar.worker.rebuild</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.rid_table.html">mstar.worker.rid_table</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.side_steps.html">mstar.worker.side_steps</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.spec_rows.html">mstar.worker.spec_rows</a></li>
@@ -701,6 +704,7 @@
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.chunking.ChunkRange"><code class="docutils literal notranslate"><span class="pre">ChunkRange</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.chunking.ChunkRange.end"><code class="docutils literal notranslate"><span class="pre">ChunkRange.end</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.chunking.ChunkRange.is_final"><code class="docutils literal notranslate"><span class="pre">ChunkRange.is_final</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.chunking.ChunkRange.is_first"><code class="docutils literal notranslate"><span class="pre">ChunkRange.is_first</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.chunking.ChunkRange.start"><code class="docutils literal notranslate"><span class="pre">ChunkRange.start</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.chunking.ChunkRange.stride"><code class="docutils literal notranslate"><span class="pre">ChunkRange.stride</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.chunking.ChunkRange.total"><code class="docutils literal notranslate"><span class="pre">ChunkRange.total</span></code></a></li>
@@ -780,6 +784,18 @@ prefix moves <code class="docutils literal notranslate"><span class="pre">start<
 <dt class="sig sig-object py" id="mstar.engine.chunking.ChunkRange.is_final">
 <span class="property"><span class="k"><span class="pre">property</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">is_final</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><span class="pre">bool</span></a></span><a class="headerlink" href="#mstar.engine.chunking.ChunkRange.is_final" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
+
+<dl class="py property">
+<dt class="sig sig-object py" id="mstar.engine.chunking.ChunkRange.is_first">
+<span class="property"><span class="k"><span class="pre">property</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">is_first</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><span class="pre">bool</span></a></span><a class="headerlink" href="#mstar.engine.chunking.ChunkRange.is_first" title="Link to this definition">#</a></dt>
+<dd><p>its stride runs from 0
+even past a cached prefix, and a later chunk’s is its own span, which starts past 0.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>Whether this is its prompt’s first chunk, which caps its chunk Loop</p>
+</dd>
+</dl>
+</dd></dl>
 
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.engine.chunking.ChunkRange.start">
@@ -1062,6 +1078,7 @@ walks with a budget of their own. None otherwise.</p>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.chunking.ChunkRange"><code class="docutils literal notranslate"><span class="pre">ChunkRange</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.chunking.ChunkRange.end"><code class="docutils literal notranslate"><span class="pre">ChunkRange.end</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.chunking.ChunkRange.is_final"><code class="docutils literal notranslate"><span class="pre">ChunkRange.is_final</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.chunking.ChunkRange.is_first"><code class="docutils literal notranslate"><span class="pre">ChunkRange.is_first</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.chunking.ChunkRange.start"><code class="docutils literal notranslate"><span class="pre">ChunkRange.start</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.chunking.ChunkRange.stride"><code class="docutils literal notranslate"><span class="pre">ChunkRange.stride</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.chunking.ChunkRange.total"><code class="docutils literal notranslate"><span class="pre">ChunkRange.total</span></code></a></li>

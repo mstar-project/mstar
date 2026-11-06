@@ -387,6 +387,7 @@
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.qwen3_asr.repetition.html">mstar.model.qwen3_asr.repetition</a></li>
 </ul>
 </details></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.model.rebuild.html">mstar.model.rebuild</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.model.submodule_base.html">mstar.model.submodule_base</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.model.utils.html">mstar.model.utils</a></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="mstar.model.vjepa2.html">mstar.model.vjepa2</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -463,7 +464,9 @@
 <li class="toctree-l2 current active has-children"><a class="current reference internal" href="#">mstar.worker</a><details open="open"><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.batch_builder.html">mstar.worker.batch_builder</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.chunk_loops.html">mstar.worker.chunk_loops</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.worker.host_pool.html">mstar.worker.host_pool</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.node_manager_utils.html">mstar.worker.node_manager_utils</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.worker.rebuild.html">mstar.worker.rebuild</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.rid_table.html">mstar.worker.rid_table</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.side_steps.html">mstar.worker.side_steps</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.spec_rows.html">mstar.worker.spec_rows</a></li>
@@ -707,8 +710,14 @@
 <tr class="row-even"><td><p><a class="reference internal" href="mstar.worker.chunk_loops.html#module-mstar.worker.chunk_loops" title="mstar.worker.chunk_loops"><code class="xref py py-obj docutils literal notranslate"><span class="pre">chunk_loops</span></code></a></p></td>
 <td><p>The worker's side of chunked prefill: which (node, walk) pairs run as a chunk Loop, and how far each step moves them.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="mstar.worker.node_manager_utils.html#module-mstar.worker.node_manager_utils" title="mstar.worker.node_manager_utils"><code class="xref py py-obj docutils literal notranslate"><span class="pre">node_manager_utils</span></code></a></p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="mstar.worker.host_pool.html#module-mstar.worker.host_pool" title="mstar.worker.host_pool"><code class="xref py py-obj docutils literal notranslate"><span class="pre">host_pool</span></code></a></p></td>
+<td><p>Host memory a worker copies request state into, so a request can leave the device and come back.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="mstar.worker.node_manager_utils.html#module-mstar.worker.node_manager_utils" title="mstar.worker.node_manager_utils"><code class="xref py py-obj docutils literal notranslate"><span class="pre">node_manager_utils</span></code></a></p></td>
 <td><p></p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="mstar.worker.rebuild.html#module-mstar.worker.rebuild" title="mstar.worker.rebuild"><code class="xref py py-obj docutils literal notranslate"><span class="pre">rebuild</span></code></a></p></td>
+<td><p>What a worker keeps so a request dropped from a node's KV can be rebuilt there, as the node's <cite>RebuildPolicy</cite> declares, and how far each rebuild has run.</p></td>
 </tr>
 <tr class="row-even"><td><p><a class="reference internal" href="mstar.worker.rid_table.html#module-mstar.worker.rid_table" title="mstar.worker.rid_table"><code class="xref py py-obj docutils literal notranslate"><span class="pre">rid_table</span></code></a></p></td>
 <td><p>Worker-local integer handles for request ids.</p></td>

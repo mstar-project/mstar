@@ -744,6 +744,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.qwen3_asr.repetition.html">mstar.model.qwen3_asr.repetition</a></li>
 </ul>
 </details></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.model.rebuild.html">mstar.model.rebuild</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.model.submodule_base.html">mstar.model.submodule_base</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.model.utils.html">mstar.model.utils</a></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="../../../../_autosummary/mstar.model.vjepa2.html">mstar.model.vjepa2</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -820,7 +821,9 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l2 has-children"><a class="reference internal" href="../../../../_autosummary/mstar.worker.html">mstar.worker</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.worker.batch_builder.html">mstar.worker.batch_builder</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.worker.chunk_loops.html">mstar.worker.chunk_loops</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.worker.host_pool.html">mstar.worker.host_pool</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.worker.node_manager_utils.html">mstar.worker.node_manager_utils</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.worker.rebuild.html">mstar.worker.rebuild</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.worker.rid_table.html">mstar.worker.rid_table</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.worker.side_steps.html">mstar.worker.side_steps</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.worker.spec_rows.html">mstar.worker.spec_rows</a></li>
@@ -992,8 +995,9 @@ window.runMermaid = runMermaid;</script>
 <span></span><span class="kn">from</span><span class="w"> </span><span class="nn">__future__</span><span class="w"> </span><span class="kn">import</span> <span class="n">annotations</span>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">ABC</span><span class="p">,</span> <span class="n">abstractmethod</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">collections.abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">Mapping</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">collections.abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">Mapping</span><span class="p">,</span> <span class="n">Sequence</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span><span class="p">,</span> <span class="n">field</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">enum</span><span class="w"> </span><span class="kn">import</span> <span class="n">IntEnum</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">TYPE_CHECKING</span><span class="p">,</span> <span class="n">Any</span><span class="p">,</span> <span class="n">NamedTuple</span>
 
 <span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
@@ -1114,6 +1118,27 @@ window.runMermaid = runMermaid;</script>
     <span class="n">label</span><span class="p">:</span> <span class="nb">str</span>
     <span class="n">tokens</span><span class="p">:</span> <span class="nb">int</span>
     <span class="n">position</span><span class="p">:</span> <span class="nb">int</span></div>
+
+
+
+<div class="viewcode-block" id="Residency">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.base.html#mstar.engine.resources.Residency">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">Residency</span><span class="p">(</span><span class="n">IntEnum</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""Where a request's state on a node is: on the device, copied to the host, or dropped for a rebuild</span>
+<span class="sd">    from its ids. Ordered by how far the state is from the device."""</span>
+    <span class="n">RESIDENT</span> <span class="o">=</span> <span class="mi">0</span>
+    <span class="n">ON_HOST</span> <span class="o">=</span> <span class="mi">1</span>
+    <span class="n">DROPPED</span> <span class="o">=</span> <span class="mi">2</span></div>
+
+
+
+<div class="viewcode-block" id="Rebuild">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.base.html#mstar.engine.resources.Rebuild">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">Rebuild</span><span class="p">(</span><span class="n">NamedTuple</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""What a rebuild row writes for a dropped request: ``ids`` without the last one, under ``walk``.</span>
+<span class="sd">    The last id is the one the next decode step reads."""</span>
+    <span class="n">walk</span><span class="p">:</span> <span class="nb">str</span>
+    <span class="n">ids</span><span class="p">:</span> <span class="n">Sequence</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span></div>
 
 
 
@@ -1569,10 +1594,15 @@ window.runMermaid = runMermaid;</script>
     <span class="k">def</span><span class="w"> </span><span class="nf">supports_eviction</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">return</span> <span class="kc">False</span>
 
-<div class="viewcode-block" id="Resource.is_offloaded">
-<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.base.html#mstar.engine.resources.Resource.is_offloaded">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">is_offloaded</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">rid</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
-        <span class="k">return</span> <span class="kc">False</span></div>
+    <span class="c1"># Whether `drop` discards every piece of a request's state here that a rebuild from its token ids</span>
+    <span class="c1"># writes again, so the rebuild never runs over stale state. A node with a rebuild policy needs it of</span>
+    <span class="c1"># every resource it holds (`Engine.load_model`).</span>
+    <span class="n">supports_drop</span> <span class="o">=</span> <span class="kc">False</span>
+
+<div class="viewcode-block" id="Resource.residency">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.base.html#mstar.engine.resources.Resource.residency">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">residency</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">rid</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Residency</span><span class="p">:</span>
+        <span class="k">return</span> <span class="n">Residency</span><span class="o">.</span><span class="n">RESIDENT</span></div>
 
 
 <div class="viewcode-block" id="Resource.offload">
@@ -1580,6 +1610,35 @@ window.runMermaid = runMermaid;</script>
     <span class="k">def</span><span class="w"> </span><span class="nf">offload</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">rid</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">"""Move the request's state off-device. Returns what was reclaimed."""</span>
         <span class="k">return</span> <span class="mi">0</span></div>
+
+
+<div class="viewcode-block" id="Resource.check_drop">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.base.html#mstar.engine.resources.Resource.check_drop">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">check_drop</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">rid</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">tokens</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Raise if ``drop`` would refuse ``rid``, whose rebuild writes ``tokens`` tokens. Changes nothing."""</span>
+        <span class="k">return</span></div>
+
+
+<div class="viewcode-block" id="Resource.drop">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.base.html#mstar.engine.resources.Resource.drop">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">drop</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">rid</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">tokens</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Discard the request's state that can be recomputed from the ``tokens``</span>
+<span class="sd">        token ids its rebuild writes, and keep the rest. Returns what was reclaimed."""</span>
+        <span class="k">return</span> <span class="mi">0</span></div>
+
+
+<div class="viewcode-block" id="Resource.prepare_rebuild">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.base.html#mstar.engine.resources.Resource.prepare_rebuild">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">prepare_rebuild</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">rid</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">rebuild</span><span class="p">:</span> <span class="n">Rebuild</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Take in what the dropped request's rebuild writes, before its first chunk runs."""</span>
+        <span class="k">return</span></div>
+
+
+<div class="viewcode-block" id="Resource.land_rebuild">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.base.html#mstar.engine.resources.Resource.land_rebuild">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">land_rebuild</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">rid</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""The dropped request's rebuild has run its last chunk."""</span>
+        <span class="k">return</span></div>
 
 
 <div class="viewcode-block" id="Resource.reload">

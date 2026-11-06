@@ -57,6 +57,7 @@
    qwen3_asr
    qwen3_omni
    qwen3_tts
+   rebuild
    registry
    submodule_base
    utils

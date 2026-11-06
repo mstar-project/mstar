@@ -744,6 +744,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.model.qwen3_asr.repetition.html">mstar.model.qwen3_asr.repetition</a></li>
 </ul>
 </details></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.model.rebuild.html">mstar.model.rebuild</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.model.submodule_base.html">mstar.model.submodule_base</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.model.utils.html">mstar.model.utils</a></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="../../../../../_autosummary/mstar.model.vjepa2.html">mstar.model.vjepa2</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -820,7 +821,9 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l2 has-children"><a class="reference internal" href="../../../../../_autosummary/mstar.worker.html">mstar.worker</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.worker.batch_builder.html">mstar.worker.batch_builder</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.worker.chunk_loops.html">mstar.worker.chunk_loops</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.worker.host_pool.html">mstar.worker.host_pool</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.worker.node_manager_utils.html">mstar.worker.node_manager_utils</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.worker.rebuild.html">mstar.worker.rebuild</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.worker.rid_table.html">mstar.worker.rid_table</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.worker.side_steps.html">mstar.worker.side_steps</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.worker.spec_rows.html">mstar.worker.spec_rows</a></li>
@@ -999,7 +1002,7 @@ window.runMermaid = runMermaid;</script>
 <span class="kn">from</span><span class="w"> </span><span class="nn">abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">ABC</span><span class="p">,</span> <span class="n">abstractmethod</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">collections.abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">Collection</span><span class="p">,</span> <span class="n">Iterable</span><span class="p">,</span> <span class="n">Mapping</span><span class="p">,</span> <span class="n">Sequence</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span><span class="p">,</span> <span class="n">field</span><span class="p">,</span> <span class="n">replace</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">enum</span><span class="w"> </span><span class="kn">import</span> <span class="n">Enum</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">enum</span><span class="w"> </span><span class="kn">import</span> <span class="n">Enum</span><span class="p">,</span> <span class="n">StrEnum</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">TYPE_CHECKING</span>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.spec</span><span class="w"> </span><span class="kn">import</span> <span class="n">NodeResourceSpec</span><span class="p">,</span> <span class="n">ResourceReqConfig</span><span class="p">,</span> <span class="n">RoutingContext</span><span class="p">,</span> <span class="n">check_sizes</span>
@@ -1368,6 +1371,16 @@ window.runMermaid = runMermaid;</script>
 
 
 
+<div class="viewcode-block" id="SpanKind">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.config.html#mstar.engine.resources.SpanKind">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">SpanKind</span><span class="p">(</span><span class="n">StrEnum</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""What a span writes: token ``IDS``, a file's KV keyed by its ``DIGEST``, or ``ROWS`` of anything else."""</span>
+    <span class="n">IDS</span> <span class="o">=</span> <span class="s2">"ids"</span>
+    <span class="n">DIGEST</span> <span class="o">=</span> <span class="s2">"digest"</span>
+    <span class="n">ROWS</span> <span class="o">=</span> <span class="s2">"rows"</span></div>
+
+
+
 <div class="viewcode-block" id="PrefixSpan">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.config.html#mstar.engine.resources.PrefixSpan">[docs]</a>
 <span class="nd">@dataclass</span><span class="p">(</span><span class="n">frozen</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
@@ -1375,10 +1388,10 @@ window.runMermaid = runMermaid;</script>
 <span class="w">    </span><span class="sd">"""One write to a keyed stream, as the preprocess worker laid it out.</span>
 
 <span class="sd">    ``length`` is how many slots the write fills and ``advance`` is how far it</span>
-<span class="sd">    moves the position counter. ``digest`` is an item's digest, and None for</span>
-<span class="sd">    ids. ``end_key`` is set for an item that ends inside a page, and keys that</span>
-<span class="sd">    page up to the item's end. ``opens_step`` is False for a span the step of the</span>
-<span class="sd">    span before it writes too, in one row.</span>
+<span class="sd">    moves the position counter. ``kind`` is the span's `Span.kind`. ``digest`` is</span>
+<span class="sd">    an item's digest, and None for ids. ``end_key`` is set for an item that ends</span>
+<span class="sd">    inside a page, and keys that page up to the item's end. ``opens_step`` is</span>
+<span class="sd">    False for a span the step of the span before it writes too, in one row.</span>
 <span class="sd">    """</span>
     <span class="n">length</span><span class="p">:</span> <span class="nb">int</span>
     <span class="n">advance</span><span class="p">:</span> <span class="nb">int</span>
@@ -1386,7 +1399,12 @@ window.runMermaid = runMermaid;</script>
     <span class="n">scratch</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span>
     <span class="n">digest</span><span class="p">:</span> <span class="nb">bytes</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
     <span class="n">end_key</span><span class="p">:</span> <span class="nb">bytes</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
-    <span class="n">opens_step</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span></div>
+    <span class="n">opens_step</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span>
+    <span class="n">kind</span><span class="p">:</span> <span class="n">SpanKind</span> <span class="o">=</span> <span class="n">SpanKind</span><span class="o">.</span><span class="n">IDS</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">__post_init__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="c1"># a layout row carries the kind as its string</span>
+        <span class="nb">object</span><span class="o">.</span><span class="fm">__setattr__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="s2">"kind"</span><span class="p">,</span> <span class="n">SpanKind</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">kind</span><span class="p">))</span></div>
 
 
 

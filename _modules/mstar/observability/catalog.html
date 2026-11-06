@@ -744,6 +744,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.qwen3_asr.repetition.html">mstar.model.qwen3_asr.repetition</a></li>
 </ul>
 </details></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.model.rebuild.html">mstar.model.rebuild</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.model.submodule_base.html">mstar.model.submodule_base</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.model.utils.html">mstar.model.utils</a></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="../../../_autosummary/mstar.model.vjepa2.html">mstar.model.vjepa2</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -820,7 +821,9 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l2 has-children"><a class="reference internal" href="../../../_autosummary/mstar.worker.html">mstar.worker</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.worker.batch_builder.html">mstar.worker.batch_builder</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.worker.chunk_loops.html">mstar.worker.chunk_loops</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.worker.host_pool.html">mstar.worker.host_pool</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.worker.node_manager_utils.html">mstar.worker.node_manager_utils</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.worker.rebuild.html">mstar.worker.rebuild</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.worker.rid_table.html">mstar.worker.rid_table</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.worker.side_steps.html">mstar.worker.side_steps</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.worker.spec_rows.html">mstar.worker.spec_rows</a></li>
@@ -1107,6 +1110,17 @@ window.runMermaid = runMermaid;</script>
     <span class="s2">"schedule the node."</span><span class="p">,</span>
     <span class="p">(</span><span class="s2">"component"</span><span class="p">,),</span>
 <span class="p">)</span>
+<span class="n">REBUILD_HOST_BYTES_USED</span> <span class="o">=</span> <span class="n">Family</span><span class="p">(</span>
+    <span class="s2">"mstar_rebuild_host_bytes_used"</span><span class="p">,</span> <span class="n">GAUGE</span><span class="p">,</span>
+    <span class="s2">"Bytes of a worker's rebuild host pool that hold kept prompt ids, which a "</span>
+    <span class="s2">"request dropped from the KV cache is rebuilt from."</span><span class="p">,</span>
+    <span class="p">(</span><span class="s2">"component"</span><span class="p">,),</span>
+<span class="p">)</span>
+<span class="n">REBUILD_HOST_BYTES_TOTAL</span> <span class="o">=</span> <span class="n">Family</span><span class="p">(</span>
+    <span class="s2">"mstar_rebuild_host_bytes_total"</span><span class="p">,</span> <span class="n">GAUGE</span><span class="p">,</span>
+    <span class="s2">"Bytes of a worker's rebuild host pool (the serving config's rebuild_host_mb)."</span><span class="p">,</span>
+    <span class="p">(</span><span class="s2">"component"</span><span class="p">,),</span>
+<span class="p">)</span>
 
 <span class="c1">#: ``src`` / ``dst`` of a tensor edge into or out of the graph: the data</span>
 <span class="c1">#: worker (a thread of the API server) sends the request's inputs and reads</span>
@@ -1146,6 +1160,7 @@ window.runMermaid = runMermaid;</script>
     <span class="n">f</span><span class="o">.</span><span class="n">name</span><span class="p">:</span> <span class="n">f</span> <span class="k">for</span> <span class="n">f</span> <span class="ow">in</span> <span class="p">(</span>
         <span class="n">KV_PAGES_USED</span><span class="p">,</span> <span class="n">KV_PAGES_TOTAL</span><span class="p">,</span> <span class="n">KV_PAGES_CACHED</span><span class="p">,</span> <span class="n">STEP_SECONDS</span><span class="p">,</span> <span class="n">BATCH_SIZE</span><span class="p">,</span>
         <span class="n">PREFIX_CACHE_QUERY_TOKENS</span><span class="p">,</span> <span class="n">PREFIX_CACHE_HIT_TOKENS</span><span class="p">,</span> <span class="n">COMPONENT_PENDING_STEPS</span><span class="p">,</span>
+        <span class="n">REBUILD_HOST_BYTES_USED</span><span class="p">,</span> <span class="n">REBUILD_HOST_BYTES_TOTAL</span><span class="p">,</span>
         <span class="n">TRANSFER_BYTES</span><span class="p">,</span> <span class="n">TRANSFERS</span><span class="p">,</span> <span class="n">TRANSFER_SECONDS</span><span class="p">,</span>
     <span class="p">)</span>
 <span class="p">}</span>
