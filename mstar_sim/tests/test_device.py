@@ -2209,6 +2209,9 @@ def test_fast_mode_skips_device_time_but_keeps_host_semantics():
             raise SystemExit("a host read during capture was accepted")
         except RuntimeError as e:
             assert "capturing" in str(e)
+        torch.cuda.set_sync_debug_mode("error")  # torch checks only a blocking copy
+        torch.empty(4).copy_(pos, non_blocking=True)
+        torch.cuda.set_sync_debug_mode(0)
         print("ok")
     """, MSTAR_SIM_FAST="1")
     assert out.strip() == "ok"

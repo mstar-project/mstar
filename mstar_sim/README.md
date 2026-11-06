@@ -54,7 +54,7 @@ attention features), Maya (one interposed process per device, symmetric collecti
 
 ## Fast mode, for bug repros
 
-`--fast` (`MSTAR_SIM_FAST=1`) keeps everything a repro of host control flow depends on: the scheduler, admission, KV and lease bookkeeping, TP agreement, CUDA-graph capture and replay, refusal of host reads during capture, and small tensors' values. It drops all timing: no kernel is priced or queued, and no host read waits. The clock is the real, monotonic one, so mstar's own timeouts still fire. Timed runs are unchanged without the flag.
+`--fast` (`MSTAR_SIM_FAST=1`) keeps everything a repro of host control flow depends on: the scheduler, admission, KV and lease bookkeeping, TP agreement, CUDA-graph capture and replay, refusal of host reads during capture, and small tensors' values. It drops all timing: no kernel is priced or queued, and no host read waits. The clock is the real, monotonic one, so mstar's own timeouts still fire. Timed runs are unchanged without the flag. A host tensor is pinned only if made so (or registered, as the arena's segments are), in both modes, so mstar takes its pageable branches where a GPU would (`h2d.py`'s staging copy).
 
 Boot is mostly mstar sizing each capture bucket with one eager forward. `--max-capture-tokens N` drops large token buckets. `--max-capture-batch N` does the same for batch buckets, but it also caps the served batch at N (mstar caps eager batches at the largest captured one).
 

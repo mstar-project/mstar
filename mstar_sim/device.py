@@ -1286,8 +1286,10 @@ def _copy_(self, src, non_blocking=False):
     check_fault()
     pinned = is_pinned(self)
     _d2h(src, pinned)
-    if not non_blocking or (not pinned and clock.capturing() is None):  # into pageable memory it syncs
+    if not non_blocking:
         host_wait()
+    elif not pinned and clock.capturing() is None:  # into pageable memory it syncs, unflagged
+        clock.wait_until(clock.current_timeline().free_at)
     if not _is_meta(self):
         if clock.capturing() is None:
             self.copy_(host_value(src._data))
