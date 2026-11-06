@@ -74,6 +74,12 @@ class _PassingPool(_StubPool):
         return self.reserve(rid, node_name, graph_walk, published)
 
 
+class _LendingPool(_StubPool):
+    """Lets a request pass whenever it fits, as the KV cache does past a first request it refused."""
+
+    reserve_past = _StubPool.reserve
+
+
 def _runner(nodes: dict[str, list[str]] | None = None, **pools: _StubPool) -> StepRunner:
     return StepRunner(pools, node_resources=nodes or {NODE: list(pools)})
 
@@ -245,3 +251,28 @@ def test_requests_pass_one_refused_while_passing_where_it_is_first():
     runner.admit_waiting(_nothing)
 
     assert kv.held == set(small), "six small requests waited behind one refused while it passed, with room for them"
+
+
+def test_a_request_refused_while_passing_isnt_passed_once_it_is_first():
+    """b was refused while it passed the head, with a unit left for the head. Once the head left, b fit as the first
+    request, but c passed it on that refusal and took 5 of the 6 units b fit in."""
+    kv = _PassingPool(6, needs={"head": 10, "b": 6, "c": 5})
+    runner = _runner(kv=kv)
+    for rid in ("head", "b"):
+        assert runner.admit_retrieve(rid, NODE, WALK).queued
+    runner.remove_request("head")
+
+    assert runner.admit_retrieve("c", NODE, WALK).queued, "c passed b, which fits now that it is first"
+    assert runner.admit_waiting(_nothing) == [(NODE, "b")]
+
+
+def test_no_request_passes_a_first_request_where_it_fits_while_another_resource_holds_it_back():
+    """The head waits only for a LoRA slot. A request that asks only the KV cache passed it there, took 5 of the 6
+    pages the head fits in, and the head then waited until that request finished."""
+    kv, lora = _LendingPool(6, needs={"head": 6, "p": 5}), _StubPool(0)
+    runner = _runner({NODE: ["kv", "lora"], "solo": ["kv"]}, kv=kv, lora=lora)
+    assert runner.admit_retrieve("head", NODE, WALK).queued
+
+    assert runner.admit_retrieve("p", "solo", WALK).queued, "p took pages the head fits in"
+    lora.free = 1
+    assert runner.admit_waiting(_nothing) == [(NODE, "head")]

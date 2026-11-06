@@ -546,6 +546,45 @@ def test_a_waiting_request_the_runner_admits_before_its_victims_land_takes_no_mo
     assert kv._allotments["w0"].pages == pages, "the victims' moves grew the allotment of a request already admitted"
 
 
+def _moved_for(kv, then) -> None:
+    """b waits in the queue and moves w, which waits holding pages, by ``then``. Before the runner sees that w's move
+    admitted b, a, older, asks for the first time and waits ahead of b."""
+    _running(kv, "x", 3, arrival=0)
+    _running(kv, "w", 5, arrival=3)
+    short = _step(kv, "w", 4 * PAGE_SIZE).reason.pages_short
+    kv._streams["w"]["main"].step_in_flight = True
+    assert _preempt(kv, "w", short, droppable=lambda rid: True).waits
+    kv._streams["w"]["main"].step_in_flight = False
+    _runner(kv).readmit("w", NODE, queued=False)
+    _request(kv, "b", 4, arrival=2)
+    assert not _admitted(kv, "b")
+    assert _make_room(kv, droppable=lambda rid: True) is not None
+    then(kv, "w")
+    assert "b" in kv._allotments
+    _request(kv, "a", 5, arrival=1)
+    assert _runner(kv).admit_request("a", NODE, WALK).queued and _queue(kv)[:2] == ["a", "b"]
+
+
+def test_a_request_its_moves_admitted_passes_an_older_one_that_asks_after():
+    kv = _pool()
+    _moved_for(kv, _drop)
+
+    started = _runner(kv).admit_waiting(lambda rid, node: None)
+
+    assert (NODE, "b") in started, "b waits behind a for room it already holds"
+
+
+def test_a_request_its_moves_admitted_passes_an_older_one_that_asks_after_even_when_nothing_grows():
+    """A move to the host leaves nothing to try again, so b and a waited on each other for good."""
+    kv = _pool()
+    kv._cpu_pool = host._HostPool(64)
+    _moved_for(kv, _offload)
+
+    started = _runner(kv).admit_waiting(lambda rid, node: None)
+
+    assert (NODE, "b") in started, "b waits behind a for room it already holds, and nothing will grow"
+
+
 def test_a_request_no_move_covers_waits_in_the_queue_until_its_whole_shortage_fits():
     kv = _pool()
     _running(kv, "a", 1, arrival=0)
