@@ -3149,7 +3149,7 @@ writes:
             return {KV_CACHE: KVStep(), ATTN_FULL: AttentionStep(causal=True)}
 
         # optional, for positions the resource cannot place (MRoPE):
-        def prompt_positions(self, fwd_info, layout, num_tokens): ...  # -> (custom_pos_ids, advance)
+        def prompt_positions(self, start, layout, num_tokens): ...  # -> (custom_pos_ids, advance)
         def decoder_kwargs(self, graph_walk, engine_inputs, num_tokens, **tensors): ...
 
 Its decoder module provides ``embed(ids)``, ``forward(input_embeds, *, label, **kw)``
