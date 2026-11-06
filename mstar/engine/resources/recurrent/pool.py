@@ -270,9 +270,14 @@ class RecurrentStatePool(Resource):
         # what admits took for prefix reuse, for `rollback_admit`
         self._admit_restores: list[tuple[str, str]] = []
         self._admit_snaps: list[tuple[str, str, int]] = []
-        # whether the backend checkpoints into one buffer sized by the largest captured
-        # bucket (`bind_snapshot_writer`), which bounds the checkpoints a step can write
+        # What the backend that fills the snapshot slots declares (`bind_snapshot_writer`):
+        # whether it checkpoints into one buffer sized by the largest captured bucket, which
+        # bounds the checkpoints a step can write; the blocks it fills, the only ones a
+        # snapshot holds; and the chunk its snapshots end on, which a KV page must be a
+        # multiple of.
         self._buffered_checkpoints = True
+        self._snapshot_blocks = tuple(self._blocks)
+        self._snapshot_chunk = 1
         # (count, hash) of the snapshot slots taken, for a TP follower to check against rank 0's
         self._trail = (0, 0) if _DEBUG_ASSERTS and world_size > 1 and config.prefix_slots else None
 
@@ -301,9 +306,10 @@ class RecurrentStatePool(Resource):
         tensor = self._blocks[name]
         return tensor[layer_idx] if per_layer else tensor
 
-    def _slot_rows(self, index: int):
-        """Every block's rows of slot ``index``, all layers."""
-        for name, tensor in self._blocks.items():
+    def _slot_rows(self, index: int, names: Sequence[str] | None = None):
+        """Every block's rows of slot ``index`` (only those of ``names``, if given), all layers."""
+        for name in self._blocks if names is None else names:
+            tensor = self._blocks[name]
             yield tensor[:, index] if self.config.blocks[name].per_layer else tensor[index]
 
     def gather(
@@ -770,13 +776,37 @@ class RecurrentStatePool(Resource):
         """Key snapshots by the page chains of ``kv``, the cache `config.kv_cache` names.
         A pool with no snapshot slots keys none."""
         self._kv = kv if self.config.prefix_slots else None
+        self._check_snapshot_chunk()
 
-    def bind_snapshot_writer(self, buffered: bool) -> None:
+    def bind_snapshot_writer(
+        self, *, buffered: bool, blocks: Sequence[str] | None = None, chunk: int = 1,
+    ) -> None:
         """Called by the backend that fills the snapshot slots. ``buffered``: it checkpoints
         into one buffer sized by the largest captured bucket (GDN), so a long eager step keeps
         its snapshots on a coarser interval; a backend that stores each one itself (KDA) keeps
-        them on every page."""
+        them on every page. ``blocks``: the blocks it fills, which are all a restore copies
+        (every block if None); the slot restored into is a fresh one, zeroed when it was freed.
+        ``chunk``: its snapshots sit on chunk ends, so the KV cache's page must be a multiple."""
+        if blocks is not None:
+            if unknown := sorted(set(blocks) - self._blocks.keys()):
+                raise ValueError(f"recurrent state pool {self._name!r} has no block {unknown[0]!r}")
+            self._snapshot_blocks = tuple(blocks)
         self._buffered_checkpoints = buffered
+        self._snapshot_chunk = chunk
+        self._check_snapshot_chunk()
+
+    def _check_snapshot_chunk(self) -> None:
+        """At load, whichever of the KV cache and the writer binds second."""
+        if self._kv is None or self._snapshot_chunk == 1:
+            return
+        page = self._kv.config.tokens_per_page
+        if page % self._snapshot_chunk:
+            raise ValueError(
+                f"recurrent state pool {self._name!r}: its backend keeps snapshots at "
+                f"{self._snapshot_chunk}-token chunk ends, but KV cache {self.config.kv_cache!r} "
+                f"holds {page} tokens a page; set its page_size to a multiple of "
+                f"{self._snapshot_chunk}, or prefix_slots to 0"
+            )
 
     def close_prefix_cache(self) -> None:
         self._kv = None
@@ -1004,9 +1034,6 @@ class RecurrentStatePool(Resource):
             return
         snap = self._reserve_snapshot()
         if snap is not None:
-            # A restore copies every block, and a backend fills only its state's: the rest (a
-            # verify step's speculative blocks, an MTP seed) must read as a fresh slot's.
-            self._zero_slot(snap)
             self._snap_writes[(rid, label, boundary)] = SnapshotWrite(snap, offset, key)
             self._admit_snaps.append((rid, label, boundary))
 
@@ -1036,8 +1063,9 @@ class RecurrentStatePool(Resource):
                 restore = self._restores.pop(key)
                 slot = self._slots.get(key[0], {}).get(key[1])
                 if slot is not None:
+                    names = self._snapshot_blocks
                     for to, from_ in zip(
-                        self._slot_rows(slot.index), self._slot_rows(restore.slot), strict=True,
+                        self._slot_rows(slot.index, names), self._slot_rows(restore.slot, names), strict=True,
                     ):
                         to.copy_(from_)
                     slot.has_state = True
@@ -1093,7 +1121,8 @@ class RecurrentStatePool(Resource):
             if previous is not None:
                 self._decode[(rid, label)] = previous
             return
-        for to, from_ in zip(self._slot_rows(snap), self._slot_rows(slot.index), strict=True):
+        names = self._snapshot_blocks
+        for to, from_ in zip(self._slot_rows(snap, names), self._slot_rows(slot.index, names), strict=True):
             to.copy_(from_)
         # a filed `previous` stays until this one is filed: a step whose token never
         # reaches the chain (the one speculated past the reply's end) never is

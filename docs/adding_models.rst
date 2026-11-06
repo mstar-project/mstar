@@ -494,7 +494,8 @@ the pool's ``resources:`` key. Each snapshot slot costs as much as a request slo
   boundary when that is past what it restored. A shared prefix is then served from the third request
   that shares it. Under GDN, a step longer than the largest captured bucket checkpoints less often,
   so that its checkpoints fit the captured steps' buffer, and keeps its boundaries on that interval;
-  KDA's kernels store each snapshot themselves and keep every page.
+  KDA's kernels store each snapshot themselves and keep every page, at the end of one of
+  their 64-token chunks, so loading refuses a KV ``page_size`` that isn't a multiple of 64.
 - A decode step that ends a page keeps the state there, where the KV cache keys the decode walk,
   so a later turn that re-sends the reply restores it. It replaces the request's previous decode snapshot once the KV chain
   keys its page; a step whose token never reaches the chain, such as the one speculated

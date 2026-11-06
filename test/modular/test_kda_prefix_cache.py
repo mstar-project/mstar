@@ -81,11 +81,11 @@ class _Node:
     are its row of a fixed table, so a prompt's state depends on its tokens alone."""
 
     def __init__(self, rank: int = 0, world_size: int = 1, prefix_slots: int = 3,
-                 speculative_tokens: int = 0):
+                 speculative_tokens: int = 0, page: int = PAGE):
         group = SimpleNamespace(rank=rank, world_size=world_size) if world_size > 1 else None
         kv_spec = KVSpec("kv", {NODE}, PagedKVConfig(
             num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=1024, num_qo_heads=2,
-            max_num_pages=40, page_size=PAGE, prefix_cache_salt="a salt",
+            max_num_pages=40, page_size=page, prefix_cache_salt="a salt",
             prefix_cache_tp=world_size > 1,
         ))
         self.kv = KVManager(
@@ -246,6 +246,12 @@ def test_windows_that_cut_a_row_inside_a_chunk_compute_what_the_whole_step_does(
                                (whole.state(whole.snapshot(rid, PAGE)), cut.state(cut.snapshot(rid, PAGE)))):
             for x, y in zip(node_a, node_b, strict=True):
                 torch.testing.assert_close(x, y, rtol=1e-5, atol=1e-5)
+
+
+def test_a_page_off_the_kda_chunk_is_refused_at_load():
+    """A snapshot sits on a chunk end, so a page of half a chunk would leave one inside a chunk."""
+    with pytest.raises(ValueError, match="page_size to a multiple of 64"):
+        _Node(page=PAGE // 2)
 
 
 def test_a_restored_slot_starts_with_no_verify_prefix():

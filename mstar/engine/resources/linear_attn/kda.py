@@ -213,8 +213,11 @@ class KDAManager(LinearAttnManager):
     def bind_dependencies(self, resources: Mapping[str, Resource]) -> None:
         self._pool = resources.get(self._pool_key)
         if self._pool is not None:
-            # the kernels store each snapshot themselves, through no checkpoint buffer
-            self._pool.bind_snapshot_writer(buffered=False)
+            # the kernels store each snapshot themselves, through no checkpoint buffer, and only
+            # the state and conv tail, at a chunk end
+            self._pool.bind_snapshot_writer(
+                buffered=False, blocks=("state", "conv"), chunk=getattr(self.kernels, "chunk", 1),
+            )
 
     # Step lifecycle
 
@@ -304,7 +307,7 @@ class KDAManager(LinearAttnManager):
                     f"({lease.bucket}); leave the node's prefill buckets out where "
                     "KDAManager.prefill_capturable is False"
                 )
-            targets = self._snapshot_targets(label, addressing, ctx, spans)
+            targets = self._snapshot_targets(label, addressing, ctx)
             plan.snapshots = targets or ()
             # an eager step without targets runs the kernels that keep none
             plan.snapshot_section = targets is not None and (lease is not None or bool(targets))
@@ -316,7 +319,7 @@ class KDAManager(LinearAttnManager):
         return plan
 
     def _snapshot_targets(
-        self, label: str, addressing: RecurrentAddressing, ctx: StepContext, spans: tuple[int, ...],
+        self, label: str, addressing: RecurrentAddressing, ctx: StepContext,
     ) -> tuple[tuple[int, int, int], ...] | None:
         """The pool's snapshot targets for this prefill, or None on a walk the KV cache doesn't
         key, where the pool keeps none."""
@@ -324,13 +327,6 @@ class KDAManager(LinearAttnManager):
         if not addressing.snapshot_every or self._pool is None or walk not in self._pool.keyed_walks(label):
             assert not addressing.snapshots, f"kda: a {walk!r} step keeps snapshots its KV cache doesn't key"
             return None
-        chunk = self.kernels.chunk
-        for row, offset, _ in addressing.snapshots:
-            if offset % chunk and offset != spans[row]:
-                raise ValueError(
-                    f"kda: a snapshot {offset} tokens into a row falls inside a {chunk}-token "
-                    "chunk; the KV cache's page size must be a multiple of the chunk"
-                )
         return tuple((t.row, t.offset, t.slot) for t in addressing.snapshots)
 
     def _stage_layout(self, host: list[int], label: str, ctx: StepContext) -> torch.Tensor:
