@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from mstar.engine.device_run import RUN_REPLAYS, RUN_SKIPPED, TokenStream, run_item
+from mstar.engine.device_run import RUN_COUNTS, RUN_REPLAYS, RUN_SKIPPED, TokenStream, run_item
 from mstar.engine.resources.resident import NOT_ASKED
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.submodule_base import EMITTED_COUNT, BatchedModelOutput, HostRows
@@ -530,8 +530,10 @@ class RepeatingSteps:
             for name, buffer in host_rows.buffers.items():
                 if buffer.dim() > 1 and buffer.shape[1] == width:
                     host_rows.buffers[name] = buffer[:, :ran]
-            engine.settle_run(batch_N.node_batch, ran)
-            batch_N.batch.repeats = ran
+        executions = host_rows.buffers.pop(RUN_COUNTS)
+        counts = dict(zip(host_rows.request_ids, executions[:len(host_rows.request_ids)].tolist(), strict=True))
+        engine.settle_run(batch_N.node_batch, ran, counts)
+        batch_N.batch.repeats = ran
 
     def _cut_run_items(
         self, batch_N: PendingBatch, outputs: BatchedModelOutput, step: PostprocessStep,

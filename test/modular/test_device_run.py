@@ -9,6 +9,7 @@ import torch
 from mstar.engine import accelerator_graph_runner as runner_mod
 from mstar.engine.accelerator_graph_runner import AcceleratorGraphRunner
 from mstar.engine.device_run import (
+    RUN_COUNTS,
     RUN_RAN,
     RUN_REPLAYS,
     RUN_SKIPPED,
@@ -41,6 +42,7 @@ class _Loop:
     def stop(self, state, tokens, handle, stream):
         """The test double of the ``run_stop`` kernel, which only CUDA can run."""
         self.state = state
+        state.counts += ~state.marks
         token = None if tokens is None else tokens.reshape(len(state.marks), -1)[:, 0]
         if token is not None:
             state.marks |= (token.unsqueeze(-1) == state.stop_ids).any(-1) & ~state.immune
@@ -133,6 +135,7 @@ def test_a_long_row_beside_a_short_one_runs_to_the_runs_limit(monkeypatch):
     _, run, _, calls = _runner(monkeypatch, _Loop(), tokens)
     stops, rows, _ = _run(run, 2, 4)
     assert len(calls) == 4 and stops[RUN_REPLAYS].tolist() == [4, 4]
+    assert stops[RUN_COUNTS].tolist() == [2, 4]
     assert stops["new_token"].tolist() == [[1, EOS, 3, 4], [1, 2, 3, 4]]
     assert rows["frame"].tolist() == [[2, 18, 6, 8], [2, 4, 6, 8]]
     assert run.state.marks.tolist() == [True, False]
@@ -142,6 +145,7 @@ def test_a_run_ends_with_its_last_row_and_padding_keeps_nothing_alive(monkeypatc
     _, run, _, calls = _runner(monkeypatch, _Loop(), [[1, 0], [EOS, 0], [3, 0]])
     stops, _, _ = _run(run, 1, 5)
     assert len(calls) == 2 and stops[RUN_REPLAYS].tolist() == [2, 2]
+    assert stops[RUN_COUNTS].tolist() == [2, 0]
 
 
 def test_a_stop_from_before_a_run_does_not_end_it_and_ignore_eos_never_marks(monkeypatch):
@@ -182,6 +186,7 @@ def test_a_run_staged_with_its_word_set_runs_nothing_unless_it_is_one_iteration(
     stops, _, _ = run.results(limit)
     assert len(calls) == ran and int(run.state.started[0]) == begun
     assert stops[RUN_REPLAYS].tolist() == [ran, ran]
+    assert stops[RUN_COUNTS].tolist() == [ran, ran]
 
 
 @pytest.mark.parametrize("yield_after_stage", [False, True])
@@ -244,6 +249,7 @@ def test_refill_at_ends_a_run_once_that_share_of_its_rows_is_done(monkeypatch):
     _, run, _, calls = _runner(monkeypatch, _Loop(), tokens, bs=4)
     stops, _, _ = _run(run, 4, 6, refill_at=0.5)
     assert stops[RUN_REPLAYS].tolist() == [2] * 4
+    assert stops[RUN_COUNTS].tolist() == [1, 2, 2, 2]
 
 
 def test_each_replay_reads_its_column_of_an_iteration_input(monkeypatch):
@@ -457,25 +463,30 @@ def test_a_raw_launch_takes_the_cuda_handle_torch_stream_doesnt_have(monkeypatch
     assert backend.raw_launch(graph) == (5, 5, 9, 77)
 
 
-def test_the_worker_settles_a_run_that_ended_short(monkeypatch):
+@pytest.mark.parametrize("ran", [3, 4])
+def test_the_worker_settles_each_row_even_if_another_reaches_the_full_bound(monkeypatch, ran):
     from mstar.utils import profiler
     from mstar.worker.worker import Worker
 
     worker = Worker.__new__(Worker)
     ended = []
-    engine = SimpleNamespace(settle_run=lambda batch, ran: ended.append(ran))
+    engine = SimpleNamespace(settle_run=lambda batch, ran, counts: ended.append((ran, counts)))
     batch = SimpleNamespace(batch=SimpleNamespace(repeats=4), node_batch=object(), graph_walk=WALK)
     monkeypatch.setattr(profiler, "PHASE_PERIOD", 1)
     profiler.phase_buffer().clear()
     tokens = torch.tensor([[1, 2, 3, 0], [4, 5, 6, 0]])  # the last column was never written
-    rows = SimpleNamespace(buffers={RUN_REPLAYS: torch.tensor([3, 3]), "t": tokens, "one": torch.zeros(2)})
+    rows = SimpleNamespace(request_ids=(7, 9), buffers={
+        RUN_REPLAYS: torch.tensor([ran, ran]), RUN_COUNTS: torch.tensor([1, ran]),
+        "t": tokens, "one": torch.zeros(2),
+    })
     worker._settle_run(batch, rows, engine)
-    assert ended == [3] and batch.batch.repeats == 3 and RUN_REPLAYS not in rows.buffers
+    assert ended == [(ran, {7: 1, 9: ran})] and batch.batch.repeats == ran
+    assert RUN_REPLAYS not in rows.buffers and RUN_COUNTS not in rows.buffers
     # what keys the prefix chain reads next: nothing the run didn't produce
-    assert rows.buffers["t"].tolist() == [[1, 2, 3], [4, 5, 6]]
+    assert torch.equal(rows.buffers["t"], tokens[:, :ran])
     assert rows.buffers["one"].shape == (2,)
     # a yield's cut shows nowhere else: the walk's line still says "on" (review-r7 G5)
-    assert profiler.phase_buffer()[f"repeats.ran.{WALK}#"] == [3]
+    assert profiler.phase_buffer()[f"repeats.ran.{WALK}#"] == [ran]
     profiler.phase_buffer().clear()
 
 

@@ -30,6 +30,8 @@ from mstar.utils.h2d import PinnedStager
 
 # a stop buffer of a run that repeats: the iterations it ran, on every row
 RUN_REPLAYS = "__run_replays__"
+# Logical executions per row, excluding padding and iterations after its stop.
+RUN_COUNTS = "__run_counts__"
 
 _STOP_SOURCE = r"""
 typedef unsigned long long cudaGraphConditionalHandle;
@@ -40,11 +42,12 @@ extern "C" __global__ void run_stop(
     const unsigned char* immune, unsigned char* marks, long long* index, const long long* limit,
     const long long* refill, const long long* generation, const volatile long long* yield_until,
     const unsigned long long* handle,
-    long long* host_tokens, volatile int* landed, int host_width
+    long long* host_tokens, volatile int* landed, int host_width, long long* counts
 ) {
     int done = 0;
     long long at = *index;
     for (int row = 0; row < rows; ++row) {
+        if (!marks[row]) counts[row] += 1;
         if (host_tokens) host_tokens[row * host_width + at] = tokens[row * stride];
         if (tokens && !marks[row] && !immune[row]) {
             for (int i = 0; i < num_ids; ++i) {
@@ -166,6 +169,7 @@ class RunState:
         self._immune_stager = PinnedStager(torch.bool, numel=bs)
         self.marks = torch.zeros(bs, dtype=torch.bool, device=device)
         self.replays = torch.zeros(bs, dtype=torch.long, device=device)
+        self.counts = torch.zeros(bs, dtype=torch.long, device=device)
         # Each stage publishes its identity on the execution stream, behind
         # any previous launch using this state. The host cutoff never clears:
         # staging a successor cannot erase a yield the current launch reads.
@@ -184,6 +188,7 @@ class RunState:
         self._generation += 1
         self.generation.fill_(self._generation)
         self.index.zero_()
+        self.counts.zero_()
         self.started.zero_()
         key = (real, tuple(immune), limit, refill_at)
         if key != self._staged:
@@ -296,6 +301,7 @@ class CudaWhile:
             ctypes.c_void_p(state.stream.tokens.data_ptr() if state.stream else None),
             ctypes.c_void_p(state.stream.landed.data_ptr() if state.stream else None),
             ctypes.c_int(state.stream.tokens.shape[1] if state.stream else 0),
+            ctypes.c_void_p(state.counts.data_ptr()),
         ]
         args = (ctypes.c_void_p * len(values))(*(ctypes.cast(ctypes.byref(v), ctypes.c_void_p) for v in values))
         self._driver_call(
@@ -415,6 +421,7 @@ class DeviceRun:
             column[:, :repeats] = column.index_select(1, ran)
         stops = {name: column[:, :repeats] for name, column in self.stops.items()}
         stops[RUN_REPLAYS] = state.replays
+        stops[RUN_COUNTS] = state.counts
         return (
             stops, {name: column[:, :repeats] for name, column in self.rows.items()},
             {name: column[:, :repeats] for name, column in self.spans.items()},
