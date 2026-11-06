@@ -815,7 +815,7 @@ The rest are free functions in `mstar.engine.state`:
 ```python
 qkv  = causal_conv(self.gdn, layer, qkv, weight=w, bias=b)              # reads and writes `conv`
 core = gated_delta_net(self.gdn, layer, q, k, v, a, b, A_log, dt_bias)  # reads and writes `state`
-p    = position(self.kv, request, label)   # a request's next position, on the host
+p    = position(self.kv, fwd_info.rid_handle, label)                    # a request's next position, on the host
 ids  = positions(self.kv)                  # this step's ids, on the device
 q, k = rope(self.kv, q, k)                 # rotate at this step's ids with the declared Rope
 tokens = sample(self.sampler, logits)      # one token per row, each a fresh draw
