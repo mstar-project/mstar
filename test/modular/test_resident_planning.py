@@ -375,6 +375,23 @@ def test_a_run_that_ends_short_gives_back_what_its_commit_counted():
     assert live["pool"]._slots[1]["main"].tokens == 4
 
 
+def test_skipped_page_crossing_rewrites_cells_before_retry():
+    live, _, planner = _setup({1: 2})
+    _captured_step(live, planner, [1], slot=0, bs=1)
+    # Commit a run crossing into the second page without replaying its cells.
+    skipped = _captured_step(live, planner, [1], slot=0, bs=1, repeats=3, run=False)
+    _promote(live, planner, skipped)
+    planner.flush(skipped.ctx.resident_plan)
+    for key, step in (("kv", skipped.kv), ("pool", skipped.pool), ("rope", skipped.rope)):
+        live[key].commit(step, skipped.ctx)
+    planner.commit(skipped.step, skipped.ctx)
+    for key, step in (("kv", skipped.kv), ("pool", skipped.pool), ("rope", skipped.rope)):
+        live[key].rewind_run(step, skipped.ctx, 3, {1})
+    retry = _captured_step(live, planner, [1], slot=0, bs=1, repeats=3)
+    expected = live["kv"]._streams[1]["main"].page_indices
+    assert [r.pages[0] for r in retry.replays] == [expected[0], expected[1], expected[1]]
+
+
 @pytest.mark.parametrize(("world_size", "policies", "why"), [
     (2, {}, "deployment: it runs on more than one rank"),
     (1, {}, "graph: its stop reads no token"),

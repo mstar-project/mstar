@@ -120,6 +120,8 @@ class KVResidentTables:
     def rewind(self, rid: int, tokens: int) -> None:
         """The host's copy of a row's length, after a run that ended short."""
         self.host_len[self.planner.slot_of(rid)] -= tokens
+        # A skipped run may never have scattered its newly committed page cells.
+        self.planner.mark_stale(rid)
 
     def gather(
         self, step: CapturedResidentStep, token_to_page: torch.Tensor | None, token_to_cache: torch.Tensor | None,
