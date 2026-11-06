@@ -284,3 +284,140 @@ def test_a_device_queue_hands_its_consumer_the_chunks_the_host_queue_does(policy
     pop("host", host)
     pop("device", device)
     assert chunks["device"] == chunks["host"] and len(chunks["host"]) > 3
+
+
+@pytest.mark.parametrize("ran", [0, 1, 4])
+@pytest.mark.parametrize("kind", ["python", "rust"])
+def test_overlapping_run_windows_consume_actual_inputs_once(ran, kind):
+    streams, tm, buf = _consumer(1, 1, kind)
+    uuids = _produce(tm, buf, range(6))
+    buf.signal_done(6)
+    first = streams.reserve_edge(buf, EDGE, RID, 4)
+    second = streams.reserve_edge(buf, EDGE, RID, 4)
+    assert first.chunk.reservation.bound == 4
+    assert second.chunk.reservation.bound == 2
+    assert second.uuids == uuids
+    assert streams.reserve_edge(buf, EDGE, RID, 4) is None
+    assert streams.consumption(RID)[EDGE] == 0
+    assert buf.policy.items_consumed == 0 and not buf._final_chunk_emitted
+
+    settled = streams.settle_window(RID, first, ran)
+    assert settled.num_items == ran and not settled.is_final
+    _consume(streams, tm, first)
+    assert all(tm.tensor_store.check_uuid_presence(u) for u in uuids), "the successor still owns its snapshot"
+    snapshot = _consume(streams, tm, second)[0].flatten()
+    assert snapshot[ran:ran + 2].tolist() == list(range(ran, ran + 2))
+    settled = streams.settle_window(RID, second, 2)
+    assert settled.is_final == (ran == 4)
+    assert streams.consumption(RID)[EDGE] == ran + 2
+    assert buf.policy.items_consumed == ran + 2
+    assert all(not tm.tensor_store.check_uuid_presence(u) for u in uuids[:ran + 2])
+    assert all(tm.tensor_store.check_uuid_presence(u) for u in uuids[ran + 2:])
+
+
+def test_two_short_successors_trim_the_retained_source_and_rollback_keeps_refs_balanced():
+    streams, tm, buf = _window_consumer()
+    uuids = _produce(tm, buf, range(8))
+    first = streams.reserve_edge(buf, EDGE, RID, 4)
+    second = streams.reserve_edge(buf, EDGE, RID, 4)
+    streams.settle_window(RID, first, 2)
+    _consume(streams, tm, first)
+    third = streams.reserve_edge(buf, EDGE, RID, 4)
+    assert third.chunk.start_offset == 2 and third.chunk.reservation.bound == 2
+    assert third.uuids == uuids[2:]
+    streams.settle_window(RID, second, 1)
+    _consume(streams, tm, second)
+    fourth = streams.reserve_edge(buf, EDGE, RID, 4)
+    assert fourth.chunk.start_offset == 3 and fourth.chunk.reservation.bound == 3
+    assert fourth.uuids == uuids[3:]
+    streams.return_edge(RID, fourth)
+    retry = streams.reserve_edge(buf, EDGE, RID, 4)
+    assert retry.uuids == fourth.uuids
+    streams.settle_window(RID, third, 2)
+    _consume(streams, tm, third)
+    streams.settle_window(RID, retry, 3)
+    _consume(streams, tm, retry)
+    assert buf._consumed == 8 and buf.policy.items_consumed == 8
+    assert not buf._buffer and not buf._reservations and not buf._waiting_graph_edges
+    assert not any(tm.tensor_store.check_uuid_presence(u) for u in uuids)
+
+
+def test_run_reservation_never_pads_missing_live_input_or_crosses_a_walk():
+    buf = StreamBuffer(RID, EDGE, "LLM", FixedChunkPolicy(1, frozenset({"decode"})), walk_tagged=True)
+    buf.put_positions([0, 1], "decode")
+    buf.put_positions([2], "other")
+    buf.signal_done(4)  # one item has not reached this worker yet
+    first = buf.reserve_window(4, "decode")
+    assert first.num_items == 2 and first.reservation.bound == 2
+    assert buf.reserve_window(4, "decode") is None
+    buf.settle_window(first.reservation, 2)
+    assert buf.reserve_window(4, "decode") is None
+    second = buf.reserve_window(4, "other")
+    buf.settle_window(second.reservation, 1)
+    assert buf.reserve_window(4, "decode") is None
+    buf.put_positions([3], "decode")
+    tail = buf.reserve_window(4, "decode")
+    assert tail.num_items == 1 and tail.reservation.bound == 4
+    buf.settle_window(tail.reservation, 4)
+    assert buf._consumed == 4 and buf.policy.items_consumed == 4
+    assert buf.reserve_window(4, "other") is None
+
+
+def test_a_reserved_window_narrows_before_its_successor_and_refuses_out_of_order_settlement():
+    streams, tm, buf = _window_consumer()
+    _produce(tm, buf, range(6))
+    first = streams.reserve_edge(buf, EDGE, RID, 4)
+    streams.return_unread(RID, first, 1)
+    second = streams.reserve_edge(buf, EDGE, RID, 4)
+    assert second.chunk.reservation.predecessor_bound == 1
+    assert second.chunk.reservation.bound == 4
+    with pytest.raises(ValueError, match="submission order"):
+        streams.settle_window(RID, second, 1)
+    with pytest.raises(ValueError, match="after its successor"):
+        streams.return_unread(RID, first, 0)
+    assert buf._consumed == 0
+    streams.return_edge(RID, second)
+    streams.return_edge(RID, first)
+    assert not buf._reservations and buf._consumed == 0
+    chunk = streams.pop_edge(buf, EDGE, RID, window=6)
+    _consume(streams, tm, chunk)
+    assert not any(tm.tensor_store.check_uuid_presence(u) for u in chunk.uuids)
+
+
+def test_a_late_stream_settlement_cannot_consume_a_recycled_requests_items():
+    streams, tm, old = _window_consumer()
+    _produce(tm, old, range(4))
+    previous = streams.reserve_edge(old, EDGE, RID, 4)
+    replacement = StreamBuffer(RID, EDGE, "LLM", FixedChunkPolicy(1))
+    streams._request_state.per_request_info[RID].stream_buffers[EDGE] = replacement
+    _produce(tm, replacement, range(4), first_uuid=200)
+    current = streams.reserve_edge(replacement, EDGE, RID, 4)
+    assert streams.settle_window(RID, previous, 4) is None
+    streams.return_edge(RID, previous)
+    assert replacement._consumed == 0 and replacement.owns_window(current.chunk.reservation)
+    streams.settle_window(RID, current, 4)
+    _consume(streams, tm, current)
+    assert replacement._consumed == 4
+
+
+def test_ring_reservations_keep_copied_windows_after_positions_are_released_and_reused():
+    from mstar.engine.resources.loopback_rows import LoopbackRows
+
+    streams, tm, buf = _window_consumer()
+    ring = LoopbackRows(torch.device("cpu"), capacity=1)
+    ring.ask_ring(EDGE, depth=6)
+    ring.ring_table(EDGE, torch.zeros(1, 1, dtype=torch.long))
+    ring.add(RID)
+    ring.ring_write(EDGE, [RID], torch.arange(6).reshape(1, 6, 1), ring.ring_reserve(EDGE, [RID], 6))
+    buf.put_positions(list(range(6)))
+    streams.rings[EDGE] = ring
+    first = streams.reserve_edge(buf, EDGE, RID, 4)
+    second = streams.reserve_edge(buf, EDGE, RID, 4)
+    streams.settle_window(RID, first, 2)
+    assert ring.ring_room(EDGE, RID) == 2
+    ring.ring_write(EDGE, [RID], torch.tensor([[[100], [101]]]), ring.ring_reserve(EDGE, [RID], 2))
+    assert _consume(streams, tm, second)[0].flatten().tolist() == list(range(6))
+    _consume(streams, tm, first)
+    streams.settle_window(RID, second, 2)
+    assert ring.ring_room(EDGE, RID) == 2
+    assert not any(tm.tensor_store.check_uuid_presence(u) for u in first.uuids + second.uuids)

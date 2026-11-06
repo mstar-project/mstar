@@ -218,6 +218,9 @@ class StreamBufferManager:
         if not self._enter_chunk_walk(sbuf, edge_name, request_id, allow_walk_change):
             return None
         chunk = sbuf.pop_window(window) if window > 1 else sbuf.pop_chunk()
+        return self._chunk_edge(chunk, edge_name, consumer_node, request_id)
+
+    def _chunk_edge(self, chunk, edge_name: str, consumer_node: str, request_id: int) -> StreamingEdge:
         ring = self.rings.get(edge_name)
         if ring is not None:
             return self._ring_edge(ring, edge_name, consumer_node, request_id, chunk)
@@ -235,6 +238,39 @@ class StreamBufferManager:
             tm.dereference_batch_uniform(list(chunk.released))
         return StreamingEdge(edge_name, consumer_node, uuids, chunk.info)
 
+    def reserve_edge(
+        self, sbuf: StreamBuffer, edge_name: str, request_id: int, bound: int,
+        consumer_walk: str | None = None,
+    ) -> StreamingEdge | None:
+        """A run's overlapping input snapshot, with its own graph references.
+        Producer consumption is published only by ``settle_window``.
+        """
+        chunk = sbuf.reserve_window(bound, consumer_walk)
+        if chunk is None:
+            return None
+        return self._chunk_edge(chunk, edge_name, self.consumer_node.get(edge_name, ""), request_id)
+
+    def settle_window(self, request_id: int, edge: StreamingEdge, executed: int) -> StreamChunkInfo | None:
+        """Release the source owner's consumed prefix; the graph independently
+        releases the snapshot references after its last submitted reader.
+        """
+        req_info = self._request_state.per_request_info.get(request_id)
+        sbuf = None if req_info is None else req_info.stream_buffers.get(edge.name)
+        if sbuf is None:
+            return None
+        if edge.chunk.reservation is None:
+            raise ValueError("a stream window needs a run reservation to settle")
+        if not sbuf.owns_window(edge.chunk.reservation):
+            return None
+        chunk = sbuf.settle_window(edge.chunk.reservation, executed)
+        if chunk.released:
+            ring = self.rings.get(edge.name)
+            if ring is None:
+                self._tensor_manager.dereference_batch_uniform(chunk.released)
+            else:
+                ring.ring_release(edge.name, request_id, max(chunk.released) + 1)
+        return chunk.info
+
     def _ring_edge(self, ring, edge_name: str, consumer_node: str, request_id: int, chunk) -> StreamingEdge:
         """A chunk of positions in the producer's ring as one stored tensor,
         the chunk's window gathered in one read; the positions it moved past
@@ -247,6 +283,7 @@ class StreamBufferManager:
                 request_id, {edge_name: [window]}, skip_cuda_sync=True,
             )[edge_name]
             uuids = [info.uuid]
+            self._tensor_manager.increment_ref_batch_uniform(uuids)
         if chunk.released:
             ring.ring_release(edge_name, request_id, max(chunk.released) + 1)
         return StreamingEdge(edge_name, consumer_node, uuids, chunk.info)
@@ -293,6 +330,12 @@ class StreamBufferManager:
             return
         sbuf = req_info.stream_buffers.get(streaming_edge.name)
         if sbuf is not None:
+            if streaming_edge.chunk.reservation is not None:
+                if not sbuf.owns_window(streaming_edge.chunk.reservation):
+                    return
+                sbuf.cancel_window(streaming_edge.chunk.reservation)
+                self._tensor_manager.dereference_batch_uniform(streaming_edge.uuids)
+                return
             sbuf.store_uningested_edge(streaming_edge)
         # The step that took the final chunk will not run; the stream is live again.
         if streaming_edge.chunk.is_final:
@@ -308,6 +351,11 @@ class StreamBufferManager:
         if sbuf is None:
             return False
         chunk = streaming_edge.chunk
+        if chunk.reservation is not None:
+            if not sbuf.owns_window(chunk.reservation):
+                return False
+            sbuf.narrow_window(chunk.reservation, used)
+            return False
         rest = streaming_edge.uuids[used:]
         if rest:
             # the step's edge drops its references when its node consumes it

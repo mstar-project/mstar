@@ -8,6 +8,14 @@ import torch
 from mstar.streaming.chunk_policy import ChunkPolicy
 
 
+@dataclass(frozen=True, eq=False)
+class StreamReservation:
+    """A step's bound and the predecessor span its input snapshot covers."""
+    chunk_index: int
+    bound: int
+    predecessor_bound: int
+
+
 @dataclass
 class StreamChunk:
     """A chunk of data popped from a StreamBuffer."""
@@ -24,11 +32,12 @@ class StreamChunk:
     # items this pop took out of the buffer for good (the stride it advanced
     # by, or everything on a flush); the buffer no longer holds them
     released: list = field(default_factory=list)
+    reservation: StreamReservation | None = None
 
     @property
     def info(self) -> "StreamChunkInfo":
         return StreamChunkInfo(
-            self.start_offset, self.context_items, self.num_items, self.is_final,
+            self.start_offset, self.context_items, self.num_items, self.is_final, self.reservation,
         )
 
 
@@ -38,6 +47,7 @@ class StreamChunkInfo(NamedTuple):
     context_items: int
     num_items: int
     is_final: bool
+    reservation: StreamReservation | None = None
 
 
 class StreamingEdge(NamedTuple):
@@ -93,6 +103,8 @@ class StreamBuffer:
     _id_to_tensor: dict = field(default_factory=dict)
     _consumed: int = 0
     _chunks_popped: int = 0
+    # Submitted readers may overlap; only settlement advances the source.
+    _reservations: dict[StreamReservation, int] = field(default_factory=dict)
     # global position just past the last item ever handed out; everything
     # before it in a later window is context, not new data
     _delivered_end: int = 0
@@ -279,6 +291,8 @@ class StreamBuffer:
         `stride` items, discards items that have fallen out of the window.
         start_offset is the global position of the first item in the chunk.
         """
+        if self._reservations:
+            raise ValueError("cannot pop a stream with unsettled run reservations")
         self._update_buffer()
         buf_len = len(self._buffer)
         window = self.policy.window_size()
@@ -366,6 +380,95 @@ class StreamBuffer:
             data=merged, chunk_index=first.chunk_index, start_offset=first.start_offset, is_final=last.is_final,
             context_items=first.context_items, num_items=sum(c.num_items for c in chunks),
             released=[item for c in chunks for item in c.released],
+        )
+
+    def reserve_window(self, bound: int, consumer_walk: str | None = None) -> StreamChunk | None:
+        """Snapshot inputs without consuming them, including every possible
+        predecessor exit. Only one-item, non-overlapping chunks may reserve.
+        The caller gives the snapshot its own graph-reader references.
+        """
+        if type(bound) is not int or bound < 1:
+            raise ValueError("a stream run bound must be a positive integer")
+        self._update_buffer()
+        ready = self._walk_run_len()
+        if self.policy.window_size() != 1 or self.policy.next_chunk_size(max(ready, 1)) != 1:
+            raise ValueError("stream run reservations need one-item chunks")
+        if self._waiting_graph_edges:
+            raise ValueError("cannot reserve past an unconsumed graph edge")
+        if len(self._reservations) >= 2:
+            return None
+        predecessor = sum(self._reservations.values())
+        ended = self._producer_done_and_all_read() and ready == len(self._buffer)
+        tail = ended and self.policy.continues_in(consumer_walk)
+        if not tail:
+            bound = min(bound, ready - predecessor)
+        if bound <= 0:
+            return None
+        if ready and self.walk_tagged and self.peek_walk() != consumer_walk:
+            return None
+        reservation = StreamReservation(self._chunks_popped, bound, predecessor)
+        self._chunks_popped += 1
+        self._reservations[reservation] = bound
+        items = self._buffer[:min(ready, predecessor + bound)]
+        return StreamChunk(
+            data=self._collate(items), chunk_index=reservation.chunk_index,
+            start_offset=self._consumed, num_items=len(items), reservation=reservation,
+        )
+
+    def owns_window(self, reservation: StreamReservation) -> bool:
+        """A recycled request's new buffer cannot settle an old reader."""
+        return reservation in self._reservations
+
+    def narrow_window(self, reservation: StreamReservation, bound: int) -> None:
+        """Admission can narrow the newest reader before a successor reserves."""
+        previous = self._reservations.get(reservation)
+        if previous is None or type(bound) is not int or not 0 <= bound <= previous:
+            raise ValueError("invalid stream reservation bound")
+        if next(reversed(self._reservations)) is not reservation:
+            raise ValueError("cannot narrow a stream reservation after its successor reserved")
+        self._reservations[reservation] = bound
+
+    def cancel_window(self, reservation: StreamReservation) -> None:
+        """After undoing graph ingest, release an unsubmitted reader. The
+        buffer still owns every item, so no input is returned or duplicated.
+        """
+        if not self._reservations or next(reversed(self._reservations)) is not reservation:
+            raise ValueError("stream reservations must roll back from the newest reader")
+        del self._reservations[reservation]
+        self.maybe_ready = True
+
+    def settle_window(self, reservation: StreamReservation, executed: int) -> StreamChunk:
+        """Retire actual input consumption in submission order. ``released``
+        holds the buffer's references; overlapping graph readers keep theirs.
+        Empty tail iterations advance policy but acknowledge no producer data.
+        """
+        bound = self._reservations.get(reservation)
+        if bound is None or type(executed) is not int or not 0 <= executed <= bound:
+            raise ValueError("invalid stream reservation execution count")
+        if next(iter(self._reservations)) is not reservation:
+            raise ValueError("stream reservations must settle in submission order")
+        self._update_buffer()
+        consumed = min(executed, self._walk_run_len())
+        items = self._buffer[:consumed]
+        self._buffer = self._buffer[consumed:]
+        origin = self._consumed
+        self._consumed += consumed
+        for i in range(executed):
+            self.policy.register_chunk(int(i < consumed))
+        if self._walk_runs and consumed:
+            self._walk_runs[0][1] -= consumed
+            if self._walk_runs[0][1] == 0:
+                self._walk_runs.popleft()
+        self._delivered_end = max(self._delivered_end, self._consumed)
+        final = bool(executed and self._producer_done_and_all_read() and not self._buffer
+                     and not self.policy.continue_after_producer_done())
+        if final:
+            self._final_chunk_emitted = True
+        del self._reservations[reservation]
+        self.maybe_ready = True
+        return StreamChunk(
+            data=self._collate(items), chunk_index=reservation.chunk_index, start_offset=origin,
+            num_items=consumed, is_final=final, released=items,
         )
 
     def store_uningested_edge(self, streaming_edge: StreamingEdge, first: bool = False):
