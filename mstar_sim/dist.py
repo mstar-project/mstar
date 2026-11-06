@@ -12,8 +12,8 @@ lengths); otherwise its outputs are never computed. Point to point has no group 
 on: a send's descriptor travels one way to its receive, ahead of a payload if the sender
 holds values (:func:`_send`, :func:`_receive`). Either way it is charged its NCCL time
 (:func:`mstar_sim.cost.collective_seconds`, measured tables where they exist) on the
-current stream, on every rank alike, so timing stays symmetric, as SGLang's simulator and
-Maya assume.
+current stream, on every rank alike, as SGLang's simulator and Maya assume; a met one starts
+when the last rank has launched it and the last rank's stream is free.
 """
 
 from __future__ import annotations
@@ -158,14 +158,15 @@ def _meet(group, mine: list[int], replay: bool = False) -> list[list[int]]:
     every rank's descriptor. Blocks until they all come, as the GPU's kernel does
     (:func:`_watched`). A mismatch aborts (NCCL's behaviour there is undefined: a hang or
     corrupt data, and a raise would be caught and served past). The collective can't start
-    on any rank's stream before every rank's stream reaches it, so each leaves at the latest
-    of them."""
+    on any rank's stream before every rank has launched it and every rank's stream reaches it,
+    so each leaves at the latest of those."""
     ranks = dist.get_process_group_ranks(group)
     me = dist.get_rank()
     seq = group._get_sequence_number_for_group()  # torch's count of the group's gloo ops
     where = f"mstar_sim: rank {me}, torch sequence number {seq} (meets included) on the group of ranks {ranks}"
     timeline = clock.current_timeline()
-    sent = torch.tensor([*mine, int(timeline.free_at * 1e9)], dtype=torch.int64, device="cpu")  # (a row is integers)
+    ready = max(timeline.free_at, clock.now())  # no rank's stream can start it before its host launches it
+    sent = torch.tensor([*mine, int(ready * 1e9)], dtype=torch.int64, device="cpu")  # (a row is integers)
     gathered = torch.empty(len(ranks) * len(sent), dtype=torch.int64, device="cpu")  # whatever the default
     with _waiting(ranks):
         # straight to the backend: torch's public function logs a failure through the group's
@@ -173,12 +174,12 @@ def _meet(group, mine: list[int], replay: bool = False) -> list[list[int]]:
         _watched(lambda: group._allgather_base(gathered, sent).wait(), where, mine, replay)
         _let_go(group, gathered, sent)
     rows = gathered.view(len(ranks), -1).tolist()
-    free_at = [r.pop() / 1e9 for r in rows]
-    timeline.free_at = max(timeline.free_at, *free_at)
+    ready = [r.pop() / 1e9 for r in rows]
+    timeline.free_at = max(timeline.free_at, *ready)
     if not clock.FAST:
         from mstar_sim import waits
 
-        waits.REPORT["meet_skew_s"] = max(waits.REPORT["meet_skew_s"], max(free_at) - min(free_at))
+        waits.REPORT["meet_skew_s"] = max(waits.REPORT["meet_skew_s"], max(ready) - min(ready))
     if not _pairs(rows):
         lines = "".join(f"\n  rank {r}: {_describe(d)}{'  <- this rank' if r == me else ''}"
                         for r, d in zip(ranks, rows, strict=True))
@@ -205,7 +206,7 @@ def collective(family: str, group, nbytes: int, desc: list[int] | None) -> int:
             tape.collectives.append((group or dist.group.WORLD, desc[:_VALUES]))
         return 0 if tape is not None else -1
     rows = _meet(group or dist.group.WORLD, desc)
-    clock.charge(seconds)
+    clock.charge(seconds, clock.current_timeline().free_at)  # launched when the last rank launched it
     return functools.reduce(operator.and_, (r[_VALUES] for r in rows))
 
 

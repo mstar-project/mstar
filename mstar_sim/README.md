@@ -176,7 +176,9 @@ the roofline.
 - MoE, MLA, grouped and fp4 GEMMs cost the roofline (~30% error in the literature, against
   ~5-10% for measured tables). Those figures are for single kernels; end-to-end numbers
   here are not validated and not accurate (see the top of this file).
-- Collective timing assumes symmetric ranks: no rank's device waits on a slower one's.
+- A collective starts on every rank once the last rank has launched it and the last rank's stream
+  is free, so a host-late rank delays its peers' devices, as on a GPU (`meet_skew_s`: the widest
+  spread of those, per meet). Its NCCL time is the same on every rank.
 - A host blocks at an eager collective's call until its peers come, where a GPU's host only
   enqueues it. Device times are unchanged, but the host waits for its slowest peer to launch, and
   host-side gloo traffic (an `agree` on a CPU group) or another stream's collectives, interleaved

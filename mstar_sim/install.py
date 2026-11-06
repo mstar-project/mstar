@@ -191,10 +191,11 @@ def _report_at_exit(path: str) -> None:
     of ``time.thread_time`` that ran ahead of the clock (an op that released the GIL inside the
     emulator); ``run_delay_s`` the emulator's time the box descheduled; ``ahead_stalls`` the times
     a thread waited for the deployment's bound; ``late_deliveries`` messages polled within 1 ms
-    of a move past W, so maybe moved past; ``meet_skew_s`` the widest gap between ranks' streams
-    at a collective; ``parks`` the times the process counted as blocked with threads in waits
-    unknown to the emulator, and ``unparks_by_look`` those a look ended, its work having run
-    hidden for up to that look; ``gate_waits`` looks that found its own tasks still on a CPU."""
+    of a move past W, so maybe moved past; ``meet_skew_s`` the widest gap between ranks' arrivals
+    at a collective (each at the later of its host and its stream); ``parks`` the times the process
+    counted as blocked with threads in waits unknown to the emulator, and ``unparks_by_look`` those
+    a look ended, its work having run hidden for up to that look; ``gate_waits`` looks that found
+    its own tasks still on a CPU."""
     import atexit
     import json
 

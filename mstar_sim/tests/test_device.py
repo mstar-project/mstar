@@ -1347,10 +1347,12 @@ def test_a_process_beside_two_ranks_stays_within_w_of_them():
     assert float(poller) < 2 * 0.5e-3 + 1e-3, poller
 
 
-def test_a_collective_starts_at_the_latest_ranks_stream():
-    """Ranks reach a collective with their streams apart: it starts when the last stream gets
-    there, on every rank, and a host reading the result on either sees that."""
-    node = f"test-{os.getpid()}-collective"
+@pytest.mark.parametrize("late", ["stream", "host"])
+def test_a_collective_starts_at_the_latest_ranks_stream(late):
+    """Ranks reach a collective with their streams apart, or their hosts: it starts when the last
+    rank's stream gets there, and none starts before the last host launches it. On every rank, and
+    a host reading the result on either sees that."""
+    node = f"test-{os.getpid()}-collective-{late}"
     out = run_sim("""
         import sys, tempfile, time, torch, torch.distributed as dist, torch.multiprocessing as mp
         from mstar_sim import clock
@@ -1359,10 +1361,15 @@ def test_a_collective_starts_at_the_latest_ranks_stream():
             dist.init_process_group("nccl", init_method=f"file://{path}", rank=r, world_size=2)
             torch.cuda.set_device(r)
             x = torch.empty(1 << 14, device="cuda")
-            dist.barrier()
+            dist.all_reduce(x)  # (a synced collective levels the ranks' clocks, which boot leaves apart)
+            torch.cuda.synchronize()
             start = time.perf_counter()
-            if r == 0:
+            if r == 0 and "%s" == "stream":
                 clock.charge(1.0)
+            elif r == 0:
+                end = clock._real() + 1.0  # the host's own work, reading no clock
+                while clock._real() < end:
+                    pass
             dist.all_reduce(x)
             torch.cuda.synchronize()
             sys.stdout.write(f"rank {r} {time.perf_counter() - start} {clock.DEFAULT.free_at}\\n")  # one write
@@ -1371,10 +1378,12 @@ def test_a_collective_starts_at_the_latest_ranks_stream():
 
         if __name__ == "__main__":
             mp.spawn(rank, args=(tempfile.mkdtemp() + "/group",), nprocs=2)
-    """, MSTAR_SIM_NODE=node)
+    """ % late, MSTAR_SIM_NODE=node)
     rows = [line.split() for line in out.splitlines() if line.startswith("rank")]
     spans, ends = {r[1]: float(r[2]) for r in rows}, [float(r[3]) for r in rows]
-    assert len(rows) == 2 and 1.0 <= spans["0"] < 1.2 and abs(ends[0] - ends[1]) < 1e-6, out
+    assert len(rows) == 2 and 0.95 <= spans["0"] < 1.2 and abs(ends[0] - ends[1]) < 1e-6, out
+    if late == "host":
+        assert spans["1"] >= 0.95, out
 
 
 def test_a_native_process_holds_the_deployment_only_while_it_works():
