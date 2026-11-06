@@ -136,10 +136,15 @@ class IterationTables(Resource):
 
     def read(
         self, specs: Mapping[str, IterationInput], rows: Sequence[tuple | None], states: Mapping, repeats: int,
+        horizons: Sequence[int] | None = None,
     ) -> dict[str, torch.Tensor]:
         """Each input of ``specs``, ``[B, repeats, *shape]``: row i's ``(rid, its
         iteration, ...)`` at that iteration on, or None for a padding row, which
         (as a row with no state) reads ``capture_fill``."""
+        if horizons is None:
+            horizons = [repeats] * len(rows)
+        if len(horizons) != len(rows) or any(type(n) is not int or not 0 <= n <= repeats for n in horizons):
+            raise ValueError("iteration input horizons must fit each staged row")
         index: list[int] = []
         names = list(specs)
         for name in names:
@@ -147,21 +152,21 @@ class IterationTables(Resource):
             if name not in self._tables:
                 self._tables[name] = _Table(spec, self._device)
             table = self._tables[name]
-            for row in rows:
+            for row, count in zip(rows, horizons, strict=True):
                 state = None if row is None else states.get(row[0])
-                if state is None:
+                if state is None or count == 0:
                     index.extend((0,) * repeats)
                     continue
                 extent = self._extent(table, spec, row[0], state)
                 start = row[1] + spec.offset
-                if extent.padless_rows is not None and start + repeats > extent.padless_rows:
+                if extent.padless_rows is not None and start + count > extent.padless_rows:
                     raise ValueError(f"iteration input {name!r} reads past the {extent.rows} rows of {spec.source!r}")
                 last = extent.base + extent.rows - 1
                 first = extent.base + start
                 if repeats == 1:
                     index.append(first if first < last else last)
                 else:
-                    index.extend(min(first + i, last) for i in range(repeats))
+                    index.extend(min(first + i, last) if i < count else 0 for i in range(repeats))
         width = len(rows) * repeats
         if width == 1:
             # A single iteration of one row is already contiguous in its

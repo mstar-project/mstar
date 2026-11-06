@@ -3452,3 +3452,24 @@ def test_requested_device_execution_refuses_unsupported_walk_at_load(repeat_reas
     with pytest.raises(ValueError, match="n/decode.*device_stop.*no conditional graph"):
         repeats.settle(lambda *key: None, lambda *key: repeat_reason,
                        {"device stop": lambda *key: "backend: no conditional graph"})
+
+
+def test_a_batched_input_window_does_not_read_past_each_rows_admitted_horizon():
+    from mstar.model.submodule_base import iteration_columns
+
+    node = SimpleNamespace(
+        ITERATION_INPUTS={
+            "t": IterationInput("ts", offset=1, dtype=torch.long, capture_fill=-9),
+            "s": IterationInput("stream", streamed=True, dtype=torch.long, capture_fill=-8),
+        },
+        iteration_tables=IterationTables(CPU),
+        request_states={1: {"ts": torch.arange(8)}, 2: {"ts": torch.arange(8)}},
+    )
+    rows = [(1, 1, {"stream": torch.arange(6)}), (2, 6, {"stream": torch.tensor([70])}), None]
+    # A continuing row covers predecessor uncertainty plus its next run;
+    # a fresh row near its fixed cap has only one valid input, in the same batch.
+    out = iteration_columns(node, rows, 8, CPU, horizons=[6, 1, 0])
+    assert out["t"].tolist() == [[2, 3, 4, 5, 6, 7, -9, -9], [7, -9, -9, -9, -9, -9, -9, -9], [-9] * 8]
+    assert out["s"].tolist() == [[0, 1, 2, 3, 4, 5, -8, -8], [70, -8, -8, -8, -8, -8, -8, -8], [-8] * 8]
+    with pytest.raises(ValueError, match="reads past"):
+        iteration_columns(node, rows, 8, CPU, horizons=[6, 2, 0])

@@ -1537,6 +1537,7 @@ class NodeSubmodule(torch.nn.Module, ABC):
 
 def iteration_columns(
     submodule: NodeSubmodule, rows: Sequence[tuple | None], repeats: int, device,
+    *, horizons: Sequence[int] | None = None,
 ) -> dict[str, torch.Tensor]:
     """``submodule``'s ``ITERATION_INPUTS`` for a step's rows, ``[B, repeats,
     *shape]`` each: row i's ``(rid handle, its iteration[, its streamed
@@ -1546,16 +1547,20 @@ def iteration_columns(
     the row's items of the stream this step, ``[items, ...]``, read from 0."""
     specs = submodule.ITERATION_INPUTS
     kept = {name: spec for name, spec in specs.items() if not spec.streamed}
-    out = submodule.iteration_tables.read(kept, rows, submodule.request_states, repeats) if kept else {}
+    if horizons is None:
+        horizons = [repeats] * len(rows)
+    if len(horizons) != len(rows) or any(type(n) is not int or not 0 <= n <= repeats for n in horizons):
+        raise ValueError("iteration input horizons must fit each staged row")
+    out = submodule.iteration_tables.read(kept, rows, submodule.request_states, repeats, horizons) if kept else {}
     states = submodule.request_states
     for name, spec in specs.items():
         if not spec.streamed:
             continue
         values = []
         fill = None
-        for row in rows:
+        for row, count in zip(rows, horizons, strict=True):
             state = None if row is None else states.get(row[0])
-            if state is None:
+            if state is None or count == 0:
                 if fill is None:
                     fill = torch.full((repeats, *spec.shape), spec.capture_fill, dtype=spec.dtype, device=device)
                 values.append(fill)
@@ -1563,14 +1568,17 @@ def iteration_columns(
             table = (row[2] if len(row) > 2 else {}).get(spec.source)
             if table is None:
                 table = torch.empty(0, *spec.shape, dtype=spec.dtype, device=device)
-            padded = _pad_table(spec, state, table, repeats)
+            padded = _pad_table(spec, state, table, count)
             start = spec.offset
             padless = spec.pad is None or (isinstance(spec.pad, str) and spec.pad not in state)
-            if padless and start + repeats > padded.shape[0]:
+            if padless and start + count > padded.shape[0]:
                 raise ValueError(f"iteration input {name!r} reads past the {padded.shape[0]} rows of {spec.source!r}")
             # past the end every row is the pad's last, which the padded table ends with ``repeats`` of
-            start = min(start, padded.shape[0] - repeats)
-            values.append(padded[start:start + repeats].reshape(repeats, *spec.shape))
+            start = min(start, padded.shape[0] - count)
+            value = padded[start:start + count].reshape(count, *spec.shape)
+            if count < repeats:
+                value = torch.cat([value, value.new_full((repeats - count, *spec.shape), spec.capture_fill)])
+            values.append(value)
         out[name] = torch.stack(values)
     return out
 
