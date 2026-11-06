@@ -131,7 +131,7 @@ class _Recorder:
     def layer_view(self, layer_idx):
         return layer_idx
 
-    def run(self, q, label=None, kv_cache_layer=None, q_pe=None, k=None, v=None):
+    def run(self, q, label=None, kv_cache_layer=None, q_pe=None):
         self.calls.append(("run", kv_cache_layer, label, q_pe.unique().tolist()))
         return q.new_zeros(q.shape)
 
