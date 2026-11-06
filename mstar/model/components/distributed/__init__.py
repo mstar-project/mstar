@@ -15,6 +15,7 @@ returning, so the sampler stays vocab-oblivious.
 """
 from mstar.model.components.distributed.attention import ParallelAttention, ParallelCrossAttention
 from mstar.model.components.distributed.embedding import VocabParallelEmbedding
+from mstar.model.components.distributed.kda import ParallelKimiDeltaAttention
 from mstar.model.components.distributed.linear import (
     ColumnParallelLinear,
     KVColumnParallelLinear,
@@ -33,6 +34,7 @@ __all__ = [
     "RowParallelLinear",
     "ParallelAttention",
     "ParallelGatedDeltaNet",
+    "ParallelKimiDeltaAttention",
     "ParallelCrossAttention",
     "ParallelGatedMLP",
     "ParallelGatedMLPUnfused",

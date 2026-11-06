@@ -324,15 +324,21 @@ def test_reasoner_submodule_step_and_stop(tmp_path) -> None:
         Cosmos3Model.REASONER_PREFILL_VISION_WALK, fwd,
         {"text_inputs": [ids], "position_ids": [pos], "vision_embeds": [torch.zeros(2, 8)]},
     )
-    assert inp.input_seq_len == 6 and sub.request_state("r")["next_pos"] == 6
+    assert inp.input_seq_len == 6
     step = sub.declare_step(Cosmos3Model.REASONER_PREFILL_VISION_WALK, ["r"], [inp])
     assert [(s.request_id, s.label, s.span) for s in step.segments] == [("r", "main", 6)]
     assert step.steps[KV_CACHE].commit and step.steps[ATTN].causal
     assert torch.equal(step.steps[SAMPLER].prefill_tracked_tokens["r"], ids)
 
+    fwd.dynamic_loop_iter_counts = {}
     dec = sub.prepare_inputs(Cosmos3Model.REASONER_DECODE_WALK, fwd, {"text_inputs": [torch.tensor([42])]})
     assert dec.input_seq_len == 1 and dec.tensor_inputs["position_ids"].tolist() == [[6], [6], [6]]
-    assert sub.request_state("r")["next_pos"] == 7
+    # a step prepared again after a refused admit feeds the same position; the next iteration the next one
+    again = sub.prepare_inputs(Cosmos3Model.REASONER_DECODE_WALK, fwd, {"text_inputs": [torch.tensor([42])]})
+    assert again.tensor_inputs["position_ids"].tolist() == [[6], [6], [6]]
+    fwd.dynamic_loop_iter_counts = {REASONER_DECODE_LOOP: 1}
+    nxt = sub.prepare_inputs(Cosmos3Model.REASONER_DECODE_WALK, fwd, {"text_inputs": [torch.tensor([43])]})
+    assert nxt.tensor_inputs["position_ids"].tolist() == [[7], [7], [7]]
     step = sub.declare_step(Cosmos3Model.REASONER_DECODE_WALK, ["r"], [dec])
     assert step.steps[SAMPLER].prefill_tracked_tokens == {}
 
@@ -363,8 +369,8 @@ def test_reasoner_padded_decode_batch_shares_one_device(tmp_path) -> None:
 
     model = _model(tmp_path)
     sub = Cosmos3ReasonerSubmodule(transformer=None, config=model.config)
-    fwd = types.SimpleNamespace(request_id="r", rid_handle="r", step_metadata={})
-    sub.request_state("r").add_all(next_pos=6)
+    fwd = types.SimpleNamespace(request_id="r", rid_handle="r", step_metadata={}, dynamic_loop_iter_counts={})
+    sub.request_state("r").add_all(first_decode_pos=6)
 
     token = torch.tensor([42])
     dec = sub.prepare_inputs(Cosmos3Model.REASONER_DECODE_WALK, fwd, {"text_inputs": [token]})

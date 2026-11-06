@@ -17,6 +17,7 @@ from mstar.engine.resources.sampler.config import (
 from mstar.engine.resources.sampler.resident import SamplerCells
 from mstar.engine.resources.sampler.utils import (
     AcceleratorGraphableSampler,
+    FusedDrawArgs,
     GenerationHistory,
     Sampler,
     SamplerBuffers,
@@ -34,6 +35,8 @@ logger = logging.getLogger(__name__)
 
 class SamplerResource(Resource):
     prefix_skip_safe = True
+    # a rebuild row's draw never commits, so a drop has nothing here to discard
+    supports_drop = True
 
     def can_capture(self) -> bool:
         return DeviceCapability.of(self._device).graph_backend is not None
@@ -478,14 +481,15 @@ class SamplerResource(Resource):
 
     @staticmethod
     def _kept_rids_of(step: SamplerStep, ctx: StepContext) -> frozenset[int] | None:
-        """The rows whose draw commits: ``step.kept_rids`` less any row mid-prefill.
-        A non-final chunk's token is not a real sample, so it advances no RNG
-        offset and marks no token seen."""
-        mid_prefill = ctx.chunk_tokens_after
-        if not mid_prefill:
+        """The rows whose draw commits: ``step.kept_rids`` less any row mid-prefill
+        or rebuilding. A non-final chunk's token is not a real sample, so it
+        advances no RNG offset and marks no token seen, and a rebuild row's
+        request already has the token it draws."""
+        mid_prefill, rebuild = ctx.chunk_tokens_after, ctx.rebuild_rids
+        if not mid_prefill and not rebuild:
             return step.kept_rids
         kept = frozenset(ctx.request_ids) if step.kept_rids is None else step.kept_rids
-        return kept - mid_prefill.keys()
+        return kept - mid_prefill.keys() - rebuild
 
     def plan(self, step: SamplerStep, ctx: StepContext):
         laps = PhaseLaps(f"{ctx.plan_phase}.sampler.")
@@ -697,7 +701,7 @@ class SamplerResource(Resource):
         # An eager step has no per-step row to scatter from: write the masters
         # by request, so the next step can still read its token on the device.
         if self._keep_last_token and by_slot:
-            bufs.write_last_tokens(request_ids, tokens)
+            bufs.write_last_tokens(request_ids, tokens, kept_rids=self._kept_rids)
         return tokens
 
     def step_host_rows(self) -> dict[str, torch.Tensor]:
@@ -725,6 +729,21 @@ class SamplerResource(Resource):
         device by slot (the graph-buffer path): what the device-side
         loop-back needs. False on an eager-only node or with the knob off."""
         return self._cg_buffers is not None and self._keep_last_token
+
+    @torch.compiler.disable
+    def fused_draw_args(self) -> FusedDrawArgs | None:
+        """This step's per-row parameters, for a kernel in the forward that draws each row's tokens as `sample` would
+        on a vocabulary of at most ``FUSED_SAMPLE_MAX_VOCAB``. Rows are the batch the forward runs on, as for
+        `sample`. None when `sample` would draw any other way: an eager step, the penalty, a kept last token, or a
+        filter, write or broadcast besides the draw. The kernel's caller advances the offsets with `advance_offsets`."""
+        if self._cg_sampler is None or self._apply_penalty_this_step or self._keep_last_token:
+            return None
+        return self._cg_sampler.fused_draw_args(self._apply_filters_this_step)
+
+    @torch.compiler.disable
+    def advance_offsets(self, draws: int) -> None:
+        """Move each row's RNG offset past ``draws`` draws, as that many `sample` calls would."""
+        self._cg_sampler.advance_offsets(draws)
 
     def loopback_tokens(self, request_ids: list[str]) -> torch.Tensor:
         """The last sampled token of each row of this step, as its input ids,

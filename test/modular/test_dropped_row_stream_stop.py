@@ -34,6 +34,7 @@ from mstar.graph.runtime.base import PhasedPostprocess, RouteOutput  # noqa: E40
 from mstar.model.submodule_base import END_PARTITION, BatchedModelOutput, chunk_loop_name  # noqa: E402
 from mstar.worker.chunk_loops import ChunkLoops  # noqa: E402
 from mstar.worker.micro_scheduler import ScheduledBatch  # noqa: E402
+from mstar.worker.rebuild import Rebuilds  # noqa: E402
 from mstar.worker.worker import PendingBatch, Worker  # noqa: E402
 
 NODE, WALK, LOOP = "vocoder", "w", "stream_loop"
@@ -153,6 +154,7 @@ def _worker(eng, runtime, in_loop=True, through_send=False, loop=LOOP):
     w.enable_nvtx = False
     w.enable_prof = False
     w.device = torch.device("cpu")
+    w._rebuilds = Rebuilds({}, {})
     w._graph_runtime = runtime
     w.scheduler = SimpleNamespace(failed_rids=set())
     w.tensor_manager = SimpleNamespace(

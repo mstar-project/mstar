@@ -44,6 +44,12 @@ class ChunkRange(NamedTuple):
     def is_final(self) -> bool:
         return self.end >= self.total
 
+    @property
+    def is_first(self) -> bool:
+        """Whether this is its prompt's first chunk, which caps its chunk Loop: its stride runs from 0
+        even past a cached prefix, and a later chunk's is its own span, which starts past 0."""
+        return self.stride == self.end
+
 
 class ChunkingManagement:
     def __init__(self, submodules: Mapping[str, "SubmoduleManagement"]):

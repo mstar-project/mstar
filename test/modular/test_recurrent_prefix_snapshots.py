@@ -212,7 +212,7 @@ def test_a_pool_keeps_snapshot_slots_only_for_a_cache_the_engine_opens():
 
 
 @pytest.mark.parametrize("override, refusal", [
-    ({"prefix_slots": -1}, "prefix_slots=-1"),
+    ({"prefix_slots": -1}, "prefix_slots must be an integer >= 0; got -1"),
     # the sink takes one slot, so no request would ever be admitted
     ({"max_slots": 1}, "max_slots=1"),
 ])

@@ -15,6 +15,8 @@ from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from mstar.engine.engine import ExecutingBatch  # noqa: E402
+from mstar.engine.resources.step import StepContext  # noqa: E402
 from mstar.streaming.stream_buffer import StreamChunkInfo, StreamingEdge  # noqa: E402
 from mstar.worker.micro_scheduler import ScheduledBatch  # noqa: E402
 from mstar.worker.worker import Speculation, Worker  # noqa: E402
@@ -35,13 +37,14 @@ def _speculation(rids: list[str]) -> Speculation:
             node_name=NODE, graph_walk="w",
             request_to_worker_graph={r: "wg" for r in rids},
         ),
-        node_batch=SimpleNamespace(
-            request_ids=list(rids),
+        node_batch=ExecutingBatch(
+            node_name=NODE,
             per_request_input_tensors={r: {} for r in rids},
             per_request_info={r: object() for r in rids},
             per_request_input_metadata={r: None for r in rids},
             final_stream_rids=set(rids),
             partition_done_rids=set(rids),
+            step_context=StepContext(request_ids=tuple(rids), graph_walk="w", slot=0, capture=False),
         ),
         consumed_edges={("tok", NODE)},
         continuing_rids=set(rids),
@@ -84,6 +87,7 @@ def test_dropped_rid_gets_its_own_edges_back():
     for table in (
         spec.node_batch.per_request_input_tensors,
         spec.node_batch.per_request_info,
+        spec.node_batch.per_request_info_wrapped,
         spec.node_batch.per_request_input_metadata,
         spec.scheduled_batch.request_to_worker_graph,
     ):
