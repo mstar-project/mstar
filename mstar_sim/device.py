@@ -1179,7 +1179,7 @@ def _h2d(src: torch.Tensor, nbytes: int, non_blocking: bool) -> None:
         if not non_blocking:
             clock.wait_until(end)
         elif not pinned:
-            clock.wait_until(clock.now() + seconds)
+            clock.wait_until(clock.now() + seconds * clock.TIME_SCALE)
 
 
 def _to(self, *args, **kwargs):

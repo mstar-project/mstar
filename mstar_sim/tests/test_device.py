@@ -1453,7 +1453,8 @@ def test_a_blocking_h2d_holds_the_host_until_the_copy_is_done():
         assert done > 0.1 and done <= span < done + 0.01, (span, done)
 
 
-def test_a_copy_from_pageable_memory_blocks_the_host_and_is_slower_than_from_pinned():
+@pytest.mark.parametrize("time_scale", ["1", "10"])  # a slower GPU's staging takes as long as its copy
+def test_a_copy_from_pageable_memory_blocks_the_host_and_is_slower_than_from_pinned(time_scale):
     out = run_sim("""
         import time, torch
         from mstar_sim import clock
@@ -1466,7 +1467,7 @@ def test_a_copy_from_pageable_memory_blocks_the_host_and_is_slower_than_from_pin
             busy, t0 = clock.ENGINES["h2d"].free_at, time.perf_counter()
             source.to("cuda", non_blocking=True)
             print(time.perf_counter() - t0, clock.DEFAULT.free_at - t0)
-    """)
+    """, MSTAR_SIM_TIME_SCALE=time_scale)
     (host_pinned, device_pinned), (host_pageable, device_pageable) = (map(float, l.split()) for l in out.splitlines())
     assert host_pinned < 0.1 * device_pinned, (host_pinned, device_pinned)
     assert host_pageable >= 0.9 * device_pageable and device_pageable > 1.5 * device_pinned, out
