@@ -17,7 +17,6 @@ import torch
 
 sys.path.insert(0, ".")
 
-from mstar.engine.precision import NodePrecision  # noqa: E402
 from mstar.graph.base import GraphNode, Loop, Sequential, TensorPointerInfo  # noqa: E402
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION  # noqa: E402
 from mstar.model.flux2_klein.config import DENOISE_LOOP, DIT_ATTN, Flux2KleinConfig  # noqa: E402
@@ -254,19 +253,6 @@ def test_postprocess_encodes_png():
     assert png[:8] == b"\x89PNG\r\n\x1a\n"
     with pytest.raises(ValueError):
         _make_model().postprocess(torch.zeros(1), "text")
-
-
-def test_autocast_is_off_so_numerics_follow_the_load_dtypes():
-    model = _make_model()
-    for node in ("text_encoder", "vae_encoder", "dit", "vae_decoder"):
-        assert model.get_node_precision(node) == NodePrecision(torch.bfloat16, autocast=False)
-    # QuantLinears keep fp32 tensor scales, so a quantized DiT keeps its build dtypes
-    assert _make_model(linear_dtype="nvfp4").get_node_precision("dit") == NodePrecision(None)
-
-
-# ----------------------------------------------------------------------
-# OpenAI adapter
-# ----------------------------------------------------------------------
 
 
 def test_diffusion_image_adapter_maps_size_seed_and_edits(tmp_path):

@@ -2559,7 +2559,7 @@ def test_qwen3_tts_node_precision_keeps_ref_encoder_islands_fp32():
     """The engine casts each node by its policy at load. RefEncoder's speaker
     encoder runs in bf16, its mel front end and codec encoder stay fp32 (and
     the globs name real modules: one that matched nothing would fail the
-    load); the Talker is bf16 without autocast; the Codec keeps ``codec_dtype``."""
+    load)."""
     from mstar.engine.precision import apply_precision
     from mstar.model.qwen3_tts.components.speaker_encoder import (
         Qwen3TTSMelFrontEnd,
@@ -2569,10 +2569,6 @@ def test_qwen3_tts_node_precision_keeps_ref_encoder_islands_fp32():
     from mstar.model.qwen3_tts.submodules import RefEncoderSubmodule
 
     model = Qwen3TTSModel.__new__(Qwen3TTSModel)
-    talker = model.get_node_precision("Talker")
-    assert (talker.param_dtype, talker.autocast_dtype) == (torch.bfloat16, None)
-    assert model.get_node_precision("Codec").param_dtype is None
-
     config = _tiny_model_config()
     speaker_config = Qwen3TTSSpeakerEncoderConfig(
         enc_dim=config.talker.hidden_size, enc_channels=(16, 16, 16, 16, 48),

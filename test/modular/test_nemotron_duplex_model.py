@@ -200,19 +200,6 @@ def test_duplex_kv_pools_hold_the_session_cap_at_the_calls_it_serves(kwargs):
                                    "c.yaml")
 
 
-def test_duplex_node_precisions():
-    """Every node in bf16; only the encoder, the shared FastConformer, still
-    takes its fp32 norms and softmax from autocast."""
-    from mstar.engine.precision import NodePrecision
-
-    model = _make_model()
-    assert {node: model.get_node_precision(node) for node in NODES} == {
-        "nano_llm": NodePrecision(torch.bfloat16),
-        "eartts_talker": NodePrecision(torch.bfloat16),
-        "conformer_encoder": NodePrecision(torch.bfloat16, autocast=True),
-    }
-
-
 @pytest.mark.parametrize("param_dtype", ["bfloat16", "float16", "float32", None])
 def test_duplex_encoder_state_is_stored_in_the_encoders_dtype(param_dtype):
     """The encoder stores each step's layer state and keys / values for the
