@@ -1749,7 +1749,7 @@ class Engine:
         self, node_name: str, runner: AcceleratorGraphRunner, graph_walk: str, config, signals: Collection[str],
     ) -> None:
         """Before capture: have ``graph_walk``'s captures run on the device,
-        where its stop reads a token and it runs on one rank."""
+        where its stop is declared and it runs on one rank."""
         mgmt = self._submodules[node_name]
         if mgmt.joint_comm_group.world_size > 1:
             return  # the stop must match on every rank, and NCCL in a WHILE body is untested
@@ -1760,9 +1760,8 @@ class Engine:
                 "and a run on the device can end short of it"
             ))
             return
-        policy = next(
-            (p for p in (self.get_stop_policies(node_name, graph_walk) or {}).values() if p.reads_token), None,
-        )
+        policies = self.get_stop_policies(node_name, graph_walk) or {}
+        policy = next((p for p in policies.values() if p.reads_token), next(iter(policies.values()), None))
         if policy is None:
             return
         mgmt.device_stops[graph_walk] = policy
@@ -1876,7 +1875,7 @@ class Engine:
         if mgmt.joint_comm_group.world_size > 1:
             return "deployment: it runs on more than one rank"
         if graph_walk not in mgmt.device_stops:
-            return "graph: its stop reads no token"
+            return "graph: it has no declared stop policy"
         if mgmt.accelerator_graph_runner is None:
             return "runner: the node captures no graphs"
         return mgmt.accelerator_graph_runner.run_refusal(graph_walk)

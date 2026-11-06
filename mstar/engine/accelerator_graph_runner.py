@@ -1374,6 +1374,9 @@ class AcceleratorGraphRunner:
         if walk in self._generator_walks:
             self._run_failures[walk] = "runner: its forward draws from a torch generator, which a raw launch repeats"
             return None, None, None
+        if ask.stream_tokens and ask.token_signal is None:
+            self._run_failures[walk] = "graph: a counted run has no token signal to stream"
+            return None, None, None
         dropping = None
         if ask.drop_rows:
             if self._resident is None or not self._resident.covers(spec.bucket):
@@ -1423,7 +1426,7 @@ class AcceleratorGraphRunner:
             for pair in ask.carries.values():
                 target = warmed.static_inputs[pair.input]
                 target.copy_(output_named(output, pair.output).reshape(target.shape))
-            tokens = output_named(output, ask.token_signal).to(torch.long)
+            tokens = None if ask.token_signal is None else output_named(output, ask.token_signal).to(torch.long)
             cuda.stop(state, tokens, device_handle, backend.raw_stream())
             return raw
 

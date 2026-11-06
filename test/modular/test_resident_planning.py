@@ -394,7 +394,7 @@ def test_skipped_page_crossing_rewrites_cells_before_retry():
 
 @pytest.mark.parametrize(("world_size", "policies", "why"), [
     (2, {}, "deployment: it runs on more than one rank"),
-    (1, {}, "graph: its stop reads no token"),
+    (1, {}, "graph: it has no declared stop policy"),
 ])
 def test_a_walk_says_why_it_doesnt_skip_a_stopped_replay(world_size, policies, why):
     from mstar.engine.engine import Engine

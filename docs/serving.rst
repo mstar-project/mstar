@@ -357,7 +357,9 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        one iteration, as one taking in new rows is, still runs. A live row hands on to the
        next run where it stands. ``drop_rows`` does that and sends a stopped row's reads and
        writes to the trash slot until the run ends, so its KV and recurrent state stay where
-       its stop left them; it needs a resident walk. Both need a token stop, one rank, CUDA
+       its stop left them; it needs a resident walk. Counted loops need no token output:
+       their admitted iteration bound and the worker yield end the same device run. Both
+       modes need a declared stop policy, one rank, CUDA
        12.4 and up, ``libcudadevrt.a`` under ``CUDA_HOME``, a capture of kernels and
        copies alone, and a node without iteration inputs (not Qwen3-TTS's Talker or a DiT).
        An explicitly requested device stop that cannot run fails startup with its refusal

@@ -41,8 +41,9 @@ class _Loop:
     def stop(self, state, tokens, handle, stream):
         """The test double of the ``run_stop`` kernel, which only CUDA can run."""
         self.state = state
-        token = tokens.reshape(len(state.marks), -1)[:, 0]
-        state.marks |= (token.unsqueeze(-1) == state.stop_ids).any(-1) & ~state.immune
+        token = None if tokens is None else tokens.reshape(len(state.marks), -1)[:, 0]
+        if token is not None:
+            state.marks |= (token.unsqueeze(-1) == state.stop_ids).any(-1) & ~state.immune
         if state.stream is not None:
             state.stream.tokens[:, int(state.index)] = token
             state.stream.landed[0] = int(state.index) + 1
@@ -77,7 +78,7 @@ class _Loop:
                 return
 
 
-def _runner(monkeypatch, loop, tokens, bs=2, limit=6, refill_at=None, carries=None, stream_tokens=False):
+def _runner(monkeypatch, loop, tokens, bs=2, limit=6, refill_at=None, carries=None, stream_tokens=False, counted=False):
     """A runner holding a captured run whose forward samples ``tokens[iteration]``."""
     monkeypatch.setattr(torch.accelerator, "is_available", lambda: False)
     runner = AcceleratorGraphRunner.__new__(AcceleratorGraphRunner)
@@ -88,7 +89,8 @@ def _runner(monkeypatch, loop, tokens, bs=2, limit=6, refill_at=None, carries=No
         while_refusal=lambda: None, while_runtime=lambda: loop,
         raw_stream=lambda: 0, synchronize=lambda: None,
     )
-    runner.ask_run(WALK, RunAsk("new_token", frozenset({EOS}), False, limit, carries or {}, ("frame",), ("cond",),
+    runner.ask_run(WALK, RunAsk(None if counted else "new_token", frozenset() if counted else frozenset({EOS}),
+                                False, limit, carries or {}, ("frame",), ("cond",),
                                 refill_at, stream_tokens))
     static = {"cond": torch.zeros(bs), "h": torch.zeros(bs)}
     calls = []
@@ -98,7 +100,7 @@ def _runner(monkeypatch, loop, tokens, bs=2, limit=6, refill_at=None, carries=No
         calls.append(static["cond"].clone())
         token = torch.tensor(tokens[i])
         return BatchedModelOutput(
-            check_stop_buffers={"new_token": token},
+            check_stop_buffers={} if counted else {"new_token": token},
             row_outputs={"frame": token.float() * 2, "h": static["h"] + 1},
         )
 
@@ -907,3 +909,43 @@ def test_a_loop_back_aliasing_a_run_column_goes_on_as_its_last_iteration():
     outputs = BatchedModelOutput(per_rid_outputs={1: {"new_token": [torch.tensor([7])]}})
     engine._postprocess_batch(batch, outputs)
     assert outputs.get(1)["text_inputs"][0].tolist() == [7]
+
+
+@pytest.mark.parametrize("yield_after", [None, 2])
+def test_counted_run_needs_no_token_output_and_honors_limit_and_yield(monkeypatch, yield_after):
+    loop = _Loop()
+    _, run, _, calls = _runner(monkeypatch, loop, [[EOS, EOS]], counted=True, limit=4)
+    if yield_after is not None:
+        loop.on_iteration = lambda i: run.state.request_yield() if i + 1 == yield_after else None
+    stops, rows, _ = _run(run, 1, 4)
+    ran = 4 if yield_after is None else yield_after
+    assert len(calls) == ran
+    assert stops[RUN_REPLAYS].tolist() == [ran, ran]
+    assert "new_token" not in stops
+    assert rows["frame"][0].tolist() == [2 * EOS] * 4
+
+
+def test_counted_run_cannot_request_token_streaming(monkeypatch):
+    runner, run, _, _ = _runner(monkeypatch, _Loop(), [[1, 1]], counted=True, stream_tokens=True)
+    assert run is None
+    assert "no token signal" in runner.run_refusal(WALK)
+
+
+def test_engine_asks_for_a_counted_device_run_without_a_token_signal():
+    from mstar.engine.engine import Engine
+    from mstar.model.submodule_base import StopKind, StopPolicy
+
+    asked = []
+    policy = StopPolicy(StopKind.ITER)
+    engine = Engine.__new__(Engine)
+    engine._submodules = {"n": SimpleNamespace(
+        joint_comm_group=SimpleNamespace(world_size=1), device_stops={}, refills={}, loopback_rows=None,
+        submodule=SimpleNamespace(repeat_carry=lambda walk, signals: {}), run_columns={},
+    )}
+    engine.get_stop_policies = lambda node, walk: {"loop": policy}
+    runner = SimpleNamespace(ask_run=lambda walk, ask: asked.append(ask))
+    engine._ask_run("n", runner, WALK, SimpleNamespace(
+        device_stop="skip", max=4, refill_at=None, stream_tokens=False,
+    ), ())
+    assert len(asked) == 1 and asked[0].token_signal is None
+    assert engine._submodules["n"].device_stops[WALK] is policy

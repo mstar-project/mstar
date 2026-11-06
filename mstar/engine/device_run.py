@@ -46,7 +46,7 @@ extern "C" __global__ void run_stop(
     long long at = *index;
     for (int row = 0; row < rows; ++row) {
         if (host_tokens) host_tokens[row * host_width + at] = tokens[row * stride];
-        if (!marks[row] && !immune[row]) {
+        if (tokens && !marks[row] && !immune[row]) {
             for (int i = 0; i < num_ids; ++i) {
                 if (tokens[row * stride] == stop_ids[i]) marks[row] = 1;
             }
@@ -81,7 +81,7 @@ _STOP_SOURCE = f"#define RUN_RAN {RUN_RAN}\n#define RUN_SKIPPED {RUN_SKIPPED}\n{
 
 class RunAsk(NamedTuple):
     """What a walk's WHILE run needs of its captures."""
-    token_signal: str
+    token_signal: str | None
     stop_ids: frozenset[int]
     # also send a stopped row's reads and writes to the trash slot
     drop_rows: bool
@@ -150,7 +150,7 @@ class RunState:
     end it."""
 
     def __init__(
-        self, bs: int, token_signal: str, stop_ids: Collection[int], device: torch.device,
+        self, bs: int, token_signal: str | None, stop_ids: Collection[int], device: torch.device,
         dropping: Any = None, stream: TokenStream | None = None,
     ):
         self.token_signal = token_signal
@@ -281,11 +281,12 @@ class CudaWhile:
         )
         return graph.value, handle.value, torch.tensor([handle.value], dtype=torch.int64, device=device)
 
-    def stop(self, state: RunState, tokens: torch.Tensor, handle: torch.Tensor, stream: int) -> None:
+    def stop(self, state: RunState, tokens: torch.Tensor | None, handle: torch.Tensor, stream: int) -> None:
         """Inside the step's capture: ``run_stop`` on ``stream``."""
-        row = tokens.reshape(len(state.marks), -1)
+        row = None if tokens is None else tokens.reshape(len(state.marks), -1)
         values = [
-            ctypes.c_void_p(row.data_ptr()), ctypes.c_int(row.stride(0)), ctypes.c_int(len(state.marks)),
+            ctypes.c_void_p(None if row is None else row.data_ptr()),
+            ctypes.c_int(0 if row is None else row.stride(0)), ctypes.c_int(len(state.marks)),
             ctypes.c_void_p(state.stop_ids.data_ptr()), ctypes.c_int(len(state.stop_ids)),
             ctypes.c_void_p(state.immune.data_ptr()), ctypes.c_void_p(state.marks.data_ptr()),
             ctypes.c_void_p(state.index.data_ptr()), ctypes.c_void_p(state.limit.data_ptr()),
