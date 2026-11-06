@@ -106,15 +106,15 @@ def test_scheduled_policy_rejects_bad_sizes():
 
 
 @pytest.mark.parametrize(
-    ("policy", "expected"),
+    ("policy_factory", "expected"),
     [
-        (FixedChunkPolicy(chunk_size=3), [(3, 0), (3, 0), (3, 0), (1, 0)]),
-        (SlidingWindowChunkPolicy(window=4, stride=2), [(4, 0), (4, 2), (4, 2), (4, 2), (2, 2)]),
-        (LeftContextChunkPolicy(chunk=4, left_context=1), [(4, 0), (5, 1), (3, 1)]),
+        (lambda: FixedChunkPolicy(chunk_size=3), [(3, 0), (3, 0), (3, 0), (1, 0)]),
+        (lambda: SlidingWindowChunkPolicy(window=4, stride=2), [(4, 0), (4, 2), (4, 2), (4, 2), (2, 2)]),
+        (lambda: LeftContextChunkPolicy(chunk=4, left_context=1), [(4, 0), (5, 1), (3, 1)]),
     ],
 )
-def test_existing_policies_report_context_items(policy, expected):
-    chunks = _drive(policy, total_items=10)
+def test_existing_policies_report_context_items(policy_factory, expected):
+    chunks = _drive(policy_factory(), total_items=10)
     assert [(w, c) for w, c, _, _ in _geometry(chunks)] == expected
     assert _new_items(chunks) == list(range(10))
 
