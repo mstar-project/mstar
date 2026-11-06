@@ -124,6 +124,8 @@ class FlashInferCrossManager(CrossAttentionManager):
         self._eager_plan_states: dict[EagerSlotKey, AttentionWrapper] = {}
         self._cg_plan_states: dict[CGSlotKey, AttentionWrapper] = {}
 
+        # a resident step's query indptr, by row count
+        self._resident_qo_indptr: dict[int, torch.Tensor] = {}
         self._preplan_states: dict[str, AttentionWrapper] = {}
         self._preplanned = False
         # wrapper key (EagerSlotKey, or CGSlotKey under capture) -> its last plan
@@ -280,6 +282,15 @@ class FlashInferCrossManager(CrossAttentionManager):
     ) -> dict[str, QueryPacking]:
         if self._query_kv_cache_name is None:
             return self._step_query_packings(step)
+        if ctx.resident is not None:
+            # one query token a row, in the step's row order; the query pool's
+            # plan of a resident step may carry no views
+            rids = ctx.padded_request_ids
+            qo = self._resident_qo_indptr.get(len(rids))
+            if qo is None:
+                qo = self._resident_qo_indptr[len(rids)] = torch.arange(len(rids) + 1, dtype=torch.int32)
+            label = ctx.resident_plan.writes.streams[self._query_kv_cache_name].label
+            return {label: QueryPacking(request_ids=list(rids), qo_indptr=qo)}
 
         plan_outputs: KVPlanOutputs = ctx.plan_results.get(
             self._query_kv_cache_name
