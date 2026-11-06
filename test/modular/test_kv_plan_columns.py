@@ -155,7 +155,7 @@ def test_a_slot_plan_equals_the_per_row_plan_over_the_slots_kept_buffers(seed, p
         kv.ingest_request(rid, KVReqConfig())
         _run(kv, [Segment(rid, "main", rng.randrange(1, 40))], [rid])
     # too small for the first plan, so it grows along the way
-    kept = kv._slot_columns[(0, "main", 6, 64)] = manager_mod.SlotColumns(kv._arena, 6, 64, capacity=1)
+    kept = kv._slot_columns[(0, "decode", "main", 6, 64)] = manager_mod.SlotColumns(kv._arena, 6, 64, capacity=1)
     for _ in range(30):
         rows = rng.sample(live, rng.randrange(1, len(live) + 1))
         decode = rng.random() < 0.7
@@ -176,14 +176,14 @@ def test_a_slot_plan_equals_the_per_row_plan_over_the_slots_kept_buffers(seed, p
             offsets = [(v.last_page_len(PAGE) or PAGE) - 1 for v in per_row.views]
             n = len(pages)
             assert out.decode_stage.tolist() == pages + [0] * (64 - n) + offsets + [0] * (64 - n)
-        assert kv._slot_columns[(0, "main", 6, 64)] is kept
+        assert kv._slot_columns[(0, "decode", "main", 6, 64)] is kept
 
 
 def test_a_slot_plan_grows_past_its_buffers(plan_backend):
     kv = _manager()
     kv.ingest_request("r", KVReqConfig())
     _run(kv, [Segment("r", "main", 300)], ["r"])
-    columns = kv._slot_columns[(0, "main", 1, 8)] = manager_mod.SlotColumns(kv._arena, 1, 8, capacity=2)
+    columns = kv._slot_columns[(0, "decode", "main", 1, 8)] = manager_mod.SlotColumns(kv._arena, 1, 8, capacity=2)
     ctx = _leased_ctx(["r"], [], 8)
     group = Segments.from_rows([Segment("r", "main", 1)])
     out = kv._plan_label(group, {}, ctx, frozenset(), None, 0, "main")

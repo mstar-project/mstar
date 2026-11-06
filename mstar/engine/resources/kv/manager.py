@@ -705,8 +705,8 @@ class KVManager(AttentionResource):
         # (slot, label) -> the plan output whose state that slot's static
         # buffers hold, so a reused plan skips re-staging them
         self._staged_outputs: dict[tuple[int, tuple[str, int]], KVPlanOutput] = {}
-        # (slot, plan label, rows, bucket tokens) -> its kept plan buffers
-        self._slot_columns: dict[tuple[int, str, int, int], SlotColumns] = {}
+        # (slot, walk, plan label, rows, bucket tokens) -> its kept plan buffers
+        self._slot_columns: dict[tuple[int, str, str, int, int], SlotColumns] = {}
         self._empty_locations: torch.Tensor | None = None
         # (label, group) -> its write addressing
         self._current_plan_states: dict[tuple[str, int], KVPlanState] = {}
@@ -2648,11 +2648,12 @@ class KVManager(AttentionResource):
     ) -> KVPlanOutput:
         """`_plan_label_rows` for a leased step, into the slot's kept buffers."""
         lease = ctx.slot_lease
+        bucket = lease.bucket
         rows = len(segments)
-        key = (lease.slot, plan_label, rows, lease.bucket.num_tokens)
+        key = (lease.slot, bucket.graph_walk, plan_label, rows, bucket.num_tokens)
         columns = self._slot_columns.get(key)
         if columns is None:
-            columns = self._slot_columns[key] = SlotColumns(self._arena, rows, lease.bucket.num_tokens)
+            columns = self._slot_columns[key] = SlotColumns(self._arena, rows, bucket.num_tokens)
         sink_pages = self._sink_pages
         args = (self._streams, segments, ctx.real_rows(), sink or None, sink_pages.sid, page_size)
         total, all_have, max_sink, decode = self._arena.plan_rows_into(*args, columns.binding)

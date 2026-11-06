@@ -224,7 +224,7 @@ def _host_lens(values: list[int]) -> torch.Tensor:
 
 
 class SlotColumns:
-    """A leased step's plan arrays in host buffers that one (slot, plan label,
+    """A leased step's plan arrays in host buffers that one (slot, walk, plan label,
     rows, bucket tokens) keeps across its plans, so a plan allocates no arrays
     or tensors. ``PageArena.plan_rows_into`` fills them; the fields read as a
     `PlanColumns`.

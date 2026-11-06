@@ -40,6 +40,8 @@ A walk a submodule names in `resident_walks` runs its captured steps off per-req
 
 `step.segments` is a `Segments` (`resources/step.py`), whose row order is the layout of the step's per-token arrays. It iterates as `Segment`s for code that wants rows, but a resource's per-step path reads the columns instead: `request_ids`, `labels` and `spans`, the last two held as one value when every row agrees, so `segments.spans == 1` (every row one token) and `group_by_label()` are O(1) in the common case; `rows()` yields plain `(request_id, label, span)` tuples for the rest, without a `Segment` per row.
 
+A leased step's KV plan arrays sit in host buffers its slot keeps (`SlotColumns` in `kv/plan.py`), which the next plan on the slot rewrites: read a `KVPlanOutput` during the step's own plan, and a plan's views raise after that. Anything that keeps a plan past its step (the read-only reuse, the plan cache) plans into arrays of its own.
+
 ## Stateful resources move together
 
 KV pages and recurrent (GDN/Mamba) state slots are two forms of the same per-request state. A lifecycle feature added to one usually needs its analogue in the other. Forking for a request that branches, offload/reload, what a partially-run (chunked) step leaves behind: when you change one, check the others. Recurrent forking was initially missed when KV forking learned chunked-prefill semantics.
