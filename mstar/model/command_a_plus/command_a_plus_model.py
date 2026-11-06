@@ -7,23 +7,29 @@ import torch
 
 from mstar.conductor.request_info import DEFAULT_PARTITION, CurrentForwardConductorMetadata
 from mstar.distributed.base import ShardingConfig
-from mstar.engine.resources import (
-    PositionConfig,
-    PositionSpec,
-    SamplerSpec,
-    SamplingReqConfig,
+from mstar.engine.state import (
+    Array,
+    Attend,
+    Causal,
+    KVEntry,
+    Layout,
+    Positions,
+    Read,
+    Rope,
+    Sampler,
+    SampleSettings,
+    Span,
+    Window,
 )
-from mstar.engine.state import Array, Attend, Causal, KVEntry, Read, Window
 from mstar.graph.base import GraphEdge, GraphNode, Loop, Sequential
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
-from mstar.model.base import ForwardPassArgs, KVLabel, LabelLayout, Model, ProcessPromptOutput, Span
+from mstar.model.base import ForwardPassArgs, KVLabel, Model, ProcessPromptOutput
 from mstar.model.command_a_plus.assets import resolve_metadata
 from mstar.model.command_a_plus.config import (
     GLOBAL_ATTN,
     KV_CACHE,
     LOCAL_ATTN,
     PREFILL_WALKS,
-    ROPE,
     SAMPLER,
     CommandAPlusConfig,
 )
@@ -120,7 +126,7 @@ class CommandAPlusModel(Model):
         edge = GraphEdge(next_node="LLM", name="text_inputs", tensor_info=seeds)
         return ForwardPassArgs(metadata, [edge], list(seeds))
 
-    def declare_state(self) -> list[Array]:
+    def declare_state(self) -> list[Array | Sampler]:
         config = self.config
         every = frozenset(range(config.num_hidden_layers))
         local = frozenset(i for i, kind in enumerate(config.layer_types) if kind == "sliding_attention")
@@ -130,29 +136,20 @@ class CommandAPlusModel(Model):
                 KV_CACHE, nodes={"LLM"}, layers=every,
                 entry=KVEntry(heads=config.num_key_value_heads, head_dim=config.head_dim),
                 max_len=self.max_seq_len,
+                positions=Positions(rope=Rope(theta=config.rope_theta, rotary_dim=config.head_dim, interleave=True)),
                 reads={
                     LOCAL_ATTN: Read(mask=Window(config.sliding_window), op=attend, layers=local),
                     GLOBAL_ATTN: Read(mask=Causal(), op=attend, layers=every - local),
                 },
             ),
-        ]
-
-    def get_node_resources(self):
-        config = self.config
-        return [
-            PositionSpec(resource_key=ROPE, nodes={"LLM"}, config=PositionConfig(
-                kv_cache=KV_CACHE, rotary_dim=config.head_dim, interleave=True,
-                rope_theta=config.rope_theta,
-            )),
-            SamplerSpec(resource_key=SAMPLER, nodes={"LLM"}, vocab_size=config.vocab_size,
-                        enable_repetion_penalty=True),
+            Sampler(SAMPLER, nodes={"LLM"}, vocab_size=config.vocab_size, penalty=True),
         ]
 
     def get_request_resource_configs(self, partition_fwd_args, model_kwargs=None):
         defaults = dict(temperature=0.9, top_p=0.95, top_k=0,
                         repetition_penalty=1.04, ignore_eos=False)
         supplied = model_kwargs or {}
-        return {SAMPLER: SamplingReqConfig(**{key: supplied.get(key, val) for key, val in defaults.items()})}
+        return {SAMPLER: SampleSettings(**{key: supplied.get(key, val) for key, val in defaults.items()})}
 
     def get_loop_caps(self, **model_kwargs):
         # Prefill samples the first token, so decode runs one fewer.
@@ -268,8 +265,8 @@ class CommandAPlusModel(Model):
         # Image rows are not keyed by the placeholder ids they replace.
         span = Span("rows" if pixel_values else "ids", "prefill_image" if pixel_values else "prefill",
                     ids.numel(), ids.numel(), "text_inputs")
-        layout = LabelLayout(spans=(span,), growth=(("decode_loop", 1),))
-        return ProcessPromptOutput(result, {"kv_layout": {KV_CACHE: {"main": layout}}})
+        layout = Layout(spans=(span,), growth=(("decode_loop", 1),))
+        return ProcessPromptOutput(result, {"state_layout": {KV_CACHE: {"main": layout}}})
 
     @staticmethod
     def _chat_messages(prompt, input_modalities, prompt_parts, messages):

@@ -8,23 +8,12 @@ import torch
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.accelerator_graph_config import AcceleratorGraphConfig, BatchedAcceleratorGraphConfig
-from mstar.engine.resources import (
-    AttentionStep,
-    KVStep,
-    PositionStep,
-    SamplerStep,
-    Segment,
-    SlotLease,
-    SubmoduleStep,
-)
+from mstar.engine.state import ArrayStep, SampleStep, Segment, SlotLease, SubmoduleStep, at_last_token, sample
 from mstar.model.command_a_plus.components.language_model import CommandAPlusForCausalLM
 from mstar.model.command_a_plus.components.vision import CommandAPlusVisionEncoder
 from mstar.model.command_a_plus.config import (
-    GLOBAL_ATTN,
     KV_CACHE,
-    LOCAL_ATTN,
     PREFILL_WALKS,
-    ROPE,
     SAMPLER,
     CommandAPlusTextConfig,
 )
@@ -94,6 +83,10 @@ class CommandAPlusLLMSubmodule(ARNodeSubmodule):
             sampler=SAMPLER, prefill_walks=frozenset(PREFILL_WALKS),
         )
 
+    def bind_state(self, handles: Mapping[str, Any]) -> None:
+        self.kv = handles[KV_CACHE]
+        self.sampler = handles[SAMPLER]
+
     def get_accelerator_graph_configs(
         self, device: torch.device, tp_world_size: int = 1,
     ) -> list[AcceleratorGraphConfig]:
@@ -148,17 +141,11 @@ class CommandAPlusLLMSubmodule(ARNodeSubmodule):
                 Segment(request_id=rid, label="main", span=inp.input_seq_len)
                 for rid, inp in zip(request_ids, inputs, strict=True)
             ],
-            steps={
-                KV_CACHE: KVStep(),
-                LOCAL_ATTN: AttentionStep(causal=True),
-                GLOBAL_ATTN: AttentionStep(causal=True),
-                ROPE: PositionStep(),
-                SAMPLER: SamplerStep(
-                    apply_penalty=True,
-                    prefill_tracked_tokens={
-                        rid: inp.input_ids for rid, inp in zip(request_ids, inputs, strict=True)
-                    } if graph_walk in PREFILL_WALKS else {},
-                ),
+            state={
+                KV_CACHE: ArrayStep(),
+                SAMPLER: SampleStep(prompt_tokens={
+                    rid: inp.input_ids for rid, inp in zip(request_ids, inputs, strict=True)
+                } if graph_walk in PREFILL_WALKS else {}),
             },
         )
 
@@ -172,22 +159,20 @@ class CommandAPlusLLMSubmodule(ARNodeSubmodule):
             return {"text_inputs": ids, "input_embeds": torch.cat([inp.input_embeds for inp in inputs])}
         return {"text_inputs": ids}
 
-    def _sample(self, graph_walk, engine_inputs, text_inputs, input_embeds=None):
+    def _sample(self, graph_walk, text_inputs, input_embeds=None):
         self._check_walk(graph_walk)
         embeddings = self.language_model.model.embed(text_inputs) if input_embeds is None else input_embeds
-        hidden = self.language_model(embeddings, label="main")
+        hidden = self.language_model(embeddings)
         if graph_walk in PREFILL_WALKS:
-            # Both managers have the same packing. Pick the final real prompt
-            # token for each request, never the last row of the whole batch.
-            hidden = engine_inputs.resources[LOCAL_ATTN].select_last_hidden(hidden, label="main")
-        logits = self.language_model.compute_logits(hidden)
-        return engine_inputs.resources[SAMPLER].sample(engine_inputs.request_ids, logits=logits)
+            # Pick the final real prompt token for each request, never the last row of the whole batch.
+            hidden = at_last_token(self.kv, hidden)
+        return sample(self.sampler, self.language_model.compute_logits(hidden))
 
     def forward(
         self, graph_walk: str, engine_inputs: ModelInputsFromEngine,
         text_inputs: torch.Tensor, input_embeds: torch.Tensor | None = None, **kwargs,
     ) -> NameToTensorList:
-        return {"new_token": [self._sample(graph_walk, engine_inputs, text_inputs, input_embeds)]}
+        return {"new_token": [self._sample(graph_walk, text_inputs, input_embeds)]}
 
     def can_batch(self, batch, model_inputs) -> bool:
         return True
@@ -196,7 +181,7 @@ class CommandAPlusLLMSubmodule(ARNodeSubmodule):
         self, graph_walk: str, engine_inputs: ModelInputsFromEngine,
         text_inputs: torch.Tensor, input_embeds: torch.Tensor | None = None, **kwargs,
     ) -> dict[str, NameToTensorList]:
-        tokens = self._sample(graph_walk, engine_inputs, text_inputs, input_embeds)
+        tokens = self._sample(graph_walk, text_inputs, input_embeds)
         return {
             rid: {"new_token": [tokens[i:i + 1]]}
             for i, rid in enumerate(engine_inputs.request_ids)

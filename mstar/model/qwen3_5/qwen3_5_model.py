@@ -13,14 +13,25 @@ from mstar.conductor.request_info import (
     StreamingConnectionState,
 )
 from mstar.distributed.base import ShardingConfig
-from mstar.engine.resources.attn.ragged.config import (
-    RaggedAttentionConfig,
-    RaggedAttentionSpec,
+from mstar.engine.resources.spec import CombinedSplit
+from mstar.engine.state import (
+    Array,
+    Attend,
+    Block,
+    Causal,
+    CausalConv,
+    Entry,
+    GatedDeltaNet,
+    KVEntry,
+    Layout,
+    Positions,
+    Read,
+    Sampler,
+    SampleSettings,
+    Span,
+    TensorType,
+    Value,
 )
-from mstar.engine.resources.position.config import PositionConfig, PositionSpec
-from mstar.engine.resources.sampler.config import SamplerSpec, SamplingReqConfig
-from mstar.engine.resources.spec import CombinedSplit, NodeResourceSpec, ResourceReqConfig
-from mstar.engine.state import Array, Attend, Causal, CausalConv, Entry, GatedDeltaNet, KVEntry, Read, TensorType, Value
 from mstar.graph.base import (
     GraphEdge,
     GraphNode,
@@ -33,11 +44,9 @@ from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import (
     ForwardPassArgs,
     KVLabel,
-    LabelLayout,
     Model,
     PrefixKeys,
     ProcessPromptOutput,
-    Span,
     TensorAndMetadata,
     prompt_spans,
 )
@@ -62,9 +71,9 @@ from mstar.model.qwen3_5.config import (
     KV_CACHE,
     LINEAR_ATTN,
     LLM_MIXED,
-    ROPE,
     SAMPLER,
     VISION_ATTN,
+    VISION_TOKENS,
     Qwen3_5Config,
     Qwen3_5VisionConfig,
 )
@@ -196,8 +205,8 @@ class Qwen3_5DenseModel(Model):
     # Model ABC: resources
     # -----------------------------------------------------------------------
 
-    def declare_state(self) -> list[Array]:
-        c = self.config
+    def declare_state(self) -> list[Array | Sampler]:
+        c, v = self.config, self.vision_config
         conv_dim = (
             2 * c.linear_num_key_heads * c.linear_key_head_dim
             + c.linear_num_value_heads * c.linear_value_head_dim
@@ -209,11 +218,12 @@ class Qwen3_5DenseModel(Model):
             ),
             "conv": TensorType((conv_dim, c.linear_conv_kernel_dim - 1), dtype=None, shard=0),
         })
-        return [
+        state = [
             Array(
                 KV_CACHE, nodes={"LLM"}, layers=c.full_layer_indices,
                 entry=KVEntry(heads=c.num_key_value_heads, head_dim=c.head_dim),
                 max_len=c.max_position_embeddings,
+                positions=Positions(),
                 reads={ATTN: Read(mask=Causal(), op=Attend(q_heads=c.num_attention_heads))},
             ),
             # written out because Qwen3.5 diverges silently without qk_l2norm
@@ -221,56 +231,34 @@ class Qwen3_5DenseModel(Model):
                 GDN_STATE, nodes={"LLM"}, layers=c.linear_layer_indices, entry=gdn,
                 updates={CONV: CausalConv(), LINEAR_ATTN: GatedDeltaNet(qk_l2norm=True)},
             ),
+            Sampler(SAMPLER, nodes={"LLM"}, vocab_size=c.vocab_size, penalty=True),
         ]
+        if v is not None:
+            state.append(Array(
+                VISION_TOKENS, nodes={"vision_encoder"}, layers=frozenset(range(v.depth)),
+                entry=KVEntry(heads=v.num_heads, head_dim=v.head_dim), max_len=0,
+                reads={VISION_ATTN: Read(mask=Block(), op=Attend(q_heads=v.num_heads))},
+            ))
+        return state
 
     def kernel_settings(self) -> dict[str, dict[str, Any]]:
-        return {
+        settings = {
             ATTN: {"splits": (_MIXED_SPLIT,), "decode_fmha": True},
             LINEAR_ATTN: {"splits": (_MIXED_SPLIT,)},
         }
+        if self.vision_config is not None:
+            settings[VISION_ATTN] = {"max_segments_per_step": self._vision_segment_ceiling(), "compile_op": True}
+        return settings
 
-    def get_node_resources(self) -> list[NodeResourceSpec]:
-        return [
-            PositionSpec(
-                resource_key=ROPE, nodes={"LLM"},
-                config=PositionConfig(kv_cache=KV_CACHE),
-            ),
-            SamplerSpec(
-                resource_key=SAMPLER, nodes={"LLM"},
-                vocab_size=self.config.vocab_size,
-                enable_repetion_penalty=True,
-            ),
-            *self._vision_resources(),
-        ]
-
-    def _vision_resources(self) -> list[NodeResourceSpec]:
-        """The ViT tower's attention, its only resource; none when text-only."""
-        if self.vision_config is None:
-            return []
+    def _vision_segment_ceiling(self) -> int:
+        """Segments a captured block loop's plan holds. A segment per image, not per request: the resize floors each
+        image at `shortest_edge` pixels. A video frame group has no floor; a step with more segments runs the block
+        loop eagerly (`VisionEncoderSubmodule._fits_capture`)."""
         from mstar.model.qwen3_5.submodules import VisionEncoderSubmodule
 
-        vision = self.vision_config
         processor = self.image_processor
         min_patches = processor.size["shortest_edge"] // processor.patch_size ** 2
-        return [
-            RaggedAttentionSpec(
-                resource_key=VISION_ATTN, nodes={"vision_encoder"},
-                config=RaggedAttentionConfig(
-                    num_qo_heads=vision.num_heads,
-                    num_kv_heads=vision.num_heads,
-                    head_dim=vision.head_dim,
-                    # A segment per image, not per request: the resize floors
-                    # each image at `shortest_edge` pixels. A video frame group
-                    # has no floor; a step with more segments runs the block
-                    # loop eagerly (`VisionEncoderSubmodule._fits_capture`).
-                    max_segments_per_step=(
-                        VisionEncoderSubmodule.BLOCK_LOOP_PATCH_BUCKETS[-1] // min_patches
-                    ),
-                    # the tower's compiled block loop keeps attention in its graph
-                    compile_op=True,
-                ),
-            ),
-        ]
+        return VisionEncoderSubmodule.BLOCK_LOOP_PATCH_BUCKETS[-1] // min_patches
 
     # -----------------------------------------------------------------------
     # Model ABC: walk graph declaration
@@ -602,21 +590,21 @@ class Qwen3_5DenseModel(Model):
             return (Span("rows" if video else "digest", walk, rows, vision_position_advance(grid, merge) + 2, source),)
 
         plan = prefill_plan(expand_video_parts(parts, groups))
-        layout = LabelLayout(
-            spans=tuple(prompt_spans(plan, segments, walk, media)), growth=(("decode_loop", 1),),
-            # The keys name `prefill_text` alone, and the preprocess worker refuses
-            # a keyed span in any other walk.
-            keyed_spans=0 if walk == "prefill_vision" else None,
-        )
+        layout = Layout(spans=tuple(prompt_spans(plan, segments, walk, media)), growth=(("decode_loop", 1),))
 
         # always set, so a `video_groups` the client sent never reaches the
         # schedule; the grids ride to the nodes as step metadata
-        return ProcessPromptOutput(result, {
+        metadata = {
             "video_groups": groups,
-            "kv_layout": {KV_CACHE: {"main": layout}},
+            "state_layout": {KV_CACHE: {"main": layout}, GDN_STATE: {"main": Layout()}},
             IMAGE_GRIDS_KEY: image_grids,
             VIDEO_GRIDS_KEY: video_grids,
-        })
+        }
+        if walk == "prefill_vision":
+            # The keys name `prefill_text` alone, and the preprocess worker refuses
+            # a keyed span in any other walk.
+            metadata["keyed_spans"] = {KV_CACHE: {"main": 0}}
+        return ProcessPromptOutput(result, metadata)
 
     def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
         # the prefill emits the first of max_output_tokens, so the loop runs one fewer
@@ -870,13 +858,13 @@ class Qwen3_5DenseModel(Model):
         self,
         partition_fwd_args: dict[str, ForwardPassArgs],
         model_kwargs: dict | None = None,
-    ) -> dict[str, ResourceReqConfig]:
+    ) -> dict[str, SampleSettings]:
         model_kwargs = model_kwargs or {}
         keys = [
             "temperature", "top_p", "top_k", "repetition_penalty", "ignore_eos", "return_logprobs", "logprobs_mode",
         ]
         return {
-            SAMPLER: SamplingReqConfig(
+            SAMPLER: SampleSettings(
                 **{k: model_kwargs[k] for k in keys if k in model_kwargs}
             )
         }

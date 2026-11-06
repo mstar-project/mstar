@@ -81,6 +81,21 @@ class DecoderLayer(nn.Module):
         return next_norm.forward_residual(self.mlp(h), residual, comm_group)
 
 
+@torch.compiler.disable
+def no_cursor(i: int, self_attn: nn.Module) -> None:
+    """``run_layers``'s ``set_cursor`` for layers that name themselves to their state handles."""
+
+
+def eager_frame(forward: Callable) -> Callable:
+    """Dynamo skips ``forward``'s frame and still compiles what it calls, for a frame around `run_layers` with no tensor
+    work of its own. Otherwise it and its resume after `run_layers` would recompile on every shape for nothing."""
+    dynamo = torch._dynamo.eval_frame
+    dynamo.set_code_exec_strategy(
+        forward.__code__, dynamo.FrameExecStrategy(dynamo.FrameAction.SKIP, dynamo.FrameAction.DEFAULT),
+    )
+    return forward
+
+
 def run_layers(
     layers: nn.ModuleList, hidden_states: torch.Tensor, norm: nn.Module,
     set_cursor: Callable[[int, nn.Module], None] | None = None,

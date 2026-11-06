@@ -43,6 +43,8 @@ from mstar.engine.resources.lora.config import (
 )
 from mstar.engine.resources.lora.serving import lora_specs, served_lora_targets
 from mstar.engine.resources.lora.store import check_adapters
+from mstar.engine.state import SampleSettings
+from mstar.engine.state.adapters import sampling_configs
 from mstar.graph.base import GraphEdge, NodeAndGraphWalk, TensorPointerInfo
 from mstar.model.base import (
     ForwardPassArgs,
@@ -678,6 +680,12 @@ class Conductor:
             )
         return built
 
+    def _declarations(self) -> list:
+        built = getattr(self, "_declarations_cache", None)
+        if built is None:
+            built = self._declarations_cache = self.model.declare_state()
+        return built
+
     def _streamed_partitions(self) -> frozenset[str]:
         streamed = getattr(self, "_streamed_partitions_cache", None)
         if streamed is None:
@@ -726,6 +734,8 @@ class Conductor:
         configs = self.model.get_request_resource_configs(
             partition_fwd_args=partition_fwd_args, model_kwargs=model_kwargs
         )
+        if any(isinstance(config, SampleSettings) for config in configs.values()):
+            configs = sampling_configs(configs, self._declarations())
         # a model that builds its sampler config from its own keys would drop it unseen
         if model_kwargs.get("return_logprobs") and not any(
             getattr(cfg, "return_logprobs", False) for cfg in configs.values()

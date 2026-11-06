@@ -5,9 +5,12 @@ Declarations are values: mappings are read-only, sets are frozensets, and everyt
 
 from collections.abc import Iterator, Mapping
 from dataclasses import KW_ONLY, dataclass
-from typing import Literal, get_args, get_origin
+from typing import Literal, NamedTuple, get_args, get_origin
 
 import torch
+
+from mstar.engine.resources.kv.config import Span
+from mstar.engine.resources.step import Segment
 
 
 class FrozenMap(Mapping):
@@ -89,6 +92,11 @@ class Window(Mask):
 
 
 @dataclass(frozen=True)
+class Block(Mask):
+    """Sees the entries of q's own segment in this step, on an array with ``max_len`` 0."""
+
+
+@dataclass(frozen=True)
 class Attend:
     q_heads: int    # a multiple of the heads of the entry's k and v
 
@@ -118,12 +126,32 @@ class Read:
                 object.__setattr__(self, name, frozenset(getattr(self, name)))
 
 
+@dataclass(frozen=True, kw_only=True)
+class Rope:
+    theta: float = 10000.0
+    rotary_dim: int | None = None              # None: head_dim
+    interleave: bool = False
+    scale: float = 1.0
+    # Llama 3.1 scaling: all three or none
+    low_freq_factor: float | None = None
+    high_freq_factor: float | None = None
+    old_context_len: int | None = None
+    dtype: torch.dtype | None = None           # None: q's
+    table_dtype: torch.dtype | None = None     # None: angles in the kernel
+
+
+@dataclass(frozen=True, kw_only=True)
+class Positions:
+    rope: Rope | None = None    # None: a counter only
+
+
 @dataclass(frozen=True)
 class Array:
     """Per request, per label and per declared layer, entries at log positions 0 to n - 1, with n <= ``max_len``.
 
     An append-only array only grows, and a rewritable one also takes writes in place. All layers of an array have
     the same length at the end of every step. ``nodes`` lists who may touch the array, and the engine places it.
+    With ``max_len`` 0 an array keeps nothing between steps, so every add is scratch.
     """
 
     name: str
@@ -135,10 +163,13 @@ class Array:
     reads: Mapping[str, Read] = EMPTY    # empty: read whole
     updates: Mapping[str, CausalConv | GatedDeltaNet] = EMPTY
     rewritable: bool = False
+    labels: frozenset[str] = frozenset({"main"})
+    positions: Positions | None = None
 
     def __post_init__(self):
         object.__setattr__(self, "nodes", frozenset(self.nodes))
         object.__setattr__(self, "layers", frozenset(self.layers))
+        object.__setattr__(self, "labels", frozenset(self.labels))
         object.__setattr__(self, "reads", FrozenMap(self.reads))
         object.__setattr__(self, "updates", FrozenMap(self.updates))
         where = f"Array {self.name!r}"
@@ -148,8 +179,10 @@ class Array:
             raise ValueError(f"{where}.layers must be ints >= 0, got {sorted(self.layers, key=repr)}")
         if not self.layers and not is_value(self):
             raise ValueError(f"{where}.layers is empty, and only a Value may declare no layers")
-        if not _is_positive(self.max_len):
-            raise ValueError(f"{where}.max_len must be a positive int, got {self.max_len!r}")
+        if not self.labels:
+            raise ValueError(f"{where}.labels must be non-empty")
+        if not (type(self.max_len) is int and self.max_len >= 0):
+            raise ValueError(f"{where}.max_len must be an int >= 0, got {self.max_len!r}")
         self._check_entry()
         for key, read in self.reads.items():
             self._check_read(key, read)
@@ -218,3 +251,91 @@ def is_value(array: Array) -> bool:
 def Value(name, *, nodes, layers, entry, updates=EMPTY) -> Array:
     """A rewritable array of one entry."""
     return Array(name, nodes=nodes, layers=layers, entry=entry, updates=updates, max_len=1, rewritable=True)
+
+
+@dataclass(frozen=True)
+class Sampler:
+    name: str
+    _: KW_ONLY
+    nodes: frozenset[str]
+    vocab_size: int
+    penalty: bool = True
+    min_p: bool = False
+    eos_ids: tuple[int, ...] = ()    # the ids min_tokens bars
+    draws: int = 1                   # calls to sample in each step that lists it
+
+    def __post_init__(self):
+        object.__setattr__(self, "nodes", frozenset(self.nodes))
+        object.__setattr__(self, "eos_ids", tuple(self.eos_ids))
+        if not self.nodes:
+            raise ValueError(f"Sampler {self.name!r}.nodes must be non-empty")
+
+
+@dataclass(frozen=True, kw_only=True)
+class SampleSettings:
+    """A request's settings for one sampler, keyed by the sampler's name in `get_request_resource_configs`."""
+
+    temperature: float = 0.6
+    top_k: int = 0
+    top_p: float = 1.0
+    min_p: float = 0.0
+    repetition_penalty: float = 1.0
+    repetition_window: int = 0
+    penalize_prompt: bool = True
+    min_tokens: int = 0
+    ignore_eos: bool = False
+    top_p_first: bool = False
+    top_p_min_keep: int = 1
+    return_logprobs: bool = False
+    logprobs_mode: str = "raw"
+
+
+@dataclass(frozen=True, kw_only=True)
+class Fork:
+    src: str
+    dst: str
+    at: Literal["start", "end"]           # before the step plans or writes, or at commit
+    rows: frozenset[int] | None = None    # None: every row
+
+    def __post_init__(self):
+        if self.at not in ("start", "end"):
+            raise ValueError(f"Fork.at must be 'start' or 'end', got {self.at!r}")
+
+
+@dataclass(frozen=True, kw_only=True)
+class ArrayStep:
+    """What one step does to one array, under `SubmoduleStep.state`."""
+
+    segments: tuple[Segment, ...] | None = None    # None: the step's segments
+    keep: bool = True                              # False: every add this step is scratch
+    forks: tuple[Fork, ...] = ()
+    placeholders: frozenset[tuple[int, str]] = frozenset()    # (row, label): holds a place, reads and keeps nothing
+    eager_add: bool = False                        # this step's adds run outside the captured graph
+    advance: tuple[int, ...] | None = None         # positions per row; None: the span
+    position_ids: torch.Tensor | None = None       # explicit ids, (tokens,) in segment order
+
+
+@dataclass(frozen=True, kw_only=True)
+class SampleStep:
+    """What one step does with one sampler, under `SubmoduleStep.state`."""
+
+    apply_penalty: bool = True
+    apply_filters: bool = True
+    prompt_tokens: Mapping[int, torch.Tensor] = EMPTY    # row -> ids the penalty counts
+    kept_rows: frozenset[int] | None = None              # None: every row's sample is kept
+
+
+@dataclass(frozen=True, kw_only=True)
+class Layout:
+    """What a request writes to one label of one array, from `process_prompt`'s ``state_layout``."""
+
+    spans: tuple[Span, ...] = ()
+    growth: tuple[tuple[str, int], ...] = ()    # (loop, entries per iteration)
+    scratch: int = 0                            # most one scratch step writes past the kept length
+
+
+class Reached(NamedTuple):
+    """What a read with no op returns: each field's reached entries packed by row, and where each row starts."""
+
+    fields: Mapping[str, torch.Tensor]
+    row_offsets: torch.Tensor

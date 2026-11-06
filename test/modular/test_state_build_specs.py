@@ -35,6 +35,7 @@ from mstar.engine.state import (
     GatedDeltaNet,
     KVEntry,
     Read,
+    Sampler,
     TensorType,
     Value,
     Window,
@@ -435,6 +436,23 @@ def test_validate_deployment_says_that_a_declaration_problem_skips_the_resources
     problems = _validation_problems(_Declaring(_kv(nodes={"dit"})), tmp_path, resources={"nope": {}})
     assert problems[-1] == "the `resources:` checks, which need the declarations, were skipped", problems
     assert not any("nope" in problem for problem in problems), problems
+
+
+def test_validate_deployment_refuses_log_probs_on_several_draws(tmp_path):
+    class _TwoDraws(_Declaring):
+        def declare_state(self):
+            return [Sampler("sampler", nodes={"llm"}, vocab_size=8, draws=2)]
+
+    path = tmp_path / "cfg.yaml"
+    path.write_text(yaml.safe_dump({
+        "max_seq_len": 8, "node_groups": [{"node_names": ["llm"], "ranks": [0]}],
+        "resources": {"sampler": {"enable_logprobs": True}},
+    }))
+    with pytest.raises(DeploymentError) as refusal:
+        _validate(_TwoDraws(), str(path))
+    assert any("Sampler 'sampler'" in problem and "enable_logprobs" in problem for problem in refusal.value.problems), (
+        refusal.value.problems
+    )
 
 
 def test_validate_deployment_skips_building_specs_after_a_declaration_problem(tmp_path):

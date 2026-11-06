@@ -15,7 +15,7 @@ from mstar.distributed.base import ShardingConfig
 from mstar.engine.resources.lora.config import LORA_RESOURCE_KEY, lora_enabled
 from mstar.engine.resources.lora.serving import declared_lora_specs, size_lora_specs
 from mstar.engine.state.adapters import node_resources
-from mstar.engine.state.analysis import state_declaration_problems
+from mstar.engine.state.analysis import deployment_problems, state_declaration_problems
 from mstar.model.base import Model, WorkerGraph, built_resources, parse_autocast_dtype
 from mstar.validation.client_streams import check_client_streams
 from mstar.validation.knobs import check_knobs
@@ -123,6 +123,8 @@ def validate_deployment(
             problems.append("the `resources:` checks, which need the declarations, were skipped")
         else:
             specs = node_resources(model)
+            if resources_readable:
+                problems += deployment_problems(model, config.get("resources") or {})
     except (ValueError, OSError) as e:
         problems.append(
             f"declaring the node resources failed: {type(e).__name__}: {e}; "

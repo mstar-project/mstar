@@ -53,6 +53,7 @@ from mstar.engine.resources.step import (
     AdmitOutcome,
     PerReqSetting,
 )
+from mstar.engine.state.adapters import node_handles
 from mstar.graph.runtime.base import GraphRuntime
 from mstar.model.base import keyed_labels
 from mstar.model.submodule_base import (
@@ -699,6 +700,9 @@ class Engine:
                 fp32_precision=node_fp32_precision(node_name, submodule),
             )
             submodule.bind_node_resources(resources)
+            handles = node_handles(model, node_name, resources) if model is not None else {}
+            if handles:
+                submodule.bind_node_state(handles)
             self._submodules[node_name].lora_pools = tuple(
                 resources[key] for key in getattr(submodule, "lora_keys", ())
             )
@@ -1065,6 +1069,7 @@ class Engine:
                 device_capability=self.device_capability,
                 capture_stream=capture_stream,
                 lora_keys=getattr(submodule_mgmt.submodule, "lora_keys", ()),
+                state_handles=getattr(submodule_mgmt.submodule, "state_handles", {}),
             )
             runners[label] = runner
         return runners
@@ -2017,9 +2022,6 @@ class Engine:
         ``(raw_outputs, step)``; ``raw_outputs`` is None when admit failed.
         """
         nvtx = self._enable_nvtx
-        cg_runner = submodule_mgmt.accelerator_graph_runner
-        submodule = submodule_mgmt.submodule
-        rids = list(ctx.padded_request_ids)
 
         if step is not None:
             if lease is not None and step.cg_key_info != node_capture_key(lease.bucket.cg_key_info):
@@ -2061,6 +2063,35 @@ class Engine:
                 )
                 if nvtx:
                     range_pop()
+
+        try:
+            if step is not None:
+                step.begin_calls()
+            return self._forward_and_commit(
+                batch, submodule_mgmt, request_ids, inputs, req_info, ctx, lease, running_batched, step, set_launch,
+            )
+        finally:
+            if step is not None:
+                step.end_calls()
+
+    def _forward_and_commit(
+        self,
+        batch: ExecutingBatch,
+        submodule_mgmt: SubmoduleManagement,
+        request_ids: list[str],
+        inputs: list[NodeInputs],
+        req_info: Mapping[str, CurrentForwardPassInfo],
+        ctx: StepContext,
+        lease: SlotLease | None,
+        running_batched: bool,
+        step: SubmoduleStep | None,
+        set_launch: bool,
+    ) -> tuple[dict | None, SubmoduleStep | None]:
+        """preprocess → forward → commit, with the step's handles open."""
+        nvtx = self._enable_nvtx
+        cg_runner = submodule_mgmt.accelerator_graph_runner
+        submodule = submodule_mgmt.submodule
+        rids = list(ctx.padded_request_ids)
 
         laps = PhaseLaps("engine.")
         engine_inputs = ModelInputsFromEngine(
@@ -2115,6 +2146,7 @@ class Engine:
                 range_pop()
 
         if step is not None:
+            step.check_calls()
             if nvtx:
                 range_push("engine.commit")
             t0 = phase_start()

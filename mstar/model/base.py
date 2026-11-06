@@ -18,7 +18,7 @@ from mstar.conductor.request_info import (
 )
 from mstar.distributed.base import ShardingConfig, ShardingGroup
 from mstar.engine.resources import NodeResourceSpec, ResourceReqConfig
-from mstar.engine.resources.kv.config import RetentionPolicy
+from mstar.engine.resources.kv.config import RetentionPolicy, Span
 from mstar.engine.resources.lora.config import LORA_ADAPTER_KWARG
 from mstar.engine.resources.sampler.utils import SamplingConfig
 from mstar.graph.base import (
@@ -135,7 +135,7 @@ if TYPE_CHECKING:
 
 if TYPE_CHECKING:
     from mstar.engine.resources.lora.config import LoraSpec
-    from mstar.engine.state import Array
+    from mstar.engine.state import Array, Sampler, SampleSettings
 
 DECODE = "decode"
 MAX_OUTPUT_TOKENS = 2048
@@ -169,32 +169,6 @@ class ClientChunk(NamedTuple):
     # this append's model_kwargs, and the opening message's
     model_kwargs: dict
     request_kwargs: dict
-
-
-class Span(NamedTuple):
-    """One write to a KV stream. A layout lists them in the order the walks write.
-
-    Each span is one step's row, unless a span sets ``opens_step`` False: the step of
-    the span before it then writes it too, in the same row, as text around an attachment is.
-    That span is of the same walk, since a step runs one.
-
-    ``length`` is how many KV slots the write fills, and ``advance`` is how far
-    it moves the position counter, which is the length for text. ``source`` is
-    the tensor whose next entry an ids span keys, or the file of a digest span
-    as ``(modality, index)``. ``params`` are the preprocessing arguments that
-    change the tensors made from the file. A ``rows`` span writes KV made from
-    anything else, such as another node's outputs, and is never keyed.
-    ``scratch`` is the most a non-committing step writes before the span
-    commits into those slots, as a denoised window does.
-    """
-    kind: str
-    walk: str
-    length: int
-    advance: int
-    source: str | tuple[str, int]
-    params: tuple = ()
-    scratch: int = 0
-    opens_step: bool = True
 
 
 class LabelLayout(NamedTuple):
@@ -765,7 +739,6 @@ class Model(ABC):
             for node in graph.get_nodes()
         })
 
-    @abstractmethod
     def get_node_resources(self) -> list[NodeResourceSpec]:
         """Declare the resources the engine builds, and which nodes share each.
 
@@ -773,9 +746,9 @@ class Model(ABC):
         cache's shape, the attention backend over it, positions, samplers. The
         engine builds one resource per spec and hands each node the subset naming it.
         """
-        pass
+        return []
 
-    def declare_state(self) -> "list[Array]":
+    def declare_state(self) -> "list[Array | Sampler]":
         """The state the model keeps between steps, from which the engine builds the specs for it.
 
         A pure function of the model's config and the deployment's settings, since each process calls it.
@@ -783,7 +756,8 @@ class Model(ABC):
         return []
 
     def kernel_settings(self) -> dict[str, dict[str, Any]]:
-        """``splits`` and ``decode_fmha`` by read or update key, until the engine picks kernels itself."""
+        """``splits``, ``decode_fmha`` and a within-step read's ``max_segments_per_step`` and ``compile_op``, by read or
+        update key, until the engine picks kernels itself."""
         return {}
 
     def get_lora_specs(self) -> list["LoraSpec"]:
@@ -852,7 +826,7 @@ class Model(ABC):
         """The paged KV labels the model's walks write, by resource and label.
 
         `process_prompt` returns a `LabelLayout` for each under ``kv_layout``, as
-        ``{resource: {label: LabelLayout}}``. A label with keys opts its node into
+        ``{resource: {label: LabelLayout}}``, or a `Layout` under ``state_layout``. A label with keys opts its node into
         cross-request prefix reuse: the preprocess worker keys its layout's keyed
         spans and the KV resource matches what it already holds. With no keyed
         label the model is uncached whatever the deployment asks for.
@@ -863,7 +837,7 @@ class Model(ABC):
         self,
         partition_fwd_args: dict[str, ForwardPassArgs],
         model_kwargs: dict | None = None,
-    ) -> dict[str, ResourceReqConfig]:
+    ) -> "dict[str, ResourceReqConfig | SampleSettings]":
         """Per-resource config a new request is opened with, by resource label.
 
         Where a request's knobs live now: sampling params, whether it needs

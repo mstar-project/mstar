@@ -150,7 +150,7 @@ class Runtime:
         from mstar.engine.resources.kv.transfer import TransferEngineInfo
         from mstar.engine.resources.runner import StepRunner
         from mstar.engine.resources.spec import apply_yaml_overrides
-        from mstar.engine.state.adapters import node_resources
+        from mstar.engine.state.adapters import node_handles, node_resources
         from mstar.model.command_a_plus.config import KV_CACHE
 
         self.model = CommandAPlusModel(str(args.checkpoint), max_seq_len=args.context)
@@ -174,6 +174,7 @@ class Runtime:
         )) for key, spec in specs.items()}
         self.runner = StepRunner(self.resources)
         self.node.bind_node_resources(self.resources)
+        self.node.bind_node_state(node_handles(self.model, "LLM", self.resources))
         self.initial_free_pages = self.resources[KV_CACHE]._arena.num_free
 
     def start(self, rid):
@@ -186,8 +187,8 @@ class Runtime:
 
     def step(self, rids, rows, iteration, pixels=None):
         from mstar.engine.resources.step import StepContext
-        from mstar.model.command_a_plus.config import LOCAL_ATTN, SAMPLER
-        from mstar.model.submodule_base import ModelInputsFromEngine
+        from mstar.engine.state import at_last_token, sample
+        from mstar.model.submodule_base import ModelInputsFromEngine, engine_step
 
         walk = "decode" if iteration else "prefill" if pixels is None else "prefill_image"
         started = time.perf_counter()
@@ -196,22 +197,25 @@ class Runtime:
             vision = self.vision.prepare_inputs(walk, None, {"pixel_values": [pixels]})
             extra = self.vision.forward(walk, None, **self.vision.preprocess(walk, None, [vision]))
         inputs = [self.node.prepare_inputs(walk, None, {"text_inputs": [row], **extra}) for row in rows]
-        step = self.node.declare_step(walk, rids, inputs)
+        step = engine_step(self.node, graph_walk=walk, request_ids=rids, inputs=inputs)
         step.set_ctx(StepContext(rids, walk, iteration % 2, False))
         admitted = self.runner.admit(step)
         if not admitted.ok or not admitted.ready:
             raise RuntimeError(admitted)
         self.runner.plan(step)
         planned = time.perf_counter()
+        step.begin_calls()
         engine = ModelInputsFromEngine(rids, {}, self.resources)
         batch = self.node.preprocess(walk, engine, inputs)
         lm = self.node.language_model
         embeds = batch["input_embeds"] if "input_embeds" in batch else lm.model.embed(batch["text_inputs"])
-        hidden = lm(embeds, label="main")
+        hidden = lm(embeds)
         if iteration == 0:
-            hidden = self.resources[LOCAL_ATTN].select_last_hidden(hidden, label="main")
+            hidden = at_last_token(self.node.kv, hidden)
         logits = lm.compute_logits(hidden)
-        tokens = self.resources[SAMPLER].sample(rids, logits=logits)
+        tokens = sample(self.node.sampler, logits)
+        step.check_calls()
+        step.end_calls()
         self.runner.commit(step)
         torch.cuda.synchronize()
         return logits, tokens, dict(planning_ms=(planned-started)*1000,

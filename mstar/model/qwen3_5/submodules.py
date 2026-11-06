@@ -28,15 +28,19 @@ from mstar.engine.accelerator_graph_config import (
     decode_rows_then_prompt,
 )
 from mstar.engine.engine import ExecutingBatch
-from mstar.engine.resources.attn.base import AttentionManager
-from mstar.engine.resources.attn.config import AttentionStep
-from mstar.engine.resources.kv.config import KVStep
-from mstar.engine.resources.linear_attn.config import LinearAttnStep
-from mstar.engine.resources.position.config import PositionStep
-from mstar.engine.resources.recurrent.config import RecurrentStep
-from mstar.engine.resources.sampler.config import SamplerStep
-from mstar.engine.resources.sampler.resource import SamplerResource
-from mstar.engine.resources.step import Segment, SlotLease, SubmoduleStep
+from mstar.engine.state import (
+    ArrayStep,
+    SampleStep,
+    Segment,
+    SlotLease,
+    SubmoduleStep,
+    at_last_token,
+    kernel_setting,
+    last_sampled,
+    position,
+    positions,
+    sample,
+)
 from mstar.model.components.mrope import mrope_position_ids
 from mstar.model.components.qwen3_vit import (
     vision_interpolation,
@@ -54,15 +58,13 @@ from mstar.model.qwen3_5.components.rope import (
 )
 from mstar.model.qwen3_5.components.vision import Qwen3_5VisionModel
 from mstar.model.qwen3_5.config import (
-    ATTN,
     GDN_STATE,
     KV_CACHE,
-    LINEAR_ATTN,
     LLM_MIXED,
     MIXED_MAX_PREFILL_ROWS,
-    ROPE,
     SAMPLER,
     VISION_ATTN,
+    VISION_TOKENS,
     Qwen3_5Config,
     Qwen3_5VisionConfig,
 )
@@ -179,6 +181,10 @@ class LLMSubmodule(ARNodeSubmodule):
     # Engine lifecycle
     # ------------------------------------------------------------------
 
+    def bind_state(self, handles: Mapping[str, Any]) -> None:
+        self.kv = handles[KV_CACHE]
+        self.sampler = handles[SAMPLER]
+
     def get_accelerator_graph_configs(
         self, device: torch.device, tp_world_size: int = 1,
     ) -> list[AcceleratorGraphConfig]:
@@ -293,9 +299,7 @@ class LLMSubmodule(ARNodeSubmodule):
         packed = inputs["vision_embeds"][0].to(device)
         start_embed, end_embed = self._sentinel_embeds()
 
-        pos = self.node_resources[ROPE].position(
-            rid=fwd_info.rid_handle, label="main",
-        )
+        pos = position(self.kv, fwd_info.rid_handle, "main")
         start_pos = pos
         embeds: list[torch.Tensor] = []
         pos_ids: list[torch.Tensor] = []
@@ -411,7 +415,7 @@ class LLMSubmodule(ARNodeSubmodule):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """The rotary tables of a decode step from the position resource's
         planned positions: one token per row, no custom grids."""
-        pos_ids = self.node_resources[ROPE].pos_ids("main")
+        pos_ids = positions(self.kv)
         assert pos_ids is not None, (
             "position resource has no plan for this step; `plan` must run "
             "before the forward"
@@ -422,7 +426,7 @@ class LLMSubmodule(ARNodeSubmodule):
         )
 
     def _position_ids_3d(self, inputs: list[ARNodeInputs]) -> torch.Tensor:
-        return mrope_position_ids(self.node_resources[ROPE].pos_ids("main"), inputs)
+        return mrope_position_ids(positions(self.kv), inputs)
 
     @staticmethod
     def _splice_row_ids(
@@ -466,10 +470,9 @@ class LLMSubmodule(ARNodeSubmodule):
         ):
             # device loop-back: every row of a decode step is its request's
             # last sampled token, read by slot (padding rows read slot 0)
-            sampler: SamplerResource = engine_inputs.resources[SAMPLER]
             t0 = perf_counter() if PHASE_PERIOD else 0.0
             laps = PhaseLaps("engine.preprocess.loopback.")
-            ids = sampler.loopback_tokens(engine_inputs.request_ids)
+            ids = last_sampled(self.sampler)
             laps.lap("tokens")
             decode = graph_walk == "decode"
             # rows whose last step ran elsewhere brought their token
@@ -559,17 +562,10 @@ class LLMSubmodule(ARNodeSubmodule):
                 )
                 for rid, inp in zip(request_ids, inputs, strict=True)
             ],
-            steps={
-                KV_CACHE: KVStep(),
-                ATTN: AttentionStep(causal=True),
-                GDN_STATE: RecurrentStep(),
-                LINEAR_ATTN: LinearAttnStep(),
-                SAMPLER: SamplerStep(
-                    apply_penalty=True,
-                    prefill_tracked_tokens=prefill_tokens,
-                    kept_rids=kept_rids,
-                ),
-                ROPE: PositionStep(advance=advance),
+            state={
+                KV_CACHE: ArrayStep(advance=advance),
+                GDN_STATE: ArrayStep(),
+                SAMPLER: SampleStep(prompt_tokens=prefill_tokens, kept_rows=kept_rids),
             },
         )
 
@@ -586,10 +582,8 @@ class LLMSubmodule(ARNodeSubmodule):
         input_ids: torch.Tensor | None = None,
         input_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        attn: AttentionManager = engine_inputs.resources[ATTN]
-        sampler: SamplerResource = engine_inputs.resources[SAMPLER]
         if input_ids is None and input_embeds is None:
-            input_ids = sampler.loopback_tokens(engine_inputs.request_ids)
+            input_ids = last_sampled(self.sampler)
         if self._rope_in_graph(engine_inputs, graph_walk) or cos_3d is None or sin_3d is None:
             # the tables come from the planned positions, inside the graph
             # (off a captured decode's per-step critical path); the static
@@ -602,13 +596,12 @@ class LLMSubmodule(ARNodeSubmodule):
             if input_embeds is None
             else input_embeds
         )
-        hidden = self.model.model(embeds, label="main", cos_sin=(cos_3d, sin_3d))
+        hidden = self.model.model(embeds, cos_sin=(cos_3d, sin_3d))
 
         if graph_walk != "decode":
             # only the last token of each prefill row feeds the head
-            hidden = attn.select_last_hidden(hidden)
-        logits = self.model.lm_head(hidden)
-        return sampler.sample(engine_inputs.request_ids, logits=logits)
+            hidden = at_last_token(self.kv, hidden)
+        return sample(self.sampler, self.model.lm_head(hidden))
 
     def forward(
         self,
@@ -754,6 +747,9 @@ class VisionEncoderSubmodule(NodeSubmodule):
         # per-column (mean, std) for byte patches; see `Qwen3_5DenseModel.pixel_normalizer`
         self._pixel_normalizer = pixel_normalizer
 
+    def bind_state(self, handles: Mapping[str, Any]) -> None:
+        self.vision = handles[VISION_TOKENS]
+
     def prepare_inputs(
         self,
         graph_walk: str,
@@ -801,10 +797,7 @@ class VisionEncoderSubmodule(NodeSubmodule):
             for rid, inp in zip(request_ids, inputs, strict=True)
             for span in inp.tensor_inputs["seq_lengths"]
         ]
-        return SubmoduleStep(
-            segments=segments,
-            steps={VISION_ATTN: AttentionStep(causal=False)},
-        )
+        return SubmoduleStep(segments=segments, state={VISION_TOKENS: ArrayStep()})
 
     def can_batch(
         self, batch: ExecutingBatch, model_inputs: list[NodeInputs],
@@ -888,7 +881,7 @@ class VisionEncoderSubmodule(NodeSubmodule):
             VISION_BLOCK_LOOP: PiecewisePackedConfig(
                 capture_fn=self._capture_block_loop,
                 make_static_inputs=make_static_inputs,
-                attn_key=VISION_ATTN,
+                array=VISION_TOKENS,
                 lease_before_step=True,
                 one_row_per_step=True,
                 can_lease=self._fits_capture,
@@ -919,7 +912,7 @@ class VisionEncoderSubmodule(NodeSubmodule):
         # the whole step replays as one row (`one_row_per_step`)
         return (
             patches <= self.BLOCK_LOOP_PATCH_BUCKETS[-1]
-            and segments <= self.node_resources[VISION_ATTN].max_segments_per_step
+            and segments <= kernel_setting(self.vision, VISION_ATTN, "max_segments_per_step")
         )
 
     def _capture_block_loop(self, inp: PiecewiseCallInputs) -> dict[str, torch.Tensor]:

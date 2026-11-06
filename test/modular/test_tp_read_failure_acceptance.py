@@ -211,7 +211,6 @@ class _Rope:
 def _submodule_class():
     from mstar.engine.resources.kv.config import KVStep
     from mstar.engine.resources.step import Segment, SubmoduleStep
-    from mstar.model.qwen3_5.config import ROPE
     from mstar.model.qwen3_5.submodules import LLMSubmodule
 
     class _LLM(LLMSubmodule):
@@ -238,7 +237,7 @@ def _submodule_class():
             )
             self.head = torch.randn(HIDDEN, VOCAB)
             self.requires_grad_(False)
-            self.bind_node_resources({ROPE: _Rope()})
+            self.kv = SimpleNamespace(positions=_Rope())
             self.group, self.rank = group, rank
             # the stand-in's decode reads routed tokens, not the sampler's
             self.device_loopback = None

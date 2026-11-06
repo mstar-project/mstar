@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, get_origin
 
 import torch
 
-from mstar.engine.state.contract import Array
+from mstar.engine.state.contract import Array, Block, Sampler
 
 if TYPE_CHECKING:
     from mstar.model.base import Model
@@ -20,10 +20,12 @@ def state_declaration_problems(model: "Model") -> list[str]:
 
     A model that declares nothing returns before its walk graphs are built, since building them can read checkpoints.
     """
-    arrays = model.declare_state()
-    if not arrays:
+    declarations = model.declare_state()
+    if not declarations:
         return []
-    problems = _name_problems(arrays)
+    arrays = [d for d in declarations if isinstance(d, Array)]
+    samplers = [d for d in declarations if isinstance(d, Sampler)]
+    problems = _name_problems(arrays, samplers)
     walks = {walk: set(graph.get_nodes()) for walk, graph in model.get_graph_walk_graphs().items()}
     nodes = sorted(set().union(*walks.values()))
     combined = {walk for by_name in model.get_combined_graph_walks().values() for walk in by_name}
@@ -33,23 +35,86 @@ def state_declaration_problems(model: "Model") -> list[str]:
             for node in sorted(array.nodes - set(nodes))
         ]
         problems += _read_problems(array, walks, combined)
+        problems += _array_problems(array)
+    problems += _kv_label_problems(model.kv_labels(), arrays)
+    for sampler in samplers:
+        problems += _sampler_problems(sampler, nodes)
     return problems
 
 
-def _name_problems(arrays: Sequence[Array]) -> list[str]:
+def position_key(array: Array) -> str:
+    """The resource key of ``array``'s positions: ``thinker_pos`` for ``thinker_kv``, ``rope`` for any other name."""
+    return f"{array.name.removesuffix('_kv')}_pos" if array.name.endswith("_kv") else "rope"
+
+
+def _name_problems(arrays: Sequence[Array], samplers: Sequence[Sampler]) -> list[str]:
     """Names share one namespace while they are resource keys, so a read can't reuse an array's name."""
     problems: list[str] = []
-    declared: set[str] = set()
-    for array in arrays:
-        where = f"Array {array.name!r}"
-        for field, name in (
-            (f"{where}.name", array.name),
-            *((f"{where}.reads", key) for key in array.reads),
-            *((f"{where}.updates", key) for key in array.updates),
-        ):
-            if name in declared:
-                problems.append(f"{field}: the name {name!r} is declared twice")
-            declared.add(name)
+    declared: dict[str, str] = {}
+    for field, name in (
+        *(
+            pair for array in arrays for pair in (
+                (f"Array {array.name!r}.name", array.name),
+                *((f"Array {array.name!r}.reads", key) for key in array.reads),
+                *((f"Array {array.name!r}.updates", key) for key in array.updates),
+                *(() if array.positions is None else ((f"Array {array.name!r}.positions", position_key(array)),)),
+            )
+        ),
+        *((f"Sampler {sampler.name!r}.name", sampler.name) for sampler in samplers),
+    ):
+        if name in declared:
+            problems.append(f"{field}: the name {name!r} is declared twice, also by {declared[name]}")
+        declared.setdefault(name, field)
+    return problems
+
+
+def _array_problems(array: Array) -> list[str]:
+    where = f"Array {array.name!r}"
+    problems: list[str] = []
+    for key, read in array.reads.items():
+        if isinstance(read.mask, Block) and array.max_len:
+            problems.append(f"{where}.reads[{key!r}].mask: Block needs max_len 0, and max_len is {array.max_len}")
+        elif not isinstance(read.mask, Block) and not array.max_len:
+            problems.append(f"{where}.reads[{key!r}].mask: every read of an array with max_len 0 is a Block read, "
+                            f"and this one is {type(read.mask).__name__}")
+    if array.positions is not None:
+        if array.rewritable or not array.max_len:
+            problems.append(f"{where}.positions: positions sit only on an append-only array that keeps entries")
+        rope = array.positions.rope
+        llama31 = () if rope is None else (rope.low_freq_factor, rope.high_freq_factor, rope.old_context_len)
+        if None in llama31 and any(factor is not None for factor in llama31):
+            problems.append(f"{where}.positions.rope: low_freq_factor, high_freq_factor and old_context_len are "
+                            f"all set or all None, and they are {llama31}")
+    kinds = [type(update) for update in array.updates.values()]
+    for kind in sorted({kind for kind in kinds if kinds.count(kind) > 1}, key=lambda kind: kind.__name__):
+        problems.append(f"{where}.updates: it carries {kinds.count(kind)} updates of type {kind.__name__}")
+    return problems
+
+
+def _kv_label_problems(kv_labels: Mapping[str, Mapping[str, object]], arrays: Sequence[Array]) -> list[str]:
+    by_name = {array.name: array for array in arrays}
+    problems: list[str] = []
+    for key, labels in kv_labels.items():
+        if key not in by_name:
+            problems.append(f"kv_labels()[{key!r}]: it names no declared array, of {sorted(by_name)}")
+            continue
+        problems += [
+            f"kv_labels()[{key!r}][{label!r}]: it is not in Array {key!r}.labels, {sorted(by_name[key].labels)}"
+            for label in sorted(labels.keys() - by_name[key].labels)
+        ]
+    return problems
+
+
+def _sampler_problems(sampler: Sampler, nodes: Sequence[str]) -> list[str]:
+    where = f"Sampler {sampler.name!r}"
+    problems = [
+        f"{where}.nodes: {node!r} is not a node of the model, which has {nodes}"
+        for node in sorted(sampler.nodes - set(nodes))
+    ]
+    if sampler.vocab_size < 1:
+        problems.append(f"{where}.vocab_size must be at least 1, got {sampler.vocab_size}")
+    if sampler.draws < 1:
+        problems.append(f"{where}.draws must be at least 1, got {sampler.draws}")
     return problems
 
 
@@ -75,12 +140,23 @@ def _read_problems(array: Array, walks: Mapping[str, set[str]], combined: set[st
     return problems
 
 
-def declaration_digest(arrays: Sequence[Array]) -> str:
+def deployment_problems(model: "Model", resources: Mapping[str, Mapping[str, object]]) -> list[str]:
+    """What a deployment's ``resources:`` block asks of a declared sampler that it can't do."""
+    return [
+        f"Sampler {declared.name!r}.draws: enable_logprobs, and draws is {declared.draws}; log-probs take one token "
+        "per step"
+        for declared in model.declare_state()
+        if isinstance(declared, Sampler) and declared.draws > 1
+        and resources.get(declared.name, {}).get("enable_logprobs")
+    ]
+
+
+def declaration_digest(declarations: Sequence[Array | Sampler]) -> str:
     """A SHA-256 that matches across processes, which Python's `hash` doesn't, since it randomizes strings per process.
 
     Every field of every declaration goes in, with keys sorted and dtypes and classes by name.
     """
-    ordered = sorted(arrays, key=lambda array: array.name)
+    ordered = sorted(declarations, key=lambda declared: declared.name)
     return hashlib.sha256(json.dumps(_canonical(ordered), sort_keys=True).encode()).hexdigest()
 
 
