@@ -652,6 +652,8 @@ class KVManager(AttentionResource):
         self._overrides: dict[str, KVReqConfig] = {}
         # dropped request -> what it returns with, until its rebuild lands
         self._dropped: dict[str, Dropped] = {}
+        # rebuilt request -> the tokens it had written when its rebuild landed
+        self._rebuilt: dict[str, int] = {}
         # A stream holds its pages in group g at `CacheStream.groups[g]`, and a plan's at
         # `KVPlanOutputs.groups[g]`; write addressing is keyed (label, g).
         self._groups: tuple[KVGroup, ...] = cfg.groups
@@ -3690,8 +3692,8 @@ class KVManager(AttentionResource):
         with self._lock:
             if not self._movable(rid):
                 return (
-                    f"KV {self.name}: {rid} is guaranteed, has a step or a read in flight on its pages, or holds a "
-                    "lease no walk's admit has taken over"
+                    f"KV {self.name}: {rid} is guaranteed, has a step or a read in flight on its pages, holds a "
+                    "lease no walk's admit has taken over, or has written nothing since its rebuild landed"
                 )
             if not self._overrides[rid].rebuildable:
                 return f"KV {self.name}: {rid} can't be rebuilt on this worker"
@@ -3719,7 +3721,7 @@ class KVManager(AttentionResource):
             # ones included, and the sample its next step writes) and one page more, at most its footprint.
             # A request dropped partway through its prompt still writes the rest.
             streams = self._streams[rid].values()
-            written = max(stream.stored_len + stream.released for stream in streams)
+            written = self._written(rid)
             history = -(-(written + 1) // self.config.tokens_per_page)
             allotment = self._allotments.get(rid)
             returns = max(
@@ -3796,7 +3798,13 @@ class KVManager(AttentionResource):
         }
 
     def land_rebuild(self, rid: str) -> None:
-        self._dropped.pop(rid, None)
+        with self._lock:
+            if self._dropped.pop(rid, None) is not None:
+                self._rebuilt[rid] = self._written(rid)
+
+    def _written(self, rid: str) -> int:
+        """The tokens ``rid``'s longest stream has written, released ones included."""
+        return max((stream.stored_len + stream.released for stream in self._streams[rid].values()), default=0)
 
     def offload(self, rid: str) -> int:
         """Move every stream of ``rid`` to host memory. Returns the device pages
@@ -4423,6 +4431,7 @@ class KVManager(AttentionResource):
             self._overrides.pop(rid, None)
             self._guaranteed.discard(rid)
             self._dropped.pop(rid, None)
+            self._rebuilt.pop(rid, None)
             self._chain_lookup.pop(rid, None)
             self._transfer.remove_request(rid)
             self._settle(rid, self._room() - room)
@@ -4929,13 +4938,17 @@ class KVManager(AttentionResource):
 
     def _movable(self, rid: str) -> bool:
         """Whether a move can take ``rid`` as soon as it is chosen: it isn't guaranteed, no step or read is in flight on
-        its pages, and it isn't dropped with a rebuild still to land, since the rebuild runs on its allotment. ``rid``
-        also stays while it holds a lease, until a walk's admit takes the lease over. The probe that took the lease
-        moved the position counter, which a smaller hit after a move couldn't move back, and a walk the cache served
-        keeps its KV only in the lease."""
-        return rid not in self._guaranteed and rid not in self._dropped and not any(
-            stream.step_in_flight or stream.read_pending or stream.lease is not None
-            for stream in self._streams[rid].values()
+        its pages, and it isn't dropped with a rebuild still to land, since the rebuild runs on its allotment. A
+        rebuilt request stays until a step writes past its rebuild, so every rebuild keeps at least one token, and that
+        step runs on the page its return reserved. ``rid`` also stays while it holds a lease, until a walk's admit
+        takes the lease over. The probe that took the lease moved the position counter, which a smaller hit after a
+        move couldn't move back, and a walk the cache served keeps its KV only in the lease."""
+        return (
+            rid not in self._guaranteed and rid not in self._dropped and self._rebuilt.get(rid, -1) < self._written(rid)
+            and not any(
+                stream.step_in_flight or stream.read_pending or stream.lease is not None
+                for stream in self._streams[rid].values()
+            )
         )
 
     def _unwritten(self, rid: str) -> bool:

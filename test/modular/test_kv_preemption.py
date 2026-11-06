@@ -915,6 +915,7 @@ def test_a_request_back_from_a_drop_is_still_a_victim_for_an_older_request():
     assert _ready(kv, "a") and _admitted(kv, "v")
     assert _step(kv, "v", 2 * PAGE_SIZE).ok
     kv.land_rebuild("v")
+    assert _step(kv, "v", 1).ok
     while (outcome := _step(kv, "a", PAGE_SIZE)).ok:
         pass
 
