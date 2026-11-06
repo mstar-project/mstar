@@ -991,6 +991,39 @@ def test_an_exiting_process_keeps_its_slot_and_its_table_until_it_is_gone():
     assert out.strip() == "True", out
 
 
+def test_a_native_spinner_doesnt_hold_the_gate_shut():
+    """A task of a process with nothing running that never leaves the CPU (an OpenMP pool's spin
+    wait) isn't a message on its way: past a limit the process says it is blocked, so its frozen
+    clock can't hold a peer to the abort. And a scan that can't tell keeps the gate shut."""
+    spinner, held = run_deployment("""
+        import hashlib
+        spin = lambda: hashlib.pbkdf2_hmac("sha256", b"x", b"y", 2**31 - 1)  # (no GIL, no clock)
+        threading.Thread(target=spin, name=waits.OWN + "spin", daemon=True).start()
+        barrier()
+        time.sleep(2.0)
+    """, """
+        waits.HELD_LIMIT = 3.0
+        barrier()
+        clock.charge(1.0)
+        torch.cuda.synchronize()
+        time.perf_counter()
+        print("passed")
+    """)
+    assert held.strip() == "passed", held
+    out = run_sim("""
+        import errno, os
+        from mstar_sim import waits
+        real, tasks = os.open, waits._Tasks("self")
+
+        def out_of_fds(*args, **kwargs):
+            raise OSError(errno.EMFILE, "too many open files")
+
+        os.open = out_of_fds
+        print(tasks.on_cpu(waits._mover_tid[0]))
+    """)
+    assert out.strip() == "True", out
+
+
 def test_a_read_held_behind_a_rising_bound_doesnt_abort():
     """The limit is on a bound that stands still, not on a hold: a device wait can put a process
     far past a peer that runs at real rate, and it then waits for the peer to get there."""

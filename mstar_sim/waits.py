@@ -96,6 +96,8 @@ _native_busy = [False]  # one is working, which counts as a running thread
 _looked = [0.0, 0.0]  # the mover's last look: when, and what the process's other threads had used
 _moved = [0.0, 0.0]  # the last move on the bound: when, and how far
 _CPU_ALLOWANCE = 1e-3  # CPU time a look lets pass as nothing: zmq's and gloo's own threads ticking over
+_shut = [0.0]  # the real time the gate found a task on a CPU, with nothing running (0.0: it hasn't)
+_GATE_LIMIT = 1.0  # real seconds a message can't stay on its way, though a loaded box descheduled it
 _meet = [0]  # the group word of the meet a thread of this process is in (dist)
 REPORT = {"slept_s": 0.0, "late_resumes": 0, "jump_blockers": {}, "ahead_stalls": 0, "late_deliveries": 0,
           "meet_skew_s": 0.0, "mover_s": 0.0, "scan_s": 0.0, "scans": 0, "settle_deferrals": 0, "gate_waits": 0,
@@ -310,8 +312,10 @@ def _move() -> float:
     idle = _running[0] == 0 or clock.PARKED[0]
     if _native and (idle or _native_busy[0]):
         timeout = 2 * SETTLE  # a move may be pending on a child: look often
+    if not idle:
+        _shut[0] = 0.0
     if idle:
-        quiet = _quiet()
+        quiet = _gate()
         if quiet and not _told_blocked[0]:
             _told_blocked[0] = True
             _publish()
@@ -369,8 +373,10 @@ class _Tasks:
     def on_cpu(self, skip: str | None = None) -> bool:
         try:
             tids = os.listdir(self.root)
-        except OSError:
+        except (FileNotFoundError, ProcessLookupError):
             return False
+        except OSError:
+            return True  # it can't tell: better a move delayed than one past a message
         for tid in self.fds.keys() - set(tids):
             os.close(self.fds.pop(tid))
         found = False
@@ -383,8 +389,10 @@ class _Tasks:
                     fd = self.fds[tid] = os.open(f"{self.root}/{tid}/stat", os.O_RDONLY)
                 stat = os.pread(fd, 128, 0)
                 found = stat[stat.rindex(b")") + 2] in b"RD"
-            except (OSError, ValueError, IndexError):
+            except (FileNotFoundError, ProcessLookupError, ValueError, IndexError):
                 pass  # a task that has just gone
+            except OSError:
+                found = True
         return found
 
     def close(self) -> None:
@@ -399,14 +407,24 @@ _libc = ctypes.CDLL(None)
 
 
 def _quiet() -> bool:
-    """The gate: nothing of this process can be on its way to a peer. A send wakes the next thread
-    on its path inside the syscall, so a message in flight has a runnable thread until the receiver
-    has it."""
+    """Nothing of this process can be on its way to a peer. A send wakes the next thread on its path
+    inside the syscall, so a message in flight has a runnable thread until the receiver has it."""
     began = clock._real()
     working = _own.on_cpu(_mover_tid[0])
     REPORT["scans"] += 1
     REPORT["scan_s"] += clock._real() - began
     return not working
+
+
+def _gate() -> bool:
+    """Whether a process with no thread running may say so. It waits for :func:`_quiet`, but a task
+    on a CPU for ``_GATE_LIMIT`` is no message: a native spinner would hold the gate for ever, and
+    the slot, running at a clock that stands still, would hold every peer to the abort."""
+    if _quiet():
+        _shut[0] = 0.0
+        return True
+    _shut[0] = _shut[0] or clock._real()
+    return clock._real() - _shut[0] > _GATE_LIMIT
 
 
 def _watch_children() -> None:
