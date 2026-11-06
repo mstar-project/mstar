@@ -1420,13 +1420,23 @@ def test_concurrent_copies_share_a_copy_engine_and_overlap_compute():
 
 
 def test_a_cached_call_answers_as_the_call_would():
-    """The shape cache tells ``1`` from ``1.0``, whose results differ in dtype."""
+    """The shape cache tells ``1`` from ``1.0``, whose results differ in dtype, and a launch counts
+    the kernels it stands for, cached or not (``rms_norm``: 8)."""
     out = run_sim("""
         import torch
+        from mstar_sim import clock
         ints = torch.empty(1 << 21, dtype=torch.int64, device="cuda")  # (too many to keep values)
         print(*((ints * value).dtype for value in (1, 1.0, True)))
+        x = torch.empty(512, 4096, device="cuda")
+        counts = [clock.DEFAULT.kernels]
+        for _ in range(3):
+            torch.rms_norm(x, (4096,))
+            counts.append(clock.DEFAULT.kernels)
+        print(*(b - a for a, b in zip(counts, counts[1:])))
     """)
-    assert out.split() == ["torch.int64", "torch.float32", "torch.int64"], out
+    dtypes, kernels = out.splitlines()
+    assert dtypes.split() == ["torch.int64", "torch.float32", "torch.int64"], out
+    assert len(set(kernels.split())) == 1 and int(kernels.split()[0]) > 1, out
 
 
 def test_timing_only_holds_shapes_not_values():

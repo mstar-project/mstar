@@ -47,10 +47,10 @@ class Timeline:
     kernels: int = 0
     busy: float = 0.0
 
-    def launch(self, seconds: float, launched: float | None = None) -> float:
+    def launch(self, seconds: float, launched: float | None = None, kernels: int = 1) -> float:
         start = max(now() if launched is None else launched, self.free_at)
         self.free_at = start + seconds
-        self.kernels += 1
+        self.kernels += kernels
         self.busy += seconds
         return self.free_at
 
@@ -318,7 +318,7 @@ def charge(seconds: float, launched: float | None = None, kernels: int = 1, engi
         timeline = current_timeline()
         if engine is not None:
             timeline.free_at = max(timeline.free_at, engine.free_at)
-        end = timeline.launch((seconds + kernels * cost.launch_seconds()) * TIME_SCALE, launched)
+        end = timeline.launch((seconds + kernels * cost.launch_seconds()) * TIME_SCALE, launched, kernels)
         if engine is not None:
             engine.free_at = end
         return end
