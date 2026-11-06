@@ -23,22 +23,27 @@ from mstar.engine.accelerator_graph_config import (
     AcceleratorGraphConfig,
     PackedAcceleratorGraphConfig,
 )
-from mstar.engine.resources import AttentionStep, KVStep, PositionStep, SamplerStep, Segment, SlotLease, SubmoduleStep
-from mstar.engine.resources.attn.base import AttentionManager
-from mstar.engine.resources.sampler.resource import SamplerResource
+from mstar.engine.state import (
+    ArrayStep,
+    SampleStep,
+    Segment,
+    SlotLease,
+    SubmoduleStep,
+    at_last_token,
+    last_sampled,
+    sample,
+)
 from mstar.model.components.audio_features import LogMelSpectrogram
 from mstar.model.components.aut_encoder import AuTEncoder
 from mstar.model.components.aut_submodule import AuTEncoderSubmodule
 from mstar.model.components.qwen3_lm import Qwen3DenseLM
 from mstar.model.components.token_step import TokenStepNode
 from mstar.model.qwen3_asr.config import (
-    ATTN,
-    AUT_ATTN,
+    AUT_TOKENS,
     DECODE_LOOP,
     DECODE_WALK,
     KV_CACHE,
     PREFILL_WALK,
-    ROPE,
     SAMPLER,
     Qwen3ASRModelConfig,
 )
@@ -50,6 +55,7 @@ from mstar.model.submodule_base import (
     ModelInputsFromEngine,
     NodeInputs,
     TokenStop,
+    splice_loopback_ids,
 )
 
 logger = logging.getLogger(__name__)
@@ -68,7 +74,7 @@ class Qwen3ASREncoderSubmodule(AuTEncoderSubmodule):
     """
 
     def __init__(self, encoder: AuTEncoder, config: Qwen3ASRModelConfig):
-        super().__init__(encoder, attn_key=AUT_ATTN)
+        super().__init__(encoder, array=AUT_TOKENS)
         self.config = config
         # built here, after the encoder was materialized, so its filter bank
         # and window are real tensors on the encoder's device
@@ -141,6 +147,10 @@ class Qwen3ASRLLMSubmodule(TokenStepNode, ARNodeSubmodule):
             walk=DECODE_WALK, signal="text_inputs", sampler=self.SAMPLER, buffer="new_token",
         )
 
+    def bind_state(self, handles: Mapping[str, Any]) -> None:
+        self.kv = handles[KV_CACHE]
+        self.sampler = handles[SAMPLER]
+
     def get_accelerator_graph_configs(
         self, device: torch.device, tp_world_size: int = 1,
     ) -> list[AcceleratorGraphConfig]:
@@ -212,12 +222,7 @@ class Qwen3ASRLLMSubmodule(TokenStepNode, ARNodeSubmodule):
                 Segment(request_id=rid, label="main", span=inp.input_seq_len)
                 for rid, inp in zip(request_ids, inputs, strict=True)
             ],
-            steps={
-                KV_CACHE: KVStep(),
-                ATTN: AttentionStep(causal=True),
-                SAMPLER: SamplerStep(apply_penalty=False),
-                ROPE: PositionStep(),
-            },
+            state={KV_CACHE: ArrayStep(), SAMPLER: SampleStep(apply_penalty=False)},
         )
 
     def preprocess(
@@ -227,28 +232,28 @@ class Qwen3ASRLLMSubmodule(TokenStepNode, ARNodeSubmodule):
         inputs: list[ARNodeInputs],
     ) -> dict[str, torch.Tensor | Any]:
         if graph_walk == DECODE_WALK:
-            if any(inp.input_ids is None for inp in inputs):
-                # device loop-back: every row is its request's last sampled
-                # token, read by slot
-                return self.loopback_inputs(engine_inputs, inputs)
-            return {"input_ids": torch.cat([inp.input_ids for inp in inputs])}
+            if all(inp.input_ids is not None for inp in inputs):
+                return {"input_ids": torch.cat([inp.input_ids for inp in inputs])}
+            # Device loop-back reads each row's last sampled token by slot. A row whose last step ran elsewhere
+            # brought its token.
+            ids = last_sampled(self.sampler)
+            if any(inp.input_ids is not None and inp.input_seq_len for inp in inputs):
+                ids = splice_loopback_ids(ids, inputs, decode=True)
+            return {"input_ids": ids}
         return {"input_embeds": torch.cat([inp.input_embeds for inp in inputs], dim=0)}
 
     def _forward(
         self,
         graph_walk: str,
-        engine_inputs: ModelInputsFromEngine,
         input_ids: torch.Tensor | None,
         input_embeds: torch.Tensor | None,
     ) -> torch.Tensor:
-        sampler: SamplerResource = engine_inputs.resources[SAMPLER]
-        attn: AttentionManager = engine_inputs.resources[ATTN]
         if input_embeds is None:
             input_embeds = self.model.embed(input_ids)
-        hidden = self.model(input_embeds, label="main")
+        hidden = self.model(input_embeds)
         if graph_walk != DECODE_WALK:
-            hidden = attn.select_last_hidden(hidden)
-        return sampler.sample(engine_inputs.request_ids, logits=self.model.logits(hidden))
+            hidden = at_last_token(self.kv, hidden)
+        return sample(self.sampler, self.model.logits(hidden))
 
     def forward(
         self,
@@ -258,7 +263,7 @@ class Qwen3ASRLLMSubmodule(TokenStepNode, ARNodeSubmodule):
         input_embeds: torch.Tensor | None = None,
         **kwargs,
     ) -> NameToTensorList:
-        return {"new_token": [self._forward(graph_walk, engine_inputs, input_ids, input_embeds)]}
+        return {"new_token": [self._forward(graph_walk, input_ids, input_embeds)]}
 
     def forward_batched(
         self,
@@ -268,7 +273,7 @@ class Qwen3ASRLLMSubmodule(TokenStepNode, ARNodeSubmodule):
         input_embeds: torch.Tensor | None = None,
         **kwargs,
     ) -> BatchedModelOutput:
-        new_tokens = self._forward(graph_walk, engine_inputs, input_ids, input_embeds)
+        new_tokens = self._forward(graph_walk, input_ids, input_embeds)
         # Row i is request i: one clone and one D2H copy per step instead of
         # one per request. A decode step's token is its loop's one signal
         # (`text_inputs`); prefill's is the persisted first token.
