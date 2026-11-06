@@ -303,6 +303,8 @@ class PendingBatch:
     submitted_at: float = 0.0
     # the chain's step, or another lane's (``mstar.worker.lanes``)
     lane: int = CHAIN_LANE
+    # its run on the device was asked to end early (``_end_run_for_ready_rows``)
+    yield_asked: bool = False
 
 
 class EvictionPolicy(Enum):

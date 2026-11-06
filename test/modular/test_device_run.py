@@ -527,12 +527,24 @@ def _waiting_on_a_run(monkeypatch, ready):
     return worker, log
 
 
-def _run_step(rows, looks, **node_batch):
+def _run_step(rows, looks, yield_asked=False, **node_batch):
     landed = iter([False] * looks + [True])
     return SimpleNamespace(
         node_name="n", graph_walk=WALK, batch=SimpleNamespace(request_to_worker_graph=dict.fromkeys(rows)),
         node_batch=SimpleNamespace(completion_event=SimpleNamespace(query=lambda: next(landed)), **node_batch),
+        yield_asked=yield_asked,
     )
+
+
+@pytest.mark.parametrize("slots, asks", [((0, 0), 1), ((0, 1), 0)])
+def test_a_yield_asked_for_a_run_survives_the_step_behind_on_its_slot(monkeypatch, slots, asks):
+    """With one slot N+1 stages N's own run state, which clears the yield the
+    speculation asked for N; with two each keeps its own (review-r7 G3)."""
+    worker, log = _waiting_on_a_run(monkeypatch, [set()])
+    worker._hold_rows = lambda lane, rows: None
+    behind = _run_step([2], 0, slot=slots[1], launch_started_event=SimpleNamespace(wait=lambda: None))
+    worker._await_run(_run_step([1], 1, yield_asked=True, slot=slots[0], token_stream=None), behind, [], None)
+    assert log.count("yield") == asks
 
 
 def test_a_runs_wait_moves_nothing_until_the_step_behind_it_has_admitted(monkeypatch):

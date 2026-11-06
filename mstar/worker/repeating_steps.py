@@ -379,6 +379,7 @@ class RepeatingSteps:
         """``step``'s run on the device ends at its next iteration, not at its count."""
         if step.node_batch.step_context.repeats > 1 and not self._step_repeats.config(step.node_name).ready_waits:
             self.engine_manager.get_engine(step.node_name).yield_runs(step.node_name)
+            step.yield_asked = True
 
     def _is_device_run(self, step: PendingBatch) -> bool:
         return (
@@ -406,6 +407,9 @@ class RepeatingSteps:
             rows.update(spec_pending.batch.request_to_worker_graph)
         self._hold_rows(CHAIN_LANE, rows)
         engine = self.engine_manager.get_engine(batch_N.node_name)
+        if batch_N.yield_asked and spec_pending is not None and spec_pending.node_batch.slot == batch_N.node_batch.slot:
+            # one slot: N+1 staged N's own run state, clearing the yield asked for N
+            engine.yield_runs(batch_N.node_name)
         has_ready = self.scheduler.has_ready_excluding
         state, chain = self.request_state, (batch_N.node_name, batch_N.graph_walk)
         waiting = has_ready(state, None)
