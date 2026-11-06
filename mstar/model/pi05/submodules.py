@@ -79,11 +79,11 @@ class Pi05ViTEncoderSubmodule(NodeSubmodule):
         """Resize one request's stack of camera images with aspect-preserving
         letterbox padding.
 
-        Matches openpi's ``image_tools.resize_with_pad_torch`` exactly:
-        the longer dimension is scaled to the target size, the shorter
-        dimension is scaled proportionally, and the result is padded with
-        ``-1`` (the float32 normalized "black" value) to reach the target
-        resolution.
+        As openpi's ``image_tools.resize_with_pad``: the longer dimension is
+        scaled to the target size, the shorter one proportionally, and the
+        result is padded with ``-1`` (black once normalized). Its linear
+        resize (``jax.image.resize``) antialiases when downscaling, so this
+        one does too.
 
         Accepted input encodings (auto-detected by dtype + value range):
           * ``uint8`` in ``[0, 255]`` — what ``Pi05Model.load_image`` hands over
@@ -121,7 +121,7 @@ class Pi05ViTEncoderSubmodule(NodeSubmodule):
         resized_h = int(cur_h / ratio)
         resized_w = int(cur_w / ratio)
         resized = nn.functional.interpolate(
-            images, size=(resized_h, resized_w), mode="bilinear", align_corners=False
+            images, size=(resized_h, resized_w), mode="bilinear", align_corners=False, antialias=True,
         ).clamp(-1.0, 1.0)
 
         # Symmetric pad with -1.0 (float32 "black" in the [-1, 1] convention).

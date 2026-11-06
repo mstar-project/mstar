@@ -870,8 +870,11 @@ def test_pi05_siglip_encoder_matches_hf_reference():
 
 
 def _ref_resize_with_pad(images: torch.Tensor, target_h: int, target_w: int) -> torch.Tensor:
-    """Reference port of ``image_tools.resize_with_pad_torch`` (channels-first
-    float32 path). Used to verify ``Pi05ViTEncoderSubmodule._prepare_one``.
+    """Reference port of openpi's ``image_tools.resize_with_pad``, which its
+    data pipeline applies (``transforms.ResizeImages``), channels-first float32.
+    Its ``jax.image.resize`` linear resize antialiases when downscaling, as
+    torch's ``antialias=True`` does. Used to verify
+    ``Pi05ViTEncoderSubmodule._prepare_one``.
     """
     assert images.dim() == 4 and images.dtype == torch.float32
     _, _, cur_h, cur_w = images.shape
@@ -879,7 +882,7 @@ def _ref_resize_with_pad(images: torch.Tensor, target_h: int, target_w: int) -> 
     resized_h = int(cur_h / ratio)
     resized_w = int(cur_w / ratio)
     resized = torch.nn.functional.interpolate(
-        images, size=(resized_h, resized_w), mode="bilinear", align_corners=False
+        images, size=(resized_h, resized_w), mode="bilinear", align_corners=False, antialias=True,
     ).clamp(-1.0, 1.0)
     pad_h0, rem_h = divmod(target_h - resized_h, 2)
     pad_h1 = pad_h0 + rem_h
@@ -891,7 +894,7 @@ def _ref_resize_with_pad(images: torch.Tensor, target_h: int, target_w: int) -> 
 
 
 def test_pi05_image_preprocessing_matches_resize_with_pad_letterbox():
-    """``Pi05ViTEncoderSubmodule._prepare_one`` vs openpi's resize_with_pad_torch.
+    """``Pi05ViTEncoderSubmodule._prepare_one`` vs openpi's resize_with_pad.
 
     Tests three cases that exercise the letterbox path:
       * already-target square (no resize / no pad — identity-ish)
