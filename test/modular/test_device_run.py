@@ -434,21 +434,9 @@ def test_the_worker_settles_a_run_that_ended_short(monkeypatch):
     profiler.phase_buffer().clear()
 
 
-@pytest.mark.parametrize("begun, skipped", [(RUN_SKIPPED, True), (RUN_RAN, False)])
-def test_a_skipped_run_lands_as_a_step_that_never_ran(begun, skipped):
-    """Nothing it counted happened and it has no outputs: what admit counted goes back
-    and its rows wait with the inputs they had, with no postprocess at all. The word
-    can still be 0 at first: the step before has only just landed."""
-    from mstar.worker.worker import Worker
-
-    worker = Worker.__new__(Worker)
-    log = []
-    words = iter([0, begun])
-    worker._clear_in_flight_flag = lambda batch: log.append("flag")
-    worker._push_back_batch = lambda batch: log.append("queued")
-    worker.engine_manager = SimpleNamespace(get_engine=lambda node: SimpleNamespace(
-        end_run_early=lambda node_batch, ran: log.append(("rewound", ran)),
-    ))
+def _skipped_step(worker, log, words, rows=(1, 2), **node_batch):
+    """A step in ``_landed_skipped``, real batch and all, on a runtime that logs what it gets back."""
+    from mstar.worker.micro_scheduler import ScheduledBatch
 
     class Word:
         value = None
@@ -457,15 +445,58 @@ def test_a_skipped_run_lands_as_a_step_that_never_ran(begun, skipped):
             self.value = next(words, self.value)
             return self.value
 
-    step = SimpleNamespace(
-        node_name="n", graph_walk=WALK, batch=object(),
-        future=SimpleNamespace(done=lambda: False, result=lambda: None),
-        node_batch=SimpleNamespace(
-            run_started=Word(), step_context=SimpleNamespace(repeats=8), completion_event=None,
+    worker._clear_in_flight_flag = lambda batch: log.append(("flag", sorted(batch.request_to_worker_graph)))
+    worker.engine_manager = SimpleNamespace(get_engine=lambda node: SimpleNamespace(
+        end_run_early=lambda node_batch, ran: log.append(("rewound", ran)),
+        ring_rows=lambda node: SimpleNamespace(
+            ring_skip=lambda signal, rid, positions: log.append(("ring", signal, rid, list(positions))),
         ),
+    ))
+    worker._graph_runtime = SimpleNamespace(
+        pending_loop_stop_rids=lambda rids, loop: [],
+        push_back_node=lambda node, rids, wgs: log.append(("queued", rids)),
     )
+    batch = ScheduledBatch(node_name="n", graph_walk=WALK, request_to_worker_graph=dict.fromkeys(rows, 0))
+    return SimpleNamespace(
+        node_name="n", graph_walk=WALK, batch=batch, speculative_new_iter=True, loop_name="loop",
+        future=SimpleNamespace(done=lambda: False, result=lambda: "outputs"),
+        node_batch=SimpleNamespace(**{
+            "run_started": Word(), "step_context": SimpleNamespace(repeats=8), "completion_event": None,
+            "request_ids": list(rows), "cached_rids": set(), "failed_requests": {}, "ring_bases": {}, "ring_width": 8,
+            **node_batch,
+        }),
+    )
+
+
+@pytest.mark.parametrize("begun, skipped", [(RUN_SKIPPED, True), (RUN_RAN, False)])
+def test_a_skipped_run_lands_as_a_step_that_never_ran(begun, skipped):
+    """Nothing it counted happened and it has no outputs: what admit counted goes back
+    and its rows wait with the inputs they had, with no postprocess at all. The word
+    can still be 0 at first: the step before has only just landed."""
+    from mstar.worker.worker import Worker
+
+    worker, log = Worker.__new__(Worker), []
+    step = _skipped_step(worker, log, iter([0, begun]))
     assert worker._landed_skipped(step) is skipped
-    assert log == (["flag", ("rewound", 0), "queued"] if skipped else [])
+    assert log == ([("rewound", 0), ("flag", [1, 2]), ("queued", [1, 2])] if skipped else [])
+
+
+def test_a_skipped_step_gives_back_only_the_rows_a_refused_one_would(monkeypatch):
+    """The step was built before N landed. A row whose loop stopped at N has an emptied
+    node, which would pop with no inputs and run past its stop. One prepare_inputs
+    vetoed has spent its inputs, and one a stage blamed fails."""
+    from mstar.worker.worker import Worker
+
+    worker, log = Worker.__new__(Worker), []
+    step = _skipped_step(
+        worker, log, iter([RUN_SKIPPED]), rows=(1, 2, 3, 4), request_ids=[1, 2, 4], failed_requests={4: "boom"},
+    )
+    worker._graph_runtime.pending_loop_stop_rids = lambda rids, loop: [2]
+    failed = []
+    worker._fail_step_rows = lambda step, outputs: failed.append((dict(step.node_batch.failed_requests), outputs))
+    assert worker._landed_skipped(step) is True
+    assert ("queued", [1, 4]) in log, log
+    assert failed == [({4: "boom"}, "outputs")]
 
 
 def test_a_short_run_takes_back_a_decode_snapshot_past_where_it_ended():

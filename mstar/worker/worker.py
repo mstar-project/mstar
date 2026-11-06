@@ -218,6 +218,18 @@ def _make_graph_runtime(
     )
 
 
+def _drop_unprepared_rows(batch: ScheduledBatch, node_batch: ExecutingBatch) -> None:
+    """A rid prepare_inputs dropped (vetoed, as a loop's extra step past the rid's
+    own count is, or failed) has no step to retry: on success the routing drops it
+    too. Re-queued, it would run again with its loop-back inputs already spent. A
+    row the cache served is retried, because its walk completes only on a step
+    that runs."""
+    prepared = set(node_batch.request_ids) | node_batch.cached_rids
+    for rid in list(batch.request_to_worker_graph):
+        if rid not in prepared:
+            batch.discard_rid(rid)
+
+
 def _parse_tp_async_sched(raw: str) -> tuple[bool, frozenset[str] | None]:
     """``MSTAR_TP_ASYNC_SCHED``: ``0``/``false``/empty off, ``1``/``true`` every
     parallel node, or a comma-separated node list. Returns ``(enabled, nodes_or_None)``."""
@@ -2753,6 +2765,14 @@ class Worker(RepeatingSteps):
             self._fail_step_rows(step, outputs)
         return refused
 
+    def _keep_rows_to_retry(self, step: PendingBatch) -> None:
+        """Of a chain's step that ran nothing, refused or skipped, keep only the
+        rows that can run it again: its nodes come off in-flight, and a row whose
+        loop stopped at N or that ``prepare_inputs`` dropped goes."""
+        self._clear_in_flight_flag(step.batch)
+        self._drop_rows_whose_loop_stopped(step)
+        _drop_unprepared_rows(step.batch, step.node_batch)
+
     def _finish_step(self, step: PendingBatch, outputs: BatchedModelOutput) -> None:
         """A step that ran, on any lane: its batch limit lifts, its outputs
         are postprocessed and routed, and metrics count it."""
@@ -2782,9 +2802,9 @@ class Worker(RepeatingSteps):
             self.scheduler.note_ran(pending.batch)
 
     def _drop_rows_whose_loop_stopped(self, pending: PendingBatch) -> None:
-        """Take a refused speculative step's rows whose loop stopped at N out
-        of its batch. Postprocess drops them on a step that runs; pushed back,
-        their emptied node would pop with no inputs."""
+        """Take the rows of a speculative step that ran nothing whose loop stopped
+        at N out of its batch. Postprocess drops them on a step that runs; pushed
+        back, their emptied node would pop with no inputs."""
         if not pending.speculative_new_iter:
             return
         for rid in self._graph_runtime.pending_loop_stop_rids(
@@ -2805,15 +2825,7 @@ class Worker(RepeatingSteps):
         ``terminal`` reason would refuse the same step again on every pass, so
         the requests it names fail instead.
         """
-        # A rid prepare_inputs dropped (vetoed, as a loop's extra step past
-        # the rid's own count is, or failed) has no step to retry: on success
-        # the routing drops it too. Re-queued, it would run again with its
-        # loop-back inputs already spent. A row the cache served is retried,
-        # because its walk completes only on a step that runs.
-        prepared = set(node_batch.request_ids) | node_batch.cached_rids
-        for rid in list(batch.request_to_worker_graph):
-            if rid not in prepared:
-                batch.discard_rid(rid)
+        _drop_unprepared_rows(batch, node_batch)
 
         reason = node_batch.admit_error
         if isinstance(reason, AllocationFailed):
@@ -5642,8 +5654,7 @@ class Worker(RepeatingSteps):
                         # that the failed rids never produced.
                         _maybe_clear_spec()
                     if refused:
-                        self._clear_in_flight_flag(pending.batch)
-                        self._drop_rows_whose_loop_stopped(pending)
+                        self._keep_rows_to_retry(pending)
                     self._settle_step_rows(pending, outputs, speculation)
 
                     if speculation is not None:
