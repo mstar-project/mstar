@@ -91,6 +91,8 @@ class LinearAttnSpec(NodeResourceSpec):
         exchange = self.split_exchange
         pool = specs[self.config.recurrent_state].config
         name = f"linear attention {self.resource_key!r}"
+        if self.config.variant is LinearAttnVariant.KDA:
+            return [f"{name} is Kimi delta attention, which takes no split steps: node {node!r} can't split them"]
         if shard.axis == 1 or shard.stripe_pool is not None:
             how = "each row (axis 1)" if shard.axis == 1 else f"by KV {shard.stripe_pool!r}'s stored positions"
             return [f"{name} splits a step's rows into contiguous pieces, and node {node!r}'s shard splits {how}"]

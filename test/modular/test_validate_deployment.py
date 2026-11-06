@@ -333,14 +333,14 @@ def _mla_llm() -> _Model:
     return _Model(specs=[kv, attn, _shard()], kv_labels={"kv": {"main": KVLabel()}})
 
 
-def _linear(k_heads=2, v_heads=4, k_dim=8, v_dim=8) -> list[NodeResourceSpec]:
+def _linear(k_heads=2, v_heads=4, k_dim=8, v_dim=8, variant=LinearAttnVariant.GDN) -> list[NodeResourceSpec]:
     """A gated delta rule layer stack's pool and resource on ``llm``."""
     geometry = DeltaNetGeometry(
         num_k_heads=k_heads, num_v_heads=v_heads, head_k_dim=k_dim, head_v_dim=v_dim, conv_kernel_size=4,
     )
     return [
         RecurrentStateSpec("state", {"llm"}, RecurrentStateConfig(num_layers=1, blocks=geometry.to_blocks())),
-        LinearAttnSpec("linear", {"llm"}, LinearAttnConfig(recurrent_state="state", variant=LinearAttnVariant.GDN)),
+        LinearAttnSpec("linear", {"llm"}, LinearAttnConfig(recurrent_state="state", variant=variant)),
     ]
 
 
@@ -414,6 +414,9 @@ def test_a_kv_placement_the_node_cannot_take_is_refused(model, group, kv, patter
      {"kv": {"context_parallel": True}, "shard": {"exchange": "ring"}},
      r"linear attention 'linear' splits a step's rows into contiguous pieces, and node 'llm''s shard splits by "
      r"KV 'kv''s stored positions"),
+    # whatever its heads: no exchange of the linear resource's serves it
+    ([_shard(), _attention(), *_linear(k_heads=3, v_heads=3, variant=LinearAttnVariant.KDA)], dict(sp_size=2), {},
+     r"linear attention 'linear' is Kimi delta attention, which takes no split steps"),
     ([_shard(), _attention(), *_linear()], dict(sp_size=2), {"linear": {"sp_exchange": "ring"}},
      r"resources.linear: sp_exchange must be one of ulysses, state_passing; got 'ring'"),
     # a paged attention's split is its node's shard's exchange, not a setting of its own
@@ -422,7 +425,7 @@ def test_a_kv_placement_the_node_cannot_take_is_refused(model, group, kv, patter
 ], ids=["no_attention", "heads_by_head", "axis1_over_positions", "ring_by_head", "all_gather_by_head",
         "ulysses_by_position", "unknown_exchange", "none_by_head", "ring_beside_ragged_ulysses", "ulysses_heads",
         "axis0_cross", "shard_misses_a_node", "linear_ulysses_heads", "linear_state_passing_head_dims",
-        "linear_axis1", "linear_beside_a_ring", "linear_unknown_exchange", "attention_exchange"])
+        "linear_axis1", "linear_beside_a_ring", "kda", "linear_unknown_exchange", "attention_exchange"])
 def test_a_node_whose_sp_ranks_cant_split_its_steps_is_refused(specs, group, resources, pattern, tmp_path):
     size = group.get("sp_size", 1)
     cfg = _cfg(tmp_path, [{"node_names": ["llm"], "ranks": list(range(size)), **group}], resources=resources)
