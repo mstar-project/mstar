@@ -547,6 +547,17 @@ def test_a_yield_asked_for_a_run_survives_the_step_behind_on_its_slot(monkeypatc
     assert log.count("yield") == asks
 
 
+@pytest.mark.parametrize("peek, yields", [(True, 1), (False, 0)])
+def test_without_the_fairness_peek_ready_work_leaves_runs_alone(monkeypatch, peek, yields):
+    """The chain yields to other work only at its consecutive-step cap then, so
+    ending a run for it serves the work no sooner (review-r7 G4)."""
+    worker, log = _waiting_on_a_run(monkeypatch, [{OTHER}])
+    worker._hold_rows = lambda lane, rows: None
+    worker._spec_peek = peek
+    worker._await_run(_run_step([1], 2, token_stream=None), None, [], None)
+    assert log.count("yield") == yields
+
+
 def test_a_runs_wait_moves_nothing_until_the_step_behind_it_has_admitted(monkeypatch):
     """The loop's own fence covers this work at the top of a pass, not here."""
     worker, log = _waiting_on_a_run(monkeypatch, [set()])

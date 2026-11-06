@@ -486,6 +486,8 @@ class Worker(RepeatingSteps):
     _copy_stream: "torch.cuda.Stream | None" = None
     # (node, walk) whose runs go on the device
     _device_runs: frozenset = frozenset()
+    # the chain looks for other ready work to yield to (``_SpecFairness.peek``); set by ``run``
+    _spec_peek: bool = True
     # (start, end, (node, walk), repeats) per step while a walk picks its run
     # length (``step_repeats: auto``); None while none does
     _auto_spans: deque | None = None
@@ -5389,6 +5391,7 @@ class Worker(RepeatingSteps):
         fair = _SpecFairness(
             peek=spec_peek_for_fairness, max_consecutive=self._max_consecutive_spec,
         )
+        self._spec_peek = fair.peek
         consecutive_spec_steps = 0
         yield_away_from_target: tuple[str, str] | None = None
 

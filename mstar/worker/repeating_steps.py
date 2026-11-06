@@ -417,7 +417,10 @@ class RepeatingSteps:
 
         def end_for_ready_rows() -> None:
             nonlocal yielded
-            if not yielded and (has_ready(state, chain) or (not waiting and has_ready(state, None))):
+            # other work: only where the chain yields to it (``MSTAR_SPEC_PEEK_FOR_FAIRNESS``)
+            if not yielded and (
+                (self._spec_peek and has_ready(state, chain)) or (not waiting and has_ready(state, None))
+            ):
                 yielded = True
                 engine.yield_runs(batch_N.node_name)
 
