@@ -18,10 +18,10 @@ import pytest
 
 PORTED = (
     "mstar/model/qwen3_5", "mstar/model/command_a_plus", "mstar/model/wan22", "mstar/model/flux2_klein",
-    "mstar/model/z_image", "mstar/model/ltx2_5", "mstar/model/qwen3_omni",
+    "mstar/model/z_image", "mstar/model/ltx2_5", "mstar/model/qwen3_omni", "mstar/model/kokoro",
 )
 FORBIDDEN_ATTRIBUTES = {
-    "node_resources", "resources", "request_state", "per_request_states",
+    "node_resources", "resources", "request_state", "request_states", "per_request_states",
     # what a handle holds
     "resource", "positions", "reads", "first_read", "_kv", "_attn", "_pool", "_linear", "_views", "_blocks",
 }
@@ -31,8 +31,9 @@ ALLOWED = {
     ("mstar.engine.accelerator_graph_config", name): _CAPTURE
     for name in (
         "AcceleratorGraphConfig", "BatchedAcceleratorGraphConfig", "DETERMINISTIC_COMPILE_MODE",
-        "PackedAcceleratorGraphConfig", "PiecewiseAcceleratorGraphConfig", "PiecewiseCallInputs",
-        "PiecewiseCaptureShape", "PiecewisePackedConfig", "decode_rows_then_prompt", "geometric_batch_sizes",
+        "PackedAcceleratorGraphConfig", "PiecewiseAcceleratorGraphConfig", "PiecewiseBatchedConfig",
+        "PiecewiseCallInputs", "PiecewiseCaptureShape", "PiecewisePackedConfig", "decode_rows_then_prompt",
+        "geometric_batch_sizes",
     )
 } | {
     ("mstar.engine.resources.spec", "CombinedSplit"): "a value of kernel_settings(), until the engine picks kernels",
@@ -104,6 +105,7 @@ def test_every_exception_is_still_used():
     ("def f(e): return e.resources['kv']", ".resources"),
     ("def f(self): return self.node_resources['kv']", ".node_resources"),
     ("def f(self, rid): return self.request_state(rid)", ".request_state"),
+    ("def f(self): return self.request_states", ".request_states"),
     ("def f(e): return e.per_request_states", ".per_request_states"),
     ("def f(self): return self.sampler.resource", ".resource"),
     ("def f(self): return self.kv.positions", ".positions"),

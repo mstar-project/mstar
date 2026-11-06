@@ -30,9 +30,9 @@ from mstar.model.kokoro.components.stft import RealSTFT  # noqa: E402
 from mstar.model.kokoro.config import (  # noqa: E402
     AUDIO_CHUNK,
     BOUNDARY_TOKEN_ID,
+    CHUNK_LENGTHS,
     CHUNK_LOOP,
     PHONEME_IDS,
-    PHONEME_LENS,
     REF_STYLE,
     SPEED,
     SYNTH_NODE,
@@ -468,7 +468,7 @@ def test_graph_is_one_streaming_loop(voices_dir):
     assert isinstance(loop, Loop) and loop.name == CHUNK_LOOP and loop.max_iters == model.config.max_chunks
     node = loop.section
     assert isinstance(node, GraphNode) and node.name == SYNTH_NODE
-    assert node.input_names == {PHONEME_IDS, PHONEME_LENS, REF_STYLE, SPEED}
+    assert node.input_names == {PHONEME_IDS, REF_STYLE, SPEED}
     assert node.enable_async_scheduling is False
     emits = [e for e in node.outputs if e.next_node == EMIT_TO_CLIENT]
     assert [(e.name, e.output_modality) for e in emits] == [(AUDIO_CHUNK, "audio")]
@@ -478,8 +478,9 @@ def test_graph_is_one_streaming_loop(voices_dir):
 def test_process_prompt_tensors(voices_dir):
     model = make_model(voices_dir)
     out = model.process_prompt("Hello. Bye!", ["text"], ["audio"], voice="af_sky(2)+af_heart", speed=1.25)
-    ids, lens, style, speed = out[PHONEME_IDS][0], out[PHONEME_LENS][0], out[REF_STYLE][0], out[SPEED][0]
-    assert ids.shape == (2, 8) and lens.tolist() == [8, 6]  # "ab cd." -> 6 ids + bos/eos; "efg!" -> 4 + 2
+    tensors = out.new_input_tensors
+    ids, style, speed = tensors[PHONEME_IDS][0], tensors[REF_STYLE][0], tensors[SPEED][0]
+    assert ids.shape == (2, 8) and out.metadata[CHUNK_LENGTHS] == [8, 6]  # "ab cd." -> 6 ids + bos/eos; "efg!" -> 4 + 2
     assert ids[0, 0] == BOUNDARY_TOKEN_ID and ids[0, 7] == BOUNDARY_TOKEN_ID and ids[1, 6:].tolist() == [0, 0]
     assert ids[0, 1:7].tolist() == [VOCAB[c] for c in "ab cd."]
     assert style.shape == (2, 16)
@@ -521,7 +522,7 @@ def test_voices_and_requests_follow_the_installed_g2p(voices_dir):
     model.g2p.unavailable.clear()
     assert model.get_voices() == ["af_heart", "af_sky", "am_adam", "zf_xiaobei"]
     out = model.process_prompt("你好", ["text"], ["audio"], voice="zf_xiaobei")
-    assert out[PHONEME_LENS][0].tolist() == [5]  # <bos> a b . <eos>
+    assert out.metadata[CHUNK_LENGTHS] == [5]  # <bos> a b . <eos>
 
 
 def test_missing_language_backend_is_reported_once(monkeypatch):
@@ -551,20 +552,22 @@ def test_process_prompt_language_and_phonemes(voices_dir):
     model.process_prompt("Hola", ["text"], ["audio"], voice="am_adam", lang_code="es")
     assert model.g2p.calls[-1] == ("Hola", "es")
     out = model.process_prompt(None, ["text"], ["audio"], phonemes="ab cd")
-    assert out[PHONEME_IDS][0].shape == (1, 7) and model.g2p.calls[-1][0] == "Hola"
+    assert out.new_input_tensors[PHONEME_IDS][0].shape == (1, 7) and model.g2p.calls[-1][0] == "Hola"
 
 
 def test_state_machine_and_postprocess(voices_dir):
     model = make_model(voices_dir)
-    signals = {name: [f"ptr_{name}"] for name in (PHONEME_IDS, PHONEME_LENS, REF_STYLE, SPEED)}
-    first = model.get_initial_forward_pass_args("default", ["text"], ["audio"], signals)
+    signals = {name: [f"ptr_{name}"] for name in (PHONEME_IDS, REF_STYLE, SPEED)}
+    kwargs = {CHUNK_LENGTHS: [8, 6]}
+    first = model.get_initial_forward_pass_args("default", ["text"], ["audio"], signals, kwargs)
     assert first.full_metadata.graph_walk == SYNTH_WALK and first.request_done is False
     assert [(e.next_node, e.name, e.tensor_info) for e in first.inputs] == [
-        (SYNTH_NODE, name, [f"ptr_{name}"]) for name in (PHONEME_IDS, PHONEME_LENS, REF_STYLE, SPEED)
+        (SYNTH_NODE, name, [f"ptr_{name}"]) for name in (PHONEME_IDS, REF_STYLE, SPEED)
     ]
+    assert first.step_metadata == kwargs
     metadata = CurrentForwardConductorMetadata(graph_walk=SYNTH_WALK, is_prefill=False)
     assert model.get_partition_forward_pass_args("default", metadata, {}).request_done is True
-    assert model.get_initial_forward_pass_args("default", ["text"], ["text"], signals).request_done is True
+    assert model.get_initial_forward_pass_args("default", ["text"], ["text"], signals, kwargs).request_done is True
     pcm = torch.tensor([1, -2, 32767], dtype=torch.int16)
     assert model.postprocess(pcm, "audio") == pcm.numpy().tobytes()
     expected = torch.tensor([16383, -32767], dtype=torch.int16).numpy().tobytes()
@@ -586,7 +589,8 @@ HANDLES = {"r1": 1, "r2": 2}
 
 def _fwd_info(rid: str, iteration: int) -> CurrentForwardPassInfo:
     info = CurrentForwardPassInfo(
-        request_id=rid, graph_walk=SYNTH_WALK, fwd_index=0, random_seed=0, max_tokens=0, rid_handle=HANDLES[rid]
+        request_id=rid, graph_walk=SYNTH_WALK, fwd_index=0, random_seed=0, max_tokens=0, rid_handle=HANDLES[rid],
+        step_metadata={CHUNK_LENGTHS: {"r1": [4, 5], "r2": [3]}[rid]},
     )
     info.dynamic_loop_iter_counts[CHUNK_LOOP] = iteration
     return info
@@ -597,9 +601,9 @@ def test_submodule_iterates_chunks_and_stops():
     submodule = KokoroSynthSubmodule(tiny_model(), config)
     torch.manual_seed(0)
     requests = {
-        "r1": {PHONEME_IDS: [torch.tensor([[0, 1, 2, 0, 0], [0, 3, 4, 5, 0]])], PHONEME_LENS: [torch.tensor([4, 5])],
+        "r1": {PHONEME_IDS: [torch.tensor([[0, 1, 2, 0, 0], [0, 3, 4, 5, 0]])],
                REF_STYLE: [torch.randn(2, 16)], SPEED: [torch.tensor([1.0])]},
-        "r2": {PHONEME_IDS: [torch.tensor([[0, 7, 0]])], PHONEME_LENS: [torch.tensor([3])],
+        "r2": {PHONEME_IDS: [torch.tensor([[0, 7, 0]])],
                REF_STYLE: [torch.randn(1, 16)], SPEED: [torch.tensor([1.5])]},
     }
     prepared = {
@@ -610,7 +614,6 @@ def test_submodule_iterates_chunks_and_stops():
     # iteration 1 exists only for r1; iteration 2 for nobody
     assert submodule.prepare_inputs(SYNTH_WALK, _fwd_info("r1", 1), requests["r1"]).input_seq_len == 5
     assert submodule.prepare_inputs(SYNTH_WALK, _fwd_info("r2", 1), requests["r2"]) is None
-    # the engine passes the rid handle, not the request id string
     assert submodule.check_stop(HANDLES["r1"], _fwd_info("r1", 0), {}) == set()
     assert submodule.check_stop(HANDLES["r1"], _fwd_info("r1", 1), {}) == {CHUNK_LOOP}
     assert submodule.check_stop(HANDLES["r2"], _fwd_info("r2", 0), {}) == {CHUNK_LOOP}
@@ -632,8 +635,6 @@ def test_submodule_iterates_chunks_and_stops():
     # the same chunk alone and inside a padded batch agree to rounding
     assert single.shape == out["r2"][AUDIO_CHUNK][0].shape
     assert rel_l2(single.float(), out["r2"][AUDIO_CHUNK][0].float()) < 5e-3
-    submodule.cleanup_request(HANDLES["r1"])
-    assert HANDLES["r1"] not in submodule.request_states
 
 
 def test_openai_adapter_maps_speech_request():

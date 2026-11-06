@@ -6,7 +6,7 @@ Graph (one node, one walk)::
         text --G2P (misaki / espeak-ng)--> sentence chunks --> phoneme ids,
         one style row per chunk from the voice pack (or blend), speed
              |
-             v   phoneme_ids [n, T], phoneme_lens [n], ref_style [n, 256], speed [1]
+             v   phoneme_ids [n, T], ref_style [n, 256], speed [1], and the chunk lengths as step metadata
     ┌─ chunk_loop ──────────────────────────────────────────────────────┐
     │  kokoro  (GPU) : PL-BERT -> prosody (durations, F0, energy)        │
     │                  -> text encoder -> iSTFTNet decoder               │
@@ -28,16 +28,15 @@ import torch
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardConductorMetadata, StreamingConnectionState
-from mstar.engine.resources import NodeResourceSpec
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
-from mstar.model.base import ForwardPassArgs, Model
+from mstar.model.base import ForwardPassArgs, Model, ProcessPromptOutput
 from mstar.model.kokoro.config import (
     AUDIO_CHUNK,
     BOUNDARY_TOKEN_ID,
+    CHUNK_LENGTHS,
     CHUNK_LOOP,
     PHONEME_IDS,
-    PHONEME_LENS,
     REF_STYLE,
     SPEED,
     SYNTH_NODE,
@@ -70,6 +69,8 @@ def _resolve_snapshot(repo_id: str, cache_dir: str | None, allow_patterns: list[
 
 class KokoroModel(Model):
     """Model contract for Kokoro-82M (``hexgrad/Kokoro-82M``)."""
+
+    INTERNAL_KWARGS = (CHUNK_LENGTHS,)
 
     def __init__(
         self,
@@ -104,14 +105,10 @@ class KokoroModel(Model):
 
     # -- graph -------------------------------------------------------------
 
-    def get_node_resources(self) -> list[NodeResourceSpec]:
-        """Kokoro is not autoregressive and keeps no state between steps."""
-        return []
-
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         synth = GraphNode(
             name=SYNTH_NODE,
-            input_names=[PHONEME_IDS, PHONEME_LENS, REF_STYLE, SPEED],
+            input_names=[PHONEME_IDS, REF_STYLE, SPEED],
             outputs=[GraphEdge(next_node=EMIT_TO_CLIENT, name=AUDIO_CHUNK, output_modality="audio")],
             # The loop length is per request (its chunk count); speculating
             # an extra iteration would synthesize a chunk that does not exist.
@@ -139,7 +136,7 @@ class KokoroModel(Model):
         output_modalities: list[str],
         tensors: NameToTensorList | None = None,
         **kwargs: Any,
-    ) -> NameToTensorList:
+    ) -> ProcessPromptOutput:
         del tensors
         if "audio" not in output_modalities:
             raise ValueError("Kokoro produces audio; request output_modalities=['audio']")
@@ -178,17 +175,15 @@ class KokoroModel(Model):
             raise RuntimeError(f"G2P produced a {longest}-phoneme chunk; the window is {self.config.max_phonemes}")
 
         ids = [torch.tensor(self.tokenize(c.phonemes), dtype=torch.long) for c in chunks]
-        lengths = torch.tensor([len(x) for x in ids], dtype=torch.long)
-        padded = torch.full((len(ids), int(lengths.max())), BOUNDARY_TOKEN_ID, dtype=torch.long)
+        lengths = [len(x) for x in ids]
+        padded = torch.full((len(ids), max(lengths)), BOUNDARY_TOKEN_ID, dtype=torch.long)
         for row, x in enumerate(ids):
             padded[row, : len(x)] = x
         style = torch.stack([self.voices.style(voice, len(c.phonemes)) for c in chunks])
-        return {
-            PHONEME_IDS: [padded],
-            PHONEME_LENS: [lengths],
-            REF_STYLE: [style],
-            SPEED: [torch.tensor([speed], dtype=torch.float32)],
-        }
+        return ProcessPromptOutput(
+            {PHONEME_IDS: [padded], REF_STYLE: [style], SPEED: [torch.tensor([speed], dtype=torch.float32)]},
+            {CHUNK_LENGTHS: lengths},
+        )
 
     # -- conductor state machine -------------------------------------------
 
@@ -200,7 +195,7 @@ class KokoroModel(Model):
         input_signals: dict[str, list[TensorPointerInfo]],
         model_kwargs: dict | None = None,
     ) -> ForwardPassArgs:
-        del partition_name, model_kwargs
+        del partition_name
         metadata = CurrentForwardConductorMetadata(
             input_modalities=input_modalities,
             output_modalities=output_modalities,
@@ -208,7 +203,7 @@ class KokoroModel(Model):
             is_prefill=True,
         )
         inputs = []
-        for name in (PHONEME_IDS, PHONEME_LENS, REF_STYLE, SPEED):
+        for name in (PHONEME_IDS, REF_STYLE, SPEED):
             edge = GraphEdge(next_node=SYNTH_NODE, name=name)
             edge.tensor_info = input_signals.get(name, [])
             inputs.append(edge)
@@ -217,6 +212,7 @@ class KokoroModel(Model):
             inputs=inputs,
             unpersist_tensors=sum([edge.tensor_info for edge in inputs], start=[]),
             request_done="audio" not in output_modalities,
+            step_metadata={CHUNK_LENGTHS: model_kwargs[CHUNK_LENGTHS]},
         )
 
     def get_partition_forward_pass_args(
