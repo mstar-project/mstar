@@ -147,9 +147,12 @@ the roofline.
   (`jump_blockers`). A process with no thread doing anything is parked (it counts as blocked)
   after a look of up to 50 ms; work done with no clock read can hide for that long
   (`unparks_by_look`).
-- Processes agree on one time through a table named by the server's port, so run a client with
-  `python -m mstar_sim -- -m benchmark.runner --url ...` for it to read that time (`MSTAR_SIM_NODE`
-  names the table when no port can be read). A process is held within 0.5 ms of the others at its
+- Processes agree on one time through a table named by the server's port or, with no port in the
+  command, by the launch, so a launch's processes always agree. Run a client with
+  `python -m mstar_sim -- -m benchmark.runner --url ...` to read the server's time (`MSTAR_SIM_NODE`
+  names the table when a port can't be read). A client with no port of its own to pair on has a
+  table to itself, and shows a wait on the server as the real time it took. A test run is not a
+  deployment: `-m pytest` keeps a private table per process. A process is held within 0.5 ms of the others at its
   clock reads. Between reads it isn't, and nothing bounds rank against rank: ranks can differ by
   their skew at collectives (`meet_skew_s`). A message on its way has a runnable thread on its
   path, so a process isn't moved past one; a third process can read the receiver's old next event

@@ -491,10 +491,9 @@ def _unpark() -> None:
 def _catch_up() -> None:
     """A process about to run with no thread awake moves up to the others' latest clock (no further
     than the bound or its own earliest deadline), as something it can't see may have woken it,
-    and what it was sent then doesn't land in its past. Under LOCK."""
-    latest = TABLE.latest()
-    if not latest:
-        return  # no other process: nothing it could have missed
+    and what it was sent then doesn't land in its past. With no one to follow, it was waiting on
+    something outside the deployment: that took the real time it stood still. Under LOCK."""
+    latest = TABLE.latest() or clock.now() + clock.stood_still()
     pending = min((w.deadline for w in _waits if not w.woken and w.deadline is not None and w.kind is not AHEAD),
                   default=math.inf)
     clock.jump(min(TABLE.bound(), latest, pending))

@@ -18,7 +18,8 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 MSTAR_COMMANDS = {"serve"}
-SERVE_PORT = "8000"  # ``mstar serve``'s default
+SERVERS = {"mstar.cli.main", "mstar.api_server.entrypoint"}
+SERVE_PORT = "8000"  # their default
 
 
 def environment(args: argparse.Namespace) -> dict[str, str]:
@@ -56,15 +57,27 @@ def environment(args: argparse.Namespace) -> dict[str, str]:
     return env
 
 
+def _flag(command: list[str], name: str) -> str | None:
+    for i, arg in enumerate(command):
+        if arg == name:
+            return command[i + 1] if i + 1 < len(command) else None
+        if arg.startswith(f"{name}="):
+            return arg.split("=", 1)[1]
+    return None
+
+
 def deployment(command: list[str]) -> str | None:
-    """The name of the clock table a command joins: its server's port, as a server or a client
-    gives it (``--port N``, ``--url http://host:N``), so ``serve`` and ``benchmark.runner``
-    share one time. None: a process alone. ``MSTAR_SIM_NODE`` in the environment names it
-    instead, for a command whose port can't be read."""
-    found = re.search(r"--port[= ](\d+)|://[^/\s]*:(\d+)", " ".join(command))
-    if found:
-        return found.group(1) or found.group(2)
-    return SERVE_PORT if "mstar.cli.main" in command else None
+    """The name of the clock table a command's processes share. Its server's port, as a server or
+    a client gives it (``--port N``, ``--url http://host:N``), so ``serve`` and ``benchmark.runner``
+    launched apart agree on one time; else the launch's own (``execvpe`` keeps this pid, and
+    every process it starts inherits the name). None for a test run, whose processes have nothing
+    to do with each other: each keeps a private table, and pairs with no one.
+    ``MSTAR_SIM_NODE`` in the environment names it instead."""
+    if "pytest" in command:
+        return None
+    url = re.search(r"://[^/\s]*:(\d+)", _flag(command, "--url") or "")
+    port = _flag(command, "--port") or (url and url.group(1))
+    return port or (SERVE_PORT if SERVERS & set(command) else str(os.getpid()))
 
 
 def main(argv: list[str] | None = None) -> None:

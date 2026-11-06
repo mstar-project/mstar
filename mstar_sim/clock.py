@@ -235,6 +235,12 @@ def thaw() -> None:
         STATS["blocked_s"] += blocked
 
 
+def stood_still() -> float:
+    """The real time the clock has been frozen."""
+    frozen = _base[1]
+    return 0.0 if frozen is None else _real() - frozen
+
+
 def jump(to: float) -> None:
     """Move the clock forward to ``to`` (no further: it never goes back). Under LOCK."""
     global _base

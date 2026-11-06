@@ -1,7 +1,7 @@
 """The deployment's clock table: what its processes need of each other to agree on one time.
 
 A shared file, ``/dev/shm/mstar_sim_clock_<uid>_<name>``, named by the deployment
-(``MSTAR_SIM_NODE``, which the launcher takes from the port in its command). A process
+(``MSTAR_SIM_NODE``, which the launcher sets: :func:`mstar_sim.__main__.deployment`). A process
 with no name keeps a private one. Each process holds one slot, by an OFD lock on its first
 byte, which the kernel drops when the process dies, however it dies. Only its owner writes a
 slot, and every field is one aligned word: a reader needs no snapshot, as a clock only rises

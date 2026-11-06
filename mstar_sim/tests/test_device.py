@@ -201,6 +201,21 @@ def test_a_mask_narrows_the_launchers_gpus_and_leaves_these_tests_alone(monkeypa
     assert run_sim(count, CUDA_VISIBLE_DEVICES="0", MSTAR_SIM_NUM_GPUS="2").strip() == "1"
 
 
+@pytest.mark.parametrize("command, table", [
+    (["-m", "mstar.cli.main", "serve", "m", "--port", "9000"], "9000"),
+    (["-m", "mstar.cli.main", "serve", "m"], "8000"),
+    (["-m", "mstar.api_server.entrypoint", "--config", "c.yaml"], "8000"),  # the README's: no port in its argv
+    (["-m", "benchmark.runner", "--url=http://localhost:9000/v1"], "9000"),
+    (["-m", "x", "--dataset-url", "http://h:443/d", "--port=9000"], "9000"),  # no other flag's URL names it
+    (["-m", "x", "--url", "http://localhost/v1"], "the launcher's pid"),  # no port: the launch is its own
+    (["my_script.py"], "the launcher's pid"),
+    (["-m", "pytest", "-n", "4"], None),  # a test run's processes aren't one deployment
+])
+def test_a_launch_names_its_processes_clock_table(command, table):
+    from mstar_sim.__main__ import deployment
+    assert deployment(command) == (str(os.getpid()) if table == "the launcher's pid" else table)
+
+
 def test_graph_replay_costs_its_kernels_and_reprices_value_dependent_ones():
     """A replay costs what its kernels cost eagerly; a kernel priced from the
     values in its arguments (attention over the latest plan) is priced again
@@ -1099,6 +1114,23 @@ def test_a_real_wake_of_the_rust_poll_survives_a_poke_for_another_wait():
         waits._poked.clear()
     """)
     assert out.split() == ["wake", "timeout"], out
+
+
+def test_a_process_alone_sees_the_real_time_of_a_wait_it_cant_see_the_end_of():
+    """A client with no peer in its table, waiting on a server's socket: nothing else can move its
+    clock, so the wait's real time is what it shows, or a client's TTFT would read its CPU alone."""
+    out = run_sim("""
+        import os, selectors, subprocess, sys, time
+        read, write = os.pipe()
+        reply = f"import os, time; time.sleep(0.3); os.write({write}, b'x')"
+        subprocess.Popen([sys.executable, "-S", "-c", reply], pass_fds=[write], env={})
+        selector = selectors.DefaultSelector()
+        selector.register(read, selectors.EVENT_READ)
+        start = time.perf_counter()
+        selector.select(30)
+        print(time.perf_counter() - start)
+    """)
+    assert 0.25 < float(out) < 5, out
 
 
 def test_a_read_held_behind_a_rising_bound_doesnt_abort():
