@@ -401,7 +401,8 @@ def _qwen3_tts() -> ModelSpec:
         "Talker", lambda model: _random_ids(2048), run,
         lambda sub, rids, ids: engine_step(sub, "talker_prefill", rids, _ar_inputs(ids)),
         config="configs/qwen3tts.yaml",
-        request={"output_modalities": "audio", "model_kwargs": {"temperature": 0.0}},
+        # greedy on every codebook: temperature alone leaves groups 1-15 sampling, unseeded
+        request={"output_modalities": "audio", "model_kwargs": {"temperature": 0.0, "subtalker_dosample": False}},
         hf=hf,
     )
 
