@@ -20,7 +20,7 @@ sys.path.insert(0, ".")
 from mstar.engine.resources import resident as resident_mod  # noqa: E402
 from mstar.engine.resources.attn.config import AttentionConfig, AttentionSpec  # noqa: E402
 from mstar.engine.resources.base import CGSlotKey, Resource  # noqa: E402
-from mstar.engine.resources.context_parallel import ContextParallel  # noqa: E402
+from mstar.engine.resources.context_parallel import TPPlacement  # noqa: E402
 from mstar.engine.resources.kv import manager as manager_mod  # noqa: E402
 from mstar.engine.resources.kv.config import KVLayout, KVReqConfig, KVSpec, KVStep, PagedKVConfig  # noqa: E402
 from mstar.engine.resources.kv.manager import KVManager  # noqa: E402
@@ -1718,7 +1718,7 @@ def test_a_context_parallel_pool_refuses():
     """Its write addresses are this rank's slots of each page (`ContextParallel.write_slots`), which
     the resident gather, at the logical page size, would not give."""
     res = _resources()
-    res["kv"].kv_cache.placement = ContextParallel(2, 0, None, False, (0, 1))
+    res["kv"].kv_cache.placement = TPPlacement(2, 0, None, (0, 1))
     planner, why = _build({"kv": res["kv"]})
     assert planner is None and "context-parallel" in why
 
