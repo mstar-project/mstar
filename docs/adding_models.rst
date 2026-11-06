@@ -663,7 +663,9 @@ never ran changes nothing.
 ``kernel_settings(self)`` is a temporary hook for what the engine doesn't pick itself yet:
 ``splits`` and ``decode_fmha`` on a read, ``splits`` on a ``GatedDeltaNet``, and
 ``max_segments_per_request``, ``max_segments_per_step``, ``compile_op`` and ``workspace_mb`` on a
-``Block`` read. It refuses anything else.
+``Block`` read. Under an array's name it sets the default size of the array's pool, ``max_num_pages``
+on a paged array and ``max_slots`` on a ``Value`` with tensor fields, which a deployment's
+``resources:`` block overrides. It refuses anything else.
 
 Resource specs
 ~~~~~~~~~~~~~~

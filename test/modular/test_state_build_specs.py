@@ -18,6 +18,7 @@ import pytest
 import torch
 import yaml
 from test_startup_graph_validation import _prefill_decode, _ToyModel, _validate
+from test_state_ports import QWEN3_5, _qwen3_5
 
 from mstar.engine.resources.attn.config import AttentionSpec
 from mstar.engine.resources.kv.config import KVSpec
@@ -29,6 +30,7 @@ from mstar.engine.resources.spec import CombinedSplit, apply_yaml_overrides, spe
 from mstar.engine.state import (
     Array,
     Attend,
+    Block,
     Causal,
     CausalConv,
     Entry,
@@ -41,7 +43,9 @@ from mstar.engine.state import (
     Window,
 )
 from mstar.engine.state.adapters import build_specs, node_resources
-from mstar.model.base import Model, enabled_resources
+from mstar.model.base import Model, enabled_resources, serving_resources
+from mstar.model.qwen3_5.config import GDN_STATE
+from mstar.model.qwen3_5.qwen3_5_model import Qwen3_5DenseModel
 from mstar.validation import DeploymentError
 
 _SPLIT = CombinedSplit("mixed", prefill_walks=("prefill",))
@@ -334,7 +338,7 @@ def test_with_no_kernel_settings_the_fields_keep_their_defaults():
 
 @pytest.mark.parametrize("settings, word", [
     ({"nope": {"splits": ()}}, "'nope'"),
-    ({"kv": {"splits": ()}}, "'kv'"),    # the array's name, not a read or an update
+    ({"kv": {"splits": ()}}, "'kv'"),    # a kernel choice under an array's name
     ({"conv": {"splits": ()}}, "'conv'"),    # a CausalConv has no spec of its own
     ({"attn": {"backend": "sdpa"}}, "backend"),
     ({"attn": {"sliding_window": 4}}, "sliding_window"),
@@ -351,6 +355,97 @@ def test_kernel_settings_refuse_anything_else(settings, word):
 def test_a_refused_kernel_setting_names_the_array_its_key_belongs_to(key, array):
     with pytest.raises(ValueError, match=f"Array '{array}'"):
         build_specs([_kv(), _gdn()], kernel_settings={key: {"sm_scale": 1.0}})
+
+
+def _within(**overrides) -> Array:
+    return Array("vision", **{
+        "nodes": {"llm"}, "layers": {0}, "entry": KVEntry(heads=4, head_dim=16), "max_len": 0,
+        "reads": {"vision_attn": _read(mask=Block())}, **overrides,
+    })
+
+
+_FLAG = Value("flag", nodes={"llm"}, layers={0}, entry=Entry({}, host={"seen": bool}))
+
+
+def test_a_hook_page_count_builds_the_spec_the_same_key_under_resources_builds():
+    hooked = build_specs([_kv()], kernel_settings={"kv": {"max_num_pages": 256}})
+    written = build_specs([_kv()])
+    apply_yaml_overrides(written, {"resources": {"kv": {"max_num_pages": 256}}})
+    apply_yaml_overrides(hooked, {})
+    assert hooked[0].config == written[0].config and hooked[0].config.max_num_pages == 256
+
+
+def test_a_hook_slot_count_builds_the_spec_the_same_key_under_resources_builds():
+    hooked = build_specs([_kv(), _gdn()], kernel_settings={"gdn": {"max_slots": 64}})
+    written = build_specs([_kv(), _gdn()])
+    apply_yaml_overrides(written, {"resources": {"gdn": {"max_slots": 64}}})
+    apply_yaml_overrides(hooked, {})
+    assert hooked[2].config == written[2].config and hooked[2].config.max_slots == 64
+
+
+def test_a_hook_slot_count_sizes_qwen3_5s_value_and_the_yaml_overrides_it():
+    class _Sized(Qwen3_5DenseModel):
+        def kernel_settings(self):
+            return {**super().kernel_settings(), GDN_STATE: {"max_slots": 64}}
+
+    model = _Sized.__new__(_Sized)
+    model.config = _qwen3_5(**QWEN3_5["9B"]).config
+    model.vision_config = None
+
+    def slots(config: dict) -> int:
+        return next(s for s in serving_resources(model, config) if s.resource_key == GDN_STATE).config.max_slots
+
+    assert slots({}) == 64, "the hook is the default"
+    assert slots({"resources": {GDN_STATE: {"max_slots": 128}}}) == 128, "a deployment overrides the hook"
+
+
+def test_a_yaml_page_count_overrides_the_hook_as_a_server_builds_the_specs():
+    model = _Declaring(_kv(), settings={"kv": {"max_num_pages": 256}})
+    specs = serving_resources(model, {"resources": {"kv": {"max_num_pages": 1024}}})
+    assert specs[0].config.max_num_pages == 1024, "a deployment overrides the hook"
+    assert serving_resources(model, {})[0].config.max_num_pages == 256, "the hook is the default"
+
+
+@pytest.mark.parametrize("arrays, key, settings, allowed", [
+    (lambda: [_kv()], "kv", {"max_slots": 8}, "['max_num_pages']"),
+    (lambda: [_kv()], "kv", {"page_size": 64}, "['max_num_pages']"),
+    (lambda: [_kv(), _gdn()], "gdn", {"max_num_pages": 8}, "['max_slots']"),
+    (lambda: [_kv(), _gdn()], "gdn", {"prefix_slots": 8}, "['max_slots']"),
+    (lambda: [_FLAG], "flag", {"max_slots": 8}, "[]"),
+    (lambda: [_FLAG], "flag", {"max_num_pages": 8}, "[]"),
+    (lambda: [_within()], "vision", {"max_slots": 8}, "[]"),
+    (lambda: [_within()], "vision", {"max_num_pages": 8}, "[]"),
+])
+def test_a_size_its_built_spec_doesnt_take_is_refused_naming_the_array_the_key_and_what_it_may_set(
+    arrays, key, settings, allowed,
+):
+    with pytest.raises(ValueError) as refused:
+        build_specs(arrays(), kernel_settings={key: settings})
+    message = str(refused.value)
+    assert f"Array {key!r}: kernel_settings[{key!r}] sets" in message and allowed in message, message
+
+
+@pytest.mark.parametrize("value", [0, -1, 1.5, "8", True])
+@pytest.mark.parametrize("arrays, key, field", [
+    (lambda: [_kv()], "kv", "max_num_pages"),
+    (lambda: [_kv(), _gdn()], "gdn", "max_slots"),
+])
+def test_a_size_that_isnt_a_positive_int_is_refused_naming_the_array_and_the_key(arrays, key, field, value):
+    with pytest.raises(ValueError) as refused:
+        build_specs(arrays(), kernel_settings={key: {field: value}})
+    message = str(refused.value)
+    assert f"Array {key!r}: kernel_settings[{key!r}]" in message and field in message, message
+
+
+@pytest.mark.parametrize("arrays, key", [(lambda: [_FLAG], "flag"), (lambda: [_within()], "vision")])
+def test_empty_settings_on_an_array_with_no_pool_set_nothing(arrays, key):
+    build_specs(arrays(), kernel_settings={key: {}})
+
+
+def test_a_key_naming_nothing_lists_the_arrays_among_the_names():
+    with pytest.raises(ValueError) as refused:
+        build_specs([_kv()], kernel_settings={"nope": {"max_num_pages": 8}})
+    assert "names no read" in str(refused.value) and "['attn', 'kv']" in str(refused.value), refused.value
 
 
 class _Declaring(_ToyModel):

@@ -278,17 +278,26 @@ def _apply_kernel_settings(
     specs: Sequence[NodeResourceSpec], arrays: Sequence[Array], by_read: Mapping[str, NodeResourceSpec],
     kernel_settings: Mapping[str, Mapping[str, Any]],
 ) -> None:
-    """Set the kernel choices and capture sizes the contract leaves to the engine, and refuse any other, so this hook
-    can't carry physical choices until the engine picks kernels itself."""
+    """Set the kernel choices, capture sizes and default pool sizes the contract leaves to the engine, and refuse any
+    other, so this hook can't carry other physical choices until the engine picks kernels and sizes its pools itself."""
+    by_name = {array.name: array for array in arrays}
     reads = {key: array for array in arrays for key in array.reads}
     deltas = {key: array for array in arrays for key, op in array.updates.items() if isinstance(op, GatedDeltaNet)}
-    owners = reads | deltas
+    owners = by_name | reads | deltas
     by_key = {spec.resource_key: spec for spec in specs}
     for key, settings in kernel_settings.items():
         if key not in owners:
-            raise ValueError(f"kernel_settings[{key!r}] names no read or GatedDeltaNet update of the declarations, "
-                             f"which have {sorted(owners)}")
-        if not owners[key].max_len:
+            raise ValueError(f"kernel_settings[{key!r}] names no read, GatedDeltaNet update or array of the "
+                             f"declarations, which have {sorted(owners)}")
+        # a read on a node in ``sdpa_nodes`` has no spec to set
+        spec = by_key.get(by_read[key].resource_key if key in by_read else key)
+        if isinstance(spec, KVSpec):
+            allowed = {"max_num_pages"}
+        elif isinstance(spec, RecurrentStateSpec):
+            allowed = {"max_slots"}
+        elif key in by_name:
+            allowed = set()    # a host-only Value or an array with max_len 0 has no pool
+        elif not owners[key].max_len:
             allowed = {"max_segments_per_request", "max_segments_per_step", "compile_op", "workspace_mb"}
         else:
             allowed = {"splits", "decode_fmha"} if key in reads else {"splits"}
@@ -296,11 +305,16 @@ def _apply_kernel_settings(
         if refused:
             raise ValueError(f"Array {owners[key].name!r}: kernel_settings[{key!r}] sets {sorted(refused)}; "
                              f"it may set only {sorted(allowed)}")
-        # a read on a node in ``sdpa_nodes`` has no spec to set
-        spec = by_key.get(by_read[key].resource_key if key in by_read else key)
-        for field, value in settings.items():
-            if spec is not None:
-                setattr(spec.config, field, value)
+        if key not in by_name:
+            for field, value in settings.items():
+                if spec is not None:
+                    setattr(spec.config, field, value)
+        elif settings:
+            try:
+                # the spec's own YAML path, so a value here means what the same key under `resources:` means
+                spec.apply_yaml_overrides(**settings)
+            except ValueError as e:
+                raise ValueError(f"Array {key!r}: kernel_settings[{key!r}]: {e}") from e
 
 
 def node_handles(
