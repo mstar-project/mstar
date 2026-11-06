@@ -370,7 +370,6 @@ class _WarmupAttention:
 class Cosmos3DiTSubmodule(ARNodeSubmodule):
     """Dual-pathway DiT node (understanding tower + generation denoiser)."""
 
-    checks_own_stop = True
 
     # The denoise loop is data-dependent (scheduler step, classifier-free guidance
     # combine), so torch.compile graph-breaks and buys little; CUDA-graph capture of
@@ -3209,7 +3208,6 @@ class Cosmos3ReasonerSubmodule(ARNodeSubmodule):
     ``max(position) + 1`` on all three axes, carried in per-request state.
     """
 
-    checks_own_stop = True
 
     # The token loop is data-dependent at the Python level (per-step state,
     # sampling); CUDA-graph capture of the decode step is the accelerator.

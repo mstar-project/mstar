@@ -192,7 +192,6 @@ class LingBotDitSubmodule(_SingleRequestMixin, NodeSubmodule):
     switched to channels-last.
     """
 
-    checks_own_stop = True
 
     disable_torch_compile = True
 

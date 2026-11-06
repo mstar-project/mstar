@@ -176,7 +176,6 @@ class OmniVoiceBackboneSubmodule(NodeSubmodule):
     its sigma tables.
     """
 
-    checks_own_stop = True
 
     disable_torch_compile = True
     # The fused flashinfer kernels this path runs on (RMSNorm, silu_and_mul,

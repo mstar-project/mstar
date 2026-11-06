@@ -233,7 +233,6 @@ class LMSubmodule(ARNodeSubmodule):
     A row carries its sampling settings as host values; ``preprocess`` sends a
     batch's columns to the device in one pinned copy per dtype."""
 
-    checks_own_stop = True
 
     disable_torch_compile = True
     MAX_BATCH_SIZE = 32

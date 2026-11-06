@@ -124,7 +124,6 @@ class WaypointDitSubmodule(_FunctionalAeMixin, NodeSubmodule):
     for the resulting two-node graph.
     """
 
-    checks_own_stop = True
 
     # Do not let the engine independently compile this wrapper and fuse
     # across the DiT's own full-graph regions.

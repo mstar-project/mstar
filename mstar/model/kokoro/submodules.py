@@ -113,7 +113,6 @@ def _pad_time(x: torch.Tensor, size: int, dim: int) -> torch.Tensor:
 class KokoroSynthSubmodule(NodeSubmodule):
     """Phonemes + style -> 24 kHz PCM16 for one chunk of every request."""
 
-    checks_own_stop = True
 
     # The forward reads the frame count on the host and shapes the decoder by
     # it, so the whole method is not compilable; its two static halves are

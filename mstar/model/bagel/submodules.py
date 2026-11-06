@@ -937,7 +937,6 @@ class LLMSubmodule(ARNodeSubmodule):
     forward call names its label.
     """
 
-    checks_own_stop = True
     # a denoise step's latents go back in as its input_embeds
     REPEAT_CARRIES = MappingProxyType({"latents": CarryPair("latents", "input_embeds")})
 

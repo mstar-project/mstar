@@ -1486,9 +1486,8 @@ methods are:
    rows are read, so a step with none costs nothing.
 
 ``check_stop(...) -> set[str]`` (optional)
-   Runs off the GPU thread, and may read tensor values. A class that defines it sets
-   ``checks_own_stop = True``, or the runtime calls it at most on a ``TokenStop``'s prefill
-   walks. Return the names of the ``Loop`` objects to stop, for example after seeing the EOS
+   Runs off the GPU thread, and may read tensor values. A class that overrides this or
+   ``check_stop_batched`` keeps its custom check unless it declares equivalent stop policies. Return the names of the ``Loop`` objects to stop, for example after seeing the EOS
    token. This is how a decode loop
    terminates. An AR submodule whose loop ends on a stop token sets
    ``self.token_stop = TokenStop(...)`` in ``__init__`` instead of writing one; that also
@@ -1539,13 +1538,13 @@ methods are:
    only the count, and ``StopKind.EOS`` only the token, for a loop whose cap is its budget.
    The limits are computed from the request's forward-pass info whenever
    the worker receives it, not per step. ``{}`` means ``check_stop`` never stops a loop
-   on the walk, and is the default for a class without ``checks_own_stop`` (its loop's
-   cap or its stream's end stops it); ``None``, the default for one with it, keeps
+   on the walk, and is the default for a class without a custom stop check (its loop's
+   cap or its stream's end stops it); ``None``, the default with a custom check, keeps
    calling ``check_stop``. The policies must agree with ``check_stop`` for every row;
    ``test/modular/test_stop_policies.py`` checks the models that declare them. A
    ``TokenStop`` declares them for you: its loop's stop ids, as ``StopKind.EOS``, on
    ``walk``. Its ``prefill_walks`` keep ``check_stop``, and so does every walk of a class
-   with ``checks_own_stop``. A policy's ``withhold`` names outputs whose
+   with a custom stop check. A policy's ``withhold`` names outputs whose
    item of a step whose token is a stop id is not routed (``TokenStop.withhold``).
 
 ``cleanup_request(self, request_id)`` (optional)

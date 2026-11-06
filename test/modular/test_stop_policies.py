@@ -164,24 +164,16 @@ def test_a_bagel_denoise_walk_stops_by_its_count_where_the_runtime_checks_it():
         assert llm.check_stop("r", SimpleNamespace(graph_walk=walk), {"latents": [torch.zeros(1)]}) == set()
 
 
-def test_a_class_with_its_own_stop_check_declares_it():
-    """The runtime calls a node's ``check_stop`` only where it says so
-    (``checks_own_stop``): one that forgets would never stop on it."""
-    import ast
-    from pathlib import Path
+@pytest.mark.parametrize("method", ["check_stop", "check_stop_batched"])
+@pytest.mark.parametrize("ar", [False, True])
+def test_custom_stop_checks_are_inferred_through_inheritance(method, ar):
+    from mstar.model.orpheus.submodules import SNACDecoderSubmodule
 
-    from mstar.model import submodule_base
-
-    root = Path(submodule_base.__file__).parent
-    undeclared = []
-    for path in root.rglob("*.py"):
-        for cls in (n for n in ast.walk(ast.parse(path.read_text())) if isinstance(n, ast.ClassDef)):
-            methods = {n.name for n in cls.body if isinstance(n, ast.FunctionDef)}
-            declared = any(
-                isinstance(n, ast.Assign) and getattr(n.targets[0], "id", None) == "checks_own_stop" for n in cls.body
-            )
-            base = cls.name in ("NodeSubmodule", "ARNodeSubmodule")
-            if methods & {"check_stop", "check_stop_batched"} and not declared and not base:
-                undeclared.append(f"{path.name}:{cls.name}")
-    assert sorted(undeclared) == []
-
+    base = Qwen3ASRLLMSubmodule if ar else SNACDecoderSubmodule
+    custom = type("CustomStop", (base,), {method: lambda *args: {LOOP}})
+    inherited = type("InheritedStop", (custom,), {})
+    sub = inherited.__new__(inherited)
+    torch.nn.Module.__init__(sub)
+    if ar:
+        sub.token_stop = TokenStop(loop=LOOP, buffer="new_token", stop_ids=frozenset(EOS), sampler="s")
+    assert sub.get_stop_policies("decode") is None

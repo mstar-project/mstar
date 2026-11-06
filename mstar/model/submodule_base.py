@@ -892,11 +892,6 @@ class NodeSubmodule(torch.nn.Module, ABC):
     # the signal: signal -> the pair (``repeat_carry``).
     REPEAT_CARRIES: Mapping[str, CarryPair] = MappingProxyType({})
 
-    # Set True on a class whose own ``check_stop`` or ``check_stop_batched`` decides
-    # its stops: the runtime then calls them rather than a declared policy
-    # (``get_stop_policies``), and a step of the node doesn't repeat.
-    checks_own_stop: bool = False
-
     # Set True where this node's looping walks run on resident tables when the
     # config leaves ``knobs: resident_planning`` at its default (``auto``); which
     # walks still comes from every owner agreeing at load. ``on`` asks every
@@ -1457,8 +1452,8 @@ class NodeSubmodule(torch.nn.Module, ABC):
     ) -> set[str]:
         """
         Return the set of dynamic-loop names that should stop after this step.
-        A class that defines this sets ``checks_own_stop``, or it is called at
-        most on a ``TokenStop``'s prefill walks.
+        An override keeps this check on the host unless the class explicitly
+        supplies equivalent ``get_stop_policies``.
 
         Runs on the worker's slow-postprocess path *after* ``execute_batch``
         returns — never inside ``execute_batch``. **Allowed** to read tensor
@@ -1491,14 +1486,18 @@ class NodeSubmodule(torch.nn.Module, ABC):
         loop it can stop, if it is only these, so the graph runtime can run
         them without calling it.
 
-        None means ``check_stop`` decides, the base's answer for a class
-        with ``checks_own_stop``; an empty dict means it never stops a loop
-        on this walk, the base's answer for any other (the loop's cap or its
+        None means a custom ``check_stop`` or ``check_stop_batched`` decides;
+        an empty dict means it never stops a loop on this walk, the base's
+        answer without a custom check (the loop's cap or its
         stream's end stops it). Asked once per walk, at startup. Every policy must agree with
         ``check_stop`` for every row.
         """
         del graph_walk
-        return None if self.checks_own_stop else {}
+        cls = type(self)
+        if (cls.check_stop not in (NodeSubmodule.check_stop, ARNodeSubmodule.check_stop)
+                or cls.check_stop_batched not in (NodeSubmodule.check_stop_batched, ARNodeSubmodule.check_stop_batched)):
+            return None
+        return {}
 
     def check_stop_batched(
         self, request_ids: list[str],
@@ -1707,11 +1706,12 @@ class ARNodeSubmodule(NodeSubmodule):
         return out
 
     def get_stop_policies(self, graph_walk: str) -> dict[str, StopPolicy] | None:
+        if super().get_stop_policies(graph_walk) is None:
+            return None
         stop = self.token_stop
         if stop is None:
-            # no token to check: the loop's cap stops it, unless the class checks more
-            return None if self.checks_own_stop else {}
-        if graph_walk in stop.prefill_walks or self.checks_own_stop:
+            return {}
+        if graph_walk in stop.prefill_walks:
             return None
         if not stop.stops_on(graph_walk):
             return {}  # as `_token_stops`: only a row of ``walk`` ends the loop
