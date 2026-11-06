@@ -613,9 +613,9 @@ deployment YAML tunes them under ``resources:`` (see :ref:`Step 6 <config-yaml>`
   it, and a prefix hit advances it over the skipped spans.
 - ``Sampler(name, nodes=, vocab_size=, penalty=, min_p=, eos_ids=, draws=)``. ``penalty`` and
   ``min_p`` declare capabilities, not intentions: each selects which kernel variant is
-  recorded into the captured graph. ``draws`` is how many times each step that lists the
-  sampler calls ``sample``. Each call is a fresh draw that advances each kept row's sampling
-  state. Log-probs and a device loop-back take one token per step, so loading refuses both
+  recorded into the captured graph. ``draws`` is how many draws each step that lists the
+  sampler makes, by ``sample`` or ``drew``. Each is a fresh draw that advances each kept row's
+  sampling state. Log-probs and a device loop-back take one token per step, so loading refuses both
   above one draw.
 
 Qwen3.5's declaration shows both kinds of state, and its ViT:
@@ -660,10 +660,23 @@ label, layer)`` reads them, and ``ArrayStep(host={(row, label, layer): {field: v
 them when the step commits, so the next step's ``prepare_inputs`` sees the write and a step that
 never ran changes nothing.
 
+A ``Value`` with tensor fields and no ``updates`` holds state the model reads and writes whole
+per row, ``Value(name, nodes=, layers={0}, entry=Entry({"tail": TensorType((8, 3), dtype=torch.float32),
+"count": TensorType((), dtype=torch.int64)}))``, where a shape of ``()`` is one scalar per entry.
+``h.read(layer).fields[f]`` is ``[rows, *shape]`` in the step's row order, padding rows included, in
+tensors the caller owns, so a captured forward may write them in place. A row with nothing written
+yet, at span 0 or that pads the step reads ``start``: ``h.read(layer, start={f: tensor})`` takes
+tensors of one entry's shape, made at load, and zeros stand in for a field it doesn't name. Every
+read of a handle passes the same ones, since a captured read keeps their address.
+``h.write(layer, **fields)`` sets the step's rows' entries at its commit. In a step, a layer's reads
+come before its write, a field takes one write, and each row at span 1 or more gets every field
+from the step's own write. Such a ``Value`` takes no ``keep=False`` and sits on no node with prefix
+keys. Parakeet's transducer state and both speech codecs are the examples.
+
 ``kernel_settings(self)`` is a temporary hook for what the engine doesn't pick itself yet:
-``splits`` and ``decode_fmha`` on a read, ``splits`` on a ``GatedDeltaNet``, and
-``max_segments_per_request``, ``max_segments_per_step``, ``compile_op`` and ``workspace_mb`` on a
-``Block`` read. Under an array's name it sets the default size of the array's pool, ``max_num_pages``
+``splits``, ``decode_fmha`` and ``decode_tensor_cores`` on a read of an array that keeps entries,
+``splits`` on a ``GatedDeltaNet``, and ``max_segments_per_request``, ``max_segments_per_step``,
+``compile_op`` and ``workspace_mb`` on a ``Block`` read. Under an array's name it sets the default size of the array's pool, ``max_num_pages``
 on a paged array and ``max_slots`` on a ``Value`` with tensor fields, which a deployment's
 ``resources:`` block overrides. It refuses anything else.
 
@@ -766,7 +779,7 @@ The spec types are:
        (default ``True``) runs one-token decode rows on FlashInfer's tensor-core
        kernel; ``False`` picks the CUDA-core decode kernel, which can be faster for
        MHA and narrow GQA (few query heads per KV head). Measure before changing it:
-       Whisper, Qwen3-ASR and Qwen3-TTS declare ``False``. ``decode_fmha`` (default ``False``) runs
+       Whisper declares ``False``, and Qwen3-ASR and Qwen3-TTS set it in ``kernel_settings``. ``decode_fmha`` (default ``False``) runs
        captured one-token decode rows on FlashInfer's trtllm-gen fmha kernel on Blackwell,
        with no FlashInfer plan per step; a geometry trtllm-gen has no kernel for keeps
        the paged kernel, with a warning. Eager steps and prompt rows stay on the paged
@@ -900,7 +913,7 @@ The spec types are:
        addressing to fetch, and eager and captured steps reach the same slots. A row with
        no saved state (a request's first step, or a padding row) reads ``start``, zeros
        when none is given. ``gather`` / ``scatter_`` need the sink, so leave
-       ``disable_sink_slot`` unset. Parakeet's transducer decode is the example.
+       ``disable_sink_slot`` unset. A model on the contract declares a ``Value`` instead.
    * - ``LinearAttnSpec(config=LinearAttnConfig(recurrent_state=..., variant=...))``
      - Linear attention planned against a ``RecurrentStateSpec`` pool that holds its
        state: gated DeltaNet (``LinearAttnVariant.GDN``), Kimi delta attention (``KDA``:
@@ -989,8 +1002,8 @@ The rows below name specs where a declaration doesn't reach them yet.
        plus a ``DSASpec`` over the same cache.
    * - A node that carries per-request state between steps of a loop (an RNN-T
        decoder, recurrent attention)
-     - A ``RecurrentStateSpec``, read and written with ``gather`` / ``scatter_``, and for
-       a linear-attention layer stack a ``LinearAttnSpec`` over it.
+     - A ``Value`` with tensor fields, read and written whole, and for a linear-attention
+       layer stack a ``Value`` with a ``GatedDeltaNet``.
    * - A node that samples with two different sets of parameters
      - Two ``SamplerSpec`` objects that both name the node, under different keys.
    * - An encoder tower that attends within the segments of one packed forward
@@ -1915,9 +1928,9 @@ step's calls cover all of its rows in segment order.
 of its own, rather than through ``write_kv``, asks the KV resource where the step's tokens go:
 ``kv.write_target(layer_idx, label)`` returns ``(layer cache, page of each token, slot in
 page of each token, number of tokens to write)`` for the current plan (NHD layout only).
-Tokens past that number are the plan's padding and must not be written. The fused q/k
-norm, RoPE and KV-write kernel that Qwen3-ASR calls through
-``AttentionCallable.norm_rope_attend`` is the example.
+Tokens past that number are the plan's padding and must not be written. A layer on the
+contract gets the same through a ``@state_op``'s ``target``, as ``qk_norm_rope_kv_write`` in
+``mstar/model/components/qwen3_lm.py`` does.
 
 **Testing.** ``declare_step`` performs only host-side bookkeeping, so you can unit-test it
 on CPU without model weights. ``test/modular/test_state_ports.py`` compares both ports' steps
@@ -1956,7 +1969,7 @@ and each row's label comes from the step's segments, so there are no cursors:
   and a step with ``keep=False`` refuses ``keep=True``.
 - ``read`` sees kept entries from earlier steps, plus this layer's latest add, at the
   positions its mask reaches. It runs the op the declaration names for the layer.
-- ``write`` overwrites entries in place.
+- ``write`` sets the step's rows' entries at its commit.
 
 These raise, naming the array and the cause: a call on an array the step doesn't list or on
 a layer it doesn't declare, an add after a kept add, an add after a read in the same layer,
@@ -2074,7 +2087,8 @@ the signal, so the worker routes it without a tensor and sends the client's copy
 ``preprocess`` reads the tokens with ``self.loopback_inputs(engine_inputs, inputs)``. A
 row whose last step did not keep its value on the device (its first decode step, after
 the prefill) still brings it routed, and that read puts it over the slot's. Qwen3.5,
-Higgs Audio, Qwen3-ASR and Whisper declare it. Qwen3.5 reads the tokens with ``last_sampled``.
+Higgs Audio, Qwen3-ASR and Whisper declare it. Qwen3.5 and Qwen3-ASR read the tokens with
+``last_sampled``, and put a row's routed token over its slot's with ``splice_loopback_ids``.
 
 On such a node a captured step writes each row's token and RNG offset back to the request's
 row inside the graph (``knobs: sampler_ingraph_scatter``, on by default). Those rows are
@@ -2105,13 +2119,15 @@ buffer and commit persists it, so the step must list the name in
 address rows the same way, and the model never sees a slot index.
 
 A kernel in the forward can draw its rows' tokens itself, as Qwen3-TTS's depth-loop kernel
-does for fifteen draws a step. ``sampler.fused_draw_args()`` returns the step's per-row
-temperature, top-k, top-p, seed and offset, in the forward's row order, and the kernel draws
-each row with ``mstar.engine.resources.sampler.fused_draw.draw_row``, which picks the token
-``fused_sample`` would. After the launch, ``sampler.advance_offsets(draws)`` moves the offsets
-as that many ``sample`` calls would. ``fused_draw_args()`` returns None when ``sample`` would
-do more than that draw (an eager step, the penalty, min-p, logprobs, a kept last token,
-TP); the model then calls ``sample``.
+does for fifteen draws a step. ``fused_draw_args(s)`` returns the step's per-row temperature,
+top-k, top-p, seed and offset, in the step's row order, padding rows included. The kernel draws
+row ``r``'s ``i``-th token with ``draw_row(..., seed[r], offset[r] + i, ..., LAY=draw_row_layout())``,
+imported from ``mstar.engine.state``, which picks the token ``sample`` would and consumes one draw
+from the row's random stream, as one ``sample`` call does. After the launch, ``drew(s, n)`` counts
+``n`` draws toward the sampler's ``draws`` and moves the offsets. ``fused_draw_args`` returns None
+when ``sample`` would do more than that draw (an eager step, the penalty, min-p, logprobs, a kept
+last token, TP) or the declared vocabulary is above 2048, where ``fused_sample`` leaves the layout
+``draw_row`` assumes; the model then calls ``sample``.
 
 .. warning::
 
@@ -2626,7 +2642,8 @@ that a misspelled setting is never silently ignored:
    * - ``BoundedKVSpec``
      - ``max_slots``
    * - ``RecurrentStateSpec``
-     - ``max_slots``, ``state_dtype``, ``prefix_slots`` (see **Cross-request prefix reuse**).
+     - ``max_slots``, ``state_dtype`` (on a ``Value``, only with a ``GatedDeltaNet``),
+       ``prefix_slots`` (see **Cross-request prefix reuse**).
        ``max_slots`` counts the sink unless ``disable_sink_slot``; a value that leaves no
        slot for a request is refused at startup.
    * - ``AttentionSpec``
