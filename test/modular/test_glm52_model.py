@@ -1,6 +1,6 @@
-"""Glm52Model contract on the resource-pools engine: registry, graph walks, the prefill ->
-decode transition, the node's resource declaration, the per-request sampling config, and
-the submodule's stop / preprocess guards.
+"""Glm52Model contract on the resource-pools engine: registry, graph walks, the node's
+resource declaration, the per-request sampling config, and the submodule's stop /
+preprocess guards.
 """
 import dataclasses
 import sys

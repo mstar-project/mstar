@@ -215,15 +215,14 @@ class _Serve:
 
 
 def _generate_greedy(model, submodule, prompt_ids, max_tokens):
-    """The real serve loop (prefill -> decode -> check_stop) on the sparse
-    path; returns (generated tokens, stopped-via-check_stop, the DSA resource's
+    """The real serve loop (prefill -> decode to the request's loop cap or a
+    stop) on the sparse path; returns (generated tokens, the DSA resource's
     stored key counts of layers 0 and 1 before retirement, the requests it
     still tracks after)."""
     serve = _Serve(model, submodule)
     dsa = serve.resources[DSA_RESOURCE]
     info = serve.info(max_tokens)
     generated: list[int] = []
-    stopped = False
     try:
         out = serve.step("prefill", info, prompt_ids)
         new_token = out["new_token"][0]
@@ -231,24 +230,20 @@ def _generate_greedy(model, submodule, prompt_ids, max_tokens):
         generated.append(int(new_token.item()))
         next_token = out["text_inputs"][0]
         # as the runtime: a prefill stop ends the request (END_PARTITION); otherwise decode
-        stopped = END_PARTITION in submodule.check_stop(serve.rid, info, out)
-        if not stopped:
+        if END_PARTITION not in submodule.check_stop(serve.rid, info, out):
             info.graph_walk = "decode"
-            for step in range(max_tokens + 4):  # +slack; check_stop must break first
+            for _ in range(model.get_loop_caps(max_output_tokens=max_tokens)["decode_loop"]):
                 out = serve.step("decode", info, next_token)
                 new_token = out["new_token"][0]
                 submodule.postprocess(serve.rid, info, out)
-                info.dynamic_loop_iter_counts["decode_loop"] = step
-                stop = submodule.check_stop(serve.rid, info, out)
                 generated.append(int(new_token.item()))
                 next_token = out["text_inputs"][0]
-                if stop:
-                    stopped = True
+                if submodule.check_stop(serve.rid, info, out):
                     break
         stored = (dsa.keys.tokens(serve.rid, 0), dsa.keys.tokens(serve.rid, 1))
     finally:
         serve.close(cleanup_request=False)
-    return generated, stopped, stored, dsa.keys.tracked_requests()
+    return generated, stored, dsa.keys.tracked_requests()
 
 
 def _teacher_forced_logits(model, submodule, prompt_ids, forced_tokens):
@@ -301,9 +296,8 @@ def test_dsa_longctx_decode_past_topk(tmp_path):
     prompt_ids = torch.arange(10, 10 + PROMPT_LEN, device=DEVICE)
 
     # ---- (1) the sparse path serves and stops cleanly ------------------
-    generated, stopped, stored, tracked = _generate_greedy(
+    generated, stored, tracked = _generate_greedy(
         model, submodule, prompt_ids, MAX_TOKENS)
-    assert stopped, "decode loop did not terminate via check_stop"
     assert len(generated) == MAX_TOKENS, generated  # max_tokens counts the prefill-emitted token (vLLM semantics)
     assert all(0 <= t < cfg.vocab_size for t in generated), generated
 
