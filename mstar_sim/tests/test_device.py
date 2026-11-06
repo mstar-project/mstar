@@ -1472,6 +1472,52 @@ def test_a_copy_from_pageable_memory_blocks_the_host_and_is_slower_than_from_pin
     assert host_pageable >= 0.9 * device_pageable and device_pageable > 1.5 * device_pinned, out
 
 
+def test_memory_the_arena_registers_is_pinned():
+    """mstar's arena pins its shared-memory segments with ``cudaHostRegister``, so a tensor read from
+    one copies to the device as a DMA, with no host wait. Unregistered, it is pageable again."""
+    run_sim("""
+        import mmap, torch
+        from mstar.communication import arena
+        segment = mmap.mmap(-1, 1 << 20)
+        view = torch.frombuffer(segment, dtype=torch.uint8)
+        ptr = view.data_ptr()
+        assert not view[4096:].is_pinned()
+        assert arena._pin(ptr, 1 << 20)
+        assert view[4096:].is_pinned() and view.view(torch.int32).is_pinned()
+        assert arena._unpin(ptr) and not view.is_pinned()
+    """)
+
+
+def test_mstars_pinned_stager_copies_to_the_device_as_on_a_gpu():
+    """mstar's H2D stager copies from its pinned arena with libcudart's own ``cudaMemcpyAsync``
+    (raw pointers, a raw stream) where it can load it, as on a GPU: priced on the stream, landing
+    once launched, and at each replay of a graph that captured it."""
+    out = run_sim("""
+        import torch
+        from mstar.utils import h2d
+        from mstar_sim import clock
+        stager = h2d.PinnedStager(torch.int32)
+        if hasattr(h2d, "_cuda_memcpy_async"):  # (mstar's direct path, where it has one)
+            assert stager._memcpy is not None
+        dst = torch.zeros(6, dtype=torch.int32, device="cuda")
+        stream = torch.cuda.Stream()
+        with torch.cuda.stream(stream):
+            busy = stream.timeline.free_at
+            stager.copy_(dst, [1, 2, 3], pad_value=7)
+            assert stream.timeline.free_at > busy  # priced on the stream it was issued on
+        torch.cuda.synchronize()
+        print(dst.tolist())
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            stager.copy_(dst, [4, 5])
+        print(dst.tolist())  # captured: nothing lands yet
+        graph.replay()
+        torch.cuda.synchronize()
+        print(dst.tolist())
+    """)
+    assert out.splitlines() == ["[1, 2, 3, 7, 7, 7]", "[1, 2, 3, 7, 7, 7]", "[4, 5, 3, 7, 7, 7]"], out
+
+
 def test_concurrent_copies_share_a_copy_engine_and_overlap_compute():
     """Two H2D copies on two streams take twice one; a kernel on a third stream runs beside them,
     and a D2H has an engine of its own."""

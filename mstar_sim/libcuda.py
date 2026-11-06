@@ -11,6 +11,7 @@ take no simulated memory.
 from __future__ import annotations
 
 import ctypes
+import functools
 import itertools
 import weakref
 
@@ -94,19 +95,70 @@ class LibCuda:
     __getitem__ = __getattr__
 
 
+def _memcpy_async(dst, src, nbytes, kind, stream) -> int:
+    """``cudaMemcpyAsync`` host to device (mstar's ``h2d`` stager, from its pinned arena), as the
+    emulator's own H2D copy: priced on the stream named by its raw handle and on the H2D copy
+    engine, and landing when launched, or at each replay of a graph that captured it. A value-less
+    destination (an address of :func:`mstar_sim.memory.fake_base`'s) takes no bytes."""
+    from mstar_sim import clock, cost, cuda, memory
+
+    dst, src, nbytes, handle = (_value(x) for x in (dst, src, nbytes, stream))
+    if _value(kind) != 1:  # cudaMemcpyHostToDevice: mstar makes no other
+        return 1  # cudaErrorInvalidValue
+    with clock.computing():
+        target = cuda.ExternalStream(handle) if handle else cuda.current_stream()
+        previous = clock.set_current_timeline(target.timeline)
+        try:
+            clock.charge(0.0 if clock.FAST else cost.copy_seconds(nbytes, "h2d"), engine=clock.ENGINES["h2d"])
+        finally:
+            clock.set_current_timeline(previous)
+        if dst < memory.FAKE_START:
+            write = functools.partial(ctypes.memmove, dst, src, nbytes)
+            if clock.capturing() is None:
+                write()
+            else:
+                clock.on_replay(write)
+    return 0
+
+
+class LibCudart:
+    """What mstar calls of ``libcudart`` through ctypes: host registration (mstar's arena pins its
+    segments: the range is pinned, :func:`mstar_sim.memory.register`) and ``cudaMemcpyAsync``
+    (:func:`_memcpy_async`). The rest of the runtime is absent: a lookup of another symbol raises
+    AttributeError, as ctypes does for a symbol a library lacks."""
+
+    _name = "libcudart.so"
+
+    def __init__(self):
+        from mstar_sim import memory
+
+        self._fns = {
+            "cudaHostRegister": _Fn(lambda ptr, nbytes, flags: memory.register(_value(ptr), _value(nbytes))),
+            "cudaHostUnregister": _Fn(lambda ptr: memory.unregister(_value(ptr))),
+            "cudaGetLastError": _Fn(_ok),
+            "cudaMemcpyAsync": _Fn(_memcpy_async),
+        }
+
+    def __getattr__(self, name):
+        try:
+            return self._fns[name]
+        except KeyError:
+            raise AttributeError(f"mstar_sim: {name}: no CUDA runtime on the emulated GPU") from None
+
+    __getitem__ = __getattr__
+
+
 # the native libraries mstar may load through ctypes, and what the emulator does
 # (read by the contract test in tests/test_device.py)
 LIBRARIES = {
     "libcuda": "this stand-in (graph introspection, contexts)",
-    "libcudart": "refused, as on a box without the runtime: mstar takes its torch copy, which is priced",
+    "libcudart": "this stand-in's host registration and cudaMemcpyAsync (LibCudart), priced as the emulator's copies",
     "libamdhip64": "ROCm only: mstar never loads it on a CUDA device",
 }
 
 
 def install() -> None:
-    """``libcuda`` is this stand-in. ``libcudart`` refuses to load, as on a box
-    without the runtime: mstar's raw ``cudaMemcpyAsync`` paths (``h2d``, the KV
-    page copier) then take the torch copy, which the emulator prices."""
+    """``libcuda`` is this stand-in, and ``libcudart`` :class:`LibCudart`."""
     for name in ("CDLL", "PyDLL"):
         real = getattr(ctypes, name)
 
@@ -115,7 +167,7 @@ def install() -> None:
                 if isinstance(lib, str) and "libcuda.so" in lib:
                     return LibCuda()
                 if isinstance(lib, str) and "libcudart" in lib:
-                    raise OSError(f"mstar_sim: {lib}: no CUDA runtime on the emulated GPU")
+                    return LibCudart()
                 return super().__new__(cls)
 
         Loader.__name__ = Loader.__qualname__ = name

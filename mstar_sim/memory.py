@@ -176,11 +176,30 @@ def count_storage(data: torch.Tensor, index: int) -> None:
             _count(entry, index)
 
 
+# host ranges registered with the device (``cudaHostRegister``): start -> end
+_REGISTERED: dict[int, int] = {}
+
+
+def register(ptr: int, nbytes: int) -> int:
+    _REGISTERED[ptr] = ptr + nbytes
+    return 0
+
+
+def unregister(ptr: int) -> int:
+    return 0 if _REGISTERED.pop(ptr, None) is not None else 1  # (cudaErrorInvalidValue)
+
+
+def registered(ptr: int) -> bool:
+    """Whether host address ``ptr`` is in a registered range."""
+    return any(start <= ptr < end for start, end in list(_REGISTERED.items()))
+
+
 # Value-less storages get addresses in [2^60, 2^62): unique per storage, never
 # reused, and non-canonical on x86-64 and arm64, so code that compares or offsets
 # pointers sees distinct storages, and code that reads through one faults loudly
 # (``faulthandler`` prints the Python stack) instead of reading host memory.
-_FAKE_NEXT = [1 << 60]
+FAKE_START = 1 << 60
+_FAKE_NEXT = [FAKE_START]
 
 
 def _fake_range(nbytes: int) -> int:

@@ -1153,8 +1153,10 @@ def _copy_seconds(nbytes: int, kind: str, pinned: bool = True) -> float:
 
 
 def is_pinned(t: torch.Tensor) -> bool:
-    """Whether host tensor ``t`` is pinned: made by ``pin_memory()`` or ``pin_memory=True``."""
-    return getattr(t.untyped_storage(), "_sim_pinned", False)
+    """Whether host tensor ``t`` is pinned: made by ``pin_memory()`` or ``pin_memory=True``, or in a
+    range registered with the device (``cudaHostRegister``)."""
+    storage = t.untyped_storage()
+    return getattr(storage, "_sim_pinned", False) or (t.device.type == "cpu" and memory.registered(storage.data_ptr()))
 
 
 def _pin(out):
