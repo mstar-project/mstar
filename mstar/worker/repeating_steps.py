@@ -407,7 +407,6 @@ class RepeatingSteps:
             for lane in lanes:
                 lane.finish()
                 lane.launch(gpu_executor)
-            # every pass: N+1 clears the word as it stages, maybe after this ended N
             if not waiting and self.scheduler.has_ready_excluding(self.request_state, None):
                 engine.yield_runs(batch_N.node_name)
 

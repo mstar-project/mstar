@@ -812,8 +812,6 @@ class AcceleratorGraphRunner:
         self._run_asks: dict[str, RunAsk] = {}
         # walk -> why its captures have no WHILE run, once one was asked for and failed
         self._run_failures: dict[str, str] = {}
-        # the node's word a host sets to end a run, read by every one of its runs
-        self._yield_word: torch.Tensor | None = None
         # walks whose forward draws from a torch generator, which a raw launch doesn't advance
         self._generator_walks: set[str] = set()
 
@@ -1338,18 +1336,18 @@ class AcceleratorGraphRunner:
     def ask_run(self, walk: str, ask: RunAsk) -> None:
         """Before capture: ``walk``'s batched captures run on the device."""
         self._run_asks[walk] = ask
-        if self._yield_word is None:
-            pinned = torch.accelerator.is_available()
-            self._yield_word = torch.zeros(1, dtype=torch.int32, pin_memory=pinned)
 
     def refuse_run(self, walk: str, why: str) -> None:
         """Before capture: ``walk`` stays off the device, for its line."""
         self._run_failures[walk] = why
 
     def yield_runs(self) -> None:
-        """Ask the node's run in flight to end at its next iteration: other work is ready."""
-        if self._yield_word is not None:
-            self._yield_word[0] = 1
+        """Ask the node's runs in flight, the one running and the one staged behind
+        it, to end at their next iteration. A slot that hasn't staged clears its word."""
+        for bucket in self._buckets.values():
+            for slot in bucket.slots:
+                if slot.run is not None:
+                    slot.run.state.yield_word[0] = 1
 
     def run_refusal(self, walk: str) -> str | None:
         """After capture: why ``walk``'s captures don't run on the device, or None."""
@@ -1385,7 +1383,7 @@ class AcceleratorGraphRunner:
         outer, handle, device_handle = cuda.new_loop(self._device)
         stream = TokenStream(spec.bucket.bs, ask.limit, self._device) if ask.stream_tokens else None
         state = RunState(
-            spec.bucket.bs, ask.token_signal, ask.stop_ids, self._device, dropping, self._yield_word, stream,
+            spec.bucket.bs, ask.token_signal, ask.stop_ids, self._device, dropping, stream,
         )
         inputs = {
             name: torch.zeros(value.shape[0], ask.limit, *value.shape[1:], dtype=value.dtype, device=value.device)

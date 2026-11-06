@@ -135,7 +135,7 @@ class RunState:
 
     def __init__(
         self, bs: int, token_signal: str, stop_ids: Collection[int], device: torch.device,
-        dropping: Any = None, yield_word: torch.Tensor | None = None, stream: TokenStream | None = None,
+        dropping: Any = None, stream: TokenStream | None = None,
     ):
         self.token_signal = token_signal
         # where its tokens land as it goes, for a walk that streams them
@@ -149,7 +149,8 @@ class RunState:
         self.immune = torch.zeros(bs, dtype=torch.bool, device=device)
         self.marks = torch.zeros(bs, dtype=torch.bool, device=device)
         self.replays = torch.zeros(bs, dtype=torch.long, device=device)
-        self.yield_word = yield_word if yield_word is not None else torch.zeros(1, dtype=torch.int32)
+        # set by the host to end the run; its own, since the step behind stages while this one runs
+        self.yield_word = torch.zeros(1, dtype=torch.int32, pin_memory=torch.accelerator.is_available())
         self.stop_ids = torch.tensor(sorted(stop_ids), dtype=torch.long, device=device)
         self._rows = torch.arange(bs, device=device)
         self._staged: tuple | None = None

@@ -8,7 +8,7 @@ import torch
 
 from mstar.engine import accelerator_graph_runner as runner_mod
 from mstar.engine.accelerator_graph_runner import AcceleratorGraphRunner
-from mstar.engine.device_run import RUN_REPLAYS, CudaWhile, DeviceRun, RunAsk, TokenStream
+from mstar.engine.device_run import RUN_REPLAYS, CudaWhile, DeviceRun, RunAsk, RunState, TokenStream
 from mstar.engine.resources.step import BucketKey
 from mstar.model.submodule_base import BatchedModelOutput, CarryPair
 
@@ -67,7 +67,6 @@ def _runner(monkeypatch, loop, tokens, bs=2, limit=6, refill_at=None, carries=No
     runner._device, runner._memory_pool, runner._autocast_dtype = CPU, None, None
     runner._submodule_name, runner._capture_stream, runner._resident = "n", None, None
     runner._run_asks, runner._run_failures, runner._generator_walks = {}, {}, set()
-    runner._yield_word = None
     runner._graph_backend = SimpleNamespace(
         while_refusal=lambda: None, while_runtime=lambda: loop,
         raw_stream=lambda: 0, synchronize=lambda: None,
@@ -98,6 +97,7 @@ def _runner(monkeypatch, loop, tokens, bs=2, limit=6, refill_at=None, carries=No
     spec = SimpleNamespace(bucket=BucketKey(WALK, bs, bs), slot=0, config=SimpleNamespace(get_config_type=lambda: None))
     warmed = SimpleNamespace(run=forward, static_inputs=static, output=None)
     run, _, _ = runner._capture_run(spec, warmed)
+    runner._buckets = {spec.bucket: SimpleNamespace(slots=[SimpleNamespace(run=run)])}
     return runner, run, static, calls
 
 
@@ -149,6 +149,19 @@ def test_the_hosts_yield_word_ends_a_run_and_its_row_goes_on_in_the_next(monkeyp
     stops, _, _ = _run(run, 2, 2)
     assert stops[RUN_REPLAYS].tolist() == [2, 2], "the next run clears the word"
     assert static["h"].tolist() == [5, 5]
+
+
+def test_a_yield_outlives_the_stage_of_the_step_behind_the_run():
+    """N+1 stages while N still runs, so a yield asked before that has to be N's own."""
+    running, behind = (RunState(2, "new_token", {EOS}, CPU) for _ in range(2))
+    runner = AcceleratorGraphRunner.__new__(AcceleratorGraphRunner)
+    slots = [SimpleNamespace(run=SimpleNamespace(state=state)) for state in (running, behind)]
+    runner._buckets = {"bucket": SimpleNamespace(slots=[*slots, SimpleNamespace(run=None)])}
+    runner.yield_runs()
+    behind.stage(2, [False, False], 4)
+    assert int(running.yield_word[0]) == 1 and int(behind.yield_word[0]) == 0
+    runner.yield_runs()
+    assert int(behind.yield_word[0]) == 1, "a yield asked once it has staged ends it too"
 
 
 def test_refill_at_ends_a_run_once_that_share_of_its_rows_is_done(monkeypatch):
