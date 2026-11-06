@@ -513,7 +513,7 @@ def test_a_pass_that_runs_no_step_starts_the_queued_host_copies(monkeypatch):
     from test_rebuild_policy import _copying, _vision_step
 
     rebuilds = _copying(R)
-    rebuilds.keep_copies(_vision_step((R,), {}, completion_event=None))
+    rebuilds.record(_vision_step((R,), {}, completion_event=None))
     w = _looping_worker(monkeypatch, *_scheduler(_Runtime(), TURNS))
     w._rebuilds = rebuilds
 
@@ -521,7 +521,8 @@ def test_a_pass_that_runs_no_step_starts_the_queued_host_copies(monkeypatch):
     with pytest.raises(_StopLoopError):
         w.run()
 
-    assert rebuilds._kept[NODE][R].copies.ready(), "the request would wait for its copies with no step to start them"
+    [record] = rebuilds._kept[NODE][R].records
+    assert record.ready(), "the request would wait for its copies with no step to start them"
 
 
 def test_the_scheduler_sees_the_rows_every_lane_holds():
