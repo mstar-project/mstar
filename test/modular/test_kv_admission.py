@@ -1,9 +1,11 @@
-"""A request is admitted only once its prompt fits, in the order requests first asked.
+"""A request is admitted only once its prompt fits, in the order requests first asked unless it passes the head.
 
 "Not ready" is an answer the scheduler already retries, so the pool gives it until the
-prompt at the head of its queue fits beside the prompts already admitted. A cache hit on a
+prompt at the head of its queue fits beside what admitted requests have reserved. A cache hit on a
 page only the index holds counts as a page taken, since eviction could hand that page out.
-Nothing passes the head, or a stream of short requests would starve a long one.
+A request passes the head when its footprint fits, less the part of its hit no eviction can take
+and the recurrent state can restore. The pages it frees are then kept for the head, or a stream
+of short requests would starve a long one.
 """
 
 from __future__ import annotations
@@ -32,9 +34,10 @@ from test_kv_prefix_lease import (
     _seed,
     _StubTransfer,
 )
+from test_sampler_admission import _resource as _sampler
 
 from mstar.engine.resources import StepRunner
-from mstar.engine.resources.base import CachedPrefix, EngineResourceInfo
+from mstar.engine.resources.base import CachedPrefix, EngineResourceInfo, Resource
 from mstar.engine.resources.kv import manager as manager_mod
 from mstar.engine.resources.kv.arena import new_page_arena
 from mstar.engine.resources.kv.config import (
@@ -56,10 +59,11 @@ from mstar.engine.resources.recurrent.config import (
     RecurrentStep,
 )
 from mstar.engine.resources.recurrent.pool import RecurrentStatePool
-from mstar.engine.resources.step import AdmitRuntimeError, Segment, StepContext
+from mstar.engine.resources.step import ASKS, AdmitRuntimeError, Segment, StepContext
 from mstar.model.submodule_base import ARNodeInputs
 
 SEED = 20261022
+HELD = list(range(48))
 
 
 @pytest.fixture(autouse=True)
@@ -131,18 +135,24 @@ def test_a_page_filed_after_a_lost_race_keeps_the_winners_pages_evictable():
 
 
 def _queued(max_num_pages: int = 9):
-    """"a" fits in 8 pages, "long" doesn't fit beside it, and "short" would."""
+    """"a" fits in 8 pages, "long" doesn't fit beside it, and "short"'s prompt would but its output wouldn't."""
     kv = _manager(max_num_pages=max_num_pages)
-    for rid, n in (("a", 80), ("long", 64), ("short", 16)):
+    kv.local_loops = {"decode_loop"}
+    for rid, n in (("a", 80), ("long", 64)):
         _laid_out(kv, rid, list(range(n)))
+    kv.ingest_request("short", KVReqConfig(loop_caps={"decode_loop": 48}, kv_layout={
+        "main": StreamLayout((PrefixSpan(16, 16, WALK),), (("decode_loop", 1),), keyed_spans=1),
+    }))
     assert _ready(kv, "a") and not _ready(kv, "long")
     return kv
 
 
-def test_nothing_passes_the_head_of_the_queue():
+def test_a_request_with_nothing_cached_passes_the_head_only_when_its_footprint_fits():
     kv = _queued()
+    _laid_out(kv, "tiny", list(range(16)))
 
-    assert not _ready(kv, "short"), "a later request took the room the head waits for"
+    assert not _ready(kv, "short"), "a request passed the head with room for its prompt but not its output"
+    assert _ready(kv, "tiny"), "a request whose footprint fits waited behind the head because nothing of it is cached"
     _remove(kv, "a")
     assert _ready(kv, "long") and _ready(kv, "short"), "the queue didn't move once the head fit"
 
@@ -154,6 +164,359 @@ def test_removing_the_head_makes_the_next_request_the_head():
     _remove(kv, "long")
 
     assert _ready(kv, "short"), "a request that left still heads the queue"
+
+
+def _prefill(kv, rid: str, tokens: list[int]) -> None:
+    """Admit ``rid`` and write its prompt past what the cache serves."""
+    _laid_out(kv, rid, tokens, keyed=True)
+    assert _ready(kv, rid)
+    prefix = _probe(kv, rid, len(tokens))
+    _grow(kv, rid, len(tokens) - (prefix.tokens if prefix else 0))
+
+
+def _passing(free: int, head: int, kv=None):
+    """"r" runs on ``HELD``, "fill" runs on tokens from 2000 and leaves ``free`` pages, and "head" waits."""
+    kv = _manager(max_num_pages=16) if kv is None else kv
+    kv._cpu_pool = host._HostPool(64)
+    kv.local_loops = {"decode_loop"}
+    _prefill(kv, "r", HELD + list(range(1000, 1008)))
+    _prefill(kv, "fill", list(range(2000, 2000 + (kv._room() - free) * PAGE_SIZE)))
+    _laid_out(kv, "head", list(range(3000, 3000 + head * PAGE_SIZE)))
+    assert not _ready(kv, "head")
+    return kv
+
+
+def _decoding(kv, rid: str, tokens: list[int], cap: int) -> None:
+    """A request on ``tokens``, decoding up to ``cap`` tokens."""
+    kv.ingest_request(rid, KVReqConfig(
+        prefix_keys={"main": _keys(tokens)}, loop_caps={"decode_loop": cap},
+        kv_layout={"main": StreamLayout(
+            (PrefixSpan(len(tokens), len(tokens), WALK),), (("decode_loop", 1),), keyed_spans=1,
+        )},
+    ))
+
+
+def _short_chat(kv, rid: str, own: list[int], cap: int = 16) -> None:
+    """A request on ``HELD``, which "r" holds, plus ``own``, decoding up to ``cap`` tokens."""
+    _decoding(kv, rid, HELD + own, cap)
+
+
+def test_a_passer_pays_for_its_output_and_for_each_page_of_its_hit_eviction_can_take():
+    kv = _passing(free=3, head=5)
+    # "w" passes and leaves its last page evictable, which the pool keeps for the head
+    _prefill(kv, "w", HELD + list(range(100, 116)))
+    kv.remove_request("w")
+    _laid_out(kv, "partly", HELD + list(range(100, 124)), keyed=True)
+    _short_chat(kv, "long", [8] * 8, cap=32)
+
+    assert not _ready(kv, "long"), "a request passed the head with room for its prompt but not its output"
+    assert _ready(kv, "partly"), "a request whose footprint fits beside its hit waited"
+    assert kv._allotments["partly"].pages == 2, "the passer's hit page eviction can take wasn't charged as fresh"
+
+
+def test_a_filed_page_tries_no_request_whose_output_cant_fit_beside_the_head(monkeypatch):
+    kv = _passing(free=3, head=5)
+    for n in range(16):
+        _short_chat(kv, f"w{n}", [7000 + n] * 8, cap=512)
+        assert not _ready(kv, f"w{n}")
+    tried, past = [], KVManager.reserve_past
+    monkeypatch.setattr(KVManager, "reserve_past", lambda kv, rid, *args: tried.append(rid) or past(kv, rid, *args))
+    kv._index.filed += 1  # a page filed on no waiting request's chain, as a decode key files one
+
+    _runner(kv).admit_waiting(lambda rid, node: None)
+
+    assert not tried, f"one filed page tried {len(tried)} requests whose output doesn't fit whatever their hit"
+
+
+def test_a_filed_page_tries_no_guaranteed_request_whose_footprint_cant_fit_beside_the_head(monkeypatch):
+    kv = _passing(free=3, head=5)
+    for n in range(16):
+        tokens = HELD + [7000 + n] * 8
+        kv.ingest_request(f"w{n}", KVReqConfig(
+            prefix_keys={"main": _keys(tokens)}, loop_caps={"decode_loop": 128}, unpausable=True,
+            kv_layout={"main": StreamLayout(
+                (PrefixSpan(len(tokens), len(tokens), WALK),), (("decode_loop", 1),), keyed_spans=1,
+            )},
+        ))
+        assert not _ready(kv, f"w{n}")
+    tried, past = [], KVManager.reserve_past
+    monkeypatch.setattr(KVManager, "reserve_past", lambda kv, rid, *args: tried.append(rid) or past(kv, rid, *args))
+    kv._index.filed += 1
+
+    _runner(kv).admit_waiting(lambda rid, node: None)
+
+    assert not tried, f"one filed page tried {len(tried)} guaranteed requests, whose hit takes nothing off"
+
+
+def test_a_request_that_asks_while_the_heads_mark_is_out_of_date_passes_once_the_head_is_refused_again():
+    kv = _passing(free=3, head=5)
+    kv._index.filed += 1  # the head may fit now, so nothing passes it until it is measured again
+    _short_chat(kv, "p", [7000] * 8)
+    assert _runner(kv).admit_retrieve("p", NODE, WALK, None).queued
+
+    started = _runner(kv).admit_waiting(lambda rid, node: None)
+
+    assert (NODE, "p") in started, "a request parked behind a head that still doesn't fit was never tried to pass"
+
+
+def test_only_the_request_an_out_of_date_mark_turned_away_is_tried_again(monkeypatch):
+    kv = _passing(free=3, head=5)
+    for n in range(16):
+        _short_chat(kv, f"w{n}", [7000 + n] * 8, cap=512)
+        assert not _ready(kv, f"w{n}")
+    kv._index.filed += 1
+    _short_chat(kv, "p", [6000] * 8)
+    assert _runner(kv).admit_retrieve("p", NODE, WALK, None).queued
+    tried, past = [], KVManager.reserve_past
+    monkeypatch.setattr(KVManager, "reserve_past", lambda kv, rid, *args: tried.append(rid) or past(kv, rid, *args))
+
+    _runner(kv).admit_waiting(lambda rid, node: None)
+
+    assert tried == ["p"], f"retrying one request turned away by the head's old mark tried {len(tried)} requests"
+
+
+def test_a_passer_finishing_tries_no_request_behind_the_head_again(monkeypatch):
+    kv = _passing(free=3, head=5)
+    _short_chat(kv, "p", [6000] * 8)
+    assert _ready(kv, "p")
+    for n in range(4):
+        _short_chat(kv, f"w{n}", [7000 + n] * 8, cap=512)
+        assert not _ready(kv, f"w{n}")
+    tried, past = [], KVManager.reserve_past
+    monkeypatch.setattr(KVManager, "reserve_past", lambda kv, rid, *args: tried.append(rid) or past(kv, rid, *args))
+    kv.remove_request("p")
+
+    _runner(kv).admit_waiting(lambda rid, node: None)
+
+    assert not tried, "the pages a passer freed for the head made the runner try requests that can't use them"
+
+
+def test_a_filed_page_remeasures_a_waiting_request_whose_output_fits(monkeypatch):
+    kv = _passing(free=3, head=5)
+    # "p"'s output fits, but not beside the three pages "p" adds to what "r" holds
+    _short_chat(kv, "p", list(range(7000, 7000 + 3 * PAGE_SIZE)))
+    assert not _ready(kv, "p")
+    measured = []
+    hit = KVManager._hit
+    monkeypatch.setattr(KVManager, "_hit", lambda self, rid, *args: measured.append(rid) or hit(self, rid, *args))
+    kv._index.filed += 1
+
+    _runner(kv).admit_waiting(lambda rid, node: None)
+
+    assert "p" in measured, "a filed page could have raised the hit of a request refused on it, and it wasn't measured"
+
+
+def _with_snapshots(kv) -> RecurrentStatePool:
+    """A Qwen3.5-shaped node: ``kv`` beside a recurrent pool whose snapshots key off ``kv``'s chains."""
+    state = RecurrentStatePool(device=torch.device("cpu"), name="state", config=RecurrentStateConfig(
+        num_layers=1, blocks={"state": RecurrentBlockConfig(shape=(3,), dtype=torch.float32)}, max_slots=8,
+        prefix_slots=4, kv_cache="kv",
+    ))
+    state.bind_kv(kv)
+    _RUNNERS[id(kv)] = (kv, StepRunner({"kv": kv, "state": state}, node_resources={NODE: ["kv", "state"]}))
+    return state
+
+
+def _snapshot(state: RecurrentStatePool, kv, rid: str, pages: int) -> None:
+    """File a snapshot at ``rid``'s chain key ``pages`` pages in, as a prefill that kept that boundary would."""
+    assert state._index(state._reserve_snapshot(), kv.chain_key(rid, "main", pages))
+
+
+def test_a_passer_stays_inside_its_allotment_when_the_recurrent_pool_cuts_its_hit():
+    kv = _manager(max_num_pages=16)
+    _with_snapshots(kv)
+    kv = _passing(free=5, head=6, kv=kv)
+    _short_chat(kv, "p", list(range(4000, 4008)))
+    assert _ready(kv, "p")
+    room = kv._room()
+    # no snapshot under the hit, so the runner agrees on none and the prefill writes the KV hit again
+    inputs = ARNodeInputs(input_seq_len=len(HELD) + 8)
+    runner = _runner(kv)
+    runner.apply_cached_prefix("p", NODE, WALK, inputs, runner.resolve_cached_prefix("p", NODE, WALK, inputs))
+    _grow(kv, "p", len(HELD) + 8)
+
+    assert kv._room() == room, (
+        f"the passer wrote {room - kv._room()} pages past its allotment, out of the room kept for the head")
+
+
+def test_a_head_is_allotted_the_part_of_its_hit_past_its_newest_snapshot():
+    kv = _manager(max_num_pages=16)
+    state = _with_snapshots(kv)
+    _prefill(kv, "r", HELD + list(range(1000, 1008)))
+    _snapshot(state, kv, "r", 1)
+    _laid_out(kv, "h", HELD + list(range(2000, 2008)), keyed=True)
+
+    assert _ready(kv, "h")
+    assert kv._allotments["h"].pages == 3, "the head's allotment left out hit pages the recurrent pool can't restore"
+
+
+def test_a_snapshot_filed_under_a_waiting_heads_hit_retries_it():
+    kv = _manager(max_num_pages=16)
+    state = _with_snapshots(kv)
+    _prefill(kv, "r", HELD + list(range(1000, 1008)))
+    _prefill(kv, "fill", list(range(5000, 5000 + (kv._room() - 2) * PAGE_SIZE)))
+    _laid_out(kv, "h", HELD + list(range(2000, 2008)), keyed=True)
+    assert not _ready(kv, "h")
+
+    _snapshot(state, kv, "r", 3)
+
+    assert _ready(kv, "h"), "a snapshot lowered what the head needs, and nothing its mark reads moved"
+
+
+def test_a_snapshot_filed_while_the_head_is_measured_retries_it(monkeypatch):
+    kv = _manager(max_num_pages=16)
+    state = _with_snapshots(kv)
+    _prefill(kv, "r", HELD + list(range(1000, 1008)))
+    _prefill(kv, "fill", list(range(5000, 5000 + (kv._room() - 2) * PAGE_SIZE)))
+    _laid_out(kv, "h", HELD + list(range(2000, 2008)), keyed=True)
+    need, filed = kv._need, []
+
+    def need_then_snapshot(*args):
+        pages = need(*args)
+        if not filed:
+            # filed under the recurrent pool's own lock, after the head's need was read
+            filed.append(_snapshot(state, kv, "r", 3))
+        return pages
+
+    monkeypatch.setattr(kv, "_need", need_then_snapshot)
+    assert not _ready(kv, "h")
+
+    assert _ready(kv, "h"), "the head's mark counted a snapshot its need didn't, so nothing tried it again"
+
+
+@pytest.mark.parametrize("leave", [KVManager.remove_request, KVManager.offload], ids=["finishes", "is offloaded"])
+def test_the_pages_a_request_that_passed_frees_go_to_the_head(leave):
+    kv = _passing(free=1, head=5)
+    _prefill(kv, "p", HELD + list(range(4000, 4008)))
+    _laid_out(kv, "q", list(range(2000, 2048)) + list(range(5000, 5008)), keyed=True)
+    leave(kv, "p")
+    assert not _ready(kv, "q"), f"a request behind the head took the page {leave.__name__} freed"
+    kv.remove_request("r")
+
+    assert not _ready(kv, "q"), "a request passed a head that the room now covers"
+    assert _ready(kv, "head"), "the head waits though the room, the page kept for it included, covers it"
+    assert kv._kept == 0, "the pages kept for the head outlived its admission, so the next head's passers wait"
+
+
+@pytest.mark.parametrize("slots, passes", [(5, True), (4, False)], ids=["a slot left for the head", "none left"])
+def test_a_request_passes_beside_a_recurrent_pool_only_while_a_slot_is_left_for_the_head(slots, passes):
+    """Qwen3.5 runs a KV pool and a recurrent pool on one node, and a request asks both."""
+    kv = _manager(max_num_pages=16)
+    state = RecurrentStatePool.build(
+        RecurrentStateSpec(resource_key="state", nodes={NODE}, config=RecurrentStateConfig(
+            num_layers=1, blocks={"state": RecurrentBlockConfig(shape=(3,), dtype=torch.float32)}, max_slots=slots,
+        )),
+        EngineResourceInfo(device=torch.device("cpu")),
+    )
+    _RUNNERS[id(kv)] = (kv, StepRunner({"kv": kv, "state": state}, node_resources={NODE: ["kv", "state"]}))
+    kv = _passing(free=3, head=5, kv=kv)
+    kv.ingest_request("short", KVReqConfig(prefix_keys={"main": _keys(HELD + [8] * 8)}, loop_caps={"decode_loop": 16},
+        kv_layout={"main": StreamLayout((PrefixSpan(56, 56, WALK),), (("decode_loop", 1),), keyed_spans=1)}))
+
+    assert _ready(kv, "short") is passes, "the head would wait for a slot a request passing it took"
+
+
+@pytest.mark.parametrize("rows, passes", [(4, True), (3, False)], ids=["a row left for the head", "none left"])
+def test_a_request_passes_beside_the_samplers_rows_only_while_one_is_left_for_the_head(monkeypatch, rows, passes):
+    """Since #938 every request on a captured node asks the sampler for an in-graph row, the head included."""
+    kv = _manager(max_num_pages=16)
+    sampler = _sampler(monkeypatch, slots=rows, max_bs=1)
+    for rid in ("r", "fill", "head", "short"):
+        sampler.ingest_request(rid)
+    _RUNNERS[id(kv)] = (kv, StepRunner({"kv": kv, "sampler": sampler}, node_resources={NODE: ["kv", "sampler"]}))
+    kv = _passing(free=3, head=5, kv=kv)
+    _short_chat(kv, "short", [8] * 8)
+
+    assert _ready(kv, "short") is passes, "a request that passes beside the KV waited behind the head for a row"
+
+
+class _Picky(Resource):
+    """A pool every request asks, which refuses the requests in ``refused``."""
+
+    def __init__(self):
+        self.refused, self.held, self.moved = set(), set(), 0
+
+    @classmethod
+    def build(cls, spec, info):
+        raise NotImplementedError
+
+    def ask(self, rid, node_name, graph_walk):
+        return None if rid in self.held else ASKS
+
+    def reserve(self, rid, node_name, graph_walk, published):
+        if rid in self.refused:
+            return self.moved
+        self.held.add(rid)
+        return None
+
+    reserve_past = reserve
+
+    def unreserve(self, rid):
+        self.held.discard(rid)
+
+    def grew_since(self, mark):
+        return self.moved != mark
+
+
+def test_a_request_that_passed_goes_back_behind_the_head_when_another_pool_holds_it_back():
+    kv = _manager(max_num_pages=16)
+    picky = _Picky()
+    picky.refused.add("p")
+    _RUNNERS[id(kv)] = (kv, StepRunner({"kv": kv, "picky": picky}, node_resources={NODE: ["kv", "picky"]}))
+    kv = _passing(free=1, head=2, kv=kv)
+    _laid_out(kv, "p", HELD + list(range(4000, 4008)), keyed=True)
+
+    assert not _ready(kv, "p"), "p passed though the other pool had no slot for it"
+    assert "p" not in kv._allotments and "p" in kv._asks, "the KV kept what it gave a request another pool held back"
+
+
+def test_the_pages_kept_for_the_head_survive_another_pool_refusing_it():
+    kv = _manager(max_num_pages=16)
+    picky = _Picky()
+    # named to sort after "kv", so the runner reserves the KV first and the other pool refuses after it
+    _RUNNERS[id(kv)] = (kv, StepRunner({"kv": kv, "picky": picky}, node_resources={NODE: ["kv", "picky"]}))
+    _prefill(kv, "r", HELD + list(range(1000, 1008)))
+    _prefill(kv, "x", list(range(6000, 6064)))
+    fill = list(range(2000, 2000 + (kv._room() - 1) * PAGE_SIZE))
+    _decoding(kv, "fill", fill, cap=4 * PAGE_SIZE)
+    assert _ready(kv, "fill")
+    _grow(kv, "fill", len(fill))
+    _laid_out(kv, "head", list(range(3000, 3000 + 5 * PAGE_SIZE)))
+    assert not _ready(kv, "head")
+    # "p" passes into the one free page, writes it and finishes, so that page is kept for the head
+    _prefill(kv, "p", HELD + list(range(4000, 4008)))
+    kv.remove_request("p")
+    # "x" finishes, so the head fits in the KV, but the other pool refuses it and the KV's allotment is undone
+    kv.remove_request("x")
+    picky.refused.add("head")
+    assert not _ready(kv, "head")
+    # "fill" grows into all but the kept page, and the other pool lets the head through, which the KV now refuses
+    _grow(kv, "fill", 4 * PAGE_SIZE)
+    picky.refused.clear()
+    picky.moved += 1
+    assert not _ready(kv, "head")
+    _laid_out(kv, "q", HELD + list(range(5000, 5008)), keyed=True)
+
+    assert not _ready(kv, "q"), "a request passed into the page kept for the head, lost when another pool refused it"
+
+
+def test_no_request_passes_a_head_that_fits_now():
+    kv = _manager(max_num_pages=16)
+    head = list(range(3000, 3000 + 5 * PAGE_SIZE))
+    _prefill(kv, "r", HELD + list(range(1000, 1008)))
+    # "s" is admitted for the head's first two pages and hasn't written them
+    _laid_out(kv, "s", head[:2 * PAGE_SIZE], keyed=True)
+    assert _ready(kv, "s")
+    _prefill(kv, "fill", list(range(2000, 2000 + (kv._room() - 3) * PAGE_SIZE)))
+    _laid_out(kv, "head", head, keyed=True)
+    assert not _ready(kv, "head")
+    # "s" writes and files those pages, which the head now hits, so the head fits in the room it waited for
+    _probe(kv, "s", 2 * PAGE_SIZE)
+    _grow(kv, "s", 2 * PAGE_SIZE)
+    _laid_out(kv, "p", HELD + list(range(4000, 4008)), keyed=True)
+    _runner(kv).admit_retrieve("p", NODE, WALK, None)
+
+    assert _ready(kv, "head"), "a request passed the head on the head's last ask, though the head fits now"
 
 
 def test_a_prompt_bigger_than_the_pool_fails_as_it_joins():
@@ -337,6 +700,48 @@ def test_a_repeat_is_allotted_the_cached_image_end_its_probe_will_take():
     assert node.kv._allotments[RID].pages == 2, "the cached image end the probe will take was left out of the allotment"
 
 
+def test_a_guaranteed_repeat_whose_footprint_fills_the_pool_is_admitted_to_an_idle_pool():
+    node = _LayoutNode([TEXT, IMAGE, ASK], [TEXT, IMAGE, OTHER_ASK])
+    node.runner.remove_request("seed")
+    overrides, node.kv.local_loops = node.kv._overrides[RID], {"decode_loop"}
+    prompt = sum(span.length for span in overrides.kv_layout["main"].spans)
+    overrides.unpausable, overrides.loop_caps = True, {"decode_loop": node.kv.config.request_pages * PAGE_SIZE - prompt}
+
+    assert _ready(node.kv, RID), "the cached image end's copy pushed a guaranteed reservation past the pool"
+    node.walk(*_walks([TEXT, IMAGE, OTHER_ASK])[0])
+    node.kv.assert_pages_conserved()
+
+
+def _fill(kv, rid: str, spare: int = 0) -> None:
+    _laid_out(kv, rid, list(range((kv._room() - spare) * PAGE_SIZE)))
+    assert _ready(kv, rid) and kv._room() == spare
+
+
+@pytest.mark.parametrize("other", ["before", "after", None])
+def test_a_guaranteed_repeat_that_copies_an_image_end_grows_to_its_cap_in_a_full_pool(other):
+    node = _LayoutNode([TEXT, IMAGE, ASK], [TEXT, IMAGE, OTHER_ASK])
+    kv, cap, walks = node.kv, 3 * PAGE_SIZE, _walks([TEXT, IMAGE, OTHER_ASK])
+    overrides, kv.local_loops = kv._overrides[RID], {"decode_loop"}
+    overrides.unpausable, overrides.loop_caps = True, {"decode_loop": cap}
+    # "c" probes the cached image end before the repeat leases it, or while the repeat holds it
+    kv.ingest_request("c", _config([TEXT, IMAGE, list(range(400, 405))]))
+    if other == "before":
+        _probe(kv, "c", len(TEXT))
+    assert _ready(kv, RID)
+    # a page another request holds is lent in a full pool, and an evictable one takes a page of room
+    _fill(kv, "b", spare=int(other != "before"))
+    node.walk(*walks[0])
+    if other == "after":
+        _probe(kv, "c", len(TEXT))
+    assert [node.walk(walk, length) for walk, length in walks[1:]][0] == IMAGE, "the repeat recomputed its image"
+    _fill(kv, "d")
+
+    for _ in range(cap):
+        node.step(RID, 1, "decode")
+
+    kv.assert_pages_conserved()
+
+
 def test_an_image_end_copied_onto_the_repeats_page_leaves_its_allotment():
     node = _LayoutNode([TEXT, IMAGE, ASK], [TEXT, IMAGE, OTHER_ASK])
     assert _ready(node.kv, RID)
@@ -461,24 +866,26 @@ def test_a_request_one_pool_holds_back_keeps_no_allotment_in_another_on_its_node
     assert decode.ok, "requests waiting on the cross pool kept the room the running request decodes into"
 
 
-def _cfg_parallel_pool(node: str, world_size: int = 1) -> KVManager:
+def _cfg_parallel_pool(node: str, world_size: int = 1, rank: int = 0) -> KVManager:
     spec = KVSpec(
         resource_key="kv", nodes={"LLM", "LLM_cfg_text", "LLM_cfg_img"}, leader="LLM",
         config=PagedKVConfig(num_layers=1, num_kv_heads=2, head_dim=8, max_seq_len=4096, max_num_pages=9, page_size=16),
     )
-    group = None if world_size == 1 else SimpleNamespace(rank=0, world_size=world_size)
+    group = None if world_size == 1 else SimpleNamespace(rank=rank, world_size=world_size)
     return KVManager.build(spec, EngineResourceInfo(
         device=torch.device("cpu"), kv_dtype=torch.float32, nodes=frozenset({node}), joint_comm_group=group,
     ))
 
 
-def test_only_the_leaders_pool_holds_a_request_back_and_none_above_one_rank():
-    for node, world_size, holds in (("LLM", 1, True), ("LLM_cfg_text", 1, False), ("LLM", 2, False)):
-        kv = _cfg_parallel_pool(node, world_size)
+def test_only_the_leaders_pool_on_rank_0_holds_a_request_back():
+    for node, world_size, rank, holds in (
+        ("LLM", 1, 0, True), ("LLM_cfg_text", 1, 0, False), ("LLM", 2, 0, True), ("LLM", 2, 1, False),
+    ):
+        kv = _cfg_parallel_pool(node, world_size, rank)
         for rid in ("a", "b"):
             _laid_out(kv, rid, list(range(80)))
 
-        assert _ready(kv, "a") and _ready(kv, "b") is not holds, f"{node}'s pool at world size {world_size} decided"
+        assert _ready(kv, "a") and _ready(kv, "b") is not holds, f"{node}'s pool on rank {rank} of {world_size}"
         assert holds or not (kv._allotments or kv._asks), "a pool that doesn't decide kept admission state"
 
 
@@ -626,12 +1033,21 @@ def test_every_page_an_offload_frees_is_room():
 def test_a_copy_from_the_host_waits_for_the_join_and_comes_out_of_the_allotment():
     kv = host._manager(max_num_pages=20)
     host._on_the_host_only(kv)
-    # "c" holds the first four pages of the prompt "b" finds on the host
-    host._serve(kv, "c", host.SHARED + list(range(900, 900 + 4 * host.PAGE_SIZE)))
+    host._serve(kv, "c", list(range(900, 900 + 8 * host.PAGE_SIZE)))
     room = kv._room()
-    for rid, prompt in (("big", list(range(500, 500 + (room + 1) * host.PAGE_SIZE))), ("b", host.A_PROMPT + [7, 8])):
-        host._ingest(kv, rid, prompt)
-        assert not _ready(kv, rid)
+    host._ingest(kv, "big", list(range(500, 500 + (room + 1) * host.PAGE_SIZE)))
+    assert not _ready(kv, "big")
+    # only the host holds "b"'s prefix, and its output doesn't fit beside "c", so it can't pass "big"
+    kv.local_loops = {"decode_loop"}
+    tokens, page = host.A_PROMPT + [7, 8], host.PAGE_SIZE
+    kv.ingest_request("b", KVReqConfig(
+        prefix_keys={"main": chain([tokens[at:at + page] for at in range(0, len(tokens), page)])},
+        prefix_tail={"main": tokens[len(tokens) // page * page:]}, loop_caps={"decode_loop": room * page},
+        kv_layout={"main": StreamLayout(
+            (PrefixSpan(len(tokens), len(tokens), WALK),), (("decode_loop", 1),), keyed_spans=1,
+        )},
+    ))
+    assert not _ready(kv, "b")
     assert kv._host_copies == [], "a request still in the queue started a copy from the host"
 
     _remove(kv, "big")

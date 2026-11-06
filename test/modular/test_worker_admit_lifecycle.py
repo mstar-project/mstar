@@ -104,6 +104,8 @@ def _worker(graphs=((WG_ID, NODE, WALK, "default"),)):
     w._in_flight_rids = set()
     w._pending_removes = {}
     w._rebuilds = Rebuilds({}, {})
+    w._preemption = SimpleNamespace(preempt=lambda node_batch: False, remove_request=lambda rid: None)
+    w._kv_writes = {}
     w.streaming_buffers = {}
     w._unprocessed_messages = {}
     w._removed_rids = RecentSet(16)
@@ -167,17 +169,6 @@ def test_remove_tears_down_both_sides_and_frees_the_handle():
     w._add_new_request(_new_request("r2"))
     assert w._rid("r2") == rid
     assert w._rid_str(rid) == "r2"
-
-
-def test_admit_is_refused_after_a_drain():
-    """A NEW that arrives after this rank sent READS_DONE for the rid is
-    refused: the drain is complete, so nothing may be read for it any more."""
-    w = _worker()
-    w._draining_rids.add("r1")
-    w._reads_done_sent.add("r1")
-    w._add_new_request(_new_request("r1"))
-    assert w._rid("r1") is None
-    assert w.tensor_manager.registered == []
 
 
 THINKER = (0, "thinker", "thinker", "Thinker")

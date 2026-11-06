@@ -87,6 +87,10 @@ class _Scheduler:
         self.last_consumed_tp_seq = -1
 
     def get_next_batch(self, request_state, **kwargs):
+        if self.heads and not self.heads[0].speculative:
+            # a step of moves alone, popped after its settle with no batch to build
+            self.pop_tp_follow_head()
+            return None
         if self.last_consumed_tp_seq + 1 >= len(self.steps):
             return None
         self.last_consumed_tp_seq += 1
@@ -97,6 +101,9 @@ class _Scheduler:
 
     def pop_tp_follow_head(self):
         self.last_consumed_tp_seq = self.heads.pop(0).spec_seq
+
+    def void_tp_follow_head(self):
+        self.heads[0].speculative = False
 
     def take_admit_errors(self):
         return {}
@@ -140,6 +147,9 @@ def _rank(
     w._removed_rids, w._unprocessed_messages = RecentSet(16), {}
     w.streaming_buffers = {}
     w._rebuilds = Rebuilds({}, {})
+    w._preemption = SimpleNamespace(
+        preempt=lambda node_batch: False, remove_request=lambda rid: None, make_room=lambda: None,
+    )
     w._tp_broadcast_seq = 0
     w._tp_nospec = RecentSet(16)
     if serial:
@@ -255,6 +265,57 @@ def test_rank_0_tears_down_after_admitting_the_step_its_stamp_names(monkeypatch)
     assert log.index(("admit", 1)) < log.index(("teardown", "gone")), log
 
 
+def test_rank_0_holds_a_removal_until_a_step_carries_its_journal(monkeypatch):
+    """A refused step can leave rank 0's journal holding a victim's drop when "idle" is removed. Each follower
+    replays the drop with the next step and tears "idle" down after the step the removal is stamped with, so rank 0
+    holds the removal until N goes out with the drop."""
+    w, log = _rank(monkeypatch, tp_rank=0, inbox=[[RemoveRequest(request_id="idle")]])
+    w.parallel_nodes = w.parallel_leader_nodes = {NODE}
+    w._lockstep_led, w._lockstep_unread = frozenset({NODE}), {}
+    owed = set()
+    w._tp_followers = {NODE: ["rank1"]}
+    w.engine_manager.get_engine = lambda node: SimpleNamespace(owes_moves=lambda: bool(owed))
+    broadcast, process = w.maybe_send_zmq_to_tp_followers, w._process_messages
+
+    def _logged(node_batch, **kwargs):
+        owed.clear()
+        log.append(("broadcast", broadcast(node_batch, **kwargs), len(node_batch.request_ids)))
+        return log[-1][1]
+
+    def _process_messages():
+        owed.add(NODE)  # the drop, journaled at the refusal of the step before N
+        process()
+
+    w.maybe_send_zmq_to_tp_followers, w._process_messages = _logged, _process_messages
+    _run(w)
+
+    assert log.index(("broadcast", 0, len(STEP_N))) < log.index(("teardown", "idle")), log
+    assert ("forward", "idle", 0) in log, log
+
+
+def test_a_follower_tears_down_what_a_head_with_no_rows_released_before_it_builds_the_next_step():
+    """Rank 0 sent a step with no rows, tore "gone" down stamped with it, and then sent N+1 into the room "gone"
+    freed. A follower whose first try at a step away from its own chain takes the step with no rows tears "gone"
+    down before its second try builds N+1, as rank 0 did before it sent N+1."""
+    log = []
+    w = Worker.__new__(Worker)
+    w.request_state, w._removes_awaiting_step = None, {0: ["gone"]}
+    w._remove_request = lambda body: log.append(("teardown", body.request_id))
+
+    def _get_next_batch(request_state, exclude_target=None):
+        if exclude_target is not None:
+            w.scheduler.last_consumed_tp_seq = 0
+            log.append(("took", 0))
+            return None
+        log.append(("built", 1))
+        return "N+1"
+
+    w.scheduler = SimpleNamespace(get_next_batch=_get_next_batch, last_consumed_tp_seq=-1)
+
+    assert Worker._next_batch(w, (NODE, WALK)) == "N+1"
+    assert log == [("took", 0), ("teardown", "gone"), ("built", 1)], "N+1 would admit with gone's pages held here"
+
+
 def test_a_follower_tears_down_after_admitting_the_step_rank_0_stamped(monkeypatch):
     """Here before this rank has even popped N+1: held until it has, then torn down behind
     the admit fence of the next pass."""
@@ -335,14 +396,15 @@ def test_a_follower_tears_down_what_it_deferred_before_it_takes_the_next_step(mo
 def test_a_follower_that_drops_a_step_tears_down_before_it_takes_the_next(monkeypatch, cache_open):
     """N fails "also", so both ranks drop the speculative N+1 built on it. Rank 0 stamped
     "gone" with N+1 and tore it down before it sent N+2. Here "gone" is held until this
-    rank pops N+1, which it does as it drops it, after building it when the prefix cache is
-    open, and goes before N+2's admit."""
+    rank pops N+1. On the serial path this rank pops N+1 once the voided head's moves land,
+    after building N+1 when the prefix cache is open. "gone" is then torn down before N+2's
+    admit."""
     removal = RemoveRequest(request_id="gone", source=MessageSource.TP_RANK_0, after_tp_seq=1)
     w, log = _rank(monkeypatch, tp_rank=1, inbox=[[], [removal]])
     w.engine_manager.get_engine = lambda node: SimpleNamespace(
         prefix_cache_open=lambda node: cache_open, drop_cached_prefix=lambda head: None,
     )
-    # N+1 is dropped, so the serial path's next step is N+2
+    # N+1 is voided, so after it the serial path's next step is N+2
     w.scheduler.steps += [None, [HANDLES["kept"]]]
     build_executing, build_speculation = w._build_executing_batch, w._build_speculation
 

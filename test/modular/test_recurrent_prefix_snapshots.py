@@ -64,6 +64,9 @@ class _StubChains:
     def chain_keys(self, rid, label, pages):
         return self.keys.get(rid, [])[:pages]
 
+    def bind_snapshots(self, pool):
+        del pool
+
 
 def _build(config: RecurrentStateConfig, world_size: int = 1, prefix_cache: bool = True) -> RecurrentStatePool:
     """The pool as the engine builds it, over a KV cache whose `prefix_cache` is ``prefix_cache``."""

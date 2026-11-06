@@ -322,9 +322,11 @@ class Qwen3_5DenseModel(Model):
         )}
 
     def rebuild_policies(self) -> dict[str, RebuildPolicy]:
-        # a prompt with images or video can't be recomputed from ids, so the KV cache refuses to drop it
-        return {"LLM": RebuildPolicy(walk="prefill_text", ids_input="text_inputs", sample_output="new_token",
-                                     loop="decode_loop")}
+        # A prompt with images or video is rebuilt from host copies of the encoder's output, one embedding per slot.
+        return {"LLM": RebuildPolicy(
+            walks=frozenset({"prefill_text", "prefill_vision"}), ids_input="text_inputs", sample_output="new_token",
+            loop="decode_loop", copy_width={"prefill_vision": self.config.hidden_size},
+        )}
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         prefill_text = GraphNode(
@@ -640,8 +642,12 @@ class Qwen3_5DenseModel(Model):
             return (Span("rows" if video else "digest", walk, rows, vision_position_advance(grid, merge) + 2, source),)
 
         plan = prefill_plan(expand_video_parts(parts, groups))
+        first, *rest = prompt_spans(plan, segments, walk, media)
+        if walk == "prefill_vision":
+            # one prefill_vision row writes the whole prompt
+            rest = [span._replace(opens_step=False) for span in rest]
         layout = LabelLayout(
-            spans=tuple(prompt_spans(plan, segments, walk, media)), growth=(("decode_loop", 1),),
+            spans=(first, *rest), growth=(("decode_loop", 1),),
             # The keys name `prefill_text` alone, and the preprocess worker refuses
             # a keyed span in any other walk.
             keyed_spans=0 if walk == "prefill_vision" else None,

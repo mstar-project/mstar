@@ -80,8 +80,11 @@ def make_executing_batch(
         # Every path to a mixed step comes through here, a TP follower's too,
         # so each rank orders the leader's rows alike.
         request_ids = engine.order_split_rows(node_name, graph_walk, request_ids, request_walks)
+    input_ready = ()
     if rebuild_rids:
-        rebuilds.fill(node_name, rebuild_rids, chunk_ranges or {}, per_request_input_tensors, per_request_info)
+        input_ready = rebuilds.fill(
+            node_name, rebuild_rids, chunk_ranges or {}, per_request_input_tensors, per_request_info,
+        )
     return ExecutingBatch(
         node_name=node_name,
         per_request_info=per_request_info,
@@ -90,6 +93,7 @@ def make_executing_batch(
         partition_done_rids=partition_done_rids,
         per_request_input_metadata=per_request_input_metadata or {},
         chunk_ranges=chunk_ranges or {},
+        input_ready=input_ready,
         step_context=StepContext(
             request_ids=tuple(request_ids),
             graph_walk=graph_walk,

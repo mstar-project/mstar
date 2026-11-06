@@ -24,6 +24,7 @@ import multiprocessing as mp
 import os
 import queue
 import traceback
+from array import array
 from concurrent.futures import Future
 from types import SimpleNamespace
 
@@ -38,12 +39,14 @@ import mstar.communication.wire_types  # noqa: F401  (registers the tags)
 from mstar.communication.tensors import StoredOutputs
 from mstar.communication.wire import decode, encode
 from mstar.engine.engine import ExecutingBatch
-from mstar.engine.resources.step import StepContext
+from mstar.engine.resources import Rebuild, Residency
+from mstar.engine.resources.step import FULL_ADMIT_REBUILD, StepContext
 from mstar.graph.base import GraphEdge, TensorPointerInfo
 from mstar.graph.runtime.base import ColumnarEdgeSpecs, SpeculationPrepOutput
+from mstar.model.submodule_base import chunk_loop_name
 from mstar.utils.ipc_format import OffloadDelta, ScheduleTPNode, WorkerMessageType
 from mstar.worker.micro_scheduler import MicroScheduler, ScheduledBatch
-from mstar.worker.rebuild import Rebuilds
+from mstar.worker.rebuild import Prefilling, Rebuilds
 from mstar.worker.stream_buffers import StreamBufferManager
 from mstar.worker.worker import Speculation, Worker
 
@@ -243,14 +246,56 @@ def test_every_rank_takes_out_the_rows_any_rank_could_not_read(tmp_path, layout)
 # ── a follower builds rank 0's step without the rows it could not read ────
 
 
-def _follower_scheduler(ready, read_failed=()):
+class _DroppedHere(_Engine):
+    """`_Engine` on a rank whose KV dropped ``dropped``, as its replay of rank 0's drop left it. Records the
+    rebuilds the rank starts."""
+
+    def __init__(self, dropped):
+        super().__init__()
+        self.dropped, self.started = set(dropped), []
+
+    def residency(self, node_name, rid):
+        return Residency.DROPPED if rid in self.dropped else Residency.RESIDENT
+
+    def in_step(self, node_name, rid):
+        return False
+
+    def check_ready(self, node_name, rid, fwd_info, allow_reload=True):
+        if rid in self.dropped:
+            return FULL_ADMIT_REBUILD
+        return super().check_ready(node_name, rid, fwd_info, allow_reload)
+
+    def prepare_rebuild(self, node_name, rid, rebuild):
+        self.started.append(rid)
+
+
+def _log(kept):
+    """A rebuild log keeping ids for ``kept``, which starts each rebuild once, and from its prompt's chunks when
+    the request was mid-prefill in its first prefill step."""
+    cursors = {}
+
+    def start(rid, node, prefilling):
+        assert (node, rid) not in cursors, f"{rid}'s rebuild started twice"
+        cursors[(node, rid)] = prefilling
+        return None if prefilling is not None else Rebuild(array("i", [1, 2]))
+
+    return SimpleNamespace(
+        kept=lambda rid, node: rid if rid in kept else None, start=start,
+        rebuilding=lambda rid, node: (node, rid) in cursors, cursors=cursors.items, nodes=frozenset({NODE}),
+        cursor=lambda rid, node: SimpleNamespace(resumes_prefill=cursors[(node, rid)] is not None),
+    )
+
+
+def _follower_scheduler(ready, read_failed=(), dropped=()):
     manager = _Manager(["r0", "r1"])
     manager.queues["wg0"]._ready = {rid: {NODE} for rid in ready}
+    engine = _DroppedHere(dropped)
     sched = MicroScheduler(
-        engine_manager=SimpleNamespace(get_engine=lambda n: _Engine()),
+        engine_manager=SimpleNamespace(get_engine=lambda n: engine),
         parallel_leader_nodes=set(),
     )
     sched.runtime = manager.runtime
+    sched.rebuilds = _log(dropped)
     sched.read_failed_rids.update(read_failed)
     return sched, manager
 
@@ -364,13 +409,13 @@ def test_a_removed_requests_read_failure_is_forgotten():
     assert "r1" not in sched.read_failed_rids
 
 
-def _spec_follower(read_failed, continuing, fresh, head_rids):
+def _spec_follower(read_failed, continuing, fresh, head_rids, dropped=()):
     """An async follower with step N (``continuing``) in flight and rank 0's
     speculative head for N+1 queued. The graph runtime's prep and the
     speculation's assembly are recorded, not run."""
     # a row whose read failed never readies
     sched, manager = _follower_scheduler(
-        ready=[r for r in fresh if r not in read_failed], read_failed=read_failed,
+        ready=[r for r in fresh if r not in read_failed], read_failed=read_failed, dropped=dropped,
     )
     w = Worker.__new__(Worker)
     w._walk_drivers = {}
@@ -407,13 +452,15 @@ def _spec_follower(read_failed, continuing, fresh, head_rids):
 
     w.continuing, w.inputs = [], []
 
-    def assemble(pending, info, rows, inputs, streamed, continuing, fresh_final, **kwargs):
+    def assemble(pending, info, rows, inputs, streamed, continuing, fresh_final, rebuild_rids=frozenset(), **kwargs):
         w.assembled.append(list(rows))
         w.continuing.append(list(continuing))
         w.inputs.append(dict(inputs))
         rids = list(rows)
         return Speculation(
-            scheduled_batch=ScheduledBatch(node_name=NODE, graph_walk=WALK, request_to_worker_graph=dict(rows)),
+            scheduled_batch=ScheduledBatch(
+                node_name=NODE, graph_walk=WALK, request_to_worker_graph=dict(rows), rebuild_rids=rebuild_rids,
+            ),
             node_batch=ExecutingBatch(
                 node_name=NODE, per_request_info=dict.fromkeys(rids, SimpleNamespace()),
                 step_context=StepContext(request_ids=tuple(rids), graph_walk=WALK, slot=0, capture=False),
@@ -465,6 +512,98 @@ def test_an_async_follower_builds_a_read_checked_head_with_the_row_empty(unread)
     # sent, and so does this rank, the unread rows' included
     Worker._settle_speculation(w, spec, success=False)
     assert sorted(w.released) == sorted(head)
+
+
+def test_an_async_follower_keeps_a_rebuild_row_of_rank_0s_head_out_of_the_pop():
+    """Rank 0's speculative head takes rb, a rebuild its log offered. The graph runtime holds no row for rb, so the
+    follower knows rb from its own KV, starts its rebuild, and puts it in with no inputs for its log to fill at the
+    build. Popping it would wait for a row that never readies."""
+    w, pending = _spec_follower(
+        read_failed=(), continuing=["c0"], fresh=["f0"], head_rids=["c0", "rb", "f0"], dropped=["rb"],
+    )
+
+    spec = Worker._try_follow_speculation(w, pending)
+
+    assert spec is not None, "the head waits on a rebuild row as if the graph runtime held it"
+    assert w.assembled == [["c0", "rb", "f0"]] and w.inputs[-1]["rb"] == {}
+    assert spec.scheduled_batch.rebuild_rids == {"rb"}, "the follower would route the rebuild row's outputs"
+    assert w.scheduler.engine_manager.get_engine(NODE).started == ["rb"]
+
+
+def test_an_async_follower_takes_a_rebuilds_next_chunk_after_n_as_a_rebuild_row():
+    """rb's rebuild ran its first chunk in N. Rank 0's speculative head takes rb's next chunk as one of N's rows
+    mid-prefill, and rank 0 marks it as a rebuild row from its log."""
+    w, pending = _spec_follower(
+        read_failed=(), continuing=["c0", "rb"], fresh=[], head_rids=["c0", "rb"], dropped=["rb"],
+    )
+    pending.batch.incomplete_node_rids = {"rb"}
+    w.scheduler.rebuilds.start("rb", NODE, None)
+
+    spec = Worker._try_follow_speculation(w, pending)
+
+    assert spec is not None
+    assert spec.scheduled_batch.rebuild_rids == {"rb"}, "rb's rebuild would not land with rank 0's"
+    assert w.preps == [["c0"]] and spec.continuing_rids == {"rb"}
+
+
+def test_a_follower_checking_a_dropped_requests_row_starts_no_rebuild():
+    """A follower's own rebuild of rb has landed and rank 0's land of it hasn't replayed yet, so rb is still dropped
+    here. A readiness check of rb's row in that gap finds it not ready and starts nothing, or rb's rebuild would run
+    a second time on this rank alone."""
+    sched, _ = _follower_scheduler(ready=[], dropped=["rb"])
+
+    assert not sched._check_ready(NODE, "rb", SimpleNamespace(graph_walk=WALK))
+    assert sched.engine_manager.get_engine(NODE).started == [] and not sched.rebuilds.rebuilding("rb", NODE)
+
+
+def test_a_follower_builds_rank_0s_rebuild_row_from_its_own_log():
+    """rb is a rebuild row of rank 0's step. The follower starts rb's rebuild from its own kept ids once, pops r0
+    alone, and builds the step with rank 0's rows in rank 0's order."""
+    sched, manager = _follower_scheduler(ready=["r0"], dropped=["rb"])
+    sched.register_tp_follow(_head(read_check=False, rids=("rb", "r0")))
+
+    batch = sched.get_next_batch(manager)
+
+    assert list(batch.request_to_worker_graph) == ["rb", "r0"], "the follower's step isn't rank 0's"
+    assert batch.rebuild_rids == {"rb"} and sched.engine_manager.get_engine(NODE).started == ["rb"]
+
+
+def test_a_follower_rebuilds_a_request_dropped_mid_prefill_from_its_prompts_chunks():
+    """rb was dropped after 2 of its prompt's 4 chunks and keeps no ids. The follower knows rb's row from its own
+    KV and starts the rebuild from rb's chunk Loop, as rank 0 did, since the Loop runs in lockstep."""
+    sched, manager = _follower_scheduler(ready=["r0"], dropped=["rb"])
+    sched.rebuilds = _log(kept=())
+    sched.chunk_loop_walks = {NODE: frozenset({WALK})}
+    manager.loops[("rb", chunk_loop_name(NODE, WALK))] = [2, 4]
+    sched.register_tp_follow(_head(read_check=False, rids=("rb", "r0")))
+
+    batch = sched.get_next_batch(manager)
+
+    assert list(batch.request_to_worker_graph) == ["rb", "r0"] and batch.rebuild_rids == {"rb"}, (
+        "the follower took rb's row as one of its own"
+    )
+    assert dict(sched.rebuilds.cursors()) == {(NODE, "rb"): Prefilling(WALK, 2, 4)}, "rb's rebuild has another source"
+
+
+def test_rank_0_and_a_follower_vote_on_the_same_rows_when_a_step_has_a_rebuild_row(tmp_path):
+    """Before a step whose rows read inputs from elsewhere, every TP rank votes one flag per row on whose read
+    failed, in one all-reduce. rb is a rebuild row of the step, and r1's prompt landed on rank 0 by a read. A
+    follower that voted on fewer rows than rank 0 would give the all-reduce a different number of values."""
+    w = _leader(tmp_path)
+    _land(w, "r1", _input(11, "text_inputs"))
+    batch = _step({"rb": ["text_inputs"], "r0": ["text_inputs"], "r1": ["text_inputs"]})
+    batch.rebuild_rids = frozenset({"rb"})
+    w.maybe_send_zmq_to_tp_followers(batch)
+    (message,) = [m.body for _, m in w.sent if m.message_type == WorkerMessageType.SCHEDULE_TP]
+    assert message.read_check and message.request_ids == ["rb", "r0", "r1"]
+
+    sched, manager = _follower_scheduler(ready=["r0", "r1"], dropped=["rb"])
+    sched.register_tp_follow(message)
+    followed = sched.get_next_batch(manager)
+
+    assert followed.read_check_rids == batch.read_check_rids, (
+        f"rank 0 votes on {batch.read_check_rids} and the follower on {followed.read_check_rids}"
+    )
 
 
 def test_an_async_follower_that_cannot_prep_gives_back_only_the_rows_it_popped():
@@ -531,7 +670,7 @@ def _leader(tmp_path, streamed=(), nodes=(NODE,), consumed=None):
     w.worker_id = "w0"
     w.parallel_nodes, w.parallel_leader_nodes = set(nodes), set(nodes)
     w.is_tp_follower, w.enable_nvtx = False, False
-    w._tp_broadcast_seq = 0
+    w._tp_broadcast_seq, w._tp_followers = 0, dict.fromkeys(nodes, FOLLOWERS[1:])
     w.sent = []
     w.communicator = SimpleNamespace(
         send=lambda dest, msg=None: w.sent.append((dest, decode(encode(msg)))),
@@ -544,7 +683,7 @@ def _leader(tmp_path, streamed=(), nodes=(NODE,), consumed=None):
         get_consumed_edges=lambda source, dest, walk: {(sig, dest) for sig in consumed.get((source, dest), ())},
     )
     w.engine_manager = SimpleNamespace(get_engine=lambda n: SimpleNamespace(
-        take_resident_delta=lambda n: OffloadDelta.new(),
+        take_resident_delta=OffloadDelta.new,
         decide_cached_prefix=lambda b: {}, page_trails=lambda n: {},
     ))
     w.tensor_manager = tm

@@ -42,6 +42,7 @@ from mstar.utils.containers import ParallelList  # noqa: E402
 from mstar.worker.batch_builder import StepPick  # noqa: E402
 from mstar.worker.chunk_loops import ChunkLoops
 from mstar.worker.micro_scheduler import ChainPick, MicroScheduler, ScheduledBatch  # noqa: E402
+from mstar.worker.rebuild import Rebuilds  # noqa: E402
 from mstar.worker.worker import SpeculationTarget, Worker  # noqa: E402
 
 NODE, WALK = "dit", "video_gen"
@@ -368,6 +369,8 @@ def _looping_worker(monkeypatch, sched, state, refuse=frozenset()) -> Worker:
                  "_poll_stream_buffers", "_set_in_flight_flag", "_clear_in_flight_flag",
                  "_drop_rows_whose_loop_stopped", "_handle_admit_failure", "_postprocess_batch"):
         setattr(w, name, stub)
+    w._preemption = SimpleNamespace(make_room=stub)
+    w._rebuilds = Rebuilds({}, {})
     w.maybe_send_zmq_to_tp_followers = lambda node_batch: -1
     w._build_executing_batch = executing
     w._build_speculation = lambda pending, consecutive, fair: (None, None)

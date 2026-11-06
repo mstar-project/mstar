@@ -325,6 +325,7 @@ def _bare_worker(tmp_path):
     worker._rebuilds = Rebuilds({}, {})
     worker.communicator = _Sink()
     worker.tensor_manager = _shm("worker_1", tmp_path)
+    worker._preemption = SimpleNamespace(counts={})
     return worker
 
 

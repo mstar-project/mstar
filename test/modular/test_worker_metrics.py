@@ -23,7 +23,7 @@ from test_conductor_status import _conductor, _request, _to_api_server  # noqa: 
 from test_ingest_unpersist import _run  # noqa: E402
 from test_kv_prefix_lease import ROOT, _grow, _keys, _layout, _seed, _StubTransfer  # noqa: E402
 from test_micro_scheduler import _Engine, _Manager, _next_batch, _scheduler  # noqa: E402
-from test_rebuild_policy import POLICY, _graphs, _ran  # noqa: E402
+from test_rebuild_policy import _rebuilds  # noqa: E402
 from test_serving_metrics import _labels, _serve, _wait  # noqa: E402
 
 import mstar.communication.wire_types  # noqa: E402,F401  (registers the wire tags)
@@ -50,7 +50,6 @@ from mstar.utils.ipc_format import (  # noqa: E402
     WorkerStatus,
 )
 from mstar.worker import worker_metrics  # noqa: E402
-from mstar.worker.host_pool import HostPool  # noqa: E402
 from mstar.worker.rebuild import Rebuilds  # noqa: E402
 from mstar.worker.worker import Worker  # noqa: E402
 from mstar.worker.worker_metrics import WorkerMetrics  # noqa: E402
@@ -139,7 +138,7 @@ def _metrics(eng=None, scheduler=None, components=(NODE,), sent=None, counting=T
         scheduler = SimpleNamespace(pending_rows=lambda: {})
     m = WorkerMetrics(
         "worker_0", 3600.0, frozenset(components), eng or _engine(), scheduler, rebuilds or Rebuilds({}, {}),
-        send=(sent if sent is not None else []).append, enable_transfers=lambda: EdgeTransfers("SHM"),
+        send=(sent if sent is not None else []).append, enable_transfers=lambda: EdgeTransfers("SHM"), preemptions={},
     )
     if counting:
         m.start_counting()
@@ -206,14 +205,12 @@ def test_a_cache_only_follower_nodes_use_is_not_reported():
 # ── kept-id pool ─────────────────────────────────────────────────────────────
 
 def test_the_kept_id_pool_reports_its_fill_under_its_node():
-    rebuilds = Rebuilds({NODE: POLICY}, _graphs(), HostPool(64, torch.device("cpu")))
-    m = _metrics(rebuilds=rebuilds)
-
-    rebuilds.keep_prompts(_ran(PREFILL, {"r": {"text_inputs": [torch.arange(3)]}}))
+    # three requests of 3 ids, each taking 8 B an id when it arrives
+    m = _metrics(rebuilds=_rebuilds(128))
 
     snaps = m.snapshot()
     assert (_values(snaps, "mstar_rebuild_host_bytes_used"), _values(snaps, "mstar_rebuild_host_bytes_total")) == (
-        {(NODE,): 24}, {(NODE,): 64}
+        {(NODE,): 72}, {(NODE,): 128}
     ), "a full pool, whose requests are never dropped, wouldn't show"
 
 
@@ -348,7 +345,12 @@ def _looping_worker(monkeypatch, schedule, speculate, refuse):
     w._phase_period, w._phase_buf = 0, {}
     w._max_consecutive_spec, w._launch_wait_s = 1024, 0.0
     w.tp_async_sched, w.is_tp_follower = False, False
+    w.parallel_nodes, w.parallel_leader_nodes = set(), set()
     w._in_flight_rids = set()
+    w._preemption = SimpleNamespace(
+        preempt=lambda node_batch: False, remove_request=lambda rid: None, make_room=lambda: None,
+    )
+    w._rebuilds = Rebuilds({}, {})
     w.parallel_groups = SimpleNamespace(barrier_all=stub, restore_default_timeout=stub)
     w.engine_manager = SimpleNamespace(warmup_all=stub, get_engine=lambda node: eng)
     w.communicator = SimpleNamespace(send=stub, wait_for_work=stub)
@@ -376,7 +378,7 @@ def _looping_worker(monkeypatch, schedule, speculate, refuse):
     w._handle_main_loop_error = fail_loudly
     w._metrics = WorkerMetrics("worker_0", 0.0, frozenset({NODE}), eng,
                                SimpleNamespace(pending_rows=dict), Rebuilds({}, {}), send=sent.append,
-                               enable_transfers=lambda: EdgeTransfers("SHM"))
+                               enable_transfers=lambda: EdgeTransfers("SHM"), preemptions={})
     w._metrics.start_counting()
     return w, sent, postprocessed, iteration
 
@@ -730,7 +732,7 @@ def _worker_status(worker_id, used, steps=(), pending=0):
     m = WorkerMetrics(
         worker_id, 3600.0, frozenset({NODE}), _engine([kv]),
         SimpleNamespace(pending_rows=lambda: {NODE: pending}), Rebuilds({}, {}), send=None,
-        enable_transfers=lambda: EdgeTransfers("SHM"),
+        enable_transfers=lambda: EdgeTransfers("SHM"), preemptions={},
     )
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr(worker_metrics, "time", clock)

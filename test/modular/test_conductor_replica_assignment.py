@@ -5,6 +5,7 @@ holds). With no mirror that is the replica serving the fewest live requests, so
 concurrent requests spread over the replicas instead of landing on one at random,
 and ties go to the replica picked longest ago, so requests that never overlap take
 turns."""
+import itertools
 import math
 from collections import Counter
 from types import SimpleNamespace
@@ -402,6 +403,7 @@ def test_a_request_refused_at_ingest_leaves_nothing_in_the_mirrors():
     )
     conductor._status_interval_s = None
     conductor._loop_max_iters = {}
+    conductor._arrivals = itertools.count()
     conductor._kv_labels = {"kv": ("main",)}
     conductor._build_request_sharding_config = lambda workers: None
     refused = []
@@ -409,7 +411,7 @@ def test_a_request_refused_at_ingest_leaves_nothing_in_the_mirrors():
     conductor._admit_request(SimpleNamespace(
         # 80 prompt positions, past the pool's max_seq_len of 64: a 400 in validate
         request_id="a", client_request_id=None, model_kwargs=_prompt("P", unkeyed=64), initial_signals={},
-        initial_input_modalities=["text"], initial_output_modalities=["text"],
+        initial_input_modalities=["text"], initial_output_modalities=["text"], streaming=False,
     ))
     assert refused == [400] and not conductor.requests
     (mirror,) = _mirrors(conductor._router)

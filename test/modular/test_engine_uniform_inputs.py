@@ -28,6 +28,7 @@ class _Batch:
         self.per_request_info_wrapped = {r: SimpleNamespace() for r in rids}
         self.per_request_input_tensors = {}
         self.per_request_input_metadata = {}
+        self.input_ready = ()
         self.final_stream_rids = set()
         self.skipped_rids = set()
         self.failed_requests = {}

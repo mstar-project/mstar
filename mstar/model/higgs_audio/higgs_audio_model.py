@@ -16,8 +16,8 @@ Architecture (2 nodes, single partition):
 
 Graph walks:
     prefill_audio — audio_encoder -> LLM: the ChatML text around the audio
-                    and the audio embeddings, prefilled as one span that
-                    samples the first token
+                    and the audio embeddings, three spans prefilled in one
+                    step that samples the first token
     decode        — LLM loop
 
 Not implemented from the reference pipeline: silero-VAD chunk
@@ -58,6 +58,7 @@ from mstar.model.higgs_audio.config import (
     SAMPLER,
     HiggsAudioModelConfig,
 )
+from mstar.model.rebuild import RebuildPolicy
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.model.utils import ByteLevelDetokenizer, TextOutput
 
@@ -191,6 +192,14 @@ class HiggsAudioModel(Model):
             growth=(("decode", "decode_loop"),),
         )}}
 
+    def rebuild_policies(self) -> dict[str, RebuildPolicy]:
+        # One step prefills the text around the audio and the audio. Its rebuild reads the text before the audio and
+        # the encoder's output from host copies, and the samples follow the text after it.
+        return {"LLM": RebuildPolicy(
+            walks=frozenset({"prefill_audio"}), ids_input="text_post", sample_output="new_token", loop="decode_loop",
+            copy_width={"prefill_audio": self.config.hidden_size},
+        )}
+
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         llm_prefill_outputs = [
             GraphEdge(
@@ -256,7 +265,7 @@ class HiggsAudioModel(Model):
     ) -> ForwardPassArgs:
         """One ``prefill_audio`` step: the ChatML text before the audio, the
         audio's mel features (to the encoder) and the text after it, prefilled
-        as one span. ``process_prompt`` emits the two ``text_inputs`` (the
+        as three spans. ``process_prompt`` emits the two ``text_inputs`` (the
         prompt split at the audio splice point) and the per-chunk features."""
         texts = input_signals.get("text_inputs", [])
         audio_features = input_signals.get("audio_features", [])
@@ -393,12 +402,16 @@ class HiggsAudioModel(Model):
 
         feature_lens = audio_feature_lens.tolist()
         audio = sum(self.config.encoder_output_length(n) for n in feature_lens)
-        # One step writes the text around the audio and the audio together, so
-        # one span; it mixes text and audio, so nothing keys it.
-        prompt = len(pre_ids) + audio + len(post_ids)
+        # One step writes the text around the audio and the audio, in one row.
+        # It mixes text and audio, so nothing keys it.
         layout = LabelLayout(
-            spans=(Span("rows", "prefill_audio", prompt, prompt, "audio_features"),),
+            spans=(
+                Span("ids", "prefill_audio", len(pre_ids), len(pre_ids), "text_inputs"),
+                Span("rows", "prefill_audio", audio, audio, "audio_features", opens_step=False),
+                Span("ids", "prefill_audio", len(post_ids), len(post_ids), "text_inputs", opens_step=False),
+            ),
             growth=(("decode_loop", 1),),
+            keyed_spans=0,
         )
         return ProcessPromptOutput({
             "text_inputs": [
