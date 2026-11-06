@@ -5197,9 +5197,9 @@ class KVManager(AttentionResource):
             if not earmark.victims:
                 del self._earmarks[earmark.rid]
             if earmark.rid in self._asks:
-                # Every rank keeps the room for it and rank 0 alone admits it, since another rank can hold other room
-                # as the move lands there, as when a window's commit frees pages at another point of the step. The
-                # engine journals the move ahead of the admit, so a follower's replay takes the same kept room.
+                # Rank 0 alone admits it, since another rank can hold other room as the move lands there, as when a
+                # window's commit frees pages at another point of the step. The engine journals the move ahead of the
+                # admit.
                 self._kept += freed
                 if self._decides and earmark.pages <= self._room():
                     self._admit(earmark.rid, earmark.pages, self.journal)
