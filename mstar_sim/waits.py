@@ -3,9 +3,10 @@
 Every thread the process starts is counted, running until it enters a wait this module
 knows (the registry): a Condition's waiter lock (Event, Queue, Future, Semaphore, Barrier,
 a thread's start), a ``queue.SimpleQueue`` get (an executor's idle thread), ``time.sleep``,
-a selector's select (asyncio), mstar's Rust poll, a wait for the device, and a rank's wait
-for its peers. A thread in any other wait (a plain lock, a join, a socket) counts as
-running. While no counted thread runs, the clock stands still (:func:`mstar_sim.clock.freeze`).
+a selector's select (asyncio), a post-install ``threading.Lock``, mstar's Rust poll, a wait for
+the device, and a rank's wait for its peers. A thread in any other wait (a native lock, a join,
+a socket) counts as running. While no counted thread runs, the clock stands still
+(:func:`mstar_sim.clock.freeze`).
 
 Each wake point marks the thread it wakes running before the waker can block: a waiter
 lock's release (a notify), a ``SimpleQueue`` put (by count, as C wakes any getter), an
@@ -55,6 +56,7 @@ import _thread
 import atexit
 import ctypes
 import math
+import operator
 import os
 import queue
 import selectors
@@ -64,6 +66,7 @@ import sys
 import threading
 import time
 import traceback
+import weakref
 from contextlib import contextmanager
 
 from mstar_sim import clock, table
@@ -86,6 +89,7 @@ _running = clock.RUNNING
 _waits: set[Wait] = set()
 _fds: dict[int, Wait] = {}  # an fd a poll waits on: its eventfd_write wakes the poll
 _installed = [False]
+_locks = weakref.WeakSet()  # adapters whose private guards need fork repair
 TABLE: table.Table
 _ahead = [math.inf]  # past this a clock read looks at the bound
 _seen = [-1]  # the deployment's state when _ahead was last worked out
@@ -632,6 +636,61 @@ class _WaiterLock:
         self.release()
 
 
+class Lock:
+    """A Python mutex whose contenders use Condition's independent registered waiters.
+    The held bit has no owner: like a native Lock, another thread may release it."""
+
+    __slots__ = ("_condition", "_held", "__weakref__")
+
+    def __init__(self):
+        self._condition = threading.Condition(_real_lock())
+        self._held = False
+        _locks.add(self)
+
+    def acquire(self, blocking=True, timeout=-1):
+        blocking = bool(blocking)
+        timeout = float.__float__(timeout) if isinstance(timeout, float) else operator.index(timeout)
+        _real_lock().acquire(blocking, timeout)  # native argument validation, even when free
+        with clock.computing(), self._condition:
+            end = None if timeout < 0 else clock.now() + timeout
+            try:
+                while self._held:
+                    if not blocking:
+                        return False
+                    left = None if end is None else end - clock.now()
+                    if left is not None and left <= 0:
+                        return False
+                    self._condition.wait(left)
+                self._held = True
+                return True
+            except BaseException:
+                if not self._held:
+                    self._condition.notify()  # an interrupted selected contender passes the wake on
+                raise
+
+    def release(self):
+        with clock.computing(), self._condition:
+            if not self._held:
+                raise RuntimeError("release unlocked lock")
+            self._held = False
+            self._condition.notify()
+
+    def locked(self):
+        with self._condition:
+            return self._held
+
+    def _at_fork_reinit(self):
+        self._condition._at_fork_reinit()
+        self._held = False
+
+    acquire_lock = __enter__ = acquire
+    release_lock = release
+    locked_lock = locked
+
+    def __exit__(self, *exc):
+        self.release()
+
+
 class SimpleQueue(_queue.SimpleQueue):
     """``queue.SimpleQueue`` (an executor's work queue) whose blocked getters the registry
     counts: as C wakes any one getter, a queue counts max(0, getters - items) blocked, and a
@@ -775,6 +834,7 @@ def install() -> None:
     threading._time = read
     queue.time = read  # bound at import: ``from time import monotonic as time``
     threading._allocate_lock = _WaiterLock
+    threading.Lock = Lock
     queue.SimpleQueue = SimpleQueue
     os.eventfd_write = eventfd_write
     for cls in (selectors.EpollSelector, selectors.PollSelector, selectors.SelectSelector):
@@ -839,6 +899,8 @@ def _after_fork() -> None:
     a mover and its wake (at the parent's fd number, which selectors and polls registered)."""
     global TABLE
     LOCK._at_fork_reinit()
+    for lock in list(_locks):
+        lock._condition._at_fork_reinit()  # preserve held, discard vanished parent contenders
     if TABLE._fd >= 0:
         os.close(TABLE._fd)  # (the parent's slot lock stays the parent's: it holds the same lock)
     TABLE = table.Table(table.path_for(os.environ.get("MSTAR_SIM_NODE")))

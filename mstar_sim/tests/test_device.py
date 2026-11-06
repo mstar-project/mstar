@@ -1344,7 +1344,7 @@ def test_a_permitted_clock_read_releases_an_application_lock_before_its_peer_exi
         open(TMP + "/peer-done", "w").close()
     """, """
         barrier()
-        lock = threading.Lock()
+        lock = waits._real_lock()  # a pre-install/native alias remains unregistered
         lock.acquire()
         def use_lock():
             with lock:
@@ -1364,6 +1364,211 @@ def test_a_permitted_clock_read_releases_an_application_lock_before_its_peer_exi
         open(TMP + "/reader-done", "w").close()
     """)
     assert reader.strip() == "False", reader
+
+
+def test_clock_read_batches_account_for_an_application_lock_waiter():
+    _, reader = run_deployment("""
+        barrier()
+        end = clock._real() + 2.0
+        while not os.path.exists(TMP + "/reader-done") and clock._real() < end:
+            clock.READS[0] += 1
+            waits._real_sleep(0.005)
+        open(TMP + "/peer-done", "w").close()
+    """, """
+        barrier()
+        lock = threading.Lock()
+        lock.acquire()
+        def contender():
+            with lock:
+                pass
+        thread = threading.Thread(target=contender)
+        thread.start()
+        waits._real_sleep(0.05)
+        clock.jump(clock.now() + 0.1)  # a preceding device completion put this host ahead
+        for _ in range(80):
+            waits.read()
+        lock.release()
+        thread.join()
+        print(os.path.exists(TMP + "/peer-done"))
+        open(TMP + "/reader-done", "w").close()
+    """)
+    assert reader.strip() == "False", reader
+
+
+def test_application_lock_protocol_and_conditions():
+    run_sim("""
+        import gc, threading, weakref
+        from mstar_sim import waits
+        def outcome(factory, args, held):
+            lock = factory()
+            if held:
+                lock.acquire()
+            try:
+                return lock.acquire(*args)
+            except Exception as e:
+                return type(e), str(e)
+        for held in (False, True):
+            for args in ((False,), (True, 0), (False, 0), (True, -2), (True, None),
+                         (True, "1"), (True, float("nan")), (True, float("inf")),
+                         (True, threading.TIMEOUT_MAX * 2)):
+                assert outcome(threading.Lock, args, held) == outcome(waits._real_lock, args, held), args
+        for factory in (threading.Lock, waits._real_lock):
+            try:
+                factory(1)
+                raise AssertionError("constructor arguments accepted")
+            except TypeError:
+                pass
+        calls = []
+        class Blocking:
+            def __bool__(self):
+                calls.append("blocking")
+                return True
+        class Timeout:
+            def __index__(self):
+                calls.append("timeout")
+                return 0
+        assert threading.Lock().acquire(Blocking(), Timeout())
+        assert calls == ["blocking", "timeout"]
+        lock = threading.Lock()
+        assert lock.acquire_lock(False) and lock.locked_lock()
+        assert not lock.acquire(False)  # non-reentrant, including its owner
+        thread = threading.Thread(target=lock.release_lock)
+        thread.start(); thread.join()
+        assert not lock.locked()
+        try:
+            lock.release()
+            raise AssertionError("unlocked release accepted")
+        except RuntimeError:
+            pass
+        for condition in (threading.Condition(), threading.Condition(threading.Lock())):
+            ready, done = threading.Event(), threading.Event()
+            def wait():
+                with condition:
+                    ready.set()
+                    assert condition.wait(2)
+                done.set()
+            thread = threading.Thread(target=wait, daemon=True)
+            thread.start()
+            assert ready.wait(2)
+            with condition:
+                condition.notify()
+            assert done.wait(2)
+            thread.join()
+        ref = weakref.ref(lock)
+        del lock
+        gc.collect()
+        assert ref() is None
+    """)
+
+
+def test_application_lock_multiple_contenders_and_timeout():
+    run_sim("""
+        import threading
+        lock = threading.Lock()
+        lock.acquire()
+        timed_out, completed = threading.Event(), []
+        def timeout():
+            assert not lock.acquire(timeout=0.05)
+            timed_out.set()
+        def acquire(i):
+            with lock:
+                completed.append(i)
+        threads = [threading.Thread(target=timeout, daemon=True)] + [
+            threading.Thread(target=acquire, args=(i,), daemon=True) for i in range(2)]
+        for thread in threads:
+            thread.start()
+        assert timed_out.wait(2)
+        lock.release()
+        for thread in threads:
+            thread.join(2)
+            assert not thread.is_alive()
+        assert sorted(completed) == [0, 1]
+    """)
+
+
+@pytest.mark.parametrize("interrupted", [False, True])
+def test_application_lock_transfers_a_notification_after_a_wait_race(interrupted):
+    run_sim("""
+        import threading
+        from mstar_sim import clock, waits
+        lock = threading.Lock()
+        lock.acquire()
+        original = lock._condition.wait
+        completed = threading.Event()
+        def racing_wait(timeout=None):
+            result = original(timeout)
+            if threading.current_thread().name == "selected":
+                if %r:
+                    raise InterruptedError()
+                return False  # timeout observed just as release makes the predicate true
+            return result
+        lock._condition.wait = racing_wait
+        def selected():
+            try:
+                with lock:
+                    pass
+            except InterruptedError:
+                pass
+        def other():
+            with lock:
+                completed.set()
+        first = threading.Thread(target=selected, name="selected", daemon=True)
+        second = threading.Thread(target=other, daemon=True)
+        first.start()
+        end = clock._real() + 2
+        while len(lock._condition._waiters) < 1 and clock._real() < end:
+            waits._real_sleep(0.001)
+        second.start()
+        while len(lock._condition._waiters) < 2 and clock._real() < end:
+            waits._real_sleep(0.001)
+        assert len(lock._condition._waiters) == 2
+        lock.release()
+        assert completed.wait(2)
+        first.join(); second.join()
+    """ % interrupted)
+
+
+def test_application_lock_preserves_held_state_but_not_parent_waiters_after_fork():
+    run_sim("""
+        import os, signal, threading
+        from mstar_sim import clock, waits
+        lock = threading.Lock()
+        lock.acquire()
+        contender = threading.Thread(target=lambda: (lock.acquire(), lock.release()), daemon=True)
+        contender.start()
+        end = clock._real() + 2
+        while not lock._condition._waiters and clock._real() < end:
+            waits._real_sleep(0.001)
+        assert lock._condition._waiters
+        held, release_guard = threading.Event(), waits._real_lock()
+        release_guard.acquire()
+        def guard():
+            with lock._condition:
+                held.set()
+                release_guard.acquire()
+        owner = threading.Thread(target=guard, daemon=True)
+        owner.start()
+        assert held.wait(2)
+        pid = os.fork()
+        if pid == 0:
+            signal.alarm(3)  # an inherited private guard must not hang the test
+            try:
+                assert lock.locked() and not lock.acquire(False)
+                lock.release()
+                with lock:
+                    pass
+                lock.acquire()
+                lock._at_fork_reinit()
+                assert lock.acquire(False)
+                os._exit(0)
+            except BaseException:
+                os._exit(1)
+        release_guard.release()
+        owner.join()
+        lock.release()
+        contender.join()
+        assert os.waitstatus_to_exitcode(os.waitpid(pid, 0)[1]) == 0
+    """)
 
 
 def test_a_read_sees_a_bound_only_the_mover_had_stale():

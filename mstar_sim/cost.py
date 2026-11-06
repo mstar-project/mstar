@@ -58,11 +58,11 @@ numeric value of a scalar argument does not change a kernel's cost.
 
 from __future__ import annotations
 
+import _thread
 import bisect
 import collections
 import json
 import os
-import threading
 from dataclasses import dataclass
 
 import torch
@@ -604,7 +604,7 @@ class _Trace:
     def __init__(self, path: str) -> None:
         self.file = open(path, "a")  # noqa: SIM115 - closed by stop_trace
         self.seen: set[str] = set()
-        self.lock = threading.Lock()
+        self.lock = _thread.allocate_lock()
 
     def record(self, key: str, spec: dict, seconds: float) -> None:
         if key in self.seen:

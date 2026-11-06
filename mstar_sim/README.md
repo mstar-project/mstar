@@ -141,12 +141,19 @@ the roofline.
 - mstar's own CPU work (scheduling, planning, Python) runs at this CPU's speed, so a different CPU
   moves host-bound results. A loaded box moves them less: time the box took from the emulator
   isn't counted, but time it took from mstar's own code is. Device time is unaffected.
-- A thread in a wait the emulator doesn't know (a plain lock, `Thread.join`, a socket) counts as
+- A thread in a wait the emulator doesn't know (a native/pre-install lock, `Thread.join`, a socket) counts as
   running, so while another thread of the process works, a device wait ends by a real-time timer
   instead of a jump: `--report` counts that time (`slept_s`) and names the call sites
   (`jump_blockers`). A process with no thread doing anything is parked (it counts as blocked)
   after a look of up to 50 ms; work done with no clock read can hide for that long
   (`unparks_by_look`).
+- Post-install `threading.Lock` uses registered Condition waiters, including separate contenders
+  and timeouts. Pre-install aliases, `_thread.allocate_lock` and `RLock` stay native. The adapter
+  supports the Python lock protocol, not `_thread.LockType` identity or C-extension mutex ABI;
+  try-acquire may briefly serialize on its private guard. Fork preserves held state and discards
+  vanished contenders; user after-child callbacks registered before the simulator must not use
+  inherited adapters before its repair hook runs. Arbitrary tracing exceptions between Python
+  state updates do not have a native mutex's atomicity.
 - Processes agree on one time through a table named by the server's port or, with no port in the
   command, by the launch, so a launch's processes always agree. Run a client with
   `python -m mstar_sim -- -m benchmark.runner --url ...` to read the server's time (`MSTAR_SIM_NODE`

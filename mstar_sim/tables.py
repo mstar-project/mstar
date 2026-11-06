@@ -39,6 +39,7 @@ first query.
 
 from __future__ import annotations
 
+import _thread
 import bisect
 import glob
 import hashlib
@@ -46,7 +47,6 @@ import json
 import math
 import os
 import re
-import threading
 from collections.abc import Callable
 
 import numpy as np
@@ -102,7 +102,7 @@ class Tables:
         self.system = SYSTEMS.get(gpu.name)
         self._raw: dict[str, np.ndarray] | None = None
         self._built: dict[str, object] = {}
-        self._lock = threading.Lock()
+        self._lock = _thread.allocate_lock()
 
     # ------------------------------------------------------------- queries
 
