@@ -333,6 +333,7 @@
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.higgs_audio.config.html">mstar.model.higgs_audio.config</a></li>
 </ul>
 </details></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.model.keys.html">mstar.model.keys</a></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="mstar.model.kokoro.html">mstar.model.kokoro</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.kokoro.config.html">mstar.model.kokoro.config</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.kokoro.g2p.html">mstar.model.kokoro.g2p</a></li>
@@ -350,6 +351,12 @@
 </details></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.model.media_limits.html">mstar.model.media_limits</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.model.multimodal.html">mstar.model.multimodal</a></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="mstar.model.muse.html">mstar.model.muse</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.muse.components.html">mstar.model.muse.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.muse.config.html">mstar.model.muse.config</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.muse.processing.html">mstar.model.muse.processing</a></li>
+</ul>
+</details></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="mstar.model.nemotron_duplex.html">mstar.model.nemotron_duplex</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.nemotron_duplex.components.html">mstar.model.nemotron_duplex.components</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.nemotron_duplex.realtime_api.html">mstar.model.nemotron_duplex.realtime_api</a></li>
@@ -713,9 +720,7 @@
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.qwen3_5.video.expand_video_pads"><code class="docutils literal notranslate"><span class="pre">expand_video_pads()</span></code></a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.qwen3_5.video.expand_video_parts"><code class="docutils literal notranslate"><span class="pre">expand_video_parts()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.qwen3_5.video.ffmpeg_unavailable"><code class="docutils literal notranslate"><span class="pre">ffmpeg_unavailable()</span></code></a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.qwen3_5.video.group_owners"><code class="docutils literal notranslate"><span class="pre">group_owners()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.qwen3_5.video.group_timestamps"><code class="docutils literal notranslate"><span class="pre">group_timestamps()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.qwen3_5.video.sample_video"><code class="docutils literal notranslate"><span class="pre">sample_video()</span></code></a></li>
 </ul>
@@ -746,14 +751,8 @@ tested without Triton.</p>
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.qwen3_5.video.expand_video_pads" title="mstar.model.qwen3_5.video.expand_video_pads"><code class="xref py py-obj docutils literal notranslate"><span class="pre">expand_video_pads</span></code></a>(text, pad, start, end, ...)</p></td>
 <td><p>Replace the nth <code class="docutils literal notranslate"><span class="pre">pad</span></code> in <code class="docutils literal notranslate"><span class="pre">text</span></code> with the nth video's groups.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.qwen3_5.video.expand_video_parts" title="mstar.model.qwen3_5.video.expand_video_parts"><code class="xref py py-obj docutils literal notranslate"><span class="pre">expand_video_parts</span></code></a>(parts, groups)</p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">parts</span></code> with each video as text, group, text, ..., group, text.</p></td>
-</tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.qwen3_5.video.ffmpeg_unavailable" title="mstar.model.qwen3_5.video.ffmpeg_unavailable"><code class="xref py py-obj docutils literal notranslate"><span class="pre">ffmpeg_unavailable</span></code></a>()</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.qwen3_5.video.ffmpeg_unavailable" title="mstar.model.qwen3_5.video.ffmpeg_unavailable"><code class="xref py py-obj docutils literal notranslate"><span class="pre">ffmpeg_unavailable</span></code></a>()</p></td>
 <td><p>Why torchcodec can't decode video in this process, or None if it can.</p></td>
-</tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.qwen3_5.video.group_owners" title="mstar.model.qwen3_5.video.group_owners"><code class="xref py py-obj docutils literal notranslate"><span class="pre">group_owners</span></code></a>(groups)</p></td>
-<td><p>The video each group (numbered across all videos) belongs to.</p></td>
 </tr>
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.qwen3_5.video.group_timestamps" title="mstar.model.qwen3_5.video.group_timestamps"><code class="xref py py-obj docutils literal notranslate"><span class="pre">group_timestamps</span></code></a>(frames_indices, fps, ...)</p></td>
 <td><p>Seconds per temporal group: the mean of its first and last frame's time.</p></td>
@@ -841,8 +840,8 @@ tested without Triton.</p>
 <dt class="sig sig-object py" id="mstar.model.qwen3_5.video.expand_video_pads">
 <span class="sig-prename descclassname"><span class="pre">mstar.model.qwen3_5.video.</span></span><span class="sig-name descname"><span class="pre">expand_video_pads</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">text</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">pad</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">start</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">end</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">timestamps</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/qwen3_5/video.html#expand_video_pads"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.qwen3_5.video.expand_video_pads" title="Link to this definition">#</a></dt>
 <dd><p>Replace the nth <code class="docutils literal notranslate"><span class="pre">pad</span></code> in <code class="docutils literal notranslate"><span class="pre">text</span></code> with the nth video’s groups.</p>
-<p>One pad per group: <cite>find_media_spans</cite> reads each group back as a span and
-the vision walk inserts its embeddings, as for an image.</p>
+<p>One pad per group, expanded to the group’s tokens afterwards
+(<cite>expand_media_pads</cite>), as an image’s pad is.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
@@ -860,48 +859,12 @@ the vision walk inserts its embeddings, as for an image.</p>
 </dd></dl>
 
 <dl class="py function">
-<dt class="sig sig-object py" id="mstar.model.qwen3_5.video.expand_video_parts">
-<span class="sig-prename descclassname"><span class="pre">mstar.model.qwen3_5.video.</span></span><span class="sig-name descname"><span class="pre">expand_video_parts</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">parts</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">groups</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/qwen3_5/video.html#expand_video_parts"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.qwen3_5.video.expand_video_parts" title="Link to this definition">#</a></dt>
-<dd><p><code class="docutils literal notranslate"><span class="pre">parts</span></code> with each video as text, group, text, …, group, text.</p>
-<p>The prefill plan’s view of <cite>expand_video_pads</cite>: the text around each group
-is the outer sentinel and the timestamps, so a video always has text on
-both sides, and <cite>prefill_plan</cite> merges it with the user’s text next to it.
-Video parts are renumbered per group, as <cite>find_media_spans</cite> numbers spans.
-A video with no entry in <code class="docutils literal notranslate"><span class="pre">groups</span></code> expands to nothing.</p>
-<dl class="field-list simple">
-<dt class="field-odd">Parameters<span class="colon">:</span></dt>
-<dd class="field-odd"><ul class="simple">
-<li><p><strong>parts</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference internal" href="mstar.model.multimodal.html#mstar.model.multimodal.PromptPart" title="mstar.model.multimodal.PromptPart"><em>PromptPart</em></a><em>]</em>)</p></li>
-<li><p><strong>groups</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Sequence" title="(in Python v3.12)"><em>Sequence</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em>)</p></li>
-</ul>
-</dd>
-<dt class="field-even">Return type<span class="colon">:</span></dt>
-<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)">list</a>[<a class="reference internal" href="mstar.model.multimodal.html#mstar.model.multimodal.PromptPart" title="mstar.model.multimodal.PromptPart"><em>PromptPart</em></a>]</p>
-</dd>
-</dl>
-</dd></dl>
-
-<dl class="py function">
 <dt class="sig sig-object py" id="mstar.model.qwen3_5.video.ffmpeg_unavailable">
 <span class="sig-prename descclassname"><span class="pre">mstar.model.qwen3_5.video.</span></span><span class="sig-name descname"><span class="pre">ffmpeg_unavailable</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/qwen3_5/video.html#ffmpeg_unavailable"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.qwen3_5.video.ffmpeg_unavailable" title="Link to this definition">#</a></dt>
 <dd><p>Why torchcodec can’t decode video in this process, or None if it can.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Return type<span class="colon">:</span></dt>
 <dd class="field-odd"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)">str</a> | None</p>
-</dd>
-</dl>
-</dd></dl>
-
-<dl class="py function">
-<dt class="sig sig-object py" id="mstar.model.qwen3_5.video.group_owners">
-<span class="sig-prename descclassname"><span class="pre">mstar.model.qwen3_5.video.</span></span><span class="sig-name descname"><span class="pre">group_owners</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">groups</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/qwen3_5/video.html#group_owners"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.qwen3_5.video.group_owners" title="Link to this definition">#</a></dt>
-<dd><p>The video each group (numbered across all videos) belongs to.</p>
-<dl class="field-list simple">
-<dt class="field-odd">Parameters<span class="colon">:</span></dt>
-<dd class="field-odd"><p><strong>groups</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Sequence" title="(in Python v3.12)"><em>Sequence</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em>)</p>
-</dd>
-<dt class="field-even">Return type<span class="colon">:</span></dt>
-<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)">list</a>[<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)">int</a>]</p>
 </dd>
 </dl>
 </dd></dl>
@@ -1008,9 +971,7 @@ decoder for the same reason.</p>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.qwen3_5.video.expand_video_pads"><code class="docutils literal notranslate"><span class="pre">expand_video_pads()</span></code></a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.qwen3_5.video.expand_video_parts"><code class="docutils literal notranslate"><span class="pre">expand_video_parts()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.qwen3_5.video.ffmpeg_unavailable"><code class="docutils literal notranslate"><span class="pre">ffmpeg_unavailable()</span></code></a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.qwen3_5.video.group_owners"><code class="docutils literal notranslate"><span class="pre">group_owners()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.qwen3_5.video.group_timestamps"><code class="docutils literal notranslate"><span class="pre">group_timestamps()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.qwen3_5.video.sample_video"><code class="docutils literal notranslate"><span class="pre">sample_video()</span></code></a></li>
 </ul>

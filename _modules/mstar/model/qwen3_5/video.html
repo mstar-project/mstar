@@ -686,6 +686,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.higgs_audio.config.html">mstar.model.higgs_audio.config</a></li>
 </ul>
 </details></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.model.keys.html">mstar.model.keys</a></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="../../../../_autosummary/mstar.model.kokoro.html">mstar.model.kokoro</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.kokoro.config.html">mstar.model.kokoro.config</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.kokoro.g2p.html">mstar.model.kokoro.g2p</a></li>
@@ -703,6 +704,12 @@ window.runMermaid = runMermaid;</script>
 </details></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.model.media_limits.html">mstar.model.media_limits</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.model.multimodal.html">mstar.model.multimodal</a></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="../../../../_autosummary/mstar.model.muse.html">mstar.model.muse</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.muse.components.html">mstar.model.muse.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.muse.config.html">mstar.model.muse.config</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.muse.processing.html">mstar.model.muse.processing</a></li>
+</ul>
+</details></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="../../../../_autosummary/mstar.model.nemotron_duplex.html">mstar.model.nemotron_duplex</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.nemotron_duplex.components.html">mstar.model.nemotron_duplex.components</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.nemotron_duplex.realtime_api.html">mstar.model.nemotron_duplex.realtime_api</a></li>
@@ -1012,10 +1019,6 @@ window.runMermaid = runMermaid;</script>
 
 <span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
 
-<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.model.multimodal</span><span class="w"> </span><span class="kn">import</span> <span class="n">TEXT</span><span class="p">,</span> <span class="n">PromptPart</span>
-
-<span class="n">VIDEO</span> <span class="o">=</span> <span class="s2">"video"</span>
-
 
 <div class="viewcode-block" id="SampledVideo">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.model.qwen3_5.video.html#mstar.model.qwen3_5.video.SampledVideo">[docs]</a>
@@ -1143,8 +1146,8 @@ window.runMermaid = runMermaid;</script>
 <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
 <span class="w">    </span><span class="sd">"""Replace the nth ``pad`` in ``text`` with the nth video's groups.</span>
 
-<span class="sd">    One pad per group: `find_media_spans` reads each group back as a span and</span>
-<span class="sd">    the vision walk inserts its embeddings, as for an image.</span>
+<span class="sd">    One pad per group, expanded to the group's tokens afterwards</span>
+<span class="sd">    (`expand_media_pads`), as an image's pad is.</span>
 <span class="sd">    """</span>
     <span class="n">pieces</span> <span class="o">=</span> <span class="n">text</span><span class="o">.</span><span class="n">split</span><span class="p">(</span><span class="n">pad</span><span class="p">)</span>
     <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">pieces</span><span class="p">)</span> <span class="o">!=</span> <span class="nb">len</span><span class="p">(</span><span class="n">timestamps</span><span class="p">)</span> <span class="o">+</span> <span class="mi">1</span><span class="p">:</span>
@@ -1157,43 +1160,6 @@ window.runMermaid = runMermaid;</script>
         <span class="n">out</span> <span class="o">+=</span> <span class="p">[</span><span class="sa">f</span><span class="s2">"&lt;</span><span class="si">{</span><span class="n">t</span><span class="si">:</span><span class="s2">.1f</span><span class="si">}</span><span class="s2"> seconds&gt;</span><span class="si">{</span><span class="n">start</span><span class="si">}{</span><span class="n">pad</span><span class="si">}{</span><span class="n">end</span><span class="si">}</span><span class="s2">"</span> <span class="k">for</span> <span class="n">t</span> <span class="ow">in</span> <span class="n">times</span><span class="p">]</span>
         <span class="n">out</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">after</span><span class="p">)</span>
     <span class="k">return</span> <span class="s2">""</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">out</span><span class="p">)</span></div>
-
-
-
-<div class="viewcode-block" id="expand_video_parts">
-<a class="viewcode-back" href="../../../../_autosummary/mstar.model.qwen3_5.video.html#mstar.model.qwen3_5.video.expand_video_parts">[docs]</a>
-<span class="k">def</span><span class="w"> </span><span class="nf">expand_video_parts</span><span class="p">(</span>
-    <span class="n">parts</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">PromptPart</span><span class="p">],</span> <span class="n">groups</span><span class="p">:</span> <span class="n">Sequence</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span>
-<span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="n">PromptPart</span><span class="p">]:</span>
-<span class="w">    </span><span class="sd">"""``parts`` with each video as text, group, text, ..., group, text.</span>
-
-<span class="sd">    The prefill plan's view of `expand_video_pads`: the text around each group</span>
-<span class="sd">    is the outer sentinel and the timestamps, so a video always has text on</span>
-<span class="sd">    both sides, and `prefill_plan` merges it with the user's text next to it.</span>
-<span class="sd">    Video parts are renumbered per group, as `find_media_spans` numbers spans.</span>
-<span class="sd">    A video with no entry in ``groups`` expands to nothing.</span>
-<span class="sd">    """</span>
-    <span class="n">out</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">PromptPart</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span>
-    <span class="n">group</span> <span class="o">=</span> <span class="mi">0</span>
-    <span class="k">for</span> <span class="n">part</span> <span class="ow">in</span> <span class="n">parts</span><span class="p">:</span>
-        <span class="k">if</span> <span class="n">part</span><span class="o">.</span><span class="n">modality</span> <span class="o">!=</span> <span class="n">VIDEO</span><span class="p">:</span>
-            <span class="n">out</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">part</span><span class="p">)</span>
-            <span class="k">continue</span>
-        <span class="n">n</span> <span class="o">=</span> <span class="n">groups</span><span class="p">[</span><span class="n">part</span><span class="o">.</span><span class="n">index</span><span class="p">]</span> <span class="k">if</span> <span class="n">part</span><span class="o">.</span><span class="n">index</span> <span class="o">&lt;</span> <span class="nb">len</span><span class="p">(</span><span class="n">groups</span><span class="p">)</span> <span class="k">else</span> <span class="mi">0</span>
-        <span class="k">for</span> <span class="n">g</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">n</span><span class="p">):</span>
-            <span class="n">out</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">PromptPart</span><span class="p">(</span><span class="n">modality</span><span class="o">=</span><span class="n">TEXT</span><span class="p">))</span>
-            <span class="n">out</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">PromptPart</span><span class="p">(</span><span class="n">modality</span><span class="o">=</span><span class="n">VIDEO</span><span class="p">,</span> <span class="n">index</span><span class="o">=</span><span class="n">group</span> <span class="o">+</span> <span class="n">g</span><span class="p">))</span>
-        <span class="n">out</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">PromptPart</span><span class="p">(</span><span class="n">modality</span><span class="o">=</span><span class="n">TEXT</span><span class="p">))</span>
-        <span class="n">group</span> <span class="o">+=</span> <span class="n">n</span>
-    <span class="k">return</span> <span class="n">out</span></div>
-
-
-
-<div class="viewcode-block" id="group_owners">
-<a class="viewcode-back" href="../../../../_autosummary/mstar.model.qwen3_5.video.html#mstar.model.qwen3_5.video.group_owners">[docs]</a>
-<span class="k">def</span><span class="w"> </span><span class="nf">group_owners</span><span class="p">(</span><span class="n">groups</span><span class="p">:</span> <span class="n">Sequence</span><span class="p">[</span><span class="nb">int</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]:</span>
-<span class="w">    </span><span class="sd">"""The video each group (numbered across all videos) belongs to."""</span>
-    <span class="k">return</span> <span class="p">[</span><span class="n">v</span> <span class="k">for</span> <span class="n">v</span><span class="p">,</span> <span class="n">n</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="n">groups</span><span class="p">)</span> <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">n</span><span class="p">)]</span></div>
 
 </pre></div>
 

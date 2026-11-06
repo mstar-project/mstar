@@ -686,6 +686,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.higgs_audio.config.html">mstar.model.higgs_audio.config</a></li>
 </ul>
 </details></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.model.keys.html">mstar.model.keys</a></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="../../../_autosummary/mstar.model.kokoro.html">mstar.model.kokoro</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.kokoro.config.html">mstar.model.kokoro.config</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.kokoro.g2p.html">mstar.model.kokoro.g2p</a></li>
@@ -703,6 +704,12 @@ window.runMermaid = runMermaid;</script>
 </details></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.model.media_limits.html">mstar.model.media_limits</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.model.multimodal.html">mstar.model.multimodal</a></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="../../../_autosummary/mstar.model.muse.html">mstar.model.muse</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.muse.components.html">mstar.model.muse.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.muse.config.html">mstar.model.muse.config</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.muse.processing.html">mstar.model.muse.processing</a></li>
+</ul>
+</details></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="../../../_autosummary/mstar.model.nemotron_duplex.html">mstar.model.nemotron_duplex</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.nemotron_duplex.components.html">mstar.model.nemotron_duplex.components</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.nemotron_duplex.realtime_api.html">mstar.model.nemotron_duplex.realtime_api</a></li>
@@ -1012,13 +1019,23 @@ window.runMermaid = runMermaid;</script>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">__future__</span><span class="w"> </span><span class="kn">import</span> <span class="n">annotations</span>
 
-<span class="kn">from</span><span class="w"> </span><span class="nn">collections.abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">Iterable</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">NamedTuple</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">collections.abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">Iterable</span><span class="p">,</span> <span class="n">Mapping</span><span class="p">,</span> <span class="n">Sequence</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span><span class="p">,</span> <span class="n">field</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">TYPE_CHECKING</span><span class="p">,</span> <span class="n">NamedTuple</span>
 
 <span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
 
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.graph.base</span><span class="w"> </span><span class="kn">import</span> <span class="n">GraphEdge</span><span class="p">,</span> <span class="n">GraphNode</span><span class="p">,</span> <span class="n">GraphSection</span><span class="p">,</span> <span class="n">Loop</span><span class="p">,</span> <span class="n">Parallel</span><span class="p">,</span> <span class="n">Sequential</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.graph.special_destinations</span><span class="w"> </span><span class="kn">import</span> <span class="n">EMIT_TO_CLIENT</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.model.keys</span><span class="w"> </span><span class="kn">import</span> <span class="n">MIXED</span>
+
+<span class="k">if</span> <span class="n">TYPE_CHECKING</span><span class="p">:</span>
+    <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.conductor.request_info</span><span class="w"> </span><span class="kn">import</span> <span class="n">CurrentForwardConductorMetadata</span>
+    <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.graph.base</span><span class="w"> </span><span class="kn">import</span> <span class="n">TensorPointerInfo</span>
+    <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.model.base</span><span class="w"> </span><span class="kn">import</span> <span class="n">ForwardPassArgs</span>
+
 <span class="n">TEXT</span> <span class="o">=</span> <span class="s2">"text"</span>
+<span class="n">VIDEO</span> <span class="o">=</span> <span class="s2">"video"</span>
 
 
 <div class="viewcode-block" id="PromptPart">
@@ -1292,6 +1309,413 @@ window.runMermaid = runMermaid;</script>
             <span class="sa">f</span><span class="s2">"multimodal placement mismatch: planned </span><span class="si">{</span><span class="n">planned_text</span><span class="si">}</span><span class="s2"> text spans, "</span>
             <span class="sa">f</span><span class="s2">"prompt has </span><span class="si">{</span><span class="n">n_text</span><span class="si">}</span><span class="s2">"</span>
         <span class="p">)</span></div>
+
+
+
+<div class="viewcode-block" id="as_uint8_chw">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.multimodal.html#mstar.model.multimodal.as_uint8_chw">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">as_uint8_chw</span><span class="p">(</span><span class="n">image</span><span class="p">,</span> <span class="n">truncate</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""``(3, H, W)`` uint8 RGB on the CPU from what the data worker sends: a</span>
+<span class="sd">    ``(C, H, W)`` tensor, float in [0, 1] (rounded to the nearest level, or</span>
+<span class="sd">    floored with ``truncate``, as the Qwen3-VL ports were measured with) or</span>
+<span class="sd">    uint8; or a PIL image or ``(H, W[, C])`` numpy array. A tensor's layout is</span>
+<span class="sd">    taken as given, not guessed from its shape. Alpha is dropped, gray</span>
+<span class="sd">    repeated."""</span>
+    <span class="k">if</span> <span class="ow">not</span> <span class="n">torch</span><span class="o">.</span><span class="n">is_tensor</span><span class="p">(</span><span class="n">image</span><span class="p">):</span>
+        <span class="kn">import</span><span class="w"> </span><span class="nn">numpy</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">np</span>
+
+        <span class="k">if</span> <span class="ow">not</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">image</span><span class="p">,</span> <span class="n">np</span><span class="o">.</span><span class="n">ndarray</span><span class="p">):</span>  <span class="c1"># a PIL image</span>
+            <span class="n">image</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">asarray</span><span class="p">(</span><span class="n">image</span><span class="o">.</span><span class="n">convert</span><span class="p">(</span><span class="s2">"RGB"</span><span class="p">))</span>
+        <span class="n">image</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">from_numpy</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">ascontiguousarray</span><span class="p">(</span><span class="n">image</span><span class="p">))</span>
+        <span class="k">if</span> <span class="n">image</span><span class="o">.</span><span class="n">dim</span><span class="p">()</span> <span class="o">==</span> <span class="mi">2</span><span class="p">:</span>
+            <span class="n">image</span> <span class="o">=</span> <span class="n">image</span><span class="p">[</span><span class="o">...</span><span class="p">,</span> <span class="kc">None</span><span class="p">]</span>
+        <span class="n">image</span> <span class="o">=</span> <span class="n">image</span><span class="o">.</span><span class="n">permute</span><span class="p">(</span><span class="mi">2</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">image</span><span class="o">.</span><span class="n">dtype</span><span class="o">.</span><span class="n">is_floating_point</span><span class="p">:</span>
+        <span class="n">levels</span> <span class="o">=</span> <span class="n">image</span> <span class="o">*</span> <span class="mf">255.0</span>
+        <span class="n">image</span> <span class="o">=</span> <span class="p">(</span><span class="n">levels</span> <span class="k">if</span> <span class="n">truncate</span> <span class="k">else</span> <span class="n">levels</span><span class="o">.</span><span class="n">round</span><span class="p">())</span><span class="o">.</span><span class="n">clamp</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="mi">255</span><span class="p">)</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">uint8</span><span class="p">)</span>
+    <span class="n">image</span> <span class="o">=</span> <span class="n">image</span><span class="o">.</span><span class="n">cpu</span><span class="p">()</span>
+    <span class="k">if</span> <span class="n">image</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">==</span> <span class="mi">1</span><span class="p">:</span>
+        <span class="n">image</span> <span class="o">=</span> <span class="n">image</span><span class="o">.</span><span class="n">expand</span><span class="p">(</span><span class="mi">3</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">image</span><span class="p">[:</span><span class="mi">3</span><span class="p">]</span><span class="o">.</span><span class="n">contiguous</span><span class="p">()</span></div>
+
+
+
+<div class="viewcode-block" id="MediaPads">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.multimodal.html#mstar.model.multimodal.MediaPads">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">MediaPads</span><span class="p">(</span><span class="n">NamedTuple</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""A prompt with each media placeholder expanded to its tokens, and where</span>
+<span class="sd">    each expanded run sits. The lists run in prompt order, one entry a run."""</span>
+
+    <span class="n">ids</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span>
+    <span class="c1"># the run's pad id, and its index among that pad's runs</span>
+    <span class="n">pad</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span>
+    <span class="n">index</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span>
+    <span class="c1"># the run's first pad position in ``ids``, and its length</span>
+    <span class="n">offset</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span>
+    <span class="n">tokens</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span></div>
+
+
+
+<div class="viewcode-block" id="expand_media_pads">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.multimodal.html#mstar.model.multimodal.expand_media_pads">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">expand_media_pads</span><span class="p">(</span>
+    <span class="n">ids</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
+    <span class="n">counts</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="n">Sequence</span><span class="p">[</span><span class="nb">int</span><span class="p">]],</span>
+    <span class="n">sentinels</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">]]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+<span class="p">)</span> <span class="o">-&gt;</span> <span class="n">MediaPads</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""Expand the nth occurrence of each pad id in ``ids`` to ``counts[pad][n]``</span>
+<span class="sd">    pads, wrapped in ``sentinels[pad]`` when given (a template that writes a</span>
+<span class="sd">    bare pad, as the processor's ``replace_*_token`` then wraps it).</span>
+
+<span class="sd">    Raises ``ValueError`` when a pad occurs other than once per count: user</span>
+<span class="sd">    text that spells a placeholder token, or a layout naming an attachment</span>
+<span class="sd">    the request did not carry. ``ids`` are host ids, straight from the</span>
+<span class="sd">    tokenizer.</span>
+<span class="sd">    """</span>
+    <span class="n">sentinels</span> <span class="o">=</span> <span class="n">sentinels</span> <span class="ow">or</span> <span class="p">{}</span>
+    <span class="c1"># a loop over the placeholders, not the tokens: a text-only prompt has none</span>
+    <span class="n">hits</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">isin</span><span class="p">(</span><span class="n">ids</span><span class="p">,</span> <span class="n">ids</span><span class="o">.</span><span class="n">new_tensor</span><span class="p">(</span><span class="nb">list</span><span class="p">(</span><span class="n">counts</span><span class="p">)))</span><span class="o">.</span><span class="n">nonzero</span><span class="p">()</span><span class="o">.</span><span class="n">flatten</span><span class="p">()</span> <span class="k">if</span> <span class="n">counts</span> <span class="k">else</span> <span class="n">ids</span><span class="o">.</span><span class="n">new_empty</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span>
+    <span class="n">seen</span> <span class="o">=</span> <span class="nb">dict</span><span class="o">.</span><span class="n">fromkeys</span><span class="p">(</span><span class="n">counts</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span>
+    <span class="n">pieces</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span>
+    <span class="n">layout</span> <span class="o">=</span> <span class="n">MediaPads</span><span class="p">(</span><span class="n">ids</span><span class="p">,</span> <span class="p">[],</span> <span class="p">[],</span> <span class="p">[],</span> <span class="p">[])</span>
+    <span class="n">cursor</span> <span class="o">=</span> <span class="n">size</span> <span class="o">=</span> <span class="mi">0</span>
+    <span class="k">for</span> <span class="n">i</span><span class="p">,</span> <span class="n">token</span> <span class="ow">in</span> <span class="nb">zip</span><span class="p">(</span><span class="n">hits</span><span class="o">.</span><span class="n">tolist</span><span class="p">(),</span> <span class="n">ids</span><span class="p">[</span><span class="n">hits</span><span class="p">]</span><span class="o">.</span><span class="n">tolist</span><span class="p">(),</span> <span class="n">strict</span><span class="o">=</span><span class="kc">True</span><span class="p">):</span>
+        <span class="n">n</span> <span class="o">=</span> <span class="n">seen</span><span class="p">[</span><span class="n">token</span><span class="p">]</span>
+        <span class="k">if</span> <span class="n">n</span> <span class="o">&gt;=</span> <span class="nb">len</span><span class="p">(</span><span class="n">counts</span><span class="p">[</span><span class="n">token</span><span class="p">]):</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                <span class="sa">f</span><span class="s2">"the prompt holds more placeholders </span><span class="si">{</span><span class="n">token</span><span class="si">}</span><span class="s2"> than the "</span>
+                <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="n">counts</span><span class="p">[</span><span class="n">token</span><span class="p">])</span><span class="si">}</span><span class="s2"> attachments it has tokens for"</span>
+            <span class="p">)</span>
+        <span class="n">seen</span><span class="p">[</span><span class="n">token</span><span class="p">]</span> <span class="o">=</span> <span class="n">n</span> <span class="o">+</span> <span class="mi">1</span>
+        <span class="n">pieces</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">ids</span><span class="p">[</span><span class="n">cursor</span><span class="p">:</span><span class="n">i</span><span class="p">])</span>
+        <span class="n">size</span> <span class="o">+=</span> <span class="n">i</span> <span class="o">-</span> <span class="n">cursor</span>
+        <span class="n">start</span><span class="p">,</span> <span class="n">end</span> <span class="o">=</span> <span class="n">sentinels</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">token</span><span class="p">,</span> <span class="p">(</span><span class="kc">None</span><span class="p">,</span> <span class="kc">None</span><span class="p">))</span>
+        <span class="k">if</span> <span class="n">start</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">pieces</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">ids</span><span class="o">.</span><span class="n">new_tensor</span><span class="p">([</span><span class="n">start</span><span class="p">]))</span>
+            <span class="n">size</span> <span class="o">+=</span> <span class="mi">1</span>
+        <span class="n">tokens</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="n">counts</span><span class="p">[</span><span class="n">token</span><span class="p">][</span><span class="n">n</span><span class="p">])</span>
+        <span class="n">layout</span><span class="o">.</span><span class="n">pad</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">token</span><span class="p">)</span>
+        <span class="n">layout</span><span class="o">.</span><span class="n">index</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">n</span><span class="p">)</span>
+        <span class="n">layout</span><span class="o">.</span><span class="n">offset</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">size</span><span class="p">)</span>
+        <span class="n">layout</span><span class="o">.</span><span class="n">tokens</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">tokens</span><span class="p">)</span>
+        <span class="n">pieces</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">ids</span><span class="o">.</span><span class="n">new_full</span><span class="p">((</span><span class="n">tokens</span><span class="p">,),</span> <span class="n">token</span><span class="p">))</span>
+        <span class="n">size</span> <span class="o">+=</span> <span class="n">tokens</span>
+        <span class="k">if</span> <span class="n">end</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">pieces</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">ids</span><span class="o">.</span><span class="n">new_tensor</span><span class="p">([</span><span class="n">end</span><span class="p">]))</span>
+            <span class="n">size</span> <span class="o">+=</span> <span class="mi">1</span>
+        <span class="n">cursor</span> <span class="o">=</span> <span class="n">i</span> <span class="o">+</span> <span class="mi">1</span>
+    <span class="n">short</span> <span class="o">=</span> <span class="p">{</span><span class="n">pad</span><span class="p">:</span> <span class="p">(</span><span class="n">seen</span><span class="p">[</span><span class="n">pad</span><span class="p">],</span> <span class="nb">len</span><span class="p">(</span><span class="n">c</span><span class="p">))</span> <span class="k">for</span> <span class="n">pad</span><span class="p">,</span> <span class="n">c</span> <span class="ow">in</span> <span class="n">counts</span><span class="o">.</span><span class="n">items</span><span class="p">()</span> <span class="k">if</span> <span class="n">seen</span><span class="p">[</span><span class="n">pad</span><span class="p">]</span> <span class="o">!=</span> <span class="nb">len</span><span class="p">(</span><span class="n">c</span><span class="p">)}</span>
+    <span class="k">if</span> <span class="n">short</span><span class="p">:</span>
+        <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"placeholder counts in the prompt (found, expected) per pad id: </span><span class="si">{</span><span class="n">short</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+    <span class="k">if</span> <span class="ow">not</span> <span class="n">pieces</span><span class="p">:</span>
+        <span class="k">return</span> <span class="n">layout</span>
+    <span class="k">return</span> <span class="n">layout</span><span class="o">.</span><span class="n">_replace</span><span class="p">(</span><span class="n">ids</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">cat</span><span class="p">([</span><span class="o">*</span><span class="n">pieces</span><span class="p">,</span> <span class="n">ids</span><span class="p">[</span><span class="n">cursor</span><span class="p">:]]))</span></div>
+
+
+
+<span class="c1"># ---------------------------------------------------------------------------</span>
+<span class="c1"># The VLM walk set: `prefill_text` for a text-only prompt; for a prompt with</span>
+<span class="c1"># media, one walk that runs the encoders of the media it holds, then the LLM</span>
+<span class="c1"># over the whole prompt as one row; then a `decode` loop. The LLM splices</span>
+<span class="c1"># each encoder's output in at its pads inside its forward (see</span>
+<span class="c1"># `SampledTokenDecoder`).</span>
+<span class="c1"># ---------------------------------------------------------------------------</span>
+
+<span class="c1"># the step metadata key of a media walk's layout (`media_layout`)</span>
+<span class="n">MEDIA_LAYOUT</span> <span class="o">=</span> <span class="s2">"media_layout"</span>
+
+
+<div class="viewcode-block" id="MediaEncoder">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.multimodal.html#mstar.model.multimodal.MediaEncoder">[docs]</a>
+<span class="nd">@dataclass</span><span class="p">(</span><span class="n">frozen</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">MediaEncoder</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""An encoder node of the media walks, as data.</span>
+
+<span class="sd">    ``name`` names the walks (``prefill_vision``, ``prefill_vision_audio``);</span>
+<span class="sd">    ``node`` reads ``inputs`` and sends the LLM ``output``, one row per pad</span>
+<span class="sd">    of ``pad_ids`` in the prompt, in prompt order.</span>
+<span class="sd">    """</span>
+
+    <span class="n">name</span><span class="p">:</span> <span class="nb">str</span>
+    <span class="n">node</span><span class="p">:</span> <span class="nb">str</span>
+    <span class="n">inputs</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="o">...</span><span class="p">]</span>
+    <span class="n">output</span><span class="p">:</span> <span class="nb">str</span>
+    <span class="n">pad_ids</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="o">...</span><span class="p">]</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">__post_init__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">pad_ids</span><span class="p">:</span>
+            <span class="c1"># the splice would have no pad to fill</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"media encoder </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">node</span><span class="si">!r}</span><span class="s2"> names no pad ids"</span><span class="p">)</span>
+
+<div class="viewcode-block" id="MediaEncoder.pads">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.multimodal.html#mstar.model.multimodal.MediaEncoder.pads">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">pads</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">ids</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Which of ``ids`` are this encoder's pads."""</span>
+        <span class="n">pad</span> <span class="o">=</span> <span class="n">ids</span> <span class="o">==</span> <span class="bp">self</span><span class="o">.</span><span class="n">pad_ids</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span>
+        <span class="k">for</span> <span class="n">p</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">pad_ids</span><span class="p">[</span><span class="mi">1</span><span class="p">:]:</span>
+            <span class="n">pad</span> <span class="o">=</span> <span class="n">pad</span> <span class="o">|</span> <span class="p">(</span><span class="n">ids</span> <span class="o">==</span> <span class="n">p</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">pad</span></div>
+</div>
+
+
+
+<div class="viewcode-block" id="splice_media">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.multimodal.html#mstar.model.multimodal.splice_media">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">splice_media</span><span class="p">(</span><span class="n">embeds</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">pad</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">media</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""``embeds`` with the nth token that ``pad`` marks replaced by ``media[n]``,</span>
+<span class="sd">    an index past the end taking the last row. Static shapes and no host sync,</span>
+<span class="sd">    so it runs inside a captured forward."""</span>
+    <span class="n">index</span> <span class="o">=</span> <span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">cumsum</span><span class="p">(</span><span class="n">pad</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span> <span class="o">-</span> <span class="mi">1</span><span class="p">)</span><span class="o">.</span><span class="n">clamp_</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">media</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">-</span> <span class="mi">1</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">torch</span><span class="o">.</span><span class="n">where</span><span class="p">(</span><span class="n">pad</span><span class="p">[:,</span> <span class="kc">None</span><span class="p">],</span> <span class="n">media</span><span class="p">[</span><span class="n">index</span><span class="p">]</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">embeds</span><span class="o">.</span><span class="n">dtype</span><span class="p">),</span> <span class="n">embeds</span><span class="p">)</span></div>
+
+
+
+<div class="viewcode-block" id="vision_encoder">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.multimodal.html#mstar.model.multimodal.vision_encoder">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">vision_encoder</span><span class="p">(</span><span class="n">pad_ids</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="o">...</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="n">MediaEncoder</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""The ``vision_encoder`` node every VLM here declares."""</span>
+    <span class="k">return</span> <span class="n">MediaEncoder</span><span class="p">(</span><span class="s2">"vision"</span><span class="p">,</span> <span class="s2">"vision_encoder"</span><span class="p">,</span> <span class="p">(</span><span class="s2">"pixel_values"</span><span class="p">,),</span> <span class="s2">"vision_embeds"</span><span class="p">,</span> <span class="n">pad_ids</span><span class="p">)</span></div>
+
+
+
+<div class="viewcode-block" id="media_walk_name">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.multimodal.html#mstar.model.multimodal.media_walk_name">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">media_walk_name</span><span class="p">(</span><span class="n">encoders</span><span class="p">:</span> <span class="n">Sequence</span><span class="p">[</span><span class="n">MediaEncoder</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
+    <span class="k">return</span> <span class="s2">"prefill_"</span> <span class="o">+</span> <span class="s2">"_"</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">e</span><span class="o">.</span><span class="n">name</span> <span class="k">for</span> <span class="n">e</span> <span class="ow">in</span> <span class="n">encoders</span><span class="p">)</span></div>
+
+
+
+<div class="viewcode-block" id="media_walk_names">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.multimodal.html#mstar.model.multimodal.media_walk_names">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">media_walk_names</span><span class="p">(</span><span class="n">encoders</span><span class="p">:</span> <span class="n">Sequence</span><span class="p">[</span><span class="n">MediaEncoder</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]:</span>
+<span class="w">    </span><span class="sd">"""One walk per non-empty subset of ``encoders``, in declaration order."""</span>
+    <span class="k">return</span> <span class="p">[</span>
+        <span class="n">media_walk_name</span><span class="p">([</span><span class="n">e</span> <span class="k">for</span> <span class="n">i</span><span class="p">,</span> <span class="n">e</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="n">encoders</span><span class="p">)</span> <span class="k">if</span> <span class="n">mask</span> <span class="o">&gt;&gt;</span> <span class="n">i</span> <span class="o">&amp;</span> <span class="mi">1</span><span class="p">])</span>
+        <span class="k">for</span> <span class="n">mask</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">1</span> <span class="o">&lt;&lt;</span> <span class="nb">len</span><span class="p">(</span><span class="n">encoders</span><span class="p">))</span>
+    <span class="p">]</span></div>
+
+
+
+<div class="viewcode-block" id="media_layout">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.multimodal.html#mstar.model.multimodal.media_layout">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">media_layout</span><span class="p">(</span>
+    <span class="n">pads</span><span class="p">:</span> <span class="n">MediaPads</span><span class="p">,</span>
+    <span class="n">output_of</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">str</span><span class="p">],</span>
+    <span class="n">grids</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="n">Sequence</span><span class="p">[</span><span class="n">Sequence</span><span class="p">[</span><span class="nb">int</span><span class="p">]]]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+<span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">list</span><span class="p">]:</span>
+<span class="w">    </span><span class="sd">"""A media walk's ``MEDIA_LAYOUT`` step metadata, columnar: each run's</span>
+<span class="sd">    ``offset`` and ``tokens``, the encoder ``output`` it is read from, and</span>
+<span class="sd">    its patch ``grid`` (``[]`` for media without one). Plain lists: it rides</span>
+<span class="sd">    the step's control message, so every node of the walk reads it on the</span>
+<span class="sd">    host (`media_grids`)."""</span>
+    <span class="n">grids</span> <span class="o">=</span> <span class="n">grids</span> <span class="ow">or</span> <span class="p">{}</span>
+    <span class="k">return</span> <span class="p">{</span>
+        <span class="s2">"offset"</span><span class="p">:</span> <span class="nb">list</span><span class="p">(</span><span class="n">pads</span><span class="o">.</span><span class="n">offset</span><span class="p">),</span>
+        <span class="s2">"tokens"</span><span class="p">:</span> <span class="nb">list</span><span class="p">(</span><span class="n">pads</span><span class="o">.</span><span class="n">tokens</span><span class="p">),</span>
+        <span class="s2">"output"</span><span class="p">:</span> <span class="p">[</span><span class="n">output_of</span><span class="p">[</span><span class="n">p</span><span class="p">]</span> <span class="k">for</span> <span class="n">p</span> <span class="ow">in</span> <span class="n">pads</span><span class="o">.</span><span class="n">pad</span><span class="p">],</span>
+        <span class="s2">"grid"</span><span class="p">:</span> <span class="p">[</span>
+            <span class="p">[</span><span class="nb">int</span><span class="p">(</span><span class="n">v</span><span class="p">)</span> <span class="k">for</span> <span class="n">v</span> <span class="ow">in</span> <span class="n">grids</span><span class="p">[</span><span class="n">p</span><span class="p">][</span><span class="n">i</span><span class="p">]]</span> <span class="k">if</span> <span class="n">p</span> <span class="ow">in</span> <span class="n">grids</span> <span class="k">else</span> <span class="p">[]</span>
+            <span class="k">for</span> <span class="n">p</span><span class="p">,</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">zip</span><span class="p">(</span><span class="n">pads</span><span class="o">.</span><span class="n">pad</span><span class="p">,</span> <span class="n">pads</span><span class="o">.</span><span class="n">index</span><span class="p">,</span> <span class="n">strict</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+        <span class="p">],</span>
+    <span class="p">}</span></div>
+
+
+
+<div class="viewcode-block" id="media_grids">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.multimodal.html#mstar.model.multimodal.media_grids">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">media_grids</span><span class="p">(</span><span class="n">layout</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">,</span> <span class="n">output</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">]]:</span>
+<span class="w">    </span><span class="sd">"""The patch grid of each run a ``MEDIA_LAYOUT`` fills from encoder output</span>
+<span class="sd">    ``output``, in prompt order."""</span>
+    <span class="k">return</span> <span class="p">[</span>
+        <span class="nb">tuple</span><span class="p">(</span><span class="n">grid</span><span class="p">)</span> <span class="k">for</span> <span class="n">grid</span><span class="p">,</span> <span class="n">out</span> <span class="ow">in</span> <span class="nb">zip</span><span class="p">(</span><span class="n">layout</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"grid"</span><span class="p">,</span> <span class="p">()),</span> <span class="n">layout</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"output"</span><span class="p">,</span> <span class="p">()),</span> <span class="n">strict</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">out</span> <span class="o">==</span> <span class="n">output</span>
+    <span class="p">]</span></div>
+
+
+
+<div class="viewcode-block" id="media_encoders">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.multimodal.html#mstar.model.multimodal.media_encoders">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">media_encoders</span><span class="p">(</span><span class="n">encoders</span><span class="p">:</span> <span class="n">Sequence</span><span class="p">[</span><span class="n">MediaEncoder</span><span class="p">],</span> <span class="n">layout</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="n">MediaEncoder</span><span class="p">]:</span>
+<span class="w">    </span><span class="sd">"""The encoders a prompt's ``MEDIA_LAYOUT`` runs, in declaration order:</span>
+<span class="sd">    those whose output fills one of its runs. Both the prefill walk and</span>
+<span class="sd">    the KV layout read this, so they name the same walk."""</span>
+    <span class="n">outputs</span> <span class="o">=</span> <span class="nb">set</span><span class="p">(</span><span class="n">layout</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"output"</span><span class="p">,</span> <span class="p">()))</span>
+    <span class="k">return</span> <span class="p">[</span><span class="n">e</span> <span class="k">for</span> <span class="n">e</span> <span class="ow">in</span> <span class="n">encoders</span> <span class="k">if</span> <span class="n">e</span><span class="o">.</span><span class="n">output</span> <span class="ow">in</span> <span class="n">outputs</span><span class="p">]</span></div>
+
+
+
+<div class="viewcode-block" id="media_walks">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.multimodal.html#mstar.model.multimodal.media_walks">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">media_walks</span><span class="p">(</span>
+    <span class="n">max_iters</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">encoders</span><span class="p">:</span> <span class="n">Sequence</span><span class="p">[</span><span class="n">MediaEncoder</span><span class="p">]</span> <span class="o">=</span> <span class="p">(),</span>
+<span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">GraphSection</span><span class="p">]:</span>
+<span class="w">    </span><span class="sd">"""``prefill_text``, one media walk per subset of ``encoders``, and</span>
+<span class="sd">    ``decode``, over the ``LLM`` node and the encoders. ``max_iters`` bounds</span>
+<span class="sd">    the decode loop; it is a safety bound, not the per-request budget."""</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">emit_first_token</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="n">GraphEdge</span><span class="p">:</span>
+        <span class="k">return</span> <span class="n">GraphEdge</span><span class="p">(</span>
+            <span class="n">next_node</span><span class="o">=</span><span class="n">EMIT_TO_CLIENT</span><span class="p">,</span> <span class="n">name</span><span class="o">=</span><span class="s2">"new_token"</span><span class="p">,</span> <span class="n">persist</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">output_modality</span><span class="o">=</span><span class="s2">"text"</span><span class="p">,</span>
+        <span class="p">)</span>
+
+    <span class="n">walks</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">GraphSection</span><span class="p">]</span> <span class="o">=</span> <span class="p">{</span>
+        <span class="s2">"prefill_text"</span><span class="p">:</span> <span class="n">GraphNode</span><span class="p">(</span><span class="n">name</span><span class="o">=</span><span class="s2">"LLM"</span><span class="p">,</span> <span class="n">input_names</span><span class="o">=</span><span class="p">[</span><span class="s2">"text_inputs"</span><span class="p">],</span> <span class="n">outputs</span><span class="o">=</span><span class="p">[</span><span class="n">emit_first_token</span><span class="p">()]),</span>
+    <span class="p">}</span>
+    <span class="k">for</span> <span class="n">mask</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">1</span> <span class="o">&lt;&lt;</span> <span class="nb">len</span><span class="p">(</span><span class="n">encoders</span><span class="p">)):</span>
+        <span class="n">present</span> <span class="o">=</span> <span class="p">[</span><span class="n">e</span> <span class="k">for</span> <span class="n">i</span><span class="p">,</span> <span class="n">e</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="n">encoders</span><span class="p">)</span> <span class="k">if</span> <span class="n">mask</span> <span class="o">&gt;&gt;</span> <span class="n">i</span> <span class="o">&amp;</span> <span class="mi">1</span><span class="p">]</span>
+        <span class="n">nodes</span> <span class="o">=</span> <span class="p">[</span>
+            <span class="n">GraphNode</span><span class="p">(</span>
+                <span class="n">name</span><span class="o">=</span><span class="n">e</span><span class="o">.</span><span class="n">node</span><span class="p">,</span> <span class="n">input_names</span><span class="o">=</span><span class="nb">list</span><span class="p">(</span><span class="n">e</span><span class="o">.</span><span class="n">inputs</span><span class="p">),</span>
+                <span class="n">outputs</span><span class="o">=</span><span class="p">[</span><span class="n">GraphEdge</span><span class="p">(</span><span class="n">next_node</span><span class="o">=</span><span class="s2">"LLM"</span><span class="p">,</span> <span class="n">name</span><span class="o">=</span><span class="n">e</span><span class="o">.</span><span class="n">output</span><span class="p">)],</span>
+            <span class="p">)</span>
+            <span class="k">for</span> <span class="n">e</span> <span class="ow">in</span> <span class="n">present</span>
+        <span class="p">]</span>
+        <span class="n">walks</span><span class="p">[</span><span class="n">media_walk_name</span><span class="p">(</span><span class="n">present</span><span class="p">)]</span> <span class="o">=</span> <span class="n">Sequential</span><span class="p">([</span>
+            <span class="n">nodes</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">nodes</span><span class="p">)</span> <span class="o">==</span> <span class="mi">1</span> <span class="k">else</span> <span class="n">Parallel</span><span class="p">(</span><span class="n">nodes</span><span class="p">),</span>
+            <span class="n">GraphNode</span><span class="p">(</span>
+                <span class="n">name</span><span class="o">=</span><span class="s2">"LLM"</span><span class="p">,</span>
+                <span class="n">input_names</span><span class="o">=</span><span class="p">[</span><span class="s2">"text_inputs"</span><span class="p">,</span> <span class="o">*</span><span class="p">(</span><span class="n">e</span><span class="o">.</span><span class="n">output</span> <span class="k">for</span> <span class="n">e</span> <span class="ow">in</span> <span class="n">present</span><span class="p">)],</span>
+                <span class="n">outputs</span><span class="o">=</span><span class="p">[</span><span class="n">emit_first_token</span><span class="p">()],</span>
+            <span class="p">),</span>
+        <span class="p">])</span>
+    <span class="n">walks</span><span class="p">[</span><span class="s2">"decode"</span><span class="p">]</span> <span class="o">=</span> <span class="n">Loop</span><span class="p">(</span>
+        <span class="n">name</span><span class="o">=</span><span class="s2">"decode_loop"</span><span class="p">,</span>
+        <span class="n">section</span><span class="o">=</span><span class="n">GraphNode</span><span class="p">(</span>
+            <span class="n">name</span><span class="o">=</span><span class="s2">"LLM"</span><span class="p">,</span>
+            <span class="n">input_names</span><span class="o">=</span><span class="p">[</span><span class="s2">"text_inputs"</span><span class="p">],</span>
+            <span class="n">outputs</span><span class="o">=</span><span class="p">[</span>
+                <span class="n">GraphEdge</span><span class="p">(</span><span class="n">next_node</span><span class="o">=</span><span class="s2">"LLM"</span><span class="p">,</span> <span class="n">name</span><span class="o">=</span><span class="s2">"text_inputs"</span><span class="p">),</span>
+                <span class="n">GraphEdge</span><span class="p">(</span><span class="n">next_node</span><span class="o">=</span><span class="n">EMIT_TO_CLIENT</span><span class="p">,</span> <span class="n">name</span><span class="o">=</span><span class="s2">"text_inputs"</span><span class="p">,</span> <span class="n">output_modality</span><span class="o">=</span><span class="s2">"text"</span><span class="p">),</span>
+            <span class="p">],</span>
+        <span class="p">),</span>
+        <span class="n">max_iters</span><span class="o">=</span><span class="n">max_iters</span><span class="p">,</span>
+        <span class="n">outputs</span><span class="o">=</span><span class="p">[],</span>
+    <span class="p">)</span>
+    <span class="k">return</span> <span class="n">walks</span></div>
+
+
+
+<div class="viewcode-block" id="text_combined_walks">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.multimodal.html#mstar.model.multimodal.text_combined_walks">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">text_combined_walks</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">set</span><span class="p">[</span><span class="nb">str</span><span class="p">]]]:</span>
+<span class="w">    </span><span class="sd">"""Text prefill and decode rows of the ``LLM`` node share a step."""</span>
+    <span class="k">return</span> <span class="p">{</span><span class="s2">"LLM"</span><span class="p">:</span> <span class="p">{</span><span class="n">MIXED</span><span class="p">:</span> <span class="p">{</span><span class="s2">"prefill_text"</span><span class="p">,</span> <span class="s2">"decode"</span><span class="p">}}}</span></div>
+
+
+
+<div class="viewcode-block" id="PrefillStep">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.multimodal.html#mstar.model.multimodal.PrefillStep">[docs]</a>
+<span class="nd">@dataclass</span><span class="p">(</span><span class="n">frozen</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">PrefillStep</span><span class="p">:</span>
+    <span class="n">walk</span><span class="p">:</span> <span class="nb">str</span>
+    <span class="c1"># (node, input name) -&gt; the tensors that input carries</span>
+    <span class="n">input_tensors</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">str</span><span class="p">],</span> <span class="nb">list</span><span class="p">[</span><span class="n">TensorPointerInfo</span><span class="p">]]</span>
+    <span class="c1"># merged into the walk's step metadata</span>
+    <span class="n">metadata</span><span class="p">:</span> <span class="nb">dict</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">dict</span><span class="p">)</span></div>
+
+
+
+<div class="viewcode-block" id="media_prefill_step">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.multimodal.html#mstar.model.multimodal.media_prefill_step">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">media_prefill_step</span><span class="p">(</span>
+    <span class="n">signals</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">list</span><span class="p">[</span><span class="n">TensorPointerInfo</span><span class="p">]],</span>
+    <span class="n">encoders</span><span class="p">:</span> <span class="n">Sequence</span><span class="p">[</span><span class="n">MediaEncoder</span><span class="p">],</span>
+    <span class="n">layout</span><span class="p">:</span> <span class="nb">dict</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+    <span class="o">*</span><span class="p">,</span>
+    <span class="n">model_name</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
+<span class="p">)</span> <span class="o">-&gt;</span> <span class="n">PrefillStep</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""The one prefill walk a request runs over its whole prompt</span>
+<span class="sd">    (``text_inputs``, one tensor): with media in its ``layout``, the walk over</span>
+<span class="sd">    the encoders it runs (`media_encoders`); without, ``prefill_text``."""</span>
+    <span class="n">texts</span> <span class="o">=</span> <span class="n">signals</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"text_inputs"</span><span class="p">,</span> <span class="p">[])</span>
+    <span class="k">if</span> <span class="ow">not</span> <span class="n">texts</span><span class="p">:</span>
+        <span class="c1"># the conductor answers this with a 400</span>
+        <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+            <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">model_name</span><span class="si">}</span><span class="s2"> has nothing to prefill: the request carries no "</span>
+            <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="nb">sorted</span><span class="p">(</span><span class="n">signals</span><span class="p">)</span><span class="w"> </span><span class="ow">or</span><span class="w"> </span><span class="s1">'inputs'</span><span class="si">}</span><span class="s2">. An empty prompt cannot be served."</span>
+        <span class="p">)</span>
+    <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">texts</span><span class="p">)</span> <span class="o">!=</span> <span class="mi">1</span><span class="p">:</span>
+        <span class="c1"># the model's intake renders one prompt; the conductor answers this with a 400</span>
+        <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">model_name</span><span class="si">}</span><span class="s2"> got a prompt as </span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="n">texts</span><span class="p">)</span><span class="si">}</span><span class="s2"> text tensors, not the one whole prompt"</span><span class="p">)</span>
+    <span class="n">present</span> <span class="o">=</span> <span class="n">media_encoders</span><span class="p">(</span><span class="n">encoders</span><span class="p">,</span> <span class="n">layout</span> <span class="ow">or</span> <span class="p">{})</span>
+    <span class="k">if</span> <span class="ow">not</span> <span class="n">present</span><span class="p">:</span>
+        <span class="n">sent</span> <span class="o">=</span> <span class="nb">sorted</span><span class="p">(</span><span class="n">name</span> <span class="k">for</span> <span class="n">e</span> <span class="ow">in</span> <span class="n">encoders</span> <span class="k">for</span> <span class="n">name</span> <span class="ow">in</span> <span class="n">e</span><span class="o">.</span><span class="n">inputs</span> <span class="k">if</span> <span class="n">signals</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">name</span><span class="p">))</span>
+        <span class="k">if</span> <span class="n">sent</span><span class="p">:</span>
+            <span class="c1"># a text prefill would drop them</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">model_name</span><span class="si">}</span><span class="s2"> got </span><span class="si">{</span><span class="n">sent</span><span class="si">}</span><span class="s2"> with no media layout to place them by"</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">PrefillStep</span><span class="p">(</span><span class="s2">"prefill_text"</span><span class="p">,</span> <span class="p">{(</span><span class="s2">"LLM"</span><span class="p">,</span> <span class="s2">"text_inputs"</span><span class="p">):</span> <span class="n">texts</span><span class="p">})</span>
+    <span class="n">inputs</span> <span class="o">=</span> <span class="p">{(</span><span class="s2">"LLM"</span><span class="p">,</span> <span class="s2">"text_inputs"</span><span class="p">):</span> <span class="n">texts</span><span class="p">}</span>
+    <span class="k">for</span> <span class="n">e</span> <span class="ow">in</span> <span class="n">present</span><span class="p">:</span>
+        <span class="k">for</span> <span class="n">name</span> <span class="ow">in</span> <span class="n">e</span><span class="o">.</span><span class="n">inputs</span><span class="p">:</span>
+            <span class="n">inputs</span><span class="p">[(</span><span class="n">e</span><span class="o">.</span><span class="n">node</span><span class="p">,</span> <span class="n">name</span><span class="p">)]</span> <span class="o">=</span> <span class="n">signals</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">name</span><span class="p">,</span> <span class="p">[])</span>
+    <span class="k">return</span> <span class="n">PrefillStep</span><span class="p">(</span><span class="n">media_walk_name</span><span class="p">(</span><span class="n">present</span><span class="p">),</span> <span class="n">inputs</span><span class="p">,</span> <span class="p">{</span><span class="n">MEDIA_LAYOUT</span><span class="p">:</span> <span class="n">layout</span> <span class="ow">or</span> <span class="p">{}})</span></div>
+
+
+
+<div class="viewcode-block" id="walk_input_edges">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.multimodal.html#mstar.model.multimodal.walk_input_edges">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">walk_input_edges</span><span class="p">(</span><span class="n">step</span><span class="p">:</span> <span class="n">PrefillStep</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="n">GraphEdge</span><span class="p">]:</span>
+<span class="w">    </span><span class="sd">"""One edge per (node, input) the step's walk reads."""</span>
+    <span class="n">edges</span> <span class="o">=</span> <span class="p">[]</span>
+    <span class="k">for</span> <span class="p">(</span><span class="n">node</span><span class="p">,</span> <span class="n">name</span><span class="p">),</span> <span class="n">tensors</span> <span class="ow">in</span> <span class="n">step</span><span class="o">.</span><span class="n">input_tensors</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
+        <span class="n">edge</span> <span class="o">=</span> <span class="n">GraphEdge</span><span class="p">(</span><span class="n">next_node</span><span class="o">=</span><span class="n">node</span><span class="p">,</span> <span class="n">name</span><span class="o">=</span><span class="n">name</span><span class="p">)</span>
+        <span class="n">edge</span><span class="o">.</span><span class="n">tensor_info</span> <span class="o">=</span> <span class="nb">list</span><span class="p">(</span><span class="n">tensors</span><span class="p">)</span>
+        <span class="n">edges</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">edge</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">edges</span></div>
+
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">_prefill_args</span><span class="p">(</span>
+    <span class="n">metadata</span><span class="p">:</span> <span class="n">CurrentForwardConductorMetadata</span><span class="p">,</span> <span class="n">inputs</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">GraphEdge</span><span class="p">],</span> <span class="n">step_metadata</span><span class="p">:</span> <span class="nb">dict</span><span class="p">,</span>
+<span class="p">)</span> <span class="o">-&gt;</span> <span class="n">ForwardPassArgs</span><span class="p">:</span>
+    <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.model.base</span><span class="w"> </span><span class="kn">import</span> <span class="n">ForwardPassArgs</span>
+
+    <span class="k">return</span> <span class="n">ForwardPassArgs</span><span class="p">(</span>
+        <span class="n">full_metadata</span><span class="o">=</span><span class="n">metadata</span><span class="p">,</span>
+        <span class="n">inputs</span><span class="o">=</span><span class="n">inputs</span><span class="p">,</span>
+        <span class="n">unpersist_tensors</span><span class="o">=</span><span class="nb">sum</span><span class="p">((</span><span class="n">inp</span><span class="o">.</span><span class="n">tensor_info</span> <span class="k">for</span> <span class="n">inp</span> <span class="ow">in</span> <span class="n">inputs</span><span class="p">),</span> <span class="n">start</span><span class="o">=</span><span class="p">[]),</span>
+        <span class="n">step_metadata</span><span class="o">=</span><span class="p">{</span><span class="s2">"is_prefill"</span><span class="p">:</span> <span class="n">metadata</span><span class="o">.</span><span class="n">is_prefill</span><span class="p">,</span> <span class="o">**</span><span class="n">step_metadata</span><span class="p">},</span>
+    <span class="p">)</span>
+
+
+<div class="viewcode-block" id="initial_prefill_args">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.multimodal.html#mstar.model.multimodal.initial_prefill_args">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">initial_prefill_args</span><span class="p">(</span>
+    <span class="n">step</span><span class="p">:</span> <span class="n">PrefillStep</span><span class="p">,</span> <span class="n">input_modalities</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">],</span> <span class="n">output_modalities</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">],</span>
+<span class="p">)</span> <span class="o">-&gt;</span> <span class="n">ForwardPassArgs</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""The prefill walk; `next_prefill_args` takes it from there."""</span>
+    <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.conductor.request_info</span><span class="w"> </span><span class="kn">import</span> <span class="n">CurrentForwardConductorMetadata</span>
+
+    <span class="n">metadata</span> <span class="o">=</span> <span class="n">CurrentForwardConductorMetadata</span><span class="p">(</span>
+        <span class="n">input_modalities</span><span class="o">=</span><span class="n">input_modalities</span><span class="p">,</span>
+        <span class="n">output_modalities</span><span class="o">=</span><span class="n">output_modalities</span><span class="p">,</span>
+        <span class="n">graph_walk</span><span class="o">=</span><span class="n">step</span><span class="o">.</span><span class="n">walk</span><span class="p">,</span>
+        <span class="n">is_prefill</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+    <span class="p">)</span>
+    <span class="k">return</span> <span class="n">_prefill_args</span><span class="p">(</span><span class="n">metadata</span><span class="p">,</span> <span class="n">walk_input_edges</span><span class="p">(</span><span class="n">step</span><span class="p">),</span> <span class="n">step</span><span class="o">.</span><span class="n">metadata</span><span class="p">)</span></div>
+
+
+
+<div class="viewcode-block" id="next_prefill_args">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.multimodal.html#mstar.model.multimodal.next_prefill_args">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">next_prefill_args</span><span class="p">(</span>
+    <span class="n">metadata</span><span class="p">:</span> <span class="n">CurrentForwardConductorMetadata</span><span class="p">,</span>
+    <span class="n">persist_signals</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">list</span><span class="p">[</span><span class="n">TensorPointerInfo</span><span class="p">]],</span>
+<span class="p">)</span> <span class="o">-&gt;</span> <span class="n">ForwardPassArgs</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""After the prefill, loop in decode until the decoder's stop check ends it."""</span>
+    <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.model.base</span><span class="w"> </span><span class="kn">import</span> <span class="n">ForwardPassArgs</span>
+
+    <span class="k">if</span> <span class="n">metadata</span><span class="o">.</span><span class="n">is_prefill</span><span class="p">:</span>
+        <span class="n">metadata</span><span class="o">.</span><span class="n">is_prefill</span> <span class="o">=</span> <span class="kc">False</span>
+        <span class="n">metadata</span><span class="o">.</span><span class="n">graph_walk</span> <span class="o">=</span> <span class="s2">"decode"</span>
+        <span class="n">edge</span> <span class="o">=</span> <span class="n">GraphEdge</span><span class="p">(</span><span class="n">next_node</span><span class="o">=</span><span class="s2">"LLM"</span><span class="p">,</span> <span class="n">name</span><span class="o">=</span><span class="s2">"text_inputs"</span><span class="p">)</span>
+        <span class="n">edge</span><span class="o">.</span><span class="n">tensor_info</span> <span class="o">=</span> <span class="n">persist_signals</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"new_token"</span><span class="p">,</span> <span class="p">[])</span>
+        <span class="k">return</span> <span class="n">_prefill_args</span><span class="p">(</span><span class="n">metadata</span><span class="p">,</span> <span class="p">[</span><span class="n">edge</span><span class="p">],</span> <span class="p">{})</span>
+    <span class="c1"># reaching here again after decode stopped means the request is finished</span>
+    <span class="n">metadata</span><span class="o">.</span><span class="n">kwargs</span><span class="p">[</span><span class="s2">"decode_finished"</span><span class="p">]</span> <span class="o">=</span> <span class="kc">True</span>
+    <span class="k">return</span> <span class="n">ForwardPassArgs</span><span class="p">(</span>
+        <span class="n">full_metadata</span><span class="o">=</span><span class="n">metadata</span><span class="p">,</span> <span class="n">inputs</span><span class="o">=</span><span class="p">[],</span> <span class="n">unpersist_tensors</span><span class="o">=</span><span class="p">[],</span> <span class="n">request_done</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+    <span class="p">)</span></div>
 
 </pre></div>
 

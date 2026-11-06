@@ -41,12 +41,15 @@
    glm52
    glm5_next
    higgs_audio
+   keys
    kokoro
    lingbot_world
    loader
    ltx2_5
    media_limits
    multimodal
+   multimodal_decoder
+   muse
    nemotron_duplex
    omnilingual_asr
    omnivoice

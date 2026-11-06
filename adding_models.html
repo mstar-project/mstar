@@ -332,6 +332,7 @@
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.higgs_audio.config.html">mstar.model.higgs_audio.config</a></li>
 </ul>
 </details></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.model.keys.html">mstar.model.keys</a></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.model.kokoro.html">mstar.model.kokoro</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.kokoro.config.html">mstar.model.kokoro.config</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.kokoro.g2p.html">mstar.model.kokoro.g2p</a></li>
@@ -349,6 +350,12 @@
 </details></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.model.media_limits.html">mstar.model.media_limits</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.model.multimodal.html">mstar.model.multimodal</a></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.model.muse.html">mstar.model.muse</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.muse.components.html">mstar.model.muse.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.muse.config.html">mstar.model.muse.config</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.muse.processing.html">mstar.model.muse.processing</a></li>
+</ul>
+</details></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.model.nemotron_duplex.html">mstar.model.nemotron_duplex</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.nemotron_duplex.components.html">mstar.model.nemotron_duplex.components</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.nemotron_duplex.realtime_api.html">mstar.model.nemotron_duplex.realtime_api</a></li>
@@ -745,6 +752,7 @@
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#worked-example-bagel">Worked example: BAGEL</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#worked-example-whisper">Worked example: Whisper</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#worked-example-an-image-dit-on-the-diffusion-scaffold">Worked example: an image DiT on the diffusion scaffold</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#worked-example-a-vision-language-model-on-the-vlm-scaffold">Worked example: a vision-language model on the VLM scaffold</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#advanced-async-partitions-and-streaming">Advanced: async partitions and streaming</a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#streams-from-the-client">Streams from the client</a></li>
 </ul>
@@ -1116,8 +1124,9 @@ takes the window’s peak instead. <code class="docutils literal notranslate"><s
 is bigger than its pool with a 400 at intake, and <code class="docutils literal notranslate"><span class="pre">KVReqConfig.loop_room</span></code> cuts the default
 length of a request that asks for none until it fits. With every loop at 0 iterations, the
 same sum is the prompt a request reserves when its pool admits it.</p>
-<p><code class="docutils literal notranslate"><span class="pre">prompt_spans(plan,</span> <span class="pre">texts,</span> <span class="pre">text_walk,</span> <span class="pre">item_spans)</span></code> builds the common case: a prompt’s
-text and attachments in <code class="docutils literal notranslate"><span class="pre">prefill_plan</span></code> order. Qwen3.5 lays out its one label with it:</p>
+<p><code class="docutils literal notranslate"><span class="pre">prompt_spans(plan,</span> <span class="pre">texts,</span> <span class="pre">text_walk,</span> <span class="pre">item_spans)</span></code> builds the spans of a prompt whose
+text and attachments, in <code class="docutils literal notranslate"><span class="pre">prefill_plan</span></code> order, are each written by their own walk, as
+BAGEL lays out its prompt:</p>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">layout</span> <span class="o">=</span> <span class="n">LabelLayout</span><span class="p">(</span>
     <span class="n">spans</span><span class="o">=</span><span class="nb">tuple</span><span class="p">(</span><span class="n">prompt_spans</span><span class="p">(</span><span class="n">prefill_plan</span><span class="p">(</span><span class="n">parts</span><span class="p">),</span> <span class="n">segments</span><span class="p">,</span> <span class="n">walk</span><span class="p">,</span> <span class="n">image</span><span class="p">)),</span>
     <span class="n">growth</span><span class="o">=</span><span class="p">((</span><span class="s2">"decode_loop"</span><span class="p">,</span> <span class="mi">1</span><span class="p">),),</span>
@@ -1391,10 +1400,12 @@ Whisper, Qwen3-ASR and Qwen3-TTS declare <code class="docutils literal notransla
 captured one-token decode rows on FlashInfer’s trtllm-gen fmha kernel on Blackwell,
 with no FlashInfer plan per step; a geometry trtllm-gen has no kernel for keeps
 the paged kernel, with a warning. Eager steps and prompt rows stay on the paged
-kernels. Qwen3.5 declares <code class="docutils literal notranslate"><span class="pre">True</span></code>. <code class="docutils literal notranslate"><span class="pre">FLASHINFER_MLA</span></code> is
+kernels. Qwen3.5 declares <code class="docutils literal notranslate"><span class="pre">True</span></code>. <code class="docutils literal notranslate"><span class="pre">sm_scale</span></code> (default
+<code class="docutils literal notranslate"><span class="pre">1/sqrt(head_dim)</span></code>) sets the softmax scale; FlashInfer and <code class="docutils literal notranslate"><span class="pre">FLASHINFER_MLA</span></code>
+read it, and the other backends refuse it. <code class="docutils literal notranslate"><span class="pre">FLASHINFER_MLA</span></code> is
 Multi-head Latent Attention over a <code class="docutils literal notranslate"><span class="pre">KVLayout.MLA</span></code> cache. It needs <code class="docutils literal notranslate"><span class="pre">sm_scale</span></code>,
-the softmax scale of the model’s original qk head dim, which the other backends
-refuse. Its <code class="docutils literal notranslate"><span class="pre">run</span></code> takes the absorbed query (<code class="docutils literal notranslate"><span class="pre">[tokens,</span> <span class="pre">heads,</span> <span class="pre">kv_lora_rank]</span></code>)
+the softmax scale of the model’s original qk head dim. Its <code class="docutils literal notranslate"><span class="pre">run</span></code> takes the
+absorbed query (<code class="docutils literal notranslate"><span class="pre">[tokens,</span> <span class="pre">heads,</span> <span class="pre">kv_lora_rank]</span></code>)
 with the rope part as <code class="docutils literal notranslate"><span class="pre">q_pe</span></code>, and returns the output in the latent space, so
 the layer applies <code class="docutils literal notranslate"><span class="pre">W_UV</span></code>. FlashInfer’s kernel covers a 512-wide latent with a
 64-wide rope part, or none from FlashInfer 0.6.18; any other shape runs a torch
@@ -2231,8 +2242,8 @@ decode. Return it only from a row outside any loop; from inside one the request 
 <code class="docutils literal notranslate"><span class="pre">TokenStop</span></code> does this for the walks in its <code class="docutils literal notranslate"><span class="pre">prefill_walks</span></code>, whose token counts toward
 the budget, so <code class="docutils literal notranslate"><span class="pre">get_loop_caps</span></code> gives the loop <code class="docutils literal notranslate"><span class="pre">max(1,</span> <span class="pre">max_output_tokens</span> <span class="pre">-</span> <span class="pre">1)</span></code>. A
 model that prefills a prompt over several passes sets <code class="docutils literal notranslate"><span class="pre">last_prefill_flag</span></code> to the
-<code class="docutils literal notranslate"><span class="pre">step_metadata</span></code> flag of its last pass (Qwen3.5: <code class="docutils literal notranslate"><span class="pre">&quot;last_prefill&quot;</span></code>), or a stop id
-sampled on its first pass ends the request. It suits a partition with nothing left to run once generation stops: a model that runs
+<code class="docutils literal notranslate"><span class="pre">step_metadata</span></code> flag of its last pass, or a stop id sampled on its first pass ends
+the request. It suits a partition with nothing left to run once generation stops: a model that runs
 another walk after its loop (an <code class="docutils literal notranslate"><span class="pre">align</span></code> walk, or image generation after thinking) or
 publishes final-only state at the loop’s stop needs its own transition instead. Keep
 <code class="docutils literal notranslate"><span class="pre">check_stop_batched</span></code>, if you write one, in agreement.
@@ -2789,9 +2800,9 @@ per-label span.</p>
 </div>
 <p>An <code class="docutils literal notranslate"><span class="pre">ARNodeSubmodule</span></code> takes a <code class="docutils literal notranslate"><span class="pre">prefill_token_buckets</span></code> constructor argument, which
 replaces its class’s <code class="docutils literal notranslate"><span class="pre">PREFILL_TOKEN_BUCKETS</span></code> for that instance: a model passes a
-deployment’s <code class="docutils literal notranslate"><span class="pre">model_kwargs.prefill_token_buckets</span></code> through to it (Qwen3.5, Qwen3-Omni
-and GLM-5.2 do). It must be a non-empty list of distinct positive token counts, or the
-submodule raises <code class="docutils literal notranslate"><span class="pre">ValueError</span></code> when it is built.</p>
+deployment’s <code class="docutils literal notranslate"><span class="pre">model_kwargs.prefill_token_buckets</span></code> through to it (Qwen3.5, Muse
+Glimmer, Qwen3-Omni and GLM-5.2 do). It must be a non-empty list of distinct positive
+token counts, or the submodule raises <code class="docutils literal notranslate"><span class="pre">ValueError</span></code> when it is built.</p>
 <p>BAGEL shows the case of two captures for one walk. It captures <code class="docutils literal notranslate"><span class="pre">decode</span></code> twice, once with
 <code class="docutils literal notranslate"><span class="pre">additional_key_info=False</span></code> and once with <code class="docutils literal notranslate"><span class="pre">additional_key_info=True</span></code>. A decode step
 with guidance enabled and a decode step with guidance disabled declare different segments
@@ -2848,9 +2859,13 @@ bucket.</p></td>
 <code class="docutils literal notranslate"><span class="pre">(shape:</span> <span class="pre">PiecewiseCaptureShape)</span> <span class="pre">-&gt;</span> <span class="pre">dict[str,</span> <span class="pre">Tensor]</span></code>. It returns the persistent
 buffers that the captured region reads. The runner owns these buffers. Before each
 replay, it copies your real tensors into them by name. <code class="docutils literal notranslate"><span class="pre">shape</span></code> provides <code class="docutils literal notranslate"><span class="pre">bs</span></code>,
-<code class="docutils literal notranslate"><span class="pre">seq_lens</span></code> and <code class="docutils literal notranslate"><span class="pre">total_tokens</span></code> for the bucket being built. Allocate the hidden-state
-buffer with dtype <code class="docutils literal notranslate"><span class="pre">autocast_dtype</span></code>, so that the copy before replay does not convert
-dtypes.</p></li>
+<code class="docutils literal notranslate"><span class="pre">seq_lens</span></code> and <code class="docutils literal notranslate"><span class="pre">total_tokens</span></code> for the bucket being built. Allocate each buffer in the
+dtype of the tensor you pass for it, which for a hidden state is usually
+<code class="docutils literal notranslate"><span class="pre">autocast_dtype</span></code>. The copy before replay casts a value into a wider dtype of its kind
+(int32 token ids into an int64 buffer, a bf16 table into an fp32 one). A value the
+buffer may round (a narrower dtype, such as an fp32 hidden state into a bf16 buffer, or
+an integer into a floating-point or complex buffer) is refused with a <code class="docutils literal notranslate"><span class="pre">ValueError</span></code>
+naming the buffer.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">forward_kwargs</span></code> holds static keyword arguments that are passed to <code class="docutils literal notranslate"><span class="pre">capture_fn</span></code> on
 every call, for example a layer count or an <code class="docutils literal notranslate"><span class="pre">is_causal</span></code> flag.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">declare_step</span></code> has signature
@@ -3661,6 +3676,119 @@ with eager to bf16 rounding rather than bitwise. Wan2.2 is the first user;
 <code class="docutils literal notranslate"><span class="pre">width</span></code>/<code class="docutils literal notranslate"><span class="pre">height</span></code>, <code class="docutils literal notranslate"><span class="pre">seed</span></code> and other knobs pass through); register it under the
 model’s registry key. The SDK exposes <code class="docutils literal notranslate"><span class="pre">generate_image</span></code> and <code class="docutils literal notranslate"><span class="pre">edit_image</span></code>.</p>
 </section>
+<section id="worked-example-a-vision-language-model-on-the-vlm-scaffold">
+<h2>Worked example: a vision-language model on the VLM scaffold<a class="headerlink" href="#worked-example-a-vision-language-model-on-the-vlm-scaffold" title="Link to this heading">#</a></h2>
+<p>A decoder LLM with a ViT in front of it (Qwen3.5, Muse Glimmer) shares one graph and
+two node shapes, so M* ships them as a scaffold; a model adds its components, its
+resource declarations and a few overrides. The older span-split path, a walk per text
+span and attachment (<code class="docutils literal notranslate"><span class="pre">prefill_plan</span></code>, <code class="docutils literal notranslate"><span class="pre">find_media_spans</span></code>, <code class="docutils literal notranslate"><span class="pre">split_around_spans</span></code>,
+<code class="docutils literal notranslate"><span class="pre">prompt_spans</span></code>; BAGEL and Qwen3-Omni), is legacy: a new model builds on this scaffold.
+BAGEL stays on it because a whole-prompt row would lose what its spans carry: an image to
+generate from is written twice, as VAE latents and as ViT patches, by walks of their own,
+its classifier-free-guidance branches open KV labels over different subsets of the
+prompt’s spans, and its leading text span is keyed for prefix reuse. Moving Qwen3-Omni
+and BAGEL onto the scaffold is tracked as a follow-up.</p>
+<p>Graph and walks (<code class="docutils literal notranslate"><span class="pre">mstar/model/multimodal.py</span></code>), from the model’s <code class="docutils literal notranslate"><span class="pre">MediaEncoder</span></code> list:</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="n">prefill_text</span>   <span class="p">:</span> <span class="n">LLM</span><span class="p">(</span><span class="n">text_inputs</span><span class="p">)</span>                        <span class="n">a</span> <span class="n">text</span><span class="o">-</span><span class="n">only</span> <span class="n">prompt</span>
+<span class="n">prefill_vision</span> <span class="p">:</span> <span class="n">vision_encoder</span><span class="p">(</span><span class="n">pixel_values</span><span class="p">)</span>            <span class="n">each</span> <span class="n">run</span><span class="s1">'s grid off MEDIA_LAYOUT</span>
+                 <span class="o">-&gt;</span> <span class="n">LLM</span><span class="p">(</span><span class="n">text_inputs</span><span class="p">,</span> <span class="n">vision_embeds</span><span class="p">)</span>      <span class="n">the</span> <span class="n">whole</span> <span class="n">prompt</span><span class="p">,</span> <span class="n">one</span> <span class="n">row</span>
+<span class="n">prefill_</span><span class="o">&lt;</span><span class="n">a</span><span class="o">&gt;</span><span class="n">_</span><span class="o">&lt;</span><span class="n">b</span><span class="o">&gt;</span><span class="p">:</span> <span class="n">Parallel</span><span class="p">(</span><span class="n">encoder</span> <span class="n">a</span><span class="p">,</span> <span class="n">encoder</span> <span class="n">b</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">LLM</span>   <span class="n">one</span> <span class="n">walk</span> <span class="n">per</span> <span class="n">subset</span> <span class="n">of</span> <span class="n">encoders</span>
+<span class="n">decode</span>         <span class="p">:</span> <span class="n">Loop</span><span class="p">(</span><span class="s2">"decode_loop"</span><span class="p">,</span> <span class="n">LLM</span><span class="p">)</span>
+<span class="n">mixed</span>          <span class="p">:</span> <span class="n">prefill_text</span> <span class="ow">and</span> <span class="n">decode</span> <span class="n">rows</span> <span class="ow">in</span> <span class="n">one</span> <span class="n">step</span> <span class="p">(</span><span class="n">a</span> <span class="n">combined</span> <span class="n">walk</span><span class="p">)</span>
+</pre></div>
+</div>
+<p>The <code class="docutils literal notranslate"><span class="pre">Model</span></code> subclasses <code class="docutils literal notranslate"><span class="pre">MultimodalDecoderModel</span></code> (<code class="docutils literal notranslate"><span class="pre">mstar/model/multimodal_decoder.py</span></code>),
+which declares the walks (<code class="docutils literal notranslate"><span class="pre">media_walks(max_iters,</span> <span class="pre">encoders)</span></code> and
+<code class="docutils literal notranslate"><span class="pre">text_combined_walks()</span></code>), runs the one prefill walk <code class="docutils literal notranslate"><span class="pre">media_prefill_step</span></code> picks
+through <code class="docutils literal notranslate"><span class="pre">initial_prefill_args</span></code> / <code class="docutils literal notranslate"><span class="pre">next_prefill_args</span></code>, decodes text output, and owns
+media intake (<code class="docutils literal notranslate"><span class="pre">process_prompt</span></code>), the decode loop’s cap (<code class="docutils literal notranslate"><span class="pre">get_loop_caps</span></code>, the
+request’s output budget less the prefill’s token), the KV label and its one-span layout (<code class="docutils literal notranslate"><span class="pre">kv_labels</span></code>,
+<code class="docutils literal notranslate"><span class="pre">kv_layout</span></code>), the sampler’s per-request config (<code class="docutils literal notranslate"><span class="pre">get_request_resource_configs</span></code>:
+the request’s <code class="docutils literal notranslate"><span class="pre">SAMPLING_KEYS</span></code> over <code class="docutils literal notranslate"><span class="pre">sampling_defaults</span></code>, which <code class="docutils literal notranslate"><span class="pre">__init__</span></code> reads
+from the checkpoint’s <code class="docutils literal notranslate"><span class="pre">generation_config.json</span></code>), the LLM’s <code class="docutils literal notranslate"><span class="pre">SamplerSpec</span></code>
+(<code class="docutils literal notranslate"><span class="pre">_sampler_spec</span></code>, whose min-p filter is on only where the checkpoint defaults
+<code class="docutils literal notranslate"><span class="pre">min_p</span></code>, so a request’s <code class="docutils literal notranslate"><span class="pre">min_p</span> <span class="pre">&gt;</span> <span class="pre">0</span></code> is otherwise refused at admission), sharding, the
+submodule cache and where the files come from. A model sets <code class="docutils literal notranslate"><span class="pre">NAME</span></code> and
+<code class="docutils literal notranslate"><span class="pre">METADATA_FILES</span></code> and writes <code class="docutils literal notranslate"><span class="pre">__init__</span></code> (setting
+<code class="docutils literal notranslate"><span class="pre">config</span></code>, <code class="docutils literal notranslate"><span class="pre">tokenizer</span></code> and <code class="docutils literal notranslate"><span class="pre">media</span></code>), its resources (the sampler from
+<code class="docutils literal notranslate"><span class="pre">_sampler_spec</span></code>; <code class="docutils literal notranslate"><span class="pre">MIXED_SPLIT</span></code> is the attention resources’ split of a mixed step),
+<code class="docutils literal notranslate"><span class="pre">_prompt_ids</span></code> and <code class="docutils literal notranslate"><span class="pre">_create_submodule</span></code>, which hands the LLM node
+<code class="docutils literal notranslate"><span class="pre">self.prefill_token_buckets</span></code> (<code class="docutils literal notranslate"><span class="pre">model_kwargs.prefill_token_buckets</span></code>). The scaffold’s
+<code class="docutils literal notranslate"><span class="pre">rebuild_policies</span></code> lets the KV cache drop a text request and reprefill its ids on
+<code class="docutils literal notranslate"><span class="pre">prefill_text</span></code>. A model whose LLM node holds a resource that can’t drop returns <code class="docutils literal notranslate"><span class="pre">{}</span></code>,
+or the engine refuses to start; Muse Glimmer returns <code class="docutils literal notranslate"><span class="pre">{}</span></code> until a drop has run through
+its sliding-window pool. <code class="docutils literal notranslate"><span class="pre">media</span></code> holds a
+<code class="docutils literal notranslate"><span class="pre">MediaIntake</span></code> per attachment modality: its <code class="docutils literal notranslate"><span class="pre">MediaEncoder</span></code> (modalities may share one),
+its placeholder <code class="docutils literal notranslate"><span class="pre">pad</span></code> id, the sentinels a template leaves to its processor, how many
+placeholders an attachment fills (<code class="docutils literal notranslate"><span class="pre">runs</span></code>, one by default; a Qwen3.5 video fills one per
+temporal group), and <code class="docutils literal notranslate"><span class="pre">prepare</span></code>, which turns an attachment into the encoder’s input
+tensors and each placeholder’s tokens (a <code class="docutils literal notranslate"><span class="pre">PreparedMedia</span></code>). <code class="docutils literal notranslate"><span class="pre">_prompt_ids</span></code> renders and
+tokenizes the whole prompt once. <code class="docutils literal notranslate"><span class="pre">intake</span></code> then refuses a prompt whose placeholders don’t
+match its attachments, prepares each attachment in prompt order, expands each placeholder
+to one pad per token with <code class="docutils literal notranslate"><span class="pre">expand_media_pads</span></code>, and <code class="docutils literal notranslate"><span class="pre">process_prompt</span></code> returns the pads’
+layout as <code class="docutils literal notranslate"><span class="pre">MEDIA_LAYOUT</span></code> metadata and <code class="docutils literal notranslate"><span class="pre">&quot;kv_layout&quot;:</span> <span class="pre">self.kv_layout(layout,</span> <span class="pre">length)</span></code>.
+The layout’s runs say which encoders the prompt runs (<code class="docutils literal notranslate"><span class="pre">media_encoders</span></code>), for the prefill
+schedule’s walk and the KV layout’s alike. <code class="docutils literal notranslate"><span class="pre">kv_layout</span></code>’s <code class="docutils literal notranslate"><span class="pre">advance</span></code>, how far the prompt
+moves the position counter, defaults to the prompt’s length; under Qwen-style MRoPE it is
+the positions’ extent instead, an image spanning <code class="docutils literal notranslate"><span class="pre">max(h',</span> <span class="pre">w')</span></code> positions rather than its
+tokens, which Qwen3.5 computes from the
+runs’ grids in its <code class="docutils literal notranslate"><span class="pre">kv_layout</span></code> override. <code class="docutils literal notranslate"><span class="pre">process_prompt</span></code> also empties each sent
+attachment’s raw <code class="docutils literal notranslate"><span class="pre">&lt;modality&gt;_inputs</span></code>, spent once prepared. The encoders’ inputs are
+lists in prompt order, as their outputs fill the pads. Each run’s patch grid (the
+<code class="docutils literal notranslate"><span class="pre">grids</span></code> of its <code class="docutils literal notranslate"><span class="pre">PreparedMedia</span></code>) rides <code class="docutils literal notranslate"><span class="pre">MEDIA_LAYOUT</span></code> rather than a tensor, so a
+tower’s grid maths in <code class="docutils literal notranslate"><span class="pre">prepare_inputs</span></code> reads host values (<code class="docutils literal notranslate"><span class="pre">PackedBlockLoopEncoder.grids</span></code>)
+and never syncs on the device.</p>
+<p>The <code class="docutils literal notranslate"><span class="pre">LLM</span></code> node subclasses <code class="docutils literal notranslate"><span class="pre">SampledTokenDecoder</span></code>
+(<code class="docutils literal notranslate"><span class="pre">mstar/model/components/sampled_token_decoder.py</span></code>), which owns the capture configs
+(decode, packed text prefill, mixed, and one packed capture every media walk replays,
+which also caps their batches), device loop-back of the sampled token, the splice of
+the encoders’ outputs into the prompt’s embeddings inside the forward
+(<code class="docutils literal notranslate"><span class="pre">where(pad,</span> <span class="pre">media[cumsum(pad)</span> <span class="pre">-</span> <span class="pre">1],</span> <span class="pre">embed(ids))</span></code>), the step declaration around the
+sampler and the position resource, the forward through the sampler, and the stop: a
+<code class="docutils literal notranslate"><span class="pre">TokenStop</span></code> over the prefill walks and decode. A stop id on a decode row ends the
+loop; a stop id on the prefill row, or a one-token budget, ends the partition before
+decode runs. The loop’s cap, <code class="docutils literal notranslate"><span class="pre">max(1,</span> <span class="pre">max_output_tokens</span> <span class="pre">-</span> <span class="pre">1)</span></code>, is the only budget.
+A media row’s tensor holds exactly the pads in its
+ids, checked against the layout in <code class="docutils literal notranslate"><span class="pre">prepare_inputs</span></code>. A prompt’s ids, pads and
+sentinels included, feed the repetition penalty, as in transformers and vLLM. A model
+writes:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">class</span><span class="w"> </span><span class="nc">LLMSubmodule</span><span class="p">(</span><span class="n">SampledTokenDecoder</span><span class="p">):</span>
+    <span class="n">ATTN_KEY</span> <span class="o">=</span> <span class="n">ATTN_FULL</span>  <span class="c1"># the attention resource that picks each prefill row's last token</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">layer_steps</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>  <span class="c1"># this step's work on the layers' resources</span>
+        <span class="k">return</span> <span class="p">{</span><span class="n">KV_CACHE</span><span class="p">:</span> <span class="n">KVStep</span><span class="p">(),</span> <span class="n">ATTN_FULL</span><span class="p">:</span> <span class="n">AttentionStep</span><span class="p">(</span><span class="n">causal</span><span class="o">=</span><span class="kc">True</span><span class="p">)}</span>
+
+    <span class="c1"># optional, for positions the resource cannot place (MRoPE):</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">prompt_positions</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">start</span><span class="p">,</span> <span class="n">layout</span><span class="p">,</span> <span class="n">num_tokens</span><span class="p">):</span> <span class="o">...</span>  <span class="c1"># -&gt; (custom_pos_ids, advance)</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">decoder_kwargs</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">,</span> <span class="n">engine_inputs</span><span class="p">,</span> <span class="n">num_tokens</span><span class="p">,</span> <span class="o">**</span><span class="n">tensors</span><span class="p">):</span> <span class="o">...</span>
+</pre></div>
+</div>
+<p>Its decoder module provides <code class="docutils literal notranslate"><span class="pre">embed(ids)</span></code>, <code class="docutils literal notranslate"><span class="pre">forward(input_embeds,</span> <span class="pre">*,</span> <span class="pre">label,</span> <span class="pre">**kw)</span></code>
+(the stack through its final norm), <code class="docutils literal notranslate"><span class="pre">logits(hidden)</span></code> and <code class="docutils literal notranslate"><span class="pre">embed_dtype</span></code>, as
+<code class="docutils literal notranslate"><span class="pre">Qwen3_5ForCausalLM</span></code> does (<code class="docutils literal notranslate"><span class="pre">Qwen3DenseLM</span></code> has the first three). The sampler and
+position resources are declared under <code class="docutils literal notranslate"><span class="pre">mstar.model.keys</span></code>’ <code class="docutils literal notranslate"><span class="pre">SAMPLER</span></code> and <code class="docutils literal notranslate"><span class="pre">ROPE</span></code>.
+<code class="docutils literal notranslate"><span class="pre">MSTAR_DECODE_BUCKETS</span></code> sets the default decode ladder, and <code class="docutils literal notranslate"><span class="pre">MIXED_MAX_PREFILL_ROWS</span></code>
+caps a mixed step’s prompt rows.</p>
+<p>The <code class="docutils literal notranslate"><span class="pre">vision_encoder</span></code> node subclasses <code class="docutils literal notranslate"><span class="pre">PackedBlockLoopEncoder</span></code>
+(<code class="docutils literal notranslate"><span class="pre">mstar/model/components/block_loop_encoder.py</span></code>): up to <code class="docutils literal notranslate"><span class="pre">MAX_BATCH_SIZE</span></code> requests per
+step, every image packed into one call, and the tower’s block loop replayed as a piecewise
+region per patch bucket (<code class="docutils literal notranslate"><span class="pre">BLOCK_LOOP_PATCH_BUCKETS</span></code>), the step as one row. Its <code class="docutils literal notranslate"><span class="pre">prepare_inputs</span></code> returns the
+tower’s tensors in <code class="docutils literal notranslate"><span class="pre">tensor_inputs</span></code> and, in <code class="docutils literal notranslate"><span class="pre">resource_step_info</span></code>, each of
+<code class="docutils literal notranslate"><span class="pre">SEGMENT_LABELS</span></code>’ attending spans (frames, windows) over the same patches. The tower
+provides <code class="docutils literal notranslate"><span class="pre">embed(**tensors)</span> <span class="pre">-&gt;</span> <span class="pre">(hidden,</span> <span class="pre">cos,</span> <span class="pre">sin)</span></code>, <code class="docutils literal notranslate"><span class="pre">encode(hidden,</span> <span class="pre">cos,</span> <span class="pre">sin)</span></code> and
+<code class="docutils literal notranslate"><span class="pre">project(encoded,</span> <span class="pre">**tensors)</span></code>. A step whose spans under some label exceed the
+ragged resource’s <code class="docutils literal notranslate"><span class="pre">max_segments_per_step</span></code> takes no lease and runs eagerly.
+Qwen3-Omni’s ViT node is one too, off the scaffold: its region also returns the
+deepstack taps (its <code class="docutils literal notranslate"><span class="pre">_capture_block_loop</span></code>), which its own <code class="docutils literal notranslate"><span class="pre">forward_batched</span></code> reads
+off the replay.
+A tower builds on the pieces in <code class="docutils literal notranslate"><span class="pre">mstar/model/components/qwen3_vit.py</span></code>:
+<code class="docutils literal notranslate"><span class="pre">bilinear_table_taps</span></code> (the learned position table resampled onto a patch grid),
+<code class="docutils literal notranslate"><span class="pre">VisionRotaryEmbedding</span></code> (axial 2D rope; <code class="docutils literal notranslate"><span class="pre">keep_fp32</span></code> keeps its frequencies fp32
+through the node’s dtype cast) and <code class="docutils literal notranslate"><span class="pre">VisionBlock</span></code>, whose attention runs over the packed
+patches through the ragged resource under the block’s <code class="docutils literal notranslate"><span class="pre">label</span></code> (Qwen3.5’s frames;
+Muse Glimmer’s windows and frames), q, k and v as one projection a split checkpoint
+loads by stacked-param rules.</p>
+</section>
 <section id="advanced-async-partitions-and-streaming">
 <h2>Advanced: async partitions and streaming<a class="headerlink" href="#advanced-async-partitions-and-streaming" title="Link to this heading">#</a></h2>
 <p>Models with a single partition can skip this section. The defaults in <code class="docutils literal notranslate"><span class="pre">Model</span></code> provide
@@ -3943,6 +4071,7 @@ for a full omni-modal model.</p>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#worked-example-bagel">Worked example: BAGEL</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#worked-example-whisper">Worked example: Whisper</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#worked-example-an-image-dit-on-the-diffusion-scaffold">Worked example: an image DiT on the diffusion scaffold</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#worked-example-a-vision-language-model-on-the-vlm-scaffold">Worked example: a vision-language model on the VLM scaffold</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#advanced-async-partitions-and-streaming">Advanced: async partitions and streaming</a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#streams-from-the-client">Streams from the client</a></li>
 </ul>

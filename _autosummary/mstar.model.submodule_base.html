@@ -333,6 +333,7 @@
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.higgs_audio.config.html">mstar.model.higgs_audio.config</a></li>
 </ul>
 </details></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.model.keys.html">mstar.model.keys</a></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="mstar.model.kokoro.html">mstar.model.kokoro</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.kokoro.config.html">mstar.model.kokoro.config</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.kokoro.g2p.html">mstar.model.kokoro.g2p</a></li>
@@ -350,6 +351,12 @@
 </details></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.model.media_limits.html">mstar.model.media_limits</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.model.multimodal.html">mstar.model.multimodal</a></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="mstar.model.muse.html">mstar.model.muse</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.muse.components.html">mstar.model.muse.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.muse.config.html">mstar.model.muse.config</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.muse.processing.html">mstar.model.muse.processing</a></li>
+</ul>
+</details></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="mstar.model.nemotron_duplex.html">mstar.model.nemotron_duplex</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.nemotron_duplex.components.html">mstar.model.nemotron_duplex.components</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.nemotron_duplex.realtime_api.html">mstar.model.nemotron_duplex.realtime_api</a></li>
@@ -2428,9 +2435,10 @@ at its first chunk.</p>
 <span class="sig-name descname"><span class="pre">get_piecewise_accelerator_graph_configs</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">device</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">autocast_dtype</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">tp_world_size</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">1</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/submodule_base.html#NodeSubmodule.get_piecewise_accelerator_graph_configs"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.submodule_base.NodeSubmodule.get_piecewise_accelerator_graph_configs" title="Link to this definition">#</a></dt>
 <dd><p>Return the piecewise CUDA graph configs this submodule opts into.</p>
 <p><code class="docutils literal notranslate"><span class="pre">autocast_dtype</span></code> is this node’s resolved dtype, float32 for a node with
-<code class="docutils literal notranslate"><span class="pre">disable_autocast</span></code> — passed so a config’s <code class="docutils literal notranslate"><span class="pre">make_static_inputs</span></code> can
-allocate the hidden-state buffer in the dtype the captured region runs
-under (avoids a copy-time upcast at replay).</p>
+<code class="docutils literal notranslate"><span class="pre">disable_autocast</span></code>, passed so a config’s <code class="docutils literal notranslate"><span class="pre">make_static_inputs</span></code> can
+allocate each input buffer in the dtype the eager path hands the region,
+often that one. The replay copies into the buffer and refuses a value the
+buffer may round.</p>
 <p>A piecewise CUDA graph captures ONE inner callable of this submodule’s
 forward (e.g. a transformer block loop) as a CUDA graph while the
 surrounding compute stays eager. The engine builds one

@@ -14,9 +14,7 @@ mstar.model.qwen3\_5.video
    .. autosummary::
    
       expand_video_pads
-      expand_video_parts
       ffmpeg_unavailable
-      group_owners
       group_timestamps
       sample_video
    
