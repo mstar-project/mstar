@@ -11,7 +11,6 @@ import weakref
 import torch
 
 from mstar_sim import clock
-from mstar_sim.cost import Cache
 
 # Simulated device memory, as torch's caching allocator accounts it. Each device has a
 # default pool and the private pools graphs capture into. A pool's ``live`` bytes are
@@ -182,7 +181,6 @@ def count_storage(data: torch.Tensor, index: int) -> None:
 # pointers sees distinct storages, and code that reads through one faults loudly
 # (``faulthandler`` prints the Python stack) instead of reading host memory.
 _FAKE_NEXT = [1 << 60]
-_FAKE_UNTRACKED = Cache()  # by storage address, which nothing tells us is free again: bounded
 
 
 def _fake_range(nbytes: int) -> int:
@@ -203,7 +201,7 @@ def fake_base(storage) -> int:
     entry = _STORAGES.get(storage._cdata)
     if entry is not None:
         return entry[2]
-    base = _FAKE_UNTRACKED.get(storage._cdata)
+    base = getattr(storage, "_sim_fake", None)
     if base is None:
-        base = _FAKE_UNTRACKED.put(storage._cdata, _fake_range(storage.nbytes()))
+        base = storage._sim_fake = _fake_range(storage.nbytes())
     return base

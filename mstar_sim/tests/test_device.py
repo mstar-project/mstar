@@ -1506,6 +1506,21 @@ def test_a_cached_call_answers_as_the_call_would():
     assert len(set(kernels.split())) == 1 and int(kernels.split()[0]) > 1, out
 
 
+def test_a_value_less_storage_keeps_its_address():
+    """mstar compares and offsets ``data_ptr()``, so no number of other storages can change one."""
+    out = run_sim("""
+        import torch
+        from mstar_sim import cost, memory
+        kept = torch.empty(8, device="meta")
+        address = memory.fake_base(kept.untyped_storage())
+        others = [torch.empty(1, device="meta") for _ in range(cost.CACHE_ENTRIES + 1)]
+        for t in others:
+            memory.fake_base(t.untyped_storage())
+        print(memory.fake_base(kept.untyped_storage()) == address)
+    """)
+    assert out.strip() == "True", out
+
+
 def test_timing_only_holds_shapes_not_values():
     """Nothing is computed: a 40 GB tensor costs no host memory
     but counts against the card; small integer tensors (what mstar plans with)
