@@ -794,8 +794,9 @@ class KVManager(AttentionResource):
         self._preplan_key = None
         self._cached_plan_output: dict[str, KVPlanOutput] | None = None
 
-        # (rid, to_label) reservations a staged step made; clear_preplan
-        # releases them. recorded in admit, not plan: forks are not staged.
+        # (rid, label) of each stream a staged step's admit created, which
+        # clear_preplan removes once `rollback_admit` has given back its pages.
+        # recorded in admit, not plan: forks are not staged.
         self._preplan_new_labels: list[tuple[str, str]] = []
 
         # The pages the live reservation freshly acquired, in the order it took them, for
@@ -3303,8 +3304,7 @@ class KVManager(AttentionResource):
         # so what is left to undo is the streams admit created.
         with self._lock:
             # labels the staged step invented are removed, not rewound to 0:
-            # a stream at 0 that nothing asked for is still a stream, and it
-            # holds the pages the reservation took
+            # a stream at 0 that nothing asked for is still a stream
             for rid, label in reversed(self._preplan_new_labels):
                 stream = self._streams.get(rid, {}).pop(label, None)
                 if stream is not None:
