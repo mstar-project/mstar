@@ -171,6 +171,10 @@ the roofline.
 - Observed runnable native tasks keep the process clock running at real rate while Python is
   blocked. Unclassified idle spinners therefore reduce acceleration; elapsed time alone cannot
   distinguish them from productive native work. Activity beginning after a scan can be missed.
+  While a registered collective meet is pending, local native activity is excluded because Gloo's
+  emulator transfers use native threads. Unrelated uncounted native work overlapping that meet
+  cannot be distinguished and is excluded too; counted host threads and watched children retain
+  their normal accounting.
 - The Rust frontend reads real time, so its safety timeouts fire on real time. It counts as running
   while a thread of its own works, looked at every 400 us while a move is pending, so the start of
   its work can be missed. Other native children (ffmpeg) count the same way. uvloop's stand-in has
