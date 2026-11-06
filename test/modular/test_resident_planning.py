@@ -996,17 +996,16 @@ def test_a_step_of_a_node_that_never_chains_repeats_where_the_scheduler_picks_it
     assert asked == ([] if chained else [("n", WALK, "loop", [0, 1], 0, False)])
 
 
-@pytest.mark.parametrize("state, why", [
-    (dict(parallel_nodes={"n"}), "TP group"),
-    (dict(streamed=frozenset({"chunk"})), "stream window"),
-    (dict(_ring_signals={"n": {"codes"}}), "ring"),
-    (dict(_signal_consumer={"t": "codec"}, _walk_drivers={"codec": object()}), "consumer"),
+@pytest.mark.parametrize("state, streamed, why", [
+    (dict(parallel_nodes={"n"}), frozenset(), "TP group"),
+    ({}, frozenset({"chunk"}), "stream window"),
+    (dict(_ring_signals={"n": {"codes"}}), frozenset(), "ring"),
+    (dict(_signal_consumer={"t": "codec"}, _walk_drivers={"codec": object()}), frozenset(), "consumer"),
 ])
-def test_a_node_that_never_chains_says_why_it_cant_repeat(state, why):
+def test_a_node_that_never_chains_says_why_it_cant_repeat(state, streamed, why):
     """Its ask has only the Loop's room to go on, so a walk that needs a chain's
     other caps says so on its line rather than overrunning them, or reading
     "on" while it runs one iteration (review-r2 F16)."""
-    streamed = state.pop("streamed", frozenset())
     worker = Worker.__new__(Worker)
     worker.parallel_nodes, worker._ring_signals, worker._signal_consumer, worker._walk_drivers = set(), {}, {}, {}
     worker.__dict__.update(state)
