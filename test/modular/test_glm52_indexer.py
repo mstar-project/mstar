@@ -242,6 +242,7 @@ def test_load_indexer_keys_land_dequantized_on_full_layer():
     loaded = load_glm52_hf_weights(
         model, iter(state), cfg.n_routed_experts,
         quant_config=cfg.quantization_config, fp8_experts=True,
+        dense_fp8=cfg.dense_fp8, fp8_shared_expert=cfg.fp8_shared_expert,
         num_hidden_layers=cfg.num_hidden_layers,
     )
 
@@ -279,6 +280,7 @@ def test_load_indexer_flag_off_skips_indexer_keys():
     loaded = load_glm52_hf_weights(
         model, iter(state), cfg.n_routed_experts,
         quant_config=cfg.quantization_config, fp8_experts=True,
+        dense_fp8=cfg.dense_fp8, fp8_shared_expert=cfg.fp8_shared_expert,
         num_hidden_layers=cfg.num_hidden_layers, load_indexer=False,
     )
 

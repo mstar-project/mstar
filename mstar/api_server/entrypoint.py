@@ -913,7 +913,7 @@ class APIServer:
             size = req.input_bytes + _file_bytes(file_paths) + len((text or "").encode())
             self._check_call_input(size)
             req.input_bytes = size
-            req.last_input_time = time.time()
+            req.last_input_time = time.monotonic()
             req.open_streams -= ending
             # under the lock: an append can't land behind its call's end
             self.preprocess_worker.stream_input(ClientAppend(
@@ -1430,7 +1430,7 @@ class APIServer:
     async def _iter_result_chunk_batches(
         self, request_id: str, key: str | None, own: PendingRequest | None,
     ):
-        start = time.time()
+        start = time.monotonic()
         last_activity = start
         finished = False
         # An error chunk ends the response: whatever follows it for this
@@ -1448,7 +1448,7 @@ class APIServer:
                 own.wake = wake
         try:
             while True:
-                if time.time() - last_activity > self.timeout_seconds:
+                if time.monotonic() - last_activity > self.timeout_seconds:
                     timed_out = True
                     raise HTTPException(status_code=500, detail="Request timed out")
 
@@ -1650,7 +1650,7 @@ class APIServer:
     ) -> list[ResultChunk]:
         """Wait for the request to finish (or the client to disconnect), then
         return its chunks. Disconnecting or timing out releases engine state."""
-        start = time.time()
+        start = time.monotonic()
         key = self.submission_key(request_id)
         # Woken by the message thread (PendingRequest.notify) when the request
         # finishes, not on each chunk (wake_on_finish). Polling every 5 ms per
@@ -1674,7 +1674,7 @@ class APIServer:
                 done = req.event.is_set() if req else True
             if done:
                 break
-            now = time.time()
+            now = time.monotonic()
             if now - start > self.timeout_seconds:
                 self.abort_submission(key, outcome="timeout")
                 raise HTTPException(status_code=500, detail="Request timed out")
@@ -1914,8 +1914,8 @@ class WarmupRequest:
 
 class DataParallelReplicas(NamedTuple):
     """The most and fewest replicas any worker graph is served by. ``most`` is
-    how many copies of a request it takes for the conductor's placement to
-    reach them all."""
+    how many copies of a request it takes for the conductor's pick to reach
+    them all."""
 
     most: int
     fewest: int
@@ -1943,11 +1943,13 @@ def _run_warmup_requests(
     the server from coming up.
 
     Each spec runs as ``replicas.most`` concurrent copies, which warm every
-    replica of a data-parallel deployment, since the conductor sends
-    concurrent requests to different replicas (the least-loaded one each).
-    When some worker graph has fewer replicas than that, each spec first runs
-    once alone, since that graph would batch the copies and miss its
-    one-request shape. Past one copy, they run with ``prefix_cache=False``
+    replica of a data-parallel deployment: with nothing else routed, the
+    conductor's pick sends each copy to the least-loaded replica, ties to the
+    one picked longest ago, so a group with ``n`` replicas runs the first
+    ``n`` copies on ``n`` different ones however the earlier copies were
+    queued or finished. When some worker graph has fewer replicas than that,
+    each spec first runs once alone, since that graph would batch the copies
+    and miss its one-request shape. Past one copy, they run with ``prefix_cache=False``
     unless the spec sets it, so no predicted hit (``routing_weights.prefix``)
     gathers them on one replica; the cost is that they leave a prefill from
     cached pages unwarmed.
@@ -2107,6 +2109,22 @@ def _decode_ws_files(
             path.unlink(missing_ok=True)
         raise
     return file_paths, parts
+
+
+async def _decode_ws_files_off_loop(
+    files: list | None, upload_dir: Path,
+) -> tuple[dict[str, list[str]], list[PromptPart]]:
+    """``_decode_ws_files`` on the threadpool. A cancel (the socket closed)
+    can't stop the thread, and the caller never learns its paths, so what
+    it saved is removed once it returns."""
+    decode = asyncio.ensure_future(run_in_threadpool(_decode_ws_files, files, upload_dir))
+    try:
+        return await asyncio.shield(decode)
+    except asyncio.CancelledError:
+        decode.add_done_callback(
+            lambda done: done.cancelled() or done.exception() or unlink_files(done.result()[0])
+        )
+        raise
 
 
 def _ws_modalities(value, key: str) -> list[str] | None:
@@ -2325,8 +2343,8 @@ async def generate_ws(websocket: WebSocket):
             end_input = _ws_end_input(message)
             if not text and not message.get("files") and (end_input is True or not api_server.takes_stream_input):
                 raise ValueError("message carries neither text nor files")
-            file_paths, parts = await run_in_threadpool(
-                _decode_ws_files, message.get("files"), api_server.upload_dir,
+            file_paths, parts = await _decode_ws_files_off_loop(
+                message.get("files"), api_server.upload_dir,
             )
             file_streams = _ws_file_streams(message.get("files"), parts)
             in_mods, parts = _ws_input_layout(
@@ -2444,8 +2462,8 @@ async def generate_ws(websocket: WebSocket):
             if text is not None and not isinstance(text, str):
                 raise ValueError("text must be a string")
             model_kwargs = _ws_model_kwargs(record.get("model_kwargs"))
-            file_paths, parts = await run_in_threadpool(
-                _decode_ws_files, record.get("files"), api_server.upload_dir,
+            file_paths, parts = await _decode_ws_files_off_loop(
+                record.get("files"), api_server.upload_dir,
             )
             file_streams = _ws_file_streams(record.get("files"), parts)
             if not file_paths and not text and not end_input:

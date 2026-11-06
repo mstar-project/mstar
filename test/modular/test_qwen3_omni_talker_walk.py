@@ -1,11 +1,11 @@
 """Qwen3-Omni's Thinker decides the Talker's walk.
 
-Not in cpu-core: importing the model needs flashinfer. The mechanism itself is
-tested in test_stream_walk_transitions.py.
+The mechanism itself is tested in test_stream_walk_transitions.py.
 """
 import pytest
 
-pytest.importorskip("flashinfer")
+# Qwen3OmniModel imports transformers at module level.
+pytest.importorskip("transformers")
 
 from mstar.conductor.request_info import CurrentForwardPassInfo  # noqa: E402
 from mstar.model.qwen3_omni.qwen3_omni_model import (  # noqa: E402

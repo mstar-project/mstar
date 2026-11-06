@@ -158,13 +158,14 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
         raise NotImplementedError
 
     def prompt_positions(
-        self, fwd_info: CurrentForwardPassInfo, layout: dict, num_tokens: int,
+        self, start: int, layout: dict, num_tokens: int,
     ) -> tuple[torch.Tensor | None, int | None]:
         """A media prompt's own position ids and how far it advances the
         position counter, for a model whose media do not take one position
-        per token (MRoPE). ``layout`` is the walk's ``MEDIA_LAYOUT`` (each
-        run's offset, tokens and grid). The default, ``(None, None)``, leaves
-        the position resource to place every token."""
+        per token (MRoPE). ``start`` is the counter's value, ``layout`` the
+        walk's ``MEDIA_LAYOUT`` (each run's offset, tokens and grid). The
+        default, ``(None, None)``, leaves the position resource to place every
+        token."""
         return None, None
 
     def decoder_kwargs(
@@ -291,7 +292,9 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
                 raise ValueError(f"{e.output} has {found} rows for the prompt's {pads} pads")
             if rows is not None:
                 media[e.output] = rows
-        pos_ids, advance = self.prompt_positions(fwd_info, layout, ids.shape[0])
+        # the stream's counter is keyed by the worker's handle (AGENTS.md invariant 14)
+        start = self.node_resources[ROPE].position(rid=fwd_info.rid_handle, label="main")
+        pos_ids, advance = self.prompt_positions(start, layout, ids.shape[0])
         return ARNodeInputs(
             input_seq_len=ids.shape[0],
             input_ids=ids,

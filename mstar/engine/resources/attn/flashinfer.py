@@ -34,6 +34,8 @@ if TYPE_CHECKING:
 
 
 class FlashInferManager(AttentionManager):
+    supports_drop = True
+
     def __init__(
         self,
         kv_cache: str,

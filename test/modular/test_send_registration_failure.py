@@ -34,6 +34,7 @@ from mstar.model.submodule_base import BatchedModelOutput
 from mstar.utils.containers import ParallelList
 from mstar.utils.ipc_format import ConductorMessageType, RemoveRequest
 from mstar.worker.micro_scheduler import ScheduledBatch
+from mstar.worker.rebuild import Rebuilds
 from mstar.worker.stream_buffers import StreamBufferManager
 from mstar.worker.worker import Worker
 
@@ -194,6 +195,7 @@ def _postprocess_worker(refuse, follower=False):
     w.parallel_nodes = {"llm"} if follower else set()
     w.parallel_leader_nodes = set()
     w._innermost_loop_by_node = {}
+    w._rebuilds = Rebuilds({}, {})
     w.log = SimpleNamespace(stop_checked=[], routed=[], registered=[], sent=[], conductor=[])
     w.scheduler = SimpleNamespace(failed_rids=set())
     w.scheduler.fail_rids = w.scheduler.failed_rids.update
@@ -277,7 +279,7 @@ def _postprocess_worker(refuse, follower=False):
 
 def _decode_step(rids, final_stream=()):
     node_batch = SimpleNamespace(
-        request_ids=list(rids), per_request_info=dict.fromkeys(rids),
+        node_name="llm", request_ids=list(rids), per_request_info=dict.fromkeys(rids),
         failed_requests={}, completion_event=None,
         final_stream_rids=set(final_stream), resource_publish_info={},
         partition_done_rids=set(), cached_rids=set(), withheld_outputs={},
@@ -403,7 +405,8 @@ def test_a_follower_still_routes_a_failed_rid_and_reports_it_once():
 def test_an_overlapping_view_fails_only_its_request_on_real_mooncake():
     """The issue's repro on Mooncake over TCP: a tensor and a view inside it
     overlap, which Mooncake refuses (-7)."""
-    pytest.importorskip("mooncake.engine")
+    # Without libibverbs the import raises ImportError, and the default skips only ModuleNotFoundError.
+    pytest.importorskip("mooncake.engine", exc_type=ImportError)
     from mstar.communication.tensors import create_tensor_communication_manager
 
     mgr = create_tensor_communication_manager(
@@ -425,7 +428,7 @@ def test_an_overlapping_view_fails_only_its_request_on_real_mooncake():
 def _real_manager(monkeypatch, rust):
     """Mooncake over TCP, with the given bookkeeper: the Rust one a worker
     uses, or the Python one a data worker falls back to."""
-    pytest.importorskip("mooncake.engine")
+    pytest.importorskip("mooncake.engine", exc_type=ImportError)
     if rust:
         pytest.importorskip("mstar_rust")
     else:

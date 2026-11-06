@@ -145,7 +145,7 @@ class LLMSubmodule(SampledTokenDecoder):
     # ------------------------------------------------------------------
 
     def prompt_positions(
-        self, fwd_info: CurrentForwardPassInfo, layout: dict, num_tokens: int,
+        self, start: int, layout: dict, num_tokens: int,
     ) -> tuple[torch.Tensor, int]:
         """A media prompt's ``[3, tokens]`` MRoPE ids, from the intake's
         layout (no read of the ids).
@@ -157,7 +157,7 @@ class LLMSubmodule(SampledTokenDecoder):
         """
         device = self.get_device()
         merge = self._merge_size
-        pos = start = self.node_resources[ROPE].position(rid=fwd_info.request_id, label="main")
+        pos = start
         pos_ids: list[torch.Tensor] = []
         cursor = 0
         for offset, tokens, grid in zip(

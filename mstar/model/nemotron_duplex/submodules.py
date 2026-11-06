@@ -711,4 +711,4 @@ def codec_step(codec: AudioCodec, pool, codes: torch.Tensor) -> CodecStreamAudio
 
 
 def pcm16(wav: torch.Tensor) -> torch.Tensor:
-    return (wav.clamp(-1, 1) * 32767).to(torch.int16)
+    return (wav.float().clamp(-1, 1) * 32767).to(torch.int16)
