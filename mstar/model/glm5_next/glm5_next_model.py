@@ -124,7 +124,7 @@ class Glm5NextModel(Model):
             if key in kwargs and (isinstance(kwargs[key], bool) or not isinstance(kwargs[key], int)):
                 raise ValueError(f"{key} must be an integer, got {kwargs[key]!r}")
         if kwargs.get("dsa_long_context", False):
-            # Contexts past index_topk through the k-pool indexer and sparse MLA (the DSA resource, dsa/kpool.py).
+            # Contexts past index_topk through the k-pool indexer and sparse MLA (the DSA resource).
             # Captured prefill buckets take whole short prompts; a longer prompt runs eager, in
             # token windows.
             self.config.dsa_long_context = True

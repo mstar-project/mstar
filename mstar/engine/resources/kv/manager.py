@@ -3889,6 +3889,11 @@ class KVManager(AttentionResource):
         """What `reclaimable` counts, the most reclaimable first."""
         return float(self.reclaimable(rid))
 
+    def stored_len(self, rid: str, label: str = "main") -> int:
+        """Tokens the stream holds."""
+        with self._lock:
+            return self._streams[rid][label].stored_len
+
     def _own_transfer_info(
         self,
         request_id: str,
@@ -4906,6 +4911,24 @@ class KVManager(AttentionResource):
                 token_to_page=state.token_to_page[start:end],
                 token_to_cache=state.token_to_cache[start:end],
                 total_tokens=end - start,
+            )
+        try:
+            yield
+        finally:
+            self._current_plan_states.update(full)
+
+    @contextmanager
+    def token_rows(self, rows: torch.Tensor, label: str | None = None) -> Iterator[None]:
+        """Narrow this step's write addressing to its tokens ``rows`` (a device index, any
+        order), for a pass over some of a step's rows: each writes at its own slot."""
+        if label is None:
+            label = self._default_label
+        full = {(label, g): self._current_plan_states[label, g] for g in range(len(self._groups))}
+        for key, state in full.items():
+            self._current_plan_states[key] = KVPlanState(
+                token_to_page=state.token_to_page[rows],
+                token_to_cache=state.token_to_cache[rows],
+                total_tokens=rows.numel(),
             )
         try:
             yield

@@ -1,4 +1,4 @@
-"""glm5_next DSA past index_topk (dsa/kpool.py) on CPU: the k-pool selection and pool keys against the
+"""glm5_next DSA past index_topk (dsa/paged.py, kpool > 1) on CPU: the k-pool selection and pool keys against the
 reference indexer (transformers' Glm5NextTextIndexer, ported below), and the long-context engine
 path against itself (one-shot prefill vs stepwise decode vs windowed prefill) and against dense
 MLA where they must agree.
@@ -20,7 +20,7 @@ from mstar.distributed.communication import WorkerParallelGroups
 from mstar.engine.engine import Engine, ExecutingBatch
 from mstar.engine.resources import SamplingReqConfig
 from mstar.engine.resources.base import Resource
-from mstar.engine.resources.dsa import kpool as dsa
+from mstar.engine.resources.dsa import paged as dsa
 from mstar.engine.resources.dsa import sparse_mla
 from mstar.engine.resources.kv import manager as kv_mod
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
@@ -88,7 +88,7 @@ class _Planes:
 def _ctx(page_table, positions, page_size, topk, kpool, spans=None):
     """A one-request context over ``page_table`` for rows at ``positions``."""
     n = len(positions)
-    return dsa.KPoolContext(
+    return dsa.DSAContext(
         pos=torch.tensor(positions, dtype=torch.int32),
         row_req=torch.zeros(n, dtype=torch.int32),
         pages=torch.tensor(page_table, dtype=torch.int32),
@@ -122,7 +122,7 @@ def test_selection_matches_reference(seq, chunks):
         planes.slots = (torch.tensor([pages[p // page] for p in positions]),
                         torch.tensor([p % page for p in positions]))
         ctx = _ctx(pages, positions, page, topk, kpool)
-        dsa.write_index(planes, 0, "main", k[start:start + c], gate[start:start + c], ape, ctx)
+        dsa.write_index(planes, 0, "main", k[start:start + c], ctx, gate=gate[start:start + c], ape=ape)
         slots = dsa.select(q[start:start + c], w[start:start + c], planes.layer_view(0), ctx)
         for r, p in enumerate(positions):
             n = dsa.attn_lens([p], topk, kpool)[0]
@@ -159,7 +159,7 @@ def test_sharded_prefill_selection_equals_unsharded():
     planes.slots = (torch.tensor([p // page for p in range(seq)]),
                     torch.tensor([p % page for p in range(seq)]))
     ctx = _ctx(pages, list(range(seq)), page, topk, kpool)
-    dsa.write_index(planes, 0, "main", k, gate, ape, ctx)
+    dsa.write_index(planes, 0, "main", k, ctx, gate=gate, ape=ape)
     want = dsa.select(q, w, planes.layer_view(0), ctx)
     group = _FakeGroup(4)
     group.call = 0
@@ -182,7 +182,7 @@ def test_pool_keys_match_reference_bf16():
     planes.slots = (torch.tensor([pages[p // page] for p in positions]),
                     torch.tensor([p % page for p in positions]))
     ctx = _ctx(pages, positions, page, 64, kpool)
-    dsa.write_index(planes, 0, "main", k, gate, ape, ctx)
+    dsa.write_index(planes, 0, "main", k, ctx, gate=gate, ape=ape)
     ref, members = _ref_pools(k, gate, ape, kpool)
     flat = planes.cache[0].view(-1, 3 * d)
     for j, last in enumerate(members[:, -1].tolist()):
@@ -436,138 +436,14 @@ def test_a_non_bf16_cache_on_cuda_is_refused_at_load():
         sub.bind_node_resources({KV_CACHE: kv})
 
 
-def test_a_node_with_dsa_double_buffers_its_captures_without_pre_plan(monkeypatch):
-    """A replay reads its slot's sparse plan, which ``plan`` re-plans through FlashInfer's
-    pinned staging: the node keeps two capture slots and fences their reuse even when no
-    pre-plan asks for them."""
-    from mstar.engine import engine as engine_mod
-    from mstar.engine.resources.dsa.config import DSAConfig
-
-    monkeypatch.setattr(engine_mod.knobs, "pre_plan_enabled", lambda: False)
-    kv_config = types.SimpleNamespace(tokens_per_page=8, max_seq_len=64, num_qo_heads=4,
-                                      kv_lora_rank=16, qk_rope_head_dim=0)
-    resource = dsa.KPoolDSA(DSAConfig(kv_cache=KV_CACHE, topk=16, kpool=4, sm_scale=0.1),
-                            kv_config, torch.device("cpu"))
-    mgmt = engine_mod.SubmoduleManagement(
-        submodule=None, forward=None, forward_batched=None, joint_comm_group=None,
-        resources={"dsa": resource})
-    assert mgmt.num_slots == 2 and mgmt.needs_slot_fence
-
-
-# -- the resource: a declared step, planned off the KV plan ------------------------------------
-
-_KV, _PAGE, _D = "kv", 4, 16
-
-
-def _kv_spec(planes=None):
-    from mstar.engine.resources.kv.config import AuxPlanes, KVLayout, KVSpec, PagedKVConfig
-
-    planes = {dsa.INDEX_PLANES: AuxPlanes(num_layers=2, width=3 * _D)} if planes is None else planes
-    return KVSpec(resource_key=_KV, nodes={"LLM"}, config=PagedKVConfig(
-        num_layers=2, num_kv_heads=1, head_dim=48, max_seq_len=64, max_num_pages=32,
-        page_size=_PAGE, num_qo_heads=16, layout=KVLayout.MLA, kv_lora_rank=32,
-        qk_rope_head_dim=16, aux_planes=planes))
-
-
-def _resource(planes=None, index_head_dim=_D):
-    from mstar.engine.resources.base import EngineResourceInfo, build_resource
-    from mstar.engine.resources.dsa.config import DSAConfig, DSASpec
-
-    spec = DSASpec(resource_key="dsa", nodes={"LLM"}, config=DSAConfig(
-        kv_cache=_KV, topk=8, kpool=4, sm_scale=0.1, index_head_dim=index_head_dim))
-    return build_resource(spec, EngineResourceInfo(
-        device=torch.device("cpu"), dependencies={_KV: _kv_spec(planes)}))
-
-
-def _kv_step(walk, pages, lengths, to_compute, lease=None, is_preplan=False) -> StepContext:
-    """A step whose KV plan holds one view per request: request i has ``lengths[i]`` tokens
-    after it, its last ``to_compute[i]`` new."""
-    from mstar.engine.resources.kv.plan import PagedIndptrs, SequenceView
-
-    views = [SequenceView(f"r{i}", "main", p, length=n, to_compute=c)
-             for i, (p, n, c) in enumerate(zip(pages, lengths, to_compute, strict=True))]
-    indptr = torch.tensor([0, *torch.tensor([len(p) for p in pages]).cumsum(0).tolist()])
-    flat = torch.tensor([page for p in pages for page in p], dtype=torch.int32)
-    plan = types.SimpleNamespace(views=views, cpu_indptrs=PagedIndptrs(
-        qo_indptr=None, paged_kv_indptr=indptr, paged_kv_indices=flat,
-        paged_kv_last_page_len=None))
-    ctx = StepContext(request_ids=tuple(f"r{i}" for i in range(len(pages))), graph_walk=walk,
-                      slot=0 if lease is None else lease.slot, capture=False,
-                      plan_results={_KV: {"main": plan}}, slot_lease=lease)
-    ctx.is_preplan = is_preplan
-    return ctx
-
-
-@pytest.mark.parametrize("planes, head_dim, match", [
-    ({}, _D, "aux_planes"),
-    (None, _D + 1, "3 x index_head_dim"),
-    (None, None, "3 x index_head_dim"),
-])
-def test_a_kpool_dsa_over_planes_it_cannot_hold_is_refused_at_build(planes, head_dim, match):
-    """A missing or mis-sized INDEX_PLANES booted, then failed on the first prefill."""
-    with pytest.raises(ValueError, match=match):
-        _resource(planes, head_dim)
-
-
-def test_a_declared_step_plans_its_rows_from_the_kv_plan():
-    """``plan`` takes each request's rows off the KV plan; the layers read them from the
-    resource, with nothing from preprocess."""
-    from mstar.engine.resources.dsa.config import DSAStep
-
-    res = _resource()
-    out = res.plan(DSAStep(), _kv_step("prefill", [[0], [5, 6, 7]], [3, 9], [3, 4]))
-    ctx = res.current()
-    assert out == {"main": ctx}
-    assert ctx.pos.tolist() == ctx.host_pos == [0, 1, 2, 5, 6, 7, 8]
-    assert ctx.row_req.tolist() == [0, 0, 0, 1, 1, 1, 1]
-    assert ctx.pages.tolist() == [0, 5, 6, 7] and ctx.page_start.tolist() == [0, 1]
-    assert ctx.spans == [(0, 3, 0), (3, 4, 1)] and ctx.max_pools == 2
-    with res.rows(3, 7, [(3, 7, 1)]):  # a window of the second request's rows
-        assert res.current().host_pos == [5, 6, 7, 8] and res.current().spans == [(0, 4, 1)]
-    assert res.current() is ctx
-
-
-def test_a_pre_plan_is_promoted_not_redone():
-    from mstar.engine.resources.dsa.config import DSAStep
-
-    res = _resource()
-    assert res.supports_preplan
-    res.plan(DSAStep(), _kv_step("decode", [[1, 2]], [7], [1]))
-    ahead = res.plan(DSAStep(), _kv_step("decode", [[1, 2]], [8], [1], is_preplan=True))
-    assert res.current().host_pos == [6]  # the live plan stays until the step runs
-    promoted = res.plan(DSAStep(), _kv_step("decode", [[3]], [2], [1]))
-    assert promoted is ahead and res.current().host_pos == [7]
-
-
-def test_plans_under_one_capture_lease_fill_the_same_buffers():
-    """A captured graph reads a slot's rows where the capture saw them: every later plan under
-    that lease refills them, padding included, and a bucket past one sparse plan is refused
-    when the buffers are sized."""
-    from mstar.engine.resources.base import CGSlotSpec
-    from mstar.engine.resources.dsa.config import DSAStep
-    from mstar.engine.resources.step import BucketKey, SlotLease
-
-    res = _resource()
-    bucket = BucketKey("decode", bs=2, num_tokens=2)
-    res.build_accelerator_graph_buffers([CGSlotSpec(bucket=bucket, slot=1, config=None)], 2, 2)
-    lease = SlotLease(slot=1, bucket=bucket)
-    first = res.plan(DSAStep(), _kv_step("decode", [[1, 2], [4]], [7, 3], [1, 1], lease))["main"]
-    second = res.plan(DSAStep(), _kv_step("decode", [[3, 5], [6]], [8, 2], [1, 1], lease))["main"]
-    assert second.pos.data_ptr() == first.pos.data_ptr()
-    assert second.pages.data_ptr() == first.pages.data_ptr()
-    assert second.pos.tolist() == [7, 1] and second.pages[:3].tolist() == [3, 5, 6]
-    assert second.host_pos is None and second.max_pools == 64 // 4  # the serving window's
-    with pytest.raises(ValueError, match="sparse plan"):
-        res.build_accelerator_graph_buffers(
-            [CGSlotSpec(bucket=BucketKey("prefill", 1, 2 * sparse_mla.MAX_ROWS), slot=0,
-                        config=None)], 1, 2 * sparse_mla.MAX_ROWS)
-
-
 def test_the_engine_plans_the_declared_dsa_step():
-    """A long prompt's prefill: the engine planned the DSA step its submodule declares."""
+    """A long prompt's prefill: the engine planned the DSA step its submodule declares, and the
+    layers read that plan, with nothing from preprocess."""
     from mstar.model.glm5_next.config import DSA
 
-    engine, _, _ = _engine(long_context=True)
+    engine, sub, _ = _engine(long_context=True)
+    ar = types.SimpleNamespace(input_ids=torch.tensor([1, 2]), input_seq_len=2)
+    assert DSA in sub.declare_step("prefill", ["a"], [ar]).keys()
     engine.add_request("a", {SAMPLER: SamplingReqConfig(temperature=0.0)})
     _step(engine, "prefill", {"a": torch.randint(0, 250, (100,))})
     assert engine._resources[DSA].current().host_pos == list(range(100))

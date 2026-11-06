@@ -18,6 +18,19 @@ def is_full_indexer_layer(config: Glm52ModelConfig, layer_idx: int) -> bool:
     return not skip
 
 
+def full_indexer_layers(config: Glm52ModelConfig) -> list[int]:
+    """The trunk's FULL layers in order: a FULL layer's index in this list is its index plane
+    on the MLA cache's pages."""
+    return [i for i in range(config.num_hidden_layers) if is_full_indexer_layer(config, i)]
+
+
+def index_store_layer(config: Glm52ModelConfig, layer_idx: int) -> int:
+    """A FULL layer's index plane; the MTP layer's (past the trunk) comes after the trunk's,
+    as its latent plane does."""
+    full = full_indexer_layers(config)
+    return len(full) if layer_idx >= config.num_hidden_layers else full.index(layer_idx)
+
+
 class Glm52Indexer(nn.Module):
     """DSA indexer projections for one FULL layer: the key each token stores, and each query
     row's heads and head weights."""

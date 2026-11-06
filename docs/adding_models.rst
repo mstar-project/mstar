@@ -666,7 +666,7 @@ The spec types are:
        (default ``True``) runs one-token decode rows on FlashInfer's tensor-core
        kernel; ``False`` picks the CUDA-core decode kernel, which can be faster for
        MHA and narrow GQA (few query heads per KV head). Measure before changing it:
-       Whisper, Qwen3-ASR and Qwen3-TTS declare ``False``. ``decode_fmha`` (default ``False``) runs
+       Whisper and Qwen3-ASR declare ``False``. ``decode_fmha`` (default ``False``) runs
        captured one-token decode rows on FlashInfer's trtllm-gen fmha kernel on Blackwell,
        with no FlashInfer plan per step; a geometry trtllm-gen has no kernel for keeps
        the paged kernel, with a warning. Eager steps and prompt rows stay on the paged
@@ -710,26 +710,21 @@ The spec types are:
        (replicas included) or hand out
        ``write_slots`` yet either; each of these is refused.
    * - ``DSASpec(config=DSAConfig(kv_cache=..., topk=...))``
-     - DeepSeek sparse attention (DSA) over the named ``KVLayout.MLA`` cache. A step
-       declares ``DSAStep()``, and the resource takes each request's rows from the KV plan.
-       The model's indexer layers store their index keys (``store_keys``) and pick each
-       query's top ``topk`` positions by the indexer's score (``select``); a layer that
-       reuses an earlier layer's pick reads it with ``shared_selection``. ``attend`` runs
-       absorbed MLA over just the picked latents. The keys sit in per-request buffers
-       outside the paged pool and the selection runs per request on the host, so the
-       resource is eager only, a prompt must fit in ``topk`` and past ``topk`` a request
-       decodes one row per step. Once one row of a batch passes ``topk``, every row of it
-       attends its pick. GLM-5.2 declares it under ``dsa_long_context``. Planned: the keys
-       move onto the MLA cache's pages under its page table, so the allocator, eviction and
-       prefix caching cover them, and selection gets fixed-shape buffers so decode captures.
-       ``kpool`` above 1 scores one pooled key per ``kpool`` tokens (GLM-5.3). That
-       resource is the paged one: its index rows sit on the aux planes ``INDEX_PLANES``
-       the model declares on the cache (``3 * index_head_dim`` wide, checked at build), and
-       it scores, picks and attends on device, under CUDA graphs. Its ``plan`` builds the
-       step's rows from the KV plan, into buffers of the capture slot under a lease, and the
-       layers call ``write_index``, ``select`` and ``attend``, which read it; ``rows``
-       narrows it for a forward run in windows. ``sm_scale`` is the absorbed MLA's softmax
-       scale for its sparse-attention plans.
+     - DeepSeek sparse attention (DSA) over the named ``KVLayout.MLA`` cache: past ``topk``
+       keys, each query row attends only the ``topk`` tokens its indexer scores highest.
+       The index keys sit on the cache's pages, in the aux planes ``INDEX_PLANES`` the
+       model declares on its ``PagedKVConfig``, so they share its page table; a row is
+       ``index_head_dim`` wide, three times that with ``kpool`` above 1 (checked at build).
+       A step declares ``DSAStep()``: ``plan`` builds its rows from the KV plan, into
+       buffers of the capture slot under a lease (the graph reads them, every plan refills
+       them), and the layers write their keys, select and attend through the resource
+       (``write_index``, ``select``, ``attend``), on device and under CUDA graphs. A pass
+       over some of a step's rows narrows the plan (``rows``, ``pick``) and writes at their
+       own slots inside ``KVManager.token_window`` or ``token_rows``; ``dense`` leaves a
+       pass to dense attention.
+       ``kpool`` above 1 scores one pooled key per ``kpool`` tokens (GLM-5.3);
+       ``dense_below_topk`` attends densely while no row sees more than ``topk`` keys
+       (GLM-5.2); ``sm_scale`` is the absorbed MLA's softmax scale for the sparse plans.
    * - ``CrossAttentionSpec(config=CrossAttentionConfig(...))``
      - Attention over a paged context that is written once and never extended.
        ``backend`` defaults to ``AttnBackend.AUTO``. Only FlashInfer is implemented.
@@ -1776,7 +1771,7 @@ this step. Such a region declares, plans and commits its own work. Any resource 
 region owns must therefore be excluded from the outer declaration. See
 `Piecewise CUDA graphs (capturing an inner loop)`_.
 
-**Advanced** ``KVStep`` **fields.** These fields cover cases that the engine previously
+**Advanced ``KVStep`` fields.** These fields cover cases that the engine previously
 handled as special cases. BAGEL uses all of them, in
 ``mstar/model/bagel/submodules.py``:
 
@@ -1912,15 +1907,6 @@ request_ids, values)``. Under a CUDA-graph slot the store is captured into a per
 buffer and commit persists it, so the step must list the name in
 ``SamplerStep(loopback_writes=...)``. An eager step writes the rows by request. Both paths
 address rows the same way, and the model never sees a slot index.
-
-A kernel in the forward can draw its rows' tokens itself, as Qwen3-TTS's depth-loop kernel
-does for fifteen draws a step. ``sampler.fused_draw_args()`` returns the step's per-row
-temperature, top-k, top-p, seed and offset, in the forward's row order, and the kernel draws
-each row with ``mstar.engine.resources.sampler.fused_draw.draw_row``, which picks the token
-``fused_sample`` would. After the launch, ``sampler.advance_offsets(draws)`` moves the offsets
-as that many ``sample`` calls would. ``fused_draw_args()`` returns None when ``sample`` would
-do more than that draw (an eager step, the penalty, min-p, logprobs, a kept last token,
-TP); the model then calls ``sample``.
 
 .. warning::
 
