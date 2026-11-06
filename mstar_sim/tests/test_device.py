@@ -950,6 +950,47 @@ def test_a_clock_read_is_held_only_where_it_can_be_let_go():
     assert out.strip() == "returned", out
 
 
+def test_an_exiting_process_keeps_its_slot_and_its_table_until_it_is_gone():
+    """A process in finalization is still a peer, at real rate: two idle processes don't carry a
+    third's ``join(timeout)`` past it. And a table isn't unlinked under a process about to claim
+    a slot in it, which would then share no time with one that comes later."""
+    exiting, waiter, _ = run_deployment("""
+        class Slow:
+            def __del__(self, real=waits._real_sleep):
+                real(1.0)
+        slow = Slow()
+        barrier()
+    """, """
+        barrier()
+        waits._real_sleep(0.2)  # the first is in finalization
+        wall = time.clock_gettime(time.CLOCK_MONOTONIC)
+        time.sleep(0.5)
+        print(time.clock_gettime(time.CLOCK_MONOTONIC) - wall)
+        open(TMP + "/done", "w").close()
+    """, """
+        barrier()
+        while not os.path.exists(TMP + "/done"):
+            time.sleep(0.05)
+    """)
+    assert float(waiter) >= 0.4, waiter
+    out = run_sim("""
+        import fcntl, os, threading
+        from mstar_sim import table, waits
+        path = table.path_for(f"test-{os.getpid()}-leave")
+        first, late = table.Table(path), []
+        fcntl.fcntl(first._fd, table._F_OFD_SETLK, table._flock(fcntl.F_WRLCK, 0))  # as a claim in progress
+        claim = threading.Thread(target=lambda: late.append(table.Table(path)))
+        claim.start()
+        waits._real_sleep(0.3)  # it has the file open, and waits to claim a slot
+        first.leave()
+        fcntl.fcntl(first._fd, table._F_OFD_SETLK, table._flock(fcntl.F_UNLCK, 0))
+        claim.join()
+        print(os.path.exists(path))
+        late[0].leave()
+    """)
+    assert out.strip() == "True", out
+
+
 def test_a_read_held_behind_a_rising_bound_doesnt_abort():
     """The limit is on a bound that stands still, not on a hold: a device wait can put a process
     far past a peer that runs at real rate, and it then waits for the peer to get there."""

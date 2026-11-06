@@ -813,6 +813,7 @@ def _unpark_now() -> None:
 
 
 def _leave() -> None:
+    TABLE.tick(clock.now())
     TABLE.leave()  # (this process's table, after a fork)
 
 

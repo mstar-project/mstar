@@ -8,7 +8,7 @@ slot, and every field is one aligned word: a reader needs no snapshot, as a cloc
 and a deadline is written before the flag that says to read it.
 
 A slot publishes its clock, its next event (the earliest deadline of a blocked process, ``inf``
-if none), whether it runs, and whether a thread of it is at a meet.
+if none), whether it runs, whether a thread of it is at a meet, and when it began to exit.
 
 :meth:`Table.bound` is how far this process may go: the minimum over the other live slots of
 their clock if running, else their next event. Each slot's mover has a futex word of its own in
@@ -29,7 +29,7 @@ import zlib
 
 SLOTS = 64
 _WORDS = 8  # a slot's 64-bit words
-_CLOCK, _NEXT, _RUNNING, _MEET, _EPOCH, _RANK, _WAKE = range(7)
+_CLOCK, _NEXT, _RUNNING, _MEET, _EPOCH, _RANK, _WAKE, _LEFT = range(8)
 _HEADER = 8  # words before the first slot: the second is how many slots were ever used
 _LIVE_FOR = 0.05  # real seconds a look at who is alive stands: a peer's death takes this long to see
 _real = time.perf_counter  # (bound here, before the emulator patches it)
@@ -54,20 +54,20 @@ class Table:
 
     def __init__(self, path: str | None):
         self.path = path
-        if path is None:
-            self._fd = -1
-            self._map = mmap.mmap(-1, _SIZE)
-        else:
+        self._fd = -1
+        while path is not None:  # one process at a time claims, and resets a dead run's table
             self._fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
-            os.ftruncate(self._fd, _SIZE)
-            self._map = mmap.mmap(self._fd, _SIZE)
+            fcntl.fcntl(self._fd, _F_OFD_SETLKW, _flock(fcntl.F_WRLCK, 0))
+            if os.fstat(self._fd).st_nlink:
+                os.ftruncate(self._fd, _SIZE)
+                break
+            os.close(self._fd)  # the last one out took this one with it
+        self._map = mmap.mmap(self._fd, _SIZE)
         self._q = memoryview(self._map).cast("Q")
         self._d = memoryview(self._map).cast("d")
         self._base = ctypes.addressof(ctypes.c_char.from_buffer(self._map))
         self._looked = -math.inf
         self.live: list[int] = []  # the others, as of the last look
-        if self._fd >= 0:  # one process at a time claims, and resets a dead run's table
-            fcntl.fcntl(self._fd, _F_OFD_SETLKW, _flock(fcntl.F_WRLCK, 0))
         try:
             self.me = self._claim()
             self._mine = _HEADER + self.me * _WORDS
@@ -80,6 +80,7 @@ class Table:
             self._q[self._mine + _RUNNING] = 1
             self._q[self._mine + _MEET] = 0
             self._q[self._mine + _RANK] = 0
+            self._d[self._mine + _LEFT] = 0.0
         finally:
             if self._fd >= 0:
                 fcntl.fcntl(self._fd, _F_OFD_SETLK, _flock(fcntl.F_UNLCK, 0))
@@ -124,7 +125,13 @@ class Table:
 
     def latest(self) -> float:
         """The latest clock among the others (0.0: none has published)."""
-        return max((self._d[_HEADER + slot * _WORDS + _CLOCK] for slot in self.live), default=0.0)
+        return max((self._clock(slot) for slot in self.live), default=0.0)
+
+    def _clock(self, slot: int) -> float:
+        """A slot's clock: one exiting runs on at real rate, as nothing reads it now."""
+        base = _HEADER + slot * _WORDS
+        left = self._d[base + _LEFT]
+        return self._d[base + _CLOCK] + (_real() - left if left else 0.0)
 
     def publish(self, clock: float, running: bool, next_event: float = math.inf, meet: int = 0) -> None:
         """This slot's state changed: tell the others (a new epoch, and every mover wakes).
@@ -173,7 +180,9 @@ class Table:
             base = _HEADER + slot * _WORDS
             if not self._d[base + _CLOCK]:  # (0: it has yet to publish)
                 continue
-            if meet:
+            if self._d[base + _LEFT]:
+                bound = min(bound, self._clock(slot))
+            elif meet:
                 if rank or not (self._q[base + _RUNNING] or meets.count(meet) >= meet & 0xFF):
                     continue
                 bound = min(bound, self._d[base + _CLOCK])
@@ -190,18 +199,23 @@ class Table:
             base = _HEADER + slot * _WORDS
             lines.append(f"  slot {slot}{' (this process)' if slot == self.me else ''}: clock "
                          f"{self._d[base + _CLOCK]:.6f}, {'running' if self._q[base + _RUNNING] else 'blocked'}, next "
-                         f"event {self._d[base + _NEXT]:.6f}{', at a meet' if self._q[base + _MEET] else ''}")
+                         f"event {self._d[base + _NEXT]:.6f}{', at a meet' if self._q[base + _MEET] else ''}"
+                         f"{', exiting' if self._d[base + _LEFT] else ''}")
         return "\n".join(lines)
 
     def leave(self) -> None:
-        """A clean exit: the last slot out takes the table with it (whoever claims a table
-        with no live slot resets it, should a death leave one)."""
+        """A clean exit, before the process's last real time. It is still a peer until it dies,
+        when the kernel drops its slot: it counts as running at real rate, as nothing reads its
+        clock now. The last slot out takes the table with it (whoever claims a table with no live
+        slot resets it, should a death leave one)."""
         if self._fd >= 0:
-            fcntl.fcntl(self._fd, _F_OFD_SETLK, _flock(fcntl.F_UNLCK, self._lock_byte(self.me)))
+            fcntl.fcntl(self._fd, _F_OFD_SETLKW, _flock(fcntl.F_WRLCK, 0))
+            self._d[self._mine + _LEFT] = _real()
             self._looked = -math.inf
-            if not self._live():
+            if all(self._d[_HEADER + slot * _WORDS + _LEFT] for slot in self._live()):
                 with contextlib.suppress(FileNotFoundError):
                     os.unlink(self.path)
+            fcntl.fcntl(self._fd, _F_OFD_SETLK, _flock(fcntl.F_UNLCK, 0))
 
     def _wake(self, slot: int) -> None:
         """Wake a slot's mover. Its word moves by an amount of this slot's, so two writers racing
