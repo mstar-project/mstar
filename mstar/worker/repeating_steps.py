@@ -440,15 +440,16 @@ class RepeatingSteps:
     ) -> None:
         """Serve what a run on the device leaves free until it lands: messages,
         ready tensors, the lanes. Before ``_finish_step``, so a lane's postprocess
-        doesn't nest in N's. A row can't join a run, so it ends the run, and N+1
-        behind it, at the next iteration, as the speculation's own yield does:
-        for other work at once; for a row of the run's walk, as a prefill on a
-        lane readies one when it lands, once it turns ready here with nothing
-        waiting, since rows of its walk ready already are ones the step had no
-        room for. With the fairness peek on, other work never sits through a
-        wait, so that nothing is of its walk. Whether N+1 has room for the new
-        row isn't asked: one that doesn't fit costs the two runs' rest once, and
-        the next wait sees it waiting."""
+        doesn't nest in N's. A row can't join a run, so it ends the run at its next
+        iteration, as the speculation's own yield does, and N+1 behind it before
+        its first, or after it if N+1 is one iteration (``run_start``): for other
+        work at once; for a row of the run's walk, as a prefill on a lane readies
+        one when it lands, once it turns ready here with nothing waiting, since
+        rows of its walk ready already are ones the step had no room for. With
+        the fairness peek on, other work never sits through a wait, so that
+        nothing is of its walk. Whether N+1 has room for the new row isn't asked:
+        one that doesn't fit costs the rest of N and N+1, which restarts behind a
+        host build, once, and the next wait sees it waiting."""
         rows = set(batch_N.batch.request_to_worker_graph)
         if spec_pending is not None:
             # the loop's admit fence, for what follows: N+1's launch needs nothing of N's postprocess
