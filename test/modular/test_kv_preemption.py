@@ -585,6 +585,30 @@ def test_a_request_its_moves_admitted_passes_an_older_one_that_asks_after_even_w
     assert (NODE, "b") in started, "b waits behind a for room it already holds, and nothing will grow"
 
 
+def test_a_request_its_moves_admitted_passes_an_older_dropped_one_waiting_at_its_arrival():
+    """b's moves admitted it, then a, older, was dropped and waits at its arrival ahead of b, for pages that include
+    b's allotment. No request passes a dropped request, and `make_room` takes nothing from b for a, so neither ever
+    started."""
+    kv = _pool()
+    _running(kv, "x", 1, arrival=0)
+    _running(kv, "a", 6, arrival=1)
+    _running(kv, "w", 3, arrival=3)
+    assert _preempt(kv, "w", _short(kv, "w"), droppable=lambda rid: True).waits
+    _runner(kv).readmit("w", NODE, queued=False)
+    _request(kv, "b", 3, arrival=2)
+    assert not _admitted(kv, "b")
+    assert _make_room(kv, droppable=lambda rid: True).to_drop == ["w"]
+    _drop(kv, "w")
+    assert "b" in kv._allotments
+    _drop(kv, "a")
+    _remove(kv, "x")
+    assert _queue(kv) == ["a", "b", "w"]
+
+    started = _runner(kv).admit_waiting(lambda rid, node: None)
+
+    assert (NODE, "b") in started, "b waits behind a, which waits for the pages b's allotment holds"
+
+
 def test_a_request_no_move_covers_waits_in_the_queue_until_its_whole_shortage_fits():
     kv = _pool()
     _running(kv, "a", 1, arrival=0)
