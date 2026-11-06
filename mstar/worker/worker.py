@@ -480,8 +480,6 @@ class Worker(RepeatingSteps):
 
     # (node, walk) -> its stop policy that withholds outputs; set at load
     _withholding: Mapping[tuple[str, str], StopPolicy] = MappingProxyType({})
-    # messages taken in while a run was awaited, not yet processed
-    _held_messages: tuple = ()
     # ``_run_copies``'s stream, made on first use
     _copy_stream: "torch.cuda.Stream | None" = None
     # (node, walk) whose runs go on the device
@@ -1603,11 +1601,7 @@ class Worker(RepeatingSteps):
                 phase_end(_MSG_SPANS[message.message_type], t0)
 
     def _process_messages(self) -> None:
-        messages = self.communicator.get_all_new_messages()
-        if self._held_messages:
-            # what arrived while a run was awaited, first (``_await_run``)
-            messages, self._held_messages = [*self._held_messages, *messages], ()
-        self._process_message_list(messages)
+        self._process_message_list(self.communicator.get_all_new_messages())
 
     # ------------------------------------------------------------------
     # Tensor readiness
@@ -3811,26 +3805,10 @@ class Worker(RepeatingSteps):
             with self._span("worker.postprocess.event_sync"):
                 if batch_N.node_batch.token_stream is not None:
                     self._stream_tokens(batch_N)
-                elif (
-                    self._device_runs and (batch_N.node_name, batch_N.graph_walk) in self._device_runs
-                    and batch_N.node_batch.step_context.repeats > 1
-                ):
-                    self._await_run(batch_N)
                 batch_N.node_batch.completion_event.synchronize()
         else:
             with self._span("worker.postprocess.device_sync"):
                 torch.accelerator.synchronize(self.device)
-
-    def _yields_on_arrival(self, batch_N: PendingBatch) -> bool:
-        """Takes in what arrived, held for ``_process_messages``; on a new
-        request, ends the run in flight at its next iteration and says so."""
-        arrived = self.communicator.get_all_new_messages()
-        if arrived:
-            self._held_messages = (*self._held_messages, *arrived)
-            if any(m.message_type == WorkerMessageType.NEW_REQUEST for m in arrived):
-                self.engine_manager.get_engine(batch_N.node_name).yield_runs(batch_N.node_name)
-                return True
-        return False
 
     def _postprocess_batch(
         self, batch_N: PendingBatch,
@@ -5157,12 +5135,8 @@ class Worker(RepeatingSteps):
                 and self.scheduler.has_ready_excluding(self.request_state, chain_key)
             )
             must_yield_away = consecutive >= fair.max_consecutive or other_ready
-            if (
-                other_ready and pending.node_batch.step_context.repeats > 1
-                and not self._step_repeats.config(pending.node_name).ready_waits
-            ):
-                # a run on the device ends at its next iteration, not at its count
-                self.engine_manager.get_engine(pending.node_name).yield_runs(pending.node_name)
+            if other_ready:
+                self._end_run_for_ready_rows(pending)
             if target is not None and not must_yield_away and not admit_refused:
                 if self.enable_nvtx:
                     range_push("worker.speculate", synchronize=False)
@@ -5170,6 +5144,11 @@ class Worker(RepeatingSteps):
                 speculation = self._try_speculate_next(pending, target, owes_run)
                 if speculation is not None and not speculation.is_yield_away:
                     self._stamp_repeats(speculation, pending, consecutive, owes_run)
+                if speculation is not None and (
+                    len(speculation.scheduled_batch.request_to_worker_graph) != len(speculation.continuing_rids)
+                ):
+                    # rows that turned ready since the last look wait behind ``pending`` alone
+                    self._end_run_for_ready_rows(pending)
                 if self._phase_period:
                     self._phase_record("speculate", _time.perf_counter() - _t0)
                 if self.enable_nvtx:
@@ -5298,7 +5277,7 @@ class Worker(RepeatingSteps):
                 self.engine_manager.engine.repeat_note,
             )
             self.streams.windows = self._step_repeats.windows()
-            # a run on the device, which an arrival can end early (``_await_run``)
+            # a run on the device, which a row turning ready can end early (``_await_run``)
             self._device_runs = frozenset(
                 key for key in self._step_repeats.device_stops()
                 if self._step_repeats.may_repeat(*key) and not self._step_repeats.config(key[0]).ready_waits
@@ -5716,6 +5695,8 @@ class Worker(RepeatingSteps):
                     # failed rids upstream.
                     laps.skip()
                     if pending.node_batch.admit_error is None:
+                        if self._is_device_run(pending):
+                            self._await_run(pending, spec_pending, lanes, gpu_executor)
                         self._finish_step(pending, outputs)
                         laps.skip()
 
@@ -5773,8 +5754,7 @@ class Worker(RepeatingSteps):
                     if busy:
                         finish_first_to_land(busy)
                         continue
-                    if not self._held_messages:  # what a run's wait drained is work already
-                        self.communicator.wait_for_work(10)
+                    self.communicator.wait_for_work(10)
                     continue
 
                 if self.enable_nvtx:

@@ -9,6 +9,7 @@ are the ones that need the worker's runtime, engine and streams, kept out of
 from __future__ import annotations
 
 import time
+from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING
 
 import torch
@@ -18,10 +19,13 @@ from mstar.engine.resources.resident import NOT_ASKED
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.submodule_base import EMITTED_COUNT, BatchedModelOutput, HostRows
 from mstar.streaming.topology import ProducerWalkCtx
+from mstar.worker.micro_scheduler import CHAIN_LANE
 from mstar.worker.step_repeats import edge_refusal, loop_back, run_columns
 
 if TYPE_CHECKING:
     from mstar.graph.runtime.base import PostprocessStep
+    from mstar.utils.threads import ThreadPool
+    from mstar.worker.lanes import Lane
     from mstar.worker.micro_scheduler import ScheduledBatch
     from mstar.worker.speculation import Speculation
     from mstar.worker.worker import PendingBatch
@@ -369,21 +373,56 @@ class RepeatingSteps:
                 for old in [k for k in record if k < seq - _TP_REPEATS_KEPT]:
                     del record[old]
 
-    def _await_run(self, batch_N: PendingBatch) -> None:
-        """Wait out a run on the device, ending it at its next iteration once
-        a new request arrives: the yield the step's speculation asks for comes
-        before any arrival during the run. What arrived is held for
-        ``_process_messages``, in order."""
-        event = batch_N.node_batch.completion_event
-        while not event.query():
-            if self._yields_on_arrival(batch_N):
-                return
+    def _end_run_for_ready_rows(self, step: PendingBatch) -> None:
+        """``step``'s run on the device ends at its next iteration, not at its count."""
+        if step.node_batch.step_context.repeats > 1 and not self._step_repeats.config(step.node_name).ready_waits:
+            self.engine_manager.get_engine(step.node_name).yield_runs(step.node_name)
+
+    def _is_device_run(self, step: PendingBatch) -> bool:
+        return (
+            (step.node_name, step.graph_walk) in self._device_runs
+            and step.node_batch.step_context.repeats > 1 and step.node_batch.completion_event is not None
+        )
+
+    def _await_run(
+        self, batch_N: PendingBatch, spec_pending: PendingBatch | None, lanes: Sequence[Lane], gpu_executor: ThreadPool,
+    ) -> None:
+        """Serve what a run on the device leaves free until it lands: messages,
+        ready tensors, the lanes. Before ``_finish_step``, so a lane's postprocess
+        doesn't nest in N's. A row can't join a run, so one that turns ready on
+        the chain ends it, and N+1 behind it, at the next iteration; a prefill on
+        a lane does that as it lands, not as its request arrives. Rows ready
+        already had their look at the speculation, which a full step leaves out."""
+        rows = set(batch_N.batch.request_to_worker_graph)
+        if spec_pending is not None:
+            rows.update(spec_pending.batch.request_to_worker_graph)
+        self._hold_rows(CHAIN_LANE, rows)
+        waiting = self.scheduler.has_ready_excluding(self.request_state, None)
+        engine = self.engine_manager.get_engine(batch_N.node_name)
+
+        def serve() -> None:
+            self._process_messages()
+            self._check_ready_tensors()
+            self._poll_stream_buffers()
+            for lane in lanes:
+                lane.finish()
+                lane.launch(gpu_executor)
+            # every pass: N+1 clears the word as it stages, maybe after this ended N
+            if not waiting and self.scheduler.has_ready_excluding(self.request_state, None):
+                engine.yield_runs(batch_N.node_name)
+
+        node_batch = batch_N.node_batch
+        if node_batch.token_stream is not None:
+            self._stream_tokens(batch_N, serve)
+            return
+        while not node_batch.completion_event.query():
+            serve()
             time.sleep(_LANDED_POLL_S)
 
-    def _stream_tokens(self, batch_N: PendingBatch) -> None:
-        """While a run is in flight, send the client what it has landed. The
-        step's rows are those still live: a row that stopped, failed or
-        drained after it was built sends nothing."""
+    def _stream_tokens(self, batch_N: PendingBatch, serve: Callable[[], None] | None = None) -> None:
+        """While a run is in flight, send the client what it has landed, and
+        ``serve`` between looks. The step's rows are those still live: a row
+        that stopped, failed or drained after it was built sends nothing."""
         node_batch = batch_N.node_batch
         stream: TokenStream = node_batch.token_stream
         walk = batch_N.graph_walk
@@ -407,8 +446,6 @@ class RepeatingSteps:
             limits, count, cap = rows[rid]
             return True, count + column + 1 >= cap or policy.stops(count + column, token, limits)
 
-        # a run on the device still ends early for a new request (``_await_run``)
-        watch = bool(self._device_runs) and (batch_N.node_name, walk) in self._device_runs
         while True:
             finished = node_batch.completion_event.query()
             rids, values = stream.take(decide)
@@ -416,8 +453,8 @@ class RepeatingSteps:
                 self._graph_runtime.send_tokens(rids, values, signal, modality)
             if finished:
                 return
-            if watch and self._yields_on_arrival(batch_N):
-                watch = False
+            if serve is not None:
+                serve()
             time.sleep(_LANDED_POLL_S)
 
     def _settle_run(self, batch_N: PendingBatch, host_rows: "HostRows | None", engine) -> None:

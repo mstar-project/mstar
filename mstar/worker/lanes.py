@@ -9,7 +9,8 @@ in the serving config that sets ``lane: <id>`` runs its walks (its
 ``graph_walks``, else every walk of its nodes) on that lane instead: the
 scheduler hands the lane only those keys
 (``MicroScheduler.lane_of``), its steps run on the GPU thread between two chain
-steps, and they land on the lane's stream while the chain carries on. Submit,
+steps, or beside a run on the device (``Worker._await_run``), and they land on
+the lane's stream while the chain carries on. Submit,
 the refused-step tail and postprocess are the chain's own
 (``Worker._submit_step``, ``Worker._settle_step_rows``, ``Worker._finish_step``),
 keyed by lane.

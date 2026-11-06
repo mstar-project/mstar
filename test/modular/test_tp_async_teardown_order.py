@@ -383,6 +383,37 @@ def test_a_follower_that_drops_a_step_tears_down_before_it_takes_the_next(monkey
     assert log.index(("teardown", "gone")) < log.index(("admit", 2)), log
 
 
+def test_a_removal_taken_in_during_a_run_waits_for_the_step_behind_the_run(monkeypatch):
+    """A run's wait reads messages before N is post-processed, with N+1 already on the GPU
+    thread. N+1 took in "idle" fresh, so N's rows alone don't cover it."""
+    w, log = _rank(monkeypatch, tp_rank=0, inbox=[[], [], [RemoveRequest(request_id="idle")]])
+    w.scheduler.has_ready_excluding = lambda state, key: False
+    w.engine_manager.get_engine = lambda node: None
+    w._is_device_run = lambda step: step.tp_seq == 0
+    landed = iter([False, True])
+    build_executing, build_speculation = w._build_executing_batch, w._build_speculation
+
+    def _executing(batch):
+        node_batch = build_executing(batch)
+        node_batch.token_stream = None
+        node_batch.completion_event = SimpleNamespace(query=lambda: next(landed))
+        return node_batch
+
+    def _speculation_taking_idle(pending, consecutive, fair):
+        spec, gave_way = build_speculation(pending, consecutive, fair)
+        if spec is not None:
+            spec.scheduled_batch, spec.node_batch = _batch(1, [HANDLES["idle"]])
+        return spec, gave_way
+
+    w._build_executing_batch = _executing
+    w._build_speculation = _speculation_taking_idle
+    deferred_by_n = []
+    w._finish_step = lambda step, outputs: deferred_by_n.extend(w._pending_removes)
+    _run(w)
+
+    assert deferred_by_n == [HANDLES["idle"]] and ("teardown", "idle") not in log, log
+
+
 def test_a_follower_counts_a_head_it_drops_on_arrival(monkeypatch):
     """N raises, and rank 0's head from it lands after that, so this rank drops it unqueued.
     Rank 0 stamped "gone" with that head, and the row "gone" gave up let it send N+2 for a

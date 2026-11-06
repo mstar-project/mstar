@@ -482,31 +482,78 @@ def test_a_decode_wrapper_reads_its_lengths_off_the_table():
     assert wrapper._paged_kv_last_page_len_buf.tolist()[:2] == [2, 3]
 
 
-def test_a_request_that_arrives_mid_run_ends_the_run_and_is_processed_in_order(monkeypatch):
-    """The speculation's yield comes before any arrival during the run, so the
-    wait itself ends the run when a new request lands; what it took in is
-    processed next, ahead of anything later."""
-    from mstar.utils.ipc_format import WorkerMessageType
+def _waiting_on_a_run(monkeypatch, ready):
+    """A worker in ``_await_run``, and what it did. ``ready``: what each look at the
+    chain's ready rows answers, the first before the wait starts."""
     from mstar.worker.worker import Worker
 
     worker = Worker.__new__(Worker)
-    arrivals = iter([[], [SimpleNamespace(message_type=WorkerMessageType.INPUT_SIGNALS)],
-                     [SimpleNamespace(message_type=WorkerMessageType.NEW_REQUEST)], ["later"]])
-    worker.communicator = SimpleNamespace(get_all_new_messages=lambda: next(arrivals))
-    yielded, processed = [], []
-    worker.engine_manager = SimpleNamespace(get_engine=lambda node: SimpleNamespace(yield_runs=yielded.append))
-    worker._process_message_list = processed.extend
-    landed = iter([False] * 10)
-    batch = SimpleNamespace(node_name="LLM", node_batch=SimpleNamespace(completion_event=SimpleNamespace(
-        query=lambda: next(landed),
-    )))
-    monkeypatch.setattr("mstar.worker.worker.time.sleep", lambda s: None)
-    worker._await_run(batch)
-    assert yielded == ["LLM"]
-    worker._process_messages()
-    assert [getattr(m, "message_type", m) for m in processed] == [
-        WorkerMessageType.INPUT_SIGNALS, WorkerMessageType.NEW_REQUEST, "later",
-    ]
+    log = []
+    answers = iter(ready)
+    worker.scheduler = SimpleNamespace(has_ready_excluding=lambda state, key: next(answers))
+    worker.request_state = None
+    worker.engine_manager = SimpleNamespace(
+        get_engine=lambda node: SimpleNamespace(yield_runs=lambda node: log.append("yield")),
+    )
+    worker._process_messages = lambda: log.append("messages")
+    worker._check_ready_tensors = lambda: None
+    worker._poll_stream_buffers = lambda: None
+    monkeypatch.setattr("mstar.worker.repeating_steps.time.sleep", lambda s: None)
+    return worker, log
+
+
+def _run_step(rows, looks, **node_batch):
+    landed = iter([False] * looks + [True])
+    return SimpleNamespace(
+        node_name="n", graph_walk=WALK, batch=SimpleNamespace(request_to_worker_graph=dict.fromkeys(rows)),
+        node_batch=SimpleNamespace(completion_event=SimpleNamespace(query=lambda: next(landed)), **node_batch),
+    )
+
+
+def test_a_run_serves_the_lanes_and_ends_once_a_row_turns_ready(monkeypatch):
+    """The request that arrives mid-run ends nothing: its prefill goes on a lane beside
+    the run, and the run ends when the row it readies does. Every look after that asks
+    again, since N+1 clears the word as it stages. N+1's rows count as in flight."""
+    worker, log = _waiting_on_a_run(monkeypatch, [False, False, True, True])
+    held = {}
+    worker._hold_rows = held.__setitem__
+    lane = SimpleNamespace(finish=lambda: log.append("finish"), launch=lambda pool: log.append("launch"))
+    worker._await_run(
+        _run_step([1], 3, token_stream=None), _run_step([2], 0), [lane], None,
+    )
+    served = ["messages", "finish", "launch"]
+    assert log == [*served, *served, "yield", *served, "yield"]
+    assert held == {0: {1, 2}}
+
+
+def test_rows_ready_before_the_wait_leave_the_run_alone(monkeypatch):
+    """They had their look at the speculation. A step too full to take them would
+    otherwise end every run after its first iteration."""
+    worker, log = _waiting_on_a_run(monkeypatch, [True])
+    worker._hold_rows = lambda lane, rows: None
+    worker._await_run(_run_step([1], 2, token_stream=None), None, [], None)
+    assert log == ["messages", "messages"]
+
+
+def test_a_run_that_streams_its_tokens_serves_between_looks(monkeypatch):
+    from mstar.model.submodule_base import StopKind, StopPolicy
+
+    worker, log = _waiting_on_a_run(monkeypatch, [False, True])
+    worker._hold_rows = lambda lane, rows: None
+    worker._graph_runtime = SimpleNamespace(
+        send_tokens=lambda *args: None,
+        loop_progress=lambda node, rids, walks, loops: ([0] * len(rids), [9] * len(rids)),
+    )
+    worker._streamed = {("n", WALK): (StopPolicy(StopKind.AR, "t", {EOS}), "text", "text")}
+    worker._innermost_loop_by_node = {}
+    stream = TokenStream(1, 4, CPU)
+    stream.begin([1])
+    step = _run_step(
+        [1], 1, token_stream=stream, request_ids=[1],
+        per_request_info_wrapped={1: SimpleNamespace(max_tokens=9, resource_configs={})},
+    )
+    worker._await_run(step, None, [], None)
+    assert log == ["messages", "yield"]
 
 
 @pytest.mark.parametrize("slots, why", [(1, "one capture slot"), (2, None)])
@@ -521,42 +568,6 @@ def test_a_single_capture_slot_does_not_stream_tokens(slots, why):
     refusal = engine.stream_tokens("n", WALK, "new_token", 4)
     assert (refusal is None) is (why is None) and (why is None or why in refusal)
     assert bool(mgmt.device_stream_tokens) is (why is None)
-
-
-def test_a_request_arriving_while_a_run_streams_its_tokens_still_ends_the_run(monkeypatch):
-    from mstar.model.submodule_base import StopKind, StopPolicy
-    from mstar.utils.ipc_format import WorkerMessageType
-    from mstar.worker.worker import Worker
-
-    worker = Worker.__new__(Worker)
-    yielded = []
-    worker._graph_runtime = SimpleNamespace(
-        send_tokens=lambda *args: None,
-        loop_progress=lambda node, rids, walks, loops: ([0] * len(rids), [9] * len(rids)),
-    )
-    worker._streamed = {("n", WALK): (StopPolicy(StopKind.AR, "t", {EOS}), "text", "text")}
-    worker._innermost_loop_by_node = {}
-    worker._device_runs = frozenset({("n", WALK)})
-    arrivals = iter([[], [SimpleNamespace(message_type=WorkerMessageType.NEW_REQUEST)]])
-    worker.communicator = SimpleNamespace(get_all_new_messages=lambda: next(arrivals, []))
-    worker.engine_manager = SimpleNamespace(get_engine=lambda node: SimpleNamespace(yield_runs=yielded.append))
-    monkeypatch.setattr("mstar.worker.worker.time.sleep", lambda s: None)
-    stream = TokenStream(1, 4, CPU)
-    stream.begin([1])
-    done = iter([False, False, False, True])
-    worker._stream_tokens(
-        SimpleNamespace(
-            node_name="n",
-            graph_walk=WALK,
-            node_batch=SimpleNamespace(
-                token_stream=stream,
-                request_ids=[1],
-                completion_event=SimpleNamespace(query=lambda: next(done)),
-                per_request_info_wrapped={1: SimpleNamespace(max_tokens=9, resource_configs={})},
-            ),
-        )
-    )
-    assert yielded == ["n"]
 
 
 def test_a_loop_back_aliasing_a_run_column_goes_on_as_its_last_iteration():

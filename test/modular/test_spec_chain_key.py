@@ -6,6 +6,7 @@ keying on it would count the chain's own parked rows as other work.
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from mstar.worker.step_repeats import RepeatConfig, StepRepeats
@@ -42,7 +43,16 @@ def _worker(target, other_ready=True, speculation=None, mid_prefill_walks=frozen
     )
     fake._build_speculation = Worker._build_speculation.__get__(fake)
     fake._stamp_repeats = lambda *args: None
+    fake._end_run_for_ready_rows = Worker._end_run_for_ready_rows.__get__(fake)
     return fake, peeked, excluded
+
+
+def _chunk():
+    """A speculation of a prompt chain's next chunk."""
+    return SimpleNamespace(
+        node_batch=None, tp_seq=-1, is_yield_away=False, continuing_rids=set(),
+        scheduled_batch=SimpleNamespace(request_to_worker_graph={}),
+    )
 
 
 def _pending(repeats=1, owed_run=False):
@@ -66,6 +76,23 @@ def test_ready_work_ends_a_run_in_flight_at_its_next_iteration():
     assert yielded == []
     worker._build_speculation(_pending(repeats=4), 1, _SpecFairness(peek=True, max_consecutive=8))
     assert yielded == ["LLM"]
+
+
+@pytest.mark.parametrize("rows, ends", [({0: 0, 1: 0}, False), ({0: 0, 1: 0, 2: 0}, True)])
+def test_a_row_the_next_step_takes_in_ends_the_run_ahead_of_it(rows, ends):
+    """A row of the chain's own walk is no other work, but it waits for ``pending``
+    to land, so a run needn't reach its count for it."""
+    target = SpeculationTarget(SimpleNamespace(node_name="LLM", graph_walk="decode"), [0, 1])
+    speculation = SimpleNamespace(
+        is_yield_away=False, node_batch=None, continuing_rids={0, 1},
+        scheduled_batch=SimpleNamespace(request_to_worker_graph=rows),
+    )
+    worker, _, _ = _worker(target, other_ready=False, speculation=speculation)
+    yielded = []
+    worker.engine_manager = SimpleNamespace(get_engine=lambda node: SimpleNamespace(yield_runs=yielded.append))
+
+    worker._build_speculation(_pending(repeats=4), 1, _SpecFairness(peek=True, max_consecutive=8))
+    assert yielded == (["LLM"] if ends else [])
 
 
 def test_ready_rows_wait_out_one_run_and_no_more():
@@ -153,7 +180,7 @@ def test_a_chains_first_step_that_cannot_continue_keeps_the_worker_busy_alone():
 
 def test_a_chains_first_step_that_continues_does_not_peek():
     worker, peeked, excluded = _worker(
-        _PROMPT, speculation=SimpleNamespace(node_batch=None, tp_seq=-1, is_yield_away=False),
+        _PROMPT, speculation=_chunk(),
     )
 
     speculation, _ = worker._build_speculation(_pending(), 0, _SpecFairness(peek=True, max_consecutive=8))
@@ -164,7 +191,7 @@ def test_a_chains_first_step_that_continues_does_not_peek():
 def test_a_prompt_chain_that_speculates_its_next_chunk_yields_from_its_first_step():
     """Speculating a row's next chunk must not hold decode rows behind a second
     prompt step, so the peek runs before the chain's first speculation."""
-    chunk = SimpleNamespace(node_batch=None, tp_seq=-1, is_yield_away=False)
+    chunk = _chunk()
     worker, peeked, excluded = _worker(
         _PROMPT, speculation=chunk, mid_prefill_walks=frozenset({("LLM", "prefill")}),
     )
@@ -176,7 +203,7 @@ def test_a_prompt_chain_that_speculates_its_next_chunk_yields_from_its_first_ste
 
 
 def test_a_prompt_chain_alone_speculates_its_next_chunk():
-    chunk = SimpleNamespace(node_batch=None, tp_seq=-1, is_yield_away=False)
+    chunk = _chunk()
     worker, _, excluded = _worker(
         _PROMPT, other_ready=False, speculation=chunk,
         mid_prefill_walks=frozenset({("LLM", "prefill")}),
@@ -207,7 +234,7 @@ def test_a_step_with_no_token_budget_that_cannot_continue_keeps_mains_order():
 
 def test_a_prompt_chain_with_no_token_budget_does_not_yield_from_its_first_step():
     """Inside its chunk Loop but never cut: it speculates on as on main."""
-    chunk = SimpleNamespace(node_batch=None, tp_seq=-1, is_yield_away=False)
+    chunk = _chunk()
     worker, peeked, excluded = _worker(
         _PROMPT, speculation=chunk, mid_prefill_walks=frozenset({("LLM", "prefill")}), budgeted=False,
     )
