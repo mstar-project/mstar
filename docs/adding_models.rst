@@ -2670,8 +2670,8 @@ page. Attention runs on each rank's slots and merges the partials across the par
   Without a ``SeqShardSpec`` every layer but attention runs copied across SP; prefer TP mode
   where it applies. With one whose ``exchange`` is ``all_gather`` or ``ring``, long steps split
   their tokens too (above).
-  Every paged pool of the node must set the key. Each layer all-gathers the partials of a step
-  copied or split by ``all_gather``. Under the same exception such a step attends no slots and
+  Every paged pool of the node must set the key. Each placed layer all-gathers the partials of a
+  step copied or split by ``all_gather``. Under the same exception such a step attends no slots and
   gathers its own tokens' shares alone; a ring step never does.
   Chunked prefill stays off on SP ranks (``_unchunkable_nodes``), so SP mode prefills a prompt in
   one step; chunking an SP-placed pool's prompts is not supported yet. TP mode chunks prompts as
