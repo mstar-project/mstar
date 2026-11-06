@@ -134,10 +134,11 @@ class FlashInferManager(AttentionManager):
                 "SP-placed pool on SM90 after an unexplained one-off lockstep hang in its prefill; use 'auto' "
                 "or 'fa3'"
             )
-        if placement.over_sp and self._wrapper_kv_kwargs["backend"] in ("auto", "fa2") and not fa3:
+        if (placement.over_sp and capability is not None and not fa3
+                and self._wrapper_kv_kwargs["backend"] in ("auto", "fa2")):
             logger.warning(
-                "attention over SP-placed KV pool %r prefills on FlashInfer's fa2 kernel, the only one it has "
-                "off SM90; an unexplained one-off lockstep hang in an fa2 prefill is still open",
+                "attention over SP-placed KV pool %r prefills on FlashInfer's fa2 kernel, the only one a placed "
+                "pool allows off SM90; an unexplained one-off lockstep hang in an fa2 prefill is still open",
                 self._kv_cache_name,
             )
         cfg = self._kv_config

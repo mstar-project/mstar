@@ -813,6 +813,7 @@ def test_a_placed_pool_plans_on_fa2_for_auto_from_sm100(monkeypatch):
     (True, (10, 0), "fa2", "warned"),
     (True, (10, 0), "auto", "warned"),  # auto runs fa2 from SM100
     (True, (8, 0), "auto", "warned"),  # and below SM90, where FlashInfer has no fa3
+    (True, (8, 0), "fa2", "warned"),
     (False, (9, 0), "fa2", "quiet"),
     (False, (10, 0), "fa2", "quiet"),
 ])
