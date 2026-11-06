@@ -13,7 +13,6 @@ scaffold's ``joint_attention`` over a ragged attention resource, or
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from typing import NamedTuple
 
 import torch
@@ -21,17 +20,14 @@ import torch.nn.functional as F
 from torch import nn
 
 from mstar.distributed.communication import CommGroup
+from mstar.model.components.diffusion.attention import Attend
 from mstar.model.components.distributed.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
 )
-from mstar.model.components.distributed.sequence_parallel import attention_over_sharded_keys, ulysses_attention
-
-# ``(q, k, v) -> out`` over ``[B, L, H, D]`` tensors (``k``/``v`` may have their own
-# ``L``); see ``mstar.model.components.diffusion.attention``.
-Attend = Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]
+from mstar.model.components.distributed.sequence_parallel import SeqParallel
 
 
 class RotaryTable(NamedTuple):
@@ -43,26 +39,6 @@ class RotaryTable(NamedTuple):
     def heads(self, start: int, count: int) -> "RotaryTable":
         """This rank's slice of the heads (tensor parallelism shards them)."""
         return RotaryTable(self.cos[:, :, start:start + count], self.sin[:, :, start:start + count])
-
-
-class SeqParallel(NamedTuple):
-    """Ulysses sequence parallelism over a ``[B, L, H, D]`` stream, the video: ``sizes``
-    is each rank's share of its ``L``.
-
-    Only an attention whose queries and keys are both the sharded stream needs the
-    exchange: it attends every token over this rank's head-group (``attend``). A
-    query shard attending a replicated stream needs nothing, and a replicated query
-    attending the sharded keys merges the ranks' partial attentions by their
-    log-sum-exps (``attend_shards``; ``run`` must take ``return_lse``)."""
-
-    group: CommGroup
-    sizes: list[int]
-
-    def attend(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, run: Attend) -> torch.Tensor:
-        return ulysses_attention(self.group, q, k, v, run, self.sizes, seq_dim=1, head_dim=2)
-
-    def attend_shards(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, run: Attend) -> torch.Tensor:
-        return attention_over_sharded_keys(self.group, q, k, v, run)
 
 
 def rms_norm_no_weight(x: torch.Tensor, eps: float) -> torch.Tensor:
