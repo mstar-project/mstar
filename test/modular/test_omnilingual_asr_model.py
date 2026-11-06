@@ -606,7 +606,7 @@ def test_model_hooks_are_not_shadowed(tiny_model):
 
 
 def test_graph_is_one_stateless_node(tiny_model):
-    assert tiny_model.get_node_resources() == []
+    assert tiny_model.declare_state() == []
     walks = tiny_model.get_graph_walk_graphs()
     assert list(walks) == [TRANSCRIBE_WALK]
     node = walks[TRANSCRIBE_WALK]
@@ -618,6 +618,17 @@ def test_graph_is_one_stateless_node(tiny_model):
     done = tiny_model.get_partition_forward_pass_args("default", fwd.full_metadata, {})
     assert done.request_done
     assert tiny_model.get_autocast_dtype() == torch.float32
+
+
+def test_a_half_precision_encoder_refuses_sdpa_at_bind(tiny_model):
+    """SDPA can't tell one request's packed tokens from the next, so startup fails and not each request."""
+    from mstar.engine.state.adapters import node_handles
+    from mstar.model.omnilingual_asr.submodules import OmniASRCTCSubmodule
+
+    tiny_model.dtype = torch.bfloat16
+    sub = OmniASRCTCSubmodule(_random_model(_tiny_config()), max_batch_size=4, max_batch_seconds=1)
+    with pytest.raises(ValueError, match="Node 'encoder': attention_backend sdpa, and packed reads"):
+        sub.bind_state(node_handles(tiny_model, ENCODER_NODE, {}, sdpa=True))
 
 
 def test_process_prompt_normalizes_and_validates(tiny_model):
@@ -706,9 +717,9 @@ def test_a_step_over_the_audio_budget_is_not_encoded_packed(tiny_model, monkeypa
 
     sub = tiny_model.get_submodule(ENCODER_NODE, "cpu")
     small = OmniASRCTCSubmodule(sub.model, max_batch_size=4, max_batch_seconds=0.5)  # 8000 samples
-    small.node_resources = {ENCODER_ATTN: types.SimpleNamespace(max_segments_per_step=2)}
+    small.tokens = types.SimpleNamespace(reads={ENCODER_ATTN: types.SimpleNamespace(max_segments_per_step=2)})
     packed_calls = []
-    monkeypatch.setattr(small, "_transcribe_packed", lambda waves, attn, ei: packed_calls.append(len(waves)) or [
+    monkeypatch.setattr(small, "_transcribe_packed", lambda waves, ei: packed_calls.append(len(waves)) or [
         torch.zeros(n, dtype=torch.long) for n in small.model.frame_lengths([w.shape[0] for w in waves])
     ])
     torch.manual_seed(6)
@@ -722,7 +733,7 @@ def test_a_step_over_the_audio_budget_is_not_encoded_packed(tiny_model, monkeypa
             for r, w in zip(rids, waves, strict=True)
         ]
         declared = small.declare_step(TRANSCRIBE_WALK, rids, inputs)
-        engine_inputs = types.SimpleNamespace(request_ids=rids, resources={ENCODER_ATTN: object()})
+        engine_inputs = types.SimpleNamespace(request_ids=rids)
         pre = small.preprocess(TRANSCRIBE_WALK, engine_inputs, inputs)
         with torch.no_grad():
             out = small.forward_batched(TRANSCRIBE_WALK, engine_inputs, **pre)
