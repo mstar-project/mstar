@@ -9,6 +9,7 @@ import pytest
 pytest.importorskip("torch")
 
 from mstar.engine.engine import Engine  # noqa: E402
+from mstar.engine.resources.step import StepContext  # noqa: E402
 from mstar.model.submodule_base import BatchedModelOutput, NodeSubmodule  # noqa: E402
 
 
@@ -78,7 +79,7 @@ def test_an_unbatched_step_clears_rows_only(rids):
     eng._exec_single = _per_request
     batch = SimpleNamespace(
         node_name="llm", request_ids=rids, rows_only=True, running_batched=False,
-        step_context=SimpleNamespace(slot_lease=None, graph_walk="decode", repeats=1),
+        step_context=StepContext(request_ids=rids, graph_walk="decode", slot=0, capture=False),
         exec_timings=SimpleNamespace(start=None), admit_error=None,
         outputs_ready=threading.Event(), release_waiters=lambda: None,
         preplanned_rids=None, preplan_event=None,
