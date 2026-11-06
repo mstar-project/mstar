@@ -440,6 +440,24 @@ def test_a_hit_that_lands_after_the_row_was_measured_is_declined_not_dropped():
     assert engine._runner.applied == [(0, 10, 0)]
 
 
+def test_a_rebuild_of_a_prompt_mid_prefill_is_cut_from_the_prompts_input_and_leaves_it():
+    """The prompt ran its first chunk and was dropped. Its rebuild runs that chunk again from the input prepared for
+    it, applying the cached prefix it starts past, and the prompt's next chunk is cut from the same input."""
+    sub = _KeyedPrompt(10)
+    engine = _keyed_engine(sub, matched=0)
+    engine._prepare_chunk(_batch(), 0, "prefill", ChunkRange(0, 4, 10, 4))
+    rebuild = _batch()
+
+    rerun = engine._prepare_chunk(rebuild, 0, "prefill", ChunkRange(0, 4, 4, 4))
+    resumed = engine._prepare_chunk(_batch(), 0, "prefill", ChunkRange(4, 10, 10, 6))
+
+    assert sub.prepares == 1 and not rebuild.first_chunk_rids, "a refused rebuild would release the prompt's input"
+    assert rerun.input_ids.tolist() == [0, 1, 2, 3] and resumed.input_ids.tolist() == list(range(4, 10))
+    assert engine._runner.applied == [(0, 10, 0), (0, 10, 0)], (
+        "the rebuild would write over the pages the drop left cached, unprobed"
+    )
+
+
 def test_a_first_chunk_past_a_prefix_its_inputs_cannot_skip_fails():
     import pytest
 

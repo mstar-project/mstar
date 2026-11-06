@@ -25,7 +25,7 @@ from mstar.worker.batch_builder import (
 )
 from mstar.worker.engine_manager import EngineManager
 from mstar.worker.node_manager_utils import RequestStateManager
-from mstar.worker.rebuild import RebuildCursor, Rebuilds
+from mstar.worker.rebuild import Prefilling, RebuildCursor, Rebuilds
 
 logger = logging.getLogger(__name__)
 
@@ -1395,9 +1395,9 @@ class MicroScheduler:
     def _measure_unstarted(
         self, request_state: RequestStateManager, batch: ScheduledBatch, only: Collection[int],
     ) -> dict[int, int]:
-        """The tokens of each rebuild of ``batch`` in ``only`` that has run no chunk, measured from its kept ids
-        past the cached prefix, as `_measure_rows` measures a fresh row, so a refused first chunk is measured
-        again against the pages the next try finds."""
+        """The tokens of each rebuild of ``batch`` in ``only`` that has run no chunk, past the cached prefix, as
+        `_measure_rows` measures a fresh row, so a refused first chunk is measured again against the pages the
+        next try finds."""
         node = batch.node_name
         engine = self.engine_manager.get_engine(node)
         partition = request_state.get_partition_for_node(node)
@@ -1405,12 +1405,11 @@ class MicroScheduler:
         for rid in batch.request_to_worker_graph:
             if rid not in only:
                 continue
-            info = engine.input_sequence_len(
-                node, batch.walk_of(rid), request_state.get_fwd_info(rid, partition),
-                self.rebuilds.host_inputs(rid, node), rid=rid,
+            cursor = self.rebuilds.cursor(rid, node)
+            info = engine.unserved_len(
+                node, batch.walk_of(rid), request_state.get_fwd_info(rid, partition), rid, cursor.length,
+                cursor.total,
             )
-            if info is None:
-                continue
             if info.cached_prefix:
                 self.cached_prefix[(rid, node)] = info.cached_prefix
             tokens[rid] = info.seq_len
@@ -1722,6 +1721,16 @@ class MicroScheduler:
             for rid, count, cap in zip(rows, counts, caps, strict=True) if count > 0
         }
 
+    def prefilling(self, node_name: str, rid: int, graph_walk: str) -> Prefilling | None:
+        """Where ``rid``'s prompt stands while it is mid-prefill in ``graph_walk`` on ``node_name``, read off its
+        chunk Loop as `_chunk_loop_progress` reads it, else None."""
+        if graph_walk not in self.chunk_loop_walks.get(node_name, ()):
+            return None
+        (done,), (total,) = self.runtime.loop_progress(
+            node_name, [rid], [graph_walk], [chunk_loop_name(node_name, graph_walk)],
+        )
+        return Prefilling(graph_walk, done, total) if 0 < done < total else None
+
     def _backlog_candidates(
         self, batch: ScheduledBatch,
         only_walk: str | None = None, skip_walk: str | None = None,
@@ -1875,9 +1884,12 @@ class MicroScheduler:
         range at all: it runs whole, and its stride ends its chunk Loop
         (``chunk_loop_stride``).
         """
-        if not (chunk_tokens or resumed or self.cached_prefix):
-            return
         node = batch.node_name
+        # A rebuild of a prompt mid-prefill is cut from the input the engine keeps for the prompt, so it runs as a
+        # chunk even when it fits whole, and the prompt keeps its place in line for its next chunk.
+        prefills = {rid for rid in batch.rebuild_rids if self.rebuilds.cursor(rid, node).resumes_prefill}
+        if not (chunk_tokens or resumed or self.cached_prefix or prefills):
+            return
         for rid in batch.request_to_worker_graph:
             at = resumed.get(rid)
             if at is not None:
@@ -1887,15 +1899,16 @@ class MicroScheduler:
             else:
                 key = (rid, node)
                 cached = self.cached_prefix.pop(key, 0)
-                if rid not in chunk_tokens:
+                if rid not in chunk_tokens and rid not in prefills:
                     continue
                 total = cached + row_tokens[rid]
-                end = cached + chunk_tokens[rid]
+                end = cached + chunk_tokens.get(rid, row_tokens[rid])
                 batch.chunk_ranges[rid] = ChunkRange(cached, end, total, end)
-                self.chunk_started[key] = next(self._chunk_starts)
+                if rid not in prefills or key not in self.chunk_started:
+                    self.chunk_started[key] = next(self._chunk_starts)
             if end < total:
                 batch.incomplete_node_rids.add(rid)
-            else:
+            elif rid not in prefills:
                 self.chunk_started.pop((rid, node), None)
         self.cap_chunk_loops(batch)
 
@@ -1951,6 +1964,16 @@ class MicroScheduler:
         )
         self.batch_number += 1
         self.node_and_walk_to_last_batch_num[(node_name, graph_walk)] = self.batch_number
+
+    def return_backlogged(self, rid: int) -> None:
+        """Put ``rid``'s backlogged rows back on the runtime's ready queues, as `_build_and_schedule`
+        returns rows a step doesn't take."""
+        for (node_name, _), batch in self.backlog.items():
+            wg_id = batch.request_to_worker_graph.get(rid)
+            if rid in batch.request_to_worker_graph:
+                self._set_in_flight(node_name, {rid: wg_id}, False)
+                self.runtime.push_back_node(node_name, [rid], [wg_id])
+        self._drop_backlogged_rid(rid)
 
     def _drop_backlogged_rid(self, rid: int) -> None:
         """Take a request out of anything still queued for it.
@@ -2211,7 +2234,8 @@ class MicroScheduler:
 
         for engine in {*map(self.engine_manager.get_engine, self.parked)}:
             for node_name, rid in engine.admit_waiting(published_of):
-                self.parked[node_name].discard(rid)
+                # a request asked again on each node of its pool may have parked on only one of them
+                self.parked.get(node_name, set()).discard(rid)
 
     def _check_ready(
         self, node_name: str, rid: int, fwd_info: CurrentForwardPassInfo,
@@ -2231,7 +2255,9 @@ class MicroScheduler:
             self.parked.setdefault(node_name, set()).add(rid)
             return False
         if outcome.rebuild:
-            engine.prepare_rebuild(node_name, rid, self.rebuilds.start(rid, node_name))
+            rebuild = self.rebuilds.start(rid, node_name, self.prefilling(node_name, rid, fwd_info.graph_walk))
+            if rebuild is not None:
+                engine.prepare_rebuild(node_name, rid, rebuild)
             return False
         if outcome.reason is not None and outcome.reason.terminal:
             logger.error(

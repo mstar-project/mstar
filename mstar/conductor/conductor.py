@@ -1,5 +1,6 @@
 import atexit
 import hashlib
+import itertools
 import logging
 import math
 import multiprocessing as mp
@@ -448,6 +449,7 @@ class Conductor:
         lora_adapter_digests: dict[str, str] | None = None,
     ):
         self.requests: dict[str, RequestData] = {}
+        self._arrivals = itertools.count()
         # Requests in teardown: kept in self.requests (so they still count toward
         # concurrency until their GPU state is freed) with barrier state here.
         self.draining: dict[str, DrainingRequest] = {}
@@ -1370,6 +1372,7 @@ class Conductor:
         if not all(partition_states[name].is_done for name in self._streamed_partitions()):
             prefix_cache = False
         kv_layout = kwargs.get("kv_layout") or {}
+        arrival = next(self._arrivals)
         refuse_undeclared_labels(type(self.model).__name__, self._kv_labels, kv_layout, resource_configs)
         for key, cfg in resource_configs.items():
             cfg.apply_conductor_config(
@@ -1482,7 +1485,8 @@ class Conductor:
                         random_seed=pstate.random_seed,
                         partition_name=partition_name,
                         max_tokens=request_data.max_output_tokens,
-                        resource_configs=request_data.resource_configs
+                        resource_configs=request_data.resource_configs,
+                        arrival=arrival,
                     ),
                 )
                 self.communicator.send(

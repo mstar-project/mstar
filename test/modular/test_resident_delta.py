@@ -192,6 +192,7 @@ class _Engine:
     apply_resident_delta = Engine.apply_resident_delta
     check_ready = Engine.check_ready
     residency = Engine.residency
+    admit_request = Engine.admit_request
     offload_request = Engine.offload_request
     _release_resident_slot = Engine._release_resident_slot
     reclaimable = Engine.reclaimable
@@ -214,7 +215,10 @@ class _Engine:
         self._submodules = {
             "node": SimpleNamespace(resources={"kv": self.resource}, resident=None)
         }
-        self._runner = SimpleNamespace(admit_retrieve=lambda **kw: FULL_ADMIT_OK)
+        self._runner = SimpleNamespace(
+            admit_retrieve=lambda **kw: FULL_ADMIT_OK, admit_request=lambda *args: None,
+            readmit=lambda *args, queued: None,
+        )
         self._resident_delta = (
             {"node": OffloadDelta.new()} if role == "leader" else {}
         )
@@ -709,6 +713,7 @@ class _Rank:
     _push_back_batch = Worker._push_back_batch
 
     def __init__(self, *, leader: bool):
+        self._preemption = SimpleNamespace(preempt=lambda node_batch: False)
         self.queue = _Queue()
         self._graph_runtime = self.queue
         self.held: list[str] = []
@@ -934,6 +939,7 @@ class _ForwardingLeader:
         self._in_flight_rids: set[int] = set()
         self._pending_removes: dict[int, None] = {}
         self._rebuilds = Rebuilds({}, {})
+        self._preemption = SimpleNamespace(remove_request=lambda rid: None)
         self.streaming_buffers: dict = {}
         # wire-string-keyed: parked teardowns and the drain bookkeeping, because
         # a handle is recycled and would reattach to the next request to get it

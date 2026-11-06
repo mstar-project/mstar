@@ -368,6 +368,7 @@ def _looping_worker(monkeypatch, sched, state, refuse=frozenset()) -> Worker:
                  "_poll_stream_buffers", "_set_in_flight_flag", "_clear_in_flight_flag",
                  "_drop_rows_whose_loop_stopped", "_handle_admit_failure", "_postprocess_batch"):
         setattr(w, name, stub)
+    w._preemption = SimpleNamespace(make_room=stub)
     w.maybe_send_zmq_to_tp_followers = lambda node_batch: -1
     w._build_executing_batch = executing
     w._build_speculation = lambda pending, consecutive, fair: (None, None)

@@ -140,6 +140,9 @@ def _rank(
     w._removed_rids, w._unprocessed_messages = RecentSet(16), {}
     w.streaming_buffers = {}
     w._rebuilds = Rebuilds({}, {})
+    w._preemption = SimpleNamespace(
+        preempt=lambda node_batch: False, remove_request=lambda rid: None, make_room=lambda: None,
+    )
     w._tp_broadcast_seq = 0
     w._tp_nospec = RecentSet(16)
     if serial:

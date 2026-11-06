@@ -39,6 +39,7 @@ class _HostPool(CPUPagePool):
     def __init__(self, max_cpu_pages: int):
         self.arena = new_page_arena(max_cpu_pages)
         self.index = PrefixIndex(self.arena)
+        self.arena.index = self.index
         self.offloaded = {}
         self._refused_logged_at = None
         self._refused_unlogged = 0

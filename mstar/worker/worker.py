@@ -120,7 +120,8 @@ from mstar.worker.micro_scheduler import (
     unfinished_chunk_rids,
 )
 from mstar.worker.node_manager_utils import RequestStateManager
-from mstar.worker.rebuild import DEFAULT_REBUILD_HOST_MB, Rebuilds
+from mstar.worker.preemption import Preemption
+from mstar.worker.rebuild import DEFAULT_REBUILD_HOST_MB, Rebuilds, policies_run_here
 from mstar.worker.side_steps import SIDE_LANE, SideStepLane
 from mstar.worker.spec_rows import DeferredRowInputs
 from mstar.worker.speculation import (
@@ -212,20 +213,19 @@ def _make_graph_runtime(
 
 
 def _make_rebuilds(
-    model: Model | None, model_config: dict | None, node_names: set[str], lockstep_nodes: set[str],
+    model: Model | None, model_config: dict | None, my_walks: set[tuple[str, str]], lockstep_nodes: set[str],
     device: torch.device,
 ) -> Rebuilds:
-    """What a dropped request is rebuilt from, on each node here whose model declares how."""
-    policies = model.rebuild_policies() if model is not None else {}
+    """What a dropped request is rebuilt from, on each node whose model declares how and whose rebuild this worker
+    runs: a disaggregated decode node can't run the prefill walk a rebuild needs."""
+    graphs = model.get_graph_walk_graphs() if model is not None else {}
+    policies = policies_run_here(model.rebuild_policies(), graphs, my_walks) if model is not None else {}
     # A lockstep node's KV refuses every drop, so its requests keep no ids.
     policies = {node: policy for node, policy in policies.items() if node not in lockstep_nodes}
     host_mb = (model_config or {}).get("rebuild_host_mb", DEFAULT_REBUILD_HOST_MB)
     if isinstance(host_mb, bool) or not isinstance(host_mb, int) or host_mb < 0:
         raise ValueError(f"rebuild_host_mb: {host_mb!r} is not a non-negative int")
-    return Rebuilds(
-        policies, model.get_graph_walk_graphs() if model is not None else {},
-        HostPool(host_mb << 20, device) if host_mb and policies.keys() & node_names else None,
-    )
+    return Rebuilds(policies, graphs, HostPool(host_mb << 20, device) if host_mb and policies else None)
 
 
 def _parse_tp_async_sched(raw: str) -> tuple[bool, frozenset[str] | None]:
@@ -788,7 +788,11 @@ class Worker:
         # (node, walk) -> when its last hold was logged, and the holds since
         self._hold_logged: dict[tuple[str, str], tuple[float, int]] = {}
 
-        self._rebuilds = _make_rebuilds(model, model_config, node_names, self.parallel_nodes, self.device)
+        self._rebuilds = _make_rebuilds(model, model_config, my_walks, self.parallel_nodes, self.device)
+        self._preemption = Preemption(
+            self.engine_manager, self._rebuilds, self.scheduler, self.request_state, self._log_throttled,
+            self._rid_str,
+        )
 
         # Async-scheduling cross-iter state. Initialized here (rather than in
         # run()) because _remove_request — which can be invoked indirectly
@@ -914,6 +918,7 @@ class Worker:
                 message_type=ConductorMessageType.WORKER_STATUS, body=status,
             )),
             enable_transfers=self.tensor_manager.enable_transfer_metrics,
+            preemptions=self._preemption.counts,
         )
 
     @staticmethod
@@ -1223,6 +1228,7 @@ class Worker:
         self._pending_removes.pop(request_id, None)
 
         self._rebuilds.remove_request(request_id)
+        self._preemption.remove_request(request_id)
         laps.lap("misc")
         # DEBUG: once per request on the main thread, it cost as much as the
         # engine's own removal (test/waypoint/serve_rollout.py, which waits on
@@ -1234,26 +1240,16 @@ class Worker:
         self._graph_runtime.remove_request(request_id)
         laps.lap("runtime")
 
-    def _drop(self, request_id: int, node_name: str) -> int:
-        """Drop the request's KV on ``node_name``, which its kept ids can rebuild, and return
-        the pages freed."""
-        info = self.request_state.get_fwd_info(request_id, self.request_state.get_partition_for_node(node_name))
-        why = self._rebuilds.refusal(request_id, node_name, info.graph_walk, info.dynamic_loop_iter_counts)
-        if why is not None:
-            raise RuntimeError(
-                f"Worker {self.worker_id}: {self._rid_str(request_id)} can't be dropped on {node_name}, since {why}"
-            )
-        backlogged = any(
-            request_id in batch.request_to_worker_graph
-            for (node, _), batch in self.scheduler.backlog.items() if node == node_name
-        )
-        if request_id in self._in_flight_rids or backlogged:
-            raise RuntimeError(
-                f"Worker {self.worker_id}: {self._rid_str(request_id)} is in a step or a backlog on {node_name}"
-            )
-        return self.engine_manager.get_engine(node_name).drop_request(
-            node_name, request_id, self._rebuilds.tokens(request_id, node_name),
-        )
+    def _log_throttled(self, logged: dict, key, message: str, *args) -> None:
+        """Log ``message`` at most once per `_HOLD_LOG_INTERVAL` for ``key``, with the lines skipped since
+        as its last argument."""
+        now = _time.monotonic()
+        last, unlogged = logged.get(key, (None, 0))
+        if last is not None and now - last < _HOLD_LOG_INTERVAL:
+            logged[key] = (last, unlogged + 1)
+            return
+        logged[key] = (now, 0)
+        logger.warning(message, *args, unlogged)
 
     def _drain_request(self, body: DrainRequest) -> None:
         """Phase-1 teardown (abort/fail): stop scheduling this rid, then ACK
@@ -2835,7 +2831,7 @@ class Worker:
         # removals wait for that.
         self._apply_pending_removes_safe_to_drop(referenced_rids)
 
-        if self._is_tp_follower_node(batch.node_name):
+        if self._is_tp_follower_node(batch.node_name) or self._preemption.preempt(node_batch):
             return
 
         # A batch the pool cannot hold even with nothing else resident does not
@@ -2873,7 +2869,7 @@ class Worker:
                 len(batch_ids) - (1 if victim_id in batch_ids else 0),
             )
         else:
-            # Nothing could be evicted, so the batch has to get smaller or it will
+            # Nothing could be evicted or dropped, so the batch has to get smaller or it will
             # refuse identically for ever. Hold the one request the admit named,
             # not the whole batch, so the retry is immediate. When other rows
             # wait to run, the batch also gets a limit, or they refill it to the
@@ -2893,19 +2889,13 @@ class Worker:
                     batch.node_name, batch.graph_walk,
                     len(batch_ids) // 2 if fit is None else fit,
                 )
-            key = (batch.node_name, batch.graph_walk)
-            now = _time.monotonic()
-            last, unlogged = self._hold_logged.get(key, (None, 0))
-            if last is not None and now - last < _HOLD_LOG_INTERVAL:
-                self._hold_logged[key] = (last, unlogged + 1)
-                return
-            self._hold_logged[key] = (now, 0)
-            logger.warning(
+            self._log_throttled(
+                self._hold_logged, (batch.node_name, batch.graph_walk),
                 "OOM on node=%s walk=%s: no offload possible, holding %s of %d "
                 "requests so the retry is smaller (%d earlier holds not logged)",
                 batch.node_name, batch.graph_walk,
                 blamed if len(shed) == 1 else f"all {len(shed)}",
-                len(batch_ids), unlogged,
+                len(batch_ids),
             )
 
     # ------------------------------------------------------------------
@@ -3983,16 +3973,19 @@ class Worker:
             })
         # a row the prefix cache served whole ran no forward, and its rebuild is done all the same
         ran = set(node_batch.request_ids) | node_batch.cached_rids
-        landed = [
-            rid for rid in rebuild if rid in ran and self._rebuilds.land_chunk(rid, node, batch.chunk_ranges.get(rid))
-        ]
+        landed = {
+            rid: cursor for rid in rebuild
+            if rid in ran and (cursor := self._rebuilds.land_chunk(rid, node, batch.chunk_ranges.get(rid)))
+        }
         if landed:
             # the step's kernels read the prepared input released here
             self._wait_for_step(batch_N)
             engine = self.engine_manager.get_engine(node)
-            for rid in landed:
-                engine.release_chunk_inputs(rid, node)
+            for rid, cursor in landed.items():
+                if not cursor.resumes_prefill:
+                    engine.release_chunk_inputs(rid, node)
                 engine.land_rebuild(node, rid)
+                self._preemption.rebuilt(rid, node, cursor.total)
         for rid in rebuild:
             outputs.pop(rid, None)
             batch.discard_rid(rid)
@@ -5326,6 +5319,7 @@ class Worker:
                 # ever fail them.
                 self._fail_requests(self.scheduler.take_admit_errors())
                 self._apply_pending_drains(self._in_flight_rids)
+                self._preemption.make_room()
                 laps.lap("teardown")
 
                 # 1. CPU preamble — overlaps with GPU(N).

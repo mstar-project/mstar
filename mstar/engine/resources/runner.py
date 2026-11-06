@@ -11,7 +11,7 @@ import logging
 from collections.abc import Callable, Collection, Mapping
 from typing import Any
 
-from mstar.engine.resources.admission import Admission
+from mstar.engine.resources.admission import Admission, Refusal
 from mstar.engine.resources.base import CachedPrefix, CGSlotSpec, PublishedInfo, Resource
 from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig
 from mstar.engine.resources.step import (
@@ -346,9 +346,10 @@ class StepRunner:
     def ingest_request(
         self, rid: str,
         overrides: Mapping[str, ResourceReqConfig] | None = None,
+        arrival: int | None = None,
     ) -> None:
-        """open state on all resources; `overrides` are per-resource. All or
-        nothing: a resource that raises leaves the request on none of them."""
+        """open state on all resources; `overrides` are per-resource, and ``arrival`` is the conductor's number
+        for the request. All or nothing: a resource that raises leaves the request on none of them."""
         for i, key in enumerate(self._order):
             try:
                 self._resources[key].ingest_request(
@@ -364,6 +365,8 @@ class StepRunner:
                             "rolling back request %s on resource %s failed", rid, done,
                         )
                 raise
+        if arrival is not None:
+            self._admission.set_arrival(rid, arrival)
 
     def ingest_capture_row(self, rid: str) -> None:
         """open a capture padding row on all resources"""
@@ -421,13 +424,9 @@ class StepRunner:
         node ends up gated on — and able to allocate against — another node's
         cache.
         """
-        if not self._admission.admitted(rid, node_name):
-            waits = self._admission.admit(
-                rid, node_name, graph_walk, published,
-                self._sweep(self._node_ask_order, self._ask_order, node_name),
-            )
-            if waits is not None:
-                return waits
+        waits = self.admit_request(rid, node_name, graph_walk, published)
+        if waits is not None:
+            return waits
         ready = True
         for key in self._sweep(
             self._node_retrieve_order, self._retrieve_order, node_name
@@ -444,6 +443,27 @@ class StepRunner:
                 return FullAdmitOutcome(outcome, key)
             ready = ready and outcome.ready
         return FULL_ADMIT_OK if ready else FULL_ADMIT_NOT_READY
+
+    def admit_request(
+        self, rid: str, node_name: str, graph_walk: str,
+        published: Mapping[str, PublishedInfo] | None = None,
+    ) -> FullAdmitOutcome | None:
+        """None once ``rid`` is admitted on ``node_name``, else `FULL_ADMIT_QUEUED` while it waits, or why
+        it can never be admitted."""
+        if self._admission.admitted(rid, node_name):
+            return None
+        return self._admission.admit(
+            rid, node_name, graph_walk, published, self._sweep(self._node_ask_order, self._ask_order, node_name),
+        )
+
+    def readmit(self, rid: str, node_name: str, queued: bool) -> None:
+        self._admission.readmit(rid, node_name, self._sweep(self._node_ask_order, self._ask_order, node_name), queued)
+
+    def newer_than(self, rid: str) -> list[str] | None:
+        return self._admission.newer_than(rid)
+
+    def refusals(self) -> list[Refusal]:
+        return self._admission.refusals()
 
     def admit_waiting(
         self, published_of: Callable[[str, str], Mapping[str, PublishedInfo] | None],
