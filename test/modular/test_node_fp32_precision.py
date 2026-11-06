@@ -336,7 +336,7 @@ def test_a_thread_started_during_a_forward_keeps_the_node_setting():
 
     class _StartsAThread(_Recorder):
         def forward(self, graph_walk, engine_inputs, x, **kwargs):
-            with ThreadPoolExecutor(1, initializer=worker._init_engine_thread) as ex:
+            with ThreadPoolExecutor(1, initializer=worker.executor._init_engine_thread) as ex:
                 ex.submit(lambda: None).result()
             return super().forward(graph_walk, engine_inputs, x, **kwargs)
 

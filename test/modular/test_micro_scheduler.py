@@ -380,7 +380,7 @@ def _chain(
     mid_prefill=(), seq_lens=None,
 ):
     """A speculation chain's step at ``target``: the pick, then the waiting
-    rows it takes, as ``Worker._try_speculate_next`` drives the two.
+    rows it takes, as ``Speculator._try_speculate_next`` drives the two.
     ``seq_lens`` estimates the chain's rows' spans for a token budget."""
     bound(sched, runtime=manager.runtime)
     manager.runtime.combined_walk_of = sched.combined_walk_of
@@ -1409,7 +1409,7 @@ def test_an_unservable_rid_leaves_the_backlog_when_the_worker_fails_it():
     assert list(batch.request_to_worker_graph) == ["r1"]
     errors = sched.admission.take_admit_errors()
     assert set(errors) == {"r0"}
-    # what ``Worker._fail_requests`` does with them, at the top of the next pass
+    # what ``StepPipeline._fail_requests`` does with them, at the top of the next pass
     sched.lifecycle.failed_rids.update(errors)
     sched.drop_backlogged(errors)
     assert sched.backlog == {}

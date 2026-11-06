@@ -35,8 +35,8 @@ from mstar.testing_utils.worker import deliver, make_worker
 from mstar.utils.containers import ParallelList
 from mstar.utils.ipc_format import ConductorMessageType, RemoveRequest, WorkerMessage, WorkerMessageType
 from mstar.worker.micro_scheduler import ScheduledBatch
+from mstar.worker.step_executor import PendingBatch
 from mstar.worker.stream_buffers import StreamBufferManager
-from mstar.worker.worker import Worker
 
 
 class _Communicator(BaseCommunicator):
@@ -137,15 +137,13 @@ def test_the_worker_fails_only_the_refused_request():
         )
         worker.lifecycle.add(7, "r7")
         worker.lifecycle.add(8, "r8")
-        reported = []
-        worker._fail_requests = reported.append
         route_output = type("RouteOutput", (), {
             "register_uuids": r7 + r8, "register_rids": [7, 7, 8],
         })()
 
-        assert worker._register_outputs(route_output) == {7}
+        assert worker.executor._register_outputs(route_output) == {7}
 
-        (errors,) = reported
+        errors = worker.lifecycle.take_failures()
         assert list(errors) == [7]
         assert errors[7].startswith("Error in worker: Mooncake memory registration failed")
         assert mgr.tensor_store.is_registered(r8[0])
@@ -178,38 +176,14 @@ def test_the_runtime_sends_nothing_for_a_failed_rid(tmp_path, failed):
         assert sent == ["api_server", "conductor"] and sent_rids == [rid]
 
 
-def _postprocess_worker(refuse, follower=False):
-    """A worker whose ``_postprocess_batch`` runs for real, with the engine,
-    graph runtime and transfer engine faked around it. The transfer engine
-    refuses every tensor of the rids in ``refuse``, step after step."""
-    w = make_worker(
-        streams=StreamBufferManager(SimpleNamespace(per_request_info={}), None, []),
-        parallel_nodes={"llm"} if follower else set(),
-        scheduler=SimpleNamespace(drop_backlogged=lambda rids: None),
-    )
-    w.enable_nvtx = w.enable_prof = False
-    w.device = torch.device("cpu")
-    w.worker_id = "w0"
-    w._innermost_loop_by_node = {}
-    w.log = SimpleNamespace(stop_checked=[], routed=[], registered=[], sent=[], conductor=[])
-    w.lifecycle.add(0, "r0")
-    w.lifecycle.add(1, "r1")
-    w.communicator = SimpleNamespace(send=lambda e, m: w.log.conductor.append(m))
-    w.request_state = SimpleNamespace(
-        per_request_info={0: object(), 1: object()},
-        get_fwd_info=lambda rid, p: None,
-        get_pending_publish_info=lambda rid, p: None,
-        flush_publish_info=lambda rid, p: None,
-    )
-    w._prematerialize_for_check_stop = (
-        lambda outputs, ev, request_ids=None: (outputs.per_rid_outputs, None)
-    )
-    w._inline_emit_values = lambda *a: (None, None)
-    w._count_new_tokens = lambda *a: {}
-    w._stream_consumption_batch = lambda rids: []
+def _postprocess_worker(refuse, follower=False, **fields):
+    """A worker whose postprocess runs for real, with the engine, graph runtime
+    and transfer engine faked around it. The transfer engine refuses every
+    tensor of the rids in ``refuse``, step after step."""
+    log = SimpleNamespace(stop_checked=[], routed=[], registered=[], sent=[], conductor=[])
 
     def check_stop(node_batch, cpu_outputs, host_rows=None):
-        w.log.stop_checked.append(list(node_batch.request_ids))
+        log.stop_checked.append(list(node_batch.request_ids))
         return {}
 
     engine = SimpleNamespace(
@@ -221,7 +195,6 @@ def _postprocess_worker(refuse, follower=False):
         finalize_stopped_requests=lambda nb, rids: [nb.per_request_info[r] for r in rids],
         step_finished=lambda batch, outputs, **kwargs: None,
     )
-    w.engine_manager = SimpleNamespace(get_engine=lambda node: engine)
 
     def store(rids, outputs, signals, **kwargs):
         return StoredOutputs(
@@ -230,10 +203,11 @@ def _postprocess_worker(refuse, follower=False):
         )
 
     def register(per_request, skip_cuda_sync):
-        w.log.registered.append(list(per_request.keys))
+        log.registered.append(list(per_request.keys))
         return {r: "refused" for r in per_request.keys if r in refuse} or None
 
-    w.tensor_manager = SimpleNamespace(
+    tensor_manager = SimpleNamespace(
+        get_tensor=None,
         cleanup_collectable=lambda *a: None,
         store_and_return_tensor_info_batch=store,
         increment_ref_batch_uniform=lambda *a: None,
@@ -244,22 +218,22 @@ def _postprocess_worker(refuse, follower=False):
 
     def route(route_input):
         rids = list(route_input.wg_ids.keys)
-        w.log.routed.append(rids)
+        log.routed.append(rids)
         return RouteOutput(
-            completion_id=len(w.log.routed),
+            completion_id=len(log.routed),
             register_uuids=list(route_input.tensors), register_rids=rids,
             new_token_output_idxs=[], local_streaming_by_signal={},
             freed_inputs=FreedTensors.none(),
         )
 
     def send(send_input):
-        w.log.sent.append(
+        log.sent.append(
             [r for r in send_input.per_request_info.keys
              if r not in send_input.failed_rids]
         )
         return []
 
-    w._graph_runtime = _StubRuntime(
+    runtime = _StubRuntime(
         cleanup_consumed_inputs=lambda *a: FreedTensors.none(),
         clear_pending_loop_stops=lambda: None,
         stop_loops_batched=lambda **kw: list(kw["loop_names"].keys),
@@ -269,6 +243,23 @@ def _postprocess_worker(refuse, follower=False):
         get_rid_string=lambda rid: f"r{rid}",
         supports_inline_emit=False,
     )
+    w = make_worker(
+        streams=StreamBufferManager(SimpleNamespace(per_request_info={}), None, []),
+        parallel_nodes={"llm"} if follower else set(),
+        scheduler=SimpleNamespace(drop_backlogged=lambda rids: None),
+        communicator=SimpleNamespace(send=lambda e, m: log.conductor.append(m)),
+        request_state=SimpleNamespace(
+            per_request_info={0: object(), 1: object()},
+            get_fwd_info=lambda rid, p: None,
+            get_pending_publish_info=lambda rid, p: None,
+            flush_publish_info=lambda rid, p: None,
+        ),
+        engine_manager=SimpleNamespace(get_engine=lambda node: engine),
+        tensor_manager=tensor_manager, graph_runtime=runtime, **fields,
+    )
+    w.log = log
+    w.lifecycle.add(0, "r0")
+    w.lifecycle.add(1, "r1")
     return w
 
 
@@ -286,10 +277,9 @@ def _decode_step(rids, final_stream=()):
     outputs = BatchedModelOutput(
         per_rid_outputs={r: {"tok": [torch.tensor([r])]} for r in rids},
     )
-    pending = SimpleNamespace(
+    pending = PendingBatch(
         batch=batch, node_batch=node_batch, node_name="llm",
-        partition="p", graph_walk="decode", loop_name="decode",
-        speculative_new_iter=False,
+        partition="p", graph_walk="decode", future=None, loop_name="decode",
     )
     return pending, outputs
 
@@ -309,11 +299,11 @@ def test_the_speculated_next_step_sends_nothing_of_a_refused_request():
     step_n = _decode_step([0, 1])
     step_n1 = _decode_step([0, 1])  # speculated from N while N ran
 
-    Worker._postprocess_batch(w, *step_n)
+    w.pipeline._finish_step(*step_n)
     assert w.log.sent == [[1]]
     assert w.lifecycle.failed_rids == {0}
 
-    Worker._postprocess_batch(w, *step_n1)
+    w.pipeline._finish_step(*step_n1)
 
     assert w.log.stop_checked == [[0, 1], [1]]
     assert w.log.routed == [[0, 1], [1]]
@@ -327,7 +317,7 @@ def test_a_step_of_only_failed_rids_routes_nothing():
     w.lifecycle.failed_rids.add(0)
     pending, outputs = _decode_step([0])
 
-    Worker._postprocess_batch(w, pending, outputs)
+    w.pipeline._finish_step(pending, outputs)
 
     assert w.log.routed == [] and w.log.sent == []
     assert pending.batch.request_to_worker_graph == {}
@@ -343,7 +333,7 @@ def test_a_failed_rid_leaves_the_batch_walk_grouping():
     pending, outputs = _decode_step([0, 1])
     assert pending.batch.rids_by_walk() == {"decode": [0, 1]}
 
-    Worker._postprocess_batch(w, pending, outputs)
+    w.pipeline._finish_step(pending, outputs)
 
     assert pending.batch.rids_by_walk() == {"decode": [1]}
     assert w.log.routed == [[1]] and w.log.sent == [[1]]
@@ -353,8 +343,7 @@ def test_a_failed_rid_leaves_the_batch_walk_grouping():
 def test_a_step_of_only_failed_rids_still_waits_for_its_gpu_work(monkeypatch, has_event):
     """No output of the step leaves, but a later step reuses its capture slot
     while its kernels may still run, so postprocess waits for them anyway."""
-    w = _postprocess_worker(refuse=set())
-    w.device = SimpleNamespace(type="cuda")
+    w = _postprocess_worker(refuse=set(), device=torch.device("cuda"))
     w.lifecycle.failed_rids.add(0)
     pending, outputs = _decode_step([0])
     waits = []
@@ -362,7 +351,7 @@ def test_a_step_of_only_failed_rids_still_waits_for_its_gpu_work(monkeypatch, ha
         pending.node_batch.completion_event = SimpleNamespace(synchronize=lambda: waits.append("event"))
     monkeypatch.setattr(torch.accelerator, "synchronize", lambda device=None: waits.append("device"))
 
-    Worker._postprocess_batch(w, pending, outputs)
+    w.pipeline._finish_step(pending, outputs)
 
     assert waits == ["event" if has_event else "device"]
     assert w.log.routed == [] and pending.batch.request_to_worker_graph == {}
@@ -372,12 +361,11 @@ def test_a_failed_rid_that_took_its_last_stream_chunk_does_not_stop_its_loop():
     """N+1 consumed the failed rid's terminal stream chunk; ending its loop
     would finalize a rid already taken out of the batch, and the raise would
     fail the healthy rows too."""
-    w = _postprocess_worker(refuse={0})
-    w._innermost_loop_by_node = {("decode", "llm"): "decode"}
-    Worker._postprocess_batch(w, *_decode_step([0, 1]))
+    w = _postprocess_worker(refuse={0}, innermost_loop_by_node={("decode", "llm"): "decode"})
+    w.pipeline._finish_step(*_decode_step([0, 1]))
 
     pending, outputs = _decode_step([0, 1], final_stream={0, 1})
-    Worker._postprocess_batch(w, pending, outputs)
+    w.pipeline._finish_step(pending, outputs)
 
     assert w.log.routed == [[0, 1], [1]]
     assert w.log.sent == [[1], [1]]
@@ -389,8 +377,8 @@ def test_a_follower_still_routes_a_failed_rid_and_reports_it_once():
     rid, which needs this step's loop-back; the refused sends stay skipped."""
     w = _postprocess_worker(refuse={0}, follower=True)
 
-    Worker._postprocess_batch(w, *_decode_step([0, 1]))
-    Worker._postprocess_batch(w, *_decode_step([0, 1]))
+    w.pipeline._finish_step(*_decode_step([0, 1]))
+    w.pipeline._finish_step(*_decode_step([0, 1]))
 
     assert w.log.routed == [[0, 1], [0, 1]]
     assert w.log.sent == [[1], [1]]
@@ -479,7 +467,7 @@ def test_remove_request_finishes_when_an_unregister_fails(monkeypatch, rust):
         request_state=SimpleNamespace(remove_request=lambda rid: None),
         profile_info=SimpleNamespace(pop_request=lambda rid: None),
         scheduler=SimpleNamespace(clear_rid=lambda rid: released.append(("scheduler", rid))),
-        _graph_runtime=SimpleNamespace(
+        graph_runtime=SimpleNamespace(
             get_sharding_config=lambda rid: None,
             get_rid_handle=lambda wire: 3,
             remove_request=lambda rid: released.append(("runtime", rid)),
@@ -615,7 +603,7 @@ def test_a_leader_drops_a_failed_row_its_follower_keeps():
     for w in (leader, follower):
         w.lifecycle.failed_rids.add(0)
 
-        Worker._postprocess_batch(w, *_decode_step([0, 1]))
+        w.pipeline._finish_step(*_decode_step([0, 1]))
 
     assert leader.log.routed == [[1]] and leader.log.registered == [[1]]
     assert follower.log.routed == [[0, 1]] and follower.log.registered == [[0, 1]]
