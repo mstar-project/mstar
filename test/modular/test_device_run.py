@@ -481,6 +481,35 @@ def test_a_skipped_run_lands_as_a_step_that_never_ran(begun, skipped):
     assert log == ([("rewound", 0), ("flag", [1, 2]), ("queued", [1, 2])] if skipped else [])
 
 
+def test_a_skipped_run_tells_auto_nothing():
+    """Its near-empty graph isn't a run's time, and the gap after it is the host build
+    the skip caused: read as idle time, each cut would push runs longer."""
+    from collections import deque
+
+    from mstar.worker.step_repeats import AutoRepeats
+    from mstar.worker.worker import Worker
+
+    worker = Worker.__new__(Worker)
+    key = ("n", WALK)
+    auto = AutoRepeats(limit=8)
+    seen = []
+    auto.observe = lambda gap, gpu, repeats: seen.append((gap, gpu, repeats))
+    worker._step_repeats = SimpleNamespace(auto={key: auto})
+
+    def event(at):
+        return SimpleNamespace(
+            query=lambda: True, at=at, elapsed_time=lambda end: (end.at - at) * 1000,
+        )
+
+    skipped, ran = torch.tensor([RUN_SKIPPED]), torch.tensor([RUN_RAN])
+    worker._auto_prev_end = event(0.0)
+    worker._auto_spans = deque([
+        (event(1.0), event(1.001), key, 8, skipped), (event(5.0), event(6.0), key, 8, ran),
+    ])
+    worker._drain_auto_spans()
+    assert seen == [(0.0, 1.0, 8)]
+
+
 def test_a_skip_is_not_missed_for_a_run_that_began_as_the_host_looked():
     """The launch tail sets the event after the admit fence lifts, and the word can
     change between two reads, so "it never launched" takes a fresh look at all three."""

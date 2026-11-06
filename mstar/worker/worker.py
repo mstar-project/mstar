@@ -36,7 +36,7 @@ from mstar.distributed.base import ShardingConfig
 from mstar.distributed.communication import WorkerParallelGroups
 from mstar.engine import apply_dynamo_config
 from mstar.engine.chunking import ChunkRange
-from mstar.engine.device_run import run_item
+from mstar.engine.device_run import RUN_SKIPPED, run_item
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import AdmitFailedReason, AllocationFailed
 from mstar.engine.resources.kv.config import without_layouts
@@ -500,7 +500,7 @@ class Worker(RepeatingSteps):
     _device_runs: frozenset = frozenset()
     # the chain looks for other ready work to yield to (``_SpecFairness.peek``); set by ``run``
     _spec_peek: bool = True
-    # (start, end, (node, walk), repeats) per step while a walk picks its run
+    # (start, end, (node, walk), repeats, RunState.started) per step while a walk picks its run
     # length (``step_repeats: auto``); None while none does
     _auto_spans: deque | None = None
     _auto_prev_end = None
@@ -2446,10 +2446,14 @@ class Worker(RepeatingSteps):
         ``AutoRepeats``. Every step is timed, so a gap is the time since the
         step before it on the stream, whichever walk that was."""
         while self._auto_spans:
-            start, end, key, repeats = self._auto_spans[0]
+            start, end, key, repeats, started = self._auto_spans[0]
             if not end.query():
                 return
             self._auto_spans.popleft()
+            if started is not None and int(started[0]) == RUN_SKIPPED:
+                # no run's time, and the gap after it is the host build the skip caused
+                self._auto_prev_end = None
+                continue
             gap = 0.0 if self._auto_prev_end is None else max(self._auto_prev_end.elapsed_time(start) / 1000, 0.0)
             self._auto_prev_end = end
             auto = self._step_repeats.auto.get(key)
@@ -2594,6 +2598,7 @@ class Worker(RepeatingSteps):
                     if self._auto_spans is not None and lane == CHAIN_LANE:  # a lane's step isn't the walk's gap
                         self._auto_spans.append((
                             gpu_start, gpu_end, (batch.node_name, batch.graph_walk), node_batch.step_context.repeats,
+                            node_batch.run_started,
                         ))
                         self._drain_auto_spans()
                     laps.lap("gpu_exec_events")
