@@ -191,6 +191,15 @@ def test_cuda_semantics():
     assert out.strip() == "ok"
 
 
+def test_a_parameter_given_another_gpus_data_is_on_that_gpu():
+    run_sim("""
+        import torch
+        p = torch.nn.Parameter(torch.ones(2, device="cuda:0"))
+        p.data = torch.ones(2, device="cuda:1")
+        assert p.device.index == 1 and (p + torch.ones(2, device="cuda:1")).device.index == 1
+    """)
+
+
 def test_a_mask_narrows_the_launchers_gpus_and_leaves_these_tests_alone(monkeypatch):
     """``CUDA_VISIBLE_DEVICES`` can hide emulated GPUs but not add any, and the caller's own
     doesn't reach a case that doesn't ask for it."""

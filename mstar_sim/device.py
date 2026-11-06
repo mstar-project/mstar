@@ -1030,7 +1030,7 @@ def _function_body(func, args, kwargs):
         # parameter reads (and aliases) the new one, as on a GPU
         with torch._C.DisableTorchFunctionSubclass():
             func(*args, **kwargs)
-        args[0]._data = args[1]._data
+        args[0]._data, args[0]._index = args[1]._data, args[1]._index
         return None
     if getattr(func, "__name__", "") == "__get__":
         # attribute getters (device, shape, dtype, data, ...) read the wrapper itself
