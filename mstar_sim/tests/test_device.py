@@ -970,7 +970,8 @@ def test_a_read_held_behind_a_rising_bound_doesnt_abort():
 
 def test_a_read_sees_a_bound_only_the_mover_had_stale():
     """The mover stores a bound it read before a change of state, over the one a read just worked
-    out: the read after that looks again."""
+    out: the read after that looks again. And of two reads that see a process parked, the second
+    must not catch up a process the first has set running."""
     out = run_sim("""
         import threading, time
         from mstar_sim import clock, waits
@@ -982,8 +983,19 @@ def test_a_read_sees_a_bound_only_the_mover_had_stale():
         waits._real_sleep(0.1)
         time.perf_counter()  # past the true bound, though the mover's says not
         print(waits.REPORT["ahead_stalls"])
+        table.bound, table.latest = lambda: 1e9, lambda: 1e6
+        go = waits._real_lock()
+        go.acquire()
+        threading.Thread(target=lambda: (go.acquire(), time.perf_counter()), name=waits.OWN + "reader").start()
+        with clock.LOCK:
+            clock.PARKED[0] = True
+            go.release()
+            waits._real_sleep(0.05)  # it has seen the process parked, and waits for this lock
+            clock.PARKED[0] = False
+        waits._real_sleep(0.05)
+        print(clock.now() < 1e6)
     """)
-    assert out.strip() == "1", out
+    assert out.split() == ["1", "True"], out
 
 
 def test_a_process_in_a_wait_the_emulator_cant_see_doesnt_pace_the_deployment():

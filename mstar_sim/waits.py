@@ -503,8 +503,7 @@ def read() -> float:
     that runs while LOCK is held): the mover needs LOCK to let it go."""
     clock.READS[0] += 1
     if clock.PARKED[0] and not LOCK._is_owned():
-        with LOCK:
-            _unpark()
+        _unpark_now()
     while True:
         t = clock.now()
         TABLE.tick(t)
