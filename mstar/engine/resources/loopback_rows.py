@@ -363,6 +363,16 @@ class LoopbackRows(Resource):
         gather_column(self._resident.store, step.buffers.rows, table.stride, table.col, indices)
         return indices
 
+    def prepare_iteration(self, walk: str, loop: LoopLayout) -> torch.Tensor:
+        """Allocate the entry record before capture, never inside a replay body."""
+        key = ("iteration", walk, loop.name)
+        table = self._tables.get(key)
+        if table is None:
+            item = torch.empty(1, 4 + len(loop.ancestors), dtype=torch.long, device=self._device)
+            table = self._table(key, item)
+            table[:, 2:].fill_(-1)  # generation zero is a valid first request
+        return table
+
     def iteration_head(
         self, walk: str, loop: LoopLayout, indices: torch.Tensor, entry: torch.Tensor,
         active: torch.Tensor | None = None,
@@ -375,11 +385,7 @@ class LoopbackRows(Resource):
         """
         if entry.shape != (len(indices), 2 + len(loop.ancestors)):
             raise ValueError("a Loop entry needs generation, graph pass and strict ancestor counts")
-        key = ("iteration", walk, loop.name)
-        table = self._tables.get(key)
-        if table is None:
-            table = self._table(key, entry.new_empty(1, entry.shape[1] + 2))
-            table[:, 2:].fill_(-1)  # generation zero is a valid first request
+        table = self.prepare_iteration(walk, loop)
         previous = table.index_select(0, indices)
         requested = indices != TRASH_ROW
         if active is not None:

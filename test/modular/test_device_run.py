@@ -1023,7 +1023,19 @@ def test_a_queued_window_reads_actual_progress_and_suppresses_predecessor_stops(
     """N+1's snapshot predates N. A short/zero N chooses its actual next input;
     an EOS row never mutates the resource again, including in a later launch.
     """
+    from mstar.engine.resources.loopback_rows import LoopbackRows
+
     loop = _Loop()
+
+    def entering_capture(body):
+        # GPU capture records allocation/initialization ops once; replay does
+        # not rerun Python's lazy-table branch. Such a reset would recur in
+        # every WHILE iteration and erase the predecessor's terminal state.
+        def no_new_table(*args):
+            pytest.fail("resident progress storage must be initialized before capture")
+        monkeypatch.setattr(LoopbackRows, "_table", no_new_table)
+
+    loop.capturing = entering_capture
     runner, run, _, calls = _runner(monkeypatch, loop, [[1, 1]], limit=4, progress=True)
     runner.test_resource.zero_()
     entries = torch.tensor([[1, 0], [1, 0]])

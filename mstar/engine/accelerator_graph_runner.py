@@ -1387,6 +1387,8 @@ class AcceleratorGraphRunner:
         if ask.loop is not None and (self._rows is None or warmed.resident is None):
             self._run_failures[walk] = "planner: actual Loop progress needs resident loop-back rows"
             return None, None, None
+        if ask.loop is not None:
+            self._rows.prepare_iteration(walk, ask.loop)
         cuda = backend.while_runtime()
         outer, handle, device_handle = cuda.new_loop(self._device)
         stream = TokenStream(spec.bucket.bs, ask.limit, self._device) if ask.stream_tokens else None
