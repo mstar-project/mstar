@@ -1,5 +1,6 @@
 """TP/EP selection from a node group's ``ep_config``, exercised on the Thinker, and
-that its forward leaves its input embeddings unwritten.
+that its forward leaves its input embeddings unwritten and hands the Talker the
+layer transformers does.
 
 Uses a shrunken Thinker config on CPU; no checkpoint or GPU needed.
 """
@@ -240,3 +241,24 @@ def test_the_forward_leaves_its_input_embeds_as_staged():
 
     assert torch.equal(input_embeds, staged), "the forward wrote into its input embeddings"
     assert torch.equal(layer_0_embed, staged)
+
+
+def test_the_talker_takes_the_stream_entering_its_accept_layer():
+    """transformers conditions the Talker on ``hidden_states[accept_hidden_layer]``,
+    where index 0 is the embeddings and index k the stream entering layer k."""
+    config = _config(num_layers=3)
+    config.talker.accept_hidden_layer = 2
+    model = Qwen3OmniThinkerModel(config)
+    for layer in model.model.layers:
+        layer.self_attn, layer.mlp = _Through(), _Through()
+    entering = []
+
+    def record(module, args):
+        hidden_states, residual = args  # the layer's input stream is their sum
+        entering.append(hidden_states + residual)
+
+    model.model.layers[2].register_forward_pre_hook(record)
+
+    _, _, layer_n_hidden = model(torch.randn(3, model.hidden_size))
+
+    assert torch.equal(layer_n_hidden, entering[0])
