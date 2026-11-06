@@ -968,6 +968,24 @@ def test_a_read_held_behind_a_rising_bound_doesnt_abort():
     assert jumper.strip() == "passed", jumper
 
 
+def test_a_read_sees_a_bound_only_the_mover_had_stale():
+    """The mover stores a bound it read before a change of state, over the one a read just worked
+    out: the read after that looks again."""
+    out = run_sim("""
+        import threading, time
+        from mstar_sim import clock, waits
+        table, low = waits.TABLE, clock.now() - 1.0
+        stale = lambda: threading.current_thread().name == waits.OWN + "mover" or waits.REPORT["ahead_stalls"]
+        table.bound = lambda: 1e9 if stale() else low
+        waits._seen[0] = table.epochs()  # the change came before this read looked
+        waits.kick()
+        waits._real_sleep(0.1)
+        time.perf_counter()  # past the true bound, though the mover's says not
+        print(waits.REPORT["ahead_stalls"])
+    """)
+    assert out.strip() == "1", out
+
+
 def test_a_process_in_a_wait_the_emulator_cant_see_doesnt_pace_the_deployment():
     """A thread in an unknown wait counts as running, but a process doing nothing at all (no task
     on a CPU, no CPU used, no clock read) is parked: a peer's device wait still jumps."""

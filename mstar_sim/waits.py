@@ -298,6 +298,7 @@ def _move() -> float:
         TABLE.tick(clock.now())  # a thread busy in native code (an import) reads no clock
     bound = TABLE.bound()
     _ahead[0] = bound + W
+    _seen[0] = -1  # (a read that worked out a lower one just now, on newer state, looks again)
     for w in pending:
         if w.kind is AHEAD and bound + W >= w.deadline and wake(w, thaw=False):
             w.release()
