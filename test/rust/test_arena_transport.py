@@ -311,6 +311,50 @@ def test_the_plan_counts_the_api_server_and_each_arena_worker(monkeypatch, fake_
     assert os.environ[arena.ARENA_PLAN_ENV] == "0x0"
 
 
+def test_the_plan_measures_after_a_dead_runs_files_are_swept(monkeypatch):
+    """A crashed run's files would otherwise leave the restart no arena at all."""
+    from types import SimpleNamespace
+
+    arena = _fake_dev_shm(monkeypatch, 256, free_mib=16)
+
+    def sweep(*args):
+        monkeypatch.setattr(arena.os, "statvfs", lambda path: SimpleNamespace(
+            f_frsize=1 << 20, f_blocks=256, f_bavail=256))
+
+    monkeypatch.setattr(arena, "_sweep_dead_namespaces", sweep)
+    monkeypatch.setattr(arena, "_sweep_orphan_segments", lambda: None)
+    arena.export_arena_plan(["cpu"] * 2)
+    assert os.environ[arena.ARENA_PLAN_ENV] == "64x1"
+
+
+def test_the_plan_sweeps_a_dead_namespaces_files_and_leaves_a_live_ones(monkeypatch, tmp_path):
+    import fcntl
+
+    arena = _fake_dev_shm(monkeypatch, 1024)
+    monkeypatch.setattr(arena, "_default_shm_dir", lambda: str(tmp_path))
+    monkeypatch.setattr(arena, "_sweep_orphan_segments", lambda: None)
+    dead, live = "a" * 12, "b" * 12
+    for ns in (dead, live):
+        (tmp_path / f"mstar_{ns}.lock").touch()
+        (tmp_path / f"mstar_{ns}_1").write_bytes(b"x")
+    # its deployment is alive: another open file description holds the shared lock
+    held = os.open(tmp_path / f"mstar_{live}.lock", os.O_RDONLY)
+    fcntl.flock(held, fcntl.LOCK_SH)
+    try:
+        arena.export_arena_plan(["cpu"])
+    finally:
+        os.close(held)
+    assert not (tmp_path / f"mstar_{dead}_1").exists()
+    assert (tmp_path / f"mstar_{live}_1").exists()
+
+
+def test_no_deployment_config_sweeps_nothing(monkeypatch):
+    arena = _fake_dev_shm(monkeypatch, 1024)
+    monkeypatch.setattr(arena, "_sweep_dead_namespaces", lambda *a: pytest.fail("swept"))
+    monkeypatch.setattr(arena, "_sweep_orphan_segments", lambda: pytest.fail("swept"))
+    arena.export_arena_plan(None)
+
+
 @pytest.mark.parametrize("planned", [True, False])
 def test_planned_arenas_do_not_depend_on_start_order(monkeypatch, tmp_path, planned):
     """An arena commits its first segment when it is built, so each one that
