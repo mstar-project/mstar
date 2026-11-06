@@ -53,7 +53,7 @@ class RepeatingSteps:
             return
         batch = speculation.scheduled_batch
         speculation.node_batch.step_context.owed_run = owes_run
-        repeats = self._step_repeats.ceiling(
+        repeats, why = self._step_repeats.ceiling(
             speculation, max(in_chain, int(owes_run)),
             lambda: self._graph_runtime.loop_room(
                 batch.node_name, batch.graph_walk, speculation.loop_name,
@@ -61,14 +61,15 @@ class RepeatingSteps:
                 self._step_repeats.config(batch.node_name).past_cap,
             ),
         )
-        if owes_run:
-            repeats = min(repeats, self._step_repeats.owed_length(batch.node_name))
+        if owes_run and self._step_repeats.owed_length(batch.node_name) < repeats:
+            repeats, why = self._step_repeats.owed_length(batch.node_name), "ready_waits"
         if self._ring_signals.get(batch.node_name):
             # a ring caps a run as a loop's room does: its rows have room for this many
             room = self.engine_manager.get_engine(batch.node_name).ring_room(
                 batch.node_name, speculation.continuing_rids,
             )
-            repeats = max(1, min(repeats, room or 1))
+            if (room or 1) < repeats:
+                repeats, why = max(1, room or 1), "its ring's room"
         # a stream window: as many iterations as every row has items for, and
         # what a row took past the step's own count goes back after its admit
         windows = {
@@ -77,11 +78,16 @@ class RepeatingSteps:
         }
         windows = {rid: edges for rid, edges in windows.items() if edges}
         if windows:
-            repeats = min(repeats, *(e.chunk.num_items for edges in windows.values() for e in edges))
+            items = min(e.chunk.num_items for edges in windows.values() for e in edges)
+            if items < repeats:
+                repeats, why = items, "its stream window"
             speculation.node_batch.stream_windows = windows
         if repeats > 1 and self._walk_drivers:
-            repeats = self._steady_consumer_walks(speculation, repeats)
+            steady = self._steady_consumer_walks(speculation, repeats)
+            if steady < repeats:
+                repeats, why = steady, "its consumer's walk changes"
         speculation.node_batch.step_context.repeats = repeats
+        self._step_repeats.note_ask((batch.node_name, batch.graph_walk), repeats, why)
 
     def _unchained_repeats(self, batch: ScheduledBatch) -> int:
         """The ask for a step the scheduler picked: more than one iteration only
@@ -91,14 +97,20 @@ class RepeatingSteps:
         (`_unchained_refusal`)."""
         if self._step_repeats is None or not self._step_repeats.asked:
             return 1
+        key = (batch.node_name, batch.graph_walk)
         # the runtime's name for the Loop: ``LoopEdges.loop`` is a build of its own
         loop = self._innermost_loop_by_node.get((batch.graph_walk, batch.node_name))
         if loop is None:
-            return 1
-        return self._step_repeats.unchained_ceiling(batch, lambda: self._graph_runtime.loop_room(
-            batch.node_name, batch.graph_walk, loop, list(batch.request_to_worker_graph), 0,
-            self._step_repeats.config(batch.node_name).past_cap,
-        ))
+            repeats, why = 1, "the runtime holds no Loop of it here"
+        else:
+            repeats, why = self._step_repeats.unchained_ceiling(batch, lambda: self._graph_runtime.loop_room(
+                batch.node_name, batch.graph_walk, loop, list(batch.request_to_worker_graph), 0,
+                self._step_repeats.config(batch.node_name).past_cap,
+            ))
+        edges = self._step_repeats.edges.get(key)
+        if edges is not None and not edges.chained:  # a chained node repeats on its chain's step
+            self._step_repeats.note_ask(key, repeats, why)
+        return repeats
 
     def _steady_consumer_walks(self, speculation: Speculation, repeats: int) -> int:
         """How far a run may go while every row's streamed items keep their

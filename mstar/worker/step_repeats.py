@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING, ClassVar
 from mstar.engine.resources.resident import NOT_ASKED
 from mstar.graph.base import EdgeKind, LoopEdges, loop_edges
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
+from mstar.utils.profiler import phase_record
 
 if TYPE_CHECKING:
     from mstar.engine.resources.step import StepContext
@@ -215,6 +216,8 @@ class StepRepeats:
         self.auto: dict[tuple[str, str], AutoRepeats] = {}
         # (node, walk) -> the next run's length, after a run whose stop odds passed eos_odds
         self._odds_caps: dict[tuple[str, str], int] = {}
+        # ((node, walk), why) of each cut to 1 already logged (``note_ask``)
+        self._cuts: set[tuple[tuple[str, str], str]] = set()
 
     def limit(self, node: str) -> int:
         config = self._configs.get(node)
@@ -308,34 +311,56 @@ class StepRepeats:
         waits = self.config(node).ready_waits
         return self.limit(node) if waits is True else min(int(waits), self.limit(node))
 
-    def ceiling(self, speculation: Speculation, in_chain: int, loop_room) -> int:
-        """The most ``speculation``'s step can repeat. Only a chain's step
-        whose rows all continue: a fresh row needs a plan of its own, and until
-        the chain has run a step, other ready work hasn't had its look in."""
+    def ceiling(self, speculation: Speculation, in_chain: int, loop_room) -> tuple[int, str | None]:
+        """The most ``speculation``'s step can repeat, and what held it there.
+        Only a chain's step whose rows all continue: a fresh row needs a plan of
+        its own, and until the chain has run a step, other ready work hasn't had
+        its look in."""
         batch = speculation.scheduled_batch
-        if (
-            in_chain < 1 or not speculation.is_new_iter or not speculation.is_same_node
-            or len(batch.request_to_worker_graph) != len(speculation.continuing_rids) or batch.chunk_ranges
-        ):
-            return 1
         if (batch.node_name, batch.graph_walk) not in self._walks:
-            return 1
+            return 1, None
+        if in_chain < 1:
+            return 1, "the chain's first step"
+        if not speculation.is_new_iter or not speculation.is_same_node:
+            return 1, "the chain's next step isn't this node's next iteration"
+        if len(batch.request_to_worker_graph) != len(speculation.continuing_rids):
+            return 1, "fresh rows join the step"
+        if batch.chunk_ranges:
+            return 1, "rows mid-prefill"
         return self._most((batch.node_name, batch.graph_walk), loop_room)
 
-    def unchained_ceiling(self, batch: ScheduledBatch, loop_room) -> int:
-        """The most a step the scheduler picked can repeat: one of a node whose
-        steps never chain (``LoopEdges.chained``), for which this is the only
-        step there is, whole rows of the one walk."""
+    def unchained_ceiling(self, batch: ScheduledBatch, loop_room) -> tuple[int, str | None]:
+        """The most a step the scheduler picked can repeat, and what held it
+        there: one of a node whose steps never chain (``LoopEdges.chained``),
+        for which this is the only step there is, whole rows of the one walk."""
         key = (batch.node_name, batch.graph_walk)
-        if key not in self._walks or self.edges[key].chained or batch.chunk_ranges or batch.request_walks:
-            return 1
+        if key not in self._walks or self.edges[key].chained:
+            return 1, None
+        if batch.chunk_ranges or batch.request_walks:
+            return 1, "rows mid-prefill or of more than one walk"
         return self._most(key, loop_room)
 
-    def _most(self, key: tuple[str, str], loop_room) -> int:
+    def _most(self, key: tuple[str, str], loop_room) -> tuple[int, str | None]:
         auto = self.auto.get(key)
         limit = self.limit(key[0]) if auto is None else auto.n
-        limit = min(limit, self._odds_caps.get(key, limit))
-        return max(1, min(limit, loop_room()))
+        why = None if auto is None else "auto"
+        if self._odds_caps.get(key, limit) < limit:
+            limit, why = self._odds_caps[key], "eos_odds"
+        room = loop_room()
+        if room < limit:
+            limit, why = room, f"its Loop has room for {room}"
+        return max(1, limit), why
+
+    def note_ask(self, key: tuple[str, str], asked: int, why: str | None) -> None:
+        """What a walk that may repeat asked of admit. The walk's line says "on"
+        from load, so a cut to one before admit shows here: counted per step,
+        and logged once per reason. ``_settle_repeats`` shows what admit cuts."""
+        if key not in self._walks:
+            return
+        phase_record(f"repeats.asked.{key[1]}#", asked)
+        if asked == 1 and why is not None and (key, why) not in self._cuts:
+            self._cuts.add((key, why))
+            logger.info("%s/%s: a step asked for 1 iteration: %s", *key, why)
 
 
 def walk_edges(walks: Mapping[str, object], pairs: Iterable[tuple[str, str]]) -> dict[tuple[str, str], LoopEdges]:

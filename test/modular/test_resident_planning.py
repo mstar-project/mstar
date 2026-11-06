@@ -570,7 +570,7 @@ def test_a_step_repeats_only_when_its_rows_all_continue(in_chain, fresh, same_no
     )
     repeats = _repeats(8)
     repeats.settle(lambda *key: None, lambda *key: None)
-    assert repeats.ceiling(speculation, in_chain, lambda: room) == want
+    assert repeats.ceiling(speculation, in_chain, lambda: room)[0] == want
 
 
 @pytest.mark.parametrize("limit", [1, 4])
@@ -1038,6 +1038,36 @@ def test_a_step_of_a_node_that_never_chains_repeats_where_the_scheduler_picks_it
     batch = ScheduledBatch(node_name="n", graph_walk=WALK, request_to_worker_graph=dict(rows))
     assert worker._unchained_repeats(batch) == (1 if chained else 3)
     assert asked == ([] if chained else [("n", WALK, "loop", [0, 1], 0, False)])
+
+
+def test_a_step_cut_to_one_before_admit_says_why(monkeypatch):
+    """Admit can't narrow an ask of 1, so the walk's "repeats on" line hid every cut
+    the worker made itself: pi0.5's Loop with no room was one. Counted per step,
+    logged once per reason."""
+    from mstar.worker import step_repeats as step_repeats_mod
+
+    edges = LoopEdges("loop", {"t": EdgeKind.LOOP_BACK}, {("t", "n"): EdgeKind.LOOP_BACK}, chained=False)
+    worker = Worker.__new__(Worker)
+    worker._step_repeats = StepRepeats({"n": RepeatConfig(max=8)}, {("n", WALK): edges})
+    worker._step_repeats.settle(lambda *key: None, lambda *key: None)
+    worker._innermost_loop_by_node = {(WALK, "n"): "loop"}
+    room = [0]
+    worker._graph_runtime = SimpleNamespace(loop_room=lambda *args: room[0])
+    logged = []
+    monkeypatch.setattr(step_repeats_mod.logger, "info", lambda *args: logged.append(args))
+    monkeypatch.setattr(profiler, "PHASE_PERIOD", 1)
+    samples = profiler.phase_buffer()
+    samples.clear()
+    batch = ScheduledBatch(node_name="n", graph_walk=WALK, request_to_worker_graph={0: 0})
+
+    assert [worker._unchained_repeats(batch) for _ in range(2)] == [1, 1]
+    room[0] = 5
+    assert worker._unchained_repeats(batch) == 5
+    worker._innermost_loop_by_node = {}
+    assert worker._unchained_repeats(batch) == 1
+    assert samples[f"repeats.asked.{WALK}#"] == [1, 1, 5, 1]
+    assert [args[-1] for args in logged] == ["its Loop has room for 0", "the runtime holds no Loop of it here"]
+    samples.clear()
 
 
 def test_an_unnamed_loop_is_asked_about_by_the_name_the_runtime_holds():
