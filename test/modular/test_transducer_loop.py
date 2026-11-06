@@ -23,6 +23,7 @@ from mstar.engine.resources.base import EngineResourceInfo
 from mstar.engine.resources.recurrent import RecurrentStatePool
 from mstar.engine.resources.runner import StepRunner
 from mstar.engine.resources.step import BucketKey, SlotLease, StepContext
+from mstar.engine.state.adapters import node_handles, node_resources
 from mstar.model.components.fastconformer import FastConformerConfig
 from mstar.model.components.transducer import CHUNK
 from mstar.model.parakeet.config import (
@@ -35,7 +36,7 @@ from mstar.model.parakeet.config import (
 )
 from mstar.model.parakeet.parakeet_model import ParakeetModel
 from mstar.model.parakeet.submodules import TransducerSubmodule, _batch_sizes
-from mstar.model.submodule_base import BatchedModelOutput, HostRows, ModelInputsFromEngine
+from mstar.model.submodule_base import BatchedModelOutput, HostRows, ModelInputsFromEngine, engine_step
 
 BUCKETS = (8, 32)
 # steps an iteration, fewer than the node's CHUNK, so that requests span several iterations
@@ -121,7 +122,7 @@ class Harness:
     def __init__(self, head, device: str = "cpu", compile_step: bool = False, max_slots: int = MAX_SLOTS):
         model = object.__new__(ParakeetModel)
         model.config = ParakeetModelConfig("parakeet_tdt", FastConformerConfig(), head.config)
-        (spec,) = model.get_node_resources()
+        (spec,) = node_resources(model)
         spec.apply_yaml_overrides(max_slots=max_slots)
         self.device = torch.device(device)
         self.pool = RecurrentStatePool.build(spec, EngineResourceInfo(device=self.device))
@@ -131,6 +132,7 @@ class Harness:
         # as the engine does at load
         self.node.requires_grad_(False)
         self.node.bind_node_resources(self.resources)
+        self.node.bind_node_state(node_handles(model, "transducer", self.resources))
         self.configs = {
             cfg.additional_key_info: cfg for cfg in self.node.get_accelerator_graph_configs(self.device)
         }
@@ -144,7 +146,7 @@ class Harness:
 
     def _drive(self, walk, inputs, infos, ctx: StepContext, forward=None) -> BatchedModelOutput:
         rids = list(ctx.padded_request_ids)
-        step = self.node.declare_step(walk, rids, inputs, slot_lease=ctx.slot_lease, per_request_info=infos)
+        step = engine_step(self.node, walk, rids, inputs, slot_lease=ctx.slot_lease, per_request_info=infos)
         step.set_ctx(ctx)
         assert self.runner.admit(step).ok
         self.runner.plan(step)
@@ -153,11 +155,15 @@ class Harness:
             captured=ctx.slot_lease is not None, step=step,
         )
         preprocessed = self.node.preprocess(walk, engine_inputs, inputs)
+        step.begin_calls()
         with fp32_precision_scope(self.precision):
             if forward is None:
                 out = self.node.forward_batched(walk, engine_inputs=engine_inputs, **preprocessed)
             else:
                 out = forward(preprocessed)
+        if forward is None:
+            step.check_calls()
+        step.end_calls()
         self.runner.commit(step)
         return BatchedModelOutput.coerce(out)
 
@@ -314,15 +320,18 @@ def test_a_step_run_row_by_row_feeds_the_stop_check():
     # one frame: max_symbols tokens, then the cursor moves past it
     harness.join([0], [clips[1]], [None])
     infos, inputs = harness._decode_inputs([0])
-    step = harness.node.declare_step(WALK, [0], inputs, per_request_info=infos)
+    step = engine_step(harness.node, WALK, [0], inputs, per_request_info=infos)
     step.set_ctx(StepContext(request_ids=[0], graph_walk=WALK, slot=0, capture=False))
     assert harness.runner.admit(step).ok
     harness.runner.plan(step)
     engine_inputs = ModelInputsFromEngine(
         request_ids=[0], per_request_info=infos, resources=harness.resources, captured=False, step=step,
     )
+    step.begin_calls()
     with torch.no_grad(), fp32_precision_scope(harness.precision):
         out = harness.node.forward(WALK, engine_inputs, **harness.node.preprocess(WALK, engine_inputs, inputs))
+    step.check_calls()
+    step.end_calls()
     harness.runner.commit(step)
     assert out.keys() == {"tokens", "active"}
     assert [token for token in out["tokens"][0][0].tolist() if token >= 0] == _reference(head, clips[1])
