@@ -80,6 +80,7 @@ from mstar.model.submodule_base import (
     HostRows,
     InputMetadata,
     InputSeqLenInfo,
+    IterationStream,
     LazyRequestStates,
     ModelInputsFromEngine,
     NodeInputs,
@@ -338,18 +339,20 @@ class SubmoduleManagement:
         for runner in self.piecewise_runners.values():
             runner.set_slot(slot)
 
-def _window_tables(specs, inputs: Mapping[str, list] | None, metadata) -> dict[str, torch.Tensor]:
+def _window_tables(specs, inputs: Mapping[str, list] | None, metadata) -> dict[str, IterationStream]:
     """A row's stream windows: each streamed iteration input's items this
     step, ``[items, ...]`` (one item is collated as itself)."""
-    if not specs or not inputs:
+    if not specs:
         return {}
+    inputs = inputs or {}
     chunks = getattr(metadata, "stream_chunks", {}) or {}
     out = {}
     for spec in specs:
         tensors = inputs.get(spec.source)
         chunk = chunks.get(spec.source)
-        if tensors and chunk is not None and chunk.num_items:
-            out[spec.source] = tensors[0].reshape(chunk.num_items, *spec.shape)
+        if chunk is not None:
+            table = tensors[0].reshape(chunk.num_items, *spec.shape) if tensors and chunk.num_items else None
+            out[spec.source] = IterationStream(table, chunk.tail_offset)
     return out
 
 

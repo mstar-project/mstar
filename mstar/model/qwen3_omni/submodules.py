@@ -1558,15 +1558,8 @@ class TalkerSubmodule(ARNodeSubmodule):
             seq_len = input_embeds.shape[0]
 
         elif graph_walk == "talker_decode":
-            # The previous step's codec embedding sum. Its text conditioning,
-            # projected in the forward, is the engine's to stage (ITERATION_INPUTS):
-            # a step with no Thinker item reads text_tail from its first row, so
-            # tts_eos the first time and only tts_pad after.
-            state = self.request_state(fwd_info.rid_handle)
-            if state.get("text_ended"):
-                state.add("text_tail", self._tts_pad_raw)
-            elif not inputs.get("thinker_states"):
-                state.add("text_ended", True)
+            # The engine stages text conditioning from the stream's own
+            # position, including EOS once and padding after the real items.
             return ARNodeInputs(input_embeds=inputs["talker_input_embeds"][0], input_seq_len=1)
 
         return ARNodeInputs(

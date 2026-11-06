@@ -2889,7 +2889,7 @@ def test_a_resident_preprocess_that_reads_what_the_graph_fills_stops_the_worker(
     )
     ctx = StepContext(request_ids=(1,), graph_walk=WALK, slot=0, capture=False)
     ctx.resident = object()
-    batch = SimpleNamespace(node_name="n", per_request_input_metadata={}, launch_started_event=None)
+    batch = SimpleNamespace(node_name="n", per_request_input_metadata={}, launch_started_event=None, stream_windows={})
     drive = partial(engine._drive_step, batch, mgmt, [1], [], {}, ctx, None, True, None, False)
     if reader == "preprocess":
         with pytest.raises(ValueError, match="rope.pos_ids"):
@@ -3227,16 +3227,16 @@ def test_a_step_that_reads_a_stream_window_repeats_as_far_as_every_row_has_items
     spec = IterationInput("chunk", shape=(2,), streamed=True)
     items = torch.arange(6.0).reshape(3, 2)
     metadata = SimpleNamespace(stream_chunks={"chunk": StreamChunkInfo(0, 0, 3, False)})
-    assert torch.equal(_window_tables([spec], {"chunk": [items]}, metadata)["chunk"], items)
+    assert torch.equal(_window_tables([spec], {"chunk": [items]}, metadata)["chunk"].items, items)
 
 
-def test_the_omni_talker_reads_the_thinkers_items_then_tts_eos_once_then_tts_pad():
+@pytest.mark.parametrize("retained", [False, True])
+def test_the_omni_talker_reads_the_thinkers_items_then_tts_eos_once_then_tts_pad(retained):
     """Whatever the runs, a Talker row's text inputs are the host path's: each
     Thinker item once, then tts_eos for one iteration, then tts_pad."""
     from mstar.engine.engine import _window_tables
     from mstar.model.qwen3_omni.submodules import TalkerSubmodule
     from mstar.model.submodule_base import iteration_columns
-    from mstar.streaming.stream_buffer import StreamChunkInfo
 
     sub = TalkerSubmodule.__new__(TalkerSubmodule)
     torch.nn.Module.__init__(sub)
@@ -3248,19 +3248,36 @@ def test_the_omni_talker_reads_the_thinkers_items_then_tts_eos_once_then_tts_pad
     (spec,) = sub.ITERATION_INPUTS.values()
     item = iter(range(1, 100))
     seen: dict[int, list[float]] = {0: [], 1: []}
+    from mstar.streaming.chunk_policy import FixedChunkPolicy
+    from mstar.streaming.stream_buffer import StreamBuffer
+
+    buffers = {rid: StreamBuffer(rid, "thinker_states", "Thinker", FixedChunkPolicy(1, True)) for rid in seen}
+    produced = {rid: 0 for rid in seen}
 
     def step(windows: dict[int, int], repeats: int) -> None:
-        rows = []
+        rows, snapshots = [], {}
         for rid, items in windows.items():
-            values = torch.tensor([[float(next(item))] * 2 for _ in range(items)])
-            inputs = {"talker_input_embeds": [torch.zeros(1, 2)], "thinker_states": [values] if items else []}
+            buf = buffers[rid]
+            for _ in range(items):
+                value = float(next(item))
+                buf.pre_read_register(produced[rid])
+                buf.put(produced[rid], torch.full((2,), value))
+                produced[rid] += 1
+            if not items:
+                buf.signal_done(produced[rid])
+            snapshot = buf.reserve_window(repeats) if retained else buf.pop_window(repeats)
+            snapshots[rid] = snapshot
+            tensor = snapshot.data.get("data")
+            inputs = {"talker_input_embeds": [torch.zeros(1, 2)], "thinker_states": [tensor] if items else []}
             info = SimpleNamespace(rid_handle=rid)
             sub.prepare_inputs("talker_decode", info, inputs)
-            chunks = SimpleNamespace(stream_chunks={"thinker_states": StreamChunkInfo(0, 0, items, False)})
+            chunks = SimpleNamespace(stream_chunks={"thinker_states": snapshot.info})
             rows.append((rid, 0, _window_tables([spec], inputs, chunks)))
         column = iteration_columns(sub, rows, repeats, CPU)["text_raw"]
         for (rid, _, _), values in zip(rows, column, strict=True):
             seen[rid].extend(values[:, 0].tolist())
+            if retained:
+                buffers[rid].settle_window(snapshots[rid].reservation, repeats)
 
     step({0: 1, 1: 1}, 1)
     step({0: 2, 1: 0}, 2)  # row 1's stream has ended; the run is as long as row 0's window
@@ -3455,7 +3472,7 @@ def test_requested_device_execution_refuses_unsupported_walk_at_load(repeat_reas
 
 
 def test_a_batched_input_window_does_not_read_past_each_rows_admitted_horizon():
-    from mstar.model.submodule_base import iteration_columns
+    from mstar.model.submodule_base import IterationStream, iteration_columns
 
     node = SimpleNamespace(
         ITERATION_INPUTS={
@@ -3465,7 +3482,8 @@ def test_a_batched_input_window_does_not_read_past_each_rows_admitted_horizon():
         iteration_tables=IterationTables(CPU),
         request_states={1: {"ts": torch.arange(8)}, 2: {"ts": torch.arange(8)}},
     )
-    rows = [(1, 1, {"stream": torch.arange(6)}), (2, 6, {"stream": torch.tensor([70])}), None]
+    rows = [(1, 1, {"stream": IterationStream(torch.arange(6))}),
+            (2, 6, {"stream": IterationStream(torch.tensor([70]))}), None]
     # A continuing row covers predecessor uncertainty plus its next run;
     # a fresh row near its fixed cap has only one valid input, in the same batch.
     out = iteration_columns(node, rows, 8, CPU, horizons=[6, 1, 0])
@@ -3512,3 +3530,21 @@ def test_an_engine_input_window_keeps_lower_origins_entry_keys_and_per_row_exten
     node.request_states[1]["ts"] = torch.arange(9) + 200
     engine._iteration_columns("n", node, one, [1], info, actual_loop=loop)
     assert single.columns["t"].item() == 101
+
+
+@pytest.mark.parametrize("items, tail, expected", [
+    ([10., 11.], 0, [10., 11., -1., -2., -3., -3.]),
+    ([], 1, [-2., -3., -3., -3., -3., -3.]),
+    ([], 5, [-3., -3., -3., -3., -3., -3.]),
+])
+def test_stream_padding_uses_its_snapshotted_tail_position(items, tail, expected):
+    from mstar.engine.engine import _window_tables
+    from mstar.model.submodule_base import InputMetadata, iteration_columns
+    from mstar.streaming.stream_buffer import StreamChunkInfo
+
+    spec = IterationInput("text", streamed=True, pad="tail")
+    node = SimpleNamespace(ITERATION_INPUTS={"cond": spec}, request_states={1: {"tail": torch.tensor([-1., -2., -3.])}})
+    metadata = InputMetadata(stream_chunks={"text": StreamChunkInfo(0, 0, len(items), False, tail_offset=tail)})
+    tables = _window_tables([spec], {"text": [torch.tensor(items)]} if items else {}, metadata)
+    actual = iteration_columns(node, [(1, 0, tables)], 6, CPU)["cond"]
+    assert actual.tolist() == [expected]

@@ -439,17 +439,17 @@ def test_only_executed_tail_reservations_spend_pad_rows_even_at_width_one():
     buf.signal_done(2)
     first = buf.reserve_window(4)
     successor = buf.reserve_window(4)
-    assert first.reservation.tail_offset == successor.reservation.tail_offset == 0
+    assert first.tail_offset == successor.tail_offset == 0
     buf.settle_window(first.reservation, 3)  # two real items, then the first tail input
-    assert successor.reservation.tail_offset == 0, "a submitted snapshot must not change"
+    assert successor.tail_offset == 0, "a submitted snapshot must not change"
     buf.settle_window(successor.reservation, 2)
     one = buf.reserve_window(1)
-    assert one.num_items == 0 and one.reservation.tail_offset == 3
+    assert one.num_items == 0 and one.tail_offset == 3
     buf.cancel_window(one.reservation)
     skipped = buf.reserve_window(1)
     buf.settle_window(skipped.reservation, 0)
     retry = buf.reserve_window(1)
-    assert retry.reservation.tail_offset == 3, "a refused or skipped input spends no pad row"
+    assert retry.tail_offset == 3, "a refused or skipped input spends no pad row"
     buf.settle_window(retry.reservation, 1)
     assert buf._tail_consumed == 4
     assert buf._consumed == buf.policy.items_consumed == 2
@@ -590,3 +590,20 @@ def test_a_skipped_reader_keeps_its_origin_and_narrowed_bound_through_real_graph
         assert buf._consumed == 2
         assert not any(tm.tensor_store.check_uuid_presence(uuid) for uuid in uuids[:2])
         assert all(tm.tensor_store.check_uuid_presence(uuid) for uuid in uuids[2:])
+
+
+def test_an_ordinary_window_leaves_eos_for_its_empty_step_and_returns_the_same_tail():
+    streams, tm, buf = _consumer(1, 1)
+    buf.policy = FixedChunkPolicy(1, True)
+    _produce(tm, buf, [5, 6])
+    buf.signal_done(2)
+    real = streams.pop_edge(buf, EDGE, RID, window=8)
+    assert real.chunk.num_items == 2 and buf._tail_consumed == 0
+    _consume(streams, tm, real)
+    eos = streams.pop_edge(buf, EDGE, RID, window=8)
+    assert eos.chunk.num_items == 0 and eos.chunk.tail_offset == 0
+    streams.return_edge(RID, eos)
+    retry = streams.pop_edge(buf, EDGE, RID, window=8)
+    assert retry.chunk is eos.chunk and buf._tail_consumed == 1
+    pad = streams.pop_edge(buf, EDGE, RID, window=8)
+    assert pad.chunk.tail_offset == 1

@@ -410,7 +410,8 @@ class StreamBufferManager:
             # the step's edge drops its references when its node consumes it
             self._tensor_manager.increment_ref_batch_uniform(rest)
         sbuf.store_uningested_edge(streaming_edge._replace(
-            uuids=rest, chunk=StreamChunkInfo(chunk.start_offset + used, 0, len(rest), chunk.is_final),
+            uuids=rest, chunk=StreamChunkInfo(chunk.start_offset + used, 0, len(rest), chunk.is_final,
+                                            tail_offset=chunk.tail_offset),
         ), first=True)
         if chunk.is_final:
             req_info.ended_streams.discard(streaming_edge.name)

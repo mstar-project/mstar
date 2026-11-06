@@ -14,8 +14,6 @@ class StreamReservation:
     chunk_index: int
     bound: int
     predecessor_bound: int
-    # Empty tail inputs already executed when this snapshot began.
-    tail_offset: int = 0
 
 
 @dataclass
@@ -35,11 +33,12 @@ class StreamChunk:
     # by, or everything on a flush); the buffer no longer holds them
     released: list = field(default_factory=list)
     reservation: StreamReservation | None = None
+    tail_offset: int = 0
 
     @property
     def info(self) -> "StreamChunkInfo":
         return StreamChunkInfo(
-            self.start_offset, self.context_items, self.num_items, self.is_final, self.reservation,
+            self.start_offset, self.context_items, self.num_items, self.is_final, self.reservation, self.tail_offset,
         )
 
 
@@ -50,6 +49,7 @@ class StreamChunkInfo(NamedTuple):
     num_items: int
     is_final: bool
     reservation: StreamReservation | None = None
+    tail_offset: int = 0
 
 
 class StreamingEdge(NamedTuple):
@@ -104,7 +104,8 @@ class StreamBuffer:
     _tensor_ids_in_order: deque = field(default_factory=deque)
     _id_to_tensor: dict = field(default_factory=dict)
     _consumed: int = 0
-    # Actual empty-tail reads, distinct from producer items acknowledged.
+    # Tail position: ordinary pops assign it; retained windows advance it only
+    # at settlement. Returned ordinary chunks keep their snapshotted offset.
     _tail_consumed: int = 0
     _chunks_popped: int = 0
     # Submitted readers may overlap; only settlement advances the source.
@@ -301,6 +302,7 @@ class StreamBuffer:
         buf_len = len(self._buffer)
         window = self.policy.window_size()
         offset = self._consumed  # global position of buffer[0]
+        tail_offset = self._tail_consumed
 
         run = self._walk_run_len()
 
@@ -327,6 +329,8 @@ class StreamBuffer:
             self._buffer = self._buffer[stride:]
             self._consumed += stride
         self.policy.register_chunk(stride)
+        if not items and self.policy.continue_after_producer_done():
+            self._tail_consumed += 1
         if self._walk_runs and stride:
             # A chunk never spans two walks, so the stride is within one run
             run = self._walk_runs[0]
@@ -350,6 +354,7 @@ class StreamBuffer:
             context_items=min(max(self._delivered_end - offset, 0), len(items)),
             num_items=len(items),
             released=released,
+            tail_offset=tail_offset,
         )
         self._delivered_end = max(self._delivered_end, offset + len(items))
         self._chunks_popped += 1
@@ -365,7 +370,9 @@ class StreamBuffer:
         if n == 1 or first.num_items != 1 or first.is_final or self.policy.window_size() != 1:
             return first
         chunks = [first]
-        while len(chunks) < n and self.has_chunk_ready() and self.peek_walk() == walk:
+        while len(chunks) < n and self.has_chunk_ready() and self.peek_walk() == walk and self._walk_run_len():
+            # Legacy windows execute only their real item count. Leave an
+            # empty tail for its own step so an unexecuted EOS is not spent.
             chunk = self.pop_chunk()
             chunks.append(chunk)
             if chunk.is_final or chunk.num_items != 1:
@@ -383,7 +390,7 @@ class StreamBuffer:
         return StreamChunk(
             data=merged, chunk_index=first.chunk_index, start_offset=first.start_offset, is_final=last.is_final,
             context_items=first.context_items, num_items=sum(c.num_items for c in chunks),
-            released=[item for c in chunks for item in c.released],
+            released=[item for c in chunks for item in c.released], tail_offset=first.tail_offset,
         )
 
     def reserve_window(self, bound: int, consumer_walk: str | None = None) -> StreamChunk | None:
@@ -412,13 +419,13 @@ class StreamBuffer:
             return None
         if ready and self.walk_tagged and self.peek_walk() != consumer_walk:
             return None
-        reservation = StreamReservation(self._chunks_popped, bound, predecessor, self._tail_consumed)
+        reservation = StreamReservation(self._chunks_popped, bound, predecessor)
         self._chunks_popped += 1
         self._reservations[reservation] = bound
         items = self._buffer[:min(ready, predecessor + bound)]
         return StreamChunk(
             data=self._collate(items), chunk_index=reservation.chunk_index,
-            start_offset=self._consumed, num_items=len(items), reservation=reservation,
+            start_offset=self._consumed, num_items=len(items), reservation=reservation, tail_offset=self._tail_consumed,
         )
 
     def owns_window(self, reservation: StreamReservation) -> bool:
@@ -436,7 +443,7 @@ class StreamBuffer:
         reservation = chunk.reservation
         if reservation is None or reservation not in self._reservations:
             raise ValueError("a retained stream snapshot needs its live reservation")
-        prefix = self._consumed + self._tail_consumed - chunk.start_offset - reservation.tail_offset
+        prefix = self._consumed + self._tail_consumed - chunk.start_offset - chunk.tail_offset
         if not 0 <= prefix <= reservation.predecessor_bound:
             raise ValueError("stream progress is outside its retained predecessor span")
         return prefix

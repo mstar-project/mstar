@@ -118,6 +118,12 @@ class IterationInput(NamedTuple):
     streamed: bool = False
 
 
+class IterationStream(NamedTuple):
+    """One immutable streamed input snapshot and its first padding position."""
+    items: torch.Tensor | None
+    tail_offset: int = 0
+
+
 class CarryPair(NamedTuple):
     """A loop-back signal between two replays of a step that repeats."""
     # the output (a row output or ``check_stop_buffers`` entry) a replay leaves it in
@@ -1565,10 +1571,11 @@ def iteration_columns(
                     fill = torch.full((repeats, *spec.shape), spec.capture_fill, dtype=spec.dtype, device=device)
                 values.append(fill)
                 continue
-            table = (row[2] if len(row) > 2 else {}).get(spec.source)
+            window = (row[2] if len(row) > 2 else {}).get(spec.source)
+            table = None if window is None else window.items
             if table is None:
                 table = torch.empty(0, *spec.shape, dtype=spec.dtype, device=device)
-            padded = _pad_table(spec, state, table, count)
+            padded = _pad_table(spec, state, table, count, 0 if window is None else window.tail_offset)
             start = spec.offset
             padless = spec.pad is None or (isinstance(spec.pad, str) and spec.pad not in state)
             if padless and start + count > padded.shape[0]:
@@ -1583,7 +1590,9 @@ def iteration_columns(
     return out
 
 
-def _pad_table(spec: IterationInput, state: PerRequestState, table: torch.Tensor, repeats: int) -> torch.Tensor:
+def _pad_table(
+    spec: IterationInput, state: PerRequestState, table: torch.Tensor, repeats: int, tail_offset: int,
+) -> torch.Tensor:
     """A stream window ``table``, then its pad rows (a state key's, or the
     constant), then the last of them ``repeats`` times more: any ``repeats``
     rows from any start are one slice. No pad: the table alone (reading past
@@ -1594,6 +1603,8 @@ def _pad_table(spec: IterationInput, state: PerRequestState, table: torch.Tensor
         pad = state[spec.pad].reshape(-1, *table.shape[1:]).to(table.dtype)
     else:
         pad = table.new_full((1, *table.shape[1:]), spec.pad)
+    # The retained real prefix is unchanged; only the pad segment has an age.
+    pad = pad[min(tail_offset, pad.shape[0] - 1):]
     return torch.cat([table, pad, pad[-1:].expand(repeats, *pad.shape[1:])])
 
 
