@@ -9,7 +9,7 @@ import torch
 from mstar.engine import accelerator_graph_runner as runner_mod
 from mstar.engine.accelerator_graph_runner import AcceleratorGraphRunner
 from mstar.engine.device_run import RUN_REPLAYS, CudaWhile, DeviceRun, RunAsk, RunState, TokenStream
-from mstar.engine.resources.step import BucketKey
+from mstar.engine.resources.step import BucketKey, SlotLease
 from mstar.model.submodule_base import BatchedModelOutput, CarryPair
 
 CPU = torch.device("cpu")
@@ -542,14 +542,23 @@ def _run_step(rows, looks, yield_asked=False, **node_batch):
     )
 
 
-@pytest.mark.parametrize("slots, asks", [((0, 0), 1), ((0, 1), 0)])
-def test_a_yield_asked_for_a_run_survives_the_step_behind_on_its_slot(monkeypatch, slots, asks):
-    """With one slot N+1 stages N's own run state, which clears the yield the
-    speculation asked for N; with two each keeps its own (review-r7 G3)."""
+@pytest.mark.parametrize("behind_on, asks", [
+    (SlotLease(0, BucketKey(WALK, 2, 2)), 1),
+    (SlotLease(1, BucketKey(WALK, 2, 2)), 0),
+    (SlotLease(0, BucketKey(WALK, 4, 4)), 0),
+])
+def test_a_yield_asked_for_a_run_survives_the_step_behind_on_its_run_state(monkeypatch, behind_on, asks):
+    """A run state is a bucket's slot's. N+1 on N's clears the yield the speculation asked
+    for N; on another each keeps its own word, and asking again would only cut N+1
+    (review-r7 G3)."""
     worker, log = _waiting_on_a_run(monkeypatch, [set()])
     worker._hold_rows = lambda lane, rows: None
-    behind = _run_step([2], 0, slot=slots[1], launch_started_event=SimpleNamespace(is_set=lambda: True))
-    worker._await_run(_run_step([1], 1, yield_asked=True, slot=slots[0], token_stream=None), behind, [], None)
+    behind = _run_step(
+        [2], 0, step_context=SimpleNamespace(slot_lease=behind_on),
+        launch_started_event=SimpleNamespace(is_set=lambda: True),
+    )
+    running = SimpleNamespace(slot_lease=SlotLease(0, BucketKey(WALK, 2, 2)))
+    worker._await_run(_run_step([1], 1, yield_asked=True, step_context=running, token_stream=None), behind, [], None)
     assert log.count("yield") == asks
 
 

@@ -408,8 +408,12 @@ class RepeatingSteps:
             rows.update(spec_pending.batch.request_to_worker_graph)
         self._hold_rows(CHAIN_LANE, rows)
         engine = self.engine_manager.get_engine(batch_N.node_name)
-        if batch_N.yield_asked and spec_pending is not None and spec_pending.node_batch.slot == batch_N.node_batch.slot:
-            # one slot: N+1 staged N's own run state, clearing the yield asked for N
+        if (
+            batch_N.yield_asked and spec_pending is not None
+            and spec_pending.node_batch.step_context.slot_lease == batch_N.node_batch.step_context.slot_lease
+        ):
+            # a bucket's slot holds one run state: N+1 staged N's, clearing the yield asked
+            # for N. One word serves both, so this cuts N+1 too.
             engine.yield_runs(batch_N.node_name)
         has_ready = self.scheduler.has_ready_excluding
         state, chain = self.request_state, (batch_N.node_name, batch_N.graph_walk)
