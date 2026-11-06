@@ -70,6 +70,7 @@ class _FakeEngine:
     def __init__(self, admit_error):
         self._admit_error = admit_error
         self.postprocessed = False
+        self._submodules = {"node": SimpleNamespace(device_stops={})}
 
     def exec(self, batch):
         batch.admit_error = self._admit_error
@@ -82,7 +83,8 @@ class _FakeEngine:
 
 
 def _batch():
-    return SimpleNamespace(request_ids=["r0", "r1"], admit_error=None, cached_rids=set(), rows_only=False)
+    return SimpleNamespace(node_name="node", request_ids=["r0", "r1"], admit_error=None,
+                           cached_rids=set(), rows_only=False, run_started=None)
 
 
 @pytest.mark.parametrize(
