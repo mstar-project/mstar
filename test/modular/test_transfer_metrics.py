@@ -43,6 +43,7 @@ from mstar.utils.ipc_format import (  # noqa: E402
     WorkerMessage,
     WorkerMessageType,
 )
+from mstar.worker.rebuild import Rebuilds  # noqa: E402
 from mstar.worker.worker import Worker  # noqa: E402
 
 DATA_WORKER = "api_server_preprocess_worker"
@@ -321,6 +322,7 @@ def _bare_worker(tmp_path):
     worker.worker_id = "worker_1"
     worker.parallel_leader_nodes = set()
     worker.engine_manager = SimpleNamespace(engine=SimpleNamespace(paged_kv_caches=list))
+    worker._rebuilds = Rebuilds({}, {})
     worker.communicator = _Sink()
     worker.tensor_manager = _shm("worker_1", tmp_path)
     return worker

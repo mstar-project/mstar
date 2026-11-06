@@ -339,6 +339,13 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
      - *(optional, default 128)* The fewest tokens a prompt cut by chunked prefill runs
        in a step, or the whole budget if that is smaller; with less left, it waits a step. A positive int, for every
        chunked walk. See *Chunked prefill budgets* below.
+   * - ``rebuild_host_mb``
+     - *(optional, default 64)* MiB of pinned host memory a worker serving a node whose model
+       declares a rebuild policy sets aside at startup for its requests' prompt ids, 8 B a token (int64),
+       which a request dropped from the KV cache is rebuilt from. A request the pool can't hold
+       keeps no ids, so it is never dropped on that node, though it can still move to the host
+       with ``cpu_offload_pages``. A tensor or sequence parallel node never drops a request, so it
+       keeps no ids and sets no memory aside. A non-negative int, and 0 keeps no ids.
    * - ``warmup_requests``
      - *(optional)* Requests the server runs after the workers are ready and before it
        binds, so no client pays a shape's first-request cost (torch.compile of a step,
@@ -1048,6 +1055,10 @@ or ``increase()``.
 - ``mstar_kv_pages_cached{model_name, component, resource}``: pages the prefix cache
   names. Some may also be in use by running requests; the cache frees the others when a
   request needs the room.
+- ``mstar_rebuild_host_bytes_used{model_name, component}``,
+  ``mstar_rebuild_host_bytes_total{model_name, component}``: bytes of the worker's
+  rebuild host pool (``rebuild_host_mb``) that hold kept prompt ids, and the pool's size.
+  A prompt the pool has no room for keeps no ids, so its request is never dropped.
 - ``mstar_step_seconds{model_name, component, graph_walk}``: histogram over engine
   steps that ran a forward. A step counts from when the worker hands it to its GPU
   thread, or from the end of the previous step if that was later, to the end of its
