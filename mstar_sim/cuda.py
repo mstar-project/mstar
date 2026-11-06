@@ -179,9 +179,11 @@ def empty_cache() -> None:
 
 
 def mem_get_info(device=None) -> tuple[int, int]:
+    """A negative index answers for the current device, as torch's ``CUDAGuard`` does."""
     _check_fault()
+    index = device_index(device)
     total = spec().total
-    return total - memory_reserved(device), total
+    return total - memory_reserved(current_device() if index < 0 else index), total
 
 
 _fraction: dict[int, float] = {}

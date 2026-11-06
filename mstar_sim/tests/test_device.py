@@ -93,6 +93,7 @@ def test_cuda_semantics():
                 raise SystemExit("a negative index's memory was read")
             except RuntimeError as e:
                 assert "Invalid device argument -1" in str(e)
+        assert torch.cuda.mem_get_info(-1) == torch.cuda.mem_get_info()  # CUDAGuard(-1) stays on the current device
         from mstar_sim.device import _rebuild
         try:
             _rebuild(torch.ones(1), 8)
