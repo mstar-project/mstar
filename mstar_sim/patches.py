@@ -370,11 +370,13 @@ def rust_poll() -> None:
         if timeout_ms <= 0:
             return poll_once(self, timeout_ms)
 
+        event = getattr(self, "event", None)
+
         def poll(seconds):
             kind = poll_once(self, max(1, math.ceil(seconds * 1000)))
-            return None if kind == "timeout" or (kind == "wake" and waits._poked) else kind  # (the mover's)
+            # a wake with no event is the mover's; one with an event may be real, and is now drained
+            return None if kind == "timeout" or (kind == "wake" and event is None) else kind
 
-        event = getattr(self, "event", None)
         kind = waits.polling(poll, event.fd if event is not None else None, timeout_ms / 1000)
         if kind == "msg":
             waits.delivered()

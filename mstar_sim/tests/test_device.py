@@ -1071,6 +1071,36 @@ def test_a_device_wait_needs_no_one():
     """)
 
 
+def test_a_real_wake_of_the_rust_poll_survives_a_poke_for_another_wait():
+    """The mover's eventfd is shared by every poll of the process, and a poll's wake drains mstar's
+    own event: dropped here, the data worker's flush would sit out the poll. A poll with no event
+    has no wake to give its caller: that one was the mover's."""
+    out = run_sim("""
+        import collections, time
+        from mstar_sim import clock, waits
+        from mstar.communication import rust_communicator as rust
+        from mstar.communication.event import EventWakeup
+
+        class Inner:
+            def recv_or_wake(self, timeout_ms):
+                if timeout_ms <= 0 or not self.woken:
+                    return "timeout", None
+                self.woken = False
+                return "wake", None
+
+        def poll(event):
+            comm = rust.RustZMQCommunicator.__new__(rust.RustZMQCommunicator)
+            comm._inner, comm._buffered, comm.event = Inner(), collections.deque(), event
+            comm._inner.woken = True
+            return comm._poll_once(100)
+
+        waits._poked.add(object())  # a selector's wait the mover is ending
+        print(poll(EventWakeup()), poll(None))
+        waits._poked.clear()
+    """)
+    assert out.split() == ["wake", "timeout"], out
+
+
 def test_a_read_held_behind_a_rising_bound_doesnt_abort():
     """The limit is on a bound that stands still, not on a hold: a device wait can put a process
     far past a peer that runs at real rate, and it then waits for the peer to get there."""
