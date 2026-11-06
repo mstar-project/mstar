@@ -28,6 +28,8 @@ from benchmark.eval.e2e import manifest as mf  # noqa: E402
 from benchmark.eval.e2e.manifest import Case, Model  # noqa: E402
 from benchmark.eval.e2e.report import Perf, Stat  # noqa: E402
 
+pytestmark = pytest.mark.usefixtures("no_host_gpus")
+
 RUN = {"id": "r", "base": {"label": "main", "sha": "a" * 40}, "head": {"label": "PR #1", "sha": "b" * 40},
        "gpu": "h200", "perf_pct": 5, "noise_sigma": 2, "gpu_hours": 1.0}
 
