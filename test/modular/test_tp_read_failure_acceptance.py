@@ -61,6 +61,7 @@ import torch
 
 from mstar.graph.runtime.base import PhasedPostprocess
 from mstar.utils.ipc_format import WorkerMessageType
+from mstar.worker.rebuild import Rebuilds
 
 HERE = Path(__file__).resolve().parent
 
@@ -76,9 +77,13 @@ ROOT = b"tp read failure"
 SIGNALS = ("new_token", "hidden")
 # A rank waiting this long in a collective for its partner is the hang.
 COLLECTIVE_S = 8.0
+# Spawned ranks can reach init_process_group seconds apart on a loaded box;
+# that skew is not a hang, so the rendezvous gets its own, longer timeout.
+RENDEZVOUS_S = 60.0
 # The follower's late read resolves at its first SCHEDULE_TP, or after this.
 TRIGGER_S = 2.0
-# The whole run; a run still going past this hung.
+# The whole run, from when both ranks have rendezvoused; a run still going
+# past this hung.
 DEADLINE_S = 30.0
 # Per-rank setup a fix adds to Worker.__init__ (see the module docstring).
 _DESIGN_SETUP = ("_setup_read_gate", "_setup_tp_read_check")
@@ -615,7 +620,7 @@ def _tp_group(rank):
     from mstar.distributed.communication import CommGroup
 
     group = CommGroup(my_global_rank=rank, my_group_rank=rank, group_members=[0, 1])
-    group.device_group = group.cpu_group = dist.group.WORLD
+    group.device_group = group.cpu_group = dist.new_group([0, 1], timeout=datetime.timedelta(seconds=COLLECTIVE_S))
     group.initialized = True
     group._all_reduce = AllReduce(group.device_group)
     return group
@@ -633,6 +638,7 @@ def _worker(rank, scenario, comm, graph, engine, tm, group):
     w = Worker.__new__(Worker)
     w._walk_drivers = {}
     w._walk_driven_edges = {}
+    w._rebuilds = Rebuilds({}, {})
     w.worker_id = WORKERS[rank]
     w.device = torch.device("cpu")
     w.enable_nvtx = w.enable_prof = False
@@ -708,6 +714,20 @@ def _probe(engine, rid, tokens):
     return {label: list(pages) for label, pages in leases.items()}
 
 
+def _reporting_failures(all_reduce, rank, outbox):
+    """Report an all-reduce that raises: a worker turns a collective's timeout into a
+    failed step and goes on, so the parent can't see it from how the run ended. Every
+    collective these ranks run in a step is an all-reduce; a design that adds another
+    kind has to be wrapped here too."""
+    def reporting(*args, **kwargs):
+        try:
+            return all_reduce(*args, **kwargs)
+        except RuntimeError as e:
+            outbox.put(("collective_failed", rank, str(e)))
+            raise
+    return reporting
+
+
 def _rank_main(rank, scenario, inbox, outbox):
     sys.path[:0] = [str(HERE), str(HERE.parents[1])]
     os.environ.setdefault("MSTAR_PRE_PLAN_SPEC", "0")
@@ -724,9 +744,11 @@ def _rank_main(rank, scenario, inbox, outbox):
 
         dist.init_process_group(
             "gloo", init_method=f"file://{scenario.store}", rank=rank, world_size=2,
-            timeout=datetime.timedelta(seconds=COLLECTIVE_S),
+            timeout=datetime.timedelta(seconds=RENDEZVOUS_S),
         )
+        dist.all_reduce = _reporting_failures(dist.all_reduce, rank, outbox)
         group = _tp_group(rank)
+        outbox.put(("ready", rank))
         kind = scenario.kind
         report = outbox.put
         graph = _Graph(rank, kind, report)
@@ -774,6 +796,13 @@ def _rank_main(rank, scenario, inbox, outbox):
             healthy_prefix = _prompt_tokens(kind, "r0")[:2 * PAGE_SIZE] + _ids(9, 78)
             final["probe_failed_prefix"] = _probe(engine, "p1", failed_prefix)
             final["probe_healthy_prefix"] = _probe(engine, "p0", healthy_prefix)
+        # Gloo's threads let go of a collective's tensors after its wait()
+        # returns, taking the GIL to do it, and one that does so while the
+        # interpreter finalizes aborts the process. A group joins its threads
+        # only when its last reference goes: one left over keeps them running
+        # past destroy_process_group.
+        group.device_group = group.cpu_group = group._all_reduce = None
+        dist.destroy_process_group()
         report(("final", rank, final))
     except BaseException:
         report(("crash", rank, traceback.format_exc()))
@@ -798,6 +827,8 @@ class Run:
     sent: dict = field(default_factory=lambda: {0: set(), 1: set()})
     # messages a rank sent anywhere but the other rank and the conductor
     other_sends: list = field(default_factory=list)
+    # (rank, error) of every all-reduce that raised
+    collective_failures: list = field(default_factory=list)
     final: dict = field(default_factory=dict)
     elapsed: float = 0.0
 
@@ -815,6 +846,7 @@ class Run:
             f"hung={self.hung} crashed={sorted(self.crashed)} exit={self.exitcodes} "
             f"failed={ {r: e[:120] for r, e in self.failed.items()} } "
             f"reads_done={self.reads_done} routed={ {k: sorted(v) for k, v in self.routed.items()} } "
+            f"collective_failures={self.collective_failures} "
             f"after {self.elapsed:.1f}s"
         )
 
@@ -842,6 +874,10 @@ def _run(tmp_path, scenario: Scenario) -> Run:
         p.start()
     run = Run()
     start = time.monotonic()
+    # Until both ranks report "ready", a rank that never rendezvouses is the
+    # other's init_process_group timeout (it crashes), not a hang.
+    deadline = start + RENDEZVOUS_S + DEADLINE_S
+    ready = set()
     stopping_since = None
 
     def to_both(message):
@@ -852,7 +888,7 @@ def _run(tmp_path, scenario: Scenario) -> Run:
         now = time.monotonic()
         if stopping_since is None:
             settled = all(run.completed(r) or run.torn_down(r) for r in ("r0", "r1"))
-            if settled or now - start > DEADLINE_S:
+            if settled or now > deadline:
                 run.hung = not settled
                 stopping_since = now
                 for box in inboxes:
@@ -870,7 +906,12 @@ def _run(tmp_path, scenario: Scenario) -> Run:
         except queue.Empty:
             continue
         tag = item[0]
-        if tag == "send":
+        if tag == "ready":
+            ready.add(item[1])
+            if len(ready) == 2:
+                start = time.monotonic()
+                deadline = start + DEADLINE_S
+        elif tag == "send":
             _, src, dest, data = item
             if dest in WORKERS:
                 inboxes[WORKERS.index(dest)].put(data)
@@ -907,16 +948,27 @@ def _run(tmp_path, scenario: Scenario) -> Run:
             run.final[item[1]] = item[2]
         elif tag == "crash":
             run.crashed[item[1]] = item[2]
-    for p in procs:
-        p.join(timeout=2)
+        elif tag == "collective_failed":
+            run.collective_failures.append(item[1:])
+    run.elapsed = time.monotonic() - start
+    # A loaded host can take seconds over an exit that is going fine.
+    killed = set()
+    for r, p in enumerate(procs):
+        p.join(timeout=COLLECTIVE_S)
         if p.is_alive():
+            killed.add(r)
             p.kill()
             p.join(timeout=2)
     run.exitcodes = {r: p.exitcode for r, p in enumerate(procs)}
     for r, code in run.exitcodes.items():
-        if code not in (0, None) and r not in run.crashed:
+        if r in run.crashed:
+            continue
+        if r in killed:
+            run.crashed[r] = f"still running {COLLECTIVE_S:.0f} s after the run stopped, so the harness killed it"
+        elif code not in (0, None):
             run.crashed[r] = f"exit code {code} (a gloo abort is a collective with another shape)"
-    run.elapsed = time.monotonic() - start
+        elif r not in run.final:
+            run.crashed[r] = "exited without its final report reaching the parent"
     return run
 
 
@@ -932,6 +984,7 @@ KINDS = [
 def _healthy_ok(run: Run):
     assert not run.crashed, run.summary() + "\n" + "\n".join(map(str, run.crashed.values()))
     assert not run.hung, "the instance hung: " + run.summary()
+    assert not run.collective_failures, run.summary()
     assert run.completed("r0"), "r0, beside the failed request, did not complete: " + run.summary()
 
 

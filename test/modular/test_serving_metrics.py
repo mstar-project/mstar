@@ -485,6 +485,7 @@ def test_a_served_request_is_not_a_refusal(served):
 
 
 def test_refusals_count_from_when_metrics_are_turned_on(monkeypatch):
+    pytest.importorskip("prometheus_client")
     from mstar.api_server import auth
 
     server = make_test_api_server(preprocess_worker=_DataWorker())
@@ -1311,6 +1312,8 @@ def _config(monkeypatch, tmp_path, text="model: fake\n") -> str:
     monkeypatch.setattr(entrypoint, "model_init_kwargs", lambda name: {})
     # sizing torch's pool would outlive the test in this process
     monkeypatch.setattr(entrypoint, "_set_preprocess_threads", lambda model, config: None)
+    # and so would handing pytest's log handlers to a writer thread, which repeats every later record
+    monkeypatch.setattr(entrypoint, "log_off_thread", lambda: None)
     return str(cfg)
 
 
@@ -1454,7 +1457,11 @@ def test_enable_metrics_without_the_package_stops_before_anything_starts(monkeyp
 
 
 def test_enable_metrics_with_the_rust_frontend_starts(monkeypatch, tmp_path):
+    from mstar.api_server import rust_frontend
+
     monkeypatch.setattr(entrypoint, "MISSING_DEPENDENCY", None)
+    # main() resolves the binary before loading anything; CI builds none.
+    monkeypatch.setattr(rust_frontend, "find_server_binary", lambda explicit=None: "mstar-server")
     assert _main_until_api_server(monkeypatch, tmp_path, "--enable-metrics", "--rust-frontend")
 
 

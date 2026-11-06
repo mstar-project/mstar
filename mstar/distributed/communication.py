@@ -54,6 +54,24 @@ def _all_to_all_single(
     return recv
 
 
+# torch 2.13 renamed the into-tensor collectives to the *_single scheme.
+# Import-time selection keeps the fallback out of compiled call paths.
+_all_gather_single = getattr(dist, "all_gather_single", None)
+if _all_gather_single is None:
+    _all_gather_single = getattr(
+        getattr(dist, "distributed_c10d", None), "all_gather_single", None
+    )
+_all_gather_into_tensor = _all_gather_single or dist.all_gather_into_tensor
+
+
+def _barrier(group: dist.ProcessGroup | None = None) -> None:
+    """Barrier without torch 2.13's implicit-device warning on NCCL groups."""
+    if dist.get_backend(group) == dist.Backend.NCCL:
+        dist.barrier(group=group, device_ids=[torch.cuda.current_device()])
+    else:
+        dist.barrier(group=group)
+
+
 class ArFusionWorkspace(NamedTuple):
     """A fused all-reduce workspace of a ``CommGroup``: its id in
     ``ar_fusion``'s registry, for inputs of up to ``max_tokens`` rows."""
@@ -133,7 +151,7 @@ class CommGroup:
             output_size, dtype=input_.dtype, device=input_.device
         )
         # All-gather
-        dist.all_gather_into_tensor(output_tensor, input_, group=self.device_group)
+        _all_gather_into_tensor(output_tensor, input_, group=self.device_group)
         # Reshape
         output_tensor = output_tensor.reshape((self.world_size,) + input_size)
         output_tensor = output_tensor.movedim(0, dim)
@@ -147,7 +165,7 @@ class CommGroup:
     def barrier(self):
         if self.world_size == 1:
             return
-        dist.barrier(group=self.device_group)
+        _barrier(self.device_group)
 
     def all_reduce_buffer(
         self, shape: tuple[int, ...], dtype: torch.dtype, device: torch.device
@@ -207,39 +225,6 @@ class CommGroup:
         v = r.float()
         v = v * torch.rsqrt(v.pow(2).mean(-1, keepdim=True) + eps)
         return (v * (weight.float() + weight_bias)).to(r.dtype), r
-
-    def reduce_scatter(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
-        world_size = self.world_size
-        # Bypass the function if we are using only 1 GPU.
-        if world_size == 1:
-            return input_
-        assert -input_.dim() <= dim < input_.dim(), (
-            f"Invalid dim ({dim}) for input tensor with shape {input_.size()}"
-        )
-
-        if dim < 0:
-            # Convert negative dim to positive.
-            dim += input_.dim()
-
-        # Note: This will produce an incorrect answer if we don't make
-        # the input_tensor contiguous. Possible bug in reduce_scatter_tensor?
-        input_tensor = input_.movedim(0, dim).contiguous()
-
-        assert input_tensor.shape[0] % world_size == 0
-        chunk_size = input_tensor.shape[0] // world_size
-        output_shape = (chunk_size,) + input_tensor.shape[1:]
-
-        output_tensor = torch.empty(
-            output_shape, dtype=input_tensor.dtype, device=input_tensor.device
-        )
-
-        # Perform reduce-scatter operation
-        dist.reduce_scatter_tensor(
-            output_tensor, input_tensor, group=self.device_group
-        )
-
-        # Reshape before returning
-        return output_tensor.movedim(0, dim).contiguous()
 
     def broadcast(self, tensor: torch.Tensor, src: int = 0) -> torch.Tensor:
         """Broadcast a tensor from source rank to all ranks."""
@@ -642,7 +627,7 @@ class WorkerParallelGroups:
         """
         if not self.any_parallelism:
             return
-        dist.barrier()
+        _barrier()
 
     def restore_default_timeout(self) -> None:
         """Give every group this rank holds torch's default timeout back."""

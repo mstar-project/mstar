@@ -74,6 +74,7 @@ def _worker(known_rids=("r1", "r2")):
     )
     # Identity interning: the rid string doubles as its own handle here.
     w._graph_runtime = _Runtime(known_rids)
+    w._in_flight_rids = set()
     w.scheduler = MicroScheduler.__new__(MicroScheduler)
     w.scheduler.failed_rids = set()
     w.scheduler.read_failed_rids = set()

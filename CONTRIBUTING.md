@@ -18,6 +18,14 @@ General questions are welcome too — a plain issue or an email to <atindra@cs.s
 3. Run `ruff check .` (CI enforces it).
 4. Open a PR against `main`. It runs CI and gets a review before merging.
 
+### Documentation
+
+During the Mintlify migration, `docs/*.rst` remains the canonical source. If a guide
+has a counterpart in `docs/mintlify/`, update its `.rst` and `.mdx` files in the
+same PR, including model, resource, installation, and environment-variable changes.
+See [the Mintlify contributor guide](docs/mintlify/CONTRIBUTING.md) for preview and
+validation commands. The generated Python API reference remains on Sphinx.
+
 ### Automated review
 
 A bot posts an advisory review when someone comments `/review` on a PR, from a fork or not; it never runs on its own when a PR is opened or pushed to. A contributor (the team, or anyone who has had a PR merged here) can comment `/review` on their own PR, and someone with write access can do so on any PR, or comment `/review thorough` for the thorough mode. It checks the invariants in [AGENTS.md](AGENTS.md) (the model/engine boundary, resource declarations, rank lockstep, Python/Rust parity, documented environment variables) and cites them by number. It is not a merge gate and a maintainer still reviews your PR. Comment `/review` again for a re-review after pushes. Reply to disagree. Details in [.github/review/](.github/review/).

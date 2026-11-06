@@ -755,6 +755,16 @@ def _fused_sample_kernel(
 FUSED_SAMPLE_MAX_VOCAB = 4096
 
 
+class FusedDrawArgs(NamedTuple):
+    """A step's per-row ``fused_sample`` parameters, for a kernel that draws as it does."""
+
+    temperature: torch.Tensor
+    top_k: torch.Tensor
+    top_p: torch.Tensor
+    seed: torch.Tensor
+    offset: torch.Tensor
+
+
 def fused_sample(
     logits: torch.Tensor, temperature: torch.Tensor, top_k: torch.Tensor, top_p: torch.Tensor,
     seed: torch.Tensor, offset: torch.Tensor,
@@ -1954,6 +1964,23 @@ class AcceleratorGraphableSampler(BaseSampler):
     # whether requests' seen token buffers should be synced post-replay
     applied_penalty_in_graph: bool = False
 
+    def fused_draw_args(self, apply_filters: bool) -> FusedDrawArgs | None:
+        """What `sample` hands `fused_sample`, or None when `sample` does more than that one draw. The copy to
+        ``last_token_buf`` is left out: the resource decides whether anything reads it."""
+        if (
+            self.offset_buf.device.type != "cuda" or self.min_p_buf is not None or self.history is not None
+            or self.order is not None or self.ingraph_scatter or self.logprob_buf is not None
+            or (self.tp_group is not None and self.tp_group.world_size > 1)
+        ):
+            return None
+        top_k, top_p = self.top_k_buf, self.top_p_buf
+        if not apply_filters:
+            top_k, top_p = torch.zeros_like(top_k), torch.ones_like(top_p)
+        return FusedDrawArgs(self.temperature_buf, top_k, top_p, self.seed_buf, self.offset_buf)
+
+    def advance_offsets(self, draws: int) -> None:
+        self.offset_buf.add_(draws)  # a fused draw runs on CUDA, where a draw takes one offset
+
     def gather_in_graph(self) -> None:
         """Offsets of this step's rows off the master, inside the graph."""
         torch.index_select(
@@ -3075,21 +3102,30 @@ class SamplerBuffers:
             0, self._slot_idx_gpu[cg_slot, :padded_bs] if index is None else index
         )
 
-    def _slots_of(self, request_ids: list[str]) -> torch.Tensor:
+    def _slots_of(
+        self, request_ids: list[str], kept_rids: "frozenset | None" = None,
+    ) -> torch.Tensor:
         slots = [
-            0 if isinstance(rid, int) and rid < 0 else self._rid_to_slot[rid]
+            0 if (isinstance(rid, int) and rid < 0)
+            or (kept_rids is not None and rid not in kept_rids)
+            else self._rid_to_slot[rid]
             for rid in request_ids
         ]
         return torch.tensor(slots, dtype=torch.long, device=self.last_token.master.device)
 
-    def write_last_tokens(self, request_ids: list[str], tokens: torch.Tensor) -> None:
+    def write_last_tokens(
+        self, request_ids: list[str], tokens: torch.Tensor,
+        kept_rids: "frozenset | None" = None,
+    ) -> None:
         """Eager-step write of ``tokens`` (``[len(request_ids)]``) to the
-        requests' master rows. Every request must be registered."""
+        requests' master rows. Every request must be registered. Rows outside
+        ``kept_rids`` go to the trash row, so their master rows stay unchanged."""
         if not request_ids:
             return
         self._sync_device_capacity()
         self.last_token.master.index_copy_(
-            0, self._slots_of(request_ids), tokens.to(self.last_token.master.dtype)
+            0, self._slots_of(request_ids, kept_rids),
+            tokens.to(self.last_token.master.dtype),
         )
 
     def last_tokens_for(self, request_ids: list[str]) -> torch.Tensor:
