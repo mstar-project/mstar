@@ -200,6 +200,20 @@ def test_a_parameter_given_another_gpus_data_is_on_that_gpu():
     """)
 
 
+def test_uvloop_hands_back_asyncios_loop_whichever_way_it_is_asked():
+    """Its epoll wait is invisible to the registry. uvicorn asks for a loop one way or the other by
+    version. (uvloop isn't a dependency: a stand-in, as the patch needs nothing else of it.)"""
+    out = run_sim("""
+        import asyncio, sys, types
+        uvloop = sys.modules["uvloop"] = types.ModuleType("uvloop")
+        from mstar_sim import patches
+        patches.no_uvloop()
+        asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+        print(type(uvloop.new_event_loop()).__module__, uvloop.run(asyncio.sleep(0, "ran")))
+    """)
+    assert out.split() == ["asyncio.unix_events", "ran"], out
+
+
 def test_a_mask_narrows_the_launchers_gpus_and_leaves_these_tests_alone(monkeypatch):
     """``CUDA_VISIBLE_DEVICES`` can hide emulated GPUs but not add any, and the caller's own
     doesn't reach a case that doesn't ask for it."""

@@ -411,6 +411,7 @@ def no_uvloop() -> None:
 
     uvloop.install = lambda: None
     uvloop.new_event_loop = asyncio.new_event_loop
+    uvloop.EventLoopPolicy = asyncio.DefaultEventLoopPolicy  # (an older uvicorn's way in)
     uvloop.run = lambda main, **kwargs: asyncio.run(main, debug=kwargs.get("debug"))
 
 
