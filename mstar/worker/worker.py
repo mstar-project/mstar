@@ -501,7 +501,8 @@ class Worker(RepeatingSteps):
     # the chain looks for other ready work to yield to (``_SpecFairness.peek``); set by ``run``
     _spec_peek: bool = True
     # (start, end, (node, walk), repeats, RunState.started) per step while a walk picks its run
-    # length (``step_repeats: auto``); None while none does
+    # length (``step_repeats: auto``); None while none does. The word is the slot's, so it holds
+    # for this run only because the next step leases the other slot: on one slot it can be the next's
     _auto_spans: deque | None = None
     _auto_prev_end = None
     # the last phase-timed step's end event, for the gap before the next

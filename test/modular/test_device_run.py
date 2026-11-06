@@ -520,6 +520,16 @@ def test_a_skip_is_not_missed_for_a_run_that_began_as_the_host_looked():
     step.future = SimpleNamespace(done=lambda: True, result=lambda: "outputs")
     assert worker._landed_skipped(step) is True
 
+    # the event wasn't set yet as the wait began, and the graph is still to run
+    step = _skipped_step(worker, log, iter([0, 0, RUN_SKIPPED]))
+
+    def _tail_done():
+        step.node_batch.completion_event = SimpleNamespace(query=lambda: False)
+        return True
+
+    step.future = SimpleNamespace(done=_tail_done, result=lambda: "outputs")
+    assert worker._landed_skipped(step) is True
+
 
 def test_a_step_that_never_launched_is_no_skip():
     from mstar.worker.worker import Worker
@@ -541,7 +551,7 @@ def test_a_skipped_steps_ring_positions_hold_no_room():
     assert rings == [("ring", "codes", 1, [16, 17]), ("ring", "codes", 2, [24, 25])]
 
 
-def test_a_skipped_step_gives_back_only_the_rows_a_refused_one_would(monkeypatch):
+def test_a_skipped_step_gives_back_only_the_rows_a_refused_one_would():
     """The step was built before N landed. A row whose loop stopped at N has an emptied
     node, which would pop with no inputs and run past its stop. One prepare_inputs
     vetoed has spent its inputs, and one a stage blamed fails."""

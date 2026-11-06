@@ -1342,8 +1342,9 @@ class AcceleratorGraphRunner:
         self._run_failures[walk] = why
 
     def yield_runs(self) -> None:
-        """Ask the node's runs in flight, the one running and the one staged behind
-        it, to end at their next iteration. A slot that hasn't staged clears its word."""
+        """Ask the node's runs in flight to end: the one running at its next iteration,
+        the one staged behind it before its first if it asks more than one. A slot
+        that hasn't staged clears its word."""
         for bucket in self._buckets.values():
             for slot in bucket.slots:
                 if slot.run is not None:
