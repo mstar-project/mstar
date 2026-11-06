@@ -15,10 +15,13 @@ F.scaled_dot_product_attention — no FlashInfer or GPU required.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import torch
 
 from mstar.model.vjepa2.components.ac_predictor import VisionTransformerPredictorAC
 from mstar.model.vjepa2.config import VJepa2ACPredictorConfig
+from mstar.model.vjepa2.submodules import VJepa2ACRolloutPredictorSubmodule
 
 from .fake_resources import bind_fake_resources
 
@@ -237,3 +240,36 @@ class TestKVCacheParity:
         # Last frame output must differ.
         assert not torch.allclose(base_outs[-1], pert_outs[-1], atol=1e-3), \
             "last-frame perturbation had no effect"
+
+
+class TestBlockLoopRegion:
+    """A region replays what `make_block_loop_fn` records, so a capture that took the SDPA path would return wrong
+    hidden states on every replay, with no error, while the eager path stayed right."""
+
+    @torch.no_grad()
+    def test_the_captured_block_loop_attends_the_array_as_the_eager_path_does(self):
+        torch.manual_seed(5)
+        cfg = _tiny_ac_config()
+        model = VisionTransformerPredictorAC(cfg).eval()
+        node = VJepa2ACRolloutPredictorSubmodule(model, None)
+        T = cfg.num_frames // cfg.tubelet_size
+        N = (cfg.img_size[0] // cfg.patch_size) ** 2
+        x = torch.randn(1, T * N, cfg.embed_dim)
+        actions, states = torch.randn(1, T, cfg.action_embed_dim), torch.randn(1, T, cfg.action_embed_dim)
+        frames = [(x[:, t * N:(t + 1) * N], actions[:, t:t + 1], states[:, t:t + 1]) for t in range(T)]
+
+        bind_fake_resources(model)
+        eager = [model(*frame, t_0=t, cached=True) for t, frame in enumerate(frames)]
+
+        handle = bind_fake_resources(model)
+        for t, frame in enumerate(frames):
+            sequence, cond_tokens, b, frames_in_step = model._prepare_sequence(*frame)
+            d_pos, h_pos, w_pos, time_pos = model._compute_rope_positions(
+                t, model.grid_height, model.grid_width, cond_tokens, sequence.device, sequence.dtype,
+            )
+            static_inputs = {"x": sequence, "d_pos": d_pos, "h_pos": h_pos, "w_pos": w_pos, "time_pos": time_pos}
+            region_inputs = SimpleNamespace(static_inputs=static_inputs, kwargs={"cond_tokens": cond_tokens})
+            captured = node._block_loop_capture(region_inputs)
+            out = model._decode_sequence(captured["x"], cond_tokens, b, frames_in_step)
+            torch.testing.assert_close(out, eager[t], msg=f"frame {t} differs from the eager path")
+        assert sorted(handle._kv) == list(range(cfg.depth)), "each block keeps its K/V under its own layer id"
