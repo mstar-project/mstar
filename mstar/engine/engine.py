@@ -2817,7 +2817,8 @@ class Engine:
         rids = output.row_request_ids or tuple(batch.request_ids)
         infos_by_rid = batch.per_request_info_wrapped
         for walk, loop in layouts.items():
-            positions = [i for i, rid in enumerate(rids) if rid in infos_by_rid and rid not in batch.cached_rids
+            positions = [i for i, rid in enumerate(rids) if rid in infos_by_rid
+                         and rid not in batch.cached_rids and rid not in batch.failed_requests
                          and batch.step_context.walk_of(rid) == walk]
             if not positions:
                 continue

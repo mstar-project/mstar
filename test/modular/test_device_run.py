@@ -1145,3 +1145,20 @@ def test_ordinary_and_device_steps_publish_the_same_actual_loop_progress(monkeyp
     indices = runner._rows._index([1, 2])
     positions, _ = runner._rows.iteration_head(WALK, engine._loops["n", WALK], indices, run.window.entries)
     assert positions.tolist() == [1, 4]
+
+    failed = ExecutingBatch(
+        node_name="n", per_request_info={1: SimpleNamespace(), 2: SimpleNamespace()},
+        per_request_input_metadata={rid: InputMetadata(
+            dynamic_loop_iter_counts={"decode": 0}, graph_pass=2, iteration_origin=0,
+        ) for rid in (1, 2)},
+        step_context=StepContext(request_ids=(1, 2), graph_walk=WALK, slot=0, capture=False),
+    )
+    engine.exec = lambda batch: BatchedModelOutput(per_rid_outputs={1: {}, 2: {"new_token": [torch.tensor([1])]}})
+    engine.postprocess_batch = lambda batch, output: batch.register_failure(1, RuntimeError("bad tail"))
+    engine.exec_and_postprocess(failed)
+    assert 1 in failed.failed_requests and 2 not in failed.failed_requests
+    assert 1 in failed.per_request_info_wrapped, "failure bookkeeping retains its wrapper until worker cleanup"
+    positions, live = runner._rows.iteration_head(
+        WALK, engine._loops["n", WALK], indices, torch.tensor([[1, 1], [1, 2]]),
+    )
+    assert positions.tolist() == [1, 1] and live.tolist() == [False, True]
