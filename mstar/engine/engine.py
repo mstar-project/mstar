@@ -3430,8 +3430,13 @@ class Engine:
             counts = getattr(info, "metadata", info)
             k = 0 if loop is None or counts is None else counts.dynamic_loop_iter_counts.get(loop, 0)
             # a stream window is items of the node's Loop; a row outside it has none
-            window = {} if loop is None else _window_tables(streamed, inputs.get(rid), getattr(info, "metadata", None))
-            rows.append((rid, k, window))
+            if streamed:
+                window = {} if loop is None else _window_tables(
+                    streamed, inputs.get(rid), getattr(info, "metadata", None),
+                )
+                rows.append((rid, k, window))
+            else:
+                rows.append((rid, k))
         return iteration_columns(submodule, rows, ctx.repeats, self._device)
 
     def keep_run_columns(self, node_name: str, graph_walk: str, signals: Collection[str]) -> str | None:

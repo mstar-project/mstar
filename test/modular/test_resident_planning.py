@@ -3382,7 +3382,10 @@ def test_iteration_inputs_read_each_row_from_its_table_with_one_gather(repeats):
         with Ops() as ops:
             iteration_columns(node, rows, repeats, CPU)
         counts.append(ops.kernels)
-    assert counts[0] == counts[1], "a step's kernels are one gather an input, whatever its rows"
+    if repeats == 1:
+        assert counts[0] == 0, "one row's single iteration is a view, with no allocation or kernel"
+    else:
+        assert counts[0] == counts[1], "a step's kernels are one gather an input, whatever its rows"
 
 
 def test_a_removed_requests_rows_of_an_iteration_table_go_to_the_next_request():

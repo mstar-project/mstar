@@ -3,9 +3,8 @@
 Each input (``IterationInput``) keeps one table for every request: a request's
 rows and their pad go in once, when a step first reads them, and a step reads
 its rows' iterations with one gather an input, on one staged index, however
-many rows it has. A view a row and a stack took about 5x as long at 64 rows in
-a CPU microbench (1082 us against 193 us); no GPU timing says what
-share of a step that is.
+many rows it has. A one-row, one-iteration read is a view of that table,
+with no index upload or gather.
 
 Row 0 of a table is the input's ``capture_fill``, which padding rows read. Read
 past its rows, a request reads its last: that is the pad's repeat.
@@ -69,6 +68,7 @@ class _Table:
         self.used = 1
         # extent size -> the bases free at that size
         self.free: dict[int, list[int]] = {}
+        self.extents: dict[Hashable, _Extent] = {}
 
     def take(self, size: int) -> int:
         if self.free.get(size):
@@ -87,7 +87,6 @@ class IterationTables(Resource):
     def __init__(self, device: torch.device):
         self._device = torch.device(device)
         self._tables: dict[str, _Table] = {}
-        self._extents: dict[Hashable, dict[str, _Extent]] = {}
         # the main thread frees what the GPU thread's steps take
         self._lock = threading.Lock()
         self._stager = PinnedStager(torch.long)
@@ -104,16 +103,16 @@ class IterationTables(Resource):
 
     def remove_request(self, rid: Hashable) -> None:
         with self._lock:
-            for name, extent in self._extents.pop(rid, {}).items():
-                self._tables[name].free.setdefault(extent.size, []).append(extent.base)
+            for table in self._tables.values():
+                if (extent := table.extents.pop(rid, None)) is not None:
+                    table.free.setdefault(extent.size, []).append(extent.base)
 
-    def _extent(self, name: str, spec: IterationInput, rid: Hashable, state) -> _Extent:
-        """``rid``'s rows of ``name``, made once while its source and pad are the
+    def _extent(self, table: _Table, spec: IterationInput, rid: Hashable, state) -> _Extent:
+        """``rid``'s rows of ``table``, made once while its source and pad are the
         same tensors (a walk change that reassigns either makes them anew)."""
-        held = self._extents.setdefault(rid, {})
         source = state[spec.source]
         pad = state.get(spec.pad) if isinstance(spec.pad, str) else None
-        extent = held.get(name)
+        extent = table.extents.get(rid)
         if extent is not None and extent.source is source and extent.pad is pad:
             return extent
         rows = source.reshape(-1, *spec.shape).to(spec.dtype)
@@ -122,7 +121,6 @@ class IterationTables(Resource):
             rows = torch.cat([rows, pad.reshape(-1, *spec.shape).to(spec.dtype)])
         elif not padless:
             rows = torch.cat([rows, rows.new_full((1, *spec.shape), spec.pad)])
-        table = self._tables[name]
         count = rows.shape[0]
         size = max(-(-count // _EXTENT_ROWS), 1) * _EXTENT_ROWS
         with self._lock:
@@ -133,7 +131,7 @@ class IterationTables(Resource):
                     table.free.setdefault(extent.size, []).append(extent.base)
                 base = table.take(size)
             table.rows[base:base + count].copy_(rows)
-            extent = held[name] = _Extent(source, pad, base, count, size, count if padless else None)
+            extent = table.extents[rid] = _Extent(source, pad, base, count, size, count if padless else None)
         return extent
 
     def read(
@@ -148,24 +146,32 @@ class IterationTables(Resource):
             spec = specs[name]
             if name not in self._tables:
                 self._tables[name] = _Table(spec, self._device)
+            table = self._tables[name]
             for row in rows:
                 state = None if row is None else states.get(row[0])
                 if state is None:
                     index.extend((0,) * repeats)
                     continue
-                extent = self._extent(name, spec, row[0], state)
+                extent = self._extent(table, spec, row[0], state)
                 start = row[1] + spec.offset
                 if extent.padless_rows is not None and start + repeats > extent.padless_rows:
                     raise ValueError(f"iteration input {name!r} reads past the {extent.rows} rows of {spec.source!r}")
                 last = extent.base + extent.rows - 1
                 first = extent.base + start
                 if repeats == 1:
-                    index.append(min(first, last))
+                    index.append(first if first < last else last)
                 else:
                     index.extend(min(first + i, last) for i in range(repeats))
+        width = len(rows) * repeats
+        if width == 1:
+            # A single iteration of one row is already contiguous in its
+            # owner's table: no index upload, gather kernel or new storage.
+            return {
+                name: self._tables[name].rows[index[i]:index[i] + 1].view(1, 1, *specs[name].shape)
+                for i, name in enumerate(names)
+            }
         staged = torch.empty(len(index), dtype=torch.long, device=self._device)
         self._stager.copy_(staged, index)
-        width = len(rows) * repeats
         return {
             name: self._tables[name].rows.index_select(0, staged[i * width:(i + 1) * width]).view(
                 len(rows), repeats, *specs[name].shape,
