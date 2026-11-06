@@ -1494,8 +1494,10 @@ class NodeSubmodule(torch.nn.Module, ABC):
         """
         del graph_walk
         cls = type(self)
-        if (cls.check_stop not in (NodeSubmodule.check_stop, ARNodeSubmodule.check_stop)
-                or cls.check_stop_batched not in (NodeSubmodule.check_stop_batched, ARNodeSubmodule.check_stop_batched)):
+        if (
+            cls.check_stop not in (NodeSubmodule.check_stop, ARNodeSubmodule.check_stop)
+            or cls.check_stop_batched not in (NodeSubmodule.check_stop_batched, ARNodeSubmodule.check_stop_batched)
+        ):
             return None
         return {}
 
