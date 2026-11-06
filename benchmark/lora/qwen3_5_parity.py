@@ -448,7 +448,7 @@ def serve(args, eager: bool = False, tp: int = 1, async_sched: str | None = None
                 # more adapters than slots, all in flight at once: slots churn while
                 # requests leave, which is where a rank deciding alone would hang
                 churn = closed_loop(
-                    url, [base_name, *args.adapters], concurrency=64, requests=512,
+                    url, HF_REPOS[args.model], [base_name, *args.adapters], concurrency=64, requests=512,
                     max_tokens=64, warmup=0, timeout=300.0,
                 )
     text = log.read_text(errors="replace")
