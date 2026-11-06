@@ -1739,7 +1739,27 @@ An input streamed in an item an iteration (a one-item chunk policy) is declared 
 way with ``streamed=True``: its table is the row's items of that stream for the step, a
 window of as many ready items as the step repeats, and the stream answers how far a run
 may go (the fewest items any row has). Items of a window that a step's resources cut short
-go back to the stream ahead of anything newer.
+go back to the stream ahead of anything newer on host-launched runs.
+
+A device-ended run reads an immutable input window using its actual Loop position in
+``LoopbackRows``. A queued successor's input window covers both the predecessor's possible
+executions and its own bound; its output columns cover only its own bound. Entry identity
+includes request generation, graph pass and ancestor Loop positions, so a new entry resets
+progress only when it executes. A stopped entry remains inactive in an already queued
+successor, before any resource gathers or writes. A successor without a usable resident
+run capture is rebuilt after the predecessor settles instead of using projected inputs.
+
+Streamed inputs of these runs require ``FixedChunkPolicy(1)`` with continuation enabled in
+every served consumer walk. ``StreamBuffer`` retains at most two overlapping snapshots;
+admission narrows each reader's bound and completion retires only that row's actual count.
+Source ownership and the graph reader's references retire independently. A skipped reader
+keeps its original snapshot if it retries; removed rows release theirs without consuming
+input. Empty-tail position belongs to the stream snapshot, so a model keeps its pad table
+unchanged: the first tail iteration reads its first row, then later rows, repeating the last.
+No model-specific EOS-tail counter is needed. Non-continuing final-chunk flushes, prefix
+chains, ``past_cap``, shared captures for different walks, and multi-rank device runs are
+refused for this path.
+
 On the producer side a run sends a row's items of a per-iteration streaming output together:
 each is an item of its own, never the pieces ``Connection.join_dim`` joins (those come from a
 Loop's ``accumulated_outputs``); a run stops short of the iteration whose items a

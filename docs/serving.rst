@@ -361,7 +361,12 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        their admitted iteration bound and the worker yield end the same device run. Both
        modes need a declared stop policy, one rank, CUDA
        12.4 and up, ``libcudadevrt.a`` under ``CUDA_HOME``, a capture of kernels and
-       copies alone, and a node without iteration inputs (not Qwen3-TTS's Talker or a DiT).
+       copies alone. Declared iteration inputs can run on the device when the walk is
+       resident, has one stop policy for its Loop, and keeps loop-back rows. These walks
+       use actual per-row Loop progress and suppress stopped rows even with ``skip``;
+       prefix chains and ``past_cap`` are refused. Streamed iteration inputs additionally
+       need fixed one-item chunks that continue after the producer ends in every enabled
+       consumer walk. Other chunk policies and final-chunk flush consumers remain unsupported.
        An explicitly requested device stop that cannot run fails startup with its refusal
        reason; it never silently becomes a host-launched run. ``stream_tokens: true`` sends a run's tokens to the client as its replays
        finish rather than when it ends, where its landing rides inline. ``ready_waits: true``

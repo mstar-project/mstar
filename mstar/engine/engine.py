@@ -1757,19 +1757,29 @@ class Engine:
         mgmt = self._submodules[node_name]
         if mgmt.joint_comm_group.world_size > 1:
             return  # the stop must match on every rank, and NCCL in a WHILE body is untested
-        if getattr(mgmt.submodule, "ITERATION_INPUTS", None):
-            # the step speculated during a run is cut on the host for the run's asked count
-            runner.refuse_run(graph_walk, (
-                "node: its iteration inputs (and stream windows) are cut on the host for a run's asked count, "
-                "and a run on the device can end short of it"
-            ))
-            return
+        iteration = bool(getattr(mgmt.submodule, "ITERATION_INPUTS", None))
+        loop = self._loops.get((node_name, graph_walk)) if iteration else None
         policies = self.get_stop_policies(node_name, graph_walk) or {}
         policy = next((p for p in policies.values() if p.reads_token), next(iter(policies.values()), None))
         if policy is None:
             return
         mgmt.device_stops[graph_walk] = policy
         mgmt.refills[graph_walk] = config.refill_at
+        if iteration:
+            refusal = None
+            if loop is None or set(policies) != {loop.name}:
+                refusal = "graph: iteration inputs need one declared stop for their actual Loop"
+            elif config.past_cap:
+                refusal = "graph: iteration input windows cannot run past their Loop cap"
+            elif self._runner.prefix_chain_keys(node_name):
+                refusal = "resource: actual iteration rows cannot key a prefix chain"
+            elif mgmt.loopback_rows is None:
+                refusal = "resource: actual iteration progress needs loop-back rows"
+            elif (why := self.resident_refusal(node_name, graph_walk)) is not None:
+                refusal = f"planner: actual iteration progress needs resident state: {why}"
+            if refusal is not None:
+                runner.refuse_run(graph_walk, refusal)
+                return
         if config.device_stop == "drop_rows" and self._runner.prefix_chain_keys(node_name):
             # its tokens past a stop hold no KV, and the chain keys every token that lands
             runner.refuse_run(graph_walk, "resource: a dropped row's pages past its stop would key a prefix chain")
@@ -1781,7 +1791,7 @@ class Engine:
             {signal: pair for signal, pair in carries.items() if signal not in heads},
             mgmt.run_columns.get(graph_walk, frozenset()),
             frozenset(getattr(mgmt.submodule, "ITERATION_INPUTS", None) or ()), config.refill_at,
-            config.stream_tokens,
+            config.stream_tokens, loop=loop,
         ))
 
     def ask_ring(self, node_name: str, signal: str, depth: int, walks: Collection[str]) -> LoopbackRows | str:

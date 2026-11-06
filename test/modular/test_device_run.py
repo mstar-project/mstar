@@ -728,28 +728,41 @@ def test_a_run_that_ends_short_repeats_its_last_iteration_in_the_columns_it_neve
     assert run.results(4)[1]["t"].tolist() == [[1, 2, 3, 4]]
 
 
-def test_a_walk_with_iteration_inputs_stays_off_the_device():
-    """A run on the device can end short of its count, and the step speculated
-    during it took iteration inputs cut on the host for the whole count
-    (review-r2 F2): such a walk keeps the host's loop, with the reason."""
+@pytest.mark.parametrize("refusal", [
+    None, "missing_loop", "other_stop", "past_cap", "prefix", "rows", "resident", "ranks",
+])
+def test_iteration_inputs_enable_only_a_resident_single_loop_run(refusal):
     from mstar.engine.engine import Engine
+    from mstar.graph.loop_indices import LoopLayout
+    from mstar.model.submodule_base import StopKind, StopPolicy
 
-    asked = []
+    asked, refused = [], []
     engine = Engine.__new__(Engine)
+    loop = LoopLayout("loop")
+    engine._loops = {} if refusal == "missing_loop" else {("n", WALK): loop}
+    engine._runner = SimpleNamespace(prefix_chain_keys=lambda node: ["kv"] if refusal == "prefix" else [])
     engine._submodules = {"n": SimpleNamespace(
-        joint_comm_group=SimpleNamespace(world_size=1), device_stops={}, refills={}, loopback_rows=None,
+        joint_comm_group=SimpleNamespace(world_size=2 if refusal == "ranks" else 1), device_stops={}, refills={},
+        loopback_rows=None if refusal == "rows" else object(),
         submodule=SimpleNamespace(repeat_carry=lambda walk, signals: {}, ITERATION_INPUTS={"x": object()}),
         run_columns={},
     )}
-    engine.get_stop_policies = lambda node, walk: {"loop": SimpleNamespace(
-        reads_token=True, token_signal="t", eos_tokens=frozenset({9}),
-    )}
+    engine.get_stop_policies = lambda node, walk: {
+        "other" if refusal == "other_stop" else "loop": StopPolicy(StopKind.ITER),
+    }
+    engine.resident_refusal = lambda *args: "mixed capture walks" if refusal == "resident" else None
+    engine._row_pairs = lambda *args: ({}, {})
     runner = SimpleNamespace(
-        ask_run=lambda walk, ask: asked.append(ask), refuse_run=lambda walk, why: asked.append(why),
+        ask_run=lambda walk, ask: asked.append(ask), refuse_run=lambda walk, why: refused.append(why),
     )
-    engine._ask_run("n", runner, WALK, SimpleNamespace(device_stop="skip", max=4, refill_at=None), ())
-    assert len(asked) == 1 and "iteration inputs" in asked[0]
-    assert "n" in engine._submodules and WALK not in engine._submodules["n"].device_stops
+    engine._ask_run("n", runner, WALK, SimpleNamespace(
+        device_stop="skip", max=4, refill_at=None, stream_tokens=False, past_cap=refusal == "past_cap",
+    ), ())
+    if refusal is None:
+        assert len(asked) == 1 and asked[0].loop is loop and asked[0].token_signal is None
+    else:
+        assert not asked
+        assert refused or refusal == "ranks"
 
 
 def test_a_decode_wrapper_reads_its_lengths_off_the_table():
@@ -1174,3 +1187,61 @@ def test_ordinary_and_device_steps_publish_the_same_actual_loop_progress(monkeyp
         WALK, engine._loops["n", WALK], indices, torch.tensor([[1, 1], [1, 2]]),
     )
     assert positions.tolist() == [1, 1] and live.tolist() == [False, True]
+
+
+@pytest.mark.parametrize("streamed", [False, True])
+def test_engine_windows_survive_two_short_runs_with_a_prepared_successor(monkeypatch, streamed):
+    """The engine's real immutable columns feed the actual capture body;
+    source settlement follows per-row counts, including a real-to-tail crossing.
+    """
+    from mstar.engine.engine import Engine
+    from mstar.engine.resources.iteration_tables import IterationTables
+    from mstar.engine.resources.step import StepContext
+    from mstar.graph.loop_indices import LoopLayout
+    from mstar.model.submodule_base import InputMetadata, IterationInput
+    from mstar.streaming.chunk_policy import FixedChunkPolicy
+    from mstar.streaming.stream_buffer import StreamBuffer
+
+    loop = _Loop()
+    runner, run, _, calls = _runner(monkeypatch, loop, [[1]], bs=1, limit=4, counted=True, progress=True)
+    layout = LoopLayout("decode")
+    node = SimpleNamespace(
+        ITERATION_INPUTS={"cond": IterationInput("source", streamed=streamed, pad="pad" if streamed else None)},
+        iteration_tables=IterationTables(CPU),
+        request_states={1: {"source": torch.arange(20., 32.), "pad": torch.tensor([-1., -2.])}},
+    )
+    engine = Engine.__new__(Engine)
+    engine._device = CPU
+    engine._loops = {("n", WALK): layout}
+    engine._runner = SimpleNamespace(request_generation=lambda rid: 1)
+    source = StreamBuffer(1, "source", "producer", FixedChunkPolicy(1, True))
+    for i in range(3):
+        source.pre_read_register(i)
+        source.put(i, torch.tensor(float(20 + i)))
+    source.signal_done(3)
+
+    def window(k, origin, width):
+        snapshot = source.reserve_window(width) if streamed else None
+        chunks = {} if snapshot is None else {"source": snapshot.info}
+        inputs = {} if snapshot is None or not snapshot.num_items else {1: {"source": [snapshot.data["data"]]}}
+        info = SimpleNamespace(metadata=InputMetadata(
+            dynamic_loop_iter_counts={"decode": k}, graph_pass=0, iteration_origin=origin, stream_chunks=chunks,
+        ))
+        ctx = StepContext(request_ids=(1,), graph_walk=WALK, slot=0, capture=False, repeats=width)
+        return engine._iteration_columns("n", node, ctx, [1], {1: info}, inputs, actual_loop=layout), snapshot
+
+    first, a = window(0, 0, 4)
+    second, b = window(4, 0, 4)  # built before the first actual count exists
+    for columns, snapshot, actual in [(first, a, 2), (second, b, 3)]:
+        loop.on_iteration = lambda i, actual=actual: run.state.request_yield() if i == actual - 1 else None
+        stops, _, _ = _run(run, 1, 4, columns=columns)
+        assert stops[RUN_COUNTS].tolist() == [actual]
+        if streamed:
+            source.settle_window(snapshot.reservation, actual)
+    third, c = window(5, 5, 1)
+    loop.on_iteration = lambda i: None
+    _run(run, 1, 1, columns=third)
+    if streamed:
+        source.settle_window(c.reservation, 1)
+        assert source._consumed == 3 and source._tail_consumed == 3 and not source._reservations
+    assert [row.item() for row in calls] == ([20, 21, 22, -1, -2, -2] if streamed else list(range(20, 26)))
