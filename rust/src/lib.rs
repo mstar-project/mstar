@@ -11,6 +11,8 @@
 //! Build: `maturin develop --release` in rust/.
 
 #[cfg(feature = "python")]
+pub mod arena_copy;
+#[cfg(feature = "python")]
 mod bindings;
 pub mod communicator;
 #[cfg(feature = "python")]

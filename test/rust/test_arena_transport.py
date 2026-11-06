@@ -12,7 +12,11 @@ pytest.importorskip("mstar_rust")
 
 from mstar.communication.arena import ArenaShmCommunicationManager
 from mstar.communication.communicator import CommProtocol
-from mstar.communication.tensor_store import RustTensorBookkeeping, TensorStore
+from mstar.communication.tensor_store import (
+    PythonTensorBookkeeping,
+    RustTensorBookkeeping,
+    TensorStore,
+)
 from mstar.communication.tensors import (
     SharedMemoryCommunicationManager,
     create_tensor_communication_manager,
@@ -496,6 +500,7 @@ def test_a_read_is_async_only_with_a_copy_stream(monkeypatch, tmp_path, copy_str
     gpu = ArenaShmCommunicationManager(
         my_entity_id="nb0", hostname="localhost", device="cuda",
         communicator=_NullCommunicator(), shm_dir=str(tmp_path))
+    gpu._copier = None  # this is about the torch-call path, which XPU runs
     if not copy_stream:
         gpu._h2d_stream = None
     y = torch.randn(1 << 16)
@@ -818,8 +823,8 @@ def test_placement_crosses_as_an_index_once_per_segment(tmp_path, backend):
     integer the caller already had.
     """
     prod = _manager(f"idx_{backend}", tmp_path)
-    if backend == "rust":
-        prod.tensor_store = TensorStore(RustTensorBookkeeping())
+    prod.tensor_store = TensorStore(
+        RustTensorBookkeeping() if backend == "rust" else PythonTensorBookkeeping())
 
     store = prod.tensor_store
     named: list[int] = []
@@ -844,10 +849,13 @@ def test_placement_crosses_as_an_index_once_per_segment(tmp_path, backend):
     assert len(flat) == 16
     prod.register_for_send_uuids(ParallelList([7], [[i.uuid for i in flat]]))
 
-    [idxs] = placed
-    assert len(idxs) == 16
-    assert all(isinstance(i, int) for i in idxs), \
-        "the segment has to cross as an index, not a name"
+    if backend == "rust":
+        assert not placed, "the Rust copier writes placement into the store itself"
+    else:
+        [idxs] = placed
+        assert len(idxs) == 16
+        assert all(isinstance(i, int) for i in idxs), \
+            "the segment has to cross as an index, not a name"
     assert len(named) <= prod._arena.num_segments, (
         f"named a segment {len(named)} times for 16 tensors; naming is once "
         "per segment, at the grow"
@@ -1439,6 +1447,8 @@ def test_no_room_to_grow_spills_or_fails_clearly(tmp_path, monkeypatch, spill):
     monkeypatch.setenv("MSTAR_SHM_ARENA_FULL_TIMEOUT_S", "0.05")
     prod = _manager("w0", tmp_path)
     cons = _manager("w1", tmp_path)
+    # The segment it has is full, so the row comes back for the growth path.
+    prod._arena.reserve(prod._segment_bytes)
     prod._arena = _NoRoomToGrow(prod._arena, _bigger_than_dev_shm())
     t = torch.arange(64, dtype=torch.int64)
     infos = prod.store_and_return_tensor_info("r1", {"x": [t]})

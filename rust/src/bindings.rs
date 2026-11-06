@@ -10,6 +10,7 @@ use pyo3::types::PyBytes;
 
 use crate::communicator::{RawZmqCommunicator, RecvEvent};
 use crate::shm::{SegmentedShmArena, ShmArena};
+use std::sync::Arc;
 
 /// Opaque byte frames over ZMQ PUSH/PULL: ipc or tcp endpoints, lazily-cached
 /// peers, and wakeup-fd polling (an eventfd wakes `recv_or_wake` instantly).
@@ -129,8 +130,20 @@ impl PyZmqCommunicator {
 /// offset descriptor; `free(off)` on reclaim. Consumer: `open(name)` and
 /// `torch.frombuffer(memoryview(arena)[off:off+n], ..)` (then H2D).
 #[pyclass(name = "ShmArena")]
-struct PyShmArena {
-    arena: ShmArena,
+pub(crate) struct PyShmArena {
+    arena: Arc<ShmArena>,
+}
+
+impl PyShmArena {
+    /// For the copier, whose reads keep the mapping alive by this share.
+    pub(crate) fn share(&self) -> Arc<ShmArena> {
+        self.arena.clone()
+    }
+
+    /// A mapping the copier holds, for a read to keep until its copies land.
+    pub(crate) fn of(arena: Arc<ShmArena>) -> Self {
+        Self { arena }
+    }
 }
 
 #[pymethods]
@@ -138,15 +151,19 @@ impl PyShmArena {
     #[staticmethod]
     fn create(name: &str, size: usize) -> PyResult<Self> {
         Ok(Self {
-            arena: ShmArena::create(name, size)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
+            arena: Arc::new(
+                ShmArena::create(name, size)
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
+            ),
         })
     }
 
     #[staticmethod]
     fn open(name: &str) -> PyResult<Self> {
         Ok(Self {
-            arena: ShmArena::open(name).map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
+            arena: Arc::new(
+                ShmArena::open(name).map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
+            ),
         })
     }
 
@@ -176,8 +193,12 @@ impl PyShmArena {
         (self.arena.as_mut_ptr() as usize, self.arena.size())
     }
 
+    /// Unlinks an owned arena. A share held elsewhere (only ever a consumer's,
+    /// which owns nothing to unlink) keeps it mapped.
     fn close(&mut self) {
-        self.arena.close();
+        if let Some(arena) = Arc::get_mut(&mut self.arena) {
+            arena.close();
+        }
     }
 
     /// Whole arena as a writable memoryview -> zero-copy `torch.frombuffer`.
@@ -251,8 +272,14 @@ impl PyShmSegment {
 /// `segment_name(idx)` so consumers keep opening plain `ShmArena`s by name.
 /// Segments are created once and never move — registration-friendly.
 #[pyclass(name = "SegmentedShmArena")]
-struct PySegmentedShmArena {
-    arena: SegmentedShmArena,
+pub(crate) struct PySegmentedShmArena {
+    arena: Arc<SegmentedShmArena>,
+}
+
+impl PySegmentedShmArena {
+    pub(crate) fn share(&self) -> Arc<SegmentedShmArena> {
+        self.arena.clone()
+    }
 }
 
 #[pymethods]
@@ -260,8 +287,10 @@ impl PySegmentedShmArena {
     #[staticmethod]
     fn create(base: &str, segment_size: usize, max_segments: usize) -> PyResult<Self> {
         Ok(Self {
-            arena: SegmentedShmArena::create(base, segment_size, max_segments)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
+            arena: Arc::new(
+                SegmentedShmArena::create(base, segment_size, max_segments)
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
+            ),
         })
     }
 
@@ -326,5 +355,9 @@ fn mstar_rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<crate::tensors::TensorBookkeeping>()?;
     m.add_class::<crate::tensors::TensorInfoOut>()?;
     crate::torch_abi::register(m)?;
+    m.add_class::<crate::arena_copy::PyArenaSlots>()?;
+    m.add_class::<crate::arena_copy::PyArenaCopier>()?;
+    m.add_class::<crate::arena_copy::StageOut>()?;
+    m.add_class::<crate::arena_copy::ReadOut>()?;
     Ok(())
 }

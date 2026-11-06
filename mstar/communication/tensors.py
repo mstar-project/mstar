@@ -1549,6 +1549,9 @@ class TensorCommunicationManager(ABC):
         for the caller to take after its put.
         """
         store = self.tensor_store
+        # The usual answer, without building the closures below for it.
+        if not (staged and info.uuid in staged) and not store.check_uuid_presence(info.uuid):
+            return False
 
         def held(uuid: int) -> TensorPointerInfo | None:
             if staged and uuid in staged:
@@ -2270,6 +2273,7 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
                 failed[request_id] = str(exc)
         return failed or None
 
+    # TODO: read tensor facts through mstar_rust's torch wrapper, as the arena does.
     def _register_one(self, request_id: Rid, uuid: int) -> None:
         """Pin one tensor for remote reads. The caller owns the CUDA sync."""
         already_registered = self.tensor_store.is_registered(uuid)
