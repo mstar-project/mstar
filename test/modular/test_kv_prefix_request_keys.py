@@ -103,6 +103,12 @@ class _Model:
         # a model that names no checkpoint and sets no salt keys nothing
         return "/a/checkpoint"
 
+    def declare_state(self):
+        return []
+
+    def kernel_settings(self):
+        return {}
+
     def get_node_resources(self):
         return [KVSpec(
             resource_key="kv", nodes={"LLM"},
@@ -342,6 +348,12 @@ def test_each_resource_config_is_handed_only_its_own_chain():
 def test_a_cache_every_engine_holding_it_keeps_shut_is_not_keyed():
     class _Thinker:
         """A cache on a two-rank node without prefix_cache_tp, so its engines keep it shut."""
+
+        def declare_state(self):
+            return []
+
+        def kernel_settings(self):
+            return {}
 
         def get_node_resources(self):
             return [KVSpec("kv", {"Thinker"}, PagedKVConfig(

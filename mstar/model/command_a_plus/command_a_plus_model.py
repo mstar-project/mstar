@@ -8,15 +8,12 @@ import torch
 from mstar.conductor.request_info import DEFAULT_PARTITION, CurrentForwardConductorMetadata
 from mstar.distributed.base import ShardingConfig
 from mstar.engine.resources import (
-    AttentionConfig,
-    AttentionSpec,
-    KVSpec,
-    PagedKVConfig,
     PositionConfig,
     PositionSpec,
     SamplerSpec,
     SamplingReqConfig,
 )
+from mstar.engine.state import Array, Attend, Causal, KVEntry, Read, Window
 from mstar.graph.base import GraphEdge, GraphNode, Loop, Sequential
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import ForwardPassArgs, KVLabel, LabelLayout, Model, ProcessPromptOutput, Span
@@ -123,21 +120,26 @@ class CommandAPlusModel(Model):
         edge = GraphEdge(next_node="LLM", name="text_inputs", tensor_info=seeds)
         return ForwardPassArgs(metadata, [edge], list(seeds))
 
+    def declare_state(self) -> list[Array]:
+        config = self.config
+        every = frozenset(range(config.num_hidden_layers))
+        local = frozenset(i for i, kind in enumerate(config.layer_types) if kind == "sliding_attention")
+        attend = Attend(q_heads=config.num_attention_heads)
+        return [
+            Array(
+                KV_CACHE, nodes={"LLM"}, layers=every,
+                entry=KVEntry(heads=config.num_key_value_heads, head_dim=config.head_dim),
+                max_len=self.max_seq_len,
+                reads={
+                    LOCAL_ATTN: Read(mask=Window(config.sliding_window), op=attend, layers=local),
+                    GLOBAL_ATTN: Read(mask=Causal(), op=attend, layers=every - local),
+                },
+            ),
+        ]
+
     def get_node_resources(self):
         config = self.config
-        local = tuple(i for i, kind in enumerate(config.layer_types) if kind == "sliding_attention")
         return [
-            KVSpec(resource_key=KV_CACHE, nodes={"LLM"}, config=PagedKVConfig(
-                num_layers=config.num_hidden_layers, num_qo_heads=config.num_attention_heads,
-                num_kv_heads=config.num_key_value_heads, head_dim=config.head_dim,
-                max_seq_len=self.max_seq_len,
-            )),
-            AttentionSpec(resource_key=LOCAL_ATTN, nodes={"LLM"}, config=AttentionConfig(
-                kv_cache=KV_CACHE, sliding_window=config.sliding_window, layers=local,
-            )),
-            AttentionSpec(resource_key=GLOBAL_ATTN, nodes={"LLM"}, config=AttentionConfig(
-                kv_cache=KV_CACHE,
-            )),
             PositionSpec(resource_key=ROPE, nodes={"LLM"}, config=PositionConfig(
                 kv_cache=KV_CACHE, rotary_dim=config.head_dim, interleave=True,
                 rope_theta=config.rope_theta,

@@ -55,8 +55,9 @@ class Attention(nn.Module):
     ):
         super().__init__()
         # Resource labels this layer calls, as the model declared them in
-        # ``get_node_resources``. Resolved to objects in ``bind_resources``;
-        # ``pos_key=None`` is a model whose positions are baked in elsewhere.
+        # ``declare_state`` or ``get_node_resources``. Resolved to objects in
+        # ``bind_resources``; ``pos_key=None`` is a model whose positions are
+        # baked in elsewhere.
         self._attn_key = attn_key
         self._kv_key = kv_key
         self._pos_key = pos_key

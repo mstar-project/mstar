@@ -662,6 +662,12 @@ def test_a_cpu_build_that_asks_for_the_lane_fails_at_startup():
         def get_submodule(self, node_name, device="cpu", tp_group=None, autocast_dtype=None):
             return _Submodule() if node_name == "Codec" else _Node()
 
+        def declare_state(self):
+            return []
+
+        def kernel_settings(self):
+            return {}
+
         def get_node_resources(self):
             return []
 

@@ -27,6 +27,8 @@ ROPE = "rope"
 SAMPLER = "sampler"
 # the ViT tower's cacheless attention, on the `vision_encoder` node
 VISION_ATTN = "vision_attn"
+# the GDN state's conv update, with no spec of its own: the `LinearAttnSpec` under `LINEAR_ATTN` runs both kernels
+CONV = "gdn_conv"
 
 
 @dataclass

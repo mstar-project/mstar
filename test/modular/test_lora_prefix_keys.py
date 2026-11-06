@@ -72,6 +72,12 @@ class _Model:
     def get_partition_topology(self):
         return PartitionTopology(partitions=["default"])
 
+    def declare_state(self):
+        return []
+
+    def kernel_settings(self):
+        return {}
+
     def get_node_resources(self):
         return [KVSpec(resource_key="kv", nodes={NODE}, config=PagedKVConfig(
             num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=4096, max_num_pages=64, page_size=128,
