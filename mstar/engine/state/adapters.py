@@ -312,7 +312,7 @@ def _apply_kernel_settings(
         elif not owners[key].max_len:
             allowed = {"max_segments_per_request", "max_segments_per_step", "compile_op", "workspace_mb"}
         else:
-            allowed = {"splits", "decode_fmha"} if key in reads else {"splits"}
+            allowed = {"splits", "decode_fmha", "decode_tensor_cores"} if key in reads else {"splits"}
         refused = settings.keys() - allowed
         if refused:
             raise ValueError(f"Array {owners[key].name!r}: kernel_settings[{key!r}] sets {sorted(refused)}; "

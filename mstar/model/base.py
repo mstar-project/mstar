@@ -756,10 +756,10 @@ class Model(ABC):
         return []
 
     def kernel_settings(self) -> dict[str, dict[str, Any]]:
-        """By read, update or array name, what the engine doesn't pick itself yet: ``splits`` and ``decode_fmha`` on a
-        read, ``splits`` on a GatedDeltaNet, the capture sizes of a ``Block`` read, and a pool's default size,
-        ``max_num_pages`` on a paged array and ``max_slots`` on a Value with tensor fields. A deployment's
-        ``resources:`` block overrides each pool size."""
+        """By read, update or array name, what the engine doesn't pick itself yet: ``splits``, ``decode_fmha`` and
+        ``decode_tensor_cores`` on a read of an array that keeps entries, ``splits`` on a GatedDeltaNet, the capture
+        sizes of a ``Block`` read, and a pool's default size, ``max_num_pages`` on a paged array and ``max_slots`` on a
+        Value with tensor fields. A deployment's ``resources:`` block overrides each pool size."""
         return {}
 
     def get_lora_specs(self) -> list["LoraSpec"]:
