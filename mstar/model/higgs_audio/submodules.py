@@ -29,14 +29,19 @@ from mstar.engine.accelerator_graph_config import (
     PiecewiseCallInputs,
 )
 from mstar.engine.engine import ExecutingBatch
-from mstar.engine.resources import AttentionStep, KVStep, PositionStep, SamplerStep, Segment, SlotLease, SubmoduleStep
-from mstar.engine.resources.attn.base import AttentionManager
-from mstar.engine.resources.sampler.resource import SamplerResource
+from mstar.engine.state import (
+    ArrayStep,
+    SampleStep,
+    Segment,
+    SlotLease,
+    SubmoduleStep,
+    at_last_token,
+    last_sampled,
+    sample,
+)
 from mstar.model.higgs_audio.config import (
-    ATTN,
     AUDIO_FEATURE_LENS_KEY,
     KV_CACHE,
-    ROPE,
     SAMPLER,
     HiggsAudioModelConfig,
 )
@@ -49,6 +54,7 @@ from mstar.model.submodule_base import (
     NodeInputs,
     NodeSubmodule,
     TokenStop,
+    splice_loopback_ids,
 )
 from mstar.utils.h2d import to_device_nonblocking
 
@@ -286,6 +292,10 @@ class HiggsAudioLLMSubmodule(ARNodeSubmodule):
             walk="decode", signal="text_inputs", sampler=SAMPLER, buffer="new_token",
         )
 
+    def bind_state(self, handles: Mapping[str, Any]) -> None:
+        self.kv = handles[KV_CACHE]
+        self.sampler = handles[SAMPLER]
+
     def get_accelerator_graph_configs(
         self, device: torch.device, tp_world_size: int = 1,
     ) -> list[AcceleratorGraphConfig]:
@@ -376,12 +386,7 @@ class HiggsAudioLLMSubmodule(ARNodeSubmodule):
                     span=inp.input_seq_len,
                 ) for rid, inp in zip(request_ids, inputs, strict=True)
             ],
-            steps={
-                KV_CACHE: KVStep(),
-                ATTN: AttentionStep(causal=True),
-                SAMPLER: SamplerStep(apply_penalty=False, kept_rids=kept_rids),
-                ROPE: PositionStep(),
-            },
+            state={KV_CACHE: ArrayStep(), SAMPLER: SampleStep(apply_penalty=False, kept_rows=kept_rids)},
         )
 
     def preprocess(
@@ -393,8 +398,12 @@ class HiggsAudioLLMSubmodule(ARNodeSubmodule):
         if graph_walk == "decode":
             if all(inp.input_ids is not None for inp in inputs):
                 return {"input_ids": torch.cat([inp.input_ids for inp in inputs])}
-            # device loop-back: each row's last sampled token, read by slot
-            return self.loopback_inputs(engine_inputs, inputs)
+            # device loop-back: each row's last sampled token, read by slot. A row whose last step ran elsewhere
+            # brought its token.
+            ids = last_sampled(self.sampler)
+            if any(inp.input_ids is not None and inp.input_seq_len for inp in inputs):
+                ids = splice_loopback_ids(ids, inputs, decode=True)
+            return {"input_ids": ids}
         return {
             "input_embeds": torch.cat(
                 [inp.input_embeds for inp in inputs], dim=0
@@ -404,26 +413,19 @@ class HiggsAudioLLMSubmodule(ARNodeSubmodule):
     def _forward(
         self,
         graph_walk: str,
-        engine_inputs: ModelInputsFromEngine,
         input_ids: torch.Tensor | None,
         input_embeds: torch.Tensor | None,
     ) -> torch.Tensor:
         """Run the backbone and sample one token per request."""
-        sampler: SamplerResource = engine_inputs.resources[SAMPLER]
-        attn: AttentionManager = engine_inputs.resources[ATTN]
-
-        if input_ids is None and input_embeds is None:
-            input_ids = sampler.loopback_tokens(engine_inputs.request_ids)
         if input_embeds is None:
             input_embeds = self.model.embed_tokens(input_ids)
-        hidden = self.model(input_embeds=input_embeds, label="main")
+        hidden = self.model(input_embeds=input_embeds)
 
         if graph_walk != "decode":
             # packed prefill: one hidden per request, at its last token
-            hidden = attn.select_last_hidden(hidden)
+            hidden = at_last_token(self.kv, hidden)
 
-        logits = self.model.lm_head(hidden)
-        return sampler.sample(engine_inputs.request_ids, logits=logits)
+        return sample(self.sampler, self.model.lm_head(hidden))
 
     def forward(
         self,
@@ -436,7 +438,6 @@ class HiggsAudioLLMSubmodule(ARNodeSubmodule):
         return {
             "new_token": [self._forward(
                 graph_walk=graph_walk,
-                engine_inputs=engine_inputs,
                 input_ids=input_ids,
                 input_embeds=input_embeds,
             )]
@@ -458,7 +459,6 @@ class HiggsAudioLLMSubmodule(ARNodeSubmodule):
     ) -> BatchedModelOutput:
         new_tokens = self._forward(
             graph_walk=graph_walk,
-            engine_inputs=engine_inputs,
             input_ids=input_ids,
             input_embeds=input_embeds,
         )

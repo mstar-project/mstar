@@ -634,27 +634,23 @@ class _PageableH2D(TorchFunctionMode):
 
 
 def test_higgs_loopback_decode_prep_copies_no_pageable_index(monkeypatch):
-    """A device loop-back decode step whose rows include one fresh off its prefill overlays
-    that row's token through the sampler's ``overwrite_rows`` (every request's first decode
-    step takes this path), and its prep makes no pageable host-to-device copy of its own. The
-    meta device stands in for the accelerator; on it the row stager takes its host branch, so
-    the pinned upload itself is not exercised here."""
-    from mstar.engine.resources.sampler.resource import SamplerResource
+    """A device loop-back decode step whose rows include one fresh off its prefill splices that
+    row's token in (every request's first decode step takes this path), and its prep makes no
+    pageable host-to-device copy of its own. The meta device stands in for the accelerator."""
+    from mstar.engine.state import Sampler
+    from mstar.engine.state.calls import SamplerHandle
     from mstar.model.higgs_audio.config import SAMPLER, HiggsAudioModelConfig
     from mstar.model.higgs_audio.submodules import HiggsAudioLLMSubmodule
     from mstar.model.submodule_base import ARNodeInputs
 
     class _Sampler:
-        # the real overlay, over a stand-in for the slot masters
-        overwrite_rows = SamplerResource.overwrite_rows
-        _row_stager = None
-
         def loopback_tokens(self, rids):
             return torch.zeros(len(rids), dtype=torch.long, device="meta")
 
     sub = HiggsAudioLLMSubmodule(None, HiggsAudioModelConfig())
-    sampler = _Sampler()
-    engine_inputs = SimpleNamespace(resources={SAMPLER: sampler}, request_ids=["fresh", "looped"])
+    sub.sampler = SamplerHandle(Sampler(SAMPLER, nodes={"LLM"}, vocab_size=8), _Sampler())
+    sub.sampler.begin_step(SimpleNamespace(ctx=SimpleNamespace(padded_request_ids=["fresh", "looped"])))
+    engine_inputs = SimpleNamespace(request_ids=["fresh", "looped"])
     inputs = [
         ARNodeInputs(input_ids=torch.zeros(1, dtype=torch.long, device="meta"), input_seq_len=1),
         ARNodeInputs(input_seq_len=1),

@@ -24,11 +24,11 @@ from mstar.model.components.distributed import (
     ParallelGatedMLP,
     VocabParallelEmbedding,
 )
-from mstar.model.higgs_audio.config import ATTN, KV_CACHE, ROPE, HiggsAudioModelConfig
+from mstar.model.higgs_audio.config import KV_CACHE, ROPE, HiggsAudioModelConfig
 
 
 def _build_decoder_layer(
-    config: HiggsAudioModelConfig, comm_group: CommGroup | None = None,
+    config: HiggsAudioModelConfig, layer: int, comm_group: CommGroup | None = None,
 ) -> DecoderLayer:
     return DecoderLayer(
         self_attn=ParallelAttention(
@@ -39,11 +39,10 @@ def _build_decoder_layer(
             head_dim=config.head_dim,
             qk_norm=True,
             rms_norm_eps=config.rms_norm_eps,
-            rope_theta=config.rope_theta,
             input_hidden_size=config.hidden_size,
-            attn_key=ATTN,
             kv_key=KV_CACHE,
             pos_key=ROPE,
+            layer=layer,
         ),
         mlp=ParallelGatedMLP(
             comm_group=comm_group,
@@ -70,8 +69,8 @@ class HiggsAudioLLM(nn.Module):
             comm_group=comm_group,
         )
         self.layers = nn.ModuleList(
-            [_build_decoder_layer(config, comm_group=comm_group)
-             for _ in range(config.num_hidden_layers)]
+            [_build_decoder_layer(config, layer, comm_group=comm_group)
+             for layer in range(config.num_hidden_layers)]
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.lm_head = ColumnParallelLinear(
@@ -82,20 +81,8 @@ class HiggsAudioLLM(nn.Module):
             gather_output=True,
         )
 
-    def forward(
-        self,
-        input_embeds: torch.Tensor,
-        *,
-        label: str,
-        **kwargs,
-    ) -> torch.Tensor:
+    def forward(self, input_embeds: torch.Tensor) -> torch.Tensor:
         hidden_states = input_embeds
-        # The label and layer index are cursors on the shared resources: bind
-        # the label once, advance the index per layer. Passing them as
-        # arguments instead would make inductor specialize on the int.
-        self.layers[0].self_attn.attend.bind_step(label)
-        for layer_idx, decoder_layer in enumerate(self.layers):
-            decoder_layer.self_attn.attend.set_layer_idx(layer_idx)
+        for decoder_layer in self.layers:
             hidden_states = decoder_layer(hidden_states=hidden_states)
-        # the advance is the runner's now, off the step declaration
         return self.norm(hidden_states)

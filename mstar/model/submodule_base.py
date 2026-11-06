@@ -103,7 +103,8 @@ class DeviceLoopback(NamedTuple):
     Declared as ``ARNodeSubmodule.device_loopback``; the loop-back hooks
     (``uniform_row_inputs``, ``device_loopback_signals``,
     ``inline_client_signals``) and the read in ``preprocess``
-    (``loopback_inputs``) follow from it. The sampler keeps the masters only
+    (``last_sampled``, or ``loopback_inputs`` on a model that hasn't moved)
+    follow from it. The sampler keeps the masters only
     for a node that declares this: their eager step write is a small
     synchronous host-to-device copy per step, which a node that reads its
     tokens on the host would pay for nothing.

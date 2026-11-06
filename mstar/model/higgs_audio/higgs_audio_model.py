@@ -27,6 +27,7 @@ boundaries (fixed 4 s chunks only) and the client-side n-gram loop fix
 
 import logging
 from pathlib import Path
+from typing import Any
 
 import torch
 
@@ -35,26 +36,26 @@ from mstar.conductor.request_info import (
     CurrentForwardConductorMetadata,
     StreamingConnectionState,
 )
-from mstar.engine.resources import (
-    AttentionConfig,
-    AttentionSpec,
-    KVSpec,
-    NodeResourceSpec,
-    PagedKVConfig,
-    PositionConfig,
-    PositionSpec,
-    ResourceReqConfig,
-    SamplerSpec,
-    SamplingReqConfig,
+from mstar.engine.state import (
+    Array,
+    Attend,
+    Causal,
+    KVEntry,
+    Layout,
+    Positions,
+    Read,
+    Rope,
+    Sampler,
+    SampleSettings,
+    Span,
 )
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
-from mstar.model.base import ForwardPassArgs, KVLabel, LabelLayout, Model, ProcessPromptOutput, Span
+from mstar.model.base import ForwardPassArgs, KVLabel, Model, ProcessPromptOutput
 from mstar.model.higgs_audio.config import (
     ATTN,
     AUDIO_FEATURE_LENS_KEY,
     KV_CACHE,
-    ROPE,
     SAMPLER,
     HiggsAudioModelConfig,
 )
@@ -122,51 +123,37 @@ class HiggsAudioModel(Model):
     # Model ABC: resources
     # -------------------------------------------------------------------
 
-    def get_node_resources(self) -> list[NodeResourceSpec]:
-        """LLM paged KV + attention/positions/sampler. audio_encoder is
-        stateless: it runs once per request and holds nothing."""
-        kv_config = PagedKVConfig(
-            num_layers=self.config.num_hidden_layers,
-            num_kv_heads=self.config.num_key_value_heads,
-            head_dim=self.config.head_dim,
-            max_seq_len=self.config.max_position_embeddings,
-            num_qo_heads=self.config.num_attention_heads,
-            # ~2k tokens per ASR request (prompt + 12.5 audio embeds/s +
-            # transcript); 256 pages = 32k tokens ≈ 16 concurrent
-            # requests at ~3.7 GB, less whatever the decode capture's
-            # padding rows hold (one page each, on first use).
-            max_num_pages=256,
-        )
+    def declare_state(self) -> list[Array | Sampler]:
+        """LLM paged KV, positions and sampler. audio_encoder is stateless: it runs once per request and holds
+        nothing."""
+        c = self.config
         return [
-            KVSpec(resource_key=KV_CACHE, nodes={"LLM"}, config=kv_config),
-            AttentionSpec(
-                resource_key=ATTN, nodes={"LLM"},
-                config=AttentionConfig(kv_cache=KV_CACHE),
+            Array(
+                KV_CACHE, nodes={"LLM"}, layers=frozenset(range(c.num_hidden_layers)),
+                entry=KVEntry(heads=c.num_key_value_heads, head_dim=c.head_dim), max_len=c.max_position_embeddings,
+                # Factors of 1 scale nothing, and setting them picks flashinfer's Llama 3.1 kernel over its plain one.
+                positions=Positions(rope=Rope(
+                    theta=c.rope_theta, low_freq_factor=1.0, high_freq_factor=1.0, old_context_len=8192,
+                )),
+                reads={ATTN: Read(mask=Causal(), op=Attend(q_heads=c.num_attention_heads))},
             ),
-            PositionSpec(
-                resource_key=ROPE, nodes={"LLM"},
-                config=PositionConfig(
-                    kv_cache=KV_CACHE,
-                    rope_theta=self.config.rope_theta,
-                ),
-            ),
-            SamplerSpec(
-                resource_key=SAMPLER, nodes={"LLM"},
-                vocab_size=self.config.vocab_size,
-                # ASR transcription: the reference decodes greedily and
-                # exposes no penalty knob, so no seen-token buffers.
-                enable_repetion_penalty=False,
-            ),
+            # ASR transcription: the reference decodes greedily and exposes no penalty knob, so no seen-token buffers.
+            Sampler(SAMPLER, nodes={"LLM"}, vocab_size=c.vocab_size, penalty=False),
         ]
+
+    def kernel_settings(self) -> dict[str, dict[str, Any]]:
+        # ~2k tokens per ASR request (prompt + 12.5 audio embeds/s + transcript); 256 pages = 32k tokens ≈ 16 concurrent
+        # requests at ~3.7 GB, less whatever the decode capture's padding rows hold (one page each, on first use).
+        return {KV_CACHE: {"max_num_pages": 256}}
 
     def get_request_resource_configs(
         self, partition_fwd_args: dict[str, ForwardPassArgs],
         model_kwargs: dict | None = None,
-    ) -> dict[str, ResourceReqConfig]:
+    ) -> dict[str, SampleSettings]:
         del partition_fwd_args
         model_kwargs = model_kwargs or {}
         return {
-            SAMPLER: SamplingReqConfig(
+            SAMPLER: SampleSettings(
                 # Reference eval decodes greedily (do_sample=False).
                 temperature=model_kwargs.get("temperature", 0.0),
                 top_p=model_kwargs.get("top_p", 1.0),
@@ -396,7 +383,7 @@ class HiggsAudioModel(Model):
         # One step writes the text around the audio and the audio together, so
         # one span; it mixes text and audio, so nothing keys it.
         prompt = len(pre_ids) + audio + len(post_ids)
-        layout = LabelLayout(
+        layout = Layout(
             spans=(Span("rows", "prefill_audio", prompt, prompt, "audio_features"),),
             growth=(("decode_loop", 1),),
         )
@@ -406,7 +393,7 @@ class HiggsAudioModel(Model):
                 torch.tensor(post_ids, dtype=torch.long),
             ],
             "audio_features": [audio_features],
-        }, {"kv_layout": {KV_CACHE: {"main": layout}}, AUDIO_FEATURE_LENS_KEY: feature_lens})
+        }, {"state_layout": {KV_CACHE: {"main": layout}}, AUDIO_FEATURE_LENS_KEY: feature_lens})
 
     # -------------------------------------------------------------------
     # Model ABC: postprocess

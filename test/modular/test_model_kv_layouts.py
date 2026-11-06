@@ -445,7 +445,7 @@ def test_higgs_lays_out_the_prefill_step_it_runs():
     output = model.process_prompt(
         "transcribe", ["audio"], ["text"], tensors={"audio_inputs": [torch.zeros(16000 * 35)]},
     )
-    [layout] = output.metadata["kv_layout"][KV_CACHE].values()
+    [layout] = output.metadata["state_layout"][KV_CACHE].values()
     tensors = output.new_input_tensors
     args = model.get_initial_forward_pass_args(
         "main", ["audio"], ["text"], {name: tensors[name] for name in tensors}, output.metadata,
