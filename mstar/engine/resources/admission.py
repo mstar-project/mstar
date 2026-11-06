@@ -247,9 +247,11 @@ class Admission:
     def _enqueue(self, rid: str, key: str) -> None:
         queue = self._queues[key]
         bisect.insort(queue, rid, key=self._arrival.__getitem__)
-        if queue[0] == rid:
-            # an earlier arrival goes ahead of the request the mark measured
+        if queue[0] == rid and len(queue) > 1:
+            # An earlier arrival goes ahead of the request the mark measured. That request may now pass it, and once
+            # the mark is gone nothing else tries it again.
             self._short.pop(key, None)
+            self._untried = True
 
     def _reserve(
         self, rid: str, published_of: Callable[[str], Mapping[str, PublishedInfo] | None],
