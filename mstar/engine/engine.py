@@ -3364,9 +3364,10 @@ class Engine:
         """``at``, the journal's length before a node's move, puts the move ahead of what its pools journaled as it
         freed room, which a follower can replay only after the move."""
         wire_rid, journal = self._graph_runtime.get_rid_string(request_id), self._resident_delta
-        # an UNRESERVE right after its RESERVE cancels it, so the followers don't replay both moves at every
-        # `check_ready` where a second KV cache on the node keeps the request not ready
-        if kind == MoveKind.UNRESERVE and journal.cancel(wire_rid, MoveKind.RESERVE, pool):
+        # An UNRESERVE right after the RESERVE that made the allotment cancels it, so the followers don't replay both
+        # moves at every `check_ready` where a second KV cache on the node keeps the request not ready. Both moves
+        # stay when the RESERVE grew an allotment, since the followers have to give that allotment back too.
+        if kind == MoveKind.UNRESERVE and count and journal.cancel(wire_rid, MoveKind.RESERVE, pool):
             return
         wire_victims = [self._graph_runtime.get_rid_string(victim) for victim in victims]
         journal.add(kind, wire_rid, pool, count, wire_victims, node, at)

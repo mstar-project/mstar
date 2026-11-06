@@ -726,12 +726,14 @@ class KVManager(AttentionResource):
         # `_unused` counts the pages admitted requests were allotted and haven't used yet.
         # `_guaranteed` holds the requests that reserve what they grow into and are never preempted, decided at their
         #   first `ask`, or later when the host has no room to set aside for their move.
+        # `_made` names the request whose allotment the last reservation made rather than grew.
         self._nodes = nodes
         self.local_loops: Collection[str] = frozenset()
         self._asks: dict[str, int] = {}
         self._allotments: dict[str, Allotment] = {}
         self._unused = 0
         self._guaranteed: set[str] = set()
+        self._made: str | None = None
         # Preemption state.
         # `_earmarks`: request -> the earmark it holds until its victims have moved.
         # `_victims`: a victim not yet moved -> its earmark.
@@ -4735,19 +4737,23 @@ class KVManager(AttentionResource):
             del self._asks[rid]
             self._parked.discard(rid)
             self._allot(rid, pages)
+            self._made = None
         else:
             returning = self._return_pages(rid) if self._on_host(rid) else None
             self._allotments[rid] = Allotment(pages=pages, prompt=self._asks.pop(rid), returning=returning)
             self._recount(rid)
+            self._made = rid
         earmark = self._earmarks.get(rid)
         if earmark is not None:
             earmark.granted = earmark.pages
 
     def unreserve(self, rid: str) -> None:
         with self._lock:
+            made = self._made == rid
             self._unreserve(rid)
             if self.journal is not None:
-                self.journal(MoveKind.UNRESERVE, rid, 0)
+                # 1 when the last reservation made the allotment, which `Engine._journal` then cancels
+                self.journal(MoveKind.UNRESERVE, rid, int(made))
 
     def _unreserve(self, rid: str) -> None:
         allotment = self._allotments.pop(rid, None)
