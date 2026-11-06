@@ -22,6 +22,7 @@ sys.path.insert(0, ".")
 from mstar.engine.accelerator_graph_runner import AcceleratorGraphRunner  # noqa: E402
 from mstar.engine.device_run import RunState, TokenStream  # noqa: E402
 from mstar.engine.resources import resident as resident_mod  # noqa: E402
+from mstar.engine.resources import runner as runner_mod  # noqa: E402
 from mstar.engine.resources.attn.config import AttentionConfig, AttentionSpec  # noqa: E402
 from mstar.engine.resources.attn.flashinfer import FlashInferManager  # noqa: E402
 from mstar.engine.resources.attn.wrappers import FlashInferDecodeWrapper  # noqa: E402
@@ -40,6 +41,8 @@ from mstar.engine.resources.recurrent.config import (  # noqa: E402
 )
 from mstar.engine.resources.recurrent.pool import SINK_SLOT, RecurrentStatePool  # noqa: E402
 from mstar.engine.resources.resident import NOT_ASKED, TRASH_SLOT, ResidentPlanner, build_planner  # noqa: E402
+from mstar.engine.resources.resident_hooks import ANY_REPEATS  # noqa: E402
+from mstar.engine.resources.runner import StepRunner  # noqa: E402
 from mstar.engine.resources.spec import resolve_spec_dependencies  # noqa: E402
 from mstar.engine.resources.step import (  # noqa: E402
     AllocationFailed,
@@ -51,7 +54,7 @@ from mstar.engine.resources.step import (  # noqa: E402
 )
 from mstar.graph.base import EdgeKind, LoopEdges  # noqa: E402
 from mstar.model.submodule_base import IterationInput  # noqa: E402
-from mstar.utils import knobs  # noqa: E402
+from mstar.utils import knobs, profiler  # noqa: E402
 from mstar.utils.ipc_format import OffloadDelta  # noqa: E402
 from mstar.worker.micro_scheduler import ScheduledBatch  # noqa: E402
 from mstar.worker.step_repeats import RepeatConfig, StepRepeats, parse_step_repeats  # noqa: E402
@@ -951,6 +954,40 @@ def test_a_run_past_a_rows_cap_stays_inside_the_rows_table():
     kv._streams[1]["main"].stored_len = kv.config.max_seq_len
     step.segments[0].span = 0
     assert kv.max_repeats(step, SimpleNamespace(request_ids=(1,), repeats=3, resident=object())) > 3
+
+
+def test_a_narrowed_run_says_which_resource_did_it(monkeypatch):
+    """The walk's line reads "repeats on" from load, so without this a resource that
+    holds every step to one iteration looks like a run (review-r6 F6). Each step
+    counts; the log has one line for it, and one more once it comes down to 1."""
+    answers = {"cross_kv": 1, "sampler": ANY_REPEATS}
+    runner = StepRunner.__new__(StepRunner)
+    runner._resources = {
+        key: SimpleNamespace(max_repeats=lambda step, ctx, key=key: answers[key]) for key in answers
+    }
+    runner._keys_cache = {frozenset(answers): list(answers)}
+    runner._node_order = {"decoder": list(answers)}
+    runner._narrowed = set()
+    logged = []
+    monkeypatch.setattr(runner_mod.logger, "info", lambda *args: logged.append(args))
+    monkeypatch.setattr(profiler, "PHASE_PERIOD", 1)
+    samples = profiler.phase_buffer()
+    samples.clear()
+
+    def settle(asked):
+        ctx = SimpleNamespace(repeats=asked, graph_walk=WALK)
+        runner._settle_repeats(SimpleNamespace(ctx=ctx, keys=answers.keys, get=lambda key: None))
+        return ctx.repeats
+
+    answers["cross_kv"] = 5
+    assert [settle(8), settle(8)] == [5, 5]
+    assert len(logged) == 1 and "cross_kv" in logged[0] and ["decoder"] in logged[0] and WALK in logged[0]
+    answers["cross_kv"] = 1
+    assert [settle(8), settle(8)] == [1, 1]
+    assert len(logged) == 2
+    assert samples[f"repeats.narrowed.{WALK}.cross_kv#"] == [5, 5, 1, 1]
+    assert settle(1) == 1 and len(samples[f"repeats.narrowed.{WALK}.cross_kv#"]) == 4, "nothing was asked"
+    samples.clear()
 
 
 def test_a_step_its_resources_held_to_one_iteration_moves_its_rows_by_one():

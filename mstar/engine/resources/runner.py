@@ -22,7 +22,7 @@ from mstar.engine.resources.step import (
     FullAdmitOutcome,
     SubmoduleStep,
 )
-from mstar.utils.profiler import phase_end, phase_start, range_pop, range_push
+from mstar.utils.profiler import phase_end, phase_record, phase_start, range_pop, range_push
 
 if TYPE_CHECKING:
     import torch
@@ -89,6 +89,8 @@ class StepRunner:
         # keyset -> ordered keys; a step's resource set is fixed for a node, so
         # admit/plan/commit reuse this rather than re-filtering _order each call
         self._keys_cache: dict[frozenset[str], list[str]] = {}
+        # (walk, resource key, down to 1) already logged (``_note_narrowed``)
+        self._narrowed: set[tuple[str, str, bool]] = set()
         self._preplan_keys_cache: dict[frozenset[str], list[str]] = {}
         # publish runs per rid per step; most resources inherit the base
         # no-op, so settle who can actually publish once instead of calling
@@ -575,11 +577,24 @@ class StepRunner:
         of them reserves for it. Every resource the step declares answers, not
         only the pre-planning ones."""
         ctx = step.ctx
-        if ctx.repeats == 1:
+        asked = ctx.repeats
+        if asked == 1:
             return
-        ctx.repeats = max(1, min(
-            [ctx.repeats, *(self._resources[key].max_repeats(step.get(key), ctx) for key in self._keys_for(step))],
-        ))
+        allowed = {key: self._resources[key].max_repeats(step.get(key), ctx) for key in self._keys_for(step)}
+        ctx.repeats = max(1, min([asked, *allowed.values()]))
+        for key, most in allowed.items():
+            if most < asked:
+                self._note_narrowed(ctx.graph_walk, key, asked, ctx.repeats)
+
+    def _note_narrowed(self, walk: str, key: str, asked: int, settled: int) -> None:
+        """The walk's line says "repeats on" from load, so what holds its steps
+        back shows here: counted per step, logged once, and once more at 1."""
+        phase_record(f"repeats.narrowed.{walk}.{key}#", settled)
+        note = (walk, key, settled == 1)
+        if note not in self._narrowed:
+            self._narrowed.add(note)
+            nodes = [node for node, keys in (self._node_order or {}).items() if key in keys]
+            logger.info("%s/%s: %s narrowed a step from %d iterations to %d", nodes, walk, key, asked, settled)
 
     def rewind_run(self, step: SubmoduleStep | None, replays: int) -> None:
         """A run landed ``replays`` iterations short: each resource takes them
