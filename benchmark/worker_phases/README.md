@@ -59,7 +59,8 @@ The names say neither which thread a phase runs on nor whether it is work.
 
 | phase | thread | what it is |
 | --- | --- | --- |
-| `worker.postprocess.event_sync` | main | **The only real GPU wait.** Blocks on the step's completion event |
+| `worker.postprocess.event_sync` | main | **A real GPU wait.** Blocks on the step's completion event |
+| `worker.await_run` | main | **The other real GPU wait**: a run on the device (`device_stop`), before N is post-processed. `.cpu` is the host work done during it (messages, lanes); `event_sync` is then about 0 |
 | `await_gpu` | main | Waits for the GPU *thread's* host work (`prepare_inputs` plus kernel launch). Not GPU execution |
 | `worker.gpu_thread.exec` | GPU | CPU time spent enqueuing kernels, not GPU time |
 | `worker.gpu_thread.prepare_inputs` | GPU | Host work, but it absorbs any host sync inside a submodule's `prepare_inputs` |
@@ -85,8 +86,9 @@ Consequences:
 * `postprocess_batch` contains several of the `postprocess.*` phases, so it
   does not sum with them.
 * **GPU busy time is not in this table**, and `iter_total - event_sync` is not
-  GPU idle time. A non-zero `event_sync` means the CPU did wait on the GPU; a
-  small one means the GPU-bound component is marginal, not absent. For the
+  GPU idle time. A non-zero `event_sync` (plus `worker.await_run` where runs go on
+  the device) means the CPU did wait on the GPU; a small one means the GPU-bound
+  component is marginal, not absent. For the
   actual GPU utilization, take an nsys capture, merge the intervals from
   `SELECT start, end FROM CUPTI_ACTIVITY_KIND_KERNEL`, and compare their union
   to the capture's wall time.

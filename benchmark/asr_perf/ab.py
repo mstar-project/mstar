@@ -38,7 +38,7 @@ H = importlib.util.module_from_spec(_spec)
 sys.modules["asr318"] = H
 _spec.loader.exec_module(H)
 
-KEY_PHASES = ("iter_total", "gpu_exec", "worker.postprocess.event_sync", "submit_spec.launch_wait",
+KEY_PHASES = ("iter_total", "gpu_exec", "worker.postprocess.event_sync", "worker.await_run", "submit_spec.launch_wait",
               "engine.plan.fresh", "engine.plan.promoted", "engine.preprocess", "engine.collect_outputs",
               "worker.gpu_thread.prepare_inputs", "worker.postprocess.check_stop",
               "worker.postprocess.prematerialize", "worker.postprocess_batch")
