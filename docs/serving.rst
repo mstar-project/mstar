@@ -484,9 +484,10 @@ ran short gets the pages freed, up to its shortage. When the newer requests can'
 moves to the host if the host pool can hold all of its pages, and otherwise waits holding its
 pages. A request on the host and one waiting for pages wait outside the queue, so a new prompt
 that fits still starts. They are tried oldest first, before the queue. A dropped request waits
-in the queue at its arrival, and no request starts ahead of it. The oldest waiting request
-that moves can let in moves newer requests that wait holding pages, to the host or by a drop as
-above. A request on the host returns once its pages and one more page fit, or every page its
+in the queue at its arrival, and the only requests that start ahead of it are those whose pages
+are already set aside. The oldest waiting request that moves can let in moves newer requests that
+wait holding pages, to the host or by a drop as above, and the pages they free are set aside for
+it. A request on the host returns once its pages and one more page fit, or every page its
 grant needed when it moved itself, and its pages are then copied back. A dropped request returns
 once its prompt, or its history and one more page if that is larger, fits, then recomputes its KV
 in prefill chunks cut by its walk's chunk budget, and isn't taken again until it writes a token past

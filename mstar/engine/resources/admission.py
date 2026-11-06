@@ -37,10 +37,12 @@ class Admission:
 
     A waiting request is admitted once it is first in every queue it is in and each resource it
     asked reserves for it, all or nothing. It may also pass the first request of a queue whose resource
-    overrides `Resource.reserve_past`, while that request can't start (`_pass`). A request that asks again
-    (`readmit`) holding something to return to waits in no queue, so it holds up no newer request, and
-    `admit_waiting` tries it, oldest first, whenever what it didn't fit has grown. One that holds nothing waits in
-    the queues at its arrival, as a prompt does, and no request passes it, so newer prompts can't keep passing it.
+    overrides `Resource.reserve_past`, while that request can't start (`_pass`), and stand anywhere in the queue of a
+    resource that already holds what it asked for (`Resource.reserved`), since that takes nothing from the requests
+    ahead of it. A request that asks again (`readmit`) holding something to return to waits in no queue, so it holds
+    up no newer request, and `admit_waiting` tries it, oldest first, whenever what it didn't fit has grown. One that
+    holds nothing waits in the queues at its arrival, as a prompt does, and no request passes it, so newer prompts
+    can't keep passing it.
     """
 
     def __init__(self, resources: Mapping[str, Resource], ask_order: Collection[str]) -> None:
@@ -163,9 +165,9 @@ class Admission:
         self, published_of: Callable[[str, str], Mapping[str, PublishedInfo] | None],
     ) -> list[tuple[str, str]]:
         """Admit each return that now fits, oldest first, then each waiting request that is now first
-        in every queue it is in and fits, then each that passes a first request that can't start, in
-        arrival order, and return the (node, rid) pairs that may start. ``published_of(rid, node)`` gives
-        what the request published for that node's resources.
+        in every queue it is in and fits, then each that passes a first request that can't start, or waits
+        where a resource holds what it asked for, in arrival order, and return the (node, rid) pairs that may
+        start. ``published_of(rid, node)`` gives what the request published for that node's resources.
 
         Nothing is tried until a resource whose first waiting request didn't fit has grown, a mark that
         requests passing were refused against has grown, or a queue has a new first request, and a return
@@ -213,8 +215,6 @@ class Admission:
         if not swept:
             return started
         blocked = self._blocked(queue[0] for key, queue in self._queues.items() if key in self._passes and queue)
-        if not blocked:
-            return started
         # a request a resource refused while it passed waits for its mark, so the sweep skips it
         waiting = self._waiting.keys() - self._refused.keys() - self._returns.keys()
         for rid in sorted(waiting, key=self._arrival.__getitem__):
@@ -288,24 +288,26 @@ class Admission:
     def _pass(
         self, rid: str, published_of: Callable[[str], Mapping[str, PublishedInfo] | None], blocked: dict[str, str],
     ) -> dict[str, str] | None:
-        """Admit waiting ``rid`` where it stands in each queue: first, or behind a first request in ``blocked``
-        whose resource lets requests pass. Return the nodes waiting on it, or None, and add ``rid`` to
-        ``blocked`` when a resource refuses it."""
+        """Admit waiting ``rid`` where it stands in each queue: first, behind a first request in ``blocked``
+        whose resource lets requests pass, or anywhere where the resource holds what ``rid`` asked for. Return
+        the nodes waiting on it, or None, and add ``rid`` to ``blocked`` when a resource refuses it."""
         if rid in self._refused:
             return None
-        passing = []
+        passing, reserved = [], []
         for key in self._waiting[rid].asked:
             first = self._queues[key][0]
             if first == rid:
                 if key in self._short:
                     return None
+            elif self._resources[key].reserved(rid):
+                reserved.append(key)
             elif key in self._passes and first in blocked:
                 passing.append(key)
             else:
                 return None
         # The KV cache lends a passer the pages a first request it didn't refuse would fit in, so ``rid`` passes a
-        # first request only if it also passes at the resource that refused that request.
-        if any(blocked[self._queues[key][0]] not in passing for key in passing):
+        # first request only if it also passes, or takes nothing, at the resource that refused that request.
+        if any(blocked[self._queues[key][0]] not in passing + reserved for key in passing):
             return None
         nodes = self._reserve(rid, published_of, passing)
         if nodes is None:

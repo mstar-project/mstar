@@ -4796,6 +4796,10 @@ class KVManager(AttentionResource):
                 return PassMark(room, None, None)
             return None
 
+    def reserved(self, rid: str) -> bool:
+        """Whether the moves `make_room` chose for waiting ``rid`` admitted it (`_settle`). Read without the lock."""
+        return rid in self._allotments and rid not in self._asks
+
     def _admit(
         self, rid: str, pages: int, journal: Callable[..., None] | None = None, passed: bool = False,
     ) -> bool:
