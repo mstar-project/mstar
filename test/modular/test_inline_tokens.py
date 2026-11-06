@@ -166,8 +166,9 @@ def test_a_row_that_fails_postprocessing_fails_only_its_request():
     worker.result_tensor_queue.put(InlineTokens(["bad", "good"], [13, 2], "text"))
     chunks = {c.request_id: c for c in _run_until(worker, stop, 2)}
     assert chunks["good"].modality == "text" and chunks["good"].data == b"<2>"
-    assert chunks["bad"].modality == "error" and b"bad token" in chunks["bad"].data
-    assert chunks["bad"].metadata["status"] == 400
+    # past intake a ValueError is a server bug: a 500 that keeps its text in the log
+    assert chunks["bad"].modality == "error" and b"internal error (error id " in chunks["bad"].data
+    assert chunks["bad"].metadata["status"] == 500
 
 
 def test_inline_logprobs_land_in_their_chunks_metadata():

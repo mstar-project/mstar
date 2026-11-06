@@ -76,6 +76,7 @@ from mstar.model.chatterbox.config import (
     ChatterboxConfig,
 )
 from mstar.model.chatterbox.loader import resolve_snapshot
+from mstar.model.media_limits import decoding_upload
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.streaming.chunk_policy import FixedChunkPolicy, RampChunkPolicy
 from mstar.streaming.topology import Connection, PartitionTopology, StreamingGraphEdge
@@ -573,16 +574,8 @@ class ChatterboxModel(Model):
             raise
         except Exception as exc:  # noqa: BLE001 - any decode failure falls through
             logger.debug("soundfile could not decode %s (%s); trying torchcodec", filepath, exc)
-            # an undecodable upload is the client's error (400); a missing
-            # decoder library above still surfaces as a server error
-            try:
+            with decoding_upload(filepath, "the reference audio", ffmpeg=True):
                 return decode_torchcodec_capped(filepath, S3GEN_SR).float()
-            except RuntimeError as decode_exc:
-                # the decoder's message names the server's upload path; the client gets none of it
-                logger.info("torchcodec could not decode %s: %s", filepath, decode_exc)
-                raise ValueError(
-                    "Could not decode the reference audio: not a format soundfile or torchcodec can read"
-                ) from None
         if wav.numel() == 0:
             # before the resampler, which cannot reshape an empty clip
             raise ValueError("Reference audio is empty")

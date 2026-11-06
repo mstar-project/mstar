@@ -207,7 +207,8 @@ def test_a_failed_encode_answers_in_its_slot(worker):
     worker.model.gate(-1).set()
     chunks = _pass_until(worker, 2)
     assert [c.modality for c in chunks] == ["error", "text"]
-    assert chunks[0].metadata == {"status": 400}
+    # past intake a ValueError is a server bug
+    assert chunks[0].metadata == {"status": 500}
 
 
 def test_an_encode_finishing_after_teardown_delivers_nothing(worker):

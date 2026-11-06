@@ -45,7 +45,7 @@ from mstar.model.lingbot_world.config import (
     WAN21_VAE_DIFFUSERS_REPO,
 )
 from mstar.model.lingbot_world.submodules import DIT_ATTN, ROLLOUT_LOOP_NAME, ROLLOUT_WALK, LingBotDitSubmodule
-from mstar.model.media_limits import PILLOW_IMAGE_FORMATS, check_image_size
+from mstar.model.media_limits import PILLOW_IMAGE_FORMATS, check_image_size, decoding_upload
 from mstar.model.submodule_base import NodeSubmodule
 
 logger = logging.getLogger(__name__)
@@ -292,6 +292,8 @@ class LingBotWorldModel(Model):
 
         check_image_size(filepath, formats=PILLOW_IMAGE_FORMATS)
         with Image.open(filepath, formats=PILLOW_IMAGE_FORMATS) as image:
+            with decoding_upload(filepath, "the image"):
+                image.load()
             rgb = np.array(image.convert("RGB"))
         return TensorAndMetadata(torch.from_numpy(rgb).permute(2, 0, 1).contiguous())
 
