@@ -47,8 +47,9 @@ from mstar.engine.resources.context_parallel import (
     zigzag_capture,
     zigzag_rows,
 )
+from mstar.engine.resources.convenience import AttentionCallable
 from mstar.engine.resources.kv import manager as manager_mod
-from mstar.engine.resources.kv.cache import KVCache
+from mstar.engine.resources.kv.cache import KVCache, _kv_scatter_nhd_eager
 from mstar.engine.resources.kv.config import KVLayout, KVReqConfig, KVSpec, KVStep, PagedKVConfig
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.kv.plan import SINK_PAGE, KVPlanOutput, KVPlanOutputs, SequenceView, build_paged_indptrs
@@ -379,14 +380,14 @@ class _Case:
         """The real rows' views, without the padding rows'."""
         return self.plan["main"].views[:len(self.rows)]
 
-    def cache(self, placement, pages: int = 0) -> torch.Tensor:
+    def cache(self, placement, pages: int = 0, stored_only: bool = False) -> torch.Tensor:
         """This rank's layer of the pool, of at least ``pages`` pages: each owned slot at its
-        physical place, NaN elsewhere (SINK_PAGE included)."""
+        physical place, NaN elsewhere (SINK_PAGE included; with ``stored_only``, the step's own slots too)."""
         slots = CP_PAGE // placement.size
         pages = max(pages, max(view.page_idxs[-1] for view in self.views) + 1)
         cache = torch.full((pages, 2, slots, 1, HEAD_DIM), math.nan, device=self.q.device, dtype=self.q.dtype)
         for view, kv in zip(self.views, self.keys, strict=True):
-            for pos in range(view.length):
+            for pos in range(view.length - view.to_compute if stored_only else view.length):
                 offset = pos % CP_PAGE
                 if offset % placement.size == placement.index:
                     page, slot = view.page_idxs[pos // CP_PAGE], offset // placement.size
@@ -427,27 +428,39 @@ class _Case:
 
 
 def _cp_attention(
-    joint: JointGroups, device: torch.device, dtype: torch.dtype, **attention,
+    joint: JointGroups, device: torch.device, dtype: torch.dtype, shard: SequenceShard | None = None,
+    exchange: str = "auto", kv_resource=None, **attention,
 ):
-    """A ``FlashInferManager`` over a placed pool, and this rank's placement."""
+    """A ``FlashInferManager`` over a placed pool, and this rank's placement; under ``shard`` (key
+    ``"shard"``) with its spec's ``exchange``, bound to the KV resource ``kv_resource(placement)``
+    builds (by default one holding only the placement)."""
     kv = KVSpec(resource_key="kv", nodes={NODE}, config=PagedKVConfig(
         num_layers=1, num_kv_heads=1, head_dim=HEAD_DIM, max_seq_len=64, num_qo_heads=Q_HEADS,
         max_num_pages=16, page_size=CP_PAGE, context_parallel=True,
     ))
+    dependencies = {"kv": kv}
+    spec = AttentionSpec(resource_key="attn", nodes={NODE}, config=AttentionConfig(kv_cache="kv", **attention))
+    if shard is not None:
+        spec.shard_key = "shard"
+        dependencies["shard"] = SeqShardSpec("shard", {NODE}, ("main",), 0, exchange=exchange)
     info = EngineResourceInfo(
-        device=device, joint_comm_group=joint, kv_dtype=dtype, dependencies={"kv": kv},
+        device=device, joint_comm_group=joint, kv_dtype=dtype, dependencies=dependencies,
         head_shards=joint.tp_group.world_size,
     )
-    spec = AttentionSpec(resource_key="attn", nodes={NODE}, config=AttentionConfig(kv_cache="kv", **attention))
     attn = AttentionManager.build(spec, info)
-    # the KV resource's one field attention reads
     placement = kv.config.place(joint, "kv")
-    attn.bind_dependencies({"kv": types.SimpleNamespace(placement=placement)})
+    # by default the KV resource's one field attention reads
+    resource = types.SimpleNamespace(placement=placement, bind_sequence_shard=lambda shard: None) \
+        if kv_resource is None else kv_resource(placement)
+    attn.bind_dependencies({"kv": resource, "shard": shard})
     return attn, placement
 
 
-def _plan(attn, case: _Case, slot: int = 0, bucket: BucketKey | None = None, capture=False, **step) -> None:
-    """Plans ``case``, its padding rows as a replay's (a capture's rows are all its own)."""
+def _plan(
+    attn, case: _Case, slot: int = 0, bucket: BucketKey | None = None, capture=False, shard=None, **step,
+) -> None:
+    """Plans ``case``, its padding rows as a replay's (a capture's rows are all its own), and first
+    on ``shard`` (key ``"shard"``) if given."""
     views = case.plan["main"].views
     real = views if capture else case.views
     ctx = StepContext(request_ids=tuple(v.request_id for v in real), graph_walk="w", slot=slot, capture=capture,
@@ -455,17 +468,60 @@ def _plan(attn, case: _Case, slot: int = 0, bucket: BucketKey | None = None, cap
     if len(real) < len(views):
         ctx.set_padded_rids(tuple(v.request_id for v in views))
     ctx.plan_results["kv"] = case.plan
+    if shard is not None:
+        segments = tuple(Segment(v.request_id, "main", v.to_compute) for v in views)
+        ctx.plan_results["shard"] = shard.plan(SeqShardStep(segments=segments), ctx)
     attn.plan(AttentionStep(**step), ctx)
 
 
-def _over_ranks(rank, world, backend, store, over_sp, rows, captured=False, padding=(0, 0), causal=True):
+class _PlacedKV:
+    """The KV resource an attention over a placed pool binds, and its ``AttentionCallable`` writes
+    through: one layer holding ``case``'s stored context, the step's slots NaN until written.
+    ``write_kv`` is ``KVManager``'s own, over a plan addressing each step token as a placed
+    pool's does (``write_slots``) and the cache's own scatter."""
+
+    write_kv = KVManager.write_kv
+
+    def __init__(self, placement, case: _Case):
+        self.placement, self._sequence_shard = placement, None
+        self._default_label, self._default_layer_idx, self._layer_group = "main", 0, [0]
+        self.cache = case.cache(placement, stored_only=True)
+        logical = [(view.page_idxs[pos // CP_PAGE], pos % CP_PAGE) for view in case.plan["main"].views
+                   for pos in range(view.length - view.to_compute, view.length)]
+        pages, offsets = placement.write_slots(*(np.array(a) for a in zip(*logical, strict=True)))
+        page, slot = (torch.as_tensor(a, dtype=torch.long, device=case.q.device) for a in (pages, offsets))
+        self._current_plan_states = {("main", 0): types.SimpleNamespace(
+            ready=None, token_to_page=page, token_to_cache=slot, total_tokens=len(logical),
+        )}
+        self.kv_cache = types.SimpleNamespace(
+            write_tokens=lambda layer_idx, k, v, page_idx, cache_idx: _kv_scatter_nhd_eager(
+                self.cache, k, v, page_idx, cache_idx,
+            ),
+        )
+
+    def bind_sequence_shard(self, shard):
+        self._sequence_shard = shard
+
+    def set_default_label(self, label):
+        self._default_label = label
+
+    def set_default_layer_idx(self, layer_idx):
+        assert layer_idx == 0
+
+    def layer_view(self):
+        return self.cache
+
+
+def _over_ranks(rank, world, backend, store, over_sp, rows, captured=False, padding=(0, 0), causal=True, split=None):
     """One rank of a ``world``-rank placement running ``rows`` through ``FlashInferManager.run``
     against one rank attending every key; every rank issues the same collectives, same shapes.
     ``captured`` (NCCL only) does what production does for a graph bucket: captures ``run`` with
     its collectives on a step of exactly the bucket's tokens on every rank, then plans the step and
     replays it. ``padding``: ``(rows, span)`` of the replay's padding rows, which make its bucket
     larger than the step: on SINK_PAGE as `KVManager` plans them, and NaN in their queries, keys
-    and the sink. ``causal`` is the step's."""
+    and the sink. ``causal`` is the step's. With ``split`` (the shard's ``exchange``, SP placement),
+    the step runs through a sequence shard instead (``_split_step``), whose ring hops pair up rank
+    by rank rather than match."""
     os.environ["MSTAR_WORKSPACE_BUFFER_MB"] = "64" if backend == "nccl" else "1"
     dist.init_process_group(backend, init_method=f"file://{store}", rank=rank, world_size=world)
     torch.set_num_threads(1)
@@ -479,7 +535,7 @@ def _over_ranks(rank, world, backend, store, over_sp, rows, captured=False, padd
     # `CommGroup.all_gather` calls the into-tensor gather it picked at import
     for owner, name in ((dist, "all_to_all_single"), (communication, "_all_gather_into_tensor")):
         def record(*args, _name=name, _call=getattr(owner, name), **kwargs):
-            calls.append((_name, tuple(args[0].shape), tuple(args[1].shape), *(str(a) for a in args[2:])))
+            calls.append((_name, tuple(args[0].shape), tuple(args[1].shape), *args[2:]))
             return _call(*args, **kwargs)
         setattr(owner, name, record)
     group = CommGroup(rank, rank, list(range(world)))
@@ -489,6 +545,12 @@ def _over_ranks(rank, world, backend, store, over_sp, rows, captured=False, padd
         joint = (JointGroups(tp_group=CommGroup.trivial(), sp_group=group) if over_sp
                  else JointGroups(tp_group=group, sp_group=CommGroup.trivial()))
         dtype = torch.bfloat16 if cuda else torch.float32
+        if split is not None:
+            _split_step(joint, device, dtype, split, causal)
+            everyone = [None] * world
+            dist.all_gather_object(everyone, calls)
+            _assert_paired(everyone)
+            return
         attn, placement = _cp_attention(joint, device, dtype)
         case = _Case.build(rows, device, dtype, padding)
         # the slot plans the other kind of step first
@@ -561,6 +623,102 @@ def _over_ranks(rank, world, backend, store, over_sp, rows, captured=False, padd
         # whatever else holds the group
         group.device_group = None
         dist.destroy_process_group()
+
+
+def _split_step(joint: JointGroups, device: torch.device, dtype: torch.dtype, split: str, causal: bool) -> None:
+    """``PREFILL_ROWS`` (odd, rows with and without stored context, one shorter than P, a riding
+    decode row) through a sequence shard and ``AttentionCallable`` over a placed pool whose step
+    slots hold NaN until the step writes them: split by ``split``, then copied on the same node
+    (``min_tokens`` above the step), with the step's ``causal``. Each gathers to one rank's
+    attention, and the sampler's rows are each row's last token of the whole step."""
+    group = joint.sp_group
+    shard = SequenceShard(("main",), 0, None, 0, group, stripe_pool="kv" if split == "ring" else None, device=device)
+    case = _Case.build(PREFILL_ROWS, device, dtype)
+
+    def placed_kv(placement):
+        nonlocal kv
+        kv = _PlacedKV(placement, case)
+        return kv
+
+    kv = None
+    attn, _ = _cp_attention(joint, device, dtype, shard=shard, exchange=split, kv_resource=placed_kv)
+    attend = AttentionCallable(kv, attn)
+    attend.bind_step("main")
+    attend.set_layer_idx(0)
+    q, (k, v) = case.q, case.new_keys()
+    n, tol = q.shape[0], {"atol": 2e-2, "rtol": 2e-2} if device.type == "cuda" else {}
+    for split_it in (True, False):
+        shard.min_tokens = 0 if split_it else n + 1
+        kv.cache = case.cache(kv.placement, stored_only=True)
+        _plan(attn, case, shard=shard, causal=causal)
+        assert (shard.split_range("main") is not None) == split_it
+        if split_it:
+            # a K/V write without attention lands each token on the rank storing it (page 0, the sink, aside)
+            attend.write(*shard.scatter("main", k, v))
+            torch.testing.assert_close(kv.cache[1:], case.cache(kv.placement)[1:], equal_nan=True)
+        # the ring's hops carry queries in their own dtype and partials in the kernel's
+        queries = q.double() if split == "ring" and split_it else q
+        out = shard.gather("main", attend(*shard.scatter("main", queries, k, v)))
+        assert torch.isfinite(out).all(), "a step token's K/V wasn't written"
+        torch.testing.assert_close(out.float(), case.want(causal), **tol)
+        last = attn.select_last_hidden(torch.arange(n, device=device)[:, None])
+        assert last.flatten().tolist() == (np.cumsum([new for _, new in PREFILL_ROWS]) - 1).tolist()
+
+
+def _assert_paired(everyone: list) -> None:
+    """Every rank ran the same collectives in the same order; each all-gather the same shapes, and
+    each all-to-all's counts pair up: what rank a sends b is what b receives from a."""
+    assert everyone[0] and all([c[0] for c in calls] == [c[0] for c in everyone[0]] for calls in everyone), everyone
+    for i, call in enumerate(everyone[0]):
+        if call[0] != "all_to_all_single":
+            assert all(calls[i] == call for calls in everyone), everyone
+            continue
+        # (name, recv shape, send shape, recv counts, send counts)
+        for a, sender in enumerate(everyone):
+            assert [receiver[i][3][a] for receiver in everyone] == sender[i][4], everyone
+
+
+@pytest.mark.parametrize("causal", [True, False])
+@pytest.mark.parametrize("world", [2, 4])
+@pytest.mark.parametrize("split", ["all_gather", "ring"])
+def test_sp_ranks_split_a_step_over_a_placed_pool_like_one_rank(tmp_path, split, world, causal):
+    mp.spawn(_over_ranks, nprocs=world,
+             args=(world, "gloo", str(tmp_path / "store"), True, PREFILL_ROWS, False, (0, 0), causal, split))
+
+
+def test_a_ring_plans_each_partners_first_query_apart_where_it_sees_no_key_here(monkeypatch):
+    """A fresh prompt's first tokens sit before some ranks' first keys: each such query plans as
+    a one-query row over a sink slot, so no causal row holds more queries than keys (which
+    FlashInfer refuses), and a partner holding none of a row plans none of it."""
+    monkeypatch.setenv("MSTAR_WORKSPACE_BUFFER_MB", "1")
+    monkeypatch.setitem(sys.modules, "flashinfer", reference_flashinfer())
+    plans = []
+    paged = sys.modules["flashinfer"].BatchPrefillWithPagedKVCacheWrapper.plan
+
+    def planned(self, qo_indptr=None, *args, seq_lens=None, causal=False, **kwargs):
+        plans.append((np.diff(qo_indptr.numpy()).tolist(), seq_lens.tolist(), causal))
+        return paged(self, qo_indptr, *args, seq_lens=seq_lens, causal=causal, **kwargs)
+
+    monkeypatch.setattr(sys.modules["flashinfer"].BatchPrefillWithPagedKVCacheWrapper, "plan", planned)
+    # the ranks are planned in one process, with no group to connect
+    monkeypatch.setattr(CommGroup, "connect_pairs", lambda self, device: None)
+    world = 4
+    case = _Case.build(((0, 6), (0, 1)), CPU, torch.float32)
+    for rank in range(world):
+        joint = JointGroups(tp_group=CommGroup.trivial(), sp_group=_group(rank, world))
+        shard = SequenceShard(("main",), 0, None, 0, joint.sp_group, stripe_pool="kv")
+        attn, _ = _cp_attention(
+            joint, CPU, torch.float32, shard=shard, exchange="ring", kv_resource=lambda p: _PlacedKV(p, case),
+        )
+        plans.clear()
+        _plan(attn, case, shard=shard)
+        assert len(plans) == world and all(causal for _, _, causal in plans)
+        for j, (queries, keys, _) in enumerate(plans):
+            # partner j holds positions j and j + 4 of the first row, and position 0 of the second if j is 0
+            assert sum(queries) == (2 if j < 2 else 1) + (j == 0), (rank, j, queries)
+            assert all(q <= k for q, k in zip(queries, keys, strict=True)), (rank, j, queries, keys)
+            # a first query this rank has no key at or before: its own row of one, over a sink slot
+            assert (queries[0] == 1 and len(queries) > 1) == (j < rank and j < 2), (rank, j, queries)
 
 
 @pytest.mark.parametrize("size", [2, 3, 4])
@@ -732,12 +890,17 @@ def test_two_ranks_attend_a_placed_pool_like_one_rank_with_the_same_collectives(
 
 def test_a_split_label_reached_outside_an_exchange_is_refused():
     """A layer that writes its K/V itself (``write_target``) or calls ``run`` directly would treat
-    this rank's range as the whole step; it raises on every rank at the first split step."""
+    this rank's range as the whole step, or over a pool stored by head write its TP heads into this
+    rank's slice of them; it raises on every rank at the first such step."""
     shard = SequenceShard(("main",), 0, None, 0, _group(0, P))
     kv = _manager(0, PagedKVConfig(
         num_layers=2, num_kv_heads=2, head_dim=2, max_seq_len=64, num_qo_heads=2, max_num_pages=4, page_size=8,
     ))
     kv.bind_sequence_shard(shard)
+    kv.bind_sequence_shard(shard)
+    # a pool keeps one shard for its writes to check, so a second node's shard would misjudge them
+    with pytest.raises(ValueError, match="two sequence shards"):
+        kv.bind_sequence_shard(SequenceShard(("main",), 0, None, 0, _group(0, P)))
     ctx = StepContext(request_ids=("r0",), graph_walk="w", slot=0, capture=False)
     shard.plan(SeqShardStep(segments=(Segment("r0", "main", 6),)), ctx)
     k = torch.zeros(3, 1, 2)
@@ -749,6 +912,52 @@ def test_a_split_label_reached_outside_an_exchange_is_refused():
     shard.exchanging = True
     with pytest.raises(KeyError):
         kv.write_slots("main")
+    # the pool stores this rank's head slice, so a copied step's direct write would land the TP
+    # heads in it too: only the exchange's head slice may write
+    shard.exchanging = False
+    shard.commit(None, ctx)
+    shard.plan(SeqShardStep(segments=(Segment("r0", "main", 1),)), ctx)
+    assert shard.split_range("main") is None
+    with pytest.raises(ValueError, match="'main', whose KV this rank stores a head slice of, outside an exchange"):
+        kv.write_target(label="main")
+
+    # an attention's run over a placed pool, on either rank, under a lease whose replay pads 6
+    # real tokens to its 16-token bucket, which the step splits 8 and 8
+    lease = SlotLease(0, BucketKey("w", bs=1, num_tokens=16))
+    for rank in range(P):
+        joint = JointGroups(tp_group=CommGroup.trivial(), sp_group=_group(rank, P))
+        shard = SequenceShard(("main",), 0, None, 0, joint.sp_group)
+        attn, _ = _cp_attention(joint, CPU, torch.float32, shard=shard)
+        ctx = StepContext(request_ids=("r0",), graph_walk="w", slot=0, capture=False, slot_lease=lease,
+                          force_prefill=True)
+        shard.plan(SeqShardStep(segments=(Segment("r0", "main", 6),)), ctx)
+        assert shard.split_range("main").counts == (8, 8)
+        q = torch.zeros(8, Q_HEADS, HEAD_DIM)
+        with pytest.raises(ValueError, match="attention run reached label 'main'.*outside an exchange"):
+            attn.run(q, "main", kv_cache_layer=None, k=q[:, :1], v=q[:, :1])
+
+
+def test_a_ring_deployment_loads_with_the_pool_it_stripes_by_planned_before_its_shard(monkeypatch):
+    """The shard's exchange ring makes it depend on the pool whose stored positions it
+    stripes by: the engine takes that edge to a pool stored by position, and plans the pool
+    first whatever the keys' order."""
+    # one rank of the two, with no group to connect
+    monkeypatch.setattr(CommGroup, "connect_pairs", lambda self, device: None)
+    groups = WorkerParallelGroups(num_workers=P, global_rank=0)
+    groups.add_sp(NODE, _group(0, P))
+    specs = [
+        KVSpec(resource_key="kv", nodes={NODE}, config=PagedKVConfig(
+            num_layers=1, num_kv_heads=1, head_dim=HEAD_DIM, max_seq_len=64, num_qo_heads=Q_HEADS, max_num_pages=8,
+            page_size=CP_PAGE,
+        )),
+        AttentionSpec(resource_key="attn", nodes={NODE}, config=AttentionConfig(kv_cache="kv")),
+        SeqShardSpec("a_shard", {NODE}, ("main",), 0),
+    ]
+    apply_yaml_overrides(specs, {"resources": {"kv": {"context_parallel": True}, "a_shard": {"exchange": "ring"}}})
+    engine = Engine(graph_runtime=None)
+    engine.load_model({NODE: _Submodule()}, specs=specs, parallel_groups=groups, device=CPU, transfer_engine_info=None)
+    order = engine._runner.order
+    assert order.index("kv") < order.index("a_shard") < order.index("attn"), order
 
 
 def test_rope_in_a_layer_rotates_a_split_labels_range_at_its_own_positions(monkeypatch):
@@ -1000,6 +1209,16 @@ def test_two_gpus_attend_a_placed_pool_like_one(tmp_path, over_sp, rows, causal,
     mp.spawn(_over_ranks, args=(P, "nccl", str(tmp_path / "store"), over_sp, rows, captured, padding, causal), nprocs=P)
 
 
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 GPUs")
+@pytest.mark.parametrize("split", ["all_gather", "ring"])
+def test_two_gpus_split_a_step_over_a_placed_pool_like_one(tmp_path, split):
+    pytest.importorskip("flashinfer")
+    mp.spawn(
+        _over_ranks, args=(P, "nccl", str(tmp_path / "store"), True, PREFILL_ROWS, False, (0, 0), True, split),
+        nprocs=P,
+    )
+
+
 # a replay's padding rows after the step's, as `KVManager` plans them: none (the bucket's tokens past
 # the step alone), two of 2 tokens, and two of none
 @pytest.mark.parametrize("padding", [(0, 0), (2, 2), (2, 0)], ids=["tail", "rows", "span-0-rows"])
@@ -1167,3 +1386,132 @@ def test_tp_placed_decode_runs_on_tensor_cores_whatever_decode_tensor_cores_says
     attn, _ = _cp_attention(joint, CPU, torch.float32, decode_tensor_cores=False)
     _plan(attn, _Case.build(DECODE_ROWS, CPU, torch.float32))
     assert attn._current_plan_states["main"].context.attn_wrapper.use_tensor_cores
+
+
+# --- the Qwen3-Omni Thinker, its steps split over SP ranks ---------------------------------------
+
+# where the Thinker's KV pool stores its tokens over the SP ranks, and the split steps' exchange
+THINKER_STORAGE = pytest.mark.parametrize("placed, exchange", [
+    pytest.param(False, None, id="by_head-ulysses"),
+    pytest.param(True, "all_gather", id="by_position-all_gather"),
+    pytest.param(True, "ring", id="by_position-ring"),
+])
+
+
+def _thinker_over_ranks(rank, world, store, placed, exchange):
+    """One SP rank of a small Qwen3-Omni Thinker (its real layers: a dense one, MoE ones masking the
+    step's last rows as padding, deepstack, the Talker's layer-N states) over the model's own Thinker
+    declarations, built as the engine builds them. Two steps (a first prefill, then one over stored
+    context with a fresh row and a riding decode row) run split, eager and compiled, and give what
+    they give copied; a split prefill samples each row's last token."""
+    from mstar.engine.resources.base import head_shards
+    from mstar.engine.resources.sequence_shard import sequence_parallel_refusals
+    from mstar.engine.resources.step import SubmoduleStep
+    from mstar.model.components import MoeParallelConfig
+    from mstar.model.qwen3_omni.components.thinker import Qwen3OmniThinkerModel
+    from mstar.model.qwen3_omni.config import THINKER_ATTN, THINKER_KV, THINKER_SHARD, Qwen3OmniModelConfig
+    from mstar.model.qwen3_omni.qwen3_omni_model import Qwen3OmniModel
+
+    dist.init_process_group("gloo", init_method=f"file://{store}", rank=rank, world_size=world)
+    torch.set_num_threads(1)
+    sys.modules["flashinfer"] = reference_flashinfer()
+    manager_mod.KVTransferManager = _StubTransfer
+    group = CommGroup(rank, rank, list(range(world)))
+    group.device_group, group.initialized = dist.group.WORLD, True
+    try:
+        cfg = Qwen3OmniModelConfig()
+        tc = cfg.thinker_text
+        tc.vocab_size, tc.hidden_size, tc.num_hidden_layers = 8, 2 * HEAD_DIM, 3
+        tc.num_attention_heads, tc.num_key_value_heads, tc.head_dim = 4, 2, HEAD_DIM
+        tc.num_experts, tc.num_experts_per_tok, tc.moe_intermediate_size = 4, 2, 16
+        tc.intermediate_size, tc.mlp_only_layers = 32, [0]
+        cfg.talker.accept_hidden_layer = 1
+        thinker = Qwen3OmniThinkerModel(cfg, moe_parallel=MoeParallelConfig(mask_padding=True))
+        gen = torch.Generator().manual_seed(0)
+        with torch.no_grad():
+            for p in thinker.parameters():
+                # norms 1, weights at unit gain
+                gain = p.shape[-1] ** -0.5
+                p.copy_(torch.ones_like(p) if p.dim() == 1 else torch.randn(p.shape, generator=gen) * gain)
+
+        omni = object.__new__(Qwen3OmniModel)
+        omni.config = cfg
+        keys = (THINKER_KV, THINKER_ATTN, THINKER_SHARD)
+        specs = [spec for spec in omni.get_node_resources() if spec.resource_key in keys]
+        overrides = {
+            THINKER_KV: dict(max_num_pages=32, page_size=CP_PAGE, max_seq_len=64, context_parallel=placed),
+            **({THINKER_SHARD: dict(exchange=exchange)} if exchange else {}),
+        }
+        apply_yaml_overrides(specs, {"resources": overrides})
+        # the engine's order: derive, then the SP refusals
+        by_key = resolve_spec_dependencies(specs)
+        assert sequence_parallel_refusals(specs, "Thinker", 1, world) == []
+        joint = JointGroups(tp_group=CommGroup.trivial(), sp_group=group)
+
+        # (rid, tokens) per step: two first prefills, then their next tokens beside a fresh prompt,
+        # one row a decode; 13 tokens, the last 2 the MoE's padding
+        steps = [(("r0", 5), ("r1", 6)), (("r0", 2), ("r1", 1), ("r2", 10))]
+        inputs = []
+        for rows in steps:
+            n = sum(span for _, span in rows)
+            hidden, cos, sin = (torch.randn(n, d, generator=gen) for d in (tc.hidden_size, HEAD_DIM, HEAD_DIM))
+            # vision features on every third row
+            deepstack = [torch.randn(n, tc.hidden_size, generator=gen) * (torch.arange(n)[:, None] % 3 == 0)
+                         for _ in range(2)]
+            inputs.append(dict(input_embeds=hidden, cos_sin_3d=(cos, sin), deepstack_visual_embeds=deepstack,
+                               num_valid_tokens=torch.tensor([n - 2])))
+
+        def run(split: bool, compiled: bool) -> list[torch.Tensor]:
+            res = {
+                key: build_resource(spec, EngineResourceInfo(
+                    device=CPU, joint_comm_group=joint, kv_dtype=torch.float32, nodes=frozenset(spec.nodes),
+                    dependencies={dep: by_key[dep] for dep in spec.depends_on()},
+                    head_shards=head_shards(joint, placed),
+                ))
+                for key, spec in by_key.items()
+            }
+            for key, spec in by_key.items():
+                res[key].bind_dependencies({dep: res[dep] for dep in spec.depends_on()})
+            for module in thinker.modules():
+                if hasattr(module, "bind_resources"):
+                    module.bind_resources(res)
+            res[THINKER_SHARD].min_tokens = 0 if split else 1 << 20
+            runner = StepRunner(res)
+            for rid in ("r0", "r1", "r2"):
+                runner.ingest_request(rid, {THINKER_KV: KVReqConfig(needed_labels=["main"])})
+            torch._dynamo.reset()
+            forward = torch.compile(thinker, backend="eager") if compiled else thinker
+            out = []
+            for rows, step_inputs in zip(steps, inputs, strict=True):
+                step = SubmoduleStep(
+                    segments=[Segment(rid, "main", span) for rid, span in rows],
+                    steps={
+                        THINKER_KV: KVStep(), THINKER_ATTN: AttentionStep(causal=True), THINKER_SHARD: SeqShardStep(),
+                    },
+                )
+                step.set_ctx(StepContext(request_ids=tuple(rid for rid, _ in rows), graph_walk="prefill_text",
+                                         slot=0, capture=False))
+                assert runner.admit(step).ok
+                runner.plan(step)
+                assert (res[THINKER_SHARD].split_range("main") is not None) == split
+                with torch.no_grad():
+                    hidden, layer_0, layer_n = forward(**step_inputs)
+                # what the Thinker samples a prefill from: each row's last token of the whole step
+                ends = torch.tensor([span for _, span in rows]).cumsum(0) - 1
+                torch.testing.assert_close(res[THINKER_ATTN].select_last_hidden(hidden), hidden[ends])
+                runner.commit(step)
+                out += [hidden, layer_0, layer_n]
+            return out
+
+        copied = run(split=False, compiled=False)
+        for compiled in (False, True):
+            for got, want in zip(run(split=True, compiled=compiled), copied, strict=True):
+                torch.testing.assert_close(got, want, rtol=1e-5, atol=1e-5)
+    finally:
+        group.device_group = None
+        dist.destroy_process_group()
+
+
+@THINKER_STORAGE
+def test_two_ranks_split_the_thinkers_steps_like_they_run_copied(tmp_path, placed, exchange):
+    mp.spawn(_thinker_over_ranks, args=(P, str(tmp_path / "store"), placed, exchange), nprocs=P)

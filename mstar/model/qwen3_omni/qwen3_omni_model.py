@@ -57,6 +57,7 @@ from mstar.engine.resources import (
     ResourceReqConfig,
     SamplerSpec,
     SamplingReqConfig,
+    SeqShardSpec,
 )
 from mstar.graph.base import GraphEdge, GraphNode, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
@@ -98,6 +99,7 @@ from mstar.model.qwen3_omni.config import (
     THINKER_MIXED,
     THINKER_POS,
     THINKER_SAMPLER,
+    THINKER_SHARD,
     THINKER_TEXT_DECODE,
     VISION_ATTN,
 )
@@ -332,6 +334,9 @@ class Qwen3OmniModel(Model):
                     kv_cache=THINKER_KV
                 )
             ),
+            # every walk may split; over KV stored by position only where the deployment sets the
+            # shard's exchange to all_gather or ring. A decode step never does.
+            SeqShardSpec(resource_key=THINKER_SHARD, nodes={"Thinker"}, labels=("main",), axis=0),
             PositionSpec(
                 resource_key=TALKER_POS,
                 nodes={"Talker"},

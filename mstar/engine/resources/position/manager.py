@@ -396,11 +396,10 @@ class RopeManager(PositionManager):
             placed = pos_ids_out[plan_label] = self._place(pos_ids, plan_label, lease)
             r = None if shard_plan is None else shard_plan.ranges.get(plan_label)
             if r is not None:
-                # a view, so a captured graph reads the slot's buffer. A packed replay's range
-                # covers its bucket's padding too, which the buffer holds
+                # a view of a contiguous range, so a captured graph reads the slot's buffer. A packed
+                # replay's range covers its bucket's padding too, which the buffer holds
                 split_out[plan_label] = (
-                    placed.narrow(0, r.start, r.count) if r.rows is None
-                    else placed[: r.rows * sum(r.counts)].view(r.rows, -1).narrow(1, r.start, r.count)
+                    r.local(placed) if r.rows is None else r.local(placed[: r.rows * sum(r.counts)].view(r.rows, -1), 1)
                 )
         self._preplanned = ctx.is_preplan
         return pos_ids_out

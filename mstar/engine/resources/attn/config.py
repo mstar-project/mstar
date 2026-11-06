@@ -8,7 +8,7 @@ import logging
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal, get_args
 
 from mstar.engine.resources.kv.config import KVConfig, KVLayout, PagedKVConfig
 from mstar.engine.resources.spec import CombinedSplit, NodeResourceSpec
@@ -77,6 +77,10 @@ class AttentionConfig:
                 raise ValueError(f"layers must be distinct layers, at least one; got {self.layers}")
 
 
+SpExchange = Literal["none", "ulysses", "all_gather", "ring"]
+SP_EXCHANGES: tuple[SpExchange, ...] = get_args(SpExchange)
+
+
 @dataclass
 class AttentionSpec(NodeResourceSpec):
     config: AttentionConfig
@@ -96,10 +100,11 @@ class AttentionSpec(NodeResourceSpec):
 
         return take_shard_edge(self, specs)
 
-    @property
-    def attends_split_steps(self) -> bool:
-        # its exchange follows from its pool's storage
-        return True
+    def resolve_exchange(self, specs: Mapping[str, NodeResourceSpec]) -> SpExchange:
+        """Its node's sequence shard's ``exchange`` over its pool's storage."""
+        from mstar.engine.resources.sequence_shard import shard_exchange
+
+        return shard_exchange(self, specs, bool(specs[self.config.kv_cache].places_positions))
 
     def combined_splits(self) -> tuple[CombinedSplit, ...]:
         return self.config.splits

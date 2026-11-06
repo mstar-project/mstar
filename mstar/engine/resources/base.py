@@ -93,7 +93,7 @@ class EngineResourceInfo:
     # how many ways the node's ranks split its attention heads, which each builder sizes head counts
     # by; None for every TP and SP rank (`head_shards`), which the engine narrows for a node that
     # places positions over its SP ranks. A ragged resource splits over TP only, unless it declares
-    # ``RaggedAttentionSpec.sp_exchange``.
+    # ``RaggedAttentionSpec.sp_exchange`` on a node whose steps split.
     head_shards: int | None = None
 
     def __post_init__(self):

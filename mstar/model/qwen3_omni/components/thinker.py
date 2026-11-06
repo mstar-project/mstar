@@ -36,7 +36,7 @@ from mstar.model.components import (
 )
 from mstar.model.components.distributed import ParallelGatedMLP
 from mstar.model.qwen3_omni.components.attention import Qwen3OmniAttention
-from mstar.model.qwen3_omni.config import THINKER_ATTN, THINKER_KV, THINKER_POS, Qwen3OmniModelConfig
+from mstar.model.qwen3_omni.config import THINKER_ATTN, THINKER_KV, THINKER_POS, THINKER_SHARD, Qwen3OmniModelConfig
 
 
 class Qwen3OmniThinkerLayer(nn.Module):
@@ -198,6 +198,12 @@ class Qwen3OmniThinkerModel(MoeParallelMixin, nn.Module):
         self.lm_head = nn.Linear(tc.hidden_size, tc.vocab_size, bias=False)
 
         self.init_moe_parallel(moe_parallel)
+        self.shard = None
+
+    def bind_resources(self, resources: dict) -> None:
+        """The node's sequence shard, which brackets the layer stack. See
+        ``NodeSubmodule.bind_node_resources``."""
+        self.shard = resources.get(THINKER_SHARD)
 
     def _deepstack_process(
         self, hidden_states: torch.Tensor, visual_embeds: torch.Tensor
@@ -245,7 +251,17 @@ class Qwen3OmniThinkerModel(MoeParallelMixin, nn.Module):
         hidden_states = input_embeds.clone()
         layer_0_embed = input_embeds if keep_states else None
         layer_n_hidden = None
+        # over the whole step: its padding rows are its last
         token_valid = self.moe_token_valid(hidden_states, num_valid_tokens)
+        if self.shard is not None:
+            # A step split over the SP ranks runs the stack on this rank's range of its
+            # tokens; attention exchanges what it needs. Identity on a copied step.
+            cos, sin = cos_sin_3d if cos_sin_3d is not None else (None, None)
+            hidden_states, cos, sin, token_valid, *deepstack = self.shard.scatter(
+                label, hidden_states, cos, sin, token_valid, *(deepstack_visual_embeds or ()),
+            )
+            cos_sin_3d = None if cos is None else (cos, sin)
+            deepstack_visual_embeds = deepstack or None
 
         # The label and layer index are cursors on the shared resources: bind
         # the label once, advance the index per layer. Passing them as
@@ -277,5 +293,8 @@ class Qwen3OmniThinkerModel(MoeParallelMixin, nn.Module):
 
         # Final layer norm
         hidden_states, _ = self.model.norm.forward_residual(hidden_states, residual)
+        if self.shard is not None:
+            # the head, sampling and the Talker's states read every token
+            hidden_states, layer_n_hidden = self.shard.gather(label, hidden_states, layer_n_hidden)
 
         return hidden_states, layer_0_embed, layer_n_hidden

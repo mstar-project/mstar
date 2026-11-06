@@ -710,15 +710,19 @@ class KVSpec(NodeResourceSpec):
         return self.config.context_parallel if isinstance(self.config, PagedKVConfig) else None
 
     def split_step_refusals(self, node: str, shard: "SeqShardSpec", tp: int, sp: int) -> list[str]:
-        # stored by head, a split step's tokens trade for heads over every TP and SP rank (Ulysses)
+        # stored by position, a split step's packed tokens are gathered or passed round; stored by
+        # head, they trade for heads over every TP and SP rank (Ulysses)
         cfg = self.config
         if not isinstance(cfg, PagedKVConfig):
             return []
         if cfg.context_parallel:
-            return [
-                f"node {node!r} splits tokens over {sp} SP ranks, and KV {self.resource_key!r} stores them by "
-                "position (context_parallel), which split steps don't support yet: store it by head"
-            ]
+            if shard.axis == 1:
+                return [
+                    f"node {node!r} splits each row of its steps (axis 1) over {sp} SP ranks, and KV "
+                    f"{self.resource_key!r} stores them by position (context_parallel), which takes a packed "
+                    "split (axis 0) only"
+                ]
+            return []
         q, kv = cfg._unsharded_qo_heads, cfg._unsharded_kv_heads
         if q % tp or kv % tp or (q // tp) % sp or (kv // tp) % sp:
             return [

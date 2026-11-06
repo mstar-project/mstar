@@ -6,6 +6,9 @@ fakes (causal SDPA over the accumulated K/V with GQA, and textbook RoPE), so
 one prefill plus a few decode steps are compared logit for logit.
 """
 
+import sys
+import types
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -15,6 +18,7 @@ pytest.importorskip("transformers")
 from transformers import Qwen3Config, Qwen3ForCausalLM  # noqa: E402
 
 from mstar.distributed.communication import CommGroup  # noqa: E402
+from mstar.engine.resources.convenience import AttentionCallable  # noqa: E402
 from mstar.model.components.qwen3_lm import Qwen3DenseLM, Qwen3LMConfig  # noqa: E402
 
 ATTN, KV, POS = "attn", "kv", "rope"
@@ -268,3 +272,29 @@ def test_the_position_resource_says_when_a_layer_may_fuse_its_rope(overrides, he
         device=torch.device("cpu"), head_dim=head_dim,
     )
     assert rope.fusable_rope_theta(head_dim) == (1e6 if fusable else None)
+
+
+@pytest.mark.parametrize("splits", [False, True])
+def test_a_layer_whose_steps_may_split_writes_its_kv_through_the_exchange(monkeypatch, splits):
+    """The fused norm/RoPE/KV-write kernel writes where ``write_target`` says, outside the
+    exchange a node whose steps may split over SP ranks attends through (which hands the write
+    this rank's tokens and heads), so such a layer rotates in place and calls ``attend``."""
+    calls = []
+    monkeypatch.setitem(sys.modules, "mstar.utils.attention", types.SimpleNamespace(
+        qk_norm_rope_inplace=lambda *args: calls.append("rotate"),
+        qk_norm_rope_kv_write=lambda *args: calls.append("fused_write"),
+    ))
+
+    class Attend:
+        # Ulysses' plan states attend only the pages: reads_step_kv is False
+        attn = types.SimpleNamespace(splits=splits, reads_step_kv=lambda: False, run=lambda q, kv_cache_layer: q)
+        kv = types.SimpleNamespace(write_target=lambda: (None, None, None, 4), layer_view=lambda: None)
+
+        def __call__(self, q, k, v):
+            calls.append("attend")
+            return q
+
+    norm = types.SimpleNamespace(variance_epsilon=1e-6, weight=None)
+    x = torch.zeros(4, 2, 8)
+    AttentionCallable.norm_rope_attend(Attend(), x, x, x, norm, norm, None, 1e6)
+    assert calls == (["rotate", "attend"] if splits else ["fused_write"])

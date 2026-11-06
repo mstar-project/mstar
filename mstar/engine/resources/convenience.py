@@ -71,10 +71,16 @@ class AttentionCallable:
             return self.attn.exchange(self._attend, q, k, v)
         return self._attend(q, k, v)
 
-    def _attend(self, q: torch.Tensor | None, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor | None:
-        # q None: the write alone, as the exchanges hand it on
+    def _attend(
+        self, q: torch.Tensor | None, k: torch.Tensor, v: torch.Tensor, tokens: torch.Tensor | None = None,
+    ) -> torch.Tensor | None:
+        # q None: the write alone. `tokens`: which of the step's tokens k and v are, named only by
+        # the ring's exchange (`sequence_shard.ring`), so a stand-in KV needn't take it
         if self.attn.requires_kv_write:
-            self.kv.write_kv(k, v)
+            if tokens is None:
+                self.kv.write_kv(k, v)
+            else:
+                self.kv.write_kv(k, v, tokens=tokens)
         if q is None:
             return None
         return self.attn.run(q, kv_cache_layer=self.kv.layer_view(), k=k, v=v)
@@ -94,9 +100,10 @@ class AttentionCallable:
         from mstar.utils.attention import qk_norm_rope_inplace, qk_norm_rope_kv_write
 
         eps = _norm_eps(q_norm, k_norm)
-        # the fused kernel leaves k as it was, so a step that attends its k and v needs them
-        # normed and rotated in place
-        if self.attn.reads_step_kv():
+        # the fused write would bypass the exchange a node whose steps may split over SP ranks
+        # attends through (`_exchanged`); and it leaves k as it was, so a step that attends its k
+        # and v needs them normed and rotated in place
+        if self.attn.splits or self.attn.reads_step_kv():
             qk_norm_rope_inplace(q, k, q_norm.weight, k_norm.weight, pos_ids, *eps, rope_theta)
             return self(q, k, v)
         layer, page_idx, slot_idx, n = self.kv.write_target()
@@ -119,7 +126,8 @@ class AttentionCallable:
         from mstar.utils.attention import qk_norm_rope_table_kv_write
 
         eps = _norm_eps(q_norm, k_norm)
-        if not q.is_cuda or self.attn.reads_step_kv():
+        # unfused where the write would bypass the exchange too (`norm_rope_attend`)
+        if not q.is_cuda or self.attn.splits or self.attn.reads_step_kv():
             cos, sin = (t[: q.shape[0], None] for t in cos_sin)
             q, k = (
                 _rotate_half_rope(norm(x.reshape(-1, x.shape[-1])).view(x.shape), cos, sin)

@@ -140,7 +140,7 @@ class _RaggedSpecBase(NodeResourceSpec):
     shard_key: str | None = field(default=None, init=False, repr=False)
     # how a split label's tokens reach the heads: declared on self-attention (`RaggedAttentionSpec`),
     # derived per pair on cross-attention
-    sp_exchange = None
+    sp_exchange = "none"
 
     def depends_on(self) -> set[str]:
         return set() if self.shard_key is None else {self.shard_key}
@@ -184,31 +184,40 @@ class RaggedAttentionSpec(_RaggedSpecBase):
     """Cacheless self-attention within each declared span (``AttentionStep``).
 
     ``sp_exchange="ulysses"`` attends a label its node's sequence shard splits by Ulysses (one
-    all-to-all from split tokens to split heads, and back), and shards heads over every TP and SP
-    rank, slicing them on a copied step. None (the default) attends only copied labels, heads over
-    TP. A no-op on a node with no ``SeqShardSpec``. On SP ranks every label of an ``sp_exchange``
-    resource goes through an exchange, so ``run(..., return_lse=True)`` raises there."""
+    all-to-all from split tokens to split heads, and back). On a node whose shard splits
+    (``SeqShardSpec.splits``) it shards heads over every TP and SP rank, slicing them on a copied
+    step. On SP ranks of such a node every label goes through an exchange, so
+    ``run(..., return_lse=True)`` raises there.
+    ``"none"`` (the default) attends only copied labels, heads over TP. ``ulysses`` is a no-op on a
+    node with no ``SeqShardSpec``, or one whose sequence shard never splits."""
 
-    sp_exchange: Literal["ulysses"] | None = None
+    sp_exchange: Literal["none", "ulysses"] = "none"
 
     def __post_init__(self):
         super().__post_init__()
-        if self.sp_exchange not in (None, "ulysses"):
-            raise ValueError(f"sp_exchange must be 'ulysses' or None, not {self.sp_exchange!r}")
+        if self.sp_exchange not in ("none", "ulysses"):
+            raise ValueError(f"sp_exchange must be 'none' or 'ulysses', not {self.sp_exchange!r}")
 
     def derive(self, specs: Mapping[str, NodeResourceSpec]) -> list[str]:
         from mstar.engine.resources.sequence_shard import take_shard_edge
 
         return take_shard_edge(self, specs)
 
-    @property
-    def attends_split_steps(self) -> bool:
-        return self.sp_exchange is not None
+    def resolve_exchange(self, specs: Mapping[str, NodeResourceSpec]) -> Literal["none", "ulysses"]:
+        return self.sp_exchange
 
     def split_step_refusals(self, node: str, shard: "SeqShardSpec", tp: int, sp: int) -> list[str]:
         cfg = self.config
         q, kv = cfg._unsharded_qo_heads, cfg._unsharded_kv_heads
-        if self.sp_exchange == "ulysses" and (q % (tp * sp) or kv % (tp * sp)):
+        if self.sp_exchange != "ulysses":
+            return []
+        if shard.stripe_pool is not None:
+            return [
+                f"ragged attention {self.resource_key!r} declares sp_exchange 'ulysses', whose plan reads a split "
+                f"label's tokens in step order, and node {node!r}'s sequence shard stripes them by KV "
+                f"{shard.stripe_pool!r}'s positions (its exchange ring)"
+            ]
+        if q % (tp * sp) or kv % (tp * sp):
             return [
                 f"ragged attention {self.resource_key!r} declares sp_exchange 'ulysses', and its {q} query and "
                 f"{kv} KV heads don't split over {tp} TP x {sp} SP ranks"

@@ -47,7 +47,7 @@ from mstar.engine.resources.kv.keys import fingerprint
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.engine.resources.lora.config import LoraBaseOnly, node_capture_key
 from mstar.engine.resources.resident import ResidentPlanner, build_planner
-from mstar.engine.resources.sequence_shard import sequence_parallel_refusals
+from mstar.engine.resources.sequence_shard import SeqShardSpec, sequence_parallel_refusals
 from mstar.engine.resources.spec import resolve_spec_dependencies
 from mstar.engine.resources.step import (
     ADMIT_OK,
@@ -647,7 +647,7 @@ class Engine:
                 raise ValueError("; ".join(refusals))
             placed = sp > 1 and any(position_pools(specs, node).values())
             shards[node] = head_shards(group, placed)
-            if sp > 1 and any(spec.splits_steps and node in spec.nodes for spec in specs):
+            if sp > 1 and any(isinstance(spec, SeqShardSpec) and spec.splits and node in spec.nodes for spec in specs):
                 splitting.add(node)
 
         for spec in specs:
@@ -666,7 +666,7 @@ class Engine:
                 raise ValueError(
                     f"resource {spec.resource_key!r} serves nodes that split heads different ways "
                     f"({ {node: shards[node] for node in sorted(relevant_nodes)} }): one places its KV "
-                    "positions over its SP ranks and another splits its steps over them (SeqShardSpec)"
+                    "positions over its SP ranks and another keeps KV by head over them"
                 )
             joint_comm_group = parallel_groups.get_joint_group_for_node(first_node)
             self._resources[spec.resource_key] = build_resource(

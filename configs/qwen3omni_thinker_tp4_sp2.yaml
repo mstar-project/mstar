@@ -1,0 +1,33 @@
+model: "qwen3_omni"
+max_seq_len: 32768
+# The Thinker on 8 GPUs, 4 TP ranks x 2 SP ranks, for long prompts. Its KV pool is
+# stored by position over each SP pair (context_parallel), and a prefill of at least
+# min_tokens tokens splits over the pair: each rank runs the layers on its half of the
+# tokens and attention gathers q, k and v (the shard's exchange all_gather; with its
+# default, auto, a pool stored by position runs every step copied). Estimated from the Thinker's geometry,
+# unmeasured: at 2 SP ranks the MoE sets the step's peak memory, so ring would save
+# nothing. Shorter prefills and decode run copied on both ranks, each attending its
+# half of the stored context, merged. Chunked prefill is off on SP nodes, so a prompt
+# prefills in one step. Pending GPU validation.
+resources:
+  thinker_kv:
+    context_parallel: true
+    # rank 0 decides each prefix hit for the 8 ranks; without it the cache is off
+    prefix_cache_tp: true
+  thinker_shard:
+    # placeholder, unmeasured. A captured prefill splits on its bucket's size, not its
+    # prompt's.
+    min_tokens: 8192
+    exchange: all_gather
+node_groups:
+  # TP groups {0..3} and {4..7}; SP pairs {0,4}, {1,5}, {2,6}, {3,7}
+  - node_names: [Thinker]
+    ranks: [0, 1, 2, 3, 4, 5, 6, 7]
+    tp_size: 4
+    sp_size: 2
+
+  - node_names: [audio_encoder, vision_encoder]
+    ranks: [0]
+
+  - node_names: [Talker, Code2Wav]
+    ranks: [7]

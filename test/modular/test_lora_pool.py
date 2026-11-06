@@ -488,9 +488,9 @@ def test_a_lora_refusal_does_not_look_for_an_eviction_victim(caplog):
 
 
 def test_lora_under_sequence_parallelism(adapters):
-    """LoRA rows are per request, not per SP shard: the build takes TP with SP 1, and a node that
-    places its KV positions over its SP ranks (heads split over TP alone), which runs every row on
-    every SP rank; a node splitting its steps over them is refused before the build."""
+    """LoRA rows are per request, not per SP shard: the build takes TP with SP 1, and a node whose
+    steps run copied over KV placed over its SP ranks (heads split over TP alone), which runs every
+    row on every SP rank; a node splitting its steps over them is refused before the build."""
     from mstar.distributed.communication import CommGroup, JointGroups
     from mstar.engine.resources.sequence_shard import SeqShardSpec, sequence_parallel_refusals
 
