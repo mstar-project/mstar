@@ -299,7 +299,7 @@ def _move() -> float:
     bound = TABLE.bound()
     _ahead[0] = bound + W
     for w in pending:
-        if w.kind is AHEAD and bound + W >= w.deadline and wake(w):
+        if w.kind is AHEAD and bound + W >= w.deadline and wake(w, thaw=False):
             w.release()
     meet = any(w.kind is MEET for w in pending)  # a rank at a meet takes no moves; what is due still ends
     timeout = _MAX_SLEEP
@@ -497,38 +497,44 @@ def _settled() -> float:
 
 def read() -> float:
     """A clock read by mstar: publishes a running clock, and holds a thread that has got more
-    than W past the bound, until the bound rises (clause 2). It is blocked meanwhile, so its
-    process's clock stands still once every thread is, and the slowest process is never held.
-    Not a read made inside this module's own bookkeeping (a GC callback that runs while LOCK is
-    held): the mover needs LOCK to let it go."""
+    than W past the bound, until the bound rises (clause 2), and reads again: what it returns is
+    always a time it checked. Not a read made inside this module's own bookkeeping (a GC callback
+    that runs while LOCK is held): the mover needs LOCK to let it go."""
     clock.READS[0] += 1
     if clock.PARKED[0] and not LOCK._is_owned():
         with LOCK:
             _unpark()
-    t = clock.now()
-    TABLE.tick(t)
-    epochs = TABLE.epochs()  # a change of state anywhere can lower the bound: look again (0.6 us)
-    if epochs != _seen[0]:
-        _seen[0] = epochs
-        _ahead[0] = TABLE.bound() + W
-    if (t > _ahead[0] and threading.get_ident() in _counted and not getattr(clock._tls, "computing", 0)
-            and not LOCK._is_owned()):
+    while True:
+        t = clock.now()
+        TABLE.tick(t)
+        epochs = TABLE.epochs()
+        if epochs != _seen[0]:  # a change of state anywhere can lower the bound: look again
+            _seen[0] = epochs
+            _ahead[0] = -math.inf
+        if (t <= _ahead[0] or threading.get_ident() not in _counted or getattr(clock._tls, "computing", 0)
+                or LOCK._is_owned()):
+            return t
         bound = TABLE.bound()
         _ahead[0] = bound + W
-        if t > bound + W:
-            lock = _real_lock()
-            lock.acquire()
-            w = enter(AHEAD, t, release=lock.release)
-            REPORT["ahead_stalls"] += 1
-            try:  # the mover lets it go; it looks too, as the mover is gone at interpreter exit
-                end = clock._real() + HELD_LIMIT
-                while not lock.acquire(True, _MAX_SLEEP) and TABLE.bound() + W < t:
-                    if clock._real() > end:
-                        _held_too_long(t)
-            finally:
-                leave(w)
-            t = clock.now()
-    return t
+        if t <= _ahead[0]:
+            return t
+        _hold(t)
+
+
+def _hold(t: float) -> None:
+    """This thread waits for the bound to reach ``t``. It is blocked meanwhile, so its process's
+    clock stands still once every thread is, and the slowest process is never held."""
+    lock = _real_lock()
+    lock.acquire()
+    w = enter(AHEAD, t, release=lock.release)
+    REPORT["ahead_stalls"] += 1
+    try:  # the mover lets it go; it looks too, as the mover is gone at interpreter exit
+        end = clock._real() + HELD_LIMIT
+        while not lock.acquire(True, _MAX_SLEEP) and TABLE.bound() + W < t:
+            if clock._real() > end:
+                _held_too_long(t)
+    finally:
+        leave(w)
 
 
 def _held_too_long(t: float) -> None:

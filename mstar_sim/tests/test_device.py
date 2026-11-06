@@ -1016,10 +1016,14 @@ def test_a_process_beside_two_ranks_stays_within_w_of_them():
         dist.destroy_process_group()
     """
     _, _, poller = run_deployment(rank % (0, 0), rank % (1, 1), """
+        leave = waits.leave  # a loaded box, slow to run a thread the mover has let go
+        late = lambda w: w is not None and w.kind is waits.AHEAD
+        waits.leave = lambda w: (waits._real_sleep(0.006) if late(w) else None, leave(w))[1]
         barrier()
         table, ahead = waits.TABLE, 0.0
         while len([f for f in os.listdir(TMP) if f.startswith("ranks-done")]) < 2:
             time.sleep(0.002)
+            waits._real_sleep(0.001)  # the box takes the thread a moment, past W: this read is held
             now = time.perf_counter()  # a read, as mstar's: clause 2 bounds a process at its reads
             latest = table.latest()
             if latest:  # (0: the ranks have gone)
