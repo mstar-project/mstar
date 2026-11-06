@@ -57,6 +57,7 @@ from mstar.model.multimodal import (
     parts_from_modalities,
     text_combined_walks,
 )
+from mstar.model.rebuild import RebuildPolicy
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.model.utils import TextOutput, load_generation_defaults
 
@@ -193,6 +194,12 @@ class MultimodalDecoderModel(Model):
     def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
         # the prefill emits the first of max_output_tokens, so the loop runs one fewer
         return {"decode_loop": max(1, self.get_max_output_tokens(**model_kwargs) - 1)}
+
+    def rebuild_policies(self) -> dict[str, RebuildPolicy]:
+        # A dropped text request reprefills its ids on the text walk. A media prompt prefills on
+        # its media walk, which keeps no ids, so the KV cache never drops it.
+        return {"LLM": RebuildPolicy(walk="prefill_text", ids_input="text_inputs", sample_output="new_token",
+                                     loop="decode_loop")}
 
     # -----------------------------------------------------------------------
     # KV layout
