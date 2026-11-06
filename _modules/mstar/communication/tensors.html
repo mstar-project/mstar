@@ -410,7 +410,7 @@ window.runMermaid = runMermaid;</script>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Nov 05, 2026"/>
+    <meta name="docbuild:last-update" content="Nov 06, 2026"/>
   
     
     <script src="../../../_static/searchtools.js"></script>
@@ -1639,12 +1639,18 @@ window.runMermaid = runMermaid;</script>
             <span class="k">raise</span> <span class="ne">NotImplementedError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"Unknown protocol </span><span class="si">{</span><span class="n">protocol</span><span class="si">}</span><span class="s2"> for mooncake"</span><span class="p">)</span>
 
         <span class="bp">self</span><span class="o">.</span><span class="n">_engine</span> <span class="o">=</span> <span class="n">TransferEngine</span><span class="p">()</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">_engine</span><span class="o">.</span><span class="n">initialize</span><span class="p">(</span>
+        <span class="c1"># a bad device or fabric is a return code, not a raise</span>
+        <span class="n">ret</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_engine</span><span class="o">.</span><span class="n">initialize</span><span class="p">(</span>
             <span class="n">hostname</span><span class="p">,</span>
             <span class="n">metadata_server</span><span class="p">,</span>
             <span class="n">protocol</span><span class="o">.</span><span class="n">value</span><span class="o">.</span><span class="n">lower</span><span class="p">(),</span>
             <span class="n">transfer_device</span><span class="p">,</span>
         <span class="p">)</span>
+        <span class="k">if</span> <span class="n">ret</span> <span class="o">!=</span> <span class="mi">0</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">SystemExit</span><span class="p">(</span>
+                <span class="sa">f</span><span class="s2">"Mooncake TransferEngine initialize failed (rc=</span><span class="si">{</span><span class="n">ret</span><span class="si">}</span><span class="s2">) for "</span>
+                <span class="sa">f</span><span class="s2">"hostname=</span><span class="si">{</span><span class="n">hostname</span><span class="si">!r}</span><span class="s2"> protocol=</span><span class="si">{</span><span class="n">protocol</span><span class="o">.</span><span class="n">value</span><span class="si">}</span><span class="s2"> device=</span><span class="si">{</span><span class="n">transfer_device</span><span class="si">!r}</span><span class="s2">"</span>
+            <span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_session_id</span> <span class="o">=</span> <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">hostname</span><span class="si">}</span><span class="s2">:</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">_engine</span><span class="o">.</span><span class="n">get_rpc_port</span><span class="p">()</span><span class="si">}</span><span class="s2">"</span>
 
 <div class="viewcode-block" id="MooncakeTransferEngine.register_memory">
@@ -4265,7 +4271,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Nov 05, 2026.
+  Last updated on Nov 06, 2026.
   <br/>
 </p>
   </div>

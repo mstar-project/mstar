@@ -55,7 +55,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Nov 05, 2026"/>
+    <meta name="docbuild:last-update" content="Nov 06, 2026"/>
   
     
     <script src="_static/searchtools.js"></script>
@@ -2145,7 +2145,10 @@ size with its aspect ratio kept, center-cropped and rounded to 8 bits, as in
 NVIDIA’s cosmos-framework and diffusers 0.40 and later. Setting
 <code class="docutils literal notranslate"><span class="pre">conditioning_resize:</span> <span class="pre">stretch</span></code> under the config YAML’s <code class="docutils literal notranslate"><span class="pre">model_kwargs</span></code>
 resizes it to the output size instead (antialiased bilinear, aspect ratio not
-kept), as diffusers 0.39 did. Action requests ignore the setting.</p>
+kept), as diffusers 0.39 did. Action requests ignore the setting. The image
+pins the first latent frame, so the request must ask for a video of more than
+one latent frame (<code class="docutils literal notranslate"><span class="pre">num_frames</span></code> above 4); an image output, or a shorter video,
+is refused with a 400.</p>
 </section>
 <section id="cosmos3-edge-reasoner-and-action-loop">
 <h2>Cosmos3-Edge reasoner and action loop<a class="headerlink" href="#cosmos3-edge-reasoner-and-action-loop" title="Link to this heading">#</a></h2>
@@ -2837,7 +2840,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Nov 05, 2026.
+  Last updated on Nov 06, 2026.
   <br/>
 </p>
   </div>
