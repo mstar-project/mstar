@@ -2691,11 +2691,16 @@ class Worker(RepeatingSteps):
         pending.batch.repeats = repeats = pending.node_batch.step_context.repeats
         if self._step_repeats is not None and self._step_repeats.asked:
             # before anything pops the stream again: this pass's speculation
+            retained = {}
             for rid, edges in pending.node_batch.stream_windows.items():
                 for edge in edges:
-                    if edge.chunk.num_items > repeats and self.streams.return_unread(rid, edge, repeats):
+                    if edge.chunk.reservation is not None:
+                        if self.streams.window_bound(rid, edge) != repeats:
+                            self.streams.return_unread(rid, edge, repeats)
+                        retained.setdefault(rid, []).append(edge)
+                    elif edge.chunk.num_items > repeats and self.streams.return_unread(rid, edge, repeats):
                         pending.node_batch.final_stream_rids.discard(rid)
-            pending.node_batch.stream_windows = {}
+            pending.node_batch.stream_windows = retained
 
     def _await_admit(self, pending: PendingBatch) -> None:
         """Wait for ``pending``'s admit however long it takes, saying so now and

@@ -129,7 +129,7 @@ def test_the_run_ready_rows_wait_for_is_at_most_ready_waits_long():
     worker._step_repeats = StepRepeats({"LLM": RepeatConfig(max=8, ready_waits=3)}, {("LLM", "decode"): None})
     worker._step_repeats._walks.add(("LLM", "decode"))
     speculation = SimpleNamespace(
-        scheduled_batch=batch, node_batch=SimpleNamespace(step_context=ctx), loop_name="loop",
+        scheduled_batch=batch, node_batch=SimpleNamespace(step_context=ctx, stream_windows={}), loop_name="loop",
         continuing_rids={0, 1}, is_new_iter=True, is_same_node=True, consumed_streaming_edges={},
     )
     in_flight = SimpleNamespace(batch=SimpleNamespace(repeats=1))
@@ -269,7 +269,7 @@ def test_a_stalled_consumer_caps_its_producer_to_one_then_takes_the_row_out():
     ctx = StepContext(request_ids=[0, 1], graph_walk="decode", slot=0, capture=False)
     batch = ScheduledBatch(node_name="LLM", graph_walk="decode", request_to_worker_graph={0: 0, 1: 0})
     speculation = SimpleNamespace(
-        scheduled_batch=batch, node_batch=SimpleNamespace(step_context=ctx), loop_name="loop",
+        scheduled_batch=batch, node_batch=SimpleNamespace(step_context=ctx, stream_windows={}), loop_name="loop",
         continuing_rids={0, 1}, is_new_iter=True, is_same_node=True, consumed_streaming_edges={},
     )
     in_flight = SimpleNamespace(batch=SimpleNamespace(repeats=1))

@@ -68,18 +68,25 @@ class RepeatingSteps:
             )
             if (room or 1) < repeats:
                 repeats, why = max(1, room or 1), "its ring's room"
-        # a stream window: as many iterations as every row has items for, and
-        # what a row took past the step's own count goes back after its admit
+        # Retained snapshots bound execution, including zero-real-item tails.
+        # Legacy destructive windows instead bound it by their real item count.
         windows = {
-            rid: [e for e in edges if e.chunk.num_items and e.next_node == batch.node_name]
-            for rid, edges in speculation.consumed_streaming_edges.items()
+            rid: {edge.name: edge for edge in edges if edge.chunk.reservation is not None}
+            for rid, edges in speculation.node_batch.stream_windows.items()
         }
-        windows = {rid: edges for rid, edges in windows.items() if edges}
+        for rid, edges in speculation.consumed_streaming_edges.items():
+            for edge in edges:
+                if edge.next_node == batch.node_name and (edge.chunk.num_items or edge.chunk.reservation is not None):
+                    windows.setdefault(rid, {})[edge.name] = edge
+        windows = {rid: list(edges.values()) for rid, edges in windows.items() if edges}
         if windows:
-            items = min(e.chunk.num_items for edges in windows.values() for e in edges)
+            items = min(
+                self.streams.window_bound(rid, edge) if edge.chunk.reservation is not None else edge.chunk.num_items
+                for rid, edges in windows.items() for edge in edges
+            )
             if items < repeats:
                 repeats, why = items, "its stream window"
-            speculation.node_batch.stream_windows = windows
+        speculation.node_batch.stream_windows = windows
         if repeats > 1 and self._walk_drivers:
             steady = self._steady_consumer_walks(speculation, repeats)
             if steady < repeats:

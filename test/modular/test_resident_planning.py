@@ -1070,7 +1070,7 @@ def test_a_step_its_resources_held_to_one_iteration_moves_its_rows_by_one():
     worker._innermost_loop_by_node = {(WALK, "n"): "loop"}
     worker._graph_runtime = SimpleNamespace(loop_room=lambda *args: 100)
     speculation = SimpleNamespace(
-        scheduled_batch=batch, node_batch=SimpleNamespace(step_context=ctx), loop_name="loop",
+        scheduled_batch=batch, node_batch=SimpleNamespace(step_context=ctx, stream_windows={}), loop_name="loop",
         continuing_rids={0, 1}, is_new_iter=True, is_same_node=True, consumed_streaming_edges={},
     )
     in_flight = SimpleNamespace(batch=SimpleNamespace(repeats=1))
@@ -3207,7 +3207,7 @@ def test_a_step_that_reads_a_stream_window_repeats_as_far_as_every_row_has_items
     def window(items):
         return [StreamingEdge("chunk", "n", list(range(items)), StreamChunkInfo(0, 0, items, False))]
 
-    node_batch = SimpleNamespace(step_context=ctx)
+    node_batch = SimpleNamespace(step_context=ctx, stream_windows={})
     worker = Worker.__new__(Worker)
     worker._step_repeats = _repeats(8)
     worker._step_repeats.settle(lambda *key: None, lambda *key: None)

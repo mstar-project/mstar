@@ -562,7 +562,25 @@ def test_a_skipped_reader_keeps_its_origin_and_narrowed_bound_through_real_graph
     assert batch.step_context.repeats == 2
     assert batch.per_request_input_metadata[rid].iteration_origin == 0
     assert batch.stream_windows[rid][0].chunk.reservation is retained.chunk.reservation
-    streams.return_unread(rid, retained, 1)
+    from mstar.worker.worker import Worker
+
+    worker = Worker.__new__(Worker)
+    worker.streams = streams
+    worker._step_repeats = SimpleNamespace(
+        asked=True, ceiling=lambda *args: (8, "configured"), note_ask=lambda *args: None,
+    )
+    worker._ring_signals = {}
+    worker._walk_drivers = {}
+    scheduled = SimpleNamespace(node_name=NODE, graph_walk="decode", repeats=4)
+    pending = SimpleNamespace(batch=scheduled, node_batch=batch)
+    speculation = SimpleNamespace(scheduled_batch=scheduled, node_batch=batch, consumed_streaming_edges={})
+    worker._stamp_repeats(speculation, pending, 1)
+    assert batch.step_context.repeats == 2, "a retry cannot restore the original wider bound"
+    batch.step_context.repeats = 1  # a resource narrows at admission
+    worker._await_admit_settled(pending)
+    assert streams.window_bound(rid, retained) == 1
+    assert batch.stream_windows[rid][0].chunk.reservation is retained.chunk.reservation
+    worker._await_admit_settled(pending)  # an already settled fence keeps its retained reader
     streams.settle_window(rid, retained, 1)
     tm.cleanup_collectable(*runtime.cleanup_consumed_inputs(NODE, [rid], [0]))
     assert not buf._reservations
