@@ -593,8 +593,8 @@ Worker scheduling
        ``1,2,4,8,16,32``) on a memory-tight GPU or for an A/B against the
        former ladder. ``MSTAR_QWEN35_DECODE_BUCKETS`` overrides it for
        Qwen3.5 alone; Canary, Canary-Qwen, Qwen3-ASR, Orpheus, Higgs-Audio,
-       GLM-5.2, Command A+ and the Cosmos3 reasoner pin their own, so it
-       reaches Qwen3.5 and Glimmer.
+       Command A+ and the Cosmos3 reasoner pin their own, so it reaches
+       Qwen3.5 and Glimmer.
    * - ``MSTAR_LAZY_PUBLISH``
      - ``1``
      - Publish resource state (KV pages, positions) only for the requests

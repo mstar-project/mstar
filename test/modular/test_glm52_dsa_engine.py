@@ -34,11 +34,7 @@ def _force_cpu_flashinfer(monkeypatch):
 from mstar.engine.resources import StepContext  # noqa: E402
 from mstar.engine.resources.attn.flashinfer_mla import flashinfer_mla_supports  # noqa: E402
 from mstar.engine.resources.dsa.manager import DSAManager  # noqa: E402
-from mstar.model.glm52._testing import (  # noqa: E402
-    build_cpu_resources,
-    install_cpu_rope,
-    recorded_logits,
-)
+from mstar.model.glm52._testing import build_cpu_resources, install_cpu_rope  # noqa: E402
 from mstar.model.glm52.components.attention import Glm52MLAAttention  # noqa: E402
 from mstar.model.glm52.components.causal_lm import Glm52ForCausalLM  # noqa: E402
 from mstar.model.glm52.config import (  # noqa: E402
@@ -93,10 +89,13 @@ class _FakePositions:
 
 
 def _make_submodule(config) -> Glm52LLMSubmodule:
-    return Glm52LLMSubmodule(None, config)
+    sub = object.__new__(Glm52LLMSubmodule)
+    sub.config = config
+    return sub
 
 
 def _preprocess(sub, starts, seq_len):
+    sub.get_device = lambda: torch.device("cpu")
     inputs = [
         ARNodeInputs(
             input_ids=torch.zeros(seq_len, dtype=torch.long),
@@ -255,10 +254,10 @@ class _Driver:
         engine_inputs = ModelInputsFromEngine(
             request_ids=[self.rid], per_request_info={}, resources=self.resources, step=step)
         packed = self.sub.preprocess(walk, engine_inputs, [ar])
-        with torch.no_grad(), recorded_logits(self.resources[SAMPLER_RESOURCE]) as logits:
-            self.sub.forward_batched(walk, engine_inputs, **packed)
+        with torch.no_grad():
+            logits = self.sub.forward(walk, engine_inputs, **packed)["logits"][0]
         self.runner.commit(step)
-        return logits[0]
+        return logits
 
 
 def _serve_steps(driver: _Driver, prompt, decode_tokens):
@@ -279,7 +278,7 @@ def _longctx_reduced_cfg(topk):
 
 def test_declared_step_under_dsa_adds_the_dsa_step():
     cfg = _longctx_reduced_cfg(topk=4)
-    sub = Glm52LLMSubmodule(_build_absorbed_model(cfg, seed=0), cfg)
+    sub = Glm52LLMSubmodule(language_model=_build_absorbed_model(cfg, seed=0), config=cfg)
     ar = ARNodeInputs(input_ids=torch.tensor([1, 2, 3]), input_seq_len=3)
     step = sub.declare_step("prefill", ["r0"], [ar])
     assert set(step.keys()) == {
@@ -292,7 +291,7 @@ def test_full_to_shared_threading_order(monkeypatch):
     0 (FULL) published THIS forward — the IndexShare reuse window."""
     cfg = _longctx_reduced_cfg(topk=4)
     model = _build_absorbed_model(cfg, seed=0)
-    sub = Glm52LLMSubmodule(model, cfg)
+    sub = Glm52LLMSubmodule(language_model=model, config=cfg)
     driver = _Driver(sub, cfg)
     dsa = driver.resources[DSA_RESOURCE]
 
@@ -372,7 +371,7 @@ def test_decode_across_topk_prefix_property_and_divergence():
     topk = 6
     cfg = _longctx_reduced_cfg(topk)
     model = _build_absorbed_model(cfg, seed=3)
-    sub = Glm52LLMSubmodule(model, cfg)
+    sub = Glm52LLMSubmodule(language_model=model, config=cfg)
 
     torch.manual_seed(7)
     prompt = torch.randint(0, cfg.vocab_size, (3,))

@@ -278,7 +278,7 @@ class Glm5NextModel(Model):
         return dict(prefill=prefill, decode=decode)
 
     # -------------------------------------------------------------------
-    # Model ABC: conductor state machine (prefill -> decode -> done)
+    # Model ABC: walk plan
 
     def walk_plan(
         self,

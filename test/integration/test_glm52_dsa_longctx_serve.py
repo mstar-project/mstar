@@ -5,7 +5,7 @@ import pytest
 import torch
 
 from mstar.communication.tensors import LocalTransferEngine
-from mstar.conductor.request_info import FINAL_PREFILL, CurrentForwardPassInfo
+from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.distributed.communication import CommGroup, JointGroups
 from mstar.engine.accelerator_graph_runner import autocast_scope
 from mstar.engine.resources import (
@@ -18,16 +18,10 @@ from mstar.engine.resources import (
 )
 from mstar.engine.resources.base import EngineResourceInfo, build_resource
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
-from mstar.model.glm52._testing import per_request_outputs, recorded_logits
+from mstar.model.glm52._testing import per_request_outputs
 from mstar.model.glm52.components.causal_lm import Glm52ForCausalLM
 from mstar.model.glm52.components.moe import Glm52SparseMoeBlock
-from mstar.model.glm52.config import (
-    ATTN_RESOURCE,
-    DSA_RESOURCE,
-    KV_RESOURCE,
-    SAMPLER_RESOURCE,
-    Glm52ModelConfig,
-)
+from mstar.model.glm52.config import ATTN_RESOURCE, DSA_RESOURCE, KV_RESOURCE, Glm52ModelConfig
 from mstar.model.glm52.submodules import Glm52LLMSubmodule
 from mstar.model.submodule_base import END_PARTITION, ModelInputsFromEngine
 
@@ -181,11 +175,10 @@ class _Serve:
         return CurrentForwardPassInfo(
             request_id=self.rid, graph_walk="prefill", fwd_index=0, random_seed=0,
             max_tokens=max_tokens, resource_configs=self.overrides,
-            # the walk plan marks the prefill, the step before decode, as the reply's first token's
-            step_metadata={FINAL_PREFILL: True},
         )
 
-    def step(self, walk: str, info: CurrentForwardPassInfo, text: torch.Tensor) -> dict:
+    def step(self, walk: str, info: CurrentForwardPassInfo, text: torch.Tensor,
+             batched: bool = True) -> dict:
         """declare -> admit -> plan -> preprocess -> forward -> commit. The
         plan runs BEFORE preprocess, as in the engine: the DSA resource plans
         this step's rows off the KV plan."""
@@ -204,8 +197,11 @@ class _Serve:
                 resources=self.resources, step=step,
             )
             kw = self.submodule.preprocess(walk, engine_inputs, inputs)
-            raw = self.submodule.forward_batched(walk, engine_inputs, **kw)
-            out = per_request_outputs(raw, [rid])[rid]
+            if batched:
+                raw = self.submodule.forward_batched(walk, engine_inputs, **kw)
+                out = per_request_outputs(raw, [rid])[rid]
+            else:
+                out = self.submodule.forward(walk, engine_inputs, **kw)
             if step is not None:
                 self.runner.commit(step)
         return out
@@ -219,14 +215,15 @@ class _Serve:
 
 
 def _generate_greedy(model, submodule, prompt_ids, max_tokens):
-    """The real serve loop (prefill -> decode to the request's loop cap or a
-    stop) on the sparse path; returns (generated tokens, the DSA resource's
+    """The real serve loop (prefill -> decode -> check_stop) on the sparse
+    path; returns (generated tokens, stopped-via-check_stop, the DSA resource's
     stored key counts of layers 0 and 1 before retirement, the requests it
     still tracks after)."""
     serve = _Serve(model, submodule)
     dsa = serve.resources[DSA_RESOURCE]
     info = serve.info(max_tokens)
     generated: list[int] = []
+    stopped = False
     try:
         out = serve.step("prefill", info, prompt_ids)
         new_token = out["new_token"][0]
@@ -234,34 +231,39 @@ def _generate_greedy(model, submodule, prompt_ids, max_tokens):
         generated.append(int(new_token.item()))
         next_token = out["text_inputs"][0]
         # as the runtime: a prefill stop ends the request (END_PARTITION); otherwise decode
-        if END_PARTITION not in submodule.check_stop(serve.rid, info, out):
+        stopped = END_PARTITION in submodule.check_stop(serve.rid, info, out)
+        if not stopped:
             info.graph_walk = "decode"
-            for _ in range(model.get_loop_caps(max_output_tokens=max_tokens)["decode_loop"]):
+            for step in range(max_tokens + 4):  # +slack; check_stop must break first
                 out = serve.step("decode", info, next_token)
                 new_token = out["new_token"][0]
                 submodule.postprocess(serve.rid, info, out)
+                info.dynamic_loop_iter_counts["decode_loop"] = step
+                stop = submodule.check_stop(serve.rid, info, out)
                 generated.append(int(new_token.item()))
                 next_token = out["text_inputs"][0]
-                if submodule.check_stop(serve.rid, info, out):
+                if stop:
+                    stopped = True
                     break
         stored = (dsa.keys.tokens(serve.rid, 0), dsa.keys.tokens(serve.rid, 1))
     finally:
         serve.close(cleanup_request=False)
-    return generated, stored, dsa.keys.tracked_requests()
+    return generated, stopped, stored, dsa.keys.tracked_requests()
 
 
 def _teacher_forced_logits(model, submodule, prompt_ids, forced_tokens):
-    """Replay a fixed token sequence and collect the logits each step hands
-    the sampler: index 0 = prefill (context PROMPT_LEN), index 1+j = decode
-    of ``forced_tokens[j]`` (post-step context PROMPT_LEN + 1 + j)."""
+    """Replay a fixed token sequence and collect the logits of every step:
+    index 0 = prefill (context PROMPT_LEN), index 1+j = decode of
+    ``forced_tokens[j]`` (post-step context PROMPT_LEN + 1 + j)."""
     serve = _Serve(model, submodule)
     info = serve.info(len(forced_tokens) + 8)
+    logits_per_step = []
     try:
-        with recorded_logits(serve.resources[SAMPLER_RESOURCE]) as logits_per_step:
-            for i, ids in enumerate(
-                [prompt_ids, *[torch.tensor([t], device=DEVICE) for t in forced_tokens]]
-            ):
-                serve.step("prefill" if i == 0 else "decode", info, ids)
+        for i, ids in enumerate(
+            [prompt_ids, *[torch.tensor([t], device=DEVICE) for t in forced_tokens]]
+        ):
+            walk = "prefill" if i == 0 else "decode"
+            logits_per_step.append(serve.step(walk, info, ids, batched=False)["logits"][0])
     finally:
         serve.close()
     return logits_per_step
@@ -299,8 +301,9 @@ def test_dsa_longctx_decode_past_topk(tmp_path):
     prompt_ids = torch.arange(10, 10 + PROMPT_LEN, device=DEVICE)
 
     # ---- (1) the sparse path serves and stops cleanly ------------------
-    generated, stored, tracked = _generate_greedy(
+    generated, stopped, stored, tracked = _generate_greedy(
         model, submodule, prompt_ids, MAX_TOKENS)
+    assert stopped, "decode loop did not terminate via check_stop"
     assert len(generated) == MAX_TOKENS, generated  # max_tokens counts the prefill-emitted token (vLLM semantics)
     assert all(0 <= t < cfg.vocab_size for t in generated), generated
 
