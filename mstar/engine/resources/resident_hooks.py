@@ -45,7 +45,12 @@ class ResidentHooks:
         may. ``host_step``: this resource's part of the walk's step, for a walk
         planned on the host, whose one plan every replay reads; None for a
         resident walk. A resource refuses until it knows better: whatever it
-        stages per step would go stale."""
+        stages per step would go stale. Returning None promises that finite
+        capacity is bounded by max_repeats, committed per-iteration accounting
+        is reversible by rewind_run, and changing replay inputs are supplied
+        by replay_columns or advanced by the capture. The defaults remain
+        valid for resources with no such limit, accounting or changing input;
+        a stateless/read-only resource need not override no-op hooks."""
         del walk, host_step
         return f"{type(self).__name__} keeps no per-replay support"
 
@@ -100,7 +105,10 @@ class ResidentHooks:
 
     def resident_run_gather(self, step: CapturedResidentStep) -> None:
         """As ``resident_gather``, for a capture that is a WHILE run's body: no
-        host stands between its iterations, or tells it how far the last run got."""
+        host stands between its iterations, or tells it how far the last run got.
+        A successor can be planned before its predecessor ends short, so these
+        reads must use the state actually reached on device, not the host's
+        predicted end of the predecessor's full reservation."""
         return
 
     def resident_commit(self, step: CapturedResidentStep) -> None:

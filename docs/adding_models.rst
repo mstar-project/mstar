@@ -1710,6 +1710,20 @@ item each, less an EOS iteration's item of a withheld output. A step that emits 
 items per row per replay (``EMITTED_COUNT`` in its ``check_stop_buffers``) holds them along
 dim 1 of each such output, and each row routes that many.
 
+Opting into repeats is a resource's promise to honor all three obligations:
+bound a finite capacity with ``max_repeats``, undo unexecuted committed work with
+``rewind_run``, and supply changing inputs through ``replay_columns`` or the
+capture itself. The default hooks are sufficient only where the corresponding
+obligation is empty, as for a read-only or stateless resource; overriding every
+hook with a no-op would not establish correctness.
+
+For a device-ended run, the successor may already be planned for the predecessor's
+full reserved count when that predecessor stops early. Every state-dependent read
+in the successor must therefore derive from the state actually reached on the
+device. Host-prepared columns indexed from a predicted full count do not satisfy
+this contract. Refuse device execution until the input owner can supply the actual
+cursor, and test an early end after the successor has already been planned.
+
 A static input that differs each iteration of the node's Loop is declared rather than
 cut in ``prepare_inputs``: ``ITERATION_INPUTS = {name: IterationInput(source, offset, pad,
 shape, capture_fill, dtype)}``, where ``source`` names a ``[T, ...]`` table in the row's
