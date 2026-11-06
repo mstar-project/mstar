@@ -7,6 +7,7 @@ consumer depends on the contract rather than on the cache.
 """
 
 import itertools
+from collections.abc import Callable
 from typing import NamedTuple
 
 import numpy as np
@@ -222,6 +223,87 @@ def _host_lens(values: list[int]) -> torch.Tensor:
     return _int32_tensor(values).as_subclass(HostLens)
 
 
+class SlotColumns:
+    """A leased step's plan arrays in host buffers that one (slot, plan label,
+    rows, bucket tokens) keeps across its plans, so a plan allocates no arrays
+    or tensors. ``PageArena.plan_rows_into`` fills them; the fields read as a
+    `PlanColumns`.
+
+    A later plan on the slot rewrites them, so they answer only for the step
+    just planned: fine while the plan's consumers read it in that step's plan.
+    The slot is what makes the rewrite safe, as for the positions' pinned buffer:
+    a slot isn't leased again while its step is in flight, and a dropped pre-plan's
+    copies land before anything reads their destination
+    (``Engine._order_after_pre_plans``). Eager steps, and plans a cache keeps past
+    their step, build their arrays afresh instead.
+    """
+
+    __slots__ = (
+        "qo_indptr", "kv_indptr", "indices", "last_page_len", "kv_lens", "decode_pages", "decode_offsets",
+        "all_have_pages", "stage", "indptrs", "binding", "capacity",
+        "_arena", "_rows", "_lens_gens", "_index_room", "_total", "_seq",
+    )
+
+    def __init__(self, arena, rows: int, capture_len: int, capacity: int = 0):
+        self._arena = arena
+        self._rows = rows
+        self._lens_gens = np.zeros(2 * rows, np.int64)
+        self.stage = np.zeros(2 * capture_len, np.int64)
+        self._seq = 0
+        self._allocate(capacity or max(256, 8 * rows))
+
+    def _allocate(self, capacity: int) -> None:
+        n = self._rows
+        self.capacity = capacity
+        out = np.zeros(2 * (n + 1) + 4 * n + capacity, np.int32)
+        a, b = n + 1, 2 * (n + 1)
+        self.qo_indptr, self.kv_indptr = out[:a], out[a:b]
+        self.last_page_len, self.kv_lens = out[b:b + n], out[b + n:b + 2 * n]
+        self.decode_pages, self.decode_offsets = out[b + 2 * n:b + 3 * n], out[b + 3 * n:b + 4 * n]
+        self.binding = self._arena.bind_plan_buffers(out, self._lens_gens, self.stage)
+        self._index_room = out[b + 4 * n:]
+        self._total = -1
+        self.indices = self.indptrs = None
+
+    def grow(self, need: int) -> None:
+        """Room for ``need`` indices; the arrays start over."""
+        self._allocate(max(need, 2 * self.capacity))
+
+    def planned(self, total: int, all_have_pages: bool) -> None:
+        """The arena filled the buffers: ``total`` indices."""
+        self._seq += 1
+        self.all_have_pages = all_have_pages
+        if total == self._total:
+            return
+        self._total = total
+        self.indices = self._index_room[:total]
+        self.indptrs = PagedIndptrs(
+            qo_indptr=torch.from_numpy(self.qo_indptr),
+            paged_kv_indptr=torch.from_numpy(self.kv_indptr),
+            paged_kv_indices=torch.from_numpy(self.indices),
+            paged_kv_last_page_len=torch.from_numpy(self.last_page_len),
+            kv_lens=torch.from_numpy(self.kv_lens).as_subclass(HostLens),
+        )
+
+    def view_builder(self, segments) -> "Callable[[], list[SequenceView]]":
+        """The views of this plan, while no later plan has rewritten them."""
+        seq = self._seq
+
+        def build_views() -> list[SequenceView]:
+            if self._seq != seq:
+                raise RuntimeError("a KV plan's views asked for after a later plan rewrote its slot's arrays")
+            n = self._rows
+            bounds = self.kv_indptr.tolist()
+            lg = self._lens_gens.tolist()
+            indices = self.indices
+            return [
+                SequenceView(rid, label, indices[bounds[i]:bounds[i + 1]].tolist(), lg[i], span, 0, lg[n + i])
+                for i, (rid, label, span) in enumerate(segments.rows())
+            ]
+
+        return build_views
+
+
 class KVPlanOutput:
     """
     Output of KVManager.plan for a single label
@@ -229,13 +311,14 @@ class KVPlanOutput:
 
     __slots__ = (
         "cpu_indptrs", "_views", "_view_builder", "decode_pages", "decode_offsets",
-        "rows", "_decode", "columns",
+        "rows", "_decode", "columns", "decode_stage",
     )
 
     def __init__(
         self, cpu_indptrs: PagedIndptrs, views: "list[SequenceView] | None" = None,
         decode_pages=None, decode_offsets=None,
         rows=None, view_builder=None, decode: bool | None = None, columns=None,
+        decode_stage=None,
     ):
         self.cpu_indptrs = cpu_indptrs
         # packing in plan order w/h 1 view per segment covered by plan; a plan
@@ -256,8 +339,12 @@ class KVPlanOutput:
         self._decode = decode
         # the plan's host arrays (``PlanColumns``), when it was built from
         # columns. Unlike ``cpu_indptrs``, which may sit in a pinned ring a
-        # later plan rewrites, they stay valid as long as the output does.
+        # later plan rewrites, they stay valid as long as the output does, but
+        # for a `SlotColumns`, which is good for its own step's plan.
         self.columns = columns
+        # the decode write addressing as ``_stage_static`` stages it, when the
+        # plan filled it in
+        self.decode_stage = decode_stage
 
     @property
     def views(self) -> "list[SequenceView]":

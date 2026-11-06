@@ -187,6 +187,27 @@ impl ArenaCore {
             page_size,
         )
     }
+
+    /// `plan_columns` into `out`; see `kv_plan::plan_columns_into`.
+    pub fn plan_columns_into(
+        &self,
+        sids: &[usize],
+        lens: &[i64],
+        spans: &[i64],
+        page_size: i64,
+        out: &mut [i32],
+    ) -> Result<(usize, bool), String> {
+        if sids.len() != lens.len() {
+            return Err("plan columns of different lengths".into());
+        }
+        crate::kv_plan::plan_columns_into(
+            |i| self.pages(sids[i]).map(|pages| pages.as_slice()).map_err(|e| format!("row {i}: {e}")),
+            lens,
+            spans,
+            page_size,
+            out,
+        )
+    }
 }
 
 /// FNV-1a over the previous hash, the acquire's number and its pages.
@@ -209,6 +230,7 @@ fn trail_hash(hash: u64, count: u64, pages: &[i32]) -> u64 {
 mod py {
     use std::sync::{Mutex, MutexGuard};
 
+    use pyo3::buffer::PyBuffer;
     use pyo3::exceptions::{PyAssertionError, PyIndexError, PyValueError};
     use pyo3::prelude::*;
     use pyo3::pyclass::CompareOp;
@@ -216,6 +238,9 @@ mod py {
     use pyo3::types::{PyByteArray, PyDict, PyList, PySlice, PyTuple};
 
     use super::{ArenaCore, ArenaError, Released};
+
+    /// `mstar.engine.resources.kv.plan.SINK_PAGE`
+    const SINK_PAGE: i64 = 0;
 
     impl From<ArenaError> for PyErr {
         fn from(e: ArenaError) -> PyErr {
@@ -283,9 +308,9 @@ mod py {
         Stream(usize, Bound<'py, PyAny>),
     }
 
-    /// Each segment's row and span. ``streams`` is the KV manager's
-    /// ``_streams`` (request -> label -> `CacheStream`); ``real`` the step's
-    /// real request ids, None when nothing is padding; ``sink`` its
+    /// Each row's row and span, off a `Segments`' columns. ``streams`` is the KV
+    /// manager's ``_streams`` (request -> label -> `CacheStream`); ``real`` the
+    /// step's real request ids, None when nothing is padding; ``sink`` its
     /// (request, label) pairs on the sink page, None when there are none. Only
     /// Python reads, no allocation that could collect a stream, and no lock.
     fn resolve_rows<'py>(
@@ -296,14 +321,26 @@ mod py {
         sink: Option<&Bound<'py, PyAny>>,
     ) -> PyResult<(Vec<Row<'py>>, Vec<i64>)> {
         let py = arena.py();
-        let mut rows = Vec::new();
-        let mut spans = Vec::new();
-        for seg in segments.try_iter()? {
-            let seg = seg?;
-            let seg = seg.downcast::<PyTuple>()?;
-            let rid = seg.get_borrowed_item(0)?;
-            let label = seg.get_borrowed_item(1)?;
-            spans.push(seg.get_borrowed_item(2)?.extract::<i64>()?);
+        let rids = segments.getattr(intern!(py, "request_ids"))?;
+        let rids = rids.downcast::<PyTuple>()?;
+        let labels = segments.getattr(intern!(py, "labels"))?;
+        let label_column = labels.downcast::<PyTuple>().ok();
+        let spans_of = segments.getattr(intern!(py, "spans"))?;
+        let span_column = spans_of.downcast::<PyTuple>().ok();
+        let one_span = if span_column.is_none() { spans_of.extract::<i64>()? } else { 0 };
+        let n = rids.len();
+        let mut rows = Vec::with_capacity(n);
+        let mut spans = Vec::with_capacity(n);
+        for i in 0..n {
+            let rid = rids.get_borrowed_item(i)?;
+            let label = match label_column {
+                Some(column) => column.get_borrowed_item(i)?,
+                None => labels.as_borrowed(),
+            };
+            spans.push(match span_column {
+                Some(column) => column.get_borrowed_item(i)?.extract::<i64>()?,
+                None => one_span,
+            });
             let pad = match real {
                 Some(real) => !real.contains(&rid)?,
                 None => false,
@@ -331,6 +368,78 @@ mod py {
             rows.push(Row::Stream(sid.sid, stream));
         }
         Ok((rows, spans))
+    }
+
+    /// A plan's rows read off their streams.
+    struct RowColumns {
+        sids: Vec<usize>,
+        spans: Vec<i64>,
+        /// each row's length then its generation
+        lens_gens: Vec<i64>,
+        max_sink_span: i64,
+        decode: bool,
+    }
+
+    /// ``sink_sid`` is the stream a padding or sink row reads, at its span and
+    /// generation 0. Every other row must have a stream.
+    fn read_row_columns<'py>(
+        arena: &Bound<'py, PyPageArena>,
+        streams: &Bound<'py, PyDict>,
+        segments: &Bound<'py, PyAny>,
+        real: Option<&Bound<'py, PyAny>>,
+        sink: Option<&Bound<'py, PyAny>>,
+        sink_sid: usize,
+    ) -> PyResult<RowColumns> {
+        let py = arena.py();
+        let (rows, spans) = resolve_rows(arena, streams, segments, real, sink)?;
+        let n = rows.len();
+        let mut sids = Vec::with_capacity(n);
+        let mut lens_gens = vec![0i64; 2 * n];
+        let mut max_sink_span = 0i64;
+        let decode = n > 0 && spans.iter().all(|&s| s == 1);
+        let (stored_len, generation) = (intern!(py, "stored_len"), intern!(py, "generation"));
+        for (i, row) in rows.iter().enumerate() {
+            match row {
+                Row::Pad => {
+                    sids.push(sink_sid);
+                    lens_gens[i] = spans[i];
+                    max_sink_span = max_sink_span.max(spans[i]);
+                }
+                Row::Missing => {
+                    return Err(PyValueError::new_err(format!("row {i} has no stream to plan")));
+                }
+                Row::Stream(sid, cs) => {
+                    sids.push(*sid);
+                    lens_gens[i] = cs.getattr(stored_len)?.extract::<i64>()? + spans[i];
+                    lens_gens[n + i] = cs.getattr(generation)?.extract()?;
+                }
+            }
+        }
+        Ok(RowColumns { sids, spans, lens_gens, max_sink_span, decode })
+    }
+
+    /// Host buffers `plan_rows_into` writes a plan into, kept across plans.
+    /// Holds the buffers, so they stay put for as long as this does.
+    #[pyclass(name = "PlanBuffers", module = "mstar_rust", frozen)]
+    pub struct PyPlanBuffers {
+        out: PyBuffer<i32>,
+        lens_gens: PyBuffer<i64>,
+        stage: PyBuffer<i64>,
+    }
+
+    #[pymethods]
+    impl PyPlanBuffers {
+        /// ``out`` is laid out as `kv_plan::PlanColumns`, with room for indices;
+        /// ``lens_gens`` holds two int64 a row; ``stage`` a bucket's staged
+        /// write addressing (`kv_plan::fill_decode_stage`).
+        #[new]
+        fn new(out: PyBuffer<i32>, lens_gens: PyBuffer<i64>, stage: PyBuffer<i64>) -> PyResult<Self> {
+            let writable = !out.readonly() && !lens_gens.readonly() && !stage.readonly();
+            if !writable || !out.is_c_contiguous() || !lens_gens.is_c_contiguous() || !stage.is_c_contiguous() {
+                return Err(PyValueError::new_err("plan buffers must be writable and C-contiguous"));
+            }
+            Ok(Self { out, lens_gens, stage })
+        }
     }
 
     #[pymethods]
@@ -623,30 +732,9 @@ mod py {
             page_size: i64,
         ) -> PyResult<(Bound<'py, PyByteArray>, usize, bool, Bound<'py, PyByteArray>, i64, bool)> {
             let py = slf.py();
-            let (rows, spans) = resolve_rows(slf, streams, segments, real, sink)?;
-            let n = rows.len();
-            let mut sids = Vec::with_capacity(n);
-            let mut lens_gens = vec![0i64; 2 * n];
-            let mut max_sink_span = 0i64;
-            let decode = n > 0 && spans.iter().all(|&s| s == 1);
-            let (stored_len, generation) = (intern!(py, "stored_len"), intern!(py, "generation"));
-            for (i, row) in rows.iter().enumerate() {
-                match row {
-                    Row::Pad => {
-                        sids.push(sink_sid);
-                        lens_gens[i] = spans[i];
-                        max_sink_span = max_sink_span.max(spans[i]);
-                    }
-                    Row::Missing => {
-                        return Err(PyValueError::new_err(format!("row {i} has no stream to plan")));
-                    }
-                    Row::Stream(sid, cs) => {
-                        sids.push(*sid);
-                        lens_gens[i] = cs.getattr(stored_len)?.extract::<i64>()? + spans[i];
-                        lens_gens[n + i] = cs.getattr(generation)?.extract()?;
-                    }
-                }
-            }
+            let RowColumns { sids, spans, lens_gens, max_sink_span, decode } =
+                read_row_columns(slf, streams, segments, real, sink, sink_sid)?;
+            let n = sids.len();
             // the Python reads are done before the lock is taken
             let cols = slf.get().core().plan_columns(&sids, &lens_gens[..n], &spans, page_size)
                 .map_err(PyValueError::new_err)?;
@@ -654,6 +742,67 @@ mod py {
             let bytes = unsafe { std::slice::from_raw_parts(cols.out.as_ptr() as *const u8, cols.out.len() * 4) };
             let lg = unsafe { std::slice::from_raw_parts(lens_gens.as_ptr() as *const u8, lens_gens.len() * 8) };
             Ok((PyByteArray::new(py, bytes), cols.total, cols.all_have_pages, PyByteArray::new(py, lg), max_sink_span, decode))
+        }
+
+        /// `plan_rows` into a slot's kept host buffers, so nothing is allocated:
+        /// ``(total, all_have_pages, max_sink_span, decode)``. With no room for
+        /// ``total`` indices nothing is written; the caller grows ``buffers``
+        /// and asks again. A decode step whose rows all have a page also gets
+        /// its write addressing in ``buffers``' stage.
+        ///
+        /// The caller holds the slot, so nothing else touches ``buffers``.
+        #[pyo3(signature = (streams, segments, real, sink, sink_sid, page_size, buffers))]
+        fn plan_rows_into<'py>(
+            slf: &Bound<'py, Self>,
+            streams: &Bound<'py, PyDict>,
+            segments: &Bound<'py, PyAny>,
+            real: Option<&Bound<'py, PyAny>>,
+            sink: Option<&Bound<'py, PyAny>>,
+            sink_sid: usize,
+            page_size: i64,
+            buffers: &Bound<'py, PyPlanBuffers>,
+        ) -> PyResult<(usize, bool, i64, bool)> {
+            let RowColumns { sids, spans, lens_gens, max_sink_span, decode } =
+                read_row_columns(slf, streams, segments, real, sink, sink_sid)?;
+            let n = sids.len();
+            let buffers = buffers.get();
+            let header = crate::kv_plan::header_len(n);
+            if buffers.out.item_count() < header || buffers.lens_gens.item_count() != 2 * n {
+                return Err(PyValueError::new_err(format!("plan buffers too small for {n} rows")));
+            }
+            // SAFETY: C-contiguous, writable buffers of the item type, checked at
+            // construction and held by ``buffers``; the GIL is held and the
+            // caller's slot keeps every other writer out
+            let out = unsafe {
+                std::slice::from_raw_parts_mut(buffers.out.buf_ptr() as *mut i32, buffers.out.item_count())
+            };
+            let lg = unsafe {
+                std::slice::from_raw_parts_mut(buffers.lens_gens.buf_ptr() as *mut i64, 2 * n)
+            };
+            let stage = unsafe {
+                std::slice::from_raw_parts_mut(buffers.stage.buf_ptr() as *mut i64, buffers.stage.item_count())
+            };
+            // `qo[0]` and `kv_indptr[0]` stay 0 from allocation
+            let (total, all_have) = slf.get().core()
+                .plan_columns_into(&sids, &lens_gens[..n], &spans, page_size, out)
+                .map_err(PyValueError::new_err)?;
+            if header + total <= out.len() {
+                lg.copy_from_slice(&lens_gens);
+                if decode && all_have {
+                    let at = 2 * (n + 1) + 2 * n;
+                    let (pages, offsets) = out[at..at + 2 * n].split_at(n);
+                    crate::kv_plan::fill_decode_stage(pages, offsets, SINK_PAGE, stage);
+                }
+            }
+            Ok((total, all_have, max_sink_span, decode))
+        }
+
+        /// The buffers `plan_rows_into` writes into.
+        #[staticmethod]
+        fn bind_plan_buffers(
+            out: PyBuffer<i32>, lens_gens: PyBuffer<i64>, stage: PyBuffer<i64>,
+        ) -> PyResult<PyPlanBuffers> {
+            PyPlanBuffers::new(out, lens_gens, stage)
         }
 
         /// `kv_plan::plan_columns` over the page lists of the streams ``sids``,
@@ -831,7 +980,7 @@ mod py {
     }
 }
 
-pub use py::{PyPageArena, PyStreamPages};
+pub use py::{PyPageArena, PyPlanBuffers, PyStreamPages};
 
 #[cfg(test)]
 mod tests {

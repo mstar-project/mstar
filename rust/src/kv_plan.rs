@@ -24,13 +24,19 @@ pub struct PlanColumns {
     pub all_have_pages: bool,
 }
 
-/// `pages(i)` is row `i`'s page list (a `PageArena` stream's).
-pub fn plan_columns<'a>(
+/// The `i32`s ahead of the indices in a plan label's arrays of `n` rows.
+pub const fn header_len(n: usize) -> usize {
+    2 * (n + 1) + 4 * n
+}
+
+/// The pages each row reads, and how many in all. `pages(i)` is row `i`'s page
+/// list (a `PageArena` stream's).
+fn rows_read<'a>(
     pages: impl Fn(usize) -> Result<&'a [i32], String>,
     lens: &[i64],
     spans: &[i64],
     page_size: i64,
-) -> Result<PlanColumns, String> {
+) -> Result<(Vec<&'a [i32]>, usize), String> {
     let n = lens.len();
     if spans.len() != n {
         return Err("plan columns of different lengths".into());
@@ -52,7 +58,45 @@ pub fn plan_columns<'a>(
         rows.push(&held[..p]);
         total += p;
     }
-    let mut out = vec![0i32; 2 * (n + 1) + 4 * n + total];
+    Ok((rows, total))
+}
+
+/// See `rows_read` for `pages`.
+pub fn plan_columns<'a>(
+    pages: impl Fn(usize) -> Result<&'a [i32], String>,
+    lens: &[i64],
+    spans: &[i64],
+    page_size: i64,
+) -> Result<PlanColumns, String> {
+    let (rows, total) = rows_read(pages, lens, spans, page_size)?;
+    let mut out = vec![0i32; header_len(lens.len()) + total];
+    let all_have_pages = fill_columns(&rows, lens, spans, page_size, &mut out);
+    Ok(PlanColumns { out, total, all_have_pages })
+}
+
+/// `plan_columns` into `out`, whose indices may have room to spare: `(total,
+/// all_have_pages)`. With no room for `total` indices nothing is written and
+/// `total` says how many are needed.
+pub fn plan_columns_into<'a>(
+    pages: impl Fn(usize) -> Result<&'a [i32], String>,
+    lens: &[i64],
+    spans: &[i64],
+    page_size: i64,
+    out: &mut [i32],
+) -> Result<(usize, bool), String> {
+    let (rows, total) = rows_read(pages, lens, spans, page_size)?;
+    let need = header_len(lens.len()) + total;
+    if out.len() < need {
+        return Ok((total, false));
+    }
+    let all_have_pages = fill_columns(&rows, lens, spans, page_size, &mut out[..need]);
+    Ok((total, all_have_pages))
+}
+
+/// Writes every array of `out` but `qo[0]` and `kv_indptr[0]`, which must be 0.
+/// True when every row has a page to write into.
+fn fill_columns(rows: &[&[i32]], lens: &[i64], spans: &[i64], page_size: i64, out: &mut [i32]) -> bool {
+    let n = lens.len();
     let (qo, rest) = out.split_at_mut(n + 1);
     let (kv_indptr, rest) = rest.split_at_mut(n + 1);
     let (last, rest) = rest.split_at_mut(n);
@@ -80,7 +124,29 @@ pub fn plan_columns<'a>(
         qo[i + 1] = q as i32;
         kv_indptr[i + 1] = k as i32;
     }
-    Ok(PlanColumns { out, total, all_have_pages })
+    all_have_pages
+}
+
+/// A decode step's write addressing as its staged buffer holds it, which is
+/// twice a bucket's tokens: each row's page then `SINK_PAGE`, then each row's
+/// offset then 0 (`KVManager._stage_static`). False, nothing written, when the
+/// rows don't fit.
+pub fn fill_decode_stage(pages: &[i32], offsets: &[i32], sink_page: i64, stage: &mut [i64]) -> bool {
+    let n = pages.len();
+    let capture_len = stage.len() / 2;
+    if n > capture_len {
+        return false;
+    }
+    let (page_out, offset_out) = stage.split_at_mut(capture_len);
+    for (dst, &page) in page_out.iter_mut().zip(pages) {
+        *dst = page as i64;
+    }
+    page_out[n..].fill(sink_page);
+    for (dst, &offset) in offset_out.iter_mut().zip(offsets) {
+        *dst = offset as i64;
+    }
+    offset_out[n..].fill(0);
+    true
 }
 
 /// Each new token's page and offset, for a packed step that appends `span`
@@ -216,6 +282,40 @@ mod tests {
         assert_eq!(p[2], vec![4, 4]); // a full page, and `0 % 4 or 4`
         assert_eq!(p[3], vec![8, 4]);
         assert!(!c.all_have_pages);
+    }
+
+    #[test]
+    fn into_a_buffer_with_room_equals_the_allocating_call() {
+        let held: [&[i32]; 3] = [&[10, 11, 12, 13], &[20], &[-1, -1]];
+        let c = plan_columns(rows(&held), &[9, 5, 1], &[1, 1, 1], 4).unwrap();
+        // room to spare, and last plan's values in every slot
+        let mut out = vec![77i32; header_len(3) + 9];
+        out[0] = 0;
+        out[4] = 0;
+        let (total, all_have) = plan_columns_into(rows(&held), &[9, 5, 1], &[1, 1, 1], 4, &mut out).unwrap();
+        assert_eq!((total, all_have), (c.total, c.all_have_pages));
+        assert_eq!(&out[..c.out.len()], c.out.as_slice());
+        assert_eq!(out[c.out.len()], 77, "past the indices is left alone");
+    }
+
+    #[test]
+    fn into_a_buffer_without_room_says_how_many_and_writes_nothing() {
+        let held: [&[i32]; 1] = [&[10, 11, 12]];
+        let mut out = vec![77i32; header_len(1) + 2];
+        let (total, _) = plan_columns_into(rows(&held), &[9], &[1], 4, &mut out).unwrap();
+        assert_eq!(total, 3);
+        assert!(out.iter().all(|&v| v == 77));
+    }
+
+    #[test]
+    fn a_decode_stage_pads_with_the_sink_page_and_offset_zero() {
+        let mut stage = vec![77i64; 8];
+        assert!(fill_decode_stage(&[12, 20], &[3, 0], 0, &mut stage));
+        assert_eq!(stage, vec![12, 20, 0, 0, 3, 0, 0, 0]);
+        // more rows than a bucket holds: `_stage_static` refuses it
+        let mut short = vec![77i64; 2];
+        assert!(!fill_decode_stage(&[12, 20], &[3, 0], 0, &mut short));
+        assert_eq!(short, vec![77, 77]);
     }
 
     #[test]

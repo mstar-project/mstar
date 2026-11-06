@@ -134,3 +134,88 @@ def test_a_columnar_plan_equals_the_per_row_plan(seed, plan_backend):
             columns = kv._plan_label(group, {}, ctx, sink, None)
             per_row = kv._plan_output(kv._sequence_views(group, {}, ctx, sink), PAGE, None)
             _same(columns, per_row)
+
+
+def _leased_ctx(rows, pads, tokens, slot=0):
+    ctx = StepContext(
+        request_ids=tuple(rows), graph_walk="decode", slot=slot, capture=False,
+        slot_lease=SlotLease(slot=slot, bucket=BucketKey("decode", len(rows) + len(pads), tokens)),
+    )
+    ctx.set_padded_rids(tuple(rows) + tuple(pads))
+    return ctx
+
+
+@pytest.mark.parametrize("seed", range(8))
+def test_a_slot_plan_equals_the_per_row_plan_over_the_slots_kept_buffers(seed, plan_backend):
+    """Whatever the plan before it on the slot left in the buffers, and however far the streams grew."""
+    rng = random.Random(seed)
+    kv = _manager()
+    live = [f"r{i}" for i in range(6)]
+    for rid in live:
+        kv.ingest_request(rid, KVReqConfig())
+        _run(kv, [Segment(rid, "main", rng.randrange(1, 40))], [rid])
+    # too small for the first plan, so it grows along the way
+    kept = kv._slot_columns[(0, "main", 6, 64)] = manager_mod.SlotColumns(kv._arena, 6, 64, capacity=1)
+    for _ in range(30):
+        rows = rng.sample(live, rng.randrange(1, len(live) + 1))
+        decode = rng.random() < 0.7
+        grow = 1 if decode else rng.randrange(0, 30)
+        _run(kv, [Segment(r, "main", grow) for r in rows], rows)
+        segs = [Segment(r, "main", 1 if decode else rng.randrange(0, 9)) for r in rows]
+        # the bucket's width and tokens stay put so one set of buffers sees every plan
+        pads = [f"pad{i}" for i in range(6 - len(rows))]
+        segs += [Segment(p, "main", 1) for p in pads]
+        ctx = _leased_ctx(rows, pads, 64)
+        group = Segments.from_rows(segs)
+        sink = frozenset({(rows[0], "main")}) if rng.random() < 0.2 else frozenset()
+        out = kv._plan_label(group, {}, ctx, sink, None, 0, "main")
+        per_row = kv._plan_output(kv._sequence_views(group, {}, ctx, sink), PAGE, None)
+        _same(out, per_row)
+        if out.decode_stage is not None:
+            pages = [v.page_idxs[-1] for v in per_row.views]
+            offsets = [(v.last_page_len(PAGE) or PAGE) - 1 for v in per_row.views]
+            n = len(pages)
+            assert out.decode_stage.tolist() == pages + [0] * (64 - n) + offsets + [0] * (64 - n)
+        assert kv._slot_columns[(0, "main", 6, 64)] is kept
+
+
+def test_a_slot_plan_grows_past_its_buffers(plan_backend):
+    kv = _manager()
+    kv.ingest_request("r", KVReqConfig())
+    _run(kv, [Segment("r", "main", 300)], ["r"])
+    columns = kv._slot_columns[(0, "main", 1, 8)] = manager_mod.SlotColumns(kv._arena, 1, 8, capacity=2)
+    ctx = _leased_ctx(["r"], [], 8)
+    group = Segments.from_rows([Segment("r", "main", 1)])
+    out = kv._plan_label(group, {}, ctx, frozenset(), None, 0, "main")
+    assert columns.capacity >= 75  # the pages the stream holds
+    _same(out, kv._plan_output(kv._sequence_views(group, {}, ctx, frozenset()), PAGE, None))
+
+
+def test_a_slot_plans_views_are_only_good_until_the_slot_is_planned_again(plan_backend):
+    """A stale read raises rather than handing back the next plan's pages."""
+    kv = _manager()
+    kv.ingest_request("r", KVReqConfig())
+    _run(kv, [Segment("r", "main", 5)], ["r"])
+    ctx = _leased_ctx(["r"], [], 8)
+    group = Segments.from_rows([Segment("r", "main", 1)])
+    first = kv._plan_label(group, {}, ctx, frozenset(), None, 0, "main")
+    second = kv._plan_label(group, {}, ctx, frozenset(), None, 0, "main")
+    assert second.views[0].length == 6
+    with pytest.raises(RuntimeError, match="rewrote"):
+        _ = first.views
+
+
+def test_a_read_only_plan_keeps_its_own_arrays(plan_backend):
+    """Reused across steps, so a read-only plan never takes a slot's kept buffers."""
+    kv = _manager()
+    kv.ingest_request("r", KVReqConfig())
+    _run(kv, [Segment("r", "ctx", 5)], ["r"])
+    ctx = StepContext(
+        request_ids=("r",), graph_walk="decode", slot=0, capture=False,
+        slot_lease=SlotLease(slot=0, bucket=BucketKey("decode", 1, 1)),
+    )
+    step = KVStep(segments=(Segment("r", "ctx", 0),))
+    assert kv.admit(step, ctx).ok
+    plans = kv.plan(step, ctx)
+    assert not kv._slot_columns
+    assert plans["ctx"].views[0].length == 5

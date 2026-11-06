@@ -338,5 +338,6 @@ fn mstar_rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(crate::kv_plan::kv_packed_addressing, m)?)?;
     m.add_class::<crate::page_arena::PyPageArena>()?;
     m.add_class::<crate::page_arena::PyStreamPages>()?;
+    m.add_class::<crate::page_arena::PyPlanBuffers>()?;
     Ok(())
 }
