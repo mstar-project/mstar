@@ -31,7 +31,7 @@ RUNNERS = {"region": object()}
 
 def _engine(sub):
     eng = Engine.__new__(Engine)
-    eng._submodules = {"llm": SimpleNamespace(submodule=sub, piecewise_runners=RUNNERS)}
+    eng._submodules = {"llm": SimpleNamespace(submodule=sub, piecewise_runners=RUNNERS, device_stops={})}
     eng._loopback_steps = {}
     eng.per_request_tails = []
     eng.postprocess_batch = lambda batch, outputs: eng.per_request_tails.append(batch)
@@ -41,7 +41,7 @@ def _engine(sub):
 def _batch(rows_only):
     return SimpleNamespace(
         node_name="llm", admit_error=None, rows_only=rows_only, cached_rids=set(),
-        per_request_info_wrapped={1: object()}, inputs=[object()],
+        per_request_info_wrapped={1: object()}, inputs=[object()], run_started=None,
     )
 
 

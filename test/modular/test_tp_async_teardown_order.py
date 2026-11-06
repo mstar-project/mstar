@@ -78,7 +78,7 @@ def _speculation(seq: int, rids: list[int]):
     return SimpleNamespace(
         scheduled_batch=scheduled, node_batch=executing, is_yield_away=False,
         plan_future=None, partition="p", is_new_iter=False, loop_name=None,
-        tp_seq=seq, dropped=set(),
+        tp_seq=seq, dropped=set(), continuing_rids=frozenset(rids),
     )
 
 
@@ -173,6 +173,7 @@ def _rank(
 
     w.engine_manager = SimpleNamespace(
         warmup_all=lambda *args: None, remove_request=_tear_down,
+        get_engine=lambda node: SimpleNamespace(iteration_layouts=lambda node: None),
     )
     w.communicator = SimpleNamespace(send=_send, wait_for_work=lambda timeout: None)
     w.request_state = SimpleNamespace(
@@ -391,7 +392,6 @@ def test_a_removal_taken_in_during_a_run_waits_for_the_step_behind_the_run(monke
     thread. N+1 took in "idle" fresh, so N's rows alone don't cover it."""
     w, log = _rank(monkeypatch, tp_rank=0, inbox=[[], [], [RemoveRequest(request_id="idle")]])
     w.scheduler.has_ready_excluding = lambda state, key: False
-    w.engine_manager.get_engine = lambda node: None
     w._is_device_run = lambda step: step.tp_seq == 0
     landed = iter([False, True])
     build_executing, build_speculation = w._build_executing_batch, w._build_speculation
