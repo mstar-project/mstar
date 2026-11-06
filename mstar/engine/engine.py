@@ -339,7 +339,9 @@ class SubmoduleManagement:
         for runner in self.piecewise_runners.values():
             runner.set_slot(slot)
 
-def _window_tables(specs, inputs: Mapping[str, list] | None, metadata) -> dict[str, IterationStream]:
+def _window_tables(
+    specs, inputs: Mapping[str, list] | None, metadata, *, start: int = 0,
+) -> dict[str, IterationStream]:
     """A row's stream windows: each streamed iteration input's items this
     step, ``[items, ...]`` (one item is collated as itself)."""
     if not specs:
@@ -352,7 +354,10 @@ def _window_tables(specs, inputs: Mapping[str, list] | None, metadata) -> dict[s
         chunk = chunks.get(spec.source)
         if chunk is not None:
             table = tensors[0].reshape(chunk.num_items, *spec.shape) if tensors and chunk.num_items else None
-            out[spec.source] = IterationStream(table, chunk.tail_offset)
+            prefix = start if chunk.reservation is not None else 0
+            if table is not None:
+                table = table[prefix:]
+            out[spec.source] = IterationStream(table, chunk.tail_offset + max(0, prefix - chunk.num_items))
     return out
 
 
@@ -3549,8 +3554,13 @@ class Engine:
                 k = origin
             # a stream window is items of the node's Loop; a row outside it has none
             if streamed:
+                # A skipped retained reader can retry eagerly after its
+                # predecessor settled. It still holds the original snapshot;
+                # without the device selector, trim its consumed prefix here.
+                origin = getattr(counts, "iteration_origin", None)
+                start = k - origin if actual_loop is None and origin is not None else 0
                 window = {} if loop is None else _window_tables(
-                    streamed, inputs.get(rid), getattr(info, "metadata", None),
+                    streamed, inputs.get(rid), getattr(info, "metadata", None), start=start,
                 )
                 rows.append((rid, k, window))
             else:

@@ -581,6 +581,20 @@ def test_a_skipped_reader_keeps_its_origin_and_narrowed_bound_through_real_graph
     assert streams.window_bound(rid, retained) == 1
     assert batch.stream_windows[rid][0].chunk.reservation is retained.chunk.reservation
     worker._await_admit_settled(pending)  # an already settled fence keeps its retained reader
+    from mstar.engine.engine import Engine
+    from mstar.graph.loop_indices import LoopLayout
+    from mstar.model.submodule_base import IterationInput
+
+    # A retry can miss its run capture. Ordinary staging must skip the same
+    # retained real/tail prefix that a device cursor would select past.
+    engine = Engine.__new__(Engine)
+    engine._device = torch.device("cpu")
+    engine._loops = {(NODE, "decode"): LoopLayout("loop")}
+    node = SimpleNamespace(ITERATION_INPUTS={"cond": IterationInput(EDGE, streamed=True, pad="tail")},
+                           request_states={rid: {"tail": torch.tensor([-1., -2.])}})
+    column = engine._iteration_columns(NODE, node, batch.step_context, [rid],
+                                       batch.per_request_info_wrapped, batch.per_request_input_tensors)
+    assert column["cond"].item() == (-2 if tail_only else 1)
     streams.settle_window(rid, retained, 1)
     tm.cleanup_collectable(*runtime.cleanup_consumed_inputs(NODE, [rid], [0]))
     assert not buf._reservations
