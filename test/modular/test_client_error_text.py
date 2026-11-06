@@ -116,6 +116,8 @@ def _worker(rids=("r1",)):
         scheduler=scheduler, admission=scheduler.admission, lockstep=scheduler.lockstep,
     )
     w.sent = sent
+    for rid in rids:
+        w.lifecycle.add(rid, rid)
     w._hold_rows(CHAIN_LANE, rids)
     return w
 

@@ -1146,10 +1146,12 @@ def _refused_worker(engine, line):
         _graph_runtime=SimpleNamespace(push_back_node=lambda node, rids, graphs: pushed.append(rids)),
         engine_manager=SimpleNamespace(get_engine=lambda node: engine),
         scheduler=SimpleNamespace(
-            arrival=list(line), could_refill=lambda *a: False,
+            could_refill=lambda *a: False,
             last_in_line=lambda node, walk, rids: max(rids, key=line.index),
         ),
     )
+    for rid in line:
+        worker.lifecycle.add(rid, str(rid))
     worker.pushed = pushed
     return worker
 

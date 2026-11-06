@@ -314,16 +314,19 @@ def test_seconds_land_in_inclusive_buckets_and_the_counts_are_cumulative():
 
 # ── worker -> conductor ──────────────────────────────────────────────────────
 
-def _bare_worker(tmp_path):
-    """The attributes ``Worker._start_metrics`` reads, for a rank leading no
-    node, with a real SHM manager."""
-    worker = make_worker(
+def _bare_worker(tmp_path, scheduler):
+    """A rank leading no node, with a real SHM manager, and the metrics
+    ``Worker._start_metrics`` builds from its attributes, which its ingest
+    switches on with ENABLE_METRICS."""
+    fields = dict(
         worker_id="worker_1",
         engine_manager=SimpleNamespace(engine=SimpleNamespace(paged_kv_caches=list)),
         communicator=_Sink(),
         tensor_manager=_shm("worker_1", tmp_path),
+        scheduler=scheduler,
     )
-    return worker
+    metrics = make_worker(**fields)._start_metrics(3600.0)
+    return make_worker(**fields, _metrics=metrics)
 
 
 def test_a_rank_leading_no_node_reports_its_transfers_once_per_interval(tmp_path):
@@ -331,17 +334,15 @@ def test_a_rank_leading_no_node_reports_its_transfers_once_per_interval(tmp_path
     transfers on the worker status; its lead rank reports the engine
     families. A read before ENABLE_METRICS (a warmup request's) is not
     counted."""
-    worker = _bare_worker(tmp_path)
-
     def not_on_a_follower():
         raise AssertionError("a rank leading nothing has no pending rows to report")
 
-    worker.scheduler = SimpleNamespace(pending_rows=not_on_a_follower)
-    metrics = worker._metrics = worker._start_metrics(3600.0)
+    worker = _bare_worker(tmp_path, SimpleNamespace(pending_rows=not_on_a_follower))
+    metrics = worker._metrics
     producer = _shm("worker_0", tmp_path)
     warmup = _send(producer, "warmup-0", {"h": [torch.randn(8, 8)]})
     _read(worker.tensor_manager, "warmup-0", [GraphEdge(next_node="llm", name="h", tensor_info=warmup["h"])])
-    worker._process_message_list([WorkerMessage(WorkerMessageType.ENABLE_METRICS, EnableMetrics())])
+    worker.ingest._dispatch([WorkerMessage(WorkerMessageType.ENABLE_METRICS, EnableMetrics())])
     infos = _send(producer, "r1", {"h": [torch.randn(4, 4)]})
     _read(worker.tensor_manager, "r1", [GraphEdge(next_node="llm", name="h", tensor_info=infos["h"])])
 

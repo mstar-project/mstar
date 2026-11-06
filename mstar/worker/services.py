@@ -25,6 +25,7 @@ if TYPE_CHECKING:
     from mstar.streaming.topology import Connection
     from mstar.worker.engine_manager import EngineManager
     from mstar.worker.node_manager_utils import RequestStateManager
+    from mstar.worker.stream_buffers import StreamBufferManager
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,6 +44,8 @@ class WorkerServices:
     communicator: BaseCommunicator
     # TP, SP and joint process groups
     parallel_groups: WorkerParallelGroups
+    # the consumer side of streaming edges, and the producer side's walk hooks
+    streams: StreamBufferManager
 
 
 def _no_entries() -> Mapping:
