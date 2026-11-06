@@ -94,7 +94,7 @@ def test_process_prompt_and_its_limits(snapshot):
     assert out.new_input_tensors["audio"][0].shape == (16_000,)
     assert out.new_input_tensors["text_inputs"][0].tolist() == model.config.prompt_ids("de", "en")
     # the decoder writes the prompt, then a slot per step; the context is the clip's encoder frames
-    layout = out.metadata["kv_layout"]
+    layout = out.metadata["state_layout"]
     assert set(layout) == set(model.kv_labels()) and all(set(layout[k]) == set(v) for k, v in model.kv_labels().items())
     assert layout["kv_cache"]["main"].spans[0].length == PROMPT_LENGTH
     assert layout["cross_kv_cache"]["main"].spans[0].length == model.config.encoder.output_lengths(100)
@@ -186,34 +186,18 @@ def test_adapter_maps_and_refuses():
 
 
 class _FakeSelfAttention:
-    """Dense stand-in for the paged KV + attention pair, one request: the K/V
-    written so far are its pages, and causal SDPA is the kernel."""
-
-    requires_kv_write = True
+    """Dense stand-in for the self-attention array's handle, one request: the
+    K/V added so far are its pages, and causal SDPA is the kernel."""
 
     def __init__(self):
-        self._label, self._layer = "main", 0
         self._kv: dict[int, tuple[list, list]] = {}
         self._pending = None
 
-    @property
-    def default_label(self):
-        return self._label
-
-    def set_default_label(self, label):
-        self._label = label
-
-    def set_default_layer_idx(self, idx):
-        self._layer = idx
-
-    def layer_view(self):
-        return self._layer
-
-    def write_kv(self, k, v):
+    def add(self, layer, *, k, v):
         self._pending = (k, v)
 
-    def run(self, q, kv_cache_layer, k=None, v=None):
-        ks, vs = self._kv.setdefault(kv_cache_layer, ([], []))
+    def read(self, layer, q):
+        ks, vs = self._kv.setdefault(int(layer), ([], []))
         ks.append(self._pending[0])
         vs.append(self._pending[1])
         k_all, v_all = torch.cat(ks), torch.cat(vs)
@@ -225,32 +209,17 @@ class _FakeSelfAttention:
 
 
 class _FakeContext:
-    """The cross-attention context cache: the clip's K/V per layer, written once."""
+    """The context array's handle: the clip's K/V per layer, added once and read
+    whole with no mask."""
 
     def __init__(self):
-        self._layer, self.kv = 0, {}
+        self.kv = {}
 
-    def set_default_layer_idx(self, idx):
-        self._layer = idx
+    def add(self, layer, *, k, v):
+        self.kv[int(layer)] = (k, v)
 
-    def layer_view(self):
-        return self._layer
-
-    def write_kv(self, k, v, label):
-        self.kv[self._layer] = (k, v)
-
-
-class _FakeCross:
-    """Cross-attention over the whole context, no mask."""
-
-    def __init__(self, context: _FakeContext):
-        self.context = context
-
-    def set_default_label(self, label):
-        pass
-
-    def run(self, q, kv_cache_layer):
-        k, v = self.context.kv[kv_cache_layer]
+    def read(self, layer, q):
+        k, v = self.kv[int(layer)]
         out = torch.nn.functional.scaled_dot_product_attention(q.transpose(0, 1), k.transpose(0, 1), v.transpose(0, 1))
         return out.transpose(0, 1)
 
@@ -261,7 +230,7 @@ def test_decoder_matches_hf():
     at every position, loaded through the serving loader."""
     transformers = pytest.importorskip("transformers")
     modeling = pytest.importorskip("transformers.models.canary.modeling_canary")
-    from mstar.model.canary.config import ATTN, CROSS_ATTN, CROSS_KV_CACHE, KV_CACHE
+    from mstar.model.canary.config import CROSS_KV_CACHE, KV_CACHE
     from mstar.model.components.fastconformer import FastConformerConfig
     from mstar.model.loader import WHISPER_STACKED_PARAMS, load_hf_weights
     from mstar.model.utils import check_loaded
@@ -282,18 +251,17 @@ def test_decoder_matches_hf():
     check_loaded(ours, load_hf_weights(
         ours, weights, stacked_params=WHISPER_STACKED_PARAMS, name_remapper=CanaryDecoderModel.remap,
     ), "decoder")
-    self_attn, context = _FakeSelfAttention(), _FakeContext()
+    handles = {KV_CACHE: _FakeSelfAttention(), CROSS_KV_CACHE: _FakeContext()}
     for module in ours.modules():
-        if hasattr(module, "bind_resources") and module is not ours:
-            module.bind_resources({ATTN: self_attn, KV_CACHE: self_attn, CROSS_ATTN: _FakeCross(context),
-                                   CROSS_KV_CACHE: context})
+        if hasattr(module, "bind_state"):
+            module.bind_state(handles)
 
     torch.manual_seed(1)
     encoder_states = torch.randn(13, 32)
     tokens = torch.randint(0, 50, (9,))
     with torch.no_grad():
-        ours.write_cross_kv(encoder_states)
-        hidden = ours(ours.embed(tokens, torch.arange(9)), label="main")
+        ours.add_context(encoder_states)
+        hidden = ours(ours.embed(tokens, torch.arange(9)))
         expected = reference(tokens[None], position_ids=torch.arange(9)[None],
                              encoder_hidden_states=encoder_states[None]).last_hidden_state[0]
         assert torch.allclose(hidden, expected, atol=1e-4), (hidden - expected).abs().max()
@@ -301,7 +269,7 @@ def test_decoder_matches_hf():
             nxt = torch.randint(0, 50, (1,))
             tokens = torch.cat([tokens, nxt])
             position = tokens.numel() - 1
-            hidden = ours(ours.embed(nxt, torch.tensor([position])), label="main")
+            hidden = ours(ours.embed(nxt, torch.tensor([position])))
             expected = reference(tokens[None], position_ids=torch.arange(position + 1)[None],
                                  encoder_hidden_states=encoder_states[None]).last_hidden_state[0, -1:]
             assert torch.allclose(hidden, expected, atol=1e-4), (step, (hidden - expected).abs().max())
@@ -319,10 +287,10 @@ def _tiny_node():
 
 
 def test_prefill_reserves_each_clips_context_once():
-    """The cross-attention context is written at prefill: each request's
+    """The cross-attention context is added at prefill: each request's
     segment spans its encoder frames, in the order the frames are concatenated
-    for the write; on decode the span is zero."""
-    from mstar.model.canary.config import CROSS_ATTN, CROSS_KV_CACHE
+    for the add; on decode the span is zero."""
+    from mstar.model.canary.config import CROSS_KV_CACHE
     from mstar.model.submodule_base import ARNodeInputs
 
     node = _tiny_node()
@@ -330,13 +298,12 @@ def test_prefill_reserves_each_clips_context_once():
     prefill = [ARNodeInputs(input_ids=torch.arange(9), input_seq_len=9, tensor_inputs={"encoder_states": c})
                for c in clips]
     step = node.declare_step("prefill", ["a", "b"], prefill)
-    for key in (CROSS_KV_CACHE, CROSS_ATTN):
-        assert [(s.request_id, s.span) for s in step.steps[key].segments] == [("a", 13), ("b", 7)]
+    assert [(s.request_id, s.span) for s in step.state[CROSS_KV_CACHE].segments] == [("a", 13), ("b", 7)]
     assert [s.span for s in step.segments] == [9, 9]
     assert torch.equal(node.preprocess("prefill", None, prefill)["encoder_states"], torch.cat(clips))
     decode = [ARNodeInputs(input_ids=torch.tensor([5]), input_seq_len=1) for _ in clips]
     step = node.declare_step("decode", ["a", "b"], decode)
-    assert [s.span for s in step.steps[CROSS_KV_CACHE].segments] == [0, 0]
+    assert [s.span for s in step.state[CROSS_KV_CACHE].segments] == [0, 0]
     assert "encoder_states" not in node.preprocess("decode", None, decode)
 
 

@@ -1,5 +1,5 @@
 """The decoder node of an encoder-decoder speech model (Canary): the
-encoder's output written once into a cross-attention context at prefill, then
+encoder's output added once to a cross-attention context at prefill, then
 one token per decode step. The model supplies the decoder, its stop token and
 its logit rules."""
 from __future__ import annotations
@@ -11,10 +11,16 @@ import torch
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.engine.resources import AttentionStep, KVStep, PositionStep, SamplerStep, Segment, SlotLease, SubmoduleStep
-from mstar.engine.resources.attn.base import AttentionManager
-from mstar.engine.resources.position.manager import PositionManager
-from mstar.engine.resources.sampler.resource import SamplerResource
+from mstar.engine.state import (
+    ArrayStep,
+    SampleStep,
+    Segment,
+    SlotLease,
+    SubmoduleStep,
+    at_last_token,
+    positions,
+    sample,
+)
 from mstar.model.components.token_step import TokenStepNode
 from mstar.model.submodule_base import ARNodeInputs, BatchedModelOutput, ModelInputsFromEngine
 from mstar.utils.h2d import to_device_nonblocking
@@ -22,27 +28,28 @@ from mstar.utils.h2d import to_device_nonblocking
 
 class EncoderDecoderNode(TokenStepNode):
     """Mixin for an ``ARNodeSubmodule`` over ``self.decoder``, which has
-    ``write_cross_kv(encoder_states)``, ``embed(input_ids, position_ids)``,
-    ``forward(input_embeds, *, label)`` and ``lm_head(hidden)``.
+    ``add_context(encoder_states)``, ``embed(input_ids, position_ids)``,
+    ``forward(input_embeds)`` and ``lm_head(hidden)``.
 
     Dispatches on graph_walk:
       - prefill: project ``encoder_states`` to per-layer cross-attention K/V
-        and write them into the context stream, fill the self-attention KV
-        cache with the prompt, and sample the first token.
+        and add them to the context array, fill the self-attention KV cache
+        with the prompt, and sample the first token.
       - decode: embed the previous token, single-step decode.
 
-    The context stream grows by the encoder output at prefill and is declared
-    zero-span (read-only) after. Only decode is captured. A subclass binds the
-    resource keys below to its model's (the encoder output gets a KV cache of
-    its own, so the self-attention resource never plans over it).
+    The context array grows by the encoder output at prefill and is declared
+    zero-span (read-only) after. Only decode is captured. A subclass names its
+    self-attention array, its context array, the context's label and its
+    sampler (the encoder output gets an array of its own, so the self-attention
+    resource never plans over it).
     """
 
     KV_CACHE: str
-    ATTN: str
-    POS: str
     CROSS_KV_CACHE: str
-    CROSS_ATTN: str
     CONTEXT_LABEL: str
+
+    def bind_state(self, handles: Mapping[str, Any]) -> None:
+        self.kv, self.sampler = handles[self.KV_CACHE], handles[self.SAMPLER]
 
     def process_logits(self, logits: torch.Tensor, graph_walk: str) -> torch.Tensor:
         """The model's rules on the logits before sampling; none by default."""
@@ -64,8 +71,8 @@ class EncoderDecoderNode(TokenStepNode):
 
     @staticmethod
     def _context_span(inp: ARNodeInputs) -> int:
-        """How far this step grows the request's encoder-context stream: the
-        encoder output on the prefill that writes it, zero after."""
+        """How far this step grows the request's encoder-context array: the
+        encoder output on the prefill that adds it, zero after."""
         encoder_states = inp.tensor_inputs.get("encoder_states")
         return 0 if encoder_states is None else encoder_states.shape[0]
 
@@ -83,20 +90,17 @@ class EncoderDecoderNode(TokenStepNode):
             for rid, inp in zip(request_ids, inputs, strict=True)
         )
         return SubmoduleStep(
-            # the default, for the resources over the self-attention cache
+            # the default, for the self-attention array
             segments=[
                 Segment(request_id=rid, label="main", span=inp.input_seq_len)
                 for rid, inp in zip(request_ids, inputs, strict=True)
             ],
-            steps={
-                self.KV_CACHE: KVStep(),
-                self.ATTN: AttentionStep(causal=True),
-                # real span on the prefill that writes the context, zero after;
+            state={
+                self.KV_CACHE: ArrayStep(),
+                # real span on the prefill that adds the context, zero after;
                 # the commit turns that reservation into resident pages
-                self.CROSS_KV_CACHE: KVStep(segments=context_segments),
-                self.CROSS_ATTN: AttentionStep(segments=context_segments, causal=False),
-                self.SAMPLER: SamplerStep(apply_penalty=False),
-                self.POS: PositionStep(),
+                self.CROSS_KV_CACHE: ArrayStep(segments=context_segments),
+                self.SAMPLER: SampleStep(apply_penalty=False),
             },
         )
 
@@ -114,26 +118,16 @@ class EncoderDecoderNode(TokenStepNode):
             )
         return preprocessed
 
-    def _forward(
-        self,
-        graph_walk: str,
-        engine_inputs: ModelInputsFromEngine,
-        input_ids: torch.Tensor,
-        encoder_states: torch.Tensor | None,
-    ) -> torch.Tensor:
-        attn: AttentionManager = engine_inputs.resources[self.ATTN]
-        pos: PositionManager = engine_inputs.resources[self.POS]
-        sampler: SamplerResource = engine_inputs.resources[self.SAMPLER]
+    def _forward(self, graph_walk: str, input_ids: torch.Tensor, encoder_states: torch.Tensor | None) -> torch.Tensor:
         if encoder_states is not None:
             # prefill only: fill the context pages this step reserved before
             # the layers read them
-            self.decoder.write_cross_kv(encoder_states)
-        hidden = self.decoder(self.decoder.embed(input_ids, pos.pos_ids("main")), label="main")
+            self.decoder.add_context(encoder_states)
+        hidden = self.decoder(self.decoder.embed(input_ids, positions(self.kv)))
         if graph_walk == self.PREFILL_WALK:
             # packed prefill: one hidden per request, at its last token
-            hidden = attn.select_last_hidden(hidden)
-        logits = self.process_logits(self.decoder.lm_head(hidden), graph_walk)
-        return sampler.sample(engine_inputs.request_ids, logits=logits)
+            hidden = at_last_token(self.kv, hidden)
+        return sample(self.sampler, self.process_logits(self.decoder.lm_head(hidden), graph_walk))
 
     def forward(
         self,
@@ -143,7 +137,7 @@ class EncoderDecoderNode(TokenStepNode):
         encoder_states: torch.Tensor | None = None,
         **kwargs,
     ) -> NameToTensorList:
-        return {"new_token": [self._forward(graph_walk, engine_inputs, input_ids, encoder_states)]}
+        return {"new_token": [self._forward(graph_walk, input_ids, encoder_states)]}
 
     def forward_batched(
         self,
@@ -153,6 +147,6 @@ class EncoderDecoderNode(TokenStepNode):
         encoder_states: torch.Tensor | None = None,
         **kwargs,
     ) -> BatchedModelOutput:
-        new_tokens = self._forward(graph_walk, engine_inputs, input_ids, encoder_states)
+        new_tokens = self._forward(graph_walk, input_ids, encoder_states)
         # row i is request i: one clone and one D2H copy per step, not per request
         return BatchedModelOutput(row_outputs={"new_token": new_tokens}, check_stop_buffers={"new_token": new_tokens})

@@ -1,18 +1,9 @@
-"""Canary's text decoder node (KV, attention, cross-attention, positions,
-sampler); the encoder node is the shared ``FastConformerEncoderSubmodule``."""
+"""Canary's text decoder node (two arrays and a sampler); the encoder node is the
+shared ``FastConformerEncoderSubmodule``."""
 
 from __future__ import annotations
 
-from mstar.model.canary.config import (
-    ATTN,
-    CONTEXT_LABEL,
-    CROSS_ATTN,
-    CROSS_KV_CACHE,
-    KV_CACHE,
-    POS,
-    SAMPLER,
-    CanaryModelConfig,
-)
+from mstar.model.canary.config import CONTEXT_LABEL, CROSS_KV_CACHE, KV_CACHE, SAMPLER, CanaryModelConfig
 from mstar.model.canary.decoder import CanaryDecoderModel
 from mstar.model.components.encoder_decoder import EncoderDecoderNode
 from mstar.model.submodule_base import ARNodeSubmodule, TokenStop
@@ -23,11 +14,8 @@ class CanaryDecoderSubmodule(EncoderDecoderNode, ARNodeSubmodule):
     token per step. Prefill isn't captured: its shape follows the clip."""
 
     KV_CACHE = KV_CACHE
-    ATTN = ATTN
-    POS = POS
     SAMPLER = SAMPLER
     CROSS_KV_CACHE = CROSS_KV_CACHE
-    CROSS_ATTN = CROSS_ATTN
     CONTEXT_LABEL = CONTEXT_LABEL
     # Prefill isn't captured, so no capture bucket bounds its batch; this does,
     # keeping one prefill's context reservation well inside the cache.

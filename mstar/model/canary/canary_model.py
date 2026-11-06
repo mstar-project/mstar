@@ -19,35 +19,35 @@ Graph walks:
 
 import json
 import logging
+from typing import Any
 
 import torch
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardConductorMetadata, StreamingConnectionState
-from mstar.engine.resources import (
-    AttentionConfig,
-    AttentionSpec,
-    CrossAttentionConfig,
-    CrossAttentionSpec,
-    KVSpec,
-    NodeResourceSpec,
-    PagedKVConfig,
-    PositionConfig,
-    PositionSpec,
-    ResourceReqConfig,
-    SamplerSpec,
-    SamplingReqConfig,
+from mstar.engine.state import (
+    Array,
+    Attend,
+    Bidirectional,
+    Causal,
+    KVEntry,
+    Layout,
+    Positions,
+    Read,
+    Sampler,
+    SampleSettings,
+    Span,
 )
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
-from mstar.model.base import ForwardPassArgs, KVLabel, LabelLayout, Model, ProcessPromptOutput, Span, TensorAndMetadata
+from mstar.model.base import ForwardPassArgs, KVLabel, Model, ProcessPromptOutput, TensorAndMetadata
 from mstar.model.canary.config import (
     ATTN,
     CONTEXT_LABEL,
     CROSS_ATTN,
     CROSS_KV_CACHE,
     KV_CACHE,
-    POS,
+    PAGE_TOKENS,
     PROMPT_LENGTH,
     SAMPLER,
     CanaryModelConfig,
@@ -88,57 +88,38 @@ class CanaryModel(Model):
         return str(self.local_dir)
 
     # -------------------------------------------------------------------
-    # resources
+    # state
     # -------------------------------------------------------------------
 
     def _max_encoder_frames(self) -> int:
         samples = int(self.MAX_AUDIO_SECONDS * self.config.sampling_rate)
         return self.config.encoder.output_lengths(samples // HOP_LENGTH)
 
-    def get_node_resources(self) -> list[NodeResourceSpec]:
+    def declare_state(self) -> list[Array | Sampler]:
         """Decoder self-attention KV and a separate encoder-context KV: the
         self-attention resource plans a wrapper per label of the cache it
         names, so a shared cache would plan the context every step."""
-        cfg = self.config
-        page_size, requests = 128, self.MAX_CONCURRENT_REQUESTS
+        c = self.config
+        kv = KVEntry(heads=c.num_heads, head_dim=c.head_dim)
+        layers = frozenset(range(c.num_layers))
+        return [
+            # no RoPE: the counter's planned ids drive the sinusoid lookup
+            Array(KV_CACHE, nodes={"decoder"}, layers=layers, entry=kv, max_len=c.max_position_embeddings,
+                  positions=Positions(), reads={ATTN: Read(mask=Causal(), op=Attend(q_heads=c.num_heads))}),
+            Array(CROSS_KV_CACHE, nodes={"decoder"}, layers=layers, entry=kv, max_len=self._max_encoder_frames(),
+                  labels={CONTEXT_LABEL},
+                  reads={CROSS_ATTN: Read(mask=Bidirectional(), op=Attend(q_heads=c.num_heads), queries=KV_CACHE)}),
+            Sampler(SAMPLER, nodes={"decoder"}, vocab_size=c.vocab_size, penalty=False),
+        ]
+
+    def kernel_settings(self) -> dict[str, dict[str, Any]]:
         # each cache holds the request cap at full length: 8 pages per request
         # at the position limit, 4 for a 40.96 s clip's context
-        kv_config = PagedKVConfig(
-            num_layers=cfg.num_layers,
-            num_kv_heads=cfg.num_heads,
-            head_dim=cfg.head_dim,
-            max_seq_len=cfg.max_position_embeddings,
-            num_qo_heads=cfg.num_heads,
-            page_size=page_size,
-            max_num_pages=kv_pages(cfg.max_position_embeddings, page_size, requests),
-        )
-        context_kv_config = PagedKVConfig(
-            num_layers=cfg.num_layers,
-            num_kv_heads=cfg.num_heads,
-            head_dim=cfg.head_dim,
-            max_seq_len=self._max_encoder_frames(),
-            num_qo_heads=cfg.num_heads,
-            page_size=page_size,
-            max_num_pages=kv_pages(self._max_encoder_frames(), page_size, requests),
-        )
-        return [
-            KVSpec(resource_key=KV_CACHE, nodes={"decoder"}, config=kv_config),
-            AttentionSpec(resource_key=ATTN, nodes={"decoder"}, config=AttentionConfig(kv_cache=KV_CACHE)),
-            KVSpec(resource_key=CROSS_KV_CACHE, nodes={"decoder"}, config=context_kv_config),
-            CrossAttentionSpec(
-                resource_key=CROSS_ATTN, nodes={"decoder"},
-                config=CrossAttentionConfig(
-                    kv_cache=CROSS_KV_CACHE, query_kv_cache=KV_CACHE, context_label=CONTEXT_LABEL,
-                ),
-            ),
-            # no RoPE: the counter's planned ids drive the sinusoid lookup
-            PositionSpec(resource_key=POS, nodes={"decoder"}, config=PositionConfig(kv_cache=KV_CACHE)),
-            SamplerSpec(
-                resource_key=SAMPLER, nodes={"decoder"},
-                vocab_size=cfg.vocab_size,
-                enable_repetion_penalty=False,
-            ),
-        ]
+        requests = self.MAX_CONCURRENT_REQUESTS
+        return {
+            KV_CACHE: {"max_num_pages": kv_pages(self.config.max_position_embeddings, PAGE_TOKENS, requests)},
+            CROSS_KV_CACHE: {"max_num_pages": kv_pages(self._max_encoder_frames(), PAGE_TOKENS, requests)},
+        }
 
     def validate_config_yaml(self, config: dict, config_path: str) -> None:
         check_kv_pools_fit(self, config, config_path, logger)
@@ -146,11 +127,11 @@ class CanaryModel(Model):
     def get_request_resource_configs(
         self, partition_fwd_args: dict[str, ForwardPassArgs],
         model_kwargs: dict | None = None,
-    ) -> dict[str, ResourceReqConfig]:
+    ) -> dict[str, SampleSettings]:
         del partition_fwd_args
         model_kwargs = model_kwargs or {}
         return {
-            SAMPLER: SamplingReqConfig(
+            SAMPLER: SampleSettings(
                 # greedy by default, as NeMo and HF decode Canary
                 temperature=model_kwargs.get("temperature", 0.0),
                 top_p=model_kwargs.get("top_p", 1.0),
@@ -280,19 +261,19 @@ class CanaryModel(Model):
         prompt_ids = self.config.prompt_ids(source, target, punctuation)
         # the encoder's frames for this clip, as the encoder node counts them
         context = int(self.config.encoder.output_lengths(samples.shape[0] // HOP_LENGTH))
-        kv_layout = {
-            KV_CACHE: {"main": LabelLayout(
+        state_layout = {
+            KV_CACHE: {"main": Layout(
                 spans=(Span("rows", "prefill", len(prompt_ids), len(prompt_ids), "text_inputs"),),
                 growth=(("decode_loop", 1),),
             )},
-            CROSS_KV_CACHE: {CONTEXT_LABEL: LabelLayout(
+            CROSS_KV_CACHE: {CONTEXT_LABEL: Layout(
                 spans=(Span("rows", "prefill", context, context, "encoder_states"),),
             )},
         }
         return ProcessPromptOutput({
             "audio": [samples],
             "text_inputs": [torch.tensor(prompt_ids, dtype=torch.long)],
-        }, {"kv_layout": kv_layout})
+        }, {"state_layout": state_layout})
 
     def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
         return {

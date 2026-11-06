@@ -19,7 +19,7 @@ import pytest
 PORTED = (
     "mstar/model/qwen3_5", "mstar/model/command_a_plus", "mstar/model/wan22", "mstar/model/flux2_klein",
     "mstar/model/z_image", "mstar/model/ltx2_5", "mstar/model/qwen3_omni", "mstar/model/pi05",
-    "mstar/model/vjepa2",
+    "mstar/model/vjepa2", "mstar/model/canary", "mstar/model/components/encoder_decoder.py",
 )
 FORBIDDEN_ATTRIBUTES = {
     "node_resources", "resources", "request_state", "per_request_states",
@@ -79,16 +79,24 @@ def _violations(source: str, path: str = "") -> tuple[list[str], set[tuple[str, 
     return found, used
 
 
+def _entry_sources(entry: str) -> list[Path]:
+    path = Path(entry)
+    return [path] if path.is_file() else [p for p in sorted(path.rglob("*.py")) if "tests" not in p.parts]
+
+
 def _sources() -> list[Path]:
-    return [
-        path for package in PORTED for path in sorted(Path(package).rglob("*.py")) if "tests" not in path.parts
-    ]
+    return [path for entry in PORTED for path in _entry_sources(entry)]
 
 
 @pytest.mark.parametrize("path", _sources(), ids=str)
 def test_a_ported_package_reaches_the_engine_only_through_the_contract(path):
     found, _ = _violations(path.read_text(), str(path))
     assert not found, f"{path} reaches past the contract: {found}"
+
+
+@pytest.mark.parametrize("entry", PORTED)
+def test_every_ported_entry_yields_a_source(entry):
+    assert _entry_sources(entry), f"{entry} yields no source, so the lint would pass it unread"
 
 
 def test_every_exception_is_still_used():
