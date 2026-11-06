@@ -5699,7 +5699,9 @@ class Worker(RepeatingSteps):
                     laps.skip()
                     if pending.node_batch.admit_error is None:
                         if self._is_device_run(pending):
-                            self._await_run(pending, spec_pending, lanes, gpu_executor)
+                            with self._span("worker.await_run", cpu="worker.await_run.cpu"):
+                                self._await_run(pending, spec_pending, lanes, gpu_executor)
+                            laps.skip()
                         self._finish_step(pending, outputs)
                         laps.skip()
 
