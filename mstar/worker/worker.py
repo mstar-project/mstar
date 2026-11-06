@@ -3331,17 +3331,12 @@ class Worker:
                 "Speculation: dropped rids %s (no loop-back output from N)",
                 sorted(dropped),
             )
-            speculation.node_batch.request_ids = [
-                r for r in speculation.node_batch.request_ids if r not in dropped
-            ]
+            # Its final chunks go back below; it must not flush or report done.
+            speculation.node_batch.drop_rids(dropped)
             for r in dropped:
                 speculation.node_batch.per_request_input_tensors.pop(r, None)
-                speculation.node_batch.per_request_info.pop(r, None)
                 speculation.scheduled_batch.discard_rid(r)
                 speculation.node_batch.per_request_input_metadata.pop(r, None)
-                # Its final chunks go back below; it must not flush or report done.
-                speculation.node_batch.final_stream_rids.discard(r)
-                speculation.node_batch.partition_done_rids.discard(r)
         speculation.continuing_rids = threaded_continuing
         speculation.dropped = dropped
 

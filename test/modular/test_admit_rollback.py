@@ -366,6 +366,32 @@ def test_a_per_request_forward_that_raises_fails_only_its_row():
     assert not any(rid == 2 for rid, _ in kv._admit_reserved_pages)
 
 
+def test_each_per_request_row_keeps_its_walk_of_a_combined_step(monkeypatch):
+    """A combined step's rows each run under their own walk; the per-row
+    fallback must say so to the resources, not hand them the combined one."""
+    kv = _kv("kv", pages=16)
+    eng = _engine({"kv": kv})
+    eng._submodules["n"].submodule = _RaisingSub.__new__(_RaisingSub)
+    eng._submodules["n"].forward = _forward_raising_on(None)
+    for rid in (1, 2):
+        kv.ingest_request(rid, None)
+    walks = {}
+    admit = kv.admit
+
+    def recording_admit(step, ctx):
+        walks.update({rid: ctx.walk_of(rid) for rid in ctx.request_ids})
+        return admit(step, ctx)
+
+    monkeypatch.setattr(kv, "admit", recording_admit)
+    batch = _per_request_batch([1, 2], PAGE)
+    batch.inputs = [SimpleNamespace(input_seq_len=PAGE, tensor_inputs={}, kwargs={})] * 2
+    batch.step_context.graph_walk = "mixed"
+    batch.step_context.request_walks = {1: "prefill", 2: "decode"}
+    eng._exec_per_request(batch)
+    assert not batch.failed_requests
+    assert walks == {1: "prefill", 2: "decode"}
+
+
 # --- the recurrent pool gives back the slots a refused step took --------------
 
 

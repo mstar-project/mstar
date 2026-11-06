@@ -299,7 +299,7 @@ class LLMSubmodule(ARNodeSubmodule):
         packed = inputs["vision_embeds"][0].to(device)
         start_embed, end_embed = self._sentinel_embeds()
 
-        pos = position(self.kv, fwd_info.request_id, "main")
+        pos = position(self.kv, fwd_info.rid_handle, "main")
         start_pos = pos
         embeds: list[torch.Tensor] = []
         pos_ids: list[torch.Tensor] = []
