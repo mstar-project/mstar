@@ -1895,19 +1895,20 @@ def test_qwen35_decode_builds_its_rope_in_the_graph_on_every_config(monkeypatch,
 @pytest.mark.parametrize("rows", ["loopback", "own_ids"])
 def test_qwen35_captured_decode_preprocess_reads_nothing_the_tables_fill(rows):
     """The graph fills positions and write locations, after `preprocess`."""
-    submodules, llm = _qwen35_llm()
+    from mstar.model.keys import SAMPLER
+
+    _, llm = _qwen35_llm()
     token = torch.tensor([5, 6])
     inputs = [
         SimpleNamespace(input_embeds=None, input_ids=None if rows == "loopback" else token[:1], custom_pos_ids=None,
                         input_seq_len=0 if rows == "loopback" else 1)
         for _ in range(2)
     ]
-    stub = SimpleNamespace(
-        _rope_in_graph=llm._rope_in_graph, _position_ids_3d=lambda inputs: pytest.fail("read positions"),
-    )
+    node = llm(None, SimpleNamespace(stop_token_ids=(1,)))
+    node._position_ids_3d = lambda inputs: pytest.fail("read positions")
     sampler = SimpleNamespace(loopback_tokens=lambda rids: token)
-    engine_inputs = SimpleNamespace(captured=True, request_ids=[1, 2], resources={submodules.SAMPLER: sampler})
-    out = llm.preprocess(stub, "decode", engine_inputs, inputs)
+    engine_inputs = SimpleNamespace(captured=True, request_ids=[1, 2], resources={SAMPLER: sampler})
+    out = node.preprocess("decode", engine_inputs, inputs)
     assert set(out) == {"input_ids"}
 
 
