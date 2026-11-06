@@ -18,6 +18,7 @@ if TYPE_CHECKING:
     from mstar.distributed.communication import JointGroups
     from mstar.engine.resources.base import Resource
     from mstar.engine.resources.context_parallel import ContextParallel
+    from mstar.engine.resources.sequence_shard import SeqShardSpec
 
 
 class KVLayout(Enum):
@@ -708,6 +709,24 @@ class KVSpec(NodeResourceSpec):
         # a paged pool's (`PagedKVConfig.context_parallel`); a ring keeps every position on each rank
         return self.config.context_parallel if isinstance(self.config, PagedKVConfig) else None
 
+    def split_step_refusals(self, node: str, shard: "SeqShardSpec", tp: int, sp: int) -> list[str]:
+        # stored by head, a split step's tokens trade for heads over every TP and SP rank (Ulysses)
+        cfg = self.config
+        if not isinstance(cfg, PagedKVConfig):
+            return []
+        if cfg.context_parallel:
+            return [
+                f"node {node!r} splits tokens over {sp} SP ranks, and KV {self.resource_key!r} stores them by "
+                "position (context_parallel), which split steps don't support yet: store it by head"
+            ]
+        q, kv = cfg._unsharded_qo_heads, cfg._unsharded_kv_heads
+        if q % tp or kv % tp or (q // tp) % sp or (kv // tp) % sp:
+            return [
+                f"node {node!r} splits tokens over {sp} SP ranks, and KV {self.resource_key!r} stores "
+                f"{q} query and {kv} KV heads by head, which don't split {sp} ways per TP rank"
+            ]
+        return []
+
     def apply_yaml_overrides(self, **kwargs):
         """Forwarded to the config: which keys are legal is a property of the
         storage strategy, so the config answers for them."""
@@ -831,8 +850,6 @@ class KVStep(ResourceStep):
     # is far longer than its prompt can then replay a graph sized by the prompt.
     eager_write: bool = False
 
-    # e.g., for batched CFG
-    combined_labels: dict[tuple[str, ...], str] = field(default_factory=dict)
     pre_forks: tuple[tuple[str, str], ...] = ()
     post_forks: tuple[tuple[str, str], ...] = ()
     # the rows the forks apply to; None is every row. A chunked prompt forks

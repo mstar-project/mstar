@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple, Protocol
 
 if TYPE_CHECKING:
     from mstar.engine.resources.base import Resource
+    from mstar.engine.resources.sequence_shard import SeqShardSpec
 
 logger = logging.getLogger(__name__)
 
@@ -138,6 +139,23 @@ class NodeResourceSpec(ABC):
         the same copy (``mstar.engine.resources.context_parallel``); None for one that holds no
         positions to place. A node whose resources place them runs replicated across its SP ranks."""
         return None
+
+    @property
+    def splits_steps(self) -> bool:
+        """Whether this resource splits its nodes' steps over their SP ranks
+        (``mstar.engine.resources.sequence_shard``)."""
+        return False
+
+    @property
+    def attends_split_steps(self) -> bool:
+        """Whether this is an attention that can take a split step's tokens: a node that splits
+        its steps needs one."""
+        return False
+
+    def split_step_refusals(self, node: str, shard: "SeqShardSpec", tp: int, sp: int) -> list[str]:
+        """What this resource can't run on ``node``, whose steps ``shard`` splits over ``sp`` SP
+        ranks (``tp`` TP ranks each); each a sentence."""
+        return []
 
     @property
     @abstractmethod

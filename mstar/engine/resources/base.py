@@ -51,12 +51,12 @@ class CGSlotKey:
     label: str
 
 
-def head_shards(group: JointGroups | None, positions_over_sp: bool = False) -> int:
+def head_shards(group: JointGroups | None, places_positions: bool = False) -> int:
     """How many ways a node's ranks split its attention heads: its TP and SP ranks, or TP alone
-    when its pools place positions over the SP ranks (``context_parallel.positions_over_sp``)."""
+    when its pools place positions over the SP ranks (``PagedKVConfig.context_parallel``)."""
     if group is None:
         return 1
-    return group.world_size // group.sp_group.world_size if positions_over_sp else group.world_size
+    return group.world_size // group.sp_group.world_size if places_positions else group.world_size
 
 
 @dataclass(frozen=True)
@@ -92,8 +92,8 @@ class EngineResourceInfo:
     prefix_caches: frozenset[str] = frozenset()
     # how many ways the node's ranks split its attention heads, which each builder sizes head counts
     # by; None for every TP and SP rank (`head_shards`), which the engine narrows for a node that
-    # places positions over its SP ranks. A ragged resource declaring
-    # ``RaggedAttentionConfig.shard_over_sp=False`` splits over TP only.
+    # places positions over its SP ranks. A ragged resource splits over TP only, unless it declares
+    # ``RaggedAttentionSpec.sp_exchange``.
     head_shards: int | None = None
 
     def __post_init__(self):
@@ -146,6 +146,9 @@ class Resource(ResidentHooks, ABC):
     prefix_skip_safe: bool = False
     # stays correct when a pool it depends on has a `placement`; the engine refuses to load it otherwise
     supports_context_parallel: bool = False
+    # stays correct on a node whose steps split over its SP ranks (`SeqShardSpec`); the engine
+    # refuses to load it on one otherwise
+    supports_split_steps: bool = False
 
     @property
     def placement(self) -> "ContextParallel | None":
@@ -417,7 +420,8 @@ class Resource(ResidentHooks, ABC):
         return snapshot
 
     def reset_request(self, rid: str, free: bool=False):
-        """For clearing dummy RIDs during cuda graph capture"""
+        """Clear a dummy rid's state: during accelerator graph capture, after each replayed step
+        and when a pre-plan is discarded."""
         return
 
     # Pre-planning
@@ -494,6 +498,12 @@ class Resource(ResidentHooks, ABC):
         return 0.0
 
     # Engine lifecycle
+
+    def check_captures(self, node: str, configs: list[AcceleratorGraphConfig], piecewise: Mapping) -> None:
+        """Raise ``ValueError`` for a capture of ``node`` this resource can't replay, before any
+        is taken: ``configs`` its whole-forward capture configs, ``piecewise`` its piecewise
+        runners by region."""
+        return
 
     def build_accelerator_graph_buffers(
         self, slots: list[CGSlotSpec],

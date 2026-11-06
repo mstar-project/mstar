@@ -57,13 +57,6 @@ class ShardingConfig:
     groups: list[ShardingGroup]
     tp_enabled_nodes: set[str]
     shard_dim: dict[str, int | None]  # signal name to shard dim (None/absent for replicated)
-    # Nodes whose attention supports Ulysses sequence parallelism. SP shards
-    # activations in-module (an all-to-all around attention) rather than
-    # weights, so it adds no shard_dim entries — signals stay replicated
-    # across the instance — but it does widen the node's ShardingGroup: the
-    # group is the lockstep unit, spanning the whole tp*sp instance. This
-    # set itself only gates config validation.
-    sp_enabled_nodes: set[str] = field(default_factory=set)
     # Nodes whose routed experts honour a node group's ``ep_config``; gates validation.
     ep_enabled_nodes: set[str] = field(default_factory=set)
 
@@ -72,7 +65,6 @@ class ShardingConfig:
             groups=[group.clone_empty() for group in self.groups],
             tp_enabled_nodes=self.tp_enabled_nodes,
             shard_dim=self.shard_dim,
-            sp_enabled_nodes=self.sp_enabled_nodes,
             ep_enabled_nodes=self.ep_enabled_nodes,
         )
 
@@ -85,7 +77,6 @@ class ShardingConfig:
         self.group_mapping: dict[NodeAndGraphWalk, ShardingGroup] = {}
         self.node_to_worker: dict[NodeAndGraphWalk, list[str]] = {}
         self.tp_enabled_nodes = set(self.tp_enabled_nodes)
-        self.sp_enabled_nodes = set(self.sp_enabled_nodes)
         self.ep_enabled_nodes = set(self.ep_enabled_nodes)
         self._setup_done = False
 

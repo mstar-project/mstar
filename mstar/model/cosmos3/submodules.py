@@ -57,7 +57,7 @@ from mstar.engine.accelerator_graph_config import (
     PackedAcceleratorGraphConfig,
 )
 from mstar.engine.fp32_precision import cudnn_benchmark
-from mstar.engine.resources import AttentionStep, KVStep, Segment, SlotLease, SubmoduleStep
+from mstar.engine.resources import AttentionStep, KVStep, Segment, SeqShardStep, SlotLease, SubmoduleStep
 from mstar.engine.resources.kv.config import RetentionPolicy
 from mstar.engine.windowing import WindowSchedule
 from mstar.model.components.diffusion.unipc import (
@@ -149,7 +149,7 @@ COND_LABEL = "main"
 UNCOND_LABEL = "uncond"
 
 # Combined plan key for the single plan that runs both guidance branches in
-# one forward (``KVStep.combined_labels`` in the step declaration).
+# one forward (``SubmoduleStep.combined_labels`` in the step declaration).
 CFG_BATCHED_LABEL = "_cfg_batched"
 
 # A captured denoise step's static-buffer inputs, each stacked on a leading
@@ -171,6 +171,10 @@ KV_CACHE = "kv"
 ATTN = "attn"
 ATTN_GEN = "attn_gen"
 SAMPLER = "sampler"
+# The sequence shard over the KV pool's nodes: on SP ranks it splits a
+# generation step's tokens over them (the transformer binds it by this name).
+# Every step of those nodes declares it, a prefill and the reasoner's included.
+SEQ_SHARD = "seq_shard"
 
 # Denoise state (initial noise, latents between steps, the guidance combine and
 # the scheduler step) is fp32 for image, video, sound and action requests, as
@@ -1037,13 +1041,13 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         read its own context. ``retention`` (per label) rides on the step
         for the pool to apply once the span is counted."""
         labels = (COND_LABEL, UNCOND_LABEL) if cfg else (COND_LABEL,)
-        combined = cfg and self.batched_cfg
         return SubmoduleStep(
             segments=self._segments(request_ids, labels, [spans] * len(labels)),
+            combined_labels={labels: CFG_BATCHED_LABEL} if cfg and self.batched_cfg else {},
             steps={
+                SEQ_SHARD: SeqShardStep(),
                 KV_CACHE: KVStep(
                     commit=True,
-                    combined_labels={labels: CFG_BATCHED_LABEL} if combined else {},
                     retention={
                         (rid, label): policy
                         for rid in request_ids
@@ -1500,6 +1504,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             labels = (COND_LABEL, UNCOND_LABEL) if cfg else (COND_LABEL,)
             return SubmoduleStep(
                 cg_key_info=cfg or None,
+                combined_labels={labels: CFG_BATCHED_LABEL} if cfg else {},
                 segments=self._segments(
                     request_ids, labels,
                     [
@@ -1508,12 +1513,8 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
                     ],
                 ),
                 steps={
-                    KV_CACHE: KVStep(
-                        commit=True,
-                        combined_labels=(
-                            {labels: CFG_BATCHED_LABEL} if cfg else {}
-                        ),
-                    ),
+                    SEQ_SHARD: SeqShardStep(),
+                    KV_CACHE: KVStep(commit=True),
                     ATTN: AttentionStep(causal=True),
                 },
             )
@@ -1607,16 +1608,13 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         committed, non-causal attention over [frozen prefix | fresh tokens]."""
         return SubmoduleStep(
             cg_key_info=cg_key_info,
+            combined_labels={labels: CFG_BATCHED_LABEL} if combined else {},
             segments=self._segments(
                 request_ids, labels, [spans] * len(labels)
             ),
             steps={
-                KV_CACHE: KVStep(
-                    commit=False,
-                    combined_labels=(
-                        {labels: CFG_BATCHED_LABEL} if combined else {}
-                    ),
-                ),
+                SEQ_SHARD: SeqShardStep(),
+                KV_CACHE: KVStep(commit=False),
                 attn_key: AttentionStep(causal=False),
             },
         )
@@ -3318,6 +3316,7 @@ class Cosmos3ReasonerSubmodule(ARNodeSubmodule):
         return SubmoduleStep(
             segments=segments,
             steps={
+                SEQ_SHARD: SeqShardStep(),
                 KV_CACHE: KVStep(commit=True),
                 ATTN: AttentionStep(causal=True),
                 SAMPLER: sampler,

@@ -284,17 +284,8 @@ class LoraAdapterPool(Resource):
         rank, world_size, agree, decides = 0, 1, None, True
         joint = info.joint_comm_group
         if joint is not None:
-            # a node whose pools place positions over its SP ranks runs replicated over
-            # them, heads split over TP alone (`head_shards`), so every rank sees every row
-            if info.head_shards != joint.tp_group.world_size:
-                raise ValueError(
-                    f"LoRA resource {spec.resource_key!r} serves a node that runs sequence "
-                    f"parallelism (SP={joint.sp_group.world_size}), which LoRA does not "
-                    "support: its rows are laid out per request, while each SP rank holds "
-                    "a shard of the tokens. Serve this node without SP, or drop the "
-                    "'lora:' block"
-                )
-            # the base linears split over the TP group
+            # the base linears split over the TP group; every SP rank runs every row, as a node
+            # splitting its steps over them is refused (`LoraSpec.split_step_refusals`)
             rank, world_size = joint.tp_group.rank, joint.tp_group.world_size
             if joint.world_size > 1:
                 agree = joint.agree  # MIN

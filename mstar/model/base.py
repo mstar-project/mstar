@@ -1115,7 +1115,7 @@ class Model(ABC):
     @abstractmethod
     def get_submodule(
         self, node_name: str, device="cpu", tp_group=None,
-        autocast_dtype: torch.dtype | None = None, sp_group=None,
+        autocast_dtype: torch.dtype | None = None,
         moe_parallel: "MoeParallelConfig | None" = None,
     ) -> torch.nn.Module | None:
         """Return the nn.Module for this node, or None for dummy mode.
@@ -1125,12 +1125,6 @@ class Model(ABC):
         Models that support tensor parallelism should forward it to
         parallel-linear constructors so weight shapes are partitioned at
         init time and the weight loaders shard correctly.
-
-        ``sp_group`` is the node's sequence-parallel comm group, orthogonal
-        to ``tp_group``. The engine manager only passes it when the node
-        participates in a non-trivial SP group, so models without SP support
-        never receive it. Models that support SP forward it to their
-        attention so it can all-to-all the sequence around the kernel.
 
         ``moe_parallel`` is the node group's ``ep_config``: TP or EP for the
         node's routed experts. Passed only for a node in ``ep_enabled_nodes``

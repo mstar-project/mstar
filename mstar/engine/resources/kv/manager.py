@@ -538,6 +538,11 @@ class _DecodePlanCache:
 
 class KVManager(AttentionResource):
     prefix_skip_safe = True
+    # written through an exchange, which hands it the step's every token (`sequence_shard`)
+    supports_split_steps = True
+    # the node's sequence shard, which refuses a write of a split label outside an exchange
+    # (`bind_sequence_shard`)
+    _sequence_shard = None
     # this pool's resident tables, once a node's planner bound them
     _resident: "KVResidentTables | None" = None
 
@@ -4837,6 +4842,11 @@ class KVManager(AttentionResource):
         # unlike attention, every read here needs a usable index
         self._default_layer_idx = 0
 
+    def bind_sequence_shard(self, shard) -> None:
+        """The sequence shard an attention over this pool exchanges split steps through
+        (`AttentionManager.bind_dependencies`): a write of a split label outside it raises."""
+        self._sequence_shard = shard
+
     @torch.compiler.disable
     def write_target(self, layer_idx: int = None, label: str = None):
         """Where this step's K/V go, for a layer that writes them itself in a
@@ -4846,6 +4856,8 @@ class KVManager(AttentionResource):
             layer_idx = self._default_layer_idx
         if label is None:
             label = self._default_label
+        if self._sequence_shard is not None:
+            self._sequence_shard.check_bypass(label, "KV write_target")
         if self.kv_cache.layout != KVLayout.NHD:
             raise NotImplementedError(f"write_target is not implemented for layout {self.kv_cache.layout}")
         state = self._current_plan_states[label, self._layer_group[layer_idx]]
@@ -4875,6 +4887,8 @@ class KVManager(AttentionResource):
             raise ValueError(f"KV {self.name}: a pool with full and sliding layers writes through write_kv only")
         if label is None:
             label = self._default_label
+        if self._sequence_shard is not None:
+            self._sequence_shard.check_bypass(label, "KV write_slots")
         plan_state = self._current_plan_states[label, 0]
         n = plan_state.total_tokens
         return plan_state.token_to_page[:n], plan_state.token_to_cache[:n]
@@ -4890,6 +4904,8 @@ class KVManager(AttentionResource):
             layer_idx = self._default_layer_idx
         if label is None:
             label = self._default_label
+        if self._sequence_shard is not None:
+            self._sequence_shard.check_bypass(label, "KV write_kv")
         plan_state = self._current_plan_states[label, self._layer_group[layer_idx]]
         if plan_state.ready is not None:
             torch.cuda.current_stream(k.device).wait_event(plan_state.ready)

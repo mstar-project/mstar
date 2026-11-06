@@ -705,11 +705,10 @@ class Wan22Model(Model):
 
     def get_submodule(
         self, node_name: str, device: str = "cpu", tp_group=None,
-        autocast_dtype: torch.dtype | None = None, sp_group=None,
+        autocast_dtype: torch.dtype | None = None,
     ) -> torch.nn.Module | None:
-        # ``autocast_dtype`` and ``sp_group`` exist for interface parity only.
-        # Weights load in the checkpoint's own dtypes, and wan22 declares no
-        # sp-enabled nodes.
+        # ``autocast_dtype`` exists for interface parity only: weights load in
+        # the checkpoint's own dtypes.
         if node_name in self._submodule_cache:
             return self._submodule_cache[node_name]
         submodule = self._create_submodule(node_name, device)

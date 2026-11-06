@@ -347,6 +347,32 @@ class CommGroup:
         return torch.cat(pieces, dim=gather_dim)
 
 
+def sp_seq_split(total: int, world_size: int) -> list[int]:
+    """Even per-rank token counts summing to ``total``, earlier ranks taking the remainder: how a
+    sequence splits over a group's ranks, contiguous in rank order."""
+    base, rem = divmod(total, world_size)
+    return [base + (1 if r < rem else 0) for r in range(world_size)]
+
+
+def gather_sequence(group: CommGroup, x_shard: torch.Tensor, seq_sizes: Sequence[int], dim: int = 0) -> torch.Tensor:
+    """Every rank's share along ``dim`` (``seq_sizes``, per rank) back as the whole tensor, in rank
+    order. Each share is padded to the largest, so every rank gathers the same shape, then trimmed."""
+    world_size = group.world_size
+    if world_size == 1:
+        return x_shard
+    max_sz = max(seq_sizes)
+    local = x_shard
+    if local.size(dim) < max_sz:
+        pad_shape = list(local.shape)
+        pad_shape[dim] = max_sz - local.size(dim)
+        local = torch.cat([local, local.new_zeros(pad_shape)], dim=dim)
+    gathered = group.all_gather(local.contiguous(), dim=dim)
+    if all(s == max_sz for s in seq_sizes):
+        return gathered
+    chunks = torch.split(gathered, max_sz, dim=dim)
+    return torch.cat([chunks[r].narrow(dim, 0, seq_sizes[r]) for r in range(world_size)], dim=dim).contiguous()
+
+
 @dataclass
 class JointGroups:
     tp_group: CommGroup

@@ -14,7 +14,7 @@ from typing import Any, NamedTuple
 from mstar.distributed.base import ShardingConfig
 from mstar.engine.resources.lora.config import LORA_RESOURCE_KEY, LoraSpec, lora_enabled
 from mstar.engine.resources.lora.serving import declared_lora_specs, size_lora_specs
-from mstar.model.base import Model, WorkerGraph, built_resources, parse_autocast_dtype
+from mstar.model.base import Model, WorkerGraph, built_resources, node_moe_parallel_configs, parse_autocast_dtype
 from mstar.validation.client_streams import check_client_streams
 from mstar.validation.knobs import check_knobs
 from mstar.validation.placement import check_worker_graphs, node_groups_problems, routing_weights_problems
@@ -158,9 +158,11 @@ def validate_deployment(
         model, config, deployment.sharding_config if deployment is not None else None,
     )
     if deployment is not None:
+        # get_sharding_config parsed these already, so this can't raise here
+        moe_parallel = node_moe_parallel_configs(config["node_groups"])
         problems += _checked(
             "checking the worker graphs", check_worker_graphs,
-            model, deployment.worker_graphs, deployment.sharding_config, specs,
+            model, deployment.worker_graphs, deployment.sharding_config, specs, moe_parallel,
         )
 
     if problems:

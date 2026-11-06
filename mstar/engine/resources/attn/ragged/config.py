@@ -4,9 +4,10 @@ Kept free of the manager and its kernels, like the other resources' configs, so
 a submodule can declare a step without pulling FlashInfer in behind it.
 """
 
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import torch
 
@@ -15,6 +16,7 @@ from mstar.engine.resources.step import ResourceStep
 
 if TYPE_CHECKING:
     from mstar.engine.resources.base import Resource
+    from mstar.engine.resources.sequence_shard import SeqShardSpec
 
 
 def cross_label(q_label: str, kv_label: str) -> str:
@@ -92,11 +94,6 @@ class RaggedAttentionConfig:
     # engine's KV dtype (which is actually a misnamed autocast dtype) is used.
     dtype: torch.dtype | None = None
 
-    # False keeps every head on each sequence-parallel rank (TP still shards
-    # them), for an attention a rank runs whole over its own tokens: one over a
-    # replicated stream, or a cross-attention from the rank's query shard.
-    shard_over_sp: bool = True
-
     # Where each label's FlashInfer workspace starts, per slot; None takes
     # MSTAR_WORKSPACE_BUFFER_MB, which a declared size wins over. A floor: a plan that
     # asks for more grows it. A ragged prefill only spends it on split-KV partials, so a
@@ -139,6 +136,14 @@ class _RaggedSpecBase(NodeResourceSpec):
     """The config and deployment overrides both ragged specs share."""
 
     config: RaggedAttentionConfig
+    # the sequence shard over its nodes, if any (`derive`, on the kinds that take split steps)
+    shard_key: str | None = field(default=None, init=False, repr=False)
+    # how a split label's tokens reach the heads: declared on self-attention (`RaggedAttentionSpec`),
+    # derived per pair on cross-attention
+    sp_exchange = None
+
+    def depends_on(self) -> set[str]:
+        return set() if self.shard_key is None else {self.shard_key}
 
     def apply_yaml_overrides(
         self,
@@ -176,7 +181,39 @@ class _RaggedSpecBase(NodeResourceSpec):
 
 @dataclass
 class RaggedAttentionSpec(_RaggedSpecBase):
-    """Cacheless self-attention within each declared span (``AttentionStep``)."""
+    """Cacheless self-attention within each declared span (``AttentionStep``).
+
+    ``sp_exchange="ulysses"`` attends a label its node's sequence shard splits by Ulysses (one
+    all-to-all from split tokens to split heads, and back), and shards heads over every TP and SP
+    rank, slicing them on a copied step. None (the default) attends only copied labels, heads over
+    TP. A no-op on a node with no ``SeqShardSpec``. On SP ranks every label of an ``sp_exchange``
+    resource goes through an exchange, so ``run(..., return_lse=True)`` raises there."""
+
+    sp_exchange: Literal["ulysses"] | None = None
+
+    def __post_init__(self):
+        super().__post_init__()
+        if self.sp_exchange not in (None, "ulysses"):
+            raise ValueError(f"sp_exchange must be 'ulysses' or None, not {self.sp_exchange!r}")
+
+    def derive(self, specs: Mapping[str, NodeResourceSpec]) -> list[str]:
+        from mstar.engine.resources.sequence_shard import take_shard_edge
+
+        return take_shard_edge(self, specs)
+
+    @property
+    def attends_split_steps(self) -> bool:
+        return self.sp_exchange is not None
+
+    def split_step_refusals(self, node: str, shard: "SeqShardSpec", tp: int, sp: int) -> list[str]:
+        cfg = self.config
+        q, kv = cfg._unsharded_qo_heads, cfg._unsharded_kv_heads
+        if self.sp_exchange == "ulysses" and (q % (tp * sp) or kv % (tp * sp)):
+            return [
+                f"ragged attention {self.resource_key!r} declares sp_exchange 'ulysses', and its {q} query and "
+                f"{kv} KV heads don't split over {tp} TP x {sp} SP ranks"
+            ]
+        return []
 
     @property
     def resource_class(self) -> "type[Resource]":
@@ -193,7 +230,26 @@ class RaggedCrossAttentionSpec(_RaggedSpecBase):
 
     Separate from ``RaggedAttentionSpec`` so a resource is one kind of attention:
     a model with both declares one of each per head geometry.
+
+    On a node whose sequence shard splits a step, each pair's exchange follows from which side
+    is split: split queries over copied keys attend locally, copied queries over split keys merge
+    every rank's partial (``sharded_key_merge``), and both split is refused. The shard must split
+    each row (``axis=1``): a packed split (``axis=0``) can leave a rank none of a row.
     """
+
+    def derive(self, specs: Mapping[str, NodeResourceSpec]) -> list[str]:
+        from mstar.engine.resources.sequence_shard import take_shard_edge
+
+        return take_shard_edge(self, specs)
+
+    def split_step_refusals(self, node: str, shard: "SeqShardSpec", tp: int, sp: int) -> list[str]:
+        if shard.axis == 0:
+            return [
+                f"ragged cross-attention {self.resource_key!r} on node {node!r}, whose sequence shard "
+                f"{shard.resource_key!r} splits packed tokens (axis 0), which can leave a rank no tokens of a "
+                "row to attend: split each row (axis 1)"
+            ]
+        return []
 
     @property
     def resource_class(self) -> "type[Resource]":

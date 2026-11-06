@@ -26,11 +26,11 @@ from torch import nn
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.distributed.communication import CommGroup
 from mstar.engine.resources import (
     AttentionStep,
     RaggedCrossAttentionStep,
     Segment,
+    SeqShardStep,
     SlotLease,
     SubmoduleStep,
     cross_label,
@@ -40,7 +40,7 @@ from mstar.model.components.diffusion.attention import joint_attention, sdpa_att
 from mstar.model.components.diffusion.compile_utils import compile_transformer_forward, with_inductor_rounding
 from mstar.model.components.diffusion.denoise_loop import DenoiseLoopSubmodule
 from mstar.model.components.diffusion.flow_match import FlowMatchSchedule, euler_step
-from mstar.model.components.distributed.sequence_parallel import sp_seq_split
+from mstar.model.ltx2_5.components.layers import RotaryTable
 from mstar.model.ltx2_5.components.transformer import LTX2Attends, build_rope
 from mstar.model.ltx2_5.config import DISTILLED_SIGMA_VALUES, STAGE_2_DISTILLED_SIGMA_VALUES, LTX25Config
 from mstar.model.submodule_base import NodeInputs, NodeSubmodule
@@ -60,6 +60,8 @@ VIDEO_OUTPUT, AUDIO_OUTPUT = "video_output", "audio_output"
 # cross-modal attentions.
 VIDEO_ATTN, AUDIO_ATTN = "dit_attn_video", "dit_attn_audio"            # self-attention
 VIDEO_XATTN, AUDIO_XATTN = "dit_xattn_video", "dit_xattn_audio"        # cross-attention
+# On SP ranks, splits each row's video tokens over them (audio and text stay whole).
+VIDEO_SHARD = "dit_video_shard"
 # (q_label, kv_label) pairs each cross resource plans
 VIDEO_XATTN_PAIRS = (("video", "text"),)
 AUDIO_XATTN_PAIRS = (("audio", "text"), ("video", "audio"), ("audio", "video"))
@@ -212,6 +214,10 @@ class LTXDenoiseSubmodule(DenoiseLoopSubmodule):
     two head geometries). With no resource bound
     (``attention_backend="sdpa"``), every attention runs SDPA, which is what the
     reference pipeline runs; so does any attention whose resource is not bound.
+
+    On SP ranks the sequence shard (``VIDEO_SHARD``) splits each row's video tokens:
+    ``denoise`` runs the DiT on this rank's share, and the video self-attention
+    exchanges tokens for heads inside its resource (``sp_exchange="ulysses"``).
     """
 
     SOLVER_STATE = (AUDIO_LATENTS,)
@@ -230,7 +236,6 @@ class LTXDenoiseSubmodule(DenoiseLoopSubmodule):
         capture_buckets=(),
         capture_batch_sizes=(1, 2, 4),
         replay_walks=None,
-        sp_group: CommGroup | None = None,
     ):
         super().__init__(
             loop_name=loop_name, max_batch_size=max_batch_size, attn_resource_key=None,
@@ -241,9 +246,6 @@ class LTXDenoiseSubmodule(DenoiseLoopSubmodule):
         self.use_ragged_attention = use_ragged_attention
         # walks that run the two-stage recipe's stage 2 (the refine loop)
         self.refine_walks = frozenset(refine_walks)
-        # the transformer's sequence-parallel group: each rank's cross-attentions attend
-        # from its share of the video tokens
-        self.sp_group = sp_group or CommGroup.trivial()
         self._attends: LTX2Attends | None = None
         if compile_transformer and transformer is not None:
             # Fuses the AdaLN modulation, norms, RoPE and gating chains (44% of an eager
@@ -325,10 +327,19 @@ class LTXDenoiseSubmodule(DenoiseLoopSubmodule):
         audio_latents, text_video, text_audio, **cond,
     ):
         dtype = self.transformer.dtype
+        rope = self.layout(bucket_key, latents.device)
+        # on a step the sequence shard splits, the DiT runs on this rank's share of each
+        # row's video tokens (the scatter is the identity otherwise)
+        shard = self.node_resources.get(VIDEO_SHARD)
+        video = latents
+        if shard is not None:
+            video, *tables = shard.scatter(VIDEO_SPAN, latents, *rope.video, *rope.cross_video)
+            rope = rope._replace(video=RotaryTable(*tables[:2]), cross_video=RotaryTable(*tables[2:]))
         velocity, audio_velocity = self.transformer(
-            latents.to(dtype), audio_latents.to(dtype), text_video, text_audio, timestep,
-            self.layout(bucket_key, latents.device), self.attends(),
+            video.to(dtype), audio_latents.to(dtype), text_video, text_audio, timestep, rope, self.attends(),
         )
+        if shard is not None:
+            velocity = shard.gather(VIDEO_SPAN, velocity)
         return {
             LATENTS: ltx_step(latents, velocity, sigma, sigma_next),
             AUDIO_LATENTS: ltx_step(audio_latents, audio_velocity, sigma, sigma_next),
@@ -365,26 +376,24 @@ class LTXDenoiseSubmodule(DenoiseLoopSubmodule):
     ) -> SubmoduleStep | None:
         if not self.use_ragged_attention:
             return None
-        sp = self.sp_group
-        video, video_shard, audio, text = [], [], [], []
+        video, audio, text = [], [], []
         for rid, inp in zip(request_ids, inputs, strict=True):
             shape: LTXShape = inp.resource_step_info
             video.append(Segment(request_id=rid, label=VIDEO_SPAN, span=shape.video_tokens))
-            # the cross-attentions attend from (and the audio queries over) this rank's share
-            # of the video tokens; LTX2Block merges the shards' audio-over-video attentions
-            shard = sp_seq_split(shape.video_tokens, sp.world_size)[sp.rank]
-            video_shard.append(Segment(request_id=rid, label=VIDEO_SPAN, span=shard))
             audio.append(Segment(request_id=rid, label=AUDIO_SPAN, span=shape.audio_frames))
             text.append(Segment(request_id=rid, label=TEXT_SPAN, span=shape.text_len))
+        # Every span whole: on a split step the attention resources cut the video spans to
+        # this rank's share themselves.
         return SubmoduleStep(
             steps={
+                VIDEO_SHARD: SeqShardStep(segments=tuple(video)),
                 VIDEO_ATTN: AttentionStep(segments=tuple(video), causal=False),
                 AUDIO_ATTN: AttentionStep(segments=tuple(audio), causal=False),
                 VIDEO_XATTN: RaggedCrossAttentionStep(
-                    segments=tuple(video_shard + text), pairs=VIDEO_XATTN_PAIRS,
+                    segments=tuple(video + text), pairs=VIDEO_XATTN_PAIRS,
                 ),
                 AUDIO_XATTN: RaggedCrossAttentionStep(
-                    segments=tuple(video_shard + audio + text), pairs=AUDIO_XATTN_PAIRS,
+                    segments=tuple(video + audio + text), pairs=AUDIO_XATTN_PAIRS,
                 ),
             },
             cg_key_info=self._uniform_key(inp.resource_step_info for inp in inputs),

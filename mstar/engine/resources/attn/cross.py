@@ -314,8 +314,8 @@ class FlashInferCrossManager(CrossAttentionManager):
         """Query packing off this step's own segments, for a query side with no
         KV cache: one entry per segment, in declared order.
 
-        No ``combined_labels`` here — that grouping lives on ``KVStep``, so a
-        cacheless query side plans one label per segment label.
+        ``combined_labels`` is read off the KV plan, not here, so a cacheless
+        query side plans one label per segment label.
         """
         rids: dict[str, list[str]] = {}
         qo_indptrs: dict[str, list[int]] = {}

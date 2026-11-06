@@ -87,7 +87,8 @@ class FlashInferRaggedBlockCausalManager(_FlashInferRaggedManagerBase, RaggedBlo
         refuse_context_only(step, type(self).__name__)
         super().plan(step, ctx)
 
-    def _plan_layouts(self, step: AttentionStep, ctx: StepContext, plan_states) -> None:
+    def _plan_layouts(self, step: AttentionStep, ctx: StepContext, plan_states, shard_plan) -> None:
+        # takes no split steps (`supports_split_steps`), so has no shard to read
         if step.causal:
             raise ValueError(
                 "block-causal attention is its own mask; declare it with "

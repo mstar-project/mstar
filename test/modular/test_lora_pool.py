@@ -488,10 +488,11 @@ def test_a_lora_refusal_does_not_look_for_an_eviction_victim(caplog):
 
 
 def test_lora_under_sequence_parallelism(adapters):
-    """LoRA rows are per request, not per SP shard: the build refuses SP > 1 at startup,
-    and takes TP with SP 1, and a node that places its KV positions over its SP ranks
-    (heads split over TP alone), which runs every row on every SP rank."""
+    """LoRA rows are per request, not per SP shard: the build takes TP with SP 1, and a node that
+    places its KV positions over its SP ranks (heads split over TP alone), which runs every row on
+    every SP rank; a node splitting its steps over them is refused before the build."""
     from mstar.distributed.communication import CommGroup, JointGroups
+    from mstar.engine.resources.sequence_shard import SeqShardSpec, sequence_parallel_refusals
 
     _, paths = adapters
     sp2 = CommGroup(my_global_rank=0, my_group_rank=0, group_members=[0, 1])
@@ -501,10 +502,13 @@ def test_lora_under_sequence_parallelism(adapters):
         info = EngineResourceInfo(device=CPU, joint_comm_group=groups, head_shards=head_shards)
         return LoraAdapterPool.build(make_spec(paths), info)
 
-    with pytest.raises(ValueError, match=r"sequence parallelism \(SP=2\)"):
-        build(sp2)
     assert build(CommGroup.trivial()).targets
     assert build(sp2, head_shards=1).targets
+    shard = SeqShardSpec("shard", {"LLM"}, ("main",), 0)
+    assert any(
+        "LoRA resource 'lora' serves node 'LLM', which splits tokens over 2 SP ranks" in refusal
+        for refusal in sequence_parallel_refusals([make_spec(paths), shard], "LLM", 1, 2)
+    )
 
 
 def test_a_replicated_slice_that_does_not_split_evenly_is_refused():
@@ -512,18 +516,6 @@ def test_a_replicated_slice_that_does_not_split_evenly_is_refused():
     the ranks, as for the base K/V projection."""
     with pytest.raises(ValueError, match="do not split evenly"):
         LoraTarget(in_features=HIDDEN, out_slices=(12,), parallel="column", slice_units=(3,)).shard(4)
-
-
-def test_lora_over_a_node_running_its_own_sp_is_refused_before_spawn():
-    """validate_deployment refuses what LoraAdapterPool.build would on every worker."""
-    from types import SimpleNamespace
-
-    from mstar.validation.placement import _sequence_parallel
-
-    model = SimpleNamespace(get_default_sharding_config=lambda: SimpleNamespace(sp_enabled_nodes={"LLM"}))
-    group = SimpleNamespace(_group_id=0, _tp_comm_size=1, sp_size=2, section=SimpleNamespace(get_nodes=lambda: {"LLM"}))
-    [problem] = _sequence_parallel(model, [group], [make_spec({})])
-    assert "LoRA resource 'lora' serves ['LLM'], which run their own sequence parallelism" in problem
 
 
 def test_served_targets_narrow_to_what_the_adapters_touch(adapters):

@@ -1259,12 +1259,9 @@ class LLMSubmodule(ARNodeSubmodule):
             pos_ids = [
                 tensor for label in labels for tensor in per_label_pos_ids[label]
             ]
-            return SubmoduleStep(cg_key_info=requires_cfg, steps={
-                "kv": KVStep(
-                    segments=segments,
-                    commit=False,
-                    combined_labels={tuple(labels): self.CFG_BATCHED_LABEL},
-                ),
+            combined = {tuple(labels): self.CFG_BATCHED_LABEL}
+            return SubmoduleStep(cg_key_info=requires_cfg, combined_labels=combined, steps={
+                "kv": KVStep(segments=segments, commit=False),
                 "attn": AttentionStep(segments=segments, causal=False),
                 "rope": PositionStep(
                     segments=segments,

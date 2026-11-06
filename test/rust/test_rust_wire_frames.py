@@ -87,7 +87,7 @@ class _Mesh:
             worker_graphs=[wg],
             remote_worker_graphs=list(remote),
             sharding={"groups": [], "shard_dim": [],
-                      "tp_enabled_nodes": [], "sp_enabled_nodes": []},
+                      "tp_enabled_nodes": []},
             bookkeeping=self.book._rust, me=ME, communicator=self.comm,
         )
 
@@ -482,7 +482,7 @@ def _loop_mesh(tmp_path):
                                "nodes": ["ar_decode"],
                                "dyn_loops": ["ar_loop"]}],
         sharding={"groups": [], "shard_dim": [],
-                  "tp_enabled_nodes": [], "sp_enabled_nodes": []},
+                  "tp_enabled_nodes": []},
         bookkeeping=book._rust, me=ME, communicator=comm,
     )
     rid = rt.add_request("r1", "default", WALK, [WG_ID, 1], [WG_ID, 1],
@@ -531,7 +531,7 @@ def _emit_mesh(tmp_path, tp_rank, shard_dim=None):
             "groups": [{"nodes": ["only"], "tp_size": 2,
                         "graph_walks": None, "tp_rank": tp_rank}],
             "shard_dim": [] if shard_dim is None else [("out", shard_dim)],
-            "tp_enabled_nodes": [], "sp_enabled_nodes": [],
+            "tp_enabled_nodes": [],
         },
         bookkeeping=book._rust, me=ME, communicator=comm,
     )
@@ -576,7 +576,7 @@ def _persist_mesh(tmp_path, tp_rank):
         sharding={
             "groups": [{"nodes": ["only"], "tp_size": 2,
                         "graph_walks": None, "tp_rank": tp_rank}],
-            "shard_dim": [], "tp_enabled_nodes": [], "sp_enabled_nodes": [],
+            "shard_dim": [], "tp_enabled_nodes": [],
         },
         bookkeeping=book._rust, me=ME, communicator=comm,
     )
@@ -675,7 +675,7 @@ def _fanout_mesh(tmp_path, shard_dim=None, dims=(4, 3), nbytes=24, stride=None):
                  "graph_walks": None, "tp_rank": 0},
             ],
             "shard_dim": [] if shard_dim is None else [("out", shard_dim)],
-            "tp_enabled_nodes": [], "sp_enabled_nodes": [],
+            "tp_enabled_nodes": [],
         },
         bookkeeping=book._rust, me=ME, communicator=comm,
     )
@@ -807,7 +807,7 @@ def _gather_mesh(tmp_path, src_tp, dest_tp, my_rank=0, shard_dim=0,
                  "graph_walks": None, "tp_rank": 0},
             ],
             "shard_dim": [] if shard_dim is None else [("out", shard_dim)],
-            "tp_enabled_nodes": [], "sp_enabled_nodes": [],
+            "tp_enabled_nodes": [],
         },
         bookkeeping=book._rust, me=ME, communicator=comm,
     )
@@ -908,7 +908,7 @@ def _looping_emit_mesh(tmp_path):
     rt = GraphRuntime(
         worker_graphs=[wg], remote_worker_graphs=[],
         sharding={"groups": [], "shard_dim": [],
-                  "tp_enabled_nodes": [], "sp_enabled_nodes": []},
+                  "tp_enabled_nodes": []},
         bookkeeping=book._rust, me=ME, communicator=comm,
     )
     rid = rt.add_request("r1", "default", WALK, [WG_ID], [WG_ID], [ME], [1], [], [])
@@ -1069,7 +1069,7 @@ def test_one_route_reports_each_row_in_its_own_walks_graph(tmp_path):
     rt = GraphRuntime(
         worker_graphs=wgs, remote_worker_graphs=[],
         sharding={"groups": [], "shard_dim": [],
-                  "tp_enabled_nodes": [], "sp_enabled_nodes": []},
+                  "tp_enabled_nodes": []},
         bookkeeping=book._rust, me=ME, communicator=comm,
     )
     rids = [
@@ -1157,7 +1157,7 @@ def test_only_a_non_streamed_edge_to_a_peer_asks_for_request_info(tmp_path, edge
         remote_worker_graphs=[{"wg_id": 1, "graph_walks": [WALK],
                                "nodes": ["remote"], "dyn_loops": []}],
         sharding={"groups": [], "shard_dim": [],
-                  "tp_enabled_nodes": [], "sp_enabled_nodes": []},
+                  "tp_enabled_nodes": []},
         bookkeeping=book._rust, me=ME, communicator=comm,
     )
     if edge == "walk_driven":

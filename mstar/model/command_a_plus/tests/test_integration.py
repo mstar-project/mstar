@@ -13,7 +13,6 @@ from safetensors.torch import save_file
 from torch import nn
 
 from mstar.conductor.request_info import DEFAULT_PARTITION, CurrentForwardPassInfo
-from mstar.distributed.communication import CommGroup
 from mstar.engine.resources import AttentionStep, SamplingReqConfig
 from mstar.graph.base import GraphEdge
 from mstar.graph.graph_io import WorkerGraphIO
@@ -267,13 +266,11 @@ class ModelIntegrationTests(unittest.TestCase):
             self.assertEqual(len(batched[rid]["image_embeds"][0]), len(tiles[rid]) * 4)
             torch.testing.assert_close(batched[rid]["image_embeds"][0], single["image_embeds"][0])
 
-    def test_load_dtype_and_reject_sequence_parallelism(self):
+    def test_load_dtype_and_reject_a_missing_checkpoint(self):
         save_file(checkpoint(self.model.config), Path(self.directory) / "model.safetensors")
         node = self.model.get_submodule("LLM", autocast_dtype=torch.bfloat16)
         self.assertTrue(all(p.dtype == torch.bfloat16 and not p.is_meta for p in node.parameters()))
         self.assertFalse(node.training)
-        with self.assertRaisesRegex(ValueError, "sequence parallelism"):
-            self.model.get_submodule("LLM", sp_group=CommGroup(0, 0, [0, 1]))
         with self.assertRaisesRegex(ValueError, "local checkpoint"):
             CommandAPlusModel("unavailable/repository")
 

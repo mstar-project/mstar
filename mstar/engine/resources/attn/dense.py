@@ -174,6 +174,9 @@ class DenseAttentionManager(AttentionManager):
     (``PositionManager`` would only work for labels supplying explicit pos_ids).
     """
 
+    # attends the K/V it is handed, which an exchange hands it whole
+    supports_split_steps = True
+
     def __init__(
         self,
         kv_cache: str,
@@ -294,6 +297,7 @@ class DenseAttentionManager(AttentionManager):
         assert plan_outputs is not None, (
             f"Dense Attention Manager expected plan result from {self._kv_cache_name}"
         )
+        self._check_sequence_shard(ctx)
 
         self._current_plans = {
             plan_label: self._build_plan(kv_out, step.causal, EagerSlotKey(label=plan_label, slot=ctx.slot))
@@ -398,6 +402,8 @@ class DenseAttentionManager(AttentionManager):
         written to the pages."""
         if label is None:
             label = self._default_label
+        if self._shard is not None:
+            self._shard.check_bypass(label, "attention run")
         if layer_idx is None:
             layer_idx = self._default_layer_idx
         assert k is not None and v is not None and layer_idx is not None, (

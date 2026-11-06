@@ -1496,7 +1496,6 @@ pub struct ShardingArg {
     /// signal -> shard dim; None means replicated, same as absent.
     #[pyo3(item)] shard_dim: Vec<(String, Option<u32>)>,
     #[pyo3(item)] tp_enabled_nodes: Vec<String>,
-    #[pyo3(item)] sp_enabled_nodes: Vec<String>,
 }
 
 /// A worker graph owned by another worker: enough to route to it, no spec.
@@ -1599,8 +1598,6 @@ impl GraphRuntime {
                 .filter_map(|(sig, dim)| dim.map(|d| (it.intern(sig), d)))
                 .collect(),
             tp_enabled_nodes: sharding.tp_enabled_nodes.iter()
-                .map(|n| it.intern(n)).collect(),
-            sp_enabled_nodes: sharding.sp_enabled_nodes.iter()
                 .map(|n| it.intern(n)).collect(),
             me: me_sym,
         };

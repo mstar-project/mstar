@@ -15,8 +15,8 @@ sys.path.insert(0, ".")
 import pytest
 import torch
 
-from mstar.distributed.communication import CommGroup
-from mstar.engine.resources import AttentionStep, RaggedCrossAttentionSpec, RaggedCrossAttentionStep
+from mstar.engine.resources import AttentionStep, RaggedCrossAttentionSpec, RaggedCrossAttentionStep, SeqShardStep
+from mstar.engine.resources.sequence_shard import sequence_parallel_refusals
 from mstar.graph.base import GraphNode, Loop, Parallel, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.components.diffusion.attention import sdpa_attention
@@ -50,6 +50,7 @@ from mstar.model.ltx2_5.submodules import (
     AUDIO_ATTN,
     AUDIO_XATTN,
     VIDEO_ATTN,
+    VIDEO_SHARD,
     VIDEO_XATTN,
     LTXDenoiseSubmodule,
     LTXShape,
@@ -174,7 +175,7 @@ def test_generate_walk_structure(walk, decoders):
 
 def test_resources_follow_the_attention_backend():
     specs = {s.resource_key: s for s in _make_model(attention_backend="flashinfer").get_node_resources()}
-    assert set(specs) == {VIDEO_ATTN, AUDIO_ATTN, VIDEO_XATTN, AUDIO_XATTN}
+    assert set(specs) == {VIDEO_SHARD, VIDEO_ATTN, AUDIO_ATTN, VIDEO_XATTN, AUDIO_XATTN}
     assert {k for k, s in specs.items() if isinstance(s, RaggedCrossAttentionSpec)} == {VIDEO_XATTN, AUDIO_XATTN}
     assert (specs[VIDEO_XATTN].config.head_dim, specs[AUDIO_XATTN].config.head_dim) == (128, 64)
     assert all(s.nodes == {"dit"} for s in specs.values())
@@ -183,6 +184,10 @@ def test_resources_follow_the_attention_backend():
     assert _make_model(attention_backend="sdpa").get_node_resources() == []
     with pytest.raises(ValueError):
         _make_model(attention_backend="flash")
+    # SDPA attends outside the engine's resources, so no sequence shard can split its steps
+    assert sequence_parallel_refusals(list(specs.values()), "dit", tp=1, sp=2) == []
+    refusal, = sequence_parallel_refusals(_make_model(attention_backend="sdpa").get_node_resources(), "dit", 1, 2)
+    assert "neither splits tokens" in refusal
 
 
 def test_worker_graphs_from_yaml():
@@ -374,6 +379,12 @@ def test_declare_step_spans_and_pairs():
     shape = LTXShape(frames=2, height=3, width=4, audio_frames=5, fps=24.0, text_len=16)
     inputs = [NodeInputs(resource_step_info=shape) for _ in range(2)]
     step = _dit(cfg).declare_step("generate_av", [11, 12], inputs)
+    # every span whole, the sequence shard's step over the video: on SP ranks the resources cut
+    # the video spans to each rank's share themselves
+    assert isinstance(step.steps[VIDEO_SHARD], SeqShardStep)
+    assert [(s.request_id, s.label, s.span) for s in step.steps[VIDEO_SHARD].segments] == [
+        (11, "video", 24), (12, "video", 24),
+    ]
     video, audio = step.steps[VIDEO_ATTN], step.steps[AUDIO_ATTN]
     assert isinstance(video, AttentionStep) and not video.causal and not audio.causal
     assert {s.label for s in video.segments} == {"video"} and {s.label for s in audio.segments} == {"audio"}
@@ -384,22 +395,6 @@ def test_declare_step_spans_and_pairs():
     assert spans == {(r, label): n for r in (11, 12) for label, n in (("video", 24), ("audio", 5), ("text", 16))}
     assert step.cg_key_info == shape
     assert _dit(cfg, use_ragged=False).declare_step("generate_av", [11], inputs[:1]) is None
-
-
-@pytest.mark.parametrize("rank, shard", [(0, 13), (1, 12)])
-def test_declare_step_under_sequence_parallelism(rank, shard):
-    """The video self-attention spans every video token; the cross-attentions attend
-    from this rank's share of them, and the audio queries attend that share too (the
-    block merges the ranks' partial attentions)."""
-    cfg = LTX25Config()
-    shape = LTXShape(frames=1, height=5, width=5, audio_frames=5, fps=24.0, text_len=16)
-    sub = LTXDenoiseSubmodule(nn_stub(), cfg, loop_name=DENOISE_LOOP, use_ragged_attention=True,
-                              sp_group=CommGroup(rank, rank, [0, 1]))
-    step = sub.declare_step("generate_av", [11], [NodeInputs(resource_step_info=shape)])
-    assert [s.span for s in step.steps[VIDEO_ATTN].segments] == [25]
-    for key in (VIDEO_XATTN, AUDIO_XATTN):
-        assert {s.label: s.span for s in step.steps[key].segments}["video"] == shard
-    assert set(step.steps[AUDIO_XATTN].pairs) == {("audio", "text"), ("video", "audio"), ("audio", "video")}
 
 
 def test_distilled_schedule_matches_the_scheduler_recipe():

@@ -427,6 +427,8 @@ them by that name:
      vit_attn:                  # a cacheless (ragged) attention resource
        max_segments_per_request: 2  # also: max_segments_per_step, max_tokens_per_request,
                                     # flashinfer_backend
+     seq_shard:                 # a node's sequence shard (SP ranks)
+       min_tokens: 2048         # steps below this run copied on every SP rank
 
 Use one block per resource. A model with two caches, such as Whisper's decoder cache and
 its encoder context, can therefore size each one separately. If a block names a resource
@@ -446,12 +448,18 @@ a sliding window (``AttentionConfig.sliding_window``) has no prefix cache yet: i
 ``prefix_cache`` goes off (logged at info), and a serving config that sets
 ``prefix_cache: true`` on it is refused.
 
-``context_parallel: true`` splits each request's positions over the ranks that would
-otherwise hold the same KV heads: the TP ranks that share a KV head, or the node's SP ranks
-when it has them, which is how a model with no sequence parallelism of its own (such as
-Qwen3.5) runs on ``sp_size`` above 1. Raise ``max_num_pages`` by that factor to turn the
-freed memory into context. **Context parallelism** in :doc:`adding_models` covers when each mode applies and
-what it refuses.
+A node on ``sp_size`` above 1 shares each step over its SP ranks along two axes. A model that
+declares a sequence shard (``SeqShardSpec``: LTX-2.5's and Cosmos3's DiTs) splits a step's tokens
+over them; its ``min_tokens`` runs smaller steps copied on every rank instead (default 0: every
+step that can split does). A captured step decides from its bucket's size, not its prompt's.
+Separately, ``context_parallel: true`` stores a paged pool's K/V by position rather than by
+head: each request's positions split over the ranks that would otherwise hold the same KV
+heads, the TP ranks that share a KV head or the node's SP ranks, which is how a model with no
+sequence shard (such as Qwen3.5) runs on ``sp_size`` above 1. Raise ``max_num_pages`` by that
+factor to turn the freed memory into context. A node on SP ranks needs at least one of the two,
+and can't yet have both: a node that splits its steps stores its pools by head.
+**Sequence and context parallelism** in :doc:`adding_models` covers what each combination does
+and what is refused.
 
 On a single rank, a request waits at the head of its pool's queue until its prompt fits
 beside the prompts already admitted, and no request behind it starts first. A cache hit on
@@ -658,7 +666,7 @@ weight loaders then shard parameters automatically, with no model-code changes. 
 details.
 
 Several TP (or SP) nodes can share GPUs when, on each worker, they are in the same TP and SP
-groups, each listed in the model's ``tp_enabled_nodes`` (or ``sp_enabled_nodes``). The ranks
+groups (a TP node listed in the model's ``tp_enabled_nodes``). The ranks
 then run every node's steps in one order. The conductor refuses lockstep nodes on one worker
 in different TP or SP groups, and two lockstep nodes on one worker that share a paged KV cache:
 rank 0 replicates the page moves it makes on a pool (host offloads and reloads, for example)

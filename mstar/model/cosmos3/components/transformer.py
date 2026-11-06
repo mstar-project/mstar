@@ -46,14 +46,6 @@ from mstar.model.components.distributed.linear import (
     RowParallelLinear,
 )
 from mstar.model.components.distributed.mlp import ParallelGatedMLPUnfused, ParallelMLP
-from mstar.model.components.distributed.sequence_parallel import (
-    gather_sequence,
-    scatter_sequence,
-    sp_head_gather,
-    sp_head_slice,
-    sp_seq_split,
-    ulysses_attention,
-)
 
 
 class RMSNorm(nn.Module):
@@ -216,7 +208,6 @@ class Cosmos3PackedMoTAttention(nn.Module):
         attention_bias: bool,
         rms_norm_eps: float,
         comm_group: CommGroup | None = None,
-        sp_group: CommGroup | None = None,
         qk_norm_for_text: bool = True,
         use_und_k_norm_for_gen: bool = False,
         norm_cls: type[nn.Module] = RMSNorm,
@@ -224,25 +215,16 @@ class Cosmos3PackedMoTAttention(nn.Module):
         super().__init__()
         if comm_group is None:
             comm_group = CommGroup.trivial()
-        if sp_group is None:
-            sp_group = CommGroup.trivial()
-        self.sp_group = sp_group
         tp_size = comm_group.world_size
-        sp_size = sp_group.world_size
-        # Ulysses sequence parallelism redistributes heads across the SP group
-        # via an all-to-all around attention, so the attention runs at effective
-        # head-degree tp*sp — both head counts must divide that product.
-        eff_size = tp_size * sp_size
-        if num_attention_heads % eff_size or num_key_value_heads % eff_size:
+        if num_attention_heads % tp_size or num_key_value_heads % tp_size:
             raise ValueError(
-                f"tp_size*sp_size ({tp_size}*{sp_size}={eff_size}) must divide "
-                f"both num_attention_heads ({num_attention_heads}) and "
-                f"num_key_value_heads ({num_key_value_heads})"
+                f"tp_size ({tp_size}) must divide both num_attention_heads "
+                f"({num_attention_heads}) and num_key_value_heads ({num_key_value_heads})"
             )
         self.head_dim = head_dim
         # TP-local (post-projection) head counts: the column-parallel q/k/v
-        # projections shard heads by tp_size, and the SP all-to-all further
-        # splits these to tp*sp heads around the attention kernel.
+        # projections shard heads by tp_size. On SP ranks the attention
+        # resource's exchange splits them further around the kernel.
         self.num_attention_heads = num_attention_heads // tp_size
         self.num_key_value_heads = num_key_value_heads // tp_size
 
@@ -378,31 +360,14 @@ class Cosmos3PackedMoTAttention(nn.Module):
         v = self.to_v(und_seq).view(-1, Hkv, D)
         q = self._apply_rope(q, cos, sin)
         k = self._apply_rope(k, cos, sin)
-        k_gen = None
+        out = attend(q, k, v).reshape(-1, H * D)
         if cache_gen_k and self.k_norm_und_for_gen is not None:
-            k_gen = self._apply_rope(self.k_norm_und_for_gen(k_raw), cos, sin)
-        if self.sp_group.world_size > 1:
-            # The UND prefix is replicated across the SP group (small text). Keep
-            # this rank's head-group so the cached prefix K/V lands on the same
-            # head partition the GEN all-to-all produces, then gather heads back
-            # for the row-parallel output projection.
-            q = sp_head_slice(self.sp_group, q)
-            k = sp_head_slice(self.sp_group, k)
-            v = sp_head_slice(self.sp_group, v)
-            if k_gen is not None:
-                k_gen = sp_head_slice(self.sp_group, k_gen)
-            out = attend(q, k, v)
-            out = sp_head_gather(self.sp_group, out).reshape(-1, H * D)
-        else:
-            out = attend(q, k, v).reshape(-1, H * D)
-        if k_gen is not None and attend.attn.requires_kv_write:
-            attend.kv.write_kv(k_gen, v)
+            attend.write(self._apply_rope(self.k_norm_und_for_gen(k_raw), cos, sin), v)
         return self.to_out(out)
 
     def forward_gen(
         self, gen_seq: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
         attend: AttentionCallable,
-        seq_sizes: list[int] | None = None,
     ) -> torch.Tensor:
         H, Hkv, D = self.num_attention_heads, self.num_key_value_heads, self.head_dim
         q = self.norm_added_q(self.add_q_proj(gen_seq).view(-1, H, D))
@@ -410,13 +375,7 @@ class Cosmos3PackedMoTAttention(nn.Module):
         v = self.add_v_proj(gen_seq).view(-1, Hkv, D)
         q = self._apply_rope(q, cos, sin)
         k = self._apply_rope(k, cos, sin)
-        # Ulysses all-to-all wraps the attend: gen_seq is sequence-sharded
-        # across the SP group, so attention runs over the full sequence at
-        # tp*sp head-degree, then the result is re-sharded back. Trivial SP
-        # group -> passthrough (byte-identical to the non-SP path).
-        out = ulysses_attention(
-            self.sp_group, q, k, v, attend, seq_sizes,
-        ).reshape(-1, H * D)
+        out = attend(q, k, v).reshape(-1, H * D)
         return self.to_add_out(out)
 
 
@@ -433,7 +392,6 @@ class Cosmos3MoTDecoderLayer(nn.Module):
         attention_bias: bool,
         rms_norm_eps: float,
         comm_group: CommGroup | None = None,
-        sp_group: CommGroup | None = None,
         hidden_act: str = "silu",
         qk_norm_for_text: bool = True,
         use_und_k_norm_for_gen: bool = False,
@@ -448,7 +406,6 @@ class Cosmos3MoTDecoderLayer(nn.Module):
             attention_bias=attention_bias,
             rms_norm_eps=rms_norm_eps,
             comm_group=comm_group,
-            sp_group=sp_group,
             qk_norm_for_text=qk_norm_for_text,
             use_und_k_norm_for_gen=use_und_k_norm_for_gen,
             norm_cls=norm_cls,
@@ -503,12 +460,9 @@ class Cosmos3MoTDecoderLayer(nn.Module):
     def forward_gen(
         self, gen_seq: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
         attend: AttentionCallable,
-        seq_sizes: list[int] | None = None,
     ) -> torch.Tensor:
         gen_norm = self.input_layernorm_moe_gen(gen_seq)
-        attn_out = self.self_attn.forward_gen(
-            gen_norm, cos, sin, attend, seq_sizes
-        )
+        attn_out = self.self_attn.forward_gen(gen_norm, cos, sin, attend)
         residual = gen_seq + attn_out
         return residual + self.mlp_moe_gen(self.post_attention_layernorm_moe_gen(residual))
 
@@ -550,13 +504,10 @@ class Cosmos3OmniTransformer(nn.Module):
     text logits, so the other checkpoints leave it out.
     """
 
-    def __init__(self, config, comm_group: CommGroup | None = None, sp_group: CommGroup | None = None):
+    def __init__(self, config, comm_group: CommGroup | None = None):
         super().__init__()
         self.config = config
         h = config.hidden_size
-        if sp_group is None:
-            sp_group = CommGroup.trivial()
-        self.sp_group = sp_group
         if comm_group is None:
             comm_group = CommGroup.trivial()
         self.comm_group = comm_group
@@ -573,7 +524,6 @@ class Cosmos3OmniTransformer(nn.Module):
                 attention_bias=config.attention_bias,
                 rms_norm_eps=config.rms_norm_eps,
                 comm_group=comm_group,
-                sp_group=sp_group,
                 hidden_act=config.hidden_act,
                 qk_norm_for_text=config.qk_norm_for_text,
                 use_und_k_norm_for_gen=config.use_und_k_norm_for_gen,
@@ -581,10 +531,13 @@ class Cosmos3OmniTransformer(nn.Module):
             )
             for _ in range(config.num_hidden_layers)
         )
-        # One shared attend callable for the whole GEN stack, built at bind
-        # time; see AttentionCallable for why it must not be per layer.
+        # One shared attend callable for the whole GEN stack (and one for the
+        # UND stack), built at bind time.
         self._gen_attend: AttentionCallable | None = None
         self._und_attend: AttentionCallable | None = None
+        # The node's sequence shard: on SP ranks it splits the generation
+        # tokens of a step over them (`_run_gen_layers`).
+        self._shard = None
         self.norm = norm_cls(h, eps=config.rms_norm_eps)
         self.norm_moe_gen = norm_cls(h, eps=config.rms_norm_eps)
         # The text head, for checkpoints whose understanding tower is served
@@ -626,15 +579,15 @@ class Cosmos3OmniTransformer(nn.Module):
             self.action_modality_embed = nn.Parameter(torch.zeros(h))
 
     def bind_resources(self, resources: dict) -> None:
-        # Built once here, not per layer, and not per step: `ulysses_attention`
-        # is traced per identity of this object (see AttentionCallable). The
-        # per-step GEN resource is rebound through `bind_step` instead.
+        # Built once here, not per layer, and not per step; the per-step GEN
+        # resource is rebound through `bind_step` instead.
         self._gen_attend = AttentionCallable(
             kv=resources["kv"], attn=resources["attn"]
         )
         self._und_attend = AttentionCallable(
             kv=resources["kv"], attn=resources["attn"]
         )
+        self._shard = resources.get("seq_shard")
 
     # ------------------------------------------------------------------
     # Pure-tensor packing/unpacking helpers (ported from diffusers).
@@ -1047,42 +1000,31 @@ class Cosmos3OmniTransformer(nn.Module):
             sin = torch.cat([s for _, s in rotary_per_branch], dim=0)
         else:
             ((cos, sin),) = rotary_per_branch
-        self._sp_run_gen_layers(gen_seq, cos, sin, label, attn)
+        self._run_gen_layers(gen_seq, cos, sin, label, attn)
 
-    def _sp_run_gen_layers(self, gen_seq, cos, sin, label, attn):
-        """Run the generation layer stack, sequence-parallel-sharded across the
-        SP group when active. ``gen_seq``/``cos``/``sin`` are the FULL sequence
-        (identical on every SP rank); returns the FULL post-layer sequence.
+    def _run_gen_layers(self, gen_seq, cos, sin, label, attn):
+        """Run the generation layer stack over ``label``'s tokens. ``gen_seq``,
+        ``cos`` and ``sin`` are the whole sequence; so is the result.
 
-        This is the only sequence-parallel bracket in the denoise path: the
-        prologue (patchify, proj_in, timestep scatter-add, action concat, rotary)
-        and epilogue (final norm, proj_out, unpatchify) all use absolute token
-        indices and must run on the full sequence, so SP shards only the layer
-        stack — where essentially all the compute is. The Ulysses all-to-all
-        inside each layer is a redistribute-and-reconstruct, so a contiguous
-        scatter + rank-order gather preserves the exact token order (including a
-        packed ``[cond | uncond]`` CFG batch)."""
-        sp = self.sp_group
+        On a step the node's sequence shard splits, the stack runs on this
+        rank's contiguous share of ``label``'s tokens (a packed ``[cond |
+        uncond]`` pack's combined label included): the prologue (patchify,
+        proj_in, timestep scatter-add, rotary) and epilogue (final norm,
+        proj_out, unpatchify) use absolute token indices, so they run whole,
+        and the stack is where nearly all the compute is."""
         # `attn` and `label` hold for the whole stack, so they go on the shared
-        # attend once rather than through every layer call; only the layer index
-        # advances. Off the call signature they cannot make the callable vary
-        # per layer (see AttentionCallable), and the index stops being a live
-        # int that inductor specializes the layer body on.
+        # attend once rather than through every layer call; the layer index goes
+        # through `set_layer_idx`, so it isn't a live int inductor specializes
+        # the layer body on.
         attend = self._gen_attend
         attend.bind_step(attn=attn, label=label)
-        if sp.world_size == 1:
-            for i, layer in enumerate(self.layers):
-                attend.set_layer_idx(i)
-                gen_seq = layer.forward_gen(gen_seq, cos, sin, attend)
-            return gen_seq
-        seq_sizes = sp_seq_split(gen_seq.shape[0], sp.world_size)
-        gen_seq = scatter_sequence(sp, gen_seq, seq_sizes)
-        cos = scatter_sequence(sp, cos, seq_sizes)
-        sin = scatter_sequence(sp, sin, seq_sizes)
+        shard = self._shard
+        if shard is not None:
+            gen_seq, cos, sin = shard.scatter(label, gen_seq, cos, sin)
         for i, layer in enumerate(self.layers):
             attend.set_layer_idx(i)
-            gen_seq = layer.forward_gen(gen_seq, cos, sin, attend, seq_sizes)
-        return gather_sequence(sp, gen_seq, seq_sizes)
+            gen_seq = layer.forward_gen(gen_seq, cos, sin, attend)
+        return gen_seq if shard is None else shard.gather(label, gen_seq)
 
     def gen_layers_batched(self, gen_seq, cos, sin):
         """The generation layer stack and final norm over ``denoise_step_batched``'s
@@ -1092,20 +1034,10 @@ class Cosmos3OmniTransformer(nn.Module):
         every batch size and mix of resolutions, while the per-request parts
         around it run eager."""
         attend = self._gen_attend
-        sp = self.sp_group
-        if sp.world_size == 1:
-            for i, layer in enumerate(self.layers):
-                attend.set_layer_idx(i)
-                gen_seq = layer.forward_gen(gen_seq, cos, sin, attend)
-            return self.norm_moe_gen(gen_seq)
-        seq_sizes = sp_seq_split(gen_seq.shape[0], sp.world_size)
-        gen_seq = scatter_sequence(sp, gen_seq, seq_sizes)
-        cos = scatter_sequence(sp, cos, seq_sizes)
-        sin = scatter_sequence(sp, sin, seq_sizes)
         for i, layer in enumerate(self.layers):
             attend.set_layer_idx(i)
-            gen_seq = layer.forward_gen(gen_seq, cos, sin, attend, seq_sizes)
-        return self.norm_moe_gen(gather_sequence(sp, gen_seq, seq_sizes))
+            gen_seq = layer.forward_gen(gen_seq, cos, sin, attend)
+        return self.norm_moe_gen(gen_seq)
 
     def denoise_step(
         self,
@@ -1173,7 +1105,7 @@ class Cosmos3OmniTransformer(nn.Module):
             gen_seq = torch.cat([gen_seq, sound_seq], dim=0)
 
         cos, sin = rotary
-        gen_seq = self._sp_run_gen_layers(gen_seq, cos, sin, label, attn)
+        gen_seq = self._run_gen_layers(gen_seq, cos, sin, label, attn)
         gen_out = self.norm_moe_gen(gen_seq)
         preds_packed = self.proj_out(gen_out[vision_mse_loss_indexes])
         preds = self._unpatchify_and_unpack_latents(
@@ -1272,7 +1204,7 @@ class Cosmos3OmniTransformer(nn.Module):
         cos = torch.cat([rotary_cond[0], rotary_uncond[0]], dim=0)
         sin = torch.cat([rotary_cond[1], rotary_uncond[1]], dim=0)
 
-        gen_seq = self._sp_run_gen_layers(gen_seq, cos, sin, label, attn)
+        gen_seq = self._run_gen_layers(gen_seq, cos, sin, label, attn)
         gen_out = self.norm_moe_gen(gen_seq)
 
         def _decode(out):
@@ -1386,7 +1318,14 @@ class Cosmos3OmniTransformer(nn.Module):
         cos = torch.cat(cos_cond + cos_uncond, dim=0)
         sin = torch.cat(sin_cond + sin_uncond, dim=0)
         self._gen_attend.bind_step(attn=attn, label=label)
+        # the stack runs on this rank's share of the pack on a step the node's
+        # sequence shard splits (norm_moe_gen is per token, so it runs inside)
+        shard = self._shard
+        if shard is not None:
+            all_gen, cos, sin = shard.scatter(label, all_gen, cos, sin)
         gen_out = self.gen_layers_batched(all_gen, cos, sin)
+        if shard is not None:
+            gen_out = shard.gather(label, gen_out)
 
         sizes = [g.shape[0] for g in gen_seqs]
         total = sum(sizes)
@@ -1483,7 +1422,7 @@ class Cosmos3OmniTransformer(nn.Module):
             cos = torch.cat(cos_cond, dim=0)
             sin = torch.cat(sin_cond, dim=0)
 
-        all_gen = self._sp_run_gen_layers(all_gen, cos, sin, label, attn)
+        all_gen = self._run_gen_layers(all_gen, cos, sin, label, attn)
         gen_out = self.norm_moe_gen(all_gen)
 
         sizes = [g.shape[0] for g in gen_seqs]

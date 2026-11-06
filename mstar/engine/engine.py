@@ -41,12 +41,13 @@ from mstar.engine.resources import (
     SubmoduleStep,
 )
 from mstar.engine.resources.base import EngineResourceInfo, KeyedWalks, build_resource, head_shards
-from mstar.engine.resources.context_parallel import positions_over_sp
+from mstar.engine.resources.context_parallel import position_pools
 from mstar.engine.resources.kv.config import instance_size, opening_prefix_caches, unrestorable
 from mstar.engine.resources.kv.keys import fingerprint
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.engine.resources.lora.config import LoraBaseOnly, node_capture_key
 from mstar.engine.resources.resident import ResidentPlanner, build_planner
+from mstar.engine.resources.sequence_shard import sequence_parallel_refusals
 from mstar.engine.resources.spec import resolve_spec_dependencies
 from mstar.engine.resources.step import (
     ADMIT_OK,
@@ -95,8 +96,10 @@ if TYPE_CHECKING:
     from mstar.engine.resources.kv.manager import KVManager
     from mstar.engine.resources.lora.pool import LoraAdapterPool
     from mstar.model.base import Model
+    from mstar.model.components.moe_parallel import MoeParallelConfig
 
 logger = logging.getLogger(__name__)
+
 
 # Block the GPU thread on its step's outputs before returning (1-step launch
 # bound vs the worker's default 2-step). Off by default: it kills the
@@ -608,7 +611,10 @@ class Engine:
         transfer_engine_info: TransferEngineInfo,
         kv_cache_type=None,
         model: "Model | None" = None,
+        moe_parallel: "Mapping[str, MoeParallelConfig] | None" = None,
     ):
+        """``moe_parallel``: each node's ``ep_config``, which a node splitting its steps over SP
+        ranks can't take."""
         self._device = device
         if self._device_capability is None or self._device_capability.device != device:
             self._device_capability = DeviceCapability.of(device)
@@ -629,13 +635,20 @@ class Engine:
         self._classify_tp_roles(node_names, parallel_groups)
         # node -> how many ways its heads split: TP alone where its pools place positions over its SP ranks
         shards = {}
-        for node in node_names:
+        # the nodes whose steps may split over their SP ranks
+        splitting = set()
+        for node in sorted(node_names):
             group = parallel_groups.get_joint_group_for_node(node)
             sp = group.sp_group.world_size
-            over_sp = sp > 1 and positions_over_sp(
-                specs, node, sp, () if model is None else model.get_default_sharding_config().sp_enabled_nodes,
+            refusals = sequence_parallel_refusals(
+                specs, node, group.tp_group.world_size, sp, (moe_parallel or {}).get(node),
             )
-            shards[node] = head_shards(group, over_sp)
+            if refusals:
+                raise ValueError("; ".join(refusals))
+            placed = sp > 1 and any(position_pools(specs, node).values())
+            shards[node] = head_shards(group, placed)
+            if sp > 1 and any(spec.splits_steps and node in spec.nodes for spec in specs):
+                splitting.add(node)
 
         for spec in specs:
             relevant_nodes = spec.nodes & node_names
@@ -653,7 +666,7 @@ class Engine:
                 raise ValueError(
                     f"resource {spec.resource_key!r} serves nodes that split heads different ways "
                     f"({ {node: shards[node] for node in sorted(relevant_nodes)} }): one places its KV "
-                    "positions over its SP ranks and another runs its own sequence parallelism"
+                    "positions over its SP ranks and another splits its steps over them (SeqShardSpec)"
                 )
             joint_comm_group = parallel_groups.get_joint_group_for_node(first_node)
             self._resources[spec.resource_key] = build_resource(
@@ -692,6 +705,12 @@ class Engine:
                         f"resource {key!r} ({type(resource).__name__}) does not support context "
                         f"parallelism, and the pool {dep!r} it depends on sets context_parallel"
                     )
+            split_nodes = sorted(self._resource_nodes[key] & splitting)
+            if split_nodes and not resource.supports_split_steps:
+                raise ValueError(
+                    f"resource {key!r} ({type(resource).__name__}) does not support steps split over SP "
+                    f"ranks, and node {split_nodes[0]!r} splits them (SeqShardSpec)"
+                )
 
         # rid -> (node, walk) of its last step here when that step was rows-only,
         # i.e. the sampler's slot master holds the token its next step reads
@@ -891,6 +910,10 @@ class Engine:
             piecewise[node_name] = self._build_piecewise_runners(
                 node_name, submodule_mgmt, capture_stream,
             )
+
+        for node_name, submodule_mgmt in self._submodules.items():
+            for resource in submodule_mgmt.resources.values():
+                resource.check_captures(node_name, ag_runners[node_name].capture_configs, piecewise[node_name])
 
         # Every runner claims its static buffers before any of them captures:
         # nodes share resources, so a build driven by a later node would move
