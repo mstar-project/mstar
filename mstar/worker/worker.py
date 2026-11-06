@@ -36,7 +36,7 @@ from mstar.distributed.base import ShardingConfig
 from mstar.distributed.communication import WorkerParallelGroups
 from mstar.engine import apply_dynamo_config
 from mstar.engine.chunking import ChunkRange
-from mstar.engine.device_run import RUN_SKIPPED, run_item
+from mstar.engine.device_run import RUN_REPLAYS, RUN_SKIPPED, run_item
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import AdmitFailedReason, AllocationFailed
 from mstar.engine.resources.kv.config import without_layouts
@@ -3870,6 +3870,18 @@ class Worker(RepeatingSteps):
             self._phase_buf[f"worker.postprocess.{name}"].append(now - _pp_t)
             _pp_t = now
 
+        # Settle every submitted row before routing membership is filtered or
+        # its input references are released. Even an entirely stopped/aborted
+        # successor owns resource reservations until its device work completes.
+        materialized = None
+        if RUN_REPLAYS in (outputs.check_stop_buffers or {}):
+            self._wait_for_step(batch_N)
+            materialized = self._prematerialize_for_check_stop(
+                outputs, batch_N.node_batch.completion_event,
+                request_ids=batch_N.node_batch.request_ids,
+            )
+            self._settle_run(batch_N, materialized[1], self.engine_manager.get_engine(batch_N.node_name))
+
         if self.enable_nvtx:
             range_push("worker.postprocess.cleanup_inputs", synchronize=False)
 
@@ -3986,11 +3998,13 @@ class Worker(RepeatingSteps):
         # Prematerialising pulls the stop check's rows to the host, so this can
         # carry a device transfer.
         engine = self.engine_manager.get_engine(batch_N.node_name)
-        cpu_outputs, host_rows = self._prematerialize_for_check_stop(
-            outputs, batch_N.node_batch.completion_event,
-            request_ids=batch_N.node_batch.request_ids,
-        )
-        self._settle_run(batch_N, host_rows, engine)
+        if materialized is None:
+            materialized = self._prematerialize_for_check_stop(
+                outputs, batch_N.node_batch.completion_event,
+                request_ids=batch_N.node_batch.request_ids,
+            )
+            self._settle_run(batch_N, materialized[1], engine)
+        cpu_outputs, host_rows = materialized
         if host_rows is not None and host_rows.request_ids and (odds := host_rows.buffers.get(STOP_ODDS)) is not None:
             self._step_repeats.observe_odds(
                 (batch_N.node_name, batch_N.graph_walk), float(odds[:len(host_rows.request_ids)].max()),

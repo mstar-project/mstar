@@ -301,3 +301,44 @@ def test_an_end_partition_stop_on_a_rows_last_chunk_ends_its_partition():
     assert not w.reported
     assert batch.partition_done_rids == {1}
     assert runtime.loop_names == {}
+
+
+@pytest.mark.parametrize("reason, removed", [("stopped", {1, 2}), ("failed", {1, 2}), ("stopped", {1})])
+def test_a_device_run_settles_submitted_rows_before_discarding_their_outputs(reason, removed):
+    from mstar.engine.device_run import RUN_COUNTS, RUN_REPLAYS
+
+    eng = _engine(_Sub())
+    batch = _batch([1, 2], streams=False)
+    batch.step_context.repeats = 4
+    runtime = _Runtime(removed if reason == "stopped" else ())
+    w = _worker(eng, runtime)
+    w.scheduler.failed_rids = removed if reason == "failed" else set()
+    w.parallel_nodes = set()
+    # A stopped row was suppressed on device; a row aborted after executing
+    # retains its actual count, despite neither row's outputs being routed.
+    counts = [2, 3] if reason == "failed" else [0, int(2 not in removed)]
+    ran = max(1, *counts)
+    settled = []
+    order = []
+    w._wait_for_step = lambda pending: order.append("completed")
+    eng.settle_run = lambda node_batch, width, actual: (
+        order.append("settled"), settled.append((tuple(node_batch.request_ids), width, actual)),
+    )
+    w.tensor_manager.cleanup_collectable = lambda *args: order.append("released")
+    outputs = BatchedModelOutput(
+        per_rid_outputs={rid: {"audio": [torch.ones(1)]} for rid in [1, 2]},
+        row_request_ids=(1, 2),
+        check_stop_buffers={RUN_REPLAYS: torch.tensor([ran, ran]), RUN_COUNTS: torch.tensor(counts)},
+    )
+    pending = PendingBatch(
+        batch=ScheduledBatch(node_name=NODE, graph_walk=WALK, request_to_worker_graph={1: 0, 2: 0}, repeats=4),
+        node_batch=batch, node_name=NODE, partition="p", graph_walk=WALK, future=Future(),
+        speculative_new_iter=reason == "stopped", loop_name=LOOP,
+    )
+    if removed == {1, 2}:
+        w._postprocess_batch(pending, outputs)
+    else:
+        with pytest.raises(_ReachedRoutingError):
+            w._postprocess_batch(pending, outputs)
+    assert settled == [((1, 2), ran, dict(zip((1, 2), counts, strict=True)))], "submitted rows settle once"
+    assert order[:3] == ["completed", "settled", "released"]
