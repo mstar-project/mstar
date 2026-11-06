@@ -295,3 +295,66 @@ def test_a_ring_is_sized_at_load_and_never_shrinks_the_rows():
     rows.ask_ring("frames", depth=1024)
     assert "over the 1024 MiB" in rows.ring_table("frames", torch.zeros(1, 512, dtype=torch.long))
     assert rows.capacity == 4096
+
+
+@pytest.mark.parametrize("actual", [0, 1, 4])
+def test_a_preplanned_successor_reads_actual_loop_progress_and_stopped_rows_do_not_advance(actual):
+    from mstar.graph.loop_indices import LoopLayout
+
+    rows = LoopbackRows(CPU, capacity=4)
+    for rid in (1, 2):
+        rows.add(rid)
+    loop = LoopLayout("inner", ancestors=("outer",))
+    bucket = BucketKey(WALK, 3, 3)
+    for slot in (0, 1):
+        rows.plan(None, SimpleNamespace(
+            slot_lease=SlotLease(slot=slot, bucket=bucket), resident=None, padded_request_ids=(1, 2, -1),
+        ))
+    # Both immutable entry snapshots are ready before N executes anything.
+    entries = [torch.tensor([[0, 0, 0], [1, 0, 0], [-1, -1, -1]]) for _ in range(2)]
+    for iteration in range(actual):
+        active = torch.tensor([True, iteration == 0, False])
+        positions = rows.iteration_head(WALK, loop, rows.indices(bucket, 0), entries[0], active)
+        rows.iteration_tail(WALK, loop, rows.indices(bucket, 0), positions, active)
+    # N+1 receives no host correction and sees N's actual end, not its bound 4.
+    for iteration in range(2):
+        active = torch.tensor([True, False, False])
+        positions = rows.iteration_head(WALK, loop, rows.indices(bucket, 1), entries[1], active)
+        assert positions.tolist() == [actual + iteration, min(actual, 1), 0]
+        rows.iteration_tail(WALK, loop, rows.indices(bucket, 1), positions, active)
+
+
+def test_only_executed_loop_entries_reset_progress_and_recycled_handles_get_new_entries():
+    from mstar.graph.loop_indices import LoopLayout
+
+    rows = LoopbackRows(CPU, capacity=2)
+    rows.add(7)
+    loop = LoopLayout("inner", ancestors=("outer",))
+    bucket = BucketKey(WALK, 1, 1)
+    ctx = SimpleNamespace(slot_lease=SlotLease(slot=0, bucket=bucket), resident=None, padded_request_ids=(7,))
+    rows.plan(None, ctx)
+    indices = rows.indices(bucket, 0)
+    entry = torch.tensor([[0, 0, 0]])
+    for i in range(3):
+        position = rows.iteration_head(WALK, loop, indices, entry)
+        assert position.item() == i
+        rows.iteration_tail(WALK, loop, indices, position)
+    # A new outer entry is staged but skipped; the old entry remains intact.
+    successor_entry = torch.tensor([[0, 0, 1]])
+    # Even a body must not publish a new entry for an already-stopped row.
+    rows.iteration_head(WALK, loop, indices, successor_entry, torch.tensor([False]))
+    assert rows.iteration_head(WALK, loop, indices, entry).item() == 3
+    assert rows.iteration_head("other_walk", loop, indices, entry).item() == 0
+    assert rows.iteration_head(WALK, loop, indices, entry).item() == 3
+    position = rows.iteration_head(WALK, loop, indices, successor_entry)
+    assert position.item() == 0
+    rows.iteration_tail(WALK, loop, indices, position)
+    assert rows.iteration_head(WALK, loop, indices, successor_entry).item() == 1
+    # A new worker-graph pass also starts a fresh logical entry.
+    position = rows.iteration_head(WALK, loop, indices, torch.tensor([[0, 1, 0]]))
+    assert position.item() == 0
+    rows.iteration_tail(WALK, loop, indices, position)
+    rows.drop(7)
+    rows.add(7)
+    rows.plan(None, ctx)
+    assert rows.iteration_head(WALK, loop, indices, torch.tensor([[1, 0, 0]])).item() == 0

@@ -37,6 +37,7 @@ from mstar.engine.resources.base import EngineResourceInfo, Resource
 from mstar.engine.resources.resident import gather_column
 from mstar.engine.resources.spec import NodeResourceSpec
 from mstar.engine.resources.step import ADMIT_OK, ASKS, AdmitOutcome, BucketKey, ResourceStep, StepContext
+from mstar.graph.loop_indices import LoopLayout
 from mstar.utils import knobs
 from mstar.utils.h2d import PinnedStager
 
@@ -82,7 +83,7 @@ class LoopbackRows(Resource):
         # request rows, the trash row excluded
         self.capacity = knobs.sampler_slots() if capacity is None else capacity
         self._max_bs = 1
-        self._tables: dict[str, torch.Tensor] = {}
+        self._tables: dict[Hashable, torch.Tensor] = {}
         self._row_of: dict[Hashable, int] = {}
         self._free: list[int] = []
         # rows handed out so far, the trash row included
@@ -339,7 +340,7 @@ class LoopbackRows(Resource):
         table.index_copy_(0, self.indices(bucket, slot)[:value.shape[0]], value.to(table.dtype))
         return True
 
-    def _table(self, name: str, like: torch.Tensor | None = None) -> torch.Tensor:
+    def _table(self, name: Hashable, like: torch.Tensor | None = None) -> torch.Tensor:
         table = self._tables.get(name)
         if table is None:
             if like is None:
@@ -350,6 +351,47 @@ class LoopbackRows(Resource):
                 (self.capacity + 1, *like.shape[1:]), dtype=like.dtype, device=self._device,
             )
         return table
+
+    def iteration_head(
+        self, walk: str, loop: LoopLayout, indices: torch.Tensor, entry: torch.Tensor,
+        active: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Actual positions for one executed body, before selecting its inputs.
+
+        ``entry`` stages request generation, graph pass, then strict ancestor
+        counts. Planning never writes this table. Only a live body's first
+        entry resets its position; a skipped body never calls this operation.
+        The capture's row indices are gathered before this call.
+        """
+        if entry.shape != (len(indices), 2 + len(loop.ancestors)):
+            raise ValueError("a Loop entry needs generation, graph pass and strict ancestor counts")
+        key = ("iteration", walk, loop.name)
+        table = self._tables.get(key)
+        if table is None:
+            table = self._table(key, entry.new_empty(1, entry.shape[1] + 1))
+            table[:, 1:].fill_(-1)  # generation zero is a valid first request
+        previous = table.index_select(0, indices)
+        live = indices != TRASH_ROW
+        if active is not None:
+            live = live & active
+        entering = live & (previous[:, 1:] != entry).any(dim=1)
+        position = torch.where(entering, torch.zeros_like(previous[:, 0]), previous[:, 0])
+        current = torch.cat((position[:, None], entry), dim=1)
+        table.index_copy_(0, indices, torch.where(live[:, None], current, previous))
+        return position
+
+    def iteration_tail(
+        self, walk: str, loop: LoopLayout, indices: torch.Tensor, position: torch.Tensor,
+        active: torch.Tensor | None = None,
+    ) -> None:
+        """Advance exactly the rows that executed, including a stop-producing
+        iteration. Eager steps and captured bodies use this same owner.
+        """
+        live = indices != TRASH_ROW
+        if active is not None:
+            live = live & active
+        table = self._tables[("iteration", walk, loop.name)]
+        table[:, 0].index_copy_(0, indices, position + live.to(position.dtype))
 
     # By request: an eager step, a mixed step's read, a row's first write
 
