@@ -5,7 +5,7 @@ from typing import NamedTuple
 
 import torch
 
-from mstar.streaming.chunk_policy import ChunkPolicy
+from mstar.streaming.chunk_policy import ChunkPolicy, FixedChunkPolicy
 
 
 @dataclass(frozen=True, eq=False)
@@ -391,8 +391,10 @@ class StreamBuffer:
             raise ValueError("a stream run bound must be a positive integer")
         self._update_buffer()
         ready = self._walk_run_len()
-        if self.policy.window_size() != 1 or self.policy.next_chunk_size(max(ready, 1)) != 1:
-            raise ValueError("stream run reservations need one-item chunks")
+        # A ramp can begin at one item and grow after the first execution.
+        # Reservation settlement must not change the policy's chunk geometry.
+        if type(self.policy) is not FixedChunkPolicy or self.policy.window_size() != 1:
+            raise ValueError("stream run reservations need fixed one-item chunks")
         if self._waiting_graph_edges:
             raise ValueError("cannot reserve past an unconsumed graph edge")
         if len(self._reservations) >= 2:

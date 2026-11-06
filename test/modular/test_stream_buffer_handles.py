@@ -188,8 +188,8 @@ def test_whatever_can_ready_a_chunk_marks_the_buffer_for_the_poll():
     assert buf.maybe_ready, "the producer's done signal"
 
 
-def _window_consumer():
-    tm = _TM(_bookkeeping("python"))
+def _window_consumer(kind="python"):
+    tm = _TM(_bookkeeping(kind))
     buf = StreamBuffer(RID, EDGE, "LLM", FixedChunkPolicy(1))
     req_info = SimpleNamespace(stream_buffers={EDGE: buf}, ended_streams=set())
     streams = StreamBufferManager(SimpleNamespace(per_request_info={RID: req_info}), tm, [])
@@ -289,7 +289,7 @@ def test_a_device_queue_hands_its_consumer_the_chunks_the_host_queue_does(policy
 @pytest.mark.parametrize("ran", [0, 1, 4])
 @pytest.mark.parametrize("kind", ["python", "rust"])
 def test_overlapping_run_windows_consume_actual_inputs_once(ran, kind):
-    streams, tm, buf = _consumer(1, 1, kind)
+    streams, tm, buf = _window_consumer(kind)
     uuids = _produce(tm, buf, range(6))
     buf.signal_done(6)
     first = streams.reserve_edge(buf, EDGE, RID, 4)
@@ -421,3 +421,13 @@ def test_ring_reservations_keep_copied_windows_after_positions_are_released_and_
     streams.settle_window(RID, second, 2)
     assert ring.ring_room(EDGE, RID) == 2
     assert not any(tm.tensor_store.check_uuid_presence(u) for u in first.uuids + second.uuids)
+
+
+@pytest.mark.parametrize("policy", [FixedChunkPolicy(2), RampChunkPolicy(1, 4)])
+def test_run_reservations_refuse_policies_that_do_not_stay_one_item(policy):
+    buf = StreamBuffer(RID, EDGE, "LLM", policy)
+    buf.put_positions(list(range(8)), "decode")
+    with pytest.raises(ValueError, match="one-item"):
+        buf.reserve_window(4, "decode")
+    assert buf._consumed == policy.items_consumed == 0
+    assert not buf._reservations
