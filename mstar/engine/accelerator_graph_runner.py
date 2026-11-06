@@ -1435,7 +1435,7 @@ class AcceleratorGraphRunner:
             if (refusal := cuda.node_refusal(raw_graph)) is not None:
                 self._run_failures[walk] = f"runner: {refusal}"
                 return None, None, None
-            graph_exec.append(cuda.finish(outer, handle, raw_graph))
+            graph_exec.append(cuda.finish(outer, handle, raw_graph, state, device_handle))
         except Exception as error:
             self._run_failures[walk] = f"runner: its capture into a WHILE body failed: {error}"
             logger.warning("AcceleratorGraphRunner[%s]: %s", self._submodule_name, error)

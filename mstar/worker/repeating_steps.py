@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from mstar.engine.device_run import RUN_REPLAYS, TokenStream, run_item
+from mstar.engine.device_run import RUN_REPLAYS, RUN_SKIPPED, TokenStream, run_item
 from mstar.engine.resources.resident import NOT_ASKED
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.submodule_base import EMITTED_COUNT, BatchedModelOutput, HostRows
@@ -393,6 +393,30 @@ class RepeatingSteps:
         if step.node_batch.step_context.repeats > 1 and not self._step_repeats.config(step.node_name).ready_waits:
             self.engine_manager.get_engine(step.node_name).yield_runs(step.node_name)
             step.yield_asked = True
+
+    def _landed_skipped(self, step: PendingBatch) -> bool:
+        """Whether ``step``'s run began with its yield set and ran nothing, landed
+        here: asked before anything is speculated from it, since its outputs are
+        no outputs. The step before it has landed, so ``run_start`` is due at once.
+        Nothing moved on the device, so what admit counted goes back and its rows
+        wait as a refused step's do: the runtime still holds their inputs."""
+        node_batch = step.node_batch
+        started = node_batch.run_started
+        if started is None or node_batch.step_context.repeats <= 1:
+            return False
+        event = node_batch.completion_event
+        while not int(started[0]):
+            if step.future.done() and (event is None or event.query()):
+                return False  # it raised before it launched
+            time.sleep(_LANDED_POLL_S)
+        if int(started[0]) != RUN_SKIPPED:
+            return False
+        step.future.result()
+        phase_record(f"repeats.ran.{step.graph_walk}#", 0)
+        self._clear_in_flight_flag(step.batch)
+        self.engine_manager.get_engine(step.node_name).end_run_early(node_batch, 0)
+        self._push_back_batch(step.batch)
+        return True
 
     def _is_device_run(self, step: PendingBatch) -> bool:
         return (

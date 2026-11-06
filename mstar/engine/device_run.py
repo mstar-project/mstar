@@ -60,7 +60,20 @@ extern "C" __global__ void run_stop(
     bool go = done < rows && next < *limit && *yield_word == 0 && (*refill == 0 || done < *refill);
     cudaGraphSetConditional(*handle, go ? 1u : 0u);
 }
+
+extern "C" __global__ void run_start(
+    const long long* limit, const volatile int* yield_word, const unsigned long long* handle, volatile int* started
+) {
+    bool skip = *limit > 1 && *yield_word != 0;
+    cudaGraphSetConditional(*handle, skip ? 0u : 1u);
+    *started = skip ? RUN_SKIPPED : RUN_RAN;
+    __threadfence_system();
+}
 """
+
+# what ``run_start`` leaves in ``RunState.started``; 0 until it has run
+RUN_RAN, RUN_SKIPPED = 1, 2
+_STOP_SOURCE = f"#define RUN_RAN {RUN_RAN}\n#define RUN_SKIPPED {RUN_SKIPPED}\n{_STOP_SOURCE}"
 
 
 class RunAsk(NamedTuple):
@@ -151,6 +164,9 @@ class RunState:
         self.replays = torch.zeros(bs, dtype=torch.long, device=device)
         # set by the host to end the run; its own, since the step behind stages while this one runs
         self.yield_word = torch.zeros(1, dtype=torch.int32, pin_memory=torch.accelerator.is_available())
+        # how the run began (``RUN_RAN``, ``RUN_SKIPPED``): a run staged for more than one
+        # iteration with its word set runs none, so the work that set it goes next
+        self.started = torch.zeros(1, dtype=torch.int32, pin_memory=torch.accelerator.is_available())
         self.stop_ids = torch.tensor(sorted(stop_ids), dtype=torch.long, device=device)
         self._rows = torch.arange(bs, device=device)
         self._staged: tuple | None = None
@@ -159,6 +175,7 @@ class RunState:
         """Before a run, on the host. A staged value keeps its address: the graph reads it."""
         self.index.zero_()
         self.yield_word.zero_()
+        self.started.zero_()
         key = (real, tuple(immune), limit, refill_at)
         if key != self._staged:
             self._staged = key
@@ -186,13 +203,21 @@ class CudaWhile:
             ("graphs", ctypes.POINTER(ctypes.c_void_p)), ("ctx", ctypes.c_void_p),
         ]
 
+    class _KernelNode(ctypes.Structure):
+        """``CUDA_KERNEL_NODE_PARAMS_v2``."""
+        _fields_ = [
+            ("func", ctypes.c_void_p), ("grid", ctypes.c_uint * 3), ("block", ctypes.c_uint * 3),
+            ("shared", ctypes.c_uint), ("args", ctypes.POINTER(ctypes.c_void_p)), ("extra", ctypes.c_void_p),
+            ("kern", ctypes.c_void_p), ("ctx", ctypes.c_void_p),
+        ]
+
     _NODE_NAMES = {3: "host", 7: "event record", 10: "memory alloc", 11: "memory free", 13: "conditional"}
     _TYPE_CONDITIONAL, _COND_WHILE, _ASSIGN_DEFAULT = 13, 1, 1
 
     def __init__(self):
         self._rt = ctypes.CDLL(f"libcudart.so.{torch.version.cuda.split('.')[0]}")
         self._driver = ctypes.CDLL("libcuda.so.1")
-        self._kernel: ctypes.c_void_p | None = None
+        self._kernels: tuple[ctypes.c_void_p, ctypes.c_void_p] | None = None
 
     @staticmethod
     def devrt_path() -> str | None:
@@ -213,9 +238,9 @@ class CudaWhile:
         if status != 0:
             raise RuntimeError(f"{name} failed with CUDA error {status}")
 
-    def _load_kernel(self) -> ctypes.c_void_p:
-        """``run_stop``, compiled once a process."""
-        if self._kernel is None:
+    def _load_kernels(self) -> tuple[ctypes.c_void_p, ctypes.c_void_p]:
+        """``run_stop`` and ``run_start``, compiled once a process."""
+        if self._kernels is None:
             from torch.cuda._utils import _nvrtc_compile
 
             ptx = _nvrtc_compile(_STOP_SOURCE, "run_stop", nvcc_options=["-rdc=true"])
@@ -227,12 +252,13 @@ class CudaWhile:
             )
             self._driver_call("cuLinkAddFile_v2", link, 4, self.devrt_path().encode(), 0, None, None)
             self._driver_call("cuLinkComplete", link, ctypes.byref(cubin), ctypes.byref(size))
-            module, kernel = ctypes.c_void_p(), ctypes.c_void_p()
+            module, stop, start = ctypes.c_void_p(), ctypes.c_void_p(), ctypes.c_void_p()
             self._driver_call("cuModuleLoadData", ctypes.byref(module), cubin)
-            self._driver_call("cuModuleGetFunction", ctypes.byref(kernel), module, b"run_stop")
+            self._driver_call("cuModuleGetFunction", ctypes.byref(stop), module, b"run_stop")
+            self._driver_call("cuModuleGetFunction", ctypes.byref(start), module, b"run_start")
             self._driver_call("cuLinkDestroy", link)
-            self._kernel = kernel
-        return self._kernel
+            self._kernels = stop, start
+        return self._kernels
 
     def new_loop(self, device: torch.device) -> tuple[int, int, torch.Tensor]:
         """The outer graph, its condition's handle, and the handle on the device."""
@@ -259,7 +285,7 @@ class CudaWhile:
         ]
         args = (ctypes.c_void_p * len(values))(*(ctypes.cast(ctypes.byref(v), ctypes.c_void_p) for v in values))
         self._driver_call(
-            "cuLaunchKernel", self._load_kernel(), 1, 1, 1, 1, 1, 1, 0, ctypes.c_void_p(stream), args, None,
+            "cuLaunchKernel", self._load_kernels()[0], 1, 1, 1, 1, 1, 1, 0, ctypes.c_void_p(stream), args, None,
         )
 
     def node_refusal(self, step_graph: int) -> str | None:
@@ -277,8 +303,25 @@ class CudaWhile:
                 return f"its capture holds a {name} node, which a child graph of a WHILE body can't"
         return None
 
-    def finish(self, outer: int, handle: int, step_graph: int) -> int:
-        """The WHILE node, its body the step's graph; the outer graph's exec."""
+    def _add_start(self, outer: int, state: RunState, handle: torch.Tensor) -> ctypes.c_void_p:
+        """``run_start``, the node ahead of the WHILE: it can clear the condition
+        the launch set, so the body doesn't run at all."""
+        values = [
+            ctypes.c_void_p(state.limit.data_ptr()), ctypes.c_void_p(state.yield_word.data_ptr()),
+            ctypes.c_void_p(handle.data_ptr()), ctypes.c_void_p(state.started.data_ptr()),
+        ]
+        args = (ctypes.c_void_p * len(values))(*(ctypes.cast(ctypes.byref(v), ctypes.c_void_p) for v in values))
+        params = self._KernelNode(func=self._load_kernels()[1], grid=(1, 1, 1), block=(1, 1, 1), args=args)
+        node = ctypes.c_void_p()
+        self._driver_call(
+            "cuGraphAddKernelNode_v2", ctypes.byref(node), ctypes.c_void_p(outer), None, ctypes.c_size_t(0),
+            ctypes.byref(params),
+        )
+        return node
+
+    def finish(self, outer: int, handle: int, step_graph: int, state: RunState, device_handle: torch.Tensor) -> int:
+        """``run_start``, then the WHILE node, its body the step's graph; the outer graph's exec."""
+        start = self._add_start(outer, state, device_handle)
         body = ctypes.c_void_p()
         raw = (ctypes.c_longlong * 32)()  # cudaGraphNodeParams: type, reserved, union, reserved
         conditional = self._Conditional.from_address(ctypes.addressof(raw) + 16)
@@ -286,7 +329,8 @@ class CudaWhile:
         conditional.handle, conditional.type, conditional.size = handle, self._COND_WHILE, 1
         node, child = ctypes.c_void_p(), ctypes.c_void_p()
         self._call(
-            "cudaGraphAddNode", ctypes.byref(node), ctypes.c_void_p(outer), None, ctypes.c_size_t(0), ctypes.byref(raw),
+            "cudaGraphAddNode", ctypes.byref(node), ctypes.c_void_p(outer), ctypes.byref(start), ctypes.c_size_t(1),
+            ctypes.byref(raw),
         )
         body = conditional.graphs[0]
         self._call(
@@ -350,7 +394,8 @@ class DeviceRun:
         node's ``postprocess``) reads the last iteration that ran."""
         state = self.state
         state.replays.copy_(state.index.expand_as(state.replays))
-        ran = torch.minimum(self._columns[:repeats], state.index - 1)
+        # a skipped run wrote nothing, and nothing reads its columns; the index has to hold
+        ran = torch.minimum(self._columns[:repeats], (state.index - 1).clamp(min=0))
         for column in (*self.rows.values(), *self.stops.values()):
             column[:, :repeats] = column.index_select(1, ran)
         stops = {name: column[:, :repeats] for name, column in self.stops.items()}

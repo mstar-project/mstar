@@ -5540,6 +5540,11 @@ class Worker(RepeatingSteps):
                     metrics.maybe_report()
                     laps.lap("metrics")
 
+                if pending is not None and self._landed_skipped(pending):
+                    _set_pending(None)
+                    consecutive_spec_steps = 0
+                    continue
+
                 # 2. Speculatively schedule + build N+1 — overlaps with GPU(N).
                 # Only when (a) there's a pending step and (b) it's AR-engine.
                 # For non-AR or non-loop-body steps, falls through to the

@@ -422,6 +422,8 @@ class ExecutingBatch:
 
     # Enables double-buffering for resources with non-blocking H2D
     slot: int | None = None
+    # how its run on the device began (``RunState.started``), for one that went on one
+    run_started: torch.Tensor | None = None
 
     # Selects among a walk's capture buckets; matches SubmoduleStep.cg_key_info
     cg_key_info: Any | None = None
@@ -2729,6 +2731,7 @@ class Engine:
                     ctx.repeats, submodule_mgmt.refills[graph_walk],
                 )
                 slot.run.stage_columns(batch.iteration_columns)
+                batch.run_started = slot.run.state.started
             streamed = submodule_mgmt.device_stream_tokens.get(graph_walk)
             if streamed is not None and ctx.repeats > 1:
                 batch.token_stream = cg_runner.token_stream(lease, *streamed)

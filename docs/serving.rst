@@ -352,7 +352,8 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        (with ``MSTAR_SPEC_PEEK_FOR_FAIRNESS=0``, only work turning ready on a wait with nothing
        ready), a row of the run's own walk turning ready (as a prefill on a lane does when it
        lands) when nothing was waiting as the run began, or ``refill_at`` (a share of the run's
-       rows done; default off, and it needs ``device_stop``). A live row hands on to the
+       rows done; default off, and it needs ``device_stop``). A run staged behind one that is
+       asked to end runs no iteration at all, so the ready work goes next. A live row hands on to the
        next run where it stands. ``drop_rows`` does that and sends a stopped row's reads and
        writes to the trash slot until the run ends, so its KV and recurrent state stay where
        its stop left them; it needs a resident walk. Both need a token stop, one rank, CUDA

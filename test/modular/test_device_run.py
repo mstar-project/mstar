@@ -8,7 +8,16 @@ import torch
 
 from mstar.engine import accelerator_graph_runner as runner_mod
 from mstar.engine.accelerator_graph_runner import AcceleratorGraphRunner
-from mstar.engine.device_run import RUN_REPLAYS, CudaWhile, DeviceRun, RunAsk, RunState, TokenStream
+from mstar.engine.device_run import (
+    RUN_RAN,
+    RUN_REPLAYS,
+    RUN_SKIPPED,
+    CudaWhile,
+    DeviceRun,
+    RunAsk,
+    RunState,
+    TokenStream,
+)
 from mstar.engine.resources.step import BucketKey, SlotLease
 from mstar.model.submodule_base import BatchedModelOutput, CarryPair
 
@@ -47,10 +56,17 @@ class _Loop:
     def node_refusal(self, graph):
         return None
 
-    def finish(self, outer, handle, graph):
+    def finish(self, outer, handle, graph, state, device_handle):
+        self.state = state
         return 3
 
     def launch(self, graph_exec, stream):
+        """``run_start``, then the WHILE."""
+        state = self.state
+        skip = int(state.limit) > 1 and int(state.yield_word[0]) != 0
+        state.started[0] = RUN_SKIPPED if skip else RUN_RAN
+        if skip:
+            return
         i = 0
         while True:
             self.on_iteration(i)
@@ -149,6 +165,20 @@ def test_the_hosts_yield_word_ends_a_run_and_its_row_goes_on_in_the_next(monkeyp
     stops, _, _ = _run(run, 2, 2)
     assert stops[RUN_REPLAYS].tolist() == [2, 2], "the next run clears the word"
     assert static["h"].tolist() == [5, 5]
+
+
+@pytest.mark.parametrize("limit, ran, begun", [(6, 0, RUN_SKIPPED), (1, 1, RUN_RAN)])
+def test_a_run_staged_with_its_word_set_runs_nothing_unless_it_is_one_iteration(monkeypatch, limit, ran, begun):
+    """The step behind a run that was asked to end would otherwise hold up what asked
+    for one iteration. A step of one iteration always runs: it's the one taking in new
+    rows, or the first after a skip, so skips can't follow each other."""
+    runner, run, _, calls = _runner(monkeypatch, _Loop(), [[1, 1]])
+    run.state.stage(2, [False, False], limit)
+    run.state.yield_word[0] = 1
+    run.launch()
+    stops, _, _ = run.results(limit)
+    assert len(calls) == ran and int(run.state.started[0]) == begun
+    assert stops[RUN_REPLAYS].tolist() == [ran, ran]
 
 
 def test_a_yield_outlives_the_stage_of_the_step_behind_the_run():
@@ -402,6 +432,40 @@ def test_the_worker_settles_a_run_that_ended_short(monkeypatch):
     # a yield's cut shows nowhere else: the walk's line still says "on" (review-r7 G5)
     assert profiler.phase_buffer()[f"repeats.ran.{WALK}#"] == [3]
     profiler.phase_buffer().clear()
+
+
+@pytest.mark.parametrize("begun, skipped", [(RUN_SKIPPED, True), (RUN_RAN, False)])
+def test_a_skipped_run_lands_as_a_step_that_never_ran(begun, skipped):
+    """Nothing it counted happened and it has no outputs: what admit counted goes back
+    and its rows wait with the inputs they had, with no postprocess at all. The word
+    can still be 0 at first: the step before has only just landed."""
+    from mstar.worker.worker import Worker
+
+    worker = Worker.__new__(Worker)
+    log = []
+    words = iter([0, begun])
+    worker._clear_in_flight_flag = lambda batch: log.append("flag")
+    worker._push_back_batch = lambda batch: log.append("queued")
+    worker.engine_manager = SimpleNamespace(get_engine=lambda node: SimpleNamespace(
+        end_run_early=lambda node_batch, ran: log.append(("rewound", ran)),
+    ))
+
+    class Word:
+        value = None
+
+        def __getitem__(self, index):
+            self.value = next(words, self.value)
+            return self.value
+
+    step = SimpleNamespace(
+        node_name="n", graph_walk=WALK, batch=object(),
+        future=SimpleNamespace(done=lambda: False, result=lambda: None),
+        node_batch=SimpleNamespace(
+            run_started=Word(), step_context=SimpleNamespace(repeats=8), completion_event=None,
+        ),
+    )
+    assert worker._landed_skipped(step) is skipped
+    assert log == (["flag", ("rewound", 0), "queued"] if skipped else [])
 
 
 def test_a_short_run_takes_back_a_decode_snapshot_past_where_it_ended():
