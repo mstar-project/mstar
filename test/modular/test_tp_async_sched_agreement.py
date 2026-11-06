@@ -37,19 +37,16 @@ class _Group:
         return out
 
 
-def _run_ranks(async_per_rank, axis):
-    """Run the check on one worker per rank of a ``node`` parallel over ``axis``;
-    return each rank's exception, or None."""
+def _run_ranks(async_per_rank):
+    """Run the check on one worker per rank of ``node``'s lockstep instance, the
+    only group it reads; return each rank's exception, or None."""
     posted = [None] * len(async_per_rank)
     barrier = threading.Barrier(len(async_per_rank), timeout=10)
     errors = [None] * len(async_per_rank)
 
     def rank(i):
         group = _Group(posted, barrier, i)
-        joint = JointGroups(
-            tp_group=group if axis == "tp" else CommGroup.trivial(),
-            sp_group=group if axis == "sp" else CommGroup.trivial(),
-        )
+        joint = JointGroups(tp_group=CommGroup.trivial(), sp_group=CommGroup.trivial(), instance=group)
         worker = types.SimpleNamespace(
             parallel_nodes={"node"},
             parallel_groups=types.SimpleNamespace(get_joint_group_for_node=lambda n: joint),
@@ -68,13 +65,11 @@ def _run_ranks(async_per_rank, axis):
     return errors
 
 
-@pytest.mark.parametrize("axis", ["tp", "sp"])
 @pytest.mark.parametrize("flag", [True, False])
-def test_agreeing_ranks_pass(axis, flag):
-    assert _run_ranks([flag, flag], axis) == [None, None]
+def test_agreeing_ranks_pass(flag):
+    assert _run_ranks([flag, flag]) == [None, None]
 
 
-@pytest.mark.parametrize("axis", ["tp", "sp"])
-def test_mismatch_is_refused_on_every_rank(axis):
-    errors = _run_ranks([True, False], axis)
+def test_mismatch_is_refused_on_every_rank():
+    errors = _run_ranks([True, False])
     assert all(exc is not None and "disagrees" in str(exc) for exc in errors)

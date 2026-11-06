@@ -1837,7 +1837,7 @@ class Engine:
                 except Exception as error:
                     # this rid fails alone, as in prepare_inputs, and keeps its
                     # admitted state (which queued kernels may still write) until
-                    # its REMOVE. Under TP/SP the ranks stay in step only if every
+                    # its REMOVE. Under TP/SP/CFG the ranks stay in step only if every
                     # rank raises here.
                     batch.register_failure(rid, error)
                 finally:

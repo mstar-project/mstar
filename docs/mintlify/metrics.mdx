@@ -136,7 +136,7 @@ Gauge, seconds, computed at scrape time. Time since the API server received the 
 
 ## Engine workers {#engine-workers}
 
-From the workers' numbers, forwarded in the conductor's status message, so up to two seconds old. A node with replicas on several workers shows their sum. The ranks of a tensor or sequence parallel instance count once: the instance's first rank reports.
+From the workers' numbers, forwarded in the conductor's status message, so up to two seconds old. A node with replicas on several workers shows their sum. The ranks of a TP, SP or CFG instance count once: the instance's first rank reports.
 
 `mstar_kv_pages_used{model_name, component, resource}` <br />
 Gauge. Pages of a paged KV cache not on its free list: held by requests, or kept by the prefix cache. A node can have several caches (e.g. a decoder's self and cross attention), told apart by `resource`. A cache two nodes of one worker share shows under each node, so summing over `component` counts it twice.

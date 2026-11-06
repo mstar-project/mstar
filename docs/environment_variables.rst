@@ -165,7 +165,8 @@ Communication
        Workers on CUDA set ``0`` unless you set it.
    * - ``GLOO_SOCKET_IFNAME``
      - ``lo``
-     - PyTorch's variable for the Gloo groups next to each TP/SP group.
+     - PyTorch's variable for the Gloo groups next to each parallel group
+       and for each lockstep instance.
        Same rule: the conductor sets ``lo`` for its workers unless you set
        it, so Gloo does not listen on the address the hostname resolves to.
 
@@ -462,7 +463,7 @@ Worker scheduling
      - Meaning
    * - ``MSTAR_TP_ASYNC_SCHED``
      - config's ``tp_async_sched``, else ``1``
-     - Async scheduling for lockstep-parallel (TP / SP) nodes; overrides the
+     - Async scheduling for lockstep-parallel (TP / SP / CFG) nodes; overrides the
        deployment config's ``tp_async_sched``. ``1`` (or ``true``): the
        instance leader speculates step N+1 of the parallel node during
        forward N (the existing single-worker speculation machinery, gate
