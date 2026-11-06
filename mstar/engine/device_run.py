@@ -406,6 +406,11 @@ class DeviceRun:
                 kept[name] = tensor.new_empty(tensor.shape[0], int(self.limit), *tensor.shape[1:])
             column_out(self.state, tensor, kept[name])
 
+    def execution_counts(self) -> dict[str, torch.Tensor]:
+        """The launched width and each row's logical executions, including width one."""
+        self.state.replays.copy_(self.state.index.expand_as(self.state.replays))
+        return {RUN_REPLAYS: self.state.replays, RUN_COUNTS: self.state.counts}
+
     def results(self, repeats: int) -> tuple[dict, dict, dict]:
         """After the launch: what ``AcceleratorGraphRunner.repeat`` returns, and
         the iterations that ran under ``RUN_REPLAYS``. A run that ended short
@@ -414,14 +419,12 @@ class DeviceRun:
         a column's last (the loop-back of the step speculated meanwhile, a
         node's ``postprocess``) reads the last iteration that ran."""
         state = self.state
-        state.replays.copy_(state.index.expand_as(state.replays))
         # a skipped run wrote nothing, and nothing reads its columns; the index has to hold
         ran = torch.minimum(self._columns[:repeats], (state.index - 1).clamp(min=0))
         for column in (*self.rows.values(), *self.stops.values()):
             column[:, :repeats] = column.index_select(1, ran)
         stops = {name: column[:, :repeats] for name, column in self.stops.items()}
-        stops[RUN_REPLAYS] = state.replays
-        stops[RUN_COUNTS] = state.counts
+        stops.update(self.execution_counts())
         return (
             stops, {name: column[:, :repeats] for name, column in self.rows.items()},
             {name: column[:, :repeats] for name, column in self.spans.items()},

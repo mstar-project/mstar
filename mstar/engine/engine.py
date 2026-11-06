@@ -2699,7 +2699,7 @@ class Engine:
                 range_push("engine.commit")
             t0 = phase_start()
             try:
-                self._runner.commit(step)
+                self._runner.commit(step, track_rows=batch.run_started is not None)
                 batch.committed = step
                 if submodule_mgmt.resident is not None:
                     submodule_mgmt.resident.commit(step, ctx)
@@ -2757,6 +2757,13 @@ class Engine:
                 out = dataclasses.replace(
                     out, check_stop_buffers=stops, row_outputs={**(out.row_outputs or {}), **rows},
                     output_spans={**(out.output_spans or {}), **spans} or None,
+                )
+            elif slot.run is not None:
+                # A width-one launch can consist entirely of rows stopped by
+                # its predecessor. Preserve ordinary output shapes, but settle
+                # those rows from the device's counts as for a longer run.
+                out = dataclasses.replace(
+                    out, check_stop_buffers={**(out.check_stop_buffers or {}), **slot.run.execution_counts()},
                 )
             elif ctx.repeats > 1:
                 columns = submodule_mgmt.run_columns.get(graph_walk, frozenset())

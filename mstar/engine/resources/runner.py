@@ -792,9 +792,9 @@ class StepRunner:
         self._staged = self._step_key(step)
         return results
 
-    def commit(self, step: SubmoduleStep) -> None:
-        """record step consumption"""
-        if step.ctx.repeats > 1:
+    def commit(self, step: SubmoduleStep, *, track_rows: bool = False) -> None:
+        """Record provisional consumption and identify rows whose execution may shorten."""
+        if step.ctx.repeats > 1 or track_rows:
             # the requests this run counted for, should it land short (``rewind_run``)
             step.ctx.counted = {rid: self._generations.get(rid) for rid in step.ctx.request_ids}
         for key in self._keys_for(step):

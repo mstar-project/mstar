@@ -960,3 +960,30 @@ def test_engine_asks_for_a_counted_device_run_without_a_token_signal():
     ), ())
     assert len(asked) == 1 and asked[0].token_signal is None
     assert engine._submodules["n"].device_stops[WALK] is policy
+
+
+def test_a_width_one_device_launch_returns_zero_row_counts_without_changing_output_shapes(monkeypatch):
+    from mstar.engine.engine import Engine
+    from mstar.engine.resources.step import SlotLease, StepContext
+
+    loop = _Loop()
+    runner, run, _, _ = _runner(monkeypatch, loop, [[1, 1]])
+    loop.on_iteration = lambda i: run.state.marks.fill_(True)
+    slot = next(iter(runner._buckets.values())).slots[0]
+    slot.row_heads = {}
+    raw = BatchedModelOutput(check_stop_buffers={"token": torch.tensor([1, 1])})
+    runner.run_forward = lambda *args, **kwargs: (run.launch(), raw)[1]
+    ctx = StepContext(request_ids=(7, 9), graph_walk=WALK, slot=0, capture=True)
+    batch = SimpleNamespace(step_context=ctx, iteration_columns=None, preplan_event=None)
+    mgmt = SimpleNamespace(
+        device_stops={WALK: SimpleNamespace(limits=lambda info: SimpleNamespace(ignore_eos=False))},
+        refills={WALK: None}, device_stream_tokens={},
+    )
+    lease = SlotLease(slot=0, bucket=next(iter(runner._buckets)))
+    out = Engine._forward(
+        Engine.__new__(Engine), batch, mgmt, runner,
+        SimpleNamespace(per_request_info={7: None, 9: None}), {}, lease, True, [7, 9], None,
+    )
+    assert out.check_stop_buffers["token"].shape == (2,)
+    assert out.check_stop_buffers[RUN_REPLAYS].tolist() == [1, 1]
+    assert out.check_stop_buffers[RUN_COUNTS].tolist() == [0, 0]
