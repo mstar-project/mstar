@@ -285,6 +285,19 @@ class StreamBufferManager:
             return None
         return self._chunk_edge(chunk, edge_name, self.consumer_node.get(edge_name, ""), request_id)
 
+    def _window_buffer(self, request_id: int, edge: StreamingEdge) -> StreamBuffer:
+        req_info = self._request_state.per_request_info.get(request_id)
+        sbuf = None if req_info is None else req_info.stream_buffers.get(edge.name)
+        if sbuf is None or edge.chunk.reservation is None:
+            raise ValueError("a retained reader needs its request's stream buffer")
+        return sbuf
+
+    def window_bound(self, request_id: int, edge: StreamingEdge) -> int:
+        return self._window_buffer(request_id, edge).window_bound(edge.chunk.reservation)
+
+    def retained_prefix(self, request_id: int, edge: StreamingEdge) -> int:
+        return self._window_buffer(request_id, edge).retained_prefix(edge.chunk)
+
     def settle_window(self, request_id: int, edge: StreamingEdge, executed: int) -> StreamChunkInfo | None:
         """Release the source owner's consumed prefix; the graph independently
         releases the snapshot references after its last submitted reader.

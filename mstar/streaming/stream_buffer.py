@@ -425,6 +425,22 @@ class StreamBuffer:
         """A recycled request's new buffer cannot settle an old reader."""
         return reservation in self._reservations
 
+    def window_bound(self, reservation: StreamReservation) -> int:
+        """The current admitted capacity, including when a skipped reader retries."""
+        if reservation not in self._reservations:
+            raise ValueError("a stream window no longer belongs to this buffer")
+        return self._reservations[reservation]
+
+    def retained_prefix(self, chunk: StreamChunkInfo) -> int:
+        """Executed real or tail inputs still present in this retained snapshot."""
+        reservation = chunk.reservation
+        if reservation is None or reservation not in self._reservations:
+            raise ValueError("a retained stream snapshot needs its live reservation")
+        prefix = self._consumed + self._tail_consumed - chunk.start_offset - reservation.tail_offset
+        if not 0 <= prefix <= reservation.predecessor_bound:
+            raise ValueError("stream progress is outside its retained predecessor span")
+        return prefix
+
     def narrow_window(self, reservation: StreamReservation, bound: int) -> None:
         """Admission can narrow the newest reader before a successor reserves."""
         previous = self._reservations.get(reservation)

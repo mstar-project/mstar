@@ -493,3 +493,82 @@ def test_only_declared_iteration_edges_reserve_and_tail_readiness_follows_the_wa
     streams.return_edge(RID, by_name[EDGE])
     tm.dereference_batch_uniform(by_name["audio"].uuids)
     assert not text._reservations and text._tail_consumed == 0
+
+
+@pytest.mark.parametrize("tail_only", [False, True])
+def test_a_skipped_reader_keeps_its_origin_and_narrowed_bound_through_real_graph_retry(tail_only):
+    from test_graph_runtime import _build
+
+    from mstar.graph.base import GraphNode, Loop
+    from mstar.graph.runtime.base import ColumnarEdgeSpecs
+    from mstar.model.submodule_base import InputMetadata
+    from mstar.worker.executing_batch import make_executing_batch
+
+    graph = Loop(name="loop", section=GraphNode(name=NODE, input_names={EDGE, "state"}, outputs=[]),
+                 max_iters=20, outputs=[])
+    graph.section._register_streaming({EDGE})
+    request_state, runtime, rid = _build(graph, 0, "decode", {NODE}, {"loop"})
+    tm = _TM(runtime.tensor_store.bookkeeping)
+    conn = Connection("LLM", "default", EDGE, lambda: FixedChunkPolicy(1, True))
+    streams = StreamBufferManager(request_state, tm, [conn], graph_runtime=runtime)
+    streams.consumer_node = {EDGE: NODE}
+    streams.configure_windows({NODE: 4}, {NODE: frozenset({("decode", EDGE)})})
+    streams.add_request(rid, SimpleNamespace(partition_name="default", stream_lead_items={}))
+    buf = request_state.per_request_info[rid].stream_buffers[EDGE]
+    uuids = []
+    for i in range(0 if tail_only else 8):
+        uuid = 800 + i
+        tm.tensor_store.put_tensor(rid, uuid, torch.tensor([i]), _info(uuid))
+        tm.tensor_store.increment_ref(uuid, 1)
+        buf.pre_read_register(uuid)
+        buf.put(uuid, uuid)
+        uuids.append(uuid)
+    if tail_only:
+        buf.signal_done(0)
+    first = streams.reserve_edge(buf, EDGE, rid, 4, "decode")
+    retained = streams.reserve_edge(buf, EDGE, rid, 4, "decode")
+    streams.return_unread(rid, retained, 2)
+    assert retained.chunk.reservation.bound == 4 and streams.window_bound(rid, retained) == 2
+    state = ColumnarEdgeSpecs.empty()
+    state.add(rid, "state", [], False, next_node=NODE)
+    assert runtime.ingest_inputs_batch(state, can_buffer=False) == []
+    block = streams.edge_block([(rid, retained)])
+    assert runtime.ingest_inputs_batch(block, can_buffer=False, is_streaming=True) == []
+    streams.mark_ingested(rid, retained)
+    runtime.pop_rids(NODE, "decode", [rid])
+    streams.settle_window(rid, first, 1)
+    tm.dereference_batch_uniform(first.uuids)
+    assert streams.retained_prefix(rid, retained) == 1
+
+    # A skipped launch did not consume the current graph inputs. An ordinary
+    # poll's offered replacement is refused, then its newest reservation is
+    # cancelled before the original reader re-admits at a narrower width.
+    offered = streams.pop_edge(buf, EDGE, rid)
+    assert runtime.ingest_inputs_batch(streams.edge_block([(rid, offered)]), can_buffer=False,
+                                       is_streaming=True) == [0]
+    streams.return_edge(rid, offered)
+    runtime.push_back_node(NODE, [rid], [0])
+    retry = runtime.pop_rids(NODE, "decode", [rid])
+    assert {edge.signal for edge in retry.input_edges.edge_tuples()} == {EDGE, "state"}
+    inputs = streams.input_tensors(retry.input_edges, NODE, [rid]).by_rid
+    chunks = streams.chunks_for(rid, NODE, inputs[rid])
+    assert chunks[EDGE].reservation is retained.chunk.reservation
+    metadata = {rid: InputMetadata(stream_chunks=chunks, dynamic_loop_iter_counts={"loop": 1},
+                                   graph_pass=0, iteration_origin=1)}
+    batch = make_executing_batch(
+        streams, NODE, "decode", [rid], inputs,
+        {rid: request_state.get_fwd_info(rid, "default")}, per_request_input_metadata=metadata, repeats=4,
+    )
+    assert batch.step_context.repeats == 2
+    assert batch.per_request_input_metadata[rid].iteration_origin == 0
+    assert batch.stream_windows[rid][0].chunk.reservation is retained.chunk.reservation
+    streams.return_unread(rid, retained, 1)
+    streams.settle_window(rid, retained, 1)
+    tm.cleanup_collectable(*runtime.cleanup_consumed_inputs(NODE, [rid], [0]))
+    assert not buf._reservations
+    if tail_only:
+        assert buf._tail_consumed == 2 and buf._consumed == 0
+    else:
+        assert buf._consumed == 2
+        assert not any(tm.tensor_store.check_uuid_presence(uuid) for uuid in uuids[:2])
+        assert all(tm.tensor_store.check_uuid_presence(uuid) for uuid in uuids[2:])

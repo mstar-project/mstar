@@ -12,6 +12,7 @@ from mstar.engine.resources import StepContext
 from mstar.graph.loop_indices import LoopLayout
 from mstar.graph.runtime.base import GraphRuntime
 from mstar.model.submodule_base import InputMetadata
+from mstar.streaming.stream_buffer import StreamingEdge
 from mstar.worker.node_manager_utils import RequestStateManager
 from mstar.worker.stream_buffers import StreamBufferManager
 
@@ -102,6 +103,24 @@ def make_executing_batch(
     final_stream_rids, partition_done_rids = streams.settle_final(
         node_name, final_edges or {},
     )
+    metadata = per_request_input_metadata or {}
+    windows = {}
+    config = streams.windows.get(node_name)
+    if config is not None and config.retained:
+        for rid, item in metadata.items():
+            edges = [StreamingEdge(name, node_name, [], chunk) for name, chunk in item.stream_chunks.items()
+                     if chunk.reservation is not None]
+            if not edges:
+                continue
+            prefixes = {streams.retained_prefix(rid, edge) for edge in edges}
+            if len(prefixes) != 1 or item.iteration_origin is None:
+                raise ValueError("retained inputs must agree on their snapshotted Loop origin")
+            prefix = prefixes.pop()
+            if prefix > item.iteration_origin:
+                raise ValueError("a retained input cannot precede its current Loop entry")
+            metadata[rid] = item._replace(iteration_origin=item.iteration_origin - prefix)
+            repeats = min(repeats, *(streams.window_bound(rid, edge) for edge in edges))
+            windows[rid] = edges  # settlement only: graph ingest owns their reader references
     if request_walks and engine is not None:
         # Every path to a mixed step comes through here, a TP follower's too,
         # so each rank orders the leader's rows alike.
@@ -112,7 +131,8 @@ def make_executing_batch(
         per_request_input_tensors=per_request_input_tensors,
         final_stream_rids=final_stream_rids,
         partition_done_rids=partition_done_rids,
-        per_request_input_metadata=per_request_input_metadata or {},
+        per_request_input_metadata=metadata,
+        stream_windows=windows,
         chunk_ranges=chunk_ranges or {},
         step_context=StepContext(
             request_ids=tuple(request_ids),
