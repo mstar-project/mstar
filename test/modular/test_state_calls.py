@@ -19,6 +19,8 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from mstar.engine.resources.recurrent.config import RecurrentStep
+from mstar.engine.resources.recurrent.pool import RecurrentStatePool
 from mstar.engine.resources.sampler import utils as sampler_utils
 from mstar.engine.resources.sampler.config import SamplerStep
 from mstar.engine.resources.sampler.resource import SamplerResource
@@ -51,7 +53,9 @@ from mstar.engine.state import (
     rope,
     sample,
 )
+from mstar.engine.state.adapters import build_specs
 from mstar.engine.state.calls import ArrayHandle, SamplerHandle
+from mstar.engine.state.host import HostFields
 from mstar.engine.state.within_step import WithinStepHandle
 
 LAYERS, SLOTS, HEADS, DIM = 4, 64, 2, 8
@@ -927,3 +931,251 @@ def test_a_step_that_keeps_a_rows_sample_still_needs_its_draw():
     h.begin_step(step)
     with pytest.raises(ValueError, match="sampled 0 times, and draws is 1"):
         h.check_step(step)
+
+
+# A plain Value, over a real pool: a fp32 matrix `x`, a 0-d int64 count `n`, row 1 fresh and row 2 written
+def _plain_value() -> tuple[ArrayHandle, RecurrentStatePool]:
+    entry = Entry({"x": TensorType((2, 3), dtype=torch.float32), "n": TensorType((), dtype=torch.int64)})
+    array = Value("state", nodes={"LLM"}, layers={0}, entry=entry)
+    (spec,) = build_specs([array], kernel_settings={"state": {"max_slots": 4}})
+    pool = RecurrentStatePool(torch.device("cpu"), spec.config)
+    for rid in (1, 2):
+        pool.ingest_request(rid)
+    return ArrayHandle(array, {"state": pool}, None), pool
+
+
+def _plan(pool, segments, capture=False):
+    plan = RecurrentStep(segments=tuple(segments))
+    rows = [segment.request_id for segment in segments]
+    ctx = StepContext(request_ids=rows, graph_walk="decode", slot=0, capture=capture)
+    assert pool.admit(plan, ctx).ok, "the pool holds a slot for every row"
+    pool.plan(plan, ctx)
+    return plan, ctx
+
+
+def _value_step(h, pool, segments) -> tuple[SubmoduleStep, RecurrentStep, StepContext]:
+    plan, ctx = _plan(pool, segments)
+    step = _begin(h, segments=list(segments), ctx=ctx)
+    return step, plan, ctx
+
+
+def _commit_written(h, pool, rid=2, x=4.0, n=9) -> None:
+    """A kept step that leaves row ``rid`` written."""
+    step, plan, ctx = _value_step(h, pool, [Segment(rid, "main", 1)])
+    h.write(0, x=torch.full((1, 2, 3), x), n=torch.tensor([n]))
+    h.check_step(step)
+    pool.commit(plan, ctx)
+    h.end_step(step)
+
+
+def test_a_values_read_and_write_are_the_pools_gather_and_scatter():
+    h, pool = _plain_value()
+    _commit_written(h, pool)
+    step, _, _ = _value_step(h, pool, [Segment(2, "main", 1)])
+    reached = h.read(0)
+    assert torch.equal(reached.fields["x"], pool.gather("x")), "a read returns what the pool holds"
+    assert reached.fields["n"].tolist() == [9], "a 0-d field reads one scalar per row"
+    assert reached.fields["x"].dtype is torch.float32 and reached.fields["n"].dtype is torch.int64
+    h.end_step(step)
+
+
+def test_row_offsets_count_one_entry_per_row():
+    h, pool = _plain_value()
+    step, _, _ = _value_step(h, pool, [Segment(1, "main", 1), Segment(2, "main", 1)])
+    offsets = h.read(0).row_offsets
+    assert offsets.tolist() == [0, 1, 2] and offsets.dtype is torch.int32, "row r holds its one entry at index r"
+    h.end_step(step)
+
+
+def test_fresh_and_span_zero_rows_read_start_per_field_and_zeros_for_the_rest():
+    h, pool = _plain_value()
+    _commit_written(h, pool)
+    start = {"x": torch.full((2, 3), 7.0)}
+    step, _, _ = _value_step(h, pool, [Segment(1, "main", 1), Segment(2, "main", 0)])
+    reached = h.read(0, start=start)
+    assert reached.fields["x"].equal(torch.full((2, 2, 3), 7.0)), "row 2 holds state, and span 0 still reads the start"
+    assert reached.fields["n"].tolist() == [0, 0], "a field start doesn't name reads zeros"
+    h.end_step(step)
+
+
+def test_a_written_row_reads_its_entry_and_not_start():
+    h, pool = _plain_value()
+    _commit_written(h, pool)
+    start = {"x": torch.full((2, 3), 7.0)}
+    step, _, _ = _value_step(h, pool, [Segment(1, "main", 1), Segment(2, "main", 1)])
+    x = h.read(0, start=start).fields["x"]
+    assert x[0].equal(start["x"]) and x[1].equal(torch.full((2, 3), 4.0)), "a written row kept its entry"
+    h.end_step(step)
+
+
+def test_writing_what_a_read_returned_changes_no_state():
+    h, pool = _plain_value()
+    _commit_written(h, pool)
+    step, _, _ = _value_step(h, pool, [Segment(2, "main", 1)])
+    reached = h.read(0)
+    reached.fields["x"].add_(100.0)
+    reached.fields["n"].add_(100)
+    assert h.read(0).fields["n"].tolist() == [9], "the read's tensors are the caller's"
+    h.end_step(step)
+
+
+def test_a_write_is_visible_to_the_next_steps_read():
+    h, pool = _plain_value()
+    _commit_written(h, pool)
+    _commit_written(h, pool, x=5.0, n=10)
+    step, _, _ = _value_step(h, pool, [Segment(2, "main", 1)])
+    assert h.read(0).fields["n"].tolist() == [10], "the write set the entry at the step's commit"
+    h.end_step(step)
+
+
+def _gdn_over_a_pool(array: Array) -> tuple[RecurrentStatePool, ArrayHandle]:
+    specs = {spec.resource_key: spec for spec in build_specs([_array(), array])}
+    pool = RecurrentStatePool(torch.device("cpu"), specs["gdn"].config, kv_dtype=torch.float32)
+    pool.ingest_request(1)
+    return pool, ArrayHandle(array, {"gdn": pool, "d": _StubLinear()}, None)
+
+
+def test_a_gated_delta_nets_state_reads_declared_and_stores_k_last():
+    entry = Entry({
+        "state": TensorType((HEADS, DIM, DIM + 1), dtype=torch.bfloat16, shard=0),
+        "conv": TensorType((3 * HEADS * DIM, 3), dtype=None, shard=0),
+    })
+    array = Value("gdn", nodes={"LLM"}, layers={0}, entry=entry, updates={"d": GatedDeltaNet()})
+    pool, h = _gdn_over_a_pool(array)
+    step, _, _ = _value_step(h, pool, [Segment(1, "main", 1)])
+    state = torch.ones(1, HEADS, DIM, DIM + 1, dtype=torch.bfloat16)
+    h.write(0, state=state)
+    assert pool.block("state", 0).shape[1:] == (HEADS, DIM + 1, DIM), "the stored layout is K-last"
+    h._written.clear()
+    assert h.read(0).fields["state"].shape == (1, HEADS, DIM, DIM + 1), "a read returns the declared layout"
+    assert h.read(0).fields["state"].dtype is torch.bfloat16, "a read returns the declared dtype"
+    h.end_step(step)
+
+
+def test_a_second_write_of_a_field_is_refused():
+    h, pool = _plain_value()
+    step, _, _ = _value_step(h, pool, [Segment(1, "main", 1)])
+    h.write(0, x=torch.ones(1, 2, 3))
+    _refused(r"Array 'state': a second write of field 'x' on layer 0", lambda: h.write(0, x=torch.ones(1, 2, 3)))
+    h.end_step(step)
+
+
+def test_a_value_field_written_with_no_row_axis_is_refused_by_name():
+    h, pool = _plain_value()
+    step, _, _ = _value_step(h, pool, [Segment(1, "main", 1)])
+    _refused(r"Array 'state': field 'x' written with no row axis", lambda: h.write(0, x=torch.tensor(1.0)))
+    h.end_step(step)
+
+
+def test_a_read_after_a_write_of_the_layer_is_refused():
+    h, pool = _plain_value()
+    step, _, _ = _value_step(h, pool, [Segment(1, "main", 1)])
+    h.write(0, x=torch.ones(1, 2, 3))
+    _refused(r"Array 'state': a read of layer 0 after its write or update", lambda: h.read(0))
+    h.end_step(step)
+
+
+def test_a_read_after_an_update_of_the_layer_is_refused():
+    entry = Entry({
+        "state": TensorType((HEADS, DIM, DIM + 1), dtype=torch.float32, shard=0),
+        "conv": TensorType((3 * HEADS * DIM, 3), dtype=None, shard=0),
+    })
+    array = Value("gdn", nodes={"LLM"}, layers={0}, entry=entry, updates={"c": CausalConv(), "d": GatedDeltaNet()})
+    pool, h = _gdn_over_a_pool(array)
+    step, _, _ = _value_step(h, pool, [Segment(1, "main", 1)])
+    causal_conv(h, 0, torch.randn(1, 3 * HEADS * DIM), weight=torch.ones(3 * HEADS * DIM, 4))
+    _refused(r"Array 'gdn': a read of layer 0 after its write or update", lambda: h.read(0))
+    h.end_step(step)
+
+
+@pytest.mark.parametrize("call, cause", [
+    (lambda h: h.read(0, torch.ones(1)), r"a Value's read takes start and no other keyword, and got \['q'\]"),
+    (lambda h: h.read(0, bias=1), r"a Value's read takes start and no other keyword, and got \['bias'\]"),
+    (lambda h: h.read(0, start={"y": torch.ones(1)}), r"start names fields \['y'\], of \['n', 'x'\]"),
+    (lambda h: h.read(0, start={"x": torch.ones(2, 4)}), r"start of field 'x' on layer 0 is \(2, 4\)"),
+    (lambda h: h.read(0, start={"x": torch.ones(2, 3).double()}), r"start of field 'x' on layer 0 is .*float64"),
+    (lambda h: h.read(1), r"read on layer 1, which the array doesn't declare"),
+    (lambda h: h.write(0, y=torch.ones(1)), r"no field 'y' on layer 0"),
+    (lambda h: h.write(0, x=torch.ones(1, 2, 4)), r"write of field 'x' on layer 0 is \(2, 4\)"),
+    (lambda h: h.write(0, n=torch.ones(1).long().float()), r"write of field 'n' on layer 0 is \(\) of torch.float32"),
+], ids=["q", "a mask keyword", "an undeclared start", "a start's shape", "a start's dtype", "an undeclared layer",
+        "an undeclared write", "a write's shape", "a write's dtype"])
+def test_a_values_calls_refuse_what_the_field_cant_hold(call, cause):
+    h, pool = _plain_value()
+    step, _, _ = _value_step(h, pool, [Segment(1, "main", 1)])
+    _refused(rf"Array 'state': {cause}", lambda: call(h))
+    h.end_step(step)
+
+
+def test_a_read_outside_a_step_is_refused():
+    h, _ = _plain_value()
+    _refused(r"Array 'state': read in a step that doesn't list the array", lambda: h.read(0))
+
+
+def test_a_read_on_a_value_with_only_host_fields_is_refused():
+    array = Value("host", nodes={"LLM"}, layers={0}, entry=Entry({}, host={"n": int}))
+    h = ArrayHandle(array, {}, None, HostFields())
+    _refused(r"Array 'host': read on a Value with no tensor fields", lambda: h.read(0))
+
+
+def test_start_on_an_array_that_isnt_a_value_is_refused_on_both_handles():
+    start = {"k": torch.ones(1)}
+    _refused(r"Array 'kv': start, on an array that isn't a Value", lambda: _kv_handle().read(0, start=start))
+    _refused(r"Array 'kv': start, on an array that isn't a Value", lambda: _within_handle().read(0, start=start))
+
+
+def test_a_read_with_another_start_than_the_first_is_refused():
+    """A captured read keeps the tensors its capture saw, so a read with others would differ from its own replay."""
+    h, pool = _plain_value()
+    first = {"x": torch.full((2, 3), 7.0)}
+    step, _, _ = _value_step(h, pool, [Segment(1, "main", 1)])
+    h.read(0, start=first)
+    h.read(0, start=dict(first))
+    _refused(r"Array 'state': a read passes another start", lambda: h.read(0, start={"x": first["x"].clone()}))
+    _refused(r"Array 'state': a read passes another start", lambda: h.read(0))
+    h.end_step(step)
+
+
+def test_keep_false_on_a_plain_value_is_refused():
+    h, pool = _plain_value()
+    _, ctx = _plan(pool, [Segment(1, "main", 1)])
+    _refused(r"Array 'state': keep=False on a Value with tensor fields",
+             lambda: _begin(h, state=ArrayStep(keep=False), ctx=ctx))
+
+
+def test_a_kept_step_that_leaves_a_field_unwritten_is_refused_naming_it():
+    h, pool = _plain_value()
+    step, _, _ = _value_step(h, pool, [Segment(1, "main", 1)])
+    h.write(0, x=torch.ones(1, 2, 3))
+    _refused(r"Array 'state': layer 0's fields \['n'\] are unwritten", lambda: h.check_step(step))
+    h.end_step(step)
+
+
+def test_a_step_over_a_fresh_row_and_a_written_row_counts_only_its_own_write():
+    """A region's replay writes its rows' slots with no Python, so the handle never sees it. A fresh row it leaves out
+    would then commit as written, and read zeros next rather than its start."""
+    h, pool = _plain_value()
+    _commit_written(h, pool)
+    step, _, _ = _value_step(h, pool, [Segment(1, "main", 1), Segment(2, "main", 1)])
+    slot = pool.addressing("main").host_slot_indices[1]
+    pool.block("x", 0)[slot] = 5.0
+    pool.block("n", 0)[slot] = 10
+    _refused(r"Array 'state': layer 0's fields \['n', 'x'\] are unwritten in a kept step for rows \[1, 2\]",
+             lambda: h.check_step(step))
+    with pytest.raises(ValueError, match="1 rows for a step that declared 2"):
+        h.write(0, x=torch.ones(1, 2, 3))
+    h.end_step(step)
+
+
+def test_a_step_with_every_row_at_span_zero_needs_no_write():
+    h, pool = _plain_value()
+    step, _, _ = _value_step(h, pool, [Segment(1, "main", 0)])
+    h.check_step(step)
+    h.end_step(step)
+
+
+def test_a_replay_skips_the_write_check():
+    h, _ = _plain_value()
+    step = _begin(h, segments=[Segment(1, "main", 1)], ctx=_ctx(leased=True))
+    h.check_step(step)
+    h.end_step(step)
