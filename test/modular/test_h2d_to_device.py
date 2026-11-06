@@ -93,3 +93,40 @@ def test_runs_past_the_staging_buffer_grow_it(accelerator_device):
     assert store[:run].tolist() == values[:run].tolist()
     assert store[run:2 * run].tolist() == [0] * run
     assert store[2 * run:3 * run].tolist() == values[run:].tolist()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA stream execution")
+@pytest.mark.parametrize("kind", ["immune", "ring"])
+def test_repeat_staging_does_not_wait_for_the_previous_run(kind):
+    from mstar.engine.device_run import RunState
+    from mstar.engine.engine import Engine
+    from mstar.engine.resources.loopback_rows import LoopbackRows
+    from mstar.model.submodule_base import BatchedModelOutput
+
+    device = torch.device("cuda")
+    state = RunState(2, "token", {9}, device)
+    rows = LoopbackRows(device, capacity=4)
+    rows.ask_ring("frames", depth=4)
+    assert rows.ring_table("frames", torch.zeros(2, 2, device=device)) is None
+    rows.add(1)
+    items = torch.arange(4, device=device).reshape(2, 1, 2)
+    batch = types.SimpleNamespace(request_ids=[2, 1], ring_bases={"frames": {1: 0}}, ring_width=1)
+    output = BatchedModelOutput(row_outputs={"frames": items[:, 0]})
+    mgmt = types.SimpleNamespace(loopback_rows=rows)
+    # Warm allocation/indexing paths before checking a busy stream.
+    state.stage(2, [False, False], 2)
+    Engine._write_rings(None, mgmt, batch, output)
+    torch.cuda.synchronize()
+    done = torch.cuda.Event()
+    torch.cuda._sleep(500_000_000)
+    done.record()
+    if kind == "immune":
+        state.stage(2, [True, False], 3)
+    else:
+        Engine._write_rings(None, mgmt, batch, output)
+    assert not done.query(), "staging waited for the preceding GPU run"
+    torch.cuda.synchronize()
+    if kind == "immune":
+        assert state.immune.tolist() == [True, False]
+    else:
+        assert rows.ring_read("frames", 1, [0]).tolist() == [[2, 3]]

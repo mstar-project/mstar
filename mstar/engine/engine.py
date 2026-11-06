@@ -93,6 +93,7 @@ from mstar.profile.worker import ExecTimings
 from mstar.utils import knobs
 from mstar.utils.client_errors import client_error_text
 from mstar.utils.device import DeviceCapability
+from mstar.utils.h2d import to_device_nonblocking
 from mstar.utils.ipc_format import OffloadDelta, ScheduleTPNode
 from mstar.utils.profiler import (
     PhaseLaps,
@@ -1838,7 +1839,7 @@ class Engine:
                 items = items.reshape(items.shape[0], 1, *items.shape[1:])
             rids = list(bases)
             rows = [index_of[rid] for rid in rids]
-            picked = items if rows == list(range(len(rows))) else items[torch.tensor(rows, device=items.device)]
+            picked = items if rows == list(range(len(rows))) else items[to_device_nonblocking(rows, items.device, dtype=torch.long)]
             mgmt.loopback_rows.ring_write(signal, rids, picked[:, :batch.ring_width], [bases[rid] for rid in rids])
 
     def stream_tokens(self, node_name: str, graph_walk: str, signal: str, limit: int) -> str | None:

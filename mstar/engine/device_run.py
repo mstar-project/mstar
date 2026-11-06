@@ -26,6 +26,7 @@ from typing import Any, NamedTuple
 import torch
 
 from mstar.engine.resources.resident import TRASH_SLOT
+from mstar.utils.h2d import PinnedStager
 
 # a stop buffer of a run that repeats: the iterations it ran, on every row
 RUN_REPLAYS = "__run_replays__"
@@ -160,6 +161,7 @@ class RunState:
         # the marks a run ends at, ``refill_at`` of its rows; 0 is off
         self.refill = torch.zeros(1, dtype=torch.long, device=device)
         self.immune = torch.zeros(bs, dtype=torch.bool, device=device)
+        self._immune_stager = PinnedStager(torch.bool, numel=bs)
         self.marks = torch.zeros(bs, dtype=torch.bool, device=device)
         self.replays = torch.zeros(bs, dtype=torch.long, device=device)
         # set by the host to end the run; its own, since the step behind stages while this one runs
@@ -182,9 +184,7 @@ class RunState:
             self.limit.fill_(limit)
             pad = len(self.marks) - real
             self.refill.fill_(0 if refill_at is None else pad + max(1, int(refill_at * real + 0.999999)))
-            self.immune.zero_()
-            if any(immune):
-                self.immune[:len(immune)].copy_(torch.tensor(immune, dtype=torch.bool))
+            self._immune_stager.copy_(self.immune, immune, pad_value=False)
         torch.ge(self._rows, real, out=self.marks)
 
     def head(self) -> None:
