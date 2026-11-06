@@ -29,7 +29,8 @@ class LinearAttnVariant(Enum):
 
 
 class LinearAttnBackend(Enum):
-    FLASHINFER = "flashinfer"
+    FLASHINFER = "flashinfer"  # GDN: FlashInfer's kernels
+    TRITON = "triton"  # KDA: the fused kernels in kda_triton.py
 
 
 @dataclass
@@ -41,10 +42,6 @@ class LinearAttnConfig:
     # Defaults to head_k_dim ** -0.5 off the pool's geometry, as the kernels'
     # own default does.
     sm_scale: float | None = None
-
-    # GLM-5.3 sets this (`gate_lower_bound: -5.0`), selecting a different gate
-    # formula in the KDA kernel. None keeps the softplus one.
-    gate_lower_bound: float | None = None
 
     # L2-normalise q and k for the delta rule: in the kernel where it can, by
     # `GDNManager.run` where it cannot (the SM90 chunked prefill). Qwen3.5 needs
@@ -168,4 +165,10 @@ class LinearAttnStep(ResourceStep):
     Carries no state semantics: the segments give the rows and spans, and the
     pool's own step says what becomes of the slots. The walk is derived from
     the spans.
+
+    ``speculative``: every row is a verify block of a speculating node, which
+    first replays the accepted part of the row's last block (the pool's
+    speculative blocks); the span is the block's length, the same for every row.
     """
+
+    speculative: bool = False

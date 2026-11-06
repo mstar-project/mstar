@@ -692,7 +692,7 @@ class S3GenSubmodule(NodeSubmodule):
     def _finish(self, wav: torch.Tensor, watermark: bool) -> torch.Tensor:
         if watermark and self.watermarker is not None and wav.numel() > 0:
             wav = self.watermarker.apply(wav, self.config.sample_rate)
-        return (wav.clamp(-1, 1) * 32767).to(torch.int16)
+        return (wav.float().clamp(-1, 1) * 32767).to(torch.int16)
 
     def _noise_field(self, state: StreamState, ref, generator: torch.Generator) -> torch.Tensor:
         if state.noise is None:

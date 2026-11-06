@@ -122,9 +122,11 @@ def _make_model(config: WhisperModelConfig | None = None) -> WhisperModel:
 
 def _snapshot(repo: str) -> Path | None:
     try:
-        from huggingface_hub import snapshot_download
+        from huggingface_hub import hf_hub_download
 
-        return Path(snapshot_download(repo, allow_patterns=["*.json", "*.txt"], local_files_only=True))
+        # An offline `snapshot_download` returns the snapshot's folder whatever it holds.
+        hf_hub_download(repo, "generation_config.json", local_files_only=True)
+        return Path(hf_hub_download(repo, "config.json", local_files_only=True)).parent
     except Exception:  # noqa: BLE001 — no cache, skip
         return None
 
@@ -136,7 +138,7 @@ def _snapshot(repo: str) -> Path | None:
 def test_config_reads_turbo_and_v3_checkpoints(repo, decoder_layers, alignment_heads):
     snap = _snapshot(repo)
     if snap is None:
-        pytest.skip(f"{repo} not in the local HF cache")
+        pytest.skip(f"config files of {repo} not in the local HF cache")
     cfg = WhisperModelConfig.from_pretrained(snap)
     assert cfg.decoder_layers == decoder_layers and cfg.encoder_layers == 32
     assert cfg.d_model == 1280 and cfg.encoder_attention_heads == 20 and cfg.encoder_ffn_dim == 5120

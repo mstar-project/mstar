@@ -56,6 +56,11 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
      - Zero-shot voice-cloning TTS: Qwen2-0.5B speech-token LM with RAS sampling,
        DiT flow-matching decoder and causal HiFT vocoder, streamed in chunks.
        Clones from a preset or an uploaded clip. 24 kHz.
+   * - ``glm5_next``
+     - ``zai-org/GLM-5.3-Flash``
+     - GLM-5.3-Flash (320B/18B): hybrid KDA linear-attention + MLA MoE causal
+       LM, text in / text out, fp8 checkpoint, TP8. ``configs/glm5_next_tp8_mtp.yaml``
+       drafts with MTP k=3 (greedy only).
    * - ``kokoro``
      - ``hexgrad/Kokoro-82M``
      - TTS (82M, not autoregressive): misaki G2P + PL-BERT prosody + iSTFTNet
@@ -74,6 +79,8 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
    * - ``glm52``
      - ``zai-org/GLM-5.2-FP8``
      - GLM-5.2 (753B/40B): MLA + DSA MoE causal LM, fp8 block-scale weights, TP8.
+       ``model_kwargs.kernels`` is ``auto`` (the tuned kernels) or ``reference``, the numerics
+       anchor, served eager. ``configs/glm52_tp8_mtp.yaml`` drafts with MTP k=3 (greedy only).
    * - ``orpheus``
      - ``canopylabs/orpheus-3b-0.1-ft``
      - TTS: Llama 3.2 3B LLM emitting audio tokens + SNAC 24 kHz decoder.
@@ -864,6 +871,12 @@ Qwen3-TTS notes
 - The Talker's layers run ``Qwen3Attention``, so each layer's q/k norm, RoPE and
   KV write are one kernel (``qk_norm_rope_kv_write``). It reads the RoPE theta off
   the position resource, which declares the checkpoint's.
+- The Talker's decode rows run on FlashInfer's CUDA-core decode kernel. Every
+  checkpoint has 16 query heads over 8 KV heads, and the tensor-core kernel pads
+  the 2 query heads per KV head out to a tile. On an H200 the 1.7B serves 1.01x
+  to 1.03x the audio from c1 to c128 with the same WER. It's unmeasured on the
+  0.6B and on B300. ``talker_attn: decode_tensor_cores: true`` in a deployment's
+  YAML selects the tensor-core kernel.
 - The codec decoder runs in float32 by default: a stream's audio is the
   reference decoder's whole decode within 1 LSB of PCM16. ``model_kwargs:
   {codec_dtype: bfloat16}`` selects a bf16 codec (RMSNorm and RoPE stay
@@ -1373,7 +1386,10 @@ size with its aspect ratio kept, center-cropped and rounded to 8 bits, as in
 NVIDIA's cosmos-framework and diffusers 0.40 and later. Setting
 ``conditioning_resize: stretch`` under the config YAML's ``model_kwargs``
 resizes it to the output size instead (antialiased bilinear, aspect ratio not
-kept), as diffusers 0.39 did. Action requests ignore the setting.
+kept), as diffusers 0.39 did. Action requests ignore the setting. The image
+pins the first latent frame, so the request must ask for a video of more than
+one latent frame (``num_frames`` above 4); an image output, or a shorter video,
+is refused with a 400.
 
 Cosmos3-Edge reasoner and action loop
 -------------------------------------
