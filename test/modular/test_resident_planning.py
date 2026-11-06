@@ -2003,3 +2003,18 @@ def test_the_knob_defaults_to_auto(monkeypatch):
 def test_the_slot_count_is_no_knob():
     with pytest.raises(ValueError):
         knobs.check({"resident_slots": 8})
+
+
+def test_cross_attention_packs_a_resident_steps_queries_off_its_rows():
+    """A resident step's query pool may hand back lengths only, with no views."""
+    from mstar.engine.resources.attn.cross import FlashInferCrossManager
+
+    cross = FlashInferCrossManager.__new__(FlashInferCrossManager)
+    cross._kv_cache_name, cross._query_kv_cache_name = "ctx", "kv"
+    cross._resident_qo_indptr = {}
+    plan = SimpleNamespace(writes=SimpleNamespace(streams={"kv": SimpleNamespace(label="main")}))
+    ctx = SimpleNamespace(resident=object(), resident_plan=plan, padded_request_ids=[3, 5, 9])
+    packings = cross._query_packings(SimpleNamespace(), ctx)
+    assert list(packings) == ["main"]
+    assert packings["main"].request_ids == [3, 5, 9]
+    assert packings["main"].qo_indptr.tolist() == [0, 1, 2, 3]
