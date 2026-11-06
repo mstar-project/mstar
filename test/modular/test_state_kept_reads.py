@@ -20,11 +20,13 @@ import torch.nn.functional as F
 
 from mstar.distributed.communication import CommGroup
 from mstar.engine.resources.attn.config import AttentionStep, CrossAttentionConfig, CrossAttentionSpec
+from mstar.engine.resources.attn.cross import FlashInferCrossManager
 from mstar.engine.resources.attn.dense import DenseAttentionManager
+from mstar.engine.resources.attn.flashinfer import FlashInferManager
 from mstar.engine.resources.attn.ragged.config import RaggedCrossAttentionStep
 from mstar.engine.resources.attn.ragged.wrappers import PrefixedPrefillWrapper
 from mstar.engine.resources.kv import manager as kv_manager_module
-from mstar.engine.resources.kv.config import KVLayout, KVSpec, KVStep, PagedKVConfig
+from mstar.engine.resources.kv.config import KVLayout, KVReqConfig, KVSpec, KVStep, PagedKVConfig
 from mstar.engine.resources.step import Segment, StepContext, SubmoduleStep
 from mstar.engine.state import (
     Array,
@@ -588,3 +590,130 @@ def test_a_scratch_step_leaves_the_rows_kept_length_unchanged(dense):
         _run_step(kv, attn, handle, {"a": 2, "b": 4}, keep=False)
         segments = attn._current_plans["main"].segments
         assert [segment.prefix_len for segment in segments] == [5, 3], "a denoise step would see another prefix"
+
+
+# On the kernels that serve
+
+
+requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="FlashInfer's kernels need a GPU")
+_PAGED = dict(num_qo_heads=4, num_kv_heads=2, head_dim=64, page_size=16, max_num_pages=16)
+
+
+def _pool(name: str, max_seq_len: int, label: str = "main") -> tuple[PagedKVConfig, kv_manager_module.KVManager]:
+    config = PagedKVConfig(num_layers=len(LAYERS), max_seq_len=max_seq_len, **_PAGED)
+    pool = kv_manager_module.KVManager(
+        cfg=config, name=name, joint_comm_group=None, transfer_engine_info=None, device=torch.device("cuda"),
+        dtype=torch.bfloat16,
+    )
+    for rid in ("a", "b"):
+        pool.ingest_request(rid, overrides=KVReqConfig(needed_labels=[label]))
+    return config, pool
+
+
+def _tokens(total: int, heads: int) -> torch.Tensor:
+    return torch.randn(total, heads, _PAGED["head_dim"], device="cuda", dtype=torch.bfloat16)
+
+
+def _float_sdpa(q, k, v) -> torch.Tensor:
+    return _sdpa(q.float(), k.float(), v.float())
+
+
+@requires_cuda
+@torch.no_grad()
+def test_a_bidirectional_read_on_flashinfers_kernel_matches_sdpa(monkeypatch):
+    monkeypatch.setattr(kv_manager_module, "KVTransferManager", lambda info, kv_cache, **kwargs: None)
+    torch.manual_seed(0)
+    config, pool = _pool("kv", 64)
+    attn = FlashInferManager(kv_cache="kv", device=torch.device("cuda"), dtype=torch.bfloat16, kv_config=config)
+    array = Array("kv", nodes={"n"}, layers=LAYERS, entry=KVEntry(heads=2, head_dim=64), max_len=64,
+                  reads={"attn": Read(mask=Bidirectional(), op=Attend(q_heads=4))})
+    handle = ArrayHandle(array, {"kv": pool, "attn": attn}, None)
+    kept: dict = {}
+    for spans, keep in (({"a": 18, "b": 3}, True), ({"a": 2, "b": 4}, False)):
+        step = state_steps(SubmoduleStep(
+            segments=[Segment(rid, "main", span) for rid, span in spans.items()], state={"kv": ArrayStep(keep=keep)},
+        ), {"kv": handle})
+        ctx = _ctx(rows=tuple(spans))
+        assert pool.admit(step.steps["kv"], ctx).ok
+        ctx.plan_results["kv"] = pool.plan(step.steps["kv"], ctx)
+        attn.plan(step.steps["attn"], ctx)
+        step.set_ctx(ctx)
+        step.begin_calls()
+        for layer in sorted(LAYERS):
+            total = sum(spans.values())
+            q, k, v = _tokens(total, 4), _tokens(total, 2), _tokens(total, 2)
+            handle.add(layer, k=k, v=v)
+            actual = handle.read(layer, q)
+            offset, parts = 0, []
+            for rid, span in spans.items():
+                past_k, past_v = kept.get((rid, layer), (k[:0], v[:0]))
+                row_k = torch.cat([past_k, k[offset:offset + span]])
+                row_v = torch.cat([past_v, v[offset:offset + span]])
+                parts.append(_float_sdpa(q[offset:offset + span], row_k, row_v))
+                if keep:
+                    kept[(rid, layer)] = (row_k, row_v)
+                offset += span
+            assert torch.allclose(actual.float(), torch.cat(parts), atol=2e-2, rtol=2e-2), f"layer {layer}, keep={keep}"
+        step.check_calls()
+        step.end_calls()
+        pool.commit(step.steps["kv"], ctx)
+
+
+@requires_cuda
+@torch.no_grad()
+def test_a_kept_cross_read_on_flashinfers_kernel_matches_sdpa_with_a_label_of_its_own(monkeypatch):
+    """A prefill that adds each row's context under its own label, then a decode that reads what it kept."""
+    monkeypatch.setattr(kv_manager_module, "KVTransferManager", lambda info, kv_cache, **kwargs: None)
+    torch.manual_seed(0)
+    self_config, self_pool = _pool("kv", 64)
+    context_config, context_pool = _pool("context", 48, label=CONTEXT)
+    attn = FlashInferManager(kv_cache="kv", device=torch.device("cuda"), dtype=torch.bfloat16, kv_config=self_config)
+    cross = FlashInferCrossManager(
+        kv_cache="context", query_kv_cache="kv", context_label=CONTEXT, device=torch.device("cuda"),
+        dtype=torch.bfloat16, kv_config=context_config,
+    )
+    self_array = Array("kv", nodes={"n"}, layers=LAYERS, entry=KVEntry(heads=2, head_dim=64), max_len=64,
+                       reads={"attn": Read(mask=Causal(), op=Attend(q_heads=4))})
+    cross_array = Array("context", nodes={"n"}, layers=LAYERS, entry=KVEntry(heads=2, head_dim=64), max_len=48,
+                        labels={CONTEXT},
+                        reads={"cross": Read(mask=Bidirectional(), op=Attend(q_heads=4), queries="kv")})
+    handles = {
+        "kv": ArrayHandle(self_array, {"kv": self_pool, "attn": attn}, None),
+        "context": ArrayHandle(cross_array, {"context": context_pool, "cross": cross}, None, queried=self_array),
+    }
+    contexts: dict = {}
+    for query_spans, context_spans in (((5, 3), (20, 7)), ((1, 1), (0, 0))):
+        segments = (Segment("a", CONTEXT, context_spans[0]), Segment("b", CONTEXT, context_spans[1]))
+        step = state_steps(SubmoduleStep(
+            segments=[Segment(rid, "main", span) for rid, span in zip("ab", query_spans, strict=True)],
+            state={"kv": ArrayStep(), "context": ArrayStep(segments=segments)},
+        ), handles)
+        ctx = _ctx()
+        assert self_pool.admit(step.steps["kv"], ctx).ok and context_pool.admit(step.steps["context"], ctx).ok
+        ctx.plan_results["kv"] = self_pool.plan(step.steps["kv"], ctx)
+        ctx.plan_results["context"] = context_pool.plan(step.steps["context"], ctx)
+        attn.plan(step.steps["attn"], ctx)
+        cross.plan(step.steps["cross"], ctx)
+        step.set_ctx(ctx)
+        step.begin_calls()
+        for layer in sorted(LAYERS):
+            if sum(context_spans):
+                k, v = _tokens(sum(context_spans), 2), _tokens(sum(context_spans), 2)
+                handles["context"].add(layer, k=k, v=v)
+                contexts[("a", layer)] = (k[:context_spans[0]], v[:context_spans[0]])
+                contexts[("b", layer)] = (k[context_spans[0]:], v[context_spans[0]:])
+        for layer in sorted(LAYERS):
+            total = sum(query_spans)
+            q = _tokens(total, 4)
+            handles["kv"].add(layer, k=_tokens(total, 2), v=_tokens(total, 2))
+            handles["kv"].read(layer, _tokens(total, 4))
+            actual = handles["context"].read(layer, q)
+            expected = torch.cat([
+                _float_sdpa(q[:query_spans[0]], *contexts[("a", layer)]),
+                _float_sdpa(q[query_spans[0]:], *contexts[("b", layer)]),
+            ])
+            assert torch.allclose(actual.float(), expected, atol=2e-2, rtol=2e-2), f"layer {layer}, {query_spans}"
+        step.check_calls()
+        step.end_calls()
+        self_pool.commit(step.steps["kv"], ctx)
+        context_pool.commit(step.steps["context"], ctx)
