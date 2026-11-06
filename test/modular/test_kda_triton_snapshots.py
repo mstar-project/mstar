@@ -8,7 +8,7 @@ sys.path.insert(0, ".")
 
 import pytest
 import torch
-from test_kda_triton import HEAD_DIM, HEADS, HIDDEN, SLOTS, _kda, _Kda, _Pool, _pools, _spans
+from test_kda_triton import HEAD_DIM, HEADS, HIDDEN, SLOTS, _Kda, _kda, _Pool, _pools, _spans
 
 from mstar.engine.resources.convenience import KDACallable
 from mstar.engine.resources.linear_attn import kda_triton
