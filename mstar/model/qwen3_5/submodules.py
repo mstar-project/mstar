@@ -157,7 +157,7 @@ class LLMSubmodule(SampledTokenDecoder):
         """
         device = self.get_device()
         merge = self._merge_size
-        pos = start = self.node_resources[ROPE].position(rid=fwd_info.request_id, label="main")
+        pos = start = self.node_resources[ROPE].position(rid=fwd_info.rid_handle, label="main")
         pos_ids: list[torch.Tensor] = []
         cursor = 0
         for offset, tokens, grid in zip(
