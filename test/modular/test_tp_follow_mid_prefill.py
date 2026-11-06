@@ -13,6 +13,7 @@ sys.path.insert(0, ".")
 
 from mstar.engine.chunking import ChunkRange
 from mstar.graph.runtime.base import ColumnarEdgeSpecs, SpeculationPrepOutput
+from mstar.testing_utils.worker import make_worker
 from mstar.utils.ipc_format import ScheduleTPNode
 from mstar.worker.micro_scheduler import MicroScheduler, ScheduledBatch
 from mstar.worker.stream_buffers import StreamBufferManager
@@ -24,10 +25,11 @@ NODE, MIXED = "LLM", "mixed"
 def _follower(head: ScheduleTPNode) -> Worker:
     """A real ``Worker`` with only what ``_try_follow_speculation`` reads, as
     far as assembling the step."""
-    worker = Worker.__new__(Worker)
-    worker.worker_id = "worker_1"
-    worker.scheduler = MicroScheduler(
+    worker = make_worker(
+        worker_id="worker_1",
+        scheduler=MicroScheduler(
         engine_manager=SimpleNamespace(get_engine=lambda node: None), parallel_leader_nodes=set(),
+    ),
     )
     worker.scheduler.register_tp_follow(head)
     worker.scheduler.chunk_loop_walks = {NODE: frozenset({"prefill_text"})}

@@ -20,6 +20,7 @@ from mstar.model.submodule_base import BatchedModelOutput
 from mstar.streaming.chunk_policy import FixedChunkPolicy
 from mstar.streaming.stream_buffer import StreamBuffer
 from mstar.streaming.topology import CLIENT
+from mstar.testing_utils.worker import make_worker
 from mstar.utils.containers import RecentSet
 from mstar.utils.ipc_format import (
     ConductorMessageType,
@@ -45,13 +46,7 @@ def _worker(
     known_rids=("X",), in_flight=(), draining=(), reads_done=(),
     pending_drains=(), inflight_reads=False, is_follower=False, tp_follow=(),
 ):
-    w = Worker.__new__(Worker)
-    w._walk_drivers = {}
-    w._walk_driven_edges = {}
-    w.worker_id = "w0"
-    w._phase_period = 0
-    w._stop_token_signal = {}  # no declared stop policies: check_stop decides
-    w.is_tp_follower = is_follower
+    w = make_worker(is_tp_follower=is_follower)
     w.sent = []
     w.cleared = []
     w.failed = set()
@@ -77,7 +72,6 @@ def _worker(
             SimpleNamespace(groups=[]) if r in known_rids else None
         ),
     )
-    w.streaming_buffers = {}
     w.scheduler = SimpleNamespace(
         clear_rid=lambda rid, rid_str: w.cleared.append(rid),
         clear_wire_rid=w.cleared.append,
@@ -484,13 +478,7 @@ def test_a_new_request_behind_the_drain_is_admitted_until_reads_done():
 
 
 def test_add_new_request_hands_off_the_handle_not_the_string():
-    w = Worker.__new__(Worker)
-    w._walk_drivers = {}
-    w._walk_driven_edges = {}
-    w.worker_id = "w0"
-    w._draining_rids = set()
-    w._reads_done_sent = set()
-    w._unprocessed_messages = {}
+    w = make_worker()
     rids = RidTable()
     rids.intern("other")  # so X's handle is 1, not 0
     w._graph_runtime = SimpleNamespace(

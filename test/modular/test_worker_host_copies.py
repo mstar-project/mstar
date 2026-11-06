@@ -25,6 +25,7 @@ from mstar.engine.resources import StepContext
 from mstar.graph.base import GraphEdge
 from mstar.graph.runtime.base import FreedTensors, PhasedPostprocess, RouteOutput
 from mstar.model.submodule_base import BatchedModelOutput
+from mstar.testing_utils.worker import make_worker
 from mstar.worker.micro_scheduler import ScheduledBatch
 from mstar.worker.stream_buffers import StreamBufferManager
 from mstar.worker.worker import Worker
@@ -85,10 +86,7 @@ def _manager(tmp_path, entity_id):
 
 
 def _worker(tmp_path):
-    w = Worker.__new__(Worker)
-    w._walk_drivers = {}
-    w._walk_driven_edges = {}
-    w._phase_period = 0
+    w = make_worker()
     w.enable_nvtx = w.enable_prof = False
     w._stop_token_signal = {}  # no declared stop policies: check_stop decides
     w.device = torch.device("cpu")
