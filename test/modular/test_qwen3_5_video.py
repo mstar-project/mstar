@@ -889,7 +889,7 @@ def test_a_rebuilt_image_prompt_holds_the_slots_and_positions_of_an_uninterrupte
     config.apply_conductor_config(kv_layout={"main": layout.row()}, loop_caps={"decode_loop": 8})
     kv.ingest_request(R, config)
     rope.ingest_request(R)
-    prefill = llm._vision_inputs(SimpleNamespace(request_id=R, step_metadata=metadata), {
+    prefill = llm._vision_inputs(SimpleNamespace(request_id=R, rid_handle=R, step_metadata=metadata), {
         "text_inputs": step.input_tensors["text_inputs"], **copied,
     })
     for walk, row in (("prefill_vision", prefill), *[("decode", None)] * samples):
@@ -921,6 +921,8 @@ def test_a_rebuilt_image_prompt_holds_the_slots_and_positions_of_an_uninterrupte
     eng.dropped.append(R)
     kv.prepare_rebuild(R, w._rebuilds.start(R, NODE, None))
     batch = w._build_executing_batch(ScheduledBatch(NODE, "prefill_vision", {R: 0}, rebuild_rids=frozenset({R})))
+    # the stub worker registers no rid handles, and the rope pool here is keyed by the request id
+    batch.per_request_info[R].rid_handle = R
     rebuilt = llm._vision_inputs(batch.per_request_info[R], batch.per_request_input_tensors[R])
     write("prefill_vision", rebuilt)
 
