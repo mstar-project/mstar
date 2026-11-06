@@ -14,12 +14,15 @@ projections but don't need TP.
 """
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn.functional as F
 from torch import nn
 
 from mstar.engine.resources.lora.config import LoraTarget
 from mstar.model.components.lora.capable import LoraCapable, LoraOutputAdd
+from mstar.model.components.quant_linear import QuantCapability
 
 
 class FusedColumnLinear(nn.Module, LoraCapable):
@@ -36,8 +39,9 @@ class FusedColumnLinear(nn.Module, LoraCapable):
     The fused ``weight`` / ``bias`` carry a ``weight_loader(param, tensor,
     shard_id)`` method that copies one checkpoint shard into its slice of
     the fused parameter, dispatched by ``shard_id`` (a key of
-    ``shard_sizes``). Wire the per-shard checkpoint keys to it with the
-    loader's stacked-param rules.
+    ``shard_sizes``), or, with no shard id, a tensor that is already fused.
+    Wire the per-shard checkpoint keys to it with the loader's stacked-param
+    rules.
     """
 
     # bound: the delta whole on every rank, like the fused linear
@@ -70,6 +74,15 @@ class FusedColumnLinear(nn.Module, LoraCapable):
         if self.bias is not None:
             self.bias.weight_loader = self.weight_loader
 
+    def reset_parameters(self) -> None:
+        """``nn.Linear``'s initialisation, for a caller that runs before (or
+        without) a checkpoint; the weights are otherwise left uninitialised."""
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        if self.bias is not None:
+            fan_in = self.weight.shape[1]
+            bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
+            nn.init.uniform_(self.bias, -bound, bound)
+
     def _apply(self, fn, recurse=True):
         result = super()._apply(fn, recurse=recurse)
         # ``to_empty`` / ``.to(...)`` reallocate the Parameters and drop the
@@ -83,6 +96,13 @@ class FusedColumnLinear(nn.Module, LoraCapable):
         loaded_weight: torch.Tensor,
         loaded_shard_id: str | int | None = None,
     ) -> None:
+        if loaded_shard_id is None:
+            # a checkpoint that stores the projection already fused
+            assert param.data.shape == loaded_weight.shape, (
+                f"fused shape mismatch: param {tuple(param.data.shape)} vs weight {tuple(loaded_weight.shape)}"
+            )
+            param.data.copy_(loaded_weight)
+            return
         assert loaded_shard_id in self._shard_sizes, (
             f"FusedColumnLinear got unknown shard id {loaded_shard_id!r}; "
             f"expected one of {list(self._shard_sizes)}"
@@ -105,6 +125,10 @@ class FusedColumnLinear(nn.Module, LoraCapable):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return F.linear(x, self.weight, self.bias)
+
+    def quant_capability(self) -> QuantCapability:
+        # one weight, quantized whole; the shards stay slices of the output
+        return QuantCapability(True)
 
     def lora_target(self) -> LoraTarget:
         # a slice per shard, named by the shard ids the stacked rules route by

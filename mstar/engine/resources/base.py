@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from enum import IntEnum
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 import torch
 
 from mstar.distributed.communication import JointGroups
+from mstar.engine.resources.resident_hooks import ResidentHooks
 from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig
 from mstar.engine.resources.step import ADMIT_OK, AdmitOutcome, BucketKey, ResourceStep, StepContext
 
@@ -110,6 +112,21 @@ class CachedPrefix(NamedTuple):
     position: int
 
 
+class Residency(IntEnum):
+    """Where a request's state on a node is: on the device, copied to the host, or dropped for a rebuild
+    from its ids. Ordered by how far the state is from the device."""
+    RESIDENT = 0
+    ON_HOST = 1
+    DROPPED = 2
+
+
+class Rebuild(NamedTuple):
+    """What a rebuild row writes for a dropped request: ``ids`` without the last one, under ``walk``.
+    The last id is the one the next decode step reads."""
+    walk: str
+    ids: Sequence[int]
+
+
 class KeyedWalks(NamedTuple):
     """A keyed label's walks, as a resource's prefix cache takes them: the walks whose
     writes are keyed, and the growth walks whose sampled ids extend the keys."""
@@ -117,7 +134,7 @@ class KeyedWalks(NamedTuple):
     growth: tuple[str, ...] = ()
 
 
-class Resource(ABC):
+class Resource(ResidentHooks, ABC):
     @classmethod
     @abstractmethod
     def build(
@@ -440,12 +457,34 @@ class Resource(ABC):
     def supports_eviction(self):
         return False
 
-    def is_offloaded(self, rid: str) -> bool:
-        return False
+    # Whether `drop` discards every piece of a request's state here that a rebuild from its token ids
+    # writes again, so the rebuild never runs over stale state. A node with a rebuild policy needs it of
+    # every resource it holds (`Engine.load_model`).
+    supports_drop = False
+
+    def residency(self, rid: str) -> Residency:
+        return Residency.RESIDENT
 
     def offload(self, rid: str) -> int:
         """Move the request's state off-device. Returns what was reclaimed."""
         return 0
+
+    def check_drop(self, rid: str, tokens: int) -> None:
+        """Raise if ``drop`` would refuse ``rid``, whose rebuild writes ``tokens`` tokens. Changes nothing."""
+        return
+
+    def drop(self, rid: str, tokens: int) -> int:
+        """Discard the request's state that can be recomputed from the ``tokens``
+        token ids its rebuild writes, and keep the rest. Returns what was reclaimed."""
+        return 0
+
+    def prepare_rebuild(self, rid: str, rebuild: Rebuild) -> None:
+        """Take in what the dropped request's rebuild writes, before its first chunk runs."""
+        return
+
+    def land_rebuild(self, rid: str) -> None:
+        """The dropped request's rebuild has run its last chunk."""
+        return
 
     def reload(self, rid: str) -> bool:
         """Bring it back. False when it doesn't fit on device yet."""

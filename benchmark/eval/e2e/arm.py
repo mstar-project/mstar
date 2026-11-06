@@ -36,7 +36,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from benchmark.eval.e2e import checks, stress
-from benchmark.eval.server import ManagedServer, ServerError, is_healthy
+from benchmark.eval.server import ManagedServer, ServerError, exit_on_signals, is_healthy, signals_deferred
 
 CASE_TIMEOUT_S = 3600
 QUALITY_TIMEOUT_S = 1800
@@ -225,15 +225,15 @@ def health_after(before: dict, server: ManagedServer, log_path: Path) -> list[st
     return found
 
 
-def dump_stacks(pgid: int, path: Path) -> None:
-    """Every Python thread's stack in the server's process group (``py-spy dump``), for a case that hung; without
+def dump_stacks(sid: int, path: Path) -> None:
+    """Every Python thread's stack in the server's session (``py-spy dump``), for a case that hung; without
     py-spy, the process list and why there are no stacks. Threads only: a hang at an ``await`` shows an idle event
     loop. Retries with ``sudo -n`` only when the job asks (``compare --stacks-sudo``): on a shared cluster a refused
     ``sudo`` is logged, and often mailed to the admins."""
-    r = subprocess.run(["ps", "-o", "pid=,args=", "-g", str(pgid)], capture_output=True, text=True, check=False)
+    r = subprocess.run(["ps", "-o", "pid=,args=", "-g", str(sid)], capture_output=True, text=True, check=False)
     procs = [ln.strip().split(None, 1) for ln in r.stdout.splitlines() if ln.strip()]
     spy = shutil.which("py-spy", path=base_env()["PATH"])
-    lines = [f"# process group {pgid}: {len(procs)} processes; py-spy: {spy or 'not installed (pip install py-spy)'}"]
+    lines = [f"# session {sid}: {len(procs)} processes; py-spy: {spy or 'not installed (pip install py-spy)'}"]
     if spy and not job.get("stacks_sudo"):
         lines[0] += " (no sudo retry; compare --stacks-sudo adds one where ptrace is restricted)"
     for pid, *args in procs:
@@ -471,8 +471,7 @@ def run_arm(arm_name: str, session: int) -> dict:
         going = run_cases(server, [c for c in mine if not c.get("server_timeout_s")], arm_name, session, cases)
         for to in sorted({c["server_timeout_s"] for c in mine if c.get("server_timeout_s")}) if going else []:
             group = [c for c in mine if c.get("server_timeout_s") == to]
-            with signals_deferred():
-                current.stop()
+            current.stop()
             wait_gpu_idle()
             scratch.append(tempfile.mkdtemp(prefix="mstar-eval-to-"))
             current = timeout_server(arm, d, to, scratch[-1])
@@ -507,26 +506,6 @@ def run_arm(arm_name: str, session: int) -> dict:
             info["cases"] = cases
             _publish("startup.json", info, d)
     return info
-
-
-SIGNALS = (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)
-
-
-def _on_term(signum, frame) -> None:  # noqa: ARG001
-    raise SystemExit(128 + signum)   # unwinds to run_arm's finally, which stops the server
-
-
-@contextmanager
-def signals_deferred():
-    pending: list[int] = []
-    old = {s: signal.signal(s, lambda n, f: pending.append(n)) for s in SIGNALS}
-    try:
-        yield
-    finally:
-        for s, h in old.items():
-            signal.signal(s, h)
-        if pending:
-            raise SystemExit(128 + pending[0])
 
 
 def watch_lease(lease_s: float) -> None:
@@ -615,20 +594,19 @@ def main(argv: list[str] | None = None) -> None:
     out.mkdir(parents=True, exist_ok=True)
     (out / "done.json").unlink(missing_ok=True)
     (out / "pid").write_text(str(os.getpid()))
-    for sig in SIGNALS:
-        signal.signal(sig, _on_term)
-    if job.get("lease_s"):
-        threading.Thread(target=watch_lease, args=(float(job["lease_s"]),), daemon=True).start()
-    t0 = time.time()
-    try:
-        run()
-    except SystemExit as e:
-        done("interrupted", reason=stop_reason or f"signal {int(e.code or 0) - 128}")
-        raise
-    except Exception as e:  # noqa: BLE001 - always leave a done.json behind
-        done("error", reason=f"{type(e).__name__}: {str(e)[:400]}")
-        raise
-    log(f"{model_name()} finished in {time.time() - t0:.0f} s")
+    with exit_on_signals():   # unwinds to run_arm's finally, which stops the server
+        if job.get("lease_s"):
+            threading.Thread(target=watch_lease, args=(float(job["lease_s"]),), daemon=True).start()
+        t0 = time.time()
+        try:
+            run()
+        except (SystemExit, KeyboardInterrupt) as e:
+            done("interrupted", reason=stop_reason or f"signal {getattr(e, 'signum', '?')}")
+            raise
+        except Exception as e:  # noqa: BLE001 - always leave a done.json behind
+            done("error", reason=f"{type(e).__name__}: {str(e)[:400]}")
+            raise
+        log(f"{model_name()} finished in {time.time() - t0:.0f} s")
 
 
 def model_name() -> str:

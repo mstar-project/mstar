@@ -82,6 +82,7 @@ command_a_plus = [
 dev = [
     "ruff<=0.16",
     "pytest>=9.0.3",
+    "pytest-timeout",  # a per-test limit, so a stuck test is named rather than holding the suite
     "pydub",  # the OmniVoice silence trim's test oracle
     "audioop-lts; python_version >= '3.13'",  # pydub imports audioop, gone in 3.13
 ]
@@ -168,9 +169,9 @@ bagel_xpu = [
 ]
 
 cosmos3 = [
-    # PyAV backs torchvision's write_video, the video-container fallback used
-    # when torchcodec is too old to ship VideoEncoder (< 0.9).
-    "av",
+    # PyAV encodes the mp4 when torchcodec can't load (video_encode.encode_mp4,
+    # whose frame conversion threads need 19).
+    "av>=19",
     # The Cosmos3 reference pipeline (used by the parity tests) landed in
     # diffusers 0.39; serving itself uses AutoencoderKLWan and the scheduler.
     "diffusers>=0.39",
@@ -329,8 +330,9 @@ wan22 = [
     "huggingface-hub",
     "transformers",
     # mp4 encode for the video output. PyAV bundles its own FFmpeg libs;
-    # torchcodec is unusable here without a system FFmpeg install.
-    "av",
+    # torchcodec is unusable here without a system FFmpeg install. 19 for the
+    # frame conversion threads in video_encode.encode_mp4.
+    "av>=19",
     # The DiT's default self-attention runs on the engine's FlashInfer ragged resource.
     "flashinfer-python==0.7.2",
 ]
@@ -410,7 +412,7 @@ asr = [
 
 # GLM-5.x
 glm = [
-    "flashinfer-python>=0.6.14",
+    "flashinfer-python==0.7.2",
     "huggingface-hub",
     "mooncake-transfer-engine>=0.3.13.post1",
     "ninja",  # speeds up the first-use JIT build of the vendored MoE align kernel
@@ -425,7 +427,7 @@ all = [
     "soundfile",
     "silero-vad>=5.1",
     "onnxruntime>=1.17",
-    "av",
+    "av>=19",
     "diffusers>=0.39",
     "fa3-fwd",
     "einops",
@@ -478,12 +480,13 @@ where = ["."]
 include = ["mstar*"]
 exclude = ["tests*", "benchmark*", "examples*"]
 
-# Ship the vendored CUDA source so it can be JIT-compiled on first use, and the
-# default deployment configs (copied from repo-root configs/ into
-# mstar/default_configs/ at build time; see setup.py) so `mstar serve <model>`
-# works from a pip install.
+# Ship the vendored CUDA source so it can be JIT-compiled on first use, the tuned
+# kernel-config tables, and the default deployment configs (copied from repo-root
+# configs/ into mstar/default_configs/ at build time; see setup.py) so
+# `mstar serve <model>` works from a pip install.
 [tool.setuptools.package-data]
-"mstar.utils.fused_moe" = ["csrc/*.cu", "csrc/*.cuh", "csrc/*.h", "csrc/*.cpp", "configs/*.json"]
+"mstar.utils.fused_moe" = ["csrc/*.cu", "csrc/*.cuh", "csrc/*.h", "csrc/*.cpp"]
+"mstar.kernels" = ["tables/*/*.json"]
 "mstar.default_configs" = ["*.yaml"]
 
 [tool.ruff]

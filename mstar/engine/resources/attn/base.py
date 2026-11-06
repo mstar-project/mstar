@@ -76,14 +76,26 @@ class AttentionManager(AttentionResource):
             )
         return "fa2" if sm100 and kernel == "auto" else kernel
 
+    @staticmethod
+    def _refuse_unread(spec: AttentionSpec, backend: AttnBackend) -> None:
+        """A backend that ignores ``sliding_window`` or ``sm_scale`` would attend
+        with the wrong mask or scale; refuse the spec instead."""
+        reads_scale = (AttnBackend.FLASHINFER, AttnBackend.FLASHINFER_MLA)
+        for name, set_, readers in (
+            ("sliding_window", spec.config.sliding_window is not None, (AttnBackend.FLASHINFER,)),
+            ("sm_scale", spec.config.sm_scale is not None, reads_scale),
+        ):
+            if set_ and backend not in readers:
+                raise ValueError(
+                    f"attention backend {backend!r} ignores {name}; only "
+                    f"{', '.join(repr(b.value) for b in readers)} read it "
+                    f"(KV resource {spec.config.kv_cache!r})"
+                )
+
     @classmethod
     def build(cls, spec: AttentionSpec, info: EngineResourceInfo):
         backend = resolve_attn_backend(spec.config.backend, info.device)
-        if spec.config.sliding_window is not None and backend != AttnBackend.FLASHINFER:
-            raise ValueError(
-                f"sliding_window is unsupported for attention backend {backend!r}; "
-                "use the flashinfer backend"
-            )
+        cls._refuse_unread(spec, backend)
         # the KV resource's own config, not a copy; per-rank head counts, and
         # `shard` is idempotent so both builders can call it
         kv_config = info.dependency(spec.config.kv_cache).config
@@ -122,11 +134,6 @@ class AttentionManager(AttentionResource):
                 f"attention backend {backend.value!r} requires a "
                 f"{required.__name__}, but KV resource {spec.config.kv_cache!r} "
                 f"holds a {type(kv_config).__name__}. "
-            )
-        if spec.config.sm_scale is not None and backend != AttnBackend.FLASHINFER_MLA:
-            raise ValueError(
-                f"attention backend {backend.value!r} ignores sm_scale; only "
-                f"{AttnBackend.FLASHINFER_MLA.value!r} reads it"
             )
         # `shard` lives on the KVConfig base, so this is unchanged for both.
         kv_config.shard(info.head_shards)
@@ -189,6 +196,7 @@ class AttentionManager(AttentionResource):
                 sliding_window=spec.config.sliding_window,
                 decode_fmha=spec.config.decode_fmha,
                 layers=spec.config.layers,
+                sm_scale=spec.config.sm_scale,
             )
 
         if backend == AttnBackend.FLEX:
@@ -241,12 +249,27 @@ class AttentionManager(AttentionResource):
         """
         return True
 
+    def qo_indptr_buf(self, label: str = "main") -> torch.Tensor | None:
+        """The current plan's query offsets per request, for backends that plan them."""
+        raise NotImplementedError(f"{type(self).__name__} plans no query offsets (qo_indptr_buf)")
+
+    # Eager as a whole: a break inside it leaves a compiled frame that holds the
+    # bucket's static token count beside its row count, which captured forwards
+    # recompile per prefill bucket until Dynamo's recompile limit.
+    @torch.compiler.disable
+    def select_last_hidden(self, hidden: torch.Tensor, label: str = "main") -> torch.Tensor:
+        """Each request's last row of ``hidden``, used for sampling from prefill,
+        for a backend whose ``qo_indptr_buf`` holds the plan's query offsets."""
+        last = (self.qo_indptr_buf(label)[1:] - 1).long()
+        return hidden.index_select(0, last)
+
 
 class PlanCacheKey(NamedTuple):
     """Fingerprint of a wrapper ``plan`` call's inputs. When it is unchanged
     between steps the re-plan is skippable."""
     q_seq_lens: tuple
-    # the int32 arrays' bytes
+    # the int32 arrays' bytes; the indptr says which pages are whose
+    page_indptr: bytes
     page_indices: bytes
     last_page_lens: bytes
 

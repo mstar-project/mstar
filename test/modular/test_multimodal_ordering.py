@@ -530,7 +530,7 @@ def test_interleaved_layout_prefills_end_to_end(bagel):
     schedule = bagel._build_prefill_schedule(
         input_modalities=in_mods,
         input_signals={"text_inputs": tensors, "image_inputs": ["i0", "i1"]},
-        is_understanding=True,
+        is_understanding=True, role_turns=True,
     )
     assert [walk for walk, _ in schedule] == [
         "prefill_text", "prefill_vit", "prefill_text", "prefill_vit", "prefill_text",
@@ -559,7 +559,7 @@ def test_bagel_skips_a_part_it_cannot_prefill(caplog):
             model,
             input_modalities=["image", "image", "text"],
             input_signals={"text_inputs": ["t0", "t1"], "image_inputs": ["i0"]},
-            is_understanding=True,
+            is_understanding=True, role_turns=True,
         )
     # The image it has still prefills; only the one with no input drops.
     assert [walk for walk, _ in schedule] == [
@@ -575,9 +575,7 @@ def test_bagel_spans_come_from_one_tokenization(bagel):
         PromptPart(modality="image", index=0),
         PromptPart(modality="text", text="B"),
     ]
-    rendered = bagel._render_prompt(
-        parts, is_understanding=True, system_prompt=bagel.BAGEL_DEFAULT_SYSTEM_PROMPT
-    )
+    rendered = bagel._render_role_turns(parts, think_mode=False)
     assert bagel.IMAGE_PLACEHOLDER in rendered
     spans = bagel.process_prompt(
         "A\nB", [p.modality for p in parts], ["text"], prompt_parts=parts
@@ -595,7 +593,6 @@ def test_bagel_spans_come_from_one_tokenization(bagel):
 
 def test_qwen_schedule_walks_the_plan():
     """Qwen3-Omni prefills each attachment where it was written."""
-    pytest.importorskip("flashinfer")  # imported by Qwen3OmniModel's submodules
     from mstar.model.qwen3_omni.qwen3_omni_model import Qwen3OmniModel
 
     model = Qwen3OmniModel.__new__(Qwen3OmniModel)
@@ -620,7 +617,6 @@ def test_qwen_schedule_walks_the_plan():
 
 def test_qwen_placeholder_ids_come_from_the_tokenizer():
     """Not from thinker_config, which disagrees with it on the checkpoint."""
-    pytest.importorskip("flashinfer")  # imported by Qwen3OmniModel's submodules
     from mstar.model.qwen3_omni.qwen3_omni_model import Qwen3OmniModel
 
     vocab = {
@@ -640,7 +636,6 @@ def test_qwen_placeholder_ids_come_from_the_tokenizer():
 
 def test_a_modality_the_tokenizer_cannot_place_is_left_out():
     """A missing placeholder drops that modality rather than scanning for 0."""
-    pytest.importorskip("flashinfer")  # imported by Qwen3OmniModel's submodules
     from mstar.model.qwen3_omni.qwen3_omni_model import Qwen3OmniModel
 
     vocab = {"<|image_pad|>": 5, "<|vision_start|>": 6, "<|vision_end|>": 7}
@@ -703,7 +698,7 @@ def test_bagel_lays_each_image_out_in_schedule_order_by_its_own_file_over_its_vi
     output, images = _laid_out(bagel, modalities, image_preprocess=image_preprocess)
     layout = output.metadata["kv_layout"]["kv"]["main"].spans
     schedule = bagel._build_prefill_schedule(
-        input_modalities=modalities, is_understanding=True,
+        input_modalities=modalities, is_understanding=True, role_turns=output.metadata["role_turns"],
         input_signals={"text_inputs": output.new_input_tensors["text_inputs"], "image_inputs": images},
     )
 
@@ -742,4 +737,67 @@ def test_bagel_keys_an_understood_image_and_otherwise_only_a_leading_text_span(b
     }, "a prompt whose images are resized before their walks see them is keyed past its first text span"
     assert isinstance(_laid_out(bagel, interleaved, tensors=False)[0], dict), (
         "a prompt was laid out without the images that size it"
+    )
+
+
+@pytest.mark.parametrize("ids,kept", [
+    # system turn cut, user kept, earlier assistant turn cut, the last turn kept whatever its role
+    ([9, 1, 2, 5, 5, 1, 3, 6, 1, 4, 7, 7, 1, 3, 8, 1, 4], [1, 0, 0, 0, 0, 1, 1, 1, 0, 0, 0, 0, 1, 1, 1, 1, 1]),
+    ([1, 2, 5], [1, 1, 1]),
+    ([5, 6], [1, 1]),
+])
+def test_the_talker_skips_system_and_earlier_assistant_turns(ids, kept):
+    from mstar.model.qwen3_omni.submodules import talker_text_mask
+
+    config = SimpleNamespace(im_start_token_id=1, system_token_id=2, assistant_token_id=4)
+    assert talker_text_mask(torch.tensor(ids), config).tolist() == [bool(k) for k in kept]
+
+
+_BEFORE_THE_IMAGES = {
+    "nothing": [],
+    "a system message": [{"role": "system", "content": "Be brief."}],
+    "earlier turns": [{"role": "user", "content": "Hi"}, {"role": "assistant", "content": "Hello"}],
+}
+
+
+@pytest.mark.parametrize("before", _BEFORE_THE_IMAGES.values(), ids=_BEFORE_THE_IMAGES.keys())
+@pytest.mark.parametrize("n_images", [1, 2])
+@pytest.mark.parametrize("think", [False, True], ids=["plain", "think"])
+def test_a_chat_ending_on_images_prefills_what_upstream_interleave_inference_does(
+    bagel, tmp_path, think, n_images, before,
+):
+    """A last turn of images alone has no role markers around it.
+
+    Upstream's ``interleave_inference(understanding_output=True)`` prefills the
+    think instruction, then each text (``prepare_prompts``: im_start, text,
+    im_end) and image (``prepare_vit_images``) in order, and ``gen_text`` feeds
+    ``<|im_start|>`` (``prepare_start_tokens``) before it samples. Under a system
+    turn and role markers every reply was the same greeting. The think span's
+    text is mstar's constant, which is shorter than upstream's.
+    """
+    from mstar.model.bagel.bagel_model import VLM_THINK_SYSTEM_PROMPT
+
+    tokenizer = bagel.tokenizer
+    start, end = tokenizer.SPECIALS["<|im_start|>"], tokenizer.SPECIALS["<|im_end|>"]
+    reference = [start, *tokenizer.encode(VLM_THINK_SYSTEM_PROMPT), end] if think else []
+    for message in before:
+        reference += [start, *tokenizer.encode(message["content"]), end]
+    reference += [("image", index) for index in range(n_images)] + [start]
+
+    bagel.config.think_mode = think
+    image = {"type": "image_url", "image_url": {"url": "data:image/png;base64,aGk="}}
+    text, _, in_mods, parts = flatten_messages([*before, {"role": "user", "content": [image] * n_images}], tmp_path)
+    images = [torch.rand(3, *SIZES[index]) for index in range(n_images)]
+    output = bagel.process_prompt(text, in_mods, ["text"], tensors={"image_inputs": images}, prompt_parts=parts)
+    schedule = bagel._build_prefill_schedule(
+        input_modalities=in_mods, is_understanding=True, role_turns=output.metadata["role_turns"], think_mode=think,
+        input_signals={"text_inputs": output.new_input_tensors["text_inputs"], "image_inputs": list(range(n_images))},
+    )
+
+    prefilled = []
+    for walk, tensor in schedule:
+        prefilled += tensor.tolist() if walk == "prefill_text" else [("image", tensor)]
+    assert prefilled == reference, "a chat ending on images prefills another prompt than upstream BAGEL's"
+    assert [span.walk for span in output.metadata["kv_layout"]["kv"]["main"].spans] == [walk for walk, _ in schedule], (
+        "the layout names its writes in another order than the walks make them"
     )

@@ -236,11 +236,15 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
    * - ``model``
      - Registry key of the model (see :doc:`models`).
    * - ``max_seq_len``
-     - Maximum sequence length (sizes the KV cache).
+     - Required, but nothing reads it: it neither sizes the KV cache nor caps context.
+       A KV cache's length limit is its own ``max_seq_len``, set by the model or under
+       ``resources: <kv>:`` (see the resource overrides below).
    * - ``node_groups``
      - List of placements. Each entry assigns ``node_names`` to ``ranks``, optionally
        scoped to specific ``graph_walks`` and/or sharded with ``tp_size``. An
-       ``ep_config`` block picks TP or EP for the group's MoE experts.
+       ``ep_config`` block picks TP or EP for the group's MoE experts. ``side_stream:
+       true`` runs the group's node beside the worker's main chain of steps (see
+       below).
    * - ``resources``
      - *(optional)* Per-resource overrides, keyed by the model's resource names (see
        below).
@@ -335,6 +339,13 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
      - *(optional, default 128)* The fewest tokens a prompt cut by chunked prefill runs
        in a step, or the whole budget if that is smaller; with less left, it waits a step. A positive int, for every
        chunked walk. See *Chunked prefill budgets* below.
+   * - ``rebuild_host_mb``
+     - *(optional, default 64)* MiB of pinned host memory a worker serving a node whose model
+       declares a rebuild policy sets aside at startup for its requests' prompt ids, 8 B a token (int64),
+       which a request dropped from the KV cache is rebuilt from. A request the pool can't hold
+       keeps no ids, so it is never dropped on that node, though it can still move to the host
+       with ``cpu_offload_pages``. A tensor or sequence parallel node never drops a request, so it
+       keeps no ids and sets no memory aside. A non-negative int, and 0 keeps no ids.
    * - ``warmup_requests``
      - *(optional)* Requests the server runs after the workers are ready and before it
        binds, so no client pays a shape's first-request cost (torch.compile of a step,
@@ -347,10 +358,12 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        long prompts take (a long-context prefill). Each entry is sent as many
        times at once as the most data-parallel replicas any of the model's worker
        graphs is served by (the replicas the conductor picks from; a node group no
-       walk places adds none), so every replica warms. When some worker graph has
-       fewer replicas than that, such as one DiT instance beside a replicated VAE,
-       the entry first runs once alone, so that graph also warms its one-request
-       shape before the copies reach it together. A malformed or failing warmup
+       walk places adds none). The conductor's pick (least loaded, ties to the
+       replica picked longest ago) puts a group's copies on every one of its
+       replicas in whatever order they finish, so every replica warms. When some
+       worker graph has fewer replicas than that, such as one DiT instance beside a
+       replicated VAE, the entry first runs once alone, so that graph also warms its
+       one-request shape before the copies reach it together. A malformed or failing warmup
        is logged and skipped.
    * - ``dist_timeout_s``
      - *(optional)* Timeout in seconds for the NCCL world group and its parallel
@@ -389,9 +402,11 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
      - *(optional)* Engine knobs for this deployment, by name: ``device_loopback``,
        ``sampler_ingraph_scatter``, ``sampler_slots``, ``ingraph_decode_rope``,
        ``kv_chain_lazy_steps``, ``kv_plan_cache``, ``kv_pinned_indptrs``,
-       ``gc_gen0_threshold``, ``pre_plan``, ``step_thread_core`` and
-       ``compile_deterministic`` (``true``/``false`` or an integer; ``step_thread_core`` takes
-       ``off``, the default, ``auto`` or a CPU number). ``compile_deterministic`` reaches
+       ``gc_gen0_threshold``, ``pre_plan``, ``step_thread_core``, ``idle_hold``,
+       ``compile_deterministic`` and ``resident_planning`` (``true``/``false`` or an integer;
+       ``step_thread_core`` takes ``auto``, the default, ``off``, ``always``, ``siblings`` or a CPU number,
+       ``idle_hold`` ``off``, the default, or ``qos``, see :ref:`host-idle`, and ``resident_planning``
+       ``auto``, the default, or ``off``). ``compile_deterministic`` reaches
        Qwen3.5's text walks and no other model (see :doc:`models`). Each one's environment variable
        (``MSTAR_DEVICE_LOOPBACK`` and so on; see
        :doc:`environment_variables`) overrides it when set, and an unknown name
@@ -529,8 +544,9 @@ replica. The conductor picks it per request, at ingest, as the replica with the 
 cost: ``routing_weights.load`` times the live requests on the replica (counted per set of
 groups that pick together, for each request with a partition on them that is not done at
 ingest), plus the price of what the conductor predicts about the request there. Ties go
-at random. Every term is in request-equivalents. Groups whose replicas sit on the same
-ranks, replica for replica, take one pick together.
+to the replica picked longest ago, so requests that never overlap still take turns. Every
+term is in request-equivalents. Groups whose replicas sit on the same ranks, replica for
+replica, take one pick together.
 
 Today the one prediction is the KV prefix cache's, on the replicas that run any walk a
 KV label keys the cache on (``kv_labels``): ``routing_weights.prefix``
@@ -591,6 +607,25 @@ and quit the daemon at shutdown. The daemon uses a private pipe directory, so ot
 processes on the GPU are unaffected. ``nvidia-cuda-mps-control`` (part of the NVIDIA
 driver) must be on ``PATH``. The ``*_split.yaml`` configs for Whisper, Qwen3-ASR, the three
 Chatterbox models and OmniVoice set it, and so does ``qwen3tts_split.yaml`` (the 0.6B).
+
+**A light node beside a heavy one, on one worker.** ``side_stream: true`` on a node
+group runs that node's steps on a lane of their own instead of the worker's main chain:
+they take no turn on it, run on a second CUDA stream beside its steps, and whatever
+comes ready meanwhile batches into the next one. It applies to the walks the node's
+submodule declares in ``side_stream_walks`` (Qwen3-TTS's ``Codec`` declares
+``codec_chunk``, but no config sets the field while it holds its ``codec_state`` pool), and keeps both nodes on one
+worker and one CUDA context, unlike a split with MPS. Startup fails with a
+``ValueError`` naming the field where the lane can't apply: a TP or SP node, a node
+alone on its worker, a device without streams, a node that also runs walks on the
+chain or holds resources, or a side walk that isn't the node's alone, is part of a
+combined walk, or has output spans or a stop check. Without the field the node runs on
+the chain:
+
+.. code-block:: yaml
+
+   node_groups:
+     - {node_names: [Talker], ranks: [0], graph_walks: [talker_prefill, talker_decode]}
+     - {node_names: [Codec], ranks: [0], graph_walks: [codec_chunk], side_stream: true}
 
 **Disaggregation.** The same node can live on different GPUs *per graph walk* — e.g.
 prefill, decode, and image generation on three GPUs:
@@ -677,17 +712,28 @@ model_kwargs
 
 ``model_kwargs`` are model parameters fixed at server start (not per request) — they are
 baked into the model's config dataclass and into CUDA-graph captures. For example, the
-Pi0.5 DROID variant fixes the action horizon:
+Pi0.5 DROID deployment (``configs/pi05_droid.yaml``) loads the DROID fine-tune (whose
+``config.json`` sets the 15-step action horizon), fixes the camera count, and carries the
+DROID robot's normalization stats:
 
 .. code-block:: yaml
 
    model: "pi05"
    max_seq_len: 2048
    model_kwargs:
-     action_horizon: 15
+     model_path_hf: "lerobot/pi05_droid"
+     num_cameras: 2
+     norm_stats:  # openpi's DROID quantiles, 8 dims each
+       state: {q01: [...], q99: [...]}
+       actions: {q01: [...], q99: [...]}
    node_groups:
      - {node_names: [vit_encoder], ranks: [0]}
      - {node_names: [LLM], ranks: [0]}
+
+With ``norm_stats`` set, Pi0.5 takes the raw robot state in ``robot_state`` and returns
+actions in robot units, as openpi's policy server does. ``norm_stats`` can also be the path
+of an openpi ``norm_stats.json``. Without it, ``robot_state`` must already be normalized to
+[-1, 1].
 
 Per-request knobs (``temperature``, ``voice``, ``max_output_tokens``, …) are sent by the
 client instead — see :doc:`clients`. A ``seed`` fixes a request's random stream whatever
@@ -730,6 +776,76 @@ upgrade, ``-O`` level and changed graph adds to it; it is safe to delete, which 
 next start's compile. On a quota-limited or network-mounted home (NFS), or a volume that
 concurrent jobs on several hosts share, export ``TORCHINDUCTOR_CACHE_DIR`` to a node-local
 path and copy a warm cache in at job start.
+
+.. _host-idle:
+
+Host idle states
+----------------
+
+A decode step hands work between a worker's main, GPU and plan threads several
+times, and every step's tokens go from the API server's message thread to the
+frontend. On a host whose idle cores drop into deep C-states each handoff to a
+sleeping core waits for it to wake, and a core that sleeps between handoffs stays
+at a low clock under the ``powersave`` governor, so a small model's step is mostly
+host time spent waking CPUs. Two knobs deal with it:
+
+- ``step_thread_core`` pins those threads. ``always`` gives each worker three cores,
+  one hardware thread of each, and the API server a core of its own. ``siblings``
+  puts a worker's three threads on one core's hardware threads (two cores of an L2
+  cluster where there is no SMT), which keeps that core awake. ``auto`` pins nothing
+  and logs one line saying why for this host, since neither layout has beaten no pin
+  on every host it was measured on (table below). ``off`` never pins, a number names
+  the first worker's core. Under a job's mask too small for every GPU the container
+  can open (8 cores on a node of four GPUs), ``always`` and ``siblings`` size by the
+  GPUs the server was given, and a lock per core keeps servers that share ``/tmp``
+  on different cores.
+- ``idle_hold: qos`` asks the kernel to keep every CPU out of deep idle states
+  through ``/dev/cpu_dma_latency`` for the server's life. It needs a device most
+  containers hide, and it logs what it got.
+
+Qwen3.5-0.8B tok/s at c=1 / 8, ``benchmark.runner`` at ``-O2``, the server ``taskset``
+to 8 cores (with their siblings where the CPU has SMT), medians over server sessions:
+
+.. list-table::
+   :header-rows: 1
+
+   * - Host
+     - no pin
+     - ``always`` (three cores)
+     - ``siblings``
+     - every core held out of idle
+   * - 2x B300, Xeon 6767P (SMT, an L2 per core, C6 170 µs)
+     - 548 / 3939
+     - 526 / 3851
+     - 808 / 5670
+     - c=1: no pin 906, three cores 935, ``siblings`` 753
+   * - 2x B300, Xeon 6740E (no SMT, four cores to an L2 cluster, C6S 270 µs)
+     - 371 / 2688
+     - not measured
+     - 527 / 3635 (two cores of a cluster)
+     - 636 / 4251, no pin
+   * - H100 VM without deep idle states (a handoff 22 µs)
+     - 529 (c=1) / 6520 (c=16)
+     - not measured
+     - 419 / 5526 (an earlier ``auto``, the same layout)
+     - not measured
+   * - H200, 2-socket AMD EPYC (C2 800 µs), 16-CPU mask
+     - 634 / 3617
+     - not measured
+     - 506 / 3103 (an earlier ``auto``, the same layout)
+     - not measured
+
+The last column is a ``SCHED_IDLE`` spinner on each server CPU, a stand-in for
+``idle_hold: qos`` where the device is hidden: the hold itself has not been measured.
+With the cores held awake, ``siblings`` loses to no pin and three separate cores are
+level with it, so ``auto`` names the hold first when it is set.
+
+Pinning has other costs. ``siblings`` on the 6740E raised 0.8B's time to first token
+at high concurrency (c=64 67 → 86 ms) while raising its throughput, and FLUX.2 klein
+at c=1 lost about 12% there (c=8 level). A low-duty model with eager host work can
+leave it ``off``.
+
+Details are in :doc:`environment_variables` under ``MSTAR_STEP_THREAD_CORE``.
 
 .. _tensor-transport:
 
@@ -939,6 +1055,10 @@ or ``increase()``.
 - ``mstar_kv_pages_cached{model_name, component, resource}``: pages the prefix cache
   names. Some may also be in use by running requests; the cache frees the others when a
   request needs the room.
+- ``mstar_rebuild_host_bytes_used{model_name, component}``,
+  ``mstar_rebuild_host_bytes_total{model_name, component}``: bytes of the worker's
+  rebuild host pool (``rebuild_host_mb``) that hold kept prompt ids, and the pool's size.
+  A prompt the pool has no room for keeps no ids, so its request is never dropped.
 - ``mstar_step_seconds{model_name, component, graph_walk}``: histogram over engine
   steps that ran a forward. A step counts from when the worker hands it to its GPU
   thread, or from the end of the previous step if that was later, to the end of its

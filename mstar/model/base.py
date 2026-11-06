@@ -18,7 +18,7 @@ from mstar.conductor.request_info import (
 )
 from mstar.distributed.base import ShardingConfig, ShardingGroup
 from mstar.engine.resources import NodeResourceSpec, ResourceReqConfig
-from mstar.engine.resources.kv.config import RetentionPolicy
+from mstar.engine.resources.kv.config import RetentionPolicy, SpanKind
 from mstar.engine.resources.lora.config import LORA_ADAPTER_KWARG
 from mstar.engine.resources.sampler.utils import SamplingConfig
 from mstar.graph.base import (
@@ -33,6 +33,7 @@ from mstar.graph.base import (
 from mstar.graph.special_destinations import EMPTY_DESTINATION
 from mstar.model.media_limits import VideoBudget, read_image, video_decode_threads
 from mstar.model.multimodal import TEXT, PromptPart
+from mstar.model.rebuild import RebuildPolicy
 from mstar.model.submodule_base import (
     CHUNK_LOOP_END,
     ChunkingPolicy,
@@ -175,6 +176,7 @@ class Span(NamedTuple):
 
     Each span is one step's row, unless a span sets ``opens_step`` False: the step of
     the span before it then writes it too, in the same row, as text around an attachment is.
+    That span is of the same walk, since a step runs one.
 
     ``length`` is how many KV slots the write fills, and ``advance`` is how far
     it moves the position counter, which is the length for text. ``source`` is
@@ -185,7 +187,7 @@ class Span(NamedTuple):
     ``scratch`` is the most a non-committing step writes before the span
     commits into those slots, as a denoised window does.
     """
-    kind: str
+    kind: SpanKind
     walk: str
     length: int
     advance: int
@@ -213,16 +215,21 @@ class LabelLayout(NamedTuple):
     def keyed_count(self) -> int:
         if self.keyed_spans is not None:
             return self.keyed_spans
-        return next((i for i, span in enumerate(self.spans) if span.kind == "rows"), len(self.spans))
+        return next((i for i, span in enumerate(self.spans) if span.kind == SpanKind.ROWS), len(self.spans))
 
     def row(self) -> list:
         """The layout as ``[spans, growth, scratch, retention, keyed spans]``, a span as
-        ``[length, advance, walk, scratch, digest, end key, opens step]``: plain values, which keep a
-        request's kwargs on the wire's msgpack path. Digest and end key are None until the preprocess
-        worker keys the span."""
-        for span in self.spans:
-            if span.kind not in ("ids", "digest", "rows"):
+        ``[length, advance, walk, scratch, digest, end key, opens step, kind]``: plain values, which
+        keep a request's kwargs on the wire's msgpack path. Digest and end key are None until the
+        preprocess worker keys the span."""
+        for i, span in enumerate(self.spans):
+            if span.kind not in tuple(SpanKind):
                 raise ValueError(f"a span of kind {span.kind!r}")
+            if not span.opens_step and (i == 0 or self.spans[i - 1].walk != span.walk):
+                raise ValueError(f"span {i} of walk {span.walk!r} opens no step, but " + (
+                    f"span {i - 1} before it is of walk {self.spans[i - 1].walk!r}: a step runs one walk"
+                    if i else "no span comes before it"
+                ))
             if not (isinstance(span.length, int) and isinstance(span.advance, int) and isinstance(span.scratch, int)):
                 raise ValueError(
                     f"a {span.kind} span's length, advance and scratch are {type(span.length).__name__}, "
@@ -230,7 +237,11 @@ class LabelLayout(NamedTuple):
                 )
         retention = self.retention
         return [
-            [[span.length, span.advance, span.walk, span.scratch, None, None, span.opens_step] for span in self.spans],
+            [
+                [span.length, span.advance, span.walk, span.scratch, None, None, span.opens_step,
+                 SpanKind(span.kind).value]
+                for span in self.spans
+            ],
             [[loop, slots] for loop, slots in self.growth],
             self.scratch,
             None if retention is None else [retention.context_budget, retention.protected_prefix],
@@ -250,7 +261,7 @@ def prompt_spans(
             spans.extend(item_spans(step))
             continue
         length = texts[step.index].numel()
-        spans.append(Span("ids", text_walk, length, length, "text_inputs"))
+        spans.append(Span(SpanKind.IDS, text_walk, length, length, "text_inputs"))
     return spans
 
 
@@ -799,6 +810,11 @@ class Model(ABC):
         """``{node: {combined_walk: {constituent walks}}}``: walks the scheduler may batch together."""
         return {}
 
+    def rebuild_policies(self) -> dict[str, RebuildPolicy]:
+        """``{node: policy}``: how a request dropped from each node's KV is rebuilt. A node without one never
+        drops a request."""
+        return {}
+
     def combined_walk_of(self) -> dict[tuple[str, str], str]:
         """``(node, real walk) -> combined walk``, validated."""
         walks = self.get_graph_walk_graphs()
@@ -961,8 +977,8 @@ class Model(ABC):
         multimodal tensors from file_paths (images, audio, video).
         The model may inspect the raw tensors dict and compute additional
         derived tensors (e.g., Qwen3-Omni computes ``pixel_values``,
-        ``image_grid_thw``, ``audio_features`` from the
-        raw ``image_inputs`` / ``audio_inputs`` / ``video_inputs``).
+        ``image_grid_thw`` and ``audio_features`` from the raw
+        ``image_inputs`` / ``audio_inputs`` / ``video_inputs``).
 
         Args:
             prompt: Raw text input from the user, or None if no text.

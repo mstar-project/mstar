@@ -103,8 +103,15 @@ def _jit_source() -> tuple[str, str]:
     return name, path
 
 
-@functools.lru_cache(maxsize=1)
+@torch.compiler.assume_constant_result
 def _cuda_op_available() -> bool:
+    """Whether the vendored CUDA op loaded. A constant to dynamo: traced, the build's file read
+    would break the graph of every compiled call between the tile lookup and the launch."""
+    return _build_cuda_op()
+
+
+@functools.lru_cache(maxsize=1)
+def _build_cuda_op() -> bool:
     """JIT-compile and load the vendored CUDA op; return whether it worked.
 
     Cached so compilation is attempted once per process.  A failure (missing
@@ -139,7 +146,9 @@ def _cuda_op_available() -> bool:
             last_error = e
     logger.warning(
         "fused MoE: could not build the CUDA moe_align_block_size op (%s); "
-        "using the slower torch fallback (NOT CUDA-graph capturable).",
+        "using the slower torch fallback (NOT CUDA-graph capturable). Compiled "
+        "fused_experts calls without a precomputed alignment also take the default "
+        "tiles rather than the moe_gemm table's.",
         last_error,
     )
     return False

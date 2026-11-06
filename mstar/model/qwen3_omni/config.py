@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Tuple
 
+from mstar.model import keys
 from mstar.model.components.aut_encoder import AuTEncoderConfig
 
 # ---------------------------------------------------------------------------
@@ -28,7 +29,8 @@ THINKER_ATTN = "thinker_attn"
 TALKER_ATTN = "talker_attn"
 # the encoders' cacheless attention (ragged: within each window / frame)
 AUDIO_ATTN = "audio_attn"
-VISION_ATTN = "vision_attn"
+# the shared ViT node (`PackedBlockLoopEncoder`) reads `keys`' one
+VISION_ATTN = keys.VISION_ATTN
 
 THINKER_POS = "thinker_pos"
 TALKER_POS = "talker_pos"
@@ -36,6 +38,8 @@ TALKER_POS = "talker_pos"
 THINKER_SAMPLER = "thinker_sampler"
 # combined walk of the Thinker's text/audio prefill and decode
 THINKER_MIXED = "thinker_mixed"
+# the decode walk of a request with no audio output: no states for the Talker
+THINKER_TEXT_DECODE = "thinker_text_decode"
 TALKER_SAMPLER = "talker_sampler"
 CODE_PRED_SAMPLER = "code_sampler"
 
