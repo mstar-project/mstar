@@ -115,15 +115,28 @@ class FlashInferManager(AttentionManager):
                 "attention over context-parallel KV pool %r decodes on FlashInfer's paged kernel although "
                 "decode_fmha is on: the merge needs each partial's lse", self._kv_cache_name,
             )
-        if self._wrapper_kv_kwargs["backend"] == "auto":
-            if current_platform.has_cuda_capability(10, 0, device=self._device):
-                # from SM100 auto can send short rows to cuDNN, whose lse the merge isn't known to
-                # read right (`_check_window_pool` resolves it the same way)
-                self._wrapper_kv_kwargs["backend"] = "fa2"
-                logger.info(
-                    "attention over context-parallel KV pool %r plans on fa2 for flashinfer_backend 'auto'",
-                    self._kv_cache_name,
+        sm100 = current_platform.has_cuda_capability(10, 0, device=self._device)
+        if sm100 and self._wrapper_kv_kwargs["backend"] == "auto":
+            # from SM100 auto can send short rows to cuDNN, whose lse the merge isn't known to
+            # read right (`_check_window_pool` resolves it the same way)
+            self._wrapper_kv_kwargs["backend"] = "fa2"
+            logger.info(
+                "attention over context-parallel KV pool %r plans on fa2 for flashinfer_backend 'auto'",
+                self._kv_cache_name,
+            )
+        if placement.over_sp and self._wrapper_kv_kwargs["backend"] == "fa2":
+            # one such server hung at its first 32k prefill and the cause isn't known. Read from the
+            # config and the GPU, so every rank of the node decides alike
+            if not sm100:
+                raise ValueError(
+                    f"attention over KV pool {self._kv_cache_name!r}: flashinfer_backend 'fa2' is refused "
+                    "over an SP-placed pool below SM100 after an unexplained one-off lockstep hang; use "
+                    "'auto', or 'fa3' on SM90"
                 )
+            logger.warning(
+                "attention over SP-placed KV pool %r runs FlashInfer's fa2 kernel, the only one it has "
+                "from SM100; an unexplained one-off lockstep hang on fa2 is still open", self._kv_cache_name,
+            )
         cfg = self._kv_config
         self._wrapper_kv_kwargs.update(
             ContextParallelWrapper.local_geometry(placement, cfg.tokens_per_page, cfg.num_qo_heads),

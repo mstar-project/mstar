@@ -5,6 +5,7 @@ attention over it, each rank's partial over its slots exchanged and merged."""
 from __future__ import annotations
 
 import itertools
+import logging
 import math
 import os
 import sys
@@ -805,6 +806,31 @@ def test_a_placed_pool_plans_on_fa2_for_auto_from_sm100(monkeypatch):
     joint = JointGroups(tp_group=_group(0, P), sp_group=CommGroup.trivial())
     attn, _ = _cp_attention(joint, CPU, torch.float32)
     assert attn._wrapper_kv_kwargs["backend"] == attn._new_kwargs["backend"] == "fa2"
+
+
+@pytest.mark.parametrize(("over_sp", "sm100", "backend", "outcome"), [
+    (True, False, "fa2", "refused"),
+    (True, True, "fa2", "warned"),
+    (True, True, "auto", "warned"),  # auto runs fa2 from SM100
+    (False, False, "fa2", "quiet"),
+    (False, True, "fa2", "quiet"),
+])
+def test_fa2_over_an_sp_placed_pool(monkeypatch, caplog, over_sp, sm100, backend, outcome):
+    """One SP-placed server on fa2 hung, cause unknown: refused where another kernel runs, a warning
+    from SM100 where none does, and a TP-placed pool doesn't care."""
+    monkeypatch.setenv("MSTAR_WORKSPACE_BUFFER_MB", "1")
+    capability = types.SimpleNamespace(has_cuda_capability=lambda major, minor=0, device=None: sm100)
+    monkeypatch.setattr(fi_mod, "current_platform", capability)
+    groups = (CommGroup.trivial(), _group(0, P))
+    joint = JointGroups(*groups) if over_sp else JointGroups(*reversed(groups))
+    if outcome == "refused":
+        with pytest.raises(ValueError, match="'fa2' is refused over an SP-placed pool"):
+            _cp_attention(joint, CPU, torch.float32, flashinfer_backend=backend)
+        return
+    with caplog.at_level(logging.WARNING, logger=fi_mod.logger.name):
+        attn, _ = _cp_attention(joint, CPU, torch.float32, flashinfer_backend=backend)
+    assert attn._wrapper_kv_kwargs["backend"] == "fa2"
+    assert any("fa2" in r.getMessage() for r in caplog.records) == (outcome == "warned")
 
 
 def test_tp_placed_decode_runs_on_tensor_cores_whatever_decode_tensor_cores_says(monkeypatch):
