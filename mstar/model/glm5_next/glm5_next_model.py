@@ -47,6 +47,7 @@ from mstar.model.glm5_next.config import (
     KV_CACHE,
     MTP_DRAFT,
     MTP_HIDDEN,
+    MTP_LEN,
     SAMPLER,
     Glm5NextModelConfig,
 )
@@ -182,6 +183,11 @@ class Glm5NextModel(Model):
                 shape=(self.config.hidden_size,), dtype=self.kda_conv_dtype, per_layer=False,
             )
             kda_blocks[MTP_DRAFT] = RecurrentBlockConfig(
+                shape=(1,), dtype=torch.long, per_layer=False,
+            )
+        if self.config.mtp_trims:
+            # each request's tokens in cache, which every verify step advances on device
+            kda_blocks[MTP_LEN] = RecurrentBlockConfig(
                 shape=(1,), dtype=torch.long, per_layer=False,
             )
         specs = [
@@ -455,9 +461,10 @@ class Glm5NextModel(Model):
         block = self.config.mtp_num_draft_tokens + 1
         budget = kwargs.get("max_output_tokens")
         if block > 1 and budget is not None:
-            # MTP decode stops two blocks short of the window (_mtp_check_stop), so a max_tokens
-            # past that is refused here rather than cut short
-            room = self.config.index_topk - 2 * block + 1 - n
+            # MTP decode stops two blocks short of the window, and of the cache rows, which
+            # every verify step books a whole block of (_mtp_check_stop), so a max_tokens past
+            # what that leaves with no draft accepted is refused here rather than cut short
+            room = min(self.config.context_limit - 2 * block + 1 - n, (self.config.kv_rows - n) // block)
             if budget > room:
                 raise ValueError(
                     f"max_tokens={budget} after a {n}-token prompt: GLM-5.3-Flash with MTP "

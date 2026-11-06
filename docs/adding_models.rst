@@ -727,6 +727,10 @@ The spec types are:
        ``kpool`` above 1 scores one pooled key per ``kpool`` tokens (GLM-5.3);
        ``dense_below_topk`` attends densely while no row sees more than ``topk`` keys
        (GLM-5.2); ``sm_scale`` is the absorbed MLA's softmax scale for the sparse plans.
+       An MTP verify block that the device places after its last accepted row rather than
+       where the host planned it declares ``DSAStep(mtp_trims=True)`` and moves its rows
+       with ``move_rows`` (GLM-5.3): a captured step's spare entries attend the cache's
+       ``spare_row``, masked in its rope slot.
    * - ``CrossAttentionSpec(config=CrossAttentionConfig(...))``
      - Attention over a paged context that is written once and never extended.
        ``backend`` defaults to ``AttnBackend.AUTO``. Only FlashInfer is implemented.

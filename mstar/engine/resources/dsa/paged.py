@@ -61,9 +61,15 @@ class DSAContext:
     needs_selection: bool = True
     decode_rows: bool = False
     sparse_plan: sparse_mla.SparseGraphPlan | sparse_mla.EagerSparsePlan | None = None
+    # a graph plan made for longer rows than the step's: each row's true length, and the
+    # masked slot its spare entries attend
+    valid: torch.Tensor | None = None
+    pad_slot: int | None = None
     last_selection: torch.Tensor | None = None
     # the resource's reused eager plans, which an eager step plans through
     eager: sparse_mla.EagerSparsePlans | None = None
+    # planned under a capture lease (its rows are the slot's buffers)
+    captured: bool = False
     # row_meta's, for the rows it was built from
     _row_meta: tuple | None = field(default=None, init=False, repr=False, compare=False)
 
@@ -121,6 +127,12 @@ def attn_lens(positions: list[int], topk: int, kpool: int) -> list[int]:
     """Keys each row attends: its selected pools' tokens plus its tail."""
     cap = topk // kpool
     return [kpool * min((p + 1) // kpool, cap) + (p + 1) % kpool for p in positions]
+
+
+def attn_lens_device(positions: torch.Tensor, topk: int, kpool: int) -> torch.Tensor:
+    """``attn_lens`` of device positions, without a sync."""
+    p = positions.long() + 1
+    return kpool * torch.clamp(p // kpool, max=topk // kpool) + p % kpool
 
 
 # -- the step's index keys --------------------------------------------------------------------
@@ -328,4 +340,6 @@ def sparse_attend(q_nope: torch.Tensor, q_pe: torch.Tensor, latent: torch.Tensor
                 sm_scale)
         ctx.sparse_plan = (ctx.eager.plan(*args) if ctx.eager is not None
                            else sparse_mla.EagerSparsePlan(*args, q_nope.device))
+    if ctx.valid is not None:
+        return ctx.sparse_plan.attend(q_nope, q_pe, latent, slots, ctx.valid, ctx.pad_slot)
     return ctx.sparse_plan.attend(q_nope, q_pe, latent, slots)
