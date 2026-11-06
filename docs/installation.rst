@@ -515,6 +515,15 @@ in ``rust-toolchain.toml``):
    uv pip install maturin
    maturin develop --release -m rust/Cargo.toml
 
+Build it with torch already installed and a C++17 compiler on the path: the
+extension embeds a small shim compiled against torch's headers
+(``rust/src/torch_abi/``), and without torch it builds with no shim and the SHM
+arena refuses to start, saying so. A build isolated from the environment's torch
+(``pip install ./rust``) needs ``MSTAR_TORCH_DIR`` set to the torch package's
+directory. The shim is not tied to the torch it was built against: any torch in
+the supported range runs it, and the arena checks that at startup. ``import
+mstar_rust``, ``cargo test`` and ``rust/server`` need neither torch nor the shim.
+
 The CPU test suites build a graph runtime too, so contributors need it as well,
 Mac contributors included: install ``cargo`` through rustup and run the same
 command. Build with ``--release`` — an unoptimized debug build (maturin's

@@ -498,6 +498,55 @@ impl Bookkeeping {
         self.stored.contains_key(&uuid)
     }
 
+    /// What to send for `uuid`: the stored host copy if there is one, else the
+    /// tensor. The manager's `_send_source`.
+    pub fn send_source(&self, uuid: u64) -> Option<&Py<PyAny>> {
+        let stored = self.stored.get(&uuid)?;
+        Some(stored.cpu.as_ref().unwrap_or(&stored.tensor))
+    }
+
+    /// A staged tensor is registered and its descriptor names its slot, in one
+    /// step. Fails only for a segment the store was never told about.
+    pub fn publish_staged(&mut self, uuid: u64, segment: usize, offset: i64) -> Result<(), String> {
+        let sym = self
+            .shm_segments
+            .get(segment)
+            .copied()
+            .filter(|&s| s != Sym::MAX)
+            .ok_or_else(|| format!("segment {segment} was never registered with the store"))?;
+        if let Some(info) = self.tensor_info.get_mut(&uuid) {
+            info.shm_segment = Some(sym);
+            info.shm_offset = offset;
+        }
+        self.set_mem_registered(uuid, true);
+        Ok(())
+    }
+
+    /// A tensor just read: its record, its object and its first references, as
+    /// `put_tensor`, `own` and `increment_ref` would leave them.
+    pub fn put_read(
+        &mut self,
+        info: TensorPointerInfo,
+        rid: RidKey,
+        tensor: Py<PyAny>,
+        refs: i64,
+    ) -> Option<StoredTensor> {
+        let uuid = info.uuid;
+        self.tensor_info.insert(uuid, info);
+        self.ref_info.insert(
+            uuid,
+            ReferenceInfo {
+                ref_count: refs,
+                ..ReferenceInfo::default()
+            },
+        );
+        self.own(rid, uuid, tensor, None)
+    }
+
+    pub fn strings_mut(&mut self) -> &mut StrToId {
+        &mut self.strings
+    }
+
     fn tensor(&self, py: Python<'_>, uuid: u64) -> Option<Py<PyAny>> {
         self.stored.get(&uuid).map(|s| s.tensor.clone_ref(py))
     }
@@ -831,6 +880,10 @@ impl TensorBookkeeping {
     /// A second handle on the same state, for a Rust-side holder.
     pub fn share(&self) -> SharedBookkeeping {
         Arc::clone(&self.inner)
+    }
+
+    pub fn share_lock(&self) -> std::sync::MutexGuard<'_, Bookkeeping> {
+        self.inner.lock().unwrap()
     }
 }
 
