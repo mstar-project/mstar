@@ -18,6 +18,7 @@ from unittest.mock import Mock
 
 import pytest
 import torch
+from torch._dynamo.utils import counters
 
 from mstar.engine.resources.sampler import utils as sampler_utils
 from mstar.engine.resources.sampler.config import SamplerStep
@@ -41,6 +42,7 @@ from mstar.engine.state import (
     SampleStep,
     TensorType,
     Value,
+    add_read,
     at_last_token,
     causal_conv,
     gated_delta_net,
@@ -702,6 +704,117 @@ def test_blocks_compiled_one_by_one_share_a_graph_and_leave_no_hold():
             block(torch.randn(TOKENS + 2, HEADS, DIM))
     assert len(calls) == 2 * LAYERS
     assert h._held is None, "a compiled block should not return k and v from its graph"
+
+
+# One call for add then read. Two breaks compile a resume frame between them, once per shape, paid at boot. So a layer
+# with nothing traced between them takes one break.
+
+
+@pytest.mark.parametrize("attn", [_StubAttn, _StubDense], ids=["pages", "held"])
+@pytest.mark.parametrize("keep", [None, False], ids=["kept", "scratch"])
+def test_add_read_does_what_add_then_read_does(attn, keep):
+    kv_two, attn_two, kv_one, attn_one = _StubKV(), attn(), _StubKV(), attn()
+    two, one = _kv_handle(kv=kv_two, attn=attn_two), _kv_handle(kv=kv_one, attn=attn_one)
+    _begin(two)
+    _begin(one)
+    q, k, v = _tensors()
+    two.add(1, keep=keep, k=k, v=v)
+    expected = two.read(1, q)
+    assert add_read(one, 1, q, keep=keep, k=k, v=v).equal(expected)
+    assert (kv_one.writes, attn_one.runs) == (kv_two.writes, attn_two.runs)
+    assert kv_one.pages.equal(kv_two.pages)
+    assert (one._kept, one._scratch, one._read) == (two._kept, two._scratch, two._read)
+
+
+def _added(h, q, k, v):
+    h.add(0, k=k, v=v)
+
+
+def _added_and_read(h, q, k, v):
+    h.add(0, keep=False, k=k, v=v)
+    h.read(0, q)
+
+
+@pytest.mark.parametrize(("setup", "layer", "keep", "with_q", "mask_args", "cause"), [
+    (None, LAYERS + 1, None, True, {}, f"add on layer {LAYERS + 1}, which the array doesn't declare"),
+    (_added, 0, None, True, {}, "an add on layer 0 after its kept add"),
+    # both calls would refuse, and the add's check runs first
+    (_added, 0, None, False, {}, "an add on layer 0 after its kept add"),
+    (_added_and_read, 0, False, True, {}, "an add on layer 0 after a read in the same layer"),
+    (None, 0, None, False, {}, "no layout yet: a read with no op"),
+    (None, 0, None, True, {"top_k": 3}, r"no layout yet: mask arguments \['top_k'\]"),
+])
+def test_add_read_refuses_with_the_message_of_the_call_that_refuses(setup, layer, keep, with_q, mask_args, cause):
+    q, k, v = _tensors()
+    read_q = q if with_q else None
+    messages = []
+    for run in (
+        lambda h: (h.add(layer, keep=keep, k=k, v=v), h.read(layer, read_q, **mask_args)),
+        lambda h: add_read(h, layer, read_q, keep=keep, k=k, v=v, **mask_args),
+    ):
+        h = _kv_handle()
+        _begin(h)
+        if setup:
+            setup(h, q, k, v)
+        with pytest.raises(ValueError, match=f"Array 'kv': {cause}") as refused:
+            run(h)
+        messages.append(str(refused.value))
+    assert messages[0] == messages[1]
+
+
+def test_add_read_on_an_array_the_step_does_not_list_raises():
+    q, k, v = _tensors()
+    _refused(r"Array 'kv': add in a step that doesn't list the array", lambda: add_read(_kv_handle(), 0, q, k=k, v=v))
+
+
+def test_add_read_refuses_keep_true_in_a_step_that_keeps_nothing_as_add_does():
+    h = _kv_handle()
+    _begin(h, kv=ArrayStep(keep=False))
+    q, k, v = _tensors()
+    _refused(r"Array 'kv': keep=True on layer 0 in a step with keep=False",
+             lambda: add_read(h, 0, q, keep=True, k=k, v=v))
+
+
+def test_add_read_refuses_an_array_with_max_len_0_whose_read_stays_in_the_graph():
+    h = _within_handle()
+    _begin(h)
+    q, k, v = _tensors()
+    _refused(r"Array 'kv': add_read with max_len 0", lambda: add_read(h, 0, q, k=k, v=v))
+
+
+def test_add_read_refuses_an_entry_with_a_field_named_q():
+    t = TensorType((HEADS, DIM), dtype=None, shard=0)
+    h = _kv_handle(_array(entry=Entry({"k": t, "v": t, "q": t})))
+    _begin(h)
+    q, k, v = _tensors()
+    _refused(r"Array 'kv': add_read takes q for the read, and the entry declares a field named q",
+             lambda: add_read(h, 0, q, k=k, v=v))
+
+
+def _resume_frames(fn, *args) -> list[str]:
+    """Counted from Dynamo's resume frames, since a frame with no graph doesn't show in ``graph_break_count``."""
+    torch._dynamo.reset()
+    counters.clear()
+    torch.compile(fn)(*args)
+    return sorted(counters["resumes"])
+
+
+@torch.no_grad()
+def test_add_read_compiles_one_resume_frame_where_add_then_read_compile_two():
+    h = _kv_handle()
+    _begin(h)
+    q, k, v = _tensors()
+
+    def two_calls(q, k, v):
+        h.add(0, keep=False, k=k * 2, v=v * 2)
+        return h.read(0, q * 2) * 2
+
+    def one_call(q, k, v):
+        return add_read(h, 1, q * 2, keep=False, k=k * 2, v=v * 2) * 2
+
+    assert len(_resume_frames(two_calls, q, k, v)) == 2
+    frames = _resume_frames(one_call, q, k, v)
+    assert len(frames) == 1 and "in_one_call" in frames[0], frames
 
 
 # What a step keeps, which the resources decide for the step as a whole
