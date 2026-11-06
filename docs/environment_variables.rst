@@ -104,7 +104,7 @@ Communication
      - Internal: ``<segment MiB>x<max segments>`` for every arena of the
        deployment (``0x0``: none, send by files), written by
        :func:`mstar.communication.arena.export_arena_plan` before any arena
-       exists and inherited by the conductor and workers, so each arena gets
+       exists, measured after a dead run's files are swept, and inherited by the conductor and workers, so each arena gets
        the same size whatever order the processes start in. Read by
        ``_arena_sizing``; ``MSTAR_SHM_ARENA_SEGMENT_MB`` and
        ``_MAX_SEGMENTS`` take precedence. Not meant to be set by hand.
