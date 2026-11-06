@@ -267,7 +267,7 @@ def test_a_media_row_with_the_wrong_row_count_fails_its_request():
     starts = []
     llm.prompt_positions = lambda start, layout, n: starts.append(start) or (None, None)
     # the stream's counter is keyed by the worker's handle, not the wire id
-    llm.node_resources = {ROPE: SimpleNamespace(position=lambda rid, label: {7: 5}[rid])}
+    llm.node_resources = {ROPE: SimpleNamespace(position=lambda rid, label: {(7, "main"): 5}[rid, label])}
     ids = torch.tensor([1, AUDIO_PAD, AUDIO_PAD])
     layout = {"offset": [1], "tokens": [2], "output": ["audio_embeds"], "grid": [[]]}
     fwd_info = SimpleNamespace(request_id="r", rid_handle=7, step_metadata={MEDIA_LAYOUT: layout})
