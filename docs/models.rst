@@ -471,13 +471,16 @@ not the 256-slot default. The state defaults to the checkpoint's
 needs FlashInfer's fused bf16 decode kernel (K = V = 128).
 
 Text prefill and mixed steps replay captured graphs by total tokens, on the
-ladder ``32 ... 8704`` (powers of two, plus 2176, 4352 and 8704 for a mixed
-step's decode rows and batches a few tokens over; a mixed step keeps only the
-powers of two past 2176); a step pads to its bucket and a longer one runs
-eagerly. ``model_kwargs: prefill_token_buckets: [...]`` sets a
-deployment's own ladder (distinct positive token counts, checked when the
-worker loads): ``configs/qwen3_5_9b*.yaml`` take the powers of two to 2048
-and 2176 for a mixed step, since the LLM's 2048-token step budget
+ladder ``32 ... 8192`` (powers of two, plus 2176 as slack for a step a few
+tokens over the 2048-token step budget); a step pads to its bucket and a longer
+one runs eagerly. A text-prefill step, one with no decode rows beside it, also
+has 1152, 1280, 1536 and 1792, so a prompt a little past 1024 tokens doesn't
+pad to 2048; a mixed step captures only the ladder's powers of two and 2176, on
+a deployment's own ladder too, so a ladder needs at least one of those.
+``model_kwargs: prefill_token_buckets: [...]`` sets a deployment's own ladder
+(distinct positive token counts, checked when the worker loads):
+``configs/qwen3_5_9b*.yaml`` take the powers of two to 2048,
+1152-1792, and 2176 as slack, since the LLM's 2048-token step budget
 (``MAX_BATCH_TOKENS``) caps prefill and mixed steps and no bucket past 2176 is
 reached. Each bucket adds captures and startup time.
 
@@ -1419,14 +1422,16 @@ is faster for a single frame. False decodes everything with the compiled stock
 ``vae.decode`` on the shared instance.
 
 Two or more requests at the same denoise step run one cross-request forward
-(``max_gen_batch_size``, default 8) for video, image and sound; the action step
-runs eager. With ``compile_denoise_batched`` (default on) its layer stack is
+(``max_gen_batch_size``, default 8) for video, image, sound and action. With
+``compile_denoise_batched`` (default on) the layer stack these steps share is
 compiled with the same mode, once, while the server starts, with the packed
 length dynamic: no batch size or mix of resolutions compiles mid-traffic. The
-per-request patchify, rotary tables and unpatchify around it run eager. At
-832x480x121 one request's guidance pair is 24k tokens, which already fills the
-GPU's GEMM and attention throughput, so a batch of N costs about N single
-steps: batching keeps requests in step rather than adding throughput.
+per-request patchify, rotary tables and unpatchify around it run eager.
+Compiled, a batched action step's outputs differ from the eager stack's at the
+kernel-drift level. At 832x480x121 one request's guidance pair is 24k tokens,
+which already fills the GPU's GEMM and attention throughput, so a batch of N
+costs about N single steps: batching keeps requests in step rather than adding
+throughput.
 
 The action policy (``cosmos3_edge_droid``, or ``cosmos3_edge`` with an action
 ``domain_name``) predicts a chunk of robot actions from the current observation:

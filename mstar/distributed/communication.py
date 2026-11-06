@@ -45,6 +45,8 @@ def rendezvous_store(init_method: str, rank: int, world_size: int, timeout: time
     )
 
 
+# Kept for direct callers still on the CP branches (`to_partners`, `all_to_all_rows`); on main
+# only `CommGroup.all_to_all` calls this.
 @torch.compiler.disable
 def _all_to_all_single(
     group: dist.ProcessGroup, send: torch.Tensor, recv: torch.Tensor,
@@ -233,6 +235,10 @@ class CommGroup:
         dist.broadcast(tensor, self.group_members[src], self.device_group)
         return tensor
 
+    # Eager as a whole, the boundary where the per-rank sizes become the collective's host split
+    # lists: traced, its branches on them would compile per sequence length, and a traced variant
+    # that kept them symbolic measured no faster on Cosmos3 SP.
+    @torch.compiler.disable
     def all_to_all(
         self,
         input_: torch.Tensor | Sequence[torch.Tensor],

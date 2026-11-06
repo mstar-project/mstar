@@ -27,23 +27,26 @@ def test_prefill_ladder_from_model_kwargs():
     from mstar.model.qwen3_5.config import LLM_MIXED
     from mstar.model.qwen3_5.submodules import LLMSubmodule
     default = list(LLMSubmodule.PREFILL_TOKEN_BUCKETS)
+    # a batch that fills a power of two doesn't pad past it
+    assert {256, 512, 1024, 2048, 4096, 8192} <= set(default)
     sub = LLMSubmodule(None, SimpleNamespace(stop_token_ids=(1,)), prefill_token_buckets=[8192, 3072, 2048])
     assert sub.PREFILL_TOKEN_BUCKETS == [2048, 3072, 8192]
     # an instance override, not the class's
     assert LLMSubmodule.PREFILL_TOKEN_BUCKETS == default
     assert LLMSubmodule(None, SimpleNamespace(stop_token_ids=(1,))).PREFILL_TOKEN_BUCKETS == default
     # the ladders the text-prefill and mixed captures are taken on; a mixed
-    # step keeps only the powers of two past 2176
+    # step keeps only the ladder's powers of two and 2176
     configs = sub.get_accelerator_graph_configs(torch.device("cpu"))
     ladders = {c.capture_graph_walk: c.capture_token_lengths for c in configs if c.capture_graph_walk != "decode"}
     assert ladders["prefill_text"] == [2048, 3072, 8192]
     assert ladders[LLM_MIXED] == [2048, 8192]
 
 
-@pytest.mark.parametrize("buckets", [[], [512, 512], [0, 64], 2048])
+@pytest.mark.parametrize("buckets", [[], [512, 512], [0, 64], 2048, [1152, 1536]])
 def test_a_bad_prefill_ladder_is_refused(buckets):
     """Refused when the submodule is built, not taken as the default (an empty
-    list), captured twice (a repeat), or failing later with a TypeError (a scalar)."""
+    list), captured twice (a repeat), failing later with a TypeError (a scalar),
+    or leaving a mixed step no bucket to replay (no power of two)."""
     from mstar.model.qwen3_5.submodules import LLMSubmodule
     with pytest.raises(ValueError, match="prefill_token_buckets"):
         LLMSubmodule(None, SimpleNamespace(stop_token_ids=(1,)), prefill_token_buckets=buckets)
@@ -54,15 +57,6 @@ def test_decode_ladder_knob(monkeypatch):
     assert m.LLMSubmodule.DECODE_CAPTURE_BATCH_SIZES == [1, 2, 4, 8, 16, 32]
     m = _reload(monkeypatch, "MSTAR_QWEN35_DECODE_BUCKETS", None)
     assert m.LLMSubmodule.DECODE_CAPTURE_BATCH_SIZES[-1] == 128
-
-
-def test_prefill_buckets_hold_near_power_of_two_batches(monkeypatch):
-    submodule = _reload(monkeypatch, "MSTAR_QWEN35_DECODE_BUCKETS", None).LLMSubmodule
-    buckets = submodule.PREFILL_TOKEN_BUCKETS
-    # a 16-row batch with a few prompts a couple of tokens long stays captured
-    assert 16 * 512 + 8 <= buckets[-1]
-    # a batch that fills a power of two doesn't pad past it
-    assert {256, 512, 1024, 2048, 4096, 8192} <= set(buckets)
 
 
 def _configs_with_prefill_ladders():
@@ -115,11 +109,11 @@ def test_every_shipped_prefill_ladder_is_a_model_argument(config):
 
 @pytest.mark.parametrize("buckets", _shipped_prefill_ladders().values(), ids=_shipped_prefill_ladders().keys())
 def test_shipped_ladders_hold_a_mixed_step_without_the_next_power_of_two(buckets):
-    """Four 512-token prompts beside the rest of the largest mixed batch replay
-    at 2176, not padded to 4096, on every ladder a config ships."""
+    """A mixed step a few tokens over the step budget replays at 2176, not
+    padded to 4096, on every ladder a config ships."""
     from mstar.model.qwen3_5.submodules import LLMSubmodule
     s = LLMSubmodule(None, SimpleNamespace(stop_token_ids=(1,)), prefill_token_buckets=buckets)
-    tokens = 4 * 512 + s.MIXED_CAPTURE_BATCH_SIZES[-1] - 4
+    tokens = s.MAX_BATCH_TOKENS + 4
     assert min(b for b in s.MIXED_TOKEN_BUCKETS if b >= tokens) == 2176
 
 

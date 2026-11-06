@@ -94,10 +94,10 @@ def token_stop(stop_token_ids) -> TokenStop:
     )
 
 
-def _mixed_token_buckets(prefill_buckets) -> list[int]:
-    """The prefill ladder up to 2176, then its powers of two (see
+def _mixed_token_buckets(prefill_buckets, slack: int) -> list[int]:
+    """The prefill ladder's powers of two and ``slack`` (see
     ``LLMSubmodule.MIXED_TOKEN_BUCKETS``)."""
-    return [b for b in prefill_buckets if b <= 2176 or b & (b - 1) == 0]
+    return [b for b in prefill_buckets if b & (b - 1) == 0 or b == slack]
 
 
 class LLMSubmodule(ARNodeSubmodule):
@@ -105,23 +105,36 @@ class LLMSubmodule(ARNodeSubmodule):
     # graph per (bucket, batch size). A prompt past the top bucket prefills
     # eagerly, and an eager 8k prefill is launch-bound (~1,100 kernel
     # launches, the GPU idle half the time: 78 ms of wall for 36 ms of kernels
-    # on 0.8B), so the ladder runs past 8192. The powers of two stay, since a
-    # batch of prompts up to a power of two long fills one exactly. 2176, 4352
-    # and 8704 add 1/16 above them for the decode rows a mixed step carries
-    # beside four prompts and for batches a few tokens over, which would
-    # otherwise pad to twice the width. A deployment sets its own with
+    # on 0.8B), so the ladder runs to 8192. The powers of two stay, since a
+    # batch of prompts up to a power of two long fills one exactly, and 2176
+    # is slack for a step a few tokens over the 2048-token step budget.
+    # 1152-1792 hold a prompt a little past 1024 tokens (1024 plus its chat
+    # template) without padding it to 2048. Only a text-prefill step, one with
+    # no decode rows beside it, uses them; a mixed step doesn't capture them.
+    # There is no slack above 4096 or 8192: the step budget never reaches
+    # them, and each bucket is one more compile against Dynamo's recompile
+    # limit. A deployment sets its own with
     # `model_kwargs.prefill_token_buckets` (static buffers are sized by the
     # largest bucket).
-    PREFILL_TOKEN_BUCKETS = [32, 64, 128, 256, 512, 1024, 2048, 2176, 4096, 4352, 8192, 8704]
+    PREFILL_TOKEN_BUCKETS = [
+        32, 64, 128, 256, 512, 1024, 1152, 1280, 1536, 1792, 2048, 2176, 4096, 8192,
+    ]
     PREFILL_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16]
     # A mixed step carries the decode batch beside its prompt rows, so its
     # captures run to the decode batch: one capped below it splits the batch.
     MIXED_CAPTURE_BATCH_SIZES = [4, 16, 64, 128]
-    # Four prompts and their decode rows reach 2176, the only slack bucket a
-    # mixed step needs. Every (rows, tokens) pair here is one more recompile of
-    # the forward all these captures share, and past Dynamo's limit the buckets
+    # The step's token budget, on a prefill capture bucket since a step over
+    # it pads to the next bucket up. 2048 measured best on 0.8B-9B:
+    # 1024 costs 3-10% throughput in steps and speculation, 4096 gives back
+    # most of the short-prompt TTFT gain and doubles decode ITL p99 at c48
+    MAX_BATCH_TOKENS = 2048
+    # A mixed step captures only the ladder's powers of two and one slack
+    # bucket, a decode batch's width above the budget, for a step a few tokens
+    # over it (2176). Every (rows, tokens) pair here is one more recompile of the
+    # forward all these captures share, and past Dynamo's limit the buckets
     # compiled last run uncompiled inside their graphs.
-    MIXED_TOKEN_BUCKETS = _mixed_token_buckets(PREFILL_TOKEN_BUCKETS)
+    MIXED_SLACK_TOKENS = MAX_BATCH_TOKENS + MIXED_CAPTURE_BATCH_SIZES[-1]
+    MIXED_TOKEN_BUCKETS = _mixed_token_buckets(PREFILL_TOKEN_BUCKETS, MIXED_SLACK_TOKENS)
     # Capture rows and a replay's padding rows address the pool's sink and
     # hold no slot, so these buckets do not size `gdn_state.max_slots`; that is
     # set by the concurrency a deployment wants (see configs/qwen3_5_*.yaml).
@@ -164,7 +177,13 @@ class LLMSubmodule(ARNodeSubmodule):
                 "with `model_kwargs.prefill_token_buckets` in the serving config",
             )
         # follows a deployment's own prefill ladder
-        self.MIXED_TOKEN_BUCKETS = _mixed_token_buckets(self.PREFILL_TOKEN_BUCKETS)
+        self.MIXED_TOKEN_BUCKETS = _mixed_token_buckets(self.PREFILL_TOKEN_BUCKETS, self.MIXED_SLACK_TOKENS)
+        if not self.MIXED_TOKEN_BUCKETS:
+            raise ValueError(
+                f"prefill_token_buckets {self.PREFILL_TOKEN_BUCKETS} leaves a mixed step no captured bucket, "
+                "so every mixed step would run eagerly: it captures only the ladder's powers of two and "
+                f"{self.MIXED_SLACK_TOKENS}, so add one (e.g. 2048)"
+            )
         self.model = model
         self.config = config
         self.vision_config = vision_config
@@ -354,12 +373,6 @@ class LLMSubmodule(ARNodeSubmodule):
                 ),
             },
         )
-
-    # on a prefill capture bucket (PREFILL_TOKEN_BUCKETS), since a step over
-    # it pads to the next bucket up. 2048 measured best on 0.8B-9B:
-    # 1024 costs 3-10% throughput in steps and speculation, 4096 gives back
-    # most of the short-prompt TTFT gain and doubles decode ITL p99 at c48
-    MAX_BATCH_TOKENS = 2048
 
     def get_input_sequence_len(
         self, graph_walk: str, fwd_info: CurrentForwardPassInfo,

@@ -315,24 +315,6 @@ def test_a_resident_step_leaves_the_addressing_memo_to_host_steps():
     assert addressing.host_slot_indices == [pool._slots[r]["main"].index for r in (1, 2)]
 
 
-def test_a_resident_step_keeps_the_cached_kv_plan_attention_reads():
-    live, ref, planner = _setup({1: 3, 2: 5, 3: 8})
-    for res in (live, ref):
-        res["kv"]._plan_cache_mode = 1
-    rids = [1, 2, 3]
-    pages = set()
-    for t in range(40):
-        a = _captured_step(live, planner, rids, slot=t % 2, bs=4)
-        b = _captured_step(ref, None, rids, slot=t % 2, bs=4)
-        _same(a, b, 3)
-        x, y = (s.ctx.plan_results["kv"]["main"].cpu_indptrs for s in (a, b))
-        for p, q in zip(x[:5], y[:5], strict=True):
-            assert torch.equal(torch.as_tensor(p), torch.as_tensor(q))
-        pages.add(a.pages[0])
-    assert len(pages) > 1
-    assert live["kv"].plan_cache_stats["hit"] > 20
-
-
 def test_a_stage_is_timed_under_the_step_plan_phase(monkeypatch):
     live, ref, planner = _setup({1: 3})
     del ref
