@@ -13,6 +13,7 @@ uv.lock
 !examples/observability/grafana/dashboards/*.json
 !mstar/kernels/tables/*/*.json
 !mstar/model/command_a_plus/tests/fixtures/tiny_config.json
+!test/modular/fixtures/*.json
 profiler/
 traces/
 

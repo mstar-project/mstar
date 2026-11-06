@@ -276,8 +276,10 @@ def _submodule_class():
             )
 
         def preprocess(self, graph_walk, engine_inputs, inputs):
+            # embeds each row on its own, so every row runs its own collective (the
+            # real `preprocess` embeds the step at once)
             return {"embeds": [
-                inp.input_embeds if inp.input_embeds is not None
+                self._vision_embeds([inp]) if inp.input_ids is None
                 else self.model.model.embed_tokens(inp.input_ids)
                 for inp in inputs
             ]}
