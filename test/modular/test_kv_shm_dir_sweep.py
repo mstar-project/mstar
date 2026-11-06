@@ -15,8 +15,8 @@ import sys
 import pytest
 
 from mstar.communication import tensors
+from mstar.communication.arena import ArenaShmCommunicationManager
 from mstar.communication.communicator import BaseCommunicator, CommProtocol
-from mstar.communication.tensors import SharedMemoryCommunicationManager
 from mstar.engine.resources.kv.transfer import make_deployment_kv_shm_dir
 
 # A worker of a deployment: joins the namespace's KV directory, writes a
@@ -126,9 +126,10 @@ class _Communicator(BaseCommunicator):
 
 
 def _start_transport(shm_dir):
-    return SharedMemoryCommunicationManager(
+    return ArenaShmCommunicationManager(
         my_entity_id="worker_0", hostname="localhost", device="cpu",
         communicator=_Communicator(), shm_dir=str(shm_dir),
+        use_arena=False,
     )
 
 

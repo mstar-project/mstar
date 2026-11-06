@@ -199,6 +199,18 @@ EXPORT PyObject* mstar_lead_contiguous(PyObject* o, int64_t dim) {
   });
 }
 
+// The inverse: dim 0 back to position `dim`.
+EXPORT PyObject* mstar_unlead_contiguous(PyObject* o, int64_t dim) {
+  return to_python([&] {
+    const at::Tensor& t = THPVariable_Unpack(o);
+    std::vector<int64_t> order;
+    for (int64_t i = 1; i <= dim; ++i) order.push_back(i);
+    order.push_back(0);
+    for (int64_t i = dim + 1; i < t.dim(); ++i) order.push_back(i);
+    return t.permute(order).contiguous();
+  });
+}
+
 EXPORT PyObject* mstar_cat(PyObject* const* tensors, int64_t n, int64_t dim) {
   return to_python([&] {
     std::vector<at::Tensor> parts;

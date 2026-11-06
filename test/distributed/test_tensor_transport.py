@@ -14,10 +14,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from mstar.communication.arena import ArenaShmCommunicationManager
 from mstar.communication.communicator import BaseCommunicator, CommProtocol
 from mstar.communication.tensors import (
     MOONCAKE_IMPORT_ERROR,
-    SharedMemoryCommunicationManager,
     create_tensor_communication_manager,
 )
 from mstar.conductor.request_info import CurrentForwardPassInfo
@@ -70,10 +70,11 @@ def make_manager(tmp_path):
     """Factory returning a fresh TensorCommunicationManager per entity."""
     def _factory(entity_id: str, protocol: CommProtocol):
         if protocol == CommProtocol.SHM:
-            return SharedMemoryCommunicationManager(
+            return ArenaShmCommunicationManager(
                 my_entity_id=entity_id, hostname="localhost",
                 device="cpu", communicator=_MockCommunicator(),
                 shm_dir=str(tmp_path),
+                use_arena=False,
             )
         return create_tensor_communication_manager(
             protocol=protocol, my_entity_id=entity_id,

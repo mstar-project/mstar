@@ -2,8 +2,8 @@
 //!
 //! One persistent `/dev/shm` mmap per producer entity plus an in-process
 //! first-fit free-list allocator, replacing the per-tensor file open/write/
-//! read/unlink dance in `SharedMemoryCommunicationManager` (the Python
-//! buffer-protocol view lives in `lib.rs`).
+//! read/unlink dance of a spilled tensor (the Python buffer-protocol view lives
+//! in `lib.rs`).
 //!
 //! - Producer: [`ShmArena::create`], [`ShmArena::reserve`] -> offset, copy
 //!   D2H bytes into `arena[off..off+n]`, send the offset as a descriptor,
@@ -140,7 +140,7 @@ pub struct ShmArena {
 unsafe impl Send for ShmArena {}
 unsafe impl Sync for ShmArena {}
 
-fn shm_path(name: &str) -> String {
+pub(crate) fn shm_path(name: &str) -> String {
     if Path::new("/dev/shm").is_dir() {
         format!("/dev/shm/{name}")
     } else {
@@ -311,13 +311,13 @@ impl Drop for ShmArena {
     }
 }
 
-fn our_uid() -> u32 {
+pub(crate) fn our_uid() -> u32 {
     unsafe { libc::getuid() }
 }
 
 /// Segment names are predictable and live in a world-writable directory, so
 /// only a regular file we own is ever reused or mapped, the rule
-/// `_create_shm_file` in `mstar/communication/tensors.py` applies to tensor
+/// `_create_shm_file` in `mstar/communication/arena.py` applies to tensor
 /// files. `meta` must come from `lstat` or from the opened fd.
 fn check_ours(meta: &std::fs::Metadata, our_uid: u32) -> std::io::Result<()> {
     use std::os::unix::fs::MetadataExt;
@@ -337,7 +337,7 @@ fn check_ours(meta: &std::fs::Metadata, our_uid: u32) -> std::io::Result<()> {
 /// Create `path` 0600, never through a symlink. A file already there is
 /// replaced only if [`check_ours`] passes (a dead run's residue): unlinked,
 /// then created exclusively again, as `_create_shm_file` does.
-fn create_exclusive(path: &str, our_uid: u32) -> std::io::Result<std::fs::File> {
+pub(crate) fn create_exclusive(path: &str, our_uid: u32) -> std::io::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
     let create = || {
         OpenOptions::new()

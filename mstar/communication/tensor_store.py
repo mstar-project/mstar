@@ -726,6 +726,13 @@ class TensorStore:
                 if not owned:
                     del self._rid_to_uuids[request_id]
 
+    def remove_tensors(self, uuids: list[int]) -> list[int]:
+        """``remove_tensor`` for a batch. Returns the uuids not held."""
+        missing = [uuid for uuid in uuids if not self.check_uuid_presence(uuid)]
+        for uuid in uuids:
+            self.remove_tensor(uuid)
+        return missing
+
     def get_all_uuids(self, request_id: Rid) -> list[int]:
         return list(self._rid_to_uuids.get(request_id, ()))
 
@@ -858,6 +865,9 @@ class RustTensorStore(TensorStore):
         """The object, its ownership and its record, in one crossing. A uuid
         not held is left alone, record included."""
         self._rust.remove_tensor(uuid)
+
+    def remove_tensors(self, uuids: list[int]) -> list[int]:
+        return self._rust.remove_tensors(uuids)
 
     def put_tensor(
         self, request_id: Rid, uuid: int,

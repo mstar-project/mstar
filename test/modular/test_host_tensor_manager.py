@@ -21,11 +21,11 @@ from pathlib import Path
 import pytest
 import torch
 
+from mstar.communication.arena import ArenaShmCommunicationManager
 from mstar.communication.communicator import BaseCommunicator, CommProtocol
 from mstar.communication.tensors import (
     AsyncMooncakeReader,
     MooncakeCommunicationManager,
-    SharedMemoryCommunicationManager,
     TensorCommunicationManager,
     TransferReadInfo,
 )
@@ -83,15 +83,9 @@ def _context_before_and_after(manager: str) -> list[str]:
 
 
 @requires_cuda
-@pytest.mark.parametrize("manager", [
-    "mstar.communication.tensors.SharedMemoryCommunicationManager",
-    pytest.param(
-        "mstar.communication.arena.ArenaShmCommunicationManager",
-        marks=pytest.mark.skipif(not _HAS_ARENA, reason="the arena needs the mstar_rust extension"),
-    ),
-])
-def test_host_manager_stores_and_registers_without_a_cuda_context(manager):
-    before, after = _context_before_and_after(manager)
+@pytest.mark.skipif(not _HAS_ARENA, reason="the arena needs the mstar_rust extension")
+def test_host_manager_stores_and_registers_without_a_cuda_context():
+    before, after = _context_before_and_after("mstar.communication.arena.ArenaShmCommunicationManager")
     assert before == "True", "the probe must start with torch's CUDA initialized and no context"
     assert after == "False", "the API server would create a CUDA context on a GPU the workers filled"
 
@@ -170,13 +164,13 @@ def _reader_calls(monkeypatch, device) -> list[str]:
 @pytest.mark.parametrize("device", ["cuda", "cuda:1"])
 def test_a_device_manager_syncs_the_gpu(monkeypatch, device):
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
-    mgr = _manager(SharedMemoryCommunicationManager, device)
+    mgr = _manager(ArenaShmCommunicationManager, device)
     assert mgr._on_cuda, f"a {device} manager would send tensors its GPU has not finished writing"
 
 
 def test_a_host_manager_never_syncs_the_gpu(monkeypatch):
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
-    mgr = _manager(SharedMemoryCommunicationManager, "cpu")
+    mgr = _manager(ArenaShmCommunicationManager, "cpu")
     assert not mgr._on_cuda, "a host manager would create a CUDA context at its first sync"
 
 

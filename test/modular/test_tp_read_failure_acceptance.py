@@ -718,7 +718,7 @@ def _rank_main(rank, scenario, inbox, outbox):
         import torch.distributed as dist
 
         import mstar.communication.wire_types  # noqa: F401  (registers the tags)
-        from mstar.communication.tensors import SharedMemoryCommunicationManager
+        from mstar.communication.arena import ArenaShmCommunicationManager
         from mstar.conductor.request_info import CurrentForwardPassInfo
         from mstar.model.qwen3_5.qwen3_5_model import IMAGE_PART, STEP_GRIDS_KEY, TEXT_PART
 
@@ -732,8 +732,9 @@ def _rank_main(rank, scenario, inbox, outbox):
         graph = _Graph(rank, kind, report)
         kv = _kv_manager(rank, scenario.prefix_cache)
         engine = _engine(rank, group, kv, scenario.prefix_cache, graph)
-        tm = SharedMemoryCommunicationManager(
+        tm = ArenaShmCommunicationManager(
             WORKERS[rank], "localhost", "cpu", None, shm_dir=os.path.join(scenario.shm_root, str(rank)),
+            use_arena=False,
         )
         graph.tensor_manager = tm
         order = [TEXT_PART, IMAGE_PART, TEXT_PART] if kind == "grid" else [TEXT_PART]

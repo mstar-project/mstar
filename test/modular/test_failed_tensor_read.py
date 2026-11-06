@@ -21,6 +21,7 @@ import torch
 from test_request_failure_propagation import _preprocess_thread, _worker
 
 from mstar.api_server.request_types import ResultChunk
+from mstar.communication.arena import ArenaShmCommunicationManager
 from mstar.communication.communicator import BaseCommunicator, CommProtocol
 from mstar.communication.tensors import (
     _TRANSFER_COMPLETED,
@@ -29,7 +30,6 @@ from mstar.communication.tensors import (
     AsyncReadError,
     FutureAndPointers,
     MooncakeCommunicationManager,
-    SharedMemoryCommunicationManager,
     TensorCommunicationManager,
     TrackedMooncakeReader,
     TransferReadInfo,
@@ -69,7 +69,7 @@ def _acked(comm):
 
 def _shm_manager(tmp_path):
     comm = _Communicator()
-    mgr = SharedMemoryCommunicationManager("worker_1", "host", "cpu", comm, shm_dir=str(tmp_path))
+    mgr = ArenaShmCommunicationManager("worker_1", "host", "cpu", comm, shm_dir=str(tmp_path), use_arena=False)
     return mgr, comm
 
 

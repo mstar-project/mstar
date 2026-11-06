@@ -13,8 +13,8 @@ from types import SimpleNamespace
 
 import torch
 
+from mstar.communication.arena import ArenaShmCommunicationManager
 from mstar.communication.communicator import BaseCommunicator
-from mstar.communication.tensors import SharedMemoryCommunicationManager
 from mstar.engine.engine import Engine, ExecutingBatch
 from mstar.engine.resources import StepContext
 from mstar.graph.runtime.base import FreedTensors, PhasedPostprocess, RouteOutput
@@ -195,9 +195,10 @@ def test_the_worker_routes_no_tensor_for_a_withheld_output(tmp_path):
     w._stop_token_signal = {}  # no declared stop policies: check_stop decides
     w._graph_runtime = _RecordingRuntime()
     w.scheduler = SimpleNamespace(failed_rids=set())
-    w.tensor_manager = SharedMemoryCommunicationManager(
+    w.tensor_manager = ArenaShmCommunicationManager(
         my_entity_id="worker_0", hostname="localhost", device="cpu",
         communicator=_Communicator(), shm_dir=str(tmp_path),
+        use_arena=False,
     )
     w.engine_manager = SimpleNamespace(get_engine=lambda node: SimpleNamespace(
         check_stop_for_batch=engine.check_stop_for_batch,

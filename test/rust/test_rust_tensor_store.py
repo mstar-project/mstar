@@ -258,7 +258,7 @@ def test_an_arena_slot_is_freed_on_release(tmp_path, monkeypatch):
     a, b = stored.flat_uuids
     mgr.increment_ref_batch_uniform([a, b], 1)
     mgr.register_for_send_uuids(ParallelList(["r"], [[a]]))
-    assert a in mgr._arena_locs
+    assert mgr._transport.has_slot(a)
 
     seen = []
     real = mgr.cleanup_collectable
@@ -267,7 +267,7 @@ def test_an_arena_slot_is_freed_on_release(tmp_path, monkeypatch):
         *mgr.tensor_store.bookkeeping.dereference_batch_uniform([a, b], 1, cleanup=True)
     )
     assert seen == [a], "only the staged one needs the arena's teardown"
-    assert not mgr._arena_locs, "its slot went back to the arena"
+    assert mgr._transport.live()[0] == 0, "its slot went back to the arena"
     assert mgr.tensor_store.stored_counts() == (0, 0)
     mgr.close()
 
