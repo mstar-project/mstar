@@ -259,7 +259,7 @@ def _poke() -> None:
 
 def device_wait(t: float) -> None:
     """Hold this thread until the device reaches ``t`` on the clock: the mover wakes it then,
-    jumping the clock there if nothing else in the process runs."""
+    jumping there when idle unless an earlier host deadline is constrained by a peer."""
     began = clock.now()
     lock = _real_lock()
     lock.acquire()

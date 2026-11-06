@@ -903,6 +903,40 @@ def test_a_blocked_process_follows_the_deployments_time():
     assert slots == 2, slots  # a read scans what was used, not all 64
 
 
+def test_a_device_wait_does_not_expire_a_host_wait_before_a_peer_notifies():
+    worker, _ = run_deployment("""
+        import socket
+        server = socket.socket(socket.AF_UNIX)
+        server.bind(TMP + "/sock")
+        server.listen()
+        barrier()
+        conn, _ = server.accept()
+        done = threading.Event()
+        def receive():
+            conn.recv(1)
+            done.set()
+        def device():
+            time.sleep(0.05)
+            clock.charge(3.0)
+            torch.cuda.synchronize()
+        reader = threading.Thread(target=receive)
+        gpu = threading.Thread(target=device)
+        reader.start()
+        gpu.start()
+        print(done.wait(0.5))
+        reader.join()
+        gpu.join()
+    """, """
+        import socket
+        barrier()
+        conn = socket.socket(socket.AF_UNIX)
+        conn.connect(TMP + "/sock")
+        time.sleep(0.2)
+        conn.send(b"x")
+    """)
+    assert worker.strip() == "True", worker
+
+
 def test_blocked_processes_with_only_host_deadlines_keep_real_time():
     """Both blocked on host deadlines, with no device time to jump to: the clock goes to the earlier
     one, then the later, each on time on the deployment's clock and no sooner in real time. A
