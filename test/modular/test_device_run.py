@@ -569,7 +569,8 @@ def test_a_skipped_step_gives_back_only_the_rows_a_refused_one_would():
     assert failed == [({4: "boom"}, "outputs")]
 
 
-def test_a_short_run_takes_back_a_decode_snapshot_past_where_it_ended():
+@pytest.mark.parametrize("later_tokens", [0, 4])
+def test_a_short_run_takes_back_a_decode_snapshot_past_where_it_ended(later_tokens):
     """Filed once the chain keys its page, a snapshot from past the row's real
     tokens would serve state at the wrong length; its predecessor stands again."""
     import threading
@@ -578,7 +579,7 @@ def test_a_short_run_takes_back_a_decode_snapshot_past_where_it_ended():
 
     pool = RecurrentStatePool.__new__(RecurrentStatePool)
     pool._lock = threading.RLock()
-    held = SimpleNamespace(tokens=12)
+    held = SimpleNamespace(tokens=12 + later_tokens)
     pool._slots = {1: {"main": held}}
     earlier = DecodeSnapshot(3, 8)
     pool._decode = {(1, "main"): DecodeSnapshot(4, 12, replaces=earlier)}
@@ -586,7 +587,7 @@ def test_a_short_run_takes_back_a_decode_snapshot_past_where_it_ended():
     freed = []
     pool._drop_decode = lambda key, decode: (pool._unkeyed.discard(key), freed.append(decode.slot))
     pool.rewind_run(SimpleNamespace(segments=[SimpleNamespace(request_id=1, label="main", span=1)]), None, 2, {1})
-    assert held.tokens == 10 and freed == [4] and pool._decode[(1, "main")] is earlier
+    assert held.tokens == 10 + later_tokens and freed == [4] and pool._decode[(1, "main")] is earlier
 
 
 def test_a_walk_that_drops_rows_refuses_a_prefix_chain():

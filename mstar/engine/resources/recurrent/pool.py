@@ -1185,11 +1185,12 @@ class RecurrentStatePool(Resource):
                 if slot is None or segment.span <= 0:
                     continue
                 slot.tokens -= segment.span * replays
-                # a snapshot saved at commit from past where the run ended holds
-                # state of another length than the chain would name it by
+                # Later steps may already have committed into slot.tokens. A
+                # pending snapshot cannot prove its prefix after this rewind;
+                # retain the previously filed snapshot instead.
                 key = (segment.request_id, segment.label)
                 decode = self._decode.get(key)
-                if decode is not None and key in self._unkeyed and decode.tokens > slot.tokens:
+                if decode is not None and key in self._unkeyed:
                     del self._decode[key]
                     self._drop_decode(key, decode)
                     if decode.replaces is not None:
