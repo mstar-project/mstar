@@ -1526,8 +1526,7 @@ class MicroScheduler:
         if next_iter_of is None:
             metadata = InputMetadata(stream_chunks=chunks) if chunks else None
         else:
-            loops = dict(fwd_info.dynamic_loop_iter_counts)
-            loops[next_iter_of] = loops.get(next_iter_of, 0) + 1
+            loops = self.runtime.loop_layout(graph_walk, next_iter_of).advance(fwd_info.dynamic_loop_iter_counts)
             metadata = InputMetadata(stream_chunks=chunks or {}, dynamic_loop_iter_counts=loops)
         return engine.capture_group(node_name, graph_walk, rid, fwd_info, input_metadata=metadata)
 

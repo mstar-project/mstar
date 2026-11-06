@@ -26,6 +26,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 import torch  # noqa: E402
 
 from mstar.conductor.request_info import CurrentForwardPassInfo  # noqa: E402
+from mstar.graph.loop_indices import LoopLayout
 from mstar.graph.runtime.base import (  # noqa: E402
     ColumnarEdgeSpecs,
     SpeculationOutput,
@@ -124,6 +125,7 @@ def _runtime():
         output_signals=("prev_text",),
     )
     return SimpleNamespace(
+        loop_layout=lambda walk, name: LoopLayout(name),
         prep_spec_rids=lambda inp: _prep(),
         prep_follow_spec_rids=lambda inp: _prep(),
         get_spec_target=lambda *a: target,

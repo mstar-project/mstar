@@ -124,6 +124,7 @@ def test_the_run_ready_rows_wait_for_is_at_most_ready_waits_long():
     batch = ScheduledBatch(node_name="LLM", graph_walk="decode", request_to_worker_graph={0: 0, 1: 0})
     worker = Worker.__new__(Worker)
     worker._walk_drivers = {}
+    worker._innermost_loop_by_node = {("decode", "LLM"): "loop"}
     worker._graph_runtime = SimpleNamespace(loop_room=lambda *args: 100)
     worker._step_repeats = StepRepeats({"LLM": RepeatConfig(max=8, ready_waits=3)}, {("LLM", "decode"): None})
     worker._step_repeats._walks.add(("LLM", "decode"))
@@ -259,6 +260,7 @@ def test_a_stalled_consumer_caps_its_producer_to_one_then_takes_the_row_out():
     engine = SimpleNamespace(ring_room=lambda node, rids: min(rows.ring_room("frames", rid) for rid in rids))
     worker = Worker.__new__(Worker)
     worker._walk_drivers = {}
+    worker._innermost_loop_by_node = {("decode", "LLM"): "loop"}
     worker._ring_signals = {"LLM": frozenset({"frames"})}
     worker.engine_manager = SimpleNamespace(get_engine=lambda node: engine)
     worker._graph_runtime = SimpleNamespace(loop_room=lambda *args: 100)

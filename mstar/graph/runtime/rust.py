@@ -33,7 +33,7 @@ from mstar.distributed.base import ShardingConfig
 from mstar.engine.resources import PublishedInfo
 from mstar.graph.base import GraphNode, GraphSection, Loop
 from mstar.graph.graph_io import WorkerGraphIO
-from mstar.graph.loop_indices import NestedLoopIndices
+from mstar.graph.loop_indices import LoopLayout, NestedLoopIndices
 from mstar.graph.runtime import sharding
 from mstar.graph.runtime.base import (
     ColumnarEdgeSpecs,
@@ -289,6 +289,18 @@ class RustGraphRuntime(GraphRuntime):
         )
         if walk_driven_signals:
             self._rust.set_walk_driven_signals(sorted(walk_driven_signals))
+        self._loop_layouts: dict[tuple[str, str], LoopLayout] = {}
+        for wg in my_worker_graphs:
+            loops = wg.section.get_loops()
+            children = {name: tuple(loop.section.get_loops()) for name, loop in loops.items()}
+            for name in loops:
+                ancestors = tuple(sorted(
+                    (parent for parent in loops if name in children[parent]),
+                    key=lambda parent: -len(children[parent]),
+                ))
+                layout = LoopLayout(name, ancestors, children[name])
+                for walk in wg.graph_walks:
+                    self._loop_layouts[(walk, name)] = layout
         self._node_to_partition = node_to_partition
         self._communicator = communicator
         self._bookkeeping = bookkeeping
@@ -458,6 +470,9 @@ class RustGraphRuntime(GraphRuntime):
             per_request_info[rids[rid_idx[k]]].dynamic_loop_iter_counts[
                 names[name_idx[k]]
             ] = iters[k]
+
+    def loop_layout(self, graph_walk: str, loop_name: str) -> LoopLayout:
+        return self._loop_layouts[(graph_walk, loop_name)]
 
     def get_dynamic_loop_iters(
         self, request_ids: list[int], partition: str,

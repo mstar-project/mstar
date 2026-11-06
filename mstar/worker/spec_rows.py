@@ -15,6 +15,7 @@ from types import MappingProxyType
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
+from mstar.graph.loop_indices import LoopLayout
 from mstar.model.submodule_base import InputMetadata
 
 _LOOP_COUNTS = attrgetter("dynamic_loop_iter_counts")
@@ -86,19 +87,20 @@ class DeferredRowInputs(MutableMapping):
 
 
 def loop_counter_snapshots(
-    infos: list[CurrentForwardPassInfo], loop_name: str | None, n_next_iter: int,
+    infos: list[CurrentForwardPassInfo], loop: LoopLayout | None, n_next_iter: int,
 ) -> list[InputMetadata]:
     """Per row, ``InputMetadata`` carrying its own copy of the loop counters.
 
     The first ``n_next_iter`` rows run one iteration past the shared
-    counters in ``loop_name``; the rest run at them. A copy, not a view: the
+    counters in ``loop``; the rest run at them. A copy, not a view: the
     shared counters move when the in-flight step is routed, which can happen
     while this step is being prepared.
     """
-    counts = list(map(dict.copy, map(_LOOP_COUNTS, infos)))
-    if loop_name is not None:
-        for c in counts[:n_next_iter]:
-            c[loop_name] = c.get(loop_name, 0) + 1
+    if loop is None:
+        counts = list(map(dict.copy, map(_LOOP_COUNTS, infos)))
+    else:
+        counts = list(map(loop.advance, map(_LOOP_COUNTS, infos[:n_next_iter])))
+        counts.extend(map(dict.copy, map(_LOOP_COUNTS, infos[n_next_iter:])))
     return list(map(
         tuple.__new__, repeat(InputMetadata), zip(repeat(_NO_STREAM_CHUNKS), counts),
     ))

@@ -53,7 +53,8 @@ class RepeatingSteps:
         repeats, why = self._step_repeats.ceiling(
             speculation, max(in_chain, int(owes_run)),
             lambda: self._graph_runtime.loop_room(
-                batch.node_name, batch.graph_walk, speculation.loop_name,
+                batch.node_name, batch.graph_walk,
+                self._innermost_loop_by_node[(batch.graph_walk, batch.node_name)],
                 list(speculation.continuing_rids), pending.batch.repeats,
                 self._step_repeats.config(batch.node_name).past_cap,
             ),
@@ -126,7 +127,7 @@ class RepeatingSteps:
             return repeats
         ctx = ProducerWalkCtx(producer_walk=batch.graph_walk, node=batch.node_name)
         metadata = speculation.node_batch.per_request_input_metadata
-        loop = speculation.loop_name
+        loop = self._innermost_loop_by_node.get((batch.graph_walk, batch.node_name))
         for rid in speculation.continuing_rids:
             meta = metadata.get(rid)
             iters = dict(meta.dynamic_loop_iter_counts) if meta else {}

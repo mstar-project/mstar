@@ -321,7 +321,8 @@ class SpeculationBuilder:
             ctx.request_state, ctx.streams, node_name=spec_node, batch_partition=pending.partition,
             per_request_inputs=per_request_inputs,
             increment_loop_rids=continuing if spec_target.is_new_loop_iter else None,
-            increment_loop_name=spec_target.loop_name
+            increment_loop=(ctx.graph_runtime.loop_layout(spec_target.graph_walk, spec_target.loop_name)
+                            if spec_target.is_new_loop_iter else None),
         )
         spec_node_batch = make_executing_batch(
             ctx.streams, node_name=spec_node,
@@ -386,7 +387,7 @@ class SpeculationBuilder:
         infos = self._ctx.request_state.fwd_infos(request_ids, pending.partition)
         metadata = loop_counter_snapshots(
             infos,
-            spec_target.loop_name if spec_target.is_new_loop_iter else None,
+            self._ctx.graph_runtime.loop_layout(walk, spec_target.loop_name) if spec_target.is_new_loop_iter else None,
             n_next_iter=len(continuing),
         )
         inputs = DeferredRowInputs(request_ids)

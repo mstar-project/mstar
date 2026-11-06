@@ -7,6 +7,7 @@ from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.chunking import ChunkRange
 from mstar.engine.engine import Engine, ExecutingBatch
 from mstar.engine.resources import StepContext
+from mstar.graph.loop_indices import LoopLayout
 from mstar.model.submodule_base import InputMetadata
 from mstar.worker.node_manager_utils import RequestStateManager
 from mstar.worker.stream_buffers import StreamBufferManager
@@ -19,7 +20,7 @@ def input_metadata_and_fwd_info(
     batch_partition: str,
     per_request_inputs: dict[int, NameToTensorList],
     increment_loop_rids: list[int] | None = None,
-    increment_loop_name: str | None = None,
+    increment_loop: LoopLayout | None = None,
 ) -> tuple[dict[int, InputMetadata], dict[int, CurrentForwardPassInfo]]:
     """Per row, its forward-pass info and an ``InputMetadata`` with its own
     copy of the loop counters (one iteration on for ``increment_loop_rids``)
@@ -27,21 +28,20 @@ def input_metadata_and_fwd_info(
     meta = {}
     fwd_info = {}
     possible = streams.possible()
+    continuing = set(increment_loop_rids or ())
     for rid, inputs in per_request_inputs.items():
         req_info = request_state.get_fwd_info(rid, batch_partition)
         fwd_info[rid] = req_info
         stream_chunks = {}
         if possible and (chunks := streams.chunks_for(rid, node_name, inputs)):
             stream_chunks = chunks
-        meta[rid] = InputMetadata(
-            stream_chunks=stream_chunks,
-            dynamic_loop_iter_counts=req_info.dynamic_loop_iter_counts.copy()
+        counts = req_info.dynamic_loop_iter_counts
+        projected = (
+            increment_loop.advance(counts)
+            if increment_loop is not None and rid in continuing
+            else counts.copy()
         )
-
-    if increment_loop_rids is not None and increment_loop_name is not None:
-        for rid in increment_loop_rids:
-            meta[rid].dynamic_loop_iter_counts[increment_loop_name] = \
-                meta[rid].dynamic_loop_iter_counts.get(increment_loop_name, 0) + 1
+        meta[rid] = InputMetadata(stream_chunks=stream_chunks, dynamic_loop_iter_counts=projected)
     return meta, fwd_info
 
 

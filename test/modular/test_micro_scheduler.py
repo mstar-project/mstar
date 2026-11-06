@@ -29,6 +29,7 @@ from mstar.engine.resources.step import (
     AdmitRuntimeError,
     FullAdmitOutcome,
 )
+from mstar.graph.loop_indices import LoopLayout
 from mstar.graph.runtime.base import (
     ColumnarEdgeSpecs,
     PopRidsOutput,
@@ -83,6 +84,9 @@ class _Runtime:
 
     def __init__(self, manager: _Manager):
         self._manager = manager
+
+    def loop_layout(self, walk, name):
+        return LoopLayout(name, descendants=("loop",) if name == "outer" else ())
 
     # what the worker constructs the real runtime with
     combined_walk_of: dict = {}
@@ -1277,14 +1281,18 @@ def test_a_chain_crossing_into_another_group_leaves_the_rows_of_its_old_one():
     assert list(batch.request_to_worker_graph) == ["f0", "f1"]
 
 
-def test_a_chain_crossing_into_another_group_takes_that_groups_rows():
-    _, pick, batch = _step_chain(["c0"], ["f0", "w2"], {"c0": 0, "f0": 0, "w2": 2})
-    assert pick.taken == ["c0", "w2"] and list(batch.request_to_worker_graph) == ["w2"]
+@pytest.mark.parametrize("crossed, continuing_step, fresh", [("loop", 0, "w2"), ("outer", 2, "f0")])
+def test_a_chain_crossing_into_another_group_takes_that_groups_rows(crossed, continuing_step, fresh):
+    _, pick, batch = _step_chain(
+        ["c0"], ["f0", "w2"], {"c0": continuing_step, "f0": 0, "w2": 2}, next_iter_of=crossed,
+    )
+    assert pick.taken == ["c0", fresh] and list(batch.request_to_worker_graph) == [fresh]
 
 
 def test_a_chain_yields_by_the_group_it_crosses_into():
     sched = _scheduler(_StepScheduleEngine(max_bs=16))
     steps = {"c0": 0, "f0": 0, "w2": 2}
+    sched.runtime = _StepManager([], steps).runtime
     sched.backlog[(NODE, WALK)] = _batch(["f0"])
     assert sched.backlog_splits_from(_StepManager([], steps), (NODE, WALK), "c0", "loop") is True
     assert sched.backlog_splits_from(_StepManager([], steps), (NODE, WALK), "c0") is False

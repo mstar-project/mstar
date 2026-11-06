@@ -843,7 +843,7 @@ impl RequestState {
             .map(|d| SpecNode {
                 node: d,
                 is_new_loop_iter: next_iter.contains(&d),
-                loop_id: g.node(d).loop_id,
+                loop_id: if next_iter.contains(&d) { src_loop } else { g.node(d).loop_id },
             })
             .collect()
     }

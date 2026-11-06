@@ -17,6 +17,7 @@ from types import SimpleNamespace
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from mstar.conductor.request_info import CurrentForwardPassInfo  # noqa: E402
+from mstar.graph.loop_indices import LoopLayout
 from mstar.graph.runtime.base import SpeculationOutput  # noqa: E402
 from mstar.worker.micro_scheduler import MicroScheduler  # noqa: E402
 from mstar.worker.speculation import SpeculationBuilder, SpeculationContext  # noqa: E402
@@ -51,7 +52,10 @@ def _context(shared: dict[int, CurrentForwardPassInfo]) -> SpeculationContext:
         get_fwd_info=lambda rid, partition: shared[rid], per_request_info={},
     )
     return SpeculationContext(
-        graph_runtime=SimpleNamespace(get_consumed_edges=lambda *a: []),
+        graph_runtime=SimpleNamespace(
+            get_consumed_edges=lambda *a: [],
+            loop_layout=lambda walk, name: LoopLayout(name),
+        ),
         tensor_manager=None, request_state=request_state, scheduler=_scheduler(),
         streams=StreamBufferManager(request_state, None, []),
     )
@@ -121,3 +125,24 @@ def test_a_transition_into_the_loop_starts_at_its_first_iteration():
 
     assert spec.node_batch.per_request_info_wrapped[1].dynamic_loop_iter_counts == {LOOP: 0}
     assert spec.is_new_iter is False
+
+
+def test_an_outer_restart_resets_inner_inputs_in_both_speculation_paths():
+    from mstar.worker.spec_rows import loop_counter_snapshots
+
+    shared = {1: _info(1, 3), 2: _info(2, 0)}
+    shared[1].dynamic_loop_iter_counts["outer"] = 0
+    shared[2].dynamic_loop_iter_counts["outer"] = 1
+    layout = LoopLayout("outer", descendants=(LOOP,))
+    ctx = _context(shared)
+    ctx.graph_runtime.loop_layout = lambda walk, name: layout
+    target = SpeculationOutput(
+        node_name="dit", graph_walk="t2i", loop_name="outer", is_new_loop_iter=True,
+    )
+    spec = _assemble(ctx, target, [1, 2], [1])
+    columnar = loop_counter_snapshots(list(shared.values()), layout, 1)
+    for rid, columns in zip(shared, columnar, strict=True):
+        expected = {"outer": 1, LOOP: 0}
+        assert spec.node_batch.per_request_info_wrapped[rid].dynamic_loop_iter_counts == expected
+        assert columns.dynamic_loop_iter_counts == expected
+    assert shared[1].dynamic_loop_iter_counts == {"outer": 0, LOOP: 3}

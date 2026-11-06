@@ -11,7 +11,7 @@ from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.distributed.base import ShardingConfig
 from mstar.engine.resources import PublishedInfo
 from mstar.graph.base import GraphEdge
-from mstar.graph.loop_indices import NestedLoopIndices
+from mstar.graph.loop_indices import LoopLayout, NestedLoopIndices
 from mstar.profile.format import GraphTiming, RxInfo, TxInfo
 from mstar.utils.containers import ParallelList
 
@@ -26,11 +26,9 @@ logger = logging.getLogger(__name__)
 class SpeculationOutput(NamedTuple):
     node_name: str
     graph_walk: str
-    # Loop context for the TARGET. Not used for filtering -- prep_spec_rids
-    # owns that -- but the speculative batch carries it, and the postprocess
-    # that follows needs it to match its pending loop stops. The selection
-    # step already computes both, so reporting them avoids a second
-    # ingest_for_speculation (which mutates speculative slot state).
+    # On a loop-back, loop_name is the crossed Loop. Otherwise it is the
+    # target node's enclosing Loop. This identifies the counter advanced by
+    # the transition, including an outer back-edge entering a nested Loop.
     is_new_loop_iter: bool = False
     loop_name: str | None = None
     # The TARGET's output edge names, same as PopRidsOutput carries for a
@@ -995,6 +993,11 @@ class GraphRuntime(PhasedPostprocess, ABC):
         for the speculative N+1 step, so the node must stay out of the ready
         set until the speculation resolves.
         """
+        pass
+
+    @abstractmethod
+    def loop_layout(self, graph_walk: str, loop_name: str) -> LoopLayout:
+        """The Loop's fixed ancestry and the descendants reset on entry."""
         pass
 
     @abstractmethod

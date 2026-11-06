@@ -1823,6 +1823,17 @@ def test_a_loop_inside_a_loop_runs_every_iteration(nested):
         node = ready[0]
         rt.pop_rids(node, WALK, [rid])
         log.append(node)
+        projected = None
+        if node == "refiner":
+            counts = rt.get_dynamic_loop_iters([rid], "default").values[0]
+            targets = _spec_targets(rt, node, WALK, rid)
+            if counts["refine_loop"] == 0:
+                assert [(t.node_name, t.loop_name) for t in targets] == [("denoiser", "refine_loop")]
+                assert targets[0].is_new_loop_iter
+                projected = rt.loop_layout(WALK, targets[0].loop_name).advance(counts)
+                assert projected == {"refine_loop": 1, "denoise_loop": 0}
+            else:
+                assert not targets, "the outer cap must refuse another inner entry"
         signals = rt.get_output_signals(node, WALK)
         rt.complete_and_route_batch(
             RouteInput(
@@ -1833,6 +1844,8 @@ def test_a_loop_inside_a_loop_runs_every_iteration(nested):
                 num_tensors=[1] * len(signals),
             ),
         )
+        if projected is not None:
+            assert rt.get_dynamic_loop_iters([rid], "default").values[0] == projected
     assert log == [
         "denoiser", "denoiser", "denoiser", "refiner",
         "denoiser", "denoiser", "denoiser", "refiner",

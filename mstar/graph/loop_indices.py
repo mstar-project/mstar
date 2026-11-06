@@ -1,3 +1,4 @@
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 
@@ -38,3 +39,21 @@ class NestedLoopIndices:
             if our_idx < their_idx:
                 return False
         return False
+
+
+@dataclass(frozen=True)
+class LoopLayout:
+    """One Loop's structural context, shared by planning and execution."""
+    name: str
+    ancestors: tuple[str, ...] = ()
+    descendants: tuple[str, ...] = ()
+
+    def advance(self, counts: Mapping[str, int], stride: int = 1) -> dict[str, int]:
+        """Counters after crossing this Loop's back-edge, as graph routing
+        advances the parent and starts each nested Loop afresh.
+        """
+        projected = dict(counts)
+        projected[self.name] = projected.get(self.name, 0) + stride
+        if self.descendants:
+            projected.update(dict.fromkeys(self.descendants, 0))
+        return projected
