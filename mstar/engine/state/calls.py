@@ -342,9 +342,9 @@ def host(h: ArrayHandle, request: int, label: str, layer: int | torch.Tensor) ->
     return fields
 
 
-def position(h: ArrayHandle, request: int, label: str) -> int:
-    """``request``'s next position on ``label``, on the host."""
-    return h.positions.position(request, label)
+def position(h: ArrayHandle, rid_handle: int, label: str) -> int:
+    """The next position on ``label`` of the request at worker handle ``rid_handle``, on the host."""
+    return h.positions.position(rid_handle, label)
 
 
 def positions(h: ArrayHandle) -> torch.Tensor:

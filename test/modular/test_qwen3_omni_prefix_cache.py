@@ -106,6 +106,7 @@ def test_a_cut_vision_walk_cuts_its_masks_and_deepstack_with_the_embeds(thinker)
         "vision_embeds": [torch.randn(6, HIDDEN)], "deepstack": [torch.randn(6, HIDDEN)] * 2,
         "image_grid_thw": [torch.tensor([1, 4, 6])],
     }
+    thinker.node_resources[THINKER_POS].ingest_request(RID)
     whole = _prepare(thinker, "prefill_vision", image)
 
     cut = thinker.split_inputs("prefill_vision", SimpleNamespace(rid_handle=RID), whole, 3, whole.input_seq_len)
@@ -198,6 +199,23 @@ def test_an_images_span_is_what_its_positions_place():
     assert image_span(torch.tensor(grid), 2) == (positions.shape[1] + 2, int(positions.max()) + 2 - start), (
         "the layout's image span disagrees with the positions its walk places"
     )
+
+
+@pytest.mark.parametrize("grid, seconds_per_grid", [((1, 8, 12), None), ((4, 8, 12), 2.0)], ids=["image", "video"])
+def test_vision_positions_match_transformers(grid, seconds_per_grid):
+    hf = pytest.importorskip("transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe")
+    start, per_second = 37, 13.0
+    ours = get_rope_index_vision(
+        torch.tensor(grid), start, per_second, spatial_merge_size=2, seconds_per_grid=seconds_per_grid,
+    )
+
+    # transformers' get_rope_index: a frame group's temporal index is its time, every axis offset by the start
+    t_index = torch.arange(grid[0]).float() * (seconds_per_grid or 1) * per_second
+    grids = torch.tensor([grid])
+    reference = hf.Qwen3OmniMoePreTrainedModelForConditionalGeneration.get_llm_pos_ids_for_vision(
+        None, start, 0, 2, t_index, grids[:, 1], grids[:, 2],
+    )
+    assert torch.equal(ours, reference)
 
 
 _SPECIALS = {
