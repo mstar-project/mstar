@@ -1975,6 +1975,7 @@ The rest are free functions in ``mstar.engine.state``:
 
 .. code-block:: python
 
+   out  = add_read(self.kv, layer, q, k=k, v=v)                            # add, then read, behind one break
    qkv  = causal_conv(self.gdn, layer, qkv, weight=w, bias=b)              # reads and writes `conv`
    core = gated_delta_net(self.gdn, layer, q, k, v, a, b, A_log, dt_bias)  # reads and writes `state`
    p    = position(self.kv, fwd_info.rid_handle, label)                    # a request's next position, on the host
@@ -1983,6 +1984,10 @@ The rest are free functions in ``mstar.engine.state``:
    tokens = sample(self.sampler, logits)      # one token per row, each a fresh draw
    last = at_last_token(self.kv, hidden)      # each row's last token in this step
    ids  = last_sampled(self.sampler)          # each row's last sampled token, for a DeviceLoopback
+
+A layer with nothing traced between its ``add`` and its ``read`` calls ``add_read``, since two breaks
+compile a frame for the gap on every shape. It runs both calls' checks in their order, and refuses an
+array with ``max_len=0``, whose calls a compiled block traces.
 
 On an array that keeps entries, every call that touches state breaks the compiled graph and runs
 eagerly, so model code adds no ``torch.compiler.disable`` of its own. A layer stack calls
