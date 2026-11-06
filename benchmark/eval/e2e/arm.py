@@ -225,15 +225,15 @@ def health_after(before: dict, server: ManagedServer, log_path: Path) -> list[st
     return found
 
 
-def dump_stacks(pgid: int, path: Path) -> None:
-    """Every Python thread's stack in the server's process group (``py-spy dump``), for a case that hung; without
+def dump_stacks(sid: int, path: Path) -> None:
+    """Every Python thread's stack in the server's session (``py-spy dump``), for a case that hung; without
     py-spy, the process list and why there are no stacks. Threads only: a hang at an ``await`` shows an idle event
     loop. Retries with ``sudo -n`` only when the job asks (``compare --stacks-sudo``): on a shared cluster a refused
     ``sudo`` is logged, and often mailed to the admins."""
-    r = subprocess.run(["ps", "-o", "pid=,args=", "-g", str(pgid)], capture_output=True, text=True, check=False)
+    r = subprocess.run(["ps", "-o", "pid=,args=", "-g", str(sid)], capture_output=True, text=True, check=False)
     procs = [ln.strip().split(None, 1) for ln in r.stdout.splitlines() if ln.strip()]
     spy = shutil.which("py-spy", path=base_env()["PATH"])
-    lines = [f"# process group {pgid}: {len(procs)} processes; py-spy: {spy or 'not installed (pip install py-spy)'}"]
+    lines = [f"# session {sid}: {len(procs)} processes; py-spy: {spy or 'not installed (pip install py-spy)'}"]
     if spy and not job.get("stacks_sudo"):
         lines[0] += " (no sudo retry; compare --stacks-sudo adds one where ptrace is restricted)"
     for pid, *args in procs:

@@ -27,6 +27,8 @@ from test_eval_compare import RUN, chat_model, fake_tree, finish, procs_under, w
 from benchmark.eval.e2e import arm, compare, hosts, report, trees  # noqa: E402
 from benchmark.eval.e2e import manifest as mf  # noqa: E402
 
+pytestmark = pytest.mark.usefixtures("no_host_gpus")
+
 SIX = {"whisper_large_tp2": 2, "qwen3omni_thinker_tp2": 3, "cosmos3_nano_sp2": 2, "qwen3tts_1p7b_split": 1,
        "orpheus_pd_disaggregated": 2, "qwen3omni_pd_disaggregated": 3}
 
@@ -202,7 +204,7 @@ def test_a_head_that_hangs_is_cut_at_the_cap_with_stacks_and_fails(tmp_path):
     info = json.loads((out / "head" / "s0" / "startup.json").read_text())["cases"]["text"]
     assert info["hung"] and info["cap_s"] == CAP_S and info["rc"] == "timeout" and info["server_alive_after"] is False
     stacks = (out / "head" / "s0" / "text" / "stacks.txt").read_text()
-    assert stacks.startswith("# process group") and "## pid" in stacks
+    assert stacks.startswith("# session") and "## pid" in stacks
     assert "hung" not in json.loads((out / "base" / "s0" / "startup.json").read_text())["cases"]["text"]
     man = mf.parse({**copy.deepcopy(ONE)})
     row = report.build_rows(tmp_path / "run", man.select("all"), calibration={})[0]
@@ -230,9 +232,12 @@ def test_dump_stacks_retries_with_sudo_only_when_asked(tmp_path, monkeypatch, st
     (bin_dir / "sudo").write_text(f'#!/bin/sh\nprintf "%s\\n" "$*" >> {calls}\necho "Thread 1 (idle)"\n')
     for f in (spy, bin_dir / "sudo"):
         f.chmod(0o755)
+    # Only the fakes: base_env() puts the interpreter's directory first, where a real py-spy may be installed.
+    monkeypatch.setattr(arm, "base_env", lambda: {"PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}"})
     monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
     monkeypatch.setattr(arm, "job", {"stacks_sudo": stacks_sudo})
-    arm.dump_stacks(os.getpgid(0), tmp_path / "stacks.txt")
+    # dump_stacks lists the server's session (``ps -g``), so pass ours: pytest is often not its group's leader.
+    arm.dump_stacks(os.getsid(0), tmp_path / "stacks.txt")
     stacks = (tmp_path / "stacks.txt").read_text()
     assert "## pid" in stacks
     if stacks_sudo:

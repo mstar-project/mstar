@@ -206,6 +206,7 @@ def _engine_with(submodule, policies=None):
     from mstar.engine.engine import Engine
 
     engine = Engine.__new__(Engine)
+    engine._tp_follower_nodes = set()
     engine._submodules = {"LLM": SimpleNamespace(submodule=submodule, resources={}, resident=None)}
     engine._keyed_walks = {}
     engine._resources = {}
