@@ -179,13 +179,16 @@ def compute_end(depth: int) -> None:
 
 
 def pause() -> None:
-    """This thread blocks: a region it is in stops here (a wait isn't the emulator's time)."""
-    if getattr(_tls, "computing", 0) and not FAST:
+    """This thread blocks: a region it is in stops here (a wait isn't the emulator's time), once,
+    however many waits it is in (one inside another: a wait the meet's error path makes)."""
+    _tls.paused = getattr(_tls, "paused", 0) + 1
+    if _tls.paused == 1 and getattr(_tls, "computing", 0) and not FAST:
         _close()
 
 
 def resume() -> None:
-    if getattr(_tls, "computing", 0) and not FAST:
+    _tls.paused -= 1
+    if _tls.paused == 0 and getattr(_tls, "computing", 0) and not FAST:
         _open()
 
 

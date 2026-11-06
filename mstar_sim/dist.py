@@ -154,6 +154,11 @@ def _let_go(group, *tensors: torch.Tensor) -> None:
 
 
 def _meet(group, mine: list[int], replay: bool = False) -> list[list[int]]:
+    with clock.computing():  # the emulator's own work around the wait (a wait isn't: :func:`clock.pause`)
+        return _meet_in(group, mine, replay)
+
+
+def _meet_in(group, mine: list[int], replay: bool) -> list[list[int]]:
     """Meet the group's other ranks at a collective (``replay``: a graph's replay) and return
     every rank's descriptor. Blocks until they all come, as the GPU's kernel does
     (:func:`_watched`). A mismatch aborts (NCCL's behaviour there is undefined: a hang or
@@ -351,6 +356,10 @@ def _collective(name: str, family: str, primitive: str | None):
 
     @functools.wraps(real)
     def call(*args, **kwargs):
+        with clock.computing():  # the emulator's own work around any wait in it
+            return calling(*args, **kwargs)
+
+    def calling(*args, **kwargs):
         tensors = _sim_tensors(args, kwargs)
         bound = sig.bind(*args, **kwargs)
         bound.apply_defaults()

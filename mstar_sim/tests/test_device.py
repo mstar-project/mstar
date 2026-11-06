@@ -1386,6 +1386,27 @@ def test_a_collective_starts_at_the_latest_ranks_stream(late):
         assert spans["1"] >= 0.95, out
 
 
+def test_a_collectives_own_bookkeeping_is_the_emulators():
+    """What the emulator does around a collective (its descriptor, the meet, the pairing check) is
+    no host time of mstar's: a run of all-reduces with nothing else costs a host a few us each."""
+    rank = """
+        import torch.distributed as dist
+        dist.init_process_group("nccl", init_method="file://" + TMP + "/group", rank=%d, world_size=2)
+        x = torch.empty(1 << 14, device="cuda")
+        barrier()
+        for _ in range(20):
+            dist.all_reduce(x)
+        start = time.perf_counter()
+        for _ in range(300):
+            dist.all_reduce(x)
+        print((time.perf_counter() - start) / 300)
+        dist.destroy_process_group()
+    """
+    outs = run_deployment(rank % 0, rank % 1)
+    each = [float(out.split()[-1]) for out in outs]
+    assert max(each) < 120e-6, each  # (250 us when it was mstar's)
+
+
 def test_a_native_process_holds_the_deployment_only_while_it_works():
     """The Rust frontend's shape: a child no patch reaches, watched by the process that started
     it. Its work takes real time on the deployment's clock, a peer's deadline can't pass it,
