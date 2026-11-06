@@ -125,20 +125,18 @@ hold 64 requests (12 cross-attention pages and 4 self-attention pages each),
 and the model refuses at startup a cap they cannot hold. Requests past the cap
 wait in the conductor. Qwen3-ASR's requests vary far more in size: a 20 minute
 file holds about 122 pages of 128 tokens for its prompt and up to 32 more for
-its transcript, so the shipped config's 2048 pages (``kv_cache.max_num_pages``)
-hold about 13 of them at full size at once. More concurrent long files than
-the pool holds offload to the host pool and, once that is full too, wait on
-each other until they time out: 16 concurrent single-window 20 minute files
-stalled on 2048 pages, and peaked at 2352 pages with 4096 in the pool.
+its transcript, while a 30 s window holds about 4. ``qwen3_asr.yaml`` sizes
+its pools for an 80 GB H100 (``kv_cache.max_num_pages: 3500``, peaking near
+74300 MiB in all under load, and ``cpu_offload_pages: 1536``) and caps Qwen3-ASR at 64
+concurrent requests, which any mix of windows fits and which is what long-form
+``parallel`` throughput needs.
 
-``qwen3_asr.yaml`` and ``qwen3_asr_split.yaml`` therefore cap Qwen3-ASR at 12
-concurrent requests, which any mix of files up to 20 minutes fits. The cap costs short-utterance
-throughput: on LibriSpeech test-clean (one H200, Qwen3-ASR 1.7B) RTFx was
-about 420 at 8 concurrent requests, 900 at 32 and 1280 at 64. A deployment
-that only serves short audio can raise ``max_concurrent_requests`` (64 fits
-the default pool); one that serves many long files at once can raise
-``kv_cache.max_num_pages`` with the cap. Admission that sizes the cap by each
-request's pages instead is planned.
+The cap does not bound long whole files. Admission reserves only a request's
+prompt, so more concurrent 20 minute files than the pools hold offload to the
+host pool and, once that is full too, wait on each other until they time out.
+A deployment that takes bursts of long whole files should send them with
+``long_form="parallel"``, lower the cap, or raise the pools with it.
+``qwen3_asr_split.yaml`` keeps its cap of 12.
 
 Both decode loops stream their transcript token by token. A decode step
 keeps its rows' tokens on the device for the next step (the sampler's device
