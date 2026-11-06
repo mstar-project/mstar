@@ -351,10 +351,12 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        long prompts take (a long-context prefill). Each entry is sent as many
        times at once as the most data-parallel replicas any of the model's worker
        graphs is served by (the replicas the conductor picks from; a node group no
-       walk places adds none), so every replica warms. When some worker graph has
-       fewer replicas than that, such as one DiT instance beside a replicated VAE,
-       the entry first runs once alone, so that graph also warms its one-request
-       shape before the copies reach it together. A malformed or failing warmup
+       walk places adds none). The conductor's pick (least loaded, ties to the
+       replica picked longest ago) puts a group's copies on every one of its
+       replicas in whatever order they finish, so every replica warms. When some
+       worker graph has fewer replicas than that, such as one DiT instance beside a
+       replicated VAE, the entry first runs once alone, so that graph also warms its
+       one-request shape before the copies reach it together. A malformed or failing warmup
        is logged and skipped.
    * - ``dist_timeout_s``
      - *(optional)* Timeout in seconds for the NCCL world group and its parallel
@@ -535,8 +537,9 @@ replica. The conductor picks it per request, at ingest, as the replica with the 
 cost: ``routing_weights.load`` times the live requests on the replica (counted per set of
 groups that pick together, for each request with a partition on them that is not done at
 ingest), plus the price of what the conductor predicts about the request there. Ties go
-at random. Every term is in request-equivalents. Groups whose replicas sit on the same
-ranks, replica for replica, take one pick together.
+to the replica picked longest ago, so requests that never overlap still take turns. Every
+term is in request-equivalents. Groups whose replicas sit on the same ranks, replica for
+replica, take one pick together.
 
 Today the one prediction is the KV prefix cache's, on the replicas that run any walk a
 KV label keys the cache on (``kv_labels``): ``routing_weights.prefix``

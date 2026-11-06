@@ -155,8 +155,9 @@ def test_hf_file_references_resolve_from_the_cache(monkeypatch) -> None:
 
 
 def test_warmup_reaches_every_data_parallel_replica(tmp_path) -> None:
-    """One concurrent copy of each warmup per replica, so the conductor's
-    least-loaded placement warms every replica, not a random one. Replicas are
+    """One concurrent copy of each warmup per replica, so the conductor's pick
+    (least loaded, ties to the replica picked longest ago) warms every replica,
+    whatever order the copies finish in. Replicas are
     counted from the model's worker graphs, the ones the conductor picks from:
     the most and the fewest any of them is served by."""
     from test_startup_graph_validation import _config, _llm, _ToyModel
