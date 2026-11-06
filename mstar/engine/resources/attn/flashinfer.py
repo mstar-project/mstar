@@ -25,7 +25,7 @@ from mstar.engine.resources.attn.wrappers import (
     fmha_decode_applies,
 )
 from mstar.engine.resources.base import CGSlotKey
-from mstar.engine.resources.context_parallel import KeyRows, OwnTokensKernel, RingAttentionWrapper
+from mstar.engine.resources.context_parallel import KeyRows, OwnTokensKernel, RingAttentionWrapper, SPPlacement
 from mstar.engine.resources.kv.config import PagedKVConfig
 from mstar.engine.resources.kv.plan import KVPlanOutputs
 from mstar.engine.resources.spec import CombinedSplit
@@ -109,15 +109,33 @@ class FlashInferManager(PlacedAttention):
                 "attention over context-parallel KV pool %r decodes on FlashInfer's paged kernel although "
                 "decode_fmha is on: the merge needs each partial's lse", self._kv_cache_name,
             )
-        if self._wrapper_kv_kwargs["backend"] == "auto":
-            if current_platform.has_cuda_capability(10, 0, device=self._device):
-                # from SM100 auto can send short rows to cuDNN, whose lse the merge isn't known to
-                # read right (`_check_window_pool` resolves it the same way)
-                self._wrapper_kv_kwargs["backend"] = "fa2"
-                logger.info(
-                    "attention over context-parallel KV pool %r plans on fa2 for flashinfer_backend 'auto'",
-                    self._kv_cache_name,
-                )
+        over_sp = isinstance(self._placement, SPPlacement)
+        capability = current_platform.cuda_capability(self._device)
+        # FlashInfer has fa3 for SM90 only (`_check_window_pool`)
+        fa3 = capability is not None and capability[0] == 9
+        if capability is not None and capability >= (10, 0) and self._wrapper_kv_kwargs["backend"] == "auto":
+            # from SM100 auto can send short rows to cuDNN, whose lse the merge isn't known to
+            # read right (`_check_window_pool` resolves it the same way)
+            self._wrapper_kv_kwargs["backend"] = "fa2"
+            logger.info(
+                "attention over context-parallel KV pool %r plans on fa2 for flashinfer_backend 'auto'",
+                self._kv_cache_name,
+            )
+        # one SP-placed server hung at its first 32k prefill on fa2 and the cause isn't known. Read
+        # from the config and the GPU, so every rank of the node decides alike
+        if over_sp and self._wrapper_kv_kwargs["backend"] == "fa2" and fa3:
+            raise ValueError(
+                f"attention over KV pool {self._kv_cache_name!r}: flashinfer_backend 'fa2' is refused over an "
+                "SP-placed pool on SM90 after an unexplained one-off lockstep hang in its prefill; use 'auto' "
+                "or 'fa3'"
+            )
+        if (over_sp and capability is not None and not fa3
+                and self._wrapper_kv_kwargs["backend"] in ("auto", "fa2")):
+            logger.warning(
+                "attention over SP-placed KV pool %r prefills on FlashInfer's fa2 kernel, the only one a placed "
+                "pool allows off SM90; an unexplained one-off lockstep hang in an fa2 prefill is still open",
+                self._kv_cache_name,
+            )
         self._wrapper_kv_kwargs.update(geometry)
         cfg = self._kv_config
         self._new_kwargs = dict(

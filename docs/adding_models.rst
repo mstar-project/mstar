@@ -2654,8 +2654,11 @@ checks these rules against ``node_groups`` before it starts a worker. ``max_num_
 logical pages, so raise it by ``P`` to use the memory placement frees (the pool logs its bytes per
 rank). Every resource over the pool must support it, or loading fails naming the one that doesn't.
 FlashInfer attention (``flashinfer``) with ``flashinfer_backend`` ``auto``, ``fa2`` or ``fa3``
-(``auto`` runs as ``fa2`` from SM100), RoPE positions and the recurrent state pool (GDN, KDA; the
-same state on every SP partner) do; dense, flex, XPU and MLA (``flashinfer_mla``) attention,
+(``auto`` runs as ``fa2`` from SM100; after an unexplained one-off lockstep hang in an ``fa2``
+prefill over an SP-placed pool, ``fa2`` is refused there on SM90, where ``auto`` prefills on
+``fa3``; where FlashInfer has no ``fa3`` (below SM90 and from SM100), ``auto`` and ``fa2`` both
+prefill on ``fa2`` and warn at startup), RoPE positions and the recurrent state pool (GDN, KDA;
+the same state on every SP partner) do; dense, flex, XPU and MLA (``flashinfer_mla``) attention,
 cross-attention, DSA and ``sliding_window`` don't, and a ring or bounded KV pool can't set the key.
 A decode/prefill ``splits`` and ``decode_fmha`` are ignored over a placed pool, and a node over
 one plans on the host rather than resident (``resident_planning``). A node that captures a step
