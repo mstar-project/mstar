@@ -8,7 +8,7 @@ import queue
 import threading
 import time
 from collections import deque
-from collections.abc import Callable, Collection
+from collections.abc import Callable, Collection, Container
 from concurrent.futures import Future
 from dataclasses import dataclass, field
 from functools import cached_property
@@ -199,6 +199,32 @@ def unlink_files(file_paths: dict[str, list[str]] | None) -> None:
                 os.unlink(path)
             except OSError:
                 pass
+
+
+def _text_usage(tokens: torch.Tensor, stop_ids, prompt_tokens: int | None) -> dict:
+    """A text chunk's usage metadata: its token count, the prompt's, and whether
+    its last token is a stop id."""
+    usage = {"tokens": tokens.numel()}
+    if prompt_tokens is not None:
+        usage["prompt_tokens"] = prompt_tokens
+    if stop_ids is not None and tokens.numel():
+        # tolist keeps the GIL; a torch op (flatten, indexing, int) releases it, and with the
+        # event loop busy each release waits out the switch interval (~5 ms) to get it back
+        last = tokens.tolist()
+        while isinstance(last, list):
+            last = last[-1]
+        usage["stop_token"] = last in stop_ids
+    return usage
+
+
+def _token_usage(value: int, stop_ids, prompt_tokens: int | None) -> dict:
+    """``_text_usage`` of one inline token, without a tensor."""
+    usage = {"tokens": 1}
+    if prompt_tokens is not None:
+        usage["prompt_tokens"] = prompt_tokens
+    if stop_ids is not None:
+        usage["stop_token"] = value in stop_ids
+    return usage
 
 
 def _preprocess_loop(**kwargs):
@@ -606,6 +632,8 @@ class RequestOutputState:
     # A video_frame chunk can carry several frames, so this advances by
     # frame_count rather than chunks.
     frame_index: int = 0
+    # the prompt's token count, for the API's usage
+    prompt_tokens: int | None = None
 
 
 class EncodedOutput(NamedTuple):
@@ -966,7 +994,10 @@ class PreprocessWorkerThread:
             call.held.append(HeldItems(self._store_held(input.request_id, stream_items), None))
 
         self.request_model_kwargs[input.request_id] = model_kwargs
-        self.request_output_state[input.request_id] = RequestOutputState()
+        prompt_ids = tensors.get("text_inputs") if self.model is not None else None
+        self.request_output_state[input.request_id] = RequestOutputState(
+            prompt_tokens=sum(t.numel() for t in prompt_ids) if prompt_ids else None,
+        )
         preprocess_only = getattr(self.model, "PREPROCESS_ONLY_KWARGS", ())
         conductor_kwargs = {k: v for k, v in model_kwargs.items() if k not in preprocess_only}
         msg = ConductorMessage(
@@ -1490,6 +1521,13 @@ class PreprocessWorkerThread:
             state.order[tensor_info.uuid] = (state.next_sequence, result.loop_indices)
             state.next_sequence += 1
 
+    @cached_property
+    def _text_stop_ids(self) -> Container[int] | None:
+        """The stop ids the model's ``text_output`` declares, read on the first
+        text chunk; None when it names none."""
+        text = self.model.text_output() if self.model is not None else None
+        return (text.stop_token_ids or None) if text is not None else None
+
     def _emit_inline_tokens(self, item: InlineTokens) -> None:
         """Postprocess a frame's inline values in one model call and queue each
         request's chunk, in arrival order with its tensor results."""
@@ -1513,6 +1551,7 @@ class PreprocessWorkerThread:
         share = (time.perf_counter() - start) / len(rids) if start is not None and rids else 0.0
         postprocess_s = share
         states = self.request_output_state
+        is_text = item.modality == "text"
         for i, request_id in enumerate(rids):
             state = states.get(request_id)
             if state is None:
@@ -1532,6 +1571,8 @@ class PreprocessWorkerThread:
                 metadata = {} if not logprobs or logprobs[i] is None else {"logprobs": [logprobs[i]]}
                 if self._wants_token_ids(request_id, item.modality):
                     metadata["token_ids"] = [values[i]]
+                if is_text:
+                    metadata.update(_token_usage(values[i], self._text_stop_ids, state.prompt_tokens))
                 self._queue_completed_output(
                     request_id,
                     sequence,
@@ -1622,6 +1663,12 @@ class PreprocessWorkerThread:
 
         chunk_metadata = self.tensor_uuid_to_metadata_per_request[request_id][uuid] or {}
         chunk_metadata = self._with_token_ids(request_id, modality, tensor, chunk_metadata)
+        if modality == "text" and self.model is not None:
+            chunk_metadata = {
+                **chunk_metadata,
+                **_text_usage(tensor, self._text_stop_ids,
+                              self.request_output_state[request_id].prompt_tokens),
+            }
         # Audio is emitted as headerless 16-bit PCM; surface the
         # model's output sample rate + channel count so clients can
         # wrap it.

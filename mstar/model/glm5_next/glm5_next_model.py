@@ -5,8 +5,8 @@ import logging
 from pathlib import Path
 
 import torch
-from jinja2 import TemplateError
 
+from mstar.api_server.openai.glm_chat import TEMPLATE_KWARGS
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardConductorMetadata
 from mstar.engine.resources import (
@@ -50,9 +50,12 @@ from mstar.model.glm5_next.config import (
     SAMPLER,
     Glm5NextModelConfig,
 )
-from mstar.model.multimodal import TEXT, PromptPart, chat_turns
+from mstar.model.multimodal import render_chat_template
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.model.utils import (
+    ByteIdDetokenizer,
+    ByteLevelDetokenizer,
+    TextOutput,
     capture_ladder,
     check_loaded,
     load_snapshot_tokenizer,
@@ -70,6 +73,9 @@ class Glm5NextModel(Model):
 
     # the conductor builds the fused-MoE align op before spawning the workers
     prebuild_fused_moe = True
+    # read only by process_prompt's template, and kept off the conductor's wire,
+    # which cannot carry every number a tool schema may hold (2**64)
+    PREPROCESS_ONLY_KWARGS = ("messages", "tools", "chat_template_kwargs")
 
     def __init__(
         self,
@@ -143,7 +149,6 @@ class Glm5NextModel(Model):
         # "byte" maps UTF-8 bytes to token ids for reduced serve (no HF IO).
         self._tokenizer_mode = kwargs.get("tokenizer_mode", "hf")
         self._tokenizer = None
-        self._detokenizer = None
         self._submodule_cache: dict[str, NodeSubmodule | None] = {}
 
     @property
@@ -429,7 +434,8 @@ class Glm5NextModel(Model):
             byte_ids = [min(b, vocab - 1) for b in prompt.encode("utf-8")] or [0]
             input_ids = torch.tensor(byte_ids, dtype=torch.long)
         elif getattr(self.tokenizer, "chat_template", None):
-            input_ids = self._render_chat(prompt, kwargs.get("prompt_parts"))
+            input_ids = render_chat_template(
+                self.tokenizer, prompt, kwargs.get("prompt_parts"), kwargs, TEMPLATE_KWARGS)
         else:
             input_ids = self.tokenizer(prompt, return_tensors="pt").input_ids[0]
 
@@ -462,30 +468,6 @@ class Glm5NextModel(Model):
             {"text_inputs": [input_ids.to(torch.long)]}, {"kv_layout": {KV_CACHE: {"main": layout}}},
         )
 
-    def _render_chat(self, prompt: str, prompt_parts: list[PromptPart] | None) -> torch.Tensor:
-        """The chat's turns, each in its own role, through the checkpoint's template, which
-        adds ``[gMASK]<sop>`` and opens the assistant turn. An entrypoint with no messages
-        sends the prompt as one user turn."""
-        parts = prompt_parts or [PromptPart(modality=TEXT, text=prompt, role="user")]
-        messages = [
-            {"role": turn.role,
-             "content": "\n".join(p.text or "" for p in turn.parts if p.modality == TEXT)}
-            for turn in chat_turns(parts)
-        ]
-        try:
-            input_ids = self.tokenizer.apply_chat_template(
-                messages,
-                add_generation_prompt=True,
-                return_tensors="pt",
-                # transformers 5.x defaults return_dict=True (a BatchEncoding);
-                # keep the bare-tensor return so [0] selects the row
-                return_dict=False,
-            )
-        except TemplateError as exc:
-            # a chat the template refuses is the client's to fix: a 400, not a 500
-            raise ValueError(f"GLM-5.3's chat template refused the chat: {exc}") from exc
-        return input_ids[0]
-
     def max_decode_steps(self) -> int:
         """Decode iterations a one-token prompt can run before its context
         reaches the context limit or its cache rows reach kv_rows (an MTP step
@@ -511,6 +493,18 @@ class Glm5NextModel(Model):
     # Model ABC: postprocess
     # -------------------------------------------------------------------
 
+    # built on first use: the tokenizer it reads loads lazily
+    _text_output: TextOutput | None = None
+
+    def text_output(self) -> TextOutput:
+        if self._text_output is None:
+            # a reduced model's byte ids never touch the HF tokenizer
+            detokenizer = (
+                ByteIdDetokenizer() if self._tokenizer_mode == "byte" else ByteLevelDetokenizer(self.tokenizer)
+            )
+            self._text_output = TextOutput(detokenizer, frozenset(self.config.eos_token_ids))
+        return self._text_output
+
     def postprocess(
         self,
         output: torch.Tensor,
@@ -518,19 +512,7 @@ class Glm5NextModel(Model):
         **kwargs,
     ) -> bytes:
         if modality == "text":
-            token_ids = output.flatten().tolist()
-            if self._tokenizer_mode == "byte":
-                # Synthetic reduced models emit arbitrary byte ids; never
-                # touch the HF tokenizer.
-                return bytes((t & 0xFF) for t in token_ids)
-            # The tokens' raw bytes (byte-level BPE): a character split across
-            # tokens reaches the client whole, where decoding each token alone
-            # gives U+FFFD. Special tokens drop, as with skip_special_tokens.
-            if self._detokenizer is None:
-                from mstar.model.utils import ByteLevelDetokenizer
-
-                self._detokenizer = ByteLevelDetokenizer(self.tokenizer)
-            return self._detokenizer.to_bytes(token_ids)
+            return super().postprocess(output, modality, **kwargs)
         raise ValueError(f"Unsupported modality for GLM-5.3-Flash: {modality!r}")
 
     # -------------------------------------------------------------------
