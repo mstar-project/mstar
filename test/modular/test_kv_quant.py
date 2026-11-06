@@ -220,6 +220,19 @@ def test_observer_and_calibrate_round_trip(tmp_path):
     torch.testing.assert_close(scales.k[0], 1.5 * torch.tensor([10, 5, 20, 5]) / 448)
 
 
+def test_replicas_on_the_same_tp_rank_merge_to_the_max(tmp_path):
+    """Data-parallel replicas each write their own file for TP rank 0; neither is lost."""
+    obs = tmp_path / "obs"
+    for replica, value in enumerate((3.0, 7.0)):
+        o = KVObserver(str(obs), "kv", 1, 1, 1, 0, 1, CPU)
+        # one process stands in for two: a replica's file is its pid's
+        o.path = str(obs / f"kv.rank0.{1000 + replica}.pt")
+        k = torch.full((1, 1, 2), value)
+        o.observe(0, k, k)
+        o.save(force=True)
+    assert merge_observed(str(obs), "kv")[:, 0, 0].tolist() == [7.0, 7.0]
+
+
 def test_observer_ignores_non_finite_and_resets(tmp_path):
     o = KVObserver(str(tmp_path), "kv", 1, 2, 2, 0, 1, CPU)
     # a head whose write holds NaN or inf is skipped for that write

@@ -738,7 +738,7 @@ Worker scheduling
    * - ``MSTAR_KV_OBSERVE``
      - unset
      - A directory: every paged KV cache records the per-layer, per-head amax of the K/V
-       it stores, into ``<dir>/<resource>.rank<r>.pt`` (``observe_dir`` in
+       it stores, into ``<dir>/<resource>.rank<r>.<pid>.pt`` (``observe_dir`` in
        ``mstar.engine.resources.kv.quant``), for
        ``python -m mstar.engine.resources.kv.calibrate`` to turn into static fp8 KV scales
        (see :doc:`serving`). Calibration only: it adds a reduction per layer per step.

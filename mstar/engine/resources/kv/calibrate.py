@@ -1,7 +1,7 @@
 """Static KV scales from observed amax.
 
-1. Serve the unquantized deployment with ``MSTAR_KV_OBSERVE=<dir>`` (eagerly, so
-   no padding rows are observed) and send it calibration prompts.
+1. Serve the unquantized deployment with ``MSTAR_KV_OBSERVE=<dir>`` and send it
+   calibration prompts. Captured steps' padding rows are observed too.
 2. Stop it, then ``python -m mstar.engine.resources.kv.calibrate <dir> --resource kv --out scales.safetensors``.
 3. Set ``resources.kv.quant: {format: fp8_e4m3, scales: static, scales_path: scales.safetensors}``.
 """
@@ -17,7 +17,8 @@ from mstar.engine.resources.kv.quant import KV_FORMATS, MIN_SCALE, local_heads
 
 
 def merge_observed(obs_dir: str, resource_key: str) -> torch.Tensor:
-    """Every rank's amax, as fp32 [2 (K, V), layers, total kv heads]."""
+    """Every rank's amax, as fp32 [2 (K, V), layers, total kv heads]: the max over every
+    file, so over data-parallel replicas too."""
     paths = sorted(glob.glob(os.path.join(obs_dir, f"{resource_key}.rank*.pt")))
     if not paths:
         raise FileNotFoundError(f"no observations for {resource_key!r} in {obs_dir}")
@@ -27,7 +28,7 @@ def merge_observed(obs_dir: str, resource_key: str) -> torch.Tensor:
     if len(world_size) != 1 or len(total) != 1:
         raise ValueError(f"observations in {obs_dir} come from different deployments")
     world_size, total = world_size.pop(), total.pop()
-    ranks = sorted(r["rank"] for r in records)
+    ranks = sorted({r["rank"] for r in records})
     if ranks != list(range(world_size)):
         raise ValueError(f"observations cover ranks {ranks} of {world_size}")
     _, layers, _ = records[0]["amax"].shape

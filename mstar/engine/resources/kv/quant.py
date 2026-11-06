@@ -193,9 +193,11 @@ def observe_dir() -> str | None:
 class KVObserver:
     """Per layer and local head amax of written K and V, saved for ``kv.calibrate``.
 
-    Reset after capture sizing, whose dummy inputs are not activations. A replay's
-    padding rows are still observed; they repeat real tokens, so they move amax little.
-    """
+    Reset after capture sizing, whose dummy inputs are not activations. A captured step
+    writes its padding rows too, so they are observed with the real ones.
+
+    One file per process (``<key>.rank<tp rank>.<pid>.pt``): data-parallel replicas
+    share TP ranks, and ``merge_observed`` takes the max over all of them."""
 
     # at most one save per this many seconds
     SAVE_INTERVAL = 2.0
@@ -204,7 +206,7 @@ class KVObserver:
         self, out_dir: str, resource_key: str, num_layers: int, num_heads: int,
         total_heads: int, rank: int, world_size: int, device: torch.device,
     ):
-        self.path = os.path.join(out_dir, f"{resource_key}.rank{rank}.pt")
+        self.path = os.path.join(out_dir, f"{resource_key}.rank{rank}.{os.getpid()}.pt")
         self.amax = torch.zeros(2, num_layers, num_heads, dtype=torch.float32, device=device)
         self._meta = dict(resource_key=resource_key, total_heads=total_heads, rank=rank, world_size=world_size)
         self._lock = threading.Lock()
