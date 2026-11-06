@@ -18,7 +18,7 @@ import torch
 pytest.importorskip("safetensors")
 from safetensors.torch import save_file  # noqa: E402
 
-from mstar.engine.resources.base import EngineResourceInfo, Resource  # noqa: E402
+from mstar.engine.resources.base import EngineResourceInfo, Residency, Resource  # noqa: E402
 from mstar.engine.resources.lora import LoraModuleRef, LoraReqConfig, LoraSpec, LoraStep, LoraTarget  # noqa: E402
 from mstar.engine.resources.lora.pool import ZERO_SLOT, LoraAdapterPool  # noqa: E402
 from mstar.engine.resources.lora.store import LoraAdapterStore  # noqa: E402
@@ -474,7 +474,7 @@ def test_a_lora_refusal_does_not_look_for_an_eviction_victim(caplog):
     asked = []
     engine = SimpleNamespace(
         evictable=lambda node, resources=None: resources is None or "kv" in resources,
-        reclaimable=lambda *a, **k: asked.append(a) or 0, is_offloaded=lambda *a: False,
+        reclaimable=lambda *a, **k: asked.append(a) or 0, residency=lambda *a: Residency.RESIDENT,
     )
     w.engine_manager = SimpleNamespace(get_engine=lambda node: engine)
     w.scheduler = SimpleNamespace(arrival={1: 0})

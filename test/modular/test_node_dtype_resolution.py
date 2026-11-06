@@ -63,6 +63,9 @@ class _Model:
     def chunking_policy_of(self):
         return {}
 
+    def rebuild_policies(self):
+        return {}
+
     def checkpoint_path(self):
         return None
 
