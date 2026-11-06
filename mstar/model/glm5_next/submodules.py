@@ -30,8 +30,7 @@ from mstar.engine.resources import (
 )
 from mstar.engine.resources.convenience import KDACallable
 from mstar.engine.resources.dsa import sparse_mla
-from mstar.engine.resources.dsa.paged import attn_lens_device
-from mstar.engine.resources.kv.plan import SINK_PAGE
+from mstar.engine.resources.dsa.config import DSAStep
 from mstar.engine.resources.linear_attn.config import LinearAttnStep
 from mstar.engine.resources.recurrent.config import RecurrentStep
 from mstar.model.glm5_next.config import (
@@ -48,15 +47,20 @@ from mstar.model.glm5_next.config import (
     Glm5NextModelConfig,
 )
 from mstar.model.submodule_base import (
+    END_PARTITION,
     ARNodeInputs,
     ARNodeSubmodule,
     BatchedModelOutput,
+    HostRows,
     ModelInputsFromEngine,
     NodeInputs,
 )
 from mstar.utils.h2d import PinnedStager
 
 logger = logging.getLogger(__name__)
+
+# How long a read waits for a verify step's verdict before the process exits
+_VERDICT_DEADLINE_S = 300.0
 
 # Captured prefill shapes when the config names none. They start above the MoE decode path's
 # 64 tokens, since the fused runner routes padding rows safely; 64 apart from 1024 to one
@@ -66,7 +70,6 @@ PREFILL_CAPTURE_BATCH_SIZES = (1, 2, 4)
 
 # The rope slot of a rejected draft row: against a query rope part of ones, a -6.4e5 score term.
 HOLE_KPE = -1.0e4
-_VERDICT_TIMEOUT_S = 120.0
 
 
 def _real_row_values(last: torch.Tensor, values: torch.Tensor) -> torch.Tensor:
@@ -91,6 +94,13 @@ def _shard_best(local: torch.Tensor, first_id: int) -> torch.Tensor:
     return torch.cat([val, (idx + first_id).to(torch.int32)], -1)
 
 
+
+def _upload(stager: PinnedStager, values: list, device: torch.device) -> torch.Tensor:
+    """``values`` on ``device`` in ``stager``'s dtype: one non-blocking copy out of its pinned ring."""
+    out = torch.empty(len(values), dtype=stager.dtype, device=device)
+    stager.copy_(out, values)
+    return out
+
 class Glm5NextLLMSubmodule(ARNodeSubmodule):
     """Embed + 45 hybrid decoder layers + lm_head, one fat TP node, and with MTP the
     layer-45 draft module."""
@@ -110,9 +120,6 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         # MTP: a decode step verifies the last token and k drafts per request
         self.mtp_k = config.mtp_num_draft_tokens
         self._mtp_seq = 0
-        # mtp_trims: the sink page's last row, masked, that a row's spare sparse entries attend
-        self._pad_slot: int | None = None
-        self._pad_kpe: torch.Tensor | None = None
         # accepted-draft counts since the last log line: a histogram over 0..k
         self._mtp_hist = [0] * (self.mtp_k + 1)
         self._mtp_logged = time.monotonic()
@@ -127,13 +134,13 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
 
     @property
     def _dsa(self):
-        """The DSA resource (dsa_long_context), whose ``ctx`` the MLA layers read."""
+        """The DSA resource (dsa_long_context), which plans the step's rows for the MLA layers."""
         return self.node_resources.get(DSA) if self.config.dsa_long_context else None
 
     @property
     def _dsa_ctx(self):
-        """The forward's DSA context, or None (no DSA resource, or none set)."""
-        return self._dsa.ctx if self._dsa is not None else None
+        """The step's DSA plan, or None without the resource."""
+        return self._dsa.current(LABEL) if self._dsa is not None else None
 
     @property
     def mtp_block(self) -> int:
@@ -142,6 +149,11 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
     def bind_node_resources(self, resources: dict) -> None:
         if KV_CACHE in resources:
             self.config.check_long_context(resources[KV_CACHE].kv_cache.page_size)
+            cache = resources[KV_CACHE].layer_view() if self.config.dsa_long_context else None
+            if cache is not None and cache.device.type == "cuda" and cache.dtype != torch.bfloat16:
+                # the DSA kernels take bf16; the torch paths sync with the host and capture nothing
+                raise ValueError(f"dsa_long_context serves a bf16 KV cache on CUDA, not "
+                                 f"{cache.dtype}: set the node's dtype to bfloat16")
         buckets = self.config.prefill_token_buckets or PREFILL_TOKEN_BUCKETS
         if self.config.dsa_long_context and self.config.prefill_graphs and (
                 max(buckets) > sparse_mla.MAX_ROWS):
@@ -149,12 +161,6 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
             raise ValueError(f"dsa_long_context captures prefill buckets up to "
                              f"{sparse_mla.MAX_ROWS} tokens; the largest is {max(buckets)}")
         super().bind_node_resources(resources)
-        if self.config.mtp_trims and KV_CACHE in resources:
-            kv, size = resources[KV_CACHE], resources[KV_CACHE].kv_cache.page_size
-            # nothing writes the sink page's last row in a decode step: padding rows take
-            # its first k + 1
-            self._pad_slot = SINK_PAGE * size + size - 1
-            self._pad_kpe = kv.kv_cache.tensor[:, SINK_PAGE, size - 1, self.config.kv_lora_rank:]
         kda = resources.get(KDA)
         self._kda = None if kda is None else KDACallable(resources[KDA_STATE], kda)
 
@@ -197,27 +203,16 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         if pool is None:
             return None
         # A prefill takes only the slots free now, so a TP follower that refuses one has
-        # diverged from rank 0. With prefill graphs, also no more rows than one captures: an
-        # eager prefill's last layer would compile the MoE decode kernels for its row count.
+        # diverged from rank 0. The engine also holds a captured prefill to its largest
+        # graph's rows: past them, the eager last layer would compile the MoE decode
+        # kernels for its row count mid-serve.
         if graph_walk == "prefill":
-            rows = self._captured_prefill_rows()
-            free = pool.num_free_slots
-            return free if rows is None else min(free, rows)
+            return pool.num_free_slots
         return pool.config.usable_slots
 
     def batch_cap_varies(self, graph_walk: str) -> bool:
         # the prefill cap follows the free KDA slots
         return graph_walk == "prefill"
-
-    def _captured_prefill_rows(self) -> int | None:
-        """The most rows a captured prefill takes, or None while prefill runs eager."""
-        if not self.config.prefill_graphs or not self._kda_prefill_capturable():
-            return None
-        # no prefill graph (reference MoE, the MLA fallback): an eager prefill is not held
-        # to the captured rows
-        if getattr(self, "_prefill_captured", True) is False:
-            return None
-        return max(self.config.prefill_capture_batch_sizes or PREFILL_CAPTURE_BATCH_SIZES)
 
     def get_accelerator_graph_configs(
         self, device: torch.device, tp_world_size: int = 1,
@@ -227,7 +222,6 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
                 "glm5_next: reference MoE dispatch active; decode runs eager "
                 "(set moe_quant_kernel=auto for the capturable fused kernel)"
             )
-            self._prefill_captured = False
             return []
         # The MLA fallback bakes page indices into its plan, so a captured
         # replay would attend the capture's pages (the resource refuses).
@@ -237,15 +231,6 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
                 "glm5_next: MLA is on the SDPA fallback, which cannot be "
                 "captured; decode runs eager"
             )
-            self._prefill_captured = False
-            return []
-        kv = self.node_resources.get(KV_CACHE)
-        if (self.config.dsa_long_context and device.type == "cuda" and kv is not None
-                and kv.layer_view().dtype != torch.bfloat16):
-            # the DSA kernels take a bf16 cache; the torch paths sync with the host
-            logger.warning("glm5_next: dsa_long_context on a %s cache cannot be captured; "
-                           "decode runs eager", kv.layer_view().dtype)
-            self._prefill_captured = False
             return []
         max_slots = self._kda_max_slots()
         batch_sizes = [
@@ -270,7 +255,7 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
             # captured replay would run the capture's dummy spans.
             logger.warning("glm5_next: fused KDA prefill off; prefill runs eager")
         elif self.config.prefill_graphs:
-            # One graph per (rows, token bucket); a batch past every bucket
+            # One graph per (rows, token bucket); a batch past every token bucket
             # runs eager rather than being split.
             configs.append(PackedAcceleratorGraphConfig(
                 capture_graph_walk="prefill",
@@ -285,10 +270,8 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
                                 or PREFILL_CAPTURE_BATCH_SIZES)
                     if max_slots is None or b <= max_slots
                 ],
-                caps_eager_batch_size=False,
                 compile=False,
             ))
-        self._prefill_captured = any(c.capture_graph_walk == "prefill" for c in configs)
         return configs
 
     # -- dtype discipline -------------------------------------------------
@@ -393,8 +376,10 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
             del steps[SAMPLER]
             steps[KDA] = LinearAttnStep(speculative=True)
         if self.config.dsa_long_context:
-            # every MLA layer attends sparse (the DSA resource): no dense plan over the whole context
+            # every MLA layer attends sparse over the DSA resource's plan, not a dense one; a
+            # verify step's rows move on the device (_trim_on_device)
             del steps[ATTN]
+            steps[DSA] = DSAStep(mtp_trims=self.config.mtp_trims and graph_walk == "decode")
         return SubmoduleStep(
             segments=[
                 Segment(request_id=rid, label=LABEL, span=inp.input_seq_len)
@@ -418,11 +403,6 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
             out["mtp_keep"] = self._mtp_keep(engine_inputs, inputs, out["input_ids"].shape[0])
         if self.mtp_k > 0 and graph_walk == "decode":
             out["mtp_seq"] = self._mtp_stage_seq(engine_inputs)
-        if self.config.dsa_long_context:
-            # the DSA resource stages its rows off the KV plan; the forward opens them
-            out.update(self._dsa.step_inputs(
-                engine_inputs.step.ctx, engine_inputs.captured, LABEL,
-                mtp_trims=self.config.mtp_trims))
         return out
 
     def _mtp_keep(
@@ -438,7 +418,7 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
                 keep[start] = 0.0
             start += inp.input_seq_len
         # staged in fp32 (no bf16 host view), cast on the device
-        return self._keep_stager.to_device(keep, self.lm_head.weight.device).to(self.lm_head.weight.dtype)
+        return _upload(self._keep_stager, keep, self.lm_head.weight.device).to(self.lm_head.weight.dtype)
 
     def _mailbox_key(self, engine_inputs: ModelInputsFromEngine) -> int | None:
         """A captured step's capture slot, None eager: each has its own mailbox, which a
@@ -467,7 +447,7 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
             for row, rid in enumerate(engine_inputs.request_ids):
                 if rid in real:
                     self.request_state(rid).add("mtp_pending", (seq, key, row))
-        return self._long_stager.to_device([seq], self.lm_head.weight.device)
+        return _upload(self._long_stager, [seq], self.lm_head.weight.device)
 
     def _last_rows(self, inputs: list[ARNodeInputs]) -> torch.Tensor:
         """Each row's last token, which a captured prefill reads at a fixed
@@ -476,7 +456,7 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         for inp in inputs:
             end += inp.input_seq_len
             last.append(max(end - 1, 0))  # a padding row repeats the one before
-        return self._int_stager.to_device(last, self.lm_head.weight.device)
+        return _upload(self._int_stager, last, self.lm_head.weight.device)
 
     def _forward(
         self,
@@ -485,23 +465,6 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         input_ids: torch.Tensor,
         last_rows: torch.Tensor | None = None,
         mtp_keep: torch.Tensor | None = None,
-        dsa_inputs: dict[str, Any] | None = None,
-    ) -> torch.Tensor:
-        if self._dsa is not None:
-            self._dsa.ctx = self._dsa.context(dsa_inputs or {})
-        try:
-            return self._forward_inner(graph_walk, engine_inputs, input_ids, last_rows, mtp_keep)
-        finally:
-            if self._dsa is not None:
-                self._dsa.ctx = None
-
-    def _forward_inner(
-        self,
-        graph_walk: str,
-        engine_inputs: ModelInputsFromEngine,
-        input_ids: torch.Tensor,
-        last_rows: torch.Tensor | None,
-        mtp_keep: torch.Tensor | None,
     ) -> torch.Tensor:
         attn = engine_inputs.resources[ATTN]
         sampler = engine_inputs.resources[SAMPLER]
@@ -536,7 +499,7 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         activations stay bounded however long the prompt. Samples each request's last row.
         With MTP each window's rows also run the MTP pass (row i pairs the trunk at i with token
         i + 1); a request's last row runs it again once its token is sampled, and seeds."""
-        ctx = self._dsa.ctx
+        dsa, ctx = self._dsa, self._dsa.current(LABEL)
         kv, kda = engine_inputs.resources[KV_CACHE], engine_inputs.resources[KDA]
         lm, size, total = self.language_model, self.config.prefill_window_tokens, input_ids.shape[0]
         last = [r0 + n - 1 for r0, n, _ in ctx.spans]
@@ -544,41 +507,36 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         split = total > size and len(ctx.spans) != total
         hidden: list[torch.Tensor | None] = [None] * len(last)
         nxt = torch.roll(input_ids, -1) if self.mtp_k > 0 else None
-        try:
-            for start in range(0, total, size if split else total):
-                end = min(start + size, total) if split else total
-                ends = [(i, r - start) for i, r in enumerate(last) if start <= r < end]
-                with contextlib.ExitStack() as scope:
-                    if split:
-                        pieces = [(max(r0, start), min(r0 + n, end), req)
-                                  for r0, n, req in ctx.spans if r0 < end and r0 + n > start]
-                        self._dsa.ctx = ctx.rows(start, end)
-                        scope.enter_context(kv.token_window(start, end, LABEL))
-                        scope.enter_context(kda.token_window(
-                            [(req, b - a) for a, b, req in pieces], LABEL))
-                    rows = self._long_stager.to_device([r for _, r in ends] or [end - start - 1], input_ids.device)
-                    if nxt is None:
-                        out = lm.model(input_ids[start:end], rows=rows)
-                    else:
-                        full = lm.model(input_ids[start:end])
-                        keep = mtp_keep[start:end, None]
-                        lm.mtp(lm.model.embed_tokens(nxt[start:end]) * keep, full)
-                        out = full.index_select(0, rows)
-                for k, (i, _) in enumerate(ends):
-                    hidden[i] = out[k]
-            last_hidden = torch.stack(hidden)
-            new_tokens = sampler.sample(engine_inputs.request_ids, logits=self.lm_head(last_hidden))
-            if nxt is not None:
-                seeds = []
-                for i, r in enumerate(last):  # its MTP row again, now with the sampled token
-                    self._dsa.ctx = ctx.rows(r, r + 1)
-                    with kv.token_window(r, r + 1, LABEL):
-                        embeds = lm.model.embed_tokens(new_tokens[i:i + 1]) * mtp_keep[r:r + 1, None]
-                        seeds.append(lm.mtp(embeds, last_hidden[i:i + 1]))
-                stored = ctx.pos.index_select(0, self._long_stager.to_device(last, ctx.pos.device)) + 1
-                self._mtp_seed(engine_inputs, torch.cat(seeds), new_tokens, stored)
-        finally:
-            self._dsa.ctx = ctx
+        for start in range(0, total, size if split else total):
+            end = min(start + size, total) if split else total
+            ends = [(i, r - start) for i, r in enumerate(last) if start <= r < end]
+            with contextlib.ExitStack() as scope:
+                if split:
+                    pieces = [(max(r0, start), min(r0 + n, end), req)
+                              for r0, n, req in ctx.spans if r0 < end and r0 + n > start]
+                    scope.enter_context(dsa.rows(start, end, LABEL))
+                    scope.enter_context(kv.token_window(start, end, LABEL))
+                    scope.enter_context(kda.token_window(
+                        [(req, b - a) for a, b, req in pieces], LABEL))
+                rows = _upload(self._long_stager, [r for _, r in ends] or [end - start - 1], input_ids.device)
+                if nxt is None:
+                    out = lm.model(input_ids[start:end], rows=rows)
+                else:
+                    full = lm.model(input_ids[start:end])
+                    keep = mtp_keep[start:end, None]
+                    lm.mtp(lm.model.embed_tokens(nxt[start:end]) * keep, full)
+                    out = full.index_select(0, rows)
+            for k, (i, _) in enumerate(ends):
+                hidden[i] = out[k]
+        last_hidden = torch.stack(hidden)
+        new_tokens = sampler.sample(engine_inputs.request_ids, logits=self.lm_head(last_hidden))
+        if nxt is not None:
+            # each request's last MTP row again, now with its sampled token: one pass
+            rows = _upload(self._long_stager, last, input_ids.device)
+            with dsa.pick(last, LABEL), kv.token_rows(rows, LABEL):
+                embeds = lm.model.embed_tokens(new_tokens) * mtp_keep.index_select(0, rows)[:, None]
+                seeds = lm.mtp(embeds, last_hidden)
+            self._mtp_seed(engine_inputs, seeds, new_tokens, ctx.pos.index_select(0, rows) + 1)
         return new_tokens
 
     # -- MTP device side ---------------------------------------------------
@@ -617,30 +575,19 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         pool.scatter_(MTP_HIDDEN, hidden, None)
         pool.scatter_(MTP_DRAFT, self._draft_tokens(hidden, prev)[:, None], None)
         if ends is not None and self.config.mtp_trims:
-            pool.scatter_(MTP_LEN, ends[:, None], None)
+            # MTP_LEN is int64, the DSA positions ``ends`` come from int32
+            pool.scatter_(MTP_LEN, ends.long()[:, None], None)
 
     def _trim_on_device(self, engine_inputs: ModelInputsFromEngine) -> torch.Tensor:
-        """mtp_trims: point this verify step's rows (their positions, and the cache slots their
-        latents and index keys go to) at each request's true rows, ``MTP_LEN`` on. The host's
-        plan, the same on every rank whatever was accepted, stays as made: a captured step masks
-        each row's spare entries, an eager one replans exact rows. Returns each ``MTP_LEN``."""
-        ctx, kv = self._dsa_ctx, engine_inputs.resources[KV_CACHE]
+        """mtp_trims: this verify step's rows start at each request's true rows (``MTP_LEN``),
+        not where the host's plan put them; that plan, the same on every rank whatever was
+        accepted, stays as made, and the DSA resource moves the rows. Spare sparse entries
+        attend a row masked as the holes are. Returns each ``MTP_LEN``."""
         # a padding request reads 0 (the sink holds no state): the sink page's first rows,
         # as planned
         base = engine_inputs.resources[KDA_STATE].gather(MTP_LEN, None)[:, 0]
         pos = (base[:, None] + torch.arange(self.mtp_block, device=base.device)).view(-1)
-        size = ctx.page_size
-        pages, offsets = kv.write_slots(LABEL)
-        page = ctx.pages[(ctx.page_start[ctx.row_req.long()] + pos // size).long()]
-        pages.copy_(page.to(pages.dtype))
-        offsets.copy_((pos % size).to(offsets.dtype))
-        ctx.pos = pos.to(ctx.pos.dtype)
-        if engine_inputs.captured:
-            ctx.valid = attn_lens_device(pos, ctx.topk, ctx.kpool).to(torch.int32)
-            ctx.pad_slot = self._pad_slot
-            self._pad_kpe.fill_(HOLE_KPE)
-        else:
-            ctx.host_pos = pos.tolist()
+        self._dsa.move_rows(pos, HOLE_KPE, LABEL)
         return base
 
     def _mtp_prefill(self, engine_inputs, input_ids, hidden, last, new_tokens, mtp_keep) -> None:
@@ -742,7 +689,7 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
             return self.forward_batched(graph_walk, engine_inputs, input_ids,
                                         mtp_seq=mtp_seq, **kwargs)[engine_inputs.request_ids[0]]
         return {"new_token": self._forward(
-            graph_walk, engine_inputs, input_ids, last_rows, mtp_keep, kwargs)}
+            graph_walk, engine_inputs, input_ids, last_rows, mtp_keep)}
 
     def can_batch(self, batch: ExecutingBatch, model_inputs: list[NodeInputs]) -> bool:
         return True
@@ -760,20 +707,13 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         if mtp_seq is not None:
             # the emitted tokens are cut on the host (unpack_packed_outputs); the next input
             # is the token after the accepted drafts
-            if self._dsa is not None:
-                self._dsa.ctx = self._dsa.context(kwargs)
-            try:
-                base = self._trim_on_device(engine_inputs) if self.config.mtp_trims else None
-                next_input = self._mtp_decode(engine_inputs, input_ids, mtp_seq, base)
-            finally:
-                if self._dsa is not None:
-                    self._dsa.ctx = None
+            base = self._trim_on_device(engine_inputs) if self.config.mtp_trims else None
+            next_input = self._mtp_decode(engine_inputs, input_ids, mtp_seq, base)
             return {
                 rid: {"text_inputs": [next_input[i : i + 1]]}
                 for i, rid in enumerate(engine_inputs.request_ids)
             }
-        new_tokens = self._forward(
-            graph_walk, engine_inputs, input_ids, last_rows, mtp_keep, kwargs)
+        new_tokens = self._forward(graph_walk, engine_inputs, input_ids, last_rows, mtp_keep)
         # row i is request i: one clone out of the graph and one host copy a step
         return BatchedModelOutput(
             row_outputs={"new_token": new_tokens},
@@ -803,23 +743,28 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         states = [self.request_state(rid) for rid in request_ids]
         pending = [st.get("mtp_pending") for st in states]
         seq, key, _ = pending[0]
-        assert all(p[:2] == (seq, key) for p in pending), pending
+        if any(p[:2] != (seq, key) for p in pending):
+            raise SystemExit(f"one MTP verdict read spans several steps: {pending}")
         # read once, then kept: a later step may reuse the mailbox before a second read
         cached = [st.get("mtp_verdict") for st in states]
         if all(c is not None and c[0] == seq for c in cached):
             return [c[1:] for c in cached]
         verdicts, staged_seq = self._mailboxes[key]
-        deadline = time.monotonic() + _VERDICT_TIMEOUT_S
+        # A step that failed after it was numbered never stages its verdict. Failing this rank's
+        # batch alone would leave the other ranks in its collective, so a missed deadline exits
+        # the process: the instance goes down where everyone sees it, rather than hanging.
+        deadline = time.monotonic() + _VERDICT_DEADLINE_S
         while True:
             staged = int(staged_seq[0])
             if staged == seq:
                 break
             if staged > seq:
-                raise RuntimeError(
+                raise SystemExit(
                     f"MTP verdict of step {seq} was overwritten by step {staged} before it "
                     "was read")
             if time.monotonic() > deadline:
-                raise RuntimeError(f"MTP verdict of step {seq} never arrived")
+                raise SystemExit(
+                    f"MTP step {seq} never staged its verdict in {_VERDICT_DEADLINE_S:.0f} s")
             time.sleep(0)
         table = verdicts[:max(p[2] for p in pending) + 1].tolist()
         k1 = self.mtp_block
@@ -878,42 +823,61 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         if "new_token" not in outputs:
             return
         outputs.setdefault("text_inputs", outputs["new_token"])
-        state = self.request_states.get(request_id)
-        if state is not None and state.get("ended_at_prefill"):
-            # the reply already ended: this step only closes the decode loop
-            del outputs["new_token"]
 
     def check_stop(
         self, request_id: str,
         request_info: CurrentForwardPassInfo,
         outputs: dict[str, list[torch.Tensor]],
     ) -> set[str]:
-        # check_stop gets host tensors, so .item() here does not sync
-        state = self.request_states.get(request_id)
-        if state is not None and state.get("ended_at_prefill"):
-            return {"decode_loop"}
         if "new_token" not in outputs:
             return set()
         if self.mtp_k > 0:
             return self._mtp_check_stop(request_id, request_info, outputs["new_token"][0])
-        token = outputs["new_token"][0].item()
+        # check_stop gets host tensors, so .item() here does not sync
+        return self._stops(request_id, request_info, outputs["new_token"][0].item())
+
+    def check_stop_batched(
+        self,
+        request_ids: list[str],
+        request_infos: dict[str, CurrentForwardPassInfo],
+        host_rows: HostRows,
+        step_walk: str | None = None,
+    ) -> dict[str, set[str]] | None:
+        """``check_stop`` for the batch off one ``tolist`` of its tokens."""
+        if self.mtp_k > 0:
+            return None  # a verify step's row holds several tokens
+        pairs = host_rows.first_values("new_token", request_ids)
+        if pairs is None:
+            return None
+        stops: dict[str, set[str]] = {}
+        for rid, token in pairs:
+            if loops := self._stops(rid, request_infos[rid], token):
+                stops[rid] = loops
+        return stops
+
+    def _stops(
+        self, request_id: str, request_info: CurrentForwardPassInfo, token: int,
+    ) -> set[str]:
+        """The loops a plain step's emitted ``token`` stops."""
+        state = self.request_states.get(request_id)
         is_eos = token in self.config.eos_token_ids
         ignore_eos = request_info.resource_configs[SAMPLER].ignore_eos
         if request_info.graph_walk == "prefill":
-            # no decode_loop on this walk to stop: a stop token ends the reply at the first
-            # decode step, and the conductor ends a max_tokens of 1 here
-            if not ignore_eos and is_eos:
-                self.request_state(request_id).add("ended_at_prefill", True)
-            return set()
+            # no decode_loop on this walk to stop: a stop token ends the partition before any
+            # decode step runs, and the conductor ends a max_tokens of 1 here
+            return {END_PARTITION} if not ignore_eos and is_eos else set()
         # Total generated = 1 prefill-emitted token + (decode iters + 1):
         # max_tokens counts the token the prefill emits, so the decode loop
         # runs one fewer.
         generated = request_info.dynamic_loop_iter_counts.get("decode_loop", 0) + 2
-        # The next step takes the context to prompt + generated, and it may
-        # already be scheduled when this stop lands, so stop while it still
-        # fits: past the context limit prepare_inputs refuses it.
+        # The next step takes the context to prompt + generated and may already
+        # be scheduled when this stop lands, so stop while it still fits, before
+        # a step past the context limit (which prepare_inputs refuses) is scheduled. A
+        # next step that emits the reply's last token ends the loop at its cap
+        # with nothing after it, so it may fill the window.
         prompt_len = state.get("prompt_len", 0) if state is not None else 0
-        full = prompt_len + generated >= self.config.context_limit
+        full = (prompt_len + generated >= self.config.context_limit
+                and generated + 1 < request_info.max_tokens)
         if (not ignore_eos and is_eos) or generated >= request_info.max_tokens or full:
             return {"decode_loop"}
         return set()
@@ -936,10 +900,8 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         is_eos = not ignore_eos and any(
             t in self.config.eos_token_ids for t in new_token.tolist())
         if request_info.graph_walk == "prefill":
-            # as in check_stop: the prefill walk has no decode_loop to stop
-            if is_eos:
-                state.add("ended_at_prefill", True)
-            return set()
+            # as in _stops: the prefill walk has no decode_loop to stop
+            return {END_PARTITION} if is_eos else set()
         steps = request_info.dynamic_loop_iter_counts.get("decode_loop", 0)
         if request_info.graph_walk == "decode":
             steps += 1

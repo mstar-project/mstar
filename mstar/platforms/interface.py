@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable
+from pathlib import Path
 
 import torch
 
@@ -41,13 +43,17 @@ class Platform:
         return None
 
     def cuda_capability(self, device=None) -> tuple[int, int] | None:
-        """NVIDIA compute capability; None on any other platform."""
+        """NVIDIA compute capability; None on any other platform or for a non-CUDA device."""
         return None
 
     def has_cuda_capability(self, major: int, minor: int = 0, device=None) -> bool:
         """An NVIDIA GPU of at least ``major.minor``; never true off NVIDIA."""
         capability = self.cuda_capability(device)
         return capability is not None and capability >= (major, minor)
+
+    def has_block_scaled_gemm(self, device=None) -> bool:
+        """cuBLASLt's MXFP8 and NVFP4 GEMMs (``torch._scaled_mm``) run on this GPU."""
+        return False
 
     def inductor_overrides(self, num_tokens: int | None = None) -> dict[str, object]:
         """``torch._inductor.config`` values to patch in while the engine
@@ -72,8 +78,55 @@ class Platform:
         """
         return {}
 
+    def pci_address(self, device_index: int) -> str | None:
+        """The device's PCI address (``0000:40:00.0``), its name under
+        ``/sys/bus/pci/devices``; None where the platform doesn't say."""
+        return None
+
+    def reachable_pci_addresses(self) -> frozenset[str]:
+        """The PCI addresses of the GPUs this container can open, whatever
+        ``CUDA_VISIBLE_DEVICES`` says; empty where the platform doesn't say.
+        sysfs lists the host's GPUs even in a container given two of them."""
+        return frozenset()
+
+    def visible_pci_addresses(self) -> frozenset[str]:
+        """The PCI addresses of the devices this process was given
+        (``CUDA_VISIBLE_DEVICES``, which ``--gpus`` sets); empty where the
+        platform doesn't report an address."""
+        return frozenset(a for i in range(torch.accelerator.device_count())
+                         if (a := self.pci_address(i)) is not None)
+
     def __repr__(self) -> str:
         return f"{type(self).__name__}()"
+
+
+def _nvidia_reachable(proc: Path = Path("/proc/driver/nvidia/gpus"), dev: Path = Path("/dev")) -> frozenset[str]:
+    """The GPUs with a device node here. procfs lists the host's GPUs in a
+    container too, each with its minor; only the node's presence is per
+    container."""
+    reachable = set()
+    try:
+        gpus = list(proc.iterdir())
+    except OSError:
+        return frozenset()
+    for gpu in gpus:
+        try:
+            minor = re.search(r"^Device Minor:\s*(\d+)", (gpu / "information").read_text(), re.MULTILINE)
+        except OSError:
+            continue
+        if minor is not None and (dev / f"nvidia{minor[1]}").exists():
+            reachable.add(gpu.name)
+    return frozenset(reachable)
+
+
+def _torch_pci_address(device_index: int) -> str | None:
+    """The PCI address torch reports for a ``torch.cuda`` device. ROCm builds
+    report it the same way, so this needs no NVML; it creates no context."""
+    try:
+        props = torch.cuda.get_device_properties(device_index)
+        return f"{props.pci_domain_id:04x}:{props.pci_bus_id:02x}:{props.pci_device_id:02x}.0"
+    except (AssertionError, AttributeError, RuntimeError):
+        return None
 
 
 class CudaPlatform(Platform):
@@ -82,12 +135,24 @@ class CudaPlatform(Platform):
     def is_cuda(self) -> bool:
         return True
 
-    def arch(self, device=None) -> str:
-        major, minor = self.cuda_capability(device)
-        return f"sm_{major}{minor}"
+    def arch(self, device=None) -> str | None:
+        capability = self.cuda_capability(device)
+        return None if capability is None else f"sm_{capability[0]}{capability[1]}"
 
-    def cuda_capability(self, device=None) -> tuple[int, int]:
+    def cuda_capability(self, device=None) -> tuple[int, int] | None:
+        # a CPU device (tests that drive GPU resources with stand-ins) has none
+        if device is not None and torch.device(device).type != "cuda":
+            return None
         return torch.cuda.get_device_capability(device)
+
+    def has_block_scaled_gemm(self, device=None) -> bool:
+        return self.has_cuda_capability(10, 0, device)
+
+    def pci_address(self, device_index: int) -> str | None:
+        return _torch_pci_address(device_index)
+
+    def reachable_pci_addresses(self) -> frozenset[str]:
+        return _nvidia_reachable()
 
     def process_env_defaults(self) -> dict[str, str | Callable[[str | None], str]]:
         # NCCL registering the buffers captured in CUDA graphs gave wrong Cosmos3 SP4 images
@@ -111,6 +176,9 @@ class RocmPlatform(Platform):
     def process_env_defaults(self) -> dict[str, str]:
         # none until one is measured to help on AMD GPUs
         return {}
+
+    def pci_address(self, device_index: int) -> str | None:
+        return _torch_pci_address(device_index)
 
 
 class XpuPlatform(Platform):

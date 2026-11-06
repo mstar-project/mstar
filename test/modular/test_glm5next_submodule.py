@@ -12,7 +12,8 @@ import torch
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.accelerator_graph_config import BatchedAcceleratorGraphConfig
-from mstar.engine.accelerator_graph_runner import DEFAULT_CAPTURE_BATCH_SIZES
+from mstar.engine.accelerator_graph_runner import DEFAULT_CAPTURE_BATCH_SIZES, AcceleratorGraphRunner
+from mstar.engine.engine import Engine
 from mstar.engine.resources import (
     SamplingReqConfig,
     Segment,
@@ -40,7 +41,7 @@ from mstar.model.glm5_next.config import (
 )
 from mstar.model.glm5_next.glm5_next_model import Glm5NextModel, process_weights_after_loading
 from mstar.model.glm5_next.submodules import Glm5NextLLMSubmodule
-from mstar.model.submodule_base import ARNodeInputs, ModelInputsFromEngine
+from mstar.model.submodule_base import END_PARTITION, ARNodeInputs, HostRows, ModelInputsFromEngine
 
 MAX_SLOTS = 4
 DEVICE = torch.device("cpu")
@@ -405,22 +406,30 @@ class TestCudaGraphs:
     @pytest.mark.parametrize("fused_kda", [False, True])
     def test_prefill_rows_follow_the_captured_prefill(self, monkeypatch, fused_kda):
         """Prefill is captured only on the kernels the KDA resource picked if they capture it
-        (the fused ones), and a captured prefill holds a step to its largest graph's rows: a
-        larger step would run eager and compile the MoE decode kernels for its row count
-        mid-serve. An eager prefill is held to the free slots alone."""
+        (the fused ones), and the engine holds a captured prefill to the largest graph the
+        pool holds rows for: a larger step would run eager and compile the MoE decode kernels
+        for its row count mid-serve. An eager prefill is held to the free slots alone."""
         h = _Harness(seed=35)
         sub = h.sub
         monkeypatch.setattr(h.kda, "kernels", TritonKDAKernels() if fused_kda else TorchKDAKernels())
         sub.config.prefill_graphs = True
+        sub.config.prefill_capture_batch_sizes = [1, 2, h.usable + 1]
+
+        def engine_cap(walk: str) -> int | None:
+            runner = AcceleratorGraphRunner.__new__(AcceleratorGraphRunner)
+            runner._capture_configs = sub.get_accelerator_graph_configs(DEVICE)
+            engine = Engine.__new__(Engine)
+            engine._submodules = {"LLM": types.SimpleNamespace(submodule=sub, capture_runner=runner)}
+            return engine.get_max_batch_size("LLM", walk)
+
         walks = [c.capture_graph_walk for c in sub.get_accelerator_graph_configs(DEVICE)]
         assert walks == (["decode", "prefill"] if fused_kda else ["decode"])
-        rows = max(sub.config.prefill_capture_batch_sizes)
-        assert sub.max_batch_size("prefill") == (rows if fused_kda else h.usable)
+        assert engine_cap("prefill") == (2 if fused_kda else h.usable)
         assert sub.max_batch_size("decode") == h.usable
         # no graphs at all (the fp8 reference MoE): prefill runs eager
         sub.config.quantization_config = Glm5NextModelConfig.reduced_fp8().quantization_config
         assert sub.get_accelerator_graph_configs(DEVICE) == []
-        assert sub.max_batch_size("prefill") == h.usable
+        assert engine_cap("prefill") == h.usable
 
 
 # --- check_stop and dtypes ---------------------------------------------------
@@ -455,6 +464,30 @@ class TestCheckStop:
         assert sub.check_stop("r", _info("r", max_tokens=3, decode_iters=None), out) == set()
         # ignore_eos does not touch the budget
         assert sub.check_stop("r", _info("r", max_tokens=5, ignore_eos=True, decode_iters=3), out) == {"decode_loop"}
+
+    def test_check_stop_batched_agrees_with_check_stop(self):
+        """One tolist for the batch, the same answer per request; a request with no row is
+        skipped, as the per-request path skips one without outputs."""
+        _model, lm, cfg = _build_model(seed=4)
+        sub = Glm5NextLLMSubmodule(lm, cfg)
+        eos = cfg.eos_token_ids[0]
+        word = next(t for t in range(cfg.vocab_size) if t not in cfg.eos_token_ids)
+        infos = {
+            "eos": _info("eos"), "mid": _info("mid"),
+            "budget": _info("budget", max_tokens=8, decode_iters=6),
+            "ignored": _info("ignored", ignore_eos=True), "first": _info("first", walk="prefill"),
+            "absent": _info("absent"),
+        }
+        rows = ("eos", "mid", "budget", "ignored", "first")
+        tokens = torch.tensor([eos, word, word, eos, eos, 0])  # a padding row last
+        batched = sub.check_stop_batched(list(infos), infos, HostRows(rows, {"new_token": tokens}))
+        per_request = {
+            rid: loops for rid, token in zip(rows, tokens, strict=False)
+            if (loops := sub.check_stop(rid, infos[rid], {"new_token": [token[None]]}))
+        }
+        assert batched == per_request == {
+            "eos": {"decode_loop"}, "budget": {"decode_loop"}, "first": {END_PARTITION},
+        }
 
 
 class TestDtype:

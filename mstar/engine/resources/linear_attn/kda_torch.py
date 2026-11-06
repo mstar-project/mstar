@@ -92,14 +92,23 @@ def chunk_kda(
         torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device),
         diagonal=0,
     )
-    # exp(g_i - g_j), (B, H, N, C, C, D), for every chunk at once as the
-    # reference does: prefill's largest transient
-    decay_mask = (g.unsqueeze(-2) - g.unsqueeze(-3)).exp().float()
-    attn = (
-        -(k_beta.unsqueeze(-2) * key.unsqueeze(-3) * decay_mask)
-        .sum(dim=-1)
-        .masked_fill(upper_incl_diag, 0)
+    strict_upper = torch.triu(
+        torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device),
+        diagonal=1,
     )
+    # The decay exp(g_i - g_j) is (B, H, C, C, D) per chunk; the reference builds it for every
+    # chunk at once, gigabytes for one long span, after the KV pool is sized. Per chunk here.
+    num_chunks = total_sequence_length // chunk_size
+    attn = query.new_empty(batch_size, num_heads, num_chunks, chunk_size, chunk_size)
+    attn_intra = torch.empty_like(attn)
+    for n in range(num_chunks):
+        k_n = key[:, :, n]
+        decay = (g[:, :, n].unsqueeze(-2) - g[:, :, n].unsqueeze(-3)).exp()
+        attn[:, :, n] = -(k_beta[:, :, n].unsqueeze(-2) * k_n.unsqueeze(-3) * decay).sum(dim=-1)
+        # intra chunk, diagonal included: token i reads its own write
+        attn_intra[:, :, n] = (query[:, :, n].unsqueeze(-2) * k_n.unsqueeze(-3) * decay).sum(dim=-1)
+    attn = attn.masked_fill(upper_incl_diag, 0)
+    attn_intra = attn_intra.masked_fill(strict_upper, 0)
     # T = (I - A)^-1 by forward substitution over the strictly-lower A.
     for i in range(1, chunk_size):
         row = attn[..., i, :i].clone()
@@ -119,27 +128,17 @@ def chunk_kda(
         else initial_state.to(torch.float32)
     )
     core_attn_out = torch.zeros_like(u)
-    strict_upper = torch.triu(
-        torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device),
-        diagonal=1,
-    )
-    for i in range(total_sequence_length // chunk_size):
+    for i in range(num_chunks):
         q_i = query[:, :, i]
         k_i = key[:, :, i]
         g_i = g[:, :, i]
 
         # inter chunk: the decayed read of the carried-in state
         attn_inter = (q_i * g_i.exp()) @ last_recurrent_state
-        # intra chunk, diagonal included: token i reads its own write
-        attn_intra = (
-            (q_i.unsqueeze(-2) * k_i.unsqueeze(-3) * decay_mask[:, :, i])
-            .sum(dim=-1)
-            .masked_fill(strict_upper, 0)
-        )
         v_prime = w[:, :, i] @ last_recurrent_state
         v_new = u[:, :, i] - v_prime
 
-        core_attn_out[:, :, i] = attn_inter + attn_intra @ v_new
+        core_attn_out[:, :, i] = attn_inter + attn_intra[:, :, i] @ v_new
         # exp(g_C) decays S along its key dim
         last_recurrent_state = (
             last_recurrent_state * g_i[:, :, -1].exp().unsqueeze(-1)

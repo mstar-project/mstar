@@ -1,16 +1,14 @@
 """Which GPUs the GLM-5.2 kernels' paths apply to. The GPU checks go through
 ``current_platform``: an AMD GPU reports a CUDA-style capability (an MI300X is 9.4), which a raw
 capability read takes for Hopper."""
+import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
 
 pytest.importorskip("triton")
-
-# GLM-5.2's o_proj at one TP8 rank, (N, K)
-O_PROJ = (6144, 2048)
-
 
 def test_an_amd_gpu_gets_neither_pdl_nor_the_sm90_gemm(monkeypatch):
     from mstar.utils import dense_fp8, mla_prep
@@ -27,36 +25,45 @@ def test_an_amd_gpu_gets_neither_pdl_nor_the_sm90_gemm(monkeypatch):
     assert not dense_fp8._probe_fi(device)
 
 
-def _paths(monkeypatch, gpu, fi_ok, calls):
-    """The kernels ``dense_fp8._linear`` picks for ``calls`` [(N, K, tokens)] on a device whose
-    limits are resolved as ``reserve`` resolves them for ``gpu``."""
+# What dense_fp8 picked before its choice moved into the fp8_linear table: see the file's
+# "made_by" for how it was recorded
+GOLDEN = Path(__file__).with_name("fp8_linear_dispatch_942c1bcc8.json")
+
+
+def _pick(dense_fp8, device, n, k, glu, m):
+    """``_choose``'s pick in the golden file's encoding: the w8a16 tile it launches, as
+    ``_w8a16`` resolves a row without a config."""
+    impl, config = dense_fp8._choose(device, n, k, bool(glu), m)
+    if impl != "w8a16":
+        return impl
+    tile = dict(config) if config else dense_fp8._w8a16_tiles(m, n, k, bool(glu))
+    keys = ("DOT", "BN", "BK", "SPLIT", "STAGES", "num_warps", "TB")
+    return "w8a16:" + "/".join(str(int(tile[key])) for key in keys if key in tile)
+
+
+def test_each_gpu_picks_what_dense_fp8_picked_before_the_table(monkeypatch):
+    """Every dense fp8 linear shape GLM-5.2 builds at TP8 and TP4 (and GLM-5.3's MLA and MLP
+    shapes, should it turn dense_fp8 on), at every token boundary, on an H200 with and without
+    flashinfer's and cuBLAS's GEMMs, an H200 NVL and an H100 (no table rows): the kernel and
+    tile are the ones the dispatch before the fp8_linear table picked."""
+    from mstar.kernels import DeviceKey, registry
     from mstar.utils import dense_fp8
 
-    cpu = torch.device("cpu")
-    seen = []
-    for fn in ("_w8a16", "_fi", "_w8a8"):
-        monkeypatch.setattr(dense_fp8, fn, lambda *args, fn=fn: seen.append(fn))
-    monkeypatch.setitem(dense_fp8._FI_OK, cpu, fi_ok)
-    monkeypatch.setitem(dense_fp8._W8A8_OK, cpu, True)
-    monkeypatch.setitem(dense_fp8._W8A16_MAX, cpu, dense_fp8._w8a16_max_tokens(gpu, fi_ok))
-    for n, k, tokens in calls:
-        dense_fp8._linear(torch.zeros(tokens, k, dtype=torch.bfloat16), torch.empty(n, k, dtype=torch.uint8),
-                          torch.ones(n // 128, k // 128), (128, 128), False)
-    return seen
-
-
-@pytest.mark.parametrize("gpu, fi_ok, own_rows", [
-    ("NVIDIA H200", True, True), ("NVIDIA H200", False, False),
-    ("NVIDIA H200 NVL", True, False), ("NVIDIA H100 80GB HBM3", True, False)])
-def test_a_gpus_own_token_limits_apply_only_there(monkeypatch, gpu, fi_ok, own_rows):
-    """A GPU model's measured w8a16 limits apply to that model alone, and only where
-    flashinfer's GEMM runs: without it those sizes would go to cuBLAS's, slower at decode."""
-    from mstar.utils import dense_fp8
-
-    own = dense_fp8._W8A16_MAX_TOKENS_BY_GPU["NVIDIA H200"][(*O_PROJ, False)]
-    calls = [(*O_PROJ, own + 1), (*O_PROJ, dense_fp8._W8A16_MAX_TOKENS + 1)]
-    assert _paths(monkeypatch, gpu, fi_ok, calls) == [
-        "_fi" if own_rows else "_w8a16", "_fi" if fi_ok else "_w8a8"]
+    golden = json.loads(GOLDEN.read_text())
+    monkeypatch.delenv("MSTAR_KERNEL_TABLES", raising=False)
+    device = torch.device("cuda", 0)
+    wrong = []
+    for scen, (gpu, fi_ok, cublas_ok) in golden["scenarios"].items():
+        monkeypatch.setattr(registry, "device_key", lambda dev, gpu=gpu: DeviceKey(gpu, "sm_90"))
+        monkeypatch.setitem(dense_fp8._FI_OK, device, fi_ok)
+        monkeypatch.setitem(dense_fp8._W8A8_OK, device, cublas_ok)
+        registry.reset_lookups()
+        for name, (n, k, glu) in golden["shapes"].items():
+            want = [pick for count, pick in golden["picks"][scen][name] for _ in range(count)]
+            got = [_pick(dense_fp8, device, n, k, glu, m) for m in golden["tokens"]]
+            wrong += [(scen, name, m, w, g) for m, w, g in zip(golden["tokens"], want, got, strict=True) if w != g]
+    registry.reset_lookups()
+    assert not wrong, wrong[:10]
 
 
 def test_an_unusable_cublas_block_gemm_falls_back(monkeypatch):

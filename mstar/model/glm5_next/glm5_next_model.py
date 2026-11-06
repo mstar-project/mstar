@@ -53,30 +53,20 @@ from mstar.model.glm5_next.config import (
 )
 from mstar.model.multimodal import render_chat_template
 from mstar.model.submodule_base import NodeSubmodule
-from mstar.model.utils import ByteIdDetokenizer, ByteLevelDetokenizer, TextOutput
+from mstar.model.utils import (
+    ByteIdDetokenizer,
+    ByteLevelDetokenizer,
+    TextOutput,
+    capture_ladder,
+    check_loaded,
+    load_snapshot_tokenizer,
+    process_weights_after_loading,
+    read_fp8_block_quant_config,
+    resolve_checkpoint,
+)
 from mstar.utils.generation_kwargs import normalize_generation_kwargs
-from mstar.utils.hf_snapshot import resolve_snapshot_dir
 
 logger = logging.getLogger(__name__)
-
-
-def process_weights_after_loading(root: torch.nn.Module, device: torch.device) -> None:
-    """Finalize kernel layouts across a freshly-loaded module tree."""
-    for module in root.modules():
-        hook = getattr(module, "process_weights_after_loading", None)
-        if callable(hook) and module is not root:
-            hook(device)
-
-
-def _check_all_loaded(module: torch.nn.Module, loaded: set[str], source: str) -> None:
-    """Refuse to serve a parameter no checkpoint tensor reached: the module was
-    built on meta and materialized with ``to_empty``, so it holds garbage."""
-    missing = {name for name, _ in module.named_parameters()} - loaded
-    if missing:
-        raise RuntimeError(
-            f"{len(missing)} parameters got no tensor from {source} (e.g. "
-            f"{sorted(missing)[:3]}); the snapshot is partial or a key was renamed"
-        )
 
 
 class Glm5NextModel(Model):
@@ -109,18 +99,37 @@ class Glm5NextModel(Model):
         if "moe_quant_kernel" in kwargs:
             self.config.moe_quant_kernel = str(kwargs["moe_quant_kernel"])
         if "mtp_num_draft_tokens" in kwargs:
-            self.config.mtp_num_draft_tokens = int(kwargs["mtp_num_draft_tokens"])
+            k = kwargs["mtp_num_draft_tokens"]
+            # the cache rows are max_seq_len * (k + 1), and a prompt leaves two verify blocks of
+            # index_topk free: k must leave room for both
+            if (isinstance(k, bool) or not isinstance(k, int) or k < 0
+                    or self.config.index_topk - 2 * (k + 1) < 1):
+                raise ValueError(
+                    f"mtp_num_draft_tokens must be an integer from 0 (off) to "
+                    f"{(self.config.index_topk - 3) // 2}, got {k!r}")
+            self.config.mtp_num_draft_tokens = k
         if "prefill_graphs" in kwargs:
-            self.config.prefill_graphs = bool(kwargs["prefill_graphs"])
+            # bool("false") is True
+            if not isinstance(kwargs["prefill_graphs"], bool):
+                raise ValueError(f"prefill_graphs must be true or false, got {kwargs['prefill_graphs']!r}")
+            self.config.prefill_graphs = kwargs["prefill_graphs"]
         # overrides of the submodule's buckets, which **kwargs would otherwise swallow
         for key in ("prefill_token_buckets", "prefill_capture_batch_sizes"):
             if kwargs.get(key) is not None:
-                setattr(self.config, key, [int(n) for n in kwargs[key]])
+                setattr(self.config, key, capture_ladder(key, kwargs[key]))
         long_only = sorted(k for k in ("max_seq_len", "prefill_window_tokens", "dsa_shard_prefill")
                            if k in kwargs)
         if long_only and not kwargs.get("dsa_long_context", False):
             # they size and split the long-context path only; without it they would be dropped
             raise ValueError(f"{long_only} apply only with dsa_long_context")
+        for key in ("dsa_long_context", "dsa_shard_prefill"):
+            # bool("false") is True
+            if key in kwargs and not isinstance(kwargs[key], bool):
+                raise ValueError(f"{key} must be true or false, got {kwargs[key]!r}")
+        for key in ("max_seq_len", "prefill_window_tokens"):
+            # int() would take True as 1 and 2.5 as 2
+            if key in kwargs and (isinstance(kwargs[key], bool) or not isinstance(kwargs[key], int)):
+                raise ValueError(f"{key} must be an integer, got {kwargs[key]!r}")
         if kwargs.get("dsa_long_context", False):
             # Contexts past index_topk through the k-pool indexer and sparse MLA (the DSA resource).
             # Captured prefill buckets take whole short prompts; a longer prompt runs eager, in
@@ -147,39 +156,8 @@ class Glm5NextModel(Model):
     def tokenizer(self):
         # loaded on first use, so byte mode never touches HF
         if self._tokenizer is None:
-            from transformers import AutoTokenizer
-
-            tokenizer_source = str(resolve_snapshot_dir(self.model_path_hf, cache_dir=self.cache_dir))
-            try:
-                self._tokenizer = AutoTokenizer.from_pretrained(
-                    tokenizer_source, cache_dir=self.cache_dir,
-                )
-            except ValueError:
-                # transformers-5 tokenizer_config declares a backend class
-                # transformers 4.x cannot construct; tokenizer.json is
-                # version-independent, so build the fast tokenizer from it.
-                self._tokenizer = self._fast_tokenizer_fallback(tokenizer_source)
+            self._tokenizer = load_snapshot_tokenizer(self.model_path_hf, self.cache_dir)
         return self._tokenizer
-
-    @staticmethod
-    def _fast_tokenizer_fallback(source: str):
-        from transformers import PreTrainedTokenizerFast
-
-        snap = Path(source)
-        tokenizer = PreTrainedTokenizerFast(
-            tokenizer_file=str(snap / "tokenizer.json"))
-        template = snap / "chat_template.jinja"
-        if template.is_file():
-            tokenizer.chat_template = template.read_text()
-        # built from tokenizer.json alone, the tokenizer has no special tokens, so the
-        # detokenizer would print <|user|> and the other turn markers into replies
-        config = snap / "tokenizer_config.json"
-        if config.is_file():
-            cfg = json.loads(config.read_text())
-            special = {k: cfg[k] for k in ("eos_token", "pad_token") if cfg.get(k)}
-            tokenizer.add_special_tokens(
-                {**special, "additional_special_tokens": list(cfg.get("extra_special_tokens") or [])})
-        return tokenizer
 
     # -------------------------------------------------------------------
     # Model ABC: KV cache config
@@ -262,7 +240,6 @@ class Glm5NextModel(Model):
                     recurrent_state=KDA_STATE,
                     variant=LinearAttnVariant.KDA,
                     backend=LinearAttnBackend.TRITON,
-                    gate_lower_bound=self.config.gate_lower_bound,
                 ),
             ),
         ]
@@ -276,6 +253,7 @@ class Glm5NextModel(Model):
                     topk=self.config.index_topk,
                     kpool=self.config.index_kpool,
                     sm_scale=self.config.qk_head_dim ** -0.5,
+                    index_head_dim=self.config.index_head_dim,
                 ),
             ))
         return specs
@@ -294,8 +272,10 @@ class Glm5NextModel(Model):
             k: model_kwargs.get(k, getattr(self.config, k))
             for k in keys
         }
-        if "top_k" in model_kwargs:
-            params["top_k"] = int(model_kwargs["top_k"])
+        # the sampler's own knobs with no config default
+        for k, cast in (("top_k", int), ("penalize_prompt", bool)):
+            if k in model_kwargs:
+                params[k] = cast(model_kwargs[k])
         if self.config.mtp_num_draft_tokens > 0 and "temperature" not in model_kwargs:
             # MTP verifies greedily: a request that names no temperature gets 0, and an
             # explicit one > 0 is refused in process_prompt
@@ -439,6 +419,9 @@ class Glm5NextModel(Model):
         if kwargs.get("min_p", 0) > 0:
             # the node's sampler is built without min-p, and the request configs do not pass it on
             raise ValueError(f"GLM-5.3 is served without min_p (min_p={kwargs['min_p']}); send none")
+        if kwargs.get("return_logprobs"):
+            # the sampler configs carry none, which the conductor refuses too
+            raise ValueError("GLM-5.3 does not report logprobs; leave return_logprobs unset")
 
         if self.config.mtp_num_draft_tokens > 0:
             # MTP verifies by argmax; refused here, it is the client's 400 rather than a
@@ -620,8 +603,7 @@ class Glm5NextModel(Model):
 
         index_file = Path(source) / "model.safetensors.index.json"
         if not index_file.is_file():
-            loaded = load_weights(language_model, source, device=device)
-            _check_all_loaded(language_model, loaded, source)
+            check_loaded(language_model, load_weights(language_model, source, device=device), source)
             return
 
         with open(index_file) as f:
@@ -639,27 +621,13 @@ class Glm5NextModel(Model):
         weights = iter_safetensors_shards(
             source, device=device, keys=keys, slice_spec=specs.get,
         )
-        loaded = language_model.load_weights(weights)
-        _check_all_loaded(language_model, loaded, source)
+        check_loaded(language_model, language_model.load_weights(weights), source)
 
     def _maybe_apply_checkpoint_quant_config(self, source: str) -> None:
         """Adopt the checkpoint's fp8-block quant config from its config.json."""
-        from mstar.utils.fp8_block import Fp8BlockQuantConfig
-
         if self.config.quantization_config is not None:
             return
-        config_json = Path(source) / "config.json"
-        if not config_json.is_file():
-            return
-        try:
-            with open(config_json) as f:
-                raw = json.load(f)
-        except (OSError, ValueError) as e:  # unreadable / malformed — stay bf16
-            logger.warning("Glm5NextModel: could not read %s: %s", config_json, e)
-            return
-        quant = Fp8BlockQuantConfig.from_hf_config_dict(
-            raw.get("quantization_config"),
-        )
+        quant = read_fp8_block_quant_config(source)
         if quant is not None:
             logger.info(
                 "Glm5NextModel: fp8 %s checkpoint (block %s) — dense dequant on "
@@ -669,9 +637,4 @@ class Glm5NextModel(Model):
             self.config.quantization_config = quant
 
     def _resolve_checkpoint(self) -> str | None:
-        path = getattr(self, "model_path_hf", None)
-        if not path:
-            return None
-        if Path(path).exists():
-            return str(path)
-        return str(resolve_snapshot_dir(path, cache_dir=self.cache_dir))
+        return resolve_checkpoint(self.model_path_hf, self.cache_dir)

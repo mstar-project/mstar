@@ -20,7 +20,7 @@ from mstar.api_server.data_worker import PreprocessWorkerThread
 from mstar.engine.engine import Engine
 from mstar.engine.resources.base import EngineResourceInfo, KeyedWalks, build_resource
 from mstar.engine.resources.kv import manager as manager_mod
-from mstar.engine.resources.kv.config import KVReqConfig, KVStep, PagedKVConfig
+from mstar.engine.resources.kv.config import KVReqConfig, KVSpec, KVStep, PagedKVConfig, opening_prefix_caches
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.linear_attn.config import (
     LinearAttnConfig,
@@ -83,13 +83,13 @@ class _Node:
     def __init__(self, rank: int = 0, world_size: int = 1, prefix_slots: int = 3,
                  speculative_tokens: int = 0):
         group = SimpleNamespace(rank=rank, world_size=world_size) if world_size > 1 else None
+        kv_spec = KVSpec("kv", {NODE}, PagedKVConfig(
+            num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=1024, num_qo_heads=2,
+            max_num_pages=40, page_size=PAGE, prefix_cache_salt="a salt",
+            prefix_cache_tp=world_size > 1,
+        ))
         self.kv = KVManager(
-            cfg=PagedKVConfig(
-                num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=1024, num_qo_heads=2,
-                max_num_pages=40, page_size=PAGE, prefix_cache_salt="a salt",
-                prefix_cache_tp=world_size > 1,
-            ),
-            name="kv", joint_comm_group=group, transfer_engine_info=None, device=CPU,
+            cfg=kv_spec.config, name="kv", joint_comm_group=group, transfer_engine_info=None, device=CPU,
             dtype=torch.float32,
         )
         self.kv.enable_prefix_cache(ROOT, {"main": KeyedWalks((WALK,))})
@@ -98,18 +98,22 @@ class _Node:
             num_layers=1, max_slots=5, prefix_slots=prefix_slots, kv_cache="kv",
             blocks=geometry.to_blocks(conv_dtype=torch.float32, speculative_tokens=speculative_tokens),
         ))
+        kda_spec = LinearAttnSpec("kda", {NODE}, LinearAttnConfig(
+            recurrent_state="state", variant=LinearAttnVariant.KDA,
+        ))
+        # as the engine decides it: above one rank the snapshots open with the KV cache's prefix_cache_tp
+        opened = opening_prefix_caches([kv_spec, pool_spec, kda_spec], {NODE: world_size}, checkpoint_named=False)
+        assert opened == ({"kv", "state"} if prefix_slots else set())
         self.pool = RecurrentStatePool.build(pool_spec, EngineResourceInfo(
-            device=CPU, joint_comm_group=group, dependencies={"kv": self.kv},
+            device=CPU, joint_comm_group=group, dependencies={"kv": kv_spec}, prefix_caches=opened,
         ))
         self.kda = build_resource(
-            LinearAttnSpec("kda", {NODE}, LinearAttnConfig(
-                recurrent_state="state", variant=LinearAttnVariant.KDA, gate_lower_bound=-5.0,
-            )),
-            EngineResourceInfo(device=CPU, joint_comm_group=group, dependencies={"state": pool_spec}),
+            kda_spec, EngineResourceInfo(device=CPU, joint_comm_group=group, dependencies={"state": pool_spec}),
         )
+        self.kda.bind_layer(lower_bound=-5.0, full_rank_output_gate=False)
         self.pool.bind_dependencies({"kv": self.kv})
         self.kda.bind_dependencies({"state": self.pool})
-        assert self.pool.enable_prefix_cache(ROOT) == bool(prefix_slots)
+        assert (self.pool._kv is not None) == bool(prefix_slots)
         self.runner = StepRunner(
             {"kv": self.kv, "state": self.pool, "kda": self.kda}, node_resources={NODE: ["kv", "state", "kda"]},
         )

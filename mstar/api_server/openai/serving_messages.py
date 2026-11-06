@@ -32,7 +32,6 @@ import json
 from mstar.api_server.openai import reply, serving_responses
 from mstar.api_server.openai._util import rid, sse
 from mstar.api_server.openai.protocol import ChatCompletionRequest
-from mstar.api_server.streaming_response import ReleasingStreamingResponse
 from mstar.model.base import ProcessPromptOutput
 
 _FIELDS = {"model", "messages", "system", "max_tokens", "stop_sequences", "stream", "temperature", "top_p",
@@ -67,7 +66,9 @@ def to_chat_request(body, *, counting: bool = False,
     unknown = sorted(set(body) - (_COUNT_FIELDS if counting else _FIELDS))
     if unknown:
         raise ValueError(f"unsupported field(s) {unknown}")
-    chat: dict = {"messages": _system(body.get("system")) + _messages(body.get("messages"))}
+    # the model names a LoRA adapter as on chat completions; with none served any name runs the model
+    chat: dict = {"model": body.get("model"),
+                  "messages": _system(body.get("system")) + _messages(body.get("messages"))}
     if not counting:
         max_tokens = body.get("max_tokens")
         if not isinstance(max_tokens, int) or isinstance(max_tokens, bool) or max_tokens < 1:
@@ -302,26 +303,11 @@ async def create_message(api, model_name, adapter, body, raw_request=None):
     args = adapter.chat_to_request(req, api.upload_dir)
     parser = adapter.make_output_parser(req)
     request_id = rid("msg")
-    api.submit_request(
-        text=args.text,
-        input_modalities=args.input_modalities,
-        output_modalities=args.output_modalities,
-        model_kwargs=args.model_kwargs,
-        prompt_parts=args.prompt_parts,
-        streaming=bool(req.stream),
-        request_id=request_id,
-    )
+    model_name = reply.submit(api, request_id, model_name, req, args)
     usage = reply.Usage()
     if req.stream:
-        key = api.submission_key(request_id)  # named before the wait
-        # a request the engine refuses gets its status, not a 200
-        batches = await api.open_result_stream(request_id, raw_request, batches=True)
-        events = reply.reply_events(api, request_id, parser, stops, usage, batches=batches, key=key)
-        return ReleasingStreamingResponse(
-            _stream(model_name, request_id, events, usage),
-            release=lambda: api.release_request(request_id),
-            media_type="text/event-stream", headers={"Cache-Control": "no-cache"},
-        )
+        events = await reply.stream_events(api, request_id, raw_request, parser, stops, usage)
+        return reply.sse_response(api, request_id, _stream(model_name, request_id, events, usage))
     events = reply.reply_events(api, request_id, parser, stops, usage)
     return _message(model_name, request_id, await reply.collect(events, raw_request))
 

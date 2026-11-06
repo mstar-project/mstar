@@ -5,9 +5,10 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from mstar.model.components.moe import NoAuxTcRouter
 from mstar.model.glm5_next import fused_decode
 from mstar.model.glm5_next.components import moe as moe_module
-from mstar.model.glm5_next.components.moe import Glm5NextMoEGate, Glm5NextSparseMoeBlock
+from mstar.model.glm5_next.components.moe import Glm5NextSparseMoeBlock
 from mstar.model.glm5_next.config import Glm5NextModelConfig
 from mstar.utils.fp8_block import Fp8BlockQuantConfig, dequantize_fp8_block_weight
 
@@ -106,7 +107,7 @@ def test_decode_matches_oracle(tokens, limit, fp32_matmul):
     block = _block(limit=limit)
     x = torch.randn(tokens, block.hidden_size, device="cuda", dtype=torch.bfloat16)
     with torch.no_grad():
-        topk_w, topk_ids = block.gate(x)
+        topk_w, topk_ids, _ = block.gate(x)
         assert topk_w.dtype == torch.float32
         got = block._dispatch_decode(x, topk_w, topk_ids)
         ref = _oracle(block, x, topk_w, topk_ids) + _shared_oracle(block, x)
@@ -120,21 +121,21 @@ def test_decode_matches_oracle(tokens, limit, fp32_matmul):
 
 def _gate(experts=288, top_k=8, hidden=4096, dtype=torch.bfloat16, seed=1):
     torch.manual_seed(seed)
-    gate = Glm5NextMoEGate(hidden, experts, top_k, routed_scaling_factor=2.5).cuda()
+    gate = NoAuxTcRouter(hidden, experts, top_k, routed_scaling_factor=2.5).cuda()
     with torch.no_grad():
         gate.weight.normal_(0.0, 0.02)
         gate.e_score_correction_bias.normal_(0.0, 0.5)
     gate.weight.data = gate.weight.data.to(dtype)
-    gate.finalize_weights()
+    gate.finalize_weights(topk_kernel=True)  # as a fused block does
     return gate
 
 
 def _assert_same_routing(gate, x, monkeypatch):
     with torch.no_grad():
-        w, ids = gate(x)
-        monkeypatch.setattr(fused_decode, "_ENABLED", False)
-        w_r, ids_r = gate(x)
-        monkeypatch.setattr(fused_decode, "_ENABLED", True)
+        w, ids, _ = gate(x)
+        monkeypatch.setattr(gate, "_route_op", None)
+        monkeypatch.setattr(gate, "_topk_op", None)
+        w_r, ids_r, _ = gate(x)
     assert w.dtype == torch.float32 and ids.dtype == torch.int64
     # the same experts per token (the reference's topk order is unspecified); ties would go
     # to the lower expert id, and the random scores here have none
@@ -147,8 +148,8 @@ def _assert_same_routing(gate, x, monkeypatch):
 @pytest.mark.parametrize("tokens", [1, 5, 33, 64, 65, 300, 1036])
 @pytest.mark.parametrize("weight_dtype", [torch.float32, torch.bfloat16])
 def test_router_matches_reference(tokens, weight_dtype, monkeypatch, fp32_matmul):
-    """Each fused path of the gate (the decode kernel up to _DECODE_MAX_TOKENS rows, then a
-    bf16 or fp32 GEMM into router_topk) picks the reference's experts with its weights."""
+    """Each fused path of the gate (the decode router up to MAX_ROUTER_TOKENS rows, then a
+    bf16 or fp32 GEMM into router_topk) picks the torch reference's experts with its weights."""
     gate = _gate(dtype=weight_dtype)
     torch.manual_seed(tokens)
     x = torch.randn(tokens, 4096, device="cuda", dtype=torch.bfloat16)
@@ -156,11 +157,13 @@ def test_router_matches_reference(tokens, weight_dtype, monkeypatch, fp32_matmul
 
 
 def test_a_nan_router_row_picks_experts_in_range():
-    logits = torch.randn(4, 16, device="cuda")
+    """18 experts pad to 32 lanes, as GLM-5.3's 288 pad to 512: a NaN row's ids stay experts."""
+    logits = torch.randn(4, 18, device="cuda")
     logits[1] = float("nan")
-    _, ids = fused_decode.router_topk(logits, torch.zeros(16, device="cuda"), top_k=4, scale=1.0,
-                                      normalize=True)
-    assert int(ids.max()) < 16 and int(ids.min()) >= 0
+    from mstar.utils.fused_moe import decode as moe_decode
+
+    _, ids = moe_decode.router_topk(logits, torch.zeros(18, device="cuda"), 4, 1.0, True)
+    assert int(ids.max()) < 18 and int(ids.min()) >= 0
     ref = torch.topk(torch.sigmoid(logits[0]), 4).indices.sort().values
     assert torch.equal(ids[0].sort().values, ref)
 
@@ -172,6 +175,6 @@ def test_large_batch_and_disabled_use_the_runner(monkeypatch):
         x = torch.randn(tokens, block.hidden_size, device="cuda", dtype=torch.bfloat16)
         with torch.no_grad():
             got = block(x)
-            topk_w, topk_ids = block.gate(x)
+            topk_w, topk_ids, _ = block.gate(x)
             old = _runner(block, x, topk_w, topk_ids) + block.shared_expert(x)
         torch.testing.assert_close(got, old, rtol=0, atol=0)

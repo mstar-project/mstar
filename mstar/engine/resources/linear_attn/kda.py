@@ -2,11 +2,12 @@
 
 As in ``gdn.py``, the pool's addressing arrives through ``ctx.plan_results`` and a
 layer's blocks reach ``run`` as tensors, which ``convenience.KDACallable`` resolves.
-The math is a kernel bundle's, which the resource picks from the spec and the pool:
+The math is a kernel bundle's, which the resource picks from the pool and its layers' gates:
 ``kda_triton.TritonKDAKernels`` where they run it, ``kda_torch.TorchKDAKernels``
 elsewhere. A bundle implements ``layout`` (the token layout its prefill reads, or
-None), ``run_paged`` and, for a speculative step, ``run_verify``. The plan stages the
-layout into buffers that stay put under capture.
+None), ``run_paged`` and, for a speculative step, ``run_verify``, and says whether its
+prefill can be captured (``prefill_capturable``; the resource refuses one it can't). The plan
+stages the layout into buffers that stay put under capture.
 """
 
 from __future__ import annotations
@@ -91,6 +92,10 @@ class KDAPlan:
     snapshot_section: bool = False
     # a window's first tokens, run on their own first (`KDAManager.token_window`)
     head: KDAPlan | None = None
+    # the verify step's accepted count went to the pool (`KDAManager.settle_verify`)
+    settled: bool = False
+    # the bucket slot a captured verify step records, so its replays know it settles
+    capture_key: CGSlotKey | None = None
     _cache: dict = field(default_factory=dict, repr=False)
 
     @property
@@ -104,14 +109,27 @@ class KDAPlan:
         return self._cache[key]
 
 
-def _default_kernels(device: torch.device, geometry: DeltaNetGeometry, config: LinearAttnConfig):
-    fused = (
-        # the Triton kernels inline NVIDIA PTX
-        device.type == "cuda" and not current_platform.is_rocm() and kda_triton._HAS_TRITON
-        and kda_triton.supported(geometry.head_k_dim) and geometry.conv_kernel_size == 4
-        and not config.full_rank_output_gate
-    )
-    return kda_triton.TritonKDAKernels() if fused else kda_torch.TorchKDAKernels()
+def _default_kernels(device: torch.device, geometry: DeltaNetGeometry, conv_dtype: torch.dtype):
+    """The fused kernels where they run the pool's shape, else the torch reference. Where they
+    would run, a dtype they don't take is a config error, not a slow fallback. A full-rank output
+    gate can still move it to the reference (`KDAManager.bind_layer`)."""
+    # the Triton kernels inline NVIDIA PTX
+    if device.type != "cuda" or current_platform.is_rocm() or not kda_triton._HAS_TRITON:
+        return kda_torch.TorchKDAKernels()
+    if not kda_triton.supported(geometry.head_k_dim):
+        reason = f"head dim {geometry.head_k_dim}"
+    elif geometry.conv_kernel_size != 4:
+        reason = f"conv width {geometry.conv_kernel_size}"
+    elif conv_dtype is not torch.bfloat16:
+        raise ValueError(
+            f"kda: the fused kernels take bf16 activations, but the pool's conv block is "
+            f"{conv_dtype}; load the KDA layers in bf16 and declare the pool's conv block "
+            "the same (DeltaNetGeometry.to_blocks(conv_dtype=torch.bfloat16))"
+        )
+    else:
+        return kda_triton.TritonKDAKernels()
+    logger.warning("kda: the fused kernels don't run %s; the torch reference runs", reason)
+    return kda_torch.TorchKDAKernels()
 
 
 class KDAManager(LinearAttnManager):
@@ -123,6 +141,7 @@ class KDAManager(LinearAttnManager):
         state_dtype: torch.dtype,
         device: torch.device,
         speculative_tokens: int = 0,
+        conv_dtype: torch.dtype = torch.bfloat16,
     ):
         if (geometry.num_k_heads != geometry.num_v_heads
                 or geometry.head_k_dim != geometry.head_v_dim):
@@ -140,7 +159,7 @@ class KDAManager(LinearAttnManager):
         self.num_layers = num_layers
         self._device = device
         self._pool_key = config.recurrent_state
-        self.kernels = _default_kernels(device, geometry, config)
+        self.kernels = _default_kernels(device, geometry, conv_dtype)
         # k of the pool's speculative blocks: a verify block spans up to k + 1 tokens
         self.speculative_tokens = speculative_tokens
 
@@ -148,6 +167,11 @@ class KDAManager(LinearAttnManager):
         self._pool: RecurrentStatePool | None = None
         # per (bucket, slot, label): a captured graph reads its layout here
         self._cg_layout: dict[CGSlotKey, torch.Tensor] = {}
+        # the verify captures that settled their count, which their replays then repeat
+        self._cg_settled: set[CGSlotKey] = set()
+        # requests that have verified: their state lags their accepted drafts, which only a
+        # verify step replays
+        self._verifying: set = set()
         self._layout_stager = PinnedStager(torch.int32)
         self._rows_stager = PinnedStager(torch.long)
         self._current: dict[str, KDAPlan] = {}
@@ -155,6 +179,27 @@ class KDAManager(LinearAttnManager):
         # it. Follows the pool, which it depends on.
         self._preplanned = False
         self._cached_plan_output: dict[str, KDAPlan] | None = None
+
+    def bind_layer(self, *, lower_bound: float, full_rank_output_gate: bool) -> None:
+        """A layer's gates, as it binds. The fused kernels apply only the low-rank output gate,
+        so a full-rank one moves every layer to the torch reference; a forget-gate bound past
+        what their decay blocks hold is refused."""
+        if not isinstance(self.kernels, kda_triton.TritonKDAKernels):
+            return
+        if full_rank_output_gate:
+            if self._current or self._preplanned:
+                raise RuntimeError("kda: a layer bound after the resource planned with its kernels")
+            logger.warning("kda: the fused kernels don't run a full-rank output gate; the torch "
+                           "reference runs")
+            self.kernels = kda_torch.TorchKDAKernels()
+            return
+        block = min(self.kernels.config.row_block, self.kernels.config.chunk)
+        if not kda_triton.bound_fits(lower_bound, block):
+            raise ValueError(
+                f"kda: forget-gate bound {lower_bound} is below the fused kernels' "
+                f"{-80.0 / (block // 2):g} (exp(|bound| * {block} / 2) must fit fp32); a "
+                "checkpoint with this bound needs a smaller kda_triton.PrefillConfig.row_block"
+            )
 
     @property
     def prefill_capturable(self) -> bool:
@@ -188,6 +233,12 @@ class KDAManager(LinearAttnManager):
             self.clear_preplan()
             return self._current
 
+        if (not step.speculative and self._verifying
+                and not self._verifying.isdisjoint(ctx.request_ids)):
+            raise ValueError(
+                "kda: a step that doesn't verify, for a request that verified; its state is "
+                "behind the drafts it accepted, which only a verify step replays"
+            )
         addressing: dict[str, RecurrentAddressing] = ctx.plan_results[self._pool_key]
         self._current = {}
         for label, segments in self._group_by_label(step.segments or ()).items():
@@ -218,13 +269,10 @@ class KDAManager(LinearAttnManager):
         rows = len(spans)
         lease = ctx.slot_lease
         num_tokens = lease.bucket.num_tokens if lease is not None else sum(spans)
-        if lease is not None:
-            # a replay runs the kernels its bucket captured, so the walk decides, not the
-            # spans: a prefill bucket of as many tokens as rows replays uneven spans
-            is_decode = not speculative and ctx.graph_walk == "decode"
-        else:
-            is_decode = (not speculative and rows > 0 and num_tokens == rows
-                         and all(s == 1 for s in spans))
+        # as GDN: a packed capture replays uneven spans, so it always takes the prefill
+        # kernels, even when it captured one token per row
+        is_decode = (not speculative and not ctx.force_prefill and rows > 0
+                     and all(s == 1 for s in spans))
         plan = KDAPlan(
             slot_ids=addressing.slot_indices[:rows],
             has_state=addressing.has_state[:rows],
@@ -239,7 +287,23 @@ class KDAManager(LinearAttnManager):
                 )
             assert num_tokens == rows * block, (num_tokens, rows, block)
             plan.is_verify, plan.block = True, block
+            if lease is not None:
+                key = CGSlotKey(bucket=lease.bucket, slot=lease.slot, label=label)
+                if ctx.capture:
+                    plan.capture_key = key
+                elif key not in self._cg_settled:
+                    raise RuntimeError(
+                        f"kda: the capture of {key} ran no set_prefix_len, so its replays "
+                        "would leave each verify step's count unsettled"
+                    )
         elif not is_decode and self.kernels is not None:
+            if lease is not None and not self.kernels.prefill_capturable:
+                # its prefill slices the spans on the host, so a replay would run the capture's
+                raise RuntimeError(
+                    f"kda: {type(self.kernels).__name__} can't run a captured prefill "
+                    f"({lease.bucket}); leave the node's prefill buckets out where "
+                    "KDAManager.prefill_capturable is False"
+                )
             targets = self._snapshot_targets(label, addressing, ctx, spans)
             plan.snapshots = targets or ()
             # an eager step without targets runs the kernels that keep none
@@ -280,7 +344,9 @@ class KDAManager(LinearAttnManager):
         previous replay on the stream that runs the step."""
         lease = ctx.slot_lease
         if lease is None:
-            return self._layout_stager.to_device(host, self._device)
+            out = torch.empty(len(host), dtype=torch.int32, device=self._device)
+            self._layout_stager.copy_(out, host)
+            return out
         key = CGSlotKey(bucket=lease.bucket, slot=lease.slot, label=label)
         buf = self._cg_layout.get(key)
         if buf is None:
@@ -346,7 +412,8 @@ class KDAManager(LinearAttnManager):
     def _window_plan(self, full: KDAPlan, pieces: list[tuple[int, int, int]]) -> KDAPlan:
         """``full`` cut to ``pieces``, (row, first token, tokens) in packed order, with the
         snapshots that fall in them."""
-        rows = self._rows_stager.to_device([row for row, _, _ in pieces], self._device)
+        rows = torch.empty(len(pieces), dtype=torch.long, device=self._device)
+        self._rows_stager.copy_(rows, [row for row, _, _ in pieces])
         spans = tuple(n for _, _, n in pieces)
         snapshots = tuple(
             (i, offset - at, slot)
@@ -362,10 +429,40 @@ class KDAManager(LinearAttnManager):
         if self.kernels is not None:
             host = self.kernels.layout(spans, plan.num_tokens, False, snapshots or None)
             if host is not None:
-                plan.layout = self._layout_stager.to_device(host, self._device)
+                plan.layout = torch.empty(len(host), dtype=torch.int32, device=self._device)
+                self._layout_stager.copy_(plan.layout, host)
         return plan
 
+    def commit(self, step: LinearAttnStep, ctx: StepContext) -> None:
+        if not step.speculative or ctx.capture:
+            return
+        if ctx.slot_lease is None:
+            # an eager forward ran this step's Python, which had to settle it
+            for label, plan in self._current.items():
+                if not plan.settled:
+                    raise RuntimeError(
+                        f"kda: a verify step under {label!r} ended without set_prefix_len"
+                    )
+        self._verifying.update(ctx.request_ids)
+
+    def remove_request(self, rid: str) -> None:
+        self._verifying.discard(rid)
+
     # Submodule-level functionality
+
+    @torch.compiler.disable
+    def settle_verify(self, label: str | None = None) -> KDAPlan:
+        """This verify step's plan, for ``KDACallable.set_prefix_len`` to write its accepted
+        count; once per step."""
+        plan = self.current_plan(label)
+        if not plan.is_verify:
+            raise RuntimeError("kda: set_prefix_len after a step that didn't verify")
+        if plan.settled:
+            raise RuntimeError("kda: set_prefix_len twice for one verify step")
+        plan.settled = True
+        if plan.capture_key is not None:
+            self._cg_settled.add(plan.capture_key)
+        return plan
 
     @torch.compiler.disable
     def run(
@@ -424,4 +521,5 @@ class KDAManager(LinearAttnManager):
 
     def cleanup(self):
         self._cg_layout.clear()
+        self._cg_settled.clear()
         self._current.clear()

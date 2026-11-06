@@ -29,7 +29,7 @@ from mstar.model.glm52.config import (
     Glm52ModelConfig,
 )
 from mstar.model.glm52.submodules import Glm52LLMSubmodule
-from mstar.model.submodule_base import ModelInputsFromEngine
+from mstar.model.submodule_base import END_PARTITION, ModelInputsFromEngine
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(),
@@ -168,6 +168,9 @@ class _Serve:
             )
             for spec in specs
         }
+        for spec in specs:  # as the engine binds them (the DSA resource reads its KV pool)
+            self.resources[spec.resource_key].bind_dependencies(
+                {key: self.resources[key] for key in spec.depends_on()})
         self.runner = StepRunner(self.resources, node_resources={NODE: list(self.resources)})
         submodule.requires_grad_(False)
         submodule.bind_node_resources(self.resources)
@@ -222,41 +225,42 @@ class _Serve:
 
 
 def _generate_greedy(model, submodule, prompt_ids, max_tokens):
-    """The real serve loop (prefill -> decode -> check_stop) on the sparse
-    path; returns (generated tokens, stopped-via-check_stop, _stored_rows before
-    retirement)."""
+    """The real serve loop (prefill -> decode -> check_stop, the decode loop capped at the
+    model's get_loop_caps as the graph runtime caps it) on the sparse path; returns
+    (generated tokens, what ended the reply: "stop" or "cap", _stored_rows before retirement)."""
     serve = _Serve(model, submodule)
     dsa = serve.resources[DSA_RESOURCE]
     info = serve.info(max_tokens)
+    cap = model.get_loop_caps(max_output_tokens=max_tokens)["decode_loop"]
     generated: list[int] = []
-    stopped = False
+    ended = "cap"
     try:
         out = serve.step("prefill", info, prompt_ids)
         new_token = out["new_token"][0]
         submodule.postprocess(serve.rid, info, out)
         generated.append(int(new_token.item()))
         next_token = out["text_inputs"][0]
-        # as the runtime: the prefill walk's stop check (it ends no loop, but marks a stop
-        # token for the first decode step), then the decode walk's
-        submodule.check_stop(serve.rid, info, out)
-        info.graph_walk = "decode"
-
-        for step in range(max_tokens + 4):  # +slack; check_stop must break first
-            out = serve.step("decode", info, next_token)
-            new_token = out["new_token"][0]
-            submodule.postprocess(serve.rid, info, out)
-            info.dynamic_loop_iter_counts["decode_loop"] = step
-            stop = submodule.check_stop(serve.rid, info, out)
-            generated.append(int(new_token.item()))
-            next_token = out["text_inputs"][0]
-            if stop:
-                stopped = True
-                break
+        # as the runtime: a prefill stop ends the request (END_PARTITION); otherwise decode
+        if END_PARTITION in submodule.check_stop(serve.rid, info, out):
+            ended = "stop"
+        else:
+            info.graph_walk = "decode"
+            for step in range(cap):
+                out = serve.step("decode", info, next_token)
+                new_token = out["new_token"][0]
+                submodule.postprocess(serve.rid, info, out)
+                info.dynamic_loop_iter_counts["decode_loop"] = step
+                stop = submodule.check_stop(serve.rid, info, out)
+                generated.append(int(new_token.item()))
+                next_token = out["text_inputs"][0]
+                if stop:
+                    ended = "stop"
+                    break
         stored = _stored_rows(serve.resources[KV_RESOURCE], serve.rid)
-        assert dsa.ctx is None  # each forward closed the context it opened on the resource
+        assert dsa.current() is not None  # the engine planned the declared DSA step
     finally:
         serve.close()
-    return generated, stopped, stored
+    return generated, ended, stored
 
 
 def _stored_rows(kv, rid):
@@ -316,9 +320,9 @@ def test_dsa_longctx_decode_past_topk(tmp_path):
     prompt_ids = torch.arange(10, 10 + PROMPT_LEN, device=DEVICE)
 
     # ---- (1) the sparse path serves and stops cleanly ------------------
-    generated, stopped, stored = _generate_greedy(model, submodule, prompt_ids, MAX_TOKENS)
-    assert stopped, "decode loop did not terminate via check_stop"
-    assert len(generated) == MAX_TOKENS, generated  # max_tokens counts the prefill-emitted token (vLLM semantics)
+    generated, ended, stored = _generate_greedy(model, submodule, prompt_ids, MAX_TOKENS)
+    # ignore_eos: only the loop cap ends it, and max_tokens counts the prefill's token (vLLM semantics)
+    assert ended == "cap" and len(generated) == MAX_TOKENS, (ended, generated)
     assert all(0 <= t < cfg.vocab_size for t in generated), generated
 
     # every stored token has its index keys, at its latent's slot

@@ -107,6 +107,7 @@ from mstar.model.cosyvoice3.submodules import (
     reference_tokens,
 )
 from mstar.model.submodule_base import NodeSubmodule
+from mstar.model.utils import check_kv_pools_fit
 from mstar.streaming.chunk_policy import ScheduledLeftContextChunkPolicy
 from mstar.streaming.topology import Connection, PartitionTopology, StreamingGraphEdge
 
@@ -134,6 +135,14 @@ MAX_TEMPERATURE = 5.0
 MAX_RAS_WINDOW = 64
 
 
+def _sizes(name: str, values: Any) -> tuple[int, ...]:
+    """A YAML list of positive integers, sorted and without repeats (the flow
+    pads a solve to the first bucket that holds it)."""
+    if isinstance(values, (str, bytes)) or not hasattr(values, "__iter__"):
+        raise ValueError(f"{name} must be a list of integers, got {values!r}")
+    return tuple(sorted({_integer(name, v, low=1) for v in values}))
+
+
 class CosyVoice3Model(Model):
     """Model contract: prompt processing, graph, partitions, resources and the
     per-partition state machine. No GPU compute lives here."""
@@ -154,6 +163,9 @@ class CosyVoice3Model(Model):
         flow_estimator_dtype: str | None = None,
         lm_dtype: str | None = None,
         max_new_tokens_limit: int | None = None,
+        flow_capture_frame_buckets: list[int] | None = None,
+        flow_capture_batch_sizes: list[int] | None = None,
+        flow_capture_batch_frames: int | None = None,
         **kwargs: Any,
     ) -> None:
         del kwargs
@@ -176,6 +188,15 @@ class CosyVoice3Model(Model):
         if flow_estimator_dtype is not None:
             _parse_dtype(str(flow_estimator_dtype))
             cfg.flow_estimator_dtype = str(flow_estimator_dtype)
+        # Captured flow solves: an empty bucket list (or a frame budget of 0)
+        # captures none, so every solve runs eagerly and startup skips the
+        # capture's time and memory.
+        if flow_capture_frame_buckets is not None:
+            cfg.flow_capture_frame_buckets = _sizes("flow_capture_frame_buckets", flow_capture_frame_buckets)
+        if flow_capture_batch_sizes is not None:
+            cfg.flow_capture_batch_sizes = _sizes("flow_capture_batch_sizes", flow_capture_batch_sizes)
+        if flow_capture_batch_frames is not None:
+            cfg.flow_capture_batch_frames = _integer("flow_capture_batch_frames", flow_capture_batch_frames, low=0)
         if max_new_tokens_limit is not None:
             cfg.max_new_tokens_limit = _integer(
                 "max_new_tokens_limit",
@@ -214,20 +235,7 @@ class CosyVoice3Model(Model):
     def validate_config_yaml(self, config: dict, config_path: str) -> None:
         """Refuse a request cap the LM KV pool cannot hold: nothing preempts a
         stream once the pool is full."""
-        cap = config.get("max_concurrent_requests")
-        if cap is None:
-            logger.warning("%s sets no max_concurrent_requests: a burst can fill the LM KV cache", config_path)
-            return
-        kv = next(s for s in self.get_node_resources() if s.resource_key == LM_KV).config
-        overrides = (config.get("resources") or {}).get(LM_KV) or {}
-        page_size = int(overrides.get("page_size", kv.page_size))
-        max_num_pages = int(overrides.get("max_num_pages", kv.max_num_pages))
-        need = 1 + int(cap) * -(-self._max_seq_len() // page_size)
-        if need > max_num_pages:
-            raise ValueError(
-                f"{config_path}: {cap} concurrent requests at {self._max_seq_len()} tokens each need "
-                f"{need} pages of resources.{LM_KV}, which has {max_num_pages}"
-            )
+        check_kv_pools_fit(self, config, config_path, logger)
 
     def get_node_resources(self) -> list[NodeResourceSpec]:
         lm = self.config.lm

@@ -14,10 +14,10 @@ from mstar.model.glm52.submodules import Glm52LLMSubmodule  # noqa: E402
 
 
 def _submodule(config) -> Glm52LLMSubmodule:
-    # get_accelerator_graph_configs reads only self.config
-    sub = object.__new__(Glm52LLMSubmodule)
-    sub.config = config
-    return sub
+    # get_accelerator_graph_configs reads the config and the ladder, not the weights
+    language_model = torch.nn.Module()
+    language_model.lm_head = torch.nn.Identity()
+    return Glm52LLMSubmodule(language_model, config)
 
 
 def _prefill_config(sub) -> PackedAcceleratorGraphConfig:
@@ -43,6 +43,30 @@ def test_prefill_buckets_default_without_kwargs():
     packed = _prefill_config(_submodule(model.config))
     assert packed.get_total_tokens(1) == Glm52LLMSubmodule.PREFILL_TOKEN_BUCKETS
     assert packed.capture_batch_sizes == Glm52LLMSubmodule.PREFILL_CAPTURE_BATCH_SIZES
+
+
+@pytest.mark.parametrize("buckets", [[], [64, 64], [64.5, 128], [True, 64], "64"])
+def test_a_bad_prefill_ladder_is_refused(buckets):
+    """Checked as Qwen3.5's and Qwen3-Omni's ladders are: an empty ladder is
+    not the default, a repeat is not captured twice, and a float, a bool or a
+    string is not read as some other ladder."""
+    model = Glm52Model("", tokenizer_mode="byte", config_variant="reduced", prefill_token_buckets=buckets)
+    with pytest.raises(ValueError, match="prefill_token_buckets"):
+        _submodule(model.config)
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"prefill_capture_batch_sizes": [0, 1]}, {"prefill_capture_batch_sizes": [-4, 1]},
+    {"prefill_capture_batch_sizes": []}, {"prefill_batched_token_buckets": [0, 256]},
+    {"prefill_batched_token_buckets": [256, 256]}, {"graph_compile": "false"},
+    {"mtp_num_draft_tokens": True}, {"mtp_num_draft_tokens": 2.5}, {"mtp_num_draft_tokens": 1023},
+])
+def test_a_bad_serving_knob_is_refused_at_load(kwargs):
+    """Each loaded before: the batch sizes failed the capture build (a ZeroDivisionError or an
+    IndexError), a 0-token bucket was captured, ``"false"`` compiled, and k=1023 refused every
+    prompt as longer than a negative limit."""
+    with pytest.raises(ValueError, match=next(iter(kwargs))):
+        Glm52Model("", tokenizer_mode="byte", config_variant="reduced", **kwargs)
 
 
 def test_config_default_buckets_unchanged():
@@ -215,13 +239,11 @@ def test_batched_prefill_buckets_get_their_own_capture():
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="triton top-k kernel on CUDA")
 @pytest.mark.parametrize("tokens", [1, 65, 1100])
 def test_router_kernel_matches_the_torch_top_k(tokens):
-    from mstar.utils.fused_moe import decode as moe_decode
-
     gate = _gate(hidden=6144, experts=256, device="cuda")
     x = torch.randn(tokens, 6144, dtype=torch.bfloat16, device="cuda")
     with torch.no_grad():  # as the engine runs it
         w_ref, ids_ref, _ = gate(x)
-        gate._topk_op = moe_decode.router_topk
+        gate.finalize_weights(topk_kernel=True)
         w, ids, _ = torch.compile(gate, fullgraph=True)(x)  # an opaque op: no graph break
     _, _, gap = _fp32_reference(gate, x)
     clear = gap > 1e-5

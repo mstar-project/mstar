@@ -191,6 +191,7 @@ class _Engine:
     check_ready = Engine.check_ready
     is_offloaded = Engine.is_offloaded
     offload_request = Engine.offload_request
+    _release_resident_slot = Engine._release_resident_slot
     reclaimable = Engine.reclaimable
     reload_request = Engine.reload_request
     take_resident_delta = Engine.take_resident_delta
@@ -209,7 +210,7 @@ class _Engine:
         self.resource = _Resource()
         self._resources = {"kv": self.resource}
         self._submodules = {
-            "node": SimpleNamespace(resources={"kv": self.resource})
+            "node": SimpleNamespace(resources={"kv": self.resource}, resident=None)
         }
         self._runner = SimpleNamespace(admit_retrieve=lambda **kw: FULL_ADMIT_OK)
         self._resident_delta = (
@@ -317,7 +318,7 @@ def test_a_partial_reload_gives_back_what_it_reloaded():
     first.offloaded = {"a"}
     second.offloaded = {"a"}
     engine._submodules = {
-        "node": SimpleNamespace(resources={"first": first, "second": second})
+        "node": SimpleNamespace(resources={"first": first, "second": second}, resident=None)
     }
 
     assert engine.reload_request("node", "a") is False
@@ -346,7 +347,7 @@ def test_a_resource_that_never_offloaded_the_request_does_not_block_its_reload()
     holder, bystander = _Unsure(), _Unsure()
     holder.offloaded = {"a"}
     engine._submodules = {
-        "node": SimpleNamespace(resources={"holder": holder, "bystander": bystander})
+        "node": SimpleNamespace(resources={"holder": holder, "bystander": bystander}, resident=None)
     }
 
     assert engine.reload_request("node", "a") is True
@@ -360,7 +361,7 @@ def test_a_resource_that_cannot_fit_stops_the_reload_before_anything_moves():
     second.offloaded = {"a"}
     first.reload = second.reload = lambda rid: pytest.fail("reloaded past a refusal")
     engine._submodules = {
-        "node": SimpleNamespace(resources={"first": first, "second": second})
+        "node": SimpleNamespace(resources={"first": first, "second": second}, resident=None)
     }
 
     assert engine.reload_request("node", "a") is False
@@ -631,7 +632,7 @@ class _Leader:
 
 def _node_batch():
     return SimpleNamespace(
-        node_name="node", graph_walk="walk", request_ids=("r0",),
+        node_name="node", graph_walk="walk", request_ids=("r0",), chunk_ranges={},
         step_context=StepContext(
             request_ids=("r0",), graph_walk="walk", slot=0, capture=False,
         ),
@@ -727,8 +728,8 @@ class _Rank:
         self.flushed_removes += 1
         self.flush_protected = set(in_flight_rids)
 
-    def _try_offload_cold_request(self, node_name, batch_ids, affected_resources=None, inside_only=False):
-        del batch_ids, affected_resources, inside_only
+    def _try_offload_cold_request(self, node_name, graph_walk, batch_ids, affected_resources=None, inside_only=False):
+        del graph_walk, batch_ids, affected_resources, inside_only
         self.offload_attempts.append(node_name)
         return "victim"
 
@@ -933,7 +934,6 @@ class _ForwardingLeader:
         # handle-keyed state, per rid_table's list
         self._in_flight_rids: set[int] = set()
         self._pending_removes: dict[int, None] = {}
-        self._last_active: dict = {}
         self.streaming_buffers: dict = {}
         # wire-string-keyed: parked teardowns and the drain bookkeeping, because
         # a handle is recycled and would reattach to the next request to get it
@@ -954,7 +954,7 @@ class _ForwardingLeader:
         )
         self.request_state = SimpleNamespace(remove_request=lambda rid: None)
         self.engine_manager = SimpleNamespace(
-            remove_request=lambda rid: None, evictable_nodes=lambda: (),
+            remove_request=lambda rid: None,
         )
         self.tensor_manager = SimpleNamespace(force_cleanup_request=lambda rid: None)
         self.streams = StreamBufferManager(self.request_state, self.tensor_manager, [])
@@ -1108,6 +1108,7 @@ class _SpecParent:
 
         class _Batch:
             node_name = "node"
+            incomplete_node_rids = frozenset()
 
             @property
             def request_to_worker_graph(self):

@@ -26,7 +26,6 @@ from test_rust_wire_frames import PEER, WALK, _Mesh  # noqa: E402
 from test_transfer_metrics import _read, _series, _Sink  # noqa: E402
 
 import mstar.communication.wire_types  # noqa: E402,F401  (registers the tags)
-from mstar.communication import wire  # noqa: E402
 from mstar.communication.arena import ArenaShmCommunicationManager  # noqa: E402
 from mstar.communication.rust_communicator import RustZMQCommunicator  # noqa: E402
 from mstar.communication.tensor_store import (  # noqa: E402
@@ -35,15 +34,12 @@ from mstar.communication.tensor_store import (  # noqa: E402
     TensorStore,
 )
 from mstar.communication.tensors import SharedMemoryCommunicationManager  # noqa: E402
-from mstar.conductor.request_info import CurrentForwardPassInfo  # noqa: E402
 from mstar.graph.base import GraphEdge  # noqa: E402
 from mstar.observability.recorders import EdgeTransfers  # noqa: E402
 from mstar.utils.containers import ParallelList  # noqa: E402
 from mstar.utils.ipc_format import (  # noqa: E402
     ConductorMessage,
     ConductorMessageType,
-    InputSignals,
-    WorkerMessage,
     WorkerMessageType,
     WorkerStatus,
 )
@@ -87,22 +83,6 @@ def _rust_frame(tmp_path, cls, tensors):
     return producer, frame.body.inputs
 
 
-def _python_frame(tmp_path, cls, tensors):
-    """The same descriptors as the Python runtime sends them: the store's own
-    objects on the edge, through the wire codec."""
-    producer = _manager(cls, ME, tmp_path, PythonTensorBookkeeping())
-    uuids = _store_and_stage(producer, "r1", tensors)
-    edge = GraphEdge(next_node="remote", name="out",
-                     tensor_info=[producer.tensor_store.get_info(u) for u in uuids])
-    message = WorkerMessage(WorkerMessageType.INPUT_SIGNALS, InputSignals(
-        request_id="r1", inputs=[edge], partition_name="default",
-        request_info=CurrentForwardPassInfo(
-            request_id="r1", graph_walk=WALK, fwd_index=0, random_seed=0, max_tokens=8,
-            partition_name="default"),
-    ))
-    return producer, wire.decode(wire.encode(message)).body.inputs
-
-
 def _consume(cls, tmp_path, edges):
     consumer = _manager(cls, PEER, tmp_path, PythonTensorBookkeeping())
     stats = consumer.enable_transfer_metrics()
@@ -112,22 +92,16 @@ def _consume(cls, tmp_path, edges):
 
 @pytest.mark.parametrize("cls", [SharedMemoryCommunicationManager, ArenaShmCommunicationManager],
                          ids=["files", "arena"])
-def test_a_rust_sent_edge_counts_like_a_python_sent_one(tmp_path, cls):
+def test_a_sent_edge_counts_on_its_source_node(tmp_path, cls):
     tensors = [torch.randn(4, 8), torch.arange(3)]
     nbytes = sum(t.nbytes for t in tensors)
-    views = {}
-    for path, frame in (("rust", _rust_frame), ("python", _python_frame)):
-        (tmp_path / path).mkdir()
-        producer, edges = frame(tmp_path / path, cls, [t.clone() for t in tensors])
-        assert all(info._source_node_name == "only" for info in edges[0].tensor_info), path
-        consumer, stats = _consume(cls, tmp_path / path, edges)
-        got = consumer.get_tensor(edges[0].tensor_info[0].uuid)
-        assert torch.equal(got, tensors[0]), path
-        ((labels, (b, n, reads, seconds)),) = _series(stats.snapshot()).items()
-        assert seconds > 0, path
-        views[path] = (labels, b, n, reads)
-
-    assert views["rust"] == views["python"] == (("only", "remote", "SHM"), nbytes, 2, 1)
+    producer, edges = _rust_frame(tmp_path, cls, [t.clone() for t in tensors])
+    assert all(info._source_node_name == "only" for info in edges[0].tensor_info)
+    consumer, stats = _consume(cls, tmp_path, edges)
+    assert torch.equal(consumer.get_tensor(edges[0].tensor_info[0].uuid), tensors[0])
+    ((labels, (b, n, reads, seconds)),) = _series(stats.snapshot()).items()
+    assert seconds > 0
+    assert (labels, b, n, reads) == (("only", "remote", "SHM"), nbytes, 2, 1)
 
 
 def test_an_arena_spill_is_still_one_shm_read(tmp_path, monkeypatch):

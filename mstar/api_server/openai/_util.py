@@ -46,7 +46,12 @@ try:
 
     def _dumps(obj: dict) -> str:
         # ~5x json.dumps; one event per token at tens of thousands a second
-        return orjson.dumps(obj).decode()
+        try:
+            return orjson.dumps(obj).decode()
+        except TypeError:
+            # orjson stops at 64-bit integers, which a request may hold and the
+            # Responses stream echoes (a tool schema's maximum)
+            return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
 except ImportError:  # pragma: no cover
     def _dumps(obj: dict) -> str:
         return json.dumps(obj)

@@ -27,6 +27,7 @@ from fastapi import FastAPI  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
 from mstar.api_server.entrypoint import APIServer  # noqa: E402
+from mstar.api_server.served_models import ServedModels  # noqa: E402
 
 
 class _Chunk:
@@ -43,10 +44,12 @@ class _StubModel:
 
 class _StubAPI:
     open_result_stream = APIServer.open_result_stream
+    lora_kwargs = APIServer.lora_kwargs
 
     def __init__(self, model_name="bagel"):
         self.model_name = model_name
         self.model = _StubModel()
+        self.served_models = ServedModels.of(model_name, None)
         self.upload_dir = Path(tempfile.mkdtemp())
         self.last_submit = None
         self._chunks: dict = {}
@@ -1040,6 +1043,18 @@ def test_a_whitespace_stop_is_seen_when_text_follows_it(client_and_stub):
 _PNG_URL = "data:image/png;base64," + base64.b64encode(
     base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==")
 ).decode()
+
+
+@pytest.mark.parametrize("model", ["qwen3_5_0.8b", "qwen3_omni"])
+def test_a_chat_refused_for_its_stream_options_leaves_no_upload(client_and_stub, model):
+    """Nothing cleans up after a chat refused before it is submitted."""
+    client, stub = client_and_stub
+    stub.model_name = model
+    r = client.post("/v1/chat/completions", json={"model": model, "stream_options": "yes", "messages": [
+        {"role": "user", "content": [{"type": "text", "text": "what is this?"},
+                                     {"type": "image_url", "image_url": {"url": _PNG_URL}}]}]})
+    assert r.status_code == 400 and stub.last_submit is None
+    assert list(stub.upload_dir.iterdir()) == []
 
 
 def _wav_b64(seconds=1, rate=16000) -> str:

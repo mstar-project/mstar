@@ -94,7 +94,7 @@ class _Harness:
     def denoise(self) -> dict[str, int]:
         """One Euler step, latents pinned at each branch's current position."""
         positions = self.positions()
-        self.run("image_gen", S_LATENT, pos_ids={
+        self.run("image_gen_guided3", S_LATENT, pos_ids={
             label: torch.zeros(
                 S_LATENT, dtype=torch.int32, device=self.device
             ) + start
@@ -189,7 +189,7 @@ def test_published_positions_travel_to_a_branch_on_another_node(harness):
 
     remote = _Harness(torch.device("cuda:0"))
     published = harness.rope.publish(RID)
-    remote.rope.admit_retrieve(RID, "LLM_cfg_text", "image_gen_cfg", published)
+    remote.rope.admit_retrieve(RID, "LLM_cfg_text", "image_gen_cfg2", published)
 
     assert remote.positions() == harness.positions()
 
@@ -200,6 +200,7 @@ def test_published_positions_travel_to_a_branch_on_another_node(harness):
 def _decode_capture_inputs(cfg_on: bool):
     """The template rows a decode capture hands declare_step and preprocess."""
     stub = types.SimpleNamespace(
+        config=types.SimpleNamespace(accelerator_graph=True),
         PREFILL_TEXT_TOKEN_BUCKETS=LLMSubmodule.PREFILL_TEXT_TOKEN_BUCKETS,
         PREFILL_TEXT_CAPTURE_BATCH_SIZES=(
             LLMSubmodule.PREFILL_TEXT_CAPTURE_BATCH_SIZES

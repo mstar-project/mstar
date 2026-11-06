@@ -738,6 +738,7 @@ def test_flashinfer_paged_prefill_attention_matches_sdpa():
 
     Both scenarios are compared against torch SDPA on the same Q,K,V values.
     """
+    from mstar.engine.resources.attn.workspace import Workspace
     from mstar.engine.resources.attn.wrappers import FlashInferPrefillWrapper
 
     torch.manual_seed(0)
@@ -752,7 +753,7 @@ def test_flashinfer_paged_prefill_attention_matches_sdpa():
     kv_cache_layer = torch.zeros(
         max_pages, 2, page_size, num_kv_heads, head_dim, device=DEVICE, dtype=MSTAR_DTYPE
     )
-    workspace = torch.empty(256 * 1024 * 1024, dtype=torch.uint8, device=DEVICE)
+    workspace = Workspace(torch.empty(256 * 1024 * 1024, dtype=torch.uint8, device=DEVICE), "test")
     wrapper = FlashInferPrefillWrapper(
         workspace, num_qo_heads, num_kv_heads, head_dim, page_size, device=DEVICE
     )

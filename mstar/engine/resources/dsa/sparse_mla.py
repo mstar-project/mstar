@@ -155,6 +155,12 @@ class EagerSparsePlan:
             self.chunks.append((r0, r1, wrapper, indices,
                                 indptr.to(device, non_blocking=True), chunk.to(device, non_blocking=True)))
 
+    @classmethod
+    def of_chunks(cls, chunks: list) -> EagerSparsePlan:
+        plan = cls.__new__(cls)
+        plan.chunks = chunks
+        return plan
+
     def attend(self, q_nope, q_pe, latent, slots) -> torch.Tensor:
         q_nope, q_pe, ckv, kpe = _split(q_nope, q_pe, latent)
         out = q_nope.new_empty(q_nope.shape)
@@ -162,6 +168,55 @@ class EagerSparsePlan:
             _pack(indices, slots[r0:r1], indptr, lens)
             out[r0:r1] = wrapper.run(q_nope[r0:r1], q_pe[r0:r1], ckv, kpe)
         return out
+
+
+class EagerSparsePlans:
+    """Eager plans a resource reuses across forwards and a long prefill's windows: one
+    workspace, and two sets of chunk wrappers taken in turn. FlashInfer copies a plan to the
+    device out of a pinned buffer its wrapper keeps, so re-planning a set waits for that set's
+    last copy (an event recorded after it), not for the stream; after the first plans nothing
+    is allocated or freed under a copy in flight."""
+
+    def __init__(self, device: torch.device):
+        self._device = device
+        self._workspace: torch.Tensor | None = None
+        # per set: (wrapper, index buffer) per chunk of MAX_ROWS rows
+        self._sets: tuple[list, list] = ([], [])
+        self._planned: list[torch.cuda.Event | None] = [None, None]
+        self._turn = 0
+
+    def plan(self, lens: list[int], width: int, heads: int, kv_lora_rank: int, kpe: int,
+             sm_scale: float) -> EagerSparsePlan:
+        import flashinfer
+
+        turn, self._turn = self._turn, 1 - self._turn
+        if self._planned[turn] is not None:
+            self._planned[turn].synchronize()
+        if self._workspace is None:
+            self._workspace = torch.empty(WORKSPACE_BYTES, dtype=torch.uint8, device=self._device)
+        wrappers = self._sets[turn]
+        lens = _lens(lens, width)
+        chunks = []
+        for i, r0 in enumerate(range(0, len(lens), MAX_ROWS)):
+            r1 = min(r0 + MAX_ROWS, len(lens))
+            need = (r1 - r0) * width + 1  # + the spare entry _pack writes the unused slots to
+            if i == len(wrappers):
+                wrappers.append((
+                    flashinfer.mla.BatchMLAPagedAttentionWrapper(self._workspace, backend="auto"),
+                    torch.empty(MAX_ROWS * width + 1, dtype=torch.int32, device=self._device)))
+            wrapper, indices = wrappers[i]
+            if indices.numel() < need:  # a wider plan than the buffer's first
+                indices = torch.empty(MAX_ROWS * width + 1, dtype=torch.int32, device=self._device)
+                wrappers[i] = (wrapper, indices)
+            chunk = torch.tensor(lens[r0:r1], dtype=torch.int32)
+            indptr = torch.cat([chunk.new_zeros(1), chunk.cumsum(0, dtype=torch.int32)])
+            _plan(wrapper, indices[:need], lens[r0:r1], heads, kv_lora_rank, kpe, sm_scale)
+            chunks.append((r0, r1, wrapper, indices[:need],
+                           indptr.to(self._device, non_blocking=True),
+                           chunk.to(self._device, non_blocking=True)))
+        self._planned[turn] = torch.cuda.Event()
+        self._planned[turn].record()
+        return EagerSparsePlan.of_chunks(chunks)
 
 
 def reference(q_nope: torch.Tensor, q_pe: torch.Tensor, latent: torch.Tensor,

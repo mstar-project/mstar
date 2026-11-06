@@ -13,7 +13,7 @@ Where the APIs differ:
   which Codex reads and sends back. There is no summary, and
   ``encrypted_content`` stays unset: the reasoning is no secret.
 * ``reasoning.effort`` asks the template for ``low`` (``minimal``, ``low``),
-  ``high`` (``medium``) or ``max`` (``high``, ``xhigh``), or for its lowest
+  ``high`` (``medium``, ``high``) or ``max`` (``xhigh``), or for its lowest
   level when it has no such one; ``none`` turns thinking off.
 * A reply cut off by ``max_output_tokens`` is ``incomplete``, and so is a call
   it cut, its ``arguments`` as far as they got.
@@ -24,7 +24,6 @@ from __future__ import annotations
 from mstar.api_server.openai import reply
 from mstar.api_server.openai._util import now, rid, sse
 from mstar.api_server.openai.protocol import ChatCompletionRequest
-from mstar.api_server.streaming_response import ReleasingStreamingResponse
 
 _FIELDS = {"model", "input", "instructions", "tools", "tool_choice", "parallel_tool_calls", "max_output_tokens",
            "reasoning", "temperature", "top_p", "stream", "store", "include", "text", "truncation",
@@ -62,7 +61,8 @@ def to_chat_request(body, efforts: tuple[str, ...]) -> ChatCompletionRequest:
     if body.get("instructions"):
         messages.append({"role": "system", "content": body["instructions"]})
     messages += _input(body.get("input"))
-    chat: dict = {"messages": messages, "stream": body.get("stream") or False}
+    # the model names a LoRA adapter as on chat completions; with none served any name runs the model
+    chat: dict = {"model": body.get("model"), "messages": messages, "stream": body.get("stream") or False}
     if body.get("max_output_tokens") is not None:
         chat["max_tokens"] = body["max_output_tokens"]
     for key in ("temperature", "top_p", "parallel_tool_calls"):
@@ -221,27 +221,12 @@ async def create_response(api, model_name, adapter, body, raw_request=None):
     args = adapter.chat_to_request(req, api.upload_dir)
     parser = adapter.make_output_parser(req)
     request_id = rid("resp")
-    api.submit_request(
-        text=args.text,
-        input_modalities=args.input_modalities,
-        output_modalities=args.output_modalities,
-        model_kwargs=args.model_kwargs,
-        prompt_parts=args.prompt_parts,
-        streaming=bool(req.stream),
-        request_id=request_id,
-    )
+    model_name = reply.submit(api, request_id, model_name, req, args)
     usage = reply.Usage()
     response = _Response(model_name, request_id, body)
     if req.stream:
-        key = api.submission_key(request_id)  # named before the wait
-        # a request the engine refuses gets its status, not a 200
-        batches = await api.open_result_stream(request_id, raw_request, batches=True)
-        events = reply.reply_events(api, request_id, parser, None, usage, batches=batches, key=key)
-        return ReleasingStreamingResponse(
-            _stream(response, events, usage),
-            release=lambda: api.release_request(request_id),
-            media_type="text/event-stream", headers={"Cache-Control": "no-cache"},
-        )
+        events = await reply.stream_events(api, request_id, raw_request, parser, None, usage)
+        return reply.sse_response(api, request_id, _stream(response, events, usage))
     events = reply.reply_events(api, request_id, parser, None, usage)
     for e in await reply.collect(events, raw_request):
         response.add(e)

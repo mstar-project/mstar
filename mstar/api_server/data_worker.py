@@ -9,15 +9,15 @@ import threading
 import time
 from collections import deque
 from collections.abc import Callable, Collection, Container
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future
 from dataclasses import dataclass, field
 from functools import cached_property
+from typing import NamedTuple
 
 import torch
 
-from mstar.graph.base import TensorPointerInfo
+from mstar.graph.base import GraphEdge, TensorPointerInfo
 from mstar.graph.loop_indices import NestedLoopIndices
-from mstar.model.components.diffusion.image_io import PNG_WORKERS
 
 try:
     import torchaudio  # noqa: F401 — probes availability; real usage in callers
@@ -44,10 +44,21 @@ from mstar.communication.tensors import (
     NameToTensorList,
     create_tensor_communication_manager,
 )
-from mstar.engine.resources.kv.config import KVSpec, PagedKVConfig
+from mstar.engine.resources.kv.config import KVSpec, prefix_caches_by_rank
 from mstar.engine.resources.kv.keys import PageItem, chain, end_key, fingerprint, page_items
-from mstar.engine.resources.spec import apply_yaml_overrides
-from mstar.model.base import ClientChunk, Model, PrefixKeys, ProcessPromptOutput, Span, keyed_labels
+from mstar.engine.resources.lora.config import LORA_ADAPTER_KWARG
+from mstar.engine.resources.lora.identity import AdapterPrefixRoots
+from mstar.engine.resources.lora.serving import lora_specs
+from mstar.model.base import (
+    ClientChunk,
+    Model,
+    PrefixKeys,
+    ProcessPromptOutput,
+    Span,
+    keyed_labels,
+    names_checkpoint,
+    serving_resources,
+)
 from mstar.model.media_limits import (
     RequestMediaBudget,
     charge_decoded_audio,
@@ -58,24 +69,30 @@ from mstar.model.media_limits import (
 from mstar.observability.catalog import STATUS_INTERVAL_S
 from mstar.observability.recorders import EdgeTransfers
 from mstar.profile.format import InputInfo, RxInfo, TxInfo
-from mstar.streaming.topology import ClientStreamLimits, client_stream_limits
-from mstar.utils import profiler
+from mstar.streaming.topology import (
+    CLIENT,
+    ClientStreamLimits,
+    client_stream_limits,
+)
+from mstar.utils import cpus, profiler
 from mstar.utils.client_errors import client_error_text
-from mstar.utils.cpus import usable_cpus
 from mstar.utils.ipc_format import (
     AbortRequest,
-    ClientStreamInput,
+    ClientStreamRoute,
     ConductorMessage,
     ConductorMessageType,
     DrainRequest,
     EnableMetrics,
+    InputSignals,
     NewRequestConductor,
     ReadsDone,
     RemoveRequest,
     TensorReceived,
     UnpersistTensors,
+    WorkerMessage,
     WorkerMessageType,
 )
+from mstar.utils.threads import Thread, ThreadPool
 
 logger = logging.getLogger(__name__)
 
@@ -94,26 +111,6 @@ def pooled_output(modality: str, loop_indices: NestedLoopIndices | None) -> bool
     return modality in ARTIFACT_MODALITIES and not streamed
 
 
-def encode_workers(cpus: int | None = None, png_workers: int | None = None) -> int:
-    """Outputs encoded at once. A PNG deflates on ``png_workers`` threads of
-    its own (``image_io.PNG_WORKERS``), so the pool times that stays within
-    the CPUs the process may use."""
-    if cpus is None:
-        cpus = usable_cpus()
-    if png_workers is None:
-        png_workers = PNG_WORKERS
-    return max(1, min(4, cpus // png_workers))
-
-
-def copy_workers(cpus: int | None = None, png_workers: int | None = None) -> int:
-    """Threads a large output read copies over (``host_copy.HostCopier``): one
-    encode's share of the CPUs in the budget ``encode_workers`` sets. Reads run
-    one at a time on the data worker's thread, each ahead of its own encode."""
-    if cpus is None:
-        cpus = usable_cpus()
-    return max(1, cpus // encode_workers(cpus, png_workers))
-
-
 def _sha256(path: str) -> bytes:
     with open(path, "rb") as file:
         return hashlib.file_digest(file, "sha256").digest()
@@ -122,6 +119,12 @@ def _sha256(path: str) -> bytes:
 def _file_state(path: str) -> tuple[int, int, int]:
     stat = os.stat(path)
     return stat.st_ino, stat.st_size, stat.st_mtime_ns
+
+
+def _prefix_cache(model_kwargs: dict) -> bool:
+    """A client's prefix_cache: unset or None is on, otherwise its truth."""
+    value = model_kwargs.get("prefix_cache")
+    return value is None or bool(value)
 
 
 class _FileChangedError(Exception):
@@ -171,11 +174,21 @@ def _video_frame_metadata(
 class InlineTokens:
     """One RESULT_TOKENS frame's values for the requests still known here,
     queued behind the tensor results so each request's chunks keep arrival
-    order. One item per frame, not per request. No loop indices: a chunk's
+    order. One item per frame, not per request, so the data worker wakes the
+    message thread once per step (``ResultQueue``). No loop indices: a chunk's
     order is its arrival sequence, and nothing reads them."""
     request_ids: list[str]
     values: list[int]
     modality: str
+    # per request, or None when no request of the frame asked
+    logprobs: list[float | None] | None = None
+
+
+def _answer_late(on_late: Callable[[str], None] | None, streams: list[str]) -> None:
+    """Answer a client's append as late, naming ``streams``, which take no
+    more items."""
+    if streams and on_late is not None:
+        on_late(f"the call's {', '.join(map(repr, sorted(streams)))} input has ended")
 
 
 def unlink_files(file_paths: dict[str, list[str]] | None) -> None:
@@ -220,14 +233,65 @@ def _preprocess_loop(**kwargs):
 
 
 def _kv_page_sizes(model: Model, model_config: dict) -> dict[str, int]:
-    """Page size per KV resource whose prefix cache is on, after this deployment's YAML has been applied."""
-    specs = model.get_node_resources()
-    apply_yaml_overrides(specs, model_config)
+    """Page size per KV resource whose prefix cache some rank's engine opens, after this deployment's
+    YAML has been applied."""
+    specs = serving_resources(model, model_config)
+    groups = [
+        (group["ranks"], int(group.get("tp_size", 1)) * int(group.get("sp_size", 1)), group["node_names"])
+        for group in model_config.get("node_groups") or []
+    ]
+    opened = frozenset().union(*prefix_caches_by_rank(specs, groups, names_checkpoint(model)).values())
     return {
-        spec.resource_key: spec.config.page_size
-        for spec in specs
-        if isinstance(spec, KVSpec) and isinstance(spec.config, PagedKVConfig) and spec.config.prefix_cache
+        spec.resource_key: spec.config.tokens_per_page for spec in specs
+        if isinstance(spec, KVSpec) and spec.resource_key in opened
     }
+
+
+def adapter_prefix_roots(
+    model: Model | None, model_config: dict | None,
+    digests: dict[str, bytes] | None = None,
+) -> AdapterPrefixRoots | None:
+    """The roots the deployment's LoRA adapters key their prompts under.
+
+    None when the deployment keys no label or serves no adapter. Otherwise each adapter
+    is keyed under its digest in ``digests`` (the API server's startup check) or read
+    once, here, so its digest names the weights as they were when it was registered and
+    no request pays for reading it.
+    """
+    if model is None or not model_config or not keyed_labels(model):
+        return None
+    # LoRA first: a deployment without it leaves its `resources:` block to the conductor
+    lora = lora_specs(model, model_config)
+    if not lora or not _kv_page_sizes(model, model_config):
+        return None
+    return AdapterPrefixRoots.read(lora[0], digests)
+
+
+class ResultQueue(queue.Queue):
+    """What the data worker hands the API message thread: output chunks, or
+    profile updates.
+
+    A put doesn't wake that thread: ``flush`` signals ``wakeup`` once for
+    everything put since the last flush. The data worker thread flushes after
+    each item it takes and after its reads. A RESULT_TOKENS frame is one item
+    whose chunks are put as it is taken, so a token step costs the message
+    thread two passes however many rows it had, one for the frame's arrival and
+    one for its chunks. A result tensor is one request's edge, and taking it
+    only starts a read, whose chunks go out with the flush after the reads."""
+
+    def __init__(self, wakeup: EventWakeup):
+        super().__init__()
+        self.wakeup = wakeup
+        self._unsignaled = False
+
+    def put(self, item, block=True, timeout=None):
+        super().put(item, block, timeout)
+        self._unsignaled = True
+
+    def flush(self) -> None:
+        if self._unsignaled:
+            self._unsignaled = False
+            self.wakeup.signal()
 
 
 class PreprocessWorker:
@@ -241,17 +305,29 @@ class PreprocessWorker:
         enable_prof: bool=False,
         model_config: dict | None = None,
         enable_nvtx: bool=False,
+        adapter_digests: dict[str, bytes] | None = None,
         is_pending: Callable[[str], bool] | None = None,
     ):
+        """``adapter_digests`` are the serving config's LoRA adapters' digests, as the API
+        server's startup check read them."""
         check_media_limits()
+        # Here, before the thread starts: the thread reads it as it starts, and
+        # a value it cannot take would end the thread with every request waiting.
+        workers = (model_config or {}).get("preprocess_workers")
+        if workers is not None and (isinstance(workers, bool) or not isinstance(workers, int) or workers < 1):
+            raise ValueError(f"preprocess_workers must be a positive integer, got {workers!r}")
         self.request_input_queue = queue.Queue()
         self.result_tensor_input_queue = queue.Queue()
         self.cleanup_request_queue = queue.Queue()
         self.abort_request_queue = queue.Queue()
         self.reads_done_queue = queue.Queue()
         self.discard_tensor_queue = queue.Queue()
-        self.output_queue = queue.Queue()
-        self.profile_queue = queue.Queue()
+        # Ends the API message thread's poll: the flushes of these two queues,
+        # and the API server when a request handler changes what that
+        # thread's next pass reads, signal it.
+        self.results_wakeup = EventWakeup()
+        self.output_queue = ResultQueue(self.results_wakeup)
+        self.profile_queue = ResultQueue(self.results_wakeup)
         # Set by report_preprocess_finish(); read by the worker thread.
         self.timing_requested = threading.Event()
         # Set by enable_worker_metrics(); the worker thread tells the conductor.
@@ -285,10 +361,13 @@ class PreprocessWorker:
             communicator=self.communicator,
             tcp_transfer_device=tcp_transfer_device,
             enable_prof=enable_prof,
-            copy_workers=copy_workers(),
+            copy_workers=cpus.plan().copy_workers,
         )
 
-        self.thread = threading.Thread(
+        # the serving config's adapters' prefix-cache roots
+        self.adapter_prefix_roots = adapter_prefix_roots(model, model_config, adapter_digests)
+
+        self.thread = Thread(
             target=_preprocess_loop,
             kwargs=dict(
                 in_queue=self.request_input_queue,
@@ -309,6 +388,7 @@ class PreprocessWorker:
                 worker_metrics_requested=self.worker_metrics_requested,
                 model_config=model_config,
                 enable_nvtx=enable_nvtx,
+                adapter_roots=self.adapter_prefix_roots,
                 is_pending=is_pending,
             )
         )
@@ -402,6 +482,7 @@ class PreprocessWorker:
 
     def new_result_tokens(
         self, request_ids: list[str], values: list[int], signal: str, modality: str,
+        logprobs: list[float | None] | None = None,
     ):
         """A frame's values that rode inline: the same accounting per request
         as a result tensor, no transport read and nothing to ack. A request
@@ -410,7 +491,8 @@ class PreprocessWorker:
         reading = self.per_request_reading_tensors
         kept_ids: list[str] = []
         kept_values: list[int] = []
-        for rid, value in zip(request_ids, values, strict=True):
+        kept_logprobs: list[float | None] = []
+        for i, (rid, value) in enumerate(zip(request_ids, values, strict=True)):
             counts = counts_by_rid.get(rid)
             if counts is None:
                 logger.debug("Late token for cleaned-up request %s dropped", rid)
@@ -419,8 +501,12 @@ class PreprocessWorker:
             reading[rid] += 1
             kept_ids.append(rid)
             kept_values.append(value)
+            if logprobs:
+                kept_logprobs.append(logprobs[i])
         if kept_ids:
-            self.result_tensor_input_queue.put(InlineTokens(kept_ids, kept_values, modality))
+            self.result_tensor_input_queue.put(
+                InlineTokens(kept_ids, kept_values, modality, kept_logprobs or None)
+            )
             self._signal()
 
     def discard_result_tensors(self, input: ResultTensors):
@@ -550,6 +636,62 @@ class RequestOutputState:
     prompt_tokens: int | None = None
 
 
+class EncodedOutput(NamedTuple):
+    """An output encoded on the pool, waiting for the data worker to queue its chunk."""
+    future: Future  # of ``(bytes, seconds in Model.postprocess)``
+    request_id: str
+    state: RequestOutputState
+    sequence: int
+    modality: str
+    metadata: dict
+    uuid: int
+    read_time: float | None  # with ``enable_prof``: when the tensor's read began
+
+
+class HeldItems(NamedTuple):
+    """Client stream items stored before their call's route arrived."""
+
+    signals: dict[str, list[TensorPointerInfo]]
+    # the append's late answer; None for items that came with the request
+    on_late: Callable[[str], None] | None
+
+
+@dataclass(slots=True)
+class ClientCall:
+    """A call's client streams, as their producer. The data worker sends each
+    item to the ranks of the node that consumes it, and then each stream's end
+    with the number of items it carried."""
+
+    # the conductor's dispatch CLIENT_STREAM_ROUTE, with a later route's rank
+    # lists merged in; None until it arrives
+    route: ClientStreamRoute | None = None
+    # items stored before the route arrived, each with its append's on_late,
+    # sent in this order once it does
+    held: list[HeldItems] = field(default_factory=list)
+    # stream edge -> items sent to each of its ranks
+    items_sent: dict[str, int] = field(default_factory=dict)
+    # streams that take no more items: the client ended them, or their
+    # consuming partition has ended
+    ended: set[str] = field(default_factory=set)
+    # stream edge -> what it carried, charged against its max_items
+    charged: dict[str, int] = field(default_factory=dict)
+
+
+class PreparedInput(NamedTuple):
+    """What a request's preparation hands back: its tensors, their metadata
+    and its kwargs, none of them stored or sent yet."""
+    tensors: NameToTensorList
+    input_metadata: dict[str, list[dict]]
+    model_kwargs: dict
+
+
+class PreparingInput(NamedTuple):
+    """A request on the prepare pool, queued in arrival order."""
+    input: PreprocessInput
+    profile: DataWorkerProfile | None
+    future: Future[PreparedInput]
+
+
 class PreprocessWorkerThread:
     # next time the thread publishes its transfer counts; class-level so a
     # thread built without __init__ has one
@@ -557,7 +699,12 @@ class PreprocessWorkerThread:
     # class-level so a thread built without __init__ never sends ENABLE_METRICS
     worker_metrics_requested: threading.Event | None = None
     # None (a thread built without __init__) postprocesses every output inline
-    _encode_pool: ThreadPoolExecutor | None = None
+    _encode_pool: ThreadPool | None = None
+    # class-level so a thread built without __init__ stamps no read times
+    enable_prof = False
+    # None (no model that declares it, one CPU's worth of workers, or a thread
+    # built without __init__) prepares every request inline
+    _prepare_pool: ThreadPool | None = None
     # Appends handled per pass before output delivery gets its turn again: one
     # for each of up to 32 live calls appending at once. An append costs a file
     # decode, far less than a request's preprocess, which is one per pass.
@@ -567,8 +714,8 @@ class PreprocessWorkerThread:
         self,
         in_queue: queue.Queue, # for preprocessing
         result_tensor_queue: queue.Queue, # for output streaming
-        out_queue: queue.Queue,
-        profile_queue: queue.Queue,
+        out_queue: ResultQueue,
+        profile_queue: ResultQueue,
         cleanup_request_queue: queue.Queue,
         abort_request_queue: queue.Queue,
         reads_done_queue: queue.Queue,
@@ -584,8 +731,10 @@ class PreprocessWorkerThread:
         wakeup: EventWakeup | None = None,
         timing_requested: threading.Event | None = None,
         worker_metrics_requested: threading.Event | None = None,
+        adapter_roots: AdapterPrefixRoots | None = None,
         is_pending: Callable[[str], bool] | None = None,
     ):
+        self._adapter_roots = adapter_roots
         # keying a label needs the deployment's page size as well as the
         # model's declaration, so a worker built without a config keys no label
         declared = keyed_labels(model) if model is not None and model_config else {}
@@ -594,15 +743,16 @@ class PreprocessWorkerThread:
         self._keyed_labels = {
             key: by_label for key, by_label in declared.items() if key in self._prefix_page_sizes
         }
+        # client stream edge -> the partition it flows into, which its items and
+        # ends name; the consuming node comes in the conductor's route
+        self._client_partitions = {
+            conn.edge_name: conn.to_partition for conn in model.get_partition_topology().client_connections()
+        } if model is not None else {}
         # tensors under these names are client stream items, not prompt signals
-        self._client_edges = frozenset(
-            conn.edge_name for conn in model.get_partition_topology().client_connections()
-        ) if model is not None else frozenset()
+        self._client_edges = frozenset(self._client_partitions)
         self._model_config = model_config
-        # per request, what each of those streams has carried so far
-        self._stream_items: dict[str, dict[str, int]] = {}
-        # per request, the client streams its client has ended
-        self._ended_streams: dict[str, set[str]] = {}
+        # per request of a model with client streams, those streams' state
+        self._client_calls: dict[str, ClientCall] = {}
         self.in_queue = in_queue
         # Whether the API server still waits on a submission (see
         # _process_waiting_input); None (tests) takes everything.
@@ -658,12 +808,33 @@ class PreprocessWorkerThread:
         # with a bare communicator).
         self.wakeup = wakeup
         self.idle_wait_ms = 20
-        self._encode_pool = ThreadPoolExecutor(
-            max_workers=encode_workers(), thread_name_prefix="mstar-encode",
+        self._encode_pool = ThreadPool(
+            max_workers=cpus.plan().encode_workers, thread_name_prefix="mstar-encode",
         )
         # Finished encodes, appended by the pool's done callbacks and released
         # by this thread, which alone touches the per-request output state.
-        self._encoded: deque = deque()
+        self._encoded: deque[EncodedOutput] = deque()
+        self._prepare_workers = self._num_prepare_workers()
+        if self._prepare_workers > 1:
+            self._prepare_pool = ThreadPool(
+                max_workers=self._prepare_workers, thread_name_prefix="mstar-prepare",
+            )
+        # Requests on the prepare pool, oldest first. They reach the conductor
+        # in this order, whichever finishes first.
+        self._preparing: deque[PreparingInput] = deque()
+
+    def _num_prepare_workers(self) -> int:
+        """Requests prepared at once. A model has to declare that its loaders
+        and ``process_prompt`` may overlap, and client streams need their
+        appends handled behind the request, so anything else runs inline."""
+        if not getattr(self.model, "PREPROCESS_PARALLEL", False) or self._client_edges:
+            return 1
+        workers = (self._model_config or {}).get("preprocess_workers")
+        if workers is not None:
+            return int(workers)
+        # each request runs on this process's intra-op pool, which the config
+        # or the model may size above the plan's default
+        return cpus.plan().prepare_workers(torch.get_num_threads())
 
     def _cleanup_request_state(self, request_id: str, *, force: bool = False) -> None:
         """Release transport and postprocessing state owned by this thread.
@@ -689,8 +860,7 @@ class PreprocessWorkerThread:
             "tensor_uuid_to_metadata_per_request",
             "request_model_kwargs",
             "request_output_state",
-            "_stream_items",
-            "_ended_streams",
+            "_client_calls",
         ):
             state = getattr(self, state_name, None)
             if state is not None:
@@ -730,9 +900,20 @@ class PreprocessWorkerThread:
     def _process_input(
         self, input: PreprocessInput, profile: DataWorkerProfile | None = None,
     ):
-        file_states: dict[str, list[tuple[int, int, int]]] = {}
+        self._start_input(input)
+        self._finish_input(input, self._prepare_input(input), profile)
+
+    def _start_input(self, input: PreprocessInput) -> None:
+        """Count the request as started here. On this thread, as it leaves the
+        queue, so a release later in the queue's order finds it."""
         self._live_requests[input.request_id] = self._live_requests.get(input.request_id, 0) + 1
         self.in_flight_requests.add(input.request_id)
+
+    def _prepare_input(self, input: PreprocessInput) -> PreparedInput:
+        """Decode the request's media and run the model's prompt processing.
+        Runs on the prepare pool when there is one, so it reads only what
+        ``__init__`` fixed and writes nothing the thread owns."""
+        file_states: dict[str, list[tuple[int, int, int]]] = {}
 
         # First, load raw modality tensors from file_paths (images, audio, video)
         # so they can be passed to process_prompt() below.
@@ -746,15 +927,15 @@ class PreprocessWorkerThread:
 
         # Then, tokenize the prompt and let the model augment/transform the
         # tensors dict (e.g., Qwen3-Omni needs to compute pixel_values,
-        # image_grid_thw, audio_features, audio_seqlens from the raw tensors
-        # loaded above).  process_prompt receives the raw multimodal tensors
+        # image_grid_thw and audio_features from the raw tensors loaded
+        # above).  process_prompt receives the raw multimodal tensors
         # and returns any additional tensors to merge into the final dict.
         model_kwargs = dict(input.model_kwargs or {})
         # only this worker keys a prompt: a client that sent its own could name
         # another request's pages and be served that request's KV. Likewise
         # only process_prompt sets the model's INTERNAL_KWARGS.
         internal = getattr(self.model, "INTERNAL_KWARGS", ())
-        for name in ("prefix_keys", "prefix_tail", "prefix_decode", "kv_layout", *internal):
+        for name in ("prefix_keys", "prefix_tail", "prefix_decode", "kv_layout", "prefix_root", *internal):
             model_kwargs.pop(name, None)
         if self.model is not None:
             prompt_tensors = self.model.process_prompt(
@@ -780,9 +961,10 @@ class PreprocessWorkerThread:
                 model_kwargs["kv_layout"] = rows
             # after the update: the chain keys the tensors the request will
             # actually be prefilled with
-            if model_kwargs.get("prefix_cache") is not False:
+            if _prefix_cache(model_kwargs):
                 model_kwargs.update(self._prefix_keys(
                     tensors, layouts, rows, input.file_paths, file_states,
+                    adapter=model_kwargs.get(LORA_ADAPTER_KWARG),
                 ))
         elif input.text is not None:
             # Fallback: encode as UTF-8 bytes -> uint8 tensor
@@ -790,22 +972,32 @@ class PreprocessWorkerThread:
             tensors["text_inputs"] = [torch.tensor(
                 list(byte_data), dtype=torch.uint8, device=self.device
             )]
+        return PreparedInput(tensors, input_metadata, model_kwargs)
+
+    def _finish_input(
+        self, input: PreprocessInput, prepared: PreparedInput, profile: DataWorkerProfile | None,
+    ) -> None:
+        """Store a prepared request's tensors and hand it to the conductor."""
+        tensors, input_metadata, model_kwargs = prepared
 
         # A client stream's first chunk, not a prompt signal: a one-shot upload
         # is a stream of one chunk. Stored before the request reaches the
-        # conductor, so a failure here still finds no remote reader.
-        stream_items = {name: tensors.pop(name) for name in self._client_edges if name in tensors}
-        self._charge_stream_items(input.request_id, stream_items)
-        stream_signals = self._store_persisted(input.request_id, stream_items)
+        # conductor, so a failure here still finds no remote reader; held
+        # until the conductor's route says where it goes.
+        stream_items = {name: items for name in self._client_edges if (items := tensors.pop(name, None))}
+        call = None
+        if self._client_edges:
+            call = self._client_calls[input.request_id] = ClientCall(ended=set(input.ends))
+            self._charge_stream_items(call, stream_items)
         initial_signals = self._store_persisted(input.request_id, tensors)
+        if stream_items:
+            call.held.append(HeldItems(self._store_held(input.request_id, stream_items), None))
 
         self.request_model_kwargs[input.request_id] = model_kwargs
         prompt_ids = tensors.get("text_inputs") if self.model is not None else None
         self.request_output_state[input.request_id] = RequestOutputState(
             prompt_tokens=sum(t.numel() for t in prompt_ids) if prompt_ids else None,
         )
-        if input.ends:
-            self._ended_streams[input.request_id] = set(input.ends)
         preprocess_only = getattr(self.model, "PREPROCESS_ONLY_KWARGS", ())
         conductor_kwargs = {k: v for k, v in model_kwargs.items() if k not in preprocess_only}
         msg = ConductorMessage(
@@ -818,9 +1010,7 @@ class PreprocessWorkerThread:
                 input_metadata=input_metadata,
                 model_kwargs=conductor_kwargs,
                 client_request_id=input.client_request_id,
-                client_input=ClientStreamInput(
-                    request_id=input.request_id, signals=stream_signals, ended=sorted(input.ends),
-                ) if self._client_edges else None,
+                input_open=bool(self._client_edges - input.ends),
             ),
         )
         self.communicator.send("conductor", msg)
@@ -864,11 +1054,12 @@ class PreprocessWorkerThread:
         )
 
     def _process_stream_input(self, chunk: ClientAppend) -> None:
-        """Load an append, turn it into stream items and hand them to the
-        conductor. The thread owns an append's files and deletes them here."""
+        """Load an append, turn it into stream items and send them to their
+        consumers. The thread owns an append's files and deletes them here."""
         request_id = chunk.request_id
         try:
-            if request_id not in self.in_flight_requests or request_id in self._draining_rids:
+            call = self._client_calls.get(request_id)
+            if call is None or self._torn_down(request_id):
                 return  # ended, failed or aborted: nothing will read it
             items: NameToTensorList = {}
             if chunk.file_paths or chunk.text:
@@ -881,30 +1072,99 @@ class PreprocessWorkerThread:
                     )
                 if chunk.text and not any(items.values()):
                     raise ValueError("this model takes no text in an append")
-                items = self._without_ended_streams(chunk, items)
-                self._charge_stream_items(request_id, items)
-            if items or chunk.ends:
-                self._send_stream_input(
-                    request_id, self._store_persisted(request_id, items), ended=chunk.ends,
-                )
-            if chunk.ends:
-                self._ended_streams.setdefault(request_id, set()).update(chunk.ends)
+                items = self._without_ended_streams(call, chunk, items)
+                self._charge_stream_items(call, items)
+            items = {name: tensors for name, tensors in items.items() if tensors}
+            if items:
+                self._send_stream_items(request_id, call, self._store_held(request_id, items), chunk.on_late)
+            ending = chunk.ends - call.ended
+            call.ended |= ending
+            if ending and call.route is not None:  # else they go once the route arrives
+                self._send_ends(request_id, call, ending)
         finally:
             unlink_files(chunk.file_paths)
 
-    def _without_ended_streams(self, chunk: ClientAppend, items: NameToTensorList) -> NameToTensorList:
-        """``items`` less those for streams the client ended before this
-        append, which nothing reads any more: they are neither charged nor
-        sent, and the append is answered as late, as one that names an ended
-        stream is. The API server can't tell for a file that names no stream:
-        the model routes it."""
-        ended = self._ended_streams.get(chunk.request_id)
-        late = sorted(name for name, tensors in items.items() if tensors and ended and name in ended)
+    def _without_ended_streams(
+        self, call: ClientCall, chunk: ClientAppend, items: NameToTensorList,
+    ) -> NameToTensorList:
+        """``items`` less those for streams that ended before this append (by
+        the client, or with their consuming partition), which nothing reads
+        any more: they are neither charged nor sent, and the append is
+        answered as late, as one that names an ended stream is. The API server
+        can't tell for a file that names no stream: the model routes it."""
+        late = [name for name, tensors in items.items() if tensors and name in call.ended]
         if not late:
             return items
-        if chunk.on_late is not None:
-            chunk.on_late(f"the call's {', '.join(map(repr, late))} input has ended")
+        _answer_late(chunk.on_late, late)
         return {name: tensors for name, tensors in items.items() if name not in late}
+
+    def _route_client_streams(self, body: ClientStreamRoute) -> None:
+        """Where a call's client streams go. The first route sends what the
+        call held for it, in order, then the ends its client already sent; a
+        later one ends a stream whose consuming partition has ended."""
+        request_id = body.request_id
+        call = self._client_calls.get(request_id)
+        if call is None:
+            return  # removed already
+        first = call.route is None
+        if first:
+            call.route = body
+        else:
+            call.route.workers.update(body.workers)
+        call.ended.update(name for name, ranks in body.workers.items() if not ranks)
+        if not first or self._torn_down(request_id):
+            return  # torn down: REMOVE frees what is held
+        held, call.held = call.held, []
+        for signals, on_late in held:
+            self._send_stream_items(request_id, call, signals, on_late)
+        self._send_ends(request_id, call, call.ended)
+
+    def _send_stream_items(
+        self, request_id: str, call: ClientCall, signals: dict[str, list[TensorPointerInfo]],
+        on_late: Callable[[str], None] | None,
+    ) -> None:
+        """Send stored items to their streams' consumer ranks, each rank one
+        reader of them, and drop the store's own hold; before the route
+        arrives, hold them. Items held for a stream the route gives no rank
+        (its partition never ran, which no model's does yet) are dropped and
+        their append answered as late; an append that also carried items for
+        a stream already ended gets a second answer."""
+        if call.route is None:
+            call.held.append(HeldItems(signals, on_late))
+            return
+        late = []
+        for name, infos in signals.items():
+            uuids = [info.uuid for info in infos]
+            ranks = call.route.workers.get(name, ())
+            if ranks:
+                self.tensor_manager.increment_ref_batch_uniform(uuids, len(ranks))
+                edge = GraphEdge(next_node=call.route.nodes[name], name=name, tensor_info=infos, is_streaming=True)
+                body = InputSignals(
+                    request_id=request_id, inputs=[edge], request_info=None,
+                    partition_name=self._client_partitions[name],
+                )
+                self.communicator.send_each(ranks, WorkerMessage(WorkerMessageType.INPUT_SIGNALS, body))
+                call.items_sent[name] = call.items_sent.get(name, 0) + len(infos)
+            else:
+                late.append(name)
+            self.tensor_manager.dereference_batch_uniform(uuids)
+        _answer_late(on_late, late)
+
+    def _send_ends(self, request_id: str, call: ClientCall, names: Collection[str]) -> None:
+        """Each rank of ``names``' consumers gets one ``producer_done`` from
+        ``CLIENT`` per partition, naming the streams it ends there, with the
+        items each carried, on the FIFO its items took, so it can't overtake
+        them."""
+        ends: dict[tuple[str, str], dict[str, int]] = {}
+        for name in sorted(names):
+            partition = self._client_partitions[name]
+            for worker in call.route.workers.get(name, ()):
+                ends.setdefault((worker, partition), {})[name] = call.items_sent.get(name, 0)
+        for (worker, partition), counts in ends.items():
+            self.communicator.send(worker, WorkerMessage(WorkerMessageType.INPUT_SIGNALS, InputSignals(
+                request_id=request_id, inputs=[], request_info=None, partition_name=partition,
+                producer_done={CLIENT}, producer_done_items=counts,
+            )))
 
     @cached_property
     def _item_limits(self) -> dict[str, ClientStreamLimits]:
@@ -920,14 +1180,14 @@ class PreprocessWorkerThread:
             if limits.max_items is not None
         }
 
-    def _charge_stream_items(self, request_id: str, items: NameToTensorList) -> None:
+    def _charge_stream_items(self, call: ClientCall, items: NameToTensorList) -> None:
         """Charge a call's new stream items to their streams' ``max_items``;
         an item past it fails the call with a 400."""
         for name, tensors in items.items():
             limits = self._item_limits.get(name)
             if limits is None or not tensors:
                 continue
-            carried = self._stream_items.setdefault(request_id, {})
+            carried = call.charged
             size = limits.item_size
             total = carried.get(name, 0) + (sum(size(t) for t in tensors) if size else len(tensors))
             if total > limits.max_items:
@@ -953,44 +1213,62 @@ class PreprocessWorkerThread:
             request_kwargs=self.request_model_kwargs.get(chunk.request_id, {}),
         )
 
-    def _store_persisted(
+    def _store(
         self, request_id: str, tensors: NameToTensorList,
-    ) -> dict[str, list[TensorPointerInfo]]:
-        """Store tensors for workers to read, held until the conductor releases
-        them with their reader count: a request's initial signals and its
-        client chunks alike."""
-        if not tensors:
-            return {}
+    ) -> tuple[dict[str, list[TensorPointerInfo]], list[TensorPointerInfo]]:
+        """Store tensors for workers to read; the descriptors by name, and flat."""
         signals = self.tensor_manager.store_and_return_tensor_info(
             request_id=request_id, tensors=tensors,
         )
         infos = [info for name_infos in signals.values() for info in name_infos]
         self.tensor_manager.register_for_send(request_id=request_id, tensor_infos=infos)
+        return signals, infos
+
+    def _store_persisted(
+        self, request_id: str, tensors: NameToTensorList,
+    ) -> dict[str, list[TensorPointerInfo]]:
+        """A request's initial signals, held until the conductor releases them
+        with their reader count."""
+        if not tensors:
+            return {}
+        signals, infos = self._store(request_id, tensors)
         for info in infos:
             self.tensor_manager.set_persist(info.uuid, persist=True)
         return signals
 
-    def _send_stream_input(
-        self, request_id: str, signals: dict[str, list[TensorPointerInfo]],
-        ended: Collection[str],
-    ) -> None:
-        self.communicator.send("conductor", ConductorMessage(
-            message_type=ConductorMessageType.CLIENT_STREAM_INPUT,
-            body=ClientStreamInput(request_id=request_id, signals=signals, ended=sorted(ended)),
-        ))
+    def _store_held(
+        self, request_id: str, items: NameToTensorList,
+    ) -> dict[str, list[TensorPointerInfo]]:
+        """Client stream items, with one reference of the store's own until
+        they are sent (``_send_stream_items``)."""
+        signals, infos = self._store(request_id, items)
+        self.tensor_manager.increment_ref_batch_uniform([info.uuid for info in infos], 1)
+        return signals
 
     def _prefix_keys(
         self, tensors: dict, layouts: dict, rows: dict, file_paths: dict | None,
         file_states: dict[str, list[tuple[int, int, int]]],
+        adapter: str | None = None,
     ) -> dict:
         """Key each page of every label's keyed spans, by resource and label.
 
         Returns the kwargs that carry the keys, the prompt tail past the last whole
         page, and the output tensor each label's sampled ids arrive in. The keys
-        are unrooted. Each keyed span's row in ``rows`` gains its digest and end key.
+        are not rooted in the process (the engine does that). Each keyed span's row
+        in ``rows`` gains its digest and end key. The chains of a request on a LoRA
+        adapter hang from the adapter's root, which is also sent as ``prefix_root``;
+        a base request's hang from the empty root, as before LoRA.
         """
         if not self._keyed_labels:
             return {}
+        root = b""
+        if adapter is not None:
+            roots = self._adapter_roots
+            root = roots.root(adapter) if roots is not None else None
+            if root is None:
+                # under the empty root its pages would serve the base model; the
+                # conductor refuses an adapter it does not serve in any case
+                return {"prefix_cache": False}
         keys: dict[str, dict[str, list[bytes]]] = {}
         tails: dict[str, dict[str, list[int]]] = {}
         decode: dict[str, dict[str, str]] = {}
@@ -1015,7 +1293,7 @@ class PreprocessWorkerThread:
                 pages, items = self._page_layout(
                     kv_label.keys, keyed, digests, tensors, page_size,
                 )
-                page_keys = chain(pages, items)
+                page_keys = chain(pages, items, root=root)
                 keys.setdefault(resource_key, {})[label] = page_keys
                 total = sum(span.length for span in keyed)
                 tails.setdefault(resource_key, {})[label] = (
@@ -1026,9 +1304,9 @@ class PreprocessWorkerThread:
                 for row, span, digest in zip(span_rows, keyed, digests, strict=True):
                     at += span.length
                     page, end = divmod(at, page_size)
-                    row += [digest, end_key(
-                        page_keys[page - 1] if page else b"", pages[page], items.get(page, ()), end,
-                    ) if digest is not None and end else None]
+                    row[4:6] = digest, end_key(
+                        page_keys[page - 1] if page else root, pages[page], items.get(page, ()), end,
+                    ) if digest is not None and end else None
                 if kv_label.keys.growth:
                     decode.setdefault(resource_key, {})[label] = kv_label.keys.tensor
         if not keys:
@@ -1036,6 +1314,8 @@ class PreprocessWorkerThread:
         kwargs = {"prefix_keys": keys, "prefix_tail": tails}
         if decode:
             kwargs["prefix_decode"] = decode
+        if root:
+            kwargs["prefix_root"] = root
         return kwargs
 
     def _page_layout(
@@ -1177,16 +1457,21 @@ class PreprocessWorkerThread:
         if abort:
             self._abort_failed_request(request_id)
 
+    def _torn_down(self, request_id: str) -> bool:
+        """Being torn down, or already handed back by the API server: this
+        thread starts no more work for it."""
+        return (
+            request_id in self._draining_rids
+            or request_id in self._reads_done_sent
+            or request_id not in self.in_flight_requests
+        )
+
     def _abort_failed_request(self, request_id: str) -> None:
         """Stop the walk of a request this thread failed. Left running, it
         would produce every remaining output only for each to be read and
         dropped. Skipped for a request already being torn down, or already
         handed back by the API server (whose own abort or finish covers it)."""
-        if (
-            request_id in self._draining_rids
-            or request_id in self._reads_done_sent
-            or request_id not in self.in_flight_requests
-        ):
+        if self._torn_down(request_id):
             return
         logger.info("Aborting request %s: one of its outputs failed", request_id)
         self._send_abort(request_id)
@@ -1246,12 +1531,16 @@ class PreprocessWorkerThread:
     def _emit_inline_tokens(self, item: InlineTokens) -> None:
         """Postprocess a frame's inline values in one model call and queue each
         request's chunk, in arrival order with its tensor results."""
-        rids, values = item.request_ids, item.values
+        rids, values, logprobs = item.request_ids, item.values, item.logprobs
         if self._draining_rids:
             keep = [i for i, rid in enumerate(rids) if rid not in self._draining_rids]
             rids = [rids[i] for i in keep]
             values = [values[i] for i in keep]
+            logprobs = logprobs and [logprobs[i] for i in keep]
         kwargs = self.request_model_kwargs
+        # one step's values share one call, split evenly across its rows; on
+        # a failed call a row is also charged its own retry
+        start = time.perf_counter() if self.enable_prof else None
         try:
             datas = self.model.postprocess_inline(
                 values, item.modality, [kwargs.get(rid) for rid in rids],
@@ -1259,6 +1548,8 @@ class PreprocessWorkerThread:
         except Exception:  # noqa: BLE001 — retried row by row below
             # so a failure fails only the request it belongs to
             datas = None
+        share = (time.perf_counter() - start) / len(rids) if start is not None and rids else 0.0
+        postprocess_s = share
         states = self.request_output_state
         is_text = item.modality == "text"
         for i, request_id in enumerate(rids):
@@ -1269,19 +1560,25 @@ class PreprocessWorkerThread:
             state.next_sequence += 1
             try:
                 if datas is None:
+                    row_start = time.perf_counter() if start is not None else None
                     data = self.model.postprocess_inline(
                         [values[i]], item.modality, [kwargs.get(request_id)],
                     )[0]
+                    if row_start is not None:
+                        postprocess_s = share + time.perf_counter() - row_start
                 else:
                     data = datas[i]
-                metadata = _token_usage(
-                    values[i], self._text_stop_ids, state.prompt_tokens,
-                ) if is_text else {}
+                metadata = {} if not logprobs or logprobs[i] is None else {"logprobs": [logprobs[i]]}
+                if self._wants_token_ids(request_id, item.modality):
+                    metadata["token_ids"] = [values[i]]
+                if is_text:
+                    metadata.update(_token_usage(values[i], self._text_stop_ids, state.prompt_tokens))
                 self._queue_completed_output(
                     request_id,
                     sequence,
                     ResultChunk(
                         request_id=request_id, modality=item.modality, data=data, metadata=metadata,
+                        postprocess_s=postprocess_s,
                     ),
                 )
             except Exception as exc:  # noqa: BLE001 — must reach the client
@@ -1289,6 +1586,17 @@ class PreprocessWorkerThread:
                     request_id, exc, f"{item.modality} output postprocessing",
                     sequence=sequence,
                 )
+
+    def _wants_token_ids(self, request_id: str, modality: str) -> bool:
+        """A text chunk of a request that set ``return_token_ids``."""
+        return modality == "text" and bool((self.request_model_kwargs.get(request_id) or {}).get("return_token_ids"))
+
+    def _with_token_ids(self, request_id: str, modality: str, tensor: torch.Tensor, metadata: dict) -> dict:
+        """``metadata`` plus the chunk's sampled ids, stop tokens included. A
+        float text tensor (Whisper's word alignment) carries no ids."""
+        if tensor.is_floating_point() or not self._wants_token_ids(request_id, modality):
+            return metadata
+        return {**metadata, "token_ids": tensor.reshape(-1).tolist()}
 
     def _queue_completed_output(
         self,
@@ -1316,10 +1624,7 @@ class PreprocessWorkerThread:
     ):
         # The request is gone, so don't start a read — just ack the tensors back
         # to the producing worker so it can free the source buffers.
-        self.tensor_manager.ack_unread_tensors(
-            request_id=result.request_id,
-            graph_edges=[result.graph_edge],
-        )
+        self.tensor_manager.ack_unread_tensors([result.graph_edge])
 
     def _fail_unread_outputs(self, failed: FailedRead) -> None:
         """Fail the request of a read that will not be delivered: one error
@@ -1339,13 +1644,17 @@ class PreprocessWorkerThread:
 
     def _postprocess_inline(
         self, request_id: str, sequence: int, modality: str, uuid: int, tensor: torch.Tensor,
+        read_time: float | None = None,
     ) -> None:
+        """``read_time``: when the tensor's read began, with ``enable_prof``."""
         if self.enable_nvtx:
             profiler.range_push(f"dataworker.postprocess.{modality}")
+        start = time.perf_counter() if read_time is not None else None
         postprocessed = self.model.postprocess(
             tensor, modality,
             request_kwargs=self.request_model_kwargs.get(request_id),
         )
+        postprocess_s = time.perf_counter() - start if start is not None else 0.0
         if self.enable_nvtx:
             profiler.range_pop()
             profiler.mark(
@@ -1353,6 +1662,7 @@ class PreprocessWorkerThread:
             )
 
         chunk_metadata = self.tensor_uuid_to_metadata_per_request[request_id][uuid] or {}
+        chunk_metadata = self._with_token_ids(request_id, modality, tensor, chunk_metadata)
         if modality == "text" and self.model is not None:
             chunk_metadata = {
                 **chunk_metadata,
@@ -1403,6 +1713,8 @@ class PreprocessWorkerThread:
                 modality=modality,
                 data=postprocessed,
                 metadata=chunk_metadata,
+                read_time=read_time,
+                postprocess_s=postprocess_s,
             ),
         )
         if self.enable_nvtx:
@@ -1410,6 +1722,7 @@ class PreprocessWorkerThread:
 
     def _submit_encode(
         self, request_id: str, sequence: int, modality: str, uuid: int, tensor: torch.Tensor,
+        read_time: float | None = None,
     ) -> None:
         """Encode on the pool; :meth:`_release_encoded` queues the chunk. The
         transport keeps its reference to ``tensor`` until then."""
@@ -1420,19 +1733,24 @@ class PreprocessWorkerThread:
         )
         # registered before the wakeup's, so the entry is queued when the thread wakes
         future.add_done_callback(lambda done: self._encoded.append(
-            (done, request_id, state, sequence, modality, metadata, uuid),
+            EncodedOutput(done, request_id, state, sequence, modality, metadata, uuid, read_time),
         ))
         if self.wakeup is not None:
             self.wakeup.register_future(future)
 
-    def _encode(self, tensor: torch.Tensor, modality: str, request_kwargs: dict | None) -> bytes:
-        if not self.enable_nvtx:
-            return self.model.postprocess(tensor, modality, request_kwargs=request_kwargs)
-        profiler.range_push(f"dataworker.encode.{modality}")
+    def _encode(
+        self, tensor: torch.Tensor, modality: str, request_kwargs: dict | None,
+    ) -> tuple[bytes, float]:
+        """The encoded bytes, and the seconds ``Model.postprocess`` took."""
+        if self.enable_nvtx:
+            profiler.range_push(f"dataworker.encode.{modality}")
+        start = time.perf_counter()
         try:
-            return self.model.postprocess(tensor, modality, request_kwargs=request_kwargs)
+            data = self.model.postprocess(tensor, modality, request_kwargs=request_kwargs)
         finally:
-            profiler.range_pop()
+            if self.enable_nvtx:
+                profiler.range_pop()
+        return data, time.perf_counter() - start
 
     def _release_encoded(self) -> bool:
         """Queue each finished encode's chunk in its request's output order."""
@@ -1440,21 +1758,25 @@ class PreprocessWorkerThread:
         if not encoded:
             return False
         while encoded:
-            future, request_id, state, sequence, modality, metadata, uuid = encoded.popleft()
-            self.tensor_manager.dereference(uuid)
+            out = encoded.popleft()
+            self.tensor_manager.dereference(out.uuid)
             # The request was torn down while this encoded, or its rid reused since.
-            if self.request_output_state.get(request_id) is not state:
+            if self.request_output_state.get(out.request_id) is not out.state:
                 continue
             try:
-                data = future.result()
+                data, postprocess_s = out.future.result()
             except Exception as exc:  # noqa: BLE001 — must reach the client
                 self._fail_request(
-                    request_id, exc, f"{modality} output postprocessing", sequence=sequence,
+                    out.request_id, exc, f"{out.modality} output postprocessing", sequence=out.sequence,
                 )
                 continue
             self._queue_completed_output(
-                request_id, sequence,
-                ResultChunk(request_id=request_id, modality=modality, data=data, metadata=metadata),
+                out.request_id, out.sequence,
+                ResultChunk(
+                    request_id=out.request_id, modality=out.modality, data=data, metadata=out.metadata,
+                    read_time=out.read_time,
+                    postprocess_s=postprocess_s if out.read_time is not None else 0.0,
+                ),
             )
         return True
 
@@ -1490,14 +1812,17 @@ class PreprocessWorkerThread:
                         )
                         if self.enable_nvtx:
                             profiler.range_push(f"dataworker.get_tensor.{modality}")
+                        read_time = time.perf_counter() if self.enable_prof else None
                         tensor = self.tensor_manager.get_tensor(tensor_info.uuid)
                         if self.enable_nvtx:
                             profiler.range_pop()
                         if self._encode_pool is not None and pooled_output(modality, loop_indices):
-                            self._submit_encode(request_id, sequence, modality, tensor_info.uuid, tensor)
+                            self._submit_encode(request_id, sequence, modality, tensor_info.uuid, tensor, read_time)
                             pooled = True
                         else:
-                            self._postprocess_inline(request_id, sequence, modality, tensor_info.uuid, tensor)
+                            self._postprocess_inline(
+                                request_id, sequence, modality, tensor_info.uuid, tensor, read_time,
+                            )
                     except Exception as exc:  # noqa: BLE001 — must reach the client
                         self._fail_request(
                             request_id, exc, f"{modality} output postprocessing",
@@ -1528,6 +1853,11 @@ class PreprocessWorkerThread:
                 for (uuid, ref_cnt) in body.uuid_to_ref_count.items():
                     self.tensor_manager.increment_ref(uuid, n=ref_cnt)
                     self.tensor_manager.set_persist(uuid, persist=False)
+            elif message.message_type == WorkerMessageType.CLIENT_STREAM_ROUTE:
+                try:
+                    self._route_client_streams(message.body)
+                except Exception as exc:  # noqa: BLE001 — this call's failure; the batch's other messages still apply
+                    self._fail_request(message.body.request_id, exc, "Client stream route")
             elif message.message_type == WorkerMessageType.DRAIN_REQUEST:
                 body: DrainRequest = message.body
                 self._begin_drain(body.request_id)
@@ -1640,8 +1970,11 @@ class PreprocessWorkerThread:
     def _next_inputs(self) -> list[PreprocessInput | ClientAppend]:
         """This pass's input: up to MAX_APPENDS_PER_PASS items in arrival
         order, ending at the first new request (a preprocess each, seconds for
-        media), so output delivery gets its turn between requests."""
+        media), so output delivery gets its turn between requests. None while
+        the prepare pool is full, so requests wait in the queue undecoded."""
         batch: list[PreprocessInput | ClientAppend] = []
+        if self._prepare_pool is not None and len(self._preparing) >= self._prepare_workers:
+            return batch
         while len(batch) < self.MAX_APPENDS_PER_PASS:
             try:
                 item = self.in_queue.get_nowait()
@@ -1672,20 +2005,66 @@ class PreprocessWorkerThread:
         try:
             if self.timing_requested.is_set():
                 profile = self._start_profile(pre_input)
-            self._process_input(pre_input, profile)
+            if self._prepare_pool is not None:
+                self._submit_prepare(pre_input, profile)
+            else:
+                self._process_input(pre_input, profile)
         except Exception as exc:  # noqa: BLE001 — any failure must reach the client
-            if profile is not None:
-                profile.failed = True
-                self.profile_queue.put(profile)
-            # A request whose media load or prompt processing fails never
-            # reaches the conductor, so nothing downstream would ever complete
-            # it; surface the failure as an error chunk instead of leaving the
-            # client to hit the server timeout.
-            self._fail_request(pre_input.request_id, exc, "preprocessing", abort=False)
-            # Never reached the conductor, so there are no remote readers to
-            # race: hard-drop the (possibly persisted) input signals directly.
-            self._cleanup_request_state(pre_input.request_id, force=True)
-            self._removed(pre_input.request_id)
+            self._input_failed(pre_input, profile, exc)
+
+    def _input_failed(
+        self, pre_input: PreprocessInput, profile: DataWorkerProfile | None, exc: Exception,
+    ) -> None:
+        if profile is not None:
+            profile.failed = True
+            self.profile_queue.put(profile)
+        # A request whose media load or prompt processing fails never
+        # reaches the conductor, so nothing downstream would ever complete
+        # it; surface the failure as an error chunk instead of leaving the
+        # client to wait out the server timeout.
+        self._fail_request(pre_input.request_id, exc, "preprocessing", abort=False)
+        # Never reached the conductor, so there are no remote readers to
+        # race: hard-drop the (possibly persisted) input signals directly.
+        self._cleanup_request_state(pre_input.request_id, force=True)
+        self._removed(pre_input.request_id)
+
+    def _submit_prepare(self, pre_input: PreprocessInput, profile: DataWorkerProfile | None) -> None:
+        """Prepare on the pool; :meth:`_release_prepared` finishes the request."""
+        self._start_input(pre_input)
+        try:
+            future = self._prepare_pool.submit(self._prepare_input, pre_input)
+        except RuntimeError as exc:  # shut down under a stopping server
+            self._input_failed(pre_input, profile, exc)
+            return
+        self._preparing.append(PreparingInput(pre_input, profile, future))
+        if self.wakeup is not None:
+            self.wakeup.register_future(future)
+
+    def _release_prepared(self) -> bool:
+        """Finish the oldest prepared request, one per pass so output delivery
+        gets its turn, as it does between inline requests. The request waits
+        on the pool for its turn behind older ones, so a conductor sees
+        requests in arrival order.
+
+        An abort that landed during preparation found nothing to stop. The API
+        server lets go of a request before it queues the abort, so the request
+        is dropped here unsent, as one still in the queue is; the conductor
+        takes an abort and a READS_DONE for a rid it never saw."""
+        if self._prepare_pool is None or not self._preparing or not self._preparing[0].future.done():
+            return False
+        pre_input, profile, future = self._preparing.popleft()
+        try:
+            if self._is_pending(pre_input.request_id):
+                self._finish_input(pre_input, future.result(), profile)
+            else:
+                self._cleanup_request_state(pre_input.request_id, force=True)
+                self._removed(pre_input.request_id)
+                if profile is not None:
+                    profile.preprocess_finish_time = time.perf_counter()
+                    self.profile_queue.put(profile)
+        except Exception as exc:  # noqa: BLE001 — any failure must reach the client
+            self._input_failed(pre_input, profile, exc)
+        return True
 
     def _idle_wait(self):
         """How a pass that found nothing waits: on the communicator's poll,
@@ -1711,6 +2090,8 @@ class PreprocessWorkerThread:
         if not isinstance(self.communicator, OutboxCommunicator):
             self.communicator = OutboxCommunicator(self.communicator)
         idle_wait = self._idle_wait()
+        flush_results = self.out_queue.flush
+        flush_profiles = self.profile_queue.flush
         while not self.stop_event.is_set():
             did_work = False
             sends_pending = False
@@ -1730,23 +2111,25 @@ class PreprocessWorkerThread:
                         # Nothing to read or ack: postprocess in place, in
                         # arrival order with the tensor results.
                         self._emit_inline_tokens(result)
-                        continue
-                    # Draining for teardown: don't start new reads — ack the
-                    # tensors back so the producing worker can free its buffers.
-                    if result.request_id in self._draining_rids:
+                    elif result.request_id in self._draining_rids:
+                        # Draining for teardown: don't start new reads — ack
+                        # the tensors back so the producing worker can free
+                        # its buffers.
                         self._discard_result_tensor(result)
-                        continue
-                    try:
-                        self._read_result_tensor(result)
-                    except Exception as exc:  # noqa: BLE001 — must reach the client
-                        # The read never started, so none of this edge's
-                        # tensors will ever produce a chunk; answer for all of
-                        # them at once.
-                        self._fail_request(
-                            result.request_id, exc,
-                            f"{result.modality} output transfer",
-                            count=len(result.graph_edge.tensor_info),
-                        )
+                    else:
+                        try:
+                            self._read_result_tensor(result)
+                        except Exception as exc:  # noqa: BLE001 — must reach the client
+                            # The read never started, so none of this edge's
+                            # tensors will ever produce a chunk; answer for all
+                            # of them at once.
+                            self._fail_request(
+                                result.request_id, exc,
+                                f"{result.modality} output transfer",
+                                count=len(result.graph_edge.tensor_info),
+                            )
+                    # one wake per item, and so per step
+                    flush_results()
                 did_work = self._process_releases() or did_work
                 while not self.discard_tensor_queue.empty():
                     did_work = True
@@ -1757,6 +2140,7 @@ class PreprocessWorkerThread:
                     self._cleanup_request_state(req_id)
                 did_work = self._process_read_tensors() or did_work
                 did_work = self._release_encoded() or did_work
+                flush_results()
                 # Reads may have just resolved; ACK any drains now free of them.
                 for rid in list(self._draining_rids):
                     self._complete_drain_if_ready(rid)
@@ -1771,12 +2155,25 @@ class PreprocessWorkerThread:
                     # Releases queued before this request was submitted belong
                     # to an earlier request under its id: apply them first.
                     self._process_releases()
+                    if self._client_edges:
+                        # Routes too, so a call's held items go out before this
+                        # input, which may be a multi-second media preprocess.
+                        try:
+                            self._process_messages()
+                        except Exception:  # noqa: BLE001 — the pass's inputs still go
+                            logger.exception("PreprocessWorkerThread message handling failed")
                     try:
                         self._process_waiting_input(pre_input)
                     except Exception:  # noqa: BLE001 — the pass's other input still goes
                         logger.exception("Input for request %s failed", pre_input.request_id)
+                if not sends_pending:
+                    did_work = self._release_prepared() or did_work
             except Exception:
                 logger.exception("PreprocessWorkerThread error")
+            # a new input's profile update or error chunks, and anything a
+            # raise skipped
+            flush_results()
+            flush_profiles()
 
             # getattr: tests drive this loop with stand-in tensor managers
             transfers = getattr(self.tensor_manager, "transfer_stats", None)
@@ -1794,3 +2191,5 @@ class PreprocessWorkerThread:
             self._hard_cleanup(request_id)
         if self._encode_pool is not None:
             self._encode_pool.shutdown(wait=False, cancel_futures=True)
+        if self._prepare_pool is not None:
+            self._prepare_pool.shutdown(wait=False, cancel_futures=True)

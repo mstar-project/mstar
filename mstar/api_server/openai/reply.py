@@ -22,6 +22,8 @@ from dataclasses import dataclass, field
 
 from fastapi import HTTPException
 
+from mstar.api_server.streaming_response import ReleasingStreamingResponse
+from mstar.engine.resources.lora.config import LORA_ADAPTER_KWARG
 from mstar.utils.utf8_stream import Utf8Stream
 
 # how often a non-streaming handler checks whether its client is still there
@@ -137,6 +139,38 @@ def _passed(deltas: list[dict], matcher: StopMatcher | None, out: list) -> str |
         if stop is not None:
             return stop
     return None
+
+
+def submit(api, request_id: str, model_name: str, req, args) -> str:
+    """Submits a chat request's ``args`` under the LoRA adapter its ``model``
+    field or ``lora_adapter`` kwarg picks. Returns the model name the reply
+    reports: the adapter that served it, as vLLM's does, else ``model_name``."""
+    model_kwargs = api.lora_kwargs(req.model, args.model_kwargs)
+    api.submit_request(
+        text=args.text,
+        file_paths=args.file_paths,
+        input_modalities=args.input_modalities,
+        output_modalities=args.output_modalities,
+        model_kwargs=model_kwargs,
+        prompt_parts=args.prompt_parts,
+        streaming=bool(req.stream),
+        request_id=request_id,
+    )
+    return (model_kwargs or {}).get(LORA_ADAPTER_KWARG) or model_name
+
+
+async def stream_events(api, request_id: str, raw_request, parser=None, stops=None, usage=None):
+    """``reply_events`` of a streamed request once its results start: a
+    request the engine refuses raises its status here rather than inside a 200."""
+    # named before the wait, which a resubmission under the id could outlast
+    key = api.submission_key(request_id)
+    batches = await api.open_result_stream(request_id, raw_request, batches=True)
+    return reply_events(api, request_id, parser, stops, usage, batches=batches, key=key)
+
+
+def sse_response(api, request_id: str, body) -> ReleasingStreamingResponse:
+    return ReleasingStreamingResponse(body, release=lambda: api.release_request(request_id),
+                                      media_type="text/event-stream", headers={"Cache-Control": "no-cache"})
 
 
 def finish_reason(parser, usage: Usage, stop_string: str | None = None) -> str:

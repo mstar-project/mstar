@@ -1,7 +1,6 @@
 """GLM-5.3-Flash (glm5_next) architecture + generation config."""
 
 import dataclasses
-import functools
 from dataclasses import dataclass, field
 
 from mstar.engine.resources.kv.config import AuxPlanes
@@ -57,18 +56,6 @@ def build_mlp_layer_types(
 def build_indexer_types(num_hidden_layers: int) -> tuple[str, ...]:
     """Every MLA layer runs its own full indexer; none are shared."""
     return tuple("full" for _ in range(num_hidden_layers))
-
-
-@functools.cache
-def _flashinfer_before(version: str) -> bool:
-    """True only for an installed FlashInfer older than ``version``."""
-    try:
-        import flashinfer
-        from packaging.version import Version
-    except ImportError:
-        return False
-    installed = getattr(flashinfer, "__version__", None)
-    return installed is not None and Version(installed) < Version(version)
 
 
 @dataclass
@@ -323,12 +310,8 @@ class Glm5NextModelConfig:
     def mla_cache_kpe(self) -> int:
         """Rope-slot width of the MLA latent cache. NoPE needs none; MTP keeps
         a 64-wide slot to mask rows a query must not see: rejected draft rows, or
-        under dsa_long_context the sparse plan's padding. FlashInfer plans a cache
-        without the slot from 0.6.18, so an older one gets it too (zeros):
-        otherwise MLA would run the uncapturable fallback."""
-        if self.mtp_num_draft_tokens > 0 or _flashinfer_before("0.6.18"):
-            return 64
-        return 0
+        under dsa_long_context the sparse plan's padding."""
+        return 64 if self.mtp_num_draft_tokens > 0 else 0
 
     @property
     def context_limit(self) -> int:

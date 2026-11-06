@@ -59,6 +59,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sysconfig
@@ -70,8 +71,10 @@ from mstar.communication.rust_communicator import (
     MsgpackCodec,
     RustZMQCommunicator,
 )
+from mstar.graph.runtime.utils import CHECKOUT_RUST, is_mstar_rust_crate, require_rust_extension
 from mstar.model.multimodal import PromptPart
 from mstar.utils.client_errors import client_error_text
+from mstar.utils.threads import ThreadPool
 
 logger = logging.getLogger(__name__)
 
@@ -96,26 +99,68 @@ def openai_adapter_class(model_name: str) -> str:
 
 
 
-def find_server_binary(explicit: str | None = None) -> str:
+def find_server_binary(explicit: str | None = None, rust_dir: Path = CHECKOUT_RUST) -> str:
     """Resolve the ``mstar-server`` binary: explicit arg, ``MSTAR_SERVER_BIN``,
     the running environment's scripts directory (where a Linux wheel installs
     it, also when the venv is not activated), ``$PATH``, then the in-repo
     release build. The scripts directory goes before ``$PATH`` so another
-    environment's older binary never serves this one's bridge."""
-    for candidate in (
-        explicit,
-        os.getenv("MSTAR_SERVER_BIN"),
-        str(Path(sysconfig.get_path("scripts")) / "mstar-server"),
-        shutil.which("mstar-server"),
-        str(Path(__file__).resolve().parents[2]
-            / "rust" / "server" / "target" / "release" / "mstar-server"),
+    environment's older binary never serves this one's bridge.
+
+    In a checkout, a binary built from other sources than ``rust_dir`` is
+    skipped, or used with a warning when named by the arg or the variable.
+    Raises FileNotFoundError when there is none, RuntimeError when all are
+    stale."""
+    checkout = is_mstar_rust_crate(rust_dir)
+    if checkout:
+        require_rust_extension()  # its source_hash is what binaries are compared with
+    stale = []
+    for candidate, named in (
+        (explicit, True),
+        (os.getenv("MSTAR_SERVER_BIN"), True),
+        (str(Path(sysconfig.get_path("scripts")) / "mstar-server"), False),
+        (shutil.which("mstar-server"), False),
+        (str(rust_dir / "server" / "target" / "release" / "mstar-server"), False),
     ):
-        if candidate and Path(candidate).is_file():
+        if not (candidate and Path(candidate).is_file()):
+            continue
+        problem = _stale_server(candidate, rust_dir) if checkout else None
+        if problem is None:
             return candidate
+        if named:
+            logger.warning("Using mstar-server %s, which %s", candidate, problem)
+            return candidate
+        stale.append(f"{candidate} {problem}")
+    if stale:
+        # Both touches, for the reason in require_rust_extension.
+        server = rust_dir / "server"
+        raise RuntimeError(
+            f"No mstar-server built from {rust_dir}: {'; '.join(stale)}. Rebuild it with "
+            f"`touch {rust_dir / 'build.rs'} {server / 'build.rs'} && "
+            f"cargo build --release --manifest-path {server / 'Cargo.toml'}`.")
     raise FileNotFoundError(
         "mstar-server binary not found: build it with "
         "`cargo build --release` in rust/server/, put it on $PATH, or set "
         "MSTAR_SERVER_BIN")
+
+
+def _stale_server(binary: str, rust_dir: Path) -> str | None:
+    """Why ``binary`` was not built from the sources in ``rust_dir``, or None."""
+    import mstar_rust
+
+    # No arguments, which every mstar-server exits on (an older one would
+    # serve `--source-hash` as a model name); a newer one prints its sources.
+    try:
+        ran = subprocess.run([binary], capture_output=True, text=True, errors="replace", timeout=30, check=False)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return f"could not be run ({e})"
+    built = re.search(r"built from sources ([0-9a-f]{16}) ([0-9a-f]{16})", ran.stdout + ran.stderr)
+    if built is None:
+        return "predates the source check"
+    current = (mstar_rust.source_hash(str(rust_dir)), mstar_rust.source_hash(str(rust_dir / "server")))
+    if built.groups() == current:
+        return None
+    return (f"was built from sources hashing to {' '.join(built.groups())}, "
+            f"but {rust_dir} and its server/ hash to {' '.join(current)}")
 
 
 def launch_rust_server(binary: str, model_name: str, port: int,
@@ -297,6 +342,10 @@ class RustFrontendBridge:
     async def _serve(self) -> None:
         logger.info("Rust-frontend bridge serving")
         loop = self.loop = asyncio.get_running_loop()
+        # asyncio would start its default pool from this thread, and so on
+        # the result CPU when the bridge is pinned; handlers' to_thread work
+        # (audio planning, request decoding) belongs on the process mask
+        loop.set_default_executor(ThreadPool(thread_name_prefix="mstar-bridge"))
         # Blocking receive on an executor thread: the wait happens inside the
         # transport (GIL released), so an arriving submit is picked up
         # immediately instead of on the next tick of a sleep/poll loop — and
@@ -323,6 +372,12 @@ class RustFrontendBridge:
 
     def run(self) -> None:
         """Blocking serve loop (the ``uvicorn.run`` replacement)."""
+        # with the message thread: tokens pass from it to this loop. The Rust
+        # process is already running, so it keeps the process mask. Test doubles
+        # stand in for the server without the pin.
+        pin = getattr(self.server, "pin_result_thread", None)
+        if pin is not None:
+            pin()
         try:
             asyncio.run(self._serve())
         except KeyboardInterrupt:
