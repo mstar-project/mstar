@@ -19,6 +19,7 @@ from mstar.engine.resources.resident import NOT_ASKED
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.submodule_base import EMITTED_COUNT, BatchedModelOutput, HostRows
 from mstar.streaming.topology import ProducerWalkCtx
+from mstar.utils.profiler import phase_record
 from mstar.worker.micro_scheduler import CHAIN_LANE
 from mstar.worker.step_repeats import edge_refusal, loop_back, run_columns
 
@@ -498,6 +499,8 @@ class RepeatingSteps:
         if replays is None:
             return
         ran = int(replays[0])
+        # what a run came to; ``repeats.narrowed.*`` counts only what admit cut
+        phase_record(f"repeats.ran.{batch_N.graph_walk}#", ran)
         width = batch_N.batch.repeats
         if ran < width:
             # before the prefix chains read them: nothing past ``ran`` was produced

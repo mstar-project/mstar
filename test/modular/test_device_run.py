@@ -382,13 +382,16 @@ def test_a_raw_launch_takes_the_cuda_handle_torch_stream_doesnt_have(monkeypatch
     assert backend.raw_launch(graph) == (5, 5, 9, 77)
 
 
-def test_the_worker_settles_a_run_that_ended_short():
+def test_the_worker_settles_a_run_that_ended_short(monkeypatch):
+    from mstar.utils import profiler
     from mstar.worker.worker import Worker
 
     worker = Worker.__new__(Worker)
     ended = []
     engine = SimpleNamespace(end_run_early=lambda batch, ran: ended.append(ran))
-    batch = SimpleNamespace(batch=SimpleNamespace(repeats=4), node_batch=object())
+    batch = SimpleNamespace(batch=SimpleNamespace(repeats=4), node_batch=object(), graph_walk=WALK)
+    monkeypatch.setattr(profiler, "PHASE_PERIOD", 1)
+    profiler.phase_buffer().clear()
     tokens = torch.tensor([[1, 2, 3, 0], [4, 5, 6, 0]])  # the last column was never written
     rows = SimpleNamespace(buffers={RUN_REPLAYS: torch.tensor([3, 3]), "t": tokens, "one": torch.zeros(2)})
     worker._settle_run(batch, rows, engine)
@@ -396,6 +399,9 @@ def test_the_worker_settles_a_run_that_ended_short():
     # what keys the prefix chain reads next: nothing the run didn't produce
     assert rows.buffers["t"].tolist() == [[1, 2, 3], [4, 5, 6]]
     assert rows.buffers["one"].shape == (2,)
+    # a yield's cut shows nowhere else: the walk's line still says "on" (review-r7 G5)
+    assert profiler.phase_buffer()[f"repeats.ran.{WALK}#"] == [3]
+    profiler.phase_buffer().clear()
 
 
 def test_a_short_run_takes_back_a_decode_snapshot_past_where_it_ended():
