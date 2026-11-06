@@ -9,6 +9,7 @@ from mstar.engine.resources.attn.base import (
     AttentionWrapper,
     EagerSlotKey,
     PlanCacheKey,
+    refuse_quantized_kv,
     resolve_attn_backend,
 )
 from mstar.engine.resources.attn.config import (
@@ -73,6 +74,7 @@ class CrossAttentionManager(AttentionResource):
         kv_config = info.dependency(spec.config.kv_cache).config
         backend = resolve_attn_backend(spec.config.backend, info.device)
         kv_config.shard(info.head_shards)
+        refuse_quantized_kv(kv_config, f"cross attention {spec.resource_key!r}")
         # planned against the context pages, so their dtype before the nodes'
         dtype = info.resolve_dtype(
             spec.config.dtype if spec.config.dtype is not None else kv_config.dtype,

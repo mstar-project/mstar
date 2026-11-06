@@ -79,7 +79,8 @@ class AttentionCallable:
         from mstar.utils.attention import qk_norm_rope_inplace, qk_norm_rope_kv_write
 
         eps = _norm_eps(q_norm, k_norm)
-        if not self.attn.requires_kv_write:
+        # a quantized cache takes its K/V through `write_kv`, which quantizes them
+        if not self.attn.requires_kv_write or self.kv.quantized:
             qk_norm_rope_inplace(q, k, q_norm.weight, k_norm.weight, pos_ids, *eps, rope_theta)
             return self(q, k, v)
         layer, page_idx, slot_idx, n = self.kv.write_target()
@@ -102,7 +103,7 @@ class AttentionCallable:
         from mstar.utils.attention import qk_norm_rope_table_kv_write
 
         eps = _norm_eps(q_norm, k_norm)
-        if not (q.is_cuda and self.attn.requires_kv_write):
+        if not (q.is_cuda and self.attn.requires_kv_write) or self.kv.quantized:
             cos, sin = (t[: q.shape[0], None] for t in cos_sin)
             q, k = (
                 _rotate_half_rope(norm(x.reshape(-1, x.shape[-1])).view(x.shape), cos, sin)

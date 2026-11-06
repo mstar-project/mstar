@@ -418,7 +418,7 @@ them by that name:
    resources:
      kv_cache:
        max_num_pages: 1024      # also: page_size, max_seq_len, cpu_offload_pages,
-                                # prefix_cache, prefix_cache_salt, prefix_cache_tp, dtype
+                                # prefix_cache, prefix_cache_salt, prefix_cache_tp, dtype, quant
      talker_attn:
        flashinfer_backend: fa2  # also: backend (flashinfer / dense), decode_tensor_cores, decode_fmha,
                                 # dtype
@@ -439,6 +439,35 @@ the dtype its model declared for it, and otherwise the dtype of the nodes that u
 attention resource takes its KV cache's dtype before its nodes'. A resource whose nodes
 keep their build dtype, or have different param dtypes, and that declares no dtype fails
 at load. The full resolution order is in :doc:`adding_models`.
+
+**KV cache quantization.** ``quant`` on a paged KV cache stores its pages in fp8 (e4m3),
+in half the bytes; ``dtype`` stays the dtype of the K/V entering the cache. The page
+count is ``max_num_pages`` either way, so raise it to spend the memory saved:
+
+.. code-block:: yaml
+
+   resources:
+     kv_cache:
+       quant: {format: fp8_e4m3, scales: unit}     # null removes a model's
+
+``scales: unit`` stores the values as they are, saturating at ±448. ``scales: static``
+divides by a scale per layer and KV head, read from ``scales_path``. To make that file,
+serve the unquantized deployment with ``MSTAR_KV_OBSERVE=<dir>``, send it representative
+prompts, stop it, then run
+``python -m mstar.engine.resources.kv.calibrate <dir> --resource kv_cache --out scales.safetensors``.
+It maps twice the observed amax to the format's largest value (``--headroom``): a value past
+the calibrated range saturates, while headroom costs little in a float format. Static
+scales are per tensor-parallel slice of the heads, so a node under sequence parallelism
+takes unit scales.
+
+The FlashInfer and dense attention backends read a quantized cache, on Hopper and
+Blackwell alike. FlashInfer keeps q in the node's dtype and runs its kernels that read
+fp8 pages (FA2 prefill, the paged decode kernels), with the static scales folded into q
+and the output; ``decode_fmha`` is not used over fp8 pages. The dense backend dequantizes
+the prefix it gathers. Flex, xpu_paged, MLA and cross attention, and ring caches, refuse a
+quantized cache at load. A layer that writes its K/V in a fused kernel writes them through
+``write_kv`` instead, which quantizes. Prefix-cache roots and KV transfer descriptors name
+the format and the scales file, so caches that disagree never share pages.
 
 **Node precision.** Each node runs under the precision policy its model declares: the
 dtype its params are cast to, the modules kept fp32, and whether its forward runs under

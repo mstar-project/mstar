@@ -14,6 +14,7 @@ from mstar.engine.resources.attn.workspace import Workspace, workspace_bytes
 from mstar.engine.resources.kv.config import PagedKVConfig
 from mstar.engine.resources.kv.keys import fingerprint
 from mstar.engine.resources.kv.plan import KVPlanOutput, KVPlanOutputs
+from mstar.engine.resources.kv.quant import KVScales, dequantize_kv
 from mstar.engine.resources.step import StepContext
 from mstar.platforms import current_platform
 
@@ -182,8 +183,12 @@ class DenseAttentionManager(AttentionManager):
         kv_config: PagedKVConfig,
         wrapper_class: type[PrefixedPrefillWrapper],
         flashinfer_backend: str = "auto",
+        kv_scales: KVScales | None = None,
     ):
+        """A quantized ``kv_config`` has its prefix dequantized as it is gathered, with
+        the static ``kv_scales`` (`kv_scales_for`), so the kernel reads plain K/V."""
         self._kv_cache_name = kv_cache
+        self._kv_scales = kv_scales
         self._device = device
         self._dtype = dtype
         self._kv_config = kv_config
@@ -377,7 +382,11 @@ class DenseAttentionManager(AttentionManager):
         if entry.pages is None:
             entry.pages = torch.tensor(segment.pages, dtype=torch.long, device=kv_cache_layer.device)
         # [n_pages, 2, page_size, num_kv_heads, head_dim] -> the prefix's rows
-        pages = kv_cache_layer[entry.pages]
+        if cfg.quant is None:
+            pages = kv_cache_layer[entry.pages]
+        else:
+            # gathered as bytes: fp8 has no indexing on CPU
+            pages = kv_cache_layer.view(torch.uint8)[entry.pages].view(kv_cache_layer.dtype)
         k_pref = pages[:, 0].reshape(-1, cfg.num_kv_heads, cfg.head_dim)
         v_pref = pages[:, 1].reshape(-1, cfg.num_kv_heads, cfg.head_dim)
         # the gather already copied; the slice keeps the trailing slots of the
@@ -385,6 +394,13 @@ class DenseAttentionManager(AttentionManager):
         cached = (
             k_pref[:segment.prefix_len].clone(), v_pref[:segment.prefix_len].clone()
         )
+        if cfg.quant is not None:
+            # once per stream and layer, so the kernel reads plain K/V
+            scales = self._kv_scales
+            cached = (
+                dequantize_kv(cached[0], scales.k[layer_idx] if scales else None, self._dtype),
+                dequantize_kv(cached[1], scales.v[layer_idx] if scales else None, self._dtype),
+            )
         entry.layers[layer_idx] = cached
         return cached
 
