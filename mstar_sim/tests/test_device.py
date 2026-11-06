@@ -1169,20 +1169,28 @@ def test_a_real_wake_of_the_rust_poll_survives_a_poke_for_another_wait():
     assert out.split() == ["wake", "timeout"], out
 
 
-def test_a_process_alone_sees_the_real_time_of_a_wait_it_cant_see_the_end_of():
-    """A client with no peer in its table, waiting on a server's socket: nothing else can move its
-    clock, so the wait's real time is what it shows, or a client's TTFT would read its CPU alone."""
+@pytest.mark.parametrize("notify", [False, True])
+def test_a_process_alone_sees_the_real_time_of_a_wait_it_cant_see_the_end_of(notify):
+    """An external response's real delay survives a known wake before the next clock read."""
     out = run_sim("""
-        import os, selectors, subprocess, sys, time
+        import os, selectors, subprocess, sys, threading, time
         read, write = os.pipe()
         reply = f"import os, time; time.sleep(0.3); os.write({write}, b'x')"
         subprocess.Popen([sys.executable, "-S", "-c", reply], pass_fds=[write], env={})
-        selector = selectors.DefaultSelector()
-        selector.register(read, selectors.EVENT_READ)
         start = time.perf_counter()
-        selector.select(30)
+        if %r:
+            done = threading.Event()
+            def receive():
+                os.read(read, 1)
+                done.set()
+            threading.Thread(target=receive).start()
+            done.wait()
+        else:
+            selector = selectors.DefaultSelector()
+            selector.register(read, selectors.EVENT_READ)
+            selector.select(30)
         print(time.perf_counter() - start)
-    """)
+    """ % notify)
     assert 0.25 < float(out) < 5, out
 
 

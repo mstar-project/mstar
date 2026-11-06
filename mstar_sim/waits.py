@@ -133,7 +133,10 @@ def _run_one(thaw: bool = True) -> None:
     how long the box takes to run it is no host time of mstar's."""
     _running[0] += 1
     if thaw:
-        clock.thaw()
+        if clock.PARKED[0]:
+            _unpark()
+        else:
+            clock.thaw()
     if _running[0] == 1 and _told_blocked[0] and not clock.PARKED[0]:
         _told_blocked[0] = False
         _publish()
