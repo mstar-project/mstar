@@ -712,6 +712,20 @@ def _probe(engine, rid, tokens):
     return {label: list(pages) for label, pages in leases.items()}
 
 
+def _reporting_failures(all_reduce, rank, outbox):
+    """Report an all-reduce that raises: a worker turns a collective's timeout into a
+    failed step and goes on, so the parent can't see it from how the run ended. Every
+    collective these ranks run in a step is an all-reduce; a design that adds another
+    kind has to be wrapped here too."""
+    def reporting(*args, **kwargs):
+        try:
+            return all_reduce(*args, **kwargs)
+        except RuntimeError as e:
+            outbox.put(("collective_failed", rank, str(e)))
+            raise
+    return reporting
+
+
 def _rank_main(rank, scenario, inbox, outbox):
     sys.path[:0] = [str(HERE), str(HERE.parents[1])]
     os.environ.setdefault("MSTAR_PRE_PLAN_SPEC", "0")
@@ -730,6 +744,7 @@ def _rank_main(rank, scenario, inbox, outbox):
             "gloo", init_method=f"file://{scenario.store}", rank=rank, world_size=2,
             timeout=datetime.timedelta(seconds=RENDEZVOUS_S),
         )
+        dist.all_reduce = _reporting_failures(dist.all_reduce, rank, outbox)
         group = _tp_group(rank)
         outbox.put(("ready", rank))
         kind = scenario.kind
@@ -779,6 +794,13 @@ def _rank_main(rank, scenario, inbox, outbox):
             healthy_prefix = _prompt_tokens(kind, "r0")[:2 * PAGE_SIZE] + _ids(9, 78)
             final["probe_failed_prefix"] = _probe(engine, "p1", failed_prefix)
             final["probe_healthy_prefix"] = _probe(engine, "p0", healthy_prefix)
+        # Gloo's threads let go of a collective's tensors after its wait()
+        # returns, taking the GIL to do it, and one that does so while the
+        # interpreter finalizes aborts the process. A group joins its threads
+        # only when its last reference goes: one left over keeps them running
+        # past destroy_process_group.
+        group.device_group = group.cpu_group = group._all_reduce = None
+        dist.destroy_process_group()
         report(("final", rank, final))
     except BaseException:
         report(("crash", rank, traceback.format_exc()))
@@ -803,6 +825,8 @@ class Run:
     sent: dict = field(default_factory=lambda: {0: set(), 1: set()})
     # messages a rank sent anywhere but the other rank and the conductor
     other_sends: list = field(default_factory=list)
+    # (rank, error) of every all-reduce that raised
+    collective_failures: list = field(default_factory=list)
     final: dict = field(default_factory=dict)
     elapsed: float = 0.0
 
@@ -820,6 +844,7 @@ class Run:
             f"hung={self.hung} crashed={sorted(self.crashed)} exit={self.exitcodes} "
             f"failed={ {r: e[:120] for r, e in self.failed.items()} } "
             f"reads_done={self.reads_done} routed={ {k: sorted(v) for k, v in self.routed.items()} } "
+            f"collective_failures={self.collective_failures} "
             f"after {self.elapsed:.1f}s"
         )
 
@@ -921,16 +946,27 @@ def _run(tmp_path, scenario: Scenario) -> Run:
             run.final[item[1]] = item[2]
         elif tag == "crash":
             run.crashed[item[1]] = item[2]
-    for p in procs:
-        p.join(timeout=2)
+        elif tag == "collective_failed":
+            run.collective_failures.append(item[1:])
+    run.elapsed = time.monotonic() - start
+    # A loaded host can take seconds over an exit that is going fine.
+    killed = set()
+    for r, p in enumerate(procs):
+        p.join(timeout=COLLECTIVE_S)
         if p.is_alive():
+            killed.add(r)
             p.kill()
             p.join(timeout=2)
     run.exitcodes = {r: p.exitcode for r, p in enumerate(procs)}
     for r, code in run.exitcodes.items():
-        if code not in (0, None) and r not in run.crashed:
+        if r in run.crashed:
+            continue
+        if r in killed:
+            run.crashed[r] = f"still running {COLLECTIVE_S:.0f} s after the run stopped, so the harness killed it"
+        elif code not in (0, None):
             run.crashed[r] = f"exit code {code} (a gloo abort is a collective with another shape)"
-    run.elapsed = time.monotonic() - start
+        elif r not in run.final:
+            run.crashed[r] = "exited without its final report reaching the parent"
     return run
 
 
@@ -946,6 +982,7 @@ KINDS = [
 def _healthy_ok(run: Run):
     assert not run.crashed, run.summary() + "\n" + "\n".join(map(str, run.crashed.values()))
     assert not run.hung, "the instance hung: " + run.summary()
+    assert not run.collective_failures, run.summary()
     assert run.completed("r0"), "r0, beside the failed request, did not complete: " + run.summary()
 
 
