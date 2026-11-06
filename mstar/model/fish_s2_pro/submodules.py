@@ -39,17 +39,13 @@ from mstar.engine.accelerator_graph_config import (
     PackedAcceleratorGraphConfig,
 )
 from mstar.engine.engine import ExecutingBatch
-from mstar.engine.resources import AttentionStep, KVStep, PositionStep, SamplerStep, Segment, SlotLease, SubmoduleStep
-from mstar.engine.resources.recurrent import RecurrentStatePool, RecurrentStep
-from mstar.engine.resources.sampler.resource import SamplerResource
+from mstar.engine.state import ArrayStep, SampleStep, Segment, SlotLease, SubmoduleStep, sample
 from mstar.model.fish_s2_pro.components.dac import FishDACDecoder, FishDACEncoder
 from mstar.model.fish_s2_pro.components.fast_ar import FishFastAR
-from mstar.model.fish_s2_pro.components.incremental_dac import IncrementalDACDecoder, codec_state_blocks
+from mstar.model.fish_s2_pro.components.incremental_dac import IncrementalDACDecoder, codec_state_entry
 from mstar.model.fish_s2_pro.components.slow_ar import FishSlowAR
 from mstar.model.fish_s2_pro.config import (
-    AR_ATTN,
     AR_KV,
-    AR_POS,
     AR_SAMPLER,
     CODEC_STATE,
     PROMPT_LAYOUT_KEY,
@@ -113,20 +109,15 @@ class ARSubmodule(ARNodeSubmodule):
             sampler=AR_SAMPLER, prefill_walks=frozenset({"ar_prefill", "ar_prefill_clone"}),
             withhold=("codec_tokens",),
         )
-        self._fast_kv: torch.Tensor | None = None
+        # Frame-local Fast AR KV scratch, overwritten every step, so a capture records one address for it.
+        shape, weight = fast_ar.kv_cache_shape(self.MAX_BATCH_SIZE), fast_ar.embeddings.weight
+        self._fast_kv = torch.zeros(shape, dtype=weight.dtype, device=weight.device)
         self._decode_last_token_indices: torch.Tensor | None = None
         self._flag_stager = PinnedStager(torch.bool, numel=self.MAX_BATCH_SIZE)
         self._index_stager = PinnedStager(torch.long, numel=self.MAX_BATCH_SIZE)
 
-    def _get_fast_kv(self, batch_size: int) -> torch.Tensor:
-        """Frame-local Fast AR KV scratch, overwritten every step (stable graph addresses)."""
-        if self._fast_kv is None:
-            self._fast_kv = torch.zeros(
-                self.fast_ar.kv_cache_shape(self.MAX_BATCH_SIZE),
-                dtype=self.fast_ar.embeddings.weight.dtype,
-                device=self.get_device(),
-            )
-        return self._fast_kv[:, :batch_size]
+    def bind_state(self, handles: Mapping[str, Any]) -> None:
+        self.sampler = handles[AR_SAMPLER]
 
     def _get_decode_last_token_indices(self, batch_size: int) -> torch.Tensor:
         if self._decode_last_token_indices is None:
@@ -240,31 +231,24 @@ class ARSubmodule(ARNodeSubmodule):
                 Segment(request_id=rid, label="main", span=inp.input_seq_len)
                 for rid, inp in zip(request_ids, inputs, strict=True)
             ],
-            steps={
-                AR_KV: KVStep(),
-                AR_ATTN: AttentionStep(causal=True),
-                AR_POS: PositionStep(),
-                AR_SAMPLER: SamplerStep(apply_penalty=True),
-            },
+            state={AR_KV: ArrayStep(), AR_SAMPLER: SampleStep(apply_penalty=True)},
         )
 
     def _run_frame(
         self,
-        engine_inputs: ModelInputsFromEngine,
         input_embeds: torch.Tensor,
         last_token_indices: torch.Tensor,
         suppress_eos: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
         """One frame for every request: semantic sample, Fast AR codebooks, next input."""
-        hidden = self.slow_ar(input_embeds, label="main")
+        hidden = self.slow_ar(input_embeds)
         last_hidden = hidden.index_select(0, last_token_indices)
         logits = self.slow_ar.semantic_logits(last_hidden)
         logits[:, self.eos_code].masked_fill_(suppress_eos, float("-inf"))
-        sampler: SamplerResource = engine_inputs.resources[AR_SAMPLER]
-        head_index = sampler.sample(engine_inputs.request_ids, logits).reshape(-1)
+        head_index = sample(self.sampler, logits).reshape(-1)
         is_eos = head_index >= self.eos_code
         semantic = torch.where(is_eos, torch.zeros_like(head_index), head_index)
-        codes = self.fast_ar(last_hidden, semantic, self._get_fast_kv(semantic.shape[0]))
+        codes = self.fast_ar(last_hidden, semantic, self._fast_kv[:, :semantic.shape[0]])
         next_embeds = self.next_input_embeds(head_index, codes)
         return {"ar_input_embeds": next_embeds, "codec_tokens": codes, "new_token": head_index}
 
@@ -278,7 +262,7 @@ class ARSubmodule(ARNodeSubmodule):
         **kwargs: Any,
     ) -> NameToTensorList:
         del graph_walk, kwargs
-        output = self._run_frame(engine_inputs, input_embeds, last_token_indices, suppress_eos)
+        output = self._run_frame(input_embeds, last_token_indices, suppress_eos)
         return {
             "ar_input_embeds": [output["ar_input_embeds"]],
             "codec_tokens": [output["codec_tokens"][0]],
@@ -295,7 +279,7 @@ class ARSubmodule(ARNodeSubmodule):
         **kwargs: Any,
     ) -> BatchedModelOutput:
         del graph_walk, kwargs
-        output = self._run_frame(engine_inputs, input_embeds, last_token_indices, suppress_eos)
+        output = self._run_frame(input_embeds, last_token_indices, suppress_eos)
         # one clone per output and one stop-check copy for the step, not one per request
         return BatchedModelOutput(row_outputs=output, check_stop_buffers={"new_token": output["new_token"]})
 
@@ -367,16 +351,16 @@ class CodecSubmodule(ARNodeSubmodule):
     Chunks carry new frames only (a ramp of small chunks, then
     ``chunk_frames``). The decoder is causal, so the state it holds after a
     chunk is all a later chunk needs (``IncrementalDACDecoder``): it lives in
-    the ``CODEC_STATE`` recurrent pool, each step gathering its rows' state
-    and scattering the new state back, and the streamed audio equals one
-    decode of the whole stream.
+    the ``CODEC_STATE`` Value, each step reading its rows' state and writing
+    the new state back, and the streamed audio equals one decode of the whole
+    stream.
 
     Each chunk width is a CUDA-graph bucket; a shorter chunk (the terminal
     flush) is zero-padded to the next bucket and its real length rides with it.
     """
 
     # the decode is a compile region (``compile_regions``); the capture's
-    # gather and scatter stay outside it
+    # read and write stay outside it
     disable_torch_compile = True
     disable_autocast = True
     # cuDNN's heuristic conv picks are slower than the ones it times per captured shape
@@ -395,12 +379,12 @@ class CodecSubmodule(ARNodeSubmodule):
             self.float32_matmul_precision, self.cudnn_allow_tf32 = "highest", False
         self.windows = sorted({*self.codec.chunk_schedule, self.codec.chunk_frames})
         self.incremental = IncrementalDACDecoder(decoder)
-        blocks = self.incremental.state_blocks()
-        declared = codec_state_blocks(self.codec)
-        if {n: (b.shape, b.dtype) for n, b in blocks.items()} != {n: (b.shape, b.dtype) for n, b in declared.items()}:
-            raise ValueError("the codec decoder's state does not match the CODEC_STATE blocks its model declares")
-        self.state_names = tuple(blocks)
+        if self.incremental.state_entry() != codec_state_entry(self.codec):
+            raise ValueError("the codec decoder's state does not match the CODEC_STATE entry its model declares")
         self._lengths_stager = PinnedStager(torch.long, numel=self.MAX_BATCH_SIZE)
+
+    def bind_state(self, handles: Mapping[str, Any]) -> None:
+        self.state = handles[CODEC_STATE]
 
     def compile_regions(self) -> dict[str, list[tuple]]:
         """The incremental decode, compiled once for every bucket: Inductor fuses
@@ -457,7 +441,7 @@ class CodecSubmodule(ARNodeSubmodule):
         del graph_walk, slot_lease, piecewise_leases, kwargs
         return SubmoduleStep(
             segments=[Segment(rid, "main", 1) for rid in request_ids],
-            steps={CODEC_STATE: RecurrentStep()},
+            state={CODEC_STATE: ArrayStep()},
             # the widest bucket, as cg_key_info derives it before prepare_inputs
             cg_key_info=self._bucket(max(self._row_bucket_frames(item) for item in inputs)),
         )
@@ -498,16 +482,11 @@ class CodecSubmodule(ARNodeSubmodule):
         self._lengths_stager.copy_(lengths, [item.kwargs["frames"] for item in inputs])
         return {"codec_tokens": codec_tokens, "lengths": lengths}
 
-    def _decode(
-        self, engine_inputs: ModelInputsFromEngine, codec_tokens: torch.Tensor, lengths: torch.Tensor,
-    ) -> torch.Tensor:
+    def _decode(self, codec_tokens: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
         """Decode the batch's chunks from their streams' state to PCM16 ``[B, width * hop]``."""
-        pool: RecurrentStatePool = engine_inputs.resources[CODEC_STATE]
         # a fresh stream, and a padding row on the sink, read zeros: the decoder's own left padding
-        state = {name: pool.gather(name) for name in self.state_names}
-        wav, new = self.incremental(codec_tokens, state, lengths)
-        for name, value in new.items():
-            pool.scatter_(name, value)
+        wav, new = self.incremental(codec_tokens, self.state.read(0).fields, lengths)
+        self.state.write(0, **new)
         return (wav.clamp(-1, 1) * 32767).to(torch.int16)
 
     def forward(
@@ -519,7 +498,7 @@ class CodecSubmodule(ARNodeSubmodule):
         **kwargs: Any,
     ) -> NameToTensorList:
         del graph_walk, kwargs
-        return {"audio_chunk": [self._decode(engine_inputs, codec_tokens, lengths)[0]]}
+        return {"audio_chunk": [self._decode(codec_tokens, lengths)[0]]}
 
     def forward_batched(
         self,
@@ -530,7 +509,7 @@ class CodecSubmodule(ARNodeSubmodule):
         **kwargs: Any,
     ) -> BatchedModelOutput:
         del graph_walk, kwargs
-        return BatchedModelOutput(row_outputs={"audio_chunk": self._decode(engine_inputs, codec_tokens, lengths)})
+        return BatchedModelOutput(row_outputs={"audio_chunk": self._decode(codec_tokens, lengths)})
 
     def postprocess(
         self,

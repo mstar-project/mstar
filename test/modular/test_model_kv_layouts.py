@@ -413,7 +413,7 @@ def test_fish_lays_out_the_rows_its_prefill_builds(clone):
 
     output = model.process_prompt("hi", ["text", "audio"] if clone else ["text"], ["audio"], tensors, ref_text="r")
 
-    layout = output.metadata["kv_layout"]
+    layout = output.metadata["state_layout"]
     [span] = layout[AR_KV]["main"].spans
     assert span.walk == ("ar_prefill_clone" if clone else "ar_prefill")
     prefix_len, frames = output.metadata[PROMPT_LAYOUT_KEY]
