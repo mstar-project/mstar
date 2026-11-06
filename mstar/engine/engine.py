@@ -2798,17 +2798,51 @@ class Engine:
                 )
             )
             self._keep_rows(submodule_mgmt, graph_walk, engine_inputs.request_ids, out)
-            return out
-        assert len(request_ids) == 1, (
-            "the unbatched forward takes one request; batch of "
-            f"{len(request_ids)} needs running_batched"
-        )
-        out = submodule_mgmt.forward(
-            graph_walk, engine_inputs=engine_inputs, **preprocessed
-        )
-        if isinstance(out, BatchedModelOutput):
-            return out
-        return BatchedModelOutput.coerce({request_ids[0]: out})
+        else:
+            assert len(request_ids) == 1, (
+                "the unbatched forward takes one request; batch of "
+                f"{len(request_ids)} needs running_batched"
+            )
+            raw = submodule_mgmt.forward(graph_walk, engine_inputs=engine_inputs, **preprocessed)
+            out = raw if isinstance(raw, BatchedModelOutput) else BatchedModelOutput.coerce({request_ids[0]: raw})
+        if submodule_mgmt.device_stops and getattr(submodule_mgmt.submodule, "ITERATION_INPUTS", None):
+            self._finish_eager_iterations(batch, submodule_mgmt, engine_inputs, out)
+        return out
+
+    def _finish_eager_iterations(self, batch, mgmt, engine_inputs, output: BatchedModelOutput) -> None:
+        """An eager fallback runs after its predecessor settled. Publish its
+        actual position and terminal state before a captured successor reads.
+        """
+        layouts = self.iteration_layouts(batch.node_name) or {}
+        rids = engine_inputs.request_ids
+        for walk, loop in layouts.items():
+            positions = [i for i, rid in enumerate(rids) if batch.step_context.walk_of(rid) == walk]
+            if not positions:
+                continue
+            selected = [rids[i] for i in positions]
+            infos = [engine_inputs.per_request_info[rid] for rid in selected]
+            policy = mgmt.device_stops[walk]
+            limits = [policy.limits(info) for info in infos]
+            stopped = to_device_nonblocking([
+                limit.max_iters is not None and info.metadata.dynamic_loop_iter_counts.get(loop.name, 0) + 1
+                >= limit.max_iters for info, limit in zip(infos, limits, strict=True)
+            ], self._device, dtype=torch.bool)
+            if policy.reads_token:
+                tokens = output_named(output, policy.token_signal)
+                if tokens is None:
+                    tokens = torch.stack([
+                        output.per_rid_outputs[rid][policy.token_signal][0].reshape(-1)[0] for rid in selected
+                    ])
+                else:
+                    pick = to_device_nonblocking(positions, self._device, dtype=torch.long)
+                    tokens = tokens.reshape(len(rids), -1)[:, 0].index_select(0, pick)
+                ids = to_device_nonblocking(list(policy.eos_tokens), self._device, dtype=tokens.dtype)
+                immune = to_device_nonblocking([limit.ignore_eos for limit in limits], self._device, dtype=torch.bool)
+                stopped.logical_or_(torch.isin(tokens, ids) & ~immune)
+            entries = to_device_nonblocking([
+                self._iteration_entry(rid, info.metadata, loop) for rid, info in zip(selected, infos, strict=True)
+            ], self._device, dtype=torch.long)
+            mgmt.loopback_rows.finish_iteration(walk, loop, selected, entries, stopped)
 
     def postprocess_batch(
         self, batch: ExecutingBatch, outputs: BatchedModelOutput,
@@ -3446,6 +3480,12 @@ class Engine:
         column of per replay (``keep_run_columns``)."""
         return self._submodules[node_name].run_columns.get(graph_walk, frozenset())
 
+    def _iteration_entry(self, rid: int, metadata: InputMetadata, loop: LoopLayout) -> list[int]:
+        if metadata.graph_pass is None:
+            raise ValueError("actual Loop progress needs a snapshotted graph pass")
+        return [self._runner.request_generation(rid), metadata.graph_pass,
+                *(metadata.dynamic_loop_iter_counts.get(name, 0) for name in loop.ancestors)]
+
     def _iteration_columns(
         self, node_name: str, submodule: NodeSubmodule, ctx: StepContext, rids: Sequence[int],
         req_info: Mapping[int, Any], inputs: Mapping[int, Mapping[str, list]] = MappingProxyType({}),
@@ -3476,10 +3516,7 @@ class Engine:
                 if origin < 0 or origin > k:
                     raise ValueError("an input window origin must precede its projected Loop position")
                 origins.append(origin)
-                entries.append([
-                    self._runner.request_generation(rid), counts.graph_pass,
-                    *(counts.dynamic_loop_iter_counts.get(name, 0) for name in actual_loop.ancestors),
-                ])
+                entries.append(self._iteration_entry(rid, counts, actual_loop))
                 horizons.append(k - origin + ctx.repeats)
                 k = origin
             # a stream window is items of the node's Loop; a row outside it has none

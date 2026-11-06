@@ -415,6 +415,14 @@ class LoopbackRows(Resource):
             done = table[:, 1].index_select(0, indices).bool() | (live & stopped)
             table[:, 1].index_copy_(0, indices, (done & real).to(table.dtype))
 
+    def finish_iteration(
+        self, walk: str, loop: LoopLayout, rids: Sequence[Hashable], entry: torch.Tensor, stopped: torch.Tensor,
+    ) -> None:
+        """Publish a settled eager step through the same cursor as captured runs."""
+        indices = self._index(rids)
+        position, live = self.iteration_head(walk, loop, indices, entry)
+        self.iteration_tail(walk, loop, indices, position, live, stopped)
+
     # By request: an eager step, a mixed step's read, a row's first write
 
     def _index(self, rids: Sequence[Hashable]) -> torch.Tensor:

@@ -1066,3 +1066,66 @@ def test_a_queued_window_reads_actual_progress_and_suppresses_predecessor_stops(
     run.launch()
     assert run.state.counts.tolist() == [1, 1]
     assert calls[-1].tolist() == [7, 20]
+
+
+def test_eager_and_captured_steps_publish_the_same_actual_loop_progress(monkeypatch):
+    from mstar.engine.engine import Engine, ExecutingBatch
+    from mstar.engine.resources.step import StepContext
+    from mstar.graph.loop_indices import LoopLayout
+    from mstar.model.submodule_base import InputMetadata, StopKind, StopPolicy
+
+    loop = _Loop()
+    runner, run, _, calls = _runner(monkeypatch, loop, [[1, 1]], limit=4, progress=True)
+    policy = StopPolicy(StopKind.EOS, token_signal="new_token", eos_tokens=frozenset({EOS}))
+    node = SimpleNamespace(ITERATION_INPUTS={"cond": object()})
+    mgmt = SimpleNamespace(
+        submodule=node, device_stops={WALK: policy}, loopback_rows=runner._rows, accelerator_graph_runner=None,
+        forward_batched=lambda *args, **kwargs: BatchedModelOutput(
+            check_stop_buffers={"new_token": torch.tensor([EOS, 2])},
+        ),
+        forward=lambda *args, **kwargs: {"new_token": [torch.tensor([EOS])]},
+    )
+    engine = Engine.__new__(Engine)
+    engine._device = CPU
+    engine._submodules = {"n": mgmt}
+    engine._loops = {("n", WALK): LoopLayout("decode")}
+    engine._runner = SimpleNamespace(request_generation=lambda rid: 1)
+
+    def eager(rids, counters, passes, walks=None):
+        batch = ExecutingBatch(
+            node_name="n", per_request_info={rid: SimpleNamespace() for rid in rids},
+            per_request_input_metadata={rid: InputMetadata(
+                dynamic_loop_iter_counts={"decode": k}, graph_pass=p, iteration_origin=k,
+            ) for rid, k, p in zip(rids, counters, passes, strict=True)},
+            step_context=StepContext(request_ids=tuple(rids), graph_walk=WALK, slot=0, capture=False,
+                                     request_walks=walks or {}),
+        )
+        return engine._forward(
+            batch, mgmt, None,
+            SimpleNamespace(request_ids=rids, per_request_info=batch.per_request_info_wrapped),
+            {}, None, len(rids) > 1, rids, None,
+        )
+
+    # Its successor's window was prepared at zero before this ordinary step.
+    window = IterationWindow(
+        {"cond": torch.tensor([[7., 8., 9., 10.], [20., 21., 22., 23.]])},
+        torch.zeros(2, dtype=torch.long), torch.tensor([[1, 0], [1, 0]]),
+    )
+    eager([1, 2], [0, 0], [0, 0])
+    run.state.stage(2, [False, False], 2)
+    run.stage_inputs(window)
+    calls.clear()
+    run.launch()
+    assert run.state.counts.tolist() == [0, 2], "eager EOS must suppress an already queued captured successor"
+    assert [row[1].item() for row in calls] == [21, 22]
+    # A new entry is allowed; a row of another walk in the same eager batch
+    # must leave this Loop's cursor alone.
+    eager([1, 2], [0, 3], [1, 0], walks={1: WALK, 2: "prefill"})
+    eager([2], [3], [0])  # the unbatched output representation stops row 2
+    run.state.stage(2, [False, False], 1)
+    run.stage_inputs(window._replace(entries=torch.tensor([[1, 1], [1, 0]])))
+    run.launch()
+    assert run.state.counts.tolist() == [0, 0]
+    indices = runner._rows._index([1, 2])
+    positions, _ = runner._rows.iteration_head(WALK, engine._loops["n", WALK], indices, run.window.entries)
+    assert positions.tolist() == [1, 4]
