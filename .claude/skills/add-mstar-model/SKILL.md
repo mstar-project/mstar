@@ -166,7 +166,7 @@ Use the [benchmarking skill](../benchmarking/SKILL.md) for methodology — warmu
 
 ## Phase 8 — Performance tuning
 
-Establish CPU-bound or GPU-bound first; the benchmarking skill covers how (`event_sync` near zero means CPU-bound). That much is settled. Beyond it **there is no established best practice in this repo yet** — current tuning work is iterative and exploratory, so treat any confident-sounding recipe with suspicion, including one you generate yourself. What holds regardless: same harness, same box, two sides adjacent in time, and re-check the workloads you are not targeting before calling a change a win.
+Establish CPU-bound or GPU-bound first; the benchmarking skill covers how (`event_sync`, plus `worker.await_run` where runs go on the device, near zero means CPU-bound). That much is settled. Beyond it **there is no established best practice in this repo yet** — current tuning work is iterative and exploratory, so treat any confident-sounding recipe with suspicion, including one you generate yourself. What holds regardless: same harness, same box, two sides adjacent in time, and re-check the workloads you are not targeting before calling a change a win.
 
 Two things that are settled: a host sync in your `prepare_inputs` hides inside that phase rather than in `event_sync`, and a host-bound step gets faster by deleting work, not by moving it to another thread. Values already known on the host travel in `step_metadata`.
 
