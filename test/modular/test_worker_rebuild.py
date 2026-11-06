@@ -443,6 +443,24 @@ def test_a_rebuild_row_leaves_its_requests_loopback_entry(branch):
     assert engine._loopback_steps[R] == (NODE, DECODE), "the resumed decode would not read the last kept id"
 
 
+def test_a_pass_that_runs_no_step_starts_the_queued_host_copies(monkeypatch):
+    """Queued host copies started only once a step's outputs were sent, and a drop waits for them. With every request
+    waiting on the pool, no step ran, so no copy started and nothing could be dropped to let one run."""
+    from test_loop_turns import TURNS, _looping_worker, _Runtime, _scheduler, _StopLoopError
+    from test_rebuild_policy import _copying, _vision_step
+
+    rebuilds = _copying(R)
+    rebuilds.keep_copies(_vision_step((R,), {}, completion_event=None))
+    w = _looping_worker(monkeypatch, *_scheduler(_Runtime(), TURNS))
+    w._rebuilds = rebuilds
+
+    # the loop ends on its first idle wait
+    with pytest.raises(_StopLoopError):
+        w.run()
+
+    assert rebuilds._kept[NODE][R].copies.ready(), "the request would wait for its copies with no step to start them"
+
+
 def test_the_scheduler_sees_the_rows_every_lane_holds():
     w = Worker.__new__(Worker)
     shared = w._in_flight_rids = set()
