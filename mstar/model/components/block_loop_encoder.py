@@ -73,6 +73,9 @@ class PackedBlockLoopEncoder(NodeSubmodule):
     MAX_BATCH_SIZE = 1
     # The ragged layouts a step plans over its patches, one label each.
     SEGMENT_LABELS: tuple[str, ...] = ("main",)
+    # The dtype of what ``embed`` hands the block loop under the node's
+    # autocast, which the replay's input buffers hold. None: autocast's.
+    BLOCK_LOOP_DTYPE: torch.dtype | None = None
 
     def __init__(self, model: torch.nn.Module, config: Any, output: str):
         super().__init__()
@@ -134,13 +137,14 @@ class PackedBlockLoopEncoder(NodeSubmodule):
         size 1: a replay is the whole step as one row, every request's
         segments in it."""
         hidden, head_dim = self.config.hidden_size, self.config.head_dim
+        dtype = self.BLOCK_LOOP_DTYPE or autocast_dtype
 
         def make_static_inputs(shape: PiecewiseCaptureShape) -> dict[str, torch.Tensor]:
             n = shape.total_tokens
             return {
-                "hidden": torch.zeros(n, hidden, dtype=autocast_dtype, device=device),
-                "cos": torch.zeros(n, head_dim, dtype=autocast_dtype, device=device),
-                "sin": torch.zeros(n, head_dim, dtype=autocast_dtype, device=device),
+                "hidden": torch.zeros(n, hidden, dtype=dtype, device=device),
+                "cos": torch.zeros(n, head_dim, dtype=dtype, device=device),
+                "sin": torch.zeros(n, head_dim, dtype=dtype, device=device),
             }
 
         def declare_step(
