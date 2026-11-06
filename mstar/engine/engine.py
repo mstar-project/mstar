@@ -3231,9 +3231,10 @@ class Engine:
         refusal = self.drop_refusal(node_name, request_id, tokens)
         if refusal is not None:
             raise RuntimeError(refusal)
+        at = len(self._resident_delta) if node_name in self._tp_leader_nodes else None
         freed = sum(resource.drop(request_id, tokens) for resource in self._submodules[node_name].resources.values())
         if node_name in self._tp_leader_nodes:
-            self._journal(MoveKind.DROP, request_id, tokens, node=node_name)
+            self._journal(MoveKind.DROP, request_id, tokens, node=node_name, at=at)
         self._runner.readmit(request_id, node_name, queued=True)
         return freed
 
@@ -3276,6 +3277,7 @@ class Engine:
             # as a resident-set delta. TP followers can deadlock if they are not
             # given a single source of truth for eviction.
             return 0
+        at = len(self._resident_delta) if node_name in self._tp_leader_nodes else None
         freed = sum(
             resource.offload(request_id)
             for resource in self._submodules[node_name].resources.values()
@@ -3286,7 +3288,7 @@ class Engine:
         if moved:
             self._release_resident_slot(node_name, request_id)
             if node_name in self._tp_leader_nodes:
-                self._journal(MoveKind.OFFLOAD, request_id, node=node_name)
+                self._journal(MoveKind.OFFLOAD, request_id, node=node_name, at=at)
         self._runner.readmit(request_id, node_name, queued=False)
         return freed
 
@@ -3357,15 +3359,17 @@ class Engine:
 
     def _journal(
         self, kind: MoveKind, request_id: int, count: int = 0, victims: Sequence[int] = (), *, node: str = "",
-        pool: str = "",
+        pool: str = "", at: int | None = None,
     ) -> None:
+        """``at``, the journal's length before a node's move, puts the move ahead of what its pools journaled as it
+        freed room, which a follower can replay only after the move."""
         wire_rid, journal = self._graph_runtime.get_rid_string(request_id), self._resident_delta
         # an UNRESERVE right after its RESERVE cancels it, so the followers don't replay both moves at every
         # `check_ready` where a second KV cache on the node keeps the request not ready
         if kind == MoveKind.UNRESERVE and journal.cancel(wire_rid, MoveKind.RESERVE, pool):
             return
         wire_victims = [self._graph_runtime.get_rid_string(victim) for victim in victims]
-        journal.add(kind, wire_rid, pool, count, wire_victims, node)
+        journal.add(kind, wire_rid, pool, count, wire_victims, node, at)
         if kind in (MoveKind.EARMARK, MoveKind.DROP):
             # matched against the followers' replay lines to compare the ranks' victims
             logger.debug("Journaled %s of request %s on %s (%d, victims %s)", kind.name, wire_rid, node or pool, count,

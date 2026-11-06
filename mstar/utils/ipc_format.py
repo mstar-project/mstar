@@ -221,13 +221,16 @@ class OffloadDelta:
 
     def add(
         self, kind: MoveKind, rid: str, pool: str = "", count: int = 0, victims: Sequence[str] = (), node: str = "",
+        at: int | None = None,
     ):
-        self.rids.append(rid)
-        self.kinds.append(kind)
-        self.pools.append(pool)
-        self.counts.append(count)
-        self.victims.append(list(victims))
-        self.nodes.append(node)
+        """Append the move, or put it ahead of the moves from index ``at`` on."""
+        at = len(self) if at is None else at
+        self.rids.insert(at, rid)
+        self.kinds.insert(at, kind)
+        self.pools.insert(at, pool)
+        self.counts.insert(at, count)
+        self.victims.insert(at, list(victims))
+        self.nodes.insert(at, node)
 
     def cancel(self, rid: str, kind: MoveKind, pool: str) -> bool:
         """Drop the last move if it is ``kind`` on ``rid`` in ``pool`` and moves no victims, and return whether a move

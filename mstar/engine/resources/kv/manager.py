@@ -4715,8 +4715,8 @@ class KVManager(AttentionResource):
         # The host sets room aside for the prompt of a request that can move only there, and `_cover_move`
         # grows it page by page. With no room for even that, the request reserves what it grows into.
         if not self._sets_aside(rid):
-            self._guarantee(rid)
-            pages = self._asks[rid] = self._footprint(rid)
+            pages = self._footprint(rid)
+            self._flip(rid, pages)
             # the other ranks replay the flip, since it can come passes before the reservation they replay
             if journal is not None:
                 journal(MoveKind.GUARANTEE, rid, pages)
@@ -4765,6 +4765,15 @@ class KVManager(AttentionResource):
         self._cpu_pool.unreserve(rid)
         if self._decides:
             self._cpu_pool.count_guaranteed(rid)
+
+    def _flip(self, rid: str, pages: int) -> None:
+        """Guarantee ``rid``, which waits for room, so that it and the earmark it waits on ask for its footprint of
+        ``pages``."""
+        self._guarantee(rid)
+        self._asks[rid] = pages
+        earmark = self._earmarks.get(rid)
+        if earmark is not None:
+            earmark.pages = pages
 
     def _cover_move(self, rid: str, n: int, undoable: bool) -> int:
         """Grow the room the host sets aside for ``rid`` by the ``n`` pages it is about to take, or guarantee ``rid``
@@ -4974,7 +4983,7 @@ class KVManager(AttentionResource):
         moving = [*victims.to_host, *victims.to_drop, *victims.to_ask]
         if self.journal is not None:
             # A waiting request takes the room whole once it covers all it asks for (`_settle`), so the other ranks
-            # replay its earmark as the reservation it ends in.
+            # replay its earmark with what it asks for, and then rank 0's reservation.
             kind = MoveKind.RESERVE if earmark.rid in self._asks else MoveKind.EARMARK
             self.journal(kind, earmark.rid, earmark.pages, moving)
         self._mark_victims(earmark, moving)
@@ -5065,11 +5074,10 @@ class KVManager(AttentionResource):
         if not earmark.victims:
             del self._earmarks[earmark.rid]
         if earmark.rid in self._asks:
-            # Every rank admits it here, from the earmark it replayed as rank 0's reservation. Journaled from inside
-            # the move, the reservation would reach a follower before the move frees the room.
-            if earmark.pages <= self._room() and not self._admit(earmark.rid, earmark.pages):
-                # turned guaranteed, so the later moves count toward its footprint
-                earmark.pages = self._asks[earmark.rid]
+            # Rank 0 alone admits it, since another rank can hold other room as the move lands there, as when a
+            # window's commit frees pages at another point of the step. The engine journals the move ahead of it.
+            if self._decides and earmark.pages <= self._room():
+                self._admit(earmark.rid, earmark.pages, self.journal)
             return
         granted = min(earmark.pages - earmark.granted, freed)
         if granted:
@@ -5110,7 +5118,7 @@ class KVManager(AttentionResource):
                 elif (failed := self._ask(rid)) is not None:
                     raise RuntimeError(failed.reason.message)
                 if victims:
-                    # rank 0's `make_room`, whose reservation `_settle` makes as the moves of ``victims`` land
+                    # rank 0's `make_room`, whose reservation rank 0 journals once the moves of ``victims`` cover it
                     self._mark_victims(Earmark(rid, count, set()), victims)
                 elif self._sets_aside(rid):
                     self._reserve(rid, count)
@@ -5131,8 +5139,7 @@ class KVManager(AttentionResource):
                     )
                 self.unreserve(rid)
             elif kind == MoveKind.GUARANTEE:
-                self._guarantee(rid)
-                self._asks[rid] = count
+                self._flip(rid, count)
             elif kind == MoveKind.ALLOT:
                 self._claim(rid, count)
             elif kind == MoveKind.WAIT:
