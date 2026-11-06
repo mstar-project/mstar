@@ -497,3 +497,155 @@ def test_offload_reload_keeps_fp8_pages(monkeypatch):
     raw.fill_(0)
     assert mgr.reload("r0")
     assert torch.equal(raw[:, list(mgr._streams["r0"]["main"].page_indices)], expected)
+
+
+# ---- parallelism ----
+
+def _tp(rank, world_size, sp_size=1):
+    """A joint group of ``world_size`` TP ranks (by ``sp_size`` SP ranks), as `kv_scales_for` reads it."""
+    return types.SimpleNamespace(
+        tp_group=types.SimpleNamespace(rank=rank, world_size=world_size),
+        sp_group=types.SimpleNamespace(rank=0, world_size=sp_size),
+        world_size=world_size * sp_size, rank=rank,
+    )
+
+
+@pytest.mark.parametrize("total_kv, tp", [(8, 1), (8, 2), (8, 4), (2, 4), (1, 2), (4, 8)])
+def test_each_tp_rank_gets_the_scales_of_the_kv_heads_its_qkv_projection_loads(tmp_path, total_kv, tp):
+    """`kv_scales_for` slices the scales file by the same heads `QKVParallelLinear` hands a rank,
+    replicated heads included, so a rank divides its K by its own heads' scales."""
+    from mstar.engine.resources.kv.quant import kv_scales_for
+    from mstar.model.components.distributed.linear import QKVParallelLinear
+
+    head_dim = 2
+    heads = torch.arange(total_kv, dtype=torch.float32)
+    path = _write_scales(tmp_path / "s.safetensors", layers=1, heads=total_kv,
+                         k=(heads + 1)[None], v=(heads + 1)[None] * 10)
+    # each K row of the checkpoint carries its head's index
+    k_weight = heads.repeat_interleave(head_dim)[:, None].expand(-1, 4).contiguous()
+    qo_heads = max(tp, total_kv) * 2
+    for rank in range(tp):
+        group = types.SimpleNamespace(rank=rank, world_size=tp)
+        qkv = QKVParallelLinear(group, 4, head_dim, total_num_heads=qo_heads, total_num_kv_heads=total_kv, bias=False)
+        qkv.weight_loader(qkv.weight, k_weight, "k")
+        start = qkv.num_heads * head_dim
+        loaded = qkv.weight.data[start:start + qkv.num_kv_heads * head_dim, 0][::head_dim]
+
+        cfg = _cfg(num_layers=1, num_kv_heads=total_kv, num_qo_heads=qo_heads, quant=_static(path))
+        cfg.shard(tp)
+        scales = kv_scales_for(cfg, EngineResourceInfo(device=CPU, joint_comm_group=_tp(rank, tp)))
+        assert scales.k.shape == (1, cfg.num_kv_heads)
+        assert (scales.k[0] - 1).tolist() == loaded.tolist(), (rank, tp)
+
+
+def test_unit_scales_need_no_rank_and_pass_under_sequence_parallel():
+    from mstar.engine.resources.kv.quant import kv_scales_for
+
+    info = EngineResourceInfo(device=CPU, joint_comm_group=_tp(0, 2, sp_size=2))
+    assert kv_scales_for(_cfg(quant=UNIT), info) is None
+
+
+def test_the_observer_refuses_sequence_parallel(monkeypatch, tmp_path):
+    monkeypatch.setattr(manager_mod, "KVTransferManager", _StubTransfer)
+    monkeypatch.setenv("MSTAR_KV_OBSERVE", str(tmp_path))
+    with pytest.raises(ValueError, match="SP is not supported"):
+        KVManager(cfg=_cfg(), name="kv", joint_comm_group=_tp(0, 2, sp_size=2),
+                  transfer_engine_info=None, device=CPU, dtype=torch.bfloat16)
+
+
+def test_replicas_with_one_scales_file_name_their_pages_alike(tmp_path):
+    """Data-parallel replicas (or the workers of one deployment) load the same file, so their
+    pages share a storage id: the prefix cache and transfers treat them as one encoding."""
+    quant = _static(_write_scales(tmp_path / "s.safetensors"))
+    a, b = (KVCache(_cfg(), CPU, torch.bfloat16, quant=quant, scales=load_kv_scales(quant, 2, 2, 0, 1, CPU))
+            for _ in range(2))
+    assert a.storage_id == b.storage_id
+
+
+def test_shm_transfer_moves_fp8_pages_between_workers(tmp_path):
+    """A node on another worker reads fp8 pages byte for byte and reads them back with the same
+    scales; a worker whose pages are encoded otherwise refuses them."""
+    from mstar.engine.resources.kv.transfer import KVReadInfo, ShmKVTransferEngine
+
+    quant = _static(_write_scales(tmp_path / "s.safetensors"))
+    scales = load_kv_scales(quant, 2, 2, 0, 1, CPU)
+    source = KVCache(_cfg(), CPU, torch.bfloat16, quant=quant, scales=scales)
+    destination = KVCache(_cfg(), CPU, torch.bfloat16, quant=quant, scales=scales)
+    k = torch.randn(12, 2, 8, dtype=torch.bfloat16)
+    pos = torch.arange(12)
+    pages = torch.tensor([1, 3])
+    source.write_tokens(1, k, -k, pages[pos // 8], pos % 8)
+    producer = ShmKVTransferEngine(source, "producer", str(tmp_path / "shm"))
+    consumer = ShmKVTransferEngine(destination, "consumer", str(tmp_path / "shm"))
+    info = producer.get_kv_transfer_info(request_id="r", label="main", page_indices=[1, 3], seq_len=12)
+    reads = [KVReadInfo(layer, local, remote, 0, 8) for layer in range(2) for local, remote in ((0, 1), (2, 3))]
+    consumer.read_batched_async(info, reads)
+    raw_src, raw_dst = source.tensor.view(torch.uint8), destination.tensor.view(torch.uint8)
+    assert torch.equal(raw_dst[:, 0], raw_src[:, 1]) and torch.equal(raw_dst[:, 2], raw_src[:, 3])
+    torch.testing.assert_close(
+        destination.read_tokens(1, torch.tensor([0, 2])[pos // 8], pos % 8),
+        source.read_tokens(1, pages[pos // 8], pos % 8),
+    )
+    plain = ShmKVTransferEngine(KVCache(_cfg(), CPU, torch.bfloat16), "plain", str(tmp_path / "shm"))
+    failed = plain.read_batched_async(info, reads)
+    with pytest.raises(ValueError, match="stored as"):
+        failed.result()
+
+
+@cuda
+@pytest.mark.parametrize("tp", [2, 4, 8])
+def test_tensor_parallel_ranks_together_compute_the_single_rank_attention(tmp_path, tp):
+    """Each TP rank holds its KV heads' fp8 pages, written and read with its own slice of the
+    static scales; the ranks' outputs side by side are the single-rank output. At tp=8 over
+    4 KV heads, ranks share heads (replicated), each with that head's scales."""
+    from mstar.engine.resources.attn.flashinfer import FlashInferManager
+    from mstar.engine.resources.attn.workspace import Workspace
+    from mstar.engine.resources.attn.wrappers import FlashInferDecodeWrapper, FlashInferPrefillWrapper
+    from mstar.engine.resources.kv.quant import kv_scales_for
+
+    dev = torch.device("cuda")
+    kv_heads, qo_heads, dim, page, length = 4, 16, 128, 16, 40
+    path = _write_scales(tmp_path / "s.safetensors", layers=2, heads=kv_heads,
+                         k=torch.tensor([[0.02, 0.05, 0.03, 0.04]] * 2),
+                         v=torch.tensor([[0.01, 0.03, 0.02, 0.05]] * 2))
+    k = torch.randn(length, kv_heads, dim, device=dev, dtype=torch.bfloat16) * 2
+    v = torch.randn(length, kv_heads, dim, device=dev, dtype=torch.bfloat16) * 2
+    pos = torch.arange(length, device=dev)
+    pages = torch.tensor([3, 5, 6], device=dev)
+    kv_kwargs = dict(
+        paged_kv_indptr=torch.tensor([0, 3], dtype=torch.int32), paged_kv_indices=pages.int().cpu(),
+        paged_kv_last_page_len=torch.tensor([length - 2 * page], dtype=torch.int32),
+    )
+
+    def attend(rank, world, q, decode):
+        cfg = _cfg(num_kv_heads=kv_heads, num_qo_heads=qo_heads, head_dim=dim, max_num_pages=8, page_size=page,
+                   quant=_static(path))
+        cfg.shard(world)
+        group = _tp(rank, world) if world > 1 else None
+        scales = kv_scales_for(cfg, EngineResourceInfo(device=dev, joint_comm_group=group))
+        cache = KVCache(cfg, dev, torch.bfloat16, quant=cfg.quant, scales=scales)
+        heads = local_heads(kv_heads, rank, world)
+        cache.write_tokens(1, k[:, heads].contiguous(), v[:, heads].contiguous(), pages[pos // page], pos % page)
+        workspace = Workspace(torch.empty(128 << 20, dtype=torch.uint8, device=dev), "kv")
+        common = dict(num_qo_heads=cfg.num_qo_heads, num_kv_heads=cfg.num_kv_heads, head_dim=dim,
+                      page_size=page, device=dev, kv_dtype=FP8)
+        if decode:
+            wrapper = FlashInferDecodeWrapper(workspace, **common)
+            wrapper.plan(dtype=torch.bfloat16, **kv_kwargs)
+        else:
+            wrapper = FlashInferPrefillWrapper(workspace, **common)
+            wrapper.plan(qo_indptr=torch.tensor([0, q.shape[0]], dtype=torch.int32), causal=True,
+                         dtype=torch.bfloat16, **kv_kwargs)
+        manager = types.SimpleNamespace(
+            _current_plan_states={"main": wrapper}, _layer_scales=layer_kv_scales(scales, cfg.num_qo_heads),
+            _layers=None, _default_layer_idx=None, _kv_cache_name="kv",
+        )
+        per = qo_heads // world
+        return FlashInferManager._attend(manager, q[:, rank * per:(rank + 1) * per].contiguous(), "main",
+                                         cache.layer_view(1), 1)
+
+    for decode, n_q in ((True, 1), (False, 7)):
+        q = torch.randn(n_q, qo_heads, dim, device=dev, dtype=torch.bfloat16) * 0.5
+        whole = attend(0, 1, q, decode)
+        parts = torch.cat([attend(rank, tp, q, decode) for rank in range(tp)], dim=1)
+        torch.testing.assert_close(parts.float(), whole.float(), rtol=1e-2, atol=1e-2)
