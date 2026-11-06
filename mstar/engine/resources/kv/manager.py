@@ -745,6 +745,7 @@ class KVManager(AttentionResource):
         # `_kept` counts the room kept for a waiting request: the pages passers freed while it waited, and the pages
         #   moves made for it freed before they covered it. Passers can't take them, but admitted requests can, and
         #   a request admitted in order takes them first.
+        # `_made` names the request whose allotment the last reservation made rather than grew.
         self._nodes = nodes
         self.local_loops: Collection[str] = frozenset()
         self._asks: dict[str, int] = {}
@@ -754,6 +755,7 @@ class KVManager(AttentionResource):
         self._snapshots: list["RecurrentStatePool"] = []
         self._footprints: dict[str, int] = {}
         self._kept = 0
+        self._made: str | None = None
         # Preemption state.
         # `_earmarks`: request -> the earmark it holds until its victims have moved.
         # `_victims`: a victim not yet moved -> its earmark.
@@ -814,8 +816,9 @@ class KVManager(AttentionResource):
         self._preplan_key = None
         self._cached_plan_output: dict[str, KVPlanOutput] | None = None
 
-        # (rid, to_label) reservations a staged step made; clear_preplan
-        # releases them. recorded in admit, not plan: forks are not staged.
+        # (rid, label) of each stream a staged step's admit created, which
+        # clear_preplan removes once `rollback_admit` has given back its pages.
+        # recorded in admit, not plan: forks are not staged.
         self._preplan_new_labels: list[tuple[str, str]] = []
 
         # The pages the live reservation freshly acquired, in the order it took them, for
@@ -3328,8 +3331,7 @@ class KVManager(AttentionResource):
         # so what is left to undo is the streams admit created.
         with self._lock:
             # labels the staged step invented are removed, not rewound to 0:
-            # a stream at 0 that nothing asked for is still a stream, and it
-            # holds the pages the reservation took
+            # a stream at 0 that nothing asked for is still a stream
             for rid, label in reversed(self._preplan_new_labels):
                 stream = self._streams.get(rid, {}).pop(label, None)
                 if stream is not None:
@@ -4799,8 +4801,8 @@ class KVManager(AttentionResource):
         # The host sets room aside for the prompt of a request that can move only there, and `_cover_move`
         # grows it page by page. With no room for even that, the request reserves what it grows into.
         if not self._sets_aside(rid):
-            self._guarantee(rid)
-            pages = self._asks[rid] = self._footprint(rid)
+            pages = self._footprint(rid)
+            self._flip(rid, pages)
             # the other ranks replay the flip, since it can come passes before the reservation they replay
             if journal is not None:
                 journal(MoveKind.GUARANTEE, rid, pages)
@@ -4822,23 +4824,27 @@ class KVManager(AttentionResource):
             del self._asks[rid]
             self._parked.discard(rid)
             self._allot(rid, pages)
+            self._made = None
         else:
             returning = self._return_pages(rid) if self._on_host(rid) else None
             self._allotments[rid] = Allotment(
                 pages=pages, prompt=self._asks.pop(rid), returning=returning, passed=passed, kept=kept,
             )
             self._recount(rid)
+            self._made = rid
         earmark = self._earmarks.get(rid)
         if earmark is not None:
             earmark.granted = earmark.pages
 
     def unreserve(self, rid: str) -> None:
         with self._lock:
+            made = self._made == rid
             # the room kept for a waiting request goes back to it
             self._kept += self._allotments[rid].kept
             self._unreserve(rid)
             if self.journal is not None:
-                self.journal(MoveKind.UNRESERVE, rid, 0)
+                # 1 when the last reservation made the allotment, which `Engine._journal` then cancels
+                self.journal(MoveKind.UNRESERVE, rid, int(made))
 
     def _unreserve(self, rid: str) -> None:
         allotment = self._allotments.pop(rid, None)
@@ -4856,6 +4862,15 @@ class KVManager(AttentionResource):
         self._cpu_pool.unreserve(rid)
         if self._decides:
             self._cpu_pool.count_guaranteed(rid)
+
+    def _flip(self, rid: str, pages: int) -> None:
+        """Guarantee ``rid``, which waits for room, so that it and the earmark it waits on ask for its footprint of
+        ``pages``."""
+        self._guarantee(rid)
+        self._asks[rid] = pages
+        earmark = self._earmarks.get(rid)
+        if earmark is not None:
+            earmark.pages = pages
 
     def _cover_move(self, rid: str, n: int, undoable: bool) -> int:
         """Grow the room the host sets aside for ``rid`` by the ``n`` pages it is about to take, or guarantee ``rid``
@@ -5080,7 +5095,7 @@ class KVManager(AttentionResource):
         moving = [*victims.to_host, *victims.to_drop, *victims.to_ask]
         if self.journal is not None:
             # A waiting request takes the room whole once it covers all it asks for (`_settle`), so the other ranks
-            # replay its earmark as the reservation it ends in.
+            # replay its earmark with what it asks for, and then rank 0's reservation.
             kind = MoveKind.RESERVE if earmark.rid in self._asks else MoveKind.EARMARK
             self.journal(kind, earmark.rid, earmark.pages, moving)
         self._mark_victims(earmark, moving)
@@ -5173,14 +5188,12 @@ class KVManager(AttentionResource):
             if not earmark.victims:
                 del self._earmarks[earmark.rid]
             if earmark.rid in self._asks:
-                # Every rank admits it here, from the earmark it replayed as rank 0's reservation. Journaled from
-                # inside the move, the reservation would reach a follower before the move frees the room.
-                if earmark.pages <= self._room():
-                    if self._admit(earmark.rid, earmark.pages):
-                        return
-                    # turned guaranteed, so the later moves count toward its footprint
-                    earmark.pages = self._asks[earmark.rid]
+                # Every rank keeps the room for it and rank 0 alone admits it, since another rank can hold other room
+                # as the move lands there, as when a window's commit frees pages at another point of the step. The
+                # engine journals the move ahead of the admit, so a follower's replay takes the same kept room.
                 self._kept += freed
+                if self._decides and earmark.pages <= self._room():
+                    self._admit(earmark.rid, earmark.pages, self.journal)
                 return
             granted = min(earmark.pages - earmark.granted, freed)
             if granted:
@@ -5225,7 +5238,7 @@ class KVManager(AttentionResource):
                 elif (failed := self._ask(rid)) is not None:
                     raise RuntimeError(failed.reason.message)
                 if victims:
-                    # rank 0's `make_room`, whose reservation `_settle` makes as the moves of ``victims`` land
+                    # rank 0's `make_room`, whose reservation rank 0 journals once the moves of ``victims`` cover it
                     self._mark_victims(Earmark(rid, count, set()), victims)
                 elif self._sets_aside(rid):
                     self._reserve(rid, count)
@@ -5246,8 +5259,7 @@ class KVManager(AttentionResource):
                     )
                 self.unreserve(rid)
             elif kind == MoveKind.GUARANTEE:
-                self._guarantee(rid)
-                self._asks[rid] = count
+                self._flip(rid, count)
             elif kind == MoveKind.ALLOT:
                 self._claim(rid, count)
             elif kind == MoveKind.WAIT:
