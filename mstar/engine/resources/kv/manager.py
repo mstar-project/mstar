@@ -4761,6 +4761,9 @@ class KVManager(AttentionResource):
         growth that admission leaves to the room fit in the room less `_kept`. A request that holds an allotment
         waits for its shortage in order."""
         with self._lock:
+            if rid not in self._asks:
+                # the moves `make_room` chose for ``rid`` admitted it, as in `reserve`
+                return None
             room = self._room() - self._kept
             # When even the fewest pages ``rid`` can take don't fit, no page the index files helps, so only the room
             # moves the mark.
