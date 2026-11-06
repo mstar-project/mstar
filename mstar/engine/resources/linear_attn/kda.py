@@ -25,7 +25,7 @@ from mstar.engine.resources.linear_attn.base import LinearAttnManager
 from mstar.engine.resources.linear_attn.config import LinearAttnConfig, LinearAttnStep
 from mstar.engine.resources.recurrent.config import DeltaNetGeometry
 from mstar.engine.resources.recurrent.pool import RecurrentAddressing
-from mstar.engine.resources.step import Segment, StepContext
+from mstar.engine.resources.step import NO_SEGMENTS, Segments, StepContext
 from mstar.platforms import current_platform
 from mstar.utils.h2d import PinnedStager
 
@@ -225,7 +225,7 @@ class KDAManager(LinearAttnManager):
             )
         addressing: dict[str, RecurrentAddressing] = ctx.plan_results[self._pool_key]
         self._current = {}
-        for label, segments in self._group_by_label(step.segments or ()).items():
+        for label, segments in (step.segments or NO_SEGMENTS).group_by_label().items():
             self._current[label] = self._build_plan(
                 label, segments, addressing[label], ctx, step.speculative,
             )
@@ -238,18 +238,11 @@ class KDAManager(LinearAttnManager):
         self._preplanned = False
         self._cached_plan_output = None
 
-    @staticmethod
-    def _group_by_label(segments) -> dict[str, list[Segment]]:
-        out: dict[str, list[Segment]] = {}
-        for seg in segments:
-            out.setdefault(seg.label, []).append(seg)
-        return out
-
     def _build_plan(
-        self, label: str, segments: list[Segment],
+        self, label: str, segments: Segments,
         addressing: RecurrentAddressing, ctx: StepContext, speculative: bool = False,
     ) -> KDAPlan:
-        spans = tuple(max(seg.span, 0) for seg in segments)
+        spans = tuple([max(span, 0) for span in segments.span_column()])
         rows = len(spans)
         lease = ctx.slot_lease
         num_tokens = lease.bucket.num_tokens if lease is not None else sum(spans)

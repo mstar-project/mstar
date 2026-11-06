@@ -12,13 +12,13 @@ from typing import NamedTuple
 import numpy as np
 import torch
 
-from mstar.engine.resources.step import Segment
+from mstar.engine.resources.step import Segments
 
 
 def group_by_plan_label(
-    segments: tuple[Segment, ...],
+    segments: Segments,
     combined_labels: dict[tuple[str, ...], str],
-) -> dict[str, list[Segment]]:
+) -> dict[str, Segments]:
     """Segments per plan label in order of packed forward view
 
     combined plan concats source labels in label major order. standalone keeps
@@ -27,17 +27,13 @@ def group_by_plan_label(
 
     NOTE: combined key with a source label with no segments in step will cause KeyError
     """
-    label_to_segments: dict[str, list[Segment]] = {}
-    for segment in segments:
-        label_to_segments.setdefault(segment.label, []).append(segment)
+    label_to_segments = segments.group_by_label()
+    if not combined_labels:
+        return label_to_segments
 
     sources = set(itertools.chain.from_iterable(combined_labels))
-    grouped: dict[str, list[Segment]] = {
-        plan_label: [
-            segment
-            for label in source_labels
-            for segment in label_to_segments[label]
-        ]
+    grouped = {
+        plan_label: Segments.concat([label_to_segments[label] for label in source_labels])
         for source_labels, plan_label in combined_labels.items()
     }
 
@@ -251,8 +247,9 @@ class KVPlanOutput:
         # each row's write page and offset in it, so staging need not walk the views
         self.decode_pages = decode_pages
         self.decode_offsets = decode_offsets
-        # (request_id, label, to_compute) per view, for consumers that need no
-        # pages or lengths (the position resource); None means read the views
+        # `Segments` of the plan's rows, whose spans are each view's to_compute,
+        # for consumers that need no pages or lengths (the position resource);
+        # None means read the views
         self.rows = rows
         # whether every row computes one token, when the plan already knows;
         # None reads the views

@@ -23,6 +23,7 @@ from mstar.engine.resources import (
     KVStep,
     Resource,
     Segment,
+    Segments,
     StepContext,
     StepRunner,
     SubmoduleStep,
@@ -498,7 +499,24 @@ def test_a_resource_step_keeps_its_own_segments():
     segs = [Segment("r1", "main", 1), Segment("r2", "main", 1)]
     own = (segs[0],)
     step = SubmoduleStep(segments=segs, steps={"cross": KVStep(segments=own)})
-    assert step.get("cross").segments is own
+    assert step.get("cross").segments == own
+
+
+def test_a_step_is_matched_to_its_stage_by_value():
+    """A pre-plan's staleness check reads the segments' values: the same rows
+    declared again, however, are the staged step, and any other row is not."""
+    runner = StepRunner({"kv": _Stub("kv", preplans=True)})
+
+    def key(segments):
+        step = SubmoduleStep(segments=segments, steps={"kv": KVStep()})
+        step.set_ctx(StepContext(("r1", "r2"), "decode", 0, False))
+        return runner._step_key(step)
+
+    columns = Segments(("r1", "r2"), "main", 1)
+    assert key(columns) == key([Segment("r1", "main", 1), Segment("r2", "main", 1)])
+    assert key(columns) != key(Segments(("r1", "r2"), "main", 2))
+    assert key(columns) != key(Segments(("r2", "r1"), "main", 1))
+    assert key(columns) != key(Segments(("r1", "r2"), ("main", "ctx"), 1))
 
 
 # --- the kv layer's import surface -----------------------------------------

@@ -35,7 +35,7 @@ import triton
 import triton.language as tl
 
 from mstar.engine.resources.base import Resource
-from mstar.engine.resources.step import BucketKey, SubmoduleStep
+from mstar.engine.resources.step import NO_SEGMENTS, BucketKey, Segments, SubmoduleStep
 from mstar.utils.h2d import PinnedStager
 from mstar.utils.profiler import PhaseLaps
 
@@ -559,9 +559,12 @@ class ResidentPlanner:
         held = self._slot_of
         if not held:
             return
-        segments = step.segments or [seg for s in step.steps.values() for seg in s.segments or ()]
-        one = [seg.request_id for seg in segments if seg.span == 1 and seg.request_id in held]
-        rest = [seg.request_id for seg in segments if seg.span != 1 and seg.request_id in held]
+        segments = step.segments or Segments.concat(s.segments or NO_SEGMENTS for s in step.steps.values())
+        if segments.spans == 1:
+            one, rest = held.keys() & segments.request_ids, ()
+        else:
+            one = [rid for rid, _, span in segments.rows() if span == 1 and rid in held]
+            rest = [rid for rid, _, span in segments.rows() if span != 1 and rid in held]
         with self._lock:
             self._moved.update(one)
             self._stale.update(rest)
@@ -602,9 +605,9 @@ class ResidentPlanner:
         streams = {}
         for key in self._keys:
             resource_step = step.steps.get(key)
-            segments = (resource_step.segments if resource_step is not None else None) or step.segments or ()
-            labels = {seg.label for seg in segments}
-            spans = {seg.span for seg in segments}
+            segments = (resource_step.segments if resource_step is not None else None) or step.segments or NO_SEGMENTS
+            labels = set(segments.label_column())
+            spans = set(segments.span_column())
             if len(labels) != 1 or spans not in ({1}, {0}):
                 raise ValueError(
                     f"resident walk {bucket.graph_walk!r} on {self.node}: resource {key!r} declares "

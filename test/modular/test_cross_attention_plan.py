@@ -30,7 +30,7 @@ from mstar.engine.resources.kv.plan import (
     PagedIndptrs,
     SequenceView,
 )
-from mstar.engine.resources.step import BucketKey, SlotLease, StepContext
+from mstar.engine.resources.step import BucketKey, Segments, SlotLease, StepContext
 
 CTX_KV = "ctx_kv"
 Q_KV = "q_kv"
@@ -302,7 +302,7 @@ def _columns_plan(rows, *, views: bool = False) -> KVPlanOutput:
         return KVPlanOutput(cpu_indptrs=None, views=built)
     # cpu_indptrs stands for the pinned ring, which a later plan may have rewritten
     return KVPlanOutput(
-        cpu_indptrs=None, rows=[(rid, CONTEXT, 0) for rid, _, _ in rows],
+        cpu_indptrs=None, rows=Segments.from_rows((rid, CONTEXT, 0) for rid, _, _ in rows),
         view_builder=_unbuilt, columns=cols,
     )
 
@@ -318,7 +318,7 @@ def _rows_query(rids, spans) -> dict[str, KVPlanOutput]:
             paged_kv_indices=torch.tensor([], dtype=torch.int32),
             paged_kv_last_page_len=torch.tensor([], dtype=torch.int32),
         ),
-        rows=[(rid, "main", n) for rid, n in zip(rids, spans, strict=True)],
+        rows=Segments(rids, "main", spans),
         view_builder=_unbuilt,
     )}
 

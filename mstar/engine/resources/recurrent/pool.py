@@ -36,10 +36,11 @@ from mstar.engine.resources.spec import ResourceReqConfig
 from mstar.engine.resources.step import (
     ADMIT_OK,
     ASKS,
+    NO_SEGMENTS,
     AdmitOutcome,
     AdmitRuntimeError,
     AllocationFailed,
-    Segment,
+    Segments,
     StepContext,
 )
 from mstar.utils.h2d import H2DMirror, PinnedStager
@@ -513,24 +514,20 @@ class RecurrentStatePool(Resource):
             ):
                 self._forget_taken(ctx.is_real_row)
                 self._forget_prefix_admit(lambda key: ctx.is_real_row(key[0]))
-            for segment in step.segments or ():
-                if segment.span <= 0 or ctx.is_padding_row(segment.request_id):
+            segments = step.segments or NO_SEGMENTS
+            for rid, label, span in segments.rows():
+                if span <= 0 or ctx.is_padding_row(rid):
                     # a zero-span row is addressed at the sink, like a padding row:
                     # it neither reads nor writes its own slot
                     continue
-                labels = slots.get(segment.request_id)
+                labels = slots.get(rid)
                 # a resident row's slot is already held
-                if (labels is None or segment.label not in labels) and self._alloc(
-                    segment.request_id, segment.label,
-                ) is None:
-                    return self._refused(segment.request_id, segment.label)
-                if page and (segment.request_id in self._leases or segment.span >= page):
-                    label = segment.label
+                if (labels is None or label not in labels) and self._alloc(rid, label) is None:
+                    return self._refused(rid, label)
+                if page and (rid in self._leases or span >= page):
                     if label not in every:
-                        every[label] = self._checkpoint_every(
-                            [seg for seg in step.segments if seg.label == label], ctx,
-                        )
-                    self._admit_prefix(segment.request_id, label, segment.span, every[label], ctx.is_preplan)
+                        every[label] = self._checkpoint_every(segments.group_by_label()[label], ctx)
+                    self._admit_prefix(rid, label, span, every[label], ctx.is_preplan)
 
         for rid in self._fork_rids(step):
             if ctx.is_padding_row(rid):
@@ -603,7 +600,7 @@ class RecurrentStatePool(Resource):
     def _fork_rids(step: RecurrentStep) -> set[str]:
         if not (step.pre_forks or step.post_forks):
             return set()
-        rids = {seg.request_id for seg in step.segments or ()}
+        rids = set((step.segments or NO_SEGMENTS).request_ids)
         return rids if step.fork_rids is None else rids & step.fork_rids
 
     @property
@@ -660,7 +657,7 @@ class RecurrentStatePool(Resource):
             self._apply_restores(step)
 
         self._current = {}
-        for label, segments in self._group_by_label(step.segments or ()).items():
+        for label, segments in (step.segments or NO_SEGMENTS).group_by_label().items():
             self._current[label] = self._build_addressing(
                 label, segments, ctx, pending,
             )
@@ -695,20 +692,20 @@ class RecurrentStatePool(Resource):
                 self._forget_prefix_admit(lambda key: ctx.is_real_row(key[0]))
             page = self._kv.config.tokens_per_page if self._kv is not None else 0
             slots, is_pad = self._slots, ctx.is_padding_row
-            for segment in step.segments or ():
-                if segment.span <= 0 or is_pad(segment.request_id):
+            for rid, label, span in (step.segments or NO_SEGMENTS).rows():
+                if span <= 0 or is_pad(rid):
                     continue
-                labels = slots.get(segment.request_id)
-                slot = labels.get(segment.label) if labels else None
+                labels = slots.get(rid)
+                slot = labels.get(label) if labels else None
                 if slot is not None:
                     if not slot.has_state:
                         # the backend already wrote the pool; a later step resumes
                         slot.has_state = True
                         self._version += 1
-                    slot.tokens += segment.span
+                    slot.tokens += span
                     # a row too short to checkpoint that ends on a page (a decode step) is saved here, after its forward
-                    if page and segment.span < page and not slot.tokens % page:
-                        self._save_decode(segment.request_id, segment.label, slot)
+                    if page and span < page and not slot.tokens % page:
+                        self._save_decode(rid, label, slot)
             if self._snap_writes:
                 self._file_writes(step)
             if self._unkeyed:
@@ -855,14 +852,14 @@ class RecurrentStatePool(Resource):
         if not self._snap_refs[snap]:
             del self._snap_refs[snap]
 
-    def _checkpoint_every(self, segments: list[Segment], ctx: StepContext) -> int:
+    def _checkpoint_every(self, segments: Segments, ctx: StepContext) -> int:
         """The checkpoint interval of a step over ``segments``: a page, or for a
         step past the largest captured bucket the smallest page multiple whose
         checkpoints fit that bucket's buffer, which an eager step writes too."""
         page = self._kv.config.tokens_per_page
         if not self._cg_max_tokens:
             return page
-        spans = [seg.span for seg in segments if seg.span > 0 and not ctx.is_padding_row(seg.request_id)]
+        spans = [span for rid, _, span in segments.rows() if span > 0 and not ctx.is_padding_row(rid)]
         rows = checkpoint_rows(self._cg_max_tokens, self._cg_max_bs, page)
         every = page
         while sum(span // every for span in spans) > rows:
@@ -910,7 +907,7 @@ class RecurrentStatePool(Resource):
 
     def _file_writes(self, step: RecurrentStep) -> None:
         """Index the states this step's forward saved. Caller holds the lock."""
-        rids = {seg.request_id for seg in step.segments or ()}
+        rids = set((step.segments or NO_SEGMENTS).request_ids)
         for key in [k for k in self._snap_writes if k[0] in rids]:
             write = self._snap_writes.pop(key)
             if _DEBUG_ASSERTS:
@@ -928,7 +925,7 @@ class RecurrentStatePool(Resource):
         dropped here."""
         if not self._restores:
             return
-        rids = {seg.request_id for seg in step.segments or ()}
+        rids = set((step.segments or NO_SEGMENTS).request_ids)
         with self._lock:
             for key in [k for k in self._restores if k[0] in rids]:
                 restore = self._restores.pop(key)
@@ -1048,15 +1045,8 @@ class RecurrentStatePool(Resource):
 
     # Addressing
 
-    @staticmethod
-    def _group_by_label(segments) -> dict[str, list[Segment]]:
-        out: dict[str, list[Segment]] = {}
-        for seg in segments:
-            out.setdefault(seg.label, []).append(seg)
-        return out
-
     def _build_addressing(
-        self, label: str, segments: list[Segment], ctx: StepContext,
+        self, label: str, segments: Segments, ctx: StepContext,
         pending_forks: dict[tuple[str, str], bool] | None = None,
     ) -> RecurrentAddressing:
         pad = self.pad_index
@@ -1064,7 +1054,7 @@ class RecurrentStatePool(Resource):
         if not pending_forks:
             memo_key = (
                 self._version, ctx.capture, tuple(ctx.request_ids),
-                tuple([seg.request_id for seg in segments]), tuple([seg.span > 0 for seg in segments]),
+                segments.request_ids, tuple([span > 0 for span in segments.span_column()]),
             )
             memo = self._addressing_memo.get(label)
             if memo is not None and memo[0] == memo_key:
@@ -1072,27 +1062,25 @@ class RecurrentStatePool(Resource):
         pending_forks = pending_forks or {}
         indices = []
         has_state = []
-        for seg in segments:
+        for rid, _, span in segments.rows():
             slot = (
-                None if ctx.capture or ctx.is_padding_row(seg.request_id)
-                else self._slots.get(seg.request_id, {}).get(label)
+                None if ctx.capture or ctx.is_padding_row(rid)
+                else self._slots.get(rid, {}).get(label)
             )
-            if slot is None or seg.span <= 0:
+            if slot is None or span <= 0:
                 # no slot, a zero-span row, a capture row or a padding row: the
                 # sink (or the sentinel), which nothing reads back
                 indices.append(pad)
                 has_state.append(False)
             else:
                 indices.append(slot.index)
-                has_state.append(
-                    pending_forks.get((seg.request_id, label), slot.has_state)
-                )
+                has_state.append(pending_forks.get((rid, label), slot.has_state))
         if memo_key is not None:
             self._addressing_memo[label] = (memo_key, indices, has_state)
         return self._stage_addressing(label, segments, ctx, indices, has_state)
 
     def _stage_addressing(
-        self, label: str, segments: list[Segment], ctx: StepContext,
+        self, label: str, segments: Segments, ctx: StepContext,
         indices: list[int], has_state: list[bool],
     ) -> RecurrentAddressing:
         pad = self.pad_index
@@ -1105,7 +1093,7 @@ class RecurrentStatePool(Resource):
                         by_rid.setdefault(rid, []).append(write)
             snapshots = tuple(
                 SnapshotTarget(row, write.offset, write.slot)
-                for row, seg in enumerate(segments) for write in by_rid.get(seg.request_id, ())
+                for row, rid in enumerate(segments.request_ids) for write in by_rid.get(rid, ())
             )
 
         num_rows = len(indices)

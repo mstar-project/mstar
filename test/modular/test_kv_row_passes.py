@@ -49,10 +49,10 @@ class _PerRow:
         return getattr(self._arena, name)
 
     def admit_rows(self, streams, segments, real, sink, page_size):
-        return [], list(range(len(segments)))
+        return [], list(range(len(list(segments))))
 
     def commit_rows(self, streams, segments, real, sink, keep):
-        return list(range(len(segments)))
+        return list(range(len(list(segments))))
 
 
 @pytest.fixture(autouse=True)

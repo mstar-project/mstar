@@ -30,7 +30,7 @@ from mstar.engine.resources.linear_attn.mamba2_kernels import (
 )
 from mstar.engine.resources.recurrent.config import Mamba2Geometry
 from mstar.engine.resources.recurrent.pool import NO_SLOT, SINK_SLOT, RecurrentAddressing
-from mstar.engine.resources.step import Segment, SlotLease, StepContext
+from mstar.engine.resources.step import NO_SEGMENTS, SlotLease, StepContext
 
 logger = logging.getLogger(__name__)
 
@@ -102,8 +102,8 @@ class Mamba2Manager(LinearAttnManager):
 
         addressing: dict[str, RecurrentAddressing] = ctx.plan_results[self._pool_key]
         self._current = {}
-        for label, segments in self._group_by_label(step.segments or ()).items():
-            spans = tuple(seg.span for seg in segments)
+        for label, segments in (step.segments or NO_SEGMENTS).group_by_label().items():
+            spans = segments.span_column()
             num_rows = len(spans)
             self._current[label] = Mamba2Plan(
                 # every row addresses a slot (padding rows keep pointing at the
@@ -121,13 +121,6 @@ class Mamba2Manager(LinearAttnManager):
     def clear_preplan(self):
         self._preplanned = False
         self._cached_plan_output = None
-
-    @staticmethod
-    def _group_by_label(segments) -> dict[str, list[Segment]]:
-        out: dict[str, list[Segment]] = {}
-        for seg in segments:
-            out.setdefault(seg.label, []).append(seg)
-        return out
 
     def current_plan(self, label: str | None = None) -> Mamba2Plan:
         if label is None:

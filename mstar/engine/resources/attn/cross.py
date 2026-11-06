@@ -1,5 +1,6 @@
 """Cross-attention over a context written once and never extended."""
 
+from itertools import accumulate
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 import numpy as np
@@ -36,7 +37,7 @@ from mstar.engine.resources.kv.plan import (
     PagedIndptrs,
     SequenceView,
 )
-from mstar.engine.resources.step import SlotLease, StepContext
+from mstar.engine.resources.step import NO_SEGMENTS, SlotLease, StepContext
 from mstar.utils.profiler import PhaseLaps
 
 if TYPE_CHECKING:
@@ -219,7 +220,7 @@ class FlashInferCrossManager(CrossAttentionManager):
                 laps.lap("unchanged")
                 continue
             if context_rids is None and context_out.columns is not None:
-                context_rids = tuple(row[0] for row in context_out.rows)
+                context_rids = context_out.rows.request_ids
             if request_ids == context_rids:
                 indptrs = self._context_indptrs(packing, context_out.columns)
             else:
@@ -299,12 +300,12 @@ class FlashInferCrossManager(CrossAttentionManager):
                 label: kv_out for label, kv_out in plan_outputs.items()
                 if label != self._context_label
             }
-        # `rows` (request id first) spares building the views
+        # `rows` spares building the views
         return {
             label: QueryPacking(
                 request_ids=[
                     view.request_id for view in kv_out.views
-                ] if kv_out.rows is None else [row[0] for row in kv_out.rows],
+                ] if kv_out.rows is None else kv_out.rows.request_ids,
                 qo_indptr=kv_out.cpu_indptrs.qo_indptr,
             )
             for label, kv_out in plan_outputs.items()
@@ -317,19 +318,12 @@ class FlashInferCrossManager(CrossAttentionManager):
         No ``combined_labels`` here — that grouping lives on ``KVStep``, so a
         cacheless query side plans one label per segment label.
         """
-        rids: dict[str, list[str]] = {}
-        qo_indptrs: dict[str, list[int]] = {}
-        for segment in step.segments or ():
-            rids.setdefault(segment.label, []).append(segment.request_id)
-            qo = qo_indptrs.setdefault(segment.label, [0])
-            qo.append(qo[-1] + segment.span)
-
         return {
             label: QueryPacking(
-                request_ids=label_rids,
-                qo_indptr=torch.tensor(qo_indptrs[label], dtype=torch.int32),
+                request_ids=rows.request_ids,
+                qo_indptr=torch.tensor(list(accumulate(rows.span_column(), initial=0)), dtype=torch.int32),
             )
-            for label, label_rids in rids.items()
+            for label, rows in (step.segments or NO_SEGMENTS).group_by_label().items()
         }
 
     @staticmethod

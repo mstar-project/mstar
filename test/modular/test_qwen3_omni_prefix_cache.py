@@ -16,6 +16,7 @@ from mstar.engine.resources.kv.manager import SpanCursor
 from mstar.engine.resources.kv.plan import KVPlanOutputs
 from mstar.engine.resources.position.config import PositionConfig
 from mstar.engine.resources.position.manager import RopeManager
+from mstar.engine.resources.step import Segments
 from mstar.model.qwen3_omni.components.rope import get_rope_index_vision
 from mstar.model.qwen3_omni.config import TALKER_KV, THINKER_KV, THINKER_MIXED, THINKER_POS, Qwen3OmniModelConfig
 from mstar.model.qwen3_omni.qwen3_omni_model import TEXT_BEFORE, Qwen3OmniModel, image_span
@@ -92,7 +93,7 @@ def test_a_cut_text_walk_prepared_again_is_planned_where_the_cache_keyed_it(thin
     _prepare(thinker, "prefill_text", text, CachedPrefix("main", 6, 16))
     # a refused admit prepares the walk again, after the probe moved the counter
     again = _prepare(thinker, "prefill_text", text, CachedPrefix("main", 6, 16))
-    kv_plan = KVPlanOutputs({"main": SimpleNamespace(rows=[(RID, "main", again.input_seq_len)])})
+    kv_plan = KVPlanOutputs({"main": SimpleNamespace(rows=Segments((RID,), "main", again.input_seq_len))})
     rope.plan(PositionStep(), StepContext((RID,), "prefill_text", 0, False, plan_results={THINKER_KV: kv_plan}))
 
     assert again.custom_pos_ids is None and thinker._position_ids_3d([again]).tolist() == [list(range(16, 22))] * 3, (

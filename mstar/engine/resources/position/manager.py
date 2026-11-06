@@ -30,7 +30,7 @@ from mstar.engine.resources.position.rope import (
     rope_apply_qk_inplace,  # noqa: F401  (registers mstar::rope_apply_qk_inplace)
 )
 from mstar.engine.resources.resident import gather_column
-from mstar.engine.resources.step import ADMIT_OK, AdmitOutcome, StepContext
+from mstar.engine.resources.step import ADMIT_OK, AdmitOutcome, Segments, StepContext
 
 if TYPE_CHECKING:
     from mstar.engine.resources.resident import (
@@ -38,6 +38,9 @@ if TYPE_CHECKING:
         ResidentPlanner,
         ResidentWrites,
     )
+
+# a request with no counters yet: every stream of it is at 0
+_NO_COUNTERS: dict[str, int] = {}
 
 
 @dataclass
@@ -358,7 +361,7 @@ class RopeManager(PositionManager):
             if pos_ids is None:
                 rows = kv_out.rows
                 if rows is None:
-                    rows = [(v.request_id, v.label, v.to_compute) for v in kv_out.views]
+                    rows = Segments.from_rows((v.request_id, v.label, v.to_compute) for v in kv_out.views)
                 pos_ids = self._build_pos_ids(rows, plan_label, lease)
             pos_ids_out[plan_label] = self._place(pos_ids, plan_label, lease)
         self._preplanned = ctx.is_preplan
@@ -399,14 +402,15 @@ class RopeManager(PositionManager):
 
     def commit(self, step: PositionStep, ctx: StepContext):
         all_counters = self._counters
-        for segment, advance in zip(
-            step.segments, self._advances(step), strict=True
+        segments = step.segments
+        for rid, label, advance in zip(
+            segments.request_ids, segments.label_column(), self._advances(step), strict=True
         ):
             if advance:
-                counters = all_counters.get(segment.request_id)
+                counters = all_counters.get(rid)
                 if counters is None:
-                    counters = all_counters[segment.request_id] = {}
-                counters[segment.label] = counters.get(segment.label, 0) + advance
+                    counters = all_counters[rid] = {}
+                counters[label] = counters.get(label, 0) + advance
 
         # post-forks copy the source after this step advanced it, matching
         # where KV applies them
@@ -442,12 +446,11 @@ class RopeManager(PositionManager):
         `step.advance` does override"""
         if step.advance is not None:
             return step.advance
+        spans = step.segments.span_column()
         if self._config.scheme == PosScheme.BLOCK:
-            return tuple(
-                self._config.block_step if segment.span else 0
-                for segment in step.segments
-            )
-        return tuple(segment.span for segment in step.segments)
+            block_step = self._config.block_step
+            return tuple([block_step if span else 0 for span in spans])
+        return spans
 
     def _explicit_pos_ids(
         self, step: PositionStep, plan_label: str, num_plans: int
@@ -478,10 +481,10 @@ class RopeManager(PositionManager):
         return buffer
 
     def _build_pos_ids(
-        self, rows, plan_label: str, lease,
+        self, rows: Segments, plan_label: str, lease,
     ) -> torch.Tensor:
-        """step positions in KV plan order from stream counters; ``rows`` is
-        ``(request_id, label, to_compute)`` per view in plan order
+        """step positions in KV plan order from stream counters; ``rows`` holds
+        each view's request, label and to_compute in plan order
 
         Under a lease these go into pinned memory so `_place`'s `non_blocking`
         copy is really asynchronous; from pageable memory the host waits. The
@@ -490,16 +493,21 @@ class RopeManager(PositionManager):
         block = self._config.scheme == PosScheme.BLOCK
         counters = self._counters
         pos_ids: list[int] = []
-        append, extend = pos_ids.append, pos_ids.extend
-        for rid, label, to_compute in rows:
-            labels = counters.get(rid)
-            start = labels.get(label, 0) if labels is not None else 0
-            if to_compute == 1:
-                append(start)  # a decode row
-            elif block:
-                extend([start] * to_compute)
-            else:
-                extend(range(start, start + to_compute))
+        if rows.spans == 1 and type(rows.labels) is not tuple:
+            # every row a decode row on one stream
+            label, get = rows.labels, counters.get
+            pos_ids = [get(rid, _NO_COUNTERS).get(label, 0) for rid in rows.request_ids]
+        else:
+            append, extend = pos_ids.append, pos_ids.extend
+            for rid, label, to_compute in rows.rows():
+                labels = counters.get(rid)
+                start = labels.get(label, 0) if labels is not None else 0
+                if to_compute == 1:
+                    append(start)  # a decode row
+                elif block:
+                    extend([start] * to_compute)
+                else:
+                    extend(range(start, start + to_compute))
         if lease is None:
             return torch.tensor(pos_ids, dtype=torch.long)
         key = CGSlotKey(

@@ -7,6 +7,7 @@ import pytest
 import torch
 
 from mstar.engine.resources.linear_attn.gdn import GDNManager
+from mstar.engine.resources.step import Segments
 from mstar.model.qwen3_5.config import LLM_MIXED, SAMPLER
 from mstar.model.qwen3_5.qwen3_5_model import Qwen3_5DenseModel
 from mstar.model.qwen3_5.submodules import LLMSubmodule
@@ -51,7 +52,7 @@ class _Recorder(GDNManager):
 ])
 def test_the_kernel_follows_a_packed_capture_not_the_spans(force_prefill, spans, kind):
     gdn = _Recorder()
-    segments = [SimpleNamespace(span=s) for s in spans]
+    segments = Segments(range(len(spans)), "main", spans)
     addressing = SimpleNamespace(slot_indices=torch.zeros(4, dtype=torch.long),
                                  has_state=torch.zeros(4, dtype=torch.bool),
                                  snapshots=(), snapshot_every=0)

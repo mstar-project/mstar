@@ -33,7 +33,7 @@ from mstar.engine.resources.recurrent.pool import (
     checkpoint_rows,
 )
 from mstar.engine.resources.spec import CombinedSplit
-from mstar.engine.resources.step import Segment, SlotLease, StepContext
+from mstar.engine.resources.step import NO_SEGMENTS, Segments, SlotLease, StepContext
 from mstar.platforms.compile import compiled
 from mstar.utils.causal_conv1d import PAD_SLOT_ID
 
@@ -186,7 +186,7 @@ class GDNManager(LinearAttnManager):
         addressing: dict[str, RecurrentAddressing] = ctx.plan_results[self._pool_key]
 
         self._current = {}
-        for label, segments in self._group_by_label(step.segments or ()).items():
+        for label, segments in (step.segments or NO_SEGMENTS).group_by_label().items():
             self._current[label] = self._build_plan(
                 label, segments, addressing[label], ctx
             )
@@ -200,13 +200,6 @@ class GDNManager(LinearAttnManager):
         # an abandoned stage leaves nothing to rewind.
         self._preplanned = False
         self._cached_plan_output = None
-
-    @staticmethod
-    def _group_by_label(segments) -> dict[str, list[Segment]]:
-        out: dict[str, list[Segment]] = {}
-        for seg in segments:
-            out.setdefault(seg.label, []).append(seg)
-        return out
 
     def _get_wrapper(
         self, label: str, is_decode: bool, lease: SlotLease | None = None,
@@ -279,11 +272,11 @@ class GDNManager(LinearAttnManager):
     def _build_plan(
         self,
         label: str,
-        segments: list[Segment],
+        segments: Segments,
         addressing: RecurrentAddressing,
         ctx: StepContext,
     ) -> GDNWrapper:
-        spans = [seg.span for seg in segments]
+        spans = list(segments.span_column())
         num_rows = len(spans)
         # a narrow, not a gather: padding rows keep pointing at the sink
         slots = addressing.slot_indices[:num_rows]
@@ -291,7 +284,7 @@ class GDNManager(LinearAttnManager):
         # One kernel for the step: the chunked one unless every row is one
         # token, or always under a packed capture, which replays mixed steps.
         # A split walk's step (decode rows beside prompt rows) takes both.
-        is_decode = not ctx.force_prefill and bool(spans) and all(s == 1 for s in spans)
+        is_decode = not ctx.force_prefill and segments.spans == 1
         walk = ctx.slot_lease.bucket.graph_walk if ctx.slot_lease is not None else ctx.graph_walk
         split = self._splits.get(walk)
         every = addressing.snapshot_every

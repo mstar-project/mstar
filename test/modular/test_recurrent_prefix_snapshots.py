@@ -35,7 +35,7 @@ from mstar.engine.resources.recurrent.config import (
 from mstar.engine.resources.recurrent.pool import RecurrentAddressing, RecurrentStatePool, SnapshotTarget
 from mstar.engine.resources.runner import StepRunner
 from mstar.engine.resources.spec import CombinedSplit, NodeResourceSpec
-from mstar.engine.resources.step import Segment, StepContext
+from mstar.engine.resources.step import Segment, Segments, StepContext
 from mstar.graph.base import GraphNode
 from mstar.model.base import KVLabel, PrefixKeys
 from mstar.validation.resources import _unskippable_resources
@@ -805,7 +805,7 @@ def _plan_gdn(gdn: GDNManager, walk: str, span: int, snapshots=(), captured: boo
     )
     lease = SimpleNamespace(bucket=SimpleNamespace(graph_walk=walk)) if captured else None
     ctx = SimpleNamespace(force_prefill=False, slot_lease=lease, graph_walk=walk)
-    gdn._build_plan("main", [Segment("a", "main", span)], addressing, ctx)
+    gdn._build_plan("main", Segments(("a",), "main", span), addressing, ctx)
 
 
 def test_a_graph_for_a_walk_the_kv_cache_doesnt_key_writes_no_checkpoints():

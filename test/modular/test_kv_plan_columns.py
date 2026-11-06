@@ -15,7 +15,7 @@ from mstar.engine.resources.kv import manager as manager_mod  # noqa: E402
 from mstar.engine.resources.kv.config import KVReqConfig, KVStep, PagedKVConfig  # noqa: E402
 from mstar.engine.resources.kv.manager import KVManager  # noqa: E402
 from mstar.engine.resources.kv.plan import group_by_plan_label  # noqa: E402
-from mstar.engine.resources.step import BucketKey, Segment, SlotLease, StepContext  # noqa: E402
+from mstar.engine.resources.step import BucketKey, Segment, Segments, SlotLease, StepContext  # noqa: E402
 
 PAGE = 4
 LABELS = ("main", "aux")
@@ -130,7 +130,7 @@ def test_a_columnar_plan_equals_the_per_row_plan(seed, plan_backend):
         sink = frozenset({(rows[0], "main")}) if rng.random() < 0.2 else frozenset()
         # the two labels as one plan label (a combined CFG plan) or each its own
         combined = {LABELS: "both"} if rng.random() < 0.5 else {}
-        for _label, group in group_by_plan_label(tuple(segs), combined).items():
+        for _label, group in group_by_plan_label(Segments.from_rows(segs), combined).items():
             columns = kv._plan_label(group, {}, ctx, sink, None)
             per_row = kv._plan_output(kv._sequence_views(group, {}, ctx, sink), PAGE, None)
             _same(columns, per_row)

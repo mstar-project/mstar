@@ -58,6 +58,7 @@ from mstar.engine.resources.step import (
     AllocationFailed,
     RequestOffloading,
     Segment,
+    Segments,
     SettingValue,
     StepContext,
 )
@@ -509,7 +510,7 @@ class _DecodePlanCache:
     )
 
     def __init__(self, step_segments, real_segments, n_real, pad_layout, combined_labels, outputs, epoch):
-        # the planned step's own segments tuple: a commit of that object is the
+        # the planned step's own `Segments`: a commit of that object is the
         # one commit the next plan may assume
         self.step_segments = step_segments
         # the real rows' segments, the key the next step must match
@@ -531,7 +532,7 @@ class _DecodePlanCache:
         """The real (request, label) pairs, for the commit check of a step
         that is not the cached batch."""
         if self._rows is None:
-            self._rows = frozenset(seg[:2] for seg in self.real_segments)
+            self._rows = frozenset(self.real_segments.pairs())
         return self._rows
 
 
@@ -2087,7 +2088,7 @@ class KVManager(AttentionResource):
             ready: list[CacheStream] = []
             rows = step.segments
             if not ctx.capture and not ahead and len(self._groups) == 1:
-                ready, slow = self._arena.admit_rows(streams, rows, ctx.real_rows(), sink or None, page_size)
+                ready, slow = self._arena.admit_rows(streams, rows.rows(), ctx.real_rows(), sink or None, page_size)
                 rows = [rows[i] for i in slow]
             for segment in rows:
                 if self._sinks(ctx, sink, segment):
@@ -2513,7 +2514,7 @@ class KVManager(AttentionResource):
         )
 
     def _plan_label(
-        self, segments: list[Segment], pending: dict, ctx: StepContext,
+        self, segments: Segments, pending: dict, ctx: StepContext,
         sink: frozenset[tuple[str, str]], ring: PinnedIndexRing | None, group: int = 0,
     ) -> KVPlanOutput:
         """One plan label's output in group ``group``:
@@ -2532,13 +2533,10 @@ class KVManager(AttentionResource):
         is_pad = ctx.is_padding_row
         sids, lens, spans, gens = [], [], [], []
         sink_rows = []
-        decode = bool(segments)
-        for i, s in enumerate(segments):
-            span = s.span
+        decode = bool(segments) and segments.spans == 1
+        for i, (rid, label, span) in enumerate(segments.rows()):
             spans.append(span)
-            if span != 1:
-                decode = False
-            if capture or is_pad(s.request_id) or (sink and (s.request_id, s.label) in sink):
+            if capture or is_pad(rid) or (sink and (rid, label) in sink):
                 # a padding row reads and writes SINK_PAGE, a page per page of
                 # span; see `_sequence_views`
                 sink_rows.append(i)
@@ -2546,7 +2544,7 @@ class KVManager(AttentionResource):
                 lens.append(span)
                 gens.append(0)
                 continue
-            stream = streams[s.request_id][s.label].group(group)
+            stream = streams[rid][label].group(group)
             sids.append(stream.page_indices.sid)
             lens.append(span + stream.stored_len)
             gens.append(stream.generation)
@@ -2569,10 +2567,10 @@ class KVManager(AttentionResource):
             bounds = kv_indptr.tolist()
             return [
                 SequenceView(
-                    s.request_id, s.label, indices[bounds[i]:bounds[i + 1]].tolist(),
-                    lens[i], s.span, 0, gens[i],
+                    rid, label, indices[bounds[i]:bounds[i + 1]].tolist(),
+                    lens[i], span, 0, gens[i],
                 )
-                for i, s in enumerate(segments)
+                for i, (rid, label, span) in enumerate(segments.rows())
             ]
 
         return KVPlanOutput(
@@ -2592,17 +2590,19 @@ class KVManager(AttentionResource):
         )
 
     def _plan_label_rows(
-        self, segments: list[Segment], ctx: StepContext, sink: frozenset[tuple[str, str]],
+        self, segments: Segments, ctx: StepContext, sink: frozenset[tuple[str, str]],
         ring: PinnedIndexRing | None, page_size: int,
     ) -> KVPlanOutput:
         """`_plan_label` for a step that isn't a capture, in the first group,
         every row read off its stream in one call (`PageArena.plan_rows`)."""
         sink_pages = self._sink_pages
-        args = (self._streams, segments, ctx.real_rows(), sink or None, sink_pages.sid, page_size)
-        raw, total, all_have, lens_gens, max_sink, decode = self._arena.plan_rows(*args)
+        args = (ctx.real_rows(), sink or None, sink_pages.sid, page_size)
+        raw, total, all_have, lens_gens, max_sink, decode = self._arena.plan_rows(self._streams, segments.rows(), *args)
         if max_sink and len(sink_pages) * page_size < max_sink:
             self._extend_sink_pages(-(-max_sink // page_size))
-            raw, total, all_have, lens_gens, max_sink, decode = self._arena.plan_rows(*args)
+            raw, total, all_have, lens_gens, max_sink, decode = self._arena.plan_rows(
+                self._streams, segments.rows(), *args,
+            )
         n = len(segments)
         cols = columns_from_raw((raw, total, all_have), n)
         indices, kv_indptr, last = cols.indices, cols.kv_indptr, cols.last_page_len
@@ -2614,10 +2614,10 @@ class KVManager(AttentionResource):
             lg = np.frombuffer(lens_gens, np.int64).tolist()
             return [
                 SequenceView(
-                    s.request_id, s.label, indices[bounds[i]:bounds[i + 1]].tolist(),
-                    lg[i], s.span, 0, lg[n + i],
+                    rid, label, indices[bounds[i]:bounds[i + 1]].tolist(),
+                    lg[i], span, 0, lg[n + i],
                 )
-                for i, s in enumerate(segments)
+                for i, (rid, label, span) in enumerate(segments.rows())
             ]
 
         return KVPlanOutput(
@@ -2645,7 +2645,7 @@ class KVManager(AttentionResource):
         return (
             not ctx.capture and bool(step.segments)
             and not step.pre_forks and not step.post_forks and not step.sink
-            and all(seg.span == 0 for seg in step.segments)
+            and step.segments.spans == 0
         )
 
     def _readonly_key(self, step: KVStep, ctx: StepContext) -> tuple[tuple, tuple]:
@@ -2653,7 +2653,7 @@ class KVManager(AttentionResource):
         holds for: an eager-write plan is never staged, so it isn't another's."""
         lease = ctx.slot_lease
         return (
-            (tuple(step.segments), lease.bucket if lease is not None else None, step.eager_write),
+            (step.segments, lease.bucket if lease is not None else None, step.eager_write),
             (self._plan_epoch, self._readonly_epoch),
         )
 
@@ -2697,7 +2697,7 @@ class KVManager(AttentionResource):
         if rid is None or rid in self._readonly_rows:
             self._drop_readonly_plans()
         cache = self._decode_plan_cache
-        if cache is not None and (rid is None or any(rid == seg[0] for seg in cache.real_segments)):
+        if cache is not None and (rid is None or rid in cache.real_segments.request_ids):
             self._plan_epoch += 1
         if row and rid is not None and self._resident is not None:
             self._resident.planner.mark_stale(rid)
@@ -2713,19 +2713,18 @@ class KVManager(AttentionResource):
         first and whose padding segments (a replay's dummy rows) all share
         one span; None when the layout is anything else."""
         segs = step.segments
+        real = ctx.real_rids()
         n_real = 0
-        for seg in segs:
-            if not ctx.is_real_row(seg.request_id):
+        for rid in segs.request_ids:
+            if rid not in real:
                 break
             n_real += 1
         pad = segs[n_real:]
         if not pad:
             return n_real, (0, 0)
-        span = pad[0].span
-        for seg in pad:
-            if seg.span != span or ctx.is_real_row(seg.request_id):
-                return None
-        return n_real, (len(pad), span)
+        if type(pad.spans) is tuple or not real.isdisjoint(pad.request_ids):
+            return None
+        return n_real, (len(pad), pad.spans)
 
     def _remember_decode_plan(
         self, step: KVStep, ctx: StepContext, res: "KVPlanOutputs",
@@ -2742,9 +2741,8 @@ class KVManager(AttentionResource):
         if split is None:
             return
         n_real, pad_layout = split
-        for seg in step.segments:
-            if seg.span != 1:
-                return
+        if step.segments and step.segments.spans != 1:
+            return
         self._decode_plan_cache = _DecodePlanCache(
             step_segments=step.segments, real_segments=step.segments[:n_real],
             n_real=n_real, pad_layout=pad_layout, combined_labels=dict(step.combined_labels),
@@ -2776,9 +2774,7 @@ class KVManager(AttentionResource):
             # a hit rebuilds each label's padding from all the step's padding
             # rows; in a combined label, a later source label's real rows can
             # follow an earlier one's padding
-            if [(v.request_id, v.label, v.to_compute) for v in pad] != [
-                (seg.request_id, seg.label, seg.span) for seg in cache.step_segments[cache.n_real:]
-            ]:
+            if [(v.request_id, v.label, v.to_compute) for v in pad] != list(cache.step_segments[cache.n_real:].rows()):
                 return None
             streams = []
             for v in real:
@@ -2791,7 +2787,7 @@ class KVManager(AttentionResource):
             row_pages = [v.page_idxs for v in real]
             derived.append(_LabelRows(
                 group=group, label=label,
-                rows=tuple((v.request_id, v.label, 1) for v in real),
+                rows=Segments([v.request_id for v in real], [v.label for v in real], 1),
                 streams=streams,
                 lens=np.fromiter((v.length for v in real), np.int64, n_real),
                 npages=np.fromiter((len(p) for p in row_pages), np.int64, n_real),
@@ -2833,16 +2829,17 @@ class KVManager(AttentionResource):
             return None
         n_real = cache.n_real
         segs = step.segments
+        pad_segs = segs[n_real:]
         if (
             len(segs) != n_real + cache.pad_layout[0]
             or segs[:n_real] != cache.real_segments
             or step.combined_labels != cache.combined_labels
-            or any(seg.span != cache.pad_layout[1] or ctx.is_real_row(seg.request_id) for seg in segs[n_real:])
-            # padding keeps its labels: their order places the real rows in a combined label
-            or any(
-                seg.label != prev.label
-                for seg, prev in zip(segs[n_real:], cache.step_segments[n_real:], strict=True)
-            )
+            or (pad_segs and (
+                pad_segs.spans != cache.pad_layout[1]
+                or not ctx.real_rids().isdisjoint(pad_segs.request_ids)
+                # padding keeps its labels: their order places the real rows in a combined label
+                or pad_segs.labels != cache.step_segments[n_real:].labels
+            ))
         ):
             stats["miss"] += 1
             return None
@@ -2852,7 +2849,6 @@ class KVManager(AttentionResource):
                 self._decode_plan_cache = None
                 stats["miss"] += 1
                 return None
-        pad_segs = segs[n_real:]
         make = self._indptr_ring.take if self._indptr_ring is not None else torch.from_numpy
         out: list[dict[str, KVPlanOutput]] = [{} for _ in self._groups]
         for rows in cache.derived:
@@ -2915,23 +2911,23 @@ class KVManager(AttentionResource):
             qo_indptr = np.arange(n_rows + 1, dtype=np.int32)
             kv_lens = (npages_all - 1) * page_size + last_all
             row_pages_now, lens_now = rows.row_pages, lens.tolist()
-            pad_now = [(seg.request_id, seg.label, seg.span) for seg in pad_segs]
             rows.built = built = [False]
 
             def build_views(
-                row_pages_now=row_pages_now, lens_now=lens_now, gens_now=gens, pad_now=pad_now, rows=rows,
+                row_pages_now=row_pages_now, lens_now=lens_now, gens_now=gens, pad_segs=pad_segs, rows=rows,
                 built=built,
             ):
                 built[0] = True
                 # generations as of this plan, not read off the streams a later commit bumps
                 views = [
                     SequenceView(rid, lab, pages, length, 1, 0, gen)
-                    for (rid, lab, _), pages, length, gen in zip(
-                        rows.rows, row_pages_now, lens_now, gens_now.tolist(), strict=True,
+                    for (rid, lab), pages, length, gen in zip(
+                        rows.rows.pairs(), row_pages_now, lens_now, gens_now.tolist(), strict=True,
                     )
                 ]
                 views.extend(
-                    SequenceView(rid, lab, [SINK_PAGE] * rows.pad_pages, span, span) for rid, lab, span in pad_now
+                    SequenceView(rid, lab, [SINK_PAGE] * rows.pad_pages, span, span)
+                    for rid, lab, span in pad_segs.rows()
                 )
                 return views
 
@@ -2945,7 +2941,7 @@ class KVManager(AttentionResource):
                 ),
                 decode_pages=pages_all,
                 decode_offsets=last_all - 1,
-                rows=rows.rows + tuple(pad_now),
+                rows=Segments.concat((rows.rows, pad_segs)),
                 view_builder=build_views,
             )
         cache.step_segments = step.segments
@@ -3073,9 +3069,9 @@ class KVManager(AttentionResource):
             # an epoch, so a plan built across it is never reused. A pre-plan
             # builds on the plan thread while the main thread can tear
             # requests down.
-            self._readonly_rows = self._readonly_rows | frozenset(
-                seg.request_id for seg in step.segments if not ctx.is_padding_row(seg.request_id)
-            )
+            real = ctx.real_rows()
+            rids = step.segments.request_ids
+            self._readonly_rows = self._readonly_rows | (frozenset(rids) if real is None else real.intersection(rids))
 
         # Forks run ahead of the views, which record length and generation;
         # staging only reads what the fork will land.
@@ -3153,7 +3149,7 @@ class KVManager(AttentionResource):
         """What identifies the step a pre-plan was staged for: its segments
         and the replay slot it was leased on."""
         lease = ctx.slot_lease
-        return tuple(step.segments), (lease.slot if lease is not None else None), step.fork_rids, step.sink
+        return step.segments, (lease.slot if lease is not None else None), step.fork_rids, step.sink
 
     @staticmethod
     def _forking_rids(step: KVStep, ctx: StepContext):
@@ -3205,7 +3201,7 @@ class KVManager(AttentionResource):
                     self._recount(rid)
             self._preplan_new_labels = []
             for segments, real, sink in self._preplan_marked:
-                self._arena.set_rows_in_flight(self._streams, segments, real, sink, False)
+                self._arena.set_rows_in_flight(self._streams, segments.rows(), real, sink, False)
             self._preplan_marked = []
         # rebind rather than clear: a consumed preplan dict is the live one
         self._preplanned = False
@@ -3274,16 +3270,14 @@ class KVManager(AttentionResource):
         if cache is not None:
             if step.segments is cache.step_segments:
                 cache.pending += 1
-            elif len(step.segments) >= len(cache.step_segments) or any(
-                (seg.request_id, seg.label) in cache.rows for seg in step.segments
-            ):
+            elif len(step.segments) >= len(cache.step_segments) or not cache.rows.isdisjoint(step.segments.pairs()):
                 # another batch that is as big (surely sharing rows) or that
                 # names a cached row: the cache no longer describes the streams
                 self._plan_epoch += 1
         if not step.commit:
             self._plan_epoch += 1
         rows = self._readonly_rows
-        if rows and any(seg.span and seg.request_id in rows for seg in step.segments):
+        if rows and not rows.isdisjoint(itertools.compress(step.segments.request_ids, step.segments.span_column())):
             self._drop_readonly_plans()
         # the index only sees real rows of a non-capture step; checked once
         index_on = self._index is not None and not ctx.capture
@@ -3304,7 +3298,7 @@ class KVManager(AttentionResource):
             if rows and self._index is None and not retention and not windows and not _DEBUG_ASSERTS:
                 # nothing to index, adopt, retain or check: the arena moves
                 # every row's counts in one call, and hands back the ones it can't
-                slow = self._arena.commit_rows(streams, rows, ctx.real_rows(), sink or None, step.commit)
+                slow = self._arena.commit_rows(streams, rows.rows(), ctx.real_rows(), sink or None, step.commit)
                 rows = [rows[i] for i in slow]
             for segment in rows:
                 if is_pad(segment.request_id) or (sink and (segment.request_id, segment.label) in sink):

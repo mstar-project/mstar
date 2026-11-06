@@ -474,7 +474,7 @@ class StepRunner:
             None if lease is None else lease.slot,
             step.cg_key_info,
             tuple(
-                (key, tuple(step.get(key).segments or ()))
+                (key, step.get(key).segments or ())
                 for key in self._keys_for(step)
             ),
         )
