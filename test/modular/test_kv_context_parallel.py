@@ -5,6 +5,7 @@ attention over it, each rank's partial over its slots exchanged and merged."""
 from __future__ import annotations
 
 import itertools
+import logging
 import math
 import os
 import sys
@@ -1502,11 +1503,39 @@ def test_a_placed_pool_plans_on_fa2_for_auto_from_sm100(monkeypatch):
     """From SM100 FlashInfer's auto can send short rows to cuDNN, whose lse the merge isn't known
     to read right."""
     monkeypatch.setenv("MSTAR_WORKSPACE_BUFFER_MB", "1")
-    sm100 = types.SimpleNamespace(has_cuda_capability=lambda major, minor=0, device=None: (major, minor) <= (10, 0))
-    monkeypatch.setattr(fi_mod, "current_platform", sm100)
+    monkeypatch.setattr(fi_mod, "current_platform", types.SimpleNamespace(cuda_capability=lambda device=None: (10, 0)))
     joint = JointGroups(tp_group=_group(0, P), sp_group=CommGroup.trivial())
     attn, _ = _cp_attention(joint, CPU, torch.float32)
     assert attn._wrapper_kv_kwargs["backend"] == attn._new_kwargs["backend"] == "fa2"
+
+
+@pytest.mark.parametrize(("over_sp", "capability", "backend", "outcome"), [
+    (True, (9, 0), "fa2", "refused"),
+    (True, (9, 0), "auto", "quiet"),  # auto prefills on fa3 on SM90
+    (True, (10, 0), "fa2", "warned"),
+    (True, (10, 0), "auto", "warned"),  # auto runs fa2 from SM100
+    (True, (8, 0), "auto", "warned"),  # and below SM90, where FlashInfer has no fa3
+    (True, (8, 0), "fa2", "warned"),
+    (False, (9, 0), "fa2", "quiet"),
+    (False, (10, 0), "fa2", "quiet"),
+])
+def test_fa2_over_an_sp_placed_pool(monkeypatch, caplog, over_sp, capability, backend, outcome):
+    """One SP-placed server hung in an fa2 prefill, cause unknown: refused on SM90, where fa3 runs
+    instead, a warning wherever fa2 is the only kernel, and a TP-placed pool doesn't care."""
+    monkeypatch.setenv("MSTAR_WORKSPACE_BUFFER_MB", "1")
+    platform = types.SimpleNamespace(cuda_capability=lambda device=None: capability)
+    monkeypatch.setattr(fi_mod, "current_platform", platform)
+    if over_sp:
+        joint = JointGroups(tp_group=CommGroup.trivial(), sp_group=_group(0, P))
+    else:
+        joint = JointGroups(tp_group=_group(0, P), sp_group=CommGroup.trivial())
+    if outcome == "refused":
+        with pytest.raises(ValueError, match="'fa2' is refused over an SP-placed pool on SM90"):
+            _cp_attention(joint, CPU, torch.float32, flashinfer_backend=backend)
+        return
+    with caplog.at_level(logging.WARNING, logger=fi_mod.logger.name):
+        _cp_attention(joint, CPU, torch.float32, flashinfer_backend=backend)
+    assert any("fa2" in r.getMessage() for r in caplog.records) == (outcome == "warned")
 
 
 def test_tp_placed_decode_runs_on_tensor_cores_whatever_decode_tensor_cores_says(monkeypatch):
