@@ -220,15 +220,22 @@ class CpuPlan:
 
     @property
     def png_threads(self) -> int:
-        """Threads one PNG deflates on (``image_io.uint8_to_png``)."""
+        """Blocks one PNG deflates in parallel (``image_io.uint8_to_png``)."""
         return min(8, self.left)
 
     @property
     def encode_workers(self) -> int:
-        """Outputs the data worker encodes at once. A PNG deflates on
-        ``png_threads`` of its own, so the pool times that stays within the
+        """Outputs the data worker encodes at once. A PNG deflates
+        ``png_threads`` blocks at once, so the pool times that stays within the
         CPUs left."""
         return max(1, min(4, self.left // self.png_threads))
+
+    @property
+    def deflate_threads(self) -> int:
+        """Threads of the deflate pool every PNG of the process shares
+        (``image_io``): enough for ``encode_workers`` images finishing together
+        to deflate all their blocks at once."""
+        return min(self.left, self.encode_workers * self.png_threads)
 
     @property
     def copy_workers(self) -> int:
