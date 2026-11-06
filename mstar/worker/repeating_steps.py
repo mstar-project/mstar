@@ -396,6 +396,8 @@ class RepeatingSteps:
         ready already are ones the step had no room for."""
         rows = set(batch_N.batch.request_to_worker_graph)
         if spec_pending is not None:
+            # the loop's admit fence, for what follows: N+1's launch needs nothing of N's postprocess
+            spec_pending.node_batch.launch_started_event.wait()
             rows.update(spec_pending.batch.request_to_worker_graph)
         self._hold_rows(CHAIN_LANE, rows)
         engine = self.engine_manager.get_engine(batch_N.node_name)

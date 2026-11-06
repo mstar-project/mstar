@@ -533,6 +533,15 @@ def _run_step(rows, looks, **node_batch):
     )
 
 
+def test_a_runs_wait_moves_nothing_until_the_step_behind_it_has_admitted(monkeypatch):
+    """The loop's own fence covers this work at the top of a pass, not here."""
+    worker, log = _waiting_on_a_run(monkeypatch, [set()])
+    worker._hold_rows = lambda lane, rows: None
+    behind = _run_step([2], 0, launch_started_event=SimpleNamespace(wait=lambda: log.append("admitted")))
+    worker._await_run(_run_step([1], 1, token_stream=None), behind, [], None)
+    assert log == ["admitted", "messages"]
+
+
 def test_a_run_serves_the_lanes_and_ends_once_a_row_turns_ready(monkeypatch):
     """The request that arrives mid-run ends nothing: its prefill goes on a lane beside
     the run, and the run ends when the row it readies does, one ask for the two runs
@@ -542,7 +551,8 @@ def test_a_run_serves_the_lanes_and_ends_once_a_row_turns_ready(monkeypatch):
     worker._hold_rows = held.__setitem__
     lane = SimpleNamespace(finish=lambda: log.append("finish"), launch=lambda pool: log.append("launch"))
     worker._await_run(
-        _run_step([1], 3, token_stream=None), _run_step([2], 0), [lane], None,
+        _run_step([1], 3, token_stream=None),
+        _run_step([2], 0, launch_started_event=SimpleNamespace(wait=lambda: None)), [lane], None,
     )
     served = ["messages", "finish", "launch"]
     assert log == [*served, *served, "yield", *served]
