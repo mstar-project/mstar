@@ -28,18 +28,16 @@ class WithinStepHandle(ArrayHandle):
     stays in that graph through ``mstar::ragged_attention``. A check here runs only while not compiling: it would guard
     on the layer, and the block would retrace per layer.
 
-    ``queried`` is the array whose segments lay out the queries of a cross read. Under sequence parallelism the two
-    flags pick the exchange: Ulysses when both sides are sharded, none when only the queries are, and a merge of the
-    ranks' partial attentions when only the keys are. A read with no resource runs SDPA.
+    Under sequence parallelism the two flags pick the exchange: Ulysses when both sides are sharded, none when only the
+    queries are, and a merge of the ranks' partial attentions when only the keys are. A read with no resource runs SDPA.
     """
 
     def __init__(
         self, array: Array, resources: Mapping[str, Any], positions_key: str | None, *,
         resource_key: str | None = None, queried: Array | None = None, sp_group: CommGroup | None = None,
     ):
-        super().__init__(array, resources, positions_key)
+        super().__init__(array, resources, positions_key, queried=queried)
         self.resource_key = resource_key or next(iter(array.reads), None)
-        self.queried = queried
         self.runs_sdpa = self.first_read is None
         self._sp = sp_group
         sharded = sp_group is not None and sp_group.world_size > 1
@@ -61,11 +59,6 @@ class WithinStepHandle(ArrayHandle):
         if step.ctx.replays:
             return
         segments = step.state[self.name].segments or step.segments or ()
-        if self.queried is not None:
-            queries = step.state[self.queried.name].segments or step.segments
-            if [s.request_id for s in queries] != [s.request_id for s in segments]:
-                raise self._refusal(f"its segments and those of {self.queried.name!r}, which lay out its queries, must "
-                                    "name the same requests in the same order, with one segment to one")
         if self._keys_sharded and self._queries_sharded:
             spans = {s.span for s in segments}
             if len(spans) > 1:

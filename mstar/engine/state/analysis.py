@@ -136,9 +136,6 @@ def _cross_read_problems(arrays: Sequence[Array]) -> list[str]:
             elif not array.nodes <= queried.nodes:
                 problems.append(f"{where}: {read.queries!r} isn't on nodes {sorted(array.nodes - queried.nodes)}, so a "
                                 "step there has no segments to lay the queries out by")
-            elif queried.max_len:
-                problems.append(f"{where}: {read.queries!r} keeps entries, and queries are laid out by the segments "
-                                "of an array with max_len 0")
     return problems
 
 

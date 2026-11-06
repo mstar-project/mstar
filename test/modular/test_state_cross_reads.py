@@ -171,7 +171,7 @@ def test_the_new_settings_reach_the_shared_spec_from_any_of_its_reads():
 
 @pytest.mark.parametrize("array, cause", [
     (Array("a", nodes={"dit"}, layers={0}, entry=KVEntry(heads=HEADS, head_dim=DIM), max_len=8, seq_sharded=True,
-           reads={"r": Read(mask=Causal(), op=Attend(q_heads=HEADS))}), "seq_sharded and queries take max_len 0"),
+           reads={"r": Read(mask=Causal(), op=Attend(q_heads=HEADS))}), "seq_sharded takes max_len 0"),
     (Array("a", nodes={"dit"}, layers={0}, entry=_entry(), max_len=0, labels={"x", "y"},
            reads={"r": Read(mask=Block(), op=Attend(q_heads=HEADS))}), "max_len 0 takes one label"),
     (Array("a", nodes={"dit"}, layers={0}, entry=_entry(dtype=torch.bfloat16), max_len=8,

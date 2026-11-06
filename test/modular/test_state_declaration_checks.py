@@ -309,10 +309,13 @@ def test_a_cross_read_over_an_array_on_its_node_has_no_problems():
     assert state_declaration_problems(_StubModel(_within("video"), _cross())) == []
 
 
+def test_a_cross_read_over_an_array_that_keeps_entries_has_no_problems():
+    assert state_declaration_problems(_StubModel(_array("video", reads={"r": _read()}), _cross())) == []
+
+
 @pytest.mark.parametrize("arrays, where, cause", [
     ((_cross(queries="nothing"),), "reads['text_attn'].queries", "'nothing' is not a declared array"),
     ((_within("video", nodes={"vision"}), _cross()), "reads['text_attn'].queries", "isn't on nodes ['LLM']"),
-    ((_array("video", reads={"r": _read()}), _cross()), "reads['text_attn'].queries", "keeps entries"),
 ])
 def test_a_cross_read_is_refused_naming_its_array_and_the_cause(arrays, where, cause):
     problem = _one_problem(*arrays)

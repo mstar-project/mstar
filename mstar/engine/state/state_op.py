@@ -112,7 +112,7 @@ def bind_state_ops(handles: Mapping[str, Any]) -> None:
 def _addresses(op: StateOp, handle: ArrayHandle) -> bool:
     """Whether ``op``'s kernel can write ``handle``'s pages. A backend that takes K/V at its read never sees them."""
     cache = handle._kv.kv_cache
-    return cache.layout is KVLayout.NHD and handle.first_read.requires_kv_write and any(
+    return cache.layout is KVLayout.NHD and all(handle._reads_pages(layer) for layer in handle.array.layers) and any(
         (fmt.dtypes is None or cache.dtype in fmt.dtypes) and (fmt.devices is None or cache.device.type in fmt.devices)
         for fmt in op.formats
     )

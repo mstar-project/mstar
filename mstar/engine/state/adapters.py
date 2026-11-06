@@ -7,7 +7,13 @@ from typing import TYPE_CHECKING, Any
 import torch
 
 from mstar.distributed.communication import CommGroup
-from mstar.engine.resources.attn.config import AttentionConfig, AttentionSpec, AttentionStep
+from mstar.engine.resources.attn.config import (
+    AttentionConfig,
+    AttentionSpec,
+    AttentionStep,
+    CrossAttentionConfig,
+    CrossAttentionSpec,
+)
 from mstar.engine.resources.attn.ragged.config import (
     RaggedAttentionConfig,
     RaggedAttentionSpec,
@@ -78,13 +84,14 @@ def build_specs(
     Raises ``ValueError`` on an array today's specs can't hold, naming what they lack.
     """
     arrays = [declared for declared in declarations if isinstance(declared, Array)]
+    by_name = {array.name: array for array in arrays}
     by_read = _within_step_specs(arrays)
     specs: list[NodeResourceSpec] = []
     for array in arrays:
         if array.rewritable:
             specs += _value_specs(array, arrays)
         elif array.max_len:
-            specs += _kv_specs(array)
+            specs += _kv_specs(array, by_name)
         elif not array.nodes <= sdpa_nodes:
             specs += [by_read[key] for key in array.reads if by_read[key].resource_key == key]
         if array.positions is not None:
@@ -106,10 +113,10 @@ def _kv_shape(array: Array) -> tuple[int, ...]:
     return k.shape
 
 
-def _kv_specs(array: Array) -> list[NodeResourceSpec]:
+def _kv_specs(array: Array, by_name: Mapping[str, Array]) -> list[NodeResourceSpec]:
     heads, head_dim = _kv_shape(array)
-    if array.seq_sharded or any(read.queries is not None for read in array.reads.values()):
-        raise _no_layout(array, "seq_sharded and queries take max_len 0, and today's paged reads attend their own pool")
+    if array.seq_sharded:
+        raise _no_layout(array, "seq_sharded takes max_len 0, and a paged pool plans whole segments")
     if not array.reads:
         raise _no_layout(array, "reads is empty, and PagedKVConfig needs num_qo_heads from an Attend read")
     for key, read in array.reads.items():
@@ -120,6 +127,19 @@ def _kv_specs(array: Array) -> list[NodeResourceSpec]:
                                     "AttentionConfig has")
         if read.walks is not None:
             raise _no_layout(array, f"reads[{key!r}].walks must be None, since AttentionConfig has no walk")
+        if read.queries is None:
+            continue
+        if len(array.labels) != 1:
+            raise _no_layout(array, f"a cross read's array declares one label, CrossAttentionConfig's one "
+                                    f"context_label, and it has {sorted(array.labels)}")
+        if len(array.reads) != 1:
+            raise _no_layout(array, f"reads[{key!r}] reads another array's queries, and the array declares other "
+                                    "reads; a handle's queried array is per array, so they would route through the "
+                                    "cross read")
+        queried = by_name[read.queries]
+        if queried.rewritable or not queried.max_len:
+            raise _no_layout(array, f"reads[{key!r}] keeps entries and reads the queries of {read.queries!r}, which "
+                                    "isn't an append-only array that keeps entries")
     q_heads = {read.op.q_heads for read in array.reads.values()}
     if len(q_heads) > 1:
         raise _no_layout(array, f"reads have q_heads {sorted(q_heads)}, and PagedKVConfig has one num_qo_heads")
@@ -133,6 +153,14 @@ def _kv_specs(array: Array) -> list[NodeResourceSpec]:
     # the pool holds only the array's layers, so AttentionConfig.layers counts among them
     kv_layer = {layer: i for i, layer in enumerate(sorted(array.layers))}
     for key, read in array.reads.items():
+        if read.queries is not None:
+            specs.append(CrossAttentionSpec(
+                resource_key=key, nodes=array.nodes,
+                config=CrossAttentionConfig(
+                    kv_cache=array.name, query_kv_cache=read.queries, context_label=min(array.labels),
+                ),
+            ))
+            continue
         windowed = isinstance(read.mask, Window)
         specs.append(AttentionSpec(
             resource_key=key, nodes=array.nodes,
@@ -293,6 +321,9 @@ def _apply_kernel_settings(
                              f"declarations, which have {sorted(owners)}")
         # a read on a node in ``sdpa_nodes`` has no spec to set
         spec = by_key.get(by_read[key].resource_key if key in by_read else key)
+        if isinstance(spec, CrossAttentionSpec) and settings:
+            raise ValueError(f"Array {owners[key].name!r}: kernel_settings[{key!r}] sets {sorted(settings)}; a cross "
+                             "read on a kept array takes no setting yet")
         if isinstance(spec, KVSpec):
             allowed = {"max_num_pages"}
         elif isinstance(spec, RecurrentStateSpec):
@@ -339,7 +370,9 @@ def node_handles(
             handles[declared.name] = ArrayHandle(declared, resources, None, host_fields)
         elif declared.max_len or declared.rewritable:
             key = None if declared.positions is None else position_key(declared)
-            handles[declared.name] = ArrayHandle(declared, resources, key)
+            # `_kv_specs` refuses a read beside a cross read, so the first read says
+            queries = next((read.queries for read in declared.reads.values()), None)
+            handles[declared.name] = ArrayHandle(declared, resources, key, queried=arrays.get(queries))
         else:
             ((read_key, read),) = declared.reads.items()
             resource_key = by_read[read_key].resource_key
@@ -370,6 +403,9 @@ def state_steps(step: SubmoduleStep | None, handles: Mapping[str, ArrayHandle | 
         elif isinstance(handle, ArrayHandle) and isinstance(declared, ArrayStep):
             if declared.segments is None and step.segments is None:
                 raise ValueError(f"Array {name!r}: a step lists it with no segments, its own or the step's")
+            if handle.queried is not None and handle.queried.name not in step.state:
+                raise ValueError(f"Array {name!r}: a step lists it without {handle.queried.name!r}, whose segments "
+                                 "lay out its queries")
             if isinstance(handle, WithinStepHandle):
                 if not handle.runs_sdpa:
                     _plan_within_step(handle, declared, step, plans.setdefault(handle.resource_key, _WithinStepPlan()))
@@ -425,11 +461,7 @@ def _plan_within_step(
     if handle.queried is None:
         plan.add(name, segments)
         return
-    queries = step.state.get(handle.queried.name)
-    if queries is None:
-        raise ValueError(f"Array {name!r}: a step lists it without {handle.queried.name!r}, whose segments lay out its "
-                         "queries")
-    q_label = plan.add(name, handle.query_share(queries.segments or step.segments))
+    q_label = plan.add(name, handle.query_share(step.state[handle.queried.name].segments or step.segments))
     plan.pairs.append((q_label, plan.add(name, handle.key_share(segments))))
 
 

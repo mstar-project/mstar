@@ -21,18 +21,21 @@ class ArrayHandle(StepHandle):
     caller passes the tensor, so that its frame doesn't guard on the layer and one frame serves every layer. Each row's
     label comes from the step's segments. A handle holds each layer's state views, built once at bind, and the
     resources hold the step's plan.
+
+    ``queried`` is the array whose segments lay out the queries of a cross read.
     """
 
     def __init__(
         self, array: Array, resources: Mapping[str, Any], positions_key: str | None,
-        host_fields: HostFields | None = None,
+        host_fields: HostFields | None = None, *, queried: Array | None = None,
     ):
         self.array = array
         self.host_fields = host_fields
+        self.queried = queried
         # the state ops whose fused kernel can write this array's pages (`bind_state_ops`)
         self.fused_ops: frozenset[str] = frozenset()
         self.name = array.name
-        self.label = "main"
+        self.label = self._query_label = "main"
         self.reads = {key: resources[key] for key in array.reads}
         self.first_read = next(iter(self.reads.values()), None)
         self.positions_key = positions_key
@@ -108,6 +111,14 @@ class ArrayHandle(StepHandle):
         if step.ctx.replays:
             return
         self._check_step(declared, segments or (), step.ctx)
+        if self.queried is None:
+            return
+        queries = step.state[self.queried.name].segments or step.segments or ()
+        if queries:
+            self._query_label = queries[0].label
+        if [s.request_id for s in queries] != [s.request_id for s in segments or ()]:
+            raise self._refusal(f"its segments and those of {self.queried.name!r}, which lay out its queries, must "
+                                "name the same requests in the same order, with one segment to one")
 
     def check_step(self, step) -> None:
         if step.ctx.replays or not self._keep:
@@ -219,10 +230,16 @@ class ArrayHandle(StepHandle):
             raise self._refusal(f"no field {field!r} on layer {layer}, of layers {sorted(self._pool_layer)}")
         return blocks[layer]
 
-    def _holds(self, layer: int) -> bool:
-        """Whether this layer's add waits for its read: the kernel takes k and v there rather than from the pages."""
+    def _reads_pages(self, layer: int) -> bool:
+        """Whether this layer's add goes to the pages, rather than waiting for a read whose kernel takes k and v. A
+        cross read attends the pages, and its resource has no ``requires_kv_write``."""
+        if self.queried is not None:
+            return True
         attn = self._attn.get(layer)
-        return attn is not None and not attn.requires_kv_write
+        return attn is None or attn.requires_kv_write
+
+    def _holds(self, layer: int) -> bool:
+        return not self._reads_pages(layer)
 
     def _take_hold(self, layer: int) -> tuple[torch.Tensor, torch.Tensor]:
         held = self._held
@@ -254,6 +271,9 @@ class ArrayHandle(StepHandle):
             raise self._no_layout(f"mask arguments {sorted(mask_args)}, which no mask defines")
         layer = self._layer_id(layer)
         self._record_read(layer)
+        if self.queried is not None:
+            # the cross resource keys its plans by the query side's label
+            return self._attn[layer].run(q, label=self._query_label, kv_cache_layer=self._views[layer])
         k, v = self._take_hold(layer) if self._holds(layer) else (None, None)
         return self._attn[layer].run(
             q, label=self.label, kv_cache_layer=self._views[layer], k=k, v=v, layer_idx=self._pool_layer[layer],
@@ -378,6 +398,9 @@ def sample(s: SamplerHandle, logits: torch.Tensor) -> torch.Tensor:
 def at_last_token(h: ArrayHandle, x: torch.Tensor) -> torch.Tensor:
     """``x`` at each row's last token in this step, in row order."""
     h._check_open("at_last_token")
+    if h.queried is not None:
+        raise h._refusal(f"at_last_token lays x out by this array's segments, and its read's queries are laid out by "
+                         f"{h.queried.name!r}; call it on that array")
     return h.first_read.select_last_hidden(x, label=h.label)
 
 

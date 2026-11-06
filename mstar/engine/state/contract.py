@@ -231,6 +231,8 @@ class Array:
         if read.queries is not None and not isinstance(read.mask, Block | Bidirectional):
             raise ValueError(f"{where}.queries: a read of another array's queries takes a mask that uses no query "
                              f"position, Block or Bidirectional, and {type(read.mask).__name__} does")
+        if read.queries is not None and read.op is None:
+            raise ValueError(f"{where}.queries: a read with no op lays out no queries")
         if not isinstance(read.op, Attend):
             return
         if not _is_positive(read.op.q_heads):
