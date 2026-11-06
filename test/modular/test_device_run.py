@@ -481,6 +481,26 @@ def test_a_skipped_run_lands_as_a_step_that_never_ran(begun, skipped):
     assert log == ([("rewound", 0), ("flag", [1, 2]), ("queued", [1, 2])] if skipped else [])
 
 
+def test_a_skip_is_not_missed_for_a_run_that_began_as_the_host_looked():
+    """The launch tail sets the event after the admit fence lifts, and the word can
+    change between two reads, so "it never launched" takes a fresh look at all three."""
+    from mstar.worker.worker import Worker
+
+    worker, log = Worker.__new__(Worker), []
+    step = _skipped_step(worker, log, iter([0, RUN_SKIPPED]))
+    step.future = SimpleNamespace(done=lambda: True, result=lambda: "outputs")
+    assert worker._landed_skipped(step) is True
+
+
+def test_a_step_that_never_launched_is_no_skip():
+    from mstar.worker.worker import Worker
+
+    worker, log = Worker.__new__(Worker), []
+    step = _skipped_step(worker, log, iter([0]))
+    step.future = SimpleNamespace(done=lambda: True, result=lambda: "outputs")
+    assert worker._landed_skipped(step) is False and log == []
+
+
 def test_a_skipped_step_gives_back_only_the_rows_a_refused_one_would(monkeypatch):
     """The step was built before N landed. A row whose loop stopped at N has an emptied
     node, which would pop with no inputs and run past its stop. One prepare_inputs

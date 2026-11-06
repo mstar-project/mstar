@@ -405,10 +405,13 @@ class RepeatingSteps:
         started = node_batch.run_started
         if started is None or node_batch.step_context.repeats <= 1:
             return False
-        event = node_batch.completion_event
         while not int(started[0]):
-            if step.future.done() and (event is None or event.query()):
-                return False  # it raised before it launched
+            # in this order, the word again last: the launch tail sets the event after the
+            # fence lifts, and a short skipped graph can end between two looks
+            if step.future.done():
+                event = node_batch.completion_event
+                if (event is None or event.query()) and not int(started[0]):
+                    return False  # it raised before it launched
             time.sleep(_LANDED_POLL_S)
         if int(started[0]) != RUN_SKIPPED:
             return False
