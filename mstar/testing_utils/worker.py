@@ -1,26 +1,102 @@
-"""A ``Worker`` for tests, built without its ``__init__``.
+"""Workers and their components for tests, built with no process groups, sockets
+or engines.
 
-``Worker.__init__`` joins the process groups, opens the control mesh, and builds
-the graph runtime and the engines. ``make_worker`` skips those and starts from
-what they would leave behind: the step-to-step state (``Worker._init_step_state``,
-the method ``__init__`` itself uses), a timer that is off, and a worker that
-leads nothing. A test supplies the collaborators the code under test reaches
-(usually a ``SimpleNamespace`` of what it calls), so one it forgot is an
-``AttributeError`` rather than a stub answering for it.
+``make_worker`` skips ``Worker.__init__`` and starts from what it would leave
+behind: the step-to-step state (``Worker._init_step_state``, the method
+``__init__`` itself uses), a timer that is off, and a worker that leads nothing.
+A test supplies the collaborators the code under test reaches (usually a
+``SimpleNamespace`` of what it calls), so one it forgot is an ``AttributeError``
+rather than a stub answering for it.
 """
+from types import SimpleNamespace
+
 import torch
 
 from mstar.profile.worker import WorkerProfileInfo
+from mstar.worker.admission import Admission
 from mstar.worker.chunk_loops import ChunkLoops
+from mstar.worker.lockstep import Lockstep
+from mstar.worker.micro_scheduler import MicroScheduler
 from mstar.worker.phase_timer import PhaseTimer
+from mstar.worker.services import WorkerLayout, WorkerServices
 from mstar.worker.worker import Worker
 
 # Built by ``__init__`` from the deployment; no default stands in for them.
 _COLLABORATORS = frozenset({
     "communicator", "wakeup_event", "tensor_manager", "_graph_runtime", "engine_manager",
-    "request_state", "scheduler", "streams", "parallel_groups", "partition_topology",
-    "_my_consumer_connections", "_all_wg_nodes", "_lockstep_consumers",
+    "request_state", "scheduler", "admission", "lockstep", "layout", "streams",
+    "parallel_groups", "partition_topology", "_my_consumer_connections", "_all_wg_nodes",
 })
+
+
+def make_services(**overrides) -> WorkerServices:
+    """``WorkerServices`` with only what the test names; the rest are None."""
+    fields = dict.fromkeys(WorkerServices.__slots__)
+    fields.update(worker_id="w0", device=torch.device("cpu"), tensor_manager=SimpleNamespace(get_tensor=None))
+    fields.update(overrides)
+    return WorkerServices(**fields)
+
+
+def make_scheduler(
+    engine_manager=None, *, parallel_leader_nodes=None, parallel_nodes=frozenset(),
+    combined_walk_of=None, chunk_loops=None, side_keys=frozenset(), request_state=None,
+    graph_runtime=None, tensor_manager=None, async_sched=(False, None), model_config=None,
+    batch_builder_type=None, speculation_mixes_walks=None, **scheduler_kwargs,
+) -> MicroScheduler:
+    """A real ``MicroScheduler``, with a real ``Lockstep`` and ``Admission``
+    under it (``.lockstep``, ``.admission``). ``parallel_leader_nodes`` defaults
+    to leading every node."""
+    model_config = dict(model_config or {})
+    if batch_builder_type is not None:
+        model_config["batch_builder"] = batch_builder_type.value
+    if speculation_mixes_walks is not None:
+        model_config["speculation_mixes_walks"] = speculation_mixes_walks
+    services = make_services(
+        engine_manager=engine_manager, request_state=request_state, graph_runtime=graph_runtime,
+        tensor_manager=tensor_manager or SimpleNamespace(get_tensor=None),
+    )
+    if parallel_leader_nodes is None:
+        parallel_leader_nodes = _AllNodes()
+    parallel_nodes = frozenset(parallel_nodes)
+    layout = WorkerLayout(
+        parallel_nodes=parallel_nodes, parallel_leader_nodes=parallel_leader_nodes,
+        is_tp_follower=bool(parallel_nodes - parallel_leader_nodes),
+        combined_walk_of=combined_walk_of or {}, chunk_loops=chunk_loops or ChunkLoops(),
+        side_keys=frozenset(side_keys),
+    )
+    admission = Admission(services=services, layout=layout)
+    lockstep = Lockstep(services=services, layout=layout, admission=admission, async_sched=async_sched)
+    return MicroScheduler(
+        services=services, layout=layout, lockstep=lockstep, admission=admission, model_config=model_config,
+        **scheduler_kwargs,
+    )
+
+
+def bound(scheduler: MicroScheduler, request_state=None, *, runtime=None) -> MicroScheduler:
+    """``scheduler``, pointed at another fake along with what is under it, for
+    a test that builds a fresh fake per call."""
+    if runtime is not None:
+        scheduler.runtime = runtime
+        scheduler.lockstep._runtime = runtime
+        scheduler.admission._runtime = runtime
+    if request_state is not None:
+        scheduler.request_state = request_state
+        scheduler.lockstep._request_state = request_state
+        scheduler.admission._request_state = request_state
+    return scheduler
+
+
+class _AllNodes(frozenset):
+    """A leader set naming every node, for a scheduler test with no deployment."""
+
+    def __contains__(self, node) -> bool:
+        return True
+
+    def __rsub__(self, other):
+        return frozenset()
+
+    def __rand__(self, other):
+        return frozenset(other)
 
 
 def make_worker(**overrides) -> Worker:
@@ -42,9 +118,6 @@ def make_worker(**overrides) -> Worker:
     worker.parallel_nodes = set()
     worker.parallel_leader_nodes = set()
     worker.is_tp_follower = False
-    worker.tp_async_sched = False
-    worker.tp_async_nodes = None
-    worker._setup_tp_read_check()
     # no streams, no loops, no declared stop policies
     worker._walk_drivers = {}
     worker._walk_driven_edges = {}
@@ -53,10 +126,38 @@ def make_worker(**overrides) -> Worker:
     worker._innermost_loop_by_node = {}
     worker._stop_token_signal = {}
 
+    async_sched = (overrides.pop("tp_async_sched", False), overrides.pop("tp_async_nodes", None))
     for name, value in overrides.items():
         if name not in _COLLABORATORS and not hasattr(worker, name):
             raise TypeError(f"Worker has no field {name!r}")
         setattr(worker, name, value)
     if "enable_nvtx" in overrides:
         worker.timer.enable_nvtx = overrides["enable_nvtx"]
+    _build_components(worker, async_sched)
     return worker
+
+
+def _build_components(worker: Worker, async_sched) -> None:
+    """The components the test did not supply, real, over the worker's collaborators."""
+    if "lockstep" in worker.__dict__ and "admission" in worker.__dict__:
+        return
+    services = WorkerServices(
+        worker_id=worker.worker_id, device=worker.device,
+        graph_runtime=getattr(worker, "_graph_runtime", None),
+        engine_manager=getattr(worker, "engine_manager", None),
+        tensor_manager=getattr(worker, "tensor_manager", None),
+        request_state=getattr(worker, "request_state", None),
+        communicator=getattr(worker, "communicator", None),
+        parallel_groups=getattr(worker, "parallel_groups", None),
+    )
+    parallel, leaders = frozenset(worker.parallel_nodes), frozenset(worker.parallel_leader_nodes)
+    layout = WorkerLayout(
+        parallel_nodes=parallel, parallel_leader_nodes=leaders, is_tp_follower=worker.is_tp_follower,
+        chunk_loops=worker.chunk_loops, streaming_edge_names=frozenset(worker._streaming_edge_names),
+    )
+    if "admission" not in worker.__dict__:
+        worker.admission = Admission(services=services, layout=layout)
+    if "lockstep" not in worker.__dict__:
+        worker.lockstep = Lockstep(
+            services=services, layout=layout, admission=worker.admission, async_sched=async_sched,
+        )

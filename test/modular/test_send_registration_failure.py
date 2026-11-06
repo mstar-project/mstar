@@ -181,12 +181,13 @@ def _postprocess_worker(refuse, follower=False):
     """A worker whose ``_postprocess_batch`` runs for real, with the engine,
     graph runtime and transfer engine faked around it. The transfer engine
     refuses every tensor of the rids in ``refuse``, step after step."""
-    w = make_worker(streams=StreamBufferManager(SimpleNamespace(per_request_info={}), None, []))
+    w = make_worker(
+        streams=StreamBufferManager(SimpleNamespace(per_request_info={}), None, []),
+        parallel_nodes={"llm"} if follower else set(),
+    )
     w.enable_nvtx = w.enable_prof = False
     w.device = torch.device("cpu")
     w.worker_id = "w0"
-    w.parallel_nodes = {"llm"} if follower else set()
-    w.parallel_leader_nodes = set()
     w._innermost_loop_by_node = {}
     w.log = SimpleNamespace(stop_checked=[], routed=[], registered=[], sent=[], conductor=[])
     w.scheduler = SimpleNamespace(failed_rids=set())
@@ -271,7 +272,7 @@ def _postprocess_worker(refuse, follower=False):
 
 def _decode_step(rids, final_stream=()):
     node_batch = SimpleNamespace(
-        request_ids=list(rids), per_request_info=dict.fromkeys(rids),
+        node_name="llm", request_ids=list(rids), per_request_info=dict.fromkeys(rids),
         failed_requests={}, completion_event=None,
         final_stream_rids=set(final_stream), resource_publish_info={},
         partition_done_rids=set(), cached_rids=set(), withheld_outputs={},
@@ -472,20 +473,15 @@ def test_remove_request_finishes_when_an_unregister_fails(monkeypatch, rust):
     w = make_worker(
         streams=StreamBufferManager(SimpleNamespace(per_request_info={}), None, []),
         _rid=lambda wire: 3,
-        _pending_removes=set(),
         tensor_manager=mgr,
-        engine_manager=SimpleNamespace(
-        remove_request=lambda rid: None,
-    ),
+        engine_manager=SimpleNamespace(remove_request=lambda rid: None),
         request_state=SimpleNamespace(remove_request=lambda rid: None),
         profile_info=SimpleNamespace(pop_request=lambda rid: None),
-        scheduler=SimpleNamespace(
-        clear_rid=lambda rid, wire: released.append(("scheduler", rid)),
-    ),
+        scheduler=SimpleNamespace(clear_rid=lambda rid: released.append(("scheduler", rid))),
         _graph_runtime=SimpleNamespace(
-        get_sharding_config=lambda rid: None,
-        remove_request=lambda rid: released.append(("runtime", rid)),
-    ),
+            get_sharding_config=lambda rid: None,
+            remove_request=lambda rid: released.append(("runtime", rid)),
+        ),
     )
 
     Worker._remove_request(w, RemoveRequest(request_id="r"))

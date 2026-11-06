@@ -27,15 +27,15 @@ sys.path.insert(0, ".")
 
 from mstar.engine import engine as engine_mod
 from mstar.engine.engine import Engine
-from mstar.engine.resources.step import FULL_ADMIT_OK, StepContext
-from mstar.utils.containers import RecentSet
+from mstar.engine.resources.step import FULL_ADMIT_OK, AllocationFailed, StepContext
+from mstar.testing_utils.worker import make_scheduler, make_worker
 from mstar.utils.ipc_format import (
     OffloadDelta,
     RemoveRequest,
     ScheduleTPNode,
 )
 from mstar.worker import worker as worker_mod
-from mstar.worker.micro_scheduler import MicroScheduler
+from mstar.worker.micro_scheduler import ScheduledBatch
 from mstar.worker.stream_buffers import StreamBufferManager
 from mstar.worker.worker import Worker
 
@@ -595,39 +595,26 @@ def test_the_roles_are_per_node():
 # collective, and the run hangs with the follower idle.
 
 
-class _Leader:
-    """``maybe_send_zmq_to_tp_followers`` over stubs."""
-
-    maybe_send_zmq_to_tp_followers = Worker.maybe_send_zmq_to_tp_followers
-    _rid_str = Worker._rid_str
-    _step_reads = Worker._step_reads
-
-    def __init__(self, followers=("rank1", "rank2")):
-        self.engine = _Engine("leader")
-        self.engine_manager = SimpleNamespace(get_engine=lambda node: self.engine)
-        self.parallel_nodes = {"node"}
-        self.parallel_leader_nodes = {"node"}
-        self._tp_broadcast_seq = 0
-        group = SimpleNamespace(_workers=["rank0", *followers])
-        # The runtime owns both the sharding config and the handle table now.
+def _leader(followers=("rank1", "rank2")) -> Worker:
+    """Rank 0's real ``Lockstep``, over a stub engine and communicator."""
+    engine = _Engine("leader")
+    group = SimpleNamespace(_workers=["rank0", *followers])
+    sent: list = []
+    leader = make_worker(
+        engine_manager=SimpleNamespace(get_engine=lambda node: engine),
+        parallel_nodes={"node"}, parallel_leader_nodes={"node"},
         # Its ``get_rid_string`` is the same prefixing stub ``_Engine`` uses, so a
         # broadcast that shipped local handles instead of wire ids is visible.
-        self._graph_runtime = SimpleNamespace(
+        _graph_runtime=SimpleNamespace(
             get_sharding_config=lambda rid: SimpleNamespace(
                 get_sharding_group=lambda n, w: group
             ),
             get_rid_string=_Rids().get_rid_string,
-        )
-        # Live requests moved off the worker-graph manager onto here; the
-        # broadcast reads it to say what its page state should add up to.
-        self.request_state = SimpleNamespace(per_request_info={"r0": object()})
-        self.sent: list = []
-        self.communicator = SimpleNamespace(
-            send=lambda worker, msg: self.sent.append((worker, msg))
-        )
-        # nothing the followers read: no step goes out read-checked
-        self._lockstep_unread: dict = {}
-        self._streaming_edge_names: set[str] = set()
+        ),
+        communicator=SimpleNamespace(send=lambda worker, msg: sent.append((worker, msg))),
+    )
+    leader.engine, leader.sent = engine, sent
+    return leader
 
 
 def _node_batch():
@@ -641,10 +628,10 @@ def _node_batch():
 
 def test_the_broadcast_carries_the_leaders_moves():
     """Without this the delta is always empty and no follower ever replays."""
-    leader = _Leader(followers=("rank1",))
+    leader = _leader(followers=("rank1",))
     leader.engine.offload_request("node", "victim")
 
-    leader.maybe_send_zmq_to_tp_followers(_node_batch())
+    leader.lockstep.broadcast(_node_batch())
 
     assert len(leader.sent) == 1
     body = leader.sent[0][1].body
@@ -657,10 +644,10 @@ def test_the_broadcast_carries_the_leaders_moves():
 def test_every_follower_gets_the_same_moves_in_its_own_queue():
     """Drained once, copied per follower. Draining inside the send loop would
     give the first follower everything and leave the rest behind forever."""
-    leader = _Leader(followers=("rank1", "rank2"))
+    leader = _leader(followers=("rank1", "rank2"))
     leader.engine.offload_request("node", "victim")
 
-    leader.maybe_send_zmq_to_tp_followers(_node_batch())
+    leader.lockstep.broadcast(_node_batch())
 
     deltas = [msg.body.resident_delta for _, msg in leader.sent]
     assert len(deltas) == 2
@@ -673,12 +660,12 @@ def test_every_follower_gets_the_same_moves_in_its_own_queue():
 
 
 def test_the_journal_is_drained_by_the_broadcast():
-    leader = _Leader(followers=("rank1",))
+    leader = _leader(followers=("rank1",))
     leader.engine.offload_request("node", "victim")
 
-    leader.maybe_send_zmq_to_tp_followers(_node_batch())
+    leader.lockstep.broadcast(_node_batch())
     leader.sent.clear()
-    leader.maybe_send_zmq_to_tp_followers(_node_batch())
+    leader.lockstep.broadcast(_node_batch())
 
     assert len(leader.sent[0][1].body.resident_delta) == 0, (
         "the same move went out twice"
@@ -699,48 +686,53 @@ class _Queue:
         self.pushed_back.extend(rids)
 
 
-class _Rank:
-    """``_handle_allocation_failure`` over stubs, for one rank of ``"node"``."""
+def _rank(*, leader: bool, parallel: bool = True) -> Worker:
+    """One rank of ``"node"``, the real refusal path over a page-holding "victim"
+    on a stub engine. Its teardown flushes are counted: a teardown releases
+    pages, so spending one before evicting is the cheaper move and the order
+    matters."""
+    engine = SimpleNamespace(offload_attempts=[])
+    engine.evictable = lambda node, resources=None: True
+    engine.is_offloaded = lambda node, rid: False
+    engine.reclaimable = lambda node, rid, resources: True
+    engine.offload_request = lambda node, rid, affected_resources=None: engine.offload_attempts.append(node) or 1
+    rank = make_worker(
+        _graph_runtime=_Queue(),
+        engine_manager=SimpleNamespace(get_engine=lambda node: engine),
+        parallel_nodes={"node"} if parallel else set(),
+        parallel_leader_nodes={"node"} if leader else set(),
+        is_tp_follower=parallel and not leader,
+        scheduler=SimpleNamespace(
+            arrival=["victim"], last_in_line=lambda node, walk, rids: next(iter(rids)),
+            could_refill=lambda node, walk, rids: False,
+        ),
+    )
+    rank.engine = engine
+    rank.flushed_removes = 0
+    rank.flush_protected = None
 
-    _handle_allocation_failure = Worker._handle_allocation_failure
-    _is_tp_follower_node = Worker._is_tp_follower_node
-    _push_back_batch = Worker._push_back_batch
+    def flush_landed():
+        rank.flushed_removes += 1
+        assert engine.offload_attempts == [], "a teardown was spent after the eviction"
 
-    def __init__(self, *, leader: bool):
-        self.queue = _Queue()
-        self._graph_runtime = self.queue
-        self.held: list[str] = []
-        self.scheduler = SimpleNamespace(hold_requests=self.held.extend)
-        self._hold_logged = {}
-        self.parallel_nodes = {"node"}
-        self.parallel_leader_nodes = {"node"} if leader else set()
-        self.offload_attempts: list[str] = []
-        self._in_flight_rids: set[str] = set()
-        # recorded rather than stubbed out: a teardown releases pages, so
-        # spending one before evicting is the cheaper move and the order matters
-        self.flushed_removes = 0
-        self.flush_protected: set[str] | None = None
-
-    def _apply_removes_whose_step_landed(self):
-        self.flushed_removes += 1
-
-    def _apply_pending_removes_safe_to_drop(self, in_flight_rids):
-        self.flushed_removes += 1
-        self.flush_protected = set(in_flight_rids)
-
-    def _try_offload_cold_request(self, node_name, graph_walk, batch_ids, affected_resources=None, inside_only=False):
-        del graph_walk, batch_ids, affected_resources, inside_only
-        self.offload_attempts.append(node_name)
-        return "victim"
+    def flush_safe(in_flight_rids):
+        flush_landed()
+        rank.flush_protected = set(in_flight_rids)
+    rank._apply_removes_whose_step_landed = flush_landed
+    rank._apply_pending_removes_safe_to_drop = flush_safe
+    return rank
 
 
 def _oom(rank, referenced_rids=frozenset()):
-    batch = SimpleNamespace(
+    batch = ScheduledBatch(
         node_name="node", graph_walk="walk",
         request_to_worker_graph={"r0": "wg", "r1": "wg"},
     )
-    node_batch = SimpleNamespace(node_name="node", failed_resource=None, admit_error=None)
-    rank._handle_allocation_failure(batch, node_batch, referenced_rids)
+    rank._handle_admit_failure(batch, SimpleNamespace(
+        node_name="node", failed_resource=None,
+        admit_error=AllocationFailed("out of pages", pages_short=1, label="main", request_id="r0"),
+        request_ids=["r0", "r1"], cached_rids=set(),
+    ), referenced_rids)
 
 
 def test_a_follow_rank_neither_evicts_nor_holds():
@@ -748,38 +740,37 @@ def test_a_follow_rank_neither_evicts_nor_holds():
     requests". The eviction is rank 0's and arrives as a delta, and a follow rank
     has no scheduling decision a backoff could improve — the hold only delays
     building the ScheduleTPNode that carries the fix."""
-    follower = _Rank(leader=False)
+    follower = _rank(leader=False)
 
     _oom(follower)
 
-    assert follower.offload_attempts == [], "a follow rank picked its own victim"
-    assert follower.held == []
+    assert follower.engine.offload_attempts == [], "a follow rank picked its own victim"
+    assert follower.admission.held_until == {}
     # the batch still has to go back, or rank 0's retry finds nothing ready
-    assert sorted(follower.queue.pushed_back) == ["r0", "r1"]
+    assert sorted(follower._graph_runtime.pushed_back) == ["r0", "r1"]
 
 
 def test_rank_zero_still_evicts_and_holds_its_victim():
-    leader = _Rank(leader=True)
+    leader = _rank(leader=True)
 
     _oom(leader)
 
-    assert leader.offload_attempts == ["node"]
+    assert leader.engine.offload_attempts == ["node"]
     assert leader.flushed_removes == 2, (
         "a pending teardown releases pages, so it has to be spent before an "
         "eviction is chosen — otherwise a page move happens that need not"
     )
-    assert leader.held == ["victim"]
-    assert sorted(leader.queue.pushed_back) == ["r0", "r1"]
+    assert list(leader.admission.held_until) == ["victim"]
+    assert sorted(leader._graph_runtime.pushed_back) == ["r0", "r1"]
 
 
 def test_an_unsharded_node_still_runs_its_own_recovery():
-    solo = _Rank(leader=False)
-    solo.parallel_nodes = set()  # "node" is not sharded here
+    solo = _rank(leader=False, parallel=False)  # "node" is not sharded here
 
     _oom(solo)
 
-    assert solo.offload_attempts == ["node"]
-    assert solo.held == ["victim"]
+    assert solo.engine.offload_attempts == ["node"]
+    assert list(solo.admission.held_until) == ["victim"]
 
 
 # --- the replay is verbatim, and says where it stopped ----------------------
@@ -819,7 +810,7 @@ def test_a_refused_replay_says_which_move_it_stopped_on(caplog):
 #
 # A step admitted against a half-replayed page state is one the other rank
 # admits differently, which deadlocks the next collective. Both the serial
-# path and the async follower go through ``settle_tp_follow_delta``.
+# path and the async follower go through ``Lockstep.settle_delta``.
 
 
 def test_the_serial_follow_path_will_not_build_mid_replay():
@@ -831,7 +822,7 @@ def test_the_serial_follow_path_will_not_build_mid_replay():
         check_ready=lambda *a, **kw: FULL_ADMIT_OK,
         get_max_batch_size=lambda node, walk: None,
     )
-    sched = MicroScheduler(
+    sched = make_scheduler(
         engine_manager=SimpleNamespace(get_engine=lambda node: engine),
         parallel_leader_nodes=set(),
     )
@@ -839,12 +830,10 @@ def test_the_serial_follow_path_will_not_build_mid_replay():
         node_name="node", graph_walk="walk", request_ids=["r0"], spec_seq=5,
     )
     message.resident_delta.add_offloaded("wire-victim")
-    sched.register_tp_follow(message)
+    sched.lockstep.enqueue_follow(message)
 
-    assert sched._try_schedule_tp_follow(
-        SimpleNamespace(per_request_info={"r0": object()})
-    ) is None
-    assert sched.peek_tp_follow() is message, "the head was consumed mid-replay"
+    assert sched._try_schedule_tp_follow() is None
+    assert sched.lockstep.follow_head() is message, "the head was consumed mid-replay"
 
 
 # --- a forwarded teardown is ordered against the step stream -----------------
@@ -854,23 +843,26 @@ def test_the_serial_follow_path_will_not_build_mid_replay():
 # after, and a follower holds it until it has consumed that step.
 
 
-class _RemoveRank:
-    """``_remove_request``'s ordering, over stubs."""
+def _consume(rank, seq: int) -> None:
+    """``rank`` takes leader step ``seq`` off its FIFO."""
+    rank.lockstep.enqueue_follow(ScheduleTPNode(
+        node_name="node", graph_walk="walk", request_ids=["step"], spec_seq=seq,
+    ))
+    rank.lockstep.pop_follow_head()
 
-    _apply_removes_whose_step_landed = Worker._apply_removes_whose_step_landed
-    _removal_step_reached = Worker._removal_step_reached
 
-    def __init__(self, consumed: int):
-        self.scheduler = SimpleNamespace(last_consumed_tp_seq=consumed)
-        self._removes_awaiting_step: dict[int, list[str]] = {}
-        self.applied: list[str] = []
-
-    def _remove_request(self, body):
-        self.applied.append(body.request_id)
+def _remove_rank(consumed: int) -> Worker:
+    """``_remove_request``'s ordering, with the teardown itself recorded."""
+    rank = make_worker(engine_manager=SimpleNamespace())
+    rank.applied = []
+    rank._remove_request = lambda body: rank.applied.append(body.request_id)
+    if consumed >= 0:
+        _consume(rank, consumed)
+    return rank
 
 
 def test_a_removal_for_a_step_not_yet_reached_waits():
-    rank = _RemoveRank(consumed=5)
+    rank = _remove_rank(consumed=5)
 
     assert rank._removal_step_reached(
         RemoveRequest(request_id="r", after_tp_seq=7)
@@ -878,7 +870,7 @@ def test_a_removal_for_a_step_not_yet_reached_waits():
 
 
 def test_a_removal_for_a_step_already_consumed_applies():
-    rank = _RemoveRank(consumed=7)
+    rank = _remove_rank(consumed=7)
 
     assert rank._removal_step_reached(
         RemoveRequest(request_id="r", after_tp_seq=7)
@@ -887,13 +879,13 @@ def test_a_removal_for_a_step_already_consumed_applies():
 
 def test_an_unstamped_removal_is_not_ordered():
     """The conductor's own sends, and a rank re-applying its own deferral."""
-    rank = _RemoveRank(consumed=-1)
+    rank = _remove_rank(consumed=-1)
 
     assert rank._removal_step_reached(RemoveRequest(request_id="r")) is True
 
 
 def test_a_held_removal_lands_once_its_step_does():
-    rank = _RemoveRank(consumed=5)
+    rank = _remove_rank(consumed=5)
     rank._removes_awaiting_step = {7: ["late"], 4: ["early"]}
 
     rank._apply_removes_whose_step_landed()
@@ -901,7 +893,7 @@ def test_a_held_removal_lands_once_its_step_does():
     assert rank.applied == ["early"], "applied a teardown from a step not reached"
     assert rank._removes_awaiting_step == {7: ["late"]}
 
-    rank.scheduler.last_consumed_tp_seq = 7
+    _consume(rank, 7)
     rank._apply_removes_whose_step_landed()
 
     assert rank.applied == ["early", "late"]
@@ -911,7 +903,7 @@ def test_a_held_removal_lands_once_its_step_does():
 def test_held_removals_land_in_step_order():
     """Two teardowns from different gaps have to be applied in the order rank 0
     made them, for the same reason the delta is a queue."""
-    rank = _RemoveRank(consumed=9)
+    rank = _remove_rank(consumed=9)
     rank._removes_awaiting_step = {8: ["second"], 3: ["first"]}
 
     rank._apply_removes_whose_step_landed()
@@ -919,60 +911,37 @@ def test_held_removals_land_in_step_order():
     assert rank.applied == ["first", "second"]
 
 
-class _ForwardingLeader:
-    """Rank 0's ``_remove_request``, over stubs, to pin what it forwards."""
-
-    _remove_request = Worker._remove_request
-    _removal_step_reached = Worker._removal_step_reached
-    _rid = Worker._rid
-    _mark_removed = Worker._mark_removed
-
-    def __init__(self, broadcast_seq: int):
-        self.is_tp_follower = False
-        self._lockstep_led = frozenset()
-        self._tp_broadcast_seq = broadcast_seq
-        # handle-keyed state, per rid_table's list
-        self._in_flight_rids: set[int] = set()
-        self._pending_removes: dict[int, None] = {}
-        # wire-string-keyed: parked teardowns and the drain bookkeeping, because
-        # a handle is recycled and would reattach to the next request to get it
-        self._removes_awaiting_step: dict[int, list[str]] = {}
-        self._draining_rids: set[str] = set()
-        self._pending_drains: set[str] = set()
-        self._reads_done_sent: set[str] = set()
-        self._removed_rids: RecentSet[str] = RecentSet(16)
-        self._unprocessed_messages: dict = {}
-        group = SimpleNamespace(tp_size=2, _tp_rank=0, _workers=["rank0", "rank1"])
-        # The runtime owns the handle table and the sharding config now, and
-        # ``remove_request`` there is what frees the handle.
-        self._graph_runtime = SimpleNamespace(
+def _forwarding_leader(broadcast_seq: int) -> Worker:
+    """Rank 0's real ``_remove_request``, over stubs, to pin what it forwards."""
+    group = SimpleNamespace(tp_size=2, _tp_rank=0, _workers=["rank0", "rank1"])
+    sent: list = []
+    request_state = SimpleNamespace(remove_request=lambda rid: None)
+    tensor_manager = SimpleNamespace(force_cleanup_request=lambda rid: None)
+    leader = make_worker(
+        # ``remove_request`` here is what frees the handle
+        _graph_runtime=SimpleNamespace(
             get_rid_handle=lambda rid: 0 if rid == "gone" else None,
             get_rid_string=lambda handle: "gone" if handle == 0 else None,
             get_sharding_config=lambda rid: SimpleNamespace(groups=[group]),
             remove_request=lambda rid: None,
-        )
-        self.request_state = SimpleNamespace(remove_request=lambda rid: None)
-        self.engine_manager = SimpleNamespace(
-            remove_request=lambda rid: None,
-        )
-        self.tensor_manager = SimpleNamespace(force_cleanup_request=lambda rid: None)
-        self.streams = StreamBufferManager(self.request_state, self.tensor_manager, [])
-        self.profile_info = SimpleNamespace(pop_request=lambda rid: None)
-        self.scheduler = SimpleNamespace(
-            clear_rid=lambda rid, wire_rid: None,
-            clear_wire_rid=lambda rid: None,
-            last_consumed_tp_seq=-1,
-        )
-        self.sent: list = []
-        self.communicator = SimpleNamespace(
-            send=lambda worker, msg: self.sent.append((worker, msg))
-        )
+        ),
+        request_state=request_state,
+        engine_manager=SimpleNamespace(remove_request=lambda rid: None),
+        tensor_manager=tensor_manager,
+        streams=StreamBufferManager(request_state, tensor_manager, []),
+        profile_info=SimpleNamespace(pop_request=lambda rid: None),
+        scheduler=SimpleNamespace(clear_rid=lambda rid: None),
+        communicator=SimpleNamespace(send=lambda worker, msg: sent.append((worker, msg))),
+    )
+    leader.lockstep._broadcast_seq = broadcast_seq
+    leader.sent = sent
+    return leader
 
 
 def test_the_forwarded_teardown_carries_the_step_it_follows():
     """Without the stamp a follower has nothing to order the teardown against,
     and applies it on whichever side of the step its loop happens to be on."""
-    leader = _ForwardingLeader(broadcast_seq=1229)
+    leader = _forwarding_leader(broadcast_seq=1229)
 
     leader._remove_request(RemoveRequest(request_id="gone"))
 
@@ -985,10 +954,10 @@ def test_the_forwarded_teardown_carries_the_step_it_follows():
 
 
 def test_a_rank_that_leads_never_parks_a_teardown():
-    """``last_consumed_tp_seq`` only advances on a rank that consumes follow
+    """``Lockstep.last_consumed_seq`` only advances on a rank that consumes follow
     steps, so a leader that parked a stamped teardown would hold it for good —
     and hold its pages with it."""
-    leader = _ForwardingLeader(broadcast_seq=1229)
+    leader = _forwarding_leader(broadcast_seq=1229)
 
     # stamped, as if it had somehow arrived ordered
     leader._remove_request(
@@ -1004,7 +973,7 @@ def test_the_teardown_flush_spares_only_what_the_speculation_touches():
     forward ran. What is not is whatever the speculation touches: its pre-plan
     may have pre-admitted, marking those streams in flight, and the speculation
     is not dropped until after this returns."""
-    leader = _Rank(leader=True)
+    leader = _rank(leader=True)
 
     _oom(leader, referenced_rids=frozenset({"spec_rid"}))
 
@@ -1016,9 +985,9 @@ def test_the_teardown_flush_spares_only_what_the_speculation_touches():
 def test_the_teardown_flush_runs_after_the_push_back():
     """A rid torn down by the flush must not then be pushed onto queues that the
     teardown has just dismantled."""
-    leader = _Rank(leader=True)
+    leader = _rank(leader=True)
     order: list[str] = []
-    leader.queue.push_back_node = (
+    leader._graph_runtime.push_back_node = (
         lambda node_name, rids, wg_ids: order.append("push")
     )
     leader._apply_pending_removes_safe_to_drop = (
@@ -1047,44 +1016,38 @@ def test_the_speculation_is_cleared_before_the_recovery_runs():
     )
 
 
-class _FollowSpec:
-    """``Worker._try_follow_speculation`` over stubs, as far as the delta gate.
-
-    A real ``MicroScheduler`` so the gate is driven by a real refusal rather than
-    a stubbed return: the bug was the async path never asking, and a stub that
+def _follow_spec(*, replay_refuses: bool) -> Worker:
+    """The real ``Worker._try_follow_speculation`` and ``MicroScheduler``, as far
+    as the delta gate, so the gate is driven by a real refusal rather than a
+    stubbed return: the bug was the async path never asking, and a stub that
     answers proves nothing about whether it asked.
     """
-
-    _try_follow_speculation = Worker._try_follow_speculation
-
-    def __init__(self, *, replay_refuses: bool):
-        self.worker_id = "worker_1"
-        self.engine = SimpleNamespace(
-            apply_resident_delta=lambda node, delta: not replay_refuses,
-            is_offloaded=lambda node, rid: False,
-            reclaimable=lambda node, rid: 0,
-            check_ready=lambda *a, **kw: FULL_ADMIT_OK,
-            get_max_batch_size=lambda node, walk: None,
-        )
-        self.engine_manager = SimpleNamespace(get_engine=lambda node: self.engine)
-        self.scheduler = MicroScheduler(
-            engine_manager=self.engine_manager, parallel_leader_nodes=set(),
-        )
-        # the worker installs this; ``_check_resident_set_matches`` needs it to
-        # compare page state in wire ids (and goes away with that check)
-        # the build asks for the spec target right after reading the parent's
-        # batch; None bails it out there, just past the gate
-        self._graph_runtime = SimpleNamespace(
-            get_spec_target=lambda *a, **kw: None,
-        )
-        # live requests live on the request-state manager now
-        self.request_state = SimpleNamespace(per_request_info={})
-        self.head = head = ScheduleTPNode(
-            node_name="node", graph_walk="walk", request_ids=["r0"],
-            speculative=True, spec_seq=6, spec_from_seq=5,
-        )
-        head.resident_delta.add_offloaded("victim")
-        self.scheduler.register_tp_follow(head)
+    engine = SimpleNamespace(
+        apply_resident_delta=lambda node, delta: not replay_refuses,
+        is_offloaded=lambda node, rid: False,
+        reclaimable=lambda node, rid: 0,
+        check_ready=lambda *a, **kw: FULL_ADMIT_OK,
+        get_max_batch_size=lambda node, walk: None,
+    )
+    engine_manager = SimpleNamespace(get_engine=lambda node: engine)
+    # the build asks for the spec target right after reading the parent's
+    # batch; None bails it out there, just past the gate
+    runtime = SimpleNamespace(get_rid_handle=lambda rid: rid, get_spec_target=lambda *a, **kw: None)
+    request_state = SimpleNamespace(per_request_info={})
+    sched = make_scheduler(
+        engine_manager, parallel_leader_nodes=set(), graph_runtime=runtime, request_state=request_state,
+    )
+    worker = make_worker(
+        worker_id="worker_1", engine_manager=engine_manager, scheduler=sched, lockstep=sched.lockstep,
+        admission=sched.admission, _graph_runtime=runtime, request_state=request_state,
+    )
+    worker.head = head = ScheduleTPNode(
+        node_name="node", graph_walk="walk", request_ids=["r0"],
+        speculative=True, spec_seq=6, spec_from_seq=5,
+    )
+    head.resident_delta.add_offloaded("victim")
+    worker.lockstep.enqueue_follow(head)
+    return worker
 
 
 class _SpecParent:
@@ -1121,12 +1084,12 @@ class _SpecParent:
 def test_the_async_follow_path_will_not_build_mid_replay():
     """The serial path waits while moves are owed; this one used to skip the delta
     entirely, read the half-applied state as "rid not ready", and poll for ever."""
-    worker = _FollowSpec(replay_refuses=True)
+    worker = _follow_spec(replay_refuses=True)
     parent = _SpecParent()
 
     assert worker._try_follow_speculation(parent) is None
     assert parent.reads == 0, "the build started before the replay had landed"
-    assert worker.scheduler.peek_tp_follow() is worker.head, (
+    assert worker.scheduler.lockstep.follow_head() is worker.head, (
         "the head was consumed mid-replay"
     )
 
@@ -1134,7 +1097,7 @@ def test_the_async_follow_path_will_not_build_mid_replay():
 def test_the_async_follow_path_proceeds_once_the_replay_lands():
     """The other direction: the gate must not be a permanent stop. Reaching the
     parent is what says the delta settled and the gate passed."""
-    worker = _FollowSpec(replay_refuses=False)
+    worker = _follow_spec(replay_refuses=False)
     parent = _SpecParent()
 
     assert worker._try_follow_speculation(parent) is None
