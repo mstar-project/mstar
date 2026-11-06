@@ -608,7 +608,7 @@ deployment YAML tunes them under ``resources:`` (see :ref:`Step 6 <config-yaml>`
   ``rotary_dim``, ``interleave``, ``scale``, the Llama 3.1 factors (all three or none), the
   rotation's ``dtype`` and a ``table_dtype`` for a cos/sin table built once. On the contract
   this picks the kernel, and a shared layer's ``rope_*`` arguments have no effect, so a port
-  declares what its layer passed on ``main``. The counter is
+  declares what its layer passed before. The counter is
   separate from log positions: a kept step advances it by each row's advance, a fork copies
   it, and a prefix hit advances it over the skipped spans.
 - ``Sampler(name, nodes=, vocab_size=, penalty=, min_p=, eos_ids=, draws=)``. ``penalty`` and
@@ -861,7 +861,7 @@ The spec types are:
        ``repetition_penalty`` values of the resident requests.
        ``enable_min_p``, ``max_repetition_window``, ``min_tokens_stop_ids`` and
        ``enable_top_p_first`` are capabilities of the same kind. See
-       ``SamplingReqConfig`` above. ``loopback_state`` declares per-request state a
+       ``SampleSettings`` above. ``loopback_state`` declares per-request state a
        decode loop keeps on the device beside its last sampled token. See
        `Device loop-back`_.
    * - ``RecurrentStateSpec(config=RecurrentStateConfig(...))``
