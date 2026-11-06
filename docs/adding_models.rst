@@ -3105,7 +3105,9 @@ submodule cache and where the files come from. A model sets ``NAME`` and
 ``_prompt_ids`` and ``_create_submodule``, which hands the LLM node
 ``self.prefill_token_buckets`` (``model_kwargs.prefill_token_buckets``). The scaffold's
 ``rebuild_policies`` lets the KV cache drop a text request and reprefill its ids on
-``prefill_text``; a model whose cache can't drop yet returns ``{}``, as Muse Glimmer does. ``media`` holds a
+``prefill_text``. A model whose LLM node holds a resource that can't drop returns ``{}``,
+or the engine refuses to start; Muse Glimmer returns ``{}`` until a drop has run through
+its sliding-window pool. ``media`` holds a
 ``MediaIntake`` per attachment modality: its ``MediaEncoder`` (modalities may share one),
 its placeholder ``pad`` id, the sentinels a template leaves to its processor, how many
 placeholders an attachment fills (``runs``, one by default; a Qwen3.5 video fills one per
