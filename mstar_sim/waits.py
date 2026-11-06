@@ -61,6 +61,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 from contextlib import contextmanager
 
 from mstar_sim import clock, table
@@ -269,17 +270,22 @@ def device_wait(t: float) -> None:
 
 
 def _mover() -> None:
+    """Every deadline hangs on this thread, so it doesn't die quietly."""
     _mover_tid[0] = str(threading.get_native_id())
-    while True:
-        word = TABLE.word()  # before it looks: a change while it does ends the wait at once
-        with LOCK:
-            began = clock._real_thread_time()
-            timeout = _move()
-            spent = clock._real_thread_time() - began
-            if _running[0] > _native_busy[0]:  # it took the GIL from a Python thread (not from a child)
-                clock.spent(spent)
-            REPORT["mover_s"] += spent
-        TABLE.wait(word, timeout)
+    try:
+        while True:
+            word = TABLE.word()  # before it looks: a change while it does ends the wait at once
+            with LOCK:
+                began = clock._real_thread_time()
+                timeout = _move()
+                spent = clock._real_thread_time() - began
+                if _running[0] > _native_busy[0]:  # it took the GIL from a Python thread (not from a child)
+                    clock.spent(spent)
+                REPORT["mover_s"] += spent
+            TABLE.wait(word, timeout)
+    except Exception:
+        traceback.print_exc()
+        clock.abort()
 
 
 def _move() -> float:
@@ -566,23 +572,24 @@ class _WaiterLock:
             return True
         if not blocking:
             return False
-        w = enter(HOST if timeout >= 0 else None, clock.now() + timeout if timeout >= 0 else None,
-                  release=self._lock.release)
-        if w is None:
-            return self._lock.acquire(True, timeout)
-        self._wait = w
-        try:  # (a notify between the first try and here released it already)
-            got = self._lock.acquire(False) or _until(w, timeout, lambda t: self._lock.acquire(True, t))
+        with LOCK:  # a notify comes before this, and is seen here, or finds the wait listed
+            if self._lock.acquire(False):
+                return True
+            w = self._wait = enter(HOST if timeout >= 0 else None, clock.now() + timeout if timeout >= 0 else None,
+                                   release=self._lock.release)
+        try:
+            got = _until(w, timeout, lambda t: self._lock.acquire(True, t))
         finally:
             self._wait = None
             leave(w)
         return got and not w.timed_out
 
     def release(self):
-        w = self._wait
-        if w is not None:
-            wake(w)
-        self._lock.release()
+        with LOCK:
+            w = self._wait
+            if w is not None:
+                wake(w)
+            self._lock.release()
 
     def locked(self):
         return self._lock.locked()

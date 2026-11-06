@@ -21,7 +21,7 @@ def caller_env() -> dict[str, str]:
     return {k: v for k, v in os.environ.items() if k != "CUDA_VISIBLE_DEVICES"}
 
 
-def run_sim(code: str, gpu: str = "h100", **extra_env: str) -> str:
+def start_sim(code: str, gpu: str = "h100", **extra_env: str) -> subprocess.CompletedProcess:
     env = dict(caller_env(), MSTAR_SIM="1", MSTAR_SIM_GPU=gpu, **extra_env,
                PYTHONPATH=os.pathsep.join([os.path.join(ROOT, "mstar_sim", "_site"), ROOT,
                                            os.environ.get("PYTHONPATH", "")]))
@@ -29,8 +29,12 @@ def run_sim(code: str, gpu: str = "h100", **extra_env: str) -> str:
         script = os.path.join(tmp, "case.py")
         with open(script, "w") as f:
             f.write(textwrap.dedent(code))
-        proc = subprocess.run([sys.executable, script], env=env, capture_output=True, text=True,
+        return subprocess.run([sys.executable, script], env=env, capture_output=True, text=True,
                               timeout=300, check=False)
+
+
+def run_sim(code: str, gpu: str = "h100", **extra_env: str) -> str:
+    proc = start_sim(code, gpu, **extra_env)
     assert proc.returncode == 0, proc.stderr[-3000:]
     return proc.stdout
 
@@ -755,6 +759,54 @@ def test_a_thread_woken_by_another_runs_before_the_clock_can_jump():
     """)
     span, wall = map(float, out.split())
     assert 0.2 <= span < 1 and wall < 5, (span, wall)
+
+
+def test_a_notify_as_a_wait_opens_leaves_the_mover_alive_and_a_dead_mover_stops_the_run():
+    """A notify between a Condition's first try and its wait being listed: the mover must not end
+    that wait too, as releasing an unlocked lock killed it. And should it die of anything, every
+    device wait would hang, so the process aborts instead."""
+    out = run_sim("""
+        import threading
+        from mstar_sim import waits
+        enter, lock, go, done = waits.enter, threading._allocate_lock(), waits._real_lock(), waits._real_lock()
+        lock.acquire()  # a Condition's waiter lock
+        go.acquire()
+        done.acquire()
+
+        def notify():
+            go.acquire()
+            try:
+                lock.release()
+            except RuntimeError:  # the mover got there first: Condition.notify allows for it
+                pass
+            done.release()
+
+        threading.Thread(target=notify, name=waits.OWN + "notify", daemon=True).start()
+
+        def entered(*args, **kwargs):
+            w = enter(*args, **kwargs)
+            go.release()
+            done.acquire(True, 0.1)
+            w.due = True  # its deadline passes before it can look
+            waits.kick()
+            waits._real_sleep(0.1)
+            return w
+
+        waits.enter = entered
+        lock.acquire(True, 0.001)
+        waits.enter = enter
+        waits._real_sleep(0.1)
+        print(any(t.name == waits.OWN + "mover" for t in threading.enumerate()))
+    """)
+    assert out.strip() == "True", out
+    dead = start_sim("""
+        import time
+        from mstar_sim import waits
+        waits._move = lambda: 1 / 0
+        waits.kick()
+        time.sleep(30)
+    """)
+    assert dead.returncode == -6 and "ZeroDivisionError" in dead.stderr, (dead.returncode, dead.stderr[-1500:])
 
 
 def run_deployment(*codes: str) -> list[str]:
