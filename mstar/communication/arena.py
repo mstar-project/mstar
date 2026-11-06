@@ -47,19 +47,23 @@ path until the arena is measured there. It then sends every tensor as a per-uuid
 still reads its peers' arenas, so it mixes with entities that have one.
 
 Selection: ``create_tensor_communication_manager`` builds this manager for
-the SHM protocol; the file transport it extends is its spill path. See
-:doc:`environment_variables` for the knobs.
+the SHM protocol. See :doc:`environment_variables` for the knobs.
 """
 
 from __future__ import annotations
 
+import errno
 import logging
 import os
+import platform
 import queue
+import shutil
+import stat
 import threading
 import time
 import weakref
 from concurrent.futures import Future
+from contextlib import nullcontext as _nullcontext
 from typing import NamedTuple
 
 import numpy as np
@@ -68,12 +72,14 @@ import torch
 from mstar.communication.communicator import BaseCommunicator
 from mstar.communication.tensor_store import RustTensorStore
 from mstar.communication.tensors import (
+    DEPLOYMENT_TOKEN_ENV,
     FutureAndPointers,
+    LocalTransferEngine,
     Rid,
-    SharedMemoryCommunicationManager,
-    _deserialize_tensor,
-    _nullcontext,
-    _serialize_tensor,
+    TensorCommunicationManager,
+    _deployment_namespace,
+    _hold_namespace_lock,
+    _sweep_dead_namespaces,
 )
 from mstar.communication.torch_abi import require_torch_abi
 from mstar.graph.base import GraphEdge, TensorPointerInfo
@@ -83,6 +89,43 @@ from mstar.utils.host_copy import HostCopier
 from mstar.utils.threads import Thread
 
 logger = logging.getLogger(__name__)
+
+def _serialize_tensor(tensor: torch.Tensor) -> bytes:
+    """Serialize a tensor to bytes: header + contiguous raw data."""
+    t = tensor.detach().contiguous().cpu()
+    # reshape(-1) so 0-dim (scalar) tensors can be byte-viewed: PyTorch
+    # disallows viewing a 0-dim tensor to a dtype with a different element size.
+    return t.reshape(-1).view(torch.uint8).numpy().tobytes()
+
+
+def _deserialize_tensor(
+    data: bytes | memoryview, device: str,
+    tensor_info: TensorPointerInfo
+) -> torch.Tensor:
+    """Reconstruct a tensor from bytes produced by ``_serialize_tensor``."""
+    if isinstance(data, memoryview):
+        data = bytes(data)
+    shape = tensor_info.dims
+    dtype = tensor_info.dtype
+    if len(data) == 0:
+        t = torch.empty(shape, dtype=dtype)
+    else:
+        t = torch.frombuffer(bytearray(data), dtype=torch.uint8).view(dtype).reshape(shape)
+    if device != "cpu":
+        t = t.to(device)
+    return t
+
+
+# Docker gives a container 64 MB of /dev/shm, and one video or audio tensor can outgrow that
+_SHM_DIR_WARN_BYTES = 1 << 30
+
+
+def _default_shm_dir() -> str:
+    """Return the default shared-memory directory for the current platform."""
+    if platform.system() == "Linux" and os.path.isdir("/dev/shm"):
+        return "/dev/shm"
+    return "/tmp/mstar_shm"
+
 
 _CUDA_HOST_ALREADY_REGISTERED = 712
 _sizing_logged = False
@@ -363,13 +406,16 @@ def _gather(view, starts: list[int], nbytes: int, dst: np.ndarray, *,
         dst[i * nbytes:(i + 1) * nbytes] = seg[s:s + nbytes]
 
 
-class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
+class ArenaShmCommunicationManager(TensorCommunicationManager):
     """Tensor transport via the Rust shared-memory arena (``mstar_rust``).
 
     ``_arena`` is None when this entity has none of its own (see the module
-    docstring): every send then spills to a per-uuid file.
+    docstring): every send then spills to a per-uuid file. ``use_arena=False``
+    asks for that outright.
     """
 
+    #: Directories besides ``shm_dir`` that hold this transport's
+    #: ``mstar_<namespace>_*`` files; each gets its own namespace lock.
     _namespace_file_dirs = ("/dev/shm",)
 
     # Staging writes the segment and offset onto the descriptor the store
@@ -387,12 +433,56 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
         shm_dir: str | None = None,
         enable_prof: bool = False,
         copy_workers: int = 1,
+        use_arena: bool = True,
     ):
+        engine = LocalTransferEngine(hostname=hostname)
         super().__init__(
-            my_entity_id=my_entity_id, hostname=hostname, device=device,
-            communicator=communicator, shm_dir=shm_dir,
+            my_entity_id=my_entity_id,
+            my_session_id=engine.get_session_id(),
+            device=device,
+            communicator=communicator,
+            transfer_engine=engine,
             enable_prof=enable_prof,
         )
+
+        self.shm_dir = shm_dir or _default_shm_dir()
+        os.makedirs(self.shm_dir, exist_ok=True)
+        # at boot, not at the first large send: that failure would be the only other sign of a small dir
+        try:
+            st = os.statvfs(self.shm_dir)
+            shm_dir_total = st.f_frsize * st.f_blocks
+        except OSError:
+            shm_dir_total = None
+        if shm_dir_total is not None and shm_dir_total < _SHM_DIR_WARN_BYTES:
+            logger.warning(
+                "SHM: %s holds only %d MiB and every tensor in flight is written there, so a large one will "
+                "fail its send with ENOSPC. Give it more room (docker --shm-size), or pass "
+                "--tensor-comm-protocol TCP, which is slower", self.shm_dir, shm_dir_total >> 20)
+
+        # uuid → file path for sender-side cleanup
+        self._shm_files: dict[int, str] = {}
+        self._shm_namespace = _deployment_namespace(communicator)
+        # The launch token is in the namespace, so a later launch on the same
+        # endpoint (uuid counters back at 1) never writes these names.
+        self.names_unique_per_launch = bool(
+            self._shm_namespace and os.environ.get(DEPLOYMENT_TOKEN_ENV))
+        if self._shm_namespace:
+            # A lock guards only the files in its own directory.
+            dirs = [d for d in dict.fromkeys(
+                (self.shm_dir, *self._namespace_file_dirs)) if os.path.isdir(d)]
+            for d in dirs:
+                _hold_namespace_lock(d, self._shm_namespace)
+            for d in dirs:
+                _sweep_dead_namespaces(d, self._shm_namespace)
+
+        # Dedicated copy streams: D2H/H2D run here so they don't serialize
+        # behind the next GPU step queued on the default stream.
+        self._d2h_stream: torch.cuda.Stream | None = None
+        self._h2d_stream: torch.cuda.Stream | None = None
+        if torch.cuda.is_available() and str(device) != "cpu":
+            self._d2h_stream = torch.cuda.Stream(device=device)
+            self._h2d_stream = torch.cuda.Stream(device=device)
+
         from mstar_rust import ArenaCopier, ArenaSlots, SegmentedShmArena, ShmArena
 
         # At startup, not at the first tensor: an unsupported torch is an error here.
@@ -402,7 +492,7 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
         self._host_copier = HostCopier(copy_workers)
 
         self._ShmArena = ShmArena
-        supported = _arena_supported(device)
+        supported = use_arena and _arena_supported(device)
         segment_mb, max_segments, shm_total, shm_avail = (
             _arena_sizing() if supported else (0, 0, None, None))
         self._full_timeout_s = float(
@@ -596,6 +686,95 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
             torch.cuda.default_stream(self.device) if self._h2d_stream is not None else None)
         if has_torch_abi:
             self._copier = self._make_copier(ArenaCopier)
+
+    # -- spill files -----------------------------------------------------
+
+    @property
+    def needs_cpu_tensor(self) -> bool:
+        # The send is a host write, so a host copy the producer already made
+        # saves the device-to-host copy here.
+        return True
+
+    def _send_source(self, uuid: int) -> torch.Tensor:
+        """What to serialize for ``uuid``: the stored host copy if there is
+        one, else the device tensor (which the write copies down)."""
+        cpu = self.tensor_store.get_cpu_tensor(uuid)
+        return cpu if cpu is not None else self.tensor_store.get_tensor(uuid)
+
+    def _shm_path(self, entity_id: str, uuid: int) -> str:
+        ns = f"{self._shm_namespace}_" if self._shm_namespace else ""
+        return os.path.join(self.shm_dir, f"mstar_{ns}{entity_id}_{uuid}")
+
+    def _create_shm_file(self, path: str):
+        """Open ``path`` for writing, having created it ourselves.
+
+        O_EXCL because the name is fully predictable -- namespace, entity and
+        a per-entity counter -- in a world-writable directory. A plain
+        ``open(path, "wb")`` onto a file some other uid got there first either
+        writes through into a file we do not own or fails the batch late on
+        PermissionError; creating it is what makes the uuid a claim.
+
+        Residue we DO own is a different case and is reclaimed rather than
+        raised on: without a launch token the namespace is derived from the
+        conductor endpoint alone, so a restart on the same ports collides with
+        every file the dead run left (uuid counters restart at 1 too).
+        Concurrent same-namespace deployments cannot reach here -- the launch
+        token separates deployments that share a tmpfs across containers, and
+        on one host the ports differ over TCP and the conductor's deployment
+        lock refuses a second one over IPC.
+        """
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        try:
+            return os.fdopen(os.open(path, flags, 0o600), "wb")
+        except FileExistsError:
+            st = os.lstat(path)
+            if stat.S_ISLNK(st.st_mode) or st.st_uid != os.getuid():
+                raise RuntimeError(
+                    f"refusing to write tensor file {path}: it exists and is "
+                    f"not ours (owner uid {st.st_uid}, ours {os.getuid()}, "
+                    f"symlink {stat.S_ISLNK(st.st_mode)}). Another user or an "
+                    "unrelated deployment holds this path; give this "
+                    "deployment its own ZMQ endpoint so it derives a "
+                    "different namespace."
+                ) from None
+            os.unlink(path)
+            try:
+                return os.fdopen(os.open(path, flags, 0o600), "wb")
+            except FileExistsError:
+                raise RuntimeError(
+                    f"tensor file {path} was recreated while reclaiming our "
+                    "own stale copy of it -- another process is writing this "
+                    "deployment's namespace"
+                ) from None
+
+    def _write_shm_file(self, path: str, data: bytes) -> None:
+        """Write one tensor's bytes to ``path``.
+
+        A full shm dir fails the write part way, and no cleanup knows the partial file: left behind, it
+        would keep the space it took, and the next request would find the dir fuller still.
+        """
+        try:
+            with self._create_shm_file(path) as f:
+                f.write(data)
+        except OSError as exc:
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
+            if exc.errno != errno.ENOSPC:
+                raise
+            free = shutil.disk_usage(self.shm_dir).free
+            if free < len(data):
+                reason = f"{self.shm_dir} has {free} bytes free, too few for a {len(data)}-byte tensor"
+            else:
+                reason = (
+                    f"{self.shm_dir} reported no space for a {len(data)}-byte tensor, with {free} bytes free after "
+                    "the failed write: it may be out of inodes, or other writers held the space meanwhile"
+                )
+            raise OSError(
+                errno.ENOSPC,
+                f"{reason}. Give it more room (docker --shm-size), or pass --tensor-comm-protocol TCP, which is slower",
+            ) from exc
 
     # -- segments --------------------------------------------------------
 
@@ -1349,7 +1528,24 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
         ends in SIGKILL or the watchdog's hard exit. Peers keep the mappings
         they have; the finalizer still runs at a normal exit and finds them
         gone, and unlinks any segment grown after this call."""
-        super().unlink_owned_files()
+        files = self._shm_files
+        # The orphan watchdog's thread can run this at the same time, so each
+        # path is taken by one caller, and put back for the retry if a stop
+        # cuts its unlink.
+        while True:
+            try:
+                uuid, path = files.popitem()
+            except KeyError:
+                break
+            try:
+                os.unlink(path)
+            except OSError:
+                # Already gone (FileNotFoundError) or not removable: either
+                # way, keep going so the rest are still reclaimed.
+                pass
+            except BaseException:
+                files[uuid] = path
+                raise
         _unlink_paths(list(self._own_segment_paths))
 
     def close(self) -> None:
@@ -1406,10 +1602,7 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
                 )
 
     def _cleanup_by_uuid(self, uuid: int, registered: bool | None = None):
-        # Grandparent cleanup (refcounts): skip the file manager's unlink.
-        super(SharedMemoryCommunicationManager, self)._cleanup_by_uuid(
-            uuid, registered,
-        )
+        super()._cleanup_by_uuid(uuid, registered)
         self._arena_ts.pop(uuid, None)
         self._arena_locs.free([uuid])
         if (path := self._shm_files.pop(uuid, None)) is not None:

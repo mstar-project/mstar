@@ -14,12 +14,12 @@ import pytest
 import torch
 
 from mstar.communication import tensors
+from mstar.communication.arena import ArenaShmCommunicationManager
 from mstar.communication.communicator import CommProtocol
 from mstar.communication.tensor_store import PythonTensorBookkeeping, TensorStore
 from mstar.communication.tensors import (
     LocalTransferEngine,
     MooncakeCommunicationManager,
-    SharedMemoryCommunicationManager,
 )
 from mstar.distributed.base import ShardingConfig, ShardingGroup
 from mstar.engine.engine import Engine
@@ -282,9 +282,10 @@ def test_overlapping_view_is_copied():
 def test_shm_transport_stores_a_gapped_view_as_is(tmp_path):
     """The SHM transports serialize a contiguous copy at send time, so the
     store does not copy for them."""
-    mgr = SharedMemoryCommunicationManager(
+    mgr = ArenaShmCommunicationManager(
         my_entity_id="worker_0", hostname="host", device="cpu",
         communicator=_NullCommunicator(), shm_dir=str(tmp_path),
+        use_arena=False,
     )
     sent = _gapped_views()["last_position"]
     [info] = mgr.store_and_return_tensor_info(1, {"x": [sent]})["x"]

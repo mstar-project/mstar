@@ -18,8 +18,8 @@ from types import SimpleNamespace
 
 import torch
 
+from mstar.communication.arena import ArenaShmCommunicationManager
 from mstar.communication.communicator import BaseCommunicator
-from mstar.communication.tensors import SharedMemoryCommunicationManager
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import StepContext
 from mstar.graph.base import GraphEdge
@@ -78,9 +78,10 @@ class _AccumulatingRuntime(PhasedPostprocess):
 
 
 def _manager(tmp_path, entity_id):
-    return SharedMemoryCommunicationManager(
+    return ArenaShmCommunicationManager(
         my_entity_id=entity_id, hostname="localhost", device="cpu",
         communicator=_Communicator(), shm_dir=str(tmp_path),
+        use_arena=False,
     )
 
 

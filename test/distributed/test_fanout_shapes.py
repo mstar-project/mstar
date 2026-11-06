@@ -11,8 +11,8 @@ agree.
 import pytest
 import torch
 
+from mstar.communication.arena import ArenaShmCommunicationManager
 from mstar.communication.communicator import CommProtocol
-from mstar.communication.tensors import SharedMemoryCommunicationManager
 from mstar.conductor.conductor import Conductor
 from mstar.distributed.base import ShardingConfig, ShardingGroup
 from mstar.graph.base import GraphEdge, NodeAndGraphWalk, TensorPointerInfo
@@ -99,9 +99,10 @@ class TestSameWorkerReslice:
     tensor instead of reading it back over the transport."""
 
     def _manager(self, tmp_path):
-        tm = SharedMemoryCommunicationManager(
+        tm = ArenaShmCommunicationManager(
             my_entity_id="worker_0", hostname="h", device="cpu",
             communicator=_Comm(tmp_path), shm_dir=str(tmp_path),
+            use_arena=False,
         )
         tm.register_request(1, _cfg(shard_dim=0, dest_workers=("worker_0", "worker_1")))
         return tm

@@ -18,7 +18,6 @@ from mstar.communication.tensor_store import (
     TensorStore,
 )
 from mstar.communication.tensors import (
-    SharedMemoryCommunicationManager,
     create_tensor_communication_manager,
 )
 from mstar.distributed.base import (
@@ -40,13 +39,13 @@ class _NullCommunicator:
         return []
 
 
-def _manager(entity, tmp_path, copy_workers=1):
+def _manager(entity, tmp_path, copy_workers=1, use_arena=True):
     os.environ["MSTAR_SHM_ARENA_SEGMENT_MB"] = "1"
     os.environ["MSTAR_SHM_ARENA_MAX_SEGMENTS"] = "4"
     return ArenaShmCommunicationManager(
         my_entity_id=entity, hostname="localhost", device="cpu",
         communicator=_NullCommunicator(), shm_dir=str(tmp_path),
-        copy_workers=copy_workers,
+        copy_workers=copy_workers, use_arena=use_arena,
     )
 
 
@@ -204,35 +203,24 @@ def test_strict_mode_backpressures_then_fails(tmp_path):
         del os.environ["MSTAR_SHM_ARENA_FULL_TIMEOUT_S"]
 
 
-def test_transport_mismatch_fails_loudly(tmp_path):
-    """The file manager on its own (the spill path) cannot read an arena slot
-    and says so; the reverse direction interops via the arena consumer's
-    file fallback."""
+def test_a_manager_with_no_arena_mixes_with_ones_that_have_one(tmp_path):
+    """Placement rides the descriptor, so either side reads the other."""
     arena_prod = _manager("mx0", tmp_path)
-    file_cons = SharedMemoryCommunicationManager(
-        my_entity_id="mx1", hostname="localhost", device="cpu",
-        communicator=_NullCommunicator(), shm_dir=str(tmp_path))
-    infos = arena_prod.store_and_return_tensor_info(
-        "rm", {"x": [torch.randn(4)]})
+    file_cons = _manager("mx1", tmp_path, use_arena=False)
+    x = torch.randn(4)
+    infos = arena_prod.store_and_return_tensor_info("rm", {"x": [x]})
     arena_prod.register_for_send("rm", [infos["x"][0]])
-    edge = GraphEdge(next_node="B", name="x", tensor_info=infos["x"])
-    with pytest.raises(RuntimeError, match="staged in an SHM arena"):
-        file_cons.start_read_tensors("rm", [edge])
+    file_cons.start_read_tensors("rm", [GraphEdge(next_node="B", name="x", tensor_info=infos["x"])])
+    assert torch.equal(file_cons.tensor_store.get_tensor(infos["x"][0].uuid), x)
 
-    # The reverse direction now INTEROPS: a file-producer's tensors carry
-    # no arena location, which is exactly the spill wire shape — the arena
-    # consumer reads them through its file fallback.
-    file_prod = SharedMemoryCommunicationManager(
-        my_entity_id="mx2", hostname="localhost", device="cpu",
-        communicator=_NullCommunicator(), shm_dir=str(tmp_path))
+    file_prod = _manager("mx2", tmp_path, use_arena=False)
     arena_cons = _manager("mx3", tmp_path)
     y = torch.randn(4)
     infos = file_prod.store_and_return_tensor_info("rm2", {"y": [y]})
     file_prod.register_for_send("rm2", [infos["y"][0]])
-    edge = GraphEdge(next_node="B", name="y", tensor_info=infos["y"])
-    arena_cons.start_read_tensors("rm2", [edge])
-    got = arena_cons.tensor_store.get_tensor(infos["y"][0].uuid)
-    assert torch.equal(got, y)
+    assert infos["y"][0].shm_segment is None
+    arena_cons.start_read_tensors("rm2", [GraphEdge(next_node="B", name="y", tensor_info=infos["y"])])
+    assert torch.equal(arena_cons.tensor_store.get_tensor(infos["y"][0].uuid), y)
 
 
 def test_the_shm_protocol_builds_the_arena(tmp_path):

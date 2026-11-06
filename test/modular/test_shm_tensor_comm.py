@@ -1,4 +1,4 @@
-"""Unit tests for SharedMemoryCommunicationManager and tensor serialization."""
+"""Unit tests for the SHM transport's spill files and tensor serialization."""
 
 import ctypes
 import errno
@@ -12,12 +12,14 @@ import pytest
 import torch
 
 import mstar.communication.tensors as tensors_mod
+from mstar.communication.arena import (
+    ArenaShmCommunicationManager,
+    _deserialize_tensor,
+    _serialize_tensor,
+)
 from mstar.communication.communicator import BaseCommunicator, CommProtocol
 from mstar.communication.tensors import (
     MooncakeCommunicationManager,
-    SharedMemoryCommunicationManager,
-    _deserialize_tensor,
-    _serialize_tensor,
     create_tensor_communication_manager,
 )
 from mstar.distributed.base import NodeAndGraphWalk, ShardingConfig, ShardingGroup
@@ -84,13 +86,14 @@ def _stub_info(t: torch.Tensor) -> TensorPointerInfo:
 def _make_manager(
     shm_dir: str, entity_id: str = "worker_0",
     request_id: str | None = None,
-) -> SharedMemoryCommunicationManager:
-    mgr = SharedMemoryCommunicationManager(
+) -> ArenaShmCommunicationManager:
+    mgr = ArenaShmCommunicationManager(
         my_entity_id=entity_id,
         hostname="localhost",
         device="cpu",
         communicator=MockCommunicator(),
         shm_dir=shm_dir,
+        use_arena=False,
     )
     if request_id is not None:
         mgr.register_request(request_id, _empty_sharding_config())
@@ -143,7 +146,7 @@ def test_serialize_high_dim():
 
 
 # ---------------------------------------------------------------------------
-# SharedMemoryCommunicationManager tests
+# Per-uuid file tests
 # ---------------------------------------------------------------------------
 
 def test_store_and_register_creates_file():
@@ -168,9 +171,10 @@ class _DeploymentCommunicator(MockCommunicator):
 
 def _deployed_manager(shm_dir, prefix, entity_id="worker_0",
                       protocol=CommProtocol.IPC):
-    mgr = SharedMemoryCommunicationManager(
+    mgr = ArenaShmCommunicationManager(
         my_entity_id=entity_id, hostname="localhost", device="cpu",
         communicator=_DeploymentCommunicator(prefix, protocol), shm_dir=shm_dir,
+        use_arena=False,
     )
     mgr.register_request("req1", _empty_sharding_config())
     return mgr
@@ -729,9 +733,10 @@ class _InProcessTransferEngine:
 
 def _transport(protocol, entity_id, shm_dir):
     if protocol == CommProtocol.SHM:
-        return SharedMemoryCommunicationManager(
+        return ArenaShmCommunicationManager(
             my_entity_id=entity_id, hostname="localhost", device="cpu",
             communicator=MockCommunicator(), shm_dir=shm_dir,
+            use_arena=False,
         )
     return MooncakeCommunicationManager(
         my_entity_id=entity_id, hostname="localhost", device="cpu",
@@ -1219,7 +1224,7 @@ def test_host_copies_not_kept_for_device_transports():
     """TCP / RDMA read device memory, so a host copy would only be held."""
     assert not MooncakeCommunicationManager.needs_cpu_tensor.fget(object())
 
-    class _DeviceTransport(SharedMemoryCommunicationManager):
+    class _DeviceTransport(ArenaShmCommunicationManager):
         needs_cpu_tensor = False
 
     with tempfile.TemporaryDirectory() as tmpdir:

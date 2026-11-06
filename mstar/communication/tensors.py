@@ -1,11 +1,9 @@
-import errno
 import fcntl
 import hashlib
 import json
 import logging
 import math
 import os
-import platform
 import re
 import secrets
 import shutil
@@ -16,7 +14,6 @@ import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable
 from concurrent.futures import CancelledError, Future
-from contextlib import nullcontext as _nullcontext
 from dataclasses import dataclass, field
 from typing import NamedTuple
 
@@ -2194,14 +2191,13 @@ class TensorCommunicationManager(ABC):
         self.cleanup_request(request_id, force=True)
 
     #: True when no other launch can write a file under this manager's names
-    #: (see ``SharedMemoryCommunicationManager``); irrelevant to transports
-    #: that write no files.
+    #: (see ``ArenaShmCommunicationManager``); irrelevant to transports that
+    #: write no files.
     names_unique_per_launch = False
 
     def unlink_owned_files(self) -> None:  # noqa: B027
         """Unlink the shared-memory files this process wrote for its peers and
-        still owns. A no-op here: only the SHM file transport (and the arena's
-        spills) writes any."""
+        still owns. A no-op here: only the SHM transport writes any."""
 
 
 # ---------------------------------------------------------------------------
@@ -2446,43 +2442,6 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
 # Shared-memory tensor serialization helpers
 # ---------------------------------------------------------------------------
 
-def _serialize_tensor(tensor: torch.Tensor) -> bytes:
-    """Serialize a tensor to bytes: header + contiguous raw data."""
-    t = tensor.detach().contiguous().cpu()
-    # reshape(-1) so 0-dim (scalar) tensors can be byte-viewed: PyTorch
-    # disallows viewing a 0-dim tensor to a dtype with a different element size.
-    return t.reshape(-1).view(torch.uint8).numpy().tobytes()
-
-
-def _deserialize_tensor(
-    data: bytes | memoryview, device: str,
-    tensor_info: TensorPointerInfo
-) -> torch.Tensor:
-    """Reconstruct a tensor from bytes produced by ``_serialize_tensor``."""
-    if isinstance(data, memoryview):
-        data = bytes(data)
-    shape = tensor_info.dims
-    dtype = tensor_info.dtype
-    if len(data) == 0:
-        t = torch.empty(shape, dtype=dtype)
-    else:
-        t = torch.frombuffer(bytearray(data), dtype=torch.uint8).view(dtype).reshape(shape)
-    if device != "cpu":
-        t = t.to(device)
-    return t
-
-
-# Docker gives a container 64 MB of /dev/shm, and one video or audio tensor can outgrow that
-_SHM_DIR_WARN_BYTES = 1 << 30
-
-
-def _default_shm_dir() -> str:
-    """Return the default shared-memory directory for the current platform."""
-    if platform.system() == "Linux" and os.path.isdir("/dev/shm"):
-        return "/dev/shm"
-    return "/tmp/mstar_shm"
-
-
 DEPLOYMENT_TOKEN_ENV = "MSTAR_DEPLOYMENT_TOKEN"
 #: The token the last API server in this environment minted.
 _MINTED_TOKEN_ENV = "MSTAR_DEPLOYMENT_TOKEN_MINTED"
@@ -2628,327 +2587,6 @@ def _sweep_dead_namespaces(shm_dir: str, own_namespace: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# SharedMemoryCommunicationManager
-# ---------------------------------------------------------------------------
-
-class SharedMemoryCommunicationManager(TensorCommunicationManager):
-    """Tensor transport via file I/O to a tmpfs directory (``/dev/shm``).
-
-    The base of ``ArenaShmCommunicationManager`` and its spill path: a tensor
-    the arena has no room for goes to a per-uuid file written and read here.
-    Nothing in ``mstar`` builds this class on its own; the SHM protocol is the
-    arena.
-    """
-
-    #: Directories besides ``shm_dir`` that hold this transport's
-    #: ``mstar_<namespace>_*`` files; each gets its own namespace lock.
-    _namespace_file_dirs: tuple[str, ...] = ()
-
-    def __init__(
-        self,
-        my_entity_id: str,
-        hostname: str,
-        device: str,
-        communicator: BaseCommunicator,
-        shm_dir: str | None = None,
-        enable_prof: bool=False
-    ):
-        engine = LocalTransferEngine(hostname=hostname)
-        super().__init__(
-            my_entity_id=my_entity_id,
-            my_session_id=engine.get_session_id(),
-            device=device,
-            communicator=communicator,
-            transfer_engine=engine,
-            enable_prof=enable_prof
-        )
-
-        self.shm_dir = shm_dir or _default_shm_dir()
-        os.makedirs(self.shm_dir, exist_ok=True)
-        # at boot, not at the first large send: that failure would be the only other sign of a small dir
-        try:
-            st = os.statvfs(self.shm_dir)
-            shm_total = st.f_frsize * st.f_blocks
-        except OSError:
-            shm_total = None
-        if shm_total is not None and shm_total < _SHM_DIR_WARN_BYTES:
-            logger.warning(
-                "SHM: %s holds only %d MiB and every tensor in flight is written there, so a large one will "
-                "fail its send with ENOSPC. Give it more room (docker --shm-size), or pass "
-                "--tensor-comm-protocol TCP, which is slower", self.shm_dir, shm_total >> 20)
-
-        # uuid → file path for sender-side cleanup
-        self._shm_files: dict[int, str] = {}
-        self._shm_namespace = _deployment_namespace(communicator)
-        # The launch token is in the namespace, so a later launch on the same
-        # endpoint (uuid counters back at 1) never writes these names.
-        self.names_unique_per_launch = bool(
-            self._shm_namespace and os.environ.get(DEPLOYMENT_TOKEN_ENV))
-        if self._shm_namespace:
-            # A lock guards only the files in its own directory.
-            dirs = [d for d in dict.fromkeys(
-                (self.shm_dir, *self._namespace_file_dirs)) if os.path.isdir(d)]
-            for d in dirs:
-                _hold_namespace_lock(d, self._shm_namespace)
-            for d in dirs:
-                _sweep_dead_namespaces(d, self._shm_namespace)
-
-        # Dedicated copy streams: D2H/H2D run here so they don't serialize
-        # behind the next GPU step queued on the default stream.
-        self._d2h_stream: torch.cuda.Stream | None = None
-        self._h2d_stream: torch.cuda.Stream | None = None
-        if torch.cuda.is_available() and str(device) != "cpu":
-            self._d2h_stream = torch.cuda.Stream(device=device)
-            self._h2d_stream = torch.cuda.Stream(device=device)
-
-    @property
-    def needs_cpu_tensor(self) -> bool:
-        # The send is a host write, so a host copy the producer already made
-        # saves the device-to-host copy here.
-        return True
-
-    def _send_source(self, uuid: int) -> torch.Tensor:
-        """What to serialize for ``uuid``: the stored host copy if there is
-        one, else the device tensor (which the write copies down)."""
-        cpu = self.tensor_store.get_cpu_tensor(uuid)
-        return cpu if cpu is not None else self.tensor_store.get_tensor(uuid)
-
-    def _shm_path(self, entity_id: str, uuid: int) -> str:
-        ns = f"{self._shm_namespace}_" if self._shm_namespace else ""
-        return os.path.join(self.shm_dir, f"mstar_{ns}{entity_id}_{uuid}")
-
-    def _create_shm_file(self, path: str):
-        """Open ``path`` for writing, having created it ourselves.
-
-        O_EXCL because the name is fully predictable -- namespace, entity and
-        a per-entity counter -- in a world-writable directory. A plain
-        ``open(path, "wb")`` onto a file some other uid got there first either
-        writes through into a file we do not own or fails the batch late on
-        PermissionError; creating it is what makes the uuid a claim.
-
-        Residue we DO own is a different case and is reclaimed rather than
-        raised on: without a launch token the namespace is derived from the
-        conductor endpoint alone, so a restart on the same ports collides with
-        every file the dead run left (uuid counters restart at 1 too).
-        Concurrent same-namespace deployments cannot reach here -- the launch
-        token separates deployments that share a tmpfs across containers, and
-        on one host the ports differ over TCP and the conductor's deployment
-        lock refuses a second one over IPC.
-        """
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-        try:
-            return os.fdopen(os.open(path, flags, 0o600), "wb")
-        except FileExistsError:
-            st = os.lstat(path)
-            if stat.S_ISLNK(st.st_mode) or st.st_uid != os.getuid():
-                raise RuntimeError(
-                    f"refusing to write tensor file {path}: it exists and is "
-                    f"not ours (owner uid {st.st_uid}, ours {os.getuid()}, "
-                    f"symlink {stat.S_ISLNK(st.st_mode)}). Another user or an "
-                    "unrelated deployment holds this path; give this "
-                    "deployment its own ZMQ endpoint so it derives a "
-                    "different namespace."
-                ) from None
-            os.unlink(path)
-            try:
-                return os.fdopen(os.open(path, flags, 0o600), "wb")
-            except FileExistsError:
-                raise RuntimeError(
-                    f"tensor file {path} was recreated while reclaiming our "
-                    "own stale copy of it -- another process is writing this "
-                    "deployment's namespace"
-                ) from None
-
-    def _write_shm_file(self, path: str, data: bytes) -> None:
-        """Write one tensor's bytes to ``path``.
-
-        A full shm dir fails the write part way, and no cleanup knows the partial file: left behind, it
-        would keep the space it took, and the next request would find the dir fuller still.
-        """
-        try:
-            with self._create_shm_file(path) as f:
-                f.write(data)
-        except OSError as exc:
-            try:
-                os.unlink(path)
-            except FileNotFoundError:
-                pass
-            if exc.errno != errno.ENOSPC:
-                raise
-            free = shutil.disk_usage(self.shm_dir).free
-            if free < len(data):
-                reason = f"{self.shm_dir} has {free} bytes free, too few for a {len(data)}-byte tensor"
-            else:
-                reason = (
-                    f"{self.shm_dir} reported no space for a {len(data)}-byte tensor, with {free} bytes free after "
-                    "the failed write: it may be out of inodes, or other writers held the space meanwhile"
-                )
-            raise OSError(
-                errno.ENOSPC,
-                f"{reason}. Give it more room (docker --shm-size), or pass --tensor-comm-protocol TCP, which is slower",
-            ) from exc
-
-    def register_for_send(
-        self, request_id: Rid, tensor_infos: list[TensorPointerInfo],
-        skip_cuda_sync: bool = False,
-    ):
-        if not skip_cuda_sync and self._on_cuda:
-            torch.cuda.default_stream().synchronize()
-        # Producer's completion event is already waited on upstream, so the
-        # source tensors are device-visible on entry. Running the D2H on a
-        # dedicated stream keeps .cpu()'s host-wait bounded by the copy
-        # itself instead of stalling behind GPU(N+1) on the default stream.
-        ctx = (
-            torch.cuda.stream(self._d2h_stream)
-            if self._d2h_stream is not None
-            else _nullcontext()
-        )
-        with ctx:
-            for info in tensor_infos:
-                self._write_one(request_id, info.uuid)
-
-    def register_for_send_uuids(
-        self,
-        per_request: ParallelList[Rid, list[int]],
-        skip_cuda_sync: bool = False,
-    ):
-        """Uuid-driven form. This path reads nothing off a descriptor but the
-        uuid, so taking uuids avoids rebuilding one per tensor."""
-        if not skip_cuda_sync and self._on_cuda:
-            torch.cuda.default_stream().synchronize()
-        ctx = (
-            torch.cuda.stream(self._d2h_stream)
-            if self._d2h_stream is not None
-            else _nullcontext()
-        )
-        with ctx:
-            for request_id, uuids in per_request:
-                for uuid in uuids:
-                    self._write_one(request_id, uuid)
-
-    def _write_one(self, request_id: Rid, uuid: int) -> None:
-        """Serialize one tensor to its per-uuid file. The caller owns the
-        CUDA sync and the copy-stream context."""
-        if self.tensor_store.is_registered(uuid):
-            return
-        tensor = self._send_source(uuid)
-        t0 = time.perf_counter()
-        data = _serialize_tensor(tensor)
-        path = self._shm_path(self.my_entity_id, uuid)
-        self._write_shm_file(path, data)
-        self._shm_files[uuid] = path
-        self.tensor_store.set_metadata(uuid, mem_registered=True)
-        if self.enable_prof:
-            # SHM: the serialize + file write IS the send work.
-            self._record_tx(request_id, uuid, len(data), time.perf_counter() - t0)
-        logger.debug("SHM: wrote tensor %s to %s (%d bytes)", uuid, path, len(data))
-
-    def start_read_tensors(
-        self, request_id: Rid, graph_edges: list[GraphEdge],
-        graph_walk: str | None = None
-    ):
-        if not any(e.tensor_info for e in graph_edges):
-            return []  # signal-only edges: no stream context to pay for
-        # Run H2D copies on a dedicated stream so they overlap with the
-        # consumer's in-flight default-stream work. We make default wait
-        # for the H2D stream at the end so downstream kernels see the data.
-        h2d_did_work = False
-        stats = self.transfer_stats
-        ctx = (
-            torch.cuda.stream(self._h2d_stream)
-            if self._h2d_stream is not None
-            else _nullcontext()
-        )
-        with ctx:
-            for graph_edge in graph_edges:
-                if len(graph_edge.tensor_info) == 0:
-                    continue
-                logger.debug(
-                    "SHM: starting read of %d tensors %s for graph node %s",
-                    len(graph_edge.tensor_info), graph_edge.name, graph_edge.next_node,
-                )
-                rx_t0 = time.perf_counter()
-                fp = FutureAndPointers(
-                    future=None, graph_edges=[graph_edge], request_id=request_id,
-                )
-                for info in graph_edge.tensor_info:
-                    if info.source_entity == self.my_entity_id:
-                        self._slice_existing_tensor(
-                            request_id=request_id, name=graph_edge.name,
-                            next_node=graph_edge.next_node,
-                            graph_walk=graph_walk, info=info
-                        )
-                        self.tensor_store.increment_ref(info.uuid, 1)
-                        continue
-                    producer_uuid = info.uuid
-                    if self._take_cached_read(request_id, info):
-                        continue
-                    if info.shm_segment is not None:
-                        raise RuntimeError(
-                            f"tensor {producer_uuid} from {info.source_entity} "
-                            "was staged in an SHM arena, which only "
-                            "ArenaShmCommunicationManager reads; this manager "
-                            "reads the per-uuid files the arena spills")
-                    path = self._shm_path(info.source_entity, producer_uuid)
-                    with open(path, "rb") as f:
-                        f.seek(info.offset)
-                        data = f.read(info.nbytes)
-                    tensor = _deserialize_tensor(data, self.device, tensor_info=info)
-                    h2d_did_work = True
-                    self.tensor_store.put_tensor(request_id, info.uuid, tensor, info)
-                    self.tensor_store.set_metadata(info.uuid, mem_registered=False)
-                    # +1 for transit (released by get_ready_tensors)
-                    # +1 for graph-node usage (released by _cleanup_consumed_inputs)
-                    self.tensor_store.increment_ref(info.uuid, 2)
-                    if stats is not None:
-                        fp.count_read(info)
-                    logger.debug("SHM: read tensor %s from %s", info.uuid, path)
-                fp.rx_time = time.perf_counter() - rx_t0
-                self.pending.append(fp)
-        if h2d_did_work and self._h2d_stream is not None:
-            torch.cuda.default_stream(self.device).wait_stream(self._h2d_stream)
-        return []
-
-    def _cleanup_by_uuid(self, uuid: int, registered: bool | None = None):
-        super()._cleanup_by_uuid(uuid, registered)
-        logger.debug("SHM: cleaning up tensor uuid %s", uuid)
-        if not self.tensor_store.check_uuid_presence(uuid):
-            logger.warning("SHM: cleanup tensor %s, uuid not found", uuid)
-            return
-        if uuid in self._shm_files:
-            path = self._shm_files.pop(uuid)
-            try:
-                os.unlink(path)
-                logger.debug("SHM: unlinked %s", path)
-            except FileNotFoundError:
-                pass
-        self.tensor_store.remove_tensor(uuid)
-
-    def unlink_owned_files(self) -> None:
-        """Unlink every tensor file this manager wrote that is still waiting
-        for its TENSOR_RECEIVED or REMOVE_REQUEST, for a process that is
-        stopping. A second call finds nothing left."""
-        files = self._shm_files
-        # The orphan watchdog's thread can run this at the same time, so each
-        # path is taken by one caller, and put back for the retry if a stop
-        # cuts its unlink.
-        while True:
-            try:
-                uuid, path = files.popitem()
-            except KeyError:
-                break
-            try:
-                os.unlink(path)
-            except OSError:
-                # Already gone (FileNotFoundError) or not removable: either
-                # way, keep going so the rest are still reclaimed.
-                pass
-            except BaseException:
-                files[uuid] = path
-                raise
-
-
-# ---------------------------------------------------------------------------
 # Factory
 # ---------------------------------------------------------------------------
 
@@ -2974,7 +2612,7 @@ def create_tensor_communication_manager(
     (``host_copy.HostCopier``).
     """
     if protocol == CommProtocol.SHM:
-        # Imported here: arena.py builds on this module's file manager.
+        # Imported here: arena.py builds on this module's base manager.
         from mstar.communication.arena import ArenaShmCommunicationManager
 
         return ArenaShmCommunicationManager(

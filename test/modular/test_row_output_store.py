@@ -3,7 +3,7 @@ stored from one row's description and the stop check's host rows."""
 import pytest
 import torch
 
-from mstar.communication.tensors import SharedMemoryCommunicationManager
+from mstar.communication.arena import ArenaShmCommunicationManager
 from mstar.model.submodule_base import BatchedModelOutput, HostRows
 
 SIGNALS = ["text_inputs", "new_token"]
@@ -14,9 +14,10 @@ def _manager(tmp_path):
         def send(self, *args, **kwargs):
             pass
 
-    return SharedMemoryCommunicationManager(
+    return ArenaShmCommunicationManager(
         my_entity_id="worker_0", hostname="localhost", device="cpu",
         communicator=_NullCommunicator(), shm_dir=str(tmp_path),
+        use_arena=False,
     )
 
 
