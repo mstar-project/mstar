@@ -597,7 +597,8 @@ def test_the_host_lengths_of_a_graph_indexed_step_match_the_host_plan():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="the kernel runs on CUDA")
-def test_the_graph_built_page_arrays_match_the_host_lengths_and_the_block_table():
+@pytest.mark.parametrize("appends", [True, False])
+def test_the_graph_built_page_arrays_match_the_host_lengths_and_the_block_table(appends):
     from mstar.engine.resources.attn.wrappers import FlashInferDecodeWrapper
     from mstar.engine.resources.kv.resident import KVResidentTables
 
@@ -622,17 +623,21 @@ def test_the_graph_built_page_arrays_match_the_host_lengths_and_the_block_table(
         _paged_kv_last_page_len_buf=torch.full((bs,), -1, dtype=torch.int32, device=cuda),
     )
     FlashInferDecodeWrapper.gather_resident(
-        SimpleNamespace(attn_wrapper=attn, page_size=page), store, slots, kv_len, stride, block_col,
+        SimpleNamespace(attn_wrapper=attn, page_size=page), store, slots, kv_len, stride, block_col, appends=appends,
     )
 
     host_len = torch.zeros(6, dtype=torch.long).numpy()
     for slot, n in lens.items():
         host_len[slot] = n
-    tables = SimpleNamespace(host_len=host_len, page_size=page, _qo_indptr={})
-    want = KVResidentTables.decode_indptrs(tables, SimpleNamespace(slots=torch.tensor(order).numpy()), bs)
+    tables = SimpleNamespace(host_len=host_len, page_size=page, key="kv", _qo_indptr={})
+    streams = {"kv": SimpleNamespace(reads=not appends)}
+    plan = SimpleNamespace(slots=torch.tensor(order).numpy(), writes=SimpleNamespace(streams=streams))
+    want = KVResidentTables.decode_indptrs(tables, plan, bs)
     assert attn._paged_kv_indptr_buf.tolist() == want.paged_kv_indptr.tolist()
     assert attn._paged_kv_last_page_len_buf.tolist() == want.paged_kv_last_page_len.tolist()
-    pages = [list(range(100 * s, 100 * s + lens[s] // page + 1)) for s in order] + [[SINK_PAGE]] * (bs - len(order))
+    read = {s: max(lens[s] + appends, 1) for s in order}
+    pages = [list(range(100 * s, 100 * s + (read[s] - 1) // page + 1)) for s in order]
+    pages += [[SINK_PAGE]] * (bs - len(order))
     end = int(want.paged_kv_indptr[-1])
     assert attn._paged_kv_indices_buf[:end].tolist() == [p for row in pages for p in row]
 
@@ -1687,9 +1692,14 @@ def test_cross_attention_over_its_own_context_pool_runs_on_the_planner():
     assert manager.resident_refusal() is None
     manager._query_kv_cache_name = "ctx"
     assert "second stream" in manager.resident_refusal()
-    step = SimpleNamespace(reads_tables=False, host_planned=False)
+    manager._query_kv_cache_name = "kv"
+    manager._cg_plan_states = {}
+    streams = {"kv": SimpleNamespace(label="main")}
+    step = SimpleNamespace(
+        reads_tables=False, host_planned=False, bucket="b", slot=0, streams=streams, lengths_only=set(),
+    )
     FlashInferCrossManager.resident_gather(manager, step)
-    assert step.host_planned and not step.reads_tables
+    assert step.host_planned and not step.reads_tables and not step.lengths_only
 
 
 # ---- refusals ----
@@ -1996,3 +2006,39 @@ def test_cross_attention_packs_a_resident_steps_queries_off_its_rows():
     assert list(packings) == ["main"]
     assert packings["main"].request_ids == [3, 5, 9]
     assert packings["main"].qo_indptr.tolist() == [0, 1, 2, 3]
+
+
+def test_cross_attention_schedules_a_context_once_per_lengths():
+    """A context's schedule reads only its lengths, so a steady step plans nothing; a full
+    plan on the wrapper in between starts over."""
+    from mstar.engine.resources.attn.cross import FlashInferCrossManager
+
+    cross = FlashInferCrossManager.__new__(FlashInferCrossManager)
+    cross._kv_cache_name, cross._query_kv_cache_name, cross._context_label = "ctx", "kv", "context"
+    cross._resident_qo_indptr, cross._scheduled_lens, cross._last_plans = {}, {}, {}
+    cross._current_plan_states, cross._preplan_states, cross._preplanned = {}, {}, False
+    cross.reset_default_cursors = lambda: None
+    planned = []
+    wrapper = SimpleNamespace(plan_schedule=lambda indptr, lens: planned.append(lens.tolist()))
+    cross._wrapper_for = lambda *args, **kwargs: ("key", wrapper)
+    lease = SimpleNamespace(bucket="bucket", slot=0)
+    resident = SimpleNamespace(lengths_only={("bucket", "ctx")})
+    streams = {"kv": SimpleNamespace(label="main")}
+
+    def plan(lens):
+        out = SimpleNamespace(cpu_indptrs=SimpleNamespace(
+            paged_kv_indptr=torch.arange(len(lens) + 1, dtype=torch.int32),
+            kv_lens=torch.tensor(lens, dtype=torch.int32),
+        ))
+        cross.plan(SimpleNamespace(segments=None, context_only=False), SimpleNamespace(
+            slot_lease=lease, is_preplan=False, plan_phase="res.plan", resident=resident,
+            resident_plan=SimpleNamespace(writes=SimpleNamespace(streams=streams)),
+            padded_request_ids=list(range(len(lens))), plan_results={"ctx": {"context": out}}, slot=0,
+            force_prefill=False,
+        ))
+
+    plan([1500, 1500, 1])
+    plan([1500, 1500, 1])
+    assert planned == [[1500, 1500, 1]]
+    plan([1500, 1, 1])
+    assert planned == [[1500, 1500, 1], [1500, 1, 1]]

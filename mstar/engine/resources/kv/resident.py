@@ -112,15 +112,16 @@ class KVResidentTables:
 
     def decode_indptrs(self, plan: ResidentPlan, bs: int) -> PagedIndptrs:
         """The host half of a step whose graph builds the page arrays: each
-        row's page count and length, the step's token included, in its row
-        order. Padding rows read the trash row, one sink page of no stored
-        tokens, as the graph does. No page indices."""
+        row's page count and length, in its row order, with the step's token
+        unless it only reads the stream. A row with nothing to read, as a
+        padding row on the trash row, reads one sink page token, as the graph
+        does. No page indices."""
         stored = self.host_len[plan.slots]
         n = stored.shape[0]
+        appends = not plan.writes.streams[self.key].reads
         lens = np.ones(bs, dtype=np.int32)
-        lens[:n] = stored + 1
-        pages = np.ones(bs, dtype=np.int32)
-        pages[:n] = stored // self.page_size + 1
+        lens[:n] = np.maximum(stored + appends, 1)
+        pages = (lens - 1) // self.page_size + 1
         indptr = np.zeros(bs + 1, dtype=np.int32)
         np.cumsum(pages, out=indptr[1:])
         qo = self._qo_indptr.get(bs)
