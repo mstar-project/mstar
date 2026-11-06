@@ -1,8 +1,9 @@
 
-from collections.abc import Callable, Collection, KeysView, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Iterator, KeysView, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, ClassVar, NamedTuple
+from itertools import chain, repeat
+from typing import Any, ClassVar, NamedTuple, overload
 
 # The graph walk on a piecewise region's step context: the region declares, plans and
 # commits its own step inside the enclosing forward's (see accelerator_graph_runner).
@@ -10,25 +11,203 @@ PIECEWISE_WALK = "__piecewise__"
 
 
 class Segment(NamedTuple):
-    """One step's addition to a request's cache stream.
+    """One step's addition to a request's cache stream: one row of `Segments`.
 
-    A request contributes one segment per label active for it in a step;
-    the batch's ordered segment list defines the layout of per-token
-    arrays. ``span`` may be 0: a zero-span segment reads its stream
-    without extending it (admission reserves nothing, commit is a no-op).
-
-    A NamedTuple, not a frozen dataclass: one is built per request per
-    step, and the frozen dataclass's ``object.__setattr__``-per-field
-    __init__ is the expensive way to do that.
+    A request contributes one segment per label active for it in a step; the
+    batch's ordered segments define the layout of per-token arrays. ``span``
+    may be 0: a zero-span segment reads its stream without extending it
+    (admission reserves nothing, commit is a no-op).
     """
     request_id: str
     label: str
     span: int
 
+
+_set = object.__setattr__
+
+
+def _uniform(column: tuple, rows: int, name: str):
+    """``column``'s one value when every row holds it, else ``column``."""
+    if len(column) != rows:
+        raise ValueError(f"Segments: {len(column)} {name} for {rows} request ids")
+    return column[0] if rows and column.count(column[0]) == rows else column
+
+
+class Segments(Sequence[Segment]):
+    """A step's segments as columns, in row order.
+
+    Immutable, and compared and hashed by value, so resources can share one and
+    a staged step can be matched against a re-declared one. A column every row
+    agrees on is always held as its one value (``labels`` a ``str``, ``spans``
+    an ``int``), so asking about it is O(1): ``segments.spans == 1`` is "every
+    row is one token", ``== 0`` "no row writes". An empty ``Segments`` answers
+    no to both; test its truth first if that matters.
+
+    It reads as a sequence of `Segment`s for code that wants rows, which are
+    built once on first use. A hot path reads the columns or ``rows()`` instead.
+    """
+
+    __slots__ = ("request_ids", "labels", "spans", "_rows")
+
+    request_ids: tuple[int, ...]
+    labels: str | tuple[str, ...]
+    spans: int | tuple[int, ...]
+
+    def __init__(
+        self, request_ids: Iterable[int], labels: str | Iterable[str] = "main", spans: int | Iterable[int] = 1,
+    ):
+        """``labels`` and ``spans`` are one value for every row, or one per row."""
+        rids = tuple(request_ids)
+        rows = len(rids)
+        if not isinstance(labels, str):
+            labels = _uniform(tuple(labels), rows, "labels")
+        if type(spans) is not int and hasattr(spans, "__iter__"):
+            spans = _uniform(tuple(spans), rows, "spans")
+        if not rows:
+            labels, spans = "", 0
+        _set(self, "request_ids", rids)
+        _set(self, "labels", labels)
+        _set(self, "spans", spans)
+        _set(self, "_rows", None)
+
+    @classmethod
+    def of_inputs(cls, request_ids: Iterable[int], inputs: Iterable, label: str = "main") -> "Segments":
+        """The usual declaration: one row per request under ``label``, each as
+        long as its input's ``input_seq_len``."""
+        return cls(request_ids, label, [inp.input_seq_len for inp in inputs])
+
+    @classmethod
+    def from_rows(cls, rows: "Iterable[Segment]") -> "Segments":
+        """``rows`` as columns, row order kept; a `Segments` as it is."""
+        if type(rows) is cls:
+            return rows
+        rows = tuple(rows)
+        if not rows:
+            return cls(())
+        out = cls(*zip(*rows, strict=False))
+        # the caller's own rows, so reading them back builds nothing
+        if type(rows[0]) is Segment:
+            _set(out, "_rows", rows)
+        return out
+
+    @classmethod
+    def concat(cls, parts: "Iterable[Segments]") -> "Segments":
+        """``parts`` one after another."""
+        parts = [part for part in parts if part]
+        if len(parts) == 1:
+            return parts[0]
+        return cls(
+            chain.from_iterable(part.request_ids for part in parts),
+            chain.from_iterable(part.label_column() for part in parts),
+            chain.from_iterable(part.span_column() for part in parts),
+        )
+
+    def label_column(self) -> tuple[str, ...]:
+        labels = self.labels
+        return labels if type(labels) is tuple else (labels,) * len(self.request_ids)
+
+    def span_column(self) -> tuple[int, ...]:
+        spans = self.spans
+        return spans if type(spans) is tuple else (spans,) * len(self.request_ids)
+
+    def rows(self) -> Iterator[tuple[int, str, int]]:
+        """``(request_id, label, span)`` per row, as plain tuples: the rows
+        without building a `Segment` per row. A one-shot iterator."""
+        labels, spans = self.labels, self.spans
+        return zip(
+            self.request_ids,
+            labels if type(labels) is tuple else repeat(labels),
+            spans if type(spans) is tuple else repeat(spans),
+            strict=False,
+        )
+
+    def pairs(self) -> Iterator[tuple[int, str]]:
+        """``(request_id, label)`` per row: the streams the rows are on."""
+        labels = self.labels
+        return zip(self.request_ids, labels if type(labels) is tuple else repeat(labels), strict=False)
+
+    def group_by_label(self) -> "dict[str, Segments]":
+        """Label -> its rows in row order, labels in order of first appearance."""
+        labels = self.labels
+        if type(labels) is not tuple:
+            return {labels: self} if self.request_ids else {}
+        rows_of: dict[str, list[int]] = {}
+        for row, label in enumerate(labels):
+            rows_of.setdefault(label, []).append(row)
+        rid_at, spans = self.request_ids.__getitem__, self.spans
+        return {
+            label: Segments(map(rid_at, rows), label, map(spans.__getitem__, rows) if type(spans) is tuple else spans)
+            for label, rows in rows_of.items()
+        }
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        raise AttributeError("Segments is immutable")
+
+    def __len__(self) -> int:
+        return len(self.request_ids)
+
+    def __bool__(self) -> bool:
+        return bool(self.request_ids)
+
+    def __iter__(self) -> Iterator[Segment]:
+        rows = self._rows
+        if rows is None:
+            # racing threads each build the same rows; either result will do
+            rows = tuple(map(Segment._make, self.rows()))
+            _set(self, "_rows", rows)
+        return iter(rows)
+
+    @overload
+    def __getitem__(self, i: int) -> Segment: ...
+    @overload
+    def __getitem__(self, i: slice) -> "Segments": ...
+    def __getitem__(self, i):
+        labels, spans = self.labels, self.spans
+        if type(i) is slice:
+            return Segments(
+                self.request_ids[i],
+                labels[i] if type(labels) is tuple else labels,
+                spans[i] if type(spans) is tuple else spans,
+            )
+        return Segment(
+            self.request_ids[i],
+            labels[i] if type(labels) is tuple else labels,
+            spans[i] if type(spans) is tuple else spans,
+        )
+
+    def __eq__(self, other: object) -> bool:
+        if type(other) is Segments:
+            return self is other or (
+                self.spans == other.spans and self.labels == other.labels and self.request_ids == other.request_ids
+            )
+        # rows compare by value too, and hash as the same rows in a tuple do
+        if isinstance(other, (list, tuple)):
+            return tuple(self) == tuple(other)
+        return NotImplemented
+
+    def __hash__(self) -> int:
+        return hash(tuple(self))
+
+    def __reduce__(self):
+        return Segments, (self.request_ids, self.labels, self.spans)
+
+    def __repr__(self) -> str:
+        return f"Segments({self.request_ids!r}, {self.labels!r}, {self.spans!r})"
+
+
+NO_SEGMENTS = Segments(())
+
+
 @dataclass(frozen=True)
 class ResourceStep:
-    # Work for one resource, for one step
-    segments: tuple[Segment, ...] | None = None
+    # Work for one resource, for one step. Rows of `Segment`s are accepted and
+    # held as columns.
+    segments: Segments | None = None
+
+    def __post_init__(self):
+        segments = self.segments
+        if segments is not None and type(segments) is not Segments:
+            _set(self, "segments", Segments.from_rows(segments))
 
 @dataclass(frozen=True)
 class BucketKey:
@@ -146,6 +325,13 @@ class StepContext:
         self._padded_request_ids = padded_rids
         self._real_rids = None
 
+    def real_rids(self) -> frozenset:
+        """``request_ids`` as a set."""
+        real = self._real_rids
+        if real is None:
+            real = self._real_rids = frozenset(self.request_ids)
+        return real
+
     def is_real_row(self, rid: str) -> bool:
         """Whether ``rid`` is one of this step's real requests."""
         real = self._real_rids
@@ -184,8 +370,8 @@ class SubmoduleStep:
     steps: dict[str, ResourceStep] # resource key -> step within cumulative
 
     # used for convenience only: if a ResourceStep does not specify segments,
-    # it gets this list
-    segments: list[Segment] | None = None
+    # it gets these. Rows of `Segment`s are accepted and held as columns.
+    segments: Segments | None = None
 
     # Matches additional_key_info in CudaGraphConfig
     cg_key_info: Any | None = None
@@ -193,11 +379,15 @@ class SubmoduleStep:
     _ctx: StepContext = None # set by the engine
 
     def __post_init__(self):
-        if self.segments is None:
+        segments = self.segments
+        if segments is None:
             return
+        if type(segments) is not Segments:
+            segments = Segments.from_rows(segments)
+            _set(self, "segments", segments)
         for step in self.steps.values():
             if step.segments is None:
-                object.__setattr__(step, "segments", self.segments)
+                _set(step, "segments", segments)
 
     @property
     def ctx(self):
