@@ -62,7 +62,8 @@ from mstar.engine.state.adapters import (
     state_steps,
 )
 from mstar.engine.state.analysis import deployment_problems
-from mstar.engine.state.calls import ArrayHandle, SamplerHandle, WithinStepHandle
+from mstar.engine.state.calls import ArrayHandle, SamplerHandle
+from mstar.engine.state.within_step import WithinStepHandle
 from mstar.model.base import LabelLayout, Model
 from mstar.model.submodule_base import ARNodeSubmodule, DeviceLoopback, NodeInputs, NodeSubmodule, engine_step
 
@@ -120,7 +121,7 @@ def _handles(*declarations, node="LLM") -> dict:
         "kv": _StubKV(), "attn": SimpleNamespace(), "local": SimpleNamespace(), "global": SimpleNamespace(),
         "rope": SimpleNamespace(), "kv_pos": SimpleNamespace(), "other_pos": SimpleNamespace(),
         "other_kv": _StubKV(), "gdn": _StubPool(), "linear": SimpleNamespace(), "conv": None,
-        "sampler": SimpleNamespace(), "vision_attn": SimpleNamespace(),
+        "sampler": SimpleNamespace(), "vision_attn": SimpleNamespace(run=lambda *args, **kwargs: None),
     }
     return node_handles(_StubModel(*declarations), node, resources)
 
@@ -739,11 +740,11 @@ class _EngineNode(NodeSubmodule):
 
 
 def _load_engine(monkeypatch, node, model):
-    monkeypatch.setattr(engine_module, "node_handles", lambda model, name, resources: {"kv": name})
+    monkeypatch.setattr(engine_module, "node_handles", lambda model, name, resources, **kwargs: {"kv": name})
     joint = SimpleNamespace(world_size=1, tp_group=SimpleNamespace(barrier=lambda: None))
     groups = SimpleNamespace(
         get_joint_group_for_node=lambda name: joint, get_instance_world_size_for_node=lambda name: 1,
-        get_instance_rank_for_node=lambda name: 0,
+        get_instance_rank_for_node=lambda name: 0, get_sp_config_for_node=lambda name: None,
     )
     engine = Engine(None, autocast_dtype=None)
     engine.load_model(

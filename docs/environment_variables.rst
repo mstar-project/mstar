@@ -742,7 +742,9 @@ Worker scheduling
        the streams holding the pages, the reservations against the free and evictable
        pages, and each commit against its request's layout. A recurrent snapshot's key is
        checked against the KV chain's key at its boundary. Logs a label left under its
-       footprint at removal. Tests and debugging only.
+       footprint at removal. Around each state op that runs its fused kernel in an eager
+       step, checks that the array changed only at the step's slots, through a host copy
+       of the array. Tests and debugging only.
 
 Compilation
 -----------

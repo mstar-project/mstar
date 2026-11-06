@@ -1,13 +1,19 @@
 """Today's specs, steps and layouts, built from declarations, so everything downstream of them sees the same objects."""
 
-from collections.abc import Mapping, Sequence
-from dataclasses import asdict, replace
+from collections.abc import Collection, Mapping, Sequence
+from dataclasses import asdict, astuple, replace
 from typing import TYPE_CHECKING, Any
 
 import torch
 
+from mstar.distributed.communication import CommGroup
 from mstar.engine.resources.attn.config import AttentionConfig, AttentionSpec, AttentionStep
-from mstar.engine.resources.attn.ragged.config import RaggedAttentionConfig, RaggedAttentionSpec
+from mstar.engine.resources.attn.ragged.config import (
+    RaggedAttentionConfig,
+    RaggedAttentionSpec,
+    RaggedCrossAttentionSpec,
+    RaggedCrossAttentionStep,
+)
 from mstar.engine.resources.kv.config import KVSpec, KVStep, PagedKVConfig
 from mstar.engine.resources.linear_attn.config import (
     LinearAttnConfig,
@@ -24,20 +30,21 @@ from mstar.engine.resources.recurrent.config import (
 )
 from mstar.engine.resources.sampler.config import SamplerSpec, SamplerStep, SamplingReqConfig
 from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig
-from mstar.engine.resources.step import SubmoduleStep
+from mstar.engine.resources.step import Segment, SubmoduleStep
 from mstar.engine.state.analysis import position_key
-from mstar.engine.state.calls import ArrayHandle, SamplerHandle, WithinStepHandle
+from mstar.engine.state.calls import ArrayHandle, SamplerHandle
 from mstar.engine.state.contract import (
     EMPTY,
     Array,
     ArrayStep,
     Attend,
-    Block,
     Causal,
     CausalConv,
+    Entry,
     GatedDeltaNet,
     KVEntry,
     Layout,
+    Read,
     Sampler,
     SampleSettings,
     SampleStep,
@@ -45,39 +52,44 @@ from mstar.engine.state.contract import (
     Window,
     is_value,
 )
+from mstar.engine.state.host import HostFields
+from mstar.engine.state.within_step import WithinStepHandle
 
 if TYPE_CHECKING:
     from mstar.model.base import LabelLayout, Model
 
 
-def node_resources(model: "Model") -> list[NodeResourceSpec]:
+def node_resources(model: "Model", *, sdpa_nodes: Collection[str] = frozenset()) -> list[NodeResourceSpec]:
     """The specs ``model`` declares through `declare_state`, then the ones it writes by hand."""
-    specs = build_specs(model.declare_state(), kernel_settings=model.kernel_settings())
+    specs = build_specs(model.declare_state(), kernel_settings=model.kernel_settings(), sdpa_nodes=sdpa_nodes)
     return specs + list(model.get_node_resources() or [])
 
 
 def build_specs(
     declarations: Sequence[Array | Sampler], *, kernel_settings: Mapping[str, Mapping[str, Any]] = EMPTY,
+    sdpa_nodes: Collection[str] = frozenset(),
 ) -> list[NodeResourceSpec]:
     """One pool per array that keeps entries, under its name, one `AttentionSpec` per read and one `LinearAttnSpec`
-    per `GatedDeltaNet`, each under its key, one `RaggedAttentionSpec` per read of an array with ``max_len`` 0, and one
-    `PositionSpec` and `SamplerSpec` for each that declares them.
+    per `GatedDeltaNet`, each under its key, one ragged spec per kind of read of the arrays with ``max_len`` 0 (see
+    `_within_step_specs`), and one `PositionSpec` and `SamplerSpec` for each that declares them. A node in
+    ``sdpa_nodes`` builds no ragged spec, since its reads run SDPA.
 
     Raises ``ValueError`` on an array today's specs can't hold, naming what they lack.
     """
     arrays = [declared for declared in declarations if isinstance(declared, Array)]
+    by_read = _within_step_specs(arrays)
     specs: list[NodeResourceSpec] = []
     for array in arrays:
         if array.rewritable:
             specs += _value_specs(array, arrays)
         elif array.max_len:
             specs += _kv_specs(array)
-        else:
-            specs += _within_step_specs(array)
+        elif not array.nodes <= sdpa_nodes:
+            specs += [by_read[key] for key in array.reads if by_read[key].resource_key == key]
         if array.positions is not None:
             specs.append(_position_spec(array))
     specs += [_sampler_spec(declared) for declared in declarations if isinstance(declared, Sampler)]
-    _apply_kernel_settings(specs, arrays, kernel_settings)
+    _apply_kernel_settings(specs, arrays, by_read, kernel_settings)
     return specs
 
 
@@ -89,12 +101,14 @@ def _kv_shape(array: Array) -> tuple[int, ...]:
     k = array.entry.tensors.get("k")
     if k is None or len(k.shape) != 2 or array.entry != KVEntry(heads=k.shape[0], head_dim=k.shape[1]):
         raise _no_layout(array, "entry must be a KVEntry, all PagedKVConfig holds: k and v of one shape, sharded on "
-                                "their heads, with no dtype and no host field")
+                                "their heads, with no dtype")
     return k.shape
 
 
 def _kv_specs(array: Array) -> list[NodeResourceSpec]:
     heads, head_dim = _kv_shape(array)
+    if array.seq_sharded or any(read.queries is not None for read in array.reads.values()):
+        raise _no_layout(array, "seq_sharded and queries take max_len 0, and today's paged reads attend their own pool")
     if not array.reads:
         raise _no_layout(array, "reads is empty, and PagedKVConfig needs num_qo_heads from an Attend read")
     for key, read in array.reads.items():
@@ -129,20 +143,47 @@ def _kv_specs(array: Array) -> list[NodeResourceSpec]:
     return specs
 
 
-def _within_step_specs(array: Array) -> list[NodeResourceSpec]:
-    heads, head_dim = _kv_shape(array)
+def _within_step_specs(arrays: Sequence[Array]) -> dict[str, NodeResourceSpec]:
+    """The ragged spec of each read of an array with ``max_len`` 0, a `RaggedCrossAttentionSpec` for a read with
+    ``queries``. Reads of one kind, on one node set and with one config share the spec of the first of them, under its
+    key, so each read is a plan on that resource rather than a resource of its own."""
+    sharded_nodes = {node for array in arrays if array.seq_sharded for node in array.nodes}
+    by_name = {array.name: array for array in arrays}
+    by_read: dict[str, NodeResourceSpec] = {}
+    shared: dict[tuple, NodeResourceSpec] = {}
+    for array in arrays:
+        if array.max_len or array.rewritable:
+            continue
+        (key, read), heads, head_dim, dtype = _within_step_read(array)
+        queried = by_name.get(read.queries, array)
+        config = RaggedAttentionConfig(
+            num_qo_heads=read.op.q_heads, num_kv_heads=heads, head_dim=head_dim, dtype=dtype,
+            # the heads narrow by SP only where the exchange runs over them
+            shard_over_sp=not array.nodes & sharded_nodes or (array.seq_sharded and queried.seq_sharded),
+        )
+        spec_class = RaggedAttentionSpec if read.queries is None else RaggedCrossAttentionSpec
+        spec = spec_class(resource_key=key, nodes=array.nodes, config=config)
+        by_read[key] = shared.setdefault((spec_class, array.nodes, astuple(config)), spec)
+    return by_read
+
+
+def _within_step_read(array: Array) -> tuple[tuple[str, Read], int, int, torch.dtype | None]:
+    """``array``'s one read, its heads and head dim, and its dtype, None for the compute dtype."""
+    k = array.entry.tensors.get("k")
+    if k is None or len(k.shape) != 2 or k.shard != 0 or array.entry != Entry({"k": k, "v": k}):
+        raise _no_layout(array, "entry must be a KVEntry, which may declare one dtype, all RaggedAttentionConfig holds")
     if len(array.reads) != 1:
         raise _no_layout(array, f"max_len 0 needs one read, the one RaggedAttentionConfig runs, and it has "
                                 f"{sorted(array.reads)}")
+    if len(array.labels) != 1:
+        raise _no_layout(array, f"max_len 0 takes one label, since a plan holds one per call, and it has "
+                                f"{sorted(array.labels)}")
     ((key, read),) = array.reads.items()
     if not isinstance(read.op, Attend):
         raise _no_layout(array, f"reads[{key!r}].op must be Attend, the only read RaggedAttentionConfig runs")
     if read.walks is not None:
         raise _no_layout(array, f"reads[{key!r}].walks must be None, since RaggedAttentionConfig has no walk")
-    return [RaggedAttentionSpec(
-        resource_key=key, nodes=array.nodes,
-        config=RaggedAttentionConfig(num_qo_heads=read.op.q_heads, num_kv_heads=heads, head_dim=head_dim),
-    )]
+    return (key, read), k.shape[0], k.shape[1], k.dtype
 
 
 def _position_spec(array: Array) -> PositionSpec:
@@ -168,8 +209,13 @@ def _sampler_spec(sampler: Sampler) -> SamplerSpec:
 def _value_specs(array: Array, arrays: Sequence[Array]) -> list[NodeResourceSpec]:
     if not is_value(array):
         raise _no_layout(array, "a rewritable array longer than one entry has no spec")
+    if array.entry.host and not array.entry.tensors:
+        # the engine holds a host field, so no resource does
+        return []
     if array.reads:
         raise _no_layout(array, "reads must be empty, since RecurrentStateConfig has no read")
+    if array.seq_sharded:
+        raise _no_layout(array, "seq_sharded takes max_len 0, and a Value's entries stay whole on each rank")
     if set(array.entry.tensors) != {"state", "conv"} or array.entry.host:
         raise _no_layout(array, "entry must be exactly state and conv, the blocks DeltaNetGeometry reads")
     deltas = [(key, op) for key, op in array.updates.items() if isinstance(op, GatedDeltaNet)]
@@ -229,7 +275,8 @@ def _state_block(state: TensorType) -> RecurrentBlockConfig:
 
 
 def _apply_kernel_settings(
-    specs: Sequence[NodeResourceSpec], arrays: Sequence[Array], kernel_settings: Mapping[str, Mapping[str, Any]],
+    specs: Sequence[NodeResourceSpec], arrays: Sequence[Array], by_read: Mapping[str, NodeResourceSpec],
+    kernel_settings: Mapping[str, Mapping[str, Any]],
 ) -> None:
     """Set the kernel choices and capture sizes the contract leaves to the engine, and refuse any other, so this hook
     can't carry physical choices until the engine picks kernels itself."""
@@ -242,40 +289,61 @@ def _apply_kernel_settings(
             raise ValueError(f"kernel_settings[{key!r}] names no read or GatedDeltaNet update of the declarations, "
                              f"which have {sorted(owners)}")
         if not owners[key].max_len:
-            allowed = {"max_segments_per_step", "compile_op"}
+            allowed = {"max_segments_per_request", "max_segments_per_step", "compile_op", "workspace_mb"}
         else:
             allowed = {"splits", "decode_fmha"} if key in reads else {"splits"}
         refused = settings.keys() - allowed
         if refused:
             raise ValueError(f"Array {owners[key].name!r}: kernel_settings[{key!r}] sets {sorted(refused)}; "
                              f"it may set only {sorted(allowed)}")
+        # a read on a node in ``sdpa_nodes`` has no spec to set
+        spec = by_key.get(by_read[key].resource_key if key in by_read else key)
         for field, value in settings.items():
-            setattr(by_key[key].config, field, value)
+            if spec is not None:
+                setattr(spec.config, field, value)
 
 
-def node_handles(model: "Model", node: str, resources: Mapping[str, Any]) -> dict[str, ArrayHandle | SamplerHandle]:
-    """``node``'s handles, by declared name, over its built ``resources``."""
+def node_handles(
+    model: "Model", node: str, resources: Mapping[str, Any], *, sp_group: CommGroup | None = None, sdpa: bool = False,
+    host_fields: HostFields | None = None,
+) -> dict[str, ArrayHandle | SamplerHandle]:
+    """``node``'s handles, by declared name, over its built ``resources``. With ``sdpa``, its reads of arrays with
+    ``max_len`` 0 have no resource and run SDPA. ``host_fields`` holds the fields of the Values that declare them."""
     declarations = model.declare_state()
-    arrays = [declared for declared in declarations if isinstance(declared, Array)]
+    arrays = {declared.name: declared for declared in declarations if isinstance(declared, Array)}
+    by_read = _within_step_specs(list(arrays.values()))
     handles: dict[str, ArrayHandle | SamplerHandle] = {}
     for declared in declarations:
         if node not in declared.nodes:
             continue
         if isinstance(declared, Sampler):
             handles[declared.name] = SamplerHandle(declared, resources[declared.name])
-        else:
+        elif declared.entry.host:
+            host_fields.declare(declared)
+            handles[declared.name] = ArrayHandle(declared, resources, None, host_fields)
+        elif declared.max_len or declared.rewritable:
             key = None if declared.positions is None else position_key(declared)
-            handle = ArrayHandle if declared.max_len else WithinStepHandle
-            handles[declared.name] = handle(declared, resources, key)
+            handles[declared.name] = ArrayHandle(declared, resources, key)
+        else:
+            ((read_key, read),) = declared.reads.items()
+            resource_key = by_read[read_key].resource_key
+            handles[declared.name] = WithinStepHandle(
+                declared, {read_key: None if sdpa else resources[resource_key]}, None, resource_key=resource_key,
+                queried=arrays.get(read.queries), sp_group=sp_group,
+            )
     return handles
 
 
 def state_steps(step: SubmoduleStep | None, handles: Mapping[str, ArrayHandle | SamplerHandle]) -> SubmoduleStep | None:
     """``step`` as a new step, with what its ``state`` declares expanded into today's step objects, built afresh for
-    each step because `SubmoduleStep` writes the segments onto them."""
+    each step because `SubmoduleStep` writes the segments onto them. None when every read it lists runs SDPA with no
+    exchange, which leaves the step nothing to do."""
     if step is None or not step.state:
         return step
+    if all(getattr(handles.get(name), "plans_nothing", False) for name in step.state):
+        return None
     steps = dict(step.steps)
+    plans: dict[str, _WithinStepPlan] = {}
     for name, declared in step.state.items():
         handle = handles.get(name)
         if isinstance(handle, SamplerHandle) and isinstance(declared, SampleStep):
@@ -286,22 +354,75 @@ def state_steps(step: SubmoduleStep | None, handles: Mapping[str, ArrayHandle | 
         elif isinstance(handle, ArrayHandle) and isinstance(declared, ArrayStep):
             if declared.segments is None and step.segments is None:
                 raise ValueError(f"Array {name!r}: a step lists it with no segments, its own or the step's")
-            _array_steps(handle, declared, step, steps)
+            if isinstance(handle, WithinStepHandle):
+                if not handle.runs_sdpa:
+                    _plan_within_step(handle, declared, step, plans.setdefault(handle.resource_key, _WithinStepPlan()))
+            else:
+                _array_steps(handle, declared, step, steps)
         else:
             raise ValueError(
                 f"a step's state[{name!r}] is a {type(declared).__name__}, and on this node {name!r} is "
                 f"{'not declared' if handle is None else type(handle).__name__}, which take an ArrayStep for an array "
                 "and a SampleStep for a sampler"
             )
+    steps.update((key, plan.step()) for key, plan in plans.items())
     expanded = replace(step, steps=steps)
     expanded.set_state_handles(tuple(handles[name] for name in step.state))
     return expanded
+
+
+class _WithinStepPlan:
+    """What the arrays sharing one ragged resource plan in one step: each label's segments, and the cross reads' pairs.
+
+    A label is one layout on the resource, so two arrays with one label have to mean the same tokens.
+    """
+
+    __slots__ = ("by_label", "pairs")
+
+    def __init__(self):
+        self.by_label: dict[str, Sequence[Segment]] = {}
+        self.pairs: list[tuple[str, str]] = []
+
+    def add(self, name: str, segments: Sequence[Segment]) -> str:
+        label = segments[0].label
+        if tuple(self.by_label.setdefault(label, segments)) != tuple(segments):
+            raise ValueError(f"Array {name!r}: label {label!r} on its resource already holds other segments")
+        return label
+
+    def step(self) -> AttentionStep | RaggedCrossAttentionStep:
+        if self.pairs:
+            return RaggedCrossAttentionStep(
+                segments=tuple(s for segments in self.by_label.values() for s in segments), pairs=tuple(self.pairs),
+            )
+        if len(self.by_label) == 1:
+            return AttentionStep(segments=next(iter(self.by_label.values())), causal=False)
+        return AttentionStep(segments=tuple(s for segments in self.by_label.values() for s in segments), causal=False)
+
+
+def _plan_within_step(
+    handle: WithinStepHandle, declared: ArrayStep, step: SubmoduleStep, plan: _WithinStepPlan,
+) -> None:
+    """Add ``handle``'s read to ``plan``, over the segments its kernel sees. A Ulysses read runs over whole segments
+    after the exchange, and any other over this rank's share of a sharded side."""
+    name = handle.name
+    segments = declared.segments or step.segments
+    if handle.queried is None:
+        plan.add(name, segments)
+        return
+    queries = step.state.get(handle.queried.name)
+    if queries is None:
+        raise ValueError(f"Array {name!r}: a step lists it without {handle.queried.name!r}, whose segments lay out its "
+                         "queries")
+    q_label = plan.add(name, handle.query_share(queries.segments or step.segments))
+    plan.pairs.append((q_label, plan.add(name, handle.key_share(segments))))
 
 
 def _array_steps(handle: ArrayHandle, declared: ArrayStep, step: SubmoduleStep, steps: dict[str, Any]) -> None:
     array, segments = handle.array, declared.segments
     pre, post, rows = _forks(array, declared)
     if is_value(array):
+        if not array.entry.tensors:
+            return
         steps[array.name] = RecurrentStep(segments=segments, pre_forks=pre, post_forks=post, fork_rids=rows)
         for key, update in array.updates.items():
             if isinstance(update, GatedDeltaNet):
@@ -312,8 +433,8 @@ def _array_steps(handle: ArrayHandle, declared: ArrayStep, step: SubmoduleStep, 
             segments=segments, commit=declared.keep, pre_forks=pre, post_forks=post, fork_rids=rows,
             sink=declared.placeholders, eager_write=declared.eager_add,
         )
-    for key, read in array.reads.items():
-        steps[key] = AttentionStep(segments=segments, causal=not isinstance(read.mask, Block))
+    for key in array.reads:
+        steps[key] = AttentionStep(segments=segments, causal=True)
     if array.positions is not None:
         # a step that keeps nothing doesn't advance the counter
         advance = declared.advance if declared.keep else (0,) * len(segments or step.segments)

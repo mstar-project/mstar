@@ -21,7 +21,8 @@ RustTensorStore; purged by force_cleanup_request), RecurrentStatePool.{_keyed,
 _leases, _restores, _snap_writes, _decode, _unkeyed, _admit_restores,
 _admit_snaps, _admit_taken, _preplan_taken, _reserved} and KDAManager._verifying
 (purged by remove_request), ResidentPlanner.{_slot_of, _stale, _moved} (purged by
-release), SamplerCells._cells (purged by the sampler's remove_request), and
+release), SamplerCells._cells (purged by the sampler's remove_request),
+HostFields._fields (purged by the engine's remove_request), and
 WorkerProfileInfo.
 
 MicroScheduler.pending_tp_follow_count is the one deliberate exception: a

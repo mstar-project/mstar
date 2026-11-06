@@ -15,7 +15,7 @@ from mstar.distributed.base import ShardingConfig
 from mstar.engine.resources.lora.config import LORA_RESOURCE_KEY, lora_enabled
 from mstar.engine.resources.lora.serving import declared_lora_specs, size_lora_specs
 from mstar.engine.state.adapters import node_resources
-from mstar.engine.state.analysis import deployment_problems, state_declaration_problems
+from mstar.engine.state.analysis import deployment_problems, sdpa_nodes, state_declaration_problems
 from mstar.model.base import Model, WorkerGraph, built_resources, parse_autocast_dtype
 from mstar.validation.client_streams import check_client_streams
 from mstar.validation.knobs import check_knobs
@@ -122,9 +122,17 @@ def validate_deployment(
         if declaration_problems:
             problems.append("the `resources:` checks, which need the declarations, were skipped")
         else:
-            specs = node_resources(model)
+            sdpa = frozenset() if malformed else sdpa_nodes(config["node_groups"])
+            specs = node_resources(model, sdpa_nodes=sdpa)
             if resources_readable:
-                problems += deployment_problems(model, config.get("resources") or {})
+                # a worker graph's `tp_size` is the instance's, TP times SP
+                head_shards = {} if deployment is None else {
+                    node: graph.tp_size for graph in deployment.worker_graphs if graph.sp_size > 1
+                    for node in graph.section.get_nodes()
+                }
+                problems += deployment_problems(
+                    model, config.get("resources") or {}, sdpa=sdpa, head_shards=head_shards,
+                )
     except (ValueError, OSError) as e:
         problems.append(
             f"declaring the node resources failed: {type(e).__name__}: {e}; "

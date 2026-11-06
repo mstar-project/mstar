@@ -2406,6 +2406,7 @@ class PiecewiseAcceleratorGraphRunner:
             data.graph.replay()
             if step is not None:
                 self._step_runner.commit(step)
+                step.commit_calls()
         finally:
             self._dummy_rows.reset(data.dummy_rids[real_bs:data.shape.bs])
 

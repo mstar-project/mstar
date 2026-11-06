@@ -1680,7 +1680,7 @@ resource (FlashInfer, FA3 on Hopper) as an opaque op inside the compiled graph,
 6% off a 1280x704x81 denoise step on an H200 against cuDNN SDPA, measured on
 an earlier version of the DiT block, before the adaLN was computed in one pass
 and the q/k norm and RoPE were fused
-(``model_kwargs: attention_backend: sdpa`` restores the reference kernel; the
+(``attention_backend: sdpa`` on the ``dit`` node group restores the reference kernel; the
 cross-attention over the 512 text tokens stays on SDPA, which is faster at that
 shape). The untiled VAE decode runs the shared Wan VAE decoder,
 channels-last and compiled (``vae_decode_fast``; set it to ``false`` under the
@@ -1790,12 +1790,11 @@ The OpenAI routes are ``POST /v1/images/generations`` (``size`` as ``WxH``, ``se
 (multipart ``image`` + ``prompt``; up to four reference images are concatenated as
 conditioning tokens, in order).
 
-Deployment knobs live under ``model_kwargs`` in ``configs/flux2_klein.yaml``:
+``attention_backend: sdpa`` on the ``dit`` node group, as the shipped configs set it, runs the
+reference kernel, cuDNN on an H100. Without it the DiT's joint attention runs on the engine's
+ragged FlashInfer resource. Both are CUDA-graph replayable.
 
-``attention_backend``
-   ``sdpa`` (default) is the reference kernel, cuDNN on an H100. ``flashinfer`` runs the
-   DiT's joint attention on the engine's ragged FlashInfer resource; both are CUDA-graph
-   replayable.
+Deployment knobs live under ``model_kwargs`` in ``configs/flux2_klein.yaml``:
 
 ``compile``
    ``torch.compile`` of the transformer, one trace per shape.

@@ -16,44 +16,57 @@ import time
 import torch
 import torch.distributed as dist
 
-from mstar.model.components.diffusion.attention import sdpa_attention
-from mstar.model.ltx2_5.components.transformer import LTX2Attends, build_rope
+from mstar.model.ltx2_5.components.transformer import build_rope
 from mstar.model.ltx2_5.config import LTX25_REPO, SNAPSHOT_PATTERNS, LTX25Config
 from mstar.model.ltx2_5.weight_loader import build_transformer
 from mstar.utils.hf_snapshot import resolve_snapshot_dir
 
 
-def ragged_attends(config, shape, batch, device, tp_size=1, sp_group=None):
-    from mstar.engine.resources import (
-        RaggedAttentionConfig,
-        RaggedAttentionSpec,
-        RaggedCrossAttentionSpec,
-        StepContext,
-    )
+def open_attention(dit, config, shape, batch, device, attention, comm_group=None, sp_group=None):
+    """Build, bind and plan what the engine would for one step of ``dit``, so the kernels are the served ones. Returns
+    the step to open around each call, or None on SDPA with no exchange, where nothing opens."""
+    from mstar.distributed.communication import CommGroup, JointGroups
     from mstar.engine.resources.base import EngineResourceInfo, build_resource
+    from mstar.engine.resources.step import StepContext
+    from mstar.engine.state.adapters import node_handles, node_resources, state_steps
     from mstar.model.ltx2_5 import submodules as S
+    from mstar.model.ltx2_5.ltx2_5_model import LTX25Model
     from mstar.model.submodule_base import NodeInputs
 
-    t = config.transformer
-    res = {}
-    video_heads = (t.num_attention_heads, t.attention_head_dim)
-    audio_heads = (t.audio_num_attention_heads, t.audio_attention_head_dim)
-    for spec_cls, key, (heads, hd) in ((RaggedAttentionSpec, S.VIDEO_ATTN, video_heads),
-                                       (RaggedAttentionSpec, S.AUDIO_ATTN, audio_heads),
-                                       (RaggedCrossAttentionSpec, S.VIDEO_XATTN, video_heads),
-                                       (RaggedCrossAttentionSpec, S.AUDIO_XATTN, audio_heads)):
-        # as the engine shards them: over TP, and the video self-attention over SP too
-        heads //= tp_size * (sp_group.world_size if sp_group is not None and key == S.VIDEO_ATTN else 1)
-        spec = spec_cls(resource_key=key, nodes={"dit"}, config=RaggedAttentionConfig(
-            num_qo_heads=heads, num_kv_heads=heads, head_dim=hd, dtype=torch.bfloat16))
-        res[key] = build_resource(spec, EngineResourceInfo(device=device, kv_dtype=torch.bfloat16))
-    sub = S.LTXDenoiseSubmodule(torch.nn.Linear(1, 1), config, loop_name="x", use_ragged_attention=True,
-                                sp_group=sp_group)
-    sub.node_resources = res
-    step = sub.declare_step("g", list(range(batch)), [NodeInputs(resource_step_info=shape)] * batch)
-    for key, r in res.items():
-        r.plan(step.steps[key], StepContext(request_ids=list(range(batch)), graph_walk="g", slot=0, capture=False))
-    return sub.attends()
+    sdpa = attention == "sdpa"
+    model = LTX25Model(skip_weight_loading=True)
+    model.set_config(config)
+    joint = JointGroups(tp_group=comm_group or CommGroup.trivial(), sp_group=sp_group or CommGroup.trivial())
+    info = EngineResourceInfo(device=device, kv_dtype=torch.bfloat16, joint_comm_group=joint)
+    resources = {
+        spec.resource_key: build_resource(spec, info)
+        for spec in node_resources(model, sdpa_nodes={"dit"} if sdpa else frozenset())
+    }
+    handles = node_handles(model, "dit", resources, sp_group=sp_group, sdpa=sdpa)
+    for module in dit.modules():
+        if hasattr(module, "bind_state"):
+            module.bind_state(handles)
+    rows = list(range(batch))
+    sub = S.LTXDenoiseSubmodule(torch.nn.Linear(1, 1), config, loop_name="x")
+    step = state_steps(sub.declare_step("g", rows, [NodeInputs(resource_step_info=shape)] * batch), handles)
+    if step is None:
+        return None
+    ctx = StepContext(request_ids=rows, graph_walk="g", slot=0, capture=False)
+    step.set_ctx(ctx)
+    for key, declared in step.steps.items():
+        resources[key].plan(declared, ctx)
+    return step
+
+
+def run_step(step, dit, *args):
+    """One call of ``dit``, with its handles open around it as the engine opens them."""
+    if step is None:
+        return dit(*args)
+    step.begin_calls()
+    try:
+        return dit(*args)
+    finally:
+        step.end_calls()
 
 
 def classify(name: str) -> str:
@@ -96,8 +109,7 @@ def main():
         dit.forward = torch.compile(dit.forward, dynamic=False)
     rope = build_rope(config.transformer, shape.frames, shape.height, shape.width, shape.fps, shape.audio_frames,
                       device)
-    attends = (LTX2Attends(*([sdpa_attention] * 6)) if args.attention == "sdpa"
-               else ragged_attends(config, shape, args.batch, device, 1 if sp_group else world_size, sp_group))
+    step = open_attention(dit, config, shape, args.batch, device, args.attention, comm_group, sp_group)
     b = args.batch
     t = config.transformer
     inputs = (
@@ -109,16 +121,16 @@ def main():
     )
     with torch.inference_mode():
         for _ in range(3):
-            dit(*inputs, rope, attends)
+            run_step(step, dit, *inputs, rope)
         torch.cuda.synchronize()
         t0 = time.perf_counter()
         for _ in range(5):
-            dit(*inputs, rope, attends)
+            run_step(step, dit, *inputs, rope)
         torch.cuda.synchronize()
         wall = 1000 * (time.perf_counter() - t0) / 5
         # every rank runs the profiled step: under TP / SP its collectives need them all
         with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA]) as prof:
-            dit(*inputs, rope, attends)
+            run_step(step, dit, *inputs, rope)
             torch.cuda.synchronize()
     if args.parallel:
         dist.destroy_process_group()

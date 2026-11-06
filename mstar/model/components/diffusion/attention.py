@@ -6,21 +6,23 @@ no KV cache to page. Two backends serve the same ``[B, S, H, D]`` contract:
 
 * ``sdpa``   ``torch.nn.functional.scaled_dot_product_attention`` — the reference
              pipelines' own kernel, hence the parity baseline; used eagerly and on CPU.
-* the engine's **ragged attention resource** (``RaggedAttentionSpec``, FlashInfer's
-  ragged prefill on FA2/FA3) — one segment per request, planned by the runner
-  outside the captured graph, so a per-step CUDA graph can replay it. The
-  resource is bound by the submodule and threaded to the layers as a callable.
+* the engine's **ragged attention resource** (FlashInfer's ragged prefill on
+  FA2/FA3) — one segment per request, planned by the runner outside the captured
+  graph, so a per-step CUDA graph can replay it.
 
-Layers call :func:`joint_attention`; the choice is made once per forward by
-whoever owns the resource, not per layer.
+Layers call :func:`attend`, and the array's read picks the backend at bind from the
+node's ``attention_backend``.
 """
 
 from __future__ import annotations
 
-from typing import Protocol
+from collections.abc import Mapping
+from typing import Any, Protocol
 
 import torch
 import torch.nn.functional as F
+
+from mstar.engine.state import Entry, TensorType
 
 
 class RaggedAttentionFn(Protocol):
@@ -30,6 +32,27 @@ class RaggedAttentionFn(Protocol):
     def __call__(
         self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, return_lse: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]: ...
+
+
+def dit_entry(heads: int, head_dim: int) -> Entry:
+    """A DiT's k and v per token, in the bf16 its attention runs in: it has no autocast dtype to resolve to."""
+    t = TensorType((heads, head_dim), dtype=torch.bfloat16, shard=0)
+    return Entry({"k": t, "v": t})
+
+
+def refuse_attention_backend_kwarg(kwargs: Mapping[str, Any]) -> None:
+    """A constructor's ``**kwargs`` would swallow the old knob, and a config that asks for SDPA would run FlashInfer."""
+    if "attention_backend" in kwargs:
+        raise ValueError("attention_backend is a node group's setting: move it from model_kwargs to the DiT's group")
+
+
+def attend(state: Any, layer: torch.Tensor | None, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    """``[B, S, H, D]`` queries over ``[B, S_kv, H_kv, D]`` keys and values through ``state``'s read, or SDPA on a layer
+    no engine bound a handle to."""
+    if state is None:
+        return sdpa_attention(q, k, v)
+    state.add(layer, k=k, v=v)
+    return state.read(layer, q)
 
 
 def sdpa_attention(
@@ -58,8 +81,8 @@ def joint_attention(
     ``return_lse``, also the log-sum-exp ``[B, S, H]`` (see :func:`sdpa_attention`).
 
     The ragged kernel wants the batch packed to ``[B * S, H, D]`` / ``[B * S_kv, ...]``
-    with one segment per request — exactly what the owning submodule declared in its
-    step (a cross-attention pair for ``S_kv != S``) — and hands back the query packing.
+    with one segment per request — exactly what the step declared (a cross read for
+    ``S_kv != S``) — and hands back the query packing.
     """
     if ragged is None:
         return sdpa_attention(q, k, v, return_lse=return_lse)

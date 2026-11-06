@@ -16,7 +16,10 @@ sys.path.insert(0, ".")
 
 import pytest
 
-PORTED = ("mstar/model/qwen3_5", "mstar/model/command_a_plus")
+PORTED = (
+    "mstar/model/qwen3_5", "mstar/model/command_a_plus", "mstar/model/wan22", "mstar/model/flux2_klein",
+    "mstar/model/z_image", "mstar/model/ltx2_5", "mstar/model/qwen3_omni",
+)
 FORBIDDEN_ATTRIBUTES = {
     "node_resources", "resources", "request_state", "per_request_states",
     # what a handle holds
@@ -29,18 +32,30 @@ ALLOWED = {
     for name in (
         "AcceleratorGraphConfig", "BatchedAcceleratorGraphConfig", "DETERMINISTIC_COMPILE_MODE",
         "PackedAcceleratorGraphConfig", "PiecewiseAcceleratorGraphConfig", "PiecewiseCallInputs",
-        "PiecewiseCaptureShape", "PiecewisePackedConfig", "decode_rows_then_prompt",
+        "PiecewiseCaptureShape", "PiecewisePackedConfig", "decode_rows_then_prompt", "geometric_batch_sizes",
     )
 } | {
     ("mstar.engine.resources.spec", "CombinedSplit"): "a value of kernel_settings(), until the engine picks kernels",
     ("mstar.engine.engine", "ExecutingBatch"): "the annotation of `NodeSubmodule.can_batch`, a base class's hook",
+    ("mstar.engine.resources.lora.checkpoint", "LoraFile"): "a model's static LoRA merge at load, which holds no state",
+}
+# Graph breaks a ported package keeps, by file and function, since no state call sits behind them.
+ALLOWED_BREAKS = {
+    ("mstar/model/qwen3_omni/submodules.py", "_replay_block_loop"): "a captured region's replay, which is eager whole",
+    ("mstar/model/qwen3_omni/components/code2wav.py", "forward"): "the vocoder's transformer, which keeps no state",
 }
 
 
-def _violations(source: str) -> tuple[list[str], set[tuple[str, str]]]:
-    """What ``source`` does that the lint refuses, and the exceptions it used."""
+def _violations(source: str, path: str = "") -> tuple[list[str], set[tuple[str, str]]]:
+    """What ``source``, the file at ``path``, does that the lint refuses, and the exceptions it used."""
     found, used = [], set()
-    for node in ast.walk(ast.parse(source)):
+    tree = ast.parse(source)
+    allowed_breaks = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and (path, node.name) in ALLOWED_BREAKS:
+            used.add((path, node.name))
+            allowed_breaks.update(decorator.lineno for decorator in node.decorator_list)
+    for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom) and node.module and node.module.startswith("mstar.engine"):
             if node.module == "mstar.engine.state":
                 continue
@@ -54,7 +69,10 @@ def _violations(source: str) -> tuple[list[str], set[tuple[str, str]]]:
             found += [f"import {a.name}" for a in node.names if a.name.startswith("mstar.engine")]
         elif isinstance(node, ast.Attribute) and node.attr in FORBIDDEN_ATTRIBUTES:
             found.append(f".{node.attr} at line {node.lineno}")
-        elif isinstance(node, ast.Attribute) and ast.unparse(node).endswith("compiler.disable"):
+        elif (
+            isinstance(node, ast.Attribute) and ast.unparse(node).endswith("compiler.disable")
+            and node.lineno not in allowed_breaks
+        ):
             found.append(f"torch.compiler.disable at line {node.lineno}, where the state calls hold the graph breaks")
     return found, used
 
@@ -67,15 +85,16 @@ def _sources() -> list[Path]:
 
 @pytest.mark.parametrize("path", _sources(), ids=str)
 def test_a_ported_package_reaches_the_engine_only_through_the_contract(path):
-    found, _ = _violations(path.read_text())
+    found, _ = _violations(path.read_text(), str(path))
     assert not found, f"{path} reaches past the contract: {found}"
 
 
 def test_every_exception_is_still_used():
     used = set()
     for path in _sources():
-        used |= _violations(path.read_text())[1]
-    assert ALLOWED.keys() <= used, f"delete these from ALLOWED: {sorted(ALLOWED.keys() - used)}"
+        used |= _violations(path.read_text(), str(path))[1]
+    excepted = ALLOWED.keys() | ALLOWED_BREAKS.keys()
+    assert excepted <= used, f"delete these exceptions: {sorted(excepted - used)}"
 
 
 @pytest.mark.parametrize("source, expected", [
@@ -100,3 +119,14 @@ def test_the_lint_catches_each_way_past_the_contract(source, expected):
 
 def test_the_lint_passes_the_contract_itself():
     assert _violations("from mstar.engine.state import Array, sample") == ([], set())
+
+
+def test_the_lint_lets_a_named_function_keep_its_break_and_no_other():
+    source = "@torch.compiler.disable\ndef _replay_block_loop(): pass\n@torch.compiler.disable\ndef other(): pass\n"
+    found, used = _violations(source, "mstar/model/qwen3_omni/submodules.py")
+    assert used == {("mstar/model/qwen3_omni/submodules.py", "_replay_block_loop")}
+    assert len(found) == 1 and "at line 3" in found[0]
+
+
+def test_the_lint_reads_all_five_reference_packages():
+    assert {path.parts[2] for path in _sources()} >= {"wan22", "flux2_klein", "z_image", "ltx2_5", "qwen3_omni"}

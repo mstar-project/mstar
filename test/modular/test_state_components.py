@@ -38,7 +38,8 @@ from mstar.engine.state import (
     Value,
 )
 from mstar.engine.state.adapters import state_steps
-from mstar.engine.state.calls import ArrayHandle, WithinStepHandle
+from mstar.engine.state.calls import ArrayHandle
+from mstar.engine.state.within_step import WithinStepHandle
 from mstar.model.components import Attention
 from mstar.model.components.decoder_layer import DecoderLayer, eager_frame, no_cursor, run_layers
 from mstar.model.components.distributed.attention import ParallelAttention

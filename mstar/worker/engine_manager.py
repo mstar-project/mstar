@@ -12,6 +12,7 @@ from mstar.engine.engine import Engine
 from mstar.engine.node_dtype import resolve_model_dtype, resolve_node_dtype
 from mstar.engine.resources import ResourceReqConfig
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
+from mstar.engine.state.analysis import sdpa_nodes
 from mstar.graph.base import GraphNode
 from mstar.graph.runtime.base import GraphRuntime
 from mstar.model.base import Model, node_moe_parallel_configs, parse_autocast_dtype, serving_resources
@@ -322,6 +323,7 @@ class EngineManager:
             gpu_memory_fraction=model_config.get("gpu_memory_fraction"),
             device_capability=device_capability,
             side_stream_nodes={name for name, _ in side_keys},
+            sdpa_nodes=sdpa_nodes(model_config["node_groups"]),
         )
         engine.load_model(
             submodules,

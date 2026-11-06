@@ -10,6 +10,7 @@ import torch
 
 sys.path.insert(0, ".")
 
+from mstar.engine.state.adapters import node_resources  # noqa: E402
 from mstar.graph.base import GraphNode, Loop, Sequential, TensorPointerInfo  # noqa: E402
 from mstar.graph.special_destinations import EMIT_TO_CLIENT  # noqa: E402
 from mstar.model.z_image.config import DENOISE_LOOP, DIT_ATTN, ZImageConfig  # noqa: E402
@@ -68,8 +69,8 @@ def test_graph_structure():
 
 
 def test_resources_and_dummy_mode():
-    assert [s.resource_key for s in _make_model().get_node_resources()] == [DIT_ATTN]
-    assert _make_model(attention_backend="sdpa").get_node_resources() == []
+    assert [s.resource_key for s in node_resources(_make_model())] == [DIT_ATTN]
+    assert node_resources(_make_model(), sdpa_nodes={"dit"}) == []
     model = _make_model()
     assert all(model.get_submodule(n) is None for n in model.nodes)
     assert model.get_autocast_dtype() is None

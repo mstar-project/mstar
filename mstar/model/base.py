@@ -533,12 +533,12 @@ def enabled_resources(model: "Model", model_config: dict) -> list[NodeResourceSp
     for callers that skip ``validate_deployment``, which reports them all."""
     from mstar.engine.resources.lora.serving import declared_lora_specs, size_lora_specs
     from mstar.engine.state.adapters import node_resources
-    from mstar.engine.state.analysis import state_declaration_problems
+    from mstar.engine.state.analysis import sdpa_nodes, state_declaration_problems
 
     problems = state_declaration_problems(model)
     if problems:
         raise ValueError(problems[0])
-    specs = node_resources(model)
+    specs = node_resources(model, sdpa_nodes=sdpa_nodes(model_config.get("node_groups") or ()))
     lora = declared_lora_specs(model, model_config)
     size_lora_specs(lora, model_config)
     return specs + lora

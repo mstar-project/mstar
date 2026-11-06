@@ -244,7 +244,8 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        scoped to specific ``graph_walks`` and/or sharded with ``tp_size``. An
        ``ep_config`` block picks TP or EP for the group's MoE experts. ``side_stream:
        true`` runs the group's node beside the worker's main chain of steps (see
-       below).
+       below). ``attention_backend: sdpa`` runs each attention the group's DiT node
+       declares on torch's SDPA in place of the default ``flashinfer``.
    * - ``resources``
      - *(optional)* Per-resource overrides, keyed by the model's resource names (see
        below).

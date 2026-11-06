@@ -6,8 +6,6 @@ model: "flux2_klein_9b"
 max_seq_len: 512
 
 model_kwargs:
-  # sdpa (cuDNN on H100) is the reference kernel; flashinfer stays available
-  attention_backend: sdpa
   compile: true
   # inductor rounds intermediates where eager PyTorch does (and fuses no FMAs); on its own the compiled
   # transformer is still not bit-exact with the eager path (measured PSNR: compile_exact_ops in docs/models.rst)
@@ -37,3 +35,5 @@ node_groups:
     ranks: [0]
   - node_names: [dit]
     ranks: [0]
+    # sdpa (cuDNN on H100) is the reference kernel; leave it out to run FlashInfer
+    attention_backend: sdpa

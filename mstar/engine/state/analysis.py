@@ -2,14 +2,14 @@
 
 import hashlib
 import json
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import fields, is_dataclass
 from itertools import product
 from typing import TYPE_CHECKING, get_origin
 
 import torch
 
-from mstar.engine.state.contract import Array, Block, Sampler
+from mstar.engine.state.contract import EMPTY, Array, Block, Sampler
 
 if TYPE_CHECKING:
     from mstar.model.base import Model
@@ -37,9 +37,25 @@ def state_declaration_problems(model: "Model") -> list[str]:
         problems += _read_problems(array, walks, combined)
         problems += _array_problems(array)
     problems += _kv_label_problems(model.kv_labels(), arrays)
+    problems += _cross_read_problems(arrays)
+    problems += _host_problems(arrays, model.kv_labels())
     for sampler in samplers:
         problems += _sampler_problems(sampler, nodes)
     return problems
+
+
+def sdpa_nodes(node_groups: Sequence[Mapping[str, object]]) -> frozenset[str]:
+    """The nodes whose node groups set ``attention_backend: sdpa``. A node listed by several groups, one per graph walk,
+    must get the same answer from each."""
+    asked: dict[str, str] = {}
+    for group in node_groups:
+        backend = group.get("attention_backend", "flashinfer")
+        if backend not in ("flashinfer", "sdpa"):
+            raise ValueError(f"attention_backend takes flashinfer or sdpa, not {backend!r}")
+        for node in group["node_names"]:
+            if asked.setdefault(node, backend) != backend:
+                raise ValueError(f"node {node!r} gets different attention_backend settings from two node_groups")
+    return frozenset(node for node, backend in asked.items() if backend == "sdpa")
 
 
 def position_key(array: Array) -> str:
@@ -105,6 +121,42 @@ def _kv_label_problems(kv_labels: Mapping[str, Mapping[str, object]], arrays: Se
     return problems
 
 
+def _cross_read_problems(arrays: Sequence[Array]) -> list[str]:
+    by_name = {array.name: array for array in arrays}
+    problems: list[str] = []
+    for array in arrays:
+        for key, read in array.reads.items():
+            if read.queries is None:
+                continue
+            where = f"Array {array.name!r}.reads[{key!r}].queries"
+            queried = by_name.get(read.queries)
+            if queried is None:
+                problems.append(f"{where}: {read.queries!r} is not a declared array, of {sorted(by_name)}")
+            elif not array.nodes <= queried.nodes:
+                problems.append(f"{where}: {read.queries!r} isn't on nodes {sorted(array.nodes - queried.nodes)}, so a "
+                                "step there has no segments to lay the queries out by")
+            elif queried.max_len:
+                problems.append(f"{where}: {read.queries!r} keeps entries, and queries are laid out by the segments "
+                                "of an array with max_len 0")
+    return problems
+
+
+def _host_problems(arrays: Sequence[Array], kv_labels: Mapping[str, Mapping[str, object]]) -> list[str]:
+    """A prefix hit restores a Value's snapshot, and a snapshot doesn't carry host fields yet."""
+    holders = [array for array in arrays if array.entry.host]
+    if not holders:
+        return []
+    keyed = {
+        node for array in arrays if any(label.keys is not None for label in kv_labels.get(array.name, {}).values())
+        for node in array.nodes
+    }
+    return [
+        f"Array {array.name!r}.entry.host: nodes {sorted(array.nodes & keyed)} have prefix keys, and a prefix hit "
+        "wouldn't restore host fields"
+        for array in holders if array.nodes & keyed
+    ]
+
+
 def _sampler_problems(sampler: Sampler, nodes: Sequence[str]) -> list[str]:
     where = f"Sampler {sampler.name!r}"
     problems = [
@@ -140,15 +192,34 @@ def _read_problems(array: Array, walks: Mapping[str, set[str]], combined: set[st
     return problems
 
 
-def deployment_problems(model: "Model", resources: Mapping[str, Mapping[str, object]]) -> list[str]:
-    """What a deployment's ``resources:`` block asks of a declared sampler that it can't do."""
-    return [
+def deployment_problems(
+    model: "Model", resources: Mapping[str, Mapping[str, object]], *, sdpa: Collection[str] = frozenset(),
+    head_shards: Mapping[str, int] = EMPTY,
+) -> list[str]:
+    """What a deployment asks of the declarations that they can't do: its ``resources:`` block of a sampler, ``sdpa``
+    of the nodes it names, and ``head_shards``, TP times SP per node above SP1, of a read sharded on both sides."""
+    declarations = model.declare_state()
+    arrays = {declared.name: declared for declared in declarations if isinstance(declared, Array)}
+    problems = [
         f"Sampler {declared.name!r}.draws: enable_logprobs, and draws is {declared.draws}; log-probs take one token "
         "per step"
-        for declared in model.declare_state()
+        for declared in declarations
         if isinstance(declared, Sampler) and declared.draws > 1
         and resources.get(declared.name, {}).get("enable_logprobs")
     ]
+    reading = {node for array in arrays.values() if array.reads for node in array.nodes}
+    problems += [f"node {node!r}: attention_backend sdpa, and it holds no array with a read for SDPA to run"
+                 for node in sorted(set(sdpa) - reading)]
+    for array in arrays.values():
+        if array.max_len and array.nodes & sdpa:
+            problems.append(f"Array {array.name!r}: attention_backend sdpa on nodes {sorted(array.nodes & sdpa)}, and "
+                            "its entries are kept between steps, so SDPA has no read of them")
+        for key, read in array.reads.items():
+            shards = max((head_shards.get(node, 1) for node in array.nodes), default=1)
+            if array.seq_sharded and arrays.get(read.queries, array).seq_sharded and read.op.q_heads % shards:
+                problems.append(f"Array {array.name!r}.reads[{key!r}]: q_heads {read.op.q_heads} doesn't divide by "
+                                f"{shards}, TP times SP, which a read sharded on both sides narrows its heads by")
+    return problems
 
 
 def declaration_digest(declarations: Sequence[Array | Sampler]) -> str:
