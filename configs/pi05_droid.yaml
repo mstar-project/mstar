@@ -38,6 +38,12 @@ openpi:
   state: [observation/joint_position, observation/gripper_position]
   action_dims: 8
 
+# FA2, not the FA3 kernel "auto" picks on SM90. On an H200 the action step's few queries over a
+# long prefix run 3.9 ms faster, and prefill, which shares this resource, 0.3 ms slower.
+resources:
+  attn:
+    flashinfer_backend: fa2
+
 node_groups:
   - node_names:
       - vit_encoder
