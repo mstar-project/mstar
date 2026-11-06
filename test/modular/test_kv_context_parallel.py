@@ -1538,19 +1538,23 @@ def test_fa2_over_an_sp_placed_pool(monkeypatch, caplog, over_sp, capability, ba
     assert any("fa2" in r.getMessage() for r in caplog.records) == (outcome == "warned")
 
 
-@pytest.mark.parametrize("capability, backend, outcome", [
-    ((9, 0), "fa2", "refused"), ((9, 0), "auto", "quiet"), ((10, 0), "auto", "warned"),
+@pytest.mark.parametrize("over_sp, capability, backend, outcome", [
+    (True, (9, 0), "fa2", "refused"), (True, (9, 0), "auto", "quiet"), (True, (10, 0), "auto", "warned"),
+    (False, (9, 0), "fa2", "quiet"),
 ])
-def test_fa2_over_an_sp_placed_pool_holds_for_a_windows_layers(monkeypatch, caplog, capability, backend, outcome):
+def test_fa2_over_an_sp_placed_pool_holds_for_a_windows_layers(
+    monkeypatch, caplog, over_sp, capability, backend, outcome,
+):
     """A window's layers are whole on every partner, so not placed, but they prefill in the SP-placed
-    node's lockstep steps: the same rule as the placed layers."""
+    node's lockstep steps: the same rule as the placed layers, naming the attention to change. A
+    TP-placed pool's window doesn't care."""
     monkeypatch.setenv("MSTAR_WORKSPACE_BUFFER_MB", "1")
     platform = types.SimpleNamespace(cuda_capability=lambda device=None: capability)
     monkeypatch.setattr(fi_mod, "current_platform", platform)
-    monkeypatch.setattr(AttentionManager, "_check_window_pool", staticmethod(
-        lambda spec, device: "fa2" if capability >= (10, 0) and backend == "auto" else backend,
-    ))
-    joint = JointGroups(tp_group=CommGroup.trivial(), sp_group=_group(0, P))
+    if over_sp:
+        joint = JointGroups(tp_group=CommGroup.trivial(), sp_group=_group(0, P))
+    else:
+        joint = JointGroups(tp_group=_group(0, P), sp_group=CommGroup.trivial())
     kv = KVSpec(resource_key="kv", nodes={NODE}, config=PagedKVConfig(
         num_layers=2, num_kv_heads=1, head_dim=HEAD_DIM, max_seq_len=64, num_qo_heads=Q_HEADS,
         max_num_pages=16, page_size=2 * CP_PAGE, context_parallel=True,
@@ -1563,12 +1567,12 @@ def test_fa2_over_an_sp_placed_pool_holds_for_a_windows_layers(monkeypatch, capl
         )),
     ])
     window = specs["window"]
-    info = EngineResourceInfo(device=CPU, joint_comm_group=joint, kv_dtype=torch.float32, head_shards=1,
-                              dependencies={"kv": kv})
+    info = EngineResourceInfo(device=CPU, joint_comm_group=joint, kv_dtype=torch.float32,
+                              head_shards=joint.tp_group.world_size, dependencies={"kv": kv})
     attn = AttentionManager.build(window, info)
     resources = {"kv": types.SimpleNamespace(placement=kv.config.place(joint, "kv"))}
     if outcome == "refused":
-        with pytest.raises(ValueError, match="'fa2' is refused over an SP-placed pool on SM90"):
+        with pytest.raises(ValueError, match="attention 'window' .*'fa2' is refused over an SP-placed pool on SM90"):
             attn.bind_dependencies(resources)
         return
     with caplog.at_level(logging.WARNING, logger=fi_mod.logger.name):

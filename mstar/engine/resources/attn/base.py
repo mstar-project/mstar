@@ -76,6 +76,8 @@ def resolve_attn_backend(backend: AttnBackend, device: torch.device) -> AttnBack
 
 class AttentionManager(AttentionResource):
     prefix_skip_safe = True
+    # its spec's key, set by `build`, for a refusal that names the attention to change
+    _resource_key: str | None = None
     # the sequence shard over its node (`AttentionSpec.derive`), set by `build`; and the shard
     # itself where it can split (`bind_dependencies`)
     _shard_key: str | None = None
@@ -198,6 +200,7 @@ class AttentionManager(AttentionResource):
     @classmethod
     def build(cls, spec: AttentionSpec, info: EngineResourceInfo):
         manager = cls._build_backend(spec, info)
+        manager._resource_key = spec.resource_key
         manager._shard_key = spec.shard_key
         manager._split_exchange = spec.resolve_exchange(info.dependencies)
         return manager

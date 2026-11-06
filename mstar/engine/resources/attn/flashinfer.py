@@ -105,9 +105,9 @@ class FlashInferManager(PlacedAttention):
         self._group = self._kv_config.groups[self._group_idx]
         self._wrapper_kv_kwargs["page_size"] = self._group.page_size
         super().bind_dependencies(resources)
-        if self._group_idx != 0 and isinstance(resources[self._kv_cache_name].placement, SPPlacement):
-            # a window's layers are whole on every partner, so not placed, but they prefill in the
-            # same SP-placed node's lockstep steps: the same fa2 rule
+        # every attention over the pool: a window's layers are whole on every partner, so not placed,
+        # but they prefill in the same node's lockstep steps
+        if isinstance(resources[self._kv_cache_name].placement, SPPlacement):
             self._check_fa2_over_sp()
 
     def _check_fa2_over_sp(self) -> None:
@@ -119,15 +119,15 @@ class FlashInferManager(PlacedAttention):
         fa3 = capability is not None and capability[0] == 9
         if self._wrapper_kv_kwargs["backend"] == "fa2" and fa3:
             raise ValueError(
-                f"attention over KV pool {self._kv_cache_name!r}: flashinfer_backend 'fa2' is refused over an "
-                "SP-placed pool on SM90 after an unexplained one-off lockstep hang in its prefill; use 'auto' "
-                "or 'fa3'"
+                f"attention {self._resource_key!r} over KV pool {self._kv_cache_name!r}: flashinfer_backend 'fa2' "
+                "is refused over an SP-placed pool on SM90 after an unexplained one-off lockstep hang in its "
+                "prefill; use 'auto' or 'fa3'"
             )
         if capability is not None and not fa3 and self._wrapper_kv_kwargs["backend"] in ("auto", "fa2"):
             logger.warning(
-                "attention over SP-placed KV pool %r prefills on FlashInfer's fa2 kernel, the only one a placed "
-                "pool allows off SM90; an unexplained one-off lockstep hang in an fa2 prefill is still open",
-                self._kv_cache_name,
+                "attention %r over SP-placed KV pool %r prefills on FlashInfer's fa2 kernel, the only one a "
+                "placed pool allows off SM90; an unexplained one-off lockstep hang in an fa2 prefill is still open",
+                self._resource_key, self._kv_cache_name,
             )
 
     def _bind_placement(self, geometry: dict[str, int]) -> None:
@@ -154,8 +154,6 @@ class FlashInferManager(PlacedAttention):
                 "attention over context-parallel KV pool %r plans on fa2 for flashinfer_backend 'auto'",
                 self._kv_cache_name,
             )
-        if isinstance(self._placement, SPPlacement):
-            self._check_fa2_over_sp()
         self._wrapper_kv_kwargs.update(geometry)
         cfg = self._kv_config
         self._new_kwargs = dict(
