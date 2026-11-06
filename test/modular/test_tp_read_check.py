@@ -595,6 +595,57 @@ def _broadcast(w, batch):
     return msg.body.read_check, batch.read_check_rids
 
 
+def test_a_leader_broadcasts_the_settled_count_after_its_predecessor_commit(tmp_path, monkeypatch):
+    from mstar.engine.engine import Engine
+    from mstar.engine.resources.base import Resource
+    from mstar.engine.resources.runner import StepRunner
+    from mstar.engine.resources.step import SubmoduleStep
+
+    worker = _leader(tmp_path)
+    batch = _step({"r0": ["text_inputs"]})
+    batch.step_context.repeats = 4
+    committed = []
+    declared = []
+
+    class Limit(Resource):
+        @classmethod
+        def build(cls, spec, info):
+            return cls()
+
+        def max_repeats(self, step, ctx):
+            assert committed == [True]
+            return 3
+
+    engine = Engine.__new__(Engine)
+    engine._stage_lock = None
+    engine._runner = StepRunner({"limit": Limit()})
+    # No real input preparation: settlement uses the same capture-template
+    # declaration as preplan. A later preplan must keep this chosen lease.
+    lease = object()
+    engine.reserve_replay_slot = lambda b: lease
+    template = object()
+    graph = SimpleNamespace(declare_inputs_for=lambda l: template, step_ids=lambda l, ids: ids)
+    engine._submodules = {NODE: SimpleNamespace(submodule=object(), accelerator_graph_runner=graph)}
+
+    def declare(submodule, **kwargs):
+        declared.append(kwargs["inputs"])
+        return SubmoduleStep(steps={"limit": SimpleNamespace(segments=())})
+
+    monkeypatch.setattr("mstar.engine.engine.engine_step", declare)
+    original = worker.engine_manager.get_engine(NODE)
+    engine.take_resident_delta = original.take_resident_delta
+    engine.decide_cached_prefix = original.decide_cached_prefix
+    engine.page_trails = original.page_trails
+    worker.engine_manager.get_engine = lambda node: engine
+    predecessor = SimpleNamespace(node_batch=SimpleNamespace(
+        commit_done=SimpleNamespace(wait=lambda **kw: committed.append(True) or True),
+    ))
+    worker.maybe_send_zmq_to_tp_followers(batch, speculative=True, spec_from=predecessor)
+    assert declared == [template]
+    assert batch.step_context.tp_repeats == batch.step_context.repeats == 3
+    assert [msg.body.repeats for _, msg in worker.sent] == [3]
+
+
 def test_a_step_taking_an_input_read_from_elsewhere_is_checked_until_it_runs(tmp_path):
     """r1's prompt landed on rank 0 by a read; the step that takes it goes out
     checked, with its rows in order. A step that never ran (a voided

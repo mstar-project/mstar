@@ -428,7 +428,7 @@ def test_a_follower_counts_a_head_it_drops_on_arrival(monkeypatch):
     )
     removal = RemoveRequest(request_id="gone", source=MessageSource.TP_RANK_0, after_tp_seq=1)
     w, log = _rank(monkeypatch, tp_rank=1, inbox=[])
-    w.tp_async_sched, w.tp_async_nodes, w._tp_repeats = True, None, None
+    w.tp_async_sched, w.tp_async_nodes = True, None
     w.scheduler.heads.clear()
     w.scheduler.steps += [None, [HANDLES["kept"]]]
     gpu, next_batch = w._execute_on_gpu_thread, w.scheduler.get_next_batch

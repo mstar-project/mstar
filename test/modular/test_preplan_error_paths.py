@@ -19,6 +19,7 @@ import pytest
 import torch
 
 from mstar.engine.engine import Engine
+from mstar.engine.resources.step import StepContext
 from mstar.worker import worker as worker_mod
 from mstar.worker.micro_scheduler import CHAIN_LANE, ScheduledBatch
 from mstar.worker.stream_buffers import StreamBufferManager
@@ -198,7 +199,7 @@ def _exec_fake(runner, raise_with):
 def _batch(preplanned) -> SimpleNamespace:
     return SimpleNamespace(
         request_ids=["a"], node_name="dit", running_batched=True,
-        step_context=SimpleNamespace(graph_walk="decode", slot_lease=None),
+        step_context=StepContext(request_ids=["a"], graph_walk="decode", slot=0, capture=False),
         preplanned_rids=preplanned, preplan_event=object(),
         outputs_ready=SimpleNamespace(set=lambda: None),
         release_waiters=lambda: None,
@@ -244,11 +245,12 @@ def test_reset_drops_the_kept_step_of_a_partly_dropped_batch() -> None:
     batch = SimpleNamespace(
         request_ids=["a"], node_name="dit", inputs=[object()], step=object(),
         preplanned_rids=("a", "b"), preplan_event=object(),
-        step_context=SimpleNamespace(slot_lease=None),
+        step_context=SimpleNamespace(slot_lease=None, tp_repeats=3),
     )
     assert fake.preplan_is_stale(batch)
     fake.reset_pre_plan_for_batch(batch)
     assert batch.step is None and batch.preplanned_rids is None and batch.preplan_event is None
+    assert batch.step_context.tp_repeats == 3
     assert cleared == [True]
 
 
@@ -289,6 +291,7 @@ def test_a_pre_plan_records_its_event_even_when_it_raises(monkeypatch) -> None:
     )
     submodule.step_is_input_free = lambda walk: False
     mgmt = SimpleNamespace(submodule=submodule, piecewise_runners={})
+    fake._declare_preplan_step = Engine._declare_preplan_step.__get__(fake)
     with pytest.raises(RuntimeError):
         Engine._pre_plan_for_batch(fake, batch, mgmt, cg_runner, object())
     event = fake._pre_plan_done["dit"]

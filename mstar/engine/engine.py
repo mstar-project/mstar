@@ -1839,7 +1839,9 @@ class Engine:
                 items = items.reshape(items.shape[0], 1, *items.shape[1:])
             rids = list(bases)
             rows = [index_of[rid] for rid in rids]
-            picked = items if rows == list(range(len(rows))) else items[to_device_nonblocking(rows, items.device, dtype=torch.long)]
+            picked = items if rows == list(range(len(rows))) else items[
+                to_device_nonblocking(rows, items.device, dtype=torch.long)
+            ]
             mgmt.loopback_rows.ring_write(signal, rids, picked[:, :batch.ring_width], [bases[rid] for rid in rids])
 
     def stream_tokens(self, node_name: str, graph_walk: str, signal: str, limit: int) -> str | None:
@@ -2168,6 +2170,7 @@ class Engine:
                 laps = PhaseLaps("engine.exec.")
                 # a caller that pre-planned already reserved one; otherwise take it here
                 lease = batch.step_context.slot_lease or self.reserve_replay_slot(batch)
+                batch.step_context.check_tp_repeats()
                 laps.lap("reserve_slot")
                 # admit/plan/commit assume the whole batch reaches the forward
                 # in order; an unbatchable walk with >1 request can't, so each
@@ -3606,6 +3609,8 @@ class Engine:
         yet, so only a batched capture can serve it — see
         ``CudaGraphRunner.select_batched_bucket``.
         """
+        if batch.step_context.slot_lease is not None:
+            return batch.step_context.slot_lease
         submodule_mgmt = self._submodules[batch.node_name]
 
         if self._walk_lanes and self._beside_chain(batch.node_name, batch.graph_walk):
@@ -3615,6 +3620,7 @@ class Engine:
             # eager, never on a slot's captures.
             batch.set_slot(submodule_mgmt.num_slots + self._walk_lanes[batch.node_name, batch.graph_walk] - 1)
             batch.step_context.repeats = 1
+            batch.step_context.check_tp_repeats()
             return None
         if batch.slot is None:
             batch.set_slot(submodule_mgmt.lease_slot())
@@ -3622,6 +3628,7 @@ class Engine:
         cg_runner = submodule_mgmt.accelerator_graph_runner
         if cg_runner is None:
             batch.step_context.repeats = 1  # an eager step runs one iteration
+            batch.step_context.check_tp_repeats()
             return None
         # Which of the walk's captures this batch belongs to. The engine can't
         # derive it — what separates two captures of one walk is the model's
@@ -3662,6 +3669,7 @@ class Engine:
         else:
             # an eager step runs one iteration: only a replay repeats
             ctx.repeats = 1
+            ctx.check_tp_repeats()
         return lease
 
     def can_pre_plan(self, node_name: str) -> bool:
@@ -3754,12 +3762,23 @@ class Engine:
             if self._enable_nvtx:
                 range_pop()
 
-    def _pre_plan_for_batch(
-        self, batch: ExecutingBatch, submodule_mgmt: SubmoduleManagement,
-        cg_runner, lease: SlotLease,
-    ) -> bool:
+    def settle_tp_repeats(self, batch: ExecutingBatch) -> None:
+        """Freeze a parallel leader's count before broadcasting it. This only
+        declares from capture templates; input preparation stays after N.
+        The worker has already waited for N's host commit, outside our lock."""
+        ctx = batch.step_context
+        if ctx.repeats > 1:
+            with self._stage_lock or nullcontext():
+                lease = self.reserve_replay_slot(batch)
+                if lease is not None:
+                    mgmt = self._submodules[batch.node_name]
+                    step = self._declare_preplan_step(batch, mgmt, mgmt.accelerator_graph_runner, lease)
+                    if step is not None:
+                        step.set_ctx(ctx)
+                        self._runner._settle_repeats(step)
+        ctx.tp_repeats = ctx.repeats
 
-        laps = PhaseLaps("engine.pre_plan.")
+    def _declare_preplan_step(self, batch, submodule_mgmt, cg_runner, lease):
         # Declare-only, so the unprepared case takes the bucket's shared
         # template rows rather than cloning a fresh set per pre-plan.
         inputs = (
@@ -3770,8 +3789,6 @@ class Engine:
         batch.step_context.set_padded_rids(
             cg_runner.step_ids(lease, batch.request_ids)
         )
-        laps.lap("pad")
-        t0 = phase_start()
         step = engine_step(
             submodule_mgmt.submodule,
             graph_walk=batch.step_context.graph_walk,
@@ -3780,6 +3797,16 @@ class Engine:
             slot_lease=lease,
             per_request_info=batch.per_request_info,
         )
+        return step
+
+    def _pre_plan_for_batch(
+        self, batch: ExecutingBatch, submodule_mgmt: SubmoduleManagement,
+        cg_runner, lease: SlotLease,
+    ) -> bool:
+
+        laps = PhaseLaps("engine.pre_plan.")
+        t0 = phase_start()
+        step = self._declare_preplan_step(batch, submodule_mgmt, cg_runner, lease)
         phase_end("engine.pre_declare", t0)
         if step is None:
             return False

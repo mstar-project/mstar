@@ -35,9 +35,6 @@ if TYPE_CHECKING:
 _LANDED_POLL_S = 1e-4
 # How often a run's wait scans for ready rows when nothing landed to say so
 _QUIET_SCAN_S = 10 * _LANDED_POLL_S
-# a TP step's settled count waits this many later seqs for the other side's
-# (``_settle_tp_repeats``): a chain's last step never gets the leader's
-_TP_REPEATS_KEPT = 256
 
 
 class RepeatingSteps:
@@ -365,28 +362,6 @@ class RepeatingSteps:
         if not self._step_repeats.may_repeat(node_name, graph_walk):
             return "repeats: the walk doesn't repeat"
         return self.engine_manager.get_engine(node_name).device_stop_refusal(node_name, graph_walk)
-
-    def _settle_tp_repeats(self, seq: int, *, follower: int = 0, leader: int = 0) -> None:
-        """A TP step's settled iterations, as this follower settled them or as
-        the leader says it did (on the head after it), whichever comes second
-        checks the other. Every rank's resources narrow alike; if one didn't,
-        the ranks would run different counts of the same collectives."""
-        mine, theirs = self._tp_repeats
-        if follower:
-            mine[seq] = follower
-        if leader:
-            theirs[seq] = leader
-        if seq in mine and seq in theirs:
-            if mine[seq] != theirs[seq]:
-                raise SystemExit(
-                    f"Worker {self.worker_id}: TP step {seq} settled at {mine.pop(seq)} iterations here and "
-                    f"{theirs.pop(seq)} on the leader; the ranks would split"
-                )
-            del mine[seq], theirs[seq]
-        for record in (mine, theirs):
-            if len(record) > _TP_REPEATS_KEPT:
-                for old in [k for k in record if k < seq - _TP_REPEATS_KEPT]:
-                    del record[old]
 
     def _end_run_for_ready_rows(self, step: PendingBatch) -> None:
         """``step``'s run on the device ends at its next iteration, not at its count."""

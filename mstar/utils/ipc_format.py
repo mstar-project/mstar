@@ -272,12 +272,9 @@ class ScheduleTPNode(MessageBody):
     chunk_totals: list[int] = field(default_factory=list)
     # how far each chunk moves its row's chunk Loop (``ChunkRange.stride``)
     chunk_strides: list[int] = field(default_factory=list)
-    # the iterations the leader asks the step to stand for; each rank's
-    # resources narrow it alike, at admit (``step_repeats``)
+    # The leader settles this count before broadcasting. Followers either
+    # honor it or exit before forward; they never narrow it independently.
     repeats: int = 1
-    # what the step at ``spec_from_seq`` settled at on the leader, 0 if unsaid:
-    # a follower that settled it otherwise stops, before the ranks split
-    from_repeats: int = 0
 
 
 @dataclass

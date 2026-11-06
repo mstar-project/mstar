@@ -127,6 +127,9 @@ class StepContext:
     # step counts for this many iterations. The worker asks, and `StepRunner`
     # narrows it to what the step's resources allow (`Resource.max_repeats`).
     repeats: int = 1
+    # Parallel nodes freeze the leader's decision before broadcast. A local
+    # limit may reject it before forward, never silently change it.
+    tp_repeats: int | None = None
     # a run's real rows -> the generation of the request each named when it
     # committed (``StepRunner.commit``), so a short landing rewinds only those
     counted: Mapping[int, int | None] = field(default_factory=dict)
@@ -141,6 +144,13 @@ class StepContext:
     # reserve them now (``ChunkingPolicy.reserve_whole_prefill``). Check it
     # before reserving by ``chunk_tokens_after``.
     reserve_whole_prefill: PerReqSetting = ALL_SET
+
+    def check_tp_repeats(self) -> None:
+        if self.tp_repeats is not None and self.repeats != self.tp_repeats:
+            raise SystemExit(
+                f"walk {self.graph_walk!r}: the leader settled {self.tp_repeats} iterations, "
+                f"but this rank can run {self.repeats}; refusing before forward"
+            )
 
     def run_span(self, span: int, keeps: bool = True) -> int:
         """What ``span`` a replay comes to over the step: read this, not

@@ -510,9 +510,6 @@ class Worker(RepeatingSteps):
     # node -> its streamed signals whose items stay in a ring on the device
     # (``_ask_rings``); empty while none do
     _ring_signals: Mapping[str, frozenset[str]] = MappingProxyType({})
-    # a TP follower's settled iterations by step seq, its own and the leader's
-    # (``_settle_tp_repeats``); set at init
-    _tp_repeats: "tuple[dict[int, int], dict[int, int]] | None" = None
     # nodes that keep their landed tokens (``NodeSubmodule.record_tokens``)
     _token_readers: frozenset[str] = frozenset()
 
@@ -761,7 +758,6 @@ class Worker(RepeatingSteps):
         )
         # Leader: monotonic seq stamped on every ScheduleTPNode it sends.
         self._tp_broadcast_seq = 0
-        self._tp_repeats = ({}, {})
         # Follower: leader steps that will NOT be followed by a head; the
         # leader said so (TPNoSpeculation) or this rank closed the step.
         self._tp_nospec: RecentSet[int] = RecentSet(self._TP_NOSPEC_KEEP)
@@ -2010,6 +2006,9 @@ class Worker(RepeatingSteps):
             engine=self.engine_manager.get_engine(batch.node_name) if batch.request_walks else None,
             repeats=max(batch.repeats, self._unchained_repeats(batch)),
         )
+        if batch.tp_seq >= 0:
+            node_batch.step_context.repeats = batch.repeats
+            node_batch.step_context.tp_repeats = batch.repeats
         node_batch.read_check_rids = batch.read_check_rids
         for rid in unresolved:
             # Reported the way a per-rid stage reports: left in
@@ -2031,8 +2030,8 @@ class Worker(RepeatingSteps):
     ) -> int:
         """Broadcast this batch as a ``ScheduleTPNode``. Returns its seq, or
         ``-1`` when this worker does not lead the node (nothing sent).
-        ``spec_from``: the step it speculates from, whose settled count rides
-        along (``from_repeats``)."""
+        ``spec_from``: the predecessor whose host commit must land before
+        the leader settles this step's resource limits."""
         if node_batch.node_name not in self.parallel_nodes or \
                 node_batch.node_name not in self.parallel_leader_nodes:
             return -1
@@ -2042,6 +2041,17 @@ class Worker(RepeatingSteps):
         # draining per follower would give the first one everything and the rest
         # nothing. Each gets its own copy because each pops as it replays.
         engine = self.engine_manager.get_engine(node_batch.node_name)
+        ctx = node_batch.step_context
+        if ctx.repeats > 1:
+            if spec_from is not None:
+                while not spec_from.node_batch.commit_done.wait(timeout=1.0):
+                    # A failed predecessor must not strand the main thread.
+                    if spec_from.future.done():
+                        spec_from.future.result()
+                        raise SystemExit("TP repeat settlement: predecessor ended without committing")
+            engine.settle_tp_repeats(node_batch)
+        else:
+            ctx.tp_repeats = 1
         resident_delta = engine.take_resident_delta(node_batch.node_name)
         prefix_hits = engine.decide_cached_prefix(node_batch)
         page_trails = engine.page_trails(node_batch.node_name)
@@ -2096,7 +2106,6 @@ class Worker(RepeatingSteps):
                         chunk_totals=chunk_totals,
                         chunk_strides=chunk_strides,
                         repeats=ctx.repeats,
-                        from_repeats=0 if spec_from is None else spec_from.batch.repeats,
                     )
                 )
             )
@@ -2658,8 +2667,6 @@ class Worker(RepeatingSteps):
             with self._span("worker.await_admit_settled"):
                 self._await_admit(pending)
         pending.batch.repeats = repeats = pending.node_batch.step_context.repeats
-        if self._tp_repeats is not None and pending.batch.tp_seq >= 0 and self._is_tp_follower_node(pending.node_name):
-            self._settle_tp_repeats(pending.batch.tp_seq, follower=repeats)
         if self._step_repeats is not None and self._step_repeats.asked:
             # before anything pops the stream again: this pass's speculation
             for rid, edges in pending.node_batch.stream_windows.items():
@@ -3683,9 +3690,8 @@ class Worker(RepeatingSteps):
         )
         # N's rows, as on the leader: N's settle readies them, not a cleared speculation
         speculation.continuing_rids.update(mid_prefill)
-        if head.repeats > 1:
-            # the leader's ask, which admit narrows here as it did there
-            speculation.node_batch.step_context.repeats = head.repeats
+        speculation.node_batch.step_context.repeats = head.repeats
+        speculation.node_batch.step_context.tp_repeats = head.repeats
         if chunk_ranges:
             # a fresh row's first chunk caps its Loop, as the leader's merge did
             self.scheduler.cap_chunk_loops(speculation.scheduled_batch)
@@ -3721,8 +3727,6 @@ class Worker(RepeatingSteps):
             # Rank 0 sends nothing between a step and its head, so no earlier head is queued.
             self.scheduler.consume_tp_follow(message)
             return
-        if message.from_repeats and self._tp_repeats is not None:
-            self._settle_tp_repeats(message.spec_from_seq, leader=message.from_repeats)
         self.scheduler.register_tp_follow(message)
 
     def _close_tp_follow_step(self, pending: PendingBatch) -> None:

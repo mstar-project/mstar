@@ -577,11 +577,13 @@ class StepRunner:
         of them reserves for it. Every resource the step declares answers, not
         only the pre-planning ones."""
         ctx = step.ctx
+        ctx.check_tp_repeats()
         asked = ctx.repeats
         if asked == 1:
             return
         allowed = {key: self._resources[key].max_repeats(step.get(key), ctx) for key in self._keys_for(step)}
         ctx.repeats = max(1, min([asked, *allowed.values()]))
+        ctx.check_tp_repeats()
         for key, most in allowed.items():
             if most < asked:
                 self._note_narrowed(ctx.graph_walk, key, asked, most)
@@ -628,6 +630,7 @@ class StepRunner:
         """Reserve capacity for step. A refused admit gives back everything
         the step reserved.
         """
+        step.ctx.check_tp_repeats()
         beside = self._beside_stage(step)
         staged_key = None if beside else self._drop_stale_preplan(step)
         # A step whose ``pre_admit`` ran a step ahead, and whose stage is still

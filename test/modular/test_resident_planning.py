@@ -425,7 +425,8 @@ def test_a_step_with_no_capture_for_its_batch_runs_one_iteration(captured):
     )}
     batch = SimpleNamespace(
         node_name="n", slot=0, request_ids=["a", "b"], inputs=None, per_request_info_wrapped={},
-        per_request_input_metadata={}, step_context=SimpleNamespace(graph_walk=WALK, repeats=4),
+        per_request_input_metadata={},
+        step_context=StepContext(request_ids=["a", "b"], graph_walk=WALK, slot=0, capture=False, repeats=4),
         lease_slot=lambda lease: None,
     )
     engine.reserve_replay_slot(batch)
@@ -864,32 +865,65 @@ def test_a_run_whose_rows_near_a_stop_shortens_the_next_one():
         assert repeats._odds_caps.get(key) == cap
 
 
-@pytest.mark.parametrize("leader_first", [True, False])
-def test_a_tp_follower_that_settles_a_step_otherwise_than_its_leader_stops(leader_first):
-    """Each rank's resources narrow the leader's ask alike; a rank that didn't
-    would run a different count of the same collectives and hang the rest.
-    The leader says what a step settled at on the head after it, which can
-    land before or after the follower's own admit."""
-    worker = Worker.__new__(Worker)
-    worker.worker_id = "w1"
-    worker._tp_repeats = ({}, {})
-    order = [("leader", 4), ("follower", 4)] if leader_first else [("follower", 4), ("leader", 4)]
-    for side, n in order:
-        worker._settle_tp_repeats(7, **{side: n})
-    assert worker._tp_repeats == ({}, {})
-    with pytest.raises(SystemExit, match="settled at 1 iterations here and 4 on the leader"):
-        for side, n in (order if leader_first else order[::-1]):
-            worker._settle_tp_repeats(8, **{side: 1 if side == "follower" else n})
+@pytest.mark.parametrize("capacity", [2, 4])
+@pytest.mark.parametrize("preplan", [False, True])
+def test_a_tp_count_is_checked_before_any_resource_reserves(capacity, preplan):
+    """The last step of a chain needs no successor message to detect a
+    follower's smaller capacity; a larger capacity never expands its count."""
+    reserved = []
+
+    class Limited(Resource):
+        supports_preplan = True
+
+        @classmethod
+        def build(cls, spec, info):
+            return cls()
+
+        def max_repeats(self, step, ctx):
+            return capacity
+
+        def admit(self, step, ctx):
+            reserved.append(ctx.repeats)
+            return super().admit(step, ctx)
+
+    runner = StepRunner({"limited": Limited()})
+    ctx = StepContext(request_ids=[1], graph_walk=WALK, slot=0, capture=False, repeats=3)
+    ctx.tp_repeats = 3
+    step = SubmoduleStep(steps={"limited": SimpleNamespace(segments=())})
+    step.set_ctx(ctx)
+    admit = runner.pre_admit if preplan else runner.admit
+    if capacity < 3:
+        with pytest.raises(SystemExit, match="leader.*3"):
+            admit(step)
+        assert reserved == []
+    else:
+        assert admit(step).ok
+        assert reserved == [3]
+        assert ctx.repeats == 3
 
 
-def test_a_tp_followers_settled_counts_the_leader_never_reports_are_let_go():
-    """A chain's last step (TP_NO_SPEC, a yield-away) gets no head after it."""
-    worker = Worker.__new__(Worker)
-    worker.worker_id = "w1"
-    worker._tp_repeats = ({}, {})
-    for seq in range(2000):
-        worker._settle_tp_repeats(seq, follower=2)
-    assert len(worker._tp_repeats[0]) <= 257
+@pytest.mark.parametrize("fallback", ["lane", "uncaptured", "bucket"])
+@pytest.mark.parametrize("authoritative", [False, True])
+def test_an_eager_tp_fallback_cannot_change_a_broadcast_count(fallback, authoritative):
+    from mstar.engine.engine import Engine, ExecutingBatch
+
+    ctx = StepContext(request_ids=[1], graph_walk=WALK, slot=0, capture=False, repeats=3)
+    ctx.tp_repeats = 3 if authoritative else None
+    batch = ExecutingBatch(node_name="n", per_request_info={1: SimpleNamespace()}, step_context=ctx)
+    engine = Engine.__new__(Engine)
+    engine._walk_lanes = {("n", WALK): 1} if fallback == "lane" else {}
+    engine._beside_chain = lambda node, walk: True
+    engine._submodules = {"n": SimpleNamespace(
+        num_slots=2, lease_slot=lambda: 0, lora_pools=(), resident=None,
+        submodule=SimpleNamespace(cg_key_info=lambda *a, **kw: None),
+        accelerator_graph_runner=None if fallback == "uncaptured" else SimpleNamespace(lease_slot=lambda **kw: None),
+    )}
+    if authoritative:
+        with pytest.raises(SystemExit, match="leader.*3"):
+            engine.reserve_replay_slot(batch)
+    else:
+        assert engine.reserve_replay_slot(batch) is None
+        assert ctx.repeats == 1
 
 
 def test_each_node_asks_for_its_own_repeats():
@@ -991,7 +1025,7 @@ def test_a_narrowed_run_says_which_resource_did_it(monkeypatch):
     samples.clear()
 
     def settle(asked):
-        ctx = SimpleNamespace(repeats=asked, graph_walk=WALK)
+        ctx = StepContext(request_ids=[], graph_walk=WALK, slot=0, capture=False, repeats=asked)
         runner._settle_repeats(SimpleNamespace(ctx=ctx, keys=answers.keys, get=lambda key: None))
         return ctx.repeats
 

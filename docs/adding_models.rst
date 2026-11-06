@@ -1693,8 +1693,11 @@ once it says how far its capture advances itself. ``Resource.ask_repeats(walk)``
 before capture that the config asks, so it can build what serves that, and
 ``Resource.repeat_note(walk)`` says on the walk's line what that changed. At admit each resource can narrow a
 step with ``Resource.max_repeats``, for what only that step decides (free pages, a row's
-log-probs), and the step runs the smallest answer; under TP the answer must come from facts
-every rank shares, or the ranks replay different counts. Whatever it counts per step (stored lengths, positions,
+log-probs), and the step runs the smallest answer. For a parallel node the leader settles this
+count after its predecessor commits and before broadcasting the step. Every rank
+validates that count before admission; a rank that cannot honor it exits before
+forward rather than launching fewer collectives. This is a local fail-fast check,
+not an all-rank preflight barrier. Whatever it counts per step (stored lengths, positions,
 recurrent token counts) it counts with ``StepContext.run_span``, not the declared
 ``span``. A run on the device can end short of what it counted: ``Resource.rewind_run(step,
 ctx, replays, rows)`` takes the ``replays`` it didn't run back, for ``rows`` only, the step's rows
