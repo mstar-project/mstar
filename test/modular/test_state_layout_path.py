@@ -53,6 +53,9 @@ class _Declaring(_Model):
     def get_combined_graph_walks(self):
         return {}
 
+    def get_chunking_policies(self):
+        return {}
+
     def process_prompt(self, *args, **kwargs):
         self.handed = kwargs
         tensors = {"text_inputs": [torch.tensor(PROMPT, dtype=torch.long)]}

@@ -55,6 +55,7 @@ SNAPSHOT = {
     "Attend": [
         ["q_heads", "POSITIONAL_OR_KEYWORD", None],
     ],
+    "Bidirectional": [],
     "Block": [],
     "Causal": [],
     "CausalConv": [

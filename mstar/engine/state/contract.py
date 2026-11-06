@@ -97,6 +97,14 @@ class Block(Mask):
 
 
 @dataclass(frozen=True)
+class Bidirectional(Mask):
+    """Sees {k : k < n}, where n is the length of q's row on this array after this layer's latest add: every entry the
+    row keeps and every entry this step adds for it. For a read with ``queries``, q's row is the row paired with q's
+    segment, on this array's label. It uses no query position. On an array that keeps entries; ``Block`` is the
+    within-step form."""
+
+
+@dataclass(frozen=True)
 class Attend:
     q_heads: int    # a multiple of the heads of the entry's k and v
 
@@ -220,9 +228,9 @@ class Array:
             raise ValueError(f"{where}.layers has {sorted(read.layers - self.layers)}, outside the array's layers")
         if isinstance(read.mask, Window) and not _is_positive(read.mask.size):
             raise ValueError(f"{where}.mask.size must be a positive int, got {read.mask.size!r}")
-        if read.queries is not None and not isinstance(read.mask, Block):
+        if read.queries is not None and not isinstance(read.mask, Block | Bidirectional):
             raise ValueError(f"{where}.queries: a read of another array's queries takes a mask that uses no query "
-                             f"position, and {type(read.mask).__name__} does")
+                             f"position, Block or Bidirectional, and {type(read.mask).__name__} does")
         if not isinstance(read.op, Attend):
             return
         if not _is_positive(read.op.q_heads):

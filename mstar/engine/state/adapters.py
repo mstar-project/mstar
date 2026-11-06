@@ -38,6 +38,7 @@ from mstar.engine.state.contract import (
     Array,
     ArrayStep,
     Attend,
+    Bidirectional,
     Causal,
     CausalConv,
     Entry,
@@ -114,8 +115,9 @@ def _kv_specs(array: Array) -> list[NodeResourceSpec]:
     for key, read in array.reads.items():
         if not isinstance(read.op, Attend):
             raise _no_layout(array, f"reads[{key!r}].op must be Attend, the only read AttentionConfig runs")
-        if not isinstance(read.mask, Causal | Window):
-            raise _no_layout(array, f"reads[{key!r}].mask must be Causal or Window, the masks AttentionConfig has")
+        if not isinstance(read.mask, Causal | Window | Bidirectional):
+            raise _no_layout(array, f"reads[{key!r}].mask must be Causal, Window or Bidirectional, the masks "
+                                    "AttentionConfig has")
         if read.walks is not None:
             raise _no_layout(array, f"reads[{key!r}].walks must be None, since AttentionConfig has no walk")
     q_heads = {read.op.q_heads for read in array.reads.values()}
@@ -447,8 +449,8 @@ def _array_steps(handle: ArrayHandle, declared: ArrayStep, step: SubmoduleStep, 
             segments=segments, commit=declared.keep, pre_forks=pre, post_forks=post, fork_rids=rows,
             sink=declared.placeholders, eager_write=declared.eager_add,
         )
-    for key in array.reads:
-        steps[key] = AttentionStep(segments=segments, causal=True)
+    for key, causal in handle.causal_reads.items():
+        steps[key] = AttentionStep(segments=segments, causal=causal)
     if array.positions is not None:
         # a step that keeps nothing doesn't advance the counter
         advance = declared.advance if declared.keep else (0,) * len(segments or step.segments)

@@ -57,6 +57,9 @@ class _StubModel:
     def declare_state(self):
         return self.arrays
 
+    def get_chunking_policies(self):
+        return {}
+
     def get_graph_walk_graphs(self):
         return {
             "prefill": GraphNode(name="LLM", input_names=[], outputs=[]),

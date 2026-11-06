@@ -10,7 +10,7 @@ from typing import Any
 import torch
 
 from mstar.engine.resources.step import StepHandle
-from mstar.engine.state.contract import Array, ArrayStep, GatedDeltaNet, Sampler, is_value
+from mstar.engine.state.contract import Array, ArrayStep, Bidirectional, GatedDeltaNet, Sampler, is_value
 from mstar.engine.state.host import HostFields, is_host_value
 
 
@@ -45,6 +45,8 @@ class ArrayHandle(StepHandle):
             layer: self.reads[key]
             for key, read in array.reads.items() for layer in read.layers or array.layers
         }
+        # each read's `AttentionStep.causal`, built once since `state_steps` runs on every step, replays too
+        self.causal_reads = {key: not isinstance(read.mask, Bidirectional) for key, read in array.reads.items()}
         self._kv = None if is_value(array) or not array.max_len else resources[array.name]
         self._views = {} if self._kv is None else {
             layer: self._kv.layer_view(i) for layer, i in self._pool_layer.items()
