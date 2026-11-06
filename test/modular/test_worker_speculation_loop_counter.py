@@ -11,8 +11,11 @@ batch, whose stop check still has to read k.
 """
 
 import sys
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
+
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
@@ -127,7 +130,8 @@ def test_a_transition_into_the_loop_starts_at_its_first_iteration():
     assert spec.is_new_iter is False
 
 
-def test_an_outer_restart_resets_inner_inputs_in_both_speculation_paths():
+@pytest.mark.parametrize("columnar", [False, True])
+def test_an_outer_restart_resets_inner_inputs_in_both_speculation_paths(columnar):
     from mstar.worker.spec_rows import loop_counter_snapshots
 
     shared = {1: _info(1, 3), 2: _info(2, 0)}
@@ -136,15 +140,25 @@ def test_an_outer_restart_resets_inner_inputs_in_both_speculation_paths():
     layout = LoopLayout("outer", descendants=(LOOP,))
     ctx = _context(shared)
     ctx.graph_runtime.loop_layout = lambda walk, name: layout
+    ctx.graph_runtime.graph_passes = lambda selected: [7] * len(selected)
+    ctx.request_state.fwd_infos = lambda rids, partition: [shared[rid] for rid in rids]
+    ctx = replace(ctx, engine_manager=SimpleNamespace(get_engine=lambda node: SimpleNamespace(
+        iteration_layouts=lambda node: {"t2i": layout},
+    )))
     target = SpeculationOutput(
         node_name="dit", graph_walk="t2i", loop_name="outer", is_new_loop_iter=True,
     )
-    spec = _assemble(ctx, target, [1, 2], [1])
-    columnar = loop_counter_snapshots(list(shared.values()), layout, 1)
-    for rid, columns in zip(shared, columnar, strict=True):
+    spec = SpeculationBuilder(ctx).assemble_rows(
+        SimpleNamespace(node_name="dit", graph_walk="t2i", partition=PARTITION), target, [1], 0,
+        fresh_request_to_worker_graph={2: 0}, fresh_inputs={2: {}},
+    ) if columnar else _assemble(ctx, target, [1, 2], [1])
+    snapshots = loop_counter_snapshots(list(shared.values()), layout, 1)
+    for rid, columns in zip(shared, snapshots, strict=True):
         expected = {"outer": 1, LOOP: 0}
         assert spec.node_batch.per_request_info_wrapped[rid].dynamic_loop_iter_counts == expected
         assert columns.dynamic_loop_iter_counts == expected
+        assert spec.node_batch.per_request_info_wrapped[rid].metadata.graph_pass == 7
+        assert spec.node_batch.per_request_input_metadata[rid].graph_pass == 7
     assert shared[1].dynamic_loop_iter_counts == {"outer": 0, LOOP: 3}
 
 

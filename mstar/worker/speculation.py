@@ -324,6 +324,11 @@ class SpeculationBuilder:
             increment_loop=(ctx.graph_runtime.loop_layout(spec_target.graph_walk, spec_target.loop_name)
                             if spec_target.is_new_loop_iter else None),
         )
+        if ctx.engine_manager is not None:
+            stamp_graph_passes(
+                ctx.graph_runtime, ctx.engine_manager.get_engine(spec_node), spec_node, label,
+                input_meta, request_to_worker_graph, request_walks,
+            )
         spec_node_batch = make_executing_batch(
             ctx.streams, node_name=spec_node,
             graph_walk=label,
@@ -340,12 +345,6 @@ class SpeculationBuilder:
             engine=ctx.engine_manager.get_engine(spec_node) if request_walks else None,
             chunk_ranges=chunk_ranges,
         )
-        if self._ctx.engine_manager is not None:
-            stamp_graph_passes(
-                self._ctx.graph_runtime, self._ctx.engine_manager.get_engine(spec_node),
-                spec_node, spec_batch.graph_walk, spec_node_batch.per_request_input_metadata,
-                request_to_worker_graph, spec_batch.request_walks,
-            )
         return Speculation(
             scheduled_batch=spec_batch,
             node_batch=spec_node_batch,
@@ -405,22 +404,22 @@ class SpeculationBuilder:
             request_to_worker_graph=request_to_worker_graph,
             output_signals=spec_target.output_signals,
         )
+        input_meta = dict(zip(request_ids, metadata, strict=True))
+        if self._ctx.engine_manager is not None:
+            stamp_graph_passes(
+                self._ctx.graph_runtime, self._ctx.engine_manager.get_engine(spec_node),
+                spec_node, walk, input_meta, request_to_worker_graph,
+            )
         spec_node_batch = ExecutingBatch(
             node_name=spec_node,
             per_request_info=dict(zip(request_ids, infos, strict=True)),
             per_request_input_tensors=inputs,
-            per_request_input_metadata=dict(zip(request_ids, metadata, strict=True)),
+            per_request_input_metadata=input_meta,
             step_context=StepContext(
                 request_ids=tuple(request_ids), graph_walk=walk, slot=0,
                 capture=False, request_walks={},
             ),
         )
-        if self._ctx.engine_manager is not None:
-            stamp_graph_passes(
-                self._ctx.graph_runtime, self._ctx.engine_manager.get_engine(spec_node),
-                spec_node, spec_batch.graph_walk, spec_node_batch.per_request_input_metadata,
-                request_to_worker_graph, spec_batch.request_walks,
-            )
         return Speculation(
             scheduled_batch=spec_batch,
             node_batch=spec_node_batch,
