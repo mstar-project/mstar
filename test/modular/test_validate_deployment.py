@@ -28,14 +28,16 @@ from test_startup_graph_validation import (
 
 from mstar.conductor.conductor import Conductor
 from mstar.distributed.base import ShardingConfig, ShardingGroup
-from mstar.engine.resources.attn.config import AttentionConfig, AttentionSpec
+from mstar.engine.resources.attn.config import AttentionConfig, AttentionSpec, AttnBackend
 from mstar.engine.resources.attn.ragged.config import (
     RaggedAttentionConfig,
     RaggedAttentionSpec,
     RaggedCrossAttentionSpec,
 )
 from mstar.engine.resources.base import Resource
-from mstar.engine.resources.kv.config import KVSpec, PagedKVConfig
+from mstar.engine.resources.kv.config import KVLayout, KVSpec, PagedKVConfig
+from mstar.engine.resources.linear_attn.config import LinearAttnConfig, LinearAttnSpec, LinearAttnVariant
+from mstar.engine.resources.recurrent.config import DeltaNetGeometry, RecurrentStateConfig, RecurrentStateSpec
 from mstar.engine.resources.sequence_shard import SeqShardSpec, sequence_parallel_refusals
 from mstar.engine.resources.spec import NodeResourceSpec, apply_yaml_overrides, resolve_spec_dependencies
 from mstar.graph.base import GraphEdge, GraphNode, Sequential
@@ -320,6 +322,28 @@ def _cross() -> RaggedCrossAttentionSpec:
     return RaggedCrossAttentionSpec("xattn", {"llm"}, RaggedAttentionConfig(4, 4, 8))
 
 
+def _mla_llm() -> _Model:
+    """A model whose ``llm`` attends an MLA pool, and declares a shard to split its steps."""
+    kv = KVSpec(resource_key="kv", nodes={"llm"}, config=PagedKVConfig(
+        num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=64, num_qo_heads=4, page_size=16,
+        layout=KVLayout.MLA, kv_lora_rank=8, qk_rope_head_dim=4,
+    ))
+    attn = AttentionSpec("attn", {"llm"}, AttentionConfig(kv_cache="kv", backend=AttnBackend.FLASHINFER_MLA,
+                                                          sm_scale=0.1))
+    return _Model(specs=[kv, attn, _shard()], kv_labels={"kv": {"main": KVLabel()}})
+
+
+def _linear(k_heads=2, v_heads=4, k_dim=8, v_dim=8, variant=LinearAttnVariant.GDN) -> list[NodeResourceSpec]:
+    """A gated delta rule layer stack's pool and resource on ``llm``."""
+    geometry = DeltaNetGeometry(
+        num_k_heads=k_heads, num_v_heads=v_heads, head_k_dim=k_dim, head_v_dim=v_dim, conv_kernel_size=4,
+    )
+    return [
+        RecurrentStateSpec("state", {"llm"}, RecurrentStateConfig(num_layers=1, blocks=geometry.to_blocks())),
+        LinearAttnSpec("linear", {"llm"}, LinearAttnConfig(recurrent_state="state", variant=variant)),
+    ]
+
+
 @pytest.mark.parametrize("model,group,kv,pattern", [
     ({}, dict(sp_size=4), dict(page_size=6),
      r"node_groups\[0\]: KV 'kv': context_parallel stripes each page over 4 ranks, which doesn't divide page_size 6"),
@@ -374,9 +398,34 @@ def test_a_kv_placement_the_node_cannot_take_is_refused(model, group, kv, patter
     # the attention spans a node the shard doesn't, so it would split on one and not the other: at any SP size
     ([_shard(), _attention(nodes=("llm", "post"))], dict(sp_size=1), {},
      r"resources.attn: spans nodes \['post'\] without the sequence shard 'shard'"),
+    # a recurrent layer's split exchanges
+    ([_shard(), _attention(), *_linear(k_heads=3, v_heads=6)], dict(sp_size=2), {},
+     r"node_groups\[0\]: linear attention 'linear' trades tokens for heads over 2 SP ranks \(ulysses\), and its "
+     r"3 key heads don't split 2 ways per TP rank: set its sp_exchange to state_passing"),
+    ([_shard(), _attention(), *_linear(v_dim=16)], dict(sp_size=3),
+     {"kv": {"context_parallel": True, "page_size": 18}, "shard": {"exchange": "all_gather"},
+      "linear": {"sp_exchange": "state_passing"}},
+     r"linear attention 'linear' hands state on over 3 SP ranks \(state_passing\), whose middle pieces' "
+     r"transition needs equal key and value head dims; they are 8 and 16"),
+    ([SeqShardSpec("shard", {"llm"}, ("main",), 1), _attention(), *_linear()], dict(sp_size=2), {},
+     r"linear attention 'linear' splits a step's rows into contiguous pieces, and node 'llm''s shard splits each "
+     r"row \(axis 1\)"),
+    ([_shard(), _attention(), *_linear()], dict(sp_size=2),
+     {"kv": {"context_parallel": True}, "shard": {"exchange": "ring"}},
+     r"linear attention 'linear' splits a step's rows into contiguous pieces, and node 'llm''s shard splits by "
+     r"KV 'kv''s stored positions"),
+    # whatever its heads: no exchange of the linear resource's serves it
+    ([_shard(), _attention(), *_linear(k_heads=3, v_heads=3, variant=LinearAttnVariant.KDA)], dict(sp_size=2), {},
+     r"linear attention 'linear' is Kimi delta attention, which takes no split steps"),
+    ([_shard(), _attention(), *_linear()], dict(sp_size=2), {"linear": {"sp_exchange": "ring"}},
+     r"resources.linear: sp_exchange must be one of ulysses, state_passing; got 'ring'"),
+    # a paged attention's split is its node's shard's exchange, not a setting of its own
+    ([_shard(), _attention()], dict(sp_size=2), {"attn": {"sp_exchange": "all_gather"}},
+     r"resources.attn: resource 'attn' takes no sp_exchange; got 'all_gather'"),
 ], ids=["no_attention", "heads_by_head", "axis1_over_positions", "ring_by_head", "all_gather_by_head",
         "ulysses_by_position", "unknown_exchange", "none_by_head", "ring_beside_ragged_ulysses", "ulysses_heads",
-        "axis0_cross", "shard_misses_a_node"])
+        "axis0_cross", "shard_misses_a_node", "linear_ulysses_heads", "linear_state_passing_head_dims",
+        "linear_axis1", "linear_beside_a_ring", "kda", "linear_unknown_exchange", "attention_exchange"])
 def test_a_node_whose_sp_ranks_cant_split_its_steps_is_refused(specs, group, resources, pattern, tmp_path):
     size = group.get("sp_size", 1)
     cfg = _cfg(tmp_path, [{"node_names": ["llm"], "ranks": list(range(size)), **group}], resources=resources)
@@ -401,6 +450,46 @@ def test_a_node_whose_sp_ranks_cant_split_its_steps_is_refused(specs, group, res
 def test_a_node_that_splits_its_steps_or_stores_positions_on_sp_ranks_validates(specs, resources, tmp_path):
     cfg = _cfg(tmp_path, [{"node_names": ["llm"], "ranks": [0, 1], "sp_size": 2}], resources=resources)
     assert _validate(_paged_llm(*specs), cfg).worker_graphs
+
+
+def test_an_mla_node_cant_split_its_steps(tmp_path):
+    """MLA attention takes no split steps: each rank planning its own queries over gathered latents
+    needs admission bounding every rank's plan, which lands with MLA over placed pools. Its pool's
+    one KV head is refused before spawn."""
+    cfg = _cfg(tmp_path, [{"node_names": ["llm"], "ranks": [0, 1], "sp_size": 2}])
+    _refused(_mla_llm(), cfg, r"KV 'kv' stores 4 query and 1 KV heads by head, which don't split 2 ways per TP rank")
+
+
+def _windowed_llm(window_layers=(1,)) -> _Model:
+    """A model whose ``llm`` attends a pool of a full layer and ``window_layers`` keeping a window,
+    and splits its steps."""
+    kv = KVSpec(resource_key="kv", nodes={"llm"}, config=PagedKVConfig(
+        num_layers=1 + len(window_layers), num_kv_heads=2, head_dim=8, max_seq_len=256, num_qo_heads=4,
+    ))
+    full = AttentionSpec("attn", {"llm"}, AttentionConfig(kv_cache="kv"))
+    window = AttentionSpec("window", {"llm"}, AttentionConfig(kv_cache="kv", sliding_window=64,
+                                                              layers=tuple(window_layers)))
+    return _Model(specs=[kv, full, window, _shard()], kv_labels={"kv": {"main": KVLabel()}})
+
+
+@pytest.mark.parametrize("resources, window_layers, refused", [
+    # the full layer split by position, the window layers whole on each rank (kv_gather)
+    ({"kv": {"context_parallel": True}, "shard": {"exchange": "all_gather"}}, (1,), None),
+    # DCP alone: copied steps, no decode collective on the window layers
+    ({"kv": {"context_parallel": True}}, (1,), None),
+    # kv_gather plans contiguous pieces, which a ring's stripe doesn't give
+    ({"kv": {"context_parallel": True}, "shard": {"exchange": "ring"}}, (1,),
+     r"attention 'window' gathers a split step's keys into KV 'kv', which every rank stores whole \(kv_gather\)"),
+    # 3-token window pages (6-token full ones) don't split over the 2 ranks
+    ({"kv": {"context_parallel": True, "page_size": 6}, "shard": {"exchange": "all_gather"}}, (1, 2),
+     r"keeps its sliding-window layers whole on each of its 2 partners in 3-token pages"),
+], ids=["all_gather", "copied", "ring", "window_page"])
+def test_a_node_storing_kv_by_position_keeps_its_window_layers_whole(resources, window_layers, refused, tmp_path):
+    cfg = _cfg(tmp_path, [{"node_names": ["llm"], "ranks": [0, 1], "sp_size": 2}], resources=resources)
+    if refused is None:
+        assert _validate(_windowed_llm(window_layers), cfg).worker_graphs
+    else:
+        _refused(_windowed_llm(window_layers), cfg, refused)
 
 
 def test_expert_parallelism_on_a_node_that_splits_its_steps_is_refused():
@@ -432,11 +521,16 @@ def test_a_resource_over_nodes_that_split_heads_differently_is_refused(tmp_path)
                          r"\['b'\] keep KV by head over them, .* share resources \['shared'\]")
 
 
-def test_qwen3_5_on_sp_ranks_runs_with_its_kv_positions_placed_over_them(tmp_path, monkeypatch):
+@pytest.mark.parametrize("tp, shard", [(4, None), (2, {"exchange": "all_gather"})], ids=["copied", "split"])
+def test_qwen3_5_on_sp_ranks_runs_with_its_kv_positions_placed_over_them(tp, shard, tmp_path, monkeypatch):
+    """As placed, its steps run copied (DCP); with its shard's exchange set they split, and its
+    recurrent layers follow by Ulysses (at a TP size leaving their heads two SP ranks' worth)."""
     config = yaml.safe_load((ROOT / "configs/qwen3_5_27b_tp4.yaml").read_text())
     llm, = (group for group in config["node_groups"] if group["node_names"] == ["LLM"])
-    llm.update(ranks=list(range(8)), tp_size=4, sp_size=2)
+    llm.update(ranks=list(range(2 * tp)), tp_size=tp, sp_size=2)
     config["resources"]["kv_cache"] = {"context_parallel": True}
+    if shard is not None:
+        config["resources"]["llm_shard"] = shard
     path = tmp_path / "cfg.yaml"
     path.write_text(yaml.safe_dump(config))
     assert _validate(_qwen3_5(config["model"], {}, tmp_path, monkeypatch), str(path)).worker_graphs

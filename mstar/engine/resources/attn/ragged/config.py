@@ -191,7 +191,8 @@ class RaggedAttentionSpec(_RaggedSpecBase):
     ``"none"`` (the default) attends only copied labels, heads over TP. ``ulysses`` is a no-op on a
     node with no ``SeqShardSpec``, or one whose sequence shard never splits."""
 
-    sp_exchange: Literal["none", "ulysses"] = "none"
+    # the model's declaration, not a deployment's (``sp_exchanges`` stays empty)
+    sp_exchange: Literal["none", "ulysses"] = field(default="none", kw_only=True)
 
     def __post_init__(self):
         super().__post_init__()
@@ -206,7 +207,9 @@ class RaggedAttentionSpec(_RaggedSpecBase):
     def resolve_exchange(self, specs: Mapping[str, NodeResourceSpec]) -> Literal["none", "ulysses"]:
         return self.sp_exchange
 
-    def split_step_refusals(self, node: str, shard: "SeqShardSpec", tp: int, sp: int) -> list[str]:
+    def split_step_refusals(
+        self, node: str, shard: "SeqShardSpec", tp: int, sp: int, specs: Mapping[str, "NodeResourceSpec"],
+    ) -> list[str]:
         cfg = self.config
         q, kv = cfg._unsharded_qo_heads, cfg._unsharded_kv_heads
         if self.sp_exchange != "ulysses":
@@ -251,7 +254,9 @@ class RaggedCrossAttentionSpec(_RaggedSpecBase):
 
         return take_shard_edge(self, specs)
 
-    def split_step_refusals(self, node: str, shard: "SeqShardSpec", tp: int, sp: int) -> list[str]:
+    def split_step_refusals(
+        self, node: str, shard: "SeqShardSpec", tp: int, sp: int, specs: Mapping[str, "NodeResourceSpec"],
+    ) -> list[str]:
         if shard.axis == 0:
             return [
                 f"ragged cross-attention {self.resource_key!r} on node {node!r}, whose sequence shard "

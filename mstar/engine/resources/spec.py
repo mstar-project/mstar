@@ -10,8 +10,8 @@ what those configs already describe.
 import logging
 from abc import ABC, abstractmethod
 from collections.abc import Collection, Mapping, Sequence
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, NamedTuple, Protocol
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, NamedTuple, Protocol
 
 if TYPE_CHECKING:
     from mstar.engine.resources.attn.config import SpExchange
@@ -19,6 +19,9 @@ if TYPE_CHECKING:
     from mstar.engine.resources.sequence_shard import SeqShardSpec
 
 logger = logging.getLogger(__name__)
+
+# how a resource stores its per-request state over a node's ranks (`NodeResourceSpec.storage`)
+Storage = Literal["by_head", "by_position", "copied"]
 
 
 @dataclass(frozen=True)
@@ -101,6 +104,15 @@ class RoutingMirror(Protocol):
 class NodeResourceSpec(ABC):
     resource_key: str
     nodes: set[str]
+    # how a split step reaches this resource where it has more than one way (``sp_exchanges``): a
+    # deployment's choice, its ``resources:`` block's ``sp_exchange`` (`apply_yaml_overrides`); None
+    # takes the first (`split_exchange`). A ragged attention's is its model's declaration instead
+    # (``RaggedAttentionSpec.sp_exchange``), which no deployment sets
+    sp_exchange: str | None = field(default=None, init=False, repr=False)
+
+    # the ways a split step may reach this resource that a deployment picks among, the default first;
+    # none for one whose way follows from its storage or its model (an attention's, a ragged one's)
+    sp_exchanges: ClassVar[tuple[str, ...]] = ()
 
     def __post_init__(self):
         if not isinstance(self.nodes, set):
@@ -135,22 +147,49 @@ class NodeResourceSpec(ABC):
         return False
 
     @property
-    def places_positions(self) -> bool | None:
-        """Whether this resource places its token positions over ranks that would otherwise hold
-        the same copy (``mstar.engine.resources.context_parallel``); None for one that holds no
-        positions to place. A node whose resources place them runs replicated across its SP ranks."""
+    def storage(self) -> "Storage | None":
+        """How this resource stores its per-request state over a node's ranks: ``by_head`` (each
+        rank a slice of the heads, over TP x SP), ``by_position`` (each a share of every page's
+        token positions over ranks that would otherwise hold the same heads, heads over TP:
+        ``mstar.engine.resources.context_parallel``), or ``copied`` (heads over TP, every SP rank the
+        whole state: a recurrent pool). None for one holding none. A resource
+        over pools that are all ``copied`` shards its heads over TP (``EngineResourceInfo.head_shards``),
+        and a node whose pools store by position runs copied unless its shard's exchange splits it.
+        From raw fields, as the shard's hooks."""
         return None
 
     def resolve_exchange(self, specs: Mapping[str, "NodeResourceSpec"]) -> "SpExchange":
-        """How a split step's tokens reach this attention (``sequence_shard``): ``none`` (the
+        """How a split step's tokens reach this resource (``sequence_shard``): ``none`` (the
         default) for a resource that takes none. From raw fields, so the sequence shard's
-        ``derive`` can ask in any order; a node's steps split where any of its attentions answers
-        otherwise (``SeqShardSpec.splits``)."""
+        ``derive`` can ask in any order; a node's steps split where its shard's ``node_exchange``
+        isn't ``none`` and any of its resources answers otherwise (``SeqShardSpec.splits``).
+
+        Every hook the sequence shard reads is computed from the spec's own raw fields and other
+        specs' hooks, never from a field ``derive`` sets: specs derive in key order, so such a
+        field may still hold its default when the shard derives."""
         return "none"
 
-    def split_step_refusals(self, node: str, shard: "SeqShardSpec", tp: int, sp: int) -> list[str]:
+    @property
+    def split_exchange(self) -> str:
+        """For a resource with ``sp_exchanges``: the one its split steps take, ``sp_exchange`` or
+        the first of them."""
+        return self.sp_exchange or self.sp_exchanges[0]
+
+    def own_exchange(self, specs: Mapping[str, "NodeResourceSpec"]) -> str:
+        """For a resource with ``sp_exchanges``: ``none`` where its node's sequence shard never
+        splits (``shard_exchange``), which ``sp_exchange`` doesn't change, and otherwise
+        ``split_exchange``. From raw fields, as ``resolve_exchange``."""
+        from mstar.engine.resources.sequence_shard import shard_exchange
+
+        if shard_exchange(self, specs) == "none":
+            return "none"
+        return self.split_exchange
+
+    def split_step_refusals(
+        self, node: str, shard: "SeqShardSpec", tp: int, sp: int, specs: Mapping[str, "NodeResourceSpec"],
+    ) -> list[str]:
         """What this resource can't run on ``node``, whose steps ``shard`` splits over ``sp`` SP
-        ranks (``tp`` TP ranks each); each a sentence."""
+        ranks (``tp`` TP ranks each), among ``specs`` (every spec, by key); each a sentence."""
         return []
 
     @property
@@ -287,6 +326,21 @@ def unknown_overrides_message(unknown: list[str], declared: Collection[str]) -> 
     )
 
 
+def apply_resource_block(spec: NodeResourceSpec, block: Mapping[str, Any]) -> None:
+    """One ``resources:`` block on its spec: ``sp_exchange``, which every spec takes from its
+    ``sp_exchanges``, and the rest through the spec's own ``apply_yaml_overrides``. A key the spec
+    doesn't take is a TypeError, a value it can't take a ValueError."""
+    block = dict(block)
+    if "sp_exchange" in block:
+        choice = block.pop("sp_exchange")
+        if not spec.sp_exchanges:
+            raise ValueError(f"resource {spec.resource_key!r} takes no sp_exchange; got {choice!r}")
+        if choice not in spec.sp_exchanges:
+            raise ValueError(f"sp_exchange must be one of {', '.join(spec.sp_exchanges)}; got {choice!r}")
+        spec.sp_exchange = choice
+    spec.apply_yaml_overrides(**block)
+
+
 def apply_yaml_overrides(
     specs: Sequence[NodeResourceSpec], model_config: Mapping[str, Any],
 ) -> None:
@@ -310,7 +364,7 @@ def apply_yaml_overrides(
         raise ValueError(unknown_overrides_message(unknown, by_key))
     for key, kwargs in overrides.items():
         try:
-            by_key[key].apply_yaml_overrides(**kwargs)
+            apply_resource_block(by_key[key], kwargs)
         except TypeError as e:
             # a key the resource doesn't take: a bad config, as every other problem here is
             raise ValueError(f"resources.{key}: {e}") from e

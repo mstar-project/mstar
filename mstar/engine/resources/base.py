@@ -51,12 +51,13 @@ class CGSlotKey:
     label: str
 
 
-def head_shards(group: JointGroups | None, places_positions: bool = False) -> int:
+def head_shards(group: JointGroups | None, tp_only: bool = False) -> int:
     """How many ways a node's ranks split its attention heads: its TP and SP ranks, or TP alone
-    when its pools place positions over the SP ranks (``PagedKVConfig.context_parallel``)."""
+    (``tp_only``) where its pools place positions over the SP ranks (``PagedKVConfig.context_parallel``),
+    or for a resource over pools every SP rank stores whole (``NodeResourceSpec.storage``)."""
     if group is None:
         return 1
-    return group.world_size // group.sp_group.world_size if places_positions else group.world_size
+    return group.world_size // group.sp_group.world_size if tp_only else group.world_size
 
 
 @dataclass(frozen=True)
@@ -90,10 +91,11 @@ class EngineResourceInfo:
     # the prefix caches this engine opens (`opening_prefix_caches`), decided
     # before any resource is built, for one that sizes itself by its own
     prefix_caches: frozenset[str] = frozenset()
-    # how many ways the node's ranks split its attention heads, which each builder sizes head counts
-    # by; None for every TP and SP rank (`head_shards`), which the engine narrows for a node that
-    # places positions over its SP ranks. A ragged resource splits over TP only, unless it declares
-    # ``RaggedAttentionSpec.sp_exchange`` on a node whose steps split.
+    # how many ways the node's ranks split this resource's heads, which each builder sizes head
+    # counts by; None for every TP and SP rank (`head_shards`), which the engine narrows to TP for a
+    # node that places positions over its SP ranks, and for a pool copied over them or a resource
+    # over such pools alone (`NodeResourceSpec.storage`). A ragged resource splits over TP only,
+    # unless it declares ``RaggedAttentionSpec.sp_exchange`` on a node whose steps split.
     head_shards: int | None = None
 
     def __post_init__(self):
@@ -140,6 +142,19 @@ class Resource(ResidentHooks, ABC):
         return set()
 
     def can_capture(self) -> bool:
+        return True
+
+    def captures_bucket(self, bucket: BucketKey, packed: bool) -> bool:
+        """Whether the node captures ``bucket`` (``packed``: a packed config's) at all. False leaves
+        it out by design, unlike a ``can_capture`` refusal (an error, ``dropped_buckets``): a step
+        that fits only such buckets runs eagerly. A resource whose split steps run eagerly only
+        answers False where a step of the bucket may split, so a leased step never splits.
+        From what every rank shares, so every rank captures the same buckets.
+
+        This relies on a step leasing the tightest bucket of its walk and key: with one config type
+        a walk, every bucket a step fits above a skipped one is skipped too. A walk replaying both a
+        packed and a batched config could lease a kept batched bucket for a step that should split
+        (``select_bucket`` doesn't filter by config type); no in-tree model has one."""
         return True
 
     # stays correct when a hit skips the front of a request; required of every resource on a keyed node

@@ -13,6 +13,7 @@ from mstar.engine.resources.attn.base import (
     PlacedAttention,
     captured_page_capacity,
     one_token_rows,
+    own_queries,
 )
 from mstar.engine.resources.attn.config import AttentionStep, refuse_context_only
 from mstar.engine.resources.attn.workspace import Workspace
@@ -31,6 +32,7 @@ from mstar.engine.resources.kv.plan import KVPlanOutputs
 from mstar.engine.resources.spec import CombinedSplit
 from mstar.engine.resources.step import SlotLease, StepContext
 from mstar.platforms import current_platform
+from mstar.utils.h2d import to_device_nonblocking
 from mstar.utils.profiler import PhaseLaps
 
 logger = logging.getLogger(__name__)
@@ -94,6 +96,40 @@ class FlashInferManager(PlacedAttention):
             and fmha_decode_applies(device)
         )
 
+        # a split label's whole step's qo_indptr, for `select_last_hidden` (`kv_gather` plans this
+        # rank's queries alone)
+        self._step_qo: dict[str, torch.Tensor] = {}
+
+    def bind_dependencies(self, resources) -> None:
+        # the pool, built, has paged its groups for its placement (`PagedKVConfig.placed_groups`)
+        self._group = self._kv_config.groups[self._group_idx]
+        self._wrapper_kv_kwargs["page_size"] = self._group.page_size
+        super().bind_dependencies(resources)
+        # every attention over the pool: a window's layers are whole on every partner, so not placed,
+        # but they prefill in the same node's lockstep steps
+        if isinstance(resources[self._kv_cache_name].placement, SPPlacement):
+            self._check_fa2_over_sp()
+
+    def _check_fa2_over_sp(self) -> None:
+        """Over an SP-placed pool: one such server hung at its first 32k prefill on fa2 and the cause
+        isn't known, so fa2 is refused on SM90, where fa3 runs, and warned of where it is the only
+        kernel. Read from the config and the GPU, so every rank of the node decides alike."""
+        capability = current_platform.cuda_capability(self._device)
+        # FlashInfer has fa3 for SM90 only (`_check_window_pool`)
+        fa3 = capability is not None and capability[0] == 9
+        if self._wrapper_kv_kwargs["backend"] == "fa2" and fa3:
+            raise ValueError(
+                f"attention {self._resource_key!r} over KV pool {self._kv_cache_name!r}: flashinfer_backend 'fa2' "
+                "is refused over an SP-placed pool on SM90 after an unexplained one-off lockstep hang in its "
+                "prefill; use 'auto' or 'fa3'"
+            )
+        if capability is not None and not fa3 and self._wrapper_kv_kwargs["backend"] in ("auto", "fa2"):
+            logger.warning(
+                "attention %r over SP-placed KV pool %r prefills on FlashInfer's fa2 kernel, the only one a "
+                "placed pool allows off SM90; an unexplained one-off lockstep hang in an fa2 prefill is still open",
+                self._resource_key, self._kv_cache_name,
+            )
+
     def _bind_placement(self, geometry: dict[str, int]) -> None:
         if geometry["num_qo_heads"] != self._kv_config.num_qo_heads and not self._decode_tensor_cores:
             # a rank attending every partner's query heads over its one KV head (TP placement) forms
@@ -109,31 +145,13 @@ class FlashInferManager(PlacedAttention):
                 "attention over context-parallel KV pool %r decodes on FlashInfer's paged kernel although "
                 "decode_fmha is on: the merge needs each partial's lse", self._kv_cache_name,
             )
-        over_sp = isinstance(self._placement, SPPlacement)
         capability = current_platform.cuda_capability(self._device)
-        # FlashInfer has fa3 for SM90 only (`_check_window_pool`)
-        fa3 = capability is not None and capability[0] == 9
         if capability is not None and capability >= (10, 0) and self._wrapper_kv_kwargs["backend"] == "auto":
             # from SM100 auto can send short rows to cuDNN, whose lse the merge isn't known to
             # read right (`_check_window_pool` resolves it the same way)
             self._wrapper_kv_kwargs["backend"] = "fa2"
             logger.info(
                 "attention over context-parallel KV pool %r plans on fa2 for flashinfer_backend 'auto'",
-                self._kv_cache_name,
-            )
-        # one SP-placed server hung at its first 32k prefill on fa2 and the cause isn't known. Read
-        # from the config and the GPU, so every rank of the node decides alike
-        if over_sp and self._wrapper_kv_kwargs["backend"] == "fa2" and fa3:
-            raise ValueError(
-                f"attention over KV pool {self._kv_cache_name!r}: flashinfer_backend 'fa2' is refused over an "
-                "SP-placed pool on SM90 after an unexplained one-off lockstep hang in its prefill; use 'auto' "
-                "or 'fa3'"
-            )
-        if (over_sp and capability is not None and not fa3
-                and self._wrapper_kv_kwargs["backend"] in ("auto", "fa2")):
-            logger.warning(
-                "attention over SP-placed KV pool %r prefills on FlashInfer's fa2 kernel, the only one a placed "
-                "pool allows off SM90; an unexplained one-off lockstep hang in an fa2 prefill is still open",
                 self._kv_cache_name,
             )
         self._wrapper_kv_kwargs.update(geometry)
@@ -360,10 +378,11 @@ class FlashInferManager(PlacedAttention):
         )
         if self._preplanned:
             # the wrappers were planned a step early against this same step's
-            # KV plan; nothing left to do but promote them
+            # KV plan; nothing left to do but promote them (a leased step, so copied)
             self._current_plan_states = self._preplan_states
             self._preplan_states = {}
             self._preplanned = False
+            self._step_qo.clear()
             return
 
         plan_outputs: KVPlanOutputs = ctx.plan_results.get(self._kv_cache_name)
@@ -377,12 +396,26 @@ class FlashInferManager(PlacedAttention):
         plan_states = self._preplan_states if ctx.is_preplan else self._current_plan_states
 
         plan_states.clear()
+        if not ctx.is_preplan:
+            # not on a pre-plan: the step in flight may still read its own
+            self._step_qo.clear()
         laps = PhaseLaps(f"{ctx.plan_phase}.attn.")
         for label, kv_out in plan_outputs.items():
             indptrs = kv_out.cpu_indptrs
             r = None if shard_plan is None else shard_plan.ranges.get(label)
+            if r is not None and self._split_exchange == "kv_gather":
+                # this rank's own queries over the whole step's keys, every rank storing the
+                # group whole (eager only, `captures_bucket`)
+                assert lease is None, "a leased step split under kv_gather"
+                own = own_queries(indptrs, r, self._group.page_size, step.causal)
+                wrapper = self._eager_wrapper(label, False, ctx.slot)
+                wrapper.plan(causal=step.causal, dtype=self._dtype, window_left=self._window_left,
+                             **own.to_kwargs_dict())
+                self._step_qo[label] = to_device_nonblocking(indptrs.qo_indptr, self._device)
+                plan_states[label] = wrapper
+                continue
             if r is not None and self._split_exchange == "ring":
-                assert lease is None, "a striped sequence shard plans a leased step copied"
+                assert lease is None, "a leased step split under ring"
                 wrapper = self._ring_wrapper(label, ctx.slot)
                 wrapper.plan(kv_out, r.counts, causal=step.causal)
                 plan_states[label] = wrapper
@@ -415,6 +448,8 @@ class FlashInferManager(PlacedAttention):
     ### Submodule-level functionality
     @torch.compiler.disable
     def qo_indptr_buf(self, label: str="main") -> torch.Tensor | None:
+        if label in self._step_qo:
+            return self._step_qo[label]
         if label not in self._current_plan_states:
             return
         # decode wrappers never set one
@@ -463,7 +498,9 @@ class FlashInferManager(PlacedAttention):
         self, q: torch.Tensor, label: str, kv_cache_layer: torch.Tensor, layer_idx: int | None = None,
     ) -> torch.Tensor:
         if self._shard is not None:
-            self._shard.check_bypass(label, "attention run", by_head=self._placement is None)
+            # every rank stores a kv_gather attention's layers whole, heads over TP
+            by_head = self._placement is None and self._split_exchange != "kv_gather"
+            self._shard.check_bypass(label, "attention run", by_head=by_head)
         if self._layers is not None:
             # an explicit layer over the cursor, checked as the cursor is
             if layer_idx is not None:

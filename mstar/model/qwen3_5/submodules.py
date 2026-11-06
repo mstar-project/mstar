@@ -36,6 +36,7 @@ from mstar.engine.resources.position.config import PositionStep
 from mstar.engine.resources.recurrent.config import RecurrentStep
 from mstar.engine.resources.sampler.config import SamplerStep
 from mstar.engine.resources.sampler.resource import SamplerResource
+from mstar.engine.resources.sequence_shard import SeqShardStep, SequenceShard
 from mstar.engine.resources.step import Segment, SlotLease, SubmoduleStep
 from mstar.model.components.mrope import mrope_position_ids
 from mstar.model.components.qwen3_vit import (
@@ -59,6 +60,7 @@ from mstar.model.qwen3_5.config import (
     KV_CACHE,
     LINEAR_ATTN,
     LLM_MIXED,
+    LLM_SHARD,
     MIXED_MAX_PREFILL_ROWS,
     ROPE,
     SAMPLER,
@@ -570,6 +572,7 @@ class LLMSubmodule(ARNodeSubmodule):
                     kept_rids=kept_rids,
                 ),
                 ROPE: PositionStep(advance=advance),
+                LLM_SHARD: SeqShardStep(),
             },
         )
 
@@ -602,7 +605,12 @@ class LLMSubmodule(ARNodeSubmodule):
             if input_embeds is None
             else input_embeds
         )
+        # a step split over the SP ranks runs the stack on this rank's range of its tokens; the
+        # attention and recurrent resources exchange what they need. Identity on a copied step
+        shard: SequenceShard = engine_inputs.resources[LLM_SHARD]
+        embeds, cos_3d, sin_3d = shard.scatter("main", embeds, cos_3d, sin_3d, walk=graph_walk)
         hidden = self.model.model(embeds, label="main", cos_sin=(cos_3d, sin_3d))
+        hidden = shard.gather("main", hidden, walk=graph_walk)
 
         if graph_walk != "decode":
             # only the last token of each prefill row feeds the head

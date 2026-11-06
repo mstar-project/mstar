@@ -27,6 +27,7 @@ from mstar.engine.resources.linear_attn.config import (
 from mstar.engine.resources.position.config import PositionConfig, PositionSpec
 from mstar.engine.resources.recurrent.config import DeltaNetGeometry, RecurrentStateConfig, RecurrentStateSpec
 from mstar.engine.resources.sampler.config import SamplerSpec, SamplingReqConfig
+from mstar.engine.resources.sequence_shard import SeqShardSpec
 from mstar.engine.resources.spec import CombinedSplit, NodeResourceSpec, ResourceReqConfig
 from mstar.graph.base import (
     GraphEdge,
@@ -68,8 +69,10 @@ from mstar.model.qwen3_5.config import (
     KV_CACHE,
     LINEAR_ATTN,
     LLM_MIXED,
+    LLM_SHARD,
     ROPE,
     SAMPLER,
+    SPLIT_WALKS,
     VISION_ATTN,
     Qwen3_5Config,
     Qwen3_5VisionConfig,
@@ -272,6 +275,10 @@ class Qwen3_5DenseModel(Model):
                 vocab_size=self.config.vocab_size,
                 enable_repetion_penalty=True,
             ),
+            # a step split over the LLM's SP ranks; one SP rank, or KV stored by position under the
+            # shard's default exchange (auto), runs every step copied. Decode never splits, so its
+            # compiled frame traces the bracket straight through
+            SeqShardSpec(LLM_SHARD, {"LLM"}, labels=("main",), axis=0, walks=SPLIT_WALKS),
             *self._vision_resources(),
         ]
 

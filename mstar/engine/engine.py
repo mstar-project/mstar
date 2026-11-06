@@ -669,6 +669,13 @@ class Engine:
                     "positions over its SP ranks and another keeps KV by head over them"
                 )
             joint_comm_group = parallel_groups.get_joint_group_for_node(first_node)
+            # a pool every SP rank stores whole, or a resource over such pools alone, shards its
+            # heads over TP alone (`NodeResourceSpec.storage`)
+            storages = (
+                {spec.storage} if spec.storage is not None
+                else {specs_by_key[key].storage for key in spec.depends_on()} - {None}
+            )
+            shards_here = head_shards(joint_comm_group, True) if storages == {"copied"} else shards[first_node]
             self._resources[spec.resource_key] = build_resource(
                 spec,
                 EngineResourceInfo(
@@ -690,7 +697,7 @@ class Engine:
                         spec.resource_key, relevant_nodes, submodules, model,
                     ),
                     prefix_caches=prefix_caches,
-                    head_shards=shards[first_node],
+                    head_shards=shards_here,
                 ),
             )
             for node in relevant_nodes:

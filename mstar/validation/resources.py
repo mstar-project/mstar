@@ -11,6 +11,7 @@ from mstar.engine.resources.runner import topo_sort
 from mstar.engine.resources.spec import (
     TOP_LEVEL_KV_CACHE,
     NodeResourceSpec,
+    apply_resource_block,
     derive_specs,
     spec_dependency_problems,
     unknown_overrides_message,
@@ -73,7 +74,7 @@ def _apply_overrides(
         if key not in by_key:
             continue
         try:
-            by_key[key].apply_yaml_overrides(**kwargs)
+            apply_resource_block(by_key[key], kwargs)
         except (TypeError, ValueError) as e:
             yield f"resources.{key}: {e}"
     # after the overrides, so a page size from the YAML is checked against the pool's window
@@ -126,6 +127,7 @@ def _unskippable_resources(
         node for spec in specs if spec.resource_key in declared
         for node in spec.nodes
     }
+    by_key = {spec.resource_key: spec for spec in specs}
     pools = {spec.resource_key for spec in specs if isinstance(spec, RecurrentStateSpec)}
     readers = {key: [spec for spec in specs if key in spec.depends_on()] for key in pools}
     for spec in specs:
@@ -136,7 +138,9 @@ def _unskippable_resources(
             reader.writes_prefix_snapshots for reader in readers[spec.resource_key]
         ):
             continue
-        if spec.depends_on() and spec.depends_on() <= pools and spec.writes_prefix_snapshots:
+        # a dependency that plans from the step a hit trimmed (a sequence shard) holds nothing to restore
+        held = {dep for dep in spec.depends_on() if not by_key[dep].resource_class.prefix_skip_safe}
+        if held and held <= pools and spec.writes_prefix_snapshots:
             continue
         yield (
             f"resource {spec.resource_key!r} cannot serve a request whose "

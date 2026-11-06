@@ -302,18 +302,26 @@ def test_mla_attention_over_a_placed_pool_is_refused_at_load():
         )
 
 
-def test_a_node_that_splits_its_steps_refuses_a_resource_that_cant_take_them(tmp_path, monkeypatch):
-    """Qwen3.5's recurrent state holds no split strategy: a node splitting its steps over SP ranks
-    can't own one."""
+def test_a_node_that_splits_its_steps_owns_its_recurrent_layers_and_refuses_what_cant_split(tmp_path, monkeypatch):
+    """Qwen3.5's recurrent state and layers take split steps, their heads over TP alone (the pool
+    is copied over SP ranks) where its KV's are over TP x SP; a resource holding no split strategy
+    is refused."""
     groups = WorkerParallelGroups(num_workers=P, global_rank=0)
     groups.add_sp(NODE, _group(0, P))
     specs = _qwen3_5(NODE, {}, tmp_path, monkeypatch).get_node_resources()
     apply_yaml_overrides(specs, {"resources": {KV_CACHE: {"max_num_pages": 8}, GDN_STATE: {"max_slots": 4}}})
-    specs.append(SeqShardSpec("shard", {NODE}, ("main",), 0))
-    with pytest.raises(ValueError, match="does not support steps split over SP ranks"):
+    pool, = (spec for spec in specs if spec.resource_key == GDN_STATE)
+    heads = pool.config.blocks["state"].shape[0]
+
+    def load(specs):
         Engine(graph_runtime=None).load_model(
             {NODE: _Submodule()}, specs=specs, parallel_groups=groups, device=CPU, transfer_engine_info=None,
         )
+
+    load(specs)
+    assert pool.config.blocks["state"].shape[0] == heads
+    with pytest.raises(ValueError, match="'dependent'.*does not support steps split over SP ranks"):
+        load([*specs, _DependentSpec(resource_key="dependent", nodes={NODE}, supports=True)])
 
 
 @dataclass
@@ -418,11 +426,11 @@ class _Case:
         q, k, v, cache = inputs
         return lambda: attn.run(q, "main", kv_cache_layer=cache, k=k, v=v)
 
-    def want(self, causal: bool = True) -> torch.Tensor:
+    def want(self, causal: bool = True, window_left: int = -1) -> torch.Tensor:
         outs = []
         qo = 0
         for kv, (_, new) in zip(self.keys, self.rows, strict=True):
-            outs.append(reference_attention(self.q[qo:qo + new], kv[:, 0], kv[:, 1], causal)[0])
+            outs.append(reference_attention(self.q[qo:qo + new], kv[:, 0], kv[:, 1], causal, window_left)[0])
             qo += new
         return torch.cat(outs)
 
@@ -632,7 +640,8 @@ def _split_step(joint: JointGroups, device: torch.device, dtype: torch.dtype, sp
     (``min_tokens`` above the step), with the step's ``causal``. Each gathers to one rank's
     attention, and the sampler's rows are each row's last token of the whole step."""
     group = joint.sp_group
-    shard = SequenceShard(("main",), 0, None, 0, group, stripe_pool="kv" if split == "ring" else None, device=device)
+    ring = split == "ring"
+    shard = SequenceShard(("main",), 0, None, 0, group, stripe_pool="kv" if ring else None, device=device)
     case = _Case.build(PREFILL_ROWS, device, dtype)
 
     def placed_kv(placement):
@@ -663,6 +672,96 @@ def _split_step(joint: JointGroups, device: torch.device, dtype: torch.dtype, sp
         torch.testing.assert_close(out.float(), case.want(causal), **tol)
         last = attn.select_last_hidden(torch.arange(n, device=device)[:, None])
         assert last.flatten().tolist() == (np.cumsum([new for _, new in PREFILL_ROWS]) - 1).tolist()
+
+
+def _on_sp_ranks(rank, world, store, body, *args):
+    """``body(group, *args)`` on one of ``world`` gloo ranks, over FlashInfer's CPU reference."""
+    dist.init_process_group("gloo", init_method=f"file://{store}", rank=rank, world_size=world)
+    torch.set_num_threads(1)
+    sys.modules["flashinfer"] = reference_flashinfer()
+    group = _group(rank, world)
+    group.device_group, group.initialized = dist.group.WORLD, True
+    try:
+        body(group, *args)
+    finally:
+        group.device_group = None
+        dist.destroy_process_group()
+
+
+WINDOW = 3
+
+
+def _window_split(group: CommGroup) -> None:
+    """``PREFILL_ROWS`` (rows longer than the window) through a sliding-window attention over a
+    pool placed by position over SP ranks, which keeps the window layer whole on every rank
+    (`PagedKVConfig.placed_groups`), so a split step gathers its keys (``kv_gather``): split, then
+    copied, then a copied decode. Each against one rank's windowed attention; the split step's
+    sampler rows are each row's last token of the whole step, and every rank holds the step's K/V.
+    The attention is built before the pool places its groups and reads the window group's plan."""
+    joint = JointGroups(tp_group=CommGroup.trivial(), sp_group=group)
+    # both groups' pages are 2 * CP_PAGE tokens unplaced; placed, the window's are CP_PAGE
+    kv = KVSpec(resource_key="kv", nodes={NODE}, config=PagedKVConfig(
+        num_layers=2, num_kv_heads=1, head_dim=HEAD_DIM, max_seq_len=64, num_qo_heads=Q_HEADS,
+        max_num_pages=16, page_size=2 * CP_PAGE, context_parallel=True,
+    ))
+    specs = resolve_spec_dependencies([
+        kv,
+        AttentionSpec(resource_key="full", nodes={NODE}, config=AttentionConfig(kv_cache="kv")),
+        AttentionSpec(resource_key="window", nodes={NODE}, config=AttentionConfig(
+            kv_cache="kv", sliding_window=WINDOW, layers=(1,),
+        )),
+        SeqShardSpec("shard", {NODE}, ("main",), 0, exchange="all_gather"),
+    ])
+    window = specs["window"]
+    info = EngineResourceInfo(device=CPU, joint_comm_group=joint, kv_dtype=torch.float32, head_shards=1)
+    attn = AttentionManager.build(window, replace(info, dependencies={k: specs[k] for k in window.depends_on()}))
+    assert attn._split_exchange == "kv_gather"
+    shard = SequenceShard.build(specs["shard"], info)
+    placement = kv.config.place(joint, "kv")
+    attn.bind_dependencies({"kv": types.SimpleNamespace(placement=placement, bind_sequence_shard=lambda s: None),
+                            "shard": shard})
+    whole = SPPlacement(1, 0, CommGroup.trivial())
+
+    def step(rows):
+        """A case of ``rows``; the case as the pool plans it, its first group's pages (which the
+        window attention mustn't read) before the window group's, the case's own; and the step's
+        slots in the window group."""
+        case = _Case.build(rows, CPU, torch.float32)
+        first, page = [], 64
+        for view in case.plan["main"].views:
+            pages = -(-view.length // (2 * CP_PAGE))
+            first.append(view._replace(page_idxs=list(range(page, page + pages))))
+            page += pages
+        plan = KVPlanOutputs({"main": KVPlanOutput(build_paged_indptrs(first, 2 * CP_PAGE), first)},
+                             later_groups=(dict(case.plan),))
+        slots = [(view.page_idxs[pos // CP_PAGE], pos % CP_PAGE) for view in case.plan["main"].views
+                 for pos in range(view.length - view.to_compute, view.length)]
+        return case, replace(case, plan=plan), tuple(torch.tensor(a) for a in zip(*slots, strict=True))
+
+    for rows, split_it in ((PREFILL_ROWS, True), (PREFILL_ROWS, False), (DECODE_ROWS, False)):
+        case, planned, (pages, offsets) = step(rows)
+        cache = case.cache(whole, stored_only=True)
+
+        def run(q, k, v, cache=cache, where=(pages, offsets)):
+            # the whole step's K/V, on every rank
+            cache[where[0], 0, where[1]], cache[where[0], 1, where[1]] = k, v
+            return attn.run(q, "main", kv_cache_layer=cache, layer_idx=1)
+
+        q, (k, v) = case.q, case.new_keys()
+        n = q.shape[0]
+        shard.min_tokens = 0 if split_it else n + 1
+        _plan(attn, planned, shard=shard)
+        assert (shard.split_range("main") is not None) == split_it
+        out = shard.gather("main", attn.exchange(run, *shard.scatter("main", q, k, v)))
+        torch.testing.assert_close(out, case.want(window_left=WINDOW - 1))
+        torch.testing.assert_close(cache, case.cache(whole), equal_nan=True)
+        if split_it:
+            last = attn.select_last_hidden(torch.arange(n)[:, None])
+            assert last.flatten().tolist() == (np.cumsum([new for _, new in rows]) - 1).tolist()
+
+
+def test_sp_ranks_split_a_sliding_window_step_over_a_placed_pool_like_one_rank(tmp_path):
+    mp.spawn(_on_sp_ranks, args=(P, str(tmp_path / "store"), _window_split), nprocs=P)
 
 
 def _assert_paired(everyone: list) -> None:
@@ -863,17 +962,78 @@ def test_head_shards_that_dont_divide_the_kv_heads_are_refused():
         config.shard(12)
 
 
-def test_a_pool_that_keeps_a_sliding_window_is_refused_a_placement():
-    """Its pages hold another page size for the windowed layers, which the placed storage doesn't
-    stripe; refused where the storage is placed, before it is allocated."""
-    config = PagedKVConfig(
-        num_layers=2, num_kv_heads=1, head_dim=8, max_seq_len=64, num_qo_heads=2, max_num_pages=8,
-        context_parallel=True,
-    )
-    config.keep_window(16, (1,))
+def test_a_placed_pool_keeping_a_window_stripes_its_full_layers_and_keeps_the_window_whole():
+    """Under a placement the full layers' slots stripe over the partners and the window layers stay
+    whole on each, in pages of 1/P their tokens (an arena page holds a partner's 1/P of a full
+    page): every rank writes each of a step's window tokens, and each full token goes to its owner
+    alone. A window page that doesn't split P ways is refused where the storage is placed."""
+    def pool(page_size=None, window_layers=(1,)):
+        cfg = PagedKVConfig(
+            num_layers=1 + len(window_layers), num_kv_heads=1, head_dim=8, max_seq_len=256, num_qo_heads=2,
+            max_num_pages=48, page_size=page_size, context_parallel=True, prefix_cache=False,
+        )
+        cfg.keep_window(64, window_layers)
+        return cfg
+
+    cfg = pool()
+    full, window = cfg.groups
+    ranks = []
+    for rank in range(P):
+        # one config for both, as one process emulating TP builds them (`_manager`)
+        cfg.shard(P)
+        joint = JointGroups(tp_group=_group(rank, P), sp_group=CommGroup.trivial())
+        ranks.append(KVManager(cfg=cfg, name="kv", joint_comm_group=joint, transfer_engine_info=None,
+                               device=CPU, dtype=torch.float32))
+    assert cfg.groups == (full, replace(window, page_size=window.page_size // P))
+    step = KVStep(segments=(Segment("a", "main", 100),))
+    for kv in ranks:
+        assert kv.kv_cache.layer_view(0).shape[2] == full.page_size // P
+        assert kv.kv_cache.layer_view(1).shape[2] == window.page_size // P
+        kv.ingest_request("a", KVReqConfig(needed_labels=["main"]))
+        assert kv.admit(step, _ctx("a")).ok
+        kv.plan(step, _ctx("a"))
+    written = [[(kv._current_plan_states["main", g].token_to_page != SINK_PAGE).tolist() for kv in ranks]
+               for g in (0, 1)]
+    assert all(sum(owners) == 1 for owners in zip(*written[0], strict=True))
+    assert all(all(rank) for rank in written[1])
+
+    # 3-token window pages (a 6-token full page over 1 full and 2 window layers) don't split 2 ways
+    cfg = pool(page_size=6, window_layers=(1, 2))
     joint = JointGroups(tp_group=_group(0, P), sp_group=CommGroup.trivial())
-    with pytest.raises(ValueError, match="context_parallel is unsupported over a pool that keeps a sliding window"):
-        config.place(joint, "kv")
+    with pytest.raises(ValueError, match="keeps its sliding-window layers whole on each of its 2 partners in 3-token"):
+        cfg.place(joint, "kv")
+
+
+def test_the_startup_fit_check_pages_a_placed_pools_window_as_the_worker_does():
+    """Placed over 2 SP ranks, a window group's pages hold half the tokens, so a request at full
+    length holds 8 full and 16 window pages rather than 8 and 8: 2 requests and the sink need 49
+    of a 40-page arena, which the check refuses on SP ranks and passes on one rank."""
+    import logging
+
+    from mstar.model.utils import check_kv_pools_fit
+
+    def resources():
+        return [
+            KVSpec(resource_key="kv", nodes={NODE}, config=PagedKVConfig(
+                num_layers=2, num_kv_heads=1, head_dim=8, max_seq_len=64, max_num_pages=20, page_size=8,
+                context_parallel=True,
+            )),
+            AttentionSpec(resource_key="full", nodes={NODE}, config=AttentionConfig(kv_cache="kv")),
+            AttentionSpec(resource_key="window", nodes={NODE}, config=AttentionConfig(
+                kv_cache="kv", sliding_window=8, layers=(1,),
+            )),
+        ]
+
+    model = types.SimpleNamespace(get_node_resources=resources)
+    log = logging.getLogger(__name__)
+    for sp, fits in ((1, True), (P, False)):
+        config = {"max_concurrent_requests": 2,
+                  "node_groups": [{"node_names": [NODE], "ranks": list(range(sp)), "sp_size": sp}]}
+        if fits:
+            check_kv_pools_fit(model, config, "cfg.yaml", log)
+        else:
+            with pytest.raises(ValueError, match="need 25 pages of resources.kv"):
+                check_kv_pools_fit(model, config, "cfg.yaml", log)
 
 
 # a step that isn't causal (BAGEL's image generation, say) attends every token of its rows
@@ -1289,7 +1449,8 @@ def test_a_capture_combining_labels_over_a_placed_pool_is_refused_at_load_if_it_
         capture_batch_sizes=batch_sizes, total_tokens_multiplier=multiplier,
     )
     joint = JointGroups(tp_group=_group(0, P), sp_group=CommGroup.trivial())
-    kv = types.SimpleNamespace(can_capture=lambda: True, placement=PagedKVConfig(
+    kv = types.SimpleNamespace(can_capture=lambda: True, captures_bucket=lambda bucket, packed: True,
+                               placement=PagedKVConfig(
         num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=64, page_size=8, context_parallel=True,
     ).place(joint, "kv"))
     step = types.SimpleNamespace(steps={"kv": KVStep(combined_labels={("cond", "uncond"): "cfg"})})
@@ -1374,6 +1535,49 @@ def test_fa2_over_an_sp_placed_pool(monkeypatch, caplog, over_sp, capability, ba
         return
     with caplog.at_level(logging.WARNING, logger=fi_mod.logger.name):
         _cp_attention(joint, CPU, torch.float32, flashinfer_backend=backend)
+    assert any("fa2" in r.getMessage() for r in caplog.records) == (outcome == "warned")
+
+
+@pytest.mark.parametrize("over_sp, capability, backend, outcome", [
+    (True, (9, 0), "fa2", "refused"), (True, (9, 0), "auto", "quiet"), (True, (10, 0), "auto", "warned"),
+    (False, (9, 0), "fa2", "quiet"),
+])
+def test_fa2_over_an_sp_placed_pool_holds_for_a_windows_layers(
+    monkeypatch, caplog, over_sp, capability, backend, outcome,
+):
+    """A window's layers are whole on every partner, so not placed, but they prefill in the SP-placed
+    node's lockstep steps: the same rule as the placed layers, naming the attention to change. A
+    TP-placed pool's window doesn't care."""
+    monkeypatch.setenv("MSTAR_WORKSPACE_BUFFER_MB", "1")
+    platform = types.SimpleNamespace(cuda_capability=lambda device=None: capability)
+    monkeypatch.setattr(fi_mod, "current_platform", platform)
+    if over_sp:
+        joint = JointGroups(tp_group=CommGroup.trivial(), sp_group=_group(0, P))
+    else:
+        joint = JointGroups(tp_group=_group(0, P), sp_group=CommGroup.trivial())
+    kv = KVSpec(resource_key="kv", nodes={NODE}, config=PagedKVConfig(
+        num_layers=2, num_kv_heads=1, head_dim=HEAD_DIM, max_seq_len=64, num_qo_heads=Q_HEADS,
+        max_num_pages=16, page_size=2 * CP_PAGE, context_parallel=True,
+    ))
+    specs = resolve_spec_dependencies([
+        kv,
+        AttentionSpec(resource_key="full", nodes={NODE}, config=AttentionConfig(kv_cache="kv")),
+        AttentionSpec(resource_key="window", nodes={NODE}, config=AttentionConfig(
+            kv_cache="kv", sliding_window=3, layers=(1,), flashinfer_backend=backend,
+        )),
+    ])
+    window = specs["window"]
+    info = EngineResourceInfo(device=CPU, joint_comm_group=joint, kv_dtype=torch.float32,
+                              head_shards=joint.tp_group.world_size, dependencies={"kv": kv})
+    attn = AttentionManager.build(window, info)
+    resources = {"kv": types.SimpleNamespace(placement=kv.config.place(joint, "kv"))}
+    if outcome == "refused":
+        with pytest.raises(ValueError, match="attention 'window' .*'fa2' is refused over an SP-placed pool on SM90"):
+            attn.bind_dependencies(resources)
+        return
+    with caplog.at_level(logging.WARNING, logger=fi_mod.logger.name):
+        attn.bind_dependencies(resources)
+    assert attn._placement is None
     assert any("fa2" in r.getMessage() for r in caplog.records) == (outcome == "warned")
 
 
