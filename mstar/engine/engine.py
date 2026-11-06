@@ -1797,6 +1797,8 @@ class Engine:
         slot = batch.slot or 0
         steps: dict[str, SubmoduleStep] = {}
         ctxs: dict[str, StepContext] = {}
+        # a combined step's rows keep their own walks
+        walks = batch.step_context.request_walks
         for i, (rid, inp) in enumerate(
             zip(batch.request_ids, batch.inputs, strict=True)
         ):
@@ -1805,6 +1807,7 @@ class Engine:
                 graph_walk=batch.step_context.graph_walk,
                 slot=slot, capture=False,
                 rebuild_rids=batch.step_context.rebuild_rids,
+                request_walks={rid: walks[rid]} if rid in walks else {},
             )
             if i != len(batch.request_ids) - 1:
                 slot = submodule_mgmt.lease_slot()
