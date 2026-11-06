@@ -139,6 +139,8 @@ logger = logging.getLogger(__name__)
 # The request's `CFGWindow`, which process_prompt resolves with its guidance
 # kwargs: the conductor's loop caps and walk schedule read it.
 CFG_WINDOW = "cfg_window"
+# kwargs: whether process_prompt wrote role turns. The schedule sees no roles, so it can't tell.
+ROLE_TURNS = "role_turns"
 
 # ---------------------------------------------------------------------------
 # System prompts (used when think_mode=True)
@@ -153,6 +155,21 @@ GEN_THINK_SYSTEM_PROMPT = (
     "You should first think about the planning process in the mind "
     "and then generate the image."
 )
+
+
+def uses_role_turns(parts: list[PromptPart], understanding: bool) -> bool:
+    """Whether the prompt is written as role turns after a system turn.
+
+    Only understanding whose last turn has text is. Upstream's
+    ``interleave_inference`` writes no roles for any request, and a last turn of
+    images alone is answered with a greeting under them, so that chat prefills
+    as upstream's does (see ``BagelModel._render_bare``). No text span need lead
+    that plan, and think mode prefills its instruction ahead of it, as
+    generation does. A text slot counts even if empty; intake drops empty text
+    before it gets here.
+    """
+    turns = chat_turns(parts)
+    return understanding and bool(turns) and any(part.modality == TEXT for part in turns[-1].parts)
 
 
 # ---------------------------------------------------------------------------
@@ -291,7 +308,7 @@ class BagelModel(Model):
     """
 
 
-    INTERNAL_KWARGS = (CFG_WINDOW,)
+    INTERNAL_KWARGS = (CFG_WINDOW, ROLE_TURNS)
 
     def __init__(
         self,
@@ -561,29 +578,34 @@ class BagelModel(Model):
             )
         return {"image": (self.boi_token_id, pad, self.eoi_token_id)}
 
-    def _render_prompt(
-        self, parts: list[PromptPart], *, is_understanding: bool, system_prompt: str
-    ) -> str:
-        """Write the request out in order, attachments as placeholders.
+    def _render_role_turns(self, parts: list[PromptPart], think_mode: bool) -> str:
+        """Write each turn in its own role block, attachments as placeholders.
 
-        Understanding writes each turn in its own role block. A text run
-        following an attachment carries the newline the old suffix supplied,
-        and a turn ending on one closes after a newline too, so every image
-        layout a single user turn could express renders to the string that
-        template gave. Generation leaves attachments outside the turn — the
-        prefill_vae/vit walks put the input image ahead of the prompt — and
-        wraps what follows.
+        A text run following an attachment carries the newline the old suffix
+        supplied, and a turn ending on one closes after a newline too, so every
+        image layout a single user turn with text could express renders to the
+        string that template gave.
         """
-        if is_understanding:
-            blocks = [self.VLM_TURN.format(role="system", content=system_prompt)]
-            for turn in chat_turns(parts):
-                body, after_attachment = self._render_body(turn.parts, sep="\n")
-                if after_attachment:
-                    body.append("\n")
-                blocks.append(self.VLM_TURN.format(role=turn.role, content="".join(body)))
-            return "".join(blocks) + self.VLM_REPLY
+        system_prompt, body = self.BAGEL_DEFAULT_SYSTEM_PROMPT, parts
+        if len(parts) > 1 and parts[0].role == "system":
+            # a leading system message takes the default's place; a lone
+            # one stays the turn it was, not an empty one after the default
+            system_prompt, body = parts[0].text, parts[1:]
+        if think_mode:
+            system_prompt = f"{system_prompt} {VLM_THINK_SYSTEM_PROMPT}"
+        blocks = [self.VLM_TURN.format(role="system", content=system_prompt)]
+        for turn in chat_turns(body):
+            text, after_attachment = self._render_body(turn.parts, sep="\n")
+            if after_attachment:
+                text.append("\n")
+            blocks.append(self.VLM_TURN.format(role=turn.role, content="".join(text)))
+        return "".join(blocks) + self.VLM_REPLY
 
-        # Generation: attachments written before any text stay outside the turn.
+    def _render_generation(self, parts: list[PromptPart]) -> str:
+        """Leave attachments written before any text outside the turn, and wrap what follows.
+
+        The prefill_vae/vit walks put the input image ahead of the prompt.
+        """
         body, _ = self._render_body(parts, sep="")
         lead = 0
         while lead < len(body) and body[lead] == self.IMAGE_PLACEHOLDER:
@@ -591,6 +613,18 @@ class BagelModel(Model):
         return "".join(body[:lead]) + self.GEN_TEMPLATE.format(
             prompt="".join(body[lead:])
         )
+
+    def _render_bare(self, parts: list[PromptPart]) -> str:
+        """Write the request as upstream's ``interleave_inference`` prefills it.
+
+        Each text in its own block with no role, each image where it was written,
+        then the ``<|im_start|>`` that ``gen_text`` opens the reply with.
+        """
+        blocks = [
+            self.BOS_EOS_TEMPL.format(prompt=part.text or "") if part.modality == TEXT else self.IMAGE_PLACEHOLDER
+            for part in parts
+        ]
+        return "".join(blocks) + "<|im_start|>"
 
     def _render_body(self, parts: list[PromptPart], sep: str) -> tuple[list[str], bool]:
         """Write ``parts`` out in order, and say whether the last is an attachment.
@@ -655,12 +689,13 @@ class BagelModel(Model):
                     raise ValueError(f"BAGEL image {key} must be an integer, got {value!r}")
         result: NameToTensorList = {}
 
+        is_understanding = (output_modalities or ["text"])[0] == "text"
+        if prompt is None and "image" in input_modalities and is_understanding:
+            # an image-only chat still opens its reply
+            prompt = ""
         if prompt is not None:
-            target_output = output_modalities[0] if output_modalities else "text"
-            is_understanding = target_output == "text"
             has_image = "image" in input_modalities
             think_mode = params["think_mode"]
-            system_prompt = self.BAGEL_DEFAULT_SYSTEM_PROMPT
 
             texts, roles = prompt, None
             if prompt_parts is not None:
@@ -679,19 +714,13 @@ class BagelModel(Model):
                     parts, {"image": len(tensors.get("image_inputs", []))},
                 )
 
-            body = parts
-            if is_understanding and len(parts) > 1 and parts[0].role == "system":
-                # a leading system message takes the default's place; a lone
-                # one stays the turn it was, not an empty one after the default
-                system_prompt, body = parts[0].text, parts[1:]
-            if think_mode and is_understanding:
-                system_prompt = f"{system_prompt} {VLM_THINK_SYSTEM_PROMPT}"
-
-            text = self._render_prompt(
-                body,
-                is_understanding=is_understanding,
-                system_prompt=system_prompt,
-            )
+            role_turns = uses_role_turns(parts, is_understanding)
+            if role_turns:
+                text = self._render_role_turns(parts, think_mode)
+            elif is_understanding:
+                text = self._render_bare(parts)
+            else:
+                text = self._render_generation(parts)
             if is_understanding and not has_image:
                 # No attachment: one span, one walk, nothing to scan.
                 segments = [self._encode_text(text)]
@@ -700,18 +729,15 @@ class BagelModel(Model):
                 spans = find_media_spans(input_ids, self._placeholder_specs())
                 segments = split_around_spans(input_ids, spans)
                 check_plan(
-                    prefill_plan(parts, leading_text=is_understanding),
+                    prefill_plan(parts, leading_text=role_turns),
                     spans,
                     len(segments),
                 )
-                if think_mode and not is_understanding:
+                if think_mode and not role_turns:
                     # Not part of the request layout: tokenized on its own and
                     # prefilled ahead of the plan.
-                    segments.insert(
-                        0, self._encode_text(
-                            self.BOS_EOS_TEMPL.format(prompt=GEN_THINK_SYSTEM_PROMPT)
-                        )
-                    )
+                    instruction = VLM_THINK_SYSTEM_PROMPT if is_understanding else GEN_THINK_SYSTEM_PROMPT
+                    segments.insert(0, self._encode_text(self.BOS_EOS_TEMPL.format(prompt=instruction)))
             result["text_inputs"] = segments
 
         # Image edit path: both input and output include "image". Resize the
@@ -740,7 +766,8 @@ class BagelModel(Model):
             return result
         if prompt is None:
             parts, segments = parts_from_modalities(input_modalities), []
-        metadata = {}
+            role_turns = uses_role_turns(parts, is_understanding)
+        metadata = {ROLE_TURNS: role_turns}
         window = None
         if "image" in output_modalities:
             window = cfg_window(
@@ -748,12 +775,14 @@ class BagelModel(Model):
                 params["cfg_text_scale"], params["cfg_img_scale"],
             )
             metadata[CFG_WINDOW] = tuple(window)
-        metadata["kv_layout"] = {"kv": self._kv_layout(parts, segments, images, output_modalities, params, window)}
+        metadata["kv_layout"] = {
+            "kv": self._kv_layout(parts, segments, images, output_modalities, params, window, role_turns),
+        }
         return ProcessPromptOutput(result, metadata)
 
     def _kv_layout(
         self, parts: list[PromptPart], segments: list[torch.Tensor], images: list[torch.Tensor],
-        output_modalities: list[str], params: dict, window: CFGWindow | None,
+        output_modalities: list[str], params: dict, window: CFGWindow | None, role_turns: bool,
     ) -> dict[str, LabelLayout]:
         """Each label's writes, in the order `_build_prefill_schedule` runs them.
 
@@ -770,7 +799,7 @@ class BagelModel(Model):
         understanding = target_output == "text"
         think_mode, image_preprocess = params["think_mode"], vit_preprocess(params["image_preprocess"])
         spans = []
-        if think_mode and not understanding and segments:
+        if think_mode and not role_turns and segments:
             spans.append(Span("ids", "prefill_text", segments[0].numel(), segments[0].numel(), "text_inputs"))
 
         def image(step: PromptPart) -> list[Span]:
@@ -787,7 +816,7 @@ class BagelModel(Model):
 
         texts = segments[len(spans):]
         # skip a text step the prompt has no tensor for, as `_build_prefill_schedule` does
-        plan = prefill_plan(parts, leading_text=understanding)
+        plan = prefill_plan(parts, leading_text=role_turns)
         plan = [step for step in plan if step.modality != TEXT or step.index < len(texts)]
         spans += prompt_spans(plan, texts, "prefill_text", image)
         keyed = int(bool(spans) and spans[0].kind == "ids")
@@ -839,6 +868,8 @@ class BagelModel(Model):
             size=(new_h, new_w),
             mode="bilinear",
             align_corners=False,
+            # filter before downsampling, as the reference's PIL resize does
+            antialias=True,
         )
         return resized.squeeze(0)
 
@@ -877,7 +908,8 @@ class BagelModel(Model):
 
         An image in an understanding prompt is keyed by its file. An edit's VAE
         walk writes ``main`` too, but the keys of ``main`` leave that walk out. A
-        chat sends a reply back as its own assistant turn, so its pages match.
+        chat sends a reply back as its own assistant turn, so its pages match
+        while the chat keeps one prompt shape: see :func:`uses_role_turns`.
         """
         decode = ((DECODE, "decode_loop"),)
         return {"kv": {
@@ -1271,25 +1303,24 @@ class BagelModel(Model):
         self, input_modalities: list[str],
         input_signals: dict[str, list[TensorPointerInfo]],
         is_understanding: bool,
+        role_turns: bool,
         think_mode: bool = False,
     ):
         """Sequential list of ``(graph_walk_name, input tensor info)``.
 
         Walks the prefill plan, so attachments prefill where they were written
-        and N of them get N walks. Understanding opens with the system span
-        ahead of them; generation opens straight into them, after the
+        and N of them get N walks. Role turns open with the system span ahead
+        of them; any other prompt keeps the order it was written in, after the
         think-mode span when there is one.
         """
         texts = list(input_signals.get("text_inputs", []))
         images = input_signals.get("image_inputs", [])
 
         schedule: list[tuple[str, TensorPointerInfo]] = []
-        if think_mode and not is_understanding and texts:
+        if think_mode and not role_turns and texts:
             schedule.append(("prefill_text", texts.pop(0)))
 
-        plan = prefill_plan(
-            parts_from_modalities(input_modalities), leading_text=is_understanding,
-        )
+        plan = prefill_plan(parts_from_modalities(input_modalities), leading_text=role_turns)
         for step in plan:
             pool = texts if step.modality == "text" else images
             if step.index >= len(pool):
@@ -1463,6 +1494,7 @@ class BagelModel(Model):
             input_modalities=input_modalities,
             input_signals=input_signals,
             is_understanding=(target_output == "text"),
+            role_turns=(model_kwargs or {})[ROLE_TURNS],
             think_mode=think_mode,
         )
 
