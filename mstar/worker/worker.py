@@ -708,6 +708,16 @@ class Worker:
         # leader said so (TPNoSpeculation) or this rank closed the step.
         self._tp_nospec: RecentSet[int] = RecentSet(self._TP_NOSPEC_KEEP)
         self._tp_leader_gap_warned = False
+        # without these the runtime sees no parallel node, and its speculation
+        # filter never holds one to the leader
+        self._graph_runtime.set_node_metadata(
+            parallel_nodes=self.parallel_nodes,
+            parallel_leader_nodes=self.parallel_leader_nodes,
+            tp_async_nodes={
+                n for n in node_names if self._tp_async_for(n)
+            },
+        )
+
         tp_async_on = sorted(n for n in self.parallel_nodes if self._tp_async_for(n))
         if tp_async_on:
             logger.info(
@@ -2256,6 +2266,17 @@ class Worker:
         """
         engine = self.engine_manager.get_engine(spec_node_batch.node_name)
         engine.reset_pre_plan_for_batch(spec_node_batch)
+
+    def _engine_thread_pool(self, name: str) -> ThreadPool:
+        """A one-thread pool for the GPU or plan thread, started here: before torch 2.12 dynamo's
+        config is process-wide, so an initializer that ran at the first step could reset a
+        recompile limit the other thread's compiled call had raised (``with_recompile_limit``)."""
+        pool = ThreadPool(
+            max_workers=1, thread_name_prefix=f"{name}-{self.worker_id}",
+            initializer=self._init_engine_thread,
+        )
+        pool.submit(int).result()
+        return pool
 
     def _init_engine_thread(self) -> None:
         """Pin this executor thread to the worker's accelerator device.
@@ -5075,10 +5096,7 @@ class Worker:
         # the main loop can overlap queue/tensor polling and post-processing
         # with GPU execution. Run the engine unconditionally on a dedicated
         # 1-worker GPU thread.
-        gpu_executor = ThreadPool(
-            max_workers=1, thread_name_prefix=f"mstar-gpu-{self.worker_id}",
-            initializer=self._init_engine_thread,
-        )
+        gpu_executor = self._engine_thread_pool("mstar-gpu")
         logger.info(
             "Worker %s: engine runs on dedicated GPU thread",
             self.worker_id,
@@ -5100,10 +5118,7 @@ class Worker:
         launch_wait_s = self._launch_wait_s
         plan_executor = None
         if pre_plan_spec:
-            plan_executor = ThreadPool(
-                max_workers=1, thread_name_prefix=f"mstar-plan-{self.worker_id}",
-                initializer=self._init_engine_thread,
-            )
+            plan_executor = self._engine_thread_pool("mstar-plan")
             logger.info(
                 "Worker %s: plan_executor enabled — speculative plan() "
                 "pre-runs on a dedicated thread",

@@ -316,7 +316,9 @@ def _router_topk_kernel(part, bias, w_out, id_out, T, scale,
     kk = tl.arange(0, KP)
     ids = tl.zeros([KP], tl.int32)
     for j in tl.static_range(K):
-        idx = tl.argmax(rank, 0)
+        # A NaN row (a captured prefill's padding) compares false everywhere, so argmax can
+        # land on a padding lane: keep the id an expert.
+        idx = tl.minimum(tl.argmax(rank, 0), E - 1)
         ids = tl.where(kk == j, idx, ids)
         rank = tl.where(e == idx, float("-inf"), rank)
     ws = tl.sum(tl.where(e[None, :] == ids[:, None], score[None, :], 0.0), 1)
@@ -768,6 +770,20 @@ def route(x, w, bias, *, top_k, scale, normalize):
     if T:
         _launch_router(x, w, bias, part, topk_w, topk_ids, scale, normalize, False, tuning)
     return topk_w, topk_ids
+
+
+@torch.library.custom_op("mstar::moe_route", mutates_args=())
+def route_op(x: torch.Tensor, w: torch.Tensor, bias: torch.Tensor, top_k: int, scale: float,
+             normalize: bool) -> tuple[torch.Tensor, torch.Tensor]:
+    """``route`` as an op opaque to dynamo, so a compiled gate keeps it whole."""
+    return route(x, w, bias, top_k=top_k, scale=scale, normalize=normalize)
+
+
+@route_op.register_fake
+def _(x, w, bias, top_k, scale, normalize):
+    T = x.shape[0]
+    return (x.new_empty(T, top_k, dtype=torch.float32),
+            x.new_empty(T, top_k, dtype=torch.int64))
 
 
 @torch.library.custom_op("mstar::moe_router_topk", mutates_args=())
