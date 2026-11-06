@@ -983,8 +983,8 @@ def test_a_request_back_from_the_host_moves_again_for_an_older_request_waiting_i
     assert _ready(kv, "p"), "p didn't get the room z made"
 
 
-def test_a_request_back_from_a_drop_is_still_a_victim_for_an_older_request():
-    kv = _pool()
+def _rebuilt(kv) -> None:
+    """``v``, dropped for ``o``, is rebuilt beside ``a``, which arrived before it."""
     _running(kv, "o", 3, arrival=0)
     _running(kv, "v", 2, arrival=2)
     assert _step(kv, "o", 5 * PAGE_SIZE).ok
@@ -995,12 +995,34 @@ def test_a_request_back_from_a_drop_is_still_a_victim_for_an_older_request():
     assert _ready(kv, "a") and _admitted(kv, "v")
     assert _step(kv, "v", 2 * PAGE_SIZE).ok
     kv.land_rebuild("v")
+
+
+def test_a_request_back_from_a_drop_is_still_a_victim_for_an_older_request():
+    kv = _pool()
+    _rebuilt(kv)
+    assert _step(kv, "v", 1).ok
     while (outcome := _step(kv, "a", PAGE_SIZE)).ok:
         pass
 
     victims = _preempt(kv, "a", outcome.reason.pages_short, droppable=lambda rid: True)
 
     assert "v" in (*victims.to_host, *victims.to_drop, *victims.to_ask), "v held back pages an older request needed"
+
+
+def test_a_rebuilt_request_isnt_chosen_again_until_it_writes_a_token():
+    """A rebuilt request lands as the newest request holding pages, so the next older request that ran short dropped
+    it again before it kept a token, and the whole rebuild was wasted. With requests going around more than once,
+    that could repeat for as long as older requests ran short."""
+    kv = _pool()
+    _rebuilt(kv)
+    while (outcome := _step(kv, "a", PAGE_SIZE)).ok:
+        pass
+
+    victims = _preempt(kv, "a", outcome.reason.pages_short, droppable=lambda rid: True)
+
+    assert "v" not in (*victims.to_host, *victims.to_drop, *victims.to_ask), "v's rebuild was thrown away unused"
+    assert victims.waits, "a took room that v's next step needs"
+    assert _step(kv, "v", 1).ok, "v's first step after its rebuild ran short"
 
 
 def test_a_failed_reload_puts_a_request_back_from_the_host_on_the_host_again():

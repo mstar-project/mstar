@@ -228,7 +228,7 @@ def _make_rebuilds(
     graphs = model.get_graph_walk_graphs() if model is not None else {}
     policies = {} if model is None else policies_run_here(model.rebuild_policies(), graphs, my_walks, lockstep_nodes)
     host_mb = _serving_mb(model_config, "rebuild_host_mb", DEFAULT_REBUILD_HOST_MB)
-    if any(names for node, policy in policies.items() for names in policy.check(node, graphs).values()):
+    if host_mb and any(names for node, policy in policies.items() for names in policy.check(node, graphs).values()):
         host_mb += _serving_mb(model_config, "rebuild_media_host_mb", DEFAULT_REBUILD_MEDIA_HOST_MB)
     return Rebuilds(
         policies, graphs, HostPool(host_mb << 20, device) if host_mb and policies else None, engine.host_allowance,
@@ -5692,6 +5692,7 @@ class Worker:
                     if side_steps is not None and side_steps.pending is not None:
                         side_steps.finish(block=True)
                         continue
+                    self._rebuilds.flush_idle()
                     self.communicator.wait_for_work(10)
                     continue
 

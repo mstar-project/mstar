@@ -28,6 +28,7 @@ from mstar.engine.resources.step import StepContext  # noqa: E402
 from mstar.platforms import CpuPlatform, CudaPlatform, RocmPlatform, interface  # noqa: E402
 from mstar.utils import cpus, threads  # noqa: E402
 from mstar.utils.cpus import CpuPlan, CpuPlanError, StepCpus, deployment_plan, parse_cpu_list  # noqa: E402
+from mstar.worker.rebuild import Rebuilds  # noqa: E402
 from mstar.worker.worker import Worker  # noqa: E402
 
 REPO = Path(__file__).resolve().parents[2]
@@ -1643,6 +1644,7 @@ def test_run_moves_the_main_gpu_and_plan_threads_to_their_cpus(monkeypatch, intr
                  "_thread_outputs_to_speculative", "_postprocess_batch"):
         setattr(w, name, stub)
     w._preemption = SimpleNamespace(make_room=stub)
+    w._rebuilds = Rebuilds({}, {})
     w.maybe_send_zmq_to_tp_followers = lambda node_batch: -1
     w._build_executing_batch = executing
     w._build_speculation = build_speculation

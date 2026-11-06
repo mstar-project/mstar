@@ -350,6 +350,7 @@ def _looping_worker(monkeypatch, schedule, speculate, refuse):
     w._preemption = SimpleNamespace(
         preempt=lambda node_batch: False, remove_request=lambda rid: None, make_room=lambda: None,
     )
+    w._rebuilds = Rebuilds({}, {})
     w.parallel_groups = SimpleNamespace(barrier_all=stub, restore_default_timeout=stub)
     w.engine_manager = SimpleNamespace(warmup_all=stub, get_engine=lambda node: eng)
     w.communicator = SimpleNamespace(send=stub, wait_for_work=stub)
