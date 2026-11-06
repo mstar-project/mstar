@@ -152,16 +152,26 @@ the roofline.
   `python -m mstar_sim -- -m benchmark.runner --url ...` to read the server's time (`MSTAR_SIM_NODE`
   names the table when a port can't be read). A client with no port of its own to pair on has a
   table to itself, and shows a wait on the server as the real time it took. A test run is not a
-  deployment: `-m pytest` keeps a private table per process. A process is held within 0.5 ms of the others at its
-  clock reads. Between reads it isn't, and nothing bounds rank against rank: ranks can differ by
-  their skew at collectives (`meet_skew_s`). A message on its way has a runnable thread on its
-  path, so a process isn't moved past one; a third process can read the receiver's old next event
-  just before, which a 200 us settle window covers but a loaded box can overrun
-  (`late_deliveries`).
+  deployment: `-m pytest` keeps a private table per process. A process is held within 0.5 ms of
+  the others at its clock reads. Between reads it isn't, and nothing bounds rank against rank on
+  the host: a collective starts once the last rank has launched it (`meet_skew_s`), but a rank's
+  clock isn't held to its peers'. A message on its way has a runnable thread on its path, so a
+  process isn't moved past one; a third process can read the receiver's old next event just
+  before, which a 200 us settle window covers but a loaded box can overrun. Nothing counts that
+  case (`late_deliveries` counts only a message a process polls near its own move).
+- Idle processes of one table step from event to event, faster than real time. A timer in it on
+  something outside the table fires early in real time: uvicorn's 5 s keep-alive closes a plain
+  client's idle connection early, and a socket read with a timeout (a remote fetch) can time out
+  falsely. Run clients under the emulator. A process stays in its table until it dies, running at
+  real rate once it begins to exit, so a peer's `join(timeout)` waits out its finalization.
+- A thread at a collective's meet holds its process's host deadlines (a sleep beside it) until
+  the meet ends; device waits beside it end on time.
+- A native task of a process with nothing else running that stays on a CPU (a spin wait) holds
+  the process's moves for up to 1 s each.
 - The Rust frontend reads real time, so its safety timeouts fire on real time. It counts as running
   while a thread of its own works, looked at every 400 us while a move is pending, so the start of
-  its work can be missed. Other native children (ffmpeg) count the same way. uvloop's stand-in
-  hasn't been run.
+  its work can be missed. Other native children (ffmpeg) count the same way. uvloop's stand-in has
+  run only against a stand-in uvloop module (none is installed here).
 - `--eager-nodes A,B` runs just those nodes eagerly. Use it for a node whose capture needs a real
   Triton build.
 - `--no-graphs` changes admission: without capture buffers the sampler never asks admission for
@@ -176,6 +186,15 @@ the roofline.
 - MoE, MLA, grouped and fp4 GEMMs cost the roofline (~30% error in the literature, against
   ~5-10% for measured tables). Those figures are for single kernels; end-to-end numbers
   here are not validated and not accurate (see the top of this file).
+- Holding processes to one time costs wall time: a client's wall was within 0-26% of the old
+  clock's on a quiet box (load 4-8) and 2-3x at load 10-29. The design's report counter for an
+  arena that fills in strict mode (`MSTAR_SHM_ARENA_SPILL=0`) isn't built.
+- Open, not yet explained: a sizeable share of runs end in a SIGSEGV at exit (on the old clock
+  too); TP1 TTFT p95 read 1.5 s against a p50 of 64 ms in the batch's runs. `_CPU_ALLOWANCE` (1 ms
+  of CPU a look lets pass as idle) hasn't been checked on a real worker with gloo and zmq threads.
+- A copy's value lands when it is launched, not when the device reaches it, so a host that reads
+  a pinned D2H target early, or rewrites a pinned H2D source after launch, sees no race. A
+  captured copy doesn't take its copy engine.
 - A collective starts on every rank once the last rank has launched it and the last rank's stream
   is free, so a host-late rank delays its peers' devices, as on a GPU (`meet_skew_s`: the widest
   spread of those, per meet). Its NCCL time is the same on every rank.

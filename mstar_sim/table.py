@@ -30,7 +30,7 @@ import zlib
 SLOTS = 64
 _WORDS = 8  # a slot's 64-bit words
 _CLOCK, _NEXT, _RUNNING, _MEET, _EPOCH, _RANK, _WAKE, _LEFT = range(8)
-_HEADER = 8  # words before the first slot: the second is how many slots were ever used
+_HEADER = 8  # words before the first slot: the second is how many slots have been claimed
 _LIVE_FOR = 0.05  # real seconds a look at who is alive stands: a peer's death takes this long to see
 _real = time.perf_counter  # (bound here, before the emulator patches it)
 _SIZE = (_HEADER + SLOTS * _WORDS) * 8

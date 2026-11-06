@@ -363,9 +363,8 @@ class Event:
     def record(self, stream: Stream | None = None) -> None:
         _check_fault()
         s = stream if stream is not None else current_stream()
-        # complete once the stream drains past it: on an idle stream that is now, for
-        # every thread (the recording thread's own virtual time would skew a waiter on
-        # another); the timestamp, for elapsed_time, is when the GPU reaches it
+        # complete once the stream drains past it, on the process's one clock: on an idle
+        # stream that is now; the timestamp, for elapsed_time, is when the GPU reaches it
         self.t = s.timeline.free_at
         self.stamp = max(clock.now(), self.t)
 

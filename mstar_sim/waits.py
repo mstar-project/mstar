@@ -24,10 +24,13 @@ two clauses. Blocked, a process follows the bound (how far the others let it go)
 next deadline: mstar's sleep loops poll what other processes write, so no host deadline goes
 past it, though a device deadline needs no one. With nothing to bound it, a host deadline
 becomes a move only once its timeout has passed in real time (it is then due: :func:`_until`),
-so idle processes keep real time rather than spin ahead. Running, a thread that reads the clock
-more than W past the bound waits there (:func:`read`), blocked, until the bound rises. A thread at
-a collective's meet stands still, as NCCL's host doesn't wait: it takes no moves, and stands aside
-from the bound until its group has all come (:meth:`mstar_sim.table.Table.bound`).
+so a lone idle process keeps real time rather than spin ahead. Idle processes of one table do
+step event to event, as fast as they settle: a timer on anything outside the table (a client
+that isn't in it, a socket read) can fire early in real time (README Limits). Running, a thread
+that reads the clock more than W past the bound waits there (:func:`read`), blocked, until the
+bound rises. A thread at a collective's meet stands still, as NCCL's host doesn't wait: only a
+device deadline moves it, and it stands aside from the bound until its group has all come
+(:meth:`mstar_sim.table.Table.bound`).
 
 The kernel says what the registry can't. A process whose threads are in waits it doesn't know is
 *parked* (counts as blocked) when, between two of the mover's looks, nothing read the clock, no
@@ -211,8 +214,8 @@ def leave(w: Wait | None) -> None:
 def _until(w: Wait | None, timeout, attempt):
     """``attempt(seconds)``, a wait ending in real time (falsy if it timed out), for wait ``w``:
     retried until it ends or the clock reaches ``w``'s deadline (none: tried once). After its
-    real timeout the deadline is due (the mover may then move the clock to it, bound or no
-    bound). The mover ends it (``w.release``, ``w.timed_out``) when the clock gets there."""
+    real timeout the deadline is due (with no bound, the mover may then move the clock to it).
+    The mover ends it (``w.release``, ``w.timed_out``) when the clock gets there."""
     result = attempt(timeout)
     while not result and w is not None and w.deadline is not None:
         with LOCK:
@@ -567,8 +570,8 @@ def _hold(t: float) -> None:
 
 
 def _held_too_long(t: float) -> None:
-    """The deployment's clock has stopped: an emulator stall, which is never wrong timing and
-    never a hang. Abort as a rank whose collectives don't pair does, saying who holds the bound."""
+    """The bound has stood still for ``HELD_LIMIT``: an emulator stall, which is never wrong timing
+    and never a hang. Abort as a rank whose collectives don't pair does, saying who holds the bound."""
     print(f"mstar_sim: pid {os.getpid()} held {HELD_LIMIT:.0f} s at clock {t:.6f}, past the bound "
           f"{TABLE.bound():.6f}; the deployment's processes:\n{TABLE.describe()}", file=sys.stderr, flush=True)
     clock.abort()

@@ -98,9 +98,10 @@ def _pairs(rows: list[list[int]]) -> bool:
 
 @contextmanager
 def _waiting(ranks=None):
-    """The host waits for its peers, as NCCL's host doesn't: the wait is blocked time, so the
-    clock stands still through it (:func:`mstar_sim.waits.blocked`). At a meet of ``ranks`` it
-    stands aside from the deployment's bound until they have all come (:meth:`Table.bound`)."""
+    """The host waits for its peers, as NCCL's host doesn't: the wait is blocked time
+    (:func:`mstar_sim.waits.blocked`), which follows the deployment's bound. At a meet of
+    ``ranks`` the clock stands still instead (only a device deadline moves it), and the rank
+    stands aside from the bound until they have all come (:meth:`Table.bound`)."""
     from mstar_sim import table, waits
 
     if ranks is None:
