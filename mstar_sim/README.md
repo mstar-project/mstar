@@ -168,8 +168,9 @@ the roofline.
   notification into a timeout. This delay is not included in `slept_s`.
 - A thread at a collective's meet holds its process's host deadlines (a sleep beside it) until
   the meet ends; device waits beside it end on time.
-- A native task of a process with nothing else running that stays on a CPU (a spin wait) holds
-  the process's moves for up to 1 s each.
+- Observed runnable native tasks keep the process clock running at real rate while Python is
+  blocked. Unclassified idle spinners therefore reduce acceleration; elapsed time alone cannot
+  distinguish them from productive native work. Activity beginning after a scan can be missed.
 - The Rust frontend reads real time, so its safety timeouts fire on real time. It counts as running
   while a thread of its own works, looked at every 400 us while a move is pending, so the start of
   its work can be missed. Other native children (ffmpeg) count the same way. uvloop's stand-in has

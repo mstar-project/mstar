@@ -194,8 +194,7 @@ def _report_at_exit(path: str) -> None:
     of a move past W, so maybe moved past; ``meet_skew_s`` the widest gap between ranks' arrivals
     at a collective (each at the later of its host and its stream); ``parks`` the times the process
     counted as blocked with threads in waits unknown to the emulator, and ``unparks_by_look`` those
-    a look ended, its work having run hidden for up to that look; ``gate_waits`` looks that found
-    its own tasks still on a CPU."""
+    a look ended, its work having run hidden for up to that look."""
     import atexit
     import json
 
@@ -225,7 +224,7 @@ def _report_at_exit(path: str) -> None:
             "ahead_stalls": waits.REPORT["ahead_stalls"], "late_deliveries": waits.REPORT["late_deliveries"],
             "meet_skew_s": round(waits.REPORT["meet_skew_s"], 6), "mover_s": round(waits.REPORT["mover_s"], 3),
             "scan_s": round(waits.REPORT["scan_s"], 3), "scans": waits.REPORT["scans"],
-            "settle_deferrals": waits.REPORT["settle_deferrals"], "gate_waits": waits.REPORT["gate_waits"],
+            "settle_deferrals": waits.REPORT["settle_deferrals"],
             "parks": waits.REPORT["parks"], "unparks_by_look": waits.REPORT["unparks_by_look"],
             "jump_blockers": dict(sorted(waits.REPORT["jump_blockers"].items(), key=lambda kv: -kv[1])[:8]),
         }

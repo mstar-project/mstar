@@ -1094,15 +1094,18 @@ def test_an_exiting_process_keeps_its_slot_and_its_table_until_it_is_gone():
 
 
 def test_a_native_spinner_doesnt_hold_the_gate_shut():
-    """A task of a process with nothing running that never leaves the CPU (an OpenMP pool's spin
-    wait) isn't a message on its way: past a limit the process says it is blocked, so its frozen
-    clock can't hold a peer to the abort. And a scan that can't tell keeps the gate shut."""
+    """Unclassified native work keeps real time instead of freezing or jumping the clock.
+    A peer still makes progress, and a scan that cannot tell reports activity."""
     spinner, held = run_deployment("""
         import hashlib
         spin = lambda: hashlib.pbkdf2_hmac("sha256", b"x", b"y", 2**31 - 1)  # (no GIL, no clock)
         threading.Thread(target=spin, name=waits.OWN + "spin", daemon=True).start()
         barrier()
-        time.sleep(2.0)
+        wall = clock._real()
+        clock.charge(1.5)
+        torch.cuda.synchronize()
+        print(clock._real() - wall)
+        time.sleep(0.5)
     """, """
         waits.HELD_LIMIT = 3.0
         barrier()
@@ -1112,6 +1115,7 @@ def test_a_native_spinner_doesnt_hold_the_gate_shut():
         print("passed")
     """)
     assert held.strip() == "passed", held
+    assert float(spinner) >= 1.4, spinner
     out = run_sim("""
         import errno, os
         from mstar_sim import waits

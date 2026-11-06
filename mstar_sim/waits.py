@@ -94,14 +94,12 @@ _wakefd = [-1]  # the mover's wake for a select or a poll, which no lock can end
 _poked: set[Wait] = set()
 _told_blocked = [False]  # the table says this process is blocked
 _native: dict = {}  # each watched child: its CPU clock, its last CPU time, its tasks
-_native_busy = [False]  # one is working, which counts as a running thread
+_native_busy = [False]  # observed native activity contributes one running participant
 _looked = [0.0, 0.0]  # the mover's last look: when, and what the process's other threads had used
 _moved = [0.0, 0.0]  # the last move on the bound: when, and how far
 _CPU_ALLOWANCE = 1e-3  # CPU time a look lets pass as nothing: zmq's and gloo's own threads ticking over
-_shut = [0.0]  # the real time the gate found a task on a CPU, with nothing running (0.0: it hasn't)
-_GATE_LIMIT = 1.0  # real seconds a message can't stay on its way, though a loaded box descheduled it
 REPORT = {"slept_s": 0.0, "late_resumes": 0, "jump_blockers": {}, "ahead_stalls": 0, "late_deliveries": 0,
-          "meet_skew_s": 0.0, "mover_s": 0.0, "scan_s": 0.0, "scans": 0, "settle_deferrals": 0, "gate_waits": 0,
+          "meet_skew_s": 0.0, "mover_s": 0.0, "scan_s": 0.0, "scans": 0, "settle_deferrals": 0,
           "parks": 0, "unparks_by_look": 0}
 
 
@@ -313,21 +311,13 @@ def _move() -> float:
     meet = any(w.kind is MEET for w in pending)  # a rank at a meet follows no one; what is due still ends
     timeout = _MAX_SLEEP
     _look()
-    if _native:
-        _watch_children()
+    _watch_activity()
     idle = _running[0] == 0 or clock.PARKED[0]
     if _native and (_native_busy[0] or (idle and any(w.deadline is not None for w in pending))):
         timeout = 2 * SETTLE  # a move is pending on a child: look often
-    if not idle:
-        _shut[0] = 0.0
-    if idle:
-        quiet = _gate()
-        if quiet and not _told_blocked[0]:
-            _told_blocked[0] = True
-            _publish()
-        elif not quiet:
-            REPORT["gate_waits"] += 1
-            timeout = SETTLE
+    if idle and not _told_blocked[0]:
+        _told_blocked[0] = True
+        _publish()
     if idle:
         device = min((w.deadline for w in pending if w.kind is DEVICE), default=math.inf)
         hosts = [w for w in pending if w.kind is HOST and w.deadline is not None]
@@ -344,9 +334,7 @@ def _move() -> float:
                 timeout = min(timeout, max(host - bound, SETTLE))
             if target < math.inf and target > clock.now():
                 waited = _settled()
-                if not quiet:
-                    target = math.inf
-                elif waited < SETTLE:
+                if waited < SETTLE:
                     REPORT["settle_deferrals"] += 1
                     target = math.inf
                     timeout = SETTLE - waited
@@ -426,22 +414,18 @@ def _quiet() -> bool:
     return not working
 
 
-def _gate() -> bool:
-    """Whether a process with no thread running may say so. It waits for :func:`_quiet`, but a task
-    on a CPU for ``_GATE_LIMIT`` is no message: a native spinner would hold the gate for ever, and
-    the slot, running at a clock that stands still, would hold every peer to the abort."""
-    if _quiet():
-        _shut[0] = 0.0
-        return True
-    _shut[0] = _shut[0] or clock._real()
-    return clock._real() - _shut[0] > _GATE_LIMIT
-
-
-def _watch_children() -> None:
-    """A child at a CPU counts as a running thread of this process. Under LOCK."""
+def _watch_activity() -> None:
+    """Reconcile one running participant for children and otherwise uncounted native work.
+    An observed runnable task keeps real time; elapsed time cannot prove it is an idle helper.
+    The mover uses this observation before either host or device progress. Under LOCK."""
     began = clock._real()
-    working = any(child[2].on_cpu() for child in list(_native.values()))
+    child_busy = any(child[2].on_cpu() for child in list(_native.values()))
     REPORT["scan_s"] += clock._real() - began
+    counted = _running[0] - _native_busy[0]
+    local_busy = not _quiet() if counted == 0 or clock.PARKED[0] else False
+    if clock.PARKED[0] and (child_busy or local_busy):
+        _unpark()
+    working = child_busy or (counted == 0 and local_busy)
     if working != _native_busy[0]:
         _native_busy[0] = working
         _run_one() if working else _block_one()
@@ -456,9 +440,6 @@ def _others_cpu() -> float:
         except OSError:  # it has gone
             child[2].close()
             del _native[pid]
-            if not _native and _native_busy[0]:
-                _native_busy[0] = False
-                _block_one()
             continue
         cpu += child[1]
     return cpu
@@ -867,7 +848,7 @@ def _after_fork() -> None:
         state.clear()
     _running[0] = 1
     _told_blocked[0] = _native_busy[0] = clock.PARKED[0] = False
-    _ahead[0], _seen[0], _shut[0] = math.inf, -1, 0.0
+    _ahead[0], _seen[0] = math.inf, -1
     _settling[:], _looked[:], _moved[:] = [0, 0.0], [0.0, 0.0], [0.0, 0.0]
     for ident in list(clock._OPEN):
         if ident != threading.get_ident():
