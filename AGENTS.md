@@ -189,12 +189,23 @@ A worker keys its own state by a small integer handle ([mstar/worker/rid_table.p
 
 ```bash
 ruff check .                          # CI enforces this
-python -m pytest test/modular test/distributed test/chatterbox test/kokoro \
-    test/omnivoice test/sampling_test mstar/model/*/tests benchmark/worker_phases
-                                      # the CPU Core CI job (CI adds -p xdist -n 4), no GPU or weights
+# the CPU Core CI job's tests, no GPU or weights; see "Running the CPU suite" below
+env -u MSTAR_SHM_ARENA CUDA_VISIBLE_DEVICES="" HF_HUB_OFFLINE=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 \
+    python -m pytest test/modular test/distributed test/chatterbox test/kokoro \
+    test/omnivoice test/sampling_test mstar/model/*/tests benchmark/worker_phases \
+    -q -p xdist -n 8 --dist worksteal --timeout=120 --basetemp=/tmp/s_cpu
 pytest test/integration/              # needs GPU + weights
 cd rust && cargo test --release --no-default-features --features python && pytest ../test/rust/
 ```
+
+### Running the CPU suite
+
+It takes 4 to 5 minutes on 8 CPUs from a local disk, and about 10 in CI on 4. If it is taking much longer, something is wrong; don't wait it out.
+
+- **Run it from a local disk.** The same code on the same 8 CPUs took 4:15 from a local disk and 16:23 from a network volume, where file metadata calls were about 23x slower. The volume also added 9 failures, several at the per-test limit, in `test_tp_read_check.py`, `test_tp_read_failure_acceptance.py`, `test_shm_shutdown_cleanup.py` and `test_transport_microbench.py`. They read like transport bugs. If your checkout is on a network volume, make a worktree on local disk and run from there.
+- **While iterating, run the modules your change touches.** Save the full suite for a commit you intend to push.
+- **Keep the per-test limit.** `--timeout=120` (`pytest-timeout`) names a stuck test instead of letting it hold the run; CI's slowest test is about 85 s.
+- **Match CI's environment.** A machine that exports `MSTAR_SHM_ARENA=1` fails `test_shm_shutdown_cleanup.py`, which is why the command unsets it, and a visible GPU sends tests that check for one onto it.
 
 The CPU suites build a graph runtime and the Rust communicator, so they need the Rust extension: `maturin develop --release -m rust/Cargo.toml` once in a checkout.
 
