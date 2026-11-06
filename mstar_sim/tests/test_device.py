@@ -1664,6 +1664,18 @@ def test_a_cached_call_answers_as_the_call_would():
     assert len(set(kernels.split())) == 1 and int(kernels.split()[0]) > 1, out
 
 
+@pytest.mark.parametrize("fast", ["0", "1"])
+def test_a_cached_call_accepts_kept_inference_tensors(fast):
+    run_sim("""
+        import torch
+        with torch.inference_mode():
+            x = torch.empty(8192, device="cuda")
+            scale = torch.ones(1, device="cuda")
+            for _ in range(2):
+                assert (x / scale).shape == x.shape
+    """, MSTAR_SIM_FAST=fast)
+
+
 def test_a_value_less_storage_keeps_its_address():
     """mstar compares and offsets ``data_ptr()``, so no number of other storages can change one."""
     out = run_sim("""

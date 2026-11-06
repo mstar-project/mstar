@@ -821,6 +821,8 @@ def _call_key(func, args, kwargs):
             if data.device.type != "meta":
                 if not _floating(data):
                     return _UNCACHEABLE  # an index, a mask, a count: its values can shape the output
+                if data.is_inference():
+                    return _UNCACHEABLE  # no version counter to detect writes by the call
                 kept.append(data)
             operands[0] += 1
             return (data.shape, data.stride(), data.dtype, x._index, data.device.type)
