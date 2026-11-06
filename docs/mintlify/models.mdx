@@ -29,6 +29,7 @@ Registered model families
 | `pi05` | `lerobot/pi05_base` | Pi0.5 vision-language-action robotics model (ViT encoder + LLM + flow action expert). A request sends one image per camera, up to the config's `num_cameras` (3 in `configs/pi05.yaml`). Cameras it leaves out are masked, as openpi does, and more images than that are a 400. `configs/pi05_droid.yaml` serves the DROID fine-tune (`lerobot/pi05_droid`) with openpi's DROID normalization: raw joint state in, joint velocities out. |
 | `qwen3_5_{0.8,2,4,9,27}b` | `Qwen/Qwen3.5-4B` | Hybrid-attention VLM (text + image in, text out): gated DeltaNet linear attention interleaved with full attention, plus a ViT tower. |
 | `qwen3_8_27b` | `Qwen/Qwen3.8-27B` | Qwen3.8-27B on the Qwen3.5 code above (same architecture); ships a TP4 config. |
+| `minicpm_o` *(Beta)* | `openbmb/MiniCPM-o-4_5` | Omni-modal chat (text/image/audio in, text out): Qwen3-8B over a navit SigLIP + resampler and a Whisper-medium encoder. Half-duplex only. |
 | `omnivoice` | `k2-fsa/OmniVoice` | Massively multilingual zero-shot TTS: masked-diffusion canvas over a Qwen3-0.6B backbone + audio codec. Clones a voice from a reference clip. |
 | `qwen3_omni` | `Qwen/Qwen3-Omni-30B-A3B-Instruct` | Omni-modal (text/image/audio/video in, text/audio out): Thinker + Talker + codec. |
 | `qwen3_tts` | `Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice` | Streaming text-to-speech with built-in speakers: Talker + 12 Hz speech codec. |
