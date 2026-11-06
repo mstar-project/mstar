@@ -143,7 +143,7 @@ def test_an_outer_restart_resets_inner_inputs_in_both_speculation_paths(columnar
     ctx.graph_runtime.graph_passes = lambda selected: [7] * len(selected)
     ctx.request_state.fwd_infos = lambda rids, partition: [shared[rid] for rid in rids]
     ctx = replace(ctx, engine_manager=SimpleNamespace(get_engine=lambda node: SimpleNamespace(
-        iteration_layouts=lambda node: {"t2i": layout},
+        iteration_layouts=lambda node: {"t2i": LoopLayout(LOOP, ancestors=("outer",))},
     )))
     target = SpeculationOutput(
         node_name="dit", graph_walk="t2i", loop_name="outer", is_new_loop_iter=True,
@@ -159,13 +159,14 @@ def test_an_outer_restart_resets_inner_inputs_in_both_speculation_paths(columnar
         assert columns.dynamic_loop_iter_counts == expected
         assert spec.node_batch.per_request_info_wrapped[rid].metadata.graph_pass == 7
         assert spec.node_batch.per_request_input_metadata[rid].graph_pass == 7
+        assert spec.node_batch.per_request_info_wrapped[rid].metadata.iteration_origin == 0
     assert shared[1].dynamic_loop_iter_counts == {"outer": 0, LOOP: 3}
 
 
 def test_actual_graph_passes_are_snapshotted_only_for_iteration_input_rows():
     from mstar.engine.engine import Engine
     from mstar.model.submodule_base import InputMetadata
-    from mstar.worker.executing_batch import stamp_graph_passes
+    from mstar.worker.executing_batch import stamp_iteration_context
 
     engine = Engine.__new__(Engine)
     engine._loops = {("dit", "t2i"): LoopLayout(LOOP)}
@@ -177,11 +178,15 @@ def test_actual_graph_passes_are_snapshotted_only_for_iteration_input_rows():
         calls.append(selected)
         return [7]
     runtime = SimpleNamespace(graph_passes=passes)
-    metadata = {rid: InputMetadata(dynamic_loop_iter_counts={LOOP: 2}) for rid in (1, 2)}
-    stamp_graph_passes(runtime, engine, "dit", "mixed", metadata, {1: 10, 2: 20}, {1: "t2i", 2: "prefill"})
+    infos = {rid: _info(rid, 2) for rid in (1, 2)}
+    metadata = {rid: InputMetadata(dynamic_loop_iter_counts={LOOP: 6}) for rid in (1, 2)}
+    stamp_iteration_context(runtime, engine, "dit", "mixed", infos, metadata, {1: 10, 2: 20}, {1: "t2i", 2: "prefill"})
     assert calls == [{1: 10}]
     assert metadata[1].graph_pass == 7 and metadata[2].graph_pass is None
-    assert metadata[1].dynamic_loop_iter_counts == {LOOP: 2}
+    assert metadata[1].dynamic_loop_iter_counts == {LOOP: 6}
+    assert metadata[1].iteration_origin == 2 and metadata[2].iteration_origin is None
+    infos[1].dynamic_loop_iter_counts[LOOP] = 3
+    assert metadata[1].iteration_origin == 2, "landing the predecessor cannot mutate its submitted successor"
     engine._submodules["dit"].device_stops.clear()
-    stamp_graph_passes(runtime, engine, "dit", "t2i", metadata, {1: 10, 2: 20})
+    stamp_iteration_context(runtime, engine, "dit", "t2i", infos, metadata, {1: 10, 2: 20})
     assert calls == [{1: 10}], "repeats off must not query graph state"

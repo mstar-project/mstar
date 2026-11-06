@@ -48,9 +48,10 @@ def input_metadata_and_fwd_info(
     return meta, fwd_info
 
 
-def stamp_graph_passes(
+def stamp_iteration_context(
     runtime: GraphRuntime, engine: Engine, node: str, walk: str,
-    metadata: dict[int, InputMetadata], request_to_worker_graph: Mapping[int, int],
+    infos: Mapping[int, CurrentForwardPassInfo], metadata: dict[int, InputMetadata],
+    request_to_worker_graph: Mapping[int, int],
     request_walks: Mapping[int, str] | None = None,
 ) -> None:
     """Snapshot the graph's actual pass before an immutable step is submitted.
@@ -69,7 +70,12 @@ def stamp_graph_passes(
     }
     if selected:
         for rid, graph_pass in zip(selected, runtime.graph_passes(selected), strict=True):
-            metadata[rid] = metadata[rid]._replace(graph_pass=graph_pass)
+            loop = layouts[walks.get(rid, walk)]
+            before = infos[rid].dynamic_loop_iter_counts
+            projected = metadata[rid].dynamic_loop_iter_counts
+            entering = any(projected.get(name, 0) != before.get(name, 0) for name in loop.ancestors)
+            origin = projected.get(loop.name, 0) if entering else before.get(loop.name, 0)
+            metadata[rid] = metadata[rid]._replace(graph_pass=graph_pass, iteration_origin=origin)
 
 
 def make_executing_batch(

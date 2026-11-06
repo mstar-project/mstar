@@ -21,7 +21,7 @@ from mstar.model.submodule_base import InputMetadata
 _LOOP_COUNTS = attrgetter("dynamic_loop_iter_counts")
 _NO_STREAM_CHUNKS = MappingProxyType({})
 # loop_counter_snapshots builds InputMetadata positionally, from C
-assert InputMetadata._fields == ("stream_chunks", "dynamic_loop_iter_counts", "graph_pass")
+assert InputMetadata._fields == ("stream_chunks", "dynamic_loop_iter_counts", "graph_pass", "iteration_origin")
 
 
 class DeferredRowInputs(MutableMapping):
@@ -102,5 +102,5 @@ def loop_counter_snapshots(
         counts = list(map(loop.advance, map(_LOOP_COUNTS, infos[:n_next_iter])))
         counts.extend(map(dict.copy, map(_LOOP_COUNTS, infos[n_next_iter:])))
     return list(map(
-        tuple.__new__, repeat(InputMetadata), zip(repeat(_NO_STREAM_CHUNKS), counts, repeat(None)),
+        tuple.__new__, repeat(InputMetadata), zip(repeat(_NO_STREAM_CHUNKS), counts, repeat(None), repeat(None)),
     ))

@@ -112,7 +112,7 @@ from mstar.utils.threads import ThreadPool, pin_thread
 from mstar.worker.batch_builder import BatchBuilderType
 from mstar.worker.chunk_loops import ChunkLoops
 from mstar.worker.engine_manager import EngineManager, refuse_combined_walks_across_tp_groups
-from mstar.worker.executing_batch import input_metadata_and_fwd_info, make_executing_batch, stamp_graph_passes
+from mstar.worker.executing_batch import input_metadata_and_fwd_info, make_executing_batch, stamp_iteration_context
 from mstar.worker.lanes import Lane, finish_first_to_land
 from mstar.worker.micro_scheduler import (
     CHAIN_LANE,
@@ -1988,9 +1988,9 @@ class Worker(RepeatingSteps):
             per_request_inputs=per_request_inputs,
         )
 
-        stamp_graph_passes(
+        stamp_iteration_context(
             self._graph_runtime, self.engine_manager.get_engine(batch.node_name),
-            batch.node_name, batch.graph_walk, per_request_input_metadata,
+            batch.node_name, batch.graph_walk, per_request_info, per_request_input_metadata,
             batch.request_to_worker_graph, batch.request_walks,
         )
 

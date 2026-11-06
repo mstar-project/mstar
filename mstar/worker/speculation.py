@@ -29,7 +29,7 @@ from mstar.graph.runtime.base import (
 )
 from mstar.streaming.stream_buffer import StreamingEdge
 from mstar.utils.profiler import PhaseLaps
-from mstar.worker.executing_batch import input_metadata_and_fwd_info, make_executing_batch, stamp_graph_passes
+from mstar.worker.executing_batch import input_metadata_and_fwd_info, make_executing_batch, stamp_iteration_context
 from mstar.worker.micro_scheduler import MicroScheduler, ScheduledBatch
 from mstar.worker.node_manager_utils import RequestStateManager
 from mstar.worker.spec_rows import DeferredRowInputs, loop_counter_snapshots
@@ -325,9 +325,9 @@ class SpeculationBuilder:
                             if spec_target.is_new_loop_iter else None),
         )
         if ctx.engine_manager is not None:
-            stamp_graph_passes(
+            stamp_iteration_context(
                 ctx.graph_runtime, ctx.engine_manager.get_engine(spec_node), spec_node, label,
-                input_meta, request_to_worker_graph, request_walks,
+                per_request_info, input_meta, request_to_worker_graph, request_walks,
             )
         spec_node_batch = make_executing_batch(
             ctx.streams, node_name=spec_node,
@@ -405,14 +405,15 @@ class SpeculationBuilder:
             output_signals=spec_target.output_signals,
         )
         input_meta = dict(zip(request_ids, metadata, strict=True))
+        per_request_info = dict(zip(request_ids, infos, strict=True))
         if self._ctx.engine_manager is not None:
-            stamp_graph_passes(
+            stamp_iteration_context(
                 self._ctx.graph_runtime, self._ctx.engine_manager.get_engine(spec_node),
-                spec_node, walk, input_meta, request_to_worker_graph,
+                spec_node, walk, per_request_info, input_meta, request_to_worker_graph,
             )
         spec_node_batch = ExecutingBatch(
             node_name=spec_node,
-            per_request_info=dict(zip(request_ids, infos, strict=True)),
+            per_request_info=per_request_info,
             per_request_input_tensors=inputs,
             per_request_input_metadata=input_meta,
             step_context=StepContext(
