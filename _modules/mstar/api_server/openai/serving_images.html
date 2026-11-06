@@ -1051,8 +1051,9 @@ window.runMermaid = runMermaid;</script>
                 <span class="n">read</span> <span class="o">+=</span> <span class="mi">1</span>  <span class="c1"># collect_results released it before raising</span>
                 <span class="k">raise</span>
             <span class="n">read</span> <span class="o">+=</span> <span class="mi">1</span>
+            <span class="c1"># bytes: MediaJSONResponse writes them into the body as they are</span>
             <span class="n">data</span><span class="o">.</span><span class="n">extend</span><span class="p">(</span>
-                <span class="p">{</span><span class="s2">"b64_json"</span><span class="p">:</span> <span class="n">base64</span><span class="o">.</span><span class="n">b64encode</span><span class="p">(</span><span class="n">c</span><span class="o">.</span><span class="n">data</span><span class="p">)</span><span class="o">.</span><span class="n">decode</span><span class="p">(</span><span class="s2">"ascii"</span><span class="p">),</span> <span class="s2">"url"</span><span class="p">:</span> <span class="kc">None</span><span class="p">}</span>
+                <span class="p">{</span><span class="s2">"b64_json"</span><span class="p">:</span> <span class="n">base64</span><span class="o">.</span><span class="n">b64encode</span><span class="p">(</span><span class="n">c</span><span class="o">.</span><span class="n">data</span><span class="p">),</span> <span class="s2">"url"</span><span class="p">:</span> <span class="kc">None</span><span class="p">}</span>
                 <span class="k">for</span> <span class="n">c</span> <span class="ow">in</span> <span class="n">chunks</span>
                 <span class="k">if</span> <span class="n">c</span><span class="o">.</span><span class="n">modality</span> <span class="o">==</span> <span class="s2">"image"</span>
             <span class="p">)</span>
@@ -1112,7 +1113,7 @@ window.runMermaid = runMermaid;</script>
     <span class="k">finally</span><span class="p">:</span>
         <span class="n">media_io</span><span class="o">.</span><span class="n">schedule_upload_cleanup</span><span class="p">({</span><span class="s2">"image"</span><span class="p">:</span> <span class="p">[</span><span class="nb">str</span><span class="p">(</span><span class="n">image_path</span><span class="p">)]},</span> <span class="n">upload_dir</span><span class="p">)</span>
     <span class="n">data</span> <span class="o">=</span> <span class="p">[</span>
-        <span class="p">{</span><span class="s2">"b64_json"</span><span class="p">:</span> <span class="n">base64</span><span class="o">.</span><span class="n">b64encode</span><span class="p">(</span><span class="n">c</span><span class="o">.</span><span class="n">data</span><span class="p">)</span><span class="o">.</span><span class="n">decode</span><span class="p">(</span><span class="s2">"ascii"</span><span class="p">),</span> <span class="s2">"url"</span><span class="p">:</span> <span class="kc">None</span><span class="p">}</span>
+        <span class="p">{</span><span class="s2">"b64_json"</span><span class="p">:</span> <span class="n">base64</span><span class="o">.</span><span class="n">b64encode</span><span class="p">(</span><span class="n">c</span><span class="o">.</span><span class="n">data</span><span class="p">),</span> <span class="s2">"url"</span><span class="p">:</span> <span class="kc">None</span><span class="p">}</span>
         <span class="k">for</span> <span class="n">c</span> <span class="ow">in</span> <span class="n">chunks</span>
         <span class="k">if</span> <span class="n">c</span><span class="o">.</span><span class="n">modality</span> <span class="o">==</span> <span class="s2">"image"</span>
     <span class="p">]</span>

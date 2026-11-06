@@ -701,6 +701,7 @@
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.cpus.CpuPlan"><code class="docutils literal notranslate"><span class="pre">CpuPlan</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.cpus.CpuPlan.copy_workers"><code class="docutils literal notranslate"><span class="pre">CpuPlan.copy_workers</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.cpus.CpuPlan.declined"><code class="docutils literal notranslate"><span class="pre">CpuPlan.declined</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.cpus.CpuPlan.deflate_threads"><code class="docutils literal notranslate"><span class="pre">CpuPlan.deflate_threads</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.cpus.CpuPlan.encode_workers"><code class="docutils literal notranslate"><span class="pre">CpuPlan.encode_workers</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.cpus.CpuPlan.left"><code class="docutils literal notranslate"><span class="pre">CpuPlan.left</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.cpus.CpuPlan.locked"><code class="docutils literal notranslate"><span class="pre">CpuPlan.locked</span></code></a></li>
@@ -925,10 +926,18 @@ data worker’s thread, each ahead of its own encode.</p>
 <dd></dd></dl>
 
 <dl class="py property">
+<dt class="sig sig-object py" id="mstar.utils.cpus.CpuPlan.deflate_threads">
+<span class="property"><span class="k"><span class="pre">property</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">deflate_threads</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><a class="headerlink" href="#mstar.utils.cpus.CpuPlan.deflate_threads" title="Link to this definition">#</a></dt>
+<dd><p>Threads of the deflate pool every PNG of the process shares
+(<code class="docutils literal notranslate"><span class="pre">image_io</span></code>): enough for <code class="docutils literal notranslate"><span class="pre">encode_workers</span></code> images finishing together
+to deflate all their blocks at once.</p>
+</dd></dl>
+
+<dl class="py property">
 <dt class="sig sig-object py" id="mstar.utils.cpus.CpuPlan.encode_workers">
 <span class="property"><span class="k"><span class="pre">property</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">encode_workers</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><a class="headerlink" href="#mstar.utils.cpus.CpuPlan.encode_workers" title="Link to this definition">#</a></dt>
-<dd><p>Outputs the data worker encodes at once. A PNG deflates on
-<code class="docutils literal notranslate"><span class="pre">png_threads</span></code> of its own, so the pool times that stays within the
+<dd><p>Outputs the data worker encodes at once. A PNG deflates
+<code class="docutils literal notranslate"><span class="pre">png_threads</span></code> blocks at once, so the pool times that stays within the
 CPUs left.</p>
 </dd></dl>
 
@@ -962,7 +971,7 @@ are sized from.</p>
 <dl class="py property">
 <dt class="sig sig-object py" id="mstar.utils.cpus.CpuPlan.png_threads">
 <span class="property"><span class="k"><span class="pre">property</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">png_threads</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><a class="headerlink" href="#mstar.utils.cpus.CpuPlan.png_threads" title="Link to this definition">#</a></dt>
-<dd><p>Threads one PNG deflates on (<code class="docutils literal notranslate"><span class="pre">image_io.uint8_to_png</span></code>).</p>
+<dd><p>Blocks one PNG deflates in parallel (<code class="docutils literal notranslate"><span class="pre">image_io.uint8_to_png</span></code>).</p>
 </dd></dl>
 
 <dl class="py method">
@@ -1497,6 +1506,7 @@ by the cgroup quota rounded down. At least 1.</p>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.cpus.CpuPlan"><code class="docutils literal notranslate"><span class="pre">CpuPlan</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.cpus.CpuPlan.copy_workers"><code class="docutils literal notranslate"><span class="pre">CpuPlan.copy_workers</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.cpus.CpuPlan.declined"><code class="docutils literal notranslate"><span class="pre">CpuPlan.declined</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.cpus.CpuPlan.deflate_threads"><code class="docutils literal notranslate"><span class="pre">CpuPlan.deflate_threads</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.cpus.CpuPlan.encode_workers"><code class="docutils literal notranslate"><span class="pre">CpuPlan.encode_workers</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.cpus.CpuPlan.left"><code class="docutils literal notranslate"><span class="pre">CpuPlan.left</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.cpus.CpuPlan.locked"><code class="docutils literal notranslate"><span class="pre">CpuPlan.locked</span></code></a></li>

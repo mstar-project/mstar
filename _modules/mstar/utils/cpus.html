@@ -1234,15 +1234,22 @@ window.runMermaid = runMermaid;</script>
 
     <span class="nd">@property</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">png_threads</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
-<span class="w">        </span><span class="sd">"""Threads one PNG deflates on (``image_io.uint8_to_png``)."""</span>
+<span class="w">        </span><span class="sd">"""Blocks one PNG deflates in parallel (``image_io.uint8_to_png``)."""</span>
         <span class="k">return</span> <span class="nb">min</span><span class="p">(</span><span class="mi">8</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">left</span><span class="p">)</span>
 
     <span class="nd">@property</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">encode_workers</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
-<span class="w">        </span><span class="sd">"""Outputs the data worker encodes at once. A PNG deflates on</span>
-<span class="sd">        ``png_threads`` of its own, so the pool times that stays within the</span>
+<span class="w">        </span><span class="sd">"""Outputs the data worker encodes at once. A PNG deflates</span>
+<span class="sd">        ``png_threads`` blocks at once, so the pool times that stays within the</span>
 <span class="sd">        CPUs left."""</span>
         <span class="k">return</span> <span class="nb">max</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="nb">min</span><span class="p">(</span><span class="mi">4</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">left</span> <span class="o">//</span> <span class="bp">self</span><span class="o">.</span><span class="n">png_threads</span><span class="p">))</span>
+
+    <span class="nd">@property</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">deflate_threads</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Threads of the deflate pool every PNG of the process shares</span>
+<span class="sd">        (``image_io``): enough for ``encode_workers`` images finishing together</span>
+<span class="sd">        to deflate all their blocks at once."""</span>
+        <span class="k">return</span> <span class="nb">min</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">left</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">encode_workers</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">png_threads</span><span class="p">)</span>
 
     <span class="nd">@property</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">copy_workers</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
