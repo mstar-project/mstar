@@ -71,7 +71,7 @@ DEVICE, HOST, MEET, AHEAD = "device", "host", "meet", "ahead"
 W = 0.5e-3  # how far past the bound a running process may read the clock
 SETTLE = 200e-6  # how long the deployment's state stays still before a move on the bound
 _MAX_SLEEP = 0.05  # the mover looks at least this often: a peer's death wakes no one
-HELD_LIMIT = 60.0  # real seconds a thread may wait for the bound before the emulator gives up
+HELD_LIMIT = 60.0  # real seconds the bound may stand still under a held thread before the emulator gives up
 _real_lock = _thread.allocate_lock
 _real_sleep = time.sleep
 _real_eventfd_write = os.eventfd_write
@@ -529,9 +529,14 @@ def _hold(t: float) -> None:
     w = enter(AHEAD, t, release=lock.release)
     REPORT["ahead_stalls"] += 1
     try:  # the mover lets it go; it looks too, as the mover is gone at interpreter exit
-        end = clock._real() + HELD_LIMIT
-        while not lock.acquire(True, _MAX_SLEEP) and TABLE.bound() + W < t:
-            if clock._real() > end:
+        bound, end = TABLE.bound(), clock._real() + HELD_LIMIT
+        while not lock.acquire(True, _MAX_SLEEP):
+            was, bound = bound, TABLE.bound()
+            if bound + W >= t:
+                break
+            if bound > was:
+                end = clock._real() + HELD_LIMIT
+            elif clock._real() > end:
                 _held_too_long(t)
     finally:
         leave(w)

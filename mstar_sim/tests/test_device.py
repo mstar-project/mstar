@@ -949,6 +949,25 @@ def test_a_clock_read_is_held_only_where_it_can_be_let_go():
     assert out.strip() == "returned", out
 
 
+def test_a_read_held_behind_a_rising_bound_doesnt_abort():
+    """The limit is on a bound that stands still, not on a hold: a device wait can put a process
+    far past a peer that runs at real rate, and it then waits for the peer to get there."""
+    jumper, spinner = run_deployment("""
+        waits.HELD_LIMIT = 0.5
+        barrier()
+        clock.charge(2.0)
+        torch.cuda.synchronize()
+        time.perf_counter()
+        print("passed")
+    """, """
+        barrier()
+        end = time.perf_counter() + 2.5
+        while time.perf_counter() < end:
+            pass
+    """)
+    assert jumper.strip() == "passed", jumper
+
+
 def test_a_process_in_a_wait_the_emulator_cant_see_doesnt_pace_the_deployment():
     """A thread in an unknown wait counts as running, but a process doing nothing at all (no task
     on a CPU, no CPU used, no clock read) is parked: a peer's device wait still jumps."""
