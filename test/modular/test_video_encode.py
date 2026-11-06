@@ -1,10 +1,10 @@
 """``encode_mp4`` converts frames a few ahead of the encoder on a thread of its own.
 
 The conversion hands the encoder the frames ``stream.encode`` would have made
-(checked through ``rawvideo``, which stores them as they come). libx264 with
-threads and a lookahead, its defaults among them, writes different bytes for one
-clip from run to run, so the mp4 bytes are compared under ``ultrafast``, which
-reproduces them: for the writer itself and through each model's ``postprocess``.
+(checked through ``rawvideo``, which stores them as they come). libx264 at its
+defaults writes different bytes for one clip from run to run, so the mp4 bytes
+are compared under ``ultrafast``, which reproduces them: for the writer itself
+and through each model's ``postprocess``.
 """
 
 from __future__ import annotations

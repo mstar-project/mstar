@@ -9,10 +9,11 @@ conversion ``stream.encode`` makes (the stream's size and format, default
 interpolation and colorspace), so the encoder gets the frames the plain loop
 would have handed it, already in its format, and takes them as they are.
 
-libx264 with threads and a lookahead (its defaults) can write different bytes
-for the same clip from one run to the next, plain loop or not; settings without
-one of the two (``preset=ultrafast``, or ``threads=1``) write the same bytes
-every time.
+libx264 at its defaults can write different bytes for the same clip from one
+run to the next, plain loop or not. ``threads=1`` has been seen to vary as
+well, and ``MALLOC_PERTURB_`` makes it stable, which points at a read of
+uninitialised memory rather than at the threading. ``preset=ultrafast`` wrote
+the same bytes in every run here, so that is what the byte tests use.
 """
 from __future__ import annotations
 
