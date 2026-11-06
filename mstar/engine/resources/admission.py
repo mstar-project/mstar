@@ -286,7 +286,7 @@ class Admission:
         return entry.nodes
 
     def _pass(
-        self, rid: str, published_of: Callable[[str], Mapping[str, PublishedInfo] | None], blocked: set[str],
+        self, rid: str, published_of: Callable[[str], Mapping[str, PublishedInfo] | None], blocked: dict[str, str],
     ) -> dict[str, str] | None:
         """Admit waiting ``rid`` where it stands in each queue: first, or behind a first request in ``blocked``
         whose resource lets requests pass. Return the nodes waiting on it, or None, and add ``rid`` to
@@ -303,15 +303,19 @@ class Admission:
                 passing.append(key)
             else:
                 return None
+        # The KV cache lends a passer the pages a first request it didn't refuse would fit in, so ``rid`` passes a
+        # first request only if it also passes at the resource that refused that request.
+        if any(blocked[self._queues[key][0]] not in passing for key in passing):
+            return None
         nodes = self._reserve(rid, published_of, passing)
         if nodes is None:
-            blocked.add(rid)
+            blocked.update(self._blocked([rid]))
         return nodes
 
-    def _blocked(self, rids: Iterable[str]) -> set[str]:
-        """Those of the waiting ``rids`` that can't start now and may be passed: a resource refused each, first in
-        its queue or passing, and hasn't grown since, and none asked again in its queues."""
-        blocked = set()
+    def _blocked(self, rids: Iterable[str]) -> dict[str, str]:
+        """Those of the waiting ``rids`` that can't start now and may be passed, each with the resource that refused
+        it, first in its queue or passing, and hasn't grown since. None of them asked again in its queues."""
+        blocked = {}
         for rid in rids:
             if rid in self._placed:
                 continue
@@ -319,7 +323,7 @@ class Admission:
                 ((key, mark) for key, mark in self._short.items() if self._queues[key][0] == rid), None,
             )
             if held is not None and not self._resources[held[0]].grew_since(held[1]):
-                blocked.add(rid)
+                blocked[rid] = held[0]
         return blocked
 
     def _leave(self, rid: str, keys: Collection[str]) -> None:
