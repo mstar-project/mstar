@@ -161,6 +161,35 @@ def test_a_read_from_another_process_lands_the_named_pages_and_tokens():
         os.unlink(path)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_a_cache_no_other_worker_reads_is_freed_with_its_manager():
+    """Only a cache another worker reads is shared over CUDA IPC; any other is freed with
+    its manager, not kept in torch's IPC limbo until exit."""
+    import gc
+
+    from mstar.communication.tensors import LocalTransferEngine
+    from mstar.engine.resources.kv.transfer import (
+        CudaIpcKVTransferEngine,
+        KVTransferManager,
+        TransferEngineInfo,
+    )
+
+    info = TransferEngineInfo("h", "h", LocalTransferEngine("h"))
+    torch.cuda.synchronize()
+    before = torch.cuda.memory_allocated()
+    cache = KVCache(_config(max_num_pages=64, max_seq_len=512), torch.device("cuda:0"))
+    nbytes = cache.tensor.nbytes
+    manager = KVTransferManager(info, cache, needs_remote_transfer=False)
+    manager.cleanup()
+    del manager, cache
+    gc.collect()
+    assert torch.cuda.memory_allocated() - before < nbytes
+
+    shared = KVTransferManager(info, KVCache(_config(), torch.device("cuda:0")), needs_remote_transfer=True)
+    assert isinstance(shared._kv_transfer_engine, CudaIpcKVTransferEngine)
+    shared.cleanup()
+
+
 # Pages 0 and 1 whole into 2 and 3, then tokens [0, 5) of page 2 into page 0,
 # every layer: the shape of a prefill -> decode handoff. Page 1 stays zero.
 _READER = """

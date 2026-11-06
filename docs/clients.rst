@@ -123,22 +123,25 @@ they were sent, so of two under one ``request_id`` it is the later one that gets
 
    with websockets.sync.client.connect("ws://localhost:8000/generate/ws", max_size=None) as ws:
        ws.send(msgpack.packb({
-           "text": "pick up the mug",
-           "files": [{"name": "obs.jpg", "data": open("obs.jpg", "rb").read()}],
+           "text": prompt,  # task + view, duration and resolution text
+           "files": [{"name": "obs.png", "data": open("obs.png", "rb").read()}],  # 736x544 composite
            "output_modalities": ["action"],
-           "model_kwargs": {"action_mode": "policy", "domain_name": "droid_lerobot",
-                            "raw_action_dim": 10, "action_chunk_size": 32},
+           "model_kwargs": {"size": "736x544",
+                            "robot_state": joints + [gripper]},  # current state, as DROID records it
            "request_id": "step-0",
        }, use_bin_type=True))
        while True:
            reply = msgpack.unpackb(ws.recv(), raw=False)
            if reply.get("modality") == "action":
-               actions = np.frombuffer(reply["data"], dtype=np.float32).reshape(32, -1)
+               actions = np.frombuffer(reply["data"], dtype=np.float32).reshape(32, -1)[:, :8]
            if reply.get("finish") or reply.get("error"):
                break
 
-``examples/cosmos3_action_ws_client.py`` is a complete openpi-style client that runs this
-loop at a fixed observation rate and reports chunks/s, actions/s and latency percentiles.
+The chunk (32 rows), the fps and the domain come from the checkpoint, and the reply holds
+the predicted rows after the state, in the robot's values. ``examples/cosmos3_action_ws_client.py``
+is a complete openpi-style client that builds the observation image and prompt the way
+NVIDIA's RoboLab server does for the DROID policies, runs this loop at a fixed observation
+rate and reports chunks/s, actions/s and latency percentiles.
 
 **Live input.** A model that listens while it runs (a full-duplex speech model) keeps a
 request's input open after the opening message, so the opening message may carry no media
@@ -382,11 +385,17 @@ Waypoint emits live RGB frame chunks and is not routed through the encoded-video
 Per-model notes:
 
 - **BAGEL** — chat returns text only; use ``/v1/images/generations`` and
-  ``/v1/images/edits`` for image output.
+  ``/v1/images/edits`` for image output, with ``output_format`` and ``output_compression``
+  as for FLUX.2 klein below.
 - **FLUX.2 klein / Z-Image** — ``/v1/images/generations`` (and ``/v1/images/edits`` for
   klein) only: ``size`` as ``WxH`` (multiples of 16); ``seed``; ``num_inference_steps``,
   ``output_format`` (``png`` default, ``jpeg``, ``webp``), ``output_compression`` (JPEG /
-  WebP quality) and ``png_compress_level`` (0-9, default 1) via ``extra_body``.
+  WebP quality, 0-100) and ``png_compress_level`` (0-9, default 1) via ``extra_body``; a
+  value of the chosen format's knob that is not a whole number in range (``90``, ``90.0``
+  and ``"90"`` are; ``true`` and ``50.9`` are not) is a 400, the other format's knob is
+  ignored, and ``null`` means the default. The PNG writer favours
+  speed (no scanline filters, zlib level 1), so its files are ~30% larger than PIL's
+  defaults; a higher ``png_compress_level`` shrinks them.
 - **Qwen3-Omni** — text sampling uses ``thinker_*`` keys, speech uses ``talker_*``, and the
   residual codec groups use ``code_predictor_*``; set the speaker with ``voice`` (default
   ``Ethan``) and request audio output by including ``"audio"`` in ``modalities``.
@@ -506,8 +515,8 @@ the Python frontend only (``--rust-frontend`` answers ``404``): ``POST /v1/chat/
 Anthropic's ``POST /v1/messages`` and ``POST /v1/messages/count_tokens`` (Claude Code), and
 OpenAI's ``POST /v1/responses`` (Codex). All three run one chat path: the messages and
 ``tools`` go to the checkpoint's chat template, and the reply comes back with its reasoning
-and tool calls split out, streamed or whole. Any ``model`` name gets the loaded model,
-``count_tokens`` counts the prompt as the same request would render it, and responses are
+and tool calls split out, streamed or whole. Any ``model`` name gets the loaded model
+(with LoRA adapters served, ``model`` picks one as on chat completions), ``count_tokens`` counts the prompt as the same request would render it, and responses are
 stateless.
 
 - **Stop strings.** ``stop`` (chat completions, at most 4) and ``stop_sequences`` (Messages)
@@ -538,14 +547,14 @@ stateless.
   ``store: true``, ``background``). Hints (``metadata``, ``cache_control``,
   ``prompt_cache_key``, ``client_metadata``) are dropped.
 - **MTP** (``mtp_num_draft_tokens > 0``) verifies greedily: a ``temperature`` above 0 is a
-  ``400``, and a request that sets none runs greedy. With ``dsa_long_context`` each step
-  books k + 1 cache rows, so ``max_tokens`` may be at most a (k + 1)th of what the prompt
-  leaves of the window. Claude Code asks for 32,000; ``CLAUDE_CODE_MAX_OUTPUT_TOKENS``
+  ``400``, and a request that sets none runs greedy. On GLM-5.3 with ``dsa_long_context``
+  each step books k + 1 cache rows, so ``max_tokens`` may be at most a (k + 1)th of what the
+  prompt leaves of the window. Claude Code asks for 32,000; ``CLAUDE_CODE_MAX_OUTPUT_TOKENS``
   lowers that.
 
-An agent's system prompt and tools alone outgrow the 2,048-token window of
-``glm5_next_tp8.yaml``: serve them with ``glm5_next_tp8_longctx.yaml`` (1M tokens) or
-``glm52_tp8_longctx.yaml`` (256k).
+An agent's system prompt and tools alone outgrow the 2,048-token window of the GLM
+configs: serve them with the long-context override in :doc:`models` (1M tokens on
+GLM-5.3-Flash, 256k on GLM-5.2).
 
 **Claude Code** sends the key as ``x-api-key``, which the Anthropic routes take
 (:ref:`api-key`):

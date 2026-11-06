@@ -91,7 +91,7 @@ def _cpu_capture(monkeypatch):
     monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: None, raising=False)
     monkeypatch.setattr(
         cgr, "capture_into_graph",
-        lambda run, pool, device, dtype, keep_graph=False, node_name=None: (
+        lambda run, pool, device, dtype, keep_graph=False, node_name=None, stream=None: (
             SimpleNamespace(replay=lambda: None), run()),
     )
 
@@ -157,6 +157,31 @@ def test_a_replay_after_release_allocates_only_the_real_rows():
 
     assert kv._streams["real"]["main"].stored_len == 5
     assert kv._arena.num_free == free - 2, "padding rows took pages at replay"
+
+
+def test_a_padded_replay_after_release_takes_no_pages_for_its_padding_row():
+    # bs 2 only, so one real row replays with a zero-length padding row
+    kv = _kv()
+    config = PiecewisePackedConfig(
+        capture_fn=lambda call: {"x": call.static_inputs["x"] + 1},
+        make_static_inputs=lambda shape: {"x": torch.zeros(shape.total_tokens)},
+        declare_step=_declare,
+        total_tokens=[16],
+        capture_batch_sizes=[2],
+    )
+    runner = PiecewiseAcceleratorGraphRunner(
+        label="region", config=config, resources={"kv": kv},
+        step_runner=StepRunner({"kv": kv}), device=CPU, autocast_dtype=None, num_slots=1,
+        device_capability=_CPU_GRAPHS,
+    )
+    runner.warmup_and_capture(None)
+    kv.ingest_request("real")
+    free = kv._arena.num_free
+
+    runner.run({"x": torch.ones(5)}, request_ids=["real"], seq_lens=[5])
+
+    assert kv._streams["real"]["main"].stored_len == 5
+    assert kv._arena.num_free == free - 2, "the padding row took pages at replay"
 
 
 def test_a_batched_region_keeps_its_padding_rows():

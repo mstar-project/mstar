@@ -123,6 +123,9 @@ class _Node:
             )
             for spec in specs
         }
+        for spec in specs:  # as the engine binds them (the DSA resource reads its KV pool)
+            self.resources[spec.resource_key].bind_dependencies(
+                {key: self.resources[key] for key in spec.depends_on()})
         self.runner = StepRunner(self.resources, node_resources={NODE: list(self.resources)})
         submodule.bind_node_resources(self.resources)
         self.overrides = model.get_request_resource_configs(
@@ -204,6 +207,8 @@ class _Node:
             self.sub.postprocess(rid, infos[rid], out)
             streams[rid].append(int(out["new_token"][0].item()))
             texts[rid] = out["text_inputs"][0].clone()
+        # check_stop stops on EOS only; the token budget is the loop's cap, which the runtime enforces
+        cap = self.model.get_loop_caps(max_output_tokens=MAX_TOKENS)["decode_loop"]
         live = list(self.prompts)
         for it in range(MAX_TOKENS + 2):
             if not live:
@@ -217,7 +222,7 @@ class _Node:
                 streams[rid].append(int(out["new_token"][0].item()))
                 texts[rid] = out["text_inputs"][0].clone()
                 infos[rid].dynamic_loop_iter_counts["decode_loop"] = it
-                if self.sub.check_stop(rid, infos[rid], out):
+                if self.sub.check_stop(rid, infos[rid], out) or it + 1 >= cap:
                     live.remove(rid)
         return streams
 

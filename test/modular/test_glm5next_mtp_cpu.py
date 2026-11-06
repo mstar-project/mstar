@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import logging
 import sys
+import threading
 import types
 
 import pytest
@@ -23,7 +24,7 @@ from mstar.engine.resources.kv import manager as kv_mod
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.engine.resources.step import StepContext
 from mstar.model.glm5_next.components.causal_lm import Glm5NextForCausalLM
-from mstar.model.glm5_next.config import KDA_STATE, KV_CACHE, MTP_LEN, SAMPLER, Glm5NextModelConfig
+from mstar.model.glm5_next.config import KDA_STATE, KV_CACHE, LABEL, MTP_LEN, SAMPLER, Glm5NextModelConfig
 from mstar.model.glm5_next.glm5_next_model import Glm5NextModel, process_weights_after_loading
 from mstar.model.glm5_next.submodules import Glm5NextLLMSubmodule
 from mstar.model.submodule_base import InputMetadata
@@ -528,9 +529,9 @@ def test_long_context_mtp_at_a_real_geometry():
         assert _generate_long(engine, sub, dict(REAL_PROMPTS), REAL_MAX_TOKENS) == reference, drafts
 
 
-def test_long_context_mtp_layer_selects_with_its_own_indexer():
+def test_long_context_mtp_pass_keys_every_prompt_row_on_its_own_plane():
     """The prompt's MTP pass writes every prompt row's index key to the MTP layer's own plane,
-    so its drafts select over the whole context."""
+    which its drafts select over (that they select well shows only as acceptance)."""
     engine, sub, cfg = _build_engine(2, long_context=True)
     attn = sub.language_model.mtp.transformer_layer.self_attn
     assert attn.index_plane == attn.kv_plane
@@ -574,7 +575,7 @@ def test_long_context_draft_passes_attend_the_seed_passes_selection(monkeypatch)
             drafting = False
 
     def spy_attend(slots, *args, **kwargs):
-        ctx = attn._dsa.ctx
+        ctx = attn._dsa.current(LABEL)
         rows = [(order[q], keys(order[q], slots[r, :n]))
                 for r, (q, n) in enumerate(zip(ctx.row_req.tolist(), ctx.attn_lens(), strict=True))]
         calls.append((drafting, rows))
@@ -587,8 +588,8 @@ def test_long_context_draft_passes_attend_the_seed_passes_selection(monkeypatch)
     for rid in prompts:
         engine.add_request(rid, {SAMPLER: SamplingReqConfig(temperature=0.0)})
     out, stops = _step(engine, "prefill", prompts, LONG_MAX_TOKENS)
-    # the prefill's last MTP passes: each request's last row again, with its sampled token
-    seed = {rows[0][0]: rows[0][1] for _, rows in calls[-len(prompts):]}
+    # the prefill's last MTP pass: each request's last row again, with its sampled token
+    seed = dict(calls[-1][1])
     assert set(seed) == set(prompts)
     nxt = {rid: out[rid]["text_inputs"][0] for rid in prompts}
     live, step, sparse = [rid for rid in prompts if not stops.get(rid)], 0, 0
@@ -643,14 +644,130 @@ def test_long_context_decode_stops_while_the_next_block_fits():
     engine.remove_request("r")
 
 
+@pytest.mark.xfail(strict=True, reason=(
+    "under mtp_trims the host books every verify step's whole block and never takes the "
+    "rejected rows back, so a request holds up to k + 1 pages' rows a token and process_prompt "
+    "refuses max_tokens past (kv_rows - prompt) / (k + 1); follow-up: release step N - 1's "
+    "rejected rows when planning N + 1, from its verdict (the same on every rank)"))
+def test_long_context_mtp_books_at_most_a_block_past_the_rows_it_holds(long_reference):
+    """Rejected drafts cost no cache rows: the host's rows stay within a block of the device's."""
+    engine, sub, _ = _build_engine(3, long_context=True)
+    _oracle(sub, long_reference, wrong_every=1)  # every draft rejected
+    kv, pool = engine._resources[KV_CACHE], engine._resources[KDA_STATE]
+    engine.add_request("a", {SAMPLER: SamplingReqConfig(temperature=0.0)})
+    out, _ = _step(engine, "prefill", {"a": LONG_PROMPTS["a"]}, LONG_MAX_TOKENS)
+    for step in range(6):
+        out, _ = _step(engine, "decode", {"a": out["a"]["text_inputs"][0]}, LONG_MAX_TOKENS, step)
+        held = int(pool.block(MTP_LEN)[pool._slots["a"]["main"].index, 0])
+        assert kv._streams["a"]["main"].stored_len <= held + sub.mtp_block, (step, held)
+    engine.remove_request("a")
+
+
+def _serve_joining(engine, sub, prompts, arrivals, max_tokens):
+    """Requests served as a worker does: each prefills alone before decode step ``arrivals``
+    names, joins the decode batch and leaves at its own stop, its KDA slot free for a later
+    one. Checks after each verify step that ``MTP_LEN`` is the rows the device holds."""
+    pool = engine._resources[KDA_STATE]
+    seqs, nxt, iters, live, slots, step = {}, {}, {}, [], {}, 0
+
+    def run(walk, inputs):
+        rids = list(inputs)
+        batch = _batch(
+            node_name="LLM",
+            per_request_info={rid: _info(rid, walk, max_tokens[rid], iters.get(rid, 0))
+                              for rid in rids},
+            per_request_input_tensors={rid: {"text_inputs": [t]} for rid, t in inputs.items()},
+            step_context=StepContext(request_ids=tuple(rids), graph_walk=walk, slot=0,
+                                     capture=False),
+        )
+        engine.prepare_inputs(batch)
+        assert not batch.failed_requests, batch.failed_requests
+        outputs = engine.exec_and_postprocess(batch)
+        assert batch.admit_error is None, batch.admit_error
+        engine.finalize_batch(batch)
+        return outputs.per_rid_outputs, engine.check_stop_for_batch(batch, outputs)
+
+    while live or any(s >= step for s in arrivals):
+        for rid in arrivals.get(step, []):
+            engine.add_request(rid, {SAMPLER: SamplingReqConfig(temperature=0.0)})
+            out, _ = run("prefill", {rid: prompts[rid]})
+            seqs[rid], nxt[rid], iters[rid] = out[rid]["new_token"][0].tolist(), out[rid]["text_inputs"][0], 0
+            slots[rid] = pool._slots[rid]["main"].index
+            live.append(rid)
+        if live:
+            out, stops = run("decode", {rid: nxt[rid] for rid in live})
+            for rid in live:
+                seqs[rid] += out[rid]["new_token"][0].tolist()
+                nxt[rid] = out[rid]["text_inputs"][0]
+                iters[rid] += 1
+                if sub.mtp_k and not stops.get(rid):  # the prompt and every token but the next input
+                    held = int(pool.block(MTP_LEN)[slots[rid], 0])
+                    assert held == len(prompts[rid]) + len(seqs[rid]) - 1, (rid, step, held)
+            for rid in [rid for rid in live if stops.get(rid)]:
+                engine.remove_request(rid)
+                live.remove(rid)
+        step += 1
+    assert pool.num_free_slots == pool.config.usable_slots
+    return seqs, slots
+
+
+def _ids(n, a, b):
+    return (torch.arange(n) * a + b) % 240
+
+
+# past index_topk (64), on it, crossing it mid-decode, and short; "e" and "f" arrive after
+# "a" has left, "e" into its slot (4 slots)
+SERVE_PROMPTS = {"a": _ids(100, 37, 11), "b": _ids(75, 53, 5), "c": _ids(58, 29, 3),
+                 "d": _ids(64, 41, 7), "e": _ids(130, 31, 17), "f": _ids(3, 19, 2)}
+SERVE_ARRIVALS = {0: ["a", "b"], 1: ["c", "d"], 6: ["e"], 14: ["f"]}
+SERVE_MAX_TOKENS = {"a": 5, "b": 23, "c": 12, "d": 11, "e": 21, "f": 8}
+
+
+@pytest.fixture
+def served_reference():
+    engine, sub, _ = _build_engine(0, long_context=True, page_size=8)
+    seqs, slots = _serve_joining(engine, sub, SERVE_PROMPTS, SERVE_ARRIVALS, SERVE_MAX_TOKENS)
+    assert slots["e"] == slots["a"]
+    assert {rid: len(s) for rid, s in seqs.items()} == SERVE_MAX_TOKENS, seqs
+    return seqs
+
+
+@pytest.mark.parametrize("k", [1, 3])
+@pytest.mark.parametrize("drafts", ["mtp", "oracle", "oracle_partial"])
+def test_long_context_mtp_serves_arrivals_and_departures_as_greedy(served_reference, k, drafts):
+    """Requests joining and leaving the decode batch, one into a freed slot, on 8-token pages:
+    each one's tokens are greedy's, and its MTP_LEN its true rows after every step."""
+    engine, sub, cfg = _build_engine(k, long_context=True, page_size=8)
+    assert cfg.mtp_trims
+    if drafts != "mtp":
+        _oracle(sub, served_reference, wrong_every=2 if drafts == "oracle_partial" else None)
+    seqs, _ = _serve_joining(engine, sub, SERVE_PROMPTS, SERVE_ARRIVALS, SERVE_MAX_TOKENS)
+    assert seqs == served_reference
+
+
+@pytest.mark.parametrize("k", [0, 3])
+def test_long_context_mtp_stops_at_a_stop_token_among_accepted_drafts(served_reference, k):
+    """A stop token inside a step's accepted drafts ends the reply there, as greedy's does."""
+    stop = served_reference["b"][9]
+    engine, sub, cfg = _build_engine(k, long_context=True, page_size=8)
+    cfg.eos_token_ids = (stop,)
+    if k:
+        _oracle(sub, served_reference, wrong_every=None)  # every draft accepted
+    seqs, _ = _serve_joining(engine, sub, SERVE_PROMPTS, SERVE_ARRIVALS, SERVE_MAX_TOKENS)
+    assert seqs["b"] == served_reference["b"][:served_reference["b"].index(stop) + 1]
+
+
 # -- a stop on the prefill walk -----------------------------------------------
 
 
-def _serve(engine, prompt: torch.Tensor, max_tokens: int, ignore_eos=False) -> list[int]:
-    """The tokens one request sends the client, its stops going through the graph runtime."""
+def _serve(engine, prompt: torch.Tensor, max_tokens: int, ignore_eos=False, walks=None) -> list[int]:
+    """The tokens one request sends the client, its stops going through the graph runtime;
+    ``walks`` collects the walk of each step it ran."""
     engine.add_request("r", {SAMPLER: SamplingReqConfig(temperature=0.0, ignore_eos=ignore_eos)})
 
     def step(walk, inputs, iteration):
+        if walks is not None:
+            walks.append(walk)
         out, stops = _step(engine, walk, {"r": inputs["text_inputs"][0]}, max_tokens, iteration,
                            ignore_eos=ignore_eos)
         return out.get("r", {}), stops.get("r", set())
@@ -668,7 +785,7 @@ def _errors(caplog) -> list[str]:
 
 @pytest.mark.parametrize("k", [0, 3])
 def test_a_stop_token_from_the_prefill_ends_the_reply(k, caplog):
-    # the prefill walk has no decode_loop: the runtime drops a stop named there
+    # the prefill walk has no decode_loop: its stop ends the partition, and no decode step runs
     engine, _, cfg = _build_engine(k)
     eos = cfg.eos_token_ids[1]
     greedy = engine._resources[SAMPLER]
@@ -678,7 +795,9 @@ def test_a_stop_token_from_the_prefill_ends_the_reply(k, caplog):
         return torch.full((logits.shape[0],), eos, dtype=torch.long)
 
     greedy.sample = eos_once
-    assert _serve(engine, PROMPTS["a"], MAX_TOKENS) == [eos]
+    walks = []
+    assert _serve(engine, PROMPTS["a"], MAX_TOKENS, walks=walks) == [eos]
+    assert walks == ["prefill"]
     assert _errors(caplog) == []
 
 
@@ -688,3 +807,49 @@ def test_short_budgets_are_exact_and_name_no_missing_loop(k, max_tokens, caplog)
     engine, _, _ = _build_engine(k)
     assert len(_serve(engine, PROMPTS["a"], max_tokens, ignore_eos=True)) == max_tokens
     assert _errors(caplog) == []
+
+
+# -- a verdict that never lands -------------------------------------------------
+
+
+def _verdict_reader(monkeypatch, pending: dict):
+    """A submodule whose eager mailbox never stages a verdict (step -1), as after a failed replay."""
+    from mstar.model.glm5_next import submodules
+
+    monkeypatch.setattr(submodules, "_VERDICT_DEADLINE_S", 0.2, raising=False)
+    sub = Glm5NextLLMSubmodule.__new__(Glm5NextLLMSubmodule)
+    sub.__dict__.update(mtp_k=3, request_states={}, _mailboxes={
+        None: (torch.zeros(4, 5, dtype=torch.long), torch.full((1,), -1, dtype=torch.long))})
+    for rid, p in pending.items():
+        sub.request_state(rid).add("mtp_pending", p)
+    return sub
+
+
+def _raised(fn, seconds: float = 20.0):
+    """What ``fn`` raised, on a thread bounded at ``seconds``: a wait with no deadline fails here."""
+    out = {}
+
+    def run():
+        try:
+            fn()
+        except BaseException as exc:  # noqa: BLE001 - SystemExit is the point
+            out["exc"] = exc
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    thread.join(seconds)
+    assert not thread.is_alive(), "the verdict read is still waiting"
+    return out.get("exc")
+
+
+def test_a_verdict_that_never_lands_exits_the_process(monkeypatch):
+    """A step that failed after it was numbered: the read exits the process at its deadline
+    instead of holding the worker forever."""
+    sub = _verdict_reader(monkeypatch, {"a": (1, None, 0)})
+    exc = _raised(lambda: sub._read_verdicts(["a"]))
+    assert isinstance(exc, SystemExit) and "never staged" in str(exc)
+
+
+def test_a_read_across_two_steps_exits_the_process(monkeypatch):
+    sub = _verdict_reader(monkeypatch, {"a": (1, None, 0), "b": (2, None, 1)})
+    assert isinstance(_raised(lambda: sub._read_verdicts(["a", "b"])), SystemExit)

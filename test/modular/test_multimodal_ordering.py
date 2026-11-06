@@ -268,14 +268,23 @@ class _StubTokenizer:
         )
 
 
+# BAGEL's ViT: 14-pixel patches, at most 70 a side
+PATCH_SIZE, MAX_PATCHES_PER_SIDE = 14, 70
+
+
 @pytest.fixture
 def bagel():
     """A BagelModel with only what process_prompt needs."""
     from mstar.model.bagel.bagel_model import BagelModel
+    from mstar.model.bagel.config import BagelAutoEncoderConfig, BagelModelConfig, BagelViTConfig
 
     class _Bagel(BagelModel):
         def __init__(self):
-            self.config = SimpleNamespace(think_mode=False)
+            self.config = BagelModelConfig(
+                vae_config=BagelAutoEncoderConfig(),
+                vit_config=BagelViTConfig(patch_size=PATCH_SIZE),
+                vit_max_num_patch_per_side=MAX_PATCHES_PER_SIDE,
+            )
             self.tokenizer = _StubTokenizer()
             self.boi_token_id = _StubTokenizer.SPECIALS["<|vision_start|>"]
             self.eoi_token_id = _StubTokenizer.SPECIALS["<|vision_end|>"]
@@ -586,7 +595,6 @@ def test_bagel_spans_come_from_one_tokenization(bagel):
 
 def test_qwen_schedule_walks_the_plan():
     """Qwen3-Omni prefills each attachment where it was written."""
-    pytest.importorskip("flashinfer")  # imported by Qwen3OmniModel's submodules
     from mstar.model.qwen3_omni.qwen3_omni_model import Qwen3OmniModel
 
     model = Qwen3OmniModel.__new__(Qwen3OmniModel)
@@ -596,22 +604,21 @@ def test_qwen_schedule_walks_the_plan():
         "pixel_values": ["px0", "px1"],
         "image_grid_thw": ["g0", "g1"],
         "audio_features": ["af0"],
-        "audio_seqlens": ["as0"],
     }
     schedule = Qwen3OmniModel._build_thinker_prefill_schedule(model, mods, signals)
-    assert [walk for walk, _ in schedule] == [
-        "prefill_text", "prefill_vision", "prefill_text", "prefill_vision",
-        "prefill_text", "prefill_audio", "prefill_text",
-    ]
+    assert [walk for walk, _ in schedule] == ["prefill_vision", "prefill_vision", "prefill_audio"]
     # Each vision walk carries its own image, in order.
     vision = [entry for walk, entry in schedule if walk == "prefill_vision"]
     assert [e["pixel_values"] for e in vision] == ["px0", "px1"]
     assert [e["image_grid_thw"] for e in vision] == ["g0", "g1"]
+    # Each attachment's walk takes the text before it, and the last one the text after it.
+    assert [(e["text_inputs"], e["text_before"]) for _, e in schedule] == [
+        (["t0"], 1), (["t1"], 1), (["t2", "t3"], 1),
+    ]
 
 
 def test_qwen_placeholder_ids_come_from_the_tokenizer():
     """Not from thinker_config, which disagrees with it on the checkpoint."""
-    pytest.importorskip("flashinfer")  # imported by Qwen3OmniModel's submodules
     from mstar.model.qwen3_omni.qwen3_omni_model import Qwen3OmniModel
 
     vocab = {
@@ -631,7 +638,6 @@ def test_qwen_placeholder_ids_come_from_the_tokenizer():
 
 def test_a_modality_the_tokenizer_cannot_place_is_left_out():
     """A missing placeholder drops that modality rather than scanning for 0."""
-    pytest.importorskip("flashinfer")  # imported by Qwen3OmniModel's submodules
     from mstar.model.qwen3_omni.qwen3_omni_model import Qwen3OmniModel
 
     vocab = {"<|image_pad|>": 5, "<|vision_start|>": 6, "<|vision_end|>": 7}
@@ -647,18 +653,12 @@ def test_a_modality_the_tokenizer_cannot_place_is_left_out():
 # runs them in, and each image's own file over the slots its ViT walk writes.
 # An image keyed by another image's file would be served that image's KV.
 
-PATCH_SIZE, MAX_PATCHES_PER_SIDE = 14, 70
 # Two images of different sizes, so a span sized or keyed by the wrong image fails the test.
 SIZES = [(480, 640), (1200, 1600)]
 
 
 def _laid_out(bagel, modalities: list[str], output_modalities=("text",), tensors=True, **kwargs):
     """Return what Bagel's `process_prompt` gives for the text and images in ``modalities``, with the images."""
-    bagel.config.vit_config = SimpleNamespace(patch_size=PATCH_SIZE)
-    bagel.config.vit_max_num_patch_per_side = MAX_PATCHES_PER_SIDE
-    bagel.config.latent_downsample, bagel.config.max_latent_size = 16, 64
-    bagel.config.cfg_text_scale, bagel.config.cfg_img_scale, bagel.config.cfg_interval = 4.0, 1.0, [0.4, 1.0]
-    bagel.config.cfg_renorm_type, bagel.config.cfg_renorm_min = "global", 0.0
     texts = iter(["what is", "in this picture", "and in this one"])
     parts, images = [], []
     for modality in modalities:
@@ -740,3 +740,16 @@ def test_bagel_keys_an_understood_image_and_otherwise_only_a_leading_text_span(b
     assert isinstance(_laid_out(bagel, interleaved, tensors=False)[0], dict), (
         "a prompt was laid out without the images that size it"
     )
+
+
+@pytest.mark.parametrize("ids,kept", [
+    # system turn cut, user kept, earlier assistant turn cut, the last turn kept whatever its role
+    ([9, 1, 2, 5, 5, 1, 3, 6, 1, 4, 7, 7, 1, 3, 8, 1, 4], [1, 0, 0, 0, 0, 1, 1, 1, 0, 0, 0, 0, 1, 1, 1, 1, 1]),
+    ([1, 2, 5], [1, 1, 1]),
+    ([5, 6], [1, 1]),
+])
+def test_the_talker_skips_system_and_earlier_assistant_turns(ids, kept):
+    from mstar.model.qwen3_omni.submodules import talker_text_mask
+
+    config = SimpleNamespace(im_start_token_id=1, system_token_id=2, assistant_token_id=4)
+    assert talker_text_mask(torch.tensor(ids), config).tolist() == [bool(k) for k in kept]

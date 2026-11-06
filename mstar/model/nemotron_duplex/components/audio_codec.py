@@ -30,8 +30,8 @@ from torch import nn
 from torch.nn import functional as F
 
 from mstar.engine.resources.recurrent import RecurrentBlockConfig
+from mstar.model.components.dft import irfft_dim1
 from mstar.model.nemotron_duplex.components._util import RawWeight, param
-from mstar.model.nemotron_duplex.components.dft import irfft_dim1
 from mstar.model.nemotron_duplex.config import CodecConfig
 
 # The encoder/decoder layer specs — (kind, weight_shape, stride, transpose) for

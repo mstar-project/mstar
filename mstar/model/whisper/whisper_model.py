@@ -368,7 +368,7 @@ class WhisperModel(Model):
                     # worker sends the batch's tokens inline, one frame a step,
                     # so a decode step stores no tensor per request (the client
                     # joins the text chunks; the align walk reads the tokens the
-                    # decoder recorded, see `check_stop_batched`).
+                    # decoder recorded, see its `_token_stops`).
                     GraphEdge(next_node=DECODER_NODE, name="text_inputs"),
                     GraphEdge(next_node=DECODER_NODE, name="ts_rules"),
                     GraphEdge(next_node=EMIT_TO_CLIENT, name="text_inputs", output_modality="text"),
@@ -649,7 +649,8 @@ class WhisperModel(Model):
         })
 
     def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
-        return {DECODE_LOOP: self.get_max_output_tokens(**model_kwargs)}
+        # the prefill emits the first of max_output_tokens, so the loop runs one fewer
+        return {DECODE_LOOP: max(1, self.get_max_output_tokens(**model_kwargs) - 1)}
 
     def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
         return {

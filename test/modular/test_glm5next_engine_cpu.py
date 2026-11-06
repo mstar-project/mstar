@@ -242,6 +242,31 @@ class TestEngineCpu:
         assert _context(sub, "r") == limit
         engine.remove_request("r")
 
+    def test_a_reply_at_the_most_tokens_the_window_holds_gets_them_all(self):
+        """The conductor takes a max_tokens up to the window's room after the prompt (the
+        last token is never stored), and the loop's cap ends the reply there: the window's
+        own stop fires on that token, not one before it."""
+        engine, sub, cfg = _build_engine(seed=2)
+        limit = cfg.index_topk
+        _add(engine, "r")
+        prompt = torch.arange(limit - 5, dtype=torch.long)
+        max_tokens = limit - len(prompt) + 1
+        token = _run(engine, "prefill", {"r": prompt})["r"]
+        emitted = 1
+        for i in range(limit):
+            token = _run(engine, "decode", {"r": token})["r"]
+            emitted += 1
+            info = _info("r", "decode", max_tokens=max_tokens)
+            info.dynamic_loop_iter_counts["decode_loop"] = i
+            batch = _batch(
+                node_name="LLM", per_request_info={"r": info},
+                step_context=StepContext(request_ids=("r",), graph_walk="decode", slot=0, capture=False),
+            )
+            if engine.check_stop_for_batch(batch, {"r": {"new_token": [token]}}).get("r"):
+                break
+        assert emitted == max_tokens == 6 and _context(sub, "r") == limit
+        engine.remove_request("r")
+
     def test_forward_runs_outside_the_engine_autocast(self):
         engine, sub, cfg = _build_engine(autocast_dtype=torch.bfloat16)
         seen = []

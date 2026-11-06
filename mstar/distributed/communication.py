@@ -2,7 +2,7 @@ import socket
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import timedelta
-from typing import Any
+from typing import Any, NamedTuple
 from urllib.parse import urlparse
 
 import torch
@@ -54,6 +54,31 @@ def _all_to_all_single(
     return recv
 
 
+# torch 2.13 renamed the into-tensor collectives to the *_single scheme.
+# Import-time selection keeps the fallback out of compiled call paths.
+_all_gather_single = getattr(dist, "all_gather_single", None)
+if _all_gather_single is None:
+    _all_gather_single = getattr(
+        getattr(dist, "distributed_c10d", None), "all_gather_single", None
+    )
+_all_gather_into_tensor = _all_gather_single or dist.all_gather_into_tensor
+
+
+def _barrier(group: dist.ProcessGroup | None = None) -> None:
+    """Barrier without torch 2.13's implicit-device warning on NCCL groups."""
+    if dist.get_backend(group) == dist.Backend.NCCL:
+        dist.barrier(group=group, device_ids=[torch.cuda.current_device()])
+    else:
+        dist.barrier(group=group)
+
+
+class ArFusionWorkspace(NamedTuple):
+    """A fused all-reduce workspace of a ``CommGroup``: its id in
+    ``ar_fusion``'s registry, for inputs of up to ``max_tokens`` rows."""
+    ws_id: int
+    max_tokens: int
+
+
 class CommGroup:
     """A communication group over one axis of the worker device mesh.
 
@@ -80,9 +105,8 @@ class CommGroup:
         # NCCL: a gloo twin, or on XPU the mixed group's gloo side
         self.cpu_group = None
         self.initialized = False
-        # see ``init_allreduce_fusion``
-        self._ar_fusion_ws: int | None = None
-        self._ar_fusion_max_tokens = 0
+        # (dtype, hidden) -> its fused all-reduce workspace; see ``init_allreduce_fusion``
+        self._ar_fusion: dict[tuple[torch.dtype, int], ArFusionWorkspace] = {}
         # NCCL until ``init_all_reduce`` sets up the deployment's backend
         self._all_reduce = AllReduce(self.device_group)
 
@@ -127,7 +151,7 @@ class CommGroup:
             output_size, dtype=input_.dtype, device=input_.device
         )
         # All-gather
-        dist.all_gather_into_tensor(output_tensor, input_, group=self.device_group)
+        _all_gather_into_tensor(output_tensor, input_, group=self.device_group)
         # Reshape
         output_tensor = output_tensor.reshape((self.world_size,) + input_size)
         output_tensor = output_tensor.movedim(0, dim)
@@ -141,7 +165,7 @@ class CommGroup:
     def barrier(self):
         if self.world_size == 1:
             return
-        dist.barrier(group=self.device_group)
+        _barrier(self.device_group)
 
     def all_reduce_buffer(
         self, shape: tuple[int, ...], dtype: torch.dtype, device: torch.device
@@ -161,17 +185,28 @@ class CommGroup:
         self, hidden: int, dtype: torch.dtype, max_tokens: int = 2048,
     ) -> bool:
         """Set up ``allreduce_add_rmsnorm``'s fused kernel for ``[<=max_tokens,
-        hidden]`` inputs; larger inputs keep the NCCL path. Collective: every
-        member calls it at the same point. Returns whether it is available."""
-        if self.world_size == 1 or self._ar_fusion_ws is not None:
-            return self._ar_fusion_ws is not None
+        hidden]`` inputs of ``dtype``. Returns whether it is available for them.
+
+        Collective: every member calls it at load, in the same order with the
+        same arguments. The lockstep nodes of an instance share its group, so
+        it uses one workspace per ``(dtype, hidden)``. A larger ``max_tokens``
+        builds another if it can and leaves the old one allocated, outside torch's
+        allocator: 512 MiB per rank in each shape measured at TP2 on H200, with
+        the MNNVL backend FlashInfer 0.7.2's "auto" chose. Other inputs take the
+        group's ``all_reduce`` and a separate norm.
+        """
+        if self.world_size == 1:
+            return False
+        have = self._ar_fusion.get((dtype, hidden))
+        if have is not None and have.max_tokens >= max_tokens:
+            return True
         from mstar.distributed.ar_fusion import create_workspace
 
-        self._ar_fusion_ws = create_workspace(
-            self, max_tokens, hidden, dtype,
-        )
-        self._ar_fusion_max_tokens = max_tokens if self._ar_fusion_ws is not None else 0
-        return self._ar_fusion_ws is not None
+        ws_id = create_workspace(self, max_tokens, hidden, dtype)
+        if ws_id is None:
+            return False
+        self._ar_fusion[(dtype, hidden)] = ArFusionWorkspace(ws_id, max_tokens)
+        return True
 
     def allreduce_add_rmsnorm(
         self, x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor,
@@ -180,14 +215,12 @@ class CommGroup:
         """``r = all_reduce(x) + residual``; returns ``(rms_norm(r), r)``,
         scaling by ``weight + weight_bias``. ``x`` is a row-parallel
         projection's partial sum (its linear skipped ``reduce_results``)."""
-        if (self._ar_fusion_ws is not None
-                and x.shape[0] <= self._ar_fusion_max_tokens
+        ws = self._ar_fusion.get((x.dtype, x.shape[-1]))
+        if (ws is not None and x.shape[0] <= ws.max_tokens
                 and x.is_contiguous() and residual.is_contiguous()):
             from mstar.distributed.ar_fusion import allreduce_add_rmsnorm
 
-            return allreduce_add_rmsnorm(
-                x, residual, weight, eps, weight_bias, self._ar_fusion_ws,
-            )
+            return allreduce_add_rmsnorm(x, residual, weight, eps, weight_bias, ws.ws_id)
         r = self.all_reduce(x) + residual
         v = r.float()
         v = v * torch.rsqrt(v.pow(2).mean(-1, keepdim=True) + eps)
@@ -627,7 +660,7 @@ class WorkerParallelGroups:
         """
         if not self.any_parallelism:
             return
-        dist.barrier()
+        _barrier()
 
     def restore_default_timeout(self) -> None:
         """Give every group this rank holds torch's default timeout back."""
@@ -660,13 +693,10 @@ class GlobalParallelConfig:
         node_to_instance_groups: dict[str, set[tuple[int, ...]]] = {}
         for wg in worker_graphs.values():
             shape = (wg._tp_comm_size, wg.sp_size)
-            instance_groups = wg._instance_ranks or [
-                [rank] for rank in wg.ranks
-            ]
             for node in wg.section.get_nodes():
                 node_to_parallel_shapes.setdefault(node, set()).add(shape)
                 node_to_instance_groups.setdefault(node, set()).update(
-                    tuple(group) for group in instance_groups
+                    tuple(group) for group in wg.replica_ranks
                 )
         frozen_parallel_shapes = {
             node: frozenset(shapes)

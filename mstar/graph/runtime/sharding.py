@@ -1,4 +1,4 @@
-"""Per-request sharding, derived the same way by both runtimes.
+"""Per-request sharding.
 
 A request's ``ShardingConfig`` is a pure function of the base config and the
 ``worker_graph_to_workers`` map the conductor sent with NEW_REQUEST:
@@ -6,7 +6,7 @@ A request's ``ShardingConfig`` is a pure function of the base config and the
 derives its own copy by the same rule (``ShardingTemplate::instantiate``), but
 that copy cannot come back out: ``TensorCommunicationManager.register_request``
 wants the Python object, and the TP fan-out paths reach into
-``group._workers``. So the Python object is built here for both.
+``group._workers``. So the Python object is built here.
 """
 from __future__ import annotations
 

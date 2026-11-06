@@ -83,7 +83,7 @@ def _request(model: Glm5NextModel, engine: Engine, rid: str, text: str) -> torch
     out = model.process_prompt(text, ["text"], ["text"])
     tensors, layouts = dict(out.new_input_tensors), out.metadata["kv_layout"]
     rows = {key: {label: layout.row() for label, layout in by.items()} for key, by in layouts.items()}
-    page = next(s.config.page_size for s in model.get_node_resources() if s.resource_key == KV_CACHE)
+    page = engine._resources[KV_CACHE].config.tokens_per_page
     worker = SimpleNamespace(
         _keyed_labels=keyed_labels(model), _prefix_page_sizes={KV_CACHE: page}, model=model,
         _page_layout=lambda *args: PreprocessWorkerThread._page_layout(None, *args),
@@ -147,7 +147,7 @@ def test_a_prompt_past_a_cached_prefix_decodes_as_a_cold_run(k):
     b_text = SHARED + " but the second one asks something else."
     b = _request(model, warm, "b", b_text)
     c = _request(model, warm, "c", "an unrelated prompt that shares nothing with the others.")
-    page = warm._resources[KV_CACHE].config.page_size
+    page = warm._resources[KV_CACHE].config.tokens_per_page
     hits_before = warm._resources[KV_CACHE].prefix_tokens.get("LLM", (0, 0))[1]
     got = _generate(warm, {"b": b, "c": c})
     hit = warm._resources[KV_CACHE].prefix_tokens["LLM"][1] - hits_before

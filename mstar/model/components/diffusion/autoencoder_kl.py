@@ -24,6 +24,8 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from mstar.model.components.diffusion.group_norm import norm_act
+
 
 @dataclass(frozen=True)
 class AutoencoderKLConfig:
@@ -84,8 +86,8 @@ class ResnetBlock(nn.Module):
         self.act = nn.SiLU()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        h = self.conv1(self.act(self.norm1(x)))
-        h = self.conv2(self.act(self.norm2(h)))
+        h = self.conv1(norm_act(self.norm1, x, self.act))
+        h = self.conv2(norm_act(self.norm2, h, self.act))
         if self.conv_shortcut is not None:
             x = self.conv_shortcut(x)
         return x + h
@@ -158,11 +160,32 @@ class UpStage(nn.Module):
             ResnetBlock(in_channels if i == 0 else out_channels, out_channels, groups, eps) for i in range(num_layers)
         )
         self.upsample = nn.Conv2d(out_channels, out_channels, 3, padding=1) if upsample else None
+        # set by fold_upsample(): the stride-2 transposed-conv kernel equal to nearest x2 + conv3x3;
+        # a buffer so it moves with the module, out of the state dict the checkpoint loads
+        self.register_buffer("upsample_folded", None, persistent=False)
+
+    def fold_upsample(self) -> None:
+        """Precompute the 4x4 stride-2 transposed-conv kernel that equals nearest x2 + the 3x3
+        conv, so a compiled decode convolves the input instead of a 4x larger upsampled copy of
+        it. Each folded tap is the sum, in fp32, of the 3x3 taps that read the same input pixel,
+        rounded once to the weight dtype: in bf16 a weight the unfolded conv never uses, so the
+        output differs from it in the last bits."""
+        if self.upsample is None:
+            return
+        w = self.upsample.weight.detach().float()  # [out, in, 3, 3]
+        taps = ((2,), (1, 2), (0, 1), (0,))  # transposed tap -> the 3x3 taps it sums, per axis
+        folded = w.new_zeros(w.shape[1], w.shape[0], 4, 4)
+        for a in range(4):
+            for b in range(4):
+                folded[:, :, a, b] = sum(w[:, :, i, j] for i in taps[a] for j in taps[b]).t()
+        self.upsample_folded = folded.to(self.upsample.weight.dtype)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         for resnet in self.resnets:
             x = resnet(x)
         if self.upsample is not None:
+            if self.upsample_folded is not None and torch.compiler.is_compiling():
+                return F.conv_transpose2d(x, self.upsample_folded, self.upsample.bias, stride=2, padding=1)
             x = self.upsample(F.interpolate(x, scale_factor=2.0, mode="nearest"))
         return x
 
@@ -189,7 +212,7 @@ class Encoder(nn.Module):
         for stage in self.down_stages:
             x = stage(x)
         x = self.mid(x)
-        return self.conv_out(self.act_out(self.norm_out(x)))
+        return self.conv_out(norm_act(self.norm_out, x, self.act_out))
 
 
 class Decoder(nn.Module):
@@ -214,7 +237,7 @@ class Decoder(nn.Module):
         x = self.mid(self.conv_in(z))
         for stage in self.up_stages:
             x = stage(x)
-        return self.conv_out(self.act_out(self.norm_out(x)))
+        return self.conv_out(norm_act(self.norm_out, x, self.act_out))
 
 
 class AutoencoderKL(nn.Module):

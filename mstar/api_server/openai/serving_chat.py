@@ -17,44 +17,27 @@ import base64
 from mstar.api_server import media_io
 from mstar.api_server.openai import reply
 from mstar.api_server.openai._util import SSE_DONE, error_type, now, rid, sse
-from mstar.api_server.streaming_response import ReleasingStreamingResponse
 
 
 async def create_chat_completion(api, model_name, adapter, req, raw_request=None):
     """The response dict, or for ``req.stream`` the SSE response itself."""
-    args = adapter.chat_to_request(req, api.upload_dir)
-    parser = adapter.make_output_parser(req)
-    stops = adapter.stop_strings(req)
-    # checked before the request runs: a raise after submit leaves it running with no reader
+    # checked before the adapter saves any upload, which only the finally below removes,
+    # and before submit, after which a raise leaves the request running with no reader
     stream_options = getattr(req, "stream_options", None) or {}
     if not isinstance(stream_options, dict):
         raise ValueError("stream_options must be an object")
     include_usage = bool(stream_options.get("include_usage"))
+    args = adapter.chat_to_request(req, api.upload_dir)
+    parser = adapter.make_output_parser(req)
+    stops = adapter.stop_strings(req)
     request_id = rid("chatcmpl")
     sample_rate = api.model.get_output_sample_rate("audio") if api.model is not None else 24000
 
     try:
-        api.submit_request(
-            text=args.text,
-            file_paths=args.file_paths,
-            input_modalities=args.input_modalities,
-            output_modalities=args.output_modalities,
-            model_kwargs=args.model_kwargs,
-            prompt_parts=args.prompt_parts,
-            streaming=bool(req.stream),
-            request_id=request_id,
-        )
+        model_name = reply.submit(api, request_id, model_name, req, args)
         if req.stream:
-            # named before the wait below, which a resubmission under the id could outlast
-            key = api.submission_key(request_id)
-            # a request the engine refuses gets its status, not a 200
-            batches = await api.open_result_stream(request_id, raw_request, batches=True)
-            return ReleasingStreamingResponse(
-                _stream_events(reply.reply_events(api, request_id, parser, stops, batches=batches, key=key),
-                               model_name, request_id, include_usage),
-                release=lambda: api.release_request(request_id),
-                media_type="text/event-stream", headers={"Cache-Control": "no-cache"},
-            )
+            events = await reply.stream_events(api, request_id, raw_request, parser, stops)
+            return reply.sse_response(api, request_id, _stream_events(events, model_name, request_id, include_usage))
         if parser is not None or stops:
             # read chunk by chunk, so a stop string ends the request as it appears
             events = await reply.collect(reply.reply_events(api, request_id, parser, stops), raw_request)
