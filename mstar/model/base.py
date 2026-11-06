@@ -653,6 +653,9 @@ class Model(ABC):
     # conductor in arrival order. Declare it only once those calls are checked
     # for shared state, and for the GIL: work that holds it gains nothing here.
     PREPROCESS_PARALLEL: bool = False
+    # Also decode one request's images at once, for a ``load_image`` that is mostly
+    # a GIL-free decode: intra-op work in it would run on each of these threads.
+    PREPROCESS_PARALLEL_IMAGES: bool = False
 
     # The rate the default ``load_audio`` decodes an upload to, and the longest
     # clip it decodes (default 30 min). The request's audio budget
