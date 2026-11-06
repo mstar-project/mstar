@@ -18,6 +18,7 @@ Maya assume.
 
 from __future__ import annotations
 
+import datetime
 import functools
 import hashlib
 import inspect
@@ -131,12 +132,26 @@ def _watched(wait, where: str, mine: list[int], replay: bool = False) -> None:
         _abort()
 
 
-def _let_go(*tensors: torch.Tensor) -> None:
-    """Hold ``tensors``, which this module made and handed to gloo, until gloo's worker has
-    dropped the work that holds them, a moment after its wait returns. A tensor Python lets go of
-    first is freed by that worker, which takes the GIL to free its Python object: in a process
-    that is exiting, Python ends the thread there, inside gloo's C++, which aborts the process."""
+def _timeout(group) -> datetime.timedelta:
+    """``group``'s timeout now: mstar's ``restore_default_timeout`` shortens it after load. A
+    fused all-reduce's channel is a gloo backend of its own."""
+    backend = group if isinstance(group, dist.ProcessGroupGloo) else group._get_backend(torch.device("cpu"))
+    return backend.options._timeout
+
+
+def _let_go(group, *tensors: torch.Tensor) -> None:
+    """Hold ``tensors``, which this module made and handed to gloo on ``group``, until gloo's
+    worker has dropped the work that holds them, a moment after its wait returns. A tensor Python
+    lets go of first is freed by that worker, which takes the GIL to free its Python object: in a
+    process that is exiting, Python ends the thread there, inside gloo's C++, which aborts the
+    process. A worker that still holds them at the group's timeout aborts, as a wait does there."""
+    deadline = time.monotonic() + _timeout(group).total_seconds()
     while any(t._use_count() > 1 for t in tensors):
+        if time.monotonic() > deadline:
+            print(f"mstar_sim: rank {dist.get_rank()}: gloo's worker still holds a finished collective's tensors"
+                  f" at the group's timeout ({_timeout(group)}): this torch's gloo keeps its work past the wait.",
+                  file=sys.stderr, flush=True)
+            _abort()
         time.sleep(0)
 
 
@@ -155,7 +170,7 @@ def _meet(group, mine: list[int], replay: bool = False) -> list[list[int]]:
         # straight to the backend: torch's public function logs a failure through the group's
         # registry entry, which the fused-AR channel hasn't, and turns the timeout into a ValueError
         _watched(lambda: group._allgather_base(gathered, sent).wait(), where, mine, replay)
-        _let_go(gathered, sent)
+        _let_go(group, gathered, sent)
     rows = gathered.view(len(ranks), -1).tolist()
     if not _pairs(rows):
         lines = "".join(f"\n  rank {r}: {_describe(d)}{'  <- this rank' if r == me else ''}"
@@ -385,7 +400,7 @@ def _collective(name: str, family: str, primitive: str | None):
                 args, kwargs = bound.args, bound.kwargs
             work = real(*device.tree_map(device._unwrap, args), **device.tree_map(device._unwrap, kwargs))
             if work is None and outputs and not written:
-                _let_go(a[first])
+                _let_go(group or dist.group.WORLD, a[first])
         # what didn't move, or a captured one at each replay, wasn't computed
         never = not (moved and values & COMPUTED)
         kept = [t._data for t in written if t._data.device.type != "meta"]

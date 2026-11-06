@@ -1137,14 +1137,15 @@ def test_tensor_parallel_ranks_meet_at_each_collective():
 
 
 @pytest.mark.parametrize("case", ["mismatch", "graph_vs_eager", "bucket", "extra_replay", "skip", "fused_skip",
-                                  "send_size", "recv_skip"])
+                                  "send_size", "recv_skip", "held"])
 def test_ranks_whose_collectives_dont_pair_abort(case):
     """A rank whose collective doesn't pair with its peer's (a barrier against an all-reduce,
     a graph replayed against eager calls or against one that captured another size) aborts
     with both ranks' descriptors; one whose peer never comes (to a collective, or to a fused
     all-reduce on its own channel) aborts at the group's timeout, as NCCL's watchdog does, or
     hangs in a replay. So for point to point: a receive of another size, whose rank has both
-    descriptors, and a receive with no sender."""
+    descriptors, and a receive with no sender. A tensor gloo's worker never lets go of aborts at
+    the timeout too."""
     out = run_sim(f"""
         import datetime, os, tempfile, time, torch, torch.distributed as dist, torch.multiprocessing as mp
 
@@ -1164,6 +1165,11 @@ def test_ranks_whose_collectives_dont_pair_abort(case):
                 dist.recv(x, src=0) if r else dist.send(x[:8] * 2, dst=1)
             elif "{case}" == "recv_skip":
                 dist.recv(x, src=1) if r == 0 else time.sleep(7)
+            elif "{case}" == "held":  # autograd holds it, as a gloo that kept its work would
+                from mstar_sim.dist import _let_go
+                held = torch.ones(1, requires_grad=True) * 2
+                kept = held * held
+                _let_go(dist.group.WORLD, held) if r == 0 else time.sleep(7)
             elif "{case}" in ("graph_vs_eager", "bucket", "extra_replay"):
                 graph = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(graph):
@@ -1197,7 +1203,7 @@ def test_ranks_whose_collectives_dont_pair_abort(case):
             for p in ctx.processes:
                 p.kill()
     """)
-    if case in ("skip", "fused_skip", "recv_skip"):
+    if case in ("skip", "fused_skip", "recv_skip", "held"):
         assert "exits [-6, 0]" in out, out
     elif case == "send_size":
         assert "exits [0, -6]" in out and "numel=16384" in out and "numel=8" in out, out

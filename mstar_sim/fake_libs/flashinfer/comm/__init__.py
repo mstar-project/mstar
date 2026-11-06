@@ -16,6 +16,7 @@ import torch
 import torch.distributed as dist
 
 from mstar_sim import clock
+from mstar_sim import dist as sim_dist
 
 # FlashInfer's member names (functional form: they are not snake_case)
 AllReduceFusionPattern = enum.IntEnum("AllReduceFusionPattern", [
@@ -64,21 +65,16 @@ def _channel(group):
     are (torch names a group by how many this process holds, which differs between ranks in
     different groups): named by ``group`` and its count of collectives after one, which the
     real one makes to swap its handles (gloo's own barrier, which raises at the timeout as that
-    exchange does); with ``group``'s timeout, which a fused call keeps it on (:func:`_timeout`).
+    exchange does); with ``group``'s timeout, which a fused call keeps it on: torch, which doesn't
+    know the channel, doesn't shorten the channel's with mstar's ``restore_default_timeout``.
     torch knows only its ranks."""
     dist.barrier.__wrapped__(group=group)
     ranks = dist.get_process_group_ranks(group)
     store = dist.PrefixStore(f"mstar_sim/ar_fusion/{group.group_name}/{group._get_sequence_number_for_group()}",
                              dist.distributed_c10d._get_default_store())
-    channel = dist.ProcessGroupGloo(store, ranks.index(dist.get_rank()), len(ranks), _timeout(group))
+    channel = dist.ProcessGroupGloo(store, ranks.index(dist.get_rank()), len(ranks), sim_dist._timeout(group))
     dist.distributed_c10d._world.pg_group_ranks[channel] = {r: i for i, r in enumerate(ranks)}
     return channel
-
-
-def _timeout(group):
-    """``group``'s timeout now: mstar's ``restore_default_timeout`` shortens it after load, and
-    torch, which doesn't know the channel, doesn't shorten the channel's with it."""
-    return group._get_backend(torch.device("cpu")).options._timeout
 
 
 def _norm_cost(input, *args, **kwargs):
@@ -95,10 +91,8 @@ def allreduce_fusion(input, workspace, pattern=AllReduceFusionPattern.kARResidua
                      residual_out=None, norm_out=None, output=None, rms_gamma=None, rms_eps=1e-6, **kwargs):
     if pattern not in (AllReduceFusionPattern.kAllReduce, AllReduceFusionPattern.kARResidualRMSNorm):
         _missing(f"allreduce_fusion(pattern={pattern!r})")
-    from mstar_sim import dist as sim_dist
-
     if workspace.world_size > 1:
-        workspace.group._set_default_timeout(_timeout(workspace.parent))
+        workspace.group._set_default_timeout(sim_dist._timeout(workspace.parent))
         sim_dist.collective("all_reduce", workspace.group, input.numel() * input.element_size(), sim_dist.row(
             "AllReduceFusion", input.numel(), input.dtype, op=int(pattern), size=workspace.world_size))
     _norm(input, residual_out, norm_out, output)
