@@ -2,7 +2,6 @@ import fcntl
 import hashlib
 import json
 import logging
-import math
 import os
 import re
 import secrets
@@ -633,33 +632,16 @@ class LocalTransferEngine(TensorTransferEngine):
 # TensorCommunicationManager base class (Comment 1: shared methods)
 # ---------------------------------------------------------------------------
 
-@dataclass
-class BufferedShards:
-    total_fanin: int
-    shard_dim: int
-    # source rank -> tensor
-    shards: dict[int, list[torch.Tensor]]
-
-    def is_done(self):
-        return len(self.shards) >= self.total_fanin
-
-    def consolidate(self) -> list[torch.Tensor]:
-        assert self.is_done(), \
-            "Can't consolidate shards until all fanin contributions are received"
-        keys = sorted(self.shards.keys())
-        n = len(self.shards[keys[0]])
-        assert all(len(self.shards[k]) == n for k in keys), (
-            f"BufferedShards: source ranks contributed unequal tensor counts: "
-            f"{ {k: len(self.shards[k]) for k in keys} }"
-        )
-        return [
-            torch.cat([self.shards[k][i] for k in keys], dim=self.shard_dim)
-            for i in range(n)
-        ]
-
-
 EdgeNameToTxInfo = dict[str, TxInfo]
 SourceAndEdgeToRxInfo = dict[tuple[str, str], RxInfo]
+
+
+def _rust():
+    """The extension, at the first sharded tensor: every transport imports this
+    module, and only a store needs the extension before that."""
+    import mstar_rust
+
+    return mstar_rust
 
 
 def _is_dense(tensor: torch.Tensor) -> bool:
@@ -757,8 +739,11 @@ class TensorCommunicationManager(ABC):
         # req_id -> {(name, consumer node) -> shards}: two nodes on this
         # worker can gather the same signal, or one gather it while the other
         # takes its slice whole
-        self.buffered_shards: dict[Rid, dict[tuple[str, str], BufferedShards]] = {}
+        self.buffered_shards: dict[Rid, dict[tuple[str, str], object]] = {}
         self.uuid_to_shard_dim: dict[int, int | None] = {}
+        # Whether Rust can run torch's calls on this manager's tensors directly
+        # (``rust/src/shards.rs``); a transport that checked the wrapper says so.
+        self._native_tensors = False
         self._flat_copy_stream: torch.cuda.Stream | None = None
         self._flat_copy_pending = False
 
@@ -856,18 +841,14 @@ class TensorCommunicationManager(ABC):
         remaining dims. The inverse is ``_undo_leading_shard_dim``."""
         if shard_dim is None or shard_dim == 0:
             return tensor
-        perm = [shard_dim] + [i for i in range(tensor.ndim) if i != shard_dim]
-        return tensor.permute(*perm).contiguous()
+        return _rust().shard_lead(tensor, shard_dim, self._native_tensors)
 
     def _undo_leading_shard_dim(self, shard_dim: int | None, tensor: torch.Tensor):
         """Inverse of ``_ensure_leading_shard_dim``: move dim 0 back to position
         ``shard_dim``, preserving the relative order of the remaining dims."""
         if shard_dim is None or shard_dim == 0:
             return tensor
-        inverse_perm = (
-            list(range(1, shard_dim + 1)) + [0] + list(range(shard_dim + 1, tensor.ndim))
-        )
-        return tensor.permute(*inverse_perm).contiguous()
+        return _rust().shard_undo_lead(tensor, shard_dim, self._native_tensors)
 
     def _source_tp(
         self, cfg: ShardingConfig | None,
@@ -1491,27 +1472,13 @@ class TensorCommunicationManager(ABC):
         )
         dest_tp_size = dest_group.tp_size if dest_group is not None else 1
         if info.source_tp_size != dest_tp_size and shard_dim is not None:
-            canonical_tensor = self.tensor_store.get_tensor(info.uuid)
             # Canonical layout has shard_dim leading and is contiguous, so a
             # contiguous byte range maps to a contiguous range of rows along
             # dim 0. Slicing along dim 0 keeps the view contiguous.
-            bytes_per_row = (
-                canonical_tensor.element_size()
-                * math.prod(canonical_tensor.shape[1:])
+            slice_view = _rust().shard_slice_rows(
+                self.tensor_store.get_tensor(info.uuid), info.offset, info.nbytes,
+                info.dims[0], self._native_tensors,
             )
-            if bytes_per_row == 0:
-                # Rows of zero bytes (a [4, 0] tensor) carry no offset to
-                # recover the start from, and hold nothing to read: only the
-                # row count matters.
-                start, end = 0, info.dims[0]
-            else:
-                assert info.offset % bytes_per_row == 0 and info.nbytes % bytes_per_row == 0, (
-                    f"slice offset {info.offset} / nbytes {info.nbytes} not aligned "
-                    f"to canonical row size {bytes_per_row}"
-                )
-                start = info.offset // bytes_per_row
-                end = start + info.nbytes // bytes_per_row
-            slice_view = canonical_tensor[start:end]
             new_uuid = self._uuid_minter.mint()
             if shard_dim:
                 self.uuid_to_shard_dim[new_uuid] = shard_dim
@@ -1907,9 +1874,8 @@ class TensorCommunicationManager(ABC):
                 if buf_key not in self.buffered_shards.get(req_id, {}):
                     total_fanin = edge._total_fanin
                     if total_fanin > 1:
-                        self.buffered_shards[req_id][buf_key] = BufferedShards(
-                            total_fanin=total_fanin, shard_dim=shard_dim,
-                            shards={},
+                        self.buffered_shards[req_id][buf_key] = _rust().BufferedShards(
+                            total_fanin, shard_dim,
                         )
 
                 for info in edge.tensor_info:
@@ -1929,9 +1895,7 @@ class TensorCommunicationManager(ABC):
                     transit = []
                     tensors = [self.get_tensor(info.uuid) for info in edge.tensor_info]
                     buf = self.buffered_shards[req_id][buf_key]
-                    buf.shards.setdefault(
-                        edge.tensor_info[0].source_tp_rank, []
-                    ).extend(tensors)
+                    buf.add(edge.tensor_info[0].source_tp_rank, tensors)
                     # Release the "+1 for graph-node usage" ref now that the
                     # tensor data has been copied into the buffer; the standard
                     # GC path drops the registered memory when refcount hits 0.
@@ -1940,7 +1904,7 @@ class TensorCommunicationManager(ABC):
                     )
 
                     if buf.is_done():
-                        consolidated = buf.consolidate()
+                        consolidated = buf.consolidate(self._native_tensors)
                         new_infos: list[TensorPointerInfo] = []
                         for uuid_, tensor in (
                             (self._uuid_minter.mint(), t) for t in consolidated

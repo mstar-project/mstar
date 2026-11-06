@@ -548,6 +548,7 @@ class ArenaShmCommunicationManager(TensorCommunicationManager):
         device_index, cuda = -1, None
         if has_torch_abi:
             device_index, cuda = self._rust_copies()
+        self._native_tensors = self._read_device_type is not None
         # Stage times feed the TTL backstop: a request aborted after staging but
         # before every consumer ACKs defers reclaim forever (cleanup_request
         # waits for ACKs that will never come). A slot older than the REQUEST

@@ -352,6 +352,10 @@ fn mstar_rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<crate::tensors::TensorInfoOut>()?;
     crate::torch_abi::register(m)?;
     m.add_class::<crate::arena_copy::PyArenaTransport>()?;
+    m.add_class::<crate::shards::PyBufferedShards>()?;
+    m.add_function(wrap_pyfunction!(crate::shards::shard_lead, m)?)?;
+    m.add_function(wrap_pyfunction!(crate::shards::shard_undo_lead, m)?)?;
+    m.add_function(wrap_pyfunction!(crate::shards::shard_slice_rows, m)?)?;
     m.add_class::<crate::arena_copy::StageOut>()?;
     m.add_class::<crate::arena_copy::ReadOut>()?;
     m.add_class::<crate::arena_copy::ReadEdgesOut>()?;
