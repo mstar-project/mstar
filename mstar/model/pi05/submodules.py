@@ -280,15 +280,15 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
                         actions as ``actions``.
     """
 
-    # Parameter name fragments whose weights must stay in float32 even when
-    # the rest of the model is bf16. Matches lerobot's
-    # ``to_bfloat16_for_selected_params`` — keeping norms in fp32 prevents
-    # the per-layer precision loss that otherwise compounds across 18 layers
-    # and causes ~0.2 abs delta on the final actions.
+    # Parameter name fragments whose weights stay in float32 while the rest of
+    # the node runs in bf16, as in openpi: its to_bfloat16_for_selected_params
+    # keeps the norms (whose loss compounds across the 18 layers), and its
+    # time MLP is never cast.
     _FLOAT32_PARAM_SELECTORS = (
         "input_layernorm",
         "post_attention_layernorm",
         ".norm.",   # final RMSNorm / adaRMS norm
+        "time_mlp.",  # the adaRMS condition
     )
 
     # For the default image size, three cameras and a simple text prompt, one request is about 910 tokens
@@ -318,19 +318,11 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
         # language embeddings times sqrt(hidden_size).
         self._text_embed_scale = math.sqrt(config.hidden_size)
 
-        # Lazily allocated on the first action_gen step, sized for the largest
-        # captured batch. sincos_timestep_embedding fully overwrites this buffer
-        # every step, so torch.empty suffices (no zeroing needed).
         self._fraction: torch.Tensor | None = None
-        self._time_emb_buffer: torch.Tensor | None = None
 
     def to(self, *args, **kwargs):
-        """Apply standard ``to()`` then upcast norm parameters back to fp32.
-
-        Matches lerobot's ``to_bfloat16_for_selected_params`` which keeps
-        ``input_layernorm``, ``post_attention_layernorm``, and ``model.norm``
-        in float32 while the rest of the transformer runs in bfloat16.
-        """
+        """Apply standard ``to()``, then upcast the ``_FLOAT32_PARAM_SELECTORS``
+        parameters (the norms and the time MLP) back to fp32."""
         result = super().to(*args, **kwargs)
         for name, param in result.named_parameters():
             if any(sel in name for sel in self._FLOAT32_PARAM_SELECTORS):
@@ -369,26 +361,6 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
             dtype=torch.float64
         )
         return self._fraction
-
-    def _get_time_emb_buffer(self, bs: int) -> torch.Tensor:
-        """Return a pre-allocated slice of shape (bs, action_hidden_size).
-
-        Allocated once at the largest capture batch size (float32, matching
-        noisy_actions dtype). sincos_timestep_embedding fully overwrites it
-        every step, so no zeroing is needed — torch.empty suffices. An eager
-        batch past the capture sizes gets its own, so the captured graphs keep
-        the buffer they wrote.
-        """
-        max_bs = max(self.ACTION_GEN_CAPTURE_BATCH_SIZES)
-        if bs > max_bs:
-            return torch.empty(bs, self.config.action_hidden_size, device=self.get_device(), dtype=torch.float32)
-        if self._time_emb_buffer is None:
-            self._time_emb_buffer = torch.empty(
-                max_bs, self.config.action_hidden_size,
-                device=self.get_device(),
-                dtype=torch.float32,
-            )
-        return self._time_emb_buffer[:bs]
 
     def _embed_tokens_scaled(self, ids: torch.Tensor) -> torch.Tensor:
         emb = self.embed_tokens(ids)
@@ -543,7 +515,6 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
         return {
             "noisy_actions": cat_noisy,
             "fraction": self._get_timestep_emb_fraction(),
-            "time_emb_buffer": self._get_time_emb_buffer(len(inputs))
         }
 
     # ------------------------------------------------------------------
@@ -602,12 +573,11 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
         request_ids: list[str],
         noisy_actions: torch.Tensor,
         fraction: torch.Tensor,
-        time_emb_buffer: torch.Tensor,
         **kwargs
     ) -> dict[str, NameToTensorList]:
         """Batched action_gen: the denoising loop over the concatenated rows, then split per-request."""
         horizon = self.config.action_horizon
-        actions = self._denoise(noisy_actions, fraction=fraction, time_emb_buffer=time_emb_buffer)
+        actions = self._denoise(noisy_actions, fraction=fraction)
         return {
             rid: {"actions": [actions[i * horizon:(i + 1) * horizon]]}
             for i, rid in enumerate(request_ids)
@@ -625,23 +595,21 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
         self,
         noisy_actions: torch.Tensor,
         fraction: torch.Tensor,
-        time_emb_buffer: torch.Tensor,
         **kwargs,
     ) -> NameToTensorList:
         """Single-request action_gen forward (called from _execute_sequential)."""
-        return {"actions": [self._denoise(noisy_actions, fraction=fraction, time_emb_buffer=time_emb_buffer)]}
+        return {"actions": [self._denoise(noisy_actions, fraction=fraction)]}
 
-    def _denoise(
-        self,
-        noisy_actions: torch.Tensor,
-        fraction: torch.Tensor,
-        time_emb_buffer: torch.Tensor,
-    ) -> torch.Tensor:
+    def _denoise(self, noisy_actions: torch.Tensor, fraction: torch.Tensor) -> torch.Tensor:
         """Run all ``num_flow_steps`` Euler steps from t=1 to t=0.
+
+        The adaRMS conditioning depends only on the step, so the time
+        embedding, ``time_mlp`` and every norm's modulation are computed for
+        all steps at once, in float32 as openpi computes them, and shared by
+        every request in the batch.
 
         Args:
             noisy_actions: [N * horizon, action_dim], the initial noise.
-            time_emb_buffer: [N, action_hidden_size] scratch for the timestep embedding.
 
         Returns:
             The denoised actions, same shape as ``noisy_actions``.
@@ -649,21 +617,23 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
         config = self.config
         num_steps = config.num_flow_steps
         dt = -1.0 / num_steps
-        actions = noisy_actions
-        for step in range(num_steps):
-            idx = time_emb_buffer.new_full((time_emb_buffer.shape[0],), float(step))
+        with torch.autocast(noisy_actions.device.type, enabled=False):
+            steps = torch.arange(num_steps, device=noisy_actions.device, dtype=torch.float32)
             time_emb = sincos_timestep_embedding(
-                1.0 - idx / num_steps,
+                1.0 - steps / num_steps,
                 dim=config.action_hidden_size,
                 fraction=fraction,
-                output_buffer=time_emb_buffer,
+                output_buffer=steps.new_empty(num_steps, config.action_hidden_size),
                 min_period=config.timestep_min_period,
                 max_period=config.timestep_max_period,
             )
-            adarms_cond = self.time_mlp(time_emb)
+            modulations = self.action_expert.modulations(self.time_mlp(time_emb))
+        actions = noisy_actions
+        for step in range(num_steps):
             suffix_out = self.action_expert(
                 query_sequence=self.action_in_proj(actions),
-                adarms_cond=adarms_cond,
+                layer_modulations=[mod[step] for mod in modulations.per_layer],
+                final_modulation=modulations.final[step],
                 label="main",
             )
             actions = euler_step(actions, self.action_out_proj(suffix_out), dt)

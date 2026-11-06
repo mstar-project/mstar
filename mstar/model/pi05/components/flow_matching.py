@@ -21,7 +21,7 @@ def sincos_timestep_embedding(
             allocated once rather than per step (see
             ``Pi05LLMSubmodule._get_timestep_emb_fraction``).
         output_buffer: ``(len(t), dim)`` destination, written in place and
-            returned; preallocated so the action-gen step stays capturable.
+            returned.
         min_period / max_period: frequency range for the sinusoidal basis.
 
     Returns:
