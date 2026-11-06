@@ -390,3 +390,25 @@ def test_captured_iterations_match_eager(durations, bs):
         captured = _run(harness, clips, "replay", runner=cg, arrivals=arrivals)
     assert captured == eager
     assert sum(map(len, eager.values())) > len(eager), "the random head emitted nothing; the test would be vacuous"
+
+
+def test_a_fresh_row_starts_from_the_prediction_network_after_the_start_token(monkeypatch):
+    """The start state comes from the weights, so a zero start would decode from the wrong LSTM state with no error."""
+    head, clips = _never_blank([])
+    harness = Harness(head)
+    harness.join([0], [clips[1]], [None])
+    seen = {}
+    advance = head.advance
+
+    def spy(states, lengths, state, *args):
+        seen.update({name: value.clone() for name, value in state.items()})
+        return advance(states, lengths, state, *args)
+
+    monkeypatch.setattr(head, "advance", spy)
+    infos, inputs = harness._decode_inputs([0])
+    ctx = StepContext(request_ids=[0], graph_walk=WALK, slot=0, capture=False)
+    with torch.no_grad():
+        harness._drive(WALK, inputs, infos, ctx)
+    start = harness.node._start
+    assert torch.equal(seen["dec_out"][0], start["dec_out"]) and torch.equal(seen["h"][0], start["h"])
+    assert seen["dec_out"].abs().sum() > 0, "the prediction network's output should not be zeros, or this tests nothing"

@@ -151,3 +151,10 @@ def test_the_debug_check_passes_the_thinkers_kernel_on_real_pages(monkeypatch):
     monkeypatch.setattr(sys.modules["mstar.engine.state.state_op"], "_DEBUG_ASSERTS", True)
     handle = _opened_step(_manager(), {1: 3, 2: 4})
     omni_attention.qk_norm_rope_table_kv_write(*_thinker_args(handle, 1, 7))
+
+
+@needs_cuda
+def test_the_debug_check_passes_the_plain_rope_kernel_on_real_pages(monkeypatch):
+    monkeypatch.setattr(sys.modules["mstar.engine.state.state_op"], "_DEBUG_ASSERTS", True)
+    handle = _opened_step(_manager(), {1: 3, 2: 4})
+    qwen3_lm.qk_norm_rope_kv_write(*_plain_rope_args(handle, 1, 7))

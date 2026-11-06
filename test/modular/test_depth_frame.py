@@ -255,3 +255,37 @@ def test_a_captured_frame_replays_what_it_ran(_frame):
         frame.run(hidden, layer0, replayed[0], positions, partials, replayed[1], replayed[2], draw)
     graph.replay()
     assert all(torch.equal(a, b) for a, b in zip(ran, replayed, strict=True)), "the replay ran another frame"
+
+
+@requires_hopper
+def test_a_frame_draws_through_the_contract_as_the_sampler_would(_frame):
+    """`fused_draw_args` hands the kernel a real sampler's buffers and `drew` moves its offsets, so the kernel's last
+    group is `fused_sample`'s at the last offset, and the next step starts past all fifteen."""
+    from mstar.engine.resources.sampler.resource import SamplerResource
+    from mstar.engine.resources.sampler.utils import SamplerBuffers, SamplingConfig, fused_sample
+    from mstar.engine.state import drew, fused_draw_args
+
+    predictor, talker_table, frame = _frame
+    rows = [f"r{i}" for i in range(13)]
+    bufs = SamplerBuffers.allocate(64, torch.device("cuda"), cg_slots=1)
+    for i, rid in enumerate(rows):
+        config = SamplingConfig(temperature=0.9, top_k=50, top_p=1.0)
+        config.set_seed(i)
+        bufs.register_request(rid, config)
+    bufs.gather_static(rows, 13, 0)
+    bufs.gather_dynamic(rows, 13, 0)
+    resource = SamplerResource(vocab_size=2048, enable_repetion_penalty=False, device=torch.device("cuda"))
+    resource._cg_sampler = bufs.sampler_for(13, 0)
+    handle = SamplerHandle(Sampler("code_predictor", nodes={"Talker"}, vocab_size=2048, draws=15), resource)
+    handle._open = True
+
+    hidden = torch.randn(13, 2048, device="cuda", dtype=torch.bfloat16)
+    layer0 = torch.randint(0, talker_table.shape[0], (13,), device="cuda")
+    codes, embed_sum = torch.empty(13, 16, device="cuda", dtype=torch.long), torch.empty_like(hidden)
+    draw = fused_draw_args(handle)
+    offsets = draw.offset.clone()
+    frame.run(hidden, layer0, frame.kv_cache, frame.depth_positions, frame.partials, codes, embed_sum, draw)
+    drew(handle, 15)
+    last = fused_sample(frame.LOGITS[:13], draw.temperature, draw.top_k, draw.top_p, draw.seed, offsets + 14)
+    assert torch.equal(codes[:, 15], last), "the kernel drew other tokens than the sampler's own draw"
+    assert torch.equal(draw.offset, offsets + 15), "the next step would draw from this step's random numbers"

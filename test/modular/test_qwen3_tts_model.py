@@ -767,6 +767,46 @@ def test_qwen3_tts_talker_prefill_transitions_to_decode():
     assert result.request_done is False
 
 
+def test_qwen3_tts_the_decode_loop_speculates_with_its_text_held():
+    """The node persists the text, so an iteration's speculation is ready on the frame embedding alone."""
+    from mstar.graph.base import GraphEdge
+    from mstar.graph.graph_io import WorkerGraphIO
+
+    loop = _make_model().get_graph_walk_graphs()["talker_decode"]
+    worker_io = WorkerGraphIO(loop)
+    for name in ("talker_input_embeds", TALKER_TEXT):
+        worker_io.ingest_input(GraphEdge(next_node="Talker", name=name, tensor_info=[]))
+    assert loop.section.persisted_input_names() == {TALKER_TEXT}
+    ready = worker_io.ingest_for_speculation(loop.section.outputs, "Talker")
+    assert [(info.node_name, info.is_new_loop_iter) for info in ready] == [("Talker", True)]
+
+
+def test_qwen3_tts_a_prefill_hands_its_decode_steps_the_text_it_persisted():
+    """The text a decode step adds lives on a persisted edge, so a missing link anywhere along it fails every request at
+    its first decode step, and nothing but a served request would otherwise show it."""
+    model = _make_model()
+    walks = model.get_graph_walk_graphs()
+    persisted = {edge.name: edge.persist for edge in walks["talker_prefill"].outputs}
+    assert persisted[TALKER_TEXT] is True and persisted["talker_input_embeds"] is True
+    decode = walks["talker_decode"]
+    assert TALKER_TEXT in decode.section.input_names, "the decode loop's node has to take the text"
+    assert (TALKER_TEXT, "Talker") in decode._external_inputs, "a loop re-injects an external input every iteration"
+    assert ("talker_input_embeds", "Talker") in decode._loop_back_inputs, "the frame embedding is the loop's own edge"
+
+    embeds, text = object(), object()
+    result = model.get_partition_forward_pass_args(
+        partition_name="Talker",
+        partition_metadata=CurrentForwardConductorMetadata(
+            input_modalities=["text"], output_modalities=["audio"], graph_walk="talker_prefill", is_prefill=True,
+        ),
+        persist_signals={"talker_input_embeds": [embeds], TALKER_TEXT: [text]},
+    )
+    assert {edge.name: edge.tensor_info for edge in result.inputs} == {
+        "talker_input_embeds": [embeds], TALKER_TEXT: [text],
+    }
+    assert result.unpersist_tensors == [embeds, text], "the text is unpersisted with the embedding"
+
+
 def test_qwen3_tts_talker_decode_marks_partition_done():
     model = _make_model()
     metadata = CurrentForwardConductorMetadata(
@@ -1041,8 +1081,8 @@ def test_qwen3_tts_postprocess_routes_a_prefills_text_and_no_decode_rows():
     assert TALKER_TEXT not in decode, "a decode row brought its text, and sends none on"
 
 
-@pytest.mark.parametrize("min_frames", [0, 1, 3])
-def test_qwen3_tts_suppresses_eos_by_the_frames_the_loop_counter_implies(min_frames):
+@pytest.mark.parametrize("min_frames, suppressed_steps", [(0, ()), (1, ()), (2, (0,)), (3, (0, 1))])
+def test_qwen3_tts_suppresses_eos_by_the_frames_the_loop_counter_implies(min_frames, suppressed_steps):
     """The prefill makes frame 1 and decode iteration ``step`` makes frame ``step + 2``, so a decode row's count is
     ``step + 1``: the count `postprocess` kept, whichever step reads it and however often."""
     config = _tiny_model_config()
@@ -1058,7 +1098,8 @@ def test_qwen3_tts_suppresses_eos_by_the_frames_the_loop_counter_implies(min_fra
             input_metadata=InputMetadata(dynamic_loop_iter_counts={"talker_decode_loop": iteration}),
         ).kwargs["suppress_eos"]
 
-    assert [suppressed(step) for step in (0, 0, 1, 1, 2, 3)] == [step + 1 < min_frames for step in (0, 0, 1, 1, 2, 3)]
+    steps = (0, 0, 1, 1, 2, 3)
+    assert [suppressed(step) for step in steps] == [step in suppressed_steps for step in steps]
 
 
 def test_qwen3_tts_stops_on_eos_from_routed_codec_tokens():
@@ -1661,8 +1702,8 @@ def test_qwen3_tts_talker_leaves_its_input_alone():
 
 
 def test_qwen3_tts_talker_declares_the_rope_theta_its_kernel_reads():
-    """``Qwen3Attention``'s kernel reads the theta off the position resource,
-    whose default is not the checkpoint's."""
+    """``Qwen3Attention``'s kernel reads the theta off the declared rope, and the position resource's default is not
+    the checkpoint's."""
     model = _make_model()
     position = next(spec for spec in node_resources(model) if spec.resource_key == "talker_pos")
     assert position.config.rope_theta == model.config.talker.rope_theta != PositionConfig(kv_cache="kv").rope_theta

@@ -295,7 +295,7 @@ def test_an_audio_encoder_step_equals_the_hand_written_one():
     sub = AudioEncoderSubmodule.__new__(AudioEncoderSubmodule)
     torch.nn.Module.__init__(sub)
     handles = _handles(model, "audio_encoder")
-    sub.__dict__.update(encoder=encoder, attn_key=None, array=AUDIO_TOKENS, state_handles=handles)
+    sub.__dict__.update(encoder=encoder, array=AUDIO_TOKENS, state_handles=handles)
     tokens = 2 * model.config.audio_encoder.window_tokens + 1
     declared = sub.declare_step("prefill_audio", [1], [NodeInputs(input_seq_len=tokens)])
     step = state_steps(declared, sub.state_handles)
