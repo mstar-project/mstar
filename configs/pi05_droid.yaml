@@ -32,10 +32,7 @@ model_kwargs:
 node_groups:
   - node_names:
       - vit_encoder
-    ranks:
-      - 0
-
-  - node_names:
+      - prefix
       - LLM
     ranks:
       - 0

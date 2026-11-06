@@ -56,6 +56,8 @@ from mstar.model.pi05.components.action_expert import (
 )
 from mstar.model.pi05.components.flow_matching import sincos_timestep_embedding
 from mstar.model.pi05.config import Pi05Config
+from mstar.model.pi05.submodules import Pi05ActionSubmodule
+from mstar.model.submodule_base import ModelInputsFromEngine
 
 # FlashInfer's rmsnorm requires CUDA, so the mstar-side forwards have to run
 # on a GPU. Tests that need the mstar action expert are skipped when CUDA
@@ -591,26 +593,49 @@ def test_action_expert_full_stack_matches_reference_against_prefix_kv_cache():
     )
 
 
-def test_euler_flow_matching_step_matches_reference():
-    """Compare a single Euler step of the flow matching loop.
+@pytest.mark.parametrize("batched", [False, True])
+def test_euler_flow_matching_step_matches_reference(batched):
+    """The real action node seeds noise and applies time conditioning,
+    projections and Euler integration, preserving each request's row."""
+    from types import SimpleNamespace
 
-    The action expert's contribution is tested above; here we focus on the
-    ``v_t = action_out_proj(suffix_out)`` -> ``x_{t+dt} = x_t + dt * v_t``
-    update, which lives in the submodule glue. We mimic ``v_t`` with a fixed
-    random tensor on both sides.
-    """
-    horizon, dim = 4, 6
-    num_steps = 10
+    config = Pi05Config(action_horizon=4, action_dim=6, action_hidden_size=8)
+
+    class Expert(nn.Module):
+        def forward(self, query_sequence, adarms_cond, *, label):
+            return query_sequence + adarms_cond.repeat_interleave(config.action_horizon, dim=0)
+
     torch.manual_seed(0)
-    x_t = torch.randn(horizon, dim)
-    v_t = torch.randn(horizon, dim)
-
-    dt = -1.0 / num_steps
-    # Reference sample_actions: x_t = x_t + dt * v_t
-    ref_next = x_t + dt * v_t
-    # mstar submodule does next_actions = noisy_actions + dt * velocity
-    ours_next = x_t + dt * v_t
-    assert torch.allclose(ours_next, ref_next, atol=1e-7)
+    node = Pi05ActionSubmodule(
+        Expert(), nn.Linear(6, 8), nn.Linear(8, 6), Pi05TimeMLP(8), config,
+    )
+    inputs = [node.prepare_inputs("action_gen", SimpleNamespace(random_seed=19),
+                                  {"noisy_actions": [], "timestep_index": []})]
+    noise = torch.randn(4, 6, generator=torch.Generator().manual_seed(19))
+    torch.testing.assert_close(inputs[0].tensor_inputs["noisy_actions"], noise, rtol=0, atol=0)
+    if batched:
+        inputs.append(node.prepare_inputs("action_gen", None, {
+            "noisy_actions": [torch.randn(1, 4, 6)], "timestep_index": [torch.tensor([[7]])],
+        }))
+    engine_inputs = ModelInputsFromEngine(request_ids=[str(i) for i in range(len(inputs))], per_request_info={})
+    packed = node.preprocess("action_gen", engine_inputs, inputs)
+    actions, indices = packed["noisy_actions"], packed["timestep_index"]
+    time_emb = ref_create_sinusoidal_pos_embedding(
+        1 - indices.float() / config.num_flow_steps, config.action_hidden_size,
+        config.timestep_min_period, config.timestep_max_period,
+    )
+    cond = F.silu(F.linear(time_emb, node.time_mlp.linear_in.weight, node.time_mlp.linear_in.bias))
+    cond = F.silu(F.linear(cond, node.time_mlp.linear_out.weight, node.time_mlp.linear_out.bias))
+    suffix = F.linear(actions, node.action_in_proj.weight, node.action_in_proj.bias)
+    suffix = suffix + cond.repeat_interleave(config.action_horizon, dim=0)
+    velocity = F.linear(suffix, node.action_out_proj.weight, node.action_out_proj.bias)
+    expected = actions - velocity / config.num_flow_steps
+    if batched:
+        actual = node.forward_batched("action_gen", engine_inputs, **packed).row_outputs
+    else:
+        actual = {name: values[0] for name, values in node.forward("action_gen", engine_inputs, **packed).items()}
+    torch.testing.assert_close(actual["noisy_actions"].reshape_as(expected), expected, rtol=1e-6, atol=1e-6)
+    torch.testing.assert_close(actual["timestep_index"].reshape_as(indices), indices + 1)
 
 
 # ----------------------------------------------------------------------
@@ -730,7 +755,7 @@ def test_flashinfer_paged_prefill_attention_matches_sdpa():
 
     Two scenarios mirror Pi0.5's pipeline:
       1. Bidirectional prefill: 1 request, ``prefix_len`` tokens, ``causal=False``.
-         Verifies the same forward path PaliGemma uses during the prefill walk.
+         Verifies the same forward path PaliGemma uses in the prefix node.
       2. Suffix attends to prefix+suffix: append ``suffix_len`` new tokens that
          attend to the entire concatenated KV. This is the action_gen denoise
          step (``write_store=False`` in the real cache manager; here we just

@@ -1,25 +1,8 @@
-"""Pi05Model: Physical Intelligence's Pi0.5 vision-language-action model.
+"""Pi0.5: vision, prefix KV, then a flow-matching action Loop in one walk.
 
-Pi0.5 is a robotics VLA model. It takes camera images, a text task prompt,
-and a robot proprioceptive state vector as inputs, and produces a 50-step
-robot action trajectory through flow-matching denoising.
-
-Architecture (2 nodes):
-    vit_encoder  (enc_dec) - SigLIP So400m/14 + linear connector
-    LLM          (ar)      - PaliGemma prefix expert + action expert.
-                             A single fat node hosts both Gemma weight sets;
-                             they share KV-cache dimensions so the action
-                             expert can attend to the prefix KV cache that
-                             PaliGemma writes during prefill.
-
-Graph walks (2):
-    prefill    - SigLIP encodes camera images, then PaliGemma prefills the
-                 prefix [image_tokens, language_tokens, state_tokens] with
-                 bidirectional attention and writes the KV cache.
-    action_gen - 10-iteration flow-matching loop. Each iteration the action
-                 expert reads the frozen prefix KV cache, predicts a velocity
-                 with adaRMS timestep conditioning, and applies one Euler
-                 step. The final iteration emits the denoised action tensor.
+The prefix and action experts own disjoint weights and share declared KV,
+attention and position resources. The action node retains the deployment
+name ``LLM``; each action step reads the prefix without advancing it.
 """
 
 import json
@@ -76,7 +59,7 @@ from mstar.model.pi05.config import (
     Pi05Config,
     load_pi05_config,
 )
-from mstar.model.pi05.submodules import Pi05LLMSubmodule, Pi05ViTEncoderSubmodule
+from mstar.model.pi05.submodules import Pi05ActionSubmodule, Pi05PrefixSubmodule, Pi05ViTEncoderSubmodule
 from mstar.model.submodule_base import NodeSubmodule
 
 logger = logging.getLogger(__name__)
@@ -106,32 +89,6 @@ def _strip_policy_prefix(flat: dict[str, torch.Tensor]) -> dict[str, torch.Tenso
     if _PALIGEMMA_LM_HEAD in out:
         out.pop(_PALIGEMMA_EMBED_TOKENS, None)
     return out
-
-
-class _Pi05LLMWeightContainer(nn.Module):
-    """Flat wrapper holding the LLM-side components for the new loader.
-
-    The loader walks ``named_parameters()`` to build its dispatch table,
-    so this wrapper exposes the LLM components as direct attributes whose
-    paths line up 1:1 with the names produced by :meth:`Pi05Model._lerobot_remap`.
-    """
-
-    def __init__(
-        self,
-        embed_tokens: nn.Embedding,
-        paligemma,
-        action_expert,
-        action_in_proj: nn.Linear,
-        action_out_proj: nn.Linear,
-        time_mlp,
-    ):
-        super().__init__()
-        self.embed_tokens = embed_tokens
-        self.paligemma = paligemma
-        self.action_expert = action_expert
-        self.action_in_proj = action_in_proj
-        self.action_out_proj = action_out_proj
-        self.time_mlp = time_mlp
 
 
 def _reset_non_persistent_buffers(module: nn.Module, device) -> None:
@@ -169,7 +126,6 @@ class Pi05Model(Model):
 
     PREPROCESS_ONLY_KWARGS = ("robot_state",)
 
-    PREFILL_WALK = "prefill"
     ACTION_GEN_WALK = "action_gen"
 
     def __init__(
@@ -197,13 +153,6 @@ class Pi05Model(Model):
         self._lerobot_flat: dict[str, torch.Tensor] | None = None
         self._submodule_cache: dict[str, NodeSubmodule | None] = {}
 
-        # Components, materialized lazily by get_submodule().
-        self.embed_tokens: nn.Embedding | None = None
-        self.paligemma: Pi05PaliGemmaExpert | None = None
-        self.action_expert: Pi05ActionExpert | None = None
-        self.action_in_proj: nn.Linear | None = None
-        self.action_out_proj: nn.Linear | None = None
-        self.time_mlp: Pi05TimeMLP | None = None
         self.siglip: Pi05SiglipEncoder | None = None
 
     # ------------------------------------------------------------------
@@ -323,8 +272,7 @@ class Pi05Model(Model):
 
         lerobot's Pi0.5 checkpoints (pi05_base, pi05_droid) ship as a single
         14-17 GB safetensors blob (not a sharded HF index), so we load it once
-        into CPU memory and cache it. Both ``get_submodule`` calls
-        (vit_encoder + LLM) consume the same dict.
+        into CPU memory and cache it. All three submodules consume the same CPU dict.
         """
         if self._lerobot_flat is not None:
             return self._lerobot_flat
@@ -342,22 +290,11 @@ class Pi05Model(Model):
         return self._lerobot_flat
 
     def _lerobot_remap(self, name: str) -> str | None:
-        """Translate one lerobot Pi0.5 key into the matching mstar
-        parameter path under the LLM weight container, or ``None`` to drop.
+        """Map a checkpoint key to its prefix/action submodule parameter path.
 
-        The LLM container layout (see :class:`_Pi05LLMWeightContainer`)
-        is::
-
-            embed_tokens.weight
-            paligemma.<gemma transformer keys>
-            action_expert.<gemma transformer keys>
-            action_in_proj.{weight,bias}
-            action_out_proj.{weight,bias}
-            time_mlp.linear_{in,out}.{weight,bias}
-
-        Siglip / connector keys live on a different module
-        (``vit_encoder``), so they are dropped here and picked up by
-        :meth:`_extract_siglip_state_dict`.
+        Each concrete submodule owns a disjoint subset of these paths; the
+        loader ignores the other node's parameters. Vision keys are loaded
+        separately by ``_extract_siglip_state_dict``.
         """
         # Top-level wrappers (already match in name).
         if name.startswith("action_in_proj.") or name.startswith("action_out_proj."):
@@ -431,13 +368,7 @@ class Pi05Model(Model):
     # ------------------------------------------------------------------
 
     def get_node_resources(self) -> list[NodeResourceSpec]:
-        """LLM paged KV + attention/position. vit_encoder is stateless.
-
-        No sampler: actions come from flow matching, not token sampling. The
-        action expert shares this KV cache with PaliGemma (same head dims), and
-        ``action_gen`` reads the frozen prefix read-only via ``KVStep(commit=
-        False)`` while ``prefill`` commits it.
-        """
+        """The prefix writes once; the action expert reads its KV without committing."""
         kv_config = PagedKVConfig(
             num_layers=self.config.num_layers,
             num_kv_heads=self.config.num_kv_heads,
@@ -446,50 +377,19 @@ class Pi05Model(Model):
             num_qo_heads=self.config.num_qo_heads,
         )
         return [
-            KVSpec(resource_key=LLM_KV, nodes={"LLM"}, config=kv_config),
+            KVSpec(resource_key=LLM_KV, nodes={"prefix", "LLM"}, config=kv_config),
             AttentionSpec(
-                resource_key=LLM_ATTN, nodes={"LLM"},
+                resource_key=LLM_ATTN, nodes={"prefix", "LLM"},
                 config=AttentionConfig(kv_cache=LLM_KV),
             ),
             PositionSpec(
-                resource_key=LLM_POS, nodes={"LLM"},
+                resource_key=LLM_POS, nodes={"prefix", "LLM"},
                 config=PositionConfig(kv_cache=LLM_KV),
             ),
         ]
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
-        # Pi0.5 encodes the robot state as a decimal-string suffix on the
-        # language prompt (e.g. "Task: pick up the block, State: 12 87 ...;
-        # \nAction: ") and tokenizes the whole thing with the PaliGemma
-        # tokenizer. So the model only ever sees a single "text_inputs"
-        # stream — there are no separate state-bin tokens. This matches
-        # lerobot's processor_pi05.Pi05PrepareStateTokenizerProcessorStep.
-        prefill = Sequential(
-            [
-                GraphNode(
-                    name="vit_encoder",
-                    input_names=["image_inputs"],
-                    outputs=[GraphEdge(next_node="LLM", name="img_emb")],
-                ),
-                GraphNode(
-                    name="LLM",
-                    input_names=["img_emb", "text_inputs"],
-                    outputs=[],
-                ),
-            ]
-        )
-
-        # NOTE: The Loop's terminal ``outputs`` are matched into the section's
-        # node outputs by **name** (see Loop._replace_outputs_for_final_iter
-        # in mstar/graph/base.py): on the final iteration, any section-output
-        # edge whose name matches a terminal output's name is replaced with
-        # the terminal version. This is the same convention BAGEL's image_gen
-        # uses (section returns ``latents`` looping back to LLM, terminal
-        # output is ``name="latents" → vae_decoder``). So our terminal output
-        # MUST be named ``noisy_actions`` to match the section's loop-back
-        # edge — the name is just a graph-internal key, while the actual
-        # client-facing modality bucket is determined by ``output_modality``.
-        action_gen = Loop(
+        action = Loop(
             section=GraphNode(
                 name="LLM",
                 input_names=["noisy_actions", "timestep_index"],
@@ -499,20 +399,25 @@ class Pi05Model(Model):
                 ],
             ),
             max_iters=self.config.num_flow_steps,
-            outputs=[
-                GraphEdge(
-                    next_node=EMIT_TO_CLIENT,
-                    name="noisy_actions",
-                    output_modality="action",
-                    persist=True,
-                ),
-            ],
+            # The terminal edge replaces the loop-back by its signal name.
+            outputs=[GraphEdge(
+                next_node=EMIT_TO_CLIENT, name="noisy_actions", output_modality="action", persist=True,
+            )],
         )
-
-        return {
-            self.PREFILL_WALK: prefill,
-            self.ACTION_GEN_WALK: action_gen,
-        }
+        return {self.ACTION_GEN_WALK: Sequential([
+            GraphNode(
+                name="vit_encoder", input_names=["image_inputs"],
+                outputs=[GraphEdge(next_node="prefix", name="img_emb")],
+            ),
+            GraphNode(
+                name="prefix", input_names=["img_emb", "text_inputs"],
+                outputs=[
+                    GraphEdge(next_node="LLM", name="noisy_actions"),
+                    GraphEdge(next_node="LLM", name="timestep_index"),
+                ],
+            ),
+            action,
+        ])}
 
     # ------------------------------------------------------------------
     # Model ABC: I/O
@@ -564,8 +469,8 @@ class Pi05Model(Model):
         image_rows = images * (cfg.vit_image_size // cfg.vit_patch_size) ** 2
         layout = LabelLayout(
             spans=(
-                Span("rows", self.PREFILL_WALK, image_rows, image_rows, "img_emb"),
-                Span("ids", self.PREFILL_WALK, text_ids.numel(), text_ids.numel(), "text_inputs"),
+                Span("rows", self.ACTION_GEN_WALK, image_rows, image_rows, "img_emb"),
+                Span("ids", self.ACTION_GEN_WALK, text_ids.numel(), text_ids.numel(), "text_inputs"),
             ),
             scratch=cfg.action_horizon,
         )
@@ -607,7 +512,7 @@ class Pi05Model(Model):
         full_metadata = CurrentForwardConductorMetadata(
             input_modalities=input_modalities,
             output_modalities=output_modalities,
-            graph_walk=self.PREFILL_WALK,
+            graph_walk=self.ACTION_GEN_WALK,
             is_prefill=True,
             kwargs={},
         )
@@ -618,7 +523,7 @@ class Pi05Model(Model):
             edge.tensor_info = input_signals["image_inputs"]
             inputs.append(edge)
         if "text_inputs" in input_signals:
-            edge = GraphEdge(next_node="LLM", name="text_inputs")
+            edge = GraphEdge(next_node="prefix", name="text_inputs")
             edge.tensor_info = input_signals["text_inputs"]
             inputs.append(edge)
 
@@ -627,7 +532,6 @@ class Pi05Model(Model):
             full_metadata=full_metadata,
             inputs=inputs,
             unpersist_tensors=unpersist_tensors,
-            step_metadata={"is_prefill": True},
         )
 
     def get_partition_forward_pass_args(
@@ -637,29 +541,8 @@ class Pi05Model(Model):
         persist_signals: dict[str, list[TensorPointerInfo]],
         incoming_connections: list[StreamingConnectionState] | None = None,
     ) -> ForwardPassArgs:
-        metadata = partition_metadata
-        request_done = False
-        inputs: list[GraphEdge] = []
-
-        if metadata.graph_walk == self.PREFILL_WALK:
-            metadata.is_prefill = False
-            metadata.graph_walk = self.ACTION_GEN_WALK
-            # Inputs for the first action_gen iteration are sampled inside the
-            # LLM submodule's preprocess (Gaussian noise + timestep_index=0).
-            inputs = [
-                GraphEdge(next_node="LLM", name="noisy_actions"),
-                GraphEdge(next_node="LLM", name="timestep_index"),
-            ]
-        elif metadata.graph_walk == self.ACTION_GEN_WALK:
-            request_done = True
-
-        unpersist_tensors = sum([inp.tensor_info for inp in inputs], start=[])
         return ForwardPassArgs(
-            full_metadata=metadata,
-            inputs=inputs,
-            unpersist_tensors=unpersist_tensors,
-            step_metadata={"is_prefill": metadata.is_prefill},
-            request_done=request_done,
+            full_metadata=partition_metadata, inputs=[], unpersist_tensors=[], request_done=True,
         )
 
     # ------------------------------------------------------------------
@@ -672,7 +555,7 @@ class Pi05Model(Model):
     ) -> torch.nn.Module | None:
         # NOTE: ``autocast_dtype`` is accepted for interface parity but
         # deliberately NOT applied at param allocation. Pi0.5's submodules
-        # (Pi05ViTEncoderSubmodule / Pi05LLMSubmodule) override ``to()`` to
+        # (vision / prefix / action) override ``to()`` to
         # keep precision-sensitive params in fp32 — the SigLIP vision tower
         # entirely, and the transformer norm params — matching lerobot's
         # ``to_bfloat16_for_selected_params``. Meta-casting to bf16 before
@@ -697,18 +580,29 @@ class Pi05Model(Model):
             return Pi05ViTEncoderSubmodule(
                 encoder=self.siglip, config=self.config
             )
-        if node_name == "LLM":
-            self._init_llm_components(device)
-            return Pi05LLMSubmodule(
-                embed_tokens=self.embed_tokens,
-                paligemma=self.paligemma,
-                action_expert=self.action_expert,
-                action_in_proj=self.action_in_proj,
-                action_out_proj=self.action_out_proj,
-                time_mlp=self.time_mlp,
-                config=self.config,
+        if node_name not in {"prefix", "LLM"}:
+            return None
+        # Construct only this node's weights, in fp32 before selective casting.
+        with torch.device("meta" if not self.skip_weight_loading else "cpu"):
+            if node_name == "prefix":
+                submodule = Pi05PrefixSubmodule(
+                    nn.Embedding(self.config.vocab_size, self.config.hidden_size, padding_idx=self.config.pad_token_id),
+                    Pi05PaliGemmaExpert(self.config), self.config,
+                )
+            else:
+                submodule = Pi05ActionSubmodule(
+                    Pi05ActionExpert(self.config),
+                    nn.Linear(self.config.action_dim, self.config.action_hidden_size, bias=True),
+                    nn.Linear(self.config.action_hidden_size, self.config.action_dim, bias=True),
+                    Pi05TimeMLP(hidden_size=self.config.action_hidden_size), self.config,
+                )
+        submodule.to_empty(device=device)
+        if not self.skip_weight_loading:
+            load_hf_weights(
+                submodule, self._ensure_lerobot_flat().items(),
+                stacked_params=LLAMA_STACKED_PARAMS, name_remapper=self._lerobot_remap,
             )
-        return None
+        return submodule
 
     def _init_vit_components(self, device: str):
         if self.siglip is not None:
@@ -753,60 +647,3 @@ class Pi05Model(Model):
                 f"Pi0.5 SigLIP: {len(missing)} parameters not in the checkpoint, "
                 f"e.g. {missing[:3]}"
             )
-
-    def _init_llm_components(self, device: str):
-        if self.embed_tokens is not None:
-            return
-        # See ``_init_vit_components`` for why we build on the meta device:
-        # it lets us instantiate ~14 GB worth of Pi0.5 LLM parameters with
-        # zero real memory and zero random init, then materialize them on
-        # ``device`` via ``to_empty`` and overwrite with lerobot weights.
-        meta = torch.device("meta" if not self.skip_weight_loading else "cpu")
-        with meta:
-            self.embed_tokens = nn.Embedding(
-                self.config.vocab_size,
-                self.config.hidden_size,
-                padding_idx=self.config.pad_token_id,
-            )
-            self.paligemma = Pi05PaliGemmaExpert(self.config)
-            self.action_expert = Pi05ActionExpert(self.config)
-            self.action_in_proj = nn.Linear(
-                self.config.action_dim, self.config.action_hidden_size, bias=True
-            )
-            self.action_out_proj = nn.Linear(
-                self.config.action_hidden_size, self.config.action_dim, bias=True
-            )
-            self.time_mlp = Pi05TimeMLP(hidden_size=self.config.action_hidden_size)
-
-        if self.skip_weight_loading:
-            for mod in (
-                self.embed_tokens,
-                self.paligemma,
-                self.action_expert,
-                self.action_in_proj,
-                self.action_out_proj,
-                self.time_mlp,
-            ):
-                mod.to_empty(device=device)
-            return
-
-        flat = self._ensure_lerobot_flat()
-        # Wrap the LLM components in a flat container so the loader's
-        # named_parameters() table has entries like ``paligemma.layers.0.
-        # self_attn.qkv_proj.weight`` for the stacked-param rules to route
-        # ``q/k/v_proj.weight`` checkpoint keys into.
-        wrapper = _Pi05LLMWeightContainer(
-            embed_tokens=self.embed_tokens,
-            paligemma=self.paligemma,
-            action_expert=self.action_expert,
-            action_in_proj=self.action_in_proj,
-            action_out_proj=self.action_out_proj,
-            time_mlp=self.time_mlp,
-        )
-        wrapper.to_empty(device=device)
-        load_hf_weights(
-            wrapper,
-            flat.items(),
-            stacked_params=LLAMA_STACKED_PARAMS,
-            name_remapper=self._lerobot_remap,
-        )

@@ -19,7 +19,7 @@ def sincos_timestep_embedding(
         dim: embedding dimension. Must be even.
         fraction: ``(dim // 2,)`` frequency ladder, caller-owned so it is
             allocated once rather than per step (see
-            ``Pi05LLMSubmodule._get_timestep_emb_fraction``).
+            ``Pi05ActionSubmodule._get_timestep_emb_fraction``).
         output_buffer: ``(len(t), dim)`` destination, written in place and
             returned; preallocated so the action-gen step stays capturable.
         min_period / max_period: frequency range for the sinusoidal basis.

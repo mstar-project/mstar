@@ -1,8 +1,7 @@
 """Tests for the Pi0.5 model class.
 
-These tests focus on the structural pieces of the Pi0.5 implementation that
-do not require real weights: graph walks, node-to-engine mapping, forward pass
-transitions, and worker graph division. Real-weight integration is exercised
+These tests focus on the Pi0.5 implementation without real weights: graph
+execution, loading, input preparation, and resource declarations. Real-weight integration is exercised
 separately via end-to-end smoke tests.
 """
 
@@ -15,10 +14,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from mstar.conductor.request_info import CurrentForwardConductorMetadata
 from mstar.engine.resources.kv.config import KVSpec
-from mstar.graph.base import GraphNode, Loop, Sequential
-from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.pi05.components.flow_matching import (
     discretize_state,
     euler_step,
@@ -26,7 +22,7 @@ from mstar.model.pi05.components.flow_matching import (
 )
 from mstar.model.pi05.config import LLM_KV, Pi05Config
 from mstar.model.pi05.pi05_model import Pi05Model
-from mstar.model.pi05.submodules import Pi05LLMSubmodule, Pi05ViTEncoderSubmodule
+from mstar.model.pi05.submodules import Pi05ActionSubmodule, Pi05PrefixSubmodule, Pi05ViTEncoderSubmodule
 from mstar.model.submodule_base import ModelInputsFromEngine
 
 CONFIG_PATH = str(
@@ -45,12 +41,6 @@ def _make_model() -> Pi05Model:
     model.tokenizer = None
     model._repo_dir = None
     model._submodule_cache = {}
-    model.embed_tokens = None
-    model.paligemma = None
-    model.action_expert = None
-    model.action_in_proj = None
-    model.action_out_proj = None
-    model.adaln_mlp = None
     model.siglip = None
     return model
 
@@ -95,10 +85,10 @@ def test_pi05_vision_keeps_fp32_under_engine_autocast(_pi05_cpu_threads, batched
         with autocast_scope(torch.bfloat16, "cpu"):
             with autocast_scope(resolve_node_dtype(submodule, torch.bfloat16), "cpu"):
                 if batched:
-                    outputs = submodule.forward_batched("prefill", engine_inputs, images)
+                    outputs = submodule.forward_batched("action_gen", engine_inputs, images)
                     actual = torch.stack([outputs[rid]["img_emb"][0] for rid in engine_inputs.request_ids])
                 else:
-                    actual = submodule.forward("prefill", engine_inputs, images)["img_emb"][0].unsqueeze(0)
+                    actual = submodule.forward("action_gen", engine_inputs, images)["img_emb"][0].unsqueeze(0)
 
         assert actual.dtype == torch.float32
         assert torch.equal(actual, reference)
@@ -108,7 +98,7 @@ def test_pi05_vision_gets_every_camera():
     """The server hands one [C, H, W] tensor per camera; all of them reach SigLIP, in order."""
     submodule = Pi05ViTEncoderSubmodule(torch.nn.Identity(), Pi05Config(vit_image_size=4, num_cameras=3))
     cameras = [torch.full((3, 4, 4), v) for v in (0.0, 0.5, 1.0)]
-    pixels = submodule.prepare_inputs("prefill", None, {"image_inputs": cameras}).tensor_inputs["pixel_values"]
+    pixels = submodule.prepare_inputs("action_gen", None, {"image_inputs": cameras}).tensor_inputs["pixel_values"]
     assert pixels.shape == (3, 3, 4, 4)
     assert torch.equal(pixels, torch.stack(cameras) * 2 - 1)
 
@@ -122,9 +112,9 @@ class _TwoTokensPerImage(torch.nn.Module):
 
 def _encode(submodule, cameras):
     """prepare_inputs, the eager forward and postprocess for one request, as the engine runs them."""
-    inputs = submodule.prepare_inputs("prefill", None, {"image_inputs": cameras})
-    pixels = submodule.preprocess("prefill", None, [inputs])["pixel_values"]
-    outputs = submodule.forward("prefill", None, pixels)
+    inputs = submodule.prepare_inputs("action_gen", None, {"image_inputs": cameras})
+    pixels = submodule.preprocess("action_gen", None, [inputs])["pixel_values"]
+    outputs = submodule.forward("action_gen", None, pixels)
     submodule.postprocess("r", None, outputs, inputs=inputs)
     return inputs, outputs["img_emb"][0]
 
@@ -151,11 +141,11 @@ def test_pi05_vision_batches_requests_with_different_camera_counts():
     each request still gets only its own cameras' tokens."""
     submodule = Pi05ViTEncoderSubmodule(_TwoTokensPerImage(), Pi05Config(vit_image_size=4, num_cameras=3))
     requests = {"one": [torch.full((3, 4, 4), 0.25)], "two": [torch.full((3, 4, 4), 0.5), torch.zeros(3, 4, 4)]}
-    inputs = [submodule.prepare_inputs("prefill", None, {"image_inputs": cams}) for cams in requests.values()]
+    inputs = [submodule.prepare_inputs("action_gen", None, {"image_inputs": cams}) for cams in requests.values()]
     assert submodule.can_batch(None, inputs)
     engine_inputs = ModelInputsFromEngine(request_ids=list(requests), per_request_info={})
-    pixels = submodule.preprocess("prefill", engine_inputs, inputs)["pixel_values"]
-    outputs = submodule.forward_batched("prefill", engine_inputs, pixels)
+    pixels = submodule.preprocess("action_gen", engine_inputs, inputs)["pixel_values"]
+    outputs = submodule.forward_batched("action_gen", engine_inputs, pixels)
     for rid, request_inputs in zip(requests, inputs, strict=True):
         submodule.postprocess(rid, None, outputs[rid], inputs=request_inputs)
     assert torch.equal(outputs["one"]["img_emb"][0], torch.tensor([[-0.5], [-0.5]]))
@@ -165,7 +155,7 @@ def test_pi05_vision_batches_requests_with_different_camera_counts():
 def test_pi05_vision_letterboxes_each_camera_at_its_own_resolution():
     submodule = Pi05ViTEncoderSubmodule(torch.nn.Identity(), Pi05Config(vit_image_size=4, num_cameras=2))
     wide, tall = torch.full((3, 2, 4), 1.0), torch.full((3, 8, 4), 1.0)
-    pixels = submodule.prepare_inputs("prefill", None, {"image_inputs": [wide, tall]}).tensor_inputs["pixel_values"]
+    pixels = submodule.prepare_inputs("action_gen", None, {"image_inputs": [wide, tall]}).tensor_inputs["pixel_values"]
     assert pixels.shape == (2, 3, 4, 4)
     assert torch.equal(pixels[0], submodule._prepare_one(wide)[0])
     assert torch.equal(pixels[1], submodule._prepare_one(tall)[0])
@@ -201,12 +191,11 @@ def test_pi05_prefix_scaling_follows_openpi():
     """openpi's and lerobot's embed_prefix: image tokens unscaled, language embeddings times sqrt(hidden)."""
     config = Pi05Config(hidden_size=16)
     embed = torch.nn.Embedding(10, 16)
-    llm = Pi05LLMSubmodule(embed, torch.nn.Identity(), torch.nn.Identity(), torch.nn.Identity(),
-                           torch.nn.Identity(), torch.nn.Identity(), config)
+    llm = Pi05PrefixSubmodule(embed, torch.nn.Identity(), config)
     img = torch.randn(6, 16)
     ids = torch.tensor([1, 4, 7])
     with torch.no_grad():
-        prefix = llm.prepare_inputs("prefill", None, {"img_emb": [img], "text_inputs": [ids]}).input_embeds
+        prefix = llm.prepare_inputs("action_gen", None, {"img_emb": [img], "text_inputs": [ids]}).input_embeds
         assert torch.equal(prefix[:6], img)
         assert torch.allclose(prefix[6:], embed(ids) * 4.0)
 
@@ -235,142 +224,116 @@ def test_pi05_load_image_ships_uint8_with_unchanged_vit_input(tmp_path):
 # ----------------------------------------------------------------------
 
 
-def test_pi05_graph_walks_have_expected_keys():
-    model = _make_model()
-    walks = model.get_graph_walk_graphs()
-    assert set(walks.keys()) == {Pi05Model.PREFILL_WALK, Pi05Model.ACTION_GEN_WALK}
+@pytest.mark.parametrize("config_name", ["pi05.yaml", "pi05_droid.yaml"])
+@pytest.mark.parametrize("strides", [(1,) * 10, (1, 9), (1, 4, 4, 1)])
+def test_pi05_one_walk_seeds_and_finishes_the_action_loop(config_name, strides):
+    from mstar.communication.tensor_store import RustTensorBookkeeping
+    from mstar.distributed.base import ShardingConfig
+    from mstar.graph.base import TensorPointerInfo
+    from mstar.graph.runtime.base import ColumnarEdgeSpecs, RouteInput
+    from mstar.graph.runtime.rust import RustGraphRuntime
+    from mstar.utils.containers import ParallelList
 
-
-def test_pi05_prefill_is_sequential_vit_then_llm():
     model = _make_model()
-    walks = model.get_graph_walk_graphs()
-    prefill = walks[Pi05Model.PREFILL_WALK]
-    assert isinstance(prefill, Sequential)
-    assert len(prefill.sections) == 2
-    first, second = prefill.sections
-    assert isinstance(first, GraphNode) and first.name == "vit_encoder"
-    assert isinstance(second, GraphNode) and second.name == "LLM"
-    # vit_encoder must emit img_emb to LLM.
-    assert any(
-        edge.next_node == "LLM" and edge.name == "img_emb"
-        for edge in first.outputs
+    worker_graphs = model.get_worker_graphs(str(Path(CONFIG_PATH).with_name(config_name)))
+    assert len(worker_graphs) == 1
+    (worker_graph,) = worker_graphs
+    walk = model.ACTION_GEN_WALK
+    assert worker_graph.graph_walks == {walk}
+    nodes = set(worker_graph.section.get_nodes())
+    assert nodes == {"vit_encoder", "prefix", "LLM"}
+    loops = worker_graph.section.get_loops()
+    book = RustTensorBookkeeping()
+    wg_id = worker_graph.worker_graph_id
+    runtime = RustGraphRuntime(
+        my_worker_id="worker", my_worker_graphs=worker_graphs,
+        all_wg_ids_to_graph_walks={wg_id: {walk}},
+        all_wg_ids_to_dyn_loops={wg_id: set(loops)},
+        all_wg_ids_to_nodes={wg_id: nodes},
+        node_to_partition=dict.fromkeys(nodes, "default"),
+        sharding_config=ShardingConfig(groups=[], tp_enabled_nodes=set(), shard_dim={}),
+        bookkeeping=book,
     )
-    # LLM consumes img_emb + text_inputs (state is encoded in text_inputs
-    # as a decimal-string suffix per Pi0.5's prompt format).
-    assert set(second.input_names) == {"img_emb", "text_inputs"}
+    rid = runtime.add_request(
+        "action", "default", walk, [wg_id], ParallelList([wg_id], [["worker"]]),
+        {name: loop.max_iters for name, loop in loops.items()},
+    )
+    initial = model.get_initial_forward_pass_args(
+        "default", ["image", "text"], ["action"],
+        {"image_inputs": [], "text_inputs": []},
+    )
+    assert initial.full_metadata.graph_walk == walk
+    block = ColumnarEdgeSpecs.empty()
+    for edge in initial.inputs:
+        block.add_edge(rid, edge)
+    assert runtime.ingest_inputs_batch(block) == []
+    emitted = []
 
+    def complete(node, outputs, stride=1):
+        assert [(ready.node_name, list(ready.rids)) for ready in runtime.get_ready_nodes(set())] == [(node, [rid])]
+        inputs = runtime.pop_rids(node, walk, [rid]).input_edges
+        runtime.cleanup_consumed_inputs(node, [rid], [wg_id])
+        signals = runtime.get_output_signals(node, walk)
+        routed = runtime.complete_and_route_batch(RouteInput(
+            partition="default", graph_walk=walk, node_name=node,
+            output_signals=list(signals), wg_ids=ParallelList([rid], [wg_id]),
+            tensors=[uuid for signal in signals for uuid in outputs[signal]],
+            num_tensors=[len(outputs[signal]) for signal in signals], loop_strides=[stride],
+        ))
+        emitted.extend(routed.register_uuids)
+        return inputs, routed
 
-def test_pi05_action_gen_is_loop_with_action_output_emission():
-    model = _make_model()
-    walks = model.get_graph_walk_graphs()
-    action_gen = walks[Pi05Model.ACTION_GEN_WALK]
-    assert isinstance(action_gen, Loop)
-    assert action_gen.max_iters== model.config.num_flow_steps == 10
-    # The terminal output emits to the client with the action modality.
-    # Its ``name`` must match one of the section's loop-back edge names so
-    # that Loop._replace_outputs_for_final_iter can swap it in on the final
-    # iteration (see the comment in Pi05Model.get_graph_walk_graphs).
-    assert len(action_gen.outputs) == 1
-    terminal = action_gen.outputs[0]
-    assert terminal.next_node == EMIT_TO_CLIENT
-    assert terminal.name == "noisy_actions"
-    assert terminal.output_modality == "action"
-    # Loop body is a single LLM node with two loop-back edges.
-    body = action_gen.section
-    assert isinstance(body, GraphNode) and body.name == "LLM"
-    assert {e.name for e in body.outputs} == {"noisy_actions", "timestep_index"}
-    assert all(e.next_node == "LLM" for e in body.outputs)
+    complete("vit_encoder", {"img_emb": []})
+    # Exercise the actual prefix forward's empty output contract: no tensor
+    # is needed to make the first action step ready and seed its own noise.
+    class PrefixExpert(torch.nn.Module):
+        def forward(self, **kwargs):
+            return None
+
+    prefix = Pi05PrefixSubmodule(torch.nn.Embedding(8, 4), PrefixExpert(), Pi05Config(hidden_size=4))
+    if config_name == "pi05_droid.yaml":
+        engine_inputs = ModelInputsFromEngine(request_ids=[rid], per_request_info={})
+        seeds = prefix.forward_batched(walk, engine_inputs, prefix_embs=torch.zeros(1, 4))[rid]
+    else:
+        seeds = prefix.forward(walk, None, prefix_embs=torch.zeros(1, 4))
+    assert seeds == {"noisy_actions": [], "timestep_index": []}
+    complete("prefix", seeds)
+    iterations = 0
+    for index, stride in enumerate(strides):
+        outputs = {}
+        for offset, signal in enumerate(("noisy_actions", "timestep_index")):
+            uuid = index * 2 + offset + 100
+            info = TensorPointerInfo(
+                dims=[1], dtype=torch.float32, nbytes=4, address=0, stride=(1,),
+                uuid=uuid, source_session_id="local", source_entity="worker",
+            )
+            book.put_tensor(uuid, info)
+            book.increment_ref(uuid, 1)
+            outputs[signal] = [uuid]
+        inputs, routed = complete("LLM", outputs, stride)
+        if index == 0:
+            assert inputs.uuids == []
+            assert set(inputs.signal_names) == set(seeds)
+        iterations += stride
+        assert bool(routed.rids_needing_request_info) == (iterations == model.config.num_flow_steps)
+    assert iterations == model.config.num_flow_steps
+    assert emitted == outputs["noisy_actions"]
+    assert runtime.get_ready_nodes(set()) == []
+    assert model.get_partition_forward_pass_args("default", initial.full_metadata, {}).request_done
+    runtime.remove_request(rid)
 
 
 def test_pi05_kv_cache_config_matches_pi05_config():
     model = _make_model()
-    kv_specs = [
-        spec for spec in model.get_node_resources() if isinstance(spec, KVSpec)
-    ]
+    specs = model.get_node_resources()
+    assert all(spec.nodes == {"prefix", "LLM"} for spec in specs)
+    kv_specs = [spec for spec in specs if isinstance(spec, KVSpec)]
     assert len(kv_specs) == 1
-    assert kv_specs[0].nodes == {"LLM"}
     kv = kv_specs[0].config
     assert kv.num_layers == model.config.num_layers
     assert kv.num_kv_heads == model.config.num_kv_heads
     assert kv.head_dim == model.config.head_dim
     assert kv.num_qo_heads == model.config.num_qo_heads
-
-
-# ----------------------------------------------------------------------
-# Worker graph division using the YAML config
-# ----------------------------------------------------------------------
-
-
-def test_pi05_worker_graphs_from_yaml():
-    model = _make_model()
-    worker_graphs = model.get_worker_graphs(CONFIG_PATH)
-    # 2 graph walks * 2 worker graphs apiece... but the prefill walk has both
-    # nodes on rank 0 and they belong to different node_groups, so they remain
-    # 2 separate worker graphs. action_gen has only the LLM node.
-    walks_seen = {tuple(sorted(wg.graph_walks)) for wg in worker_graphs}
-    assert (Pi05Model.PREFILL_WALK,) in walks_seen
-    assert (Pi05Model.ACTION_GEN_WALK,) in walks_seen
-
-
-# ----------------------------------------------------------------------
-# Forward pass transitions
-# ----------------------------------------------------------------------
-
-
-def test_pi05_initial_forward_pass_args_starts_in_prefill():
-    model = _make_model()
-    args = model.get_initial_forward_pass_args(
-        partition_name="default",
-        input_modalities=["image", "text"],
-        output_modalities=["action"],
-        input_signals={
-            "image_inputs": [],
-            "text_inputs": [],
-        },
-    )
-    assert args.full_metadata.graph_walk == Pi05Model.PREFILL_WALK
-    assert args.full_metadata.is_prefill is True
-    edge_targets = {(e.next_node, e.name) for e in args.inputs}
-    assert ("vit_encoder", "image_inputs") in edge_targets
-    assert ("LLM", "text_inputs") in edge_targets
-    # Pi0.5 has no separate state_inputs edge — state is part of text_inputs.
-    assert not any(e.name == "state_inputs" for e in args.inputs)
-
-
-def test_pi05_prefill_transitions_to_action_gen():
-    model = _make_model()
-    metadata = CurrentForwardConductorMetadata(
-        input_modalities=["image", "text"],
-        output_modalities=["action"],
-        graph_walk=Pi05Model.PREFILL_WALK,
-        is_prefill=True,
-    )
-    result = model.get_partition_forward_pass_args(
-        partition_name="default",
-        partition_metadata=metadata,
-        persist_signals={},
-    )
-    assert result.full_metadata.graph_walk == Pi05Model.ACTION_GEN_WALK
-    assert result.full_metadata.is_prefill is False
-    assert result.request_done is False
-    edge_names = {e.name for e in result.inputs}
-    assert edge_names == {"noisy_actions", "timestep_index"}
-
-
-def test_pi05_action_gen_marks_request_done():
-    model = _make_model()
-    metadata = CurrentForwardConductorMetadata(
-        input_modalities=["image", "text"],
-        output_modalities=["action"],
-        graph_walk=Pi05Model.ACTION_GEN_WALK,
-        is_prefill=False,
-    )
-    result = model.get_partition_forward_pass_args(
-        partition_name="default",
-        partition_metadata=metadata,
-        persist_signals={},
-    )
-    assert result.request_done is True
 
 
 # ----------------------------------------------------------------------
@@ -806,10 +769,8 @@ def test_pi05_refuses_a_request_without_images():
 # ----------------------------------------------------------------------
 
 
-def test_lerobot_remap_routes_keys_to_llm_wrapper_paths():
-    """Verify that ``Pi05Model._lerobot_remap`` translates each LLM-side
-    lerobot key to the matching parameter path on the LLM weight container.
-    """
+def test_lerobot_remap_routes_keys_to_expert_parameter_paths():
+    """Checkpoint keys target the attributes of the prefix or action submodule."""
     from mstar.model.pi05.pi05_model import Pi05Model
 
     model = Pi05Model.__new__(Pi05Model)  # bypass __init__ — pure-method test
@@ -865,30 +826,70 @@ def test_lerobot_checkpoint_keys_with_and_without_policy_prefix(tmp_path, policy
     It must load the same way as lerobot/pi05_base, which has neither."""
     from safetensors.torch import save_file
 
-    lm_head = torch.randn(8, 4)
-    base = {
-        "paligemma_with_expert.paligemma.lm_head.weight": lm_head,
-        "paligemma_with_expert.paligemma.model.language_model.layers.0.mlp.up_proj.weight": torch.randn(4, 4),
-        "paligemma_with_expert.paligemma.model.vision_tower.vision_model.post_layernorm.weight": torch.randn(4),
-        "paligemma_with_expert.gemma_expert.model.norm.dense.weight": torch.randn(4),
-        "action_in_proj.weight": torch.randn(4, 2),
-        "time_mlp_in.bias": torch.randn(4),
-    }
+    model = _make_model()
+    model.config = Pi05Config(
+        hidden_size=16, action_hidden_size=8, num_layers=1,
+        num_qo_heads=2, num_kv_heads=1, head_dim=8,
+        pali_intermediate_size=32, action_intermediate_size=16,
+        vocab_size=8, action_dim=4,
+    )
+    expected, base = {}, {}
+    for node in ("prefix", "LLM"):
+        expected[node] = {}
+        for index, (name, param) in enumerate(model._create_submodule(node, "cpu").named_parameters()):
+            value = torch.arange(param.numel(), dtype=torch.float32).reshape(param.shape) / 511 + index
+            expected[node][name] = value
+            checkpoint_name = name
+            if name == "embed_tokens.weight":
+                checkpoint_name = "paligemma_with_expert.paligemma.lm_head.weight"
+            elif name.startswith("paligemma."):
+                checkpoint_name = name.replace("paligemma.", "paligemma_with_expert.paligemma.model.language_model.", 1)
+            elif name.startswith("action_expert."):
+                checkpoint_name = name.replace("action_expert.", "paligemma_with_expert.gemma_expert.model.", 1)
+            elif name.startswith("time_mlp."):
+                checkpoint_name = name.replace("time_mlp.linear_", "time_mlp_", 1)
+            if "qkv_proj" in name:
+                pieces = value.split((16, 8, 8))
+                base.update({checkpoint_name.replace("qkv_proj", key): piece.contiguous()
+                             for key, piece in zip(("q_proj", "k_proj", "v_proj"), pieces, strict=True)})
+            elif "gate_up_proj" in name:
+                base.update({checkpoint_name.replace("gate_up_proj", key): piece.contiguous()
+                             for key, piece in zip(("gate_proj", "up_proj"), value.chunk(2), strict=True)})
+            else:
+                base[checkpoint_name] = value
     saved = dict(base)
     if policy_saved:
         saved = {"model." + k: v for k, v in base.items()}
-        saved["model.paligemma_with_expert.paligemma.model.language_model.embed_tokens.weight"] = lm_head.clone()
+        tied_embedding = "model.paligemma_with_expert.paligemma.model.language_model.embed_tokens.weight"
+        saved[tied_embedding] = expected["prefix"]["embed_tokens.weight"].clone()
     save_file(saved, str(tmp_path / "model.safetensors"))
 
-    model = Pi05Model.__new__(Pi05Model)  # bypass __init__: no config or tokenizer download
+    model.skip_weight_loading = False
     model._repo_dir = tmp_path
     model._lerobot_flat = None
     flat = model._ensure_lerobot_flat()
-
     assert flat.keys() == base.keys()
     assert all(torch.equal(flat[k], v) for k, v in base.items())
-    assert model._lerobot_remap("paligemma_with_expert.paligemma.lm_head.weight") == "embed_tokens.weight"
-    assert model._lerobot_remap("time_mlp_in.bias") == "time_mlp.linear_in.bias"
+
+    # Either node can load first. Each owns only its expert, and loading in
+    # fp32 preserves values the requested autocast dtype would round away.
+    order = ("LLM", "prefix") if policy_saved else ("prefix", "LLM")
+    for index, node in enumerate(order):
+        submodule = model.get_submodule(node, device="cpu", autocast_dtype=torch.bfloat16)
+        assert set(model._submodule_cache) == set(order[: index + 1])
+        actual = dict(submodule.named_parameters())
+        assert actual.keys() == expected[node].keys()
+        for name, value in expected[node].items():
+            assert actual[name].dtype == torch.float32
+            torch.testing.assert_close(actual[name], value, rtol=0, atol=0)
+    prefix_params = list(model._submodule_cache["prefix"].parameters())
+    action_params = list(model._submodule_cache["LLM"].parameters())
+    assert {p.data_ptr() for p in prefix_params}.isdisjoint(p.data_ptr() for p in action_params)
+    for submodule in model._submodule_cache.values():
+        submodule.to(dtype=torch.bfloat16)
+        for name, param in submodule.named_parameters():
+            norm = any(part in name for part in ("input_layernorm", "post_attention_layernorm", ".norm."))
+            assert param.dtype == (torch.float32 if norm else torch.bfloat16)
 
 
 def test_pi05_droid_config_serves_the_droid_checkpoint_with_its_stats():
@@ -912,8 +913,8 @@ def test_an_action_run_of_four_steps_equals_four_one_step_steps():
     from run_parity import replay_run
 
     config = Pi05Config(hidden_size=16)
-    llm = Pi05LLMSubmodule(torch.nn.Embedding(10, 16), torch.nn.Identity(), torch.nn.Identity(), torch.nn.Identity(),
-                           torch.nn.Identity(), torch.nn.Identity(), config)
+    llm = Pi05ActionSubmodule(torch.nn.Identity(), torch.nn.Identity(), torch.nn.Identity(),
+                             torch.nn.Identity(), config)
     llm._euler_step = lambda noisy, idx, **kw: (
         noisy * 0.9 + idx.repeat_interleave(config.action_horizon)[:, None].to(noisy.dtype), idx + 1,
     )

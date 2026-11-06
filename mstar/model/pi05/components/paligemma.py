@@ -1,7 +1,7 @@
 """PaliGemma transformer expert for Pi0.5 (prefix processing).
 
 A Gemma-style transformer that writes the paged KV cache through the node's
-KV/attention/position resources. Used for the prefill graph walk where it
+KV/attention/position resources. Used by the prefix node, which
 processes the prefix tokens (image + language + state) and writes the KV cache
 that the action expert later reads during action generation.
 
@@ -61,7 +61,7 @@ class Pi05PaliGemmaExpert(nn.Module):
     The submodule's input embeddings (image tokens + language tokens +
     state tokens) are passed in directly. This module owns only the
     transformer blocks plus a final Gemma RMSNorm; the embedding table is
-    held by the parent submodule and shared with the action expert.
+    held by the prefix submodule. The action expert has no token embedding.
     """
 
     def __init__(self, config: Pi05Config):

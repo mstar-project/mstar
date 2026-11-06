@@ -3,7 +3,7 @@
 from dataclasses import dataclass, field
 
 # ---------------------------------------------------------------------------
-# Resource label constants (LLM node: shared by PaliGemma + action expert)
+# Resource keys shared by the prefix and action nodes
 # ---------------------------------------------------------------------------
 LLM_KV = "kv"
 LLM_ATTN = "attn"
