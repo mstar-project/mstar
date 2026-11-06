@@ -113,18 +113,30 @@ def test_repeat_staging_does_not_wait_for_the_previous_run(kind):
     batch = types.SimpleNamespace(request_ids=[2, 1], ring_bases={"frames": {1: 0}}, ring_width=1)
     output = BatchedModelOutput(row_outputs={"frames": items[:, 0]})
     mgmt = types.SimpleNamespace(loopback_rows=rows)
-    # Warm allocation/indexing paths before checking a busy stream.
-    state.stage(2, [False, False], 2)
-    Engine._write_rings(None, mgmt, batch, output)
-    torch.cuda.synchronize()
-    done = torch.cuda.Event()
-    torch.cuda._sleep(500_000_000)
-    done.record()
-    if kind == "immune":
-        state.stage(2, [True, False], 3)
-    else:
-        Engine._write_rings(None, mgmt, batch, output)
-    assert not done.query(), "staging waited for the preceding GPU run"
+    from torch.utils._python_dispatch import TorchDispatchMode
+
+    class AsyncHostCopies(TorchDispatchMode):
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            kwargs = kwargs or {}
+            if func is torch.ops.aten.copy_.default:
+                dst, src = args[:2]
+                if dst.is_cuda and src.device.type == "cpu":
+                    assert src.is_pinned()
+                    assert kwargs.get("non_blocking", args[2] if len(args) > 2 else False)
+            elif func is torch.ops.aten._to_copy.default:
+                src = args[0]
+                if src.device.type == "cpu" and torch.device(kwargs.get("device", "cpu")).type == "cuda":
+                    assert src.is_pinned()
+                    assert kwargs.get("non_blocking", False)
+            return func(*args, **kwargs)
+
+    # Check the transfer contract itself, without racing a finite GPU sleep
+    # against host scheduling on a loaded test machine.
+    with AsyncHostCopies():
+        if kind == "immune":
+            state.stage(2, [True, False], 3)
+        else:
+            Engine._write_rings(None, mgmt, batch, output)
     torch.cuda.synchronize()
     if kind == "immune":
         assert state.immune.tolist() == [True, False]
