@@ -486,6 +486,9 @@ class FlashInferDecodeWrapper:
         # with where in them the per-step indptr and lengths go
         self._planner_args: list | None = None
         self._planner_slots: tuple[int, int | None] = (4, 5)
+        # the captured indices buffer's view at the last plan's page count, and that count
+        self._indices_view: torch.Tensor | None = None
+        self._indices_viewed = -1
         self._workspace = workspace_buffer
 
         import flashinfer
@@ -644,7 +647,9 @@ class FlashInferDecodeWrapper:
             raise ValueError("more page indices than the captured buffer holds")
         w._paged_kv_indptr_buf.copy_(indptr, non_blocking=True)
         w._paged_kv_last_page_len_buf.copy_(last_page_len, non_blocking=True)
-        dst = w._paged_kv_indices_buf[:n]
+        if n != self._indices_viewed:
+            self._indices_view, self._indices_viewed = w._paged_kv_indices_buf[:n], n
+        dst = self._indices_view
         if indices.data_ptr() != dst.data_ptr():
             dst.copy_(indices, non_blocking=indices.device == dst.device)
         args = self._planner_args

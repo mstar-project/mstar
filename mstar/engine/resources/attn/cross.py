@@ -51,7 +51,7 @@ class _LastPlan(NamedTuple):
     object over the same pages still skips FlashInfer's plan."""
     context: Any  # the context label's KVPlanOutput
     request_ids: tuple
-    qo_indptr: tuple
+    spans: int | tuple[int, ...]  # as `QueryPacking.spans`
     plan_key: PlanCacheKey
 
 
@@ -60,6 +60,13 @@ class QueryPacking(NamedTuple):
     cumulative query lengths over them."""
     request_ids: list[str]
     qo_indptr: torch.Tensor  # int32, CPU
+    # each row's query count: one value when every row agrees, as `Segments.spans`
+    spans: int | tuple[int, ...]
+
+
+def _uniform_spans(spans: list[int]) -> int | tuple[int, ...]:
+    """As `Segments` holds a column: one value when every row agrees."""
+    return spans[0] if spans and spans.count(spans[0]) == len(spans) else tuple(spans)
 
 
 class CrossAttentionManager(AttentionResource):
@@ -203,18 +210,18 @@ class FlashInferCrossManager(CrossAttentionManager):
         packings = self._query_packings(step, ctx)
         laps.lap("packing")
         for plan_label, packing in packings.items():
-            qo_indptr = tuple(packing.qo_indptr.tolist())
-            num_rows = len(qo_indptr) - 1
+            spans = packing.spans
+            request_ids = tuple(packing.request_ids)
+            num_rows = len(request_ids)
             # every row queries one token (a span-0 row does not)
-            decode = not ctx.force_prefill and qo_indptr == tuple(range(num_rows + 1))
+            decode = not ctx.force_prefill and num_rows > 0 and spans == 1
             state_key, wrapper = self._wrapper_for(
                 plan_label, lease, num_rows=num_rows, slot=ctx.slot, decode=decode,
             )
-            request_ids = tuple(packing.request_ids)
             last = self._last_plans.get(state_key)
             if (
                 last is not None and last.context is context_out
-                and last.request_ids == request_ids and last.qo_indptr == qo_indptr
+                and last.request_ids == request_ids and last.spans == spans
             ):
                 plan_states[plan_label] = wrapper
                 laps.lap("unchanged")
@@ -239,7 +246,7 @@ class FlashInferCrossManager(CrossAttentionManager):
             # side moves between steps; when neither moved, FlashInfer's plan
             # is skippable. Every tensor here is on CPU.
             plan_key = PlanCacheKey(
-                q_seq_lens=qo_indptr,
+                q_seq_lens=spans,
                 page_indptr=indptrs.paged_kv_indptr.numpy().tobytes(),
                 page_indices=indptrs.paged_kv_indices.numpy().tobytes(),
                 last_page_lens=indptrs.paged_kv_last_page_len.numpy().tobytes(),
@@ -252,7 +259,7 @@ class FlashInferCrossManager(CrossAttentionManager):
                     **indptrs.to_kwargs_dict()
                 )
                 laps.lap("wrapper_plan")
-            self._last_plans[state_key] = _LastPlan(context_out, request_ids, qo_indptr, plan_key)
+            self._last_plans[state_key] = _LastPlan(context_out, request_ids, spans, plan_key)
             plan_states[plan_label] = wrapper
 
         self._preplanned = ctx.is_preplan
@@ -307,6 +314,9 @@ class FlashInferCrossManager(CrossAttentionManager):
                     view.request_id for view in kv_out.views
                 ] if kv_out.rows is None else kv_out.rows.request_ids,
                 qo_indptr=kv_out.cpu_indptrs.qo_indptr,
+                spans=_uniform_spans(
+                    [view.to_compute for view in kv_out.views]
+                ) if kv_out.rows is None else kv_out.rows.spans,
             )
             for label, kv_out in plan_outputs.items()
         }
@@ -322,6 +332,7 @@ class FlashInferCrossManager(CrossAttentionManager):
             label: QueryPacking(
                 request_ids=rows.request_ids,
                 qo_indptr=torch.tensor(list(accumulate(rows.span_column(), initial=0)), dtype=torch.int32),
+                spans=rows.spans,
             )
             for label, rows in (step.segments or NO_SEGMENTS).group_by_label().items()
         }

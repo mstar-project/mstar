@@ -43,8 +43,8 @@ class CGSlotSpec:
         return f"{self.bucket} slot={self.slot}"
 
 
-@dataclass(frozen=True)
-class CGSlotKey:
+class CGSlotKey(NamedTuple):
+    # looked up several times a step: a tuple builds, hashes and compares in C
     bucket: BucketKey
     slot: int
     label: str
