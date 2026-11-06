@@ -1024,6 +1024,53 @@ def test_a_native_spinner_doesnt_hold_the_gate_shut():
     assert out.strip() == "True", out
 
 
+def test_a_device_wait_needs_no_one():
+    """A device wait beside another thread's wait that it can't see the end of ends all the same.
+    Beside a sleep (nothing bounds it, the sleep is earlier): at once, not as the sleep passes in
+    real time. And beside a thread at a meet, whose peer may be waiting for what comes after."""
+    out = run_sim("""
+        import threading, time, torch
+        from mstar_sim import clock
+        threading.Thread(target=time.sleep, args=(0.5,), daemon=True).start()
+        wall = time.clock_gettime(time.CLOCK_MONOTONIC)
+        clock.charge(1.0)
+        torch.cuda.synchronize()
+        print(time.clock_gettime(time.CLOCK_MONOTONIC) - wall)
+    """)
+    assert float(out) < 0.4, out
+    run_deployment("""
+        import datetime
+        import torch.distributed as dist
+        dist.init_process_group("nccl", init_method="file://" + TMP + "/group", rank=0, world_size=2,
+                                timeout=datetime.timedelta(seconds=20))
+        x = torch.empty(1 << 14, device="cuda")
+        barrier()
+
+        def after_the_device():
+            clock.charge(1.0)
+            torch.cuda.synchronize()
+            open(TMP + "/passed", "w").close()
+
+        thread = threading.Thread(target=after_the_device)
+        thread.start()
+        dist.all_reduce(x)
+        thread.join()
+        dist.destroy_process_group()
+    """, """
+        import datetime
+        import torch.distributed as dist
+        dist.init_process_group("nccl", init_method="file://" + TMP + "/group", rank=1, world_size=2,
+                                timeout=datetime.timedelta(seconds=20))
+        x = torch.empty(1 << 14, device="cuda")
+        barrier()
+        while not os.path.exists(TMP + "/passed"):
+            time.perf_counter()  # it runs, so the bound is its clock
+            waits._real_sleep(0.01)
+        dist.all_reduce(x)
+        dist.destroy_process_group()
+    """)
+
+
 def test_a_read_held_behind_a_rising_bound_doesnt_abort():
     """The limit is on a bound that stands still, not on a hold: a device wait can put a process
     far past a peer that runs at real rate, and it then waits for the peer to get there."""

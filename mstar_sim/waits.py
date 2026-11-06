@@ -304,7 +304,7 @@ def _move() -> float:
     for w in pending:
         if w.kind is AHEAD and bound + W >= w.deadline and wake(w, thaw=False):
             w.release()
-    meet = any(w.kind is MEET for w in pending)  # a rank at a meet takes no moves; what is due still ends
+    meet = any(w.kind is MEET for w in pending)  # a rank at a meet follows no one; what is due still ends
     timeout = _MAX_SLEEP
     _look()
     if _native:
@@ -322,12 +322,14 @@ def _move() -> float:
         elif not quiet:
             REPORT["gate_waits"] += 1
             timeout = SETTLE
-    if idle and not meet:
+    if idle:
         device = min((w.deadline for w in pending if w.kind is DEVICE), default=math.inf)
         hosts = [w for w in pending if w.kind is HOST and w.deadline is not None]
         host = min((w.deadline for w in hosts), default=math.inf)
-        target = device  # a device deadline needs no one
-        if device > host or device == math.inf:
+        target = math.inf
+        if device < math.inf and (device <= host or bound == math.inf or meet):
+            target = min(device, host)  # a device deadline needs no one, and a sleep on its way ends as it passes
+        elif not meet:
             due = min((w.deadline for w in hosts if w.due), default=math.inf)
             target = min(host, bound) if bound < math.inf else due
             if bound < host < math.inf:  # the bound, running, wakes no one as it rises
