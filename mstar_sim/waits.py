@@ -310,8 +310,8 @@ def _move() -> float:
     if _native:
         _watch_children()
     idle = _running[0] == 0 or clock.PARKED[0]
-    if _native and (idle or _native_busy[0]):
-        timeout = 2 * SETTLE  # a move may be pending on a child: look often
+    if _native and (_native_busy[0] or (idle and any(w.deadline is not None for w in pending))):
+        timeout = 2 * SETTLE  # a move is pending on a child: look often
     if not idle:
         _shut[0] = 0.0
     if idle:
