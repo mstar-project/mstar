@@ -202,8 +202,10 @@ class LabelLayout(NamedTuple):
 
     ``spans`` are the committed writes known at intake, in walk order. Each
     ``(loop, slots)`` in ``growth`` writes ``slots`` per iteration of the named
-    loop. ``scratch`` is the most one non-committing step writes past the
-    committed length, and ``retention`` the policy the label's committing steps declare.
+    loop, and ``max_growth``, when set, is the most slots ``growth`` writes in all,
+    for loops that end before their caps. ``scratch`` is the most one
+    non-committing step writes past the committed length, and ``retention`` the
+    policy the label's committing steps declare.
     """
     spans: tuple[Span, ...] = ()
     growth: tuple[tuple[str, int], ...] = ()
@@ -211,6 +213,7 @@ class LabelLayout(NamedTuple):
     retention: RetentionPolicy | None = None
     # how many leading spans the label's keys cover, by default every span before the first rows span
     keyed_spans: int | None = None
+    max_growth: int | None = None
 
     def keyed_count(self) -> int:
         if self.keyed_spans is not None:
@@ -218,7 +221,7 @@ class LabelLayout(NamedTuple):
         return next((i for i, span in enumerate(self.spans) if span.kind == SpanKind.ROWS), len(self.spans))
 
     def row(self) -> list:
-        """The layout as ``[spans, growth, scratch, retention, keyed spans]``, a span as
+        """The layout as ``[spans, growth, scratch, retention, keyed spans, max growth]``, a span as
         ``[length, advance, walk, scratch, digest, end key, opens step, kind]``: plain values, which
         keep a request's kwargs on the wire's msgpack path. Digest and end key are None until the
         preprocess worker keys the span."""
@@ -246,6 +249,7 @@ class LabelLayout(NamedTuple):
             self.scratch,
             None if retention is None else [retention.context_budget, retention.protected_prefix],
             self.keyed_count(),
+            self.max_growth,
         ]
 
 
@@ -627,6 +631,10 @@ class Model(ABC):
     LENGTH_KWARGS: tuple[str, ...] = ("max_output_tokens",)
     # Request keys the conductor or data worker reads for every model, never logged as ignored.
     ENGINE_KWARGS: tuple[str, ...] = ("seed", "prefix_cache", "return_token_ids", LORA_ADAPTER_KWARG)
+    # Output modalities a client plays as they stream, where a pause is a gap. A streamed request with one of
+    # them reserves its whole KV footprint and is never preempted. ``unpausable_outputs`` in the serving config
+    # overrides it.
+    UNPAUSABLE_OUTPUTS: frozenset[str] = frozenset({"audio"})
 
     # Intra-op threads for the API server's preprocessing of this model's
     # inputs (``load_image``, ``process_prompt``, ...). None takes a default

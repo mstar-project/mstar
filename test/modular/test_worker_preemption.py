@@ -37,9 +37,10 @@ from test_kv_preemption import (  # noqa: F401
 from mstar.engine.engine import Engine, PagedKVCache
 from mstar.engine.resources import Residency
 from mstar.engine.resources.admission import Admission
-from mstar.engine.resources.kv.config import KVStep
+from mstar.engine.resources.kv.config import KVReqConfig, KVStep, PrefixSpan, StreamLayout
 from mstar.engine.resources.step import ASKS, Segment
 from mstar.graph.base import GraphEdge, GraphNode, Loop
+from mstar.model.base import KVLabel
 from mstar.model.rebuild import RebuildPolicy
 from mstar.observability.recorders import EdgeTransfers
 from mstar.worker.host_pool import HostCopy, HostSlice
@@ -279,7 +280,8 @@ def test_a_victim_whose_rebuild_wouldnt_write_what_its_kv_holds_isnt_chosen(why)
     assert kv.residency("r") is Residency.RESIDENT and _returns(kv) == ["r"], "r didn't wait for room beside v"
 
 
-def test_an_older_request_that_asks_after_a_newer_one_parks_moves_it():
+@pytest.mark.parametrize("guaranteed", [False, True])
+def test_an_older_request_that_asks_after_a_newer_one_parks_moves_it(guaranteed):
     """z ran short with nothing newer to move and, the host too full to take it, waits holding its pages. p, older,
     asks only afterwards, as a request held in an encoder does, and doesn't fit. z runs no step that could run short
     again, so nothing moved it and both waited for good."""
@@ -291,7 +293,8 @@ def test_an_older_request_that_asks_after_a_newer_one_parks_moves_it():
     _running(kv, "z", 6, arrival=3)
     assert _preempt(kv, "z", _short(kv, "z"), droppable=lambda rid: False).waits
     _runner(kv).readmit("z", NODE, queued=False)
-    _request(kv, "p", 5, arrival=2)
+    # either way p asks for 5 pages, a guaranteed p for its prompt page and 4 of decode
+    _request(kv, "p", 1 if guaranteed else 5, arrival=2, guaranteed=guaranteed)
     assert not _ready(kv, "p") and not _admitted(kv, "z")
     _remove(kv, "x")
     w = _worker(kv)
@@ -299,6 +302,27 @@ def test_an_older_request_that_asks_after_a_newer_one_parks_moves_it():
     w._preemption.make_room()
 
     assert kv.is_offloaded("z") and _ready(kv, "p"), "z, newer and waiting, kept the pages p needs"
+
+
+def test_a_request_whose_kept_ids_dont_rebuild_its_kv_waits_rather_than_dropping_itself():
+    """v keeps no ids, so only r could move, and r's kept ids rebuild a token less than its KV holds. Dropping
+    itself, r would fail its own drop in the move."""
+    kv = _pool()
+    _running(kv, "r", 5, arrival=1)
+    _running(kv, "v", 5, arrival=2)
+    reason = _step(kv, "r", 1).reason
+    w = _worker(kv)
+    w._rebuilds._kept[NODE] = {"r": _kept(5 * PAGE_SIZE - 1)}
+    batch = ScheduledBatch(node_name=NODE, graph_walk="decode", request_to_worker_graph={"r": 0})
+    node_batch = SimpleNamespace(
+        node_name=NODE, admit_error=reason, failed_resource="kv", step_context=SimpleNamespace(graph_walk="decode"),
+    )
+
+    Worker._handle_allocation_failure(w, batch, node_batch)
+
+    assert kv.residency("r") is Residency.RESIDENT and _returns(kv) == ["r"], (
+        "r dropped itself with ids short of its KV"
+    )
 
 
 def test_make_room_helps_the_oldest_refused_request_moves_can_let_in():
@@ -444,6 +468,90 @@ def test_preemptions_after_metrics_start_are_reported():
     (snapshot,) = [s for s in metrics.snapshot() if s.name == "mstar_kv_preemptions_total"]
     reported = dict(zip(map(tuple, snapshot.label_values), snapshot.values, strict=True))
     assert reported == {(NODE,): 1}, "the preemption went unreported"
+
+
+@pytest.mark.parametrize("walks, loops", [
+    ({(NODE, "prefill")}, set()), ({(NODE, "prefill"), (NODE, "decode")}, {"decode"}),
+], ids=["prefill worker", "worker that runs every walk"])
+def test_a_pool_reserves_growth_only_for_the_loops_its_worker_runs(walks, loops):
+    kv = _pool()
+    model = SimpleNamespace(kv_labels=lambda: {"kv": {"main": KVLabel(growth=(("decode", "decode"),))}})
+    _worker(kv)._set_kv_writes(model, walks)
+    assert kv.local_loops == loops, "a guaranteed request would reserve growth its worker never runs"
+
+
+def test_a_node_that_writes_none_of_a_requests_labels_leaves_it_preemptible():
+    """Bagel's CFG nodes share the LLM's pool and declare no rebuild policy. A text chat writes only the LLM's
+    main label, in the policy's walks, so placing the CFG nodes on the LLM's rank must not change its class."""
+    kv = _pool()
+    w = _worker(kv)
+    w.engine_manager.engine = SimpleNamespace(
+        paged_kv_caches=lambda: [PagedKVCache("kv", frozenset({NODE, "LLM_cfg_text"}), kv)],
+    )
+    model = SimpleNamespace(kv_labels=lambda: {"kv": {"main": KVLabel(growth=(("decode", "decode"),))}})
+    w._set_kv_writes(model, {(NODE, "prefill"), (NODE, "decode"), ("LLM_cfg_text", "cfg_text")})
+    layout = StreamLayout(spans=(PrefixSpan(4 * PAGE_SIZE, 4 * PAGE_SIZE, "prefill"),), growth=(("decode", 1),))
+    configs = {"kv": KVReqConfig(kv_layout={"main": layout}, loop_caps={"decode": 64})}
+
+    w._set_rebuildable(1, configs)
+
+    assert configs["kv"].rebuildable, "a node that writes nothing for the request made it guaranteed"
+
+
+@pytest.mark.parametrize("unpausable", [False, True])
+def test_the_worker_keeps_ids_only_for_a_request_whose_output_can_pause(unpausable):
+    kv = _pool()
+    w = _worker(kv)
+    model = SimpleNamespace(kv_labels=lambda: {"kv": {"main": KVLabel(growth=(("decode", "decode"),))}})
+    w._set_kv_writes(model, {(NODE, "prefill"), (NODE, "decode")})
+    layout = StreamLayout(spans=(PrefixSpan(4 * PAGE_SIZE, 4 * PAGE_SIZE, "prefill"),), growth=(("decode", 1),))
+    configs = {"kv": KVReqConfig(kv_layout={"main": layout}, loop_caps={"decode": 64}, unpausable=unpausable)}
+
+    w._set_rebuildable(1, configs)
+
+    assert (1 in w._rebuilds._droppable[NODE]) is not unpausable, "the conductor's mark didn't reach the kept ids"
+
+
+@pytest.mark.parametrize("layout", ["two labels", "two spans", "two loops"])
+def test_a_pool_whose_layout_one_rebuild_row_cant_write_again_isnt_rebuildable(layout):
+    """A drop lays the pool's one label out again as one span of the policy's walk. In the two labels case, the
+    second label is written in a walk and a loop this worker doesn't run, so only the pool's own layout refuses
+    the request."""
+    kv = _pool()
+    w = _worker(kv)
+    model = SimpleNamespace(kv_labels=lambda: {"kv": {"main": KVLabel(growth=(("decode", "decode"),))}})
+    w._set_kv_writes(model, {(NODE, "prefill"), (NODE, "decode")})
+    span, growth = PrefixSpan(4 * PAGE_SIZE, 4 * PAGE_SIZE, "prefill"), (("decode", 1),)
+    layouts = {"main": StreamLayout(spans=(span,), growth=growth)}
+    if layout == "two labels":
+        layouts["uncond"] = StreamLayout(spans=(PrefixSpan(4, 4, "cfg_text"),), growth=(("cfg_loop", 1),))
+    elif layout == "two spans":  # as a prompt prefilled over two rows
+        layouts["main"] = StreamLayout(spans=(span, PrefixSpan(4, 4, "prefill")), growth=growth)
+    else:
+        layouts["main"] = StreamLayout(spans=(span,), growth=(*growth, ("other_loop", 1)))
+    configs = {"kv": KVReqConfig(kv_layout=layouts, loop_caps={"decode": 64, "cfg_loop": 4, "other_loop": 4})}
+
+    w._set_rebuildable(1, configs)
+
+    assert not configs["kv"].rebuildable, "a request its rebuild couldn't bring back could be dropped"
+
+
+def test_an_older_request_waits_rather_than_moving_a_newer_guaranteed_one():
+    kv = _pool()
+    _running(kv, "r", 5, arrival=1)
+    _running(kv, "v", 1, arrival=2, guaranteed=True)
+    w = _worker(kv)
+    batch = ScheduledBatch(node_name=NODE, graph_walk="decode", request_to_worker_graph={"r": 0})
+    node_batch = SimpleNamespace(
+        node_name=NODE, admit_error=_step(kv, "r", 1).reason, failed_resource="kv",
+        step_context=SimpleNamespace(graph_walk="decode"),
+    )
+
+    Worker._handle_allocation_failure(w, batch, node_batch)
+
+    assert kv.residency("v") is Residency.RESIDENT and _returns(kv) == ["r"], (
+        "a guaranteed request was dropped for an older page"
+    )
 
 
 def test_requests_short_of_pages_all_finish_and_each_goes_to_the_host_at_most_twice():

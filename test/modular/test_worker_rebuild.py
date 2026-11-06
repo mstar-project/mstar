@@ -10,22 +10,27 @@ discarded sample or count a row it never scheduled.
 from __future__ import annotations
 
 from array import array
+from collections import defaultdict
 from concurrent.futures import Future
 from types import SimpleNamespace
 
 import pytest
 import torch
+from test_kv_preemption import _pool
+from test_kv_prefix_lease import _StubTransfer
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.chunking import ChunkRange
 from mstar.engine.engine import Engine, ExecutingBatch
 from mstar.engine.resources import Residency, StepContext
+from mstar.engine.resources.kv import manager as manager_mod
+from mstar.engine.resources.kv.config import KVReqConfig, PrefixSpan, StreamLayout
 from mstar.model.rebuild import RebuildPolicy
 from mstar.model.submodule_base import BatchedModelOutput
 from mstar.worker.host_pool import HostCopy, HostPool, HostSlice
 from mstar.worker.micro_scheduler import CHAIN_LANE, ScheduledBatch
 from mstar.worker.preemption import Preemption
-from mstar.worker.rebuild import KeptIds, Prefilling, RebuildCursor, Rebuilds
+from mstar.worker.rebuild import KeptIds, NodeWrites, Prefilling, RebuildCursor, Rebuilds
 from mstar.worker.side_steps import SIDE_LANE
 from mstar.worker.stream_buffers import StreamBufferManager
 from mstar.worker.worker import PendingBatch, Speculation, Worker, _make_rebuilds
@@ -68,6 +73,7 @@ def _worker():
     w.tensor_manager = SimpleNamespace(get_tensor=None, get_tensors=None, cleanup_collectable=lambda *a: None)
     w.streams = StreamBufferManager(SimpleNamespace(per_request_info={}), w.tensor_manager, [])  # no streams
     w._rebuilds = Rebuilds({NODE: POLICY}, _graphs(), HostPool(1 << 10, torch.device("cpu")))
+    w._kv_writes = {"kv": {NODE: NodeWrites(frozenset({PREFILL, DECODE}), frozenset({"loop"}))}}
     w._pending_removes, w._pending_drains, w._draining_rids = {}, set(), set()
     # keeps the rows the worker hands it in ``w.seen``, and holds no row, so any routing, stop or loop-count
     # call fails the test
@@ -98,6 +104,45 @@ def _rebuilding(fresh: dict[int, int] | None = None):
     w._rebuilds.start(R, NODE, None)
     batch = ScheduledBatch(NODE, PREFILL, {R: 0, **(fresh or {})}, rebuild_rids=frozenset({R}))
     return w, eng, batch, w._build_executing_batch(batch)
+
+
+def _config(growth=(("loop", 1),), labels=("main",), walk=PREFILL) -> dict[str, KVReqConfig]:
+    layout = StreamLayout(spans=(PrefixSpan(2, 2, walk),), growth=growth)
+    return {"kv": KVReqConfig(kv_layout=dict.fromkeys(labels, layout), loop_caps={loop: 1 for loop, _ in growth})}
+
+
+@pytest.mark.parametrize("talker_walk", [None, "talk", PREFILL], ids=[
+    "own pool", "pool shared with a node that writes nothing for it",
+    "pool shared with a node with no rebuild policy that writes for it",
+])
+def test_a_request_no_rebuild_can_write_again_isnt_rebuildable_in_its_pools(monkeypatch, talker_walk):
+    monkeypatch.setattr(manager_mod, "KVTransferManager", _StubTransfer)
+    w, _ = _worker()
+    if talker_walk is not None:
+        w._kv_writes["kv"]["talker"] = NodeWrites(frozenset({talker_walk}), frozenset())
+    kv, w._unprocessed_messages = _pool(), {}
+    # neither the publish skip nor the streams bear on the class
+    w._skip_unshared_publish, w.streams = lambda rid, workers: None, SimpleNamespace(add_request=lambda rid, info: None)
+    w._graph_runtime.add_request, w._graph_runtime.get_sharding_config = lambda request_id, **kw: int(request_id), id
+    w._reads_done_sent, w.scheduler.note_arrival = set(), lambda rid: None
+    w._graph_runtime.register_stop_limits = lambda rid, info: None
+    w.engine_manager.add_request = lambda rid, configs, info=None: kv.ingest_request(rid, configs["kv"])
+    w.request_state.add_request, w.request_state.per_request_info = lambda rid, info: None, defaultdict(dict)
+    w.tensor_manager.register_request, w.tensor_manager.start_read_tensors = lambda *a: None, lambda *a, **k: []
+    w.wakeup_event = SimpleNamespace(register_futures=lambda futures: None)
+    # 12's KV grows in a loop the node's policy doesn't name, so no rebuild can write it again.
+    # 13's prompt was written in a walk the node's policy doesn't prefill, so it keeps no ids.
+    # 10 lays out nothing, so nothing refuses it.
+    configs = {R: _config(), 12: _config(growth=(("embeds_loop", 1),)), 13: _config(walk="audio"),
+               10: {"kv": KVReqConfig(kv_layout={})}}
+    for rid, config in configs.items():
+        info = SimpleNamespace(partition_name="p", graph_walk=PREFILL, resource_configs=config, stream_lead_items={})
+        w._add_new_request(SimpleNamespace(request_id=str(rid), partition_worker_graph_ids=None, loop_caps={},
+                                           worker_graph_to_workers={}, initial_inputs=[], request_info=info))
+    refused = {rid for rid in configs if not kv._overrides[rid].rebuildable}
+    assert refused == ({R, 12, 13} if talker_walk == PREFILL else {12, 13}), (
+        "a request nothing can drop would count as one a drop frees"
+    )
 
 
 def test_postprocess_appends_kept_samples_and_lands_a_rebuild_row_beside_them():

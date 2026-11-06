@@ -495,7 +495,7 @@ class _EvictingWorker(_HoldingWorker):
             evictable=lambda node, resources=None: True,
             residency=lambda node, rid: Residency.DROPPED if rid in dropped
             else Residency.ON_HOST if rid in self.offloaded else Residency.RESIDENT,
-            reclaimable=lambda node, rid, resources: rid in holders,
+            reclaimable=lambda node, rid, resources: rid in holders, can_offload=lambda node, rid: True,
             offload_request=lambda node, rid, affected_resources=None: self.offloaded.append(rid) or 12,
         )
         # #461's worker keeps one; harmless here
@@ -633,6 +633,16 @@ def test_a_row_inside_the_batch_goes_only_when_none_is_outside_it_under_turns():
 
     assert worker._try_offload_cold_request(SCHED_NODE, SCHED_WALK, {"r0", "r1"}) == "outside"
     assert worker._try_offload_cold_request(SCHED_NODE, SCHED_WALK, {"r0", "r1"}) == "r1"
+
+
+def test_a_request_its_resources_keep_on_the_device_is_no_eviction_candidate():
+    """A KV pool keeps a guaranteed request on the device. Chosen as the victim, its offload moved nothing, and the
+    refused step got no room."""
+    worker = _EvictingWorker(["r0", "r1", "g"], _scheduler(_SchedEngine(order=StepOrder.TURNS)))
+    worker.engine_manager.get_engine(SCHED_NODE).can_offload = lambda node, rid: rid != "g"
+
+    assert worker._try_offload_cold_request(SCHED_NODE, SCHED_WALK, {"r9"}) == "r1", "g was chosen as the victim"
+    assert worker.offloaded == ["r1"]
 
 
 def test_a_step_of_one_walk_lifts_its_combined_walks_limit():

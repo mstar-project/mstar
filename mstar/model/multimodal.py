@@ -25,6 +25,9 @@ from typing import NamedTuple
 import torch
 
 TEXT = "text"
+SUPPORTED_MODALITIES = frozenset({
+    "text", "image", "audio", "video", "video_frame", "action", "scalar", "tensor",
+})
 
 
 @dataclass(frozen=True)

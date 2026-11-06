@@ -56,7 +56,7 @@ from mstar.conductor.workers import accelerator_type, deployment_workers
 from mstar.engine.resources.lora.config import lora_enabled
 from mstar.engine.resources.lora.serving import lora_specs
 from mstar.engine.resources.lora.store import check_adapters
-from mstar.model.multimodal import PromptPart
+from mstar.model.multimodal import SUPPORTED_MODALITIES, PromptPart
 from mstar.model.registry import model_init_kwargs
 from mstar.observability.catalog import STATUS_INTERVAL_S
 from mstar.observability.metrics import (
@@ -80,9 +80,6 @@ from mstar.utils.threads import Thread, pin_thread
 
 logger = logging.getLogger(__name__)
 
-SUPPORTED_MODALITIES = frozenset({
-    "text", "image", "audio", "video", "video_frame", "action", "scalar", "tensor",
-})
 STREAMING_ONLY_MODALITIES = frozenset({"video_frame"})
 
 NDJSON_STREAM_MEDIA_TYPE = "application/x-ndjson"
@@ -805,6 +802,7 @@ class APIServer:
             model_kwargs=model_kwargs,
             prompt_parts=prompt_parts,
             ends=ending,
+            streaming=streaming,
         ))
 
         logger.info(

@@ -7,6 +7,7 @@ import pytest
 pytest.importorskip("torch")
 
 from mstar.engine.resources.runner import StepRunner  # noqa: E402
+from mstar.worker.rebuild import Rebuilds  # noqa: E402
 from mstar.worker.worker import Worker  # noqa: E402
 
 
@@ -47,6 +48,7 @@ def test_the_worker_fails_only_the_request_whose_ingest_raised():
     w._draining_rids = set()
     w._reads_done_sent = set()
     w._unprocessed_messages = {"wire": ["parked"]}
+    w._rebuilds, w._kv_writes = Rebuilds({}, {}), {}
     processed, failed, registered = [], [], []
     w._graph_runtime = SimpleNamespace(
         add_request=lambda **kw: 5, get_sharding_config=lambda rid: None,
@@ -67,7 +69,7 @@ def test_the_worker_fails_only_the_request_whose_ingest_raised():
     body = SimpleNamespace(
         request_id="wire", partition_worker_graph_ids=None, worker_graph_to_workers={}, loop_caps={},
         request_info=SimpleNamespace(
-            partition_name="p", graph_walk="g", resource_configs=None, rid_handle=None,
+            partition_name="p", graph_walk="g", resource_configs={}, rid_handle=None,
         ),
     )
     Worker._add_new_request(w, body)

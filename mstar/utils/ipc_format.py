@@ -315,6 +315,7 @@ class NewRequestConductor(MessageBody):
     # A client stream the opening leaves open: a live call, which is refused
     # rather than queued at max_concurrent_requests.
     input_open: bool = False
+    streaming: bool = False
 
 
 @dataclass

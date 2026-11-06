@@ -172,7 +172,7 @@ def test_remove_purges_handle_keyed_state_then_frees_the_handle():
     w._pending_removes = {}
     w._pending_drains, w._draining_rids, w._reads_done_sent = set(), set(), set()
     w._rebuilds = Rebuilds({}, {})
-    w._rebuilds._kept = {"n": {a: None, b: None}}
+    w._rebuilds._kept, w._rebuilds._droppable = {"n": {a: None, b: None}}, {"n": {a, b}}
     w._rebuilds._cursors[("n", a)] = None
     w._preemption = Preemption(
         SimpleNamespace(engine=SimpleNamespace(paged_kv_caches=list)), w._rebuilds, w.scheduler, w.request_state,
@@ -196,6 +196,7 @@ def test_remove_purges_handle_keyed_state_then_frees_the_handle():
     assert a not in w.streaming_buffers
     assert a not in w.scheduler.held_until
     assert w._rebuilds._kept == {"n": {b: None}}, "the next request would rebuild from these ids"
+    assert w._rebuilds._droppable == {"n": {b}}, "the next request would keep ids it can't be dropped with"
     assert not (w._rebuilds._cursors or w._preemption._preempted), (
         "the next request would run this one's rebuild, or be counted as preempted"
     )
@@ -250,6 +251,7 @@ def test_add_new_request_hands_the_handle_to_every_subsystem():
     w.streams = StreamBufferManager(w.request_state, w.tensor_manager, [])
     w._rebuilds = Rebuilds({}, {})
     w._preemption = SimpleNamespace(preempt=lambda node_batch: False, remove_request=lambda rid: None)
+    w._kv_writes = {}
     w.wakeup_event = SimpleNamespace(register_futures=lambda f: None)
     w._unprocessed_messages = {}
     info = SimpleNamespace(
@@ -293,6 +295,7 @@ def test_add_new_request_keeps_the_stream_buffer_and_primes_it_for_its_consumer(
     w._draining_rids, w._unprocessed_messages = set(), {}
     w._rebuilds = Rebuilds({}, {})
     w._preemption = SimpleNamespace(preempt=lambda node_batch: False, remove_request=lambda rid: None)
+    w._kv_writes = {}
     w.wakeup_event = SimpleNamespace(register_futures=lambda f: None)
     w.streams = StreamBufferManager(w.request_state, w.tensor_manager, [Connection(
         from_partition="Talker", to_partition="Codec", edge_name="codec_tokens",

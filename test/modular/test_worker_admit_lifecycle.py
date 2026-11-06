@@ -105,6 +105,7 @@ def _worker(graphs=((WG_ID, NODE, WALK, "default"),)):
     w._pending_removes = {}
     w._rebuilds = Rebuilds({}, {})
     w._preemption = SimpleNamespace(preempt=lambda node_batch: False, remove_request=lambda rid: None)
+    w._kv_writes = {}
     w.streaming_buffers = {}
     w._unprocessed_messages = {}
     w._removed_rids = RecentSet(16)

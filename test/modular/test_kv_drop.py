@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import sys
 from array import array
+from dataclasses import replace
 from types import SimpleNamespace
 
 sys.path.insert(0, ".")
@@ -112,10 +113,14 @@ def test_a_drop_frees_only_the_pages_the_request_held_alone():
     kv.assert_pages_conserved()
 
 
-@pytest.mark.parametrize("refusal", ["digest", "rows", "step", "read", "ranks", "host", "fewer ids", "more ids"])
+@pytest.mark.parametrize(
+    "refusal", ["step", "read", "ranks", "host", "guaranteed", "not rebuildable", "fewer ids", "more ids"],
+)
 def test_a_refused_drop_changes_nothing(refusal):
     kv = _manager()
-    _prefill(kv, "r", PAGE_SIZE, kind=refusal if refusal in ("digest", "rows") else "ids")
+    _prefill(kv, "r", PAGE_SIZE)
+    kv._guaranteed.update({"r"} if refusal == "guaranteed" else ())
+    kv._overrides["r"].rebuildable = refusal != "not rebuildable"
     assert refusal != "step" or kv.admit(*_step("r", 1)).ok
     kv._streams["r"]["main"].read_pending = refusal == "read"
     kv._world_size = 2 if refusal == "ranks" else kv._world_size
@@ -136,25 +141,6 @@ def test_a_second_drop_before_the_rebuild_lands_is_refused():
     with pytest.raises(RuntimeError):
         kv.drop("r", PAGE_SIZE)
     assert kv._dropped["r"] == held, "a second drop would overwrite what the rebuild has to write again"
-
-
-@pytest.mark.parametrize("layout", ["two labels", "two spans", "two loops"])
-def test_a_drop_is_refused_when_one_row_couldnt_write_the_request_again(layout):
-    kv = _manager()
-    config = _config(list(range(PAGE_SIZE)))
-    spans, growth = config.kv_layout["main"].spans, config.kv_layout["main"].growth
-    if layout == "two labels":
-        config.kv_layout["uncond"] = config.kv_layout["main"]
-    elif layout == "two spans":  # as a prompt prefilled over two rows
-        config.kv_layout["main"] = StreamLayout(spans=(*spans, PrefixSpan(4, 4, WALK)), growth=growth)
-    else:
-        config.kv_layout["main"] = StreamLayout(spans=spans, growth=(*growth, ("other_loop", 1)))
-        config.loop_caps["other_loop"] = 4
-    kv.ingest_request("r", config)
-
-    with pytest.raises(RuntimeError, match="one rebuild row"):
-        kv.drop("r", 0)
-    assert "r" not in kv._dropped, "a request its rebuild couldn't bring back would be dropped"
 
 
 class _Recording:
@@ -214,6 +200,7 @@ def test_a_refusal_by_any_resource_leaves_every_resource_alone():
     rope.ingest_request("r")
     _prefill(kv, "r", PAGE_SIZE)
     _prefill(cross, "r", PAGE_SIZE, kind="rows")
+    cross._guaranteed.add("r")
     rope._counters["r"]["main"] = PAGE_SIZE
 
     with pytest.raises(RuntimeError):
@@ -239,6 +226,25 @@ def test_a_rebuilt_stream_keeps_its_footprint_and_is_keyed_as_a_fresh_prompt():
     assert rebuilt.footprint == footprint, "the rebuild would hold more pages than the request declared"
     assert (rebuilt.chain.keys, rebuilt.chain.unkeyed) == (want.chain.keys, want.chain.unkeyed), (
         "the rebuilt pages would be filed under keys another request with these ids can't match"
+    )
+
+
+def test_a_rebuilt_stream_whose_growth_is_bounded_keeps_its_footprint():
+    """The rebuild's span covers what the loop wrote, so the growth bound drops by that as the loop's cap does.
+    Otherwise the stream would grow by those slots."""
+    kv = _manager()
+    prompt, sampled = list(range(20)), list(range(100, 130))
+    config = _config(prompt, cap=500)
+    config.kv_layout["main"] = replace(config.kv_layout["main"], max_growth=50)
+    kv.ingest_request("r", config)
+    footprint = kv._streams["r"]["main"].footprint
+    _write(kv, "r", len(prompt), *[1] * (len(sampled) - 1))
+    kv.drop("r", len(prompt) + len(sampled) - 1)
+
+    kv.prepare_rebuild("r", Rebuild(WALK, array("i", prompt + sampled)))
+
+    assert kv._streams["r"]["main"].footprint == footprint, (
+        "the rebuild would hold more pages than the request declared"
     )
 
 

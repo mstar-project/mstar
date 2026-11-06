@@ -37,8 +37,8 @@ from mstar.distributed.communication import WorkerParallelGroups
 from mstar.engine import apply_dynamo_config
 from mstar.engine.chunking import ChunkRange
 from mstar.engine.engine import ExecutingBatch
-from mstar.engine.resources import AdmitFailedReason, AllocationFailed, Residency
-from mstar.engine.resources.kv.config import without_layouts
+from mstar.engine.resources import AdmitFailedReason, AllocationFailed, Residency, ResourceReqConfig
+from mstar.engine.resources.kv.config import KVReqConfig, without_layouts
 from mstar.engine.resources.kv.transfer import (
     TransferEngineInfo,
     make_deployment_kv_shm_dir,
@@ -121,7 +121,7 @@ from mstar.worker.micro_scheduler import (
 )
 from mstar.worker.node_manager_utils import RequestStateManager
 from mstar.worker.preemption import Preemption
-from mstar.worker.rebuild import DEFAULT_REBUILD_HOST_MB, Rebuilds, policies_run_here
+from mstar.worker.rebuild import DEFAULT_REBUILD_HOST_MB, Rebuilds, node_writes, policies_run_here
 from mstar.worker.side_steps import SIDE_LANE, SideStepLane
 from mstar.worker.spec_rows import DeferredRowInputs
 from mstar.worker.speculation import (
@@ -793,6 +793,7 @@ class Worker:
             self.engine_manager, self._rebuilds, self.scheduler, self.request_state, self._log_throttled,
             self._rid_str,
         )
+        self._set_kv_writes(model, my_walks)
 
         # Async-scheduling cross-iter state. Initialized here (rather than in
         # run()) because _remove_request — which can be invoked indirectly
@@ -1060,6 +1061,7 @@ class Worker:
             )
         laps.lap("worker_state")
         if first:
+            self._set_rebuildable(request_id, body.request_info.resource_configs)
             try:
                 self.engine_manager.add_request(
                     request_id, body.request_info.resource_configs, body.request_info,
@@ -1239,6 +1241,24 @@ class Worker:
         # Last: frees the handle for reuse, so nothing above may run after it.
         self._graph_runtime.remove_request(request_id)
         laps.lap("runtime")
+
+    def _set_kv_writes(self, model: Model | None, my_walks: set[tuple[str, str]]) -> None:
+        """Record what each node of each paged KV cache writes here, and give each cache the loops that grow it
+        in a walk this worker runs on one of its nodes."""
+        labels = model.kv_labels() if model is not None else {}
+        # key -> node -> its `NodeWrites`
+        self._kv_writes = {}
+        for kv in self.engine_manager.engine.paged_kv_caches():
+            self._kv_writes[kv.key] = node_writes(labels.get(kv.key, {}), kv.nodes, my_walks)
+            kv.cache.local_loops = {loop for writes in self._kv_writes[kv.key].values() for loop in writes.loops}
+
+    def _set_rebuildable(self, request_id: int, configs: dict[str, ResourceReqConfig]) -> None:
+        kv_configs = {key: config for key, config in configs.items() if isinstance(config, KVReqConfig)}
+        layouts = {key: (config.kv_layout or {}).values() for key, config in kv_configs.items()}
+        unpausable = any(config.unpausable for config in kv_configs.values())
+        for key, rebuildable in self._rebuilds.ingest_request(request_id, self._kv_writes, layouts, unpausable).items():
+            if key in configs:
+                configs[key].rebuildable = rebuildable
 
     def _log_throttled(self, logged: dict, key, message: str, *args) -> None:
         """Log ``message`` at most once per `_HOLD_LOG_INTERVAL` for ``key``, with the lines skipped since
@@ -1880,7 +1900,8 @@ class Worker:
         # a request admitted but not yet run holds no pages: offloading it
         # frees nothing and the retry would re-pick it
         candidates = [
-            rid for rid in active if engine.reclaimable(node_name, rid, affected_resources)
+            rid for rid in active
+            if engine.reclaimable(node_name, rid, affected_resources) and engine.can_offload(node_name, rid)
         ]
 
         if not candidates:
