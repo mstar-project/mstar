@@ -927,8 +927,9 @@ The spec types are:
        when the serving YAML has a ``resources: lora:`` block. See `Per-request LoRA
        adapters`_.
 
-Orpheus, which hasn't moved yet, writes four specs for its one autoregressive node. Its
-``snac_decoder`` node appears in no spec, so it receives no resources:
+Orpheus's declarations build four specs for its one autoregressive node, a ``KVSpec``, an
+``AttentionSpec``, a ``PositionSpec`` and a ``SamplerSpec``. Its ``snac_decoder`` node appears
+in no declaration, so it receives no state:
 
 .. code-block:: python
 
@@ -936,36 +937,20 @@ Orpheus, which hasn't moved yet, writes four specs for its one autoregressive no
    KV_CACHE, ATTN, SAMPLER, ROPE = "kv_cache", "attn", "sampler", "rope"
 
    # mstar/model/orpheus/orpheus_model.py
-   def get_node_resources(self) -> list[NodeResourceSpec]:
-       kv_config = PagedKVConfig(
-           num_layers=self.config.num_hidden_layers,
-           num_kv_heads=self.config.num_key_value_heads,
-           head_dim=self.config.head_dim,
-           max_seq_len=self.config.max_position_embeddings,
-           num_qo_heads=self.config.num_attention_heads,
-       )
+   def declare_state(self) -> list[Array | Sampler]:
+       c, scaling = self.config, self.config.rope_scaling
        return [
-           KVSpec(resource_key=KV_CACHE, nodes={"LLM"}, config=kv_config),
-           AttentionSpec(
-               resource_key=ATTN, nodes={"LLM"},
-               config=AttentionConfig(kv_cache=KV_CACHE),
+           Array(
+               KV_CACHE, nodes={"LLM"}, layers=frozenset(range(c.num_hidden_layers)),
+               entry=KVEntry(heads=c.num_key_value_heads, head_dim=c.head_dim), max_len=c.max_position_embeddings,
+               positions=Positions(rope=Rope(
+                   theta=c.rope_theta, scale=scaling["factor"], low_freq_factor=scaling["low_freq_factor"],
+                   high_freq_factor=scaling["high_freq_factor"],
+                   old_context_len=scaling["original_max_position_embeddings"],
+               )),
+               reads={ATTN: Read(mask=Causal(), op=Attend(q_heads=c.num_attention_heads))},
            ),
-           SamplerSpec(
-               resource_key=SAMPLER, nodes={"LLM"},
-               vocab_size=self.config.vocab_size,
-               enable_repetion_penalty=True,
-           ),
-           PositionSpec(
-               resource_key=ROPE, nodes={"LLM"},
-               config=PositionConfig(
-                   kv_cache=KV_CACHE,
-                   rope_theta=self.config.rope_theta,
-                   rope_scale=self.config.rope_scaling["factor"],
-                   low_freq_factor=self.config.rope_scaling["low_freq_factor"],
-                   high_freq_factor=self.config.rope_scaling["high_freq_factor"],
-                   old_context_len=self.config.rope_scaling["original_max_position_embeddings"],
-               ),
-           ),
+           Sampler(SAMPLER, nodes={"LLM"}, vocab_size=c.vocab_size, penalty=True),
        ]
 
 **Which state does a node need?**
@@ -2071,10 +2056,11 @@ signal, sampler, buffer)`` instead reads each row's last sampled token off the s
 the device (``MSTAR_DEVICE_LOOPBACK``): the base class's ``device_loopback_signals`` names
 the signal, so the worker routes it without a tensor and sends the client's copy inline,
 ``prepare_inputs`` returns ``self.uniform_row_inputs(...)`` for such a row, and
-``preprocess`` reads the tokens with ``self.loopback_inputs(engine_inputs, inputs)``. A
-row whose last step did not keep its value on the device (its first decode step, after
-the prefill) still brings it routed, and that read puts it over the slot's. Qwen3.5,
-Higgs Audio, Qwen3-ASR and Whisper declare it. Qwen3.5 reads the tokens with ``last_sampled``.
+``preprocess`` reads the tokens with ``last_sampled``. A row whose last step did not keep its
+value on the device (its first decode step, after the prefill) still brings it routed, and
+``splice_loopback_ids(ids, inputs, decode=True)`` puts it over the slot's. A model that hasn't
+moved reads both with ``self.loopback_inputs(engine_inputs, inputs)``. Qwen3.5, Qwen3-Omni, Higgs
+Audio, Qwen3-ASR and Whisper declare it.
 
 On such a node a captured step writes each row's token and RNG offset back to the request's
 row inside the graph (``knobs: sampler_ingraph_scatter``, on by default). Those rows are
@@ -2901,10 +2887,9 @@ Worked example: Orpheus
 Orpheus (``mstar/model/orpheus/``) is a small and complete reference. It is a TTS model. A
 Llama 3.2 3B LLM emits audio tokens, and a SNAC decoder converts them into 24 kHz PCM.
 
-Orpheus hasn't moved to declarations. The two nodes have different needs. The LLM declares
-the four standard resources, shown under `Resource specs`_. No spec names ``snac_decoder``,
-so that node receives no resources. The SNAC decoder instead declares how it must be run,
-using two class attributes on the submodule:
+The two nodes have different needs. The LLM declares a paged array and a sampler, shown under
+`Resource specs`_. No declaration names ``snac_decoder``, so that node receives no state. The
+SNAC decoder instead declares how it must be run, using two class attributes on the submodule:
 
 .. code-block:: python
 
@@ -2925,7 +2910,8 @@ There are three graph walks: ``prefill`` and a ``decode`` ``Loop`` on the LLM, p
    )
 
 ``process_prompt`` formats the string ``"{voice}: {text}"``, tokenizes it, wraps the ids in
-the model's start and end tokens, and returns ``{"text_inputs": [ids]}``.
+the model's start and end tokens, and returns ``{"text_inputs": [ids]}``, with its layout under
+``state_layout``.
 ``get_submodule`` builds either the Llama LLM submodule, which is an ``ARNodeSubmodule``,
 or the SNAC decoder submodule, and caches the result. ``postprocess`` returns the raw
 bytes of the audio tensor for the ``audio`` modality.
