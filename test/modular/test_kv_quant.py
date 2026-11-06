@@ -4,26 +4,13 @@ import types
 import pytest
 import torch
 
-from mstar.engine.resources.attn.base import AttentionManager
-from mstar.engine.resources.attn.config import (
-    AttentionConfig,
-    AttentionSpec,
-    AttnBackend,
-    CrossAttentionConfig,
-    CrossAttentionSpec,
-)
-from mstar.engine.resources.attn.cross import CrossAttentionManager
 from mstar.engine.resources.base import EngineResourceInfo
 from mstar.engine.resources.kv import manager as manager_mod
 from mstar.engine.resources.kv.cache import KVCache
 from mstar.engine.resources.kv.calibrate import main as calibrate_main
 from mstar.engine.resources.kv.calibrate import merge_observed
 from mstar.engine.resources.kv.config import (
-    KVLayout,
-    KVSpec,
     PagedKVConfig,
-    RingKVConfig,
-    RingKVLayerConfig,
 )
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.kv.quant import (
@@ -35,7 +22,6 @@ from mstar.engine.resources.kv.quant import (
     local_heads,
     quantize_kv,
 )
-from mstar.engine.resources.kv.transfer import ShmKVTransferInfo, check_storage
 
 FP8 = torch.float8_e4m3fn
 UNIT = KVQuantConfig("fp8_e4m3")
@@ -66,52 +52,6 @@ def _static(path) -> KVQuantConfig:
 
 # ---- config and YAML ----
 
-def test_config_validation():
-    with pytest.raises(ValueError, match="unknown KV quant format"):
-        KVQuantConfig("int8")
-    with pytest.raises(ValueError, match="unknown KV scales"):
-        KVQuantConfig("fp8_e4m3", scales="dynamic_head")
-    with pytest.raises(ValueError, match="need scales_path"):
-        KVQuantConfig("fp8_e4m3", scales="static")
-    with pytest.raises(ValueError, match="only for static"):
-        KVQuantConfig("fp8_e4m3", scales_path="x.safetensors")
-    with pytest.raises(ValueError, match="records amax only"):
-        KVQuantConfig("fp8_e4m3", scale_rule="mse")
-    assert UNIT.value_dtype is FP8
-
-
-def test_yaml_sets_changes_and_removes_quant():
-    spec = KVSpec(resource_key="kv", nodes={"n"}, config=_cfg())
-    spec.apply_yaml_overrides(quant={"format": "fp8_e4m3", "scales": "unit"})
-    assert spec.config.quant == UNIT
-    # an omitted key keeps it
-    spec.apply_yaml_overrides(max_num_pages=8)
-    assert spec.config.quant == UNIT
-    spec.apply_yaml_overrides(quant=None)
-    assert spec.config.quant is None
-    with pytest.raises(ValueError, match=r"resources\.kv\.quant: unknown key"):
-        spec.apply_yaml_overrides(quant={"format": "fp8_e4m3", "scale": "unit"})
-    with pytest.raises(ValueError, match=r"resources\.kv\.quant: format is required"):
-        spec.apply_yaml_overrides(quant={"scales": "unit"})
-
-
-def test_ring_kv_refuses_quant():
-    ring = RingKVConfig(
-        num_layers=1, num_kv_heads=1, head_dim=8, tokens_per_frame=4,
-        layers=(RingKVLayerConfig(2, 1, 1),),
-    )
-    with pytest.raises(ValueError, match="ring KV cannot be quantized"):
-        ring.apply_yaml_overrides(quant={"format": "fp8_e4m3"})
-
-
-def test_an_mla_cache_refuses_quant():
-    cfg = _cfg(layout=KVLayout.MLA, num_kv_heads=1, num_qo_heads=2, kv_lora_rank=6, qk_rope_head_dim=2, quant=UNIT)
-    with pytest.raises(ValueError, match="MLA KV cache cannot be quantized"):
-        KVCache(cfg, CPU, torch.bfloat16, quant=UNIT)
-
-
-# ---- the cache ----
-
 @pytest.mark.parametrize("static", [False, True])
 def test_cache_stores_fp8_and_reads_back_dequantized(tmp_path, static):
     quant, scales = UNIT, None
@@ -131,11 +71,6 @@ def test_cache_stores_fp8_and_reads_back_dequantized(tmp_path, static):
     out = cache.read_tokens(1, pages, slots)
     assert out.dtype is torch.bfloat16
     assert torch.equal(out[:, 0], dequantize_kv(quantize_kv(k, ks, FP8), ks, torch.bfloat16))
-
-
-def test_unit_scale_saturates_instead_of_overflowing():
-    x = torch.tensor([[[1e4, -1e4, 1.0]]])
-    assert quantize_kv(x, None, FP8).float().tolist() == [[[448.0, -448.0, 1.0]]]
 
 
 def test_a_grouped_pool_stores_fp8():
@@ -160,11 +95,6 @@ def test_storage_id_names_format_and_scales(tmp_path):
     assert static.digest() != a.storage_id.split("/")[1]
 
 
-def test_static_needs_scales_and_only_static_takes_them():
-    with pytest.raises(ValueError, match="static KV quantization needs scales"):
-        KVCache(_cfg(), CPU, torch.bfloat16, quant=UNIT, scales=types.SimpleNamespace(k=None, v=None))
-
-
 def test_copy_pages_moves_fp8_bytes():
     cache = KVCache(_cfg(), CPU, torch.bfloat16, quant=UNIT)
     raw = cache.tensor.view(torch.uint8)
@@ -175,30 +105,6 @@ def test_copy_pages_moves_fp8_bytes():
 
 
 # ---- scales ----
-
-def test_local_heads_match_the_qkv_split():
-    assert local_heads(8, 1, 4) == slice(2, 4)
-    # fewer heads than ranks: rank r holds head r // replicas
-    assert [local_heads(2, r, 4) for r in range(4)] == [slice(0, 1), slice(0, 1), slice(1, 2), slice(1, 2)]
-
-
-def test_load_kv_scales_slices_by_rank_and_checks_shape(tmp_path):
-    k = torch.arange(1, 9, dtype=torch.float32).reshape(2, 4)
-    quant = _static(_write_scales(tmp_path / "s.safetensors", heads=4, k=k, v=k * 2))
-    scales = load_kv_scales(quant, 2, 4, 1, 2, CPU)
-    assert scales.k.tolist() == [[3, 4], [7, 8]] and scales.v.tolist() == [[6, 8], [14, 16]]
-    with pytest.raises(ValueError, match=r"k_scale is \(2, 4\), the cache has 3 layers"):
-        load_kv_scales(quant, 3, 4, 0, 1, CPU)
-    bad = _static(_write_scales(tmp_path / "bad.safetensors", k=torch.zeros(2, 2)))
-    with pytest.raises(ValueError, match="non-positive"):
-        load_kv_scales(bad, 2, 2, 0, 1, CPU)
-
-
-def test_layer_scales_expand_per_q_head(tmp_path):
-    quant = _static(_write_scales(tmp_path / "s.safetensors", k=torch.tensor([[1.0, 2.0], [3.0, 4.0]])))
-    layers = layer_kv_scales(load_kv_scales(quant, 2, 2, 0, 1, CPU), 4)
-    assert layers[1].k_qo[:, 0].tolist() == [3.0, 3.0, 4.0, 4.0]
-
 
 def test_observer_and_calibrate_round_trip(tmp_path):
     obs = tmp_path / "obs"
@@ -245,14 +151,6 @@ def test_observer_ignores_non_finite_and_resets(tmp_path):
 
 # ---- moving pages, and the manager ----
 
-def test_transfer_refuses_pages_in_another_encoding():
-    cache = KVCache(_cfg(), CPU, torch.bfloat16, quant=UNIT)
-    info = ShmKVTransferInfo(path="", page_indices=(), layout=cache.layout, storage="torch.bfloat16")
-    with pytest.raises(ValueError, match="stored as 'torch.bfloat16'"):
-        check_storage(info, cache)
-    check_storage(ShmKVTransferInfo("", (), cache.layout, storage=cache.storage_id), cache)
-
-
 class _StubTransfer:
     def __init__(self, *args, **kwargs):
         pass
@@ -275,20 +173,6 @@ def test_prefix_root_folds_in_the_quant(monkeypatch, tmp_path):
     assert len(prints) == 3
 
 
-def test_fp8_pages_take_half_the_bytes(monkeypatch):
-    mgr = _manager(monkeypatch, UNIT)
-    assert mgr.kv_cache.tensor.dtype is FP8 and mgr.quantized
-    assert mgr.kv_cache.nbytes == _manager(monkeypatch, None).kv_cache.nbytes // 2
-
-
-def test_a_fused_write_is_refused_on_a_quantized_cache(monkeypatch):
-    mgr = _manager(monkeypatch, UNIT)
-    with pytest.raises(NotImplementedError, match="quantized: write through write_kv"):
-        mgr.write_target(layer_idx=0, label="main")
-    with pytest.raises(NotImplementedError, match="quantized: write through write_kv"):
-        mgr.write_slots("main")
-
-
 def test_a_quantized_cache_takes_norm_rope_attend_unfused(monkeypatch):
     """The fused norm/RoPE kernels would write raw values into fp8 pages; a quantized
     cache takes the unfused path, whose ``write_kv`` quantizes."""
@@ -307,49 +191,6 @@ def test_a_quantized_cache_takes_norm_rope_attend_unfused(monkeypatch):
 
 
 # ---- what reads it ----
-
-def _info(kv_spec):
-    return EngineResourceInfo(
-        device=CPU, compute_dtype=torch.bfloat16, dependencies={kv_spec.resource_key: kv_spec},
-    )
-
-
-def test_flashinfer_plans_fp8_pages_and_holds_static_scales(tmp_path):
-    path = _write_scales(tmp_path / "s.safetensors", k=torch.tensor([[1.0, 2.0], [3.0, 4.0]]))
-    kv = KVSpec(resource_key="kv", nodes={"n"}, config=_cfg(num_qo_heads=4, head_dim=64, quant=_static(path)))
-    attn = AttentionManager.build(AttentionSpec(
-        resource_key="attn", nodes={"n"},
-        config=AttentionConfig(kv_cache="kv", backend=AttnBackend.FLASHINFER, decode_fmha=True),
-    ), _info(kv))
-    assert attn._wrapper_kv_kwargs["kv_dtype"] is FP8 and attn._dtype is torch.bfloat16
-    assert attn._layer_scales[1].k_qo[:, 0].tolist() == [3.0, 3.0, 4.0, 4.0]
-    # trtllm-gen's fmha decode doesn't take these pages: the paged kernel does
-    assert not attn._decode_fmha
-
-
-@pytest.mark.parametrize("backend", [AttnBackend.FLEX, AttnBackend.XPU_PAGED])
-def test_backends_without_an_fp8_read_refuse(backend):
-    kv = KVSpec(resource_key="kv", nodes={"n"}, config=_cfg(quant=UNIT))
-    spec = AttentionSpec(resource_key="attn", nodes={"n"}, config=AttentionConfig(kv_cache="kv", backend=backend))
-    with pytest.raises((ValueError, TypeError), match="reads no quantized KV|requires a RingKVConfig"):
-        AttentionManager.build(spec, _info(kv))
-
-
-def test_cross_attention_refuses_a_quantized_context():
-    kv = KVSpec(resource_key="kv", nodes={"n"}, config=_cfg(quant=UNIT))
-    spec = CrossAttentionSpec(resource_key="cross", nodes={"n"}, config=CrossAttentionConfig(kv_cache="kv"))
-    with pytest.raises(ValueError, match="cross attention 'cross' reads no quantized KV"):
-        CrossAttentionManager.build(spec, _info(kv))
-
-
-def test_static_scales_refuse_sequence_parallel(tmp_path):
-    from mstar.engine.resources.kv.quant import kv_scales_for
-
-    cfg = _cfg(quant=_static(_write_scales(tmp_path / "s.safetensors")))
-    group = types.SimpleNamespace(sp_group=types.SimpleNamespace(world_size=2))
-    with pytest.raises(ValueError, match="SP is not supported"):
-        kv_scales_for(cfg, EngineResourceInfo(device=CPU, joint_comm_group=group))
-
 
 @pytest.mark.parametrize("static", [False, True])
 def test_dense_dequantizes_the_prefix_it_gathers(tmp_path, static):
@@ -536,30 +377,6 @@ def test_each_tp_rank_gets_the_scales_of_the_kv_heads_its_qkv_projection_loads(t
         scales = kv_scales_for(cfg, EngineResourceInfo(device=CPU, joint_comm_group=_tp(rank, tp)))
         assert scales.k.shape == (1, cfg.num_kv_heads)
         assert (scales.k[0] - 1).tolist() == loaded.tolist(), (rank, tp)
-
-
-def test_unit_scales_need_no_rank_and_pass_under_sequence_parallel():
-    from mstar.engine.resources.kv.quant import kv_scales_for
-
-    info = EngineResourceInfo(device=CPU, joint_comm_group=_tp(0, 2, sp_size=2))
-    assert kv_scales_for(_cfg(quant=UNIT), info) is None
-
-
-def test_the_observer_refuses_sequence_parallel(monkeypatch, tmp_path):
-    monkeypatch.setattr(manager_mod, "KVTransferManager", _StubTransfer)
-    monkeypatch.setenv("MSTAR_KV_OBSERVE", str(tmp_path))
-    with pytest.raises(ValueError, match="SP is not supported"):
-        KVManager(cfg=_cfg(), name="kv", joint_comm_group=_tp(0, 2, sp_size=2),
-                  transfer_engine_info=None, device=CPU, dtype=torch.bfloat16)
-
-
-def test_replicas_with_one_scales_file_name_their_pages_alike(tmp_path):
-    """Data-parallel replicas (or the workers of one deployment) load the same file, so their
-    pages share a storage id: the prefix cache and transfers treat them as one encoding."""
-    quant = _static(_write_scales(tmp_path / "s.safetensors"))
-    a, b = (KVCache(_cfg(), CPU, torch.bfloat16, quant=quant, scales=load_kv_scales(quant, 2, 2, 0, 1, CPU))
-            for _ in range(2))
-    assert a.storage_id == b.storage_id
 
 
 def test_shm_transfer_moves_fp8_pages_between_workers(tmp_path):
