@@ -1632,7 +1632,7 @@ def test_tensor_parallel_ranks_meet_at_each_collective():
 
 
 @pytest.mark.parametrize("case", ["mismatch", "graph_vs_eager", "bucket", "extra_replay", "skip", "fused_skip",
-                                  "send_size", "recv_skip", "held"])
+                                  "send_size", "recv_skip", "held", "held_debug"])
 def test_ranks_whose_collectives_dont_pair_abort(case):
     """A rank whose collective doesn't pair with its peer's (a barrier against an all-reduce,
     a graph replayed against eager calls or against one that captured another size) aborts
@@ -1640,7 +1640,7 @@ def test_ranks_whose_collectives_dont_pair_abort(case):
     all-reduce on its own channel) aborts at the group's timeout, as NCCL's watchdog does, or
     hangs in a replay. So for point to point: a receive of another size, whose rank has both
     descriptors, and a receive with no sender. A tensor gloo's worker never lets go of aborts at
-    the timeout too."""
+    the timeout too, with torch's debug wrapper around the backend or not."""
     out = run_sim(f"""
         import datetime, os, tempfile, time, torch, torch.distributed as dist, torch.multiprocessing as mp
 
@@ -1649,6 +1649,9 @@ def test_ranks_whose_collectives_dont_pair_abort(case):
             dist.init_process_group("nccl", init_method=f"file://{{path}}", rank=r, world_size=2)
             # short for the collectives only: a rank that starts late on a loaded box still joins
             dist.distributed_c10d._set_pg_timeout(datetime.timedelta(seconds=5), dist.group.WORLD)
+            if "{case}" == "held_debug":  # torch's setter doesn't see through its wrapper
+                gloo = dist.group.WORLD._get_backend(torch.device("cpu")).wrapped_pg
+                gloo._set_default_timeout(datetime.timedelta(seconds=5))
             torch.cuda.set_device(r)
             x = torch.empty(1 << 14, device="cuda")
             if "{case}" == "fused_skip":
@@ -1660,7 +1663,7 @@ def test_ranks_whose_collectives_dont_pair_abort(case):
                 dist.recv(x, src=0) if r else dist.send(x[:8] * 2, dst=1)
             elif "{case}" == "recv_skip":
                 dist.recv(x, src=1) if r == 0 else time.sleep(7)
-            elif "{case}" == "held":  # autograd holds it, as a gloo that kept its work would
+            elif "{case}" in ("held", "held_debug"):  # autograd holds it, as a gloo that kept its work would
                 from mstar_sim.dist import _let_go, _waiting
                 held = torch.ones(1, requires_grad=True) * 2
                 kept = held * held
@@ -1701,8 +1704,8 @@ def test_ranks_whose_collectives_dont_pair_abort(case):
             print("exits", [p.exitcode for p in ctx.processes], flush=True)
             for p in ctx.processes:
                 p.kill()
-    """)
-    if case in ("skip", "fused_skip", "recv_skip", "held"):
+    """, **({"TORCH_DISTRIBUTED_DEBUG": "DETAIL"} if case == "held_debug" else {}))
+    if case in ("skip", "fused_skip", "recv_skip", "held", "held_debug"):
         assert "exits [-6, 0]" in out, out
     elif case == "send_size":
         assert "exits [0, -6]" in out and "numel=16384" in out and "numel=8" in out, out

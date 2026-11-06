@@ -129,9 +129,10 @@ def _watched(wait, where: str, mine: list[int], replay: bool = False) -> None:
 
 def _timeout(group) -> datetime.timedelta:
     """``group``'s timeout now: mstar's ``restore_default_timeout`` shortens it after load. A
-    fused all-reduce's channel is a gloo backend of its own."""
+    fused all-reduce's channel is a gloo backend of its own, and ``TORCH_DISTRIBUTED_DEBUG=DETAIL``
+    wraps a group's in a backend with no options."""
     backend = group if isinstance(group, dist.ProcessGroupGloo) else group._get_backend(torch.device("cpu"))
-    return backend.options._timeout
+    return getattr(backend, "wrapped_pg", backend).options._timeout
 
 
 def _let_go(group, *tensors: torch.Tensor) -> None:
@@ -141,8 +142,9 @@ def _let_go(group, *tensors: torch.Tensor) -> None:
     process that is exiting, Python ends the thread there, inside gloo's C++, which aborts the
     process. A worker that still holds them at the group's timeout aborts, as a wait does there:
     the host's real time, as gloo's own timeout is, where the clock stands still in a wait."""
-    deadline = clock._real() + _timeout(group).total_seconds()
+    deadline = None
     while any(t._use_count() > 1 for t in tensors):
+        deadline = deadline or clock._real() + _timeout(group).total_seconds()
         if clock._real() > deadline:
             print(f"mstar_sim: rank {dist.get_rank()}: gloo's worker still holds a finished collective's tensors"
                   f" at the group's timeout ({_timeout(group)}): this torch's gloo keeps its work past the wait.",
