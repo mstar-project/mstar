@@ -14,6 +14,8 @@ class StreamReservation:
     chunk_index: int
     bound: int
     predecessor_bound: int
+    # Empty tail inputs already executed when this snapshot began.
+    tail_offset: int = 0
 
 
 @dataclass
@@ -102,6 +104,8 @@ class StreamBuffer:
     _tensor_ids_in_order: deque = field(default_factory=deque)
     _id_to_tensor: dict = field(default_factory=dict)
     _consumed: int = 0
+    # Actual empty-tail reads, distinct from producer items acknowledged.
+    _tail_consumed: int = 0
     _chunks_popped: int = 0
     # Submitted readers may overlap; only settlement advances the source.
     _reservations: dict[StreamReservation, int] = field(default_factory=dict)
@@ -408,7 +412,7 @@ class StreamBuffer:
             return None
         if ready and self.walk_tagged and self.peek_walk() != consumer_walk:
             return None
-        reservation = StreamReservation(self._chunks_popped, bound, predecessor)
+        reservation = StreamReservation(self._chunks_popped, bound, predecessor, self._tail_consumed)
         self._chunks_popped += 1
         self._reservations[reservation] = bound
         items = self._buffer[:min(ready, predecessor + bound)]
@@ -455,6 +459,7 @@ class StreamBuffer:
         self._buffer = self._buffer[consumed:]
         origin = self._consumed
         self._consumed += consumed
+        self._tail_consumed += executed - consumed
         for i in range(executed):
             self.policy.register_chunk(int(i < consumed))
         if self._walk_runs and consumed:

@@ -431,3 +431,25 @@ def test_run_reservations_refuse_policies_that_do_not_stay_one_item(policy):
         buf.reserve_window(4, "decode")
     assert buf._consumed == policy.items_consumed == 0
     assert not buf._reservations
+
+
+def test_only_executed_tail_reservations_spend_pad_rows_even_at_width_one():
+    buf = StreamBuffer(RID, EDGE, "LLM", FixedChunkPolicy(1, continue_after_done=True))
+    buf.put_positions([0, 1])
+    buf.signal_done(2)
+    first = buf.reserve_window(4)
+    successor = buf.reserve_window(4)
+    assert first.reservation.tail_offset == successor.reservation.tail_offset == 0
+    buf.settle_window(first.reservation, 3)  # two real items, then the first tail input
+    assert successor.reservation.tail_offset == 0, "a submitted snapshot must not change"
+    buf.settle_window(successor.reservation, 2)
+    one = buf.reserve_window(1)
+    assert one.num_items == 0 and one.reservation.tail_offset == 3
+    buf.cancel_window(one.reservation)
+    skipped = buf.reserve_window(1)
+    buf.settle_window(skipped.reservation, 0)
+    retry = buf.reserve_window(1)
+    assert retry.reservation.tail_offset == 3, "a refused or skipped input spends no pad row"
+    buf.settle_window(retry.reservation, 1)
+    assert buf._tail_consumed == 4
+    assert buf._consumed == buf.policy.items_consumed == 2
