@@ -3390,3 +3390,12 @@ def test_a_walk_with_a_capture_key_that_cant_be_resident_is_refused_at_load_not_
     assert why is not None and why.startswith("its capture keyed True:") and "sink" in why
     runner.keyed_template_steps = lambda walk: {False: step(False)}
     assert engine._keyed_resident_refusal(mgmt, runner, WALK, step(False)) is None
+
+
+@pytest.mark.parametrize("repeat_reason", [None, "resource refuses repeats"])
+def test_requested_device_execution_refuses_unsupported_walk_at_load(repeat_reason):
+    repeats = _repeats(4)
+    repeats._configs["n"] = RepeatConfig(max=4, device_stop="skip")
+    with pytest.raises(ValueError, match="n/decode.*device_stop.*no conditional graph"):
+        repeats.settle(lambda *key: None, lambda *key: repeat_reason,
+                       {"device stop": lambda *key: "backend: no conditional graph"})

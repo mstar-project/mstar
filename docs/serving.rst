@@ -359,7 +359,9 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        writes to the trash slot until the run ends, so its KV and recurrent state stay where
        its stop left them; it needs a resident walk. Both need a token stop, one rank, CUDA
        12.4 and up, ``libcudadevrt.a`` under ``CUDA_HOME``, a capture of kernels and
-       copies alone, and a node without iteration inputs (not Qwen3-TTS's Talker or a DiT). ``stream_tokens: true`` sends a run's tokens to the client as its replays
+       copies alone, and a node without iteration inputs (not Qwen3-TTS's Talker or a DiT).
+       An explicitly requested device stop that cannot run fails startup with its refusal
+       reason; it never silently becomes a host-launched run. ``stream_tokens: true`` sends a run's tokens to the client as its replays
        finish rather than when it ends, where its landing rides inline. ``ready_waits: true``
        makes ready rows wait for one run: after a step that took rows the next takes none and
        runs at full length, and ready work doesn't end a run early. A new row's first token

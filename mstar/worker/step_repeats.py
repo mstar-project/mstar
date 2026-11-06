@@ -288,6 +288,8 @@ class StepRepeats:
             ]
             for name, refusal in others.items():
                 why = refusal(*key)
+                if name == "device stop" and self.config(key[0]).device_stop != "off" and why is not None:
+                    raise ValueError(f"{key[0]}/{key[1]}: requested device_stop cannot run: {why}")
                 parts.append(f"{name} {'on' if why is None else f'off: {why}'}")
             logger.info("%s/%s: %s", *key, " | ".join(parts))
 
