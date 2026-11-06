@@ -431,6 +431,7 @@ def test_managed_server_lifecycle(fake_cmd):
 @pytest.mark.parametrize("sig, end, inherited_ignored, status", [
     ("SIGTERM", "pass", False, 128 + 15),
     ("SIGTERM", "raise SystemExit(0)", False, 128 + 15),
+    ("SIGTERM", "raise ValueError", False, 128 + 15),    # what a raise inside `with wave.open` turns into
     ("SIGINT", "pass", True, -2),                        # a background launch: SIGINT is still ours
 ])
 def test_a_signal_held_by_an_import_sets_the_exit_status_of_a_block_that_ends_first(
@@ -448,38 +449,34 @@ def test_a_signal_held_by_an_import_sets_the_exit_status_of_a_block_that_ends_fi
 
 def test_a_signal_during_stop_does_not_cut_the_teardown_short(tmp_path):
     import signal
-    import threading
 
     from benchmark.eval.server import ManagedServer, _exit_on_signal
 
     ready = tmp_path / "ready"
-    srv = ManagedServer("stubborn", command=[sys.executable, "-c", "import signal, time; "
-                                             "signal.signal(signal.SIGINT, signal.SIG_IGN); "
-                                             f"open({str(ready)!r}, 'w').close(); time.sleep(60)"])
+    srv = ManagedServer("stubborn", command=[
+        sys.executable, "-c", "import os, signal, time; "   # answers stop()'s SIGINT with a SIGTERM to the runner
+        "signal.signal(signal.SIGINT, lambda *_: os.kill(os.getppid(), signal.SIGTERM)); "
+        f"open({str(ready)!r}, 'w').close(); time.sleep(60)"])
     srv.start()
     pid = srv.pid
     deadline = time.monotonic() + 20
     while not ready.exists() and time.monotonic() < deadline:
         time.sleep(0.05)
     old = signal.signal(signal.SIGTERM, _exit_on_signal)
-    timer = threading.Timer(0.2, os.kill, (os.getpid(), signal.SIGTERM))   # while stop() waits out SIGINT
     try:
-        timer.start()
         with pytest.raises(SystemExit):
             srv.stop(grace_s=2.0)
     finally:
-        timer.cancel()
-        timer.join()
         signal.signal(signal.SIGTERM, old)
     with pytest.raises(ProcessLookupError):
         os.kill(pid, 0)
 
 
-# A torch that sends the runner a SIGTERM (or SIGINT) inside its import (the real import runs Python from C++, where the
-# SystemExit aborts the process, and import-lock weakref callbacks, which drop it), or in a finalizer after the
-# import (which drops it too).
+# A torch that signals the runner where the exception can't go: inside its import (the real import runs Python from
+# C++, where the SystemExit aborts the process, and import-lock weakref callbacks, which drop it), in a finalizer
+# after the import, in aiohttp's parser (which swallows it), or in scoring, which must not hold a signal back.
 SIGNALLING_TORCH = """
-import os, signal
+import os, signal, time
 class _Signal:
     def __del__(self):
         os.kill(os.getpid(), signal.SIGTERM)
@@ -490,37 +487,58 @@ class _Version:
         {finalizer}_Signal()
         return None
 __version__, version = "0.0", _Version()
+import benchmark.eval.server as s
+s.HOLD_LIMIT_S = 120   # so a held signal can't end the run by the bound, only by being raised where it can
+{stuck}s.HOLD_LIMIT_S = 0.2
 {import_}os.kill(os.getpid(), signal.{sig})
+{stuck}time.sleep(60)
+{parser}import aiohttp.streams as a
+{parser}feed_data = a.StreamReader.feed_data
+{parser}def signal_once(*args):
+{parser}    a.StreamReader.feed_data = feed_data
+{parser}    os.kill(os.getpid(), signal.SIGTERM)
+{parser}    sum(range(1000))
+{parser}    return feed_data(*args)
+{parser}a.StreamReader.feed_data = signal_once
+{scoring}import benchmark.eval.suites.tts as t
+{scoring}def blocked_score(*args):
+{scoring}    os.kill(os.getpid(), signal.SIGTERM)
+{scoring}    time.sleep(60)
+{scoring}t.TTSSuite.score = blocked_score
 open(__file__ + ".imported", "w").close()
 """
+IN_FLIGHT, IN_IMPORT, FINALIZER = "request in flight", "inside an import", "in a finalizer"
+STUCK, IN_PARSER, SCORING = "inside an import that never returns", "inside aiohttp's response parser", "in scoring"
 
 
-@pytest.mark.parametrize("where, sig", [("request in flight", "SIGTERM"), ("inside an import", "SIGTERM"),
-                                       ("inside an import", "SIGINT"), ("in a finalizer", "SIGTERM")])
+@pytest.mark.parametrize("where, sig", [(IN_FLIGHT, "SIGTERM"), (IN_IMPORT, "SIGTERM"), (IN_IMPORT, "SIGINT"),
+                                       (FINALIZER, "SIGTERM"), (STUCK, "SIGTERM"), (IN_PARSER, "SIGTERM"),
+                                       (SCORING, "SIGTERM")])
 def test_sigterm_to_the_runner_stops_the_managed_server(tmp_path, fake_cmd, where, sig):
     pidfile, env = tmp_path / "server.pid", dict(os.environ)
-    (tmp_path / "s.txt").write_text("SLOW one two\n" if where == "request in flight" else "one two\n")
-    if where != "request in flight":
-        (tmp_path / "site" / "torch").mkdir(parents=True)
-        (tmp_path / "site" / "torch" / "__init__.py").write_text(SIGNALLING_TORCH.format(
-            import_="" if where == "inside an import" else "# ", finalizer="" if where == "in a finalizer" else "# ",
-            sig=sig))
-        (tmp_path / "site" / "torch-0.0.dist-info").mkdir()
-        (tmp_path / "site" / "torch-0.0.dist-info" / "METADATA").write_text("Name: torch\nVersion: 0.0\n")
-        env["PYTHONPATH"] = os.pathsep.join([str(tmp_path / "site"), env.get("PYTHONPATH", "")])
+    # A slow request keeps the run going, so a held signal can only end it by being tried again.
+    (tmp_path / "s.txt").write_text("one two\n" if where == SCORING else "SLOW one two\nSLOW three four\n")
+    (tmp_path / "site" / "torch").mkdir(parents=True)
+    (tmp_path / "site" / "torch" / "__init__.py").write_text(SIGNALLING_TORCH.format(
+        import_="" if where in (IN_IMPORT, STUCK) else "# ", finalizer="" if where == FINALIZER else "# ",
+        stuck="" if where == STUCK else "# ", parser="" if where == IN_PARSER else "# ",
+        scoring="" if where == SCORING else "# ", sig=sig))
+    (tmp_path / "site" / "torch-0.0.dist-info").mkdir()
+    (tmp_path / "site" / "torch-0.0.dist-info" / "METADATA").write_text("Name: torch\nVersion: 0.0\n")
+    env["PYTHONPATH"] = os.pathsep.join([str(tmp_path / "site"), env.get("PYTHONPATH", "")])
     runner = subprocess.Popen(
         [sys.executable, "-m", "benchmark.eval", "run", "tts", "--serve-cmd", f"{fake_cmd} {pidfile}",
          "--data", str(tmp_path / "s.txt"), "--repeats", "1", "--warmup", "0", "--asr-judge", "none",
          "--out", str(tmp_path / "out")],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env,
     )
-    if where == "request in flight":
+    if where == IN_FLIGHT:
         deadline = time.monotonic() + 30
         while not os.path.exists(f"{pidfile}.slow") and time.monotonic() < deadline:
             time.sleep(0.05)
         runner.terminate()
     assert runner.wait(timeout=30) == (-2 if sig == "SIGINT" else 128 + 15)   # an unhandled Ctrl-C dies by SIGINT
-    if where == "inside an import":
+    if where == IN_IMPORT:
         assert (tmp_path / "site" / "torch" / "__init__.py.imported").exists()  # the import was not cut short
     pid = int(pidfile.read_text())
     deadline = time.monotonic() + 10
