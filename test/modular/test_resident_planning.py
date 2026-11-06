@@ -986,7 +986,13 @@ def test_a_narrowed_run_says_which_resource_did_it(monkeypatch):
     assert [settle(8), settle(8)] == [1, 1]
     assert len(logged) == 2
     assert samples[f"repeats.narrowed.{WALK}.cross_kv#"] == [5, 5, 1, 1]
-    assert settle(1) == 1 and len(samples[f"repeats.narrowed.{WALK}.cross_kv#"]) == 4, "nothing was asked"
+    # each resource is named with what it allowed, not the step's settled count (review-r7 G6)
+    answers["cross_kv"], answers["sampler"] = 5, 1
+    assert settle(8) == 1
+    assert samples[f"repeats.narrowed.{WALK}.cross_kv#"][-1] == 5
+    assert samples[f"repeats.narrowed.{WALK}.sampler#"] == [1]
+    assert logged[-1][-2:] == (1, 8) and "sampler" in logged[-1]
+    assert settle(1) == 1 and len(samples[f"repeats.narrowed.{WALK}.cross_kv#"]) == 5, "nothing was asked"
     samples.clear()
 
 

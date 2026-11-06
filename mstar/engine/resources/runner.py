@@ -584,17 +584,22 @@ class StepRunner:
         ctx.repeats = max(1, min([asked, *allowed.values()]))
         for key, most in allowed.items():
             if most < asked:
-                self._note_narrowed(ctx.graph_walk, key, asked, ctx.repeats)
+                self._note_narrowed(ctx.graph_walk, key, asked, most)
 
-    def _note_narrowed(self, walk: str, key: str, asked: int, settled: int) -> None:
+    def _note_narrowed(self, walk: str, key: str, asked: int, most: int) -> None:
         """The walk's line says "repeats on" from load, so what holds its steps
-        back shows here: counted per step, logged once, and once more at 1."""
-        phase_record(f"repeats.narrowed.{walk}.{key}#", settled)
-        note = (walk, key, settled == 1)
+        back shows here: what each resource allowed, counted per step, logged
+        once, and once more at 1. A step names no node, so the line lists the
+        nodes that declare the resource."""
+        phase_record(f"repeats.narrowed.{walk}.{key}#", most)
+        note = (walk, key, most <= 1)
         if note not in self._narrowed:
             self._narrowed.add(note)
             nodes = [node for node, keys in (self._node_order or {}).items() if key in keys]
-            logger.info("%s/%s: %s narrowed a step from %d iterations to %d", nodes, walk, key, asked, settled)
+            logger.info(
+                "walk %s (nodes declaring %s: %s): %s allowed a step %d of %d iterations",
+                walk, key, nodes, key, max(most, 1), asked,
+            )
 
     def rewind_run(self, step: SubmoduleStep | None, replays: int) -> None:
         """A run landed ``replays`` iterations short: each resource takes them
