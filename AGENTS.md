@@ -193,7 +193,7 @@ ruff check .                          # CI enforces this
 env -u MSTAR_SHM_ARENA CUDA_VISIBLE_DEVICES="" HF_HUB_OFFLINE=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 \
     python -m pytest test/modular test/distributed test/chatterbox test/kokoro \
     test/omnivoice test/sampling_test mstar/model/*/tests benchmark/worker_phases \
-    -q -p xdist -n 8 --dist worksteal --timeout=120 --basetemp=/tmp/s_cpu
+    -q -p xdist -n 8 --dist worksteal --timeout=120 --basetemp=$(mktemp -d /tmp/s_XXXX)
 pytest test/integration/              # needs GPU + weights
 cd rust && cargo test --release --no-default-features --features python && pytest ../test/rust/
 ```
@@ -227,7 +227,7 @@ When rebasing onto a `main` that moved, check each resolution for hunks that kep
 
 The Rust extension under `rust/` is a build artifact, so it goes stale after merging or rebasing onto a `main` that changed `rust/`; so does `mstar-server` (`rust/server/`, behind `--rust-frontend`). In a checkout, a stale extension is refused wherever a graph runtime or tensor store is built (`require_rust_extension`), and `find_server_binary` skips a stale `mstar-server` (one named by `MSTAR_SERVER_BIN` or `--rust-frontend-bin` only gets a warning), so a stale build stops the server at startup and fails the tests that need it. Run the rebuild command the refusal prints as given: its `touch` is what makes cargo rebuild sources copied in with old mtimes (`git archive | tar x`, `rsync -a`, `cp -p`). Code that calls `mstar_rust` directly is not checked; there a stale build still imports fine and fails at call time, often as an unexpected-keyword `TypeError`.
 
-Unix-socket paths are limited to about 107 characters, so a long `--basetemp` or `TMPDIR` makes the ZMQ-based Rust tests fail with `File name too long`, which reads like a real failure. Use a short `--basetemp`.
+Unix-socket paths are limited to about 107 characters, so a long `--basetemp` or `TMPDIR` makes the ZMQ-based Rust tests fail with `File name too long`, which reads like a real failure. Use a short `--basetemp`, and a different one per run: pytest empties an existing `--basetemp` at startup, which fails any run already using it.
 
 ## Splitting work across PRs
 
