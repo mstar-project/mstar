@@ -17,6 +17,7 @@ import torch
 
 sys.path.insert(0, ".")
 
+from mstar.distributed.communication import CommGroup  # noqa: E402
 from mstar.engine.resources import resident as resident_mod  # noqa: E402
 from mstar.engine.resources.attn.config import AttentionConfig, AttentionSpec  # noqa: E402
 from mstar.engine.resources.base import CGSlotKey, Resource  # noqa: E402
@@ -34,6 +35,7 @@ from mstar.engine.resources.recurrent.config import (  # noqa: E402
 )
 from mstar.engine.resources.recurrent.pool import SINK_SLOT, RecurrentStatePool  # noqa: E402
 from mstar.engine.resources.resident import TRASH_SLOT, ResidentPlanner, build_planner  # noqa: E402
+from mstar.engine.resources.sequence_shard import SeqShardStep, SequenceShard  # noqa: E402
 from mstar.engine.resources.spec import resolve_spec_dependencies  # noqa: E402
 from mstar.engine.resources.step import (  # noqa: E402
     AllocationFailed,
@@ -1699,6 +1701,25 @@ def test_no_capture_of_the_walks_no_planner():
 def test_a_resource_without_a_table_refuses():
     planner, why = _build({"other": _Spare()})
     assert planner is None and "_Spare keeps no resident table" in why
+
+
+def test_a_shard_that_cant_split_leaves_the_node_resident_and_one_that_can_refuses():
+    """Qwen3.5 declares its shard at every SP size, so one that can't split must not cost the node its
+    resident decode: its steps replay on the tables and plan copied. On SP ranks it refuses."""
+    res = _resources()
+    res["shard"] = SequenceShard(("main",), 0, None, 0, CommGroup.trivial())
+    planner, why = _build({k: res[k] for k in ("kv", "pool", "rope", "shard")})
+    assert planner is not None and why == ""
+    _ingest(res, 1)
+    _host_step(res, [1], [3])
+    s = _captured_step(res, planner, [1], 0, 2)
+    assert s.positions[0] == 3
+    assert not res["shard"].plan(SeqShardStep(segments=s.kv.segments), s.ctx).split
+    ranks = SimpleNamespace(world_size=2)
+    planner, why = _build({"shard": SequenceShard(("main",), 0, None, 0, ranks)})
+    assert planner is None and "may split over 2 SP ranks" in why
+    # DCP alone: copied, and the placed pool beside it is what refuses
+    assert _build({"shard": SequenceShard(("main",), 0, None, 0, ranks, splits=False)})[0] is not None
 
 
 def test_a_pool_shared_by_nodes_refuses():
