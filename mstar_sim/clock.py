@@ -16,6 +16,7 @@ own fused kernels) one kernel of its own cost.
 
 from __future__ import annotations
 
+import bisect
 import contextlib
 import functools
 import inspect
@@ -55,11 +56,30 @@ class Timeline:
         return self.free_at
 
 
+class CopyEngine:
+    """A GPU's copy engine, one each way over its one PCIe link: copies each way take turns on it,
+    whatever their stream, each for its own span (not while it waits behind its stream's work),
+    and overlap compute on other streams."""
+
+    def __init__(self):
+        self.busy: list[tuple[float, float]] = []  # the spans copies hold it, in order
+
+    def take(self, ready: float, seconds: float) -> float:
+        """A copy ready at ``ready`` takes the engine's first gap of ``seconds`` from then: its start."""
+        t = now()
+        self.busy = [span for span in self.busy if span[1] > t]
+        start = ready
+        for begin, end in self.busy:
+            if begin >= start + seconds:
+                break
+            start = max(start, end)
+        bisect.insort(self.busy, (start, start + seconds))
+        return start
+
+
 _LOCK = threading.Lock()
 DEFAULT = Timeline("default")
-# a GPU's copy engines, one each way over its one PCIe link: copies each way queue on it, whatever
-# their stream, and overlap compute on other streams
-ENGINES = {"h2d": Timeline("h2d"), "d2h": Timeline("d2h")}
+ENGINES = {"h2d": CopyEngine(), "d2h": CopyEngine()}
 STATS = {"replays": 0, "calls": 0, "emulator_s": 0.0, "run_delay_s": 0.0, "blocked_s": 0.0, "jumped_s": 0.0,
          "device_waited_s": 0.0, "thread_time_faster": 0}
 
@@ -295,11 +315,11 @@ def in_kernel() -> bool:
     return getattr(_tls, "in_kernel", 0) > 0
 
 
-def charge(seconds: float, launched: float | None = None, kernels: int = 1, engine: Timeline | None = None) -> float:
+def charge(seconds: float, launched: float | None = None, kernels: int = 1, engine: CopyEngine | None = None) -> float:
     """Queue ``kernels`` kernels whose bodies take ``seconds`` of device time in all, launched
     at host time ``launched`` (now by default), on the current stream: each adds the GPU's
     eager launch gap. Returns their end. ``engine``: a copy engine (:data:`ENGINES`) it also
-    needs, so it waits for what is on that too. While capturing, they go on the tape instead (a
+    needs, so it waits for a gap on that too. While capturing, they go on the tape instead (a
     replay adds its own gaps)."""
     recording = getattr(_tls, "recording", None)
     if recording is not None:
@@ -316,12 +336,10 @@ def charge(seconds: float, launched: float | None = None, kernels: int = 1, engi
 
     with _LOCK:
         timeline = current_timeline()
+        seconds = (seconds + kernels * cost.launch_seconds()) * TIME_SCALE
         if engine is not None:
-            timeline.free_at = max(timeline.free_at, engine.free_at)
-        end = timeline.launch((seconds + kernels * cost.launch_seconds()) * TIME_SCALE, launched, kernels)
-        if engine is not None:
-            engine.free_at = end
-        return end
+            launched = engine.take(max(now() if launched is None else launched, timeline.free_at), seconds)
+        return timeline.launch(seconds, launched, kernels)
 
 
 @contextmanager

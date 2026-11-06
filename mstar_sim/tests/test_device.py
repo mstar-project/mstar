@@ -1464,7 +1464,7 @@ def test_a_copy_from_pageable_memory_blocks_the_host_and_is_slower_than_from_pin
         assert pinned[8:].is_pinned() and not pageable.clone().is_pinned()
         for source in (pinned, pageable):
             torch.cuda.synchronize()
-            busy, t0 = clock.ENGINES["h2d"].free_at, time.perf_counter()
+            t0 = time.perf_counter()
             source.to("cuda", non_blocking=True)
             print(time.perf_counter() - t0, clock.DEFAULT.free_at - t0)
     """, MSTAR_SIM_TIME_SCALE=time_scale)
@@ -1542,9 +1542,19 @@ def test_concurrent_copies_share_a_copy_engine_and_overlap_compute():
             start = clock.now()
             host.copy_(out, non_blocking=True)
         print((streams[2].timeline.free_at - start) / one)
+        # a copy holds its engine for its own span: one queued behind compute on its stream leaves
+        # the engine to a copy on an idle stream meanwhile
+        torch.cuda.synchronize()
+        start = clock.now()
+        with torch.cuda.stream(streams[0]):
+            clock.charge(10 * one)
+            host.copy_(out, non_blocking=True)
+        with torch.cuda.stream(streams[1]):
+            host.copy_(out, non_blocking=True)
+        print((streams[1].timeline.free_at - start) / one)
     """)
-    (both, compute), (d2h,) = (map(float, line.split()) for line in out.splitlines())
-    assert 1.95 < both < 2.1 and compute < 1.1 and d2h < 1.1, out
+    (both, compute), (d2h,), (beside,) = (map(float, line.split()) for line in out.splitlines())
+    assert 1.95 < both < 2.1 and compute < 1.1 and d2h < 1.1 and beside < 1.1, out
 
 
 def test_a_cached_call_answers_as_the_call_would():
