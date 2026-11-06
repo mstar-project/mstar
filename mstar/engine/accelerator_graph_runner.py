@@ -1344,11 +1344,11 @@ class AcceleratorGraphRunner:
     def yield_runs(self) -> None:
         """Ask the node's runs in flight to end: the one running at its next iteration,
         the one staged behind it before its first if it asks more than one. A slot
-        that hasn't staged clears its word."""
+        staged later is unaffected."""
         for bucket in self._buckets.values():
             for slot in bucket.slots:
                 if slot.run is not None:
-                    slot.run.state.yield_word[0] = 1
+                    slot.run.state.request_yield()
 
     def run_refusal(self, walk: str) -> str | None:
         """After capture: why ``walk``'s captures don't run on the device, or None."""

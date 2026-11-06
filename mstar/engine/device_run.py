@@ -38,7 +38,8 @@ extern "C" __device__ __cudart_builtin__ void cudaGraphSetConditional(cudaGraphC
 extern "C" __global__ void run_stop(
     const long long* tokens, int stride, int rows, const long long* stop_ids, int num_ids,
     const unsigned char* immune, unsigned char* marks, long long* index, const long long* limit,
-    const long long* refill, const volatile int* yield_word, const unsigned long long* handle,
+    const long long* refill, const long long* generation, const volatile long long* yield_until,
+    const unsigned long long* handle,
     long long* host_tokens, volatile int* landed, int host_width
 ) {
     int done = 0;
@@ -58,14 +59,15 @@ extern "C" __global__ void run_stop(
         __threadfence_system();
         *landed = (int)next;
     }
-    bool go = done < rows && next < *limit && *yield_word == 0 && (*refill == 0 || done < *refill);
+    bool go = done < rows && next < *limit && *generation > *yield_until && (*refill == 0 || done < *refill);
     cudaGraphSetConditional(*handle, go ? 1u : 0u);
 }
 
 extern "C" __global__ void run_start(
-    const long long* limit, const volatile int* yield_word, const unsigned long long* handle, volatile int* started
+    const long long* limit, const long long* generation, const volatile long long* yield_until,
+    const unsigned long long* handle, volatile int* started
 ) {
-    bool skip = *limit > 1 && *yield_word != 0;
+    bool skip = *limit > 1 && *generation <= *yield_until;
     cudaGraphSetConditional(*handle, skip ? 0u : 1u);
     *started = skip ? RUN_SKIPPED : RUN_RAN;
     __threadfence_system();
@@ -164,10 +166,14 @@ class RunState:
         self._immune_stager = PinnedStager(torch.bool, numel=bs)
         self.marks = torch.zeros(bs, dtype=torch.bool, device=device)
         self.replays = torch.zeros(bs, dtype=torch.long, device=device)
-        # set by the host to end the run; its own, since the step behind stages while this one runs
-        self.yield_word = torch.zeros(1, dtype=torch.int32, pin_memory=torch.accelerator.is_available())
+        # Each stage publishes its identity on the execution stream, behind
+        # any previous launch using this state. The host cutoff never clears:
+        # staging a successor cannot erase a yield the current launch reads.
+        self._generation = 0
+        self.generation = torch.zeros(1, dtype=torch.long, device=device)
+        self.yield_until = torch.zeros(1, dtype=torch.long, pin_memory=torch.accelerator.is_available())
         # how the run began (``RUN_RAN``, ``RUN_SKIPPED``): a run staged for more than one
-        # iteration with its word set runs none, so the work that set it goes next
+        # iteration and covered by the yield cutoff runs none, letting ready work go next
         self.started = torch.zeros(1, dtype=torch.int32, pin_memory=torch.accelerator.is_available())
         self.stop_ids = torch.tensor(sorted(stop_ids), dtype=torch.long, device=device)
         self._rows = torch.arange(bs, device=device)
@@ -175,8 +181,9 @@ class RunState:
 
     def stage(self, real: int, immune: Sequence[bool], limit: int, refill_at: float | None = None) -> None:
         """Before a run, on the host. A staged value keeps its address: the graph reads it."""
+        self._generation += 1
+        self.generation.fill_(self._generation)
         self.index.zero_()
-        self.yield_word.zero_()
         self.started.zero_()
         key = (real, tuple(immune), limit, refill_at)
         if key != self._staged:
@@ -186,6 +193,11 @@ class RunState:
             self.refill.fill_(0 if refill_at is None else pad + max(1, int(refill_at * real + 0.999999)))
             self._immune_stager.copy_(self.immune, immune, pad_value=False)
         torch.ge(self._rows, real, out=self.marks)
+
+    def request_yield(self) -> None:
+        """End every launch already staged on this state; later stages are
+        independent. The host generation increment is the cutoff boundary."""
+        self.yield_until[0] = self._generation
 
     def head(self) -> None:
         """Before a replay's forward: a stopped row reads and writes the trash slot."""
@@ -277,7 +289,8 @@ class CudaWhile:
             ctypes.c_void_p(state.stop_ids.data_ptr()), ctypes.c_int(len(state.stop_ids)),
             ctypes.c_void_p(state.immune.data_ptr()), ctypes.c_void_p(state.marks.data_ptr()),
             ctypes.c_void_p(state.index.data_ptr()), ctypes.c_void_p(state.limit.data_ptr()),
-            ctypes.c_void_p(state.refill.data_ptr()), ctypes.c_void_p(state.yield_word.data_ptr()),
+            ctypes.c_void_p(state.refill.data_ptr()), ctypes.c_void_p(state.generation.data_ptr()),
+            ctypes.c_void_p(state.yield_until.data_ptr()),
             ctypes.c_void_p(handle.data_ptr()),
             ctypes.c_void_p(state.stream.tokens.data_ptr() if state.stream else None),
             ctypes.c_void_p(state.stream.landed.data_ptr() if state.stream else None),
@@ -307,7 +320,8 @@ class CudaWhile:
         """``run_start``, the node ahead of the WHILE: it can clear the condition
         the launch set, so the body doesn't run at all."""
         values = [
-            ctypes.c_void_p(state.limit.data_ptr()), ctypes.c_void_p(state.yield_word.data_ptr()),
+            ctypes.c_void_p(state.limit.data_ptr()), ctypes.c_void_p(state.generation.data_ptr()),
+            ctypes.c_void_p(state.yield_until.data_ptr()),
             ctypes.c_void_p(handle.data_ptr()), ctypes.c_void_p(state.started.data_ptr()),
         ]
         args = (ctypes.c_void_p * len(values))(*(ctypes.cast(ctypes.byref(v), ctypes.c_void_p) for v in values))

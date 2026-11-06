@@ -367,10 +367,9 @@ class RepeatingSteps:
         """``step``'s run on the device ends at its next iteration, not at its count."""
         if step.node_batch.step_context.repeats > 1 and not self._step_repeats.config(step.node_name).ready_waits:
             self.engine_manager.get_engine(step.node_name).yield_runs(step.node_name)
-            step.yield_asked = True
 
     def _landed_skipped(self, step: PendingBatch) -> bool:
-        """Whether ``step``'s run began with its yield set and ran nothing, landed
+        """Whether ``step``'s run began covered by a yield and ran nothing, landed
         here: asked before anything is speculated from it, since its outputs are
         no outputs. The step before it has landed, so ``run_start`` is due at once.
         Nothing moved on the device, so what admit counted goes back and the rows
@@ -432,13 +431,6 @@ class RepeatingSteps:
             rows.update(spec_pending.batch.request_to_worker_graph)
         self._hold_rows(CHAIN_LANE, rows)
         engine = self.engine_manager.get_engine(batch_N.node_name)
-        if (
-            batch_N.yield_asked and spec_pending is not None
-            and spec_pending.node_batch.step_context.slot_lease == batch_N.node_batch.step_context.slot_lease
-        ):
-            # a bucket's slot holds one run state: N+1 staged N's, clearing the yield asked
-            # for N. One word serves both, so this cuts N+1 too.
-            engine.yield_runs(batch_N.node_name)
         has_ready = self.scheduler.has_ready_excluding
         state, chain = self.request_state, (batch_N.node_name, batch_N.graph_walk)
         waiting = has_ready(state, None)

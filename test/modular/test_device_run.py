@@ -18,7 +18,7 @@ from mstar.engine.device_run import (
     RunState,
     TokenStream,
 )
-from mstar.engine.resources.step import BucketKey, SlotLease
+from mstar.engine.resources.step import BucketKey
 from mstar.model.submodule_base import BatchedModelOutput, CarryPair
 
 CPU = torch.device("cpu")
@@ -49,7 +49,8 @@ class _Loop:
         state.index += 1
         done = int(state.marks.sum())
         self.go = (
-            done < len(state.marks) and int(state.index) < int(state.limit) and int(state.yield_word[0]) == 0
+            done < len(state.marks) and int(state.index) < int(state.limit)
+            and int(state.generation[0]) > int(state.yield_until[0])
             and (int(state.refill) == 0 or done < int(state.refill))
         )
 
@@ -63,7 +64,7 @@ class _Loop:
     def launch(self, graph_exec, stream):
         """``run_start``, then the WHILE."""
         state = self.state
-        skip = int(state.limit) > 1 and int(state.yield_word[0]) != 0
+        skip = int(state.limit) > 1 and int(state.generation[0]) <= int(state.yield_until[0])
         state.started[0] = RUN_SKIPPED if skip else RUN_RAN
         if skip:
             return
@@ -163,7 +164,7 @@ def test_the_hosts_yield_word_ends_a_run_and_its_row_goes_on_in_the_next(monkeyp
     assert static["h"].tolist() == [3, 3]
     loop.on_iteration = lambda i: None
     stops, _, _ = _run(run, 2, 2)
-    assert stops[RUN_REPLAYS].tolist() == [2, 2], "the next run clears the word"
+    assert stops[RUN_REPLAYS].tolist() == [2, 2], "the next launch is newer than the yield"
     assert static["h"].tolist() == [5, 5]
 
 
@@ -174,24 +175,66 @@ def test_a_run_staged_with_its_word_set_runs_nothing_unless_it_is_one_iteration(
     rows, or the first after a skip, so skips can't follow each other."""
     runner, run, _, calls = _runner(monkeypatch, _Loop(), [[1, 1]])
     run.state.stage(2, [False, False], limit)
-    run.state.yield_word[0] = 1
+    run.state.request_yield()
     run.launch()
     stops, _, _ = run.results(limit)
     assert len(calls) == ran and int(run.state.started[0]) == begun
     assert stops[RUN_REPLAYS].tolist() == [ran, ran]
 
 
-def test_a_yield_outlives_the_stage_of_the_step_behind_the_run():
-    """N+1 stages while N still runs, so a yield asked before that has to be N's own."""
-    running, behind = (RunState(2, "new_token", {EOS}, CPU) for _ in range(2))
-    runner = AcceleratorGraphRunner.__new__(AcceleratorGraphRunner)
-    slots = [SimpleNamespace(run=SimpleNamespace(state=state)) for state in (running, behind)]
-    runner._buckets = {"bucket": SimpleNamespace(slots=[*slots, SimpleNamespace(run=None)])}
-    runner.yield_runs()
-    behind.stage(2, [False, False], 4)
-    assert int(running.yield_word[0]) == 1 and int(behind.yield_word[0]) == 0
-    runner.yield_runs()
-    assert int(behind.yield_word[0]) == 1, "a yield asked once it has staged ends it too"
+@pytest.mark.parametrize("yield_after_stage", [False, True])
+def test_a_yield_names_only_already_staged_runs_on_a_shared_state(monkeypatch, yield_after_stage):
+    """N is live while N+1 stages on the same state. A yield before N+1's
+    stage must survive for N without cancelling the new row merged into N+1;
+    a yield after that stage skips N+1 too. Later identical stages run again."""
+    from torch.utils._python_dispatch import TorchDispatchMode
+
+    loop = _Loop()
+    runner, run, _, calls = _runner(monkeypatch, loop, [[1, 1]])
+    state = run.state
+    queued = []
+    # CPU stand-in for the device execution stream: stage's device writes
+    # wait behind N, while its host writes happen immediately.
+    device_words = [
+        t for t in vars(state).values()
+        if isinstance(t, torch.Tensor) and t is not state.yield_until and t is not state.started
+    ]
+    pointers = {t.untyped_storage().data_ptr() for t in device_words}
+
+    class QueueDeviceWrites(TorchDispatchMode):
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            kwargs = kwargs or {}
+            target = kwargs.get("out", args[0] if args else None)
+            if (func._schema.is_mutable and isinstance(target, torch.Tensor)
+                    and target.untyped_storage().data_ptr() in pointers):
+                queued.append((func, args, kwargs))
+                return target
+            return func(*args, **kwargs)
+
+    def stage_successor(i):
+        if i != 0:
+            return
+        if not yield_after_stage:
+            runner.yield_runs()
+        with QueueDeviceWrites():
+            state.stage(2, [False, False], 4)
+        if yield_after_stage:
+            runner.yield_runs()
+
+    loop.on_iteration = stage_successor
+    _run(run, 1, 4)
+    assert len(calls) == 1, "staging the successor must not erase the live run's yield"
+    loop.on_iteration = lambda i: None
+    for func, args, kwargs in queued:
+        func(*args, **kwargs)
+    calls.clear()
+    run.launch()
+    assert len(calls) == (0 if yield_after_stage else 4)
+    assert int(state.started[0]) == (RUN_SKIPPED if yield_after_stage else RUN_RAN)
+    assert not state.marks.any(), "the successor includes its newly admitted row"
+    calls.clear()
+    _run(run, 2, 4)  # identical configuration, but a new launch
+    assert len(calls) == 4, "a later launch must not inherit an earlier yield"
 
 
 def test_refill_at_ends_a_run_once_that_share_of_its_rows_is_done(monkeypatch):
@@ -616,7 +659,7 @@ def test_a_run_that_ends_short_repeats_its_last_iteration_in_the_columns_it_neve
     reads a column's last (the step speculated meanwhile, a node's postprocess)
     reads the last iteration that ran, not a column nothing wrote (GPU finding
     14, review-r2 F2)."""
-    from mstar.engine.device_run import RUN_REPLAYS, DeviceRun, RunState
+    from mstar.engine.device_run import RUN_REPLAYS, DeviceRun
 
     state = RunState(1, "t", {9}, CPU)
     run = DeviceRun(state, {}, lambda: None, 4, torch.zeros(1, dtype=torch.long))
@@ -699,33 +742,12 @@ def _waiting_on_a_run(monkeypatch, ready):
     return worker, log
 
 
-def _run_step(rows, looks, yield_asked=False, **node_batch):
+def _run_step(rows, looks, **node_batch):
     landed = iter([False] * looks + [True])
     return SimpleNamespace(
         node_name="n", graph_walk=WALK, batch=SimpleNamespace(request_to_worker_graph=dict.fromkeys(rows)),
         node_batch=SimpleNamespace(completion_event=SimpleNamespace(query=lambda: next(landed)), **node_batch),
-        yield_asked=yield_asked,
     )
-
-
-@pytest.mark.parametrize("behind_on, asks", [
-    (SlotLease(0, BucketKey(WALK, 2, 2)), 1),
-    (SlotLease(1, BucketKey(WALK, 2, 2)), 0),
-    (SlotLease(0, BucketKey(WALK, 4, 4)), 0),
-])
-def test_a_yield_asked_for_a_run_survives_the_step_behind_on_its_run_state(monkeypatch, behind_on, asks):
-    """A run state is a bucket's slot's. N+1 on N's clears the yield the speculation asked
-    for N; on another each keeps its own word, and asking again would only cut N+1
-    (review-r7 G3)."""
-    worker, log = _waiting_on_a_run(monkeypatch, [set()])
-    worker._hold_rows = lambda lane, rows: None
-    behind = _run_step(
-        [2], 0, step_context=SimpleNamespace(slot_lease=behind_on),
-        launch_started_event=SimpleNamespace(is_set=lambda: True),
-    )
-    running = SimpleNamespace(slot_lease=SlotLease(0, BucketKey(WALK, 2, 2)))
-    worker._await_run(_run_step([1], 1, yield_asked=True, step_context=running, token_stream=None), behind, [], None)
-    assert log.count("yield") == asks
 
 
 @pytest.mark.parametrize("peek, yields", [(True, 1), (False, 0)])
@@ -806,7 +828,7 @@ def test_a_row_ready_with_nothing_landing_is_still_seen(monkeypatch):
     ([{CHAIN}], 0),
     # that row hides nothing else, and other work needs no room in the step
     ([{CHAIN}, {CHAIN}, {CHAIN, OTHER}], 1),
-    # N+1's stage used to clear this one's yield; a row ready since the speculation gets its ask here
+    # A row ready since speculation gets its yield here, after N+1 stages
     ([{OTHER}], 1),
 ])
 def test_rows_ready_as_a_run_waits_end_it_unless_its_walk_had_rows_waiting(monkeypatch, ready, yields):

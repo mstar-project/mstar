@@ -476,7 +476,7 @@ def _run_waits_on(w, pending):
     w.scheduler = SimpleNamespace(has_ready_excluding=lambda state, key: False)
     w.request_state = None
     run = SimpleNamespace(
-        node_name=NODE, graph_walk=WALK, yield_asked=False, batch=SimpleNamespace(request_to_worker_graph={}),
+        node_name=NODE, graph_walk=WALK, batch=SimpleNamespace(request_to_worker_graph={}),
         node_batch=SimpleNamespace(token_stream=None, completion_event=SimpleNamespace(query=lambda: True)),
     )
     w._await_run(run, pending, [], None)
