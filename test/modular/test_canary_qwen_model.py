@@ -215,7 +215,7 @@ def test_prompt_ids():
     def ids(**kwargs):
         out = model.process_prompt(generic, ["audio", "text"], ["text"], tensors=tensors, **kwargs)
         # the prompt holds the clip's frames, so it's laid out as rows (never keyed for prefix reuse)
-        span, = out.metadata["kv_layout"]["kv_cache"]["main"].spans
+        span, = out.metadata["state_layout"]["kv_cache"]["main"].spans
         assert span.kind == "rows" and span.length == len(out.new_input_tensors["text_inputs"][0])
         return out.new_input_tensors["text_inputs"][0]
 
