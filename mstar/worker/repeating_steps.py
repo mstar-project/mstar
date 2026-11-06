@@ -396,11 +396,12 @@ class RepeatingSteps:
         doesn't nest in N's. A row can't join a run, so it ends the run, and N+1
         behind it, at the next iteration, as the speculation's own yield does:
         for other work at once; for a row of the run's walk, as a prefill on a
-        lane readies one when it lands, once it turns ready here with none of
-        that walk waiting, since rows of it ready already are ones the step had
-        no room for. Whether N+1 has room for the new row isn't asked: one that
-        doesn't fit costs the two runs' rest once, and the next wait sees it
-        waiting."""
+        lane readies one when it lands, once it turns ready here with nothing
+        waiting, since rows of its walk ready already are ones the step had no
+        room for. With the fairness peek on, other work never sits through a
+        wait, so that nothing is of its walk. Whether N+1 has room for the new
+        row isn't asked: one that doesn't fit costs the two runs' rest once, and
+        the next wait sees it waiting."""
         rows = set(batch_N.batch.request_to_worker_graph)
         if spec_pending is not None:
             # the loop's admit fence, for what follows: N+1's launch needs nothing of N's postprocess
@@ -422,7 +423,9 @@ class RepeatingSteps:
 
         def end_for_ready_rows() -> None:
             nonlocal yielded
-            # other work: only where the chain yields to it (``MSTAR_SPEC_PEEK_FOR_FAIRNESS``)
+            # Work ready already follows the chain's peek (``MSTAR_SPEC_PEEK_FOR_FAIRNESS``). With it
+            # off, the first row to turn ready on an idle wait still ends the run, of any walk,
+            # and a row of this walk waits while other work does.
             if not yielded and (
                 (self._spec_peek and has_ready(state, chain)) or (not waiting and has_ready(state, None))
             ):
