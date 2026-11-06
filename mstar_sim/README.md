@@ -176,6 +176,10 @@ the roofline.
   mstar's compiled paths aren't exercised. A test that calls `torch._dynamo.explain` itself
   traces, but CPU torch's Dynamo can't see the emulated GPU, which the plugin reports as a gap.
 - Nothing checks numerics: a port's wrong math (a transposed weight, a bad mask) still serves.
+- A daemon thread inside a torch call as the process exits aborts it ("terminate called without an
+  active exception"), on plain torch too: Python ends the thread through torch's C++ frames. Here
+  that includes the thread behind an unwaited `irecv` (mstar sends no point-to-point). One parked
+  in Python exits cleanly.
 - The FlashInfer stand-in sizes the CUDA-core decode kernel's grid without its register count
   (a fact of the compiled kernel, which varies with the box's nvcc), so a mixed wrapper's decode
   workspace can come out larger than a GPU's, never smaller. A decode kernel past 48 KiB of shared

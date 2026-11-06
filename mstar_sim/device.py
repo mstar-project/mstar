@@ -1400,7 +1400,9 @@ def install() -> None:
     bootstrap = threading.Thread._bootstrap_inner
 
     def bootstrap_inner(self):
-        with SimMode():  # left while the thread can still run Python: past that, the mode stack's
-            bootstrap(self)  # thread-local teardown needs the GIL, which an exiting process won't give
+        # a mode still on the thread's C++ stack is released by its thread-local teardown, which takes
+        # the GIL: as the process exits, Python ends the thread there, in a noexcept frame, which aborts
+        with SimMode():
+            bootstrap(self)
 
     threading.Thread._bootstrap_inner = bootstrap_inner
