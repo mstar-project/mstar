@@ -92,7 +92,14 @@ class LinearAttnSpec(NodeResourceSpec):
         pool = specs[self.config.recurrent_state].config
         name = f"linear attention {self.resource_key!r}"
         if self.config.variant is LinearAttnVariant.KDA:
-            return [f"{name} is Kimi delta attention, which takes no split steps: node {node!r} can't split them"]
+            # KDAManager sets no supports_split_steps, which the engine refuses at build; a spec can't
+            # see the built class (`resource_class` is LinearAttnManager for every variant), so this
+            # names the variant. Both change together if KDA gains split steps
+            return [
+                f"{name} is Kimi delta attention, which takes no split steps, so node {node!r} can't split them: "
+                "run it on TP ranks alone, or store its KV by position (context_parallel) with its sequence "
+                "shard's exchange at auto, so its steps run copied"
+            ]
         if shard.axis == 1 or shard.stripe_pool is not None:
             how = "each row (axis 1)" if shard.axis == 1 else f"by KV {shard.stripe_pool!r}'s stored positions"
             return [f"{name} splits a step's rows into contiguous pieces, and node {node!r}'s shard splits {how}"]

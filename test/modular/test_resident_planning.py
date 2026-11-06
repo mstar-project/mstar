@@ -1717,7 +1717,7 @@ def test_a_shard_that_cant_split_leaves_the_node_resident_and_one_that_can_refus
     assert not res["shard"].plan(SeqShardStep(segments=s.kv.segments), s.ctx).split
     ranks = SimpleNamespace(world_size=2)
     planner, why = _build({"shard": SequenceShard(("main",), 0, None, 0, ranks)})
-    assert planner is None and "may split over 2 SP ranks" in why
+    assert planner is None and "exchanges heads over its 2 SP ranks" in why
     # DCP alone: copied, and the placed pool beside it is what refuses
     assert _build({"shard": SequenceShard(("main",), 0, None, 0, ranks, splits=False)})[0] is not None
 

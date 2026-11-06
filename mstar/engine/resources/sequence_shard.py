@@ -393,12 +393,16 @@ class SequenceShard(Resource):
 
     def resident_refusal(self) -> str | None:
         # one that can't split plans every step copied with nothing on the device, so a resident
-        # step takes it as it is. One that can: a decode step runs copied, but its attention still
-        # goes through the exchange, which resident capture isn't built over. From the group's size
-        # and the spec, so every rank of the node decides alike
+        # step takes it as it is. One that can: decode never splits, but a copied step's attention
+        # still goes through the exchange (a head slice), and GDN keeps the split rows of the last
+        # split prefill, which a resident decode would read stale (`GDNManager.plan`). From the
+        # group's size and the spec, so every rank of the node decides alike
         if not self.can_split:
             return None
-        return f"its steps may split over {self.group.world_size} SP ranks, which a resident capture can't"
+        return (
+            f"a copied step's attention still exchanges heads over its {self.group.world_size} SP ranks, and a "
+            "recurrent layer keeps the last split prefill's rows, neither of which a resident capture is built over"
+        )
 
     def commit(self, step: SeqShardStep, ctx: StepContext) -> None:
         # the plan ends with its step: a bracket outside one (a warmup compile) is the identity
