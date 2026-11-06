@@ -13,18 +13,8 @@ from mstar.engine.accelerator_graph_config import (
     PackedAcceleratorGraphConfig,
 )
 from mstar.engine.engine import ExecutingBatch
-from mstar.engine.resources import (
-    AttentionStep,
-    KVStep,
-    PositionStep,
-    SamplerStep,
-    Segment,
-    SlotLease,
-    SubmoduleStep,
-)
-from mstar.engine.resources.attn.base import AttentionManager
-from mstar.engine.resources.sampler.resource import SamplerResource
-from mstar.model.orpheus.config import ATTN, KV_CACHE, ROPE, SAMPLER, SNAC_LEFT_REACH_FRAMES, OrpheusModelConfig
+from mstar.engine.state import ArrayStep, SampleStep, Segment, SlotLease, SubmoduleStep, at_last_token, sample
+from mstar.model.orpheus.config import KV_CACHE, SAMPLER, SNAC_LEFT_REACH_FRAMES, OrpheusModelConfig
 from mstar.model.submodule_base import (
     EMPTY_INPUT_METADATA,
     ARNodeInputs,
@@ -75,6 +65,10 @@ class OrpheusLLMSubmodule(ARNodeSubmodule):
         # the text rows (``output_start``), so the stop token must be one of them.
         if config.stop_token_id < config.custom_token_base_id:
             raise ValueError("Orpheus's stop token must be a custom token")
+
+    def bind_state(self, handles: Mapping[str, Any]) -> None:
+        self.kv = handles[KV_CACHE]
+        self.sampler = handles[SAMPLER]
 
     PREFILL_TOKEN_BUCKETS = [32, 64, 128, 256, 512, 1024]
     PREFILL_CAPTURE_BATCH_SIZES = [1, 4, 16, 64]
@@ -154,15 +148,7 @@ class OrpheusLLMSubmodule(ARNodeSubmodule):
                     span=inp.input_seq_len,
                 ) for rid, inp in zip(request_ids, inputs, strict=True)
             ],
-            steps={
-                KV_CACHE: KVStep(),
-                ATTN: AttentionStep(causal=True),
-                SAMPLER: SamplerStep(
-                    apply_penalty=True,
-                    prefill_tracked_tokens=prefill_tokens
-                ),
-                ROPE: PositionStep()
-            }
+            state={KV_CACHE: ArrayStep(), SAMPLER: SampleStep(prompt_tokens=prefill_tokens)},
         )
 
     def preprocess(
@@ -175,26 +161,11 @@ class OrpheusLLMSubmodule(ARNodeSubmodule):
             "text_inputs": torch.cat([inp.input_ids for inp in inputs]),
         }
 
-    def _forward(
-        self,
-        graph_walk: str,
-        engine_inputs: ModelInputsFromEngine,
-        text_inputs: torch.Tensor,
-    ) -> torch.Tensor:
-        sampler: SamplerResource = engine_inputs.resources[SAMPLER]
-        attn: AttentionManager = engine_inputs.resources[ATTN]
-        emb = self.embed_tokens(text_inputs)
-        hidden = self.language_model(emb, label="main")
-
+    def _forward(self, graph_walk: str, text_inputs: torch.Tensor) -> torch.Tensor:
+        hidden = self.language_model(self.embed_tokens(text_inputs))
         if graph_walk != "decode":
-            hidden = attn.select_last_hidden(hidden)
-
-        logits = self.lm_head(hidden)
-        return sampler.sample(
-            engine_inputs.request_ids,
-            logits=logits
-        )
-
+            hidden = at_last_token(self.kv, hidden)
+        return sample(self.sampler, self.lm_head(hidden))
 
     def forward(
         self,
@@ -204,11 +175,7 @@ class OrpheusLLMSubmodule(ARNodeSubmodule):
         **kwargs
     ) -> NameToTensorList:
         return {
-            "new_token": self._forward(
-                graph_walk=graph_walk,
-                engine_inputs=engine_inputs,
-                text_inputs=text_inputs
-            )
+            "new_token": self._forward(graph_walk=graph_walk, text_inputs=text_inputs)
         }
 
     def can_batch(
@@ -224,11 +191,7 @@ class OrpheusLLMSubmodule(ARNodeSubmodule):
         text_inputs: torch.Tensor,
         **kwargs
     ) -> BatchedModelOutput:
-        new_tokens = self._forward(
-            graph_walk=graph_walk,
-            engine_inputs=engine_inputs,
-            text_inputs=text_inputs
-        )
+        new_tokens = self._forward(graph_walk=graph_walk, text_inputs=text_inputs)
         # Row i is request i; a per-rid dict here would guard the compiled frame
         # on the ids. As the stop buffers too, the stop check reads one host
         # copy of the rows, and the declared stop policies run in the runtime.
