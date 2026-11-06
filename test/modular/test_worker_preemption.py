@@ -43,7 +43,7 @@ from mstar.graph.base import GraphEdge, GraphNode, Loop
 from mstar.model.base import KVLabel
 from mstar.model.rebuild import RebuildPolicy
 from mstar.observability.recorders import EdgeTransfers
-from mstar.worker.host_pool import HostCopy, HostSlice
+from mstar.worker.host_pool import HostCopy, HostPool
 from mstar.worker.micro_scheduler import MicroScheduler, ScheduledBatch
 from mstar.worker.preemption import Preemption
 from mstar.worker.rebuild import KeptIds, Prefilling, Rebuilds, policies_run_here
@@ -51,7 +51,7 @@ from mstar.worker.worker import Worker
 from mstar.worker.worker_metrics import PreemptionCounts
 
 NODE = "LLM"
-POLICY = RebuildPolicy(walk="prefill", ids_input="text_inputs", sample_output="new_token", loop="decode")
+POLICY = RebuildPolicy(walks=frozenset({"prefill"}), ids_input="text_inputs", sample_output="new_token", loop="decode")
 
 
 def _graphs(node_name: str = NODE) -> dict:
@@ -69,7 +69,7 @@ class _Engine(SimpleNamespace):
 def _kept(tokens: int) -> KeptIds:
     """A request's prompt of ``tokens`` ids on the host, and one sample."""
     view = torch.arange(tokens, dtype=torch.long)
-    return KeptIds(HostCopy(HostSlice(0, view.nbytes), view, None), array("i", [0]))
+    return KeptIds(HostCopy(view, None), "prefill", array("i", [0]), {})
 
 
 def _worker(kv):
@@ -91,7 +91,7 @@ def _worker(kv):
     )
     w = Worker.__new__(Worker)
     w.worker_id, w.parallel_nodes, w.parallel_leader_nodes = "w", set(), set()
-    w._rebuilds = Rebuilds({NODE: POLICY}, _graphs())
+    w._rebuilds = Rebuilds({NODE: POLICY}, _graphs(), HostPool(1 << 20, torch.device("cpu")))
     w._rebuilds._kept[NODE] = {rid: _kept(5 * PAGE_SIZE) for rid in "rv"}
     w._in_flight_rids, w._hold_logged, w._rid_str = set(), {}, str
     w.held, w.tried, w.failed = [], [], {}
@@ -178,7 +178,7 @@ def test_only_a_deciding_kv_pool_preempts(case):
     pytest.param({(NODE, "decode")}, False, id="a node whose prefill walk runs on another worker"),
 ])
 def test_a_policy_runs_here_only_where_the_worker_runs_its_prefill_and_loop_walks(my_walks, rebuilds):
-    assert bool(policies_run_here({NODE: POLICY}, _graphs(), my_walks)) == rebuilds
+    assert bool(policies_run_here({NODE: POLICY}, _graphs(), my_walks, ())) == rebuilds
 
 
 def test_a_victim_the_host_takes_whole_goes_there_and_its_pages_to_the_request_that_ran_short():
@@ -242,7 +242,7 @@ def test_an_older_decode_short_by_a_page_drops_the_newest_request_mid_prefill_no
     reason = _step(kv, "r", 1).reason
     w = _worker(kv)
     del w._rebuilds._kept[NODE]["v"]
-    w.scheduler.prefilling = lambda node, rid, walk: Prefilling(POLICY.walk, 5 * PAGE_SIZE, 8 * PAGE_SIZE) if (
+    w.scheduler.prefilling = lambda node, rid, walk: Prefilling("prefill", 5 * PAGE_SIZE, 8 * PAGE_SIZE) if (
         rid == "v") else None
     batch = ScheduledBatch(node_name=NODE, graph_walk="decode", request_to_worker_graph={"r": 0})
     node_batch = SimpleNamespace(node_name=NODE, admit_error=reason, failed_resource="kv")
@@ -267,7 +267,7 @@ def test_a_victim_whose_rebuild_wouldnt_write_what_its_kv_holds_isnt_chosen(why)
         w._rebuilds._kept[NODE]["v"] = _kept(5 * PAGE_SIZE - 1)
     else:
         del w._rebuilds._kept[NODE]["v"]
-        w.scheduler.prefilling = lambda node, rid, walk: Prefilling(POLICY.walk, 5 * PAGE_SIZE - 1, 8 * PAGE_SIZE) if (
+        w.scheduler.prefilling = lambda node, rid, walk: Prefilling("prefill", 5 * PAGE_SIZE - 1, 8 * PAGE_SIZE) if (
             rid == "v") else None
     batch = ScheduledBatch(node_name=NODE, graph_walk="decode", request_to_worker_graph={"r": 0})
     node_batch = SimpleNamespace(

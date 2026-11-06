@@ -28,6 +28,7 @@ torch = pytest.importorskip("torch")
 from mstar.communication.tensors import StoredOutputs  # noqa: E402
 from mstar.engine.chunking import ChunkingManagement  # noqa: E402
 from mstar.engine.engine import Engine, ExecutingBatch  # noqa: E402
+from mstar.engine.resources.kv.host_writes import StepAllowance  # noqa: E402
 from mstar.engine.resources.runner import StepRunner  # noqa: E402
 from mstar.engine.resources.step import StepContext  # noqa: E402
 from mstar.graph.runtime.base import PhasedPostprocess, RouteOutput  # noqa: E402
@@ -122,6 +123,7 @@ def _engine(sub):
     eng._loopback_steps = {}
     eng._chunking = ChunkingManagement(eng._submodules)
     eng._runner = StepRunner({})
+    eng.host_allowance = StepAllowance()
     return eng
 
 

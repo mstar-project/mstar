@@ -559,12 +559,24 @@ def refuse_undeclared_labels(
 
 
 def rebuild_refusal(layouts: Iterable["StreamLayout"]) -> str | None:
-    """Why one rebuild row can't write a request's laid-out labels again from its token ids, or None."""
+    """Why one rebuild row can't write a request's laid-out labels again, or None.
+
+    The row writes one label, grown by one loop, in the one step of one walk that wrote its spans. It writes the
+    ids spans from the request's kept ids, every other span from host copies of what that walk read, whatever the
+    span's kind, and the ids sampled since at the end of the last span, which must be ids.
+    """
     laid_out = [layout for layout in layouts if layout.spans]
-    if any(span.kind != SpanKind.IDS for layout in laid_out for span in layout.spans):
-        return "it holds KV that can't be recomputed from token ids"
-    if len(laid_out) > 1 or any(len(layout.spans) != 1 or len(layout.growth) != 1 for layout in laid_out):
-        return "it writes more than one label, span or growth loop, which one rebuild row can't lay out again"
+    if len(laid_out) > 1 or any(len(layout.growth) != 1 for layout in laid_out):
+        return "it writes more than one label or growth loop, which one rebuild row can't lay out again"
+    for layout in laid_out:
+        if len({span.walk for span in layout.spans}) > 1:
+            return "its prompt was written in more than one walk, which one rebuild row can't run"
+        if any(span.opens_step for span in layout.spans[1:]):
+            return "its prompt was written in more than one step, which one rebuild row can't run"
+        if layout.spans[-1].kind != SpanKind.IDS:
+            return "its prompt ends on a span of no ids, where the ids it sampled can't follow"
+        if len(layout.spans) > 1 and layout.keyed_spans:
+            return "it keys a prompt of more than one span, which a rebuild can't key again"
     return None
 
 
@@ -762,6 +774,14 @@ class StreamLayout:
     def _grown(self, caps: Mapping[str, int]) -> int:
         grown = sum(slots * caps[loop] for loop, slots in self.growth)
         return grown if self.max_growth is None else min(grown, self.max_growth)
+
+    def rebuilt(self, slots: int) -> "StreamLayout":
+        """This layout once a rebuild row has written ``slots`` slots into it: the last span, which
+        `rebuild_refusal` requires to be ids, grows by the slots past the layout, the ids sampled since it was
+        laid out."""
+        grown = slots - sum(span.length for span in self.spans)
+        *spans, last = self.spans
+        return replace(self, spans=(*spans, replace(last, length=last.length + grown, advance=last.advance + grown)))
 
     def pages(
         self, caps: Mapping[str, int], page_size: int, retention: "RetentionPolicy | None" = None,

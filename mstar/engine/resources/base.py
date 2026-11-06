@@ -21,6 +21,7 @@ if TYPE_CHECKING:
         PiecewiseAcceleratorGraphConfig,
     )
     from mstar.engine.resources.attn.workspace import WorkspacePool
+    from mstar.engine.resources.kv.host_writes import StepAllowance
     from mstar.engine.resources.kv.transfer import TransferEngineInfo
 
 
@@ -82,6 +83,8 @@ class EngineResourceInfo:
     # the prefix caches this engine opens (`opening_prefix_caches`), decided
     # before any resource is built, for one that sizes itself by its own
     prefix_caches: frozenset[str] = frozenset()
+    # what each step may still copy to the host once its outputs are sent
+    host_allowance: "StepAllowance | None" = None
 
     @property
     def head_shards(self) -> int:

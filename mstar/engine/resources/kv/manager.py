@@ -33,10 +33,11 @@ from mstar.engine.resources.kv.config import (
     PagedKVConfig,
     PrefixSpan,
     RetentionPolicy,
+    SpanKind,
     StreamLayout,
 )
 from mstar.engine.resources.kv.cpu_page_pool import CPUPagePool, PageCopies
-from mstar.engine.resources.kv.host_writes import HostWrites
+from mstar.engine.resources.kv.host_writes import HostWrites, StepAllowance
 from mstar.engine.resources.kv.keys import PageItem, chain, fingerprint, page_items, page_key
 from mstar.engine.resources.kv.plan import (
     SINK_PAGE,
@@ -592,8 +593,10 @@ class KVManager(AttentionResource):
         needs_remote_transfer: bool = False,
         leads: bool = True,
         nodes: Collection[str] | None = None,
+        host_allowance: StepAllowance | None = None,
     ):
         self.config = cfg
+        self._host_allowance = StepAllowance() if host_allowance is None else host_allowance
         if len(cfg.groups) > 1 and needs_remote_transfer:
             raise ValueError(
                 f"KV {name}: a node on another instance reads this pool (replicas, or walks "
@@ -812,6 +815,7 @@ class KVManager(AttentionResource):
             needs_remote_transfer=info.needs_remote_transfer,
             leads=spec.leader is None or spec.leader in info.nodes,
             nodes=info.nodes,
+            host_allowance=info.host_allowance,
         )
 
     def build_accelerator_graph_buffers(
@@ -911,7 +915,9 @@ class KVManager(AttentionResource):
             self._open_host_writes()
 
     def _open_host_writes(self) -> None:
-        self._host_writes = HostWrites(self._cpu_pool, self._index, self.kv_cache.tensor[:, 0].nbytes)
+        self._host_writes = HostWrites(
+            self._cpu_pool, self._index, self.kv_cache.tensor[:, 0].nbytes, self._host_allowance,
+        )
         self._arena.writes = self._host_writes
 
     def close_prefix_cache(self) -> None:
@@ -3733,10 +3739,11 @@ class KVManager(AttentionResource):
             return self._arena.num_free - free
 
     def prepare_rebuild(self, rid: str, rebuild: Rebuild) -> None:
-        """Lay ``rid``'s label out again as one ids span of the rebuild's walk over its ids without the last
-        one, keyed as a prompt of those ids would be.
+        """Lay ``rid``'s label out again to hold the slots its drop checked, which its rebuild row writes: the
+        label's spans, the last grown by the ids sampled since (`StreamLayout.rebuilt`). A label of one ids span
+        is keyed as a prompt of the rebuild's ids without the last one would be.
 
-        The growth loop's cap and the layout's ``max_growth`` drop by what the span now covers, so the
+        The growth loop's cap and the layout's ``max_growth`` drop by what the last span grew, so the
         footprint stays the one at intake. The decode step that samples an id keys it, so a label that keys
         generation also extends its chain by the last id.
         """
@@ -3745,19 +3752,21 @@ class KVManager(AttentionResource):
         if not laid_out:
             return
         (label,) = laid_out
-        ids, walk = rebuild.ids, rebuild.walk
+        ids, layout, held = rebuild.ids, overrides.kv_layout[label], self._dropped[rid].held
         prompt, page_size = ids[:-1], self.config.tokens_per_page
-        length = len(prompt)
-        held = self._dropped[rid].held
-        assert length == held, f"KV {self.name}: {rid}'s rebuild writes {length} tokens, but its drop checked {held}"
+        length, rebuilt = len(prompt), layout.rebuilt(held)
+        laid_out_ids = sum(span.length for span in rebuilt.spans if span.kind == SpanKind.IDS)
+        assert length == laid_out_ids, (
+            f"KV {self.name}: {rid}'s rebuild writes {length} ids, but the {held} slots its drop checked hold "
+            f"{laid_out_ids}"
+        )
         pages = [prompt[start:start + page_size] for start in range(0, length, page_size)]
         keyed = bool((overrides.prefix_keys or {}).get(label))
         # hashed before the lock, as `resolve_cached_prefix` hashes outside it
         keys = chain(pages, root=overrides.prefix_root) if keyed else None
         with self._lock:
-            layout = overrides.kv_layout[label]
             ((loop, slots),) = layout.growth
-            grown = length - sum(span.length for span in layout.spans)
+            grown = held - sum(span.length for span in layout.spans)
             changes = {}
             if keyed:
                 changes["prefix_keys"] = {**overrides.prefix_keys, label: keys}
@@ -3769,7 +3778,7 @@ class KVManager(AttentionResource):
                 kv_layout={
                     **overrides.kv_layout,
                     label: replace(
-                        layout, spans=(PrefixSpan(length, length, walk),), keyed_spans=int(keyed),
+                        rebuilt, keyed_spans=int(keyed),
                         max_growth=None if layout.max_growth is None else layout.max_growth - grown,
                     ),
                 },

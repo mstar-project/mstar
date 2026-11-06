@@ -36,7 +36,7 @@ from mstar.distributed.base import ShardingConfig
 from mstar.distributed.communication import WorkerParallelGroups
 from mstar.engine import apply_dynamo_config
 from mstar.engine.chunking import ChunkRange
-from mstar.engine.engine import ExecutingBatch
+from mstar.engine.engine import Engine, ExecutingBatch
 from mstar.engine.resources import AdmitFailedReason, AllocationFailed, Residency, ResourceReqConfig
 from mstar.engine.resources.kv.config import KVReqConfig, without_layouts
 from mstar.engine.resources.kv.transfer import (
@@ -121,7 +121,13 @@ from mstar.worker.micro_scheduler import (
 )
 from mstar.worker.node_manager_utils import RequestStateManager
 from mstar.worker.preemption import Preemption
-from mstar.worker.rebuild import DEFAULT_REBUILD_HOST_MB, Rebuilds, node_writes, policies_run_here
+from mstar.worker.rebuild import (
+    DEFAULT_REBUILD_HOST_MB,
+    DEFAULT_REBUILD_MEDIA_HOST_MB,
+    Rebuilds,
+    node_writes,
+    policies_run_here,
+)
 from mstar.worker.side_steps import SIDE_LANE, SideStepLane
 from mstar.worker.spec_rows import DeferredRowInputs
 from mstar.worker.speculation import (
@@ -214,18 +220,21 @@ def _make_graph_runtime(
 
 def _make_rebuilds(
     model: Model | None, model_config: dict | None, my_walks: set[tuple[str, str]], lockstep_nodes: set[str],
-    device: torch.device,
+    device: torch.device, engine: Engine,
 ) -> Rebuilds:
     """What a dropped request is rebuilt from, on each node whose model declares how and whose rebuild this worker
     runs: a disaggregated decode node can't run the prefill walk a rebuild needs."""
     graphs = model.get_graph_walk_graphs() if model is not None else {}
-    policies = policies_run_here(model.rebuild_policies(), graphs, my_walks) if model is not None else {}
+    policies = {} if model is None else policies_run_here(model.rebuild_policies(), graphs, my_walks, lockstep_nodes)
     # A lockstep node's KV refuses every drop, so its requests keep no ids.
     policies = {node: policy for node, policy in policies.items() if node not in lockstep_nodes}
-    host_mb = (model_config or {}).get("rebuild_host_mb", DEFAULT_REBUILD_HOST_MB)
-    if isinstance(host_mb, bool) or not isinstance(host_mb, int) or host_mb < 0:
-        raise ValueError(f"rebuild_host_mb: {host_mb!r} is not a non-negative int")
-    return Rebuilds(policies, graphs, HostPool(host_mb << 20, device) if host_mb and policies else None)
+    host_mb = _serving_mb(model_config, "rebuild_host_mb", DEFAULT_REBUILD_HOST_MB)
+    if host_mb and any(names for node, policy in policies.items() for names in policy.check(node, graphs).values()):
+        host_mb += _serving_mb(model_config, "rebuild_media_host_mb", DEFAULT_REBUILD_MEDIA_HOST_MB)
+    return Rebuilds(
+        policies, graphs, HostPool(host_mb << 20, device) if host_mb and policies else None, engine.host_allowance,
+        {node: dtype for node in policies if (dtype := engine.node_dtype(node)) is not None},
+    )
 
 
 def _parse_tp_async_sched(raw: str) -> tuple[bool, frozenset[str] | None]:
@@ -470,6 +479,12 @@ class _LazyHostRow(Mapping):
     def __len__(self) -> int:
         return len(self._row)
 
+
+def _serving_mb(model_config: dict | None, key: str, default: int) -> int:
+    value = (model_config or {}).get(key, default)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{key}: {value!r} is not a non-negative int")
+    return value
 
 class Worker:
     """
@@ -788,7 +803,9 @@ class Worker:
         # (node, walk) -> when its last hold was logged, and the holds since
         self._hold_logged: dict[tuple[str, str], tuple[float, int]] = {}
 
-        self._rebuilds = _make_rebuilds(model, model_config, my_walks, self.parallel_nodes, self.device)
+        self._rebuilds = _make_rebuilds(
+            model, model_config, my_walks, self.parallel_nodes, self.device, self.engine_manager.engine,
+        )
         self._preemption = Preemption(
             self.engine_manager, self._rebuilds, self.scheduler, self.request_state, self._log_throttled,
             self._rid_str,
@@ -3893,6 +3910,7 @@ class Worker:
         self._rebuilds.keep_samples(
             batch_N.node_batch, cpu_outputs, host_rows, skip_rids=batch_N.batch.incomplete_node_rids,
         )
+        self._rebuilds.keep_copies(batch_N.node_batch)
         _pp_stage("prematerialize")
         runtime_stops, tokens = self._runtime_stop_column(batch_N, host_rows)
         checked = None
@@ -3974,6 +3992,7 @@ class Worker:
         # Those sends were the last readers of this step's host copies.
         self.tensor_manager.drop_host_copies()
         _pp_stage("tail")
+        self._rebuilds.flush()
         engine.after_output_copy(batch_N.node_batch)
         _pp_stage("after_output_copy")
 
@@ -4006,7 +4025,7 @@ class Worker:
                 if not cursor.resumes_prefill:
                     engine.release_chunk_inputs(rid, node)
                 engine.land_rebuild(node, rid)
-                self._preemption.rebuilt(rid, node, cursor.total)
+                self._preemption.rebuilt(rid, node, cursor.ran)
         for rid in rebuild:
             outputs.pop(rid, None)
             batch.discard_rid(rid)
@@ -5616,6 +5635,7 @@ class Worker:
                     if side_steps is not None and side_steps.pending is not None:
                         side_steps.finish(block=True)
                         continue
+                    self._rebuilds.flush_idle()
                     self.communicator.wait_for_work(10)
                     continue
 

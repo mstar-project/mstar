@@ -1134,8 +1134,9 @@ class BagelModel(Model):
     def rebuild_policies(self) -> dict[str, RebuildPolicy]:
         # Only understanding decodes, and an image's KV can't be recomputed from ids, so the KV cache
         # refuses to drop a prompt with one. The CFG nodes run only image generation.
-        return {"LLM": RebuildPolicy(walk="prefill_text", ids_input="text_inputs", sample_output="new_token",
-                                     loop="decode_loop")}
+        return {"LLM": RebuildPolicy(
+            walks=frozenset({"prefill_text"}), ids_input="text_inputs", sample_output="new_token", loop="decode_loop",
+        )}
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         # -- prefill_text: just the LLM node (text embedding is internal) --

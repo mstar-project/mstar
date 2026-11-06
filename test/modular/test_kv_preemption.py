@@ -224,6 +224,19 @@ def test_each_victim_sets_aside_what_it_frees_before_the_next_one_moves():
     assert kv._room() >= 0, f"the pool promises {kv._unused} pages, {-kv._room()} more than free and evictable"
 
 
+def test_a_dropped_request_with_an_image_returns_with_pages_for_the_image_too():
+    kv = _pool()
+    image = PrefixSpan(3 * PAGE_SIZE, 4, WALK, kind="digest", opens_step=False)
+    text = (PrefixSpan(PAGE_SIZE - 1, PAGE_SIZE - 1, WALK), PrefixSpan(1, 1, WALK, opens_step=False))
+    layout, caps = StreamLayout(spans=(text[0], image, text[1]), growth=(("decode", 1),)), {"decode": 4 * PAGE_SIZE}
+    _runner(kv).ingest_request("v", {"kv": KVReqConfig(kv_layout={"main": layout}, loop_caps=caps)}, arrival=1)
+    assert _ready(kv, "v") and _step(kv, "v", 4 * PAGE_SIZE).ok
+    _drop(kv, "v")
+
+    # its rebuild writes the image's rows too: the 4 pages its KV held, a page for its next sample and one more
+    assert _admitted(kv, "v") and kv._allotments["v"].pages == 6, "the rebuild would run out of pages in the image"
+
+
 @pytest.mark.parametrize("flight", ["step_in_flight", "read_pending"])
 def test_a_request_with_a_step_or_read_in_flight_isnt_chosen(flight):
     kv = _pool()

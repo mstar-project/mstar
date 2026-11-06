@@ -12,6 +12,7 @@ from __future__ import annotations
 from array import array
 from collections import defaultdict
 from concurrent.futures import Future
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -27,17 +28,17 @@ from mstar.engine.resources.kv import manager as manager_mod
 from mstar.engine.resources.kv.config import KVReqConfig, PrefixSpan, StreamLayout
 from mstar.model.rebuild import RebuildPolicy
 from mstar.model.submodule_base import BatchedModelOutput
-from mstar.worker.host_pool import HostCopy, HostPool, HostSlice
+from mstar.worker.host_pool import HostCopy, HostPool
 from mstar.worker.micro_scheduler import CHAIN_LANE, ScheduledBatch
 from mstar.worker.preemption import Preemption
-from mstar.worker.rebuild import KeptIds, NodeWrites, Prefilling, RebuildCursor, Rebuilds
+from mstar.worker.rebuild import HostCopies, KeptIds, LogRoom, NodeWrites, Prefilling, RebuildCursor, Rebuilds
 from mstar.worker.side_steps import SIDE_LANE
 from mstar.worker.stream_buffers import StreamBufferManager
 from mstar.worker.worker import PendingBatch, Speculation, Worker, _make_rebuilds
 
 NODE, PREFILL, DECODE = "LLM", "prefill", "decode"
 R, A = 7, 8
-POLICY = RebuildPolicy(walk=PREFILL, ids_input="text_inputs", sample_output="new_token", loop="loop")
+POLICY = RebuildPolicy(walks=frozenset({PREFILL}), ids_input="text_inputs", sample_output="new_token", loop="loop")
 
 
 def _graphs() -> dict:
@@ -52,7 +53,7 @@ def _graphs() -> dict:
 
 def _kept(*sampled: int, prompt=(1, 2, 3)) -> KeptIds:
     view = torch.tensor(prompt, dtype=torch.long)
-    return KeptIds(HostCopy(HostSlice(0, view.nbytes), view, None), array("i", sampled))
+    return KeptIds(HostCopy(view, None), PREFILL, array("i", sampled), {"is_prefill": True})
 
 
 def _cleanup(node, rids, wgs):
@@ -164,6 +165,52 @@ def test_postprocess_appends_kept_samples_and_lands_a_rebuild_row_beside_them():
     assert landed == [R], "the rebuilt request would never be ready to decode again"
 
 
+@pytest.mark.parametrize("build", ["executing", "speculative"])
+def test_postprocess_keeps_a_host_copy_of_what_a_prefill_row_read_besides_its_ids(build):
+    from test_dropped_row_stream_stop import _engine, _ReachedRoutingError, _Runtime, _Sub, _worker
+
+    eng = _engine(_Sub())
+    eng.land_rebuild = lambda node, rid: None
+    w, node, walk = _worker(eng, _Runtime()), "vocoder", "w"
+    w._rebuilds._policies = {node: replace(POLICY, walks=frozenset({walk}))}
+    w._rebuilds._copied = {node: {walk: frozenset({"embeds"})}}
+    w._rebuilds._kept = {node: {1: replace(_kept(), walk=walk, copies=HostCopies())}}
+    w._rebuilds._pool = pool = HostPool(1 << 10, torch.device("cpu"))
+    w._rebuilds._droppable = {node: {1: LogRoom(pool.take(64), 0)}}
+    embeds = {rid: torch.full((2,), rid) for rid in (R, 1, 2)}
+    batch = _step((R, 1, 2), walk, node, per_request_input_tensors={
+        rid: {"embeds": [] if build == "speculative" else [t], "ids": [t]} for rid, t in embeds.items()
+    })
+    if build == "speculative":
+        # a speculated step gets its embeds only once the encoder has run
+        spec = Speculation(ScheduledBatch(node, walk, {1: 0, 2: 0}), batch, {("embeds", node)}, {R, 1, 2}, "p",
+                           is_new_iter=False, is_same_node=False)
+        w._thread_outputs_to_speculative(spec, BatchedModelOutput({rid: {"embeds": [t]} for rid, t in embeds.items()}))
+    for rid, info in batch.per_request_info.items():
+        info.graph_walk, info.step_metadata = walk, {"prefill_order": (rid,)}
+    eng.prepare_inputs(batch)
+    pending = PendingBatch(ScheduledBatch(node, walk, {1: 0, 2: 0}), batch, node, "p", walk, Future())
+    outputs = BatchedModelOutput(per_rid_outputs={rid: {"new_token": [torch.tensor([rid + 4])]} for rid in (1, 2)})
+    with pytest.raises(_ReachedRoutingError):
+        w._postprocess_batch(pending, outputs)
+    # what the worker does once the step's outputs are sent
+    w._rebuilds.flush()
+
+    assert w._rebuilds._kept[node][1].copies.inputs["embeds"][0].tolist() == embeds[1].tolist(), (
+        "a rebuild would need the encoder to run again"
+    )
+
+
+def test_a_rebuild_row_runs_under_its_recorded_metadata_even_when_empty():
+    w, _ = _worker()
+    w.infos[R].step_metadata = {"prefill_order": ()}  # decode's metadata
+    w._rebuilds._cursors[(NODE, R)] = RebuildCursor(PREFILL, 2, 2, array("i", [1, 2, 3]), torch.long, step_metadata={})
+
+    node_batch = w._build_executing_batch(ScheduledBatch(NODE, PREFILL, {R: 0}, rebuild_rids=frozenset({R})))
+
+    assert node_batch.per_request_info[R].step_metadata == {}, "the rebuild row would run under decode's metadata"
+
+
 @pytest.mark.parametrize("why", ["no ids", "backlog", "prefill walk", "samples short"])
 def test_a_drop_is_refused_when_its_rebuild_could_not_follow(why):
     w, eng = _worker()
@@ -197,11 +244,26 @@ def test_a_lockstep_node_keeps_no_ids_and_sets_no_pool_aside():
     model = SimpleNamespace(rebuild_policies=lambda: {NODE: POLICY}, get_graph_walk_graphs=_graphs)
 
     my_walks = {(NODE, PREFILL), (NODE, DECODE)}
-    rebuilds = _make_rebuilds(model, {"rebuild_host_mb": 1}, my_walks, {NODE}, torch.device("cpu"))
+    engine = SimpleNamespace(host_allowance=None, node_dtype=lambda node: torch.float32)
+    rebuilds = _make_rebuilds(model, {"rebuild_host_mb": 1}, my_walks, {NODE}, torch.device("cpu"), engine)
 
     assert rebuilds.pool is None and NODE not in rebuilds.nodes, (
         "every rank would copy each prompt to pinned memory for a drop its KV refuses"
     )
+
+
+def test_rebuild_host_mb_0_sets_no_pool_aside_on_a_node_that_copies_media():
+    """``rebuild_host_mb: 0`` turned off the ids' room alone, so a worker whose node copies media still pinned
+    ``rebuild_media_host_mb`` at startup and kept every request's ids and copies there."""
+    from test_rebuild_policy import MEDIA, VISION
+    from test_rebuild_policy import _graphs as media_graphs
+
+    model = SimpleNamespace(rebuild_policies=lambda: {NODE: MEDIA}, get_graph_walk_graphs=media_graphs)
+    my_walks = {(NODE, PREFILL), (NODE, VISION), (NODE, DECODE)}
+    engine = SimpleNamespace(host_allowance=None, node_dtype=lambda node: torch.float32)
+    rebuilds = _make_rebuilds(model, {"rebuild_host_mb": 0}, my_walks, set(), torch.device("cpu"), engine)
+
+    assert NODE in rebuilds.nodes and rebuilds.pool is None, "the worker pinned the media pool with rebuilds off"
 
 
 def test_a_step_of_rebuild_rows_alone_routes_nothing_and_makes_them_resident():
@@ -393,6 +455,24 @@ def test_a_rebuild_row_leaves_its_requests_loopback_entry(branch):
     Engine._record_loopback(engine, batch)
 
     assert engine._loopback_steps[R] == (NODE, DECODE), "the resumed decode would not read the last kept id"
+
+
+def test_a_pass_that_runs_no_step_starts_the_queued_host_copies(monkeypatch):
+    """Queued host copies started only once a step's outputs were sent, and a drop waits for them. With every request
+    waiting on the pool, no step ran, so no copy started and nothing could be dropped to let one run."""
+    from test_loop_turns import TURNS, _looping_worker, _Runtime, _scheduler, _StopLoopError
+    from test_rebuild_policy import _copying, _vision_step
+
+    rebuilds = _copying(R)
+    rebuilds.keep_copies(_vision_step((R,), {}, completion_event=None))
+    w = _looping_worker(monkeypatch, *_scheduler(_Runtime(), TURNS))
+    w._rebuilds = rebuilds
+
+    # the loop ends on its first idle wait
+    with pytest.raises(_StopLoopError):
+        w.run()
+
+    assert rebuilds._kept[NODE][R].copies.ready(), "the request would wait for its copies with no step to start them"
 
 
 def test_the_scheduler_sees_the_rows_every_lane_holds():

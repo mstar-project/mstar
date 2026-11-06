@@ -22,7 +22,14 @@ from mstar.communication.tensors import LocalTransferEngine
 from mstar.engine.engine import Engine
 from mstar.engine.resources.base import EngineResourceInfo, Rebuild, Residency, Resource
 from mstar.engine.resources.kv.bounded.manager import BoundedKVManager
-from mstar.engine.resources.kv.config import KVReqConfig, KVStep, PagedKVConfig, PrefixSpan, StreamLayout
+from mstar.engine.resources.kv.config import (
+    KVReqConfig,
+    KVStep,
+    PagedKVConfig,
+    PrefixSpan,
+    StreamLayout,
+    rebuild_refusal,
+)
 from mstar.engine.resources.kv.keys import chain
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.kv.ring.manager import RingKVManager
@@ -132,6 +139,33 @@ def test_a_refused_drop_changes_nothing(refusal):
     assert kv._streams["r"]["main"].page_indices == pages and "r" not in kv._dropped, "the refused drop changed it"
 
 
+IMAGE = PrefixSpan(6, 4, WALK, kind="digest", opens_step=False)
+
+
+@pytest.mark.parametrize("layout, why", [
+    ("two labels", "more than one label"),
+    ("two loops", "more than one label or growth loop"),
+    ("two walks", "more than one walk"),
+    ("two steps", "more than one step"),
+    ("image last", "ends on a span of no ids"),
+    ("keyed text around an image", "can't key again"),
+])
+def test_a_layout_one_row_couldnt_write_again_is_refused(layout, why):
+    main = _config(list(range(PAGE_SIZE))).kv_layout["main"]
+    (text,) = main.spans
+    tail = replace(text, opens_step=False)
+    layouts = {
+        "two labels": [main, main],
+        "two loops": [replace(main, growth=(*main.growth, ("other_loop", 1)))],
+        "two walks": [replace(main, spans=(text, replace(IMAGE, walk="vit"), tail))],  # as a Bagel image chat
+        "two steps": [replace(main, spans=(text, text))],  # as a prompt prefilled over two rows
+        "image last": [replace(main, spans=(text, IMAGE))],
+        "keyed text around an image": [replace(main, spans=(text, IMAGE, tail), keyed_spans=3)],
+    }[layout]
+
+    assert why in (rebuild_refusal(layouts) or ""), f"one rebuild row would write {layout} again"
+
+
 def test_a_second_drop_before_the_rebuild_lands_is_refused():
     kv = _manager()
     _prefill(kv, "r", PAGE_SIZE, kind="ids")
@@ -229,6 +263,31 @@ def test_a_rebuilt_stream_keeps_its_footprint_and_is_keyed_as_a_fresh_prompt():
     )
 
 
+def _image_prompt(kv: KVManager, decoded: int) -> None:
+    """Ingest ``r`` with three ids, an image and two ids on one walk, as Qwen3.5 lays out an image chat, write
+    them and ``decoded`` tokens after them, then drop it."""
+    layout = StreamLayout(spans=(PrefixSpan(3, 3, WALK), IMAGE, PrefixSpan(2, 2, WALK)), growth=(("decode_loop", 1),))
+    kv.ingest_request("r", KVReqConfig(kv_layout={"main": layout}, loop_caps={"decode_loop": 50}))
+    _write(kv, "r", 11, *[1] * decoded)
+    kv.drop("r", 11 + decoded)
+
+
+def test_a_rebuild_keeps_an_image_prompts_spans_and_writes_its_samples_after_its_last_text():
+    kv = _manager()
+    _image_prompt(kv, decoded=2)
+    footprint = kv._streams["r"]["main"].footprint
+
+    # the prompt's 5 ids, then the prefill's sample and one per decode step
+    kv.prepare_rebuild("r", Rebuild(WALK, array("i", [*range(5), 100, 101, 102])))
+
+    assert kv._overrides["r"].kv_layout["main"].spans == (PrefixSpan(3, 3, WALK), IMAGE, PrefixSpan(4, 4, WALK)), (
+        "the image would lose its slots or its advance, or the samples would land at other positions"
+    )
+    assert kv._overrides["r"].loop_caps["decode_loop"] == 48 and kv._streams["r"]["main"].footprint == footprint, (
+        "the rebuild would hold more pages than the request declared"
+    )
+
+
 def test_a_rebuilt_stream_whose_growth_is_bounded_keeps_its_footprint():
     """The rebuild's span covers what the loop wrote, so the growth bound drops by that as the loop's cap does.
     Otherwise the stream would grow by those slots."""
@@ -314,7 +373,9 @@ def _boot_engine(resources: dict, split: frozenset = frozenset()) -> Engine:
 
 def _model(combined: dict | None = None) -> SimpleNamespace:
     """Declares a rebuild policy on ``NODE`` and, given ``combined``, batches its walks under a combined walk."""
-    policy = SimpleNamespace(walk=WALK, ids_input="text_inputs", sample_output="new_token", loop="decode_loop")
+    policy = SimpleNamespace(
+        walks=frozenset({WALK}), ids_input="text_inputs", sample_output="new_token", loop="decode_loop",
+    )
     return SimpleNamespace(rebuild_policies=lambda: {NODE: policy}, combined_walk_of=lambda: combined or {})
 
 
