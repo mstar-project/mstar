@@ -548,7 +548,7 @@ def test_a_yield_asked_for_a_run_survives_the_step_behind_on_its_slot(monkeypatc
     speculation asked for N; with two each keeps its own (review-r7 G3)."""
     worker, log = _waiting_on_a_run(monkeypatch, [set()])
     worker._hold_rows = lambda lane, rows: None
-    behind = _run_step([2], 0, slot=slots[1], launch_started_event=SimpleNamespace(wait=lambda: None))
+    behind = _run_step([2], 0, slot=slots[1], launch_started_event=SimpleNamespace(is_set=lambda: True))
     worker._await_run(_run_step([1], 1, yield_asked=True, slot=slots[0], token_stream=None), behind, [], None)
     assert log.count("yield") == asks
 
@@ -568,7 +568,9 @@ def test_a_runs_wait_moves_nothing_until_the_step_behind_it_has_admitted(monkeyp
     """The loop's own fence covers this work at the top of a pass, not here."""
     worker, log = _waiting_on_a_run(monkeypatch, [set()])
     worker._hold_rows = lambda lane, rows: None
-    behind = _run_step([2], 0, launch_started_event=SimpleNamespace(wait=lambda: log.append("admitted")))
+    behind = _run_step([2], 0, launch_started_event=SimpleNamespace(
+        is_set=lambda: False, wait=lambda timeout: log.append("admitted") or True,
+    ))
     worker._await_run(_run_step([1], 1, token_stream=None), behind, [], None)
     assert log == ["admitted", "messages"]
 
@@ -583,7 +585,7 @@ def test_a_run_serves_the_lanes_and_ends_once_a_row_turns_ready(monkeypatch):
     lane = SimpleNamespace(finish=lambda: log.append("finish"), launch=lambda pool: log.append("launch"))
     worker._await_run(
         _run_step([1], 3, token_stream=None),
-        _run_step([2], 0, launch_started_event=SimpleNamespace(wait=lambda: None)), [lane], None,
+        _run_step([2], 0, launch_started_event=SimpleNamespace(is_set=lambda: True)), [lane], None,
     )
     served = ["messages", "finish", "launch"]
     assert log == [*served, *served, "yield", *served]

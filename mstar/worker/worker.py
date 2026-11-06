@@ -2635,15 +2635,8 @@ class Worker(RepeatingSteps):
             return
         event = pending.node_batch.launch_started_event
         if event is not None and not event.is_set():
-            waited = 0.0
             with self._span("worker.await_admit_settled"):
-                while not event.wait(timeout=_ADMIT_FENCE_WARN_S):
-                    waited += _ADMIT_FENCE_WARN_S
-                    logger.warning(
-                        "Worker %s: still waiting for node=%s walk=%s to admit after "
-                        "%.0f s; scheduling and teardowns wait for it",
-                        self.worker_id, pending.node_name, pending.graph_walk, waited,
-                    )
+                self._await_admit(pending)
         pending.batch.repeats = repeats = pending.node_batch.step_context.repeats
         if self._tp_repeats is not None and pending.batch.tp_seq >= 0 and self._is_tp_follower_node(pending.node_name):
             self._settle_tp_repeats(pending.batch.tp_seq, follower=repeats)
@@ -2654,6 +2647,21 @@ class Worker(RepeatingSteps):
                     if edge.chunk.num_items > repeats and self.streams.return_unread(rid, edge, repeats):
                         pending.node_batch.final_stream_rids.discard(rid)
             pending.node_batch.stream_windows = {}
+
+    def _await_admit(self, pending: PendingBatch) -> None:
+        """Wait for ``pending``'s admit however long it takes, saying so now and
+        then: the admit fence, here and in a run's wait (``_await_run``)."""
+        event = pending.node_batch.launch_started_event
+        if event.is_set():
+            return
+        waited = 0.0
+        while not event.wait(timeout=_ADMIT_FENCE_WARN_S):
+            waited += _ADMIT_FENCE_WARN_S
+            logger.warning(
+                "Worker %s: still waiting for node=%s walk=%s to admit after "
+                "%.0f s; scheduling and teardowns wait for it",
+                self.worker_id, pending.node_name, pending.graph_walk, waited,
+            )
 
     def _submit_gpu_step(
         self,

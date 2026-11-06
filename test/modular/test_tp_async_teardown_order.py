@@ -468,9 +468,24 @@ def test_a_follower_counts_a_head_it_drops_on_arrival(monkeypatch):
     assert log.index(("teardown", "gone")) < log.index(("admit", 2)), log
 
 
-def test_the_admit_fence_waits_out_a_slow_admit(monkeypatch):
+def _run_waits_on(w, pending):
+    """A run's wait, with ``pending`` the step behind it (review-r7 G9)."""
+    w._hold_rows = lambda lane, rows: None
+    w.engine_manager = SimpleNamespace(get_engine=lambda node: None)
+    w.scheduler = SimpleNamespace(has_ready_excluding=lambda state, key: False)
+    w.request_state = None
+    run = SimpleNamespace(
+        node_name=NODE, graph_walk=WALK, yield_asked=False, batch=SimpleNamespace(request_to_worker_graph={}),
+        node_batch=SimpleNamespace(token_stream=None, completion_event=SimpleNamespace(query=lambda: True)),
+    )
+    w._await_run(run, pending, [], None)
+
+
+@pytest.mark.parametrize("fence", [Worker._await_admit_settled, _run_waits_on])
+def test_the_admit_fence_waits_out_a_slow_admit(monkeypatch, fence):
     """The fence waits past any number of warning intervals; it never gives up.
-    A lone-rank step (``tp_seq=-1``) is the case that used to."""
+    A lone-rank step (``tp_seq=-1``) is the case that used to. A run's wait
+    holds the same fence, and says so as it waits."""
     tp_seq = -1
     monkeypatch.setattr(worker_mod, "_ADMIT_FENCE_WARN_S", 0.001)
     admitted = threading.Event()
@@ -491,6 +506,9 @@ def test_the_admit_fence_waits_out_a_slow_admit(monkeypatch):
         tp_seq=tp_seq, node_name=NODE, graph_walk=WALK, batch=scheduled, node_batch=executing,
     )
 
-    w._await_admit_settled(pending)
+    backstop = threading.Timer(2.0, admitted.set)  # a fence that never warns would wait for good
+    backstop.start()
+    fence(w, pending)
+    backstop.cancel()
 
     assert admitted.is_set() and len(warnings) == 3
