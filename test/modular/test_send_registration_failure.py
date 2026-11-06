@@ -403,7 +403,8 @@ def test_a_follower_still_routes_a_failed_rid_and_reports_it_once():
 def test_an_overlapping_view_fails_only_its_request_on_real_mooncake():
     """The issue's repro on Mooncake over TCP: a tensor and a view inside it
     overlap, which Mooncake refuses (-7)."""
-    pytest.importorskip("mooncake.engine")
+    # Without libibverbs the import raises ImportError, and the default skips only ModuleNotFoundError.
+    pytest.importorskip("mooncake.engine", exc_type=ImportError)
     from mstar.communication.tensors import create_tensor_communication_manager
 
     mgr = create_tensor_communication_manager(
@@ -425,7 +426,7 @@ def test_an_overlapping_view_fails_only_its_request_on_real_mooncake():
 def _real_manager(monkeypatch, rust):
     """Mooncake over TCP, with the given bookkeeper: the Rust one a worker
     uses, or the Python one a data worker falls back to."""
-    pytest.importorskip("mooncake.engine")
+    pytest.importorskip("mooncake.engine", exc_type=ImportError)
     if rust:
         pytest.importorskip("mstar_rust")
     else:

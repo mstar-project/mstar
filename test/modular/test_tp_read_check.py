@@ -172,7 +172,8 @@ def _four_rank_groups(rank, sizes, port):
         ranks=[0, 1, 2, 3], **sizes,
     )
     workers = [f"worker_{r}" for r in range(4)]
-    groups = GlobalParallelConfig({NODE: wg}, workers, dist_timeout_s=10).per_worker_config[workers[rank]]
+    # covers the rendezvous too: on a loaded box the ranks reach it seconds apart
+    groups = GlobalParallelConfig({NODE: wg}, workers, dist_timeout_s=acc.RENDEZVOUS_S).per_worker_config[workers[rank]]
     init = dist.init_process_group
     # torch binds a world to an accelerator only: it refuses a CPU device_id
     dist.init_process_group = lambda device_id, **kwargs: init(**kwargs)
@@ -229,7 +230,7 @@ def _run_four_ranks(target, args) -> dict:
     results = {}
     try:
         for _ in procs:
-            rank, *rest = out.get(timeout=60)
+            rank, *rest = out.get(timeout=acc.RENDEZVOUS_S + acc.DEADLINE_S)
             results[rank] = rest
     except queue.Empty:
         pass
