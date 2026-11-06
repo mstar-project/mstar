@@ -11,6 +11,8 @@ import logging
 from collections.abc import Callable, Collection, Mapping
 from typing import Any
 
+import torch
+
 from mstar.engine.resources.admission import Admission
 from mstar.engine.resources.base import CachedPrefix, CGSlotSpec, PublishedInfo, Resource
 from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig
@@ -66,6 +68,7 @@ class StepRunner:
         node_resources: Mapping[str, Collection[str]] | None = None,
         enable_nvtx: bool = False,
         declared_by: Mapping[str, Collection[str]] | None = None,
+        side_resources: Collection[str] = (),
     ):
         # Per-resource NVTX. `engine.plan.promoted` only reports that the sweep
         # was slow; these say WHICH resource ate it. Gated because range_push
@@ -142,6 +145,14 @@ class StepRunner:
         self._staged: tuple | None = None
         # (step key, ready) of the last pre_admit whose stage is still up
         self._pre_admitted: tuple | None = None
+        # Resources only a side lane's steps declare (``mstar.worker.side_steps``),
+        # and the lane's stream for each, once it has one. Such a step runs
+        # between a chain step and its staged successor, on the GPU thread while
+        # the plan thread may still be staging that successor; its resources are
+        # never staged, so it neither promotes nor drops the stage
+        # (``_beside_stage``).
+        self._side_resources = frozenset(side_resources)
+        self._side_streams: dict[str, Any] = {}
 
     def resolve_cached_prefix(
         self, rid: str, node_name: str, graph_walk: str, inputs,
@@ -370,10 +381,26 @@ class StepRunner:
         for key in self._order:
             self._resources[key].ingest_capture_row(rid)
 
+    def set_side_stream(self, keys: Collection[str], stream: Any) -> None:
+        """Tear ``keys`` down on ``stream``, the side lane's stream their steps run on."""
+        self._side_streams.update(dict.fromkeys(keys, stream))
+
     def remove_request(self, rid: str) -> None:
         self._admission.remove_request(rid)
         for key in self._order:
-            self._resources[key].remove_request(rid)
+            stream = self._side_streams.get(key)
+            if stream is None:
+                self._resources[key].remove_request(rid)
+                continue
+            # Not ``with stream:``, whose enter state is kept on the stream
+            # object and so shared with the GPU thread, which holds it entered
+            # for the whole of a side step; set this thread's stream instead.
+            previous = torch.accelerator.current_stream(stream.device)
+            torch.accelerator.set_stream(stream)
+            try:
+                self._resources[key].remove_request(rid)
+            finally:
+                torch.accelerator.set_stream(previous)
         for rids in self._unpublished.values():
             rids.discard(rid)
 
@@ -508,12 +535,17 @@ class StepRunner:
         for key in self._order:
             self._resources[key].clear_preplan()
 
+    def _beside_stage(self, step: SubmoduleStep) -> bool:
+        """A side lane's step, which leaves the stage alone."""
+        return bool(self._side_resources) and bool(step.keys()) and self._side_resources.issuperset(step.keys())
+
     def admit(self, step: SubmoduleStep) -> FullAdmitOutcome:
         """Reserve capacity for step. A refused admit gives back everything
         the step reserved, and drops its stage, whose plan addresses what it
         gave back.
         """
-        staged_key = self._drop_stale_preplan(step)
+        beside = self._beside_stage(step)
+        staged_key = None if beside else self._drop_stale_preplan(step)
         # A step whose ``pre_admit`` ran a step ahead, and whose stage is still
         # up for it, skips the resources that sweep covered: each would only
         # find its own reservation and no-op (0.1 ms of Python per step at
@@ -545,7 +577,7 @@ class StepRunner:
                 )
                 self._unwind(step, [*covered, *admitted, key])
                 # the unwind gave back the stage's pages, so a retry must plan afresh
-                if self._staged is not None:
+                if self._staged is not None and not beside:
                     self.clear_preplan()
                 return FullAdmitOutcome(outcome, key)
             admitted.append(key)
@@ -568,8 +600,10 @@ class StepRunner:
 
         place plan in `step.ctx.plan_results` before next plan runs
         again could possibly move that into `plan` itself"""
-        self._drop_stale_preplan(step)
-        if not step.ctx.is_preplan:
+        beside = self._beside_stage(step)
+        if not beside:
+            self._drop_stale_preplan(step)
+        if not (step.ctx.is_preplan or beside):
             # the resources promote their staged share below (or plan afresh
             # if nothing was staged): either way nothing stays staged
             self._staged = None

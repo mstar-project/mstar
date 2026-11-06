@@ -675,6 +675,8 @@ class Engine:
             node_resources={n: node_to_resources.get(n, []) for n in node_names},
             enable_nvtx=self._enable_nvtx,
             declared_by=declared_by,
+            # a side node's own: ``EngineManager.build`` lets no other node declare them
+            side_resources={key for node in self._side_stream_nodes for key in node_to_resources.get(node, ())},
         )
 
         self._open_prefix_caches(specs_by_key, model, instance, prefix_caches, checkpoint)
@@ -1011,6 +1013,14 @@ class Engine:
             "CapturePlan[%s] %s: capture took %.0f MiB, %.0f predicted", self._device, pool,
             took / 2**20, plan.predicted[pool] / 2**20,
         )
+
+    def set_side_stream(self, node_name: str, stream: Any) -> None:
+        """Run a side node's resource teardowns on ``stream``, the one its
+        steps run on. A pool zeroes a slot when a request releases it, and the
+        next request to take the slot writes it from the lane: on the main
+        stream that zero could land after the write, behind the chain's queued
+        steps."""
+        self._runner.set_side_stream(self._submodules[node_name].resources, stream)
 
     def _capture_stream_for(self, node_name: str) -> Any:
         """The stream a node captures on; None for the backend's shared one.

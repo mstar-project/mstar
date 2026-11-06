@@ -17,9 +17,17 @@ speculated, planned ahead or lockstep. Its graphs are captured on a stream of
 their own (``Engine._capture_stream_for``), which is what makes overlapping
 them safe.
 
-A resourced node, or a second side node, would each take a lane of their own
-with an id past this one: admit and plan on the lane's thread against its own
-stream, and the same submit, finish and scheduler filter.
+Of resources the lane takes recurrent state pools of its node's own (a codec's
+per-stream state). The step admits, plans and commits them on the GPU thread
+under the lane's stream, as the chain's inline steps do on theirs; with one
+step in flight, the next one plans only after this one has landed, so there is
+nothing to double-buffer. It leaves the chain's staged pre-plan alone
+(``StepRunner._beside_stage``), a refused admit sends its rows back to wait for a slot,
+teardowns wait for its admit (``Worker._settle_side_admit``), and the pools'
+teardowns run on its stream (``Engine.set_side_stream``).
+
+A second side node would take a lane of its own with an id past this one, and
+the same submit, finish and scheduler filter.
 """
 from __future__ import annotations
 
@@ -85,6 +93,8 @@ class SideStepLane:
             return
         if self._stream is None:
             self._stream = torch.Stream(device=worker.device)
+            # where its pools' slots are written, so their teardowns go there too
+            worker.engine_manager.get_engine(batch.node_name).set_side_stream(batch.node_name, self._stream)
         try:
             # its windows stack here, so the step is ordered behind them alone
             with self._stream:
@@ -109,8 +119,8 @@ class SideStepLane:
 
         Never before the step has landed: postprocess frees its inputs first,
         and those are main-stream allocations a main-stream step could reuse
-        while this one still reads them. A step here holds no resource, so
-        there is no admit to have refused it.
+        while this one still reads them. A step its pool refused ran nothing:
+        its rows go back to the scheduler as the chain's do, to wait for room.
         """
         step = self.pending
         if step is None or not (block or self._landed(step)):
@@ -121,6 +131,9 @@ class SideStepLane:
             worker._wait_for_step(step)
             worker._clear_in_flight_flag(step.batch)
             worker._count_turn(step)
+            if step.node_batch.admit_error is not None:
+                worker._handle_admit_failure(step.batch, step.node_batch)
+                return
             if step.node_batch.failed_requests:
                 worker._fail_step_rows(step, outputs)
             worker._finish_step(step, outputs)

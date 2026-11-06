@@ -8,6 +8,7 @@ lane filter, and which configs the startup decision refuses.
 from __future__ import annotations
 
 import contextlib
+import threading
 from concurrent.futures import Future
 from types import SimpleNamespace
 
@@ -18,11 +19,21 @@ from test_send_registration_failure import _decode_step, _postprocess_worker
 
 from mstar.distributed.communication import WorkerParallelGroups
 from mstar.engine import accelerator_graph_runner as runner_module
-from mstar.engine.engine import Engine
+from mstar.engine.engine import Engine, ExecutingBatch, SubmoduleManagement
+from mstar.engine.resources.base import EngineResourceInfo
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
+from mstar.engine.resources.recurrent.config import (
+    RecurrentBlockConfig,
+    RecurrentStateConfig,
+    RecurrentStateSpec,
+    RecurrentStep,
+)
+from mstar.engine.resources.recurrent.pool import SINK_SLOT, RecurrentStatePool
+from mstar.engine.resources.runner import StepRunner
+from mstar.engine.resources.step import AllocationFailed, Segment, StepContext, SubmoduleStep
 from mstar.graph.base import GraphEdge, GraphNode, Loop
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
-from mstar.model.submodule_base import DeviceLoopback, NodeSubmodule, TokenStop
+from mstar.model.submodule_base import BatchedModelOutput, DeviceLoopback, NodeSubmodule, TokenStop
 from mstar.utils.threads import ThreadPool
 from mstar.worker import side_steps
 from mstar.worker.engine_manager import EngineManager, _side_lane_keys, side_stream_nodes
@@ -35,27 +46,53 @@ _OUTPUTS = SimpleNamespace(host_rows=None, host_spans=None)
 
 
 class _StreamBackend:
-    """Records what reaches the stream API, in order."""
+    """Records what reaches the stream API, in order.
+
+    Each thread has a current stream, ``"main"`` until it sets one. As in torch
+    2.10, a ``Stream`` keeps its enter state on the object, whichever thread
+    entered it, and refuses a second enter while one is open (later builds
+    stack the enters on the object instead, which is no safer across threads).
+    """
 
     def __init__(self, monkeypatch):
         self.log: list[str] = []
         self.streams = 0
+        self._current: dict[int, object] = {}
         backend = self
 
         class Stream:
             def __init__(self, device):
                 backend.streams += 1
+                self.device = device
+                self._previous = None
 
             def wait_event(self, event):
                 backend.log.append("wait")
 
             def __enter__(self):
+                if self._previous is not None:
+                    raise RuntimeError("Stream's context should not be initialized.")
+                self._previous = backend.current()
+                backend._current[threading.get_ident()] = self
                 backend.log.append("enter side")
 
             def __exit__(self, *exc):
+                backend._current[threading.get_ident()], self._previous = self._previous, None
                 backend.log.append("exit side")
 
+            def __repr__(self):
+                return "side"
+
+        def set_stream(stream):
+            backend._current[threading.get_ident()] = stream
+            backend.log.append(f"set {stream}")
+
         monkeypatch.setattr(side_steps.torch, "Stream", Stream)
+        monkeypatch.setattr(torch.accelerator, "current_stream", lambda device=None: self.current())
+        monkeypatch.setattr(torch.accelerator, "set_stream", set_stream)
+
+    def current(self):
+        return self._current.get(threading.get_ident(), "main")
 
 
 def _batch(rids, node="Codec", walk="codec_chunk"):
@@ -72,6 +109,7 @@ def _step(rids, landed=True, done=True, failed=None, lane=SIDE_LANE):
     return PendingBatch(
         batch=_batch(rids), node_batch=SimpleNamespace(
             completion_event=SimpleNamespace(query=lambda: landed), failed_requests=dict(failed or {}),
+            admit_error=None,
         ),
         node_name=SIDE[0], partition="Codec", graph_walk=SIDE[1], future=future, lane=lane,
     )
@@ -103,6 +141,10 @@ def _worker():
         clear_batch_limit=lambda *a, **k: log.append("clear limit"),
         get_next_batch=lambda state, lane=CHAIN_LANE: None,
     )
+    worker.side_streams = []
+    worker.engine_manager = SimpleNamespace(get_engine=lambda node: SimpleNamespace(
+        set_side_stream=lambda node, stream: worker.side_streams.append(node),
+    ))
     return worker
 
 
@@ -136,7 +178,7 @@ def test_the_window_collates_on_the_lane_stream_before_the_step_is_submitted(mon
     assert backend.log == ["enter side", "build", "exit side", "submit"]
 
 
-def test_every_step_shares_one_stream(monkeypatch):
+def test_every_step_shares_one_stream_and_the_nodes_teardowns_run_on_it(monkeypatch):
     backend = _StreamBackend(monkeypatch)
     worker = _worker()
     worker.scheduler.get_next_batch = lambda state, lane=CHAIN_LANE: _batch([1])
@@ -147,7 +189,7 @@ def test_every_step_shares_one_stream(monkeypatch):
     lane.finish()
     lane.launch(None)
 
-    assert backend.streams == 1
+    assert backend.streams == 1 and worker.side_streams == ["Codec"]
 
 
 def test_a_step_that_staged_host_rows_fails(monkeypatch):
@@ -321,6 +363,24 @@ def test_failed_rows_are_reported_before_the_step_routes():
     )
 
 
+def test_a_step_its_pool_refused_goes_back_to_wait_and_routes_nothing():
+    """It ran no forward: its rows return to the scheduler as a refused
+    chain step's do (``Worker._handle_admit_failure``), and leave the lane."""
+    worker = _worker()
+    refused = []
+    worker._handle_admit_failure = lambda batch, node_batch: refused.append(sorted(batch.request_to_worker_graph))
+    lane = SideStepLane(worker)
+    step = lane.pending = _step([1, 2])
+    step.node_batch.admit_error = AllocationFailed(message="full", pages_short=1, label="main", request_id=2)
+    worker._hold_rows(SIDE_LANE, {1, 2})
+
+    lane.finish()
+
+    assert refused == [[1, 2]]
+    assert worker.log == ["wait for step", "clear in flight"]
+    assert lane.pending is None and worker._in_flight_rids == set()
+
+
 # ----- the chain's postprocess order ----------------------------------------
 
 def _chain_worker():
@@ -428,6 +488,306 @@ def test_a_row_in_both_steps_fails_with_the_chain():
     w._handle_main_loop_error(RuntimeError("boom"), (_step([1], lane=CHAIN_LANE), None), None)
 
     assert set(failed[0]) == {1}
+
+
+# ----- a step that holds a recurrent pool -------------------------------------
+#
+# A real RecurrentStatePool and StepRunner behind a hand-built Engine, driven
+# through the engine's own declare, admit, plan, forward and commit.
+
+POOL = "codec_state"
+
+
+def _pool(key=POOL, node="Codec", max_slots=3):
+    """The sink plus ``max_slots - 1`` streams of a two-float state."""
+    spec = RecurrentStateSpec(key, {node}, RecurrentStateConfig(
+        num_layers=1, blocks={"state": RecurrentBlockConfig(shape=(2,), dtype=torch.float32)},
+        max_slots=max_slots,
+    ))
+    return RecurrentStatePool.build(spec, EngineResourceInfo(device=torch.device("cpu")))
+
+
+class _StateSub(NodeSubmodule):
+    """The codec's declaration: a row per stream, reading and writing its slot."""
+
+    def declare_step(self, graph_walk, request_ids, inputs, **kwargs):
+        del graph_walk, inputs, kwargs
+        return SubmoduleStep(segments=[Segment(rid, "main", 1) for rid in request_ids], steps={POOL: RecurrentStep()})
+
+    def prepare_inputs(self, *a, **kw):  # pragma: no cover - the test builds inputs
+        raise NotImplementedError
+
+    def forward(self, *a, **kw):  # pragma: no cover - forward_batched runs
+        raise NotImplementedError
+
+    def preprocess(self, graph_walk, engine_inputs, inputs):
+        return {}
+
+
+def _advance(graph_walk, engine_inputs, **kwargs):
+    """Each row reads its stream's state and writes it back one higher, as a
+    window moves its decoder state on."""
+    del graph_walk, kwargs
+    pool = engine_inputs.resources[POOL]
+    state = pool.gather("state")
+    pool.scatter_("state", state + 1)
+    return BatchedModelOutput(per_rid_outputs={
+        rid: {"audio_chunk": [state[row]]} for row, rid in enumerate(engine_inputs.request_ids)
+    })
+
+
+def _state_engine(pool, chain_pool=None):
+    resources = {POOL: pool, **({"talker_state": chain_pool} if chain_pool is not None else {})}
+    eng = Engine.__new__(Engine)
+    eng._runner = StepRunner(resources, node_resources={
+        "Codec": [POOL], "Talker": ["talker_state"] if chain_pool is not None else [],
+    }, side_resources={POOL})
+    eng._resources = resources
+    eng._enable_nvtx = eng._enable_profile = False
+    eng._device = torch.device("cpu")
+    eng._pre_plan_done = {}
+    eng._loopback_steps = {}
+    eng._chunking = SimpleNamespace(forget_request=lambda rid: None, release=lambda rid, node: None)
+    eng._submodules = {"Codec": SubmoduleManagement(
+        submodule=_StateSub(), forward=None, forward_batched=_advance,
+        joint_comm_group=None, resources={POOL: pool},
+    )}
+    return eng
+
+
+def _side_batch(rids) -> ExecutingBatch:
+    batch = ExecutingBatch(
+        node_name="Codec", per_request_info={rid: SimpleNamespace() for rid in rids},
+        step_context=StepContext(request_ids=tuple(rids), graph_walk="codec_chunk", slot=0, capture=False),
+    )
+    batch.inputs = [SimpleNamespace(input_seq_len=1, tensor_inputs={}, kwargs={})] * len(rids)
+    batch.running_batched = True
+    return batch
+
+
+def _logged(log, obj, *names):
+    """Log each call of ``obj``'s methods ``names``, then make it."""
+    for name in names:
+        method = getattr(obj, name)
+        setattr(obj, name, lambda *a, _m=method, _n=name, **k: log.append(_n) or _m(*a, **k))
+
+
+def _zeroed_on(backend, pool):
+    """Log each slot zero with the stream current on its thread."""
+    zero = pool._zero_slot
+    pool._zero_slot = lambda index: backend.log.append(f"zero on {backend.current()}") or zero(index)
+
+
+def _side_lane(eng, monkeypatch):
+    """A lane whose GPU-thread step is the engine's exec, on a recorded stream."""
+    backend = _StreamBackend(monkeypatch)
+    worker = _worker()
+    worker._execute_on_gpu_thread = lambda batch, node_batch, plan_future: eng.exec(node_batch) and _OUTPUTS
+    lane = SideStepLane(worker)
+    lane._stream = side_steps.torch.Stream(worker.device)
+    eng.set_side_stream("Codec", lane._stream)
+    return lane, backend
+
+
+def test_a_side_step_takes_plans_and_commits_its_slot_on_the_lane_stream(monkeypatch):
+    pool = _pool()
+    eng = _state_engine(pool)
+    eng.add_request(1)
+    free = pool.num_free_slots
+    lane, backend = _side_lane(eng, monkeypatch)
+    _logged(backend.log, pool, "admit", "plan", "commit")
+    _zeroed_on(backend, pool)
+
+    first, second = _side_batch([1]), _side_batch([1])
+    lane.execute(_batch([1]), first, None)
+    slot = pool._slots[1]["main"]
+    lane.execute(_batch([1]), second, None)
+
+    assert slot.index != SINK_SLOT and pool.num_free_slots == free - 1
+    assert backend.log == ["enter side", "admit", "plan", "commit", "exit side"] * 2
+    # a fresh stream reads zeros, and its next window what the first one wrote
+    assert first.outputs.per_rid_outputs[1]["audio_chunk"][0].tolist() == [0.0, 0.0]
+    assert second.outputs.per_rid_outputs[1]["audio_chunk"][0].tolist() == [1.0, 1.0]
+    assert slot.has_state and slot.tokens == 2
+
+    eng.remove_request(1)
+
+    assert pool.num_free_slots == free and 1 not in pool._slots
+    assert backend.log[-3:] == ["set side", "zero on side", "set main"], (
+        "the slot was zeroed off the lane's stream, where the next stream's first write could land ahead of it"
+    )
+    assert backend.current() == "main"
+
+
+def test_a_teardown_beside_a_side_step_in_flight_sets_its_own_stream(monkeypatch):
+    """The GPU thread holds the lane's stream entered for the whole of a side
+    step, and a cancel tears a stream down on the main thread meanwhile: the
+    teardown can't enter the stream object, but its zero still goes on it."""
+    pool = _pool()
+    eng = _state_engine(pool)
+    for rid in (1, 2):
+        eng.add_request(rid)
+    lane, backend = _side_lane(eng, monkeypatch)
+    lane.execute(_batch([1]), _side_batch([1]), None)
+    _zeroed_on(backend, pool)
+    inside, release = threading.Event(), threading.Event()
+    seen, errors = {}, []
+
+    def forward(*args, **kwargs):
+        # past its admit, which is as far as a teardown waits for (``Worker._settle_side_admit``)
+        inside.set()
+        release.wait(5)
+        seen["gpu thread"] = backend.current()
+        return _advance(*args, **kwargs)
+
+    eng._submodules["Codec"].forward_batched = forward
+
+    def gpu_thread():
+        try:
+            lane.execute(_batch([2]), _side_batch([2]), None)
+        except Exception as exc:  # noqa: BLE001 - the assert below reports it
+            errors.append(exc)
+
+    thread = threading.Thread(target=gpu_thread)
+    thread.start()
+    assert inside.wait(5)
+    with pytest.raises(RuntimeError, match="context should not be initialized"), lane._stream:
+        pass
+    try:
+        eng.remove_request(1)
+    finally:
+        release.set()
+        thread.join(5)
+
+    assert "zero on side" in backend.log and backend.current() == "main"
+    assert not errors and seen["gpu thread"] is lane._stream
+    assert 1 not in pool._slots and pool._slots[2]["main"].tokens == 1
+
+
+def test_a_side_step_leaves_the_chains_staged_pre_plan_alone(monkeypatch):
+    """The plan thread stages the chain's next step while a side step admits
+    and plans on the GPU thread; the side step neither promotes nor drops it."""
+    pool, talker = _pool(), _pool("talker_state", "Talker")
+    eng = _state_engine(pool, talker)
+    eng.add_request(1)
+    eng.add_request(9)
+    chain = SubmoduleStep(segments=[Segment(9, "main", 1)], steps={"talker_state": RecurrentStep()})
+    chain.set_ctx(StepContext(request_ids=(9,), graph_walk="talker_decode", slot=0, capture=False))
+    chain.ctx.is_preplan = True
+    assert eng._runner.pre_admit(chain).ok
+    eng._runner.pre_plan(chain)
+    chain.ctx.is_preplan = False
+    lane, _ = _side_lane(eng, monkeypatch)
+
+    lane.execute(_batch([1]), _side_batch([1]), None)
+
+    assert eng._runner.staged and talker._preplanned, "the side step dropped the chain's stage"
+    assert eng._runner.admit(chain).ok
+    staged = talker._cached_plan_output
+    assert eng._runner.plan(chain)["talker_state"] is staged, "the chain's step planned afresh"
+
+
+@pytest.mark.parametrize("stage", ["admit", "plan"])
+def test_a_raise_in_a_side_steps_admit_or_plan_fails_its_own_rows(monkeypatch, stage):
+    pool, talker = _pool(), _pool("talker_state", "Talker")
+    eng = _state_engine(pool, talker)
+    for rid in (1, 9):
+        eng.add_request(rid)
+    chain = SubmoduleStep(segments=[Segment(9, "main", 1)], steps={"talker_state": RecurrentStep()})
+    chain.set_ctx(StepContext(request_ids=(9,), graph_walk="talker_decode", slot=0, capture=False))
+    chain.ctx.is_preplan = True
+    eng._runner.pre_admit(chain)
+    eng._runner.pre_plan(chain)
+    chain.ctx.is_preplan = False
+
+    def boom(*a, **k):
+        raise RuntimeError(f"{stage} failed")
+
+    monkeypatch.setattr(pool, stage, boom)
+    lane, _ = _side_lane(eng, monkeypatch)
+    worker = lane._worker
+    lane.pending = _step([1], done=False)
+    try:
+        lane.execute(_batch([1]), _side_batch([1]), None)
+    except RuntimeError as exc:
+        lane.pending.future.set_exception(exc)
+    worker._hold_rows(SIDE_LANE, {1})
+    worker._hold_rows(CHAIN_LANE, {9})
+
+    lane.finish()
+
+    assert ("fail", [1]) in worker.log and not any(e[0] == "postprocess" for e in worker.log if isinstance(e, tuple))
+    assert worker._in_flight_rids == {9} and lane.pending is None
+    assert eng._runner.staged and talker._preplanned, "the chain's stage went with the side step's raise"
+
+
+class _PoolEngine(_Engine):
+    """The scheduler's view of an engine whose ``NODE`` holds a real pool:
+    readiness asks its admission, as ``Engine.check_ready`` does."""
+
+    def __init__(self, eng):
+        super().__init__()
+        self.eng = eng
+
+    def check_ready(self, node_name, rid, fwd_info, allow_reload=True):
+        if node_name != NODE:
+            return super().check_ready(node_name, rid, fwd_info, allow_reload)
+        return self.eng._runner.admit_retrieve(rid, "Codec", WALK)
+
+    def admit_waiting(self, published_of):
+        return [(NODE, rid) for _, rid in self.eng.admit_waiting(published_of)]
+
+
+def test_a_full_pool_keeps_the_row_queued_while_the_chain_runs_on():
+    """A stream that finds every slot taken waits at readiness: it stays on its
+    queue, the chain's rows keep scheduling, and it runs once a slot frees."""
+    pool = _pool(max_slots=2)  # one stream beside the sink
+    eng = _state_engine(pool)
+    sched = _lanes(_scheduler(_PoolEngine(eng)))
+    sched.parallel_leader_nodes = {NODE, "Talker"}
+    for rid in (1, 2, 7):
+        eng.add_request(rid)
+    assert sorted(_next_batch(sched, _Manager([1]), lane=SIDE_LANE).request_to_worker_graph) == [1]
+    eng.exec(_side_batch([1]))  # its first window takes the slot
+    codec = _Manager([2])
+    codec.get_fwd_info = lambda rid, partition: SimpleNamespace(resource_publish_info=None)
+
+    assert _next_batch(sched, codec, lane=SIDE_LANE) is None
+    assert sched.parked.get(NODE) == {2} and 2 in codec.queues["wg0"]._ready
+    assert sorted(_next_batch(sched, _Manager([7], node="Talker", walk="talker_decode")).request_to_worker_graph) == [7]
+
+    eng.remove_request(1)
+
+    assert sorted(_next_batch(sched, codec, lane=SIDE_LANE).request_to_worker_graph) == [2]
+
+
+def _teardown_worker():
+    from test_removed_request_messages import _new
+    from test_removed_request_messages import _worker as _messages_worker
+
+    w = _messages_worker()
+    w._process_message_list([_new("A#1")])
+    return w
+
+
+def test_a_teardown_waits_for_the_side_steps_admit():
+    """The step admits on the GPU thread from the state a teardown releases."""
+    from test_removed_request_messages import _remove
+
+    w = _teardown_worker()
+    admitted = threading.Event()
+    seen = []
+    w.engine_manager.remove_request = lambda rid: seen.append(admitted.is_set())
+    lane = w._side_steps = SideStepLane(w)
+    lane.pending = _step([5], done=False)
+    lane.pending.node_batch.launch_started_event = admitted
+    w._phase_period = 0
+    w._span = lambda *a, **k: contextlib.nullcontext()
+    threading.Timer(0.2, admitted.set).start()
+
+    w._process_message_list([_remove("A#1")])
+
+    assert seen == [True], "the teardown ran while the side step had yet to admit"
 
 
 # ----- the scheduler ---------------------------------------------------------
@@ -569,6 +929,9 @@ class _Codec:
     def spanned_outputs(self, walk):
         return frozenset()
 
+    def resident_walks(self):
+        return frozenset()
+
 
 class _Groups:
     def __init__(self, world=1):
@@ -588,6 +951,16 @@ def _keys(submodules=None, specs=(), model=None, nodes=("Codec", "Talker"), aske
 
 def test_a_stream_fed_walk_beside_another_node_takes_the_lane():
     assert _keys() == (SIDE,)
+
+
+def _pool_spec(nodes=("Codec",), kv_cache=None):
+    return RecurrentStateSpec(POOL, set(nodes), RecurrentStateConfig(
+        num_layers=1, blocks={"state": RecurrentBlockConfig(shape=(2,), dtype=torch.float32)}, kv_cache=kv_cache,
+    ))
+
+
+def test_a_node_with_a_recurrent_pool_of_its_own_takes_the_lane():
+    assert _keys(specs=[_pool_spec()]) == (SIDE,)
 
 
 def test_a_node_that_does_not_ask_stays_on_the_chain_whatever_it_holds():
@@ -626,6 +999,11 @@ class _Vocoder(_Codec):
     side_stream_walks = frozenset({"vocode"})
 
 
+class _Resident(_Codec):
+    def resident_walks(self):
+        return frozenset({"codec_chunk"})
+
+
 _LOOP = Loop(name="decode_loop", section=_codec_node(), max_iters=4, outputs=[])
 
 
@@ -635,7 +1013,12 @@ _LOOP = Loop(name="decode_loop", section=_codec_node(), max_iters=4, outputs=[])
     (dict(nodes=("Codec",)), "only node on its worker"),
     (dict(accelerator=False), "no streams"),
     (dict(model=_Model({"codec_chunk": _codec_node(), "codec_warm": _codec_node()})), "also runs"),
-    (dict(specs=[SimpleNamespace(resource_key="codec_state", nodes={"Codec"})]), "holds resources"),
+    (dict(specs=[SimpleNamespace(resource_key="codec_kv", nodes={"Codec"})]), "holds resources .'codec_kv'"),
+    (dict(specs=[_pool_spec(), SimpleNamespace(resource_key="codec_kv", nodes={"Codec"})]),
+     "holds resources .'codec_kv'.: the lane admits and plans only a recurrent state pool"),
+    (dict(specs=[_pool_spec(nodes=("Codec", "Talker"))]), "a pool another node shares"),
+    (dict(specs=[_pool_spec(kv_cache="talker_kv")]), "holds resources .'codec_state'.*no prefix snapshots"),
+    (dict(submodules={"Codec": _Resident(), "Talker": object()}), "resident tables"),
     (dict(model=_Model({"codec_chunk": _LOOP})), "not a walk of that one node"),
     (dict(model=_Model({"codec_chunk": _codec_node("Talker")})), "not a walk of that one node"),
     (dict(model=_Model(combined={SIDE: "codec_mixed"})), "combined walk"),

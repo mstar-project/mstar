@@ -823,10 +823,16 @@ Qwen3-TTS notes
   why and runs the loop. torchaudio has no build for torch 2.12, and decoding a
   reference clip imports it, so a Base deployment that clones voices can't turn
   the kernel on yet.
-- The Codec does not run beside the Talker on a side stream (``side_stream``,
-  see :doc:`serving`): its windows read and write their streams' ``codec_state``
-  rows, and the side lane only takes a node that holds no resources, since it
-  neither admits nor plans a step ahead. No Qwen3-TTS config sets the field.
+- The Codec can run beside the Talker on a side stream (``side_stream: true``
+  on its node group, see :doc:`serving`), where the lane admits and plans the
+  windows' ``codec_state`` rows itself, but no config sets it. With every chunk
+  width in one codec step it pays only at low concurrency: on a B300 with
+  ``qwen3tts_1p7b.yaml``, lane on against the Codec on the chain is +6%
+  audio-s/s at c=8, level at c=16 and -4%, -11% and -7% at c=32, 64 and 128,
+  with first audio 11% later at c=64 (an H200 measures the same from c=64).
+  Beside the Codec's kernels a Talker decode step takes 11-15% longer on the
+  GPU at c=64 and c=128, and the lane runs smaller codec steps more often than
+  the chain batches them.
 - ``configs/qwen3tts_1p7b_split.yaml`` (and ``configs/qwen3tts_split.yaml``
   for the 0.6B) runs the Codec on a second worker that
   shares GPU 0 (``rank_devices``) and caps the Talker KV pool so both fit.

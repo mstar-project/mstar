@@ -606,13 +606,16 @@ group runs that node's steps on a lane of their own instead of the worker's main
 they take no turn on it, run on a second CUDA stream beside its steps, and whatever
 comes ready meanwhile batches into the next one. It applies to the walks the node's
 submodule declares in ``side_stream_walks`` (Qwen3-TTS's ``Codec`` declares
-``codec_chunk``, but no config sets the field while it holds its ``codec_state`` pool), and keeps both nodes on one
-worker and one CUDA context, unlike a split with MPS. Startup fails with a
+``codec_chunk``; no shipped config sets the field, see :doc:`models` for why), and keeps both nodes on one
+worker and one CUDA context, unlike a split with MPS. The lane admits and plans a
+recurrent state pool of the node's own (the Codec's ``codec_state``); a slot the pool
+can't give yet makes the stream wait, as on the chain. Startup fails with a
 ``ValueError`` naming the field where the lane can't apply: a TP or SP node, a node
 alone on its worker, a device without streams, a node that also runs walks on the
-chain or holds resources, or a side walk that isn't the node's alone, is part of a
-combined walk, or has output spans or a stop check. Without the field the node runs on
-the chain:
+chain, holds any other resource (a KV cache, attention, positions, a sampler, a pool
+another node shares or one keyed on a KV cache) or plans on resident tables, or a side
+walk that isn't the node's alone, is part of a combined walk, or has output spans or a
+stop check. Without the field the node runs on the chain:
 
 .. code-block:: yaml
 
