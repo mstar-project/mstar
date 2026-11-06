@@ -16,7 +16,7 @@ import pytest
 import torch
 
 from mstar.engine.resources.kv.config import KVSpec
-from mstar.graph.base import GraphNode, Loop, Sequential, TensorPointerInfo
+from mstar.graph.base import GraphNode, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.pi05.components.flow_matching import (
     discretize_state,
@@ -259,26 +259,17 @@ def test_pi05_prefill_is_sequential_vit_then_llm():
     assert set(second.input_names) == {"img_emb", "text_inputs"}
 
 
-def test_pi05_action_gen_is_loop_with_action_output_emission():
+def test_pi05_action_gen_is_one_llm_step_emitting_actions():
     model = _make_model()
-    walks = model.get_graph_walk_graphs()
-    action_gen = walks[Pi05Model.ACTION_GEN_WALK]
-    assert isinstance(action_gen, Loop)
-    assert action_gen.max_iters== model.config.num_flow_steps == 10
-    # The terminal output emits to the client with the action modality.
-    # Its ``name`` must match one of the section's loop-back edge names so
-    # that Loop._replace_outputs_for_final_iter can swap it in on the final
-    # iteration (see the comment in Pi05Model.get_graph_walk_graphs).
+    action_gen = model.get_graph_walk_graphs()[Pi05Model.ACTION_GEN_WALK]
+    # The whole denoising loop runs inside one LLM step, so the walk is a
+    # single node whose only output goes to the client.
+    assert isinstance(action_gen, GraphNode) and action_gen.name == "LLM"
+    assert set(action_gen.input_names) == {"noisy_actions"}
     assert len(action_gen.outputs) == 1
-    terminal = action_gen.outputs[0]
-    assert terminal.next_node == EMIT_TO_CLIENT
-    assert terminal.name == "noisy_actions"
-    assert terminal.output_modality == "action"
-    # Loop body is a single LLM node with two loop-back edges.
-    body = action_gen.section
-    assert isinstance(body, GraphNode) and body.name == "LLM"
-    assert {e.name for e in body.outputs} == {"noisy_actions", "timestep_index"}
-    assert all(e.next_node == "LLM" for e in body.outputs)
+    out = action_gen.outputs[0]
+    assert out.next_node == EMIT_TO_CLIENT
+    assert out.output_modality == "action"
 
 
 def test_pi05_kv_cache_config_matches_pi05_config():

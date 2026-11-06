@@ -5,8 +5,8 @@ Two submodules:
   Pi05LLMSubmodule        -- combined PaliGemma + action expert. Dispatches by
                              graph_walk between prefill (PaliGemma writes the
                              prefix KV cache) and action_gen (action expert
-                             reads the frozen prefix KV cache and runs one
-                             Euler flow-matching step).
+                             reads the frozen prefix KV cache and runs the
+                             whole Euler flow-matching loop).
 """
 
 import logging
@@ -27,7 +27,7 @@ from mstar.engine.accelerator_graph_config import (
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import AttentionStep, KVStep, PositionStep, Segment, SlotLease, SubmoduleStep
 from mstar.model.pi05.components.action_expert import Pi05ActionExpert, Pi05TimeMLP
-from mstar.model.pi05.components.flow_matching import sincos_timestep_embedding
+from mstar.model.pi05.components.flow_matching import euler_step, sincos_timestep_embedding
 from mstar.model.pi05.components.paligemma import Pi05PaliGemmaExpert
 from mstar.model.pi05.components.siglip import Pi05SiglipEncoder
 from mstar.model.pi05.config import LLM_ATTN, LLM_KV, LLM_POS, Pi05Config
@@ -285,12 +285,10 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
       - ``prefill``:    PaliGemma forwards over the prefix
                         ``[image_tokens, language_tokens, state_tokens]`` and
                         writes the KV cache.
-      - ``action_gen``: action expert runs one Euler step of flow-matching
+      - ``action_gen``: action expert runs every Euler step of flow-matching
                         denoising over the action suffix, attending to the
-                        frozen prefix KV cache. The current ``noisy_actions``
-                        and ``timestep_index`` cycle through the loop via
-                        loop-back graph edges; on the final iteration the
-                        denoised action tensor is emitted as ``action_output``.
+                        frozen prefix KV cache, and emits the denoised
+                        actions as ``actions``.
     """
 
     # Parameter name fragments whose weights must stay in float32 even when
@@ -331,7 +329,7 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
         # language embeddings times sqrt(hidden_size).
         self._text_embed_scale = math.sqrt(config.hidden_size)
 
-        # Lazily allocated on first action Euler step, sized for the largest
+        # Lazily allocated on the first action_gen step, sized for the largest
         # captured batch. sincos_timestep_embedding fully overwrites this buffer
         # every step, so torch.empty suffices (no zeroing needed).
         self._fraction: torch.Tensor | None = None
@@ -361,9 +359,9 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
           processed in a single PaliGemma forward with batched FlashInfer
           attention. Each request can have a different prefix length (different
           text prompt lengths).
-        - ``action_gen``: all requests in a batch are at the same Euler
-          iteration (guaranteed by the Loop primitive), so their suffix tokens
-          can be concatenated and processed in a single action expert forward.
+        - ``action_gen``: every request runs the same denoising loop, so their
+          suffix tokens are concatenated and each Euler step is one action
+          expert forward.
         """
         return True
 
@@ -424,7 +422,6 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
                         "noisy_actions": torch.zeros(
                             self.config.action_horizon, self.config.action_dim, device=device
                         ),
-                        "ts": torch.zeros(1, device=device, dtype=torch.long)
                     }
                 ),
                 capture_batch_sizes=self.ACTION_GEN_CAPTURE_BATCH_SIZES
@@ -457,10 +454,7 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
                 inputs=inputs,
             )
         if graph_walk == "action_gen":
-            return self._prepare_inputs_action_gen(
-                inputs=inputs,
-                fwd_info=fwd_info,
-            )
+            return self._prepare_inputs_action_gen(fwd_info=fwd_info)
         raise ValueError(f"Unknown Pi0.5 LLM graph walk: {graph_walk!r}")
 
     def _prepare_inputs_prefill(
@@ -483,32 +477,14 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
 
         return ARNodeInputs(input_embeds=prefix_emb, input_seq_len=seq_len)
 
-    def _prepare_inputs_action_gen(
-        self,
-        fwd_info: CurrentForwardPassInfo,
-        inputs: NameToTensorList,
-        **kwargs
-    ) -> ARNodeInputs:
+    def _prepare_inputs_action_gen(self, fwd_info: CurrentForwardPassInfo) -> ARNodeInputs:
         device = self.get_device()
         action_horizon = self.config.action_horizon
-        action_dim = self.config.action_dim
-
-        if "noisy_actions" not in inputs or len(inputs["noisy_actions"]) == 0:
-            generator = torch.Generator(device=device).manual_seed(fwd_info.random_seed)
-            noisy = torch.randn(
-                action_horizon, action_dim, device=device, generator=generator
-            )
-            ts = torch.zeros(1, device=device, dtype=torch.long)
-        else:
-            noisy = inputs["noisy_actions"][0]
-            ts = inputs["timestep_index"][0]
-
-        seq_len = action_horizon
-        return ARNodeInputs(input_seq_len=seq_len,
-                            tensor_inputs={
-                                "noisy_actions": noisy,
-                                "ts": ts
-                            })
+        generator = torch.Generator(device=device).manual_seed(fwd_info.random_seed)
+        noisy = torch.randn(
+            action_horizon, self.config.action_dim, device=device, generator=generator
+        )
+        return ARNodeInputs(input_seq_len=action_horizon, tensor_inputs={"noisy_actions": noisy})
 
 
     def declare_step(
@@ -576,15 +552,8 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
             dim=0
         ) # [N * horizon, action_dim]
 
-        all_ts = torch.cat(
-            [inp.tensor_inputs["ts"] for inp in inputs],
-            dim=0
-        )
-
         return {
             "noisy_actions": cat_noisy,
-            "timestep_index": all_ts,
-            "seq_lens": [inp.input_seq_len for inp in inputs],
             "fraction": self._get_timestep_emb_fraction(),
             "time_emb_buffer": self._get_time_emb_buffer(len(inputs))
         }
@@ -644,31 +613,17 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
         self,
         request_ids: list[str],
         noisy_actions: torch.Tensor,
-        timestep_index: torch.Tensor,
         fraction: torch.Tensor,
         time_emb_buffer: torch.Tensor,
         **kwargs
     ) -> dict[str, NameToTensorList]:
-        """Batched action_gen: single action expert forward, then split per-request."""
-
+        """Batched action_gen: the denoising loop over the concatenated rows, then split per-request."""
         horizon = self.config.action_horizon
-
-        next_actions, next_index = self._euler_step(
-            noisy_actions, timestep_index,
-            fraction=fraction,
-            time_emb_buffer=time_emb_buffer,
-        )
-
-        # Split back per-request by horizon.
-        result: dict[str, NameToTensorList] = {}
-        for i, rid in enumerate(request_ids):
-            start = i * horizon
-            end = start + horizon
-            result[rid] = {
-                "noisy_actions": [next_actions[start:end]],
-                "timestep_index": [next_index[i:i+1]],
-            }
-        return result
+        actions = self._denoise(noisy_actions, fraction=fraction, time_emb_buffer=time_emb_buffer)
+        return {
+            rid: {"actions": [actions[i * horizon:(i + 1) * horizon]]}
+            for i, rid in enumerate(request_ids)
+        }
 
     def _forward_prefill(
         self,
@@ -680,88 +635,48 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
 
     def _forward_action_gen(
         self,
-        noisy_actions,
-        timestep_index,
-        fraction,
-        time_emb_buffer,
-        **kwargs,
-    ) -> NameToTensorList:
-        """Single-request action_gen forward (called from _execute_sequential).
-
-        ``noisy_actions`` and ``timestep_index`` arrive as single-element
-        lists from preprocess (to keep the data structure uniform with the
-        batched path). We unpack the first element, run one Euler step, and
-        return the loop-back edges.
-        """
-        # Unpack from list form (preprocess always returns lists now).
-        if isinstance(noisy_actions, list):
-            noisy_actions = noisy_actions[0]
-        if isinstance(timestep_index, list):
-            timestep_index = timestep_index[0]
-
-        next_actions, next_index = self._euler_step(
-            noisy_actions, timestep_index,
-            fraction=fraction,
-            time_emb_buffer=time_emb_buffer,
-        )
-        # We ALWAYS return both loop-back edges, even on the final iteration.
-        # The Loop primitive (mstar/graph/base.py:Loop) handles the final-iter
-        # swap automatically: it matches the section's output ``noisy_actions``
-        # to the Loop's terminal output (also named ``noisy_actions``, but
-        # routed to EMIT_TO_CLIENT with ``output_modality="action"``) and
-        # filters out the ``timestep_index`` loop-back edge. Same convention
-        # BAGEL's image_gen uses for ``latents`` / ``time_index``.
-        return {
-            "noisy_actions": [next_actions],
-            "timestep_index": [next_index],
-        }
-
-    def _euler_step(
-        self,
         noisy_actions: torch.Tensor,
-        timestep_index: torch.Tensor,
         fraction: torch.Tensor,
         time_emb_buffer: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """One Euler flow-matching step. Shared by sequential and batched paths.
+        **kwargs,
+    ) -> NameToTensorList:
+        """Single-request action_gen forward (called from _execute_sequential)."""
+        return {"actions": [self._denoise(noisy_actions, fraction=fraction, time_emb_buffer=time_emb_buffer)]}
+
+    def _denoise(
+        self,
+        noisy_actions: torch.Tensor,
+        fraction: torch.Tensor,
+        time_emb_buffer: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run all ``num_flow_steps`` Euler steps from t=1 to t=0.
 
         Args:
-            noisy_actions: [horizon, action_dim] (or [total_horizon, action_dim]
-                when batched across multiple requests).
-            timestep_index: scalar long.
+            noisy_actions: [N * horizon, action_dim], the initial noise.
+            time_emb_buffer: [N, action_hidden_size] scratch for the timestep embedding.
 
         Returns:
-            (next_actions, next_timestep_index) with same shapes as inputs.
+            The denoised actions, same shape as ``noisy_actions``.
         """
-        # noisy_actions: [N * horizon, action_dim]
-        # timestep_index: [N]
-
         config = self.config
         num_steps = config.num_flow_steps
-
-        idx = timestep_index.to(noisy_actions.dtype)
-        t = 1.0 - idx / num_steps
-
-        time_emb = sincos_timestep_embedding(
-            t,
-            dim=config.action_hidden_size,
-            fraction=fraction,
-            output_buffer=time_emb_buffer,
-            min_period=config.timestep_min_period,
-            max_period=config.timestep_max_period,
-        )
-        adarms_cond = self.time_mlp(time_emb)
-
-        suffix = self.action_in_proj(noisy_actions)
-
-        suffix_out = self.action_expert(
-            query_sequence=suffix,
-            adarms_cond=adarms_cond,
-            label="main",
-        )
-
-        velocity = self.action_out_proj(suffix_out)
         dt = -1.0 / num_steps
-        next_actions = noisy_actions + dt * velocity
-        next_index = timestep_index + 1
-        return next_actions, next_index
+        actions = noisy_actions
+        for step in range(num_steps):
+            idx = time_emb_buffer.new_full((time_emb_buffer.shape[0],), float(step))
+            time_emb = sincos_timestep_embedding(
+                1.0 - idx / num_steps,
+                dim=config.action_hidden_size,
+                fraction=fraction,
+                output_buffer=time_emb_buffer,
+                min_period=config.timestep_min_period,
+                max_period=config.timestep_max_period,
+            )
+            adarms_cond = self.time_mlp(time_emb)
+            suffix_out = self.action_expert(
+                query_sequence=self.action_in_proj(actions),
+                adarms_cond=adarms_cond,
+                label="main",
+            )
+            actions = euler_step(actions, self.action_out_proj(suffix_out), dt)
+        return actions
