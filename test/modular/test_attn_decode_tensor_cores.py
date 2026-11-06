@@ -128,3 +128,34 @@ def test_a_flag_that_is_not_a_yaml_boolean_is_refused(spec_cls, config):
 def test_the_default_is_mains_tensor_core_kernel():
     assert AttentionConfig(kv_cache="kv").decode_tensor_cores is True
     assert CrossAttentionConfig(kv_cache="ctx").decode_tensor_cores is True
+
+
+def test_cross_attention_replans_a_new_split_of_the_same_pages():
+    """Two steps over the same concatenated context pages and last-page
+    lengths, split between the rows differently, are different plans: a
+    skipped re-plan would keep the old split and a row would attend another's
+    context."""
+    from mstar.engine.resources.attn.config import AttentionStep
+    from mstar.engine.resources.kv.plan import SequenceView
+    from mstar.engine.resources.step import Segment, StepContext
+
+    spec = CrossAttentionSpec(resource_key="xattn", nodes={"n"}, config=CrossAttentionConfig(
+        kv_cache="ctx", backend=AttnBackend.FLASHINFER,
+    ))
+    manager = CrossAttentionManager.build(spec, _info(_kv()))
+    plans = []
+    wrapper = SimpleNamespace(plan=lambda **kw: plans.append(kw["paged_kv_indptr"].tolist()))
+    manager._wrapper_for = lambda *args, **kwargs: ("slot", wrapper)
+    step = AttentionStep(segments=(Segment("a", "main", 1), Segment("b", "main", 1)))
+    label = manager._context_label
+    for a_pages, b_pages in (([1, 2], [3]), ([1], [2, 3])):
+        views = [
+            SequenceView(rid, label, pages, 16 * len(pages), 0)
+            for rid, pages in (("a", a_pages), ("b", b_pages))
+        ]
+        ctx = StepContext(
+            request_ids=("a", "b"), graph_walk="decode", slot=0, capture=False,
+            plan_results={"ctx": {label: SimpleNamespace(columns=None, views=views)}},
+        )
+        manager.plan(step, ctx)
+    assert plans == [[0, 2, 3], [0, 1, 3]]

@@ -2111,6 +2111,22 @@ def _decode_ws_files(
     return file_paths, parts
 
 
+async def _decode_ws_files_off_loop(
+    files: list | None, upload_dir: Path,
+) -> tuple[dict[str, list[str]], list[PromptPart]]:
+    """``_decode_ws_files`` on the threadpool. A cancel (the socket closed)
+    can't stop the thread, and the caller never learns its paths, so what
+    it saved is removed once it returns."""
+    decode = asyncio.ensure_future(run_in_threadpool(_decode_ws_files, files, upload_dir))
+    try:
+        return await asyncio.shield(decode)
+    except asyncio.CancelledError:
+        decode.add_done_callback(
+            lambda done: done.cancelled() or done.exception() or unlink_files(done.result()[0])
+        )
+        raise
+
+
 def _ws_modalities(value, key: str) -> list[str] | None:
     """A modality list as a message may spell it: a comma-separated string or
     a list of strings. Anything else is rejected by name."""
@@ -2327,8 +2343,8 @@ async def generate_ws(websocket: WebSocket):
             end_input = _ws_end_input(message)
             if not text and not message.get("files") and (end_input is True or not api_server.takes_stream_input):
                 raise ValueError("message carries neither text nor files")
-            file_paths, parts = await run_in_threadpool(
-                _decode_ws_files, message.get("files"), api_server.upload_dir,
+            file_paths, parts = await _decode_ws_files_off_loop(
+                message.get("files"), api_server.upload_dir,
             )
             file_streams = _ws_file_streams(message.get("files"), parts)
             in_mods, parts = _ws_input_layout(
@@ -2446,8 +2462,8 @@ async def generate_ws(websocket: WebSocket):
             if text is not None and not isinstance(text, str):
                 raise ValueError("text must be a string")
             model_kwargs = _ws_model_kwargs(record.get("model_kwargs"))
-            file_paths, parts = await run_in_threadpool(
-                _decode_ws_files, record.get("files"), api_server.upload_dir,
+            file_paths, parts = await _decode_ws_files_off_loop(
+                record.get("files"), api_server.upload_dir,
             )
             file_streams = _ws_file_streams(record.get("files"), parts)
             if not file_paths and not text and not end_input:
