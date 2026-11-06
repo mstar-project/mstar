@@ -2805,22 +2805,24 @@ class Engine:
             )
             raw = submodule_mgmt.forward(graph_walk, engine_inputs=engine_inputs, **preprocessed)
             out = raw if isinstance(raw, BatchedModelOutput) else BatchedModelOutput.coerce({request_ids[0]: raw})
-        if submodule_mgmt.device_stops and getattr(submodule_mgmt.submodule, "ITERATION_INPUTS", None):
-            self._finish_eager_iterations(batch, submodule_mgmt, engine_inputs, out)
         return out
 
-    def _finish_eager_iterations(self, batch, mgmt, engine_inputs, output: BatchedModelOutput) -> None:
-        """An eager fallback runs after its predecessor settled. Publish its
-        actual position and terminal state before a captured successor reads.
+    def _finish_ordinary_iterations(self, batch, mgmt, output: BatchedModelOutput) -> None:
+        """Publish an ordinary fallback after its complete node computation.
+
+        This includes plain captures and output-name normalization in the tail.
+        Dependent fallback steps are rebuilt after their predecessor settles.
         """
         layouts = self.iteration_layouts(batch.node_name) or {}
-        rids = engine_inputs.request_ids
+        rids = output.row_request_ids or tuple(batch.request_ids)
+        infos_by_rid = batch.per_request_info_wrapped
         for walk, loop in layouts.items():
-            positions = [i for i, rid in enumerate(rids) if batch.step_context.walk_of(rid) == walk]
+            positions = [i for i, rid in enumerate(rids) if rid in infos_by_rid and rid not in batch.cached_rids
+                         and batch.step_context.walk_of(rid) == walk]
             if not positions:
                 continue
             selected = [rids[i] for i in positions]
-            infos = [engine_inputs.per_request_info[rid] for rid in selected]
+            infos = [infos_by_rid[rid] for rid in selected]
             policy = mgmt.device_stops[walk]
             limits = [policy.limits(info) for info in infos]
             stopped = to_device_nonblocking([
@@ -2835,7 +2837,7 @@ class Engine:
                     ])
                 else:
                     pick = to_device_nonblocking(positions, self._device, dtype=torch.long)
-                    tokens = tokens.reshape(len(rids), -1)[:, 0].index_select(0, pick)
+                    tokens = tokens.reshape(tokens.shape[0], -1)[:, 0].index_select(0, pick)
                 ids = to_device_nonblocking(list(policy.eos_tokens), self._device, dtype=tokens.dtype)
                 immune = to_device_nonblocking([limit.ignore_eos for limit in limits], self._device, dtype=torch.bool)
                 stopped.logical_or_(torch.isin(tokens, ids) & ~immune)
@@ -2943,6 +2945,10 @@ class Engine:
                         outputs, batch.per_request_info_wrapped, batch.inputs,
                         piecewise_runners=submodule_mgmt.piecewise_runners,
                     )
+            mgmt = self._submodules[batch.node_name]
+            if (batch.run_started is None and mgmt.device_stops
+                    and getattr(mgmt.submodule, "ITERATION_INPUTS", None)):
+                self._finish_ordinary_iterations(batch, mgmt, outputs)
             for rid in batch.cached_rids:
                 self._runner.complete_cached_walk(rid, batch.node_name, batch.step_context.walk_of(rid))
         laps.lap("tail")

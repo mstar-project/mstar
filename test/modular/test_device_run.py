@@ -1068,7 +1068,8 @@ def test_a_queued_window_reads_actual_progress_and_suppresses_predecessor_stops(
     assert calls[-1].tolist() == [7, 20]
 
 
-def test_eager_and_captured_steps_publish_the_same_actual_loop_progress(monkeypatch):
+@pytest.mark.parametrize("plain_capture", [False, True])
+def test_ordinary_and_device_steps_publish_the_same_actual_loop_progress(monkeypatch, plain_capture):
     from mstar.engine.engine import Engine, ExecutingBatch
     from mstar.engine.resources.step import StepContext
     from mstar.graph.loop_indices import LoopLayout
@@ -1083,13 +1084,21 @@ def test_eager_and_captured_steps_publish_the_same_actual_loop_progress(monkeypa
         forward_batched=lambda *args, **kwargs: BatchedModelOutput(
             check_stop_buffers={"new_token": torch.tensor([EOS, 2])},
         ),
-        forward=lambda *args, **kwargs: {"new_token": [torch.tensor([EOS])]},
+        forward=lambda *args, **kwargs: {"raw_sample": [torch.tensor([EOS])]},
     )
     engine = Engine.__new__(Engine)
     engine._device = CPU
     engine._submodules = {"n": mgmt}
     engine._loops = {("n", WALK): LoopLayout("decode")}
     engine._runner = SimpleNamespace(request_generation=lambda rid: 1)
+    engine._stage_lock = None
+
+    def postprocess(batch, output):
+        for values in output.per_rid_outputs.values():
+            if "raw_sample" in values:
+                values["new_token"] = values.pop("raw_sample")
+
+    engine.postprocess_batch = postprocess
 
     def eager(rids, counters, passes, walks=None):
         batch = ExecutingBatch(
@@ -1100,11 +1109,18 @@ def test_eager_and_captured_steps_publish_the_same_actual_loop_progress(monkeypa
             step_context=StepContext(request_ids=tuple(rids), graph_walk=WALK, slot=0, capture=False,
                                      request_walks=walks or {}),
         )
-        return engine._forward(
-            batch, mgmt, None,
-            SimpleNamespace(request_ids=rids, per_request_info=batch.per_request_info_wrapped),
-            {}, None, len(rids) > 1, rids, None,
+        lease = object() if plain_capture and len(rids) > 1 else None
+        ordinary = SimpleNamespace(
+            slot_for=lambda lease: SimpleNamespace(row_heads={}, run=None),
+            run_forward=lambda *args, **kwargs: mgmt.forward_batched(),
         )
+        mgmt.device_stream_tokens = {}
+        engine.exec = lambda current: engine._forward(
+            current, mgmt, ordinary,
+            SimpleNamespace(request_ids=rids, per_request_info=current.per_request_info_wrapped),
+            {}, lease, len(rids) > 1, rids, None,
+        )
+        return engine.exec_and_postprocess(batch)
 
     # Its successor's window was prepared at zero before this ordinary step.
     window = IterationWindow(
