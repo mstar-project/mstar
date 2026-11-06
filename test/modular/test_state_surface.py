@@ -24,7 +24,7 @@ from mstar.engine.state.within_step import WithinStepHandle
 _POSITIONAL = {"PagedNHDTarget", "Reached", "Segment", "SlotLease", "Span"}
 # The calls take the handle first, then what every call names, and only then keywords.
 _CALLS = {
-    "at_last_token", "causal_conv", "gated_delta_net", "host", "last_sampled", "position", "positions",
+    "add_read", "at_last_token", "causal_conv", "gated_delta_net", "host", "last_sampled", "position", "positions",
     "rope", "sample",
 }
 # Each public name's parameters as ``[name, kind, default]``. A dataclass's parameters are its fields.
@@ -182,6 +182,13 @@ SNAPSHOT = {
     ],
     "Window": [
         ["size", "POSITIONAL_OR_KEYWORD", None],
+    ],
+    "add_read": [
+        ["h", "POSITIONAL_OR_KEYWORD", None],
+        ["layer", "POSITIONAL_OR_KEYWORD", None],
+        ["q", "POSITIONAL_OR_KEYWORD", 'None'],
+        ["keep", "KEYWORD_ONLY", 'None'],
+        ["keywords", "VAR_KEYWORD", None],
     ],
     "at_last_token": [
         ["h", "POSITIONAL_OR_KEYWORD", None],

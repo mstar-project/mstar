@@ -332,6 +332,24 @@ class SamplerHandle(StepHandle):
 
 
 @torch.compiler.disable
+def add_read(
+    h: ArrayHandle, layer: int | torch.Tensor, q: torch.Tensor | None = None, *, keep: bool | None = None,
+    **keywords: Any,
+) -> torch.Tensor:
+    """``add`` then ``read`` on ``layer`` behind one graph break, for a layer with nothing traced between them, so it
+    compiles no frame for the gap. A keyword that names an entry field goes to ``add``, and any other to ``read``."""
+    if not h.array.max_len:
+        raise h._refusal("add_read with max_len 0, whose add and read a compiled block traces: a break here takes the "
+                         "read out of that graph")
+    fields = h.array.entry.tensors
+    # A keyword a read defines can't share a field's name, since it would go to `add`.
+    if "q" in fields:
+        raise h._refusal("add_read takes q for the read, and the entry declares a field named q")
+    h.add(layer, keep=keep, **{name: keywords.pop(name) for name in fields if name in keywords})
+    return h.read(layer, q, **keywords)
+
+
+@torch.compiler.disable
 def causal_conv(
     h: ArrayHandle, layer: int | torch.Tensor, x: torch.Tensor, *, weight: torch.Tensor,
     bias: torch.Tensor | None = None,
