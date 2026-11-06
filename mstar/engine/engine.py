@@ -28,7 +28,7 @@ from mstar.engine.accelerator_graph_runner import (
     plan_captures,
 )
 from mstar.engine.chunking import DEFAULT_MIN_CHUNK_TOKENS, ChunkingManagement, ChunkRange
-from mstar.engine.device_run import RunAsk, TokenStream, run_item
+from mstar.engine.device_run import IterationWindow, RunAsk, TokenStream, run_item
 from mstar.engine.fp32_precision import Fp32Precision, cudnn_benchmark, fp32_precision_scope, node_fp32_precision
 from mstar.engine.node_dtype import resolve_node_dtype
 from mstar.engine.resources import (
@@ -474,7 +474,7 @@ class ExecutingBatch:
     uniform_inputs: NodeInputs | None = None
     # the step's iteration inputs (``NodeSubmodule.ITERATION_INPUTS``), a
     # column a replay: ``[rows, repeats, ...]``, staged after ``preprocess``
-    iteration_columns: dict[str, torch.Tensor] | None = None
+    iteration_columns: dict[str, torch.Tensor] | IterationWindow | None = None
     # rid -> the stream windows its row took (an item a replay), whose items
     # past the step's settled count go back to their streams
     stream_windows: dict[int, list] = field(default_factory=dict)
@@ -2648,9 +2648,19 @@ class Engine:
         try:
             columns = None
             if getattr(submodule, "ITERATION_INPUTS", None):
-                batch.iteration_columns = engine_inputs.iteration_inputs = columns = self._iteration_columns(
-                    batch.node_name, submodule, ctx, rids, req_info, batch.per_request_input_tensors,
+                run = None if lease is None else cg_runner.slot_for(lease).run
+                loop = (
+                    self._loops[(batch.node_name, ctx.graph_walk)]
+                    if run is not None and run.window is not None else None
                 )
+                batch.iteration_columns = self._iteration_columns(
+                    batch.node_name, submodule, ctx, rids, req_info, batch.per_request_input_tensors,
+                    actual_loop=loop,
+                )
+                columns = batch.iteration_columns
+                if isinstance(columns, IterationWindow):
+                    columns = columns.columns
+                engine_inputs.iteration_inputs = columns
             if ctx.resident is None and ctx.repeats == 1:
                 preprocessed = submodule.preprocess(ctx.graph_walk, engine_inputs=engine_inputs, inputs=inputs)
             else:
@@ -3439,18 +3449,39 @@ class Engine:
     def _iteration_columns(
         self, node_name: str, submodule: NodeSubmodule, ctx: StepContext, rids: Sequence[int],
         req_info: Mapping[int, Any], inputs: Mapping[int, Mapping[str, list]] = MappingProxyType({}),
-    ) -> dict[str, torch.Tensor]:
+        *, actual_loop: LoopLayout | None = None,
+    ) -> dict[str, torch.Tensor] | IterationWindow:
         """The step's iteration inputs, a column a replay: each row at its own
         iteration of its walk's Loop (0 outside one), a padding row at its
         ``capture_fill``."""
         streamed = [spec for spec in submodule.ITERATION_INPUTS.values() if spec.streamed]
-        rows = []
+        rows, origins, entries, horizons = [], [], [], []
+        real = set(ctx.request_ids) if actual_loop is not None else ()
         for rid in rids:
+            if actual_loop is not None and rid not in real:
+                rows.append(None)
+                origins.append(0)
+                entries.append([-1] * (2 + len(actual_loop.ancestors)))
+                horizons.append(0)
+                continue
             info = req_info.get(rid)
             loop = self._loops.get((node_name, ctx.walk_of(rid)))
             # the counter as the engine reads it, not watched
             counts = getattr(info, "metadata", info)
             k = 0 if loop is None or counts is None else counts.dynamic_loop_iter_counts.get(loop.name, 0)
+            if actual_loop is not None:
+                if loop != actual_loop or counts is None or counts.iteration_origin is None:
+                    raise ValueError("a device input window needs its row's snapshotted Loop origin")
+                origin = counts.iteration_origin
+                if origin < 0 or origin > k:
+                    raise ValueError("an input window origin must precede its projected Loop position")
+                origins.append(origin)
+                entries.append([
+                    self._runner.request_generation(rid), counts.graph_pass,
+                    *(counts.dynamic_loop_iter_counts.get(name, 0) for name in actual_loop.ancestors),
+                ])
+                horizons.append(k - origin + ctx.repeats)
+                k = origin
             # a stream window is items of the node's Loop; a row outside it has none
             if streamed:
                 window = {} if loop is None else _window_tables(
@@ -3459,7 +3490,19 @@ class Engine:
                 rows.append((rid, k, window))
             else:
                 rows.append((rid, k))
-        return iteration_columns(submodule, rows, ctx.repeats, self._device)
+        if actual_loop is None:
+            return iteration_columns(submodule, rows, ctx.repeats, self._device)
+        columns = iteration_columns(
+            submodule, rows, max(horizons, default=ctx.repeats), self._device, horizons=horizons,
+        )
+        if len(rids) == 1 and horizons == [1]:
+            # The ordinary single-item fast path is an arena view. A queued
+            # window must survive a later source assignment in that arena.
+            columns = {name: value.clone() for name, value in columns.items()}
+        return IterationWindow(
+            columns, to_device_nonblocking(origins, self._device, dtype=torch.long),
+            to_device_nonblocking(entries, self._device, dtype=torch.long),
+        )
 
     def keep_run_columns(self, node_name: str, graph_walk: str, signals: Collection[str]) -> str | None:
         """Have a step of this walk that repeats keep a column per replay of

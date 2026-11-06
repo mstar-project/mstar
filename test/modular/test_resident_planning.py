@@ -3473,3 +3473,42 @@ def test_a_batched_input_window_does_not_read_past_each_rows_admitted_horizon():
     assert out["s"].tolist() == [[0, 1, 2, 3, 4, 5, -8, -8], [70, -8, -8, -8, -8, -8, -8, -8], [-8] * 8]
     with pytest.raises(ValueError, match="reads past"):
         iteration_columns(node, rows, 8, CPU, horizons=[6, 2, 0])
+
+
+def test_an_engine_input_window_keeps_lower_origins_entry_keys_and_per_row_extents():
+    from mstar.engine.device_run import IterationWindow
+    from mstar.engine.engine import Engine, ForwardPassInfoWrapper
+    from mstar.graph.loop_indices import LoopLayout
+    from mstar.model.submodule_base import InputMetadata
+
+    node = SimpleNamespace(
+        ITERATION_INPUTS={"t": IterationInput("ts", dtype=torch.long, capture_fill=-9)},
+        iteration_tables=IterationTables(CPU),
+        request_states={1: {"ts": torch.arange(9)}, 2: {"ts": torch.arange(10)}},
+    )
+    loop = LoopLayout("inner", ("outer",), ())
+    engine = Engine.__new__(Engine)
+    engine._device, engine._loops = CPU, {("n", "decode"): loop}
+    engine._runner = SimpleNamespace(request_generation=lambda rid: 100 + rid)
+    ctx = StepContext(request_ids=(1, 2), graph_walk="decode", slot=0, capture=True, repeats=4)
+    metadata = {
+        1: InputMetadata(dynamic_loop_iter_counts={"inner": 5, "outer": 7}, graph_pass=3, iteration_origin=1),
+        2: InputMetadata(dynamic_loop_iter_counts={"inner": 6, "outer": 4}, graph_pass=9, iteration_origin=6),
+    }
+    info = {rid: ForwardPassInfoWrapper(SimpleNamespace(), item) for rid, item in metadata.items()}
+    window = engine._iteration_columns("n", node, ctx, [1, 2, -1], info, actual_loop=loop)
+    assert isinstance(window, IterationWindow)
+    assert window.origins.tolist() == [1, 6, 0]
+    assert window.entries.tolist() == [[101, 3, 7], [102, 9, 4], [-1, -1, -1]]
+    assert window.columns["t"].tolist() == [list(range(1, 9)), [6, 7, 8, 9, -9, -9, -9, -9], [-9] * 8]
+    # A later assignment reuses the owner's arena, but cannot change a queued snapshot.
+    node.request_states[1]["ts"] = torch.arange(9) + 100
+    engine._iteration_columns("n", node, ctx, [1, 2, -1], info, actual_loop=loop)
+    assert window.columns["t"][0].tolist() == list(range(1, 9))
+
+    one = StepContext(request_ids=(1,), graph_walk="decode", slot=0, capture=True, repeats=1)
+    info[1].metadata.dynamic_loop_iter_counts["inner"] = 1
+    single = engine._iteration_columns("n", node, one, [1], info, actual_loop=loop)
+    node.request_states[1]["ts"] = torch.arange(9) + 200
+    engine._iteration_columns("n", node, one, [1], info, actual_loop=loop)
+    assert single.columns["t"].item() == 101
