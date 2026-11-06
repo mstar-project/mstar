@@ -106,7 +106,7 @@ def test_a_cut_vision_walk_cuts_its_masks_and_deepstack_with_the_embeds(thinker)
         "vision_embeds": [torch.randn(6, HIDDEN)], "deepstack": [torch.randn(6, HIDDEN)] * 2,
         "image_grid_thw": [torch.tensor([1, 4, 6])],
     }
-    thinker.node_resources[THINKER_POS].ingest_request(RID)
+    thinker.kv.positions.ingest_request(RID)
     whole = _prepare(thinker, "prefill_vision", image)
 
     cut = thinker.split_inputs("prefill_vision", SimpleNamespace(rid_handle=RID), whole, 3, whole.input_seq_len)
