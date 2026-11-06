@@ -532,7 +532,7 @@ def _grouped_down_kernel(
                       stride_se, I, H, BO, BI, BN, NG, BM, NT, CLAMP)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["T"])
 def _sum_kernel(part, out, T, K: tl.constexpr, H: tl.constexpr, BN: tl.constexpr,
                 PDL: tl.constexpr):
     """Program (token, BN hidden rows): the K routed partials in slot order plus the shared
