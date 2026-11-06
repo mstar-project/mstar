@@ -26,6 +26,7 @@ from typing import Any, NamedTuple
 import torch
 
 from mstar.engine.resources.resident import TRASH_SLOT
+from mstar.graph.loop_indices import LoopLayout
 from mstar.utils.h2d import PinnedStager
 
 # a stop buffer of a run that repeats: the iterations it ran, on every row
@@ -98,6 +99,19 @@ class RunAsk(NamedTuple):
     iteration: Collection[str]
     refill_at: float | None = None
     stream_tokens: bool = False
+    # Actual Loop progress selects inputs across queued, possibly short runs.
+    loop: LoopLayout | None = None
+
+
+class IterationWindow(NamedTuple):
+    """One immutable launch snapshot: input columns and their logical origins.
+
+    Entry keys are request generation, graph pass and strict ancestor counts.
+    Input width includes a predecessor's uncertainty; output width does not.
+    """
+    columns: Mapping[str, torch.Tensor]
+    origins: torch.Tensor
+    entries: torch.Tensor
 
 
 class TokenStream:
@@ -378,13 +392,14 @@ class DeviceRun:
 
     def __init__(
         self, state: RunState, inputs: Mapping[str, torch.Tensor], launch: Callable[[], None], limit: int,
-        handle: torch.Tensor,
+        handle: torch.Tensor, window: IterationWindow | None = None,
     ):
         self.state = state
         self.handle = handle
         # set once the columns are sized, before the capture, which only writes them
         self.sealed = False
         self.inputs = inputs
+        self.window = window
         self.limit = limit
         # a column index per iteration (``results``)
         self._columns = torch.arange(limit, device=handle.device)
@@ -393,9 +408,20 @@ class DeviceRun:
         self.rows: dict[str, torch.Tensor] = {}
         self.spans: dict[str, torch.Tensor] = {}
 
-    def stage_columns(self, iteration: Mapping[str, torch.Tensor] | None) -> None:
+    def stage_inputs(self, iteration: Mapping[str, torch.Tensor] | IterationWindow | None) -> None:
+        if self.window is not None:
+            if not isinstance(iteration, IterationWindow):
+                raise ValueError("an actual-progress run needs an immutable input window")
+            self.window.origins.copy_(iteration.origins)
+            self.window.entries.copy_(iteration.entries)
+            iteration = iteration.columns
+        elif isinstance(iteration, IterationWindow):
+            raise ValueError("this run has no actual-progress input selection")
         for name, column in (iteration or {}).items():
-            self.inputs[name][:, :column.shape[1]].copy_(column)
+            target = self.inputs[name]
+            if column.shape[0] != target.shape[0] or column.shape[1] > target.shape[1]:
+                raise ValueError("iteration input window exceeds its captured shape")
+            target[:, :column.shape[1]].copy_(column)
 
     def keep(self, name_of: Mapping[str, torch.Tensor], kept: dict[str, torch.Tensor]) -> None:
         """Inside the body: a column of each of ``name_of``, this replay's."""
@@ -431,9 +457,11 @@ class DeviceRun:
         )
 
 
-def column_in(state: RunState, column: torch.Tensor, target: torch.Tensor) -> None:
-    """Inside a body: this replay's column of ``column`` into ``target``."""
-    target.copy_(column.index_select(1, state.index).reshape(target.shape))
+def column_in(indices: torch.Tensor, column: torch.Tensor, target: torch.Tensor) -> None:
+    """Inside a body: one selected input per row, after resource gathering."""
+    index = indices.reshape(-1, 1, *((1,) * (column.ndim - 2)))
+    index = index.expand(column.shape[0], 1, *column.shape[2:])
+    target.copy_(column.gather(1, index).reshape(target.shape))
 
 
 def column_out(state: RunState, tensor: torch.Tensor, column: torch.Tensor) -> None:

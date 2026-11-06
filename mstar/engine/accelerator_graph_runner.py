@@ -26,12 +26,12 @@ from mstar.engine.accelerator_graph_config import (
     PiecewiseCaptureShape,
     PiecewiseConfigType,
 )
-from mstar.engine.device_run import DeviceRun, RunAsk, RunState, TokenStream, column_in
+from mstar.engine.device_run import DeviceRun, IterationWindow, RunAsk, RunState, TokenStream, column_in
 from mstar.engine.node_dtype import node_scope
 from mstar.engine.resources import BucketKey, CGSlotSpec, Resource, SlotLease, StepContext, StepRunner
 from mstar.engine.resources.loopback_rows import LoopbackRows
 from mstar.engine.resources.lora.config import LoraBaseOnly
-from mstar.engine.resources.resident import ResidentPlanner, watched_counts
+from mstar.engine.resources.resident import CapturedResidentStep, ResidentPlanner, watched_counts
 from mstar.engine.resources.step import PIECEWISE_WALK, SubmoduleStep
 from mstar.model.submodule_base import (
     BatchedModelOutput,
@@ -763,7 +763,7 @@ class CaptureTemplate(NamedTuple):
 
 class WarmedSpec(NamedTuple):
     """A spec prepared and run eagerly: what its capture reads."""
-    run: Callable[[], Any]
+    run: Callable[..., Any]
     static_inputs: dict[str, Any]
     static_input_keys: tuple[str, ...]
     dummy_rids: list[int]
@@ -777,6 +777,7 @@ class WarmedSpec(NamedTuple):
     # the last warm-up forward's output, kept for a walk asked to run on the
     # device: it sizes the run's columns before the capture
     output: Any = None
+    resident: CapturedResidentStep | None = None
 
 
 class AcceleratorGraphRunner:
@@ -1378,11 +1379,14 @@ class AcceleratorGraphRunner:
             self._run_failures[walk] = "graph: a counted run has no token signal to stream"
             return None, None, None
         dropping = None
-        if ask.drop_rows:
+        if ask.drop_rows or ask.loop is not None:
             if self._resident is None or not self._resident.covers(spec.bucket):
                 self._run_failures[walk] = "planner: the walk isn't resident, which dropping rows needs"
                 return None, None, None
             dropping = self._resident.drop_rows(spec.bucket, spec.slot)
+        if ask.loop is not None and (self._rows is None or warmed.resident is None):
+            self._run_failures[walk] = "planner: actual Loop progress needs resident loop-back rows"
+            return None, None, None
         cuda = backend.while_runtime()
         outer, handle, device_handle = cuda.new_loop(self._device)
         stream = TokenStream(spec.bucket.bs, ask.limit, self._device) if ask.stream_tokens else None
@@ -1390,12 +1394,19 @@ class AcceleratorGraphRunner:
             spec.bucket.bs, ask.token_signal, ask.stop_ids, self._device, dropping, stream,
         )
         inputs = {
-            name: torch.zeros(value.shape[0], ask.limit, *value.shape[1:], dtype=value.dtype, device=value.device)
+            name: torch.zeros(
+                value.shape[0], ask.limit * (2 if ask.loop is not None else 1), *value.shape[1:],
+                dtype=value.dtype, device=value.device,
+            )
             for name, value in warmed.static_inputs.items() if name in ask.iteration
         }
+        window = None if ask.loop is None else IterationWindow(
+            inputs, torch.zeros(spec.bucket.bs, dtype=torch.long, device=self._device),
+            torch.zeros(spec.bucket.bs, 2 + len(ask.loop.ancestors), dtype=torch.long, device=self._device),
+        )
         graph_exec: list[int] = []
         run = DeviceRun(
-            state, inputs, lambda: cuda.launch(graph_exec[0], backend.raw_stream()), ask.limit, device_handle,
+            state, inputs, lambda: cuda.launch(graph_exec[0], backend.raw_stream()), ask.limit, device_handle, window,
         )
         # The run's columns live outside the capture's pool: a block the forward
         # frees mid-capture goes to a later allocation of the same capture, so
@@ -1412,10 +1423,19 @@ class AcceleratorGraphRunner:
         backend.synchronize()
 
         def body() -> Any:
+            position = active = None
+            if window is not None:
+                indices = self._rows.iteration_rows(warmed.resident)
+                position, active = self._rows.iteration_head(walk, ask.loop, indices, window.entries, ~state.marks)
+                state.marks.logical_or_(~active)
             state.head()
-            for name, column in inputs.items():
-                column_in(state, column, warmed.static_inputs[name])
-            raw = warmed.run(True)
+
+            def select_inputs():
+                selected = state.index if window is None else torch.where(active, position - window.origins, 0)
+                for name, column in inputs.items():
+                    column_in(selected, column, warmed.static_inputs[name])
+
+            raw = warmed.run(True, select_inputs)
             output = BatchedModelOutput.coerce(raw)
             buffers = output.check_stop_buffers or {}
             unique = {name: t.reshape(t.shape[0], -1)[:, 0] for name, t in buffers.items()}
@@ -1428,6 +1448,10 @@ class AcceleratorGraphRunner:
                 target.copy_(output_named(output, pair.output).reshape(target.shape))
             tokens = None if ask.token_signal is None else output_named(output, ask.token_signal).to(torch.long)
             cuda.stop(state, tokens, device_handle, backend.raw_stream())
+            if window is not None:
+                self._rows.iteration_tail(
+                    walk, ask.loop, self._rows.indices(spec.bucket, spec.slot), position, active, state.marks,
+                )
             return raw
 
         try:
@@ -1487,11 +1511,13 @@ class AcceleratorGraphRunner:
                 heads = {}  # one row a request, of one walk
             row_heads: dict[str, str] = {}
 
-            def run_forward(in_run: bool = False):
+            def run_forward(in_run: bool = False, select_inputs: Callable[[], None] | None = None):
                 if resident is not None:
                     planner.gather(resident)
                     if in_run:
                         planner.run_gather(resident)
+                if select_inputs is not None:
+                    select_inputs()
                 for signal, name in heads.items():
                     target = static_inputs.get(name)
                     if isinstance(target, torch.Tensor) and rows.head(spec.bucket, spec.slot, signal, target):
@@ -1546,6 +1572,7 @@ class AcceleratorGraphRunner:
                 returned=returned,
                 row_heads=row_heads,
                 output=output,
+                resident=resident,
             )
         finally:
             # Capture ran the dummy rows as real requests; free their storage

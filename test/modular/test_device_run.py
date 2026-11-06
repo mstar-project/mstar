@@ -15,6 +15,7 @@ from mstar.engine.device_run import (
     RUN_SKIPPED,
     CudaWhile,
     DeviceRun,
+    IterationWindow,
     RunAsk,
     RunState,
     TokenStream,
@@ -80,7 +81,10 @@ class _Loop:
                 return
 
 
-def _runner(monkeypatch, loop, tokens, bs=2, limit=6, refill_at=None, carries=None, stream_tokens=False, counted=False):
+def _runner(
+    monkeypatch, loop, tokens, bs=2, limit=6, refill_at=None, carries=None, stream_tokens=False, counted=False,
+    progress=False,
+):
     """A runner holding a captured run whose forward samples ``tokens[iteration]``."""
     monkeypatch.setattr(torch.accelerator, "is_available", lambda: False)
     runner = AcceleratorGraphRunner.__new__(AcceleratorGraphRunner)
@@ -91,16 +95,41 @@ def _runner(monkeypatch, loop, tokens, bs=2, limit=6, refill_at=None, carries=No
         while_refusal=lambda: None, while_runtime=lambda: loop,
         raw_stream=lambda: 0, synchronize=lambda: None,
     )
+    resident = layout = None
+    if progress:
+        from mstar.engine.resources.loopback_rows import LoopbackRows
+        from mstar.graph.loop_indices import LoopLayout
+
+        layout = LoopLayout("decode", (), ())
+        rows = runner._rows = LoopbackRows(CPU, capacity=bs)
+        for rid in range(1, bs + 1):
+            rows.add(rid)
+        buffers = SimpleNamespace(rows=torch.arange(1, bs + 1), slots=torch.arange(1, bs + 1))
+        planner = runner._resident = SimpleNamespace(
+            store=torch.tensor([0] + [rows._row_of[rid] for rid in range(1, bs + 1)]),
+            table=lambda: SimpleNamespace(stride=1, col=0), covers=lambda bucket: True,
+            drop_rows=lambda bucket, slot: buffers,
+        )
+        rows.bind_resident(planner, "rows")
+        resident = SimpleNamespace(bucket=BucketKey(WALK, bs, bs), slot=0, buffers=buffers, slots=buffers.slots)
+        runner.test_resource = torch.zeros(bs + 1)
     runner.ask_run(WALK, RunAsk(None if counted else "new_token", frozenset() if counted else frozenset({EOS}),
                                 False, limit, carries or {}, ("frame",), ("cond",),
-                                refill_at, stream_tokens))
+                                refill_at, stream_tokens, layout))
     static = {"cond": torch.zeros(bs), "h": torch.zeros(bs)}
     calls = []
 
-    def forward(in_run=False):
+    def forward(in_run=False, select_inputs=None):
+        if resident is not None:
+            runner._rows.resident_gather(resident)
+            static["cond"].fill_(-55)  # input selection must follow resource gathering
+        if select_inputs is not None:
+            select_inputs()
         i = min(len(calls), len(tokens) - 1)
         calls.append(static["cond"].clone())
-        token = torch.tensor(tokens[i])
+        token = static["cond"].long() if progress else torch.tensor(tokens[i])
+        if resident is not None:
+            runner.test_resource.index_add_(0, resident.slots, static["cond"])
         return BatchedModelOutput(
             check_stop_buffers={} if counted else {"new_token": token},
             row_outputs={"frame": token.float() * 2, "h": static["h"] + 1},
@@ -116,7 +145,7 @@ def _runner(monkeypatch, loop, tokens, bs=2, limit=6, refill_at=None, carries=No
 
     monkeypatch.setattr(runner_mod, "capture_into_graph", capture)
     spec = SimpleNamespace(bucket=BucketKey(WALK, bs, bs), slot=0, config=SimpleNamespace(get_config_type=lambda: None))
-    warmed = SimpleNamespace(run=forward, static_inputs=static, output=None)
+    warmed = SimpleNamespace(run=forward, static_inputs=static, output=None, resident=resident)
     run, _, _ = runner._capture_run(spec, warmed)
     runner._buckets = {spec.bucket: SimpleNamespace(slots=[SimpleNamespace(run=run)])}
     return runner, run, static, calls
@@ -124,7 +153,7 @@ def _runner(monkeypatch, loop, tokens, bs=2, limit=6, refill_at=None, carries=No
 
 def _run(run, real, repeats, immune=None, refill_at=None, columns=None):
     run.state.stage(real, immune or [False] * real, repeats, refill_at)
-    run.stage_columns(columns)
+    run.stage_inputs(columns)
     run.launch()
     return run.results(repeats)
 
@@ -987,3 +1016,41 @@ def test_a_width_one_device_launch_returns_zero_row_counts_without_changing_outp
     assert out.check_stop_buffers["token"].shape == (2,)
     assert out.check_stop_buffers[RUN_REPLAYS].tolist() == [1, 1]
     assert out.check_stop_buffers[RUN_COUNTS].tolist() == [0, 0]
+
+
+@pytest.mark.parametrize("first_count", [0, 1, 3, 4])
+def test_a_queued_window_reads_actual_progress_and_suppresses_predecessor_stops(monkeypatch, first_count):
+    """N+1's snapshot predates N. A short/zero N chooses its actual next input;
+    an EOS row never mutates the resource again, including in a later launch.
+    """
+    loop = _Loop()
+    runner, run, _, calls = _runner(monkeypatch, loop, [[1, 1]], limit=4, progress=True)
+    runner.test_resource.zero_()
+    entries = torch.tensor([[1, 0], [1, 0]])
+    columns = {"cond": torch.tensor([[7., 8., 9., 10., 11., 12., 13., 14.],
+                                     [20., 21., 22., 23., 24., 25., 26., 27.]])}
+    # The immutable successor already exists before the first launch.
+    successor = IterationWindow(columns, torch.zeros(2, dtype=torch.long), entries)
+    run.state.stage(2, [False, False], 4)
+    run.stage_inputs(successor)
+    if first_count == 0:
+        run.state.request_yield()
+    else:
+        loop.on_iteration = lambda i: run.state.request_yield() if i == first_count - 1 else None
+    run.launch()
+    assert run.state.counts.tolist() == [min(first_count, 3), first_count]
+    calls.clear()
+    loop.on_iteration = lambda i: None
+    run.state.stage(2, [False, False], 4)
+    run.stage_inputs(successor)
+    run.launch()
+    assert run.state.counts.tolist() == [max(0, 3 - first_count), 4]
+    assert calls[0][1].item() == 20 + first_count
+    assert runner.test_resource[1].item() == 7 + 8 + 9, "stale successor cannot overwrite recurrent state"
+    assert run.inputs["cond"].shape[1] == 8 and run.rows["frame"].shape[1] == 4
+    # A new graph pass is a new entry, even when the resident row/slot is unchanged.
+    run.state.stage(2, [False, False], 1)
+    run.stage_inputs(IterationWindow(columns, torch.zeros(2, dtype=torch.long), entries + torch.tensor([0, 1])))
+    run.launch()
+    assert run.state.counts.tolist() == [1, 1]
+    assert calls[-1].tolist() == [7, 20]

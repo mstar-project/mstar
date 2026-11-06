@@ -2741,7 +2741,7 @@ class Engine:
                     len(request_ids), [policy.limits(infos[rid]).ignore_eos for rid in request_ids],
                     ctx.repeats, submodule_mgmt.refills[graph_walk],
                 )
-                slot.run.stage_columns(batch.iteration_columns)
+                slot.run.stage_inputs(batch.iteration_columns)
                 batch.run_started = slot.run.state.started
             streamed = submodule_mgmt.device_stream_tokens.get(graph_walk)
             if streamed is not None and ctx.repeats > 1:
