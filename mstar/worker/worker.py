@@ -1600,8 +1600,11 @@ class Worker(RepeatingSteps):
             if t0 is not None:
                 phase_end(_MSG_SPANS[message.message_type], t0)
 
-    def _process_messages(self) -> None:
-        self._process_message_list(self.communicator.get_all_new_messages())
+    def _process_messages(self) -> bool:
+        """Whether any arrived."""
+        messages = self.communicator.get_all_new_messages()
+        self._process_message_list(messages)
+        return bool(messages)
 
     # ------------------------------------------------------------------
     # Tensor readiness

@@ -413,11 +413,15 @@ class RepeatingSteps:
                 engine.yield_runs(batch_N.node_name)
 
         def serve() -> None:
-            self._process_messages()
+            # a row turns ready only as one of these lands: a run's wait is mostly none of them
+            arrived = self._process_messages()
+            arrived |= self.wakeup_event.drain()
+            arrived |= any([lane.finish() for lane in lanes])
+            if not arrived:
+                return
             self._check_ready_tensors()
             self._poll_stream_buffers()
             for lane in lanes:
-                lane.finish()
                 lane.launch(gpu_executor)
             end_for_ready_rows()
 

@@ -25,8 +25,10 @@ class EventWakeup:
     def fd(self):
         return self.event
 
-    def drain(self):
+    def drain(self) -> bool:
+        """Whether it was signalled since the last drain."""
         try:
             os.eventfd_read(self.event)
         except BlockingIOError:
-            pass
+            return False
+        return True

@@ -106,8 +106,9 @@ class Lane:
         event = step.node_batch.completion_event
         return event is None or event.query()
 
-    def finish(self, block: bool = False) -> None:
-        """Postprocess the step in flight once it has landed; ``block`` waits.
+    def finish(self, block: bool = False) -> bool:
+        """Postprocess the step in flight once it has landed, and say whether it
+        had; ``block`` waits.
 
         Never before the step has landed: postprocess frees its inputs first,
         and those are main-stream allocations a main-stream step could reuse
@@ -115,7 +116,7 @@ class Lane:
         """
         step = self.pending
         if step is None or not (block or self._landed(step)):
-            return
+            return False
         worker = self._worker
         try:
             outputs = step.future.result()
@@ -129,6 +130,7 @@ class Lane:
         finally:
             self.pending = None
             worker._hold_rows(self.lane, ())
+        return True
 
 
 def finish_first_to_land(busy: Sequence[Lane]) -> None:

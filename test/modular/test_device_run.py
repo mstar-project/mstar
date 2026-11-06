@@ -517,8 +517,10 @@ def _waiting_on_a_run(monkeypatch, ready):
     def _messages():
         log.append("messages")
         scheduler.ready = next(looks, scheduler.ready)
+        return True
 
     worker._process_messages = _messages
+    worker.wakeup_event = SimpleNamespace(drain=lambda: False)
     worker._check_ready_tensors = lambda: None
     worker._poll_stream_buffers = lambda: None
     monkeypatch.setattr("mstar.worker.repeating_steps.time.sleep", lambda s: None)
@@ -557,6 +559,20 @@ def test_a_run_serves_the_lanes_and_ends_once_a_row_turns_ready(monkeypatch):
     served = ["messages", "finish", "launch"]
     assert log == [*served, *served, "yield", *served]
     assert held == {0: {1, 2}}
+
+
+def test_a_pass_where_nothing_happened_scans_nothing(monkeypatch):
+    """A row turns ready only as a message, a read or a lane's step lands, so the
+    other 100 us passes of a run's wait pay for those three looks alone."""
+    worker, log = _waiting_on_a_run(monkeypatch, [set()])
+    worker._hold_rows = lambda lane, rows: None
+    worker._process_messages = lambda: False
+    woke, landed = iter([False, True, False, False]), iter([False, False, True, False])
+    worker.wakeup_event = SimpleNamespace(drain=lambda: next(woke))
+    worker._check_ready_tensors = lambda: log.append("tensors")
+    lane = SimpleNamespace(finish=lambda: next(landed), launch=lambda pool: log.append("launch"))
+    worker._await_run(_run_step([1], 4, token_stream=None), None, [lane], None)
+    assert log == ["tensors", "launch"] * 2
 
 
 @pytest.mark.parametrize("ready, yields", [

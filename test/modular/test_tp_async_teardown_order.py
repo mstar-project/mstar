@@ -183,7 +183,7 @@ def _rank(
     w.parallel_groups = SimpleNamespace(
         barrier_all=lambda: None, restore_default_timeout=lambda: None,
     )
-    w.wakeup_event = SimpleNamespace(register_future=lambda future: None)
+    w.wakeup_event = SimpleNamespace(register_future=lambda future: None, drain=lambda: False)
 
     def _broadcast(node_batch, **kwargs):
         if tp_rank:
@@ -217,8 +217,10 @@ def _rank(
     passes = iter(inbox)
 
     def _process_messages():
-        for body in next(passes, []):
+        bodies = next(passes, [])
+        for body in bodies:
             w._remove_request(body)
+        return bool(bodies)
 
     w._process_messages = _process_messages
     w._build_executing_batch = lambda batch: _batch(
