@@ -5352,7 +5352,15 @@ class Worker(RepeatingSteps):
                 },
                 self.engine_manager.engine.repeat_note,
             )
-            self.streams.windows = self._step_repeats.windows()
+            widths = self._step_repeats.windows()
+            retained = {}
+            for node in widths:
+                engine = self.engine_manager.get_engine(node)
+                retained[node] = frozenset(
+                    (walk, edge) for walk in (engine.iteration_layouts(node) or {})
+                    for edge in engine.streamed_iteration_inputs(node)
+                )
+            self.streams.configure_windows(widths, retained)
             # a run on the device, which a row turning ready can end early (``_await_run``)
             self._device_runs = frozenset(
                 key for key in self._step_repeats.device_stops()

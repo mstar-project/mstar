@@ -6,14 +6,16 @@ chunks a step did not keep, and settles which streams a step ends.
 """
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from functools import partial
+from typing import NamedTuple
 
 import torch
 
 from mstar.communication.tensors import NameToTensorList, TensorCommunicationManager
 from mstar.graph.base import GraphEdge, GraphSection
 from mstar.graph.runtime.base import ColumnarEdgeSpecs, EdgeSpec, InputTensors
+from mstar.streaming.chunk_policy import FixedChunkPolicy
 from mstar.streaming.stream_buffer import StreamBuffer, StreamChunkInfo, StreamingEdge, collate
 from mstar.streaming.topology import Connection
 from mstar.worker.node_manager_utils import RequestStateManager
@@ -52,6 +54,12 @@ def iteration_edges(walks: dict[str, GraphSection]) -> frozenset[tuple[str, str]
     return frozenset(out)
 
 
+class StreamWindowConfig(NamedTuple):
+    """The existing run width plus inputs whose source must remain resident."""
+    limit: int
+    retained: frozenset[tuple[str, str]] = frozenset()  # (consumer walk, input edge)
+
+
 class StreamBufferManager:
     """The stream buffers of this worker's requests, for the connections whose
     consumer runs here."""
@@ -86,10 +94,29 @@ class StreamBufferManager:
         # consumer node -> the most items a speculated step may take of each
         # stream into it, one an iteration of a step that repeats (a stream
         # window); a node not here takes a chunk a step
-        self.windows: dict[str, int] = {}
+        self.windows: dict[str, StreamWindowConfig] = {}
         # edge -> the loop-back rows whose ring holds its items on the device
         # (``step_repeats: stream_queue``); its chunks are read from there
         self.rings: dict[str, object] = {}
+
+    def configure_windows(
+        self, widths: Mapping[str, int], retained: Mapping[str, frozenset[tuple[str, str]]],
+    ) -> None:
+        """Derive run input handling once, checking the actual connection policy."""
+        policies = {conn.edge_name: conn.chunk_policy_factory() for conn in self.connections}
+        configured = {}
+        for node, limit in widths.items():
+            inputs = retained.get(node, frozenset())
+            for walk, edge in inputs:
+                policy = policies.get(edge)
+                if (self.consumer_node.get(edge) != node or type(policy) is not FixedChunkPolicy
+                        or policy.window_size() != 1 or not policy.continues_in(walk)):
+                    raise ValueError(
+                        f"{node}/{walk}: device iteration input {edge!r} requires fixed one-item chunks "
+                        "that continue after the producer ends in this walk"
+                    )
+            configured[node] = StreamWindowConfig(limit, inputs)
+        self.windows = configured
 
     def pieces(self, walk: str | None, edge_name: str) -> bool:
         """Whether what one producer step of ``walk`` sends on ``edge_name``
@@ -205,18 +232,26 @@ class StreamBufferManager:
         waiting = sbuf.pop_waiting_edge()
         if waiting is not None:
             return waiting
+        config = self.windows.get(consumer_node)
+        retained_edge = config is not None and any(edge == edge_name for _, edge in config.retained)
         partition = self._walk_driven_edges.get(edge_name)
+        walk_partition = self._partition.get(edge_name) if retained_edge else partition
         consumer_walk = (
-            self._partition_walk(request_id, partition) if partition else None
+            self._partition_walk(request_id, walk_partition) if walk_partition else None
         )
         if not sbuf.has_chunk_ready(consumer_walk):
             # a walk-driven buffer's readiness also moves with its consumer's
             # walk, which no buffer event reports, so it is never skipped
-            if partition is None:
+            if partition is None and not retained_edge:
                 sbuf.maybe_ready = False
             return None
         if not self._enter_chunk_walk(sbuf, edge_name, request_id, allow_walk_change):
             return None
+        if retained_edge:
+            # A producer-driven transition above may have changed the walk.
+            consumer_walk = self._partition_walk(request_id, self._partition[edge_name])
+            if (consumer_walk, edge_name) in config.retained:
+                return self.reserve_edge(sbuf, edge_name, request_id, window, consumer_walk)
         chunk = sbuf.pop_window(window) if window > 1 else sbuf.pop_chunk()
         return self._chunk_edge(chunk, edge_name, consumer_node, request_id)
 
@@ -314,7 +349,8 @@ class StreamBufferManager:
         if req_info is None:
             return []
         result = []
-        window = self.windows.get(node_name, 1)
+        config = self.windows.get(node_name)
+        window = 1 if config is None else config.limit
         for edge_name, sbuf in req_info.stream_buffers_by_consumer.get(node_name, {}).items():
             edge = self.pop_edge(sbuf, edge_name, request_id, allow_walk_change=False, window=window)
             if edge is not None:

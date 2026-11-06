@@ -453,3 +453,43 @@ def test_only_executed_tail_reservations_spend_pad_rows_even_at_width_one():
     buf.settle_window(retry.reservation, 1)
     assert buf._tail_consumed == 4
     assert buf._consumed == buf.policy.items_consumed == 2
+
+
+@pytest.mark.parametrize("policy", [
+    lambda: FixedChunkPolicy(1),
+    lambda: FixedChunkPolicy(1, frozenset({"prefill"})),
+    lambda: FixedChunkPolicy(2, True),
+])
+def test_retained_iteration_inputs_reject_noncontinuing_or_multi_item_policies(policy):
+    streams, _, _ = _consumer(1, 1)
+    streams.connections = [Connection("Thinker", "Talker", EDGE, policy)]
+    with pytest.raises(ValueError, match="fixed one-item chunks"):
+        streams.configure_windows({NODE: 4}, {NODE: frozenset({("decode", EDGE)})})
+
+
+def test_only_declared_iteration_edges_reserve_and_tail_readiness_follows_the_walk():
+    tm = _TM(_bookkeeping("python"))
+    conn = Connection("Thinker", "Talker", EDGE, lambda: FixedChunkPolicy(1, frozenset({"decode"})))
+    audio = Connection("Encoder", "Talker", "audio", lambda: FixedChunkPolicy(2))
+    fwd = SimpleNamespace(graph_walk="prefill")
+    req = SimpleNamespace(
+        stream_buffers={}, stream_buffers_by_consumer={},
+        per_partition_info={"Talker": SimpleNamespace(current_fwd_info=fwd)},
+    )
+    streams = StreamBufferManager(SimpleNamespace(per_request_info={RID: req}), tm, [conn, audio])
+    streams.consumer_node = {EDGE: NODE, "audio": NODE}
+    streams.configure_windows({NODE: 4}, {NODE: frozenset({("decode", EDGE)})})
+    streams.add_request(RID, SimpleNamespace(partition_name="Talker", stream_lead_items={}))
+    text, sound = req.stream_buffers[EDGE], req.stream_buffers["audio"]
+    _produce(tm, sound, [10, 11], first_uuid=200)
+    text.signal_done(0)
+    assert streams.pop_edge(text, EDGE, RID) is None
+    assert text.maybe_ready, "a later graph walk can make its empty tail ready without new producer input"
+    fwd.graph_walk = "decode"
+    edges = streams.poll_for(RID, NODE)
+    by_name = {edge.name: edge for edge in edges}
+    assert by_name[EDGE].chunk.reservation.bound == 4 and by_name[EDGE].chunk.num_items == 0
+    assert by_name["audio"].chunk.reservation is None and sound._consumed == 2
+    streams.return_edge(RID, by_name[EDGE])
+    tm.dereference_batch_uniform(by_name["audio"].uuids)
+    assert not text._reservations and text._tail_consumed == 0
