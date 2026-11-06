@@ -36,7 +36,7 @@ from mstar.engine.resources.position.config import PositionStep
 from mstar.engine.resources.recurrent.config import RecurrentStep
 from mstar.engine.resources.sampler.config import SamplerStep
 from mstar.engine.resources.sampler.resource import SamplerResource
-from mstar.engine.resources.step import Segment, SlotLease, SubmoduleStep
+from mstar.engine.resources.step import Segments, SlotLease, SubmoduleStep
 from mstar.model.components.mrope import mrope_position_ids
 from mstar.model.components.qwen3_vit import (
     vision_interpolation,
@@ -551,14 +551,7 @@ class LLMSubmodule(ARNodeSubmodule):
             )
 
         return SubmoduleStep(
-            segments=[
-                Segment(
-                    request_id=rid,
-                    label="main",
-                    span=inp.input_seq_len,
-                )
-                for rid, inp in zip(request_ids, inputs, strict=True)
-            ],
+            segments=Segments.of_inputs(request_ids, inputs),
             steps={
                 KV_CACHE: KVStep(),
                 ATTN: AttentionStep(causal=True),
@@ -796,11 +789,12 @@ class VisionEncoderSubmodule(NodeSubmodule):
         if (piecewise_leases or {}).get(VISION_BLOCK_LOOP):
             return None
         # one segment per frame: a frame attends to itself alone
-        segments = [
-            Segment(request_id=rid, label="main", span=span)
-            for rid, inp in zip(request_ids, inputs, strict=True)
-            for span in inp.tensor_inputs["seq_lengths"]
-        ]
+        seq_lengths = [inp.tensor_inputs["seq_lengths"] for inp in inputs]
+        segments = Segments(
+            [rid for rid, spans in zip(request_ids, seq_lengths, strict=True) for _ in spans],
+            "main",
+            [span for spans in seq_lengths for span in spans],
+        )
         return SubmoduleStep(
             segments=segments,
             steps={VISION_ATTN: AttentionStep(causal=False)},

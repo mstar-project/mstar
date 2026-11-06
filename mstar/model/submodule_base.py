@@ -1496,7 +1496,7 @@ def lora_rows(step: SubmoduleStep | None, lora_keys: Sequence[str]) -> Submodule
     calls keeps its own). A step without segments gets none: an adapted module it runs
     refuses for want of a plan (``LoraLayerDelta``)."""
     if lora_keys and step is not None and step.segments is not None:
-        segments = tuple(step.segments)
+        segments = step.segments
         added = {key: LoraStep(segments=segments) for key in lora_keys if key not in step.steps}
         if added:
             step = replace(step, steps={**step.steps, **added})

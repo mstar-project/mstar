@@ -1044,7 +1044,7 @@ step names the ``(q_label, kv_label)`` pairs:
 .. code-block:: python
 
    RaggedCrossAttentionStep(
-       segments=segments,              # one Segment per (request, label) the pairs use
+       segments=segments,              # one row per (request, label) the pairs use
        pairs=(("video", "text"), ("audio", "video")),
    )
 
@@ -1691,15 +1691,21 @@ own: its per-request scalars (temperature, top-k, top-p, seed, penalties) become
 of the row, so a resident step stages none of them, while the RNG offset, the last token
 and the repetition-penalty mask stay by the sampler's own row of each request.
 
-A ``SubmoduleStep`` contains a list of ``Segment`` objects and one ``ResourceStep`` per
-resource key:
+A ``SubmoduleStep`` contains the step's ``Segments`` and one ``ResourceStep`` per resource
+key:
 
-- ``Segment(request_id, label, span)`` is one request's contribution to one cache stream
-  in this step. ``span`` is the number of tokens by which the stream grows. A ``span`` of
-  0 reads the stream without extending it: admission reserves nothing, and commit does
-  nothing. A request contributes one segment per label that is active for it.
+- ``Segments(request_ids, labels, spans)`` holds the step's rows as columns, and each
+  row is one request's contribution to one cache stream in this step. ``labels`` and
+  ``spans`` are one value for every row or one per row, and their order defines the
+  layout of the step's per-token arrays. A ``span`` is the number of tokens by which the
+  stream grows. A ``span`` of 0 reads the stream without extending it: admission reserves
+  nothing, and commit does nothing. A request contributes one row per label that is
+  active for it, and the usual step, one ``"main"`` row per request as long as its input,
+  is ``Segments.of_inputs(request_ids, inputs)``. A list of
+  ``Segment(request_id, label, span)`` rows is also accepted. The columns are built per
+  step, so prefer them on a decode path.
 - The ``segments`` argument of ``SubmoduleStep`` is a default value. Any ``ResourceStep``
-  that does not set its own ``segments`` uses this list.
+  that does not set its own ``segments`` uses these.
 - ``KVStep(commit=, eager_write=, combined_labels=, pre_forks=, post_forks=)``. See
   below.
 - ``AttentionStep(causal=, context_only=)`` describes the attention plan.
@@ -1731,10 +1737,7 @@ from the prepared inputs, and steps all four resources together:
                for rid, inp in zip(request_ids, inputs, strict=True)
            }
        return SubmoduleStep(
-           segments=[
-               Segment(request_id=rid, label="main", span=inp.input_seq_len)
-               for rid, inp in zip(request_ids, inputs, strict=True)
-           ],
+           segments=Segments.of_inputs(request_ids, inputs),
            steps={
                KV_CACHE: KVStep(),
                ATTN: AttentionStep(causal=True),
@@ -1746,8 +1749,8 @@ from the prepared inputs, and steps all four resources together:
 
 **Padding rows.** Under a captured graph, the batch is padded to the shape of the capture
 bucket, and ``request_ids`` also contains the ids of the padding rows. Declare segments
-for those rows in the same way as for real rows. The ``zip(..., strict=True)`` in the
-example above already does this.
+for those rows in the same way as for real rows. ``Segments.of_inputs`` in the example
+above already does this.
 
 **The two leases.** ``slot_lease`` is the CUDA-graph slot on which this step will replay.
 It is ``None`` for an eager step. If a submodule's declaration differs between the
@@ -2245,10 +2248,7 @@ otherwise, which covers the eager fallback path:
        if (piecewise_leases or {}).get(BLOCK_LOOP_REGION):
            return None                      # the region declares its own KV + attention
        return SubmoduleStep(                # eager path: nobody else reserves these pages
-           segments=[
-               Segment(request_id=rid, label="main", span=inp.input_seq_len)
-               for rid, inp in zip(request_ids, inputs, strict=True)
-           ],
+           segments=Segments.of_inputs(request_ids, inputs),
            steps={KV_CACHE: KVStep(), ATTN: AttentionStep(causal=False)},
        )
 
@@ -2313,10 +2313,7 @@ sequence, and an eager section after the region.
 
        def declare_step(request_ids: list[str], seq_lens: list[int]) -> SubmoduleStep:
            return SubmoduleStep(
-               segments=[
-                   Segment(request_id=rid, label="main", span=seq_len)
-                   for rid, seq_len in zip(request_ids, seq_lens, strict=True)
-               ],
+               segments=Segments(request_ids, "main", seq_lens),
                steps={KV_CACHE: KVStep(), ATTN: AttentionStep(causal=False)},
            )
 

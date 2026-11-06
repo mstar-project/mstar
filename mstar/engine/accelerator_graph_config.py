@@ -5,7 +5,7 @@ from typing import Any, Callable
 
 import torch
 
-from mstar.engine.resources import AttentionStep, Segment, SubmoduleStep
+from mstar.engine.resources import AttentionStep, Segments, SubmoduleStep
 from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs
 
 # A compile mode of the engine's own rather than torch.compile's: Inductor's
@@ -426,10 +426,7 @@ class PiecewisePackedConfig(PiecewiseAcceleratorGraphConfig):
             (rid,) = request_ids
             request_ids = [rid] * len(seq_lens)
         return SubmoduleStep(
-            segments=[
-                Segment(request_id=rid, label="main", span=n)
-                for rid, n in zip(request_ids, seq_lens, strict=True)
-            ],
+            segments=Segments(request_ids, "main", seq_lens),
             steps={self.attn_key: AttentionStep(causal=False)},
         )
 

@@ -24,7 +24,7 @@ from mstar.engine.accelerator_graph_config import (
     PackedAcceleratorGraphConfig,
 )
 from mstar.engine.engine import ExecutingBatch
-from mstar.engine.resources import AttentionStep, KVStep, PositionStep, SamplerStep, Segment, SlotLease, SubmoduleStep
+from mstar.engine.resources import AttentionStep, KVStep, PositionStep, SamplerStep, Segments, SlotLease, SubmoduleStep
 from mstar.engine.resources.position.manager import PositionManager
 from mstar.engine.resources.sampler.resource import SamplerResource
 from mstar.model.components.audio_features import LogMelSpectrogram
@@ -503,29 +503,12 @@ class WhisperDecoderSubmodule(TokenStepNode, ARNodeSubmodule):
         if graph_walk == ALIGN_WALK:
             # an eager pass over its own inputs that touches no cache; its segment is
             # the rows the decoder's projections see, for a LoRA pool's rows
-            return SubmoduleStep(
-                segments=[
-                    Segment(request_id=rid, label="main", span=inp.input_seq_len)
-                    for rid, inp in zip(request_ids, inputs, strict=True)
-                ],
-                steps={},
-            )
-        context_segments = tuple(
-            Segment(
-                request_id=rid,
-                label=CONTEXT_LABEL,
-                span=self._context_span(inp),
-            ) for rid, inp in zip(request_ids, inputs, strict=True)
-        )
+            return SubmoduleStep(segments=Segments.of_inputs(request_ids, inputs), steps={})
+        context_spans = [self._context_span(inp) for inp in inputs] if graph_walk in ENCODER_WALKS else 0
+        context_segments = Segments(request_ids, CONTEXT_LABEL, context_spans)
         return SubmoduleStep(
             # the default, for the resources over the self-attention cache
-            segments=[
-                Segment(
-                    request_id=rid,
-                    label="main",
-                    span=inp.input_seq_len,
-                ) for rid, inp in zip(request_ids, inputs, strict=True)
-            ],
+            segments=Segments.of_inputs(request_ids, inputs),
             steps={
                 KV_CACHE: KVStep(),
                 ATTN: AttentionStep(causal=True),

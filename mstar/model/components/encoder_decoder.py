@@ -11,7 +11,7 @@ import torch
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.engine.resources import AttentionStep, KVStep, PositionStep, SamplerStep, Segment, SlotLease, SubmoduleStep
+from mstar.engine.resources import AttentionStep, KVStep, PositionStep, SamplerStep, Segments, SlotLease, SubmoduleStep
 from mstar.engine.resources.attn.base import AttentionManager
 from mstar.engine.resources.position.manager import PositionManager
 from mstar.engine.resources.sampler.resource import SamplerResource
@@ -78,16 +78,11 @@ class EncoderDecoderNode(TokenStepNode):
         piecewise_leases: Mapping[str, SlotLease] | None = None,
         **kwargs,
     ) -> SubmoduleStep:
-        context_segments = tuple(
-            Segment(request_id=rid, label=self.CONTEXT_LABEL, span=self._context_span(inp))
-            for rid, inp in zip(request_ids, inputs, strict=True)
-        )
+        context_spans = [self._context_span(inp) for inp in inputs] if graph_walk == self.PREFILL_WALK else 0
+        context_segments = Segments(request_ids, self.CONTEXT_LABEL, context_spans)
         return SubmoduleStep(
             # the default, for the resources over the self-attention cache
-            segments=[
-                Segment(request_id=rid, label="main", span=inp.input_seq_len)
-                for rid, inp in zip(request_ids, inputs, strict=True)
-            ],
+            segments=Segments.of_inputs(request_ids, inputs),
             steps={
                 self.KV_CACHE: KVStep(),
                 self.ATTN: AttentionStep(causal=True),

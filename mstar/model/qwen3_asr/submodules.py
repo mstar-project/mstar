@@ -23,7 +23,7 @@ from mstar.engine.accelerator_graph_config import (
     AcceleratorGraphConfig,
     PackedAcceleratorGraphConfig,
 )
-from mstar.engine.resources import AttentionStep, KVStep, PositionStep, SamplerStep, Segment, SlotLease, SubmoduleStep
+from mstar.engine.resources import AttentionStep, KVStep, PositionStep, SamplerStep, Segments, SlotLease, SubmoduleStep
 from mstar.engine.resources.attn.base import AttentionManager
 from mstar.engine.resources.sampler.resource import SamplerResource
 from mstar.model.components.audio_features import LogMelSpectrogram
@@ -208,10 +208,7 @@ class Qwen3ASRLLMSubmodule(TokenStepNode, ARNodeSubmodule):
         **kwargs,
     ) -> SubmoduleStep:
         return SubmoduleStep(
-            segments=[
-                Segment(request_id=rid, label="main", span=inp.input_seq_len)
-                for rid, inp in zip(request_ids, inputs, strict=True)
-            ],
+            segments=Segments.of_inputs(request_ids, inputs),
             steps={
                 KV_CACHE: KVStep(),
                 ATTN: AttentionStep(causal=True),
