@@ -28,10 +28,13 @@ from mstar.engine.resources import (
     SubmoduleStep,
 )
 from mstar.engine.resources.convenience import KDACallable
+from mstar.engine.resources.dsa import sparse_mla
+from mstar.engine.resources.dsa.config import DSAStep
 from mstar.engine.resources.linear_attn.config import LinearAttnStep
 from mstar.engine.resources.recurrent.config import RecurrentStep
 from mstar.model.glm5_next.config import (
     ATTN,
+    DSA,
     KDA,
     KDA_STATE,
     KV_CACHE,
@@ -128,10 +131,28 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         self._kda: KDACallable | None = None
 
     @property
+    def _dsa(self):
+        """The DSA resource (dsa_long_context), which plans the step's rows for the MLA layers."""
+        return self.node_resources.get(DSA) if self.config.dsa_long_context else None
+
+    @property
     def mtp_block(self) -> int:
         return self.mtp_k + 1
 
     def bind_node_resources(self, resources: dict) -> None:
+        if KV_CACHE in resources:
+            self.config.check_long_context(resources[KV_CACHE].kv_cache.page_size)
+            cache = resources[KV_CACHE].layer_view() if self.config.dsa_long_context else None
+            if cache is not None and cache.device.type == "cuda" and cache.dtype != torch.bfloat16:
+                # the DSA kernels take bf16; the torch paths sync with the host and capture nothing
+                raise ValueError(f"dsa_long_context serves a bf16 KV cache on CUDA, not "
+                                 f"{cache.dtype}: set the node's dtype to bfloat16")
+        buckets = self.config.prefill_token_buckets or PREFILL_TOKEN_BUCKETS
+        if self.config.dsa_long_context and self.config.prefill_graphs and (
+                max(buckets) > sparse_mla.MAX_ROWS):
+            # a captured prefill plans its whole bucket at once; the eager plan takes chunks
+            raise ValueError(f"dsa_long_context captures prefill buckets up to "
+                             f"{sparse_mla.MAX_ROWS} tokens; the largest is {max(buckets)}")
         super().bind_node_resources(resources)
         kda = resources.get(KDA)
         self._kda = None if kda is None else KDACallable(resources[KDA_STATE], kda)
@@ -277,12 +298,10 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
             if graph_walk == "decode":
                 # one id in, the last emitted token: the step verifies it and k drafts
                 seq_len = self.mtp_block
-        # dsa_long_context is refused at model __init__, so the serving
-        # regime is ALWAYS ctx <= index_topk, where dense MLA computes
-        # exactly what GLM-5.3-Flash's DSA would — refuse beyond it rather
-        # than serve off-spec logits. Raising here fails only this request
-        # (the engine registers the failure and drops the rid from the batch).
-        limit = self.config.index_topk
+        # Without dsa_long_context dense MLA is GLM-5.3-Flash's DSA only within
+        # index_topk: refuse past the limit rather than serve off-spec logits.
+        # Raising fails only this request (the engine drops it from the batch).
+        limit = self.config.context_limit
         # the handle, which the batch, check_stop and cleanup_request key by
         state = self.request_state(fwd_info.rid_handle)
         committed = state.get("context", 0)
@@ -294,9 +313,10 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         if real + seq_len > limit or committed + seq_len > self.config.kv_rows:
             raise RuntimeError(
                 f"request {fwd_info.request_id}: context {real + seq_len} "
-                f"({committed + seq_len} cache rows) exceeds index_topk={limit} "
-                f"or {self.config.kv_rows} rows; index_topk is the regime where "
-                "dense MLA is exactly GLM-5.3-Flash's DSA computation"
+                f"({committed + seq_len} cache rows) exceeds "
+                f"{'max_seq_len' if self.config.dsa_long_context else 'index_topk'}={limit} "
+                f"or {self.config.kv_rows} rows; without dsa_long_context the limit is "
+                "index_topk, where dense MLA is exactly GLM-5.3-Flash's DSA."
             )
         if graph_walk == "prefill":
             state.add("prompt_len", committed + seq_len)
@@ -348,6 +368,10 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
             # replay what the last step accepted
             del steps[SAMPLER]
             steps[KDA] = LinearAttnStep(speculative=True)
+        if self.config.dsa_long_context:
+            # every MLA layer attends sparse over the DSA resource's plan, not a dense one
+            del steps[ATTN]
+            steps[DSA] = DSAStep()
         return SubmoduleStep(
             segments=[
                 Segment(request_id=rid, label=LABEL, span=inp.input_seq_len)
@@ -436,6 +460,8 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
     ) -> torch.Tensor:
         attn = engine_inputs.resources[ATTN]
         sampler = engine_inputs.resources[SAMPLER]
+        if self.config.dsa_long_context and graph_walk == "prefill" and not engine_inputs.captured:
+            return self._prefill_windows(engine_inputs, input_ids, sampler)
         last = None  # prefill samples each row's last token: the model computes only those
         if last_rows is not None:
             last = last_rows
@@ -455,6 +481,36 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         hidden = self.language_model.model(input_ids, rows=last)
         logits = self.lm_head(hidden)  # (rows, vocab)
         return sampler.sample(engine_inputs.request_ids, logits=logits)
+
+    def _prefill_windows(
+        self, engine_inputs: ModelInputsFromEngine, input_ids: torch.Tensor, sampler,
+    ) -> torch.Tensor:
+        """dsa_long_context's prefill: the step's tokens in windows of prefill_window_tokens,
+        each through every layer before the next (its KV rows and KDA state land first), so
+        activations stay bounded however long the prompt. Samples each request's last row."""
+        dsa, ctx = self._dsa, self._dsa.current(LABEL)
+        kv, kda = engine_inputs.resources[KV_CACHE], engine_inputs.resources[KDA]
+        size = self.config.prefill_window_tokens
+        total = input_ids.shape[0]
+        last = [r0 + n - 1 for r0, n, _ in ctx.spans]
+        # one window: the step's own plans (one-token prompts plan as decode, unsplittable)
+        if total <= size or len(ctx.spans) == total:
+            rows = _upload(self._long_stager, last, input_ids.device)
+            hidden = self.language_model.model(input_ids, rows=rows)
+            return sampler.sample(engine_inputs.request_ids, logits=self.lm_head(hidden))
+        hidden: list[torch.Tensor | None] = [None] * len(last)
+        for start in range(0, total, size):
+            end = min(start + size, total)
+            pieces = [(max(r0, start), min(r0 + n, end), req)
+                      for r0, n, req in ctx.spans if r0 < end and r0 + n > start]
+            ends = [(i, r - start) for i, r in enumerate(last) if start <= r < end]
+            rows = _upload(self._long_stager, [r for _, r in ends] or [end - start - 1], input_ids.device)
+            with dsa.rows(start, end, pieces, LABEL), kv.token_window(start, end, LABEL), \
+                    kda.token_window([(req, b - a) for a, b, req in pieces], LABEL):
+                out = self.language_model.model(input_ids[start:end], rows=rows)
+            for k, (i, _) in enumerate(ends):
+                hidden[i] = out[k]
+        return sampler.sample(engine_inputs.request_ids, logits=self.lm_head(torch.stack(hidden)))
 
     # -- MTP device side ---------------------------------------------------
 
@@ -759,11 +815,11 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         generated = request_info.dynamic_loop_iter_counts.get("decode_loop", 0) + 2
         # The next step takes the context to prompt + generated and may already
         # be scheduled when this stop lands, so stop while it still fits, before
-        # a step past index_topk (which prepare_inputs refuses) is scheduled. A
+        # a step past the context limit (which prepare_inputs refuses) is scheduled. A
         # next step that emits the reply's last token ends the loop at its cap
         # with nothing after it, so it may fill the window.
         prompt_len = state.get("prompt_len", 0) if state is not None else 0
-        full = (prompt_len + generated >= self.config.index_topk
+        full = (prompt_len + generated >= self.config.context_limit
                 and generated + 1 < request_info.max_tokens)
         if (not ignore_eos and is_eos) or generated >= request_info.max_tokens or full:
             return {"decode_loop"}
