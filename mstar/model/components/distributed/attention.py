@@ -27,7 +27,7 @@ from torch import nn
 from mstar.distributed.communication import CommGroup
 from mstar.distributed.utils import divide
 from mstar.engine.resources.convenience import AttentionCallable
-from mstar.engine.state import rope
+from mstar.engine.state import add_read, rope
 from mstar.model.components.distributed.linear import (
     ColumnParallelLinear,
     KVColumnParallelLinear,
@@ -156,8 +156,7 @@ class ParallelAttention(nn.Module):
 
     def _attend_state(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
         q, k = self._rotate_state(q, k)
-        self.state.add(self.layer, k=k, v=v)
-        return self.state.read(self.layer, q)
+        return add_read(self.state, self.layer, q, k=k, v=v)
 
     def _apply_rope(
         self,
@@ -186,12 +185,11 @@ class ParallelAttention(nn.Module):
         q, k, v = self._project_qkv(hidden_states)
         q, k = self._apply_qk_norm(q, k)
         if self.state is not None:
-            # Here, not through `_attend_state`, whose break in `add` would compile the rotation in a frame of its own.
+            # Here, not through `_attend_state`, whose break would compile the rotation in a frame of its own.
             # q and k are views of one projection. That frame fixes the size of their base when it compiles, and a
             # packed prefill reuses it across batch sizes, where the base can differ.
             q, k = self._rotate_state(q, k)
-            self.state.add(self.layer, k=k, v=v)
-            attn_output = self.state.read(self.layer, q)
+            attn_output = add_read(self.state, self.layer, q, k=k, v=v)
         else:
             q, k = self._apply_rope(q, k, self.attend.label)
             attn_output = self.attend(q, k, v)

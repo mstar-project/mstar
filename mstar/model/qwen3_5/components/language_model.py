@@ -16,6 +16,7 @@ from torch import nn
 
 from mstar.distributed.communication import CommGroup
 from mstar.distributed.utils import divide
+from mstar.engine.state import add_read
 from mstar.model.components import Attention, DecoderLayer, RMSNorm
 from mstar.model.components.decoder_layer import eager_frame, no_cursor, run_layers
 from mstar.model.components.distributed import (
@@ -123,8 +124,7 @@ class Qwen3_5Attention(Attention):
         v = v.view(num_tokens, self.num_kv_heads, self.head_dim)
         q, k = self._apply_qk_norm(q, k)
         q, k = self._apply_rope(q, k)
-        self.state.add(self.layer, k=k, v=v)
-        out = self.state.read(self.layer, q).reshape(num_tokens, self.num_heads * self.head_dim)
+        out = add_read(self.state, self.layer, q, k=k, v=v).reshape(num_tokens, self.num_heads * self.head_dim)
         if self.output_gate:
             out = out * torch.sigmoid(gate.reshape(num_tokens, -1))
         return self.o_proj(out)

@@ -19,7 +19,7 @@ from typing import Optional, Tuple
 import torch
 
 from mstar.distributed.communication import CommGroup
-from mstar.engine.state import PagedNHD, PagedNHDTarget, rope, state_op
+from mstar.engine.state import PagedNHD, PagedNHDTarget, add_read, rope, state_op
 from mstar.model.components.distributed import ParallelAttention
 from mstar.model.components.norm import rms_norm
 
@@ -117,11 +117,10 @@ class Qwen3OmniAttention(ParallelAttention):
             attn_output = self.state.read(self.layer, q)
         else:
             q, k = self._apply_qk_norm(q, k)
-            # Here, not through `_attend_state`, whose break in `add` would compile the rotation in a frame of its own.
+            # Here, not through `_attend_state`, whose break would compile the rotation in a frame of its own.
             if self._pos_key is not None:
                 q, k = rope(self.state, q, k)
-            self.state.add(self.layer, k=k, v=v)
-            attn_output = self.state.read(self.layer, q)
+            attn_output = add_read(self.state, self.layer, q, k=k, v=v)
 
         attn_output = attn_output.reshape(num_tokens, self.num_heads * self.head_dim)
         return self.o_proj(attn_output)

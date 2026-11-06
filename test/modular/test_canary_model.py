@@ -5,12 +5,14 @@ for by dense fakes; and the decoder node's context spans and stop checks. The
 encoder's parity is in test_fastconformer.py."""
 
 import json
+from types import SimpleNamespace
 
 import pytest
 import torch
 
 from mstar.api_server.openai.adapters import CanaryAdapter
 from mstar.api_server.openai.protocol import TranscriptionRequest
+from mstar.engine.state import KVEntry
 from mstar.model.canary.canary_model import CanaryModel
 from mstar.model.canary.config import LANGUAGES, MEL_SETTINGS, PROMPT_LENGTH, CanaryModelConfig, check_task
 from mstar.model.canary.decoder import CanaryDecoderModel, sinusoid_positions
@@ -189,11 +191,13 @@ class _FakeSelfAttention:
     """Dense stand-in for the self-attention array's handle, one request: the
     K/V added so far are its pages, and causal SDPA is the kernel."""
 
+    array = SimpleNamespace(max_len=1, entry=KVEntry(heads=1, head_dim=1))
+
     def __init__(self):
         self._kv: dict[int, tuple[list, list]] = {}
         self._pending = None
 
-    def add(self, layer, *, k, v):
+    def add(self, layer, *, keep=None, k, v):
         self._pending = (k, v)
 
     def read(self, layer, q):
