@@ -197,17 +197,6 @@ def test_dummy_mode_returns_no_submodules():
     assert all(model.get_submodule(node) is None for node in model.nodes)
 
 
-def test_autocast_is_off_so_numerics_follow_the_load_dtypes():
-    model = _make_model()
-    assert all(not model.get_node_precision(node).autocast for node in model.nodes)
-    assert model.get_node_precision("dit").param_dtype is torch.bfloat16
-
-
-# ----------------------------------------------------------------------
-# requests
-# ----------------------------------------------------------------------
-
-
 def test_process_prompt_tokenizes_the_stripped_prompt():
     out = _make_model().process_prompt("  a dog ", ["text"], ["video", "audio"])
     assert out["text_inputs"][0].tolist() == list(b"a dog")

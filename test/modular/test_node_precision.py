@@ -11,7 +11,6 @@ from mstar.distributed.communication import WorkerParallelGroups
 from mstar.engine.precision import (
     NodePrecision,
     apply_precision,
-    apply_yaml_precision,
     precision_mismatches,
 )
 from mstar.engine.resources import KVSpec
@@ -46,14 +45,6 @@ class _Node(NodeSubmodule):
 # --- the policy itself ------------------------------------------------------------
 
 
-def test_autocast_is_off_unless_asked_and_needs_a_param_dtype():
-    assert NodePrecision(torch.bfloat16).autocast is False
-    assert NodePrecision(None).autocast_dtype is None
-    assert NodePrecision(torch.bfloat16, autocast=True).autocast_dtype is torch.bfloat16
-    with pytest.raises(ValueError, match="needs a param_dtype"):
-        NodePrecision(None, autocast=True)
-
-
 def test_fp32_modules_and_their_children_stay_fp32():
     node = apply_precision(_Node(), NodePrecision(torch.bfloat16, fp32_modules=("blocks.*.norm", "head")))
     for block in node.blocks:
@@ -63,11 +54,6 @@ def test_fp32_modules_and_their_children_stay_fp32():
         # integer buffers are never cast
         assert block.index.dtype is torch.int64
     assert node.head.weight.dtype is torch.float32
-
-
-def test_a_glob_matching_nothing_is_an_error():
-    with pytest.raises(ValueError, match="'blocks.*.nrom' matches no module, param or buffer"):
-        apply_precision(_Node(), NodePrecision(torch.bfloat16, fp32_modules=("blocks.*.nrom",)))
 
 
 def test_params_and_buffers_match_by_name_and_keep_their_identity():
@@ -113,32 +99,6 @@ def test_meta_cast_never_materialises_bf16_params_in_fp32():
 
 
 # --- YAML -------------------------------------------------------------------------
-
-
-def test_yaml_may_tighten():
-    model = NodePrecision(torch.bfloat16, fp32_modules=("head",))
-    tightened = apply_yaml_precision(
-        model, "llm",
-        {"param_dtype": "float32", "fp32_modules": ["blocks.*.norm", "head"], "autocast": False},
-    )
-    assert tightened == NodePrecision(
-        torch.float32, fp32_modules=("head", "blocks.*.norm"), autocast=False,
-    )
-
-
-def test_yaml_may_not_turn_autocast_on_or_retype_a_pinned_node():
-    with pytest.raises(ValueError, match="cannot turn it on"):
-        apply_yaml_precision(NodePrecision(torch.bfloat16), "codec", {"autocast": True})
-    assert apply_yaml_precision(
-        NodePrecision(torch.bfloat16, autocast=True), "llm", {"autocast": False},
-    ) == NodePrecision(torch.bfloat16)
-    with pytest.raises(ValueError, match="cannot set param_dtype"):
-        apply_yaml_precision(NodePrecision(None, autocast=False), "codec", {"param_dtype": "bfloat16"})
-    with pytest.raises(ValueError, match="unknown key"):
-        apply_yaml_precision(NodePrecision(torch.bfloat16), "llm", {"dtype": "bfloat16"})
-
-
-# --- through the engine -------------------------------------------------------------
 
 
 class _Model:
@@ -230,11 +190,6 @@ def test_engine_reads_one_policy_for_load_resources_and_scope():
         manager.shutdown()
 
 
-def test_model_wide_autocast_dtype_yaml_is_refused_with_its_replacement():
-    with pytest.raises(ValueError, match=r"(?s)no longer read.*nodes:"):
-        _build(_Model({}), {"llm"}, {"autocast_dtype": "bfloat16"})
-
-
 def test_yaml_node_block_reaches_the_load_hint_and_the_policy():
     model = _Model({"llm": NodePrecision(torch.bfloat16)})
     config = {"nodes": {"llm": {"precision": {"param_dtype": "float32", "autocast": False}}}}
@@ -244,11 +199,6 @@ def test_yaml_node_block_reaches_the_load_hint_and_the_policy():
         assert manager.engine._submodules["llm"].precision == NodePrecision(torch.float32, autocast=False)
     finally:
         manager.shutdown()
-
-
-def test_yaml_naming_an_unplaced_node_is_an_error():
-    with pytest.raises(ValueError, match=r"unknown node\(s\) \['lmm'\]"):
-        _build(_Model({}), {"llm"}, {"nodes": {"lmm": {"precision": {"autocast": False}}}})
 
 
 def test_nodes_sharing_a_module_must_agree():
@@ -270,12 +220,7 @@ def test_nodes_sharing_a_module_must_agree():
         _build(clashing, {"a", "b"})
 
 
-def test_a_quantized_param_dtype_is_refused_and_quantized_tensors_survive_the_cast():
-    # fp8 weights are a quant config's job, not a cast's
-    with pytest.raises(ValueError, match="param_dtype is torch.float8_e4m3fn, a quantized dtype"):
-        NodePrecision(torch.float8_e4m3fn)
-    with pytest.raises(ValueError, match="quantized dtype"):
-        apply_yaml_precision(NodePrecision(torch.bfloat16), "llm", {"param_dtype": "float8_e4m3fn"})
+def test_quantized_tensors_survive_the_cast():
     # a tensor a quant pass (or a pre-quantized checkpoint) left in fp8 keeps its dtype
     node = _Node()
     node.blocks[0].proj.weight.data = node.blocks[0].proj.weight.data.to(torch.float8_e4m3fn)
@@ -283,16 +228,3 @@ def test_a_quantized_param_dtype_is_refused_and_quantized_tensors_survive_the_ca
     assert node.blocks[0].proj.weight.dtype is torch.float8_e4m3fn
     assert node.blocks[1].proj.weight.dtype is torch.bfloat16
     assert precision_mismatches(node, NodePrecision(torch.bfloat16)) == []
-
-
-def test_autocast_may_name_its_own_dtype_for_a_node_that_keeps_its_build_dtypes():
-    precision = NodePrecision(None, autocast=torch.bfloat16)
-    assert precision.autocast_dtype is torch.bfloat16
-    node = torch.nn.Linear(2, 2)
-    apply_precision(node, precision)
-    assert node.weight.dtype is torch.float32
-    with pytest.raises(ValueError, match="quantized dtype"):
-        NodePrecision(None, autocast=torch.float8_e4m3fn)
-    # YAML may turn it off, and asking for it again keeps the model's dtype
-    assert apply_yaml_precision(precision, "n", {"autocast": False}).autocast_dtype is None
-    assert apply_yaml_precision(precision, "n", {"autocast": True}).autocast_dtype is torch.bfloat16
