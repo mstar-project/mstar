@@ -501,6 +501,17 @@ def test_a_step_that_never_launched_is_no_skip():
     assert worker._landed_skipped(step) is False and log == []
 
 
+def test_a_skipped_steps_ring_positions_hold_no_room():
+    """The consumer never gets them, and only postprocess gave them back."""
+    from mstar.worker.worker import Worker
+
+    worker, log = Worker.__new__(Worker), []
+    step = _skipped_step(worker, log, iter([RUN_SKIPPED]), ring_bases={"codes": {1: 16, 2: 24}}, ring_width=2)
+    assert worker._landed_skipped(step) is True
+    rings = [entry for entry in log if entry[0] == "ring"]
+    assert rings == [("ring", "codes", 1, [16, 17]), ("ring", "codes", 2, [24, 25])]
+
+
 def test_a_skipped_step_gives_back_only_the_rows_a_refused_one_would(monkeypatch):
     """The step was built before N landed. A row whose loop stopped at N has an emptied
     node, which would pop with no inputs and run past its stop. One prepare_inputs

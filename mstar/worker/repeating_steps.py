@@ -417,7 +417,12 @@ class RepeatingSteps:
             return False
         outputs = step.future.result()
         phase_record(f"repeats.ran.{step.graph_walk}#", 0)
-        self.engine_manager.get_engine(step.node_name).end_run_early(node_batch, 0)
+        engine = self.engine_manager.get_engine(step.node_name)
+        engine.end_run_early(node_batch, 0)
+        for signal, bases in node_batch.ring_bases.items():
+            # what it reserved holds no room: only postprocess gives it back otherwise
+            for rid, base in bases.items():
+                engine.ring_rows(step.node_name).ring_skip(signal, rid, range(base, base + node_batch.ring_width))
         self._keep_rows_to_retry(step)
         self._push_back_batch(step.batch)
         if node_batch.failed_requests:
