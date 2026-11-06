@@ -422,7 +422,9 @@ def _watch_activity() -> None:
     child_busy = any(child[2].on_cpu() for child in list(_native.values()))
     REPORT["scan_s"] += clock._real() - began
     counted = _running[0] - _native_busy[0]
-    local_busy = not _quiet() if counted == 0 or clock.PARKED[0] else False
+    # Gloo at a registered meet is emulator work, not unclassified host activity.
+    meet = any(w.kind is MEET and not w.woken for w in _waits)
+    local_busy = not _quiet() if not meet and (counted == 0 or clock.PARKED[0]) else False
     if clock.PARKED[0] and (child_busy or local_busy):
         _unpark()
     working = child_busy or (counted == 0 and local_busy)
