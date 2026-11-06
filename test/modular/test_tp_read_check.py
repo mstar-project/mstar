@@ -139,19 +139,14 @@ def test_a_prepare_that_runs_a_collective_per_row_stays_in_step(tmp_path, monkey
 def test_a_step_whose_every_row_failed_runs_empty_on_every_rank(tmp_path, monkeypatch):
     """Rank 0 sends a step of rows the follower could read none of: both ranks
     run it empty, both requests fail and drain, and nothing is routed."""
-    clean = acc._run(tmp_path / "clean", acc.Scenario(kind="text", fail=False))
-    assert not clean.crashed and not clean.hung, clean.summary()
     monkeypatch.setattr(acc, "_rank_main", _rank_main_every_row_fails)
-    run = acc._run(tmp_path / "failed", acc.Scenario(kind="text"))
+    run = acc._run(tmp_path, acc.Scenario(kind="text"))
     assert not run.crashed, run.summary() + "\n" + "\n".join(map(str, run.crashed.values()))
     assert not run.hung, run.summary()
     assert set(run.failed) == {"r0", "r1"}, run.summary()
     assert run.torn_down("r0") and run.torn_down("r1"), run.summary()
     assert run.routed == {0: {}, 1: {}}, run.summary()
-    # No rank sat in a collective the other never joined, which costs a
-    # COLLECTIVE_S wait. Measured against the run with no failure, not as a
-    # fixed bound: starting the two ranks alone takes seconds on a slow host.
-    assert run.elapsed < clean.elapsed + acc.COLLECTIVE_S, (run.summary(), clean.summary())
+    assert not run.collective_failures, run.summary()   # no rank sat in one the other never joined
 
 
 # ── the check itself at TP4 and TP2 x SP2 (four gloo ranks) ───────────────
