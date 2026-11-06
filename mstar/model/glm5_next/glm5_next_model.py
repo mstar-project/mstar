@@ -1,0 +1,604 @@
+"""Glm5NextModel: Model implementation for GLM-5.3-Flash (text generation)."""
+
+import json
+import logging
+from pathlib import Path
+
+import torch
+from jinja2 import TemplateError
+
+from mstar.communication.tensors import NameToTensorList
+from mstar.conductor.request_info import CurrentForwardConductorMetadata
+from mstar.engine.resources import (
+    AttentionConfig,
+    AttentionSpec,
+    AttnBackend,
+    KVLayout,
+    KVSpec,
+    NodeResourceSpec,
+    PagedKVConfig,
+    ResourceReqConfig,
+    SamplerSpec,
+    SamplingReqConfig,
+)
+from mstar.engine.resources.linear_attn.config import (
+    LinearAttnBackend,
+    LinearAttnConfig,
+    LinearAttnSpec,
+    LinearAttnVariant,
+)
+from mstar.engine.resources.recurrent.config import (
+    DeltaNetGeometry,
+    RecurrentBlockConfig,
+    RecurrentStateConfig,
+    RecurrentStateSpec,
+)
+from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, TensorPointerInfo
+from mstar.graph.special_destinations import EMIT_TO_CLIENT
+from mstar.model.base import ForwardPassArgs, KVLabel, LabelLayout, Model, ProcessPromptOutput, Span
+from mstar.model.glm5_next.config import (
+    ATTN,
+    KDA,
+    KDA_STATE,
+    KV_CACHE,
+    MTP_DRAFT,
+    MTP_HIDDEN,
+    SAMPLER,
+    Glm5NextModelConfig,
+)
+from mstar.model.multimodal import TEXT, PromptPart, chat_turns
+from mstar.model.submodule_base import NodeSubmodule
+from mstar.model.utils import (
+    capture_ladder,
+    check_loaded,
+    load_snapshot_tokenizer,
+    process_weights_after_loading,
+    read_fp8_block_quant_config,
+    resolve_checkpoint,
+)
+from mstar.utils.generation_kwargs import normalize_generation_kwargs
+
+logger = logging.getLogger(__name__)
+
+
+class Glm5NextModel(Model):
+    """GLM-5.3-Flash: 320B hybrid KDA/MLA MoE causal LM, text in / text out."""
+
+    # the conductor builds the fused-MoE align op before spawning the workers
+    prebuild_fused_moe = True
+
+    def __init__(
+        self,
+        model_path_hf: str,
+        cache_dir: str | None = None,
+        **kwargs,
+    ):
+        self.cache_dir = cache_dir
+        checkpoint_path = kwargs.get("checkpoint_path")
+        self.model_path_hf = checkpoint_path or model_path_hf
+        self._config_variant = kwargs.get("config_variant", "full")
+        if self._config_variant == "reduced":
+            self.config = Glm5NextModelConfig.reduced()
+        elif self._config_variant == "reduced_fp8":
+            self.config = Glm5NextModelConfig.reduced_fp8()
+        else:
+            self.config = Glm5NextModelConfig()
+        if kwargs.get("dsa_long_context", False):
+            # rather than serve a long context densely
+            raise NotImplementedError(
+                "dsa_long_context needs the k-pool DSA path, which this build does not serve; "
+                "serve within index_topk (2048), where dense MLA is exact DSA"
+            )
+        if "moe_quant_kernel" in kwargs:
+            self.config.moe_quant_kernel = str(kwargs["moe_quant_kernel"])
+        if "mtp_num_draft_tokens" in kwargs:
+            k = kwargs["mtp_num_draft_tokens"]
+            # the cache rows are max_seq_len * (k + 1), and a prompt leaves two verify blocks of
+            # index_topk free: k must leave room for both
+            if (isinstance(k, bool) or not isinstance(k, int) or k < 0
+                    or self.config.index_topk - 2 * (k + 1) < 1):
+                raise ValueError(
+                    f"mtp_num_draft_tokens must be an integer from 0 (off) to "
+                    f"{(self.config.index_topk - 3) // 2}, got {k!r}")
+            self.config.mtp_num_draft_tokens = k
+        if "prefill_graphs" in kwargs:
+            # bool("false") is True
+            if not isinstance(kwargs["prefill_graphs"], bool):
+                raise ValueError(f"prefill_graphs must be true or false, got {kwargs['prefill_graphs']!r}")
+            self.config.prefill_graphs = kwargs["prefill_graphs"]
+        # overrides of the submodule's buckets, which **kwargs would otherwise swallow
+        for key in ("prefill_token_buckets", "prefill_capture_batch_sizes"):
+            if kwargs.get(key) is not None:
+                setattr(self.config, key, capture_ladder(key, kwargs[key]))
+        # Requests that may hold KDA state at once (the decode batch cap). The
+        # pool holds one more slot, its sink; a serve YAML sets the pool's
+        # size, sink included, under ``resources: kda_state: {max_slots: N}``.
+        self.kda_max_requests = int(kwargs.get("kda_max_requests", 32))
+        # the KDA conv tail's dtype, which must match the projections' (bf16 at serve; CPU
+        # tests pass fp32)
+        self.kda_conv_dtype = kwargs.get("kda_conv_dtype", torch.bfloat16)
+        # "byte" maps UTF-8 bytes to token ids for reduced serve (no HF IO).
+        self._tokenizer_mode = kwargs.get("tokenizer_mode", "hf")
+        self._tokenizer = None
+        self._detokenizer = None
+        self._submodule_cache: dict[str, NodeSubmodule | None] = {}
+
+    @property
+    def tokenizer(self):
+        # loaded on first use, so byte mode never touches HF
+        if self._tokenizer is None:
+            self._tokenizer = load_snapshot_tokenizer(self.model_path_hf, self.cache_dir)
+        return self._tokenizer
+
+    # -------------------------------------------------------------------
+    # Model ABC: KV cache config
+    # -------------------------------------------------------------------
+
+    def get_node_resources(self) -> list[NodeResourceSpec]:
+        """The LLM node's five resources."""
+        num_kv_layers = len(self.config.full_attn_layer_indices) + (
+            1 if self.config.mtp_num_draft_tokens > 0 else 0
+        )
+        kda_blocks = DeltaNetGeometry(
+            num_k_heads=self.config.linear_num_heads,
+            num_v_heads=self.config.linear_num_heads,
+            head_k_dim=self.config.linear_head_dim,
+            head_v_dim=self.config.linear_head_dim,
+            conv_kernel_size=self.config.linear_conv_kernel_size,
+        ).to_blocks(
+            conv_dtype=self.kda_conv_dtype,
+            # an MTP decode step verifies k + 1 tokens per request
+            speculative_tokens=self.config.mtp_num_draft_tokens,
+        )
+        if self.config.mtp_num_draft_tokens > 0:
+            # the next step's draft seed, in the model's dtype (the KDA projections')
+            kda_blocks[MTP_HIDDEN] = RecurrentBlockConfig(
+                shape=(self.config.hidden_size,), dtype=self.kda_conv_dtype, per_layer=False,
+            )
+            kda_blocks[MTP_DRAFT] = RecurrentBlockConfig(
+                shape=(1,), dtype=torch.long, per_layer=False,
+            )
+        return [
+            KVSpec(
+                resource_key=KV_CACHE,
+                nodes={"LLM"},
+                config=PagedKVConfig(
+                    num_layers=num_kv_layers,
+                    num_kv_heads=1,
+                    head_dim=self.config.kv_lora_rank + self.config.mla_cache_kpe,
+                    max_seq_len=self.config.kv_rows,
+                    num_qo_heads=self.config.num_attention_heads,
+                    layout=KVLayout.MLA,
+                    kv_lora_rank=self.config.kv_lora_rank,
+                    qk_rope_head_dim=self.config.mla_cache_kpe,
+                ),
+            ),
+            AttentionSpec(
+                resource_key=ATTN,
+                nodes={"LLM"},
+                config=AttentionConfig(
+                    kv_cache=KV_CACHE,
+                    backend=AttnBackend.FLASHINFER_MLA,
+                    sm_scale=self.config.qk_head_dim ** -0.5,
+                ),
+            ),
+            SamplerSpec(
+                resource_key=SAMPLER,
+                nodes={"LLM"},
+                vocab_size=self.config.vocab_size,
+                enable_repetion_penalty=True,
+            ),
+            RecurrentStateSpec(
+                resource_key=KDA_STATE,
+                nodes={"LLM"},
+                config=RecurrentStateConfig(
+                    num_layers=len(self.config.kda_layer_indices),
+                    blocks=kda_blocks,
+                    max_slots=self.kda_max_requests + 1,  # + the sink
+                ),
+            ),
+            LinearAttnSpec(
+                resource_key=KDA,
+                nodes={"LLM"},
+                config=LinearAttnConfig(
+                    recurrent_state=KDA_STATE,
+                    variant=LinearAttnVariant.KDA,
+                    backend=LinearAttnBackend.TRITON,
+                ),
+            ),
+        ]
+
+    def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
+        return {KV_CACHE: {"main": KVLabel(growth=(("decode", "decode_loop"),))}}
+
+    def get_request_resource_configs(
+        self, partition_fwd_args: dict[str, ForwardPassArgs],
+        model_kwargs: dict | None = None,
+    ) -> dict[str, ResourceReqConfig]:
+        del partition_fwd_args
+        model_kwargs = normalize_generation_kwargs(model_kwargs)
+        keys = ["temperature", "top_p", "repetition_penalty", "ignore_eos"]
+        params = {
+            k: model_kwargs.get(k, getattr(self.config, k))
+            for k in keys
+        }
+        # the sampler's own knobs with no config default
+        for k, cast in (("top_k", int), ("penalize_prompt", bool)):
+            if k in model_kwargs:
+                params[k] = cast(model_kwargs[k])
+        if self.config.mtp_num_draft_tokens > 0 and "temperature" not in model_kwargs:
+            # MTP verifies greedily: a request that names no temperature gets 0, and an
+            # explicit one > 0 is refused in process_prompt
+            params["temperature"] = 0.0
+        return {SAMPLER: SamplingReqConfig(**params)}
+
+    # -------------------------------------------------------------------
+    # Model ABC: graph walk definitions
+    # -------------------------------------------------------------------
+
+    def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
+        # MTP keeps this graph: the draft seed lives in the request's KDA slot, and a
+        # verify step's tokens leave on new_token like a decode step's
+        prefill = GraphNode(
+            name="LLM",
+            input_names=["text_inputs"],
+            outputs=[
+                GraphEdge(
+                    next_node=EMIT_TO_CLIENT,
+                    name="new_token",
+                    output_modality="text",
+                    conductor_new_token=True,
+                    persist=True,
+                ),
+            ],
+        )
+
+        decode = Loop(
+            name="decode_loop",
+            section=GraphNode(
+                name="LLM",
+                input_names=["text_inputs"],
+                outputs=[
+                    GraphEdge(
+                        next_node="LLM",
+                        name="text_inputs",
+                    ),
+                    GraphEdge(
+                        next_node=EMIT_TO_CLIENT,
+                        name="new_token",
+                        output_modality="text",
+                    ),
+                ],
+            ),
+            # Runaway guard; the per-request budget lives in check_stop.
+            max_iters=self.max_decode_steps(),
+            outputs=[],
+        )
+
+        return dict(prefill=prefill, decode=decode)
+
+    # -------------------------------------------------------------------
+    # Model ABC: conductor state machine (prefill -> decode -> done)
+
+    def get_initial_forward_pass_args(
+        self,
+        partition_name: str,
+        input_modalities: list[str],
+        output_modalities: list[str],
+        input_signals: dict[str, list[TensorPointerInfo]],
+        model_kwargs: dict | None = None,
+    ) -> ForwardPassArgs:
+        full_metadata = CurrentForwardConductorMetadata(
+            input_modalities=input_modalities,
+            output_modalities=output_modalities,
+            graph_walk="prefill",
+            is_prefill=True,
+        )
+
+        graph_edge = GraphEdge(next_node="LLM", name="text_inputs")
+        graph_edge.tensor_info = input_signals.get("text_inputs", [])
+        inputs = [graph_edge]
+        unpersist_tensors = sum([inp.tensor_info for inp in inputs], start=[])
+
+        return ForwardPassArgs(
+            full_metadata=full_metadata,
+            inputs=inputs,
+            unpersist_tensors=unpersist_tensors,
+            step_metadata={"is_prefill": True},
+        )
+
+    def get_partition_forward_pass_args(
+        self,
+        partition_name: str,
+        partition_metadata: CurrentForwardConductorMetadata,
+        persist_signals: dict[str, list[TensorPointerInfo]],
+        incoming_connections=None,
+    ) -> ForwardPassArgs:
+        metadata = partition_metadata
+        request_done = False
+
+        if metadata.is_prefill:
+            metadata.is_prefill = False
+            metadata.graph_walk = "decode"
+        elif metadata.graph_walk == "decode":
+            # The decode Loop ran to EOS (submodule check_stop) or to
+            # max_iters; either way the request is finished.
+            request_done = True
+            metadata.kwargs["decode_finished"] = True
+
+        if request_done:
+            return ForwardPassArgs(
+                full_metadata=metadata,
+                inputs=[],
+                unpersist_tensors=[],
+                request_done=True,
+            )
+
+        # seed decode from the persisted emitted token
+        graph_edge = GraphEdge(next_node="LLM", name="text_inputs")
+        graph_edge.tensor_info = persist_signals.get("new_token", [])
+        unpersist_tensors = list(graph_edge.tensor_info)
+        inputs = [graph_edge]
+
+        return ForwardPassArgs(
+            full_metadata=metadata,
+            inputs=inputs,
+            unpersist_tensors=unpersist_tensors,
+            step_metadata={"is_prefill": metadata.is_prefill},
+        )
+
+    # -------------------------------------------------------------------
+    # Model ABC: prompt processing
+    # -------------------------------------------------------------------
+
+    def process_prompt(
+        self,
+        prompt: str | None,
+        input_modalities: list[str],
+        output_modalities: list[str],
+        tensors: NameToTensorList | None = None,
+        **kwargs,
+    ) -> NameToTensorList | ProcessPromptOutput:
+        if prompt is None:
+            return {}
+        # the conductor reads these kwargs; read here first, a bad one is the
+        # client's 400 before the request reaches any rank
+        kwargs = normalize_generation_kwargs(kwargs)
+        self.get_request_resource_configs({}, kwargs)
+        self.get_max_output_tokens(**kwargs)
+        if kwargs.get("min_p", 0) > 0:
+            # the node's sampler is built without min-p, and the request configs do not pass it on
+            raise ValueError(f"GLM-5.3 is served without min_p (min_p={kwargs['min_p']}); send none")
+        if kwargs.get("return_logprobs"):
+            # the sampler configs carry none, which the conductor refuses too
+            raise ValueError("GLM-5.3 does not report logprobs; leave return_logprobs unset")
+
+        if self.config.mtp_num_draft_tokens > 0:
+            # MTP verifies by argmax; refused here, it is the client's 400 rather than a
+            # worker's 500
+            temperature = float(kwargs.get("temperature", 0.0))
+            penalty = float(kwargs.get("repetition_penalty", self.config.repetition_penalty))
+            if temperature > 0.0 or penalty != 1.0:
+                raise ValueError(
+                    f"MTP drafting is greedy only (temperature={temperature}, "
+                    f"repetition_penalty={penalty}); serve with mtp_num_draft_tokens: 0"
+                )
+
+        if self._tokenizer_mode == "byte":
+            # Reduced serve maps UTF-8 bytes directly to token ids, avoiding HF IO.
+            vocab = self.config.vocab_size
+            byte_ids = [min(b, vocab - 1) for b in prompt.encode("utf-8")] or [0]
+            input_ids = torch.tensor(byte_ids, dtype=torch.long)
+        elif getattr(self.tokenizer, "chat_template", None):
+            input_ids = self._render_chat(prompt, kwargs.get("prompt_parts"))
+        else:
+            input_ids = self.tokenizer(prompt, return_tensors="pt").input_ids[0]
+
+        # Decode runs at least one step, and one more may already be scheduled
+        # when it stops, so the prompt leaves two steps' tokens of index_topk
+        # free (an MTP step keeps k + 1). A ValueError here reaches the client
+        # as a 400.
+        limit = self.config.index_topk - 2 * (self.config.mtp_num_draft_tokens + 1)
+        if input_ids.numel() > limit:
+            raise ValueError(
+                f"prompt is {input_ids.numel()} tokens; GLM-5.3-Flash is served "
+                f"with at most {limit}"
+            )
+        n = input_ids.numel()
+        # a decode step writes one row, or under MTP its whole verify block (the rejected
+        # drafts stay as holes), so the KV pool sizes a request at its worst case
+        block = self.config.mtp_num_draft_tokens + 1
+        budget = kwargs.get("max_output_tokens")
+        if block > 1 and budget is not None:
+            # MTP decode stops two blocks short of the window (_mtp_check_stop), so a max_tokens
+            # past that is refused here rather than cut short
+            room = self.config.index_topk - 2 * block + 1 - n
+            if budget > room:
+                raise ValueError(
+                    f"max_tokens={budget} after a {n}-token prompt: GLM-5.3-Flash with MTP "
+                    f"emits at most {room} tokens after it"
+                )
+        layout = LabelLayout(spans=(Span("ids", "prefill", n, n, "text_inputs"),), growth=(("decode_loop", block),))
+        return ProcessPromptOutput(
+            {"text_inputs": [input_ids.to(torch.long)]}, {"kv_layout": {KV_CACHE: {"main": layout}}},
+        )
+
+    def _render_chat(self, prompt: str, prompt_parts: list[PromptPart] | None) -> torch.Tensor:
+        """The chat's turns, each in its own role, through the checkpoint's template, which
+        adds ``[gMASK]<sop>`` and opens the assistant turn. An entrypoint with no messages
+        sends the prompt as one user turn."""
+        parts = prompt_parts or [PromptPart(modality=TEXT, text=prompt, role="user")]
+        messages = [
+            {"role": turn.role,
+             "content": "\n".join(p.text or "" for p in turn.parts if p.modality == TEXT)}
+            for turn in chat_turns(parts)
+        ]
+        try:
+            input_ids = self.tokenizer.apply_chat_template(
+                messages,
+                add_generation_prompt=True,
+                return_tensors="pt",
+                # transformers 5.x defaults return_dict=True (a BatchEncoding);
+                # keep the bare-tensor return so [0] selects the row
+                return_dict=False,
+            )
+        except TemplateError as exc:
+            # a chat the template refuses is the client's to fix: a 400, not a 500
+            raise ValueError(f"GLM-5.3's chat template refused the chat: {exc}") from exc
+        return input_ids[0]
+
+    def max_decode_steps(self) -> int:
+        """Decode iterations a one-token prompt can run before its context
+        reaches index_topk or its cache rows reach kv_rows (an MTP step stores
+        k + 1); check_stop stops every request before either."""
+        cfg = self.config
+        return min(cfg.index_topk - 1, (cfg.kv_rows - 1) // (cfg.mtp_num_draft_tokens + 1))
+
+    def get_max_output_tokens(self, **model_kwargs):
+        # held to the window: a one-token prompt emits at most index_topk tokens. A request
+        # that names none runs as far as the decode loop can (under MTP the cache rows bind
+        # first), and the conductor fits it to the room its prompt leaves.
+        budget = normalize_generation_kwargs(model_kwargs).get("max_output_tokens", self.config.max_output_tokens)
+        if budget is None:
+            return min(self.config.index_topk, self.max_decode_steps() + 1)
+        return min(budget, self.config.index_topk)
+
+    def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
+        # the prefill emits the first of max_output_tokens, so decode runs one fewer; the
+        # conductor refuses a cap past the loop's max_iters
+        return {"decode_loop": max(1, self.get_max_output_tokens(**model_kwargs) - 1)}
+
+    # -------------------------------------------------------------------
+    # Model ABC: postprocess
+    # -------------------------------------------------------------------
+
+    def postprocess(
+        self,
+        output: torch.Tensor,
+        modality: str,
+        **kwargs,
+    ) -> bytes:
+        if modality == "text":
+            token_ids = output.flatten().tolist()
+            if self._tokenizer_mode == "byte":
+                # Synthetic reduced models emit arbitrary byte ids; never
+                # touch the HF tokenizer.
+                return bytes((t & 0xFF) for t in token_ids)
+            # The tokens' raw bytes (byte-level BPE): a character split across
+            # tokens reaches the client whole, where decoding each token alone
+            # gives U+FFFD. Special tokens drop, as with skip_special_tokens.
+            if self._detokenizer is None:
+                from mstar.model.utils import ByteLevelDetokenizer
+
+                self._detokenizer = ByteLevelDetokenizer(self.tokenizer)
+            return self._detokenizer.to_bytes(token_ids)
+        raise ValueError(f"Unsupported modality for GLM-5.3-Flash: {modality!r}")
+
+    # -------------------------------------------------------------------
+    # Model ABC: sharding
+    # -------------------------------------------------------------------
+
+    def get_default_sharding_config(self):
+        from mstar.distributed.base import ShardingConfig
+
+        return ShardingConfig(groups=[], tp_enabled_nodes={"LLM"}, shard_dim={})
+
+    # -------------------------------------------------------------------
+    # Model ABC: submodule loading
+    # -------------------------------------------------------------------
+
+    def get_submodule(
+        self, node_name: str, device: str = "cpu", tp_group=None,
+        autocast_dtype: torch.dtype | None = None,
+    ) -> NodeSubmodule | None:
+        if node_name in self._submodule_cache:
+            return self._submodule_cache[node_name]
+        submodule = self._create_submodule(
+            node_name, device, tp_group=tp_group, autocast_dtype=autocast_dtype,
+        )
+        self._submodule_cache[node_name] = submodule
+        return submodule
+
+    def _create_submodule(
+        self,
+        node_name: str,
+        device: str,
+        tp_group=None,
+        autocast_dtype: torch.dtype | None = None,
+    ) -> NodeSubmodule | None:
+        if node_name != "LLM":
+            return None
+
+        source = self._resolve_checkpoint()
+        if source is None:
+            logger.info(
+                "Glm5NextModel: no checkpoint resolved for node %r — dummy "
+                "mode (None).", node_name,
+            )
+            return None
+
+        self._maybe_apply_checkpoint_quant_config(source)
+
+        from mstar.model.glm5_next.components.causal_lm import Glm5NextForCausalLM
+        from mstar.model.glm5_next.submodules import Glm5NextLLMSubmodule
+
+        # built on meta, so nothing is allocated before to_empty; load_weights re-widens the
+        # fp32 params (restore_fp32_params)
+        with torch.device("meta"):
+            language_model = Glm5NextForCausalLM(self.config, comm_group=tp_group)
+        if autocast_dtype is not None:
+            language_model = language_model.to(autocast_dtype)
+        language_model.to_empty(device=device)
+        self._load_checkpoint(language_model, source, device, tp_group)
+        process_weights_after_loading(language_model, torch.device(device))
+        language_model.eval()
+        # The declared conv-tail dtype must match the loaded projections.
+        self.kda_conv_dtype = language_model.kda_conv_dtype()
+
+        logger.info("Successfully loaded GLM-5.3-Flash submodule for %s", node_name)
+        return Glm5NextLLMSubmodule(
+            language_model=language_model, config=self.config)
+
+    def _load_checkpoint(self, language_model, source: str, device, tp_group) -> None:
+        """Load weights, taking the sliced TP fast read path when possible."""
+        from mstar.model.glm5_next.weight_loader import build_glm5_next_read_plan
+        from mstar.model.loader import load_weights
+        from mstar.model.loader.iterators import iter_safetensors_shards
+
+        index_file = Path(source) / "model.safetensors.index.json"
+        if not index_file.is_file():
+            check_loaded(language_model, load_weights(language_model, source, device=device), source)
+            return
+
+        with open(index_file) as f:
+            checkpoint_keys = list(json.load(f)["weight_map"])
+        tp_rank = tp_group.rank if tp_group is not None else 0
+        tp_size = tp_group.world_size if tp_group is not None else 1
+        keys, specs = build_glm5_next_read_plan(
+            checkpoint_keys, self.config, tp_rank, tp_size,
+            load_mtp=language_model.mtp is not None,
+        )
+        logger.info(
+            "Glm5NextModel fast read plan: %d/%d keys, %d sliced (tp %d/%d)",
+            len(keys), len(checkpoint_keys), len(specs), tp_rank, tp_size,
+        )
+        weights = iter_safetensors_shards(
+            source, device=device, keys=keys, slice_spec=specs.get,
+        )
+        check_loaded(language_model, language_model.load_weights(weights), source)
+
+    def _maybe_apply_checkpoint_quant_config(self, source: str) -> None:
+        """Adopt the checkpoint's fp8-block quant config from its config.json."""
+        if self.config.quantization_config is not None:
+            return
+        quant = read_fp8_block_quant_config(source)
+        if quant is not None:
+            logger.info(
+                "Glm5NextModel: fp8 %s checkpoint (block %s) — dense dequant on "
+                "load, routed experts fp8-resident=%s.",
+                quant.fmt, quant.weight_block_size, self.config.moe_fp8_resident,
+            )
+            self.config.quantization_config = quant
+
+    def _resolve_checkpoint(self) -> str | None:
+        return resolve_checkpoint(self.model_path_hf, self.cache_dir)

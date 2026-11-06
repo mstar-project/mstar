@@ -278,6 +278,12 @@ TOP_LEVEL_KV_CACHE = (
 )
 
 
+def check_sizes(sizes: Mapping[str, Any], smallest: int = 1) -> None:
+    for name, value in sizes.items():
+        if isinstance(value, bool) or not isinstance(value, int) or value < smallest:
+            raise ValueError(f"{name} must be an integer >= {smallest}; got {value!r}")
+
+
 def unknown_overrides_message(unknown: list[str], declared: Collection[str]) -> str:
     return (
         f"serving config overrides unknown resource(s) {unknown}; this "
