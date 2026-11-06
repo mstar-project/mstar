@@ -28,11 +28,12 @@ from typing import Any
 # ---------------------------------------------------------------------------
 TALKER_KV = "talker_kv"
 TALKER_ATTN = "talker_attn"
-TALKER_POS = "talker_pos"
 TALKER_SAMPLER = "talker_sampler"
 CODE_PRED_SAMPLER = "code_predictor"
 # Codec node: each stream's incremental decoder state
 CODEC_STATE = "codec_state"
+# the text each decode step adds, then TTS PAD
+TALKER_TEXT = "talker_text"
 # combined walk of the Talker's prefills and decode: a new prompt rides a
 # decode step (Model.get_combined_graph_walks)
 TALKER_MIXED = "talker_mixed"

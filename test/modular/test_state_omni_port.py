@@ -31,7 +31,6 @@ from mstar.engine.state.analysis import state_declaration_problems
 from mstar.engine.state.host import HostFields
 from mstar.model.components.aut_encoder import AuTEncoderConfig
 from mstar.model.components.aut_submodule import AuTEncoderSubmodule
-from mstar.model.components.code_predictor_kernels import DepthKV
 from mstar.model.components.norm import RMSNorm
 from mstar.model.qwen3_omni.components.attention import _norm_rotate_add
 from mstar.model.qwen3_omni.config import (
@@ -459,23 +458,6 @@ def test_the_reference_equals_the_unfused_norm_and_rotation():
     assert torch.equal(q, want_q), "the fused op mutates q, so its reference does too"
     assert torch.equal(added["k"], want_k) and added["v"] is v_before and added["layer"] == 2
     assert torch.equal(k, k_before), "the fused op leaves k as it was"
-
-
-# Scratch at load
-
-
-def test_the_depth_scratch_can_be_made_at_load_and_a_step_reuses_it():
-    depth = DepthKV((2, 4, 2, 8, 2, 16))
-    depth.make(torch.bfloat16, "cpu")
-    cache, partials = depth.kv_cache, depth.partials
-    assert cache.dtype is torch.bfloat16 and cache.shape == (2, 4, 2, 8, 2, 16)
-    assert depth.scratch(torch.zeros(1, dtype=torch.float32)) is partials and depth.kv_cache is cache
-
-
-def test_a_depth_scratch_nothing_made_at_load_still_comes_at_the_first_step():
-    depth = DepthKV((2, 4, 2, 8, 2, 16))
-    depth.scratch(torch.zeros(1, dtype=torch.float16))
-    assert depth.kv_cache.dtype is torch.float16, "Qwen3-TTS still makes its buffers at the first step"
 
 
 def test_the_declarations_have_no_problems_on_the_real_walks(monkeypatch):

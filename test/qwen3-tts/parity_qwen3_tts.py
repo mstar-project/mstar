@@ -56,9 +56,10 @@ from mstar.distributed.communication import CommGroup, JointGroups
 from mstar.engine.resources import StepContext, StepRunner, apply_yaml_overrides, resolve_spec_dependencies
 from mstar.engine.resources.base import EngineResourceInfo, build_resource
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
-from mstar.model.qwen3_tts.config import LANGUAGE_ID_KEY, PROMPT_LAYOUT_KEY, SPEAKER_ID_KEY
+from mstar.engine.state.adapters import node_handles, node_resources, sampling_configs
+from mstar.model.qwen3_tts.config import LANGUAGE_ID_KEY, PROMPT_LAYOUT_KEY, SPEAKER_ID_KEY, TALKER_TEXT
 from mstar.model.qwen3_tts.qwen3_tts_model import Qwen3TTSModel
-from mstar.model.submodule_base import ModelInputsFromEngine
+from mstar.model.submodule_base import InputMetadata, ModelInputsFromEngine, engine_step
 
 GREEDY_KWARGS = {"do_sample": False, "subtalker_dosample": False}
 
@@ -197,7 +198,7 @@ class MStarTalkerDriver:
     """Drive ``TalkerSubmodule`` through declare -> admit -> plan -> forward -> commit.
 
     Mirrors ``Engine._drive_step`` for one eager request, on resources built
-    from the model's own ``get_node_resources`` declaration.
+    from the model's own ``declare_state`` declaration.
     """
 
     def __init__(self, model: Qwen3TTSModel, talker, device: str, deployment: str | None = None,
@@ -205,7 +206,7 @@ class MStarTalkerDriver:
         self.model = model
         self.talker = talker
         self.device = torch.device(device)
-        specs = model.get_node_resources()
+        specs = [spec for spec in node_resources(model) if "Talker" in spec.nodes]
         by_key = resolve_spec_dependencies(specs)
         if deployment is not None:
             # The served deployment's resource overrides (e.g. the FA2 pin), so
@@ -233,12 +234,18 @@ class MStarTalkerDriver:
             for spec in specs
         }
         talker.bind_node_resources(self.resources)
+        talker.bind_node_state(node_handles(model, "Talker", self.resources))
         self.runner = StepRunner(self.resources)
         self.fwd_index = 0
+        # what the graph holds for a request between its steps: the prefill's text edge and the loop counter
+        self.text: torch.Tensor | None = None
+        self.iteration = 0
 
     def open_request(self, rid: str, model_kwargs: dict[str, Any], prompt: dict[str, Any]) -> CurrentForwardPassInfo:
         """``prompt`` is ``process_prompt``'s metadata, which the prefill reads as step metadata."""
-        configs = self.model.get_request_resource_configs({}, model_kwargs)
+        settings = self.model.get_request_resource_configs({}, model_kwargs)
+        configs = sampling_configs(settings, self.model.declare_state())
+        self.iteration = 0
         for config in configs.values():
             config.apply_conductor_config(seed=1234)
         self.runner.ingest_request(rid, configs)
@@ -258,18 +265,26 @@ class MStarTalkerDriver:
         if walk == "talker_prefill" and ("speaker_embed" in inputs or "ref_codes" in inputs):
             walk = "talker_prefill_clone"
         fwd.graph_walk = walk
-        prepared = self.talker.prepare_inputs(walk, fwd, inputs)
-        step = self.talker.declare_step(walk, [rid], [prepared])
+        if walk == "talker_decode":
+            inputs = {**inputs, TALKER_TEXT: [self.text]}
+        metadata = InputMetadata(dynamic_loop_iter_counts={"talker_decode_loop": self.iteration})
+        prepared = self.talker.prepare_inputs(walk, fwd, inputs, input_metadata=metadata)
+        if walk == "talker_decode":
+            self.iteration += 1
+        else:
+            self.text = prepared.kwargs[TALKER_TEXT]
+        step = engine_step(self.talker, walk, [rid], [prepared])
         step.set_ctx(StepContext(request_ids=(rid,), graph_walk=walk, slot=0, capture=False))
         outcome = self.runner.admit(step)
         assert outcome.ok, f"admit failed: {outcome.reason}"
         self.runner.plan(step)
         engine_inputs = ModelInputsFromEngine(
-            request_ids=[rid], per_request_info={rid: fwd}, resources=dict(self.resources),
-            per_request_states={rid: self.talker.request_state(rid)}, step=step,
+            request_ids=[rid], per_request_info={rid: fwd}, resources=dict(self.resources), step=step,
         )
         preprocessed = self.talker.preprocess(walk, engine_inputs, [prepared])
+        step.begin_calls()
         out = forward(engine_inputs, **preprocessed)
+        step.end_calls()
         self.runner.commit(step)
         return out
 
@@ -285,7 +300,7 @@ def mstar_teacher_forced(driver: MStarTalkerDriver, tensors: dict, prompt: dict,
 
     def backbone(engine_inputs, input_embeds, last_token_indices, suppress_eos):
         del engine_inputs, suppress_eos
-        hidden = talker.model(input_embeds, label="main")
+        hidden = talker.model(input_embeds)
         last = hidden.index_select(0, last_token_indices)
         hiddens.append(last[0])
         logits.append(talker.model.codec_head(last)[0])
@@ -581,17 +596,13 @@ def main(argv: list[str] | None = None) -> None:
         "rel_diff": float((ours_hidden.float() - ref_hidden.float()).norm() / ref_hidden.float().norm()),
     }
     # Diagnostic: the reference backbone over M*'s own prefill embeddings.
-    prefill = talker._build_prefill(
-        "layout-probe", tensors["text_inputs"][0], prompt[PROMPT_LAYOUT_KEY],
+    prefill, text, _ = talker._build_prefill(
+        tensors["text_inputs"][0], prompt[PROMPT_LAYOUT_KEY],
         prompt[SPEAKER_ID_KEY], prompt[LANGUAGE_ID_KEY],
         speaker_embed=tensors.get("speaker_embed", [None])[0],
         ref_codes=tensors.get("ref_codes", [None])[0],
     )
-    probe_state = talker.request_state("layout-probe")
-    backbone_logits, _ = reference_teacher_forced(
-        ref, prefill, frame_embeds, probe_state["trailing_text_hidden"], probe_state["tts_pad_embed"],
-    )
-    talker.cleanup_request("layout-probe")
+    backbone_logits, _ = reference_teacher_forced(ref, prefill, frame_embeds, text[:-1], text[-1])
     backbone_report = compare_logits("backbone_only_on_mstar_prefill", ours_logits, backbone_logits)
     cp_ours = mstar_code_predictor_logits(talker, ref_hidden, ref_codes)
     cp_theirs = reference_code_predictor_logits(ref, ref_hidden, ref_codes)

@@ -11,6 +11,8 @@ from collections import defaultdict
 import pytest
 import torch
 
+from mstar.engine.state import Sampler
+from mstar.engine.state.calls import SamplerHandle
 from mstar.model.qwen3_tts.components.depth_frame import schedule
 from mstar.model.qwen3_tts.components.depth_frame.schedule import NPAGES, TB
 
@@ -85,7 +87,7 @@ class _StubFrame:
     """Records its launches instead of running the kernel."""
 
     max_rows = 64
-    kv_cache = positions = partials = None
+    kv_cache = depth_positions = partials = None
 
     def __init__(self):
         self.runs = 0
@@ -109,7 +111,9 @@ def _talker(frame):
 
 
 def _run_depth(talker, sampler, rows=3):
-    return talker._run_depth(torch.zeros(rows, 2048), torch.zeros(rows, dtype=torch.long), sampler, ["r"] * rows)
+    talker.cp_sampler = SamplerHandle(Sampler("code_predictor", nodes={"Talker"}, vocab_size=2048, draws=15), sampler)
+    talker.cp_sampler._open = True
+    return talker._run_depth(torch.zeros(rows, 2048), torch.zeros(rows, dtype=torch.long))
 
 
 def test_a_step_the_frame_can_draw_runs_the_frame_and_moves_the_offsets_past_its_draws():
@@ -163,6 +167,7 @@ def _predictor():
             param.data.normal_(std=0.02)
     talker_table = torch.randn(config.talker.vocab_size, 2048, device="cuda", dtype=torch.bfloat16)
     predictor.consolidate_stacked_weights()
+    predictor.depth.make(torch.bfloat16, "cuda")
     return predictor, talker_table
 
 
@@ -187,7 +192,7 @@ def test_the_frame_with_given_codes_matches_the_depth_loop(_frame, bs):
     runs = []
     for _ in range(2):
         all_codes, embed_sum = torch.empty_like(codes), torch.empty_like(sum_want)
-        frame.run(hidden, codes, frame.kv_cache, frame.positions, frame.partials, all_codes, embed_sum, None)
+        frame.run(hidden, codes, frame.kv_cache, frame.depth_positions, frame.partials, all_codes, embed_sum, None)
         runs.append((all_codes, embed_sum, frame.kv_cache[:, :bs].clone(), frame.LOGITS[:bs].clone()))
     all_codes, embed_sum, kv, logits = runs[0]
     assert torch.equal(all_codes, codes_want) and torch.equal(embed_sum, sum_want), "given codes summed differently"
@@ -199,7 +204,7 @@ def test_the_frame_with_given_codes_matches_the_depth_loop(_frame, bs):
 
 
 def _draw(bs: int, offset: int):
-    from mstar.engine.resources.sampler.utils import FusedDrawArgs
+    from mstar.engine.state import FusedDrawArgs
 
     return FusedDrawArgs(
         torch.full((bs,), 0.9, device="cuda"), torch.full((bs,), 50, device="cuda", dtype=torch.int32),
@@ -219,7 +224,7 @@ def test_a_sampled_frame_draws_its_last_group_from_its_own_logits_at_the_last_of
     hidden = torch.randn(bs, 2048, device="cuda", dtype=torch.bfloat16)
     layer0 = torch.randint(0, talker_table.shape[0], (bs,), device="cuda")
     draw = _draw(bs, offset=5)
-    kv, positions, partials = frame.kv_cache, frame.positions, frame.partials
+    kv, positions, partials = frame.kv_cache, frame.depth_positions, frame.partials
     codes, embed_sum = torch.empty(bs, 16, device="cuda", dtype=torch.long), torch.empty_like(hidden)
     frame.run(hidden, layer0, kv, positions, partials, codes, embed_sum, draw)
     given_sum = torch.empty_like(embed_sum)
@@ -236,7 +241,7 @@ def test_a_captured_frame_replays_what_it_ran(_frame):
     bs = 13
     hidden = torch.randn(bs, 2048, device="cuda", dtype=torch.bfloat16)
     layer0 = torch.randint(0, talker_table.shape[0], (bs,), device="cuda")
-    positions, partials = frame.positions, frame.partials
+    positions, partials = frame.depth_positions, frame.partials
     draw = _draw(bs, offset=5)
 
     def outputs():
