@@ -1214,6 +1214,30 @@ def test_a_host_collective_is_a_wait_for_the_peers():
     assert float(waiter.split()[-1]) < 0.25, waiter
 
 
+def test_a_forked_child_starts_its_own_process_state():
+    """Nothing in mstar forks and runs on, but a library may: the child shares none of the parent's
+    waits, pokes or mover wake, and holds a slot of its own."""
+    out = run_sim("""
+        import os
+        from mstar_sim import waits
+        waits._poked.add(object())
+        fd = waits._wakefd[0]
+        pid = os.fork()
+        if pid == 0:
+            os.eventfd_write(waits._wakefd[0], 1)
+            os._exit(0 if not waits._poked and waits._wakefd[0] == fd else 1)  # (the same number, a new fd)
+        _, status = os.waitpid(pid, 0)
+        try:
+            os.eventfd_read(fd)
+            crossed = True
+        except BlockingIOError:
+            crossed = False
+        print(os.waitstatus_to_exitcode(status), crossed)
+        waits._poked.clear()
+    """)
+    assert out.split() == ["0", "False"], out
+
+
 def test_a_read_held_behind_a_rising_bound_doesnt_abort():
     """The limit is on a bound that stands still, not on a hold: a device wait can put a process
     far past a peer that runs at real rate, and it then waits for the peer to get there."""

@@ -698,7 +698,7 @@ def sleep(seconds) -> None:
     lock.acquire()
     w = enter(HOST, clock.now() + seconds, release=lock.release)
     try:
-        _until(w, seconds, lambda t: lock.acquire(True, t)) if w is not None else _real_sleep(seconds)
+        _until(w, seconds, lambda t: lock.acquire(True, t))
     finally:
         leave(w)
 
@@ -842,20 +842,28 @@ def _leave() -> None:
 
 
 def _after_fork() -> None:
-    """A forked child has only the forking thread, running, and a slot of its own to find."""
+    """A forked child has only the forking thread, running, and a process state of its own: a slot,
+    a mover and its wake (at the parent's fd number, which selectors and polls registered)."""
     global TABLE
     LOCK._at_fork_reinit()
+    if TABLE._fd >= 0:
+        os.close(TABLE._fd)  # (the parent's slot lock stays the parent's: it holds the same lock)
     TABLE = table.Table(table.path_for(os.environ.get("MSTAR_SIM_NODE")))
+    wake = os.eventfd(0, os.EFD_NONBLOCK | os.EFD_CLOEXEC)
+    os.dup2(wake, _wakefd[0], inheritable=False)
+    os.close(wake)
     _counted.clear()
     _counted.add(threading.get_ident())
-    _waits.clear()
-    _fds.clear()
-    _native.clear()
+    for state in (_waits, _fds, _native, _poked):
+        state.clear()
     _running[0] = 1
     _told_blocked[0] = _native_busy[0] = clock.PARKED[0] = False
+    _ahead[0], _seen[0], _shut[0] = math.inf, -1, 0.0
+    _settling[:], _looked[:], _moved[:] = [0, 0.0], [0.0, 0.0], [0.0, 0.0]
     for ident in list(clock._OPEN):
         if ident != threading.get_ident():
             del clock._OPEN[ident]
+    clock._tls.clk = None  # a CPU clock is a task's: this one is new
     clock.thaw()
     TABLE.publish(clock.now(), True)
     threading.Thread(target=_mover, name=OWN + "mover", daemon=True).start()
