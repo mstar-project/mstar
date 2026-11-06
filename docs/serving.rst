@@ -338,7 +338,8 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
    * - ``min_chunk_tokens``
      - *(optional, default 128)* The fewest tokens a prompt cut by chunked prefill runs
        in a step, or the whole budget if that is smaller; with less left, it waits a step. A positive int, for every
-       chunked walk. See *Chunked prefill budgets* below.
+       chunked walk. Where a node cuts whole KV pages (Qwen3.5 with its prefix cache on), it rounds
+       up to a page. See *Chunked prefill budgets* below.
    * - ``rebuild_host_mb``
      - *(optional, default 64)* MiB of pinned host memory a worker serving a node whose model
        declares a rebuild policy sets aside at startup for its requests' prompt ids, 8 B a token (int64),
@@ -503,6 +504,13 @@ the model budgets or with a budget per walk; null turns a walk's chunking off. A
 that is cut runs at least ``min_chunk_tokens`` tokens a step (default 128), or the whole
 budget if that is smaller. When less than that is left of a step's budget, the prompt waits
 for the next step rather than running the step over its budget.
+
+A node whose resources keep state only on a grid of tokens counted from where a chunk starts
+(``Resource.chunk_alignment``) cuts its prompts to whole multiples of that grid, so each
+chunk starts on it. Qwen3.5 with its prefix cache on cuts whole KV pages (128 tokens by
+default), since its GDN snapshots sit on page boundaries. There ``min_chunk_tokens`` rounds
+up to a page, a budget under a page fails loading, and one under three pages logs a warning:
+a step can then leave up to a page, less one token, of its budget unused.
 
 Most chunked walks run inside a combined walk, which batches a node's prompts and its
 decode rows into one step: ``mixed`` for Qwen3.5's and Orpheus's LLM, ``mixed_text`` for
