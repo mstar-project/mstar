@@ -352,46 +352,62 @@ class LoopbackRows(Resource):
             )
         return table
 
+    def iteration_rows(self, step: CapturedResidentStep) -> torch.Tensor:
+        """The entry's owner rows before stopped rows are sent to trash.
+
+        Only this column is gathered ahead of the active-row mask; the normal
+        resident gather still runs once for all resources afterwards.
+        """
+        table = self._resident_rows
+        indices = self.indices(step.bucket, step.slot)
+        gather_column(self._resident.store, step.buffers.rows, table.stride, table.col, indices)
+        return indices
+
     def iteration_head(
         self, walk: str, loop: LoopLayout, indices: torch.Tensor, entry: torch.Tensor,
         active: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """Actual positions for one executed body, before selecting its inputs.
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Actual positions and live rows for one body, before any resource writes.
 
         ``entry`` stages request generation, graph pass, then strict ancestor
-        counts. Planning never writes this table. Only a live body's first
-        entry resets its position; a skipped body never calls this operation.
-        The capture's row indices are gathered before this call.
+        counts. Planning never writes this table. Only an executed entry resets
+        its position and stop; a skipped body never calls this operation.
         """
         if entry.shape != (len(indices), 2 + len(loop.ancestors)):
             raise ValueError("a Loop entry needs generation, graph pass and strict ancestor counts")
         key = ("iteration", walk, loop.name)
         table = self._tables.get(key)
         if table is None:
-            table = self._table(key, entry.new_empty(1, entry.shape[1] + 1))
-            table[:, 1:].fill_(-1)  # generation zero is a valid first request
+            table = self._table(key, entry.new_empty(1, entry.shape[1] + 2))
+            table[:, 2:].fill_(-1)  # generation zero is a valid first request
         previous = table.index_select(0, indices)
-        live = indices != TRASH_ROW
+        requested = indices != TRASH_ROW
         if active is not None:
-            live = live & active
-        entering = live & (previous[:, 1:] != entry).any(dim=1)
+            requested = requested & active
+        entering = requested & (previous[:, 2:] != entry).any(dim=1)
         position = torch.where(entering, torch.zeros_like(previous[:, 0]), previous[:, 0])
-        current = torch.cat((position[:, None], entry), dim=1)
-        table.index_copy_(0, indices, torch.where(live[:, None], current, previous))
-        return position
+        stopped = (previous[:, 1] != 0) & ~entering
+        live = requested & ~stopped
+        current = torch.cat((position[:, None], stopped[:, None].to(entry.dtype), entry), dim=1)
+        table.index_copy_(0, indices, torch.where(requested[:, None], current, previous))
+        return position, live
 
     def iteration_tail(
         self, walk: str, loop: LoopLayout, indices: torch.Tensor, position: torch.Tensor,
-        active: torch.Tensor | None = None,
+        active: torch.Tensor, stopped: torch.Tensor | None = None,
     ) -> None:
-        """Advance exactly the rows that executed, including a stop-producing
-        iteration. Eager steps and captured bodies use this same owner.
+        """Advance executed rows and remember their terminal iteration.
+
+        Resource gathers may already have mapped inactive indices to trash;
+        neither their old position nor their stop may alter that padding row.
         """
-        live = indices != TRASH_ROW
-        if active is not None:
-            live = live & active
+        real = indices != TRASH_ROW
+        live = real & active
         table = self._tables[("iteration", walk, loop.name)]
-        table[:, 0].index_copy_(0, indices, position + live.to(position.dtype))
+        table[:, 0].index_copy_(0, indices, torch.where(real, position + live.to(position.dtype), 0))
+        if stopped is not None:
+            done = table[:, 1].index_select(0, indices).bool() | (live & stopped)
+            table[:, 1].index_copy_(0, indices, (done & real).to(table.dtype))
 
     # By request: an eager step, a mixed step's read, a row's first write
 
