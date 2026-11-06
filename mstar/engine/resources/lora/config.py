@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING, Any, Literal, NamedTuple
 import torch
 
 from mstar.distributed.utils import kv_head_replicas
-from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig
+from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig, check_sizes
 from mstar.engine.resources.step import ResourceStep
 
 if TYPE_CHECKING:
@@ -332,7 +332,7 @@ class LoraSpec(NodeResourceSpec):
         super().__post_init__()
         if not self.targets:
             raise ValueError(f"LoRA resource {self.resource_key!r} declares no targets")
-        _check_sizes({name: getattr(self, name) for name in _SIZES})
+        check_sizes({name: getattr(self, name) for name in _SIZES})
 
     @property
     def num_slots(self) -> int:
@@ -368,7 +368,7 @@ class LoraSpec(NodeResourceSpec):
             for name, value in zip(_SIZES, (max_slots, max_rank, cpu_capacity), strict=True)
             if value is not None
         }
-        _check_sizes(sizes)
+        check_sizes(sizes)
         if adapters is not None:
             if not isinstance(adapters, dict) or not all(
                 isinstance(k, str) and isinstance(v, str) for k, v in adapters.items()
@@ -462,12 +462,6 @@ class LoraSpec(NodeResourceSpec):
 
 
 _SIZES = ("max_slots", "max_rank", "cpu_capacity")
-
-
-def _check_sizes(sizes: Mapping[str, Any]) -> None:
-    for name, value in sizes.items():
-        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
-            raise ValueError(f"{name} must be an integer >= 1; got {value!r}")
 
 
 def _some(items: tuple[str, ...], n: int = 5) -> str:

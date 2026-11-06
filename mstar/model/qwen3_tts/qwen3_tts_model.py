@@ -488,9 +488,11 @@ class Qwen3TTSModel(Model):
         )
         return [
             KVSpec(resource_key=TALKER_KV, nodes={"Talker"}, config=talker_kv),
+            # Every checkpoint has two query heads per KV head: the CUDA-core
+            # decode kernel wins, since the tensor-core one pads them to a tile
             AttentionSpec(
                 resource_key=TALKER_ATTN, nodes={"Talker"},
-                config=AttentionConfig(kv_cache=TALKER_KV),
+                config=AttentionConfig(kv_cache=TALKER_KV, decode_tensor_cores=False),
             ),
             PositionSpec(
                 resource_key=TALKER_POS, nodes={"Talker"},
@@ -867,6 +869,9 @@ class Qwen3TTSModel(Model):
         how many reference frames lead the codec stream (context only, 0
         without an in-context clone; see ``get_initial_forward_pass_args``).
         """
+        # a leading newline would merge with the template's "assistant\n" into one token,
+        # changing the ChatML prefix the text span is sized from; it carries no speech
+        prompt = (prompt or "").lstrip()
         if not prompt:
             raise ValueError("Qwen3-TTS requires a non-empty text prompt")
         if "audio" in input_modalities and not self.config.supports_reference_audio:
