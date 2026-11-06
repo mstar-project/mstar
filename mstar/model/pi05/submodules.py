@@ -296,12 +296,22 @@ class _Pi05ExpertSubmodule(ARNodeSubmodule):
         return True
 
 
+class _PrefillCaptureConfig(PackedAcceleratorGraphConfig):
+    """Leaves out buckets longer than a batch of that size can fill, which would
+    otherwise be captured and never replayed."""
+
+    def __init__(self, longest_prefix: int, **kwargs):
+        super().__init__(**kwargs)
+        self.longest_prefix = longest_prefix
+
+    def get_total_tokens(self, bs: int) -> list[int]:
+        return [n for n in super().get_total_tokens(bs) if n <= bs * self.longest_prefix]
+
+
 class Pi05LLMSubmodule(_Pi05ExpertSubmodule):
     """PaliGemma over the prefix ``[image_tokens, language_tokens]``: writes the
     KV cache the action expert reads, and tells it so with ``prefix_done``."""
 
-    # For the default image size, three cameras and a simple text prompt, one request is about 910 tokens
-    PREFILL_TOKEN_BUCKETS = [512, 1024, 1800] # 2048 was giving OOM
     PREFILL_CAPTURE_BATCH_SIZES = [1, 2, 4]
 
     def __init__(self, embed_tokens: nn.Embedding, paligemma: Pi05PaliGemmaExpert, config: Pi05Config):
@@ -323,8 +333,11 @@ class Pi05LLMSubmodule(_Pi05ExpertSubmodule):
         self, device: torch.device, tp_world_size: int = 1,
     ) -> list[AcceleratorGraphConfig]:
         del tp_world_size
+        cfg = self.config
+        longest = cfg.num_cameras * cfg.tokens_per_image + cfg.max_lang_tokens
         return [
-            PackedAcceleratorGraphConfig(
+            _PrefillCaptureConfig(
+                longest_prefix=longest,
                 # max-autotune until the default compile level (mstar serve -O) is measured on this model
                 compile_mode="max-autotune-no-cudagraphs",
                 capture_graph_walk=CHUNK_WALK,
@@ -334,7 +347,9 @@ class Pi05LLMSubmodule(_Pi05ExpertSubmodule):
                         n, self.config.hidden_size, device=device, dtype=torch.float32
                     ),
                 ),
-                capture_token_lengths=self.PREFILL_TOKEN_BUCKETS,
+                # Whole requests' longest prefixes, so a step that fits runs captured: an
+                # eager prefill costs tens of ms of host time, a replay about 1 ms.
+                capture_token_lengths=sorted({512, *(n * longest for n in self.PREFILL_CAPTURE_BATCH_SIZES)}),
                 capture_batch_sizes=self.PREFILL_CAPTURE_BATCH_SIZES,
                 compile=True,
             ),
