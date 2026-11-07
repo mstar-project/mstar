@@ -34,7 +34,7 @@ from mstar.integrations.dynamo.bridges import (
     get_tensor_spec,
 )
 from mstar.utils import cpus
-from mstar.utils.socket_prefix import per_launch_socket_prefix
+from mstar.utils.socket_prefix import default_upload_dir, per_launch_socket_prefix
 
 if TYPE_CHECKING:
     from mstar.api_server.entrypoint import APIServer
@@ -223,7 +223,8 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--socket-path-prefix", default=None,
                         help="ZMQ IPC socket prefix; default a new /tmp/mstar_<user>_* "
                              "directory per launch, removed at exit")
-    parser.add_argument("--upload-dir", default="/tmp/mstar_uploads")
+    parser.add_argument("--upload-dir", default=None,
+                        help="Directory for uploaded media; default /tmp/mstar_uploads_<user>/")
     parser.add_argument("--tensor-comm-protocol", default="RDMA",
                         help="Tensor transfer protocol: RDMA, TCP, or SHM (shared memory)")
     parser.add_argument("--namespace", default="mstar")
@@ -248,6 +249,8 @@ def main(argv: list[str] | None = None) -> None:
     # No HTTP port to key the prefix on, and replicas of one endpoint
     # (same namespace, component and endpoint) commonly share a host.
     owned_prefix = None
+    if args.upload_dir is None:
+        args.upload_dir = default_upload_dir()
     if args.socket_path_prefix is None:
         owned_prefix = args.socket_path_prefix = per_launch_socket_prefix()
         logger.info("IPC socket prefix: %s", owned_prefix)

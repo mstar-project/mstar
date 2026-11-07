@@ -36,10 +36,10 @@ import asyncio
 import base64
 import contextlib
 import dataclasses
+import io
 import logging
 import time
 import uuid
-from pathlib import Path
 from typing import TYPE_CHECKING
 
 from mstar.api_server.openai.adapters import OpenAIAdapter, SubmitArgs
@@ -50,7 +50,9 @@ from mstar.api_server.openai.protocol import (
     VideoGenerationRequest,
 )
 from mstar.api_server.openai.serving_images import image_count
+from mstar.utils.client_errors import client_error_text
 from mstar.utils.generation_kwargs import offset_seed
+from mstar.utils.runtime_dir import ensure_private_dir, write_private_file
 from mstar.utils.utf8_stream import Utf8Stream
 
 if TYPE_CHECKING:
@@ -837,9 +839,18 @@ class RealtimeBridge:
                         try:
                             args = self._utterance_args(session, bytes(pcm[:whole]))
                         except Exception as exc:  # noqa: BLE001 — keep the session usable
-                            logger.exception("realtime: building the utterance request failed")
+                            # the upload dir check and the upload write name
+                            # the server's path and both uids; only a refusal
+                            # raised on purpose keeps its text, as the native
+                            # routes do
+                            text, _ = client_error_text(
+                                exc, "realtime: building the utterance request failed",
+                                log=logger, type_name=False,
+                            )
+                            bad_request = isinstance(exc, (ValueError, TypeError))
                             out_stream.put_nowait(self._error(
-                                str(exc), etype="invalid_request_error"))
+                                text,
+                                etype="invalid_request_error" if bad_request else "server_error"))
                             pcm = pcm[whole:]
                             continue
                         pcm = pcm[whole:]
@@ -954,13 +965,14 @@ class Pi05TensorSpec:
         else:
             frames = np.asarray(values, dtype=np.uint8).reshape(shape)
 
-        upload_dir = Path(upload_dir)
-        upload_dir.mkdir(parents=True, exist_ok=True)
+        upload_dir = ensure_private_dir(upload_dir)
         tag = uuid.uuid4().hex
         paths = []
         for i, frame in enumerate(frames):
             path = upload_dir / f"tensor_{tag}_cam{i}.png"
-            Image.fromarray(np.ascontiguousarray(frame), mode="RGB").save(path)
+            buf = io.BytesIO()
+            Image.fromarray(np.ascontiguousarray(frame), mode="RGB").save(buf, format="PNG")
+            write_private_file(path, buf.getvalue())
             paths.append(str(path))
 
         model_kwargs = {}
@@ -1070,10 +1082,9 @@ class VJepa2AcTensorSpec:
                 f"{actions['metadata']['shape']} vs {states['metadata']['shape']}"
             )
 
-        upload_dir = Path(upload_dir)
-        upload_dir.mkdir(parents=True, exist_ok=True)
+        upload_dir = ensure_private_dir(upload_dir)
         path = upload_dir / f"tensor_{uuid.uuid4().hex}.mp4"
-        path.write_bytes(video_bytes)
+        write_private_file(path, video_bytes)
 
         model_kwargs = {"actions": action_rows, "states": state_rows}
         parameters = parameters or {}
@@ -1162,7 +1173,18 @@ class TensorBridge:
     async def generate(self, request: dict, context=None):
         named = {t["metadata"]["name"]: t for t in request.get("tensors", [])}
         parameters = request.get("parameters") or {}
-        args = self.spec.submit_args(named, self.server.upload_dir, parameters)
+        try:
+            args = self.spec.submit_args(named, self.server.upload_dir, parameters)
+        except Exception as exc:  # noqa: BLE001
+            # Dynamo forwards the message to the client, and the upload dir
+            # check and the upload write name the server's path and both uids;
+            # only a refusal raised on purpose keeps its text.
+            text, _ = client_error_text(
+                exc, f"tensor request for {self.served_model_name} could not be built",
+                log=logger, type_name=False,
+            )
+            kind = type(exc) if isinstance(exc, (ValueError, TypeError)) else RuntimeError
+            raise kind(text) from None
         # An aggregating spec folds every mapped chunk into ONE response —
         # required for unary ModelInfer when the engine emits multiple
         # chunks per request. Non-aggregating requests get one response
