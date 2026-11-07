@@ -1257,3 +1257,115 @@ def test_engine_windows_survive_two_short_runs_with_a_prepared_successor(monkeyp
         source.settle_window(c.reservation, 1)
         assert source._consumed == 3 and source._tail_consumed == 3 and not source._reservations
     assert [row.item() for row in calls] == ([20, 21, 22, -1, -2, -2] if streamed else list(range(20, 26)))
+
+
+@pytest.mark.parametrize("device_name", ["cpu", "cuda"])
+def test_run_membership_keeps_old_readers_across_captured_row_reuse(device_name):
+    from contextlib import nullcontext
+
+    from mstar.engine.resources.run_rows import RunRows
+
+    if device_name == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA membership publication")
+    device = torch.device(device_name, 0) if device_name == "cuda" else CPU
+    rows = RunRows(device, rows=1, capacity=2, binding_width=2)
+    snapshots = [(torch.zeros(1, dtype=torch.long, device=device),
+                  torch.zeros((1, 2), dtype=torch.long, device=device)) for _ in range(2)]
+    stopped = torch.ones(1, dtype=torch.bool, device=device)
+    graphs = []
+    for ids, bindings in snapshots:
+        rows.boundary(ids, bindings)
+        if device.type == "cuda":
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                rows.boundary(ids, bindings)
+            graphs.append(graph)
+
+    def publication():
+        return torch.cuda.stream(rows.publication_stream) if device.type == "cuda" else nullcontext()
+
+    def execute(index):
+        if graphs:
+            torch.cuda.current_stream().wait_stream(rows.publication_stream)
+            graphs[index].replay()
+        else:
+            rows.boundary(*snapshots[index])
+        return snapshots[index]
+
+    def retire(descriptor, ids):
+        rows.stop(ids, stopped)
+        rows.acknowledge(rows.control.tolist())
+        if device.type == "cuda":
+            rows.publication_stream.wait_stream(torch.cuda.current_stream())
+        return rows.release(descriptor)
+
+    first = rows.reserve(7, 1, 0, (11, 21))
+    rows.retain(first)  # the first run's output reader outlives later runs
+    with publication():
+        rows.publish(first)
+    ids, bindings = execute(0)
+    old_ids, old_bindings = ids.clone(), bindings.clone()
+    assert ids.tolist() == [first.handle] and bindings.tolist() == [[11, 21]]
+    assert rows.copied[(first.handle - 1) % rows.capacity].item() == first.handle
+    assert not retire(first, ids)
+
+    # Both captures existed before either generation was published. A long-lived
+    # output reader retains one credit while the other cycles through new rows.
+    for generation in (2, 3, 4):
+        next_row = rows.reserve(7, generation, 0, (10 + generation, 20 + generation))
+        assert next_row is not None and next_row.handle != first.handle
+        with publication():
+            rows.publish(next_row)
+        ids, bindings = execute(generation % 2)
+        assert ids.tolist() == [next_row.handle]
+        assert bindings.tolist() == [[10 + generation, 20 + generation]]
+        rows.retain(next_row)
+        assert not retire(next_row, ids)
+        assert rows.reserve(8, 1, 0, (8, 8)) is None  # readers hold both credits
+        assert rows.release(next_row)
+    assert old_ids.tolist() == [first.handle] and old_bindings.tolist() == [[11, 21]]
+    assert rows.release(first)
+
+
+@pytest.mark.parametrize("device_name", ["cpu", "cuda"])
+@pytest.mark.parametrize("cancel_at", ["unpublished", "offered", "active", "closed"])
+def test_run_membership_retracts_zero_work_and_cancels_accepted_rows(cancel_at, device_name):
+    from contextlib import nullcontext
+
+    from mstar.engine.resources.run_rows import RunRows
+
+    if device_name == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA membership publication")
+    device = torch.device(device_name, 0) if device_name == "cuda" else CPU
+    rows = RunRows(device, rows=1, capacity=1, binding_width=1)
+    ids = torch.zeros(1, dtype=torch.long, device=device)
+    bindings = torch.zeros((1, 1), dtype=torch.long, device=device)
+
+    def publish_call(method, *args):
+        with torch.cuda.stream(rows.publication_stream) if device.type == "cuda" else nullcontext():
+            method(*args)
+        if device.type == "cuda":
+            torch.cuda.current_stream().wait_stream(rows.publication_stream)
+    descriptor = rows.reserve(3, 1, 0, (17,))
+    if cancel_at != "unpublished":
+        publish_call(rows.publish, descriptor)
+    if cancel_at == "active":
+        rows.boundary(ids, bindings)
+        assert ids.tolist() == [descriptor.handle]
+    if cancel_at == "closed":
+        # Every submitted window ended before the offer became visible.
+        publish_call(rows.drain)
+    else:
+        publish_call(rows.cancel, descriptor)
+        if cancel_at != "unpublished":
+            rows.boundary(ids, bindings)
+            assert ids.tolist() == [0] and bindings.tolist() == [[0]]
+    rows.acknowledge(rows.control.tolist())
+    assert rows.release(descriptor)
+    replacement = rows.reserve(3, 2, 0, (23,))
+    assert replacement.handle != descriptor.handle
+    publish_call(rows.publish, replacement)
+    rows.boundary(ids, bindings)
+    assert ids.tolist() == [replacement.handle] and bindings.tolist() == [[23]]
+    with pytest.raises(ValueError):
+        publish_call(rows.cancel, descriptor)
