@@ -710,6 +710,7 @@
                 <ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#native-generate">Native <code class="docutils literal notranslate"><span class="pre">/generate</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#websocket-generate-ws">WebSocket <code class="docutils literal notranslate"><span class="pre">/generate/ws</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#openpi-websocket">openpi WebSocket <code class="docutils literal notranslate"><span class="pre">/</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#python-sdk">Python SDK</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#openai-compatible-api">OpenAI-compatible API</a></li>
 </ul>
@@ -938,6 +939,52 @@ slowly (see <a class="reference internal" href="models.html"><span class="doc">S
     <span class="s2">"model_kwargs"</span><span class="p">:</span> <span class="p">{</span><span class="s2">"gain"</span><span class="p">:</span> <span class="mf">2.0</span><span class="p">},</span>  <span class="c1"># what this model's hook reads, not a sampling setting</span>
 <span class="p">}}))</span>
 <span class="n">ws</span><span class="o">.</span><span class="n">send</span><span class="p">(</span><span class="n">msgpack</span><span class="o">.</span><span class="n">packb</span><span class="p">({</span><span class="s2">"request_id"</span><span class="p">:</span> <span class="s2">"call"</span><span class="p">,</span> <span class="s2">"end_input"</span><span class="p">:</span> <span class="kc">True</span><span class="p">}))</span>
+</pre></div>
+</div>
+</section>
+<section id="openpi-websocket">
+<h2>openpi WebSocket <code class="docutils literal notranslate"><span class="pre">/</span></code><a class="headerlink" href="#openpi-websocket" title="Link to this heading">#</a></h2>
+<p>A deployment whose config has an <code class="docutils literal notranslate"><span class="pre">openpi:</span></code> block (<code class="docutils literal notranslate"><span class="pre">configs/pi05_droid.yaml</span></code>) also
+serves openpi’s policy protocol at the server’s root, so robot clients written against
+openpi’s <code class="docutils literal notranslate"><span class="pre">openpi_client.WebsocketClientPolicy</span></code> connect unchanged. Those include its
+DROID example and <code class="docutils literal notranslate"><span class="pre">examples/simple_client</span> <span class="pre">--env</span> <span class="pre">DROID</span></code>. openpi’s default port is 8000,
+as M*’s is. The protocol:</p>
+<ul class="simple">
+<li><p>On connect the server sends one msgpack frame, the block’s <code class="docutils literal notranslate"><span class="pre">metadata</span></code> (<code class="docutils literal notranslate"><span class="pre">{}</span></code> by
+default).</p></li>
+<li><p>The client then sends one observation and waits for one reply, and repeats. Arrays
+travel as <code class="docutils literal notranslate"><span class="pre">openpi_client.msgpack_numpy</span></code> encodes them, so camera frames arrive as raw
+pixels and reach the model with no PNG and no file in between.</p></li>
+<li><p>The reply is <code class="docutils literal notranslate"><span class="pre">{&quot;actions&quot;:</span> <span class="pre">float32</span> <span class="pre">[H,</span> <span class="pre">action_dims],</span> <span class="pre">&quot;server_timing&quot;:</span> <span class="pre">{&quot;infer_ms&quot;,</span>
+<span class="pre">&quot;prev_total_ms&quot;}}</span></code>. For <code class="docutils literal notranslate"><span class="pre">pi05_droid</span></code> that is <code class="docutils literal notranslate"><span class="pre">(15,</span> <span class="pre">8)</span></code>, as openpi’s own
+<code class="docutils literal notranslate"><span class="pre">pi05_droid</span></code> server returns. The DROID example’s <code class="docutils literal notranslate"><span class="pre">assert</span> <span class="pre">shape</span> <span class="pre">==</span> <span class="pre">(10,</span> <span class="pre">8)</span></code> was
+written for pi0-FAST.</p></li>
+<li><p>A call that fails is answered with a text frame holding the error, which the client
+raises, and the socket closes with <code class="docutils literal notranslate"><span class="pre">1011</span></code>.</p></li>
+<li><p>An observation may carry <code class="docutils literal notranslate"><span class="pre">seed</span></code> (an int), which openpi does not have. It pins the
+call’s noise, as <code class="docutils literal notranslate"><span class="pre">seed</span></code> in <code class="docutils literal notranslate"><span class="pre">/generate</span></code>’s <code class="docutils literal notranslate"><span class="pre">model_kwargs</span></code> does. Without it each call
+gets a fresh seed.</p></li>
+</ul>
+<p>On a server with the block, <code class="docutils literal notranslate"><span class="pre">GET</span> <span class="pre">/healthz</span></code> answers <code class="docutils literal notranslate"><span class="pre">OK</span></code> without a key, as openpi’s
+server does, and with <code class="docutils literal notranslate"><span class="pre">--api-key</span></code> the handshake takes <code class="docutils literal notranslate"><span class="pre">Authorization:</span> <span class="pre">Api-Key</span> <span class="pre">&lt;key&gt;</span></code>
+(what the client sends for <code class="docutils literal notranslate"><span class="pre">api_key</span></code>) as well as <code class="docutils literal notranslate"><span class="pre">Bearer</span></code>. Every other route still
+takes only <code class="docutils literal notranslate"><span class="pre">Bearer</span></code>. A server without the block has none of this: it refuses the
+handshake and has no <code class="docutils literal notranslate"><span class="pre">/healthz</span></code>. Only the Python frontend serves this route;
+<code class="docutils literal notranslate"><span class="pre">--rust-frontend</span></code> logs a warning and serves without it.</p>
+<p><code class="docutils literal notranslate"><span class="pre">openpi_client</span></code> sets no size limit on its messages, but the server does:
+<code class="docutils literal notranslate"><span class="pre">ws_max_message_mb</span></code> (16 MiB by default, see <a class="reference internal" href="serving.html"><span class="doc">Serving</span></a>). A larger observation closes
+the socket with <code class="docutils literal notranslate"><span class="pre">1009</span></code> and no error frame, so a deployment whose robots send several
+raw high-resolution cameras raises it.</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">openpi_client</span><span class="w"> </span><span class="kn">import</span> <span class="n">websocket_client_policy</span>
+
+<span class="n">policy</span> <span class="o">=</span> <span class="n">websocket_client_policy</span><span class="o">.</span><span class="n">WebsocketClientPolicy</span><span class="p">(</span><span class="s2">"localhost"</span><span class="p">,</span> <span class="mi">8000</span><span class="p">)</span>
+<span class="n">actions</span> <span class="o">=</span> <span class="n">policy</span><span class="o">.</span><span class="n">infer</span><span class="p">({</span>
+    <span class="s2">"observation/exterior_image_1_left"</span><span class="p">:</span> <span class="n">exterior</span><span class="p">,</span>  <span class="c1"># uint8 [224, 224, 3]</span>
+    <span class="s2">"observation/wrist_image_left"</span><span class="p">:</span> <span class="n">wrist</span><span class="p">,</span>
+    <span class="s2">"observation/joint_position"</span><span class="p">:</span> <span class="n">joints</span><span class="p">,</span>           <span class="c1"># 7 floats</span>
+    <span class="s2">"observation/gripper_position"</span><span class="p">:</span> <span class="n">gripper</span><span class="p">,</span>        <span class="c1"># 1 float</span>
+    <span class="s2">"prompt"</span><span class="p">:</span> <span class="s2">"put the marker in the cup"</span><span class="p">,</span>
+<span class="p">})[</span><span class="s2">"actions"</span><span class="p">]</span>                                       <span class="c1"># float32 (15, 8)</span>
 </pre></div>
 </div>
 </section>
@@ -1289,6 +1336,7 @@ in the Orpheus config).</p></li>
     <ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#native-generate">Native <code class="docutils literal notranslate"><span class="pre">/generate</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#websocket-generate-ws">WebSocket <code class="docutils literal notranslate"><span class="pre">/generate/ws</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#openpi-websocket">openpi WebSocket <code class="docutils literal notranslate"><span class="pre">/</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#python-sdk">Python SDK</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#openai-compatible-api">OpenAI-compatible API</a></li>
 </ul>

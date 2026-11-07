@@ -708,6 +708,7 @@
             </div>
             <nav aria-label="Page">
                 <ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.media_limits.RAW_INPUT_CHARGES"><code class="docutils literal notranslate"><span class="pre">RAW_INPUT_CHARGES</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.media_limits.RequestMediaBudget"><code class="docutils literal notranslate"><span class="pre">RequestMediaBudget</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.media_limits.RequestMediaBudget.charge"><code class="docutils literal notranslate"><span class="pre">RequestMediaBudget.charge()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.media_limits.RequestMediaBudget.file"><code class="docutils literal notranslate"><span class="pre">RequestMediaBudget.file()</span></code></a></li>
@@ -718,6 +719,7 @@
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.media_limits.charge_decoded_audio"><code class="docutils literal notranslate"><span class="pre">charge_decoded_audio()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.media_limits.charge_decoded_image"><code class="docutils literal notranslate"><span class="pre">charge_decoded_image()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.media_limits.check_audio_duration"><code class="docutils literal notranslate"><span class="pre">check_audio_duration()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.media_limits.check_file_counts"><code class="docutils literal notranslate"><span class="pre">check_file_counts()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.media_limits.check_image_size"><code class="docutils literal notranslate"><span class="pre">check_image_size()</span></code></a></li>
@@ -754,55 +756,67 @@ check what a file will decode to, not how big it is. A refusal is a
 <p>The pixel and audio caps hold for a whole request: while the data worker loads
 a request’s files inside <a class="reference internal" href="#mstar.model.media_limits.RequestMediaBudget" title="mstar.model.media_limits.RequestMediaBudget"><code class="xref py py-class docutils literal notranslate"><span class="pre">RequestMediaBudget</span></code></a>, every check also counts
 against what the request’s earlier files used.</p>
+<p class="rubric">Module Attributes</p>
+<div class="pst-scrollable-table-container"><table class="autosummary longtable table">
+<tbody>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.media_limits.RAW_INPUT_CHARGES" title="mstar.model.media_limits.RAW_INPUT_CHARGES"><code class="xref py py-obj docutils literal notranslate"><span class="pre">RAW_INPUT_CHARGES</span></code></a></p></td>
+<td><p>Which modalities a request may send as <code class="docutils literal notranslate"><span class="pre">raw_inputs</span></code> (tensors instead of files), each with its size check: the check refuses an input over the limit (for images, MSTAR_MAX_IMAGE_PIXELS) and counts it toward the request's total, as reading a file's header does.</p></td>
+</tr>
+</tbody>
+</table>
+</div>
 <p class="rubric">Functions</p>
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
 <tbody>
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.media_limits.charge_decoded_audio" title="mstar.model.media_limits.charge_decoded_audio"><code class="xref py py-obj docutils literal notranslate"><span class="pre">charge_decoded_audio</span></code></a>(audio, sample_rate)</p></td>
 <td><p>Charge the request the samples a loader returned, as seconds at <code class="docutils literal notranslate"><span class="pre">sample_rate</span></code>; a file whose header understated its length or could not be read is counted here.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.media_limits.check_audio_duration" title="mstar.model.media_limits.check_audio_duration"><code class="xref py py-obj docutils literal notranslate"><span class="pre">check_audio_duration</span></code></a>(filepath)</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.media_limits.charge_decoded_image" title="mstar.model.media_limits.charge_decoded_image"><code class="xref py py-obj docutils literal notranslate"><span class="pre">charge_decoded_image</span></code></a>(image)</p></td>
+<td><p>Hold an image that arrived decoded (<code class="docutils literal notranslate"><span class="pre">[C,</span> <span class="pre">H,</span> <span class="pre">W]</span></code>) to the cap a file's header is held to, and charge the request its pixels.</p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.media_limits.check_audio_duration" title="mstar.model.media_limits.check_audio_duration"><code class="xref py py-obj docutils literal notranslate"><span class="pre">check_audio_duration</span></code></a>(filepath)</p></td>
 <td><p>Charge the request what an audio file's header declares, before the model's loader decodes it; a file whose header declares nothing is counted as it decodes (<code class="xref py py-func docutils literal notranslate"><span class="pre">_count_audio_seconds()</span></code>).</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.media_limits.check_file_counts" title="mstar.model.media_limits.check_file_counts"><code class="xref py py-obj docutils literal notranslate"><span class="pre">check_file_counts</span></code></a>(counts, model_limits)</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.media_limits.check_file_counts" title="mstar.model.media_limits.check_file_counts"><code class="xref py py-obj docutils literal notranslate"><span class="pre">check_file_counts</span></code></a>(counts, model_limits)</p></td>
 <td><p>Refuse more files of a modality than the model takes (<code class="xref py py-meth docutils literal notranslate"><span class="pre">mstar.model.base.Model.max_input_files()</span></code>), before any is decoded.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.media_limits.check_image_size" title="mstar.model.media_limits.check_image_size"><code class="xref py py-obj docutils literal notranslate"><span class="pre">check_image_size</span></code></a>(filepath[, formats])</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.media_limits.check_image_size" title="mstar.model.media_limits.check_image_size"><code class="xref py py-obj docutils literal notranslate"><span class="pre">check_image_size</span></code></a>(filepath[, formats])</p></td>
 <td><p>Refuse an image whose header promises more than <code class="docutils literal notranslate"><span class="pre">max_image_pixels()</span></code> or that is not in <code class="docutils literal notranslate"><span class="pre">formats</span></code> (the ones the caller's decoder reads); returns Pillow's name for the format and whether the file holds more than one frame.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.media_limits.check_media_limits" title="mstar.model.media_limits.check_media_limits"><code class="xref py py-obj docutils literal notranslate"><span class="pre">check_media_limits</span></code></a>()</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.media_limits.check_media_limits" title="mstar.model.media_limits.check_media_limits"><code class="xref py py-obj docutils literal notranslate"><span class="pre">check_media_limits</span></code></a>()</p></td>
 <td><p>Read the limits once at startup: a bad value then stops the server, instead of turning every media request into a 400 that blames the client.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.media_limits.count_sound_file_seconds" title="mstar.model.media_limits.count_sound_file_seconds"><code class="xref py py-obj docutils literal notranslate"><span class="pre">count_sound_file_seconds</span></code></a>(filepath, max_seconds)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.media_limits.count_sound_file_seconds" title="mstar.model.media_limits.count_sound_file_seconds"><code class="xref py py-obj docutils literal notranslate"><span class="pre">count_sound_file_seconds</span></code></a>(filepath, max_seconds)</p></td>
 <td><p>The length of a libsndfile file whose header gives none, counted as it decodes and keeping no samples; stops just past <code class="docutils literal notranslate"><span class="pre">max_seconds</span></code>, so the caller's limit check refuses a longer clip without decoding all of it.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.media_limits.max_audio_seconds" title="mstar.model.media_limits.max_audio_seconds"><code class="xref py py-obj docutils literal notranslate"><span class="pre">max_audio_seconds</span></code></a>()</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.media_limits.max_audio_seconds" title="mstar.model.media_limits.max_audio_seconds"><code class="xref py py-obj docutils literal notranslate"><span class="pre">max_audio_seconds</span></code></a>()</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_MAX_AUDIO_SECONDS</span></code>: seconds a request's audio clips may decode to, summed over them.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.media_limits.max_image_pixels" title="mstar.model.media_limits.max_image_pixels"><code class="xref py py-obj docutils literal notranslate"><span class="pre">max_image_pixels</span></code></a>()</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.media_limits.max_image_pixels" title="mstar.model.media_limits.max_image_pixels"><code class="xref py py-obj docutils literal notranslate"><span class="pre">max_image_pixels</span></code></a>()</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_MAX_IMAGE_PIXELS</span></code>: pixels a request's images may decode to, summed over them.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.media_limits.max_media_files" title="mstar.model.media_limits.max_media_files"><code class="xref py py-obj docutils literal notranslate"><span class="pre">max_media_files</span></code></a>()</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.media_limits.max_media_files" title="mstar.model.media_limits.max_media_files"><code class="xref py py-obj docutils literal notranslate"><span class="pre">max_media_files</span></code></a>()</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_MAX_MEDIA_FILES</span></code>: images, audio clips and videos one request may attach, together.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.media_limits.max_video_pixels" title="mstar.model.media_limits.max_video_pixels"><code class="xref py py-obj docutils literal notranslate"><span class="pre">max_video_pixels</span></code></a>()</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.media_limits.max_video_pixels" title="mstar.model.media_limits.max_video_pixels"><code class="xref py py-obj docutils literal notranslate"><span class="pre">max_video_pixels</span></code></a>()</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_MAX_VIDEO_PIXELS</span></code>: pixels a request's videos may decode to, summed over the frames the loader decodes from each.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.media_limits.probe_audio_seconds" title="mstar.model.media_limits.probe_audio_seconds"><code class="xref py py-obj docutils literal notranslate"><span class="pre">probe_audio_seconds</span></code></a>(filepath)</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.media_limits.probe_audio_seconds" title="mstar.model.media_limits.probe_audio_seconds"><code class="xref py py-obj docutils literal notranslate"><span class="pre">probe_audio_seconds</span></code></a>(filepath)</p></td>
 <td><p>The duration an audio file's header declares, or None when it declares none (a sample count of 0 or libsndfile's &quot;unknown&quot; value) or neither soundfile nor torchcodec can read it.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.media_limits.probe_video" title="mstar.model.media_limits.probe_video"><code class="xref py py-obj docutils literal notranslate"><span class="pre">probe_video</span></code></a>(filepath)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.media_limits.probe_video" title="mstar.model.media_limits.probe_video"><code class="xref py py-obj docutils literal notranslate"><span class="pre">probe_video</span></code></a>(filepath)</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">(num_frames,</span> <span class="pre">fps,</span> <span class="pre">height,</span> <span class="pre">width)</span></code> from the container header, or None when neither torchcodec nor PyAV can read it.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.media_limits.read_image" title="mstar.model.media_limits.read_image"><code class="xref py py-obj docutils literal notranslate"><span class="pre">read_image</span></code></a>(filepath, *[, rgb])</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.media_limits.read_image" title="mstar.model.media_limits.read_image"><code class="xref py py-obj docutils literal notranslate"><span class="pre">read_image</span></code></a>(filepath, *[, rgb])</p></td>
 <td><p>A request image as uint8 <code class="docutils literal notranslate"><span class="pre">[C,</span> <span class="pre">H,</span> <span class="pre">W]</span></code>, refused first if it is too large (a <code class="docutils literal notranslate"><span class="pre">ValueError</span></code>, as is a file that does not decode).</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.media_limits.read_sound_file" title="mstar.model.media_limits.read_sound_file"><code class="xref py py-obj docutils literal notranslate"><span class="pre">read_sound_file</span></code></a>(filepath, max_seconds)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.media_limits.read_sound_file" title="mstar.model.media_limits.read_sound_file"><code class="xref py py-obj docutils literal notranslate"><span class="pre">read_sound_file</span></code></a>(filepath, max_seconds)</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">soundfile.read(filepath,</span> <span class="pre">dtype=&quot;float32&quot;,</span> <span class="pre">always_2d=True)</span></code> for a header that gives no sample count, where <code class="docutils literal notranslate"><span class="pre">soundfile.read</span></code> would size its buffer from the header (libsndfile's 2**63 - 1 frames) and fail; decodes block by block and stops just past <code class="docutils literal notranslate"><span class="pre">max_seconds</span></code>, so the caller's length check refuses a longer clip.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.media_limits.sound_file_seconds" title="mstar.model.media_limits.sound_file_seconds"><code class="xref py py-obj docutils literal notranslate"><span class="pre">sound_file_seconds</span></code></a>(frames, rate)</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.media_limits.sound_file_seconds" title="mstar.model.media_limits.sound_file_seconds"><code class="xref py py-obj docutils literal notranslate"><span class="pre">sound_file_seconds</span></code></a>(frames, rate)</p></td>
 <td><p>The length a libsndfile header declares, or None when it declares none (a sample count of 0 or libsndfile's &quot;unknown&quot; value).</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.media_limits.video_decode_threads" title="mstar.model.media_limits.video_decode_threads"><code class="xref py py-obj docutils literal notranslate"><span class="pre">video_decode_threads</span></code></a>()</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.media_limits.video_decode_threads" title="mstar.model.media_limits.video_decode_threads"><code class="xref py py-obj docutils literal notranslate"><span class="pre">video_decode_threads</span></code></a>()</p></td>
 <td><p>FFmpeg threads for one video decode.</p></td>
 </tr>
 </tbody>
@@ -820,6 +834,15 @@ against what the request’s earlier files used.</p>
 </tbody>
 </table>
 </div>
+<dl class="py data">
+<dt class="sig sig-object py" id="mstar.model.media_limits.RAW_INPUT_CHARGES">
+<span class="sig-prename descclassname"><span class="pre">mstar.model.media_limits.</span></span><span class="sig-name descname"><span class="pre">RAW_INPUT_CHARGES</span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">{'image':</span> <span class="pre">&lt;function</span> <span class="pre">charge_decoded_image&gt;}</span></span><a class="headerlink" href="#mstar.model.media_limits.RAW_INPUT_CHARGES" title="Link to this definition">#</a></dt>
+<dd><p>Which modalities a request may send as <code class="docutils literal notranslate"><span class="pre">raw_inputs</span></code> (tensors instead of files),
+each with its size check: the check refuses an input over the limit (for images,
+MSTAR_MAX_IMAGE_PIXELS) and counts it toward the request’s total, as reading a
+file’s header does. The model then loads each with <code class="docutils literal notranslate"><span class="pre">Model.load_decoded_&lt;modality&gt;</span></code>.</p>
+</dd></dl>
+
 <dl class="py class">
 <dt class="sig sig-object py" id="mstar.model.media_limits.RequestMediaBudget">
 <span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.model.media_limits.</span></span><span class="sig-name descname"><span class="pre">RequestMediaBudget</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">num_files</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/media_limits.html#RequestMediaBudget"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.media_limits.RequestMediaBudget" title="Link to this definition">#</a></dt>
@@ -901,6 +924,21 @@ read is counted here.</p>
 <li><p><strong>audio</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a>)</p></li>
 <li><p><strong>sample_rate</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
 </ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p>None</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="mstar.model.media_limits.charge_decoded_image">
+<span class="sig-prename descclassname"><span class="pre">mstar.model.media_limits.</span></span><span class="sig-name descname"><span class="pre">charge_decoded_image</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">image</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/media_limits.html#charge_decoded_image"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.media_limits.charge_decoded_image" title="Link to this definition">#</a></dt>
+<dd><p>Hold an image that arrived decoded (<code class="docutils literal notranslate"><span class="pre">[C,</span> <span class="pre">H,</span> <span class="pre">W]</span></code>) to the cap a file’s
+header is held to, and charge the request its pixels.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>image</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a>)</p>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
 <dd class="field-even"><p>None</p>
@@ -1203,6 +1241,7 @@ for fork-join ops a decode doesn’t run.</p>
   </div>
   <nav id="pst-page-toc-nav" class="page-toc" aria-labelledby="pst-page-navigation-heading-2">
     <ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.media_limits.RAW_INPUT_CHARGES"><code class="docutils literal notranslate"><span class="pre">RAW_INPUT_CHARGES</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.media_limits.RequestMediaBudget"><code class="docutils literal notranslate"><span class="pre">RequestMediaBudget</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.media_limits.RequestMediaBudget.charge"><code class="docutils literal notranslate"><span class="pre">RequestMediaBudget.charge()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.media_limits.RequestMediaBudget.file"><code class="docutils literal notranslate"><span class="pre">RequestMediaBudget.file()</span></code></a></li>
@@ -1213,6 +1252,7 @@ for fork-join ops a decode doesn’t run.</p>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.media_limits.charge_decoded_audio"><code class="docutils literal notranslate"><span class="pre">charge_decoded_audio()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.media_limits.charge_decoded_image"><code class="docutils literal notranslate"><span class="pre">charge_decoded_image()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.media_limits.check_audio_duration"><code class="docutils literal notranslate"><span class="pre">check_audio_duration()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.media_limits.check_file_counts"><code class="docutils literal notranslate"><span class="pre">check_file_counts()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.media_limits.check_image_size"><code class="docutils literal notranslate"><span class="pre">check_image_size()</span></code></a></li>

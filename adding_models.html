@@ -976,7 +976,15 @@ such facts under their own key: LTX-2.5 nests the request’s geometry under
 <code class="docutils literal notranslate"><span class="pre">text_output</span></code>, <code class="docutils literal notranslate"><span class="pre">postprocess</span></code> and <code class="docutils literal notranslate"><span class="pre">postprocess_inline</span></code> (described next),
 <code class="docutils literal notranslate"><span class="pre">get_request_resource_configs</span></code> (described below), <code class="docutils literal notranslate"><span class="pre">get_sampling_config</span></code>,
 <code class="docutils literal notranslate"><span class="pre">get_max_output_tokens</span></code>, <code class="docutils literal notranslate"><span class="pre">get_autocast_dtype</span></code>, <code class="docutils literal notranslate"><span class="pre">load_image</span></code>, <code class="docutils literal notranslate"><span class="pre">load_audio</span></code>,
-<code class="docutils literal notranslate"><span class="pre">load_video</span></code>, and the partition methods described at the end of this page.</p>
+<code class="docutils literal notranslate"><span class="pre">load_video</span></code>, <code class="docutils literal notranslate"><span class="pre">load_decoded_image</span></code>, and the partition methods described at the end
+of this page. <code class="docutils literal notranslate"><span class="pre">load_decoded_image</span></code> takes an image the API server already holds decoded
+(RGB uint8 <code class="docutils literal notranslate"><span class="pre">[3,</span> <span class="pre">H,</span> <span class="pre">W]</span></code>, from the openpi WebSocket) and must return what <code class="docutils literal notranslate"><span class="pre">load_image</span></code>
+returns for the same pixels in a file. The default refuses, so a model takes images only as
+files until it overrides this. pi0.5’s <code class="docutils literal notranslate"><span class="pre">load_image</span></code> calls it, so the two paths cannot
+drift apart. A robot policy also overrides <code class="docutils literal notranslate"><span class="pre">robot_io</span></code>, returning a <code class="docutils literal notranslate"><span class="pre">RobotIO</span></code>: the
+<code class="docutils literal notranslate"><span class="pre">model_kwargs</span></code> key its robot state goes under, and the <code class="docutils literal notranslate"><span class="pre">[action_horizon,</span> <span class="pre">action_dim]</span></code>
+shape of the float32 actions its <code class="docutils literal notranslate"><span class="pre">postprocess</span></code> returns. The openpi WebSocket serves a
+model by these two hooks alone, so a new policy needs no change to the API server.</p>
 <dl class="simple">
 <dt><code class="docutils literal notranslate"><span class="pre">text_output(self)</span> <span class="pre">-&gt;</span> <span class="pre">TextOutput</span> <span class="pre">|</span> <span class="pre">None</span></code></dt><dd><p>Declare how text output (token ids) becomes bytes: a detokenizer, and the ids that
 end a reply, which are dropped unless the request sets <code class="docutils literal notranslate"><span class="pre">ignore_eos</span></code>.

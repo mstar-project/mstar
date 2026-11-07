@@ -5,6 +5,12 @@ mstar.model.media\_limits
 
    
    
+   .. rubric:: Module Attributes
+
+   .. autosummary::
+   
+      RAW_INPUT_CHARGES
+   
    
 
    
@@ -14,6 +20,7 @@ mstar.model.media\_limits
    .. autosummary::
    
       charge_decoded_audio
+      charge_decoded_image
       check_audio_duration
       check_file_counts
       check_image_size

@@ -736,7 +736,10 @@
 <p>Off unless <code class="docutils literal notranslate"><span class="pre">--api-key</span></code> or <code class="docutils literal notranslate"><span class="pre">MSTAR_API_KEY</span></code> sets a key. When set, every
 request except the probe and scrape paths in <code class="docutils literal notranslate"><span class="pre">UNAUTHENTICATED_PATHS</span></code> must carry
 <code class="docutils literal notranslate"><span class="pre">Authorization:</span> <span class="pre">Bearer</span> <span class="pre">&lt;key&gt;</span></code> (what the OpenAI SDKs send for <code class="docutils literal notranslate"><span class="pre">api_key</span></code>);
-WebSocket routes are checked at the handshake. The check is one ASGI
+WebSocket routes are checked at the handshake. A deployment that serves the
+openpi socket (an <code class="docutils literal notranslate"><span class="pre">openpi:</span></code> block) also takes openpi_client’s conventions
+there, and only there: <code class="docutils literal notranslate"><span class="pre">Authorization:</span> <span class="pre">Api-Key</span> <span class="pre">&lt;key&gt;</span></code> on the <code class="docutils literal notranslate"><span class="pre">/</span></code> handshake,
+and <code class="docutils literal notranslate"><span class="pre">/healthz</span></code> without a key. The check is one ASGI
 middleware over the whole app rather than a per-route dependency, so a route
 added later is covered without anyone remembering to opt it in.</p>
 <p class="rubric">Module Attributes</p>
@@ -766,7 +769,7 @@ added later is covered without anyone remembering to opt it in.</p>
 <p class="rubric">Classes</p>
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
 <tbody>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.auth.APIKeyGuard" title="mstar.api_server.auth.APIKeyGuard"><code class="xref py py-obj docutils literal notranslate"><span class="pre">APIKeyGuard</span></code></a>([key])</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.auth.APIKeyGuard" title="mstar.api_server.auth.APIKeyGuard"><code class="xref py py-obj docutils literal notranslate"><span class="pre">APIKeyGuard</span></code></a>([key, serves_openpi])</p></td>
 <td><p>Holds the key (if any) and checks a request's headers against it.</p></td>
 </tr>
 <tr class="row-even"><td><p><a class="reference internal" href="#mstar.api_server.auth.APIKeyMiddleware" title="mstar.api_server.auth.APIKeyMiddleware"><code class="xref py py-obj docutils literal notranslate"><span class="pre">APIKeyMiddleware</span></code></a>(app, guard)</p></td>
@@ -777,22 +780,28 @@ added later is covered without anyone remembering to opt it in.</p>
 </div>
 <dl class="py class">
 <dt class="sig sig-object py" id="mstar.api_server.auth.APIKeyGuard">
-<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.api_server.auth.</span></span><span class="sig-name descname"><span class="pre">APIKeyGuard</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">key</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/api_server/auth.html#APIKeyGuard"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.auth.APIKeyGuard" title="Link to this definition">#</a></dt>
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.api_server.auth.</span></span><span class="sig-name descname"><span class="pre">APIKeyGuard</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">key</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">serves_openpi</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">lambda</span> <span class="pre">:</span> <span class="pre">...</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/api_server/auth.html#APIKeyGuard"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.auth.APIKeyGuard" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
 <p>Holds the key (if any) and checks a request’s headers against it.</p>
 <p>Mutable so the module-level app can install the middleware at import and
 the CLI can set the key once its flags are parsed.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
-<dd class="field-odd"><p><strong>key</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em> | </em><em>None</em>)</p>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>key</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em> | </em><em>None</em>)</p></li>
+<li><p><strong>serves_openpi</strong> (<em>Callable</em><em>[</em><em>[</em><em>]</em><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a><em>]</em>)</p></li>
+</ul>
 </dd>
 </dl>
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.api_server.auth.APIKeyGuard.accepts">
-<span class="sig-name descname"><span class="pre">accepts</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">headers</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/api_server/auth.html#APIKeyGuard.accepts"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.auth.APIKeyGuard.accepts" title="Link to this definition">#</a></dt>
+<span class="sig-name descname"><span class="pre">accepts</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">headers</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">schemes</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">_SCHEMES</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/api_server/auth.html#APIKeyGuard.accepts"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.auth.APIKeyGuard.accepts" title="Link to this definition">#</a></dt>
 <dd><dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
-<dd class="field-odd"><p><strong>headers</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)"><em>tuple</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#bytes" title="(in Python v3.12)"><em>bytes</em></a><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#bytes" title="(in Python v3.12)"><em>bytes</em></a><em>]</em><em>]</em>)</p>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>headers</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)"><em>tuple</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#bytes" title="(in Python v3.12)"><em>bytes</em></a><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#bytes" title="(in Python v3.12)"><em>bytes</em></a><em>]</em><em>]</em>)</p></li>
+<li><p><strong>schemes</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#frozenset" title="(in Python v3.12)"><em>frozenset</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#bytes" title="(in Python v3.12)"><em>bytes</em></a><em>]</em>)</p></li>
+</ul>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
 <dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)">bool</a></p>

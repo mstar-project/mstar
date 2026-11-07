@@ -33,6 +33,7 @@
    entrypoint
    media_io
    openai
+   openpi
    request_types
    rust_frontend
    served_models

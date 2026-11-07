@@ -1004,7 +1004,10 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">Off unless ``--api-key`` or ``MSTAR_API_KEY`` sets a key. When set, every</span>
 <span class="sd">request except the probe and scrape paths in ``UNAUTHENTICATED_PATHS`` must carry</span>
 <span class="sd">``Authorization: Bearer &lt;key&gt;`` (what the OpenAI SDKs send for ``api_key``);</span>
-<span class="sd">WebSocket routes are checked at the handshake. The check is one ASGI</span>
+<span class="sd">WebSocket routes are checked at the handshake. A deployment that serves the</span>
+<span class="sd">openpi socket (an ``openpi:`` block) also takes openpi_client's conventions</span>
+<span class="sd">there, and only there: ``Authorization: Api-Key &lt;key&gt;`` on the ``/`` handshake,</span>
+<span class="sd">and ``/healthz`` without a key. The check is one ASGI</span>
 <span class="sd">middleware over the whole app rather than a per-route dependency, so a route</span>
 <span class="sd">added later is covered without anyone remembering to opt it in.</span>
 <span class="sd">"""</span>
@@ -1017,6 +1020,7 @@ window.runMermaid = runMermaid;</script>
 <span class="kn">import</span><span class="w"> </span><span class="nn">logging</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">os</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">sys</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">collections.abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">Callable</span>
 
 <span class="n">logger</span> <span class="o">=</span> <span class="n">logging</span><span class="o">.</span><span class="n">getLogger</span><span class="p">(</span><span class="vm">__name__</span><span class="p">)</span>
 
@@ -1026,6 +1030,12 @@ window.runMermaid = runMermaid;</script>
 <span class="c1">#: and the Prometheus scrape endpoint (request counts, latencies and the model</span>
 <span class="c1">#: name; never prompts or outputs).</span>
 <span class="n">UNAUTHENTICATED_PATHS</span> <span class="o">=</span> <span class="nb">frozenset</span><span class="p">({</span><span class="s2">"/health"</span><span class="p">,</span> <span class="s2">"/metrics"</span><span class="p">})</span>
+
+<span class="n">OPENPI_SOCKET_PATH</span> <span class="o">=</span> <span class="s2">"/"</span>
+<span class="n">OPENPI_HEALTH_PATH</span> <span class="o">=</span> <span class="s2">"/healthz"</span>
+<span class="n">_OPENPI_PATHS</span> <span class="o">=</span> <span class="nb">frozenset</span><span class="p">({</span><span class="n">OPENPI_SOCKET_PATH</span><span class="p">,</span> <span class="n">OPENPI_HEALTH_PATH</span><span class="p">})</span>
+<span class="n">_SCHEMES</span> <span class="o">=</span> <span class="nb">frozenset</span><span class="p">({</span><span class="sa">b</span><span class="s2">"bearer"</span><span class="p">})</span>
+<span class="n">_OPENPI_SCHEMES</span> <span class="o">=</span> <span class="nb">frozenset</span><span class="p">({</span><span class="sa">b</span><span class="s2">"bearer"</span><span class="p">,</span> <span class="sa">b</span><span class="s2">"api-key"</span><span class="p">})</span>
 
 <span class="n">_UNAUTHORIZED_BODY</span> <span class="o">=</span> <span class="n">json</span><span class="o">.</span><span class="n">dumps</span><span class="p">({</span><span class="s2">"error"</span><span class="p">:</span> <span class="p">{</span>
     <span class="s2">"message"</span><span class="p">:</span> <span class="s2">"missing or invalid API key; send 'Authorization: Bearer &lt;key&gt;'"</span><span class="p">,</span>
@@ -1088,8 +1098,10 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">    the CLI can set the key once its flags are parsed.</span>
 <span class="sd">    """</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">key</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span>
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">key</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span> <span class="n">serves_openpi</span><span class="p">:</span> <span class="n">Callable</span><span class="p">[[],</span> <span class="nb">bool</span><span class="p">]</span> <span class="o">=</span> <span class="k">lambda</span><span class="p">:</span> <span class="kc">False</span><span class="p">):</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">set</span><span class="p">(</span><span class="n">key</span><span class="p">)</span>
+        <span class="c1"># asked only for the openpi paths, so the app can answer once its config is read</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">serves_openpi</span> <span class="o">=</span> <span class="n">serves_openpi</span>
 
 <div class="viewcode-block" id="APIKeyGuard.set">
 <a class="viewcode-back" href="../../../_autosummary/mstar.api_server.auth.html#mstar.api_server.auth.APIKeyGuard.set">[docs]</a>
@@ -1103,21 +1115,21 @@ window.runMermaid = runMermaid;</script>
 
 <div class="viewcode-block" id="APIKeyGuard.accepts">
 <a class="viewcode-back" href="../../../_autosummary/mstar.api_server.auth.html#mstar.api_server.auth.APIKeyGuard.accepts">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">accepts</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">headers</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">tuple</span><span class="p">[</span><span class="nb">bytes</span><span class="p">,</span> <span class="nb">bytes</span><span class="p">]])</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">accepts</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">headers</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">tuple</span><span class="p">[</span><span class="nb">bytes</span><span class="p">,</span> <span class="nb">bytes</span><span class="p">]],</span> <span class="n">schemes</span><span class="p">:</span> <span class="nb">frozenset</span><span class="p">[</span><span class="nb">bytes</span><span class="p">]</span> <span class="o">=</span> <span class="n">_SCHEMES</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_digest</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
             <span class="k">return</span> <span class="kc">True</span>
-        <span class="n">token</span> <span class="o">=</span> <span class="n">_bearer_token</span><span class="p">(</span><span class="n">headers</span><span class="p">)</span>
+        <span class="n">token</span> <span class="o">=</span> <span class="n">_request_token</span><span class="p">(</span><span class="n">headers</span><span class="p">,</span> <span class="n">schemes</span><span class="p">)</span>
         <span class="c1"># Comparing digests keeps the time independent of the key's length too.</span>
         <span class="k">return</span> <span class="n">token</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">hmac</span><span class="o">.</span><span class="n">compare_digest</span><span class="p">(</span><span class="n">_digest</span><span class="p">(</span><span class="n">token</span><span class="p">),</span> <span class="bp">self</span><span class="o">.</span><span class="n">_digest</span><span class="p">)</span></div>
 </div>
 
 
 
-<span class="k">def</span><span class="w"> </span><span class="nf">_bearer_token</span><span class="p">(</span><span class="n">headers</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">tuple</span><span class="p">[</span><span class="nb">bytes</span><span class="p">,</span> <span class="nb">bytes</span><span class="p">]])</span> <span class="o">-&gt;</span> <span class="nb">bytes</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">_request_token</span><span class="p">(</span><span class="n">headers</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">tuple</span><span class="p">[</span><span class="nb">bytes</span><span class="p">,</span> <span class="nb">bytes</span><span class="p">]],</span> <span class="n">schemes</span><span class="p">:</span> <span class="nb">frozenset</span><span class="p">[</span><span class="nb">bytes</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="nb">bytes</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
     <span class="k">for</span> <span class="n">name</span><span class="p">,</span> <span class="n">value</span> <span class="ow">in</span> <span class="n">headers</span><span class="p">:</span>
         <span class="k">if</span> <span class="n">name</span> <span class="o">==</span> <span class="sa">b</span><span class="s2">"authorization"</span><span class="p">:</span>
             <span class="n">scheme</span><span class="p">,</span> <span class="n">_</span><span class="p">,</span> <span class="n">token</span> <span class="o">=</span> <span class="n">value</span><span class="o">.</span><span class="n">strip</span><span class="p">()</span><span class="o">.</span><span class="n">partition</span><span class="p">(</span><span class="sa">b</span><span class="s2">" "</span><span class="p">)</span>
-            <span class="k">return</span> <span class="n">token</span><span class="o">.</span><span class="n">strip</span><span class="p">()</span> <span class="k">if</span> <span class="n">scheme</span><span class="o">.</span><span class="n">lower</span><span class="p">()</span> <span class="o">==</span> <span class="sa">b</span><span class="s2">"bearer"</span> <span class="k">else</span> <span class="kc">None</span>
+            <span class="k">return</span> <span class="n">token</span><span class="o">.</span><span class="n">strip</span><span class="p">()</span> <span class="k">if</span> <span class="n">scheme</span><span class="o">.</span><span class="n">lower</span><span class="p">()</span> <span class="ow">in</span> <span class="n">schemes</span> <span class="k">else</span> <span class="kc">None</span>
     <span class="k">return</span> <span class="kc">None</span>
 
 
@@ -1145,10 +1157,16 @@ window.runMermaid = runMermaid;</script>
         <span class="bp">self</span><span class="o">.</span><span class="n">guard</span> <span class="o">=</span> <span class="n">guard</span>
 
     <span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="fm">__call__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">scope</span><span class="p">,</span> <span class="n">receive</span><span class="p">,</span> <span class="n">send</span><span class="p">):</span>
-        <span class="k">if</span> <span class="p">(</span><span class="n">scope</span><span class="p">[</span><span class="s2">"type"</span><span class="p">]</span> <span class="ow">not</span> <span class="ow">in</span> <span class="p">(</span><span class="s2">"http"</span><span class="p">,</span> <span class="s2">"websocket"</span><span class="p">)</span>
-                <span class="ow">or</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">guard</span><span class="o">.</span><span class="n">enabled</span>
-                <span class="ow">or</span> <span class="n">_route_path</span><span class="p">(</span><span class="n">scope</span><span class="p">)</span> <span class="ow">in</span> <span class="n">UNAUTHENTICATED_PATHS</span>
-                <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">guard</span><span class="o">.</span><span class="n">accepts</span><span class="p">(</span><span class="n">scope</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"headers"</span><span class="p">,</span> <span class="p">[]))):</span>
+        <span class="k">if</span> <span class="n">scope</span><span class="p">[</span><span class="s2">"type"</span><span class="p">]</span> <span class="ow">not</span> <span class="ow">in</span> <span class="p">(</span><span class="s2">"http"</span><span class="p">,</span> <span class="s2">"websocket"</span><span class="p">)</span> <span class="ow">or</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">guard</span><span class="o">.</span><span class="n">enabled</span><span class="p">:</span>
+            <span class="k">await</span> <span class="bp">self</span><span class="o">.</span><span class="n">app</span><span class="p">(</span><span class="n">scope</span><span class="p">,</span> <span class="n">receive</span><span class="p">,</span> <span class="n">send</span><span class="p">)</span>
+            <span class="k">return</span>
+        <span class="n">path</span> <span class="o">=</span> <span class="n">_route_path</span><span class="p">(</span><span class="n">scope</span><span class="p">)</span>
+        <span class="n">openpi</span> <span class="o">=</span> <span class="n">path</span> <span class="ow">in</span> <span class="n">_OPENPI_PATHS</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">guard</span><span class="o">.</span><span class="n">serves_openpi</span><span class="p">()</span>
+        <span class="n">openpi_health</span> <span class="o">=</span> <span class="n">openpi</span> <span class="ow">and</span> <span class="n">path</span> <span class="o">==</span> <span class="n">OPENPI_HEALTH_PATH</span> <span class="ow">and</span> <span class="n">scope</span><span class="p">[</span><span class="s2">"type"</span><span class="p">]</span> <span class="o">==</span> <span class="s2">"http"</span>
+        <span class="n">openpi_socket</span> <span class="o">=</span> <span class="n">openpi</span> <span class="ow">and</span> <span class="n">path</span> <span class="o">==</span> <span class="n">OPENPI_SOCKET_PATH</span> <span class="ow">and</span> <span class="n">scope</span><span class="p">[</span><span class="s2">"type"</span><span class="p">]</span> <span class="o">==</span> <span class="s2">"websocket"</span>
+        <span class="k">if</span> <span class="p">(</span><span class="n">path</span> <span class="ow">in</span> <span class="n">UNAUTHENTICATED_PATHS</span>
+                <span class="ow">or</span> <span class="n">openpi_health</span>
+                <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">guard</span><span class="o">.</span><span class="n">accepts</span><span class="p">(</span><span class="n">scope</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"headers"</span><span class="p">,</span> <span class="p">[]),</span> <span class="n">_OPENPI_SCHEMES</span> <span class="k">if</span> <span class="n">openpi_socket</span> <span class="k">else</span> <span class="n">_SCHEMES</span><span class="p">)):</span>
             <span class="k">await</span> <span class="bp">self</span><span class="o">.</span><span class="n">app</span><span class="p">(</span><span class="n">scope</span><span class="p">,</span> <span class="n">receive</span><span class="p">,</span> <span class="n">send</span><span class="p">)</span>
             <span class="k">return</span>
         <span class="k">if</span> <span class="n">scope</span><span class="p">[</span><span class="s2">"type"</span><span class="p">]</span> <span class="o">==</span> <span class="s2">"websocket"</span><span class="p">:</span>

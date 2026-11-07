@@ -1088,7 +1088,18 @@ model sizes its buffers from its own settings (for <code class="docutils literal
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">model_kwargs</span></code></p></td>
 <td><p><em>(optional)</em> Server-init model parameters (see below).</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">ws_per_message_deflate</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">openpi</span></code></p></td>
+<td><p><em>(optional)</em> For a robot policy, a model that declares <code class="docutils literal notranslate"><span class="pre">Model.robot_io</span></code> and
+<code class="docutils literal notranslate"><span class="pre">Model.load_decoded_image</span></code> (pi0.5 today). Serves openpi’s policy WebSocket at <code class="docutils literal notranslate"><span class="pre">/</span></code> (see
+<a class="reference internal" href="clients.html"><span class="doc">Using a Server</span></a>), mapping an openpi observation onto the request, as openpi’s
+per-robot input and output transforms do. <code class="docutils literal notranslate"><span class="pre">images</span></code>: the observation keys of the
+cameras, in slot order. <code class="docutils literal notranslate"><span class="pre">state</span></code>: the keys whose values are joined, in order,
+into the robot state. <code class="docutils literal notranslate"><span class="pre">action_dims</span></code>: how many leading action dims a reply keeps
+(default all). <code class="docutils literal notranslate"><span class="pre">metadata</span></code>: the frame sent on connect (default <code class="docutils literal notranslate"><span class="pre">{}</span></code>). A block
+the model can’t serve (more cameras than <code class="docutils literal notranslate"><span class="pre">num_cameras</span></code>, an unknown key) stops
+the server at startup.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">ws_per_message_deflate</span></code></p></td>
 <td><p><em>(optional, default true)</em> Whether the server offers per-message deflate on its
 WebSocket routes (<code class="docutils literal notranslate"><span class="pre">/generate/ws</span></code>, <code class="docutils literal notranslate"><span class="pre">/v1/realtime</span></code>); it applies to every route.
 Deflate shrinks 80 ms speech frames to 49-73% of their size as base64 JSON and to
@@ -1096,6 +1107,13 @@ Deflate shrinks 80 ms speech frames to 49-73% of their size as base64 JSON and t
 costs the event loop: about 8% of it at 32 live Nemotron VoiceChat calls on
 <code class="docutils literal notranslate"><span class="pre">/generate/ws</span></code>, whose configs turn it off. Turn it off where the server’s
 event loop, not the network, is the bottleneck.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">ws_max_message_mb</span></code></p></td>
+<td><p><em>(optional, default 16)</em> The largest WebSocket message the server reads, in MiB,
+on every WebSocket route. A larger one closes its socket with <code class="docutils literal notranslate"><span class="pre">1009</span></code> before any
+handler sees it, so the client gets no error frame. Raise it for clients that send
+big uncompressed frames, such as several raw camera images in one openpi
+observation.</p></td>
 </tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">speculation_mixes_walks</span></code></p></td>
 <td><p><em>(optional)</em> Per node, <code class="docutils literal notranslate"><span class="pre">true</span></code>/<code class="docutils literal notranslate"><span class="pre">false</span></code> for every walk of the node’s combined

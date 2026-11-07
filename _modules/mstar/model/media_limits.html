@@ -1312,6 +1312,26 @@ window.runMermaid = runMermaid;</script>
 
 
 
+<div class="viewcode-block" id="charge_decoded_image">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.media_limits.html#mstar.model.media_limits.charge_decoded_image">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">charge_decoded_image</span><span class="p">(</span><span class="n">image</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""Hold an image that arrived decoded (``[C, H, W]``) to the cap a file's</span>
+<span class="sd">    header is held to, and charge the request its pixels."""</span>
+    <span class="n">height</span><span class="p">,</span> <span class="n">width</span> <span class="o">=</span> <span class="n">image</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="o">-</span><span class="mi">2</span><span class="p">:]</span>
+    <span class="n">limit</span> <span class="o">=</span> <span class="n">max_image_pixels</span><span class="p">()</span>
+    <span class="k">if</span> <span class="n">width</span> <span class="o">*</span> <span class="n">height</span> <span class="o">&gt;</span> <span class="n">limit</span><span class="p">:</span>
+        <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"image is </span><span class="si">{</span><span class="n">width</span><span class="si">}</span><span class="s2">x</span><span class="si">{</span><span class="n">height</span><span class="si">}</span><span class="s2"> (</span><span class="si">{</span><span class="n">width</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">height</span><span class="si">}</span><span class="s2"> pixels); the limit is </span><span class="si">{</span><span class="n">limit</span><span class="si">}</span><span class="s2"> pixels"</span><span class="p">)</span>
+    <span class="n">_charge_request</span><span class="p">(</span><span class="s2">"image"</span><span class="p">,</span> <span class="n">width</span> <span class="o">*</span> <span class="n">height</span><span class="p">)</span></div>
+
+
+
+<span class="c1">#: Which modalities a request may send as ``raw_inputs`` (tensors instead of files),</span>
+<span class="c1">#: each with its size check: the check refuses an input over the limit (for images,</span>
+<span class="c1">#: MSTAR_MAX_IMAGE_PIXELS) and counts it toward the request's total, as reading a</span>
+<span class="c1">#: file's header does. The model then loads each with ``Model.load_decoded_&lt;modality&gt;``.</span>
+<span class="n">RAW_INPUT_CHARGES</span> <span class="o">=</span> <span class="p">{</span><span class="s2">"image"</span><span class="p">:</span> <span class="n">charge_decoded_image</span><span class="p">}</span>
+
+
 <div class="viewcode-block" id="sound_file_seconds">
 <a class="viewcode-back" href="../../../_autosummary/mstar.model.media_limits.html#mstar.model.media_limits.sound_file_seconds">[docs]</a>
 <span class="k">def</span><span class="w"> </span><span class="nf">sound_file_seconds</span><span class="p">(</span><span class="n">frames</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">rate</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">float</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>

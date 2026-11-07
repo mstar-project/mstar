@@ -864,7 +864,9 @@ A request sends one image per camera, up to the config’s <code class="docutils
 <code class="docutils literal notranslate"><span class="pre">configs/pi05.yaml</span></code>). Cameras it leaves out are masked, as openpi does, and more
 images than that are a 400.
 <code class="docutils literal notranslate"><span class="pre">configs/pi05_droid.yaml</span></code> serves the DROID fine-tune (<code class="docutils literal notranslate"><span class="pre">lerobot/pi05_droid</span></code>) with
-openpi’s DROID normalization: raw joint state in, joint velocities out.</p></td>
+openpi’s DROID normalization: raw joint state in, joint velocities out. It also
+serves openpi’s policy WebSocket, so openpi’s DROID client connects unchanged
+(see <a class="reference internal" href="clients.html"><span class="doc">Using a Server</span></a>).</p></td>
 </tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">qwen3_5_{0.8,2,4,9,27}b</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Qwen/Qwen3.5-4B</span></code></p></td>
