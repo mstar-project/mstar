@@ -218,6 +218,10 @@ def _value_specs(array: Array, arrays: Sequence[Array]) -> list[NodeResourceSpec
         raise _no_layout(array, "seq_sharded takes max_len 0, and a Value's entries stay whole on each rank")
     if set(array.entry.tensors) != {"state", "conv"} or array.entry.host:
         raise _no_layout(array, "entry must be exactly state and conv, the blocks DeltaNetGeometry reads")
+    unknown = sorted(key for key, op in array.updates.items() if not isinstance(op, GatedDeltaNet | CausalConv))
+    if unknown:
+        raise _no_layout(array, f"updates {unknown} are neither GatedDeltaNet nor CausalConv, the kernels "
+                                "LinearAttnConfig runs")
     deltas = [(key, op) for key, op in array.updates.items() if isinstance(op, GatedDeltaNet)]
     convs = [op for op in array.updates.values() if isinstance(op, CausalConv)]
     if len(deltas) != 1:
