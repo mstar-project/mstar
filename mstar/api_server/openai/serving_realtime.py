@@ -74,6 +74,7 @@ import reprlib
 import uuid
 from dataclasses import dataclass, field
 
+import anyio
 import numpy as np
 from fastapi import HTTPException, WebSocket, WebSocketDisconnect
 
@@ -545,19 +546,38 @@ class RealtimeTranscription:
     async def run(self) -> None:
         await self.ws.accept()
         await self.send(_event("transcription_session.created", session=self._session_view()))
-        try:
+        # Keep inference ordered, but keep reading so disconnects and WebSocket
+        # control traffic cannot wait behind a model request. Bound both large
+        # audio frames and tiny events; overload closes this session.
+        inbox = asyncio.Queue(maxsize=1024)
+        queued_chars = 0
+        max_chars = int(self.session.max_item_seconds * max(INPUT_SAMPLE_RATES) * 2 * 4 / 3) + 65536
+
+        async def receive():
+            nonlocal queued_chars
             while True:
-                # receive_text() raises KeyError on a binary frame
                 message = await self.ws.receive()
                 if message["type"] == "websocket.disconnect":
-                    raise WebSocketDisconnect(message.get("code", 1000), message.get("reason"))
+                    return
+                size = len(message.get("text") or message.get("bytes") or b"")
+                if inbox.full() or queued_chars + size > max_chars:
+                    await self.ws.close(code=1013, reason="transcription input queue is full")
+                    return
+                queued_chars += size
+                inbox.put_nowait((message, size))
+                # ASGI receive may return immediately for an already queued burst.
+                await asyncio.sleep(0)
+
+        async def consume():
+            nonlocal queued_chars
+            while True:
+                message, size = await inbox.get()
+                queued_chars -= size
                 if message.get("text") is None:
                     await self.send(_error("an event must be a JSON text message, not binary"))
                     continue
                 try:
                     event = json.loads(message["text"])
-                # ValueError covers JSONDecodeError and integers past Python's
-                # int-string digit limit; RecursionError is deep nesting
                 except (ValueError, RecursionError):
                     await self.send(_error("not JSON"))
                     continue
@@ -565,8 +585,18 @@ class RealtimeTranscription:
                     await self.send(_error("an event must be a JSON object"))
                     continue
                 await self.handle(event)
-        except WebSocketDisconnect:
-            return
+
+        async with anyio.create_task_group() as group:
+            async def drive(operation):
+                try:
+                    await operation()
+                except WebSocketDisconnect:
+                    pass
+                finally:
+                    group.cancel_scope.cancel()
+
+            group.start_soon(drive, consume)
+            group.start_soon(drive, receive)
 
     async def handle(self, event: dict) -> None:
         kind = event.get("type")

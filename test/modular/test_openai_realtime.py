@@ -1050,3 +1050,67 @@ def test_a_character_split_across_token_chunks_survives_a_step():
     )
     out = asyncio.run(serving_realtime._run_step(api, _ContinuingAdapter(), session, "pre "))
     assert out == "pre " + text
+
+
+def test_disconnect_is_read_while_a_step_waits_and_cancels_its_request():
+    import asyncio
+
+    async def exercise():
+        started = asyncio.Event()
+        released = []
+        class WaitingAPI(_StubAPI):
+            async def collect_results(self, request_id, raw_request=None):
+                started.set()
+                await asyncio.Future()
+            def release_request(self, request_id):
+                released.append(request_id)
+
+        class Socket(_ScriptedWS):
+            async def receive(self):
+                if self.inbox:
+                    return await super().receive()
+                await started.wait()
+                return {"type": "websocket.disconnect", "code": 1000}
+
+        api = WaitingAPI()
+        ws = Socket([json.dumps({"type": "input_audio_buffer.append", "audio": _pcm(2)})])
+        rt = serving_realtime.RealtimeTranscription(api, "rt_test", _ContinuingAdapter(), ws)
+        task = asyncio.create_task(rt.run())
+        await asyncio.wait_for(started.wait(), 1)
+        done, _ = await asyncio.wait({task}, timeout=0.2)
+        try:
+            assert task in done, "disconnect waits behind the blocked inference step"
+            await task
+            assert released == [api.submits[0]["request_id"]]
+            assert not list(api.upload_dir.iterdir())
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+    asyncio.run(exercise())
+
+
+def test_realtime_closes_a_flooded_queue_instead_of_stopping_reads():
+    import asyncio
+
+    async def exercise():
+        started = asyncio.Event()
+        class Socket(_ScriptedWS):
+            closed = None
+            reads = 0
+            async def receive(self):
+                self.reads += 1
+                if self.reads > 1:
+                    await started.wait()
+                return {"type": "websocket.receive", "text": "{}"}
+            async def close(self, code, reason):
+                self.closed = code
+        ws = Socket([])
+        rt = serving_realtime.RealtimeTranscription(_StubAPI(), "rt_test", _ContinuingAdapter(), ws)
+        async def blocked(event):
+            started.set()
+            await asyncio.Future()
+        rt.handle = blocked
+        await asyncio.wait_for(rt.run(), 1)
+        assert ws.closed == 1013
+        assert ws.reads <= 1026
+    asyncio.run(exercise())
