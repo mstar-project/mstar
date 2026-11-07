@@ -112,7 +112,7 @@ class XPUPagedAttentionManager(AttentionManager):
                 plan = self._build_plan(kv_out, step.causal, graph_mode=False)
             else:
                 key = CGSlotKey(
-                    bucket=lease.bucket, slot=lease.slot, label=label
+                    bucket=lease.bucket, slot=lease.buffer_slot, label=label
                 )
                 plan = self._build_plan(
                     kv_out, step.causal, graph_mode=True, max_q=max_q,

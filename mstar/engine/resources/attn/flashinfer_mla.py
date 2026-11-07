@@ -287,13 +287,13 @@ class FlashInferMLAManager(AttentionManager):
                 "MLA torch fallback cannot run under a CUDA graph; declare no "
                 "capture configs when uses_kernel is False"
             )
-        key = CGSlotKey(bucket=lease.bucket, slot=lease.slot, label=label)
+        key = CGSlotKey(bucket=lease.bucket, slot=lease.buffer_slot, label=label)
         wrapper = self._cg_plan_states.get(key)
         if wrapper is None:
             kwargs = {**self._wrapper_kwargs, "max_num_pages": captured_page_capacity(
                 num_rows, lease.bucket.num_tokens, self._kv_config)}
             wrapper = FlashInferMLAWrapper(
-                workspace_buffer=self._workspaces.get(label, lease.slot),
+                workspace_buffer=self._workspaces.get(label, lease.buffer_slot),
                 batch_size=num_rows, use_cuda_graph=True, **kwargs,
             )
             self._cg_plan_states[key] = wrapper

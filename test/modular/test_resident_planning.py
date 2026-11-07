@@ -2815,22 +2815,29 @@ def test_a_walk_that_isnt_one_token_a_row_in_one_stream_is_refused_at_load(segme
 # ---- the engine ----
 
 
-@pytest.mark.parametrize("shared", [False, True])
-def test_connected_admission_refusal_releases_real_owner_reservations(shared):
+@pytest.mark.parametrize("sharing", ["disjoint", "direct", "dependency"])
+def test_connected_admission_refusal_releases_real_owner_reservations(sharing):
     from test_engine_uniform_inputs import _connected_engine
 
     engine, group, events = _connected_engine()
     first = _resources()["kv"]
-    second = first if shared else _resources(max_num_pages=2)["kv"]
+    second = first if sharing == "direct" else (
+        RopeManager(PositionConfig(kv_cache="a"), CPU, max_seq_len=512, head_dim=8)
+        if sharing == "dependency" else _resources(max_num_pages=2)["kv"]
+    )
     for kv in {first, second}:
         for rid in (1, 2):
-            kv.ingest_request(rid, KVReqConfig())
+            kv.ingest_request(rid, KVReqConfig() if isinstance(kv, KVManager) else None)
     for name, kv in (("a", first), ("b", second)):
         mgmt = engine._submodules[name]
         mgmt.resources = {name: kv}
-        mgmt.submodule.declare_step = lambda request_ids, name=name, **kw: SubmoduleStep(steps={
-            name: KVStep(segments=tuple(Segment(rid, "main", 1) for rid in request_ids)),
-        })
+        def declare(request_ids, name=name, kv=kv, **kw):
+            segments = tuple(Segment(rid, "main", 1) for rid in request_ids)
+            part = PositionStep(segments=segments) if isinstance(kv, RopeManager) else KVStep(
+                segments=segments, eager_write=sharing == "direct" and name == "b",
+            )
+            return SubmoduleStep(steps={name: part})
+        mgmt.submodule.declare_step = declare
     engine._runner = StepRunner({"a": first, "b": second})
     free = first._arena.num_free
     admitted = []
@@ -2840,12 +2847,212 @@ def test_connected_admission_refusal_releases_real_owner_reservations(shared):
     assert not group.submitted and not any(e in {"a", "b"} for e in events)
     assert first._arena.num_free == free and not first._admit_reserved_pages
     first.assert_pages_conserved()
-    if shared:
-        assert admitted == []  # before KV.admit can forget A's unwind records
+    if sharing != "disjoint":
+        assert admitted == []  # including the unsafe second/dependency-only occurrence
     else:
         assert admitted == [("a",), ("b",)]
         assert not second._admit_reserved_pages
         second.assert_pages_conserved()
+
+
+@pytest.mark.parametrize("settlement", ["scratch", "append", "cancel", "refuse"])
+def test_connected_kv_and_positions_project_prefix_without_committing_and_hold_each_members_buffers(settlement):
+    resources = _resources(max_num_pages=2 if settlement == "refuse" else 64)
+    kv, rope = resources["kv"], resources["rope"]
+    _ingest(resources, 1)
+    runner = StepRunner({"kv": kv, "rope": rope})
+    before = kv._arena.num_free
+    steps = []
+    for i, member in enumerate(("prefix", "action")):
+        segments = (Segment(1, "main", 4),)
+        ctx = StepContext(
+            (1,), "prefill", 0, False, unit_id=99, unit_member=i,
+            slot_lease=SlotLease(0, BucketKey("prefill", 1, 4), member=member),
+        )
+        step = SubmoduleStep(steps={
+            "kv": KVStep(segments=segments, commit=i == 0 or settlement == "append"),
+            "rope": PositionStep(segments=segments, advance=None if i == 0 or settlement == "append" else (0,)),
+        })
+        step.set_ctx(ctx)
+        outcome = runner.admit(step)
+        if i == 1 and settlement == "refuse":
+            assert not outcome.ok
+            assert kv._arena.num_free == before - 1
+            assert kv._streams[1]["main"].step_in_flight
+            runner.rollback_admit(steps[0])
+            assert kv._arena.num_free == before
+            assert kv._streams[1]["main"].stored_len == rope.position(1, "main") == 0
+            assert not kv._streams[1]["main"].step_in_flight
+            assert not kv._admit_reserved_pages and not kv._unit_steps and not rope._unit_steps
+            kv.assert_pages_conserved()
+            return
+        assert outcome.ok
+        steps.append(step)
+    assert kv._arena.num_free == before - 2
+    assert kv._streams[1]["main"].stored_len == rope.position(1, "main") == 0
+    assert len(kv._admit_reserved_pages) == 2
+
+    runner.plan(steps[0])
+    prefix_pages = kv._current_plan_states["main", 0].token_to_page
+    prefix_positions = steps[0].ctx.plan_results["rope"]["main"]
+    runner.plan(steps[1])
+    action_pages = kv._current_plan_states["main", 0].token_to_page
+    action_positions = steps[1].ctx.plan_results["rope"]["main"]
+    assert steps[0].ctx.plan_results["rope"]["main"] is prefix_positions
+    assert prefix_pages.data_ptr() != action_pages.data_ptr()
+    assert prefix_pages.unique().tolist() != action_pages.unique().tolist()
+    assert prefix_positions.tolist() == [0, 1, 2, 3]
+    assert action_positions.tolist() == [4, 5, 6, 7]
+    assert steps[1].ctx.plan_results["kv"]["main"].views[0].length == 8
+    assert kv._streams[1]["main"].stored_len == rope.position(1, "main") == 0
+    if settlement == "cancel":
+        runner.rollback_admit(steps[1])
+        assert kv._arena.num_free == before - 1
+        assert kv._streams[1]["main"].step_in_flight
+        runner.rollback_admit(steps[0])
+        assert kv._arena.num_free == before
+        assert kv._streams[1]["main"].stored_len == rope.position(1, "main") == 0
+    else:
+        runner.commit(steps[0])
+        assert kv._streams[1]["main"].step_in_flight
+        runner.commit(steps[1])
+        assert kv._streams[1]["main"].stored_len == rope.position(1, "main") == (
+            8 if settlement == "append" else 4
+        )
+    assert not kv._streams[1]["main"].step_in_flight
+    assert not kv._admit_reserved_pages and not kv._unit_steps and not rope._unit_steps
+    kv.assert_pages_conserved()
+
+
+@pytest.mark.parametrize("remove", [False, True])
+def test_connected_row_cleanup_keeps_the_other_rows_projected_growth_and_reservations(remove):
+    resources = _resources()
+    kv, rope = resources["kv"], resources["rope"]
+    for rid in (1, 2):
+        _ingest(resources, rid)
+    runner = StepRunner({"kv": kv, "rope": rope})
+    before = kv._arena.num_free
+    segments = (Segment(1, "main", 4), Segment(2, "main", 8))
+    first = SubmoduleStep(steps={
+        "kv": KVStep(segments=segments),
+        "rope": PositionStep(segments=segments, advance=(3, 7)),
+    })
+    first.set_ctx(StepContext((1, 2), "prefill", 0, False, unit_id=9))
+    assert runner.admit(first).ok
+    for resource in (kv, rope):
+        if remove:
+            resource.remove_request(1)
+        else:
+            resource.reset_request(1, free=True)
+    segments = (Segment(2, "main", 4),)
+    second = SubmoduleStep(steps={
+        "kv": KVStep(segments=segments, commit=False),
+        "rope": PositionStep(segments=segments, advance=(0,)),
+    })
+    second.set_ctx(StepContext(
+        (2,), "prefill", 0, False, unit_id=9, unit_member=1,
+        slot_lease=SlotLease(0, BucketKey("prefill", 1, 4), "action"),
+    ))
+    assert runner.admit(second).ok
+    runner.plan(second)
+    assert second.ctx.plan_results["kv"]["main"].views[0].length == 12
+    assert second.ctx.plan_results["rope"]["main"].tolist() == [7, 8, 9, 10]
+    runner.rollback_admit(second)
+    assert kv._streams[2]["main"].step_in_flight
+    runner.rollback_admit(first)
+    assert kv._arena.num_free == before
+    assert not kv._admit_reserved_pages and not kv._unit_steps and not rope._unit_steps
+    assert not kv._streams[2]["main"].step_in_flight
+    kv.assert_pages_conserved()
+
+
+@pytest.mark.parametrize("settlement", ["append", "scratch", "refuse", "unsupported", "state_read"])
+def test_connected_engine_launches_shared_owners_once_and_snapshots_each_commit(settlement):
+    from test_engine_uniform_inputs import _connected_engine
+
+    engine, group, events = _connected_engine()
+    resources = _resources(max_num_pages=4 if settlement == "refuse" else 8)
+    kv, rope = resources["kv"], resources["rope"]
+    for rid in (1, 2):
+        _ingest(resources, rid)
+    resources = {key: resource for key, resource in resources.items() if key != "pool" or settlement == "unsupported"}
+    engine._runner = StepRunner(resources, node_resources={name: list(resources) for name in ("a", "b")})
+    admitted = []
+    admit = engine._runner.admit
+    engine._runner.admit = lambda step: (admitted.append(step), admit(step))[-1]
+    engine._pre_plan_done = {}
+    engine._plan_peers = {name: ("a", "b") for name in ("a", "b")}
+    bucket = BucketKey("prefill", 3, 12)
+    planned = {}
+    for name, mgmt in engine._submodules.items():
+        mgmt.resources = resources
+        runner = mgmt.accelerator_graph_runner
+        captured = next(iter(runner._buckets.values()))
+        runner._buckets = {bucket: captured}
+        lease = SlotLease(0, bucket, name)
+        # The replay keeps exactly the addresses that a real capture holds.
+        # Planning B must leave A's vectors intact until this replay reads them.
+        positions = rope._static_buffer(CGSlotKey(bucket, lease.buffer_slot, "main"), 12)
+        pages = kv._static_plan_state(lease.buffer_slot, ("main", 0), 12).token_to_page
+        replay = captured.slots[0].graph.replay
+
+        def run(name=name, positions=positions, pages=pages, replay=replay):
+            planned[name] = positions[:8].clone(), pages[:8].clone()
+            replay()
+
+        captured.slots[0].graph.replay = run
+
+        def declare(request_ids, name=name, **kw):
+            segments = tuple(Segment(rid, "main", 4 if rid > 0 else 0) for rid in request_ids)
+            keeps = name == "a" or settlement != "scratch"
+            parts = {
+                "kv": KVStep(segments=segments, commit=keeps),
+                "rope": PositionStep(segments=segments, advance=None if keeps else (0,) * len(segments)),
+            }
+            if "pool" in resources:
+                parts["pool"] = RecurrentStep(segments=segments)
+            return SubmoduleStep(steps=parts)
+
+        mgmt.submodule.declare_step = declare
+        if name == "b" and settlement == "state_read":
+            prepare = mgmt.submodule.prepare_inputs
+
+            def prepare_with_position(*args, prepare=prepare, **kwargs):
+                rope.position(2, "main")
+                return prepare(*args, **kwargs)
+
+            mgmt.submodule.prepare_inputs = prepare_with_position
+
+    def reserve(batch):
+        lease = SlotLease(0, bucket, batch.node_name)
+        batch.lease_slot(lease)
+        return lease
+
+    engine.reserve_replay_slot = reserve
+    free = kv._arena.num_free
+    outputs = engine.exec_group(group)
+    if settlement in {"refuse", "unsupported", "state_read"}:
+        assert outputs is None and not group.submitted and not planned
+        assert kv._arena.num_free == free
+        for rid in (1, 2):
+            assert kv._streams[rid].get("main", SimpleNamespace(stored_len=0)).stored_len == 0
+            assert rope.position(rid, "main") == 0
+        assert len(admitted) == (2 if settlement == "refuse" else 0)
+    else:
+        assert group.submitted and events == ["a", "b", "release:b", "release:a"]
+        assert outputs[1].per_rid_outputs[2]["x"][0].tolist() == [[112., 112.]]
+        assert planned["a"][0].tolist() == [0, 1, 2, 3] * 2
+        assert planned["b"][0].tolist() == [4, 5, 6, 7] * 2
+        assert not torch.equal(planned["a"][1], planned["b"][1])
+        for i, (_, batch) in enumerate(group.members):
+            length = 8 if i and settlement == "append" else 4
+            for rid in (1, 2):
+                assert batch.publish_snapshots[rid]["kv"][0][1] == length
+                assert dict(batch.publish_snapshots[rid]["rope"]) == {"main": length}
+        assert kv._streams[2]["main"].stored_len == (8 if settlement == "append" else 4)
+    assert not kv._admit_reserved_pages and not kv._unit_steps and not rope._unit_steps
+    assert all(not stream.step_in_flight for streams in kv._streams.values() for stream in streams.values())
+    kv.assert_pages_conserved()
 
 def _capture_runner(max_bs=4, refusal=None, step=_ONE_TOKEN):
     bound = {}

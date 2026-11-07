@@ -3,7 +3,7 @@
 has ownership of per-(request,label) position counter"""
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, field, fields, replace
 from typing import TYPE_CHECKING
 
 import torch
@@ -157,6 +157,7 @@ class RopeManager(PositionManager):
 
         # rid -> label -> next pos of stream
         self._counters: dict[str, dict[str, int]] = {}
+        self._unit_steps: dict[tuple[int, int], tuple[PositionStep, StepContext]] = {}
 
         self._static_pos_ids: dict[CGSlotKey, torch.Tensor] = {}
         # Host side of the same addressing, keyed the same way; see
@@ -212,9 +213,48 @@ class RopeManager(PositionManager):
 
     def remove_request(self, rid: str):
         self._counters.pop(rid, None)
+        self._forget_unit_row(rid)
 
     def reset_request(self, rid: str, free: bool=False):
         self._counters[rid].clear()
+        self._forget_unit_row(rid)
+
+    def _forget_unit_row(self, rid: int) -> None:
+        for key, (step, ctx) in list(self._unit_steps.items()):
+            keep = [i for i, segment in enumerate(step.segments) if segment.request_id != rid]
+            segments = tuple(step.segments[i] for i in keep)
+            if not any(ctx.is_real_row(segment.request_id) for segment in segments):
+                del self._unit_steps[key]
+            elif len(keep) != len(step.segments):
+                advance = None if step.advance is None else tuple(step.advance[i] for i in keep)
+                self._unit_steps[key] = replace(step, segments=segments, advance=advance), ctx
+
+    def connected_refusal(self, step: PositionStep | None, ctx: StepContext) -> str | None:
+        if step is None:
+            return "shared positions need each member's declared step"
+        if ctx.slot_lease is None or not ctx.slot_lease.member or ctx.resident is not None:
+            return "shared positions need member-qualified host-planned capture buffers"
+        return None
+
+    def admit(self, step: PositionStep, ctx: StepContext) -> AdmitOutcome:
+        if ctx.unit_id is not None:
+            self._unit_steps[ctx.unit_id, ctx.unit_member] = step, ctx
+        return ADMIT_OK
+
+    def rollback_admit(self, step: PositionStep, ctx: StepContext) -> None:
+        if ctx.unit_id is not None:
+            self._unit_steps.pop((ctx.unit_id, ctx.unit_member), None)
+
+    def _unit_growth(self, ctx: StepContext | None, rid: int, label: str) -> int:
+        if ctx is None or ctx.unit_id is None:
+            return 0
+        return sum(
+            earlier.run_span(advance, request_id=rid)
+            for (unit, member), (step, earlier) in self._unit_steps.items()
+            if unit == ctx.unit_id and member < ctx.unit_member
+            for segment, advance in zip(step.segments, self._advances(step), strict=True)
+            if segment.request_id == rid and segment.label == label and earlier.is_real_row(rid)
+        )
 
     def apply_cached_prefix(
         self, rid: str, node_name: str, graph_walk: str, inputs,
@@ -346,6 +386,10 @@ class RopeManager(PositionManager):
             undo=self._preplan_fork_undo if ctx.is_preplan else None,
         )
 
+        if ctx.unit_id is not None:
+            # Each admitted member keeps its own plan result through commit;
+            # replacing the live view must not rewrite an earlier context.
+            self._current_pos_ids = {}
         pos_ids_out = self._preplan_pos_ids if ctx.is_preplan else self._current_pos_ids
         pos_ids_out.clear()
         for plan_label, kv_out in plan_outputs.items():
@@ -354,7 +398,7 @@ class RopeManager(PositionManager):
                 rows = kv_out.rows
                 if rows is None:
                     rows = [(v.request_id, v.label, v.to_compute) for v in kv_out.views]
-                pos_ids = self._build_pos_ids(rows, plan_label, lease)
+                pos_ids = self._build_pos_ids(rows, plan_label, lease, ctx)
             pos_ids_out[plan_label] = self._place(pos_ids, plan_label, lease)
         self._preplanned = ctx.is_preplan
         return pos_ids_out
@@ -399,7 +443,7 @@ class RopeManager(PositionManager):
 
     def resident_gather(self, step: "CapturedResidentStep") -> None:
         own = step.streams[self._resident_key]
-        key = CGSlotKey(bucket=step.bucket, slot=step.slot, label=own.label)
+        key = CGSlotKey(bucket=step.bucket, slot=step.buffer_slot, label=own.label)
         table = self._resident_delta
         gather_column(
             self._resident_store.store, step.slots, table.stride, table.col,
@@ -407,6 +451,8 @@ class RopeManager(PositionManager):
         )
 
     def commit(self, step: PositionStep, ctx: StepContext):
+        if ctx.unit_id is not None:
+            self._unit_steps.pop((ctx.unit_id, ctx.unit_member), None)
         all_counters = self._counters
         for segment, advance in zip(
             step.segments, self._advances(step), strict=True
@@ -489,7 +535,7 @@ class RopeManager(PositionManager):
         return buffer
 
     def _build_pos_ids(
-        self, rows, plan_label: str, lease,
+        self, rows, plan_label: str, lease, ctx: StepContext | None = None,
     ) -> torch.Tensor:
         """step positions in KV plan order from stream counters; ``rows`` is
         ``(request_id, label, to_compute)`` per view in plan order
@@ -505,6 +551,8 @@ class RopeManager(PositionManager):
         for rid, label, to_compute in rows:
             labels = counters.get(rid)
             start = labels.get(label, 0) if labels is not None else 0
+            if ctx is not None and ctx.unit_id is not None:
+                start += self._unit_growth(ctx, rid, label)
             if to_compute == 1:
                 append(start)  # a decode row
             elif block:
@@ -514,7 +562,7 @@ class RopeManager(PositionManager):
         if lease is None:
             return torch.tensor(pos_ids, dtype=torch.long)
         key = CGSlotKey(
-            bucket=lease.bucket, slot=lease.slot, label=plan_label
+            bucket=lease.bucket, slot=lease.buffer_slot, label=plan_label
         )
         buffer = self._pinned_pos_ids_buffer(key, lease.bucket.num_tokens)
         num_tokens = len(pos_ids)
@@ -535,7 +583,7 @@ class RopeManager(PositionManager):
             return pos_ids
 
         key = CGSlotKey(
-            bucket=lease.bucket, slot=lease.slot, label=plan_label
+            bucket=lease.bucket, slot=lease.buffer_slot, label=plan_label
         )
         buffer = self._static_buffer(key, lease.bucket.num_tokens)
         n = pos_ids.shape[0]
@@ -550,6 +598,11 @@ class RopeManager(PositionManager):
 
 
     def position(self, rid: str, label: str) -> int:
+        from mstar.engine.connected_inputs import active_guard
+
+        guard = active_guard()
+        if guard is not None:
+            guard.refuse("preparation reads a position counter before connected members commit")
         return self._counters.get(rid, {}).get(label, 0)
 
     def pos_ids(self, label: str) -> torch.Tensor | None:

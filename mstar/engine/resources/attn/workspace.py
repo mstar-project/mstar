@@ -141,7 +141,7 @@ class WorkspacePool:
         self._workspaces: dict[str, Workspace] = {}
         self._sealed = False
 
-    def get(self, label: str, cg_slot: int | None = None) -> Workspace:
+    def get(self, label: str, cg_slot: int | tuple[str, int] | None = None) -> Workspace:
         key = label if cg_slot is None else f"{label}_{cg_slot}"
         workspace = self._workspaces.get(key)
         if workspace is None:

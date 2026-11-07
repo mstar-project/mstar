@@ -426,7 +426,7 @@ class FlashInferCrossManager(CrossAttentionManager):
         decode kernel serves."""
         if lease is not None:
             key = CGSlotKey(
-                bucket=lease.bucket, slot=lease.slot, label=plan_label
+                bucket=lease.bucket, slot=lease.buffer_slot, label=plan_label
             )
             wrapper = self._cg_plan_states.get(key)
             if wrapper is not None:
@@ -438,7 +438,7 @@ class FlashInferCrossManager(CrossAttentionManager):
                 )
             else:
                 # built on first plan for the key; see FlashInferManager._cg_wrapper
-                workspace = self._workspaces.get(plan_label, lease.slot)
+                workspace = self._workspaces.get(plan_label, lease.buffer_slot)
                 if decode:
                     wrapper = self._decode_wrapper(workspace, batch_size=num_rows, accelerator_graph=True)
                 else:

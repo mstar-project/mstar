@@ -265,7 +265,7 @@ class _RaggedManagerBase:
         first plan's ``num_rows``, which is only one of the layouts the bucket
         will replay.
         """
-        key = CGSlotKey(bucket=lease.bucket, slot=lease.slot, label=label)
+        key = CGSlotKey(bucket=lease.bucket, slot=lease.buffer_slot, label=label)
         wrapper = self._cg_plan_states.get(key)
         if wrapper is not None:
             return wrapper
@@ -278,7 +278,7 @@ class _RaggedManagerBase:
             bucket.num_tokens, self._config.max_tokens_for(bucket.bs) or 0
         )
         wrapper = self._build_wrapper(
-            label, lease.slot,
+            label, lease.buffer_slot,
             accelerator_graph=True,
             max_num_segments=max_segments,
             max_total_tokens=max_tokens,

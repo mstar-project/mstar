@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, NamedTuple
 
@@ -46,7 +46,7 @@ class CGSlotSpec:
 @dataclass(frozen=True)
 class CGSlotKey:
     bucket: BucketKey
-    slot: int
+    slot: int | tuple[str, int]
     label: str
 
 
@@ -116,6 +116,18 @@ class KeyedWalks(NamedTuple):
     writes are keyed, and the growth walks whose sampled ids extend the keys."""
     writes: tuple[str, ...]
     growth: tuple[str, ...] = ()
+
+
+def reachable_resources(resources: Mapping[str, "Resource"], keys: Collection[str]) -> dict[str, "Resource"]:
+    """Local resources named by these keys, including their dependencies."""
+    reached = {}
+    todo = list(keys)
+    while todo:
+        key = todo.pop()
+        if key not in reached and key in resources:
+            resource = reached[key] = resources[key]
+            todo.extend(resource.depends_on())
+    return reached
 
 
 class Resource(ResidentHooks, ABC):
@@ -410,6 +422,17 @@ class Resource(ResidentHooks, ABC):
     @property
     def supports_preplan(self):
         return False
+
+    def connected_refusal(self, step: ResourceStep | None, ctx: StepContext) -> str | None:
+        """Why this owner cannot prepare another member before this one commits.
+
+        Called for every shared owner's occurrence after all declarations and
+        before any admission, including dependency-only occurrences (None).
+        Supporting owners retain each member's reservations, projected state,
+        captured buffers and publication through ordered commit or reverse
+        rollback. Preplanning alone does not provide that lifetime.
+        """
+        return "the resource has no lifetime for multiple connected members"
 
     @property
     def force_double_buffer(self):

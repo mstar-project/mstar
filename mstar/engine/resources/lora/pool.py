@@ -1066,7 +1066,7 @@ class LoraAdapterPool(Resource):
             if buf is None or buf.data.numel() < need:
                 buf = self._eager = _Buffers(_next_pow2(need), self._device)
             return buf
-        key = CGSlotKey(bucket=lease.bucket, slot=lease.slot, label=_LABEL)
+        key = CGSlotKey(bucket=lease.bucket, slot=lease.buffer_slot, label=_LABEL)
         buf = self._cg.get(key)
         if buf is None:
             # built by the bucket's capture, whose step is exactly the bucket's shape

@@ -45,7 +45,7 @@ from mstar.engine.resources import (
     StepRunner,
     SubmoduleStep,
 )
-from mstar.engine.resources.base import EngineResourceInfo, KeyedWalks, build_resource
+from mstar.engine.resources.base import EngineResourceInfo, KeyedWalks, build_resource, reachable_resources
 from mstar.engine.resources.iteration_tables import IterationTablesSpec, tables_key
 from mstar.engine.resources.kv.config import instance_size, opening_prefix_caches, unrestorable
 from mstar.engine.resources.kv.keys import fingerprint
@@ -218,6 +218,29 @@ class _MeasuredRow(NamedTuple):
     custom_pos_ids: None = None
 
 
+class SlotRotation:
+    """One rotation for a local component of shared resource buffers.
+
+    Plan and GPU threads lease under one lock. The plan thread waits for
+    commit_done before reusing the next slot; the cursor itself is not a fence.
+    """
+
+    def __init__(self, resources: Collection[Resource]):
+        self.next_slot = 0
+        self.lock = threading.Lock()
+        self.needs_fence = any(res.force_double_buffer for res in resources)
+        buffered = self.needs_fence or (
+            knobs.pre_plan_enabled() and any(res.supports_preplan for res in resources)
+        )
+        self.count = max(2, int(os.environ.get("MSTAR_NUM_SLOTS", "2"))) if buffered else 1
+
+    def lease(self) -> int:
+        with self.lock:
+            slot = self.next_slot
+            self.next_slot = (slot + 1) % self.count
+            return slot
+
+
 @dataclass
 class SubmoduleManagement:
     submodule: NodeSubmodule
@@ -259,16 +282,8 @@ class SubmoduleManagement:
     # streamed signal -> the walks whose steps put it in the node's ring (``step_repeats: stream_queue``)
     rings: dict[str, frozenset[str]] = field(default_factory=dict)
 
-    # Rotated globally, not per runner: slot-keyed buffers are shared across
-    # buckets and regions, so per-runner counters let consecutive steps collide
-    # on a slot. Leased from the plan thread and the GPU thread both, hence the
-    # lock.
-    _next_slot: int = field(init=False, default=0)
-    _num_slots: int = field(init=False, default=1)
-    _forced_double_buffer: bool = field(init=False, default=False)
-    _slot_lock: threading.Lock = field(
-        init=False, default_factory=threading.Lock, repr=False
-    )
+    # Shared by local nodes whose resource buffers can alias.
+    slot_rotation: SlotRotation = field(init=False)
 
     # label -> PiecewiseCudaGraphRunner for inner-loop capture; spread into
     # ModelInputsFromEngine so the submodule's forward can look them up
@@ -279,60 +294,22 @@ class SubmoduleManagement:
     lora_pools: tuple = ()
 
     def __post_init__(self):
-        # Two hazards want a second slot, both of them the host running ahead of
-        # the GPU: pre-plan needs plan(N+1) to write buffers replay(N) isn't
-        # reading, and ``force_double_buffer`` is the same for a resource
-        # staging into a reused host buffer. The latter is not pre-plan
-        # specific — the main runner has it too (see `Resource`).
-        # TODO: submodule-wide, so a capture touching neither kind still pays
-        # double the buffers. Each runner could size its own count from the
-        # resources its captures touch, as PiecewiseCudaGraphRunner does.
-        preplan_enabled = knobs.pre_plan_enabled()
-        self._forced_double_buffer = any(
-            res.force_double_buffer for res in self.resources.values()
-        )
-        double_buffered = self._forced_double_buffer or (
-            preplan_enabled
-            and any(res.supports_preplan for res in self.resources.values())
-        )
-        if not double_buffered:
-            self._num_slots = 1
-            return
-        self._num_slots = int(os.environ.get("MSTAR_NUM_SLOTS", "2"))
-        if self._num_slots < 2:
-            # MSTAR_NUM_SLOTS=1 is the knob for turning double-buffering off,
-            # but neither hazard has a single-buffered form: one slot puts the
-            # next step's staging on top of a DMA that may not have retired.
-            # Turn pre-planning off (`knobs: {pre_plan: false}`, or
-            # MSTAR_PRE_PLAN_SPEC=0) to drop to a single slot.
-            logger.warning(
-                "MSTAR_NUM_SLOTS=%d, but a resource on this node needs "
-                "double-buffering; using 2 slots.", self._num_slots,
-            )
-            self._num_slots = 2
+        self.slot_rotation = SlotRotation(self.resources.values())
 
     @property
     def num_slots(self) -> int:
-        return self._num_slots
+        return self.slot_rotation.count
 
     @property
     def needs_slot_fence(self) -> bool:
-        """Whether reusing a slot has to wait out the GPU work that last held
-        it — true exactly when a resource stages into a reused host buffer."""
-        return self._forced_double_buffer
+        return self.slot_rotation.needs_fence
 
     @property
     def next_slot(self) -> int:
-        """The slot the next lease hands out. Read unlocked: an int read is
-        atomic under the GIL, and the only other leaser is the plan thread,
-        which is gated on the previous batch's ``commit_done``."""
-        return self._next_slot
+        return self.slot_rotation.next_slot
 
     def lease_slot(self) -> int:
-        with self._slot_lock:
-            slot = self._next_slot
-            self._next_slot = (self._next_slot + 1) % self._num_slots
-            return slot
+        return self.slot_rotation.lease()
 
     def set_piecewise_slot(self, slot: int) -> None:
         """Point the region runners at this batch's slot, on the GPU thread just
@@ -860,6 +837,8 @@ class Engine:
             if (key := tables_key(node_name)) in resources:
                 submodule.iteration_tables = resources[key]
 
+        self._share_slot_rotations()
+
     @staticmethod
     def _row_specs(submodules: Mapping[str, NodeSubmodule], row_nodes: Collection[str]) -> list[LoopbackRowsSpec]:
         """The rows of each node that reads its token back on the device
@@ -1094,6 +1073,7 @@ class Engine:
                 enable_nvtx=self._enable_nvtx,
                 device_capability=self.device_capability,
                 capture_stream=capture_stream,
+                separate_member=bool(self._walk_runs),
             )
             runner._connected_walks = self._walk_runs
             piecewise[node_name] = self._build_piecewise_runners(
@@ -2362,10 +2342,11 @@ class Engine:
         admitted = []
         rows = tuple(group.members[0][1].request_ids)
         leases = {}
-        owners = set()
+        slots = {}
+        owners = {}
         try:
             with torch.no_grad(), guard.preparing():
-                for _, batch in group.members:
+                for member, (_, batch) in enumerate(group.members):
                     mgmt = self._submodules[batch.node_name]
                     runner, submodule = mgmt.accelerator_graph_runner, mgmt.submodule
                     if (runner is None or batch.chunk_ranges or batch.step_context.request_walks
@@ -2373,12 +2354,6 @@ class Engine:
                         guard.refuse("a member has no whole capture or has chunked/mixed rows")
                     if batch.graph_walk in self._keyed_walks.get(batch.node_name, ()) or mgmt.rings:
                         guard.refuse("a member prepares cached prefixes or stream windows")
-                    # Reachable owners include resource dependencies, even if
-                    # this declaration would not explicitly name them.
-                    member_owners = {id(resource) for resource in mgmt.resources.values()}
-                    if owners & member_owners:
-                        guard.refuse("members share a resource owner")
-                    owners.update(member_owners)
                     incoming = [(a, signal) for a, b, signal in group.unit.edges if b == batch.node_name]
                     tensors = {rid: dict(batch.per_request_input_tensors.get(rid, {})) for rid in rows}
                     for maker, signal in incoming:
@@ -2411,11 +2386,22 @@ class Engine:
                         guard.refuse("a member changed the common row set")
                     for inp in batch.inputs:
                         for f in dataclasses.fields(inp):
-                            if f.name != "tensor_inputs":
-                                guard.require_real(getattr(inp, f.name), f"NodeInputs.{f.name}")
+                            value = getattr(inp, f.name)
+                            # ARNodeInputs also exposes input_ids/input_embeds
+                            # as tensor fields. Only host/declaration fields
+                            # must be entirely real at this stage; final
+                            # staging still certifies every future tensor.
+                            if f.name != "tensor_inputs" and not isinstance(value, torch.Tensor):
+                                guard.require_real(value, f"NodeInputs.{f.name}")
+                    # The same rotation can serve several node captures.
+                    # Lease it once so a large group cannot wrap back onto a
+                    # still-live component slot from the preceding step.
+                    if mgmt.slot_rotation in slots:
+                        batch.set_slot(slots[mgmt.slot_rotation])
                     lease = self.reserve_replay_slot(batch)
                     if lease is None:
                         guard.refuse("a member has no capture for the common rows")
+                    slots.setdefault(mgmt.slot_rotation, lease.slot)
                     leases[batch.node_name] = lease
                     slot = runner.slot_for(lease)
                     if lease.bucket.graph_walk in runner._generator_walks:
@@ -2424,6 +2410,8 @@ class Engine:
                         guard.refuse("connected resident runs need their shared run state staged before launch")
                     if slot.row_heads:
                         guard.refuse("connected inputs need their captured row owner's destination")
+                    batch.step_context.unit_id = group.claim
+                    batch.step_context.unit_member = member
                     inputs, info = self._pad_batch(batch, mgmt, lease)
                     prepared.append((batch, mgmt, lease, inputs, info, incoming))
                     batch.step = self._declare_step(batch, batch.step_context.padded_request_ids, inputs,
@@ -2433,6 +2421,20 @@ class Engine:
                         for resource_step in batch.step.steps.values():
                             if getattr(resource_step, "pre_forks", ()) or getattr(resource_step, "post_forks", ()):
                                 guard.refuse("a member forks resource state during planning")
+                    for key, resource in reachable_resources(self._runner.resources, mgmt.resources).items():
+                        owners.setdefault(id(resource), []).append((key, resource, batch))
+                # A declaration may make an otherwise compatible owner unsafe
+                # to share. Check every occurrence, including a dependency
+                # with no explicit step, before the first member admits.
+                for occurrences in owners.values():
+                    if len({batch.node_name for _, _, batch in occurrences}) < 2:
+                        continue
+                    for key, resource, batch in occurrences:
+                        if self._submodules[batch.node_name].piecewise_runners:
+                            guard.refuse("a shared owner also has nested piecewise capture buffers")
+                        resource_step = None if batch.step is None else batch.step.get(key)
+                        if why := resource.connected_refusal(resource_step, batch.step_context):
+                            guard.refuse(f"{batch.node_name}/{key}: {why}")
                 for batch, _, _, inputs, _, _ in prepared:
                     admit = self._admit_step(batch, batch.step_context.padded_request_ids, inputs,
                                              batch.step_context, batch.step)
@@ -2484,6 +2486,13 @@ class Engine:
             prepared[0][1].accelerator_graph_runner.launch_parts(group.parts)
             for batch, mgmt, _, _, _, _ in prepared:
                 self._commit_step(batch, mgmt, batch.step, batch.step_context)
+                # A later member can advance the same owner. Preserve what
+                # this member publishes now; the worker still decides which
+                # non-aborting rows may materialize/send it.
+                batch.publish_snapshots = self._runner.publish_snapshot(
+                    batch.request_ids, node_name=batch.node_name,
+                    graph_walk=batch.graph_walk, request_walks=batch.step_context.request_walks,
+                )
                 batch.commit_done.set()
             outputs = []
             for batch, mgmt, lease, inputs, info, _ in prepared:
@@ -3324,6 +3333,14 @@ class Engine:
                 batch.request_ids if publish_request_ids is None
                 else publish_request_ids
             )
+            if batch.publish_snapshots is not None:
+                allowed = set(rids)
+                batch.publish_snapshots = {
+                    rid: snapshot for rid, snapshot in batch.publish_snapshots.items() if rid in allowed
+                }
+                if not _LAZY_PUBLISH:
+                    self.materialize_publish(batch, rids)
+                return batch.resource_publish_info
             if _LAZY_PUBLISH:
                 # Snapshot now, on the gpu thread, so the lengths are this
                 # step's; finish in ``materialize_publish`` for the rids whose
@@ -4263,21 +4280,34 @@ class Engine:
         """Each node, and the nodes that share a resource with it, directly or
         through what their resources depend on: the pre-plans whose copies a
         step of the node can skip or overwrite (``_order_after_pre_plans``)."""
-        def reach(keys: Collection[str]) -> set[str]:
-            seen: set[str] = set()
-            todo = list(keys)
-            while todo:
-                key = todo.pop()
-                if key not in seen and key in self._resources:
-                    seen.add(key)
-                    todo.extend(self._resources[key].depends_on())
-            return seen
-
-        held = {node: reach(keys) for node, keys in node_to_resources.items()}
+        held = {
+            node: {id(res) for res in reachable_resources(self._resources, keys).values()}
+            for node, keys in node_to_resources.items()
+        }
         return {
             node: tuple(sorted(other for other, theirs in held.items() if other == node or keys & theirs))
             for node, keys in held.items()
         }
+
+    def _share_slot_rotations(self) -> None:
+        """Resolve components before any runner allocates slot-keyed buffers."""
+        remaining = set(self._submodules)
+        while remaining:
+            component = set()
+            todo = [min(remaining)]
+            while todo:
+                node = todo.pop()
+                if node not in component:
+                    component.add(node)
+                    todo.extend(set(self._plan_peers[node]) - component)
+            remaining.difference_update(component)
+            resources = reachable_resources(
+                self._resources,
+                {key for node in component for key in self._submodules[node].resources},
+            )
+            rotation = SlotRotation(resources.values())
+            for node in component:
+                self._submodules[node].slot_rotation = rotation
 
     def _order_after_pre_plans(self, node_name: str) -> None:
         """Order the current stream after every copy a pre-plan that

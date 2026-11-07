@@ -30,6 +30,7 @@ from mstar.engine.accelerator_graph_config import (
 from mstar.engine.device_run import DeviceRun, IterationWindow, RunAsk, RunState, TokenStream, column_in
 from mstar.engine.node_dtype import node_scope
 from mstar.engine.resources import BucketKey, CGSlotSpec, Resource, SlotLease, StepContext, StepRunner
+from mstar.engine.resources.base import reachable_resources
 from mstar.engine.resources.loopback_rows import LoopbackRows
 from mstar.engine.resources.lora.config import LoraBaseOnly
 from mstar.engine.resources.resident import CapturedResidentStep, ResidentPlanner, watched_counts
@@ -46,7 +47,7 @@ from mstar.model.submodule_base import (
 )
 from mstar.platforms import current_platform
 from mstar.platforms.compile import with_inductor_overrides
-from mstar.utils import profiler
+from mstar.utils import knobs, profiler
 from mstar.utils.device import DeviceCapability
 
 logger = logging.getLogger(__name__)
@@ -778,6 +779,7 @@ class WarmedSpec(NamedTuple):
 
 class AcceleratorGraphRunner:
     _connected_walks: frozenset[str] = frozenset()
+    _member: str = ""
     CAPTURE_BATCH_SIZES = DEFAULT_CAPTURE_BATCH_SIZES
     NUM_WARMUP = 2
     # None: the backend's shared capture stream (see ``Engine._capture_stream_for``)
@@ -798,8 +800,10 @@ class AcceleratorGraphRunner:
         enable_nvtx: bool=False,
         device_capability: DeviceCapability | None = None,
         capture_stream: Any = None,
+        separate_member: bool = False,
     ):
         self._submodule_name = submodule_name
+        self._member = submodule_name if separate_member else ""
         self._capture_stream = capture_stream
         self._submodule = submodule
         self._comm_group = joint_comm_group
@@ -1034,7 +1038,7 @@ class AcceleratorGraphRunner:
                     graph_walk=spec.bucket.graph_walk,
                     request_ids=rids,
                     inputs=spec.config.get_node_inputs(spec.bs, spec.num_tokens),
-                    slot_lease=SlotLease(slot=0, bucket=spec.bucket),
+                    slot_lease=SlotLease(slot=0, bucket=spec.bucket, member=self._member),
                     per_request_info=dummy_metadata(rids, spec.bucket.graph_walk),
                 )
                 blocked = blocked_capture_resources(step, self._resources)
@@ -1587,7 +1591,7 @@ class AcceleratorGraphRunner:
         dummy_rids = self._dummy_rows.ensure(f"{spec.config_idx}_slot{spec.slot}", spec.bs)
         dummy_inputs = spec.config.get_node_inputs(spec.bs, spec.num_tokens)
         engine_inputs = self._dummy_engine_inputs(dummy_rids, walk)
-        lease = SlotLease(slot=spec.slot, bucket=spec.bucket)
+        lease = SlotLease(slot=spec.slot, bucket=spec.bucket, member=self._member)
         step = engine_step(
             self._submodule,
             graph_walk=walk, request_ids=dummy_rids, inputs=dummy_inputs,
@@ -1857,6 +1861,7 @@ class AcceleratorGraphRunner:
             # capture is dropped whole — so this agrees with `_next_slot`'s wrap
             slot=slot % len(bucket.slots),
             bucket=replace(key, graph_walk=bucket.config.capture_graph_walk),
+            member=self._member,
         )
 
     def slot_for(self, lease: SlotLease) -> AcceleratorGraphSlot:
@@ -2384,9 +2389,8 @@ class PiecewiseAcceleratorGraphRunner:
         self._current_slot = 0
 
     def _size_slots(self) -> None:
-        """A region has no pre-plan path, so a second slot buys nothing unless a
-        resource its step touches stages into a reused host buffer behind an
-        async H2D (see ``Resource.force_double_buffer``)."""
+        """Retain the component count for buffers another node can pre-plan,
+        or whose host staging may still be in flight when this region runs."""
         if self._max_slots <= 1:
             return
         for shape in self._config.get_capture_shapes(self._capture_batch_sizes):
@@ -2397,7 +2401,8 @@ class PiecewiseAcceleratorGraphRunner:
                 list(shape.seq_lens),
             )
             if step is not None and any(
-                self._resources[key].force_double_buffer for key in step.steps
+                resource.force_double_buffer or (knobs.pre_plan_enabled() and resource.supports_preplan)
+                for resource in reachable_resources(self._resources, step.steps).values()
             ):
                 self._num_slots = self._max_slots
                 return

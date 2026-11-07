@@ -1226,7 +1226,7 @@ def test_a_step_beside_the_chain_takes_a_slot_of_its_lanes_and_runs_eager():
     engine = Engine.__new__(Engine)
     engine._walk_lanes, engine._node_lanes = {("n", "prefill"): 1}, {"n": 1}
     mgmt = SubmoduleManagement.__new__(SubmoduleManagement)
-    mgmt._num_slots, mgmt._next_slot = 2, 0
+    mgmt.slot_rotation = SimpleNamespace(count=2, next_slot=0)
     mgmt.resources = {"kv": object()}
     engine._submodules = {"n": mgmt}
     engine._runner = SimpleNamespace(lane_held=frozenset())

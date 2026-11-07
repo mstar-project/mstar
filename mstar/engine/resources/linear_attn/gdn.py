@@ -225,7 +225,7 @@ class GDNManager(LinearAttnManager):
             key, store = (label, "split" if split is not None else is_decode), self._eager_wrappers
             bs, tok = None, None
         else:
-            key = CGSlotKey(lease.bucket, lease.slot, label)
+            key = CGSlotKey(lease.bucket, lease.buffer_slot, label)
             store = self._cg_wrappers
             # A split's decode half runs on as many rows as it is sized for,
             # so it takes the bucket's; the floor is for the other wrappers,

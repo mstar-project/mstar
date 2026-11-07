@@ -50,6 +50,13 @@ class SlotLease:
     has no clean channel to plan/commit/release. see O."""
     slot: int
     bucket: BucketKey | None # None -> eagre
+    # Captures of connected members hold distinct plans on the same component
+    # slot. Empty on ordinary deployments, retaining their existing sharing.
+    member: str = ""
+
+    @property
+    def buffer_slot(self) -> int | tuple[str, int]:
+        return (self.member, self.slot) if self.member else self.slot
 
 
 class SettingValue(Enum):
@@ -93,7 +100,6 @@ class StepContext:
     graph_walk: str
     slot: int
     capture: bool
-
     # Preplan
     is_preplan: bool = False
     # the prefix a resource's own plan laps record under, as the runner times
@@ -146,6 +152,10 @@ class StepContext:
     # reserve them now (``ChunkingPolicy.reserve_whole_prefill``). Check it
     # before reserving by ``chunk_tokens_after``.
     reserve_whole_prefill: PerReqSetting = ALL_SET
+    # One claimed unit's ordered member. Resources own outstanding admissions
+    # and derive earlier members' growth without advancing durable state.
+    unit_id: int | None = None
+    unit_member: int = 0
 
     def check_tp_repeats(self) -> None:
         if self.tp_repeats is not None and self.repeats != self.tp_repeats:

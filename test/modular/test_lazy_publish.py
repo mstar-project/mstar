@@ -245,6 +245,27 @@ def test_eager_finalize_still_publishes_every_request(monkeypatch):
     eng.materialize_publish(batch, [1])  # nothing to finish, no error
 
 
+@pytest.mark.parametrize("lazy", [False, True])
+def test_connected_member_finalize_preserves_its_snapshot_and_filters_aborting_rows(monkeypatch, lazy):
+    monkeypatch.setattr(engine_mod, "_LAZY_PUBLISH", lazy)
+    kv = _manager()
+    for rid in (1, 2):
+        kv.ingest_request(rid, None)
+        _grow(kv, rid, 4)
+    eng = _engine_with(StepRunner({"kv": kv}))
+    batch = _batch([1, 2])
+    batch.publish_snapshots = eng._runner.publish_snapshot([1, 2])
+    # The second member advances the owner before the worker finalizes the
+    # first. An aborting row must still be filtered at finalization.
+    for rid in (1, 2):
+        _grow(kv, rid, 4)
+    eng.finalize_batch(batch, publish_request_ids=[1])
+    eng.materialize_publish(batch, [1, 2])
+    assert set(batch.resource_publish_info) == {1}
+    assert _seq(batch.resource_publish_info[1]["kv"]).seq_len == 4
+    assert kv._streams[1]["main"].stored_len == 8
+
+
 def test_kv_snapshot_of_a_stream_reset_since_publishes_the_stream_as_it_stands():
     # a reset between the snapshot and its finish replaces the page list
     # (the generation moves): the snapshot's page count would name pages

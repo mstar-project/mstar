@@ -18,7 +18,7 @@ from mstar.engine.resources.step import BucketKey, SlotLease  # noqa: E402
 from mstar.model.submodule_base import ARNodeInputs  # noqa: E402
 
 
-def _connected_engine(transform=None, *, head_state=False, mixed=False):
+def _connected_engine(transform=None, *, head_state=False, mixed=False, device="cpu", width=2):
     """Real ordinary preparation/plan/collect, with replay standing in for CUDA."""
     from mstar.engine.accelerator_graph_runner import AcceleratorGraphSlot
     from mstar.engine.engine import ExecutingBatch, ExecutionGroup, SubmoduleManagement
@@ -29,6 +29,7 @@ def _connected_engine(transform=None, *, head_state=False, mixed=False):
     from mstar.worker.micro_scheduler import ScheduledBatch
 
     events = []
+    device = torch.device(device)
 
     class Node(NodeSubmodule):
         def __init__(self, name):
@@ -43,16 +44,18 @@ def _connected_engine(transform=None, *, head_state=False, mixed=False):
                 x = transform(x)
                 if x is None:
                     return None
+            if mixed and self.name == "b":
+                return ARNodeInputs(input_embeds=x)
             return NodeInputs(tensor_inputs={"x": x})
 
         def can_batch(self, **kw):
             return True
 
         def preprocess(self, graph_walk, engine_inputs, inputs):
-            values = [inp.tensor_inputs["x"] for inp in inputs]
+            values = [inp.input_embeds if mixed and self.name == "b" else inp.tensor_inputs["x"] for inp in inputs]
             if mixed and self.name == "b":
                 # Real-only work must stay real; its values precede future rows.
-                values.insert(0, torch.ones(1, 2).mul(7))
+                values.insert(0, torch.ones(1, width, device=device).mul(7))
             return {"x": torch.cat(values)}
 
         def forward(self, *a, **kw):
@@ -60,8 +63,8 @@ def _connected_engine(transform=None, *, head_state=False, mixed=False):
 
     eng = Engine.__new__(Engine)
     eng._enable_nvtx = eng._enable_profile = False
-    eng._device = torch.device("cpu")
-    eng._device_capability = SimpleNamespace(is_accelerator=False)
+    eng._device = device
+    eng._device_capability = SimpleNamespace(is_accelerator=device.type != "cpu")
     eng._keyed_walks = eng._loopback_steps = {}
     eng._runner = StepRunner({})
     eng._submodules = {}
@@ -72,27 +75,42 @@ def _connected_engine(transform=None, *, head_state=False, mixed=False):
         # never replace the consumer template's padding.
         config = BatchedAcceleratorGraphConfig(
             capture_graph_walk="prefill",
-            single_request_inputs=NodeInputs(tensor_inputs={"x": torch.ones(1, 2).mul(9)}),
+            single_request_inputs=(ARNodeInputs(input_embeds=torch.ones(1, width, device=device).mul(9))
+                                   if mixed and name == "b" else
+                                   NodeInputs(tensor_inputs={"x": torch.ones(1, width, device=device).mul(9)})),
         )
         runner = AcceleratorGraphRunner.__new__(AcceleratorGraphRunner)
         bucket = BucketKey("prefill", 3, 0)
-        leases[name] = SlotLease(0, bucket)
-        inputs = torch.zeros(4 if name == "b" and mixed else 3, 2)
+        leases[name] = SlotLease(0, bucket, name)
+        inputs = torch.zeros(4 if name == "b" and mixed else 3, width, device=device)
         output = torch.full_like(inputs, -999)
 
         def replay(name=name, inputs=inputs, output=output):
             events.append(name)
             output.copy_(inputs + (10 if name == "a" else 100))
 
+        graph = SimpleNamespace(replay=replay)
+        if device.type == "cuda":
+            from mstar.engine.accelerator_graph_backend import CUDAGraphBackend
+            from mstar.engine.accelerator_graph_runner import capture_into_graph
+
+            runner._graph_backend = CUDAGraphBackend(device)
+            replay()
+            graph, _ = capture_into_graph(
+                lambda inputs=inputs, output=output, name=name: output.copy_(inputs + (10 if name == "a" else 100)),
+                runner._graph_backend.graph_pool_handle(), device, None, keep_graph=True,
+            )
+            events.clear()
         slot = AcceleratorGraphSlot(
-            graph=SimpleNamespace(replay=replay), static_inputs={"x": inputs}, static_input_keys=("x",),
+            graph=graph, static_inputs={"x": inputs}, static_input_keys=("x",),
             static_outputs=BatchedModelOutput(row_outputs={"x": output}),
             dummy_rids=[-1, -2, -3], dummy_metadata={-3: SimpleNamespace()}, config_idx=0,
+            raw_launch=device.type == "cuda",
         )
         runner._buckets = {bucket: SimpleNamespace(config=config, slots=[slot])}
         runner._static_buffer_seq_dims = {}
         runner._submodule_name = name
-        runner._device = torch.device("cpu")
+        runner._device = device
         runner._generator_walks = set()
         runner.release = lambda lease, bs, name=name: events.append(f"release:{name}")
         mgmt = SubmoduleManagement(Node(name), None, None, None, {}, accelerator_graph_runner=runner)
@@ -101,7 +119,8 @@ def _connected_engine(transform=None, *, head_state=False, mixed=False):
             node_name=name, per_request_info={rid: SimpleNamespace(request_id=rid) for rid in (2, 1)},
             step_context=StepContext((2, 1), "prefill", 0, False),
             per_request_input_tensors=(
-                {rid: {"x": [torch.full((1, 2), rid * 1.)]} for rid in (2, 1)} if name == "a" else {}
+                {rid: {"x": [torch.full((1, width), rid * 1., device=device)]} for rid in (2, 1)}
+                if name == "a" else {}
             ),
         )
         members.append((ScheduledBatch(name, "prefill", {2: 1, 1: 1}), batch))
@@ -120,12 +139,26 @@ def _connected_engine(transform=None, *, head_state=False, mixed=False):
 @pytest.mark.parametrize("mixed", [False, True])
 def test_connected_members_launch_once_with_ordered_real_and_future_rows(mixed):
     eng, group, events = _connected_engine(mixed=mixed)
+    a, b = (eng._submodules[name] for name in ("a", "b"))
+    b.slot_rotation = a.slot_rotation
+    a.slot_rotation.count = 2
+
+    def reserve(batch):
+        mgmt = eng._submodules[batch.node_name]
+        if batch.slot is None:
+            batch.set_slot(mgmt.lease_slot())
+        lease = SlotLease(batch.slot, BucketKey("prefill", 3, 0), batch.node_name)
+        batch.lease_slot(lease)
+        return lease
+
+    eng.reserve_replay_slot = reserve
     runner = eng._submodules["a"].accelerator_graph_runner
     runs = []
     run = runner._run
     runner._run = lambda ops: (runs.append(list(ops)), run(ops))[-1]
     outputs = eng.exec_group(group)
     assert group.submitted and group.refusal is None and len(runs) == 1
+    assert a.next_slot == 1  # one component lease, shared by both members
     assert events == ["a", "b", "release:b", "release:a"]
     assert outputs[0].per_rid_outputs[2]["x"][0].tolist() == [[12., 12.]]
     b_slot = group.parts[1].slot
@@ -138,16 +171,16 @@ def test_connected_members_launch_once_with_ordered_real_and_future_rows(mixed):
     assert outputs[0].per_rid_outputs[2]["x"][0].tolist() == [[12., 12.]]
 
 
-@pytest.mark.parametrize("transform", [
-    lambda x: x + 1,
-    lambda x: torch.empty(2).copy_(x),
-    lambda x: x[0].item(),
-    lambda x: x.tolist(),
-    lambda x: bool(x[0]),
-    lambda x: None,
+@pytest.mark.parametrize("transform,width", [
+    (lambda x: x + 1, 2),
+    (lambda x: torch.empty(2).copy_(x), 2),
+    (lambda x: x.item(), 1),
+    (lambda x: x.tolist(), 2),
+    (bool, 1),
+    (lambda x: None, 2),
 ])
-def test_connected_actual_preparation_refuses_before_launch_without_failing_rows(transform):
-    eng, group, events = _connected_engine(transform)
+def test_connected_actual_preparation_refuses_before_launch_without_failing_rows(transform, width):
+    eng, group, events = _connected_engine(transform, width=width)
     assert eng.exec_group(group) is None
     assert group.refusal and not group.submitted
     assert not any(event in {"a", "b"} for event in events)
@@ -159,6 +192,31 @@ def test_connected_head_cannot_mutate_request_state_before_a_later_refusal():
     assert eng.exec_group(group) is None
     assert not eng._submodules["a"].submodule.request_states
     assert events == []
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA graphs")
+def test_connected_cuda_launch_copies_future_values_and_preserves_external_outputs(monkeypatch):
+    eng, group, events = _connected_engine(mixed=True, device="cuda")
+    calls = []
+    cuda = eng._submodules["a"].accelerator_graph_runner._graph_backend.while_runtime()
+    launch = cuda.launch
+
+    def launch_counted(*args):
+        calls.append(args)
+        return launch(*args)
+
+    monkeypatch.setattr(cuda, "launch", launch_counted)
+    outputs = eng.exec_group(group)
+    assert group.submitted and group.refusal is None and len(calls) == 1
+    torch.cuda.synchronize()
+    assert events == ["release:b", "release:a"]
+    assert group.parts[1].slot.static_outputs.row_outputs["x"].tolist() == [
+        [107., 107.], [112., 112.], [111., 111.], [109., 109.],
+    ]
+    # Reuse the producer slot after all GPU readers were queued. External
+    # outputs retain their values even though the captured storage changes.
+    group.parts[0].slot.static_outputs.row_outputs["x"].fill_(-1)
+    assert outputs[0].per_rid_outputs[2]["x"][0].tolist() == [[12., 12.]]
 
 
 class _Batch:

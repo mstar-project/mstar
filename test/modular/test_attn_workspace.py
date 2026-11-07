@@ -418,6 +418,23 @@ def test_a_captured_wrapper_made_after_the_seal_gets_a_sealed_workspace(monkeypa
     assert all(workspace.sealed for workspace in workspaces)
 
 
+def test_connected_members_keep_distinct_attention_plans_and_workspaces(monkeypatch):
+    monkeypatch.setenv("MSTAR_WORKSPACE_BUFFER_MB", "1")
+    config = PagedKVConfig(
+        num_layers=1, head_dim=64, num_qo_heads=2, num_kv_heads=2, page_size=16, max_num_pages=4, max_seq_len=64,
+    )
+    manager = FlashInferManager("kv", CPU, torch.float32, config)
+    monkeypatch.setattr(flashinfer_mod, "FlashInferPrefillWrapper", SimpleNamespace)
+    bucket = BucketKey("prefill", 1, 16)
+    first = SlotLease(0, bucket, member="prefix")
+    second = SlotLease(0, bucket, member="action")
+    a = manager._cg_wrapper(first, "main", 1, force_prefill=False)
+    b = manager._cg_wrapper(second, "main", 1, force_prefill=False)
+    assert a is not b and a.workspace_buffer is not b.workspace_buffer
+    assert a.workspace_buffer.tensor.data_ptr() != b.workspace_buffer.tensor.data_ptr()
+    assert manager._cg_wrapper(first, "main", 1, force_prefill=False) is a
+
+
 def test_the_engine_seals_between_sizing_and_capture(monkeypatch):
     """A growth during sizing moves wrappers whose only graphs were thrown away; one during
     capture would free memory a recorded graph reads."""

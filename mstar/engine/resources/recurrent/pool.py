@@ -1107,7 +1107,7 @@ class RecurrentStatePool(Resource):
                 buf = self._eager_addressing[label] = self._new_buffers(num_rows)
             return buf, (None, None)
 
-        key = CGSlotKey(bucket=lease.bucket, slot=lease.slot, label=label)
+        key = CGSlotKey(bucket=lease.bucket, slot=lease.buffer_slot, label=label)
         buf = self._cg_addressing.get(key)
         if buf is None:
             size = max(self._cg_max_bs, lease.bucket.bs, num_rows)
@@ -1167,7 +1167,7 @@ class RecurrentStatePool(Resource):
 
     def resident_gather(self, step: "CapturedResidentStep") -> None:
         stream = step.streams[self._resident_key]
-        key = CGSlotKey(bucket=step.bucket, slot=step.slot, label=stream.label)
+        key = CGSlotKey(bucket=step.bucket, slot=step.buffer_slot, label=stream.label)
         table, store, addressing = self._resident_table, self._resident.store, self._cg_addressing[key]
         # a padding row reads the trash row's zero, which is SINK_SLOT
         gather_column(store, step.slots, table.stride, table.col, addressing.slot_indices)

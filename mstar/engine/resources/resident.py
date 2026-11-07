@@ -294,6 +294,11 @@ class CapturedResidentStep:
     # host plan of the step. Nothing plans the bucket only if none needed one.
     reads_tables: bool = False
     host_planned: bool = False
+    member: str = ""
+
+    @property
+    def buffer_slot(self) -> int | tuple[str, int]:
+        return (self.member, self.slot) if self.member else self.slot
 
 
 class ResidentPlanner:
@@ -680,7 +685,9 @@ class ResidentPlanner:
             # once per bucket: each of its captures, and every step it replays, reads these
             streams = self._streams[bucket] = want
         buffers = self.buffers(bucket, slot)
-        return CapturedResidentStep(bucket, slot, buffers.slots, buffers, self._store, streams)
+        lease = step.ctx.slot_lease if step.ctx is not None else None
+        return CapturedResidentStep(bucket, slot, buffers.slots, buffers, self._store, streams,
+                                    member=lease.member if lease is not None else "")
 
     def gather(self, step: CapturedResidentStep) -> None:
         if self._length_keys:

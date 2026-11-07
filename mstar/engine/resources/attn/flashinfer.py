@@ -131,7 +131,7 @@ class FlashInferManager(AttentionManager):
         if ctx.resident is None or lease.bucket in ctx.resident.host_plan_free:
             return ANY_REPEATS
         # a resident walk plans one stream, under its segments' label
-        key = CGSlotKey(bucket=lease.bucket, slot=lease.slot, label=step.segments[0].label)
+        key = CGSlotKey(bucket=lease.bucket, slot=lease.buffer_slot, label=step.segments[0].label)
         wrapper = self._cg_plan_states.get(key)
         return ANY_REPEATS if isinstance(wrapper, FlashInferDecodeWrapper) and wrapper.lengths_move else 1
 
@@ -153,14 +153,14 @@ class FlashInferManager(AttentionManager):
     def resident_run_gather(self, step: "CapturedResidentStep") -> None:
         # the table's lengths: the last run may have ended short of what the plan assumed
         stream = step.streams[self._kv_cache_name]
-        wrapper = self._cg_plan_states.get(CGSlotKey(bucket=step.bucket, slot=step.slot, label=stream.label))
+        wrapper = self._cg_plan_states.get(CGSlotKey(bucket=step.bucket, slot=step.buffer_slot, label=stream.label))
         if isinstance(wrapper, FlashInferDecodeWrapper) and not stream.reads:
             wrapper.gather_lengths(step.buffers.kv_len[self._kv_cache_name])
 
     def resident_gather(self, step: "CapturedResidentStep") -> None:
         # planned per label of its KV cache's plan, so its wrapper is under that stream's label
         pool, stream = self._kv_cache_name, step.streams[self._kv_cache_name]
-        wrapper = self._cg_plan_states.get(CGSlotKey(bucket=step.bucket, slot=step.slot, label=stream.label))
+        wrapper = self._cg_plan_states.get(CGSlotKey(bucket=step.bucket, slot=step.buffer_slot, label=stream.label))
         if isinstance(wrapper, FmhaDecodeWrapper) and not stream.reads:
             table = step.block_tables[pool]
             wrapper.gather_resident(step.store, step.slots, step.buffers.kv_len[pool], table.stride, table.col)
@@ -202,13 +202,13 @@ class FlashInferManager(AttentionManager):
         under-allocates the wrapper's fixed buffers and every later plan()
         call overruns them with a "runtime batch size" mismatch.
         """
-        key = CGSlotKey(bucket=lease.bucket, slot=lease.slot, label=label)
+        key = CGSlotKey(bucket=lease.bucket, slot=lease.buffer_slot, label=label)
         wrapper = self._cg_plan_states.get(key)
         if wrapper is not None:
             return wrapper
 
         bucket = lease.bucket
-        workspace = self._workspaces.get(label, lease.slot)
+        workspace = self._workspaces.get(label, lease.buffer_slot)
         kv_kwargs = {
             **self._wrapper_kv_kwargs,
             "max_num_pages": captured_page_capacity(num_rows, bucket.num_tokens, self._kv_config, self._group),
@@ -216,10 +216,10 @@ class FlashInferManager(AttentionManager):
         split = self._splits.get(bucket.graph_walk)
         if split is not None:
             # its own workspaces: both wrappers are planned for the one step
-            decode_workspace = self._workspaces.get(f"{label}.split_decode", lease.slot)
+            decode_workspace = self._workspaces.get(f"{label}.split_decode", lease.buffer_slot)
             wrapper = FlashInferMixedWrapper(
                 decode_workspace=decode_workspace,
-                prefill_workspace=self._workspaces.get(f"{label}.split_prefill", lease.slot),
+                prefill_workspace=self._workspaces.get(f"{label}.split_prefill", lease.buffer_slot),
                 batch_size=num_rows,
                 max_total_tokens=bucket.num_tokens,
                 max_prefill_rows=split.max_prefill_rows(
@@ -293,6 +293,13 @@ class FlashInferManager(AttentionManager):
     @property
     def supports_preplan(self):
         return True
+
+    def connected_refusal(self, step: AttentionStep | None, ctx: StepContext) -> str | None:
+        if step is None:
+            return "shared attention needs each member's declared step"
+        if ctx.slot_lease is None or not ctx.slot_lease.member or ctx.resident is not None:
+            return "shared attention needs member-qualified host-planned capture buffers"
+        return None
 
     @property
     def force_double_buffer(self):

@@ -329,7 +329,7 @@ class BoundedKVManager(Resource):
             if self._eager_table is None or self._eager_table.shape[0] < rows:
                 self._eager_table = torch.zeros(max(rows, 1), ROW_INTS, dtype=torch.int32, device=self._device)
             return self._eager_table[:max(rows, 1)]
-        key = CGSlotKey(bucket=lease.bucket, slot=lease.slot, label="main")
+        key = CGSlotKey(bucket=lease.bucket, slot=lease.buffer_slot, label="main")
         table = self._cg_tables.get(key)
         if table is None:
             size = max(self._cg_max_bs, lease.bucket.bs, rows)

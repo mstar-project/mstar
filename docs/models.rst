@@ -241,10 +241,15 @@ The worker selects common rows, prepares and admits all members, and submits
 their captures and internal copies in one CUDA graph launch, in graph order.
 The composed graph and its stable bindings stay with the capture slot; ordinary
 external inputs are staged before launch. An unsubmitted refusal runs the
-ordinary head. Currently eligible sections are acyclic, on one CUDA GPU, and
-have disjoint resource owners. Resident/conditional captures, captured row heads,
-streaming edges and torch-generator draws remain execution boundaries. Preparation may structurally pack future inputs
-with real values; arithmetic on future values, mutable model request state,
+ordinary head. Currently eligible sections are acyclic and on one CUDA GPU.
+Shared resources qualify through their own ``connected_refusal`` checks;
+KV, positions and FlashInfer plans retain separate member buffers and project
+prior members' growth before commit. Shared KV forks, retention and prefix-cache
+conversion remain boundaries, as do resident/conditional captures, captured row
+heads, streaming edges and torch-generator draws.
+
+Preparation may structurally pack future inputs with real values; arithmetic
+on future values, mutable model request state, host reads of future positions,
 and uncaptured producer output transformations use ordinary execution. The
 phase trace records ``connected.members#`` and each member's real row count.
 
