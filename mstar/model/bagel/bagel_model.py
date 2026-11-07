@@ -681,6 +681,11 @@ class BagelModel(Model):
 
         Given the tensors, it also returns a ``kv_layout`` for each label the request may open.
         """
+        unsupported = set(input_modalities) - {TEXT, "image"}
+        if unsupported:
+            raise ValueError(f"BAGEL has no encoder for {', '.join(sorted(unsupported))}")
+        if (output_modalities or ["text"])[0] == "text" and not prompt and "image" not in input_modalities:
+            raise ValueError("BAGEL chat requires text or image input")
         params = self._request_params(input_modalities, output_modalities, kwargs)
         if "image" in output_modalities:
             image_output_format(kwargs)  # fail a bad output knob now, not after the denoise

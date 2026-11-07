@@ -760,3 +760,16 @@ def test_a_dropped_guidance_scale_is_always_reported(caplog):
     with caplog.at_level(logging.WARNING):
         model.process_prompt("a cat", ["text"], ["image"])
     assert not [r for r in caplog.records if "guidance_scale" in r.message]
+
+
+def test_truncated_reference_image_is_a_client_error(tmp_path):
+    import io
+    import numpy as np
+    from PIL import Image
+
+    data = io.BytesIO()
+    Image.fromarray(np.random.default_rng(0).integers(0, 256, (64, 64, 3), dtype=np.uint8)).save(data, format="PNG")
+    path = tmp_path / "truncated.png"
+    path.write_bytes(data.getvalue()[:200])
+    with pytest.raises(ValueError, match="image"):
+        _make_model().load_image(str(path), "cpu")

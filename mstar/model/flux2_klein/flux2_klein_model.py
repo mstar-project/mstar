@@ -278,7 +278,10 @@ class Flux2KleinModel(Model):
 
         check_image_size(filepath, formats=PILLOW_IMAGE_FORMATS)
         with Image.open(filepath, formats=PILLOW_IMAGE_FORMATS) as raw:
-            raw.load()
+            try:
+                raw.load()
+            except OSError as exc:
+                raise ValueError("reference image cannot be decoded") from exc
             image = raw
             width, height = image.size
             if width < 64 or height < 64:

@@ -86,3 +86,9 @@ def test_image_outside_position_table_fails_at_intake(width, height):
     with pytest.raises(ValueError, match="position table"):
         model.process_prompt(None, [], ["image"], width=width, height=height)
     model.process_prompt(None, [], ["image"], width=1024, height=1024)
+
+
+@pytest.mark.parametrize("modalities", [[], ["video"], ["audio"]])
+def test_bagel_chat_requires_encodable_input(modalities):
+    with pytest.raises(ValueError, match="input|encoder"):
+        _model().process_prompt(None, modalities, ["text"])
