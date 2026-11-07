@@ -117,39 +117,38 @@ pub fn flatten_messages(
         for part in content {
             let obj = match part.as_object() {
                 Some(o) => o,
-                None => continue,
+                None => return Err("message content parts must be objects".into()),
             };
             let ptype = obj.get("type").and_then(Value::as_str).unwrap_or("");
             match ptype {
                 "text" => {
-                    if let Some(t) = obj.get("text").and_then(Value::as_str) {
-                        if !t.is_empty() {
-                            add_text(&mut parts, t, role);
-                        }
+                    let text = obj.get("text").and_then(Value::as_str)
+                        .ok_or("text content must be a string")?;
+                    if !text.is_empty() {
+                        add_text(&mut parts, text, role);
                     }
                 }
                 "image_url" | "video_url" | "audio_url" => {
                     let url = nested_url(obj, ptype);
-                    if !url.is_empty() {
-                        let fallback = ptype.trim_end_matches("_url");
-                        let (m, p) = media::resolve_media_ref(&url, upload_dir, allow_remote)?;
-                        let m = if m == "unknown" { fallback.to_string() } else { m };
-                        add_file(&mut parts, &mut saved.paths, m, p);
+                    if url.is_empty() {
+                        return Err(format!("{ptype} must contain a non-empty url string"));
                     }
+                    let (m, p) = media::resolve_media_ref(&url, upload_dir, allow_remote)?;
+                    add_file(&mut parts, &mut saved.paths, m, p);
                 }
                 "input_audio" => {
-                    // OpenAI-native audio input: base64 + format.
-                    let ia = obj.get("input_audio").and_then(Value::as_object);
-                    if let Some(ia) = ia {
-                        let data = ia.get("data").and_then(Value::as_str).unwrap_or("");
-                        let fmt = ia.get("format").and_then(Value::as_str).unwrap_or("wav");
-                        if !data.is_empty() {
-                            let (m, p) = media::save_base64(data, fmt, "audio", upload_dir)?;
-                            add_file(&mut parts, &mut saved.paths, m, p);
-                        }
-                    }
+                    let ia = obj.get("input_audio").and_then(Value::as_object)
+                        .ok_or("input_audio must contain base64 data and a format string")?;
+                    let data = ia.get("data").and_then(Value::as_str).filter(|s| !s.is_empty())
+                        .ok_or("input_audio must contain base64 data")?;
+                    let fmt = match ia.get("format") {
+                        None => "wav",
+                        Some(value) => value.as_str().ok_or("input_audio format must be a string")?,
+                    };
+                    let (m, p) = media::save_base64(data, fmt, "audio", upload_dir)?;
+                    add_file(&mut parts, &mut saved.paths, m, p);
                 }
-                _ => {}
+                _ => return Err(format!("unsupported message content type {ptype:?}")),
             }
         }
     }
@@ -1132,4 +1131,23 @@ mod tests {
             "the second image does not address the second upload"
         );
     }
+    #[test]
+    fn malformed_content_parts_are_refused() {
+        let dir = UploadDir::new();
+        std::fs::create_dir_all(&dir.0).unwrap();
+        for part in [
+            serde_json::json!("bare string"),
+            serde_json::json!({"type":"text", "text": 5}),
+            serde_json::json!({"type":"image_url", "image_url":"data:image/png;base64,YQ=="}),
+            serde_json::json!({"type":"image_url", "image_url":{"url":""}}),
+            serde_json::json!({"type":"image_url", "image_url":{"url":"data:text/plain;base64,YQ=="}}),
+            serde_json::json!({"type":"input_audio", "input_audio":{"data":"YQ==", "format":5}}),
+            serde_json::json!({"type":"unknown"}),
+        ] {
+            let messages = serde_json::json!([{"role":"user", "content":[part]}]);
+            assert!(flatten(&messages.to_string(), &dir.0).is_err(), "{messages}");
+        }
+        assert_eq!(std::fs::read_dir(&dir.0).unwrap().count(), 0);
+    }
+
 }

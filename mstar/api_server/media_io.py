@@ -170,6 +170,8 @@ def save_data_url(data_url: str, upload_dir: Path) -> tuple[str, str]:
     if not payload:
         raise ValueError("Malformed data URL: missing payload")
     mime = header[len("data:"):].split(";", 1)[0] or "application/octet-stream"
+    if modality_from_mime(mime) == "unknown":
+        raise ValueError("data URL must contain image, audio or video media")
     raw = _decode_base64_payload(payload)
     return _save_bytes(raw, mime, upload_dir)
 

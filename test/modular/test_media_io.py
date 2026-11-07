@@ -167,3 +167,9 @@ def test_upload_cleanup_uses_the_loop_without_threads(tmp_path, monkeypatch):
         assert not os.path.exists(path)
 
     asyncio.run(run())
+
+
+def test_non_media_data_url_is_refused_without_saving(tmp_path):
+    with pytest.raises(ValueError, match="media"):
+        media_io.save_data_url("data:text/plain;base64,YQ==", tmp_path)
+    assert list(tmp_path.iterdir()) == []

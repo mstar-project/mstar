@@ -117,6 +117,9 @@ fn save_data_url(data_url: &str, upload_dir: &Path) -> Result<(String, String), 
         .next()
         .filter(|s| !s.is_empty())
         .unwrap_or("application/octet-stream");
+    if modality_from_mime(mime) == "unknown" {
+        return Err("data URL must contain image, audio or video media".into());
+    }
     let raw = decode_b64_lenient(payload)
         .map_err(|e| format!("data URL base64 decode failed: {e}"))?;
     save_bytes(&raw, mime, upload_dir).map_err(|e| e.to_string())
