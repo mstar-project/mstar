@@ -156,7 +156,7 @@ class FlashInferManager(AttentionManager):
         lease = ctx.slot_lease
         if lease is None:
             raise ValueError("new attention rows must name their captured addressing")
-        stream = ctx.resident._walk_streams[ctx.graph_walk][self._kv_cache_name]
+        stream = ctx.resident._walk_streams[ctx.graph_walk][self._kv_cache_name][0]
         wrapper = self._cg_plan_states.get(CGSlotKey(bucket=lease.bucket, slot=lease.buffer_slot, label=stream.label))
         if not (isinstance(wrapper, FmhaDecodeWrapper)
                 or isinstance(wrapper, FlashInferDecodeWrapper) and wrapper._resident_pages is not None):
@@ -178,20 +178,22 @@ class FlashInferManager(AttentionManager):
         )
 
     def _resident_refusal(self, key, streams) -> str | None:
+        if any(len(streams.get(owner, ())) > 1 for owner in (key, self._kv_cache_name)):
+            return "resident attention needs one labelled stream per request"
         if self._window_left >= 0:
             return "a sliding window reads pages a resident row no longer holds"
         return None
 
     def _resident_run_gather(self, step: "CapturedResidentStep") -> None:
         # the table's lengths: the last run may have ended short of what the plan assumed
-        stream = step.streams[self._kv_cache_name]
+        stream = step.streams[self._kv_cache_name][0]
         wrapper = self._cg_plan_states.get(CGSlotKey(bucket=step.bucket, slot=step.buffer_slot, label=stream.label))
         if isinstance(wrapper, FlashInferDecodeWrapper) and not stream.reads:
             wrapper.gather_lengths(step.buffers.kv_len[self._kv_cache_name])
 
     def _resident_gather(self, step: "CapturedResidentStep") -> None:
         # planned per label of its KV cache's plan, so its wrapper is under that stream's label
-        pool, stream = self._kv_cache_name, step.streams[self._kv_cache_name]
+        pool, stream = self._kv_cache_name, step.streams[self._kv_cache_name][0]
         wrapper = self._cg_plan_states.get(CGSlotKey(bucket=step.bucket, slot=step.buffer_slot, label=stream.label))
         resident = (isinstance(wrapper, FmhaDecodeWrapper)
                     or isinstance(wrapper, FlashInferDecodeWrapper) and wrapper._resident_pages is not None)

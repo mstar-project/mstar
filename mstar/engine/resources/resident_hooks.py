@@ -53,7 +53,7 @@ class ResidentBinding:
     readers exist; table pins and descriptor credits do not replace that hold.
     """
 
-    check_streams: Callable[[str, Mapping[str, ResidentStream]], str | None]
+    check_streams: Callable[[str, Mapping[str, tuple[ResidentStream, ...]]], str | None]
     bind: Callable[[ResidentPlanner, str], None]
     row: Callable[[int, int, list[int], ResidentWrites], None]
     stage: Callable[[ResidentPlan], None]

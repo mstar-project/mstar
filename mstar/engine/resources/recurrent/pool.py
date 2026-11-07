@@ -1174,12 +1174,14 @@ class RecurrentStatePool(Resource):
             rewind_run=self.rewind_run,
         )
 
-    def _resident_refusal(self, key: str, streams: Mapping[str, "ResidentStream"]) -> str | None:
+    def _resident_refusal(self, key: str, streams: Mapping[str, tuple["ResidentStream", ...]]) -> str | None:
         if self.config.disable_sink_slot:
             return "a pool with no sink slot has nowhere for a padding row"
         if key not in streams:
             return "its step declares it no stream"
-        if streams[key].reads:
+        if len(streams[key]) != 1:
+            return "resident addressing needs one labelled stream per request"
+        if streams[key][0].reads:
             return "a resident step advances its state, not reads it"
         return None
 
@@ -1190,12 +1192,12 @@ class RecurrentStatePool(Resource):
         self._resident_saved = planner.table()
 
     def _resident_row(self, rid: int, slot: int, row: list[int], writes: "ResidentWrites") -> None:
-        held = self._slots[rid][writes.streams[self._resident_key].label]
+        held = self._slots[rid][writes.streams[self._resident_key][0].label]
         row[self._resident_table.col] = held.index
         row[self._resident_saved.col] = int(held.has_state)
 
     def _resident_gather(self, step: "CapturedResidentStep") -> None:
-        stream = step.streams[self._resident_key]
+        stream = step.streams[self._resident_key][0]
         key = CGSlotKey(bucket=step.bucket, slot=step.buffer_slot, label=stream.label)
         table, store, addressing = self._resident_table, self._resident.store, self._cg_addressing[key]
         # a padding row reads the trash row's zero, which is SINK_SLOT

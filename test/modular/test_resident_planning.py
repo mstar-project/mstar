@@ -87,7 +87,7 @@ def _repeats(limit: int, nodes="n") -> StepRepeats:
 def _walk(*keys: str, reads: tuple[str, ...] = ()) -> dict:
     """WALK's streams as its template declares them: each resource on label
     "main", appending a token a row unless it only ``reads``."""
-    return {WALK: {key: resident_mod.ResidentStream("main", key in reads) for key in keys}}
+    return {WALK: {key: (resident_mod.ResidentStream("main", key in reads),) for key in keys}}
 
 
 def _planner(res, max_bs: int, keys=("kv", "pool", "rope")) -> ResidentPlanner:
@@ -860,7 +860,7 @@ def test_a_kv_pool_says_what_keeps_it_off_the_tables(groups, why):
     kv = KVManager.__new__(KVManager)
     kv._groups = [object()] * groups
     kv._needs_remote_transfer = False
-    refusal = kv.resident_binding().check_streams("kv", {"kv": object()})
+    refusal = kv.resident_binding().check_streams("kv", {"kv": (resident_mod.ResidentStream("main", False),)})
     assert refusal is None if why is None else why in refusal
 
 
@@ -1290,18 +1290,31 @@ def test_a_node_that_never_chains_says_why_it_cant_repeat(state, streamed, why):
     assert worker._unchained_refusal("n", WALK) is None
 
 
-def test_a_row_declaring_another_stream_than_its_walk_fails_its_step_not_the_worker():
-    """A resident step, and each replay of one, advances every row on the walk's
-    streams; a row whose declared label differs would be read and written on
-    the wrong stream."""
-    live, _, planner = _setup({1: 3, 2: 3})
-    _captured_step(live, planner, [1], slot=0, bs=2)
-    padded = (1, 2)
-    lease = SlotLease(slot=0, bucket=BucketKey(graph_walk=WALK, bs=2, num_tokens=2))
-    ctx = StepContext(request_ids=padded, graph_walk=WALK, slot=0, capture=False, slot_lease=lease, repeats=4)
-    step = SubmoduleStep(steps={}, segments=[Segment(1, "main", 1), Segment(2, "aux", 1)])
-    with pytest.raises(ValueError, match="row 2 declares 'aux'"):
-        planner.plan(step, ctx)
+@pytest.mark.parametrize("phase", ["fresh", "cached", "staged"])
+@pytest.mark.parametrize("malformed", ["label", "duplicate", "missing", "order", "span"])
+def test_resident_rows_are_certified_before_build_or_promotion(phase, malformed):
+    live, _, planner = _setup({1: 2, 2: 2})
+    _captured_step(live, planner, [1] if phase == "fresh" else [1, 2], slot=0, bs=2)
+    if phase == "staged":
+        _captured_step(live, planner, [1, 2], slot=1, bs=2, preplan=True, run=False)
+    lease = SlotLease(slot=1, bucket=BucketKey(graph_walk=WALK, bs=2, num_tokens=2))
+    ctx = StepContext(request_ids=(1, 2), graph_walk=WALK, slot=1, capture=False, slot_lease=lease, repeats=1)
+    rows = [Segment(1, "main", 1), Segment(2, "main", 1)]
+    if malformed == "label":
+        rows[1] = Segment(2, "aux", 1)
+    elif malformed == "duplicate":
+        rows.append(rows[1])
+    elif malformed == "missing":
+        rows.pop()
+    elif malformed == "order":
+        rows.reverse()
+    else:
+        rows[1] = Segment(2, "main", 0)
+    before = (dict(planner._slot_of), planner._plan_seq, planner._staged)
+    with pytest.raises(ValueError):
+        planner.plan(SubmoduleStep(steps={}, segments=rows), ctx)
+    assert (dict(planner._slot_of), planner._plan_seq, planner._staged) == before
+    assert ctx.resident_plan is None
 
 
 def test_a_row_a_host_step_moved_does_not_rewind_on_each_replay():
@@ -1661,7 +1674,7 @@ def test_the_captured_kernels_match_the_torch_ops():
         step = SimpleNamespace(
             slots=slots, bucket=SimpleNamespace(bs=4), buffers=SimpleNamespace(
                 cells=torch.zeros((2, 8), dtype=torch.long, device=device), kv_len={"kv": out},
-            ), streams={"kv": resident_mod.ResidentStream("main", reads=False)}, block_tables={},
+            ), streams={"kv": (resident_mod.ResidentStream("main", reads=False),)}, block_tables={},
         )
         KVResidentTables.gather(tables, step, pages, offsets)
         return [t.tolist() for t in (store, out, small, pages, offsets)]
@@ -2411,7 +2424,7 @@ def test_a_stream_wider_than_a_row_raises():
     planner = ResidentPlanner("n", _walk("kv"), {"kv": kv}, CPU, max_bs=1)
     tables = kv._resident
     assert tables.block_table.width == 2
-    writes = resident_mod.ResidentWrites({"kv": resident_mod.ResidentStream("main", reads=False)})
+    writes = resident_mod.ResidentWrites({"kv": (resident_mod.ResidentStream("main", reads=False),)})
     with pytest.raises(ValueError, match="fit a block table row"):
         tables.row(9, [1, 2, 3], 1, [0] * planner.narrow_cols, writes)
     plan = SimpleNamespace(
@@ -2948,7 +2961,7 @@ def test_a_context_the_step_only_reads_never_advances():
     slot = planner.slot_of(1)
     assert int(ctx.kv_len.view[slot, 0]) == int(ctx.host_len[slot]) == 7
     assert int(ctx.host_cols[slot]) == 2
-    assert s.captured.streams["ctx"].reads and not s.captured.streams["kv"].reads
+    assert s.captured.streams["ctx"][0].reads and not s.captured.streams["kv"][0].reads
     assert "ctx" in s.captured.block_tables and "kv" in s.captured.block_tables
 
 
@@ -3023,20 +3036,34 @@ def test_a_walk_takes_a_label_for_each_resource():
         segments=rows,
     )
     streams = {key: tuple(s) for key, s in resident_mod.declared_streams(("kv", "ctx", "rope"), step).items()}
-    assert streams == {"kv": ("self", False), "ctx": ("context", True), "rope": ("self", False)}
+    assert streams == {"kv": (("self", False),), "ctx": (("context", True),), "rope": (("self", False),)}
 
 
-def test_a_walk_with_two_labels_on_one_resource_is_refused():
-    rows = [Segment(1, "main", 1)]
-    two = (Segment(1, "main", 1), Segment(1, "aux", 1))
-    step = SubmoduleStep(steps={"kv": KVStep(segments=two), "ctx": KVStep(), "rope": PositionStep()}, segments=rows)
-    assert "resource 'kv' declares 2 segments over labels" in resident_mod.step_refusal(("kv", "ctx", "rope"), step)
-    # a resource with no segments has no stream: the line names the one that refuses
-    bagel = SubmoduleStep(steps={"kv": step.steps["kv"], "sampler": SimpleNamespace(segments=())})
-    assert "resource 'kv' declares" in resident_mod.step_refusal(("sampler", "kv"), bagel)
-    mixed = (Segment(1, "main", 1), Segment(2, "main", 0))
-    step = SubmoduleStep(steps={"kv": KVStep(), "ctx": KVStep(segments=mixed), "rope": PositionStep()}, segments=rows)
-    assert "resource 'ctx'" in resident_mod.step_refusal(("kv", "ctx", "rope"), step)
+def test_labelled_streams_are_declared_but_unmigrated_owners_refuse_them():
+    rows = [Segment(1, "main", 1), Segment(2, "main", 1)]
+    two = (*rows, Segment(1, "aux", 0), Segment(2, "aux", 0))
+    step = SubmoduleStep(steps={"kv": KVStep(segments=two), "rope": PositionStep()}, segments=rows)
+    assert resident_mod.step_refusal(("kv", "rope"), step) is None
+    assert resident_mod.declared_streams(("kv", "rope"), step) == {
+        "kv": (resident_mod.ResidentStream("main", False), resident_mod.ResidentStream("aux", True)),
+        "rope": (resident_mod.ResidentStream("main", False),),
+    }
+    res = _resources()
+    planner, why = _build({"kv": res["kv"]}, step=step)
+    assert planner is None and "one labelled stream" in why
+    # The generic declaration does not choose KV's combined-plan ordering.
+    step.steps["kv"] = replace(step.steps["kv"], combined_labels={("aux", "main"): "combined"})
+    assert resident_mod.declared_streams(("kv",), step)["kv"] == (
+        resident_mod.ResidentStream("main", False), resident_mod.ResidentStream("aux", True),
+    )
+    for auxiliary in (
+        (Segment(1, "aux", 0),),
+        (Segment(2, "aux", 0), Segment(1, "aux", 0)),
+        (Segment(1, "aux", 0), Segment(1, "aux", 0)),
+        (Segment(1, "aux", 0), Segment(2, "aux", 1)),
+    ):
+        step.steps["kv"] = KVStep(segments=(*rows, *auxiliary))
+        assert resident_mod.step_refusal(("kv", "rope"), step) is not None
 
 
 def test_a_bucket_that_declares_other_streams_than_its_walk_stops_the_worker():
@@ -3307,6 +3334,7 @@ def test_flashinfer_refuses_a_sliding_window():
 
     manager = FlashInferManager.__new__(FlashInferManager)
     manager._window_left = 5
+    manager._kv_cache_name = "kv"
     assert "sliding window" in manager.resident_binding().check_streams("attn", {})
     manager._window_left = -1
     assert manager.resident_binding().check_streams("attn", {}) is None
@@ -3329,7 +3357,7 @@ def test_a_walk_declaring_forks_or_a_sink_is_refused_at_load(field, value):
 def test_a_walk_that_isnt_one_token_a_row_in_one_stream_is_refused_at_load(segments):
     res = _resources()
     planner, why = _build({"kv": res["kv"]}, step=SubmoduleStep(steps={}, segments=segments))
-    assert planner is None and "not one token a row" in why
+    assert planner is None and ("not one token a row" in why or "one labelled stream" in why)
 
 
 # ---- the engine ----

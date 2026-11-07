@@ -172,7 +172,7 @@ def test_joining_cross_attention_uses_its_context_owner_and_exact_query_capture(
         SequenceView(request_id=rid, label="query", page_idxs=[55], length=4, to_compute=1) for rid in rids
     ])}
     ctx = _ctx(rids, query)
-    streams = {CTX_KV: ResidentStream(CONTEXT, True), Q_KV: ResidentStream("query", False)}
+    streams = {CTX_KV: (ResidentStream(CONTEXT, True),), Q_KV: (ResidentStream("query", False),)}
     ctx.resident = SimpleNamespace(_walk_streams={"decode": streams})
     # Whisper declares context segments on attention, while its query cache
     # supplies query geometry. Cacheless attention declares the query itself.

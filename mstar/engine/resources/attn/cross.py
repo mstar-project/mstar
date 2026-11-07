@@ -172,6 +172,9 @@ class FlashInferCrossManager(CrossAttentionManager):
         )
 
     def _resident_refusal(self, key, streams) -> str | None:
+        if any(len(streams.get(owner, ())) > 1
+               for owner in (key, self._kv_cache_name, self._query_kv_cache_name)):
+            return "resident cross attention needs one labelled stream per request"
         if self._query_kv_cache_name == self._kv_cache_name:
             return "a context in the query's own pool would be a second stream on one resident row"
         return None
@@ -190,10 +193,12 @@ class FlashInferCrossManager(CrossAttentionManager):
         step.reads_tables = True
 
     def _resident_wrapper(self, bucket, buffer_slot, streams) -> FlashInferDecodeWrapper | None:
-        context = streams.get(self._kv_cache_name)
+        context = streams.get(self._kv_cache_name, ())
+        context = context[0] if len(context) == 1 else None
         if context is None or context.label != self._context_label or not context.reads:
             return None
-        query = streams.get(self._query_kv_cache_name)
+        query = streams.get(self._query_kv_cache_name, ())
+        query = query[0] if len(query) == 1 else None
         if self._query_kv_cache_name is not None and (query is None or query.reads):
             return None
         matches = [wrapper for key, wrapper in self._cg_plan_states.items()

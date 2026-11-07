@@ -58,7 +58,7 @@ class KVResidentTables:
             raise ValueError(f"{len(pages)} pages of a stream don't fit a block table row of {self.block_table.width}")
         page = self.page_size
         # a stream that appends holds the pages its next tokens go to, too
-        reads = writes.streams[self.key].reads
+        reads = writes.streams[self.key][0].reads
         cols = -(-stored_len // page) if reads else (stored_len + writes.repeats - 1) // page + 1
         row[self.kv_len.col] = stored_len
         writes.kv_len[self.key] = stored_len
@@ -83,7 +83,7 @@ class KVResidentTables:
         A stream the step only reads moves only under a host-planned step, so
         just the rows one moved are compared, and one that changed is
         rewritten whole."""
-        if plan.writes.streams[self.key].reads:
+        if plan.writes.streams[self.key][0].reads:
             slot_of = self.planner.slot_of
             for rid in plan.moved:
                 slot = slot_of(rid)
@@ -109,7 +109,7 @@ class KVResidentTables:
         plan.crossed[self.key] = (rows, need[rows])
 
     def advance(self, plan: ResidentPlan) -> None:
-        if plan.writes.streams[self.key].reads:
+        if plan.writes.streams[self.key][0].reads:
             return
         self.host_len[plan.slots] += plan.writes.repeats
         crossed = plan.crossed.get(self.key)
@@ -133,7 +133,7 @@ class KVResidentTables:
         step.block_tables[self.key] = table
         kv_len = step.buffers.kv_len[self.key]
         gather_column(store, step.slots, stride, self.kv_len.col, kv_len)
-        if step.streams[self.key].reads:
+        if step.streams[self.key][0].reads:
             return
         if store.is_cuda:
             _gather_write_slots_kernel[(step.bucket.bs,)](
@@ -147,5 +147,5 @@ class KVResidentTables:
         token_to_cache[:bs].copy_(kv_len - col * page_size)
 
     def commit(self, step: CapturedResidentStep) -> None:
-        if not step.streams[self.key].reads:
+        if not step.streams[self.key][0].reads:
             advance_column(self.planner.store, step.slots, self.kv_len.stride, self.kv_len.col)

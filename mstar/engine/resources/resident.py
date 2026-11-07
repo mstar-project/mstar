@@ -202,8 +202,7 @@ class ResidentTable:
 
 
 class ResidentStream(NamedTuple):
-    """One resource's stream on a resident walk's steps, fixed at load by the
-    step its capture template declares."""
+    """One labelled state stream declared by a resident capture template."""
 
     label: str
     # declared at span 0: the step reads the stream and appends nothing
@@ -218,7 +217,7 @@ class ResidentWrites:
 
     __slots__ = ("streams", "rows", "cells", "values", "kv_len", "repeats")
 
-    def __init__(self, streams: Mapping[str, ResidentStream], repeats: int = 1):
+    def __init__(self, streams: Mapping[str, tuple[ResidentStream, ...]], repeats: int = 1):
         self.repeats = repeats
         self.streams = streams
         self.rows: list[tuple[int, int, list[int]]] = []
@@ -288,7 +287,7 @@ class CapturedResidentStep:
     buffers: ResidentBuffers
     store: torch.Tensor
     # each resource's stream, by resource key
-    streams: Mapping[str, ResidentStream]
+    streams: Mapping[str, tuple[ResidentStream, ...]]
     # each KV pool's block table, by resource key, for attention that reads a row's pages itself
     block_tables: dict[str, ResidentTable] = field(default_factory=dict)
     # How each attention read its pages: off the tables alone, or through a
@@ -318,7 +317,8 @@ class ResidentPlanner:
     """
 
     def __init__(
-        self, node: str, walks: Mapping[str, Mapping[str, ResidentStream]], resources: Mapping[str, Resource],
+        self, node: str, walks: Mapping[str, Mapping[str, tuple[ResidentStream, ...]]],
+        resources: Mapping[str, Resource],
         device: torch.device, max_bs: int, *, bindings: Mapping[str, ResidentBinding] | None = None,
     ):
         self.node = node
@@ -344,7 +344,7 @@ class ResidentPlanner:
         self.narrow_cols = 0
         self._buffers: dict[tuple[BucketKey, int], ResidentBuffers] = {}
         # each resource's stream on a bucket's steps, by bucket then resource key, from its capture
-        self._streams: dict[BucketKey, Mapping[str, ResidentStream]] = {}
+        self._streams: dict[BucketKey, Mapping[str, tuple[ResidentStream, ...]]] = {}
         # buckets whose steps need no host plan at all
         self.host_plan_free: set[BucketKey] = set()
 
@@ -558,6 +558,8 @@ class ResidentPlanner:
         lease = ctx.slot_lease
         rids = tuple(ctx.request_ids)
         key = (rids, lease.bucket, lease.slot)
+        if (refusal := _row_refusal(step, self._streams[lease.bucket], rids)) is not None:
+            raise ValueError(f"resident walk {ctx.graph_walk!r} on {self.node}: {refusal}")
         staged = self._staged
         if staged is not None:
             self._staged = None
@@ -566,7 +568,7 @@ class ResidentPlanner:
                 return
             # the step it was for never ran, or something ran first
             self._restore(staged)
-        plan = self._build(rids, key, self._streams[lease.bucket], step, ctx)
+        plan = self._build(rids, key, self._streams[lease.bucket], ctx)
         ctx.resident_plan = plan
         if ctx.is_preplan:
             self._staged = plan
@@ -579,11 +581,7 @@ class ResidentPlanner:
             raise ValueError(f"walk {ctx.graph_walk!r} has no resident binding on {self.node}")
         if not rids or len(set(rids)) != len(rids) or any(rid < 0 for rid in rids):
             raise ValueError("resident row publication needs distinct real requests")
-        for key in streams:
-            actual = tuple(segment.request_id for segment in _segments(key, step) if segment.request_id >= 0)
-            if actual != rids:
-                raise ValueError(f"resident row publication needs one ordered segment per request on {key!r}")
-        if (refusal := _row_refusal(step, streams, set(rids))) is not None:
+        if (refusal := _row_refusal(step, streams, rids)) is not None:
             raise ValueError(f"resident walk {ctx.graph_walk!r} on {self.node}: {refusal}")
 
     def prepare_rows(self, step: SubmoduleStep, ctx) -> ResidentPlan:
@@ -656,7 +654,7 @@ class ResidentPlanner:
             buffers.staged = None
 
     def _build(
-        self, rids: tuple[int, ...], key: tuple, streams: Mapping[str, ResidentStream], step: SubmoduleStep, ctx,
+        self, rids: tuple[int, ...], key: tuple, streams: Mapping[str, tuple[ResidentStream, ...]], ctx,
     ) -> ResidentPlan:
         lease = ctx.slot_lease
         laps = PhaseLaps(f"{ctx.plan_phase}.resident.")
@@ -686,9 +684,6 @@ class ResidentPlanner:
             refreshed -= taken
             self._last_read[slots] = seq
             rows = [(rid, self._slot_of[rid]) for rid in taken]
-        if taken and (refusal := _row_refusal(step, streams, taken)) is not None:
-            # the tables advance each row on its walk's streams, every replay; the step's rows fail
-            raise ValueError(f"resident walk {ctx.graph_walk!r} on {self.node}: {refusal}")
         plan = ResidentPlan(
             key, rids, slots, seq, self._commits, ResidentWrites(streams, ctx.repeats), taken, refreshed,
         )
@@ -824,8 +819,8 @@ _UNCARRIED = ("pre_forks", "post_forks", "retention", "sink", "advance", "pos_id
 
 def step_refusal(keys: Collection[str], step: SubmoduleStep | None) -> str | None:
     """Why ``step`` can't be a resident step, or None: for each resource of
-    ``keys``, one stream that it appends one token a row to (span 1) or only
-    reads (span 0), each row advancing alone."""
+    ``keys``, labelled streams that append one token per row (span 1) or
+    only read (span 0), in the same logical request order."""
     if step is None:
         return "it declares no step"
     for key, resource_step in step.steps.items():
@@ -840,42 +835,51 @@ def step_refusal(keys: Collection[str], step: SubmoduleStep | None) -> str | Non
     for key in keys:
         segments = _segments(key, step)
         if not segments:
-            continue  # a resource with no segments has no stream to refuse
-        labels = {seg.label for seg in segments}
-        spans = {seg.span for seg in segments}
-        if len(labels) != 1 or spans not in ({1}, {0}):
-            return (
-                f"resource {key!r} declares {len(segments)} segments over labels {sorted(labels)} and spans "
-                f"{sorted(spans)}, not one token a row in one stream or a stream it only reads"
-            )
+            continue
+        rows = {}
+        spans = {}
+        for seg in segments:
+            rows.setdefault(seg.label, []).append(seg.request_id)
+            spans.setdefault(seg.label, set()).add(seg.span)
+        expected = next(iter(rows.values()))
+        for label, actual in rows.items():
+            if len(set(actual)) != len(actual) or actual != expected:
+                return f"resource {key!r} needs one ordered segment per request on each labelled stream"
+            if spans[label] not in ({1}, {0}):
+                return f"resource {key!r} is not one token a row or a read-only stream on {label!r}"
     return None
 
 
-def declared_streams(keys: Collection[str], step: SubmoduleStep) -> dict[str, ResidentStream]:
-    """Each resource's stream on a step that passed `step_refusal`: the label
-    of its own segments, or of the step's when it names none. A resource with
-    neither has no stream."""
+def declared_streams(keys: Collection[str], step: SubmoduleStep) -> dict[str, tuple[ResidentStream, ...]]:
+    """Source streams in declaration order, independent of KV plan packing."""
     streams = {}
     for key in keys:
         segments = _segments(key, step)
         if segments:
-            streams[key] = ResidentStream(segments[0].label, reads=segments[0].span == 0)
+            streams[key] = tuple(dict.fromkeys(ResidentStream(seg.label, seg.span == 0) for seg in segments))
     return streams
 
 
 def _row_refusal(
-    step: SubmoduleStep, streams: Mapping[str, ResidentStream], rids: Collection[int],
+    step: SubmoduleStep, streams: Mapping[str, tuple[ResidentStream, ...]], rids: Collection[int],
 ) -> str | None:
-    """Why a row of ``rids`` in ``step`` declares other than its walk's
-    ``streams``. Asked of the rows a step writes whole, which every row is once."""
+    """Require each declared source stream to address these logical rows once."""
+    rids = tuple(rids)
+    if len(set(rids)) != len(rids):
+        return "resident rows need distinct logical requests"
     for key, want in streams.items():
-        span = 0 if want.reads else 1
+        rows = {stream.label: [] for stream in want}
+        spans = {stream.label: 0 if stream.reads else 1 for stream in want}
         for seg in _segments(key, step):
-            if seg.request_id in rids and (seg.label != want.label or seg.span != span):
-                return (
-                    f"row {seg.request_id} declares {seg.label!r} at span {seg.span} on resource {key!r}, "
-                    f"not its walk's {want.label!r} at span {span}"
-                )
+            # Ordinary captures also declare padding, whose state is not held by
+            # the request planner. Capture templates include it in their rids.
+            if seg.request_id < 0 and seg.request_id not in rids:
+                continue
+            if seg.label not in rows or seg.span != spans[seg.label]:
+                return f"row {seg.request_id} declares {seg.label!r} at span {seg.span} outside its walk's streams"
+            rows[seg.label].append(seg.request_id)
+        if any(tuple(actual) != rids for actual in rows.values()):
+            return f"resource {key!r} needs one ordered segment per request on each labelled stream"
     return None
 
 
@@ -912,7 +916,7 @@ def build_planner(
     if refusal is not None:
         return None, dict.fromkeys(steps, refusal)
     refusals: dict[str, str] = {}
-    walks: dict[str, dict[str, ResidentStream]] = {}
+    walks: dict[str, dict[str, tuple[ResidentStream, ...]]] = {}
     for walk, step in steps.items():
         refusal = step_refusal(resources, step)
         if refusal is not None:

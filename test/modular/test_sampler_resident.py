@@ -130,7 +130,7 @@ class _Node:
         self.sampler.build_accelerator_graph_buffers(
             [SimpleNamespace(slot=0), SimpleNamespace(slot=1)], max_bs=max_bs, max_seq_len=1,
         )
-        walk = {WALK: {key: ResidentStream("main", reads=False) for key in resources}}
+        walk = {WALK: {key: (ResidentStream("main", reads=False),) for key in resources}}
         self.planner = ResidentPlanner("n", walk, resources, CPU, max_bs=max_bs) if planner else None
         self.bufs = self.sampler._cg_buffers
         self.captured: dict = {}

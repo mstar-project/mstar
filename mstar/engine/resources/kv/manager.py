@@ -4837,6 +4837,8 @@ class KVManager(AttentionResource):
     def _resident_refusal(self, key, streams) -> str | None:
         if key not in streams:
             return "its step declares it no stream"
+        if len(streams[key]) != 1:
+            return "resident addressing needs one labelled stream per request"
         if len(self._groups) > 1:
             # a table per group would hold the pages; what's missing is the release: a group frees its
             # front pages at commit, a step behind the device, so a planned step's row would point at them
@@ -4856,7 +4858,7 @@ class KVManager(AttentionResource):
 
     def _resident_row(self, rid: int, slot: int, row: list[int], writes: "ResidentWrites") -> None:
         tables = self._resident
-        label = writes.streams[tables.key].label
+        label = writes.streams[tables.key][0].label
         stream = self._streams[rid][label]
         if stream.released:
             raise ValueError(
@@ -4867,7 +4869,7 @@ class KVManager(AttentionResource):
 
     def _resident_stage(self, plan: "ResidentPlan") -> None:
         tables, streams = self._resident, self._streams
-        stream = plan.writes.streams[tables.key]
+        stream = plan.writes.streams[tables.key][0]
         label, planner = stream.label, tables.planner
         if not stream.reads:
             for rid in plan.moved:
@@ -4883,7 +4885,7 @@ class KVManager(AttentionResource):
 
     def _resident_gather(self, step: "CapturedResidentStep") -> None:
         tables = self._resident
-        stream = step.streams[tables.key]
+        stream = step.streams[tables.key][0]
         if stream.reads:
             tables.gather(step, None, None)
             return

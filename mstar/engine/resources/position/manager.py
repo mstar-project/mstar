@@ -443,12 +443,14 @@ class RopeManager(PositionManager):
             rewind_run=self.rewind_run,
         )
 
-    def _resident_refusal(self, key: str, streams: Mapping[str, "ResidentStream"]) -> str | None:
+    def _resident_refusal(self, key: str, streams: Mapping[str, tuple["ResidentStream", ...]]) -> str | None:
         if self._config.scheme != PosScheme.SEQUENTIAL:
             return f"position scheme {self._config.scheme} doesn't advance with the stream"
         if key not in streams or self._kv_cache_name not in streams:
             return "its step declares it no stream"
-        own, pool = streams[key], streams[self._kv_cache_name]
+        if len(streams[key]) != 1 or len(streams[self._kv_cache_name]) != 1:
+            return "resident positions need one labelled stream per request"
+        own, pool = streams[key][0], streams[self._kv_cache_name][0]
         if own.label != pool.label or own.reads or pool.reads:
             # the offset holds only while both advance a token a step, as one stream
             return (
@@ -464,11 +466,11 @@ class RopeManager(PositionManager):
 
     def _resident_row(self, rid: int, slot: int, row: list[int], writes: "ResidentWrites") -> None:
         # the KV pool binds ahead of this, its dependent, and sets its length first
-        label = writes.streams[self._resident_key].label
+        label = writes.streams[self._resident_key][0].label
         row[self._resident_delta.col] = self.position(rid, label) - writes.kv_len[self._kv_cache_name]
 
     def _resident_gather(self, step: "CapturedResidentStep") -> None:
-        own = step.streams[self._resident_key]
+        own = step.streams[self._resident_key][0]
         key = CGSlotKey(bucket=step.bucket, slot=step.buffer_slot, label=own.label)
         table = self._resident_delta
         gather_column(
