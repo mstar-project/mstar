@@ -21,7 +21,38 @@ THINKER, TALKER, THINKER_TP2 = (128, 2048, 768, 8), (128, 1024, 384, 6), (128, 2
 
 @pytest.fixture
 def nvidia(monkeypatch):
+    """An NVIDIA GPU whose tables have no entry for the shape: the default threshold."""
     monkeypatch.setattr(current_platform, "is_cuda", lambda: True)
+    monkeypatch.setattr(decode, "routed_fp8_max_tokens", lambda device, shape: decode.ROUTED_FP8_MAX_TOKENS)
+
+
+@pytest.fixture
+def h200(monkeypatch):
+    """Lookups as on an H200, from the package's tables."""
+    from mstar.kernels import DeviceKey, registry
+
+    monkeypatch.setattr(registry, "_device", lambda device: CUDA)
+    monkeypatch.setattr(registry, "device_key", lambda device: DeviceKey("NVIDIA H200", "sm_90"))
+    monkeypatch.setattr(torch.cuda, "get_device_name", lambda device=None: "NVIDIA H200")
+    registry.reset_lookups()
+    decode._tuning.cache_clear()
+    yield
+    registry.reset_lookups()
+    decode._tuning.cache_clear()
+
+
+def test_the_h200_table_sets_each_omni_shapes_threshold_and_tiles(h200):
+    """The swept H200 entries: the Thinker per-pair to 7 tokens, the Talker to 16, each count on its swept
+    tiles; a shape without an entry keeps ROUTED_FP8_MAX_TOKENS and the built-in tiles."""
+    thinker, talker = (THINKER[1], *THINKER[:1], *THINKER[2:]), (TALKER[1], *TALKER[:1], *TALKER[2:])
+    assert decode.routed_fp8_max_tokens(CUDA, thinker) == 7
+    assert decode.routed_fp8_max_tokens(CUDA, talker) == 16
+    assert decode.routed_fp8_max_tokens(CUDA, (2048, 128, 384, 8)) == decode.ROUTED_FP8_MAX_TOKENS  # TP2
+    gate_up, down = decode._tiles(1, decode._tuning(CUDA, thinker))
+    assert (gate_up["bj"], gate_up["bk"], gate_up["warps"], down["bn"], down["bc"]) == (16, 256, 8, 16, 128)
+    gate_up, down = decode._tiles(16, decode._tuning(CUDA, talker))
+    assert (gate_up["bj"], gate_up["bk"], down["bn"], down["bc"], down["warps"]) == (8, 1024, 64, 256, 4)
+    assert decode._tuning(CUDA, (2048, 128, 384, 8)) is decode._H200
 
 
 def _w1(e, h, i):

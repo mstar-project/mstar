@@ -284,16 +284,17 @@ def fused_experts_fp8(
 
 def per_pair_fp8(num_tokens: int, device: torch.device, w1_shape, top_k: int, block_size, skip_invalid: bool) -> bool:
     """Whether :func:`experts_fp8` runs this call as per-pair GEMVs (``decode.routed_experts_fp8``): up to
-    ``decode.ROUTED_FP8_MAX_TOKENS`` tokens on an NVIDIA GPU, every slot a real expert, and whole scale blocks
+    ``decode.routed_fp8_max_tokens`` tokens on an NVIDIA GPU, every slot a real expert, and whole scale blocks
     (``decode.routed_fp8_fits``). ROCm keeps the grouped runner, as ``runs_per_pair`` does for bf16."""
     if skip_invalid or device.type != "cuda" or not current_platform.is_cuda():
         return False
     # imported here: it needs triton's CUDA extras, which CPU hosts may lack
     from mstar.utils.fused_moe import decode
 
-    _, two_inter, hidden = w1_shape
-    return num_tokens <= decode.ROUTED_FP8_MAX_TOKENS and decode.routed_fp8_fits(hidden, two_inter // 2,
-                                                                                  tuple(block_size))
+    experts, two_inter, hidden = w1_shape
+    if not decode.routed_fp8_fits(hidden, two_inter // 2, tuple(block_size)):
+        return False
+    return num_tokens <= decode.routed_fp8_max_tokens(device, (hidden, experts, two_inter // 2, top_k))
 
 
 def experts_fp8(

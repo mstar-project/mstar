@@ -88,10 +88,10 @@ def routed_fits(H, I):
             and all(H % t["bn"] == 0 and I % t["bc"] == 0 for _, t in _UNSCALED.down))
 
 
-# ``routed_experts_fp8``: block-fp8 experts, no shared expert, up to this many tokens (``runner.experts_fp8``);
-# above it the grouped W8A8 runner. For now the bf16 per-pair crossover at Qwen3-Omni's Thinker shapes
-# (benchmark/quantization/bench_experts.py times the fp8 one).
-ROUTED_FP8_MAX_TOKENS = ROUTED_MAX_TOKENS
+# ``routed_experts_fp8``: block-fp8 experts, no shared expert, up to this many tokens (``runner.experts_fp8``)
+# where no ``moe_decode`` entry has the shape; above it the grouped W8A8 runner. The crossover at Qwen3-Omni's
+# Thinker shape on an H200 (benchmark/quantization/bench_experts.py: a tie at 8 tokens, grouped ahead from 12).
+ROUTED_FP8_MAX_TOKENS = 7
 
 
 def routed_fp8_fits(H, I, block_size) -> bool:
@@ -99,6 +99,14 @@ def routed_fp8_fits(H, I, block_size) -> bool:
     ``block_size`` scale blocks: power-of-two blocks, whole ones per gate / up half and along H."""
     bo, bi = block_size
     return I % bo == 0 and H % bi == 0 and bo & (bo - 1) == 0 and bi & (bi - 1) == 0
+
+
+def routed_fp8_max_tokens(device, shape) -> int:
+    """Up to how many tokens ``routed_experts_fp8`` runs experts of ``shape`` (H, E, I, K) on this GPU: the
+    last per-pair row of a ``moe_decode`` entry for the shape (rows swept against the grouped runner, which
+    its ``"*"`` row names), else ``ROUTED_FP8_MAX_TOKENS``."""
+    entry = MOE_DECODE.lookup(torch.float8_e4m3fn, dict(zip("HEIK", shape, strict=True)), device)
+    return ROUTED_FP8_MAX_TOKENS if entry is None else _tuning(device, tuple(shape)).pair_max_tokens
 
 
 def _fit(tile, dim):
