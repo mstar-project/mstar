@@ -803,7 +803,8 @@ class TalkerSubmodule(ARNodeSubmodule):
             )
         if "layer0_codes" not in outputs and "codec_tokens" in outputs:
             codec_tokens = outputs["codec_tokens"][-1]
-            outputs["layer0_codes"] = [codec_tokens.reshape(-1)[0]]
+            layer0 = codec_tokens[..., 0]
+            outputs["layer0_codes"] = [layer0 if codec_tokens.ndim > 2 else layer0.reshape(-1)[0]]
 
     def can_batch(self, batch: ExecutingBatch, model_inputs: list[NodeInputs]) -> bool:
         """Admit compatible prefill/decode requests to continuous batching.

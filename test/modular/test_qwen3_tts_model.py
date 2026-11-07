@@ -2590,22 +2590,26 @@ def test_a_talker_run_of_four_frames_equals_four_one_frame_steps():
     assert torch.equal(columns["codec_tokens"], torch.stack(steps, dim=1))
 
 
-@pytest.mark.parametrize("walk,with_stop", [("talker_decode", True), ("talker_decode", False),
-                                            ("talker_prefill_clone", True)])
-def test_talker_direct_output_survives_ordinary_engine_collection(walk, with_stop):
+@pytest.mark.parametrize("walk,with_stop,width", [("talker_decode", True, 1), ("talker_decode", False, 1),
+                                                  ("talker_decode", True, 4), ("talker_decode", False, 4),
+                                                  ("talker_prefill_clone", True, 1)])
+def test_talker_direct_output_survives_ordinary_engine_collection(walk, with_stop, width):
     from mstar.engine.engine import Engine
     from mstar.model.submodule_base import BatchedModelOutput, NodeInputs
 
     config = _tiny_model_config()
     node = TalkerSubmodule(Qwen3TTSTalkerModel(config), _code_predictor(config), config)
     rids = [1, 2]
-    codec = torch.arange(8).view(2, 4)
+    codec = torch.arange(8 * width).view(2, width, 4)
+    if width == 1:
+        codec = codec[:, 0]
     engine = Engine.__new__(Engine)
-    mgmt = SimpleNamespace(submodule=node, piecewise_runners={})
+    columns = frozenset({"codec_tokens", "layer0_codes"})
+    mgmt = SimpleNamespace(submodule=node, piecewise_runners={}, run_columns={walk: columns}, carries={})
     engine._submodules = {"Talker": mgmt}
     frame = {"codec_tokens": codec, "talker_input_embeds": torch.zeros(2, 16)}
     if with_stop:
-        frame["layer0_codes"] = codec[:, 0]
+        frame["layer0_codes"] = codec[..., 0]
     for rid in rids:
         node.request_state(rid).add_all(reference_frames=torch.full((3, 4), 77))
     infos = {rid: SimpleNamespace(graph_walk=walk) for rid in rids}
@@ -2614,9 +2618,9 @@ def test_talker_direct_output_survives_ordinary_engine_collection(walk, with_sto
         mgmt, None, BatchedModelOutput(row_outputs=frame), inputs, infos, rids, tuple(rids), walk,
     )
     failures = {}
-    batch = SimpleNamespace(node_name="Talker", request_ids=rids, inputs=inputs,
+    batch = SimpleNamespace(node_name="Talker", graph_walk=walk, request_ids=rids, inputs=inputs,
                             per_request_info_wrapped=infos, failed_requests=failures,
-                            register_failure=failures.__setitem__, step_context=SimpleNamespace(repeats=1))
+                            register_failure=failures.__setitem__, step_context=SimpleNamespace(repeats=width))
     engine._postprocess_batch(batch, collected)
     assert not failures
     for i, rid in enumerate(rids):
@@ -2624,3 +2628,8 @@ def test_talker_direct_output_survives_ordinary_engine_collection(walk, with_sto
         unchanged = len(items) == 1 and torch.equal(items[0], codec[i:i + 1])
         assert unchanged == ("codec_tokens" in node.DIRECT_OUTPUTS.get(walk, ()))
         assert unchanged == (walk == "talker_decode")
+        if walk == "talker_decode":
+            expected = codec[i:i + 1, ..., 0]
+            if not with_stop and width == 1:
+                expected = expected.reshape(())  # preserve the ordinary scalar fallback
+            torch.testing.assert_close(collected.get(rid)["layer0_codes"][0], expected)

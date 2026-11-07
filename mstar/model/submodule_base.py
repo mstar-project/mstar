@@ -906,9 +906,11 @@ class NodeSubmodule(torch.nn.Module, ABC):
     # captured row_outputs, before stop withholding. A consumer may prepare,
     # plan, compute and collect without producer-tail effects; the producer
     # tail must not need the consumer's pre-compute state. This is an author
-    # contract, not a Python-purity inference. Initially checked only for a
-    # streamed producer requesting one compute, with disjoint resource owners
-    # and no custom filter, unpack or batch tail.
+    # contract, not a Python-purity inference. For an ordinary repeated step,
+    # each declared per-replay column must likewise survive its normal tail.
+    # Repeats still need the ordinary owner checks; this declares no repeat
+    # capability. Streamed producers need disjoint resource owners and no
+    # custom filter, unpack or batch tail.
     DIRECT_OUTPUTS: Mapping[str, frozenset[str]] = MappingProxyType({})
 
     # Set True where this node's looping walks run on resident tables when the

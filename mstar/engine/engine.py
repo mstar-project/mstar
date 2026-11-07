@@ -2666,11 +2666,8 @@ class Engine:
                         guard.refuse("a producer changes its routed outputs outside capture")
                     if kind.postprocess is not NodeSubmodule.postprocess:
                         signals = {signal for a, _, signal in group.unit.edges if a == maker}
-                        requested = next(batch.step_context.repeats for _, batch in group.members
-                                         if batch.node_name == maker)
-                        if (not streamed or requested != 1
-                                or not signals <= producer.DIRECT_OUTPUTS.get(walk, frozenset())):
-                            guard.refuse("a custom producer needs declared direct outputs and one compute")
+                        if not streamed or not signals <= producer.DIRECT_OUTPUTS.get(walk, frozenset()):
+                            guard.refuse("a custom producer needs declared direct outputs")
                         direct_producers.add(maker)
                 for member, (_, batch) in enumerate(group.members):
                     if finished[batch.node_name] or batch.node_name in idle_sources:
@@ -2771,9 +2768,8 @@ class Engine:
                     if streamed:
                         if (slot.run is None or slot.run.state.membership is not None or lease.bucket.bs != 1):
                             guard.refuse("streamed composition needs captured fixed-membership one-row bodies")
-                        if self._custom_output_tail(submodule) and (
-                            (not stream_incoming and batch.node_name not in direct_producers)
-                            or batch.step_context.repeats != 1
+                        if self._custom_output_tail(submodule) and batch.node_name not in direct_producers and (
+                            not stream_incoming or batch.step_context.repeats != 1
                         ):
                             guard.refuse("a custom streamed tail needs one consumer compute and no producer transform")
                     elif slot.run is not None or batch.step_context.resident is not None:
@@ -3105,28 +3101,41 @@ class Engine:
         raw, reserved = batch.outputs, batch.step_context.repeats
         if RUN_REPLAYS not in (raw.check_stop_buffers or {}):
             raise ValueError("independent member collection needs uncollected run outputs")
-        self.settle_run(batch, width, counts)
-        if batch.step is None:
-            batch.step_context.run_counts = MappingProxyType(dict(counts))
+        mgmt, lease = self._submodules[batch.node_name], batch.step_context.slot_lease
+        custom = self._custom_output_tail(mgmt.submodule)
+        empty = width == 0 or all(rid in batch.failed_requests for rid in batch.request_ids)
+        # A producing member owns the internal output ring. Its tail sees the
+        # ordinary standalone representation: requested-one has no iteration
+        # axis; requested-N keeps N columns (last-valid padding included), even
+        # when fewer ran. The worker later routes only actual kept columns.
+        producer_repeat = custom and bool(batch.ring_bases) and reserved > 1 and not empty
+
+        def settle():
+            self.settle_run(batch, width, counts)
+            if batch.step is None:
+                batch.step_context.run_counts = MappingProxyType(dict(counts))
+            batch.publish_snapshots = self._runner.publish_snapshot(
+                batch.request_ids, node_name=batch.node_name,
+                graph_walk=batch.graph_walk, request_walks=batch.step_context.request_walks,
+            )
+
+        if not producer_repeat:
+            settle()
         semantic = {name: value for name, value in raw.check_stop_buffers.items()
                     if name in (STREAM_COUNTS, STREAM_TRANSITION)}
-        batch.publish_snapshots = self._runner.publish_snapshot(
-            batch.request_ids, node_name=batch.node_name,
-            graph_walk=batch.graph_walk, request_walks=batch.step_context.request_walks,
-        )
-        if width == 0 or all(rid in batch.failed_requests for rid in batch.request_ids):
+        if empty:
             batch.outputs = BatchedModelOutput(check_stop_buffers=semantic, row_request_ids=tuple(batch.request_ids))
             return batch.outputs
-        mgmt, lease = self._submodules[batch.node_name], batch.step_context.slot_lease
-        ordinary = self._custom_output_tail(mgmt.submodule)
+        ordinary = custom and not producer_repeat
         if ordinary and (width != 1 or reserved != 1):
-            raise ValueError("a custom connected tail cannot collect multiple computations")
+            raise ValueError("a custom connected consumer tail cannot collect multiple computations")
         columns = self.run_columns(batch.node_name, batch.graph_walk)
-        buffers = {name: (value[:, :width] if value.ndim > 1 and value.shape[1] == reserved else value)
+        visible = reserved if producer_repeat else width
+        buffers = {name: (value[:, :visible] if value.ndim > 1 and value.shape[1] == reserved else value)
                    for name, value in raw.check_stop_buffers.items() if name not in (RUN_COUNTS, RUN_REPLAYS)}
-        values = {name: value[:, :width] if name in columns else value
+        values = {name: value[:, :visible] if name in columns else value
                   for name, value in (raw.row_outputs or {}).items()}
-        spans = {name: value[:, :width] if name in columns else value
+        spans = {name: value[:, :visible] if name in columns else value
                  for name, value in (raw.output_spans or {}).items()}
         if ordinary:
             values = {name: value[:, 0] if name in columns else value for name, value in values.items()}
@@ -3134,12 +3143,16 @@ class Engine:
             buffers = {name: value[:, 0] if name not in semantic and value.ndim > 1
                        and value.shape[1] == reserved else value for name, value in buffers.items()}
         raw = dataclasses.replace(raw, check_stop_buffers=buffers, row_outputs=values, output_spans=spans or None)
-        inputs, info = self._pad_batch(batch, mgmt, lease)
-        output = self._collect_step(batch, mgmt, lease, raw, inputs, info)
-        output.run_columns = frozenset() if ordinary else columns
-        batch.outputs = output
-        self._finish_outputs(batch)
-        batch.outputs = self._postprocess_outputs(batch, output)
+        try:
+            inputs, info = self._pad_batch(batch, mgmt, lease)
+            output = self._collect_step(batch, mgmt, lease, raw, inputs, info)
+            output.run_columns = frozenset() if ordinary else columns
+            batch.outputs = output
+            self._finish_outputs(batch)
+            batch.outputs = self._postprocess_outputs(batch, output)
+        finally:
+            if producer_repeat:
+                settle()  # ordinary producer tail precedes resource rewind
         return batch.outputs
 
     def release_group(self, group: ExecutionGroup) -> None:

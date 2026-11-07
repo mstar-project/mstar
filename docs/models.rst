@@ -277,8 +277,14 @@ the consumer's state from before its computation. This is an author contract,
 not a runtime inference about Python purity. Qwen3-TTS declares only decode's
 ``codec_tokens``; clone-prefill prepends reference frames and is not declared.
 
-This bounded custom-producer path requires a requested single compute, disjoint
-resource owners, and no custom filter, unpack or batch tail. Aliases, packed or
+An ordinary repeated producer must also preserve each declared per-replay
+column through its normal tail. It uses the same tail representation as a
+standalone run: requested-one has no iteration axis; requested-N retains N
+columns with last-valid padding when the run ends short. Its tail runs before
+resource settlement, and ordinary routing keeps only actual output columns.
+This grants no repeat capability by itself: every owner must still support the
+ordinary repeated path. Custom producers require disjoint resource owners and
+no custom filter, unpack or batch tail. Aliases, packed or
 per-request overrides and output spans refuse before launch. The producer tail
 runs once iff its body computed; failure still settles dependent work without
 publishing a successful result or retrying either body. These eligibility rules
