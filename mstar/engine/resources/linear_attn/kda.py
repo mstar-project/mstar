@@ -491,17 +491,18 @@ class KDAManager(LinearAttnManager):
                 qkv, g, beta, plan, conv_layer, state_layer, spec, params, gate=gate,
             )
         if plan.head is not None:
-            # a window's head runs first, on its own (`token_window`)
+            # a window's head runs first, on its own (`token_window`); both write one output
             n = plan.head.num_tokens
-            first = self.kernels.run_paged(
+            out = qkv.new_empty(qkv.shape[0], qkv.shape[1] // 3)
+            self.kernels.run_paged(
                 qkv[:n], g[:n], beta[:n], plan.head, conv_layer, state_layer, params,
-                gate=None if gate is None else gate[:n],
+                gate=None if gate is None else gate[:n], out=out[:n],
             )
             rest = self.kernels.run_paged(
                 qkv[n:], g[n:], beta[n:], plan, conv_layer, state_layer, params,
-                gate=None if gate is None else gate[n:],
+                gate=None if gate is None else gate[n:], out=out[n:],
             )
-            return torch.cat([first, rest])
+            return out.view(qkv.shape[0], *rest.shape[1:])
         return self.kernels.run_paged(
             qkv, g, beta, plan, conv_layer, state_layer, params, gate=gate,
         )

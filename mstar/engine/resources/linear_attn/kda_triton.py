@@ -297,6 +297,14 @@ if _HAS_TRITON:
                       mask=(live & (src < 0))[None, :], other=0.0)
         return x + old
 
+    @triton.jit
+    def _store_tails(proj, stride_proj, cstate, dst, ch, P, bos, L, m):
+        """The q, k and v conv tails after a span of ``L`` tokens (``_new_tail``), at ``dst``."""
+        live = (m < 3)[None, :]
+        for part in tl.static_range(3):
+            tail = _new_tail(proj, stride_proj, cstate, part * P + ch, bos, L, m)
+            tl.store(dst + (part * P + ch)[:, None] * 3 + m[None, :], tail, mask=live)
+
     # T, the step's token count, is not specialized on, so a step whose T changes
     # divisibility doesn't recompile; every T-derived address is scaled by D
     @triton.jit(do_not_specialize=["T"])
@@ -502,9 +510,12 @@ if _HAS_TRITON:
                      o.to(o_out.dtype.element_ty), mask=valid)
             s = s * decay[:, None] + _mm(tl.trans(kg), v_new, PREC)
             if SNAP:
+                # scalar branches: a span with no snapshot at this chunk skips the stores
                 end = tl.minimum((c + 1) * C, L)
-                tl.store(state_pool + snap0 * stride_state + head, s, mask=end == off0)
-                tl.store(state_pool + snap1 * stride_state + head, s, mask=end == off1)
+                if end == off0:
+                    tl.store(state_pool + snap0 * stride_state + head, s)
+                if end == off1:
+                    tl.store(state_pool + snap1 * stride_state + head, s)
         tl.store(sp, s)
 
         if iv == 0:
@@ -516,29 +527,19 @@ if _HAS_TRITON:
             tk = _new_tail(proj, stride_proj, cstate, P + h * D + k, bos, L, m)
             tv = _new_tail(proj, stride_proj, cstate, 2 * P + h * D + k, bos, L, m)
             if SNAP:
-                # each snapshot's tail, as a span ending at its offset leaves it
-                q0 = _new_tail(proj, stride_proj, cstate, h * D + k, bos, off0, m)
-                k0 = _new_tail(proj, stride_proj, cstate, P + h * D + k, bos, off0, m)
-                v0 = _new_tail(proj, stride_proj, cstate, 2 * P + h * D + k, bos, off0, m)
-                q1 = _new_tail(proj, stride_proj, cstate, h * D + k, bos, off1, m)
-                k1 = _new_tail(proj, stride_proj, cstate, P + h * D + k, bos, off1, m)
-                v1 = _new_tail(proj, stride_proj, cstate, 2 * P + h * D + k, bos, off1, m)
+                # each snapshot's tail, as a span ending at its offset leaves it; no program
+                # reads a snapshot slot, so these store before the barrier
+                if off0 > 0:
+                    _store_tails(proj, stride_proj, cstate, conv_pool + snap0 * stride_conv,
+                                 h * D + k, P, bos, off0, m)
+                if off1 > 0:
+                    _store_tails(proj, stride_proj, cstate, conv_pool + snap1 * stride_conv,
+                                 h * D + k, P, bos, off1, m)
             tl.debug_barrier()
             live = (m < 3)[None, :]
             tl.store(cstate + (h * D + k)[:, None] * 3 + m[None, :], tq, mask=live)
             tl.store(cstate + (P + h * D + k)[:, None] * 3 + m[None, :], tk, mask=live)
             tl.store(cstate + (2 * P + h * D + k)[:, None] * 3 + m[None, :], tv, mask=live)
-            if SNAP:
-                at0 = conv_pool + snap0 * stride_conv + m[None, :]
-                at1 = conv_pool + snap1 * stride_conv + m[None, :]
-                keep0 = live & (off0 > 0)
-                keep1 = live & (off1 > 0)
-                tl.store(at0 + (h * D + k)[:, None] * 3, q0, mask=keep0)
-                tl.store(at0 + (P + h * D + k)[:, None] * 3, k0, mask=keep0)
-                tl.store(at0 + (2 * P + h * D + k)[:, None] * 3, v0, mask=keep0)
-                tl.store(at1 + (h * D + k)[:, None] * 3, q1, mask=keep1)
-                tl.store(at1 + (P + h * D + k)[:, None] * 3, k1, mask=keep1)
-                tl.store(at1 + (2 * P + h * D + k)[:, None] * 3, v1, mask=keep1)
 
     @triton.jit(do_not_specialize=["T"])
     def _kda_out_norm_kernel(o_in, proj, stride_proj, g_b, norm_w, out, T, norm_eps,
@@ -560,11 +561,12 @@ if _HAS_TRITON:
 
 
 def kda_prefill(proj, conv_pool, conv_w, f_b, g_b, dt_bias, a_log, norm_w, state_pool, varlen,
-                *, num_heads, head_dim, lower_bound, scale, norm_eps, cfg: PrefillConfig | None = None):
+                *, num_heads, head_dim, lower_bound, scale, norm_eps, cfg: PrefillConfig | None = None,
+                out: torch.Tensor | None = None):
     """Fused KDA prefill for ``proj (T, 3P + H + 2D)`` over ``varlen``'s spans; returns the
-    gated-normed ``(T, P)``. The spans' slots in ``conv_pool (S, 3P, 3)`` and
-    ``state_pool (S, H, V, K)`` fp32 are updated in place, and ``varlen``'s snapshot slots
-    written."""
+    gated-normed ``(T, P)``, written into ``out`` when given. The spans' slots in
+    ``conv_pool (S, 3P, 3)`` and ``state_pool (S, H, V, K)`` fp32 are updated in place, and
+    ``varlen``'s snapshot slots written."""
     cfg = cfg or CONFIG
     H, D, C = num_heads, head_dim, varlen.chunk
     T, P = proj.shape[0], num_heads * head_dim
@@ -576,7 +578,9 @@ def kda_prefill(proj, conv_pool, conv_w, f_b, g_b, dt_bias, a_log, norm_w, state
     # The in-block decay factors reach exp(|lb| * br / 2); fp32 tops out at exp(88.7).
     assert bound_fits(lower_bound, br), (lower_bound, br)
     dev, dt = proj.device, cfg.scratch_dtype
-    out = torch.empty(T, P, dtype=proj.dtype, device=dev)
+    if out is None:
+        out = torch.empty(T, P, dtype=proj.dtype, device=dev)
+    assert out.shape == (T, P) and out.is_contiguous(), (out.shape, T, P)
     if T == 0:
         return out
     qkv_s = torch.empty(3, H, T, D, dtype=torch.bfloat16, device=dev)
@@ -839,21 +843,23 @@ class TritonKDAKernels:
         return varlen_layout(spans, num_tokens if fixed else None, self.config.chunk, snapshots)
 
     @torch.compiler.disable
-    def run_paged(self, qkv, g, beta, plan, conv_state, rec_state, p, gate=None):
+    def run_paged(self, qkv, g, beta, plan, conv_state, rec_state, p, gate=None, out=None):
         """``qkv [T, 3P]`` pre-conv, ``g`` and ``gate`` the low-rank forget and output gates
         ``[T, D]``, ``beta [T, H]`` raw; the pool's layer blocks ``conv_state [S, 3P, W - 1]``
-        and ``rec_state [S, H, V, K]`` are updated in place. Returns ``[T, P]``."""
+        and ``rec_state [S, H, V, K]`` are updated in place. Returns ``[T, P]``, a prefill's
+        written into ``out`` when given."""
         proj = _merged_row(qkv, g, beta, gate, p)
         kwargs = dict(num_heads=p.num_heads, head_dim=p.head_dim, lower_bound=p.lower_bound,
                       scale=p.scale, norm_eps=p.norm_eps)
         if plan.is_decode:
+            assert out is None, "kda: only a prefill writes into a given output"
             return kda_decode(proj, conv_state, p.conv_weight, p.f_b, p.g_b, p.dt_bias, p.A_log,
                               p.norm_weight, rec_state, plan.slot_ids, **kwargs)
         varlen = plan.cached("kda_triton", lambda: varlen_view(
             plan.layout, plan.slot_ids, plan.num_rows, plan.num_tokens, self.config.chunk,
             snapshots=plan.snapshot_section))
         return kda_prefill(proj, conv_state, p.conv_weight, p.f_b, p.g_b, p.dt_bias, p.A_log,
-                           p.norm_weight, rec_state, varlen, cfg=self.config, **kwargs)
+                           p.norm_weight, rec_state, varlen, cfg=self.config, out=out, **kwargs)
 
     @torch.compiler.disable
     def run_verify(self, qkv, g, beta, plan, conv_state, rec_state, spec, p, gate=None):
