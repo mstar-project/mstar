@@ -660,8 +660,9 @@ class Fp8Experts:
     rank's share) as one quantizable layer, ``<block>.experts`` (``mstar.quantization``), held as block fp8: e4m3
     in uint8 containers and their fp32 ``*_scale_inv`` blocks in int32 ones (the engine's node cast would round
     them). Loaded as a block-fp8 checkpoint stores them (``experts_prepare``) or quantized from the loaded bf16
-    an expert at a time (``experts_quantize``); dispatched through ``fused_experts_fp8`` (W8A8, activations per
-    token per 128), whose sentinel expert id skips a slot as the bf16 dispatch's does.
+    an expert at a time (``experts_quantize``); dispatched through ``experts_fp8``: per-pair GEMVs at a few tokens,
+    else ``fused_experts_fp8`` (W8A8, activations per token per 128), whose sentinel expert id skips a slot as the
+    bf16 dispatch's does.
 
     The block supplies ``_reattach_loaders()`` (its ``_attach_weight_loaders`` with its own arguments), which
     calls ``_attach_fp8_loaders`` while ``experts_fp8_block`` is set."""
@@ -751,9 +752,9 @@ class Fp8Experts:
             ]
             return dispatch_experts_fused(flat, *bf16, w1.shape[0], selected_experts, routing_weights,
                                           skip_invalid=skip_invalid)
-        from mstar.utils.fused_moe import fused_experts_fp8
+        from mstar.utils.fused_moe.runner import experts_fp8
 
-        return fused_experts_fp8(
+        return experts_fp8(
             flat, w1, w2, s1, s2, routing_weights, selected_experts,
             block_size=self.experts_fp8_block, skip_invalid=skip_invalid,
         )

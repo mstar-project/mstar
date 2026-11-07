@@ -282,6 +282,69 @@ def fused_experts_fp8(
     )
 
 
+def per_pair_fp8(num_tokens: int, device: torch.device, w1_shape, top_k: int, block_size, skip_invalid: bool) -> bool:
+    """Whether :func:`experts_fp8` runs this call as per-pair GEMVs (``decode.routed_experts_fp8``): up to
+    ``decode.ROUTED_FP8_MAX_TOKENS`` tokens on an NVIDIA GPU, every slot a real expert, and whole scale blocks
+    (``decode.routed_fp8_fits``). ROCm keeps the grouped runner, as ``runs_per_pair`` does for bf16."""
+    if skip_invalid or device.type != "cuda" or not current_platform.is_cuda():
+        return False
+    # imported here: it needs triton's CUDA extras, which CPU hosts may lack
+    from mstar.utils.fused_moe import decode
+
+    _, two_inter, hidden = w1_shape
+    return num_tokens <= decode.ROUTED_FP8_MAX_TOKENS and decode.routed_fp8_fits(hidden, two_inter // 2,
+                                                                                  tuple(block_size))
+
+
+def experts_fp8(
+    hidden_states: torch.Tensor,
+    w1_fp8: torch.Tensor,
+    w2_fp8: torch.Tensor,
+    w1_scale_inv: torch.Tensor,
+    w2_scale_inv: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    block_size: tuple[int, int] = (128, 128),
+    skip_invalid: bool = False,
+) -> torch.Tensor:
+    """Block-fp8 routed experts (no shared expert), summed per token, by token count: per-pair GEMVs where
+    :func:`per_pair_fp8` says (a few tokens: the grouped runner's alignment, quantize, SwiGLU and sum
+    launches outweigh reading the experts; the GEMVs scale each fp8 block against bf16 activations, w8a16),
+    else :func:`fused_experts_fp8`. Arguments as there."""
+    return torch.ops.mstar.experts_fp8(
+        hidden_states, w1_fp8, w2_fp8, w1_scale_inv, w2_scale_inv, topk_weights, topk_ids, list(block_size),
+        skip_invalid)
+
+
+# One op to dynamo, so the token-count dispatch is a runtime branch, not a guard.
+@torch.library.custom_op("mstar::experts_fp8", mutates_args=())
+def _experts_fp8_op(
+    hidden_states: torch.Tensor,
+    w1_fp8: torch.Tensor,
+    w2_fp8: torch.Tensor,
+    w1_scale_inv: torch.Tensor,
+    w2_scale_inv: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    block_size: list[int],
+    skip_invalid: bool,
+) -> torch.Tensor:
+    if per_pair_fp8(hidden_states.shape[0], hidden_states.device, w1_fp8.shape, topk_ids.shape[1], block_size,
+                    skip_invalid):
+        from mstar.utils.fused_moe import decode
+
+        return decode.routed_experts_fp8(hidden_states, w1_fp8, w1_scale_inv, w2_fp8, w2_scale_inv, topk_weights,
+                                         topk_ids, block_size=tuple(block_size))
+    return _fused_experts_fp8_impl(hidden_states, w1_fp8, w2_fp8, w1_scale_inv, w2_scale_inv, topk_weights,
+                                   topk_ids, tuple(block_size), "silu", True, None, skip_invalid)
+
+
+@_experts_fp8_op.register_fake
+def _(hidden_states, w1_fp8, w2_fp8, w1_scale_inv, w2_scale_inv, topk_weights, topk_ids, block_size,
+      skip_invalid):
+    return torch.empty_like(hidden_states)
+
+
 # One opaque op to dynamo: traced inline, the launch path's host logic breaks
 # the graph (and fails outright on a symbolic token count in some torch versions).
 @torch.library.custom_op("mstar::fused_experts_fp8", mutates_args=())
