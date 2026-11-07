@@ -65,7 +65,9 @@ class _FakeSoundfile(types.ModuleType):
         self.SoundFile = SoundFile
 
     def info(self, path):
-        return types.SimpleNamespace(frames=self.header_frames, samplerate=self.rate, channels=self.channels)
+        return types.SimpleNamespace(
+            format="WAV", frames=self.header_frames, samplerate=self.rate, channels=self.channels,
+        )
 
     def read(self, path, dtype="float64", always_2d=False, **k):
         # the whole-file read main used: hands out every frame
