@@ -3533,49 +3533,64 @@ class Engine:
         if slot:
             batch.step_context.resident.unpin((slot,))
 
-    def _seed_run_rows(self, batch: ExecutingBatch, slot, immune: Sequence[bool]) -> None:
-        """Pin and publish incumbents before launching an empty membership window."""
-        membership = slot.run.state.membership
-        if not membership.idle or batch.run_rows:
+    def _seed_run_rows(self, members: Sequence[tuple[ExecutingBatch, Any, Sequence[bool]]]) -> None:
+        """Publish each complete logical claim after all member owners are pinned."""
+        membership = members[0][1].run.state.membership
+        if not membership.idle or any(batch.run_rows for batch, _, _ in members):
             raise ValueError("a joining capture must close its previous descriptor readers before reuse")
-        ctx = batch.step_context
-        if ctx.resident is None or batch.step is None or len(immune) != len(batch.request_ids):
-            raise ValueError("joining incumbents need their admitted resident step")
-        for key, binding in ctx.resident.bindings.items():
-            binding.check_horizon(batch.step.get(key), ctx)
-        pins = ctx.resident.pin(batch.request_ids)
+        if len({batch.node_name for batch, _, _ in members}) != len(members):
+            raise ValueError("a publication may bind each member only once")
+        for batch, slot, immune in members:
+            ctx = batch.step_context
+            if (slot.run.state.membership is not membership or ctx.resident is None
+                    or batch.step is None or len(immune) != len(batch.request_ids)):
+                raise ValueError("joining incumbents need their admitted resident member steps")
+            for key, binding in ctx.resident.bindings.items():
+                binding.check_horizon(batch.step.get(key), ctx)
+        pins, descriptors = [], {}
         execution = torch.cuda.current_stream(self._device) if membership.publication_stream is not None else None
-        if execution is not None:
-            membership.publication_stream.wait_stream(execution)
         publication = torch.cuda.stream(membership.publication_stream) if execution is not None else nullcontext()
         try:
+            values = {}
+            for batch, _, immune in members:
+                ctx = batch.step_context
+                held = ctx.resident.pin(batch.request_ids)
+                pins.append((ctx.resident, held))
+                for rid, resident, ignore in zip(batch.request_ids, held, immune, strict=True):
+                    binding = self._row_binding(batch.node_name, resident, ignore, ctx.repeats)
+                    row = values.setdefault(rid, [0] * len(binding))
+                    for i, value in enumerate(binding):
+                        row[i] += value
+            if execution is not None:
+                membership.publication_stream.wait_stream(execution)
             with publication:
-                for row, (rid, resident, ignore) in enumerate(zip(batch.request_ids, pins, immune, strict=True)):
-                    descriptor = membership.reserve_row(
-                        rid, self._runner.request_generation(rid), row,
-                        self._row_binding(batch.node_name, resident, ignore, ctx.repeats),
-                    )
+                for row, (rid, binding) in enumerate(values.items()):
+                    descriptor = membership.reserve_row(rid, self._runner.request_generation(rid), row, binding)
                     if descriptor is None:
                         raise ValueError("a fresh membership window lacks descriptor credits")
-                    batch.run_rows[rid] = descriptor
-                for descriptor in batch.run_rows.values():
+                    descriptors[rid] = descriptor
+                for batch, _, _ in members:
+                    batch.run_rows.update((rid, descriptors[rid]) for rid in batch.request_ids)
+                for descriptor in descriptors.values():
                     membership.publish_row(descriptor)
             if execution is not None:
                 execution.wait_stream(membership.publication_stream)
         except BaseException:
-            # No WHILE was submitted. Drain only this previously empty window,
-            # and finish queued copies before making owner rows reusable.
+            # This previously empty parent was never launched. Reverse every
+            # member pin and descriptor, including a partially published claim.
             with torch.cuda.stream(membership.publication_stream) if execution is not None else nullcontext():
-                for descriptor in batch.run_rows.values():
+                for descriptor in descriptors.values():
                     membership.cancel(descriptor)
                 membership.drain()
             if execution is not None:
                 membership.publication_stream.synchronize()
             membership.acknowledge(membership.control.cpu().tolist())
-            for descriptor in batch.run_rows.values():
+            for descriptor in descriptors.values():
                 membership.release(descriptor)
-            batch.run_rows.clear()
-            ctx.resident.unpin(pins)
+            for batch, _, _ in members:
+                batch.run_rows.clear()
+            for planner, held in reversed(pins):
+                planner.unpin(held)
             raise
 
     def admit_run_row(self, batch: ExecutingBatch, active: ExecutingBatch, row: int) -> RunRow | None:
@@ -4328,7 +4343,7 @@ class Engine:
             immune = [policy is not None and policy.limits(infos[rid]).ignore_eos for rid in request_ids]
             slot.run.state.stage(len(request_ids), immune, ctx.repeats, submodule_mgmt.refills[graph_walk])
             if slot.run.state.membership is not None:
-                self._seed_run_rows(batch, slot, immune)
+                self._seed_run_rows(((batch, slot, immune),))
             if slot.run.window is not None:
                 submodule_mgmt.submodule.iteration_tables.stage_window(
                     lease, ctx.resident_plan.slots.tolist(), batch.iteration_columns,

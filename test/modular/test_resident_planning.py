@@ -1994,9 +1994,9 @@ def test_engine_prepares_one_logical_joining_receipt_without_replanning(
         with monkeypatch.context() as patch:
             patch.setattr(membership, "publish_row", fail_publication)
             with pytest.raises(ValueError, match="publication failed"):
-                eng._seed_run_rows(active, slot, [False])
+                eng._seed_run_rows(((active, slot, [False]),))
         assert membership.idle and not active.run_rows and not planner._readers.any()
-    eng._seed_run_rows(active, slot, [False])
+    eng._seed_run_rows(((active, slot, [False]),))
     ctx = StepContext((2,), WALK, 0, False, repeats=4)
     segments = (Segment(2, "main", 1),)
     step = SubmoduleStep({"kv": KVStep(segments=segments), "rope": PositionStep(segments=segments),
@@ -4466,3 +4466,61 @@ def test_a_joining_unit_shares_one_publication_and_serializes_subset_parents():
         engine._walk_lanes = {("b", walk): 1}
         with pytest.raises(ValueError, match="main chain"):
             engine._membership_specs(submodules, {"a": 4}, ranks)
+
+
+@pytest.mark.parametrize("failure", [None, "check", "pin", "publish"])
+def test_unit_seed_publishes_complete_bindings_or_reverses_every_owner(failure, monkeypatch):
+    from mstar.engine.engine import Engine, RunLayout
+    from mstar.engine.resources.run_rows import RunRows
+
+    eng = Engine.__new__(Engine)
+    eng._device = CPU
+    layout = RunLayout(("a", "b"), 4)
+    eng._run_layouts = dict.fromkeys(layout.nodes, layout)
+    eng._runner = SimpleNamespace(request_generation=lambda rid: 7)
+    owner = RunRows(CPU, 2, 8, 6)
+    slot = SimpleNamespace(run=SimpleNamespace(state=SimpleNamespace(membership=owner)))
+    held, members = set(), []
+    for node, rids, slots, limit in (("a", (1,), (3,), 4), ("b", (1, 2), (2, 4), 1)):
+        def check(step, ctx, node=node):
+            if node == "b" and failure == "check":
+                raise ValueError("checked refusal")
+        def pin(rids, node=node, slots=slots):
+            if node == "b" and failure == "pin":
+                raise ValueError("pin refusal")
+            held.update((node, s) for s in slots)
+            return slots
+        def unpin(slots, node=node):
+            for s in slots:
+                held.remove((node, s))
+        planner = SimpleNamespace(bindings={"state": SimpleNamespace(check_horizon=check)}, pin=pin, unpin=unpin)
+        batch = SimpleNamespace(node_name=node, request_ids=rids, step={}, run_rows={},
+                                step_context=SimpleNamespace(resident=planner, repeats=limit))
+        members.append((batch, slot, [False] * len(rids)))
+    publish = owner.publish_row
+    if failure == "publish":
+        def fail_second(descriptor):
+            if descriptor.request_id == 2:
+                raise ValueError("publication failure")
+            publish(descriptor)
+        monkeypatch.setattr(owner, "publish_row", fail_second)
+    if failure is not None:
+        with pytest.raises(ValueError):
+            eng._seed_run_rows(members)
+        assert not held and owner.idle
+        assert all(not batch.run_rows for batch, _, _ in members)
+        return
+    eng._seed_run_rows(members)
+    a, b = (batch for batch, _, _ in members)
+    assert a.run_rows[1] is b.run_rows[1]
+    assert a.run_rows[1].bindings == (3, 0, 4, 2, 0, 1)
+    assert b.run_rows[2].bindings == (0, 0, 0, 4, 0, 1)
+    assert held == {("a", 3), ("b", 2), ("b", 4)}
+    owner.drain()
+    owner.acknowledge(owner.control.tolist())
+    for descriptor in b.run_rows.values():
+        assert owner.release(descriptor)
+    for batch, _, _ in members:
+        for descriptor in batch.run_rows.values():
+            eng.release_run_row(batch, descriptor)
+    assert not held and owner.idle
