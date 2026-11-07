@@ -4,20 +4,28 @@
 //!  * **Inbound** — turn media referenced by an OpenAI-style request (`data:`
 //!    URLs or base64 blobs) into files under the server's `upload_dir`, so the
 //!    Python data-worker can read them by path (the same contract `/generate`
-//!    uses for multipart uploads). `http(s)` fetch is SSRF surface and is gated
-//!    off by default here (data-URL / base64 only). Paths on the server are
-//!    refused.
+//!    uses for multipart uploads). `http(s)` fetch is SSRF surface: it is off
+//!    unless `MSTAR_ALLOW_REMOTE=1`, and limited as in `save_remote_url` when
+//!    on. Paths on the server are refused.
 //!  * **Outbound** — wrap raw model audio output (16-bit PCM, no header) into a
 //!    real container (WAV by default) and encode PNG image bytes as a `data:`
 //!    URL for OpenAI chat image output.
 //!
-//! Only the stdlib + `base64` + `uuid` are needed; compressed audio containers
-//! (mp3/flac/ogg) degrade to WAV since the base install has no encoder — the
-//! Python side is where those are produced when `soundfile` is present.
+//! Only the stdlib + `base64` + `uuid` are needed (plus `url` and `ureq` for
+//! the opt-in remote fetch: a GET bounded in size and by the fetch deadline,
+//! which reaches only the addresses this module has vetted); compressed audio
+//! containers (mp3/flac/ogg) degrade to WAV since the base install has no
+//! encoder — the Python side is where those are produced when `soundfile` is
+//! present.
 
+use std::io::{self, Read, Write};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
+use ureq::unversioned::resolver::ResolvedSocketAddrs;
 use uuid::Uuid;
 
 /// Map a MIME type (top-level or full) to a file extension for persisting.
@@ -151,43 +159,465 @@ pub fn save_base64(
     Ok((modality_hint.to_string(), path.to_string_lossy().into_owned()))
 }
 
-/// Download an `http(s)` URL into `upload_dir` (mstar's `save_remote_url`;
-/// 30 s timeout). Modality from the Content-Type, falling back to the URL
-/// path's extension. Gated by `allow_remote` — SSRF surface.
-fn save_remote_url(url: &str, upload_dir: &Path) -> Result<(String, String), String> {
-    let resp = ureq::AgentBuilder::new()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .get(url)
-        .call()
-        .map_err(|e| format!("remote media fetch failed: {e}"))?;
-    let mut mime = resp
-        .header("content-type")
-        .unwrap_or("")
-        .split(';')
-        .next()
-        .unwrap_or("")
-        .trim()
-        .to_string();
-    let mut raw = Vec::new();
-    resp.into_reader()
-        .read_to_end(&mut raw)
-        .map_err(|e| format!("remote media read failed: {e}"))?;
-    if mime.is_empty() || mime == "application/octet-stream" {
-        // Infer from the URL path extension (mstar's fallback).
-        let path = url.split('?').next().unwrap_or(url);
-        let suffix = PathBuf::from(path)
-            .extension()
-            .map(|e| format!(".{}", e.to_string_lossy()))
-            .unwrap_or_default();
-        mime = match modality_from_ext(&suffix) {
-            "image" => format!("image/{}", suffix.trim_start_matches('.')),
-            "audio" => format!("audio/{}", suffix.trim_start_matches('.')),
-            "video" => format!("video/{}", suffix.trim_start_matches('.')),
-            _ => "application/octet-stream".to_string(),
-        };
+const REMOTE_MAX_BYTES: u64 = 64 << 20;
+const REMOTE_MAX_REDIRECTS: usize = 3;
+const REMOTE_USER_AGENT: &str = "mstar";
+
+// Refused unless the host is allowlisted: loopback, private, link-local (cloud
+// metadata at 169.254.169.254), shared/CGNAT, multicast, reserved. The same
+// list is in mstar/api_server/media_io.py.
+const BLOCKED_V4: [(Ipv4Addr, u32); 11] = [
+    (Ipv4Addr::new(0, 0, 0, 0), 8),
+    (Ipv4Addr::new(10, 0, 0, 0), 8),
+    (Ipv4Addr::new(100, 64, 0, 0), 10),
+    (Ipv4Addr::new(127, 0, 0, 0), 8),
+    (Ipv4Addr::new(169, 254, 0, 0), 16),
+    (Ipv4Addr::new(172, 16, 0, 0), 12),
+    (Ipv4Addr::new(192, 0, 0, 0), 24),
+    (Ipv4Addr::new(192, 168, 0, 0), 16),
+    (Ipv4Addr::new(198, 18, 0, 0), 15),
+    (Ipv4Addr::new(224, 0, 0, 0), 4),
+    (Ipv4Addr::new(240, 0, 0, 0), 4),
+];
+const BLOCKED_V6: [(Ipv6Addr, u32); 7] = [
+    (Ipv6Addr::UNSPECIFIED, 128),
+    (Ipv6Addr::LOCALHOST, 128),
+    (Ipv6Addr::new(0x64, 0xff9b, 1, 0, 0, 0, 0, 0), 48),
+    (Ipv6Addr::new(0xfc00, 0, 0, 0, 0, 0, 0, 0), 7),
+    (Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0), 10),
+    (Ipv6Addr::new(0xfec0, 0, 0, 0, 0, 0, 0, 0), 10),
+    (Ipv6Addr::new(0xff00, 0, 0, 0, 0, 0, 0, 0), 8),
+];
+
+/// The IPv4 address an IPv4-mapped, 6to4 (2002::/16), NAT64 (64:ff9b::/96) or
+/// IPv4-compatible (::/96) address reaches. NAT64 is not refused outright: on an
+/// IPv6-only network with DNS64 every IPv4-only host resolves into it.
+fn embedded_v4(v6: Ipv6Addr) -> Option<Ipv4Addr> {
+    let bits = u128::from(v6);
+    if let Some(v4) = v6.to_ipv4_mapped() {
+        Some(v4)
+    } else if bits >> 112 == 0x2002 {
+        Some(Ipv4Addr::from((bits >> 80) as u32))
+    } else if bits >> 32 == 0x64_ff9b_0000_0000_0000_0000 || bits >> 32 == 0 {
+        Some(Ipv4Addr::from(bits as u32))
+    } else {
+        None
     }
-    save_bytes(&raw, &mime, upload_dir).map_err(|e| e.to_string())
+}
+
+fn blocked_address(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => BLOCKED_V4
+            .iter()
+            .any(|&(net, len)| u32::from(v4) >> (32 - len) == u32::from(net) >> (32 - len)),
+        IpAddr::V6(v6) => match embedded_v4(v6) {
+            Some(v4) => blocked_address(IpAddr::V4(v4)),
+            None => BLOCKED_V6
+                .iter()
+                .any(|&(net, len)| u128::from(v6) >> (128 - len) == u128::from(net) >> (128 - len)),
+        },
+    }
+}
+
+/// Both URL parsers delete these anywhere in a URL, so a host written with them
+/// would match the allowlist as if they were not there; such URLs are refused.
+const URL_DROPPED: [char; 3] = ['\t', '\r', '\n'];
+
+/// The host of `url` as written (lower-cased, without brackets or a trailing
+/// dot), or `None` when the text has no `//` authority.
+fn written_host(url: &str) -> Option<String> {
+    let after_scheme = match url.split_once(':') {
+        Some((scheme, rest)) if !scheme.is_empty() && scheme.bytes().all(|b| b.is_ascii_alphanumeric() || b"+-.".contains(&b)) => rest,
+        _ => url,
+    };
+    let rest = after_scheme.strip_prefix("//")?;
+    let authority = &rest[..rest.find(['/', '\\', '?', '#']).unwrap_or(rest.len())];
+    let host_port = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    let host = match host_port.strip_prefix('[') {
+        Some(v6) => &v6[..v6.find(']')?],
+        None => host_port.rsplit_once(':').map_or(host_port, |(h, _)| h),
+    };
+    Some(host.trim_end_matches('.').to_ascii_lowercase())
+}
+
+/// Limits on remote fetch: `MSTAR_REMOTE_ALLOWED_HOSTS` (comma-separated hosts
+/// and `*.suffix` patterns; when set, only those hosts are fetched) and
+/// `MSTAR_REMOTE_MAX_BYTES`.
+struct RemotePolicy {
+    allowed_hosts: Vec<String>,
+    max_bytes: u64,
+    timeout: Duration,
+}
+
+impl RemotePolicy {
+    fn from_env() -> &'static RemotePolicy {
+        static POLICY: OnceLock<RemotePolicy> = OnceLock::new();
+        POLICY.get_or_init(|| RemotePolicy {
+            allowed_hosts: std::env::var("MSTAR_REMOTE_ALLOWED_HOSTS")
+                .unwrap_or_default()
+                .split(',')
+                .map(|h| {
+                    let h = h.trim().trim_matches(|c| c == '[' || c == ']');
+                    h.trim_end_matches('.').to_ascii_lowercase()
+                })
+                .filter(|h| !h.is_empty())
+                .collect(),
+            max_bytes: std::env::var("MSTAR_REMOTE_MAX_BYTES")
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+                .unwrap_or(REMOTE_MAX_BYTES),
+            timeout: Duration::from_secs(30),
+        })
+    }
+
+    /// `host` (as the URL parser prints it) equals an entry, or ends in `.suffix`
+    /// for a `*.suffix` entry. Only a host the URL wrote that same way can match,
+    /// so another spelling of a listed address (`2130706433`, `0x7f000001`,
+    /// `127.1`) gets the address check instead, as in the Python frontend.
+    fn allowlisted(&self, host: &str, written: Option<&str>) -> bool {
+        written == Some(host)
+            && self
+                .allowed_hosts
+                .iter()
+                .any(|p| host == p || (p.starts_with("*.") && host.ends_with(&p[1..])))
+    }
+}
+
+/// Log a fetch failure's details server-side; the client gets only `reason`.
+fn fetch_error(host: &str, reason: &str, detail: impl std::fmt::Display) -> String {
+    eprintln!("remote media fetch from {host} failed: {reason} {detail}");
+    format!("remote media fetch failed: {reason}")
+}
+
+/// A transport failure: `timed out` once the deadline has passed (the fetch ran
+/// out of time even if the error itself does not say so), `connection failed`
+/// before it.
+fn transport_error(host: &str, deadline: Instant, detail: impl std::fmt::Display) -> String {
+    let reason = if Instant::now() >= deadline { "timed out" } else { "connection failed" };
+    fetch_error(host, reason, detail)
+}
+
+/// Download an `http(s)` URL into `upload_dir` (mstar's `save_remote_url`).
+/// Hosts outside `MSTAR_REMOTE_ALLOWED_HOSTS` (when set) are refused, and so
+/// is a host that is not allowlisted and resolves to a blocked address; the
+/// connection goes to the vetted addresses. Every redirect hop is checked again
+/// (at most `REMOTE_MAX_REDIRECTS`), the body is streamed to disk and capped at
+/// `MSTAR_REMOTE_MAX_BYTES`, and the whole fetch takes at most 30 s. Errors
+/// are short messages; the details are logged only.
+fn save_remote_url(
+    url: &str,
+    upload_dir: &Path,
+    policy: &RemotePolicy,
+) -> Result<(String, String), String> {
+    let deadline = Instant::now() + policy.timeout;
+    if url.contains(URL_DROPPED) {
+        return Err(fetch_error("", "invalid URL", format!("{url:?}")));
+    }
+    let mut written = written_host(url);
+    let mut url = url::Url::parse(url).map_err(|e| fetch_error("", "invalid URL", e))?;
+    let mut host = String::new();
+    for _ in 0..=REMOTE_MAX_REDIRECTS {
+        // the same spelling the pinned resolver checks the hop's URI against
+        host = normalized_host(url.host_str().unwrap_or(""));
+        let allowlisted = policy.allowlisted(&host, written.as_deref());
+        if !matches!(url.scheme(), "http" | "https") || host.is_empty() {
+            return Err(fetch_error(&host, "invalid URL", &url));
+        }
+        if !policy.allowed_hosts.is_empty() && !allowlisted {
+            return Err(fetch_error(&host, "host not allowed", "not in MSTAR_REMOTE_ALLOWED_HOSTS"));
+        }
+        let addrs = url
+            .socket_addrs(|| None)
+            .map_err(|e| fetch_error(&host, "connection failed", e))?;
+        if !allowlisted && addrs.iter().any(|a| blocked_address(a.ip())) {
+            return Err(fetch_error(&host, "host not allowed", format!("resolves to {addrs:?}")));
+        }
+        match fetch_hop(&url, &host, &addrs, upload_dir, policy.max_bytes, deadline)? {
+            Hop::Redirect(next, location) => {
+                // only a Location with neither a scheme nor an authority (`//`, or
+                // `\\` as the URL parser also reads it) stays on this host as written
+                let first = location.split(['/', '\\', '?', '#']).next().unwrap_or("");
+                let relative = !first.contains(':')
+                    && !matches!(location.as_bytes(), [b'/' | b'\\', b'/' | b'\\', ..]);
+                if !relative {
+                    written = written_host(&location);
+                } else if next.host_str() != url.host_str() {
+                    written = None;
+                }
+                url = next;
+            }
+            Hop::Saved(modality, path) => return Ok((modality, path)),
+        }
+    }
+    Err(fetch_error(&host, "too many redirects", ""))
+}
+
+enum Hop {
+    /// The next URL and the `Location` text it came from.
+    Redirect(url::Url, String),
+    Saved(String, String),
+}
+
+enum BodyError {
+    TooLarge,
+    Read(io::Error),
+    Store(io::Error),
+}
+
+/// `host` as the allowlist and the address check spell it: lower-cased, without
+/// brackets around an IPv6 literal or a trailing dot.
+fn normalized_host(host: &str) -> String {
+    host.trim_start_matches('[')
+        .trim_end_matches(']')
+        .trim_end_matches('.')
+        .to_ascii_lowercase()
+}
+
+/// Answers every lookup with the one address `save_remote_url` has already
+/// vetted, and refuses any other host. ureq's connector reaches only what a
+/// resolver returns, so the name cannot resolve to something else between the
+/// address check and the connect.
+#[derive(Debug)]
+struct Pinned {
+    host: String,
+    addr: SocketAddr,
+}
+
+impl ureq::unversioned::resolver::Resolver for Pinned {
+    fn resolve(
+        &self,
+        uri: &ureq::http::Uri,
+        _config: &ureq::config::Config,
+        _timeout: ureq::unversioned::transport::NextTimeout,
+    ) -> Result<ResolvedSocketAddrs, ureq::Error> {
+        // one hop is one vetted host; redirects go back through save_remote_url
+        if normalized_host(uri.host().unwrap_or("")) != self.host {
+            return Err(ureq::Error::HostNotFound);
+        }
+        let mut out = self.empty();
+        out.push(self.addr);
+        Ok(out)
+    }
+}
+
+/// Whether a failed attempt concerns only the address tried, so the next
+/// vetted address may still answer. These are the kinds ureq's own connector
+/// retries, but it reads them from the connect alone while this reads them
+/// from the whole call: a route that disappears after the request was sent
+/// retries the GET on the next vetted address, where the socket client
+/// returned. Both stay inside the checked host, its vetted addresses and the
+/// fetch deadline, and only a call that returned no response is retried.
+fn addr_specific(e: &ureq::Error) -> bool {
+    matches!(
+        e,
+        ureq::Error::Io(io)
+            if matches!(
+                io.kind(),
+                io::ErrorKind::ConnectionRefused
+                    | io::ErrorKind::HostUnreachable
+                    | io::ErrorKind::NetworkUnreachable
+                    | io::ErrorKind::AddrNotAvailable
+            )
+    )
+}
+
+/// A failed call as one of the fetch's short reasons. The detail goes to the
+/// log only: ureq's messages name the host, the address and the upstream.
+fn request_error(host: &str, deadline: Instant, max_bytes: u64, e: &ureq::Error) -> String {
+    match e {
+        ureq::Error::Timeout(_) => fetch_error(host, "timed out", e),
+        ureq::Error::BodyExceedsLimit(_) => {
+            fetch_error(host, &format!("too large (limit {max_bytes} bytes)"), e)
+        }
+        ureq::Error::BadUri(_) | ureq::Error::Http(_) => fetch_error(host, "invalid URL", e),
+        ureq::Error::Io(io) => io_error(host, deadline, io),
+        // a protocol error (bad framing, an unreadable Content-Length, too many
+        // headers), a refused connection, or anything ureq adds later
+        _ => transport_error(host, deadline, e),
+    }
+}
+
+fn io_error(host: &str, deadline: Instant, e: &io::Error) -> String {
+    if e.kind() == io::ErrorKind::TimedOut {
+        return fetch_error(host, "timed out", e);
+    }
+    transport_error(host, deadline, e)
+}
+
+/// The MIME type from `Content-Type`, or from the URL path extension when it
+/// is missing or generic (mstar's fallback).
+fn mime_for(content_type: Option<&str>, url: &url::Url) -> String {
+    let mime = content_type.unwrap_or("").split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+    if !mime.is_empty() && mime != "application/octet-stream" {
+        return mime;
+    }
+    let suffix = PathBuf::from(url.path())
+        .extension()
+        .map(|e| format!(".{}", e.to_string_lossy()))
+        .unwrap_or_default();
+    match modality_from_ext(&suffix) {
+        "image" => format!("image/{}", suffix.trim_start_matches('.')),
+        "audio" => format!("audio/{}", suffix.trim_start_matches('.')),
+        "video" => format!("video/{}", suffix.trim_start_matches('.')),
+        _ => "application/octet-stream".to_string(),
+    }
+}
+
+/// The client settings for one hop. `proxy(None)` matters: ureq's default
+/// config takes a proxy from `ALL_PROXY` / `HTTPS_PROXY` / `HTTP_PROXY`, and a
+/// fetch sent to a proxy would reach neither the vetted addresses nor the
+/// checked host.
+fn hop_config(left: Duration) -> ureq::config::Config {
+    ureq::config::Config::builder()
+        .proxy(None)
+        .http_status_as_error(false)
+        .max_redirects(0)
+        .max_redirects_will_error(false)
+        .user_agent(REMOTE_USER_AGENT)
+        .timeout_global(Some(left))
+        // a fetch is one connection: nothing is kept for a later request
+        .max_idle_connections(0)
+        .max_idle_connections_per_host(0)
+        .build()
+}
+
+/// One GET to the vetted `addrs`: the next URL for a redirect, or the body
+/// saved under `upload_dir`.
+///
+/// ureq does the HTTP/1.1 and TLS work. The redirect loop stays in
+/// `save_remote_url` (`max_redirects(0)`, and a 3xx is a response rather than
+/// an error), so every hop is checked against the allowlist and the blocked
+/// ranges, the `Location` is read as the server wrote it, and the hop count
+/// stays at `REMOTE_MAX_REDIRECTS`.
+///
+/// The addresses are tried one call at a time, each with `timeout_global` set
+/// to what is left of the fetch deadline, so the handshake, the headers, the
+/// chunk framing and the body are all bounded by it and several addresses
+/// cannot spend it more than once. ureq's own address loop would: it moves on
+/// from a refusal without re-reading the clock or shrinking the next
+/// address's share (`try_connect_with` in its `transport::tcp`).
+fn fetch_hop(
+    url: &url::Url,
+    host: &str,
+    addrs: &[SocketAddr],
+    upload_dir: &Path,
+    max_bytes: u64,
+    deadline: Instant,
+) -> Result<Hop, String> {
+    let mut last: Option<ureq::Error> = None;
+    for addr in addrs {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(fetch_error(host, "timed out", "the fetch ran out of time"));
+        }
+        let agent = ureq::Agent::with_parts(
+            hop_config(left),
+            ureq::unversioned::transport::DefaultConnector::new(),
+            Pinned { host: host.to_string(), addr: *addr },
+        );
+        let call = agent
+            .get(url.as_str())
+            // the cap counts the bytes written to disk, so take the body as it is
+            .header("accept-encoding", "identity")
+            .call();
+        match call {
+            Ok(resp) => return read_hop(resp, url, host, upload_dir, max_bytes, deadline),
+            Err(e) if addr_specific(&e) => last = Some(e),
+            Err(e) => return Err(request_error(host, deadline, max_bytes, &e)),
+        }
+    }
+    match last {
+        Some(e) => Err(request_error(host, deadline, max_bytes, &e)),
+        None => Err(fetch_error(host, "connection failed", "no vetted address")),
+    }
+}
+
+/// The redirect this response points at, or its body saved under `upload_dir`.
+fn read_hop(
+    mut resp: ureq::http::Response<ureq::Body>,
+    url: &url::Url,
+    host: &str,
+    upload_dir: &Path,
+    max_bytes: u64,
+    deadline: Instant,
+) -> Result<Hop, String> {
+    let code = resp.status().as_u16();
+    match code {
+        301 | 302 | 303 | 307 | 308 => {
+            let location = resp
+                .headers()
+                .get("location")
+                .and_then(|v| v.to_str().ok())
+                .ok_or_else(|| fetch_error(host, "bad redirect", format!("{code} without Location")))?
+                .to_string();
+            if location.contains(URL_DROPPED) {
+                return Err(fetch_error(host, "invalid URL", format!("{location:?}")));
+            }
+            return url
+                .join(&location)
+                .map(|next| Hop::Redirect(next, location))
+                .map_err(|e| fetch_error(host, "invalid URL", e));
+        }
+        200..=299 => {}
+        _ => return Err(fetch_error(host, &format!("upstream returned {code}"), "")),
+    }
+    let too_large = format!("too large (limit {max_bytes} bytes)");
+    // as http.client: a non-numeric length is ignored; one past u64 is still a
+    // length, over any cap. The header is read as well as the framing ureq
+    // chose from it, so a length it does not frame a body with (a 204's, say)
+    // is still checked.
+    let declared = resp
+        .headers()
+        .get("content-length")
+        .and_then(|v| v.to_str().ok())
+        .filter(|v| !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()))
+        .map(|v| v.parse::<u64>().unwrap_or(u64::MAX));
+    for length in [resp.body().content_length(), declared].into_iter().flatten() {
+        if length > max_bytes {
+            return Err(fetch_error(host, &too_large, format!("Content-Length {length}")));
+        }
+    }
+    let mime = mime_for(resp.headers().get("content-type").and_then(|v| v.to_str().ok()), url);
+    std::fs::create_dir_all(upload_dir).map_err(|e| fetch_error(host, "could not save the file", e))?;
+    let path = upload_dir.join(format!("{}{}", Uuid::new_v4(), ext_for(&mime)));
+    // Two things ureq's reader is laxer about than the socket client was, both
+    // bounded by the fetch deadline and neither reaching the file: it consumes
+    // chunk trailers without counting their number or their bytes (the old
+    // reader stopped at 100 trailers and a 64 KiB line), and it reads a reset
+    // connection as the end of a body that has no declared length, where the
+    // old reader refused anything but a clean EOF. A body short of its
+    // `Content-Length` is still refused.
+    let copied = std::fs::File::create(&path).map_err(BodyError::Store).and_then(|mut f| {
+        // `limit` stops the read one byte past the cap, so the count below
+        // always reaches `max_bytes` first and names the refusal
+        let mut body = resp.body_mut().with_config().limit(max_bytes.saturating_add(1)).reader();
+        let mut buf = [0u8; 1 << 14];
+        let mut total = 0u64;
+        loop {
+            let n = match body.read(&mut buf) {
+                Ok(0) => return Ok(()),
+                Ok(n) => n,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(BodyError::Read(e)),
+            };
+            total += n as u64;
+            if total > max_bytes {
+                return Err(BodyError::TooLarge);
+            }
+            f.write_all(&buf[..n]).map_err(BodyError::Store)?;
+        }
+    });
+    match copied {
+        Ok(()) => Ok(Hop::Saved(modality_from_mime(&mime).to_string(), path.to_string_lossy().into_owned())),
+        Err(e) => {
+            let _ = std::fs::remove_file(&path);
+            Err(match e {
+                BodyError::TooLarge => fetch_error(host, &too_large, "body exceeded the limit"),
+                BodyError::Read(e) => io_error(host, deadline, &e),
+                BodyError::Store(e) => fetch_error(host, "could not save the file", e),
+            })
+        }
+    }
 }
 
 /// Resolve a media reference from a request: a data URL, or an `http(s)` URL
@@ -208,7 +638,7 @@ pub fn resolve_media_ref(
         if !allow_remote {
             return Err("Remote media fetch is disabled on this server".to_string());
         }
-        return save_remote_url(reference, upload_dir);
+        return save_remote_url(reference, upload_dir, RemotePolicy::from_env());
     }
     Err("server file paths are refused; send media as a data URL or a file upload".to_string())
 }
@@ -349,6 +779,8 @@ pub fn b64(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::{Arc, Mutex};
 
     #[test]
     fn a_stream_refuses_a_container_with_the_python_text() {
@@ -373,5 +805,550 @@ mod tests {
         ] {
             assert_eq!(py_repr(s), want, "{s:?}");
         }
+    }
+
+    const PNG: &[u8] = b"\x89PNG\r\n\x1a\n0123456789";
+    const LEAKY: &[u8] = b"upstream says: db.internal.corp 10.1.2.3 secret-token";
+    const TOO_LARGE: &str = "too large (limit 1000 bytes)";
+
+    enum Reply {
+        Bytes(Vec<u8>),
+        Hang,
+        Trickle,
+        Stall,
+        /// write the prefix, then one byte every 50 ms for 3 s
+        Drip(&'static [u8], u8),
+        /// wait, then write: a hop that costs time before it redirects
+        Delayed(Vec<u8>, Duration),
+    }
+
+    fn http(status: &str, headers: &str, body: &[u8]) -> Reply {
+        let head = format!(
+            "HTTP/1.1 {status}\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        Reply::Bytes([head.as_bytes(), body].concat())
+    }
+
+    fn chunked(total: usize) -> Reply {
+        let mut out = b"HTTP/1.1 200 OK\r\nContent-Type: video/mp4\r\n".to_vec();
+        out.extend_from_slice(b"Transfer-Encoding: chunked\r\n\r\n");
+        for _ in 0..total / 500 {
+            out.extend_from_slice(&[b"1f4\r\n", &[0u8; 500][..], b"\r\n"].concat());
+        }
+        out.extend_from_slice(b"0\r\n\r\n");
+        Reply::Bytes(out)
+    }
+
+    fn route(path: &str, port: u16) -> Reply {
+        let redirect = |status: &str, to: &str| http(status, &format!("Location: {to}\r\n"), b"");
+        match path {
+            "/a.png" => http("200 OK", "Content-Type: image/png\r\n", PNG),
+            "/untyped.png" => http("200 OK", "", PNG),
+            "/generic.png" => http("200 OK", "Content-Type: application/octet-stream\r\n", PNG),
+            "/r1" => redirect("301 Moved Permanently", "/r2"),
+            "/r2" => redirect("307 Temporary Redirect", &format!("http://127.0.0.1:{port}/r3")),
+            "/r3" => redirect("308 Permanent Redirect", "a.png"),
+            "/loop" => redirect("302 Found", "/loop"),
+            "/to-stall" => redirect("302 Found", "/stall"),
+            "/slow-to-stall" => {
+                let Reply::Bytes(out) = redirect("302 Found", "/stall") else { unreachable!() };
+                Reply::Delayed(out, Duration::from_millis(600))
+            }
+            "/to-localhost" => redirect("302 Found", &format!("http://localhost:{port}/a.png")),
+            "/to-short-form" => redirect("302 Found", &format!("//127.1:{port}/a.png")),
+            "/to-backslash-authority" => redirect("302 Found", &format!("\\\\127.1:{port}/a.png")),
+            "/to-tab" => redirect("302 Found", &format!("http://127.0.0.\t1:{port}/a.png")),
+            "/to-file" => redirect("302 Found", "file:///etc/passwd"),
+            // a body this size would never finish
+            "/big.png" => Reply::Bytes(b"HTTP/1.1 200 OK\r\nContent-Length: 1000000000000\r\n\r\n".to_vec()),
+            "/at.mp4" => chunked(1000),
+            "/over.mp4" => chunked(5000),
+            "/hang" => Reply::Hang,
+            "/trickle" => Reply::Trickle,
+            "/stall" => Reply::Stall,
+            "/drip-head" => Reply::Drip(b"HTTP/1.1 200 OK\r\nX-Slow: ", b'a'),
+            "/drip-chunk" => Reply::Drip(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n", b'0'),
+            "/long-chunk-line" => {
+                let mut out = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+                out.extend(std::iter::repeat(b'0').take(100_000));
+                out.extend_from_slice(b"1\r\nx\r\n0\r\n\r\n");
+                Reply::Bytes(out)
+            }
+            "/huge-length.png" => {
+                Reply::Bytes(b"HTTP/1.1 200 OK\r\nContent-Length: 18446744073709551616\r\n\r\nabc".to_vec())
+            }
+            "/empty-but-long.png" => {
+                Reply::Bytes(b"HTTP/1.1 204 No Content\r\nContent-Length: 5000\r\n\r\n".to_vec())
+            }
+            "/text-length.png" => {
+                Reply::Bytes(b"HTTP/1.1 200 OK\r\nContent-Length: abc\r\n\r\nabc".to_vec())
+            }
+            "/negative-chunk" => {
+                Reply::Bytes(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n-1\r\nabc".to_vec())
+            }
+            "/huge-negative-chunk" => Reply::Bytes(
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n-10000000000000000000000000\r\nabc".to_vec(),
+            ),
+            "/a.png;v=2?t=1" => http("200 OK", "Content-Type: image/png\r\n", PNG),
+            "/truncated.png" => Reply::Bytes(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nabc".to_vec()),
+            "/eof.png" => Reply::Bytes([b"HTTP/1.0 200 OK\r\nContent-Type: image/png\r\n\r\n", PNG].concat()),
+            status => http(&format!("{} Nope", &status[1..]), "", LEAKY),
+        }
+    }
+
+    /// A local HTTP server answering with `route`; returns its port and the request heads it saw.
+    fn serve() -> (u16, Arc<Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = seen.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let log = log.clone();
+                std::thread::spawn(move || answer(stream, port, &log));
+            }
+        });
+        (port, seen)
+    }
+
+    fn answer(mut s: TcpStream, port: u16, log: &Mutex<Vec<String>>) {
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            if s.read(&mut byte).unwrap_or(0) == 0 {
+                return;
+            }
+            head.push(byte[0]);
+        }
+        let head = String::from_utf8_lossy(&head).into_owned();
+        let path = head.split_whitespace().nth(1).unwrap_or("").to_string();
+        log.lock().unwrap().push(head);
+        match route(&path, port) {
+            Reply::Bytes(out) => {
+                let _ = s.write_all(&out);
+            }
+            Reply::Hang => std::thread::sleep(Duration::from_secs(3)),
+            Reply::Trickle => {
+                let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n");
+                for _ in 0..100 {
+                    if s.write_all(b"x").is_err() {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+            Reply::Stall => {
+                std::thread::sleep(Duration::from_millis(700));
+                let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nx");
+                std::thread::sleep(Duration::from_secs(3));
+            }
+            Reply::Delayed(out, wait) => {
+                std::thread::sleep(wait);
+                let _ = s.write_all(&out);
+            }
+            Reply::Drip(prefix, byte) => {
+                let _ = s.write_all(prefix);
+                for _ in 0..60 {
+                    if s.write_all(&[byte]).is_err() {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+        }
+    }
+
+    fn policy(hosts: &[&str], max_bytes: u64, timeout: Duration) -> RemotePolicy {
+        let allowed_hosts = hosts.iter().map(|h| h.to_string()).collect();
+        RemotePolicy { allowed_hosts, max_bytes, timeout }
+    }
+
+    fn local() -> RemotePolicy {
+        policy(&["127.0.0.1"], REMOTE_MAX_BYTES, Duration::from_secs(30))
+    }
+
+    /// Fetch into a fresh upload dir; a failed fetch must leave nothing behind.
+    fn fetch(url: &str, policy: &RemotePolicy) -> Result<(String, Vec<u8>), String> {
+        let dir = std::env::temp_dir().join(format!("mstar-remote-{}", Uuid::new_v4()));
+        let out = save_remote_url(url, &dir, policy).map(|(m, p)| (m, std::fs::read(p).unwrap()));
+        if out.is_err() {
+            let left = std::fs::read_dir(&dir).map(|d| d.count()).unwrap_or(0);
+            assert_eq!(left, 0, "upload left behind");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        out
+    }
+
+    fn refused(url: &str, policy: &RemotePolicy, reason: &str) {
+        assert_eq!(fetch(url, policy).unwrap_err(), format!("remote media fetch failed: {reason}"));
+    }
+
+    #[test]
+    fn internal_addresses_are_blocked() {
+        for a in [
+            "127.0.0.1", "10.1.2.3", "172.16.0.1", "192.168.1.1", "169.254.169.254",
+            "100.100.100.200", "0.0.0.0", "224.0.0.1", "239.1.1.1", "255.255.255.255", "::1", "::",
+            "fe80::1", "fd00:ec2::254", "ff02::1", "::ffff:127.0.0.1", "::ffff:169.254.169.254",
+            "64:ff9b::7f00:1", "64:ff9b::a9fe:a9fe", "64:ff9b:1::808:808", "2002:7f00:1::",
+            "2002:a00:1:2::3", "::127.0.0.1", "::169.254.169.254",
+        ] {
+            assert!(blocked_address(a.parse().unwrap()), "{a}");
+        }
+        for a in [
+            "8.8.8.8", "1.1.1.1", "2606:4700:4700::1111", "::ffff:8.8.8.8", "64:ff9b::808:808",
+            "2002:808:808::1", "::8.8.8.8",
+        ] {
+            assert!(!blocked_address(a.parse().unwrap()), "{a}");
+        }
+    }
+
+    #[test]
+    fn wildcard_entries_match_subdomains_only() {
+        let p = policy(&["*.media.test", "example.org"], 1, Duration::ZERO);
+        for host in ["cdn.media.test", "a.b.media.test", "example.org"] {
+            assert!(p.allowlisted(host, Some(host)), "{host}");
+        }
+        for host in ["media.test", "evilmedia.test", "www.example.org"] {
+            assert!(!p.allowlisted(host, Some(host)), "{host}");
+        }
+    }
+
+    /// The host each URL is matched against, or `None` when another spelling
+    /// keeps it from matching any allowlist entry. Same table as
+    /// `test_only_the_canonical_spelling_matches_the_allowlist` in Python.
+    fn allowlist_host(raw: &str) -> Option<String> {
+        let url = url::Url::parse(raw).ok()?;
+        let host = url.host_str()?.trim_start_matches('[').trim_end_matches(']').trim_end_matches('.');
+        (written_host(raw).as_deref() == Some(host)).then(|| host.to_string())
+    }
+
+    #[test]
+    fn only_the_canonical_spelling_matches_the_allowlist() {
+        for (raw, host) in [
+            ("http://127.0.0.1:8000/a.png", "127.0.0.1"),
+            ("http://127.0.0.1./a.png", "127.0.0.1"),
+            ("http://user@Example.ORG/a.png", "example.org"),
+            ("https://[::1]:8443/a.png", "::1"),
+            ("http://[::ffff:7f00:1]/a.png", "::ffff:7f00:1"),
+            ("http://0xg/a.png", "0xg"),
+        ] {
+            assert_eq!(allowlist_host(raw).as_deref(), Some(host), "{raw}");
+        }
+        for raw in [
+            "http://2130706433/a.png",
+            "http://0x7f000001/a.png",
+            "http://127.1/a.png",
+            "http://127.0.0.01/a.png",
+            "http://0177.0.0.1/a.png",
+            "http://[0:0:0:0:0:0:0:1]/a.png",
+            "http://[::ffff:127.0.0.1]/a.png",
+            "http://%31%32%37.0.0.1/a.png",
+            "http://b\u{fc}cher.example/a.png",
+        ] {
+            assert_eq!(allowlist_host(raw), None, "{raw}");
+        }
+    }
+
+    #[test]
+    fn other_spellings_of_an_allowlisted_address_are_refused() {
+        let (port, seen) = serve();
+        for host in ["2130706433", "0x7f000001", "127.1", "127.0.0.01"] {
+            refused(&format!("http://{host}:{port}/a.png"), &local(), "host not allowed");
+        }
+        let numeric = policy(&["2130706433"], REMOTE_MAX_BYTES, Duration::from_secs(30));
+        refused(&format!("http://2130706433:{port}/a.png"), &numeric, "host not allowed");
+        refused(&format!("http://127.0.0.1:{port}/to-short-form"), &local(), "host not allowed");
+        refused(&format!("http://127.0.0.1:{port}/to-backslash-authority"), &local(), "host not allowed");
+        // the parsers drop tabs and newlines, which would make `127.0.0.\t1` read as 127.0.0.1
+        refused(&format!("http://127.0.0.\t1:{port}/a.png"), &local(), "invalid URL");
+        refused(&format!("http://127.0.0.1:{port}/to-tab"), &local(), "invalid URL");
+        let paths: Vec<String> = seen.lock().unwrap().iter().map(|h| h.split(' ').nth(1).unwrap().to_string()).collect();
+        assert_eq!(paths, ["/to-short-form", "/to-backslash-authority", "/to-tab"], "only redirecting hops reach the server");
+    }
+
+    #[test]
+    fn allowlisted_host_is_fetched() {
+        let (port, seen) = serve();
+        let (modality, body) = fetch(&format!("http://127.0.0.1:{port}/a.png"), &local()).unwrap();
+        assert_eq!((modality.as_str(), body.as_slice()), ("image", PNG));
+        let head = seen.lock().unwrap()[0].to_ascii_lowercase();
+        assert!(head.contains("\r\nuser-agent: mstar\r\n"), "{head:?}");
+        // one identity Accept-Encoding, so the size cap counts the stored bytes
+        assert_eq!(head.matches("\r\naccept-encoding: identity\r\n").count(), 1, "{head:?}");
+        assert_eq!(head.matches("accept-encoding").count(), 1, "{head:?}");
+    }
+
+    /// The fetch reaches the address it was handed and nothing else. The name
+    /// here is in a TLD that never resolves, so a body that arrives can only
+    /// have come from the vetted address, and a hop for a host that was not
+    /// vetted is refused before any connection.
+    #[test]
+    fn the_fetch_goes_only_to_the_vetted_address() {
+        let (port, seen) = serve();
+        let vetted = [SocketAddr::from(([127, 0, 0, 1], port))];
+        let dir = std::env::temp_dir().join(format!("mstar-remote-{}", Uuid::new_v4()));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let url = url::Url::parse("http://pinned.invalid/a.png").unwrap();
+        let hop = fetch_hop(&url, "pinned.invalid", &vetted, &dir, REMOTE_MAX_BYTES, deadline).unwrap();
+        let Hop::Saved(modality, path) = hop else { panic!("expected a saved body") };
+        assert_eq!((modality.as_str(), std::fs::read(&path).unwrap().as_slice()), ("image", PNG));
+        // reached with the name it was asked for, not with the address
+        assert!(seen.lock().unwrap()[0].to_ascii_lowercase().contains("\r\nhost: pinned.invalid\r\n"));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let other = url::Url::parse("http://other.invalid/a.png").unwrap();
+        let refusal = fetch_hop(&other, "pinned.invalid", &vetted, &dir, REMOTE_MAX_BYTES, deadline);
+        assert!(matches!(&refusal, Err(e) if e == "remote media fetch failed: connection failed"));
+        assert_eq!(seen.lock().unwrap().len(), 1, "a host that was not vetted reaches no server");
+    }
+
+    /// A proxy in the environment does not divert a fetch: ureq's default config
+    /// would take one, and the request would then go to the proxy instead of the
+    /// vetted address, with neither the host nor the address checked.
+    #[test]
+    fn a_proxy_in_the_environment_is_ignored() {
+        let (port, seen) = serve();
+        // a port nothing listens on: were the proxy used, the fetch would fail
+        let sink = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let vars = ["ALL_PROXY", "HTTPS_PROXY", "HTTP_PROXY"];
+        let was: Vec<_> = vars.iter().map(|v| (v, std::env::var(v).ok())).collect();
+        for var in vars {
+            std::env::set_var(var, format!("http://127.0.0.1:{sink}"));
+        }
+        assert!(hop_config(Duration::from_secs(5)).proxy().is_none());
+        let fetched = fetch(&format!("http://127.0.0.1:{port}/a.png"), &local());
+        for (var, before) in was {
+            match before {
+                Some(v) => std::env::set_var(var, v),
+                None => std::env::remove_var(var),
+            }
+        }
+        assert_eq!(fetched.unwrap().1, PNG);
+        assert!(seen.lock().unwrap()[0].starts_with("GET /a.png HTTP/1.1\r\n"), "went straight to the host");
+    }
+
+    /// The deadline covers the whole fetch, not one hop: each hop gets only what
+    /// is left of it. The first hop spends 600 ms of a 1 s budget before it
+    /// redirects, so the stall behind it has about 400 ms; a hop that started
+    /// the budget again would run to about 1.6 s instead.
+    #[test]
+    fn the_deadline_is_not_reset_by_a_redirect() {
+        let (port, seen) = serve();
+        let one_second = policy(&["127.0.0.1"], REMOTE_MAX_BYTES, Duration::from_secs(1));
+        let started = Instant::now();
+        refused(&format!("http://127.0.0.1:{port}/slow-to-stall"), &one_second, "timed out");
+        let took = started.elapsed();
+        assert!(took > Duration::from_millis(600), "the first hop was not reached: {took:?}");
+        assert!(took < Duration::from_millis(1300), "the deadline restarted: {took:?}");
+        assert_eq!(seen.lock().unwrap().len(), 2, "the redirect was followed, then it timed out");
+    }
+
+    /// Every vetted address is tried in turn, and none is tried once the
+    /// deadline has passed. That the deadline also covers them all together
+    /// comes from the one-address-per-call shape of `fetch_hop`, which keeps
+    /// ureq's own address loop (and its missing elapsed check) out of the way;
+    /// a refused connection returns too quickly to show the difference here.
+    #[test]
+    fn the_addresses_are_tried_in_turn_within_one_deadline() {
+        let (port, seen) = serve();
+        // bound then dropped: nothing listens there, so the connect is refused
+        let refuses = |_| {
+            let p = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+            SocketAddr::from(([127, 0, 0, 1], p))
+        };
+        let addrs = [refuses(0), refuses(1), SocketAddr::from(([127, 0, 0, 1], port))];
+        let dir = std::env::temp_dir().join(format!("mstar-remote-{}", Uuid::new_v4()));
+        let url = url::Url::parse("http://pinned.invalid/a.png").unwrap();
+        let started = Instant::now();
+        let hop =
+            fetch_hop(&url, "pinned.invalid", &addrs, &dir, REMOTE_MAX_BYTES, started + Duration::from_secs(5))
+                .unwrap();
+        let Hop::Saved(_, path) = hop else { panic!("expected a saved body") };
+        assert_eq!(std::fs::read(&path).unwrap(), PNG, "the third address answered");
+        assert_eq!(seen.lock().unwrap().len(), 1);
+
+        // past the deadline no address is tried at all
+        let out = fetch_hop(&url, "pinned.invalid", &addrs, &dir, REMOTE_MAX_BYTES, Instant::now());
+        assert!(matches!(&out, Err(e) if e == "remote media fetch failed: timed out"), "not refused");
+        assert_eq!(seen.lock().unwrap().len(), 1, "nothing is tried past the deadline");
+        assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A `Content-Length` over the cap is refused even when ureq does not frame
+    /// the body with it (a 204 carrying one is invalid, and was refused before).
+    #[test]
+    fn a_declared_length_over_the_cap_is_refused_whatever_the_framing() {
+        let (port, _) = serve();
+        let small = policy(&["127.0.0.1"], 1000, Duration::from_secs(5));
+        refused(&format!("http://127.0.0.1:{port}/empty-but-long.png"), &small, TOO_LARGE);
+    }
+
+    #[test]
+    fn hosts_outside_the_allowlist_are_refused() {
+        let (port, seen) = serve();
+        refused(&format!("http://localhost:{port}/a.png"), &local(), "host not allowed");
+        let other = policy(&["example.org"], REMOTE_MAX_BYTES, Duration::from_secs(30));
+        refused(&format!("http://127.0.0.1:{port}/a.png"), &other, "host not allowed");
+        assert!(seen.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn internal_addresses_are_refused_unless_allowlisted() {
+        let (port, seen) = serve();
+        let open = policy(&[], REMOTE_MAX_BYTES, Duration::from_secs(30));
+        for host in ["127.0.0.1", "localhost", "[::1]", "169.254.169.254", "10.0.0.1"] {
+            refused(&format!("http://{host}:{port}/a.png"), &open, "host not allowed");
+        }
+        assert!(seen.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn redirect_to_a_host_outside_the_allowlist_is_refused() {
+        let (port, seen) = serve();
+        refused(&format!("http://127.0.0.1:{port}/to-localhost"), &local(), "host not allowed");
+        refused(&format!("http://127.0.0.1:{port}/to-file"), &local(), "invalid URL");
+        assert_eq!(seen.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn redirects_are_followed_up_to_the_cap() {
+        let (port, seen) = serve();
+        assert_eq!(fetch(&format!("http://127.0.0.1:{port}/r1"), &local()).unwrap().1, PNG);
+        seen.lock().unwrap().clear();
+        refused(&format!("http://127.0.0.1:{port}/loop"), &local(), "too many redirects");
+        assert_eq!(seen.lock().unwrap().len(), REMOTE_MAX_REDIRECTS + 1);
+    }
+
+    #[test]
+    fn content_length_over_the_cap_is_refused_before_reading() {
+        let (port, _) = serve();
+        let small = policy(&["127.0.0.1"], 1000, Duration::from_secs(5));
+        let started = Instant::now();
+        refused(&format!("http://127.0.0.1:{port}/big.png"), &small, TOO_LARGE);
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn body_without_content_length_is_capped_while_streaming() {
+        let (port, _) = serve();
+        let small = policy(&["127.0.0.1"], 1000, Duration::from_secs(30));
+        refused(&format!("http://127.0.0.1:{port}/over.mp4"), &small, TOO_LARGE);
+        let (modality, body) = fetch(&format!("http://127.0.0.1:{port}/at.mp4"), &small).unwrap();
+        assert_eq!((modality.as_str(), body.len()), ("video", 1000));
+    }
+
+    #[test]
+    fn upstream_errors_become_a_short_message() {
+        let (port, _) = serve();
+        for status in [403, 404, 500, 502] {
+            let reason = format!("upstream returned {status}");
+            refused(&format!("http://127.0.0.1:{port}/{status}"), &local(), &reason);
+        }
+    }
+
+    #[test]
+    fn the_whole_fetch_is_bounded_by_the_timeout() {
+        let (port, _) = serve();
+        let quick = policy(&["127.0.0.1"], REMOTE_MAX_BYTES, Duration::from_millis(500));
+        for path in ["/hang", "/trickle"] {
+            let started = Instant::now();
+            refused(&format!("http://127.0.0.1:{port}{path}"), &quick, "timed out");
+            assert!(started.elapsed() < Duration::from_secs(2), "{path}");
+        }
+    }
+
+    #[test]
+    fn a_read_that_stalls_late_still_ends_at_the_deadline() {
+        let (port, _) = serve();
+        let one_second = policy(&["127.0.0.1"], REMOTE_MAX_BYTES, Duration::from_secs(1));
+        let started = Instant::now();
+        refused(&format!("http://127.0.0.1:{port}/stall"), &one_second, "timed out");
+        assert!(started.elapsed() < Duration::from_millis(1500));
+    }
+
+    #[test]
+    fn trickled_headers_and_chunk_framing_end_at_the_deadline() {
+        let (port, _) = serve();
+        let quick = policy(&["127.0.0.1"], REMOTE_MAX_BYTES, Duration::from_millis(500));
+        for path in ["/drip-head", "/drip-chunk"] {
+            let started = Instant::now();
+            refused(&format!("http://127.0.0.1:{port}{path}"), &quick, "timed out");
+            assert!(started.elapsed() < Duration::from_millis(1500), "{path}");
+        }
+    }
+
+    #[test]
+    fn malformed_bodies_are_refused() {
+        let (port, _) = serve();
+        // an over-long chunk-size line, negative chunk sizes, and a body shorter
+        // than its Content-Length. ureq bounds the whole size line, extensions
+        // included, at 20 bytes, so it refuses a long one sooner than the Python
+        // frontend's 64 KiB line bound does; a valid chunk extension past 20
+        // bytes is refused here and read there.
+        for path in ["/long-chunk-line", "/negative-chunk", "/huge-negative-chunk", "/truncated.png"] {
+            refused(&format!("http://127.0.0.1:{port}{path}"), &local(), "connection failed");
+        }
+    }
+
+    /// A `Content-Length` the HTTP client cannot read is refused before any of
+    /// the body is kept. ureq rejects such a response outright, so both of these
+    /// are `connection failed` here. The Python frontend answers `too large` for
+    /// the one past 64 bits and reads the non-numeric one to EOF, so this is
+    /// where the two frontends differ; nothing is written either way.
+    #[test]
+    fn an_unreadable_content_length_is_refused() {
+        let (port, _) = serve();
+        let small = policy(&["127.0.0.1"], 1000, Duration::from_secs(5));
+        for path in ["/huge-length.png", "/text-length.png"] {
+            refused(&format!("http://127.0.0.1:{port}{path}"), &small, "connection failed");
+        }
+    }
+
+    #[test]
+    fn the_request_target_keeps_params_and_query() {
+        let (port, seen) = serve();
+        assert_eq!(fetch(&format!("http://127.0.0.1:{port}/a.png;v=2?t=1"), &local()).unwrap().1, PNG);
+        assert!(seen.lock().unwrap()[0].starts_with("GET /a.png;v=2?t=1 HTTP/1.1\r\n"));
+    }
+
+    #[test]
+    fn unparseable_urls_are_a_short_message() {
+        for url in ["http://[db.internal.corp]/a.png", "http://127.0.0.1:99999/a.png"] {
+            refused(url, &local(), "invalid URL");
+        }
+    }
+
+    #[test]
+    fn a_body_that_runs_to_eof_is_fetched() {
+        let (port, _) = serve();
+        let (modality, body) = fetch(&format!("http://127.0.0.1:{port}/eof.png"), &local()).unwrap();
+        assert_eq!((modality.as_str(), body.as_slice()), ("image", PNG));
+    }
+
+    #[test]
+    fn a_storage_failure_is_a_short_message() {
+        let (port, _) = serve();
+        let occupied = std::env::temp_dir().join(format!("mstar-remote-{}", Uuid::new_v4()));
+        std::fs::write(&occupied, b"not a directory").unwrap();
+        let out = save_remote_url(&format!("http://127.0.0.1:{port}/a.png"), &occupied, &local());
+        let _ = std::fs::remove_file(&occupied);
+        assert_eq!(out.unwrap_err(), "remote media fetch failed: could not save the file");
+    }
+
+    #[test]
+    fn a_missing_or_generic_content_type_falls_back_to_the_url_extension() {
+        let (port, _) = serve();
+        for path in ["/untyped.png", "/generic.png"] {
+            let (modality, body) = fetch(&format!("http://127.0.0.1:{port}{path}"), &local()).unwrap();
+            assert_eq!((modality.as_str(), body.as_slice()), ("image", PNG), "{path}");
+        }
+    }
+
+    #[test]
+    fn connection_failure_does_not_echo_transport_details() {
+        let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        refused(&format!("http://127.0.0.1:{port}/a.png"), &local(), "connection failed");
     }
 }

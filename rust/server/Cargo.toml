@@ -26,7 +26,11 @@ form_urlencoded = "1"
 uuid = { version = "1", features = ["v4"] }
 serde_bytes = "0.11"
 tower-http = { version = "0.5", features = ["cors"] }
-ureq = { version = "2", default-features = false, features = ["tls"] }
+# The remote media fetch. Pinned to a minor: the `Resolver` that holds the
+# fetch to its vetted addresses lives in ureq's `unversioned` module, which the
+# crate may change in a minor release.
+ureq = { version = "~3.5", default-features = false, features = ["rustls"] }
+url = "2"
 # Constant-time API key compare; already in the tree through rustls.
 subtle = "2"
 # `\p{M}` and the printable classes for the Python-rule text code; already in the tree through tokenizers.
