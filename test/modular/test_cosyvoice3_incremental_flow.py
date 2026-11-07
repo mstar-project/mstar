@@ -474,3 +474,48 @@ def test_a_row_past_its_budget_carries_on_by_resolving():
         want = rig.flow.solve_rows([row], cfg.flow.cfm.n_timesteps)[0]
     assert (got.float() - want.float()).abs().mean() < 0.05 * want.abs().mean()
     assert np.isfinite(got.float().cpu().numpy()).all()
+
+
+def close(got, want):
+    # a few bfloat16 rounding steps, relative to each value
+    assert ((got.float() - want).abs() <= 0.03 * want.abs().clamp_min(1.0)).all()
+
+
+@cuda
+def test_the_fused_kernels_match_the_plain_ops():
+    """A block's residual norm and partial rotary, against the modules they stand in for."""
+    from mstar.model.cosyvoice3.components.dit import (
+        _modulated_norm,
+        _residual_modulated_norm,
+        _table,
+        apply_partial_rotary,
+    )
+    from mstar.model.cosyvoice3.components.dit_kernels import partial_rotary_
+
+    device = torch.device("cuda")
+    gen = torch.Generator(device=device).manual_seed(0)
+    # a width past a multiple of 128 too: the scaffold's kernel masks its columns
+    for dim in (1024, 1000):
+        x = torch.randn(37, dim, dtype=torch.bfloat16, device=device, generator=gen)
+        y = torch.randn(37, dim, dtype=torch.bfloat16, device=device, generator=gen)
+        gate, shift, scale = (torch.randn(1, dim, dtype=torch.bfloat16, device=device, generator=gen) for _ in range(3))
+
+        def plain_norm(v, dim=dim, shift=shift, scale=scale):
+            return F.layer_norm(v.float(), (dim,), eps=1e-6) * (1 + scale.float()) + shift.float()
+
+        close(_modulated_norm(x, _table(shift), _table(scale), 1e-6), plain_norm(x))
+        out, norm = _residual_modulated_norm(x, y, _table(gate), _table(shift), _table(scale), 1e-6)
+        want = (x.float() + gate.float() * y.float()).to(torch.bfloat16).float()
+        close(out, want)
+        close(norm, plain_norm(want))
+
+    q = torch.randn(300, 1024, dtype=torch.bfloat16, device=device, generator=gen)
+    k = torch.randn(300, 1024, dtype=torch.bfloat16, device=device, generator=gen)
+    freqs = torch.outer(torch.arange(300, device=device).float(), torch.rand(32, device=device, generator=gen))
+    freqs = torch.stack((freqs, freqs), dim=-1).flatten(-2)
+    want_q = apply_partial_rotary(q[None], freqs[None])[0].clone()
+    want_k = apply_partial_rotary(k[None], freqs[None])[0].clone()
+    partial_rotary_(q, k, freqs.cos(), freqs.sin())
+    assert torch.equal(q[:, 64:], want_q[:, 64:])
+    close(q, want_q.float())
+    close(k, want_k.float())

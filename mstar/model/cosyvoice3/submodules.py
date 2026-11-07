@@ -1029,6 +1029,10 @@ class FlowSubmodule(NodeSubmodule):
         del autocast_dtype, tp_world_size, kwargs
         regions: dict[str, PiecewiseAcceleratorGraphConfig] = {}
         if self.config.flow_cache_frames > 0:
+            if device.type == "cuda":
+                self.flow.decoder.estimator.prepare_fused(
+                    self.flow.decoder.time_grid(self.config.flow.cfm.n_timesteps, device, torch.float32, meanflow=False)
+                )
             regions[FLOW_NEW_FRAMES_REGION] = PiecewisePackedConfig(
                 capture_fn=self._new_frames_capture,
                 make_static_inputs=functools.partial(self._new_frames_static_inputs, device=device),
