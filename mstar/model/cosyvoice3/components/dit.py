@@ -38,6 +38,7 @@ paths match ``flow.pt`` under ``decoder.estimator.``.
 from __future__ import annotations
 
 import math
+from typing import NamedTuple
 
 import torch
 import torch.nn.functional as F
@@ -148,6 +149,18 @@ class Attention(nn.Module):
         return self.to_out[0](out) * row_keep
 
 
+    def forward_packed(self, x: torch.Tensor, attend, real: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
+        """``x`` ``[1, N, C]`` of packed rows. ``attend`` writes the K/V to the cache
+        and reads the rows' prefixes; ``real`` ``[N]`` is False on a bucket's padded
+        tail, which the kernel leaves unwritten."""
+        n = x.shape[1]
+        q = apply_partial_rotary(self.to_q(x), freqs).view(n, self.heads, -1)
+        k = apply_partial_rotary(self.to_k(x), freqs).view(n, self.heads, -1)
+        v = self.to_v(x).view(n, self.heads, -1)
+        out = torch.where(real[:, None, None], attend(q, k, v).to(q.dtype), 0.0)
+        return self.to_out[0](out.reshape(1, n, -1))
+
+
 class AdaLayerNormZero(nn.Module):
     def __init__(self, dim: int):
         super().__init__()
@@ -198,6 +211,46 @@ class DiTBlock(nn.Module):
         x = x + gate_msa.unsqueeze(1) * self.attn(norm, attn_mask, row_keep, freqs)
         ff_in = self.ff_norm(x) * (1 + scale_mlp[:, None]) + shift_mlp[:, None]
         return x + gate_mlp.unsqueeze(1) * self.ff(ff_in)
+
+
+    def forward_packed(self, x, t, attend, real, freqs):
+        norm, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.attn_norm(x, t)
+        x = x + gate_msa.unsqueeze(1) * self.attn.forward_packed(norm, attend, real, freqs)
+        ff_in = self.ff_norm(x) * (1 + scale_mlp[:, None]) + shift_mlp[:, None]
+        return x + gate_mlp.unsqueeze(1) * self.ff(ff_in)
+
+
+class PackedRows(NamedTuple):
+    """Where a step's new frames sit, for a DiT pass over them alone.
+
+    Tokens are packed row by row in a branch's buffer; the blocks see every row's
+    conditional frames then, in the same order, its unconditional ones (``plan_order``).
+    A row's two causal convolutions run over a sequence that lays its kept tail right
+    before its new frames, so each new frame reads what a whole-utterance convolution
+    would. Position 0 of that sequence is
+    scratch: what a padded buffer leaves at zero (padding rows and tokens) lands there.
+    """
+
+    positions: torch.Tensor  # [T] long, each token's frame in its row
+    seq_at: torch.Tensor  # [T] long, each token's place in the convolution sequence
+    tail_at: torch.Tensor  # [B, K-1] long, where each row's kept tail goes
+    last_at: torch.Tensor  # [B, K-1] long, the row's tail after its new frames
+    real: torch.Tensor  # [T] bool, False on the padded tail
+
+
+def plan_order(real: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Permutations between the two CFG branches stacked as buffers, ``[cond T | uncond T]``,
+    and the KV and attention plan's order, ``[cond R | uncond R | padding]``, where ``R``
+    is the real tokens (``real``'s ``True`` prefix). Returns ``(to_plan, to_stacked)``:
+    ``stacked[to_plan]`` is in plan order, ``planned[to_stacked]`` back in buffer order.
+    Built on the device, so a captured graph follows each replay's ``R``."""
+    t = real.shape[0]
+    r = real.sum()
+    s = torch.arange(2 * t, device=real.device)
+    branch, i = s // t, s % t
+    to_stacked = torch.where(i < r, branch * r + i, 2 * r + branch * (t - r) + (i - r))
+    to_plan = torch.empty_like(s).scatter_(0, to_stacked, s)
+    return to_plan, to_stacked
 
 
 class DiT(nn.Module):
@@ -259,3 +312,50 @@ class DiT(nn.Module):
         for block in self.transformer_blocks:
             h = block(h, temb, keep, row_keep, freqs)
         return self.proj_out(self.norm_out(h, temb)).transpose(1, 2).to(out_dtype)
+
+    def _conv_position(
+        self, h: torch.Tensor, tails: torch.Tensor, rows: PackedRows
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Position embedding of new frames ``h`` ``[2, T, D]`` (one row of ``h`` per CFG
+        branch) off the rows' tails ``[2, 2, B, K-1, D]`` (branch, convolution, row).
+        Returns the embedding and the next tails."""
+        kernel = self.config.conv_pos_kernel
+        convs = (self.input_embed.conv_pos_embed.conv1, self.input_embed.conv_pos_embed.conv2)
+        length = rows.seq_at.shape[0] + rows.tail_at.numel() + 1
+        next_tails = []
+        x = h
+        for c, conv in enumerate(convs):
+            seq = h.new_zeros(2, length, h.shape[-1])
+            seq[:, rows.tail_at.reshape(-1)] = tails[:, c].reshape(2, -1, h.shape[-1])
+            seq[:, rows.seq_at] = x
+            next_tails.append(seq[:, rows.last_at.reshape(-1)].reshape(tails[:, c].shape))
+            out = conv(F.pad(seq.transpose(1, 2), (kernel - 1, 0))).transpose(1, 2)
+            x = out[:, rows.seq_at]
+        return x, torch.stack(next_tails, dim=1)
+
+    def forward_new_frames(self, x, cond, mu, spks, t, tails, rows: PackedRows, attend, layer_base: int):
+        """One classifier-free-guided evaluation of new frames, over the cached K/V of
+        the frames before them: the conditional half of ``x``/``cond``/``mu``/``spks``
+        ``[T, 80]``, the unconditional half with zero ``cond``/``mu``/``spks``. Returns
+        (velocities ``[2, T, 80]``, next tails)."""
+        dtype = self.proj_out.weight.dtype
+        x, cond, mu, spks = (v.to(dtype) for v in (x, cond, mu, spks))
+        zeros = torch.zeros_like(mu)
+        h = self.input_embed.proj(
+            torch.stack([torch.cat([x, cond, mu, spks], dim=-1), torch.cat([x, zeros, zeros, zeros], dim=-1)])
+        )
+        conv, tails = self._conv_position(h, tails, rows)
+        # the blocks run in the plan's token order, which packs the branches' real tokens
+        # together however far the buffers are padded
+        to_plan, to_stacked = plan_order(rows.real)
+        h = (conv + h).reshape(-1, h.shape[-1]).index_select(0, to_plan)[None]
+        temb = self.time_embed(t.reshape(1))
+        positions = rows.positions.repeat(2).index_select(0, to_plan).float()
+        freqs = torch.outer(positions, self.inv_freq)
+        freqs = torch.stack((freqs, freqs), dim=-1).flatten(-2)[None]
+        real = rows.real.repeat(2).index_select(0, to_plan)
+        for b, block in enumerate(self.transformer_blocks):
+            attend.set_layer_idx(layer_base + b)
+            h = block.forward_packed(h, temb, attend, real, freqs)
+        v = self.proj_out(self.norm_out(h, temb))[0].index_select(0, to_stacked)
+        return v.reshape(2, -1, v.shape[-1]), tails
