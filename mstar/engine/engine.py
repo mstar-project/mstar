@@ -2748,12 +2748,10 @@ class Engine:
                     if streamed:
                         if (slot.run is None or slot.run.state.membership is not None or lease.bucket.bs != 1):
                             guard.refuse("streamed composition needs captured fixed-membership one-row bodies")
-                        kind = type(submodule)
-                        if (kind.postprocess is not NodeSubmodule.postprocess
-                                or kind.batch_postprocess is not NodeSubmodule.batch_postprocess
-                                or kind.filter_batched_output is not NodeSubmodule.filter_batched_output
-                                or kind.unpack_packed_outputs is not NodeSubmodule.unpack_packed_outputs):
-                            guard.refuse("a streamed member has a host tail that needs selected per-iteration metadata")
+                        if self._custom_output_tail(submodule) and (
+                            not stream_incoming or batch.step_context.repeats != 1
+                        ):
+                            guard.refuse("a custom streamed tail needs one consumer compute and no producer transform")
                     elif slot.run is not None or batch.step_context.resident is not None:
                         guard.refuse("connected resident runs need their shared run state staged before launch")
                     batch.step_context.unit_id = group.claim
@@ -3018,6 +3016,46 @@ class Engine:
             for _, batch in reversed(group.members):
                 batch.release_waiters()
 
+    @staticmethod
+    def _custom_output_tail(submodule: NodeSubmodule) -> bool:
+        kind = type(submodule)
+        return (kind.postprocess is not NodeSubmodule.postprocess
+                or kind.batch_postprocess is not NodeSubmodule.batch_postprocess
+                or kind.filter_batched_output is not NodeSubmodule.filter_batched_output
+                or kind.unpack_packed_outputs is not NodeSubmodule.unpack_packed_outputs)
+
+    def materialize_group_inputs(self, batch: ExecutingBatch, producer: str, signal: str,
+                                 selected: int, width: int) -> None:
+        """Give a single ordinary tail its actual, still-retained stream input."""
+        if not width or not self._custom_output_tail(self._submodules[batch.node_name].submodule):
+            return
+        if width != 1 or batch.step_context.repeats != 1 or len(batch.request_ids) != 1:
+            raise ValueError("a custom connected tail needs exactly one ordinary consumer compute")
+        rid = batch.request_ids[0]
+        edge, = batch.stream_windows[rid]
+        receipt = edge.chunk.reservation
+        chunks = [receipt.transitions[index].chunk for index in receipt.selected_indices(selected)
+                  if receipt.transitions[index].chunk.num_items]
+        if len(chunks) != 1 or edge.name != signal:
+            raise ValueError("a landed consumer does not name its one actual input chunk")
+        chunk, = chunks
+        start = chunk.start_offset - receipt.origin
+        positions = receipt.positions[start:start + chunk.num_items]
+        if start < 0 or len(positions) != chunk.num_items:
+            raise ValueError("a landed consumer input is outside its retained source coverage")
+        items = self._submodules[producer].loopback_rows.ring_read(signal, rid, positions)
+        value = items[0] if chunk.num_items == 1 else items
+        batch.inputs = ConnectedInputs.materialize(batch.inputs, {(producer, batch.node_name, signal, rid): value})
+        batch.uniform_inputs = None
+        batch.per_request_input_tensors = {rid: {**batch.per_request_input_tensors.get(rid, {}), signal: [value]}}
+        metadata = batch.per_request_input_metadata.get(rid, EMPTY_INPUT_METADATA)
+        batch.per_request_input_metadata = {rid: metadata._replace(
+            stream_chunks={**metadata.stream_chunks, signal: chunk._replace(reservation=None)},
+        )}
+        batch.per_request_info_wrapped = {rid: dataclasses.replace(
+            batch.per_request_info_wrapped[rid], metadata=batch.per_request_input_metadata[rid],
+        )}
+
     def collect_group_outputs(self, batch: ExecutingBatch, width: int, counts: Mapping[int, int]):
         """Close one independently executed member after its actual count lands.
 
@@ -3039,6 +3077,10 @@ class Engine:
         if width == 0:
             batch.outputs = BatchedModelOutput(check_stop_buffers=semantic, row_request_ids=tuple(batch.request_ids))
             return batch.outputs
+        mgmt, lease = self._submodules[batch.node_name], batch.step_context.slot_lease
+        ordinary = self._custom_output_tail(mgmt.submodule)
+        if ordinary and (width != 1 or reserved != 1):
+            raise ValueError("a custom connected tail cannot collect multiple computations")
         columns = self.run_columns(batch.node_name, batch.graph_walk)
         buffers = {name: (value[:, :width] if value.ndim > 1 and value.shape[1] == reserved else value)
                    for name, value in raw.check_stop_buffers.items() if name not in (RUN_COUNTS, RUN_REPLAYS)}
@@ -3046,11 +3088,15 @@ class Engine:
                   for name, value in (raw.row_outputs or {}).items()}
         spans = {name: value[:, :width] if name in columns else value
                  for name, value in (raw.output_spans or {}).items()}
+        if ordinary:
+            values = {name: value[:, 0] if name in columns else value for name, value in values.items()}
+            spans = {name: value[:, 0] if name in columns else value for name, value in spans.items()}
+            buffers = {name: value[:, 0] if name not in semantic and value.ndim > 1
+                       and value.shape[1] == reserved else value for name, value in buffers.items()}
         raw = dataclasses.replace(raw, check_stop_buffers=buffers, row_outputs=values, output_spans=spans or None)
-        mgmt, lease = self._submodules[batch.node_name], batch.step_context.slot_lease
         inputs, info = self._pad_batch(batch, mgmt, lease)
         output = self._collect_step(batch, mgmt, lease, raw, inputs, info)
-        output.run_columns = columns
+        output.run_columns = frozenset() if ordinary else columns
         batch.outputs = output
         self._finish_outputs(batch)
         batch.outputs = self._postprocess_outputs(batch, output)

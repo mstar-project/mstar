@@ -32,6 +32,20 @@ class StreamReservation:
     positions: tuple[int, ...] = ()
     origin: int = 0
 
+    def selected_indices(self, final: int) -> tuple[int, ...]:
+        """The actual semantic path named by a landed future reader."""
+        if (type(final) is not int or not -1 <= final < len(self.transitions)
+                or len(self.parents) != len(self.transitions)):
+            raise ValueError("a future stream reservation needs its selected policy transition")
+        selected = []
+        while final >= 0:
+            selected.append(final)
+            parent = self.parents[final]
+            if not -1 <= parent < final:
+                raise ValueError("a future stream transition has an invalid predecessor")
+            final = parent
+        return tuple(reversed(selected))
+
 
 @dataclass
 class StreamChunk:
@@ -706,16 +720,9 @@ class StreamBuffer:
         self._update_buffer()
         prefix = self._executed_chunks - reservation.start_iteration
         if reservation.decisions:
-            if type(final_transition) is not int or not -1 <= final_transition < len(reservation.transitions):
-                raise ValueError("a future stream reservation needs its selected policy transition")
-            chain = []
-            index = final_transition
-            while index >= 0:
-                chain.append(index)
-                index = reservation.parents[index]
-            chain.reverse()
-            selected = tuple(reservation.transitions[index] for index in chain)
-            selected_ids = set(chain)
+            indices = reservation.selected_indices(final_transition)
+            selected = tuple(reservation.transitions[index] for index in indices)
+            selected_ids = set(indices)
             available_end = self._consumed + len(self._buffer)
             for _, end, done, target in reservation.decisions:
                 if target in selected_ids and (

@@ -891,7 +891,8 @@ def test_streamed_alternatives_preserve_host_meaning_and_do_not_read_future_valu
 
 
 @pytest.mark.parametrize("device_name", ["cpu", "cuda"])
-@pytest.mark.parametrize("mode", ["live", "full", "yield", "unsupported", "bank_small"])
+@pytest.mark.parametrize("mode", ["live", "full", "yield", "unsupported", "bank_small",
+                                  "tail", "tail_error", "tail_zero", "tail_wide", "producer_tail"])
 def test_streamed_engine_composes_independent_bodies_and_owner_reads(device_name, mode, monkeypatch):
     from dataclasses import replace
 
@@ -907,7 +908,9 @@ def test_streamed_engine_composes_independent_bodies_and_owner_reads(device_name
     if device_name == "cuda" and not torch.cuda.is_available():
         pytest.skip("real Engine streamed composition")
     device = torch.device(device_name)
-    full, yielded = mode == "full", mode == "yield"
+    full, yielded = mode == "full", mode in {"yield", "tail_zero"}
+    custom = mode.startswith("tail") or mode == "producer_tail"
+    tails, batch_tails = [], []
     eng, group, events = _connected_engine(device=device)
     group.unit = replace(group.unit, streaming_edges=group.unit.edges)
     source = StreamBuffer(2, "x", "a", FixedChunkPolicy(2))
@@ -915,6 +918,12 @@ def test_streamed_engine_composes_independent_bodies_and_owner_reads(device_name
     ring.add(2)
     ring.ask_ring("x", 8)
     ring.ring_table("x", torch.zeros(1, 2, device=device))
+    if custom:
+        # A prior refused producer left physical holes. Semantic offset zero
+        # starts at position three, not at the ring's first storage element.
+        ring.ring_reserve("x", [2], 3)
+        ring.ring_write("x", [2], torch.full((1, 3, 2), -999., device=device), [0])
+        ring.ring_skip("x", 2, [0, 1, 2])
     tables = IterationTables(device)
     eng._submodules["a"].loopback_rows = ring
     eng._submodules["a"].rings = {"x": {"prefill"}}
@@ -955,6 +964,22 @@ def test_streamed_engine_composes_independent_bodies_and_owner_reads(device_name
 
     for name, width in (("a", 2), ("b", 4)):
         mgmt = eng._submodules[name]
+        if custom and name == ("a" if mode == "producer_tail" else "b"):
+            class Tail(type(mgmt.submodule)):
+                def postprocess(self, request_id, request_info, outputs, inputs, **kwargs):
+                    assert inputs.kwargs["context"] == 1
+                    assert request_info.metadata.stream_chunks["x"].num_items == 2
+                    actual = inputs.tensor_inputs["x"].reshape(-1)
+                    tails.append(actual.tolist())
+                    assert source._reservations, "the real input reader survives its ordinary tail"
+                    if mode == "tail_error":
+                        raise ValueError("ordinary tail failed")
+                    outputs["x"] = [actual[1:3]]
+
+                def batch_postprocess(self, outputs, request_infos, inputs, **kwargs):
+                    batch_tails.append(tuple(request_infos))
+                    assert outputs.get(2)["x"][0].tolist() == [10, 11]
+            mgmt.submodule.__class__ = Tail
         runner = mgmt.accelerator_graph_runner
         runner._graph_backend = backend
         old_bucket = next(iter(runner._buckets.values()))
@@ -992,6 +1017,8 @@ def test_streamed_engine_composes_independent_bodies_and_owner_reads(device_name
             def prepare(ordinary=ordinary, **kwargs):
                 result = ordinary(**kwargs)
                 result.tensor_inputs["x"] = result.tensor_inputs["x"].reshape(1, -1)
+                if custom:
+                    result.kwargs["context"] = 1
                 return result
             mgmt.submodule.prepare_inputs = prepare
 
@@ -1022,7 +1049,8 @@ def test_streamed_engine_composes_independent_bodies_and_owner_reads(device_name
         batch.request_ids = [2]
         batch.per_request_info = {2: batch.per_request_info[2]}
         batch.per_request_info_wrapped = {2: batch.per_request_info_wrapped[2]}
-        batch.step_context.repeats = scheduled.repeats = 4 if name == "a" else 3
+        batch.step_context.repeats = scheduled.repeats = (4 if name == "a" else
+                                                        1 if custom and mode != "tail_wide" else 3)
         scheduled.request_to_worker_graph = {2: 1}
 
     def reserve(batch):
@@ -1060,7 +1088,7 @@ def test_streamed_engine_composes_independent_bodies_and_owner_reads(device_name
     if mode == "bank_small":
         tables.prepare_stream_window(leases["b"], 1, 1, 1)
     output = eng.exec_group(group)
-    if mode in {"unsupported", "bank_small"}:
+    if mode in {"unsupported", "bank_small", "tail_wide", "producer_tail"}:
         assert output is None and group.refusal is not None
         assert not group.submitted and not launches
         worker._restore_group_stream(group)
@@ -1099,11 +1127,24 @@ def test_streamed_engine_composes_independent_bodies_and_owner_reads(device_name
         completed.append((step.node_name, step.batch.repeats, dict(step.node_batch.step_context.run_counts)))
         if step.node_name == "a":
             assert outputs.per_rid_outputs[2]["x"][0].shape[1] == 3
-            source.put_positions([0, 1])  # the ordinary producer route publishes only kept items
-            ring.ring_skip("x", 2, [2, 3])
+            base = a.ring_bases["x"][2]
+            source.put_positions([base, base + 1])  # ordinary routing publishes only kept items
+            ring.ring_skip("x", 2, [base + 2, base + 3])
         else:
             assert source._consumed == (6 if full else 2) and not source._reservations
-            assert outputs.per_rid_outputs[2]["x"][0].flatten().tolist() == ([42, 50, 58] if full else [42])
+            if custom:
+                assert tails == [[10, 10, 11, 11]]
+                assert not outputs.run_columns
+                if mode == "tail_error":
+                    assert 2 in step.node_batch.failed_requests
+                else:
+                    # The ordinary ragged output reaches the worker unchanged;
+                    # it must not be split as a synthetic width-one run column.
+                    worker._withholding = False
+                    worker._cut_run_items(step, outputs, SimpleNamespace(), None, {}, eng)
+                    assert outputs.per_rid_outputs[2]["x"][0].tolist() == [10, 11]
+            else:
+                assert outputs.per_rid_outputs[2]["x"][0].flatten().tolist() == ([42, 50, 58] if full else [42])
     worker._postprocess_batch = close_member
     pending = PendingBatch(group.members[0][0], a, "a", "a", "prefill", None, group=group)
     with ThreadPoolExecutor(max_workers=1) as executor:
@@ -1113,3 +1154,7 @@ def test_streamed_engine_composes_independent_bodies_and_owner_reads(device_name
     assert len(released) == (2 if yielded else 1 if full else 0)
     assert ring.ring_room("x", 2) == (6 if full else 8) and not b.stream_windows
     assert not source.producer_done, "a stopped producer Loop is not conductor EOF"
+    if yielded:
+        assert not tails
+    if custom:
+        assert batch_tails == ([] if yielded or mode == "tail_error" else [(2,)])

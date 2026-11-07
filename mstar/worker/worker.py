@@ -3106,6 +3106,7 @@ class Worker(RepeatingSteps):
                         semantic = host.buffers.get(STREAM_COUNTS)
                         pops = 0 if semantic is None else int(semantic[0])
                         final = None
+                        selected = None
                         if semantic is not None:
                             rid = executing.request_ids[0]
                             edge = executing.stream_windows[rid][0]
@@ -3113,19 +3114,15 @@ class Worker(RepeatingSteps):
                             selected = int(host.buffers[STREAM_TRANSITION][0])
                             if pops:
                                 final = receipt.transitions[selected].chunk
-                                self._settle_stream_windows(
-                                    executing, counts, transitions={(rid, edge.name): (pops, selected)},
-                                )
-                                if final.is_final:
-                                    done, partition = self.streams.settle_final(scheduled.node_name, {rid: {edge.name}})
-                                    executing.final_stream_rids.update(done)
-                                    executing.partition_done_rids.update(partition)
                             else:
                                 restored = self.streams.restore_edge(rid, edge)
                                 executing.stream_windows = {} if restored is None else {rid: [restored]}
 
-                        def collect(executing=executing, width=width, counts=counts):
+                        def collect(executing=executing, width=width, counts=counts, pops=pops, selected=selected):
                             engine = self.engine_manager.get_engine(executing.node_name)
+                            if pops:
+                                producer, _, signal = step.group.unit.streaming_edges[0]
+                                engine.materialize_group_inputs(executing, producer, signal, selected, width)
                             result = engine.collect_group_outputs(executing, width, counts)
                             self._stage_host_rows(result, step.lane)
                             if self.device_capability.is_accelerator:
@@ -3137,7 +3134,20 @@ class Worker(RepeatingSteps):
                             )
                             return result
 
-                        executing.outputs = gpu_executor.submit(collect).result()
+                        try:
+                            executing.outputs = gpu_executor.submit(collect).result()
+                        finally:
+                            # The forward already consumed these chunks, even
+                            # if its ordinary tail failed. Keep their reader
+                            # until that tail and its input copies have landed.
+                            if pops:
+                                self._settle_stream_windows(
+                                    executing, counts, transitions={(rid, edge.name): (pops, selected)},
+                                )
+                                if final.is_final:
+                                    done, partition = self.streams.settle_final(scheduled.node_name, {rid: {edge.name}})
+                                    executing.final_stream_rids.update(done)
+                                    executing.partition_done_rids.update(partition)
                         if width == 0 and pops == 0:
                             engine = self.engine_manager.get_engine(executing.node_name)
                             for signal, bases in executing.ring_bases.items():

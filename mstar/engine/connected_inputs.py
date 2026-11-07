@@ -7,7 +7,7 @@ operations on real tensors must keep doing real work.
 """
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import fields, is_dataclass
+from dataclasses import fields, is_dataclass, replace
 from enum import Enum
 from types import MappingProxyType, SimpleNamespace
 from typing import Any, Collection, Iterator
@@ -200,6 +200,39 @@ class ConnectedInputs(FakeTensorMode):
     def require_real(self, value: Any, where: str) -> None:
         if self.contains(value):
             self.refuse(f"future values escaped into {where}")
+
+    @staticmethod
+    def materialize(value: Any, bindings: dict[Any, torch.Tensor]) -> Any:
+        """An admitted ordinary input, now backed by its retained real values.
+
+        Each fake keeps the guard that certified its contiguous packing. Real
+        inputs stay unchanged; future bindings are supplied by their owner,
+        never by the prototype used while exploring alternative chunks.
+        """
+        if isinstance(value, FakeTensor):
+            mode = value.fake_mode
+            if not isinstance(mode, ConnectedInputs):
+                raise ValueError("a future input has no connected preparation certificate")
+            parts = []
+            for key in mode._parts(value):
+                expected = mode.bindings[key]
+                actual = expected if key[0] == "real" else bindings.get(key)
+                if (actual is None or actual.shape != expected.shape or actual.dtype != expected.dtype
+                        or actual.device != expected.device or not actual.is_contiguous()):
+                    raise ValueError("a landed input disagrees with its certified future span")
+                parts.append(actual.reshape(-1))
+            return torch.cat(parts).reshape(value.shape)
+        if isinstance(value, dict):
+            return {key: ConnectedInputs.materialize(item, bindings) for key, item in value.items()}
+        if isinstance(value, list):
+            return [ConnectedInputs.materialize(item, bindings) for item in value]
+        if isinstance(value, tuple):
+            items = [ConnectedInputs.materialize(item, bindings) for item in value]
+            return type(value)(*items) if hasattr(type(value), "_fields") else tuple(items)
+        if is_dataclass(value) and not isinstance(value, type):
+            return replace(value, **{field.name: ConnectedInputs.materialize(getattr(value, field.name), bindings)
+                                     for field in fields(value) if field.init})
+        return value
 
     def rebind(self, key: Any, source: torch.Tensor) -> None:
         """A certified seed is replaced by the same-shaped captured carry."""
