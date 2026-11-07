@@ -274,7 +274,8 @@ class SubmoduleManagement:
     # ``DeviceLoopback``'s, for each walk whose config asks
     row_signals: dict[str, dict[str, CarryPair]] = field(default_factory=dict)
     # walk -> the token stop that ends its WHILE runs, where asked
-    device_stops: dict[str, StopPolicy] = field(default_factory=dict)
+    # None denotes an iteration-input Loop bounded solely by its graph cap.
+    device_stops: dict[str, StopPolicy | None] = field(default_factory=dict)
     # walk -> a run's share of its rows done that ends it, where asked
     refills: dict[str, float | None] = field(default_factory=dict)
     # walk -> the stop buffer whose tokens go to the client as they land, and a run's limit
@@ -1763,22 +1764,24 @@ class Engine:
         self, node_name: str, runner: AcceleratorGraphRunner, graph_walk: str, config, signals: Collection[str],
     ) -> None:
         """Before capture: have ``graph_walk``'s captures run on the device,
-        where its stop is declared and it runs on one rank."""
+        where its stop is declared or its actual Loop cap bounds it, on one rank."""
         mgmt = self._submodules[node_name]
         if mgmt.joint_comm_group.world_size > 1:
             return  # the stop must match on every rank, and NCCL in a WHILE body is untested
         iteration = bool(getattr(mgmt.submodule, "ITERATION_INPUTS", None))
         loop = self._loops.get((node_name, graph_walk)) if iteration else None
-        policies = self.get_stop_policies(node_name, graph_walk) or {}
+        policies = self.get_stop_policies(node_name, graph_walk)
+        if policies is None:
+            return  # a custom host stop cannot be skipped
         policy = next((p for p in policies.values() if p.reads_token), next(iter(policies.values()), None))
-        if policy is None:
+        if policy is None and (not iteration or loop is None):
             return
         mgmt.device_stops[graph_walk] = policy
         mgmt.refills[graph_walk] = config.refill_at
         if iteration:
             refusal = None
-            if loop is None or set(policies) != {loop.name}:
-                refusal = "graph: iteration inputs need one declared stop for their actual Loop"
+            if loop is None or (policies and set(policies) != {loop.name}):
+                refusal = "graph: iteration inputs need stops belonging to their actual Loop"
             elif config.past_cap:
                 refusal = "graph: iteration input windows cannot run past their Loop cap"
             elif self._runner.prefix_chain_keys(node_name):
@@ -1797,7 +1800,8 @@ class Engine:
         heads = self._row_pairs(mgmt, graph_walk)[0] if mgmt.loopback_rows is not None else {}
         carries = mgmt.submodule.repeat_carry(graph_walk, signals)
         runner.ask_run(graph_walk, RunAsk(
-            policy.token_signal, policy.eos_tokens, config.device_stop == "drop_rows", config.max,
+            None if policy is None else policy.token_signal, () if policy is None else policy.eos_tokens,
+            config.device_stop == "drop_rows", config.max,
             {signal: pair for signal, pair in carries.items() if signal not in heads},
             mgmt.run_columns.get(graph_walk, frozenset()),
             frozenset(getattr(mgmt.submodule, "ITERATION_INPUTS", None) or ()), config.refill_at,
@@ -3134,7 +3138,8 @@ class Engine:
                 policy = submodule_mgmt.device_stops[graph_walk]
                 infos = engine_inputs.per_request_info
                 slot.run.state.stage(
-                    len(request_ids), [policy.limits(infos[rid]).ignore_eos for rid in request_ids],
+                    len(request_ids),
+                    [policy is not None and policy.limits(infos[rid]).ignore_eos for rid in request_ids],
                     ctx.repeats, submodule_mgmt.refills[graph_walk],
                 )
                 slot.run.stage_inputs(batch.iteration_columns)
@@ -3213,12 +3218,14 @@ class Engine:
             selected = [rids[i] for i in positions]
             infos = [infos_by_rid[rid] for rid in selected]
             policy = mgmt.device_stops[walk]
-            limits = [policy.limits(info) for info in infos]
+            # A cap-only Loop never schedules beyond its remaining room. It
+            # needs no persistent EOS marker; a new Loop entry resets position.
+            limits = [] if policy is None else [policy.limits(info) for info in infos]
             stopped = to_device_nonblocking([
                 limit.max_iters is not None and info.metadata.dynamic_loop_iter_counts.get(loop.name, 0) + 1
                 >= limit.max_iters for info, limit in zip(infos, limits, strict=True)
-            ], self._device, dtype=torch.bool)
-            if policy.reads_token:
+            ] if policy is not None else [False] * len(infos), self._device, dtype=torch.bool)
+            if policy is not None and policy.reads_token:
                 tokens = output_named(output, policy.token_signal)
                 if tokens is None:
                     tokens = torch.stack([

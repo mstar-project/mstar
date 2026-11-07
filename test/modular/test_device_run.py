@@ -729,7 +729,7 @@ def test_a_run_that_ends_short_repeats_its_last_iteration_in_the_columns_it_neve
 
 
 @pytest.mark.parametrize("refusal", [
-    None, "missing_loop", "other_stop", "past_cap", "prefix", "rows", "resident", "ranks",
+    None, "cap_only", "custom", "missing_loop", "other_stop", "past_cap", "prefix", "rows", "resident", "ranks",
 ])
 def test_iteration_inputs_enable_only_a_resident_single_loop_run(refusal):
     from mstar.engine.engine import Engine
@@ -750,6 +750,8 @@ def test_iteration_inputs_enable_only_a_resident_single_loop_run(refusal):
     engine.get_stop_policies = lambda node, walk: {
         "other" if refusal == "other_stop" else "loop": StopPolicy(StopKind.ITER),
     }
+    if refusal in {"cap_only", "custom"}:
+        engine.get_stop_policies = lambda node, walk: {} if refusal == "cap_only" else None
     engine.resident_refusal = lambda *args: "mixed capture walks" if refusal == "resident" else None
     engine._row_pairs = lambda *args: ({}, {})
     runner = SimpleNamespace(
@@ -758,11 +760,11 @@ def test_iteration_inputs_enable_only_a_resident_single_loop_run(refusal):
     engine._ask_run("n", runner, WALK, SimpleNamespace(
         device_stop="skip", max=4, refill_at=None, stream_tokens=False, past_cap=refusal == "past_cap",
     ), ())
-    if refusal is None:
+    if refusal in {None, "cap_only"}:
         assert len(asked) == 1 and asked[0].loop is loop and asked[0].token_signal is None
     else:
         assert not asked
-        assert refused or refusal == "ranks"
+        assert refused or refusal in {"ranks", "custom"}
 
 
 def test_a_decode_wrapper_reads_its_lengths_off_the_table():
@@ -1185,6 +1187,16 @@ def test_ordinary_and_device_steps_publish_the_same_actual_loop_progress(monkeyp
     assert 1 in failed.per_request_info_wrapped, "failure bookkeeping retains its wrapper until worker cleanup"
     positions, live = runner._rows.iteration_head(
         WALK, engine._loops["n", WALK], indices, torch.tensor([[1, 1], [1, 2]]),
+    )
+    assert positions.tolist() == [1, 1] and live.tolist() == [False, True]
+
+    # A model whose Loop cap is its only stop must not acquire an EOS stop
+    # from an ordinary fallback's incidental output, nor use max_tokens as
+    # its denoising budget. This fixture has no max_tokens field at all.
+    mgmt.device_stops[WALK] = None
+    eager([2], [0], [3])
+    positions, live = runner._rows.iteration_head(
+        WALK, engine._loops["n", WALK], indices, torch.tensor([[1, 1], [1, 3]]),
     )
     assert positions.tolist() == [1, 1] and live.tolist() == [False, True]
 
