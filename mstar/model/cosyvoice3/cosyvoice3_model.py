@@ -191,6 +191,8 @@ class CosyVoice3Model(Model):
         flow_capture_batch_frames: int | None = None,
         hift_capture_frame_buckets: list[int] | None = None,
         hift_capture_batch_sizes: list[int] | None = None,
+        lm_prefill_token_buckets: list[int] | None = None,
+        lm_prefill_batch_sizes: list[int] | None = None,
         flow_cache_frames: int | None = None,
         flow_new_frame_buckets: list[int] | None = None,
         flow_new_batch_sizes: list[int] | None = None,
@@ -244,6 +246,10 @@ class CosyVoice3Model(Model):
                 f"the largest hift_capture_frame_buckets must hold more than a stream's {needed} frames of "
                 "tail and pending mel"
             )
+        if lm_prefill_token_buckets is not None:
+            cfg.lm_prefill_token_buckets = _sizes("lm_prefill_token_buckets", lm_prefill_token_buckets)
+        if lm_prefill_batch_sizes is not None:
+            cfg.lm_prefill_batch_sizes = _sizes("lm_prefill_batch_sizes", lm_prefill_batch_sizes)
         if flow_cache_frames is not None:
             cfg.flow_cache_frames = _integer("flow_cache_frames", flow_cache_frames, low=0)
         if flow_new_frame_buckets is not None:
@@ -367,7 +373,11 @@ class CosyVoice3Model(Model):
         )
         specs: list[NodeResourceSpec] = [
             KVSpec(resource_key=LM_KV, nodes={LM_NODE}, config=kv),
-            AttentionSpec(resource_key=LM_ATTN, nodes={LM_NODE}, config=AttentionConfig(kv_cache=LM_KV)),
+            AttentionSpec(
+                resource_key=LM_ATTN,
+                nodes={LM_NODE},
+                config=AttentionConfig(kv_cache=LM_KV, decode_fmha=True),
+            ),
             PositionSpec(
                 resource_key=LM_POS,
                 nodes={LM_NODE},
