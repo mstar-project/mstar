@@ -1,5 +1,5 @@
-"""BAGEL's image response: the shared PNG writer must decode to the pixels the old PIL path
-sent, and a format it cannot write fails at intake."""
+"""BAGEL's images: the shared PNG writer must decode to the pixels the old PIL path sent, a
+format it cannot write fails at intake, and an edit's input is resized as the reference does."""
 import io
 
 import numpy as np
@@ -67,3 +67,14 @@ def test_a_null_sampling_knob_is_the_default():
     """An explicit null top_k, as a client's extra_body can send, samples with the config's top_k."""
     model = _model()
     assert model.get_sampling_config("LLM", {"top_k": None}).top_k == model.config.top_k
+
+
+def test_an_edit_input_is_downsized_as_pil_does():
+    """The reference resizes an edit's input with PIL, which filters before it
+    downsamples; plain bilinear sampling aliases a large photo's fine texture."""
+    pixels = torch.randint(0, 256, (3, 400, 600), generator=torch.Generator().manual_seed(0), dtype=torch.uint8)
+    ours = BagelModel._resize_to_fit(pixels.float() / 255, max_width=150, max_height=150)
+    reference = PIL.fromarray(pixels.permute(1, 2, 0).numpy()).resize((150, 100), PIL.BILINEAR)
+    expected = torch.from_numpy(np.asarray(reference)).permute(2, 0, 1).float() / 255
+    assert ours.shape == expected.shape
+    assert (ours - expected).abs().max() < 2 / 255

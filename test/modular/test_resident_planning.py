@@ -19,7 +19,7 @@ sys.path.insert(0, ".")
 
 from mstar.engine.resources import resident as resident_mod  # noqa: E402
 from mstar.engine.resources.attn.config import AttentionConfig, AttentionSpec  # noqa: E402
-from mstar.engine.resources.base import CGSlotKey, Resource  # noqa: E402
+from mstar.engine.resources.base import CGSlotKey, Residency, Resource  # noqa: E402
 from mstar.engine.resources.kv import manager as manager_mod  # noqa: E402
 from mstar.engine.resources.kv.config import KVLayout, KVReqConfig, KVSpec, KVStep, PagedKVConfig  # noqa: E402
 from mstar.engine.resources.kv.manager import KVManager  # noqa: E402
@@ -44,6 +44,7 @@ from mstar.engine.resources.step import (  # noqa: E402
 )
 from mstar.utils import knobs  # noqa: E402
 from mstar.utils.ipc_format import OffloadDelta  # noqa: E402
+from mstar.worker.micro_scheduler import ScheduledBatch  # noqa: E402
 from mstar.worker.worker import Worker  # noqa: E402
 
 PAGE = 4
@@ -1192,12 +1193,12 @@ def test_a_refused_admit_offloads_a_victim_and_its_reload_is_written_whole():
     assert not outcome.ok and isinstance(outcome.reason, AllocationFailed) and outcome.failed_resource == "kv"
 
     worker = _refused_worker(engine, line=[1, 2, 3])
-    batch = SimpleNamespace(node_name="n", graph_walk=WALK, request_to_worker_graph={1: "g", 2: "g"})
+    batch = ScheduledBatch(node_name="n", graph_walk=WALK, request_to_worker_graph={1: "g", 2: "g"})
     worker._handle_allocation_failure(batch, SimpleNamespace(
         node_name="n", admit_error=outcome.reason, failed_resource=outcome.failed_resource,
     ))
     assert worker.pushed == [[1, 2]] and worker.held == [3]
-    assert engine.is_offloaded("n", 3)
+    assert engine.residency("n", 3) is Residency.ON_HOST
     assert planner.slot_of(3) is None and 3 not in planner._stale
 
     # the retry runs on the victim's pages
@@ -1238,13 +1239,13 @@ def test_a_recurrent_pool_refusal_holds_the_request_since_the_pool_cannot_evict(
 
     engine = _offload_engine({k: live[k] for k in ("kv", "pool", "rope")}, planner)
     worker = _refused_worker(engine, line=[1, 2])
-    batch = SimpleNamespace(node_name="n", graph_walk="prefill", request_to_worker_graph={2: "g"})
+    batch = ScheduledBatch(node_name="n", graph_walk="prefill", request_to_worker_graph={2: "g"})
     worker._handle_allocation_failure(batch, SimpleNamespace(
         node_name="n", admit_error=outcome.reason, failed_resource="pool",
     ))
     assert worker.pushed == [[2]]
     assert worker.held == [2]
-    assert not engine.is_offloaded("n", 1)
+    assert engine.residency("n", 1) is Residency.RESIDENT
 
 
 def test_a_follower_replaying_an_offload_gives_the_slot_up_too():
@@ -1894,19 +1895,20 @@ def test_qwen35_decode_builds_its_rope_in_the_graph_on_every_config(monkeypatch,
 @pytest.mark.parametrize("rows", ["loopback", "own_ids"])
 def test_qwen35_captured_decode_preprocess_reads_nothing_the_tables_fill(rows):
     """The graph fills positions and write locations, after `preprocess`."""
-    submodules, llm = _qwen35_llm()
+    from mstar.model.keys import SAMPLER
+
+    _, llm = _qwen35_llm()
     token = torch.tensor([5, 6])
     inputs = [
         SimpleNamespace(input_embeds=None, input_ids=None if rows == "loopback" else token[:1], custom_pos_ids=None,
                         input_seq_len=0 if rows == "loopback" else 1)
         for _ in range(2)
     ]
-    stub = SimpleNamespace(
-        _rope_in_graph=llm._rope_in_graph, _position_ids_3d=lambda inputs: pytest.fail("read positions"),
-    )
+    node = llm(None, SimpleNamespace(stop_token_ids=(1,)))
+    node._position_ids_3d = lambda inputs: pytest.fail("read positions")
     sampler = SimpleNamespace(loopback_tokens=lambda rids: token)
-    engine_inputs = SimpleNamespace(captured=True, request_ids=[1, 2], resources={submodules.SAMPLER: sampler})
-    out = llm.preprocess(stub, "decode", engine_inputs, inputs)
+    engine_inputs = SimpleNamespace(captured=True, request_ids=[1, 2], resources={SAMPLER: sampler})
+    out = node.preprocess("decode", engine_inputs, inputs)
     assert set(out) == {"input_ids"}
 
 

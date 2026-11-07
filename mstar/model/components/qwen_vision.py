@@ -109,7 +109,7 @@ class FrameSDPA:
     def __init__(self, lengths=()):
         self.lengths = list(lengths)
 
-    def run(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    def run(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, label: str | None = None) -> torch.Tensor:
         # [1, heads, frame, head_dim] per frame, the call transformers makes (and so its kernel)
         out = [
             F.scaled_dot_product_attention(*(t.transpose(0, 1)[None] for t in segment))[0].transpose(0, 1)

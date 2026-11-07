@@ -6,7 +6,8 @@ from types import SimpleNamespace
 import pytest
 
 from mstar.conductor.conductor import Conductor
-from mstar.engine.resources import SamplerSpec
+from mstar.engine.resources import SamplerSpec, SamplingReqConfig
+from mstar.engine.resources.sampler.config import BOOL_KNOBS, INT_KNOB_RULES, REAL_KNOB_RULES
 from mstar.model.glm52.config import SAMPLER_RESOURCE
 from mstar.model.glm52.glm52_model import Glm52Model
 
@@ -51,6 +52,19 @@ def test_a_null_kwarg_is_unset(kwargs):
     assert _intake(m, kwargs) == _intake(m, {}) == m.get_max_output_tokens()
     out = m.process_prompt("Hi", ["text"], ["text"], **kwargs)
     assert out.new_input_tensors["text_inputs"][0].tolist() == [72, 105]
+
+
+@pytest.mark.parametrize("knob", [*REAL_KNOB_RULES, *INT_KNOB_RULES, *BOOL_KNOBS])
+def test_a_sampler_knob_is_honored_or_refused(knob):
+    """A knob the API accepts reaches the sampler, or intake refuses it: never dropped."""
+    value = (not getattr(SamplingReqConfig(), knob) if knob in BOOL_KNOBS
+             else 5 if knob in INT_KNOB_RULES else 0.5)
+    m = _model()
+    try:
+        _intake(m, {knob: value})
+    except ValueError:
+        return
+    assert getattr(m.get_request_resource_configs({}, {knob: value})[SAMPLER_RESOURCE], knob) == value
 
 
 @pytest.mark.parametrize("kwargs", [
@@ -106,3 +120,19 @@ def test_a_request_without_max_tokens_runs_to_the_window():
     assert m.get_max_output_tokens() == m.get_max_output_tokens(max_output_tokens=None) == 8192
     assert m.get_max_output_tokens(max_output_tokens=100) == 100
     assert _intake(m, {}) == 8192
+
+
+@pytest.mark.parametrize("kwargs", [{"temperature": 0.7}, {"repetition_penalty": 1.1}])
+def test_mtp_refuses_sampling_it_cannot_serve_in_process_prompt(kwargs):
+    with pytest.raises(ValueError, match="greedy only"):
+        _model(mtp_num_draft_tokens=2).process_prompt("Hi", ["text"], ["text"], **kwargs)
+    # without MTP it samples
+    out = _model().process_prompt("Hi", ["text"], ["text"], **kwargs)
+    assert out.new_input_tensors["text_inputs"][0].numel() == 2
+
+
+@pytest.mark.parametrize("kwargs", [{}, {"temperature": 0}, {"temperature": None}])
+def test_mtp_serves_greedy(kwargs):
+    m = _model(mtp_num_draft_tokens=2)
+    assert m.process_prompt("Hi", ["text"], ["text"], **kwargs).new_input_tensors["text_inputs"][0].numel() == 2
+    assert m.get_request_resource_configs({}, kwargs)[SAMPLER_RESOURCE].temperature == 0

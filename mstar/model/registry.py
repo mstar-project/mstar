@@ -22,6 +22,7 @@ MODEL_REGISTRY: dict[str, tuple[str, str]] = {
     "flux2_klein_9b": ("mstar.model.flux2_klein.flux2_klein_model", "Flux2KleinModel"),
     "fish_s2_pro": ("mstar.model.fish_s2_pro.fish_s2_pro_model", "FishS2ProModel"),
     "glm52": ("mstar.model.glm52.glm52_model", "Glm52Model"),
+    "glm5_next": ("mstar.model.glm5_next.glm5_next_model", "Glm5NextModel"),
     "higgs_audio": ("mstar.model.higgs_audio.higgs_audio_model", "HiggsAudioModel"),
     "nemotron_duplex": ("mstar.model.nemotron_duplex.nemotron_duplex_model", "NemotronDuplexModel"),
     "omnilingual_asr_ctc_300m": ("mstar.model.omnilingual_asr.omnilingual_asr_model", "OmnilingualASRModel"),
@@ -32,6 +33,7 @@ MODEL_REGISTRY: dict[str, tuple[str, str]] = {
     "kokoro": ("mstar.model.kokoro.kokoro_model", "KokoroModel"),
     "ltx2_5": ("mstar.model.ltx2_5.ltx2_5_model", "LTX25Model"),
     "minimax_h3": ("mstar.model.minimax_h3.minimax_h3_model", "H3Model"),
+    "muse_glimmer": ("mstar.model.muse.glimmer_model", "MuseGlimmerModel"),
     "lingbot_world_1_3b": ("mstar.model.lingbot_world.lingbot_world_model", "LingBotWorldModel"),
     "nemotron_asr": ("mstar.model.parakeet.parakeet_model", "ParakeetModel"),
     "orpheus": ("mstar.model.orpheus.orpheus_model", "OrpheusModel"),
@@ -110,6 +112,8 @@ HF_MODELS: dict[str, dict] = {
     # MiniMax-H3 (FL2VA): 33B packed-sequence audio-video DiT, CFG-distilled, Qwen3-VL-32B
     # conditioner, ViT video VAE decoder, 32 kHz stereo audio VAE. MiniMax H3 Community License.
     "minimax_h3": {"model_path_hf": "MiniMaxAI/MiniMax-H3"},
+    # Meta's 30B dense agentic VLM (text + image in). Apache-2.0.
+    "muse_glimmer": {"model_path_hf": "meta-models/Muse-Glimmer-30B"},
     "flux2_klein_9b": {"model_path_hf": "black-forest-labs/FLUX.2-klein-9B"},
     # Fish Audio S2-Pro: dual-AR TTS (Qwen3-4B Slow AR + 4-layer Fast AR over
     # 10 codebooks) with a 44.1 kHz causal DAC codec and reference-audio voice
@@ -118,6 +122,9 @@ HF_MODELS: dict[str, dict] = {
     # GLM-5.2: 753B/40B MoE causal LM (MLA + DSA). The official release ships
     # FP8 e4m3 block-scale under the -FP8 repo id; real serving is TP8.
     "glm52": {"model_path_hf": "zai-org/GLM-5.2-FP8"},
+    # GLM-5.3-Flash: 34 KDA linear-attention + 11 MLA layers with mHC residuals,
+    # fp8 checkpoint, text only (the ViT is skipped). TP8 on 8xH100.
+    "glm5_next": {"model_path_hf": "zai-org/GLM-5.3-Flash"},
     # Higgs-Audio v3 STT: Whisper-style audio tower + Qwen3-1.7B LLM.
     # (The v2 checkpoints are TTS/generation models, not ASR.)
     "higgs_audio": {"model_path_hf": "bosonai/higgs-audio-v3-stt"},

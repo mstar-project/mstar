@@ -23,6 +23,7 @@ from mstar.model.base import WorkerGraph
 from mstar.utils.containers import RecentSet
 from mstar.utils.ipc_format import NewRequest, RemoveRequest
 from mstar.worker.node_manager_utils import RequestStateManager
+from mstar.worker.rebuild import Rebuilds
 from mstar.worker.stream_buffers import StreamBufferManager
 from mstar.worker.worker import Worker
 
@@ -102,6 +103,7 @@ def _worker(graphs=((WG_ID, NODE, WALK, "default"),)):
     w._reads_done_sent = set()
     w._in_flight_rids = set()
     w._pending_removes = {}
+    w._rebuilds = Rebuilds({}, {})
     w.streaming_buffers = {}
     w._unprocessed_messages = {}
     w._removed_rids = RecentSet(16)

@@ -304,7 +304,11 @@ class PiecewiseAcceleratorGraphConfig(ABC):
     # This region's own resource work, declared over the padded batch. Separate
     # from the submodule's `declare_step` because the region's shape is its
     # own: the runner admits, plans, and commits it per replay.
-    declare_step: Callable[[list[str], list[int]], SubmoduleStep | None] | None = None
+    # A region whose step plans several ragged layouts also takes an optional
+    # keyword ``label_seq_lens`` (label -> spans), passed on a replay given
+    # one; capture passes none, so the declaration falls back to ``seq_lens``
+    # for every label then.
+    declare_step: Callable[..., SubmoduleStep | None] | None = None
     # Take this region's slot before the outer `declare_step` runs, and report
     # it on the step context. The region still declares, plans and commits its
     # own work; the lease only tells the outer declaration which resources are
@@ -346,10 +350,17 @@ class PiecewiseAcceleratorGraphConfig(ABC):
                 "with capture_batch_sizes=[1]"
             )
 
-    def region_step(self, request_ids: list[str], seq_lens: list[int]) -> SubmoduleStep | None:
+    def region_step(
+        self, request_ids: list[str], seq_lens: list[int],
+        label_seq_lens: dict[str, list[int]] | None = None,
+    ) -> SubmoduleStep | None:
         """This region's step over the padded batch (``declare_step``); None
         for a region that declares none."""
-        return None if self.declare_step is None else self.declare_step(request_ids, seq_lens)
+        if self.declare_step is None:
+            return None
+        if label_seq_lens is None:
+            return self.declare_step(request_ids, seq_lens)
+        return self.declare_step(request_ids, seq_lens, label_seq_lens=label_seq_lens)
 
     @abstractmethod
     def get_config_type(self) -> PiecewiseConfigType:
@@ -419,9 +430,12 @@ class PiecewisePackedConfig(PiecewiseAcceleratorGraphConfig):
         if self.attn_key is not None and self.declare_step is not None:
             raise ValueError("attn_key declares the region's step; leave declare_step None")
 
-    def region_step(self, request_ids: list[str], seq_lens: list[int]) -> SubmoduleStep | None:
+    def region_step(
+        self, request_ids: list[str], seq_lens: list[int],
+        label_seq_lens: dict[str, list[int]] | None = None,
+    ) -> SubmoduleStep | None:
         if self.attn_key is None:
-            return super().region_step(request_ids, seq_lens)
+            return super().region_step(request_ids, seq_lens, label_seq_lens)
         if self.one_row_per_step:
             (rid,) = request_ids
             request_ids = [rid] * len(seq_lens)
