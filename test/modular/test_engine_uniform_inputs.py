@@ -12,10 +12,9 @@ import torch  # noqa: E402
 
 from mstar.engine.accelerator_graph_config import BatchedAcceleratorGraphConfig  # noqa: E402
 from mstar.engine.accelerator_graph_runner import AcceleratorGraphRunner  # noqa: E402
-from mstar.engine.chunking import ChunkingManagement  # noqa: E402
-from mstar.engine.engine import Engine  # noqa: E402
 from mstar.engine.resources.step import BucketKey, SlotLease  # noqa: E402
 from mstar.model.submodule_base import ARNodeInputs  # noqa: E402
+from mstar.testing_utils.engine import make_engine  # noqa: E402
 
 
 class _Batch:
@@ -70,12 +69,7 @@ class _Sub:
 
 
 def _engine(sub):
-    eng = Engine.__new__(Engine)
-    eng._submodules = {"llm": SimpleNamespace(submodule=sub, resources={})}
-    eng._enable_nvtx = False
-    eng._loopback_steps = {}
-    # no policies: these steps are not chunked
-    eng._chunking = ChunkingManagement(eng._submodules)
+    eng = make_engine(_submodules={"llm": SimpleNamespace(submodule=sub, resources={})})
     return eng
 
 

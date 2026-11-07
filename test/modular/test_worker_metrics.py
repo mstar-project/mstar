@@ -40,6 +40,7 @@ from mstar.engine.resources.step import StepContext  # noqa: E402
 from mstar.model.submodule_base import ARNodeInputs  # noqa: E402
 from mstar.observability import catalog  # noqa: E402
 from mstar.observability.recorders import EdgeTransfers, MetricSnapshot  # noqa: E402
+from mstar.testing_utils.engine import make_engine  # noqa: E402
 from mstar.testing_utils.model import StubModel  # noqa: E402
 from mstar.utils.ipc_format import (  # noqa: E402
     ConductorMessage,
@@ -107,12 +108,11 @@ def _hold(kv: KVManager, rid: str, tokens: int) -> None:
 def _engine(resources=(), sub=None, keyed=False) -> Engine:
     """The real ``Engine`` attributes its prefix probe and
     ``paged_kv_caches`` read; every resource here sits on ``NODE``."""
-    eng = Engine.__new__(Engine)
-    eng._resources = {r.name: r for r in resources}
-    eng._resource_nodes = {r.name: frozenset({NODE}) for r in resources}
-    eng._submodules = {NODE: SimpleNamespace(submodule=sub or _Sub(), resources={})}
-    eng._enable_nvtx = False
-    eng._loopback_steps = {}
+    eng = make_engine(
+        _resources={r.name: r for r in resources},
+        _resource_nodes={r.name: frozenset({NODE}) for r in resources},
+        _submodules={NODE: SimpleNamespace(submodule=sub or _Sub(), resources={})},
+    )
     eng._runner = StepRunner(eng._resources, node_resources={NODE: list(eng._resources)})
     eng._keyed_walks = {NODE: {PREFILL}} if keyed else {}
     eng._prefix_model = "Toy"

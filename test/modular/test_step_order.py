@@ -7,8 +7,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from mstar.engine.engine import Engine
 from mstar.model.submodule_base import NodeSubmodule, StepOrder
+from mstar.testing_utils.engine import make_engine
 
 pytest.importorskip("diffusers")
 
@@ -27,10 +27,7 @@ def _order_of(submodule_class: type[NodeSubmodule], walk: str) -> StepOrder:
     """The order the scheduler reads for a node of ``submodule_class``, through
     the real ``Engine.get_step_order``. No weights: the hook reads no state."""
     submodule = submodule_class.__new__(submodule_class)
-    engine = SimpleNamespace(
-        _submodules={"node": SimpleNamespace(submodule=submodule)},
-        get_step_order=lambda node, graph_walk: Engine.get_step_order(engine, node, graph_walk),
-    )
+    engine = make_engine(_submodules={"node": SimpleNamespace(submodule=submodule)})
     sched = MicroScheduler(engine_manager=SimpleNamespace(get_engine=lambda name: engine))
     return sched._order_of(("node", walk))
 

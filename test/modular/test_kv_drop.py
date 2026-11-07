@@ -36,6 +36,7 @@ from mstar.engine.resources.sampler.config import SamplingReqConfig
 from mstar.engine.resources.sampler.resource import SamplerResource
 from mstar.engine.resources.step import FULL_ADMIT_NOT_READY, FULL_ADMIT_REBUILD, Segment, StepContext
 from mstar.model.base import LabelLayout, Span
+from mstar.testing_utils.engine import make_engine
 from mstar.testing_utils.model import StubModel, make_model
 
 PAGE_SIZE = 16
@@ -86,10 +87,7 @@ def _write(kv: KVManager, rid: str, *spans: int) -> None:
 
 
 def _engine(resources: dict) -> Engine:
-    engine = Engine.__new__(Engine)
-    engine._runner, engine._submodules = StepRunner(resources), {NODE: SimpleNamespace(resources=resources)}
-    engine._tp_follower_nodes = set()
-    return engine
+    return make_engine(_runner=StepRunner(resources), _submodules={NODE: SimpleNamespace(resources=resources)})
 
 
 def test_each_span_reaches_the_kv_manager_with_its_kind():
@@ -173,8 +171,8 @@ class _Recording:
 
 def test_the_engine_tells_every_resource_of_the_node_about_a_rebuild():
     first, second = _Recording(), _Recording()
-    engine, rebuild = Engine.__new__(Engine), Rebuild(WALK, array("i", [1, 2, 3]))
-    engine._submodules = {NODE: SimpleNamespace(resources={"first": first, "second": second})}
+    rebuild = Rebuild(WALK, array("i", [1, 2, 3]))
+    engine = make_engine(_submodules={NODE: SimpleNamespace(resources={"first": first, "second": second})})
 
     engine.prepare_rebuild(NODE, "r", rebuild)
     engine.land_rebuild(NODE, "r")
@@ -301,10 +299,8 @@ def test_readiness_answers_a_dropped_request_with_a_rebuild_and_a_follower_with_
 
 
 def _boot_engine(resources: dict, split: frozenset = frozenset()) -> Engine:
-    engine = Engine.__new__(Engine)
     submodule = SimpleNamespace(split_batches_by_capture_key=lambda walk: walk in split)
-    engine._submodules = {NODE: SimpleNamespace(resources=resources, submodule=submodule)}
-    return engine
+    return make_engine(_submodules={NODE: SimpleNamespace(resources=resources, submodule=submodule)})
 
 
 def _model(combined: dict | None = None) -> StubModel:

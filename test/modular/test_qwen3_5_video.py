@@ -643,7 +643,7 @@ def test_a_vision_request_too_large_for_a_replay_gets_a_step_of_its_own():
     segment ceiling is a group of its own, so a long video's embeddings are
     not held back for its batch's others. The engine splits a node whose only
     capture is a piecewise region."""
-    from mstar.engine.engine import Engine
+    from mstar.testing_utils.engine import make_engine
 
     encoder = _encoder(max_segments=4)
 
@@ -656,10 +656,11 @@ def test_a_vision_request_too_large_for_a_replay_gets_a_step_of_its_own():
     assert encoder.cg_key_info("prefill_vision", {2: video}) == (2,)
     assert encoder.cg_key_info("prefill_vision", {3: frames}) == (3,)
 
-    engine = Engine.__new__(Engine)
-    engine._submodules = {"vision_encoder": SimpleNamespace(
-        submodule=encoder, accelerator_graph_runner=None, piecewise_runners={"vision_block_loop": object()},
-    )}
+    engine = make_engine(
+        _submodules={"vision_encoder": SimpleNamespace(
+            submodule=encoder, accelerator_graph_runner=None, piecewise_runners={"vision_block_loop": object()},
+        )},
+    )
     assert engine.splits_by_capture_key("vision_encoder", "prefill_vision")
     assert engine.capture_group("vision_encoder", "prefill_vision", 2, video) == (2,)
     assert engine.capture_group("vision_encoder", "prefill_vision", 1, image) is None

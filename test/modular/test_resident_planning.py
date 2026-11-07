@@ -976,15 +976,10 @@ def _preplan_worker(engine):
 
 
 def _preplan_engine(res, planner):
-    from mstar.engine.engine import Engine
     from mstar.engine.resources.runner import StepRunner
+    from mstar.testing_utils.engine import make_engine
 
     resources = {k: res[k] for k in ("kv", "pool", "rope")}
-    engine = Engine.__new__(Engine)
-    engine._enable_nvtx = False
-    engine._device = CPU
-    engine._pre_plan_done = {}
-    engine._runner = StepRunner(resources)
     runner = SimpleNamespace(
         plan_stream=lambda: None, pad_inputs=lambda lease, inputs, uniform=None: inputs,
         step_ids=lambda lease, rids: list(rids), release=lambda lease, rows: None,
@@ -996,10 +991,10 @@ def _preplan_engine(res, planner):
         keys = {"kv": KVStep(), "pool": RecurrentStep(), "rope": PositionStep()}
         return SubmoduleStep(segments=segments, steps=keys)
 
-    engine._submodules = {"n": SimpleNamespace(
+    engine = make_engine(_runner=StepRunner(resources), _submodules={"n": SimpleNamespace(
         submodule=SimpleNamespace(declare_step=declare, step_is_input_free=lambda walk: False),
         accelerator_graph_runner=runner, piecewise_runners={}, resident=planner,
-    )}
+    )})
     engine.can_pre_plan = lambda node: True
     engine.reserve_replay_slot = lambda batch: batch.step_context.slot_lease
     return engine
@@ -1132,14 +1127,13 @@ class _HostPagesKV:
 
 
 def _offload_engine(resources, planner):
-    from mstar.engine.engine import Engine
+    from mstar.testing_utils.engine import make_engine
 
-    engine = Engine.__new__(Engine)
-    engine._tp_follower_nodes = set()
-    engine._resident_delta = {}
-    engine._resources = resources
-    engine._submodules = {"n": SimpleNamespace(resources=resources, resident=planner)}
-    engine._graph_runtime = SimpleNamespace(get_rid_string=str, get_rid_handle=int)
+    engine = make_engine(
+        _resources=resources,
+        _submodules={"n": SimpleNamespace(resources=resources, resident=planner)},
+        _graph_runtime=SimpleNamespace(get_rid_string=str, get_rid_handle=int),
+    )
     return engine
 
 
@@ -1811,15 +1805,16 @@ def _capture_runner(max_bs=4):
 
 
 def _engine(walks, resources, device=CPU):
-    from mstar.engine.engine import Engine
     from mstar.engine.resources.runner import StepRunner
+    from mstar.testing_utils.engine import make_engine
 
-    engine = Engine.__new__(Engine)
-    engine._device = device
-    engine._runner = StepRunner(resources)
-    engine._resource_nodes = {key: frozenset({"n"}) for key in resources}
     submodule = SimpleNamespace(resident_walks=lambda: frozenset(walks))
-    engine._submodules = {"n": SimpleNamespace(submodule=submodule, resources=resources, resident=None)}
+    engine = make_engine(
+        _device=device,
+        _runner=StepRunner(resources),
+        _resource_nodes={key: frozenset({"n"}) for key in resources},
+        _submodules={"n": SimpleNamespace(submodule=submodule, resources=resources, resident=None)},
+    )
     return engine, engine._submodules["n"]
 
 

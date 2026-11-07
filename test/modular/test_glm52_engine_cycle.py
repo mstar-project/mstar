@@ -35,7 +35,6 @@ def _force_cpu_flashinfer(monkeypatch):
 
 from request_walks import run_walks  # noqa: E402
 
-from mstar.engine.engine import Engine  # noqa: E402
 from mstar.engine.resources import StepContext  # noqa: E402
 from mstar.model.glm52._testing import (  # noqa: E402
     build_cpu_resources,
@@ -53,6 +52,7 @@ from mstar.model.glm52.glm52_model import Glm52Model  # noqa: E402
 from mstar.model.glm52.submodules import Glm52LLMSubmodule  # noqa: E402
 from mstar.model.submodule_base import BatchedModelOutput, ModelInputsFromEngine  # noqa: E402
 from mstar.model.utils import process_weights_after_loading  # noqa: E402
+from mstar.testing_utils.engine import make_engine  # noqa: E402
 
 
 def _cfg(mla_absorb: bool) -> Glm52ModelConfig:
@@ -109,8 +109,8 @@ class _Driver:
             per_request_info_wrapped={rid: info for rid, (info, _) in batch.items()},
             failed_requests=failures, register_failure=failures.__setitem__, step_context=ctx,
         )
-        engine = SimpleNamespace(_submodules={"llm": SimpleNamespace(submodule=self.sub, piecewise_runners={})})
-        Engine._postprocess_batch(engine, executing, BatchedModelOutput(per_rid_outputs=outs))
+        engine = make_engine(_submodules={"llm": SimpleNamespace(submodule=self.sub, piecewise_runners={})})
+        engine._postprocess_batch(executing, BatchedModelOutput(per_rid_outputs=outs))
         assert not failures, failures
         return outs
 

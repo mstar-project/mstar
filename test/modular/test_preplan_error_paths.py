@@ -18,7 +18,7 @@ sys.path.insert(0, ".")
 import pytest
 import torch
 
-from mstar.engine.engine import Engine
+from mstar.testing_utils.engine import make_engine
 from mstar.worker import worker as worker_mod
 from mstar.worker.micro_scheduler import CHAIN_LANE, ScheduledBatch
 from mstar.worker.stream_buffers import StreamBufferManager
@@ -183,8 +183,7 @@ def test_a_step_the_executor_never_runs_still_lifts_the_fence() -> None:
 
 
 def _exec_fake(runner, raise_with):
-    fake = SimpleNamespace(
-        _enable_nvtx=False, _enable_profile=False, _device=torch.device("cpu"),
+    return make_engine(
         _submodules={"dit": SimpleNamespace(submodule=object())},
         _autocast_dtype_for=lambda submodule: None,
         reserve_replay_slot=lambda batch: None,
@@ -192,8 +191,6 @@ def _exec_fake(runner, raise_with):
         _exec_per_request=_raiser(raise_with),
         _runner=runner,
     )
-    fake.exec = Engine.exec.__get__(fake)
-    return fake
 
 
 def _batch(preplanned) -> SimpleNamespace:
@@ -235,13 +232,10 @@ def test_reset_drops_the_kept_step_of_a_partly_dropped_batch() -> None:
     # exec), then prepare_inputs dropped "b": the stale step must not reach
     # admit, so the reset clears it even though the batch still has inputs
     cleared = []
-    fake = SimpleNamespace(
-        _enable_nvtx=False,
+    fake = make_engine(
         _submodules={"dit": SimpleNamespace(accelerator_graph_runner=None)},
         _runner=SimpleNamespace(clear_preplan=lambda: cleared.append(True)),
     )
-    fake.reset_pre_plan_for_batch = Engine.reset_pre_plan_for_batch.__get__(fake)
-    fake.preplan_is_stale = Engine.preplan_is_stale.__get__(fake)
     batch = SimpleNamespace(
         request_ids=["a"], node_name="dit", inputs=[object()], step=object(),
         preplanned_rids=("a", "b"), preplan_event=object(),
@@ -265,9 +259,7 @@ def test_a_pre_plan_records_its_event_even_when_it_raises(monkeypatch) -> None:
     # a later step may skip a copy into a slot buffer this pre-plan issued,
     # so its plan-stream copies must be waited on even if it never finishes
     monkeypatch.setattr(torch, "Event", _FakeEvent)
-    fake = SimpleNamespace(
-        _device=torch.device("cpu"),
-        _pre_plan_done={},
+    fake = make_engine(
         _order_after_pre_plans=lambda: None,
         _runner=SimpleNamespace(
             pre_admit=lambda step: SimpleNamespace(ok=True),
@@ -291,7 +283,7 @@ def test_a_pre_plan_records_its_event_even_when_it_raises(monkeypatch) -> None:
     submodule.step_is_input_free = lambda walk: False
     mgmt = SimpleNamespace(submodule=submodule, piecewise_runners={})
     with pytest.raises(RuntimeError):
-        Engine._pre_plan_for_batch(fake, batch, mgmt, cg_runner, object())
+        fake._pre_plan_for_batch(batch, mgmt, cg_runner, object())
     event = fake._pre_plan_done["dit"]
     assert isinstance(event, _FakeEvent) and event.recorded_on is None
     assert batch.preplan_event is None
@@ -303,11 +295,11 @@ def test_a_step_is_ordered_after_every_plan_streams_pre_plans(monkeypatch) -> No
     waits = []
     stream = SimpleNamespace(wait_event=waits.append)
     monkeypatch.setattr(torch.accelerator, "current_stream", lambda device=None: stream)
-    fake = SimpleNamespace(_device=torch.device("cpu"), _pre_plan_done={})
-    Engine._order_after_pre_plans(fake)
+    fake = make_engine()
+    fake._order_after_pre_plans()
     assert waits == []
     fake._pre_plan_done.update(enc="e1", dec="e2")
-    Engine._order_after_pre_plans(fake)
+    fake._order_after_pre_plans()
     assert waits == ["e1", "e2"]
 
 
@@ -322,10 +314,7 @@ def test_an_inline_plan_waits_on_pre_plans_before_the_resident_stage_copies() ->
         calls.append("runner")
         raise NotImplementedError("reached plan")
 
-    engine = object.__new__(Engine)
-    engine._enable_nvtx = False
-    engine._runner = SimpleNamespace(plan=plan)
-    engine._order_after_pre_plans = lambda: calls.append("wait")
+    engine = make_engine(_runner=SimpleNamespace(plan=plan), _order_after_pre_plans=lambda: calls.append("wait"))
     lease = SlotLease(slot=0, bucket=BucketKey("decode", 1, 1))
     ctx = StepContext(request_ids=[1], graph_walk="decode", slot=0, capture=False, slot_lease=lease)
     ctx.resident = SimpleNamespace(plan=lambda step, ctx: calls.append("resident"))
