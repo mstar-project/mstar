@@ -30,6 +30,7 @@ from mstar.graph.loop_indices import LoopLayout
 from mstar.utils.h2d import PinnedStager
 
 if TYPE_CHECKING:
+    from mstar.engine.accelerator_graph_backend import CapturedGraph
     from mstar.engine.resources.run_rows import RunRows
 
 # a stop buffer of a run that repeats: the iterations it ran, on every row
@@ -78,10 +79,10 @@ extern "C" __global__ void run_stop(
 
 extern "C" __global__ void run_start(
     const long long* limit, const long long* generation, const volatile long long* yield_until,
-    const unsigned long long* handle, volatile int* started
+    long long* continuation, volatile int* started
 ) {
     bool skip = *limit > 1 && *generation <= *yield_until;
-    cudaGraphSetConditional(*handle, skip ? 0u : 1u);
+    *continuation = skip ? 0 : 1;
     *started = skip ? RUN_SKIPPED : RUN_RAN;
     __threadfence_system();
 }
@@ -214,7 +215,8 @@ class RunState:
         self.bindings = torch.zeros((bs, 2), dtype=torch.long, device=device) if membership is not None else None
         self.descriptors = torch.zeros((bs, width), dtype=torch.long, device=device) if membership is not None else None
         self.index = torch.zeros(1, dtype=torch.long, device=device)
-        # An executed body's decision, not first-entry eligibility or EOF.
+        # Entry writes eligibility; each executed body writes continuation.
+        # Neither is producer EOF or proof that a row executed.
         self.continuation = torch.zeros(1, dtype=torch.long, device=device)
         self.limit = torch.ones(1, dtype=torch.long, device=device)
         # the marks a run ends at, ``refill_at`` of its rows; 0 is off
@@ -243,7 +245,6 @@ class RunState:
         self._generation += 1
         self.generation.fill_(self._generation)
         self.index.zero_()
-        self.continuation.zero_()
         self.counts.zero_()
         if self.descriptors is not None:
             self.descriptors.zero_()
@@ -300,7 +301,7 @@ class CudaWhile:
         ]
 
     _NODE_NAMES = {3: "host", 7: "event record", 10: "memory alloc", 11: "memory free", 13: "conditional"}
-    _TYPE_CONDITIONAL, _COND_WHILE, _ASSIGN_DEFAULT = 13, 1, 1
+    _TYPE_CONDITIONAL = 13
 
     def __init__(self):
         self._rt = ctypes.CDLL(f"libcudart.so.{torch.version.cuda.split('.')[0]}")
@@ -350,14 +351,17 @@ class CudaWhile:
             self._kernels = stop, start, condition
         return self._kernels
 
-    def new_loop(self, device: torch.device) -> tuple[int, int, torch.Tensor]:
-        """The outer graph, its condition's handle, and the handle on the device."""
-        graph, handle = ctypes.c_void_p(), ctypes.c_ulonglong()
-        self._call("cudaGraphCreate", ctypes.byref(graph), 0)
-        self._call(
-            "cudaGraphConditionalHandleCreate", ctypes.byref(handle), graph, 1, self._ASSIGN_DEFAULT,
+    def start(self, state: RunState, stream: int) -> None:
+        """Captured entry, once per attempt before its first condition read."""
+        values = [
+            ctypes.c_void_p(state.limit.data_ptr()), ctypes.c_void_p(state.generation.data_ptr()),
+            ctypes.c_void_p(state.yield_until.data_ptr()), ctypes.c_void_p(state.continuation.data_ptr()),
+            ctypes.c_void_p(state.started.data_ptr()),
+        ]
+        args = (ctypes.c_void_p * len(values))(*(ctypes.cast(ctypes.byref(v), ctypes.c_void_p) for v in values))
+        self._driver_call(
+            "cuLaunchKernel", self._load_kernels()[1], 1, 1, 1, 1, 1, 1, 0, ctypes.c_void_p(stream), args, None,
         )
-        return graph.value, handle.value, torch.tensor([handle.value], dtype=torch.int64, device=device)
 
     def stop(self, state: RunState, tokens: torch.Tensor | None, stream: int) -> None:
         """Inside the step's capture: ``run_stop`` on ``stream``."""
@@ -401,23 +405,6 @@ class CudaWhile:
                 return f"its capture holds a {name} node, which a child graph of a WHILE body can't"
         return None
 
-    def _add_start(self, outer: int, state: RunState, handle: torch.Tensor) -> ctypes.c_void_p:
-        """``run_start``, the node ahead of the WHILE: it can clear the condition
-        the launch set, so the body doesn't run at all."""
-        values = [
-            ctypes.c_void_p(state.limit.data_ptr()), ctypes.c_void_p(state.generation.data_ptr()),
-            ctypes.c_void_p(state.yield_until.data_ptr()),
-            ctypes.c_void_p(handle.data_ptr()), ctypes.c_void_p(state.started.data_ptr()),
-        ]
-        args = (ctypes.c_void_p * len(values))(*(ctypes.cast(ctypes.byref(v), ctypes.c_void_p) for v in values))
-        params = self._KernelNode(func=self._load_kernels()[1], grid=(1, 1, 1), block=(1, 1, 1), args=args)
-        node = ctypes.c_void_p()
-        self._driver_call(
-            "cuGraphAddKernelNode_v2", ctypes.byref(node), ctypes.c_void_p(outer), None, ctypes.c_size_t(0),
-            ctypes.byref(params),
-        )
-        return node
-
     def add_condition_setter(
         self, graph: int, previous: ctypes.c_void_p | None, predicate: torch.Tensor, handle: int,
     ) -> ctypes.c_void_p:
@@ -448,24 +435,6 @@ class CudaWhile:
         )
         return node, conditional.graphs[0]
 
-    def finish(self, outer: int, handle: int, step_graph: int, state: RunState, device_handle: torch.Tensor) -> int:
-        """``run_start``, then the WHILE node, its body the step's graph; the outer graph's exec."""
-        start = self._add_start(outer, state, device_handle)
-        _, body = self.add_conditional(outer, start, handle, self._COND_WHILE)
-        child = ctypes.c_void_p()
-        self._call(
-            "cudaGraphAddChildGraphNode", ctypes.byref(child), ctypes.c_void_p(body), None, ctypes.c_size_t(0),
-            ctypes.c_void_p(step_graph),
-        )
-        # The child includes owner retirement and actual Loop progress after
-        # run_stop. Refresh the condition only after that entire body completes.
-        self.add_condition_setter(body, child, state.continuation, handle)
-        graph_exec = ctypes.c_void_p()
-        self._call(
-            "cudaGraphInstantiateWithFlags", ctypes.byref(graph_exec), ctypes.c_void_p(outer), ctypes.c_ulonglong(0),
-        )
-        return graph_exec.value
-
     def launch(self, graph_exec: int, stream: int) -> None:
         self._call("cudaGraphLaunch", ctypes.c_void_p(graph_exec), ctypes.c_void_p(stream))
 
@@ -475,22 +444,22 @@ class DeviceRun:
     ``inputs``: static input -> its iteration input's column, staged before
     the run; ``stops``, ``rows``, ``spans``: the outputs kept per replay,
     ``[rows, limit, ...]`` each. ``launch`` is the host's one call.
-    ``handle`` keeps the device tensor read by the standalone entry kernel alive.
-    Its native conditional handle belongs to the standalone outer graph."""
+    ``entry`` is the capture that publishes first-entry eligibility; the bound
+    ``launch`` method retains its composed graph and both child captures."""
 
     def __init__(
         self, state: RunState, inputs: Mapping[str, torch.Tensor], launch: Callable[[], None], limit: int,
-        handle: torch.Tensor, window: IterationWindow | None = None,
+        window: IterationWindow | None = None,
     ):
         self.state = state
-        self.handle = handle
+        self.entry: CapturedGraph | None = None
         # set once the columns are sized, before the capture, which only writes them
         self.sealed = False
         self.inputs = inputs
         self.window = window
         self.limit = limit
         # a column index per iteration (``results``)
-        self._columns = torch.arange(limit, device=handle.device)
+        self._columns = torch.arange(limit, device=state.index.device)
         self.launch = launch
         self.stops: dict[str, torch.Tensor] = {}
         self.rows: dict[str, torch.Tensor] = {}

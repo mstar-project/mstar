@@ -16,6 +16,7 @@ from mstar.distributed.communication import CommGroup, JointGroups
 from mstar.engine.accelerator_graph_backend import (
     AcceleratorGraphPool,
     CapturedGraph,
+    GraphConditional,
     copy_words,
 )
 from mstar.engine.accelerator_graph_config import (
@@ -1438,7 +1439,6 @@ class AcceleratorGraphRunner:
         if ask.loop is not None:
             self._rows.prepare_iteration(walk, ask.loop)
         cuda = backend.while_runtime()
-        outer, handle, device_handle = cuda.new_loop(self._device)
         stream = (TokenStream(spec.bucket.bs, ask.limit, self._device, membership=ask.membership is not None)
                   if ask.stream_tokens else None)
         state = RunState(
@@ -1458,10 +1458,7 @@ class AcceleratorGraphRunner:
         else:
             inputs = {name: value.new_zeros((value.shape[0], ask.limit, *value.shape[1:]))
                       for name, value in shapes.items()}
-        graph_exec: list[int] = []
-        run = DeviceRun(
-            state, inputs, lambda: cuda.launch(graph_exec[0], backend.raw_stream()), ask.limit, device_handle, window,
-        )
+        run = DeviceRun(state, inputs, lambda: None, ask.limit, window)
         # The run's columns live outside the capture's pool: a block the forward
         # frees mid-capture goes to a later allocation of the same capture, so
         # the next iteration's forward would write its scratch over all but the
@@ -1526,6 +1523,7 @@ class AcceleratorGraphRunner:
             return raw
 
         try:
+            cuda._load_kernels()
             graph, output = capture_into_graph(
                 body, self._memory_pool, self._device, self._autocast_dtype, keep_graph=True,
                 node_name=self._submodule_name, stream=self._capture_stream,
@@ -1536,7 +1534,12 @@ class AcceleratorGraphRunner:
                 if window is not None:
                     owner.discard_window(SlotLease(spec.slot, spec.bucket, self._member))
                 return None, None, None
-            graph_exec.append(cuda.finish(outer, handle, raw_graph, state, device_handle))
+            entry, _ = capture_into_graph(
+                lambda: cuda.start(state, backend.raw_stream()), self._memory_pool, self._device, None,
+                keep_graph=True, node_name=self._submodule_name, stream=self._capture_stream,
+            )
+            composed = backend.compose((entry, GraphConditional("while", state.continuation, (graph,))))
+            run.entry, run.launch = entry, composed.replay
         except Exception as error:
             self._run_failures[walk] = f"runner: its capture into a WHILE body failed: {error}"
             logger.warning("AcceleratorGraphRunner[%s]: %s", self._submodule_name, error)

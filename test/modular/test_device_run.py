@@ -7,6 +7,7 @@ import pytest
 import torch
 
 from mstar.engine import accelerator_graph_runner as runner_mod
+from mstar.engine.accelerator_graph_backend import GraphConditional
 from mstar.engine.accelerator_graph_runner import AcceleratorGraphRunner
 from mstar.engine.device_run import (
     RUN_COUNTS,
@@ -40,8 +41,13 @@ class _Loop:
         self.on_iteration = on_iteration
         self.state = None
 
-    def new_loop(self, device):
-        return 1, 2, torch.zeros(1)
+    def _load_kernels(self):
+        pass
+
+    def start(self, state, stream):
+        skip = int(state.limit) > 1 and int(state.generation[0]) <= int(state.yield_until[0])
+        state.started[0] = RUN_SKIPPED if skip else RUN_RAN
+        state.continuation[0] = not skip
 
     def stop(self, state, tokens, stream):
         """The test double of the ``run_stop`` kernel, which only CUDA can run."""
@@ -69,24 +75,20 @@ class _Loop:
     def node_refusal(self, graph):
         return None
 
-    def finish(self, outer, handle, graph, state, device_handle):
-        self.state = state
-        return 3
-
-    def launch(self, graph_exec, stream):
-        """``run_start``, then the WHILE."""
-        state = self.state
-        skip = int(state.limit) > 1 and int(state.generation[0]) <= int(state.yield_until[0])
-        state.started[0] = RUN_SKIPPED if skip else RUN_RAN
-        if skip:
-            return
-        i = 0
-        while True:
-            self.on_iteration(i)
-            self.body()
-            i += 1
-            if not state.continuation.item():
-                return
+    def compose(self, ops):
+        def replay(sequence):
+            for op in sequence:
+                if isinstance(op, GraphConditional):
+                    iteration = 0
+                    while op.predicate.item():
+                        self.on_iteration(iteration)
+                        replay(op.body)
+                        iteration += 1
+                        if op.kind == "if":
+                            break
+                else:
+                    op.replay()
+        return SimpleNamespace(replay=lambda: replay(ops))
 
 
 def _runner(
@@ -104,7 +106,7 @@ def _runner(
     runner._submodule = SimpleNamespace(ITERATION_INPUTS={"cond": SimpleNamespace(capture_fill=0)})
     runner._graph_backend = SimpleNamespace(
         while_refusal=lambda: None, while_runtime=lambda: loop,
-        raw_stream=lambda: 0, synchronize=lambda: None,
+        raw_stream=lambda: 0, synchronize=lambda: None, compose=loop.compose,
     )
     resident = layout = None
     if progress:
@@ -151,13 +153,14 @@ def _runner(
         )
 
     def capture(body, *args, **kwargs):
-        loop.body = body
-        loop.capturing(body)
+        if loop.body is None:
+            loop.body = body
+            loop.capturing(body)
         out = body()
         calls.clear()  # capture records; it doesn't run
         if "h" in static:
             static["h"].zero_()
-        return SimpleNamespace(raw_cuda_graph=lambda: 7), out
+        return SimpleNamespace(raw_cuda_graph=lambda: 7, replay=body), out
 
     monkeypatch.setattr(runner_mod, "capture_into_graph", capture)
     spec = SimpleNamespace(bucket=BucketKey(WALK, bs, bs), slot=0, config=SimpleNamespace(get_config_type=lambda: None))
@@ -343,40 +346,9 @@ def test_a_step_graph_a_while_body_cant_hold_is_refused(kinds, why):
 
 
 
-def test_standalone_condition_waits_for_the_entire_captured_body():
-    import ctypes
-
-    cuda = CudaWhile.__new__(CudaWhile)
-    state = RunState(1, None, (), CPU)
-    child_done, condition_set = [], []
-    cuda._add_start = lambda *args: ctypes.c_void_p(4)
-    cuda.add_conditional = lambda *args: (ctypes.c_void_p(5), 6)
-
-    def call(name, *args):
-        if name == "cudaGraphAddChildGraphNode":
-            assert args[1].value == 6
-            args[0]._obj.value = 7
-            child_done.append(7)
-        elif name == "cudaGraphInstantiateWithFlags":
-            assert condition_set == [True]
-            args[0]._obj.value = 8
-        else:
-            pytest.fail(name)
-
-    def set_condition(parent, previous, predicate, handle):
-        assert child_done == [previous.value]
-        assert parent == 6 and predicate is state.continuation and handle == 2
-        condition_set.append(True)
-
-    cuda._call, cuda.add_condition_setter = call, set_condition
-    assert cuda.finish(1, 2, 3, state, torch.tensor([2])) == 8
-
-
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="real CUDA captured body reuse")
 def test_one_run_body_reuses_standalone_and_composed_parents():
-    import ctypes
-
-    from mstar.engine.accelerator_graph_backend import GraphConditional, get_accelerator_graph_backend
+    from mstar.engine.accelerator_graph_backend import get_accelerator_graph_backend
     from mstar.engine.accelerator_graph_runner import capture_into_graph
 
     backend = get_accelerator_graph_backend(torch.device("cuda:0"))
@@ -386,7 +358,7 @@ def test_one_run_body_reuses_standalone_and_composed_parents():
     history = torch.zeros((2, 6), dtype=torch.long, device=device)
     offsets = torch.tensor([1, 11], device=device)
     tail = torch.zeros_like(state.index)
-    outer, handle, device_handle = cuda.new_loop(device)
+    pool = backend.graph_pool_handle()
     cuda._load_kernels()
 
     def body():
@@ -395,43 +367,43 @@ def test_one_run_body_reuses_standalone_and_composed_parents():
         cuda.stop(state, token, backend.raw_stream())
         tail.copy_(state.index)
 
-    captured = capture_into_graph(body, backend.graph_pool_handle(), device, None, keep_graph=True)[0]
-    standalone = cuda.finish(outer, handle, int(captured.raw_cuda_graph()), state, device_handle)
-    # This graph owns fresh conditional handles. The same capture and all its
-    # bound storage remain leased while either parent executes, never both.
-    composed = backend.compose((GraphConditional("while", state.continuation, (
+    captured = capture_into_graph(body, pool, device, None, keep_graph=True)[0]
+    entry = capture_into_graph(lambda: cuda.start(state, backend.raw_stream()), pool, device, None,
+                               keep_graph=True)[0]
+    standalone = backend.compose((entry, GraphConditional("while", state.continuation, (captured,))))
+    # Both parents own fresh conditional handles but reuse the same entry/body
+    # and exclusive bound storage. Entry executes once, never inside the loop.
+    composed = backend.compose((entry, GraphConditional("while", state.continuation, (
         GraphConditional("if", state.continuation, (captured,)),
-    )),))
+    ))))
     try:
-        for kind, skip in (("standalone", False), ("composed", False),
-                           ("standalone", True), ("composed", True),
-                           ("composed", False), ("standalone", False)):
-            state.stage(2, [False, False], 6)
+        cases = [(standalone, False, 6), (composed, False, 6),
+                 (standalone, True, 6), (composed, True, 6),
+                 (composed, False, 6), (standalone, False, 6),
+                 (standalone, True, 1), (composed, True, 1)]
+        for parent, yielded, width in cases:
+            state.stage(2, [False, False], width)
             history.zero_()
             tail.zero_()
-            if kind == "standalone":
-                if skip:
-                    state.request_yield()
-                cuda.launch(standalone, backend.raw_stream())
-            else:
-                # Entry eligibility belongs to this parent, not the previous
-                # launch's continuation or an invented started receipt.
-                state.continuation.fill_(0 if skip else 1)
-                composed.replay()
+            if yielded:
+                state.request_yield()
+            parent.replay()
             backend.synchronize()
-            assert state.counts.tolist() == ([0, 0] if skip else [3, 4])
-            assert state.index.item() == tail.item() == (0 if skip else 4)
+            skip = yielded and width > 1
+            count = 0 if skip else min(width, 4)
+            assert state.counts.tolist() == [min(count, 3), count]
+            assert state.index.item() == tail.item() == count
             assert state.continuation.item() == 0
-            if kind == "standalone":
-                assert state.started.item() == (RUN_SKIPPED if skip else RUN_RAN)
-            else:
-                assert state.started.item() == 0
-            if not skip:
-                assert history.tolist() == [[1, 2, 3, 4, 0, 0], [11, 12, 13, 14, 0, 0]]
+            assert state.started.item() == (RUN_SKIPPED if skip else RUN_RAN)
+            assert history.tolist() == [
+                list(range(1, count + 1)) + [0] * (6 - count),
+                list(range(11, count + 11)) + [0] * (6 - count),
+            ]
     finally:
         backend.synchronize()
-        cuda._call("cudaGraphExecDestroy", ctypes.c_void_p(standalone))
-        cuda._call("cudaGraphDestroy", ctypes.c_void_p(outer))
+        composed.reset()
+        standalone.reset()
+
 
 def test_a_run_refuses_a_generator_draw_and_a_walk_with_no_while_node():
     runner = AcceleratorGraphRunner.__new__(AcceleratorGraphRunner)
@@ -555,39 +527,15 @@ def test_a_runs_columns_are_allocated_before_its_capture(monkeypatch):
     assert seen and {name: id(column) for name, column in run.stops.items()} == seen and run.sealed
 
 
-def test_a_run_holds_the_device_handle_its_graph_reads(monkeypatch):
-    """The stop kernel reads the WHILE handle by address: freed after capture,
-    its block went to the next allocation and the kernel trapped on the GPU."""
-    import gc
-    import weakref
-
-    handles = []
-
-    class Kept(_Loop):
-        def new_loop(self, device):
-            outer, handle, on_device = super().new_loop(device)
-            handles.append(weakref.ref(on_device))
-            return outer, handle, on_device
-
-    loop = Kept()
-    _, run, _, _ = _runner(monkeypatch, loop, [[1, 2]])
-    loop.body = None  # a real capture keeps no Python body
-    gc.collect()
-    assert handles[0]() is not None and run is not None
-
-
 @pytest.mark.parametrize("progress", [False, True])
 def test_a_failed_while_capture_settles_its_walk_and_a_plain_capture_serves(monkeypatch, progress):
     """One failure is the walk's answer: trying each bucket cost a second capture
     of every one of them."""
     class Failing(_Loop):
-        loops = 0
-
-        def new_loop(self, device):
-            Failing.loops += 1
-            return super().new_loop(device)
+        attempts = 0
 
         def stop(self, state, tokens, stream):
+            Failing.attempts += 1
             raise RuntimeError("no such stream")
 
     monkeypatch.setattr(torch.accelerator, "is_available", lambda: False)
@@ -595,7 +543,7 @@ def test_a_failed_while_capture_settles_its_walk_and_a_plain_capture_serves(monk
     assert not runner._resources[tables_key("n")]._windows
     assert run is None and "no such stream" in runner.run_refusal(WALK)
     spec = SimpleNamespace(bucket=BucketKey(WALK, 2, 2), slot=1, config=SimpleNamespace(get_config_type=lambda: None))
-    assert runner._capture_run(spec, None) == (None, None, None) and Failing.loops == 1
+    assert runner._capture_run(spec, None) == (None, None, None) and Failing.attempts == 1
 
 
 def test_a_raw_launch_takes_the_cuda_handle_torch_stream_doesnt_have(monkeypatch):
@@ -1008,7 +956,7 @@ def test_a_run_that_ends_short_repeats_its_last_iteration_in_the_columns_it_neve
     from mstar.engine.device_run import RUN_REPLAYS, DeviceRun
 
     state = RunState(1, "t", {9}, CPU)
-    run = DeviceRun(state, {}, lambda: None, 4, torch.zeros(1, dtype=torch.long))
+    run = DeviceRun(state, {}, lambda: None, 4)
     run.rows["t"] = torch.tensor([[5, 6, 1 << 40, 1 << 40]])
     run.stops["t"] = run.rows["t"].clone()
     state.index.fill_(2)
@@ -1039,7 +987,7 @@ def test_joining_results_only_expose_views_while_the_device_run_is_active():
     state.descriptors = torch.tensor([[1, 2, 0, 0], [3, 3, 0, 0]])
     state.index.fill_(2)
     state.counts.fill_(2)
-    run = DeviceRun(state, {}, lambda: None, 4, torch.zeros(1, dtype=torch.long))
+    run = DeviceRun(state, {}, lambda: None, 4)
     run.rows["t"] = torch.tensor([[5, 6, -1, -2], [7, 8, -3, -4]])
     run.stops["t"] = run.rows["t"].clone()
     run.spans["t"] = torch.ones(2, 4, dtype=torch.long)
