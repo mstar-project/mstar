@@ -22,9 +22,9 @@ from mstar.communication.tensors import (
     SharedMemoryCommunicationManager,
 )
 from mstar.distributed.base import ShardingConfig, ShardingGroup
-from mstar.engine.engine import Engine
 from mstar.graph.base import GraphEdge, NodeAndGraphWalk
 from mstar.model.submodule_base import BatchedModelOutput, NodeSubmodule
+from mstar.testing_utils.engine import make_engine
 
 
 class _NullCommunicator:
@@ -188,8 +188,8 @@ def test_engine_row_output_arrives_intact(bookkeeping):
         row_outputs={"x": torch.arange(12.0).reshape(3, 4).t()},
     )
     per_rid: dict = {}
-    _, row_views = Engine._merge_per_rid(
-        None, per_rid, raw, rids, rids, _UnfilteredSubmodule(), {},
+    _, row_views = make_engine()._merge_per_rid(
+        per_rid, raw, rids, rids, _UnfilteredSubmodule(), {},
     )
     assert not row_views["x"][0].is_contiguous()
     outputs = BatchedModelOutput(

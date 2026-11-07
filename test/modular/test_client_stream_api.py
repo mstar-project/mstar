@@ -47,6 +47,7 @@ from mstar.streaming.topology import (  # noqa: E402
     Connection,
     PartitionTopology,
 )
+from mstar.testing_utils.model import StubModel  # noqa: E402
 from mstar.utils.ipc_format import (  # noqa: E402
     ClientStreamRoute,
     ConductorMessageType,
@@ -68,18 +69,12 @@ def _headerless_audio(monkeypatch):
     monkeypatch.setattr("mstar.api_server.data_worker.check_audio_duration", lambda filepath: None)
 
 
-class _ListeningModel:
+class _ListeningModel(StubModel):
     """Raw float32 files in; ``audio_in`` stream items out. No walks: the
     data worker addresses items to the node the conductor's route names."""
 
     def __init__(self):
         self.chunk_calls = []
-
-    def max_input_files(self):
-        return {}
-
-    def kv_labels(self):
-        return {}
 
     def get_partition_topology(self):
         return PartitionTopology(partitions=["Ear"], connections=[

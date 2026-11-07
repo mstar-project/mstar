@@ -33,6 +33,7 @@ from mstar.engine.state.analysis import state_declaration_problems
 from mstar.model.base import parse_autocast_dtype, serving_resources
 from mstar.model.command_a_plus import config as command_a_plus_config
 from mstar.model.command_a_plus.command_a_plus_model import CommandAPlusModel
+from mstar.model.keys import MIXED
 from mstar.model.qwen3_5.config import (
     ATTN,
     CONV,
@@ -41,7 +42,6 @@ from mstar.model.qwen3_5.config import (
     KV_CACHE,
     LINEAR_ATTENTION,
     LINEAR_ATTN,
-    LLM_MIXED,
     ROPE,
     SAMPLER,
     VISION_ATTN,
@@ -50,7 +50,7 @@ from mstar.model.qwen3_5.config import (
 from mstar.model.qwen3_5.qwen3_5_model import Qwen3_5DenseModel
 from mstar.model.registry import MODEL_REGISTRY
 
-_MIXED_SPLIT = CombinedSplit(LLM_MIXED, prefill_walks=("prefill_text",))
+_MIXED_SPLIT = CombinedSplit(MIXED, prefill_walks=("prefill_text",))
 
 # The published geometries (Qwen/Qwen3.5-0.8B, -9B and -27B `config.json`), so these tests need no download.
 QWEN3_5 = {
