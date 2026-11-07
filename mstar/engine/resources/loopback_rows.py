@@ -377,12 +377,17 @@ class LoopbackRows(Resource):
         table = self._resident_rows
         gather_column(self._resident.store, step.slots, table.stride, table.col, self.indices(step.bucket, step.slot))
 
+    def covers_head(self, name: str, target: torch.Tensor) -> bool:
+        """Whether the existing row table can fill this captured input."""
+        table = self._tables.get(name)
+        return table is not None and target.ndim > 0 and table[0].numel() * target.shape[0] == target.numel()
+
     def head(self, bucket: BucketKey, slot: int, name: str, target: torch.Tensor) -> bool:
         """In a capture, before the forward: each row's ``name`` into the
         static input ``target``. False while no table holds it (the first warm-up)."""
-        table = self._tables.get(name)
-        if table is None or table[0].numel() * target.shape[0] != target.numel():
+        if not self.covers_head(name, target):
             return False
+        table = self._tables[name]
         rows = table.index_select(0, self.indices(bucket, slot)[:target.shape[0]])
         target.copy_(rows.reshape(target.shape))
         return True

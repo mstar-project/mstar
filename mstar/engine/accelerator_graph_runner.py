@@ -1587,8 +1587,6 @@ class AcceleratorGraphRunner:
             heads, tails = self._row_pairs(walk) if rows is not None else ({}, {})
             if heads and (_is_packed(config) or set(config.replay_graph_walks) - {walk}):
                 heads = {}  # one row a request, of one walk
-            row_heads: dict[str, str] = {}
-
             def run_forward(in_run: bool = False, select_inputs: Callable[[], None] | None = None):
                 if resident is not None:
                     planner.gather(resident)
@@ -1598,8 +1596,8 @@ class AcceleratorGraphRunner:
                     select_inputs()
                 for signal, name in heads.items():
                     target = static_inputs.get(name)
-                    if isinstance(target, torch.Tensor) and rows.head(spec.bucket, spec.slot, signal, target):
-                        row_heads[signal] = name
+                    if isinstance(target, torch.Tensor):
+                        rows.head(spec.bucket, spec.slot, signal, target)
                 out = forward(
                     graph_walk=walk,
                     engine_inputs=engine_inputs,
@@ -1640,6 +1638,13 @@ class AcceleratorGraphRunner:
                 prepare()
             self._graph_backend.synchronize()
 
+            # Sizing already warmed this spec. Capturing it with forwards=0
+            # must still discover the input owner before membership checks,
+            # without executing another forward or gather to rediscover it.
+            row_heads = {
+                signal: name for signal, name in heads.items()
+                if isinstance(target := static_inputs.get(name), torch.Tensor) and rows.covers_head(signal, target)
+            }
             yield WarmedSpec(
                 run=run_forward,
                 static_inputs=static_inputs,

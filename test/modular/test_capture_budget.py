@@ -398,6 +398,42 @@ def test_every_bucket_is_sized_whatever_the_pools_size(measured, monkeypatch):
     assert kv._arena.num_free == free, "sizing must leave every page free"
 
 
+@pytest.mark.parametrize("width", [1, 2])
+def test_a_sized_capture_knows_its_loopback_owner_before_running_again(width):
+    from mstar.engine.accelerator_graph_config import BatchedAcceleratorGraphConfig
+    from mstar.engine.accelerator_graph_runner import CaptureTemplate
+    from mstar.engine.resources.loopback_rows import LoopbackRows
+    from mstar.model.submodule_base import ARNodeInputs
+
+    device = torch.device("cpu")
+    rows = LoopbackRows(device, capacity=2)
+    for rid in (1, 2):
+        rows.add(rid)
+    rows.write("token", [1, 2], torch.tensor([[11], [22]]).expand(2, width))
+    bucket = _bucket("decode", 2, 2)
+    rows.indices(bucket, 0).copy_(torch.tensor([rows._row_of[1], rows._row_of[2]]))
+    config = BatchedAcceleratorGraphConfig(
+        capture_graph_walk="decode", single_request_inputs=ARNodeInputs(input_seq_len=1),
+    )
+    spec = CGSlotSpec(bucket=bucket, slot=0, config=config)
+    static = torch.zeros(2, dtype=torch.long)
+    calls = []
+    runner = AcceleratorGraphRunner.__new__(AcceleratorGraphRunner)
+    runner._device, runner._resident, runner._rows = device, None, rows
+    runner._row_pairs = lambda walk: ({"token": "input_ids"}, {})
+    runner._template = lambda spec: CaptureTemplate([1, 2], [], SimpleNamespace(per_request_info={}), None)
+    runner._prepare = lambda *args: {"input_ids": static}
+    runner._intern_static_buffer = lambda config, key, value, **kwargs: value
+    runner._forward_for = lambda spec: lambda **kwargs: calls.append(kwargs["input_ids"].clone())
+    runner._graph_backend = SimpleNamespace(set_device=lambda: None, synchronize=lambda: None)
+    runner._dummy_rows = SimpleNamespace(reset=lambda *args, **kwargs: None)
+    with runner._warmed(spec, forwards=0) as warmed:
+        assert calls == [] and static.tolist() == [0, 0]
+        assert warmed.row_heads == ({"token": "input_ids"} if width == 1 else {})
+        warmed.run()
+        assert calls[0].tolist() == ([11, 22] if width == 1 else [0, 0])
+
+
 def test_a_cpu_device_never_asks_the_driver(monkeypatch):
     """Asking the CUDA driver for memory fails an XPU or CPU worker at start. A
     CPU device skips the plan even on a host where CUDA exists."""
