@@ -92,6 +92,8 @@ def _connected_engine(transform=None, *, head_state=False, mixed=False):
         runner._buckets = {bucket: SimpleNamespace(config=config, slots=[slot])}
         runner._static_buffer_seq_dims = {}
         runner._submodule_name = name
+        runner._device = torch.device("cpu")
+        runner._generator_walks = set()
         runner.release = lambda lease, bs, name=name: events.append(f"release:{name}")
         mgmt = SubmoduleManagement(Node(name), None, None, None, {}, accelerator_graph_runner=runner)
         eng._submodules[name] = mgmt
@@ -368,7 +370,7 @@ def test_connected_completion_keeps_ordinary_last_member_metadata(kept):
     assert eng._loopback_rows(group.members[1][1]) == ([False, True] if kept else None)
 
 
-@pytest.mark.parametrize("unsupported", ["run", "resident", "row_heads"])
+@pytest.mark.parametrize("unsupported", ["run", "resident", "row_heads", "generator"])
 def test_connected_refuses_unstaged_captured_state_before_launch(unsupported):
     eng, group, events = _connected_engine()
     batch = group.members[0][1]
@@ -378,6 +380,8 @@ def test_connected_refuses_unstaged_captured_state_before_launch(unsupported):
         batch.step_context.resident = object()
     elif unsupported == "run":
         slot.run = object()
+    elif unsupported == "generator":
+        runner._generator_walks.add("prefill")
     else:
         slot.row_heads = {"x": "x"}
     assert eng.exec_group(group) is None
@@ -401,3 +405,40 @@ def test_connected_preserves_ordinary_output_precedence(replacement, monkeypatch
     ordinary = eng._collect_step(batch, mgmt, batch.step_context.slot_lease, slot.static_outputs,
                                  batch.inputs, batch.per_request_info_wrapped)
     assert ordinary.per_rid_outputs[2]["x"][0].tolist() == [[42., 42.]]
+
+
+def test_composed_unit_reuses_capture_bindings_across_new_real_inputs():
+    from dataclasses import replace
+
+    eng, original, events = _connected_engine(mixed=True)
+    runner = eng._submodules["a"].accelerator_graph_runner
+    runner._device = torch.device("cuda")
+    compositions, launches = [], []
+
+    def compose(ops):
+        compositions.append(tuple(ops))
+
+        def replay():
+            launches.append(1)
+            for op in ops:
+                if isinstance(op, tuple):
+                    op[0].copy_(op[1])
+                else:
+                    op.replay()
+
+        return SimpleNamespace(replay=replay)
+
+    runner._graph_backend = SimpleNamespace(compose=compose)
+    retained = []
+    for offset in (0, 20):
+        group = replace(original, parts=[], initial_copies=[])
+        head = group.members[0][1]
+        head.per_request_input_tensors = {
+            rid: {"x": [torch.full((1, 2), float(rid + offset))]} for rid in (2, 1)
+        }
+        outputs = eng.exec_group(group)
+        assert group.submitted and not group.refusal
+        retained.append(outputs[1].per_rid_outputs[1]["x"][0].clone())
+    assert len(compositions) == 1 and len(launches) == 2
+    assert [out.tolist() for out in retained] == [[[112., 112.]], [[132., 132.]]]
+    assert events == ["a", "b", "release:b", "release:a"] * 2

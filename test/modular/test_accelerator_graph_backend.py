@@ -343,3 +343,50 @@ def test_chatterbox_shape_graphs_keep_results_across_replays(graph_device):
     torch.testing.assert_close(first.cpu(), host_source * 2 + 1)
     torch.testing.assert_close(second.cpu(), (host_source + 10) * 3 + 1)
     torch.testing.assert_close(third.cpu(), (host_source + 20) * 2 + 1)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="real CUDA graph composition")
+def test_composed_cuda_captures_keep_each_round_and_reuse_both_slots(monkeypatch):
+    """Two slots, three A→B rounds, strided output columns, one launch per unit."""
+    device = torch.device("cuda")
+    backend = get_accelerator_graph_backend(device)
+    slots = []
+    for _ in range(2):
+        x = torch.zeros(3, device=device)
+        b_input = torch.zeros_like(x)
+        graph_a, a = capture_into_graph(lambda x=x: x + 1, backend.graph_pool_handle(), device, None, keep_graph=True)
+        graph_b, b = capture_into_graph(
+            lambda b_input=b_input: b_input * 2, backend.graph_pool_handle(), device, None, keep_graph=True,
+        )
+        columns = torch.empty(3, 3, device=device)
+        ops = []
+        for i in range(3):
+            ops.extend([graph_a, (b_input, a), graph_b, (columns[:, i], b)])
+            if i != 2:
+                ops.append((x, b))
+        slots.append((x, columns, backend.compose(ops)))
+    launches = []
+    runtime = backend.while_runtime()
+    launch = runtime.launch
+
+    def counted_launch(*args):
+        launches.append(args[0])
+        return launch(*args)
+
+    monkeypatch.setattr(runtime, "launch", counted_launch)
+    retained, expected = [], []
+    for wave in range(2):
+        for slot, (x, columns, graph) in enumerate(slots):
+            value = torch.arange(3, device=device, dtype=torch.float32) + 10 * wave + slot
+            x.copy_(value)
+            graph.replay()
+            retained.append(columns.clone())
+            want = []
+            for _ in range(3):
+                value = (value + 1) * 2
+                want.append(value)
+            expected.append(torch.stack(want, dim=1))
+    backend.synchronize()
+    assert len(launches) == 4 and launches[0:2] == launches[2:4]
+    for got, want in zip(retained, expected, strict=True):
+        torch.testing.assert_close(got, want)

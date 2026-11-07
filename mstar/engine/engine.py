@@ -662,9 +662,11 @@ class ExecutionGroup:
     submitted: bool = False
     refusal: str | None = None
     parts: list[RunPart] = field(default_factory=list)
+    initial_copies: list[tuple[torch.Tensor, torch.Tensor]] = field(default_factory=list)
 
 
 class Engine:
+    _walk_runs: frozenset[str] = frozenset()
     # node -> its lane, for nodes off the chain, and each such lane's stream;
     # set at construction and load, empty for an engine with no lanes
     _walk_lanes: Mapping[tuple[str, str], int] = MappingProxyType({})
@@ -1065,6 +1067,8 @@ class Engine:
         node's ``step_repeats`` settings;
         ``kept_rows``: the loop-back signals of the pairs whose config asks to
         keep them in device rows."""
+        if self._walk_runs and self._device.type != "cuda":
+            raise ValueError("walk_runs currently requires CUDA graph composition")
         # the Loop each (node, walk) runs in, whose counter its iteration inputs read
         self._loops = dict(looped) if isinstance(looped, Mapping) else {}
         for node_name, walk in carried:
@@ -1091,6 +1095,7 @@ class Engine:
                 device_capability=self.device_capability,
                 capture_stream=capture_stream,
             )
+            runner._connected_walks = self._walk_runs
             piecewise[node_name] = self._build_piecewise_runners(
                 node_name, submodule_mgmt, capture_stream,
             )
@@ -2413,6 +2418,8 @@ class Engine:
                         guard.refuse("a member has no capture for the common rows")
                     leases[batch.node_name] = lease
                     slot = runner.slot_for(lease)
+                    if batch.graph_walk in runner._generator_walks:
+                        guard.refuse("a composed member draws from a torch generator")
                     if slot.run is not None or batch.step_context.resident is not None:
                         guard.refuse("connected resident runs need their shared run state staged before launch")
                     if slot.row_heads:
@@ -2457,7 +2464,9 @@ class Engine:
                             if value.ndim != target.ndim or value.shape[dim] > target.shape[dim]:
                                 guard.refuse(f"future field {name} exceeds its captured destination")
                             target = target.narrow(dim, 0, value.shape[dim])
-                            copies.extend(guard.copies(value, target, tuple(expected.pop(name))))
+                            keys = tuple(expected.pop(name))
+                            copies.extend(guard.copies(value, target, keys, keys))
+                            group.initial_copies.extend(guard.copies(value, target, keys, bindings.keys() - set(keys)))
                         else:
                             real[name] = value
                     if expected:
@@ -2470,6 +2479,8 @@ class Engine:
             head = group.members[0][1]
             if head.launch_started_event is not None:
                 head.launch_started_event.set()
+            for source, target in group.initial_copies:
+                target.copy_(source.reshape(target.shape), non_blocking=True)
             prepared[0][1].accelerator_graph_runner.launch_parts(group.parts)
             for batch, mgmt, _, _, _, _ in prepared:
                 self._commit_step(batch, mgmt, batch.step, batch.step_context)

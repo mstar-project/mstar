@@ -343,6 +343,7 @@ class EngineManager:
             model=model,
             row_nodes=_row_nodes(model, model_config, submodules),
         )
+        engine._walk_runs = frozenset(model_config.get("walk_runs") or ())
         budgets = model_config.get("max_batch_tokens") or {}
         override_mixed = model_config.get("can_override_mixed_max_tokens") or {}
         known = {n for group in model_config.get("node_groups", []) for n in group.get("node_names", [])}

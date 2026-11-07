@@ -238,9 +238,12 @@ ordinary graph edges, captures, resource declarations and ``REPEAT_CARRIES``
 names; no additional model method is required.
 
 The worker selects common rows, prepares and admits all members, and submits
-their captures and internal copies in graph order. An unsubmitted refusal runs
-the ordinary head. Currently eligible sections are acyclic, on one GPU, and
-have disjoint resource owners. Preparation may structurally pack future inputs
+their captures and internal copies in one CUDA graph launch, in graph order.
+The composed graph and its stable bindings stay with the capture slot; ordinary
+external inputs are staged before launch. An unsubmitted refusal runs the
+ordinary head. Currently eligible sections are acyclic, on one CUDA GPU, and
+have disjoint resource owners. Resident/conditional captures, captured row heads,
+streaming edges and torch-generator draws remain execution boundaries. Preparation may structurally pack future inputs
 with real values; arithmetic on future values, mutable model request state,
 and uncaptured producer output transformations use ordinary execution. The
 phase trace records ``connected.members#`` and each member's real row count.

@@ -16,6 +16,7 @@ from mstar.distributed.communication import CommGroup, JointGroups
 from mstar.engine.accelerator_graph_backend import (
     AcceleratorGraphPool,
     CapturedGraph,
+    copy_words,
 )
 from mstar.engine.accelerator_graph_config import (
     DETERMINISTIC_COMPILE_MODE,
@@ -658,24 +659,6 @@ def output_named(outputs, name: str) -> torch.Tensor | None:
     return None
 
 
-def _copy_words(target: torch.Tensor, source: torch.Tensor) -> list[int] | None:
-    """``target.copy_(source)`` as a launch op's words: destination, its pitch,
-    source, its pitch, row width and rows, in bytes. None where that can't say
-    it: a cast, a broadcast, or rows that aren't contiguous."""
-    if target.shape != source.shape or target.dtype != source.dtype or target.numel() == 0:
-        return None
-    if target.is_contiguous() and source.is_contiguous():
-        size = target.numel() * target.element_size()
-        return [target.data_ptr(), size, source.data_ptr(), size, size, 1]
-    if target.dim() == 0 or not (target[0].is_contiguous() and source[0].is_contiguous()):
-        return None
-    item = target.element_size()
-    return [
-        target.data_ptr(), target.stride(0) * item, source.data_ptr(), source.stride(0) * item,
-        target[0].numel() * item, target.shape[0],
-    ]
-
-
 def _launch_words(ops: Sequence[tuple[torch.Tensor, torch.Tensor] | int]) -> list[int] | None:
     """``ops`` as ``mstar_rust.launch_run`` takes them: a launch is its graph
     exec's address, a copy its target and source. None if a copy can't be
@@ -685,7 +668,7 @@ def _launch_words(ops: Sequence[tuple[torch.Tensor, torch.Tensor] | int]) -> lis
         if not isinstance(op, tuple):
             words.extend((0, op))
             continue
-        copy = _copy_words(*op)
+        copy = copy_words(*op)
         if copy is None:
             return None
         words.append(1)
@@ -744,6 +727,9 @@ class AcceleratorGraphSlot:
     # loop-back signal -> the static input this capture reads it into, off the
     # node's rows, at its head
     row_heads: Mapping[str, str] = MappingProxyType({})
+    # The latest compatible connected unit anchored on this leased slot.
+    composed_key: tuple = ()
+    composed_graph: CapturedGraph | None = None
 
 
 class RunPart(NamedTuple):
@@ -791,6 +777,7 @@ class WarmedSpec(NamedTuple):
 
 
 class AcceleratorGraphRunner:
+    _connected_walks: frozenset[str] = frozenset()
     CAPTURE_BATCH_SIZES = DEFAULT_CAPTURE_BATCH_SIZES
     NUM_WARMUP = 2
     # None: the backend's shared capture stream (see ``Engine._capture_stream_for``)
@@ -1327,6 +1314,7 @@ class AcceleratorGraphRunner:
                 graph, output = capture_into_graph(
                     warmed.run, self._memory_pool, self._device, self._autocast_dtype,
                     node_name=self._submodule_name, stream=self._capture_stream,
+                    keep_graph=self._device.type == "cuda" and spec.bucket.graph_walk in self._connected_walks,
                 )
             return self._build_slot_from_capture(
                 output=BatchedModelOutput.coerce(output),
@@ -2044,13 +2032,32 @@ class AcceleratorGraphRunner:
         )
 
     def launch_parts(self, parts: Sequence[RunPart]) -> None:
-        """Submit a prepared unit from its first member, in one ordered run."""
+        """Submit a connected unit as one graph, reusing this capture slot's bindings."""
         ops: list[AcceleratorGraphSlot | tuple[torch.Tensor, torch.Tensor]] = []
         for part in parts:
             ops.extend((target, source.reshape(target.shape)) for source, target in part.copies)
             ops.extend((target, column[:, 0].reshape(target.shape)) for column, target in part.columns)
             ops.append(part.slot)
-        self._run(ops)
+        if self._device.type == "cpu":
+            self._run(ops)
+            return
+        lowered, key = [], []
+        for op in ops:
+            if isinstance(op, tuple):
+                words = copy_words(*op)
+                if words is None:
+                    raise ValueError("connected graph copies need contiguous rows without casts")
+                lowered.append(op)
+                key.append(tuple(words))
+            else:
+                lowered.append(op.graph)
+                key.append(id(op.graph))
+        slot = parts[0].slot
+        signature = tuple(key)
+        if slot.composed_graph is None or slot.composed_key != signature:
+            graph = self._graph_backend.compose(lowered)
+            slot.composed_graph, slot.composed_key = graph, signature
+        slot.composed_graph.replay()
 
     def captured_output(self, name: str) -> torch.Tensor | None:
         """A capture's static output ``name``, row i request i; None if no capture has one."""

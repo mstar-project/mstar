@@ -8,7 +8,7 @@ operations on real tensors must keep doing real work.
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import fields, is_dataclass
-from typing import Any, Iterator
+from typing import Any, Collection, Iterator
 
 import torch
 from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode
@@ -111,6 +111,7 @@ class ConnectedInputs(FakeTensorMode):
 
     def copies(
         self, value: torch.Tensor, target: torch.Tensor, expected: tuple[Any, ...],
+        keys: Collection[Any] | None = None,
     ) -> list[tuple[torch.Tensor, torch.Tensor]]:
         """Lower a certified mixed real/future field to existing RunPart copies."""
         spans = self._parts(value)
@@ -127,6 +128,7 @@ class ConnectedInputs(FakeTensorMode):
             if source.dtype != target.dtype or source.device != target.device:
                 self.refuse("future packing casts a source")
             size = source.numel()
-            copies.append((source.view(-1), flat.narrow(0, offset, size)))
+            if keys is None or key in keys:
+                copies.append((source.view(-1), flat.narrow(0, offset, size)))
             offset += size
         return copies
