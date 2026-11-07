@@ -108,6 +108,7 @@ pub struct LoopSpec {
     pub name: Sym,
     pub max_iters: u32,
     pub parent: Option<LoopId>,
+    pub complete: bool,
     /// Entities this loop's registry manages directly. A node inside a child
     /// loop belongs to the child, not here — matching Python's
     /// `GraphStateRegistry._set_managed_entities`, which stops at a Loop.
@@ -154,6 +155,8 @@ pub struct ExecutionUnit {
     /// Signals requiring ordinary output storage/routing. An exclusively
     /// internal edge needs only its readiness notification at landing.
     pub output_signals: Vec<Vec<Sym>>,
+    pub repeat_loop: Option<LoopId>,
+    pub loop_back: Vec<(NodeId, NodeId, Sym)>,
 }
 
 impl ExecutionUnit {
@@ -271,7 +274,46 @@ impl ExecutionUnit {
                 stored.dedup();
                 output_signals.push(stored);
             }
-            units.insert(head, Self { nodes: members, internal_inputs, edges, output_signals });
+            let repeat_loop = nodes[head as usize].loop_id.filter(|&id| {
+                let lp = &loops[id as usize];
+                lp.complete && lp.child_loops.is_empty()
+                    && lp.member_nodes.len() == members.len()
+                    && lp.member_nodes.iter().all(|node| members.contains(node))
+                    && members.iter().all(|&source| {
+                        let node = &nodes[source as usize];
+                        let mut ancestor = lp.parent;
+                        while let Some(parent) = ancestor {
+                            if loops[parent as usize].loop_back.iter().any(|&(signal, dest)| {
+                                dest == node.name && node.inputs.contains(&signal)
+                            }) { return false; }
+                            ancestor = loops[parent as usize].parent;
+                        }
+                        node.outputs.iter().all(|edge| match edge.dest {
+                            Dest::Local(dest) => members.contains(&dest),
+                            Dest::External(_) => false,
+                            Dest::Empty | Dest::EmitToClient => !edge.streaming,
+                        })
+                    })
+                    && lp.loop_back.iter().all(|&(signal, dest)| members.iter().any(|&source| {
+                        nodes[source as usize].outputs.iter().any(|edge| {
+                            edge.name == signal && edge.dest_sym == dest
+                                && matches!(edge.dest, Dest::Local(target) if members.contains(&target))
+                        })
+                    }))
+            });
+            let mut loop_back = Vec::new();
+            if let Some(id) = repeat_loop {
+                for &source in &members {
+                    for edge in &nodes[source as usize].outputs {
+                        if loops[id as usize].loop_back.contains(&(edge.name, edge.dest_sym)) {
+                            if let Dest::Local(dest) = edge.dest {
+                                loop_back.push((source, dest, edge.name));
+                            }
+                        }
+                    }
+                }
+            }
+            units.insert(head, Self { nodes: members, internal_inputs, edges, output_signals, repeat_loop, loop_back });
         }
         units
     }

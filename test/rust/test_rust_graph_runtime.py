@@ -1331,3 +1331,34 @@ def test_a_loop_back_routed_with_no_tensor_keeps_the_loop_going():
     assert rt.pop_rids("dec", WALK, [rid]) is not None
     after = dict(rt.get_dynamic_loop_iters([rid], "default").values[0])
     assert after["loop"] == before["loop"] + 1
+
+
+@pytest.mark.parametrize("shape", ["whole", "partial", "split", "ancestor"])
+def test_only_a_complete_closed_loop_unit_names_a_repeat_domain(shape):
+    from mstar.graph.base import Parallel
+    from mstar.model.base import _divide_into_worker_graphs
+
+    a = GraphNode(name="a", input_names={"x", "y"}, outputs=[GraphEdge(name="x", next_node="b")])
+    b = GraphNode(name="b", input_names={"x"}, outputs=[GraphEdge(name="x", next_node="a")])
+    body = Sequential([a, b])
+    if shape == "partial":
+        body = Sequential([GraphNode(name="p", input_names={"p"},
+                                     outputs=[GraphEdge(name="y", next_node="a")]), body])
+    elif shape == "split":
+        body = Parallel([body, GraphNode(name="other", input_names={"q"}, outputs=[])])
+    loop = Loop(name="steps", section=body, max_iters=4, outputs=[])
+    section = Sequential([loop])
+    if shape == "split":
+        graphs = _divide_into_worker_graphs(section, WALK, {"a": 0, "b": 0, "other": 1},
+                                           [{"ranks": [0]}, {"ranks": [1]}], set())
+        section = next(wg.section for wg in graphs if "a" in wg.section.get_nodes())
+        assert not section.get_loops()["steps"]._partition_complete
+    elif shape == "ancestor":
+        section = Sequential([Loop(name="outer", max_iters=2, outputs=[], section=Sequential([
+            loop, GraphNode(name="p", input_names={"p"}, outputs=[GraphEdge(name="y", next_node="a")]),
+        ]))])
+    runtime = _unit_runtime(section, section.get_loops())
+    unit = next(unit for unit in runtime.execution_units(WALK) if unit.nodes[0] == "a")
+    assert unit.nodes == ("a", "b")
+    assert unit.loop_name == ("steps" if shape == "whole" else None)
+    assert unit.loop_back == ((("b", "a", "x"),) if shape == "whole" else ())

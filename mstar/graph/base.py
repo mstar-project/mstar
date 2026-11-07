@@ -518,6 +518,8 @@ class Loop(GraphSection):
     # loops, where they are set manually
     _external_inputs: set[NameAndDest] | None = None
     _loop_back_inputs: set[NameAndDest] | None = None
+    # Construction preserves whether partitioning retained the entire Loop.
+    _partition_complete: bool = True
 
 
     def get_nodes(self):

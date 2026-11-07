@@ -986,7 +986,7 @@ mod tests {
             node("dec", &["h", "tok"], &[], vec![edge("tok", "dec"), edge("frame", "")]),
         ];
         let loops = vec![LoopArg {
-            name: "L".into(), max_iters: 3, parent: None,
+            name: "L".into(), max_iters: 3, parent: None, complete: true,
             member_nodes: vec!["dec".into()],
             outputs: vec![edge("tok", "emit_to_client")],
             accumulated: vec![edge("frame", "emit_to_client")],

@@ -2565,7 +2565,7 @@ impl GraphRuntime {
 
     /// Immutable local units for a walk. Placement and capture eligibility
     /// are worker/engine concerns; these descriptions never mutate readiness.
-    fn execution_units(&self, graph_walk: &str) -> Vec<(u32, Vec<String>, Vec<(String, String, String)>, Vec<Vec<String>>)> {
+    fn execution_units(&self, graph_walk: &str) -> Vec<(u32, Vec<String>, Vec<(String, String, String)>, Vec<Vec<String>>, Option<String>, Vec<(String, String, String)>)> {
         let Some(walk) = self.interner.get(graph_walk) else { return vec![] };
         let mut out = Vec::new();
         for &wg in self.walk_to_local_wgs.get(&walk).into_iter().flatten() {
@@ -2584,6 +2584,8 @@ impl GraphRuntime {
                     self.wg_ids[wg as usize], unit.nodes.iter().map(|&n| name(n)).collect(),
                     unit.edges.iter().map(|&(a, b, s)| (name(a), name(b), self.interner.name(s).to_owned())).collect(),
                     outputs,
+                    unit.repeat_loop.map(|id| self.interner.name(g.lp(id).name).to_owned()),
+                    unit.loop_back.iter().map(|&(a, b, s)| (name(a), name(b), self.interner.name(s).to_owned())).collect(),
                 ));
             }
         }

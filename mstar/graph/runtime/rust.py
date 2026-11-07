@@ -146,6 +146,7 @@ def worker_graph_args(worker_graph: WorkerGraph) -> dict:
             {
                 "name": lp.name,
                 "max_iters": lp.max_iters,
+                "complete": lp._partition_complete,
                 "parent": _parent_loop_name(lp),
                 # Directly-owned only: a node inside a child loop belongs there.
                 "member_nodes": _member_nodes(lp),
@@ -421,8 +422,8 @@ class RustGraphRuntime(GraphRuntime):
 
     def execution_units(self, graph_walk: str) -> tuple[ExecutionUnit, ...]:
         return tuple(
-            ExecutionUnit(wg, tuple(nodes), tuple(edges), tuple(tuple(s) for s in signals))
-            for wg, nodes, edges, signals in self._rust.execution_units(graph_walk)
+            ExecutionUnit(wg, tuple(nodes), tuple(edges), tuple(tuple(s) for s in signals), loop, tuple(back))
+            for wg, nodes, edges, signals, loop, back in self._rust.execution_units(graph_walk)
         )
 
     def claim_execution_unit(

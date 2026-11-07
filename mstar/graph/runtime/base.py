@@ -397,6 +397,9 @@ class ExecutionUnit:
     # (producer node, consumer node, signal)
     edges: tuple[tuple[str, str, str], ...]
     output_signals: tuple[tuple[str, ...], ...]
+    # Present only for one complete, dependency-closed flat Loop body.
+    loop_name: str | None = None
+    loop_back: tuple[tuple[str, str, str], ...] = ()
 
 
 class RequestWalks(NamedTuple):
