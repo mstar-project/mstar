@@ -37,7 +37,7 @@ from mstar.graph.runtime.base import (  # noqa: E402
     ReadyNodeSpec,
     SpeculationOutput,
 )
-from mstar.model.submodule_base import StepOrder  # noqa: E402
+from mstar.model.submodule_base import BatchedModelOutput, StepOrder  # noqa: E402
 from mstar.utils.containers import ParallelList  # noqa: E402
 from mstar.worker.batch_builder import StepPick  # noqa: E402
 from mstar.worker.chunk_loops import ChunkLoops
@@ -346,7 +346,7 @@ def _looping_worker(monkeypatch, sched, state, refuse=frozenset()) -> Worker:
     def gpu(batch, node_batch, plan_future):
         if refuse.intersection(batch.request_to_worker_graph):
             node_batch.register_admit_error("out of pages")
-        return {}
+        return BatchedModelOutput()
 
     w = Worker.__new__(Worker)
     w.worker_id = "worker_0"
