@@ -310,6 +310,63 @@ def test_a_ring_is_sized_at_load_and_never_shrinks_the_rows():
     assert rows.capacity == 4096
 
 
+@pytest.mark.parametrize("device_name", ["cpu", "cuda"])
+def test_captured_ring_access_uses_owner_rows_and_reserved_positions_without_host_reads(device_name):
+    from mstar.engine.accelerator_graph_runner import capture_into_graph
+    from mstar.engine.resources.loopback_rows import LoopbackRowsStep
+    from mstar.engine.resources.step import StepContext
+    from mstar.utils.device import DeviceCapability
+
+    if device_name == "cuda" and not torch.cuda.is_available():
+        pytest.skip("real captured ring access")
+    device = torch.device(device_name)
+    owner = LoopbackRows(device, capacity=3)
+    owner.ask_ring("frames", 4)
+    owner.ring_table("frames", torch.zeros(2, 1, dtype=torch.long, device=device))
+    for rid in (1, 2):
+        owner.add(rid)
+    assert owner.ring_reserve("frames", [1, 2], 2) == [0, 0]
+    for rid in (1, 2):
+        owner.ring_release("frames", rid, 2)
+    assert owner.ring_reserve("frames", [1, 2], 4) == [2, 2]
+    bucket = BucketKey(WALK, 3, 3)
+    ctx = StepContext([2, 1], WALK, 0, False)
+    ctx.slot_lease = SlotLease(0, bucket)
+    ctx.set_padded_rids((2, 1, -1))
+    owner.plan(LoopbackRowsStep(), ctx)
+    indices = owner.indices(bucket, 0)
+    positions = torch.tensor([3, 2, -1], device=device)
+    active = torch.tensor([True, True, False], device=device)
+    items = torch.tensor([[10], [21], [999]], device=device)
+    read_positions = torch.tensor([[3, 4], [2, 3], [0, -1]], device=device)
+    output = torch.empty(3, 2, 1, dtype=torch.long, device=device)
+
+    def step():
+        owner.ring_scatter("frames", indices, positions, items, active)
+        owner.ring_gather("frames", indices, read_positions, output)
+
+    graph = None
+    if device_name == "cuda":
+        backend = DeviceCapability.of(device).graph_backend
+        graph, _ = capture_into_graph(step, backend.graph_pool_handle(), device, None)
+    # Capturing may execute writes. Reset before checking the ordinary lifetime.
+    owner.ring_write("frames", [1], torch.tensor([[[20], [30]]], device=device), [2])
+    step() if graph is None else graph.replay()
+    positions.add_(1)
+    items.copy_(torch.tensor([[11], [999], [999]], device=device))
+    active.copy_(torch.tensor([True, False, False], device=device))
+    step() if graph is None else graph.replay()
+    if graph is not None:
+        backend.synchronize()
+    assert output.tolist() == [[[10], [11]], [[21], [30]], [[0], [0]]]
+    assert owner.ring_room("frames", 1) == owner.ring_room("frames", 2) == 0
+    # GPU reads do not release semantic ownership; unused slots and consumption
+    # still close through the existing ordinary ring protocol.
+    owner.ring_skip("frames", 2, [2, 5])
+    owner.ring_release("frames", 2, 5)
+    assert owner.ring_room("frames", 2) == 4 and owner.ring_room("frames", 1) == 0
+
+
 @pytest.mark.parametrize("actual", [0, 1, 4])
 def test_a_preplanned_successor_reads_actual_loop_progress_and_stopped_rows_do_not_advance(actual):
     from mstar.graph.loop_indices import LoopLayout

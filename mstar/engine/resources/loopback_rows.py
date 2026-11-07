@@ -245,6 +245,46 @@ class LoopbackRows(Resource):
             stream.synchronize()
         return window
 
+    def ring_gather(
+        self, name: str, rows: torch.Tensor, positions: torch.Tensor, target: torch.Tensor,
+    ) -> None:
+        """Inside a capture, read reserved positions from this owner's fixed ring.
+
+        Row indices are this owner's captured bindings, not another owner's
+        resident slots. Negative positions and the trash row produce zeros.
+        Reservation and reader lifetime remain with the ordinary ring/buffer.
+        """
+        table, depth = self._tables[name], self._depths[name]
+        if (rows.dtype != torch.long or positions.dtype != torch.long or rows.ndim != 1
+                or positions.ndim != 2 or positions.shape[0] != len(rows)
+                or target.shape != (*positions.shape, *table.shape[2:]) or target.dtype != table.dtype
+                or rows.device != table.device or positions.device != table.device or target.device != table.device):
+            raise ValueError("captured ring reads need owner rows, positions and a matching fixed destination")
+        valid = (rows[:, None] != TRASH_ROW) & (positions >= 0)
+        indices = rows[:, None] * depth + positions.clamp_min(0).remainder(depth)
+        source = table.flatten(0, 1).index_select(0, indices.reshape(-1)).reshape_as(target)
+        mask = valid.reshape(*valid.shape, *([1] * (target.ndim - 2)))
+        target.copy_(torch.where(mask, source, 0))
+
+    def ring_scatter(
+        self, name: str, rows: torch.Tensor, positions: torch.Tensor, items: torch.Tensor,
+        active: torch.Tensor,
+    ) -> None:
+        """Inside a capture, publish one reserved item per active owner row.
+
+        Inactive writes go to trash; readers never observe trash contents.
+        The host publishes only the actual produced positions after closure.
+        """
+        table, depth = self._tables[name], self._depths[name]
+        if (rows.dtype != torch.long or positions.dtype != torch.long or active.dtype != torch.bool
+                or rows.ndim != 1 or positions.shape != rows.shape or active.shape != rows.shape
+                or items.shape != (len(rows), *table.shape[2:]) or items.dtype != table.dtype
+                or any(t.device != table.device for t in (rows, positions, items, active))):
+            raise ValueError("captured ring writes need owner rows, positions and one item per row")
+        live = active & (rows != TRASH_ROW) & (positions >= 0)
+        indices = torch.where(live, rows * depth + positions.clamp_min(0).remainder(depth), 0)
+        table.flatten(0, 1).index_copy_(0, indices, items)
+
     def _read_stream(self) -> "torch.cuda.Stream | None":
         if self._device.type != "cuda":
             return None
