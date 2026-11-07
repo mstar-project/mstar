@@ -134,10 +134,25 @@ def flatten_messages(
                 if content:
                     add_text(content, role)
                 continue
+            if not isinstance(content, list):
+                raise ValueError("message content must be text or a list of parts")
             for part in content:
                 if not isinstance(part, dict):
-                    continue
+                    raise ValueError("message content parts must be objects")
                 ptype = part.get("type")
+                if ptype == "text" and not isinstance(part.get("text"), str):
+                    raise ValueError("text content must be a string")
+                if ptype in ("image_url", "video_url", "audio_url"):
+                    media = part.get(ptype)
+                    if not isinstance(media, dict) or not isinstance(media.get("url"), str) or not media["url"]:
+                        raise ValueError(f"{ptype} must contain a non-empty url string")
+                elif ptype == "input_audio":
+                    media = part.get(ptype)
+                    if (not isinstance(media, dict) or not isinstance(media.get("data"), str)
+                            or not media["data"] or not isinstance(media.get("format", "wav"), str)):
+                        raise ValueError("input_audio must contain base64 data and a format string")
+                elif ptype != "text":
+                    raise ValueError(f"unsupported message content type {ptype!r}")
                 if ptype == "text":
                     if part.get("text"):
                         add_text(part["text"], role)
