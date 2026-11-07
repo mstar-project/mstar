@@ -902,6 +902,7 @@ def test_stream_unit_drains_after_producer_done_without_advancing_that_producer_
     executing = worker._build_executing_batch(scheduled)
     group = worker._claim_group(scheduled, executing)
     assert group.trigger == 1 and group.members[1][1] is executing
+    assert group.finished_rids == (frozenset({rid}), frozenset())
     assert [(b.node_name, b.graph_walk) for b, _ in group.members] == [("a", "produce"), ("b", "consume")]
     assert checked == [("a", "produce"), ("b", "consume")]
     claim = group.claim
@@ -909,12 +910,34 @@ def test_stream_unit_drains_after_producer_done_without_advancing_that_producer_
     worker._settle_group_claim(group)
     worker._settle_group_claim(group)
     assert group.claim == claim and group.acknowledged
-    assert rt.release_execution_unit_member(group.claim, "a", 7, [rid])
-    assert rt.get_ready_nodes(set()) == []
-    rt.complete_and_route_batch(RouteInput(
-        partition="sink", graph_walk="consume", node_name="b", output_signals=[],
-        wg_ids=ParallelList([rid], [9]), tensors=[], num_tensors=[], loop_strides=[1],
-    ))
+    from contextlib import nullcontext
+
+    from mstar.model.submodule_base import BatchedModelOutput
+    from mstar.worker.worker import PendingBatch
+
+    turns, closed = [], []
+    worker.scheduler.note_ran = lambda batch: turns.append((batch.node_name, batch.graph_walk))
+    worker.scheduler.clear_batch_limit = lambda *a, **kw: None
+    worker._phase_period, worker._metrics = 0, None
+    worker._span = lambda *a, **kw: nullcontext()
+    worker._clear_in_flight_flag = lambda batch: None
+    worker.request_state = SimpleNamespace(get_partition_for_node=lambda node: "source" if node == "a" else "sink")
+    engine.release_group = lambda group: closed.append(group.claim)
+    output = executing.outputs = BatchedModelOutput()
+
+    def finish_member(step, outputs, **kwargs):
+        assert step.node_name == "b" and step.graph_walk == "consume" and step.partition == "sink"
+        rt.complete_and_route_batch(RouteInput(
+            partition=step.partition, graph_walk=step.graph_walk, node_name=step.node_name, output_signals=[],
+            wg_ids=ParallelList([rid], [9]), tensors=[], num_tensors=[], loop_strides=[1],
+        ))
+
+    worker._postprocess_batch = finish_member
+    pending = PendingBatch(scheduled, executing, "b", "sink", "consume", None, group=group)
+    worker._count_turn(pending)
+    assert not turns  # admission cannot tell which independent member actually ran
+    worker._finish_step(pending, output)
+    assert turns == [("b", "consume")] and closed == [claim]
     assert rt.graph_passes({rid: 7}) == [1]
     assert rt.graph_passes({rid: 9}) == [0]
     assert rt.loop_room("b", "consume", "steps", [rid], 0, False) == 4

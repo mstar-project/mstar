@@ -383,6 +383,9 @@ class PopRidsOutput(NamedTuple):
     # walk's output edge names.
     rid_walk_idx: list[int] = []
     walk_output_signals: tuple[tuple[str, ...], ...] = ()
+    # Claim-only: these members retain their identity for downstream drain,
+    # but their already-finished partition must not prepare or execute again.
+    finished_rids: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1185,7 +1188,8 @@ class GraphRuntime(PhasedPostprocess, ABC):
 
         The head may already have been popped by the scheduler. Returned
         inputs are the members' existing external inputs; the unit's edges
-        supply internal inputs from leased device buffers.
+        supply internal inputs from leased device buffers. Finished partition
+        rows are identified explicitly so a draining consumer needs no producer plan.
         """
         pass
 

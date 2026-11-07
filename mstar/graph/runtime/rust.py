@@ -454,7 +454,8 @@ class RustGraphRuntime(GraphRuntime):
             return None
         claim_id, members = out
         return claim_id, tuple(
-            PopRidsOutput(ParallelList(m.rids, m.wg_ids), _columns(m), tuple(m.output_signals))
+            PopRidsOutput(ParallelList(m.rids, m.wg_ids), _columns(m), tuple(m.output_signals),
+                          finished_rids=tuple(m.finished_rids))
             for m in members
         )
 

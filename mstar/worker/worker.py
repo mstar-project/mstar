@@ -2890,7 +2890,10 @@ class Worker(RepeatingSteps):
                     self._graph_runtime.cancel_execution_unit(claim)
                     return None
                 members.append((scheduled, executing))
-            group = ExecutionGroup(unit, claim, tuple(members), trigger=trigger)
+            group = ExecutionGroup(
+                unit, claim, tuple(members), trigger=trigger,
+                finished_rids=tuple(frozenset(part.finished_rids) for part in popped),
+            )
             self._stamp_group_repeats(group)
         except Exception:
             self._graph_runtime.cancel_execution_unit(claim)
@@ -2961,6 +2964,18 @@ class Worker(RepeatingSteps):
         if step.group is not None and step.group.submitted:
             try:
                 for i, (scheduled, executing) in enumerate(step.group.members):
+                    finished = step.group.finished_rids[i] if step.group.finished_rids else frozenset()
+                    if finished:
+                        self._graph_runtime.release_execution_unit_member(
+                            step.group.claim, scheduled.node_name, step.group.unit.worker_graph_ids[i], list(finished),
+                        )
+                        for rid in finished:
+                            scheduled.discard_rid(rid)
+                        executing.drop_rids(finished)
+                    if not scheduled.request_to_worker_graph:
+                        continue
+                    if step.group.unit.streaming_edges:
+                        self.scheduler.note_ran(scheduled)
                     member = replace(step, batch=scheduled, node_batch=executing, node_name=scheduled.node_name,
                                      graph_walk=scheduled.graph_walk,
                                      partition=self.request_state.get_partition_for_node(scheduled.node_name),
@@ -2996,6 +3011,8 @@ class Worker(RepeatingSteps):
         it took the step, the step's rows have had their turn at its node. A
         refused step is retried, and its rows keep their place in line."""
         if pending is not None and pending.node_batch.admit_error is None:
+            if pending.group is not None and pending.group.submitted and pending.group.unit.streaming_edges:
+                return  # independent members take turns only when their actual receipts close
             members = pending.group.members if pending.group is not None and pending.group.submitted else (
                 (pending.batch, pending.node_batch),
             )

@@ -675,6 +675,8 @@ class ExecutionGroup:
     trigger: int = 0
     submitted: bool = False
     acknowledged: bool = False
+    # Immutable graph facts captured with the claim, in canonical member order.
+    finished_rids: tuple[frozenset[int], ...] = ()
     refusal: str | None = None
     parts: list[RunPart] = field(default_factory=list)
     initial_copies: list[tuple[torch.Tensor, torch.Tensor]] = field(default_factory=list)

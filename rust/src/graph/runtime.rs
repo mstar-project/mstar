@@ -1201,6 +1201,8 @@ pub struct PopRidsOut {
     /// walk's output edge names.
     #[pyo3(get)] pub rid_walk_idx: Vec<u32>,
     #[pyo3(get)] pub walk_output_signals: Vec<Vec<String>>,
+    /// Claimed streaming members whose partition already ended: identity only, no new execution.
+    #[pyo3(get)] pub finished_rids: Vec<u32>,
     /// The ready inputs as columns; see `EdgeColumns`. Flattened on rather
     /// than nested, because a `#[pyo3(get)]` on a pyclass field clones it.
     #[pyo3(get)] pub signal_names: Vec<String>,
@@ -2706,7 +2708,7 @@ impl GraphRuntime {
             }
         }
         let mut members = Vec::new();
-        for (i, &(wg, node, _)) in unit.nodes.iter().enumerate() {
+        for (i, &(wg, node, walk)) in unit.nodes.iter().enumerate() {
             let mut cols = EdgeColumns::default();
             for &rid in &rids {
                 for (name, tensors, final_chunk) in self.state(wg, rid).unwrap().input_tensors(node, false) {
@@ -2717,7 +2719,12 @@ impl GraphRuntime {
             signals.sort();
             let mut member = PopRidsOut {
                 rids: rids.clone(), wg_ids: vec![self.wg_ids[wg as usize]; rids.len()],
-                output_signals: signals, ..Default::default()
+                output_signals: signals,
+                finished_rids: rids.iter().copied().filter(|&rid| {
+                    self.info(rid).is_some_and(|info| info.partitions.values().any(|part|
+                        part.partition_done && part.graph_walk == walk && part.walk_worker_graphs.contains(&wg)))
+                }).collect(),
+                ..Default::default()
             };
             member.set_edges(cols);
             members.push(member);
