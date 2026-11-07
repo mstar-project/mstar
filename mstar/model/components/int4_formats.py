@@ -132,10 +132,12 @@ class W4A16Format(LinearFormat):
                  layout: str = "compressed-tensors", zero_offset: int = 0):
         self.group, self.symmetric, self.scale_dtype = group, symmetric, scale_dtype
         self.layout, self.zero_offset = layout, zero_offset
-        # tinygemm_*: torch's int4 GEMM's copy of the weight (1-2 tokens, CUDA), built at load; empty elsewhere
-        # weight_planes: the checkpoint's weight_packed in the kernels' layout (``to_planes``), built at load
+        # weight_planes: the checkpoint's weight_packed in the Triton kernels' layout (``to_planes``), built at load
+        # marlin_*: the vendored Marlin GEMM's copy (``mstar.utils.marlin``), built at load on CUDA where it builds;
+        # tinygemm_*: torch's int4 GEMM's copy (1-3 tokens) where Marlin doesn't; empty placeholders elsewhere
         self.buffers = (("weight_planes", "weight_scale") + (() if symmetric else ("weight_zero_point",))
-                        + ("tinygemm_weight", "tinygemm_scale_zero"))
+                        + ("tinygemm_weight", "tinygemm_scale_zero", "marlin_weight", "marlin_scale")
+                        + (() if symmetric else ("marlin_zero",)))
 
     def __repr__(self) -> str:
         return (f"w4a16(g{self.group}, {'sym' if self.symmetric else 'asym'}, {self.scale_dtype}, "
@@ -238,14 +240,33 @@ class W4A16Format(LinearFormat):
         return out
 
     def after_load(self, tensors):
-        """The checkpoint's weight in the kernels' layout (``weight_planes``) and tinygemm's copy of it."""
+        """The checkpoint's weight in the Triton kernels' layout (``weight_planes``), and Marlin's copy of it where
+        Marlin builds, else tinygemm's."""
         if "weight_planes" in tensors:
             return dict(tensors)
         out = {name: t for name, t in tensors.items() if name != "weight_packed"}
         out["weight_planes"] = to_planes(tensors["weight_packed"])
-        return {**out, **self._tinygemm(tensors)}
+        marlin = self._marlin(tensors)
+        tinygemm = self._tinygemm(tensors, skip=marlin["marlin_weight"].numel() > 0)
+        return {**out, **tinygemm, **marlin}
 
-    def _tinygemm(self, tensors) -> dict[str, torch.Tensor]:
+    def _marlin(self, tensors) -> dict[str, torch.Tensor]:
+        packed = tensors["weight_packed"]
+        n, k = packed.shape[0], packed.shape[1] * 8
+        kind = KIND_INT4_SYM if self.symmetric else KIND_INT4_ZP
+        names = ("marlin_weight", "marlin_scale") + (() if self.symmetric else ("marlin_zero",))
+        if packed.is_cuda:
+            from mstar.utils import marlin
+
+            if marlin.shape_reason(kind, self.group, n, k) is None and marlin.available(kind, self.group,
+                                                                                         packed.device):
+                scale = tensors["weight_scale"]
+                scale = scale.view(self.scale_dtype) if scale.dtype == _I16 else scale
+                zero = None if self.symmetric else unpack_int4(tensors["weight_zero_point"].view(_I32), dim=0)[:n]
+                return marlin.prepare(kind, unpack_int4(packed.view(_I32)), scale, zero)
+        return {name: torch.empty(0, dtype=_I32, device=packed.device) for name in names}
+
+    def _tinygemm(self, tensors, skip: bool = False) -> dict[str, torch.Tensor]:
         """torch's int4 GEMM's copy of the weight (``aten._convert_weight_to_int4pack``: uint8 ``[N, K/2]`` with the
         even column in the high nibble; scales and zeros ``[K/g, N, 2]`` bf16 for ``(q - 8) * scale + zero``, so a
         zero point z is ``(8 - z) * scale``), on CUDA for groups of 32-256; empty placeholders elsewhere. It doubles
@@ -253,7 +274,7 @@ class W4A16Format(LinearFormat):
         Triton GEMV reached ~1x."""
         packed = tensors["weight_packed"]
         n, k = packed.shape[0], packed.shape[1] * 8
-        usable = (packed.is_cuda and self.group in (32, 64, 128, 256) and k % 128 == 0 and n % 8 == 0
+        usable = (not skip and packed.is_cuda and self.group in (32, 64, 128, 256) and k % 128 == 0 and n % 8 == 0
                   and hasattr(torch.ops.aten, "_convert_weight_to_int4pack"))
         if not usable:
             return {"tinygemm_weight": torch.empty(0, dtype=_I32, device=packed.device),
@@ -277,13 +298,18 @@ class W4A16Format(LinearFormat):
             from mstar.utils import w4a16  # noqa: F401  (registers the CUDA kernel before any compile)
 
     def linear(self, x, weight_planes, weight_scale, *rest):
-        zero_point, tg_weight, tg_scale_zero = (None, *rest) if self.symmetric else rest
+        if self.symmetric:
+            (tg_weight, tg_scale_zero, m_weight, m_scale), zero_point, m_zero = rest, None, None
+        else:
+            zero_point, tg_weight, tg_scale_zero, m_weight, m_scale, m_zero = rest
         scale = weight_scale.view(self.scale_dtype) if weight_scale.dtype == _I16 else weight_scale
         if tg_scale_zero.dtype == _I16:
             tg_scale_zero = tg_scale_zero.view(torch.bfloat16)
+        if m_scale.dtype == _I16:
+            m_scale = m_scale.view(torch.bfloat16)
         kind = KIND_INT4_SYM if zero_point is None else KIND_INT4_ZP
         return torch.ops.mstar.w4a16_linear(x, weight_planes.view(_U8), scale, zero_point, self.group, kind,
-                                            tg_weight, tg_scale_zero)
+                                            tg_weight, tg_scale_zero, m_weight, m_scale, m_zero)
 
 
 @lru_cache(maxsize=None)
@@ -295,8 +321,9 @@ class Mxfp4Format(LinearFormat):
     """e2m1 codes two a byte, one e8m0 scale per 32 along K (OCP MX)."""
 
     name = "mxfp4"
-    # weight_planes: the checkpoint's weight_packed in the kernels' layout (``to_planes``), built at load
-    buffers = ("weight_planes", "weight_scale")
+    # weight_planes: the checkpoint's weight_packed in the Triton kernels' layout (``to_planes``); marlin_*: the
+    # vendored Marlin GEMM's copy where it builds (CUDA); both built at load
+    buffers = ("weight_planes", "weight_scale", "marlin_weight", "marlin_scale")
     group = 32
 
     def check(self, out_features, in_features, dtype):
@@ -330,8 +357,17 @@ class Mxfp4Format(LinearFormat):
     def after_load(self, tensors):
         if "weight_planes" in tensors:
             return dict(tensors)
+        packed = tensors["weight_packed"].view(_U8)
         out = {name: t for name, t in tensors.items() if name != "weight_packed"}
-        out["weight_planes"] = to_planes(tensors["weight_packed"].view(_U8))
+        out["weight_planes"] = to_planes(packed)
+        n, k = packed.shape[0], packed.shape[1] * 2
+        empty = torch.empty(0, dtype=_I32, device=packed.device)
+        out.update(marlin_weight=empty, marlin_scale=empty)
+        if packed.is_cuda:
+            from mstar.utils import marlin
+
+            if marlin.shape_reason(KIND_E2M1, 32, n, k) is None and marlin.available(KIND_E2M1, 32, packed.device):
+                out.update(marlin.prepare(KIND_E2M1, unpack_fp4(packed), tensors["weight_scale"].view(_U8)))
         return out
 
     def quantize_storage(self, weight):
@@ -350,9 +386,9 @@ class Mxfp4Format(LinearFormat):
         if device.type == "cuda":
             from mstar.utils import w4a16  # noqa: F401
 
-    def linear(self, x, weight_planes, weight_scale):
+    def linear(self, x, weight_planes, weight_scale, marlin_weight, marlin_scale):
         return torch.ops.mstar.w4a16_linear(x, weight_planes.view(_U8), weight_scale.view(_U8), None, 32,
-                                            KIND_E2M1, None, None)
+                                            KIND_E2M1, None, None, marlin_weight, marlin_scale.view(_U8), None)
 
 
 def _triton_reason(device: torch.device, name: str) -> str | None:
@@ -390,16 +426,19 @@ def dequantize_kind(packed_u8: torch.Tensor, scale: torch.Tensor, zero_point: to
 def w4a16_linear(
     x: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor, zero_point: torch.Tensor | None, group: int,
     kind: int, tinygemm_weight: torch.Tensor | None = None, tinygemm_scale_zero: torch.Tensor | None = None,
+    marlin_weight: torch.Tensor | None = None, marlin_scale: torch.Tensor | None = None,
+    marlin_zero: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """``x [M, K]`` times a 4-bit weight (uint8 ``[N, K/2]`` in the planes layout, its group scales, zero points for
-    ``KIND_INT4_ZP``; optionally tinygemm's copy of it, for 1-2 tokens) dequantized to ``x``'s dtype: ``[M, N]``.
+    ``KIND_INT4_ZP``; optionally tinygemm's or Marlin's copy of it) dequantized to ``x``'s dtype: ``[M, N]``.
     Off CUDA, the reference."""
     w = dequantize_kind(weight, scale, zero_point, group, kind).to(x.dtype)
     return F.linear(x, w)
 
 
 @w4a16_linear.register_fake
-def _(x, weight, scale, zero_point, group, kind, tinygemm_weight=None, tinygemm_scale_zero=None):
+def _(x, weight, scale, zero_point, group, kind, tinygemm_weight=None, tinygemm_scale_zero=None, marlin_weight=None,
+      marlin_scale=None, marlin_zero=None):
     return x.new_empty((x.shape[0], weight.shape[0]))
 
 

@@ -13,8 +13,10 @@ contiguous. An int4 code becomes ``code - 8`` in fp32 without a conversion instr
 float ``2**23 + code``), and scales and zero points apply to the dot's output, ``scale * (dot + (8 - zero) *
 sum(x))``, so the decode feeding a dot has no per-row operand. Paths:
 
-- ``tinygemm`` (1-2 tokens): torch's int4 GEMM (``aten._weight_int4pack_mm``) on its own copy of the weight, which
-  ``int4_formats`` builds at load for a symmetric or zero-point int4 weight in groups of 32-256;
+- ``marlin`` (below ``DEQUANT_M`` tokens, bf16 activations): vLLM's Marlin GEMM, vendored (``mstar.utils.marlin``),
+  on its own copy of the weight, which ``int4_formats`` builds at load where the op builds and takes the shape;
+- ``tinygemm`` (1-3 tokens without Marlin): torch's int4 GEMM (``aten._weight_int4pack_mm``) on its own copy of the
+  weight, built at load for a symmetric or zero-point int4 weight in groups of 32-256 when Marlin isn't;
 - ``gemv`` (a few tokens): CUDA-core FMAs over a word's 8 nibbles in turn, each weight decoded once for all tokens,
   reduced once at the end; split along K;
 - ``dot`` / ``dot8``: weight rows on the MMA's M side and tokens (padded to 16) on its N side; ``dot`` unpacks a
@@ -22,7 +24,8 @@ sum(x))``, so the decode feeding a dot has no per-row operand. Paths:
   split along K;
 - ``dequant``: past ``DEQUANT_M`` tokens, the weight dequantized to the activation's dtype and cuBLAS runs it.
 
-Which path and tile runs at a token count is ``config``'s built-in rule, a hypothesis for other GPUs and shapes.
+Which Triton path and tile runs at a token count is ``config``'s built-in rule, from an H200 sweep; a hypothesis for
+other GPUs and shapes.
 Every path matches the reference op (``int4_formats.dequantize_kind`` then a GEMM) to fp32 accumulation order.
 """
 
@@ -37,7 +40,7 @@ import triton.language as tl
 
 from mstar.model.components.int4_formats import KIND_E2M1, KIND_INT4_ZP, w4a16_linear
 
-TINYGEMM_MAX = 2
+TINYGEMM_MAX = 3
 GEMV_MAX = 4
 DEQUANT_M = 192
 
@@ -271,19 +274,25 @@ def _w4_dequant_kernel(
     w_ptr, s_ptr, z_ptr, out_ptr, N, K, stride_wn, stride_sn, stride_zn, stride_on,
     KIND: tl.constexpr, GROUP: tl.constexpr, BN: tl.constexpr,
 ):
-    """One 128-column block of BN rows from the planes layout, nibble j to columns 16j..16j + 15."""
+    """One 128-column block of BN rows from the planes layout, unpacked in column order and stored as one tile
+    (whole 256-byte row segments: job 1508 measured nibble-by-nibble 32-byte stores at 0.33-0.39x of bf16 at
+    128 tokens, where the compressed-tensors layout's tile store had 0.40-0.54x)."""
     n = tl.program_id(0) * BN + tl.arange(0, BN)
     kb = tl.program_id(1) * 128
     live_n = n < N
-    i16 = tl.arange(0, 16)
-    words = tl.load(w_ptr + n[:, None].to(tl.int64) * stride_wn + (kb // 8 + i16)[None, :], mask=live_n[:, None],
-                    other=0)
-    for j in tl.static_range(8):
-        kc = kb + 16 * j
-        scale, zf = _plane_params(s_ptr, z_ptr, n, live_n, kc // GROUP, stride_sn, stride_zn, KIND)
-        v = _values((words >> (4 * j)) & 0xF, zf[:, None], KIND) * scale[:, None]
-        tl.store(out_ptr + n[:, None].to(tl.int64) * stride_on + (kc + i16)[None, :],
-                 v.to(out_ptr.dtype.element_ty), mask=live_n[:, None])
+    words = tl.load(w_ptr + n[:, None].to(tl.int64) * stride_wn + (kb // 8 + tl.arange(0, 16))[None, :],
+                    mask=live_n[:, None], other=0)
+    cols = kb + tl.arange(0, 128)
+    codes = _plane_codes(words, 0, 8, BN)
+    if GROUP >= 128:
+        scale, zf = _plane_params(s_ptr, z_ptr, n, live_n, kb // GROUP, stride_sn, stride_zn, KIND)
+        v = _values(codes, zf[:, None], KIND) * scale[:, None]
+    else:
+        scale, zf = _plane_params(s_ptr, z_ptr, n[:, None], live_n[:, None], (cols // GROUP)[None, :], stride_sn,
+                                  stride_zn, KIND)
+        v = _values(codes, zf, KIND) * scale
+    tl.store(out_ptr + n[:, None].to(tl.int64) * stride_on + cols[None, :], v.to(out_ptr.dtype.element_ty),
+             mask=live_n[:, None])
 
 
 @lru_cache(maxsize=None)
@@ -299,35 +308,29 @@ def _tb(m: int) -> int:
     return 16 if m <= 16 else 32 if m <= 32 else 64
 
 
-def _nb(blocks: int, want: int) -> int:
-    """The largest of want, want / 2, ..., 1 dividing ``blocks`` (a step must not run past K)."""
-    while blocks % want:
-        want //= 2
-    return want
-
-
 def config(m: int, n: int, k: int, group: int, kind: int, sms: int) -> tuple[str, dict]:
-    """The built-in path and tile for ``m`` tokens of an ``[n, k]`` weight: the H200 winners of ``bench_w4a16`` at
-    Qwen3.5-27B's shapes for the compressed-tensors layout (job 1492, ``res/w4r3k``) carried over to the planes
-    layout, so a hypothesis until a sweep of these kernels: the GEMV at one token (MXFP4 to four; tinygemm takes
-    int4's one and two), ``dot`` with 16 tokens a tile and 128 rows (8 warps) for N under ~128 tiles or 64 rows and
-    two blocks a step above, 64 rows for more tokens (tiles of up to 64), and dequant + cuBLAS from ``DEQUANT_M``
-    tokens."""
-    if m >= DEQUANT_M:
+    """The built-in Triton path and tile for ``m`` tokens of an ``[n, k]`` weight where Marlin isn't built: the
+    winners of ``bench_w4a16``'s H200 sweep at Qwen3.5-27B's shapes (job 1508, ``res/w4r4``; tinygemm takes int4's
+    first ``TINYGEMM_MAX`` tokens before this). ``dot8`` with 16 / 32 tokens a tile and 64 rows (128 rows, 8 warps,
+    for 32 tokens where 64-row tiles don't fill the GPU), split along K to ~4 waves; at 33-64 tokens ``dot8`` 128 x 64
+    (8 warps), ``dot`` 64 x 64 for zero points, split to ~2 waves; above 64 tokens the same tiles symmetric, dequant
+    + cuBLAS for zero points; dequant + cuBLAS from ``DEQUANT_M`` tokens."""
+    if m >= DEQUANT_M or (kind == KIND_INT4_ZP and m > 64):
         return "dequant", {}
-    blocks = k // 128
-    if m == 1 or (kind == KIND_E2M1 and m <= GEMV_MAX):
-        nb = _nb(blocks, 4)
-        return "gemv", {"BN": 16, "NB": nb, "SPLIT_K": _split(triton.cdiv(n, 16), blocks // nb, sms, 4),
-                        "num_warps": 4}
     tb = _tb(m)
-    wide = tb == 16 and triton.cdiv(n, 128) < sms
-    # 64 x 64 tiles spill at 4 warps (255 registers in the sm_90 PTX), not at 8
-    bn, warps = (128, 8) if wide else (64, 8 if tb == 64 else 4)
-    nb = _nb(blocks, 2) if tb == 16 and not wide else 1
+    if tb == 64:
+        path, bn, warps = ("dot", 64, 4) if kind == KIND_INT4_ZP else ("dot8", 64, 4) if kind == KIND_E2M1 else (
+            "dot8", 128, 8)
+    elif tb == 32 and triton.cdiv(n, 64) * triton.cdiv(m, tb) < sms:
+        path, bn, warps = "dot8", 128, 8
+    else:
+        path, bn, warps = "dot8", 64, 4
     ctas = triton.cdiv(n, bn) * triton.cdiv(m, tb)
-    return "dot", {"BN": bn, "TB": tb, "NB": nb, "SPLIT_K": _split(ctas, blocks // nb, sms, 2),
-                   "STAGES": 2 if nb == 2 else 3, "num_warps": warps}
+    if tb == 64:
+        split = 1 if 2 * ctas >= sms else _split(ctas, k // 128, sms, 2)
+    else:
+        split = 1 if ctas >= sms else _split(ctas, k // 128, sms, 4)
+    return path, {"BN": bn, "TB": tb, "NB": 1, "SPLIT_K": split, "STAGES": 3, "num_warps": warps}
 
 
 # a stand-in for ``config`` (the benchmark sweeps tiles through it); None runs the built-in rule
@@ -361,19 +364,37 @@ def dequantize(weight: torch.Tensor, scale: torch.Tensor, zero_point: torch.Tens
     return out
 
 
+def _marlin_lib(kind: int, group: int, device: torch.device) -> str | None:
+    from mstar.utils import marlin
+
+    return marlin.available(kind, group, device)
+
+
 def gemm(x: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor, zero_point: torch.Tensor | None, group: int,
-         kind: int, tinygemm_weight: torch.Tensor | None = None,
-         tinygemm_scale_zero: torch.Tensor | None = None) -> torch.Tensor:
-    """``x @ W.T`` for ``W`` in the planes layout (uint8 ``[N, K/2]`` or int32 ``[N, K/8]``), K a multiple of 128."""
+         kind: int, tinygemm_weight: torch.Tensor | None = None, tinygemm_scale_zero: torch.Tensor | None = None,
+         marlin_weight: torch.Tensor | None = None, marlin_scale: torch.Tensor | None = None,
+         marlin_zero: torch.Tensor | None = None) -> torch.Tensor:
+    """``x @ W.T`` for ``W`` in the planes layout (uint8 ``[N, K/2]`` or int32 ``[N, K/8]``), K a multiple of 128:
+    Marlin below ``DEQUANT_M`` tokens where the format built its copy (bf16 activations), else tinygemm for its
+    first ``TINYGEMM_MAX`` tokens, else ``config``'s Triton path."""
     words = _words(weight)
     m, k = x.shape
     n = words.shape[0]
     assert words.shape[1] * 8 == k and k % 128 == 0 and words.is_contiguous(), (tuple(weight.shape), k)
     assert kind != KIND_INT4_ZP or zero_point is not None
-    if (CONFIG_OVERRIDE is None and m <= TINYGEMM_MAX and tinygemm_weight is not None and tinygemm_weight.numel()
+    marlin = (marlin_weight is not None and marlin_weight.numel() > 0 and x.dtype == torch.bfloat16
+              and x.stride(1) == 1 and x.stride(0) % 8 == 0)
+    if CONFIG_OVERRIDE is None and m < DEQUANT_M and marlin:
+        path, cfg = "marlin", {}
+    elif (CONFIG_OVERRIDE is None and m <= TINYGEMM_MAX and tinygemm_weight is not None and tinygemm_weight.numel()
             and x.dtype == tinygemm_scale_zero.dtype):
-        return torch.ops.aten._weight_int4pack_mm(x, tinygemm_weight, group, tinygemm_scale_zero)
-    path, cfg = (CONFIG_OVERRIDE or config)(m, n, k, group, kind, _sm_count(x.device.index or 0))
+        path, cfg = "tinygemm", {}
+    else:
+        path, cfg = (CONFIG_OVERRIDE or config)(m, n, k, group, kind, _sm_count(x.device.index or 0))
+    if path == "marlin":
+        from mstar.utils import marlin as M
+
+        return M.gemm(_marlin_lib(kind, group, x.device), x, marlin_weight, marlin_scale, marlin_zero, kind, n)
     if path == "tinygemm":
         return torch.ops.aten._weight_int4pack_mm(x, tinygemm_weight, group, tinygemm_scale_zero)
     if path == "dequant":
@@ -399,5 +420,7 @@ def gemm(x: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor, zero_point:
 
 
 @w4a16_linear.register_kernel("cuda")
-def _(x, weight, scale, zero_point, group, kind, tinygemm_weight=None, tinygemm_scale_zero=None):
-    return gemm(x, weight, scale, zero_point, group, kind, tinygemm_weight, tinygemm_scale_zero)
+def _(x, weight, scale, zero_point, group, kind, tinygemm_weight=None, tinygemm_scale_zero=None, marlin_weight=None,
+      marlin_scale=None, marlin_zero=None):
+    return gemm(x, weight, scale, zero_point, group, kind, tinygemm_weight, tinygemm_scale_zero, marlin_weight,
+                marlin_scale, marlin_zero)

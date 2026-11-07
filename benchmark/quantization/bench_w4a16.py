@@ -1,6 +1,6 @@
 """The 4-bit dense GEMM's paths and tiles (``mstar.utils.w4a16``) against bf16 at a model's per-rank shapes, each call
 replayed in a CUDA graph, torch's own int4 GEMM (tinygemm, ``aten._weight_int4pack_mm``, on the copy the format
-builds at load) among them:
+builds at load) and the vendored Marlin (``mstar.utils.marlin``) among them:
 
     python -m benchmark.quantization.bench_w4a16 --shapes qwen3_5_27b --tp 1 --kinds int4,int4zp,mxfp4 \\
         --tokens 1,2,4,8,16,32,64,128,256,512,1024 --out w4a16.jsonl
@@ -32,21 +32,27 @@ DOT8 = [{"BN": bn, "NB": nb, "STAGES": st, "num_warps": w} for bn, nb, st, w in
 
 
 def _weights(kind: str, n: int, k: int, device):
-    """The served buffers of a random weight (planes layout, scales, zero points, tinygemm's copy) and its kind."""
+    """The served buffers of a random weight (planes layout, scales, zero points), its kind, and the copies the
+    other GEMMs read: tinygemm's (always built here, so it is timed beside Marlin) and Marlin's (None where the
+    vendored op doesn't build or take the shape)."""
     from mstar.model.components import int4_formats as I
 
     w = (torch.randn(n, k, device=device) * 0.02).to(torch.bfloat16)
     if kind == "mxfp4":
-        q = I.MXFP4.quantize_weight(w, None)
-        return q["weight_planes"].view(torch.uint8), q["weight_scale"], None, 32, I.KIND_E2M1, None, None
-    fmt = I.W4A16Format(group=128, symmetric=kind == "int4")
-    stored = fmt.quantize_storage(w)
-    if kind == "int4zp":
-        stored["weight_zero_point"] = I.pack_int4(torch.randint(4, 12, (n, k // 128), device=device), dim=0)
-    q = fmt.after_load(stored)
-    tg = q["tinygemm_weight"] if q["tinygemm_weight"].numel() else None
+        fmt, stored = I.MXFP4, I.MXFP4.quantize_storage(w)
+    else:
+        fmt = I.W4A16Format(group=128, symmetric=kind == "int4")
+        stored = fmt.quantize_storage(w)
+        if kind == "int4zp":
+            stored["weight_zero_point"] = I.pack_int4(torch.randint(4, 12, (n, k // 128), device=device), dim=0)
+    q = fmt.after_load(dict(stored))
+    marlin = (q["marlin_weight"], q["marlin_scale"], q.get("marlin_zero")) if q["marlin_weight"].numel() else None
+    if kind == "mxfp4":
+        return q["weight_planes"].view(torch.uint8), q["weight_scale"], None, 32, I.KIND_E2M1, None, None, marlin
+    tg = fmt._tinygemm(stored)
+    tg_w = tg["tinygemm_weight"] if tg["tinygemm_weight"].numel() else None
     return (q["weight_planes"].view(torch.uint8), q["weight_scale"], q.get("weight_zero_point"), 128,
-            I.KIND_INT4_SYM if kind == "int4" else I.KIND_INT4_ZP, tg, q["tinygemm_scale_zero"])
+            I.KIND_INT4_SYM if kind == "int4" else I.KIND_INT4_ZP, tg_w, tg["tinygemm_scale_zero"], marlin)
 
 
 def main() -> None:
@@ -72,7 +78,8 @@ def main() -> None:
             continue
         n, k = (n // args.tp, k) if kind == "col" else (n, k // args.tp)
         for wkind in args.kinds.split(","):
-            packed, scale, zp, group, code, tg_w, tg_sz = _weights(wkind, n, k, dev)
+            packed, scale, zp, group, code, tg_w, tg_sz, marlin = _weights(wkind, n, k, dev)
+            mbufs = marlin or (None, None, None)
             ref_w = I.dequantize_kind(packed, scale, zp, group, code).to(torch.bfloat16)
             blocks = k // 128
             for m in (int(t) for t in args.tokens.split(",")):
@@ -81,9 +88,15 @@ def main() -> None:
                 base_us = _time(lambda: F.linear(x, ref_w), args.iters)  # noqa: B023
                 base = {"layer": layer, "n": n, "k": k, "tokens": m, "kind": wkind}
                 rows.append({**base, "impl": "bf16", "us": round(base_us, 2)})
-                # the built-in dispatch as gemm runs it (tinygemm first at 1-2 tokens), timed with no override
+                # the built-in dispatch as gemm runs it (Marlin, else tinygemm first), timed with no override, and
+                # what it runs without Marlin
                 tiny_first = tg_w is not None and m <= w4a16.TINYGEMM_MAX
-                cands = [("builtin", ("tinygemm", {}) if tiny_first else w4a16.config(m, n, k, group, code, sms))]
+                triton_choice = ("tinygemm", {}) if tiny_first else w4a16.config(m, n, k, group, code, sms)
+                marlin_first = marlin is not None and m < w4a16.DEQUANT_M
+                cands = [("builtin", ("marlin", {}) if marlin_first else triton_choice),
+                         ("builtin_triton", triton_choice)]
+                if marlin is not None and m < 512:
+                    cands.append(("marlin", ("marlin", {})))
                 if tg_w is not None and m <= 64:
                     cands.append(("tinygemm", ("tinygemm", {})))
                 if m <= w4a16.GEMV_MAX:
@@ -105,7 +118,8 @@ def main() -> None:
                         cfg["SPLIT_K"] = w4a16._split(-(-n // cfg["BN"]), blocks // cfg["NB"], sms, 4)
                     try:
                         w4a16.CONFIG_OVERRIDE = None if name == "builtin" else (lambda *a, p=path, c=cfg: (p, c))
-                        run = lambda: w4a16.gemm(x, packed, scale, zp, group, code, tg_w, tg_sz)  # noqa: E731,B023
+                        run = lambda: w4a16.gemm(x, packed, scale, zp, group, code, tg_w, tg_sz,  # noqa: E731,B023
+                                                 *mbufs)  # noqa: B023
                         out = run()
                         err = ((out.float() - ref.float()).norm() / ref.float().norm()).item()
                         if not err < 1e-2:
@@ -125,11 +139,13 @@ def main() -> None:
                 built = next((r for r in timed if r["impl"] == "builtin"), None)
                 per_path = {}
                 for r in timed:
-                    if r["impl"] != "builtin" and r["speedup"] > per_path.get(r["path"], (0,))[0]:
+                    if not r["impl"].startswith("builtin") and r["speedup"] > per_path.get(r["path"], (0,))[0]:
                         per_path[r["path"]] = (r["speedup"], r["config"])
                 summary = {**base, "bf16_us": round(base_us, 2),
                            "builtin": built and {"path": built["path"], "config": built["config"],
                                                  "speedup": built["speedup"]},
+                           "builtin_triton": next(({"path": r["path"], "speedup": r["speedup"]} for r in timed
+                                                   if r["impl"] == "builtin_triton"), None),
                            "best": best and {"path": best["path"], "config": best["config"],
                                              "speedup": best["speedup"]},
                            "per_path": {p: v[0] for p, v in per_path.items()},

@@ -564,6 +564,50 @@ def test_every_kernel_compiles_for_hopper(case, kind):
         pytest.skip(f"no CUDA backend toolchain here: {type(e).__name__}: {e}"[:200])
 
 
+# ---------------------------------------------------------------- the vendored Marlin's layout (CPU)
+def test_marlin_layout_is_vllms_bit_for_bit():
+    """``mstar.utils.marlin.prepare`` builds the B operand, scales and zero points Marlin reads in torch at load; on
+    fixed inputs its bytes hash as vLLM 0.33.0's own reference functions' do (``marlin_weights``,
+    ``marlin_permute_scales``, ``marlin_zero_points``, ``mxfp4_marlin_process_scales``, digests computed in a vLLM
+    environment), so the vendored kernel reads the layout it was written for."""
+    import hashlib
+
+    from mstar.utils import marlin
+
+    def digest(t):
+        return hashlib.sha256(t.contiguous().view(torch.uint8).numpy().tobytes()).hexdigest()[:16]
+
+    k, n, g = 256, 128, 64
+    kk, nn, gg = torch.arange(k)[:, None], torch.arange(n)[None, :], torch.arange(k // g)[:, None]
+    codes = ((kk * 31 + nn * 7 + 3) % 16).to(torch.uint8)
+    s = ((gg * 37 + nn) % 200 + 1).to(torch.bfloat16)
+    z = ((gg * 5 + nn * 3) % 16).to(torch.uint8)
+    e = ((torch.arange(n)[:, None] * 3 + torch.arange(k // 32)[None, :] * 11) % 40 + 100).to(torch.uint8)
+    assert digest(marlin.repack_codes(codes)) == "4b0d84388ea59149"
+    assert digest(marlin.permute_scales(s)) == "6341d8d9255a6f11"
+    assert digest(marlin.zero_points(z)) == "a4d1b990568ff00b"
+    buffers = marlin.prepare(marlin.KIND_ZP, codes.t(), s.t(), z.t())
+    assert digest(buffers["marlin_weight"]) == "4b0d84388ea59149"
+    assert digest(buffers["marlin_zero"]) == "a4d1b990568ff00b"
+    mx = marlin.prepare(marlin.KIND_E2M1, codes.t(), e)
+    assert digest(mx["marlin_scale"]) == "8460cded5b686f89" and digest(mx["marlin_weight"]) == "4b0d84388ea59149"
+
+
+def test_marlin_takes_the_shapes_it_was_built_for():
+    from mstar.utils import marlin
+
+    assert marlin.shape_reason(marlin.KIND_ZP, 128, 5120, 17408) is None
+    assert "groups" in marlin.shape_reason(marlin.KIND_SYM, 256, 5120, 5120)
+    assert "multiple of 64" in marlin.shape_reason(marlin.KIND_SYM, 128, 5136, 5120)
+    assert "two groups" in marlin.shape_reason(marlin.KIND_SYM, 128, 128, 128)
+    # off CUDA nothing is built and the format keeps empty placeholders
+    fmt = I.W4A16Format(group=128, symmetric=False)
+    stored = fmt.quantize_storage(torch.randn(128, 256))
+    stored["weight_zero_point"] = I.pack_int4(torch.full((128, 2), 8, dtype=torch.uint8), dim=0)
+    done = fmt.after_load(stored)
+    assert set(done) == set(fmt.buffers) and done["marlin_weight"].numel() == 0
+
+
 # ---------------------------------------------------------------- CUDA: the kernels against the reference
 def _kernel_case(kind, n, k, group, device):
     w = torch.randn(n, k) * 0.05
@@ -650,6 +694,45 @@ def test_cuda_tinygemm_copy_matches_the_reference(symmetric, group, m):
     got = fmt.linear(x, *(buffers[b] for b in fmt.buffers))
     ref = F.linear(x.float(), ref_w.float())
     assert ((got.float() - ref).norm() / ref.norm()).item() < 5e-3
+
+
+@cuda
+@pytest.mark.parametrize("kind, group", [(I.KIND_INT4_SYM, 128), (I.KIND_INT4_ZP, 128), (I.KIND_INT4_SYM, 32),
+                                         (I.KIND_INT4_ZP, 32), (I.KIND_E2M1, 32)])
+def test_cuda_marlin_matches_the_reference(kind, group):
+    """The vendored Marlin (built on this GPU's toolchain: a GPU job has nvcc, so a failed build fails here) runs
+    what the format hands ``linear()`` below ``DEQUANT_M`` tokens, within a GEMM's tolerance of the reference (its
+    scales in bf16: AWQ's fp16 scales round once), the same output captured and replayed in a CUDA graph."""
+    from mstar.utils import marlin, w4a16
+
+    torch.manual_seed(9)
+    dev = torch.device("cuda")
+    n, k = 1536, 1024
+    assert marlin.available(kind, group, dev), "the vendored Marlin did not build here (see the log)"
+    if kind == I.KIND_E2M1:
+        fmt = I.MXFP4
+        buffers = fmt.after_load(fmt.quantize_storage(torch.randn(n, k, device=dev) * 0.05))
+    else:
+        fmt = I.W4A16Format(group=group, symmetric=kind == I.KIND_INT4_SYM, scale_dtype=torch.float16)
+        stored = fmt.quantize_storage((torch.randn(n, k, device=dev) * 0.05).to(torch.bfloat16))
+        if kind == I.KIND_INT4_ZP:
+            stored["weight_zero_point"] = I.pack_int4(torch.randint(2, 14, (n, k // group), device=dev), dim=0)
+        buffers = fmt.after_load(stored)
+    assert buffers["marlin_weight"].numel() > 0
+    ref_w = fmt.dequantize(buffers).to(torch.bfloat16)
+    for m in (1, 5, 16, 33, 64, 100, w4a16.DEQUANT_M - 1):
+        x = torch.randn(m, k, device=dev, dtype=torch.bfloat16)
+        got = fmt.linear(x, *(buffers[b] for b in fmt.buffers))
+        ref = F.linear(x.float(), ref_w.float())
+        assert ((got.float() - ref).norm() / ref.norm()).item() < 5e-3, m
+    graph = torch.cuda.CUDAGraph()
+    x = torch.randn(16, k, device=dev, dtype=torch.bfloat16)
+    eager = fmt.linear(x, *(buffers[b] for b in fmt.buffers))
+    with torch.cuda.graph(graph):
+        out = fmt.linear(x, *(buffers[b] for b in fmt.buffers))
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(out, eager)
 
 
 @cuda
