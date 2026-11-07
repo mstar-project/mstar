@@ -13,8 +13,9 @@ through. ``trtllm_fp4_block_scale_routed_moe`` then takes M*'s own routing (ids 
 - NVFP4 (modelopt, nvidia/*-NVFP4): activations quantized to NVFP4 with the layer's calibrated input scale (the
   largest of its experts'), dequant scalars per expert as vLLM's modelopt path sets them.
 
-Untested on hardware in this tree (no sm_100 here): ``test_quantization_int4.py``'s CUDA cases compare it with
-the CPU reference on the B300.
+Checked on a B300 (sm_103): on nvidia/GLM-5.3-NVFP4's own experts it matches a reference that rounds the
+activations as FlashInfer's quantizer does to 0.022 (rel. L2); the CPU reference rounds activation block scales up,
+not to nearest, so the GPU tests bound the kernel by that reference's own error (``test_glm52_nvfp4.py``).
 """
 
 from __future__ import annotations
@@ -107,6 +108,8 @@ class TrtllmFp4Experts:
             return q, sf.view(torch.float8_e4m3fn).reshape(flat.shape[0], -1)
         return flat, None
 
+    # FlashInfer's launch wrappers stay outside dynamo; the kernels run inside a captured graph
+    @torch.compiler.disable
     def __call__(self, flat: torch.Tensor, routing_weights: torch.Tensor, selected_experts: torch.Tensor,
                  skip_invalid: bool) -> torch.Tensor:
         from flashinfer.fused_moe.core import trtllm_fp4_block_scale_routed_moe
