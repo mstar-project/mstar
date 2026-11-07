@@ -13,15 +13,88 @@ A new thread starts with its creator's CPU mask, so a thread or pool that a
 pinned thread starts would share its CPU. ``Thread`` and ``ThreadPool`` start
 theirs on the process mask; ruff refuses a bare ``threading.Thread`` or
 ``ThreadPoolExecutor`` under ``mstar/`` (``banned-api`` in pyproject.toml).
+
+A ``schedutil`` governor sets a CPU's clock from how busy it looks, so threads
+that take turns stay near the lowest clock although together they fill a core.
+``hold_clock_from_knob`` tells it what a process's threads need instead.
 """
 from __future__ import annotations
 
+import ctypes
+import logging
 import os
+import platform
 import threading
 from collections.abc import Callable, Collection
 from concurrent.futures import ThreadPoolExecutor
 
+from mstar.utils import knobs
 from mstar.utils.cpus import PINNABLE
+
+logger = logging.getLogger(__name__)
+
+# ``os`` has no ``sched_setattr``
+_SCHED_SETATTR = {"x86_64": 314, "aarch64": 274}
+_SCHED_KEEP_POLICY, _SCHED_KEEP_PARAMS, _SCHED_UTIL_CLAMP_MIN = 0x08, 0x10, 0x20
+_UCLAMP_SYSTEM_CAP = "/proc/sys/kernel/sched_util_clamp_min"
+
+
+class _SchedAttr(ctypes.Structure):
+    _fields_ = [
+        ("size", ctypes.c_uint32), ("policy", ctypes.c_uint32), ("flags", ctypes.c_uint64),
+        ("nice", ctypes.c_int32), ("priority", ctypes.c_uint32),
+        ("runtime", ctypes.c_uint64), ("deadline", ctypes.c_uint64), ("period", ctypes.c_uint64),
+        ("util_min", ctypes.c_uint32), ("util_max", ctypes.c_uint32),
+    ]
+
+
+def _set_util_min(value: int) -> str | None:
+    number = _SCHED_SETATTR.get(platform.machine())
+    if number is None:
+        return f"no sched_setattr number for {platform.machine()}"
+    attr = _SchedAttr(
+        size=ctypes.sizeof(_SchedAttr), util_min=value,
+        flags=_SCHED_KEEP_POLICY | _SCHED_KEEP_PARAMS | _SCHED_UTIL_CLAMP_MIN,
+    )
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.syscall(number, 0, ctypes.byref(attr), 0) != 0:
+        return f"sched_setattr failed: {os.strerror(ctypes.get_errno())}"
+    return None
+
+
+def hold_clock(floor: int) -> str | None:
+    """Ask for this thread's CPU at no less than ``floor`` of 1024 of its clock
+    whenever it runs (uclamp's ``util_min``), or say why not. Needs no
+    privileges. Threads and processes this one starts afterwards inherit it. The
+    hint does nothing under a governor that isn't reading utilization, and a
+    cgroup's ``cpu.uclamp.max`` can cap it unseen."""
+    try:
+        with open(_UCLAMP_SYSTEM_CAP) as f:
+            cap = int(f.read())
+    except (OSError, ValueError) as e:
+        return f"this kernel has no uclamp ({e})"
+    if cap < floor:
+        return f"{_UCLAMP_SYSTEM_CAP} caps it at {cap}"
+    return _set_util_min(floor)
+
+
+def hold_clock_from_knob(who: str) -> None:
+    """``knobs: uclamp_min`` for this process: call it on its main thread, before
+    it starts the threads that should have it."""
+    floor = knobs.uclamp_min()
+    if not floor:
+        return
+    refused = hold_clock(floor)
+    if refused is None:
+        logger.info("%s: uclamp_min %d applied", who, floor)
+    else:
+        logger.warning("%s: uclamp_min %d not applied: %s", who, floor, refused)
+
+
+def release_clock() -> None:
+    """Drop what this process inherited from the one that started it."""
+    _set_util_min(0)
+
 
 # ATen splits an op into chunks of at least this many elements per thread
 _INTRA_OP_GRAIN = 32768
