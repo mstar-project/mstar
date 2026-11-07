@@ -4,7 +4,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import asdict, dataclass, field, replace
 from fractions import Fraction
-from typing import TYPE_CHECKING, NamedTuple, Type
+from typing import TYPE_CHECKING, Any, NamedTuple, Type
 
 import torch
 import yaml
@@ -136,6 +136,7 @@ if TYPE_CHECKING:
 
 if TYPE_CHECKING:
     from mstar.engine.resources.lora.config import LoraSpec
+    from mstar.engine.state import Array
 
 DECODE = "decode"
 MAX_OUTPUT_TOKENS = 2048
@@ -559,10 +560,16 @@ class ForwardPassArgs:
 def enabled_resources(model: "Model", model_config: dict) -> list[NodeResourceSpec]:
     """The resource specs a deployment's YAML turns on, before its ``resources:``
     overrides: the model's declaration, and its LoRA specs when the YAML turns LoRA on
-    (``mstar.engine.resources.lora.serving``)."""
+    (``mstar.engine.resources.lora.serving``). Raises the first problem with the declaration,
+    for callers that skip ``validate_deployment``, which reports them all."""
     from mstar.engine.resources.lora.serving import declared_lora_specs, size_lora_specs
+    from mstar.engine.state.adapters import node_resources
+    from mstar.engine.state.analysis import state_declaration_problems
 
-    specs = list(model.get_node_resources() or [])
+    problems = state_declaration_problems(model)
+    if problems:
+        raise ValueError(problems[0])
+    specs = node_resources(model)
     lora = declared_lora_specs(model, model_config)
     size_lora_specs(lora, model_config)
     return specs + lora
@@ -767,11 +774,22 @@ class Model(ABC):
     def get_node_resources(self) -> list[NodeResourceSpec]:
         """Declare the resources the engine builds, and which nodes share each.
 
-        The whole declaration: a KV cache's shape, the attention backend over
-        it, positions, samplers. The engine builds one resource per spec and
-        hands each node the subset naming it.
+        The whole declaration, apart from what `declare_state` declares: a KV
+        cache's shape, the attention backend over it, positions, samplers. The
+        engine builds one resource per spec and hands each node the subset naming it.
         """
         pass
+
+    def declare_state(self) -> "list[Array]":
+        """The state the model keeps between steps, from which the engine builds the specs for it.
+
+        A pure function of the model's config and the deployment's settings, since each process calls it.
+        """
+        return []
+
+    def kernel_settings(self) -> dict[str, dict[str, Any]]:
+        """``splits`` and ``decode_fmha`` by read or update key, until the engine picks kernels itself."""
+        return {}
 
     def get_lora_specs(self) -> list["LoraSpec"]:
         """The per-request LoRA adapters this model can serve: a spec per node they

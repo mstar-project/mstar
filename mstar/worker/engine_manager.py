@@ -265,8 +265,8 @@ class EngineManager:
         """Build the engine and load this worker's nodes into it.
 
         The model supplies each node's submodule via ``get_submodule`` and its
-        resources via ``get_node_resources``; the KV cache's shape rides on
-        the latter, so there is no separate cache config. The conductor's
+        resources via ``declare_state`` and ``get_node_resources``; the KV cache's
+        shape rides on those, so there is no separate cache config. The conductor's
         ``validate_deployment`` has already checked the specs and overrides.
         """
         specs = serving_resources(model, model_config)
