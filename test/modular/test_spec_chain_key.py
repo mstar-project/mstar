@@ -57,7 +57,7 @@ def _chunk():
 
 def _pending(repeats=1, owed_run=False):
     return SimpleNamespace(
-        batch=object(), node_name="LLM", graph_walk="mixed",
+        batch=object(), group=None, node_name="LLM", graph_walk="mixed",
         node_batch=SimpleNamespace(
             admit_error=None, step_context=SimpleNamespace(repeats=repeats, owed_run=owed_run),
         ),
