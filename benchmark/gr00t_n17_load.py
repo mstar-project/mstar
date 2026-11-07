@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Closed-loop load on a running GR00T N1.7 server, M* or NVIDIA's own: the recorded DROID requests,
 sent as each system's client sends them, at each concurrency in turn. Per level: latency median,
-p95 and mean, throughput, and failed requests. Requests are encoded before the clock starts.
+p95 and mean, throughput, and failed requests. M*'s PNG frames are encoded once, off the clock, and
+its reply is not decoded; NVIDIA's client serialises each request and reply on the clock. A real M*
+client pays that encode per request, so it is reported on its own, as `client_encode_ms`.
 
     --system mstar   `mstar serve gr00t_n17` over HTTP: PNG frames and kwargs, as
                      `test/gr00t_n17/serve_check.py`'s `observation` builds them. Run in M*'s venv.
@@ -73,7 +75,9 @@ def mstar_client(port: int, dumps: list[dict]):
     def call(client, obs):
         return send(client, obs, seed=7)
 
-    return [observation(d) for d in dumps], lambda: MStarClient(url), call
+    t = time.perf_counter()
+    obs = [observation(d) for d in dumps]
+    return obs, lambda: MStarClient(url), call, (time.perf_counter() - t) * 1e3 / len(obs)
 
 
 def nvidia_client(port: int, dumps: list[dict]):
@@ -88,7 +92,8 @@ def nvidia_client(port: int, dumps: list[dict]):
             raise RuntimeError(action["error"])
         return action
 
-    return [d["raw_obs"] for d in dumps], lambda: PolicyClient(host="127.0.0.1", port=port, timeout_ms=600000), call
+    obs = [d["raw_obs"] for d in dumps]
+    return obs, lambda: PolicyClient(host="127.0.0.1", port=port, timeout_ms=600000), call, None
 
 
 def level(obs: list, new_client, call, c: int, n: int) -> dict:
@@ -145,7 +150,7 @@ def main() -> None:
 
     dumps = requests(args.dump, args.text_rows)
     build = mstar_client if args.system == "mstar" else nvidia_client
-    obs, new_client, call = build(args.port, dumps)
+    obs, new_client, call, encode_ms = build(args.port, dumps)
     results = []
     for c in args.levels:
         warm = level(obs, new_client, call, c, args.warmup_waves * c)
@@ -158,7 +163,8 @@ def main() -> None:
     args.out.mkdir(parents=True, exist_ok=True)
     out = args.out / f"load_{args.system}{'_' + str(args.text_rows) if args.text_rows else ''}.json"
     out.write_text(json.dumps({"system": args.system, "label": args.label, "requests_pool": len(obs),
-                               "text_rows": args.text_rows, "levels": results}, indent=1))
+                               "text_rows": args.text_rows, "client_encode_ms": encode_ms,
+                               "levels": results}, indent=1))
     print("wrote", out)
 
 
