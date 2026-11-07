@@ -11,7 +11,7 @@ from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.engine import ForwardPassInfoWrapper
 from mstar.engine.resources import SamplingReqConfig
 from mstar.engine.resources.kv.manager import SpanCursor
-from mstar.model.base import LabelLayout
+from mstar.model.base import LabelLayout, Span
 from mstar.model.submodule_base import InputMetadata
 
 NOT_EOS = 42
@@ -455,6 +455,20 @@ def test_higgs_lays_out_the_prefill_step_it_runs():
     audio = sum(model.config.encoder_output_length(n) for n in output.metadata["audio_feature_lens"])
     text = sum(ids.numel() for ids in tensors["text_inputs"])
     assert sum(span.length for span in layout.spans) == text + audio
+
+
+def test_a_text_only_qwen3_5_lays_out_a_text_prompt():
+    from mstar.model.keys import KV_CACHE
+    from mstar.model.qwen3_5.qwen3_5_model import Qwen3_5DenseModel
+
+    model = object.__new__(Qwen3_5DenseModel)
+    model.vision_config, model.media = None, ()  # a checkpoint without a vision tower
+
+    layout = model.kv_layout({"offset": [], "tokens": [], "output": [], "grid": []}, 7)
+
+    assert layout[KV_CACHE]["main"] == LabelLayout(
+        spans=(Span("ids", "prefill_text", 7, 7, "text_inputs"),), growth=(("decode_loop", 1),),
+    ), "a text-only checkpoint lays out a text prompt as a vision checkpoint does"
 
 
 def _omni_submodule():
