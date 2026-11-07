@@ -1936,6 +1936,7 @@ def test_engine_prepares_one_logical_joining_receipt_without_replanning(actual, 
     for rid in (1, 2):
         owner.add(rid)
     owner.write("token", [1, 2], torch.tensor([11, 22]))
+    owner.ask_ring("frame", 8)
     if routed:
         slot.row_heads = {"token": "input_ids"}
         slot.static_inputs["input_ids"] = torch.zeros(4, dtype=torch.long)
@@ -1946,7 +1947,7 @@ def test_engine_prepares_one_logical_joining_receipt_without_replanning(actual, 
     eng._runner, eng._enable_nvtx = runner, False
     eng._submodules = {"decode": SimpleNamespace(
         resident=planner, submodule=submodule, device_stops={WALK: None}, loopback_rows=owner,
-        resources=live, piecewise_runners={},
+        resources=live, piecewise_runners={}, rings={"frame": {WALK}},
         accelerator_graph_runner=SimpleNamespace(
             slot_for=lambda lease: slot,
             pad_inputs=lambda lease, inputs, **kwargs: inputs + [SimpleNamespace(input_seq_len=1, token=0)] * 3,
@@ -1993,6 +1994,8 @@ def test_engine_prepares_one_logical_joining_receipt_without_replanning(actual, 
     assert descriptor is candidate.run_rows[2]
     assert owner.read("token", [1, 2]).tolist() == [11, 42 if routed else 22]
     assert candidate.committed is step and ctx.counted == {2: runner.request_generation(2)}
+    assert candidate.ring_bases == {"frame": {2: 0}} and candidate.ring_width == 4
+    assert owner.ring_room("frame", 2) == 4
     assert membership.control[1:].tolist() == [0] * 3, "the worker attaches its receipt before publication"
     assert live["kv"]._streams[2]["main"].stored_len == live["rope"].position(2, "main") == 7
     assert (planner._plan_seq, planner._commits, planner._committed_seq) == stamps

@@ -2846,6 +2846,8 @@ class Engine:
             )
             if descriptor is None:
                 return None
+            if mgmt.rings:
+                self._reserve_rings(mgmt, batch)
             ctx.resident.flush(plan, stager=membership.stager)
             self._runner.commit(step, track_rows=True)
             batch.committed = step
