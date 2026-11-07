@@ -67,7 +67,7 @@ extern "C" __global__ void run_stop(
                 if (tokens[row * stride] == stop_ids[i]) marks[row] = 1;
             }
         }
-        done += marks[row];
+        done += marks[row] || (active && counts[row] >= *limit);
     }
     long long next = at + 1;
     *index = next;
@@ -75,7 +75,8 @@ extern "C" __global__ void run_stop(
         __threadfence_system();
         *landed = (int)next;
     }
-    bool go = done < rows && next < *limit && *generation > *yield_until && (*refill == 0 || done < *refill);
+    bool go = done < rows && (active || next < *limit) && *generation > *yield_until
+              && (*refill == 0 || done < *refill);
     *continuation = go ? 1 : 0;
 }
 
@@ -234,8 +235,8 @@ class RunState:
         self.immune = torch.zeros(bs, dtype=torch.bool, device=device)
         self._immune_stager = PinnedStager(torch.bool, numel=bs)
         self.marks = torch.zeros(bs, dtype=torch.bool, device=device)
-        if independent_rows and (dropping is None or stream is not None):
-            raise ValueError("independently ready rows need resident writes and no live token stream")
+        if independent_rows and (dropping is None or stream is not None or membership is not None):
+            raise ValueError("independently ready rows need fixed resident writes and no live token stream")
         self.eligible = torch.ones_like(self.marks) if independent_rows else None
         self.active = torch.zeros_like(self.marks) if independent_rows else None
         self.counts = torch.zeros(bs, dtype=torch.long, device=device)
@@ -295,6 +296,7 @@ class RunState:
         if self.active is None:
             return ~self.marks
         torch.logical_and(self.eligible, ~self.marks, out=self.active)
+        self.active.logical_and_(self.counts < self.limit)
         return self.active
 
     def head(self) -> None:
@@ -514,7 +516,14 @@ class DeviceRun:
         """The launched width and each row's logical executions, including width one."""
         state = self.state
         if state.descriptors is None:
-            state.replays.copy_(state.index.expand_as(state.replays))
+            if state.active is None:
+                state.replays.copy_(state.index.expand_as(state.replays))
+            else:
+                # Independent readiness can need more body invocations than
+                # any one row's budget. Collection indexes compact logical
+                # columns, so its width is the largest actual row count.
+                torch.amax(state.counts, dim=0, keepdim=True, out=state.replays[:1])
+                state.replays[1:].copy_(state.replays[:1])
             replays = state.replays
         else:
             # Membership closes before any successor can restage this state.

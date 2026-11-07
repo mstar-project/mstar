@@ -1436,7 +1436,8 @@ class AcceleratorGraphRunner:
             if ask.refill_at is not None:
                 self._run_failures[walk] = "graph: joining membership has no fixed refill row count"
                 return None, None, None
-        if ask.independent_rows and (ask.stream_tokens or ask.carries or (ask.iteration and ask.loop is None)):
+        if ask.independent_rows and (ask.stream_tokens or ask.membership is not None or ask.carries
+                                     or (ask.iteration and ask.loop is None)):
             self._run_failures[walk] = "resource: independent rows need owned carries/cursors and no live token stream"
             return None, None, None
         if ask.loop is not None:

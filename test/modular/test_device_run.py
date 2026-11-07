@@ -69,9 +69,10 @@ class _Loop:
             state.stream.tokens[:, int(state.index)] = token
             state.stream.landed[0] = int(state.index) + 1
         state.index += 1
-        done = int(state.marks.sum())
+        done = int((state.marks | (state.counts >= state.limit)).sum() if state.active is not None
+                   else state.marks.sum())
         state.continuation[0] = (
-            done < len(state.marks) and int(state.index) < int(state.limit)
+            done < len(state.marks) and (state.active is not None or int(state.index) < int(state.limit))
             and int(state.generation[0]) > int(state.yield_until[0])
             and (int(state.refill) == 0 or done < int(state.refill))
         )
@@ -1888,7 +1889,8 @@ def test_a_streamed_unit_waits_and_yields_for_its_nontrigger_members(monkeypatch
     assert log.count("a") == 1 and "n" not in log
 
 
-def test_independently_ready_rows_keep_actual_progress_and_last_values(monkeypatch):
+@pytest.mark.parametrize("budget", [4, 1])
+def test_independently_ready_rows_keep_actual_progress_and_last_values(monkeypatch, budget):
     loop = _Loop()
     runner, run, _, _ = _runner(monkeypatch, loop, [[1, 1, 1]], bs=3, limit=4,
                                 progress=True, independent=True)
@@ -1897,19 +1899,25 @@ def test_independently_ready_rows_keep_actual_progress_and_last_values(monkeypat
     table = runner._rows.prepare_iteration(WALK, runner._run_asks[WALK].loop)
     table[runner._rows._row_of[3]] = torch.tensor([17, 1, 5, 3])
     patterns = torch.tensor([[1, 0, 0], [0, 1, 0], [1, 1, 0], [0, 1, 0]], dtype=torch.bool)
-    loop.on_iteration = lambda i: run.state.eligible.copy_(patterns[i])
+    def available(i):
+        run.state.eligible.copy_(patterns[i])
+        if i == len(patterns) - 1:
+            run.state.request_yield()  # the supplying window ends; row3 never becomes ready
+    loop.on_iteration = available
     window = IterationWindow(
         {"cond": torch.tensor([[1., 9., 5., 6., 7., 8., 9., 10.],
                                 [2., 3., 9., 5., 6., 7., 8., 9.],
                                 [9., 9., 9., 9., 9., 9., 9., 9.]])},
         torch.zeros(3, dtype=torch.long), torch.tensor([[1, 1], [1, 1], [1, 1]]),
     )
-    stops, values, _ = _run(run, 3, 4, columns=window)
-    assert stops[RUN_COUNTS].tolist() == [2, 3, 0]
-    assert values["frame"].tolist() == [[2, 18, 18, 18], [4, 6, 18, 18], [0, 0, 0, 0]]
-    assert values["h"].tolist() == [109, 109, 0]  # no synthetic stream axis on a last-value output
-    assert run.state.marks.tolist() == [True, True, False]
-    assert runner.test_resource[1:].tolist() == [10, 14, 0]
+    stops, values, _ = _run(run, 3, budget, columns=window)
+    assert stops[RUN_COUNTS].tolist() == ([2, 3, 0] if budget == 4 else [1, 1, 0])
+    assert stops[RUN_REPLAYS].tolist() == [3 if budget == 4 else 1] * 3
+    assert values["frame"].tolist() == ([[2, 18, 18, 18], [4, 6, 18, 18], [0, 0, 0, 0]] if budget == 4
+                                        else [[2], [4], [0]])
+    assert values["h"].tolist() == ([109, 109, 0] if budget == 4 else [101, 102, 0])
+    assert run.state.marks.tolist() == ([True, True, False] if budget == 4 else [False] * 3)
+    assert runner.test_resource[1:].tolist() == ([10, 14, 0] if budget == 4 else [1, 2, 0])
     assert table[runner._rows._row_of[3]].tolist() == [17, 1, 5, 3]  # waiting never writes entry
     # A preplanned new entry can use this same capture with ordinary all-ready
     # execution. The entry itself resets the previous eligibility snapshot.
@@ -1920,16 +1928,20 @@ def test_independently_ready_rows_keep_actual_progress_and_last_values(monkeypat
     assert values["frame"].flatten().tolist() == [2, 4, 18]
 
 
-@pytest.mark.parametrize("unsupported", ["owners", "stream", "carry"])
+@pytest.mark.parametrize("unsupported", ["owners", "stream", "carry", "membership"])
 def test_independent_row_capture_refuses_uncovered_effects(monkeypatch, unsupported):
+    from mstar.engine.resources.run_rows import RunRows
+
     runner, run, _, _ = _runner(
         monkeypatch, _Loop(), [[1, 1]], independent=True, progress=unsupported != "owners",
         stream_tokens=unsupported == "stream", carries={"h": CarryPair("h", "h")} if unsupported == "carry" else {},
+        membership=RunRows(CPU, 2, 8, 2) if unsupported == "membership" else None,
     )
     assert run is None and WALK in runner._run_failures
 
 
-def test_independent_row_masks_execute_in_a_real_conditional_capture():
+@pytest.mark.parametrize("budget", [4, 1])
+def test_independent_row_masks_execute_in_a_real_conditional_capture(budget):
     from mstar.engine.accelerator_graph_backend import CUDAGraphBackend
     from mstar.engine.accelerator_graph_runner import capture_into_graph
 
@@ -1962,6 +1974,9 @@ def test_independent_row_masks_execute_in_a_real_conditional_capture():
         run.keep({"frame": token, "last": last}, run.rows)
         run.keep({"token": token}, run.stops)
         cuda.stop(state, token, backend.raw_stream())
+        # The supplying policy window is finite even if a row never becomes
+        # ready. A connected parent owns this bound, not a row's compute budget.
+        state.continuation.logical_and_(state.index < len(masks))
 
     cuda._load_kernels()
     pool = backend.graph_pool_handle()
@@ -1969,15 +1984,17 @@ def test_independent_row_masks_execute_in_a_real_conditional_capture():
     entry, _ = capture_into_graph(lambda: cuda.start(state, backend.raw_stream()), pool, device, None, keep_graph=True)
     composed = backend.compose((entry, GraphConditional("while", state.continuation, (graph,))))
     owner.zero_()
-    state.stage(3, [False] * 3, 4)
+    state.stage(3, [False] * 3, budget)
     composed.replay()
-    stops, values, _ = run.results(4)
+    stops, values, _ = run.results(budget)
     backend.synchronize()
-    assert stops[RUN_COUNTS].tolist() == [2, 3, 0]
-    assert owner[1:].tolist() == [2, 3, 0]
-    assert values["frame"].tolist() == [[1, 9, 9, 9], [1, 2, 9, 9], [0, 0, 0, 0]]
-    assert values["last"].tolist() == [102, 103, 0]
-    assert state.marks.tolist() == [True, True, False]
+    assert stops[RUN_COUNTS].tolist() == ([2, 3, 0] if budget == 4 else [1, 1, 0])
+    assert stops[RUN_REPLAYS].tolist() == [3 if budget == 4 else 1] * 3
+    assert owner[1:].tolist() == ([2, 3, 0] if budget == 4 else [1, 1, 0])
+    assert values["frame"].tolist() == ([[1, 9, 9, 9], [1, 2, 9, 9], [0, 0, 0, 0]] if budget == 4
+                                        else [[1], [1], [0]])
+    assert values["last"].tolist() == ([102, 103, 0] if budget == 4 else [100, 101, 0])
+    assert state.marks.tolist() == ([True, True, False] if budget == 4 else [False] * 3)
     # Entry resets must be captured operations even when the body never runs.
     state.eligible.zero_()
     state.stage(3, [False] * 3, 4)
