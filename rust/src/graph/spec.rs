@@ -139,6 +139,86 @@ pub struct CompiledGraph {
     pub loop_by_name: FxHashMap<Sym, LoopId>,
     pub root_nodes: Vec<NodeId>,
     pub root_loops: Vec<LoopId>,
+    /// Connected ordinary steps, indexed by their first node. Execution
+    /// eligibility (captures, placement and resources) is checked at load;
+    /// this is only the immutable graph structure.
+    pub units: FxHashMap<NodeId, ExecutionUnit>,
+}
+
+pub struct ExecutionUnit {
+    pub nodes: Vec<NodeId>,
+    /// Inputs supplied by an earlier member, one mask per member.
+    pub internal_inputs: Vec<u64>,
+    /// (producer, consumer, signal), in graph order.
+    pub edges: Vec<(NodeId, NodeId, Sym)>,
+    /// Signals requiring ordinary output storage/routing. An exclusively
+    /// internal edge needs only its readiness notification at landing.
+    pub output_signals: Vec<Vec<Sym>>,
+}
+
+impl ExecutionUnit {
+    pub fn compile(nodes: &[NodeSpec]) -> FxHashMap<NodeId, Self> {
+        let mut units = FxHashMap::default();
+        for head in 0..nodes.len() as NodeId {
+            let mut members = Vec::new();
+            let mut current = head;
+            loop {
+                let node = &nodes[current as usize];
+                // Loops and streaming policies need their own lowering, not
+                // a guessed order over their member names.
+                if node.loop_id.is_some() || node.streaming_mask != 0 || members.contains(&current) {
+                    break;
+                }
+                members.push(current);
+                let mut targets: Vec<_> = node.outputs.iter().filter_map(|edge| match edge.dest {
+                    Dest::Local(next) if !edge.streaming => Some(next),
+                    _ => None,
+                }).collect();
+                targets.sort_unstable();
+                targets.dedup();
+                if targets.len() != 1 {
+                    break;
+                }
+                current = targets[0];
+            }
+            if members.len() < 2 {
+                continue;
+            }
+            // A back edge, even outside an explicit Loop, is a boundary.
+            if members.iter().enumerate().any(|(i, &source)| nodes[source as usize].outputs.iter().any(|e| {
+                matches!(e.dest, Dest::Local(dest) if members[..=i].contains(&dest))
+            })) {
+                continue;
+            }
+            let mut internal_inputs = vec![0; members.len()];
+            let mut edges = Vec::new();
+            let mut output_signals = Vec::new();
+            for &source in &members {
+                let mut stored = Vec::new();
+                for edge in &nodes[source as usize].outputs {
+                    let internal = match edge.dest {
+                        Dest::Local(dest) if !edge.streaming => members.iter().position(|&n| n == dest),
+                        _ => None,
+                    };
+                    if let Some(i) = internal {
+                        internal_inputs[i] |= 1 << edge.dest_slot;
+                        let binding = (source, members[i], edge.name);
+                        if !edges.contains(&binding) {
+                            edges.push(binding);
+                        }
+                    }
+                    if internal.is_none() || edge.persist || edge.new_token {
+                        stored.push(edge.name);
+                    }
+                }
+                stored.sort_unstable();
+                stored.dedup();
+                output_signals.push(stored);
+            }
+            units.insert(head, Self { nodes: members, internal_inputs, edges, output_signals });
+        }
+        units
+    }
 }
 
 impl CompiledGraph {

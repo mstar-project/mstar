@@ -385,6 +385,20 @@ class PopRidsOutput(NamedTuple):
     walk_output_signals: tuple[tuple[str, ...], ...] = ()
 
 
+@dataclass(frozen=True)
+class ExecutionUnit:
+    """A connected section of the compiled graph, shared by all its rows.
+
+    Member inputs/outputs retain ordinary node names. Only exclusively
+    internal payloads stay in the members' leased capture buffers.
+    """
+    worker_graph_id: int
+    nodes: tuple[str, ...]
+    # (producer node, consumer node, signal)
+    edges: tuple[tuple[str, str, str], ...]
+    output_signals: tuple[tuple[str, ...], ...]
+
+
 class RequestWalks(NamedTuple):
     """Rows of several walks of one node, columnar: rid ``rids[i]`` runs
     ``walks[walk_idx[i]]``."""
@@ -1153,6 +1167,33 @@ class GraphRuntime(PhasedPostprocess, ABC):
         pass
 
     # --------- Scheduling ----------
+    @abstractmethod
+    def execution_units(self, graph_walk: str) -> tuple[ExecutionUnit, ...]:
+        """Immutable local connected sections; no readiness mutation."""
+        pass
+
+    @abstractmethod
+    def claim_execution_unit(
+        self, head: str, graph_walk: str, rids: list[int],
+    ) -> tuple[int, tuple[PopRidsOutput, ...]] | None:
+        """Claim one common row set before execution, all or none.
+
+        The head may already have been popped by the scheduler. Returned
+        inputs are the members' existing external inputs; the unit's edges
+        supply internal inputs from leased device buffers.
+        """
+        pass
+
+    @abstractmethod
+    def submit_execution_unit(self, claim_id: int) -> bool:
+        """Record irreversible submission; later failures cannot retry it."""
+        pass
+
+    @abstractmethod
+    def cancel_execution_unit(self, claim_id: int) -> bool:
+        """Undo a prelaunch claim exactly once, returning its head to ready."""
+        pass
+
     @abstractmethod
     def pop_rids(
         self, node_name: str,

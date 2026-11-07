@@ -657,7 +657,7 @@ def test_prep_respects_room_for_continuing(runtime):
     ).ready_rids == [rid]
 
 
-def _two_node_runtime():
+def _two_node_runtime(a_outputs=(), b_outputs=(), communicator=None):
     """a -> b, where b ALSO needs an input a does not produce.
 
     A same-node loop-back is a poor subject for not-ready: its held external
@@ -670,13 +670,14 @@ def _two_node_runtime():
         section=Sequential(sections=[
             GraphNode(
                 name="a", input_names={"in"},
-                outputs=[GraphEdge(name="x", next_node="b")],
+                outputs=[GraphEdge(name="x", next_node="b"), *a_outputs],
             ),
-            GraphNode(name="b", input_names={"x", "y"}, outputs=[]),
+            GraphNode(name="b", input_names={"x", "y"}, outputs=list(b_outputs)),
         ]),
         graph_walks={WALK}, ranks=[0], worker_graph_id=WG_ID,
     )
-    return rust_runtime.RustGraphRuntime(
+    book = RustTensorBookkeeping()
+    runtime = rust_runtime.RustGraphRuntime(
         my_worker_id=WORKER, my_worker_graphs=[wg],
         all_wg_ids_to_graph_walks={WG_ID: {WALK}},
         all_wg_ids_to_dyn_loops={WG_ID: set()},
@@ -685,8 +686,105 @@ def _two_node_runtime():
         sharding_config=ShardingConfig(
             groups=[], tp_enabled_nodes=set(), shard_dim={},
         ),
-        bookkeeping=RustTensorBookkeeping(),
+        bookkeeping=book,
+        communicator=communicator,
     )
+    runtime._bookkeeping_for_test = book
+    return runtime
+
+
+def test_unit_claim_preserves_common_rows_and_refusal_returns_readiness_once():
+    rt = _two_node_runtime()
+    a, b = (_admit(rt, name) for name in ("ra", "rb"))
+    rt.ingest_inputs_batch(_ingest_block([a, b, a], [
+        _spec("in", "a"), _spec("in", "a"), _spec("y", "b"),
+    ]))
+    # One downstream row is missing an external input: no member is claimed.
+    assert rt.claim_execution_unit("a", WALK, [b, a]) is None
+    assert set(rt.get_ready_nodes(set())[0].rids) == {a, b}
+    rt.ingest_inputs_batch(_ingest_block([b], [_spec("y", "b")]))
+    rt.pop_rids("a", WALK, [b, a], check_ready=True)
+    claim, members = rt.claim_execution_unit("a", WALK, [b, a])
+    assert [member.wg_ids.keys for member in members] == [[b, a], [b, a]]
+    assert members[1].input_edges.edge_tuples() == [(b, "y", [], False), (a, "y", [], False)]
+    assert rt.get_ready_nodes(set()) == []
+    assert rt.claim_execution_unit("a", WALK, [a]) is None
+    assert rt.cancel_execution_unit(claim)
+    assert not rt.cancel_execution_unit(claim)
+    assert set(rt.get_ready_nodes(set())[0].rids) == {a, b}
+    # Refused admission never consumed the original inputs.
+    retry = rt.pop_rids("a", WALK, [b, a], check_ready=True)
+    assert retry.input_edges.edge_tuples() == [(b, "in", [], False), (a, "in", [], False)]
+
+
+@pytest.mark.parametrize("submitted", [False, True])
+def test_unit_cancellation_does_not_attach_to_recycled_handles(submitted):
+    rt = _two_node_runtime()
+    rid = _admit(rt)
+    rt.ingest_inputs_batch(_ingest_block([rid, rid], [_spec("in", "a"), _spec("y", "b")]))
+    claim, _ = rt.claim_execution_unit("a", WALK, [rid])
+    if submitted:
+        assert rt.submit_execution_unit(claim)
+        with pytest.raises(ValueError, match="cannot retry"):
+            rt.cancel_execution_unit(claim)
+    rt.remove_request(rid)
+    assert _admit(rt, "replacement") == rid
+    assert not rt.cancel_execution_unit(claim)
+    assert not rt.submit_execution_unit(claim)
+    rt.ingest_inputs_batch(_ingest_block([rid, rid], [_spec("in", "a"), _spec("y", "b")]))
+    replacement, _ = rt.claim_execution_unit("a", WALK, [rid])
+    assert replacement != claim
+    assert rt.cancel_execution_unit(replacement)
+
+
+def test_unit_lands_in_graph_order_with_internal_readiness_and_external_outputs_once(tmp_path):
+    from types import SimpleNamespace
+
+    from mstar_rust import ZmqCommunicator
+
+    import mstar.communication.wire_types  # noqa: F401 -- register real wire messages
+    from mstar.communication.wire import decode
+    from mstar.graph.special_destinations import EMIT_TO_CLIENT
+
+    comm = ZmqCommunicator(WORKER, str(tmp_path))
+    client = ZmqCommunicator("api_server", str(tmp_path))
+    conductor = ZmqCommunicator("conductor", str(tmp_path))
+    rt = _two_node_runtime(
+        a_outputs=[GraphEdge(name="first", next_node=EMIT_TO_CLIENT, output_modality="text")],
+        b_outputs=[GraphEdge(name="last", next_node=EMIT_TO_CLIENT, output_modality="text")],
+        communicator=SimpleNamespace(_inner=comm),
+    )
+    rid = _admit(rt)
+    rt.ingest_inputs_batch(_ingest_block([rid, rid], [_spec("in", "a"), _spec("y", "b")]))
+    unit, = rt.execution_units(WALK)
+    assert unit.nodes == ("a", "b")
+    assert unit.edges == (("a", "b", "x"),)
+    # The internal x payload is held by device leases, never stored here.
+    assert unit.output_signals == (("first",), ("last",))
+    claim, _ = rt.claim_execution_unit("a", WALK, [rid])
+    with pytest.raises(ValueError, match="graph order"):
+        _route(rt, [rid], "a", [], [[]])
+    assert rt.submit_execution_unit(claim)
+    with pytest.raises(ValueError, match="graph order"):
+        _route(rt, [rid], "b", [], [[]])
+    for uuid in (901, 902):
+        rt._bookkeeping_for_test.put_tensor(uuid, _tensor_info(uuid))
+        rt._bookkeeping_for_test.increment_ref(uuid)
+    first = _route(rt, [rid], "a", ["first"], [[[901]]])
+    rt.send_outputs(_send_input(rid, first.completion_id))
+    # x arrived as a readiness edge; the claim prevents a second schedule.
+    assert rt.get_ready_nodes(set()) == []
+    with pytest.raises(ValueError, match="graph order"):
+        _route(rt, [rid], "a", ["first"], [[[901]]])
+    last = _route(rt, [rid], "b", ["last"], [[[902]]])
+    rt.send_outputs(_send_input(rid, last.completion_id))
+    emitted = [decode(client.recv_timeout(1000)) for _ in range(2)]
+    assert [message.body.graph_edge.tensor_info[0].uuid for message in emitted] == [901, 902]
+    assert conductor.recv_timeout(1000) is not None
+    assert client.recv_timeout(0) is None
+    assert conductor.recv_timeout(0) is None
+    assert not rt.cancel_execution_unit(claim)
+    assert rt.get_ready_nodes(set()) == []
 
 
 def _ab(rids, room=None):

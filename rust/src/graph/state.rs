@@ -9,7 +9,7 @@
 //!   (reset_for_iter is only ever called on a LoopStateRegistry).
 
 use crate::graph::spec::{
-    CompiledGraph, Dest, EdgeSpec, GraphRef, LoopId, NodeId, Sym,
+    CompiledGraph, Dest, EdgeSpec, ExecutionUnit, GraphRef, LoopId, NodeId, Sym,
 };
 use serde::Serialize;
 
@@ -75,13 +75,14 @@ struct NodeState {
     spec: Slot,      // speculative_signals
     completed: bool,
     in_flight: bool, // GraphNode._in_flight
+    unit_claim: Option<u64>,
 }
 
 impl NodeState {
     fn new(n: usize) -> Self {
         NodeState {
             cur: Slot::new(n), next: Slot::new(n), spec: Slot::new(n),
-            completed: false, in_flight: false,
+            completed: false, in_flight: false, unit_claim: None,
         }
     }
     fn clear(&mut self) {
@@ -90,6 +91,7 @@ impl NodeState {
         self.spec.clear();
         self.completed = false;
         self.in_flight = false;
+        self.unit_claim = None;
     }
 }
 
@@ -473,6 +475,43 @@ impl RequestState {
 
     pub fn is_in_flight(&self, node: NodeId) -> bool {
         self.nodes[node as usize].in_flight
+    }
+
+    /// A unit may supply missing internal inputs, never overwrite an input
+    /// already queued for this node. All external inputs must already exist.
+    pub fn can_claim_unit(&self, unit: &ExecutionUnit) -> bool {
+        unit.nodes.iter().zip(&unit.internal_inputs).all(|(&node, &internal)| {
+            let st = &self.nodes[node as usize];
+            !st.completed && !st.in_flight && st.unit_claim.is_none()
+                && (st.cur.mask & internal) == 0
+                && (st.cur.mask | internal) == self.graph.node(node).full_mask
+        })
+    }
+
+    pub fn claim_unit(&mut self, unit: &ExecutionUnit, claim: u64) {
+        for &node in &unit.nodes {
+            self.take_for_schedule(node);
+            let st = &mut self.nodes[node as usize];
+            st.in_flight = true;
+            st.unit_claim = Some(claim);
+        }
+    }
+
+    pub fn unit_claim(&self, node: NodeId) -> Option<u64> {
+        self.nodes[node as usize].unit_claim
+    }
+
+    pub fn release_unit(&mut self, unit: &ExecutionUnit, retry: bool) {
+        for &node in &unit.nodes {
+            let st = &mut self.nodes[node as usize];
+            st.in_flight = false;
+            st.unit_claim = None;
+        }
+        if retry {
+            // The scheduler already popped the head; its inputs stayed here.
+            // Downstream members had missing internal inputs before the claim.
+            self.push_back(unit.nodes[0]);
+        }
     }
 
     // -- completion ----------------------------------------------------------

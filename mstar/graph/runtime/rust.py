@@ -37,6 +37,7 @@ from mstar.graph.loop_indices import LoopLayout, NestedLoopIndices
 from mstar.graph.runtime import sharding
 from mstar.graph.runtime.base import (
     ColumnarEdgeSpecs,
+    ExecutionUnit,
     FreedTensors,
     GraphRuntime,
     ParallelList,
@@ -417,6 +418,30 @@ class RustGraphRuntime(GraphRuntime):
         self, node_name: str, rids: list[int], wg_ids: list[int],
     ):
         self._rust.push_back_node(node_name, rids, wg_ids)
+
+    def execution_units(self, graph_walk: str) -> tuple[ExecutionUnit, ...]:
+        return tuple(
+            ExecutionUnit(wg, tuple(nodes), tuple(edges), tuple(tuple(s) for s in signals))
+            for wg, nodes, edges, signals in self._rust.execution_units(graph_walk)
+        )
+
+    def claim_execution_unit(
+        self, head: str, graph_walk: str, rids: list[int],
+    ) -> tuple[int, tuple[PopRidsOutput, ...]] | None:
+        out = self._rust.claim_execution_unit(head, graph_walk, rids)
+        if out is None:
+            return None
+        claim_id, members = out
+        return claim_id, tuple(
+            PopRidsOutput(ParallelList(m.rids, m.wg_ids), _columns(m), tuple(m.output_signals))
+            for m in members
+        )
+
+    def submit_execution_unit(self, claim_id: int) -> bool:
+        return self._rust.submit_execution_unit(claim_id)
+
+    def cancel_execution_unit(self, claim_id: int) -> bool:
+        return self._rust.cancel_execution_unit(claim_id)
 
     # --------- pending loop stops ----------
 

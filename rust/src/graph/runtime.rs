@@ -177,6 +177,10 @@ pub struct GraphRuntime {
     /// prep used to reach the walk state.
     staged_specs: FxHashMap<u32, (WgIndex, Vec<(u32, NodeId, Vec<(u8, bool)>)>)>,
     spec_counter: u32,
+    /// Claims own ordinary member steps until admission rolls back or the
+    /// last member lands. Per-node flags live in RequestState, not Python.
+    unit_claims: FxHashMap<u64, UnitClaim>,
+    unit_counter: u64,
     /// (node, real walk) -> the combined walk the scheduler batches it under;
     /// a ready-scan target or exclusion may name either.
     combined_walk_of: FxHashMap<(Sym, Sym), Sym>,
@@ -198,6 +202,14 @@ pub struct GraphRuntime {
 
     /// A postprocess parked at a break (`begin_postprocess`).
     postprocess: Option<postprocess::Postprocess>,
+}
+
+struct UnitClaim {
+    wg: WgIndex,
+    head: NodeId,
+    submitted: bool,
+    /// Each row's next member to land; cancellation removes the row here.
+    next: FxHashMap<u32, usize>,
 }
 
  impl GraphRuntime {
@@ -1059,6 +1071,39 @@ pub struct GraphRuntime {
         self.states.get_mut(wg as usize)?.get_mut(rid as usize)?.as_mut()
     }
 
+    fn validate_unit_landing(&self, wg: WgIndex, node: NodeId, rid: u32) -> PyResult<()> {
+        let Some(id) = self.state(wg, rid).and_then(|s| s.unit_claim(node)) else { return Ok(()) };
+        let claim = &self.unit_claims[&id];
+        let unit = &self.g(wg).units[&claim.head];
+        if !claim.submitted || unit.nodes[claim.next[&rid]] != node {
+            return Err(PyValueError::new_err("execution unit members must land once, in graph order, after submission"));
+        }
+        Ok(())
+    }
+
+    fn land_unit_member(&mut self, wg: WgIndex, node: NodeId, rid: u32) {
+        let Some(id) = self.state(wg, rid).and_then(|s| s.unit_claim(node)) else { return };
+        let g = self.g(wg).clone();
+        let claim = self.unit_claims.get_mut(&id).unwrap();
+        let unit = &g.units[&claim.head];
+        let next = claim.next.get_mut(&rid).unwrap();
+        *next += 1;
+        let last = *next == unit.nodes.len();
+        if last {
+            claim.next.remove(&rid);
+        }
+        if claim.next.is_empty() {
+            self.unit_claims.remove(&id);
+        }
+        if let Some(state) = self.state_mut(wg, rid) {
+            if last {
+                state.release_unit(unit, false);
+            } else {
+                state.set_in_flight(node, false);
+            }
+        }
+    }
+
     /// `state_mut` with the field passed in rather than reached through
     /// `self`, so a caller can hold `&self.graphs` at the same time. A method
     /// on `&mut self` borrows the whole struct, which is what forced the walk
@@ -1671,6 +1716,8 @@ impl GraphRuntime {
             completion_counter: 0,
             staged_specs: FxHashMap::default(),
             spec_counter: 0,
+            unit_claims: FxHashMap::default(),
+            unit_counter: 0,
             combined_walk_of,
             walk_driven_signals: FxHashSet::default(),
             postprocess: None,
@@ -1859,6 +1906,10 @@ impl GraphRuntime {
         self.staged_specs.retain(|_, (_, staged)| {
             staged.retain(|&(r, _, _)| r != rid);
             !staged.is_empty()
+        });
+        self.unit_claims.retain(|_, claim| {
+            claim.next.remove(&rid);
+            !claim.next.is_empty()
         });
 
         if let Some(info) = self.requests[rid as usize].take() {
@@ -2510,6 +2561,109 @@ impl GraphRuntime {
         Ok(Some(out))
     }
 
+    /// Immutable local units for a walk. Placement and capture eligibility
+    /// are worker/engine concerns; these descriptions never mutate readiness.
+    fn execution_units(&self, graph_walk: &str) -> Vec<(u32, Vec<String>, Vec<(String, String, String)>, Vec<Vec<String>>)> {
+        let Some(walk) = self.interner.get(graph_walk) else { return vec![] };
+        let mut out = Vec::new();
+        for &wg in self.walk_to_local_wgs.get(&walk).into_iter().flatten() {
+            let g = self.g(wg);
+            let mut heads: Vec<_> = g.units.keys().copied().collect();
+            heads.sort_unstable();
+            for head in heads {
+                let unit = &g.units[&head];
+                let name = |node| self.interner.name(g.node(node).name).to_owned();
+                let outputs = unit.output_signals.iter().map(|signals| {
+                    let mut names: Vec<_> = signals.iter().map(|&s| self.interner.name(s).to_owned()).collect();
+                    names.sort();
+                    names
+                }).collect();
+                out.push((
+                    self.wg_ids[wg as usize], unit.nodes.iter().map(|&n| name(n)).collect(),
+                    unit.edges.iter().map(|&(a, b, s)| (name(a), name(b), self.interner.name(s).to_owned())).collect(),
+                    outputs,
+                ));
+            }
+        }
+        out
+    }
+
+    /// Claim one common scheduler-selected row set, all or none, before
+    /// resource admission or a device launch. No internal tensors are staged.
+    fn claim_execution_unit(
+        &mut self, head: &str, graph_walk: &str, rids: Vec<u32>,
+    ) -> PyResult<Option<(u64, Vec<PopRidsOut>)>> {
+        if rids.is_empty() {
+            return Ok(None);
+        }
+        let distinct: FxHashSet<_> = rids.iter().copied().collect();
+        if distinct.len() != rids.len() {
+            return Err(PyValueError::new_err("claim_execution_unit: duplicate request"));
+        }
+        let Some(wg) = self.owner_of(head, graph_walk) else { return Ok(None) };
+        let Some(head) = self.nid(wg, head) else { return Ok(None) };
+        let g = self.g(wg).clone();
+        let Some(unit) = g.units.get(&head) else { return Ok(None) };
+        if !rids.iter().all(|&rid| {
+            self.state(wg, rid).is_some_and(|state| state.can_claim_unit(unit))
+                && unit.nodes.iter().all(|&n| self.runs_for_request(rid, g.node(n).name))
+        }) {
+            return Ok(None);
+        }
+        self.unit_counter += 1;
+        let id = self.unit_counter;
+        for &rid in &rids {
+            self.state_mut(wg, rid).unwrap().claim_unit(unit, id);
+        }
+        let mut members = Vec::new();
+        for (i, &node) in unit.nodes.iter().enumerate() {
+            let mut cols = EdgeColumns::default();
+            for &rid in &rids {
+                for (name, tensors, final_chunk) in self.state(wg, rid).unwrap().input_tensors(node, false) {
+                    cols.push(&self.interner, rid, name, tensors.iter().map(|t| t.uuid), final_chunk);
+                }
+            }
+            let mut signals: Vec<_> = unit.output_signals[i].iter().map(|&s| self.interner.name(s).to_owned()).collect();
+            signals.sort();
+            let mut member = PopRidsOut {
+                rids: rids.clone(), wg_ids: vec![self.wg_ids[wg as usize]; rids.len()],
+                output_signals: signals, ..Default::default()
+            };
+            member.set_edges(cols);
+            members.push(member);
+        }
+        self.unit_claims.insert(id, UnitClaim {
+            wg, head, submitted: false, next: rids.into_iter().map(|r| (r, 0)).collect(),
+        });
+        Ok(Some((id, members)))
+    }
+
+    /// Irreversible boundary: after this acknowledgement, failure must fail
+    /// the ordinary request rather than retrying a possibly executed unit.
+    fn submit_execution_unit(&mut self, claim_id: u64) -> PyResult<bool> {
+        let Some(claim) = self.unit_claims.get_mut(&claim_id) else { return Ok(false) };
+        if claim.submitted {
+            return Err(PyValueError::new_err("execution unit already submitted"));
+        }
+        claim.submitted = true;
+        Ok(true)
+    }
+
+    fn cancel_execution_unit(&mut self, claim_id: u64) -> PyResult<bool> {
+        let Some(claim) = self.unit_claims.get(&claim_id) else { return Ok(false) };
+        if claim.submitted {
+            return Err(PyValueError::new_err("cannot retry a submitted execution unit"));
+        }
+        let claim = self.unit_claims.remove(&claim_id).unwrap();
+        let g = self.g(claim.wg).clone();
+        for rid in claim.next.keys() {
+            if let Some(state) = self.state_mut(claim.wg, *rid) {
+                state.release_unit(&g.units[&claim.head], true);
+            }
+        }
+        Ok(true)
+    }
+
     // --------- Speculation ----------
 
     /// Which nodes could run next, after the current node's outputs land.
@@ -2726,6 +2880,12 @@ impl GraphRuntime {
                 ));
             }
         }
+        // Validate the entire batch before completing any row. A stale or
+        // repeated member must not partially route external outputs.
+        for (i, &rid) in input.rids.iter().enumerate() {
+            let (wg, node, ..) = ctxs[rid_walk_idx.map_or(0, |idx| idx[i] as usize)];
+            self.validate_unit_landing(wg, node, rid)?;
+        }
         let several_walks = ctxs.len() > 1;
         let signals: Vec<Option<Sym>> = input
             .output_signals
@@ -2832,6 +2992,7 @@ impl GraphRuntime {
             let was_speculative = state.is_in_flight(node);
             let stride = input.loop_strides.as_ref().map_or(1, |s| s[i]);
             let completed = state.complete_strided(&g, node, &out_tensors, stride);
+            self.land_unit_member(wg, node, rid);
             let mut pre_shard_edges = completed.edges;
             // A step that repeated routes a column an iteration, for the
             // edges that take items. The loop-back reads the last one only.
