@@ -134,10 +134,10 @@ def test_a_resident_step_gathers_its_rows_index_from_the_planners_slots():
     rows.resident_binding().row(7, 3, cell, None)
     cells[3 * 2 + 1] = cell[1]
     bucket = BucketKey(WALK, 2, 2)
-    rows.resident_binding().gather(SimpleNamespace(bucket=bucket, slot=0, slots=torch.tensor([3, 0])))
+    rows.resident_binding().gather(SimpleNamespace(bucket=bucket, slot=0, buffer_slot=0, slots=torch.tensor([3, 0])))
     assert rows.indices(bucket, 0).tolist() == [rows._row_of[7], TRASH_ROW]
     step = SimpleNamespace(
-        bucket=bucket, slot=0, slots=torch.tensor([0, 0]),
+        bucket=bucket, slot=0, buffer_slot=0, slots=torch.tensor([0, 0]),
         buffers=SimpleNamespace(rows=torch.tensor([3, 0])),
     )
     assert rows.iteration_rows(step).tolist() == [rows._row_of[7], TRASH_ROW]

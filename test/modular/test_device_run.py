@@ -131,7 +131,8 @@ def _runner(
             bindings={},
         )
         rows.resident_binding().bind(planner, "rows")
-        resident = SimpleNamespace(bucket=BucketKey(WALK, bs, bs), slot=0, buffers=buffers, slots=buffers.slots)
+        resident = SimpleNamespace(bucket=BucketKey(WALK, bs, bs), slot=0, buffer_slot=0,
+                                   buffers=buffers, slots=buffers.slots)
         runner.test_resource = torch.zeros(capacity + 1)
     runner.ask_run(WALK, ask or RunAsk(None if counted else "new_token", frozenset() if counted else frozenset({EOS}),
                                        False, limit, carries or {}, ("frame",), ("cond",),

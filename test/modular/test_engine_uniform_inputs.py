@@ -1390,7 +1390,9 @@ def test_streamed_engine_composes_independent_bodies_and_owner_reads(device_name
                 expected = [42, 50, 58] if full else [42, 50] if b_count == 2 else [42]
                 assert outputs.per_rid_outputs[2]["x"][0].flatten().tolist() == expected
     worker._postprocess_batch = close_member
-    pending = PendingBatch(group.members[0][0], a, "a", "a", "prefill", None, group=group)
+    trigger_schedule, trigger_batch = group.members[group.trigger]
+    pending = PendingBatch(trigger_schedule, trigger_batch, trigger_batch.node_name,
+                           trigger_batch.node_name, "prefill", None, group=group)
     with ThreadPoolExecutor(max_workers=1) as executor:
         worker._finish_step(pending, output[0], gpu_executor=executor)
     if direct:
@@ -1424,7 +1426,10 @@ def test_streamed_engine_composes_independent_bodies_and_owner_reads(device_name
 
 
 @pytest.mark.parametrize("device_name", ["cpu", "cuda"])
-@pytest.mark.parametrize("horizon", [4, 1, "eos", "error", "reserve_refuse", "metadata"])
+@pytest.mark.parametrize("horizon", [
+    4, 1, "eos", "error", "reserve_refuse", "metadata",
+    "retired", "retired_short", "retired_same", "retired_refuse", "retired_full",
+])
 def test_streamed_row_budgets_preserve_later_chunks_and_staggered_readiness(device_name, horizon, monkeypatch):
     from dataclasses import replace
 
@@ -1443,7 +1448,8 @@ def test_streamed_row_budgets_preserve_later_chunks_and_staggered_readiness(devi
         pytest.skip("CUDA staggered stream readiness")
     device = torch.device(device_name)
     early_eos = horizon == "eos"
-    producer_limit = 1 if horizon == 1 else 4
+    retired = isinstance(horizon, str) and horizon.startswith("retired")
+    producer_limit = 1 if horizon in (1, "retired_short") else 4
     eng, group, _ = _connected_engine(device=device)
     group.unit = replace(group.unit, streaming_edges=group.unit.edges)
     members = []
@@ -1457,6 +1463,18 @@ def test_streamed_row_budgets_preserve_later_chunks_and_staggered_readiness(devi
         )
         members.append((scheduled, batch))
     group.members = tuple(members)
+    if retired:
+        group.trigger = 1
+        group.finished_rids = (frozenset({2}), frozenset())
+        source = group.members[0][1]
+        source.request_ids = (1, 3)
+        source.per_request_info.pop(2)
+        source.per_request_input_tensors.pop(2)
+        prepare_source = eng._submodules["a"].submodule.prepare_inputs
+        def prepare_live(fwd_info, **kwargs):
+            assert fwd_info.request_id != 2, "retired producer has no forward state"
+            return prepare_source(fwd_info=fwd_info, **kwargs)
+        eng._submodules["a"].submodule.prepare_inputs = prepare_live
     backend = CUDAGraphBackend(device) if device_name == "cuda" else _Loop()
     stop = backend.while_runtime() if device_name == "cuda" else backend
     if device_name == "cpu":
@@ -1513,8 +1531,11 @@ def test_streamed_row_budgets_preserve_later_chunks_and_staggered_readiness(devi
         eng._submodules["b"].submodule.can_batch = can_batch
     eng._submodules["a"].device_stops["prefill"] = StopPolicy(StopKind.EOS, "token", frozenset({99}), withhold=("x",))
     leases, runs, slots, owner_counts = {}, {}, {}, {}
-    first_values = torch.tensor([21, 11, 31, 0], device=device)
-    eos_row = torch.tensor([early_eos, False, True, False], device=device)
+    source_size = 2 if retired and horizon != "retired_same" else 4
+    first_values = torch.tensor(([11, 31] + [0] * (source_size - 2)) if retired else [21, 11, 31, 0],
+                                device=device)
+    eos_row = torch.tensor(([False, True] + [False] * (source_size - 2)) if retired
+                           else [early_eos, False, True, False], device=device)
     for scheduled, batch in group.members:
         name = batch.node_name
         mgmt = eng._submodules[name]
@@ -1526,27 +1547,34 @@ def test_streamed_row_budgets_preserve_later_chunks_and_staggered_readiness(devi
         mgmt.refills["prefill"] = None
         batch.step_context.repeats = scheduled.repeats = 4 if name == "a" else 3 if horizon == "metadata" else 1
         previous = next(iter(runner._buckets.values()))
-        bucket = BucketKey("prefill", 4, 0)
+        size = source_size if name == "a" else 4
+        bucket = BucketKey("prefill", size, 0)
         runner._buckets = {bucket: previous}
         lease = leases[name] = SlotLease(0, bucket, name)
         batch.lease_slot(lease)
-        batch.step_context.set_padded_rids([2, 1, 3, -1])
+        batch.step_context.set_padded_rids(
+            [1, 3] + list(range(-1, 1 - size, -1)) if retired and name == "a" else [2, 1, 3, -1],
+        )
         slot = slots[name] = runner.slot_for(lease)
         slot.dummy_rids = [-1, -2, -3, -4]
         slot.dummy_metadata = {rid: SimpleNamespace() for rid in slot.dummy_rids}
-        slot.static_inputs = {"x": torch.zeros(4, 2, device=device)}
-        dropping = SimpleNamespace(rows=torch.tensor([1, 2, 3, 0], device=device),
-                                   slots=torch.tensor([1, 2, 3, 0], device=device))
-        state = RunState(4, "token", {99}, device, dropping=dropping, independent_rows=True)
+        slot.static_inputs = {"x": torch.zeros(size, 2, device=device)}
+        owner_rows = [2, 3] + [0] * (size - 2) if retired and name == "a" else [1, 2, 3, 0]
+        dropping = SimpleNamespace(rows=torch.tensor(owner_rows, device=device),
+                                   slots=torch.tensor(owner_rows, device=device))
+        state = RunState(size, "token", {99}, device, dropping=dropping, independent_rows=True)
         run = runs[name] = slot.run = DeviceRun(state, {}, lambda: None, 4)
-        out = torch.zeros(4, 1, device=device)
-        token = torch.ones(4, dtype=torch.long, device=device)
+        out = torch.zeros(size, 1, device=device)
+        token = torch.ones(size, dtype=torch.long, device=device)
         slot.static_outputs.row_outputs = {"x": out}
         slot.static_outputs.check_stop_buffers = {"token": token}
         run.keep({"x": out}, run.rows)
         run.keep({"token": token}, run.stops)
         run.sealed = True
         owner_counts[name] = torch.zeros(4, dtype=torch.long, device=device)
+        if name == "a" and retired:
+            ring.write("seed", [1, 3], torch.zeros(2, 2, device=device))
+            slot.row_heads = {"seed": "x"}
         if name == "b":
             from mstar.model.submodule_base import NodeInputs
 
@@ -1565,7 +1593,7 @@ def test_streamed_row_budgets_preserve_later_chunks_and_staggered_readiness(devi
             mgmt.submodule.prepare_inputs = prepare
 
         def body(name=name, state=state, run=run, dropping=dropping, out=out, token=token,
-                 slot=slot, bucket=bucket):
+                 slot=slot, bucket=bucket, lease=lease):
             state.select_rows()
             state.head()
             owner_counts[name].index_add_(0, dropping.slots, torch.ones_like(state.counts))
@@ -1573,7 +1601,7 @@ def test_streamed_row_budgets_preserve_later_chunks_and_staggered_readiness(devi
                 out.copy_((state.counts + first_values)[:, None])
                 token.copy_(torch.where(eos_row & (state.counts == 0), 99, 1))
             else:
-                target_owner.head(bucket, 0, "x", slot.static_inputs["x"])
+                target_owner.head(bucket, lease.buffer_slot, "x", slot.static_inputs["x"])
                 out.copy_(slot.static_inputs["x"].sum(dim=1))
             run.keep({"x": out}, run.rows)
             run.keep({"token": token}, run.stops)
@@ -1603,24 +1631,65 @@ def test_streamed_row_budgets_preserve_later_chunks_and_staggered_readiness(devi
         stream = streams[rid] = StreamBuffer(rid, "x", "a", FixedChunkPolicy(2))
         if rid == 2:
             stream.put_positions([0, 1])
+            if retired:
+                stream.signal_done(2)
     worker = Worker.__new__(Worker)
     worker.engine_manager = SimpleNamespace(get_engine=lambda node: eng)
     worker.streams = StreamBufferManager(SimpleNamespace(per_request_info={
-        rid: SimpleNamespace(stream_buffers={"x": stream}) for rid, stream in streams.items()
+        rid: SimpleNamespace(stream_buffers={"x": stream}, ended_streams=set()) for rid, stream in streams.items()
     }), None, [])
     worker.streams.consumer_node, worker.streams.rings = {"x": "b"}, {"x": ring}
-    if horizon == "reserve_refuse":
+    if horizon == "retired_full":
+        ring.ring_reserve("x", [1, 3], 8)
+        assert worker._reserve_group_stream(group)
+        assert group.members[0][1].ring_width == 0
+        for rid in (1, 3):
+            reservation = group.members[1][1].stream_windows[rid][0].chunk.reservation
+            assert all(not key[2] for key in reservation.decisions)
+        assert eng.exec_group(group) is None and not group.submitted
+        worker._restore_group_stream(group)
+        assert not streams[1].producer_done and not streams[3].producer_done
+        assert not any(stream._reservations for stream in streams.values())
+        assert ring.ring_room("x", 2) == 6 and ring.ring_room("x", 1) == 0
+        return
+    if horizon in ("reserve_refuse", "retired_refuse"):
         monkeypatch.setattr(streams[1], "reserve_future_window", lambda *a, **kw: None)
         assert not worker._reserve_group_stream(group)
         assert not any(stream._reservations for stream in streams.values())
-        assert ring.ring_room("x", 2) == 2 and ring.ring_room("x", 1) == 8
+        assert ring.ring_room("x", 2) == (6 if retired else 2) and ring.ring_room("x", 1) == 8
         ring.ring_release("x", 2, 2)  # the held prefix releases every cancelled future hole too
         assert ring.ring_room("x", 2) == 8
         return
-    assert worker._reserve_group_stream(group)
+    if retired:
+        source_batch = group.members[0][1]
+        looked_up = []
+        def build_live(scheduled):
+            looked_up.append(tuple(scheduled.request_to_worker_graph))
+            assert tuple(scheduled.request_to_worker_graph) == (1, 3)
+            return source_batch
+        worker._build_executing_batch = build_live
+        worker._step_repeats = None
+        worker.scheduler = SimpleNamespace(execution_units={("b", "prefill"): group.unit})
+        popped = [SimpleNamespace(
+            finished_rids=group.finished_rids[i], input_edges=scheduled.input_edges,
+            output_signals=scheduled.output_signals,
+            wg_ids=SimpleNamespace(keys=list(scheduled.request_to_worker_graph),
+                                   values=list(scheduled.request_to_worker_graph.values())),
+        ) for i, (scheduled, _) in enumerate(group.members)]
+        worker._graph_runtime = SimpleNamespace(
+            claim_execution_unit=lambda *a: (1, popped),
+            cancel_execution_unit=lambda claim: pytest.fail("valid compact claim was cancelled"),
+        )
+        for mgmt in eng._submodules.values():
+            monkeypatch.setattr(mgmt.accelerator_graph_runner, "launch_refusal", lambda walk: None)
+        group = worker._claim_group(*group.members[1])
+        assert group is not None and looked_up == [(1, 3)]
+    else:
+        assert worker._reserve_group_stream(group)
     a, b = (part[1] for part in group.members)
     bases = a.ring_bases["x"]
-    ring.ring_write("x", [2], torch.full((1, 4, 1), -777., device=device), [bases[2]])
+    if not retired:
+        ring.ring_write("x", [2], torch.full((1, 4, 1), -777., device=device), [bases[2]])
     for counts in owner_counts.values():
         counts.zero_()
     outputs = eng.exec_group(group)
@@ -1628,13 +1697,16 @@ def test_streamed_row_budgets_preserve_later_chunks_and_staggered_readiness(devi
         assert outputs is None and not group.submitted and group.refusal
         worker._restore_group_stream(group)
         assert not any(stream._reservations for stream in streams.values())
-        assert ring.ring_room("x", 2) == 2 and ring.ring_room("x", 1) == 8
+        assert ring.ring_room("x", 2) == (6 if retired else 2) and ring.ring_room("x", 1) == 8
         ring.ring_release("x", 2, 2)  # the held prefix releases every cancelled future hole too
         assert ring.ring_room("x", 2) == 8
         return
     assert outputs is not None and group.submitted, group.refusal
     if device_name == "cuda":
         backend.synchronize()
+    if retired:
+        assert ring.row("seed", 1).tolist() == [1., 1.]
+        assert ring.row("seed", 3).tolist() == [1., 1.]
     expected = [1, 1 if producer_limit == 4 else 0, 0, 0]
     assert outputs[1].check_stop_buffers[RUN_COUNTS].tolist() == expected
     assert outputs[1].check_stop_buffers[RUN_REPLAYS].tolist() == [1, 1, 1, 1]
@@ -1662,8 +1734,9 @@ def test_streamed_row_budgets_preserve_later_chunks_and_staggered_readiness(devi
     def close(part, output, **kwargs):
         completed.append((part.node_name, tuple(part.node_batch.request_ids)))
         if part.node_name == "a":
-            for rid in (2, 1, 3):
-                produced = 0 if rid == 3 or ((early_eos or horizon == "error") and rid == 2) else producer_limit
+            for rid in part.node_batch.request_ids:
+                produced = (0 if rid == 3 or ((retired or early_eos or horizon == "error") and rid == 2)
+                            else producer_limit)
                 streams[rid].put_positions(list(range(bases[rid], bases[rid] + produced)))
                 ring.ring_skip("x", rid, range(bases[rid] + produced, bases[rid] + 4))
         else:
@@ -1676,16 +1749,20 @@ def test_streamed_row_budgets_preserve_later_chunks_and_staggered_readiness(devi
             else:
                 assert 1 not in output.per_rid_outputs
     worker._postprocess_batch = close
-    pending = PendingBatch(group.members[0][0], a, "a", "a", "prefill", None, group=group)
+    trigger_schedule, trigger_batch = group.members[group.trigger]
+    pending = PendingBatch(trigger_schedule, trigger_batch, trigger_batch.node_name,
+                           trigger_batch.node_name, "prefill", None, group=group)
     with ThreadPoolExecutor(max_workers=1) as executor:
         worker._finish_step(pending, outputs[0], gpu_executor=executor)
     assert tails == ([1] if horizon == "error" else [2, 1] if producer_limit == 4 else [2])
-    source_rows = (1, 3) if horizon == "error" else (2, 1, 3)
+    source_rows = (1, 3) if horizon == "error" or retired else (2, 1, 3)
     target_rows = (1,) if horizon == "error" else (2, 1) if producer_limit == 4 else (2,)
     assert completed == [("a", source_rows), ("b", target_rows)]
-    assert [record[-1] for record in released] == ([[3]] if producer_limit == 4 else [[1, 3]])
+    assert [record[-1] for record in released] == (
+        ([[2]] if retired else []) + ([[3]] if producer_limit == 4 else [[1, 3]])
+    )
     for i, (rid, stream) in enumerate(streams.items()):
-        produced = 0 if rid == 3 or ((early_eos or horizon == "error") and rid == 2) else producer_limit
+        produced = 0 if rid == 3 or ((retired or early_eos or horizon == "error") and rid == 2) else producer_limit
         consumed = 0 if horizon == "error" and rid == 2 else expected[i] * 2
         assert stream._consumed == consumed
         assert list(stream._buffer) == list(range(consumed, (2 if rid == 2 else 0) + produced))

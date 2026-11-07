@@ -2894,20 +2894,19 @@ class Worker(RepeatingSteps):
                     request_to_worker_graph=dict(zip(part.wg_ids.keys, part.wg_ids.values, strict=True)),
                     input_edges=part.input_edges, output_signals=list(part.output_signals),
                 )
-                if part.finished_rids:
-                    if set(part.finished_rids) != set(node_batch.request_ids):
-                        self._graph_runtime.cancel_execution_unit(claim)
-                        return None  # mixed retired/live rows need per-member masking
-                    executing = ExecutingBatch(
-                        node, {}, StepContext(tuple(node_batch.request_ids), walk, 0, False),
-                    )
+                live = [rid for rid in node_batch.request_ids if rid not in part.finished_rids]
+                if not live:
+                    executing = ExecutingBatch(node, {}, StepContext((), walk, 0, False))
                 else:
                     runner = engine._submodules[node].accelerator_graph_runner
                     if runner is None or runner.launch_refusal(walk) is not None:
                         self._graph_runtime.cancel_execution_unit(claim)
                         return None
-                    executing = node_batch if i == trigger else self._build_executing_batch(scheduled)
-                if tuple(executing.request_ids) != tuple(node_batch.request_ids):
+                    # Finished members can have no forward state left. Remove
+                    # them before ordinary tensor/metadata lookup, not after prepare.
+                    executing = (node_batch if i == trigger and tuple(live) == tuple(node_batch.request_ids)
+                                 else self._build_executing_batch(scheduled._sub_batch(live)))
+                if tuple(executing.request_ids) != tuple(live):
                     self._graph_runtime.cancel_execution_unit(claim)
                     return None
                 members.append((scheduled, executing))
@@ -2932,7 +2931,7 @@ class Worker(RepeatingSteps):
         members = {batch.node_name: (scheduled, batch) for scheduled, batch in group.members}
         source_schedule, source = members[maker]
         _, target = members[consumer]
-        if not source.request_ids or tuple(target.request_ids) != tuple(source.request_ids):
+        if not target.request_ids or not set(source.request_ids) <= set(target.request_ids):
             return False
         engine = self.engine_manager.get_engine(maker)
         mgmt = engine._submodules[maker]
@@ -2942,7 +2941,7 @@ class Worker(RepeatingSteps):
             return False
         if source.ring_bases:
             raise ValueError("a connected producer already reserved its output ring")
-        for rid in source.request_ids:
+        for rid in target.request_ids:
             existing = target.stream_windows.get(rid, ())
             if len(existing) > 1 or (existing and existing[0].name != signal):
                 return False
@@ -2951,8 +2950,7 @@ class Worker(RepeatingSteps):
                 # An ordinary pop already advanced the policy and released its
                 # ring positions. Execute it before replacing its future reader.
                 return False
-        done = group.finished_rids[group.unit.nodes.index(maker)] if group.finished_rids else frozenset()
-        room = 0 if done else engine.ring_room(maker, source.request_ids)
+        room = engine.ring_room(maker, source.request_ids) if source.request_ids else 0
         if room is None:
             return False
         source.ring_width = min(source.step_context.repeats, room)
@@ -2960,9 +2958,9 @@ class Worker(RepeatingSteps):
             source_schedule.repeats = source.step_context.repeats = source.ring_width
             engine._reserve_rings(mgmt, source)
         try:
-            for rid in source.request_ids:
+            for rid in target.request_ids:
                 existing = target.stream_windows.get(rid, ())
-                positions = () if not source.ring_width else range(
+                positions = () if rid not in source.ring_bases.get(signal, {}) else range(
                     source.ring_bases[signal][rid], source.ring_bases[signal][rid] + source.ring_width,
                 )
                 retained = self.streams.reserve_connected_edge(

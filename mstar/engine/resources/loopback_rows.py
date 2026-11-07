@@ -97,8 +97,8 @@ class LoopbackRows(Resource):
         # the last eager index uploaded, by its rids: a batch reads and writes the same rows
         self._last: tuple[tuple, torch.Tensor] | None = None
         # (bucket, cg slot) -> a capture's device row of table indices, and the rids it holds
-        self._captured: dict[tuple[BucketKey, int], torch.Tensor] = {}
-        self._staged: dict[tuple[BucketKey, int], tuple] = {}
+        self._captured: dict[tuple[BucketKey, int | tuple[str, int]], torch.Tensor] = {}
+        self._staged: dict[tuple[BucketKey, int | tuple[str, int]], tuple] = {}
         self._placeholders: dict[tuple[str, int], torch.Tensor] = {}
         self._resident: ResidentPlanner | None = None
         self._resident_rows: ResidentTable | None = None
@@ -350,7 +350,7 @@ class LoopbackRows(Resource):
     def build_accelerator_graph_buffers(self, slots, max_bs: int, max_seq_len: int) -> None:
         self._max_bs = max(self._max_bs, max_bs)
 
-    def indices(self, bucket: BucketKey, slot: int) -> torch.Tensor:
+    def indices(self, bucket: BucketKey, slot: int | tuple[str, int]) -> torch.Tensor:
         """The device row of table indices a capture of ``bucket`` on ``slot`` reads."""
         found = self._captured.get((bucket, slot))
         if found is None:
@@ -363,7 +363,7 @@ class LoopbackRows(Resource):
         lease = ctx.slot_lease
         if lease is None or ctx.resident is not None:
             return  # an eager step goes by request; a resident one gathers in its graph
-        key = (lease.bucket, lease.slot)
+        key = (lease.bucket, lease.buffer_slot)
         rids = tuple(ctx.padded_request_ids)
         if self._staged.get(key) != rids:
             self._staged[key] = rids
@@ -381,14 +381,15 @@ class LoopbackRows(Resource):
     def _resident_gather(self, step: CapturedResidentStep) -> None:
         # a padding row reads the trash slot's zero, which is the trash row
         table = self._resident_rows
-        gather_column(self._resident.store, step.slots, table.stride, table.col, self.indices(step.bucket, step.slot))
+        gather_column(self._resident.store, step.slots, table.stride, table.col,
+                      self.indices(step.bucket, step.buffer_slot))
 
     def covers_head(self, name: str, target: torch.Tensor) -> bool:
         """Whether the existing row table can fill this captured input."""
         table = self._tables.get(name)
         return table is not None and target.ndim > 0 and table[0].numel() * target.shape[0] == target.numel()
 
-    def head(self, bucket: BucketKey, slot: int, name: str, target: torch.Tensor) -> bool:
+    def head(self, bucket: BucketKey, slot: int | tuple[str, int], name: str, target: torch.Tensor) -> bool:
         """In a capture, before the forward: each row's ``name`` into the
         static input ``target``. False while no table holds it (the first warm-up)."""
         if not self.covers_head(name, target):
@@ -398,7 +399,7 @@ class LoopbackRows(Resource):
         target.copy_(rows.reshape(target.shape))
         return True
 
-    def tail(self, bucket: BucketKey, slot: int, name: str, value: torch.Tensor) -> bool:
+    def tail(self, bucket: BucketKey, slot: int | tuple[str, int], name: str, value: torch.Tensor) -> bool:
         """In a capture, after the forward: each row's ``name`` from ``value``.
         False for a value of another shape than the table's."""
         table = self._table(name, value)
@@ -426,7 +427,7 @@ class LoopbackRows(Resource):
         resident gather still runs once for all resources afterwards.
         """
         table = self._resident_rows
-        indices = self.indices(step.bucket, step.slot)
+        indices = self.indices(step.bucket, step.buffer_slot)
         gather_column(self._resident.store, step.buffers.rows, table.stride, table.col, indices)
         return indices
 

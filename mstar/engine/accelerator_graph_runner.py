@@ -1531,7 +1531,8 @@ class AcceleratorGraphRunner:
             state.retire_rows()
             if window is not None:
                 self._rows.iteration_tail(
-                    walk, ask.loop, self._rows.indices(spec.bucket, spec.slot), position, active, state.marks,
+                    walk, ask.loop, self._rows.indices(spec.bucket, warmed.resident.buffer_slot),
+                    position, active, state.marks,
                 )
             return raw
 
@@ -1597,6 +1598,7 @@ class AcceleratorGraphRunner:
             )
 
             rows = self._rows
+            buffer_slot = SlotLease(spec.slot, spec.bucket, self._member).buffer_slot
             heads, tails = self._row_pairs(walk) if rows is not None else ({}, {})
             if heads and (_is_packed(config) or set(config.replay_graph_walks) - {walk}):
                 heads = {}  # one row a request, of one walk
@@ -1610,7 +1612,7 @@ class AcceleratorGraphRunner:
                 for signal, name in heads.items():
                     target = static_inputs.get(name)
                     if isinstance(target, torch.Tensor):
-                        rows.head(spec.bucket, spec.slot, signal, target)
+                        rows.head(spec.bucket, buffer_slot, signal, target)
                 out = forward(
                     graph_walk=walk,
                     engine_inputs=engine_inputs,
@@ -1621,7 +1623,7 @@ class AcceleratorGraphRunner:
                     for signal, name in tails.items():
                         value = output_named(outputs, name)
                         if value is not None:
-                            rows.tail(spec.bucket, spec.slot, signal, value)
+                            rows.tail(spec.bucket, buffer_slot, signal, value)
                 if resident is not None:
                     planner.commit_in_graph(resident)
                 return out

@@ -2530,15 +2530,26 @@ class Engine:
         runner = mgmt.accelerator_graph_runner
         slot = runner.slot_for(leases[consumer])
         source = None if maker not in leases else source_mgmt.accelerator_graph_runner.slot_for(leases[maker])
-        binding = source_batch.step_context if source is not None else batch.step_context
-        # Ring row addresses must be valid even when source entry yields before
-        # its body (and hence its resident gather), or the producer is finished.
-        ring.plan(LoopbackRowsStep(), dataclasses.replace(binding, resident=None))
-        indices = ring.indices(binding.slot_lease.bucket, binding.slot_lease.slot)
+        # Each member owns its compact layout. Finished source rows are absent
+        # from its admission, while their consumer can still drain held items.
+        target_rows = tuple(batch.request_ids)
+        source_rows = () if source is None else tuple(source_batch.request_ids)
+        if not set(source_rows) <= set(target_rows):
+            guard.refuse("every live producer needs a claimed consumer row")
+        correspondence = tuple(target_rows.index(rid) for rid in source_rows)
+        for context in ([source_batch.step_context] if source is not None else []) + [batch.step_context]:
+            ring.plan(LoopbackRowsStep(), dataclasses.replace(context, resident=None))
+        lease = batch.step_context.slot_lease
+        indices = ring.indices(lease.bucket, lease.buffer_slot)
+        source_lease = None if source is None else source_batch.step_context.slot_lease
+        source_indices = (None if source is None else
+                          ring.indices(source_lease.bucket, source_lease.buffer_slot))
         capacity = slot.run.state.counts.numel()
-        if indices.numel() != capacity or (source is not None and source.run.state.counts.numel() != capacity):
-            guard.refuse("streamed members need matching physical row capacities")
-        if capacity > 1 and (slot.run.state.active is None or (source is not None and source.run.state.active is None)):
+        source_capacity = 0 if source is None else source.run.state.counts.numel()
+        if indices.numel() != capacity or (source is not None and source_indices.numel() != source_capacity):
+            guard.refuse("streamed member addresses need their own captured row capacity")
+        if ((capacity > 1 and slot.run.state.active is None)
+                or (source_capacity > 1 and source.run.state.active is None)):
             guard.refuse("independently ready streamed rows need captured owner masks")
         if len(payload) != len(batch.request_ids):
             guard.refuse("each streamed row needs its own owner destination")
@@ -2558,7 +2569,7 @@ class Engine:
         policy = source_mgmt.device_stops.get(source_batch.graph_walk)
         withheld = policy is not None and signal in policy.withhold
         if source is not None and withheld and any(
-            policy.limits(source_batch.per_request_info_wrapped[rid]).ignore_eos for rid in batch.request_ids
+            policy.limits(source_batch.per_request_info_wrapped[rid]).ignore_eos for rid in source_rows
         ):
             guard.refuse("withheld items inside an EOS-immune run need explicit item identities")
         token = None if not withheld or source is None else output_named(source.static_outputs, policy.token_signal)
@@ -2570,24 +2581,24 @@ class Engine:
                 guard.refuse("a direct output needs its same-named unspanned captured row tensor")
         produced = (None if source is None else (source.static_outputs.row_outputs or {}).get(signal) if direct
                     else output_named(source.static_outputs, signal))
-        if source is not None and (produced is None or produced.shape != (capacity, *item.shape[1:])):
+        if source is not None and (produced is None or produced.shape != (source_capacity, *item.shape[1:])):
             guard.refuse("a streamed producer must emit one captured item per iteration")
         key = ("stream", id(slot.graph), None if source is None else id(source.graph), id(window),
                tuple((target.data_ptr(), tuple(target.shape), target.stride(), target.storage_offset())
                      for target in targets), indices.data_ptr(), item.untyped_storage().data_ptr(),
-               withheld)
+               withheld, correspondence, None if source_indices is None else source_indices.data_ptr())
         if slot.composed_graph is not None and slot.composed_key == key:
             return slot.composed_graph
         state = slot.run.state
 
         retained_token = None if source is None or not withheld else source.run.stops.get(policy.token_signal)
-        if source is not None and withheld and capacity > 1 and retained_token is None:
+        if source is not None and withheld and source_capacity > 1 and retained_token is None:
             guard.refuse("withheld streamed rows need their retained actual stop token")
 
         def eos(values):
             stopped = torch.zeros_like(source.run.state.counts, dtype=torch.bool)
             for value in policy.eos_tokens:
-                stopped.logical_or_(values.reshape(capacity) == value)
+                stopped.logical_or_(values.reshape(source_capacity) == value)
             return stopped
 
         def kept():
@@ -2595,12 +2606,24 @@ class Engine:
                         else source.run.state.active)
             return executed if not withheld else executed & ~eos(token)
 
+        def project(values):
+            if source_capacity == capacity and correspondence == tuple(range(len(target_rows))):
+                return values
+            result = torch.zeros_like(window.counts)
+            for row, target in enumerate(correspondence):
+                result[target:target + 1].copy_(values[row:row + 1])
+            return result
+
         def choose():
-            emitted = torch.zeros_like(window.counts) if source is None else source.run.state.counts
-            if source is not None and withheld:
-                last = (token if retained_token is None else
-                        retained_token.gather(1, (emitted - 1).clamp(min=0)[:, None]))
-                emitted = emitted - ((emitted > 0) & eos(last)).long()
+            if source is None:
+                emitted = torch.zeros_like(window.counts)
+            else:
+                count = source.run.state.counts
+                if withheld:
+                    last = (token if retained_token is None else
+                            retained_token.gather(1, (count - 1).clamp(min=0)[:, None]))
+                    count = count - ((count > 0) & eos(last)).long()
+                emitted = project(count)
             window.select(window.origins[:, 0] + window.origins[:, 1] + emitted,
                           window.origins[:, 2].bool(), ~state.marks)
             # A semantic empty final flush needs no compute budget. A chunk
@@ -2618,7 +2641,14 @@ class Engine:
             window.continuation.copy_((running != 0) | (window.ready != 0))
 
         def publish():
-            ring.ring_scatter(signal, indices, window.produced_positions(source.run.state.counts), produced, kept())
+            positions = window.produced_positions(project(source.run.state.counts))
+            active = kept()
+            if source_capacity == capacity and correspondence == tuple(range(len(target_rows))):
+                ring.ring_scatter(signal, source_indices, positions, produced, active)
+            else:
+                for row, target in enumerate(correspondence):
+                    ring.ring_scatter(signal, source_indices[row:row + 1], positions[target:target + 1],
+                                      produced[row:row + 1], active[row:row + 1])
 
         def gather():
             for row, target in enumerate(targets):
@@ -2655,11 +2685,12 @@ class Engine:
         guard = ConnectedInputs(bindings)
         prepared = []
         admitted = []
-        rows = tuple(group.members[0][1].request_ids)
+        rows = tuple(group.members[group.trigger][1].request_ids)
+        common_rows = rows
         member_walks = dict(zip(group.unit.nodes, group.unit.graph_walks, strict=True))
         finished = dict(zip(group.unit.nodes, group.finished_rids or [frozenset()] * len(group.members), strict=True))
         active = [(scheduled, batch) for scheduled, batch in group.members
-                  if finished[batch.node_name] != frozenset(rows)]
+                  if batch.request_ids and not set(batch.request_ids) <= finished[batch.node_name]]
         leases = {}
         slots = {}
         owners = {}
@@ -2678,11 +2709,16 @@ class Engine:
         try:
             with torch.no_grad(), guard.preparing(), ExitStack() as preparation:
                 metadata_preparation = ExitStack()
-                if not active or any(finished[batch.node_name] for _, batch in active):
-                    guard.refuse("connected member retirement needs a uniform claimed row set")
+                if not active or any(set(batch.request_ids) & finished[batch.node_name] for _, batch in active):
+                    guard.refuse("finished member rows must be removed before preparation")
                 if streamed and (len(group.members) != 2 or len(group.unit.streaming_edges) != 1
                                  or group.unit.edges != group.unit.streaming_edges):
                     guard.refuse("streamed composition needs two members and one internal edge")
+                if streamed:
+                    maker, consumer, _ = group.unit.streaming_edges[0]
+                    layouts = {batch.node_name: set(batch.request_ids) for _, batch in group.members}
+                    if not layouts[maker] <= layouts[consumer]:
+                        guard.refuse("every live producer needs a claimed consumer row")
                 for _, batch in active:
                     preparation.enter_context(guard.isolated_info(batch))
                 preparation.enter_context(metadata_preparation)
@@ -2705,7 +2741,7 @@ class Engine:
                 loop_back = group.unit.loop_back if not streamed and repeats > 1 else ()
                 direct_producers = set()
                 for maker in {a for a, _, _ in (*group.unit.edges, *loop_back)}:
-                    if finished[maker]:
+                    if not any(batch.node_name == maker for _, batch in active):
                         continue
                     producer = self._submodules[maker].submodule
                     kind = type(producer)
@@ -2721,8 +2757,11 @@ class Engine:
                             guard.refuse("a custom producer needs declared direct outputs")
                         direct_producers.add(maker)
                 for member, (_, batch) in enumerate(group.members):
-                    if finished[batch.node_name] or batch.node_name in idle_sources:
+                    if not any(batch is live for _, live in active):
                         continue
+                    rows = tuple(batch.request_ids)
+                    if not streamed and rows != common_rows:
+                        guard.refuse("fixed-count connected members need matching logical rows")
                     mgmt = self._submodules[batch.node_name]
                     runner, submodule = mgmt.accelerator_graph_runner, mgmt.submodule
                     if runner is None or batch.chunk_ranges or batch.step_context.request_walks:
@@ -2926,6 +2965,7 @@ class Engine:
                     if not streamed and batch.step_context.repeats != repeats:
                         guard.refuse("a member changed the common iteration count during admission")
                 for batch, mgmt, lease, inputs, info, incoming in prepared:
+                    rows = tuple(batch.request_ids)
                     with autocast_scope(self._autocast_dtype_for(batch.node_name), device_type=self._device.type,
                                         node_name=batch.node_name):
                         engine_inputs, values = self._plan_step(batch, mgmt, batch.request_ids, inputs, info,
@@ -3012,6 +3052,7 @@ class Engine:
                     maker, consumer, signal = group.unit.streaming_edges[0]
                     batches = {batch.node_name: batch for _, batch in group.members}
                     consumer_batch, producer_batch = batches[consumer], batches[maker]
+                    rows = tuple(consumer_batch.request_ids)
                     reservations = [next(edge.chunk.reservation for edge in consumer_batch.stream_windows[rid]
                                          if edge.name == signal) for rid in rows]
                     tables = self._submodules[consumer].submodule.iteration_tables
@@ -3028,7 +3069,10 @@ class Engine:
                     tables.stage_stream_window(
                         leases[consumer], reservations,
                         [[choice is not None for choice in stream_choices[rid]] for rid in rows],
-                        producer_limits=[producer_batch.ring_width if maker in leases else 0] * len(rows),
+                        producer_limits=[
+                            producer_batch.ring_width if maker in leases and rid in producer_batch.request_ids else 0
+                            for rid in rows
+                        ],
                     )
                 elif repeats > 1:
                     row_of = {rid: i for i, rid in enumerate(rows)}

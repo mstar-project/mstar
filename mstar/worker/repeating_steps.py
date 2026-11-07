@@ -62,8 +62,8 @@ class RepeatingSteps:
         if group.unit.streaming_edges:
             if self._step_repeats is None:
                 return
-            for i, (scheduled, executing) in enumerate(group.members):
-                if group.finished_rids and group.finished_rids[i]:
+            for scheduled, executing in group.members:
+                if not executing.request_ids:
                     continue
                 key = scheduled.node_name, scheduled.graph_walk
                 loop = self._innermost_loop_by_node.get((scheduled.graph_walk, scheduled.node_name))
