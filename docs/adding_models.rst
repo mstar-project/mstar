@@ -2530,6 +2530,35 @@ example, ``configs/qwen3tts.yaml`` selects FA2 under ``talker_attn``,
    with a message describing the migration. Move the block under ``resources:``, keyed by
    the resource name.
 
+Quantization per deployment
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A ``quantization:`` block picks a weight format per layer, for every model that declares its weights roots
+(``Model.get_quantization_roots``: the root class its loader fills, which linears may go low precision and
+which stay bf16 as a ``QuantizableLinears``, and its ``CheckpointRules``). Without the block a declared model
+serves its checkpoint as stored, so a block-fp8 checkpoint (``quant_method: fp8``) loads into fp8 layers.
+
+.. code-block:: yaml
+
+   quantization:
+     format: fp8_block            # auto (default) | bf16 | fp8_tensor | fp8_channel | fp8_block | mxfp8 | nvfp4
+     layers:                      # ordered, first match wins
+       - {match: "model.layers.0-3.**", format: bf16}
+       - {match: "model.layers.*.mlp.*", format: fp8_channel}
+     keep_bf16: [lm_head]
+     nodes:                       # per node; its rules go before the top level's
+       vision_encoder: {format: bf16}
+
+Patterns are module paths under the root (each dotted segment an ``fnmatch`` pattern or an index range, ``**``
+for any number of segments, or ``re:<regex>``). The checkpoint's format per linear is read from its safetensors
+headers, so the compressed-tensors, modelopt, AWQ, GPTQ and DeepSeek-style layouts are all recognised; one with
+no loader yet, a rule that matches nothing, a rule on a layer the model keeps bf16, or a stored format served as
+another quantized one is refused at startup with every problem listed. A default format that doesn't fit one
+layer's width keeps that layer bf16 and logs why. Tensor-parallel linears and MoE experts take a format in place,
+each rank quantizing or loading its own shard. ``python -m mstar.quantization.convert`` writes a bf16
+checkpoint's chosen linears as block fp8; ``benchmark/quantization/qa_gate.py`` and ``bench_linears.py`` are the
+quality gate and the GEMM sweep for a format.
+
 Routing across data-parallel replicas
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 

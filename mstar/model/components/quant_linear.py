@@ -105,6 +105,14 @@ class LinearFormat:
         """The fp32 ``[n, k]`` weight ``buffers`` (a checkpoint's tensors by suffix) stand for."""
         raise NotImplementedError
 
+    # whether ``glu_linear`` runs a [gate; up] weight's SwiGLU in the same call
+    has_glu: ClassVar[bool] = False
+
+    def glu_linear(self, x: torch.Tensor, *buffers: torch.Tensor | None) -> torch.Tensor:
+        """``silu(x @ gate.T) * (x @ up.T)`` for a stored ``[gate; up]`` weight (halves of its rows), ``[M, N / 2]``;
+        only where ``has_glu``."""
+        raise NotImplementedError
+
     def prepare_device(self, device: torch.device) -> None:
         """Load the format's kernels on ``device`` before any capture (once per process is enough)."""
 
@@ -484,16 +492,26 @@ class InPlaceQuant:
         else:
             self.weight_loader(param, loaded, shard_id, units=st.units)
 
-    def _quant_local(self, x: torch.Tensor, bias: torch.Tensor | None) -> torch.Tensor:
-        fmt = self.quant_format
-        rows = x.reshape(-1, x.shape[-1]).contiguous()
+    def _quant_buffers(self) -> list[torch.Tensor]:
         views = self._quant_views
         buffers = []
-        for name in fmt.buffers:
+        for name in self.quant_format.buffers:
             tensor = getattr(self, name)
             dtype = views.get(name)
             buffers.append(tensor if dtype is None or tensor.dtype == dtype else tensor.view(dtype))
-        out = fmt.linear(rows, *buffers)
+        return buffers
+
+    def quant_glu(self, x: torch.Tensor) -> torch.Tensor:
+        """The SwiGLU of this rank's ``[gate; up]`` output in one call of the format (``has_glu``); the caller
+        checks there is no bias and nothing (LoRA) bound around the GEMM."""
+        rows = x.reshape(-1, x.shape[-1]).contiguous()
+        out = self.quant_format.glu_linear(rows, *self._quant_buffers())
+        return out.reshape(*x.shape[:-1], out.shape[-1])
+
+    def _quant_local(self, x: torch.Tensor, bias: torch.Tensor | None) -> torch.Tensor:
+        fmt = self.quant_format
+        rows = x.reshape(-1, x.shape[-1]).contiguous()
+        out = fmt.linear(rows, *self._quant_buffers())
         if bias is not None:
             out = out + bias
         return out.reshape(*x.shape[:-1], out.shape[-1])

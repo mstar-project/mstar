@@ -5,7 +5,18 @@ fp8 layers' outputs track bf16's within e4m3's rounding."""
 import pytest
 import torch
 import torch.nn.functional as F
-from quant_helpers import EXPERTS, HEADS, HIDDEN, INTER, KV_HEADS, build, full_weights, load, write_checkpoint
+from quant_helpers import (
+    EXPERTS,
+    HEADS,
+    HIDDEN,
+    INTER,
+    KV_HEADS,
+    build,
+    default_dtype,
+    full_weights,
+    load,
+    write_checkpoint,
+)
 
 from mstar.model.components.quant_linear import linear_format
 from mstar.model.loader import iter_safetensors_shards, load_weights_into
@@ -222,6 +233,10 @@ def test_the_cuda_kernels_match_the_reference(name):
         gpu = fmt.linear(x, *(buffers[b] for b in fmt.buffers))
         cpu = fmt.linear(x.cpu(), *(buffers[b].cpu() for b in fmt.buffers))
         assert rel(gpu.cpu(), cpu) < 0.02, (name, m)
+        if fmt.has_glu:
+            gpu = fmt.glu_linear(x, *(buffers[b] for b in fmt.buffers))
+            cpu = fmt.glu_linear(x.cpu(), *(buffers[b].cpu() for b in fmt.buffers))
+            assert gpu.shape == (m, 256) and rel(gpu.cpu(), cpu) < 0.03, (name, m, "glu")
 
 
 def test_experts_count_matches_the_helper():
@@ -295,3 +310,30 @@ def test_a_stored_layer_runs_the_cuda_kernels(checkpoints):
         cpu = layer(x)
         gpu = layer.to("cuda")(x.cuda())
         assert rel(gpu.cpu(), cpu) < 0.02
+        assert rel(layer.quant_glu(x.cuda()).cpu(), F.silu(cpu.chunk(2, -1)[0]) * cpu.chunk(2, -1)[1]) < 0.03
+
+
+def test_a_quantized_gate_up_runs_its_swiglu_in_the_formats_epilogue(checkpoints, monkeypatch):
+    # one call of the format for GEMM + SwiGLU (block fp8's w8a16 kernel at decode), the same numbers as two steps
+    root, _ = load(checkpoints["fp8"])
+    mlp = root.layers[0].mlp
+    x = torch.randn(5, HIDDEN, dtype=torch.bfloat16)
+    calls = []
+    real = type(mlp.gate_up_proj).quant_glu
+    monkeypatch.setattr(type(mlp.gate_up_proj), "quant_glu", lambda self, h: calls.append(1) or real(self, h))
+    fused = mlp(x)
+    assert calls == [1]
+    gate, up = mlp.gate_up_proj(x).split(mlp.intermediate_size_per_partition, dim=-1)
+    assert torch.equal(fused, mlp.down_proj(F.silu(gate) * up))
+
+
+def test_a_gated_mlp_with_another_linear_kind_runs_as_before():
+    from mstar.model.components.distributed.mlp import ParallelGatedMLP
+
+    with default_dtype(torch.bfloat16):
+        mlp = ParallelGatedMLP(HIDDEN, INTER)
+    mlp.gate_up_proj = torch.nn.Linear(HIDDEN, 2 * INTER, bias=False, dtype=torch.bfloat16)
+    torch.nn.init.normal_(mlp.down_proj.weight, std=0.05)
+    x = torch.randn(3, HIDDEN, dtype=torch.bfloat16)
+    gate, up = mlp.gate_up_proj(x).chunk(2, dim=-1)
+    assert torch.equal(mlp(x), mlp.down_proj(F.silu(gate) * up))

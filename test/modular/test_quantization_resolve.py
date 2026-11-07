@@ -146,3 +146,10 @@ def test_a_checkpoint_format_without_a_loader_is_refused_by_name():
 def test_a_linear_the_model_didnt_declare_is_a_problem_not_a_silent_skip():
     plan = plan_for("fp8_block", linears=QuantizableLinears(candidates=("layers.*.mlp.*",), keep_bf16=("lm_head",)))
     assert any("neither a low-precision candidate nor kept bf16" in p for p in plan.problems)
+
+
+def test_a_rule_refused_on_many_layers_is_one_problem():
+    plan = plan_for({"layers": [{"match": "layers.*.mlp.down_proj", "format": "fp8_block"}]}, tp=4)
+    assert len(plan.problems) == 1
+    layers = "['layers.0.mlp.down_proj', 'layers.1.mlp.down_proj']"
+    assert plan.problems[0].startswith(f"node 'LLM': 2 layers (e.g. {layers}) can't run fp8_block")

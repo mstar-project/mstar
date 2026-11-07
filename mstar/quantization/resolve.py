@@ -195,6 +195,8 @@ def resolve_plan(
             )
 
     unloadable: dict[str, list[str]] = defaultdict(list)
+    # (origin, runtime, why) -> the layers a rule can't apply to, reported once per rule and reason
+    refused: dict[tuple[str, str, str], list[str]] = defaultdict(list)
     for path, (kind, module) in layers.items():
         stored, block = _stored_of(stored_by_layer.get(path, set()))
         if stored not in (BF16, MIXED) and stored not in LOADABLE:
@@ -226,7 +228,7 @@ def resolve_plan(
             problem = _runtime_problem(module, kind, runtime, stored, block, device_capability)
             if problem is not None:
                 if explicit or (origin == "format" and _always_wrong(problem)):
-                    plan.problems.append(f"{where}: {path!r} can't run {runtime} ({origin}): {problem}")
+                    refused[(origin, runtime, problem)].append(path)
                     continue
                 plan.notes.append(f"{path}: stays bf16 ({origin} {runtime}: {problem})")
                 runtime = BF16
@@ -249,6 +251,9 @@ def resolve_plan(
             continue
         plan.layers[path] = LayerPlan(path, kind, stored, runtime, action, origin, block)
 
+    for (origin, runtime, problem), paths in refused.items():
+        what = repr(paths[0]) if len(paths) == 1 else f"{len(paths)} layers (e.g. {paths[:2]})"
+        plan.problems.append(f"{where}: {what} can't run {runtime} ({origin}): {problem}")
     for fmt, paths in sorted(unloadable.items()):
         plan.problems.append(
             f"{where}: the checkpoint stores {len(paths)} layer(s) as {fmt} (e.g. {paths[:2]}); this build has "

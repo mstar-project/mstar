@@ -236,6 +236,7 @@ def fused_experts_fp8(
     activation: str = "silu",
     reduce_results: bool = True,
     swiglu_limit: float | None = None,
+    skip_invalid: bool = False,
 ) -> torch.Tensor:
     """Grouped-GEMM MoE dispatch for block-scaled FP8 experts (W8A8).
 
@@ -265,8 +266,9 @@ def fused_experts_fp8(
         ``(block_n, block_k)`` weight scale blocks.  ``block_k`` doubles as
         the activation quant group and the kernel's ``BLOCK_SIZE_K``, so
         both GEMM contraction dims must be multiples of it.
-    activation, reduce_results
-        As in :func:`fused_experts`.
+    activation, reduce_results, skip_invalid
+        As in :func:`fused_experts`: with ``skip_invalid``, slots routed to the sentinel id ``num_experts``
+        (padding rows, another rank's experts) run no GEMM and add nothing.
 
     Returns
     -------
@@ -276,7 +278,7 @@ def fused_experts_fp8(
     """
     return torch.ops.mstar.fused_experts_fp8(
         hidden_states, w1_fp8, w2_fp8, w1_scale_inv, w2_scale_inv, topk_weights, topk_ids,
-        list(block_size), activation, reduce_results, swiglu_limit,
+        list(block_size), activation, reduce_results, swiglu_limit, skip_invalid,
     )
 
 
@@ -295,16 +297,17 @@ def _fused_experts_fp8_op(
     activation: str,
     reduce_results: bool,
     swiglu_limit: float | None,
+    skip_invalid: bool = False,
 ) -> torch.Tensor:
     return _fused_experts_fp8_impl(
         hidden_states, w1_fp8, w2_fp8, w1_scale_inv, w2_scale_inv, topk_weights, topk_ids,
-        tuple(block_size), activation, reduce_results, swiglu_limit,
+        tuple(block_size), activation, reduce_results, swiglu_limit, skip_invalid,
     )
 
 
 @_fused_experts_fp8_op.register_fake
 def _(hidden_states, w1_fp8, w2_fp8, w1_scale_inv, w2_scale_inv, topk_weights, topk_ids,
-      block_size, activation, reduce_results, swiglu_limit):
+      block_size, activation, reduce_results, swiglu_limit, skip_invalid=False):
     if reduce_results:
         return torch.empty_like(hidden_states)
     tokens, hidden = hidden_states.shape
@@ -323,6 +326,7 @@ def _fused_experts_fp8_impl(
     activation: str,
     reduce_results: bool,
     swiglu_limit: float | None,
+    skip_invalid: bool = False,
 ) -> torch.Tensor:
     assert hidden_states.is_contiguous(), "hidden_states must be contiguous"
     assert hidden_states.dim() == 2
@@ -387,7 +391,8 @@ def _fused_experts_fp8_impl(
         device=hidden_states.device,
         dtype=hidden_states.dtype,
     )
-    cache3 = torch.empty(
+    # Skipped slots are never written by the down GEMM, so they must start at zero.
+    cache3 = (torch.zeros if skip_invalid else torch.empty)(
         (num_tokens, top_k, hidden),
         device=hidden_states.device,
         dtype=hidden_states.dtype,

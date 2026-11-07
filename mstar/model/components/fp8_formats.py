@@ -160,14 +160,28 @@ class Fp8BlockFormat(_Fp8Format):
 
             dense_fp8.reserve(device)
 
+    has_glu = True
+
     def linear(self, x, weight, weight_scale_inv):
+        return self._run(x, weight, weight_scale_inv, glu=False)
+
+    def glu_linear(self, x, weight, weight_scale_inv):
+        # dense_fp8's w8a16 kernel applies SwiGLU in its epilogue; its larger-M paths run the GEMM then one
+        # act-and-mul, as a separate SwiGLU would
+        return self._run(x, weight, weight_scale_inv, glu=True)
+
+    def _run(self, x, weight, weight_scale_inv, glu: bool):
         scale = weight_scale_inv.view(_F32)
         if not x.is_cuda:
             w = dequantize_fp8_block_weight(_e4m3(weight), scale, self.block, out_dtype=x.dtype)
-            return F.linear(x, w)
+            y = F.linear(x, w)
+            if glu:
+                gate, up = y.chunk(2, dim=-1)
+                y = F.silu(gate) * up
+            return y
         from mstar.utils import dense_fp8
 
-        return dense_fp8.linear(x, weight, scale, self.block)
+        return dense_fp8.linear(x, weight, scale, self.block, glu)
 
 
 FP8_TENSOR = register_format(Fp8TensorFormat())
