@@ -1340,8 +1340,10 @@ def _parse_timestamped(text: str) -> tuple[str | None, list[dict], list[str], bo
     tail = text[cursor:]
     (buffer if start is not None else parts).append(tail)
     if start is not None and "".join(buffer).strip():
-        # an open segment at the end of the stream: keep its text, no end
-        parts.append("".join(buffer).strip())
+        # The window owner supplies the end if no later decode replaces this tail.
+        tail_text = "".join(buffer).strip()
+        parts.append(tail_text)
+        segments.append({"start": start, "end": None, "text": tail_text})
     return language, segments, parts, start is not None
 
 
@@ -1397,7 +1399,7 @@ class Qwen3ASRAdapter(OpenAIAdapter):
     def parse_transcript(self, text: str, req: TranscriptionRequest) -> Transcript:
         raw = text.strip()
         if ASR_TEXT_TAG not in raw:
-            return Transcript(text=raw, language=req.language)
+            return Transcript(text=self.final_text(raw), language=req.language)
         meta, body = raw.split(ASR_TEXT_TAG, 1)
         language = None
         for line in meta.splitlines():
@@ -1407,7 +1409,7 @@ class Qwen3ASRAdapter(OpenAIAdapter):
                 break
         if language and language.lower() == "none":
             language = None
-        return Transcript(text=body.strip(), language=req.language or _qwen3_language_code(language))
+        return Transcript(text=self.final_text(body.strip()), language=req.language or _qwen3_language_code(language))
 
 
 def _qwen3_language_code(name: str | None) -> str | None:

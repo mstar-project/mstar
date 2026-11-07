@@ -429,12 +429,13 @@ def _carry_over(texts: list[str]) -> str:
 def _closed(t: Transcript) -> Transcript:
     """``t`` without its unfinished last segment, whose audio the next window
     hears again from the last closed segment's end."""
-    end = t.segments[-1]["end"]
+    segments = [s for s in t.segments if s["end"] is not None]
+    end = segments[-1]["end"] if segments else 0.0
     return Transcript(
-        text=" ".join(s["text"].strip() for s in t.segments if s["text"].strip()),
+        text=" ".join(s["text"].strip() for s in segments if s["text"].strip()),
         language=t.language,
-        segments=list(t.segments),
-        words=[w for w in t.words if w["end"] <= end + 1e-6],
+        segments=segments,
+        words=[w for w in t.words if w["end"] is not None and w["end"] <= end + 1e-6],
     )
 
 
@@ -450,7 +451,7 @@ async def _tail(adapter, req, planner: WindowPlanner, window: Window) -> Window 
     parsed = adapter.parse_transcript(window.raw_text, req)
     if not (parsed.unfinished and parsed.segments):
         return None
-    end = parsed.segments[-1]["end"]
+    end = next((s["end"] for s in reversed(parsed.segments) if s["end"] is not None), 0.0)
     if not MIN_SEEK_SECONDS <= end <= window.duration - MIN_REDECODE_SECONDS:
         return None
     window.transcript = _closed(parsed)
@@ -487,7 +488,7 @@ async def _sequential(api, adapter, req, planner: WindowPlanner, inflight: set[s
                 break
         consumed = window.duration
         if seeks and parsed.unfinished and parsed.segments:
-            end = parsed.segments[-1]["end"]
+            end = next((s["end"] for s in reversed(parsed.segments) if s["end"] is not None), 0.0)
             if MIN_SEEK_SECONDS <= end < window.duration:
                 consumed = end
                 parsed = _closed(parsed)
@@ -524,14 +525,14 @@ def merge_windows(windows: list[Window], adapter, req) -> Transcript:
             segments.append({
                 **seg,
                 "start": min(max(seg["start"], 0.0), end) + window.offset,
-                "end": min(max(seg["end"], seg["start"], 0.0), end) + window.offset,
+                "end": min(max(seg["end"] if seg["end"] is not None else end, seg["start"], 0.0), end) + window.offset,
                 "temperature": window.temperature, "compression_ratio": window.compression_ratio,
             })
         for word in t.words:
             words.append({
                 **word,
                 "start": min(max(word["start"], 0.0), end) + window.offset,
-                "end": min(max(word["end"], word["start"], 0.0), end) + window.offset,
+                "end": min(max(word["end"] if word["end"] is not None else end, word["start"], 0.0), end) + window.offset,
             })
         language = language or t.language
     for idx, seg in enumerate(segments):
@@ -779,14 +780,14 @@ async def _stream(api, adapter, req, planner: WindowPlanner, mode: str, raw_requ
                             yield sse({"type": "transcript.text.delta", "delta": " "})
                             gap = False
                         yield sse({"type": "transcript.text.delta", "delta": delta})
-                tail = decoder.flush()
-                if tail:
-                    raw += tail
-                    delta, emitted = _stream_delta(adapter.stream_text(raw), emitted)
-                    if delta:
-                        if gap:
-                            yield sse({"type": "transcript.text.delta", "delta": " "})
-                        yield sse({"type": "transcript.text.delta", "delta": delta})
+                raw += decoder.flush()
+                # A language/control prefix may have held all the text back.
+                # At EOF the final parse can distinguish it from spoken words.
+                delta, emitted = _stream_delta(adapter.parse_transcript(raw, window_req).text, emitted)
+                if delta:
+                    if gap:
+                        yield sse({"type": "transcript.text.delta", "delta": " "})
+                    yield sse({"type": "transcript.text.delta", "delta": delta})
                 inflight.discard(window.request_id)
                 window.raw_text = raw
                 # as merge_windows, which joins only the windows with text

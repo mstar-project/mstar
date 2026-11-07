@@ -182,7 +182,14 @@ def test_whisper_parse_plain_text_and_forced_language():
 def test_whisper_parse_keeps_text_of_an_unterminated_segment():
     req = TranscriptionRequest()
     t = adapters.WhisperAdapter().parse_transcript("<|en|><|0.00|> cut off", req)
-    assert t.text == "cut off" and t.segments == []
+    assert t.text == "cut off"
+    assert t.segments == [{"start": 0.0, "end": None, "text": "cut off", "id": 0}]
+    merged = serving_transcriptions.merge_windows(
+        [serving_transcriptions.Window(path="a", offset=0.0, duration=2.0, raw_text="<|0.00|> cut off")],
+        adapters.WhisperAdapter(), req,
+    )
+    assert merged.segments[0]["text"] == "cut off"
+    assert merged.segments[0]["end"] == 2.0
 
 
 def test_whisper_stream_text_hides_control_tokens():
@@ -940,3 +947,27 @@ def test_window_timestamps_cannot_overlap_the_next_window():
     t = serving_transcriptions.merge_windows([window], adapter, req)
     assert t.segments[0]["start"] == 7.0
     assert t.segments[0]["end"] == 14.0
+
+
+def test_qwen_short_language_prefix_is_flushed_in_stream(client_and_stub):
+    client, stub = client_and_stub
+    stub.model_name = "qwen3_asr"
+    stub.queued_chunks = [_text("language", " is interesting")]
+    response = _post(client, {"model": "qwen3_asr", "stream": "true", "long_form": "parallel"})
+    events = [json.loads(line[6:]) for line in response.text.splitlines()
+              if line.startswith("data: ") and line != "data: [DONE]"]
+    assert "".join(e["delta"] for e in events if e["type"] == "transcript.text.delta") == "language is interesting"
+    assert events[-1]["text"] == "language is interesting"
+
+
+@pytest.mark.parametrize("prefix", ["", "language English<asr_text>"])
+def test_qwen_repetition_is_removed_before_captions_and_realtime(prefix):
+    req = TranscriptionRequest()
+    adapter = adapters.Qwen3ASRAdapter()
+    raw = prefix + "hello " * 30
+    parsed = adapter.parse_transcript(raw, req)
+    assert parsed.text == adapter.final_text(("hello " * 30).strip())
+    merged = serving_transcriptions.merge_windows(
+        [serving_transcriptions.Window(path="a", offset=0.0, duration=2.0, raw_text=raw)], adapter, req,
+    )
+    assert merged.segments[0]["text"] == merged.text
