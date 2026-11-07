@@ -1867,7 +1867,8 @@ def test_stream_parent_replaces_one_complete_unit_while_its_sibling_runs(monkeyp
     from test_device_run import _Loop
 
     from mstar.engine.connected_inputs import ConnectedInputs
-    from mstar.engine.device_run import DeviceRun, RunState
+    from mstar.engine.device_run import RUN_COUNTS, DeviceRun, RunState
+    from mstar.engine.engine import RunLayout
     from mstar.engine.resources.iteration_tables import IterationTables
     from mstar.engine.resources.loopback_rows import LoopbackRows
     from mstar.engine.resources.run_rows import RunRows, RunRowsSnapshot
@@ -1877,6 +1878,7 @@ def test_stream_parent_replaces_one_complete_unit_while_its_sibling_runs(monkeyp
 
     device = torch.device("cpu")
     eng, group, _ = _connected_engine(device=device)
+    eng._run_layouts = dict.fromkeys(("a", "b"), RunLayout(("a", "b"), 6))
     group.unit = replace(group.unit, streaming_edges=group.unit.edges)
     backend = _Loop()
     backend.graph_pool_handle = lambda: None
@@ -1898,6 +1900,7 @@ def test_stream_parent_replaces_one_complete_unit_while_its_sibling_runs(monkeyp
     leases, slots, states = {}, {}, {}
     for member, name in enumerate(("a", "b")):
         mgmt = eng._submodules[name]
+        mgmt.run_columns["prefill"] = frozenset({"x"})
         runner = mgmt.accelerator_graph_runner
         runner._graph_backend = backend
         bucket = BucketKey("prefill", 2, 0)
@@ -1932,7 +1935,7 @@ def test_stream_parent_replaces_one_complete_unit_while_its_sibling_runs(monkeyp
             run.keep({"token": token}, run.stops)
             backend.stop(state, token, None)
         slot.graph = capture(body)
-    tables = IterationTables(device)
+    tables = eng._submodules["b"].submodule.iteration_tables = IterationTables(device)
     reservations, sources = [], []
     for rid, count in ((1, 2), (2, 5), (3, 3)):
         ring.ring_reserve("x", [rid], count)
@@ -1957,7 +1960,7 @@ def test_stream_parent_replaces_one_complete_unit_while_its_sibling_runs(monkeyp
         retire(completed)
         owner.acknowledge(owner.control.tolist())
         if len(descriptors) == 2 and 0 in owner.available_rows(2):
-            descriptor = owner.reserve_row(3, 1, 0, (3, 0, 3, 3, 0, 1))
+            descriptor = owner.reserve_row(3, 1, 0, (3, 0, 4, 3, 0, 1))
             descriptors.append(descriptor)
             owner.publish_row(descriptor)
     snapshot.retire = replace_completed
@@ -1974,4 +1977,107 @@ def test_stream_parent_replaces_one_complete_unit_while_its_sibling_runs(monkeyp
     assert slots["b"].run.rows["x"][1, 0, 0].item() == 23
     assert window.bank.counts.tolist() == [0, 1, 1, 1]
     assert ring.ring_read("x", 3, [0, 1]).flatten().tolist() == [31., 32.]
+    # Restore old and replacement receipts after both physical views were
+    # retired. Producer tails still receive their requested four columns.
+    for name, batch in ((batch.node_name, batch) for _, batch in group.members):
+        raw_stops, raw_rows, raw_spans = slots[name].run.results(6)
+        raw = BatchedModelOutput(check_stop_buffers=raw_stops, row_outputs=raw_rows, output_spans=raw_spans)
+        identities = states[name].descriptors.tolist()
+        batch.request_ids = [3]
+        batch.run_rows = {3: descriptors[-1]}
+        batch.step_context.repeats = 4 if name == "a" else 1
+        if name == "b":
+            from mstar.engine.resources.iteration_tables import STREAM_COUNTS
+            batch.stream_windows = {3: [object()]}
+            eng.restore_group_run_outputs(batch, [(raw, [[0] * 6] * 2)])
+            assert batch.outputs.check_stop_buffers[RUN_COUNTS].tolist() == [0]
+            assert batch.outputs.check_stop_buffers[STREAM_COUNTS].tolist() == [1]
+        eng.restore_group_run_outputs(batch, [(raw, identities)])
+        assert batch.step_context.run_counts is None, "restoration must not rewind owners before their tail"
+        assert batch.outputs.row_request_ids == (3,)
+        assert batch.outputs.row_outputs["x"].flatten().tolist() == ([31., 32., 33., 33.] if name == "a" else [63.])
     assert all(owner.release(descriptor) for descriptor in descriptors)
+
+
+@pytest.mark.parametrize("tail_failure", [False, True])
+def test_live_unit_closes_all_claims_before_releasing_its_original_parent(tail_failure):
+    from concurrent.futures import ThreadPoolExecutor
+
+    from mstar.engine.device_run import RUN_COUNTS, RUN_DESCRIPTORS
+    from mstar.engine.engine import Engine, RunLayout
+    from mstar.engine.resources.run_rows import RunRows, RunRowsSnapshot
+    from mstar.model.submodule_base import BatchedModelOutput
+    from mstar.worker.worker import Worker
+
+    owner = RunRows(torch.device("cpu"), 2, 8, 6)
+    first = owner.reserve_row(1, 1, 0, (1, 0, 4, 4, 0, 1))
+    sibling = owner.reserve_row(2, 1, 1, (2, 0, 4, 5, 0, 1))
+    owner.publish_row(first)
+    owner.publish_row(sibling)
+    snapshot = RunRowsSnapshot(owner, 2)
+    snapshot.accept()
+    snapshot.retire(torch.tensor([True, False]))
+    owner.acknowledge(owner.control.tolist())
+    late = owner.reserve_row(3, 1, 0, (3, 0, 4, 6, 0, 1))
+    owner.publish_row(late)
+    snapshot.accept()
+    ids = {"a": [[first.handle, late.handle, late.handle], [sibling.handle, sibling.handle, 0]],
+           "b": [[first.handle, late.handle, 0], [sibling.handle, 0, 0]]}
+    engine = Engine.__new__(Engine)
+    engine._run_layouts = dict.fromkeys(("a", "b"), RunLayout(("a", "b"), 4))
+    engine._submodules = {node: SimpleNamespace(run_columns={"walk": frozenset({"x"})}) for node in ids}
+    held = {(node, index) for node, indices in (("a", (1, 2, 3)), ("b", (4, 5, 6))) for index in indices}
+    events = []
+    def make_group(rows):
+        members = []
+        for node in ("a", "b"):
+            def unpin(slots, node=node):
+                for index in slots:
+                    held.remove((node, index))
+            batch = SimpleNamespace(node_name=node, graph_walk="walk", request_ids=list(rows), run_rows=dict(rows),
+                                    stream_windows={}, step_context=SimpleNamespace(
+                                        run_counts=None, repeats=4 if node == "a" else 1,
+                                        resident=SimpleNamespace(unpin=unpin)),
+                                    outputs=BatchedModelOutput(
+                                        check_stop_buffers={RUN_DESCRIPTORS: torch.tensor(ids[node])},
+                                        row_outputs={"x": torch.ones(2, 3, 1)},
+                                    ))
+            members.append((None, batch))
+        group = SimpleNamespace(members=members, parts=[object()], trigger=0)
+        return SimpleNamespace(group=group, node_name="a", node_batch=members[0][1], joined=[])
+    active = make_group({1: first, 2: sibling})
+    active.joined = [make_group({3: late})]
+    engine.run_membership = lambda batch: owner
+    def settle(batch, width, actual):
+        assert batch.step_context.run_counts is None
+        batch.step_context.run_counts = actual
+        events.append((batch.node_name, tuple(actual.items())))
+    engine.settle_run = settle
+    def release(group):
+        assert group is active.group and held, "borrowed receipts do not release physical padding"
+        assert all(batch.request_ids == [1, 2] for _, batch in group.members)
+        events.append("release")
+    engine.release_group = release
+    worker = Worker.__new__(Worker)
+    worker.engine_manager = SimpleNamespace(get_engine=lambda node: engine)
+    worker.device_capability = SimpleNamespace(is_accelerator=False)
+    worker._wait_for_step = lambda step: None
+    def finish(receipt, executor):
+        for _, batch in receipt.group.members:
+            assert batch.step_context.run_counts is None, "producer tail precedes its actual-count rewind"
+            actual = dict(zip(batch.request_ids, batch.outputs.check_stop_buffers[RUN_COUNTS].tolist(), strict=True))
+            settle(batch, max(actual.values()), actual)
+            batch.request_ids = []  # logical failure/drain must not shrink the physical lease
+            if tail_failure:
+                raise ValueError("unexpected tail failure")
+    worker._finish_group = finish
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        if tail_failure:
+            with pytest.raises(ValueError, match="tail failure"):
+                worker._finish_live_run(active, executor)
+        else:
+            worker._finish_live_run(active, executor)
+    assert events == [("a", ((1, 1), (2, 2))), ("b", ((1, 1), (2, 1))),
+                      ("a", ((3, 2),)), ("b", ((3, 1),)), "release"]
+    assert not held and owner.idle and active.group.parts == []
+    assert all(not batch.run_rows for receipt in (active, *active.joined) for _, batch in receipt.group.members)

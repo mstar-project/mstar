@@ -8,6 +8,7 @@ are the ones that need the worker's runtime, engine and streams, kept out of
 """
 from __future__ import annotations
 
+import copy
 import time
 from collections import Counter
 from collections.abc import Callable, Collection, Mapping, Sequence
@@ -544,11 +545,29 @@ class RepeatingSteps:
             raise ValueError("a live run has no captured membership owner")
         receipts = (active, *active.joined)
         self._wait_for_step(active)
-        raw = active.node_batch.outputs
-        identities = raw.check_stop_buffers[RUN_DESCRIPTORS].cpu().tolist()
-        counts = Counter(handle for ids in identities for handle in ids if handle)
-        descriptors = {row.handle: row for receipt in receipts for row in receipt.node_batch.run_rows.values()}
-        if counts.keys() - descriptors.keys():
+        def members(receipt):
+            return ([batch for _, batch in receipt.group.members] if receipt.group is not None
+                    else [receipt.node_batch])
+
+        physical = {batch.node_name: (batch.outputs,
+                    batch.outputs.check_stop_buffers[RUN_DESCRIPTORS].cpu().tolist())
+                    for batch in members(active) if batch.run_rows}
+        counts = {node: Counter(handle for ids in identities for handle in ids if handle)
+                  for node, (_, identities) in physical.items()}
+        if active.group is not None:
+            # The original parent retains its physical lease sizes even when
+            # logical failure/zero-row handling narrows the first receipt.
+            logical = copy.copy(active)
+            logical.group = copy.copy(active.group)
+            logical.group.members = tuple((scheduled, copy.copy(batch)) for scheduled, batch in active.group.members)
+            for _, batch in logical.group.members:
+                batch.step_context = copy.copy(batch.step_context)
+                batch.request_ids = list(batch.request_ids)
+            logical.node_batch = logical.group.members[logical.group.trigger][1]
+            receipts = (logical, *active.joined)
+        claims = [(batch, dict(batch.run_rows)) for receipt in receipts for batch in members(receipt) if batch.run_rows]
+        descriptors = {row.handle: row for _, rows in claims for row in rows.values()}
+        if any(set(actual) - descriptors.keys() for actual in counts.values()):
             raise ValueError("a captured output has no attached logical receipt")
         stream = membership.publication_stream
         with torch.cuda.stream(stream) if stream is not None else nullcontext():
@@ -561,10 +580,21 @@ class RepeatingSteps:
             # Settle every owner before invoking any model tail or graph route;
             # a failure in the first tail must not leave later H reservations.
             for receipt in receipts:
-                batch = receipt.node_batch
-                actual = {rid: counts[row.handle] for rid, row in batch.run_rows.items()}
-                engine.settle_run(batch, max(actual.values(), default=0), actual)
+                if receipt.group is None:
+                    batch = receipt.node_batch
+                    actual = {rid: counts[batch.node_name][row.handle] for rid, row in batch.run_rows.items()}
+                    engine.settle_run(batch, max(actual.values(), default=0), actual)
             for receipt in receipts:
+                if receipt.group is not None:
+                    def restore(receipt=receipt):
+                        for batch in members(receipt):
+                            if batch.run_rows:
+                                engine.restore_group_run_outputs(batch, [physical[batch.node_name]])
+                    gpu_executor.submit(restore).result()
+                    # The existing closure preserves producer-tail/rewind
+                    # order and zero-compute semantic consumer transitions.
+                    self._finish_group(receipt, gpu_executor)
+                    continue
                 batch = receipt.node_batch
                 actual = batch.step_context.run_counts
                 zero = [rid for rid in batch.request_ids if not actual[rid]]
@@ -578,7 +608,7 @@ class RepeatingSteps:
 
                 def collect(part=part):
                     batch = part.node_batch
-                    output = engine.collect_run_outputs(batch, [(raw, identities)])
+                    output = engine.collect_run_outputs(batch, [physical[batch.node_name]])
                     batch.outputs = output
                     self._stage_host_rows(output, part.lane)
                     if self.device_capability.is_accelerator:
@@ -601,12 +631,22 @@ class RepeatingSteps:
             def release():
                 if self.device_capability.is_accelerator:
                     torch.accelerator.current_stream(self.device).synchronize()
-                engine.finish_run_outputs(active.node_batch, BatchedModelOutput())
-                for receipt in receipts:
-                    batch = receipt.node_batch
-                    for descriptor in batch.run_rows.values():
-                        if not membership.release(descriptor):
-                            raise ValueError("a closed run still has a live descriptor reader")
+                for batch, rows in claims:
+                    if batch.step_context.run_counts is None:
+                        # An unexpected earlier tail failure must not strand
+                        # reservations belonging to later logical members.
+                        actual = {rid: counts[batch.node_name][row.handle] for rid, row in rows.items()}
+                        engine.settle_run(batch, max(actual.values(), default=0), actual)
+                if active.group is None:
+                    engine.finish_run_outputs(active.node_batch, BatchedModelOutput())
+                else:
+                    engine.release_group(active.group)
+                    active.group.parts.clear()
+                for descriptor in descriptors.values():
+                    if not membership.release(descriptor):
+                        raise ValueError("a closed run still has a live descriptor reader")
+                for batch, rows in claims:
+                    for descriptor in rows.values():
                         engine.release_run_row(batch, descriptor)
                     batch.run_rows.clear()
             gpu_executor.submit(release).result()

@@ -3388,6 +3388,31 @@ class Engine:
         batch.per_request_input_tensors, batch.per_request_input_metadata = tensors, metadata
         batch.per_request_info_wrapped = infos
 
+    def restore_group_run_outputs(
+        self, batch: ExecutingBatch,
+        records: Sequence[tuple[BatchedModelOutput, Sequence[Sequence[int]]]],
+    ) -> None:
+        """Restore a logical member before its existing graph-order closure.
+
+        Keep requested producer width until its ordinary tail finishes; even a
+        zero-compute consumer still owns its retained semantic policy receipt.
+        No resource is settled and no physical capture is released here.
+        """
+        ctx = batch.step_context
+        descriptors = [batch.run_rows[rid] for rid in batch.request_ids]
+        columns = self.run_columns(batch.node_name, batch.graph_walk)
+        raw, _ = self._run_outputs(records, [row.handle for row in descriptors], ctx.repeats, columns)
+        if batch.stream_windows:
+            layout = self._run_layouts[batch.node_name]
+            slots = [layout.resident(batch.node_name, row) for row in descriptors]
+            owner = self._submodules[batch.node_name].submodule.iteration_tables
+            raw.check_stop_buffers.update(owner.stream_results(ctx.slot_lease, slots))
+        raw.row_request_ids = tuple(batch.request_ids)
+        if raw.output_spans:
+            raw.span_request_ids = raw.row_request_ids
+        raw.run_columns = columns
+        batch.outputs = raw
+
     def collect_group_outputs(self, batch: ExecutingBatch, width: int, counts: Mapping[int, int]):
         """Close one independently executed member after its actual count lands.
 

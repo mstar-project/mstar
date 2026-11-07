@@ -322,6 +322,14 @@ class IterationTables(Resource):
         self._stream_windows[key] = window
         return window
 
+    def stream_results(self, lease: SlotLease, slots: Sequence[int]) -> dict[str, torch.Tensor]:
+        """Completed semantic receipts from pinned owners, not recycled physical rows."""
+        bank = self._stream_windows[lease.bucket, lease.buffer_slot].bank
+        if not slots or any(type(slot) is not int or not 0 < slot < len(bank.counts) for slot in slots):
+            raise ValueError("stream collection needs retained owner slots")
+        return {name: torch.cat([value[slot:slot + 1] for slot in slots])
+                for name, value in ((STREAM_COUNTS, bank.counts), (STREAM_TRANSITION, bank.history))}
+
     def stage_stream_window(
         self, lease: SlotLease, slots: Sequence[int], reservations: Sequence[StreamReservation],
         computes: Sequence[Sequence[bool]], *, source_rows: Sequence[int] = (),
