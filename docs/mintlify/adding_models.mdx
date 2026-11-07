@@ -1089,6 +1089,7 @@ A `quantization:` block picks a weight format per layer, for every model that de
 ```yaml
 quantization:
   format: fp8_block            # auto (default) | bf16 | fp8_tensor | fp8_channel | fp8_block | mxfp8 | nvfp4
+                               # | mxfp4 | w4a16
   layers:                      # ordered, first match wins
     - {match: "model.layers.0-3.**", format: bf16}
     - {match: "model.layers.*.mlp.*", format: fp8_channel}
@@ -1098,6 +1099,8 @@ quantization:
 ```
 
 Patterns are module paths under the root (each dotted segment an `fnmatch` pattern or an index range, `**` for any number of segments, or `re:<regex>`). The checkpoint's format per linear is read from its safetensors headers, so the compressed-tensors, modelopt, AWQ, GPTQ and DeepSeek-style layouts are all recognised; one with no loader yet, a rule that matches nothing, a rule on a layer the model keeps bf16, or a stored format served as another quantized one is refused at startup with every problem listed. A default format that doesn't fit one layer's width keeps that layer bf16 and logs why. Tensor-parallel linears and MoE experts take a format in place, each rank quantizing or loading its own shard. `python -m mstar.quantization.convert` writes a bf16 checkpoint's chosen linears as block fp8; `benchmark/quantization/qa_gate.py` and `bench_linears.py` are the quality gate and the GEMM sweep for a format.
+
+4-bit checkpoints load as stored, in compressed-tensors' layout: `pack-quantized` int4 (symmetric or with zero points, any group), AutoAWQ and GPTQ (repacked to it as they stream in; a GPTQ act-order checkpoint is refused), `mxfp4-pack-quantized` (Kimi K3's routed experts) and modelopt NVFP4 (`nvidia/*-NVFP4`; its GEMM needs compute capability 10.0, so `auto` refuses it elsewhere and `format: bf16` dequantizes it instead). `w4a16` and `mxfp4` run a Triton GEMM that dequantizes each weight tile to bf16 in registers (Ampere and later; both can also quantize a bf16 checkpoint at load); MoE routed experts take every 4-bit format, through a Triton grouped GEMM on H100/H200 and FlashInfer's TRT-LLM FP4 MoE (MXFP4, NVFP4) on B200/B300. `bench_experts.py` times the experts' formats against the bf16 fused MoE.
 
 ### Routing across data-parallel replicas {#routing-across-data-parallel-replicas}
 
