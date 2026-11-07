@@ -153,6 +153,8 @@ def flatten_messages(
                         raise ValueError("input_audio must contain base64 data and a format string")
                 elif ptype != "text":
                     raise ValueError(f"unsupported message content type {ptype!r}")
+                if role == "system" and ptype != "text":
+                    raise ValueError("system messages support text content only")
                 if ptype == "text":
                     if part.get("text"):
                         add_text(part["text"], role)

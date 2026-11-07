@@ -525,7 +525,9 @@ def merge_windows(windows: list[Window], adapter, req) -> Transcript:
             segments.append({
                 **seg,
                 "start": min(max(seg["start"], 0.0), end) + window.offset,
-                "end": min(max(seg["end"] if seg["end"] is not None else end, seg["start"], 0.0), end) + window.offset,
+                "end": min(max(
+                    seg["end"] if seg["end"] is not None else (window.duration or seg["start"]), seg["start"], 0.0,
+                ), end) + window.offset,
                 "temperature": window.temperature, "compression_ratio": window.compression_ratio,
             })
         for word in t.words:
@@ -533,7 +535,7 @@ def merge_windows(windows: list[Window], adapter, req) -> Transcript:
                 **word,
                 "start": min(max(word["start"], 0.0), end) + window.offset,
                 "end": min(max(
-                    word["end"] if word["end"] is not None else end, word["start"], 0.0,
+                    word["end"] if word["end"] is not None else (window.duration or word["start"]), word["start"], 0.0,
                 ), end) + window.offset,
             })
         language = language or t.language

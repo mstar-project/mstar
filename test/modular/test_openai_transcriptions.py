@@ -985,3 +985,11 @@ def test_transcription_error_after_text_stays_in_band(client_and_stub):
     assert events[0]["type"] == "transcript.text.delta"
     assert events[-1]["error"]["message"] == "later failure"
     assert not list(stub.upload_dir.iterdir())
+
+
+def test_open_timestamp_without_known_duration_stays_finite():
+    window = serving_transcriptions.Window(path="", offset=0, duration=0,
+        raw_text="<|2.00|>unfinished")
+    transcript = serving_transcriptions.merge_windows([window], adapters.WhisperAdapter(), TranscriptionRequest())
+    assert transcript.segments[0]["start"] == transcript.segments[0]["end"] == 2.0
+    json.dumps(transcript.segments, allow_nan=False)

@@ -2925,7 +2925,7 @@ class Worker:
                 "OOM on node=%s walk=%s: no offload possible, holding %s of %d "
                 "requests so the retry is smaller (%d earlier holds not logged)",
                 batch.node_name, batch.graph_walk,
-                blamed if len(shed) == 1 else f"all {len(shed)}",
+                len(shed),
                 len(batch_ids), unlogged,
             )
 

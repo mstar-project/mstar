@@ -120,6 +120,9 @@ pub fn flatten_messages(
                 None => return Err("message content parts must be objects".into()),
             };
             let ptype = obj.get("type").and_then(Value::as_str).unwrap_or("");
+            if role == "system" && ptype != "text" {
+                return Err("system messages support text content only".into());
+            }
             match ptype {
                 "text" => {
                     let text = obj.get("text").and_then(Value::as_str)
@@ -1108,6 +1111,16 @@ mod tests {
             ],
             "the reply's image did not land in the next user turn"
         );
+    }
+
+    #[test]
+    fn system_media_is_refused_before_persisting() {
+        for role in ["system", "developer"] {
+            let dir = UploadDir::new();
+            let input = format!(r#"[{{"role":"{role}","content":[{{"type":"image_url","image_url":{{"url":"{IMAGE_A}"}}}}]}}]"#);
+            assert!(flatten(&input, &dir.0).unwrap_err().contains("system messages support text"));
+            assert!(!dir.0.exists());
+        }
     }
 
     #[test]

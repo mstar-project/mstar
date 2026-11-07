@@ -340,3 +340,12 @@ def test_malformed_chat_parts_are_client_errors(tmp_path, part):
 def test_omni_speech_requires_nonempty_input(tmp_path):
     with pytest.raises(ValueError, match="input"):
         adapters.Qwen3OmniAdapter().speech_to_request(SpeechRequest(model="qwen3_omni", input=""), tmp_path)
+
+
+@pytest.mark.parametrize("role", ["system", "developer"])
+def test_system_media_is_refused_before_becoming_a_user_attachment(tmp_path, role):
+    with pytest.raises(ValueError, match="system.*text"):
+        adapters.flatten_messages([{"role": role, "content": [
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,YQ=="}},
+        ]}], tmp_path)
+    assert not list(tmp_path.iterdir())
