@@ -2158,16 +2158,20 @@ def test_late_unit_admission_stages_private_owners_before_one_complete_publicati
         assert committed_resources == ["a", "b"], "failure cleanup never fabricates a resource rewind"
 
 
-def test_stream_parent_replaces_one_complete_unit_while_its_sibling_runs(monkeypatch):
+@pytest.mark.parametrize("device_name", ["cpu", "cuda"])
+def test_stream_parent_replaces_one_complete_unit_while_its_sibling_runs(device_name, monkeypatch):
     """The production parent lowers one publication into both captured bodies.
 
-    Host publication is injected at a completed CPU boundary; CUDA concurrency
-    and worker claim ownership remain separate acceptance gates.
+    The CUDA case publishes only after observing real retirement while the
+    sibling keeps the same parent alive; worker claim admission is tested above.
     """
+    from contextlib import nullcontext
     from dataclasses import replace
 
     from test_device_run import _Loop
 
+    from mstar.engine.accelerator_graph_backend import CUDAGraphBackend
+    from mstar.engine.accelerator_graph_runner import capture_into_graph
     from mstar.engine.connected_inputs import ConnectedInputs
     from mstar.engine.device_run import RUN_COUNTS, DeviceRun, RunState
     from mstar.engine.engine import RunLayout
@@ -2178,22 +2182,34 @@ def test_stream_parent_replaces_one_complete_unit_while_its_sibling_runs(monkeyp
     from mstar.streaming.chunk_policy import FixedChunkPolicy
     from mstar.streaming.stream_buffer import StreamBuffer
 
-    device = torch.device("cpu")
+    if device_name == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA connected-unit membership")
+    device = torch.device(device_name)
+    width = 12 if device_name == "cuda" else 6
+    sibling_count = width - 1
     eng, group, _ = _connected_engine(device=device)
-    eng._run_layouts = dict.fromkeys(("a", "b"), RunLayout(("a", "b"), 6))
+    eng._run_layouts = dict.fromkeys(("a", "b"), RunLayout(("a", "b"), width))
     group.unit = replace(group.unit, streaming_edges=group.unit.edges)
-    backend = _Loop()
-    backend.graph_pool_handle = lambda: None
+    backend = CUDAGraphBackend(device) if device_name == "cuda" else _Loop()
+    runtime = backend.while_runtime() if device_name == "cuda" else backend
+    raw_stream = backend.raw_stream if device_name == "cuda" else lambda: None
     def capture(fn):
-        return SimpleNamespace(replay=fn)
-    monkeypatch.setattr("mstar.engine.accelerator_graph_runner.capture_into_graph",
-                        lambda fn, *a, **kw: (capture(fn), None))
+        if device_name == "cpu":
+            return SimpleNamespace(replay=fn)
+        return capture_into_graph(fn, backend.graph_pool_handle(), device, None, keep_graph=True)[0]
+    if device_name == "cpu":
+        backend.graph_pool_handle = lambda: None
+        monkeypatch.setattr("mstar.engine.accelerator_graph_runner.capture_into_graph",
+                            lambda fn, *a, **kw: (capture(fn), None))
     owner = RunRows(device, 2, 8, 6)
+    def publish(descriptor):
+        with torch.cuda.stream(owner.publication_stream) if device_name == "cuda" else nullcontext():
+            owner.publish_row(descriptor)
     ring = LoopbackRows(device, capacity=3)
     for rid in (1, 2, 3):
         ring.add(rid)
-    ring.ask_ring("x", 8)
-    ring.ring_table("x", torch.zeros(2, 1))
+    ring.ask_ring("x", 16)
+    ring.ring_table("x", torch.zeros(2, 1, device=device))
     eng._submodules["a"].loopback_rows = ring
     eng._submodules["a"].device_stops["prefill"] = StopPolicy(
         StopKind.EOS, "token", frozenset({99}), withhold=("x",),
@@ -2211,23 +2227,26 @@ def test_stream_parent_replaces_one_complete_unit_while_its_sibling_runs(monkeyp
         previous = next(iter(runner._buckets.values()))
         runner._buckets = {bucket: previous}
         slot = slots[name] = previous.slots[0]
-        slot.static_inputs = {"x": torch.zeros(2, 2, 1)}
-        out, token = torch.zeros(2, 1), torch.zeros(2, dtype=torch.long)
+        slot.static_inputs = {"x": torch.zeros(2, 2, 1, device=device)}
+        out, token = torch.zeros(2, 1, device=device), torch.zeros(2, dtype=torch.long, device=device)
         slot.static_outputs = BatchedModelOutput(row_outputs={"x": out}, check_stop_buffers={"token": token})
-        dropping = SimpleNamespace(rows=torch.zeros(2, dtype=torch.long), slots=torch.zeros(2, dtype=torch.long))
+        dropping = SimpleNamespace(rows=torch.zeros(2, dtype=torch.long, device=device),
+                                   slots=torch.zeros(2, dtype=torch.long, device=device))
         state = states[name] = RunState(2, "token", {99}, device, dropping=dropping,
                                         membership=RunRowsSnapshot(owner, 2), member=member,
-                                        width=6, independent_rows=True)
-        run = slot.run = DeviceRun(state, {}, lambda: None, 6)
+                                        width=width, independent_rows=True)
+        run = slot.run = DeviceRun(state, {}, lambda: None, width)
         run.keep({"x": out}, run.rows)
         run.keep({"token": token}, run.stops)
         run.sealed = True
         state.stage(2, [False, False], 2 if name == "a" else 1)
-        run.entry = capture(lambda state=state: backend.start(state, None))
+        run.entry = capture(lambda state=state: runtime.start(state, raw_stream()))
         def body(name=name, state=state, run=run, out=out, token=token, slot=slot):
             state.select_rows()
             state.head()
             if name == "a":
+                if device_name == "cuda":
+                    torch.cuda._sleep(25_000_000)
                 out.copy_((state.dropping.slots * 10 + state.counts + 1)[:, None])
                 token.copy_(torch.where((state.dropping.slots == 3) & (state.counts == 2), 99, 1))
             else:
@@ -2235,27 +2254,27 @@ def test_stream_parent_replaces_one_complete_unit_while_its_sibling_runs(monkeyp
                 token.fill_(1)
             run.keep({"x": out}, run.rows)
             run.keep({"token": token}, run.stops)
-            backend.stop(state, token, None)
+            runtime.stop(state, token, raw_stream())
         slot.graph = capture(body)
     tables = eng._submodules["b"].submodule.iteration_tables = IterationTables(device)
     reservations, sources = [], []
-    for rid, count in ((1, 2), (2, 5), (3, 3)):
+    for rid, count in ((1, 2), (2, sibling_count), (3, 3)):
         ring.ring_reserve("x", [rid], count)
         source = StreamBuffer(rid, "x", "a", FixedChunkPolicy(2))
         reservations.append(source.reserve_future_window(list(range(count)), 1).reservation)
         sources.append(source)
     window = tables.prepare_stream_window(
         leases["b"], max(len(r.decisions) for r in reservations),
-        max(len(r.transitions) for r in reservations), 5, rows=states["b"].dropping.rows, slots=4,
+        max(len(r.transitions) for r in reservations), sibling_count, rows=states["b"].dropping.rows, slots=4,
     )
-    for rid, slot, reservation, count in zip((1, 2, 3), (2, 1, 3), reservations, (2, 5, 3), strict=True):
+    for rid, slot, reservation, count in zip((1, 2, 3), (2, 1, 3), reservations, (2, sibling_count, 3), strict=True):
         tables.stage_stream_window(leases["b"], [slot], [reservation],
                                    [[True] * len(reservation.transitions)],
                                    source_rows=ring.retained_rows([rid]), producer_limits=[count])
     descriptors = [owner.reserve_row(1, 1, 0, (2, 0, 2, 2, 0, 1)),
-                   owner.reserve_row(2, 1, 1, (1, 0, 5, 1, 0, 1))]
+                   owner.reserve_row(2, 1, 1, (1, 0, sibling_count, 1, 0, 1))]
     for descriptor in descriptors:
-        owner.publish_row(descriptor)
+        publish(descriptor)
     snapshot = states["b"].snapshot
     retire = snapshot.retire
     def replace_completed(completed):
@@ -2264,17 +2283,41 @@ def test_stream_parent_replaces_one_complete_unit_while_its_sibling_runs(monkeyp
         if len(descriptors) == 2 and 0 in owner.available_rows(2):
             descriptor = owner.reserve_row(3, 1, 0, (3, 0, 4, 3, 0, 1))
             descriptors.append(descriptor)
-            owner.publish_row(descriptor)
-    snapshot.retire = replace_completed
+            publish(descriptor)
+    if device_name == "cpu":
+        snapshot.retire = replace_completed
     target = slots["b"].static_inputs["x"]
     payload = ("x", None, [(target[row], target[row]) for row in range(2)])
     graph = eng._compose_stream(group, leases, window, payload, ConnectedInputs({}))
-    graph.replay()
+    if device_name == "cuda":
+        import time
+
+        owner.publication_stream.synchronize()
+        ended = torch.cuda.Event()
+        graph.replay()
+        ended.record()
+        try:
+            deadline = time.monotonic() + 5
+            while 0 not in owner.available_rows(2):
+                assert not ended.query(), "parent ended before retirement could be observed"
+                assert time.monotonic() < deadline, "no physical row retired"
+                time.sleep(0.001)
+            descriptor = owner.reserve_row(3, 1, 0, (3, 0, 4, 3, 0, 1))
+            descriptors.append(descriptor)
+            publish(descriptor)
+            assert not ended.query(), "publication waited until the parent ended"
+        finally:
+            backend.synchronize()
+        owner.acknowledge(owner.control.tolist())
+    else:
+        graph.replay()
     first, sibling, replacement = (descriptor.handle for descriptor in descriptors)
-    assert states["a"].descriptors.tolist() == [[first, first, replacement, replacement, replacement, 0],
-                                                [sibling] * 5 + [0]]
-    assert states["b"].descriptors.tolist() == [[first, replacement, 0, 0, 0, 0],
-                                                [sibling, 0, 0, 0, 0, 0]]
+    producer_ids = states["a"].descriptors.tolist()
+    consumer_ids = states["b"].descriptors.tolist()
+    assert [identity for identity in producer_ids[0] if identity] == [first] * 2 + [replacement] * 3
+    assert producer_ids[1] == [sibling] * sibling_count + [0]
+    assert [identity for identity in consumer_ids[0] if identity] == [first, replacement]
+    assert consumer_ids[1] == [sibling] + [0] * (width - 1)
     assert slots["b"].run.rows["x"][0, :2, 0].tolist() == [43., 63.]
     assert slots["b"].run.rows["x"][1, 0, 0].item() == 23
     assert window.bank.counts.tolist() == [0, 1, 1, 1]
@@ -2282,7 +2325,7 @@ def test_stream_parent_replaces_one_complete_unit_while_its_sibling_runs(monkeyp
     # Restore old and replacement receipts after both physical views were
     # retired. Producer tails still receive their requested four columns.
     for name, batch in ((batch.node_name, batch) for _, batch in group.members):
-        raw_stops, raw_rows, raw_spans = slots[name].run.results(6)
+        raw_stops, raw_rows, raw_spans = slots[name].run.results(width)
         raw = BatchedModelOutput(check_stop_buffers=raw_stops, row_outputs=raw_rows, output_spans=raw_spans)
         identities = states[name].descriptors.tolist()
         batch.request_ids = [3]
@@ -2291,7 +2334,7 @@ def test_stream_parent_replaces_one_complete_unit_while_its_sibling_runs(monkeyp
         if name == "b":
             from mstar.engine.resources.iteration_tables import STREAM_COUNTS
             batch.stream_windows = {3: [object()]}
-            eng.restore_group_run_outputs(batch, [(raw, [[0] * 6] * 2)])
+            eng.restore_group_run_outputs(batch, [(raw, [[0] * width] * 2)])
             assert batch.outputs.check_stop_buffers[RUN_COUNTS].tolist() == [0]
             assert batch.outputs.check_stop_buffers[STREAM_COUNTS].tolist() == [1]
         eng.restore_group_run_outputs(batch, [(raw, identities)])
