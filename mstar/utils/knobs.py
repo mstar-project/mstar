@@ -19,6 +19,7 @@ KNOBS: dict[str, str] = {
     "kv_pinned_indptrs": "MSTAR_KV_PINNED_INDPTRS",
     "gc_gen0_threshold": "MSTAR_GC_GEN0_THRESHOLD",
     "pre_plan": "MSTAR_PRE_PLAN_SPEC",
+    "uclamp_min": "MSTAR_UCLAMP_MIN",
     "step_thread_core": "MSTAR_STEP_THREAD_CORE",
     "compile_deterministic": "MSTAR_COMPILE_DETERMINISTIC",
     "idle_hold": "MSTAR_IDLE_HOLD",
@@ -51,6 +52,8 @@ def check(settings: Mapping[str, object] | None) -> dict[str, str]:
             out[key] = _idle_hold_value(value)
         elif key == "resident_planning":
             out[key] = _resident_planning_value(value)
+        elif key == "uclamp_min":
+            out[key] = str(_uclamp_min_value(value))
         elif isinstance(value, bool):
             out[key] = "1" if value else "0"
         elif isinstance(value, int):
@@ -60,6 +63,20 @@ def check(settings: Mapping[str, object] | None) -> dict[str, str]:
                 f"`knobs: {key}` must be a bool or an integer, got {value!r}"
             )
     return out
+
+
+def _uclamp_min_value(value: object) -> int:
+    # yaml reads a bare ``off`` as False; True is no floor anyone meant
+    if isinstance(value, bool):
+        floor = 0 if value is False else -1
+    else:
+        try:
+            floor = int(str(value).strip())
+        except ValueError:
+            floor = -1
+    if not 0 <= floor <= 1024:
+        raise ValueError(f"`knobs: uclamp_min` must be 0 to 1024, got {value!r}")
+    return floor
 
 
 def _resident_planning_value(value: object) -> str:
@@ -200,6 +217,14 @@ def gc_gen0_threshold() -> int:
     c=128 (8% shorter decode step) for at most that many young objects held
     between collections."""
     return max(0, int(_setting("gc_gen0_threshold", "0")))
+
+
+def uclamp_min() -> int:
+    """``uclamp_min`` / ``MSTAR_UCLAMP_MIN`` (default 0, off): the clock the threads
+    of a worker and of the API server ask for whenever they run, of 1024
+    (``threads.hold_clock_from_knob``). A ``schedutil`` governor otherwise keeps
+    threads that take turns near its lowest clock."""
+    return _uclamp_min_value(_setting("uclamp_min", "0"))
 
 
 def pre_plan_enabled() -> bool:
