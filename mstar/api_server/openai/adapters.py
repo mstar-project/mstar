@@ -489,6 +489,8 @@ class Qwen3OmniAdapter(OpenAIAdapter):
     def speech_to_request(self, req: SpeechRequest, upload_dir: Path) -> SubmitArgs:  # noqa: ARG002
         # Qwen3-Omni is a chat model; /v1/audio/speech returns the audio of its
         # spoken response to ``input`` (the handler keeps only the audio).
+        if not req.input.strip():
+            raise ValueError("input must be non-empty")
         mk = _passthrough(req)
         if getattr(req, "voice", None) is not None:
             mk["voice"] = req.voice

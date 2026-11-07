@@ -83,3 +83,13 @@ def test_a_two_turn_chat_renders_as_its_template_renders_its_messages(env, rende
     text, _, in_mods, parts = flatten_messages(CHAT, tmp_path)
     ours, template = render(os.environ[env], text, in_mods, parts)
     assert ours == template, "the chat reached the template as one user message, its turns glued together"
+
+
+@pytest.mark.parametrize("voice", [5, "unknown", ""])
+def test_omni_rejects_unknown_voice_before_preprocessing(voice):
+    from types import SimpleNamespace
+    from mstar.model.qwen3_omni.qwen3_omni_model import Qwen3OmniModel
+    model = Qwen3OmniModel.__new__(Qwen3OmniModel)
+    model.config = SimpleNamespace(talker=SimpleNamespace(speaker_id={"ethan": 1}))
+    with pytest.raises(ValueError, match="voice"):
+        model.process_prompt("hi", ["text"], ["text", "audio"], voice=voice)

@@ -335,3 +335,8 @@ def test_malformed_chat_parts_are_client_errors(tmp_path, part):
     from mstar.api_server.openai.adapters import flatten_messages
     with pytest.raises(ValueError):
         flatten_messages([{"role": "user", "content": [part]}], tmp_path)
+
+
+def test_omni_speech_requires_nonempty_input(tmp_path):
+    with pytest.raises(ValueError, match="input"):
+        adapters.Qwen3OmniAdapter().speech_to_request(SpeechRequest(model="qwen3_omni", input=""), tmp_path)

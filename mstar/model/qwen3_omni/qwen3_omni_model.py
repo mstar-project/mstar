@@ -1260,6 +1260,11 @@ class Qwen3OmniModel(Model):
         expanded token IDs, plus the per-modality tensor outputs needed by
         the Thinker's prefill walks.
         """
+        if "audio" in output_modalities and kwargs.get("voice") is not None:
+            voice = kwargs["voice"]
+            speakers = self.config.talker.speaker_id or {}
+            if not isinstance(voice, str) or voice.lower() not in speakers:
+                raise ValueError(f"voice must be one of {sorted(speakers)}")
         result: NameToTensorList = {}
 
         attached = tensors is not None
