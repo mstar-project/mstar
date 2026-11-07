@@ -289,7 +289,7 @@ impl ExecutionUnit {
                             ancestor = loops[parent as usize].parent;
                         }
                         node.outputs.iter().all(|edge| match edge.dest {
-                            Dest::Local(dest) => members.contains(&dest),
+                            Dest::Local(dest) => !edge.streaming && members.contains(&dest),
                             Dest::External(_) => false,
                             Dest::Empty | Dest::EmitToClient => !edge.streaming,
                         })

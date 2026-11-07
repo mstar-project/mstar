@@ -2046,6 +2046,7 @@ class AcceleratorGraphRunner:
         self, parts: Sequence[RunPart], repeats: int = 1,
         columns: Sequence[Collection[str]] = (), *, capacity: int | None = None,
         boundary: Sequence[tuple[torch.Tensor, torch.Tensor]] = (),
+        initial: Sequence[tuple[torch.Tensor, torch.Tensor]] = (),
     ) -> list[BatchedModelOutput]:
         """Replay a whole connected unit, retaining each member before the next.
 
@@ -2082,7 +2083,10 @@ class AcceleratorGraphRunner:
                 member_columns.append((column, target, len(needs)))
                 needs.append((column, (column.shape[0], capacity, *column.shape[2:])))
             staged.append(member_columns)
-        snapshots = []
+        snapshots, seeds = [], []
+        for source, target in initial:
+            seeds.append((source, target, len(needs)))
+            needs.append((source, tuple(source.shape)))
         for source, target in boundary:
             if source.numel() != target.numel():
                 raise ValueError("a connected boundary changes the number of elements")
@@ -2106,6 +2110,10 @@ class AcceleratorGraphRunner:
         for member_columns in staged:
             for source, _, index in member_columns:
                 storage[index][:, :repeats].copy_(source[:, :repeats], non_blocking=True)
+        for source, _, index in seeds:
+            storage[index].copy_(source, non_blocking=True)
+        for _, target, index in seeds:
+            target.copy_(storage[index].reshape(target.shape), non_blocking=True)
         ops: list[AcceleratorGraphSlot | tuple[torch.Tensor, torch.Tensor]] = []
         for iteration in range(repeats):
             if iteration:

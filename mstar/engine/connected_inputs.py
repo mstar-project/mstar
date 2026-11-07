@@ -109,6 +109,13 @@ class ConnectedInputs(FakeTensorMode):
         if self.contains(value):
             self.refuse(f"future values escaped into {where}")
 
+    def rebind(self, key: Any, source: torch.Tensor) -> None:
+        """A certified seed is replaced by the same-shaped captured carry."""
+        old = self.bindings[key]
+        if old.shape != source.shape or old.dtype != source.dtype or old.device != source.device:
+            self.refuse("a Loop carry disagrees with its first iteration's seed")
+        self.bindings[key] = source
+
     def copies(
         self, value: torch.Tensor, target: torch.Tensor, expected: tuple[Any, ...],
         keys: Collection[Any] | None = None,

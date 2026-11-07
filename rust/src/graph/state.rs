@@ -615,7 +615,7 @@ impl RequestState {
         out: &mut Vec<RoutedEdge>, stride: u32,
     ) {
         let lspec = g.lp(lid);
-        self.cache_outputs(g, lid, edges_from, out);
+        self.cache_outputs(g, lid, edges_from, out, stride);
 
         {
             let st = &mut self.loops[lid as usize];
@@ -643,7 +643,7 @@ impl RequestState {
     /// extend across iterations.
     fn cache_outputs(
         &mut self, g: &CompiledGraph, lid: LoopId, from: usize,
-        out: &[RoutedEdge],
+        out: &[RoutedEdge], stride: u32,
     ) {
         let lspec = g.lp(lid);
         let mut seen: Vec<Sym> = Vec::new();
@@ -653,20 +653,25 @@ impl RequestState {
             }
             seen.push(e.name);
             let st = &mut self.loops[lid as usize];
-            let bucket = if lspec.output_names.contains(&e.name) {
+            let final_only = lspec.output_names.contains(&e.name);
+            let bucket = if final_only {
                 &mut st.cached
             } else if lspec.accum_names.contains(&e.name) {
                 &mut st.accum
             } else {
                 continue;
             };
+            // A strided completion carries one item per replay. The Loop's
+            // ordinary output is the final iteration, while accumulated and
+            // per-iteration fanouts keep the whole column.
+            let tensors = if final_only && stride > 1 && e.tensors.len() > 1 {
+                &e.tensors[e.tensors.len() - 1..]
+            } else { &e.tensors[..] };
             match bucket.iter_mut().find(|(n, _)| *n == e.name) {
-                Some((_, v)) => v.extend_from_slice(&e.tensors),
-                None => bucket.push((e.name, e.tensors.clone())),
+                Some((_, v)) => v.extend_from_slice(tensors),
+                None => bucket.push((e.name, tensors.to_vec())),
             }
-            // `maybe_cache_output` holds each cached tensor until the loop
-            // hands it on (finish) or drops it (advance / clear).
-            self.refs_taken.extend(e.tensors.iter().map(|t| t.uuid));
+            self.refs_taken.extend(tensors.iter().map(|t| t.uuid));
         }
     }
 

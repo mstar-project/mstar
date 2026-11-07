@@ -346,6 +346,8 @@ def _refuse_counter_read(node_name: str, ctx: StepContext, reads: Collection[str
     once, so a value they derive from the loop counter would hold for every
     replay; an iteration's value belongs in ``ITERATION_INPUTS``."""
     if ctx.repeats > 1 and LOOP_COUNTER in reads:
+        if guard := active_guard():
+            guard.refuse(f"{stage} reads a Loop counter that later iterations do not renew")
         # the step's rows fail, not the worker: a branch only a real row takes can land here
         raise ValueError(
             f"{node_name}/{ctx.graph_walk}: a repeating step's {stage} read "
@@ -640,6 +642,7 @@ class ExecutionGroup:
     refusal: str | None = None
     parts: list[RunPart] = field(default_factory=list)
     initial_copies: list[tuple[torch.Tensor, torch.Tensor]] = field(default_factory=list)
+    capacity: int = 1
 
 
 class Engine:
@@ -2344,13 +2347,38 @@ class Engine:
         leases = {}
         slots = {}
         owners = {}
+        back_keys, boundary_fields = set(), []
+        boundary = []
         try:
             with torch.no_grad(), guard.preparing():
+                repeats = group.members[0][1].step_context.repeats
+                if any(batch.step_context.repeats != repeats for _, batch in group.members):
+                    guard.refuse("members requested different iteration counts")
+                if repeats > 1 and group.unit.loop_name is None:
+                    guard.refuse("the graph did not certify a complete connected Loop")
+                if repeats > 1 and any(
+                    len(batch.per_request_input_tensors.get(rid, {}).get(signal, ())) != 1
+                    for _, batch in group.members for _, consumer, signal in group.unit.loop_back
+                    if consumer == batch.node_name for rid in rows
+                ):
+                    repeats = 1  # the first ordinary iteration produces an empty seed
+                    for _, batch in group.members:
+                        batch.step_context.repeats = 1
+                loop_back = group.unit.loop_back if repeats > 1 else ()
+                for maker in {a for a, _, _ in (*group.unit.edges, *loop_back)}:
+                    producer = self._submodules[maker].submodule
+                    kind = type(producer)
+                    walk = group.members[0][1].graph_walk
+                    if (kind.postprocess is not NodeSubmodule.postprocess
+                            or kind.batch_postprocess is not NodeSubmodule.batch_postprocess
+                            or kind.filter_batched_output is not NodeSubmodule.filter_batched_output
+                            or kind.unpack_packed_outputs is not NodeSubmodule.unpack_packed_outputs
+                            or producer.spanned_outputs(walk) or producer.get_stop_policies(walk) is None):
+                        guard.refuse("a producer changes its routed outputs outside capture")
                 for member, (_, batch) in enumerate(group.members):
                     mgmt = self._submodules[batch.node_name]
                     runner, submodule = mgmt.accelerator_graph_runner, mgmt.submodule
-                    if (runner is None or batch.chunk_ranges or batch.step_context.request_walks
-                            or batch.step_context.repeats != 1):
+                    if runner is None or batch.chunk_ranges or batch.step_context.request_walks:
                         guard.refuse("a member has no whole capture or has chunked/mixed rows")
                     if batch.graph_walk in self._keyed_walks.get(batch.node_name, ()) or mgmt.rings:
                         guard.refuse("a member prepares cached prefixes or stream windows")
@@ -2358,25 +2386,27 @@ class Engine:
                     tensors = {rid: dict(batch.per_request_input_tensors.get(rid, {})) for rid in rows}
                     for maker, signal in incoming:
                         maker_mgmt = self._submodules[maker]
-                        maker_type = type(maker_mgmt.submodule)
                         maker_slot = maker_mgmt.accelerator_graph_runner.slot_for(leases[maker])
-                        if (maker_type.postprocess is not NodeSubmodule.postprocess
-                                or maker_type.batch_postprocess is not NodeSubmodule.batch_postprocess
-                                or maker_type.filter_batched_output is not NodeSubmodule.filter_batched_output
-                                or maker_type.unpack_packed_outputs is not NodeSubmodule.unpack_packed_outputs
-                                or maker_slot.static_outputs.per_rid_outputs
-                                or maker_mgmt.submodule.spanned_outputs(batch.graph_walk)
-                                or maker_mgmt.submodule.get_stop_policies(batch.graph_walk) is None):
+                        if maker_slot.static_outputs.per_rid_outputs:
                             guard.refuse("a producer changes its routed outputs outside capture")
                         output = maker_mgmt.submodule.repeat_carry(batch.graph_walk, {signal})[signal].output
                         source = (maker_slot.static_outputs.row_outputs or {}).get(output)
                         if source is None or source.ndim == 0 or source.shape[0] < len(rows):
                             guard.refuse(f"{maker}/{signal} has no captured row output")
                         for i, rid in enumerate(rows):
-                            key = maker, signal, rid
+                            key = maker, batch.node_name, signal, rid
                             # Ordinary collect gives the consumer split(1)
                             # views, retaining the row axis.
                             bindings[key] = source[i:i + 1]
+                            tensors[rid][signal] = [guard.unknown(key)]
+                    for maker, consumer, signal in loop_back:
+                        if consumer != batch.node_name:
+                            continue
+                        incoming.append((maker, signal))
+                        for rid in rows:
+                            key = maker, consumer, signal, rid
+                            bindings[key] = tensors[rid][signal][0]
+                            back_keys.add(key)
                             tensors[rid][signal] = [guard.unknown(key)]
                     batch.per_request_input_tensors = tensors
                     with autocast_scope(self._autocast_dtype_for(batch.node_name), device_type=self._device.type,
@@ -2404,9 +2434,11 @@ class Engine:
                     slots.setdefault(mgmt.slot_rotation, lease.slot)
                     leases[batch.node_name] = lease
                     slot = runner.slot_for(lease)
-                    if member + 1 < len(group.members):
+                    if member + 1 < len(group.members) or repeats > 1:
                         policies = submodule.get_stop_policies(batch.graph_walk)
-                        if policies is None or policies:
+                        if (policies is None or (repeats > 1 and not set(policies) <= {group.unit.loop_name})
+                                or (policies and (member + 1 < len(group.members)
+                                                  or any(p.reads_token for p in policies.values())))):
                             guard.refuse("a member can end its Loop before later members execute")
                     if lease.bucket.graph_walk in runner._generator_walks:
                         guard.refuse("a composed member draws from a torch generator")
@@ -2418,9 +2450,12 @@ class Engine:
                     batch.step_context.unit_member = member
                     inputs, info = self._pad_batch(batch, mgmt, lease)
                     prepared.append((batch, mgmt, lease, inputs, info, incoming))
-                    batch.step = self._declare_step(batch, batch.step_context.padded_request_ids, inputs,
-                                                    submodule, batch.step_context, batch.step)
+                    with watch_table_reads() as reads:
+                        batch.step = self._declare_step(batch, batch.step_context.padded_request_ids, inputs,
+                                                        submodule, batch.step_context, batch.step)
+                    _refuse_counter_read(batch.node_name, batch.step_context, reads, "declare_step")
                     if batch.step is not None:
+                        batch.step.set_ctx(batch.step_context)
                         guard.require_real(batch.step.steps, "resource declarations")
                         for resource_step in batch.step.steps.values():
                             if getattr(resource_step, "pre_forks", ()) or getattr(resource_step, "post_forks", ()):
@@ -2439,6 +2474,17 @@ class Engine:
                         resource_step = None if batch.step is None else batch.step.get(key)
                         if why := resource.connected_refusal(resource_step, batch.step_context):
                             guard.refuse(f"{batch.node_name}/{key}: {why}")
+                if repeats > 1:
+                    for occurrences in owners.values():
+                        for key, resource, batch in occurrences:
+                            step = None if batch.step is None else batch.step.get(key)
+                            if resource.repeat_refusal(batch.graph_walk, step) is not None:
+                                repeats = 1
+                            else:
+                                repeats = min(repeats, resource.max_repeats(step, batch.step_context))
+                    repeats = max(1, repeats)
+                    for _, batch in group.members:
+                        batch.step_context.repeats = repeats
                 for batch, _, _, inputs, _, _ in prepared:
                     admit = self._admit_step(batch, batch.step_context.padded_request_ids, inputs,
                                              batch.step_context, batch.step)
@@ -2446,6 +2492,8 @@ class Engine:
                         guard.refuse("a member refused admission")
                     if batch.step is not None:
                         admitted.append(batch.step)
+                    if batch.step_context.repeats != repeats:
+                        guard.refuse("a member changed the common iteration count during admission")
                 for batch, mgmt, lease, inputs, info, incoming in prepared:
                     with autocast_scope(self._autocast_dtype_for(batch.node_name), device_type=self._device.type,
                                         node_name=batch.node_name):
@@ -2457,7 +2505,9 @@ class Engine:
                     carries = mgmt.submodule.repeat_carry(batch.graph_walk, {signal for _, signal in incoming})
                     expected = {}
                     for maker, signal in incoming:
-                        expected.setdefault(carries[signal].input, []).extend((maker, signal, rid) for rid in rows)
+                        expected.setdefault(carries[signal].input, []).extend(
+                            (maker, batch.node_name, signal, rid) for rid in rows
+                        )
                     copies, real = [], {}
                     for name, value in values.items():
                         if guard.contains(value):
@@ -2471,23 +2521,49 @@ class Engine:
                                 guard.refuse(f"future field {name} exceeds its captured destination")
                             target = target.narrow(dim, 0, value.shape[dim])
                             keys = tuple(expected.pop(name))
-                            copies.extend(guard.copies(value, target, keys, keys))
+                            copies.extend(guard.copies(value, target, keys, set(keys) - back_keys))
                             group.initial_copies.extend(guard.copies(value, target, keys, bindings.keys() - set(keys)))
+                            if back_keys.intersection(keys):
+                                group.initial_copies.extend(guard.copies(value, target, keys, back_keys))
+                                boundary_fields.append((value, target, keys))
                         else:
                             real[name] = value
                     if expected:
                         guard.refuse("preprocess discarded a future input")
+                    if (batch.iteration_columns or {}).keys() & {pair.input for pair in carries.values()}:
+                        guard.refuse("an iteration column overwrites a connected input")
                     runner._stage(lease, real)
-                    group.parts.append(RunPart(slot, copies, []))
+                    columns = [
+                        *((column, slot.static_inputs[name])
+                          for name, column in (batch.iteration_columns or {}).items()),
+                        *self._runner.replay_columns(batch.step, repeats),
+                    ]
+                    group.parts.append(RunPart(slot, copies, columns))
+                if repeats > 1:
+                    row_of = {rid: i for i, rid in enumerate(rows)}
+                    for maker, consumer, signal, rid in back_keys:
+                        mgmt = self._submodules[maker]
+                        slot = mgmt.accelerator_graph_runner.slot_for(leases[maker])
+                        name = mgmt.submodule.repeat_carry(group.members[0][1].graph_walk, {signal})[signal].output
+                        source = (slot.static_outputs.row_outputs or {}).get(name)
+                        if (slot.static_outputs.per_rid_outputs or source is None or source.ndim == 0
+                                or source.shape[0] < len(rows)):
+                            guard.refuse(f"{maker}/{signal} has no captured Loop carry")
+                        row = row_of[rid]
+                        guard.rebind((maker, consumer, signal, rid), source[row:row + 1])
+                    boundary = [copy for value, target, keys in boundary_fields
+                                for copy in guard.copies(value, target, keys, back_keys)]
             # Every binding has been checked. This is the irreversible point;
             # the main thread publishes it to Rust before landing members.
             group.submitted = True
             head = group.members[0][1]
             if head.launch_started_event is not None:
                 head.launch_started_event.set()
-            for source, target in group.initial_copies:
-                target.copy_(source.reshape(target.shape), non_blocking=True)
-            prepared[0][1].accelerator_graph_runner.launch_parts(group.parts)
+            retained = prepared[0][1].accelerator_graph_runner.launch_parts(
+                group.parts, repeats,
+                [mgmt.run_columns.get(batch.graph_walk, ()) for batch, mgmt, _, _, _, _ in prepared],
+                capacity=max(repeats, group.capacity), boundary=boundary, initial=group.initial_copies,
+            )
             for batch, mgmt, _, _, _, _ in prepared:
                 self._commit_step(batch, mgmt, batch.step, batch.step_context)
                 # A later member can advance the same owner. Preserve what
@@ -2499,9 +2575,17 @@ class Engine:
                 )
                 batch.commit_done.set()
             outputs = []
-            for batch, mgmt, lease, inputs, info, _ in prepared:
+            for (batch, mgmt, lease, inputs, info, _), columns in zip(prepared, retained, strict=True):
                 raw = mgmt.accelerator_graph_runner.slot_for(lease).static_outputs
+                if repeats > 1:
+                    raw = dataclasses.replace(
+                        raw, check_stop_buffers=columns.check_stop_buffers,
+                        row_outputs={**(raw.row_outputs or {}), **(columns.row_outputs or {})},
+                        output_spans={**(raw.output_spans or {}), **(columns.output_spans or {})} or None,
+                    )
                 output = self._collect_step(batch, mgmt, lease, raw, inputs, info)
+                if repeats > 1:
+                    output.run_columns = self.run_columns(batch.node_name, batch.graph_walk)
                 batch.outputs = output
                 self._finish_outputs(batch)
                 outputs.append(self._postprocess_outputs(batch, output))

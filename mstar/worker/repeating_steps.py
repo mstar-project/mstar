@@ -21,7 +21,7 @@ from mstar.model.submodule_base import EMITTED_COUNT, BatchedModelOutput, HostRo
 from mstar.streaming.topology import ProducerWalkCtx
 from mstar.utils.profiler import phase_record
 from mstar.worker.micro_scheduler import CHAIN_LANE
-from mstar.worker.step_repeats import edge_refusal, loop_back, run_columns
+from mstar.worker.step_repeats import RepeatConfig, edge_refusal, loop_back, run_columns
 
 if TYPE_CHECKING:
     from mstar.graph.runtime.base import PostprocessStep
@@ -39,6 +39,47 @@ _QUIET_SCAN_S = 10 * _LANDED_POLL_S
 
 class RepeatingSteps:
     """A ``Worker``'s repeat logic. Reads the worker's own attributes."""
+
+    def _group_repeat_config(self, unit):
+        """Only the graph's complete Loop domain has a connected repeat setting.
+
+        This deliberately does not make its closer eligible to repeat alone.
+        Unsupported run controls are rejected during worker construction.
+        """
+        if unit.loop_name is None or self._step_repeats is None:
+            return None
+        config = self._step_repeats.config(unit.nodes[-1])
+        if config.max <= 1:
+            return None
+        if config != RepeatConfig(max=config.max):
+            raise ValueError("connected fixed-count Loops currently accept only step_repeats.max")
+        return config
+
+    def _stamp_group_repeats(self, group) -> None:
+        config = self._group_repeat_config(group.unit)
+        if config is None:
+            return
+        walk = group.members[0][0].graph_walk
+        engine = self.engine_manager.get_engine(group.unit.nodes[0])
+        for i, node in enumerate(group.unit.nodes):
+            policies = engine.get_stop_policies(node, walk)
+            if (policies is None or not set(policies) <= {group.unit.loop_name}
+                    or any(p.reads_token for p in policies.values())
+                    or (policies and i + 1 < len(group.unit.nodes))):
+                return
+            edges = self._step_repeats.edges[node, walk]
+            columns = frozenset(signal for signal, dest in edges.items)
+            if engine.keep_run_columns(node, walk, columns):
+                return
+        rows = list(group.members[0][1].request_ids)
+        key = group.unit.nodes[-1], walk
+        room = self._graph_runtime.loop_room(*key, group.unit.loop_name, rows, 0, False)
+        if room <= 0:
+            raise ValueError("a claimed connected Loop has no remaining iteration")
+        count, _ = self._step_repeats._most(key, lambda: room)
+        group.capacity = config.max
+        for scheduled, executing in group.members:
+            scheduled.repeats = executing.step_context.repeats = count
 
     def _stamp_repeats(
         self, speculation: Speculation, pending: PendingBatch, in_chain: int, owes_run: bool = False,

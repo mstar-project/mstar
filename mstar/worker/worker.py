@@ -942,6 +942,9 @@ class Worker(RepeatingSteps):
             and all(self.scheduler.lane_of.get((node, walk), CHAIN_LANE) == CHAIN_LANE for node in unit.nodes)
         }
 
+        for unit in self.scheduler.execution_units.values():
+            self._group_repeat_config(unit)
+
         if status_interval_s is not None:
             self._metrics = self._start_metrics(status_interval_s)
 
@@ -2554,7 +2557,7 @@ class Worker(RepeatingSteps):
         original = None
         if group is not None:
             original = replace(
-                node_batch, step_context=replace(node_batch.step_context),
+                node_batch, step_context=replace(node_batch.step_context, repeats=batch.repeats),
                 skipped_rids=set(node_batch.skipped_rids), cached_rids=set(node_batch.cached_rids),
                 failed_requests=dict(node_batch.failed_requests), first_chunk_rids=set(node_batch.first_chunk_rids),
                 outputs_ready=threading.Event(), commit_done=threading.Event(),
@@ -2850,15 +2853,19 @@ class Worker(RepeatingSteps):
                     self._graph_runtime.cancel_execution_unit(claim)
                     return None
                 members.append((scheduled, executing))
+            group = ExecutionGroup(unit, claim, tuple(members))
+            self._stamp_group_repeats(group)
         except Exception:
             self._graph_runtime.cancel_execution_unit(claim)
             raise
-        return ExecutionGroup(unit, claim, tuple(members))
+        return group
 
     def _settle_group_claim(self, group: ExecutionGroup) -> None:
         """Publish the GPU thread's irreversible boundary on the main thread."""
         if group.claim:
             if group.submitted:
+                for scheduled, executing in group.members:
+                    scheduled.repeats = executing.step_context.repeats
                 self._graph_runtime.submit_execution_unit(group.claim)
             else:
                 self._graph_runtime.cancel_execution_unit(group.claim)

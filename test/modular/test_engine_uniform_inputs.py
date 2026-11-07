@@ -66,6 +66,8 @@ def _connected_engine(transform=None, *, head_state=False, mixed=False, device="
     eng._device = device
     eng._device_capability = SimpleNamespace(is_accelerator=device.type != "cpu")
     eng._keyed_walks = eng._loopback_steps = {}
+    eng._pre_plan_done = {}
+    eng._plan_peers = {"a": (), "b": ()}
     eng._runner = StepRunner({})
     eng._submodules = {}
     members = []
@@ -462,8 +464,11 @@ def test_connected_preserves_ordinary_output_precedence(replacement, monkeypatch
     else:
         monkeypatch.setattr(type(mgmt.submodule), "unpack_packed_outputs", lambda *a, **kw: changed)
     assert eng.exec_group(group) is None
-    assert not group.submitted and events == ["release:a"]
+    assert not group.submitted and events == (["release:a"] if replacement == "per_request" else [])
     batch = group.members[0][1]
+    if batch.inputs is None:
+        eng.prepare_inputs(batch)
+        eng.reserve_replay_slot(batch)
     ordinary = eng._collect_step(batch, mgmt, batch.step_context.slot_lease, slot.static_outputs,
                                  batch.inputs, batch.per_request_info_wrapped)
     assert ordinary.per_rid_outputs[2]["x"][0].tolist() == [[42., 42.]]
@@ -504,3 +509,82 @@ def test_composed_unit_reuses_capture_bindings_across_new_real_inputs():
     assert len(compositions) == 1 and len(launches) == 2
     assert [out.tolist() for out in retained] == [[[112., 112.]], [[132., 132.]]]
     assert events == ["a", "b", "release:b", "release:a"] * 2
+
+
+@pytest.mark.parametrize("repeats,device", [(1, "cpu"), (3, "cpu"), (3, "cuda")])
+def test_connected_loop_repeats_from_its_first_seed_and_keeps_each_members_outputs(repeats, device):
+    from dataclasses import replace
+
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("real connected CUDA Loop")
+    eng, group, events = _connected_engine(device=device)
+    group.unit = replace(group.unit, loop_name="loop", loop_back=(("b", "a", "x"),))
+    group.capacity = 3
+    for _, batch in group.members:
+        batch.step_context.repeats = repeats
+        eng._submodules[batch.node_name].run_columns["prefill"] = frozenset({"x"})
+    outputs = eng.exec_group(group)
+    assert group.submitted and group.refusal is None
+    assert events == (["a", "b"] * repeats if device == "cpu" else []) + ["release:b", "release:a"]
+    for i, output in enumerate(outputs):
+        got = output.per_rid_outputs[2]["x"][0]
+        wanted = torch.tensor([[12. + i * 100. + 110. * n] * 2 for n in range(repeats)])
+        if repeats > 1:
+            wanted = wanted.unsqueeze(0)
+        torch.testing.assert_close(got.cpu(), wanted)
+    # The ordinary collection owns these values, beyond reuse of the captures.
+    for part in group.parts:
+        part.slot.static_outputs.row_outputs["x"].fill_(-999)
+    assert outputs[0].per_rid_outputs[2]["x"][0].flatten()[0] == 12
+
+
+@pytest.mark.parametrize("late", [False, True])
+def test_connected_round_count_settles_before_admit_and_late_narrowing_unwinds_every_owner(late):
+    from dataclasses import replace
+
+    from mstar.engine.resources.base import Resource
+    from mstar.engine.resources.runner import StepRunner
+    from mstar.engine.resources.step import ADMIT_OK, ResourceStep, SubmoduleStep
+
+    admitted, rolled_back = [], []
+    class Owner(Resource):
+        @classmethod
+        def build(cls, spec, info):
+            return cls()
+
+        def repeat_refusal(self, walk, host_step=None):
+            return None
+
+        def max_repeats(self, step, ctx):
+            return 3 if late else 2
+
+        def admit(self, step, ctx):
+            admitted.append((ctx.unit_member, ctx.repeats))
+            if late and ctx.unit_member == 1:
+                ctx.repeats = 1
+            return ADMIT_OK
+
+        def rollback_admit(self, step, ctx):
+            rolled_back.append(ctx.unit_member)
+
+    eng, group, events = _connected_engine()
+    group.unit = replace(group.unit, loop_name="loop", loop_back=(("b", "a", "x"),))
+    group.capacity = 3
+    owners = {name: Owner() for name in ("a", "b")}
+    eng._runner = StepRunner(owners)
+    for _, batch in group.members:
+        name = batch.node_name
+        batch.step_context.repeats = 3
+        mgmt = eng._submodules[name]
+        mgmt.resources = {name: owners[name]}
+        mgmt.submodule.declare_step = lambda name=name, **kw: SubmoduleStep(steps={name: ResourceStep()})
+    result = eng.exec_group(group)
+    if late:
+        assert result is None and not group.submitted
+        assert admitted == [(0, 3), (1, 3)] and rolled_back == [1, 0]
+        assert events == ["release:b", "release:a"]
+    else:
+        assert result is not None and group.submitted
+        assert admitted == [(0, 2), (1, 2)] and rolled_back == []
+        assert events == ["a", "b"] * 2 + ["release:b", "release:a"]
+        assert all(batch.step_context.repeats == 2 for _, batch in group.members)

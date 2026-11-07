@@ -2997,13 +2997,17 @@ impl GraphRuntime {
             let claim_id = state.unit_claim(node);
             let stride = input.loop_strides.as_ref().map_or(1, |s| s[i]);
             let completed = state.complete_strided(&g, node, &out_tensors, stride);
+            let repeat_loop = claim_id.and_then(|id| self.unit_claims.get(&id))
+                .and_then(|claim| g.units[&claim.head].repeat_loop);
             self.land_unit_member(wg, node, rid, claim_id);
             let mut pre_shard_edges = completed.edges;
             // A step that repeated routes a column an iteration, for the
             // edges that take items. The loop-back reads the last one only.
             if stride > 1 {
                 for e in pre_shard_edges.iter_mut() {
-                    if matches!(e.dest, Dest::Local(d) if d == node) && !e.streaming && e.tensors.len() > 1 {
+                    let carried = matches!(e.dest, Dest::Local(d) if d == node)
+                        || repeat_loop.is_some_and(|id| g.loops[id as usize].loop_back.contains(&(e.name, e.dest_sym)));
+                    if carried && !e.streaming && e.tensors.len() > 1 {
                         e.tensors.drain(..e.tensors.len() - 1);
                     }
                 }
