@@ -39,7 +39,7 @@ from mstar.engine.resources import (
     StepContext,
     SubmoduleStep,
 )
-from mstar.model.submodule_base import NodeSubmodule, StepOrder
+from mstar.model.submodule_base import BatchedModelOutput, NodeSubmodule, StepOrder
 from mstar.utils.device import DeviceCapability
 from mstar.worker import worker as worker_mod
 from mstar.worker.micro_scheduler import ScheduledBatch
@@ -74,7 +74,7 @@ class _FakeEngine(Engine):
     def exec(self, batch):
         batch.admit_error = self._admit_error
         # what `_exec_single` returns when admit refused the step
-        return {rid: {} for rid in batch.request_ids}
+        return BatchedModelOutput(per_rid_outputs={rid: {} for rid in batch.request_ids})
 
     def postprocess_batch(self, batch, outputs):
         del batch, outputs
