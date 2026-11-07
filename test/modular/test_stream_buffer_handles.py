@@ -687,3 +687,141 @@ def test_successor_keeps_frozen_policy_prefix_when_arrivals_change_chunk_stride(
     assert buf._buffer == list(range(expected, 12))
     assert buf._consumed == buf.policy.items_consumed == expected
     assert buf._executed_chunks == ran + 2
+
+
+class _HistoryChunkPolicy(FixedChunkPolicy):
+    """Sizing depends on both available length and the history of earlier pops."""
+    def __init__(self):
+        super().__init__(2)
+        self.history = []
+        self.last_available = 0
+
+    def next_chunk_size(self, buffer_len):
+        self.last_available = buffer_len
+        return 1 if (buffer_len + len(self.history)) % 2 else 2
+
+    def register_chunk(self, chunk_size):
+        self.history.append(self.last_available)
+        super().register_chunk(chunk_size)
+
+
+@pytest.mark.parametrize("factory", [lambda: FixedChunkPolicy(2), lambda: SlidingWindowChunkPolicy(4, 2),
+                                      _HistoryChunkPolicy])
+@pytest.mark.parametrize("stop,withheld", [(None, False), (1, True), (3, False), (5, True)])
+def test_future_stream_decisions_equal_ordinary_interleaving_and_preserve_later_arrivals(factory, stop, withheld):
+    source = StreamBuffer(RID, EDGE, "LLM", factory())
+    oracle = StreamBuffer(RID, EDGE, "LLM", factory())
+    source.put_positions([0, 1, 2])
+    oracle.put_positions([0, 1, 2])
+    future, bound = list(range(3, 9)), 8
+    snapshot = source.reserve_future_window(future, bound)
+    reservation = snapshot.reservation
+    assert source._consumed == source._executed_chunks == 0
+    assert source.policy.items_consumed == 0 and source._buffer == [0, 1, 2]
+    assert source.reserve_window(1) is None
+    choices = {(parent, end, done): selected for parent, end, done, selected in reservation.decisions}
+    parent, count, produced, done = -1, 0, [], False
+    chunks, released = [], []
+
+    def pop():
+        nonlocal parent, count
+        selected = choices[parent, 3 + len(produced), done]
+        if not oracle.has_chunk_ready():
+            assert selected == -1
+            return False
+        chunk = oracle.pop_chunk()
+        assert selected >= 0 and reservation.transitions[selected].chunk == chunk.info
+        parent, count = selected, count + 1
+        chunks.append(chunk.info)
+        released.extend(chunk.released)
+        return not chunk.is_final
+
+    for step, item in enumerate(future, 1):
+        if not (step == stop and withheld):
+            produced.append(item)
+            oracle.put_positions([item])
+        if step == stop:
+            done = True
+            oracle.signal_done(3 + len(produced))
+        if count < bound:
+            pop()
+        if done:
+            break
+    while count < bound and oracle.has_chunk_ready():
+        if not pop():
+            break
+    # Publication and EOF are ordinary output routing, before semantic settle.
+    source.put_positions(produced)
+    if done:
+        source.signal_done(3 + len(produced))
+    else:
+        source.put_positions([100, 101])  # later arrivals were not in this launch's snapshot
+    result = source.settle_window(reservation, count, final_transition=parent)
+    assert result.released == released
+    assert source._consumed == oracle._consumed
+    assert source._executed_chunks == oracle._executed_chunks == count
+    assert source._delivered_end == oracle._delivered_end
+    assert source._buffer == oracle._buffer + ([] if done else [100, 101])
+    assert source._final_chunk_emitted == oracle._final_chunk_emitted
+    assert source.policy.items_consumed == oracle.policy.items_consumed
+    if isinstance(source.policy, _HistoryChunkPolicy):
+        assert source.policy.history == oracle.policy.history
+    if not done:
+        assert not source.producer_done and not any(chunk.is_final for chunk in chunks)
+
+
+@pytest.mark.parametrize("continues", [False, True])
+def test_future_stream_empty_final_and_continuing_tail_use_distinct_semantic_receipts(continues):
+    source = StreamBuffer(RID, EDGE, "LLM", FixedChunkPolicy(1, continue_after_done=continues))
+    source.signal_done(0)
+    reservation = source.reserve_future_window([], 3).reservation
+    choices = {(parent, end, done): selected for parent, end, done, selected in reservation.decisions}
+    parent, count = -1, 0
+    while count < 3:
+        parent = choices[parent, 0, True]
+        assert parent >= 0
+        chunk = reservation.transitions[parent].chunk
+        assert chunk.num_items == 0 and chunk.is_final is not continues
+        count += 1
+        if chunk.is_final:
+            break
+    result = source.settle_window(reservation, count, final_transition=parent)
+    assert result.released == [] and result.is_final is not continues
+    assert source._executed_chunks == (3 if continues else 1)
+    assert source._tail_consumed == (3 if continues else 0)
+
+
+def test_future_stream_settlement_requires_actual_publication_and_preserves_zero_work_retry():
+    source = StreamBuffer(RID, EDGE, "LLM", FixedChunkPolicy(1))
+    reservation = source.reserve_future_window([10, 11], 2).reservation
+    chosen = next(selected for parent, end, done, selected in reservation.decisions
+                  if parent == -1 and end == 1 and done)
+    with pytest.raises(ValueError, match="actual arrivals"):
+        source.settle_window(reservation, 1, final_transition=chosen)
+    source.put_positions([10])
+    with pytest.raises(ValueError, match="producer completion"):
+        source.settle_window(reservation, 1, final_transition=chosen)
+    assert source._consumed == source._executed_chunks == 0
+    assert source.owns_window(reservation)
+    source.settle_window(reservation, 0, final_transition=-1)
+    assert source._buffer == [10] and source.policy.items_consumed == 0
+    retry = source.reserve_future_window([11], 2)
+    source.cancel_window(retry.reservation)
+    assert source.pop_chunk().data == {"data": [10]}
+
+
+def test_a_full_producer_reservation_can_still_drain_consumers_and_preview_is_bounded():
+    source = StreamBuffer(RID, EDGE, "LLM", FixedChunkPolicy(2))
+    source.put_positions([0, 1, 2, 3])
+    assert source.reserve_future_window(range(100_000), 100_000) is None
+    assert source._consumed == source._executed_chunks == 0 and not source._reservations
+    # No free producer positions: B can still consume existing input. Budget
+    # exhaustion does not manufacture EOF or consume an extra empty chunk.
+    reservation = source.reserve_future_window([], 4, may_finish=False).reservation
+    choices = {(parent, end, done): selected for parent, end, done, selected in reservation.decisions}
+    first = choices[-1, 4, False]
+    second = choices[first, 4, False]
+    assert choices[second, 4, False] == -1
+    result = source.settle_window(reservation, 2, final_transition=second)
+    assert result.released == [0, 1, 2, 3] and not result.is_final
+    assert not source.producer_done and not source.has_chunk_ready()

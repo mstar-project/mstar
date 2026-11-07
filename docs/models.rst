@@ -253,8 +253,12 @@ The graph runtime also describes local streaming connections as qualified
 members: each retains its worker graph, active walk and own Loop progress. A
 claim can reserve a waiting consumer, and an unexecuted member releases its
 claim without a graph completion. These streaming units remain on ordinary
-execution until their policy reservations and conditional capture lowering are
-available; the runtime description alone does not enable streamed fusion.
+execution until their policy reservations are wired to conditional capture
+lowering; the runtime description alone does not enable streamed fusion. The
+stream buffer can freeze the ordinary policy decisions for future producer
+items, including overlap and final tails. Settlement applies only the selected
+history after the actual items and producer completion have been published;
+run-budget exhaustion alone never finishes a stream.
 
 Preparation may structurally pack future inputs with real values; arithmetic
 on future values, mutable model request state, host reads of future positions,

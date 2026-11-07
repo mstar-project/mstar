@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from copy import copy
 from dataclasses import dataclass, field
 from typing import NamedTuple
@@ -19,6 +19,11 @@ class StreamReservation:
     predecessor_bound: int
     start_iteration: int = 0
     transitions: tuple[StreamTransition, ...] = ()
+    # Future producer decisions form a tree of ordinary policy pops. The key
+    # is (previous pop, absolute available end, producer done); -1 means no pop.
+    # Empty columns retain the linear, already-arrived predecessor window.
+    parents: tuple[int, ...] = ()
+    decisions: tuple[tuple[int, int, bool, int], ...] = ()
 
 
 @dataclass
@@ -465,7 +470,7 @@ class StreamBuffer:
         self._update_buffer()
         if self._waiting_graph_edges:
             raise ValueError("cannot reserve past an unconsumed graph edge")
-        if len(self._reservations) >= 2:
+        if len(self._reservations) >= 2 or any(r.decisions for r in self._reservations):
             return None
         if self._buffer and self.walk_tagged and self.peek_walk() != consumer_walk:
             return None
@@ -512,6 +517,105 @@ class StreamBuffer:
             num_items=len(items), reservation=reservation, tail_offset=self._tail_consumed,
         )
 
+    def reserve_future_window(
+        self, future_positions: Sequence[int], bound: int, consumer_walk: str | None = None,
+        *, may_finish: bool = True,
+    ) -> StreamChunk | None:
+        """Freeze ordinary policy pops for an A-then-B connected sweep.
+
+        Each producer iteration emits one item, or ends with/without that item.
+        Its owner reserves these positions for the whole launch; the buffer
+        acquires only actual emitted items at ordinary output publication.
+        Once the producer stops or exhausts its reservation, B may drain.
+        Exhausting the reservation never signals producer done.
+        """
+        if type(bound) is not int or bound < 1:
+            raise ValueError("a stream run bound must be a positive integer")
+        self._update_buffer()
+        if (self._reservations or self._waiting_graph_edges or self._tensor_ids_in_order
+                or self._num_buffer_writes < self._num_tensors_registered
+                or (self.walk_tagged and self._walk_run_len() != len(self._buffer))
+                or (self._buffer and self.walk_tagged and self.peek_walk() != consumer_walk)):
+            return None
+        if self.producer_done and (future_positions or not self._producer_done_and_all_read()):
+            return None
+        # Bound compilation work independently of the device capture budget.
+        # This bounds preview calls and table bytes, not a policy's private
+        # storage inside its existing preview_copy implementation.
+        max_previews = 4096
+        producers = len(future_positions)
+        # Each producer has two terminal drain branches and one continuation;
+        # include their independent snapshots as well as every possible pop.
+        preview_work = 3 * producers + 1 + (2 * producers + 1) * bound
+        if preview_work > max_previews:
+            return None
+        transitions: list[StreamTransition] = []
+        parents: list[int] = []
+        decisions: dict[tuple[int, int, bool], int] = {}
+        origin_end = self._consumed + len(self._buffer)
+
+        def pop(preview: StreamBuffer, parent: int, produced: int, done: bool) -> int | None:
+            key = parent, origin_end + produced, done
+            if key in decisions:
+                selected = decisions[key]
+                if selected >= 0:
+                    preview._apply_transition(transitions[selected])
+                return None if selected < 0 else selected
+            if not preview.has_chunk_ready(consumer_walk):
+                decisions[key] = -1
+                return None
+            chunk = preview.pop_chunk()
+            selected = len(transitions)
+            transitions.append(StreamTransition(
+                chunk.info, preview.policy.preview_copy(), preview._consumed, preview._tail_consumed,
+                preview._delivered_end, preview._final_chunk_emitted,
+            ))
+            parents.append(parent)
+            decisions[key] = selected
+            return selected
+
+        def drain(preview: StreamBuffer, parent: int, produced: int, count: int, done: bool) -> None:
+            if done:
+                preview.signal_done(preview._num_tensors_registered)
+            while count < bound:
+                selected = pop(preview, parent, produced, done)
+                if selected is None:
+                    break
+                parent, count = selected, count + 1
+                if transitions[selected].chunk.is_final:
+                    break
+
+        primary = self._preview()
+        parent, count = -1, 0
+        if self._producer_done_and_all_read():
+            drain(primary, parent, 0, count, True)
+        else:
+            for produced, position in enumerate(future_positions):
+                if may_finish:
+                    # A stop withholds this iteration's item, or emits it.
+                    drain(primary._preview(), parent, produced, count, True)
+                    final = primary._preview()
+                    final.put_positions([position], consumer_walk)
+                    drain(final, parent, produced + 1, count, True)
+                primary.put_positions([position], consumer_walk)
+                if count < bound:
+                    selected = pop(primary, parent, produced + 1, False)
+                    if selected is not None:
+                        parent, count = selected, count + 1
+            drain(primary, parent, len(future_positions), count, False)
+        reservation = StreamReservation(
+            self._chunks_popped, bound, 0, self._executed_chunks, tuple(transitions), tuple(parents),
+            tuple((*key, selected) for key, selected in decisions.items()),
+        )
+        self._chunks_popped += 1
+        self._reservations[reservation] = bound
+        items = [*self._buffer, *future_positions]
+        return StreamChunk(
+            data=self._collate(items), chunk_index=reservation.chunk_index,
+            start_offset=self._consumed, num_items=len(items), reservation=reservation,
+            tail_offset=self._tail_consumed,
+        )
+
     def owns_window(self, reservation: StreamReservation) -> bool:
         """A recycled request's new buffer cannot settle an old reader."""
         return reservation in self._reservations
@@ -550,7 +654,9 @@ class StreamBuffer:
         del self._reservations[reservation]
         self.maybe_ready = True
 
-    def settle_window(self, reservation: StreamReservation, executed: int) -> StreamChunk:
+    def settle_window(
+        self, reservation: StreamReservation, executed: int, *, final_transition: int | None = None,
+    ) -> StreamChunk:
         """Retire actual input consumption in submission order. ``released``
         holds the buffer's references; overlapping graph readers keep theirs.
         Empty tail iterations advance policy but acknowledge no producer data.
@@ -562,7 +668,27 @@ class StreamBuffer:
             raise ValueError("stream reservations must settle in submission order")
         self._update_buffer()
         prefix = self._executed_chunks - reservation.start_iteration
-        selected = reservation.transitions[prefix:prefix + executed]
+        if reservation.decisions:
+            if type(final_transition) is not int or not -1 <= final_transition < len(reservation.transitions):
+                raise ValueError("a future stream reservation needs its selected policy transition")
+            chain = []
+            index = final_transition
+            while index >= 0:
+                chain.append(index)
+                index = reservation.parents[index]
+            chain.reverse()
+            selected = tuple(reservation.transitions[index] for index in chain)
+            selected_ids = set(chain)
+            available_end = self._consumed + len(self._buffer)
+            for _, end, done, target in reservation.decisions:
+                if target in selected_ids and (
+                    end > available_end or (done and not self._producer_done_and_all_read())
+                ):
+                    raise ValueError("selected stream transition precedes its actual arrivals or producer completion")
+        else:
+            if final_transition is not None:
+                raise ValueError("an arrived stream window selects by actual iteration count")
+            selected = reservation.transitions[prefix:prefix + executed]
         if prefix < 0 or prefix > reservation.predecessor_bound or len(selected) != executed:
             raise ValueError("stream execution is outside its frozen policy transitions")
         origin, items = self._consumed, []
