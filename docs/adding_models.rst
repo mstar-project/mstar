@@ -2236,6 +2236,11 @@ Both types share the base ``CudaGraphConfig`` fields:
   scaffold's ``compile_blocks`` and Cosmos3's denoise step do. Building the config refuses
   an unknown mode, and one that turns on Inductor's own CUDA graphs (``reduce-overhead``,
   ``max-autotune``), which fail inside the runner's capture.
+- ``inductor_options`` are Inductor config entries the compile runs under, over the mode's
+  or the compile level's own, e.g. ``{"max_autotune_gemm_backends": "ATEN"}`` to keep
+  max-autotune's fusion choices but cuBLAS for the GEMMs (autotune's timings of decode-width
+  GEMMs can vary between processes). Building the config
+  refuses an entry Inductor doesn't have, and ``triton.cudagraphs``.
 - ``required`` makes every bucket in the config mandatory. If capture fails locally or
   on another participating rank, warmup raises after rank-wide agreement instead of
   dropping the bucket and falling back to eager execution. The default is ``False``.
