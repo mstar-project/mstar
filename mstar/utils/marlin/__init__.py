@@ -124,6 +124,57 @@ def prepare(kind: int, codes_nk: torch.Tensor, scale_ng: torch.Tensor, zero_ng: 
     return out
 
 
+# ---------------------------------------------------------------- reading the layout back
+@functools.lru_cache(maxsize=None)
+def _tables() -> dict[str, torch.Tensor]:
+    """Where ``prepare`` put each value, as int32 lookup tables (``(word << 5) | shift`` or a position):
+
+    - ``weight [16 * 64]``: code (k, n) of a row of 16-row tiles sits in word ``(n // 64) * 128 + word`` at
+      ``shift``, indexed by ``(k % 16) * 64 + n % 64``;
+    - ``scale [64]``: group scale (g, n) sits at column ``(n // 64) * 64 + scale[n % 64]`` of row g;
+      ``scale_e2m1 [64]`` the same after MXFP4's 0, 2, 1, 3 shuffle;
+    - ``zero [64]``: zero point (g, n) sits in word ``(n // 64) * 8 + word`` of row g, at ``shift``."""
+    inv = torch.argsort(_weight_perm())
+    kk, nn = torch.arange(16)[:, None], torch.arange(64)[None, :]
+    j = inv[(nn // 16) * 256 + kk * 16 + nn % 16]
+    sinv = torch.argsort(_scale_perms()[0])
+    shuffle = torch.tensor([0, 2, 1, 3])
+    il_inv = torch.argsort(torch.tensor([0, 2, 4, 6, 1, 3, 5, 7]))
+    return {"weight": (((j // 8) << 5) | (4 * (j % 8))).reshape(-1).to(torch.int32),
+            "scale": sinv.to(torch.int32),
+            "scale_e2m1": ((sinv // 4) * 4 + shuffle[sinv % 4]).to(torch.int32),
+            "zero": (((sinv // 8) << 5) | (4 * il_inv[sinv % 8])).to(torch.int32)}
+
+
+def tables(device: torch.device) -> dict[str, torch.Tensor]:
+    return {name: t.to(device) for name, t in _tables().items()}
+
+
+def unprepare(kind: int, buffers: dict[str, torch.Tensor]) -> tuple[torch.Tensor, ...]:
+    """``prepare``'s inverse in torch (the reference the Marlin-layout dequant kernel matches): codes ``[N, K]``,
+    group scales ``[N, K / group]`` (e8m0 bytes for MXFP4) and, with zero points, ``[N, K / group]``."""
+    w = buffers["marlin_weight"].view(torch.int32)
+    k, n = w.shape[0] * _TILE, w.shape[1] // 2
+    t = tables(w.device)
+    kk, nv = torch.arange(k, device=w.device)[None, :], torch.arange(n, device=w.device)[:, None]
+    entry = t["weight"][(kk % 16) * 64 + nv % 64]
+    words = w[kk // 16, (nv // 64) * 128 + (entry >> 5)]
+    codes = ((words >> (entry & 31)) & 0xF).to(torch.uint8)
+    s = buffers["marlin_scale"]
+    s = s.view(torch.uint8) if kind == KIND_E2M1 else s
+    groups = s.shape[0]
+    cols = (nv // 64) * 64 + t["scale_e2m1" if kind == KIND_E2M1 else "scale"][nv % 64]  # [N, 1]
+    scale = s.t()[cols[:, 0]]
+    if kind != KIND_ZP:
+        return codes, scale
+    z = buffers["marlin_zero"].view(torch.int32)
+    ze = t["zero"][nv[:, 0] % 64]
+    zwords = z.t()[(nv[:, 0] // 64) * 8 + (ze >> 5)]  # [N, groups]
+    zero = ((zwords >> (ze & 31)[:, None]) & 0xF).to(torch.uint8)
+    assert zero.shape == (n, groups)
+    return codes, scale, zero
+
+
 # ---------------------------------------------------------------- the CUDA op (JIT, per variant)
 _INSTANCE = ("template __global__ void Marlin<vllm::kBFloat16.id(), vllm::{b}.id(), vllm::kBFloat16.id(), "
              "vllm::{s}.id(), {threads}, {m}, {n}, {k}, {m8}, 4, {gb}, false>( MARLIN_KERNEL_PARAMS );")
@@ -244,8 +295,11 @@ def _workspace(device: torch.device) -> torch.Tensor:
 
 
 def gemm(lib: str, x: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor, zero: torch.Tensor | None,
-         kind: int, n: int) -> torch.Tensor:
-    """``x [M, K] @ W.T`` from ``prepare``'s buffers through the variant ``lib`` (``build``'s result)."""
+         kind: int, n: int, fp32_reduce: bool = True, atomic_add: bool = False) -> torch.Tensor:
+    """``x [M, K] @ W.T`` from ``prepare``'s buffers through the variant ``lib`` (``build``'s result); the
+    reduction flags as vLLM's ``apply_gptq_marlin_linear`` sets them by default (fp32 reduce on, atomic add off,
+    which vLLM's heuristic keeps off for N >= 2048 anyway)."""
     if kind == KIND_E2M1:
         scale = scale.view(torch.float8_e8m0fnu)
-    return getattr(torch.ops, lib).gemm(x, weight, scale, zero, _workspace(x.device), kind, n, x.shape[1])
+    return getattr(torch.ops, lib).gemm(x, weight, scale, zero, _workspace(x.device), kind, n, x.shape[1],
+                                        atomic_add, fp32_reduce)

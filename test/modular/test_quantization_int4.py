@@ -524,6 +524,10 @@ def _compile_cases():
     yield "dot8_g128", w4a16._w4_dot8_kernel, dense, dict(GROUP=128, BN=64, TB=64, NB=2, SPLIT_K=1, STAGES=3)
     yield "gemv", w4a16._w4_gemv_kernel, dense, dict(GROUP=128, BN=32, NB=4, SPLIT_K=1, MB=1)
     yield "gemv_g32", w4a16._w4_gemv_kernel, dense, dict(GROUP=32, BN=16, NB=2, SPLIT_K=2, MB=4)
+    yield "marlin_dequant", w4a16._marlin_dequant_kernel, {
+        "w_ptr": "*i32", "s_ptr": "*bf16", "z_ptr": "*i32", "wt_ptr": "*i32", "st_ptr": "*i32", "zt_ptr": "*i32",
+        "out_ptr": "*bf16", **{name: "i32" for name in ("stride_w", "stride_s", "stride_z", "stride_on")}}, dict(
+        GROUP=128, BN=64, BK=128)
     yield "dequant", w4a16._w4_dequant_kernel, {
         "w_ptr": "*i32", "s_ptr": "*bf16", "z_ptr": "*i32", "out_ptr": "*bf16",
         **{name: "i32" for name in ("N", "K", "stride_wn", "stride_sn", "stride_zn", "stride_on")}}, dict(
@@ -539,7 +543,8 @@ def _compile_cases():
 
 
 @pytest.mark.parametrize("kind", [I.KIND_INT4_SYM, I.KIND_INT4_ZP, I.KIND_E2M1])
-@pytest.mark.parametrize("case", ["dot", "dot_g32", "dot8", "dot8_g128", "gemv", "gemv_g32", "dequant", "experts"])
+@pytest.mark.parametrize("case", ["dot", "dot_g32", "dot8", "dot8_g128", "gemv", "gemv_g32", "dequant",
+                                  "marlin_dequant", "experts"])
 def test_every_kernel_compiles_for_hopper(case, kind):
     """Triton's compiler, not its CPU interpreter, type-checks a kernel: a helper returning a tensor zero point in
     one constexpr branch and a scalar in another compiled for no GPU (job 1479's CompilationError) while the
@@ -591,6 +596,35 @@ def test_marlin_layout_is_vllms_bit_for_bit():
     assert digest(buffers["marlin_zero"]) == "a4d1b990568ff00b"
     mx = marlin.prepare(marlin.KIND_E2M1, codes.t(), e)
     assert digest(mx["marlin_scale"]) == "8460cded5b686f89" and digest(mx["marlin_weight"]) == "4b0d84388ea59149"
+
+
+@pytest.mark.parametrize("kind, group", [(I.KIND_INT4_SYM, 128), (I.KIND_INT4_ZP, 128), (I.KIND_INT4_ZP, 32),
+                                         (I.KIND_INT4_SYM, 64), (I.KIND_E2M1, 32)])
+def test_one_marlin_copy_holds_the_whole_weight(kind, group):
+    """A layer that takes Marlin keeps only Marlin's copy: ``unprepare`` reads back exactly the codes, scales and
+    zero points ``prepare`` was given, and the format dequantizes that copy to the planes layout's weight (what the
+    Marlin-layout dequant kernel, the large-M path, matches on a GPU)."""
+    from mstar.utils import marlin
+
+    torch.manual_seed(10)
+    n, k = 192, 512
+    w = torch.randn(n, k) * 0.05
+    if kind == I.KIND_E2M1:
+        fmt, stored = I.MXFP4, I.MXFP4.quantize_storage(w)
+        codes, scale, zero = I.unpack_fp4(stored["weight_packed"]), stored["weight_scale"], None
+    else:
+        fmt = I.W4A16Format(group=group, symmetric=kind == I.KIND_INT4_SYM, scale_dtype=torch.bfloat16)
+        stored = fmt.quantize_storage(w.to(torch.bfloat16))
+        zero = torch.randint(0, 16, (n, k // group), dtype=torch.uint8) if kind == I.KIND_INT4_ZP else None
+        if zero is not None:
+            stored["weight_zero_point"] = I.pack_int4(zero, dim=0)
+        codes, scale = I.unpack_int4(stored["weight_packed"]), stored["weight_scale"]
+    held = marlin.prepare(kind, codes, scale, zero)
+    back = marlin.unprepare(kind, held)
+    assert torch.equal(back[0], codes) and torch.equal(back[1], scale)
+    assert zero is None or torch.equal(back[2], zero)
+    one_copy = {name: torch.empty(0, dtype=torch.int32) for name in fmt.buffers} | held
+    assert torch.equal(fmt.dequantize(one_copy), fmt.dequantize(fmt.after_load(dict(stored))))
 
 
 def test_marlin_takes_the_shapes_it_was_built_for():
@@ -702,8 +736,9 @@ def test_cuda_tinygemm_copy_matches_the_reference(symmetric, group, m, monkeypat
                                          (I.KIND_INT4_ZP, 32), (I.KIND_E2M1, 32)])
 def test_cuda_marlin_matches_the_reference(kind, group):
     """The vendored Marlin (built on this GPU's toolchain: a GPU job has nvcc, so a failed build fails here) runs
-    what the format hands ``linear()`` below ``DEQUANT_M`` tokens, within a GEMM's tolerance of the reference (its
-    scales in bf16: AWQ's fp16 scales round once), the same output captured and replayed in a CUDA graph."""
+    what the format hands ``linear()`` below ``MARLIN_M`` tokens and its copy dequantized above, within a GEMM's
+    tolerance of the reference read from that copy (its scales in bf16: AWQ's fp16 scales round once), the same
+    output captured and replayed in a CUDA graph."""
     from mstar.utils import marlin, w4a16
 
     torch.manual_seed(9)
@@ -719,9 +754,15 @@ def test_cuda_marlin_matches_the_reference(kind, group):
         if kind == I.KIND_INT4_ZP:
             stored["weight_zero_point"] = I.pack_int4(torch.randint(2, 14, (n, k // group), device=dev), dim=0)
         buffers = fmt.after_load(stored)
-    assert buffers["marlin_weight"].numel() > 0
-    ref_w = fmt.dequantize(buffers).to(torch.bfloat16)
-    for m in (1, 5, 16, 33, 64, 100, w4a16.DEQUANT_M - 1):
+    # one copy: Marlin's, the planes layout empty
+    assert buffers["marlin_weight"].numel() > 0 and buffers["weight_planes"].numel() == 0
+    ref_w32 = fmt.dequantize(buffers)
+    ref_w = ref_w32.to(torch.bfloat16)
+    # the large-M path's dequant from Marlin's copy, exact
+    m_zero = buffers.get("marlin_zero")
+    assert torch.equal(w4a16.marlin_dequantize(buffers["marlin_weight"], buffers["marlin_scale"], m_zero, group, kind,
+                                               torch.float32), ref_w32)
+    for m in (1, 5, 16, 33, 64, 100, w4a16.MARLIN_M - 1, w4a16.MARLIN_M + 44):
         x = torch.randn(m, k, device=dev, dtype=torch.bfloat16)
         got = fmt.linear(x, *(buffers[b] for b in fmt.buffers))
         ref = F.linear(x.float(), ref_w.float())

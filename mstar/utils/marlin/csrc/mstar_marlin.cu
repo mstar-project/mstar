@@ -24,6 +24,7 @@
  * activation scales, global scale, bias or float zero points), registered under the op namespace
  * MSTAR_MARLIN_LIB (one per built variant, see mstar/utils/marlin/__init__.py), so it never collides with
  * vLLM's _C. The kernel instantiations and kernel_selector.h are generated per variant at build time.
+ * use_atomic_add / use_fp32_reduce are passed through (vLLM's defaults: false for N >= 2048, true).
  */
 
 #ifndef MARLIN_NAMESPACE_NAME
@@ -420,7 +421,8 @@ vllm::ScalarType weight_type(int64_t kind) {
 // ``workspace`` int32 zeros, at least one per SM (Marlin leaves them zero after each call).
 torch::Tensor mstar_marlin_gemm(const torch::Tensor& a, const torch::Tensor& b_q_weight,
                                 const torch::Tensor& b_scales, const c10::optional<torch::Tensor>& b_zeros,
-                                torch::Tensor& workspace, int64_t kind, int64_t size_n, int64_t size_k) {
+                                torch::Tensor& workspace, int64_t kind, int64_t size_n, int64_t size_k,
+                                bool use_atomic_add, bool use_fp32_reduce) {
   TORCH_CHECK(a.is_cuda() && a.dim() == 2 && a.size(1) == size_k, "mstar marlin: a must be CUDA [M, K]");
   TORCH_CHECK(a.stride(1) == 1 && a.stride(0) % 8 == 0 && reinterpret_cast<uint64_t>(a.data_ptr()) % 16 == 0,
               "mstar marlin: a must be row-major, 16-byte aligned, its row stride a multiple of 8");
@@ -461,9 +463,9 @@ torch::Tensor mstar_marlin_gemm(const torch::Tensor& a, const torch::Tensor& b_q
   const int64_t size_m = a.size(0);
   auto c = torch::empty({size_m, size_n}, a.options());
   if (size_m == 0) return c;
-  // use_fp32_reduce (vLLM's default): partial sums reduced in fp32 scratch
+  // use_fp32_reduce (vLLM's default): partial sums reduced in fp32 scratch; else in c's dtype
   int max_m_block_size = std::min<int>((size_m + 15) / 16 * 16, 64);
-  auto c_tmp = torch::empty({sms * max_m_block_size * MARLIN_NAMESPACE_NAME::max_thread_n},
+  auto c_tmp = torch::empty({use_fp32_reduce ? sms * max_m_block_size * MARLIN_NAMESPACE_NAME::max_thread_n : 0},
                             a.options().dtype(at::kFloat));
   auto empty = torch::empty({0}, a.options());
   auto zeros = has_zp ? *b_zeros : torch::empty({0}, a.options().dtype(at::kInt));
@@ -474,8 +476,7 @@ torch::Tensor mstar_marlin_gemm(const torch::Tensor& a, const torch::Tensor& b_q
                     a_s.data_ptr(), b_scales.data_ptr(), g_s.data_ptr(), zeros.data_ptr(), size_m, size_n, size_k,
                     a.stride(0), workspace.data_ptr(), a_type, b_type, a_type, s_type, /*has_bias=*/false, has_zp,
                     num_groups, group_size, dev, at::cuda::getCurrentCUDAStream(dev), /*thread_k_init=*/-1,
-                    /*thread_n_init=*/-1, sms, /*use_atomic_add=*/false, /*use_fp32_reduce=*/true,
-                    /*is_zp_float=*/false);
+                    /*thread_n_init=*/-1, sms, use_atomic_add, use_fp32_reduce, /*is_zp_float=*/false);
   return c;
 }
 
@@ -484,7 +485,7 @@ torch::Tensor mstar_marlin_gemm(const torch::Tensor& a, const torch::Tensor& b_q
 
 MSTAR_LIBRARY(MSTAR_MARLIN_LIB, m) {
   m.def("gemm(Tensor a, Tensor b_q_weight, Tensor b_scales, Tensor? b_zeros, Tensor(a!) workspace, int kind, "
-        "int size_n, int size_k) -> Tensor");
+        "int size_n, int size_k, bool use_atomic_add, bool use_fp32_reduce) -> Tensor");
 }
 
 MSTAR_LIBRARY_IMPL(MSTAR_MARLIN_LIB, CUDA, m) { m.impl("gemm", &mstar_marlin_gemm); }

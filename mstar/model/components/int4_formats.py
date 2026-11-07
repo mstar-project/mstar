@@ -132,9 +132,10 @@ class W4A16Format(LinearFormat):
                  layout: str = "compressed-tensors", zero_offset: int = 0):
         self.group, self.symmetric, self.scale_dtype = group, symmetric, scale_dtype
         self.layout, self.zero_offset = layout, zero_offset
-        # weight_planes: the checkpoint's weight_packed in the Triton kernels' layout (``to_planes``), built at load
-        # marlin_*: the vendored Marlin GEMM's copy (``mstar.utils.marlin``), built at load on CUDA where it builds;
-        # tinygemm_*: torch's int4 GEMM's copy (1-3 tokens) where Marlin doesn't; empty placeholders elsewhere
+        # Built at load, one 4-bit copy of the weight: marlin_* (the vendored Marlin GEMM's, ``mstar.utils.marlin``)
+        # on CUDA where it builds and takes the shape; else weight_planes (the checkpoint's weight_packed in the
+        # Triton kernels' layout, ``to_planes``) with its scales and zero points, plus tinygemm_* (torch's int4 GEMM,
+        # 1-3 tokens) on CUDA. What a layer doesn't keep is an empty placeholder.
         self.buffers = (("weight_planes", "weight_scale") + (() if symmetric else ("weight_zero_point",))
                         + ("tinygemm_weight", "tinygemm_scale_zero", "marlin_weight", "marlin_scale")
                         + (() if symmetric else ("marlin_zero",)))
@@ -212,6 +213,8 @@ class W4A16Format(LinearFormat):
         return suffix, tensor
 
     def dequantize(self, buffers: Mapping[str, torch.Tensor]) -> torch.Tensor:
+        if "weight_packed" not in buffers and not buffers["weight_planes"].numel():
+            return self._dequantize_marlin(buffers)
         packed = buffers["weight_packed"] if "weight_packed" in buffers else from_planes(buffers["weight_planes"])
         u = unpack_int4(packed).float()
         n, k = u.shape
@@ -239,16 +242,33 @@ class W4A16Format(LinearFormat):
                                                             device=weight.device), dim=0)
         return out
 
+    def _dequantize_marlin(self, buffers) -> torch.Tensor:
+        from mstar.utils import marlin
+
+        kind = KIND_INT4_SYM if self.symmetric else KIND_INT4_ZP
+        held = {name: buffers[name] for name in buffers if name.startswith("marlin_")}
+        if held["marlin_scale"].dtype == _I16:  # the module's container: Marlin's scales are bf16
+            held["marlin_scale"] = held["marlin_scale"].view(torch.bfloat16)
+        codes, scale, *zero = marlin.unprepare(kind, held)
+        n, k = codes.shape
+        zero = zero[0].float()[..., None] if zero else 8.0
+        return ((codes.float().view(n, -1, self.group) - zero) * scale.float()[..., None]).view(n, k)
+
     def after_load(self, tensors):
-        """The checkpoint's weight in the Triton kernels' layout (``weight_planes``), and Marlin's copy of it where
-        Marlin builds, else tinygemm's."""
+        """One 4-bit copy: Marlin's where it builds (the checkpoint layout's placeholders empty), else the Triton
+        kernels' layout (``weight_planes``) and tinygemm's."""
         if "weight_planes" in tensors:
             return dict(tensors)
+        marlin = self._marlin(tensors)
+        if marlin["marlin_weight"].numel():
+            dev = marlin["marlin_weight"].device
+            out = {name: torch.empty(0, dtype=t.dtype, device=dev) for name, t in tensors.items()
+                   if name != "weight_packed"}
+            out["weight_planes"] = torch.empty(0, dtype=_I32, device=dev)
+            return {**out, **self._tinygemm(tensors, skip=True), **marlin}
         out = {name: t for name, t in tensors.items() if name != "weight_packed"}
         out["weight_planes"] = to_planes(tensors["weight_packed"])
-        marlin = self._marlin(tensors)
-        tinygemm = self._tinygemm(tensors, skip=marlin["marlin_weight"].numel() > 0)
-        return {**out, **tinygemm, **marlin}
+        return {**out, **self._tinygemm(tensors), **marlin}
 
     def _marlin(self, tensors) -> dict[str, torch.Tensor]:
         packed = tensors["weight_packed"]
@@ -343,12 +363,18 @@ class Mxfp4Format(LinearFormat):
         return tensor.view(_U8) if tensor.dtype != _U8 and tensor.element_size() == 1 else tensor
 
     def dequantize(self, buffers):
+        scale = buffers.get("weight_scale")
         if "weight_packed" in buffers:
             codes = unpack_fp4(buffers["weight_packed"].view(_U8))
-        else:
+        elif buffers["weight_planes"].numel():
             codes = unpack_int4(from_planes(buffers["weight_planes"].view(_I32)))
+        else:
+            from mstar.utils import marlin
+
+            codes, scale = marlin.unprepare(KIND_E2M1, {"marlin_weight": buffers["marlin_weight"],
+                                                        "marlin_scale": buffers["marlin_scale"]})
         n, k = codes.shape
-        scale = torch.exp2(buffers["weight_scale"].view(_U8).float() - 127.0)
+        scale = torch.exp2(scale.view(_U8).float() - 127.0)
         return (e2m1_values(codes).view(n, -1, 32) * scale[..., None]).view(n, k)
 
     def quantize_weight(self, weight, input_amax):
@@ -367,7 +393,9 @@ class Mxfp4Format(LinearFormat):
             from mstar.utils import marlin
 
             if marlin.shape_reason(KIND_E2M1, 32, n, k) is None and marlin.available(KIND_E2M1, 32, packed.device):
+                # one copy: Marlin's, the planes layout and its scales left empty
                 out.update(marlin.prepare(KIND_E2M1, unpack_fp4(packed), tensors["weight_scale"].view(_U8)))
+                out.update(weight_planes=empty, weight_scale=torch.empty(0, dtype=_U8, device=packed.device))
         return out
 
     def quantize_storage(self, weight):

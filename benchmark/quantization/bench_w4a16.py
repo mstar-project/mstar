@@ -32,9 +32,11 @@ DOT8 = [{"BN": bn, "NB": nb, "STAGES": st, "num_warps": w} for bn, nb, st, w in
 
 
 def _weights(kind: str, n: int, k: int, device):
-    """The served buffers of a random weight (planes layout, scales, zero points), its kind, and the copies the
-    other GEMMs read: tinygemm's (always built here, so it is timed beside Marlin) and Marlin's (None where the
-    vendored op doesn't build or take the shape)."""
+    """A random weight's Triton buffers (planes layout, scales, zero points; built with Marlin off, as a layer
+    without it keeps them), its kind, tinygemm's copy, and Marlin's copy (None where the vendored op doesn't build
+    or take the shape): a served layer keeps Marlin's or the others, the benchmark times both."""
+    import os
+
     from mstar.model.components import int4_formats as I
 
     w = (torch.randn(n, k, device=device) * 0.02).to(torch.bfloat16)
@@ -45,8 +47,13 @@ def _weights(kind: str, n: int, k: int, device):
         stored = fmt.quantize_storage(w)
         if kind == "int4zp":
             stored["weight_zero_point"] = I.pack_int4(torch.randint(4, 12, (n, k // 128), device=device), dim=0)
-    q = fmt.after_load(dict(stored))
-    marlin = (q["marlin_weight"], q["marlin_scale"], q.get("marlin_zero")) if q["marlin_weight"].numel() else None
+    mq = fmt.after_load(dict(stored))
+    marlin = (mq["marlin_weight"], mq["marlin_scale"], mq.get("marlin_zero")) if mq["marlin_weight"].numel() else None
+    os.environ["MSTAR_W4A16_MARLIN"] = "0"
+    try:
+        q = fmt.after_load(dict(stored))
+    finally:
+        del os.environ["MSTAR_W4A16_MARLIN"]
     if kind == "mxfp4":
         return q["weight_planes"].view(torch.uint8), q["weight_scale"], None, 32, I.KIND_E2M1, None, None, marlin
     tg = fmt._tinygemm(stored)
@@ -80,6 +87,7 @@ def main() -> None:
         for wkind in args.kinds.split(","):
             packed, scale, zp, group, code, tg_w, tg_sz, marlin = _weights(wkind, n, k, dev)
             mbufs = marlin or (None, None, None)
+            empty = torch.empty(0, dtype=torch.int32, device=dev)
             ref_w = I.dequantize_kind(packed, scale, zp, group, code).to(torch.bfloat16)
             blocks = k // 128
             for m in (int(t) for t in args.tokens.split(",")):
@@ -88,15 +96,17 @@ def main() -> None:
                 base_us = _time(lambda: F.linear(x, ref_w), args.iters)  # noqa: B023
                 base = {"layer": layer, "n": n, "k": k, "tokens": m, "kind": wkind}
                 rows.append({**base, "impl": "bf16", "us": round(base_us, 2)})
-                # the built-in dispatch as gemm runs it (Marlin, else tinygemm first), timed with no override, and
-                # what it runs without Marlin
+                # the built-in dispatch on what a served layer keeps (Marlin's copy, else the Triton buffers and
+                # tinygemm's), timed with no override, and what it runs without Marlin
                 tiny_first = tg_w is not None and m <= w4a16.TINYGEMM_MAX
                 triton_choice = ("tinygemm", {}) if tiny_first else w4a16.config(m, n, k, group, code, sms)
-                marlin_first = marlin is not None and m < w4a16.DEQUANT_M
-                cands = [("builtin", ("marlin", {}) if marlin_first else triton_choice),
+                marlin_choice = ("marlin", {}) if m < w4a16.MARLIN_M else ("marlin_dequant", {})
+                cands = [("builtin", marlin_choice if marlin is not None else triton_choice),
                          ("builtin_triton", triton_choice)]
-                if marlin is not None and m < 512:
-                    cands.append(("marlin", ("marlin", {})))
+                if marlin is not None:
+                    cands += [("marlin", ("marlin", {})), ("marlin_bf16reduce", ("marlin_bf16reduce", {}))]
+                    if m >= 64:
+                        cands.append(("marlin_dequant", ("marlin_dequant", {})))
                 if tg_w is not None and m <= 64:
                     cands.append(("tinygemm", ("tinygemm", {})))
                 if m <= w4a16.GEMV_MAX:
@@ -116,10 +126,15 @@ def main() -> None:
                     cfg = dict(cfg)
                     if path == "gemv":
                         cfg["SPLIT_K"] = w4a16._split(-(-n // cfg["BN"]), blocks // cfg["NB"], sms, 4)
+                    # a Marlin path runs on Marlin's copy alone (the planes empty, as served), the rest on the
+                    # Triton buffers alone
+                    on_marlin = path.startswith("marlin") or (name == "builtin" and marlin is not None)
+                    bufs = ((empty, empty, None, None, None, *mbufs) if on_marlin
+                            else (packed, scale, zp, tg_w, tg_sz, None, None, None))
                     try:
                         w4a16.CONFIG_OVERRIDE = None if name == "builtin" else (lambda *a, p=path, c=cfg: (p, c))
-                        run = lambda: w4a16.gemm(x, packed, scale, zp, group, code, tg_w, tg_sz,  # noqa: E731,B023
-                                                 *mbufs)  # noqa: B023
+                        run = lambda: w4a16.gemm(x, bufs[0], bufs[1], bufs[2], group, code,  # noqa: E731,B023
+                                                 *bufs[3:])  # noqa: B023
                         out = run()
                         err = ((out.float() - ref.float()).norm() / ref.float().norm()).item()
                         if not err < 1e-2:

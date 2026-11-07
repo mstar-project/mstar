@@ -43,6 +43,9 @@ from mstar.model.components.int4_formats import KIND_E2M1, KIND_INT4_ZP, w4a16_l
 TINYGEMM_MAX = 3
 GEMV_MAX = 4
 DEQUANT_M = 192
+# Marlin below this many tokens, dequant (from Marlin's copy) + cuBLAS from it: job 1527 measured Marlin 0.57-0.76x
+# of bf16 at 128 tokens where dequant + cuBLAS had 0.39-0.44x, both ~0.5x at 256
+MARLIN_M = 256
 
 
 @triton.jit
@@ -295,6 +298,36 @@ def _w4_dequant_kernel(
              mask=live_n[:, None])
 
 
+@triton.jit
+def _marlin_dequant_kernel(
+    w_ptr, s_ptr, z_ptr, wt_ptr, st_ptr, zt_ptr, out_ptr, stride_w, stride_s, stride_z, stride_on,
+    KIND: tl.constexpr, GROUP: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
+):
+    """A ``[BN, BK]`` tile of the weight from Marlin's copy (``mstar.utils.marlin.prepare``), through the lookup
+    tables of ``marlin.tables`` (where each code, scale and zero point sits), stored row-major: the large-M path
+    when the format keeps only Marlin's copy. N a multiple of 64 and K of 128, so no masks."""
+    n = tl.program_id(0) * BN + tl.arange(0, BN)
+    k = tl.program_id(1) * BK + tl.arange(0, BK)
+    nc, nn = n // 64, n % 64
+    t = tl.load(wt_ptr + (k % 16)[None, :] * 64 + nn[:, None])
+    words = tl.load(w_ptr + (k // 16)[None, :].to(tl.int64) * stride_w + (nc * 128)[:, None] + (t >> 5))
+    codes = (words >> (t & 31)) & 0xF
+    g = (k // GROUP)[None, :]
+    col = (nc * 64 + tl.load(st_ptr + nn))[:, None]
+    if KIND == 2:
+        scale = tl.exp2(tl.load(s_ptr + g * stride_s + col).to(tl.float32) - 127.0)
+        v = _e2m1(codes) * scale
+    else:
+        scale = tl.load(s_ptr + g * stride_s + col).to(tl.float32)
+        if KIND == 1:
+            zt = tl.load(zt_ptr + nn)
+            zw = tl.load(z_ptr + g * stride_z + (nc * 8 + (zt >> 5))[:, None])
+            v = (codes - ((zw >> (zt & 31)[:, None]) & 0xF)).to(tl.float32) * scale
+        else:
+            v = (codes - 8).to(tl.float32) * scale
+    tl.store(out_ptr + n[:, None].to(tl.int64) * stride_on + k[None, :], v.to(out_ptr.dtype.element_ty))
+
+
 @lru_cache(maxsize=None)
 def _sm_count(index: int) -> int:
     return torch.cuda.get_device_properties(index).multi_processor_count
@@ -370,32 +403,62 @@ def _marlin_lib(kind: int, group: int, device: torch.device) -> str | None:
     return marlin.available(kind, group, device)
 
 
+def marlin_dequantize(marlin_weight: torch.Tensor, marlin_scale: torch.Tensor, marlin_zero: torch.Tensor | None,
+                      group: int, kind: int, dtype: torch.dtype) -> torch.Tensor:
+    """The ``[N, K]`` weight in ``dtype`` from Marlin's copy (``mstar.utils.marlin.prepare``)."""
+    from mstar.utils import marlin
+
+    w = marlin_weight.view(torch.int32)
+    k, n = w.shape[0] * 16, w.shape[1] // 2
+    t = marlin.tables(w.device)
+    s = marlin_scale.view(torch.uint8) if kind == KIND_E2M1 else marlin_scale
+    z = marlin_zero.view(torch.int32) if marlin_zero is not None and marlin_zero.numel() else w
+    out = torch.empty((n, k), dtype=dtype, device=w.device)
+    _marlin_dequant_kernel[(n // 64, k // 128)](
+        w, s, z, t["weight"], t["scale_e2m1" if kind == KIND_E2M1 else "scale"], t["zero"], out, w.stride(0),
+        s.stride(0), z.stride(0), out.stride(0), KIND=kind, GROUP=group, BN=64, BK=128, num_warps=4,
+    )
+    return out
+
+
 def gemm(x: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor, zero_point: torch.Tensor | None, group: int,
          kind: int, tinygemm_weight: torch.Tensor | None = None, tinygemm_scale_zero: torch.Tensor | None = None,
          marlin_weight: torch.Tensor | None = None, marlin_scale: torch.Tensor | None = None,
          marlin_zero: torch.Tensor | None = None) -> torch.Tensor:
-    """``x @ W.T`` for ``W`` in the planes layout (uint8 ``[N, K/2]`` or int32 ``[N, K/8]``), K a multiple of 128:
-    Marlin below ``DEQUANT_M`` tokens where the format built its copy (bf16 activations), else tinygemm for its
-    first ``TINYGEMM_MAX`` tokens, else ``config``'s Triton path."""
+    """``x @ W.T`` for ``W`` in the planes layout (uint8 ``[N, K/2]`` or int32 ``[N, K/8]``), K a multiple of 128,
+    or only in Marlin's copy (``weight`` empty: the format keeps one copy where Marlin builds): Marlin below
+    ``MARLIN_M`` tokens (bf16 activations), dequant from its copy + cuBLAS above; without Marlin's copy, tinygemm for
+    its first ``TINYGEMM_MAX`` tokens, else ``config``'s Triton path."""
     words = _words(weight)
     m, k = x.shape
-    n = words.shape[0]
-    assert words.shape[1] * 8 == k and k % 128 == 0 and words.is_contiguous(), (tuple(weight.shape), k)
-    assert kind != KIND_INT4_ZP or zero_point is not None
+    has_marlin = marlin_weight is not None and marlin_weight.numel() > 0
+    if not words.numel():
+        assert has_marlin, "w4a16: neither the planes layout nor Marlin's copy"
+        if CONFIG_OVERRIDE is not None and CONFIG_OVERRIDE(m, 0, k, group, kind, 0)[0] not in (
+                "marlin", "marlin_bf16reduce", "marlin_dequant"):
+            raise ValueError("w4a16: a Triton path needs the planes layout; this weight keeps only Marlin's copy")
+    n = marlin_weight.shape[1] // 2 if not words.numel() else words.shape[0]
+    assert not words.numel() or (words.shape[1] * 8 == k and k % 128 == 0 and words.is_contiguous()), (
+        tuple(weight.shape), k)
+    assert kind != KIND_INT4_ZP or zero_point is not None or has_marlin
     # Marlin reads x in 16-byte vectors: rows contiguous and aligned
-    marlin = (marlin_weight is not None and marlin_weight.numel() > 0 and x.dtype == torch.bfloat16
-              and x.stride(1) == 1 and x.stride(0) % 8 == 0 and x.data_ptr() % 16 == 0)
-    if CONFIG_OVERRIDE is None and m < DEQUANT_M and marlin:
-        path, cfg = "marlin", {}
+    marlin = (has_marlin and x.dtype == torch.bfloat16 and x.stride(1) == 1 and x.stride(0) % 8 == 0
+              and x.data_ptr() % 16 == 0)
+    if CONFIG_OVERRIDE is None and has_marlin:
+        path, cfg = ("marlin" if marlin and m < MARLIN_M else "marlin_dequant"), {}
     elif (CONFIG_OVERRIDE is None and m <= TINYGEMM_MAX and tinygemm_weight is not None and tinygemm_weight.numel()
             and x.dtype == tinygemm_scale_zero.dtype):
         path, cfg = "tinygemm", {}
     else:
         path, cfg = (CONFIG_OVERRIDE or config)(m, n, k, group, kind, _sm_count(x.device.index or 0))
-    if path == "marlin":
+    if path in ("marlin", "marlin_bf16reduce"):
         from mstar.utils import marlin as M
 
-        return M.gemm(_marlin_lib(kind, group, x.device), x, marlin_weight, marlin_scale, marlin_zero, kind, n)
+        return M.gemm(_marlin_lib(kind, group, x.device), x, marlin_weight, marlin_scale, marlin_zero, kind, n,
+                      fp32_reduce=path == "marlin")
+    if path == "marlin_dequant":
+        return torch.nn.functional.linear(x, marlin_dequantize(marlin_weight, marlin_scale, marlin_zero, group,
+                                                               kind, x.dtype))
     if path == "tinygemm":
         return torch.ops.aten._weight_int4pack_mm(x, tinygemm_weight, group, tinygemm_scale_zero)
     if path == "dequant":
