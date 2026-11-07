@@ -727,8 +727,10 @@ class DROIDDataset(BaseDataset):
     decoded to a PNG, and a request carries what openpi's pi05_droid policy
     takes (configs/pi05_droid.yaml): the exterior_image_1_left and
     wrist_image_left frames and the recorded state, unpadded. droid_100 records
-    the end-effector pose and gripper rather than joint positions, so the state
-    has the right width for a DROID request but not the right meaning.
+    7 values, the end-effector pose and gripper, rather than DROID's 7 joint
+    positions and gripper, so the state has neither the width nor the meaning
+    of a DROID request: ``/generate`` takes it (a state shorter than the norm
+    stats is allowed, as openpi allows it), and the openpi WebSocket refuses it.
 
     Args:
         local_file_dir:  directory for extracted PNGs (created if absent).

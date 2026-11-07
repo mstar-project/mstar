@@ -30,6 +30,11 @@ class Pi05Tokenizer:
         self.config = config
 
     def encode_prompt(self, prompt: str) -> torch.Tensor:
+        """Refuses a prompt over ``max_lang_tokens``. openpi truncates it instead,
+        which cuts off the state and "Action:" that end the prompt."""
         ids = self.hf_tokenizer(prompt, add_special_tokens=True).input_ids
-        ids = ids[: self.config.max_lang_tokens]
+        limit = self.config.max_lang_tokens
+        if len(ids) > limit:
+            raise ValueError(f"the prompt is {len(ids)} tokens, task and robot state together; "
+                             f"pi0.5 takes at most {limit} (max_lang_tokens)")
         return torch.tensor(ids, dtype=torch.long)
