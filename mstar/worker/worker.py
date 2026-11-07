@@ -2702,6 +2702,14 @@ class Worker(RepeatingSteps):
                     laps.lap("gpu_exec_events")
             return outputs
         finally:
+            # A submitted group can fail during collection, before its ordinary
+            # completion event. Failure cleanup must still await these readers.
+            if group is not None and group.submitted and execution_stream is not None:
+                if node_batch.completion_event is None:
+                    event = torch.Event(device=self.device)
+                    event.record(execution_stream)
+                    for _, member in group.members:
+                        member.completion_event = event
             # Safety net: a step that raised before publishing outputs or
             # committing would otherwise strand the plan thread preparing the
             # next one. The engine does this too on its own paths; here covers
@@ -2951,15 +2959,19 @@ class Worker(RepeatingSteps):
         """A step that ran, on any lane: its batch limit lifts, its outputs
         are postprocessed and routed, and metrics count it."""
         if step.group is not None and step.group.submitted:
-            for i, (scheduled, executing) in enumerate(step.group.members):
-                member = replace(step, batch=scheduled, node_batch=executing, node_name=scheduled.node_name,
-                                 graph_walk=scheduled.graph_walk,
-                                 partition=self.request_state.get_partition_for_node(scheduled.node_name), group=None)
-                if i != step.group.trigger:
-                    self._clear_in_flight_flag(scheduled)
-                    self._settle_step_rows(member, executing.outputs)
-                self._finish_step(member, executing.outputs)
-            step.group.parts.clear()
+            try:
+                for i, (scheduled, executing) in enumerate(step.group.members):
+                    member = replace(step, batch=scheduled, node_batch=executing, node_name=scheduled.node_name,
+                                     graph_walk=scheduled.graph_walk,
+                                     partition=self.request_state.get_partition_for_node(scheduled.node_name),
+                                     group=None)
+                    if i != step.group.trigger:
+                        self._clear_in_flight_flag(scheduled)
+                        self._settle_step_rows(member, executing.outputs)
+                    self._finish_step(member, executing.outputs)
+            finally:
+                self.engine_manager.get_engine(step.node_name).release_group(step.group)
+                step.group.parts.clear()
             return
         self.scheduler.clear_batch_limit(
             step.node_name, step.graph_walk, len(step.batch.request_to_worker_graph),
@@ -5247,6 +5259,8 @@ class Worker(RepeatingSteps):
                 )
             if stale.group is not None:
                 self._settle_group_claim(stale.group)
+                self.engine_manager.get_engine(stale.node_name).release_group(stale.group)
+                stale.group.parts.clear()
         if batch is not None:
             failed_rids.update(batch.request_to_worker_graph)
             self._clear_in_flight_flag(batch)

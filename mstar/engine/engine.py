@@ -2702,11 +2702,20 @@ class Engine:
                     torch.accelerator.current_stream(self._device).synchronize()
                 for step in reversed(admitted):
                     self._runner.rollback_admit(step)
+                self.release_group(group)
             for _, batch in reversed(group.members):
-                lease = leases.get(batch.node_name)
-                if lease is not None:
-                    self._submodules[batch.node_name].accelerator_graph_runner.release(lease, len(rows))
                 batch.release_waiters()
+
+    def release_group(self, group: ExecutionGroup) -> None:
+        """After all member tails (or failure): return their existing capture leases."""
+        event = group.members[group.trigger][1].completion_event
+        if event is not None:
+            event.synchronize()
+        for _, batch in reversed(group.members):
+            lease = batch.step_context.slot_lease
+            if lease is not None:
+                self._submodules[batch.node_name].accelerator_graph_runner.release(lease, len(batch.request_ids))
+                batch.step_context.slot_lease = None
 
     def _collect_step(
         self, batch: ExecutingBatch, submodule_mgmt: SubmoduleManagement,

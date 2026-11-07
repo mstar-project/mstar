@@ -171,6 +171,7 @@ def test_connected_members_launch_once_with_ordered_real_and_future_rows(mixed, 
         return run(ops)
     runner._run = launch
     outputs = eng.exec_group(group)
+    eng.release_group(group)
     assert group.submitted and group.refusal is None and len(runs) == 1
     assert a.next_slot == 1  # one component lease, shared by both members
     assert events == ["a", "b", "release:b", "release:a"]
@@ -221,6 +222,7 @@ def test_connected_cuda_launch_copies_future_values_and_preserves_external_outpu
 
     monkeypatch.setattr(cuda, "launch", launch_counted)
     outputs = eng.exec_group(group)
+    eng.release_group(group)
     assert group.submitted and group.refusal is None and len(calls) == 1
     torch.cuda.synchronize()
     assert events == ["release:b", "release:a"]
@@ -423,9 +425,57 @@ def test_connected_capture_can_run_when_the_eager_forward_does_not_batch():
     for mgmt in eng._submodules.values():
         mgmt.submodule.can_batch = lambda **kw: False
     outputs = eng.exec_group(group)
+    eng.release_group(group)
     assert group.submitted and len(outputs) == 2
     assert outputs[1].per_rid_outputs[2]["x"][0].tolist() == [[112., 112.]]
     assert events == ["a", "b", "release:b", "release:a"]
+
+
+@pytest.mark.parametrize("fail_member", [None, "a", "b"])
+def test_connected_worker_keeps_capture_leases_through_all_member_tails(fail_member):
+    from contextlib import nullcontext
+
+    from mstar.worker.worker import PendingBatch, Worker
+
+    eng, group, events = _connected_engine()
+    group.trigger = 1
+    outputs = eng.exec_group(group)
+    assert events == ["a", "b"]
+    assert all(batch.step_context.slot_lease is not None for _, batch in group.members)
+    event = SimpleNamespace(synchronize=lambda: events.append("await"))
+    for _, batch in group.members:
+        batch.completion_event = event
+    worker = Worker.__new__(Worker)
+    worker.engine_manager = SimpleNamespace(get_engine=lambda node: eng)
+    worker.request_state = SimpleNamespace(get_partition_for_node=lambda node: node)
+    worker.scheduler = SimpleNamespace(clear_batch_limit=lambda *a, **kw: None)
+    worker._phase_period = 0
+    worker._metrics = None
+    worker._span = lambda *a, **kw: nullcontext()
+    worker._clear_in_flight_flag = lambda scheduled: None
+
+    def finish(step, output, **kwargs):
+        assert all(batch.step_context.slot_lease is not None for _, batch in group.members)
+        assert output is group.members[0 if step.node_name == "a" else 1][1].outputs
+        events.append(f"tail:{step.node_name}")
+        if step.node_name == fail_member:
+            raise ValueError("output routing failed")
+
+    worker._postprocess_batch = finish
+    scheduled, batch = group.members[group.trigger]
+    pending = PendingBatch(scheduled, batch, scheduled.node_name, "p", scheduled.graph_walk, None, group=group)
+    if fail_member is None:
+        worker._finish_step(pending, outputs[group.trigger])
+    else:
+        with pytest.raises(ValueError, match="output routing failed"):
+            worker._finish_step(pending, outputs[group.trigger])
+    tails = ["tail:a"] if fail_member == "a" else ["tail:a", "tail:b"]
+    assert events == ["a", "b", *tails, "await", "release:b", "release:a"]
+    assert all(batch.step_context.slot_lease is None for _, batch in group.members)
+    assert not group.parts
+    # Main-loop failure cleanup can encounter this same group a second time.
+    eng.release_group(group)
+    assert events.count("release:a") == events.count("release:b") == 1
 
 
 @pytest.mark.parametrize("kept", [frozenset(), frozenset({1})])
@@ -435,6 +485,7 @@ def test_connected_completion_keeps_ordinary_last_member_metadata(kept):
     group.members[0][1].rows_only = True
     group.members[1][1].loopback_rids = kept
     outputs = eng.exec_group(group)
+    eng.release_group(group)
     assert group.submitted
     assert outputs[1].loopback_rids == kept
     assert eng._loopback_steps == {rid: ("b", "prefill") for rid in kept}
@@ -478,7 +529,7 @@ def test_connected_preserves_ordinary_output_precedence(replacement, monkeypatch
     batch = group.members[0][1]
     if batch.inputs is None:
         eng.prepare_inputs(batch)
-        eng.reserve_replay_slot(batch)
+    eng.reserve_replay_slot(batch)
     ordinary = eng._collect_step(batch, mgmt, batch.step_context.slot_lease, slot.static_outputs,
                                  batch.inputs, batch.per_request_info_wrapped)
     assert ordinary.per_rid_outputs[2]["x"][0].tolist() == [[42., 42.]]
@@ -514,6 +565,7 @@ def test_composed_unit_reuses_capture_bindings_across_new_real_inputs():
             rid: {"x": [torch.full((1, 2), float(rid + offset))]} for rid in (2, 1)
         }
         outputs = eng.exec_group(group)
+        eng.release_group(group)
         assert group.submitted and not group.refusal
         retained.append(outputs[1].per_rid_outputs[1]["x"][0].clone())
     assert len(compositions) == 1 and len(launches) == 2
@@ -534,6 +586,7 @@ def test_connected_loop_repeats_from_its_first_seed_and_keeps_each_members_outpu
         batch.step_context.repeats = repeats
         eng._submodules[batch.node_name].run_columns["prefill"] = frozenset({"x"})
     outputs = eng.exec_group(group)
+    eng.release_group(group)
     assert group.submitted and group.refusal is None
     assert events == (["a", "b"] * repeats if device == "cpu" else []) + ["release:b", "release:a"]
     for i, output in enumerate(outputs):
@@ -589,6 +642,7 @@ def test_connected_round_count_settles_before_admit_and_late_narrowing_unwinds_e
         mgmt.resources = {name: owners[name]}
         mgmt.submodule.declare_step = lambda name=name, **kw: SubmoduleStep(steps={name: ResourceStep()})
     result = eng.exec_group(group)
+    eng.release_group(group)
     if late:
         assert result is None and not group.submitted
         assert admitted == [(0, 3), (1, 3)] and rolled_back == [1, 0]
@@ -687,6 +741,7 @@ def test_connected_inputs_reach_captured_row_owners_only_after_submission(repeat
         assert all(torch.equal(owner.read("x", (2, 1)), values) for owner, values in zip(owners, before, strict=True))
         return
     outputs = eng.exec_group(group)
+    eng.release_group(group)
     assert group.submitted and group.refusal is None
     for rid in (2, 1):
         expected = torch.tensor([[rid + 110 * (i + 1)] * 2 for i in range(repeats)])
