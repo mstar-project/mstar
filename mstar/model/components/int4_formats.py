@@ -52,7 +52,7 @@ def pack_int4(values: torch.Tensor, dim: int = -1) -> torch.Tensor:
     if v.shape[-1] % 8:
         v = F.pad(v, (0, 8 - v.shape[-1] % 8))
     words = (v.reshape(*v.shape[:-1], -1, 8) << _SHIFTS.to(v.device)).sum(-1)
-    return torch.where(words >= 2**31, words - 2**32, words).to(_I32).movedim(-1, dim)
+    return torch.where(words >= 2**31, words - 2**32, words).to(_I32).movedim(-1, dim).contiguous()
 
 
 def unpack_awq(packed: torch.Tensor) -> torch.Tensor:

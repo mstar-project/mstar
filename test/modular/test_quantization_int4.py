@@ -515,7 +515,7 @@ def _kernel_case(kind, n, k, group, device):
 @cuda
 @pytest.mark.parametrize("kind, group", [(I.KIND_INT4_SYM, 128), (I.KIND_INT4_ZP, 128), (I.KIND_INT4_SYM, 32),
                                          (I.KIND_INT4_ZP, 32), (I.KIND_E2M1, 32)])
-@pytest.mark.parametrize("m", [1, 7, 48, 300])
+@pytest.mark.parametrize("m", [1, 3, 7, 48, 300, 600])
 def test_cuda_dequant_gemm_matches_the_reference(kind, group, m):
     from mstar.utils import w4a16
 
@@ -538,6 +538,30 @@ def test_cuda_dequant_gemm_matches_the_reference(kind, group, m):
     graph.replay()
     torch.cuda.synchronize()
     assert torch.equal(out, got)
+
+
+@cuda
+@pytest.mark.parametrize("kind, group", [(I.KIND_INT4_SYM, 128), (I.KIND_INT4_ZP, 32), (I.KIND_E2M1, 32)])
+@pytest.mark.parametrize("path, m, cfg", [
+    ("gemv", 1, {"BN": 32, "BK": 256, "SPLIT_K": 1, "num_warps": 4}),
+    ("gemv", 4, {"BN": 64, "BK": 128, "SPLIT_K": 3, "num_warps": 4}),
+    ("dot", 5, {"BN": 64, "TB": 16, "BK": 128, "SPLIT_K": 2, "STAGES": 3, "num_warps": 4}),
+    ("dot", 200, {"BN": 128, "TB": 128, "BK": 64, "SPLIT_K": 1, "STAGES": 2, "num_warps": 8}),
+])
+def test_cuda_every_path_and_split_matches_the_reference(kind, group, path, m, cfg, monkeypatch):
+    """Each path at a tile the built-in rule may not pick (the benchmark sweeps them)."""
+    from mstar.utils import w4a16
+
+    torch.manual_seed(6)
+    dev = torch.device("cuda")
+    n, k = 1536, 1024
+    packed, scale, zp = _kernel_case(kind, n, k, group, dev)
+    ref_w = I.dequantize_kind(packed.cpu(), scale.cpu(), None if zp is None else zp.cpu(), group, kind)
+    monkeypatch.setattr(w4a16, "CONFIG_OVERRIDE", lambda *a: (path, cfg))
+    x = torch.randn(m, k, device=dev, dtype=torch.bfloat16)
+    got = w4a16.gemm(x, packed, scale, zp, group, kind)
+    ref = F.linear(x.float(), ref_w.to(dev).to(torch.bfloat16).float())
+    assert ((got.float() - ref).norm() / ref.norm()).item() < 5e-3
 
 
 @cuda

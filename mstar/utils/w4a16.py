@@ -1,20 +1,29 @@
 # SPDX-License-Identifier: Apache-2.0
-# Adapted from vLLM's ``model_executor/layers/quantization/awq_triton.py`` and the int4 (``use_int4_w4a16``) branch
-# of SGLang's / vLLM's ``fused_moe_kernel_gptq_awq`` (both Apache-2.0, Copyright the vLLM and SGLang authors): the
-# K-split dequant GEMM, reading the packed weight byte per K pair. Changed here: the weight is the compressed-tensors
-# layout (``[N, K/2]`` bytes, low nibble first) rather than AWQ's interleaved ``[K, N/8]``, scales and packed zero
-# points are ``[N, K/g]`` / ``[N/8, K/g]``, and an e2m1 + e8m0 (MXFP4) decode sits beside the int4 one.
-"""The CUDA kernel of ``mstar::w4a16_linear`` (``model.components.int4_formats``): ``x @ W.T`` for a 4-bit ``W``.
+# The int4 decode follows the int4 (``use_int4_w4a16``) branch of SGLang's / vLLM's ``fused_moe_kernel_gptq_awq`` and
+# vLLM's ``awq_triton.py`` (Apache-2.0, Copyright the vLLM and SGLang authors). Changed here: the compressed-tensors
+# layout read in its own orientation, weight rows on the MMA's M side, one dot per scale group, a CUDA-core GEMV for
+# a few tokens, and an e2m1 + e8m0 (MXFP4) decode beside the int4 one.
+"""The CUDA kernels of ``mstar::w4a16_linear`` (``model.components.int4_formats``): ``x @ W.T`` for a 4-bit ``W``.
 
-Up to ``DEQUANT_M`` tokens it is one Triton GEMM that dequantizes each ``[BLOCK_K, BLOCK_N]`` weight tile in
-registers to ``x``'s dtype (exact: an int4 times its bf16/fp16 scale, or an e2m1 times a power of two, rounded once)
-and accumulates in fp32, split along K when the output tiles alone can't fill the GPU. From ``DEQUANT_M`` tokens up,
-where the GEMM is compute-bound, the weight is dequantized once into a bf16 scratch and cuBLAS runs it (vLLM's AWQ
-does the same past 256 tokens; the threshold is a hypothesis until ``bench_linears`` sweeps it).
+``W`` is compressed-tensors' ``[N, K/8]`` int32 words (an MXFP4 weight's ``[N, K/2]`` bytes read the same way), and
+every kernel loads a ``[rows, cols / 8]`` block of words along K, the way they lie in memory, and unpacks it in
+registers. An int4 code becomes ``code - zero`` in fp32 without a conversion instruction (``code | 0x4B000000`` is
+the float ``2**23 + code``); scales apply once per group, to a partial sum, not to every weight. Three paths:
+
+- ``gemv`` (a few tokens): CUDA-core FMAs, each weight decoded once for all tokens, split along K;
+- ``dot``: weight rows on the MMA's M side and tokens (padded to 16) on its N side, one dot per scale group,
+  split along K to fill the GPU;
+- ``dequant``: past ``DEQUANT_M`` tokens, the weight dequantized to the activation's dtype and cuBLAS runs it.
+
+Which path and tile runs at a token count is ``config``'s built-in rule (a hypothesis until
+``benchmark/quantization/bench_w4a16.py`` sweeps it per shape on the GPU). Every path matches the reference op
+(``int4_formats.dequantize_kind`` then a GEMM) to fp32 accumulation order; the scale applied to a partial sum,
+rather than to each weight rounded to bf16, is the one numerical difference, and it is the more accurate one.
 """
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from functools import lru_cache
 
 import torch
@@ -23,86 +32,129 @@ import triton.language as tl
 
 from mstar.model.components.int4_formats import KIND_E2M1, KIND_INT4_ZP, w4a16_linear
 
-DEQUANT_M = 256
+GEMV_MAX = 4
+DEQUANT_M = 512
+_MAGIC = 8388608.0  # 2 ** 23
 
 
 @triton.jit
-def _decode_tile(b, k, offs_n, mask, s_ptr, z_ptr, stride_sn, stride_sk, stride_zn, stride_zk,
-                 KIND: tl.constexpr, GROUP: tl.constexpr):
-    """The fp32 values of a ``[BLOCK_K, BLOCK_N]`` tile of packed bytes ``b`` at rows ``k`` (K indices)."""
-    code = ((b >> ((k[:, None] % 2) * 4)) & 0xF).to(tl.int32)
-    group = k[:, None] // GROUP
+def _codes(words, ROWS: tl.constexpr, COLS: tl.constexpr):
+    """int32 words ``[ROWS, COLS // 8]`` -> their 4-bit codes ``[ROWS, COLS]``: word i's nibble j is column 8i + j."""
+    shifts = tl.arange(0, 8) * 4
+    return tl.reshape((words[:, :, None] >> shifts[None, None, :]) & 0xF, (ROWS, COLS))
+
+
+@triton.jit
+def _values(codes, z, KIND: tl.constexpr):
+    """fp32 values of 4-bit codes: an int4 code minus its zero point ``z`` (exact), or an e2m1 code's value."""
     if KIND == 2:
-        sign = tl.where((code & 8) != 0, -1.0, 1.0)
-        e = (code >> 1) & 3
-        m = (code & 1).to(tl.float32)
-        mag = tl.where(e == 0, 0.5 * m, (1.0 + 0.5 * m) * tl.exp2((e - 1).to(tl.float32)))
-        s = tl.load(s_ptr + offs_n[None, :] * stride_sn + group * stride_sk, mask=mask, other=127)
-        return sign * mag * tl.exp2(s.to(tl.float32) - 127.0)
-    s = tl.load(s_ptr + offs_n[None, :] * stride_sn + group * stride_sk, mask=mask, other=0.0).to(tl.float32)
+        # e2m1 magnitude e:m (3 bits) as an fp32 exponent / mantissa: (e + 126) << 23 | m << 22, exact for e >= 1
+        v = ((((codes & 7) << 22) + (126 << 23)) | ((codes & 8) << 28)).to(tl.float32, bitcast=True)
+        small = (codes & 1).to(tl.float32) * 0.5
+        small = tl.where((codes & 8) != 0, -small, small)
+        return tl.where((codes & 6) == 0, small, v)
+    return (codes | 0x4B000000).to(tl.float32, bitcast=True) - (8388608.0 + z)
+
+
+@triton.jit
+def _group_params(s_ptr, z_ptr, n, live, g, stride_sn, stride_zn, KIND: tl.constexpr):
+    """Rows ``n``'s scale (fp32) and zero point at group ``g`` (``g`` a scalar or a ``[1, NG]`` row of groups)."""
+    if KIND == 2:
+        se = tl.load(s_ptr + n * stride_sn + g, mask=live, other=127)
+        return tl.exp2(se.to(tl.float32) - 127.0), 0
+    scale = tl.load(s_ptr + n * stride_sn + g, mask=live, other=0.0).to(tl.float32)
     if KIND == 1:
-        zw = tl.load(z_ptr + (offs_n[None, :] // 8) * stride_zn + group * stride_zk, mask=mask, other=0)
-        z = (zw >> ((offs_n[None, :] % 8) * 4)) & 0xF
-    else:
-        z = 8
-    return (code - z).to(tl.float32) * s
+        zw = tl.load(z_ptr + (n // 8) * stride_zn + g, mask=live, other=0)
+        return scale, (zw >> ((n % 8) * 4)) & 0xF
+    return scale, 8
 
 
 @triton.jit
-def _w4a16_gemm_kernel(
-    x_ptr, w_ptr, s_ptr, z_ptr, out_ptr,
-    M, N, K,
-    stride_xm, stride_xk, stride_wn, stride_wk, stride_sn, stride_sk, stride_zn, stride_zk,
-    stride_os, stride_om, stride_on,
-    KIND: tl.constexpr, GROUP: tl.constexpr,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, SPLIT_K: tl.constexpr,
-    GROUP_M: tl.constexpr,
+def _w4_dot_kernel(
+    x_ptr, w_ptr, s_ptr, z_ptr, out_ptr, M, N, K,
+    stride_xm, stride_wn, stride_sn, stride_zn, stride_os, stride_om,
+    KIND: tl.constexpr, GROUP: tl.constexpr, BN: tl.constexpr, TB: tl.constexpr, BK: tl.constexpr,
+    SB: tl.constexpr, SPLIT_K: tl.constexpr, STAGES: tl.constexpr,
 ):
-    pid = tl.program_id(0)
+    """``out[pid_k, t, n]`` for BN weight rows x TB tokens: steps of BK columns made of BK / SB dots, one scale group
+    each (SB = min(BK, GROUP)); split ``pid_k`` takes steps pid_k, pid_k + SPLIT_K, ..."""
+    pid_n = tl.program_id(0)
+    pid_t = tl.program_id(1)
+    pid_k = tl.program_id(2)
+    n = pid_n * BN + tl.arange(0, BN)
+    live_n = n < N
+    t = pid_t * TB + tl.arange(0, TB)
+    live_t = t < M
+    w_rows = w_ptr + n[:, None].to(tl.int64) * stride_wn
+    x_rows = x_ptr + t[:, None].to(tl.int64) * stride_xm
+    sub = tl.arange(0, SB)
+    acc = tl.zeros((BN, TB), dtype=tl.float32)
+    for k0 in tl.range(pid_k * BK, K, SPLIT_K * BK, num_stages=STAGES):
+        for j in tl.static_range(BK // SB):
+            k = k0 + j * SB
+            live_k = k < K
+            words = tl.load(w_rows + (k // 8 + tl.arange(0, SB // 8))[None, :], mask=live_n[:, None] & live_k, other=0)
+            scale, z = _group_params(s_ptr, z_ptr, n, live_n & live_k, k // GROUP, stride_sn, stride_zn, KIND)
+            if KIND == 1:
+                z = z[:, None]
+            v = _values(_codes(words, BN, SB), z, KIND)
+            xk = tl.load(x_rows + (k + sub)[None, :], mask=live_t[:, None] & live_k, other=0.0)
+            acc += tl.dot(v.to(xk.dtype), tl.trans(xk)) * scale[:, None]
+    out = out_ptr + pid_k * stride_os + t[None, :].to(tl.int64) * stride_om + n[:, None]
+    tl.store(out, acc.to(out_ptr.dtype.element_ty), mask=live_n[:, None] & live_t[None, :])
+
+
+@triton.jit
+def _w4_gemv_kernel(
+    x_ptr, w_ptr, s_ptr, z_ptr, out_ptr, M, N, K,
+    stride_xm, stride_wn, stride_sn, stride_zn, stride_os, stride_om,
+    KIND: tl.constexpr, GROUP: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, NG: tl.constexpr,
+    GS: tl.constexpr, SPLIT_K: tl.constexpr, MB: tl.constexpr,
+):
+    """``out[pid_k, m, n]`` for BN weight rows and MB (>= M) tokens on CUDA cores: a ``[BN, BK]`` block is decoded once
+    and multiplied into every token; its NG groups of GS columns are summed first and scaled once."""
+    pid_n = tl.program_id(0)
     pid_k = tl.program_id(1)
-    num_pid_m = tl.cdiv(M, BLOCK_M)
-    num_pid_n = tl.cdiv(N, BLOCK_N)
-    num_pid_in_group = GROUP_M * num_pid_n
-    group_id = pid // num_pid_in_group
-    first_pid_m = group_id * GROUP_M
-    group_size_m = min(num_pid_m - first_pid_m, GROUP_M)
-    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
-    pid_n = (pid % num_pid_in_group) // group_size_m
-
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    offs_k = tl.arange(0, BLOCK_K)
-    mask_m = offs_m < M
-    mask_n = offs_n < N
-
-    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-    # split ``pid_k`` takes K tiles pid_k, pid_k + SPLIT_K, ...
-    for k0 in range(0, K, BLOCK_K * SPLIT_K):
-        k = k0 + pid_k * BLOCK_K + offs_k
-        mask_k = k < K
-        a = tl.load(x_ptr + offs_m[:, None] * stride_xm + k[None, :] * stride_xk,
-                    mask=mask_m[:, None] & mask_k[None, :], other=0.0)
-        wmask = mask_k[:, None] & mask_n[None, :]
-        b = tl.load(w_ptr + offs_n[None, :] * stride_wn + (k[:, None] // 2) * stride_wk, mask=wmask, other=0)
-        w = _decode_tile(b, k, offs_n, wmask, s_ptr, z_ptr, stride_sn, stride_sk, stride_zn, stride_zk, KIND, GROUP)
-        acc += tl.dot(a, w.to(a.dtype))
-    out = out_ptr + pid_k * stride_os + offs_m[:, None] * stride_om + offs_n[None, :] * stride_on
-    tl.store(out, acc.to(out_ptr.dtype.element_ty), mask=mask_m[:, None] & mask_n[None, :])
+    n = pid_n * BN + tl.arange(0, BN)
+    live_n = n < N
+    w_rows = w_ptr + n[:, None].to(tl.int64) * stride_wn
+    rows_m = tl.arange(0, MB)
+    cols = tl.arange(0, BK)
+    groups = tl.arange(0, NG)[None, :]
+    acc = tl.zeros((MB, BN), dtype=tl.float32)
+    for k0 in range(pid_k * BK, K, SPLIT_K * BK):
+        words = tl.load(w_rows + (k0 // 8 + tl.arange(0, BK // 8))[None, :], mask=live_n[:, None], other=0)
+        scale, z = _group_params(s_ptr, z_ptr, n[:, None], live_n[:, None], k0 // GROUP + groups, stride_sn,
+                                 stride_zn, KIND)
+        if KIND == 1:
+            z = tl.reshape(tl.broadcast_to(z[:, :, None], (BN, NG, GS)), (BN, BK))
+        v = tl.reshape(_values(_codes(words, BN, BK), z, KIND), (BN, NG, GS))
+        for mi in tl.static_range(MB):
+            xm = tl.load(x_ptr + mi * stride_xm + k0 + cols, mask=mi < M, other=0.0).to(tl.float32)
+            part = tl.sum(tl.sum(v * tl.reshape(xm, (1, NG, GS)), axis=2) * scale, axis=1)
+            acc += tl.where(rows_m[:, None] == mi, part[None, :], 0.0)
+    out = out_ptr + pid_k * stride_os + rows_m[:, None] * stride_om + n[None, :]
+    tl.store(out, acc.to(out_ptr.dtype.element_ty), mask=(rows_m[:, None] < M) & live_n[None, :])
 
 
 @triton.jit
-def _w4a16_dequant_kernel(
-    w_ptr, s_ptr, z_ptr, out_ptr, N, K,
-    stride_wn, stride_wk, stride_sn, stride_sk, stride_zn, stride_zk, stride_on, stride_ok,
-    KIND: tl.constexpr, GROUP: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+def _w4_dequant_kernel(
+    w_ptr, s_ptr, z_ptr, out_ptr, N, K, stride_wn, stride_sn, stride_zn, stride_on,
+    KIND: tl.constexpr, GROUP: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, NG: tl.constexpr,
+    GS: tl.constexpr,
 ):
-    offs_n = tl.program_id(0) * BLOCK_N + tl.arange(0, BLOCK_N)
-    k = tl.program_id(1) * BLOCK_K + tl.arange(0, BLOCK_K)
-    mask = (k[:, None] < K) & (offs_n[None, :] < N)
-    b = tl.load(w_ptr + offs_n[None, :] * stride_wn + (k[:, None] // 2) * stride_wk, mask=mask, other=0)
-    w = _decode_tile(b, k, offs_n, mask, s_ptr, z_ptr, stride_sn, stride_sk, stride_zn, stride_zk, KIND, GROUP)
-    tl.store(out_ptr + offs_n[None, :] * stride_on + k[:, None] * stride_ok, w.to(out_ptr.dtype.element_ty),
-             mask=mask)
+    n = tl.program_id(0) * BN + tl.arange(0, BN)
+    k0 = tl.program_id(1) * BK
+    live_n = n < N
+    words = tl.load(w_ptr + n[:, None].to(tl.int64) * stride_wn + (k0 // 8 + tl.arange(0, BK // 8))[None, :],
+                    mask=live_n[:, None], other=0)
+    scale, z = _group_params(s_ptr, z_ptr, n[:, None], live_n[:, None], k0 // GROUP + tl.arange(0, NG)[None, :],
+                             stride_sn, stride_zn, KIND)
+    if KIND == 1:
+        z = tl.reshape(tl.broadcast_to(z[:, :, None], (BN, NG, GS)), (BN, BK))
+    v = tl.reshape(_values(_codes(words, BN, BK), z, KIND), (BN, NG, GS)) * scale[:, :, None]
+    tl.store(out_ptr + n[:, None].to(tl.int64) * stride_on + (k0 + tl.arange(0, BK))[None, :],
+             tl.reshape(v, (BN, BK)).to(out_ptr.dtype.element_ty), mask=live_n[:, None])
 
 
 @lru_cache(maxsize=None)
@@ -110,55 +162,93 @@ def _sm_count(index: int) -> int:
     return torch.cuda.get_device_properties(index).multi_processor_count
 
 
-def _config(m: int, n: int, k: int, group: int, sms: int) -> tuple[int, int, int, int]:
-    """``(BLOCK_M, BLOCK_N, BLOCK_K, SPLIT_K)``: the smallest M tile that holds the batch, and a K split that
-    brings the CTA count to about two waves (hypothesis: decode is weight-bandwidth-bound, so occupancy is what
-    counts; ``bench_linears`` is where it gets tuned)."""
-    block_m = 16 if m <= 16 else 32 if m <= 32 else 64
-    block_n = 64 if m <= 32 else 128
-    block_k = 128 if group % 128 == 0 or group >= 128 else 64
-    tiles = triton.cdiv(m, block_m) * triton.cdiv(n, block_n)
-    k_tiles = triton.cdiv(k, block_k)
-    split = max(1, min(8, k_tiles, (2 * sms) // max(tiles, 1)))
-    return block_m, block_n, block_k, split
+def _block_k(group: int, k: int, want: int) -> int:
+    """A K step that divides the group or is whole groups, and divides K."""
+    for bk in (want, 256, 128, 64, 32):
+        if bk <= k and k % bk == 0 and (bk % group == 0 or group % bk == 0):
+            return bk
+    raise ValueError(f"no K step for K={k}, group={group}")
 
 
-def _strides(t: torch.Tensor | None) -> tuple[int, int]:
-    return (0, 0) if t is None else (t.stride(0), t.stride(1))
+def _split(ctas: int, k_steps: int, sms: int, waves: int) -> int:
+    return max(1, min(16, k_steps, (waves * sms) // max(ctas, 1)))
+
+
+def config(m: int, n: int, k: int, group: int, kind: int, sms: int) -> tuple[str, dict]:
+    """The built-in path and tile for ``m`` tokens of an ``[n, k]`` weight (see the module docstring)."""
+    if m >= DEQUANT_M:
+        return "dequant", {}
+    if m <= GEMV_MAX:
+        bn = 32
+        bk = _block_k(group, k, 256)
+        return "gemv", {"BN": bn, "BK": bk, "SPLIT_K": _split(triton.cdiv(n, bn), k // bk, sms, 4),
+                        "num_warps": 4}
+    tb = 16 if m <= 16 else 32 if m <= 32 else 64 if m <= 64 else 128
+    bn = 64 if tb <= 64 else 128
+    bk = _block_k(group, k, 128)
+    ctas = triton.cdiv(n, bn) * triton.cdiv(m, tb)
+    return "dot", {"BN": bn, "TB": tb, "BK": bk, "SPLIT_K": _split(ctas, k // bk, sms, 2),
+                   "STAGES": 2 if kind == KIND_E2M1 else 3, "num_warps": 8 if tb == 128 else 4}
+
+
+# a stand-in for ``config`` (the benchmark sweeps tiles through it); None runs the built-in rule
+CONFIG_OVERRIDE: Callable[[int, int, int, int, int, int], tuple[str, dict]] | None = None
+
+
+def _words(weight: torch.Tensor) -> torch.Tensor:
+    return weight.view(torch.int32) if weight.dtype == torch.uint8 else weight
+
+
+def _scale_zero(scale, zero_point):
+    # the kernels step along a scale or zero-point row by one element
+    scale = scale.contiguous()
+    zero_point = zero_point.contiguous() if zero_point is not None else None
+    return (scale, scale.stride(0), zero_point if zero_point is not None else scale,
+            zero_point.stride(0) if zero_point is not None else 0)
 
 
 def dequantize(weight: torch.Tensor, scale: torch.Tensor, zero_point: torch.Tensor | None, group: int, kind: int,
                dtype: torch.dtype) -> torch.Tensor:
     """The ``[N, K]`` weight in ``dtype`` (the large-M path's scratch, and tests)."""
-    n, k = weight.shape[0], weight.shape[1] * 2
+    words = _words(weight)
+    n, k = words.shape[0], words.shape[1] * 8
     out = torch.empty((n, k), dtype=dtype, device=weight.device)
-    bn, bk = 64, 128
-    _w4a16_dequant_kernel[(triton.cdiv(n, bn), triton.cdiv(k, bk))](
-        weight, scale, zero_point if zero_point is not None else scale, out, n, k,
-        weight.stride(0), weight.stride(1), *_strides(scale), *_strides(zero_point), out.stride(0), out.stride(1),
-        KIND=kind, GROUP=group, BLOCK_N=bn, BLOCK_K=bk,
+    bn, bk = 32, _block_k(group, k, 128)
+    s, ssn, z, szn = _scale_zero(scale, zero_point)
+    _w4_dequant_kernel[(triton.cdiv(n, bn), k // bk)](
+        words, s, z, out, n, k, words.stride(0), ssn, szn, out.stride(0),
+        KIND=kind, GROUP=group, BN=bn, BK=bk, NG=max(bk // group, 1), GS=min(group, bk), num_warps=4,
     )
     return out
 
 
 def gemm(x: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor, zero_point: torch.Tensor | None, group: int,
          kind: int) -> torch.Tensor:
+    words = _words(weight)
     m, k = x.shape
-    n = weight.shape[0]
-    assert weight.shape[1] * 2 == k and weight.dtype == torch.uint8, (tuple(weight.shape), k, weight.dtype)
+    n = words.shape[0]
+    assert words.shape[1] * 8 == k and words.is_contiguous(), (tuple(weight.shape), k)
     assert kind != KIND_INT4_ZP or zero_point is not None
-    if m >= DEQUANT_M:
+    path, cfg = (CONFIG_OVERRIDE or config)(m, n, k, group, kind, _sm_count(x.device.index or 0))
+    if path == "dequant":
         return torch.nn.functional.linear(x, dequantize(weight, scale, zero_point, group, kind, x.dtype))
-    bm, bn, bk, split = _config(m, n, k, group, _sm_count(x.device.index or 0))
+    split = cfg["SPLIT_K"]
     out = torch.empty((split, m, n), dtype=torch.float32 if split > 1 else x.dtype, device=x.device)
-    grid = (triton.cdiv(m, bm) * triton.cdiv(n, bn), split)
-    _w4a16_gemm_kernel[grid](
-        x, weight, scale, zero_point if zero_point is not None else scale, out, m, n, k,
-        x.stride(0), x.stride(1), weight.stride(0), weight.stride(1), *_strides(scale), *_strides(zero_point),
-        out.stride(0), out.stride(1), out.stride(2),
-        KIND=kind, GROUP=group, BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk, SPLIT_K=split, GROUP_M=8,
-        num_warps=4, num_stages=3 if kind != KIND_E2M1 else 2,
-    )
+    s, ssn, z, szn = _scale_zero(scale, zero_point)
+    common = (x, words, s, z, out, m, n, k, x.stride(0), words.stride(0), ssn, szn, out.stride(0), out.stride(1))
+    if path == "gemv":
+        bk = cfg["BK"]
+        mb = 1 if m == 1 else 2 if m == 2 else 4 if m <= 4 else triton.next_power_of_2(m)
+        _w4_gemv_kernel[(triton.cdiv(n, cfg["BN"]), split)](
+            *common, KIND=kind, GROUP=group, BN=cfg["BN"], BK=bk, NG=max(bk // group, 1), GS=min(group, bk),
+            SPLIT_K=split, MB=mb, num_warps=cfg["num_warps"],
+        )
+    else:
+        bk = cfg["BK"]
+        _w4_dot_kernel[(triton.cdiv(n, cfg["BN"]), triton.cdiv(m, cfg["TB"]), split)](
+            *common, KIND=kind, GROUP=group, BN=cfg["BN"], TB=cfg["TB"], BK=bk, SB=min(bk, group), SPLIT_K=split,
+            STAGES=cfg["STAGES"], num_warps=cfg["num_warps"],
+        )
     return out[0] if split == 1 else out.sum(0).to(x.dtype)
 
 
