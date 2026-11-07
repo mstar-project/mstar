@@ -373,7 +373,9 @@ class Qwen3_5DenseModel(MultimodalDecoderModel):
                 text, self._PAD_TOKENS[VIDEO], "<|vision_start|>", "<|vision_end|>", timestamps,
             )
         # a long prompt is encoded as parallel chunks, identical ids
-        return torch.tensor(encode_ids(self.tokenizer, text), dtype=torch.long)
+        return torch.tensor(encode_ids(
+            self.tokenizer, text, max_tokens=self.config.max_position_embeddings,
+        ), dtype=torch.long)
 
     def _merge(self) -> int:
         if self.vision_config is None:

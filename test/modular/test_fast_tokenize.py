@@ -55,6 +55,9 @@ def test_chunked_ids_are_identical_to_one_encode_on_the_benchmark_prompts():
         whole = tok(t).input_ids
         assert encode_ids(tok, t, chunk_chars=2048, max_chunks=8) == whole
         assert encode_ids(tok, t, chunk_chars=512, max_chunks=16) == whole
+        assert encode_ids(tok, t, chunk_chars=512, max_chunks=4, max_tokens=len(whole)) == whole
+        with pytest.raises(ValueError, match="context"):
+            encode_ids(tok, t, chunk_chars=512, max_chunks=4, max_tokens=len(whole) - 1)
 
 
 def test_chunked_encode_turns_the_crate_parallelism_on(monkeypatch):
@@ -87,3 +90,63 @@ def test_chunked_encode_turns_the_crate_parallelism_on(monkeypatch):
     monkeypatch.setenv("MSTAR_TOKENIZE_PARALLEL", "0")
     encode_ids(_Tok(), text, chunk_chars=4096, max_chunks=8)
     assert os.environ["TOKENIZERS_PARALLELISM"] == "false"
+
+
+@pytest.mark.parametrize("text,normalizer", [
+    ("word " * 20000, None), ("x" * 100000, None), ("word " * 20000, {"type": "Replace"}),
+])
+def test_oversized_text_is_refused_without_encoding_the_whole_prompt(text, normalizer):
+    from types import SimpleNamespace
+
+    encoded = []
+
+    class Backend:
+        def to_str(self):
+            return json.dumps({
+                "model": {"type": "BPE", "vocab": {"word": 0, "x": 1}},
+                "normalizer": normalizer, "pre_tokenizer": {"type": "ByteLevel"}, "added_tokens": [],
+            })
+
+        def encode_batch(self, parts, **kwargs):
+            encoded.extend(parts)
+            return [SimpleNamespace(ids=list(part)) for part in parts]
+
+    class Tokenizer:
+        backend_tokenizer = Backend()
+
+        def __call__(self, value):
+            encoded.append(value)
+            return SimpleNamespace(input_ids=list(value))
+
+    with pytest.raises(ValueError, match="context"):
+        encode_ids(Tokenizer(), text, chunk_chars=100, max_chunks=2, max_tokens=1000)
+    assert sum(map(len, encoded)) < len(text) // 2
+
+
+@pytest.mark.parametrize("strips_added_token", [False, True])
+def test_context_bound_keeps_valid_ids_and_does_not_guess_past_normalization(strips_added_token):
+    from types import SimpleNamespace
+
+    class Backend:
+        def to_str(self):
+            return json.dumps({
+                "normalizer": None if strips_added_token else {"type": "Replace"},
+                "model": {"type": "BPE", "vocab": {"x": 0}},
+                "pre_tokenizer": {"type": "ByteLevel"},
+                "added_tokens": [{"content": "<s>", "lstrip": strips_added_token}],
+            })
+
+        def encode_batch(self, parts, **kwargs):
+            return [SimpleNamespace(ids=[ord(c) for c in part]) for part in parts]
+
+    class Tokenizer:
+        backend_tokenizer = Backend()
+
+        def __call__(self, value):
+            return SimpleNamespace(input_ids=[42])
+
+    text = "word " * 100
+    tokenizer = Tokenizer()
+    assert encode_ids(tokenizer, text, chunk_chars=100, max_chunks=2, max_tokens=len(text)) == list(map(ord, text))
+    # A normalizer can collapse arbitrarily many input characters into one token.
+    assert encode_ids(tokenizer, " " * 100000 + "<s>", max_tokens=1) == [42]
