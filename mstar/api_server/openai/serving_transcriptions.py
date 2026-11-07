@@ -114,6 +114,8 @@ def audio_duration_seconds(path: str) -> float | None:
         import soundfile as sf
 
         info = sf.info(path)
+        if info.format == "MP3" or info.frames == 0:
+            return None  # decode to determine length; these headers can omit audio
         # libsndfile reports an unknown length (a FLAC whose header leaves the
         # sample count out) as the largest frame count
         if info.frames < _SF_UNKNOWN_FRAMES:

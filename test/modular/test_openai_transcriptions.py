@@ -877,7 +877,7 @@ def test_undecodable_upload_is_a_400(client_and_stub, monkeypatch):
             raise RuntimeError("decode_av_frame: /src/torchcodec/_core/SingleStreamDecoder.cpp")
 
     # the header reads fine, the payload does not: libsndfile and FFmpeg both refuse it
-    monkeypatch.setattr(serving_transcriptions.media_io, "read_soundfile_capped", refuse)
+    monkeypatch.setattr(serving_transcriptions.media_io, "read_audio_capped", refuse)
     decoders = types.SimpleNamespace(AudioDecoder=_Decoder)
     monkeypatch.setitem(sys.modules, "torchcodec", types.SimpleNamespace(decoders=decoders))
     monkeypatch.setitem(sys.modules, "torchcodec.decoders", decoders)

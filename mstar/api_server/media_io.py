@@ -426,9 +426,6 @@ def check_resample_rate(rate: int, target: int) -> None:
 # and /generate audio, reference clips): the transcription route's limit.
 MAX_AUDIO_SECONDS = 30 * 60
 _SOUNDFILE_BLOCK_SECONDS = 10
-# libsndfile's MP3 decoder is seamless across reads only at whole 1152-sample
-# MPEG frames; a read that splits a frame glitches the samples after it
-_SOUNDFILE_BLOCK_ALIGN = 1152
 
 
 class AudioRefusedError(ValueError):
@@ -446,8 +443,11 @@ class AudioTooLongError(AudioRefusedError):
         super().__init__(f"audio is longer than the {max_seconds:g} s limit")
 
 
-def read_soundfile_capped(path: str, max_seconds: float = MAX_AUDIO_SECONDS) -> tuple[np.ndarray, int]:
-    """libsndfile decode of ``path``: float32 mono at the file's own rate.
+def read_audio_capped(path: str, max_seconds: float = MAX_AUDIO_SECONDS) -> tuple[np.ndarray, int]:
+    """Decode ``path`` to float32 mono at the file's own rate.
+
+    PyAV reads MP3 and zero-length WAV headers through EOF; soundfile reads
+    other supported containers.
 
     Reads in blocks and counts the frames it decodes, so a header that hides
     or understates the length cannot make the read unbounded; past
@@ -458,6 +458,12 @@ def read_soundfile_capped(path: str, max_seconds: float = MAX_AUDIO_SECONDS) -> 
     import soundfile as sf
 
     with sf.SoundFile(path) as f:
+        # libsndfile stops at MPEG's first/estimated frame count, and at a
+        # streaming WAV's zero-length data header, even when bytes remain.
+        if getattr(f, "format", None) == "MP3" or (
+            getattr(f, "format", None) in ("WAV", "WAVEX", "RF64") and f.frames == 0
+        ):
+            return _read_av_capped(path, max_seconds)
         rate = f.samplerate
         # the frame cap scales with the rate; the range alone here, the
         # kernel to the caller's target is checked after the decode
@@ -466,7 +472,7 @@ def read_soundfile_capped(path: str, max_seconds: float = MAX_AUDIO_SECONDS) -> 
         except ValueError as exc:
             raise AudioRefusedError(str(exc)) from None
         limit = int(max_seconds * rate)
-        block = max(1, _SOUNDFILE_BLOCK_SECONDS * rate // _SOUNDFILE_BLOCK_ALIGN) * _SOUNDFILE_BLOCK_ALIGN
+        block = max(1, _SOUNDFILE_BLOCK_SECONDS * rate)
         parts, frames = [], 0
         while True:
             data = f.read(min(block, limit + 1 - frames), dtype="float32", always_2d=True)
@@ -478,6 +484,47 @@ def read_soundfile_capped(path: str, max_seconds: float = MAX_AUDIO_SECONDS) -> 
             # a mono block is its own mean, and numpy's reduction over the
             # length-1 axis costs ~10x the copy
             parts.append(data[:, 0] if data.shape[1] == 1 else data.mean(axis=1))
+    return (np.concatenate(parts) if parts else np.zeros(0, dtype=np.float32)), rate
+
+
+def _read_av_capped(path: str, max_seconds: float) -> tuple[np.ndarray, int]:
+    """Decode through EOF, counting samples rather than trusting duration tags."""
+    import av
+
+    parts, frames = [], 0
+    with av.open(path) as container:
+        stream = container.streams.audio[0]
+        rate = stream.codec_context.sample_rate
+        try:
+            check_resample_rate(rate, rate)
+        except ValueError as exc:
+            raise AudioRefusedError(str(exc)) from None
+        limit = int(max_seconds * rate)
+        resampler = av.AudioResampler(format="fltp", rate=rate)
+
+        def append(frame):
+            nonlocal frames
+            frames += frame.samples
+            if frames > limit:
+                raise AudioTooLongError(max_seconds)
+            data = frame.to_ndarray()
+            parts.append(data[0] if data.shape[0] == 1 else data.mean(axis=0))
+
+        for packet in container.demux(stream):
+            try:
+                decoded = packet.decode()
+            except av.error.InvalidDataError:
+                # A concatenated MP3 can put an ID3 tag between audio segments.
+                # The demuxer emits that metadata as a packet; it is not audio.
+                if stream.codec_context.name == "mp3float" and bytes(packet).startswith(b"ID3"):
+                    continue
+                raise
+            for frame in decoded:
+                frame.pts = None  # concatenated segments may restart timestamps
+                for converted in resampler.resample(frame):
+                    append(converted)
+        for converted in resampler.resample(None):
+            append(converted)
     return (np.concatenate(parts) if parts else np.zeros(0, dtype=np.float32)), rate
 
 

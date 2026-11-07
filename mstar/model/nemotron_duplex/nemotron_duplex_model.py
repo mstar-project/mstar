@@ -875,7 +875,7 @@ class NemotronDuplexModel(Model):
         ``TensorAndMetadata`` shape the data worker expects."""
         import soundfile as sf
 
-        from mstar.api_server.media_io import AudioTooLongError, check_resample_rate, read_soundfile_capped
+        from mstar.api_server.media_io import AudioTooLongError, check_resample_rate, read_audio_capped
         from mstar.model.base import TensorAndMetadata
 
         try:
@@ -886,7 +886,7 @@ class NemotronDuplexModel(Model):
                 raise ValueError(
                     f"audio must have at most {self.max_upload_channels} channels; got {info.channels}"
                 )
-            data, sr = read_soundfile_capped(filepath, self.max_session_s)   # mono
+            data, sr = read_audio_capped(filepath, self.max_session_s)   # mono
         except AudioTooLongError:
             raise session_too_long(self.max_session_s) from None
         except sf.SoundFileError as exc:   # garbage or truncated upload
