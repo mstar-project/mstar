@@ -153,3 +153,32 @@ def test_a_rule_refused_on_many_layers_is_one_problem():
     assert len(plan.problems) == 1
     layers = "['layers.0.mlp.down_proj', 'layers.1.mlp.down_proj']"
     assert plan.problems[0].startswith(f"node 'LLM': 2 layers (e.g. {layers}) can't run fp8_block")
+
+
+def test_a_stored_partial_last_row_block_serves_as_stored_where_no_shard_cuts_it():
+    # GLM's kv_a_proj_with_mqa is 576 rows: four whole 128-row blocks and a partial one
+    from torch import nn
+
+    from mstar.model.components.distributed import ColumnParallelLinear
+    from mstar.model.loader.base import CheckpointRules
+    from mstar.quantization.resolve import QuantizationRoot
+
+    class Root(nn.Module):
+        def __init__(self, cg):
+            super().__init__()
+            self.proj = ColumnParallelLinear(cg, 256, 576, bias=False)
+
+    decl = QuantizationRoot("LLM", Root, QuantizableLinears(("proj",), ()), CheckpointRules(), lambda: None, Root)
+    ckpt = CheckpointQuant.from_tensors({"proj.weight": TensorInfo("F8_E4M3", (576, 256)),
+                                         "proj.weight_scale_inv": TensorInfo("F32", (5, 2))})
+    spec = parse_quantization(None).for_node("LLM")
+    for tp, action in ((1, Action.DIRECT), (2, Action.DEQUANT)):
+        with torch.device("meta"):
+            plan = resolve_plan(Root(group(0, tp)), decl, spec, ckpt)
+        assert not plan.problems and plan.layers["proj"].action is action, (tp, plan.layers["proj"])
+    # 288 rows a rank cut a block, and no whole block remains to quantize: bf16, with the reason logged
+    assert "straddle" in plan.notes[0]
+    # quantizing at load still takes whole row blocks
+    with torch.device("meta"):
+        plan = resolve_plan(Root(group(0, 1)), decl, parse_quantization("fp8_block").for_node("LLM"), None)
+    assert plan.layers["proj"].action is Action.KEEP and "stays bf16" in plan.notes[0]

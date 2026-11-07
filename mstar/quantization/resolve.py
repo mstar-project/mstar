@@ -22,7 +22,7 @@ from torch import nn
 from mstar.distributed.communication import CommGroup
 from mstar.model.components.quant_linear import QuantGeometry as Geometry
 from mstar.model.components.quant_linear import QuantizableLinears, quant_capability
-from mstar.model.loader.base import CheckpointRules, apply_stacked
+from mstar.model.loader.base import CheckpointRules, _StackedMatcher
 from mstar.quantization.checkpoint import UNKNOWN, CheckpointQuant, StoredBase
 from mstar.quantization.formats import AUTO, BF16, FORMATS, served
 from mstar.quantization.spec import NodeQuantSpec, pattern_matches
@@ -102,8 +102,13 @@ def layer_geometry(module: nn.Module, kind: str) -> Geometry | None:
     return Geometry(n, k, (n,), (k,))
 
 
-def geometry_problem(fmt: str, geometry: Geometry, direct: bool, kind: str) -> str | None:
-    """Why ``fmt``'s kernels (or, ``direct``, the checkpoint's scale blocks) don't fit ``geometry``."""
+def geometry_problem(
+    fmt: str, geometry: Geometry, direct: bool, kind: str, block: tuple[int, int] | None = None,
+    stored_layout: bool | None = None,
+) -> str | None:
+    """Why ``fmt``'s kernels (or, ``direct``, the checkpoint's scale blocks of ``block``) don't fit ``geometry``;
+    ``stored_layout`` (default ``direct``): the weight keeps the checkpoint's layout, partial last block included."""
+    stored_layout = direct if stored_layout is None else stored_layout
     n, k = geometry.n, geometry.k
     if fmt in ("fp8_tensor", "fp8_channel"):
         if n % 16 or k % 16:
@@ -112,12 +117,15 @@ def geometry_problem(fmt: str, geometry: Geometry, direct: bool, kind: str) -> s
             return f"one per-tensor scale can't hold the scales of its {len(geometry.rows)} checkpoint shards"
         return None
     if fmt == "fp8_block":
-        bn, bk = FORMATS[fmt].block
-        if n % bn or k % bk:
+        bn, bk = block or FORMATS[fmt].block
+        # K is quantized in whole groups; quantizing here takes whole row blocks too, while a checkpoint's partial
+        # last row block (GLM's kv_a, 576 rows) serves as stored where no shard boundary cuts it
+        if k % bk or (not stored_layout and n % bn):
             return f"fp8_block runs N and K in whole {bn}x{bk} blocks per rank; this layer is {n} x {k}"
         if kind == EXPERTS and any(r % bk for r in geometry.rows):
             return f"fp8_block quantizes the expert width in groups of {bk}; it is {geometry.rows[0]} per rank"
-        if direct and (any(r % bn for r in geometry.rows) or any(c % bk for c in geometry.cols)):
+        rows = geometry.rows if geometry.sharded else geometry.rows[:-1]
+        if direct and (any(r % bn for r in rows) or any(c % bk for c in geometry.cols)):
             return (f"a checkpoint scale block would straddle two of this rank's sub-blocks "
                     f"(rows {list(geometry.rows)}, cols {list(geometry.cols)}, block {bn}x{bk})")
         return None
@@ -144,24 +152,26 @@ def discover_layers(root: nn.Module) -> dict[str, tuple[str, nn.Module]]:
 
 def stored_formats(
     ckpt: CheckpointQuant | None, rules: CheckpointRules, layer_paths: set[str],
+    param_names: set[str] | None = None,
 ) -> tuple[dict[str, set[StoredBase]], dict[str, StoredBase]]:
     """``(per layer path: the stored formats of the checkpoint bases that land on it, per base outside any
-    layer that is stored quantized)``. A base is mapped by ``<base>.weight`` through the rules, so a
-    ``weight_packed`` base maps the way its ``weight`` would."""
+    layer that is stored quantized and lands on one of ``param_names``)``. A base is mapped by ``<base>.weight``
+    through the rules, so a ``weight_packed`` base maps the way its ``weight`` would; one that lands on no
+    parameter (a layer this deployment doesn't build) never loads, so it doesn't count."""
     per_layer: dict[str, set[StoredBase]] = defaultdict(set)
     stray: dict[str, StoredBase] = {}
     if ckpt is None:
         return per_layer, stray
-    stacked = list(rules.stacked_params)
+    match = _StackedMatcher(list(rules.stacked_params))  # indexed: thousands of per-expert rules
     for base, stored in ckpt.bases.items():
         native = rules.native(base + ".weight")
         if native is None:
             continue
-        target, _ = apply_stacked(native, stacked)
+        target, _ = match(native)
         path = target.rpartition(".")[0]
         if path in layer_paths:
             per_layer[path].add(stored)
-        elif stored.format != BF16:
+        elif stored.format != BF16 and (param_names is None or target in param_names):
             stray[path] = stored
     return per_layer, stray
 
@@ -185,7 +195,8 @@ def resolve_plan(
     plan = QuantPlan(decl.node)
     where = f"node {decl.node!r}"
     layers = discover_layers(root)
-    stored_by_layer, stray = stored_formats(ckpt, decl.rules, set(layers))
+    params = {name for name, _ in root.named_parameters()}
+    stored_by_layer, stray = stored_formats(ckpt, decl.rules, set(layers), params)
 
     for rule in spec.rules:
         if not any(pattern_matches(path, rule.pattern) for path in layers):
@@ -238,16 +249,21 @@ def resolve_plan(
             plan.notes.append(f"{path}: {type(module).__name__} holds no checkpoint layout; re-quantized at load")
             action = Action.REQUANT
         if action is Action.DIRECT:
-            misfit = geometry_problem(runtime, layer_geometry(module, kind), direct=True, kind=kind)
+            geometry = layer_geometry(module, kind)
+            misfit = geometry_problem(runtime, geometry, direct=True, kind=kind, block=block)
             if misfit is not None:
                 # the checkpoint's scales don't land on this rank's blocks: dequantize, then quantize the shard
-                plan.notes.append(f"{path}: re-quantized per rank ({misfit})")
-                action = Action.REQUANT
+                # (or serve it bf16, when the shard has no whole blocks to quantize)
+                unquantizable = geometry_problem(runtime, geometry, direct=False, kind=kind)
+                if unquantizable is None:
+                    plan.notes.append(f"{path}: re-quantized per rank ({misfit})")
+                    action = Action.REQUANT
+                else:
+                    plan.notes.append(f"{path}: stays bf16 ({misfit}; {unquantizable})")
+                    runtime, action = BF16, Action.DEQUANT
         if action is None:
-            plan.problems.append(
-                f"{where}: {path!r} is stored {stored} and {origin} asks {runtime}; serving one quantized format "
-                f"as another compounds two roundings. Ask for {stored} or bf16 there"
-            )
+            refused[(origin, runtime, f"it is stored {stored}, and serving one quantized format as another "
+                                      f"compounds two roundings; ask for {stored} or bf16 there")].append(path)
             continue
         plan.layers[path] = LayerPlan(path, kind, stored, runtime, action, origin, block)
 
@@ -285,12 +301,13 @@ def _runtime_problem(
     capability = module.experts_quant_capability() if kind == EXPERTS else quant_capability(module)
     if not capability.capable:
         return capability.reason
-    if runtime == "fp8_block" and stored == "fp8_block" and block not in (None, FORMATS["fp8_block"].block):
-        return f"the checkpoint's blocks are {block}; the kernels take {FORMATS['fp8_block'].block}"
     geometry = layer_geometry(module, kind)
     if geometry is None:
         return "its weight geometry is unknown"
-    return geometry_problem(runtime, geometry, direct=False, kind=kind)
+    # as stored, the layer keeps the checkpoint's block and layout; quantized here, the format's
+    as_stored = stored == runtime
+    return geometry_problem(runtime, geometry, direct=False, kind=kind, block=block if as_stored else None,
+                            stored_layout=as_stored)
 
 
 def _action(stored: str, runtime: str) -> Action | None:

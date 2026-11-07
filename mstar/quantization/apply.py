@@ -18,7 +18,7 @@ from collections.abc import Callable, Iterable, Iterator
 import torch
 from torch import nn
 
-from mstar.model.components.quant_linear import QuantLinear, linear_format
+from mstar.model.components.quant_linear import LinearFormat, QuantLinear, linear_format
 from mstar.model.loader.base import StackedParamRule, _StackedMatcher
 from mstar.quantization.checkpoint import split_name
 from mstar.quantization.resolve import EXPERTS, LINEAR, Action, QuantPlan
@@ -28,6 +28,15 @@ logger = logging.getLogger(__name__)
 # checkpoint tensors a dequantized linear no longer needs (static activation scales, kv scales)
 _DROPPED = ("input_scale",)
 _FLOATS = (torch.bfloat16, torch.float16, torch.float32)
+
+
+def format_of(layer) -> LinearFormat:
+    """The format object a linear layer's plan runs: fp8_block at the checkpoint's block when it loads as stored."""
+    if layer.runtime == "fp8_block" and layer.action is Action.DIRECT:
+        from mstar.model.components.fp8_formats import Fp8BlockFormat
+
+        return Fp8BlockFormat.for_block(layer.block)
+    return linear_format(layer.runtime)
 
 
 def _block_of(root: nn.Module, path: str) -> nn.Module:
@@ -45,8 +54,7 @@ def prepare(root: nn.Module, plan: QuantPlan) -> None:
                 getattr(experts, name).data.view(torch.float32).fill_(float("nan"))
             continue
         module = root.get_submodule(layer.path)
-        fmt = linear_format(layer.runtime)
-        module.quant_prepare(fmt)
+        module.quant_prepare(format_of(layer))
         for name, dtype in module._quant_views.items():
             if dtype == torch.float32:
                 getattr(module, name).data.view(torch.float32).fill_(float("nan"))
@@ -70,16 +78,17 @@ def intercept(
     match = _StackedMatcher(list(stacked_params or []))
     located: dict[str, bool] = {}
 
-    def is_dequantized(base: str) -> bool:
+    def layer_of(base: str):
         if base not in located:
             mapped = name_remapper(base + ".weight") if name_remapper is not None else base + ".weight"
-            located[base] = mapped is not None and match(mapped)[0].rpartition(".")[0] in dequant
+            located[base] = dequant.get(match(mapped)[0].rpartition(".")[0]) if mapped is not None else None
         return located[base]
 
     pending: dict[str, dict[str, torch.Tensor]] = {}
     for name, tensor in weights:
         base, suffix = split_name(name)
-        if not suffix or not is_dequantized(base):
+        layer = layer_of(base) if suffix else None
+        if layer is None:
             yield name, tensor
             continue
         if suffix in _DROPPED:
@@ -95,14 +104,30 @@ def intercept(
         if "weight" in slot and len(slot) == 2:
             del pending[base]
             (scale_name,) = (s for s in slot if s != "weight")
-            stored = "fp8_block" if scale_name == "weight_scale_inv" else _per_tensor_or_channel(slot[scale_name])
-            buffers = {"weight": slot["weight"], scale_name: slot[scale_name]}
-            yield base + ".weight", linear_format(stored).dequantize(buffers).to(dtype)
+            weight, scale = slot["weight"], slot[scale_name]
+            if scale_name == "weight_scale_inv":
+                fmt = _block_format(weight, scale, layer.block)
+            else:
+                fmt = linear_format(_per_tensor_or_channel(scale))
+            yield base + ".weight", fmt.dequantize({"weight": weight, scale_name: scale}).to(dtype)
     if pending:
         raise ValueError(
             f"{plan.node}: the checkpoint stream ended with quantized tensors missing their pair "
             f"(weight or scale): {sorted((b, sorted(s)) for b, s in pending.items())[:5]}"
         )
+
+
+def _block_format(weight: torch.Tensor, scale: torch.Tensor, hint: tuple[int, int] | None) -> LinearFormat:
+    """The block-fp8 format of one stored pair: the layer's block, else what the shapes say (a sliced read
+    hands over this rank's slice of both, which keeps the block)."""
+    from mstar.model.components.fp8_formats import Fp8BlockFormat
+    from mstar.quantization.checkpoint import TensorInfo, classify
+
+    stored = classify({"weight": TensorInfo("F8_E4M3", tuple(weight.shape)),
+                       "weight_scale_inv": TensorInfo("F32", tuple(scale.shape))}, "fp8", hint)
+    if stored.format != "fp8_block":
+        raise ValueError(f"a weight {tuple(weight.shape)} with scales {tuple(scale.shape)} is no block-fp8 pair")
+    return Fp8BlockFormat.for_block(stored.block)
 
 
 def _per_tensor_or_channel(scale: torch.Tensor) -> str:

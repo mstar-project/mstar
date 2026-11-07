@@ -21,7 +21,7 @@ from mstar.graph.base import GraphNode
 from mstar.graph.runtime.base import GraphRuntime
 from mstar.model.base import Model, node_moe_parallel_configs, serving_resources
 from mstar.model.submodule_base import NodeSubmodule
-from mstar.quantization.scope import node_scope
+from mstar.quantization.scope import load_submodule
 from mstar.utils.device import DeviceCapability
 from mstar.utils.streams import reset_device_scheduling
 
@@ -317,16 +317,12 @@ class EngineManager:
             if name in moe_parallel:
                 extra["moe_parallel"] = moe_parallel[name]
             # quantization (``mstar.quantization``): the node's declared roots load as the plan says
-            with node_scope(model, name, model_config, device) as quantization:
-                submodule = model.get_submodule(
-                    name, device,
-                    tp_group=parallel_groups.get_tp_config_for_node(name),
-                    # the node's param dtype, under its pre-policy name
-                    autocast_dtype=precision.param_dtype,
-                    **extra,
-                )
-                if quantization is not None:
-                    quantization.finish(submodule)
+            submodule = load_submodule(
+                model, name, model_config, device,
+                tp_group=parallel_groups.get_tp_config_for_node(name),
+                # the node's param dtype, under its pre-policy name
+                autocast_dtype=precision.param_dtype, **extra,
+            )
             if submodule is None:
                 continue
             # the one policy the load cast and every forward and capture use

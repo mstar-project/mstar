@@ -569,7 +569,8 @@ def _gate_up_weight_loader(
     expert_idx = int(expert_str)
     shard_inter = divide(full_inter, tp_size)
     start = tp_rank * shard_inter
-    tp_slice = loaded_weight[start:start + shard_inter, :]
+    # the full tensor, or this rank's slice from a sliced read
+    tp_slice = loaded_weight if loaded_weight.shape[0] == shard_inter else loaded_weight[start:start + shard_inter, :]
     if kind == "gate":
         param.data[expert_idx, :shard_inter, :] = tp_slice
     else:
@@ -590,7 +591,9 @@ def _down_proj_weight_loader(
     expert_idx = int(loaded_shard_id.split(":")[1])
     shard_inter = divide(full_inter, tp_size)
     start = tp_rank * shard_inter
-    param.data[expert_idx, :, :] = loaded_weight[:, start:start + shard_inter]
+    if loaded_weight.shape[1] != shard_inter:
+        loaded_weight = loaded_weight[:, start:start + shard_inter]
+    param.data[expert_idx, :, :] = loaded_weight
 
 
 def _gate_up_fp8_weight_loader(

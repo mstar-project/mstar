@@ -244,12 +244,14 @@ class QuantLinear(nn.Module, LoraCapable):
 
 class QuantGeometry(NamedTuple):
     """One rank's weight ``[n, k]`` and the sub-blocks its loader places along each dim: ``rows`` the
-    per-rank q/k/v or gate/up widths, ``cols`` one span unless the layer fuses along K."""
+    per-rank q/k/v or gate/up widths, ``cols`` one span unless the layer fuses along K; ``sharded``
+    when those are slices of a bigger checkpoint tensor (tensor parallelism)."""
 
     n: int
     k: int
     rows: tuple[int, ...]
     cols: tuple[int, ...]
+    sharded: bool = False
 
 
 class QuantCapability(NamedTuple):

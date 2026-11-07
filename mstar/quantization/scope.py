@@ -42,16 +42,30 @@ class NodeQuantization:
     """One node's quantization while it loads: its spec, its declared roots, and each root's plan."""
 
     def __init__(self, node: str, spec: NodeQuantSpec, roots: list[QuantizationRoot],
-                 device: torch.device | str | None = None):
+                 device: torch.device | str | None = None, checkpoint: CheckpointQuant | None = None):
+        """``checkpoint``: what the stream stores, when it comes from no directory (an in-memory stream)."""
         self.node = node
         self.spec = spec
         self.roots = roots
         self.device = device
+        self._given = checkpoint
         self._checkpoints: dict[str, CheckpointQuant | None] = {}
         # id(root module) -> (module, plan), in load order
         self.plans: dict[int, tuple[nn.Module, QuantPlan]] = {}
+        self._finalized: set[int] = set()
+
+    @contextlib.contextmanager
+    def activated(self) -> Iterator[NodeQuantization]:
+        """This scope as the active one for the body (the engine manager's ``node_scope`` does it per node)."""
+        token = _ACTIVE.set(self)
+        try:
+            yield self
+        finally:
+            _ACTIVE.reset(token)
 
     def _checkpoint(self, decl: QuantizationRoot) -> CheckpointQuant | None:
+        if self._given is not None:
+            return self._given
         directory = decl.checkpoint_dir()
         if directory is None:
             return None
@@ -86,10 +100,21 @@ class NodeQuantization:
             return weights
         return apply.intercept(weights, plan, stacked_params, name_remapper)
 
+    def finalize_within(self, module: nn.Module) -> None:
+        """Finalize the loaded roots at or under ``module`` (once each): quantize what loaded bf16 before the
+        model's own post-load processing (``process_weights_after_loading``) reads the weights."""
+        inside = {id(m) for m in module.modules()}
+        for key, (root, plan) in self.plans.items():
+            if key in inside and key not in self._finalized:
+                apply.finalize(root, plan, self.device)
+                self._finalized.add(key)
+
     def finish(self, submodule: nn.Module | None) -> None:
         """Finalize every root this node loaded; refuse a spec that asked for a format no root took."""
-        for module, plan in self.plans.values():
-            apply.finalize(module, plan, self.device)
+        for key, (module, plan) in self.plans.items():
+            if key not in self._finalized:
+                apply.finalize(module, plan, self.device)
+                self._finalized.add(key)
         asked = self.spec.format not in (AUTO, BF16) or any(rule.format != BF16 for rule in self.spec.rules)
         if submodule is not None and asked and not self.plans:
             raise ValueError(
@@ -120,3 +145,14 @@ def node_scope(
         yield scope
     finally:
         _ACTIVE.reset(token)
+
+
+def load_submodule(model: Any, node: str, model_config: Mapping[str, Any] | None = None,
+                   device: torch.device | str = "cpu", **kwargs: Any):
+    """``model.get_submodule(node, device, **kwargs)`` under the node's quantization scope: how the engine
+    manager loads a node, for anything else that loads one (tests, tools)."""
+    with node_scope(model, node, model_config or {}, device) as scope:
+        submodule = model.get_submodule(node, device, **kwargs)
+        if scope is not None:
+            scope.finish(submodule)
+    return submodule

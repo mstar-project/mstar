@@ -19,6 +19,7 @@ resolver refuses a GPU without e4m3 tensor cores.
 from __future__ import annotations
 
 from collections.abc import Mapping
+from typing import ClassVar
 
 import torch
 import torch.nn.functional as F
@@ -128,10 +129,28 @@ class Fp8ChannelFormat(_Fp8Format):
 
 
 class Fp8BlockFormat(_Fp8Format):
+    """``block`` is the checkpoint's scale tile (128 x 128 for every released checkpoint; ``for_block`` makes
+    another, which the kernels run as w8a16). ``reference`` runs the weight dequantized per call on any device:
+    a model's numerics anchor (GLM-5.2's ``kernels: reference``)."""
+
     name = "fp8_block"
     buffers = ("weight", "weight_scale_inv")
     scale_name = "weight_scale_inv"
-    block = (128, 128)
+    _variants: ClassVar[dict] = {}
+
+    def __init__(self, block: tuple[int, int] = (128, 128), reference: bool = False):
+        self.block = tuple(block)
+        self.reference = reference
+
+    @classmethod
+    def for_block(cls, block: tuple[int, int] | None, reference: bool = False) -> "Fp8BlockFormat":
+        """The registered 128 x 128 format, or a variant for another block or the reference kernels."""
+        key = (tuple(block or FP8_BLOCK.block), reference)
+        if key == (FP8_BLOCK.block, False):
+            return FP8_BLOCK
+        if key not in cls._variants:
+            cls._variants[key] = cls(*key)
+        return cls._variants[key]
 
     def check(self, out_features, in_features, dtype):
         super().check(out_features, in_features, dtype)
@@ -172,8 +191,9 @@ class Fp8BlockFormat(_Fp8Format):
 
     def _run(self, x, weight, weight_scale_inv, glu: bool):
         scale = weight_scale_inv.view(_F32)
-        if not x.is_cuda:
-            w = dequantize_fp8_block_weight(_e4m3(weight), scale, self.block, out_dtype=x.dtype)
+        if self.reference or not x.is_cuda:
+            # the weight as a bf16 checkpoint's loader would hold it (dequantized to bf16), in x's dtype
+            w = dequantize_fp8_block_weight(_e4m3(weight), scale, self.block).to(x.dtype)
             y = F.linear(x, w)
             if glu:
                 gate, up = y.chunk(2, dim=-1)

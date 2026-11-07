@@ -170,7 +170,7 @@ class ColumnParallelLinear(nn.Module, LoraCapable, InPlaceQuant):
 
     def quant_geometry(self) -> QuantGeometry:
         n, k = self.output_size_per_partition, self.input_size_per_partition
-        return QuantGeometry(n, k, (n,), (k,))
+        return QuantGeometry(n, k, (n,), (k,), self.tp_size > 1)
 
     def lora_target(self) -> LoraTarget:
         return LoraTarget(
@@ -255,7 +255,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
     def quant_geometry(self) -> QuantGeometry:
         rows = tuple(size // self.tp_size for size in self.output_sizes)
         return QuantGeometry(self.output_size_per_partition, self.input_size_per_partition, rows,
-                             (self.input_size_per_partition,))
+                             (self.input_size_per_partition,), self.tp_size > 1)
 
     def lora_target(self) -> LoraTarget:
         # a slice per sub-shard, named by the index the stacked rules route by
@@ -385,7 +385,7 @@ class QKVParallelLinear(ColumnParallelLinear):
         rows = (self.num_heads * self.head_size, self.num_kv_heads * self.head_size,
                 self.num_kv_heads * self.v_head_size)
         return QuantGeometry(self.output_size_per_partition, self.input_size_per_partition, rows,
-                             (self.input_size_per_partition,))
+                             (self.input_size_per_partition,), self.tp_size > 1)
 
     def lora_target(self) -> LoraTarget:
         # the checkpoint's widths: K/V heads replicated past their count still count once,
@@ -557,7 +557,7 @@ class RowParallelLinear(nn.Module, LoraCapable, InPlaceQuant):
 
     def quant_geometry(self) -> QuantGeometry:
         n, k = self.output_size_per_partition, self.input_size_per_partition
-        return QuantGeometry(n, k, (n,), (k,))
+        return QuantGeometry(n, k, (n,), (k,), self.tp_size > 1)
 
     def lora_target(self) -> LoraTarget:
         return LoraTarget(
