@@ -133,7 +133,7 @@ class Gr00tN17Model(Model):
         # dims come from `nvidia/Cosmos-Reason2-2B`, which is gated.
         self.backbone_path_hf = backbone_path_hf or self.config_backbone_default
         self.cache_dir = cache_dir
-        # NVIDIA's fine-tunes also ship their optimizer state: 29 GB of Bridge's 36
+        # NVIDIA's fine-tunes also ship their training checkpoint: 29 GB of Bridge's 36
         self._repo_dir = resolve_snapshot_dir(model_path_hf, cache_dir, allow_patterns=["*.json", "*.safetensors"])
         self.config: Gr00tN17Config = Gr00tN17Config.from_hf(
             self._repo_dir, self._backbone_config(),
