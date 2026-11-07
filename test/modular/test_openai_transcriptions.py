@@ -436,7 +436,7 @@ def test_sequential_long_form_carries_language_and_text(client_and_stub):
         _text("<|0.00|>", " Second window.", "<|10.00|>"),
         _text("<|0.00|>", " Tail.", "<|5.00|>"),
     ]
-    r = _post(client, {"model": "whisper_large", "response_format": "verbose_json"},
+    r = _post(client, {"model": "whisper_large", "long_form": "sequential", "response_format": "verbose_json"},
               filename="long.wav", content=_wav_bytes(65))
     assert r.status_code == 200, r.text
     body = r.json()
@@ -534,13 +534,15 @@ def test_client_gone_after_a_parallel_tail_releases_it_and_submits_nothing_more(
     stub.collect_results = collect_until_gone
     monkeypatch.setattr(Request, "is_disconnected", is_disconnected)
     # window 0 stopped inside a segment, so it has a tail to decode
+    # fewer than the upload's 20 windows, so some are left unsubmitted
+    monkeypatch.setattr(serving_transcriptions, "PARALLEL_INFLIGHT", 8)
     stub.queued_chunks = [_text("<|en|>", "<|0.00|>", " One.", "<|20.00|>", "<|20.40|>", " cut off")]
     stub.queued_chunks += [_text("<|0.00|>", f" w{i}.", "<|29.00|>") for i in range(1, 30)]
     r = _post(client, {"model": "whisper_large", "long_form": "parallel", "language": "en",
                        "response_format": "verbose_json"}, filename="long.wav", content=_wav_bytes(10 * 60))
     assert r.status_code == 200, r.text
     # the first window's tail went out when that window came back, before the disconnect
-    assert len(stub.submits) == 2 + serving_transcriptions.PARALLEL_INFLIGHT
+    assert len(stub.submits) == 2 + 8
     # the tail's file is cut after every fixed window's, so it has the highest _wNNNN
     tail = max(stub.submits, key=lambda sub: sub["file_paths"]["audio"][0])["request_id"]
     assert tail in stub.released
@@ -566,7 +568,7 @@ def test_streaming_long_form_emits_every_window_in_order(client_and_stub):
     stub.queued_chunks = [_text("<|en|>", " one"), _text(" two")]
     with client.stream(
         "POST", "/v1/audio/transcriptions",
-        data={"model": "whisper_large", "stream": "true"},
+        data={"model": "whisper_large", "long_form": "sequential", "stream": "true"},
         files={"file": ("long.wav", _wav_bytes(45), "audio/wav")},
     ) as r:
         lines = [ln for ln in r.iter_lines() if ln.startswith("data:")]
@@ -654,7 +656,7 @@ def test_sequential_seeks_to_the_last_closed_segment(client_and_stub):
         _text("<|0.00|>", " Second.", "<|29.00|>"),
         _text("<|0.00|>", " Third.", "<|15.00|>"),
     ]
-    r = _post(client, {"model": "whisper_large", "response_format": "verbose_json"},
+    r = _post(client, {"model": "whisper_large", "long_form": "sequential", "response_format": "verbose_json"},
               filename="long.wav", content=_wav_bytes(65))
     assert r.status_code == 200, r.text
     body = r.json()
@@ -672,7 +674,8 @@ def test_sequential_seeks_to_the_last_closed_segment(client_and_stub):
 def test_sequential_json_decodes_windows_with_timestamps(client_and_stub):
     client, stub = client_and_stub
     stub.queued_chunks = [_text("<|en|>", "<|0.00|>", " one", "<|29.50|>"), _text("<|0.00|>", " two", "<|15.00|>")]
-    r = _post(client, {"model": "whisper_large"}, filename="long.wav", content=_wav_bytes(45))
+    r = _post(client, {"model": "whisper_large",
+        "long_form": "sequential"}, filename="long.wav", content=_wav_bytes(45))
     assert r.json() == {"text": "one two"}
     assert all(s["model_kwargs"]["timestamps"] == "segment" for s in stub.submits)
 
@@ -703,7 +706,7 @@ def test_repetitive_window_first_drops_the_prompt_then_warms_up(client_and_stub)
         _text("<|0.00|>", " Fine now.", "<|10.00|>"),   # 0.2 without the prompt: accepted
         _text("<|0.00|>", " The end.", "<|15.00|>"),
     ]
-    r = _post(client, {"model": "whisper_large", "response_format": "verbose_json"},
+    r = _post(client, {"model": "whisper_large", "long_form": "sequential", "response_format": "verbose_json"},
               filename="long.wav", content=_wav_bytes(75))
     body = r.json()
     assert body["text"] == "Hello there. Fine now. The end."
@@ -721,7 +724,8 @@ def test_window_accepted_hot_stops_conditioning_the_next(client_and_stub):
     stub.queued_chunks = [_text("<|en|>", "<|0.00|>", " Hello there.", "<|20.00|>")]
     stub.queued_chunks += [_text("<|0.00|>", loop, "<|29.00|>")] * 5   # prompt, no prompt, 0.2, 0.4, 0.6
     stub.queued_chunks += [_text("<|0.00|>", " Warm.", "<|10.00|>"), _text("<|0.00|>", " The end.", "<|15.00|>")]
-    r = _post(client, {"model": "whisper_large"}, filename="long.wav", content=_wav_bytes(75))
+    r = _post(client, {"model": "whisper_large",
+        "long_form": "sequential"}, filename="long.wav", content=_wav_bytes(75))
     assert r.json() == {"text": "Hello there. Warm. The end."}
     assert [s["model_kwargs"]["temperature"] for s in stub.submits] == [0.0, 0.0, 0.0, 0.2, 0.4, 0.6, 0.8, 0.0]
     # the window accepted at 0.8 does not condition the one after it
@@ -899,13 +903,15 @@ def test_upload_longer_than_the_cap_is_rejected(client_and_stub, monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "mode, submitted", [("parallel", 1 + serving_transcriptions.PARALLEL_INFLIGHT), ("sequential", 2)],
+    "mode, submitted", [("parallel", 9), ("sequential", 2)],
 )
 def test_client_gone_mid_long_form_stops_submitting(client_and_stub, monkeypatch, mode, submitted):
     # collect_results aborts and returns [] once the client is gone; the
     # remaining windows must not be submitted after that
     from starlette.requests import Request
 
+    # fewer than the upload's 20 windows, so some are left unsubmitted
+    monkeypatch.setattr(serving_transcriptions, "PARALLEL_INFLIGHT", 8)
     client, stub = client_and_stub
     gone = False
     collect = stub.collect_results
@@ -929,3 +935,9 @@ def test_client_gone_mid_long_form_stops_submitting(client_and_stub, monkeypatch
     assert len(stub.submits) == submitted
     assert set(stub.released) == {s["request_id"] for s in stub.submits[2:]}
     assert not list(stub.upload_dir.iterdir())
+
+
+@pytest.mark.parametrize("cls", [adapters.WhisperAdapter, adapters.Qwen3ASRAdapter])
+def test_asr_models_cut_a_long_upload_unless_asked_not_to(cls):
+    assert cls.long_form == "parallel"
+    assert (cls.window_seconds or cls.max_audio_seconds) == 30.0
