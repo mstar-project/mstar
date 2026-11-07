@@ -3594,30 +3594,13 @@ class Engine:
         if ctx.repeats != width:
             raise ValueError("run output width must match its settled logical receipt")
         columns = self.run_columns(batch.node_name, batch.graph_walk)
-        rows = []
-        for rid in batch.request_ids:
-            descriptor = batch.run_rows[rid]
-            actual = sum(ids.count(descriptor.handle) for _, identities in records for ids in identities)
-            output = self._run_row_output(records, descriptor.handle, width)
-            if output is None or actual != ctx.run_counts[rid]:
-                raise ValueError("descriptor output count disagrees with its settled receipt")
-            for values in (output.row_outputs, output.output_spans):
-                for name, value in (values or {}).items():
-                    if name not in columns:
-                        values[name] = value[:, actual - 1]
-            rows.append(output)
-
-        def join(attribute: str, excluded=frozenset()):
-            values = [getattr(row, attribute) or {} for row in rows]
-            names = values[0].keys() - excluded
-            if any(value.keys() - excluded != names for value in values):
-                raise ValueError("logical rows have incompatible retained outputs")
-            return {name: torch.cat([value[name] for value in values]) for name in names}
-
-        raw = BatchedModelOutput(
-            check_stop_buffers=join("check_stop_buffers", {RUN_COUNTS, RUN_REPLAYS}),
-            row_outputs=join("row_outputs") or None, output_spans=join("output_spans") or None,
-        )
+        descriptors = [batch.run_rows[rid].handle for rid in batch.request_ids]
+        raw, actual = self._run_outputs(records, descriptors, width, columns)
+        if any(actual[descriptor] != ctx.run_counts[rid]
+               for rid, descriptor in zip(batch.request_ids, descriptors, strict=True)):
+            raise ValueError("descriptor output count disagrees with its settled receipt")
+        raw.check_stop_buffers = {name: value for name, value in raw.check_stop_buffers.items()
+                                  if name not in (RUN_COUNTS, RUN_REPLAYS)}
         mgmt = self._submodules[batch.node_name]
         if mgmt.rings:
             # A width-one physical capture still stores an iteration axis.
@@ -3638,6 +3621,53 @@ class Engine:
         return self._postprocess_outputs(batch, outputs)
 
     @staticmethod
+    def _run_outputs(
+        records: Sequence[tuple[BatchedModelOutput, Sequence[Sequence[int]]]],
+        descriptors: Sequence[int], width: int, columns: Collection[str],
+    ) -> tuple[BatchedModelOutput, dict[int, int]]:
+        """Restore logical rows without settling owners or invoking a tail.
+
+        A producer may need its full requested width before resource rewind;
+        the caller decides that order. Semantic policy receipts are not output
+        columns and must be read separately from their retained owner slots.
+        """
+        if not descriptors or len(set(descriptors)) != len(descriptors):
+            raise ValueError("logical output rows need distinct membership descriptors")
+        actual = {descriptor: sum(ids.count(descriptor) for _, identities in records for ids in identities)
+                  for descriptor in descriptors}
+        rows = [Engine._run_row_output(records, descriptor, width) for descriptor in descriptors]
+        exemplar = next((row for row in rows if row is not None), None)
+        if exemplar is None:
+            anchor = next((value for raw, _ in records
+                           for values in (raw.row_outputs, raw.check_stop_buffers, raw.output_spans)
+                           for value in (values or {}).values() if isinstance(value, torch.Tensor)), None)
+            if anchor is None:
+                raise ValueError("a closed capture has no retained output buffers")
+            zero = anchor.new_zeros((len(descriptors),), dtype=torch.long)
+            return BatchedModelOutput(check_stop_buffers={RUN_COUNTS: zero, RUN_REPLAYS: zero}), actual
+        rows = [row if row is not None else BatchedModelOutput(**{
+                    name: {key: torch.zeros_like(value) for key, value in (getattr(exemplar, name) or {}).items()}
+                    for name in ("check_stop_buffers", "row_outputs", "output_spans")
+                }) for row in rows]
+        for descriptor, row in zip(descriptors, rows, strict=True):
+            for values in (row.row_outputs, row.output_spans):
+                for name, value in (values or {}).items():
+                    if name not in columns:
+                        values[name] = value[:, max(0, actual[descriptor] - 1)]
+
+        def join(attribute):
+            values = [getattr(row, attribute) or {} for row in rows]
+            names = values[0].keys()
+            if any(value.keys() != names for value in values):
+                raise ValueError("logical rows have incompatible retained outputs")
+            return {name: torch.cat([value[name] for value in values]) for name in names}
+
+        stops = join("check_stop_buffers")
+        stops[RUN_REPLAYS] = stops[RUN_COUNTS].new_full((len(rows),), max(actual.values()))
+        return BatchedModelOutput(check_stop_buffers=stops, row_outputs=join("row_outputs") or None,
+                                  output_spans=join("output_spans") or None), actual
+
+    @staticmethod
     def _run_row_output(
         records: Sequence[tuple[BatchedModelOutput, Sequence[Sequence[int]]]], descriptor: int, width: int,
     ) -> BatchedModelOutput | None:
@@ -3652,7 +3682,7 @@ class Engine:
             raise ValueError("a run row needs a positive descriptor and logical width")
         selected = []
         shapes = []
-        metadata = {RUN_COUNTS, RUN_REPLAYS, RUN_DESCRIPTORS}
+        metadata = {RUN_COUNTS, RUN_REPLAYS, RUN_DESCRIPTORS, STREAM_COUNTS, STREAM_TRANSITION}
         for index, (raw, identities) in enumerate(records):
             if raw.per_rid_outputs or raw.packed_outputs:
                 raise ValueError("joining outputs must retain row-addressed iteration columns")

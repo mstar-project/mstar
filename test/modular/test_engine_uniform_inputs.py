@@ -1356,6 +1356,15 @@ def test_streamed_engine_composes_independent_bodies_and_owner_reads(device_name
     assert output[1].check_stop_buffers[STREAM_COUNTS].tolist() == [b_count]
     if b_count:
         assert output[1].row_outputs["x"][0, 0].item() == 42
+    if mode in {"direct_short", "direct_skip"}:
+        # Descriptor restoration is only a data operation. Its producer still
+        # reaches the ordinary tail at requested width, before actual rewind.
+        identities = [[41] * producer_count + [0] * (4 - producer_count)]
+        a.outputs, actual = Engine._run_outputs(
+            [(output[0], identities)], [41], 4, eng.run_columns("a", a.graph_walk),
+        )
+        assert actual == {41: producer_count}
+        output[0] = a.outputs
     from concurrent.futures import ThreadPoolExecutor
     from contextlib import nullcontext
 

@@ -95,13 +95,16 @@ def test_run_row_collection_uses_descriptor_order_and_the_late_requests_metadata
 
     from mstar.engine.device_run import RUN_COUNTS, RUN_DESCRIPTORS, RUN_REPLAYS
     from mstar.engine.engine import ExecutingBatch
+    from mstar.engine.resources.iteration_tables import STREAM_COUNTS, STREAM_TRANSITION
 
     def raw(values):
         values = torch.tensor([values])
         spans = torch.stack((values, values + 1), dim=-1)
-        return BatchedModelOutput(row_outputs={"frame": values}, output_spans={"frame": spans},
+        return BatchedModelOutput(row_outputs={"frame": values, "final": values + 100}, output_spans={"frame": spans},
                                   check_stop_buffers={"token": values, RUN_COUNTS: torch.tensor([99]),
-                                                      RUN_REPLAYS: torch.tensor([99])})
+                                                      RUN_REPLAYS: torch.tensor([99]),
+                                                      STREAM_COUNTS: torch.tensor([3]),
+                                                      STREAM_TRANSITION: torch.tensor([7])})
 
     first, second = raw([11, 12, 21]), raw([22, 31, 32])
     first.check_stop_buffers[RUN_DESCRIPTORS] = torch.tensor([[7, 7, 8]])
@@ -112,6 +115,16 @@ def test_run_row_collection_uses_descriptor_order_and_the_late_requests_metadata
     assert late.output_spans["frame"].tolist() == [[[21, 22], [22, 23], [22, 23], [22, 23]]]
     assert late.check_stop_buffers["token"].tolist() == [[21, 22, 22, 22]]
     assert late.check_stop_buffers[RUN_COUNTS].tolist() == [2]
+    compacted, counts = Engine._run_outputs(records, [8, 10], 4, {"frame"})
+    assert counts == {8: 2, 10: 0}
+    assert compacted.row_outputs["frame"].tolist() == [[21, 22, 22, 22], [0, 0, 0, 0]]
+    assert compacted.row_outputs["final"].tolist() == [122, 0]
+    assert compacted.check_stop_buffers[RUN_COUNTS].tolist() == [2, 0]
+    assert compacted.check_stop_buffers[RUN_REPLAYS].tolist() == [2, 2]
+    assert not {RUN_DESCRIPTORS, STREAM_COUNTS, STREAM_TRANSITION} & compacted.check_stop_buffers.keys()
+    empty, counts = Engine._run_outputs(records, [10], 4, {"frame"})
+    assert counts == {10: 0} and not empty.row_outputs
+    assert empty.check_stop_buffers[RUN_COUNTS].tolist() == [0]
     assert Engine._run_row_output(records, 10, 4) is None
     with pytest.raises(ValueError, match="admitted logical horizon"):
         Engine._run_row_output(records, 8, 1)
