@@ -3270,6 +3270,15 @@ activations, which needs no entry. You can also set <code class="docutils litera
 <p>If a node group has <code class="docutils literal notranslate"><span class="pre">tp_size</span> <span class="pre">&gt;</span> <span class="pre">1</span></code> and names a node that is not in <code class="docutils literal notranslate"><span class="pre">tp_enabled_nodes</span></code>,
 loading fails. See <code class="docutils literal notranslate"><span class="pre">configs/qwen3omni_thinker_tp2.yaml</span></code> for an example with several node
 types.</p>
+<p>A row-parallel projection followed by an RMSNorm can leave its all-reduce to the norm, which
+runs both in one fused kernel. Set the projection’s <code class="docutils literal notranslate"><span class="pre">reduce_results</span> <span class="pre">=</span> <span class="pre">False</span></code>, so it returns
+its partial sum, and hand the norm the comm group: <code class="docutils literal notranslate"><span class="pre">RMSNorm.forward_residual(x,</span> <span class="pre">residual,</span>
+<span class="pre">comm_group)</span></code> reduces, adds and norms, and <code class="docutils literal notranslate"><span class="pre">RMSNorm.forward(x,</span> <span class="pre">comm_group)</span></code> reduces and
+norms (a post-norm before the residual add). The two go together, since a norm called
+without the group norms an unreduced partial sum, which is wrong only under TP. Keep both in
+the module whose <code class="docutils literal notranslate"><span class="pre">forward</span></code> calls the norms, as <code class="docutils literal notranslate"><span class="pre">Qwen3_5LanguageModel</span></code> and
+<code class="docutils literal notranslate"><span class="pre">MuseGlimmerTextModel</span></code> do. <code class="docutils literal notranslate"><span class="pre">MultimodalDecoderModel</span></code> builds the kernel’s workspace for its
+TP node.</p>
 </section>
 <section id="expert-parallelism-moe">
 <span id="id6"></span><h3>Expert parallelism (MoE)<a class="headerlink" href="#expert-parallelism-moe" title="Link to this heading">#</a></h3>
@@ -3776,10 +3785,14 @@ region per patch bucket (<code class="docutils literal notranslate"><span class=
 tower’s tensors in <code class="docutils literal notranslate"><span class="pre">tensor_inputs</span></code> and, in <code class="docutils literal notranslate"><span class="pre">resource_step_info</span></code>, each of
 <code class="docutils literal notranslate"><span class="pre">SEGMENT_LABELS</span></code>’ attending spans (frames, windows) over the same patches. The tower
 provides <code class="docutils literal notranslate"><span class="pre">embed(**tensors)</span> <span class="pre">-&gt;</span> <span class="pre">(hidden,</span> <span class="pre">cos,</span> <span class="pre">sin)</span></code>, <code class="docutils literal notranslate"><span class="pre">encode(hidden,</span> <span class="pre">cos,</span> <span class="pre">sin)</span></code> and
-<code class="docutils literal notranslate"><span class="pre">project(encoded,</span> <span class="pre">**tensors)</span></code>. A step whose spans under some label exceed the
-ragged resource’s <code class="docutils literal notranslate"><span class="pre">max_segments_per_step</span></code> takes no lease and runs eagerly.
-Qwen3-Omni’s ViT node is one too, off the scaffold: its region also returns the
-deepstack taps (its <code class="docutils literal notranslate"><span class="pre">_capture_block_loop</span></code>), which its own <code class="docutils literal notranslate"><span class="pre">forward_batched</span></code> reads
+<code class="docutils literal notranslate"><span class="pre">project(encoded,</span> <span class="pre">**tensors)</span></code>. The replay’s input buffers are in the node’s autocast
+dtype unless <code class="docutils literal notranslate"><span class="pre">BLOCK_LOOP_DTYPE</span></code> names what <code class="docutils literal notranslate"><span class="pre">embed</span></code> returns (Muse Glimmer’s ends on a
+LayerNorm, which autocast returns in fp32). The runner refuses an <code class="docutils literal notranslate"><span class="pre">embed</span></code> output its
+buffers may round, and widens a narrower one, so a declaration wider than <code class="docutils literal notranslate"><span class="pre">embed</span></code>’s
+output replays the loop in more precision than the eager loop runs. A step whose spans
+under some label exceed the ragged resource’s <code class="docutils literal notranslate"><span class="pre">max_segments_per_step</span></code> takes no lease and
+runs eagerly. Qwen3-Omni’s ViT node is one too, off the scaffold: its region also returns
+the deepstack taps (its <code class="docutils literal notranslate"><span class="pre">_capture_block_loop</span></code>), which its own <code class="docutils literal notranslate"><span class="pre">forward_batched</span></code> reads
 off the replay.
 A tower builds on the pieces in <code class="docutils literal notranslate"><span class="pre">mstar/model/components/qwen3_vit.py</span></code>:
 <code class="docutils literal notranslate"><span class="pre">bilinear_table_taps</span></code> (the learned position table resampled onto a patch grid),
