@@ -30,7 +30,7 @@ from test_micro_scheduler import NODE as SCHED_NODE
 from test_micro_scheduler import WALK as SCHED_WALK
 from test_micro_scheduler import _batch as _sched_batch
 
-from mstar.engine.engine import Engine, ExecutingBatch
+from mstar.engine.engine import Engine, ExecutingBatch, SubmoduleManagement
 from mstar.engine.resources import (
     AdmitOutcome,
     AllocationFailed,
@@ -41,6 +41,7 @@ from mstar.engine.resources import (
     SubmoduleStep,
 )
 from mstar.model.submodule_base import NodeSubmodule, StepOrder
+from mstar.testing_utils.engine import make_engine, make_mgmt
 from mstar.utils.device import DeviceCapability
 from mstar.worker import worker as worker_mod
 from mstar.worker.micro_scheduler import ScheduledBatch
@@ -62,12 +63,11 @@ def _offloading(rid: str = "r0") -> RequestOffloading:
 # --- engine: the tail must not run over a step that never ran --------------
 
 
-class _FakeEngine:
+class _FakeEngine(Engine):
     """Just enough engine to exercise the ``exec``/``postprocess`` branch."""
 
-    exec_and_postprocess = Engine.exec_and_postprocess
-
     def __init__(self, admit_error):
+        super().__init__(graph_runtime=None)
         self._admit_error = admit_error
         self.postprocessed = False
 
@@ -703,28 +703,18 @@ def test_could_refill_counts_the_rows_that_could_run_in_the_retry():
 # --- the unbatchable path admits everything before it runs anything --------
 
 
-class _FakeMgmt:
-    """``SubmoduleManagement``'s slot rotation, as `_exec_per_request` uses it."""
+class _FakeMgmt(SubmoduleManagement):
+    """``SubmoduleManagement``'s slot rotation from a chosen slot, recording what the forward was pointed at."""
 
     def __init__(
         self, submodule, num_slots: int, next_slot: int, seen: list,
         slot_raise_at: int | None = None,
     ):
-        self.submodule = submodule
-        self.num_slots = num_slots
-        self.needs_slot_fence = False
+        super().__init__(submodule=submodule, forward=None, forward_batched=None, joint_comm_group=None, resources={})
+        self._num_slots = num_slots
         self._next_slot = next_slot
         self._seen = seen
         self._slot_raise_at = slot_raise_at
-
-    @property
-    def next_slot(self) -> int:
-        return self._next_slot
-
-    def lease_slot(self) -> int:
-        slot = self._next_slot
-        self._next_slot = (self._next_slot + 1) % self.num_slots
-        return slot
 
     def set_piecewise_slot(self, slot: int) -> None:
         self._seen.append(slot)
@@ -732,20 +722,15 @@ class _FakeMgmt:
             raise RuntimeError("slot setup failed")
 
 
-class _FakeExecEngine:
-    """Engine internals bound onto stubs, to drive `_exec_per_request` alone."""
-
-    _exec_per_request = Engine._exec_per_request
-    _declare_and_admit = Engine._declare_and_admit
-    _check_follower_refusal = Engine._check_follower_refusal
-    _tp_follower_nodes = frozenset()  # a single rank: no follower to check
+class _FakeExecEngine(Engine):
+    """Engine internals over stubs, to drive `_exec_per_request` alone."""
 
     def __init__(
         self, fail_on: str | None = None, num_slots: int = 1, next_slot: int = 0,
         raise_on: str | tuple[str, ...] = (), collect_raise_on: str | None = None,
         slot_raise_at: int | None = None,
     ):
-        self._enable_nvtx = False
+        super().__init__(graph_runtime=None)
         self._fail_on = fail_on
         self._raise_on = {raise_on} if isinstance(raise_on, str) else set(raise_on)
         self._collect_raise_on = collect_raise_on
@@ -756,14 +741,14 @@ class _FakeExecEngine:
         self.launch_signals: list[str] = []
         self._runner = self
         self._device = torch.device("cpu")
-        self.device_capability = DeviceCapability.of(self._device)
+        self._device_capability = DeviceCapability.of(self._device)
         # the per-request path's slots; no fence, so no CUDA event is recorded
         self.piecewise_slots: list[int] = []
         self.run_slots: list[int] = []
         self.mgmt = _FakeMgmt(
             self, num_slots, next_slot, self.piecewise_slots, slot_raise_at=slot_raise_at,
         )
-        self._submodules = {"node": self.mgmt}
+        self._submodules["node"] = self.mgmt
 
     # --- submodule surface
     def _maybe_lease_piecewise_regions(self, node_name, ctx, inputs):
@@ -1008,8 +993,8 @@ class _LoggedEvent(threading.Event):
 
 def _fenced(monkeypatch, **kwargs) -> _FakeExecEngine:
     engine = _FakeExecEngine(**kwargs)
-    engine.mgmt.needs_slot_fence = True
-    engine.device_capability = SimpleNamespace(
+    engine.mgmt._forced_double_buffer = True
+    engine._device_capability = SimpleNamespace(
         is_accelerator=True, is_capturing=lambda: False,
     )
     monkeypatch.setattr(torch, "Event", lambda device=None: _FakeEvent(engine))
@@ -1071,11 +1056,11 @@ def test_postprocess_skips_a_rid_whose_forward_raised():
     """The tail must not run over a failed rid's empty outputs: it would raise
     again and replace the forward's error with its own."""
     submodule = _TailSubmodule()
-    engine = SimpleNamespace(_submodules={"node": SimpleNamespace(submodule=submodule)})
+    engine = make_engine(_submodules={"node": make_mgmt(submodule=submodule)})
     batch = _exec_batch(["a", "b"])
     batch.register_failure("b", ValueError("forward failed for b"))
 
-    Engine._postprocess_batch(engine, batch, {"a": {"token": 1}, "b": {}})
+    engine._postprocess_batch(batch, {"a": {"token": 1}, "b": {}})
 
     assert submodule.postprocessed == ["a"]
     assert batch.failed_requests == {"b": "ValueError: forward failed for b"}

@@ -16,6 +16,7 @@ import torch
 
 from mstar.engine.chunking import ChunkRange
 from mstar.model.submodule_base import ChunkingPolicy, NodeSubmodule
+from mstar.testing_utils.model import make_model
 from mstar.worker.batch_builder import fill_token_budget, fill_token_budget_in_start_order
 
 # ── the token budget ────────────────────────────────────────────────────
@@ -256,17 +257,10 @@ def test_the_floor_rounds_up_to_the_alignment_within_the_budget():
 
 def _engine_with(submodule, policies=None):
     """``policies`` is the model's ``chunking_policy_of()``: (node, walk) -> policy."""
-    from types import SimpleNamespace
 
-    from mstar.engine.chunking import ChunkingManagement
-    from mstar.engine.engine import Engine
+    from mstar.testing_utils.engine import make_engine, make_mgmt
 
-    engine = Engine.__new__(Engine)
-    engine._tp_follower_nodes = set()
-    engine._submodules = {"LLM": SimpleNamespace(submodule=submodule, resources={}, resident=None)}
-    engine._keyed_walks = {}
-    engine._resources = {}
-    engine._chunking = ChunkingManagement(engine._submodules)
+    engine = make_engine(_submodules={"LLM": make_mgmt(submodule)})
     engine._chunking.set_policies(policies or {})
     return engine
 
@@ -534,8 +528,6 @@ def test_the_mismatched_row_fails_and_the_rest_of_the_step_runs():
             return super().prepare_inputs(**kwargs)
 
     engine = _engine_with(_Sub(10))
-    engine._enable_nvtx = False
-    engine._loopback_steps = {}
     batch = ExecutingBatch(
         node_name="LLM",
         per_request_info={1: 1, 2: 2},
@@ -554,8 +546,9 @@ def test_a_step_over_its_token_budget_is_reported(caplog):
 
     from mstar.engine.chunking import ChunkingManagement
     from mstar.model.submodule_base import ChunkingPolicy
+    from mstar.testing_utils.engine import make_mgmt
 
-    chunking = ChunkingManagement({"LLM": SimpleNamespace(submodule=SimpleNamespace())})
+    chunking = ChunkingManagement({"LLM": make_mgmt(submodule=SimpleNamespace())})
     chunking.set_policies(
         {("LLM", "mixed"): ChunkingPolicy(walks=("mixed",), max_batch_tokens=4)},
     )
@@ -603,16 +596,11 @@ def _budgeted_engine(align: int = 1):
     """An engine whose LLM node carries a resource declaring ``align`` (`Resource.chunk_alignment`)."""
     from types import SimpleNamespace
 
-    from mstar.engine.chunking import ChunkingManagement
-    from mstar.engine.engine import Engine
     from mstar.model.submodule_base import ChunkingPolicy
+    from mstar.testing_utils.engine import make_engine, make_mgmt
 
-    engine = Engine.__new__(Engine)
-    engine._submodules = {"LLM": SimpleNamespace(
-        submodule=SimpleNamespace(), resources={"state": SimpleNamespace(chunk_alignment=align)},
-    )}
-    engine._chunk_alignment = {}
-    engine._chunking = ChunkingManagement(engine._submodules)
+    state = SimpleNamespace(chunk_alignment=align, force_double_buffer=False, supports_preplan=False)
+    engine = make_engine(_submodules={"LLM": make_mgmt(submodule=SimpleNamespace(), resources={"state": state})})
     engine.set_chunking_policies({
         ("LLM", "prefill"): ChunkingPolicy(walks=("prefill",), max_batch_tokens=512),
         ("LLM", "vision"): ChunkingPolicy(walks=("vision",), max_batch_tokens=2048),
@@ -831,7 +819,7 @@ class _Unmeasured(_Chunker):
 
 
 def _chunking_model():
-    return SimpleNamespace(chunking_policy_of=lambda: {
+    return make_model(chunking_policy_of=lambda: {
         ("LLM", "prefill"): ChunkingPolicy(
             walks=("prefill",), chunkable=True, max_batch_tokens=512),
     })
