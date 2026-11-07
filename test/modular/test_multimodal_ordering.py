@@ -9,6 +9,7 @@ import torch
 
 from mstar.api_server.openai.adapters import flatten_messages
 from mstar.api_server.openai.serving_chat import _build_response
+from mstar.api_server.request_types import ResultChunk
 from mstar.model.multimodal import (
     PromptPart,
     check_attachments,
@@ -457,8 +458,8 @@ def test_an_image_chat_puts_each_turn_in_its_own_role_block(bagel, tmp_path):
 def test_a_replys_image_comes_back_in_the_next_user_turn(bagel, tmp_path):
     """A client appends the assistant message a chat response carries and goes on."""
     reply = _build_response("bagel", "chatcmpl-0", [
-        SimpleNamespace(modality="text", data=b"Here it is."),
-        SimpleNamespace(modality="image", data=b"\x89PNG"),
+        ResultChunk(request_id="chatcmpl-0", modality="text", data=b"Here it is."),
+        ResultChunk(request_id="chatcmpl-0", modality="image", data=b"\x89PNG"),
     ], 24000)["choices"][0]["message"]
     messages = [
         {"role": "user", "content": "Draw a red cube."},
