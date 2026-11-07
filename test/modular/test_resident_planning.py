@@ -1985,7 +1985,9 @@ def test_joining_horizon_preserves_other_preplans_and_settles_both_receipts(monk
     kv.assert_pages_conserved()
 
 
-@pytest.mark.parametrize("unsupported", ["recurrent", "host_writes", "foreign_segment", "iteration_inputs", "sampler"])
+@pytest.mark.parametrize("unsupported", [
+    "recurrent", "host_writes", "foreign_segment", "iteration_inputs", "sampler", "span", "walk",
+])
 def test_joining_rejects_unaudited_owner_effects_before_reserving(unsupported):
     live = _resources(prefix_cache=False, recurrent_prefix_slots=1 if unsupported == "recurrent" else 0)
     if unsupported == "iteration_inputs":
@@ -2011,10 +2013,15 @@ def test_joining_rejects_unaudited_owner_effects_before_reserving(unsupported):
     elif unsupported == "sampler":
         from mstar.engine.resources.sampler.config import SamplerStep
         steps["sampler"] = SamplerStep(segments=segments)
+    elif unsupported == "span":
+        steps["kv"] = KVStep(segments=(Segment(1, "main", 2),))
+    elif unsupported == "walk":
+        pass
     else:
         steps["kv"] = KVStep(segments=(Segment(2, "main", 1),))
     step = SubmoduleStep(steps)
-    step.set_ctx(StepContext((1,), WALK, 0, False, resident=planner, repeats=4))
+    step.set_ctx(StepContext((1,), "other" if unsupported == "walk" else WALK,
+                             0, False, resident=planner, repeats=4))
     free = live["kv"]._arena.num_free
     with pytest.raises(ValueError):
         runner.admit_rows(step)

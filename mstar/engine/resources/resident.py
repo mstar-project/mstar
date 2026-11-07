@@ -571,6 +571,17 @@ class ResidentPlanner:
         if ctx.is_preplan:
             self._staged = plan
 
+    def validate_rows(self, step: SubmoduleStep, ctx) -> None:
+        """Validate a publication's row geometry before any owner reserves."""
+        rids = tuple(ctx.request_ids)
+        streams = self._walk_streams.get(ctx.graph_walk)
+        if streams is None:
+            raise ValueError(f"walk {ctx.graph_walk!r} has no resident binding on {self.node}")
+        if not rids or len(set(rids)) != len(rids) or any(rid < 0 for rid in rids):
+            raise ValueError("resident row publication needs distinct real requests")
+        if (refusal := _row_refusal(step, streams, set(rids))) is not None:
+            raise ValueError(f"resident walk {ctx.graph_walk!r} on {self.node}: {refusal}")
+
     def prepare_rows(self, step: SubmoduleStep, ctx) -> ResidentPlan:
         """Retain fresh rows without changing an already staged capture.
 
@@ -580,12 +591,9 @@ class ResidentPlanner:
         release its pins only after the last reader. No ordinary plan/commit
         sequence advances here.
         """
+        self.validate_rows(step, ctx)
         rids = tuple(ctx.request_ids)
         streams = self._walk_streams[ctx.graph_walk]
-        if not rids or len(set(rids)) != len(rids) or any(rid < 0 for rid in rids):
-            raise ValueError("resident row publication needs distinct real requests")
-        if (refusal := _row_refusal(step, streams, set(rids))) is not None:
-            raise ValueError(f"resident walk {ctx.graph_walk!r} on {self.node}: {refusal}")
         with self._lock:
             if any(rid in self._slot_of for rid in rids):
                 raise ValueError("resident row publication needs previously unheld requests")

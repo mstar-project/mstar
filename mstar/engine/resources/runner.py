@@ -692,6 +692,7 @@ class StepRunner:
                 or ctx.capture or ctx.plan_results or ctx.counted or ctx.run_counts is not None):
             raise ValueError("joining rows need a fresh resident accounting context")
         ctx.check_tp_repeats()
+        ctx.resident.validate_rows(step, ctx)
         if self._staged is not None:
             held = set(self._staged[1])
             held.update(seg.request_id for _, segments in self._staged[4] for seg in segments)
