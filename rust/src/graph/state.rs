@@ -895,6 +895,9 @@ impl RequestState {
             needed &= !spec.streaming_mask;
         }
         let st = &self.nodes[node as usize];
+        if st.unit_claim.is_some() {
+            return false;
+        }
         let mut have = if check_next_iter { st.next.mask } else { st.cur.mask } | st.spec.mask;
         if check_next_iter {
             // Held (loop-external) inputs are re-injected into the current

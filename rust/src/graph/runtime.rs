@@ -2989,7 +2989,7 @@ impl GraphRuntime {
                 continue;
             };
             // Before complete(), which clears the flag.
-            let was_speculative = state.is_in_flight(node);
+            let was_speculative = state.is_in_flight(node) && state.unit_claim(node).is_none();
             let stride = input.loop_strides.as_ref().map_or(1, |s| s[i]);
             let completed = state.complete_strided(&g, node, &out_tensors, stride);
             self.land_unit_member(wg, node, rid);

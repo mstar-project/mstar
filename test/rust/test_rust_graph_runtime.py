@@ -709,6 +709,7 @@ def test_unit_claim_preserves_common_rows_and_refusal_returns_readiness_once():
     assert members[1].input_edges.edge_tuples() == [(b, "y", [], False), (a, "y", [], False)]
     assert rt.get_ready_nodes(set()) == []
     assert rt.claim_execution_unit("a", WALK, [a]) is None
+    assert rt.prep_spec_rids(_ab([b, a])).ready_rids == []
     assert rt.cancel_execution_unit(claim)
     assert not rt.cancel_execution_unit(claim)
     assert set(rt.get_ready_nodes(set())[0].rids) == {a, b}
@@ -776,11 +777,13 @@ def test_unit_lands_in_graph_order_with_internal_readiness_and_external_outputs_
     assert rt.get_ready_nodes(set()) == []
     with pytest.raises(ValueError, match="graph order"):
         _route(rt, [rid], "a", ["first"], [[[901]]])
+    rt.mark_partition_done(rid, "default")
     last = _route(rt, [rid], "b", ["last"], [[[902]]])
     rt.send_outputs(_send_input(rid, last.completion_id))
     emitted = [decode(client.recv_timeout(1000)) for _ in range(2)]
     assert [message.body.graph_edge.tensor_info[0].uuid for message in emitted] == [901, 902]
-    assert conductor.recv_timeout(1000) is not None
+    done = decode(conductor.recv_timeout(1000))
+    assert done.body.partition_done
     assert client.recv_timeout(0) is None
     assert conductor.recv_timeout(0) is None
     assert not rt.cancel_execution_unit(claim)
