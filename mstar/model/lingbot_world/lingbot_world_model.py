@@ -136,6 +136,27 @@ class LingBotWorldModel(Model):
         frames = cfg.local_attn_size if cfg.local_attn_size > -1 else cfg.max_chunks * cfg.chunk_size
         return frames * (cfg.max_area // cell)
 
+    def validate_config_yaml(self, config: dict, config_path: str) -> None:
+        """Refuse to serve more than one rollout at a time.
+
+        The pool bounds each rollout's rolling K/V, not how many rollouts run: at
+        small output sizes it admits many. Each one's text K/V and VAE caches are
+        allocated by the dit outside the engine's resources, so until they are
+        resources, the conductor's admit queue, which exists only when
+        ``max_concurrent_requests`` is set, has to hold them to one rollout.
+        """
+        limit = config.get("max_concurrent_requests")
+        if type(limit) is int and limit == 1:
+            return
+        cfg = self.config
+        text_kv_mib = cfg.num_layers * 2 * cfg.text_len * cfg.dim * torch.bfloat16.itemsize / 2**20
+        raise ValueError(
+            f"LingBot-World requires `max_concurrent_requests: 1` in {config_path}; got {limit!r}. "
+            f"The rolling K/V pool bounds each rollout's K/V, not how many run, and each rollout's "
+            f"text K/V ({text_kv_mib:.0f} MiB) and VAE caches are allocated by the dit outside the "
+            "engine's resources, so the admit queue that this key enables is the only bound on them."
+        )
+
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         encode_text = GraphNode(
             name="text_encoder",

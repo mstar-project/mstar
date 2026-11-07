@@ -1320,8 +1320,11 @@ conductor. Its first step takes a contiguous region of exactly that size (first 
 back when the request ends, so requests of different sizes share the pool instead of each
 holding the largest. When no free gap holds a new request but the free tokens do, the
 resident regions slide left to join the gaps, a copy of what they hold, between steps. How
-many requests run at once is the deployment's ``max_concurrent_requests``, not the store's. A step that declares this store
-runs eager (no capture yet), and it does not shard across ranks yet.
+many requests run at once is the deployment's ``max_concurrent_requests``, not the store's:
+the pool counts tokens, so it admits many small requests, and any state a model keeps per
+request outside the store is bounded only by that limit (LingBot-World requires it to be 1
+for this reason). A step that declares this store runs eager (no capture yet), and it does
+not shard across ranks yet.
 
 Per-request LoRA adapters
 ~~~~~~~~~~~~~~~~~~~~~~~~~

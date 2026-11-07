@@ -659,6 +659,18 @@ def test_the_fast_config_only_adds_the_autotuned_compile():
     fast = yaml.safe_load((configs / "lingbot_world_1_3b_fast.yaml").read_text())
     assert fast.pop("model_kwargs") == {"dit_compile_autotune": True}
     assert fast == base
+    LingBotWorldModel(skip_weight_loading=True).validate_config_yaml(fast, "lingbot_world_1_3b_fast.yaml")
+
+
+def test_a_config_must_run_one_rollout_at_a_time(model):
+    """The pool doesn't bound the rollouts' text K/V and VAE caches, so until
+    they are engine resources the conductor runs one rollout at a time."""
+    model.validate_config_yaml({"max_concurrent_requests": 1}, "lingbot.yaml")
+    for limit in (None, 0, 2, 16, True, "1", 1.0):
+        config = {"max_concurrent_requests": limit} if limit is not None else {}
+        with pytest.raises(ValueError, match="requires `max_concurrent_requests: 1`") as err:
+            model.validate_config_yaml(config, "lingbot.yaml")
+    assert "text K/V (90 MiB) and VAE caches" in str(err.value)
 
 
 def test_the_shipped_config_runs_one_rollout_at_a_time_over_a_pool_for_the_largest(model):
@@ -668,8 +680,10 @@ def test_the_shipped_config_runs_one_rollout_at_a_time_over_a_pool_for_the_large
 
     import yaml
 
-    config = yaml.safe_load((Path(__file__).parents[2] / "configs" / "lingbot_world_1_3b.yaml").read_text())
+    path = Path(__file__).parents[2] / "configs" / "lingbot_world_1_3b.yaml"
+    config = yaml.safe_load(path.read_text())
     assert config["max_concurrent_requests"] == 1
+    model.validate_config_yaml(config, str(path))
     (kv, _) = model.get_node_resources()
     kv.apply_yaml_overrides(**config["resources"][DIT_KV])
     assert kv.config.pool_tokens == model.max_window_tokens()
