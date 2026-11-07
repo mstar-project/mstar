@@ -260,6 +260,12 @@ items, including overlap and final tails. Settlement applies only the selected
 history after the actual items and producer completion have been published;
 run-budget exhaustion alone never finishes a stream.
 
+The input owner can retain a captured table of those policy decisions, their
+chunk metadata and selected semantic history. It exposes separate predicates
+for a policy pop and model computation, so an empty terminal flush need not
+execute a model. The payload owner supplies captured reads/writes of reserved
+ring positions; reads do not release the buffer's references or permit reuse.
+
 The capture backend can lower nested IF/WHILE operations directly into one
 native graph. Predicates remain caller-owned resident scalar buffers; existing
 member captures remain ordinary child graphs. A conditional executable is

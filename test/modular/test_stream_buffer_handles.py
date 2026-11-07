@@ -849,6 +849,140 @@ def test_future_policy_capture_bank_reuse_clears_history_and_checks_before_stagi
     assert owner.prepare_stream_window(lease, len(reservation.decisions), len(reservation.transitions)) is not window
 
 
+@pytest.mark.parametrize("factory", [lambda: FixedChunkPolicy(2), lambda: SlidingWindowChunkPolicy(4, 2)])
+@pytest.mark.parametrize("device_name", ["cpu", "cuda"])
+def test_future_stream_policy_and_ring_payloads_run_in_one_conditional_graph(factory, device_name, monkeypatch):
+    from mstar.engine.accelerator_graph_backend import GraphConditional, get_accelerator_graph_backend
+    from mstar.engine.accelerator_graph_runner import capture_into_graph
+    from mstar.engine.resources.iteration_tables import IterationTables
+    from mstar.engine.resources.loopback_rows import LoopbackRows, LoopbackRowsStep
+    from mstar.engine.resources.step import BucketKey, SlotLease, StepContext
+
+    if device_name == "cuda" and not torch.cuda.is_available():
+        pytest.skip("real stream-policy conditional graph")
+    device = torch.device(device_name)
+    ring = LoopbackRows(device, capacity=1)
+    ring.add(RID)
+    ring.ask_ring(EDGE, 8)
+    ring.ring_table(EDGE, torch.zeros(1, 1, dtype=torch.long, device=device))
+    ring.ring_reserve(EDGE, [RID], 3)
+    ring.ring_skip(EDGE, RID, [1])
+    assert ring.ring_reserve(EDGE, [RID], 5) == [3]
+    source = StreamBuffer(RID, EDGE, "LLM", factory())
+    source.put_positions([0, 2])  # logical stream positions need not equal physical ring positions
+    reservation = source.reserve_future_window([3, 4, 5, 6, 7], 8).reservation
+    width = max(t.chunk.num_items for t in reservation.transitions)
+    lease = SlotLease(0, BucketKey("consume", 1, 1))
+    tables = IterationTables(device)
+    window = tables.prepare_stream_window(lease, len(reservation.decisions), len(reservation.transitions))
+    # This synthetic node's ordinary preparation computes only nonempty chunks.
+    computes = [t.chunk.num_items > 0 for t in reservation.transitions]
+    ctx = StepContext([RID], "produce", 0, False)
+    ctx.slot_lease = lease
+    ring.plan(LoopbackRowsStep(), ctx)
+    rows = ring.indices(lease.bucket, lease.slot)
+    positions = torch.tensor([[0, 2, 3, 4, 5, 6, 7]], device=device)
+    offsets = torch.arange(width, device=device)[None, :]
+    inputs = torch.zeros(1, width, 1, dtype=torch.long, device=device)
+    a_count, emitted, b_count, done, a_ready, go, remaining = (
+        torch.zeros(1, dtype=torch.long, device=device) for _ in range(7)
+    )
+    live = torch.ones(1, dtype=torch.bool, device=device)
+    outputs = torch.zeros(8, dtype=torch.long, device=device)
+
+    def choose():
+        window.select(2 + emitted, done, live)
+
+    def more():
+        choose()
+        a_ready.copy_(a_count < 3)
+        go.copy_(((a_ready != 0) | (window.ready != 0)) & (remaining > 0))
+
+    def produce():
+        # Third model execution stops and withholds its item. The consumer
+        # sees EOF with exactly two actual future positions, not five reserved.
+        keeps = a_count < 2
+        ring.ring_scatter(EDGE, rows, 3 + emitted, (100 + a_count)[:, None], keeps)
+        emitted.add_(keeps)
+        a_count.add_(1)
+        done.copy_(a_count == 3)
+
+    def consume():
+        logical = window.metadata[:, :1] + offsets
+        picked = positions.gather(1, logical.clamp(0, positions.shape[1] - 1))
+        picked = torch.where(offsets < window.metadata[:, 2:3], picked, -1)
+        ring.ring_gather(EDGE, rows, picked, inputs)
+        outputs.scatter_(0, window.counts.clamp_max(7), inputs.sum(dim=(1, 2)))
+        b_count.add_(1)
+
+    def boundary():
+        remaining.sub_(1)
+        more()
+
+    functions = (more, produce, choose, consume, window.advance, boundary)
+    backend, graph, launches = None, None, []
+    if device_name == "cuda":
+        backend = get_accelerator_graph_backend(device)
+        captures = [capture_into_graph(fn, backend.graph_pool_handle(), device, None, keep_graph=True)[0]
+                    for fn in functions]
+        graph = backend.compose((captures[0], GraphConditional("while", go, (
+            GraphConditional("if", a_ready, (captures[1],)), captures[2],
+            GraphConditional("if", window.compute_ready, (captures[3],)),
+            GraphConditional("if", window.ready, (captures[4],)), captures[5],
+        ))))
+        runtime, launch = backend.while_runtime(), backend.while_runtime().launch
+        monkeypatch.setattr(runtime, "launch", lambda *args: (launches.append(args[0]), launch(*args))[-1])
+    tables.stage_stream_window(lease, [reservation], [computes])
+    for value in (a_count, emitted, b_count, done, outputs):
+        value.zero_()
+    remaining.fill_(12)
+    ring.ring_write(EDGE, [RID], torch.tensor([[[10], [0], [12]]], device=device), [0])
+    if graph is not None:
+        graph.replay()
+        backend.synchronize()
+        assert len(launches) == 1
+    else:
+        more()
+        while go.item():
+            if a_ready.item():
+                produce()
+            choose()
+            if window.compute_ready.item():
+                consume()
+            if window.ready.item():
+                window.advance()
+            boundary()
+    oracle = StreamBuffer(RID, EDGE, "LLM", factory())
+    oracle.put_positions([0, 2])
+    values = {0: 10, 2: 12, 3: 100, 4: 101}
+    expected, pops = [], 0
+    def pop():
+        nonlocal pops
+        chunk = oracle.pop_chunk()
+        if chunk.num_items:
+            expected.append(sum(values[p] for p in chunk.data["data"]))
+        pops += 1
+    for position in (3, 4, None):
+        if position is None:
+            oracle.signal_done(4)
+        else:
+            oracle.put_positions([position])
+        if oracle.has_chunk_ready():
+            pop()
+    while oracle.has_chunk_ready():
+        pop()
+    assert a_count.item() == 3 and emitted.item() == 2 and b_count.item() == len(expected)
+    assert outputs[:len(expected)].tolist() == expected and window.counts.item() == pops
+    source.put_positions([3, 4])
+    source.signal_done(4)
+    source.settle_window(reservation, pops, final_transition=window.history.item())
+    assert source._consumed == oracle._consumed and source._buffer == oracle._buffer
+    assert source._executed_chunks == oracle._executed_chunks and source._final_chunk_emitted
+    assert ring.ring_room(EDGE, RID) == 0  # reads alone never release payload ownership
+    if graph is not None:
+        graph.reset()
+
+
 def test_future_stream_settlement_requires_actual_publication_and_preserves_zero_work_retry():
     source = StreamBuffer(RID, EDGE, "LLM", FixedChunkPolicy(1))
     reservation = source.reserve_future_window([10, 11], 2).reservation
