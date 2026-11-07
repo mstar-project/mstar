@@ -35,6 +35,7 @@ from mstar.engine.resources.iteration_tables import IterationTables, tables_key
 from mstar.engine.resources.loopback_rows import LoopbackRows
 from mstar.engine.resources.lora.config import LoraBaseOnly
 from mstar.engine.resources.resident import CapturedResidentStep, ResidentPlanner, watched_counts
+from mstar.engine.resources.resident_hooks import unbound_horizon
 from mstar.engine.resources.step import PIECEWISE_WALK, SubmoduleStep
 from mstar.model.submodule_base import (
     BatchedModelOutput,
@@ -1416,6 +1417,11 @@ class AcceleratorGraphRunner:
             self._run_failures[walk] = "planner: actual Loop progress needs resident loop-back rows"
             return None, None, None
         if ask.membership is not None:
+            unbound = next((key for key, binding in self._resident.bindings.items()
+                            if binding.check_horizon is unbound_horizon), None)
+            if unbound is not None:
+                self._run_failures[walk] = f"resource {unbound!r}: no execution-time binding for joining rows"
+                return None, None, None
             uncovered = set(warmed.static_input_keys) - set(warmed.row_heads.values()) - set(ask.iteration)
             if uncovered:
                 self._run_failures[walk] = f"resource: joining inputs have no execution-time owner: {sorted(uncovered)}"

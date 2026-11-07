@@ -121,6 +121,7 @@ def _runner(
             store=torch.tensor([0] + [rows._row_of[rid] for rid in range(1, capacity + 1)]),
             table=lambda: SimpleNamespace(stride=1, col=0), covers=lambda bucket: True,
             drop_rows=lambda bucket, slot: buffers, max_slots=capacity + 1,
+            bindings={},
         )
         rows.resident_binding().bind(planner, "rows")
         resident = SimpleNamespace(bucket=BucketKey(WALK, bs, bs), slot=0, buffers=buffers, slots=buffers.slots)
@@ -1573,6 +1574,23 @@ def test_run_membership_retracts_zero_work_and_cancels_accepted_rows(cancel_at, 
     assert ids.tolist() == [replacement.handle] and bindings.tolist() == [[23]]
     with pytest.raises(ValueError):
         publish_call(rows.cancel, descriptor)
+
+
+def test_a_joining_capture_refuses_an_unbound_owner_before_serving(monkeypatch):
+    from mstar.engine.resources.resident_hooks import unbound_horizon
+    from mstar.engine.resources.run_rows import RunRows
+
+    original = AcceleratorGraphRunner.ask_run
+
+    def ask(runner, *args):
+        original(runner, *args)
+        runner._resident.bindings["context"] = SimpleNamespace(check_horizon=unbound_horizon)
+
+    monkeypatch.setattr(AcceleratorGraphRunner, "ask_run", ask)
+    membership = RunRows(CPU, rows=2, capacity=4, binding_width=2)
+    runner, run, _, calls = _runner(monkeypatch, _Loop(), [[0, 0]], progress=True, membership=membership)
+    assert run is None and not calls
+    assert "context" in runner._run_failures[WALK]
 
 
 def test_captured_membership_uses_one_owner_snapshot_and_keeps_output_identity_through_eos_reuse(monkeypatch):
