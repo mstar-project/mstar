@@ -977,7 +977,7 @@ def _preplan_worker(engine):
 
 def _preplan_engine(res, planner):
     from mstar.engine.resources.runner import StepRunner
-    from mstar.testing_utils.engine import make_engine
+    from mstar.testing_utils.engine import make_engine, make_mgmt
 
     resources = {k: res[k] for k in ("kv", "pool", "rope")}
     runner = SimpleNamespace(
@@ -991,9 +991,10 @@ def _preplan_engine(res, planner):
         keys = {"kv": KVStep(), "pool": RecurrentStep(), "rope": PositionStep()}
         return SubmoduleStep(segments=segments, steps=keys)
 
-    engine = make_engine(_runner=StepRunner(resources), _submodules={"n": SimpleNamespace(
-        submodule=SimpleNamespace(declare_step=declare, step_is_input_free=lambda walk: False),
-        accelerator_graph_runner=runner, piecewise_runners={}, resident=planner,
+    engine = make_engine(_runner=StepRunner(resources), _submodules={"n": make_mgmt(
+        SimpleNamespace(declare_step=declare, step_is_input_free=lambda walk: False),
+        accelerator_graph_runner=runner,
+        resident=planner,
     )})
     engine.can_pre_plan = lambda node: True
     engine.reserve_replay_slot = lambda batch: batch.step_context.slot_lease
@@ -1127,11 +1128,11 @@ class _HostPagesKV:
 
 
 def _offload_engine(resources, planner):
-    from mstar.testing_utils.engine import make_engine
+    from mstar.testing_utils.engine import make_engine, make_mgmt
 
     engine = make_engine(
         _resources=resources,
-        _submodules={"n": SimpleNamespace(resources=resources, resident=planner)},
+        _submodules={"n": make_mgmt(resources=resources, resident=planner)},
         _graph_runtime=SimpleNamespace(get_rid_string=str, get_rid_handle=int),
     )
     return engine
@@ -1806,14 +1807,14 @@ def _capture_runner(max_bs=4):
 
 def _engine(walks, resources, device=CPU):
     from mstar.engine.resources.runner import StepRunner
-    from mstar.testing_utils.engine import make_engine
+    from mstar.testing_utils.engine import make_engine, make_mgmt
 
     submodule = SimpleNamespace(resident_walks=lambda: frozenset(walks))
     engine = make_engine(
         _device=device,
         _runner=StepRunner(resources),
         _resource_nodes={key: frozenset({"n"}) for key in resources},
-        _submodules={"n": SimpleNamespace(submodule=submodule, resources=resources, resident=None)},
+        _submodules={"n": make_mgmt(submodule, resources=resources)},
     )
     return engine, engine._submodules["n"]
 

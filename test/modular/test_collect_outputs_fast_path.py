@@ -6,7 +6,7 @@ from __future__ import annotations
 import torch
 
 from mstar.model.submodule_base import BatchedModelOutput, NodeSubmodule
-from mstar.testing_utils.engine import make_engine
+from mstar.testing_utils.engine import make_engine, make_mgmt
 
 
 class _Sub(NodeSubmodule):
@@ -142,13 +142,12 @@ def test_rows_only_keeps_the_views_and_builds_no_per_rid_dicts():
 def test_rows_only_collect_takes_no_clone():
     """On a rows-only step the gpu thread copies the rows to the host right
     behind the step, so the graph's own output buffer is handed over as is."""
-    from types import SimpleNamespace
 
     rids = [1, 2, 3, 4]
     raw = _raw(bs=4)
     eng = make_engine()
     out = eng._collect_outputs(
-        SimpleNamespace(submodule=_Sub(), accelerator_graph_runner=None), None, raw,
+        make_mgmt(_Sub()), None, raw,
         [], {}, request_ids=rids, step_request_ids=tuple(rids), graph_walk="decode",
         rows_only=True,
     )

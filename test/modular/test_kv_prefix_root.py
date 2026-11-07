@@ -49,7 +49,7 @@ from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import KVLabel, PrefixKeys, _wrap_node_in_loop
 from mstar.model.submodule_base import ChunkingPolicy
 from mstar.streaming.topology import StreamingGraphEdge
-from mstar.testing_utils.engine import make_engine
+from mstar.testing_utils.engine import make_engine, make_mgmt
 from mstar.testing_utils.model import StubModel, make_model
 from mstar.validation.resources import _unservable_walks, streamed_partitions
 
@@ -547,7 +547,7 @@ def test_a_chunked_node_still_names_the_partition_it_streams_into():
 def test_only_a_node_whose_output_is_cached_under_a_digest_is_compiled_dynamic(monkeypatch, salt, vit):
     engine = make_engine(_device=torch.device("cuda"), _submodules={
         # "vae" is an encoder that no layout walk runs, like an edit's.
-        name: SimpleNamespace(submodule=SimpleNamespace(forward=None, forward_batched=None))
+        name: make_mgmt(submodule=SimpleNamespace(forward=None, forward_batched=None))
         for name in ("vit", "LLM", "vae")
     })
     kv = _kv(prefix_cache_salt=salt).config
@@ -569,7 +569,7 @@ def test_an_encoder_that_marks_its_own_dims_compiles_with_the_default_while_its_
     monkeypatch.setattr(torch, "compile", lambda fn, dynamic, **kwargs: dynamic)
     vit = SimpleNamespace(forward="eager", forward_batched="eager", marks_dynamic_dims=True)
     engine = make_engine(
-        _device=torch.device("cuda"), _submodules={"vit": SimpleNamespace(submodule=vit, forward="eager")},
+        _device=torch.device("cuda"), _submodules={"vit": make_mgmt(submodule=vit, forward="eager")},
     )
     spec = KVSpec(resource_key=KV, nodes={"LLM"}, config=PagedKVConfig(
         num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=64,

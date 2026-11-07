@@ -25,7 +25,7 @@ from mstar.engine.resources.kv.config import KVSpec, KVStep, PagedKVConfig, open
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.step import Segment, StepContext
 from mstar.model.submodule_base import ARNodeInputs, ARNodeSubmodule
-from mstar.testing_utils.engine import make_engine
+from mstar.testing_utils.engine import make_engine, make_mgmt
 from mstar.utils.ipc_format import ScheduleTPNode
 from mstar.worker.micro_scheduler import MicroScheduler
 from mstar.worker.worker import Worker
@@ -110,7 +110,7 @@ def _engine(kv: KVManager) -> Engine:
     return make_engine(
         _resources=resources,
         _runner=StepRunner(resources, node_resources={NODE: ["kv"]}),
-        _submodules={NODE: SimpleNamespace(submodule=_Submodule())},
+        _submodules={NODE: make_mgmt(submodule=_Submodule())},
         _keyed_walks={NODE: {WALK, IMAGE_WALK}},
         _prefix_model="_Model",
         _graph_runtime=SimpleNamespace(
@@ -416,7 +416,7 @@ def test_a_chunked_row_starts_past_the_prefix_rank_0_measured_on_every_rank():
             return ARNodeInputs(input_ids=torch.tensor(prompt), input_seq_len=len(prompt))
 
     engine = _engine(follower)
-    engine._submodules[NODE] = SimpleNamespace(submodule=_Prompt(), resources={})
+    engine._submodules[NODE] = make_mgmt(_Prompt())
     batch = SimpleNamespace(
         node_name=NODE, per_request_info_wrapped={"b": None}, per_request_input_tensors={},
         final_stream_rids=set(), per_request_input_metadata={}, first_chunk_rids=set(),

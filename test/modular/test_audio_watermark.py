@@ -29,7 +29,7 @@ from mstar.model.audio_watermark import (
     import_audioseal,
 )
 from mstar.model.submodule_base import NodeSubmodule
-from mstar.testing_utils.engine import make_engine
+from mstar.testing_utils.engine import make_engine, make_mgmt
 
 # -- config -------------------------------------------------------------------
 
@@ -130,7 +130,7 @@ def _batch(rids):
 def test_batch_tail_runs_once_on_the_requests_postprocess_kept():
     tail = _Tail()
     runners = {"watermark_1920": object()}
-    engine = make_engine(_submodules={"Codec": SimpleNamespace(submodule=tail, piecewise_runners=runners)})
+    engine = make_engine(_submodules={"Codec": make_mgmt(submodule=tail, piecewise_runners=runners)})
     batch = _batch(["a", "bad", "c"])
     engine._postprocess_batch(batch, {"a": {}, "bad": {}, "c": {}})
     # the node's captured regions come along, as the forward gets them
@@ -140,7 +140,7 @@ def test_batch_tail_runs_once_on_the_requests_postprocess_kept():
 
 def test_batch_tail_failure_fails_its_requests_only():
     tail = _Tail(fail=True)
-    engine = make_engine(_submodules={"Codec": SimpleNamespace(submodule=tail, piecewise_runners={})})
+    engine = make_engine(_submodules={"Codec": make_mgmt(tail)})
     batch = _batch(["a", "bad", "c"])
     engine._postprocess_batch(batch, {})
     assert set(batch.failed_requests) == {"a", "bad", "c"}

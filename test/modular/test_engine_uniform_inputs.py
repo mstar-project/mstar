@@ -14,7 +14,7 @@ from mstar.engine.accelerator_graph_config import BatchedAcceleratorGraphConfig 
 from mstar.engine.accelerator_graph_runner import AcceleratorGraphRunner  # noqa: E402
 from mstar.engine.resources.step import BucketKey, SlotLease  # noqa: E402
 from mstar.model.submodule_base import ARNodeInputs  # noqa: E402
-from mstar.testing_utils.engine import make_engine  # noqa: E402
+from mstar.testing_utils.engine import make_engine, make_mgmt  # noqa: E402
 
 
 class _Batch:
@@ -69,7 +69,7 @@ class _Sub:
 
 
 def _engine(sub):
-    eng = make_engine(_submodules={"llm": SimpleNamespace(submodule=sub, resources={})})
+    eng = make_engine(_submodules={"llm": make_mgmt(sub)})
     return eng
 
 

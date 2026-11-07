@@ -36,7 +36,7 @@ from mstar.engine.resources.sampler.config import SamplingReqConfig
 from mstar.engine.resources.sampler.resource import SamplerResource
 from mstar.engine.resources.step import FULL_ADMIT_NOT_READY, FULL_ADMIT_REBUILD, Segment, StepContext
 from mstar.model.base import LabelLayout, Span
-from mstar.testing_utils.engine import make_engine
+from mstar.testing_utils.engine import make_engine, make_mgmt
 from mstar.testing_utils.model import StubModel, make_model
 
 PAGE_SIZE = 16
@@ -87,7 +87,7 @@ def _write(kv: KVManager, rid: str, *spans: int) -> None:
 
 
 def _engine(resources: dict) -> Engine:
-    return make_engine(_runner=StepRunner(resources), _submodules={NODE: SimpleNamespace(resources=resources)})
+    return make_engine(_runner=StepRunner(resources), _submodules={NODE: make_mgmt(resources=resources)})
 
 
 def test_each_span_reaches_the_kv_manager_with_its_kind():
@@ -159,6 +159,9 @@ def test_a_drop_is_refused_when_one_row_couldnt_write_the_request_again(layout):
 class _Recording:
     """A resource that records the rebuild hooks it is called with."""
 
+    supports_preplan = False
+    force_double_buffer = False
+
     def __init__(self):
         self.calls = []
 
@@ -172,7 +175,7 @@ class _Recording:
 def test_the_engine_tells_every_resource_of_the_node_about_a_rebuild():
     first, second = _Recording(), _Recording()
     rebuild = Rebuild(WALK, array("i", [1, 2, 3]))
-    engine = make_engine(_submodules={NODE: SimpleNamespace(resources={"first": first, "second": second})})
+    engine = make_engine(_submodules={NODE: make_mgmt(resources={"first": first, "second": second})})
 
     engine.prepare_rebuild(NODE, "r", rebuild)
     engine.land_rebuild(NODE, "r")
@@ -300,7 +303,7 @@ def test_readiness_answers_a_dropped_request_with_a_rebuild_and_a_follower_with_
 
 def _boot_engine(resources: dict, split: frozenset = frozenset()) -> Engine:
     submodule = SimpleNamespace(split_batches_by_capture_key=lambda walk: walk in split)
-    return make_engine(_submodules={NODE: SimpleNamespace(resources=resources, submodule=submodule)})
+    return make_engine(_submodules={NODE: make_mgmt(resources=resources, submodule=submodule)})
 
 
 def _model(combined: dict | None = None) -> StubModel:
@@ -320,7 +323,8 @@ def test_a_rebuild_policy_on_a_node_with_a_resource_that_cant_drop_is_refused_at
     _boot_engine({"kv": _manager()})._check_rebuild_policies(_model())
 
     with pytest.raises(ValueError, match=r"\['bounded'\] can't drop"):
-        engine = _boot_engine({"kv": _manager(), "bounded": SimpleNamespace(supports_drop=False)})
+        bounded = SimpleNamespace(supports_drop=False, supports_preplan=False, force_double_buffer=False)
+        engine = _boot_engine({"kv": _manager(), "bounded": bounded})
         engine._check_rebuild_policies(_model())
 
 

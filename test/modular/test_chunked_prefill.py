@@ -201,11 +201,10 @@ def test_in_start_order_the_head_runs_over_budget_rather_than_nothing():
 
 def _engine_with(submodule, policies=None):
     """``policies`` is the model's ``chunking_policy_of()``: (node, walk) -> policy."""
-    from types import SimpleNamespace
 
-    from mstar.testing_utils.engine import make_engine
+    from mstar.testing_utils.engine import make_engine, make_mgmt
 
-    engine = make_engine(_submodules={"LLM": SimpleNamespace(submodule=submodule, resources={}, resident=None)})
+    engine = make_engine(_submodules={"LLM": make_mgmt(submodule)})
     engine._chunking.set_policies(policies or {})
     return engine
 
@@ -491,8 +490,9 @@ def test_a_step_over_its_token_budget_is_reported(caplog):
 
     from mstar.engine.chunking import ChunkingManagement
     from mstar.model.submodule_base import ChunkingPolicy
+    from mstar.testing_utils.engine import make_mgmt
 
-    chunking = ChunkingManagement({"LLM": SimpleNamespace(submodule=SimpleNamespace())})
+    chunking = ChunkingManagement({"LLM": make_mgmt(submodule=SimpleNamespace())})
     chunking.set_policies(
         {("LLM", "mixed"): ChunkingPolicy(walks=("mixed",), max_batch_tokens=4)},
     )
@@ -540,9 +540,9 @@ def _budgeted_engine():
     from types import SimpleNamespace
 
     from mstar.model.submodule_base import ChunkingPolicy
-    from mstar.testing_utils.engine import make_engine
+    from mstar.testing_utils.engine import make_engine, make_mgmt
 
-    engine = make_engine(_submodules={"LLM": SimpleNamespace(submodule=SimpleNamespace())})
+    engine = make_engine(_submodules={"LLM": make_mgmt(submodule=SimpleNamespace())})
     engine.set_chunking_policies({
         ("LLM", "prefill"): ChunkingPolicy(walks=("prefill",), max_batch_tokens=512),
         ("LLM", "vision"): ChunkingPolicy(walks=("vision",), max_batch_tokens=2048),

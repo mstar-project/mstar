@@ -35,7 +35,7 @@ from mstar.engine.accelerator_graph_runner import (
     plan_captures,
 )
 from mstar.engine.resources import BucketKey, CGSlotSpec, SubmoduleStep
-from mstar.testing_utils.engine import make_engine
+from mstar.testing_utils.engine import make_engine, make_mgmt
 
 _GIB = 2**30
 _MIB = 2**20
@@ -44,7 +44,7 @@ requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="a thro
 
 
 # a node with no float32 or cuDNN-search setting of its own
-_NO_PRECISION = SimpleNamespace(fp32_precision=None, submodule=SimpleNamespace(capture_cudnn_benchmark=False))
+_NO_PRECISION = make_mgmt(SimpleNamespace(capture_cudnn_benchmark=False))
 
 
 def _bucket(walk: str, bs: int, tokens: int) -> BucketKey:
@@ -879,9 +879,8 @@ def test_the_cap_bounds_the_plan(monkeypatch, fraction, reserved, planned):
 def test_a_runner_with_no_graphs_keeps_its_largest_bucket_as_its_batch_cap():
     """A runner that captured nothing runs every bucket eager, and the floor
     covers eager steps only up to its largest bucket."""
-    code2wav = SimpleNamespace(
-        submodule=SimpleNamespace(max_batch_size=lambda walk: None),
-        accelerator_graph_runner=None,
+    code2wav = make_mgmt(
+        SimpleNamespace(max_batch_size=lambda walk: None),
         capture_runner=SimpleNamespace(max_batch_size_for=lambda walk: 32),
     )
     engine = make_engine(_submodules={"Code2Wav": code2wav})

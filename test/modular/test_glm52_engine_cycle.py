@@ -52,7 +52,7 @@ from mstar.model.glm52.glm52_model import Glm52Model  # noqa: E402
 from mstar.model.glm52.submodules import Glm52LLMSubmodule  # noqa: E402
 from mstar.model.submodule_base import BatchedModelOutput, ModelInputsFromEngine  # noqa: E402
 from mstar.model.utils import process_weights_after_loading  # noqa: E402
-from mstar.testing_utils.engine import make_engine  # noqa: E402
+from mstar.testing_utils.engine import make_engine, make_mgmt  # noqa: E402
 
 
 def _cfg(mla_absorb: bool) -> Glm52ModelConfig:
@@ -109,7 +109,7 @@ class _Driver:
             per_request_info_wrapped={rid: info for rid, (info, _) in batch.items()},
             failed_requests=failures, register_failure=failures.__setitem__, step_context=ctx,
         )
-        engine = make_engine(_submodules={"llm": SimpleNamespace(submodule=self.sub, piecewise_runners={})})
+        engine = make_engine(_submodules={"llm": make_mgmt(self.sub)})
         engine._postprocess_batch(executing, BatchedModelOutput(per_rid_outputs=outs))
         assert not failures, failures
         return outs

@@ -182,7 +182,7 @@ def test_a_warm_up_outside_any_step_runs_a_bound_module_as_a_base_only_step(comp
     from lora_module_helpers import serve
 
     from mstar.model.components.lora.modules import bind_module_lora, module_lora_spec
-    from mstar.testing_utils.engine import make_engine
+    from mstar.testing_utils.engine import make_engine, make_mgmt
 
     real = torch.compile
     monkeypatch.setattr(torch, "compile", (lambda fn, **kw: real(fn, backend="eager", **kw)) if compiled
@@ -194,7 +194,7 @@ def test_a_warm_up_outside_any_step_runs_a_bound_module_as_a_base_only_step(comp
     bind_module_lora(node, {"lora": pool})
     engine = make_engine(
         _device_capability=SimpleNamespace(is_available=True),
-        _submodules={"N": SimpleNamespace(submodule=node, fp32_precision=None, node_dtype=None, lora_pools=(pool,))},
+        _submodules={"N": make_mgmt(node, lora_pools=(pool,))},
     )
     engine._compile_regions()
     assert pool._current is None and pool.active
@@ -249,7 +249,7 @@ def test_every_bucket_is_captured_again_under_a_base_only_key_beside_the_nodes_o
 
 def _engine_with(pool, captured_keys, model_key="cfg"):
     """An engine whose node keys captures ``model_key`` and has ``captured_keys``; and what it asks."""
-    from mstar.testing_utils.engine import make_engine
+    from mstar.testing_utils.engine import make_engine, make_mgmt
 
     asked = []
 
@@ -258,10 +258,10 @@ def _engine_with(pool, captured_keys, model_key="cfg"):
         return SlotLease(slot, BucketKey(graph_walk, 8, 8, cg_key_info)) if cg_key_info in captured_keys else None
 
     engine = make_engine(
-        _submodules={"LLM": SimpleNamespace(
-            submodule=SimpleNamespace(cg_key_info=lambda walk, info, **kw: model_key), lora_pools=(pool,),
+        _submodules={"LLM": make_mgmt(
+            SimpleNamespace(cg_key_info=lambda walk, info, **kw: model_key),
+            lora_pools=(pool,),
             accelerator_graph_runner=SimpleNamespace(lease_slot=lease_slot, is_packed=lambda lease: False),
-            resident=None,
         )},
     )
     return engine, asked
@@ -299,12 +299,12 @@ def test_the_declaration_check_still_compares_the_nodes_own_key():
     def plan(step, phase):
         raise NotImplementedError("reached plan")
 
-    from mstar.testing_utils.engine import make_engine
+    from mstar.testing_utils.engine import make_engine, make_mgmt
 
     engine = make_engine(_runner=SimpleNamespace(plan=plan))
     lease = SlotLease(slot=0, bucket=BucketKey("decode", 1, 1, LoraBaseOnly("cfg")))
     ctx = StepContext(request_ids=[1], graph_walk="decode", slot=0, capture=False, slot_lease=lease)
-    mgmt = SimpleNamespace(accelerator_graph_runner=None, submodule=None)
+    mgmt = make_mgmt()
 
     def drive(key):
         engine._drive_step(SimpleNamespace(node_name="LLM", preplan_event=None), mgmt, [1], [], {},
