@@ -654,12 +654,43 @@ class FlashInferDecodeWrapper:
         dst = w._paged_kv_indices_buf[:n]
         if indices.data_ptr() != dst.data_ptr():
             dst.copy_(indices, non_blocking=indices.device == dst.device)
+        self.plan_schedule(indptr, kv_lens)
+
+    @property
+    def schedules_alone(self) -> bool:
+        """Whether ``plan_schedule`` can stand for a full plan: the first plan
+        took the path ``_plan_direct`` reproduces."""
+        return self._planner_args is not None
+
+    def plan_schedule(self, indptr: torch.Tensor, kv_lens: torch.Tensor) -> None:
+        """FlashInfer's planner alone, from the host indptr and lengths, for a
+        captured wrapper whose paged arrays its graph writes (``gather_resident``)."""
+        w = self.attn_wrapper
+        if int(indptr[-1]) > w._paged_kv_indices_buf.shape[0]:
+            raise ValueError("more page indices than the captured buffer holds")
         args = self._planner_args
         at_indptr, at_lens = self._planner_slots
         args[at_indptr] = indptr
         if at_lens is not None:
             args[at_lens] = kv_lens
         w._plan_info = w._cached_module.plan(*args)
+
+    def gather_resident(
+        self, store: torch.Tensor, slots: torch.Tensor, kv_len: torch.Tensor, stride: int, block_col: int,
+        appends: bool = True,
+    ) -> None:
+        """Inside a resident step's capture: the paged arrays of this step's
+        rows, off the tables, into the buffers the captured kernel reads. Each
+        row reads its stored length, plus the step's token if ``appends``."""
+        w = self.attn_wrapper
+        bs = slots.numel()
+        _resident_decode_arrays_kernel[(bs,)](
+            slots, kv_len, store,
+            w._paged_kv_indptr_buf, w._paged_kv_indices_buf, w._paged_kv_last_page_len_buf,
+            w._paged_kv_indices_buf.shape[0],
+            STRIDE=stride, BLOCK=block_col, PAGE=self.page_size,
+            ROWS=bs, ROWS_P2=triton.next_power_of_2(bs), APPENDS=int(appends), num_warps=1,
+        )
 
     @torch.compiler.disable
     def run(self, q: torch.Tensor, kv_cache_layer: torch.Tensor) -> torch.Tensor:
@@ -689,6 +720,34 @@ def _gather_block_rows_kernel(
         keep = cols < pages
         values = tl.load(store_ptr + row + cols, mask=keep, other=0)
         tl.store(table_ptr + i * WIDTH + cols, values.to(tl.int32), mask=keep)
+
+
+@triton.jit
+def _resident_decode_arrays_kernel(
+    slots_ptr, kv_len_ptr, store_ptr, indptr_ptr, indices_ptr, last_page_len_ptr, capacity,
+    STRIDE: tl.constexpr, BLOCK: tl.constexpr, PAGE: tl.constexpr,
+    ROWS: tl.constexpr, ROWS_P2: tl.constexpr, APPENDS: tl.constexpr,
+):
+    # one program a row; its first index is the page count of the rows before it.
+    # A row reads its stored length, plus the step's token if it appends one, and
+    # at least the one token of its sink page.
+    i = tl.program_id(0)
+    rows = tl.arange(0, ROWS_P2)
+    lens = tl.maximum(tl.load(kv_len_ptr + rows, mask=rows < ROWS, other=0) + APPENDS, 1)
+    counts = (lens - 1) // PAGE + 1
+    start = tl.sum(tl.where(rows < i, counts, 0))
+    n = tl.maximum(tl.load(kv_len_ptr + i) + APPENDS, 1)
+    pages = (n - 1) // PAGE + 1
+    if i == 0:
+        tl.store(indptr_ptr, 0)
+    tl.store(indptr_ptr + i + 1, (start + pages).to(tl.int32))
+    tl.store(last_page_len_ptr + i, (n - (pages - 1) * PAGE).to(tl.int32))
+    row = tl.load(slots_ptr + i) * STRIDE + BLOCK
+    for at in tl.range(0, pages, 32):
+        cols = at + tl.arange(0, 32)
+        keep = (cols < pages) & (start + cols < capacity)
+        values = tl.load(store_ptr + row + cols, mask=keep, other=0)
+        tl.store(indices_ptr + start + cols, values.to(tl.int32), mask=keep)
 
 
 class FmhaDecodeWrapper:
