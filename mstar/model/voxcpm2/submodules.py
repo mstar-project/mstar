@@ -48,6 +48,7 @@ from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.accelerator_graph_config import (
     AcceleratorGraphConfig,
     BatchedAcceleratorGraphConfig,
+    PackedAcceleratorGraphConfig,
     PiecewiseAcceleratorGraphConfig,
     PiecewiseBatchedConfig,
     PiecewiseCallInputs,
@@ -229,6 +230,12 @@ class TalkerSubmodule(ARNodeSubmodule):
     disable_autocast = True
     MAX_BATCH_SIZE = 32
     DECODE_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32]
+    # The prefill's captured ladder (``ARNodeSubmodule``'s, which a deployment may
+    # replace) and prompt counts: Seed-TTS clones are about 100 prompt positions,
+    # zero-shot text a few dozen; up to the Talker's batch, since a burst of prompts
+    # past the largest capture ran eagerly, about 30 ms of host time
+    PREFILL_TOKEN_BUCKETS = [64, 96, 128, 160, 192, 256, 320, 384, 512, 768, 1024, 1536, 2048]
+    PREFILL_BATCH_SIZES = [1, 2, 4, 8, 16, 32]
 
     def __init__(
         self,
@@ -308,15 +315,18 @@ class TalkerSubmodule(ARNodeSubmodule):
                 min_len=min_len,
                 cfg=params[:1].clone(),
             )
-            if audio is None:
-                audio = torch.zeros(0, self.config.patch_size, self.config.feat_dim, device=device, dtype=self._dtype())
+            # every position carries a patch, zeros at the text: the prefill's shapes follow its tokens alone
+            patches = torch.zeros(
+                token_ids.shape[0], self.config.patch_size, self.config.feat_dim, device=device, dtype=self._dtype()
+            )
+            if audio is not None:
+                patches.index_copy_(0, audio_pos, audio)
             return ARNodeInputs(
                 input_ids=token_ids,
                 input_seq_len=token_ids.shape[0],
                 tensor_inputs={
                     "text_mask": text_mask,
-                    "audio_patches": audio,
-                    "audio_pos": audio_pos,
+                    "audio_patches": patches,
                     "cond_patch": cond,
                     "noise": self._noise(state, 0),
                     "cfg": state["cfg"],
@@ -368,17 +378,13 @@ class TalkerSubmodule(ARNodeSubmodule):
             stack["prev_patch"] = torch.stack([item.tensor_inputs["prev_patch"] for item in inputs])
             return stack
         ends = list(itertools.accumulate(item.input_seq_len for item in inputs))
-        starts = [0, *ends[:-1]]
         stack.update(
             token_ids=torch.cat([item.input_ids for item in inputs]),
             text_mask=torch.cat([item.tensor_inputs["text_mask"] for item in inputs]),
             audio_patches=torch.cat([item.tensor_inputs["audio_patches"] for item in inputs]),
-            audio_index=torch.cat(
-                [item.tensor_inputs["audio_pos"] + start for start, item in zip(starts, inputs, strict=True)]
-            ),
-            last_token_indices=self._to_device([end - 1 for end in ends]),
+            # a replay's zero-length padding rows read the last real token
+            last_token_indices=self._to_device([max(end - 1, 0) for end in ends]),
             cond_patch=torch.stack([item.tensor_inputs["cond_patch"] for item in inputs]),
-            prompt_patches=[item.kwargs.get("prompt_patches") for item in inputs],
         )
         return stack
 
@@ -423,7 +429,11 @@ class TalkerSubmodule(ARNodeSubmodule):
         del step_index
         if graph_walk == "talker_decode":
             return self.model.decode_step(prev_patch, noise, cfg, self.t_span())
-        prefill.pop("prompt_patches", None)
+        if engine_inputs.captured:
+            return self.model.prefill(
+                cond_patch=cond_patch, noise=noise, cfg_value=cfg, t_span=self.t_span(), **prefill
+            )
+        # past every prefill capture: the LMs eagerly, the per-row tail captured on its own
         lm_hidden, res_hidden = self.model.prefill_states(**prefill)
         rows = lm_hidden.shape[0]
         runner = engine_inputs.piecewise_runners.get(PREFILL_TAIL)
@@ -441,15 +451,9 @@ class TalkerSubmodule(ARNodeSubmodule):
         )
         return out["patch"], out["stop_logits"]
 
-    def _outputs(
-        self, graph_walk: str, patch: torch.Tensor, stop: torch.Tensor, prompt_patches: torch.Tensor | None
-    ) -> NameToTensorList:
-        stream = [patch]
-        if graph_walk == "talker_prefill_clone" and prompt_patches is not None:
-            # A continuation's VAE stream leads with the tail of the prompt
-            # audio, as the reference decodes it: context, trimmed downstream.
-            stream = [*prompt_patches.unbind(0), patch]
-        return {"latent_patch": [patch], "latent_patches": stream, "stop_flag": [stop]}
+    @staticmethod
+    def _outputs(patch: torch.Tensor, stop: torch.Tensor) -> NameToTensorList:
+        return {"latent_patch": [patch], "latent_patches": [patch], "stop_flag": [stop]}
 
     @staticmethod
     def _stop_flags(stop_logits: torch.Tensor, step_index: torch.Tensor) -> torch.Tensor:
@@ -459,30 +463,32 @@ class TalkerSubmodule(ARNodeSubmodule):
         return torch.stack([stop_logits.argmax(dim=-1), step_index], dim=-1)
 
     def forward(self, graph_walk: str, engine_inputs: ModelInputsFromEngine, **kwargs: Any) -> NameToTensorList:
-        prompt = kwargs.get("prompt_patches")
         patch, stop_logits = self._run(graph_walk, engine_inputs, **kwargs)
         stop = self._stop_flags(stop_logits, kwargs["step_index"])
-        return self._outputs(graph_walk, patch[0], stop[0], prompt[0] if prompt else None)
+        return self._outputs(patch[0], stop[0])
 
     def forward_batched(
         self, graph_walk: str, engine_inputs: ModelInputsFromEngine, **kwargs: Any
     ) -> dict[str, NameToTensorList]:
-        prompt = kwargs.get("prompt_patches") or [None] * len(engine_inputs.request_ids)
         patch, stop_logits = self._run(graph_walk, engine_inputs, **kwargs)
         stop = self._stop_flags(stop_logits, kwargs["step_index"])
-        return {
-            rid: self._outputs(graph_walk, patch[i], stop[i], prompt[i] if i < len(prompt) else None)
-            for i, rid in enumerate(engine_inputs.request_ids)
-        }
+        return {rid: self._outputs(patch[i], stop[i]) for i, rid in enumerate(engine_inputs.request_ids)}
 
     def postprocess(
         self,
         request_id: str,
         request_info: CurrentForwardPassInfo,
         outputs: dict[str, list[torch.Tensor]],
+        inputs: ARNodeInputs | None = None,
         **kwargs: Any,
     ) -> None:
         del request_info, kwargs
+        lead = inputs.kwargs.get("prompt_patches") if inputs is not None else None
+        if lead is not None and "latent_patches" in outputs:
+            # A continuation's VAE stream leads with the tail of the prompt audio,
+            # as the reference decodes it: context, trimmed downstream. Here, not in
+            # the forward, since a captured prefill can't carry it.
+            outputs["latent_patches"] = [*lead.unbind(0), *outputs["latent_patches"]]
         if "stop_flag" in outputs:
             state = self.request_state(request_id)
             state.add("generated", int(state.get("generated", 0)) + 1)
@@ -517,11 +523,29 @@ class TalkerSubmodule(ARNodeSubmodule):
         self, device: torch.device, tp_world_size: int = 1
     ) -> list[AcceleratorGraphConfig]:
         """Capture the whole decode step (both LMs, the 10-step CFM, the stop head),
-        ``torch.compile``'d first unless the deployment set ``compile_talker: false``."""
+        ``torch.compile``'d first unless the deployment set ``compile_talker: false``;
+        and the whole prefill, eager kernels, per token bucket and prompt count."""
         del tp_world_size
         dtype = self._dtype()
         cfg = self.config
+        prefill = []
+        if self.PREFILL_TOKEN_BUCKETS and self.PREFILL_BATCH_SIZES:
+            prefill.append(
+                PackedAcceleratorGraphConfig(
+                    capture_graph_walk="talker_prefill",
+                    replay_graph_walks=list(PREFILL_WALKS),
+                    capture_token_lengths=self.PREFILL_TOKEN_BUCKETS,
+                    make_node_input=partial(self._prefill_capture_row, device=device),
+                    capture_batch_sizes=self.PREFILL_BATCH_SIZES,
+                    compile=False,
+                    # a longer or wider prefill runs eagerly
+                    caps_eager_batch_size=False,
+                    # per-row inputs lead with the row, per-token ones with the token
+                    input_seq_dims=dict.fromkeys(self._PREFILL_STATIC_KEYS, 0),
+                )
+            )
         return [
+            *prefill,
             BatchedAcceleratorGraphConfig(
                 capture_graph_walk="talker_decode",
                 single_request_inputs=ARNodeInputs(
@@ -538,12 +562,28 @@ class TalkerSubmodule(ARNodeSubmodule):
             )
         ]
 
-    def can_use_accelerator_graphs(self, batch: ExecutingBatch, model_inputs: list[NodeInputs]) -> bool:
-        return (
-            batch.graph_walk == "talker_decode"
-            and self.can_batch(batch, model_inputs)
-            and super().can_use_accelerator_graphs(batch, model_inputs)
+    _PREFILL_STATIC_KEYS = (
+        "token_ids", "text_mask", "audio_patches", "last_token_indices", "cond_patch", "noise", "cfg", "step_index",
+    )
+
+    def _prefill_capture_row(self, n: int, device: torch.device) -> ARNodeInputs:
+        """A capture row of ``n`` prompt positions; ``n`` = 0 pads a replay."""
+        cfg, dtype = self.config, self._dtype()
+        return ARNodeInputs(
+            input_ids=torch.zeros(n, dtype=torch.long, device=device),
+            input_seq_len=n,
+            tensor_inputs={
+                "text_mask": torch.ones(n, dtype=torch.bool, device=device),
+                "audio_patches": torch.zeros(n, cfg.patch_size, cfg.feat_dim, dtype=dtype, device=device),
+                "cond_patch": torch.zeros(cfg.patch_size, cfg.feat_dim, dtype=dtype, device=device),
+                "noise": torch.zeros(cfg.feat_dim, cfg.patch_size, dtype=dtype, device=device),
+                "cfg": torch.full((1,), cfg.cfg_value, dtype=torch.float32, device=device),
+            },
+            kwargs={"step": 0},
         )
+
+    def can_use_accelerator_graphs(self, batch: ExecutingBatch, model_inputs: list[NodeInputs]) -> bool:
+        return self.can_batch(batch, model_inputs) and super().can_use_accelerator_graphs(batch, model_inputs)
 
     def _first_patch_capture(self, inp: PiecewiseCallInputs) -> dict[str, torch.Tensor]:
         si = inp.static_inputs
