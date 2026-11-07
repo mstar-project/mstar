@@ -33,6 +33,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from mstar.engine.resources.kv.cache import PageAllocator  # noqa: E402
+from mstar.model.submodule_base import BatchedModelOutput  # noqa: E402
 from mstar.utils.containers import RecentSet  # noqa: E402
 from mstar.utils.ipc_format import (  # noqa: E402
     MessageSource,
@@ -68,7 +69,7 @@ def _batch(seq: int, rids: list[int]):
     executing = SimpleNamespace(
         node_name=NODE, request_ids=list(rids), admit_error=None, failed_requests={},
         launch_started_event=None, read_check_rids=None, step_context=SimpleNamespace(repeats=1),
-        run_started=None,
+        run_started=None, run_rows={},
     )
     return scheduled, executing
 
@@ -214,7 +215,7 @@ def _rank(
             torn_down.wait(HOLD_S)
         log.append(("admit", batch.tp_seq))
         node_batch.launch_started_event.set()
-        return {}
+        return BatchedModelOutput()
 
     passes = iter(inbox)
 
@@ -437,7 +438,7 @@ def test_a_follower_counts_a_head_it_drops_on_arrival(monkeypatch):
         gpu(batch, node_batch, plan_future)
         if batch.tp_seq == 0:
             raise RuntimeError("forward failed")
-        return {}
+        return BatchedModelOutput()
 
     def _row_waits_on_the_teardown(request_state, **kwargs):
         if w.scheduler.last_consumed_tp_seq < 0 or ("teardown", "gone") in log:
@@ -477,7 +478,8 @@ def _run_waits_on(w, pending):
     w.request_state = None
     run = SimpleNamespace(
         node_name=NODE, graph_walk=WALK, batch=SimpleNamespace(request_to_worker_graph={}),
-        node_batch=SimpleNamespace(token_stream=None, completion_event=SimpleNamespace(query=lambda: True)),
+        node_batch=SimpleNamespace(token_stream=None, run_rows={},
+                                   completion_event=SimpleNamespace(query=lambda: True)),
     )
     w._await_run(run, pending, [], None)
 
