@@ -318,7 +318,10 @@ class SpeculationBuilder:
             # Reported by whichever step chose the target -- speculate_node on
             # the leader, get_spec_target on a follower -- so the hot path does
             # not cross back into the runtime once per forward pass.
-            output_signals=spec_target.output_signals,
+            output_signals=(
+                spec_target.output_signals if request_walks
+                else self._walk_output_signals(spec_node, label, spec_target)
+            ),
             tp_seq=tp_seq,
         )
         input_meta, per_request_info = input_metadata_and_fwd_info(

@@ -122,3 +122,17 @@ def test_a_transition_into_the_loop_starts_at_its_first_iteration():
 
     assert spec.node_batch.per_request_info_wrapped[1].dynamic_loop_iter_counts == {LOOP: 0}
     assert spec.is_new_iter is False
+
+
+def test_uniform_speculation_uses_its_actual_walks_output_signals():
+    ctx = _context({1: _info(1, 0)})
+    ctx.graph_runtime.get_output_signals = lambda node, walk: ["text_inputs"] if walk == "decode" else []
+    target = SpeculationOutput(node_name="dit", graph_walk="prefill", is_new_loop_iter=False,
+                               output_signals=("next_chunk", "new_token"))
+    spec = SpeculationBuilder(ctx).assemble(
+        SimpleNamespace(node_name="dit", graph_walk="prefill", partition=PARTITION),
+        target, {1: 0}, {1: {}}, {}, [], {}, is_same_node=True, request_walks={1: "decode"},
+    )
+    assert spec.scheduled_batch.graph_walk == "decode"
+    assert not spec.scheduled_batch.request_walks
+    assert list(spec.scheduled_batch.output_signals) == ["text_inputs"]
