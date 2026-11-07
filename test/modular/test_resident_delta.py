@@ -720,6 +720,7 @@ class _Rank:
         # spending one before evicting is the cheaper move and the order matters
         self.flushed_removes = 0
         self.flush_protected: set[str] | None = None
+        self.offload_protected: set[str] | None = None
 
     def _apply_removes_whose_step_landed(self):
         self.flushed_removes += 1
@@ -728,8 +729,11 @@ class _Rank:
         self.flushed_removes += 1
         self.flush_protected = set(in_flight_rids)
 
-    def _try_offload_cold_request(self, node_name, graph_walk, batch_ids, affected_resources=None, inside_only=False):
+    def _try_offload_cold_request(
+        self, node_name, graph_walk, batch_ids, affected_resources=None, inside_only=False, referenced_rids=frozenset(),
+    ):
         del graph_walk, batch_ids, affected_resources, inside_only
+        self.offload_protected = set(referenced_rids)
         self.offload_attempts.append(node_name)
         return "victim"
 
@@ -1009,6 +1013,7 @@ def test_the_teardown_flush_spares_only_what_the_speculation_touches():
 
     _oom(leader, referenced_rids=frozenset({"spec_rid"}))
 
+    assert leader.offload_protected == {"spec_rid"}
     assert leader.flush_protected == {"spec_rid"}, (
         "the flush protected the failed step's rids, whose pages are reclaimable"
     )
