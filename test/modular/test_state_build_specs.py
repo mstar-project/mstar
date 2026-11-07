@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import re
 import sys
-from dataclasses import replace
+from dataclasses import dataclass, replace
 
 sys.path.insert(0, ".")
 sys.path.insert(0, "test/modular")
@@ -43,6 +43,7 @@ from mstar.engine.state import (
     Window,
 )
 from mstar.engine.state.adapters import build_specs, node_resources
+from mstar.engine.state.contract import Mask, Op
 from mstar.model.base import Model, enabled_resources, serving_resources
 from mstar.model.qwen3_5.config import GDN_STATE
 from mstar.model.qwen3_5.qwen3_5_model import Qwen3_5DenseModel
@@ -241,12 +242,24 @@ def test_a_gated_delta_net_defaults_to_the_config_defaults():
     assert config.qk_l2norm is True and config.sm_scale is None
 
 
+@dataclass(frozen=True)
+class _OtherMask(Mask):
+    """A mask `build_specs` has no layout for."""
+
+
+@dataclass(frozen=True)
+class _OtherUpdate(Op):
+    """An update kernel `build_specs` has no layout for."""
+
+    writes = ("state",)
+
+
 _MIXED = _read(op=Attend(q_heads=4))
 # The array each refusal names, its declarations, and what the message says is missing.
 NO_LAYOUT = {
     "a read through no op": ("kv", lambda: [_kv(reads={"r": _read(op=None)})], "reads['r'].op"),
     "a read of one walk": ("kv", lambda: [_kv(reads={"r": _read(walks={"decode"})})], "reads['r'].walks"),
-    "a mask of no known name": ("kv", lambda: [_kv(reads={"r": _read(mask=object())})], "reads['r'].mask"),
+    "a mask of no known name": ("kv", lambda: [_kv(reads={"r": _read(mask=_OtherMask())})], "reads['r'].mask"),
     "two query head counts": ("kv", lambda: [_kv(reads={"a": _read(layers={2}), "b": _MIXED})], "q_heads"),
     "no reads": ("kv", lambda: [_kv(reads={})], "reads is empty"),
     "an entry of other fields": (
@@ -294,6 +307,9 @@ NO_LAYOUT = {
     "a value with a host field": ("gdn", lambda: [_kv(), _gdn(entry=_gdn_entry(host={"done": bool}))], "entry"),
     "a value with no update": ("gdn", lambda: [_kv(), _gdn(updates={})], "GatedDeltaNet"),
     "a value with only a conv": ("gdn", lambda: [_kv(), _gdn(updates={"conv": CausalConv()})], "GatedDeltaNet"),
+    "an update of another kernel": (
+        "gdn", lambda: [_kv(), _gdn(updates={"delta": GatedDeltaNet(), "x": _OtherUpdate()})], "updates ['x']",
+    ),
     "two delta nets": (
         "gdn", lambda: [_kv(), _gdn(updates={"a": GatedDeltaNet(), "b": GatedDeltaNet()})], "GatedDeltaNet",
     ),
