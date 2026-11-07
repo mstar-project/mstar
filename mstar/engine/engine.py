@@ -950,11 +950,16 @@ class Engine:
         ]
 
     def _build_resident_planner(self, node_name: str, runner: AcceleratorGraphRunner, looped: Collection[str]) -> None:
-        """Put each walk in ``looped`` (those that loop ``node_name``) on
-        resident tables if every owner of a fact it needs agrees, and keep why
-        each other one stays host-planned (`resident_refusal`). After every
-        runner has claimed its capture buffers, which a template's plan reads,
-        and before any capture, which holds the tables' addresses."""
+        """Build checked owner tables for Loops and independently ready members.
+
+        A plain consumer still needs per-row masks and retained policy slots
+        inside a connected capture; it need not be a computation Loop.
+        """
+        looped = set(looped) | {
+            walk for requested in self._walk_runs for unit in self._graph_runtime.execution_units(requested)
+            if unit.streaming_edges for node, walk in zip(unit.nodes, unit.graph_walks, strict=True)
+            if node == node_name
+        }
         if not looped:
             return
         submodule_mgmt = self._submodules[node_name]

@@ -3505,11 +3505,17 @@ def _engine(resources, device=CPU):
     return engine, engine._submodules["n"]
 
 
-def test_the_engine_puts_a_loop_walk_on_resident_tables_with_nothing_declared():
+@pytest.mark.parametrize("plain_stream", [False, True])
+def test_the_engine_puts_a_loop_walk_on_resident_tables_with_nothing_declared(plain_stream):
     res = _resources()
     engine, mgmt = _engine({k: res[k] for k in ("kv", "pool", "rope")})
     runner = _capture_runner()
-    engine._build_resident_planner("n", runner, {WALK})
+    if plain_stream:
+        engine._walk_runs = frozenset({"produce"})
+        engine._graph_runtime = SimpleNamespace(execution_units=lambda walk: (SimpleNamespace(
+            nodes=("producer", "n"), graph_walks=("produce", WALK), streaming_edges=(("producer", "n", "x"),),
+        ),))
+    engine._build_resident_planner("n", runner, set() if plain_stream else {WALK})
     assert isinstance(mgmt.resident, ResidentPlanner)
     assert runner.bound["p"] is mgmt.resident
     assert mgmt.resident.max_slots == 9
