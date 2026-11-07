@@ -63,16 +63,25 @@ _PREFILL = _bucket("prefill_vision", 1, 16384)
 class _StubMeasuredRunner:
     """`size_captures` over stub warm-ups of ``steps``, two slots each, in capture order."""
 
+    _input_bank_bytes = AcceleratorGraphRunner._input_bank_bytes
     size_captures = AcceleratorGraphRunner.size_captures
     size_lent_captures = AcceleratorGraphRunner.size_lent_captures
+    _template = AcceleratorGraphRunner._template
+    _prepare = AcceleratorGraphRunner._prepare
     NUM_WARMUP = AcceleratorGraphRunner.NUM_WARMUP
     _capture_stream = None
+    _rows = None
+    _capture_run = staticmethod(lambda spec, warmed: (None, None, None))
 
     def __init__(self, device: torch.device, steps: dict[BucketKey, CaptureCost]):
+        self._run_asks = {}
+        self.static_inputs = {}
         self._steps = steps
         self._device = device
         self._autocast_dtype = None
         self._submodule_name = "Thinker"
+        self._member = ""
+        self._connected_walks = frozenset()
         self._resident = None
         self._num_slots = 2
         self._capture_costs = {}
@@ -83,7 +92,8 @@ class _StubMeasuredRunner:
         self.forwards: list[int] = []
 
     def prepare_for_capture(self):
-        return [CGSlotSpec(bucket=b, slot=s, config=SimpleNamespace()) for b in self._steps for s in (0, 1)]
+        return [CGSlotSpec(bucket=b, slot=s, config=SimpleNamespace(replay_graph_walks=[b.graph_walk]))
+                for b in self._steps for s in (0, 1)]
 
     @contextmanager
     def _warmed(self, spec, forwards):
@@ -91,7 +101,7 @@ class _StubMeasuredRunner:
         self.forwards.append(forwards)
         step = self._steps[spec.bucket]
         yield WarmedSpec(
-            run=lambda: step, static_inputs={}, static_input_keys=(), dummy_rids=[], dummy_metadata={},
+            run=lambda: step, static_inputs=self.static_inputs, static_input_keys=(), dummy_rids=[], dummy_metadata={},
             peak=step.peak, returned=step.kept,
         )
 
@@ -363,7 +373,9 @@ def test_every_bucket_is_sized_whatever_the_pools_size(measured, monkeypatch):
     runner._dummy_rows = SimpleNamespace(ensure=ensure, reset=lambda rids, free=False: None)
     runner._dummy_engine_inputs = lambda rids, walk: SimpleNamespace(per_request_info={})
     runner._submodule = SimpleNamespace(declare_step=declare_step, preprocess=lambda **kwargs: {})
-    runner._graph_backend = SimpleNamespace(set_device=lambda: None, synchronize=lambda: None)
+    runner._graph_backend = SimpleNamespace(
+        set_device=lambda: None, synchronize=lambda: None, generator_offset=lambda: 0,
+    )
     runner._step_runner = SimpleNamespace(
         admit=lambda step: kv.admit(step.get("kv"), step.ctx),
         plan=lambda step: kv.plan(step.get("kv"), step.ctx),
@@ -384,6 +396,42 @@ def test_every_bucket_is_sized_whatever_the_pools_size(measured, monkeypatch):
     assert set(runner._capture_costs) == {wide, fits}, "every bucket must be sized, so the floor covers it"
     assert plan.buckets["LLM"] == {wide, fits}, "a bucket a served step pads into must be captured"
     assert kv._arena.num_free == free, "sizing must leave every page free"
+
+
+@pytest.mark.parametrize("width", [1, 2])
+def test_a_sized_capture_knows_its_loopback_owner_before_running_again(width):
+    from mstar.engine.accelerator_graph_config import BatchedAcceleratorGraphConfig
+    from mstar.engine.accelerator_graph_runner import CaptureTemplate
+    from mstar.engine.resources.loopback_rows import LoopbackRows
+    from mstar.model.submodule_base import ARNodeInputs
+
+    device = torch.device("cpu")
+    rows = LoopbackRows(device, capacity=2)
+    for rid in (1, 2):
+        rows.add(rid)
+    rows.write("token", [1, 2], torch.tensor([[11], [22]]).expand(2, width))
+    bucket = _bucket("decode", 2, 2)
+    rows.indices(bucket, 0).copy_(torch.tensor([rows._row_of[1], rows._row_of[2]]))
+    config = BatchedAcceleratorGraphConfig(
+        capture_graph_walk="decode", single_request_inputs=ARNodeInputs(input_seq_len=1),
+    )
+    spec = CGSlotSpec(bucket=bucket, slot=0, config=config)
+    static = torch.zeros(2, dtype=torch.long)
+    calls = []
+    runner = AcceleratorGraphRunner.__new__(AcceleratorGraphRunner)
+    runner._device, runner._resident, runner._rows = device, None, rows
+    runner._row_pairs = lambda walk: ({"token": "input_ids"}, {})
+    runner._template = lambda spec: CaptureTemplate([1, 2], [], SimpleNamespace(per_request_info={}), None)
+    runner._prepare = lambda *args: {"input_ids": static}
+    runner._intern_static_buffer = lambda config, key, value, **kwargs: value
+    runner._forward_for = lambda spec: lambda **kwargs: calls.append(kwargs["input_ids"].clone())
+    runner._graph_backend = SimpleNamespace(set_device=lambda: None, synchronize=lambda: None)
+    runner._dummy_rows = SimpleNamespace(reset=lambda *args, **kwargs: None)
+    with runner._warmed(spec, forwards=0) as warmed:
+        assert calls == [] and static.tolist() == [0, 0]
+        assert warmed.row_heads == ({"token": "input_ids"} if width == 1 else {})
+        warmed.run()
+        assert calls[0].tolist() == ([11, 22] if width == 1 else [0, 0])
 
 
 def test_a_cpu_device_never_asks_the_driver(monkeypatch):
@@ -895,3 +943,27 @@ def test_a_runner_with_no_graphs_keeps_its_largest_bucket_as_its_batch_cap():
     cap = Engine.get_max_batch_size(engine, "Code2Wav", "code2wav_chunk")
 
     assert cap == 32, "a batch past the largest bucket is an eager step the floor never measured"
+
+
+
+def test_retained_input_banks_are_budgeted_before_selecting_captures(measured):
+    from mstar.engine.resources.iteration_tables import IterationTables
+
+    bucket = _bucket("decode", 1, 1)
+    costs = {bucket: CaptureCost(0, 0, 0, 2)}
+    runner = _StubMeasuredRunner(torch.device("cuda", 0), costs)
+    plain = runner.size_captures()
+    free = 16 * _MIB
+    assert plan_captures({"n": plain}, free=free).buckets == {"n": {bucket}}
+    owner = IterationTables(torch.device("cpu"))
+    runner._resources = {"iteration_tables:Thinker": owner}
+    runner._run_asks = {"decode": SimpleNamespace(
+        loop=SimpleNamespace(ancestors=()), limit=4, iteration={"cond"}, membership=None,
+    )}
+    runner._resident = SimpleNamespace(max_slots=16)
+    runner.static_inputs = {"cond": torch.empty(1, 32768)}
+    retained = runner.size_captures()
+    assert retained[bucket].outside == plain[bucket].outside
+    assert retained[bucket].graph == retained[bucket].kept > free
+    assert plan_captures({"n": retained}, free=free).buckets == {"n": set()}
+    assert not owner._windows  # sizing does not allocate banks for discarded captures

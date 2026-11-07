@@ -192,6 +192,7 @@ class LingBotDitSubmodule(_SingleRequestMixin, NodeSubmodule):
     switched to channels-last.
     """
 
+
     disable_torch_compile = True
 
     def __init__(self, dit: LingBotCausalDiT, vae: nn.Module, config: LingBotWorldConfig,

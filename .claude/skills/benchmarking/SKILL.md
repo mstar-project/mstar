@@ -119,7 +119,7 @@ python -m benchmark.worker_phases.server \
 
 Reading the table:
 
-- **`event_sync` is the only real GPU wait.** Near zero → you are **CPU-bound**. A sizeable value → there is a **GPU-bound** component, and the next step is profiling kernels, not shaving Python. For a firm answer, measure GPU busy time from an nsys capture (the README says how); it cannot be derived from the table.
+- **`event_sync`, plus `worker.await_run` where runs go on the device, is the only real GPU wait.** Near zero → you are **CPU-bound**. A sizeable value → there is a **GPU-bound** component, and the next step is profiling kernels, not shaving Python. For a firm answer, measure GPU busy time from an nsys capture (the README says how); it cannot be derived from the table.
 - **`await_gpu` is not that signal.** It is waiting for the CPU part of the GPU thread.
 - **`check_stop` is a side-stream D2H**, not pure Python/Rust CPU work.
 - **A host sync hides in whatever phase encloses it** and makes `event_sync` look smaller. An unexpectedly expensive `prepare_inputs` is the usual tell.

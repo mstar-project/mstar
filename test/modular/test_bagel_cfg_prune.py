@@ -29,6 +29,7 @@ from mstar.model.bagel.submodules import (
     IMAGE_DECODE,
     IMAGE_GEN,
     IMAGE_GEN_HEAD,
+    NODE_TO_CFG_LABEL,
     LLMSubmodule,
     apply_timestep_shift,
     cfg_branches,
@@ -38,7 +39,7 @@ from mstar.model.bagel.submodules import (
     image_gen_phases,
     image_gen_timestep,
 )
-from mstar.model.submodule_base import ARNodeInputs
+from mstar.model.submodule_base import ARNodeInputs, CarryPair
 
 IMAGE_GEN_LOOP = denoise_loop(IMAGE_GEN)
 
@@ -181,11 +182,14 @@ def _info(graph_walk: str = "image_gen", **fields) -> CurrentForwardPassInfo:
 def _image_gen_row(span: int = 6) -> ARNodeInputs:
     row = ARNodeInputs(input_seq_len=span)
     row.resource_step_info = True  # requires_cfg
-    row.custom_pos_ids = {
-        label: torch.full((span,), 10 + i, dtype=torch.int32)
-        for i, label in enumerate(("main", "cfg_text", "cfg_img"))
-    }
     return row
+
+
+def _with_positions(llm: LLMSubmodule) -> LLMSubmodule:
+    """Each stream at its own position, 10 and up, as the position resource holds them."""
+    offset = {"main": 0, "cfg_text": 1, "cfg_img": 2}
+    llm.node_resources = {"rope": types.SimpleNamespace(position=lambda rid, label: 10 + offset[label])}
+    return llm
 
 
 @pytest.mark.parametrize("walk,labels", [
@@ -195,8 +199,11 @@ def _image_gen_row(span: int = 6) -> ARNodeInputs:
     (IMAGE_GEN_HEAD, ("main",)),
 ])
 def test_declared_step_plans_exactly_the_branches_run(walk, labels):
+    """The row's positions come from the position resource, not its inputs: a
+    pre-plan declares over the capture's template rows, whose positions aren't
+    the request's, and the step that runs takes what it staged (GPU finding 16)."""
     span = 6
-    step = _llm().declare_step(walk, ["r0"], [_image_gen_row(span)])
+    step = _with_positions(_llm()).declare_step(walk, ["r0"], [_image_gen_row(span)])
     kv: KVStep = step.steps["kv"]
     rope: PositionStep = step.steps["rope"]
     assert tuple(seg.label for seg in kv.segments) == labels
@@ -380,3 +387,120 @@ def test_a_guided_request_publishes_only_the_kv_its_cfg_walk_reads(kwargs, cfg_p
     kv = model.get_request_resource_configs({DEFAULT_PARTITION: fwd}, model_kwargs)["kv"]
     assert kv.publish_labels_per_node_walk == published
     assert kv.final_publish_labels_per_node_walk == final
+
+
+@pytest.mark.parametrize("node,walk", [
+    ("LLM", "image_gen"), ("LLM", "image_gen_head"), ("LLM", "image_gen_guided2"), ("LLM", "image_gen_guided3"),
+    ("LLM", "image_gen_cfg2"), ("LLM_cfg_text", "image_gen_cfg2"), ("LLM_cfg_img", "image_gen_cfg3"),
+])
+def test_a_denoise_step_leases_and_declares_the_bucket_its_capture_was_made_under(node, walk):
+    """With denoise captures asked for (``denoise_capture_sizes``), a request at a
+    captured size and the default guidance lands on the capture's key from
+    ``cg_key_info`` and from its own ``declare_step``; other guidance lands on
+    none where the step combines the branches itself (guided2/3) and on the
+    same key where it doesn't; the node captures the walk; an unsplit step's
+    latents carry into the next replay's input_embeds; and without the setting
+    the key is the guidance flag it always was."""
+    import dataclasses
+
+    llm = _with_positions(_llm())
+    llm.node_name = node
+    llm.config = dataclasses.replace(CONFIG, denoise_capture_sizes=((256, 256),))
+    tokens = (256 // CONFIG.latent_downsample) ** 2
+    template = llm._denoise_key(walk, (), tokens)
+    meta = {"height": 256, "width": 256}
+    rows = {0: _info(walk, step_metadata=meta)}
+    assert llm.cg_key_info(walk, rows) == template
+    row = _image_gen_row(tokens + 2)
+    assert llm.declare_step(walk, [0], [row], per_request_info=rows).cg_key_info == template
+    other = {0: _info(walk, step_metadata={**meta, "cfg_text_scale": 7.5})}
+    assert (llm.cg_key_info(walk, other) != template) == (walk in ("image_gen_guided2", "image_gen_guided3"))
+    assert walk in llm._denoise_walks
+    if not DENOISE_WALKS[walk].split:
+        assert llm.repeat_carry(walk, {"latents", "time_index"})["latents"] == CarryPair("latents", "input_embeds")
+    llm.config = CONFIG
+    assert llm.cg_key_info(walk, rows) is False
+
+
+@pytest.mark.parametrize("node,walk", [
+    ("LLM", "image_gen_cfg2"), ("LLM_cfg_text", "image_gen_cfg2"), ("LLM_cfg_img", "image_gen_cfg3"),
+])
+def test_a_captured_branch_step_hands_combine_cfg_the_eager_velocity(node, walk):
+    """A split branch's step, run as a capture runs it (``forward_batched``),
+    hands its velocity on as a row, which combine_cfg reads back as the eager
+    step's [tokens, channels] velocity."""
+    from mstar.model.bagel.submodules import CombineCFGSubmodule
+    from mstar.model.submodule_base import ModelInputsFromEngine
+
+    class Doubling:  # the language model, as a function of its input embeddings
+        model, lm_head = types.SimpleNamespace(embed_tokens=None), None
+
+        def __call__(self, emb, **kwargs):
+            return emb * 2
+
+    torch.manual_seed(0)
+    channels, hidden, tokens = 4, 8, 6
+    llm = LLMSubmodule(
+        language_model=Doubling(),
+        llm2vae=torch.nn.Linear(hidden, channels), vae2llm=torch.nn.Linear(channels, hidden),
+        time_embedder=lambda t: t[:, None].expand(-1, hidden),
+        latent_pos_embed=lambda ids: torch.zeros(ids.shape[0], hidden),
+        config=CONFIG, node_name=node,
+    )
+    def inputs():
+        return dict(
+            input_embeds=torch.randn(tokens, channels, generator=torch.Generator().manual_seed(1)),
+            empty_combined_emb=torch.zeros(tokens + 2, hidden), vae_position_ids=torch.zeros(tokens, dtype=torch.long),
+            text_indexes=torch.tensor([0, tokens + 1]), vae_token_indexes=torch.arange(1, tokens + 1),
+            text_mask=torch.zeros(tokens + 2, dtype=torch.bool), time_index=torch.full((tokens,), 3.0),
+        )
+    engine = ModelInputsFromEngine(request_ids=["r0"], per_request_info={"r0": _info(walk)})
+    label = f"v_{NODE_TO_CFG_LABEL[node]}"
+    with torch.no_grad():
+        eager = llm.forward(walk, engine, **inputs())[label][0]
+        # what the worker hands on of a batch-1 row: [1, tokens, channels]
+        row = llm.forward_batched(walk, engine, **inputs()).row_outputs[label]
+    assert row.shape == (1, tokens, channels)
+    rows = {f"v_{lab}": [torch.zeros(1, tokens, channels)] for lab in ("main", "cfg_text")}
+    rows[label] = [row]
+    combine = CombineCFGSubmodule(CONFIG).prepare_inputs(
+        walk, _info(walk), {**rows, "latents": [torch.zeros(tokens, channels)], "time_index": [torch.zeros(tokens)]},
+    )
+    assert torch.equal(combine.tensor_inputs[label], eager)
+
+
+@pytest.mark.parametrize("walk", sorted(CFG_WALKS))
+def test_a_captured_combine_step_is_keyed_by_its_guidance_and_hands_on_the_eager_step(walk):
+    """combine_cfg captures each split walk at a captured size with the default
+    guidance, which a request lands on unless its guidance differs; its
+    captured step (``forward_batched``) hands on the eager step's latents and
+    time_index as rows, which its next step reads back."""
+    import dataclasses
+
+    from mstar.model.bagel.submodules import CombineCFGSubmodule
+    from mstar.model.submodule_base import ModelInputsFromEngine
+
+    combine = CombineCFGSubmodule(dataclasses.replace(CONFIG, denoise_capture_sizes=((256, 256),)))
+    tokens = (256 // CONFIG.latent_downsample) ** 2
+    meta = {"height": 256, "width": 256}
+    configs = {c.capture_graph_walk: c for c in combine.get_accelerator_graph_configs("cpu")}
+    assert set(configs) == set(CFG_WALKS)
+    rows = {0: _info(walk, step_metadata=meta)}
+    assert combine.cg_key_info(walk, rows) == configs[walk].additional_key_info
+    assert combine.cg_key_info(walk, {0: _info(walk, step_metadata={**meta, "cfg_text_scale": 7.5})}) \
+        != configs[walk].additional_key_info
+
+    template = configs[walk].single_request_inputs.tensor_inputs
+    g = torch.Generator().manual_seed(0)
+    inputs = {name: [torch.randn(t.shape, generator=g)] for name, t in template.items() if name != "time_index"}
+    inputs["time_index"] = [torch.full((tokens,), 5.0)]
+    prepared = combine.prepare_inputs(walk, _info(walk, step_metadata=meta), inputs)
+    engine = ModelInputsFromEngine(request_ids=["r0"], per_request_info=rows)
+    eager = combine.forward(walk, engine, **prepared.tensor_inputs, **prepared.kwargs)
+    captured = combine.forward_batched(walk, engine, **prepared.tensor_inputs).row_outputs
+    assert torch.equal(captured["latents"][0], eager["latents"][0])
+    again = combine.prepare_inputs(walk, _info(walk, step_metadata=meta), {
+        **inputs, "latents": [captured["latents"]], "time_index": [captured["time_index"]],
+    })
+    assert again.tensor_inputs["latents"].shape == eager["latents"][0].shape
+    assert again.tensor_inputs["time_index"].tolist() == [6.0] * tokens

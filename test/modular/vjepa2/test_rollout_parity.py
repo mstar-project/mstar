@@ -222,39 +222,36 @@ class TestRolloutParity:
                 encoder_hidden = next_hidden
 
 
-class TestEarlyExit:
-    def test_register_loop_stop_at_requested_horizon(self):
-        """When ``step_metadata["rollout_horizon"]`` is reached, the
-        submodule requests that the DynamicLoop terminate"""
-        torch.manual_seed(2)
+class TestRunOfSteps:
+    def test_a_run_of_four_steps_equals_four_one_step_steps(self):
+        """A batched step returns its rows, so a run carries the sliding
+        window into its next replay and keeps a ``predicted_hidden`` column a
+        replay: four replays predict what four steps do, for two requests."""
+        import sys
+        from pathlib import Path
+
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+        from run_parity import replay_run
+
+        torch.manual_seed(3)
         config = _tiny_config()
-        predictor = VJEPA2Predictor(config).eval()
+        submodule = VJepa2RolloutPredictorSubmodule(predictor=VJEPA2Predictor(config).eval(), config=config)
+        engine_inputs = ModelInputsFromEngine(request_ids=["a", "b"], per_request_info={})
+        clips = [torch.randn(config.num_patches, config.hidden_size) for _ in range(2)]
+        rows = [submodule.prepare_inputs(_GRAPH_WALK, None, {"encoder_hidden": [clip]}) for clip in clips]
+        static = submodule.preprocess(_GRAPH_WALK, engine_inputs, rows)
 
-        submodule = VJepa2RolloutPredictorSubmodule(
-            predictor=predictor,
-            config=config,
-            num_output_frames=2,
-            frames_per_second=4,
-            anticipation_seconds=1.0,
-        )
+        def forward(**inputs):
+            return submodule.forward_batched(_GRAPH_WALK, engine_inputs, **inputs).row_outputs
 
-        x_full = torch.randn(1, config.num_patches, config.hidden_size)
-        horizon = 3
-        stop_seen_at: list[int] = []
-        encoder_hidden = x_full
         with torch.no_grad():
-            # Drive the submodule as if max_iters were larger than horizon;
-            # after iter horizon-1 the submodule should register the stop.
-            for k in range(horizon + 2):
-                info = _make_request_info(iter_idx=k, rollout_horizon=horizon)
-                out = submodule.forward(
-                    _GRAPH_WALK, _engine_inputs(info), encoder_hidden=encoder_hidden
-                )
-                encoder_hidden = out["encoder_hidden"][0]
-                if "rollout_loop" in submodule.check_stop(info.request_id, info, out):
-                    stop_seen_at.append(k)
-
-        # The very first iter where the stop fires should be iter == horizon - 1,
-        # because the submodule checks ``iter_idx + 1 >= horizon``.
-        assert stop_seen_at, "submodule never registered a loop stop"
-        assert stop_seen_at[0] == horizon - 1
+            window, predictions = static["encoder_hidden"], []
+            for _ in range(4):
+                out = forward(encoder_hidden=window)
+                window = out["encoder_hidden"]
+                predictions.append(out["predicted_hidden"])
+            carries = submodule.repeat_carry(_GRAPH_WALK, {"encoder_hidden"})
+            _, columns = replay_run(forward, static, carries, 4, columns=("predicted_hidden",))
+        assert torch.equal(columns["predicted_hidden"], torch.stack(predictions, dim=1))
+        # a row a request, shaped as the per-request forward emits it
+        assert columns["predicted_hidden"][0, 0].shape == predictions[0][0].shape == (1, 16, config.hidden_size)

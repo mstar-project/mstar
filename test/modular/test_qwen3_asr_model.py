@@ -695,32 +695,29 @@ def test_decode_loop_emits_its_one_signal_inline_and_loops_it_back_on_the_device
 
     cfg = _tiny_config()
     sub = _llm_submodule(cfg)
-    sub.node_resources = {SAMPLER: type("S", (), {"has_slot_masters": True})()}
-    assert sub.device_loopback_signals(DECODE_WALK) == frozenset({"text_inputs"})
-    assert sub.device_loopback_signals(PREFILL_WALK) == frozenset()
+    assert sub.device_loopback.walk == DECODE_WALK and sub.device_loopback.outputs() == {"text_inputs": "new_token"}
     assert sub.inline_client_signals(DECODE_WALK) == {"text_inputs": "new_token"}
     assert sub.inline_client_signals(PREFILL_WALK) == {}
-    # a loop-back row brings no ids; preprocess reads them off the sampler
+    # a loop-back row brings no ids; preprocess reads them off the loop-back rows
     row = sub.prepare_inputs(DECODE_WALK, None, {}, has_loopback=True)
     assert row.input_ids is None and row.input_seq_len == 1
     assert sub.uniform_row_inputs(DECODE_WALK, has_loopback=True).input_seq_len == 1
     routed = sub.prepare_inputs(DECODE_WALK, None, {"text_inputs": [torch.tensor([7])]})
-    from mstar.engine.resources.sampler.resource import SamplerResource
+    from mstar.engine.resources.loopback_rows import LoopbackRows
 
-    sampler = type("S", (), {
-        "loopback_tokens": staticmethod(lambda rids: torch.tensor([11, 12, 13])),
-        "overwrite_rows": SamplerResource.overwrite_rows, "_row_stager": None,
-    })()
+    kept = LoopbackRows(torch.device("cpu"))
+    for rid in ("a", "b", "c"):
+        kept.add(rid)
+    kept.write("text_inputs", ["a", "b", "c"], torch.tensor([11, 12, 13]))
     ids = sub.preprocess(DECODE_WALK, ModelInputsFromEngine(
-        request_ids=["a", "b", "c"], per_request_info={}, resources={SAMPLER: sampler},
+        request_ids=["a", "b", "c"], per_request_info={}, loopback_rows=kept,
     ), [row, routed, row])["input_ids"]
     assert ids.tolist() == [11, 7, 13], "a row whose last step ran elsewhere brings its token"
-    # without slot masters (or MSTAR_DEVICE_LOOPBACK=0) the tensor path stays
-    monkeypatch.setenv("MSTAR_DEVICE_LOOPBACK", "0")
-    assert sub.device_loopback_signals(DECODE_WALK) == frozenset()
-    # the per-request stop check reads the decode signal
+    # and the routed token is its row's first write
+    assert kept.read("text_inputs", ["b"]).tolist() == [7]
+    # the per-request stop check reads the token's stop buffer
     info = type("I", (), {
         "graph_walk": DECODE_WALK, "dynamic_loop_iter_counts": {}, "max_tokens": 100,
         "resource_configs": {SAMPLER: type("C", (), {"ignore_eos": False})()},
     })()
-    assert sub.check_stop("a", info, {"text_inputs": [torch.tensor([next(iter(cfg.stop_token_ids))])]})
+    assert sub.check_stop("a", info, {"new_token": [torch.tensor([next(iter(cfg.stop_token_ids))])]})

@@ -15,6 +15,8 @@ import torch
 from mstar.model.orpheus.submodules import OrpheusLLMSubmodule
 from mstar.model.orpheus.submodules import token_stop as orpheus_token_stop
 from mstar.model.qwen3_5.submodules import LLMSubmodule, token_stop
+from mstar.model.qwen3_asr.submodules import Qwen3ASRLLMSubmodule
+from mstar.model.submodule_base import TokenStop
 
 LOOP = "decode_loop"
 EOS = (7, 9)
@@ -25,6 +27,11 @@ MODELS = {
                 ("decode", "prefill_text", "prefill_vision"), token_stop(EOS)),
     "orpheus": (OrpheusLLMSubmodule, SimpleNamespace(stop_token_id=EOS[0]), ("prefill", "decode"),
                 orpheus_token_stop(EOS[0])),
+    # a `TokenStepNode`: the runtime checks its decode walk, which routes the token as text_inputs
+    "qwen3_asr": (Qwen3ASRLLMSubmodule, None, ("prefill", "decode"), TokenStop(
+        loop=LOOP, buffer="new_token", stop_ids=frozenset(EOS), sampler=Qwen3ASRLLMSubmodule.SAMPLER,
+        walk="decode", prefill_walks=frozenset({"prefill"}),
+    )),
 }
 
 
@@ -82,10 +89,91 @@ def test_a_token_stop_names_the_walks_that_end_its_loop():
     assert both.stops_on("a") and both.stops_on("b") and not both.stops_on("c")
 
 
-def test_a_withholding_token_stop_refuses_the_runtime_check():
-    """The runtime's check never calls ``check_stop``, which is what withholds."""
-    from mstar.model.submodule_base import TokenStop
+def test_a_withholding_token_stop_is_the_runtimes_too():
+    sub = Qwen3ASRLLMSubmodule.__new__(Qwen3ASRLLMSubmodule)
+    torch.nn.Module.__init__(sub)
+    sub.token_stop = TokenStop(
+        loop=LOOP, buffer="new_token", stop_ids=frozenset(EOS), sampler="s", withhold=("codes",),
+    )
+    assert sub.get_stop_policies("decode")[LOOP].withhold == ("codes",)
 
-    with pytest.raises(ValueError, match="runtime_check"):
-        TokenStop(loop=LOOP, buffer="new_token", stop_ids=frozenset(EOS), sampler="s",
-                  withhold=("codes",), runtime_check=True)
+
+@pytest.mark.parametrize(("module", "name", "policies"), [
+    # a count-only node: the loop's cap (or no loop) stops it
+    ("mstar.model.orpheus.submodules", "SNACDecoderSubmodule", {}),
+    # an AR node with no token stop
+    ("mstar.model.qwen3_asr.submodules", "Qwen3ASRLLMSubmodule", {}),
+    # a denoise loop: the request's step cap stops it
+    ("mstar.model.z_image.submodules", "ZImageDenoiseSubmodule", {}),
+    ("mstar.model.vjepa2.submodules", "VJepa2RolloutPredictorSubmodule", {}),
+    # its own check_stop decides
+    ("mstar.model.waypoint.submodules", "WaypointDitSubmodule", None),
+])
+def test_a_class_without_its_own_stop_check_declares_no_stops(module, name, policies):
+    cls = getattr(__import__(module, fromlist=[name]), name)
+    sub = cls.__new__(cls)
+    torch.nn.Module.__init__(sub)
+    assert sub.get_stop_policies("decode") == policies
+
+
+def test_the_omni_talker_withholds_its_codec_eos_frame_through_its_token_stop():
+    """The Talker's stop is a ``TokenStop`` like any other: the runtime checks
+    it, and its codec_eos frame stays out of the Code2Wav stream."""
+    from mstar.model.qwen3_omni.config import Qwen3OmniModelConfig
+    from mstar.model.qwen3_omni.submodules import TalkerSubmodule, talker_token_stop
+
+    config = Qwen3OmniModelConfig()
+    sub = TalkerSubmodule.__new__(TalkerSubmodule)
+    torch.nn.Module.__init__(sub)
+    sub.token_stop = talker_token_stop(config)
+    (policy,) = sub.get_stop_policies("talker_decode").values()
+    assert policy.eos_tokens == {config.talker.codec_eos_token_id}
+    assert policy.withhold == ("codec_tokens",)
+
+
+def test_the_omni_talker_carries_its_codec_embedding_into_the_input_its_preprocess_feeds():
+    """A run carries ``talker_input_embeds`` between replays into the static
+    input the forward reads, which ``preprocess`` names ``input_embeds``."""
+    from types import SimpleNamespace
+
+    from mstar.model.qwen3_omni.submodules import TalkerSubmodule
+    from mstar.model.submodule_base import ARNodeInputs
+
+    sub = TalkerSubmodule.__new__(TalkerSubmodule)
+    torch.nn.Module.__init__(sub)
+    sub.model = SimpleNamespace(text_projection=SimpleNamespace(linear_fc1=SimpleNamespace(weight=torch.zeros(1))))
+    sub.get_device = lambda: torch.device("cpu")
+    row = ARNodeInputs(input_embeds=torch.ones(1, 4), input_seq_len=1, tensor_inputs={"text_raw": torch.ones(1, 4)})
+    pair = sub.repeat_carry("talker_decode", {"talker_input_embeds"})["talker_input_embeds"]
+    assert pair.output == "talker_input_embeds"
+    assert torch.equal(sub.preprocess("talker_decode", None, [row])[pair.input], row.input_embeds)
+
+
+def test_a_bagel_denoise_walk_stops_by_its_count_where_the_runtime_checks_it():
+    """A denoise step samples no token, so its loop ends at its cap; declaring
+    that lets the runtime check the stop, which a step that repeats needs."""
+    from types import SimpleNamespace
+
+    import torch
+
+    from mstar.model.bagel.submodules import DENOISE_WALKS, LLMSubmodule
+
+    llm = LLMSubmodule.__new__(LLMSubmodule)
+    for walk in DENOISE_WALKS:
+        assert llm.get_stop_policies(walk) == {}
+        assert llm.check_stop("r", SimpleNamespace(graph_walk=walk), {"latents": [torch.zeros(1)]}) == set()
+
+
+@pytest.mark.parametrize("method", ["check_stop", "check_stop_batched"])
+@pytest.mark.parametrize("ar", [False, True])
+def test_custom_stop_checks_are_inferred_through_inheritance(method, ar):
+    from mstar.model.orpheus.submodules import SNACDecoderSubmodule
+
+    base = Qwen3ASRLLMSubmodule if ar else SNACDecoderSubmodule
+    custom = type("CustomStop", (base,), {method: lambda *args: {LOOP}})
+    inherited = type("InheritedStop", (custom,), {})
+    sub = inherited.__new__(inherited)
+    torch.nn.Module.__init__(sub)
+    if ar:
+        sub.token_stop = TokenStop(loop=LOOP, buffer="new_token", stop_ids=frozenset(EOS), sampler="s")
+    assert sub.get_stop_policies("decode") is None

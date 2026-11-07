@@ -39,7 +39,7 @@ def test_queued_request_does_not_block_the_skip(monkeypatch):
     buffers.gather_static(["a", "b", "c"], 4, 0)
     assert len(gathers) > first
     assert not buffers._pending_init
-    slot_c = buffers._rid_to_slot["c"]
+    slot_c = buffers.rows._rid_to_slot["c"]
     assert float(buffers.temperature.master[slot_c]) == pytest.approx(0.9)
 
 
@@ -55,7 +55,7 @@ def test_pending_row_in_the_batch_forces_the_gather(monkeypatch):
     buffers.register_request("a", SamplingConfig(temperature=0.2))
     buffers.gather_static(["a", "b"], 4, 0)
     assert len(gathers) > first
-    slot_a = buffers._rid_to_slot["a"]
+    slot_a = buffers.rows._rid_to_slot["a"]
     assert float(buffers.temperature.master[slot_a]) == pytest.approx(0.2)
 
 

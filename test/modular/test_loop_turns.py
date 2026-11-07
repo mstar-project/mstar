@@ -37,7 +37,7 @@ from mstar.graph.runtime.base import (  # noqa: E402
     ReadyNodeSpec,
     SpeculationOutput,
 )
-from mstar.model.submodule_base import StepOrder  # noqa: E402
+from mstar.model.submodule_base import BatchedModelOutput, StepOrder  # noqa: E402
 from mstar.utils.containers import ParallelList  # noqa: E402
 from mstar.worker.batch_builder import StepPick  # noqa: E402
 from mstar.worker.chunk_loops import ChunkLoops
@@ -111,7 +111,7 @@ def _scheduler(runtime: _Runtime, order: StepOrder) -> tuple[MicroScheduler, Sim
 
 def _admitted(sched: MicroScheduler, batch: ScheduledBatch, refused: bool = False) -> None:
     """The worker's turn count once the step's admit has settled."""
-    pending = SimpleNamespace(batch=batch, node_batch=SimpleNamespace(
+    pending = SimpleNamespace(batch=batch, group=None, node_batch=SimpleNamespace(
         admit_error=object() if refused else None,
     ))
     Worker._count_turn(SimpleNamespace(scheduler=sched), pending)
@@ -346,7 +346,7 @@ def _looping_worker(monkeypatch, sched, state, refuse=frozenset()) -> Worker:
     def gpu(batch, node_batch, plan_future):
         if refuse.intersection(batch.request_to_worker_graph):
             node_batch.register_admit_error("out of pages")
-        return {}
+        return BatchedModelOutput()
 
     w = Worker.__new__(Worker)
     w.worker_id = "worker_0"
@@ -406,13 +406,24 @@ def test_a_lone_request_keeps_its_chain_without_a_scan():
     assert sched.pick_chain_step(state, KEY, [7]).pick.room == 1
 
 
+def test_a_chain_owed_a_run_keeps_its_step_from_a_waiting_row():
+    runtime = _Runtime()
+    runtime.requests.update({7: None, 8: None})
+    sched, state = _scheduler(runtime, TURNS)
+    sched.note_arrival(8)
+    runtime.ready.add(8)
+
+    assert sched.pick_chain_step(state, KEY, [7]).specs
+    assert not sched.pick_chain_step(state, KEY, [7], continuing_only=True).specs
+
+
 # ── the worker's side ───────────────────────────────────────────────────
 
 
 def _worker(chain: ChainPick, prep, taken=None, asked=None) -> SimpleNamespace:
     asked = {} if asked is None else asked
 
-    def pick_chain_step(state, target, continuing, mid_prefill=(), next_iter_of=None):
+    def pick_chain_step(state, target, continuing, mid_prefill=(), next_iter_of=None, continuing_only=False):
         asked["pick"] = next_iter_of
         return chain
 
@@ -433,6 +444,7 @@ def _worker(chain: ChainPick, prep, taken=None, asked=None) -> SimpleNamespace:
         _is_tearing_down=lambda rid: False,
         _teardowns_pending=lambda: False,
         chunk_loops=ChunkLoops(),
+        _ring_signals={},
         _yield_away_speculation=lambda batch, gave_way=False: SimpleNamespace(
             scheduled_batch=batch, gave_way=gave_way,
         ),

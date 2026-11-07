@@ -38,7 +38,6 @@ from mstar.model.fish_s2_pro.config import (
 from mstar.model.fish_s2_pro.fish_s2_pro_model import FishS2ProModel, clip_digest, load_fast_ar_weights
 from mstar.model.fish_s2_pro.submodules import ARSubmodule
 from mstar.model.registry import HF_MODELS, get_model_class
-from mstar.model.submodule_base import StopCheck
 
 CONFIG_PATH = Path(__file__).resolve().parents[2] / "configs" / "fish_s2_pro.yaml"
 SEMANTIC_START, SEMANTIC_CODES, EOS_ID = 100, 32, 99
@@ -443,9 +442,10 @@ def test_clone_prefill_splices_reference_frames_after_the_prefix():
 
 
 def test_check_stop_ends_on_im_end_and_withholds_it_even_under_ignore_eos():
-    """<|im_end|> ends decode, and its frame stays out of the codec stream either
-    way, so the codec never reads it; under ``ignore_eos`` the row goes on. Other
-    frames neither stop nor withhold: the frame budget is the loop's cap."""
+    """<|im_end|> ends decode, and its declared stop withholds its frame from the
+    codec stream either way, so the codec never reads it; under ``ignore_eos``
+    the row goes on. Other frames neither stop nor withhold: the frame budget is
+    the loop's cap."""
     ar = tiny_ar()
 
     def check(head, ignore_eos=False, walk="ar_decode"):
@@ -457,8 +457,10 @@ def test_check_stop_ends_on_im_end_and_withholds_it_even_under_ignore_eos():
 
     assert check(4, walk="ar_prefill") == set()
     assert check(4) == set()
-    assert check(ar.eos_code) == StopCheck({"ar_decode_loop"}, withheld=("codec_tokens",))
-    assert check(ar.eos_code, ignore_eos=True) == StopCheck(set(), withheld=("codec_tokens",))
+    assert check(ar.eos_code) == {"ar_decode_loop"}
+    assert check(ar.eos_code, ignore_eos=True) == set()
+    (policy,) = ar.get_stop_policies("ar_decode").values()
+    assert policy.withhold == ("codec_tokens",) and ar.eos_code in policy.eos_tokens
 
 
 def ar_info(ignore_eos=False, layout=None):
@@ -721,3 +723,51 @@ def test_the_shipped_request_cap_fits_the_codec_streams():
     small = {**cfg, "resources": {CODEC_STATE: {"max_slots": cfg["max_concurrent_requests"]}}}
     with pytest.raises(ValueError, match="max_concurrent_requests"):
         model.validate_config_yaml(small, str(CONFIG_PATH))
+
+
+def test_an_ar_run_of_four_frames_equals_four_one_frame_steps():
+    """A step that repeats replays the decode capture on one plan: each replay
+    reads the frame embedding the last one left (``ar_input_embeds`` into
+    ``input_embeds``), so four replays give the frames four steps do. The
+    Slow AR's transformer is a stand-in; its heads and the Fast AR are real."""
+    from run_parity import replay_run
+
+    from mstar.model.submodule_base import ModelInputsFromEngine
+
+    ar = tiny_ar()
+    slow = ar.slow_ar
+
+    class Transformer(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.inner = slow
+
+        def forward(self, x, label):
+            return torch.tanh(x * 1.5)
+
+        def __getattr__(self, name):
+            try:
+                return super().__getattr__(name)
+            except AttributeError:
+                return getattr(self.inner, name)
+
+    ar.slow_ar = Transformer()
+    sampler = SimpleNamespace(sample=lambda rids, logits: logits.argmax(-1))
+    engine_inputs = ModelInputsFromEngine(request_ids=["a", "b"], per_request_info={}, resources={AR_SAMPLER: sampler})
+    torch.manual_seed(1)
+    first = torch.randn(2, ar.config.slow_ar.dim, dtype=torch.float64)
+    static = {"last_token_indices": torch.arange(2), "suppress_eos": torch.tensor([False, True])}
+
+    def forward(**inputs):
+        return ar.forward_batched("ar_decode", engine_inputs, **inputs).row_outputs
+
+    x, frames = first, []
+    for _ in range(4):
+        out = forward(input_embeds=x, **static)
+        frames.append(out["codec_tokens"])
+        x = out["ar_input_embeds"]
+    _, columns = replay_run(
+        forward, {"input_embeds": first, **static}, ar.repeat_carry("ar_decode", {"ar_input_embeds"}), 4,
+        ["codec_tokens"],
+    )
+    assert torch.equal(columns["codec_tokens"], torch.stack(frames, dim=1))

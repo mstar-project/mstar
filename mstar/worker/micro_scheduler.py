@@ -126,6 +126,9 @@ class ScheduledBatch:
     # the step is submitted (``Worker._submit_gpu_step``): the graphs say,
     # not the scheduler, and every step that runs passes through there.
     chunk_loop_walks: frozenset[str] = frozenset()
+    # How many iterations of its Loop this step stands for, once its resources
+    # have settled it at admit (`StepContext.repeats` holds the ask until then)
+    repeats: int = 1
 
 
     def walk_of(self, rid: int) -> str:
@@ -141,6 +144,8 @@ class ScheduledBatch:
         range: a row with no range ran whole, which also ends the Loop -- a
         walk with no token budget is never measured or cut.
         """
+        if self.repeats > 1:
+            return [self.repeats] * len(rids)
         walks = self.chunk_loop_walks
         # one lookup for a single-walk step outside a chunk Loop (decode)
         if not walks or (not self.request_walks and self.graph_walk not in walks):
@@ -425,10 +430,13 @@ class MicroScheduler:
         self._walks_of_key: dict[tuple[str, str], list[str]] = defaultdict(list)
         for (node, walk), combined in self.combined_walk_of.items():
             self._walks_of_key[(node, combined)].append(walk)
-        # node -> the lane its steps run on, for nodes off the chain: a lane
+        # (node, walk) -> the lane its steps run on, for walks off the chain: a lane
         # schedules only its own nodes' keys (``get_next_batch``), so the chain
         # neither runs nor yields to another lane's
-        self.lane_of: dict[str, int] = {}
+        self.lane_of: dict[tuple[str, str], int] = {}
+        # Opted-in graph sections, derived by the Rust runtime. The existing
+        # builder takes their common capture key and tightest member cap.
+        self.execution_units = {}
         # (node, walk) -> whether its speculation chain merges the other walks
         # of its combined walk: the config's settings, then each default as
         # `speculation_mixes` first decides it
@@ -866,8 +874,7 @@ class MicroScheduler:
         # and the async follower's build / drop / void paths) pops here, so the
         # drain refcount is discharged in one place.
         message = self.tp_batches_pending_schedule.popleft()
-        self._apply_delta_from_message(message)
-        self._last_popped_tp_seq = max(self._last_popped_tp_seq, message.spec_seq)
+        self.consume_tp_follow(message)
         for rid in message.request_ids:
             if rid not in self.pending_tp_follow_count:
                 continue
@@ -875,6 +882,12 @@ class MicroScheduler:
             if self.pending_tp_follow_count[rid] <= 0:
                 self.pending_tp_follow_count.pop(rid, None)
         return message
+
+    def consume_tp_follow(self, message: ScheduleTPNode) -> None:
+        """Count a leader step as taken, queued or not: a removal stamped with it
+        waits on nothing else, and only this message carries its resident moves."""
+        self._apply_delta_from_message(message)
+        self._last_popped_tp_seq = max(self._last_popped_tp_seq, message.spec_seq)
 
     def pop_ready_rids(
         self, request_state: RequestStateManager,
@@ -995,6 +1008,8 @@ class MicroScheduler:
             # the leader's chunks, so the chunk Loop ends on the same step here
             chunk_ranges=chunk_ranges,
             incomplete_node_rids=unfinished_chunk_rids(chunk_ranges),
+            # its ask until admit settles it, as the leader's (``step_repeats``)
+            repeats=first_tp_node.repeats,
         )
         self.cap_chunk_loops(batch)
         return batch
@@ -1072,7 +1087,7 @@ class MicroScheduler:
                 the chain's.
         """
         # done before any early returns
-        self._let_rows_back(request_state)
+        self.let_rows_back(request_state)
 
         # Note: a TP follow batch has to be scheduled irrespective of failure.
         # Rank 0 already committed to this batch and will sit on the collective
@@ -1143,8 +1158,8 @@ class MicroScheduler:
         return None
 
     def _lane(self, key: tuple[str, str]) -> int:
-        """The lane of a (node, walk) key: its node's, whatever the walk."""
-        return self.lane_of.get(key[0], CHAIN_LANE)
+        """The lane of a (node, walk) key."""
+        return self.lane_of.get(key, CHAIN_LANE)
 
     def _left_to_its_chain(
         self, key: tuple[str, str], exclude_key: tuple[str, str] | None,
@@ -1352,6 +1367,7 @@ class MicroScheduler:
         self, request_state: RequestStateManager,
         target: tuple[str, str], continuing: Sequence[int],
         mid_prefill: Collection[MidPrefillRow] = (), next_iter_of: str | None = None,
+        continuing_only: bool = False,
     ) -> "ChainPick":
         """Who runs the step a speculation chain speculates into at
         ``target``: its ``continuing`` rows (ready, in step order), the rows
@@ -1372,12 +1388,14 @@ class MicroScheduler:
         ``next_iter_of``: the loop the chain's step runs its rows one
         iteration on in, if it does; their capture group is the one they have
         there (``_chain_capture_group``).
+
+        ``continuing_only``: the rows waiting wait out this step.
         """
-        self._let_rows_back(request_state)
+        self.let_rows_back(request_state)
         key = self._key(*target)
         own_walk = None if self.speculation_mixes(*target) else target[1]
         backlogged = self.backlog.get(key)
-        live = [] if backlogged is None else self._backlog_candidates(
+        live = [] if backlogged is None or continuing_only else self._backlog_candidates(
             backlogged, only_walk=own_walk,
         )
         mid = [
@@ -1390,7 +1408,7 @@ class MicroScheduler:
             live = [row.request_id for row in mid] + live
         specs = []
         # a chain holding every request here has nothing waiting on the queues
-        if len(request_state.per_request_info) > len(continuing) + len(mid):
+        if not continuing_only and len(request_state.per_request_info) > len(continuing) + len(mid):
             exclude = self.failed_rids.union(self.pending_removes, self.held_until)
             specs = [
                 spec for spec in self._rows_here(self._ready_specs(
@@ -1472,6 +1490,11 @@ class MicroScheduler:
         capture_group = None
         if engine.splits_by_capture_key(node, walk):
             capture_group = self._chain_capture_group(request_state, node, walk, continuing, next_iter_of)
+        unit = self.execution_units.get(key)
+        if unit is not None:
+            def capture_group(rid):
+                return tuple(self._capture_group(request_state, member, member_walk, rid)
+                             for member, member_walk in zip(unit.nodes, unit.graph_walks, strict=True))
         return StepCandidates(
             graph_walk=walk,
             continuing=continuing, own_walk=own_walk,
@@ -1511,8 +1534,7 @@ class MicroScheduler:
         if next_iter_of is None:
             metadata = InputMetadata(stream_chunks=chunks) if chunks else None
         else:
-            loops = dict(fwd_info.dynamic_loop_iter_counts)
-            loops[next_iter_of] = loops.get(next_iter_of, 0) + 1
+            loops = self.runtime.loop_layout(graph_walk, next_iter_of).advance(fwd_info.dynamic_loop_iter_counts)
             metadata = InputMetadata(stream_chunks=chunks or {}, dynamic_loop_iter_counts=loops)
         return engine.capture_group(node_name, graph_walk, rid, fwd_info, input_metadata=metadata)
 
@@ -1907,9 +1929,11 @@ class MicroScheduler:
         Fixed once the graphs are captured, so asked once."""
         key = (node_name, graph_walk)
         if key not in self._max_bs:
-            self._max_bs[key] = self.engine_manager.get_engine(node_name).get_max_batch_size(
-                node_name, graph_walk
-            )
+            unit = self.execution_units.get(key)
+            members = zip(unit.nodes, unit.graph_walks, strict=True) if unit is not None else ((node_name, graph_walk),)
+            caps = [self.engine_manager.get_engine(node).get_max_batch_size(node, walk) for node, walk in members]
+            capped = [cap for cap in caps if cap is not None]
+            self._max_bs[key] = min(capped) if capped else None
         return self._max_bs[key]
 
     def _limited(self, node_name: str, graph_walk: str, cap: int | None) -> int | None:
@@ -2068,7 +2092,7 @@ class MicroScheduler:
                     return True
         return False
 
-    def _let_rows_back(self, request_state: RequestStateManager) -> None:
+    def let_rows_back(self, request_state: RequestStateManager) -> None:
         """Before a scan: drop the holds that have run out, and unpark the
         rows whose capacity has freed."""
         now = time.monotonic()

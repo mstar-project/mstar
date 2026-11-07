@@ -9,6 +9,7 @@ import pytest
 pytest.importorskip("torch")
 
 from mstar.engine.engine import Engine  # noqa: E402
+from mstar.engine.resources.step import StepContext  # noqa: E402
 from mstar.model.submodule_base import BatchedModelOutput, NodeSubmodule  # noqa: E402
 
 
@@ -30,7 +31,7 @@ RUNNERS = {"region": object()}
 
 def _engine(sub):
     eng = Engine.__new__(Engine)
-    eng._submodules = {"llm": SimpleNamespace(submodule=sub, piecewise_runners=RUNNERS)}
+    eng._submodules = {"llm": SimpleNamespace(submodule=sub, piecewise_runners=RUNNERS, device_stops={})}
     eng._loopback_steps = {}
     eng.per_request_tails = []
     eng.postprocess_batch = lambda batch, outputs: eng.per_request_tails.append(batch)
@@ -40,7 +41,7 @@ def _engine(sub):
 def _batch(rows_only):
     return SimpleNamespace(
         node_name="llm", admit_error=None, rows_only=rows_only, cached_rids=set(),
-        per_request_info_wrapped={1: object()}, inputs=[object()],
+        per_request_info_wrapped={1: object()}, inputs=[object()], run_started=None,
     )
 
 
@@ -78,7 +79,7 @@ def test_an_unbatched_step_clears_rows_only(rids):
     eng._exec_single = _per_request
     batch = SimpleNamespace(
         node_name="llm", request_ids=rids, rows_only=True, running_batched=False,
-        step_context=SimpleNamespace(slot_lease=None, graph_walk="decode"),
+        step_context=StepContext(request_ids=rids, graph_walk="decode", slot=0, capture=False),
         exec_timings=SimpleNamespace(start=None), admit_error=None,
         outputs_ready=threading.Event(), release_waiters=lambda: None,
         preplanned_rids=None, preplan_event=None,
@@ -86,3 +87,76 @@ def test_an_unbatched_step_clears_rows_only(rids):
     eng.exec(batch)
     assert seen["rows_only"] is False and batch.rows_only is False
     assert eng._loopback_steps == {}
+
+
+@pytest.mark.parametrize("executions", [1, 2])
+def test_run_row_collection_uses_descriptor_order_and_the_late_requests_metadata(executions):
+    import torch
+
+    from mstar.engine.device_run import RUN_COUNTS, RUN_DESCRIPTORS, RUN_REPLAYS
+    from mstar.engine.engine import ExecutingBatch
+
+    def raw(values):
+        values = torch.tensor([values])
+        spans = torch.stack((values, values + 1), dim=-1)
+        return BatchedModelOutput(row_outputs={"frame": values}, output_spans={"frame": spans},
+                                  check_stop_buffers={"token": values, RUN_COUNTS: torch.tensor([99]),
+                                                      RUN_REPLAYS: torch.tensor([99])})
+
+    first, second = raw([11, 12, 21]), raw([22, 31, 32])
+    first.check_stop_buffers[RUN_DESCRIPTORS] = torch.tensor([[7, 7, 8]])
+    second.check_stop_buffers[RUN_DESCRIPTORS] = torch.tensor([[8, 9, 9]])
+    records = [(first, [[7, 7, 8]]), (second, [[8, 9, 9]])]
+    late = Engine._run_row_output(records, 8, 4)
+    assert late.row_outputs["frame"].tolist() == [[21, 22, 22, 22]]
+    assert late.output_spans["frame"].tolist() == [[[21, 22], [22, 23], [22, 23], [22, 23]]]
+    assert late.check_stop_buffers["token"].tolist() == [[21, 22, 22, 22]]
+    assert late.check_stop_buffers[RUN_COUNTS].tolist() == [2]
+    assert Engine._run_row_output(records, 10, 4) is None
+    with pytest.raises(ValueError, match="admitted logical horizon"):
+        Engine._run_row_output(records, 8, 1)
+
+    class Filtered(_Plain):
+        def filter_batched_output(self, info, outputs):
+            return {info.signal: outputs["frame"]}
+
+        def spanned_outputs(self, walk):
+            return {"frame"}
+
+    sub = Filtered.__new__(Filtered)
+    eng = _engine(sub)
+    pending = _batch(rows_only=False)
+    eng.exec = lambda batch: first
+    assert eng.exec_and_postprocess(pending) is first
+    assert eng._collect_step(pending, eng._submodules["llm"], None, first, [], {}) is first
+    assert eng.per_request_tails == []
+    collected = eng._collect_outputs(
+        eng._submodules["llm"], None, late, [None], {44: SimpleNamespace(signal="late")},
+        request_ids=[44], step_request_ids=(44,), graph_walk="decode",
+    )
+    assert collected.per_rid_outputs[44]["late"][0].tolist() == [[21, 22, 22, 22]]
+    assert collected.row_request_ids == (44,) and collected.span_request_ids == (44,)
+    eng._postprocess_outputs(pending, collected)
+    assert eng.per_request_tails == [pending]
+    # The real deferred tail sees this receipt's inputs/metadata and only its
+    # actual columns, including an accepted row that ran exactly once.
+    eng._submodules["llm"].rings = {}
+    eng._submodules["llm"].run_columns = {"decode": frozenset({"frame"})}
+    ctx = StepContext((44,), "decode", 0, False, repeats=executions)
+    ctx.run_counts = {44: executions}
+    receipt = ExecutingBatch("llm", {}, ctx, inputs=[None])
+    receipt.per_request_info_wrapped = {44: SimpleNamespace(signal="late")}
+    receipt.run_rows = {44: SimpleNamespace(handle=8)}
+    receipt.run_started = torch.tensor([1])
+    selected = records if executions == 2 else records[:1]
+    resolved = eng.collect_run_outputs(receipt, selected)
+    assert resolved.per_rid_outputs[44]["late"][0].tolist() == [[21, 22][:executions]]
+    assert resolved.run_columns == frozenset({"frame"})
+    assert RUN_COUNTS not in resolved.check_stop_buffers and RUN_REPLAYS not in resolved.check_stop_buffers
+    assert eng.per_request_tails == [pending, receipt]
+    ctx.run_counts = {44: 0}
+    with pytest.raises(ValueError, match="settled, nonempty"):
+        eng.collect_run_outputs(receipt, selected)
+    first.row_outputs["frame"].fill_(-1)
+    second.row_outputs["frame"].fill_(-2)
+    assert collected.per_rid_outputs[44]["late"][0].tolist() == [[21, 22, 22, 22]]

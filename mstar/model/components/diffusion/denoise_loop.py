@@ -6,32 +6,35 @@ leaves the model-specific parts to a handful of hooks:
 
   engine contract (base)                          model hooks (subclass)
   ───────────────────────────────────────────     ──────────────────────────────────────
-  step index from the engine's loop counter       bucket_key_for(fwd_info)      -> hashable
+  per-step schedule scalars (ITERATION_INPUTS)    bucket_key_for(fwd_info)      -> hashable
   per-request schedule + seeded initial noise,    schedule_for(fwd_info, key)   -> FlowMatchSchedule
-    drawn at ingest under PREFETCH_SEEDS
-  overshoot veto (async scheduling)               seed_latents(fwd_info, key, generator) -> [L, C]
+    drawn at ingest under PREFETCH_SEEDS          seed_latents(fwd_info, key, generator) -> [L, C]
   equal-key request batching (can_batch)          request_inputs(fwd_info, inputs, key) -> {name: [..]}
-  stacked preprocess / per-row outputs            num_tokens(key)               -> int
-  stop after the request's own step count         denoise(engine_inputs, key, latents, timestep,
-  per-key CUDA-graph buckets (Euler inside)               sigma, sigma_next, **cond) -> [B, L, C]
-  ragged-attention step declaration               capture_request_inputs(key, device) -> {name: [..]}
+  stacked preprocess / packed per-row outputs     num_tokens(key)               -> int
+  per-key CUDA-graph buckets (Euler inside)       denoise(engine_inputs, key, latents, timestep,
+  ragged-attention step declaration                       sigma, sigma_next, **cond) -> [B, L, C]
+                                                  capture_request_inputs(key, device) -> {name: [..]}
                                                   attention_segments(key) -> ((label, span), ...)
+
+The model stops the loop at the request's step count with ``get_loop_caps``
+(the count ``schedule_for`` reads, known at ingest), so no step runs past it.
 
 Conventions the base fixes:
 
 * The loop-back edges are :attr:`~DenoiseLoopSubmodule.loop_back_names`
   (``latents`` plus whatever ``SOLVER_STATE`` a multi-step scheduler carries);
-  every other input is re-injected by the Loop each iteration. The step index
-  ``k`` is ``fwd_info.dynamic_loop_iter_counts`` for the loop, refreshed by the
-  worker before each batch — no host sync per step.
+  every other input is re-injected by the Loop each iteration. A step reads no
+  loop counter: iteration 0 is the one with nothing carried back yet, and the
+  engine cuts each row's schedule scalars per step, so a step can repeat on
+  the device. The latents leave as a packed output, one row a request.
 * A request's schedule and its device-resident ``sigmas`` / ``timesteps`` live in
   the engine-owned ``PerRequestState`` (freed with the request).
-* Per-step per-request scalars (``STEP_SCALARS``: ``sigma``, ``sigma_next``,
-  ``timestep``) are sliced out of the schedule ``schedule_for`` returns and
-  travel as ``[1]`` device tensors, so a batch of requests at different steps
-  (or step counts) shares one forward, and a captured graph reads them from
-  staged buffers. Declaring one is enough: the base stages every source the
-  table names on the device and slices it per step.
+* Per-step per-request scalars (``ITERATION_INPUTS``: ``sigma``, ``sigma_next``,
+  ``timestep``) come off the schedule ``schedule_for`` returns: the base stages
+  each source the table names on the device in the request's state, and the
+  engine cuts every row's value per step (``IterationInput``), so a batch of
+  requests at different steps (or step counts) shares one forward, and a
+  captured graph reads them from staged buffers.
 * Rows are batched only at an identical ``bucket_key``, which is also the
   CUDA-graph bucket key. It need not be shape alone: anything that has to match
   for two rows to share a forward belongs in it (the latent grid, text length
@@ -56,7 +59,7 @@ import logging
 from collections import OrderedDict
 from collections.abc import Hashable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, NamedTuple
+from typing import TYPE_CHECKING, Any
 
 import torch
 
@@ -73,7 +76,13 @@ from mstar.model.components.diffusion.unipc import (
     initial_state,
     unipc_step,
 )
-from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs, NodeSubmodule
+from mstar.model.submodule_base import (
+    BatchedModelOutput,
+    IterationInput,
+    ModelInputsFromEngine,
+    NodeInputs,
+    NodeSubmodule,
+)
 from mstar.utils.h2d import to_device_nonblocking
 from mstar.utils.threads import ThreadPool
 
@@ -81,22 +90,6 @@ if TYPE_CHECKING:
     from mstar.model.components.quant_linear import StepDtypes
 
 logger = logging.getLogger(__name__)
-
-
-class StepScalar(NamedTuple):
-    """One per-step per-request scalar, sliced out of the request's schedule.
-
-    Travels as a ``[1]`` device tensor so a batch of requests at different steps
-    shares one forward (see the module docstring)."""
-
-    # Attribute of the FlowMatchSchedule ``schedule_for`` returns ("sigmas").
-    # The base stages it on the device and slices it per step, so declaring a
-    # scalar whose source the schedule does not carry is an error.
-    source: str
-    offset: int = 0  # 0 reads step k; 1 reads k + 1, the step's target
-    # viewed as [B, 1, 1] to broadcast over [B, L, C]; a plain [B] otherwise
-    broadcast: bool = True
-    capture_fill: float = 1.0  # placeholder value for a graph capture's dummy rows
 
 
 @dataclass(frozen=True)
@@ -129,13 +122,16 @@ class DenoiseLoopSubmodule(NodeSubmodule):
     # :meth:`seed_loop_back` supplies iteration 0's values.
     SOLVER_STATE: tuple[str, ...] = ()
 
-    # name -> where in the request's schedule this step's value comes from. A
+    # name -> where in the request's schedule this step's value comes from: an
+    # attribute of the FlowMatchSchedule ``schedule_for`` returns, which the
+    # base stages in the request's state. ``sigma`` and ``sigma_next`` are
+    # [B, 1, 1] to broadcast over [B, L, C]; ``timestep`` a plain [B]. A
     # scheduler needing another scalar (a per-step guidance scale, say) adds an
     # entry here instead of overriding prepare_inputs / preprocess / _run.
-    STEP_SCALARS: Mapping[str, StepScalar] = {
-        "sigma": StepScalar("sigmas"),
-        "sigma_next": StepScalar("sigmas", offset=1, capture_fill=0.0),
-        "timestep": StepScalar("timesteps", broadcast=False, capture_fill=1000.0),
+    ITERATION_INPUTS: Mapping[str, IterationInput] = {
+        "sigma": IterationInput("sigmas", shape=(1, 1), capture_fill=1.0),
+        "sigma_next": IterationInput("sigmas", offset=1, shape=(1, 1), capture_fill=0.0),
+        "timestep": IterationInput("timesteps", capture_fill=1000.0),
     }
 
     # True when :meth:`seed_loop_back` depends on nothing but the bucket key and the
@@ -383,35 +379,26 @@ class DenoiseLoopSubmodule(NodeSubmodule):
         self, graph_walk: str, fwd_info: CurrentForwardPassInfo, inputs: NameToTensorList, **kwargs,
     ) -> NodeInputs | None:
         # Keyed by the integer rid_handle, NOT by request_id. The handle is what
-        # the engine keys batches by and what it hands check_stop
+        # the engine keys batches by and frees the state under
         state = self.request_state(fwd_info.rid_handle)
-        k = self.step_index(fwd_info)
         device = self.get_device()
+        # Iteration 0 is the one the Loop routes nothing back to yet: told by
+        # what arrived, not by the loop counter, which a step that repeats may
+        # not read (its iteration inputs are the engine's to cut).
+        first = not any(inputs.get(name) for name in self.loop_back_names)
         # One schedule per loop: a request whose walks run this node in successive
         # stages (a draft loop, then a refinement loop) gets a fresh shape and
         # schedule for each.
-        if k == 0 or state.get("schedule_walk") != graph_walk:
+        if first or state.get("schedule_walk") != graph_walk:
             bucket_key = self.bucket_key_for(fwd_info)
             schedule = self.schedule_for(fwd_info, bucket_key)
             state.add_all(
                 schedule=schedule, bucket_key=bucket_key, num_steps=schedule.num_steps, schedule_walk=graph_walk,
                 **self._step_scalar_sources(schedule, device),
             )
-        bucket_key, num_steps = state["bucket_key"], state["num_steps"]
-        if k >= num_steps:
-            # Async scheduling dispatched an iteration past this request's stop; None
-            # makes the engine skip the forward (the cosmos3 / wan22 veto).
-            # debug, not info: one line per vetoed step per request (1.9k lines in a
-            # 36-minute served run), and it is the expected outcome of speculation.
-            logger.debug("%s: skipping overshoot iteration %d (request %s runs %d steps)",
-                         type(self).__name__, k, fwd_info.request_id, num_steps)
-            return None
+        bucket_key = state["bucket_key"]
         tensors = {
-            **self._carried_inputs(fwd_info, inputs, bucket_key, k, device),
-            **{
-                name: state[scalar.source][k + scalar.offset:k + scalar.offset + 1]
-                for name, scalar in self.STEP_SCALARS.items()
-            },
+            **self._carried_inputs(fwd_info, inputs, bucket_key, first, state, graph_walk, device),
             **self.request_inputs(fwd_info, inputs, bucket_key),
         }
         return NodeInputs(
@@ -422,17 +409,17 @@ class DenoiseLoopSubmodule(NodeSubmodule):
     def _step_scalar_sources(
         self, schedule: FlowMatchSchedule, device: torch.device,
     ) -> dict[str, torch.Tensor]:
-        """The schedule tensors ``STEP_SCALARS`` slices, device-resident, by source
-        name: what ``prepare_inputs`` puts in the request's state.
+        """The schedule tensors ``ITERATION_INPUTS`` read, device-resident, by
+        source name: what ``prepare_inputs`` puts in the request's state.
 
         Override if you need custom logic here.
         """
         staged: dict[str, torch.Tensor] = {}
-        for name, scalar in self.STEP_SCALARS.items():
+        for name, scalar in self.ITERATION_INPUTS.items():
             tensor = getattr(schedule, scalar.source, None)
             if tensor is None:
                 raise AttributeError(
-                    f"{type(self).__name__}.STEP_SCALARS[{name!r}] reads "
+                    f"{type(self).__name__}.ITERATION_INPUTS[{name!r}] reads "
                     f"{scalar.source!r}, which {type(schedule).__name__} does not "
                     f"carry. A declared per-step scalar comes off the schedule "
                     f"{type(self).__name__}.schedule_for returns."
@@ -441,9 +428,9 @@ class DenoiseLoopSubmodule(NodeSubmodule):
             # more than there are steps (which is why sigmas carries a terminal 0
             # and timesteps does not).
             needed = schedule.num_steps + scalar.offset
-            if tensor.shape[0] < needed:
+            if scalar.pad is None and tensor.shape[0] < needed:
                 raise ValueError(
-                    f"{type(self).__name__}.STEP_SCALARS[{name!r}] reads "
+                    f"{type(self).__name__}.ITERATION_INPUTS[{name!r}] reads "
                     f"{scalar.source}[k + {scalar.offset}], needing {needed} "
                     f"entries for {schedule.num_steps} steps, but "
                     f"{scalar.source} has {tensor.shape[0]}."
@@ -453,22 +440,29 @@ class DenoiseLoopSubmodule(NodeSubmodule):
 
     def _carried_inputs(
         self, fwd_info: CurrentForwardPassInfo, inputs: NameToTensorList,
-        bucket_key: Hashable, k: int, device: torch.device,
+        bucket_key: Hashable, first: bool, state, graph_walk: str, device: torch.device,
     ) -> dict[str, torch.Tensor]:
         """This iteration's loop-back tensors: the previous iteration's outputs, or
         seeds on the first one (where the Loop has nothing to route back yet).
 
-        Past iteration 0 a missing edge is a routing bug: raise rather than reseed."""
-        if k == 0:
+        A walk that has carried its edges once and finds them missing has hit a
+        routing bug: raise rather than reseed. (A first iteration prepared again,
+        after a refused admit, reseeds to the same draw.)"""
+        if first:
+            if state.get("carrying_walk") == graph_walk:
+                raise RuntimeError(
+                    f"{type(self).__name__}: loop-back edge(s) {list(self.loop_back_names)} missing "
+                    f"past iteration 0 of request {fwd_info.request_id}"
+                )
             generator = torch.Generator(device="cpu").manual_seed(fwd_info.random_seed)
             seeds = self.initial_loop_back(fwd_info, inputs, bucket_key, generator)
             return {name: self.stage_seed(tensor, device) for name, tensor in seeds.items()}
         missing = [name for name in self.loop_back_names if not inputs.get(name)]
         if missing:
             raise RuntimeError(
-                f"{type(self).__name__}: loop-back edge(s) {missing} missing at iteration {k} "
-                f"of request {fwd_info.request_id}"
+                f"{type(self).__name__}: loop-back edge(s) {missing} missing for request {fwd_info.request_id}"
             )
+        state.add("carrying_walk", graph_walk)
         return {name: inputs[name][0] for name in self.loop_back_names}
 
     def can_batch(self, batch, model_inputs: list[NodeInputs]) -> bool:
@@ -482,9 +476,6 @@ class DenoiseLoopSubmodule(NodeSubmodule):
     def preprocess(self, graph_walk: str, engine_inputs: ModelInputsFromEngine, inputs: list[NodeInputs]) -> dict:
         keys = inputs[0].tensor_inputs.keys()
         stacked = {key: torch.stack([inp.tensor_inputs[key] for inp in inputs]) for key in keys}
-        for name, scalar in self.STEP_SCALARS.items():
-            # [B, 1] -> [B, 1, 1] to broadcast over [B, L, C], or a plain [B]
-            stacked[name] = stacked[name].view(-1, 1, 1) if scalar.broadcast else stacked[name].view(-1)
         stacked["bucket_key"] = inputs[0].resource_step_info
         return stacked
 
@@ -496,7 +487,7 @@ class DenoiseLoopSubmodule(NodeSubmodule):
         if isinstance(bucket_key, StepBucket):
             self.step_dtype, bucket_key = bucket_key.dtype, bucket_key.bucket
         carried = {name: kwargs.pop(name) for name in self.loop_back_names}
-        scalars = {name: kwargs.pop(name) for name in self.STEP_SCALARS}
+        scalars = {name: kwargs.pop(name) for name in self.ITERATION_INPUTS}
         out = self.denoise(engine_inputs, bucket_key, **carried, **scalars, **kwargs)
         return {self.LATENTS: out} if isinstance(out, torch.Tensor) else dict(out)
 
@@ -505,33 +496,22 @@ class DenoiseLoopSubmodule(NodeSubmodule):
 
     def forward_batched(
         self, graph_walk: str, engine_inputs: ModelInputsFromEngine, **kwargs,
-    ) -> dict[str, NameToTensorList]:
+    ) -> BatchedModelOutput:
+        # whole batch tensors, row i request i: what a step that repeats carries
+        # into its next replay; each request takes a copy of its row
+        # (``unpack_packed_outputs``)
         outputs = self._run(engine_inputs, kwargs)
-        return {
-            rid: {name: [value[i]] for name, value in outputs.items()}
-            for i, rid in enumerate(engine_inputs.request_ids)
-        }
+        return BatchedModelOutput(packed_outputs={f"__{name}__": value for name, value in outputs.items()})
 
-    def check_stop(self, request_id: int, request_info: CurrentForwardPassInfo, outputs) -> set[str]:
-        # ``request_id`` is the engine's integer rid handle, the same key
-        # prepare_inputs stored under.
-        state = self.request_states.get(request_id)
-        if state is None or "num_steps" not in state:
-            logger.warning(
-                "%s: check_stop found no schedule for request %r (state=%s); the loop "
-                "will not be stopped by this pass",
-                type(self).__name__, request_id, "absent" if state is None else "no num_steps",
-            )
-            return set()
-        # iteration k is being postprocessed while the counter reads k, so N steps stop at k == N - 1
-        k, num_steps = self.step_index(request_info), int(state["num_steps"])
-        stop = k + 1 >= num_steps
-        # debug, not info: one line per request per step on the GPU thread -- 19.8k of
-        # the 49.7k lines in a 36-minute served run. Invaluable when debugging the loop
-        # counter, far too loud for a served default.
-        logger.debug("%s: check_stop request %s k=%d/%d -> %s", type(self).__name__,
-                     request_id, k, num_steps, "STOP" if stop else "continue")
-        return {self.loop_name} if stop else set()
+    def unpack_packed_outputs(
+        self, static_output: dict, request_ids: list[str], real_seq_lens: list[int], inputs, per_request_info,
+    ) -> dict[str, NameToTensorList]:
+        del real_seq_lens, inputs, per_request_info
+        names = {key: key[2:-2] for key in static_output}
+        return {
+            rid: {name: [static_output[key][i].clone()] for key, name in names.items()}
+            for i, rid in enumerate(request_ids)
+        }
 
     # ------------------------------------------------------------ resources
     def _uniform_key(self, keys) -> Hashable | None:
@@ -597,10 +577,6 @@ class DenoiseLoopSubmodule(NodeSubmodule):
             )
             for step_key in step_keys:
                 tensors = dict(self.capture_request_inputs(bucket_key, device))
-                for name, scalar in self.STEP_SCALARS.items():
-                    tensors[name] = torch.full(
-                        (1,), scalar.capture_fill, dtype=torch.float32, device=device,
-                    )
                 single = NodeInputs(
                     tensor_inputs=tensors, input_seq_len=self.num_tokens(bucket_key), resource_step_info=step_key,
                 )
@@ -617,7 +593,7 @@ class DenoiseLoopSubmodule(NodeSubmodule):
                     # every static input is row-leading ([tokens, features] or a per-batch scalar); a text
                     # embedding's hidden size can equal an edit bucket's token count (7680 for klein), which
                     # would otherwise be mistaken for the token axis
-                    input_seq_dims={key: 0 for key in tensors},
+                    input_seq_dims={key: 0 for key in (*tensors, *self.ITERATION_INPUTS)},
                 ))
         return configs
 
@@ -632,7 +608,7 @@ class UniPCDenoiseLoopSubmodule(DenoiseLoopSubmodule):
     """
 
     SOLVER_STATE = SOLVER_STATE
-    STEP_SCALARS = {"timestep": StepScalar("timesteps", broadcast=False, capture_fill=1000.0)}
+    ITERATION_INPUTS = {"timestep": IterationInput("timesteps", capture_fill=1000.0)}
 
     def model_output(
         self, engine_inputs: ModelInputsFromEngine, bucket_key: Hashable, latents: torch.Tensor,

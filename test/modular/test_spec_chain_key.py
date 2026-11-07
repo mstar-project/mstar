@@ -6,6 +6,10 @@ keying on it would count the chain's own parked rows as other work.
 
 from types import SimpleNamespace
 
+import pytest
+import torch
+
+from mstar.worker.step_repeats import RepeatConfig, StepRepeats
 from mstar.worker.worker import SpeculationTarget, Worker, _SpecFairness
 
 
@@ -23,7 +27,8 @@ def _worker(target, other_ready=True, speculation=None, mid_prefill_walks=frozen
         _can_speculate=lambda batch: True,
         chunk_loops=SimpleNamespace(speculated=mid_prefill_walks),
         _choose_spec_target=lambda batch: target,
-        _try_speculate_next=lambda pending, target: speculation,
+        _try_speculate_next=lambda pending, target, owes_run=False: speculation,
+        _step_repeats=StepRepeats({}, {}),
         maybe_send_zmq_to_tp_followers=lambda node_batch, **kw: -1,
         _tp_lead_needs_marker=lambda pending, speculation: False,
         _span=lambda name: _Span(),
@@ -37,14 +42,101 @@ def _worker(target, other_ready=True, speculation=None, mid_prefill_walks=frozen
         ),
     )
     fake._build_speculation = Worker._build_speculation.__get__(fake)
+    fake._stamp_repeats = lambda *args: None
+    fake._end_run_for_ready_rows = Worker._end_run_for_ready_rows.__get__(fake)
     return fake, peeked, excluded
 
 
-def _pending():
+def _chunk():
+    """A speculation of a prompt chain's next chunk."""
     return SimpleNamespace(
-        batch=object(), node_name="LLM", graph_walk="mixed",
-        node_batch=SimpleNamespace(admit_error=None), tp_seq=-1,
+        node_batch=None, tp_seq=-1, is_yield_away=False, continuing_rids=set(),
+        scheduled_batch=SimpleNamespace(request_to_worker_graph={}),
     )
+
+
+def _pending(repeats=1, owed_run=False):
+    return SimpleNamespace(
+        batch=object(), group=None, node_name="LLM", graph_walk="mixed",
+        node_batch=SimpleNamespace(
+            admit_error=None, step_context=SimpleNamespace(repeats=repeats, owed_run=owed_run),
+        ),
+        tp_seq=-1,
+    )
+
+
+def test_ready_work_ends_a_run_in_flight_at_its_next_iteration():
+    """The rule that yields a chain away, on the device: a run needn't reach its count."""
+    target = SpeculationTarget(SimpleNamespace(node_name="LLM", graph_walk="decode"), [0, 1])
+    worker, _, _ = _worker(target)
+    yielded = []
+    worker.engine_manager = SimpleNamespace(get_engine=lambda node: SimpleNamespace(yield_runs=yielded.append))
+
+    worker._build_speculation(_pending(), 1, _SpecFairness(peek=True, max_consecutive=8))
+    assert yielded == []
+    worker._build_speculation(_pending(repeats=4), 1, _SpecFairness(peek=True, max_consecutive=8))
+    assert yielded == ["LLM"]
+
+
+@pytest.mark.parametrize("rows, ends", [({0: 0, 1: 0}, False), ({0: 0, 1: 0, 2: 0}, True)])
+def test_a_row_the_next_step_takes_in_ends_the_run_ahead_of_it(rows, ends):
+    """A row of the chain's own walk is no other work, but it waits for ``pending``
+    to land, so a run needn't reach its count for it."""
+    target = SpeculationTarget(SimpleNamespace(node_name="LLM", graph_walk="decode"), [0, 1])
+    speculation = SimpleNamespace(
+        is_yield_away=False, node_batch=None, continuing_rids={0, 1},
+        scheduled_batch=SimpleNamespace(request_to_worker_graph=rows),
+    )
+    worker, _, _ = _worker(target, other_ready=False, speculation=speculation)
+    yielded = []
+    worker.engine_manager = SimpleNamespace(get_engine=lambda node: SimpleNamespace(yield_runs=yielded.append))
+
+    worker._build_speculation(_pending(repeats=4), 1, _SpecFairness(peek=True, max_consecutive=8))
+    assert yielded == (["LLM"] if ends else [])
+
+
+def test_ready_rows_wait_out_one_run_and_no_more():
+    """With ``ready_waits`` a step of one iteration is followed by a run that
+    ready work gets no look at and can't end. After the run it gets its look,
+    and after a step narrowed to one too, so nothing keeps it out for good."""
+    target = SpeculationTarget(SimpleNamespace(node_name="LLM", graph_walk="decode"), [0, 1])
+    worker, peeked, _ = _worker(target)
+    worker._step_repeats = StepRepeats({"LLM": RepeatConfig(max=4, ready_waits=True)}, {})
+    yielded = []
+    worker.engine_manager = SimpleNamespace(get_engine=lambda node: SimpleNamespace(yield_runs=yielded.append))
+    fair = _SpecFairness(peek=True, max_consecutive=8)
+
+    worker._build_speculation(_pending(), 1, fair)
+    assert peeked == []
+    worker._build_speculation(_pending(repeats=4), 1, fair)
+    assert peeked == [("LLM", "decode")] and yielded == []
+    worker._build_speculation(_pending(owed_run=True), 1, fair)
+    assert peeked == [("LLM", "decode")] * 2
+
+
+def test_the_run_ready_rows_wait_for_is_at_most_ready_waits_long():
+    """``ready_waits: k`` lets a prefill in after ``k`` iterations: the owed run
+    stops there, and the next step takes the waiting rows."""
+    from mstar.engine.resources.step import StepContext
+    from mstar.worker.micro_scheduler import ScheduledBatch
+
+    ctx = StepContext(request_ids=[0, 1], graph_walk="decode", slot=0, capture=False)
+    batch = ScheduledBatch(node_name="LLM", graph_walk="decode", request_to_worker_graph={0: 0, 1: 0})
+    worker = Worker.__new__(Worker)
+    worker._walk_drivers = {}
+    worker._innermost_loop_by_node = {("decode", "LLM"): "loop"}
+    worker._graph_runtime = SimpleNamespace(loop_room=lambda *args: 100)
+    worker._step_repeats = StepRepeats({"LLM": RepeatConfig(max=8, ready_waits=3)}, {("LLM", "decode"): None})
+    worker._step_repeats._walks.add(("LLM", "decode"))
+    speculation = SimpleNamespace(
+        scheduled_batch=batch, node_batch=SimpleNamespace(step_context=ctx, stream_windows={}), loop_name="loop",
+        continuing_rids={0, 1}, is_new_iter=True, is_same_node=True, consumed_streaming_edges={},
+    )
+    in_flight = SimpleNamespace(batch=SimpleNamespace(repeats=1))
+    worker._stamp_repeats(speculation, in_flight, 1, owes_run=True)
+    assert ctx.repeats == 3 and ctx.owed_run
+    worker._stamp_repeats(speculation, in_flight, 1)
+    assert ctx.repeats == 8
 
 
 def test_after_a_mixed_step_the_chain_keys_on_its_target_walk():
@@ -89,7 +181,7 @@ def test_a_chains_first_step_that_cannot_continue_keeps_the_worker_busy_alone():
 
 def test_a_chains_first_step_that_continues_does_not_peek():
     worker, peeked, excluded = _worker(
-        _PROMPT, speculation=SimpleNamespace(node_batch=None, tp_seq=-1, is_yield_away=False),
+        _PROMPT, speculation=_chunk(),
     )
 
     speculation, _ = worker._build_speculation(_pending(), 0, _SpecFairness(peek=True, max_consecutive=8))
@@ -100,7 +192,7 @@ def test_a_chains_first_step_that_continues_does_not_peek():
 def test_a_prompt_chain_that_speculates_its_next_chunk_yields_from_its_first_step():
     """Speculating a row's next chunk must not hold decode rows behind a second
     prompt step, so the peek runs before the chain's first speculation."""
-    chunk = SimpleNamespace(node_batch=None, tp_seq=-1, is_yield_away=False)
+    chunk = _chunk()
     worker, peeked, excluded = _worker(
         _PROMPT, speculation=chunk, mid_prefill_walks=frozenset({("LLM", "prefill")}),
     )
@@ -112,7 +204,7 @@ def test_a_prompt_chain_that_speculates_its_next_chunk_yields_from_its_first_ste
 
 
 def test_a_prompt_chain_alone_speculates_its_next_chunk():
-    chunk = SimpleNamespace(node_batch=None, tp_seq=-1, is_yield_away=False)
+    chunk = _chunk()
     worker, _, excluded = _worker(
         _PROMPT, other_ready=False, speculation=chunk,
         mid_prefill_walks=frozenset({("LLM", "prefill")}),
@@ -143,7 +235,7 @@ def test_a_step_with_no_token_budget_that_cannot_continue_keeps_mains_order():
 
 def test_a_prompt_chain_with_no_token_budget_does_not_yield_from_its_first_step():
     """Inside its chunk Loop but never cut: it speculates on as on main."""
-    chunk = SimpleNamespace(node_batch=None, tp_seq=-1, is_yield_away=False)
+    chunk = _chunk()
     worker, peeked, excluded = _worker(
         _PROMPT, speculation=chunk, mid_prefill_walks=frozenset({("LLM", "prefill")}), budgeted=False,
     )
@@ -151,3 +243,42 @@ def test_a_prompt_chain_with_no_token_budget_does_not_yield_from_its_first_step(
     speculation, _ = worker._build_speculation(_pending(), 0, _SpecFairness(peek=True, max_consecutive=8))
 
     assert speculation is chunk and not peeked and not excluded
+
+
+def test_a_stalled_consumer_caps_its_producer_to_one_then_takes_the_row_out():
+    """``stream_queue``: the ring's room caps a run as a loop's room does; a
+    row with none leaves the step until its consumer frees some."""
+    from mstar.engine.resources.loopback_rows import LoopbackRows
+    from mstar.engine.resources.step import StepContext
+    from mstar.worker.micro_scheduler import ScheduledBatch
+
+    rows = LoopbackRows(torch.device("cpu"), capacity=4)
+    rows.ask_ring("frames", depth=6)
+    rows.ring_table("frames", torch.zeros(2, 1))
+    for rid in (0, 1):
+        rows.add(rid)
+    engine = SimpleNamespace(ring_room=lambda node, rids: min(rows.ring_room("frames", rid) for rid in rids))
+    worker = Worker.__new__(Worker)
+    worker._walk_drivers = {}
+    worker._innermost_loop_by_node = {("decode", "LLM"): "loop"}
+    worker._ring_signals = {"LLM": frozenset({"frames"})}
+    worker.engine_manager = SimpleNamespace(get_engine=lambda node: engine)
+    worker._graph_runtime = SimpleNamespace(loop_room=lambda *args: 100)
+    worker._step_repeats = StepRepeats({"LLM": RepeatConfig(max=8)}, {("LLM", "decode"): None})
+    worker._step_repeats._walks.add(("LLM", "decode"))
+    ctx = StepContext(request_ids=[0, 1], graph_walk="decode", slot=0, capture=False)
+    batch = ScheduledBatch(node_name="LLM", graph_walk="decode", request_to_worker_graph={0: 0, 1: 0})
+    speculation = SimpleNamespace(
+        scheduled_batch=batch, node_batch=SimpleNamespace(step_context=ctx, stream_windows={}), loop_name="loop",
+        continuing_rids={0, 1}, is_new_iter=True, is_same_node=True, consumed_streaming_edges={},
+    )
+    in_flight = SimpleNamespace(batch=SimpleNamespace(repeats=1))
+    worker._stamp_repeats(speculation, in_flight, 1)
+    assert ctx.repeats == 6
+    rows.ring_write("frames", [0, 1], torch.zeros(2, 5, 1), rows.ring_reserve("frames", [0, 1], 5))
+    worker._stamp_repeats(speculation, in_flight, 1)
+    assert ctx.repeats == 1
+    rows.ring_write("frames", [0], torch.zeros(1, 1, 1), rows.ring_reserve("frames", [0], 1))
+    assert worker._with_ring_room("LLM", [0, 1]) == [1]
+    rows.ring_release("frames", 0, 3)
+    assert worker._with_ring_room("LLM", [0, 1]) == [0, 1]

@@ -97,6 +97,7 @@ def _stub(cache_open: bool = False):
     stub.communicator = _Communicator(stub)
     stub._check_ready_tensors = lambda: None
     stub._poll_stream_buffers = lambda: None
+    stub.request_state = None
     stub.build_results = []   # what _try_follow_speculation returns, in order
 
     def _process_messages():
@@ -272,8 +273,16 @@ def test_nospec_marker_is_recorded_and_never_queued():
 def test_head_for_a_closed_step_is_dropped_on_arrival():
     s = _stub()
     s._close_tp_follow_step(_pending(4))
-    s._register_tp_follow(_head(["r0"], seq=5, from_seq=4))
+    head = _head(["r0"], seq=5, from_seq=4)
+    head.resident_delta.add_offloaded("r1")
+    replayed = []
+    s.engine_manager.get_engine = lambda node: types.SimpleNamespace(
+        apply_resident_delta=lambda node, delta: replayed.extend(delta.rids) or True,
+    )
+    s._register_tp_follow(head)
     assert s.scheduler.peek_tp_follow() is None
+    # rank 0 made the head's moves and stamps removals with it, dropped or not
+    assert s.scheduler.last_consumed_tp_seq == 5 and replayed == ["r1"]
 
 
 def test_close_drops_an_already_queued_head_for_that_step_only():
@@ -338,6 +347,31 @@ def test_await_builds_a_queued_head_and_arms_it():
     assert _await(s, _pending(4, _future(s, out)), armed.append) == (out, spec)
     assert armed == [spec]
     assert s.communicator.waits == 0
+
+
+def test_await_unparks_a_head_row_whose_capacity_freed():
+    """A follower can't leave this wait without a decision, so nothing else
+    unparks a row of its head. A parked row never reads ready, so the head
+    builds only once this poll has let it back."""
+    s = _stub()
+    s.request_state = types.SimpleNamespace(
+        get_partition_for_node=lambda node: "p",
+        get_fwd_info=lambda rid, partition: types.SimpleNamespace(resource_publish_info=None),
+    )
+    s.scheduler.parked[NODE] = {"r0"}
+    class _Engine:
+        def admit_waiting(self, published_of):
+            return [(NODE, "r0")]
+
+    s.engine_manager.get_engine = lambda node: _Engine()
+    spec = object()
+
+    def _build(pending):
+        return None if "r0" in s.scheduler.parked[NODE] else spec
+
+    s._try_follow_speculation = _build
+    s.scheduler.register_tp_follow(_head(["r0"], seq=5, from_seq=4))
+    assert _await(s, _pending(4, _future(s, _output())))[1] is spec
 
 
 def test_await_goes_serial_on_the_marker_without_waiting():

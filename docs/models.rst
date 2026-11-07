@@ -229,6 +229,50 @@ Notes
   for each shape it serves untuned; see "Tuned kernel configs" in :doc:`adding_models`.
 - To add a new family, see :doc:`adding_models`.
 
+Connected captures
+~~~~~~~~~~~~~~~~~~
+
+``walk_runs: [prefill]`` in a serving config asks the worker to submit eligible
+connected nodes of that walk together. It is off by default. Models use their
+ordinary graph edges, captures, resource declarations and ``REPEAT_CARRIES``
+names; no additional model method is required.
+
+The worker selects common rows, prepares and admits all members, and submits
+their captures and internal copies in one CUDA graph launch, in graph order.
+The composed graph and its stable bindings stay with the capture slot; ordinary
+external inputs are staged before launch. An unsubmitted refusal runs the
+ordinary head. Eligible sections run on one CUDA GPU. Shared resources qualify
+through their own ``connected_refusal`` checks; their member-qualified buffers
+retain plans and project prior members' growth before commit. Unsupported shared
+state, prefix chains and generator draws remain boundaries.
+
+Local streaming connections keep each member's graph identity and actual Loop
+progress. The bounded implementation supports two members, one streaming edge,
+one logical and physical row, and fixed membership. It can claim a waiting
+consumer and compose existing entries and bodies under native IF/WHILE nodes.
+The producer and consumer have independent compute counts. The ordinary chunk
+policy supplies readiness, consumption and final-tail decisions; run-budget
+exhaustion does not finish the stream. Selected history is settled only after
+actual producer output is published. Physical ring reservations and reader
+references remain owned by the stream resources until collection completes.
+
+Preparation may structurally pack future inputs with real values through
+reshape, transpose, stack, concatenation and constant padding. These operations
+lower to copies into the existing capture or resource-owned destination; an
+inverse reshape that would allocate, value-dependent work or unsupported native
+copy layout refuses before launch. Alternative chunks must preserve prepared
+host meaning, declarations and independent staged values. Arithmetic on future
+values, mutable model request state and host reads of future positions remain
+boundaries.
+
+A custom consumer tail is eligible only for a requested single compute. Its
+selected real input is reconstructed from retained owner storage before the
+ordinary tail runs, and its reader is released afterward, including on failure.
+A zero-compute consumer runs no tail. Custom producer output transformations
+remain a boundary. These eligibility rules do not by themselves establish that
+every served model's preparation and resources qualify. The phase trace records
+``connected.members#`` and each member's real row count.
+
 OmniVoice notes
 ~~~~~~~~~~~~~~~
 
@@ -274,7 +318,7 @@ Higgs Audio notes
   tower eagerly.
 - One prefill step per request: the ChatML text around the audio and the audio
   embeddings go into the KV cache as one span.
-- Decode keeps each request's last token in the sampler's slot master and
+- Decode keeps each request's last token in the node's loop-back rows and
   sends the client's copy inline (``MSTAR_DEVICE_LOOPBACK``, on by default),
   as Qwen3.5 does: a decode step stores and routes no tensors.
 
@@ -1815,8 +1859,8 @@ Deployment knobs live under ``model_kwargs`` in ``configs/flux2_klein.yaml``:
 ``async_scheduling``
    The engine's speculative scheduling of the image nodes: the worker assembles a batch's
    next denoise step while the current one runs and merges requests that became ready
-   meanwhile, so requests at different steps share a forward. On by default; a step a
-   request speculates past its schedule is vetoed before any forward, and ``false``
+   meanwhile, so requests at different steps share a forward. On by default; each
+   request's loop is capped at its schedule, so no step runs past it, and ``false``
    restores lockstep. Measured on one H100 back to back against lockstep: klein-4B 0.365
    to 0.372 s vs 0.377 to 0.390 s at B=1 and about 3% more images per second at 4 and 16
    concurrent requests, klein-9B 2%, Z-Image neutral, served images unchanged — the

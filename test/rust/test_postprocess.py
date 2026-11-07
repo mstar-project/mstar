@@ -53,7 +53,7 @@ class _Reference(rust_runtime.RustGraphRuntime):
     resume_postprocess = PhasedPostprocess.resume_postprocess
 
 
-def _runtime(cls, sock_dir):
+def _runtime(cls, sock_dir, policy=POLICY):
     section = Loop(
         name=LOOP,
         section=GraphNode(
@@ -74,7 +74,7 @@ def _runtime(cls, sock_dir):
         bookkeeping=RustTensorBookkeeping(),
         communicator=SimpleNamespace(_inner=ZmqCommunicator(ME, sock_dir)),
     )
-    rt.set_stop_policies(NODE, WALK, {LOOP: POLICY})
+    rt.set_stop_policies(NODE, WALK, {LOOP: policy})
     return rt
 
 
@@ -261,3 +261,115 @@ def test_each_rows_loop_stride_advances_its_loop(tmp_path, drop):
     assert iters["native"] == iters["reference"]
     # the dropped row does not move; the last row's 3 + 1 reaches MAX_ITERS and resets
     assert iters["native"] == ([[2, 0, 3], [3, 0]] if drop else [[2, 1, 3], [3, 2, 0]])
+
+
+@pytest.mark.parametrize("landed_first", [False, True])
+def test_a_repeated_step_stops_a_row_at_its_iteration_and_emits_up_to_it(tmp_path, landed_first):
+    """A step that ran three iterations hands over a token per iteration: a row
+    stops at the first that stops it, and the client gets its tokens up to that
+    one, in order; what the device ran past the stop goes nowhere. What a run
+    sent as it landed the landing doesn't send again."""
+    box = ZmqCommunicator("api_server", str(tmp_path))
+    rt = _runtime(rust_runtime.RustGraphRuntime, str(tmp_path))
+    rids = _start(rt, 2)
+    assert rt.pop_rids(NODE, WALK, rids) is not None
+    wide = torch.tensor([[1, 2, 3], [4, EOS, 5]], dtype=torch.int64)
+    emit_skip = None
+    if landed_first:
+        rt.send_tokens(rids, [1, 4], SIG, "text")
+        rt.send_tokens(rids[:1], [2], SIG, "text")
+        emit_skip = {rids[0]: 2, rids[1]: 1}
+    trace = _drive(rt, PostprocessRequest(
+        partition=PART, node_name=NODE, graph_walk=WALK, output_signals=[SIG],
+        wg_ids=ParallelList(list(rids), [0, 0]), runtime_stops=True,
+        tokens=wide[:, 0], row_rids=rids, inline=InlineColumn(SIG, wide[:, 0]),
+        loop_strides=[3, 3], token_width=3, emit_skip=emit_skip,
+    ), {}, model_stops={})
+    assert trace[-1][2] == [rids[1]]
+    sent = {}
+    for frame in _collect(box):
+        for rid, value in zip(frame.body.request_ids, frame.body.values, strict=True):
+            sent.setdefault(rid, []).append(value)
+    assert sent == {"r0": [1, 2, 3], "r1": [4, EOS]}
+
+
+def test_a_repeated_step_refuses_the_model_check_that_reads_one_iteration(tmp_path):
+    """Only the runtime's own check reads every iteration: the model's would
+    drop the rest of a row's tokens unseen."""
+    rt = _runtime(rust_runtime.RustGraphRuntime, str(tmp_path))
+    rids = _start(rt, 2, limits=False)
+    assert rt.pop_rids(NODE, WALK, rids) is not None
+    wide = torch.tensor([[1, 2, 3], [4, 5, 6]], dtype=torch.int64)
+    with pytest.raises(RuntimeError):
+        rt.begin_postprocess(PostprocessRequest(
+            partition=PART, node_name=NODE, graph_walk=WALK, output_signals=[SIG],
+            wg_ids=ParallelList(list(rids), [0, 0]), runtime_stops=True,
+            tokens=wide[:, 0], row_rids=rids, loop_strides=[3, 3], token_width=3,
+        ))
+
+
+@pytest.mark.parametrize("cls", [rust_runtime.RustGraphRuntime, _Reference], ids=["native", "reference"])
+def test_a_repeated_step_hands_the_store_what_each_row_kept(tmp_path, cls):
+    """At STORE a step that ran three iterations says, per row, the iterations
+    its stop kept, nothing past the stop. In order: row 0 runs on, row 1 stops
+    on EOS at iteration 1, row 2 reaches its cap at iteration 1."""
+    rt = _runtime(cls, str(tmp_path))
+    rids = _start(rt, 3)
+    rt.register_stop_limits(rids[2], SimpleNamespace(max_tokens=2, resource_configs={}))
+    assert rt.pop_rids(NODE, WALK, rids) is not None
+    wide = torch.tensor([[1, 2, 3], [4, EOS, EOS], [6, 8, 9]], dtype=torch.int64)
+    step = rt.begin_postprocess(PostprocessRequest(
+        partition=PART, node_name=NODE, graph_walk=WALK, output_signals=[SIG],
+        wg_ids=ParallelList(list(rids), [0, 0, 0]), runtime_stops=True,
+        tokens=wide[:, 0], row_rids=rids, loop_strides=[3, 3, 3], token_width=3,
+    ))
+    assert step.need is PostprocessNeed.STORE
+    assert dict(step.kept) == {rids[1]: 2, rids[2]: 2}
+    assert sorted(step.stopped_rids) == [rids[1], rids[2]]
+
+
+def test_loop_room_is_what_every_row_has_left_past_what_it_has_in_flight(tmp_path):
+    rt = _runtime(rust_runtime.RustGraphRuntime, str(tmp_path))
+    rids = _start(rt, 2)
+    assert rt.loop_room(NODE, WALK, LOOP, rids, 1) == MAX_ITERS - 1
+    assert rt.pop_rids(NODE, WALK, rids) is not None
+    column = torch.tensor([1, 2], dtype=torch.int64)
+    _drive(rt, PostprocessRequest(
+        partition=PART, node_name=NODE, graph_walk=WALK, output_signals=[SIG],
+        wg_ids=ParallelList(list(rids), [0, 0]), runtime_stops=True,
+        tokens=column, row_rids=rids, inline=InlineColumn(SIG, column), loop_strides=[3, 1],
+    ), {}, model_stops={})
+    assert rt.loop_room(NODE, WALK, LOOP, rids, 0) == MAX_ITERS - 3
+    assert rt.loop_room(NODE, WALK, LOOP, rids, 1) == 0
+    assert rt.loop_room(NODE, WALK, LOOP, [*rids, 99], 0) == 0, "a row not here has no room"
+    # past its cap a run goes on for its last row
+    assert rt.loop_room(NODE, WALK, LOOP, rids, 0, True) == MAX_ITERS - 1
+    assert rt.loop_room(NODE, WALK, LOOP, [*rids, 99], 0, True) == 0
+
+
+def test_a_count_stop_counts_every_iteration_of_a_run(tmp_path):
+    """A count stop reads no token column (a DiT's denoise loop), so the
+    step's own width says how far its rows went."""
+    rt = _runtime(rust_runtime.RustGraphRuntime, str(tmp_path), StopPolicy(StopKind.ITER, max_iters=lambda info: 3))
+    rids = _start(rt, 1)
+    assert rt.pop_rids(NODE, WALK, rids) is not None
+    stops = rt.check_stops(PART, NODE, WALK, rids, None, rids, token_width=3)
+    assert stops is not None and list(stops.stops) == rids
+
+
+def test_a_row_reaches_its_cap_inside_a_run_and_stops_there(tmp_path):
+    """``past_cap``: the row stops as at an end token, and what ran past goes nowhere."""
+    box = ZmqCommunicator("api_server", str(tmp_path))
+    rt = _runtime(rust_runtime.RustGraphRuntime, str(tmp_path))
+    rids = _start(rt, 1)
+    assert rt.pop_rids(NODE, WALK, rids) is not None
+    wide = torch.arange(1, MAX_ITERS + 3, dtype=torch.int64)[None]
+    width = wide.shape[1]
+    trace = _drive(rt, PostprocessRequest(
+        partition=PART, node_name=NODE, graph_walk=WALK, output_signals=[SIG],
+        wg_ids=ParallelList(list(rids), [0]), runtime_stops=True,
+        tokens=wide[:, 0], row_rids=rids, inline=InlineColumn(SIG, wide[:, 0]),
+        loop_strides=[width], token_width=width,
+    ), {}, model_stops={})
+    assert trace[-1][2] == rids
+    assert [value for frame in _collect(box) for value in frame.body.values] == list(range(1, MAX_ITERS + 1))

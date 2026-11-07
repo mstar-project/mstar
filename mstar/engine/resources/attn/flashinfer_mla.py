@@ -24,6 +24,12 @@ from mstar.engine.resources.attn.workspace import Workspace, WorkspacePool
 from mstar.engine.resources.base import CGSlotKey
 from mstar.engine.resources.kv.config import KVConfig, KVLayout
 from mstar.engine.resources.kv.plan import KVPlanOutputs, build_paged_indptrs, context_only_views
+from mstar.engine.resources.resident_hooks import (
+    ResidentBinding,
+    no_resident_effect,
+    unbound_horizon,
+    unbounded_repeats,
+)
 from mstar.engine.resources.step import SlotLease, StepContext
 
 logger = logging.getLogger(__name__)
@@ -258,6 +264,30 @@ class FlashInferMLAManager(AttentionManager):
         )
         self._workspaces = WorkspacePool(device, owner=kv_cache)
 
+    def repeat_refusal(self, walk: str, host_step=None) -> str | None:
+        if host_step is not None:
+            return None  # a cache that doesn't grow: one plan serves every replay
+        return "its planned kernel takes each row's length from its plan, which a replay can't move"
+
+    def resident_binding(self) -> ResidentBinding:
+        return ResidentBinding(
+            check_streams=no_resident_effect,
+            bind=no_resident_effect,
+            row=no_resident_effect,
+            stage=no_resident_effect,
+            gather=self._resident_gather,
+            run_gather=no_resident_effect,
+            commit_in_graph=no_resident_effect,
+            advance=no_resident_effect,
+            check_horizon=unbound_horizon,
+            max_repeats=unbounded_repeats,
+            rewind_run=no_resident_effect,
+        )
+
+    def _resident_gather(self, step) -> None:
+        # its kernel reads the host's plan; the tables fill only where K/V go
+        step.host_planned = True
+
     def depends_on(self):
         return {self._kv_cache_name}
 
@@ -275,13 +305,13 @@ class FlashInferMLAManager(AttentionManager):
                 "MLA torch fallback cannot run under a CUDA graph; declare no "
                 "capture configs when uses_kernel is False"
             )
-        key = CGSlotKey(bucket=lease.bucket, slot=lease.slot, label=label)
+        key = CGSlotKey(bucket=lease.bucket, slot=lease.buffer_slot, label=label)
         wrapper = self._cg_plan_states.get(key)
         if wrapper is None:
             kwargs = {**self._wrapper_kwargs, "max_num_pages": captured_page_capacity(
                 num_rows, lease.bucket.num_tokens, self._kv_config)}
             wrapper = FlashInferMLAWrapper(
-                workspace_buffer=self._workspaces.get(label, lease.slot),
+                workspace_buffer=self._workspaces.get(label, lease.buffer_slot),
                 batch_size=num_rows, use_cuda_graph=True, **kwargs,
             )
             self._cg_plan_states[key] = wrapper

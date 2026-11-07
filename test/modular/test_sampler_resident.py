@@ -21,7 +21,8 @@ sys.path.insert(0, ".")
 from mstar.engine.resources.kv import manager as manager_mod  # noqa: E402
 from mstar.engine.resources.kv.config import KVReqConfig, KVStep, PagedKVConfig  # noqa: E402
 from mstar.engine.resources.kv.manager import KVManager  # noqa: E402
-from mstar.engine.resources.resident import TRASH_SLOT, ResidentPlanner  # noqa: E402
+from mstar.engine.resources.resident import TRASH_SLOT, ResidentPlanner, ResidentStream  # noqa: E402
+from mstar.engine.resources.runner import StepRunner  # noqa: E402
 from mstar.engine.resources.sampler import resident as sampler_resident  # noqa: E402
 from mstar.engine.resources.sampler import utils as sampler_utils  # noqa: E402
 from mstar.engine.resources.sampler.config import SamplerStep, SamplingReqConfig  # noqa: E402
@@ -109,7 +110,7 @@ def _expected(cfg: SamplingReqConfig) -> tuple:
 class _Node:
     """A planner over a KV pool and a sampler, driven as the engine drives them."""
 
-    def __init__(self, max_bs: int, with_kv: bool = True, planner: bool = True):
+    def __init__(self, max_bs: int, with_kv: bool = True, planner: bool = True, history: int = 0):
         self.kv = None
         resources = {}
         if with_kv:
@@ -121,14 +122,15 @@ class _Node:
             )
             self.kv._cg_max_seq_len = 64
             resources["kv"] = self.kv
-        self.sampler = SamplerResource(vocab_size=V, enable_repetion_penalty=True, device=CPU)
-        self.sampler.enable_device_loopback_reader()
+        self.sampler = SamplerResource(vocab_size=V, enable_repetion_penalty=True, device=CPU,
+                                       max_repetition_window=history)
         resources["sampler"] = self.sampler
-        # as warmup does: the planner binds, then the runners claim their buffers
-        self.planner = ResidentPlanner("n", {WALK}, resources, CPU, max_bs=max_bs) if planner else None
+        # as warmup does: the runners claim their buffers, then the planner binds
         self.sampler.build_accelerator_graph_buffers(
             [SimpleNamespace(slot=0), SimpleNamespace(slot=1)], max_bs=max_bs, max_seq_len=1,
         )
+        walk = {WALK: {key: ResidentStream("main", reads=False) for key in resources}}
+        self.planner = ResidentPlanner("n", walk, resources, CPU, max_bs=max_bs) if planner else None
         self.bufs = self.sampler._cg_buffers
         self.captured: dict = {}
         self.tokens: dict[int, list[int]] = {}
@@ -161,9 +163,13 @@ class _Node:
             self.tokens.setdefault(rid, []).append(token)
         return out
 
-    def decode(self, rids, slot: int = 0, bs: int | None = None, preplan: bool = True, kept=None):
+    def decode(
+        self, rids, slot: int = 0, bs: int | None = None, preplan: bool = True, kept=None, replays: int = 1,
+        draws: int = 1,
+    ):
         """One captured decode step: capture once per (bucket, slot), then pre-plan,
-        promote, read the loop-back tokens, flush, replay and commit."""
+        promote, read the loop-back tokens, flush, replay and commit. A step
+        that repeats replays ``replays`` times, each drawing ``draws`` times."""
         bs = bs or len(rids)
         padded = tuple(rids) + tuple(-(i + 1) for i in range(bs - len(rids)))
         bucket = BucketKey(graph_walk=WALK, bs=bs, num_tokens=bs)
@@ -208,32 +214,31 @@ class _Node:
             self.kv.plan(kv, ctx)
         self.sampler.plan(smp, ctx)
         assert self.sampler._cg_sampler is graph_sampler
-        ids = self.sampler.loopback_tokens(list(padded))
         if self.planner is not None:
             self.planner.flush(ctx.resident_plan)
-            # what the capture recorded: each owner's gathers (the sampler's cells), the sample
-            for owner in self.planner._owners:
-                if owner is self.sampler:
-                    self.sampler._cells.gather(rec)
-                else:
-                    owner.resident_gather(rec)
-        out = graph_sampler.sample(list(padded), torch.zeros(bs, V))
-        if self.planner is not None:
-            self.planner.commit_in_graph(rec)
+        n = len(rids)
+        for _ in range(replays):
+            if self.planner is not None:
+                self.planner.gather(rec)  # the gather recorded before every forward
+            for _ in range(draws):
+                out = graph_sampler.sample(
+                    list(padded), torch.zeros(bs, V), apply_penalty=self.sampler._apply_penalty_this_step,
+                )
+            if self.planner is not None:
+                self.planner.commit_in_graph(rec)
+            for rid, token in zip(rids, out[:n].tolist(), strict=True):
+                if kept is None or rid in kept:
+                    self.tokens.setdefault(rid, []).append(token)
         if kv is not None:
             self.kv.commit(kv, ctx)
         self.sampler.commit(smp, ctx)
         if self.planner is not None:
             self.planner.commit(step, ctx)
-        n = len(rids)
-        for rid, token in zip(rids, out[:n].tolist(), strict=True):
-            if kept is None or rid in kept:
-                self.tokens.setdefault(rid, []).append(token)
-        return SimpleNamespace(ids=ids[:n].tolist(), ctx=ctx, out=out)
+        return SimpleNamespace(ctx=ctx, out=out)
 
 
 def _offset(node: _Node, rid: int) -> int:
-    return int(node.bufs.offset.master[node.bufs.slot_of(rid)])
+    return int(node.bufs.rows.offset[node.bufs.rows.slot_of(rid)])
 
 
 # ---- the cells ----
@@ -282,14 +287,18 @@ def test_a_config_update_rewrites_its_row_and_the_next_sample_reads_it(drawn, in
     drawn.clear()
     s = node.decode([1, 2])
     # the one row, written whole by the step after the update
-    assert s.ctx.resident_plan.taken == {2}
+    if ingraph:
+        assert s.ctx.resident_plan.taken == {2}
+    else:
+        assert node.sampler._cells is None
     assert drawn[-1][0][0] == pytest.approx(0.5)
     assert drawn[-1][1][:4] == (pytest.approx(0.3), 5, pytest.approx(0.8), 9)
     # and no config version restages a resident step's scalars
     calls = []
-    node.bufs.gather_static = lambda *a, **k: calls.append(a)
+    real = node.bufs.gather_static
+    node.bufs.gather_static = lambda *a, **k: (calls.append(a), real(*a, **k))
     node.decode([1, 2], slot=1)
-    assert not calls
+    assert bool(calls) is not ingraph
 
 
 def test_padding_rows_read_the_defaults_and_leave_the_trash_row(drawn, ingraph):
@@ -305,7 +314,7 @@ def test_padding_rows_read_the_defaults_and_leave_the_trash_row(drawn, ingraph):
                        row[4], defaults["rep_penalty"])
     # the planner's trash row stays zero; the sampler's trash row took the padding draws
     assert not node.planner.store.view(node.planner.max_slots, -1)[TRASH_SLOT].any()
-    assert node.bufs.slot_of(1) != sampler_resident.SAMPLER_TRASH_ROW
+    assert node.bufs.rows.slot_of(1) != sampler_resident.SAMPLER_TRASH_ROW
 
 
 # ---- the offset and the tokens ----
@@ -348,31 +357,19 @@ def test_tokens_do_not_depend_on_the_slot_or_the_path(drawn, ingraph):
     assert runs[0] == runs[1]
 
 
-def test_the_loopback_read_takes_each_row_by_its_own_sampler_row(drawn, ingraph):
-    node = _Node(max_bs=2)
-    for rid in (1, 2, 3):
-        node.ingest(rid, _cfg(seed=rid))
-    a = node.decode([1, 2])
-    b = node.decode([3, 1], slot=1)
-    c = node.decode([2, 3])
-    assert b.ids[1] == a.out[0].item()
-    assert c.ids == [a.out[1].item(), b.out[0].item()]
-
-
-def test_a_dropped_draw_keeps_its_offset_and_token(drawn, ingraph):
+@pytest.mark.parametrize("restore", [None, frozenset({1, 2})])
+def test_a_dropped_draw_keeps_its_offset(drawn, ingraph, restore):
     node = _Node(max_bs=2)
     node.ingest(1, _cfg(seed=1))
     node.ingest(2, _cfg(seed=2))
-    first = node.decode([1, 2])
+    node.decode([1, 2])
     node.decode([1, 2], slot=1, kept=frozenset({1}))
     assert _offset(node, 1) == 3 * STRIDE
     assert _offset(node, 2) == 2 * STRIDE
-    # the next step reads row 2's last kept token
-    s = node.decode([1, 2])
-    assert s.ids[1] == first.out[1].item()
+    node.decode([1, 2])
     assert _offset(node, 2) == 3 * STRIDE
-    # and the dropping step's capture keeps every draw again on its next step
-    node.decode([1, 2], slot=1)
+    # Both default and explicit all-kept restore the same capture's writes.
+    node.decode([1, 2], slot=1, kept=restore)
     assert _offset(node, 1) == 5 * STRIDE
     assert _offset(node, 2) == 4 * STRIDE
 
@@ -384,20 +381,102 @@ def test_a_recycled_row_whose_first_step_is_resident_starts_at_zero(drawn, ingra
     node.ingest(1, _cfg(seed=1))
     for i in range(3):
         node.decode([1], slot=i % 2)
-    row = node.bufs.slot_of(1)
+    row = node.bufs.rows.slot_of(1)
     node.planner.release(1)
     node.sampler.remove_request(1)
     node.ingest(2, _cfg(seed=2))
-    assert node.bufs.slot_of(2) == row
+    assert node.bufs.rows.slot_of(2) == row
     drawn.clear()
     node.decode([2])
     assert drawn[-1][0][4] == 0
     assert node.tokens[2] == [(2 * 7) % V]
 
 
+def test_each_replay_reads_sampler_identity_and_contents_from_resident_cells(drawn, monkeypatch):
+    monkeypatch.setenv("MSTAR_SAMPLER_INGRAPH_SCATTER", "1")
+    node = _Node(max_bs=3, with_kv=False, history=4)
+    for rid in (1, 2, 3):
+        node.ingest(rid, _cfg(seed=rid, penalty=1.3))
+    node.decode([1, 2], bs=3)
+    # Initialize a new owner row without changing this captured batch's plan.
+    # Every later replay must gather its RNG/history identity from the binding.
+    joining = SubmoduleStep({"sampler": SamplerStep()}, segments=[Segment(3, "main", 1)])
+    joining.set_ctx(StepContext((3,), WALK, 0, False, resident=node.planner, repeats=4,
+                               slot_lease=SlotLease(0, BucketKey(WALK, 3, 3))))
+    assert StepRunner({"sampler": node.sampler}).admit_rows(joining).ok
+    snapshot = node.planner.prepare_rows(joining, joining.ctx)
+    node.planner.flush(snapshot)
+    rec, sampler = node.captured[(BucketKey(WALK, 3, 3), 0)]
+    owner = node.sampler._rows
+    masks = []
+    original = sampler_utils.sample_accelerator_graphable_gpu
+
+    def inspect(*args, **kwargs):
+        masks.append(kwargs["seen_tokens"].clone())
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(sampler_utils, "sample_accelerator_graphable_gpu", inspect)
+    # Only device-side resident membership changes between these reads. The
+    # same prepared sampler/gather must stop reading and writing the old owner.
+    for rids in ((1, 2), (3,)):
+        rows = owner.indices((1, 2, 3))
+        before_offsets = owner.offset.index_select(0, rows).clone()
+        before_tokens, before_counts = owner.history.read(rows)
+        before_masks = owner.read_seen(rows)
+        slots = [node.planner.slot_of(rid) for rid in rids]
+        rec.slots.copy_(torch.tensor([*slots, *([TRASH_SLOT] * (3 - len(slots)))]))
+        node.planner.gather(rec)
+        out = sampler.sample([1, 2, -1], torch.zeros(3, V), apply_penalty=True)
+        for i, rid in enumerate(rids):
+            assert drawn[-1][i][3:5] == (rid, before_offsets[rid - 1].item())
+            torch.testing.assert_close(masks[-1][i], before_masks[rid - 1])
+            assert owner.offset[owner.slot_of(rid)].item() == before_offsets[rid - 1].item() + STRIDE
+            assert owner.history.count[owner.slot_of(rid)].item() == before_counts[rid - 1].item() + 1
+            assert owner.read_seen(owner.indices([rid]))[0, out[i]].item()
+        for rid in set((1, 2, 3)) - set(rids):
+            row = owner.indices([rid])
+            assert owner.offset[row].item() == before_offsets[rid - 1].item()
+            tokens, counts = owner.history.read(row)
+            assert counts.item() == before_counts[rid - 1].item()
+            torch.testing.assert_close(tokens[0], before_tokens[rid - 1])
+            torch.testing.assert_close(owner.read_seen(row)[0], before_masks[rid - 1])
+    node.planner.release(3)
+    node.planner.unpin(tuple(snapshot.slots.tolist()))
+
+
+def test_preplanning_a_successor_preserves_the_current_identity_and_kept_rows(drawn, monkeypatch):
+    monkeypatch.setenv("MSTAR_SAMPLER_INGRAPH_SCATTER", "1")
+    node = _Node(max_bs=2, with_kv=False)
+    for rid in (1, 2, 3):
+        node.ingest(rid, _cfg(seed=rid))
+    node.decode([1, 2])
+    node.decode([2, 3], slot=1, kept=frozenset({3}))
+    before = {rid: _offset(node, rid) for rid in (1, 2, 3)}
+    real_flush = node.planner.flush
+
+    def preplan_after_flush(plan):
+        real_flush(plan)
+        # A successor may be prepared while this replay is outstanding.
+        monkeypatch.setattr(node.planner, "flush", real_flush)
+        ctx = StepContext((2, 3), WALK, 1, False, is_preplan=True,
+                          slot_lease=SlotLease(1, BucketKey(WALK, 2, 2)))
+        ctx.resident = node.planner
+        smp = SamplerStep(kept_rids=frozenset({3}))
+        step = SubmoduleStep(steps={"sampler": smp}, segments=[Segment(rid, "main", 1) for rid in (2, 3)])
+        node.planner.plan(step, ctx)
+        node.sampler.plan(smp, ctx)
+
+    monkeypatch.setattr(node.planner, "flush", preplan_after_flush)
+    node.decode([1, 2])
+    assert [_offset(node, rid) for rid in (1, 2, 3)] == [before[1] + STRIDE, before[2] + STRIDE, before[3]]
+    node.decode([2, 3], slot=1)
+    assert [_offset(node, rid) for rid in (1, 2, 3)] == [before[1] + STRIDE, before[2] + 2 * STRIDE, before[3] + STRIDE]
+
+
 # ---- what a resident step stages ----
 
-def test_a_steady_batch_uploads_no_rows_and_restages_nothing(drawn, ingraph, monkeypatch):
+def test_a_steady_batch_uploads_no_rows_and_restages_nothing(drawn, monkeypatch):
+    monkeypatch.setenv("MSTAR_SAMPLER_INGRAPH_SCATTER", "1")
     node = _Node(max_bs=2)
     node.ingest(1, _cfg(seed=1))
     node.ingest(2, _cfg(seed=2))
@@ -414,7 +493,8 @@ def test_a_steady_batch_uploads_no_rows_and_restages_nothing(drawn, ingraph, mon
     assert copies == statics == dynamics == []
     node.ingest(3, _cfg(seed=3))
     node.decode([3, 2])
-    assert len(copies) == 1 and statics == dynamics == []
+    assert copies == statics == dynamics == []
+    assert drawn[-1][0][3] == 3
 
 
 def test_a_node_without_a_planner_keeps_host_staging(drawn, ingraph):
@@ -438,8 +518,8 @@ def test_host_steps_of_a_resident_node_keep_host_staging(drawn, ingraph):
     node.decode([1])
     resident = node.sampler._cg_sampler
     host = node.bufs.sampler_for(1, 0)
-    assert resident is not host
-    assert resident.temperature_buf.data_ptr() != host.temperature_buf.data_ptr()
+    assert (resident is not host) is ingraph
+    assert (resident.temperature_buf.data_ptr() != host.temperature_buf.data_ptr()) is ingraph
 
 
 def test_other_owners_keep_their_cells(drawn, ingraph):
@@ -451,8 +531,9 @@ def test_other_owners_keep_their_cells(drawn, ingraph):
     for i, rids in enumerate([(1, 2), (3, 1), (2, 3), (1, 2)]):
         node.decode(list(rids), slot=i % 2)
     tables = node.kv._resident
-    cols = [t.col for t in node.sampler._cells._tables]
-    assert cols == list(range(cols[0], cols[0] + len(cols)))
+    cols = [t.col for t in node.sampler._cells._tables] if ingraph else []
+    if ingraph:
+        assert cols == list(range(cols[0], cols[0] + len(cols)))
     assert tables.kv_len.col not in cols and not set(cols) & set(range(tables.block_table.col, node.planner._stride))
     for rid in (1, 2):
         slot = node.planner.slot_of(rid)
@@ -466,7 +547,8 @@ def test_other_owners_keep_their_cells(drawn, ingraph):
 def test_the_cell_kernel_matches_the_torch_ops_under_capture():
     """Every field a spec can enable, each dtype, a padding row: the captured
     kernel writes what the CPU path does."""
-    fields = scalar_fields(True, True, True, True, True, True)
+    fields = (*scalar_fields(True, True, True, True, True, True),
+              sampler_utils.ScalarField("sampler_row", torch.long, 0))
     sizes = tuple(torch.empty((), dtype=f.dtype).element_size() for f in fields)
     enc = [sampler_resident._encoder(f.dtype) for f in fields]
     defaults = [e(f.default) for e, f in zip(enc, fields, strict=True)]
@@ -494,3 +576,66 @@ def test_the_cell_kernel_matches_the_torch_ops_under_capture():
     assert torch.equal(got.row.cpu(), want.row)
     for f in fields:
         assert want.views[f.name][1].item() == f.default
+
+
+# ---- steps that repeat ----
+
+def test_a_penalised_run_of_four_draws_as_four_steps_do(drawn, ingraph):
+    """A run replays its draws on one plan: the RNG offset and the seen-token
+    mask move in the graph, so four replays give the tokens, offsets and mask
+    four one-replay steps do, and a live penalty no longer holds a step to one."""
+    seen = []
+    for replays in (1, 4):
+        node = _Node(max_bs=2, with_kv=False)
+        node.ingest(1, _cfg(seed=1, penalty=1.3))
+        smp_ctx = StepContext(request_ids=(1,), graph_walk=WALK, slot=0, capture=False)
+        assert node.sampler.max_repeats(SamplerStep(), smp_ctx) > 4
+        for _ in range(4 // replays):
+            node.decode([1], replays=replays)
+        mask = node.sampler._rows.read_seen(node.sampler._rows.indices([1]))[0]
+        seen.append((node.tokens[1], _offset(node, 1), mask.nonzero().flatten().tolist()))
+    assert seen[0] == seen[1]
+    assert len(set(seen[0][0])) > 1 and seen[0][1] == 4 * STRIDE and seen[0][2]
+
+
+def test_a_loop_back_free_sampler_drawing_fifteen_times_a_replay_may_repeat(drawn, monkeypatch):
+    """A second sampler of a node, one no loop-back reads (a code predictor's),
+    moves its own offsets in the graph too: its walk may repeat, and each of
+    its 15 draws a replay, in each of 4 replays, is fresh."""
+    monkeypatch.setenv("MSTAR_SAMPLER_INGRAPH_SCATTER", "1")
+    node = _Node(max_bs=2, with_kv=False)
+    assert node.sampler.repeat_refusal(WALK) is None
+    node.ingest(1, _cfg(seed=1))
+    node.decode([1], replays=4, draws=15)
+    offsets = [row[0][4] for row in drawn]
+    assert offsets == [i * STRIDE for i in range(60)]
+    assert _offset(node, 1) == 60 * STRIDE
+
+
+@pytest.mark.parametrize("unsafe", ["reset", "prompt", "cached_prefix", "filters", "dropped_draw"])
+def test_joining_sampler_requires_initialized_owner_and_matching_capture(unsafe, monkeypatch, drawn):
+    monkeypatch.setenv("MSTAR_SAMPLER_INGRAPH_SCATTER", "1")
+    node = _Node(max_bs=2, with_kv=False)
+    node.ingest(1, _cfg(11))
+    node.decode([1], bs=2)
+    node.ingest(2, _cfg(12))
+    sampler = node.sampler
+    lease = SlotLease(0, BucketKey(WALK, 2, 2))
+    ctx = StepContext((2,), WALK, 0, False, slot_lease=lease, resident=node.planner, repeats=4)
+    step = SamplerStep()
+    if unsafe != "reset":
+        sampler._rows.sync()
+    if unsafe == "prompt":
+        step = SamplerStep(prefill_tracked_tokens={2: torch.tensor([3])})
+    elif unsafe == "cached_prefix":
+        sampler._cached_prefix[2] = {0: torch.tensor([3])}
+    elif unsafe == "filters":
+        step = SamplerStep(apply_filters=False)
+    elif unsafe == "dropped_draw":
+        sampler._cells.stage_keep(lease.bucket, lease.slot, (1,), frozenset())
+    with pytest.raises(ValueError):
+        sampler.resident_binding().check_horizon(step, ctx)
+    sampler._rows.sync()
+    sampler._cached_prefix.clear()
+    sampler._cells.stage_keep(lease.bucket, lease.slot, (1,), None)
+    sampler.resident_binding().check_horizon(SamplerStep(), ctx)

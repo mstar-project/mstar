@@ -30,6 +30,7 @@ from mstar.model.submodule_base import (
     ARNodeInputs,
     ARNodeSubmodule,
     BatchedModelOutput,
+    DeviceLoopback,
     InputMetadata,
     InputSeqLenInfo,
     ModelInputsFromEngine,
@@ -43,12 +44,8 @@ logger = logging.getLogger(__name__)
 
 
 def token_stop(stop_token_id: int) -> TokenStop:
-    """The decode loop's stop id, checked by the graph runtime on every walk;
-    the loop's cap is the token budget."""
-    return TokenStop(
-        loop="decode_loop", buffer="new_token", stop_ids=frozenset({stop_token_id}), sampler=SAMPLER,
-        runtime_check=True,
-    )
+    """The decode loop's stop id, on every walk; the loop's cap is the token budget."""
+    return TokenStop(loop="decode_loop", buffer="new_token", stop_ids=frozenset({stop_token_id}), sampler=SAMPLER)
 
 
 class OrpheusLLMSubmodule(ARNodeSubmodule):
@@ -71,6 +68,11 @@ class OrpheusLLMSubmodule(ARNodeSubmodule):
         self.lm_head = language_model.lm_head
         self.config = config
         self.token_stop = token_stop(config.stop_token_id)
+        # decode reads its last token off the node's loop-back rows, and a run
+        # carries it from the sampled token to the next replay's input
+        self.device_loopback = DeviceLoopback(
+            walk="decode", signal="text_inputs", buffer="new_token", input="text_inputs",
+        )
         # The LM head computes the custom-token rows alone and reads -inf for
         # the text rows (``output_start``), so the stop token must be one of them.
         if config.stop_token_id < config.custom_token_base_id:
@@ -114,8 +116,12 @@ class OrpheusLLMSubmodule(ARNodeSubmodule):
         graph_walk: str,
         fwd_info: CurrentForwardPassInfo,
         inputs: NameToTensorList,
+        has_loopback: bool = False,
         **kwargs,
     ) -> ARNodeInputs:
+        if (row := self.uniform_row_inputs(graph_walk, has_loopback)) is not None:
+            # one token, read off the node's loop-back rows in `preprocess`
+            return row
         return ARNodeInputs(
             input_ids=inputs["text_inputs"][0],
             input_seq_len=inputs["text_inputs"][0].shape[0]
@@ -171,9 +177,16 @@ class OrpheusLLMSubmodule(ARNodeSubmodule):
         engine_inputs: ModelInputsFromEngine,
         inputs: list[ARNodeInputs],
     ) -> dict[str, torch.Tensor | Any]:
-        return {
-            "text_inputs": torch.cat([inp.input_ids for inp in inputs]),
-        }
+        if all(inp.input_ids is not None for inp in inputs):
+            return {"text_inputs": torch.cat([inp.input_ids for inp in inputs])}
+        if graph_walk == "decode":
+            # device loop-back: every row its request's last token, off the loop-back rows
+            return self.loopback_inputs(engine_inputs, inputs)
+        # a mixed step: a loop-back row's one token off the rows, beside the others' own
+        tokens = self.loopback_tokens(engine_inputs)
+        return {"text_inputs": torch.cat([
+            tokens[i:i + 1] if inp.input_ids is None else inp.input_ids for i, inp in enumerate(inputs)
+        ])}
 
     def _forward(
         self,

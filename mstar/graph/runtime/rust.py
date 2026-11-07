@@ -33,10 +33,11 @@ from mstar.distributed.base import ShardingConfig
 from mstar.engine.resources import PublishedInfo
 from mstar.graph.base import GraphNode, GraphSection, Loop
 from mstar.graph.graph_io import WorkerGraphIO
-from mstar.graph.loop_indices import NestedLoopIndices
+from mstar.graph.loop_indices import LoopLayout, NestedLoopIndices
 from mstar.graph.runtime import sharding
 from mstar.graph.runtime.base import (
     ColumnarEdgeSpecs,
+    ExecutionUnit,
     FreedTensors,
     GraphRuntime,
     ParallelList,
@@ -50,6 +51,7 @@ from mstar.graph.runtime.base import (
     RouteInput,
     RouteOutput,
     RouteTensors,
+    RuntimeStops,
     SendInput,
     SpecRows,
     SpeculationOutput,
@@ -62,6 +64,8 @@ from mstar.utils.profiler import PHASE_PERIOD, phase_record
 
 if TYPE_CHECKING:
     import torch
+
+    from mstar.streaming.topology import Connection
 
 # SendInput.profiling's (rx_info, tx_info, graph_timings), by declared type.
 _PROFILING_HINTS = get_args(Profiling)
@@ -144,6 +148,7 @@ def worker_graph_args(worker_graph: WorkerGraph) -> dict:
             {
                 "name": lp.name,
                 "max_iters": lp.max_iters,
+                "complete": lp._partition_complete,
                 "parent": _parent_loop_name(lp),
                 # Directly-owned only: a node inside a child loop belongs there.
                 "member_nodes": _member_nodes(lp),
@@ -251,6 +256,7 @@ class RustGraphRuntime(GraphRuntime):
         communicator=None,
         combined_walk_of: dict[tuple[str, str], str] | None = None,
         walk_driven_signals: frozenset[str] = frozenset(),
+        connections: tuple[Connection, ...] = (),
     ):
         mine = {wg.worker_graph_id for wg in my_worker_graphs}
         combined_walk_of = combined_walk_of or {}
@@ -280,6 +286,22 @@ class RustGraphRuntime(GraphRuntime):
             # be sent from there rather than handed back one at a time. None
             # for a communicator built without a socket (the tests' stand-ins).
             communicator=getattr(communicator, "_inner", None),
+            # Resolve the declared connection against the actual routed edge,
+            # once at installation. Dynamic consumer-walk callbacks cannot be
+            # predicted by this bounded cell; they retain ordinary scheduling.
+            stream_connections=[
+                (source.name, source_walk, target.name, target_walk, conn.edge_name)
+                for conn in connections if conn.consumer_walk is None
+                for source_wg in my_worker_graphs
+                for source in source_wg.section.get_nodes().values()
+                if node_to_partition.get(source.name) == conn.from_partition
+                for edge in source.outputs if edge.is_streaming and edge.name == conn.edge_name
+                for target_wg in my_worker_graphs
+                for target in target_wg.section.get_nodes().values()
+                if target.name == edge.next_node and node_to_partition.get(target.name) == conn.to_partition
+                for source_walk in sorted(source_wg.graph_walks)
+                for target_walk in sorted(target_wg.graph_walks)
+            ],
             combined_walks=(
                 [node for node, _ in combined_walk_of],
                 [walk for _, walk in combined_walk_of],
@@ -288,6 +310,18 @@ class RustGraphRuntime(GraphRuntime):
         )
         if walk_driven_signals:
             self._rust.set_walk_driven_signals(sorted(walk_driven_signals))
+        self._loop_layouts: dict[tuple[str, str], LoopLayout] = {}
+        for wg in my_worker_graphs:
+            loops = wg.section.get_loops()
+            children = {name: tuple(loop.section.get_loops()) for name, loop in loops.items()}
+            for name in loops:
+                ancestors = tuple(sorted(
+                    (parent for parent in loops if name in children[parent]),
+                    key=lambda parent: -len(children[parent]),
+                ))
+                layout = LoopLayout(name, ancestors, children[name])
+                for walk in wg.graph_walks:
+                    self._loop_layouts[(walk, name)] = layout
         self._node_to_partition = node_to_partition
         self._communicator = communicator
         self._bookkeeping = bookkeeping
@@ -405,6 +439,37 @@ class RustGraphRuntime(GraphRuntime):
     ):
         self._rust.push_back_node(node_name, rids, wg_ids)
 
+    def execution_units(self, graph_walk: str) -> tuple[ExecutionUnit, ...]:
+        return tuple(
+            ExecutionUnit(tuple(wgs), tuple(walks), tuple(nodes), tuple(edges),
+                          tuple(tuple(s) for s in signals), loop, tuple(back), tuple(streaming))
+            for wgs, walks, nodes, edges, signals, loop, back, streaming in self._rust.execution_units(graph_walk)
+        )
+
+    def claim_execution_unit(
+        self, head: str, graph_walk: str, rids: list[int], member_walks: tuple[str, ...] | None = None,
+    ) -> tuple[int, tuple[PopRidsOutput, ...]] | None:
+        out = self._rust.claim_execution_unit(head, graph_walk, rids, member_walks)
+        if out is None:
+            return None
+        claim_id, members = out
+        return claim_id, tuple(
+            PopRidsOutput(ParallelList(m.rids, m.wg_ids), _columns(m), tuple(m.output_signals),
+                          finished_rids=tuple(m.finished_rids))
+            for m in members
+        )
+
+    def submit_execution_unit(self, claim_id: int) -> bool:
+        return self._rust.submit_execution_unit(claim_id)
+
+    def cancel_execution_unit(self, claim_id: int) -> bool:
+        return self._rust.cancel_execution_unit(claim_id)
+
+    def release_execution_unit_member(
+        self, claim_id: int, node_name: str, worker_graph_id: int, rids: list[int],
+    ) -> bool:
+        return self._rust.release_execution_unit_member(claim_id, node_name, worker_graph_id, rids)
+
     # --------- pending loop stops ----------
 
     def has_pending_loop_stop(
@@ -457,6 +522,12 @@ class RustGraphRuntime(GraphRuntime):
             per_request_info[rids[rid_idx[k]]].dynamic_loop_iter_counts[
                 names[name_idx[k]]
             ] = iters[k]
+
+    def loop_layout(self, graph_walk: str, loop_name: str) -> LoopLayout:
+        return self._loop_layouts[(graph_walk, loop_name)]
+
+    def graph_passes(self, request_to_worker_graph: Mapping[int, int]) -> list[int]:
+        return self._rust.graph_passes(list(request_to_worker_graph), list(request_to_worker_graph.values()))
 
     def get_dynamic_loop_iters(
         self, request_ids: list[int], partition: str,
@@ -662,6 +733,7 @@ class RustGraphRuntime(GraphRuntime):
             "walks": input.walks,
             "rid_walk_idx": input.rid_walk_idx,
             "loop_strides": input.loop_strides,
+            "inline_tails": [list(t) for t in input.inline_tails],
         })
         return self._route_output(out)
 
@@ -699,6 +771,15 @@ class RustGraphRuntime(GraphRuntime):
             [sorted(p.eos_tokens) for p in policies.values()],
         )
 
+    def add_stream_items(self, rid: int, signal: str, n: int) -> None:
+        """``n`` items of ``signal`` a consumer here took from a device ring, not a route."""
+        self._rust.add_stream_items(rid, signal, n)
+
+    def loop_room(
+        self, node_name: str, graph_walk: str, loop_name: str, rids: list[int], stride: int, past_cap: bool = False,
+    ) -> int:
+        return self._rust.loop_room(node_name, graph_walk, loop_name, rids, stride, past_cap)
+
     def register_stop_limits(self, rid: int, info: CurrentForwardPassInfo) -> None:
         cap = (1 << 32) - 1  # also "no limit": a loop count never reaches it
         for (node, walk), policies in self._stop_policies.items():
@@ -713,14 +794,14 @@ class RustGraphRuntime(GraphRuntime):
 
     def check_stops(
         self, partition: str, node_name: str, graph_walk: str, rids: list[int],
-        tokens: torch.Tensor | None, row_rids: list[int],
-    ) -> dict[int, set[str]] | None:
+        tokens: torch.Tensor | None, row_rids: list[int], token_width: int = 1,
+    ) -> RuntimeStops | None:
         policies = self._stop_policies[(node_name, graph_walk)]
         if not policies:
-            return {}
+            return RuntimeStops({}, {})
         ptr, rows, stride, dtype = _column(tokens)
-        stop_rids, stop_rules, missing = self._rust.check_stops_inline(
-            partition, node_name, graph_walk, rids, ptr, rows, stride, dtype, row_rids,
+        stop_rids, stop_rules, kept, missing = self._rust.check_stops_inline(
+            partition, node_name, graph_walk, rids, ptr, rows, stride, dtype, row_rids, token_width,
         )
         if missing:
             return None
@@ -728,7 +809,7 @@ class RustGraphRuntime(GraphRuntime):
         stops: dict[int, set[str]] = {}
         for rid, k in zip(stop_rids, stop_rules, strict=True):
             stops.setdefault(rid, set()).add(loops[k])
-        return stops
+        return RuntimeStops(stops, dict(zip(stop_rids, kept, strict=True)) if token_width > 1 else {})
 
     def begin_postprocess(self, request: PostprocessRequest) -> PostprocessStep:
         """Natively (``postprocess.rs``)."""
@@ -749,9 +830,15 @@ class RustGraphRuntime(GraphRuntime):
             inline_signal=None if inline is None else inline.signal,
             inline_ptr=iptr, inline_rows=irows, inline_stride=istride, inline_dtype=idtype,
             partition_done=list(request.partition_done), python_send=request.python_send,
-            loop_strides=request.loop_strides,
+            loop_strides=request.loop_strides, token_width=request.token_width,
+            emit_skip=None if request.emit_skip is None else dict(request.emit_skip),
         )
         return self._postprocess_step(out)
+
+    def send_tokens(self, rids: list[int], values: list[int], signal: str, modality: str) -> None:
+        """Send a step's landed tokens ahead of its postprocess, which skips
+        them (``PostprocessRequest.emit_skip``)."""
+        self._rust.send_tokens(rids, values, signal, modality)
 
     def resume_postprocess(
         self, stops: Mapping[int, set[str]] | None = None, dropped: Iterable[int] = (),
@@ -765,7 +852,7 @@ class RustGraphRuntime(GraphRuntime):
             out = self._rust.resume_postprocess_store(
                 tensors=list(stored.tensors), num_tensors=list(stored.num_tensors),
                 inline_signal=stored.inline_signal, inline_values=list(stored.inline_values),
-                logprobs=list(stored.logprobs),
+                logprobs=list(stored.logprobs), inline_tails=[list(t) for t in stored.inline_tails],
             )
         elif send is not None:
             # The parked step's own route output carries the completion id.
@@ -792,9 +879,11 @@ class RustGraphRuntime(GraphRuntime):
         wg_of = dict(zip(wg_ids.keys, wg_ids.values, strict=True))
         rids = out.rids
         route = out.take_route()
+        kept = out.kept_rids if need is PostprocessNeed.STORE else ()
         return PostprocessStep(
             need, ParallelList(rids, [wg_of[r] for r in rids]), out.rid_walk_idx,
             out.stopped_rids, None if route is None else self._route_output(route),
+            kept=dict(zip(kept, out.kept, strict=True)) if kept else {},
         )
 
     def stop_loops_batched(

@@ -10,9 +10,12 @@ from __future__ import annotations
 import sys
 from types import SimpleNamespace
 
+import torch
+
 sys.path.insert(0, ".")
 
 from mstar.graph.runtime.base import SpeculationOutput
+from mstar.model.submodule_base import BatchedModelOutput
 from mstar.worker.batch_builder import StepPick
 from mstar.worker.micro_scheduler import ChainPick, ScheduledBatch
 from mstar.worker.worker import SpeculationTarget, Worker
@@ -35,7 +38,7 @@ def test_a_request_the_next_node_holds_back_is_not_continued_onto_it():
         failed_rids=set(),
         backlog_splits_from=lambda *_: False,
         # an uncapped target: the chain keeps every row it brings
-        pick_chain_step=lambda state, target, continuing, mid_prefill=(), next_iter_of=None: ChainPick(target, StepPick(
+        pick_chain_step=lambda state, target, continuing, *_: ChainPick(target, StepPick(
             taken=list(continuing), continuing=list(continuing), room=None,
             held_back=set(), ordered=False,
         ), []),
@@ -49,3 +52,19 @@ def test_a_request_the_next_node_holds_back_is_not_continued_onto_it():
     worker._try_speculate_next(SimpleNamespace(batch=batch), target)
 
     assert worker._spec_preparer.prepped == [1, 3], "a request the decoder would not run was carried onto it anyway"
+
+
+def test_a_speculated_step_takes_the_last_iteration_of_a_signal_that_repeated():
+    """Orpheus's token loops back and goes to SNAC, so a run keeps it a column
+    an iteration: the step after the run reads the last one, not the row."""
+    worker = Worker.__new__(Worker)
+    node_batch = SimpleNamespace(request_ids=[1], per_request_input_tensors={1: {"text_inputs": []}})
+    speculation = SimpleNamespace(
+        node_batch=node_batch, continuing_rids={1}, scheduled_batch=SimpleNamespace(chunk_ranges={}),
+        consumed_edges=[("text_inputs", "LLM")], dropped=set(),
+    )
+    outputs = BatchedModelOutput(per_rid_outputs={1: {"text_inputs": [torch.tensor([[5, 6, 7, 8]])]}})
+    outputs.run_columns = frozenset({"text_inputs"})
+    worker._thread_outputs_to_speculative(speculation, outputs)
+    (token,) = node_batch.per_request_input_tensors[1]["text_inputs"]
+    assert token.tolist() == [8]

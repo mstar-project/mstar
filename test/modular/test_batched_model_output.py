@@ -245,7 +245,6 @@ class _StagingWorker(_StubWorker):
     """The gpu-thread side of the host rows: stage behind the step, hand
     the landed rows to the stop check without a sync of its own."""
 
-    _host_rows_slot = 0
     _d2h_stream = None
     _stage_host_rows = Worker._stage_host_rows
     _copy_to_pinned = Worker._copy_to_pinned
@@ -253,6 +252,7 @@ class _StagingWorker(_StubWorker):
 
     def __init__(self, device=torch.device("cpu")):
         super().__init__(device)
+        self._host_rows_slots = {}
 
 
 def test_landed_host_rows_skip_the_side_stream_copy():
@@ -312,3 +312,27 @@ def test_staged_rows_land_a_tensor_under_two_names_once(accelerator_device):
     worker._stage_host_rows(out)
     host = out.host_rows.buffers
     assert host["text_inputs"] is host["new_token"], "one tensor was copied to the host twice"
+
+
+def test_cloning_the_stop_buffers_leaves_nothing_for_the_collector():
+    """A step that clones its stop buffers made a reference cycle (a nested
+    function calling itself), which held the clones until a collection."""
+    import gc
+    import weakref
+
+    import torch
+
+    from mstar.model.submodule_base import BatchedModelOutput
+
+    out = BatchedModelOutput(check_stop_buffers={"t": torch.zeros(4, 2), "nested": {"u": torch.ones(4)}})
+    was = gc.isenabled()
+    gc.disable()
+    try:
+        clones = out.clone_check_stop_buffers()
+        refs = [weakref.ref(clones["t"]), weakref.ref(clones["nested"]["u"])]
+        del clones
+        # with the collector off, only reference counting can have freed them
+        assert [ref() for ref in refs] == [None, None]
+    finally:
+        if was:
+            gc.enable()

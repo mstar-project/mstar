@@ -66,7 +66,7 @@ def test_resources_that_disagree_on_a_splits_prompt_walks_are_refused():
 
 
 def test_a_mixed_steps_batch_is_made_decode_first():
-    streams = SimpleNamespace(settle_final=lambda node, final_edges: (set(), set()))
+    streams = SimpleNamespace(settle_final=lambda node, final_edges: (set(), set()), windows={})
 
     batch = make_executing_batch(
         streams, node_name="LLM", graph_walk="mixed", request_ids=[0, 1, 2, 3, 4],

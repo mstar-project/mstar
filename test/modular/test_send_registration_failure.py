@@ -278,9 +278,9 @@ def _postprocess_worker(refuse, follower=False):
 def _decode_step(rids, final_stream=()):
     node_batch = SimpleNamespace(
         request_ids=list(rids), per_request_info=dict.fromkeys(rids),
-        failed_requests={}, completion_event=None,
+        failed_requests={}, completion_event=None, token_stream=None,
         final_stream_rids=set(final_stream), resource_publish_info={},
-        partition_done_rids=set(), cached_rids=set(), withheld_outputs={},
+        partition_done_rids=set(), cached_rids=set(), stream_windows={},
     )
     batch = ScheduledBatch(
         node_name="llm", graph_walk="decode",
@@ -290,7 +290,7 @@ def _decode_step(rids, final_stream=()):
         per_rid_outputs={r: {"tok": [torch.tensor([r])]} for r in rids},
     )
     pending = SimpleNamespace(
-        batch=batch, node_batch=node_batch, node_name="llm",
+        batch=batch, group=None, node_batch=node_batch, node_name="llm",
         partition="p", graph_walk="decode", loop_name="decode",
         speculative_new_iter=False,
     )

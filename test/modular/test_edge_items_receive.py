@@ -15,6 +15,7 @@ from mstar.streaming.chunk_policy import FixedChunkPolicy
 from mstar.streaming.stream_buffer import StreamBuffer
 from mstar.utils.containers import RecentSet
 from mstar.utils.ipc_format import WorkerMessage, WorkerMessageType
+from mstar.worker.stream_buffers import StreamBufferManager
 from mstar.worker.worker import Worker
 
 EDGE, NODE = "new_token", "snac_decoder"
@@ -59,6 +60,8 @@ def _worker(join_dim=None):
         for h in HANDLES.values()
     })
     w.scheduler = SimpleNamespace(failed_rids=set())
+    # no graph: every edge's items are a producer pass's pieces
+    w.streams = StreamBufferManager(w.request_state, None, [])
     w.reads, w.acked = [], []
 
     def start_read_tensors(rid, edges, graph_walk=None):

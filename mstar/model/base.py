@@ -508,6 +508,7 @@ def _divide_into_worker_graphs(
                 accumulated_outputs=graph.accumulated_outputs,
                 _external_inputs=ext_inps,
                 _loop_back_inputs=graph._loop_back_inputs,
+                _partition_complete=graph._partition_complete and len(loop_section_worker_graphs) == 1,
             )
         return loop_section_worker_graphs
 

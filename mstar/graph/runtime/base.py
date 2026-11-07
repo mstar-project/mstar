@@ -3,6 +3,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from enum import IntEnum
+from types import MappingProxyType
 from typing import TYPE_CHECKING, NamedTuple
 
 from mstar.communication.tensors import NameToTensorList, TensorStore
@@ -10,7 +11,7 @@ from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.distributed.base import ShardingConfig
 from mstar.engine.resources import PublishedInfo
 from mstar.graph.base import GraphEdge
-from mstar.graph.loop_indices import NestedLoopIndices
+from mstar.graph.loop_indices import LoopLayout, NestedLoopIndices
 from mstar.profile.format import GraphTiming, RxInfo, TxInfo
 from mstar.utils.containers import ParallelList
 
@@ -25,11 +26,9 @@ logger = logging.getLogger(__name__)
 class SpeculationOutput(NamedTuple):
     node_name: str
     graph_walk: str
-    # Loop context for the TARGET. Not used for filtering -- prep_spec_rids
-    # owns that -- but the speculative batch carries it, and the postprocess
-    # that follows needs it to match its pending loop stops. The selection
-    # step already computes both, so reporting them avoids a second
-    # ingest_for_speculation (which mutates speculative slot state).
+    # On a loop-back, loop_name is the crossed Loop. Otherwise it is the
+    # target node's enclosing Loop. This identifies the counter advanced by
+    # the transition, including an outer back-edge entering a nested Loop.
     is_new_loop_iter: bool = False
     loop_name: str | None = None
     # The TARGET's output edge names, same as PopRidsOutput carries for a
@@ -384,6 +383,28 @@ class PopRidsOutput(NamedTuple):
     # walk's output edge names.
     rid_walk_idx: list[int] = []
     walk_output_signals: tuple[tuple[str, ...], ...] = ()
+    # Claim-only: these members retain their identity for downstream drain,
+    # but their already-finished partition must not prepare or execute again.
+    finished_rids: tuple[int, ...] = ()
+
+
+@dataclass(frozen=True)
+class ExecutionUnit:
+    """A connected section of the compiled graph, shared by all its rows.
+
+    Member inputs/outputs retain ordinary node names. Only exclusively
+    internal payloads stay in the members' leased capture buffers.
+    """
+    worker_graph_ids: tuple[int, ...]
+    graph_walks: tuple[str, ...]
+    nodes: tuple[str, ...]
+    # (producer node, consumer node, signal)
+    edges: tuple[tuple[str, str, str], ...]
+    output_signals: tuple[tuple[str, ...], ...]
+    # Present only for one complete, dependency-closed flat Loop body.
+    loop_name: str | None = None
+    loop_back: tuple[tuple[str, str, str], ...] = ()
+    streaming_edges: tuple[tuple[str, str, str], ...] = ()
 
 
 class RequestWalks(NamedTuple):
@@ -501,6 +522,9 @@ class RouteInput(NamedTuple):
     # its iteration, in wg_ids.keys() order; None, one each. A chunk loop
     # counts tokens, so its row's stride is the chunk's.
     loop_strides: list[int] | None = None
+    # A repeated step's inline values after each row's first, in wg_ids.keys()
+    # order; empty for a step that ran once.
+    inline_tails: tuple[list[int], ...] | list[list[int]] = ()
 
 
 class RouteOutput(NamedTuple):
@@ -616,6 +640,11 @@ class PostprocessRequest(NamedTuple):
     python_send: bool = False
     # wg_ids.keys[i]'s ``RouteInput.loop_strides``; None, 1 each
     loop_strides: list[int] | None = None
+    # rid -> the inline values already sent, during the step (``send_tokens``)
+    emit_skip: Mapping[int, int] | None = None
+    # values per row of ``tokens`` and ``inline``: one per iteration of a
+    # repeated step, side by side
+    token_width: int = 1
 
 
 class RouteTensors(NamedTuple):
@@ -626,6 +655,16 @@ class RouteTensors(NamedTuple):
     inline_signal: str | None = None
     inline_values: tuple[int, ...] | list[int] = ()
     logprobs: tuple[float | None, ...] | list[float | None] = ()
+    inline_tails: tuple[list[int], ...] | list[list[int]] = ()
+
+
+class RuntimeStops(NamedTuple):
+    """``check_stops``' answer over a step's rows."""
+    # rid -> the loops it stops
+    stops: dict[int, set[str]]
+    # rid -> the iterations that count, for a row that stopped inside a step
+    # that repeated; a row not here keeps all of them
+    kept: dict[int, int]
 
 
 class PostprocessStep(NamedTuple):
@@ -640,6 +679,8 @@ class PostprocessStep(NamedTuple):
     route_output: RouteOutput | None = None
     # the rids a WORKER_GRAPHS_DONE went out for (DONE)
     completed_rids: list[int] | tuple[()] = ()
+    # STORE: the iterations the stop check kept of each row (``RuntimeStops``)
+    kept: Mapping[int, int] = MappingProxyType({})
 
 
 class _PostprocessPhase(IntEnum):
@@ -662,11 +703,14 @@ class _Postprocess:
     stored: RouteTensors | None = None
     route: RouteOutput | None = None
     send: SendInput | None = None
+    kept: dict[int, int] = field(default_factory=dict)
 
     def step(self, need: PostprocessNeed, completed: list[int] | None = None) -> PostprocessStep:
         if need is PostprocessNeed.DONE:
             return PostprocessStep(need, stopped_rids=self.stopped, completed_rids=completed or [])
-        return PostprocessStep(need, self.wg_ids, self.rid_walk_idx, self.stopped, self.route)
+        return PostprocessStep(
+            need, self.wg_ids, self.rid_walk_idx, self.stopped, self.route, kept=self.kept,
+        )
 
 
 def _merged_stops(*parts: Mapping[int, set[str]] | None) -> dict[int, set[str]]:
@@ -675,6 +719,16 @@ def _merged_stops(*parts: Mapping[int, set[str]] | None) -> dict[int, set[str]]:
         for rid, loops in (part or {}).items():
             out.setdefault(rid, set()).update(loops)
     return out
+
+
+def _refuse_repeated(request: PostprocessRequest, path: str) -> None:
+    """The worker's stop check reads one value a row, so on a step that
+    repeated the rest of each row's iterations would go unseen."""
+    if request.token_width > 1:
+        raise RuntimeError(
+            f"{request.node_name}/{request.graph_walk}: a step of {request.token_width} "
+            f"iterations can't take the worker's {path} path"
+        )
 
 
 def _route_needs_python(route: RouteOutput) -> bool:
@@ -724,6 +778,7 @@ class PhasedPostprocess:
         if pp.phase is _PostprocessPhase.STOPS:
             if pp.stops is None and not req.runtime_stops:
                 # checked by the worker: the request's stops are all of them
+                _refuse_repeated(req, "check_stop")
                 pp.stops = _merged_stops(req.stops)
                 self._keep_rows(pp, set())
             if pp.stops is None:
@@ -734,14 +789,16 @@ class PhasedPostprocess:
                     try:
                         found = self.check_stops(
                             req.partition, req.node_name, req.graph_walk,
-                            list(req.wg_ids.keys), req.tokens, list(req.row_rids),
+                            list(req.wg_ids.keys), req.tokens, list(req.row_rids), req.token_width,
                         )
                     except Exception:
                         logger.debug("runtime stop check failed (node=%s)", req.node_name,
                                      exc_info=True)
                 if found is None:
+                    _refuse_repeated(req, "check_stop")
                     return pp.step(PostprocessNeed.STOPS)
-                pp.stops = _merged_stops(req.stops, found)
+                pp.stops = _merged_stops(req.stops, found.stops)
+                pp.kept = found.kept
                 self._keep_rows(pp, set())
             pp.stopped = self._stop_step_loops(pp)
             pp.phase = _PostprocessPhase.ROUTE
@@ -753,7 +810,10 @@ class PhasedPostprocess:
             if inline_values is None and pp.stored is None:
                 return pp.step(PostprocessNeed.STORE)
             n = len(pp.wg_ids.keys) * len(req.output_signals)
-            stored = pp.stored or RouteTensors([], [0] * n, req.inline.signal, inline_values)
+            stored = pp.stored or RouteTensors(
+                [], [0] * n, req.inline.signal, inline_values,
+                inline_tails=self._inline_tails(pp) if req.token_width > 1 else (),
+            )
             loop_strides = req.loop_strides
             if loop_strides is not None and len(pp.wg_ids.keys) != len(loop_strides):
                 stride_of = dict(zip(req.wg_ids.keys, loop_strides, strict=True))
@@ -766,6 +826,7 @@ class PhasedPostprocess:
                 logprobs=stored.logprobs,
                 walks=req.walks if pp.rid_walk_idx is not None else None,
                 rid_walk_idx=pp.rid_walk_idx, loop_strides=loop_strides,
+                inline_tails=stored.inline_tails,
             ))
             pp.phase = _PostprocessPhase.SEND
         if pp.send is None:
@@ -816,6 +877,17 @@ class PhasedPostprocess:
                 loop_names=ParallelList(list(walk_stops), [list(v) for v in walk_stops.values()]),
             )
         return stopped
+
+    @staticmethod
+    def _inline_tails(pp: _Postprocess) -> list[list[int]]:
+        """A repeated step's inline values after each row's first, up to the
+        iteration it stopped at, in route order."""
+        req = pp.request
+        column = req.inline.column
+        width = req.token_width
+        rows = column.as_strided((column.shape[0], width), (column.stride(0), 1)).tolist()
+        row_of = {rid: i for i, rid in enumerate(req.row_rids)}
+        return [rows[row_of[rid]][1:pp.kept.get(rid, width)] for rid in pp.wg_ids.keys]
 
     @staticmethod
     def _inline_values(pp: _Postprocess) -> list[int] | None:
@@ -946,6 +1018,16 @@ class GraphRuntime(PhasedPostprocess, ABC):
         pass
 
     @abstractmethod
+    def loop_layout(self, graph_walk: str, loop_name: str) -> LoopLayout:
+        """The Loop's fixed ancestry and the descendants reset on entry."""
+        pass
+
+    @abstractmethod
+    def graph_passes(self, request_to_worker_graph: Mapping[int, int]) -> list[int]:
+        """Actual worker-graph pass counters, in submitted row order."""
+        pass
+
+    @abstractmethod
     def get_dynamic_loop_iters(
         self, request_ids: list[int],
         partition: str,
@@ -981,11 +1063,13 @@ class GraphRuntime(PhasedPostprocess, ABC):
     @abstractmethod
     def check_stops(
         self, partition: str, node_name: str, graph_walk: str, rids: list[int],
-        tokens: "torch.Tensor | None", row_rids: list[int],
-    ) -> dict[int, set[str]] | None:
+        tokens: "torch.Tensor | None", row_rids: list[int], token_width: int = 1,
+    ) -> RuntimeStops | None:
         """(node, walk)'s declared stop policies over a step's rows: per rid,
-        the loops it stops (``StopPolicy.stops``); None when a row has no
-        limits for the walk, and the worker's ``check_stop`` decides.
+        the loops it stops (``StopPolicy.stops``), at its first iteration that
+        stops it when the step repeated (``token_width`` values a row); None
+        when a row has no limits for the walk, and the worker's ``check_stop``
+        decides.
 
         Each loop's count is this runtime's as of the step: counts move when
         the step is routed, which comes after. ``tokens`` is the step's token
@@ -1091,6 +1175,41 @@ class GraphRuntime(PhasedPostprocess, ABC):
         pass
 
     # --------- Scheduling ----------
+    @abstractmethod
+    def execution_units(self, graph_walk: str) -> tuple[ExecutionUnit, ...]:
+        """Immutable local connected sections; no readiness mutation."""
+        pass
+
+    @abstractmethod
+    def claim_execution_unit(
+        self, head: str, graph_walk: str, rids: list[int], member_walks: tuple[str, ...] | None = None,
+    ) -> tuple[int, tuple[PopRidsOutput, ...]] | None:
+        """Claim one common row set before execution, all or none.
+
+        The head may already have been popped by the scheduler. Returned
+        inputs are the members' existing external inputs; the unit's edges
+        supply internal inputs from leased device buffers. Finished partition
+        rows are identified explicitly so a draining consumer needs no producer plan.
+        """
+        pass
+
+    @abstractmethod
+    def submit_execution_unit(self, claim_id: int) -> bool:
+        """Record irreversible submission; later failures cannot retry it."""
+        pass
+
+    @abstractmethod
+    def cancel_execution_unit(self, claim_id: int) -> bool:
+        """Undo a prelaunch claim exactly once, returning its head to ready."""
+        pass
+
+    @abstractmethod
+    def release_execution_unit_member(
+        self, claim_id: int, node_name: str, worker_graph_id: int, rids: list[int],
+    ) -> bool:
+        """Release a submitted member that did no work, without completing it."""
+        raise NotImplementedError
+
     @abstractmethod
     def pop_rids(
         self, node_name: str,
@@ -1346,6 +1465,15 @@ class GraphRuntime(PhasedPostprocess, ABC):
         """``(counts, caps)``: row i's ``loop_names[i]`` (as ``set_loop_caps``),
         its count so far and the count it ends at; -1 for both for a row this
         worker does not hold."""
+        pass
+
+    @abstractmethod
+    def loop_room(
+        self, node_name: str, graph_walk: str, loop_name: str, rids: list[int], stride: int, past_cap: bool = False,
+    ) -> int:
+        """How many more iterations of ``loop_name`` every row of ``rids`` can
+        take after the ``stride`` each has in flight (``past_cap``: its longest
+        row can); 0 if a row isn't here."""
         pass
 
     @abstractmethod

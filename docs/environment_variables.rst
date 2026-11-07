@@ -654,11 +654,13 @@ Worker scheduling
        objects between collections. Read by ``knobs.gc_gen0_threshold``.
    * - ``MSTAR_RESIDENT_PLANNING``
      - config's ``knobs: resident_planning``, else ``auto``
-     - ``auto`` runs a node's captured decode steps off per-request tables on
-       the device where the submodule names resident walks
-       (``NodeSubmodule.resident_walks``) and every resource of the node can
-       (``Resource.resident_refusal``); the worker log says why a node that
-       names walks stays on the host. ``off`` plans every step on the host. The
+     - ``on`` runs a node's captured steps off per-request tables on the
+       device for each walk that runs the node in a Loop, where its capture,
+       its declared step, its ``preprocess`` and every resource of the node
+       (``Resource.resident_binding``) agree; the worker logs one line per
+       such walk saying which refused. ``off`` plans every step on the host.
+       ``auto`` is ``on`` for a node whose submodule sets ``resident_by_default``
+       (Qwen3.5's LLM) and ``off`` elsewhere. The
        tables are sized at startup, not by a setting: twice the walk's largest
        capture batch in rows, plus one, since a request that finds no row takes
        the least recently run one's. A row has a cell per page of the KV pool's
@@ -680,16 +682,14 @@ Worker scheduling
    * - ``MSTAR_DEVICE_LOOPBACK``
      - config's ``knobs: device_loopback``, else ``1``
      - Whether a decode node may keep its loop-back token on the device:
-       the sampler writes each request's last token to a slot-addressed
-       master and the next step reads its input ids from it, so the worker
-       routes the signal with no tensor (no per-request store, hold or
-       cleanup per step). Only nodes that declare the read
-       (``DeviceLoopback``: the decode walks of Qwen3.5, Higgs Audio, Qwen3-ASR and
-       Whisper, which also keeps its timestamp rule state in the sampler's
-       declared loop-back state) and only when the sampler has graph
-       buffers; the sampler keeps the masters for those nodes alone, so a
-       node that takes its tokens on the host does not pay the eager-step
-       master write. ``0`` keeps every node on the per-request tensor path.
+       each step writes each request's last token into the node's loop-back
+       rows (``mstar.engine.resources.loopback_rows``), inside its capture, and
+       the next step reads its input ids from them at its head, so the worker routes the signal with no tensor (no
+       per-request store, hold or cleanup per step). Only captured nodes that
+       declare the read (``DeviceLoopback``: the decode walks of Qwen3.5,
+       Higgs Audio, Qwen3-ASR, Qwen3-Omni, Orpheus and Whisper, which also
+       keeps its timestamp rule state there). ``0`` keeps every node on the
+       per-request tensor path.
    * - ``MSTAR_INGRAPH_DECODE_ROPE``
      - config's ``knobs: ingraph_decode_rope``, else ``0``
      - A captured Qwen3.5 text prefill or mixed step builds its rotary tables
@@ -699,26 +699,26 @@ Worker scheduling
        on its own.
    * - ``MSTAR_SAMPLER_INGRAPH_SCATTER``
      - config's ``knobs: sampler_ingraph_scatter``, else ``1``
-     - The captured sampler gathers its RNG offsets from the slot masters
-       and scatters the advanced offsets and the sampled tokens back inside
-       the graph, so a replayed decode step issues none of those launches on
+     - The captured sampler gathers its state from the slot masters
+       and persists RNG offsets, history and token presence inside the graph, so a replayed decode step issues none of those launches on
        the gpu thread afterwards (each one is a GIL release the main thread's
        postprocess wins). Padding rows, and the rows a step drops
-       (``SamplerStep.kept_rids``), write a trash master row. The offset and
-       last-token masters, which the captured graphs index, are allocated
+       (``SamplerStep.kept_rids``), write a trash master row. The state
+       masters, which the captured graphs index, are allocated
        once for ``MSTAR_SAMPLER_SLOTS`` requests, and a request takes its row
        when the runner admits it (``SamplerResource.reserve``): past them it
        waits, as for a recurrent state slot, until a removed request frees
-       one. Only for a node that reads its tokens back on the device
-       (Qwen3.5, Qwen3-ASR, Whisper) with the device loop-back on, on one
-       rank: above one, where admission doesn't decide, the masters grow and
-       the scatter runs after the replay, as with ``0``.
+       one. For every captured sampler, whether or not its node reads its
+       tokens back on the device, on every rank: a TP follower runs its
+       leader's steps, so it admits the same rows in the same order. A step
+       that repeats needs it.
    * - ``MSTAR_SAMPLER_SLOTS``
      - config's ``knobs: sampler_slots``, else ``4096``
      - Request rows of the sampler masters a captured graph indexes when
        ``MSTAR_SAMPLER_INGRAPH_SCATTER`` is on (at least the node's largest
        capture batch): the most requests admitted at once on such a node; the
-       rest wait to be admitted. Read by ``knobs.sampler_slots``.
+       rest wait to be admitted. Presence-capable samplers use four bytes per
+       32 vocabulary tokens per row, plus capture scratch. Read by ``knobs.sampler_slots``.
    * - ``MSTAR_RUST_SEND_TIMING``
      - unset
      - ``1`` makes the Rust runtime print, every 500 calls, how long the

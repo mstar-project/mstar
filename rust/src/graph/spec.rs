@@ -108,6 +108,7 @@ pub struct LoopSpec {
     pub name: Sym,
     pub max_iters: u32,
     pub parent: Option<LoopId>,
+    pub complete: bool,
     /// Entities this loop's registry manages directly. A node inside a child
     /// loop belongs to the child, not here — matching Python's
     /// `GraphStateRegistry._set_managed_entities`, which stops at a Loop.
@@ -139,6 +140,182 @@ pub struct CompiledGraph {
     pub loop_by_name: FxHashMap<Sym, LoopId>,
     pub root_nodes: Vec<NodeId>,
     pub root_loops: Vec<LoopId>,
+}
+
+/// A connected section. Compilation uses graph-local ids; runtime plans
+/// qualify the same members/edges with graph and walk, without a second claim.
+pub struct ExecutionUnit<N = NodeId, L = LoopId> {
+    pub nodes: Vec<N>,
+    /// Inputs supplied by an earlier member, one mask per member.
+    pub internal_inputs: Vec<u64>,
+    /// (producer, consumer, signal), in graph order.
+    pub edges: Vec<(N, N, Sym)>,
+    /// Signals requiring ordinary output storage/routing. An exclusively
+    /// internal edge needs only its readiness notification at landing.
+    pub output_signals: Vec<Vec<Sym>>,
+    pub repeat_loop: Option<L>,
+    pub loop_back: Vec<(N, N, Sym)>,
+    pub streaming_edges: Vec<(N, N, Sym)>,
+}
+
+impl ExecutionUnit {
+    pub fn compile(nodes: &[NodeSpec], loops: &[LoopSpec]) -> FxHashMap<NodeId, Self> {
+        let is_loopback = |source: NodeId, edge: &EdgeSpec| {
+            let mut enclosing = nodes[source as usize].loop_id;
+            while let Some(id) = enclosing {
+                let lp = &loops[id as usize];
+                if lp.loop_back.contains(&(edge.name, edge.dest_sym)) {
+                    return true;
+                }
+                enclosing = lp.parent;
+            }
+            false
+        };
+        let cached_by_loop = |source: NodeId, signal: Sym| {
+            let mut enclosing = nodes[source as usize].loop_id;
+            while let Some(id) = enclosing {
+                let lp = &loops[id as usize];
+                if lp.output_names.contains(&signal) || lp.accum_names.contains(&signal) {
+                    return true;
+                }
+                enclosing = lp.parent;
+            }
+            false
+        };
+        let forward: Vec<Vec<NodeId>> = nodes.iter().enumerate().map(|(source, node)| {
+            let mut targets: Vec<_> = node.outputs.iter().filter_map(|edge| match edge.dest {
+                Dest::Local(next) if !edge.streaming && !is_loopback(source as NodeId, edge)
+                    && node.streaming_mask == 0 && nodes[next as usize].streaming_mask == 0 => Some(next),
+                _ => None,
+            }).collect();
+            targets.sort_unstable();
+            targets.dedup();
+            targets
+        }).collect();
+        let mut units = FxHashMap::default();
+        for head in 0..nodes.len() as NodeId {
+            // An already scheduled head must stay first. Its predecessors
+            // supply ordinary external inputs, while independent branches
+            // feeding its downstream joins can be claimed alongside it.
+            let mut ancestors = vec![false; nodes.len()];
+            loop {
+                let mut changed = false;
+                for (source, targets) in forward.iter().enumerate() {
+                    if !ancestors[source] && targets.iter().any(|&dest| dest == head || ancestors[dest as usize]) {
+                        ancestors[source] = true;
+                        changed = true;
+                    }
+                }
+                if !changed { break; }
+            }
+            if ancestors[head as usize] || nodes[head as usize].streaming_mask != 0 {
+                continue;
+            }
+            let mut included = vec![false; nodes.len()];
+            included[head as usize] = true;
+            loop {
+                let mut changed = false;
+                for (source, targets) in forward.iter().enumerate() {
+                    if ancestors[source] { continue; }
+                    for &dest in targets {
+                        if ancestors[dest as usize] { continue; }
+                        if included[source] != included[dest as usize] {
+                            included[source] = true;
+                            included[dest as usize] = true;
+                            changed = true;
+                        }
+                    }
+                }
+                if !changed { break; }
+            }
+            let count = included.iter().filter(|&&yes| yes).count();
+            if count < 2 {
+                continue;
+            }
+            let mut members = vec![head];
+            while members.len() < count {
+                let next = (0..nodes.len() as NodeId).find(|&node| {
+                    included[node as usize] && !members.contains(&node)
+                        && forward.iter().enumerate().all(|(source, targets)| {
+                            !included[source] || !targets.contains(&node) || members.contains(&(source as NodeId))
+                        })
+                });
+                let Some(next) = next else { break };
+                members.push(next);
+            }
+            if members.len() != count {
+                continue;
+            }
+            let mut internal_inputs = vec![0; members.len()];
+            let mut edges = Vec::new();
+            let mut output_signals = Vec::new();
+            for &source in &members {
+                let mut stored = Vec::new();
+                for edge in &nodes[source as usize].outputs {
+                    let internal = match edge.dest {
+                        Dest::Local(dest) if !edge.streaming && !is_loopback(source, edge) => {
+                            members.iter().position(|&n| n == dest)
+                        },
+                        _ => None,
+                    };
+                    if let Some(i) = internal {
+                        internal_inputs[i] |= 1 << edge.dest_slot;
+                        let binding = (source, members[i], edge.name);
+                        if !edges.contains(&binding) {
+                            edges.push(binding);
+                        }
+                    }
+                    if internal.is_none() || edge.persist || edge.new_token || cached_by_loop(source, edge.name) {
+                        stored.push(edge.name);
+                    }
+                }
+                stored.sort_unstable();
+                stored.dedup();
+                output_signals.push(stored);
+            }
+            let repeat_loop = nodes[head as usize].loop_id.filter(|&id| {
+                let lp = &loops[id as usize];
+                lp.complete && lp.child_loops.is_empty()
+                    && lp.member_nodes.len() == members.len()
+                    && lp.member_nodes.iter().all(|node| members.contains(node))
+                    && members.iter().all(|&source| {
+                        let node = &nodes[source as usize];
+                        let mut ancestor = lp.parent;
+                        while let Some(parent) = ancestor {
+                            if loops[parent as usize].loop_back.iter().any(|&(signal, dest)| {
+                                dest == node.name && node.inputs.contains(&signal)
+                            }) { return false; }
+                            ancestor = loops[parent as usize].parent;
+                        }
+                        node.outputs.iter().all(|edge| match edge.dest {
+                            Dest::Local(dest) => !edge.streaming && members.contains(&dest),
+                            Dest::External(_) => false,
+                            Dest::Empty | Dest::EmitToClient => !edge.streaming,
+                        })
+                    })
+                    && lp.loop_back.iter().all(|&(signal, dest)| members.iter().any(|&source| {
+                        nodes[source as usize].outputs.iter().any(|edge| {
+                            edge.name == signal && edge.dest_sym == dest
+                                && matches!(edge.dest, Dest::Local(target) if members.contains(&target))
+                        })
+                    }))
+            });
+            let mut loop_back = Vec::new();
+            if let Some(id) = repeat_loop {
+                for &source in &members {
+                    for edge in &nodes[source as usize].outputs {
+                        if loops[id as usize].loop_back.contains(&(edge.name, edge.dest_sym)) {
+                            if let Dest::Local(dest) = edge.dest {
+                                loop_back.push((source, dest, edge.name));
+                            }
+                        }
+                    }
+                }
+            }
+            units.insert(head, Self { nodes: members, internal_inputs, edges, output_signals, repeat_loop, loop_back, streaming_edges: vec![] });
+        }
+        units
+    }
 }
 
 impl CompiledGraph {

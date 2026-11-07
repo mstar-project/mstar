@@ -65,7 +65,10 @@ def _follower(head: ScheduleTPNode) -> Worker:
             node_name=NODE, graph_walk=MIXED, request_to_worker_graph=dict(rid_to_wg),
             request_walks=kwargs["request_walks"] or {}, chunk_ranges=kwargs["chunk_ranges"],
         )
-        return SimpleNamespace(continuing_rids=set(continuing), node_batch=SimpleNamespace(), scheduled_batch=batch)
+        return SimpleNamespace(
+            continuing_rids=set(continuing),
+            node_batch=SimpleNamespace(step_context=SimpleNamespace(repeats=8)), scheduled_batch=batch,
+        )
 
     worker._spec_builder = SimpleNamespace(assemble=assemble)
     return worker
@@ -87,19 +90,23 @@ def _batch_n() -> ScheduledBatch:
     )
 
 
-def test_a_follower_runs_a_row_mid_prefill_as_the_leader_does():
+@pytest.mark.parametrize("repeats", [1, 3])
+def test_a_follower_runs_a_row_mid_prefill_as_the_leader_does(repeats):
     """The leader's head for N+1 holds both rows. p0 loops back on nothing of
     N's, so it is not prepped: an all-or-none prep would wait on a loop-back
     input N never produced."""
     head = ScheduleTPNode(
         node_name=NODE, graph_walk=MIXED, request_ids=["d0", "p0"],
-        speculative=True, spec_seq=6, spec_from_seq=5, walks=["decode", "prefill_text"], walk_idx=[0, 1],
+        speculative=True, spec_seq=6, spec_from_seq=5, repeats=repeats,
+        walks=["decode", "prefill_text"], walk_idx=[0, 1],
         chunk_starts=[-1, 4], chunk_ends=[-1, 8], chunk_totals=[-1, 10], chunk_strides=[-1, 4],
     )
     follower = _follower(head)
 
     speculation = follower._try_follow_speculation(_pending(_batch_n()))
 
+    assert speculation.node_batch.step_context.repeats == repeats
+    assert speculation.node_batch.step_context.tp_repeats == repeats
     assert follower.prepped == [["d0"]]
     assert follower.assembled["continuing"] == ["d0"], "the leader advances no loop for a row mid-prefill"
     assert follower.assembled["inputs"]["p0"] == {}

@@ -31,6 +31,7 @@ pub struct NodeArg {
 pub struct LoopArg {
     #[pyo3(item)] pub name: String,
     #[pyo3(item)] pub max_iters: u32,
+    #[pyo3(item, default)] pub complete: bool,
     #[pyo3(item)] pub parent: Option<String>,
     /// Directly-owned nodes only — a node inside a child loop belongs there.
     #[pyo3(item)] pub member_nodes: Vec<String>,
@@ -130,7 +131,7 @@ pub fn compile_one(
             .filter_map(|(n, d)| local.get(d.as_str()).map(|&id| (it.intern(n), id)))
             .collect();
         loop_specs.push(LoopSpec {
-            name: it.intern(&l.name), max_iters: l.max_iters, parent,
+            name: it.intern(&l.name), max_iters: l.max_iters, parent, complete: l.complete,
             member_nodes, child_loops: Vec::new(),
             output_names: outputs.iter().map(|e| e.name).collect(),
             accum_names: accumulated.iter().map(|e| e.name).collect(),

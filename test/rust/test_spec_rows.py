@@ -86,7 +86,7 @@ class _Scheduler:
     def backlog_splits_from(self, *a):
         return False
 
-    def pick_chain_step(self, state, target, continuing, mid_prefill=(), next_iter_of=None):
+    def pick_chain_step(self, state, target, continuing, mid_prefill=(), next_iter_of=None, continuing_only=False):
         # the chain keeps its rows up to the cap whatever loop it advances; the
         # fresh rows come from the take
         rows = list(continuing)
@@ -159,6 +159,7 @@ def _worker(max_iters: int = 1 << 20, pair: bool = False, mixed: bool = False) -
     w.streams = StreamBufferManager(w.request_state, tm, [])
     # no resource splits a walk here, so a mixed step keeps its rows' order
     w.engine_manager = SimpleNamespace(get_engine=lambda node: SimpleNamespace(
+        iteration_layouts=lambda node: None,
         order_split_rows=lambda node, walk, rids, walks: rids,
     ))
     w._pending_removes = {}

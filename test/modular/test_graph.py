@@ -183,6 +183,13 @@ def test_nested_loops():
 
     def record(node_name, io_manager):
         log.append(node_name)
+        if node_name == "refiner":
+            targets = io_manager.ingest_for_speculation(
+                [GraphEdge(name="latents", next_node="denoiser")], "refiner",
+            )
+            assert [(t.node_name, t.loop_name) for t in targets] == [("denoiser", "refine_loop")]
+            assert targets[0].is_new_loop_iter
+            io_manager.clear_speculative_inputs()
 
     result = run_graph(io, [GraphEdge(name="latents", next_node="denoiser")],
                        on_node_complete=record)

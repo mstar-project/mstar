@@ -21,7 +21,7 @@ branch.
 from __future__ import annotations
 
 import logging
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 import torch
@@ -40,7 +40,14 @@ from mstar.engine.accelerator_graph_config import (
 from mstar.engine.accelerator_graph_runner import PiecewiseAcceleratorGraphRunner
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import AttentionStep, KVStep, Segment, SlotLease, SubmoduleStep
-from mstar.model.submodule_base import ARNodeInputs, ARNodeSubmodule, ModelInputsFromEngine, NodeInputs, NodeSubmodule
+from mstar.model.submodule_base import (
+    ARNodeInputs,
+    ARNodeSubmodule,
+    BatchedModelOutput,
+    ModelInputsFromEngine,
+    NodeInputs,
+    NodeSubmodule,
+)
 from mstar.model.vjepa2.components.ac_predictor import VisionTransformerPredictorAC
 from mstar.model.vjepa2.components.predictor import VJEPA2Predictor
 from mstar.model.vjepa2.components.vit_encoder import VJEPA2Encoder
@@ -466,10 +473,13 @@ class VJepa2RolloutPredictorSubmodule(ARNodeSubmodule):
     ``VJepa2PredictorSubmodule`` — weights are loaded once and shared.  Only
     the preprocess/forward rollout-awareness differs.
 
-    Uses the single-request sequential path (``can_batch=False`` inherited
-    from ``NodeSubmodule``).  Same cross-request batching story as the
-    encoder — enabling it requires an engine fix.
+    A step reads no loop counter (the window math is the same every
+    iteration), so with ``capture_batch_sizes`` it captures a full clip's
+    step and can repeat on the device; the loop's cap is the request's
+    horizon (``VJepa2Model.get_loop_caps``).
     """
+
+    _ROLLOUT_WALKS = ("prefill_video_rollout", "prefill_video_rollout_streaming")
 
     def __init__(
         self,
@@ -478,10 +488,13 @@ class VJepa2RolloutPredictorSubmodule(ARNodeSubmodule):
         num_output_frames: int = 2,
         frames_per_second: int = 4,
         anticipation_seconds: float = 1.0,
+        capture_batch_sizes: Sequence[int] = (),
     ):
         super().__init__()
         self.predictor = predictor
         self.config = config
+        # the batch sizes a full clip's step captures at; none: eager
+        self.capture_batch_sizes = list(capture_batch_sizes)
         # ``num_output_frames`` is rounded up to tubelet_size — below
         # tubelet_size the math (N_pred = grid^2 * (nof // tubelet)) yields
         # zero target tokens, which would make the predictor call degenerate.
@@ -489,15 +502,50 @@ class VJepa2RolloutPredictorSubmodule(ARNodeSubmodule):
         self.frames_per_second = int(frames_per_second)
         self.anticipation_seconds = float(anticipation_seconds)
 
-    # NOTE: this masked predictor does NOT opt into piecewise CUDA graphs
-    # (``get_piecewise_cuda_graph_configs`` returns the base default of {}).
-    # The non-AC predictor attends over n_ctxt + n_pred ≈ 8448 tokens using
-    # plain SDPA (no FlashInfer). At that sequence length the O(N²) attention
-    # dominates completely — Python kernel-launch overhead is negligible
-    # relative to the ~1.7 GB attention matrix per layer, so CUDA graphs give
-    # no meaningful speedup and capture risks OOM on top of the ViT-g weights.
-    # Piecewise graphs are only worth it for the AC predictor
-    # (capture_seq_len=258, FlashInfer per-call overhead worth eliminating).
+    # The predictor attends over n_ctxt + n_pred ≈ 8448 tokens with plain
+    # SDPA, so launch overhead is small beside the attention and a capture
+    # costs a graph's memory on top of the ViT-g weights: capture is opt-in
+    # (``capture_batch_sizes``), for a deployment that repeats the step.
+
+    def _clip_tokens(self, video_shape: Sequence[int]) -> int | None:
+        """The encoder tokens a ``(frames, channels, height, width)`` clip makes."""
+        if len(video_shape) != 4:
+            return None
+        frames, _, height, width = video_shape
+        patch = self.config.patch_size
+        return (frames // self.config.tubelet_size) * (height // patch) * (width // patch)
+
+    def get_accelerator_graph_configs(
+        self, device: torch.device, tp_world_size: int = 1
+    ) -> list[AcceleratorGraphConfig]:
+        del tp_world_size
+        if not self.capture_batch_sizes:
+            return []
+        tokens = self.config.num_patches
+        dtype = next(self.predictor.parameters()).dtype
+        hidden = torch.zeros((1, tokens, self.config.hidden_size), dtype=dtype, device=device)
+        return [BatchedAcceleratorGraphConfig(
+            capture_graph_walk=self._ROLLOUT_WALKS[0],
+            replay_graph_walks=list(self._ROLLOUT_WALKS),
+            single_request_inputs=ARNodeInputs(input_embeds=hidden, input_seq_len=tokens),
+            capture_batch_sizes=self.capture_batch_sizes,
+            caps_eager_batch_size=False,
+            capture_forward_method="forward_batched",
+            additional_key_info=(tokens,),
+        )]
+
+    def cg_key_info(
+        self, graph_walk: str, per_request_info: dict[str, CurrentForwardPassInfo],
+        per_request_input_metadata=None, **kwargs,
+    ) -> tuple[int] | None:
+        """The capture for a batch of full clips, else None (eager)."""
+        del per_request_input_metadata, kwargs
+        if not self.capture_batch_sizes or graph_walk not in self._ROLLOUT_WALKS:
+            return None
+        for info in per_request_info.values():
+            if self._clip_tokens(tuple(info.step_metadata.get("video_shape") or ())) != self.config.num_patches:
+                return None
+        return (self.config.num_patches,)
 
     # ------------------------------------------------------------------
     # Rollout geometry (derived from config + hyperparams; shape-static)
@@ -629,22 +677,7 @@ class VJepa2RolloutPredictorSubmodule(ARNodeSubmodule):
         """
         if encoder_hidden.dim() == 2:
             encoder_hidden = encoder_hidden.unsqueeze(0)
-        request_info = engine_inputs.single_request_info
-
-        iter_idx = request_info.dynamic_loop_iter_counts.get("rollout_loop", 0)
-
-        logger.info(
-            "VJepa2RolloutPredictorSubmodule.forward: iter=%d encoder_hidden=%s",
-            iter_idx,
-            tuple(encoder_hidden.shape),
-        )
         next_encoder_hidden, predicted = self._rollout_step(encoder_hidden)
-
-        logger.info(
-            "VJepa2RolloutPredictorSubmodule.forward: predicted=%s next_encoder_hidden=%s",
-            tuple(predicted.shape),
-            tuple(next_encoder_hidden.shape),
-        )
         return {
             "encoder_hidden": [next_encoder_hidden],
             "predicted_hidden": [predicted],
@@ -657,59 +690,20 @@ class VJepa2RolloutPredictorSubmodule(ARNodeSubmodule):
         engine_inputs: ModelInputsFromEngine,
         encoder_hidden: torch.Tensor,
         **kwargs, # coming from preprocess output
-    )  -> dict[str, NameToTensorList]: # request_id to tensors
-        """Batched rollout step across shape-homogeneous same-iter requests.
-
-        ``can_batch`` guarantees all rids are at the same ``iter_idx`` (else
-        we fall to sequential), so the rollout-step math is a single
-        ``[B, N, D]`` forward.  Per-request early-exit (``check_stop``)
-        still fires independently when each rid's ``rollout_horizon`` is
-        reached — individual rids can drop out while others continue, and
-        the scheduler re-batches remaining rids on the next iter.
-        """
-        request_ids = engine_inputs.request_ids
-        per_request_info = engine_inputs.per_request_info
-
-        if encoder_hidden.size(0) != len(request_ids):
+    ) -> BatchedModelOutput:
+        """One rollout step for a ``[B, N, D]`` batch, as rows: row i is
+        request i's, so a run carries ``encoder_hidden`` into its next replay
+        and keeps a ``predicted_hidden`` column a replay."""
+        if encoder_hidden.size(0) != len(engine_inputs.request_ids):
             raise ValueError(
                 f"encoder_hidden batch dim {encoder_hidden.size(0)} does not "
-                f"match request count {len(request_ids)}."
+                f"match request count {len(engine_inputs.request_ids)}."
             )
-
-        # All rids at same iter (can_batch invariant); read any one for logs.
-        iter_idx = per_request_info[request_ids[0]].dynamic_loop_iter_counts.get("rollout_loop", 0)
-        logger.info(
-            "VJepa2RolloutPredictorSubmodule.forward_batched: iter=%d encoder_hidden=%s rids=%d",
-            iter_idx,
-            tuple(encoder_hidden.shape),
-            len(request_ids),
-        )
-
         next_encoder_hidden, predicted = self._rollout_step(encoder_hidden)
-
-        return {
-            rid: {
-                "encoder_hidden": [next_encoder_hidden[i : i + 1]],
-                "predicted_hidden": [predicted[i : i + 1]],
-            }
-            for i, rid in enumerate(request_ids)
-        }
-
-    def check_stop(
-        self, request_id: str,
-        request_info: CurrentForwardPassInfo,
-        outputs: Mapping[str, list[torch.Tensor]],
-    ) -> set[str]:
-        iter_idx = request_info.dynamic_loop_iter_counts.get("rollout_loop", 0)
-        horizon = int(request_info.step_metadata.get("rollout_horizon", 0) or 0)
-        if horizon > 0 and iter_idx + 1 >= horizon:
-            logger.info(
-                "VJepa2RolloutPredictorSubmodule.forward: horizon H=%d reached at iter=%d; stopping rollout_loop.",
-                horizon,
-                iter_idx,
-            )
-            return {"rollout_loop"}
-        return set()
+        # [B, 1, n_pred, D]: a row is [1, n_pred, D], as the per-request forward emits
+        return BatchedModelOutput(row_outputs={
+            "encoder_hidden": next_encoder_hidden, "predicted_hidden": predicted.unsqueeze(1),
+        })
 
 
 class VJepa2ACPredictorSubmodule(ARNodeSubmodule):
@@ -1272,23 +1266,6 @@ class VJepa2ACRolloutPredictorSubmodule(ARNodeSubmodule):
             }
             for i, rid in enumerate(request_ids)
         }
-
-    def check_stop(
-        self, request_id: str,
-        request_info: CurrentForwardPassInfo,
-        outputs: Mapping[str, list[torch.Tensor]],
-    ) -> set[str]:
-        horizon = int(request_info.step_metadata.get("rollout_horizon", 0) or 0)
-        iter_idx = request_info.dynamic_loop_iter_counts.get("rollout_loop", 0)
-        if horizon > 0 and iter_idx + 1 >= horizon:
-            logger.info(
-                "VJepa2ACRolloutPredictorSubmodule.forward: horizon H=%d reached at iter=%d; stopping rollout_loop.",
-                horizon,
-                iter_idx,
-            )
-            return {"rollout_loop"}
-        return set()
-
 
 # ---------------------------------------------------------------------------
 # MPC submodules (intra-request K-way candidate evaluation)

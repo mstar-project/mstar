@@ -161,3 +161,104 @@ def test_direct_plan_only_takes_host_int32_lengths(monkeypatch):
         wrapper._planner_args = []  # as if the first plan resolved to the direct path
         wrapper.plan(dtype=torch.bfloat16, **{**batch, "kv_lens": kv_lens})
         assert bool(calls) == direct, (kv_lens.dtype, kv_lens.device)
+
+
+@pytest.mark.parametrize("repeats", [8, 32])
+def test_repeat_plan_clamps_to_each_replays_actual_length(repeats):
+    """A final-length plan must not read future tokens, even across page/chunk boundaries."""
+    first = np.array([1, 15, 16, 17, 511, 513, 1023, 2049], dtype=np.int32)
+    final = first + repeats - 1
+    counts = (final + PAGE - 1) // PAGE
+    bases = np.concatenate(([0], np.cumsum(counts)))
+    pages = np.arange(int(bases[-1]), dtype=np.int32)
+    repeated, single = _wrapper(), _wrapper()
+    cache = torch.randn(PAGES, 2, PAGE, KV, HD, dtype=torch.bfloat16, device="cuda")
+    query = torch.randn(BS, QO, HD, dtype=torch.bfloat16, device="cuda")
+    last = torch.from_numpy((final - 1) % PAGE + 1)
+    repeated.plan(
+        dtype=torch.bfloat16, paged_kv_indptr=torch.from_numpy(bases.astype(np.int32)),
+        paged_kv_indices=torch.from_numpy(pages),
+        paged_kv_last_page_len=repeated.first_replay(last, BS, repeats), kv_lens=torch.from_numpy(final),
+    )
+    assert repeated.lengths_move
+    repeated.run(query, cache)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = repeated.run(query, cache)
+    columns, target = repeated.replay_column(repeats)
+    for iteration in range(repeats):
+        current = first + iteration
+        current_counts = (current + PAGE - 1) // PAGE
+        indices = np.concatenate([pages[bases[i]:bases[i] + current_counts[i]] for i in range(BS)])
+        single.plan(
+            dtype=torch.bfloat16,
+            paged_kv_indptr=torch.from_numpy(np.concatenate(([0], np.cumsum(current_counts))).astype(np.int32)),
+            paged_kv_indices=torch.from_numpy(indices),
+            paged_kv_last_page_len=torch.from_numpy((current - 1) % PAGE + 1), kv_lens=torch.from_numpy(current),
+        )
+        target.copy_(columns[:, iteration])
+        graph.replay()
+        expected = single.run(query, cache)
+        torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.parametrize("append", [0, 1])
+def test_resident_decode_captures_follow_replaced_rows_and_page_boundaries(append):
+    width = 32
+    rows = 2 * BS + 1
+    cache = torch.randn((rows - 1) * width + 1, 2, PAGE, KV, HD, dtype=torch.bfloat16, device="cuda")
+    cache[0].zero_()
+    query = torch.randn(BS, QO, HD, dtype=torch.bfloat16, device="cuda")
+    store = torch.zeros(rows, width, dtype=torch.long, device="cuda")
+    slots = torch.zeros(BS, dtype=torch.long, device="cuda")
+    lengths = torch.zeros(BS, dtype=torch.long, device="cuda")
+    graphs, outputs, captured = [], [], []
+    for _ in range(2):
+        wrapper = _wrapper(backend="fa2")
+        captured.append(wrapper)
+        wrapper.plan_resident(width)
+        for _ in range(3):
+            wrapper.gather_resident(store.flatten(), slots, lengths, width, 0, append=append)
+            wrapper.run(query, cache)
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            wrapper.gather_resident(store.flatten(), slots, lengths, width, 0, append=append)
+            output = wrapper.run(query, cache)
+        graphs.append(graph)
+        outputs.append(output)
+    oracle = _wrapper(backend="fa2")
+    desired = np.array([1, 15, 16, 17, 511, 512, 33, 1], dtype=np.int32)
+    page_counts = (desired + PAGE - 1) // PAGE
+    for offset in (0, BS, 0):
+        owners = list(range(offset + 1, offset + BS)) + [0]
+        # Every unused owner cell is poisoned, including old tenants' tails.
+        host = torch.full((rows, width), cache.shape[0] + 99, dtype=torch.long)
+        host[0].zero_()
+        indices = []
+        for i, (row, count) in enumerate(zip(owners, page_counts, strict=True)):
+            empty = append == 0 and i == 0
+            pages = [0] if row == 0 or empty else list(
+                range((row - 1) * width + 1, (row - 1) * width + 1 + int(count)),
+            )
+            if not empty:
+                host[row, :count] = torch.tensor(pages)
+            indices.extend(pages)
+        store.copy_(host)
+        slots.copy_(torch.tensor(owners))
+        stored = desired - append
+        if append == 0:
+            stored[0] = 0
+        lengths.copy_(torch.from_numpy(stored))
+        for graph in graphs:
+            graph.replay()
+        oracle.plan(
+            torch.from_numpy(np.concatenate(([0], np.cumsum(page_counts))).astype(np.int32)),
+            torch.tensor(indices, dtype=torch.int32), torch.from_numpy((desired - 1) % PAGE + 1),
+            kv_lens=torch.from_numpy(desired),
+        )
+        expected = oracle.run(query, cache)
+        for actual in outputs:
+            assert torch.isfinite(actual).all()
+            torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)

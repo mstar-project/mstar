@@ -91,10 +91,10 @@ def test_batched_stop_check_answers_decode_steps_only():
 
 
 def test_stop_check_on_a_routed_token_copies_only_the_token():
-    """A decode step that routes its token as ``text_inputs`` alone, checked
-    per request over lazily copied host outputs: the stop check copies that
-    one output, not every output the step produced."""
-    source = {"eos": {"text_inputs": [torch.tensor([[3]])], "hidden": [torch.ones(2, 4)],
+    """A decode step checked per request over lazily copied host outputs: the
+    stop check copies its token's stop buffer alone, not every output the step
+    produced."""
+    source = {"eos": {"new_token": [torch.tensor([[3]])], "hidden": [torch.ones(2, 4)],
                       "cross_kv": [torch.ones(4)]}}
     copied = []
 
@@ -107,4 +107,4 @@ def test_stop_check_on_a_routed_token_copies_only_the_token():
                            step_metadata={}, rid_handle=0)
     lazy = _LazyHostOutputs(source, copy_names)
     assert _node().check_stop("eos", info, lazy["eos"]) == {"decode_loop"}
-    assert copied == ["text_inputs"]
+    assert copied == ["new_token"]

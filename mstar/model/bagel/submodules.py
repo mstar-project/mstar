@@ -6,8 +6,9 @@
 import functools
 import logging
 import os
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 from dataclasses import replace
+from types import MappingProxyType
 from typing import Any, NamedTuple
 
 import torch
@@ -52,11 +53,13 @@ from mstar.model.submodule_base import (
     ARNodeInputs,
     ARNodeSubmodule,
     BatchedModelOutput,
+    CarryPair,
     InputSeqLenInfo,
     ModelInputsFromEngine,
     NodeInputs,
     NodeSubmodule,
     StackingMethod,
+    StopPolicy,
 )
 from mstar.utils.h2d import to_device_nonblocking
 
@@ -187,6 +190,8 @@ def vit_patches(
 # the shipped configs' concurrency (16), so concurrent sizes don't evict each other.
 # An entry is the size's position ids and indexes, tens of KB at 1024x1024.
 _IMAGE_GEN_SHAPES_CACHED = 64
+# what a denoise capture bakes in from the request's guidance (its default config's)
+_BAKED_GUIDANCE = ("cfg_text_scale", "cfg_img_scale", "cfg_renorm_type", "cfg_renorm_min")
 
 
 def apply_timestep_shift(t: torch.Tensor, shift: float) -> torch.Tensor:
@@ -843,6 +848,31 @@ class VAEEncoderSubmodule(NodeSubmodule):
         packed_latent = self.vae2llm(packed_latent) + packed_timestep_embeds + packed_pos_embed
         return {"img_emb": [packed_latent]}
 
+
+def denoise_key(
+    config: BagelModelConfig, rows: Collection[CurrentForwardPassInfo], tokens: int, combines: bool,
+) -> tuple:
+    """A denoise step's capture bucket: its latent token count, and where the step
+    ``combines`` the branches' velocities, the guidance its capture bakes in. A row
+    with other guidance there, or no capture at its size, lands on no bucket and
+    runs eager."""
+    if not combines:
+        return ("denoise", tokens, None)
+
+    def guidance(info):
+        meta = info.step_metadata if info is not None else {}
+        return tuple(meta.get(name, getattr(config, name)) for name in _BAKED_GUIDANCE)
+    kinds = {guidance(info) for info in rows} or {guidance(None)}
+    return ("denoise", tokens, kinds.pop() if len(kinds) == 1 else None)
+
+
+def latent_tokens(config: BagelModelConfig, info: CurrentForwardPassInfo) -> int:
+    """A denoise request's latent token count, from its output size."""
+    down = config.latent_downsample
+    meta = info.step_metadata
+    return (meta.get("height", 1024) // down) * (meta.get("width", 1024) // down)
+
+
 def _init_latents_and_time_index(
     config: BagelModelConfig,
     device,
@@ -906,6 +936,9 @@ class LLMSubmodule(ARNodeSubmodule):
     The runner drives the declaration (forks, plans, commits); every
     forward call names its label.
     """
+
+    # a denoise step's latents go back in as its input_embeds
+    REPEAT_CARRIES = MappingProxyType({"latents": CarryPair("latents", "input_embeds")})
 
     # Plan label the three CFG branches share when they run as one
     # combined plan; see declare_step.
@@ -1070,10 +1103,64 @@ class LLMSubmodule(ARNodeSubmodule):
                 compile=True,
                 capture_batch_sizes=self.PREFILL_TEXT_CAPTURE_BATCH_SIZES,
             ),
+            *(
+                self._denoise_capture_config(walk, H, W, device)
+                for H, W in self.config.denoise_capture_sizes
+                for walk in self._denoise_walks
+            ),
         ]
 
     def _get_active_labels(self, graph_walk: str, cfg: bool):
         return active_labels(graph_walk, cfg, self.node_name)
+
+    @property
+    def _latent_dtype(self) -> torch.dtype:
+        """The latents' dtype from the second step on (``_forward_image_gen`` casts
+        to the autocast dtype, which the engine settles as the node's dtype)."""
+        return self.vae2llm.weight.dtype
+
+    @property
+    def _denoise_walks(self) -> list[str]:
+        """The denoise walks this node runs a step of: LLM every unsplit walk, and
+        every node its branch of each split walk that has it."""
+        branch = list(NODE_TO_CFG_LABEL).index(self.node_name)
+        return sorted(
+            walk for walk, d in DENOISE_WALKS.items()
+            if (d.branches > branch if d.split else branch == 0)
+        )
+
+    def _denoise_key(self, walk: str, rows: Collection[CurrentForwardPassInfo], tokens: int) -> tuple:
+        """A denoise step's capture bucket (`denoise_key`): guidance is baked in
+        where the step combines the branches itself (an unsplit guided walk)."""
+        d = DENOISE_WALKS[walk]
+        return denoise_key(self.config, rows, tokens, combines=not d.split and d.branches > 1)
+
+    def _denoise_capture_config(self, walk: str, H: int, W: int, device) -> BatchedAcceleratorGraphConfig:
+        """One bucket of ``walk`` at ``H`` x ``W``, batch 1, the config's default guidance:
+        the walk's branches as one forward, or a split walk's one branch."""
+        latents, time_index = _init_latents_and_time_index(self.config, device, seed=0, H=H, W=W)
+        latents = latents.to(self._latent_dtype)
+        shape_inputs = self._image_gen_shape_inputs(H, W, device)
+        tokens = latents.shape[0]
+        frame = self._sentinel_frame(tokens, latents.dtype, device)
+        single = ARNodeInputs(
+            input_seq_len=frame.shape[0], input_embeds=latents,
+            tensor_inputs={
+                "time_index": time_index, "empty_combined_emb": frame,
+                "vae_position_ids": shape_inputs["vae_position_ids"],
+                "text_indexes": shape_inputs["text_indexes"],
+                "vae_token_indexes": shape_inputs["vae_token_indexes"],
+                "text_mask": shape_inputs["text_mask"],
+            },
+            # a guided walk's rows run the guidance branches (requires_cfg)
+            resource_step_info=DENOISE_WALKS[walk].branches > 1,
+        )
+        return BatchedAcceleratorGraphConfig(
+            capture_graph_walk=walk, single_request_inputs=single,
+            additional_key_info=self._denoise_key(walk, (), tokens),
+            compile=False, capture_batch_sizes=[1], caps_eager_batch_size=False,
+            total_tokens_multiplier=1 if DENOISE_WALKS[walk].split else DENOISE_WALKS[walk].branches,
+        )
 
     def cg_key_info(
         self, graph_walk: str,
@@ -1085,7 +1172,10 @@ class LLMSubmodule(ARNodeSubmodule):
         captures. Same fact `declare_step` stamps on the step, read from the
         batch rather than from the prepared inputs because the lease can be
         taken before `prepare_inputs` runs (the speculation path)."""
-        del graph_walk, per_request_input_metadata, kwargs
+        del per_request_input_metadata, kwargs
+        if self.config.denoise_capture_sizes and graph_walk in DENOISE_WALKS:
+            tokens = {latent_tokens(self.config, info) for info in per_request_info.values()}
+            return self._denoise_key(graph_walk, per_request_info.values(), tokens.pop() if len(tokens) == 1 else -1)
         return self._batch_get_requires_cfg(per_request_info)
 
     def prepare_inputs(
@@ -1138,19 +1228,20 @@ class LLMSubmodule(ARNodeSubmodule):
                 node_inputs.input_embeds, tensor_inputs["time_index"] = _init_latents_and_time_index(
                     self.config, device, seed=fwd_info.random_seed, H=H, W=W
                 )
+                if self.config.denoise_capture_sizes:
+                    # one dtype for every step, which a capture's static input holds
+                    node_inputs.input_embeds = node_inputs.input_embeds.to(self._latent_dtype)
             else:
-               node_inputs.input_embeds = inputs["latents"][0]
-               tensor_inputs["time_index"] = inputs["time_index"][0]
+                # a captured step hands its latents on as a row, [1, tokens, channels]
+                latents = inputs["latents"][0]
+                node_inputs.input_embeds = latents.reshape(-1, latents.shape[-1])
+                tensor_inputs["time_index"] = inputs["time_index"][0].reshape(-1)
 
             tensor_inputs["empty_combined_emb"] = self._sentinel_frame(
                 node_inputs.input_embeds.shape[0], node_inputs.input_embeds.dtype, device,
             )
-            labels = ["main", "cfg_text", "cfg_img"]
             seq_len = tensor_inputs["empty_combined_emb"].shape[0]
             node_inputs.input_seq_len = seq_len
-            node_inputs.custom_pos_ids = self._get_image_pos_ids(
-                labels, fwd_info.rid_handle, device, seq_len
-            )
             node_inputs.tensor_inputs = {
                 **tensor_inputs,
                 "text_indexes": shape_inputs["text_indexes"],
@@ -1230,6 +1321,13 @@ class LLMSubmodule(ARNodeSubmodule):
         ``prepare_inputs``.
         """
         requires_cfg = requires_cfg_for_inputs(inputs)
+        key = requires_cfg
+        if self.config.denoise_capture_sizes and graph_walk in DENOISE_WALKS:
+            # the bucket `cg_key_info` leased the step under
+            tokens = {inp.input_seq_len - IMAGE_SENTINELS for inp in inputs}
+            key = self._denoise_key(
+                graph_walk, list((per_request_info or {}).values()), tokens.pop() if len(tokens) == 1 else -1,
+            )
         labels = self._get_active_labels(graph_walk, requires_cfg)
         if graph_walk in SINGLE_NODE_DENOISE_WALKS:
             # Only the branches the walk runs: labels are ordered main,
@@ -1245,12 +1343,24 @@ class LLMSubmodule(ARNodeSubmodule):
             for label in labels
             for rid, span in zip(request_ids, spans, strict=True)
         )
-        per_label_pos_ids = {
-            label: [
-                inp.custom_pos_ids[label] for inp in inputs
-                if isinstance(inp.custom_pos_ids, dict) and label in inp.custom_pos_ids
-            ] for label in labels
-        }
+        if graph_walk in DENOISE_WALKS:
+            # Every latent sits at its stream's current position, read here: a
+            # pre-plan declares over the capture's template rows, and the step
+            # that runs takes what it staged.
+            positions = self.node_resources["rope"]
+            per_label_pos_ids = {
+                label: [
+                    torch.full((span,), positions.position(rid, label), dtype=torch.int32)
+                    for rid, span in zip(request_ids, spans, strict=True)
+                ] for label in labels
+            }
+        else:
+            per_label_pos_ids = {
+                label: [
+                    inp.custom_pos_ids[label] for inp in inputs
+                    if isinstance(inp.custom_pos_ids, dict) and label in inp.custom_pos_ids
+                ] for label in labels
+            }
 
         if graph_walk in SINGLE_NODE_DENOISE_WALKS and len(labels) > 1:
             # Batched CFG: one combined plan across the active branch labels
@@ -1259,7 +1369,7 @@ class LLMSubmodule(ARNodeSubmodule):
             pos_ids = [
                 tensor for label in labels for tensor in per_label_pos_ids[label]
             ]
-            return SubmoduleStep(cg_key_info=requires_cfg, steps={
+            return SubmoduleStep(cg_key_info=key, steps={
                 "kv": KVStep(
                     segments=segments,
                     commit=False,
@@ -1375,7 +1485,7 @@ class LLMSubmodule(ARNodeSubmodule):
                 advance=pos_advance,
             ),
         })
-        return SubmoduleStep(cg_key_info=requires_cfg, steps=steps)
+        return SubmoduleStep(cg_key_info=key, steps=steps)
 
     def preprocess(
         self,
@@ -1802,6 +1912,25 @@ class LLMSubmodule(ARNodeSubmodule):
         """
         request_ids = engine_inputs.request_ids
 
+        if graph_walk in SINGLE_NODE_DENOISE_WALKS:
+            # a captured denoise step (one request): the eager step's forward, its
+            # latents and time_index handed on as rows
+            info = next(iter(engine_inputs.per_request_info.values()), None)
+            out = self._forward_image_gen(
+                input_embeds=input_embeds, branches=DENOISE_WALKS[graph_walk].branches,
+                requires_cfg=requires_cfg, sample_token=sample_token,
+                **{**kwargs, **(info.step_metadata if info is not None else {})},
+            )
+            return BatchedModelOutput(row_outputs={name: out[name][0][None] for name in ("latents", "time_index")})
+        if graph_walk in CFG_WALKS:
+            # a captured branch step (one request): its velocity, combine_cfg's input, as a row
+            info = next(iter(engine_inputs.per_request_info.values()), None)
+            out = self._forward_image_gen_single_branch(
+                input_embeds=input_embeds, **{**kwargs, **(info.step_metadata if info is not None else {})},
+            )
+            label = f"v_{self._cfg_label}"
+            return BatchedModelOutput(row_outputs={label: out[label][0][None]})
+
         if graph_walk == "decode":
             out = self._forward_decode_batched(
                 input_ids=input_ids,
@@ -1918,6 +2047,13 @@ class LLMSubmodule(ARNodeSubmodule):
             return
         outputs["text_inputs"] = outputs["new_token"]
 
+    def get_stop_policies(self, graph_walk: str) -> dict[str, StopPolicy] | None:
+        # a denoise step samples no token: its loop ends at its own cap, which
+        # check_stop agrees with (it stops nothing without a new_token)
+        if graph_walk in DENOISE_WALKS:
+            return {}
+        return super().get_stop_policies(graph_walk)
+
     def check_stop(
         self, request_id: str,
         request_info: CurrentForwardPassInfo,
@@ -2023,9 +2159,54 @@ class CombineCFGSubmodule(NodeSubmodule):
     Runs on the same GPU as the main LLM branch (enc_dec engine, no KV cache).
     """
 
-    def __init__(self, config: "BagelModelConfig"):
+    def __init__(self, config: "BagelModelConfig", dtype: torch.dtype | None = None):
         super().__init__()
         self.config = config
+        # the velocities' and latents' dtype from the second step on (the node's),
+        # which a capture's static inputs hold
+        self.dtype = dtype or torch.float32
+
+    def get_accelerator_graph_configs(
+        self, device: torch.device, tp_world_size: int = 1,
+    ) -> list[BatchedAcceleratorGraphConfig]:
+        """A capture of each split walk's step at each of ``denoise_capture_sizes``,
+        batch 1, the config's default guidance baked in."""
+        if not self.config.accelerator_graph:
+            return []
+        return [
+            self._capture_config(walk, H, W, device)
+            for H, W in self.config.denoise_capture_sizes for walk in sorted(CFG_WALKS)
+        ]
+
+    def _capture_config(self, walk: str, H: int, W: int, device) -> BatchedAcceleratorGraphConfig:
+        down = self.config.latent_downsample
+        tokens = (H // down) * (W // down)
+        channels = self.config.vae_config.z_channels * self.config.latent_patch_size ** 2
+        frame = torch.zeros(tokens, channels, dtype=self.dtype, device=device)
+        labels = list(NODE_TO_CFG_LABEL.values())[:CFG_WALKS[walk]]
+        single = NodeInputs(tensor_inputs={
+            **{f"v_{label}": frame.clone() for label in labels},
+            "latents": frame.clone(), "time_index": torch.zeros(tokens, device=device),
+        })
+        return BatchedAcceleratorGraphConfig(
+            capture_graph_walk=walk, single_request_inputs=single,
+            additional_key_info=denoise_key(self.config, (), tokens, combines=True),
+            compile=False, capture_batch_sizes=[1], caps_eager_batch_size=False,
+        )
+
+    def cg_key_info(self, graph_walk: str, per_request_info: dict[str, CurrentForwardPassInfo], **kwargs):
+        """The capture bucket of a denoise step (`denoise_key`): its size and guidance."""
+        del kwargs
+        tokens = {latent_tokens(self.config, info) for info in per_request_info.values()}
+        return denoise_key(self.config, per_request_info.values(), tokens.pop() if len(tokens) == 1 else -1, True)
+
+    def forward_batched(
+        self, graph_walk: str, engine_inputs: ModelInputsFromEngine, **kwargs,
+    ) -> BatchedModelOutput:
+        """A captured step (one request): the eager step, its latents and
+        time_index handed on as rows."""
+        out = self.forward(graph_walk, engine_inputs, **kwargs)
+        return BatchedModelOutput(row_outputs={name: out[name][0][None] for name in ("latents", "time_index")})
 
     def prepare_inputs(
         self,
@@ -2039,9 +2220,11 @@ class CombineCFGSubmodule(NodeSubmodule):
         device = inputs["v_main"][0].device
 
         first_iter = "latents" not in inputs or not inputs["latents"]
-        # the walk's branches: v_cfg_img only on image_gen_cfg3
+        # the walk's branches: v_cfg_img only on image_gen_cfg3; a captured
+        # step hands its velocity, latents and time_index on as rows,
+        # [1, tokens, channels]
         result = {
-            f"v_{label}": inputs[f"v_{label}"][0]
+            f"v_{label}": inputs[f"v_{label}"][0].reshape(-1, inputs[f"v_{label}"][0].shape[-1])
             for label in NODE_TO_CFG_LABEL.values() if inputs.get(f"v_{label}")
         }
         if first_iter:
@@ -2050,10 +2233,14 @@ class CombineCFGSubmodule(NodeSubmodule):
             result["latents"], result["time_index"] = _init_latents_and_time_index(
                 self.config, device=device, seed=fwd_info.random_seed, H=H, W=W
             )
+            if self.config.denoise_capture_sizes:
+                # one dtype for every step, which a capture's static input holds
+                result["latents"] = result["latents"].to(self.dtype)
         else:
+            latents = inputs["latents"][0]
             result = {
-                "latents": inputs["latents"][0],
-                "time_index": inputs["time_index"][0],
+                "latents": latents.reshape(-1, latents.shape[-1]),
+                "time_index": inputs["time_index"][0].reshape(-1),
                 **result,
             }
         return NodeInputs(tensor_inputs=result, kwargs=dict(fwd_info.step_metadata))

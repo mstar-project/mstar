@@ -1,20 +1,22 @@
-"""Lanes: the steps of nodes placed off a worker's main chain, each lane on a
+"""Lanes: the steps of walks placed off a worker's main chain, each lane on a
 stream of its own.
 
 A worker's GPU runs any number of lanes. Lane 0 is the chain (``CHAIN_LANE``):
 step N on the device, N+1 speculated behind it. A step on the chain costs a
 pass of the loop and holds the next step behind its kernels on the main stream,
-which is what a codec window does to the decode steps around it. A node whose
-node group in the serving config sets ``lane: <id>`` runs every walk of its on
-that lane instead: the scheduler hands the lane only its nodes' keys
+which is what a codec window does to the decode steps around it. A node group
+in the serving config that sets ``lane: <id>`` runs its walks (its
+``graph_walks``, else every walk of its nodes) on that lane instead: the
+scheduler hands the lane only those keys
 (``MicroScheduler.lane_of``), its steps run on the GPU thread between two chain
-steps, and they land on the lane's stream while the chain carries on. Submit,
+steps, or beside a run on the device (``Worker._await_run``), and they land on
+the lane's stream while the chain carries on. Submit,
 the refused-step tail and postprocess are the chain's own
 (``Worker._submit_step``, ``Worker._settle_step_rows``, ``Worker._finish_step``),
 keyed by lane.
 
 Each lane has one step in flight; steps that come ready meanwhile batch into
-the next one. ``EngineManager.build`` decides which nodes a lane can take and
+the next one. ``EngineManager.build`` decides which walks a lane can take and
 refuses what it can't serve: a step here is admitted and planned inline, never
 speculated, planned ahead or lockstep.
 
@@ -75,14 +77,7 @@ class Lane:
         were routed to it (postprocess waits for the step that made them), and
         ``launch`` collated its inputs on this stream."""
         with self._on_lane():
-            outputs = self._worker._execute_on_gpu_thread(batch, node_batch, plan_future)
-        if outputs.host_rows is not None or outputs.host_spans is not None:
-            # the pinned ring they stage through is reused by the chain's next
-            # steps before this one lands (refused at startup where declared)
-            raise RuntimeError(
-                f"{batch.node_name} {batch.graph_walk!r} returned stop buffers or output spans on lane {self.lane}"
-            )
-        return outputs
+            return self._worker._execute_on_gpu_thread(batch, node_batch, plan_future)
 
     def launch(self, gpu_executor: ThreadPool) -> None:
         """Queue the lane's next step on the GPU thread, if the lane is free."""
@@ -111,8 +106,9 @@ class Lane:
         event = step.node_batch.completion_event
         return event is None or event.query()
 
-    def finish(self, block: bool = False) -> None:
-        """Postprocess the step in flight once it has landed; ``block`` waits.
+    def finish(self, block: bool = False) -> bool:
+        """Postprocess the step in flight once it has landed, and say whether it
+        had; ``block`` waits.
 
         Never before the step has landed: postprocess frees its inputs first,
         and those are main-stream allocations a main-stream step could reuse
@@ -120,7 +116,7 @@ class Lane:
         """
         step = self.pending
         if step is None or not (block or self._landed(step)):
-            return
+            return False
         worker = self._worker
         try:
             outputs = step.future.result()
@@ -134,6 +130,7 @@ class Lane:
         finally:
             self.pending = None
             worker._hold_rows(self.lane, ())
+        return True
 
 
 def finish_first_to_land(busy: Sequence[Lane]) -> None:

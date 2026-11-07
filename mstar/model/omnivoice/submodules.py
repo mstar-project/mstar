@@ -176,6 +176,7 @@ class OmniVoiceBackboneSubmodule(NodeSubmodule):
     its sigma tables.
     """
 
+
     disable_torch_compile = True
     # The fused flashinfer kernels this path runs on (RMSNorm, silu_and_mul,
     # ragged attention) require every tensor in a call to share one dtype --

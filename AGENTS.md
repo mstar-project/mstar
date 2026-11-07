@@ -133,7 +133,7 @@ The same goes for code paths added for performance: A/B them, and delete the one
 Don't assert a speedup without a number. Which tool depends on *where* you think the time goes:
 
 - **Worker-level timing — start here.** `benchmark/worker_phases/` (see its [README](benchmark/worker_phases/README.md)) gives a per-phase wall-clock breakdown of the worker loop. Prefer it over `mstar/profile/`, whose output is per-request and much harder to read. It is also how you answer the first question of any tuning work, **CPU-bound or GPU-bound**:
-  - `event_sync` is the only real GPU wait. Near zero means CPU-bound; a sizeable value means the CPU did wait on the GPU, so there is a GPU-bound component worth profiling at the kernel level. Note that `await_gpu` is *not* that signal — it is waiting on the CPU part of the GPU thread
+  - `event_sync`, plus `worker.await_run` where runs go on the device, is the only real GPU wait. Near zero means CPU-bound; a sizeable value means the CPU did wait on the GPU, so there is a GPU-bound component worth profiling at the kernel level. Note that `await_gpu` is *not* that signal — it is waiting on the CPU part of the GPU thread
   - `check_stop` is a side-stream D2H rather than pure CPU work.
   - A host sync is charged to whichever phase encloses it, not to `event_sync`, so a stray `.tolist()` shows up as an expensive `prepare_inputs` and makes `event_sync` look *smaller*.
   - The README lists which phases are waits rather than work. Never add a wait to a work total.

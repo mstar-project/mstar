@@ -52,7 +52,6 @@ from mstar.engine.resources import (
     CrossAttentionConfig,
     CrossAttentionSpec,
     KVSpec,
-    LoopbackState,
     NodeResourceSpec,
     PagedKVConfig,
     PositionConfig,
@@ -69,7 +68,6 @@ from mstar.model.components.request_kwargs import checked_request_kwargs
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.model.utils import ByteLevelDetokenizer, TextOutput, check_kv_pools_fit, kv_pages
 from mstar.model.whisper.components import alignment
-from mstar.model.whisper.components.timestamps import inactive_state
 from mstar.model.whisper.config import (
     ALIGN_WALK,
     ATTN,
@@ -86,7 +84,6 @@ from mstar.model.whisper.config import (
     PREFILL_PROMPT_WALK,
     PREFILL_WALK,
     SAMPLER,
-    TS_RULES,
     WORDS_MARKER,
     WhisperModelConfig,
 )
@@ -258,10 +255,6 @@ class WhisperModel(Model):
                 vocab_size=self.config.vocab_size,
                 # ASR transcription decodes greedily; no seen-token buffers.
                 enable_repetion_penalty=False,
-                # the decode loop's timestamp rule state, kept by slot
-                loopback_state={TS_RULES: LoopbackState(
-                    width=len(inactive_state()), dtype=torch.long, default=tuple(inactive_state()),
-                )},
             ),
         ]
 
@@ -368,7 +361,7 @@ class WhisperModel(Model):
                     # worker sends the batch's tokens inline, one frame a step,
                     # so a decode step stores no tensor per request (the client
                     # joins the text chunks; the align walk reads the tokens the
-                    # decoder recorded, see its `_token_stops`).
+                    # decoder recorded, see its `record_tokens`).
                     GraphEdge(next_node=DECODER_NODE, name="text_inputs"),
                     GraphEdge(next_node=DECODER_NODE, name="ts_rules"),
                     GraphEdge(next_node=EMIT_TO_CLIENT, name="text_inputs", output_modality="text"),

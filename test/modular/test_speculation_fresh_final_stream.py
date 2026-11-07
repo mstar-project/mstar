@@ -26,6 +26,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 import torch  # noqa: E402
 
 from mstar.conductor.request_info import CurrentForwardPassInfo  # noqa: E402
+from mstar.graph.loop_indices import LoopLayout
 from mstar.graph.runtime.base import (  # noqa: E402
     ColumnarEdgeSpecs,
     SpeculationOutput,
@@ -81,6 +82,7 @@ def _worker(scheduler, runtime):
         ) for rid in (CONTINUING, FRESH)
     }
     worker = SimpleNamespace(
+        _ring_signals={},
         worker_id="w0",
         scheduler=scheduler,
         _graph_runtime=runtime,
@@ -123,6 +125,7 @@ def _runtime():
         output_signals=("prev_text",),
     )
     return SimpleNamespace(
+        loop_layout=lambda walk, name: LoopLayout(name),
         prep_spec_rids=lambda inp: _prep(),
         prep_follow_spec_rids=lambda inp: _prep(),
         get_spec_target=lambda *a: target,
@@ -147,7 +150,7 @@ def _leader_speculation(final: bool):
     )
     scheduler = SimpleNamespace(
         backlog_splits_from=lambda *a: False,
-        pick_chain_step=lambda state, target, continuing, mid_prefill=(), next_iter_of=None: ChainPick(target, StepPick(
+        pick_chain_step=lambda state, target, continuing, *_: ChainPick(target, StepPick(
             taken=[*continuing, FRESH], continuing=list(continuing), room=None,
             held_back=set(), ordered=False,
         ), []),
@@ -160,7 +163,7 @@ def _leader_speculation(final: bool):
 
 def _follower_speculation(final: bool):
     head = SimpleNamespace(
-        speculative=True, spec_from_seq=5, spec_seq=6, node_name=NODE, graph_walk=WALK,
+        speculative=True, spec_from_seq=5, spec_seq=6, node_name=NODE, graph_walk=WALK, repeats=1,
         walks=[], walk_idx=[], request_ids=[CONTINUING, FRESH], read_check=False,
         chunk_starts=[], chunk_ends=[], chunk_totals=[], chunk_strides=[],
     )

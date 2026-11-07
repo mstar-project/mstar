@@ -19,6 +19,7 @@ import pytest
 import torch
 
 from mstar.engine.engine import Engine
+from mstar.engine.resources.step import StepContext
 from mstar.worker import worker as worker_mod
 from mstar.worker.micro_scheduler import CHAIN_LANE, ScheduledBatch
 from mstar.worker.stream_buffers import StreamBufferManager
@@ -198,7 +199,7 @@ def _exec_fake(runner, raise_with):
 def _batch(preplanned) -> SimpleNamespace:
     return SimpleNamespace(
         request_ids=["a"], node_name="dit", running_batched=True,
-        step_context=SimpleNamespace(graph_walk="decode", slot_lease=None),
+        step_context=StepContext(request_ids=["a"], graph_walk="decode", slot=0, capture=False),
         preplanned_rids=preplanned, preplan_event=object(),
         outputs_ready=SimpleNamespace(set=lambda: None),
         release_waiters=lambda: None,
@@ -244,11 +245,12 @@ def test_reset_drops_the_kept_step_of_a_partly_dropped_batch() -> None:
     batch = SimpleNamespace(
         request_ids=["a"], node_name="dit", inputs=[object()], step=object(),
         preplanned_rids=("a", "b"), preplan_event=object(),
-        step_context=SimpleNamespace(slot_lease=None),
+        step_context=SimpleNamespace(slot_lease=None, tp_repeats=3),
     )
     assert fake.preplan_is_stale(batch)
     fake.reset_pre_plan_for_batch(batch)
     assert batch.step is None and batch.preplanned_rids is None and batch.preplan_event is None
+    assert batch.step_context.tp_repeats == 3
     assert cleared == [True]
 
 
@@ -289,6 +291,7 @@ def test_a_pre_plan_records_its_event_even_when_it_raises(monkeypatch) -> None:
     )
     submodule.step_is_input_free = lambda walk: False
     mgmt = SimpleNamespace(submodule=submodule, piecewise_runners={})
+    fake._declare_preplan_step = Engine._declare_preplan_step.__get__(fake)
     with pytest.raises(RuntimeError):
         Engine._pre_plan_for_batch(fake, batch, mgmt, cg_runner, object())
     event = fake._pre_plan_done["dit"]
@@ -345,3 +348,46 @@ def test_an_inline_plan_waits_on_pre_plans_before_the_resident_stage_copies() ->
             ctx, lease, True, SubmoduleStep(steps={}, cg_key_info=None), False,
         )
     assert calls == ["wait", "resident", "runner"]
+
+
+@pytest.mark.parametrize("preplan,forced", [(True, False), (False, True), (False, False)])
+def test_sharing_nodes_rotate_together_including_dependency_only_regions(monkeypatch, preplan, forced):
+    from mstar.engine.accelerator_graph_runner import PiecewiseAcceleratorGraphRunner
+    from mstar.engine.engine import SubmoduleManagement
+    from mstar.utils import knobs
+
+    monkeypatch.setattr(knobs, "pre_plan_enabled", lambda: preplan)
+    monkeypatch.setenv("MSTAR_NUM_SLOTS", "2")
+    def resource(deps=(), buffered=False):
+        return SimpleNamespace(depends_on=lambda: deps, supports_preplan=buffered,
+                               force_double_buffer=forced and buffered)
+    x, y = resource(buffered=True), resource(buffered=True)
+    engine = object.__new__(Engine)
+    engine._resources = {"x": x, "alias": x, "y": y, "dep": resource(("y",)), "z": resource()}
+    declared = {"a": ["x"], "b": ["alias", "y"], "c": ["dep"], "d": ["z"]}
+    engine._plan_peers = engine._plan_peers_of(declared)
+    engine._submodules = {
+        node: SubmoduleManagement(submodule=None, forward=None, forward_batched=None, joint_comm_group=None,
+                                  resources={key: engine._resources[key] for key in keys})
+        for node, keys in declared.items()
+    }
+    engine._share_slot_rotations()
+    a, b, c, d = (engine._submodules[node] for node in "abcd")
+    buffered = preplan or forced
+    assert [a.lease_slot(), c.lease_slot(), b.lease_slot(), a.lease_slot()] == (
+        [0, 1, 0, 1] if buffered else [0, 0, 0, 0]
+    )
+    assert d.lease_slot() == 0 and d.num_slots == 1
+    assert "c" not in engine._plan_peers["a"]  # closure must not widen stream waits
+
+    region = object.__new__(PiecewiseAcceleratorGraphRunner)
+    region._max_slots, region._num_slots = c.num_slots, 1
+    region._resources = engine._resources
+    region._capture_batch_sizes = [1]
+    region._config = SimpleNamespace(get_capture_shapes=lambda _: [SimpleNamespace(bs=1, seq_lens=[1])])
+    region._dummy_rows = SimpleNamespace(handles=lambda *args: [])
+    region._dummy_key = lambda *args: "r"
+    region._region_step = lambda *args: SimpleNamespace(steps={"dep": None})
+    region._size_slots()
+    region.set_slot(1)
+    assert region._current_slot == int(buffered)

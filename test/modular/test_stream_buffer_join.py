@@ -96,3 +96,27 @@ def test_a_joined_group_counts_in_the_producers_units():
     assert buf.has_chunk_ready()
     assert buf._producer_done_and_all_read(), "the stream must be able to close"
     assert buf.pop_chunk().data["data"].shape == (8, 8), "still one item"
+
+
+def test_a_steps_iterations_are_items_not_pieces():
+    """What a step that repeated sends on an edge a Loop's node emits each
+    iteration is an item an iteration, join_dim or not; what a Loop gathers
+    (``accumulated_outputs``) is the pieces of one."""
+    from mstar.graph.base import GraphEdge, GraphNode, Loop
+    from mstar.worker.stream_buffers import StreamBufferManager
+
+    node = GraphNode(name="thinker", input_names=["t"], outputs=[
+        GraphEdge("thinker", "t"), GraphEdge("talker", "states", is_streaming=True),
+        GraphEdge("talker", "prompt", is_streaming=True),
+    ])
+    loop = Loop(section=node, max_iters=8, outputs=[], name="decode_loop",
+                accumulated_outputs=[GraphEdge("talker", "prompt", is_streaming=True)])
+    streams = StreamBufferManager(None, None, [], {"decode": loop})
+    assert not streams.pieces("decode", "states")
+    assert streams.pieces("decode", "prompt") and streams.pieces("prefill", "states")
+
+    buf = _buf(0)
+    buf.pre_read_register_joined(["a", "b"], pieces=False)
+    buf.put("a", torch.ones(2, 8))
+    buf.put("b", torch.ones(3, 8))
+    assert [buf.pop_chunk().data["data"].shape for _ in range(2)] == [(2, 8), (3, 8)]

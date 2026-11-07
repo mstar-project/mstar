@@ -1543,6 +1543,7 @@ def test_run_moves_the_main_gpu_and_plan_threads_to_their_cpus(monkeypatch, intr
     reports its mask from inside its own work; a thread one of them starts
     afterwards for intra-op work keeps the process mask."""
     import mstar.worker.worker as worker_mod
+    from mstar.model.submodule_base import BatchedModelOutput
     from mstar.worker.micro_scheduler import ScheduledBatch
     from mstar.worker.worker import Speculation
 
@@ -1584,7 +1585,7 @@ def test_run_moves_the_main_gpu_and_plan_threads_to_their_cpus(monkeypatch, intr
             plan_future.result()
         if node_batch.launch_started_event is not None:
             node_batch.launch_started_event.set()
-        return {}
+        return BatchedModelOutput()
 
     def preplan(pending, spec):
         # a pool this thread started before moving keeps the process mask; one

@@ -27,3 +27,12 @@ node_groups:
       - rollout_predictor
     ranks:
       - 0
+
+# Opt-in: capture the masked rollout step for a full clip at these batch sizes
+# and let one step stand for up to 4 rollout iterations (docs/serving.rst,
+# step_repeats). Off by default: the capture holds a graph's memory beside
+# the predictor.
+# model_kwargs:
+#   rollout_capture_batch_sizes: [1]
+# step_repeats:
+#   rollout_predictor: {max: 4}

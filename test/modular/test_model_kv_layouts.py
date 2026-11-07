@@ -43,6 +43,7 @@ def _bagel():
         cfg_renorm_type="global", cfg_renorm_min=0.0, vit_config=SimpleNamespace(patch_size=14),
         vit_max_num_patch_per_side=70, latent_downsample=16, max_latent_size=64,
         temperature=0.0, top_k=-1, top_p=1.0, repetition_penalty=1.0, ignore_eos=False, vocab_size=1000,
+        denoise_capture_sizes=(),
     )
     model.tokenizer = _StubTokenizer()
     model.boi_token_id = _StubTokenizer.SPECIALS["<|vision_start|>"]
@@ -169,6 +170,7 @@ class _BagelPool:
         for rid, config in configs.items():
             self.runner.ingest_request(rid, {"kv": config})
         self.llm = _llm()
+        self.llm.node_resources = {"rope": SimpleNamespace(position=lambda rid, label: 0)}
 
     def step(self, walk: str, rows: dict, guided: dict) -> None:
         from mstar.engine.resources import StepContext
@@ -458,7 +460,14 @@ def test_higgs_lays_out_the_prefill_step_it_runs():
 
 
 def _omni_submodule():
-    return SimpleNamespace(config=SimpleNamespace(im_end_token_id=0, talker=SimpleNamespace(codec_eos_token_id=0)))
+    """A Talker with its declared stop, codec_eos 0."""
+    from mstar.model.qwen3_omni.submodules import TalkerSubmodule, talker_token_stop
+
+    talker = TalkerSubmodule.__new__(TalkerSubmodule)
+    torch.nn.Module.__init__(talker)
+    talker.config = SimpleNamespace(im_end_token_id=0, talker=SimpleNamespace(codec_eos_token_id=0))
+    talker.token_stop = talker_token_stop(talker.config)
+    return talker
 
 
 @pytest.mark.parametrize("talker_max_tokens", [2, 3, 64])
@@ -554,18 +563,10 @@ def _vjepa2(predictor_kind: str = "ac", extrinsics: bool = False):
     return model
 
 
-@pytest.mark.parametrize("horizon", [2, 40])
-def test_vjepa2_caps_the_rollout_where_its_stop_check_ends_it(horizon):
-    from mstar.model.vjepa2.submodules import VJepa2ACRolloutPredictorSubmodule
-
-    model = _vjepa2()
-    kwargs = {"rollout_horizon": horizon}
-    step_metadata = model.get_initial_forward_pass_args("p0", ["video"], ["video"], {}, kwargs).step_metadata
-
-    assert model.get_loop_caps(**kwargs)["rollout_loop"] == _stops_after(
-        VJepa2ACRolloutPredictorSubmodule(None, model.config).check_stop, "rollout_loop", "prefill_video_rollout",
-        64, {}, max_tokens=1, step_metadata=step_metadata,
-    ), "the cap and the stop check end the rollout on different iterations"
+@pytest.mark.parametrize(("horizon", "cap"), [(2, 2), (40, 16)])
+def test_vjepa2_caps_the_rollout_at_the_request_horizon(horizon, cap):
+    # the cap is the rollout's only stop: the horizon, clamped to max_iters
+    assert _vjepa2().get_loop_caps(rollout_horizon=horizon)["rollout_loop"] == cap
 
 
 @pytest.mark.parametrize("extrinsics", [False, True])

@@ -301,3 +301,98 @@ def test_an_end_partition_stop_on_a_rows_last_chunk_ends_its_partition():
     assert not w.reported
     assert batch.partition_done_rids == {1}
     assert runtime.loop_names == {}
+
+
+@pytest.mark.parametrize("reason, removed", [("stopped", {1, 2}), ("failed", {1, 2}), ("stopped", {1})])
+@pytest.mark.parametrize("device_run", [False, True])
+def test_a_step_settles_submitted_rows_before_discarding_their_outputs(reason, removed, device_run):
+    from mstar.engine.device_run import RUN_COUNTS, RUN_REPLAYS
+
+    eng = _engine(_Sub())
+    batch = _batch([1, 2], streams=False)
+    batch.step_context.repeats = 4 if device_run else 1
+    runtime = _Runtime(removed if reason == "stopped" else ())
+    w = _worker(eng, runtime)
+    w.scheduler.failed_rids = removed if reason == "failed" else set()
+    w.parallel_nodes = set()
+    # A stopped row was suppressed on device; a row aborted after executing
+    # retains its actual count, despite neither row's outputs being routed.
+    counts = ([2, 3] if reason == "failed" else [0, int(2 not in removed)]) if device_run else [1, 1]
+    ran = max(1, *counts)
+    settled = []
+    order = []
+    w._wait_for_step = lambda pending: order.append("completed")
+    eng.settle_run = lambda node_batch, width, actual: (
+        order.append("settled"), settled.append((tuple(node_batch.request_ids), width, actual)),
+    )
+    w.tensor_manager.cleanup_collectable = lambda *args: order.append("released")
+    from mstar.streaming.stream_buffer import StreamChunkInfo, StreamingEdge, StreamReservation
+
+    # Row 3 was declined in prepare_inputs. Its source snapshot is unspent;
+    # executed rows retain physical counts even when their outputs are removed.
+    batch.stream_windows = {rid: [StreamingEdge("text", NODE, [], StreamChunkInfo(
+        0, 0, 8, False, StreamReservation(0, 4, 4),
+    ))] for rid in (1, 2, 3)}
+    retired = []
+    w.streams.settle_window = lambda rid, edge, count: (order.append("source"), retired.append((rid, count)))
+    if not device_run:
+        batch.step_context.run_counts = dict(zip((1, 2), counts, strict=True))
+    outputs = BatchedModelOutput(
+        per_rid_outputs={rid: {"audio": [torch.ones(1)]} for rid in [1, 2]},
+        row_request_ids=(1, 2),
+        check_stop_buffers=(
+            {RUN_REPLAYS: torch.tensor([ran, ran]), RUN_COUNTS: torch.tensor(counts)} if device_run else None
+        ),
+    )
+    pending = PendingBatch(
+        batch=ScheduledBatch(node_name=NODE, graph_walk=WALK, request_to_worker_graph={1: 0, 2: 0},
+                             repeats=4 if device_run else 1),
+        node_batch=batch, node_name=NODE, partition="p", graph_walk=WALK, future=Future(),
+        speculative_new_iter=reason == "stopped", loop_name=LOOP,
+    )
+    if removed == {1, 2}:
+        w._postprocess_batch(pending, outputs)
+    else:
+        with pytest.raises(_ReachedRoutingError):
+            w._postprocess_batch(pending, outputs)
+    expected = [((1, 2), ran, dict(zip((1, 2), counts, strict=True)))] if device_run else []
+    assert settled == expected, "submitted rows settle once"
+    assert retired == [(1, counts[0]), (2, counts[1]), (3, 0)]
+    assert order[:6 if device_run else 5] == (
+        ["completed"] + (["settled"] if device_run else []) + ["source"] * 3 + ["released"]
+    )
+    assert not batch.stream_windows
+
+
+@pytest.mark.parametrize("per_request", [False, True])
+def test_stream_consumption_keeps_executed_rows_when_the_model_tail_fails(per_request):
+    """A tail exception suppresses output, not already executed stream input;
+    per-request fallback forwards contribute to the same submitted batch facts.
+    """
+    eng = _engine(_Sub(bad={1}, stage="postprocess"))
+    batch = _batch([1, 2], streams=False)
+    batch.stream_windows = {1: [], 2: []}
+    batch.inputs = [SimpleNamespace(input_seq_len=1), SimpleNamespace(input_seq_len=1)]
+    eng._enable_profile = False
+    mgmt = eng._submodules[NODE]
+    mgmt.accelerator_graph_runner = None
+    mgmt.piecewise_runners = {}
+    mgmt.loopback_rows = None
+    mgmt.fp32_precision = None
+    mgmt.submodule.preprocess = lambda *args, **kwargs: {}
+    eng._forward = lambda *args, **kwargs: {}
+    groups = [[1], [2]] if per_request else [[1, 2]]
+    for rids in groups:
+        ctx = StepContext(request_ids=tuple(rids), graph_walk=WALK, slot=0, capture=False)
+        eng._drive_step(batch, mgmt, rids, [batch.inputs[rid - 1] for rid in rids], {},
+                        ctx, None, not per_request, None, False)
+    assert dict(batch.step_context.run_counts) == {1: 1, 2: 1}
+    # Simulate an output tail failure, then the worker's normal suppression.
+    outputs = BatchedModelOutput(per_rid_outputs={1: {}, 2: {}})
+    batch.failed_requests[1] = "tail failed"
+    w = _worker(eng, _Runtime())
+    pending = SimpleNamespace(batch=ScheduledBatch(node_name=NODE, graph_walk=WALK,
+                              request_to_worker_graph={1: 0, 2: 0}), node_batch=batch)
+    w._drop_failed_rids(pending, outputs, {1})
+    assert batch.request_ids == [2] and outputs.get(1) is None
+    assert dict(batch.step_context.run_counts) == {1: 1, 2: 1}

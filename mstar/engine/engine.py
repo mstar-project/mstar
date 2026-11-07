@@ -1,6 +1,8 @@
 
 
+import dataclasses
 import logging
+import math
 import os
 import threading
 import time
@@ -10,7 +12,7 @@ from functools import partial
 from itertools import repeat
 from pathlib import Path
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, Callable, Collection, Iterator, Mapping, NamedTuple
+from typing import TYPE_CHECKING, Any, Callable, Collection, Iterator, Mapping, NamedTuple, Sequence
 
 import torch
 
@@ -21,11 +23,23 @@ from mstar.engine.accelerator_graph_runner import (
     AcceleratorGraphRunner,
     CapturePlan,
     PiecewiseAcceleratorGraphRunner,
+    RunPart,
     autocast_scope,
     fail_if_graphs_required,
+    output_named,
     plan_captures,
 )
 from mstar.engine.chunking import DEFAULT_MIN_CHUNK_TOKENS, ChunkingManagement, ChunkRange
+from mstar.engine.connected_inputs import ConnectedInputs, active_guard
+from mstar.engine.device_run import (
+    RUN_COUNTS,
+    RUN_DESCRIPTORS,
+    RUN_REPLAYS,
+    IterationWindow,
+    RunAsk,
+    TokenStream,
+    run_item,
+)
 from mstar.engine.fp32_precision import Fp32Precision, cudnn_benchmark, fp32_precision_scope, node_fp32_precision
 from mstar.engine.node_dtype import resolve_node_dtype
 from mstar.engine.resources import (
@@ -40,12 +54,25 @@ from mstar.engine.resources import (
     StepRunner,
     SubmoduleStep,
 )
-from mstar.engine.resources.base import EngineResourceInfo, KeyedWalks, build_resource
+from mstar.engine.resources.base import EngineResourceInfo, KeyedWalks, build_resource, reachable_resources
+from mstar.engine.resources.iteration_tables import STREAM_COUNTS, STREAM_TRANSITION, IterationTablesSpec, tables_key
 from mstar.engine.resources.kv.config import instance_size, opening_prefix_caches, unrestorable
 from mstar.engine.resources.kv.keys import fingerprint
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
+from mstar.engine.resources.loopback_rows import LoopbackRows, LoopbackRowsSpec, rows_key
 from mstar.engine.resources.lora.config import LoraBaseOnly, node_capture_key
-from mstar.engine.resources.resident import ResidentPlanner, build_planner
+from mstar.engine.resources.resident import (
+    LOOP_COUNTER,
+    NOT_ASKED,
+    ResidentPlanner,
+    build_planner,
+    declared_streams,
+    resident_asked,
+    step_refusal,
+    watch_table_reads,
+    watched_counts,
+)
+from mstar.engine.resources.run_rows import RunRow, RunRowsSpec, run_rows_key
 from mstar.engine.resources.spec import resolve_spec_dependencies
 from mstar.engine.resources.step import (
     ADMIT_OK,
@@ -53,32 +80,34 @@ from mstar.engine.resources.step import (
     AdmitOutcome,
     PerReqSetting,
 )
-from mstar.graph.runtime.base import GraphRuntime
+from mstar.graph.loop_indices import LoopLayout
+from mstar.graph.runtime.base import ExecutionUnit, GraphRuntime
 from mstar.model.base import keyed_labels
 from mstar.model.submodule_base import (
     EMPTY_INPUT_METADATA,
     ARNodeInputs,
-    ARNodeSubmodule,
     BatchedModelOutput,
-    BatchedStopCheck,
+    CarryPair,
     ChunkingPolicy,
     HostRows,
     InputMetadata,
     InputSeqLenInfo,
+    IterationStream,
     LazyRequestStates,
     ModelInputsFromEngine,
     NodeInputs,
     NodeSubmodule,
     StepOrder,
-    StopCheck,
     StopPolicy,
     engine_step,
+    iteration_columns,
 )
 from mstar.platforms.compile import with_inductor_overrides
 from mstar.profile.worker import ExecTimings
 from mstar.utils import knobs
 from mstar.utils.client_errors import client_error_text
 from mstar.utils.device import DeviceCapability
+from mstar.utils.h2d import to_device_nonblocking
 from mstar.utils.ipc_format import OffloadDelta, ScheduleTPNode
 from mstar.utils.profiler import (
     PhaseLaps,
@@ -94,6 +123,7 @@ if TYPE_CHECKING:
     from mstar.engine.resources.kv.manager import KVManager
     from mstar.engine.resources.lora.pool import LoraAdapterPool
     from mstar.model.base import Model
+    from mstar.worker.micro_scheduler import ScheduledBatch
 
 logger = logging.getLogger(__name__)
 
@@ -142,6 +172,28 @@ def _outside_steps(submodule_mgmt) -> Iterator[None]:
         yield
 
 
+def _last_iteration_loops_back(outputs: dict, columns: Collection[str], loop_back: Collection[str]) -> None:
+    """A step that repeated keeps each of ``columns`` a column an iteration; a
+    loop-back signal its node named after one hands on that column's last
+    iteration, the one the next step continues from (a short device run's
+    columns repeat its last, ``DeviceRun.results``)."""
+    kept = {id(t) for name in columns for t in outputs.get(name, ())}
+    for signal in loop_back:
+        values = outputs.get(signal)
+        if values and all(id(t) in kept for t in values):
+            # a one-element iteration as a view of the row: no kernel a row a step
+            outputs[signal] = [t.reshape(-1)[-1:] if t.dim() == 2 else run_item(t, -1) for t in values]
+
+
+def node_lanes_of(walk_lanes: Mapping[tuple[str, str], int]) -> dict[str, int]:
+    """node -> the one lane off the chain every walk of it in ``walk_lanes``
+    runs on; a node with any walk on the chain, or on two lanes, is left out."""
+    lanes: dict[str, set[int]] = {}
+    for (node, _), lane in walk_lanes.items():
+        lanes.setdefault(node, set()).add(lane)
+    return {node: next(iter(held)) for node, held in lanes.items() if len(held) == 1 and 0 not in held}
+
+
 def checkpoint_identity(path: str | Path) -> bytes:
     """Name the weights a cached page was produced under, without reading them.
 
@@ -176,6 +228,29 @@ class _MeasuredRow(NamedTuple):
     custom_pos_ids: None = None
 
 
+class SlotRotation:
+    """One rotation for a local component of shared resource buffers.
+
+    Plan and GPU threads lease under one lock. The plan thread waits for
+    commit_done before reusing the next slot; the cursor itself is not a fence.
+    """
+
+    def __init__(self, resources: Collection[Resource]):
+        self.next_slot = 0
+        self.lock = threading.Lock()
+        self.needs_fence = any(res.force_double_buffer for res in resources)
+        buffered = self.needs_fence or (
+            knobs.pre_plan_enabled() and any(res.supports_preplan for res in resources)
+        )
+        self.count = max(2, int(os.environ.get("MSTAR_NUM_SLOTS", "2"))) if buffered else 1
+
+    def lease(self) -> int:
+        with self.lock:
+            slot = self.next_slot
+            self.next_slot = (slot + 1) % self.count
+            return slot
+
+
 @dataclass
 class SubmoduleManagement:
     submodule: NodeSubmodule
@@ -193,17 +268,33 @@ class SubmoduleManagement:
     fp32_precision: Fp32Precision | None = None
     # the node's request slots and device tables, where it runs on them
     resident: ResidentPlanner | None = None
+    # walk -> why it stays host-planned, for each walk that loops the node and isn't resident
+    resident_refusals: dict[str, str] = field(default_factory=dict)
+    # walk -> the row outputs a step that repeats keeps a column of per replay
+    run_columns: dict[str, frozenset[str]] = field(default_factory=dict)
+    # walk -> how a step that repeats carries each loop-back signal between replays
+    carries: dict[str, dict[str, CarryPair]] = field(default_factory=dict)
+    # walk -> why its preprocess can't be skipped between replays (checked at load)
+    carry_refusals: dict[str, str] = field(default_factory=dict)
+    # walk -> the step its widest capture declares, for each walk that may repeat
+    template_steps: dict[str, SubmoduleStep | None] = field(default_factory=dict)
+    # the node's loop-back values kept on the device by request, where it keeps any
+    loopback_rows: LoopbackRows | None = None
+    # walk -> loop-back signal -> its pair, kept in those rows beside a
+    # ``DeviceLoopback``'s, for each walk whose config asks
+    row_signals: dict[str, dict[str, CarryPair]] = field(default_factory=dict)
+    # walk -> the token stop that ends its WHILE runs, where asked
+    # None denotes an iteration-input Loop bounded solely by its graph cap.
+    device_stops: dict[str, StopPolicy | None] = field(default_factory=dict)
+    # walk -> a run's share of its rows done that ends it, where asked
+    refills: dict[str, float | None] = field(default_factory=dict)
+    # walk -> the stop buffer whose tokens go to the client as they land, and a run's limit
+    device_stream_tokens: dict[str, tuple[str, int]] = field(default_factory=dict)
+    # streamed signal -> the walks whose steps put it in the node's ring (``step_repeats: stream_queue``)
+    rings: dict[str, frozenset[str]] = field(default_factory=dict)
 
-    # Rotated globally, not per runner: slot-keyed buffers are shared across
-    # buckets and regions, so per-runner counters let consecutive steps collide
-    # on a slot. Leased from the plan thread and the GPU thread both, hence the
-    # lock.
-    _next_slot: int = field(init=False, default=0)
-    _num_slots: int = field(init=False, default=1)
-    _forced_double_buffer: bool = field(init=False, default=False)
-    _slot_lock: threading.Lock = field(
-        init=False, default_factory=threading.Lock, repr=False
-    )
+    # Shared by local nodes whose resource buffers can alias.
+    slot_rotation: SlotRotation = field(init=False)
 
     # label -> PiecewiseCudaGraphRunner for inner-loop capture; spread into
     # ModelInputsFromEngine so the submodule's forward can look them up
@@ -214,60 +305,22 @@ class SubmoduleManagement:
     lora_pools: tuple = ()
 
     def __post_init__(self):
-        # Two hazards want a second slot, both of them the host running ahead of
-        # the GPU: pre-plan needs plan(N+1) to write buffers replay(N) isn't
-        # reading, and ``force_double_buffer`` is the same for a resource
-        # staging into a reused host buffer. The latter is not pre-plan
-        # specific — the main runner has it too (see `Resource`).
-        # TODO: submodule-wide, so a capture touching neither kind still pays
-        # double the buffers. Each runner could size its own count from the
-        # resources its captures touch, as PiecewiseCudaGraphRunner does.
-        preplan_enabled = knobs.pre_plan_enabled()
-        self._forced_double_buffer = any(
-            res.force_double_buffer for res in self.resources.values()
-        )
-        double_buffered = self._forced_double_buffer or (
-            preplan_enabled
-            and any(res.supports_preplan for res in self.resources.values())
-        )
-        if not double_buffered:
-            self._num_slots = 1
-            return
-        self._num_slots = int(os.environ.get("MSTAR_NUM_SLOTS", "2"))
-        if self._num_slots < 2:
-            # MSTAR_NUM_SLOTS=1 is the knob for turning double-buffering off,
-            # but neither hazard has a single-buffered form: one slot puts the
-            # next step's staging on top of a DMA that may not have retired.
-            # Turn pre-planning off (`knobs: {pre_plan: false}`, or
-            # MSTAR_PRE_PLAN_SPEC=0) to drop to a single slot.
-            logger.warning(
-                "MSTAR_NUM_SLOTS=%d, but a resource on this node needs "
-                "double-buffering; using 2 slots.", self._num_slots,
-            )
-            self._num_slots = 2
+        self.slot_rotation = SlotRotation(self.resources.values())
 
     @property
     def num_slots(self) -> int:
-        return self._num_slots
+        return self.slot_rotation.count
 
     @property
     def needs_slot_fence(self) -> bool:
-        """Whether reusing a slot has to wait out the GPU work that last held
-        it — true exactly when a resource stages into a reused host buffer."""
-        return self._forced_double_buffer
+        return self.slot_rotation.needs_fence
 
     @property
     def next_slot(self) -> int:
-        """The slot the next lease hands out. Read unlocked: an int read is
-        atomic under the GIL, and the only other leaser is the plan thread,
-        which is gated on the previous batch's ``commit_done``."""
-        return self._next_slot
+        return self.slot_rotation.next_slot
 
     def lease_slot(self) -> int:
-        with self._slot_lock:
-            slot = self._next_slot
-            self._next_slot = (self._next_slot + 1) % self._num_slots
-            return slot
+        return self.slot_rotation.lease()
 
     def set_piecewise_slot(self, slot: int) -> None:
         """Point the region runners at this batch's slot, on the GPU thread just
@@ -276,6 +329,62 @@ class SubmoduleManagement:
         so a lease-time write would race the replay reading ``_current_slot``."""
         for runner in self.piecewise_runners.values():
             runner.set_slot(slot)
+
+def _window_tables(
+    specs, inputs: Mapping[str, list] | None, metadata, *, start: int = 0,
+) -> dict[str, IterationStream]:
+    """A row's stream windows: each streamed iteration input's items this
+    step, ``[items, ...]`` (one item is collated as itself)."""
+    if not specs:
+        return {}
+    inputs = inputs or {}
+    chunks = getattr(metadata, "stream_chunks", {}) or {}
+    out = {}
+    for spec in specs:
+        tensors = inputs.get(spec.source)
+        chunk = chunks.get(spec.source)
+        if chunk is not None:
+            if chunk.reservation is not None:
+                transitions = chunk.reservation.transitions[start:]
+                if not transitions:
+                    raise ValueError("retained stream input has no frozen policy transitions")
+                table = tensors[0].reshape(chunk.num_items, -1) if tensors and chunk.num_items else None
+                values = []
+                empty = False
+                for transition in transitions:
+                    part = transition.chunk
+                    if not part.num_items:
+                        empty = True
+                        continue
+                    if empty or table is None:
+                        raise ValueError("retained stream inputs cannot have data after an empty tail")
+                    offset = part.start_offset - chunk.start_offset
+                    value = table[offset:offset + part.num_items]
+                    if value.numel() != math.prod(spec.shape):
+                        raise ValueError(f"stream input {spec.source!r} does not fit its declared iteration shape")
+                    values.append(value.reshape(spec.shape))
+                packed = torch.stack(values) if values else None
+                tail = transitions[0].chunk.tail_offset if transitions else chunk.tail_offset
+                out[spec.source] = IterationStream(packed, tail)
+            else:
+                table = tensors[0].reshape(chunk.num_items, *spec.shape) if tensors and chunk.num_items else None
+                out[spec.source] = IterationStream(table, chunk.tail_offset)
+    return out
+
+
+def _refuse_counter_read(node_name: str, ctx: StepContext, reads: Collection[str], stage: str) -> None:
+    """A step that repeats runs its ``prepare_inputs`` and ``preprocess``
+    once, so a value they derive from the loop counter would hold for every
+    replay; an iteration's value belongs in ``ITERATION_INPUTS``."""
+    if ctx.repeats > 1 and LOOP_COUNTER in reads:
+        if guard := active_guard():
+            guard.refuse(f"{stage} reads a Loop counter that later iterations do not renew")
+        # the step's rows fail, not the worker: a branch only a real row takes can land here
+        raise ValueError(
+            f"{node_name}/{ctx.graph_walk}: a repeating step's {stage} read "
+            f"{LOOP_COUNTER}, which its later replays don't renew; declare the value in ITERATION_INPUTS"
+        )
+
 
 @dataclass
 class ForwardPassInfoWrapper:
@@ -297,7 +406,7 @@ class ForwardPassInfoWrapper:
     # failed lookup plus a Python call per read.
     @property
     def dynamic_loop_iter_counts(self):
-        return self.metadata.dynamic_loop_iter_counts
+        return watched_counts(self.metadata.dynamic_loop_iter_counts)
 
     @property
     def resource_configs(self):
@@ -317,7 +426,7 @@ class ForwardPassInfoWrapper:
 
     def __getattr__(self, name):
         if name == "dynamic_loop_iter_counts":
-            return self.metadata.dynamic_loop_iter_counts
+            return watched_counts(self.metadata.dynamic_loop_iter_counts)
         return getattr(self.info, name)
 
 
@@ -336,6 +445,10 @@ class ExecutingBatch:
 
     # Enables double-buffering for resources with non-blocking H2D
     slot: int | None = None
+    # how its run on the device began (``RunState.started``), for one that went on one
+    run_started: torch.Tensor | None = None
+    # Descriptor readers owned by this ordinary logical step, until collection.
+    run_rows: dict[int, RunRow] = field(default_factory=dict)
 
     # Selects among a walk's capture buckets; matches SubmoduleStep.cg_key_info
     cg_key_info: Any | None = None
@@ -382,6 +495,12 @@ class ExecutingBatch:
     # the one object every row shares, when the step was prepared with the
     # submodule's ``uniform_row_inputs``
     uniform_inputs: NodeInputs | None = None
+    # the step's iteration inputs (``NodeSubmodule.ITERATION_INPUTS``), a
+    # column a replay: ``[rows, repeats, ...]``, staged after ``preprocess``
+    iteration_columns: dict[str, torch.Tensor] | IterationWindow | None = None
+    # rid -> the stream windows its row took (an item a replay), whose items
+    # past the step's settled count go back to their streams
+    stream_windows: dict[int, list] = field(default_factory=dict)
     # rids the submodule declined this step — e.g. a speculatively scheduled
     # flow step for a request already past its own max iters
     skipped_rids: set[int] = field(default_factory=set)
@@ -391,9 +510,6 @@ class ExecutingBatch:
     # rid -> error, for per-rid stages that raised. The rid leaves the batch;
     # the rest of it runs.
     failed_requests: dict[int, str] = field(default_factory=dict)
-    # rid -> outputs the stop check found are not data this step
-    # (``StopCheck.withheld``); the worker does not route them
-    withheld_outputs: dict[int, tuple[str, ...]] = field(default_factory=dict)
     # A lockstep step whose rows' input reads every rank checks before
     # preparing it: the leader's rows in its order (see
     # ``Worker._drop_rows_whose_read_failed``); None for no check
@@ -413,6 +529,14 @@ class ExecutingBatch:
     # device: such a row loops back as it would in a step of its walk alone,
     # while the step's other rows route tensors.
     loopback_rids: frozenset = frozenset()
+    # per row, whether its last step here kept its loop-back values on the device
+    kept_rows: list[bool] | None = None
+    # where a run streaming its tokens leaves them as they land
+    token_stream: TokenStream | None = None
+    # streamed signal -> rid -> the ring position its first item of the step took,
+    # and the positions each took (``Engine._reserve_rings``)
+    ring_bases: dict[str, dict[int, int]] = field(default_factory=dict)
+    ring_width: int = 1
 
     # This step's outputs, published as soon as the forward has been
     # submitted — the tensors exist then, even though their values land later.
@@ -541,10 +665,33 @@ class ExecutingBatch:
             self.set_slot(slot_lease.slot)
 
 
+@dataclass
+class ExecutionGroup:
+    """One graph claim, its ordinary members, and their held launch bindings."""
+    unit: ExecutionUnit
+    claim: int
+    members: tuple[tuple["ScheduledBatch", ExecutingBatch], ...]
+    # Ordinary ready member that triggered this attempt; members stay in graph order.
+    trigger: int = 0
+    submitted: bool = False
+    acknowledged: bool = False
+    # Immutable graph facts captured with the claim, in canonical member order.
+    finished_rids: tuple[frozenset[int], ...] = ()
+    refusal: str | None = None
+    parts: list[RunPart] = field(default_factory=list)
+    initial_copies: list[tuple[torch.Tensor, torch.Tensor]] = field(default_factory=list)
+    capacity: int = 1
+
+
 class Engine:
+    _walk_runs: frozenset[str] = frozenset()
     # node -> its lane, for nodes off the chain, and each such lane's stream;
     # set at construction and load, empty for an engine with no lanes
+    _walk_lanes: Mapping[tuple[str, str], int] = MappingProxyType({})
     _node_lanes: Mapping[str, int] = MappingProxyType({})
+    _stage_lock: "threading.Lock | None" = None
+    # (node, walk) -> the Loop it runs in; set at warmup
+    _loops: Mapping[tuple[str, str], LoopLayout] = MappingProxyType({})
     _lane_streams: Mapping[int, Any] = MappingProxyType({})
 
     @property
@@ -561,15 +708,21 @@ class Engine:
         enable_profile: bool=False,
         gpu_memory_fraction: float | None = None,
         device_capability: DeviceCapability | None = None,
-        node_lanes: Mapping[str, int] | None = None,
+        walk_lanes: Mapping[tuple[str, str], int] | None = None,
     ):
         assert gpu_memory_fraction is None or 0 < gpu_memory_fraction <= 1, (
             f"gpu_memory_fraction is a fraction of the device, got {gpu_memory_fraction}"
         )
         self._device = None
         self._device_capability = device_capability
-        # the lanes off the chain, as ``EngineManager.build`` placed them
-        self._node_lanes = dict(node_lanes or {})
+        # (node, walk) -> its lane, as ``EngineManager.build`` placed them
+        self._walk_lanes = dict(walk_lanes or {})
+        # node -> the one lane off the chain every walk of it runs on; a node
+        # with walks on the chain is the chain's, whatever its other walks
+        self._node_lanes = node_lanes_of(self._walk_lanes)
+        # the plan thread's stage of the chain's next step, against a step off the
+        # chain that plans the same resources on the GPU thread (``_beside_chain``)
+        self._stage_lock = threading.Lock() if any(self._walk_lanes.values()) else None
         self._autocast_dtype = autocast_dtype
         # the share of the device this worker's allocations may hold once
         # capture is done, None for whatever is free
@@ -610,7 +763,11 @@ class Engine:
         transfer_engine_info: TransferEngineInfo,
         kv_cache_type=None,
         model: "Model | None" = None,
+        row_nodes: Collection[str] = (),
+        joining: Mapping[str, int] | None = None,
     ):
+        """``row_nodes``: the nodes whose config asks to keep their loop-back
+        signals in device rows, beside those that declare a ``DeviceLoopback``."""
         self._device = device
         if self._device_capability is None or self._device_capability.device != device:
             self._device_capability = DeviceCapability.of(device)
@@ -622,6 +779,24 @@ class Engine:
         node_to_resources = {}
         # resource -> every node declaring it, on this worker or another
         declared_by: dict[str, frozenset[str]] = {}
+        streamed_consumers = {
+            consumer for walk in self._walk_runs for unit in self._graph_runtime.execution_units(walk)
+            for _, consumer, _ in unit.streaming_edges
+        }
+        specs = [*specs, *self._row_specs(submodules, row_nodes),
+                 *self._iteration_specs(submodules, streamed_consumers)]
+        for node, limit in (joining or {}).items():
+            if node not in submodules:
+                continue
+            if device.type != "cuda" or parallel_groups.get_joint_group_for_node(node).world_size != 1:
+                raise ValueError(f"{node}: join_rows needs one CUDA rank")
+            configs = submodules[node].get_accelerator_graph_configs(device, 1)
+            rows = max((max(c.capture_batch_sizes or AcceleratorGraphRunner.CAPTURE_BATCH_SIZES)
+                        for c in configs), default=0)
+            if not rows:
+                raise ValueError(f"{node}: join_rows needs whole-forward captures")
+            specs.append(RunRowsSpec(resource_key=run_rows_key(node), nodes={node}, rows=rows,
+                                     capacity=rows * (limit + 1), binding_width=2))
         specs_by_key = resolve_spec_dependencies(specs)
         instance = {node: parallel_groups.get_joint_group_for_node(node).world_size for node in node_names}
         checkpoint = model.checkpoint_path() if model is not None else None
@@ -675,7 +850,8 @@ class Engine:
         self._loopback_steps: dict[int, tuple[str, str]] = {}
         # one stream per lane off the chain, made once; everything a lane issues goes on it (``on_lane``)
         self._lane_streams = {
-            lane: self.device_capability.graph_backend.new_stream() for lane in sorted(set(self._node_lanes.values()))
+            lane: self.device_capability.graph_backend.new_stream()
+            for lane in sorted(set(self._walk_lanes.values()) - {0})
         }
         self._runner = StepRunner(
             self._resources,
@@ -714,33 +890,102 @@ class Engine:
             self._submodules[node_name].lora_pools = tuple(
                 resources[key] for key in getattr(submodule, "lora_keys", ())
             )
-            loopback = submodule.device_loopback if isinstance(submodule, ARNodeSubmodule) else None
-            if loopback is not None:
-                # the sampler keeps its slot masters only for a node that
-                # reads them back on the device (see DeviceLoopback)
-                resources[loopback.sampler].enable_device_loopback_reader()
+            if (key := rows_key(node_name)) in resources:
+                self._submodules[node_name].loopback_rows = resources[key]
+                submodule.loopback_rows_key = key
+            if (key := tables_key(node_name)) in resources:
+                submodule.iteration_tables = resources[key]
 
-    def _build_resident_planner(self, node_name: str, runner: AcceleratorGraphRunner) -> None:
-        """Put ``node_name`` on resident tables if it can and the deployment
-        lets it; the startup log says why a node that named walks stays on the
-        host. In `order`, so an owner runs after what it depends on. Built here
-        because the tables are sized by the node's captures, and ahead of them
-        because a capture holds the tables' addresses."""
-        if knobs.resident_planning() == "off":
+        self._share_slot_rotations()
+
+    @staticmethod
+    def _row_specs(submodules: Mapping[str, NodeSubmodule], row_nodes: Collection[str]) -> list[LoopbackRowsSpec]:
+        """The rows of each node that reads its token back on the device
+        (see DeviceLoopback) or whose config asks; a model declares none."""
+        if not knobs.device_loopback_enabled():
+            return []
+        return [
+            LoopbackRowsSpec(resource_key=rows_key(name), nodes={name}) for name, submodule in submodules.items()
+            if name in row_nodes or getattr(submodule, "device_loopback", None) is not None
+        ]
+
+    @staticmethod
+    def _iteration_specs(
+        submodules: Mapping[str, NodeSubmodule], streamed_consumers: Collection[str] = (),
+    ) -> list[IterationTablesSpec]:
+        """Input/policy tables only for nodes whose resolved execution reads them."""
+        return [
+            IterationTablesSpec(resource_key=tables_key(name), nodes={name}) for name, submodule in submodules.items()
+            if getattr(submodule, "ITERATION_INPUTS", None) or name in streamed_consumers
+        ]
+
+    def _build_resident_planner(self, node_name: str, runner: AcceleratorGraphRunner, looped: Collection[str]) -> None:
+        """Put each walk in ``looped`` (those that loop ``node_name``) on
+        resident tables if every owner of a fact it needs agrees, and keep why
+        each other one stays host-planned (`resident_refusal`). After every
+        runner has claimed its capture buffers, which a template's plan reads,
+        and before any capture, which holds the tables' addresses."""
+        if not looped:
             return
         submodule_mgmt = self._submodules[node_name]
-        walks = submodule_mgmt.submodule.resident_walks()
-        if not walks:
+        refusals = submodule_mgmt.resident_refusals
+        if not resident_asked(submodule_mgmt.submodule):
+            refusals.update(dict.fromkeys(looped, NOT_ASKED))
+            return
+        steps = {}
+        for walk in sorted(looped):
+            refusal = runner.resident_refusal(walk)
+            if refusal is None:
+                steps[walk] = runner.template_step(walk)
+                refusal = self._keyed_resident_refusal(submodule_mgmt, runner, walk, steps[walk])
+                if refusal is not None:
+                    del steps[walk]
+            if refusal is not None:
+                refusals[walk] = f"runner: {refusal}"
+
+        def probe(walk: str) -> str | None:
+            # a resident step's tables fill these in its graph, after its preprocess
+            with watch_table_reads() as reads:
+                runner.prepare_template(walk)
+            read = next((r for r in reads if r != LOOP_COUNTER), None)
+            return f"node: its captured preprocess reads {read}, which the graph fills after it" if read else None
+
+        if not steps:
             return
         resources = submodule_mgmt.resources
         submodule_mgmt.resident, refused = build_planner(
-            node_name, walks,
+            node_name, steps,
             {key: resources[key] for key in self._runner.order if key in resources},
-            self._resource_nodes, self._device, runner.max_capture_bs(walks),
+            self._resource_nodes, self._device, runner.max_capture_bs, probe,
         )
-        if submodule_mgmt.resident is None:
-            logger.warning("resident planning stays off on %s: %s", node_name, refused)
+        refusals.update(refused)
         runner.bind_resident(submodule_mgmt.resident)
+
+    def _keyed_resident_refusal(
+        self, mgmt: SubmoduleManagement, runner: AcceleratorGraphRunner, walk: str, widest: SubmoduleStep | None,
+    ) -> str | None:
+        """Why a capture key of ``walk`` other than its widest bucket's can't run
+        resident, or None: each key's captures declare their own step, and every
+        one has to be a resident step over the same streams (a capture that
+        isn't stops the worker when it is made)."""
+        keys = [key for key in self._runner.order if key in mgmt.resources]
+        if widest is None or step_refusal(keys, widest) is not None:
+            return None  # the planner refuses the walk on its widest step itself
+        want = declared_streams(keys, widest)
+        for cg_key, step in runner.keyed_template_steps(walk).items():
+            if (why := step_refusal(keys, step)) is not None:
+                return f"its capture keyed {cg_key!r}: {why}"
+            if declared_streams(keys, step) != want:
+                return f"its capture keyed {cg_key!r} declares other streams than its widest"
+        return None
+
+    def resident_refusal(self, node_name: str, graph_walk: str) -> str | None:
+        """Why steps of ``graph_walk`` on ``node_name`` plan on the host, or
+        None if they run on resident tables. Settled at load."""
+        mgmt = self._submodules[node_name]
+        if mgmt.resident is not None and graph_walk in mgmt.resident.walks:
+            return None
+        return mgmt.resident_refusals.get(graph_walk, "its node isn't in a Loop of it")
 
     def paged_kv_caches(self) -> list[PagedKVCache]:
         """Every paged KV cache this engine built, with the nodes that use it."""
@@ -847,7 +1092,39 @@ class Engine:
         """This node's resolved dtype, or None for one that opted out."""
         return self._submodules[node_name].node_dtype
 
-    def warmup(self) -> None:
+    def warmup(
+        self, looped: Collection[tuple[str, str]] = (),
+        carried: Mapping[tuple[str, str], Collection[str]] = MappingProxyType({}),
+        device_stops: Mapping[tuple[str, str], Any] = MappingProxyType({}),
+        kept_rows: Mapping[tuple[str, str], Collection[str]] = MappingProxyType({}),
+    ) -> None:
+        """Capture every node's graphs. ``looped``: the (node, walk) pairs whose
+        walk runs the node inside a Loop, which may run on resident tables, by
+        the Loop (a mapping) when its iteration inputs read the Loop's counter;
+        ``carried``: the loop-back signals of each such pair whose steps may
+        repeat, whose ``preprocess`` is checked here (``probe_carries``);
+        ``device_stops``: the pairs asked to run on the device, by their
+        node's ``step_repeats`` settings;
+        ``kept_rows``: the loop-back signals of the pairs whose config asks to
+        keep them in device rows."""
+        if self._walk_runs and self._device.type != "cuda":
+            raise ValueError("walk_runs currently requires CUDA graph composition")
+        # the Loop each (node, walk) runs in, whose counter its iteration inputs read
+        self._loops = dict(looped) if isinstance(looped, Mapping) else {}
+        requests = set(carried) | set(device_stops)
+        owners = {}
+        for node_name, walk in sorted(requests):
+            if node_name in self._submodules:
+                for resource in self._submodules[node_name].resources.values():
+                    key = id(resource), walk
+                    config = device_stops.get((node_name, walk))
+                    joining = bool(config is not None and config.join_rows)
+                    owners[key] = resource, walk, joining or (key in owners and owners[key][2])
+        for resource, walk, joining in owners.values():
+            if joining:
+                resource.ask_repeats(walk, join_rows=True)
+            else:
+                resource.ask_repeats(walk)
         # before capture: a region inside a captured graph compiles in its warm-up
         self._compile_regions()
         ag_runners: dict[str, AcceleratorGraphRunner] = {}
@@ -867,11 +1144,22 @@ class Engine:
                 enable_nvtx=self._enable_nvtx,
                 device_capability=self.device_capability,
                 capture_stream=capture_stream,
+                separate_member=bool(self._walk_runs),
             )
-            self._build_resident_planner(node_name, runner)
+            runner._connected_walks = self._walk_runs
             piecewise[node_name] = self._build_piecewise_runners(
                 node_name, submodule_mgmt, capture_stream,
             )
+            self._refuse_regions_beside_chain(node_name, piecewise[node_name])
+
+        for (node_name, walk), signals in kept_rows.items():
+            if node_name in self._submodules:
+                self._ask_rows(node_name, walk, signals, ag_runners.get(node_name))
+        for node_name, submodule_mgmt in self._submodules.items():
+            if submodule_mgmt.loopback_rows is not None:
+                ag_runners[node_name].bind_rows(
+                    submodule_mgmt.loopback_rows, partial(self._row_pairs, submodule_mgmt),
+                )
 
         # Every runner claims its static buffers before any of them captures:
         # nodes share resources, so a build driven by a later node would move
@@ -880,6 +1168,17 @@ class Engine:
             ag_runners[node_name].prepare_for_capture()
             for runner in piecewise[node_name].values():
                 runner.prepare_for_capture()
+        for node_name in self._submodules:
+            self._build_resident_planner(
+                node_name, ag_runners[node_name], {walk for node, walk in looped if node == node_name},
+            )
+        for node_name, walk in sorted(requests):
+            if node_name in self._submodules:
+                self._probe_carries(node_name, ag_runners[node_name], walk, carried.get((node_name, walk), ()))
+        # after the planners bind: dropping rows writes the row their captures read
+        for (node_name, walk), config in device_stops.items():
+            if node_name in self._submodules:
+                self._ask_run(node_name, ag_runners[node_name], walk, config, carried.get((node_name, walk), ()))
 
         # every bucket sized before any is captured, so one plan weighs them all
         # against the largest eager step on the device
@@ -1052,8 +1351,8 @@ class Engine:
         stream too (``StepRunner._on_lane_of``). What only the chain does stays
         on the chain: a prefix cache, state the main thread moves outside the
         step (``Resource.journals_resident_moves``: eviction, prefix leases,
-        page trails), and host rows, which stage through a ring the chain's next
-        steps reuse before a step off it lands.
+        page trails). Host rows stage through a ring of the lane's own
+        (``Worker._stage_host_rows``).
 
         Nothing fences a lane's admit and plan against the main thread, so a
         resource a lane holds must keep them safe against its ingest, readiness
@@ -1092,9 +1391,6 @@ class Engine:
             if type(resource).journals_resident_moves():
                 raise refuse("the main thread moves its state outside the step (eviction, prefix leases or "
                              "page trails)")
-            if type(resource).step_host_rows is not Resource.step_host_rows:
-                raise refuse("its host rows stage through a ring the chain's next steps reuse before a step "
-                             "off it lands")
             (lane,) = holds
             contexts[key] = partial(backend.stream_context, self._lane_streams[lane])
         return contexts
@@ -1270,7 +1566,12 @@ class Engine:
         if self._enable_nvtx:
             range_push(f"engine.prepare_inputs.bs{len(batch.request_ids)}")
         try:
-            self._prepare_inputs(batch)
+            if batch.step_context.repeats > 1:
+                with watch_table_reads() as reads:
+                    self._prepare_inputs(batch)
+                _refuse_counter_read(batch.node_name, batch.step_context, reads, "prepare_inputs")
+            else:
+                self._prepare_inputs(batch)
         finally:
             if self._enable_nvtx:
                 range_pop()
@@ -1296,7 +1597,9 @@ class Engine:
         keyed_walks = (getattr(self, "_keyed_walks", None) or {}).get(
             batch.node_name, (),
         )
-        loopback = self._loopback_rows(batch)
+        loopback = batch.kept_rows = self._loopback_rows(batch)
+        # a kept signal no model hook reads: its row, as if routed
+        kept = mgmt.row_signals.get(walk, {}) if loopback is not None and not mixed else {}
         # a chunked row is cut from its whole input, so no uniform path
         if not mixed and walk not in keyed_walks and not batch.chunk_ranges:
             uniform = submodule.uniform_row_inputs(
@@ -1327,10 +1630,13 @@ class Engine:
                     else:
                         node_inputs.append(req_inputs)
                     continue
+                row_inputs = tensors.get(rid, {})
+                if kept and loopback[i]:
+                    row_inputs = {**row_inputs, **{s: [mgmt.loopback_rows.row(s, rid)] for s in kept}}
                 req_inputs = prepare(
                     graph_walk=row_walk,
                     fwd_info=wrapped[rid],
-                    inputs=tensors.get(rid, {}),
+                    inputs=row_inputs,
                     resources=resources,
                     # the step that ends the last of the node's streams: it must
                     # flush whatever it held back (a vocoder's crossfade tail, the
@@ -1345,6 +1651,9 @@ class Engine:
                     # the submodule reads a mixed step's rows by their own walk
                     req_inputs.graph_walk = row_walk
             except Exception as error:
+                guard = active_guard()
+                if guard is not None and guard.reason is not None:
+                    raise
                 batch.register_failure(rid, error, walk=row_walk)
                 continue
             if req_inputs is None:
@@ -1476,12 +1785,301 @@ class Engine:
     def device_loopback_signals(
         self, node_name: str, graph_walk: str,
     ) -> frozenset[str]:
-        """The node's loop-back signals it keeps on the device this walk, so
-        the worker routes them without a tensor (see the submodule hook)."""
+        """Loop-back signals of this walk whose per-row value the node keeps in
+        its loop-back rows, so the worker routes them with no tensor: the next
+        step reads them there and every fallback batch arrives with the signal
+        empty. ``prepare_inputs`` is told per row (``has_loopback``) whether
+        its last step here kept them; a row without it (e.g. its previous
+        step ran on another rank) brings the tensor. On a walk whose output
+        signals all stay on the device the engine builds no per-request
+        output dicts and does not call ``postprocess``: the stop check, the
+        inline emit and the next step's speculation read the step's rows
+        instead. Only a captured node keeps rows; ``MSTAR_DEVICE_LOOPBACK=0``
+        keeps every node on the tensor path."""
         mgmt = self._submodules.get(node_name)
-        if mgmt is None:
+        if mgmt is None or mgmt.loopback_rows is None or mgmt.accelerator_graph_runner is None:
             return frozenset()
-        return mgmt.submodule.device_loopback_signals(graph_walk)
+        return frozenset(self._row_outputs(mgmt, graph_walk))
+
+    @staticmethod
+    def _row_outputs(mgmt: SubmoduleManagement, graph_walk: str) -> dict[str, str]:
+        """Each signal of ``graph_walk`` the node's rows keep -> its output."""
+        loopback = getattr(mgmt.submodule, "device_loopback", None)
+        out = dict(loopback.outputs()) if loopback is not None and loopback.walk == graph_walk else {}
+        out.update((signal, pair.output) for signal, pair in mgmt.row_signals.get(graph_walk, {}).items())
+        return out
+
+    @staticmethod
+    def _row_pairs(mgmt: SubmoduleManagement, graph_walk: str) -> tuple[dict[str, str], dict[str, str]]:
+        """What a capture of ``graph_walk`` reads at its head (signal -> static
+        input) and writes at its tail (signal -> output). A ``DeviceLoopback``'s
+        token at the tail of every capture: a mixed step's decode rows read it next."""
+        heads: dict[str, str] = {}
+        tails: dict[str, str] = {}
+        loopback = getattr(mgmt.submodule, "device_loopback", None)
+        if loopback is not None:
+            tails.update(loopback.outputs())
+            if loopback.walk == graph_walk:
+                heads[loopback.signal] = loopback.input
+                heads.update((name, name) for name in loopback.states)
+        for signal, pair in mgmt.row_signals.get(graph_walk, {}).items():
+            heads[signal] = pair.input
+            tails[signal] = pair.output
+        return heads, tails
+
+    def _ask_run(
+        self, node_name: str, runner: AcceleratorGraphRunner, graph_walk: str, config, signals: Collection[str],
+    ) -> None:
+        """Before capture: have ``graph_walk``'s captures run on the device,
+        where its stop is declared or its actual Loop cap bounds it, on one rank."""
+        mgmt = self._submodules[node_name]
+        if mgmt.joint_comm_group.world_size > 1:
+            return  # the stop must match on every rank, and NCCL in a WHILE body is untested
+        iteration = bool(getattr(mgmt.submodule, "ITERATION_INPUTS", None))
+        loop = self._loops.get((node_name, graph_walk)) if iteration else None
+        policies = self.get_stop_policies(node_name, graph_walk)
+        if policies is None:
+            return  # a custom host stop cannot be skipped
+        policy = next((p for p in policies.values() if p.reads_token), next(iter(policies.values()), None))
+        connected = any(
+            unit.streaming_edges and (node_name, graph_walk) in zip(unit.nodes, unit.graph_walks, strict=True)
+            for walk in self._walk_runs for unit in self._graph_runtime.execution_units(walk)
+        )
+        if policy is None and (not iteration or loop is None) and not connected:
+            return
+        mgmt.device_stops[graph_walk] = policy
+        mgmt.refills[graph_walk] = config.refill_at
+        if config.join_rows and self._runner.prefix_chain_keys(node_name):
+            runner.refuse_run(graph_walk, "resource: joining rows cannot key a prefix chain")
+            return
+        if iteration:
+            refusal = None
+            if loop is None or (policies and set(policies) != {loop.name}):
+                refusal = "graph: iteration inputs need stops belonging to their actual Loop"
+            elif config.past_cap:
+                refusal = "graph: iteration input windows cannot run past their Loop cap"
+            elif self._runner.prefix_chain_keys(node_name):
+                refusal = "resource: actual iteration rows cannot key a prefix chain"
+            elif mgmt.loopback_rows is None:
+                refusal = "resource: actual iteration progress needs loop-back rows"
+            elif (why := self.resident_refusal(node_name, graph_walk)) is not None:
+                refusal = f"planner: actual iteration progress needs resident state: {why}"
+            if refusal is not None:
+                runner.refuse_run(graph_walk, refusal)
+                return
+        if config.device_stop == "drop_rows" and self._runner.prefix_chain_keys(node_name):
+            # its tokens past a stop hold no KV, and the chain keys every token that lands
+            runner.refuse_run(graph_walk, "resource: a dropped row's pages past its stop would key a prefix chain")
+            return
+        heads = self._row_pairs(mgmt, graph_walk)[0] if mgmt.loopback_rows is not None else {}
+        carries = mgmt.submodule.repeat_carry(graph_walk, signals)
+        runner.ask_run(graph_walk, RunAsk(
+            None if policy is None else policy.token_signal, () if policy is None else policy.eos_tokens,
+            config.device_stop == "drop_rows", config.max,
+            {signal: pair for signal, pair in carries.items() if signal not in heads},
+            mgmt.run_columns.get(graph_walk, frozenset()),
+            frozenset(getattr(mgmt.submodule, "ITERATION_INPUTS", None) or ()), config.refill_at,
+            config.stream_tokens, loop=loop,
+            membership=mgmt.resources[run_rows_key(node_name)] if config.join_rows else None,
+        ))
+
+    def ask_ring(self, node_name: str, signal: str, depth: int, walks: Collection[str]) -> LoopbackRows | str:
+        """After capture: keep ``signal``'s items, which ``walks`` stream to a
+        consumer on this GPU, in a ring of the node's rows ``depth`` deep,
+        allocated now from a capture's output; the rows, or why not."""
+        mgmt = self._submodules[node_name]
+        rows, runner = mgmt.loopback_rows, mgmt.accelerator_graph_runner
+        if rows is None:
+            return "node: it keeps no loop-back rows (asked for by repeats or resident planning)"
+        item = None if runner is None else runner.captured_output(signal)
+        if item is None:
+            return f"runner: no capture of the node outputs {signal!r}, to size its ring by"
+        rows.ask_ring(signal, depth)
+        if (refusal := rows.ring_table(signal, item)) is not None:
+            return refusal
+        mgmt.rings[signal] = frozenset(walks)
+        return rows
+
+    def ring_rows(self, node_name: str) -> LoopbackRows | None:
+        """The rows that hold the node's rings."""
+        return self._submodules[node_name].loopback_rows
+
+    def ring_room(self, node_name: str, rids: Collection[int]) -> int | None:
+        """The fewest items any of ``rids``' rings takes now; None for a node with none."""
+        mgmt = self._submodules[node_name]
+        if not mgmt.rings:
+            return None
+        rows = mgmt.loopback_rows
+        return min((rows.ring_room(signal, rid) for signal in mgmt.rings for rid in rids), default=None)
+
+    def _reserve_rings(self, mgmt: SubmoduleManagement, batch: ExecutingBatch) -> None:
+        """Before the launch: the ring positions each row's items of each ringed
+        signal take. A row whose walk streams none, or whose prompt is still in
+        chunks, takes none."""
+        ctx = batch.step_context
+        chunks = batch.chunk_ranges
+        rids = [
+            rid for rid in batch.request_ids
+            if rid not in chunks or chunks[rid].is_final
+        ]
+        batch.ring_width = ctx.repeats
+        for signal, walks in mgmt.rings.items():
+            mine = [rid for rid in rids if ctx.walk_of(rid) in walks]
+            if mine:
+                bases = mgmt.loopback_rows.ring_reserve(signal, mine, ctx.repeats)
+                batch.ring_bases[signal] = dict(zip(mine, bases, strict=True))
+
+    def _write_rings(self, mgmt: SubmoduleManagement, batch: ExecutingBatch, raw: BatchedModelOutput) -> None:
+        """Right behind the step, on its stream: each row's items of each ringed
+        signal into the positions reserved for it, one copy a signal."""
+        index_of = {rid: i for i, rid in enumerate(batch.request_ids)}
+        for signal, bases in batch.ring_bases.items():
+            items = output_named(raw, signal)
+            if items is None:
+                continue
+            if batch.ring_width == 1:
+                items = items.reshape(items.shape[0], 1, *items.shape[1:])
+            rids = list(bases)
+            rows = [index_of[rid] for rid in rids]
+            picked = items if rows == list(range(len(rows))) else items[
+                to_device_nonblocking(rows, items.device, dtype=torch.long)
+            ]
+            mgmt.loopback_rows.ring_write(signal, rids, picked[:, :batch.ring_width], [bases[rid] for rid in rids])
+
+    def stream_tokens(self, node_name: str, graph_walk: str, signal: str, limit: int) -> str | None:
+        """A walk's runs, up to ``limit`` long, leave ``signal``, a stop
+        buffer, where the host can send it as it lands; why they can't, or None.
+        A slot's landing area is the slot's: with one slot, the next step would
+        reset it while this one's tokens are still being sent."""
+        mgmt = self._submodules[node_name]
+        runner = mgmt.accelerator_graph_runner
+        if runner is None or runner.num_slots < 2:
+            return "runner: one capture slot, which the next step's tokens would land in while this one's go out"
+        mgmt.device_stream_tokens[graph_walk] = (signal, limit)
+        return None
+
+    def yield_runs(self, node_name: str) -> None:
+        """Other work is ready: the node's run in flight ends at its next iteration."""
+        runner = self._submodules[node_name].accelerator_graph_runner
+        if runner is not None:
+            runner.yield_runs()
+
+    def settle_run(
+        self, batch: ExecutingBatch, width: int, counts: Mapping[int, int] | None = None,
+    ) -> None:
+        """Settle row executions separately from the run's output width."""
+        ctx = batch.step_context
+        if type(width) is not int or not 0 <= width <= ctx.repeats:
+            raise ValueError(f"invalid run width {width!r}")
+        if counts is None:
+            counts = dict.fromkeys(ctx.counted or ctx.request_ids, width)
+        if any(type(count) is not int or not 0 <= count <= width for count in counts.values()):
+            raise ValueError("row execution count exceeds the run width")
+        self._runner.settle_run(batch.step, counts)
+        ctx.repeats = width
+
+    def device_stop_refusal(self, node_name: str, graph_walk: str) -> str | None:
+        """After capture: why ``graph_walk``'s captures don't skip a replay
+        whose rows have all stopped, or None."""
+        mgmt = self._submodules[node_name]
+        if mgmt.joint_comm_group.world_size > 1:
+            return "deployment: it runs on more than one rank"
+        if graph_walk not in mgmt.device_stops:
+            return "graph: it has no declared stop policy"
+        if mgmt.accelerator_graph_runner is None:
+            return "runner: the node captures no graphs"
+        return mgmt.accelerator_graph_runner.run_refusal(graph_walk)
+
+    def launch_refusal(self, node_name: str, graph_walk: str) -> str | None:
+        """After capture: why a run of this walk stays on the host's launch
+        loop, or None."""
+        return self._submodules[node_name].accelerator_graph_runner.launch_refusal(graph_walk)
+
+    def _ask_rows(
+        self, node_name: str, graph_walk: str, signals: Collection[str], runner: "AcceleratorGraphRunner | None" = None,
+    ) -> None:
+        """Before capture: keep each loop-back signal of this walk in the node's
+        rows, beside a ``DeviceLoopback``'s, where it runs on one rank."""
+        mgmt = self._submodules[node_name]
+        if mgmt.loopback_rows is None or mgmt.joint_comm_group.world_size > 1:
+            return
+        if runner is not None:
+            if not any(spec.bucket.graph_walk == graph_walk for spec in runner.prepare_for_capture()):
+                return  # no capture to keep rows for (``rows_refusal`` says so)
+            if runner.template_step(graph_walk) is None:
+                return  # nothing would place its rows for the captures to read (``rows_refusal`` says so)
+        loopback = getattr(mgmt.submodule, "device_loopback", None)
+        own = set(loopback.outputs()) if loopback is not None and loopback.walk == graph_walk else set()
+        mgmt.row_signals[graph_walk] = mgmt.submodule.repeat_carry(graph_walk, set(signals) - own)
+
+    def rows_refusal(self, node_name: str, graph_walk: str) -> str | None:
+        """After capture: why this walk's loop-back signals don't stay in the
+        node's rows between steps, or None: each must be a buffer of every
+        capture of the walk, one fixed-shape row per request. One that isn't
+        goes back to being routed, which its captures' heads read just the same."""
+        mgmt = self._submodules[node_name]
+        if mgmt.joint_comm_group.world_size > 1:
+            return "deployment: it runs on more than one rank"
+        runner = mgmt.accelerator_graph_runner
+        if runner is None:
+            return "runner: the node captures no graphs"
+        if not any(spec.bucket.graph_walk == graph_walk for spec in runner.prepare_for_capture()):
+            return "runner: it has no capture"
+        steps = mgmt.template_steps
+        step = steps[graph_walk] if graph_walk in steps else runner.template_step(graph_walk)
+        if step is None:
+            # the rows' plan places each row's index for the capture's head and tail
+            mgmt.row_signals.pop(graph_walk, None)
+            return "node: it declares no step, so nothing places a row in the rows its capture reads"
+        pairs = mgmt.row_signals.get(graph_walk, {})
+        refusal = runner.row_refusal(graph_walk, {signal: pair.output for signal, pair in pairs.items()})
+        if refusal is not None:
+            mgmt.row_signals.pop(graph_walk, None)
+            return f"runner: {refusal}"
+        return None
+
+    @staticmethod
+    def _write_routed_rows(
+        batch: ExecutingBatch, mgmt: SubmoduleManagement, slot, engine_inputs: ModelInputsFromEngine,
+        preprocessed: Mapping[str, Any],
+        *, stager=None,
+    ) -> None:
+        """A capture reads its rows at its head, so what a row brought routed
+        (its first step here) goes into them first: a row's one host write."""
+        kept = batch.kept_rows
+        real = len(batch.request_ids)
+        routed = list(range(real)) if kept is None else [i for i in range(real) if not kept[i]]
+        if not routed:
+            return
+        rids = [engine_inputs.request_ids[i] for i in routed]
+        for signal, name in slot.row_heads.items():
+            value = preprocessed.get(name)
+            if isinstance(value, torch.Tensor):
+                if stager is None:
+                    mgmt.loopback_rows.write_rows(signal, rids, value, routed)
+                else:
+                    mgmt.loopback_rows.write_rows(signal, rids, value, routed, stager=stager)
+
+    def resident_asked(self, node_name: str) -> bool:
+        return resident_asked(self._submodules[node_name].submodule)
+
+    def resident_nodes(self) -> frozenset[str]:
+        """The nodes the serving config asks for resident planning."""
+        return frozenset(name for name in self._submodules if self.resident_asked(name))
+
+    def _keep_rows(
+        self, mgmt: SubmoduleManagement, graph_walk: str, rids: Sequence, outputs,
+    ) -> None:
+        """An eager step's tail, which a capture does itself: each loop-back
+        value the node keeps on the device, out of ``outputs``, into the rows
+        of ``rids``."""
+        rows = mgmt.loopback_rows
+        if rows is None or mgmt.accelerator_graph_runner is None:
+            return  # an eager-only node reads none back (``device_loopback_signals``)
+        for signal, output in self._row_pairs(mgmt, graph_walk)[1].items():
+            value = output_named(outputs, output)
+            if value is not None:
+                rows.write(signal, rids, value)
 
     def after_output_copy(self, batch: ExecutingBatch) -> None:
         if batch.committed is not None:
@@ -1685,6 +2283,7 @@ class Engine:
                 laps = PhaseLaps("engine.exec.")
                 # a caller that pre-planned already reserved one; otherwise take it here
                 lease = batch.step_context.slot_lease or self.reserve_replay_slot(batch)
+                batch.step_context.check_tp_repeats()
                 laps.lap("reserve_slot")
                 # admit/plan/commit assume the whole batch reaches the forward
                 # in order; an unbatchable walk with >1 request can't, so each
@@ -1698,10 +2297,7 @@ class Engine:
                 else:
                     batch.outputs = self._exec_single(batch)
             laps = PhaseLaps("engine.exec.")
-            if batch.admit_error is None:
-                self._record_loopback(batch)
-                batch.outputs.loopback_rids = batch.loopback_rids
-            batch.outputs_ready.set()
+            self._finish_outputs(batch)
             laps.lap("record_loopback")
             return batch.outputs
         except Exception:
@@ -1718,6 +2314,34 @@ class Engine:
             if nvtx:
                 range_pop()
 
+    def _finish_outputs(self, batch: ExecutingBatch) -> None:
+        """Publish ordinary completion metadata before the outputs become ready."""
+        if batch.admit_error is None:
+            if RUN_DESCRIPTORS not in (batch.outputs.check_stop_buffers or {}):
+                self._record_loopback(batch)
+            batch.outputs.loopback_rids = batch.loopback_rids
+            if batch.step_context.repeats > 1:
+                batch.outputs.run_columns = self.run_columns(batch.node_name, batch.step_context.graph_walk)
+        batch.outputs_ready.set()
+
+    @staticmethod
+    def _pad_batch(
+        batch: ExecutingBatch, submodule_mgmt: SubmoduleManagement, lease: SlotLease | None,
+    ) -> tuple[list[NodeInputs], Mapping[int, CurrentForwardPassInfo]]:
+        """The admitted rows of an ordinary step, padded to its leased capture."""
+        cg_runner = submodule_mgmt.accelerator_graph_runner
+        inputs = batch.inputs
+        req_info = batch.per_request_info_wrapped
+        if lease is not None:
+            inputs = cg_runner.pad_inputs(lease, inputs, uniform=batch.uniform_inputs)
+            req_info = cg_runner.step_metadata(
+                lease, batch.request_ids, req_info
+            )
+            batch.step_context.set_padded_rids(
+                cg_runner.step_ids(lease, batch.request_ids)
+            )
+        return inputs, req_info
+
     def _exec_single(
         self, batch: ExecutingBatch
     ) -> BatchedModelOutput:
@@ -1732,17 +2356,9 @@ class Engine:
         lease = batch.step_context.slot_lease
         real_bs = len(batch.request_ids)
 
-        inputs = batch.inputs
-        req_info = batch.per_request_info_wrapped
-        if lease is not None:
-            inputs = cg_runner.pad_inputs(lease, inputs, uniform=batch.uniform_inputs)
-            req_info = cg_runner.step_metadata(
-                lease, batch.request_ids, req_info
-            )
-            batch.step_context.set_padded_rids(
-                cg_runner.step_ids(lease, batch.request_ids)
-            )
+        inputs, req_info = self._pad_batch(batch, submodule_mgmt, lease)
         laps.lap("pad")
+        retained = False
 
         try:
             admit, batch.step = self._declare_and_admit(
@@ -1757,6 +2373,9 @@ class Engine:
                 return BatchedModelOutput(
                     per_rid_outputs={rid: {} for rid in batch.request_ids}
                 )
+            if submodule_mgmt.rings:
+                # before the launch, which lets the next step be built against this one's room
+                self._reserve_rings(submodule_mgmt, batch)
 
             raw, batch.step = self._drive_step(
                 batch, submodule_mgmt, batch.request_ids, inputs, req_info,
@@ -1770,22 +2389,17 @@ class Engine:
             # Commit first: releasing `commit_done` here is what lets a pre-plan
             # of N+1 overlap this step's per-request tail.
             batch.commit_done.set()
-            if self._enable_nvtx:
-                range_push("engine.collect_outputs")
-            t0 = phase_start()
-            try:
-                out = self._collect_outputs(
-                    submodule_mgmt, lease, raw, inputs, req_info,
-                    request_ids=batch.request_ids,
-                    step_request_ids=batch.step_context.padded_request_ids,
-                    graph_walk=batch.step_context.graph_walk,
-                    rows_only=batch.rows_only,
-                )
-            finally:
-                phase_end("engine.collect_outputs", t0)
-                if self._enable_nvtx:
-                    range_pop()
-            self._add_resource_host_rows(submodule_mgmt, out)
+            if RUN_DESCRIPTORS in (raw.check_stop_buffers or {}):
+                # The worker closes publication and collects each descriptor
+                # under its own logical receipt before releasing this lease.
+                # Enqueue-time fixed-rid collection/ring writes would attribute
+                # a later tenant's values to the capture's original row.
+                batch.outputs = raw
+                retained = True
+                return raw
+            if submodule_mgmt.rings:
+                self._write_rings(submodule_mgmt, batch, raw)
+            out = self._collect_step(batch, submodule_mgmt, lease, raw, inputs, req_info)
             # Optional 1-step launch throttle (see MSTAR_ENGINE_STEP_SYNC).
             # Not for correctness — downstream reads already gate on the
             # completion event, so the token exists before it is read. This just
@@ -1807,17 +2421,1042 @@ class Engine:
             return out
         finally:
             laps.skip()
-            if lease is not None:
+            if lease is not None and not retained:
                 cg_runner.release(lease, real_bs)
             laps.lap("release")
 
+    def _prepare_stream_choices(self, batch: ExecutingBatch, maker: str, signal: str, prototype: torch.Tensor, guard):
+        """Certify each ordinary policy pop before selecting one on the device.
+
+        Only structural input changes are allowed. Compute choices must have
+        identical host inputs and resource declarations; an empty final pop
+        may complete without a forward. The stream owner keeps the decisions.
+        """
+        if len(batch.request_ids) != 1:
+            guard.refuse("independently ready streamed rows need descriptor-addressed outputs")
+        rid = batch.request_ids[0]
+        edges = [edge for edge in batch.stream_windows.get(rid, ()) if edge.name == signal]
+        if len(edges) != 1 or edges[0].chunk.reservation is None or not edges[0].chunk.reservation.decisions:
+            guard.refuse("a connected stream has no retained policy decisions")
+        reservation = edges[0].chunk.reservation
+        choices = []
+        reference = None
+        mgmt = self._submodules[batch.node_name]
+        for transition in reservation.transitions:
+            chunk = transition.chunk._replace(reservation=None)
+            if chunk.num_items > prototype.shape[0]:
+                guard.refuse("a policy chunk exceeds its retained producer coverage")
+            key = (maker, batch.node_name, signal, rid)
+            # The prototype supplies geometry only. No unproduced ring value
+            # is read or uploaded while ordinary preparation is certified.
+            if chunk.num_items:
+                guard.bindings[key] = prototype[0] if chunk.num_items == 1 else prototype[:chunk.num_items]
+            tensors = {**batch.per_request_input_tensors.get(rid, {}),
+                       signal: [guard.unknown(key)] if chunk.num_items else []}
+            metadata = batch.per_request_input_metadata.get(rid, EMPTY_INPUT_METADATA)
+            metadata = metadata._replace(stream_chunks={**metadata.stream_chunks, signal: chunk})
+            candidate = dataclasses.replace(
+                batch, step_context=dataclasses.replace(batch.step_context),
+                per_request_input_tensors={rid: tensors}, per_request_input_metadata={rid: metadata},
+                inputs=None, prepared_rids=(), skipped_rids=set(), cached_rids=set(), failed_requests={},
+                final_stream_rids={rid} if chunk.is_final else set(),
+                partition_done_rids=set(batch.partition_done_rids),
+            )
+            with guard.isolated_info(candidate):
+                self.prepare_inputs(candidate)
+                if candidate.failed_requests:
+                    guard.refuse("a future policy chunk failed ordinary preparation")
+                if not candidate.request_ids:
+                    if not chunk.is_final or chunk.num_items:
+                        guard.refuse("only an empty final policy chunk may finish without computation")
+                    choices.append(None)
+                    continue
+                with watch_table_reads() as reads:
+                    declaration = self._declare_step(
+                        candidate, candidate.request_ids, candidate.inputs, mgmt.submodule,
+                        candidate.step_context, None,
+                    )
+                _refuse_counter_read(batch.node_name, candidate.step_context, reads, "declare_step")
+                shape = (candidate.inputs, None if declaration is None else declaration.steps)
+                guard.require_real(shape[1], "streamed resource declarations")
+                if reference is not None and not guard.same(reference, shape):
+                    guard.refuse("policy alternatives change prepared host inputs or resource declarations")
+                reference = shape
+            choices.append(candidate)
+        return choices
+
+    def _compose_stream(self, group, leases, window, payload, guard):
+        """Lower the claimed stream through the existing capture entries/bodies.
+
+        Policy selection and payload access belong to the retained owners;
+        this only connects their operations to the backend's IF/WHILE nodes.
+        No model forward is captured again.
+        """
+        from mstar.engine.accelerator_graph_backend import GraphConditional
+        from mstar.engine.accelerator_graph_runner import capture_into_graph
+        from mstar.engine.resources.loopback_rows import LoopbackRowsStep
+
+        maker, consumer, signal = group.unit.streaming_edges[0]
+        batches = {batch.node_name: batch for _, batch in group.members}
+        source_batch, batch = batches[maker], batches[consumer]
+        source_mgmt, mgmt = self._submodules[maker], self._submodules[consumer]
+        ring = source_mgmt.loopback_rows
+        runner = mgmt.accelerator_graph_runner
+        slot = runner.slot_for(leases[consumer])
+        source = None if maker not in leases else source_mgmt.accelerator_graph_runner.slot_for(leases[maker])
+        binding = source_batch.step_context if source is not None else batch.step_context
+        # Ring row addresses must be valid even when source entry yields before
+        # its body (and hence its resident gather), or the producer is finished.
+        ring.plan(LoopbackRowsStep(), dataclasses.replace(binding, resident=None))
+        indices = ring.indices(binding.slot_lease.bucket, binding.slot_lease.slot)
+        if indices.numel() != 1 or slot.run.state.counts.numel() != 1:
+            guard.refuse("streamed composition currently needs one physical row per member")
+        if source is not None and source.run.state.counts.numel() != 1:
+            guard.refuse("streamed composition currently needs one physical row per member")
+        item = ring.row(signal, batch.request_ids[0])
+        prototype, target = payload
+        if prototype.numel() % item[0].numel():
+            guard.refuse("a streamed destination does not hold whole producer items")
+        width = prototype.numel() // item[0].numel()
+        shape = (width, *item.shape[1:])
+        if tuple(prototype.shape) not in (shape, tuple(item.shape[1:]) if width == 1 else shape):
+            guard.refuse("a streamed payload changed its owner's item geometry")
+        try:
+            target = target.view(1, *shape)
+        except RuntimeError:
+            guard.refuse("a streamed destination cannot preserve its owner's item coordinates")
+        policy = source_mgmt.device_stops.get(source_batch.graph_walk)
+        withheld = policy is not None and signal in policy.withhold
+        if source is not None and withheld and policy.limits(
+            source_batch.per_request_info_wrapped[batch.request_ids[0]],
+        ).ignore_eos:
+            guard.refuse("withheld items inside an EOS-immune run need explicit item identities")
+        token = None if not withheld or source is None else output_named(source.static_outputs, policy.token_signal)
+        produced = None if source is None else output_named(source.static_outputs, signal)
+        if source is not None and (produced is None or produced.shape != (1, *item.shape[1:])):
+            guard.refuse("a streamed producer must emit one captured item per iteration")
+        key = ("stream", id(slot.graph), None if source is None else id(source.graph), id(window),
+               target.data_ptr(), tuple(target.shape), target.stride(), target.storage_offset(),
+               indices.data_ptr(), item.untyped_storage().data_ptr(),
+               withheld)
+        if slot.composed_graph is not None and slot.composed_key == key:
+            return slot.composed_graph
+        state = slot.run.state
+
+        def kept():
+            if not withheld:
+                return source.run.state.counts > 0
+            eos = torch.zeros_like(source.run.state.counts, dtype=torch.bool)
+            for value in policy.eos_tokens:
+                eos.logical_or_(token.reshape(1) == value)
+            return (source.run.state.counts > 0) & ~eos
+
+        def choose():
+            emitted = torch.zeros_like(window.counts) if source is None else source.run.state.counts
+            if source is not None and withheld:
+                emitted = emitted - ((emitted > 0) & ~kept()).long()
+            window.select(window.origins[:, 0] + window.origins[:, 1] + emitted,
+                          window.origins[:, 2].bool(), ~state.marks)
+            # A semantic empty final flush needs no compute budget. A chunk
+            # that does compute is acknowledged only if its body will execute.
+            allowed = ((window.selected >= 0)
+                       & ((window.metadata[:, 5] == 0) | (state.continuation != 0)))
+            window.selected.copy_(torch.where(allowed, window.selected, -1))
+            window.ready.copy_(allowed.any().reshape(1))
+            window.compute_ready.copy_((allowed & (window.metadata[:, 5] != 0)).any().reshape(1))
+            running = torch.zeros_like(window.continuation) if source is None else source.run.state.continuation
+            window.continuation.copy_((running != 0) | (window.ready != 0))
+
+        def publish():
+            ring.ring_scatter(signal, indices, window.produced_positions(source.run.state.counts), produced, kept())
+
+        def gather():
+            ring.ring_gather(signal, indices, window.payload_positions(width), target)
+
+        backend = runner._graph_backend
+        def capture(fn):
+            return capture_into_graph(
+                fn, backend.graph_pool_handle(), self._device, None, keep_graph=True,
+            )[0]
+        select, read, advance = capture(choose), capture(gather), capture(window.advance)
+        body = []
+        entry = []
+        if source is not None:
+            entry.append(source.run.entry)
+            body.append(GraphConditional("if", source.run.state.continuation, (source.graph, capture(publish))))
+        entry.extend((slot.run.entry, select))
+        body.extend((select, GraphConditional("if", window.compute_ready, (read, slot.graph)),
+                     GraphConditional("if", window.ready, (advance,)), select))
+        graph = backend.compose((*entry, GraphConditional("while", window.continuation, tuple(body))))
+        slot.composed_graph, slot.composed_key = graph, key
+        return graph
+
+    def exec_group(self, group: ExecutionGroup) -> list[BatchedModelOutput] | None:
+        """Prepare all ordinary members, then submit their captures together.
+
+        None is an unsubmitted refusal: the worker runs the original head.
+        Once submission starts, errors use ordinary failure settlement instead
+        of replaying any member. No graph-runtime call runs on this thread.
+        """
+        bindings: dict[Any, torch.Tensor] = {}
+        guard = ConnectedInputs(bindings)
+        prepared = []
+        admitted = []
+        rows = tuple(group.members[0][1].request_ids)
+        member_walks = dict(zip(group.unit.nodes, group.unit.graph_walks, strict=True))
+        finished = dict(zip(group.unit.nodes, group.finished_rids or [frozenset()] * len(group.members), strict=True))
+        active = [(scheduled, batch) for scheduled, batch in group.members
+                  if finished[batch.node_name] != frozenset(rows)]
+        leases = {}
+        slots = {}
+        owners = {}
+        back_keys, boundary_fields = set(), []
+        boundary = []
+        streamed = bool(group.unit.streaming_edges and any(
+            edge.chunk.reservation is not None and edge.chunk.reservation.decisions
+            for _, batch in active for edges in batch.stream_windows.values() for edge in edges
+        ))
+        idle_sources = ({maker for maker, _, _ in group.unit.streaming_edges
+                         for _, batch in group.members if batch.node_name == maker and batch.ring_width == 0}
+                        if streamed else set())
+        active = [(scheduled, batch) for scheduled, batch in active if batch.node_name not in idle_sources]
+        stream_choices, stream_target, stream_window = None, None, None
+        composed = None
+        try:
+            with torch.no_grad(), guard.preparing(), ExitStack() as preparation:
+                if not active or any(finished[batch.node_name] for _, batch in active):
+                    guard.refuse("connected member retirement needs a uniform claimed row set")
+                if streamed and (len(rows) != 1 or len(group.members) != 2 or len(group.unit.streaming_edges) != 1
+                                 or group.unit.edges != group.unit.streaming_edges):
+                    guard.refuse("streamed composition currently needs two members and one logical row")
+                for _, batch in active:
+                    preparation.enter_context(guard.isolated_info(batch))
+                repeats = active[0][1].step_context.repeats
+                if not streamed and any(batch.step_context.repeats != repeats for _, batch in active):
+                    guard.refuse("members requested different iteration counts")
+                if not streamed and repeats > 1 and group.unit.loop_name is None:
+                    guard.refuse("the graph did not certify a complete connected Loop")
+                if repeats > 1 and any(
+                    len(batch.per_request_input_tensors.get(rid, {}).get(signal, ())) != 1
+                    for _, batch in group.members for _, consumer, signal in group.unit.loop_back
+                    if consumer == batch.node_name for rid in rows
+                ):
+                    repeats = 1  # the first ordinary iteration produces an empty seed
+                    for _, batch in group.members:
+                        batch.step_context.repeats = 1
+                loop_back = group.unit.loop_back if repeats > 1 else ()
+                for maker in {a for a, _, _ in (*group.unit.edges, *loop_back)}:
+                    if finished[maker]:
+                        continue
+                    producer = self._submodules[maker].submodule
+                    kind = type(producer)
+                    walk = member_walks[maker]
+                    if (kind.postprocess is not NodeSubmodule.postprocess
+                            or kind.batch_postprocess is not NodeSubmodule.batch_postprocess
+                            or kind.filter_batched_output is not NodeSubmodule.filter_batched_output
+                            or kind.unpack_packed_outputs is not NodeSubmodule.unpack_packed_outputs
+                            or producer.spanned_outputs(walk) or producer.get_stop_policies(walk) is None):
+                        guard.refuse("a producer changes its routed outputs outside capture")
+                for member, (_, batch) in enumerate(group.members):
+                    if finished[batch.node_name] or batch.node_name in idle_sources:
+                        continue
+                    mgmt = self._submodules[batch.node_name]
+                    runner, submodule = mgmt.accelerator_graph_runner, mgmt.submodule
+                    if runner is None or batch.chunk_ranges or batch.step_context.request_walks:
+                        guard.refuse("a member has no whole capture or has chunked/mixed rows")
+                    if (batch.graph_walk in self._keyed_walks.get(batch.node_name, ())
+                            or (mgmt.rings and not streamed)):
+                        guard.refuse("a member prepares cached prefixes or stream windows")
+                    if streamed and mgmt.joint_comm_group.world_size != 1:
+                        guard.refuse("streamed composition is single-rank")
+                    if streamed:
+                        if why := mgmt.carry_refusals.get(batch.graph_walk):
+                            guard.refuse(f"{batch.node_name}: {why}")
+                        internal = {signal for maker, _, signal in group.unit.streaming_edges
+                                    if maker == batch.node_name}
+                        if set(mgmt.rings) - internal:
+                            guard.refuse("a streamed member has output rings outside the composed edge")
+                    incoming = [(a, signal) for a, b, signal in group.unit.edges
+                                if b == batch.node_name and (not finished[a] or streamed)]
+                    tensors = {rid: dict(batch.per_request_input_tensors.get(rid, {})) for rid in rows}
+                    stream_incoming = incoming if streamed else ()
+                    if stream_incoming:
+                        maker, signal = stream_incoming[0]
+                        source = self._submodules[maker].loopback_rows
+                        stream_choices = self._prepare_stream_choices(
+                            batch, maker, signal, source.row(signal, rows[0]), guard,
+                        )
+                        reference = next((choice for choice in stream_choices if choice is not None), None)
+                        if reference is None:
+                            guard.refuse("a final stream tail with no computation completes on its ordinary path")
+                        batch.per_request_input_tensors = reference.per_request_input_tensors
+                        batch.per_request_input_metadata = reference.per_request_input_metadata
+                        batch.per_request_info_wrapped = reference.per_request_info_wrapped
+                        batch.inputs, batch.prepared_rids = reference.inputs, reference.prepared_rids
+                        batch.running_batched, batch.kept_rows = reference.running_batched, reference.kept_rows
+                    for maker, signal in (() if stream_incoming else incoming):
+                        maker_mgmt = self._submodules[maker]
+                        maker_slot = maker_mgmt.accelerator_graph_runner.slot_for(leases[maker])
+                        if maker_slot.static_outputs.per_rid_outputs:
+                            guard.refuse("a producer changes its routed outputs outside capture")
+                        output = maker_mgmt.submodule.repeat_carry(member_walks[maker], {signal})[signal].output
+                        source = (maker_slot.static_outputs.row_outputs or {}).get(output)
+                        if source is None or source.ndim == 0 or source.shape[0] < len(rows):
+                            guard.refuse(f"{maker}/{signal} has no captured row output")
+                        for i, rid in enumerate(rows):
+                            key = maker, batch.node_name, signal, rid
+                            # Ordinary collect gives the consumer split(1)
+                            # views, retaining the row axis.
+                            bindings[key] = source[i:i + 1]
+                            tensors[rid][signal] = [guard.unknown(key)]
+                    for maker, consumer, signal in loop_back:
+                        if consumer != batch.node_name:
+                            continue
+                        incoming.append((maker, signal))
+                        for rid in rows:
+                            key = maker, consumer, signal, rid
+                            bindings[key] = tensors[rid][signal][0]
+                            back_keys.add(key)
+                            tensors[rid][signal] = [guard.unknown(key)]
+                    if not stream_incoming:
+                        batch.per_request_input_tensors = tensors
+                        with autocast_scope(self._autocast_dtype_for(batch.node_name), device_type=self._device.type,
+                                            node_name=batch.node_name):
+                            self.prepare_inputs(batch)
+                    if tuple(batch.request_ids) != rows:
+                        guard.refuse("a member changed the common row set")
+                    for inp in batch.inputs:
+                        for f in dataclasses.fields(inp):
+                            value = getattr(inp, f.name)
+                            # ARNodeInputs also exposes input_ids/input_embeds
+                            # as tensor fields. Only host/declaration fields
+                            # must be entirely real at this stage; final
+                            # staging still certifies every future tensor.
+                            if f.name != "tensor_inputs" and not isinstance(value, torch.Tensor):
+                                guard.require_real(value, f"NodeInputs.{f.name}")
+                    # The same rotation can serve several node captures.
+                    # Lease it once so a large group cannot wrap back onto a
+                    # still-live component slot from the preceding step.
+                    if mgmt.slot_rotation in slots:
+                        batch.set_slot(slots[mgmt.slot_rotation])
+                    lease = self.reserve_replay_slot(batch)
+                    if lease is None:
+                        guard.refuse("a member has no capture for the common rows")
+                    slots.setdefault(mgmt.slot_rotation, lease.slot)
+                    leases[batch.node_name] = lease
+                    slot = runner.slot_for(lease)
+                    if not streamed and (member + 1 < len(group.members) or repeats > 1):
+                        policies = submodule.get_stop_policies(batch.graph_walk)
+                        if (policies is None or (repeats > 1 and not set(policies) <= {group.unit.loop_name})
+                                or (policies and (member + 1 < len(group.members)
+                                                  or any(p.reads_token for p in policies.values())))):
+                            guard.refuse("a member can end its Loop before later members execute")
+                    if lease.bucket.graph_walk in runner._generator_walks:
+                        guard.refuse("a composed member draws from a torch generator")
+                    if streamed:
+                        if (slot.run is None or slot.run.state.membership is not None or lease.bucket.bs != 1):
+                            guard.refuse("streamed composition needs captured fixed-membership one-row bodies")
+                        if self._custom_output_tail(submodule) and (
+                            not stream_incoming or batch.step_context.repeats != 1
+                        ):
+                            guard.refuse("a custom streamed tail needs one consumer compute and no producer transform")
+                    elif slot.run is not None or batch.step_context.resident is not None:
+                        guard.refuse("connected resident runs need their shared run state staged before launch")
+                    batch.step_context.unit_id = group.claim
+                    batch.step_context.unit_member = member
+                    inputs, info = self._pad_batch(batch, mgmt, lease)
+                    prepared.append((batch, mgmt, lease, inputs, info, incoming))
+                    with watch_table_reads() as reads:
+                        batch.step = self._declare_step(batch, batch.step_context.padded_request_ids, inputs,
+                                                        submodule, batch.step_context, batch.step)
+                    _refuse_counter_read(batch.node_name, batch.step_context, reads, "declare_step")
+                    if batch.step is not None:
+                        batch.step.set_ctx(batch.step_context)
+                        guard.require_real(batch.step.steps, "resource declarations")
+                        for resource_step in batch.step.steps.values():
+                            if getattr(resource_step, "pre_forks", ()) or getattr(resource_step, "post_forks", ()):
+                                guard.refuse("a member forks resource state during planning")
+                    for key, resource in reachable_resources(self._runner.resources, mgmt.resources).items():
+                        owners.setdefault(id(resource), []).append((key, resource, batch))
+                # A declaration may make an otherwise compatible owner unsafe
+                # to share. Check every occurrence, including a dependency
+                # with no explicit step, before the first member admits.
+                for occurrences in owners.values():
+                    if len({batch.node_name for _, _, batch in occurrences}) < 2:
+                        continue
+                    for key, resource, batch in occurrences:
+                        if self._submodules[batch.node_name].piecewise_runners:
+                            guard.refuse("a shared owner also has nested piecewise capture buffers")
+                        resource_step = None if batch.step is None else batch.step.get(key)
+                        if why := resource.connected_refusal(resource_step, batch.step_context):
+                            guard.refuse(f"{batch.node_name}/{key}: {why}")
+                if streamed:
+                    # Every member may end early or run zero iterations, even
+                    # when its compute ask is one. Its actual declaration and
+                    # dependencies must promise reversible accounting first.
+                    for occurrences in owners.values():
+                        for key, resource, batch in occurrences:
+                            part = (None if batch.step is None or batch.step_context.resident is not None
+                                    else batch.step.get(key))
+                            if why := resource.repeat_refusal(batch.graph_walk, part):
+                                guard.refuse(f"{batch.node_name}/{key}: {why}")
+                if not streamed and repeats > 1:
+                    for occurrences in owners.values():
+                        for key, resource, batch in occurrences:
+                            step = None if batch.step is None else batch.step.get(key)
+                            if resource.repeat_refusal(batch.graph_walk, step) is not None:
+                                repeats = 1
+                            else:
+                                repeats = min(repeats, resource.max_repeats(step, batch.step_context))
+                    repeats = max(1, repeats)
+                    for _, batch in group.members:
+                        batch.step_context.repeats = repeats
+                for batch, _, _, inputs, _, _ in prepared:
+                    admit = self._admit_step(batch, batch.step_context.padded_request_ids, inputs,
+                                             batch.step_context, batch.step)
+                    if not admit.ok:
+                        guard.refuse("a member refused admission")
+                    if batch.step is not None:
+                        admitted.append(batch.step)
+                    if not streamed and batch.step_context.repeats != repeats:
+                        guard.refuse("a member changed the common iteration count during admission")
+                for batch, mgmt, lease, inputs, info, incoming in prepared:
+                    with autocast_scope(self._autocast_dtype_for(batch.node_name), device_type=self._device.type,
+                                        node_name=batch.node_name):
+                        engine_inputs, values = self._plan_step(batch, mgmt, batch.request_ids, inputs, info,
+                                                    batch.step_context, lease, batch.step)
+                    guard.require_real(batch.step_context.plan_results, "resource plans")
+                    runner = mgmt.accelerator_graph_runner
+                    slot = runner.slot_for(lease)
+                    if streamed and incoming:
+                        for choice in (part for part in stream_choices if part is not None):
+                            choice.step_context = batch.step_context
+                            choice.step = batch.step
+                            _, alternative = self._preprocess_step(
+                                choice, mgmt, choice.request_ids, choice.inputs, choice.per_request_info_wrapped,
+                                choice.step_context, lease, choice.step,
+                            )
+                            if not guard.same(values, alternative):
+                                guard.refuse("policy alternatives change independent staged values or packing")
+                    row_inputs = {name: signal for signal, name in slot.row_heads.items()}
+
+                    def destinations(name, copies, mgmt=mgmt, slot=slot, batch=batch, row_inputs=row_inputs):
+                        signal = row_inputs.get(name)
+                        if signal is None:
+                            return copies
+                        try:
+                            return mgmt.loopback_rows.input_copies(
+                                signal, batch.step_context.padded_request_ids, slot.static_inputs[name], copies,
+                            )
+                        except ValueError as error:
+                            guard.refuse(str(error))
+
+                    carries = mgmt.submodule.repeat_carry(batch.graph_walk, {signal for _, signal in incoming})
+                    expected = {}
+                    for maker, signal in incoming:
+                        expected.setdefault(carries[signal].input, []).extend(
+                            (maker, batch.node_name, signal, rid) for rid in rows
+                        )
+                    copies, real = [], {}
+                    for name, value in values.items():
+                        if guard.contains(value):
+                            if name not in expected or not isinstance(value, torch.Tensor):
+                                guard.refuse(f"future values escaped into preprocess field {name}")
+                            target = slot.static_inputs.get(name)
+                            if not isinstance(target, torch.Tensor) or name not in slot.static_input_keys:
+                                guard.refuse(f"no captured destination for {name}")
+                            dim = runner._static_buffer_seq_dims.get((slot.config_idx, name), 0)
+                            if value.ndim != target.ndim or value.shape[dim] > target.shape[dim]:
+                                guard.refuse(f"future field {name} exceeds its captured destination")
+                            target = target.narrow(dim, 0, value.shape[dim])
+                            keys = tuple(expected.pop(name))
+                            routed = destinations(name, guard.copies(value, target, keys, set(keys) - back_keys))
+                            if streamed and incoming:
+                                if stream_target is not None or len(routed) != 1:
+                                    guard.refuse("a streamed payload needs one contiguous owner destination")
+                                stream_target = routed[0]
+                            else:
+                                copies.extend(routed)
+                            group.initial_copies.extend(destinations(
+                                name, guard.copies(value, target, keys, bindings.keys() - set(keys)),
+                            ))
+                            if back_keys.intersection(keys):
+                                group.initial_copies.extend(destinations(
+                                    name, guard.copies(value, target, keys, back_keys),
+                                ))
+                                boundary_fields.append((value, target, keys, name, destinations))
+                        else:
+                            real[name] = value
+                            if name in row_inputs and isinstance(value, torch.Tensor):
+                                kept = batch.kept_rows
+                                target = slot.static_inputs[name]
+                                routed = [(value[i], target[i]) for i in range(len(rows))
+                                          if kept is None or not kept[i]]
+                                group.initial_copies.extend(destinations(name, routed))
+                    if expected:
+                        guard.refuse("preprocess discarded a future input")
+                    iteration = (batch.iteration_columns.columns if isinstance(batch.iteration_columns, IterationWindow)
+                                 else batch.iteration_columns or {})
+                    if iteration.keys() & {pair.input for pair in carries.values()}:
+                        guard.refuse("an iteration column overwrites a connected input")
+                    if iteration.keys() & row_inputs.keys():
+                        guard.refuse("an iteration column needs its captured row owner's destination")
+                    runner._stage(lease, real)
+                    if streamed:
+                        self._stage_capture(batch, mgmt, runner, engine_inputs, real, lease, batch.request_ids)
+                    columns = [] if streamed else [
+                        *((column, slot.static_inputs[name]) for name, column in iteration.items()),
+                        *self._runner.replay_columns(batch.step, repeats),
+                    ]
+                    group.parts.append(RunPart(slot, copies, columns))
+                if streamed:
+                    maker, consumer, signal = group.unit.streaming_edges[0]
+                    batches = {batch.node_name: batch for _, batch in group.members}
+                    consumer_batch, producer_batch = batches[consumer], batches[maker]
+                    reservation = next(edge.chunk.reservation for edge in consumer_batch.stream_windows[rows[0]]
+                                       if edge.name == signal)
+                    tables = self._submodules[consumer].submodule.iteration_tables
+                    try:
+                        stream_window = tables.prepare_stream_window(
+                            leases[consumer], len(reservation.decisions), len(reservation.transitions),
+                            len(reservation.positions),
+                        )
+                    except ValueError as error:
+                        guard.refuse(str(error))  # a larger policy snapshot takes the ordinary path
+                    if stream_target is None:
+                        guard.refuse("a streamed consumer discarded its future payload")
+                    composed = self._compose_stream(group, leases, stream_window, stream_target, guard)
+                    tables.stage_stream_window(
+                        leases[consumer], [reservation], [[choice is not None for choice in stream_choices]],
+                        producer_limits=[producer_batch.ring_width if maker in leases else 0],
+                    )
+                elif repeats > 1:
+                    row_of = {rid: i for i, rid in enumerate(rows)}
+                    for maker, consumer, signal, rid in back_keys:
+                        mgmt = self._submodules[maker]
+                        slot = mgmt.accelerator_graph_runner.slot_for(leases[maker])
+                        name = mgmt.submodule.repeat_carry(member_walks[maker], {signal})[signal].output
+                        source = (slot.static_outputs.row_outputs or {}).get(name)
+                        if (slot.static_outputs.per_rid_outputs or source is None or source.ndim == 0
+                                or source.shape[0] < len(rows)):
+                            guard.refuse(f"{maker}/{signal} has no captured Loop carry")
+                        row = row_of[rid]
+                        guard.rebind((maker, consumer, signal, rid), source[row:row + 1])
+                    boundary = [copy for value, target, keys, name, destinations in boundary_fields
+                                for copy in destinations(name, guard.copies(value, target, keys, back_keys))]
+            if not streamed and self._device.type != "cpu":
+                from mstar.engine.accelerator_graph_backend import copy_words
+
+                # Native composition only accepts its existing memcpy layouts.
+                # Refuse before any seed staging or irreversible submission.
+                pairs = [*group.initial_copies, *boundary,
+                         *(pair for part in group.parts for pair in part.copies)]
+                for source, target in pairs:
+                    try:
+                        source = source.view(target.shape)
+                    except RuntimeError:
+                        guard.refuse("connected graph copies cannot reshape a strided source")
+                    if copy_words(target, source) is None:
+                        guard.refuse("connected graph copies need contiguous rows without casts")
+            # Every binding has been checked. This is the irreversible point;
+            # the main thread publishes it to Rust before landing members.
+            for scheduled, batch in group.members:
+                scheduled.repeats = batch.step_context.repeats
+            group.submitted = True
+            head = group.members[group.trigger][1]
+            if head.launch_started_event is not None:
+                head.launch_started_event.set()
+            if streamed:
+                for source, target in group.initial_copies:
+                    target.copy_(source.reshape_as(target), non_blocking=True)
+                composed.replay()
+                retained = []
+                for batch, mgmt, lease, _, _, _ in prepared:
+                    run = mgmt.accelerator_graph_runner.slot_for(lease).run
+                    stops, values, spans = run.results(batch.step_context.repeats)
+                    if batch.node_name == group.unit.streaming_edges[0][1]:
+                        stops = {**stops, STREAM_COUNTS: stream_window.counts,
+                                 STREAM_TRANSITION: stream_window.history}
+                    raw = mgmt.accelerator_graph_runner.slot_for(lease).static_outputs
+                    retained.append(BatchedModelOutput(
+                        check_stop_buffers=stops, row_outputs={**(raw.row_outputs or {}), **values},
+                        output_spans={**(raw.output_spans or {}), **spans} or None,
+                    ))
+            else:
+                retained = prepared[0][1].accelerator_graph_runner.launch_parts(
+                    group.parts, repeats,
+                    [mgmt.run_columns.get(batch.graph_walk, ()) for batch, mgmt, _, _, _, _ in prepared],
+                    capacity=max(repeats, group.capacity), boundary=boundary, initial=group.initial_copies,
+                )
+            for batch, mgmt, _, _, _, _ in prepared:
+                self._commit_step(batch, mgmt, batch.step, batch.step_context)
+                # A later member can advance the same owner. Preserve what
+                # this member publishes now; the worker still decides which
+                # non-aborting rows may materialize/send it.
+                batch.publish_snapshots = self._runner.publish_snapshot(
+                    batch.request_ids, node_name=batch.node_name,
+                    graph_walk=batch.graph_walk, request_walks=batch.step_context.request_walks,
+                )
+                batch.commit_done.set()
+            for (batch, mgmt, lease, inputs, info, _), columns in zip(prepared, retained, strict=True):
+                if streamed:
+                    # Independent counts and policy receipts resolve before a
+                    # model tail or graph completion can see these columns.
+                    batch.outputs = columns
+                    batch.outputs.row_request_ids = tuple(batch.request_ids)
+                    batch.outputs.run_columns = self.run_columns(batch.node_name, batch.graph_walk)
+                    batch.outputs_ready.set()
+                    continue
+                raw = mgmt.accelerator_graph_runner.slot_for(lease).static_outputs
+                if repeats > 1:
+                    raw = dataclasses.replace(
+                        raw, check_stop_buffers=columns.check_stop_buffers,
+                        row_outputs={**(raw.row_outputs or {}), **(columns.row_outputs or {})},
+                        output_spans={**(raw.output_spans or {}), **(columns.output_spans or {})} or None,
+                    )
+                output = self._collect_step(batch, mgmt, lease, raw, inputs, info)
+                if repeats > 1:
+                    output.run_columns = self.run_columns(batch.node_name, batch.graph_walk)
+                batch.outputs = output
+                self._finish_outputs(batch)
+                batch.outputs = self._postprocess_outputs(batch, output)
+            return [batch.outputs for _, batch in group.members]
+        except Exception:
+            if group.submitted or guard.reason is None:
+                raise
+            group.refusal = guard.reason
+            return None
+        finally:
+            if not group.submitted:
+                # Preparation may have queued plan/staging writes. Keep pages
+                # and their buffers owned until those writes have drained.
+                if self.device_capability.is_accelerator:
+                    torch.accelerator.current_stream(self._device).synchronize()
+                for step in reversed(admitted):
+                    self._runner.rollback_admit(step)
+                self.release_group(group)
+            for _, batch in reversed(group.members):
+                batch.release_waiters()
+
+    @staticmethod
+    def _custom_output_tail(submodule: NodeSubmodule) -> bool:
+        kind = type(submodule)
+        return (kind.postprocess is not NodeSubmodule.postprocess
+                or kind.batch_postprocess is not NodeSubmodule.batch_postprocess
+                or kind.filter_batched_output is not NodeSubmodule.filter_batched_output
+                or kind.unpack_packed_outputs is not NodeSubmodule.unpack_packed_outputs)
+
+    def materialize_group_inputs(self, batch: ExecutingBatch, producer: str, signal: str,
+                                 selected: int, width: int) -> None:
+        """Give a single ordinary tail its actual, still-retained stream input."""
+        if not width or not self._custom_output_tail(self._submodules[batch.node_name].submodule):
+            return
+        if width != 1 or batch.step_context.repeats != 1 or len(batch.request_ids) != 1:
+            raise ValueError("a custom connected tail needs exactly one ordinary consumer compute")
+        rid = batch.request_ids[0]
+        edge, = batch.stream_windows[rid]
+        receipt = edge.chunk.reservation
+        chunks = [receipt.transitions[index].chunk for index in receipt.selected_indices(selected)
+                  if receipt.transitions[index].chunk.num_items]
+        if len(chunks) != 1 or edge.name != signal:
+            raise ValueError("a landed consumer does not name its one actual input chunk")
+        chunk, = chunks
+        start = chunk.start_offset - receipt.origin
+        positions = receipt.positions[start:start + chunk.num_items]
+        if start < 0 or len(positions) != chunk.num_items:
+            raise ValueError("a landed consumer input is outside its retained source coverage")
+        items = self._submodules[producer].loopback_rows.ring_read(signal, rid, positions)
+        value = items[0] if chunk.num_items == 1 else items
+        batch.inputs = ConnectedInputs.materialize(batch.inputs, {(producer, batch.node_name, signal, rid): value})
+        batch.uniform_inputs = None
+        batch.per_request_input_tensors = {rid: {**batch.per_request_input_tensors.get(rid, {}), signal: [value]}}
+        metadata = batch.per_request_input_metadata.get(rid, EMPTY_INPUT_METADATA)
+        batch.per_request_input_metadata = {rid: metadata._replace(
+            stream_chunks={**metadata.stream_chunks, signal: chunk._replace(reservation=None)},
+        )}
+        batch.per_request_info_wrapped = {rid: dataclasses.replace(
+            batch.per_request_info_wrapped[rid], metadata=batch.per_request_input_metadata[rid],
+        )}
+
+    def collect_group_outputs(self, batch: ExecutingBatch, width: int, counts: Mapping[int, int]):
+        """Close one independently executed member after its actual count lands.
+
+        The worker closes members in graph order, publishing the producer's
+        real arrivals before settling the consumer's semantic receipt.
+        """
+        raw, reserved = batch.outputs, batch.step_context.repeats
+        if RUN_REPLAYS not in (raw.check_stop_buffers or {}):
+            raise ValueError("independent member collection needs uncollected run outputs")
+        self.settle_run(batch, width, counts)
+        if batch.step is None:
+            batch.step_context.run_counts = MappingProxyType(dict(counts))
+        semantic = {name: value for name, value in raw.check_stop_buffers.items()
+                    if name in (STREAM_COUNTS, STREAM_TRANSITION)}
+        batch.publish_snapshots = self._runner.publish_snapshot(
+            batch.request_ids, node_name=batch.node_name,
+            graph_walk=batch.graph_walk, request_walks=batch.step_context.request_walks,
+        )
+        if width == 0:
+            batch.outputs = BatchedModelOutput(check_stop_buffers=semantic, row_request_ids=tuple(batch.request_ids))
+            return batch.outputs
+        mgmt, lease = self._submodules[batch.node_name], batch.step_context.slot_lease
+        ordinary = self._custom_output_tail(mgmt.submodule)
+        if ordinary and (width != 1 or reserved != 1):
+            raise ValueError("a custom connected tail cannot collect multiple computations")
+        columns = self.run_columns(batch.node_name, batch.graph_walk)
+        buffers = {name: (value[:, :width] if value.ndim > 1 and value.shape[1] == reserved else value)
+                   for name, value in raw.check_stop_buffers.items() if name not in (RUN_COUNTS, RUN_REPLAYS)}
+        values = {name: value[:, :width] if name in columns else value
+                  for name, value in (raw.row_outputs or {}).items()}
+        spans = {name: value[:, :width] if name in columns else value
+                 for name, value in (raw.output_spans or {}).items()}
+        if ordinary:
+            values = {name: value[:, 0] if name in columns else value for name, value in values.items()}
+            spans = {name: value[:, 0] if name in columns else value for name, value in spans.items()}
+            buffers = {name: value[:, 0] if name not in semantic and value.ndim > 1
+                       and value.shape[1] == reserved else value for name, value in buffers.items()}
+        raw = dataclasses.replace(raw, check_stop_buffers=buffers, row_outputs=values, output_spans=spans or None)
+        inputs, info = self._pad_batch(batch, mgmt, lease)
+        output = self._collect_step(batch, mgmt, lease, raw, inputs, info)
+        output.run_columns = frozenset() if ordinary else columns
+        batch.outputs = output
+        self._finish_outputs(batch)
+        batch.outputs = self._postprocess_outputs(batch, output)
+        return batch.outputs
+
+    def release_group(self, group: ExecutionGroup) -> None:
+        """After all member tails (or failure): return their existing capture leases."""
+        event = group.members[group.trigger][1].completion_event
+        if event is not None:
+            event.synchronize()
+        for _, batch in reversed(group.members):
+            lease = batch.step_context.slot_lease
+            if lease is not None:
+                self._submodules[batch.node_name].accelerator_graph_runner.release(lease, len(batch.request_ids))
+                batch.step_context.slot_lease = None
+
+    def _collect_step(
+        self, batch: ExecutingBatch, submodule_mgmt: SubmoduleManagement,
+        lease: SlotLease | None, raw: BatchedModelOutput,
+        inputs: list[NodeInputs], req_info: Mapping[int, CurrentForwardPassInfo],
+    ) -> BatchedModelOutput:
+        """Collect one ordinary member's outputs after its resource commit."""
+        if RUN_DESCRIPTORS in (raw.check_stop_buffers or {}):
+            return raw  # its output owners are fixed only when publication closes
+        if self._enable_nvtx:
+            range_push("engine.collect_outputs")
+        t0 = phase_start()
+        try:
+            out = self._collect_outputs(
+                submodule_mgmt, lease, raw, inputs, req_info,
+                request_ids=batch.request_ids,
+                step_request_ids=batch.step_context.padded_request_ids,
+                graph_walk=batch.step_context.graph_walk,
+                rows_only=batch.rows_only,
+            )
+        finally:
+            phase_end("engine.collect_outputs", t0)
+            if self._enable_nvtx:
+                range_pop()
+        self._add_resource_host_rows(submodule_mgmt, out, batch.step_context.repeats)
+        return out
+
+    def _seed_run_rows(self, batch: ExecutingBatch, slot, immune: Sequence[bool]) -> None:
+        """Pin and publish incumbents before launching an empty membership window."""
+        membership = slot.run.state.membership
+        if not membership.idle or batch.run_rows:
+            raise ValueError("a joining capture must close its previous descriptor readers before reuse")
+        ctx = batch.step_context
+        if ctx.resident is None or batch.step is None or len(immune) != len(batch.request_ids):
+            raise ValueError("joining incumbents need their admitted resident step")
+        for key, binding in ctx.resident.bindings.items():
+            binding.check_horizon(batch.step.get(key), ctx)
+        pins = ctx.resident.pin(batch.request_ids)
+        execution = torch.cuda.current_stream(self._device) if membership.publication_stream is not None else None
+        if execution is not None:
+            membership.publication_stream.wait_stream(execution)
+        publication = torch.cuda.stream(membership.publication_stream) if execution is not None else nullcontext()
+        try:
+            with publication:
+                for row, (rid, resident, ignore) in enumerate(zip(batch.request_ids, pins, immune, strict=True)):
+                    descriptor = membership.reserve_row(
+                        rid, self._runner.request_generation(rid), row, (resident, int(ignore)),
+                    )
+                    if descriptor is None:
+                        raise ValueError("a fresh membership window lacks descriptor credits")
+                    batch.run_rows[rid] = descriptor
+                for descriptor in batch.run_rows.values():
+                    membership.publish_row(descriptor)
+            if execution is not None:
+                execution.wait_stream(membership.publication_stream)
+        except BaseException:
+            # No WHILE was submitted. Drain only this previously empty window,
+            # and finish queued copies before making owner rows reusable.
+            with torch.cuda.stream(membership.publication_stream) if execution is not None else nullcontext():
+                for descriptor in batch.run_rows.values():
+                    membership.cancel(descriptor)
+                membership.drain()
+            if execution is not None:
+                membership.publication_stream.synchronize()
+            membership.acknowledge(membership.control.cpu().tolist())
+            for descriptor in batch.run_rows.values():
+                membership.release(descriptor)
+            batch.run_rows.clear()
+            ctx.resident.unpin(pins)
+            raise
+
+    def admit_run_row(self, batch: ExecutingBatch, active: ExecutingBatch, row: int) -> RunRow | None:
+        """Prepare one ordinary logical step beside an active capture.
+
+        Called on its membership publication stream, after the worker takes
+        the ordinary graph in-flight flag/request hold. No host plan, capture
+        staging, or forward runs here. The worker attaches the returned receipt
+        before publishing its descriptor; an unpublished receipt can settle at
+        zero using the same actual-count path as an executed one.
+        """
+        if (batch.node_name != active.node_name or batch.graph_walk != active.graph_walk
+                or len(batch.request_ids) != 1 or batch.run_rows or batch.committed is not None
+                or batch.chunk_ranges or batch.step_context.request_walks):
+            raise ValueError("joining needs one fresh ordinary row of the active walk")
+        mgmt = self._submodules[batch.node_name]
+        lease = active.step_context.slot_lease
+        if lease is None or mgmt.resident is None:
+            raise ValueError("joining needs an active resident capture")
+        slot = mgmt.accelerator_graph_runner.slot_for(lease)
+        membership = None if slot.run is None else slot.run.state.membership
+        if membership is None or not 0 <= row < lease.bucket.bs:
+            raise ValueError("joining row falls outside the active membership capture")
+        membership._check_publication_stream()
+        if set(active.run_rows) != set(active.request_ids):
+            raise ValueError("joining needs pinned incumbent descriptor readers")
+        ctx = batch.step_context
+        if ctx.repeats != active.step_context.repeats or ctx.repeats < 1:
+            raise ValueError("joining rows must reserve the complete active capture horizon")
+        if batch.inputs is None or batch.failed_requests or batch.skipped_rids or batch.cached_rids:
+            raise ValueError("joining needs a successfully prepared ordinary row")
+        rid = batch.request_ids[0]
+        ctx.slot, ctx.slot_lease, ctx.resident = lease.slot, lease, mgmt.resident
+        step = batch.step = self._declare_step(batch, [rid], batch.inputs, mgmt.submodule, ctx, batch.step)
+        if step is None or step.cg_key_info != node_capture_key(lease.bucket.cg_key_info):
+            raise ValueError("joining step does not match the active capture declaration")
+        step.set_ctx(ctx)
+        outcome = self._runner.admit_rows(step)
+        if not outcome.ok:
+            return None  # admit_rows already unwound this candidate alone
+        plan = descriptor = None
+        try:
+            if not outcome.ready:
+                return None
+            plan = ctx.resident.prepare_rows(step, ctx)
+            inputs, infos = self._pad_batch(batch, mgmt, lease)
+            engine_inputs, preprocessed = self._preprocess_step(
+                batch, mgmt, [rid], inputs, infos, ctx, lease, step,
+            )
+            for name, captured in slot.static_inputs.items():
+                if not isinstance(captured, torch.Tensor) and preprocessed.get(name) != captured:
+                    raise ValueError("joining inputs change a captured non-tensor specialization")
+            if slot.row_heads:
+                if batch.kept_rows != [True] and any(
+                    not isinstance(preprocessed.get(name), torch.Tensor) for name in slot.row_heads.values()
+                ):
+                    raise ValueError("joining row has no routed value for a captured input owner")
+                self._write_routed_rows(batch, mgmt, slot, engine_inputs, preprocessed, stager=membership.stager)
+            if slot.run.window is not None:
+                snapshot = batch.iteration_columns
+                if not isinstance(snapshot, IterationWindow):
+                    raise ValueError("joining iteration inputs need their prepared owner window")
+                mgmt.submodule.iteration_tables.stage_window(
+                    lease, plan.slots.tolist(), snapshot, stager=membership.stager,
+                )
+                batch.iteration_columns = snapshot
+            policy = mgmt.device_stops[batch.graph_walk]
+            immune = policy is not None and policy.limits(batch.per_request_info_wrapped[rid]).ignore_eos
+            descriptor = membership.reserve_row(
+                rid, self._runner.request_generation(rid), row, (int(plan.slots[0]), int(immune)),
+            )
+            if descriptor is None:
+                return None
+            if mgmt.rings:
+                self._reserve_rings(mgmt, batch)
+            ctx.resident.flush(plan, stager=membership.stager)
+            self._runner.commit(step, track_rows=True)
+            batch.committed = step
+            batch.run_started = active.run_started
+            ctx.resident_plan = plan
+            batch.run_rows[rid] = descriptor
+            ctx.resident.advance(plan)
+            return descriptor
+        finally:
+            if batch.committed is None:
+                # Failed preparation may have queued writes into the candidate's
+                # private rows. Finish those before releasing/reusing owners.
+                if membership.publication_stream is not None:
+                    membership.publication_stream.synchronize()
+                if descriptor is not None:
+                    membership.cancel(descriptor)
+                    membership.release(descriptor)
+                if plan is not None:
+                    ctx.resident.release(rid)
+                    ctx.resident.unpin(tuple(plan.slots.tolist()))
+                self._runner.rollback_admit(step)
+
+    def finish_run_outputs(self, batch: ExecutingBatch, outputs: BatchedModelOutput) -> None:
+        """Finish a retained capture after all descriptor copies are enqueued.
+
+        Runs on the same execution stream as collection. The worker keeps the
+        capture out of scheduling until this transition and retains owner/
+        descriptor readers until the collection completion event lands.
+        """
+        if (RUN_DESCRIPTORS not in (batch.outputs.check_stop_buffers or {})
+                or RUN_DESCRIPTORS in (outputs.check_stop_buffers or {})):
+            raise ValueError("a retained run must finish once with identity-resolved outputs")
+        lease = batch.step_context.slot_lease
+        if lease is None:
+            raise ValueError("a retained run has no capture lease")
+        self._submodules[batch.node_name].accelerator_graph_runner.release(lease, len(batch.request_ids))
+        batch.outputs = outputs
+        # Each positive logical receipt already published its own loop-back
+        # metadata. This physical capture may also have zero-execution rows.
+        batch.outputs_ready.set()
+
+    def run_membership(self, batch: ExecutingBatch):
+        """The declared membership owner of this retained capture."""
+        lease = batch.step_context.slot_lease
+        if lease is None or not batch.run_rows:
+            return None
+        runner = self._submodules[batch.node_name].accelerator_graph_runner
+        return runner.slot_for(lease).run.state.membership
+
+    def collect_run_outputs(
+        self, batch: ExecutingBatch,
+        records: Sequence[tuple[BatchedModelOutput, Sequence[Sequence[int]]]],
+    ) -> BatchedModelOutput:
+        """Collect a settled logical receipt under its own inputs and metadata.
+
+        The worker settles the complete admitted membership first and returns
+        proved-zero rows separately. This tail only sees rows that executed;
+        descriptor identities, never the physical capture rows, select values.
+        Capture storage and owner pins remain held until these copies finish.
+        """
+        ctx = batch.step_context
+        if (ctx.run_counts is None or not batch.request_ids
+                or any(ctx.run_counts.get(rid, 0) <= 0 for rid in batch.request_ids)):
+            raise ValueError("run output collection needs settled, nonempty logical rows")
+        width = max(ctx.run_counts[rid] for rid in batch.request_ids)
+        if ctx.repeats != width:
+            raise ValueError("run output width must match its settled logical receipt")
+        columns = self.run_columns(batch.node_name, batch.graph_walk)
+        rows = []
+        for rid in batch.request_ids:
+            descriptor = batch.run_rows[rid]
+            actual = sum(ids.count(descriptor.handle) for _, identities in records for ids in identities)
+            output = self._run_row_output(records, descriptor.handle, width)
+            if output is None or actual != ctx.run_counts[rid]:
+                raise ValueError("descriptor output count disagrees with its settled receipt")
+            for values in (output.row_outputs, output.output_spans):
+                for name, value in (values or {}).items():
+                    if name not in columns:
+                        values[name] = value[:, actual - 1]
+            rows.append(output)
+
+        def join(attribute: str, excluded=frozenset()):
+            values = [getattr(row, attribute) or {} for row in rows]
+            names = values[0].keys() - excluded
+            if any(value.keys() - excluded != names for value in values):
+                raise ValueError("logical rows have incompatible retained outputs")
+            return {name: torch.cat([value[name] for value in values]) for name in names}
+
+        raw = BatchedModelOutput(
+            check_stop_buffers=join("check_stop_buffers", {RUN_COUNTS, RUN_REPLAYS}),
+            row_outputs=join("row_outputs") or None, output_spans=join("output_spans") or None,
+        )
+        mgmt = self._submodules[batch.node_name]
+        if mgmt.rings:
+            # A width-one physical capture still stores an iteration axis.
+            ring_raw = raw
+            if batch.ring_width == 1:
+                ring_raw = BatchedModelOutput(
+                    check_stop_buffers={k: v[:, 0] for k, v in (raw.check_stop_buffers or {}).items()},
+                    row_outputs={k: v[:, 0] if k in columns else v for k, v in (raw.row_outputs or {}).items()},
+                )
+            self._write_rings(mgmt, batch, ring_raw)
+        outputs = self._collect_outputs(
+            mgmt, None, raw, batch.inputs, batch.per_request_info_wrapped,
+            batch.request_ids, tuple(batch.request_ids), batch.graph_walk, rows_only=batch.rows_only,
+        )
+        outputs.run_columns = self.run_columns(batch.node_name, batch.graph_walk)
+        outputs.loopback_rids = batch.loopback_rids
+        self._record_loopback(batch)
+        return self._postprocess_outputs(batch, outputs)
+
+    @staticmethod
+    def _run_row_output(
+        records: Sequence[tuple[BatchedModelOutput, Sequence[Sequence[int]]]], descriptor: int, width: int,
+    ) -> BatchedModelOutput | None:
+        """Compact one logical row from completed, descriptor-stamped runs.
+
+        The caller retains each capture until this copy finishes and supplies
+        identity columns from the same completed publication as the outputs.
+        Physical row/launch boundaries do not define this request's ordinal.
+        Zero execution has no output to collect or pass to a model tail.
+        """
+        if descriptor <= 0 or width < 1:
+            raise ValueError("a run row needs a positive descriptor and logical width")
+        selected = []
+        shapes = []
+        metadata = {RUN_COUNTS, RUN_REPLAYS, RUN_DESCRIPTORS}
+        for index, (raw, identities) in enumerate(records):
+            if raw.per_rid_outputs or raw.packed_outputs:
+                raise ValueError("joining outputs must retain row-addressed iteration columns")
+            columns = len(identities[0]) if identities else 0
+            if any(len(row) != columns for row in identities):
+                raise ValueError("run identity rows must have one common width")
+            shapes.append((len(identities), columns))
+            for column in range(columns):
+                rows = [row for row, ids in enumerate(identities) if ids[column] == descriptor]
+                if len(rows) > 1:
+                    raise ValueError("a descriptor executed on two physical rows in one iteration")
+                selected.extend((index, row, column) for row in rows)
+        if not selected:
+            return None
+        if len(selected) > width:
+            raise ValueError("a run row executed beyond its admitted logical horizon")
+
+        def gather(attribute: str, excluded=frozenset()) -> dict[str, torch.Tensor]:
+            sources = [getattr(raw, attribute) or {} for raw, _ in records]
+            names = sources[0].keys() - excluded
+            if any(source.keys() - excluded != names for source in sources):
+                raise ValueError("queued runs changed their retained output names")
+            output = {}
+            for name in names:
+                values = [source[name] for source in sources]
+                if any(not isinstance(value, torch.Tensor) or value.ndim < 2
+                       or tuple(value.shape[:2]) != shape for value, shape in zip(values, shapes, strict=True)):
+                    raise ValueError(f"run output {name!r} has no matching row/iteration columns")
+                pieces = [values[index][row:row + 1, column:column + 1] for index, row, column in selected]
+                # Preserve ordinary repeated-step tail semantics; actual counts
+                # below distinguish these padding values from executed work.
+                pieces.extend([pieces[-1]] * (width - len(pieces)))
+                output[name] = torch.cat(pieces, dim=1)
+            return output
+
+        stops = gather("check_stop_buffers", metadata)
+        rows = gather("row_outputs")
+        spans = gather("output_spans")
+        anchor = next(iter(stops.values()), next(iter(rows.values()), next(iter(spans.values()), None)))
+        if anchor is None:
+            raise ValueError("a joining run retained no row-addressed outputs")
+        count = anchor.new_full((1,), len(selected), dtype=torch.long)
+        stops.update({RUN_COUNTS: count, RUN_REPLAYS: count})
+        return BatchedModelOutput(check_stop_buffers=stops, row_outputs=rows or None, output_spans=spans or None)
+
     @staticmethod
     def _add_resource_host_rows(
-        submodule_mgmt: SubmoduleManagement, out: BatchedModelOutput,
+        submodule_mgmt: SubmoduleManagement, out: BatchedModelOutput, repeats: int,
     ) -> None:
         """Adds ``Resource.step_host_rows`` to the step's stop buffers."""
         for key, resource in submodule_mgmt.resources.items():
-            if not (rows := resource.step_host_rows()):
+            if not (rows := resource.step_host_rows(repeats)):
                 continue
             if out.check_stop_buffers is None:
                 raise RuntimeError(
@@ -1969,9 +3608,52 @@ class Engine:
         ctx: StepContext,
         step: SubmoduleStep | None=None,
     ) -> tuple[AdmitOutcome, SubmoduleStep]:
+        step = self._declare_step(batch, rids, inputs, submodule, ctx, step)
+        return self._admit_step(batch, rids, inputs, ctx, step), step
+
+    def _admit_step(
+        self, batch: ExecutingBatch, rids: Sequence[int], inputs: list[NodeInputs],
+        ctx: StepContext, step: SubmoduleStep | None,
+    ) -> AdmitOutcome:
+        if step is None:
+            return ADMIT_OK
+        nvtx = self._enable_nvtx
+        if batch.chunk_ranges:
+            ctx.chunk_tokens_after = {
+                rid: inp.chunk_total - inp.chunk_start - inp.input_seq_len
+                for rid, inp in zip(rids, inputs, strict=True)
+                if not inp.is_final_chunk
+            }
+            ctx.reserve_whole_prefill = PerReqSetting.over(
+                ctx.chunk_tokens_after,
+                lambda rid: self._chunking.policy(
+                    batch.node_name, batch.step_context.walk_of(rid),
+                ).reserve_whole_prefill,
+            )
+        step.set_ctx(ctx)
+        if nvtx:
+            range_push("engine.admit")
+        t0 = phase_start()
+        try:
+            admit_outcome = self._runner.admit(step)
+        finally:
+            phase_end("engine.admit", t0)
+            if nvtx:
+                range_pop()
+        if not admit_outcome.ok:
+            batch.register_admit_error(admit_outcome.reason, admit_outcome.failed_resource)
+            for rid in batch.first_chunk_rids:
+                self._chunking.release(rid, batch.node_name)
+        return admit_outcome
+
+    def _declare_step(
+        self, batch: ExecutingBatch, rids: Sequence[int], inputs: list[NodeInputs],
+        submodule: NodeSubmodule, ctx: StepContext, step: SubmoduleStep | None,
+    ) -> SubmoduleStep | None:
+        """Declare once, separately from admission so a unit can preflight it."""
         if step is None:
             self._maybe_lease_piecewise_regions(batch.node_name, ctx, inputs)
-            if nvtx:
+            if self._enable_nvtx:
                 range_push("engine.declare_step")
             t0 = phase_start()
             try:
@@ -1984,48 +3666,9 @@ class Engine:
                 )
             finally:
                 phase_end("engine.declare_step", t0)
-                if nvtx:
+                if self._enable_nvtx:
                     range_pop()
-        if step is None:
-            # the submodule declared no step (a node owning no resources);
-            # there is nothing to admit, and the forward still runs
-            return ADMIT_OK, None
-        if batch.chunk_ranges:
-            walk_of = batch.step_context.walk_of
-            ctx.chunk_tokens_after = {
-                rid: inp.chunk_total - inp.chunk_start - inp.input_seq_len
-                for rid, inp in zip(rids, inputs, strict=True)
-                if not inp.is_final_chunk
-            }
-            ctx.reserve_whole_prefill = PerReqSetting.over(
-                ctx.chunk_tokens_after,
-                lambda rid: self._chunking.policy(
-                    batch.node_name, walk_of(rid),
-                ).reserve_whole_prefill,
-            )
-        # admit reads the step's ctx, so bind it before the sweep rather than
-        # in `_drive_step`
-        step.set_ctx(ctx)
-
-        if nvtx:
-            range_push("engine.admit")
-        t0 = phase_start()
-        try:
-            admit_outcome = self._runner.admit(step)
-        finally:
-            phase_end("engine.admit", t0)
-            if nvtx:
-                range_pop()
-
-        if not admit_outcome.ok:
-            batch.register_admit_error(
-                admit_outcome.reason, admit_outcome.failed_resource,
-            )
-            # A retry prepares the row again, so its length and cached prefix
-            # are checked against the pages it then finds, not the ones before.
-            for rid in batch.first_chunk_rids:
-                self._chunking.release(rid, batch.node_name)
-        return admit_outcome, step
+        return step
 
     def _maybe_lease_piecewise_regions(
         self, node_name: str, ctx: StepContext, inputs: list[NodeInputs],
@@ -2058,29 +3701,19 @@ class Engine:
         if leases:
             ctx.set_piecewise_leases(leases)
 
-    def _drive_step(
+    def _plan_step(
         self,
         batch: ExecutingBatch,
         submodule_mgmt: SubmoduleManagement,
-        request_ids: list[str],
+        request_ids: list[int],
         inputs: list[NodeInputs],
-        req_info: Mapping[str, CurrentForwardPassInfo],
+        req_info: Mapping[int, CurrentForwardPassInfo],
         ctx: StepContext,
         lease: SlotLease | None,
-        running_batched: bool,
         step: SubmoduleStep | None,
-        set_launch: bool,
-    ) -> tuple[dict | None, SubmoduleStep | None]:
-        """declare → admit → plan → preprocess → forward → commit for one forward.
-
-        ``request_ids`` are the real rids (for admit-fail / collect); the model
-        runs over ``ctx.request_ids`` (padded under a lease). Returns
-        ``(raw_outputs, step)``; ``raw_outputs`` is None when admit failed.
-        """
+    ) -> tuple[ModelInputsFromEngine, dict[str, Any]]:
+        """Plan and preprocess an admitted ordinary step, without launching it."""
         nvtx = self._enable_nvtx
-        cg_runner = submodule_mgmt.accelerator_graph_runner
-        submodule = submodule_mgmt.submodule
-        rids = list(ctx.padded_request_ids)
 
         if step is not None:
             if lease is not None and step.cg_key_info != node_capture_key(lease.bucket.cg_key_info):
@@ -2123,6 +3756,17 @@ class Engine:
                 if nvtx:
                     range_pop()
 
+        return self._preprocess_step(batch, submodule_mgmt, request_ids, inputs, req_info, ctx, lease, step)
+
+    def _preprocess_step(
+        self, batch: ExecutingBatch, submodule_mgmt: SubmoduleManagement,
+        request_ids: list[int], inputs: list[NodeInputs], req_info: Mapping[int, CurrentForwardPassInfo],
+        ctx: StepContext, lease: SlotLease | None, step: SubmoduleStep | None,
+    ) -> tuple[ModelInputsFromEngine, dict[str, Any]]:
+        """Prepare declared inputs without planning or writing capture buffers."""
+        nvtx = self._enable_nvtx
+        cg_runner, submodule = submodule_mgmt.accelerator_graph_runner, submodule_mgmt.submodule
+        rids = list(ctx.padded_request_ids)
         laps = PhaseLaps("engine.")
         engine_inputs = ModelInputsFromEngine(
             request_ids=rids,
@@ -2138,20 +3782,75 @@ class Engine:
             real_seq_len=sum(inp.input_seq_len for inp in inputs[:len(request_ids)]),
             step=step,
             per_request_input_metadata=batch.per_request_input_metadata,
+            loopback_rows=submodule_mgmt.loopback_rows,
+            rows_in_graph=lease is not None and bool(cg_runner.slot_for(lease).row_heads),
         )
         laps.lap("engine_inputs")
         if nvtx:
             range_push("engine.preprocess")
         t0 = phase_start()
         try:
-            preprocessed = submodule.preprocess(
-                ctx.graph_walk, engine_inputs=engine_inputs, inputs=inputs,
-            )
+            columns = None
+            if getattr(submodule, "ITERATION_INPUTS", None):
+                run = None if lease is None else cg_runner.slot_for(lease).run
+                loop = (
+                    self._loops[(batch.node_name, ctx.graph_walk)]
+                    if run is not None and run.window is not None else None
+                )
+                batch.iteration_columns = self._iteration_columns(
+                    batch.node_name, submodule, ctx, rids, req_info, batch.per_request_input_tensors,
+                    actual_loop=loop,
+                )
+                columns = batch.iteration_columns
+                if isinstance(columns, IterationWindow):
+                    columns = columns.columns
+                engine_inputs.iteration_inputs = columns
+            if ctx.resident is None and ctx.repeats == 1:
+                preprocessed = submodule.preprocess(ctx.graph_walk, engine_inputs=engine_inputs, inputs=inputs)
+            else:
+                with watch_table_reads() as reads:
+                    preprocessed = submodule.preprocess(ctx.graph_walk, engine_inputs=engine_inputs, inputs=inputs)
+                table = next((r for r in reads if r != LOOP_COUNTER), None)
+                if table is not None and ctx.resident is not None:
+                    # a branch the capture template didn't take at load: the step's rows fail
+                    raise ValueError(
+                        f"{batch.node_name}/{ctx.graph_walk}: a resident step's preprocess read {table}, "
+                        "which its graph fills after it; serve it with resident_planning: off"
+                    )
+                _refuse_counter_read(batch.node_name, ctx, reads, "preprocess")
+            for name, column in (columns or {}).items():
+                preprocessed.setdefault(name, column[:, 0])
         finally:
             phase_end("engine.preprocess", t0)
             if nvtx:
                 range_pop()
 
+        return engine_inputs, preprocessed
+
+    def _drive_step(
+        self,
+        batch: ExecutingBatch,
+        submodule_mgmt: SubmoduleManagement,
+        request_ids: list[str],
+        inputs: list[NodeInputs],
+        req_info: Mapping[str, CurrentForwardPassInfo],
+        ctx: StepContext,
+        lease: SlotLease | None,
+        running_batched: bool,
+        step: SubmoduleStep | None,
+        set_launch: bool,
+    ) -> tuple[dict | None, SubmoduleStep | None]:
+        """Plan, preprocess, forward and commit one admitted ordinary step.
+
+        ``request_ids`` are the real rids (for admit-fail / collect); the model
+        runs over ``ctx.request_ids`` (padded under a lease). Returns
+        ``(raw_outputs, step)``; ``raw_outputs`` is None when admit failed.
+        """
+        engine_inputs, preprocessed = self._plan_step(
+            batch, submodule_mgmt, request_ids, inputs, req_info, ctx, lease, step,
+        )
+        nvtx = self._enable_nvtx
+        cg_runner = submodule_mgmt.accelerator_graph_runner
         if self._enable_profile and batch.exec_timings.fwd_start is None:
             batch.exec_timings.fwd_start = time.perf_counter()
         # The waiter is released inside the forward, immediately before the
@@ -2168,19 +3867,36 @@ class Engine:
             with fp32_precision_scope(submodule_mgmt.fp32_precision):
                 raw = self._forward(
                     batch, submodule_mgmt, cg_runner, engine_inputs, preprocessed,
-                    lease, running_batched, request_ids, release_event,
+                    lease, running_batched, request_ids, step, release_event,
                 )
         finally:
             phase_end("engine.forward", t0)
             if nvtx:
                 range_pop()
 
+        if batch.stream_windows and batch.run_started is None:
+            # Physical execution is known before output collection or a model
+            # tail can fail. Per-request forwards aggregate into the batch's
+            # existing execution facts, not their temporary resource contexts.
+            actual = dict(batch.step_context.run_counts or {})
+            actual.update(dict.fromkeys(request_ids, ctx.repeats))
+            batch.step_context.run_counts = MappingProxyType(actual)
+
+        self._commit_step(batch, submodule_mgmt, step, ctx)
+        return raw, step
+
+    def _commit_step(
+        self, batch: ExecutingBatch, submodule_mgmt: SubmoduleManagement,
+        step: SubmoduleStep | None, ctx: StepContext,
+    ) -> None:
+        """Settle one submitted step through the ordinary resource owners."""
+        nvtx = self._enable_nvtx
         if step is not None:
             if nvtx:
                 range_push("engine.commit")
             t0 = phase_start()
             try:
-                self._runner.commit(step)
+                self._runner.commit(step, track_rows=batch.run_started is not None)
                 batch.committed = step
                 if submodule_mgmt.resident is not None:
                     submodule_mgmt.resident.commit(step, ctx)
@@ -2188,7 +3904,39 @@ class Engine:
                 phase_end("engine.commit", t0)
                 if nvtx:
                     range_pop()
-        return raw, step
+
+    def _stage_capture(
+        self, batch: ExecutingBatch, submodule_mgmt: SubmoduleManagement,
+        cg_runner, engine_inputs: ModelInputsFromEngine, preprocessed: dict[str, Any],
+        lease: SlotLease, request_ids: Sequence[int],
+    ):
+        """Stage an admitted capture's existing owners without launching it."""
+        graph_walk = batch.step_context.graph_walk
+        ctx = batch.step_context
+        if ctx.resident is not None:
+            ctx.resident.flush(ctx.resident_plan)
+        slot = cg_runner.slot_for(lease)
+        if slot.row_heads:
+            self._write_routed_rows(batch, submodule_mgmt, slot, engine_inputs, preprocessed)
+        if slot.run is not None:
+            policy = submodule_mgmt.device_stops[graph_walk]
+            infos = engine_inputs.per_request_info
+            immune = [policy is not None and policy.limits(infos[rid]).ignore_eos for rid in request_ids]
+            slot.run.state.stage(len(request_ids), immune, ctx.repeats, submodule_mgmt.refills[graph_walk])
+            if slot.run.state.membership is not None:
+                self._seed_run_rows(batch, slot, immune)
+            if slot.run.window is not None:
+                submodule_mgmt.submodule.iteration_tables.stage_window(
+                    lease, ctx.resident_plan.slots.tolist(), batch.iteration_columns,
+                )
+            else:
+                slot.run.stage_inputs(batch.iteration_columns)
+            batch.run_started = slot.run.state.started
+        streamed = submodule_mgmt.device_stream_tokens.get(graph_walk)
+        if streamed is not None and ctx.repeats > 1:
+            batch.token_stream = cg_runner.token_stream(lease, *streamed)
+            batch.token_stream.begin(request_ids)
+        return slot
 
     def _forward(
         self,
@@ -2200,6 +3948,7 @@ class Engine:
         lease: SlotLease | None,
         running_batched: bool,
         request_ids: list[str],
+        step: SubmoduleStep,
         release_event: "threading.Event | None" = None,
     ) -> BatchedModelOutput:
         """Replay the leased slot, or run the eager forward.
@@ -2209,31 +3958,103 @@ class Engine:
         graph_walk = batch.step_context.graph_walk
         if lease is not None:
             ctx = batch.step_context
-            if ctx.resident is not None:
-                ctx.resident.flush(ctx.resident_plan)
-            return cg_runner.run_forward(
+            slot = self._stage_capture(
+                batch, submodule_mgmt, cg_runner, engine_inputs, preprocessed, lease, request_ids,
+            )
+            streamed = submodule_mgmt.device_stream_tokens.get(graph_walk)
+            out = cg_runner.run_forward(
                 lease, preprocessed,
                 plan_done_event=batch.preplan_event,
                 launch_started_event=release_event,
             )
+            if slot.run is not None and (ctx.repeats > 1 or slot.run.state.membership is not None):
+                stops, rows, spans = slot.run.results(ctx.repeats)
+                out = dataclasses.replace(
+                    out, check_stop_buffers=stops, row_outputs={**(out.row_outputs or {}), **rows},
+                    output_spans={**(out.output_spans or {}), **spans} or None,
+                )
+            elif slot.run is not None:
+                # A width-one launch can consist entirely of rows stopped by
+                # its predecessor. Preserve ordinary output shapes, but settle
+                # those rows from the device's counts as for a longer run.
+                out = dataclasses.replace(
+                    out, check_stop_buffers={**(out.check_stop_buffers or {}), **slot.run.execution_counts()},
+                )
+            elif ctx.repeats > 1:
+                columns = submodule_mgmt.run_columns.get(graph_walk, frozenset())
+                # a signal in the rows moves through them, in the graph
+                carries = {s: pair for s, pair in submodule_mgmt.carries[graph_walk].items() if s not in slot.row_heads}
+                part = cg_runner.run_part(
+                    lease, carries, self._runner.replay_columns(step, ctx.repeats), batch.iteration_columns,
+                )
+                stops, rows, spans = cg_runner.repeat(
+                    [part], ctx.repeats, columns,
+                    None if batch.token_stream is None else (batch.token_stream, streamed[0]),
+                )
+                out = dataclasses.replace(
+                    out, check_stop_buffers=stops, row_outputs={**(out.row_outputs or {}), **rows},
+                    output_spans={**(out.output_spans or {}), **spans} or None,
+                )
+            return out
         if release_event is not None:
             release_event.set()
         if running_batched:
-            return BatchedModelOutput.coerce(
+            out = BatchedModelOutput.coerce(
                 submodule_mgmt.forward_batched(
                     graph_walk, engine_inputs=engine_inputs, **preprocessed
                 )
             )
-        assert len(request_ids) == 1, (
-            "the unbatched forward takes one request; batch of "
-            f"{len(request_ids)} needs running_batched"
-        )
-        out = submodule_mgmt.forward(
-            graph_walk, engine_inputs=engine_inputs, **preprocessed
-        )
-        if isinstance(out, BatchedModelOutput):
-            return out
-        return BatchedModelOutput.coerce({request_ids[0]: out})
+            self._keep_rows(submodule_mgmt, graph_walk, engine_inputs.request_ids, out)
+        else:
+            assert len(request_ids) == 1, (
+                "the unbatched forward takes one request; batch of "
+                f"{len(request_ids)} needs running_batched"
+            )
+            raw = submodule_mgmt.forward(graph_walk, engine_inputs=engine_inputs, **preprocessed)
+            out = raw if isinstance(raw, BatchedModelOutput) else BatchedModelOutput.coerce({request_ids[0]: raw})
+        return out
+
+    def _finish_ordinary_iterations(self, batch, mgmt, output: BatchedModelOutput) -> None:
+        """Publish an ordinary fallback after its complete node computation.
+
+        This includes plain captures and output-name normalization in the tail.
+        Dependent fallback steps are rebuilt after their predecessor settles.
+        """
+        layouts = self.iteration_layouts(batch.node_name) or {}
+        rids = output.row_request_ids or tuple(batch.request_ids)
+        infos_by_rid = batch.per_request_info_wrapped
+        for walk, loop in layouts.items():
+            positions = [i for i, rid in enumerate(rids) if rid in infos_by_rid
+                         and rid not in batch.cached_rids and rid not in batch.failed_requests
+                         and batch.step_context.walk_of(rid) == walk]
+            if not positions:
+                continue
+            selected = [rids[i] for i in positions]
+            infos = [infos_by_rid[rid] for rid in selected]
+            policy = mgmt.device_stops[walk]
+            # A cap-only Loop never schedules beyond its remaining room. It
+            # needs no persistent EOS marker; a new Loop entry resets position.
+            limits = [] if policy is None else [policy.limits(info) for info in infos]
+            stopped = to_device_nonblocking([
+                limit.max_iters is not None and info.metadata.dynamic_loop_iter_counts.get(loop.name, 0) + 1
+                >= limit.max_iters for info, limit in zip(infos, limits, strict=True)
+            ] if policy is not None else [False] * len(infos), self._device, dtype=torch.bool)
+            if policy is not None and policy.reads_token:
+                tokens = output_named(output, policy.token_signal)
+                if tokens is None:
+                    tokens = torch.stack([
+                        output.per_rid_outputs[rid][policy.token_signal][0].reshape(-1)[0] for rid in selected
+                    ])
+                else:
+                    pick = to_device_nonblocking(positions, self._device, dtype=torch.long)
+                    tokens = tokens.reshape(tokens.shape[0], -1)[:, 0].index_select(0, pick)
+                ids = to_device_nonblocking(list(policy.eos_tokens), self._device, dtype=tokens.dtype)
+                immune = to_device_nonblocking([limit.ignore_eos for limit in limits], self._device, dtype=torch.bool)
+                stopped.logical_or_(torch.isin(tokens, ids) & ~immune)
+            entries = to_device_nonblocking([
+                self._iteration_entry(rid, info.metadata, loop) for rid, info in zip(selected, infos, strict=True)
+            ], self._device, dtype=torch.long)
+            mgmt.loopback_rows.finish_iteration(walk, loop, selected, entries, stopped)
 
     def postprocess_batch(
         self, batch: ExecutingBatch, outputs: BatchedModelOutput,
@@ -2260,20 +4081,29 @@ class Engine:
         submodule_mgmt = self._submodules[batch.node_name]
         submodule = submodule_mgmt.submodule
         failed = batch.failed_requests
+        columns = loop_back = ()
+        if batch.step_context.repeats > 1 or outputs.run_columns:
+            columns = submodule_mgmt.run_columns.get(batch.graph_walk, frozenset())
+            # loop-back signals a node may name after a run column (``text_inputs = new_token``)
+            loop_back = [s for s in submodule_mgmt.carries.get(batch.graph_walk, {}) if s not in columns]
         for rid, node_inputs in zip(batch.request_ids, batch.inputs, strict=True):
             if failed and rid in failed:
                 # its per-request forward raised: nothing to finish, and a
                 # second raise here would replace the error the client gets
                 continue
+            rid_outputs = outputs.get(rid, {})
             try:
                 submodule.postprocess(
                     request_id=rid,
                     request_info=batch.per_request_info_wrapped[rid],
-                    outputs=outputs.get(rid, {}),
+                    outputs=rid_outputs,
                     inputs=node_inputs,
                 )
             except Exception as error:
                 batch.register_failure(rid, error)
+                continue
+            if loop_back:
+                _last_iteration_loops_back(rid_outputs, columns, loop_back)
         if type(submodule).batch_postprocess is not NodeSubmodule.batch_postprocess:
             live = [
                 (rid, node_inputs)
@@ -2307,7 +4137,15 @@ class Engine:
         ``prepare_inputs`` and the stop check stay outside — the worker has to
         place those itself.
         """
-        outputs = self.exec(batch)
+        beside = self._stage_lock is not None and self._beside_chain(batch.node_name, batch.graph_walk)
+        with self._stage_lock if beside else nullcontext():
+            outputs = self.exec(batch)
+        return self._postprocess_outputs(batch, outputs)
+
+    def _postprocess_outputs(self, batch: ExecutingBatch, outputs: BatchedModelOutput) -> BatchedModelOutput:
+        """The ordinary host tail, shared by independent and grouped steps."""
+        if RUN_DESCRIPTORS in (outputs.check_stop_buffers or {}):
+            return outputs  # descriptor grouping precedes every identity-dependent tail
         laps = PhaseLaps("engine.")
         # A failed admit means no forward ran and every rid's outputs are empty,
         # so the tail has nothing to consume; the worker re-drives the step.
@@ -2323,10 +4161,47 @@ class Engine:
                         outputs, batch.per_request_info_wrapped, batch.inputs,
                         piecewise_runners=submodule_mgmt.piecewise_runners,
                     )
+            mgmt = self._submodules[batch.node_name]
+            if (batch.run_started is None and mgmt.device_stops
+                    and getattr(mgmt.submodule, "ITERATION_INPUTS", None)):
+                self._finish_ordinary_iterations(batch, mgmt, outputs)
             for rid in batch.cached_rids:
                 self._runner.complete_cached_walk(rid, batch.node_name, batch.step_context.walk_of(rid))
         laps.lap("tail")
         return outputs
+
+    def reads_tokens(self, node_name: str) -> bool:
+        """Whether the node keeps its landed tokens (``NodeSubmodule.record_tokens``)."""
+        mgmt = self._submodules.get(node_name)
+        return mgmt is not None and type(mgmt.submodule).record_tokens is not NodeSubmodule.record_tokens
+
+    def record_tokens(self, batch: ExecutingBatch, walk_rids: Mapping[str, Sequence[int]], host_rows: HostRows) -> None:
+        """Hand the node the host tokens of the rows it reads them for."""
+        submodule = self._submodules[batch.node_name].submodule
+        buffer = host_rows.buffers[submodule.token_stop.buffer]
+        row_of = {rid: i for i, rid in enumerate(host_rows.request_ids)}
+        tokens = None
+        for walk, rids in walk_rids.items():
+            wanted = submodule.token_rows(walk, [rid for rid in rids if rid in row_of])
+            if wanted:
+                if tokens is None:
+                    tokens = buffer.reshape(buffer.shape[0], -1).tolist()
+                submodule.record_tokens(
+                    walk, {rid: tokens[row_of[rid]] for rid in wanted}, batch.per_request_info_wrapped,
+                )
+
+    def ask_stop_odds(self, node_name: str, graph_walk: str) -> str | None:
+        """Before capture: have the sampler of ``graph_walk``'s token stop
+        score its stop ids each sample; why it can't, or None."""
+        policy = next(
+            (p for p in (self.get_stop_policies(node_name, graph_walk) or {}).values() if p.reads_token), None,
+        )
+        if policy is None or not policy.eos_tokens:
+            return "node: its stop reads no token"
+        resource = self._submodules[node_name].resources.get(policy.sampler)
+        if resource is None:
+            return "node: its stop names no sampler"
+        return resource.ask_stop_odds(graph_walk, policy.eos_tokens)
 
     def get_stop_policies(self, node_name: str, graph_walk: str) -> dict[str, StopPolicy] | None:
         """The node's declared stop policies on ``graph_walk``
@@ -2352,9 +4227,6 @@ class Engine:
         With ``host_rows``, ``check_stop_batched`` checks the batch in one call;
         if it raises, the per-request path runs so a failure lands on its own
         request.
-
-        Outputs the check withholds (``StopCheck`` / ``BatchedStopCheck``) go
-        on ``batch.withheld_outputs``, for the caller to leave unrouted.
         """
         submodule = self._submodules[batch.node_name].submodule
         if host_rows is not None:
@@ -2368,14 +4240,9 @@ class Engine:
                     batch.node_name, exc_info=True,
                 )
                 batched = None
-            if isinstance(batched, BatchedStopCheck):
-                if batched.withheld:
-                    batch.withheld_outputs = batched.withheld
-                return batched.stops
             if batched is not None:
                 return batched
         stops: dict[str, set[str]] = {}
-        withheld: dict[str, tuple[str, ...]] = {}
         for rid in batch.request_ids:
             rid_outputs = outputs.get(rid)
             if not rid_outputs:
@@ -2387,14 +4254,8 @@ class Engine:
             except Exception as error:
                 batch.register_failure(rid, error)
                 continue
-            if isinstance(rid_stops, StopCheck):
-                if rid_stops.withheld:
-                    withheld[rid] = rid_stops.withheld
-                rid_stops = rid_stops.stops
             if rid_stops:
                 stops[rid] = rid_stops
-        if withheld:
-            batch.withheld_outputs = withheld
         return stops
 
     def finalize_batch(
@@ -2408,6 +4269,14 @@ class Engine:
                 batch.request_ids if publish_request_ids is None
                 else publish_request_ids
             )
+            if batch.publish_snapshots is not None:
+                allowed = set(rids)
+                batch.publish_snapshots = {
+                    rid: snapshot for rid, snapshot in batch.publish_snapshots.items() if rid in allowed
+                }
+                if not _LAZY_PUBLISH:
+                    self.materialize_publish(batch, rids)
+                return batch.resource_publish_info
             if _LAZY_PUBLISH:
                 # Snapshot now, on the gpu thread, so the lengths are this
                 # step's; finish in ``materialize_publish`` for the rids whose
@@ -2588,7 +4457,8 @@ class Engine:
                 f"returns one for every output spanned_outputs declares"
             )
         for name, span in spans.items():
-            if span.dim() != 2 or span.shape[1] != 2 or span.shape[0] < num_rows:
+            # a step that repeated holds a span a replay: [rows, repeats, 2]
+            if span.dim() not in (2, 3) or span.shape[-1] != 2 or span.shape[0] < num_rows:
                 raise ValueError(
                     f"{type(submodule).__name__}: the span of {name!r} is "
                     f"{tuple(span.shape)}, not [{num_rows}, 2]"
@@ -2820,6 +4690,156 @@ class Engine:
         capped = [cap for cap in caps if cap is not None]
         return min(capped) if capped else None
 
+    def iteration_layouts(self, node_name: str) -> Mapping[str, LoopLayout] | None:
+        """Graph-owned contexts for walks whose device runs need actual progress."""
+        mgmt = self._submodules[node_name]
+        if not mgmt.device_stops or not getattr(mgmt.submodule, "ITERATION_INPUTS", None):
+            return None
+        return {walk: self._loops[(node_name, walk)] for walk in mgmt.device_stops
+                if (node_name, walk) in self._loops}
+
+    def streamed_iteration_inputs(self, node_name: str) -> frozenset[str]:
+        """The streamed inputs ``node_name`` reads an item a replay of
+        (``IterationInput.streamed``)."""
+        submodule = self._submodules[node_name].submodule
+        specs = getattr(submodule, "ITERATION_INPUTS", {})
+        return frozenset(spec.source for spec in specs.values() if spec.streamed)
+
+    def run_columns(self, node_name: str, graph_walk: str) -> frozenset[str]:
+        """The per-iteration outputs a step of this walk that repeats keeps a
+        column of per replay (``keep_run_columns``)."""
+        return self._submodules[node_name].run_columns.get(graph_walk, frozenset())
+
+    def _iteration_entry(self, rid: int, metadata: InputMetadata, loop: LoopLayout) -> list[int]:
+        if metadata.graph_pass is None:
+            raise ValueError("actual Loop progress needs a snapshotted graph pass")
+        return [self._runner.request_generation(rid), metadata.graph_pass,
+                *(metadata.dynamic_loop_iter_counts.get(name, 0) for name in loop.ancestors)]
+
+    def _iteration_columns(
+        self, node_name: str, submodule: NodeSubmodule, ctx: StepContext, rids: Sequence[int],
+        req_info: Mapping[int, Any], inputs: Mapping[int, Mapping[str, list]] = MappingProxyType({}),
+        *, actual_loop: LoopLayout | None = None,
+    ) -> dict[str, torch.Tensor] | IterationWindow:
+        """The step's iteration inputs, a column a replay: each row at its own
+        iteration of its walk's Loop (0 outside one), a padding row at its
+        ``capture_fill``."""
+        streamed = [spec for spec in submodule.ITERATION_INPUTS.values() if spec.streamed]
+        rows, origins, entries, horizons = [], [], [], []
+        real = set(ctx.request_ids) if actual_loop is not None else ()
+        for rid in rids:
+            if actual_loop is not None and rid not in real:
+                rows.append(None)
+                origins.append(0)
+                entries.append([-1] * (2 + len(actual_loop.ancestors)))
+                horizons.append(0)
+                continue
+            info = req_info.get(rid)
+            loop = self._loops.get((node_name, ctx.walk_of(rid)))
+            # the counter as the engine reads it, not watched
+            counts = getattr(info, "metadata", info)
+            k = 0 if loop is None or counts is None else counts.dynamic_loop_iter_counts.get(loop.name, 0)
+            if actual_loop is not None:
+                if loop != actual_loop or counts is None or counts.iteration_origin is None:
+                    raise ValueError("a device input window needs its row's snapshotted Loop origin")
+                origin = counts.iteration_origin
+                if origin < 0 or origin > k:
+                    raise ValueError("an input window origin must precede its projected Loop position")
+                origins.append(origin)
+                entries.append(self._iteration_entry(rid, counts, actual_loop))
+                horizons.append(k - origin + ctx.repeats)
+                k = origin
+            # a stream window is items of the node's Loop; a row outside it has none
+            if streamed:
+                # A skipped retained reader can retry eagerly after its
+                # predecessor settled. It still holds the original snapshot;
+                # without the device selector, trim its consumed prefix here.
+                origin = getattr(counts, "iteration_origin", None)
+                start = k - origin if actual_loop is None and origin is not None else 0
+                window = {} if loop is None else _window_tables(
+                    streamed, inputs.get(rid), getattr(info, "metadata", None), start=start,
+                )
+                rows.append((rid, k, window))
+            else:
+                rows.append((rid, k))
+        if actual_loop is None:
+            return iteration_columns(submodule, rows, ctx.repeats, self._device)
+        columns = iteration_columns(
+            submodule, rows, max(horizons, default=ctx.repeats), self._device, horizons=horizons,
+        )
+        if len(rids) == 1 and horizons == [1]:
+            # The ordinary single-item fast path is an arena view. A queued
+            # window must survive a later source assignment in that arena.
+            columns = {name: value.clone() for name, value in columns.items()}
+        return IterationWindow(
+            columns, to_device_nonblocking(origins, self._device, dtype=torch.long),
+            to_device_nonblocking(entries, self._device, dtype=torch.long),
+        )
+
+    def keep_run_columns(self, node_name: str, graph_walk: str, signals: Collection[str]) -> str | None:
+        """Have a step of this walk that repeats keep a column per replay of
+        each of ``signals`` (its per-iteration outputs); why it can't, or None."""
+        mgmt = self._submodules[node_name]
+        runner = mgmt.accelerator_graph_runner
+        if signals and runner is not None:
+            if (refusal := runner.run_column_refusal(graph_walk, signals)) is not None:
+                return f"runner: {refusal}"
+        mgmt.run_columns[graph_walk] = frozenset(signals)
+        return None
+
+    def _probe_carries(
+        self, node_name: str, runner: AcceleratorGraphRunner, walk: str, signals: Collection[str],
+    ) -> None:
+        """Before capture: whether ``walk``'s ``preprocess`` hands each
+        loop-back signal to the forward unchanged, which a run skips between
+        replays (``AcceleratorGraphRunner.prepare_template``)."""
+        mgmt = self._submodules[node_name]
+        if runner.batched_refusal(walk) is not None:
+            return  # no batched capture of it: its steps never repeat
+        mgmt.template_steps[walk] = runner.template_step(walk)
+        with watch_table_reads() as reads:
+            refusal = runner.prepare_template(walk, mgmt.submodule.repeat_carry(walk, signals))
+        if refusal is None and LOOP_COUNTER in reads:
+            refusal = f"its captured preprocess reads {LOOP_COUNTER}, which a run's later replays don't renew"
+        if refusal is not None:
+            mgmt.carry_refusals[walk] = f"node: {refusal}"
+
+    def repeat_refusal(self, node_name: str, graph_walk: str, signals: Collection[str] = ()) -> str | None:
+        """Why a step of this walk can't replay with no host work between, or
+        None if it may: the deployment, the walk's step, its capture and every
+        resource of the node each answer. ``signals``: the walk's loop-back
+        signals, each carried between replays (``NodeSubmodule.repeat_carry``).
+        After capture, which some resources decide at."""
+        mgmt = self._submodules[node_name]
+        runner = mgmt.accelerator_graph_runner
+        # a host-planned step replays its one plan: each resource answers for its part
+        host_planned, host_step = False, None
+        if self.resident_refusal(node_name, graph_walk) is not None:
+            if graph_walk not in mgmt.template_steps:
+                # no batched capture of it was probed
+                why = "it has no capture" if runner is None else runner.batched_refusal(graph_walk)
+                return f"runner: {why or 'its captures were not probed'}"
+            # None: the step touches no resource, so there is nothing to plan
+            host_planned, host_step = True, mgmt.template_steps[graph_walk]
+        if (refusal := mgmt.carry_refusals.get(graph_walk)) is not None:
+            return refusal
+        carries = mgmt.submodule.repeat_carry(graph_walk, signals)
+        if runner is not None and (refusal := runner.carry_refusal(graph_walk, carries)) is not None:
+            return f"runner: {refusal}"
+        for key, resource in mgmt.resources.items():
+            part = None if host_step is None else host_step.get(key)
+            if host_planned and part is None:
+                continue  # the step doesn't touch it
+            if (refusal := resource.repeat_refusal(graph_walk, part)) is not None:
+                return f"resource {key!r}: {refusal}"
+        mgmt.carries[graph_walk] = carries
+        return None
+
+    def repeat_note(self, node_name: str, graph_walk: str) -> str | None:
+        """What the node's resources changed so this walk can repeat, or None."""
+        notes = (r.repeat_note(graph_walk) for r in self._submodules[node_name].resources.values())
+        return "; ".join(note for note in notes if note) or None
+
     def get_max_batch_tokens(self, node_name: str, graph_walk: str) -> int | None:
         return self._chunking.max_batch_tokens(node_name, graph_walk)
 
@@ -2931,13 +4951,26 @@ class Engine:
         yet, so only a batched capture can serve it — see
         ``CudaGraphRunner.select_batched_bucket``.
         """
+        if batch.step_context.slot_lease is not None:
+            return batch.step_context.slot_lease
         submodule_mgmt = self._submodules[batch.node_name]
 
+        if self._walk_lanes and self._beside_chain(batch.node_name, batch.graph_walk):
+            # The chain holds its rotation of slots (a run in flight, the next
+            # step staged), and every per-step buffer is keyed by slot: a step
+            # beside it takes a slot of its lane's, past the rotation, and runs
+            # eager, never on a slot's captures.
+            batch.set_slot(submodule_mgmt.num_slots + self._walk_lanes[batch.node_name, batch.graph_walk] - 1)
+            batch.step_context.repeats = 1
+            batch.step_context.check_tp_repeats()
+            return None
         if batch.slot is None:
             batch.set_slot(submodule_mgmt.lease_slot())
 
         cg_runner = submodule_mgmt.accelerator_graph_runner
         if cg_runner is None:
+            batch.step_context.repeats = 1  # an eager step runs one iteration
+            batch.step_context.check_tp_repeats()
             return None
         # Which of the walk's captures this batch belongs to. The engine can't
         # derive it — what separates two captures of one walk is the model's
@@ -2975,7 +5008,24 @@ class Engine:
         if lease is not None:
             batch.lease_slot(lease)
             ctx.force_prefill = cg_runner.is_packed(lease)
+        else:
+            # an eager step runs one iteration: only a replay repeats
+            ctx.repeats = 1
+            ctx.check_tp_repeats()
         return lease
+
+    def reserve_iteration_run(self, batch: ExecutingBatch) -> bool:
+        """Prove a queued successor uses resident addressing and actual progress.
+
+        A capture miss can execute eagerly only after its predecessor settles;
+        its host-built addresses cannot be repaired by the device row mask.
+        """
+        lease = self.reserve_replay_slot(batch)
+        if lease is None or batch.step_context.resident is None:
+            return False
+        runner = self._submodules[batch.node_name].accelerator_graph_runner
+        run = runner.slot_for(lease).run
+        return run is not None and run.window is not None
 
     def can_pre_plan(self, node_name: str) -> bool:
         """Whether pre-planning this node could stage anything at all.
@@ -3027,6 +5077,38 @@ class Engine:
         lease = batch.step_context.slot_lease
         if cg_runner is None or lease is None:
             return False
+        with self._stage_lock or nullcontext():
+            return self._pre_plan_staged(batch, submodule_mgmt, cg_runner, lease)
+
+    def _refuse_regions_beside_chain(self, node_name: str, regions: Collection[str]) -> None:
+        """A step beside the chain takes a slot past the node's rotation, which
+        a piecewise region wraps back onto a slot of the chain's: the two would
+        replay one graph on one set of buffers."""
+        beside = sorted(
+            walk for (node, walk), lane in self._walk_lanes.items()
+            if node == node_name and lane and self._node_lanes.get(node) != lane
+        )
+        if regions and beside:
+            raise ValueError(
+                f"{node_name!r} walks {beside} are placed on a lane beside the node's walks on the chain, "
+                f"but the node has piecewise regions {sorted(regions)}, which a lane has no slot of"
+            )
+
+    def _beside_chain(self, node_name: str, graph_walk: str) -> bool:
+        """Whether a step of this walk runs off the chain on what the chain
+        uses too: resources the chain plans, whose admit, plan and commit then
+        must not overlap the plan thread staging the chain's next step on them
+        (``_stage_lock``), or a node whose captures are the chain's. Its
+        arrival drops that stage, as any step the stage wasn't for does."""
+        lane = self._walk_lanes.get((node_name, graph_walk), 0)
+        if not lane:
+            return False
+        held = self._runner.lane_held
+        return self._node_lanes.get(node_name) != lane or any(
+            key not in held for key in self._submodules[node_name].resources
+        )
+
+    def _pre_plan_staged(self, batch: ExecutingBatch, submodule_mgmt, cg_runner, lease) -> bool:
         if self._enable_nvtx:
             range_push(f"engine.pre_plan.bs{len(batch.request_ids)}")
         try:
@@ -3035,12 +5117,23 @@ class Engine:
             if self._enable_nvtx:
                 range_pop()
 
-    def _pre_plan_for_batch(
-        self, batch: ExecutingBatch, submodule_mgmt: SubmoduleManagement,
-        cg_runner, lease: SlotLease,
-    ) -> bool:
+    def settle_tp_repeats(self, batch: ExecutingBatch) -> None:
+        """Freeze a parallel leader's count before broadcasting it. This only
+        declares from capture templates; input preparation stays after N.
+        The worker has already waited for N's host commit, outside our lock."""
+        ctx = batch.step_context
+        if ctx.repeats > 1:
+            with self._stage_lock or nullcontext():
+                lease = self.reserve_replay_slot(batch)
+                if lease is not None:
+                    mgmt = self._submodules[batch.node_name]
+                    step = self._declare_preplan_step(batch, mgmt, mgmt.accelerator_graph_runner, lease)
+                    if step is not None:
+                        step.set_ctx(ctx)
+                        self._runner._settle_repeats(step)
+        ctx.tp_repeats = ctx.repeats
 
-        laps = PhaseLaps("engine.pre_plan.")
+    def _declare_preplan_step(self, batch, submodule_mgmt, cg_runner, lease):
         # Declare-only, so the unprepared case takes the bucket's shared
         # template rows rather than cloning a fresh set per pre-plan.
         inputs = (
@@ -3051,8 +5144,6 @@ class Engine:
         batch.step_context.set_padded_rids(
             cg_runner.step_ids(lease, batch.request_ids)
         )
-        laps.lap("pad")
-        t0 = phase_start()
         step = engine_step(
             submodule_mgmt.submodule,
             graph_walk=batch.step_context.graph_walk,
@@ -3061,6 +5152,16 @@ class Engine:
             slot_lease=lease,
             per_request_info=batch.per_request_info,
         )
+        return step
+
+    def _pre_plan_for_batch(
+        self, batch: ExecutingBatch, submodule_mgmt: SubmoduleManagement,
+        cg_runner, lease: SlotLease,
+    ) -> bool:
+
+        laps = PhaseLaps("engine.pre_plan.")
+        t0 = phase_start()
+        step = self._declare_preplan_step(batch, submodule_mgmt, cg_runner, lease)
         phase_end("engine.pre_declare", t0)
         if step is None:
             return False
@@ -3115,21 +5216,34 @@ class Engine:
         """Each node, and the nodes that share a resource with it, directly or
         through what their resources depend on: the pre-plans whose copies a
         step of the node can skip or overwrite (``_order_after_pre_plans``)."""
-        def reach(keys: Collection[str]) -> set[str]:
-            seen: set[str] = set()
-            todo = list(keys)
-            while todo:
-                key = todo.pop()
-                if key not in seen and key in self._resources:
-                    seen.add(key)
-                    todo.extend(self._resources[key].depends_on())
-            return seen
-
-        held = {node: reach(keys) for node, keys in node_to_resources.items()}
+        held = {
+            node: {id(res) for res in reachable_resources(self._resources, keys).values()}
+            for node, keys in node_to_resources.items()
+        }
         return {
             node: tuple(sorted(other for other, theirs in held.items() if other == node or keys & theirs))
             for node, keys in held.items()
         }
+
+    def _share_slot_rotations(self) -> None:
+        """Resolve components before any runner allocates slot-keyed buffers."""
+        remaining = set(self._submodules)
+        while remaining:
+            component = set()
+            todo = [min(remaining)]
+            while todo:
+                node = todo.pop()
+                if node not in component:
+                    component.add(node)
+                    todo.extend(set(self._plan_peers[node]) - component)
+            remaining.difference_update(component)
+            resources = reachable_resources(
+                self._resources,
+                {key for node in component for key in self._submodules[node].resources},
+            )
+            rotation = SlotRotation(resources.values())
+            for node in component:
+                self._submodules[node].slot_rotation = rotation
 
     def _order_after_pre_plans(self, node_name: str) -> None:
         """Order the current stream after every copy a pre-plan that

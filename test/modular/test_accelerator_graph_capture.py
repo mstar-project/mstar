@@ -510,3 +510,34 @@ def test_geometric_batch_sizes(max_batch_size, expected):
 def test_geometric_batch_sizes_refuses_a_max_under_one():
     with pytest.raises(ValueError, match="at least 1"):
         geometric_batch_sizes(0)
+
+
+def test_a_connected_replay_alias_keeps_its_child_graph(monkeypatch):
+    from mstar.engine import accelerator_graph_runner as module
+    from mstar.model.submodule_base import BatchedModelOutput
+
+    spec = CGSlotSpec(
+        bucket=BucketKey("capture", 1, 0), slot=0, config_idx=0,
+        config=SimpleNamespace(replay_graph_walks=["alias"]),
+    )
+    warmed = SimpleNamespace(run=None, static_inputs={}, static_input_keys=(),
+                             dummy_rids=[], dummy_metadata={}, row_heads={})
+    runner = AcceleratorGraphRunner.__new__(AcceleratorGraphRunner)
+    runner._device = torch.device("cuda")
+    runner._connected_walks = frozenset({"alias"})
+    runner._memory_pool = runner._autocast_dtype = runner._capture_stream = None
+    runner._submodule_name = "node"
+    runner._warmed = lambda *args: nullcontext(warmed)
+    runner._capture_run = lambda *args: (None, None, None)
+    runner._build_slot_from_capture = lambda **kwargs: kwargs["graph"]
+    monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: None)
+
+    def capture(*args, keep_graph, **kwargs):
+        def raw():
+            if not keep_graph:
+                raise RuntimeError("the raw child graph was destroyed")
+            return 17
+        return SimpleNamespace(raw_cuda_graph=raw), BatchedModelOutput()
+
+    monkeypatch.setattr(module, "capture_into_graph", capture)
+    assert runner._capture_one(spec, 1).raw_cuda_graph() == 17

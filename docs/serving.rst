@@ -241,8 +241,8 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
      - List of placements. Each entry assigns ``node_names`` to ``ranks``, optionally
        scoped to specific ``graph_walks`` and/or sharded with ``tp_size``. An
        ``ep_config`` block picks TP or EP for the group's MoE experts. ``lane: <id>``
-       runs the group's nodes on a lane beside the worker's main chain of steps,
-       which is lane 0 (see below).
+       runs the group's walks (its ``graph_walks``, else every walk of its nodes) on
+       a lane beside the worker's main chain of steps, which is lane 0 (see below).
    * - ``resources``
      - *(optional)* Per-resource overrides, keyed by the model's resource names (see
        below).
@@ -326,6 +326,88 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        pays no scheduling gap between chunks; other ready work still goes first after
        every prompt step. Off, the next chunk waits for the current one to land. Naming
        a node or walk the model does not chunk fails loading.
+   * - ``step_repeats``
+     - *(optional)* Per node, the settings for steps that stand for several iterations
+       of a Loop: ``{<node>: {max: <int>}}``. ``max`` (default 1) is the most iterations
+       one step may stand for. The host plans once, the captured graph replays that many
+       times, and stops are read when the step lands. The next step is already running by
+       then, so a row that stops inside a step runs up to 2N-1 iterations past its stop,
+       against 1 at N=1. A step repeats inside a speculated chain (async scheduling on),
+       with no new rows (a TP group runs its leader's count, which every rank's
+       resources narrow alike), or, for a node with async scheduling off, as the step
+       the scheduler picks (not under TP, or with a stream window, a ring or a
+       walk-driven consumer: its startup line says which), for a Loop walk on resident tables or one
+       planned on the host whose step keeps nothing, with a stop the runtime checks, and
+       at most a KV page's worth of iterations. Each edge of the
+       node in its Loop must be one a run serves: a loop-back (carried between replays),
+       a constant input, a Loop output, an iteration input, a stream window, or a
+       per-iteration output to the client, a stream or an accumulated output. Its
+       resources can refuse the walk (``Resource.repeat_refusal``): fa3 or cuDNN FlashInfer
+       decode, or a sampler without the in-graph scatter. A walk that asks for repeats gets
+       tensor-core captured decode wrappers whatever ``decode_tensor_cores`` says; the line
+       says so. They can narrow a step to 1 (``Resource.max_repeats``), as for a step with a
+       row that asks for log-probs. ``device_stop`` (default ``off``):
+       ``skip`` puts a run on the device, one host launch of a WHILE node around the step,
+       ending on the first of: every row done, the run's count, other work ready on the worker
+       (with ``MSTAR_SPEC_PEEK_FOR_FAIRNESS=0``, only work turning ready on a wait with nothing
+       ready), a row of the run's own walk turning ready (as a prefill on a lane does when it
+       lands) when nothing was waiting as the run began, or ``refill_at`` (a share of the run's
+       rows done; default off, and it needs ``device_stop``). A run of more than one iteration
+       staged behind one that is asked to end runs none, so the ready work goes next; a step of
+       one iteration, as one taking in new rows is, still runs. A live row hands on to the
+       next run where it stands. ``drop_rows`` does that and sends a stopped row's reads and
+       writes to the trash slot until the run ends, so its KV and recurrent state stay where
+       its stop left them; it needs a resident walk. Counted loops need no token output:
+       their admitted iteration bound and the worker yield end the same device run. Both
+       modes need a declared stop policy, one rank, CUDA
+       12.4 and up, ``libcudadevrt.a`` under ``CUDA_HOME``, a capture of kernels and
+       copies alone. Declared iteration inputs can run on the device when the walk is
+       resident, has one stop policy for its Loop, and keeps loop-back rows. These walks
+       use actual per-row Loop progress and suppress stopped rows even with ``skip``;
+       prefix chains and ``past_cap`` are refused. Streamed iteration inputs additionally
+       need retained windows whose ordinary chunk policy supplies complete per-iteration
+       readiness, consumption and final-tail decisions. Unsupported windows are refused.
+       ``join_rows: true`` lets compatible ready requests enter free physical rows at iteration
+       boundaries, including rows released by EOS. It needs ``device_stop`` and resident
+       resource bindings for every owner. One capture window closes before another launches;
+       ordinary graph admission reserves each request's full horizon before publication, and
+       collection settles its actual executions once. Outputs are delivered at window closure.
+       The existing capture bucket bounds simultaneous rows; this setting does not enlarge it.
+       Prefix caching, multiple ranks, previously resident late rows, non-owned capture inputs
+       and custom host stops cannot join. Requests needing an unsupported input/state binding
+       stay on ordinary steps. ``refill_at``, ``stream_tokens``, ``past_cap``, ``auto`` and
+       ``eos_odds`` cannot currently be combined with ``join_rows``.
+       An explicitly requested device stop that cannot run fails startup with its refusal
+       reason; it never silently becomes a host-launched run. ``stream_tokens: true`` sends a run's tokens to the client as its replays
+       finish rather than when it ends, where its landing rides inline. ``ready_waits: true``
+       makes ready rows wait for one run: after a step that took rows the next takes none and
+       runs at full length, and ready work doesn't end a run early. A new row's first token
+       can come up to ``max`` iterations later; ``ready_waits: k`` caps the run they wait for at
+       ``k`` iterations, so a prefill lands that soon, between two runs. ``past_cap: true`` lets a run go on for its
+       longest row: a row reaches its iteration cap inside the run and stops there, as at an
+       end token. Set it only where nothing the capture reads is sized by that cap (a learned
+       position table is); the KV pool still keeps a run inside the row's context.
+       ``auto: true`` picks each walk's run length under ``max`` from what its steps measure on
+       the device: an idle gap before a step raises the next run at once to what would have
+       hidden it, and eight steps with none lower it by one. ``eos_odds: p`` has the sampler
+       score each row's stop ids at temperature 1; when a run's last iteration gives a row more
+       than ``p``, the next run is cut to ``1 / odds`` iterations, about when that stop lands.
+       ``stream_queue: {depth: <int>}`` (default depth 1024) keeps the node's streamed items on
+       the device for a consumer on its GPU, in a ring of its rows: the consumer's buffer holds
+       positions and reads each chunk in one gather, so no item is stored or routed on its own.
+       A row whose ring is full sits out a step until its consumer frees room. A consumer on
+       another worker, one that joins pieces or reads an item an iteration, or a chunk policy
+       that takes more than ``depth`` items at once is refused at load.
+       At startup the worker logs one line per Loop walk with each capability
+       (``resident``, ``repeats``, ``rows``, ``device stop``, ``launch loop``, ``stream tokens``,
+       ``eos odds``, ``stream queue``) ``on``,
+       ``off: not asked for``, or ``off: <owner>: <reason>``. ``launch loop``: a run's launches
+       and copies go out from one Rust call with the GIL released; a capture that draws from
+       a torch generator, or a backend other than CUDA, keeps the Python loop. ``rows``: a node asked for
+       resident planning or repeats keeps its fixed-shape loop-back values in device rows
+       between steps (``mstar.engine.resources.loopback_rows``), so a step whose every output stays on
+       the device routes no tensor. A setting other than ``max`` on a node whose ``max`` is
+       1, a name that is no node of the model, and an unknown setting fail loading.
    * - ``batch_builder``
      - *(optional, default* ``fifo`` *)* How the worker composes a step under a token
        budget (``max_batch_tokens``). ``fifo`` serves prompts in the order they started:
@@ -395,7 +477,7 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        ``compile_deterministic`` and ``resident_planning`` (``true``/``false`` or an integer;
        ``step_thread_core`` takes ``auto``, the default, ``off``, ``always``, ``siblings`` or a CPU number,
        ``idle_hold`` ``off``, the default, or ``qos``, see :ref:`host-idle`, and ``resident_planning``
-       ``auto``, the default, or ``off``). ``compile_deterministic`` reaches
+       ``auto``, the default, ``on`` or ``off``). ``compile_deterministic`` reaches
        Qwen3.5's text walks and no other model (see :doc:`models`). Each one's environment variable
        (``MSTAR_DEVICE_LOOPBACK`` and so on; see
        :doc:`environment_variables`) overrides it when set, and an unknown name
@@ -598,24 +680,26 @@ Chatterbox models and OmniVoice set it, and so does ``qwen3tts_split.yaml`` (the
 
 **A light node beside a heavy one, on one worker.** A worker's GPU runs any number of
 lanes, each a CUDA stream with one step in flight; lane 0 is the worker's main chain.
-``lane: <id>`` on a node group (1 or more) runs every walk of the group's nodes on that
-lane instead of the chain: its steps take no turn on the chain, run on the lane's stream
-beside it, and whatever comes ready meanwhile batches into the lane's next step. Nodes
-given one id share a lane and take turns on it; nodes given different ids overlap. It
-keeps the nodes on one worker and one CUDA context, unlike a split with MPS (the
-colocated Qwen3-TTS configs put the ``Codec`` on lane 1). A lane holds the resources
-only its nodes declare (the Codec's ``codec_state`` pool), whatever their kind, and
-admits and plans them itself; a slot the pool can't give yet makes the stream wait, as
-on the chain. Startup fails with a ``ValueError`` naming the lane where it can't apply:
-a TP or SP node, a worker with no node left on the chain, a device without an
-accelerator-graph backend (CUDA or XPU), a node that plans on resident tables while
-resident planning is on, or that runs a walk with other nodes or a loop in it, a
-combined walk, output spans or a stop check; or a
-resource of a node off the chain that a node on another lane or worker also declares,
-that depends on (or is depended on by) another lane's, that keeps a prefix cache, whose
-state the main thread moves outside the step (eviction, prefix leases, page trails: a
-paged KV cache), or that stages host rows (a sampler). ``side_stream: true``, which this
-field replaced, fails at startup too. Without the field the node runs on the chain:
+``lane: <id>`` on a node group (1 or more) runs the group's walks (its ``graph_walks``,
+else every walk of its nodes) on that lane instead of the chain: their steps take no turn
+on the chain, run on the lane's stream beside it, and whatever comes ready meanwhile
+batches into the lane's next step. Walks given one id share a lane and take turns on it;
+walks given different ids overlap. It keeps the nodes on one worker and one CUDA context,
+unlike a split with MPS (the colocated Qwen3-TTS configs put the ``Codec`` on lane 1). A
+lane holds the resources only its nodes declare (the Codec's ``codec_state`` pool),
+whatever their kind, and admits and plans them itself; a slot the pool can't give yet
+makes the stream wait, as on the chain. A node with a walk on the chain and another on a
+lane (a prompt walk beside its decode) keeps its resources and captures the chain's: its
+lane walk's steps run eager, on a slot of their own, wait out the chain's next step being
+planned ahead, and make it plan again. Startup fails with a ``ValueError`` naming the
+lane where it can't apply: a walk of a TP or SP node, a worker with no walk left on the
+chain, a device without an accelerator-graph backend (CUDA or XPU), a walk with a loop in
+it, or a combined walk; or a resource of a node wholly off the chain
+that a node on another lane or worker also declares, that depends on (or is depended on
+by) another lane's, that keeps a prefix cache, or whose state the main thread moves
+outside the step (eviction, prefix leases, page trails: a paged KV cache).
+``side_stream: true``, which this field replaced, fails at startup too. Without the field
+the node runs on the chain:
 
 .. code-block:: yaml
 

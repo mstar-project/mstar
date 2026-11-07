@@ -11,6 +11,7 @@ request, and sizing off ``bucket.bs`` there under-allocates: every later
 from __future__ import annotations
 
 import sys
+from types import SimpleNamespace
 
 sys.path.insert(0, ".")
 
@@ -30,7 +31,8 @@ from mstar.engine.resources.kv.plan import (
     PagedIndptrs,
     SequenceView,
 )
-from mstar.engine.resources.step import BucketKey, SlotLease, StepContext
+from mstar.engine.resources.resident import ResidentStream
+from mstar.engine.resources.step import BucketKey, Segment, SlotLease, StepContext
 
 CTX_KV = "ctx_kv"
 Q_KV = "q_kv"
@@ -65,6 +67,21 @@ class _RecordingDecodeWrapper(_RecordingWrapper):
     """Stands in for FlashInferDecodeWrapper (rows of one query token)."""
 
     kind = "decode"
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._resident_pages = None
+        self.batch_size = kwargs.get("batch_size")
+        self.page_size = kwargs["page_size"]
+
+    def plan_resident(self, pages, dtype):
+        self._resident_pages = pages
+        self._paged_kv_indices_buf = torch.empty(self.batch_size * pages, dtype=torch.int32)
+        self._paged_kv_last_page_len_buf = torch.empty(self.batch_size, dtype=torch.int32)
+
+    def gather_resident(self, *args, **kwargs):
+        from mstar.engine.resources.attn.wrappers import FlashInferDecodeWrapper
+        FlashInferDecodeWrapper.gather_resident(self, *args, **kwargs)
 
 
 @pytest.fixture(autouse=True)
@@ -143,6 +160,62 @@ def test_an_ordinary_label_is_sized_one_row_per_request():
 
     (built,) = _RecordingWrapper.built
     assert built["batch_size"] == 2, "one qo row per request"
+
+
+@pytest.mark.parametrize("cacheless", [False, True])
+def test_joining_cross_attention_uses_its_context_owner_and_exact_query_capture(cacheless):
+    manager = _manager()
+    manager._query_kv_cache_name = None if cacheless else Q_KV
+    manager.ask_repeats("decode", join_rows=True)
+    rids = (1, 2)
+    query = {"query": _plan_output([
+        SequenceView(request_id=rid, label="query", page_idxs=[55], length=4, to_compute=1) for rid in rids
+    ])}
+    ctx = _ctx(rids, query)
+    streams = {CTX_KV: ResidentStream(CONTEXT, True), Q_KV: ResidentStream("query", False)}
+    ctx.resident = SimpleNamespace(_walk_streams={"decode": streams})
+    # Whisper declares context segments on attention, while its query cache
+    # supplies query geometry. Cacheless attention declares the query itself.
+    item = AttentionStep(segments=[Segment(rid, "query" if cacheless else CONTEXT, 1 if cacheless else 0)
+                                   for rid in rids], causal=False)
+    manager.plan(item, ctx)
+    manager.plan(item, ctx)
+    wrapper = manager._current_plan_states["query"]
+    assert wrapper.plans == 0, "a full-grid plan must not be rebuilt by ordinary planning"
+    assert wrapper.kwargs["use_tensor_cores"]
+    manager.resident_binding().check_horizon(item, ctx)
+    lease = ctx.slot_lease
+    ctx.slot_lease = SlotLease(1, lease.bucket)
+    with pytest.raises(ValueError, match="exact capture"):
+        manager.resident_binding().check_horizon(item, ctx)
+    ctx.slot_lease = lease
+    width = wrapper._resident_pages
+    # A readonly empty context must ignore even a poisoned page cell.
+    store = torch.full((3, width + 2), 999, dtype=torch.long)
+    store[1, 2:4], store[2, 2:4] = torch.tensor([11, 12]), torch.tensor([21, 22])
+    lengths = torch.tensor([16, 0])
+    captured = SimpleNamespace(
+        bucket=lease.bucket, buffer_slot=lease.buffer_slot, streams=streams,
+        block_tables={CTX_KV: SimpleNamespace(width=width, stride=width + 2, col=2)},
+        store=store.flatten(), slots=torch.tensor([1, 2]), buffers=SimpleNamespace(kv_len={CTX_KV: lengths}),
+        reads_tables=False, host_planned=False,
+    )
+    manager.resident_binding().gather(captured)
+    pages = wrapper._paged_kv_indices_buf.reshape(2, width)
+    assert pages[:, :2].tolist() == [[11, 0], [0, 0]]
+    assert not pages[:, 2:].any()
+    assert (wrapper._paged_kv_last_page_len_buf + (width - 1) * 16).tolist() == [16, 1]
+    assert lengths.tolist() == [16, 0]
+    assert captured.reads_tables and not captured.host_planned
+
+    bad = _ctx(rids, {"query": _plan_output([
+        SequenceView(request_id=rid, label="query", page_idxs=[55], length=4, to_compute=1)
+        for rid in reversed(rids)
+    ])})
+    if cacheless:
+        item = AttentionStep(segments=list(reversed(item.segments)), causal=False)
+    with pytest.raises(ValueError, match="ordered query"):
+        manager.plan(item, bad)
 
 
 def test_a_combined_query_plan_is_sized_by_its_rows_not_the_batch_size():

@@ -150,18 +150,8 @@ def test_wan22_step_prep_reads_no_tensor():
         with _HostReads() as host:
             got = prepare(k)
         assert host.reads == [], f"step {k}: host reads {host.reads}"
-        assert got.tensor_inputs.keys() == {*_wan22_loop_inputs(shape, k), "timestep"}
+        assert got.tensor_inputs.keys() == set(_wan22_loop_inputs(shape, k))
         assert torch.equal(got.tensor_inputs["latents"], torch.full(shape, float(k)))
-    with _HostReads() as host:
-        assert prepare(steps) is None  # overshoot vetoed
-    assert host.reads == []
-
-
-def test_wan22_step_prep_fails_without_the_loop_counter():
-    sub = _wan22_sub()
-    info = _fwd("r", "video_gen", _WAN22_META)
-    with pytest.raises(KeyError, match=DENOISE_LOOP_NAME):
-        sub.prepare_inputs("video_gen", info, _wan22_loop_inputs((1, 4, 2, 2, 2), 1))
 
 
 class _WanStubTransformer(nn.Module):
@@ -635,27 +625,22 @@ class _PageableH2D(TorchFunctionMode):
 
 
 def test_higgs_loopback_decode_prep_copies_no_pageable_index(monkeypatch):
-    """A device loop-back decode step whose rows include one fresh off its prefill overlays
-    that row's token through the sampler's ``overwrite_rows`` (every request's first decode
-    step takes this path), and its prep makes no pageable host-to-device copy of its own. The
-    meta device stands in for the accelerator; on it the row stager takes its host branch, so
+    """A device loop-back decode step whose rows include one fresh off its prefill writes
+    that row's token into the loop-back rows first (every request's first decode step takes
+    this path), and its prep makes no pageable host-to-device copy of its own. The meta
+    device stands in for the accelerator; on it the index stager takes its host branch, so
     the pinned upload itself is not exercised here."""
-    from mstar.engine.resources.sampler.resource import SamplerResource
-    from mstar.model.higgs_audio.config import SAMPLER, HiggsAudioModelConfig
+    from mstar.engine.resources.loopback_rows import LoopbackRows
+    from mstar.model.higgs_audio.config import HiggsAudioModelConfig
     from mstar.model.higgs_audio.submodules import HiggsAudioLLMSubmodule
     from mstar.model.submodule_base import ARNodeInputs
 
-    class _Sampler:
-        # the real overlay, over a stand-in for the slot masters
-        overwrite_rows = SamplerResource.overwrite_rows
-        _row_stager = None
-
-        def loopback_tokens(self, rids):
-            return torch.zeros(len(rids), dtype=torch.long, device="meta")
-
     sub = HiggsAudioLLMSubmodule(None, HiggsAudioModelConfig())
-    sampler = _Sampler()
-    engine_inputs = SimpleNamespace(resources={SAMPLER: sampler}, request_ids=["fresh", "looped"])
+    rows = LoopbackRows(torch.device("meta"))
+    for rid in ("fresh", "looped"):
+        rows.add(rid)
+    rows.write("text_inputs", ["fresh", "looped"], torch.zeros(2, dtype=torch.long, device="meta"))
+    engine_inputs = SimpleNamespace(loopback_rows=rows, rows_in_graph=False, request_ids=["fresh", "looped"])
     inputs = [
         ARNodeInputs(input_ids=torch.zeros(1, dtype=torch.long, device="meta"), input_seq_len=1),
         ARNodeInputs(input_seq_len=1),

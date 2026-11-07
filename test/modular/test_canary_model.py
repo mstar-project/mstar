@@ -378,6 +378,6 @@ def test_decoder_node_caps_captures_and_names(snapshot):
     assert capture.capture_graph_walk == "decode" and capture.capture_batch_sizes == [1, 2, 4, 8, 16, 32, 64]
     outputs = {"new_token": [torch.tensor([5])]}
     node.postprocess("a", None, outputs)
-    assert outputs["text_inputs"] is outputs["new_token"]
+    assert outputs["text_inputs"][0].tolist() == [5]
     walks = CanaryModel(str(snapshot)).get_graph_walk_graphs()
     assert walks[node.DECODE_WALK].name == node.DECODE_LOOP and node.SAMPLER == SAMPLER

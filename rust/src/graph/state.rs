@@ -75,13 +75,14 @@ struct NodeState {
     spec: Slot,      // speculative_signals
     completed: bool,
     in_flight: bool, // GraphNode._in_flight
+    unit_claim: Option<u64>,
 }
 
 impl NodeState {
     fn new(n: usize) -> Self {
         NodeState {
             cur: Slot::new(n), next: Slot::new(n), spec: Slot::new(n),
-            completed: false, in_flight: false,
+            completed: false, in_flight: false, unit_claim: None,
         }
     }
     fn clear(&mut self) {
@@ -90,6 +91,7 @@ impl NodeState {
         self.spec.clear();
         self.completed = false;
         self.in_flight = false;
+        self.unit_claim = None;
     }
 }
 
@@ -233,7 +235,7 @@ impl RequestState {
     /// input has arrived, so a streaming chunk can be taken now.
     pub fn is_ready_for_streaming(&self, id: NodeId) -> bool {
         let (w, b) = Self::bit(id);
-        self.ready_streaming[w] >> b & 1 == 1
+        self.ready_streaming[w] >> b & 1 == 1 && self.nodes[id as usize].unit_claim.is_none()
     }
 
     pub fn is_ready(&self, id: NodeId) -> bool {
@@ -475,6 +477,54 @@ impl RequestState {
         self.nodes[node as usize].in_flight
     }
 
+    /// A unit may supply missing internal inputs, never overwrite an input
+    /// already queued for this node. All external inputs must already exist.
+    pub fn can_claim_member(&self, node: NodeId, internal: u64, partition_done: bool) -> bool {
+        if self.is_done || partition_done {
+            let st = &self.nodes[node as usize];
+            return partition_done && !st.in_flight && st.unit_claim.is_none();
+        }
+        let mut enclosing = self.graph.node(node).loop_id;
+        while let Some(id) = enclosing {
+            if self.loops[id as usize].done {
+                return false;
+            }
+            enclosing = self.graph.lp(id).parent;
+        }
+        let st = &self.nodes[node as usize];
+        !st.completed && !st.in_flight && st.unit_claim.is_none()
+            && (st.cur.mask & internal & !self.graph.node(node).streaming_mask) == 0
+            && (st.cur.mask | internal) == self.graph.node(node).full_mask
+    }
+
+    pub fn member_inputs_ready(&self, node: NodeId) -> bool {
+        !self.is_done && self.nodes[node as usize].cur.mask == self.graph.node(node).full_mask
+    }
+
+    pub fn claim_member(&mut self, node: NodeId, claim: u64) {
+        self.take_for_schedule(node);
+        let st = &mut self.nodes[node as usize];
+        st.in_flight = true;
+        st.unit_claim = Some(claim);
+    }
+
+    pub fn unit_claim(&self, node: NodeId) -> Option<u64> {
+        self.nodes[node as usize].unit_claim
+    }
+
+    pub fn release_member(&mut self, node: NodeId) {
+        let st = &mut self.nodes[node as usize];
+        st.in_flight = false;
+        st.unit_claim = None;
+        if !self.is_done {
+            // Claims preserve their inputs. Unlike push_back after ordinary
+            // consumed-input cleanup, a refused or unexecuted member must
+            // recompute readiness: an internal-stream consumer may still wait.
+            self.refresh_ready(node);
+            self.note_ingested_for_streaming(node);
+        }
+    }
+
     // -- completion ----------------------------------------------------------
 
     /// Python's `WorkerGraphIO.mark_node_complete`. Returns the edges to route,
@@ -564,7 +614,7 @@ impl RequestState {
         out: &mut Vec<RoutedEdge>, stride: u32,
     ) {
         let lspec = g.lp(lid);
-        self.cache_outputs(g, lid, edges_from, out);
+        self.cache_outputs(g, lid, edges_from, out, stride);
 
         {
             let st = &mut self.loops[lid as usize];
@@ -592,7 +642,7 @@ impl RequestState {
     /// extend across iterations.
     fn cache_outputs(
         &mut self, g: &CompiledGraph, lid: LoopId, from: usize,
-        out: &[RoutedEdge],
+        out: &[RoutedEdge], stride: u32,
     ) {
         let lspec = g.lp(lid);
         let mut seen: Vec<Sym> = Vec::new();
@@ -602,20 +652,25 @@ impl RequestState {
             }
             seen.push(e.name);
             let st = &mut self.loops[lid as usize];
-            let bucket = if lspec.output_names.contains(&e.name) {
+            let final_only = lspec.output_names.contains(&e.name);
+            let bucket = if final_only {
                 &mut st.cached
             } else if lspec.accum_names.contains(&e.name) {
                 &mut st.accum
             } else {
                 continue;
             };
+            // A strided completion carries one item per replay. The Loop's
+            // ordinary output is the final iteration, while accumulated and
+            // per-iteration fanouts keep the whole column.
+            let tensors = if final_only && stride > 1 && e.tensors.len() > 1 {
+                &e.tensors[e.tensors.len() - 1..]
+            } else { &e.tensors[..] };
             match bucket.iter_mut().find(|(n, _)| *n == e.name) {
-                Some((_, v)) => v.extend_from_slice(&e.tensors),
-                None => bucket.push((e.name, e.tensors.clone())),
+                Some((_, v)) => v.extend_from_slice(tensors),
+                None => bucket.push((e.name, tensors.to_vec())),
             }
-            // `maybe_cache_output` holds each cached tensor until the loop
-            // hands it on (finish) or drops it (advance / clear).
-            self.refs_taken.extend(e.tensors.iter().map(|t| t.uuid));
+            self.refs_taken.extend(tensors.iter().map(|t| t.uuid));
         }
     }
 
@@ -843,7 +898,7 @@ impl RequestState {
             .map(|d| SpecNode {
                 node: d,
                 is_new_loop_iter: next_iter.contains(&d),
-                loop_id: g.node(d).loop_id,
+                loop_id: if next_iter.contains(&d) { src_loop } else { g.node(d).loop_id },
             })
             .collect()
     }
@@ -856,6 +911,9 @@ impl RequestState {
             needed &= !spec.streaming_mask;
         }
         let st = &self.nodes[node as usize];
+        if st.unit_claim.is_some() {
+            return false;
+        }
         let mut have = if check_next_iter { st.next.mask } else { st.cur.mask } | st.spec.mask;
         if check_next_iter {
             // Held (loop-external) inputs are re-injected into the current
@@ -878,7 +936,12 @@ impl RequestState {
     /// Python's `WorkerGraphIO.clear()` — end of a full forward pass.
     pub fn reset(&mut self) {
         for n in self.nodes.iter_mut() {
+            // A connected member's graph can finish before another graph's
+            // receipt lands. Reset graph progress, never the unit's ownership.
+            let claim = n.unit_claim;
             n.clear();
+            n.unit_claim = claim;
+            n.in_flight = claim.is_some();
         }
         for l in self.loops.iter_mut() {
             *l = LoopState { max_iters: l.max_iters, ..LoopState::default() };
@@ -932,7 +995,7 @@ mod tests {
             node("dec", &["h", "tok"], &[], vec![edge("tok", "dec"), edge("frame", "")]),
         ];
         let loops = vec![LoopArg {
-            name: "L".into(), max_iters: 3, parent: None,
+            name: "L".into(), max_iters: 3, parent: None, complete: true,
             member_nodes: vec!["dec".into()],
             outputs: vec![edge("tok", "emit_to_client")],
             accumulated: vec![edge("frame", "emit_to_client")],

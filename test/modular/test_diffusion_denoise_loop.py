@@ -18,17 +18,17 @@ import torch
 sys.path.insert(0, ".")
 
 from mstar.conductor.request_info import CurrentForwardPassInfo  # noqa: E402
+from mstar.engine.resources.iteration_tables import IterationTables
 from mstar.model.components.diffusion.denoise_loop import (  # noqa: E402
     LATENTS,
     DenoiseLoopSubmodule,
-    StepScalar,
 )
 from mstar.model.components.diffusion.flow_match import (  # noqa: E402
     FlowMatchConfig,
     FlowMatchSchedule,
     euler_step,
 )
-from mstar.model.submodule_base import ModelInputsFromEngine  # noqa: E402
+from mstar.model.submodule_base import IterationInput, ModelInputsFromEngine, iteration_columns  # noqa: E402
 
 LOOP = "denoise_loop"
 WALK = "image_gen"
@@ -84,6 +84,23 @@ def _info(rid: str, k: int, steps: int = 4, tokens: int = 8, seed: int = 0) -> C
     )
 
 
+def _cut(sub, infos, repeats=1):
+    """The rows' iteration inputs as the engine stages them, a column a replay."""
+    rows = [None if info is None else (info.rid_handle, info.dynamic_loop_iter_counts[LOOP]) for info in infos]
+    sub.__dict__.setdefault("iteration_tables", IterationTables(torch.device("cpu")))
+    return iteration_columns(sub, rows, repeats, torch.device("cpu"))
+
+
+def _staged(sub, infos):
+    """What a step's forward reads of them: the first replay's column."""
+    return {name: column[:, 0] for name, column in _cut(sub, infos).items()}
+
+
+def _rows(sub, out, rids):
+    """A batched step's outputs per request, as the engine cuts its rows."""
+    return sub.unpack_packed_outputs(out.packed_outputs, rids, [], [], {})
+
+
 def _inputs(latents=None):
     d = {"cond": [torch.zeros(3)]}
     if latents is not None:
@@ -101,9 +118,10 @@ def test_iteration_zero_seeds_from_request_seed_and_is_repeatable():
     assert a.input_seq_len == 8 + 3 and a.resource_step_info == (8, 3)
     state = sub.request_state(_handle("r0"))
     assert state["num_steps"] == 4 and state["schedule"].num_steps == 4
-    # step scalars come off the device-resident schedule
-    assert torch.equal(a.tensor_inputs["sigma"], state["sigmas"][0:1])
-    assert torch.equal(a.tensor_inputs["timestep"], state["timesteps"][0:1])
+    # iteration inputs come off the device-resident schedule
+    cut = _cut(sub, [_info("r0", 0, seed=7)])
+    assert torch.equal(cut["sigma"].reshape(-1), state["sigmas"][0:1])
+    assert torch.equal(cut["timestep"].reshape(-1), state["timesteps"][0:1])
 
 
 def test_later_iterations_take_the_loop_back_latents_and_step_k():
@@ -113,36 +131,22 @@ def test_later_iterations_take_the_loop_back_latents_and_step_k():
     out = sub.prepare_inputs(WALK, _info("r0", 2), _inputs(x))
     assert out.tensor_inputs[LATENTS] is x
     sched = sub.request_state(_handle("r0"))["schedule"]
-    assert torch.equal(out.tensor_inputs["sigma"], sched.sigmas[2:3])
-    assert torch.equal(out.tensor_inputs["sigma_next"], sched.sigmas[3:4])
+    cut = _cut(sub, [_info("r0", 2)])
+    assert torch.equal(cut["sigma"].reshape(-1), sched.sigmas[2:3])
+    assert torch.equal(cut["sigma_next"].reshape(-1), sched.sigmas[3:4])
 
 
 def test_missing_loop_back_latents_past_iteration_zero_raises():
+    """Iteration 0 is the one nothing is routed back to, told by what arrived
+    (a step prepared again after a refused admit reseeds to the same draw);
+    a walk that carried its edges and loses them has hit a routing bug."""
     sub = ToyDenoise()
-    sub.prepare_inputs(WALK, _info("r0", 0), _inputs())
-    with pytest.raises(RuntimeError, match=r"\['latents'\] missing at iteration 2 of request r0"):
+    a = sub.prepare_inputs(WALK, _info("r0", 0), _inputs())
+    again = sub.prepare_inputs(WALK, _info("r0", 0), _inputs())
+    assert torch.equal(again.tensor_inputs[LATENTS], a.tensor_inputs[LATENTS])
+    sub.prepare_inputs(WALK, _info("r0", 1), _inputs(torch.ones(8, 4)))
+    with pytest.raises(RuntimeError, match=r"missing past iteration 0 of request r0"):
         sub.prepare_inputs(WALK, _info("r0", 2), _inputs())
-
-
-def test_a_step_without_the_loop_counter_raises():
-    """Read as 0, it would reseed from noise every iteration and run to max_iters."""
-    sub = ToyDenoise()
-    with pytest.raises(KeyError, match=LOOP):
-        sub.prepare_inputs(WALK, dataclasses_replace(_info("r0", 1), dynamic_loop_iter_counts={}), _inputs())
-
-
-def test_overshoot_iteration_is_vetoed():
-    sub = ToyDenoise()
-    sub.prepare_inputs(WALK, _info("r0", 0, steps=2), _inputs())
-    assert sub.prepare_inputs(WALK, _info("r0", 2, steps=2), _inputs(torch.ones(8, 4))) is None
-
-
-@pytest.mark.parametrize("steps,k,expect", [(1, 0, True), (4, 2, False), (4, 3, True), (4, 4, True)])
-def test_check_stop_boundary(steps, k, expect):
-    sub = ToyDenoise()
-    sub.prepare_inputs(WALK, _info("r0", 0, steps=steps), _inputs())
-    assert (LOOP in sub.check_stop(_handle("r0"), _info("r0", k, steps=steps), {})) is expect
-    assert sub.check_stop(_handle("unknown"), _info("unknown", k), {}) == set()
 
 
 def test_can_batch_only_equal_shapes():
@@ -162,10 +166,11 @@ def test_preprocess_stacks_and_forward_batched_splits_rows():
     b = sub.prepare_inputs(WALK, _info("b", 1, tokens=8, steps=6), _inputs(torch.ones(8, 4)))
     engine_inputs = ModelInputsFromEngine(request_ids=["a", "b"], per_request_info={})
     kwargs = sub.preprocess(WALK, engine_inputs, [a, b])
+    kwargs.update(_staged(sub, [_info("a", 0, tokens=8), _info("b", 1, tokens=8, steps=6)]))
     assert kwargs[LATENTS].shape == (2, 8, 4) and kwargs["cond"].shape == (2, 3)
     assert kwargs["sigma"].shape == (2, 1, 1) and kwargs["timestep"].shape == (2,)
     assert kwargs["bucket_key"] == (8, 3)
-    out = sub.forward_batched(WALK, engine_inputs, **kwargs)
+    out = _rows(sub, sub.forward_batched(WALK, engine_inputs, **kwargs), ["a", "b"])
     assert set(out) == {"a", "b"}
     assert out["a"][LATENTS][0].shape == (8, 4)
     # row b took its own sigma pair (step 1 of a 6-step schedule)
@@ -175,7 +180,7 @@ def test_preprocess_stacks_and_forward_batched_splits_rows():
     assert sub.calls[-1] == ((2, 8, 4), (2,), (2, 1, 1), (2, 3))
     # the single-request path goes through forward and returns the row directly
     single = sub.forward(WALK, ModelInputsFromEngine(request_ids=["a"], per_request_info={}),
-                         **sub.preprocess(WALK, engine_inputs, [a]))
+                         **sub.preprocess(WALK, engine_inputs, [a]), **_staged(sub, [_info("a", 0, tokens=8)]))
     assert single[LATENTS][0].shape == (8, 4)
 
 
@@ -205,10 +210,11 @@ def test_accelerator_graph_configs_one_bucket_per_shape():
     assert cfg.capture_graph_walk == WALK and cfg.capture_batch_sizes == [1, 4]
     assert cfg.single_request_inputs.input_seq_len == 11
     assert cfg.single_request_inputs.resource_step_info == (8, 3)
-    assert set(cfg.single_request_inputs.tensor_inputs) == {LATENTS, "cond", "sigma", "sigma_next", "timestep"}
+    assert set(cfg.single_request_inputs.tensor_inputs) == {LATENTS, "cond"}
     assert cfg.get_total_tokens(4) == [44]
     assert cfg.caps_eager_batch_size is False and cfg.compile is False
-    assert cfg.input_seq_dims == {key: 0 for key in cfg.single_request_inputs.tensor_inputs}
+    # every static input is row-leading, the iteration inputs the engine stages too
+    assert cfg.input_seq_dims == {key: 0 for key in (*cfg.single_request_inputs.tensor_inputs, *sub.ITERATION_INPUTS)}
     assert ToyDenoise().get_accelerator_graph_configs(torch.device("cpu")) == []
 
 
@@ -296,7 +302,7 @@ def test_every_loop_back_edge_is_seeded_then_carried():
     assert later.tensor_inputs["history"] is carried["history"][0]
 
     # solver state lost on the way back is an error, not a fresh seed
-    with pytest.raises(RuntimeError, match=r"\['history'\] missing at iteration 1"):
+    with pytest.raises(RuntimeError, match=r"\['history'\] missing for request r0"):
         sub.prepare_inputs(WALK, _info("r0", 1), {"cond": [torch.zeros(3)], LATENTS: [torch.ones(8, 4)]})
 
 
@@ -305,7 +311,9 @@ def test_a_mapping_from_denoise_is_split_across_rows_and_edges():
     a = sub.prepare_inputs(WALK, _info("a", 0, tokens=8), _inputs())
     b = sub.prepare_inputs(WALK, _info("b", 0, tokens=8), _inputs())
     engine_inputs = ModelInputsFromEngine(request_ids=["a", "b"], per_request_info={})
-    out = sub.forward_batched(WALK, engine_inputs, **sub.preprocess(WALK, engine_inputs, [a, b]))
+    staged = _staged(sub, [_info("a", 0, tokens=8), _info("b", 0, tokens=8)])
+    kwargs = {**sub.preprocess(WALK, engine_inputs, [a, b]), **staged}
+    out = _rows(sub, sub.forward_batched(WALK, engine_inputs, **kwargs), ["a", "b"])
 
     assert set(out) == {"a", "b"}
     for rid in ("a", "b"):
@@ -313,14 +321,15 @@ def test_a_mapping_from_denoise_is_split_across_rows_and_edges():
         assert out[rid][LATENTS][0].shape == (8, 4) and out[rid]["history"][0].shape == (8, 4)
     # the single-request path splits the same way
     single = sub.forward(WALK, ModelInputsFromEngine(request_ids=["a"], per_request_info={}),
-                         **sub.preprocess(WALK, engine_inputs, [a]))
+                         **sub.preprocess(WALK, engine_inputs, [a]), **_staged(sub, [_info("a", 0, tokens=8)]))
     assert set(single) == {LATENTS, "history"}
 
 
 def test_capture_buckets_stage_every_loop_back_edge():
     sub = UniPCDenoise(capture_buckets=[(WALK, (8, 3))])
     tensor_inputs = sub.get_accelerator_graph_configs(torch.device("cpu"))[0].single_request_inputs.tensor_inputs
-    assert set(tensor_inputs) == {LATENTS, "history", "cond", "sigma", "sigma_next", "timestep"}
+    # the iteration inputs are the engine's to stage, each row at its capture_fill
+    assert set(tensor_inputs) == {LATENTS, "history", "cond"}
 
 
 @dataclasses.dataclass(frozen=True)
@@ -334,9 +343,9 @@ class GuidedDenoise(ToyDenoise):
     """A scheduler with a per-step scalar of its own, declared rather than
     threaded through prepare_inputs / preprocess / _run by hand."""
 
-    STEP_SCALARS = {
-        **ToyDenoise.STEP_SCALARS,
-        "guidance": StepScalar("guidances", broadcast=False, capture_fill=3.5),
+    ITERATION_INPUTS = {
+        **ToyDenoise.ITERATION_INPUTS,
+        "guidance": IterationInput("guidances", capture_fill=3.5),
     }
 
     def schedule_for(self, fwd_info, bucket_key):
@@ -353,48 +362,93 @@ class GuidedDenoise(ToyDenoise):
         return euler_step(latents, -latents * self.scale * guidance.view(-1, 1, 1), sigma, sigma_next)
 
 
-def test_a_declared_step_scalar_is_sliced_reshaped_and_popped():
+def test_a_declared_iteration_input_is_cut_shaped_and_popped():
     sub = GuidedDenoise()
     a = sub.prepare_inputs(WALK, _info("a", 0), _inputs())
     b = sub.prepare_inputs(WALK, _info("b", 2), _inputs(torch.ones(8, 4)))
-    # sliced at each row's own step index, and offset=1 still reads k + 1
-    assert torch.equal(a.tensor_inputs["guidance"], torch.tensor([0.0]))
-    assert torch.equal(b.tensor_inputs["guidance"], torch.tensor([2.0]))
+    staged = _staged(sub, [_info("a", 0), _info("b", 2)])
+    # cut at each row's own step index, and offset=1 still reads k + 1
+    assert staged["guidance"].tolist() == [0.0, 2.0]
     sched_b = sub.request_state(_handle("b"))["schedule"]
-    assert torch.equal(b.tensor_inputs["sigma_next"], sched_b.sigmas[3:4])
+    assert torch.equal(staged["sigma_next"][1].reshape(-1), sched_b.sigmas[3:4])
 
     engine_inputs = ModelInputsFromEngine(request_ids=["a", "b"], per_request_info={})
-    kwargs = sub.preprocess(WALK, engine_inputs, [a, b])
-    assert kwargs["guidance"].shape == (2,)  # broadcast=False stays [B]
-    out = sub.forward_batched(WALK, engine_inputs, **kwargs)
+    kwargs = {**sub.preprocess(WALK, engine_inputs, [a, b]), **staged}
+    assert kwargs["guidance"].shape == (2,)  # shape () stays [B]
+    out = _rows(sub, sub.forward_batched(WALK, engine_inputs, **kwargs), ["a", "b"])
     assert sub.calls[-1] == (2,)  # reached denoise by name, not left in **cond
     assert out["a"][LATENTS][0].shape == (8, 4)
 
-    # and the capture bucket stages it at the declared fill
-    cfg = GuidedDenoise(capture_buckets=[(WALK, (8, 3))]).get_accelerator_graph_configs(torch.device("cpu"))[0]
-    assert torch.equal(cfg.single_request_inputs.tensor_inputs["guidance"], torch.tensor([3.5]))
+    # a padding row takes the declared fill, and gets no state
+    assert _cut(sub, [None])["guidance"].tolist() == [[3.5]]
     # the base staged it off the schedule, so nothing had to touch the state
     assert torch.equal(sub.request_state(_handle("a"))["guidances"], torch.arange(4.0))
 
 
-def test_a_step_scalar_the_schedule_does_not_carry_says_so():
+@pytest.mark.parametrize("name", ["sigma", "sigma_next", "timestep"])
+def test_an_iteration_input_reads_what_the_old_slice_read_in_its_old_shape(name):
+    """offset 0 and 1, as [B, 1, 1] (sigma, sigma_next) and [B] (timestep)."""
+    sub = ToyDenoise()
+    infos = [_info("a", 0), _info("b", 0, steps=6)]
+    for info in infos:
+        sub.prepare_inputs(WALK, info, _inputs())
+    infos = [_info("a", 1), _info("b", 2, steps=6)]
+    staged = _staged(sub, infos)[name]
+    spec = ToyDenoise.ITERATION_INPUTS[name]
+    old = torch.stack([
+        sub.request_state(info.rid_handle)[spec.source][k + spec.offset:k + spec.offset + 1]
+        for info, k in zip(infos, (1, 2), strict=True)
+    ])
+    assert staged.shape == ((2, 1, 1) if name != "timestep" else (2,))
+    assert torch.equal(staged.reshape(-1), old.reshape(-1))
+
+
+def test_a_run_of_three_reads_iterations_k_to_k_plus_two():
+    sub = ToyDenoise()
+    sub.prepare_inputs(WALK, _info("a", 0, steps=6), _inputs())
+    sigma = _cut(sub, [_info("a", 1, steps=6)], repeats=3)["sigma"]
+    assert sigma.shape == (1, 3, 1, 1)
+    assert torch.equal(sigma.reshape(-1), sub.request_state(_handle("a"))["sigmas"][1:4])
+
+
+def test_an_iteration_input_past_its_table_takes_its_pad():
+    class Padded(ToyDenoise):
+        ITERATION_INPUTS = {
+            **ToyDenoise.ITERATION_INPUTS,
+            "late": IterationInput("timesteps", offset=3, pad=-1.0),
+            "late_row": IterationInput("timesteps", offset=3, pad="pad_row"),
+        }
+
+    sub = Padded()
+    sub.prepare_inputs(WALK, _info("a", 0, steps=4), _inputs())
+    state = sub.request_state(_handle("a"))
+    state.add("pad_row", torch.tensor(7.0))
+    cut = _cut(sub, [_info("a", 0, steps=4)], repeats=3)
+    last = state["timesteps"][3].item()
+    assert cut["late"].tolist() == [[last, -1.0, -1.0]]
+    assert cut["late_row"].tolist() == [[last, 7.0, 7.0]]
+    with pytest.raises(ValueError, match="'sigma_next' reads past the 5 rows of 'sigmas'"):
+        _cut(sub, [_info("a", 3, steps=4)], repeats=2)
+
+
+def test_an_iteration_input_the_schedule_does_not_carry_says_so():
     """Otherwise it surfaces as an AttributeError (or, before the state was
     populated from the table, a KeyError) from inside the slicing dict."""
     class Undeclared(ToyDenoise):
-        STEP_SCALARS = {**ToyDenoise.STEP_SCALARS, "cfg": StepScalar("cfg_scales")}
+        ITERATION_INPUTS = {**ToyDenoise.ITERATION_INPUTS, "cfg": IterationInput("cfg_scales")}
 
-    with pytest.raises(AttributeError, match="STEP_SCALARS\\['cfg'\\] reads 'cfg_scales'"):
+    with pytest.raises(AttributeError, match="ITERATION_INPUTS\\['cfg'\\] reads 'cfg_scales'"):
         Undeclared().prepare_inputs(WALK, _info("a", 0), _inputs())
 
 
-def test_a_step_scalar_too_short_for_its_offset_says_so():
+def test_an_iteration_input_too_short_for_its_offset_says_so():
     """``timesteps`` has one entry per step, so reading k + 1 off it runs out on
     the last step -- an empty slice that would only surface as a shape error
     once preprocess tried to stack it."""
     class OffsetPastTheEnd(ToyDenoise):
-        STEP_SCALARS = {
-            **ToyDenoise.STEP_SCALARS,
-            "next_timestep": StepScalar("timesteps", offset=1),
+        ITERATION_INPUTS = {
+            **ToyDenoise.ITERATION_INPUTS,
+            "next_timestep": IterationInput("timesteps", offset=1),
         }
 
     with pytest.raises(ValueError, match="needing 5 entries for 4 steps, but timesteps has 4"):
@@ -447,25 +501,6 @@ def test_cg_key_info_accepts_the_contract_the_engine_calls_it_with():
     ) == (8, 3)
 
 
-def test_check_stop_finds_the_schedule_under_the_engines_key():
-    """The loop's state must be keyed by the integer rid_handle, because that is
-    what the engine hands check_stop. Keyed by request_id instead, check_stop
-    missed, returned "do not stop", and the loop ran forever -- which hung every
-    served request on both klein and Z-Image."""
-    sub = ToyDenoise()
-    info = _info("r0", 0, steps=4)
-    sub.prepare_inputs(WALK, info, _inputs())
-
-    # the engine calls check_stop with batch.request_ids, i.e. the handle
-    assert info.rid_handle in sub.request_states
-    assert sub.check_stop(info.rid_handle, _info("r0", 3, steps=4), {}) == {LOOP}
-    assert sub.check_stop(info.rid_handle, _info("r0", 2, steps=4), {}) == set()
-
-    # the wire string is NOT the key: a lookup by it finds nothing, and the
-    # scaffold warns rather than silently declining to stop
-    assert info.request_id not in sub.request_states
-
-
 class ToyRefine(ToyDenoise):
     """A loop that starts from the latents routed to it (a refinement stage)."""
 
@@ -505,7 +540,6 @@ def test_a_second_walk_through_the_node_gets_its_own_shape_and_schedule():
     state = sub.request_state(_handle("rs"))
     assert state["num_steps"] == 2 and state["bucket_key"] == (16, 3)
     assert out.tensor_inputs[LATENTS].shape == (16, 4)
-    assert sub.check_stop(_handle("rs"), dataclasses_replace(refine, dynamic_loop_iter_counts={LOOP: 1}), {}) == {LOOP}
 
 
 def dataclasses_replace(info, **changes):
@@ -635,3 +669,26 @@ def test_iteration_zero_stages_its_schedule_and_seeds_without_a_host_sync():
     want = PrefetchingToy().prepare_inputs(WALK, _info("s1", 0, seed=4), _inputs())
     for name in (LATENTS, "sigma", "timestep"):
         assert torch.equal(got.tensor_inputs[name].cpu(), want.tensor_inputs[name].cpu()), name
+
+
+def test_a_run_of_four_denoise_steps_equals_four_one_step_steps():
+    """The latents carry back as a packed output and each replay reads its
+    own column of the schedule, so four replays of one step reach the latents
+    four steps do, for rows with different step counts."""
+    from run_parity import replay_run
+
+    sub = ToyDenoise()
+    infos = [_info("a", 0), _info("b", 0, steps=6)]
+    prepared = [sub.prepare_inputs(WALK, info, _inputs()) for info in infos]
+    engine_inputs = ModelInputsFromEngine(request_ids=["a", "b"], per_request_info={})
+    static = sub.preprocess(WALK, engine_inputs, prepared)
+
+    def forward(**inputs):
+        return sub.forward_batched(WALK, engine_inputs, **inputs).packed_outputs
+
+    latents = static[LATENTS]
+    for k in range(4):
+        step = {name: column[:, 0] for name, column in _cut(sub, [_info("a", k), _info("b", k, steps=6)]).items()}
+        latents = forward(**{**static, **step, LATENTS: latents})[f"__{LATENTS}__"]
+    replay_run(forward, static, sub.repeat_carry(WALK, {LATENTS}), 4, iteration=_cut(sub, infos, repeats=4))
+    assert torch.equal(forward(**static)[f"__{LATENTS}__"], latents)

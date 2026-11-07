@@ -68,6 +68,9 @@ class BagelModelConfig:
     cfg_renorm_min: float = 0.0
     think_mode: bool = False
     accelerator_graph: bool = True
+    # (height, width) sizes whose unsplit denoise steps are captured, one bucket per
+    # size at batch 1 for the config's default guidance; empty: denoise runs eager
+    denoise_capture_sizes: tuple = ()
 
     # Sampling defaults (per-request overridable via model_kwargs)
     temperature: float = 0.6  # 0 = greedy (argmax), >0 = sampling

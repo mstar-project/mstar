@@ -16,6 +16,7 @@ import functools
 import logging
 from collections.abc import Mapping
 from dataclasses import replace
+from types import MappingProxyType
 from typing import Any
 
 import torch
@@ -84,13 +85,14 @@ from mstar.model.submodule_base import (
     ARNodeInputs,
     ARNodeSubmodule,
     BatchedModelOutput,
+    CarryPair,
     DeviceLoopback,
     InputMetadata,
     InputSeqLenInfo,
+    IterationInput,
     ModelInputsFromEngine,
     NodeInputs,
     NodeSubmodule,
-    StopCheck,
     TokenStop,
 )
 from mstar.utils.h2d import to_device_nonblocking
@@ -410,9 +412,9 @@ class ThinkerSubmodule(ARNodeSubmodule):
             loop="thinker_decode_loop", buffer="new_token", stop_ids=frozenset({config.im_end_token_id}),
             sampler=THINKER_SAMPLER, walk=THINKER_DECODE_WALKS,
         )
-        # thinker_text_decode reads its input ids off the sampler's slot masters
+        # thinker_text_decode reads its input ids off the node's loop-back rows
         self.device_loopback = DeviceLoopback(
-            walk=THINKER_TEXT_DECODE, signal="text_inputs", sampler=THINKER_SAMPLER, buffer="new_token",
+            walk=THINKER_TEXT_DECODE, signal="text_inputs", buffer="new_token",
         )
 
         # Pre-compute inverse frequencies for 3D MRoPE
@@ -508,7 +510,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
         device = self.get_device()
         if graph_walk in THINKER_DECODE_WALKS:
             if (row := self.uniform_row_inputs(graph_walk, has_loopback)) is not None:
-                # read off the sampler's slot master in `preprocess`
+                # read off the node's loop-back rows in `preprocess`
                 return row
             # The previous token, embedded in the graph, or with the step's
             # other decode rows in `preprocess`; its MRoPE position (the same
@@ -854,12 +856,11 @@ class ThinkerSubmodule(ARNodeSubmodule):
     def _decode_tokens(
         self, engine_inputs: ModelInputsFromEngine, inputs: list[ARNodeInputs], decode: list[int],
     ) -> torch.Tensor:
-        """The tokens of a mixed step's decode rows, routed or on the sampler's
-        slot master."""
+        """The tokens of a mixed step's decode rows, routed or on the node's
+        loop-back rows."""
         masters = None
         if any(inputs[i].input_ids is None for i in decode):
-            sampler: SamplerResource = engine_inputs.resources[THINKER_SAMPLER]
-            masters = sampler.loopback_tokens(engine_inputs.request_ids)
+            masters = self.loopback_tokens(engine_inputs)
         return torch.cat([
             masters[i:i + 1] if inputs[i].input_ids is None else inputs[i].input_ids for i in decode
         ])
@@ -1356,8 +1357,23 @@ class ThinkerSubmodule(ARNodeSubmodule):
 # 4. TalkerSubmodule (ar engine) -- SECOND MOST COMPLEX
 # ===================================================================
 
+def talker_token_stop(config: Qwen3OmniModelConfig) -> TokenStop | None:
+    """The Talker stops on codec_eos; the frame budget is the loop's cap
+    (``Qwen3OmniModel.get_loop_caps``). The codec_eos frame stays out of the
+    Code2Wav stream: it is not a codebook index, and only the stop check's
+    host copy tells it from audio."""
+    eos = config.talker.codec_eos_token_id
+    return None if eos is None else TokenStop(
+        loop="talker_decode_loop", buffer="layer0_codes", stop_ids=frozenset({eos}),
+        sampler=TALKER_SAMPLER, withhold=("codec_tokens",),
+    )
+
+
 class TalkerSubmodule(ARNodeSubmodule):
     MAX_BATCH_SIZE = 32
+
+    # the forward reads the codec embedding sum as ``input_embeds``
+    REPEAT_CARRIES = MappingProxyType({"talker_input_embeds": CarryPair("talker_input_embeds", "input_embeds")})
 
     def __init__(
         self,
@@ -1384,10 +1400,10 @@ class TalkerSubmodule(ARNodeSubmodule):
         # with True at positions to suppress.  Cached on first forward.
         self._suppress_mask: torch.Tensor | None = None
 
-        # Per-request flag: whether we've already sent tts_eos_embed as
-        # the text conditioning for this request. We use this flag to
-        # inject tts_eos_embed for ONE step before falling back to pad.
-        self._eos_embed_sent: set[str] = set()
+        # ITERATION_INPUTS by the projection's dtype, which the engine settles after construction
+        self._iteration_inputs: dict[torch.dtype, Mapping[str, IterationInput]] = {}
+
+        self.token_stop = talker_token_stop(config)
 
     def init_tts_embeds(self, thinker_embed_tokens: nn.Embedding) -> None:
         """Pre-compute TTS pad/bos/eos hidden states using the Thinker's
@@ -1515,6 +1531,10 @@ class TalkerSubmodule(ARNodeSubmodule):
         **kwargs
     ) -> ARNodeInputs:
         device = self.get_device()
+        state = self.request_state(fwd_info.rid_handle)
+        if "text_tail" not in state:
+            # every row has one: the engine stages the text input for each walk
+            state.add("text_tail", torch.cat([self._tts_eos_raw, self._tts_pad_raw]))
 
         if graph_walk == "talker_prefill":
             # The Thinker's walk, or one chunk of it when its prefill is chunked
@@ -1538,24 +1558,9 @@ class TalkerSubmodule(ARNodeSubmodule):
             seq_len = input_embeds.shape[0]
 
         elif graph_walk == "talker_decode":
-            # The previous step's codec embedding sum plus this step's text
-            # conditioning, which the forward projects for the whole batch:
-            # the Thinker's next token state (decode is always text), then
-            # tts_eos for one step, then tts_pad.
-            thinker_states = inputs.get("thinker_states", [])
-            rid = fwd_info.rid_handle
-            if thinker_states:
-                text_raw = thinker_states[0]
-            elif rid not in self._eos_embed_sent:
-                text_raw = self._tts_eos_raw
-                self._eos_embed_sent.add(rid)
-            else:
-                text_raw = self._tts_pad_raw
-            return ARNodeInputs(
-                input_embeds=inputs["talker_input_embeds"][0],
-                input_seq_len=1,
-                tensor_inputs={"text_raw": text_raw},
-            )
+            # The engine stages text conditioning from the stream's own
+            # position, including EOS once and padding after the real items.
+            return ARNodeInputs(input_embeds=inputs["talker_input_embeds"][0], input_seq_len=1)
 
         return ARNodeInputs(
             input_embeds=input_embeds,
@@ -1611,13 +1616,11 @@ class TalkerSubmodule(ARNodeSubmodule):
         ], dim=0)
         device = self.get_device()
 
-        extra_args = {}
+        # a decode step's text input is the engine's to stage (ITERATION_INPUTS);
+        # the other walks have none
+        extra_args = {} if graph_walk == "talker_decode" else {"text_raw": None}
         if graph_walk == "talker_decode":
-            dtype = self.model.text_projection.linear_fc1.weight.dtype
-            input_embeds = input_embeds.to(dtype)
-            extra_args["text_raw"] = torch.cat(
-                [inp.tensor_inputs["text_raw"] for inp in inputs], dim=0,
-            ).to(dtype)
+            input_embeds = input_embeds.to(self.model.text_projection.linear_fc1.weight.dtype)
         if graph_walk == "talker_last_prefill":
             extra_args["last_token_indices"] = (
                 torch.tensor(seq_lens, device=device, dtype=torch.long).cumsum(0) - 1
@@ -1626,6 +1629,21 @@ class TalkerSubmodule(ARNodeSubmodule):
             "input_embeds": input_embeds,
             **extra_args
         }
+
+    @property
+    def ITERATION_INPUTS(self) -> Mapping[str, IterationInput]:  # noqa: N802
+        """A decode step's text input, before ``text_projection``: the
+        Thinker's next text state, an item of its stream an iteration, then
+        once the stream has ended tts_eos for one iteration and tts_pad after
+        (``text_tail``, which ``prepare_inputs`` keeps)."""
+        dtype = self.model.text_projection.linear_fc1.weight.dtype
+        specs = self._iteration_inputs.get(dtype)
+        if specs is None:
+            specs = self._iteration_inputs[dtype] = {"text_raw": IterationInput(
+                "thinker_states", pad="text_tail", shape=(self.config.thinker_hidden_size,), dtype=dtype,
+                streamed=True,
+            )}
+        return specs
 
     def _add_text_conditioning(
         self, input_embeds: torch.Tensor, text_raw: torch.Tensor | None,
@@ -1791,32 +1809,14 @@ class TalkerSubmodule(ARNodeSubmodule):
     ):
         if "new_token" not in outputs:
             return
-        # Rename new_token → layer0_codes for downstream graph routing.
-        # check_stop reads layer0_codes (same tensor) on the worker's slow path.
+        # Rename new_token → layer0_codes for downstream graph routing; the
+        # stop check reads layer0_codes (same tensor).
         codes = outputs.pop("new_token")[0]
         outputs["layer0_codes"] = [codes]
-
-    def check_stop(
-        self, request_id: str,
-        request_info: CurrentForwardPassInfo,
-        outputs: dict[str, list[torch.Tensor]],
-    ) -> set[str] | StopCheck:
-        """Stop on codec_eos. The frame budget is the loop's cap
-        (``Qwen3OmniModel.get_loop_caps``), which the graph runtime enforces.
-        The codec_eos frame stays out of the Code2Wav stream: it is not a
-        codebook index, and only this host copy tells it from audio."""
-        if "layer0_codes" not in outputs:
-            return set()
-        token = outputs["layer0_codes"][0].item()
-        eos_token_id = self.config.talker.codec_eos_token_id
-        if eos_token_id is None or eos_token_id != token:
-            return set()
-        return StopCheck({"talker_decode_loop"}, withheld=("codec_tokens",))
 
     def cleanup_request(self, request_id: str) -> None:
         """Remove per-request state when a request completes."""
         super().cleanup_request(request_id)
-        self._eos_embed_sent.discard(request_id)
 
     def can_batch(self, batch: ExecutingBatch, model_inputs: list[NodeInputs]) -> bool:
         return batch.graph_walk in [
@@ -1845,10 +1845,6 @@ class TalkerSubmodule(ARNodeSubmodule):
                         device=device, dtype=torch.bfloat16
                     ),
                     input_seq_len=1,
-                    tensor_inputs={"text_raw": torch.zeros(
-                        (1, self.config.thinker_hidden_size),
-                        device=device, dtype=torch.bfloat16,
-                    )},
                 ),
                 capture_batch_sizes=[1, 2, 4, 8, 16, 32],
                 compile=True

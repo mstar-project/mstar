@@ -24,6 +24,7 @@ from mstar.engine.resources.sampler.resource import SamplerResource
 from mstar.engine.resources.sampler.utils import (
     Sampler,
     SamplerBuffers,
+    SamplerRows,
     SamplingConfig,
     apply_min_p,
 )
@@ -70,7 +71,7 @@ def test_greedy_one_hot_rows_pass_through():
 
 
 def test_request_config_reaches_the_eager_sampler():
-    sampler = Sampler(device=CPU)
+    sampler = Sampler(device=CPU, rows=SamplerRows(CPU))
     sampler.add_request("r")
     sampler.set_config("r", **asdict(SamplingReqConfig(min_p=0.05, temperature=0.8)))
 
@@ -98,8 +99,7 @@ def test_resource_refuses_min_p_without_the_capability():
     with pytest.raises(ValueError, match="enable_min_p=False"):
         plain.ingest_request("r", SamplingReqConfig(min_p=0.05, repetition_penalty=1.2))
     assert "r" not in plain._sampler._sampling_config
-    # a stale entry would pin `_penalty_live` on for the node's lifetime
-    assert "r" not in plain._penalty_rids
+    assert not plain._rows.has_slot("r")
 
     plain.ingest_request("ok", SamplingReqConfig(min_p=0.0))  # default stays fine
     assert plain._sampler._sampling_config["ok"].min_p == 0.0
@@ -116,12 +116,12 @@ def test_resource_refuses_min_p_out_of_range(bad):
     # checked before the capability, so a plain node rejects NaN rather than admitting it
     for enable in (False, True):
         res = SamplerResource(
-            vocab_size=None, enable_repetion_penalty=True, device=CPU, enable_min_p=enable,
+            vocab_size=64, enable_repetion_penalty=True, device=CPU, enable_min_p=enable,
         )
         with pytest.raises(ValueError, match=r"must be in \[0, 1\]"):
             res.ingest_request("r", SamplingReqConfig(min_p=bad, repetition_penalty=1.2))
         assert "r" not in res._sampler._sampling_config
-        assert "r" not in res._penalty_rids
+        assert not res._rows.has_slot("r")
 
 
 def test_resource_accepts_min_p_bounds():
@@ -133,12 +133,12 @@ def test_resource_accepts_min_p_bounds():
 
 
 def test_spec_capability_defaults_off():
-    spec = SamplerSpec(resource_key="sampler", nodes={"lm"}, vocab_size=None)
+    spec = SamplerSpec(resource_key="sampler", nodes={"lm"}, vocab_size=64)
     assert spec.enable_min_p is False
     # and build() forwards it, so a spec that opts in gets a capable resource
     info = SimpleNamespace(device=CPU, joint_comm_group=None)
     assert SamplerResource.build(spec, info)._enable_min_p is False
-    on = SamplerSpec(resource_key="sampler", nodes={"lm"}, vocab_size=None, enable_min_p=True)
+    on = SamplerSpec(resource_key="sampler", nodes={"lm"}, vocab_size=64, enable_min_p=True)
     assert SamplerResource.build(on, info)._enable_min_p is True
 
 

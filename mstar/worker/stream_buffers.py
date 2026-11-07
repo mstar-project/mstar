@@ -6,15 +6,16 @@ chunks a step did not keep, and settles which streams a step ends.
 """
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping, Sequence
 from functools import partial
+from typing import NamedTuple
 
 import torch
 
 from mstar.communication.tensors import NameToTensorList, TensorCommunicationManager
 from mstar.graph.base import GraphEdge, GraphSection
 from mstar.graph.runtime.base import ColumnarEdgeSpecs, EdgeSpec, InputTensors
-from mstar.streaming.stream_buffer import StreamBuffer, StreamChunkInfo, StreamingEdge, collate
+from mstar.streaming.stream_buffer import StreamBuffer, StreamChunk, StreamChunkInfo, StreamingEdge, collate
 from mstar.streaming.topology import Connection
 from mstar.worker.node_manager_utils import RequestStateManager
 
@@ -37,6 +38,25 @@ def consumer_nodes(
                 if conn.edge_name in node.input_names:
                     cache[conn.edge_name] = node.name
     return cache
+
+
+def iteration_edges(walks: dict[str, GraphSection]) -> frozenset[tuple[str, str]]:
+    """(walk, streamed signal) for each signal a node inside a Loop of the walk
+    emits each iteration, rather than gathers at the Loop's end
+    (``Loop.accumulated_outputs``)."""
+    out = set()
+    for walk, section in walks.items():
+        for loop in section.get_loops().values():
+            gathered = {edge.name for edge in loop.accumulated_outputs}
+            for node in loop.get_nodes().values():
+                out.update((walk, e.name) for e in node.outputs if e.is_streaming and e.name not in gathered)
+    return frozenset(out)
+
+
+class StreamWindowConfig(NamedTuple):
+    """The existing run width plus inputs whose source must remain resident."""
+    limit: int
+    retained: frozenset[tuple[str, str]] = frozenset()  # (consumer walk, input edge)
 
 
 class StreamBufferManager:
@@ -65,9 +85,43 @@ class StreamBufferManager:
         )
         # edge name -> the partition the stream feeds
         self._partition: dict[str, str] = {c.edge_name: c.to_partition for c in connections}
+        # (producer walk, edge) pairs a Loop's node emits an item an iteration
+        self._iteration_edges = iteration_edges(walks) if walks else frozenset()
         # the rids that own a buffer; empty for a text model, so a speculation
         # skips its per-row stream polls
         self._rids: set[int] = set()
+        # consumer node -> the most items a speculated step may take of each
+        # stream into it, one an iteration of a step that repeats (a stream
+        # window); a node not here takes a chunk a step
+        self.windows: dict[str, StreamWindowConfig] = {}
+        # edge -> the loop-back rows whose ring holds its items on the device
+        # (``step_repeats: stream_queue``); its chunks are read from there
+        self.rings: dict[str, object] = {}
+
+    def configure_windows(
+        self, widths: Mapping[str, int], retained: Mapping[str, frozenset[tuple[str, str]]],
+    ) -> None:
+        """Derive run input handling once, checking the actual connection policy."""
+        policies = {conn.edge_name: conn.chunk_policy_factory() for conn in self.connections}
+        configured = {}
+        for node, limit in widths.items():
+            inputs = retained.get(node, frozenset())
+            for walk, edge in inputs:
+                policy = policies.get(edge)
+                if self.consumer_node.get(edge) != node or policy is None:
+                    raise ValueError(f"{node}/{walk}: device iteration input {edge!r} has no matching stream")
+                preview = policy.preview_copy()
+                if preview is policy:
+                    raise ValueError(f"{node}/{walk}: iteration input {edge!r} needs independent policy preview state")
+            configured[node] = StreamWindowConfig(limit, inputs)
+        self.windows = configured
+
+    def pieces(self, walk: str | None, edge_name: str) -> bool:
+        """Whether what one producer step of ``walk`` sends on ``edge_name``
+        is the pieces of one item (a Loop's gathered output, a chunked
+        producer's), not iterations of a step that repeated: a Loop's node
+        emitting the edge each iteration sends an item each."""
+        return (walk, edge_name) not in self._iteration_edges
 
     def possible(self) -> bool:
         """Whether any live request owns a stream buffer."""
@@ -164,29 +218,45 @@ class StreamBufferManager:
 
     def pop_edge(
         self, sbuf: StreamBuffer, edge_name: str, request_id: int,
-        allow_walk_change: bool = True,
+        allow_walk_change: bool = True, window: int = 1,
     ) -> StreamingEdge | None:
         """The buffer's next chunk as a graph edge into its consumer: one a
         step refused earlier first, else a newly ready one; None when there
         is neither. A producer-triggered consumer first enters the chunk's
-        walk, if ``allow_walk_change`` and nothing of it is mid-pass."""
+        walk, if ``allow_walk_change`` and nothing of it is mid-pass. With a
+        ``window``, up to that many one-item chunks as one
+        (``StreamBuffer.pop_window``)."""
         consumer_node = self.consumer_node.get(edge_name, "")
         waiting = sbuf.pop_waiting_edge()
         if waiting is not None:
             return waiting
+        config = self.windows.get(consumer_node)
+        retained_edge = config is not None and any(edge == edge_name for _, edge in config.retained)
         partition = self._walk_driven_edges.get(edge_name)
+        walk_partition = self._partition.get(edge_name) if retained_edge else partition
         consumer_walk = (
-            self._partition_walk(request_id, partition) if partition else None
+            self._partition_walk(request_id, walk_partition) if walk_partition else None
         )
         if not sbuf.has_chunk_ready(consumer_walk):
             # a walk-driven buffer's readiness also moves with its consumer's
             # walk, which no buffer event reports, so it is never skipped
-            if partition is None:
+            if partition is None and not retained_edge:
                 sbuf.maybe_ready = False
             return None
         if not self._enter_chunk_walk(sbuf, edge_name, request_id, allow_walk_change):
             return None
-        chunk = sbuf.pop_chunk()
+        if retained_edge:
+            # A producer-driven transition above may have changed the walk.
+            consumer_walk = self._partition_walk(request_id, self._partition[edge_name])
+            if (consumer_walk, edge_name) in config.retained:
+                return self.reserve_edge(sbuf, edge_name, request_id, window, consumer_walk)
+        chunk = sbuf.pop_window(window) if window > 1 else sbuf.pop_chunk()
+        return self._chunk_edge(chunk, edge_name, consumer_node, request_id)
+
+    def _chunk_edge(self, chunk, edge_name: str, consumer_node: str, request_id: int) -> StreamingEdge:
+        ring = self.rings.get(edge_name)
+        if ring is not None:
+            return self._ring_edge(ring, edge_name, consumer_node, request_id, chunk)
         # The chunk's items as the buffer holds them: their uuids, or none for
         # an empty chunk (producer done, nothing left). The edge carries every
         # item; ``input_tensors`` stacks them when the consuming batch is built.
@@ -200,6 +270,123 @@ class StreamBufferManager:
             # the increment, so an item in both stays alive
             tm.dereference_batch_uniform(list(chunk.released))
         return StreamingEdge(edge_name, consumer_node, uuids, chunk.info)
+
+    def reserve_edge(
+        self, sbuf: StreamBuffer, edge_name: str, request_id: int, bound: int,
+        consumer_walk: str | None = None,
+    ) -> StreamingEdge | None:
+        """A run's overlapping input snapshot, with its own graph references.
+        Producer consumption is published only by ``settle_window``.
+        """
+        chunk = sbuf.reserve_window(bound, consumer_walk)
+        if chunk is None:
+            return None
+        return self._chunk_edge(chunk, edge_name, self.consumer_node.get(edge_name, ""), request_id)
+
+    def reserve_connected_edge(
+        self, request_id: int, edge_name: str, future_positions: Sequence[int], bound: int,
+        consumer_walk: str | None = None, *, ingested: StreamingEdge | None = None, may_finish: bool = True,
+    ) -> tuple[StreamingEdge, StreamChunk] | None:
+        """Under a unit claim, retain a new future reader or extend its ingested one.
+
+        An existing reader keeps its exact UUIDs and frozen first chunk. A
+        waiting consumer gets only a semantic receipt: future payloads bind
+        directly to the ring, without reading or minting graph input tensors.
+        """
+        req_info = self._request_state.per_request_info.get(request_id)
+        sbuf = None if req_info is None else req_info.stream_buffers.get(edge_name)
+        consumer = self.consumer_node.get(edge_name)
+        if sbuf is None or edge_name not in self.rings or consumer is None:
+            return None
+        adopt = None if ingested is None else ingested.chunk.reservation
+        if ingested is not None and (
+            adopt is None or ingested.name != edge_name or ingested.next_node != consumer
+            or sbuf.ingested_chunk is None or sbuf.ingested_chunk.reservation is not adopt
+        ):
+            return None
+        snapshot = sbuf.reserve_future_window(
+            future_positions, bound, consumer_walk, adopt=adopt, may_finish=may_finish,
+        )
+        if snapshot is None:
+            return None
+        if ingested is None:
+            receipt = StreamingEdge(edge_name, consumer, [], snapshot.info)
+        else:
+            receipt = ingested._replace(chunk=ingested.chunk._replace(reservation=snapshot.reservation))
+            self.mark_ingested(request_id, receipt)
+        return receipt, snapshot
+
+    def restore_edge(self, request_id: int, edge: StreamingEdge) -> StreamingEdge | None:
+        """Cancel a connected reader; restore its ordinary edge if one was ingested."""
+        sbuf = self._window_buffer(request_id, edge)
+        reservation = edge.chunk.reservation
+        if not reservation.decisions:
+            raise ValueError("only a connected future reader can be restored")
+        sbuf.cancel_window(reservation)
+        if reservation.replaced is None:
+            return None
+        original = edge._replace(chunk=edge.chunk._replace(reservation=reservation.replaced[0]))
+        self.mark_ingested(request_id, original)
+        return original
+
+    def _window_buffer(self, request_id: int, edge: StreamingEdge) -> StreamBuffer:
+        req_info = self._request_state.per_request_info.get(request_id)
+        sbuf = None if req_info is None else req_info.stream_buffers.get(edge.name)
+        if sbuf is None or edge.chunk.reservation is None:
+            raise ValueError("a retained reader needs its request's stream buffer")
+        return sbuf
+
+    def window_bound(self, request_id: int, edge: StreamingEdge) -> int:
+        return self._window_buffer(request_id, edge).window_bound(edge.chunk.reservation)
+
+    def retained_prefix(self, request_id: int, edge: StreamingEdge) -> int:
+        return self._window_buffer(request_id, edge).retained_prefix(edge.chunk)
+
+    def settle_window(
+        self, request_id: int, edge: StreamingEdge, executed: int, *, final_transition: int | None = None,
+    ) -> StreamChunkInfo | None:
+        """Release the source owner's consumed prefix; the graph independently
+        releases the snapshot references after its last submitted reader.
+        """
+        req_info = self._request_state.per_request_info.get(request_id)
+        sbuf = None if req_info is None else req_info.stream_buffers.get(edge.name)
+        if sbuf is None:
+            return None
+        if edge.chunk.reservation is None:
+            raise ValueError("a stream window needs a run reservation to settle")
+        if not sbuf.owns_window(edge.chunk.reservation):
+            return None
+        chunk = sbuf.settle_window(edge.chunk.reservation, executed, final_transition=final_transition)
+        if chunk.released:
+            ring = self.rings.get(edge.name)
+            if ring is None:
+                self._tensor_manager.dereference_batch_uniform(chunk.released)
+            else:
+                ring.ring_release(edge.name, request_id, max(chunk.released) + 1)
+        return chunk.info
+
+    def _ring_edge(self, ring, edge_name: str, consumer_node: str, request_id: int, chunk) -> StreamingEdge:
+        """A chunk of positions in the producer's ring as one stored tensor,
+        the chunk's window gathered in one read; the positions it moved past
+        go back to the ring."""
+        positions = list(chunk.data.get("data") or [])
+        uuids = []
+        if positions:
+            window = ring.ring_read(edge_name, request_id, positions)
+            (info,) = self._tensor_manager.store_and_return_tensor_info(
+                request_id, {edge_name: [window]}, skip_cuda_sync=True,
+            )[edge_name]
+            uuids = [info.uuid]
+            self._tensor_manager.increment_ref_batch_uniform(uuids)
+        if chunk.released:
+            ring.ring_release(edge_name, request_id, max(chunk.released) + 1)
+        return StreamingEdge(edge_name, consumer_node, uuids, chunk.info)
+
+    def push_positions(self, request_id: int, edge_name: str, positions: list[int], walk: str | None) -> None:
+        """A step's items for ``edge_name`` that its producer wrote into its ring."""
+        req_info = self._request_state.per_request_info.get(request_id)
+        if req_info is not None:
+            req_info.stream_buffers[edge_name].put_positions(positions, walk)
 
     def poll(self) -> list[tuple[int, StreamingEdge]]:
         """Every request's ready chunks, popped. A buffer nothing has touched
@@ -221,8 +408,10 @@ class StreamBufferManager:
         if req_info is None:
             return []
         result = []
+        config = self.windows.get(node_name)
+        window = 1 if config is None else config.limit
         for edge_name, sbuf in req_info.stream_buffers_by_consumer.get(node_name, {}).items():
-            edge = self.pop_edge(sbuf, edge_name, request_id, allow_walk_change=False)
+            edge = self.pop_edge(sbuf, edge_name, request_id, allow_walk_change=False, window=window)
             if edge is not None:
                 result.append(edge)
         return result
@@ -236,10 +425,43 @@ class StreamBufferManager:
             return
         sbuf = req_info.stream_buffers.get(streaming_edge.name)
         if sbuf is not None:
+            if streaming_edge.chunk.reservation is not None:
+                if not sbuf.owns_window(streaming_edge.chunk.reservation):
+                    return
+                sbuf.cancel_window(streaming_edge.chunk.reservation)
+                self._tensor_manager.dereference_batch_uniform(streaming_edge.uuids)
+                return
             sbuf.store_uningested_edge(streaming_edge)
         # The step that took the final chunk will not run; the stream is live again.
         if streaming_edge.chunk.is_final:
             req_info.ended_streams.discard(streaming_edge.name)
+
+    def return_unread(self, request_id: int, streaming_edge: StreamingEdge, used: int) -> bool:
+        """Hand back what a step that took ``streaming_edge``'s window didn't
+        run: its items past the first ``used``, ahead of anything else
+        waiting, before any later step pops the stream. Whether the final
+        chunk went back with them (the step then ends no stream)."""
+        req_info = self._request_state.per_request_info.get(request_id)
+        sbuf = None if req_info is None else req_info.stream_buffers.get(streaming_edge.name)
+        if sbuf is None:
+            return False
+        chunk = streaming_edge.chunk
+        if chunk.reservation is not None:
+            if not sbuf.owns_window(chunk.reservation):
+                return False
+            sbuf.narrow_window(chunk.reservation, used)
+            return False
+        rest = streaming_edge.uuids[used:]
+        if rest:
+            # the step's edge drops its references when its node consumes it
+            self._tensor_manager.increment_ref_batch_uniform(rest)
+        sbuf.store_uningested_edge(streaming_edge._replace(
+            uuids=rest, chunk=StreamChunkInfo(chunk.start_offset + used, 0, len(rest), chunk.is_final,
+                                            tail_offset=chunk.tail_offset),
+        ), first=True)
+        if chunk.is_final:
+            req_info.ended_streams.discard(streaming_edge.name)
+        return chunk.is_final
 
     def mark_ingested(self, request_id: int, streaming_edge: StreamingEdge) -> None:
         """Remember the chunk the graph accepted, for the batch that consumes it.

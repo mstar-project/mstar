@@ -42,6 +42,13 @@ def buffer_device(request):
     return torch.device(request.param)
 
 
+@pytest.fixture(autouse=True)
+def _scatter_after_replay(monkeypatch):
+    """The scatter after the replay, which commit runs: the in-graph one sends
+    a dropped row to the trash row inside the captured sample instead."""
+    monkeypatch.setenv("MSTAR_SAMPLER_INGRAPH_SCATTER", "0")
+
+
 def _resource(graph: bool, device: torch.device) -> SamplerResource:
     res = SamplerResource(
         vocab_size=V, enable_repetion_penalty=True, device=device,
@@ -72,13 +79,13 @@ def _step(res: SamplerResource, step: SamplerStep, graph: bool) -> torch.Tensor:
 
 def _offset(res: SamplerResource, rid: int, graph: bool) -> int:
     if graph:
-        slot = res._cg_buffers._rid_to_slot[rid]
-        return int(res._cg_buffers.offset.master[slot].item())
-    return res._sampler._step_offset[rid]
+        slot = res._cg_buffers.rows._rid_to_slot[rid]
+        return int(res._cg_buffers.rows.offset[slot].item())
+    return int(res._rows.offset[res._rows.slot_of(rid)])
 
 
 def _seen(res: SamplerResource, rid: int) -> int:
-    mask = res._sampler.get_token_mask(rid)._seen_token_mask
+    mask = res._rows.read_seen(res._rows.indices([rid]))[0]
     return 0 if mask is None else int(mask.sum().item())
 
 
@@ -144,6 +151,6 @@ def test_commit_keeps_only_selected_rows_and_ignores_padding(buffer_device, kept
         kept = kept_rids is None or rid in kept_rids
         assert _offset(res, rid, True) == int(kept)
         assert _seen(res, rid) == int(kept)
-        mask = res._sampler.get_token_mask(rid)._seen_token_mask
+        mask = res._rows.read_seen(res._rows.indices([rid]))[0]
         assert bool(mask[token]) == kept
-    assert res._cg_buffers.offset.master[0].item() == 0
+    assert res._cg_buffers.rows.offset[0].item() == 0

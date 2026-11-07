@@ -26,8 +26,8 @@ import torch.nn.functional as F
 from mstar.model.qwen3_omni.components import code2wav as code2wav_module
 from mstar.model.qwen3_omni.components.code2wav import Qwen3OmniMoeCode2Wav
 from mstar.model.qwen3_omni.config import Code2WavConfig, Qwen3OmniModelConfig
-from mstar.model.qwen3_omni.submodules import Code2WavSubmodule, TalkerSubmodule
-from mstar.model.submodule_base import InputMetadata, ModelInputsFromEngine, StopCheck
+from mstar.model.qwen3_omni.submodules import Code2WavSubmodule, TalkerSubmodule, talker_token_stop
+from mstar.model.submodule_base import InputMetadata, ModelInputsFromEngine
 from mstar.streaming.chunk_policy import LeftContextChunkPolicy, ScheduledLeftContextChunkPolicy
 from mstar.streaming.stream_buffer import StreamBuffer, StreamChunkInfo
 
@@ -48,16 +48,21 @@ def _scheduled_policy(cfg: Code2WavConfig) -> ScheduledLeftContextChunkPolicy:
 
 def _talker_streamed(config: Qwen3OmniModelConfig, frames: torch.Tensor) -> tuple[torch.Tensor, list]:
     """The frames the Talker puts on the Code2Wav stream, out of the frames it
-    samples (``[T, 16]``), and its stop check's answer per frame: the
-    codec_eos frame is withheld."""
+    samples (``[T, 16]``), and its stop check's answer per frame: its declared
+    stop withholds the codec_eos frame."""
     talker = TalkerSubmodule.__new__(TalkerSubmodule)
+    torch.nn.Module.__init__(talker)
     talker.config = config
-    info = SimpleNamespace(step_metadata={}, max_tokens=frames.shape[0] + 1, dynamic_loop_iter_counts={})
+    talker.token_stop = talker_token_stop(config)
+    (policy,) = talker.get_stop_policies("talker_decode").values()
+    info = SimpleNamespace(
+        step_metadata={}, max_tokens=frames.shape[0] + 1, dynamic_loop_iter_counts={}, graph_walk="talker_decode",
+        resource_configs={talker.token_stop.sampler: SimpleNamespace(ignore_eos=False)},
+    )
     kept, results = [], []
     for frame in frames:
-        result = talker.check_stop("r", info, {"layer0_codes": [frame[:1]], "codec_tokens": [frame]})
-        results.append(result)
-        if not (isinstance(result, StopCheck) and "codec_tokens" in result.withheld):
+        results.append(talker.check_stop("r", info, {"layer0_codes": [frame[:1]], "codec_tokens": [frame]}))
+        if not ("codec_tokens" in policy.withhold and frame[0].item() in policy.eos_tokens):
             kept.append(frame)
     return (torch.stack(kept) if kept else frames[:0]), results
 
@@ -214,7 +219,7 @@ def test_the_talker_withholds_codec_eos_from_the_stream(num_frames):
     eos = torch.full((1, 16), config.talker.codec_eos_token_id)
 
     streamed_frames, results = _talker_streamed(config, torch.cat([codes, eos]))
-    assert results[-1] == StopCheck({"talker_decode_loop"}, ("codec_tokens",))
+    assert results[-1] == {"talker_decode_loop"}
     assert results[:-1] == [set()] * num_frames
     assert torch.equal(streamed_frames, codes)
 

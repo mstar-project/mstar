@@ -8,8 +8,11 @@ set of resources plans the same requests on the host as the reference.
 """
 from __future__ import annotations
 
+import ctypes
 import random
 import sys
+from dataclasses import replace
+from functools import partial
 from types import SimpleNamespace
 
 import pytest
@@ -17,9 +20,15 @@ import torch
 
 sys.path.insert(0, ".")
 
+from mstar.engine.accelerator_graph_runner import AcceleratorGraphRunner  # noqa: E402
+from mstar.engine.device_run import RunState, TokenStream  # noqa: E402
 from mstar.engine.resources import resident as resident_mod  # noqa: E402
+from mstar.engine.resources import runner as runner_mod  # noqa: E402
 from mstar.engine.resources.attn.config import AttentionConfig, AttentionSpec  # noqa: E402
+from mstar.engine.resources.attn.flashinfer import FlashInferManager  # noqa: E402
+from mstar.engine.resources.attn.wrappers import FlashInferDecodeWrapper  # noqa: E402
 from mstar.engine.resources.base import CGSlotKey, Resource  # noqa: E402
+from mstar.engine.resources.iteration_tables import IterationTables  # noqa: E402
 from mstar.engine.resources.kv import manager as manager_mod  # noqa: E402
 from mstar.engine.resources.kv.config import KVLayout, KVReqConfig, KVSpec, KVStep, PagedKVConfig  # noqa: E402
 from mstar.engine.resources.kv.manager import KVManager  # noqa: E402
@@ -32,7 +41,15 @@ from mstar.engine.resources.recurrent.config import (  # noqa: E402
     RecurrentStep,
 )
 from mstar.engine.resources.recurrent.pool import SINK_SLOT, RecurrentStatePool  # noqa: E402
-from mstar.engine.resources.resident import TRASH_SLOT, ResidentPlanner, build_planner  # noqa: E402
+from mstar.engine.resources.resident import NOT_ASKED, TRASH_SLOT, ResidentPlanner, build_planner  # noqa: E402
+from mstar.engine.resources.resident_hooks import (  # noqa: E402
+    ANY_REPEATS,
+    ResidentBinding,
+    no_resident_effect,
+    unbound_horizon,
+    unbounded_repeats,
+)
+from mstar.engine.resources.runner import StepRunner  # noqa: E402
 from mstar.engine.resources.spec import resolve_spec_dependencies  # noqa: E402
 from mstar.engine.resources.step import (  # noqa: E402
     AllocationFailed,
@@ -42,13 +59,39 @@ from mstar.engine.resources.step import (  # noqa: E402
     StepContext,
     SubmoduleStep,
 )
-from mstar.utils import knobs  # noqa: E402
+from mstar.graph.base import EdgeKind, LoopEdges  # noqa: E402
+from mstar.model.submodule_base import IterationInput  # noqa: E402
+from mstar.utils import knobs, profiler  # noqa: E402
 from mstar.utils.ipc_format import OffloadDelta  # noqa: E402
+from mstar.worker.micro_scheduler import ScheduledBatch  # noqa: E402
+from mstar.worker.step_repeats import RepeatConfig, StepRepeats, parse_step_repeats  # noqa: E402
 from mstar.worker.worker import Worker  # noqa: E402
 
 PAGE = 4
 WALK = "decode"
 CPU = torch.device("cpu")
+
+
+@pytest.fixture(autouse=True)
+def _resident_planning_on(monkeypatch):
+    """Resident planning is opt-in; these tests are of a deployment that asks."""
+    monkeypatch.setenv("MSTAR_RESIDENT_PLANNING", "on")
+
+
+def _repeats(limit: int, nodes="n") -> StepRepeats:
+    """Repeats up to ``limit`` asked of each of ``nodes``' WALK, a token loop."""
+    edges = LoopEdges({"t": EdgeKind.LOOP_BACK}, {("t", "n"): EdgeKind.LOOP_BACK})
+    return StepRepeats({n: RepeatConfig(max=limit) for n in nodes}, {(n, WALK): edges for n in nodes})
+
+
+def _walk(*keys: str, reads: tuple[str, ...] = ()) -> dict:
+    """WALK's streams as its template declares them: each resource on label
+    "main", appending a token a row unless it only ``reads``."""
+    return {WALK: {key: resident_mod.ResidentStream("main", key in reads) for key in keys}}
+
+
+def _planner(res, max_bs: int, keys=("kv", "pool", "rope")) -> ResidentPlanner:
+    return ResidentPlanner("n", _walk(*keys), {k: res[k] for k in keys}, CPU, max_bs=max_bs)
 
 
 class _StubTransfer:
@@ -70,18 +113,24 @@ def _stub_transfer(monkeypatch):
     monkeypatch.setattr(manager_mod, "KVTransferManager", _StubTransfer)
 
 
-def _resources(cpu_offload_pages: int = 0, max_num_pages: int = 64, pool_slots: int = 9):
+def _resources(
+    cpu_offload_pages: int = 0, max_num_pages: int = 64, pool_slots: int = 9,
+    prefix_cache=True, recurrent_prefix_slots=0,
+):
     kv = KVManager(
         cfg=PagedKVConfig(
             num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=512,
             max_num_pages=max_num_pages, page_size=PAGE, cpu_offload_pages=cpu_offload_pages,
+            prefix_cache=prefix_cache,
         ),
         name="kv", joint_comm_group=None, transfer_engine_info=None, device=CPU, dtype=torch.float32,
     )
     kv._cg_max_seq_len = 64
     pool = RecurrentStatePool(device=CPU, config=RecurrentStateConfig(
         num_layers=1, max_slots=pool_slots, blocks={"state": RecurrentBlockConfig(shape=(2,), dtype=torch.float32)},
+        prefix_slots=recurrent_prefix_slots,
     ))
+    pool.bind_kv(kv)
     rope = RopeManager(PositionConfig(kv_cache="kv"), CPU, max_seq_len=512, head_dim=8)
     # page-locked memory needs a GPU, and nothing here copies out of it asynchronously
     rope._pinned_pos_ids_buffer = lambda key, n: torch.empty(n, dtype=torch.long)
@@ -111,13 +160,15 @@ def _host_step(res, rids, spans, walk="prefill", advance=None):
     return SubmoduleStep(steps={"kv": kv}, segments=list(segments)), ctx
 
 
-def _captured_step(res, planner: ResidentPlanner | None, rids, slot, bs, preplan=False, run=True):
+def _captured_step(res, planner: ResidentPlanner | None, rids, slot, bs, preplan=False, run=True, repeats=1):
     """One decode step on a bucket of ``bs`` rows. With a planner, the replay of a
-    resident capture; without one, the host plan of the same step."""
+    resident capture, ``repeats`` times; without one, the host plan of the same step."""
     padded = tuple(rids) + tuple(-(i + 1) for i in range(bs - len(rids)))
     bucket = BucketKey(graph_walk=WALK, bs=bs, num_tokens=bs)
     lease = SlotLease(slot=slot, bucket=bucket)
-    ctx = StepContext(request_ids=tuple(rids), graph_walk=WALK, slot=slot, capture=False, slot_lease=lease)
+    ctx = StepContext(
+        request_ids=tuple(rids), graph_walk=WALK, slot=slot, capture=False, slot_lease=lease, repeats=repeats,
+    )
     ctx.set_padded_rids(padded)
     segments = tuple(Segment(r, "main", 1) for r in padded)
     kv, pool, rope = KVStep(segments=segments), RecurrentStep(segments=segments), PositionStep(segments=segments)
@@ -157,22 +208,32 @@ def _promote(res, planner, s):
     res["rope"].plan(s.rope, ctx)
 
 
-def _replay(res, planner, s, promote=True):
-    """What the GPU thread does from the promote on."""
+def _replay(res, planner, s, promote=True, head=None):
+    """What the GPU thread does from the promote on. ``head``: the capture's
+    ops before each replay's gather, given the replay's index."""
     ctx, bucket, lease = s.ctx, s.ctx.slot_lease.bucket, s.ctx.slot_lease
     if planner is not None:
         if promote:
             _promote(res, planner, s)
         planner.flush(ctx.resident_plan)
-        planner.gather(s.captured)
     state = res["kv"]._static_plan_state(lease.slot, ("main", 0), bucket.num_tokens)
     ck = CGSlotKey(bucket=bucket, slot=lease.slot, label="main")
-    s.pages = state.token_to_page[: bucket.bs].tolist()
-    s.offsets = state.token_to_cache[: bucket.bs].tolist()
-    s.positions = res["rope"]._static_pos_ids[ck][: bucket.bs].tolist()
-    s.pool_slots = res["pool"]._cg_addressing[ck].slot_indices[: bucket.bs].tolist()
-    if planner is not None:
-        planner.commit_in_graph(s.captured)
+    s.replays = []
+    for replay in range(ctx.repeats):
+        if head is not None:
+            head(replay)
+        if planner is not None:
+            planner.gather(s.captured)
+        s.pages = state.token_to_page[: bucket.bs].tolist()
+        s.offsets = state.token_to_cache[: bucket.bs].tolist()
+        s.positions = res["rope"]._static_pos_ids[ck][: bucket.bs].tolist()
+        s.pool_slots = res["pool"]._cg_addressing[ck].slot_indices[: bucket.bs].tolist()
+        s.replays.append(SimpleNamespace(
+            pages=s.pages, offsets=s.offsets, positions=s.positions, pool_slots=s.pool_slots,
+            has_state=res["pool"]._cg_addressing[ck].has_state[: bucket.bs].tolist(),
+        ))
+        if planner is not None:
+            planner.commit_in_graph(s.captured)
     res["kv"].commit(s.kv, ctx)
     res["pool"].commit(s.pool, ctx)
     res["rope"].commit(s.rope, ctx)
@@ -185,7 +246,7 @@ def _setup(prompts: dict[int, int], cpu_offload_pages: int = 0, max_num_pages: i
     """The same requests prefilled on resident resources and on a host-planned reference."""
     live = _resources(cpu_offload_pages, max_num_pages, pool_slots)
     ref = _resources(cpu_offload_pages, max_num_pages, pool_slots)
-    planner = ResidentPlanner("n", {WALK}, {k: live[k] for k in ("kv", "pool", "rope")}, CPU, max_bs=4)
+    planner = _planner(live, max_bs=4)
     for res in (live, ref):
         for rid, n in prompts.items():
             _ingest(res, rid)
@@ -242,6 +303,1013 @@ def test_steps_with_crossings_match_the_host_plan_and_the_host_lengths():
         assert tables.host_cols[slot] == live["kv"]._streams[rid]["main"].stored_len // PAGE + (
             1 if live["kv"]._streams[rid]["main"].stored_len % PAGE else 0
         )
+
+
+@pytest.mark.parametrize("repeats", [2, 3, PAGE], ids=lambda n: f"{n}_replays")
+def test_a_repeated_step_addresses_each_replay_as_host_plans_would(repeats):
+    """Every replay of a step that repeats writes and attends where a host plan
+    of that iteration would, page crossings included, with no host work between
+    replays; the host's mirrors then stand where the stream does."""
+    live, ref, planner = _setup({1: 3, 2: 5, 3: 8})
+    rids = [1, 2, 3]
+    for t in range(6):
+        a = _captured_step(live, planner, rids, slot=t % 2, bs=4, repeats=repeats)
+        for i, replay in enumerate(a.replays):
+            b = _captured_step(ref, None, rids, slot=(t + i) % 2, bs=4)
+            assert (replay.offsets[:3], replay.positions[:3]) == (b.offsets[:3], b.positions[:3])
+            # a run reserves ahead, so its page numbers aren't the host's: each is the row's own
+            for row, rid in enumerate(rids):
+                page = live["kv"]._streams[rid]["main"].page_indices[replay.positions[row] // PAGE]
+                assert replay.pages[row] == page
+    tables = live["kv"]._resident
+    for rid in rids:
+        _assert_row(planner, live, rid)
+        assert tables.host_len[planner.slot_of(rid)] == live["kv"]._streams[rid]["main"].stored_len
+
+
+def test_a_resident_step_resumes_the_state_its_last_step_left():
+    """``RecurrentStatePool.gather`` reads ``start`` for a row with no saved
+    state, so a resident row must read as saved from its second iteration on,
+    replays included (a transducer's state, restarted each step, repeats its
+    first tokens); a fresh row and a padding row read ``start``."""
+    live, _, planner = _setup({1: 3})
+    _ingest(live, 2)
+    a = _captured_step(live, planner, [1, 2], slot=0, bs=4, repeats=2)
+    assert [r.has_state for r in a.replays] == [[True, False, False, False], [True, True, False, False]]
+    b = _captured_step(live, planner, [1, 2], slot=1, bs=4)
+    assert b.replays[0].has_state == [True, True, False, False]
+
+
+def test_a_stopped_row_leaves_its_kv_and_recurrent_state_where_its_stop_left_them():
+    """``device_stop: drop_rows``: from the replay after its stop column a row
+    reads and writes the trash slot, so its stream length, page and recurrent
+    slot stay where the stop left them, while the others advance; the next
+    run reads the rows the host staged."""
+    live, _, planner = _setup({1: 3, 2: 5})
+    s = _captured_step(live, planner, [1, 2], slot=0, bs=2, run=False, repeats=3)
+    bucket = s.ctx.slot_lease.bucket
+    state = RunState(2, "t", {9}, CPU, planner.drop_rows(bucket, 0))
+    state.stage(2, [False, False], 3)
+    tokens = [[9, 1], [1, 1], [1, 1]]  # row 0 stops in the first column
+
+    def head(replay):
+        if replay:  # the stop kernel's mark
+            state.marks |= (torch.tensor(tokens[replay - 1]).unsqueeze(-1) == state.stop_ids).any(-1)
+        state.head()
+
+    _replay(live, planner, s, head=head)
+    assert [replay.pool_slots[0] == s.replays[0].pool_slots[0] for replay in s.replays] == [True, False, False]
+    assert s.replays[0].pool_slots[1] == s.replays[2].pool_slots[1], "the other row keeps its slot"
+    lengths = live["kv"]._resident.kv_len
+    row, other = planner.slot_of(1), planner.slot_of(2)
+
+    def stored(slot):
+        return planner.store[slot * lengths.stride + lengths.col].item()
+
+    assert stored(row) == 3 + 1, "the row stopped in the first replay"
+    assert stored(other) == 5 + 3
+    # the next run's first replay reads every row again
+    state.stage(2, [False, False], 3)
+    state.head()
+    assert planner.buffers(bucket, 0).slots.tolist() == [row, other]
+
+
+def test_a_run_that_ends_short_gives_back_what_its_commit_counted():
+    """A yield ends a run where it stands: the host counted the whole run at
+    commit, so what it didn't run goes back, and the row runs on from there."""
+    live, _, planner = _setup({1: 3})
+    s = _captured_step(live, planner, [1], slot=0, bs=1, repeats=3)
+    stream = live["kv"]._streams[1]["main"]
+    assert stream.stored_len == 6
+    for key, step in (("kv", s.kv), ("pool", s.pool), ("rope", s.rope)):
+        live[key].rewind_run(step, s.ctx, 2, {1})
+    assert stream.stored_len == 4
+    assert live["kv"]._resident.host_len[planner.slot_of(1)] == 4
+    assert live["pool"]._slots[1]["main"].tokens == 4
+
+
+def test_skipped_page_crossing_rewrites_cells_before_retry():
+    live, _, planner = _setup({1: 2})
+    _captured_step(live, planner, [1], slot=0, bs=1)
+    # Commit a run crossing into the second page without replaying its cells.
+    skipped = _captured_step(live, planner, [1], slot=0, bs=1, repeats=3, run=False)
+    _promote(live, planner, skipped)
+    planner.flush(skipped.ctx.resident_plan)
+    for key, step in (("kv", skipped.kv), ("pool", skipped.pool), ("rope", skipped.rope)):
+        live[key].commit(step, skipped.ctx)
+    planner.commit(skipped.step, skipped.ctx)
+    for key, step in (("kv", skipped.kv), ("pool", skipped.pool), ("rope", skipped.rope)):
+        live[key].rewind_run(step, skipped.ctx, 3, {1})
+    retry = _captured_step(live, planner, [1], slot=0, bs=1, repeats=3)
+    expected = live["kv"]._streams[1]["main"].page_indices
+    assert [r.pages[0] for r in retry.replays] == [expected[0], expected[1], expected[1]]
+
+
+@pytest.mark.parametrize(("world_size", "policies", "why"), [
+    (2, {}, "deployment: it runs on more than one rank"),
+    (1, {}, "graph: it has no declared stop policy"),
+])
+def test_a_walk_says_why_it_doesnt_skip_a_stopped_replay(world_size, policies, why):
+    from mstar.engine.engine import Engine
+
+    engine = Engine.__new__(Engine)
+    mgmt = SimpleNamespace(
+        joint_comm_group=SimpleNamespace(world_size=world_size), device_stops={}, accelerator_graph_runner=None,
+        submodule=SimpleNamespace(get_stop_policies=lambda walk: policies),
+    )
+    engine._submodules = {"n": mgmt}
+    engine._ask_run("n", None, WALK, SimpleNamespace(), ())
+    assert engine.device_stop_refusal("n", WALK) == why
+
+
+@pytest.mark.parametrize("captured", [True, False])
+def test_a_step_with_no_capture_for_its_batch_runs_one_iteration(captured):
+    """Only a replay repeats: a batch that leases no graph (a size or shape
+    the node didn't capture) runs its eager forward once."""
+    from mstar.engine.engine import Engine
+
+    def lease_slot(graph_walk, bs, slot, num_tokens=None, cg_key_info=None):
+        return SlotLease(slot, BucketKey(graph_walk, bs, bs)) if captured else None
+
+    engine = object.__new__(Engine)
+    engine._submodules = {"n": SimpleNamespace(
+        submodule=SimpleNamespace(cg_key_info=lambda walk, info, **kw: None), lora_pools=(), resident=None,
+        accelerator_graph_runner=SimpleNamespace(lease_slot=lease_slot, is_packed=lambda lease: False),
+    )}
+    batch = SimpleNamespace(
+        node_name="n", slot=0, request_ids=["a", "b"], inputs=None, per_request_info_wrapped={},
+        per_request_input_metadata={},
+        step_context=StepContext(request_ids=["a", "b"], graph_walk=WALK, slot=0, capture=False, repeats=4),
+        lease_slot=lambda lease: None,
+    )
+    engine.reserve_replay_slot(batch)
+    assert batch.step_context.repeats == (4 if captured else 1)
+
+
+def _raw_backend(*slots):
+    """A backend whose raw launch of graph exec ``i + 1`` replays ``slots[i]``'s
+    graph and whose 2D copy moves bytes on the host, through the C entry
+    points the Rust loop calls; and the calls it took, in order."""
+    from mstar.engine.accelerator_graph_backend import RawLaunch
+
+    calls = []
+
+    @ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p)
+    def launch(graph_exec, stream):
+        assert stream == 2
+        calls.append("launch")
+        slots[graph_exec - 1].graph.replay()
+        return 0
+
+    @ctypes.CFUNCTYPE(
+        ctypes.c_int, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_size_t,
+        ctypes.c_size_t, ctypes.c_int, ctypes.c_void_p,
+    )
+    def copy(dst, dst_pitch, src, src_pitch, width, height, kind, stream):
+        assert kind == 4 and stream == 2
+        calls.append("copy")
+        for row in range(height):
+            ctypes.memmove(dst + row * dst_pitch, src + row * src_pitch, width)
+        return 0
+
+    addresses = [ctypes.cast(fn, ctypes.c_void_p).value for fn in (launch, copy)]
+    execs = {id(slot.graph): i + 1 for i, slot in enumerate(slots)}
+    backend = SimpleNamespace(
+        raw_launch=lambda graph: RawLaunch(*addresses, execs[id(graph)], 2), keep=(launch, copy),
+    )
+    return backend, calls
+
+
+@pytest.mark.parametrize("raw", [False, True], ids=["host_loop", "rust_loop"])
+def test_a_repeat_carries_every_loop_back_signal_and_keeps_a_column_per_replay(raw):
+    """A replay overwrites its outputs and reads its static inputs, so a step
+    that repeats hands each replay what the one before left of every
+    loop-back signal (a token, a float embedding under another name, a long
+    counter) and keeps a column of each per-iteration output, whichever loop
+    launches it."""
+    from mstar.model.submodule_base import CarryPair
+
+    tokens, ids = torch.tensor([5, 7]), torch.zeros(2, 1, dtype=torch.long)
+    embeds, embeds_in = torch.tensor([[0.5], [1.5]]), torch.zeros(2, 1)
+    step, step_in = torch.tensor([10, 20]), torch.zeros(2, dtype=torch.long)
+    frames = torch.tensor([[5.0, -5.0], [7.0, -7.0]])
+
+    class Graph:
+        def replay(self):
+            tokens.copy_(ids.reshape(-1) + 1)
+            embeds.copy_(embeds_in * 2)
+            step.copy_(step_in + 1)
+            frames.copy_(tokens[:, None] * torch.tensor([1.0, -1.0]))
+
+    slot = SimpleNamespace(
+        graph=Graph(), raw_launch=raw, static_inputs={"input_ids": ids, "input_embeds": embeds_in, "step": step_in},
+        static_outputs=SimpleNamespace(
+            check_stop_buffers={"new_token": tokens, "text_inputs": tokens},
+            row_outputs={"frame": frames, "embeds": embeds, "step": step}, output_spans=None, packed_outputs={},
+        ),
+    )
+    carries = {
+        "text_inputs": CarryPair("new_token", "input_ids"), "embeds": CarryPair("embeds", "input_embeds"),
+        "step": CarryPair("step", "step"),
+    }
+    runner = AcceleratorGraphRunner.__new__(AcceleratorGraphRunner)
+    runner.slot_for = lambda lease: slot
+    runner._graph_backend, calls = _raw_backend(slot)
+    landing = TokenStream(2, 3, torch.device("cpu"))
+    wide, rows, _ = runner.repeat([runner.run_part(None, carries)], 3, ["frame"], stream=(landing, "new_token"))
+    if raw:
+        # each replay's columns out, then the next one's carries in and its launch
+        assert calls == ["copy"] * 4 + (["copy"] * 3 + ["launch"] + ["copy"] * 4) * 2
+    # a replay's tokens land behind it, and ``landed`` behind them
+    assert landing.tokens.tolist() == wide["new_token"].tolist() and landing.landed.item() == 3
+    assert wide["new_token"].tolist() == [[5, 6, 7], [7, 8, 9]]
+    assert wide["text_inputs"] is wide["new_token"]
+    # the last replay's outputs, each from the replay before's
+    assert embeds.reshape(-1).tolist() == [2.0, 6.0] and step.tolist() == [12, 22]
+    # a per-iteration output keeps each replay's rows: [rows, replays, ...]
+    assert rows["frame"].tolist() == [[[5, -5], [6, -6], [7, -7]], [[7, -7], [8, -8], [9, -9]]]
+
+
+@pytest.mark.parametrize("raw", [False, True], ids=["host_loop", "rust_loop"])
+def test_a_run_of_two_nodes_replays_each_in_turn_with_what_the_other_left(raw):
+    """A Loop of a producer and the node that closes its iteration (BAGEL's
+    branch and combine_cfg): each round, the producer reads the closer's last
+    output and the closer reads the producer's, as N passes of the two would."""
+    from mstar.engine.accelerator_graph_runner import RunPart
+
+    x_in, v, v_in, x = torch.zeros(1), torch.zeros(1), torch.zeros(1), torch.tensor([1.0])
+    order = []
+
+    class Producer:
+        def replay(self):
+            order.append("p")
+            v.copy_(x_in * 10)
+
+    class Closer:
+        def replay(self):
+            order.append("c")
+            x.copy_(x_in + v_in)
+
+    producer = SimpleNamespace(graph=Producer(), raw_launch=raw)
+    closer = SimpleNamespace(
+        graph=Closer(), raw_launch=raw, static_inputs={},
+        static_outputs=SimpleNamespace(check_stop_buffers={}, row_outputs={"x": x}, output_spans=None),
+    )
+    runner = AcceleratorGraphRunner.__new__(AcceleratorGraphRunner)
+    runner._graph_backend, calls = _raw_backend(producer, closer)
+    # the closer's x feeds both nodes' x_in (one buffer here), the producer's v the closer's v_in
+    parts = [RunPart(producer, [(x, x_in)], []), RunPart(closer, [(v, v_in)], [])]
+    wide, rows, _ = runner.repeat(parts, 3, ["x"])
+    # replay 0 ran before the run (x = 1); then p, c twice: v = 10, x = 11; v = 110, x = 121
+    assert order == ["p", "c"] * 2
+    if raw:
+        assert calls.count("launch") == 4
+    assert rows["x"].tolist() == [[1.0, 11.0, 121.0]]
+
+
+def test_a_run_a_copy_of_which_casts_stays_on_the_hosts_loop():
+    from mstar.engine.accelerator_graph_runner import _launch_words
+
+    assert _launch_words([7, (torch.zeros(2), torch.zeros(2))])[:2] == [0, 7]
+    assert _launch_words([7, (torch.zeros(2), torch.zeros(2, dtype=torch.long))]) is None
+
+
+def test_a_capture_that_draws_from_a_torch_generator_keeps_the_hosts_loop():
+    """A raw launch doesn't advance torch's generators, so its draws would repeat."""
+    slot = SimpleNamespace(graph=object(), raw_launch=False)
+    runner = AcceleratorGraphRunner.__new__(AcceleratorGraphRunner)
+    runner._buckets = {0: SimpleNamespace(config=SimpleNamespace(capture_graph_walk=WALK), slots=[slot])}
+    runner._graph_backend = SimpleNamespace(launch_refusal=lambda: None)
+    runner._generator_walks = {WALK}
+    assert "torch generator" in runner.launch_refusal(WALK) and slot.raw_launch is False
+    runner._generator_walks = set()
+    assert runner.launch_refusal(WALK) is None and slot.raw_launch is True
+    runner._graph_backend = SimpleNamespace(launch_refusal=lambda: "no runtime")
+    assert runner.launch_refusal(WALK) == "backend: no runtime"
+
+
+def test_a_decode_wrappers_lengths_move_one_a_replay_as_a_column():
+    wrapper = FlashInferDecodeWrapper.__new__(FlashInferDecodeWrapper)
+    wrapper._paged_kv_last_page_len_buf = torch.tensor([3, 5, 9], dtype=torch.int32)
+    wrapper._replay_rows = 2
+    column, target = wrapper.replay_column(3)
+    assert column.tolist() == [[3, 4, 5], [5, 6, 7]] and column.dtype == torch.int32
+    assert target.data_ptr() == wrapper._paged_kv_last_page_len_buf.data_ptr() and len(target) == 2
+
+
+@pytest.mark.parametrize(("preprocess", "refused"), [
+    (torch.cat, False),
+    (lambda rows: torch.cat(rows) * 2, True),
+    # a zero condition added to a template of zeros would pass without a probe value
+    (lambda rows: torch.cat(rows) + torch.zeros(1), False),
+    (lambda rows: torch.cat(rows) + 1.0, True),
+], ids=["identity", "scaled", "zero_add", "condition_add"])
+def test_a_preprocess_that_changes_a_loop_back_signal_keeps_its_walk_from_repeating(preprocess, refused):
+    """A run skips ``preprocess`` between replays, so at load the engine feeds
+    each loop-back signal a probe value through the capture template's
+    ``preprocess`` and refuses a walk that changes it on the way."""
+    from mstar.engine.accelerator_graph_runner import CaptureTemplate
+    from mstar.model.submodule_base import CarryPair, NodeInputs
+
+    rows = [NodeInputs(tensor_inputs={"embeds": torch.zeros(1, 4)}) for _ in range(2)]
+    runner = AcceleratorGraphRunner.__new__(AcceleratorGraphRunner)
+    runner._widest = lambda walk: SimpleNamespace(bucket=SimpleNamespace(graph_walk=walk))
+    runner._template = lambda spec: CaptureTemplate([0, 1], rows, None, None)
+    runner._dummy_rows = SimpleNamespace(reset=lambda rids, free: None)
+    runner._submodule = SimpleNamespace(preprocess=lambda graph_walk, engine_inputs, inputs: {
+        "input_embeds": preprocess([row.tensor_inputs["embeds"] for row in inputs]),
+    })
+    refusal = runner.prepare_template(WALK, {"embeds": CarryPair("embeds", "input_embeds")})
+    assert (refusal is not None) is refused
+    assert refusal is None or "changes loop-back 'embeds'" in refusal
+
+
+@pytest.mark.parametrize(("in_chain", "fresh", "same_node", "room", "want"), [
+    (1, 0, True, 100, 8),
+    (0, 0, True, 100, 1),  # other ready work hasn't had its look in
+    (1, 1, True, 100, 1),  # a fresh row needs a plan of its own
+    (1, 0, False, 100, 1),
+    (1, 0, True, 3, 3),  # a row's cap ends the run, never passes it
+], ids=["steady", "chain_start", "fresh_row", "other_node", "near_cap"])
+def test_a_step_repeats_only_when_its_rows_all_continue(in_chain, fresh, same_node, room, want):
+    rows = dict.fromkeys(range(2 + fresh), 0)
+    speculation = SimpleNamespace(
+        scheduled_batch=SimpleNamespace(
+            node_name="n", graph_walk=WALK, request_to_worker_graph=rows, chunk_ranges={},
+        ),
+        continuing_rids={0, 1}, is_new_iter=True, is_same_node=same_node,
+    )
+    repeats = _repeats(8)
+    repeats.settle(lambda *key: None, lambda *key: None)
+    assert repeats.ceiling(speculation, in_chain, lambda: room)[0] == want
+
+
+@pytest.mark.parametrize("limit", [1, 4])
+def test_the_startup_line_names_the_owner_that_refuses_each_capability(caplog, limit):
+    """Each owner answers for itself; the worker prints one line per Loop walk,
+    at every limit, naming the first that refused each capability."""
+    from mstar.engine.engine import Engine
+    from mstar.engine.resources.resident_hooks import ResidentHooks
+
+    willing = SimpleNamespace(repeat_refusal=lambda walk, host_step: None)
+    engine = Engine.__new__(Engine)
+    engine._submodules = {node: SimpleNamespace(
+        resident=SimpleNamespace(walks={WALK} - refused.keys()), resident_refusals=refused,
+        joint_comm_group=SimpleNamespace(world_size=1),
+        submodule=SimpleNamespace(repeat_carry=lambda walk, signals: {}),
+        resources=resources, carry_refusals={}, carries={}, accelerator_graph_runner=None, template_steps={},
+        row_signals={},
+    ) for node, resources, refused in (
+        ("a", {"kv": willing}, {}), ("b", {"kv": willing, "pool": ResidentHooks()}, {}),
+        ("c", {"kv": willing}, {WALK: "resource 'kv': why"}),
+    )}
+    with caplog.at_level("INFO", logger="mstar.worker.step_repeats"):
+        _repeats(limit, "abc").settle(
+            engine.resident_refusal, engine.repeat_refusal,
+            {"rows": lambda node, walk: NOT_ASKED if limit == 1 else engine.rows_refusal(node, walk)},
+        )
+    lines = {line.split(":", 1)[0]: line for line in caplog.messages}
+    want = (
+        "resident on | repeats on, up to 4 | rows off: runner: the node captures no graphs" if limit > 1
+        else "resident on | repeats off: not asked for | rows off: not asked for"
+    )
+    assert lines[f"a/{WALK}"].endswith(want)
+    if limit > 1:
+        assert "repeats off: resource 'pool': ResidentHooks keeps no per-replay support |" in lines[f"b/{WALK}"]
+    assert lines[f"c/{WALK}"].startswith(f"c/{WALK}: resident off: resource 'kv': why | repeats off")
+
+
+def _token_loop(*extra_outputs, streamed=()):
+    """Loop "loop" over node "n", whose token "t" loops back and goes to the
+    client, beside a constant input "cond" and a Loop output "latent"."""
+    from mstar.graph.base import GraphEdge, GraphNode, Loop
+    from mstar.graph.special_destinations import EMIT_TO_CLIENT
+
+    node = GraphNode(name="n", input_names={"t", "cond", *streamed}, outputs=[
+        GraphEdge("n", "t"), GraphEdge(EMIT_TO_CLIENT, "t"), GraphEdge("vae", "latent"), *extra_outputs,
+    ])
+    node._register_streaming(set(streamed))
+    return Loop(section=node, max_iters=8, outputs=[GraphEdge("vae", "latent")], name="loop")
+
+
+def test_each_edge_of_a_loop_has_its_own_kind():
+    """The kind is the edge's, not the signal's: "t" loops back and goes to the
+    client at once."""
+    from mstar.graph.base import loop_edges
+    from mstar.graph.special_destinations import EMIT_TO_CLIENT
+
+    edges = loop_edges(_token_loop(), "n")
+    assert edges.inputs == {"t": EdgeKind.LOOP_BACK, "cond": EdgeKind.CONSTANT}
+    assert edges.outputs == {
+        ("t", "n"): EdgeKind.LOOP_BACK, ("t", EMIT_TO_CLIENT): EdgeKind.PER_ITERATION,
+        ("latent", "vae"): EdgeKind.TERMINAL,
+    }
+    assert loop_edges(_token_loop(), "absent") is None
+
+
+@pytest.mark.parametrize("accumulated", [True, False])
+def test_a_loop_back_its_node_never_reads_is_an_item_only_of_what_the_loop_accumulates(accumulated):
+    """It routes nothing to the next iteration, so a run carries none of it:
+    an accumulated one keeps a column a replay, else it is no edge at all."""
+    from mstar.graph.base import GraphEdge, GraphNode, Loop, loop_edges
+    from mstar.graph.special_destinations import EMIT_TO_CLIENT
+    from mstar.worker.step_repeats import loop_back, run_columns
+
+    node = GraphNode(name="n", input_names={"h"}, outputs=[GraphEdge("n", "h"), GraphEdge("n", "p")])
+    loop = Loop(section=node, max_iters=8, outputs=[], name="loop", accumulated_outputs=(
+        [GraphEdge(EMIT_TO_CLIENT, "p")] if accumulated else []
+    ))
+    edges = loop_edges(loop, "n")
+    assert loop_back(edges) == {"h"}
+    assert run_columns(edges, inline=()) == ({"p"} if accumulated else set())
+    assert (("p", "n") in edges.outputs) == accumulated
+
+
+def _frames(streaming: bool):
+    from mstar.graph.base import GraphEdge
+
+    return GraphEdge("codec", "frame", is_streaming=streaming)
+
+
+@pytest.mark.parametrize(("loop", "why"), [
+    (_token_loop(), None),
+    (_token_loop(_frames(streaming=True)), None),
+    (_token_loop(_frames(streaming=False)), "graph runtime: 'frame' -> 'codec' is read once an iteration"),
+    (_token_loop(streamed=("chunk",)), "node: its streamed input 'chunk' isn't an iteration input"),
+], ids=["served", "streamed_out", "next_node", "streamed_in"])
+def test_a_walk_repeats_only_if_a_run_serves_each_of_its_edges(loop, why):
+    from mstar.graph.base import loop_edges
+    from mstar.worker.step_repeats import edge_refusal
+
+    refusal = edge_refusal(loop_edges(loop, "n"))
+    assert refusal is None if why is None else refusal.startswith(why)
+
+
+def test_an_input_another_node_of_the_loop_makes_each_iteration_is_not_constant():
+    """BAGEL's split CFG: combine_cfg reads each branch's velocity once an
+    iteration. A run of combine alone would replay on the first velocity while
+    its count skipped the branch's iterations, so it doesn't repeat alone."""
+    from mstar.graph.base import GraphEdge, GraphNode, Loop, Parallel, Sequential, loop_edges
+    from mstar.worker.step_repeats import edge_refusal
+
+    branch = GraphNode(name="b", input_names=["x"], outputs=[GraphEdge("c", "v")], enable_async_scheduling=False)
+    combine = GraphNode(
+        name="c", input_names=["v", "x"], outputs=[GraphEdge("b", "x"), GraphEdge("c", "x")],
+        enable_async_scheduling=False,
+    )
+    edges = loop_edges(Loop(section=Sequential([Parallel([branch]), combine]), max_iters=8, outputs=[], name="l"), "c")
+    assert edges.inputs == {"v": EdgeKind.PER_ITERATION, "x": EdgeKind.LOOP_BACK}
+    assert edges.made_by == {"v": "b", "x": "c"} and edges.streamed == frozenset()
+    assert edge_refusal(edges) == "graph runtime: its input 'v' is made by 'b' once an iteration"
+
+
+@pytest.mark.parametrize(("parallel", "why"), [(False, None), (True, "TP: each rank's window")])
+def test_under_tp_a_walk_reading_a_streamed_iteration_input_does_not_repeat(parallel, why):
+    """Each rank's window is what reached it, so a follower would read other items."""
+    from mstar.graph.base import loop_edges
+    from mstar.worker.step_repeats import edge_refusal
+
+    refusal = edge_refusal(loop_edges(_token_loop(streamed=("chunk",)), "n"), {"chunk"}, parallel)
+    assert refusal is None if why is None else refusal.startswith(why)
+
+
+def test_a_run_keeps_a_column_of_each_per_iteration_output_the_token_column_doesnt_carry():
+    from mstar.graph.base import loop_edges
+    from mstar.worker.step_repeats import run_columns
+
+    edges = loop_edges(_token_loop(_frames(streaming=True)), "n")
+    assert run_columns(edges, inline={"t"}) == {"frame"}
+    assert run_columns(edges, inline=()) == {"frame", "t"}
+
+
+class _LengthsFixedDecode(FlashInferDecodeWrapper):
+    lengths_move = False  # fa3 or cuDNN
+
+
+class _TensorCoreDecode(FlashInferDecodeWrapper):
+    lengths_move = True
+
+
+@pytest.mark.parametrize("append", [0, 1])
+def test_resident_decode_grid_tracks_new_owners_and_discards_old_page_ids(append):
+    # Fixed capture addresses, two queued windows, different resident owners.
+    # Poison unused source columns so reading a prior tenant cannot look valid.
+    store = torch.tensor([[0, 0, 0, 0], [11, 777, 777, 777],
+                          [21, 22, 777, 777], [31, 32, 33, 34]], dtype=torch.long).flatten()
+    wrappers = []
+    for _ in range(2):
+        wrapper = _TensorCoreDecode.__new__(_TensorCoreDecode)
+        wrapper.batch_size, wrapper.page_size, wrapper._resident_pages = 2, 16, 4
+        wrapper._paged_kv_indices_buf = torch.full((8,), 999, dtype=torch.int32)
+        wrapper._paged_kv_last_page_len_buf = torch.zeros(2, dtype=torch.int32)
+        wrappers.append(wrapper)
+    for slots, lengths, expected in (
+        ([1, 2], [16 - append, 17 - append], [[11, 0, 0, 0], [21, 22, 0, 0]]),
+        ([1, 3], [0, 64 - append], [[11 if append else 0, 0, 0, 0], [31, 32, 33, 34]]),
+    ):
+        for wrapper in wrappers:
+            wrapper.gather_resident(store, torch.tensor(slots), torch.tensor(lengths), 4, 0, append=append)
+            assert wrapper._paged_kv_indices_buf.reshape(2, 4).tolist() == expected
+            # FlashInfer reconstructs length from the fixed grid plus its tail.
+            assert (wrapper._paged_kv_last_page_len_buf + 48).tolist() == [max(n + append, 1) for n in lengths]
+
+
+def _sampler(**attrs):
+    from mstar.engine.resources.sampler.resource import SamplerResource
+
+    sampler = SamplerResource.__new__(SamplerResource)
+    for name, value in {
+        "_history": None, **attrs,
+    }.items():
+        setattr(sampler, name, value)
+    return sampler
+
+
+def _attention(*wrappers):
+    manager = FlashInferManager.__new__(FlashInferManager)
+    bucket = BucketKey(graph_walk=WALK, bs=1, num_tokens=1)
+    manager._cg_plan_states = {
+        CGSlotKey(bucket=bucket, slot=slot, label="main"): cls.__new__(cls) for slot, cls in enumerate(wrappers)
+    }
+    return manager
+
+
+@pytest.mark.parametrize(("resource", "refuses"), [
+    (_sampler, False),
+    # the repetition window moves in the graph each replay, like the offset
+    (lambda: _sampler(_history=object()), False),
+    (lambda: _attention(_TensorCoreDecode), False),
+    (lambda: _attention(_LengthsFixedDecode, _LengthsFixedDecode), True),
+], ids=["sampler", "history", "tensor_core", "lengths_fixed"])
+def test_a_resource_refuses_repeats_at_load_for_what_it_knows_at_load(resource, refuses):
+    assert (resource().repeat_refusal(WALK) is not None) is refuses
+
+
+@pytest.mark.parametrize(("groups", "why"), [
+    (1, None),  # either layout: its writes go through the same two tables
+    (2, "a sliding-window group frees its front pages at commit"),
+], ids=["one_group", "sliding_window"])
+def test_a_kv_pool_says_what_keeps_it_off_the_tables(groups, why):
+    kv = KVManager.__new__(KVManager)
+    kv._groups = [object()] * groups
+    kv._needs_remote_transfer = False
+    refusal = kv.resident_binding().check_streams("kv", {"kv": object()})
+    assert refusal is None if why is None else why in refusal
+
+
+def test_mla_attention_is_resident_on_its_host_plan_and_says_why_it_doesnt_repeat():
+    from mstar.engine.resources.attn.flashinfer_mla import FlashInferMLAManager
+
+    mla = FlashInferMLAManager.__new__(FlashInferMLAManager)
+    assert mla.resident_binding().check_streams("attn", {}) is None
+    step = SimpleNamespace(host_planned=False)
+    mla.resident_binding().gather(step)
+    assert step.host_planned
+    assert "takes each row's length from its plan" in mla.repeat_refusal(WALK)
+    assert mla.repeat_refusal(WALK, host_step=object()) is None
+
+
+@pytest.mark.parametrize(("walk", "tensor_cores", "note"), [
+    (WALK, True, "tensor-core decode for it"),
+    ("other", False, None),  # a walk that doesn't ask keeps the config's choice
+])
+def test_a_walk_that_asks_for_repeats_gets_tensor_core_decode(monkeypatch, walk, tensor_cores, note):
+    from mstar.engine.resources.attn import flashinfer
+
+    built = {}
+    monkeypatch.setattr(flashinfer, "FlashInferDecodeWrapper", lambda **kw: built.update(kw) or object())
+    manager = FlashInferManager.__new__(FlashInferManager)
+    manager._cg_plan_states, manager._splits, manager._decode_fmha = {}, {}, False
+    manager._decode_tensor_cores, manager._repeat_walks = False, set()
+    manager._joining_walks = set()
+    manager._wrapper_kv_kwargs, manager._kv_config, manager._group = {}, None, None
+    manager._workspaces = SimpleNamespace(get=lambda label, slot: "workspace")
+    monkeypatch.setattr(flashinfer, "captured_page_capacity", lambda *args: 8)
+    manager.ask_repeats(WALK)
+    lease = SlotLease(slot=0, bucket=BucketKey(graph_walk=walk, bs=4, num_tokens=4))
+    manager._cg_wrapper(lease, "main", 4, False)
+    assert built["use_tensor_cores"] is tensor_cores and manager.repeat_note(walk) == note
+
+
+@pytest.mark.parametrize(("block", "why"), [
+    *(({"n": {"max": limit}}, "integer of at least 1") for limit in (2.5, True, "4", 0)),
+    ({"n": {"max": 2, "maxx": 3}}, "not settings"),
+    ({"m": {"max": 2}}, "not nodes of the model"),
+    ({"n": 4}, "must be a mapping"),
+    ({"n": {"max": 2, "device_stop": "maybe"}}, "must be one of"),
+    ({"n": {"device_stop": "skip"}}, "need max above 1"),
+    ({"n": {"max": 2, "refill_at": 1.5}}, "must be in"),
+    ({"n": {"max": 2, "device_stop": "skip", "refill_at": "0.5"}}, "must be in"),
+    ({"n": {"max": 2, "refill_at": 0.5}}, "needs device_stop"),
+    ({"n": {"max": 2, "device_launch": "on"}}, "not settings"),
+    ({"n": {"max": 2, "ready_waits": "yes"}}, "must be a boolean"),
+    ({"n": {"ready_waits": True}}, "need max above 1"),
+    ({"n": {"auto": True}}, "need max above 1"),
+    ({"n": {"max": 2, "eos_odds": 1.5}}, "must be in"),
+    ({"n": {"max": 2, "stream_queue": {"depth": 0}}}, "must be {depth"),
+    ({"n": {"max": 2, "join_rows": True}}, "needs device_stop"),
+    ({"n": {"max": 2, "device_stop": "skip", "join_rows": 1}}, "must be a boolean"),
+    ({"n": {"max": 2, "device_stop": "skip", "join_rows": True, "refill_at": 0.5}}, "cannot currently combine"),
+])
+def test_a_step_repeats_block_that_asks_for_nothing_real_is_refused(block, why):
+    with pytest.raises(ValueError, match=why):
+        parse_step_repeats(block, {"n"})
+
+
+def test_auto_raises_the_run_at_once_and_lowers_it_after_eight_quiet_steps():
+    """A gap is host time the run didn't hide: the next run is long enough to
+    fill it, under ``max``. Quiet steps lower it one at a time, to see whether
+    less still hides the host."""
+    from mstar.worker.step_repeats import AutoRepeats
+
+    auto = AutoRepeats(limit=8)
+    ms = 1e-3
+    # 1 ms of GPU an iteration, a 2.5 ms gap: the host's period is 3.5 iterations
+    assert auto.observe(2.5 * ms, 1 * ms, 1) == 4
+    # a longer gap than the max fills: capped
+    assert auto.observe(40 * ms, 4 * ms, 4) == 8
+    for _ in range(7):
+        assert auto.observe(0.0, 8 * ms, 8) == 8
+    assert auto.observe(0.0, 8 * ms, 8) == 7
+    # a launch's own gap is no host time
+    assert all(auto.observe(5e-6, 7 * ms, 7) == 7 for _ in range(7))
+    assert auto.observe(5e-6, 7 * ms, 7) == 6
+
+
+def test_a_run_whose_rows_near_a_stop_shortens_the_next_one():
+    """Past ``eos_odds`` the next run takes the iterations such a stop takes on
+    average; below it, the full length again."""
+    repeats = StepRepeats({"n": RepeatConfig(max=8, eos_odds=0.2)}, {})
+    key = ("n", WALK)
+    for odds, cap in [(0.05, None), (0.3, 3), (0.6, 1), (0.1, None)]:
+        repeats.observe_odds(key, odds)
+        assert repeats._odds_caps.get(key) == cap
+
+
+@pytest.mark.parametrize("capacity", [2, 4])
+@pytest.mark.parametrize("preplan", [False, True])
+def test_a_tp_count_is_checked_before_any_resource_reserves(capacity, preplan):
+    """The last step of a chain needs no successor message to detect a
+    follower's smaller capacity; a larger capacity never expands its count."""
+    reserved = []
+
+    class Limited(Resource):
+        supports_preplan = True
+
+        @classmethod
+        def build(cls, spec, info):
+            return cls()
+
+        def max_repeats(self, step, ctx):
+            return capacity
+
+        def admit(self, step, ctx):
+            reserved.append(ctx.repeats)
+            return super().admit(step, ctx)
+
+    runner = StepRunner({"limited": Limited()})
+    ctx = StepContext(request_ids=[1], graph_walk=WALK, slot=0, capture=False, repeats=3)
+    ctx.tp_repeats = 3
+    step = SubmoduleStep(steps={"limited": SimpleNamespace(segments=())})
+    step.set_ctx(ctx)
+    admit = runner.pre_admit if preplan else runner.admit
+    if capacity < 3:
+        with pytest.raises(SystemExit, match="leader.*3"):
+            admit(step)
+        assert reserved == []
+    else:
+        assert admit(step).ok
+        assert reserved == [3]
+        assert ctx.repeats == 3
+
+
+@pytest.mark.parametrize("fallback", ["lane", "uncaptured", "bucket"])
+@pytest.mark.parametrize("authoritative", [False, True])
+def test_an_eager_tp_fallback_cannot_change_a_broadcast_count(fallback, authoritative):
+    from mstar.engine.engine import Engine, ExecutingBatch
+
+    ctx = StepContext(request_ids=[1], graph_walk=WALK, slot=0, capture=False, repeats=3)
+    ctx.tp_repeats = 3 if authoritative else None
+    batch = ExecutingBatch(node_name="n", per_request_info={1: SimpleNamespace()}, step_context=ctx)
+    engine = Engine.__new__(Engine)
+    engine._walk_lanes = {("n", WALK): 1} if fallback == "lane" else {}
+    engine._beside_chain = lambda node, walk: True
+    engine._submodules = {"n": SimpleNamespace(
+        num_slots=2, lease_slot=lambda: 0, lora_pools=(), resident=None,
+        submodule=SimpleNamespace(cg_key_info=lambda *a, **kw: None),
+        accelerator_graph_runner=None if fallback == "uncaptured" else SimpleNamespace(lease_slot=lambda **kw: None),
+    )}
+    if authoritative:
+        with pytest.raises(SystemExit, match="leader.*3"):
+            engine.reserve_replay_slot(batch)
+    else:
+        assert engine.reserve_replay_slot(batch) is None
+        assert ctx.repeats == 1
+
+
+def test_explicit_device_stop_requires_a_loop_in_the_whole_model():
+    from mstar.graph.base import GraphNode, Loop
+    from mstar.model.base import Model
+    from mstar.model.submodule_base import ChunkingPolicy
+    from mstar.worker.step_repeats import walk_edges
+
+    node = GraphNode(name="n", input_names=[], outputs=[])
+    config = {"n": {"max": 4, "device_stop": "skip"}}
+    with pytest.raises(ValueError, match="device_stop.*Loop"):
+        parse_step_repeats(config, {"n"}, walks={"prefill": node})
+    # A prefill-only worker still accepts a node whose loop runs elsewhere.
+    walks = {"prefill": node, "decode": Loop(section=node, max_iters=8, outputs=[])}
+    assert parse_step_repeats(config, {"n"}, walks=walks)["n"].device_stop == "skip"
+    # Chunked prefill is a scheduler-owned token Loop, not another requested
+    # device run. Use the same graph transformation as a served model.
+    model = SimpleNamespace(get_chunking_policies=lambda: {
+        "n": (ChunkingPolicy(walks=("prefill",), chunkable=True),),
+    })
+    walks = Model.apply_chunking(model, walks)
+    edges = walk_edges(walks, (("n", walk) for walk in walks))
+    repeats = StepRepeats(parse_step_repeats(config, {"n"}, walks=walks), edges)
+    assert set(repeats.device_stops()) == {("n", "decode")}
+    repeats.settle(lambda *key: None, lambda *key: None, {"device stop": lambda *key: None})
+    assert repeats.may_repeat("n", "decode") and not repeats.may_repeat("n", "prefill")
+    with pytest.raises(ValueError, match="device_stop.*Loop"):
+        parse_step_repeats(config, {"n"}, walks={"prefill": walks["prefill"]})
+
+
+def test_each_node_asks_for_its_own_repeats():
+    configs = parse_step_repeats({"thinker": {"max": 4}, "talker": {"max": 1}}, {"thinker", "talker", "codec"})
+    assert configs == {"thinker": RepeatConfig(max=4), "talker": RepeatConfig()}
+
+
+def test_a_step_with_no_plan_of_its_own_leaves_the_last_steps_wrappers_alone():
+    """A bucket whose kernels read the tables plans nothing, so the wrappers the
+    manager still holds are an earlier step's, on another slot or eager."""
+    bucket = BucketKey(graph_walk=WALK, bs=1, num_tokens=1)
+    manager = FlashInferManager.__new__(FlashInferManager)
+    manager._current_plan_states = {"main": FlashInferDecodeWrapper.__new__(FlashInferDecodeWrapper)}
+    assert manager.replay_columns(None, SimpleNamespace(
+        slot_lease=SlotLease(slot=0, bucket=bucket), resident=SimpleNamespace(host_plan_free={bucket}),
+    ), 4) == []
+
+
+def test_cached_pages_are_room_for_a_step_that_repeats():
+    """A long-running server's free pages sink to none while the prefix cache
+    holds them, and those go on demand."""
+    kv = KVManager.__new__(KVManager)
+    kv._arena = SimpleNamespace(num_free=1)
+    kv._groups = [SimpleNamespace(page_size=PAGE)]
+    kv._index = SimpleNamespace(evictable=lambda: {5, 6})
+    kv.config = SimpleNamespace(max_seq_len=10 * PAGE, request_pages=100)
+    kv._streams = {}
+    step = SimpleNamespace(segments=())
+    assert kv.max_repeats(step, SimpleNamespace(request_ids=(1, 2, 3), repeats=2, resident=object())) == PAGE
+    assert kv.max_repeats(step, SimpleNamespace(request_ids=(1, 2, 3, 4), repeats=2, resident=object())) == 1
+
+
+def test_under_tp_a_steps_repeats_never_narrow_on_a_ranks_own_free_pages():
+    """Each rank of a lockstep instance frees pages when its own teardown runs,
+    so its free count is its own: narrowing on it would settle the ranks at
+    different counts of the same collectives (review-r2 F3)."""
+    kv = KVManager.__new__(KVManager)
+    kv._arena = SimpleNamespace(num_free=1)
+    kv._groups = [SimpleNamespace(page_size=PAGE)]
+    kv._index = None
+    kv.config = SimpleNamespace(max_seq_len=10 * PAGE, request_pages=100)
+    kv._streams = {}
+    kv._world_size = 2
+    step = SimpleNamespace(segments=())
+    assert kv.max_repeats(step, SimpleNamespace(request_ids=(1, 2, 3, 4), repeats=2, resident=object())) == PAGE
+
+
+def test_a_steps_log_probs_narrow_it_only_by_its_own_rows():
+    """Which requests ask log-probs, pool-wide, depends on when each rank
+    ingested them; the step's own rows are the same on every rank (review-r2 F3)."""
+    from mstar.engine.resources.sampler.resource import SamplerResource
+
+    sampler = SamplerResource.__new__(SamplerResource)
+    sampler._logprob_rids = {9}
+    sampler._kept_rids_of = lambda step, ctx: None
+    assert sampler.max_repeats(object(), SimpleNamespace(request_ids=(1, 2))) > 1
+    assert sampler.max_repeats(object(), SimpleNamespace(request_ids=(1, 9))) == 1
+
+
+def test_a_run_past_a_rows_cap_stays_inside_the_rows_table():
+    """``past_cap`` lets a run outlast a row's count, and a row at the end of
+    its context has nowhere to put those tokens."""
+    kv = KVManager.__new__(KVManager)
+    kv._arena = SimpleNamespace(num_free=8)
+    kv._groups = [SimpleNamespace(page_size=PAGE)]
+    kv._index = None
+    kv.config = SimpleNamespace(max_seq_len=10 * PAGE, request_pages=100)
+    kv._streams = {1: {"main": SimpleNamespace(stored_len=10 * PAGE - 5)}}
+    step = SimpleNamespace(segments=[SimpleNamespace(request_id=1, label="main", span=1)])
+    assert kv.max_repeats(step, SimpleNamespace(request_ids=(1,), repeats=3, resident=object())) == 2
+    kv._streams[1]["main"].stored_len = 10 * PAGE
+    assert kv.max_repeats(step, SimpleNamespace(request_ids=(1,), repeats=3, resident=object())) == 1
+    # nor past max_seq_len inside its last page: a learned position table ends there (review-r2 F14)
+    kv.config.max_seq_len = 10 * PAGE - 3
+    kv._streams[1]["main"].stored_len = 10 * PAGE - 8
+    assert kv.max_repeats(step, SimpleNamespace(request_ids=(1,), repeats=3, resident=object())) == 2
+    # a full stream the step only reads goes nowhere: Whisper's cross KV holds max_seq_len frames
+    kv._streams[1]["main"].stored_len = kv.config.max_seq_len
+    step.segments[0].span = 0
+    assert kv.max_repeats(step, SimpleNamespace(request_ids=(1,), repeats=3, resident=object())) > 3
+
+
+def test_a_narrowed_run_says_which_resource_did_it(monkeypatch):
+    """The walk's line reads "repeats on" from load, so without this a resource that
+    holds every step to one iteration looks like a run (review-r6 F6). Each step
+    counts; the log has one line for it, and one more once it comes down to 1."""
+    answers = {"cross_kv": 1, "sampler": ANY_REPEATS}
+    runner = StepRunner.__new__(StepRunner)
+    runner._resources = {
+        key: SimpleNamespace(max_repeats=lambda step, ctx, key=key: answers[key]) for key in answers
+    }
+    runner._keys_cache = {frozenset(answers): list(answers)}
+    runner._node_order = {"decoder": list(answers)}
+    runner._narrowed = set()
+    logged = []
+    monkeypatch.setattr(runner_mod.logger, "info", lambda *args: logged.append(args))
+    monkeypatch.setattr(profiler, "PHASE_PERIOD", 1)
+    samples = profiler.phase_buffer()
+    samples.clear()
+
+    def settle(asked):
+        ctx = StepContext(request_ids=[], graph_walk=WALK, slot=0, capture=False, repeats=asked)
+        runner._settle_repeats(SimpleNamespace(ctx=ctx, keys=answers.keys, get=lambda key: None))
+        return ctx.repeats
+
+    answers["cross_kv"] = 5
+    assert [settle(8), settle(8)] == [5, 5]
+    assert len(logged) == 1 and "cross_kv" in logged[0] and ["decoder"] in logged[0] and WALK in logged[0]
+    answers["cross_kv"] = 1
+    assert [settle(8), settle(8)] == [1, 1]
+    assert len(logged) == 2
+    assert samples[f"repeats.narrowed.{WALK}.cross_kv#"] == [5, 5, 1, 1]
+    # each resource is named with what it allowed, not the step's settled count (review-r7 G6)
+    answers["cross_kv"], answers["sampler"] = 5, 1
+    assert settle(8) == 1
+    assert samples[f"repeats.narrowed.{WALK}.cross_kv#"][-1] == 5
+    assert samples[f"repeats.narrowed.{WALK}.sampler#"] == [1]
+    assert logged[-1][-2:] == (1, 8) and "sampler" in logged[-1]
+    assert settle(1) == 1 and len(samples[f"repeats.narrowed.{WALK}.cross_kv#"]) == 5, "nothing was asked"
+    samples.clear()
+
+
+def test_a_step_its_resources_held_to_one_iteration_moves_its_rows_by_one():
+    """The worker asks for a ceiling, and the step's resources settle what it
+    runs. Once it has admitted, its rows' Loops move by what it runs."""
+    rows = {0: 0, 1: 0}
+    batch = ScheduledBatch(node_name="n", graph_walk=WALK, request_to_worker_graph=dict(rows))
+    ctx = SimpleNamespace(repeats=1)
+    worker = Worker.__new__(Worker)
+    worker._step_repeats = _repeats(8)
+    worker._step_repeats.settle(lambda *key: None, lambda *key: None)
+    worker._innermost_loop_by_node = {(WALK, "n"): "loop"}
+    worker._graph_runtime = SimpleNamespace(loop_room=lambda *args: 100)
+    speculation = SimpleNamespace(
+        scheduled_batch=batch, node_batch=SimpleNamespace(step_context=ctx, stream_windows={}), loop_name="loop",
+        continuing_rids={0, 1}, is_new_iter=True, is_same_node=True, consumed_streaming_edges={},
+    )
+    in_flight = SimpleNamespace(batch=SimpleNamespace(repeats=1))
+    worker._stamp_repeats(speculation, in_flight, 1)
+    assert ctx.repeats == 8
+    ctx.repeats = 1  # what its resources allowed, at admit
+    pending = SimpleNamespace(batch=batch, node_batch=SimpleNamespace(
+        step_context=ctx, launch_started_event=SimpleNamespace(is_set=lambda: True), stream_windows={},
+    ))
+    worker._await_admit_settled(pending)
+    assert batch.loop_strides(list(rows)) in (None, [1, 1])
+
+
+@pytest.mark.parametrize("chained", [False, True])
+def test_a_step_of_a_node_that_never_chains_repeats_where_the_scheduler_picks_it(chained):
+    """A node that opts out of async scheduling has no speculated next step, so
+    the step the scheduler picks is where it repeats: as far as its Loop's room
+    with nothing of it in flight. A chained node's picked step stays one
+    iteration (its chain's next step repeats)."""
+    rows = {0: 0, 1: 0}
+    edges = LoopEdges({"t": EdgeKind.LOOP_BACK}, {("t", "n"): EdgeKind.LOOP_BACK}, chained=chained)
+    worker = Worker.__new__(Worker)
+    worker._step_repeats = StepRepeats({"n": RepeatConfig(max=8)}, {("n", WALK): edges})
+    worker._step_repeats.settle(lambda *key: None, lambda *key: None)
+    worker._innermost_loop_by_node = {(WALK, "n"): "loop"}
+    asked = []
+    worker._graph_runtime = SimpleNamespace(loop_room=lambda *args: asked.append(args) or 3)
+    batch = ScheduledBatch(node_name="n", graph_walk=WALK, request_to_worker_graph=dict(rows))
+    assert worker._unchained_repeats(batch) == (1 if chained else 3)
+    assert asked == ([] if chained else [("n", WALK, "loop", [0, 1], 0, False)])
+
+
+def test_a_step_cut_to_one_before_admit_says_why(monkeypatch):
+    """Admit can't narrow an ask of 1, so the walk's "repeats on" line hid every cut
+    the worker made itself: pi0.5's Loop with no room was one. Counted per step,
+    logged once per reason."""
+    from mstar.worker import step_repeats as step_repeats_mod
+
+    edges = LoopEdges({"t": EdgeKind.LOOP_BACK}, {("t", "n"): EdgeKind.LOOP_BACK}, chained=False)
+    worker = Worker.__new__(Worker)
+    worker._step_repeats = StepRepeats({"n": RepeatConfig(max=8)}, {("n", WALK): edges})
+    worker._step_repeats.settle(lambda *key: None, lambda *key: None)
+    worker._innermost_loop_by_node = {(WALK, "n"): "loop"}
+    room = [0]
+    worker._graph_runtime = SimpleNamespace(loop_room=lambda *args: room[0])
+    logged = []
+    monkeypatch.setattr(step_repeats_mod.logger, "info", lambda *args: logged.append(args))
+    monkeypatch.setattr(profiler, "PHASE_PERIOD", 1)
+    samples = profiler.phase_buffer()
+    samples.clear()
+    batch = ScheduledBatch(node_name="n", graph_walk=WALK, request_to_worker_graph={0: 0})
+
+    assert [worker._unchained_repeats(batch) for _ in range(2)] == [1, 1]
+    room[0] = 5
+    assert worker._unchained_repeats(batch) == 5
+    worker._innermost_loop_by_node = {}
+    assert worker._unchained_repeats(batch) == 1
+    assert samples[f"repeats.asked.{WALK}#"] == [1, 1, 5, 1]
+    assert [args[-1] for args in logged] == ["its Loop has room for 0", "the runtime holds no Loop of it here"]
+    samples.clear()
+
+
+def test_an_unnamed_loop_is_asked_about_by_the_name_the_runtime_holds():
+    """A Loop without a name draws a fresh one each time the model builds its walks,
+    and the runtime holds the worker graphs' build. pi0.5's action loop is one: its
+    unchained steps asked about a name the runtime didn't know, got no room, and ran
+    one iteration under a "repeats on" line."""
+    from mstar.graph.base import GraphEdge, GraphNode, Loop
+    from mstar.model.base import WorkerGraph
+    from mstar.worker.step_repeats import walk_edges
+
+    def build():
+        node = GraphNode(
+            name="n", input_names=["t"], outputs=[GraphEdge(next_node="n", name="t")], enable_async_scheduling=False,
+        )
+        return {WALK: Loop(section=node, max_iters=10, outputs=[])}
+
+    held = WorkerGraph(section=build()[WALK], graph_walks={WALK})
+    worker = Worker.__new__(Worker)
+    worker._innermost_loop_by_node = Worker._build_innermost_loop_cache(
+        (walk, wg.section) for wg in [held] for walk in wg.graph_walks
+    )
+    worker._step_repeats = StepRepeats({"n": RepeatConfig(max=8)}, walk_edges(build(), [("n", WALK)]))
+    worker._step_repeats.settle(lambda *key: None, lambda *key: None)
+    names = {held.section.name: 10}
+    worker._graph_runtime = SimpleNamespace(loop_room=lambda node, walk, loop, *rest: names.get(loop, 0))
+    batch = ScheduledBatch(node_name="n", graph_walk=WALK, request_to_worker_graph={0: 0})
+    assert worker._unchained_repeats(batch) == 8
+
+
+@pytest.mark.parametrize("state, streamed, why", [
+    (dict(parallel_nodes={"n"}), frozenset(), "TP group"),
+    ({}, frozenset({"chunk"}), "stream window"),
+    (dict(_ring_signals={"n": {"codes"}}), frozenset(), "ring"),
+    (dict(_signal_consumer={"t": "codec"}, _walk_drivers={"codec": object()}), frozenset(), "consumer"),
+])
+def test_a_node_that_never_chains_says_why_it_cant_repeat(state, streamed, why):
+    """Its ask has only the Loop's room to go on, so a walk that needs a chain's
+    other caps says so on its line rather than overrunning them, or reading
+    "on" while it runs one iteration (review-r2 F16)."""
+    worker = Worker.__new__(Worker)
+    worker.parallel_nodes, worker._ring_signals, worker._signal_consumer, worker._walk_drivers = set(), {}, {}, {}
+    worker.__dict__.update(state)
+    worker.engine_manager = SimpleNamespace(get_engine=lambda node: SimpleNamespace(
+        streamed_iteration_inputs=lambda node: streamed,
+    ))
+    worker._graph_runtime = SimpleNamespace(get_output_signals=lambda node, walk: ["t"])
+    assert why in worker._unchained_refusal("n", WALK)
+    worker.__dict__.update(
+        parallel_nodes=set(), _ring_signals={}, _signal_consumer={}, _walk_drivers={},
+    )
+    streamed = frozenset()
+    assert worker._unchained_refusal("n", WALK) is None
+
+
+def test_a_row_declaring_another_stream_than_its_walk_fails_its_step_not_the_worker():
+    """A resident step, and each replay of one, advances every row on the walk's
+    streams; a row whose declared label differs would be read and written on
+    the wrong stream."""
+    live, _, planner = _setup({1: 3, 2: 3})
+    _captured_step(live, planner, [1], slot=0, bs=2)
+    padded = (1, 2)
+    lease = SlotLease(slot=0, bucket=BucketKey(graph_walk=WALK, bs=2, num_tokens=2))
+    ctx = StepContext(request_ids=padded, graph_walk=WALK, slot=0, capture=False, slot_lease=lease, repeats=4)
+    step = SubmoduleStep(steps={}, segments=[Segment(1, "main", 1), Segment(2, "aux", 1)])
+    with pytest.raises(ValueError, match="row 2 declares 'aux'"):
+        planner.plan(step, ctx)
+
+
+def test_a_row_a_host_step_moved_does_not_rewind_on_each_replay():
+    """A one-token host step leaves a row's length to be refreshed. A run after
+    it refreshes it once, not at the head of every replay."""
+    live, ref, planner = _setup({1: 5})
+    _captured_step(live, planner, [1], slot=0, bs=1)
+    _captured_step(ref, None, [1], slot=0, bs=1)
+    step, ctx = _host_step(live, [1], [1], walk=WALK)
+    planner.commit(step, ctx)
+    _host_step(ref, [1], [1], walk=WALK)
+    a = _captured_step(live, planner, [1], slot=1, bs=1, repeats=3)
+    for i, replay in enumerate(a.replays):
+        b = _captured_step(ref, None, [1], slot=(1 + i) % 2, bs=1)
+        assert (replay.offsets[:1], replay.positions[:1]) == (b.offsets[:1], b.positions[:1])
 
 
 def test_a_steady_batch_keeps_its_row():
@@ -446,7 +1514,7 @@ def test_a_real_offload_gives_the_slot_up_and_its_reload_is_written_whole():
         name="kv", joint_comm_group=None, transfer_engine_info=None, device=device, dtype=torch.float32,
     )
     kv._cg_max_seq_len = 64
-    planner = ResidentPlanner("n", {WALK}, {"kv": kv}, device, max_bs=2)
+    planner = ResidentPlanner("n", _walk("kv"), {"kv": kv}, device, max_bs=2)
     engine = _offload_engine({"kv": kv}, planner)
     kv.ingest_request(1, KVReqConfig())
     segments = (Segment(1, "main", 9),)
@@ -775,6 +1843,323 @@ def test_a_displaced_row_is_written_whole_with_its_lengths():
     assert tables.host_len[planner.slot_of(1)] == live["kv"]._streams[1]["main"].stored_len
 
 
+def test_resident_readers_survive_displacement_and_recycled_handles():
+    live, _, planner = _setup({rid: 3 for rid in range(1, 16)}, max_num_pages=256, pool_slots=20)
+    _captured_step(live, planner, [1, 2, 3, 4], slot=0, bs=4)
+    first = planner.pin([1])
+    second = planner.pin([1])
+    retained = planner.store.view(planner.max_slots, -1)[first[0]].clone()
+    _captured_step(live, planner, [5, 6, 7, 8], slot=1, bs=4)
+    _captured_step(live, planner, [9], slot=0, bs=4)
+    assert planner.slot_of(1) == first[0]
+    assert planner.slot_of(2) is None
+
+    # Handle reuse gets a different row even after the original step committed.
+    planner.release(1)
+    _captured_step(live, planner, [1], slot=1, bs=4)
+    assert planner.slot_of(1) != first[0]
+    planner.unpin(first)
+    for rid in (10, 11, 12):
+        _captured_step(live, planner, [rid], slot=rid % 2, bs=4)
+        assert planner.slot_of(rid) != first[0]
+    assert torch.equal(planner.store.view(planner.max_slots, -1)[first[0]], retained)
+    _slot_ledger(planner)
+
+    # Only the last reader makes the released row available to a new request.
+    planner.unpin(second)
+    _captured_step(live, planner, [13], slot=0, bs=4)
+    assert planner.slot_of(13) == first[0]
+    _assert_row(planner, live, 13)
+    _slot_ledger(planner)
+
+    planner.release(13)
+    pinned = planner.pin(tuple(planner._slot_of))
+    free = list(planner._free)
+    with planner._lock, pytest.raises(RuntimeError):
+        planner._take_slots(2, planner._plan_seq + 2)
+    assert planner._free == free
+    planner.unpin(pinned)
+    _slot_ledger(planner)
+
+
+def test_fresh_resident_rows_preserve_a_queued_capture_and_ordinary_sequence(monkeypatch):
+    from mstar.utils.h2d import PinnedStager
+
+    live, _, planner = _setup({1: 3, 2: 3})
+    _captured_step(live, planner, [1], slot=0, bs=4)
+    # Reserve the joining horizon first. Its publication must not use ordinary
+    # planning, which would replace the capture staged for request 1 below.
+    joining = _captured_step(live, planner, [2], slot=0, bs=4, repeats=4, run=False)
+    queued = _captured_step(live, planner, [1], slot=1, bs=4, preplan=True, run=False)
+    staged = planner._staged
+    stamps = planner._plan_seq, planner._commits, planner._committed_seq
+    before = {key: (buf.rows.clone(), buf.cells.clone(), buf.staged) for key, buf in planner._buffers.items()}
+    rewrite = planner.rewrite
+    with monkeypatch.context() as patch:
+        def fail_row(*args):
+            rewrite(*args)
+            raise ValueError("owner row refused")
+        patch.setattr(planner, "rewrite", fail_row)
+        for _ in range(planner.max_slots + 1):
+            with pytest.raises(ValueError, match="owner row refused"):
+                planner.prepare_rows(joining.step, joining.ctx)
+    assert planner.slot_of(2) is None
+    _slot_ledger(planner)
+
+    snapshot = planner.prepare_rows(joining.step, joining.ctx)
+    planner.flush(snapshot, stager=PinnedStager(torch.int64))
+    slot = planner.slot_of(2)
+    assert planner._readers[slot] == 1
+    tables = live["kv"]._resident
+    assert tables.host_len[slot] == 3
+    assert tables.host_cols[slot] == 2
+    assert tables.block_table.view[slot, :2].tolist() == live["kv"]._streams[2]["main"].page_indices[:2]
+    assert tables.kv_len.view[slot, 0].item() == 3
+    planner.advance(snapshot)
+    assert tables.host_len[slot] == 7
+    assert tables.kv_len.view[slot, 0].item() == 3, "only executed iterations advance device state"
+    assert planner._staged is staged
+    assert (planner._plan_seq, planner._commits, planner._committed_seq) == stamps
+    for key, (rows, cells, identity) in before.items():
+        buf = planner._buffers[key]
+        assert torch.equal(buf.rows, rows) and torch.equal(buf.cells, cells)
+        assert buf.staged is identity
+    _replay(live, planner, queued)
+    _assert_step_read_its_streams(live, queued, [1])
+    planner.release(2)
+    planner.unpin(tuple(snapshot.slots.tolist()))
+    _slot_ledger(planner)
+
+
+@pytest.mark.parametrize("actual,routed,changed_flag", [
+    (actual, routed, False) for actual in (0, 2, 4) for routed in (False, True)
+] + [(2, False, True)])
+def test_engine_prepares_one_logical_joining_receipt_without_replanning(actual, routed, changed_flag, monkeypatch):
+    from mstar.engine.engine import Engine, ExecutingBatch
+    from mstar.engine.resources.run_rows import RunRows
+
+    live = _resources(prefix_cache=False)
+    planner = _planner(live, max_bs=4)
+    runner = StepRunner(live)
+    for rid in (1, 2):
+        runner.ingest_request(rid, {"kv": KVReqConfig()})
+        _host_step(live, [rid], [3])
+    incumbent = _captured_step(live, planner, [1], slot=0, bs=4, repeats=4)
+    membership = RunRows(torch.device("cpu"), 4, 8, 2)
+    slot = SimpleNamespace(run=SimpleNamespace(state=SimpleNamespace(membership=membership), window=None),
+                           row_heads={}, static_inputs={"flag": False}, dummy_rids=(-1, -2, -3, -4))
+    from mstar.engine.resources.loopback_rows import LoopbackRows
+    owner = LoopbackRows(CPU)
+    for rid in (1, 2):
+        owner.add(rid)
+    owner.write("token", [1, 2], torch.tensor([11, 22]))
+    owner.ask_ring("frame", 8)
+    if routed:
+        slot.row_heads = {"token": "input_ids"}
+        slot.static_inputs["input_ids"] = torch.zeros(4, dtype=torch.long)
+    submodule = SimpleNamespace(preprocess=lambda walk, engine_inputs, inputs: {
+        "input_ids": torch.tensor([inp.token for inp in inputs]), "flag": changed_flag,
+    })
+    eng = Engine.__new__(Engine)
+    eng._runner, eng._enable_nvtx = runner, False
+    eng._submodules = {"decode": SimpleNamespace(
+        resident=planner, submodule=submodule, device_stops={WALK: None}, loopback_rows=owner,
+        resources=live, piecewise_runners={}, rings={"frame": {WALK}},
+        accelerator_graph_runner=SimpleNamespace(
+            slot_for=lambda lease: slot,
+            pad_inputs=lambda lease, inputs, **kwargs: inputs + [SimpleNamespace(input_seq_len=1, token=0)] * 3,
+            step_metadata=lambda lease, rids, infos: infos,
+            step_ids=lambda lease, rids: (*rids, *slot.dummy_rids[1:]),
+        ),
+    )}
+    active_step = SubmoduleStep({"kv": incumbent.kv, "pool": incumbent.pool, "rope": incumbent.rope})
+    active_step.set_ctx(incumbent.ctx)
+    active = ExecutingBatch("decode", {}, incumbent.ctx, step=active_step)
+    if actual == 0:
+        publish = membership.publish_row
+        def fail_publication(descriptor):
+            publish(descriptor)
+            raise ValueError("publication failed before launch")
+        with monkeypatch.context() as patch:
+            patch.setattr(membership, "publish_row", fail_publication)
+            with pytest.raises(ValueError, match="publication failed"):
+                eng._seed_run_rows(active, slot, [False])
+        assert membership.idle and not active.run_rows and not planner._readers.any()
+    eng._seed_run_rows(active, slot, [False])
+    ctx = StepContext((2,), WALK, 0, False, repeats=4)
+    segments = (Segment(2, "main", 1),)
+    step = SubmoduleStep({"kv": KVStep(segments=segments), "rope": PositionStep(segments=segments),
+                          "pool": RecurrentStep(segments=segments)})
+    candidate = ExecutingBatch("decode", {}, ctx, inputs=[SimpleNamespace(input_seq_len=1, token=42)], step=step,
+                               kept_rows=[False] if routed else None)
+    if changed_flag:
+        with pytest.raises(ValueError, match="non-tensor specialization"):
+            eng.admit_run_row(candidate, active, 1)
+        assert planner.slot_of(2) is None and candidate.committed is None and not candidate.run_rows
+        assert live["kv"]._streams[2]["main"].stored_len == live["rope"].position(2, "main") == 3
+        assert owner.read("token", [1, 2]).tolist() == [11, 22]
+        return
+    stamps = planner._plan_seq, planner._commits, planner._committed_seq
+    buffers = {key: (buf.rows.clone(), buf.cells.clone()) for key, buf in planner._buffers.items()}
+    with monkeypatch.context() as patch:
+        patch.setattr(runner, "plan", lambda *args: pytest.fail("joining replaced an active plan"))
+        pages = live["kv"]._arena.num_free
+        assert eng.admit_run_row(candidate, active, 0) is None  # the incumbent still owns this row
+        assert planner.slot_of(2) is None and live["kv"]._arena.num_free == pages
+        assert live["kv"]._streams[2]["main"].stored_len == live["rope"].position(2, "main") == 3
+        descriptor = eng.admit_run_row(candidate, active, 1)
+    assert descriptor is candidate.run_rows[2]
+    assert owner.read("token", [1, 2]).tolist() == [11, 42 if routed else 22]
+    assert candidate.committed is step and ctx.counted == {2: runner.request_generation(2)}
+    assert candidate.ring_bases == {"frame": {2: 0}} and candidate.ring_width == 4
+    assert owner.ring_room("frame", 2) == 4
+    assert membership.control[1:].tolist() == [0] * 3, "the worker attaches its receipt before publication"
+    assert live["kv"]._streams[2]["main"].stored_len == live["rope"].position(2, "main") == 7
+    assert (planner._plan_seq, planner._commits, planner._committed_seq) == stamps
+    for key, (rows, cells) in buffers.items():
+        assert torch.equal(planner._buffers[key].rows, rows)
+        assert torch.equal(planner._buffers[key].cells, cells)
+    membership.publish_row(descriptor)
+    membership.drain()
+    membership.acknowledge(membership.control.tolist())
+    eng.settle_run(candidate, actual, {2: actual})
+    assert live["kv"]._streams[2]["main"].stored_len == live["rope"].position(2, "main") == 3 + actual
+    assert membership.release(descriptor)
+    planner.unpin((descriptor.bindings[0],))
+    for incumbent_descriptor in active.run_rows.values():
+        assert membership.release(incumbent_descriptor)
+        planner.unpin((incumbent_descriptor.bindings[0],))
+    assert membership.idle
+    _slot_ledger(planner)
+
+
+@pytest.mark.parametrize("first_count", [0, 1, 2])
+def test_joining_horizon_preserves_other_preplans_and_settles_both_receipts(monkeypatch, first_count):
+    from mstar.engine.resources.step import AdmitFailedReason, AdmitOutcome
+
+    live = _resources(prefix_cache=False)
+    kv, rope = live["kv"], live["rope"]
+    planner = _planner(live, max_bs=4)
+    runner = StepRunner(live)
+    for rid in (1, 2):
+        runner.ingest_request(rid, {"kv": KVReqConfig()})
+        _host_step(live, [rid], [3])
+    _captured_step(live, planner, [1], slot=0, bs=4)
+    bucket = BucketKey(WALK, 4, 4)
+    ctx = StepContext((1,), WALK, 0, False, resident=planner, is_preplan=True,
+                      slot_lease=SlotLease(0, bucket))
+    ctx.set_padded_rids((1, -1, -2, -3))
+    segments = tuple(Segment(rid, "main", 1) for rid in ctx.padded_request_ids)
+    queued = SubmoduleStep({"kv": KVStep(segments=segments), "rope": PositionStep(segments=segments),
+                            "pool": RecurrentStep(segments=segments)})
+    queued.set_ctx(ctx)
+    assert runner.pre_admit(queued).ok
+    planner.plan(queued, ctx)
+    runner.pre_plan(queued)
+    ctx.is_preplan = False
+    original = runner._staged, runner._pre_admitted, kv._preplan_key, kv._cached_plan_output, planner._staged
+    marked = list(kv._preplan_marked)
+    before_pages = kv._arena.num_free
+    items = (Segment(2, "main", 1),)
+    joining = SubmoduleStep({"kv": KVStep(segments=items), "rope": PositionStep(segments=items),
+                             "pool": RecurrentStep(segments=items)})
+    joining.set_ctx(StepContext((2,), WALK, 0, False, resident=planner, repeats=4))
+
+    # Full horizon sizing refuses before reserving; it never changes receipts.
+    with monkeypatch.context() as patch:
+        patch.setitem(planner.bindings, "rope", replace(planner.bindings["rope"], max_repeats=lambda step, ctx: 3))
+        assert not runner.admit_rows(joining).ok
+    assert joining.ctx.repeats == 4 and kv._arena.num_free == before_pages
+    # An owner refusing after KV must release only the new row's pages.
+    with monkeypatch.context() as patch:
+        patch.setattr(rope, "admit", lambda step, ctx: AdmitOutcome(False, reason=AdmitFailedReason("busy")))
+        assert not runner.admit_rows(joining).ok
+    assert kv._arena.num_free == before_pages
+    assert (runner._staged, runner._pre_admitted, kv._preplan_key, kv._cached_plan_output, planner._staged) == original
+    assert kv._preplan_marked == marked and kv._streams[1]["main"].step_in_flight
+    assert not kv._streams[2]["main"].step_in_flight
+    assert runner.admit_rows(joining).ok
+    snapshot = planner.prepare_rows(joining, joining.ctx)
+    receipts = []
+    for _ in range(2):
+        receipt = SubmoduleStep(joining.steps)
+        receipt.set_ctx(StepContext((2,), WALK, 0, False, resident=planner, repeats=2))
+        runner.commit(receipt, track_rows=True)
+        receipts.append(receipt)
+    planner.advance(snapshot)
+    assert kv._streams[2]["main"].stored_len == rope.position(2, "main") == 7
+    runner.settle_run(receipts[0], {2: first_count})
+    runner.settle_run(receipts[1], {2: 2})
+    expected = 5 + first_count
+    assert kv._streams[2]["main"].stored_len == rope.position(2, "main") == expected
+    assert kv._resident.host_len[planner.slot_of(2)] == expected
+    assert live["pool"]._slots[2]["main"].tokens == expected
+    assert live["pool"]._slots[2]["main"].has_state
+    assert (runner._staged, runner._pre_admitted, kv._preplan_key, kv._cached_plan_output, planner._staged) == original
+    # The ordinary successor still promotes the plan it reserved before the join.
+    assert runner.admit(queued).ok
+    planner.plan(queued, ctx)
+    assert ctx.resident_plan is original[-1]
+    assert runner.plan(queued)["kv"] is original[3]
+    runner.commit(queued)
+    planner.commit(queued, ctx)
+    planner.release(2)
+    planner.unpin(tuple(snapshot.slots.tolist()))
+    kv.assert_pages_conserved()
+
+
+@pytest.mark.parametrize("unsupported", [
+    "recurrent", "host_writes", "foreign_segment", "iteration_inputs", "sampler", "span", "walk",
+    "missing", "duplicate",
+])
+def test_joining_rejects_unaudited_owner_effects_before_reserving(unsupported):
+    live = _resources(prefix_cache=False, recurrent_prefix_slots=1 if unsupported == "recurrent" else 0)
+    if unsupported == "iteration_inputs":
+        live["input"] = IterationTables(CPU)
+    elif unsupported == "sampler":
+        from mstar.engine.resources.sampler.resource import SamplerResource
+        live["sampler"] = SamplerResource(vocab_size=8, enable_repetion_penalty=False, device=CPU)
+    planner = _planner(live, max_bs=4, keys=tuple(live))
+    runner = StepRunner(live)
+    runner.ingest_request(1, {"kv": KVReqConfig()})
+    _host_step(live, [1], [3])
+    segments = (Segment(1, "main", 1),)
+    steps = {"kv": KVStep(segments=segments), "rope": PositionStep(segments=segments),
+             "pool": RecurrentStep(segments=segments)}
+    if unsupported == "recurrent":
+        # A provisional first receipt ends at a page boundary and may snapshot
+        # state. Repeat support alone cannot authorize this owner-only path.
+        steps["pool"] = RecurrentStep(segments=segments)
+    elif unsupported == "host_writes":
+        live["kv"]._host_writes = SimpleNamespace()
+    elif unsupported == "iteration_inputs":
+        from mstar.engine.resources.step import ResourceStep
+        steps["input"] = ResourceStep(segments=segments)
+    elif unsupported == "sampler":
+        from mstar.engine.resources.sampler.config import SamplerStep
+        steps["sampler"] = SamplerStep(segments=segments)
+    elif unsupported == "span":
+        steps["kv"] = KVStep(segments=(Segment(1, "main", 2),))
+    elif unsupported == "walk":
+        pass
+    elif unsupported == "missing":
+        steps["kv"] = KVStep(segments=())
+    elif unsupported == "duplicate":
+        steps["kv"] = KVStep(segments=segments * 2)
+    else:
+        steps["kv"] = KVStep(segments=(Segment(2, "main", 1),))
+    step = SubmoduleStep(steps)
+    step.set_ctx(StepContext((1,), "other" if unsupported == "walk" else WALK,
+                             0, False, resident=planner, repeats=4))
+    free = live["kv"]._arena.num_free
+    with pytest.raises(ValueError):
+        runner.admit_rows(step)
+    assert live["kv"]._arena.num_free == free
+    assert not live["kv"]._admit_reserved_pages
+    assert live["kv"]._streams[1]["main"].stored_len == 3
+    assert not planner._slot_of
+
+
 def test_a_step_does_not_displace_its_own_rows_or_the_step_behind_it():
     live, ref, planner = _setup({rid: 3 for rid in range(1, 16)}, max_num_pages=256, pool_slots=20)
     del ref
@@ -885,7 +2270,7 @@ def test_ranks_with_the_same_history_displace_the_same_requests():
 
 def test_the_store_is_sized_by_the_widest_capture():
     res = _resources()
-    planner = ResidentPlanner("n", {WALK}, {k: res[k] for k in ("kv", "pool", "rope")}, CPU, max_bs=8)
+    planner = _planner(res, max_bs=8)
     assert planner.max_slots == 17
     assert len(planner._free) == 16
     assert TRASH_SLOT not in planner._free
@@ -893,7 +2278,7 @@ def test_the_store_is_sized_by_the_widest_capture():
 
 def test_a_flush_of_the_largest_step_stages_without_growing(monkeypatch):
     res = _resources(max_num_pages=64)
-    planner = ResidentPlanner("n", {WALK}, {k: res[k] for k in ("kv", "pool", "rope")}, CPU, max_bs=4)
+    planner = _planner(res, max_bs=4)
     stride = planner._tables[0].stride
     assert planner._stager._seg_numel >= 4 * stride + 4 * 4
     monkeypatch.setattr(planner._stager, "_grow", lambda numel: pytest.fail(f"grew to {numel}"))
@@ -912,7 +2297,7 @@ def test_a_flush_of_the_largest_step_stages_on_the_device_without_growing(monkey
         ),
         name="kv", joint_comm_group=None, transfer_engine_info=None, device=device, dtype=torch.float32,
     )
-    planner = ResidentPlanner("n", {WALK}, {"kv": kv}, device, max_bs=4)
+    planner = ResidentPlanner("n", _walk("kv"), {"kv": kv}, device, max_bs=4)
     stride = planner._tables[0].stride
     monkeypatch.setattr(planner._stager, "_grow", lambda numel: pytest.fail(f"grew to {numel}"))
     rows = [(slot, 0, list(range(100, 100 + stride))) for slot in range(1, 5)]
@@ -936,19 +2321,19 @@ def _kv(max_seq_len: int, max_num_pages: int) -> KVManager:
 
 def test_a_row_is_as_wide_as_the_pool_when_the_context_is_wider():
     kv = _kv(max_seq_len=1 << 20, max_num_pages=64)
-    ResidentPlanner("n", {WALK}, {"kv": kv}, CPU, max_bs=1)
+    ResidentPlanner("n", _walk("kv"), {"kv": kv}, CPU, max_bs=1)
     assert kv._resident.block_table.width == kv.config.request_pages == 63
 
 
 def test_a_row_is_as_wide_as_the_context_when_the_pool_is_wider():
     kv = _kv(max_seq_len=4 * 10 + 1, max_num_pages=64)
-    ResidentPlanner("n", {WALK}, {"kv": kv}, CPU, max_bs=1)
+    ResidentPlanner("n", _walk("kv"), {"kv": kv}, CPU, max_bs=1)
     assert kv._resident.block_table.width == 11
 
 
 def test_a_stream_wider_than_a_row_raises():
     kv = _kv(max_seq_len=8, max_num_pages=64)
-    planner = ResidentPlanner("n", {WALK}, {"kv": kv}, CPU, max_bs=1)
+    planner = ResidentPlanner("n", _walk("kv"), {"kv": kv}, CPU, max_bs=1)
     tables = kv._resident
     assert tables.block_table.width == 2
     writes = resident_mod.ResidentWrites({"kv": resident_mod.ResidentStream("main", reads=False)})
@@ -1030,7 +2415,7 @@ def test_a_raise_in_the_preplan_leaves_the_reservation_for_exec(monkeypatch, rai
     stream, the in-flight mark goes, and exec's admit finds the page and takes no
     other. The same for a raise from the planner and from the runner's own pre-plan."""
     res = _resources()
-    planner = ResidentPlanner("n", {WALK}, {k: res[k] for k in ("kv", "pool", "rope")}, CPU, max_bs=4)
+    planner = _planner(res, max_bs=4)
     _ingest(res, 1)
     step, ctx = _host_step(res, [1], [3])
     planner.commit(step, ctx)
@@ -1075,19 +2460,19 @@ def test_a_plan_that_raises_leaves_its_rows_to_the_next_step(monkeypatch):
     live, ref, planner = _setup({1: 3, 2: 5})
     del ref
     kv = live["kv"]
-    real = kv.resident_row
+    real = planner.bindings["kv"].row
 
     def boom(rid, slot, row, writes):
         if rid == 2:
             raise ValueError("a row that can't be written")
         real(rid, slot, row, writes)
 
-    monkeypatch.setattr(kv, "resident_row", boom)
+    monkeypatch.setitem(planner.bindings, "kv", replace(planner.bindings["kv"], row=boom))
     s = _captured_step(live, planner, [1, 2], slot=0, bs=2, run=False)
     with pytest.raises(ValueError, match="can't be written"):
         planner.plan(s.step, s.ctx)
     assert planner._stale == {1, 2}
-    monkeypatch.setattr(kv, "resident_row", real)
+    monkeypatch.setitem(planner.bindings, "kv", replace(planner.bindings["kv"], row=real))
     _replay(live, planner, s)
     _assert_row(planner, live, 1)
     _assert_row(planner, live, 2)
@@ -1171,7 +2556,7 @@ def test_a_refused_admit_offloads_a_victim_and_its_reload_is_written_whole():
     # seven pages to hand out, all held: each of 1 and 2 has room for one more token
     live = _resources(max_num_pages=8)
     owned = {k: live[k] for k in ("kv", "pool", "rope")}
-    planner = ResidentPlanner("n", {WALK}, owned, CPU, max_bs=4)
+    planner = ResidentPlanner("n", _walk(*owned), owned, CPU, max_bs=4)
     for rid, tokens in ((1, 7), (2, 7), (3, 11)):
         _ingest(live, rid)
         step, ctx = _host_step(live, [rid], [tokens])
@@ -1223,7 +2608,7 @@ def test_a_recurrent_pool_refusal_holds_the_request_since_the_pool_cannot_evict(
     """The pool refuses with `AllocationFailed`, which is backpressure: it has no
     eviction, so nothing is offloaded and the row it named is held for a smaller retry."""
     live = _resources(pool_slots=2)
-    planner = ResidentPlanner("n", {WALK}, {k: live[k] for k in ("kv", "pool", "rope")}, CPU, max_bs=4)
+    planner = _planner(live, max_bs=4)
     for rid in (1, 2):
         _ingest(live, rid)
     step, ctx = _host_step(live, [1], [3])
@@ -1262,11 +2647,11 @@ def test_a_follower_replaying_an_offload_gives_the_slot_up_too():
 
 # ---- two KV pools on a node ----
 
-def _pool(name: str, max_seq_len: int = 512, max_num_pages: int = 64) -> KVManager:
+def _pool(name: str, max_seq_len: int = 512, max_num_pages: int = 64, *, prefix_cache: bool = True) -> KVManager:
     kv = KVManager(
         cfg=PagedKVConfig(
             num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=max_seq_len,
-            max_num_pages=max_num_pages, page_size=PAGE,
+            max_num_pages=max_num_pages, page_size=PAGE, prefix_cache=prefix_cache,
         ),
         name=name, joint_comm_group=None, transfer_engine_info=None, device=CPU, dtype=torch.float32,
     )
@@ -1282,11 +2667,13 @@ def _decoder(positions: str = "kv"):
     return {"kv": _pool("kv"), "ctx": _pool("ctx", max_seq_len=64), "rope": rope}
 
 
-def _decoder_setup(prompts: dict[int, tuple[int, int]], positions: str = "kv"):
+def _decoder_setup(prompts: dict[int, tuple[int, int]], positions: str = "kv", context_span: int = 0):
     """Each request's prompt and context prefilled on resident resources and a
-    host-planned reference. ``prompts`` is rid -> (prompt tokens, context tokens)."""
+    host-planned reference. ``prompts`` is rid -> (prompt tokens, context tokens);
+    decode steps append ``context_span`` tokens a row to the context."""
     live, ref = _decoder(positions), _decoder(positions)
-    planner = ResidentPlanner("n", {WALK}, {k: live[k] for k in ("kv", "ctx", "rope")}, CPU, max_bs=4)
+    walk = _walk("kv", "ctx", "rope", reads=() if context_span else ("ctx",))
+    planner = ResidentPlanner("n", walk, {k: live[k] for k in ("kv", "ctx", "rope")}, CPU, max_bs=4)
     for res in (live, ref):
         for rid, (prompt, context) in prompts.items():
             res["kv"].ingest_request(rid, KVReqConfig())
@@ -1490,11 +2877,51 @@ def test_a_context_the_step_only_reads_never_advances():
     assert "ctx" in s.captured.block_tables and "kv" in s.captured.block_tables
 
 
+@pytest.mark.parametrize("actual", [0, 2])
+def test_a_joining_receipt_retains_its_readonly_context_when_it_ends_short(actual):
+    resources = {key: _pool(key, prefix_cache=False) for key in ("kv", "ctx")}
+    planner = ResidentPlanner("n", _walk("kv", "ctx", reads=("ctx",)), resources, CPU, max_bs=2)
+    runner = StepRunner(resources)
+    runner.ingest_request(1, {key: KVReqConfig() for key in resources})
+    prefill = SubmoduleStep({
+        "kv": KVStep(segments=(Segment(1, "main", 3),)),
+        "ctx": KVStep(segments=(Segment(1, "main", 16),)),
+    })
+    prefill.set_ctx(StepContext((1,), "prefill", 0, False))
+    assert runner.admit(prefill).ok
+    runner.plan(prefill)
+    runner.commit(prefill, track_rows=True)
+    context = resources["ctx"]._streams[1]["main"]
+    pages = tuple(context.page_indices)
+    joining = SubmoduleStep({
+        "kv": KVStep(segments=(Segment(1, "main", 1),)),
+        "ctx": KVStep(segments=(Segment(1, "main", 0),)),
+    })
+    ctx = StepContext((1,), WALK, 0, False, resident=planner, repeats=4)
+    joining.set_ctx(ctx)
+    assert runner.admit_rows(joining).ok
+    snapshot = planner.prepare_rows(joining, ctx)
+    planner.flush(snapshot)
+    runner.commit(joining, track_rows=True)
+    planner.advance(snapshot)
+    runner.settle_run(joining, {1: actual})
+    assert resources["kv"]._streams[1]["main"].stored_len == 3 + actual
+    assert context.stored_len == 16 and tuple(context.page_indices) == pages
+    slot = planner.slot_of(1)
+    assert resources["ctx"]._resident.host_len[slot] == 16
+    assert resources["ctx"]._resident.kv_len.view[slot, 0].item() == 16
+    planner.release(1)
+    assert planner._readers[slot] == 1 and slot not in planner._free
+    planner.unpin((slot,))
+    for owner in resources.values():
+        owner.assert_pages_conserved()
+
+
 @pytest.mark.parametrize("positions", ["kv", "ctx"])
 def test_positions_follow_the_pool_their_config_names(positions):
     """Two pools that both append, at different lengths: the position offset is
     taken against, and gathered with, the length of the pool positions name."""
-    live, ref, planner = _decoder_setup({1: (3, 11), 2: (9, 2)}, positions=positions)
+    live, ref, planner = _decoder_setup({1: (3, 11), 2: (9, 2)}, positions=positions, context_span=1)
     for t in range(8):
         a = _decoder_step(live, planner, [1, 2], slot=t % 2, bs=4, context_span=1)
         b = _decoder_step(ref, None, [1, 2], slot=t % 2, bs=4, context_span=1)
@@ -1505,39 +2932,44 @@ def test_positions_follow_the_pool_their_config_names(positions):
     assert planner.buffers(BucketKey(WALK, 4, 4), 0).cells.shape == (2, 2 * 4 * 2)
 
 
-def test_positions_over_a_pool_the_step_only_reads_refuse_at_capture():
-    live, ref, planner = _decoder_setup({1: (3, 7)}, positions="ctx")
-    del ref
-    with pytest.raises(ValueError, match="advance with the stream"):
-        _decoder_step(live, planner, [1], slot=0, bs=1)
+def test_positions_over_a_pool_the_step_only_reads_are_refused_at_load():
+    res = _decoder("ctx")
+    steps = {WALK: SubmoduleStep(
+        steps={"ctx": KVStep(segments=(Segment(1, "main", 0),))}, segments=[Segment(1, "main", 1)],
+    )}
+    planner, refused = build_planner("n", steps, res, {}, CPU, lambda walks: 4)
+    assert planner is None and "advance with the stream" in refused[WALK]
 
 
-def test_capture_takes_a_label_for_each_resource():
-    live, _, planner = _decoder_setup({})
-    del live
+def test_a_walk_takes_a_label_for_each_resource():
     rows = [Segment(1, "self", 1)]
     step = SubmoduleStep(
         steps={"kv": KVStep(), "ctx": KVStep(segments=(Segment(1, "context", 0),)), "rope": PositionStep()},
         segments=rows,
     )
-    captured = planner.capture_step(BucketKey(WALK, 1, 1), 0, step)
-    streams = {key: (s.label, s.reads) for key, s in captured.streams.items()}
+    streams = {key: tuple(s) for key, s in resident_mod.declared_streams(("kv", "ctx", "rope"), step).items()}
     assert streams == {"kv": ("self", False), "ctx": ("context", True), "rope": ("self", False)}
-    assert planner._streams[BucketKey(WALK, 1, 1)] is captured.streams
 
 
-def test_capture_refuses_two_labels_on_one_resource():
-    live, _, planner = _decoder_setup({})
-    del live
+def test_a_walk_with_two_labels_on_one_resource_is_refused():
     rows = [Segment(1, "main", 1)]
     two = (Segment(1, "main", 1), Segment(1, "aux", 1))
     step = SubmoduleStep(steps={"kv": KVStep(segments=two), "ctx": KVStep(), "rope": PositionStep()}, segments=rows)
-    with pytest.raises(ValueError, match="resource 'kv' declares 2 segments over labels"):
-        planner.capture_step(BucketKey(WALK, 1, 1), 0, step)
+    assert "resource 'kv' declares 2 segments over labels" in resident_mod.step_refusal(("kv", "ctx", "rope"), step)
+    # a resource with no segments has no stream: the line names the one that refuses
+    bagel = SubmoduleStep(steps={"kv": step.steps["kv"], "sampler": SimpleNamespace(segments=())})
+    assert "resource 'kv' declares" in resident_mod.step_refusal(("sampler", "kv"), bagel)
     mixed = (Segment(1, "main", 1), Segment(2, "main", 0))
     step = SubmoduleStep(steps={"kv": KVStep(), "ctx": KVStep(segments=mixed), "rope": PositionStep()}, segments=rows)
-    with pytest.raises(ValueError, match="resource 'ctx'"):
-        planner.capture_step(BucketKey(WALK, 2, 2), 0, step)
+    assert "resource 'ctx'" in resident_mod.step_refusal(("kv", "ctx", "rope"), step)
+
+
+def test_a_bucket_that_declares_other_streams_than_its_walk_stops_the_worker():
+    _, _, planner = _decoder_setup({})
+    rows = [Segment(1, "main", 1)]
+    step = SubmoduleStep(steps={"kv": KVStep(), "ctx": KVStep(), "rope": PositionStep()}, segments=rows)
+    with pytest.raises(SystemExit, match="aren't its walk's"):
+        planner.capture_step(BucketKey(WALK, 1, 1), 0, step)
 
 
 class _Fmha:
@@ -1564,7 +2996,7 @@ def test_the_fmha_gather_reads_its_own_pools_table_and_lengths(monkeypatch, pool
     from mstar.engine.resources.attn import flashinfer as flashinfer_mod
 
     monkeypatch.setattr(flashinfer_mod, "FmhaDecodeWrapper", _Fmha)
-    live, _, planner = _decoder_setup({})
+    live, _, planner = _decoder_setup({}, context_span=1)
     wrapper = _Fmha()
     manager = _fmha_manager(pool, wrapper)
     segments = [Segment(1, "main", 1), Segment(2, "main", 1)]
@@ -1572,8 +3004,8 @@ def test_the_fmha_gather_reads_its_own_pools_table_and_lengths(monkeypatch, pool
     step = SubmoduleStep(steps={"kv": KVStep(), "ctx": KVStep(), "rope": PositionStep()}, segments=segments)
     captured = planner.capture_step(BucketKey(WALK, 2, 2), 0, step)
     for key in ("kv", "ctx"):
-        live[key].resident_gather(captured)
-    manager.resident_gather(captured)
+        live[key].resident_binding().gather(captured)
+    manager.resident_binding().gather(captured)
     assert wrapper.calls == [(captured.buffers.kv_len[pool], live[pool]._resident.block_table.col)]
     assert captured.reads_tables and not captured.host_planned
 
@@ -1589,7 +3021,7 @@ def test_an_fmha_wrapper_over_a_pool_the_step_only_reads_keeps_its_host_plan(mon
     context = (Segment(1, "main", 0), Segment(2, "main", 0))
     steps = {"kv": KVStep(), "ctx": KVStep(segments=context), "rope": PositionStep()}
     captured = planner.capture_step(BucketKey(WALK, 2, 2), 0, SubmoduleStep(steps=steps, segments=segments))
-    manager.resident_gather(captured)
+    manager.resident_binding().gather(captured)
     assert not wrapper.calls and captured.host_planned
 
 
@@ -1625,10 +3057,15 @@ class _Attention(Resource):
     def __init__(self, reads_tables: bool):
         self._reads = reads_tables
 
-    def resident_refusal(self):
-        return None
+    def resident_binding(self):
+        return ResidentBinding(
+            check_streams=no_resident_effect, bind=no_resident_effect, row=no_resident_effect,
+            stage=no_resident_effect, gather=self._gather, run_gather=no_resident_effect,
+            commit_in_graph=no_resident_effect, advance=no_resident_effect, check_horizon=unbound_horizon,
+            max_repeats=unbounded_repeats, rewind_run=no_resident_effect,
+        )
 
-    def resident_gather(self, step):
+    def _gather(self, step):
         if self._reads:
             step.reads_tables = True
         else:
@@ -1640,7 +3077,7 @@ class _Attention(Resource):
 ])
 def test_a_bucket_is_host_plan_free_only_when_every_attention_reads_the_tables(attentions, free):
     resources = {f"attn{i}": _Attention(reads) for i, reads in enumerate(attentions)}
-    planner = ResidentPlanner("n", {WALK}, resources, CPU, max_bs=2)
+    planner = ResidentPlanner("n", _walk(*resources), resources, CPU, max_bs=2)
     step = SubmoduleStep(steps={}, segments=[Segment(1, "main", 1)])
     planner.gather(planner.capture_step(BucketKey(WALK, 1, 1), 0, step))
     assert (BucketKey(WALK, 1, 1) in planner.host_plan_free) is free
@@ -1651,11 +3088,12 @@ def test_cross_attention_over_its_own_context_pool_runs_on_the_planner():
 
     manager = FlashInferCrossManager.__new__(FlashInferCrossManager)
     manager._kv_cache_name, manager._query_kv_cache_name = "ctx", "kv"
-    assert manager.resident_refusal() is None
+    manager._context_label = "context"
+    assert manager.resident_binding().check_streams("x", {}) is None
     manager._query_kv_cache_name = "ctx"
-    assert "second stream" in manager.resident_refusal()
-    step = SimpleNamespace(reads_tables=False, host_planned=False)
-    FlashInferCrossManager.resident_gather(manager, step)
+    assert "second stream" in manager.resident_binding().check_streams("x", {})
+    step = SimpleNamespace(reads_tables=False, host_planned=False, bucket=None, buffer_slot=0, streams={})
+    manager.resident_binding().gather(step)
     assert step.host_planned and not step.reads_tables
 
 
@@ -1667,13 +3105,13 @@ class _Spare(Resource):
         return cls()
 
 
-def _build(resources, nodes=None, walks=(WALK,), max_bs=4):
-    return build_planner("n", walks, resources, nodes or {}, CPU, max_bs)
+_ONE_TOKEN = SubmoduleStep(steps={}, segments=[Segment(1, "main", 1)])
 
 
-def test_a_node_with_no_table_owner_still_builds():
-    planner = ResidentPlanner("n", {WALK}, {}, CPU, max_bs=2)
-    assert planner.max_slots == 5
+def _build(resources, nodes=None, step=_ONE_TOKEN):
+    """The planner for WALK on its declared ``step``, and why not."""
+    planner, refused = build_planner("n", {WALK: step}, resources, nodes or {}, CPU, lambda walks: 4)
+    return planner, refused.get(WALK, "")
 
 
 def test_every_resident_resource_passes():
@@ -1682,17 +3120,15 @@ def test_every_resident_resource_passes():
     assert planner is not None and why == ""
 
 
-def test_no_walks_no_planner():
-    res = _resources()
-    planner, why = _build({"kv": res["kv"]}, walks=())
-    assert planner is None and "no resident walk" in why
-
-
-def test_no_capture_of_the_walks_no_planner():
-    res = _resources()
-    planner, why = _build({"kv": res["kv"]}, max_bs=0)
-    assert planner is None and "nothing captures" in why
-    assert res["kv"]._resident is None
+@pytest.mark.parametrize(("resources", "step", "why"), [
+    ({}, _ONE_TOKEN, "no resource of it keeps a table"),
+    ({"kv": None}, None, "declares no step"),
+], ids=["no_table_owner", "no_step"])
+def test_a_looped_node_with_no_step_or_no_table_owner_is_refused_at_load(resources, step, why):
+    if "kv" in resources:
+        resources = {"kv": _resources()["kv"]}
+    planner, refused = _build(resources, step=step)
+    assert planner is None and why in refused
 
 
 def test_a_resource_without_a_table_refuses():
@@ -1713,8 +3149,8 @@ def test_a_pool_read_across_nodes_refuses():
     assert planner is None and "across nodes" in why
 
 
-def test_the_mla_layout_refuses():
-    """GLM-5.2's latent pages have no K/V axis to write through."""
+def test_the_mla_layout_takes_the_tables():
+    """GLM-5.2's latent pages take ``write_kv``, through the two buffers the tables fill."""
     kv = KVManager(
         cfg=PagedKVConfig(
             num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=512, max_num_pages=64, page_size=PAGE,
@@ -1723,7 +3159,7 @@ def test_the_mla_layout_refuses():
         name="kv", joint_comm_group=None, transfer_engine_info=None, device=CPU, dtype=torch.float32,
     )
     planner, why = _build({"kv": kv})
-    assert planner is None and "MLA" in why
+    assert planner is not None and why == ""
 
 
 def test_a_sliding_window_pool_refuses():
@@ -1742,7 +3178,7 @@ def test_a_sliding_window_pool_refuses():
 
 def test_block_positions_refuse():
     rope = RopeManager(PositionConfig(kv_cache="kv", scheme=PosScheme.BLOCK), CPU, max_seq_len=512, head_dim=8)
-    assert "doesn't advance" in rope.resident_refusal()
+    assert "doesn't advance" in rope.resident_binding().check_streams("rope", {})
 
 
 def test_a_pool_without_a_sink_refuses():
@@ -1750,15 +3186,12 @@ def test_a_pool_without_a_sink_refuses():
         num_layers=1, max_slots=4, blocks={"state": RecurrentBlockConfig(shape=(2,), dtype=torch.float32)},
         disable_sink_slot=True,
     ))
-    assert "sink" in pool.resident_refusal()
+    assert "sink" in pool.resident_binding().check_streams("pool", {})
 
 
 @pytest.mark.parametrize("module,name", [
     ("mstar.engine.resources.attn.cross", "CrossAttentionManager"),
-    ("mstar.engine.resources.kv.bounded.manager", "BoundedKVManager"),
     ("mstar.engine.resources.attn.dense", "DenseAttentionManager"),
-    ("mstar.engine.resources.attn.flashinfer_mla", "FlashInferMLAManager"),
-    ("mstar.engine.resources.linear_attn.mamba2", "Mamba2Manager"),
     ("mstar.engine.resources.kv.ring.manager", "RingKVManager"),
 ])
 def test_resources_with_no_table_keep_the_base_refusal(module, name):
@@ -1766,7 +3199,7 @@ def test_resources_with_no_table_keep_the_base_refusal(module, name):
     import importlib
 
     cls = getattr(importlib.import_module(module), name)
-    assert cls.resident_refusal is Resource.resident_refusal
+    assert cls.resident_binding is Resource.resident_binding
 
 
 def test_flashinfer_refuses_a_sliding_window():
@@ -1774,42 +3207,284 @@ def test_flashinfer_refuses_a_sliding_window():
 
     manager = FlashInferManager.__new__(FlashInferManager)
     manager._window_left = 5
-    assert "sliding window" in manager.resident_refusal()
+    assert "sliding window" in manager.resident_binding().check_streams("attn", {})
     manager._window_left = -1
-    assert manager.resident_refusal() is None
+    assert manager.resident_binding().check_streams("attn", {}) is None
 
 
 @pytest.mark.parametrize("field,value", [
     ("pre_forks", (("a", "b"),)), ("post_forks", (("a", "b"),)), ("sink", frozenset({(1, "main")})), ("commit", False),
 ])
-def test_a_resident_walk_can_not_declare_forks_or_a_sink(field, value):
-    _, _, planner = _setup({})
+def test_a_walk_declaring_forks_or_a_sink_is_refused_at_load(field, value):
+    res = _resources()
     segments = [Segment(1, "main", 1)]
     kv = KVStep(segments=tuple(segments), **{field: value})
-    with pytest.raises(ValueError, match=field):
-        planner.capture_step(BucketKey(WALK, 1, 1), 0, SubmoduleStep(steps={"kv": kv}, segments=segments))
+    planner, why = _build({"kv": res["kv"]}, step=SubmoduleStep(steps={"kv": kv}, segments=segments))
+    assert planner is None and field in why
 
 
-def test_a_resident_walk_is_one_token_a_row_in_one_stream():
-    _, _, planner = _setup({})
-    two = [Segment(1, "main", 2)]
-    with pytest.raises(ValueError, match="one token per row"):
-        planner.capture_step(BucketKey(WALK, 1, 2), 0, SubmoduleStep(steps={}, segments=two))
-    labels = [Segment(1, "a", 1), Segment(1, "b", 1)]
-    with pytest.raises(ValueError, match="one token per row"):
-        planner.capture_step(BucketKey(WALK, 2, 2), 0, SubmoduleStep(steps={}, segments=labels))
+@pytest.mark.parametrize("segments", [
+    [Segment(1, "main", 2)], [Segment(1, "a", 1), Segment(1, "b", 1)],
+], ids=["two_tokens", "two_labels"])
+def test_a_walk_that_isnt_one_token_a_row_in_one_stream_is_refused_at_load(segments):
+    res = _resources()
+    planner, why = _build({"kv": res["kv"]}, step=SubmoduleStep(steps={}, segments=segments))
+    assert planner is None and "not one token a row" in why
 
 
 # ---- the engine ----
 
-def _capture_runner(max_bs=4):
+
+@pytest.mark.parametrize("sharing", ["disjoint", "direct", "dependency"])
+def test_connected_admission_refusal_releases_real_owner_reservations(sharing):
+    from test_engine_uniform_inputs import _connected_engine
+
+    engine, group, events = _connected_engine()
+    first = _resources()["kv"]
+    second = first if sharing == "direct" else (
+        RopeManager(PositionConfig(kv_cache="a"), CPU, max_seq_len=512, head_dim=8)
+        if sharing == "dependency" else _resources(max_num_pages=2)["kv"]
+    )
+    for kv in {first, second}:
+        for rid in (1, 2):
+            kv.ingest_request(rid, KVReqConfig() if isinstance(kv, KVManager) else None)
+    for name, kv in (("a", first), ("b", second)):
+        mgmt = engine._submodules[name]
+        mgmt.resources = {name: kv}
+        def declare(request_ids, name=name, kv=kv, **kw):
+            segments = tuple(Segment(rid, "main", 1) for rid in request_ids)
+            part = PositionStep(segments=segments) if isinstance(kv, RopeManager) else KVStep(
+                segments=segments, eager_write=sharing == "direct" and name == "b",
+            )
+            return SubmoduleStep(steps={name: part})
+        mgmt.submodule.declare_step = declare
+    engine._runner = StepRunner({"a": first, "b": second})
+    free = first._arena.num_free
+    admitted = []
+    admit = engine._runner.admit
+    engine._runner.admit = lambda step: (admitted.append(tuple(step.keys())), admit(step))[-1]
+    assert engine.exec_group(group) is None
+    assert not group.submitted and not any(e in {"a", "b"} for e in events)
+    assert first._arena.num_free == free and not first._admit_reserved_pages
+    first.assert_pages_conserved()
+    if sharing != "disjoint":
+        assert admitted == []  # including the unsafe second/dependency-only occurrence
+    else:
+        assert admitted == [("a",), ("b",)]
+        assert not second._admit_reserved_pages
+        second.assert_pages_conserved()
+
+
+@pytest.mark.parametrize("settlement", ["scratch", "append", "cancel", "refuse"])
+def test_connected_kv_and_positions_project_prefix_without_committing_and_hold_each_members_buffers(settlement):
+    resources = _resources(max_num_pages=2 if settlement == "refuse" else 64)
+    kv, rope = resources["kv"], resources["rope"]
+    _ingest(resources, 1)
+    runner = StepRunner({"kv": kv, "rope": rope})
+    before = kv._arena.num_free
+    steps = []
+    for i, member in enumerate(("prefix", "action")):
+        segments = (Segment(1, "main", 4),)
+        ctx = StepContext(
+            (1,), "prefill", 0, False, unit_id=99, unit_member=i,
+            slot_lease=SlotLease(0, BucketKey("prefill", 1, 4), member=member),
+        )
+        step = SubmoduleStep(steps={
+            "kv": KVStep(segments=segments, commit=i == 0 or settlement == "append"),
+            "rope": PositionStep(segments=segments, advance=None if i == 0 or settlement == "append" else (0,)),
+        })
+        step.set_ctx(ctx)
+        outcome = runner.admit(step)
+        if i == 1 and settlement == "refuse":
+            assert not outcome.ok
+            assert kv._arena.num_free == before - 1
+            assert kv._streams[1]["main"].step_in_flight
+            runner.rollback_admit(steps[0])
+            assert kv._arena.num_free == before
+            assert kv._streams[1]["main"].stored_len == rope.position(1, "main") == 0
+            assert not kv._streams[1]["main"].step_in_flight
+            assert not kv._admit_reserved_pages and not kv._unit_steps and not rope._unit_steps
+            kv.assert_pages_conserved()
+            return
+        assert outcome.ok
+        steps.append(step)
+    assert kv._arena.num_free == before - 2
+    assert kv._streams[1]["main"].stored_len == rope.position(1, "main") == 0
+    assert len(kv._admit_reserved_pages) == 2
+
+    runner.plan(steps[0])
+    prefix_pages = kv._current_plan_states["main", 0].token_to_page
+    prefix_positions = steps[0].ctx.plan_results["rope"]["main"]
+    runner.plan(steps[1])
+    action_pages = kv._current_plan_states["main", 0].token_to_page
+    action_positions = steps[1].ctx.plan_results["rope"]["main"]
+    assert steps[0].ctx.plan_results["rope"]["main"] is prefix_positions
+    assert prefix_pages.data_ptr() != action_pages.data_ptr()
+    assert prefix_pages.unique().tolist() != action_pages.unique().tolist()
+    assert prefix_positions.tolist() == [0, 1, 2, 3]
+    assert action_positions.tolist() == [4, 5, 6, 7]
+    assert steps[1].ctx.plan_results["kv"]["main"].views[0].length == 8
+    assert kv._streams[1]["main"].stored_len == rope.position(1, "main") == 0
+    if settlement == "cancel":
+        runner.rollback_admit(steps[1])
+        assert kv._arena.num_free == before - 1
+        assert kv._streams[1]["main"].step_in_flight
+        runner.rollback_admit(steps[0])
+        assert kv._arena.num_free == before
+        assert kv._streams[1]["main"].stored_len == rope.position(1, "main") == 0
+    else:
+        runner.commit(steps[0])
+        assert kv._streams[1]["main"].step_in_flight
+        runner.commit(steps[1])
+        assert kv._streams[1]["main"].stored_len == rope.position(1, "main") == (
+            8 if settlement == "append" else 4
+        )
+    assert not kv._streams[1]["main"].step_in_flight
+    assert not kv._admit_reserved_pages and not kv._unit_steps and not rope._unit_steps
+    kv.assert_pages_conserved()
+
+
+@pytest.mark.parametrize("remove", [False, True])
+def test_connected_row_cleanup_keeps_the_other_rows_projected_growth_and_reservations(remove):
+    resources = _resources()
+    kv, rope = resources["kv"], resources["rope"]
+    for rid in (1, 2):
+        _ingest(resources, rid)
+    runner = StepRunner({"kv": kv, "rope": rope})
+    before = kv._arena.num_free
+    segments = (Segment(1, "main", 4), Segment(2, "main", 8))
+    first = SubmoduleStep(steps={
+        "kv": KVStep(segments=segments),
+        "rope": PositionStep(segments=segments, advance=(3, 7)),
+    })
+    first.set_ctx(StepContext((1, 2), "prefill", 0, False, unit_id=9))
+    assert runner.admit(first).ok
+    for resource in (kv, rope):
+        if remove:
+            resource.remove_request(1)
+        else:
+            resource.reset_request(1, free=True)
+    segments = (Segment(2, "main", 4),)
+    second = SubmoduleStep(steps={
+        "kv": KVStep(segments=segments, commit=False),
+        "rope": PositionStep(segments=segments, advance=(0,)),
+    })
+    second.set_ctx(StepContext(
+        (2,), "prefill", 0, False, unit_id=9, unit_member=1,
+        slot_lease=SlotLease(0, BucketKey("prefill", 1, 4), "action"),
+    ))
+    assert runner.admit(second).ok
+    runner.plan(second)
+    assert second.ctx.plan_results["kv"]["main"].views[0].length == 12
+    assert second.ctx.plan_results["rope"]["main"].tolist() == [7, 8, 9, 10]
+    runner.rollback_admit(second)
+    assert kv._streams[2]["main"].step_in_flight
+    runner.rollback_admit(first)
+    assert kv._arena.num_free == before
+    assert not kv._admit_reserved_pages and not kv._unit_steps and not rope._unit_steps
+    assert not kv._streams[2]["main"].step_in_flight
+    kv.assert_pages_conserved()
+
+
+@pytest.mark.parametrize("settlement", ["append", "scratch", "refuse", "unsupported", "state_read"])
+def test_connected_engine_launches_shared_owners_once_and_snapshots_each_commit(settlement):
+    from test_engine_uniform_inputs import _connected_engine
+
+    engine, group, events = _connected_engine()
+    resources = _resources(max_num_pages=4 if settlement == "refuse" else 8)
+    kv, rope = resources["kv"], resources["rope"]
+    for rid in (1, 2):
+        _ingest(resources, rid)
+    resources = {key: resource for key, resource in resources.items() if key != "pool" or settlement == "unsupported"}
+    engine._runner = StepRunner(resources, node_resources={name: list(resources) for name in ("a", "b")})
+    admitted = []
+    admit = engine._runner.admit
+    engine._runner.admit = lambda step: (admitted.append(step), admit(step))[-1]
+    engine._pre_plan_done = {}
+    engine._plan_peers = {name: ("a", "b") for name in ("a", "b")}
+    bucket = BucketKey("prefill", 3, 12)
+    planned = {}
+    for name, mgmt in engine._submodules.items():
+        mgmt.resources = resources
+        runner = mgmt.accelerator_graph_runner
+        captured = next(iter(runner._buckets.values()))
+        runner._buckets = {bucket: captured}
+        lease = SlotLease(0, bucket, name)
+        # The replay keeps exactly the addresses that a real capture holds.
+        # Planning B must leave A's vectors intact until this replay reads them.
+        positions = rope._static_buffer(CGSlotKey(bucket, lease.buffer_slot, "main"), 12)
+        pages = kv._static_plan_state(lease.buffer_slot, ("main", 0), 12).token_to_page
+        replay = captured.slots[0].graph.replay
+
+        def run(name=name, positions=positions, pages=pages, replay=replay):
+            planned[name] = positions[:8].clone(), pages[:8].clone()
+            replay()
+
+        captured.slots[0].graph.replay = run
+
+        def declare(request_ids, name=name, **kw):
+            segments = tuple(Segment(rid, "main", 4 if rid > 0 else 0) for rid in request_ids)
+            keeps = name == "a" or settlement != "scratch"
+            parts = {
+                "kv": KVStep(segments=segments, commit=keeps),
+                "rope": PositionStep(segments=segments, advance=None if keeps else (0,) * len(segments)),
+            }
+            if "pool" in resources:
+                parts["pool"] = RecurrentStep(segments=segments)
+            return SubmoduleStep(steps=parts)
+
+        mgmt.submodule.declare_step = declare
+        if name == "b" and settlement == "state_read":
+            prepare = mgmt.submodule.prepare_inputs
+
+            def prepare_with_position(*args, prepare=prepare, **kwargs):
+                rope.position(2, "main")
+                return prepare(*args, **kwargs)
+
+            mgmt.submodule.prepare_inputs = prepare_with_position
+
+    def reserve(batch):
+        lease = SlotLease(0, bucket, batch.node_name)
+        batch.lease_slot(lease)
+        return lease
+
+    engine.reserve_replay_slot = reserve
+    free = kv._arena.num_free
+    outputs = engine.exec_group(group)
+    engine.release_group(group)
+    if settlement in {"refuse", "unsupported", "state_read"}:
+        assert outputs is None and not group.submitted and not planned
+        assert kv._arena.num_free == free
+        for rid in (1, 2):
+            assert kv._streams[rid].get("main", SimpleNamespace(stored_len=0)).stored_len == 0
+            assert rope.position(rid, "main") == 0
+        assert len(admitted) == (2 if settlement == "refuse" else 0)
+    else:
+        assert group.submitted and events == ["a", "b", "release:b", "release:a"]
+        assert outputs[1].per_rid_outputs[2]["x"][0].tolist() == [[112., 112.]]
+        assert planned["a"][0].tolist() == [0, 1, 2, 3] * 2
+        assert planned["b"][0].tolist() == [4, 5, 6, 7] * 2
+        assert not torch.equal(planned["a"][1], planned["b"][1])
+        for i, (_, batch) in enumerate(group.members):
+            length = 8 if i and settlement == "append" else 4
+            for rid in (1, 2):
+                assert batch.publish_snapshots[rid]["kv"][0][1] == length
+                assert dict(batch.publish_snapshots[rid]["rope"]) == {"main": length}
+        assert kv._streams[2]["main"].stored_len == (8 if settlement == "append" else 4)
+    assert not kv._admit_reserved_pages and not kv._unit_steps and not rope._unit_steps
+    assert all(not stream.step_in_flight for streams in kv._streams.values() for stream in streams.values())
+    kv.assert_pages_conserved()
+
+def _capture_runner(max_bs=4, refusal=None, step=_ONE_TOKEN):
     bound = {}
     return SimpleNamespace(
+        resident_refusal=lambda walk: refusal, template_step=lambda walk: step,
+        keyed_template_steps=lambda walk: {None: step}, prepare_template=lambda walk: None,
         max_capture_bs=lambda walks: max_bs, bind_resident=lambda planner: bound.update(p=planner), bound=bound,
     )
 
 
-def _engine(walks, resources, device=CPU):
+def _engine(resources, device=CPU):
     from mstar.engine.engine import Engine
     from mstar.engine.resources.runner import StepRunner
 
@@ -1817,49 +3492,111 @@ def _engine(walks, resources, device=CPU):
     engine._device = device
     engine._runner = StepRunner(resources)
     engine._resource_nodes = {key: frozenset({"n"}) for key in resources}
-    submodule = SimpleNamespace(resident_walks=lambda: frozenset(walks))
-    engine._submodules = {"n": SimpleNamespace(submodule=submodule, resources=resources, resident=None)}
+    engine._submodules = {"n": SimpleNamespace(
+        submodule=SimpleNamespace(), resources=resources, resident=None, resident_refusals={},
+    )}
     return engine, engine._submodules["n"]
 
 
-def test_the_engine_builds_a_planner_for_a_capable_node():
+def test_the_engine_puts_a_loop_walk_on_resident_tables_with_nothing_declared():
     res = _resources()
-    engine, mgmt = _engine({WALK}, {k: res[k] for k in ("kv", "pool", "rope")})
+    engine, mgmt = _engine({k: res[k] for k in ("kv", "pool", "rope")})
     runner = _capture_runner()
-    engine._build_resident_planner("n", runner)
+    engine._build_resident_planner("n", runner, {WALK})
     assert isinstance(mgmt.resident, ResidentPlanner)
     assert runner.bound["p"] is mgmt.resident
     assert mgmt.resident.max_slots == 9
+    assert engine.resident_refusal("n", WALK) is None
     assert mgmt.resident.covers(BucketKey(WALK, 2, 2))
     assert not mgmt.resident.covers(BucketKey("prefill_text", 2, 64))
 
 
-def test_the_knob_turns_it_off(monkeypatch):
-    monkeypatch.setenv("MSTAR_RESIDENT_PLANNING", "off")
+@pytest.mark.parametrize(("knob", "runner", "resources", "why"), [
+    ("off", _capture_runner(), ("kv",), "not asked for"),
+    ("on", _capture_runner(refusal="it has no batched capture"), ("kv",), "runner: it has no batched capture"),
+    ("on", _capture_runner(), ("kv", "other"), "_Spare keeps no resident table"),
+], ids=["knob", "capture", "resource"])
+def test_a_refused_walk_stays_on_the_host_and_says_why(monkeypatch, knob, runner, resources, why):
+    monkeypatch.setenv("MSTAR_RESIDENT_PLANNING", knob)
+    res = {**_resources(), "other": _Spare()}
+    engine, mgmt = _engine({k: res[k] for k in resources})
+    engine._build_resident_planner("n", runner, {WALK})
+    assert mgmt.resident is None and res["kv"]._resident is None
+    assert why in engine.resident_refusal("n", WALK)
+
+
+def _probe_runner(preprocess, freed: list):
+    """A runner whose one batched capture of WALK preprocesses with ``preprocess``."""
+    from mstar.engine.accelerator_graph_config import AcceleratorGraphConfigType
+    from mstar.engine.resources import CGSlotSpec
+
+    config = SimpleNamespace(
+        capture_graph_walk=WALK, replay_graph_walks=[WALK], capture_batch_sizes=[2],
+        get_config_type=lambda: AcceleratorGraphConfigType.BASIC_BATCHED, get_node_inputs=lambda bs, n: [None] * bs,
+    )
+    runner = AcceleratorGraphRunner.__new__(AcceleratorGraphRunner)
+    runner._capture_configs = [config]
+    runner._prepared_slot_specs = [CGSlotSpec(bucket=BucketKey(WALK, 2, 2), slot=0, config=config, config_idx=0)]
+    runner._graph_backend = SimpleNamespace(is_available=lambda: True)
+    runner._resources, runner._resident = {}, None
+    runner._dummy_rows = SimpleNamespace(
+        ensure=lambda key, bs: [-1, -2], reset=lambda rids, free=False: freed.append((rids, free)),
+    )
+    runner._step_runner = SimpleNamespace(admit=lambda step: SimpleNamespace(ok=True), plan=lambda step: None)
+    runner._submodule = SimpleNamespace(
+        declare_step=lambda **kwargs: SubmoduleStep(steps={}, segments=[Segment(r, "main", 1) for r in (-1, -2)]),
+        preprocess=lambda graph_walk, engine_inputs, inputs: preprocess(),
+    )
+    return runner
+
+
+@pytest.mark.parametrize("reads", [False, True])
+def test_a_walk_whose_captured_preprocess_reads_what_the_graph_fills_is_refused_naming_it(reads):
+    """The promise a model can't state in code is checked on the template its
+    capture runs, at load, whose padding rows the probe leaves at rest."""
     res = _resources()
-    engine, mgmt = _engine({WALK}, {"kv": res["kv"]})
-    engine._build_resident_planner("n", _capture_runner())
-    assert mgmt.resident is None
-    assert res["kv"]._resident is None
+    freed = []
+    runner = _probe_runner(lambda: res["rope"].pos_ids("main") if reads else None, freed)
+    engine, mgmt = _engine({k: res[k] for k in ("kv", "pool", "rope")})
+    engine._build_resident_planner("n", runner, {WALK})
+    assert freed == [([-1, -2], True)]
+    if reads:
+        assert mgmt.resident is None and "rope.pos_ids" in engine.resident_refusal("n", WALK)
+    else:
+        assert engine.resident_refusal("n", WALK) is None
+    res["rope"].pos_ids("main")  # outside a resident preprocess, a read is the forward's
 
 
-def test_a_refused_node_stays_on_the_host_and_says_why(caplog):
-    res = _resources()
-    engine, mgmt = _engine({WALK}, {"kv": res["kv"], "other": _Spare()})
-    with caplog.at_level("WARNING"):
-        engine._build_resident_planner("n", _capture_runner())
-    assert mgmt.resident is None
-    assert "_Spare keeps no resident table" in caplog.text
-    assert res["kv"]._resident is None
+@pytest.mark.parametrize("reader", ["preprocess", "forward"])
+def test_a_resident_preprocess_that_reads_what_the_graph_fills_stops_the_worker(reader):
+    """A branch the load-time template didn't take: the forward reads the same
+    buffer legitimately, after the graph has filled it."""
+    from mstar.engine.engine import Engine
 
+    rope = _resources()["rope"]
 
-def test_a_node_with_no_resident_walk_is_left_alone(caplog):
-    res = _resources()
-    engine, mgmt = _engine((), {"kv": res["kv"]})
-    with caplog.at_level("WARNING"):
-        engine._build_resident_planner("n", _capture_runner())
-    assert mgmt.resident is None
-    assert not caplog.text
+    def read(where):
+        if where == reader:
+            rope.pos_ids("main")
+        return {}
+
+    engine = Engine.__new__(Engine)
+    engine._enable_nvtx = engine._enable_profile = False
+    engine._forward = lambda *args: read("forward")
+    submodule = SimpleNamespace(preprocess=lambda walk, engine_inputs, inputs: read("preprocess"))
+    mgmt = SimpleNamespace(
+        accelerator_graph_runner=None, submodule=submodule, piecewise_runners={}, fp32_precision=None, resources={},
+        loopback_rows=None,
+    )
+    ctx = StepContext(request_ids=(1,), graph_walk=WALK, slot=0, capture=False)
+    ctx.resident = object()
+    batch = SimpleNamespace(node_name="n", per_request_input_metadata={}, launch_started_event=None, stream_windows={})
+    drive = partial(engine._drive_step, batch, mgmt, [1], [], {}, ctx, None, True, None, False)
+    if reader == "preprocess":
+        with pytest.raises(ValueError, match="rope.pos_ids"):
+            drive()
+    else:
+        assert drive() == ({}, None)
 
 
 def test_an_eager_step_marks_its_rows():
@@ -1876,17 +3613,30 @@ def test_an_eager_step_marks_its_rows():
 def _qwen35_llm():
     from mstar.model.qwen3_5 import submodules
 
-    return submodules, next(
-        cls for cls in vars(submodules).values()
-        if isinstance(cls, type) and cls.__module__ == submodules.__name__ and "resident_walks" in vars(cls)
-    )
+    return submodules, submodules.LLMSubmodule
+
+
+def test_qwen35s_resident_set_is_derived_as_its_decode_walk():
+    """Nothing declared: the LLM node's Loop walks are decode and the chunked
+    text prefill, and only decode has a batched capture."""
+    from mstar.model.qwen3_5.qwen3_5_model import Qwen3_5DenseModel
+
+    model = object.__new__(Qwen3_5DenseModel)
+    model.config = SimpleNamespace(max_position_embeddings=4096)
+    walks = model.get_graph_walk_graphs().items()
+    looped = {walk for walk, node in Worker._build_innermost_loop_cache(walks) if node == "LLM"}
+    _, llm = _qwen35_llm()
+    runner = AcceleratorGraphRunner.__new__(AcceleratorGraphRunner)
+    runner._capture_configs = object.__new__(llm).get_accelerator_graph_configs(CPU)
+    runner._graph_backend = SimpleNamespace(is_available=lambda: True)
+    runner._prepared_slot_specs = [SimpleNamespace(bucket=BucketKey(walk, 1, 1)) for walk in looped]
+    assert {walk for walk in looped if runner.resident_refusal(walk) is None} == {"decode"}
 
 
 @pytest.mark.parametrize("knob", [False, True])
 def test_qwen35_decode_builds_its_rope_in_the_graph_on_every_config(monkeypatch, knob):
     submodules, llm = _qwen35_llm()
     monkeypatch.setattr(submodules, "ingraph_decode_rope", lambda: knob)
-    assert llm.resident_walks(None) == {"decode"}
     assert llm._rope_in_graph(SimpleNamespace(captured=True), "decode")
     assert not llm._rope_in_graph(SimpleNamespace(captured=False), "decode")
 
@@ -1903,9 +3653,9 @@ def test_qwen35_captured_decode_preprocess_reads_nothing_the_tables_fill(rows):
     ]
     stub = SimpleNamespace(
         _rope_in_graph=llm._rope_in_graph, _position_ids_3d=lambda inputs: pytest.fail("read positions"),
+        loopback_tokens=lambda engine_inputs: token,
     )
-    sampler = SimpleNamespace(loopback_tokens=lambda rids: token)
-    engine_inputs = SimpleNamespace(captured=True, request_ids=[1, 2], resources={submodules.SAMPLER: sampler})
+    engine_inputs = SimpleNamespace(captured=True, request_ids=[1, 2])
     out = llm.preprocess(stub, "decode", engine_inputs, inputs)
     assert set(out) == {"input_ids"}
 
@@ -1926,23 +3676,718 @@ def test_a_capture_runner_answers_for_the_walks_it_captures():
 
 # ---- the knob ----
 
-def test_the_knob_takes_auto_and_off():
-    assert knobs.check({"resident_planning": "auto"}) == {"resident_planning": "auto"}
+def test_the_knob_takes_on_off_and_auto():
+    assert knobs.check({"resident_planning": "on"}) == {"resident_planning": "on"}
+    # yaml reads a bare on/off as a bool
+    assert knobs.check({"resident_planning": True}) == {"resident_planning": "on"}
     assert knobs.check({"resident_planning": False}) == {"resident_planning": "off"}
-    with pytest.raises(ValueError, match="auto or off"):
+    assert knobs.check({"resident_planning": "auto"}) == {"resident_planning": "auto"}
+    with pytest.raises(ValueError, match="on, off or auto"):
         knobs.check({"resident_planning": "maybe"})
-    with pytest.raises(ValueError, match="auto or off"):
-        knobs.check({"resident_planning": True})
 
 
-def test_the_knob_defaults_to_auto(monkeypatch):
+@pytest.mark.parametrize(("setting", "by_default", "asked"), [
+    (None, True, True), (None, False, False), ("on", False, True), ("off", True, False),
+])
+def test_a_node_resident_by_default_is_resident_with_no_knob(monkeypatch, setting, by_default, asked):
+    """#1192 ran Qwen3.5's decode resident by default: a user who sets nothing
+    keeps it (``resident_by_default``), and the knob still turns it on or off."""
+    from mstar.engine.engine import Engine
+    from mstar.model.qwen3_5.submodules import LLMSubmodule
+
+    assert LLMSubmodule.resident_by_default
     monkeypatch.delenv("MSTAR_RESIDENT_PLANNING", raising=False)
-    knobs.configure(None)
-    assert knobs.resident_planning() == "auto"
-    monkeypatch.setenv("MSTAR_RESIDENT_PLANNING", "off")
-    assert knobs.resident_planning() == "off"
+    knobs.configure(None if setting is None else {"resident_planning": setting})
+    engine = Engine.__new__(Engine)
+    mgmt = SimpleNamespace(submodule=SimpleNamespace(resident_by_default=by_default), resident_refusals={})
+    engine._submodules = {"n": mgmt}
+    runner = SimpleNamespace(resident_refusal=lambda walk: "probed")
+    try:
+        engine._build_resident_planner("n", runner, {"decode"})
+    finally:
+        knobs.configure(None)
+    assert mgmt.resident_refusals["decode"] == ("runner: probed" if asked else NOT_ASKED)
+
+
+@pytest.mark.parametrize(("setting", "rows"), [(None, {"keeps"}), ("on", {"keeps", "other"}), ("off", set())])
+def test_a_node_that_keeps_resident_planning_keeps_its_rows_under_auto_as_under_on(monkeypatch, setting, rows):
+    """The default (``auto``) asks for a ``resident_by_default`` node what ``on``
+    asks, so a config needn't set the knob (review-r2 F30): rows included."""
+    from mstar.worker.engine_manager import _row_nodes
+
+    monkeypatch.delenv("MSTAR_RESIDENT_PLANNING", raising=False)
+    knobs.configure(None if setting is None else {"resident_planning": setting})
+    loop = SimpleNamespace(get_nodes=lambda: {"keeps": None, "other": None})
+    model = SimpleNamespace(get_graph_walk_graphs=lambda: {"w": SimpleNamespace(get_loops=lambda: {"l": loop})})
+    submodules = {
+        "keeps": SimpleNamespace(resident_by_default=True), "other": SimpleNamespace(resident_by_default=False),
+    }
+    try:
+        assert _row_nodes(model, {}, submodules) == rows
+    finally:
+        knobs.configure(None)
 
 
 def test_the_slot_count_is_no_knob():
     with pytest.raises(ValueError):
         knobs.check({"resident_slots": 8})
+
+
+# ---- host-planned steps that keep nothing ----
+
+def test_a_host_planned_step_that_keeps_nothing_repeats_on_one_iterations_lengths():
+    """A step that commits nothing (an action loop's denoise over a fixed
+    prefix) rewrites the same scratch tokens each replay: a run of it reserves
+    and plans one replay's pages, as it does at one iteration."""
+    res = _resources()
+    for rid in (1, 2):
+        _ingest(res, rid)
+    _host_step(res, [1, 2], [5, 6])
+
+    def plan(repeats):
+        segments = (Segment(1, "main", 3), Segment(2, "main", 3))
+        ctx = StepContext(request_ids=(1, 2), graph_walk="action", slot=0, capture=False, repeats=repeats)
+        kv = KVStep(segments=segments, commit=False)
+        assert res["kv"].max_repeats(kv, ctx) > 4
+        assert res["kv"].admit(kv, ctx).ok
+        out = res["kv"].plan(kv, ctx)["main"].cpu_indptrs
+        res["kv"].commit(kv, ctx)
+        return [t.tolist() for t in out[:4]]
+
+    assert plan(4) == plan(1)
+
+
+def test_a_host_planned_walk_repeats_only_if_its_step_keeps_nothing():
+    """Each resource answers for its part of a host-planned walk's step: a KV
+    step that commits, or positions that advance, refuse with their line."""
+    from mstar.engine.engine import Engine
+
+    res = _resources()
+    segments = (Segment(1, "main", 3),)
+
+    def refusal(commit, advance, declares=True):
+        engine = Engine.__new__(Engine)
+        step = SubmoduleStep(steps={
+            "kv": KVStep(segments=segments, commit=commit), "rope": PositionStep(segments=segments, advance=advance),
+        }, segments=list(segments)) if declares else None
+        engine._submodules = {"n": SimpleNamespace(
+            resident=None, resident_refusals={WALK: "not asked for"}, template_steps={WALK: step},
+            joint_comm_group=SimpleNamespace(world_size=1), submodule=SimpleNamespace(repeat_carry=lambda w, s: {}),
+            resources={"kv": res["kv"], "rope": res["rope"]}, carry_refusals={}, carries={},
+            accelerator_graph_runner=None,
+        )}
+        return engine.repeat_refusal("n", WALK)
+
+    assert refusal(commit=False, advance=(0,)) is None
+    assert refusal(commit=True, advance=(0,)).startswith("resource 'kv': a host-planned step that commits")
+    assert refusal(commit=False, advance=None).startswith("resource 'rope': a host-planned step that advances")
+    # a step that touches no resource (a DiT's) has nothing to plan, so nothing refuses
+    assert refusal(commit=True, advance=None, declares=False) is None
+
+
+# ---- iteration inputs and the watched loop counter ----
+
+class _Conditioned(torch.nn.Module):
+    """A node whose ``cond`` input is row i's ``trailing[k]`` at iteration k."""
+
+    ITERATION_INPUTS = {"cond": IterationInput("trailing", shape=(2,), pad="pad", capture_fill=-1.0)}
+
+    def __init__(self):
+        super().__init__()
+        self.request_states = {}
+
+
+def test_a_mixed_step_stages_each_rows_iteration_of_its_own_walk():
+    """A decode row at k=3 reads trailing[3]; a prefill row of the same step,
+    outside the Loop, reads trailing[0]; a padding row takes its fill."""
+    from mstar.engine.engine import Engine, ForwardPassInfoWrapper
+    from mstar.model.submodule_base import InputMetadata, PerRequestState
+
+    node = _Conditioned()
+    for rid in (1, 2):
+        node.request_states[rid] = PerRequestState()
+        node.request_states[rid].add("trailing", torch.arange(10.0).reshape(5, 2) + 100 * rid)
+    engine = Engine.__new__(Engine)
+    from mstar.graph.loop_indices import LoopLayout
+    engine._device, engine._loops = CPU, {("n", "decode"): LoopLayout("loop")}
+    ctx = StepContext(request_ids=(1, 2), graph_walk="mixed", slot=0, capture=False, repeats=1)
+    ctx.request_walks = {1: "decode", 2: "prefill"}
+    info = {
+        rid: ForwardPassInfoWrapper(SimpleNamespace(), InputMetadata(dynamic_loop_iter_counts={"loop": k}))
+        for rid, k in ((1, 3), (2, 0))
+    }
+    node.iteration_tables = IterationTables(CPU)
+    cond = engine._iteration_columns("n", node, ctx, [1, 2, -1], info)["cond"]
+    assert cond[:, 0].tolist() == [[106.0, 107.0], [200.0, 201.0], [-1.0, -1.0]]
+
+
+def test_a_run_stages_each_replays_iteration_input_before_it():
+    cond_in, seen = torch.zeros(2), []
+
+    class Graph:
+        def replay(self):
+            seen.append(cond_in.tolist())
+
+    slot = SimpleNamespace(
+        graph=Graph(), raw_launch=False, static_inputs={"cond": cond_in},
+        static_outputs=SimpleNamespace(check_stop_buffers={"t": torch.zeros(2)}, row_outputs={}, output_spans=None),
+    )
+    runner = AcceleratorGraphRunner.__new__(AcceleratorGraphRunner)
+    runner.slot_for = lambda lease: slot
+    columns = torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+    cond_in.copy_(columns[:, 0])  # the first replay's, staged with the step
+    seen.append(cond_in.tolist())
+    runner.repeat([runner.run_part(None, {}, iteration={"cond": columns})], 3)
+    assert seen == [[1.0, 4.0], [2.0, 5.0], [3.0, 6.0]]
+
+
+@pytest.mark.parametrize("repeats", [1, 2])
+def test_a_repeating_step_that_reads_the_loop_counter_stops_the_worker(repeats):
+    """A run's later replays don't run prepare_inputs or preprocess again, so a
+    value either derives from the counter would hold for all of them."""
+    from mstar.engine.engine import ForwardPassInfoWrapper, _refuse_counter_read
+    from mstar.engine.resources.resident import LOOP_COUNTER, watch_table_reads
+    from mstar.model.submodule_base import InputMetadata
+
+    info = ForwardPassInfoWrapper(SimpleNamespace(), InputMetadata(dynamic_loop_iter_counts={"loop": 4}))
+    assert info.dynamic_loop_iter_counts["loop"] == 4  # unwatched: free
+    with watch_table_reads() as reads:
+        assert info.dynamic_loop_iter_counts.get("loop") == 4
+    assert reads == [LOOP_COUNTER]
+    ctx = SimpleNamespace(repeats=repeats, graph_walk=WALK)
+    if repeats == 1:
+        _refuse_counter_read("n", ctx, reads, "preprocess")
+    else:
+        with pytest.raises(ValueError, match="preprocess read the loop counter"):
+            _refuse_counter_read("n", ctx, reads, "preprocess")
+
+
+def test_a_captured_preprocess_that_reads_the_loop_counter_keeps_its_walk_from_repeating():
+    """Probed too where the capture also serves another walk (V-JEPA2's
+    rollouts), which keeps the walk off resident tables but not from repeating."""
+    from mstar.engine.accelerator_graph_runner import CaptureTemplate
+    from mstar.engine.engine import Engine
+
+    def preprocess(graph_walk, engine_inputs, inputs):
+        info = next(iter(engine_inputs.per_request_info.values()))
+        return {"x": torch.tensor([info.dynamic_loop_iter_counts.get("loop", 0)])}
+
+    rows = [SimpleNamespace(tensor_inputs={})]
+    template_info = {-1: SimpleNamespace(dynamic_loop_iter_counts={})}
+    runner = AcceleratorGraphRunner.__new__(AcceleratorGraphRunner)
+    runner.batched_refusal = lambda walk: None
+    runner.resident_refusal = lambda walk: "its capture also replays other walks"
+    runner.template_step = lambda walk: None
+    runner._widest = lambda walk: SimpleNamespace(bucket=SimpleNamespace(graph_walk=walk))
+    runner._template = lambda spec: CaptureTemplate(
+        [-1], rows, SimpleNamespace(per_request_info=template_info), None,
+    )
+    runner._dummy_rows = SimpleNamespace(reset=lambda rids, free: None)
+    runner._submodule = SimpleNamespace(preprocess=preprocess, ITERATION_INPUTS={})
+    engine = Engine.__new__(Engine)
+    mgmt = SimpleNamespace(
+        submodule=SimpleNamespace(repeat_carry=lambda walk, signals: {}), template_steps={}, carry_refusals={},
+    )
+    engine._submodules = {"n": mgmt}
+    engine._probe_carries("n", runner, WALK, ())
+    assert mgmt.carry_refusals[WALK] == (
+        "node: its captured preprocess reads the loop counter, which a run's later replays don't renew"
+    )
+
+
+def test_a_step_that_reads_a_stream_window_repeats_as_far_as_every_row_has_items():
+    """The stream answers how far a step may run: the fewest items any row's
+    window holds; a row's window is cut an item a replay."""
+    from mstar.engine.engine import _window_tables
+    from mstar.streaming.stream_buffer import StreamChunkInfo, StreamingEdge
+
+    rows = {0: 0, 1: 0}
+    batch = ScheduledBatch(node_name="n", graph_walk=WALK, request_to_worker_graph=dict(rows))
+    ctx = SimpleNamespace(repeats=1)
+
+    def window(items):
+        return [StreamingEdge("chunk", "n", list(range(items)), StreamChunkInfo(0, 0, items, False))]
+
+    node_batch = SimpleNamespace(step_context=ctx, stream_windows={})
+    worker = Worker.__new__(Worker)
+    worker._step_repeats = _repeats(8)
+    worker._step_repeats.settle(lambda *key: None, lambda *key: None)
+    worker._innermost_loop_by_node = {(WALK, "n"): "loop"}
+    worker._graph_runtime = SimpleNamespace(loop_room=lambda *args: 100)
+    speculation = SimpleNamespace(
+        scheduled_batch=batch, node_batch=node_batch, loop_name="loop", continuing_rids={0, 1},
+        is_new_iter=True, is_same_node=True, consumed_streaming_edges={0: window(3), 1: window(5)},
+    )
+    worker._stamp_repeats(speculation, SimpleNamespace(batch=SimpleNamespace(repeats=1)), 1)
+    assert ctx.repeats == 3 and set(node_batch.stream_windows) == {0, 1}
+    # a row with one item has one iteration of it
+    speculation.consumed_streaming_edges = {0: window(1), 1: window(5)}
+    worker._stamp_repeats(speculation, SimpleNamespace(batch=SimpleNamespace(repeats=1)), 1)
+    assert ctx.repeats == 1
+
+    spec = IterationInput("chunk", shape=(2,), streamed=True)
+    items = torch.arange(6.0).reshape(3, 2)
+    metadata = SimpleNamespace(stream_chunks={"chunk": StreamChunkInfo(0, 0, 3, False)})
+    assert torch.equal(_window_tables([spec], {"chunk": [items]}, metadata)["chunk"].items, items)
+
+
+@pytest.mark.parametrize("retained", [False, True])
+def test_the_omni_talker_reads_the_thinkers_items_then_tts_eos_once_then_tts_pad(retained):
+    """Whatever the runs, a Talker row's text inputs are the host path's: each
+    Thinker item once, then tts_eos for one iteration, then tts_pad."""
+    from mstar.engine.engine import _window_tables
+    from mstar.model.qwen3_omni.submodules import TalkerSubmodule
+    from mstar.model.submodule_base import iteration_columns
+
+    sub = TalkerSubmodule.__new__(TalkerSubmodule)
+    torch.nn.Module.__init__(sub)
+    sub.model = SimpleNamespace(text_projection=SimpleNamespace(linear_fc1=SimpleNamespace(weight=torch.zeros(1))))
+    sub.config = SimpleNamespace(thinker_hidden_size=2)
+    sub.request_states, sub._iteration_inputs = {}, {}
+    sub._tts_eos_raw, sub._tts_pad_raw = torch.full((1, 2), -1.0), torch.zeros(1, 2)
+    sub.get_device = lambda: CPU
+    (spec,) = sub.ITERATION_INPUTS.values()
+    item = iter(range(1, 100))
+    seen: dict[int, list[float]] = {0: [], 1: []}
+    from mstar.streaming.chunk_policy import FixedChunkPolicy
+    from mstar.streaming.stream_buffer import StreamBuffer
+
+    buffers = {rid: StreamBuffer(rid, "thinker_states", "Thinker", FixedChunkPolicy(1, True)) for rid in seen}
+    produced = {rid: 0 for rid in seen}
+
+    def step(windows: dict[int, int], repeats: int) -> None:
+        rows, snapshots = [], {}
+        for rid, items in windows.items():
+            buf = buffers[rid]
+            for _ in range(items):
+                value = float(next(item))
+                buf.pre_read_register(produced[rid])
+                buf.put(produced[rid], torch.full((2,), value))
+                produced[rid] += 1
+            if not items:
+                buf.signal_done(produced[rid])
+            snapshot = buf.reserve_window(repeats) if retained else buf.pop_window(repeats)
+            snapshots[rid] = snapshot
+            tensor = snapshot.data.get("data")
+            inputs = {"talker_input_embeds": [torch.zeros(1, 2)], "thinker_states": [tensor] if items else []}
+            info = SimpleNamespace(rid_handle=rid)
+            sub.prepare_inputs("talker_decode", info, inputs)
+            chunks = SimpleNamespace(stream_chunks={"thinker_states": snapshot.info})
+            rows.append((rid, 0, _window_tables([spec], inputs, chunks)))
+        column = iteration_columns(sub, rows, repeats, CPU)["text_raw"]
+        for (rid, _, _), values in zip(rows, column, strict=True):
+            seen[rid].extend(values[:, 0].tolist())
+            if retained:
+                buffers[rid].settle_window(snapshots[rid].reservation, repeats)
+
+    step({0: 1, 1: 1}, 1)
+    step({0: 2, 1: 0}, 2)  # row 1's stream has ended; the run is as long as row 0's window
+    step({0: 0, 1: 0}, 3)  # and now row 0's
+    step({0: 0, 1: 0}, 2)
+    assert seen[0] == [1, 3, 4, -1, 0, 0, 0, 0]
+    assert seen[1] == [2, -1, 0, 0, 0, 0, 0, 0]
+
+
+def test_a_run_stops_short_of_the_iteration_whose_items_run_another_consumer_walk():
+    """A pass stamps one consumer walk on what it streams, so a run's items
+    must all run the walk its first does: a hook that moves on at k=3 holds a
+    run from k=1 to two iterations."""
+    from mstar.engine.engine import InputMetadata
+    from mstar.streaming.topology import Connection
+
+    batch = ScheduledBatch(node_name="n", graph_walk=WALK, request_to_worker_graph={0: 0})
+    hook = Connection.__new__(Connection)
+    hook.consumer_walk = lambda ctx: "late" if ctx.loop_iters["loop"] >= 3 else "early"
+    worker = Worker.__new__(Worker)
+    worker._walk_drivers = {"talker": hook}
+    worker._innermost_loop_by_node = {(WALK, "n"): "loop"}
+    worker._signal_consumer = {"states": "talker"}
+    worker._graph_runtime = SimpleNamespace(get_output_signals=lambda node, walk: ["states"])
+    speculation = SimpleNamespace(
+        scheduled_batch=batch, loop_name="loop", continuing_rids={0},
+        node_batch=SimpleNamespace(
+            per_request_input_metadata={0: InputMetadata(dynamic_loop_iter_counts={"loop": 1})},
+            per_request_info={0: None},
+        ),
+    )
+    assert worker._steady_consumer_walks(batch, speculation.node_batch, speculation.continuing_rids, 4) == 2
+    worker._walk_drivers = {}
+    assert worker._steady_consumer_walks(batch, speculation.node_batch, speculation.continuing_rids, 4) == 4
+
+
+
+def test_a_token_step_node_carries_its_token_from_the_sample_to_its_input_ids():
+    """A decoder that feeds its token back as ``text_inputs`` (canary, canary-
+    qwen, qwen3-asr, whisper) carries it within a run as its preprocess stages
+    it, from the sampled ``new_token`` into ``input_ids``."""
+    from mstar.model.canary_qwen.submodules import CanaryQwenLLMSubmodule
+    from mstar.model.submodule_base import CarryPair
+
+    sub = CanaryQwenLLMSubmodule.__new__(CanaryQwenLLMSubmodule)
+    torch.nn.Module.__init__(sub)
+    assert sub.repeat_carry("decode", {"text_inputs"}) == {"text_inputs": CarryPair("new_token", "input_ids")}
+
+
+def test_cross_attention_over_a_fixed_context_repeats():
+    from mstar.engine.resources.attn.cross import FlashInferCrossManager
+
+    cross = FlashInferCrossManager.__new__(FlashInferCrossManager)
+    assert cross.repeat_refusal(WALK) is None
+
+
+def _cut(table, pad, start, repeats):
+    """The column a row's table gives from ``start``: past its end, the pad's rows,
+    then the pad's last row over and over."""
+    rows = torch.cat([table, pad]) if pad is not None else table
+    at = [min(i, rows.shape[0] - 1) for i in range(start, start + repeats)]
+    return rows[at]
+
+
+@pytest.mark.parametrize("repeats", [1, 4])
+def test_iteration_inputs_read_each_row_from_its_table_with_one_gather(repeats):
+    """Inside the table, across into a state pad, past the pad, a constant pad,
+    an empty table, an offset, a padding row; a pad-less read past the end
+    raises; a reassigned source is read anew; a column keeps its table's dtype;
+    and once the tables are made a step's device work doesn't grow with its
+    rows (review-r2 F6)."""
+    from torch.utils._python_dispatch import TorchDispatchMode
+
+    from mstar.model.submodule_base import PerRequestState, iteration_columns
+
+    class Node:
+        ITERATION_INPUTS = {
+            "cond": IterationInput("trailing", shape=(2,), pad="pad", capture_fill=-1.0),
+            "floor": IterationInput("floor", pad=False, capture_fill=True, dtype=torch.bool),
+            "t": IterationInput("ts", pad=None, offset=1, dtype=torch.long),
+        }
+
+        def __init__(self):
+            self.request_states = {}
+
+    node = Node()
+    node.iteration_tables = IterationTables(CPU)
+    for rid, (n, floor) in enumerate([(5, 3), (2, 0)], start=1):
+        state = node.request_states[rid] = PerRequestState()
+        state.add("trailing", torch.arange(2.0 * n).reshape(n, 2) + 100 * rid)
+        state.add("pad", torch.tensor([[-7.0, -8.0], [-9.0, -10.0]]))
+        state.add("floor", torch.ones(floor, dtype=torch.bool))
+        state.add("ts", torch.arange(40))
+    pad = torch.tensor([[-7.0, -8.0], [-9.0, -10.0]])
+    for ks in ([0, 0], [3, 1], [6, 2], [30, 30]):
+        out = iteration_columns(node, [(1, ks[0]), (2, ks[1]), None], repeats, CPU)
+        for i, rid in enumerate((1, 2)):
+            state = node.request_states[rid]
+            assert torch.equal(out["cond"][i], _cut(state["trailing"], pad, ks[i], repeats))
+            assert torch.equal(out["floor"][i], _cut(state["floor"], torch.zeros(1, dtype=torch.bool), ks[i], repeats))
+            assert torch.equal(out["t"][i], state["ts"][ks[i] + 1:ks[i] + 1 + repeats])
+        assert (out["cond"][2] == -1).all() and out["floor"][2].all()
+        assert out["t"].dtype == torch.long and out["floor"].dtype == torch.bool
+    with pytest.raises(ValueError, match="reads past"):
+        iteration_columns(node, [(1, 39)], repeats, CPU)
+    node.request_states[1].add("trailing", torch.zeros(5, 2))  # a walk change reassigns its source
+    assert iteration_columns(node, [(1, 0)], repeats, CPU)["cond"][0].abs().sum() == 0
+
+    class Ops(TorchDispatchMode):
+        def __init__(self):
+            super().__init__()
+            self.kernels = 0
+
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            if not func._schema.name.startswith(("aten::slice", "aten::view", "aten::reshape", "aten::_reshape",
+                                                  "aten::alias", "aten::unsqueeze", "aten::expand")):
+                self.kernels += 1
+            return func(*args, **(kwargs or {}))
+
+    counts = []
+    for rows in ([(1, 2)], [(1, 2), (2, 2), None, None]):
+        iteration_columns(node, rows, repeats, CPU)  # the tables are made once
+        with Ops() as ops:
+            iteration_columns(node, rows, repeats, CPU)
+        counts.append(ops.kernels)
+    if repeats == 1:
+        assert counts[0] == 0, "one row's single iteration is a view, with no allocation or kernel"
+    else:
+        assert counts[0] == counts[1], "a step's kernels are one gather an input, whatever its rows"
+
+
+def test_a_removed_requests_rows_of_an_iteration_table_go_to_the_next_request():
+    """A table grows past its rows and never refuses, and what a request held
+    is handed on (a long-running server's table stops growing)."""
+    spec = {"cond": IterationInput("t", shape=(2,), pad=0.0, capture_fill=-1.0)}
+    tables = IterationTables(CPU)
+    states = {rid: {"t": torch.full((100, 2), float(rid))} for rid in (1, 2, 3)}
+    out = tables.read(spec, [(1, 99), (2, 0), (3, 100), None], states, 1)["cond"]
+    assert out[:, 0, 0].tolist() == [1.0, 2.0, 0.0, -1.0]
+    size = tables._tables["cond"].used
+    tables.remove_request(2)
+    states[4] = {"t": torch.full((100, 2), 4.0)}
+    assert tables.read(spec, [(4, 5), (1, 5)], states, 1)["cond"][:, 0, 0].tolist() == [4.0, 1.0]
+    assert tables._tables["cond"].used == size
+
+
+def test_a_loop_back_that_also_leaves_the_loop_is_not_kept_in_rows():
+    """BAGEL's latents loop back and, when the Loop ends, go to the VAE: a step
+    that kept them on the device would hand the VAE nothing."""
+    from mstar.graph.base import GraphEdge, GraphNode, Loop, loop_edges
+    from mstar.worker.step_repeats import StepRepeats
+
+    node = GraphNode(name="n", input_names={"x", "t"}, outputs=[GraphEdge("n", "x"), GraphEdge("n", "t")])
+    loop = Loop(section=node, max_iters=8, outputs=[GraphEdge("vae", "x")], name="loop")
+    edges = loop_edges(loop, "n")
+    assert edges.leaving == {"x"}
+    repeats = StepRepeats.__new__(StepRepeats)
+    repeats.edges = {("n", "w"): edges}
+    repeats.limit = lambda node: 4
+    assert repeats.kept_rows(resident=()) == {("n", "w"): {"t"}}
+
+
+def test_a_walk_with_a_capture_key_that_cant_be_resident_is_refused_at_load_not_at_capture():
+    """BAGEL's decode captures twice, without and with guidance, and only the
+    guided step declares a KV sink: the walk is refused on the verdict line,
+    where before the second capture stopped the worker."""
+    from mstar.engine.engine import Engine
+
+    segments = (Segment(1, "main", 1),)
+
+    def step(sink):
+        kv = KVStep(segments=segments, sink=frozenset({(1, "main")}) if sink else frozenset())
+        return SubmoduleStep(steps={"kv": kv}, segments=list(segments))
+
+    engine = Engine.__new__(Engine)
+    engine._runner = SimpleNamespace(order=("kv",))
+    mgmt = SimpleNamespace(resources={"kv": object()})
+    runner = SimpleNamespace(keyed_template_steps=lambda walk: {False: step(False), True: step(True)})
+    why = engine._keyed_resident_refusal(mgmt, runner, WALK, step(False))
+    assert why is not None and why.startswith("its capture keyed True:") and "sink" in why
+    runner.keyed_template_steps = lambda walk: {False: step(False)}
+    assert engine._keyed_resident_refusal(mgmt, runner, WALK, step(False)) is None
+
+
+@pytest.mark.parametrize("repeat_reason", [None, "resource refuses repeats"])
+def test_requested_device_execution_refuses_unsupported_walk_at_load(repeat_reason):
+    repeats = _repeats(4)
+    repeats._configs["n"] = RepeatConfig(max=4, device_stop="skip")
+    with pytest.raises(ValueError, match="n/decode.*device_stop.*no conditional graph"):
+        repeats.settle(lambda *key: None, lambda *key: repeat_reason,
+                       {"device stop": lambda *key: "backend: no conditional graph"})
+
+
+def test_a_batched_input_window_does_not_read_past_each_rows_admitted_horizon():
+    from mstar.model.submodule_base import IterationStream, iteration_columns
+
+    node = SimpleNamespace(
+        ITERATION_INPUTS={
+            "t": IterationInput("ts", offset=1, dtype=torch.long, capture_fill=-9),
+            "s": IterationInput("stream", streamed=True, dtype=torch.long, capture_fill=-8),
+        },
+        iteration_tables=IterationTables(CPU),
+        request_states={1: {"ts": torch.arange(8)}, 2: {"ts": torch.arange(8)}},
+    )
+    rows = [(1, 1, {"stream": IterationStream(torch.arange(6))}),
+            (2, 6, {"stream": IterationStream(torch.tensor([70]))}), None]
+    # A continuing row covers predecessor uncertainty plus its next run;
+    # a fresh row near its fixed cap has only one valid input, in the same batch.
+    out = iteration_columns(node, rows, 8, CPU, horizons=[6, 1, 0])
+    assert out["t"].tolist() == [[2, 3, 4, 5, 6, 7, -9, -9], [7, -9, -9, -9, -9, -9, -9, -9], [-9] * 8]
+    assert out["s"].tolist() == [[0, 1, 2, 3, 4, 5, -8, -8], [70, -8, -8, -8, -8, -8, -8, -8], [-8] * 8]
+    with pytest.raises(ValueError, match="reads past"):
+        iteration_columns(node, rows, 8, CPU, horizons=[6, 2, 0])
+
+
+def test_an_engine_input_window_keeps_lower_origins_entry_keys_and_per_row_extents():
+    from mstar.engine.device_run import IterationWindow
+    from mstar.engine.engine import Engine, ForwardPassInfoWrapper
+    from mstar.graph.loop_indices import LoopLayout
+    from mstar.model.submodule_base import InputMetadata
+
+    node = SimpleNamespace(
+        ITERATION_INPUTS={"t": IterationInput("ts", dtype=torch.long, capture_fill=-9)},
+        iteration_tables=IterationTables(CPU),
+        request_states={1: {"ts": torch.arange(9)}, 2: {"ts": torch.arange(10)}},
+    )
+    loop = LoopLayout("inner", ("outer",), ())
+    engine = Engine.__new__(Engine)
+    engine._device, engine._loops = CPU, {("n", "decode"): loop}
+    engine._runner = SimpleNamespace(request_generation=lambda rid: 100 + rid)
+    ctx = StepContext(request_ids=(1, 2), graph_walk="decode", slot=0, capture=True, repeats=4)
+    metadata = {
+        1: InputMetadata(dynamic_loop_iter_counts={"inner": 5, "outer": 7}, graph_pass=3, iteration_origin=1),
+        2: InputMetadata(dynamic_loop_iter_counts={"inner": 6, "outer": 4}, graph_pass=9, iteration_origin=6),
+    }
+    info = {rid: ForwardPassInfoWrapper(SimpleNamespace(), item) for rid, item in metadata.items()}
+    window = engine._iteration_columns("n", node, ctx, [1, 2, -1], info, actual_loop=loop)
+    assert isinstance(window, IterationWindow)
+    assert window.origins.tolist() == [1, 6, 0]
+    assert window.entries.tolist() == [[101, 3, 7], [102, 9, 4], [-1, -1, -1]]
+    assert window.columns["t"].tolist() == [list(range(1, 9)), [6, 7, 8, 9, -9, -9, -9, -9], [-9] * 8]
+    # A later assignment reuses the owner's arena, but cannot change a queued snapshot.
+    node.request_states[1]["ts"] = torch.arange(9) + 100
+    engine._iteration_columns("n", node, ctx, [1, 2, -1], info, actual_loop=loop)
+    assert window.columns["t"][0].tolist() == list(range(1, 9))
+
+    one = StepContext(request_ids=(1,), graph_walk="decode", slot=0, capture=True, repeats=1)
+    info[1].metadata.dynamic_loop_iter_counts["inner"] = 1
+    single = engine._iteration_columns("n", node, one, [1], info, actual_loop=loop)
+    node.request_states[1]["ts"] = torch.arange(9) + 200
+    engine._iteration_columns("n", node, one, [1], info, actual_loop=loop)
+    assert single.columns["t"].item() == 101
+
+
+@pytest.mark.parametrize("items, tail, expected", [
+    ([10., 11.], 0, [10., 11., -1., -2., -3., -3.]),
+    ([], 1, [-2., -3., -3., -3., -3., -3.]),
+    ([], 5, [-3., -3., -3., -3., -3., -3.]),
+])
+def test_stream_padding_uses_its_snapshotted_tail_position(items, tail, expected):
+    from mstar.engine.engine import _window_tables
+    from mstar.model.submodule_base import InputMetadata, iteration_columns
+    from mstar.streaming.stream_buffer import StreamChunkInfo
+
+    spec = IterationInput("text", streamed=True, pad="tail")
+    node = SimpleNamespace(ITERATION_INPUTS={"cond": spec}, request_states={1: {"tail": torch.tensor([-1., -2., -3.])}})
+    metadata = InputMetadata(stream_chunks={"text": StreamChunkInfo(0, 0, len(items), False, tail_offset=tail)})
+    tables = _window_tables([spec], {"text": [torch.tensor(items)]} if items else {}, metadata)
+    actual = iteration_columns(node, [(1, 0, tables)], 6, CPU)["cond"]
+    assert actual.tolist() == [expected]
+
+
+@pytest.mark.parametrize("other", ["slot", "bucket", "member"])
+def test_captured_input_banks_hold_two_windows_after_source_growth_and_validate_before_writes(other):
+    from mstar.engine.device_run import IterationWindow
+
+    owner = IterationTables(CPU)
+    specs = {"cond": IterationInput("source", capture_fill=-9),
+             "mask": IterationInput("mask", dtype=torch.bool, capture_fill=False)}
+    states = {1: {"source": torch.arange(8).float(), "mask": torch.ones(8, dtype=torch.bool)}}
+    lease = SlotLease(0, BucketKey("decode", 1, 1), "a")
+    second = {"slot": replace(lease, slot=1), "bucket": replace(lease, bucket=BucketKey("decode2", 1, 1)),
+              "member": replace(lease, member="b")}[other]
+    inputs = {"cond": torch.zeros(1), "mask": torch.zeros(1, dtype=torch.bool)}
+    fills = {"cond": -9, "mask": False}
+    banks = [owner.prepare_window(key, inputs, 2, 2, 4, fills) for key in (lease, second)]
+    horizon = StepContext((1,), "decode", 0, False, slot_lease=lease, repeats=4)
+    owner.resident_binding().check_horizon(None, horizon)
+    horizon.repeats = 5
+    with pytest.raises(ValueError, match="horizon"):
+        owner.resident_binding().check_horizon(None, horizon)
+    assert owner.prepare_window(replace(lease), inputs, 2, 2, 4, fills) is banks[0]
+    with pytest.raises(ValueError, match="geometry changed"):
+        owner.prepare_window(lease, inputs, 3, 2, 4, fills)
+    pointers = [[tensor.data_ptr() for tensor in bank.columns.values()] for bank in banks]
+    for start, key in zip((0, 2), (lease, second), strict=True):
+        snapshot = IterationWindow(owner.read(specs, [(1, start)], states, 4),
+                                   torch.tensor([start]), torch.tensor([[7, 0]]))
+        owner.stage_window(key, [2], snapshot)
+    # Both captured addresses survive arena growth and source reassignment.
+    states[2] = {"source": torch.arange(1024).float(), "mask": torch.zeros(1024, dtype=torch.bool)}
+    owner.read(specs, [(2, 0)], states, 4)
+    states[1]["source"] = torch.arange(8).float() + 100
+    owner.read(specs, [(1, 0)], states, 4)
+    for start, bank, addresses in zip((0, 2), banks, pointers, strict=True):
+        assert [tensor.data_ptr() for tensor in bank.columns.values()] == addresses
+        assert bank.columns["cond"][2].tolist() == list(range(start, start + 4))
+        assert bank.origins[2] == start and bank.entries[2].tolist() == [7, 0]
+    before = {name: value.clone() for name, value in banks[0].columns.items()}
+    bad = IterationWindow({"cond": torch.full((1, 1), 99.), "mask": torch.ones(1, 1)},
+                          torch.tensor([4]), torch.tensor([[8, 1]]))
+    with pytest.raises(ValueError, match="iteration input 'mask'"):
+        owner.stage_window(lease, [2], bad)
+    for name, value in before.items():
+        assert torch.equal(value, banks[0].columns[name])
+    # Reuse clears the unread tail, without touching another resident row.
+    good = bad._replace(columns={"cond": bad.columns["cond"], "mask": bad.columns["mask"].bool()})
+    owner.stage_window(lease, [1], good)
+    assert banks[0].columns["cond"][1].tolist() == [99., -9., -9., -9.]
+    assert torch.equal(banks[0].columns["cond"][2], before["cond"][2])
+
+
+@pytest.mark.parametrize("overlap", [False, True])
+def test_iteration_stream_packs_frozen_policy_windows_without_reinterpreting_items(overlap):
+    from mstar.engine.engine import _window_tables
+    from mstar.model.submodule_base import InputMetadata
+    from mstar.streaming.chunk_policy import FixedChunkPolicy, SlidingWindowChunkPolicy
+    from mstar.streaming.stream_buffer import StreamBuffer
+
+    policy = SlidingWindowChunkPolicy(4, 2) if overlap else FixedChunkPolicy(4)
+    buf = StreamBuffer(1, "text", "producer", policy)
+    buf.put_positions(list(range(24)))
+    if overlap:
+        buf.pop_chunk()  # subsequent overlap/context geometry is stable
+    first = buf.reserve_window(2)
+    second = buf.reserve_window(2)
+    assert first.reservation.bound == second.reservation.bound == 2
+    values = torch.tensor(second.data["data"]).float()
+    spec = IterationInput("text", shape=(4,), streamed=True)
+    metadata = InputMetadata(stream_chunks={"text": second.info})
+    packed = _window_tables([spec], {"text": [values]}, metadata)["text"].items
+    stride, start = (2, 2) if overlap else (4, 0)
+    expected = torch.tensor([list(range(start + i * stride, start + i * stride + 4)) for i in range(4)]).float()
+    torch.testing.assert_close(packed, expected)
+    # A short first run selects the retained prefix by iterations, not item count.
+    buf.settle_window(first.reservation, 1)
+    assert buf.retained_prefix(second.info) == 1
+    retry = _window_tables([spec], {"text": [values]}, metadata, start=1)["text"].items
+    torch.testing.assert_close(retry, expected[1:])
+    with pytest.raises(ValueError, match="declared iteration shape"):
+        _window_tables([IterationInput("text", shape=(3,), streamed=True)], {"text": [values]}, metadata)
+
+
+@pytest.mark.parametrize("refuse", [False, True])
+def test_joining_checks_undeclared_capture_owners_before_declared_owner_reservation(refuse):
+    live = _resources(prefix_cache=False, recurrent_prefix_slots=0)
+    auxiliary = live["aux"] = _Attention(True)
+    planner = _planner(live, 4, keys=("kv", "aux"))
+    runner = StepRunner(live)
+    runner.ingest_request(1, {"kv": KVReqConfig()})
+    _host_step(live, [1], [3])
+    seen = []
+
+    def check(step, ctx):
+        seen.append((step, ctx.repeats))
+        if refuse:
+            raise ValueError("captured auxiliary storage is not ready")
+
+    def cannot_mutate(*args):
+        raise AssertionError("an undeclared auxiliary must not be admitted or rolled back")
+
+    auxiliary.admit = auxiliary.rollback_admit = cannot_mutate
+    planner.bindings["aux"] = replace(planner.bindings["aux"], check_horizon=check)
+    step = SubmoduleStep({"kv": KVStep(segments=(Segment(1, "main", 1),))}, segments=[Segment(1, "main", 1)])
+    step.set_ctx(StepContext((1,), WALK, 0, False, resident=planner, repeats=4))
+    free = live["kv"]._arena.num_free
+    if refuse:
+        with pytest.raises(ValueError, match="auxiliary storage"):
+            runner.admit_rows(step)
+        assert live["kv"]._arena.num_free == free
+        assert not live["kv"]._admit_reserved_pages
+    else:
+        assert runner.admit_rows(step).ok
+        runner.rollback_admit(step)
+        assert live["kv"]._arena.num_free == free
+    assert seen == [(None, 4)]
+
+
+def test_publication_input_staging_does_not_overwrite_an_execution_streams_queued_indices(monkeypatch):
+    from mstar.engine.device_run import IterationWindow
+    from mstar.engine.resources.run_rows import RunRows
+
+    owner = IterationTables(CPU)
+    lease = SlotLease(0, BucketKey("decode", 1, 1))
+    bank = owner.prepare_window(lease, {"cond": torch.zeros(1)}, 2, 2, 3, {"cond": -1})
+    membership = RunRows(CPU, 1, 2, 2)
+
+    def snapshot(value, entry):
+        return IterationWindow({"cond": torch.full((1, 4), value)}, torch.tensor([0]), torch.tensor([[entry, 0]]))
+
+    copy = owner._stager.copy_
+
+    def interleave(target, values):
+        copy(target, values)
+        # Model publication landing after the queued ordinary index copy, but
+        # before its index_copy_ reads that destination on the other stream.
+        owner.stage_window(lease, [2], snapshot(20., 2), stager=membership.stager)
+
+    monkeypatch.setattr(owner._stager, "copy_", interleave)
+    owner.stage_window(lease, [1], snapshot(10., 1))
+    assert bank.columns["cond"].tolist() == [[-1.] * 4, [10.] * 4, [20.] * 4]
+    assert bank.entries.tolist() == [[-1, -1], [1, 0], [2, 0]]

@@ -57,6 +57,7 @@ class TransducerSubmodule(NodeSubmodule):
     frames it reads.
     """
 
+
     MAX_BATCH_SIZE = max(CAPTURE_BATCH_SIZES)
     disable_autocast = True
     # only the greedy step is compiled (``__init__``)

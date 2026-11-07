@@ -360,10 +360,15 @@ def test_a_capped_loop_ends_at_its_cap_on_every_pass(decode):
     capped = _admit(rt, "r1", loop_caps={"ar_loop": 2})
     free = _admit(rt, "r2")
 
-    first = _run_pass(rt, book, capped, uuids)
-    second = _run_pass(rt, book, capped, uuids)
+    passes = []
+    def observe():
+        passes.append(rt.graph_passes({capped: WG_ID, free: WG_ID}))
+    first = _run_pass(rt, book, capped, uuids, on_decode=observe)
+    second = _run_pass(rt, book, capped, uuids, on_decode=observe)
     other = _run_pass(rt, book, free, uuids)
 
+    assert passes == [[0, 0], [0, 0], [1, 0], [1, 0]]
+    assert rt.graph_passes({free: WG_ID, capped: WG_ID}) == [1, 2]
     assert first.count("ar_decode") == second.count("ar_decode") == 2
     assert other.count("ar_decode") == 4, "the cap leaked to the next request"
 
@@ -1823,6 +1828,17 @@ def test_a_loop_inside_a_loop_runs_every_iteration(nested):
         node = ready[0]
         rt.pop_rids(node, WALK, [rid])
         log.append(node)
+        projected = None
+        if node == "refiner":
+            counts = rt.get_dynamic_loop_iters([rid], "default").values[0]
+            targets = _spec_targets(rt, node, WALK, rid)
+            if counts["refine_loop"] == 0:
+                assert [(t.node_name, t.loop_name) for t in targets] == [("denoiser", "refine_loop")]
+                assert targets[0].is_new_loop_iter
+                projected = rt.loop_layout(WALK, targets[0].loop_name).advance(counts)
+                assert projected == {"refine_loop": 1, "denoise_loop": 0}
+            else:
+                assert not targets, "the outer cap must refuse another inner entry"
         signals = rt.get_output_signals(node, WALK)
         rt.complete_and_route_batch(
             RouteInput(
@@ -1833,6 +1849,8 @@ def test_a_loop_inside_a_loop_runs_every_iteration(nested):
                 num_tensors=[1] * len(signals),
             ),
         )
+        if projected is not None:
+            assert rt.get_dynamic_loop_iters([rid], "default").values[0] == projected
     assert log == [
         "denoiser", "denoiser", "denoiser", "refiner",
         "denoiser", "denoiser", "denoiser", "refiner",

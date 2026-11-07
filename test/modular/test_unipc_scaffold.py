@@ -8,6 +8,7 @@ import pytest
 import torch
 from diffusers import UniPCMultistepScheduler
 
+from mstar.engine.resources.iteration_tables import IterationTables
 from mstar.model.components.diffusion.denoise_loop import UniPCDenoiseLoopSubmodule
 from mstar.model.components.diffusion.flow_match import FlowMatchSchedule
 from mstar.model.components.diffusion.unipc import (
@@ -20,6 +21,7 @@ from mstar.model.components.diffusion.unipc import (
     unipc_step,
 )
 from mstar.model.cosmos3.submodules import _UniPCSampler, native_flow_sigmas
+from mstar.model.submodule_base import iteration_columns
 
 BASE = {
     "num_train_timesteps": 1000, "solver_order": 2, "prediction_type": "flow_prediction", "predict_x0": True,
@@ -123,12 +125,19 @@ def _info(rid, steps, k):
 
 
 def _step(sub, rows):
-    """One engine pass over ``{rid: (info, carried)}``."""
+    """One engine pass over ``{rid: (info, carried)}``: each row prepared, its
+    iteration inputs cut, the batch preprocessed, run and handed back per row."""
     prepared = [sub.prepare_inputs("walk", info, carried) for info, carried in rows.values()]
     engine_inputs = SimpleNamespace(
         request_ids=list(rows), per_request_info={rid: row[0] for rid, row in rows.items()},
     )
-    return sub.forward_batched("walk", engine_inputs, **sub.preprocess("walk", engine_inputs, prepared))
+    sub.__dict__.setdefault("iteration_tables", IterationTables(torch.device("cpu")))
+    cut = iteration_columns(
+        sub, [(rid, info.dynamic_loop_iter_counts["loop"]) for rid, (info, _) in rows.items()], 1, torch.device("cpu"),
+    )
+    kwargs = {**sub.preprocess("walk", engine_inputs, prepared), **{n: c[:, 0] for n, c in cut.items()}}
+    out = sub.forward_batched("walk", engine_inputs, **kwargs)
+    return sub.unpack_packed_outputs(out.packed_outputs, list(rows), [], prepared, {})
 
 
 def _solo(rid, steps):
@@ -165,9 +174,9 @@ def test_a_loop_seeds_and_carries_its_solver_state():
     sub = _Loop()
     info = _info("r", 3, 0)
     prepared = sub.prepare_inputs("walk", info, {})
-    assert set(prepared.tensor_inputs) == {"latents", MODEL_OUTPUTS, LAST_SAMPLE, "timestep"}
+    assert set(prepared.tensor_inputs) == {"latents", MODEL_OUTPUTS, LAST_SAMPLE}
     assert prepared.tensor_inputs[MODEL_OUTPUTS].shape == (2, 1, 4)
     assert not np.any(prepared.tensor_inputs[LAST_SAMPLE].numpy())
-    # past iteration 0 a missing edge is a routing bug, not a fresh loop
-    with pytest.raises(RuntimeError, match="missing at iteration 1"):
-        sub.prepare_inputs("walk", _info("r", 3, 1), {})
+    # a carried walk that loses an edge has hit a routing bug, not a fresh loop
+    with pytest.raises(RuntimeError, match=r"\['unipc_model_outputs', 'unipc_last_sample'\] missing for request r"):
+        sub.prepare_inputs("walk", _info("r", 3, 1), {"latents": [torch.zeros(1, 4)]})

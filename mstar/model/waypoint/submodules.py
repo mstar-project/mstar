@@ -124,6 +124,7 @@ class WaypointDitSubmodule(_FunctionalAeMixin, NodeSubmodule):
     for the resulting two-node graph.
     """
 
+
     # Do not let the engine independently compile this wrapper and fuse
     # across the DiT's own full-graph regions.
     disable_torch_compile = True

@@ -1,5 +1,6 @@
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
+from copy import deepcopy
 
 
 class ChunkPolicy(ABC):
@@ -7,6 +8,16 @@ class ChunkPolicy(ABC):
     def __init__(self):
         self.first_chunk_read = False
         self.items_consumed = 0
+
+    def preview_copy(self) -> "ChunkPolicy":
+        """Independent policy state for ordinary readiness/pop preview.
+
+        Readiness must be pure; chunk sizing and registration may only change
+        instance state. Policies using external mutable state or I/O must override this
+        operation with an independent semantic copy, or raise ValueError.
+        A preview is never allowed to run external side effects.
+        """
+        return deepcopy(self)
 
     def register_chunk(self, chunk_size: int):
         self.first_chunk_read = True

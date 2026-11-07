@@ -50,6 +50,13 @@ class SlotLease:
     has no clean channel to plan/commit/release. see O."""
     slot: int
     bucket: BucketKey | None # None -> eagre
+    # Captures of connected members hold distinct plans on the same component
+    # slot. Empty on ordinary deployments, retaining their existing sharing.
+    member: str = ""
+
+    @property
+    def buffer_slot(self) -> int | tuple[str, int]:
+        return (self.member, self.slot) if self.member else self.slot
 
 
 class SettingValue(Enum):
@@ -93,7 +100,6 @@ class StepContext:
     graph_walk: str
     slot: int
     capture: bool
-
     # Preplan
     is_preplan: bool = False
     # the prefix a resource's own plan laps record under, as the runner times
@@ -102,6 +108,8 @@ class StepContext:
     # will get populated with the output of plan as previous steps
     # complete their plan stages
     plan_results: dict[str, Any] = field(default_factory=dict)
+    # the step is the run ready rows waited for (``step_repeats: ready_waits``)
+    owed_run: bool = False
     slot_lease: SlotLease | None = None
     # label -> the slot a piecewise region of this node holds for this step,
     # for regions that opt into leasing ahead of the declaration. The region
@@ -121,6 +129,18 @@ class StepContext:
     # plan prefill attention even when every row is one token: a packed
     # capture's forward reads per-row token offsets
     force_prefill: bool = False
+    # How many times this step's capture replays: the host plans once and the
+    # step counts for this many iterations. The worker asks, and `StepRunner`
+    # narrows it to what the step's resources allow (`Resource.max_repeats`).
+    repeats: int = 1
+    # Parallel nodes freeze the leader's decision before broadcast. A local
+    # limit may reject it before forward, never silently change it.
+    tp_repeats: int | None = None
+    # a run's real rows -> the generation of the request each named when it
+    # committed (``StepRunner.commit``), so a short landing rewinds only those
+    counted: Mapping[int, int | None] = field(default_factory=dict)
+    # Actual executions after settlement, distinct from the submitted bound.
+    run_counts: Mapping[int, int] | None = field(default=None, init=False)
     # the node's `ResidentPlanner` when this step's capture reads the resident
     # tables: a resource then stages nothing per row (see `resources/resident.py`)
     resident: Any = None
@@ -132,6 +152,34 @@ class StepContext:
     # reserve them now (``ChunkingPolicy.reserve_whole_prefill``). Check it
     # before reserving by ``chunk_tokens_after``.
     reserve_whole_prefill: PerReqSetting = ALL_SET
+    # One claimed unit's ordered member. Resources own outstanding admissions
+    # and derive earlier members' growth without advancing durable state.
+    unit_id: int | None = None
+    unit_member: int = 0
+
+    def check_tp_repeats(self) -> None:
+        if self.tp_repeats is not None and self.repeats != self.tp_repeats:
+            raise SystemExit(
+                f"walk {self.graph_walk!r}: the leader settled {self.tp_repeats} iterations, "
+                f"but this rank can run {self.repeats}; refusing before forward"
+            )
+
+    def run_span(self, span: int, keeps: bool = True, *, request_id: int | None = None) -> int:
+        """What ``span`` a replay comes to over the step: read this, not
+        ``span``, for anything counted per step rather than per replay. A
+        step that ``keeps`` nothing (``KVStep(commit=False)``) rewrites the
+        same tokens each replay, so it reaches one replay's. After settlement,
+        use the request's actual count; a zero-execution row reaches nothing."""
+        count = self.repeats
+        if self.run_counts is not None:
+            if request_id is None:
+                raise ValueError("a settled run span needs its request id")
+            count = self.run_counts.get(request_id)
+            if count is None:
+                if self.is_padding_row(request_id) and request_id in self.padded_request_ids:
+                    return 0
+                raise ValueError(f"request {request_id!r} is not in the settled run")
+        return span * count if keeps else span if count else 0
 
     def walk_of(self, rid: int) -> str:
         return self.request_walks.get(rid, self.graph_walk)

@@ -14,6 +14,7 @@ state, scheduler and stream buffers.
 """
 from __future__ import annotations
 
+from collections.abc import Mapping
 from concurrent.futures import Future
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
@@ -29,7 +30,7 @@ from mstar.graph.runtime.base import (
 )
 from mstar.streaming.stream_buffer import StreamingEdge
 from mstar.utils.profiler import PhaseLaps
-from mstar.worker.executing_batch import input_metadata_and_fwd_info, make_executing_batch
+from mstar.worker.executing_batch import input_metadata_and_fwd_info, make_executing_batch, stamp_iteration_context
 from mstar.worker.micro_scheduler import MicroScheduler, ScheduledBatch
 from mstar.worker.node_manager_utils import RequestStateManager
 from mstar.worker.spec_rows import DeferredRowInputs, loop_counter_snapshots
@@ -85,6 +86,7 @@ class SpeculationContext:
     streams: StreamBufferManager
     # orders a mixed step's rows for its split kernels
     engine_manager: EngineManager | None = None
+    loop_by_node: Mapping[tuple[str, str], str] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -223,6 +225,14 @@ class SpeculationBuilder:
         # (node, walk) -> its output signals, also structural
         self._walk_signals_cache: dict[tuple[str, str], list[str]] = {}
 
+    def _successor_stride(self, pending: PendingBatch, target: SpeculationOutput) -> int:
+        # Replaying the inner Loop does not repeat a crossed outer transition.
+        if target.is_new_loop_iter and self._ctx.loop_by_node.get(
+            (target.graph_walk, pending.node_name),
+        ) == target.loop_name:
+            return pending.batch.repeats
+        return 1
+
     def build(
         self, pending: PendingBatch, spec_target: SpeculationOutput,
         prep: PreparedSpeculation, other_walks: dict[int, str],
@@ -321,8 +331,15 @@ class SpeculationBuilder:
             ctx.request_state, ctx.streams, node_name=spec_node, batch_partition=pending.partition,
             per_request_inputs=per_request_inputs,
             increment_loop_rids=continuing if spec_target.is_new_loop_iter else None,
-            increment_loop_name=spec_target.loop_name
+            increment_loop=(ctx.graph_runtime.loop_layout(spec_target.graph_walk, spec_target.loop_name)
+                            if spec_target.is_new_loop_iter else None),
+            increment_loop_stride=self._successor_stride(pending, spec_target),
         )
+        if ctx.engine_manager is not None:
+            stamp_iteration_context(
+                ctx.graph_runtime, ctx.engine_manager.get_engine(spec_node), spec_node, label,
+                per_request_info, input_meta, request_to_worker_graph, request_walks,
+            )
         spec_node_batch = make_executing_batch(
             ctx.streams, node_name=spec_node,
             graph_walk=label,
@@ -386,8 +403,8 @@ class SpeculationBuilder:
         infos = self._ctx.request_state.fwd_infos(request_ids, pending.partition)
         metadata = loop_counter_snapshots(
             infos,
-            spec_target.loop_name if spec_target.is_new_loop_iter else None,
-            n_next_iter=len(continuing),
+            self._ctx.graph_runtime.loop_layout(walk, spec_target.loop_name) if spec_target.is_new_loop_iter else None,
+            n_next_iter=len(continuing), stride=self._successor_stride(pending, spec_target),
         )
         inputs = DeferredRowInputs(request_ids)
         for rid, rid_inputs in fresh_inputs.items():
@@ -398,11 +415,18 @@ class SpeculationBuilder:
             request_to_worker_graph=request_to_worker_graph,
             output_signals=spec_target.output_signals,
         )
+        input_meta = dict(zip(request_ids, metadata, strict=True))
+        per_request_info = dict(zip(request_ids, infos, strict=True))
+        if self._ctx.engine_manager is not None:
+            stamp_iteration_context(
+                self._ctx.graph_runtime, self._ctx.engine_manager.get_engine(spec_node),
+                spec_node, walk, per_request_info, input_meta, request_to_worker_graph,
+            )
         spec_node_batch = ExecutingBatch(
             node_name=spec_node,
-            per_request_info=dict(zip(request_ids, infos, strict=True)),
+            per_request_info=per_request_info,
             per_request_input_tensors=inputs,
-            per_request_input_metadata=dict(zip(request_ids, metadata, strict=True)),
+            per_request_input_metadata=input_meta,
             step_context=StepContext(
                 request_ids=tuple(request_ids), graph_walk=walk, slot=0,
                 capture=False, request_walks={},

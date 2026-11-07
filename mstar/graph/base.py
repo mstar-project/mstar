@@ -1,8 +1,14 @@
 from abc import ABC, abstractmethod
+from collections.abc import Mapping
 from dataclasses import dataclass, field
+from enum import Enum
+from types import MappingProxyType
+from typing import NamedTuple
 from uuid import uuid4
 
 import torch
+
+from mstar.graph.special_destinations import SPECIAL_DESTINATIONS
 
 
 @dataclass(frozen=True)
@@ -512,6 +518,8 @@ class Loop(GraphSection):
     # loops, where they are set manually
     _external_inputs: set[NameAndDest] | None = None
     _loop_back_inputs: set[NameAndDest] | None = None
+    # Construction preserves whether partitioning retained the entire Loop.
+    _partition_complete: bool = True
 
 
     def get_nodes(self):
@@ -728,6 +736,94 @@ def self_triggered(entity: "GraphNode | Loop") -> bool:
         node.consumes_stream and node.input_names <= node._streaming_inputs
         for node in entity.get_nodes().values()
     )
+
+
+class EdgeKind(Enum):
+    """How an edge of a node inside a Loop behaves over the Loop's iterations,
+    which is what a step standing for several iterations has to do with it."""
+    # an input that is the same every iteration
+    CONSTANT = "constant"
+    # made by one iteration on device, read by the next
+    LOOP_BACK = "loop-back"
+    # a different value every iteration: an input streamed in, or an output to
+    # the client, a stream, an accumulated output or the Loop's next node
+    PER_ITERATION = "per-iteration"
+    # a Loop output: only the last iteration's value leaves
+    TERMINAL = "terminal"
+
+
+class LoopEdges(NamedTuple):
+    """Every edge of one node in its innermost Loop, by kind."""
+    # input name -> kind
+    inputs: dict[str, EdgeKind]
+    # (signal, destination) -> kind
+    outputs: dict[tuple[str, str], EdgeKind]
+    # the per-iteration outputs that take each iteration's value as an item
+    # of their own (the client, a streaming edge, an accumulated output),
+    # rather than once an iteration by the next node
+    items: frozenset[tuple[str, str]] = frozenset()
+    # the node's signals the Loop hands on when it ends (its outputs), whatever
+    # the node's own edge for them inside it
+    leaving: frozenset[str] = frozenset()
+    # whether the node's next iteration is speculated (it opts into async
+    # scheduling); one that isn't runs every iteration as a step the scheduler picks
+    chained: bool = True
+    # input name -> the node of the Loop that makes it each iteration: a
+    # loop-back (its own or another node's), or the output of a node before
+    # it in the iteration
+    made_by: Mapping[str, str] = MappingProxyType({})
+
+    @property
+    def streamed(self) -> frozenset[str]:
+        """The inputs streamed in from outside the Loop, an item an iteration."""
+        return frozenset(
+            name for name, kind in self.inputs.items() if kind is EdgeKind.PER_ITERATION and name not in self.made_by
+        )
+
+
+def loop_edges(section: GraphSection, node_name: str) -> LoopEdges | None:
+    """The kinds of ``node_name``'s edges in its innermost Loop in ``section``,
+    or None outside any Loop. The kind belongs to the edge: one signal can loop
+    back and go to the client at once."""
+    loops = [loop for loop in section.get_loops().values() if node_name in loop.get_nodes()]
+    inner = next((loop for loop in loops if not set(loop.section.get_loops()) & {lp.name for lp in loops}), None)
+    if inner is None:
+        return None
+    nodes = inner.get_nodes()
+    node = nodes[node_name]
+    back = inner._loop_back_inputs or set()
+    terminal = {edge.name for edge in inner.outputs}
+    accumulated = {edge.name for edge in inner.accumulated_outputs}
+    made_by = {
+        edge.name: name for name, other in nodes.items() for edge in other.outputs
+        if edge.next_node == node_name and edge.name in node.input_names and not edge.is_streaming
+    }
+    inputs = {
+        name: EdgeKind.LOOP_BACK if (name, node_name) in back
+        else EdgeKind.PER_ITERATION if name in node._streaming_inputs or name in made_by
+        else EdgeKind.CONSTANT
+        for name in node.input_names
+    }
+    # A loop-back its node never reads only feeds the loop's accumulated
+    # outputs: an iteration's item when the loop accumulates it, else nothing.
+    unread = {(name, dest) for name, dest in back if dest not in nodes or name not in nodes[dest].input_names}
+    edges = [
+        edge for edge in node.outputs
+        if (edge.name, edge.next_node) not in unread or edge.name in accumulated
+    ]
+    outputs = {
+        (edge.name, edge.next_node): EdgeKind.LOOP_BACK if (edge.name, edge.next_node) in back - unread
+        else EdgeKind.TERMINAL if edge.name in terminal
+        else EdgeKind.PER_ITERATION
+        for edge in edges
+    }
+    items = frozenset(
+        (edge.name, edge.next_node) for edge in edges
+        if outputs[(edge.name, edge.next_node)] is EdgeKind.PER_ITERATION
+        and (edge.is_streaming or edge.name in accumulated or edge.next_node in SPECIAL_DESTINATIONS)
+    )
+    leaving = frozenset(name for name, _ in outputs if name in terminal)
+    return LoopEdges(inputs, outputs, items, leaving, node.enable_async_scheduling, made_by)
 
 
 class GraphStateRegistry(ABC):

@@ -77,7 +77,7 @@ def test_consumer_node_cache_finds_nested_consumers():
 
 
 def test_innermost_loop_cache_maps_only_nodes_inside_a_loop():
-    cache = Worker._build_innermost_loop_cache(_model().get_graph_walk_graphs())
+    cache = Worker._build_innermost_loop_cache(_model().get_graph_walk_graphs().items())
     assert cache == {("consume", "consumer"): "consumer_loop"}
     # Nodes outside any loop get no entry, so no stop is ever synthesised.
     assert ("produce", "producer") not in cache
@@ -92,5 +92,5 @@ def test_innermost_loop_cache_picks_the_inner_loop_when_nested():
         max_iters=4, outputs=[],
     )
     outer = Loop(name="outer_loop", section=inner, max_iters=2, outputs=[])
-    cache = Worker._build_innermost_loop_cache({"w": outer})
+    cache = Worker._build_innermost_loop_cache({"w": outer}.items())
     assert cache == {("w", "deep"): "inner_loop"}

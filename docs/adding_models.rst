@@ -758,15 +758,14 @@ The spec types are:
        model never applies RoPE.
    * - ``SamplerSpec(vocab_size=..., enable_repetion_penalty=...)``
      - A sampler with its own per-request parameter buffers, philox stream, and optional
-       seen-token mask. ``enable_repetion_penalty`` declares a capability, not an
-       intention. It selects which kernel variant is recorded into the captured graph.
-       Whether the penalty runs on a given step is decided from the
-       ``repetition_penalty`` values of the resident requests.
+       token-presence state. ``enable_repetion_penalty`` requires a positive
+       ``vocab_size`` equal to the logit width and selects the captured kernel's
+       capability. Per-request ``repetition_penalty`` controls its strength.
+       Packed presence bits share the sampler's admitted rows with its RNG and
+       generation history; captured draws read and update that owner every replay.
        ``enable_min_p``, ``max_repetition_window``, ``min_tokens_stop_ids`` and
        ``enable_top_p_first`` are capabilities of the same kind. See
-       ``SamplingReqConfig`` above. ``loopback_state`` declares per-request state a
-       decode loop keeps on the device beside its last sampled token. See
-       `Device loop-back`_.
+       ``SamplingReqConfig`` above.
    * - ``RecurrentStateSpec(config=RecurrentStateConfig(...))``
      - Fixed-size per-request state that carries between steps (an LSTM's ``h`` and
        ``c``, a cursor, a conv tail, a Mamba or gated-DeltaNet layer's conv window and SSM
@@ -1481,9 +1480,16 @@ methods are:
    scheduling overlap. Use this method only to rename outputs for routing. Put decisions
    that depend on tensor values in ``check_stop``.
 
-``check_stop(...) -> set[str] | StopCheck`` (optional)
-   Runs off the GPU thread, and may read tensor values. Return the names of the ``Loop``
-   objects to stop, for example after seeing the EOS token. This is how a decode loop
+``token_rows(...)`` and ``record_tokens(...)`` (optional)
+   A node that keeps its host tokens gets them as a step lands, every iteration of a step
+   that repeats, without giving up the runtime's stop check. Whisper's decoder keeps a
+   word-timestamp request's transcript for its align walk this way. Only ``token_rows``'
+   rows are read, so a step with none costs nothing.
+
+``check_stop(...) -> set[str]`` (optional)
+   Runs off the GPU thread, and may read tensor values. A class that overrides this or
+   ``check_stop_batched`` keeps its custom check unless it declares equivalent stop policies. Return the names of the ``Loop`` objects to stop, for example after seeing the EOS
+   token. This is how a decode loop
    terminates. An AR submodule whose loop ends on a stop token sets
    ``self.token_stop = TokenStop(...)`` in ``__init__`` instead of writing one; that also
    gives it ``check_stop_batched``, which checks a whole step off one host copy of its
@@ -1503,18 +1509,16 @@ methods are:
    another walk after its loop (an ``align`` walk, or image generation after thinking) or
    publishes final-only state at the loop's stop needs its own transition instead. Keep
    ``check_stop_batched``, if you write one, in agreement.
-   To also keep some of this step's outputs from being routed, return
-   ``StopCheck(stops, withheld=(names...))``, for example a frame streamed alongside the
-   EOS token: its consumer then never receives it, instead of finding and dropping it with
-   a device read. ``check_stop_batched`` returns a ``BatchedStopCheck`` for the same.
-   The Qwen3-Omni Talker and Fish S2 Pro's AR keep their EOS frame out of the codec
-   stream this way; a ``TokenStop`` names such outputs in ``withhold``, left unrouted on a
-   row whose token is a stop id (the Qwen3-TTS Talker).
-   Only an output that leaves by a streaming edge can be withheld (any other consumer
-   would wait for an item that never comes), and not one that a node this worker
-   speculates into reads, nor the loop-back signal. Startup refuses a
-   ``TokenStop.withhold`` that breaks this; a ``StopCheck`` from ``check_stop`` is not
-   checked.
+   To also keep some of a step's outputs from being routed, for example a frame streamed
+   alongside the EOS token, a ``TokenStop`` names them in ``withhold``: they are left
+   unrouted on a row whose token is a stop id, ``ignore_eos`` or not, so the consumer never
+   receives them instead of finding and dropping them with a device read. The worker reads
+   that off the stop check's host copy, whichever check decided the stops. The Qwen3-Omni
+   and Qwen3-TTS Talkers and Fish S2 Pro's AR keep their EOS frame out of the codec stream
+   this way. Only an output that leaves by a streaming edge can be withheld (any other
+   consumer would wait for an item that never comes), and not one that a node this worker
+   speculates into reads, nor the loop-back signal; startup refuses a ``withhold`` that
+   breaks this.
 
 ``on_request_added(self, request_id, request_info)`` (optional)
    Called on the worker's main thread when the request reaches the worker, before any of
@@ -1534,12 +1538,15 @@ methods are:
    one reaches ``max_iters`` (``info.max_tokens`` unless given). ``StopKind.ITER`` checks
    only the count, and ``StopKind.EOS`` only the token, for a loop whose cap is its budget.
    The limits are computed from the request's forward-pass info whenever
-   the worker receives it, not per step. Return ``{}`` for a
-   walk on which ``check_stop`` never stops a loop, and ``None`` (the default) to keep
+   the worker receives it, not per step. ``{}`` means ``check_stop`` never stops a loop
+   on the walk, and is the default for a class without a custom stop check (its loop's
+   cap or its stream's end stops it); ``None``, the default with a custom check, keeps
    calling ``check_stop``. The policies must agree with ``check_stop`` for every row;
    ``test/modular/test_stop_policies.py`` checks the models that declare them. A
-   ``TokenStop`` with ``runtime_check=True`` declares them for you: its loop's stop ids,
-   as ``StopKind.EOS``, on ``walk``; its ``prefill_walks`` keep ``check_stop``.
+   ``TokenStop`` declares them for you: its loop's stop ids, as ``StopKind.EOS``, on
+   ``walk``. Its ``prefill_walks`` keep ``check_stop``, and so does every walk of a class
+   with a custom stop check. A policy's ``withhold`` names outputs whose
+   item of a step whose token is a stop id is not routed (``TokenStop.withhold``).
 
 ``cleanup_request(self, request_id)`` (optional)
    Free per-request state held inside the submodule when a request finishes: buffers,
@@ -1565,7 +1572,7 @@ methods are:
    The worker cuts each row to its span after the step's completion event, before the stop
    check, transport or a streaming edge reads it. The cut is a view, not a copy. Engine-side
    ``postprocess`` still sees the uncut output. A row whose span is empty is left out of the
-   store after the stop check, as a withheld output is (``StopCheck``): a streaming edge
+   store after the stop check, as a withheld output is (``TokenStop.withhold``): a streaming edge
    gets no item for it. A spanned output must not feed a node that the same worker
    speculates into.
 
@@ -1644,20 +1651,142 @@ and evict other requests. Without a declaration, the same situation raises a
 Returning ``None`` means that the submodule manages its own resources. This is the legacy
 path, kept for submodules that have not been migrated.
 
-A walk named in ``resident_walks()`` runs its captured steps off per-request tables on the
-device instead of a plan rebuilt per step (``mstar/engine/resources/resident.py``). The
-walk must declare, for each resource, one stream that takes one token per row, or one
-it only reads at span 0 (a cross-attention context), with no forks, retention or sink,
-and its ``preprocess`` must read no planned position or KV location, because the
-captured graph fills those in first. Each KV pool of the node keeps its own block table
-and lengths; positions read the pool their ``PositionConfig.kv_cache`` names. Capture raises on a declaration that breaks this. The engine
-turns it on only if every resource of the node can (``Resource.resident_refusal``) and
-the deployment left ``knobs: resident_planning`` at ``auto``; the worker log says why
-otherwise. Steps of other walks, and eager steps, keep the host plan and leave the row
+With ``knobs: resident_planning: on`` in the serving config (or the default, ``auto``,
+for a submodule that sets ``resident_by_default = True``), a walk that runs a node
+inside a ``Loop`` runs its captured steps off per-request tables on the device instead of
+a plan rebuilt per step (``mstar/engine/resources/resident.py``), with nothing for the
+model to declare. The engine decides at load, before capture, from
+what each owner already says: the walk has a batched capture; the step its widest capture
+declares has, for each resource, one stream that takes one token per row, or one it only
+reads at span 0 (a cross-attention context), with no forks, retention or sink; every
+resource resolves ``Resource.resident_binding()`` and its binding accepts the streams, and none is shared
+with another node; and its captured ``preprocess`` reads no buffer the graph fills (an
+accessor of one, such as ``RopeManager.pos_ids``, calls ``resident.table_read``). Each KV
+pool of the node keeps its own block table and lengths; positions read the pool their
+``PositionConfig.kv_cache`` names. The worker logs one line per Loop walk saying, for each
+capability, ``on``, ``off: not asked for`` or ``off: <owner>: <reason>``. A resident ``preprocess`` that reads such a buffer on a branch the capture
+didn't take fails the step's rows, and so does a row that declares other streams than its walk's
+capture: the tables advance every row on the walk's streams. Steps of other walks, and eager steps, keep the host plan and leave the row
 stale, so the first resident step after them writes it. The sampler takes part on its
-own: its per-request scalars (temperature, top-k, top-p, seed, penalties) become cells
-of the row, so a resident step stages none of them, while the RNG offset, the last token
-and the repetition-penalty mask stay by the sampler's own row of each request.
+own: its per-request scalars (temperature, top-k, top-p, seed, penalties) and its owner
+row id become cells of the row. Each replay gathers that identity before reading and
+writing the owner's RNG offset, generation history and packed token presence. With
+``sampler_ingraph_scatter: false``, the sampler uses ordinary host planning while other
+resources may still use resident tables.
+
+A resource resolves one ``ResidentBinding`` before the planner allocates tables.
+Its required operations cover stream validation, table binding, row initialization,
+staging, gather, in-graph commit, host mirror advance, horizon validation, repeat
+capacity and actual-count rewind. No operation inherits permission from a no-op
+resource hook. Stateless operations explicitly use ``no_resident_effect``. The
+planner filters walks through the binding's pure ``check_streams`` before calling
+``bind`` once. Ordinary admit, commit and rollback remain the resource lifecycle.
+
+Joining a running capture additionally calls every binding's ``check_horizon``
+before any owner reserves. The whole two-window horizon must fit; it never silently
+narrows. This check rejects irreversible provisional effects (such as recurrent
+prefix snapshots) and capture addresses fixed to the old membership. Each receipt
+settles through the same binding's ``rewind_run``. The worker must retain the
+request's allocations and prevent movement until their actual readers finish;
+resident table pins and publication descriptor credits alone do not retain them.
+Prepared-input owners without stable captured windows and attention backends with
+host-fixed page addressing refuse joining even when they support ordinary resident
+steps. A model adds no methods for this contract.
+
+A resident step can also stand for several iterations of its Loop (``step_repeats``
+per node in the serving config): the host plans once and the capture replays, each loop-back
+signal carried from one replay to the next by copying the output it left into the static input
+it feeds (``NodeSubmodule.repeat_carry``: both named as the signal by default, or as
+``NodeSubmodule.REPEAT_CARRIES`` declares; a ``DeviceLoopback`` token goes from its stop
+buffer to its input). A run skips ``preprocess``
+between replays, so at load the engine feeds each carried signal a probe value through the
+capture template's ``preprocess`` and refuses a walk that changes it on the way. Whether
+a walk may repeat is settled once, after capture, and the worker logs it per walk with the
+reason when it can't: the walk must be resident, or planned on the host with a step that
+keeps nothing (a ``KVStep(commit=False)`` and positions that don't advance, as an action
+loop's denoise over a fixed prefix: its one plan serves every replay); its stop must be
+the runtime's (a token stop, or the loop's cap); under TP every rank runs its leader's
+count, which each rank's resources narrow alike (a follower that settles otherwise stops);
+and each of its node's edges in the Loop (``mstar.graph.base.loop_edges``: constant, loop-back,
+per-iteration or terminal) must be one a run serves, and every resource of the node must answer
+``Resource.repeat_refusal(walk, host_step)`` with None (``host_step``: its part of a
+host-planned walk's step). The default refuses, so a resource takes part only
+once it says how far its capture advances itself. ``Resource.ask_repeats(walk)`` tells it
+before capture that the config asks, so it can build what serves that, and
+``Resource.repeat_note(walk)`` says on the walk's line what that changed. At admit each resource can narrow a
+step with ``Resource.max_repeats``, for what only that step decides (free pages, a row's
+log-probs), and the step runs the smallest answer. For a parallel node the leader settles this
+count after its predecessor commits and before broadcasting the step. Every rank
+validates that count before admission; a rank that cannot honor it exits before
+forward rather than launching fewer collectives. This is a local fail-fast check,
+not an all-rank preflight barrier. Whatever it counts per step (stored lengths, positions,
+recurrent token counts) it counts with ``StepContext.run_span``, not the declared
+``span``. A run on the device can end short of what it counted: ``Resource.rewind_run(step,
+ctx, replays, rows)`` takes the ``replays`` it didn't run back, for ``rows`` only, the step's rows
+still the requests it counted for. What a replay reads that its capture doesn't advance moves in
+``Resource.replay_columns``, before each replay; in a capture that is a WHILE run's body, where no
+host stands between iterations, ``ResidentBinding.run_gather`` does that work in the graph. Each per-iteration output of the node in its
+Loop (a client, streaming or accumulated edge) keeps a column per replay, which must be
+a row output of the capture; at STORE each row routes the iterations its stop kept, one
+item each, less an EOS iteration's item of a withheld output. A step that emits a count of
+items per row per replay (``EMITTED_COUNT`` in its ``check_stop_buffers``) holds them along
+dim 1 of each such output, and each row routes that many.
+
+Opting into repeats is a resource's promise to honor all three obligations:
+bound a finite capacity with ``max_repeats``, undo unexecuted committed work with
+``rewind_run``, and supply changing inputs through ``replay_columns`` or the
+capture itself. The default hooks are sufficient only where the corresponding
+obligation is empty, as for a read-only or stateless resource; overriding every
+hook with a no-op would not establish correctness.
+
+For a device-ended run, the successor may already be planned for the predecessor's
+full reserved count when that predecessor stops early. Every state-dependent read
+in the successor must therefore derive from the state actually reached on the
+device. Host-prepared columns indexed from a predicted full count do not satisfy
+this contract. Refuse device execution until the input owner can supply the actual
+cursor, and test an early end after the successor has already been planned.
+
+A static input that differs each iteration of the node's Loop is declared rather than
+cut in ``prepare_inputs``: ``ITERATION_INPUTS = {name: IterationInput(source, offset, pad,
+shape, capture_fill, dtype)}``, where ``source`` names a ``[T, ...]`` table in the row's
+request state and iteration ``k`` reads ``table[k + offset]`` (past the end, ``pad``: a
+value, or the name of a request-state row). The engine stages each after ``preprocess``,
+for every walk, as ``[B, *shape]`` (a padding row at ``capture_fill``, with no state made
+for it), and a step that repeats reads a column per replay, so a run of N reads iterations
+k to k+N-1. ``prepare_inputs`` and ``preprocess`` then never read the loop counter for it,
+and a step that repeats may not read the counter at all: the engine watches
+``dynamic_loop_iter_counts`` there, refuses a walk whose captured ``preprocess`` reads it at
+load, and fails the step's rows if a repeating step's ``prepare_inputs`` or ``preprocess`` does.
+An input streamed in an item an iteration (a one-item chunk policy) is declared the same
+way with ``streamed=True``: its table is the row's items of that stream for the step, a
+window of as many ready items as the step repeats, and the stream answers how far a run
+may go (the fewest items any row has). Items of a window that a step's resources cut short
+go back to the stream ahead of anything newer on host-launched runs.
+
+A device-ended run reads an immutable input window using its actual Loop position in
+``LoopbackRows``. A queued successor's input window covers both the predecessor's possible
+executions and its own bound; its output columns cover only its own bound. Entry identity
+includes request generation, graph pass and ancestor Loop positions, so a new entry resets
+progress only when it executes. A stopped entry remains inactive in an already queued
+successor, before any resource gathers or writes. A successor without a usable resident
+run capture is rebuilt after the predecessor settles instead of using projected inputs.
+
+Streamed inputs of these runs require ``FixedChunkPolicy(1)`` with continuation enabled in
+every served consumer walk. ``StreamBuffer`` retains at most two overlapping snapshots;
+admission narrows each reader's bound and completion retires only that row's actual count.
+Source ownership and the graph reader's references retire independently. A skipped reader
+keeps its original snapshot if it retries; removed rows release theirs without consuming
+input. Empty-tail position belongs to the stream snapshot, so a model keeps its pad table
+unchanged: the first tail iteration reads its first row, then later rows, repeating the last.
+No model-specific EOS-tail counter is needed. Non-continuing final-chunk flushes, prefix
+chains, ``past_cap``, shared captures for different walks, and multi-rank device runs are
+refused for this path.
+
+On the producer side a run sends a row's items of a per-iteration streaming output together:
+each is an item of its own, never the pieces ``Connection.join_dim`` joins (those come from a
+Loop's ``accumulated_outputs``); a run stops short of the iteration whose items a
+``Connection.consumer_walk`` hook would send to another walk; and a spanned per-iteration
+output (``spanned_outputs``) holds a span a replay, each item cut to its own.
 
 A ``SubmoduleStep`` contains a list of ``Segment`` objects and one ``ResourceStep`` per
 resource key:
@@ -1679,11 +1808,13 @@ resource key:
 - ``PositionStep(pos_ids=, advance=)``. With ``pos_ids=None``, positions are derived from
   the stream counters. Pass explicit ids, keyed by plan label, when the model computes
   positions itself.
-- ``SamplerStep(apply_penalty=, prefill_tracked_tokens=, loopback_writes=)``.
+- ``SamplerStep(apply_penalty=, prefill_tracked_tokens=)``.
   ``prefill_tracked_tokens`` initializes the repetition-penalty mask with the prompt
   tokens. Only the prefill step passes them, because the sampler tracks every token it
-  samples afterwards. ``loopback_writes`` names the declared loop-back states this step's
-  forward stores (see `Device loop-back`_).
+  samples afterwards. Prompt tracking respects ``penalize_prompt``. Generated-token
+  presence is recorded only for kept draws of steps with ``apply_penalty=True``,
+  including when the current penalty multiplier is 1; later settings therefore
+  read the same accumulated state on eager and captured paths.
 
 The Orpheus declaration is the simplest form. It uses one label, computes spans directly
 from the prepared inputs, and steps all four resources together:
@@ -1829,42 +1960,35 @@ inductor specialize on that integer. The frame is then retraced once per layer.
 
 **Device loop-back.** A decode loop normally routes its sampled token back to itself as a
 tensor per request. An AR node that sets ``self.device_loopback = DeviceLoopback(walk,
-signal, sampler, buffer)`` instead reads each row's last sampled token off the sampler on
-the device (``MSTAR_DEVICE_LOOPBACK``): the base class's ``device_loopback_signals`` names
-the signal, so the worker routes it without a tensor and sends the client's copy inline,
-``prepare_inputs`` returns ``self.uniform_row_inputs(...)`` for such a row, and
-``preprocess`` reads the tokens with ``self.loopback_inputs(engine_inputs, inputs)``. A
-row whose last step did not keep its value on the device (its first decode step, after
-the prefill) still brings it routed, and that read puts it over the slot's. Qwen3.5,
-Higgs Audio, Qwen3-ASR and Whisper declare it.
+signal, buffer)`` instead keeps each request's last token on the device, in the node's
+loop-back rows (``mstar.engine.resources.loopback_rows``, a resource the engine declares;
+``MSTAR_DEVICE_LOOPBACK``): each capture reads the rows at its head and writes the token from
+its stop buffer ``buffer`` at its tail, inside the graph, through a device row of table
+indices (the planner's on a resident step, staged by ``plan`` on a host-planned one), so a
+replay needs nothing from the host. The worker routes the signal without a tensor and sends
+the client's copy inline, ``prepare_inputs`` returns ``self.uniform_row_inputs(...)`` for such
+a row, and ``preprocess`` calls ``self.loopback_inputs(engine_inputs, inputs)``. A row whose
+last step did not keep its value there (its first decode step, after the prefill) brings it
+routed, which goes into the row first. A request takes a row at admission; the tables never
+grow, ``knobs: sampler_slots`` rows at most. Qwen3.5, Higgs Audio, Qwen3-ASR, Qwen3-Omni, Orpheus and
+Whisper declare it. Only a captured node keeps the rows.
 
-On such a node a captured step writes each row's token and RNG offset back to the request's
-row inside the graph (``knobs: sampler_ingraph_scatter``, on by default). Those rows are
-allocated once, ``knobs: sampler_slots`` of them, so a request takes its row when the runner
-admits it and waits while none is free, as it does for a recurrent state slot. A row the
-step drops (``SamplerStep(kept_rids=...)``) writes the trash row, so it keeps its offset.
+A captured sampler writes each row's RNG offset back to the request's row inside the graph
+(``knobs: sampler_ingraph_scatter``, on by default). Those rows are allocated once,
+``knobs: sampler_slots`` of them, so a request takes its row when the runner admits it and
+waits while none is free, as it does for a recurrent state slot. A row the step drops
+(``SamplerStep(kept_rids=...)``) writes the trash row, so it keeps its offset.
 
 State that a decode loop carries from step to step beside the token, such as Whisper's
-timestamp rule state, is declared on the sampler, not kept in the model (Whisper adds its
-signal to ``device_loopback_signals`` and passes its name to ``loopback_inputs``):
+timestamp rule state, is named in ``DeviceLoopback(states=...)``: a row output of the same
+name, kept in the rows beside the token and read back by ``loopback_inputs``. A row that
+first reads it brings it routed, as it does its token.
 
-.. code-block:: python
-
-   SamplerSpec(
-       resource_key=SAMPLER, nodes={"decoder"}, vocab_size=vocab,
-       loopback_state={"ts_rules": LoopbackState(
-           width=4, dtype=torch.long, default=tuple(inactive_state()),
-       )},
-   )
-
-The sampler keeps one row per request by slot, grows it with its other per-request
-buffers, and resets a row to ``default`` when its slot is given to a new request. A step
-reads the rows with ``sampler.loopback_state(name, request_ids)`` in ``preprocess`` and
-stores the next ones from the forward with ``sampler.store_loopback_state(name,
-request_ids, values)``. Under a CUDA-graph slot the store is captured into a per-step
-buffer and commit persists it, so the step must list the name in
-``SamplerStep(loopback_writes=...)``. An eager step writes the rows by request. Both paths
-address rows the same way, and the model never sees a slot index.
+A node whose config asks for resident planning or step repeats also keeps its other
+fixed-shape loop-back signals in the rows (the line ``rows on``): a row whose last step
+kept them gets its row as the routed input would be. A signal whose shape changes with the
+capture bucket, a walk with no capture, or a walk on more than one rank says why it can't
+(``rows off: ...``).
 
 .. warning::
 
@@ -1973,23 +2097,27 @@ other walk of the combined walk must be one token per row.
 
 **Steps beside the chain.** A worker's main loop runs one chain of steps (lane 0), and any
 step on it costs a pass of the loop and holds the next one behind its kernels. A node that
-shares a worker with a heavier one can run on another lane instead: a deployment sets
-``lane: <id>`` on the node's group (see :doc:`serving`), and the model declares nothing.
+shares a worker with a heavier one can run on another lane instead, or one walk of a node
+(a prompt walk beside its decode): a deployment sets ``lane: <id>`` on the group (see
+:doc:`serving`), and the model declares nothing.
 Such a step neither takes a turn on the chain nor makes it yield, runs on its lane's
 stream, and the windows that come ready while it runs batch into the next one (see
 ``mstar/worker/lanes.py``). The lane's graphs capture on its stream, since graphs captured
 on one stream must not overlap. It suits stream-fed walks that nothing on the chain reads,
 such as a codec's. Where the config asks, ``EngineManager.build`` refuses what a lane can't
 serve, since a step off the chain is neither speculated nor planned ahead and lands between
-two chain steps: a TP or SP node, a worker with nothing left on the chain, a device without
-an accelerator-graph backend (CUDA or XPU), resident walks while resident planning is on,
-and a walk of the node that has other nodes or a loop in it, sits in a combined walk, or
-has output spans or a stop check.
+two chain steps: a walk of a TP or SP node, a worker with nothing left on the chain, a
+device without an accelerator-graph backend (CUDA or XPU), and a lane walk that has a loop
+in it or sits in a combined walk. A chain node before it in its walk (an encoder before
+the decoder) never speculates into it. Each lane stages its host rows (stop
+buffers, output spans) through a ring of its own.
 The engine then gives the lane the resources only its nodes declare, of any kind, and
 refuses one that another lane's node (or another worker's) declares too, that depends on
-another lane's, that keeps a prefix cache, whose state the main thread moves outside the
+another lane's, that keeps a prefix cache, or whose state the main thread moves outside the
 step (``Resource.journals_resident_moves``: eviction, prefix leases, page trails, as the
-paged KV cache's), or that stages host rows (a sampler). The lane admits, plans and commits
+paged KV cache's). A node with a walk on the chain keeps its resources and captures the
+chain's; its lane walk's steps run eager on a slot of their own and wait out the chain's
+plan-ahead (``Engine._beside_chain``). The lane admits, plans and commits
 its resources itself, on its stream, and every call into them from outside the step
 (ingest, readiness, output copies, publishing, teardown) runs on that stream too. Nothing
 fences those calls, made on the main thread, against the lane's admit and plan on the GPU
@@ -2983,9 +3111,9 @@ comes with the scaffold: a subclass of ``UniPCDenoiseLoopSubmodule`` implements
 ``unipc_model_outputs`` and ``unipc_last_sample`` and steps each row by the loop counter
 from its own tables, with no host read, so rows at different steps share a forward
 (wan22 is the example). A scheduler needing another per-step
-scalar adds a ``STEP_SCALARS`` entry naming the attribute of its ``FlowMatchSchedule``
-to slice it from — the base stages that tensor on the device and slices it per step, so
-nothing in the batching path has to change.
+scalar adds an ``ITERATION_INPUTS`` entry naming the attribute of its ``FlowMatchSchedule``
+to read it from — the base stages that tensor in the request's state, and the engine cuts
+each row's value per step, so nothing in the batching path has to change.
 
 A model whose ``seed_loop_back`` depends on nothing but the bucket key and the request's
 seed sets ``PREFETCH_SEEDS = True`` (klein and Z-Image do): the base then draws the noise

@@ -52,12 +52,10 @@ class VJEPA2PredictorEmbeddings(nn.Module):
         mask_index = mask_index % self.num_mask_tokens
         target = self.mask_tokens[mask_index]
 
-        # Max patch id in the target mask determines how many mask tokens to
-        # materialize before gather.  (Enables running predictor with more
-        # tokens than the config's frames_per_clip suggests.)
-        max_patch_num = target_mask[0].max() + 1
-        target = target.repeat(B, max_patch_num, 1)
-        target = apply_masks(target, target_mask)
+        # Every target position takes the same mask token, so this is the
+        # reference's repeat-then-gather without sizing a tensor by a mask's
+        # largest index, which a captured graph can't read back.
+        target = torch.cat([target.expand(B, mask.shape[-1], -1) for mask in target_mask], dim=0)
 
         context = context.repeat(len(context_mask), 1, 1)
         embeddings = torch.cat([context, target], dim=1)

@@ -84,6 +84,14 @@ def _argmax_draw(monkeypatch):
     monkeypatch.setattr(utils, "sample_accelerator_graphable_gpu", lambda logits, *a, **kw: logits.argmax(-1))
 
 
+def _ingest(res: SamplerResource, rid: int, cfg: SamplingReqConfig) -> None:
+    """As the runner admits a request: with the in-graph scatter, its sampler
+    row is taken at admission."""
+    res.ingest_request(rid, cfg)
+    if res._cg_buffers is not None and res._cg_buffers.ingraph_scatter:
+        assert res.reserve(rid, "n", "decode", None) is None
+
+
 def _resource(graph: bool = False, enable: bool = True) -> SamplerResource:
     res = SamplerResource(
         vocab_size=None, enable_repetion_penalty=False, device=torch.device("cpu"),
@@ -112,9 +120,9 @@ def _expected(logits, temperature):
 
 def test_the_eager_sampler_scores_the_rows_that_asked():
     res = _resource()
-    res.ingest_request(0, SamplingReqConfig(temperature=0.7, return_logprobs=True))
-    res.ingest_request(1, SamplingReqConfig(temperature=0.7))
-    res.ingest_request(2, SamplingReqConfig(temperature=0.0, return_logprobs=True))
+    _ingest(res, 0, SamplingReqConfig(temperature=0.7, return_logprobs=True))
+    _ingest(res, 1, SamplingReqConfig(temperature=0.7))
+    _ingest(res, 2, SamplingReqConfig(temperature=0.0, return_logprobs=True))
     logits = _logits()
 
     rows = _step(res, [0, 1, 2], logits)[SAMPLED_LOGPROB]
@@ -129,9 +137,9 @@ def test_no_rows_reach_the_host_unless_a_request_asked(graph):
     res = _resource(graph=graph)
     padded_bs = 4 if graph else None
     logits = _logits()[:1].expand(4 if graph else 1, -1)
-    res.ingest_request(0, SamplingReqConfig(temperature=1.0))
+    _ingest(res, 0, SamplingReqConfig(temperature=1.0))
     assert _step(res, [0], logits, padded_bs=padded_bs) == {}
-    res.ingest_request(1, SamplingReqConfig(temperature=1.0, return_logprobs=True))
+    _ingest(res, 1, SamplingReqConfig(temperature=1.0, return_logprobs=True))
     rows = _step(res, [0], logits, padded_bs=padded_bs)
     if graph:
         # a resident request asked, none of the step's rows: all NaN
@@ -145,14 +153,14 @@ def test_no_rows_reach_the_host_unless_a_request_asked(graph):
 def test_a_node_without_the_capability_refuses_at_ingest():
     res = _resource(enable=False)
     with pytest.raises(ValueError, match="enable_logprobs=False"):
-        res.ingest_request(0, SamplingReqConfig(return_logprobs=True))
+        _ingest(res, 0, SamplingReqConfig(return_logprobs=True))
     assert 0 not in res._sampler._sampling_config
 
 
 def test_the_graph_sampler_writes_a_row_per_padded_slot_row():
     res = _resource(graph=True)
-    res.ingest_request(0, SamplingReqConfig(temperature=0.5, return_logprobs=True))
-    res.ingest_request(1, SamplingReqConfig(temperature=0.5))
+    _ingest(res, 0, SamplingReqConfig(temperature=0.5, return_logprobs=True))
+    _ingest(res, 1, SamplingReqConfig(temperature=0.5))
     logits = torch.cat([_logits(), _logits()[:1]])  # the bucket's 4 rows
 
     rows = _step(res, [0, 1], logits, padded_bs=4)[SAMPLED_LOGPROB]
@@ -164,15 +172,15 @@ def test_the_graph_sampler_writes_a_row_per_padded_slot_row():
 
 def test_a_recycled_slot_does_not_inherit_the_previous_requests_flag():
     res = _resource(graph=True)
-    res.ingest_request(0, SamplingReqConfig(temperature=1.0, return_logprobs=True))
-    res.ingest_request(9, SamplingReqConfig(temperature=1.0, return_logprobs=True))
+    _ingest(res, 0, SamplingReqConfig(temperature=1.0, return_logprobs=True))
+    _ingest(res, 9, SamplingReqConfig(temperature=1.0, return_logprobs=True))
     logits = torch.cat([_logits(), _logits()[:1]])
     assert not _step(res, [0], logits, padded_bs=4)[SAMPLED_LOGPROB][0].isnan()
-    slot = res._cg_buffers._rid_to_slot[0]
+    slot = res._cg_buffers.rows._rid_to_slot[0]
     res.remove_request(0)
 
-    res.ingest_request(1, SamplingReqConfig(temperature=1.0))
-    assert res._cg_buffers._rid_to_slot[1] == slot
+    _ingest(res, 1, SamplingReqConfig(temperature=1.0))
+    assert res._cg_buffers.rows._rid_to_slot[1] == slot
     assert _step(res, [1], logits, padded_bs=4)[SAMPLED_LOGPROB][0].isnan()
 
 
@@ -183,7 +191,7 @@ class _Rows:
     def __init__(self, rows):
         self.rows = rows
 
-    def step_host_rows(self):
+    def step_host_rows(self, repeats=1):
         return self.rows
 
 
@@ -193,25 +201,34 @@ def test_resource_rows_join_the_stop_buffers_without_touching_the_models_dict():
     out = BatchedModelOutput(check_stop_buffers=stop)
     mgmt = SimpleNamespace(resources={"kv": _Rows({}), "sampler": _Rows({SAMPLED_LOGPROB: logprobs})})
 
-    Engine._add_resource_host_rows(mgmt, out)
+    Engine._add_resource_host_rows(mgmt, out, 1)
 
     assert out.check_stop_buffers == {"new_token": tokens, SAMPLED_LOGPROB: logprobs}
     assert stop == {"new_token": tokens}
 
 
+def test_a_step_that_repeats_takes_no_rows_from_a_request_that_arrived_after_it_settled():
+    """Log-prob rows would send the step down the store path, which reads one
+    iteration, so every other row of it would lose the rest of its tokens."""
+    res = _resource()
+    _ingest(res, 0, SamplingReqConfig(return_logprobs=True))
+    assert SAMPLED_LOGPROB in _step(res, [0], _logits()[:1])
+    assert SAMPLED_LOGPROB not in res.step_host_rows(2)
+
+
 def test_resource_rows_with_nowhere_to_go_raise():
     rows = _Rows({SAMPLED_LOGPROB: torch.tensor([-0.1])})
     with pytest.raises(RuntimeError, match="no row-addressed stop buffers"):
-        Engine._add_resource_host_rows(SimpleNamespace(resources={"sampler": rows}), BatchedModelOutput())
+        Engine._add_resource_host_rows(SimpleNamespace(resources={"sampler": rows}), BatchedModelOutput(), 1)
     # two resources under one key would keep only the last one's
     out = BatchedModelOutput(check_stop_buffers={"new_token": torch.tensor([1])})
     with pytest.raises(RuntimeError, match="already has"):
-        Engine._add_resource_host_rows(SimpleNamespace(resources={"talker": rows, "code_pred": rows}), out)
+        Engine._add_resource_host_rows(SimpleNamespace(resources={"talker": rows, "code_pred": rows}), out, 1)
 
 
 def test_a_second_sample_in_one_step_raises_while_logprobs_are_on():
     res = _resource()
-    res.ingest_request(0, SamplingReqConfig(return_logprobs=True))
+    _ingest(res, 0, SamplingReqConfig(return_logprobs=True))
     _step(res, [0], _logits()[:1])
     with pytest.raises(RuntimeError, match="one sample"):
         res.sample([0], _logits()[:1])
@@ -221,3 +238,38 @@ def test_a_second_sample_in_one_step_raises_while_logprobs_are_on():
     plain.ingest_request(0, SamplingReqConfig())
     plain.sample([0], _logits()[:1])
     plain.sample([0], _logits()[:1])
+
+
+def test_a_sample_scores_each_rows_stop_ids_greedy_or_not():
+    """``step_repeats: eos_odds`` reads a row's chance of a stop id off the raw
+    logits, so a greedy request has one too; a step that repeats keeps them."""
+    from mstar.engine.resources.sampler.config import STOP_ODDS
+
+    res = _resource(enable=False)
+    res.ask_stop_odds("w", {2, 3})
+    for rid in (0, 1):
+        _ingest(res, rid, SamplingReqConfig(temperature=0.0))
+    logits = torch.tensor([[0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 10.0, -100.0]])
+    assert _step(res, [0, 1], logits)[STOP_ODDS][:2].tolist() == pytest.approx([0.5, 1.0], abs=1e-3)
+
+
+def test_stop_odds_are_only_the_asked_walks_and_an_eager_steps_rows_only_its_own():
+    """A walk that wasn't asked hands over no odds (its forward may hand over no
+    stop buffers), and a replay after a step too wide for the capture reads the
+    capture's rows, not that step's."""
+    from mstar.engine.resources.sampler.config import STOP_ODDS
+
+    res = _resource(graph=True, enable=False)
+    res.ask_stop_odds("w", {2})
+    res._odds = torch.zeros(2)  # the capture's rows: 2
+    for rid in range(3):
+        _ingest(res, rid, SamplingReqConfig(temperature=0.0))
+    wide = torch.tensor([[0.0, 0.0, 10.0, -100.0]] * 3)
+    assert _step(res, [0, 1, 2], wide)[STOP_ODDS].tolist() == pytest.approx([1.0] * 3, abs=1e-3)
+    # a replay: plan only, the graph wrote the capture's rows
+    res.plan(SamplerStep(apply_penalty=False), StepContext(request_ids=(0,), graph_walk="w", slot=0, capture=False))
+    assert res.step_host_rows(1)[STOP_ODDS] is res._odds
+    other = StepContext(request_ids=(0,), graph_walk="prefill", slot=0, capture=False)
+    res.plan(SamplerStep(apply_penalty=False), other)
+    res.sample([0], wide[:1])
+    assert STOP_ODDS not in res.step_host_rows(1)

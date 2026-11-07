@@ -449,6 +449,7 @@ def test_shipped_config_builds_through_registry_and_engine_manager_without_netwo
         model=model,
         # only offload/reload reach it
         graph_runtime=types.SimpleNamespace(),
+        my_walks=(),
     )
     try:
         assert manager.node_names == {DIT_NODE, VAE_ENCODER_NODE}

@@ -1,253 +1,100 @@
-"""The repetition-penalty gate on ``SamplerResource``.
-
-Does the seen-token bookkeeping actually get skipped when no resident request
-asks for a penalty, and does it come back the moment one does?
-
-What this covers is the *decision*, not the arithmetic: the penalty itself lives
-in a Triton kernel whose ``APPLY_PENALTY`` is a constexpr baked at capture
-(``sampling.fused_temperature_softmax``), so the resource cannot turn it off per
-step and does not try to. It suppresses only the off-graph mask traffic — bs x
-[vocab] staging copies, a [bs, vocab] gather, and bs copies back — which is
-inert whenever every resident ``repetition_penalty`` is 1.0. The numerics of the
-kernel itself are covered by ``cudagraph_sampler_test.py`` (GPU).
-
-Runs on CPU; ``mstar.engine.resources.sampler.utils`` imports triton at module scope, so the
-whole module skips where triton isn't installed.
-
-    pytest test/sampling_test/test_penalty_gate.py
-"""
+"""A sampler's presence state survives changes in settings and execution path."""
+from types import SimpleNamespace
 
 import pytest
-
-pytest.importorskip("triton")
-
-import torch  # noqa: E402
+import torch
 
 from mstar.engine.resources import BucketKey, SamplerStep, SamplingReqConfig, SlotLease, StepContext
+from mstar.engine.resources.base import CachedPrefix
+from mstar.engine.resources.sampler import utils
 from mstar.engine.resources.sampler.resource import SamplerResource
-
-VOCAB = 64
-
-
-class _RecordingSampler:
-    """Stands in for the CudaGraphableSampler a plan hands back."""
-
-    def __init__(self):
-        self.synced = 0
-        self.sampled_with: list[bool] = []
-
-    def sync_seen_token_masks(self, seen_masks, keep=None):
-        self.synced += 1
-
-    def sample(self, request_ids, logits, apply_penalty=False, apply_filters=True):
-        self.sampled_with.append(apply_penalty)
-        return torch.zeros(len(request_ids), dtype=torch.long)
-
-
-class _RecordingBuffers:
-    """Stands in for SamplerBuffers, recording just what the gate controls."""
-
-    ingraph_scatter = False
-
-    def __init__(self):
-        self.sampler = _RecordingSampler()
-        self.staged = 0
-        self.static_gathers = 0
-        self.offset_scatters = 0
-        # one entry per gather_dynamic call: was the mask gathered?
-        self.gathered_seen: list[bool] = []
-
-    def gather_static(self, request_ids, padded_bs, cg_slot):
-        self.static_gathers += 1
-
-    def stage_seen_token_masks(self, request_ids, seen_masks):
-        self.staged += 1
-
-    def gather_dynamic(self, request_ids, padded_bs, cg_slot, gather_seen_tokens=True, kept=None):
-        self.gathered_seen.append(gather_seen_tokens)
-
-    def sampler_for(self, padded_bs, cg_slot):
-        return self.sampler
-
-    def scatter_offset(self, cg_slot=0, keep=None, index=None):
-        self.offset_scatters += 1
-
-    def keep_mask(self, keep):
-        return None if keep is None else torch.tensor(keep, dtype=torch.bool)
-
-    def register_request(self, rid, sampling_config):
-        pass
-
-    def unregister_request(self, rid):
-        pass
-
-
-def _resource(*, capable: bool = True) -> SamplerResource:
-    res = SamplerResource(
-        vocab_size=VOCAB,
-        enable_repetion_penalty=capable,
-        device=torch.device("cpu"),
-    )
-    # Skip build_cuda_graph_buffers: the real buffers would allocate a
-    # [capacity, VOCAB] mask, and the gate is what's under test, not the copies.
-    res._cg_buffers = _RecordingBuffers()
-    return res
-
-
-def _ctx(rids, *, is_preplan: bool = False) -> StepContext:
-    bucket = BucketKey(graph_walk="decode", bs=len(rids), num_tokens=len(rids))
-    return StepContext(
-        request_ids=tuple(rids),
-        graph_walk="decode",
-        slot=0,
-        capture=False,
-        is_preplan=is_preplan,
-        slot_lease=SlotLease(slot=0, bucket=bucket),
-    )
-
-
-def _drive(res, rids, *, apply_penalty=True, prefill_tokens=None):
-    """One step in `_drive_step`'s order: admit -> plan -> forward -> commit."""
-    step = SamplerStep(
-        apply_penalty=apply_penalty,
-        prefill_tracked_tokens=prefill_tokens or {},
-    )
-    ctx = _ctx(rids)
-    res.admit(step, ctx)
-    res.plan(step, ctx)
-    res.sample(list(rids), torch.zeros(len(rids), VOCAB))
-    res.commit(step, ctx)
-
-
-def _ingest(res, **rid_to_penalty):
-    for rid, penalty in rid_to_penalty.items():
-        res.ingest_request(rid, SamplingReqConfig(repetition_penalty=penalty))
-
-
-# ── the gate ────────────────────────────────────────────────────────────
-
-
-def test_mask_traffic_skipped_when_nobody_asks_for_a_penalty():
-    res = _resource()
-    _ingest(res, a=1.0, b=1.0)
-    assert res._penalty_live is False
-
-    _drive(res, ["a", "b"])
-    buffers = res._cg_buffers
-
-    assert buffers.staged == 0, "staged a mask nothing would read"
-    assert buffers.gathered_seen == [False], "gathered a mask nothing would read"
-    assert buffers.sampler.synced == 0, "synced a mask nothing wrote to"
-    # the offset is per-step state regardless of the penalty
-    assert buffers.static_gathers == 1
-    assert buffers.offset_scatters == 1
-
-
-def test_capability_survives_the_skip():
-    """The kernel variant is baked at capture, so `sample` must keep saying
-    True even on steps where the bookkeeping was skipped."""
-    res = _resource()
-    _ingest(res, a=1.0)
-    _drive(res, ["a"])
-
-    assert res._apply_penalty_this_step is True
-    assert res._penalty_needed_this_step is False
-    assert res._cg_buffers.sampler.sampled_with == [True]
-
-
-def test_mask_traffic_engaged_when_a_request_asks():
-    res = _resource()
-    _ingest(res, a=1.0, b=1.05)
-    assert res._penalty_live is True
-
-    _drive(res, ["a", "b"])
-    buffers = res._cg_buffers
-
-    assert buffers.staged == 1
-    assert buffers.gathered_seen == [True]
-    assert buffers.sampler.synced == 1
-
-
-def test_gate_follows_residency_not_the_batch():
-    """A penalised request anywhere on the resource keeps every mask live, and
-    its departure lets the gate close again."""
-    res = _resource()
-    _ingest(res, a=1.0, b=1.05)
-
-    _drive(res, ["a"])  # batch excludes the penalised request
-    assert res._cg_buffers.gathered_seen == [True]
-
-    res.remove_request("b")
-    assert res._penalty_live is False
-    _drive(res, ["a"])
-    assert res._cg_buffers.gathered_seen == [True, False]
-
-
-def test_step_may_decline_the_penalty():
-    """The Talker's code-predictor declares apply_penalty=False; that must win
-    over residency."""
-    res = _resource()
-    _ingest(res, a=1.05)
-
-    _drive(res, ["a"], apply_penalty=False)
-
-    assert res._apply_penalty_this_step is False
-    assert res._penalty_needed_this_step is False
-    assert res._cg_buffers.staged == 0
-    assert res._cg_buffers.sampler.sampled_with == [False]
-
-
-def test_incapable_spec_never_engages():
-    res = _resource(capable=False)
-    _ingest(res, a=1.05)
-
-    assert res._penalty_live is False
-    _drive(res, ["a"])
-
-    assert res._apply_penalty_this_step is False
-    assert res._cg_buffers.gathered_seen == [False]
-
-
-# ── prompt-token recording ──────────────────────────────────────────────
-
-
-def test_prefill_tokens_recorded_only_while_live():
-    res = _resource()
-    _ingest(res, a=1.0)
-    tokens = torch.tensor([3, 5, 7])
-
-    _drive(res, ["a"], prefill_tokens={"a": tokens})
-    assert not res._sampler.get_token_mask("a")._seen_token_mask.any(), \
-        "recorded prompt tokens into a mask nothing reads"
-
-    _ingest(res, b=1.05)  # now someone reads masks
-    _drive(res, ["a"], prefill_tokens={"a": tokens})
-    assert res._sampler.get_token_mask("a")._seen_token_mask.sum().item() == 3
-
-
-# ── flag lifetime ───────────────────────────────────────────────────────
-
-
-def test_preplan_leaves_the_flags_alone():
-    """The flags are latched on the non-preplan path only, which is why they
-    need no preplan twin the way `_cg_sampler` does."""
-    res = _resource()
-    _ingest(res, a=1.05)
-    _drive(res, ["a"])
-    assert res._penalty_needed_this_step is True
-
-    # a step planned a slot ahead, declaring the opposite
-    res.admit(SamplerStep(apply_penalty=False), _ctx(["a"], is_preplan=True))
-    assert res._apply_penalty_this_step is True
-    assert res._penalty_needed_this_step is True
-
-
-def test_desynced_bookkeeping_trips_the_assert():
-    """`_penalty_rids` going stale (e.g. a mid-request config update that
-    forgets to refresh it) must fail loudly, not silently drop the penalty."""
-    res = _resource()
-    _ingest(res, a=1.05)
-    res._penalty_rids.clear()  # simulate the desync
-
-    with pytest.raises(AssertionError, match="out of sync"):
-        _drive(res, ["a"])
+from mstar.model.submodule_base import ARNodeInputs
+
+
+@pytest.mark.parametrize("ingraph", [False, True])
+@pytest.mark.parametrize("vocab", [33, 65])
+def test_presence_uses_one_owner_across_eager_captured_and_reused_rows(monkeypatch, ingraph, vocab):
+    monkeypatch.setenv("MSTAR_SAMPLER_INGRAPH_SCATTER", "1" if ingraph else "0")
+    monkeypatch.setenv("MSTAR_SAMPLER_SLOTS", "3")
+    observed = []
+
+    def draw(logits, *args, **kwargs):
+        mask = kwargs.get("seen_token_mask", kwargs.get("seen_tokens"))
+        observed.append(None if mask is None else mask.clone())
+        return logits.argmax(-1)
+
+    monkeypatch.setattr(utils, "sample_tokens", draw)
+    monkeypatch.setattr(utils, "sample_accelerator_graphable_gpu", draw)
+    res = SamplerResource(vocab, True, torch.device("cpu"))
+    res.build_accelerator_graph_buffers([SimpleNamespace(slot=0), SimpleNamespace(slot=1)], 3, 1)
+    res.seal_capture_buffers()
+    for rid in (1, 2):
+        res.ingest_request(rid, SamplingReqConfig(penalize_prompt=rid == 1))
+        if ingraph:
+            assert res.reserve(rid, "n", "decode", None) is None
+    owner, bufs = res._rows, res._cg_buffers
+    expected = {rid: torch.zeros(vocab, dtype=torch.bool) for rid in (1, 2)}
+
+    def ctx(rids=(1, 2), slot=None, preplan=False):
+        lease = None if slot is None else SlotLease(slot, BucketKey("decode", 3, 3))
+        return StepContext(tuple(rids), "decode", 0, False, slot_lease=lease, is_preplan=preplan)
+
+    def sample(rids, tokens, *, tracked=True, kept=None, check=False, captured=False):
+        logits = torch.zeros(3 if captured else len(rids), vocab)
+        logits.scatter_(1, torch.tensor([*tokens, *([31] if captured else [])]).unsqueeze(1), 1.)
+        res.sample([*rids, *([-1] if captured else [])], logits)
+        if check:
+            torch.testing.assert_close(observed[-1][:len(rids)], torch.stack([expected[rid] for rid in rids]))
+        if tracked:
+            for rid, token in zip(rids, tokens, strict=True):
+                if kept is None or rid in kept:
+                    expected[rid][token] = True
+
+    # Reset must drain before the first prompt OR. Prefix and prompt overlap
+    # within one signed word and across the word/tail boundaries.
+    prefix = torch.tensor([32, vocab - 1, 32])
+    res.apply_cached_prefix(1, "n", "decode", ARNodeInputs(input_ids=prefix, input_seq_len=3),
+                            CachedPrefix("main", 3, 3))
+    prompt = torch.tensor([0, 31, 31])
+    first = SamplerStep(apply_penalty=False, prefill_tracked_tokens={1: prompt, 2: prompt})
+    res.plan(first, ctx())
+    master = owner.seen_words
+    expected[1][torch.cat((prefix, prompt))] = True
+    sample((1, 2), (2, 2), tracked=False)
+    res.commit(first, ctx())
+    torch.testing.assert_close(owner.read_seen(owner.indices((1, 2))), torch.stack(list(expected.values())))
+
+    # Inert parameters still retain kept draws for a later enabled penalty.
+    res.plan(SamplerStep(), ctx())
+    sample((1, 2), (1, 31))
+    res.commit(SamplerStep(), ctx())
+    for rid in (1, 2):
+        res._sampler.set_config(rid, repetition_penalty=1.3)
+        bufs.update_request_config(rid, res._sampler._sampling_config[rid])
+    current, successor = ctx((2, 1), 0), ctx(slot=1)
+    res.plan(SamplerStep(), current)
+    res.plan(SamplerStep(), ctx(slot=1, preplan=True))
+    sample((2, 1), (0, 5), check=True, captured=True)
+    sample((2, 1), (32, vocab - 1), check=True, captured=True)
+    res.commit(SamplerStep(), current)
+    dropped = SamplerStep(kept_rids=frozenset({1}))
+    res.plan(dropped, successor)
+    sample((1, 2), (6, 7), kept={1}, check=True, captured=True)
+    res.commit(dropped, successor)
+    res.plan(SamplerStep(), ctx())
+    sample((1, 2), (31, vocab - 1), check=True)
+    res.commit(SamplerStep(), ctx())
+    torch.testing.assert_close(owner.read_seen(owner.indices((1, 2))), torch.stack(list(expected.values())))
+    assert bufs.sampler_for(3, 0).seen_tokens_buf.data_ptr() != bufs.sampler_for(3, 1).seen_tokens_buf.data_ptr()
+
+    old_row = owner.slot_of(1)
+    res.remove_request(1)
+    res.ingest_request(3, SamplingReqConfig(repetition_penalty=1.3))
+    if ingraph:
+        assert res.reserve(3, "n", "decode", None) is None
+    assert owner.slot_of(3) == old_row
+    res.plan(SamplerStep(prefill_tracked_tokens={3: torch.tensor([31, 31])}), ctx((3, 2), 0))
+    reused = owner.read_seen(owner.indices((3, 2)))
+    assert reused[0].nonzero().flatten().tolist() == [31]
+    torch.testing.assert_close(reused[1], expected[2])
+    assert owner.seen_words is master

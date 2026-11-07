@@ -209,6 +209,14 @@ class FIFOBatchBuilder(BaseBatchBuilder):
 
     def pick(self, candidates: StepCandidates) -> StepPick:
         c = candidates
+        if c.continuing and not c.backlog and not c.queued and c.capture_group is None:
+            # a chain with nobody waiting is one walk's rows: nothing to compose
+            cap = c.walk_caps.get(c.own_walk)
+            if cap is None or len(c.continuing) <= cap:
+                return StepPick(
+                    taken=list(c.continuing), continuing=list(c.continuing),
+                    room=None if cap is None else len(c.continuing), held_back=set(), ordered=False,
+                )
         chain = set(c.continuing)
         rows = [*c.backlog, *c.continuing, *c.queued]
         ordered = not _all_fit(rows, chain, c)

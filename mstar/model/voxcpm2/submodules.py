@@ -225,6 +225,7 @@ class TalkerSubmodule(ARNodeSubmodule):
     batching and graph replay leave it alone.
     """
 
+
     disable_torch_compile = True
     disable_autocast = True
     MAX_BATCH_SIZE = 32

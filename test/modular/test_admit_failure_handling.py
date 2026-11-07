@@ -39,7 +39,7 @@ from mstar.engine.resources import (
     StepContext,
     SubmoduleStep,
 )
-from mstar.model.submodule_base import NodeSubmodule, StepOrder
+from mstar.model.submodule_base import BatchedModelOutput, NodeSubmodule, StepOrder
 from mstar.utils.device import DeviceCapability
 from mstar.worker import worker as worker_mod
 from mstar.worker.micro_scheduler import ScheduledBatch
@@ -61,19 +61,20 @@ def _offloading(rid: str = "r0") -> RequestOffloading:
 # --- engine: the tail must not run over a step that never ran --------------
 
 
-class _FakeEngine:
+class _FakeEngine(Engine):
     """Just enough engine to exercise the ``exec``/``postprocess`` branch."""
 
-    exec_and_postprocess = Engine.exec_and_postprocess
+    _stage_lock = None  # no lanes
 
     def __init__(self, admit_error):
         self._admit_error = admit_error
         self.postprocessed = False
+        self._submodules = {"node": SimpleNamespace(device_stops={})}
 
     def exec(self, batch):
         batch.admit_error = self._admit_error
         # what `_exec_single` returns when admit refused the step
-        return {rid: {} for rid in batch.request_ids}
+        return BatchedModelOutput(per_rid_outputs={rid: {} for rid in batch.request_ids})
 
     def postprocess_batch(self, batch, outputs):
         del batch, outputs
@@ -81,7 +82,8 @@ class _FakeEngine:
 
 
 def _batch():
-    return SimpleNamespace(request_ids=["r0", "r1"], admit_error=None, cached_rids=set(), rows_only=False)
+    return SimpleNamespace(node_name="node", request_ids=["r0", "r1"], admit_error=None,
+                           cached_rids=set(), rows_only=False, run_started=None)
 
 
 @pytest.mark.parametrize(
@@ -144,7 +146,7 @@ def _batches(reason, prepared=("r0", "r1"), cached=()):
         request_to_worker_graph={"r0": "wg", "r1": "wg"},
     )
     node_batch = SimpleNamespace(
-        node_name="node", admit_error=reason, request_ids=list(prepared), cached_rids=set(cached),
+        node_name="node", admit_error=reason, request_ids=list(prepared), cached_rids=set(cached), stream_windows={},
     )
     return batch, node_batch
 
@@ -229,9 +231,11 @@ class _HoldingWorker:
     def _apply_pending_removes_safe_to_drop(self, in_flight_rids):
         del in_flight_rids
 
-    def _try_offload_cold_request(self, node_name, graph_walk, batch_ids, affected_resources=None, inside_only=False):
+    def _try_offload_cold_request(
+        self, node_name, graph_walk, batch_ids, affected_resources=None, inside_only=False, referenced_rids=frozenset(),
+    ):
         # no victim
-        del node_name, graph_walk, batch_ids, affected_resources, inside_only
+        del node_name, graph_walk, batch_ids, affected_resources, inside_only, referenced_rids
 
 
 def _hold(worker, monkeypatch, at: float, walk: str = "walk") -> None:
@@ -620,6 +624,28 @@ def test_a_row_inside_the_batch_goes_only_when_none_is_outside_it_under_turns():
     assert worker._try_offload_cold_request(SCHED_NODE, SCHED_WALK, {"r0", "r1"}) == "r1"
 
 
+@pytest.mark.parametrize("protected", [frozenset(), frozenset({"r1"}), frozenset({"r0", "r1"})])
+def test_oom_preserves_actual_readers_but_can_evict_a_refused_steps_own_rows(protected):
+    worker = _EvictingWorker(["outside", "r0", "r1"])
+    worker.scheduler.could_refill = _NO_LIMITS["could_refill"]
+    batch, node_batch = _batches(_sized_refusal("r1", rows_fit=1, rows_fit_alone=1))
+    node_batch.failed_resource = "kv"
+    batch.node_name = node_batch.node_name = SCHED_NODE
+    # The refused receipt retains these only for teardown; r1 can also have
+    # a real reader on another lane or in the already submitted successor.
+    worker._in_flight_rids = {"r0", "r1"}
+    worker._handle_allocation_failure(batch, node_batch, referenced_rids=protected)
+    assert worker.offloaded == ([] if len(protected) == 2 else ["r0" if protected else "r1"])
+
+
+def test_a_successor_reader_outside_the_refused_batch_cannot_be_offloaded():
+    worker = _EvictingWorker(["cold", "live"], _scheduler(_SchedEngine(order=StepOrder.TURNS)))
+    assert worker._try_offload_cold_request(
+        SCHED_NODE, SCHED_WALK, {"other"}, referenced_rids=frozenset({"live"}),
+    ) == "cold"
+    assert worker._try_offload_cold_request(SCHED_NODE, SCHED_WALK, {"other"}) == "live"
+
+
 def test_a_step_of_one_walk_lifts_its_combined_walks_limit():
     """A mixed batch limited to one row: every step under it holds one walk
     and carries that walk's label. The first of them to admit has to lift
@@ -720,11 +746,8 @@ class _FakeMgmt:
             raise RuntimeError("slot setup failed")
 
 
-class _FakeExecEngine:
+class _FakeExecEngine(Engine):
     """Engine internals bound onto stubs, to drive `_exec_per_request` alone."""
-
-    _exec_per_request = Engine._exec_per_request
-    _declare_and_admit = Engine._declare_and_admit
 
     def __init__(
         self, fail_on: str | None = None, num_slots: int = 1, next_slot: int = 0,
@@ -742,7 +765,7 @@ class _FakeExecEngine:
         self.launch_signals: list[str] = []
         self._runner = self
         self._device = torch.device("cpu")
-        self.device_capability = DeviceCapability.of(self._device)
+        self._device_capability = DeviceCapability.of(self._device)
         # the per-request path's slots; no fence, so no CUDA event is recorded
         self.piecewise_slots: list[int] = []
         self.run_slots: list[int] = []
@@ -995,7 +1018,7 @@ class _LoggedEvent(threading.Event):
 def _fenced(monkeypatch, **kwargs) -> _FakeExecEngine:
     engine = _FakeExecEngine(**kwargs)
     engine.mgmt.needs_slot_fence = True
-    engine.device_capability = SimpleNamespace(
+    engine._device_capability = SimpleNamespace(
         is_accelerator=True, is_capturing=lambda: False,
     )
     monkeypatch.setattr(torch, "Event", lambda device=None: _FakeEvent(engine))
@@ -1061,7 +1084,7 @@ def test_postprocess_skips_a_rid_whose_forward_raised():
     batch = _exec_batch(["a", "b"])
     batch.register_failure("b", ValueError("forward failed for b"))
 
-    Engine._postprocess_batch(engine, batch, {"a": {"token": 1}, "b": {}})
+    Engine._postprocess_batch(engine, batch, BatchedModelOutput(per_rid_outputs={"a": {"token": 1}, "b": {}}))
 
     assert submodule.postprocessed == ["a"]
     assert batch.failed_requests == {"b": "ValueError: forward failed for b"}

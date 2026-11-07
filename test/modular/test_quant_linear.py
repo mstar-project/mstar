@@ -14,6 +14,7 @@ import torch
 from torch import nn
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
+from mstar.engine.resources.iteration_tables import IterationTables
 from mstar.model.components import quant_linear
 from mstar.model.components.block_scaled import MXFP8, NVFP4, Mxfp8Format, Nvfp4Format
 from mstar.model.components.diffusion.denoise_loop import DenoiseLoopSubmodule, StepBucket
@@ -34,7 +35,7 @@ from mstar.model.components.quant_linear import (
 from mstar.model.flux2_klein.components.transformer import QUANTIZABLE_LINEARS, Flux2DiT
 from mstar.model.flux2_klein.config import Flux2KleinConfig, Flux2TransformerConfig
 from mstar.model.flux2_klein.flux2_klein_model import Flux2KleinModel
-from mstar.model.submodule_base import ModelInputsFromEngine
+from mstar.model.submodule_base import ModelInputsFromEngine, iteration_columns
 from mstar.model.z_image.components.transformer import QUANTIZABLE_LINEARS as Z_QUANTIZABLE_LINEARS
 from mstar.model.z_image.components.transformer import ZImageDiT
 from mstar.model.z_image.config import ZImageTransformerConfig
@@ -546,7 +547,9 @@ def test_a_schedule_captures_each_bucket_per_dtype_and_denoise_sees_the_plain_ke
     inputs = [loop.prepare_inputs("gen", _info(0, rid=rid), {}) for rid in (0, 1)]
     assert loop.can_batch(None, inputs)
     engine_inputs = ModelInputsFromEngine(request_ids=[0, 1], per_request_info={})
-    loop.forward_batched("gen", engine_inputs, **loop.preprocess("gen", engine_inputs, inputs))
+    loop.__dict__.setdefault("iteration_tables", IterationTables(torch.device("cpu")))
+    step = {name: column[:, 0] for name, column in iteration_columns(loop, [(0, 0), (1, 0)], 1, "cpu").items()}
+    loop.forward_batched("gen", engine_inputs, **loop.preprocess("gen", engine_inputs, inputs), **step)
     assert loop.seen == [(4, "bf16")]
     later = loop.prepare_inputs("gen", _info(1, rid=2), {"latents": [torch.zeros(4, 2)]})
     assert not loop.can_batch(None, [inputs[0], later])

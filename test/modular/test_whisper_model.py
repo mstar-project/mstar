@@ -394,7 +394,7 @@ def test_decoder_timestamp_rules_ride_along_as_a_staged_row():
     # postprocess keeps the state under its own name for the loop-back edge
     outputs = {"new_token": [torch.tensor([5])], "ts_rules": [routed]}
     sub.postprocess("ts", None, outputs)
-    assert outputs["text_inputs"] is outputs["new_token"] and outputs["ts_rules"] == [routed]
+    assert outputs["text_inputs"][0].tolist() == [5] and outputs["ts_rules"] == [routed]
     # the capture templates carry the same row so the graphs' input sets are fixed
     decode_cfg, prefill_cfg = sub.get_accelerator_graph_configs(torch.device("cpu"))
     assert decode_cfg.single_request_inputs.tensor_inputs["ts_rules"].tolist() == inactive_state()
@@ -433,24 +433,33 @@ def _stop_info(walk, handle, word_timestamps=True, decoded=0, max_tokens=444):
     })()
 
 
+def _land(sub, walk, tokens, **info):
+    """A landed step's tokens, ``{rid: its iterations}``, as ``Engine.record_tokens`` hands them over."""
+    from types import SimpleNamespace
+
+    from mstar.engine.engine import Engine
+
+    rows = {rid: row + [0] * (max(map(len, tokens.values())) - len(row)) for rid, row in tokens.items()}
+    engine = SimpleNamespace(_submodules={"decoder": SimpleNamespace(submodule=sub)})
+    batch = SimpleNamespace(
+        node_name="decoder", per_request_info_wrapped={rid: _stop_info(walk, rid, **info) for rid in tokens},
+    )
+    host_rows = HostRows(tuple(tokens), {"new_token": torch.tensor(list(rows.values()))})
+    Engine.record_tokens(engine, batch, {walk: list(tokens)}, host_rows)
+
+
 def _align_inputs(cfg):
     return {"encoder_states": [torch.zeros(cfg.max_source_positions, cfg.d_model)]}
 
 
 def test_decoder_align_walk_uses_the_detected_language():
     """The detected language and the first token come off the prompt walks'
-    host tokens in the stop check; the align walk reads no device value."""
+    host tokens as they land; the align walk reads no device value."""
     cfg = _tiny_config()
     sub = _decoder_submodule(cfg)
     sub.register_parameter("anchor", torch.nn.Parameter(torch.zeros(1)))
-    for walk, token in ((DETECT_LANGUAGE_WALK, DE), (PREFILL_PROMPT_WALK, 7)):
-        stops = sub.check_stop_batched(
-            ["r"], {"r": _stop_info(walk, 7)}, HostRows(("r",), {"new_token": torch.tensor([token])}),
-        )
-        assert stops == {}
-    sub.check_stop_batched(
-        ["r"], {"r": _stop_info(DECODE_WALK, 7)}, HostRows(("r",), {"new_token": torch.tensor([EOT])}),
-    )
+    for walk, token in ((DETECT_LANGUAGE_WALK, DE), (PREFILL_PROMPT_WALK, 7), (DECODE_WALK, EOT)):
+        _land(sub, walk, {7: [token]})
     # after detection the route leaves the language unset on the align walk
     row = sub.prepare_inputs(ALIGN_WALK, _fwd(7, "r", **_align_meta(language=None)), _align_inputs(cfg))
     assert row.input_ids.tolist() == [SOT, DE, TRANSCRIBE, NOTS, 7, EOT]
@@ -605,79 +614,6 @@ def test_decoder_check_stop_batched_agrees_with_per_request():
     assert batched == per_request == {"eos": {"decode_loop"}}
     # no token buffer: the engine falls back to the per-request path
     assert sub.check_stop_batched(["eos"], infos, HostRows(("eos",), {})) is None
-
-
-def test_engine_stop_check_takes_the_batched_path():
-    """The engine's stop check reaches the batched path rather than falling
-    back to one ``check_stop`` per row."""
-    from types import SimpleNamespace
-
-    from mstar.engine.engine import Engine
-
-    sub = _decoder_submodule(_tiny_config())
-
-    def per_request(*args):
-        raise AssertionError("fell back to the per-request stop check")
-
-    sub.check_stop = per_request
-    sub.request_state(1).add("decoded", [7])  # a word-timestamp request's transcript, from its prompt walk
-    infos = {}
-    for handle, rid in enumerate(("eos", "word")):
-        infos[rid] = type("I", (), {
-            "graph_walk": DECODE_WALK, "max_tokens": 444, "rid_handle": handle,
-            "resource_configs": {"sampler": type("C", (), {"ignore_eos": False})()},
-            "dynamic_loop_iter_counts": {"decode_loop": 0},
-        })()
-    failures = {}
-    batch = SimpleNamespace(
-        node_name="decoder", request_ids=["eos", "word"], per_request_info_wrapped=infos,
-        register_failure=failures.setdefault,
-    )
-    engine = SimpleNamespace(_submodules={"decoder": SimpleNamespace(submodule=sub)})
-    tokens = torch.tensor([EOT, 1234, 0])  # a padding row past the real ones
-    stops = Engine.check_stop_for_batch(
-        engine, batch, {}, host_rows=HostRows(("eos", "word"), {"new_token": tokens}),
-    )
-    assert stops == {"eos": {"decode_loop"}} and not failures
-    assert sub.request_state(1).get("decoded") == [7, 1234]
-
-
-def test_a_batched_stop_check_that_raises_partway_records_each_token_once():
-    """When the batched stop check raises, the engine re-runs it per request;
-    a row the batched pass already recorded keeps its token once."""
-    from types import SimpleNamespace
-
-    from mstar.engine.engine import Engine
-
-    sub = _decoder_submodule(_tiny_config())
-    infos = {}
-    for handle, (rid, first) in enumerate((("a", 7), ("b", 8))):
-        sub.request_state(handle).add("decoded", [first])
-        infos[rid] = _stop_info(DECODE_WALK, handle)
-
-    class _RaisesOnce(dict):
-        raised = False
-
-        def __getitem__(self, rid):
-            if rid == "b" and not self.raised:
-                self.raised = True
-                raise RuntimeError("lookup failed")
-            return super().__getitem__(rid)
-
-    failures = {}
-    batch = SimpleNamespace(
-        node_name="decoder", request_ids=["a", "b"], per_request_info_wrapped=_RaisesOnce(infos),
-        register_failure=failures.setdefault,
-    )
-    engine = SimpleNamespace(_submodules={"decoder": SimpleNamespace(submodule=sub)})
-    tokens = torch.tensor([1234, 99])
-    outputs = {"a": {"new_token": [tokens[:1]]}, "b": {"new_token": [tokens[1:]]}}
-    stops = Engine.check_stop_for_batch(
-        engine, batch, outputs, host_rows=HostRows(("a", "b"), {"new_token": tokens}),
-    )
-    assert batch.per_request_info_wrapped.raised and stops == {} and not failures
-    assert sub.request_state(0).get("decoded") == [7, 1234]
-    assert sub.request_state(1).get("decoded") == [8, 99]
 
 
 # --------------------------------------------------------------------------
@@ -1056,41 +992,48 @@ def test_only_turbo_turns_pre_plan_off():
 
 
 def test_decode_tokens_are_recorded_for_the_align_walk_until_the_stop():
-    """The decode loop no longer persists its tokens: the stop check records
-    them per request, and nothing past the step that stopped the loop (a
-    speculative step) joins the transcript the align walk teacher-forces."""
+    """The runtime checks the stop, so the tokens reach the transcript the
+    align walk teacher-forces as they land, every iteration of a step that
+    repeats, and nothing past the stop: the rest of the run, or a speculated
+    step. A request without word timestamps records nothing."""
     cfg = _tiny_config()
     sub = _decoder_submodule(cfg)
     sub.register_parameter("anchor", torch.nn.Parameter(torch.zeros(1)))
-    infos = {"r": _stop_info(PREFILL_WALK, 9), "plain": _stop_info(PREFILL_WALK, 10, word_timestamps=False)}
-    # the prefill's token starts the transcript, only for a word-timestamp request
-    sub.check_stop_batched(
-        ["r", "plain"], infos, HostRows(("r", "plain"), {"new_token": torch.tensor([10, 10])}),
-    )
-    for info in infos.values():
-        info.graph_walk = DECODE_WALK
-    for token in (11, 12, EOT, 13):
-        rows = HostRows(("r", "plain"), {"new_token": torch.tensor([token] * 2)})
-        sub.check_stop_batched(["r", "plain"], infos, rows)
-        for info in infos.values():
-            info.dynamic_loop_iter_counts["decode_loop"] += 1
+    assert sub.get_stop_policies(DECODE_WALK), "the runtime checks the stop"
+    assert sub.get_stop_policies(PREFILL_WALK) == {}
+    _land(sub, PREFILL_WALK, {9: [10]})
+    _land(sub, PREFILL_WALK, {10: [10]}, word_timestamps=False)
+    _land(sub, DECODE_WALK, {9: [11, 12], 10: [11, 12]})
+    assert sub.token_rows(DECODE_WALK, [9, 10]) == [9]
+    _land(sub, DECODE_WALK, {9: [EOT, 13], 10: [EOT, 13]})
+    _land(sub, DECODE_WALK, {9: [14, 15], 10: [14, 15]})
     assert sub.request_state(9).get("decoded") == [10, 11, 12, EOT]
     assert sub.request_state(10).get("decoded", None) is None
     row = sub.prepare_inputs(ALIGN_WALK, _fwd(9, **_align_meta()), _align_inputs(cfg))
     assert row.input_ids.tolist() == [SOT, EN, TRANSCRIBE, NOTS, 10, 11, 12, EOT]
 
 
-def test_decode_loopback_contract(monkeypatch):
-    from mstar.model.whisper.config import SAMPLER
-
+def test_decode_loopback_contract():
     cfg = _tiny_config()
     sub = _decoder_submodule(cfg)
     sub.register_parameter("anchor", torch.nn.Parameter(torch.zeros(1)))
-    sub.node_resources = {SAMPLER: type("S", (), {"has_slot_masters": True})()}
-    assert sub.device_loopback_signals(DECODE_WALK) == frozenset({"text_inputs", "ts_rules"})
-    assert sub.device_loopback_signals(PREFILL_WALK) == frozenset()
+    assert sub.device_loopback.walk == DECODE_WALK
+    assert sub.device_loopback.outputs() == {"text_inputs": "new_token", "ts_rules": "ts_rules"}
     assert sub.inline_client_signals(DECODE_WALK) == {"text_inputs": "new_token"}
     row = sub.prepare_inputs(DECODE_WALK, _fwd(1), {}, has_loopback=True)
     assert row.input_ids is None and row.input_seq_len == 1
-    monkeypatch.setenv("MSTAR_DEVICE_LOOPBACK", "0")
-    assert sub.device_loopback_signals(DECODE_WALK) == frozenset()
+    # the rule state rides beside the token: a routed row writes both first
+    from mstar.engine.resources.loopback_rows import LoopbackRows
+
+    kept = LoopbackRows(torch.device("cpu"))
+    for rid in (1, 2):
+        kept.add(rid)
+    kept.write("text_inputs", [1], torch.tensor([10]))
+    kept.write("ts_rules", [1], torch.arange(4).reshape(1, 4))
+    routed = sub.prepare_inputs(DECODE_WALK, _fwd(2), {
+        "text_inputs": [torch.tensor([7])], "ts_rules": [torch.arange(4, 8)],
+    })
+    out = sub.loopback_inputs(ModelInputsFromEngine(request_ids=[1, 2], per_request_info={}, loopback_rows=kept),
+                              [row, routed])
+    assert out["input_ids"].tolist() == [10, 7]
+    assert out["ts_rules"].tolist() == [[0, 1, 2, 3], [4, 5, 6, 7]]

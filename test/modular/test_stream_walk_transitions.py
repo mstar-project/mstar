@@ -370,3 +370,19 @@ def test_the_conductor_follows_the_walk_the_worker_ran():
     ))
     assert pstate.metadata.graph_walk == "talker_last_prefill"
     assert done == ["Talker"]
+
+
+def test_a_producer_walk_transition_reserves_under_the_new_consumer_walk():
+    streams, request_state, walks = _streams()
+    edge = "thinker_states"
+    streams.connections = [_conn(edge, policy=lambda: FixedChunkPolicy(1, frozenset({"talker_decode"})))]
+    streams.consumer_node = {edge: "Talker"}
+    streams._partition = {edge: "Talker"}
+    streams._tensor_manager = SimpleNamespace(increment_ref_batch_uniform=lambda uuids: None)
+    streams.configure_windows({"Talker": 4}, {"Talker": frozenset({("talker_decode", edge)})})
+    sbuf = _buffer()
+    _feed(sbuf, ["talker_decode"])
+    popped = streams.pop_edge(sbuf, edge, 0)
+    assert popped.chunk.reservation is not None and sbuf._consumed == 0
+    assert walks == ["talker_decode"]
+    assert request_state.get_fwd_info(0, "Talker").graph_walk == "talker_decode"

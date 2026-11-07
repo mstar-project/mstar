@@ -5,6 +5,7 @@ import threading
 from contextlib import contextmanager
 from dataclasses import dataclass, field, is_dataclass, replace
 from functools import cache, partial
+from types import MappingProxyType
 from typing import Any, Callable, Collection, Iterator, Mapping, NamedTuple, Sequence
 
 import torch
@@ -15,6 +16,8 @@ from mstar.distributed.communication import CommGroup, JointGroups
 from mstar.engine.accelerator_graph_backend import (
     AcceleratorGraphPool,
     CapturedGraph,
+    GraphConditional,
+    copy_words,
 )
 from mstar.engine.accelerator_graph_config import (
     DETERMINISTIC_COMPILE_MODE,
@@ -25,22 +28,29 @@ from mstar.engine.accelerator_graph_config import (
     PiecewiseCaptureShape,
     PiecewiseConfigType,
 )
+from mstar.engine.device_run import DeviceRun, RunAsk, RunState, TokenStream, column_in
 from mstar.engine.node_dtype import node_scope
 from mstar.engine.resources import BucketKey, CGSlotSpec, Resource, SlotLease, StepContext, StepRunner
+from mstar.engine.resources.base import reachable_resources
+from mstar.engine.resources.iteration_tables import IterationTables, tables_key
+from mstar.engine.resources.loopback_rows import LoopbackRows
 from mstar.engine.resources.lora.config import LoraBaseOnly
-from mstar.engine.resources.resident import ResidentPlanner
-from mstar.engine.resources.step import PIECEWISE_WALK
+from mstar.engine.resources.resident import CapturedResidentStep, ResidentPlanner, watched_counts
+from mstar.engine.resources.resident_hooks import unbound_horizon
+from mstar.engine.resources.step import PIECEWISE_WALK, SubmoduleStep
 from mstar.model.submodule_base import (
     BatchedModelOutput,
+    CarryPair,
     ModelInputsFromEngine,
     NodeInputs,
     NodeSubmodule,
     engine_step,
+    iteration_columns,
     lora_rows,
 )
 from mstar.platforms import current_platform
 from mstar.platforms.compile import with_inductor_overrides
-from mstar.utils import profiler
+from mstar.utils import knobs, profiler
 from mstar.utils.device import DeviceCapability
 
 logger = logging.getLogger(__name__)
@@ -639,6 +649,61 @@ class DummyRowPool:
             self.reset(rids, free=True)
 
 
+def output_named(outputs, name: str) -> torch.Tensor | None:
+    """The tensor a step's ``outputs`` (``BatchedModelOutput``, or a capture's
+    static ones) leave ``name`` in, row i request i: a row output, a stop
+    buffer, or a packed output under ``__name__``."""
+    for buffers, key in (
+        (outputs.row_outputs, name), (outputs.check_stop_buffers, name),
+        (outputs.packed_outputs, f"__{name}__"),
+    ):
+        value = (buffers or {}).get(key)
+        if isinstance(value, torch.Tensor):
+            return value
+    return None
+
+
+def _launch_words(ops: Sequence[tuple[torch.Tensor, torch.Tensor] | int]) -> list[int] | None:
+    """``ops`` as ``mstar_rust.launch_run`` takes them: a launch is its graph
+    exec's address, a copy its target and source. None if a copy can't be
+    said (that run stays on the host's loop)."""
+    words: list[int] = []
+    for op in ops:
+        if not isinstance(op, tuple):
+            words.extend((0, op))
+            continue
+        copy = copy_words(*op)
+        if copy is None:
+            return None
+        words.append(1)
+        words.extend(copy)
+    return words
+
+
+def _probe_rows(
+    inputs: Sequence[NodeInputs], carries: Mapping[str, CarryPair],
+) -> tuple[list[NodeInputs], dict[str, list[torch.Tensor]]]:
+    """``inputs`` with each row's tensor input of a carried signal replaced
+    by a probe value of its own (floats only: an integer may index a table),
+    and the values, by signal, for the signals every row carries."""
+    rows = list(inputs)
+    probed: dict[str, list[torch.Tensor]] = {}
+    gen = torch.Generator().manual_seed(0)
+    for signal in carries:
+        values = [(getattr(row, "tensor_inputs", None) or {}).get(signal) for row in rows]
+        if not rows or not all(isinstance(v, torch.Tensor) for v in values):
+            continue
+        values = [
+            torch.randn(v.shape, generator=gen).to(v.device, v.dtype) if v.is_floating_point() else v
+            for v in values
+        ]
+        rows = [
+            replace(row, tensor_inputs={**row.tensor_inputs, signal: v}) for row, v in zip(rows, values, strict=True)
+        ]
+        probed[signal] = values
+    return rows, probed
+
+
 @dataclass
 class AcceleratorGraphSlot:
     """One captured graph + the buffers its replay reads and writes.
@@ -657,6 +722,31 @@ class AcceleratorGraphSlot:
     dummy_rids: list[int]
     dummy_metadata: dict[int, CurrentForwardPassInfo]
     config_idx: int
+    # its WHILE run: a step launches this, not ``graph``
+    run: DeviceRun | None = None
+    # whether a run of it launches through ``mstar_rust.launch_run``
+    raw_launch: bool = False
+    # where a run of it leaves its tokens as they land, for a walk that streams them
+    token_stream: TokenStream | None = None
+    # loop-back signal -> the static input this capture reads it into, off the
+    # node's rows, at its head
+    row_heads: Mapping[str, str] = MappingProxyType({})
+    # The latest compatible connected unit anchored on this leased slot.
+    composed_key: tuple = ()
+    composed_graph: CapturedGraph | None = None
+    # Bounded scratch for this slot: retained outputs, input columns and
+    # parallel-assignment snapshots. A tail run reuses the configured capacity.
+    composed_buffers_key: tuple = ()
+    composed_buffers: list[torch.Tensor] = field(default_factory=list)
+
+
+class RunPart(NamedTuple):
+    """One ordinary capture and the copies/columns it reads before replay."""
+    slot: AcceleratorGraphSlot
+    # (source, target): the same buffers every round, a carried signal each
+    copies: Sequence[tuple[torch.Tensor, torch.Tensor]]
+    # (column, target): a column a round, ``[rows, repeats, ...]``
+    columns: Sequence[tuple[torch.Tensor, torch.Tensor]]
 
 
 @dataclass
@@ -667,9 +757,17 @@ class AcceleratorGraphBucket:
     slots: list[AcceleratorGraphSlot] = field(default_factory=list)
 
 
+class CaptureTemplate(NamedTuple):
+    """A capture's padding rows, their inputs, and the step they declare."""
+    rids: list[int]
+    inputs: list[NodeInputs]
+    engine_inputs: ModelInputsFromEngine
+    step: SubmoduleStep | None
+
+
 class WarmedSpec(NamedTuple):
     """A spec prepared and run eagerly: what its capture reads."""
-    run: Callable[[], Any]
+    run: Callable[..., Any]
     static_inputs: dict[str, Any]
     static_input_keys: tuple[str, ...]
     dummy_rids: list[int]
@@ -678,13 +776,23 @@ class WarmedSpec(NamedTuple):
     peak: int
     # bytes of what it returned
     returned: int
+    # what its capture reads off the node's rows (``AcceleratorGraphSlot.row_heads``)
+    row_heads: Mapping[str, str] = MappingProxyType({})
+    # the last warm-up forward's output, kept for a walk asked to run on the
+    # device: it sizes the run's columns before the capture
+    output: Any = None
+    resident: CapturedResidentStep | None = None
 
 
 class AcceleratorGraphRunner:
+    _connected_walks: frozenset[str] = frozenset()
+    _member: str = ""
     CAPTURE_BATCH_SIZES = DEFAULT_CAPTURE_BATCH_SIZES
     NUM_WARMUP = 2
     # None: the backend's shared capture stream (see ``Engine._capture_stream_for``)
     _capture_stream: Any = None
+    # the node's loop-back rows, where it keeps any (``bind_rows``)
+    _rows: LoopbackRows | None = None
 
     def __init__(
         self,
@@ -699,12 +807,22 @@ class AcceleratorGraphRunner:
         enable_nvtx: bool=False,
         device_capability: DeviceCapability | None = None,
         capture_stream: Any = None,
+        separate_member: bool = False,
     ):
         self._submodule_name = submodule_name
+        self._member = submodule_name if separate_member else ""
         self._capture_stream = capture_stream
         self._submodule = submodule
         self._comm_group = joint_comm_group
         self._resident: ResidentPlanner | None = None
+        # what a walk's captures read and write of the node's rows
+        self._row_pairs: Callable[[str], tuple[dict[str, str], dict[str, str]]] | None = None
+        # walk -> what its WHILE run needs, for each walk asked to run on the device
+        self._run_asks: dict[str, RunAsk] = {}
+        # walk -> why its captures have no WHILE run, once one was asked for and failed
+        self._run_failures: dict[str, str] = {}
+        # walks whose forward draws from a torch generator, which a raw launch doesn't advance
+        self._generator_walks: set[str] = set()
 
         self._capture_configs: list[AcceleratorGraphConfig] = (
             submodule.get_accelerator_graph_configs(
@@ -796,6 +914,77 @@ class AcceleratorGraphRunner:
         """Before any capture: a capture of a walk ``planner`` covers records its kernels."""
         self._resident = planner
 
+    def batched_refusal(self, walk: str) -> str | None:
+        """Why no batched capture of ``walk`` runs its steps, or None. After
+        `prepare_for_capture`."""
+        if self._graph_backend is None or not self._graph_backend.is_available():
+            return "its device captures no graphs"
+        configs = [c for c in self._capture_configs if c.capture_graph_walk == walk]
+        if not any(not _is_packed(c) for c in configs):
+            return "it has no batched capture"
+        if not any(spec.bucket.graph_walk == walk for spec in self.prepare_for_capture()):
+            return "every capture of it was dropped"
+        return None
+
+    def resident_refusal(self, walk: str) -> str | None:
+        """Why the captures of ``walk`` can't run it on resident tables, or
+        None. After `prepare_for_capture`."""
+        if (refusal := self.batched_refusal(walk)) is not None:
+            return refusal
+        if any(set(c.replay_graph_walks) - {walk} for c in self._capture_configs if c.capture_graph_walk == walk):
+            # one graph would serve walks with and without the tables
+            return "its capture also replays other walks"
+        return None
+
+    def template_step(self, walk: str) -> SubmoduleStep | None:
+        """The step ``walk``'s widest capture declares."""
+        return self._template(self._widest(walk)).step
+
+    def keyed_template_steps(self, walk: str) -> dict[Any, SubmoduleStep | None]:
+        """The step each of ``walk``'s capture keys declares (its widest bucket),
+        by key: two keys of one walk can declare different steps (BAGEL's
+        decode with and without guidance)."""
+        steps: dict[Any, SubmoduleStep | None] = {}
+        for spec in self.prepare_for_capture():
+            key = spec.bucket.cg_key_info
+            if spec.bucket.graph_walk == walk and spec.slot == 0 and key not in steps:
+                steps[key] = self._template(spec).step
+        return steps
+
+    def prepare_template(self, walk: str, carries: Mapping[str, CarryPair] = MappingProxyType({})) -> str | None:
+        """Admit, plan and preprocess ``walk``'s widest capture on its padding
+        rows, as its capture will, then free them. Before any capture, so the
+        engine can watch what this ``preprocess`` reads (`resident.table_read`).
+
+        Returns why ``preprocess`` doesn't hand a loop-back signal of
+        ``carries`` to the forward unchanged, or None: a replay that repeats
+        skips it, so its input must be the carried output as is. Each
+        template row's value is replaced by a probe first, so a transform
+        can't hide behind a template of zeros. A signal the rows don't carry
+        as a tensor input (a token read off the sampler) isn't checked."""
+        spec = self._widest(walk)
+        template = self._template(spec)
+        rows, probed = _probe_rows(template.inputs, carries)
+        template = template._replace(inputs=rows)
+        # inside an engine watch, a read of a padding row's loop counter is recorded
+        for info in (template.engine_inputs.per_request_info if template.engine_inputs is not None else {}).values():
+            info.dynamic_loop_iter_counts = watched_counts(info.dynamic_loop_iter_counts)
+        try:
+            preprocessed = self._prepare(spec, template)
+        finally:
+            self._dummy_rows.reset(template.rids, free=True)
+        for signal, rows in probed.items():
+            value = preprocessed.get(carries[signal].input)
+            expected = torch.cat([row.reshape(-1) for row in rows])
+            if not isinstance(value, torch.Tensor) or value.numel() != expected.numel() or not torch.equal(
+                value.reshape(-1).to(expected.device, expected.dtype), expected,
+            ):
+                return f"its preprocess changes loop-back {signal!r} on its way to {carries[signal].input!r}"
+        return None
+
+    def _widest(self, walk: str) -> CGSlotSpec:
+        return next(s for s in self.prepare_for_capture() if s.bucket.graph_walk == walk and s.slot == 0)
+
     # ── Capture ─────────────────────────────────────────────────────────
 
     def _get_slot_specs(self) -> list[CGSlotSpec]:
@@ -856,7 +1045,7 @@ class AcceleratorGraphRunner:
                     graph_walk=spec.bucket.graph_walk,
                     request_ids=rids,
                     inputs=spec.config.get_node_inputs(spec.bs, spec.num_tokens),
-                    slot_lease=SlotLease(slot=0, bucket=spec.bucket),
+                    slot_lease=SlotLease(slot=0, bucket=spec.bucket, member=self._member),
                     per_request_info=dummy_metadata(rids, spec.bucket.graph_walk),
                 )
                 blocked = blocked_capture_resources(step, self._resources)
@@ -884,6 +1073,18 @@ class AcceleratorGraphRunner:
                 )
             self._prepared_slot_specs = slot_specs
         return self._prepared_slot_specs
+
+    def _input_bank_bytes(self, spec: CGSlotSpec, inputs: Mapping[str, Any]) -> int:
+        ask = self._run_asks.get(spec.bucket.graph_walk)
+        if ask is None:
+            return 0
+        membership = 8 * spec.bucket.bs * (3 + ask.limit) if ask.membership is not None else 0
+        if ask.loop is None:
+            return membership
+        return membership + IterationTables.window_bytes(
+            self._resident.max_slots, ask.limit, 2 + len(ask.loop.ancestors),
+            {name: value for name, value in inputs.items() if name in ask.iteration}, spec.bucket.bs,
+        )
 
     def size_captures(self) -> dict[BucketKey, CaptureCost]:
         """Warm every spec up, and capture each walk's largest buckets once,
@@ -918,6 +1119,12 @@ class AcceleratorGraphRunner:
                             ),
                             f"{self._submodule_name} {spec}", self._executables.setdefault(walk, ExecutableMemory()),
                         )
+                        extra = self._input_bank_bytes(spec, warmed.static_inputs)
+                        cost = self._capture_costs[spec.bucket]
+                        if cost.graph is not None:
+                            self._capture_costs[spec.bucket] = cost._replace(
+                                graph=cost.graph + extra, kept=cost.kept + extra,
+                            )
                         if lent:
                             self._lent.add(spec.bucket)
             except Exception as e:
@@ -957,7 +1164,8 @@ class AcceleratorGraphRunner:
                         self._executables[(spec.bucket.graph_walk, spec.bucket.cg_key_info)],
                     )
                 if memory is not None:
-                    cost = cost._replace(graph=memory.pool, outside=memory.outside)
+                    extra = self._input_bank_bytes(spec, warmed.static_inputs)
+                    cost = cost._replace(graph=memory.pool + extra, outside=memory.outside)
             except Exception:
                 logger.warning(
                     "AcceleratorGraphRunner[%s]: could not prepare %s to size its capture",
@@ -1131,10 +1339,15 @@ class AcceleratorGraphRunner:
             # what preparing it left cached in the allocator is out of the
             # capture pool's reach
             torch.accelerator.empty_cache()
-            graph, output = capture_into_graph(
-                warmed.run, self._memory_pool, self._device, self._autocast_dtype,
-                node_name=self._submodule_name, stream=self._capture_stream,
-            )
+            run, graph, output = self._capture_run(spec, warmed)
+            if graph is None:
+                graph, output = capture_into_graph(
+                    warmed.run, self._memory_pool, self._device, self._autocast_dtype,
+                    node_name=self._submodule_name, stream=self._capture_stream,
+                    keep_graph=self._device.type == "cuda" and not self._connected_walks.isdisjoint(
+                        spec.config.replay_graph_walks,
+                    ),
+                )
             return self._build_slot_from_capture(
                 output=BatchedModelOutput.coerce(output),
                 graph=graph,
@@ -1143,7 +1356,197 @@ class AcceleratorGraphRunner:
                 dummy_rids=warmed.dummy_rids,
                 dummy_metadata=warmed.dummy_metadata,
                 config_idx=spec.config_idx,
+                run=run,
+                row_heads=warmed.row_heads,
             )
+
+    def bind_rows(self, rows: LoopbackRows, pairs: Callable[[str], tuple[dict[str, str], dict[str, str]]]) -> None:
+        """Before capture: read and write the node's rows inside each capture."""
+        self._rows, self._row_pairs = rows, pairs
+
+    def ask_run(self, walk: str, ask: RunAsk) -> None:
+        """Before capture: ``walk``'s batched captures run on the device."""
+        self._run_asks[walk] = ask
+
+    def refuse_run(self, walk: str, why: str) -> None:
+        """Before capture: ``walk`` stays off the device, for its line."""
+        self._run_failures[walk] = why
+
+    def yield_runs(self) -> None:
+        """Ask the node's runs in flight to end: the one running at its next iteration,
+        the one staged behind it before its first if it asks more than one. A slot
+        staged later is unaffected."""
+        for bucket in self._buckets.values():
+            for slot in bucket.slots:
+                if slot.run is not None:
+                    slot.run.state.request_yield()
+
+    def run_refusal(self, walk: str) -> str | None:
+        """After capture: why ``walk``'s captures don't run on the device, or None."""
+        if (refusal := self._graph_backend.while_refusal()) is not None:
+            return f"backend: {refusal}"
+        if (failure := self._run_failures.get(walk)) is not None:
+            return failure
+        slots = [slot for bucket in self._buckets.values() if bucket.config.capture_graph_walk == walk
+                 for slot in bucket.slots]
+        if not slots or any(slot.run is None for slot in slots):
+            return "runner: it has no batched capture"
+        return None
+
+    def _capture_run(self, spec: CGSlotSpec, warmed: WarmedSpec) -> tuple[DeviceRun | None, Any, Any]:
+        """``spec``'s capture as the body of a WHILE run, or (None, None, None)
+        where a plain capture serves it, the reason kept for its line."""
+        walk = spec.bucket.graph_walk
+        ask = self._run_asks.get(walk)
+        backend = self._graph_backend
+        # one failure settles the walk: every other bucket would capture twice for it
+        if ask is None or walk in self._run_failures or _is_packed(spec.config) or backend.while_refusal() is not None:
+            return None, None, None
+        if walk in self._generator_walks:
+            self._run_failures[walk] = "runner: its forward draws from a torch generator, which a raw launch repeats"
+            return None, None, None
+        if ask.stream_tokens and ask.token_signal is None:
+            self._run_failures[walk] = "graph: a counted run has no token signal to stream"
+            return None, None, None
+        dropping = None
+        if ask.drop_rows or ask.loop is not None or ask.membership is not None:
+            if self._resident is None or not self._resident.covers(spec.bucket):
+                self._run_failures[walk] = "planner: the walk isn't resident, which dropping rows needs"
+                return None, None, None
+            dropping = self._resident.drop_rows(spec.bucket, spec.slot)
+        if ask.loop is not None and (self._rows is None or warmed.resident is None):
+            self._run_failures[walk] = "planner: actual Loop progress needs resident loop-back rows"
+            return None, None, None
+        if ask.membership is not None:
+            unbound = next((key for key, binding in self._resident.bindings.items()
+                            if binding.check_horizon is unbound_horizon), None)
+            if unbound is not None:
+                self._run_failures[walk] = f"resource {unbound!r}: no execution-time binding for joining rows"
+                return None, None, None
+            uncovered = set(warmed.static_input_keys) - set(warmed.row_heads.values()) - set(ask.iteration)
+            if uncovered:
+                self._run_failures[walk] = f"resource: joining inputs have no execution-time owner: {sorted(uncovered)}"
+                return None, None, None
+            if ask.carries:
+                self._run_failures[walk] = "resource: joining rows require owner-backed carries"
+                return None, None, None
+            if ask.iteration and ask.loop is None:
+                self._run_failures[walk] = "graph: joining iteration inputs need their actual Loop cursor"
+                return None, None, None
+            if ask.refill_at is not None:
+                self._run_failures[walk] = "graph: joining membership has no fixed refill row count"
+                return None, None, None
+        if ask.loop is not None:
+            self._rows.prepare_iteration(walk, ask.loop)
+        cuda = backend.while_runtime()
+        stream = (TokenStream(spec.bucket.bs, ask.limit, self._device, membership=ask.membership is not None)
+                  if ask.stream_tokens else None)
+        state = RunState(
+            spec.bucket.bs, ask.token_signal, ask.stop_ids, self._device, dropping, stream,
+            membership=ask.membership, width=ask.limit,
+        )
+        shapes = {name: value for name, value in warmed.static_inputs.items() if name in ask.iteration}
+        window = None
+        if ask.loop is not None:
+            owner = self._resources[tables_key(self._submodule_name)]
+            window = owner.prepare_window(
+                SlotLease(spec.slot, spec.bucket, self._member), shapes, ask.limit,
+                2 + len(ask.loop.ancestors), self._resident.max_slots,
+                {name: self._submodule.ITERATION_INPUTS[name].capture_fill for name in shapes},
+            )
+            inputs = {}  # the captured view belongs solely to IterationTables
+        else:
+            inputs = {name: value.new_zeros((value.shape[0], ask.limit, *value.shape[1:]))
+                      for name, value in shapes.items()}
+        run = DeviceRun(state, inputs, lambda: None, ask.limit, window)
+        # The run's columns live outside the capture's pool: a block the forward
+        # frees mid-capture goes to a later allocation of the same capture, so
+        # the next iteration's forward would write its scratch over all but the
+        # last column. Sized off the last warm-up forward, or one more.
+        with autocast_scope(self._autocast_dtype, self._device.type, self._submodule_name):
+            sized = BatchedModelOutput.coerce(warmed.output if warmed.output is not None else warmed.run(False))
+        if ask.membership is not None and (sized.per_rid_outputs or sized.packed_outputs):
+            raise ValueError("joining runs require row-addressed outputs")
+        # Every physical row may change owners, including outputs routed only
+        # when a Loop ends. Keep its value until the logical receipt is collected.
+        columns = tuple(sized.row_outputs or {}) if ask.membership is not None else ask.columns
+        buffers, spans = sized.check_stop_buffers or {}, sized.output_spans or {}
+        run.keep({name: t.reshape(t.shape[0], -1)[:, 0] for name, t in buffers.items()}, run.stops)
+        run.keep({name: sized.row_outputs[name] for name in columns}, run.rows)
+        run.keep({name: spans[name] for name in columns if name in spans}, run.spans)
+        run.sealed = True
+        del sized, buffers, spans
+        backend.synchronize()
+
+        def body() -> Any:
+            state.acquire_rows()
+            position = active = None
+            if window is not None:
+                indices = self._rows.iteration_rows(warmed.resident)
+                # Resident slots select the input bank; LoopbackRows indices
+                # select actual Loop progress. These are distinct namespaces.
+                resident_slots = warmed.resident.buffers.rows
+                entries = window.entries.index_select(0, resident_slots)
+                origins = window.origins.index_select(0, resident_slots)
+                position, active = self._rows.iteration_head(walk, ask.loop, indices, entries, ~state.marks)
+                state.marks.logical_or_(~active)
+            state.head()
+
+            def select_inputs():
+                if window is None:
+                    for name, column in inputs.items():
+                        column_in(state.index, column, warmed.static_inputs[name])
+                else:
+                    selected = torch.where(active, position - origins, 0)
+                    selected_rows = torch.where(active, resident_slots, 0)
+                    for name, column in window.columns.items():
+                        warmed.static_inputs[name].copy_(column[selected_rows, selected])
+
+            raw = warmed.run(True, select_inputs)
+            output = BatchedModelOutput.coerce(raw)
+            buffers = output.check_stop_buffers or {}
+            unique = {name: t.reshape(t.shape[0], -1)[:, 0] for name, t in buffers.items()}
+            run.keep(unique, run.stops)
+            run.keep({name: output.row_outputs[name] for name in columns}, run.rows)
+            spans = output.output_spans or {}
+            run.keep({name: spans[name] for name in columns if name in spans}, run.spans)
+            for pair in ask.carries.values():
+                target = warmed.static_inputs[pair.input]
+                target.copy_(output_named(output, pair.output).reshape(target.shape))
+            tokens = None if ask.token_signal is None else output_named(output, ask.token_signal).to(torch.long)
+            cuda.stop(state, tokens, backend.raw_stream())
+            state.retire_rows()
+            if window is not None:
+                self._rows.iteration_tail(
+                    walk, ask.loop, self._rows.indices(spec.bucket, spec.slot), position, active, state.marks,
+                )
+            return raw
+
+        try:
+            cuda._load_kernels()
+            graph, output = capture_into_graph(
+                body, self._memory_pool, self._device, self._autocast_dtype, keep_graph=True,
+                node_name=self._submodule_name, stream=self._capture_stream,
+            )
+            raw_graph = int(graph.raw_cuda_graph())
+            if (refusal := cuda.node_refusal(raw_graph)) is not None:
+                self._run_failures[walk] = f"runner: {refusal}"
+                if window is not None:
+                    owner.discard_window(SlotLease(spec.slot, spec.bucket, self._member))
+                return None, None, None
+            entry, _ = capture_into_graph(
+                lambda: cuda.start(state, backend.raw_stream()), self._memory_pool, self._device, None,
+                keep_graph=True, node_name=self._submodule_name, stream=self._capture_stream,
+            )
+            composed = backend.compose((entry, GraphConditional("while", state.continuation, (graph,))))
+            run.entry, run.launch = entry, composed.replay
+        except Exception as error:
+            self._run_failures[walk] = f"runner: its capture into a WHILE body failed: {error}"
+            logger.warning("AcceleratorGraphRunner[%s]: %s", self._submodule_name, error)
+            if window is not None:
+                owner.discard_window(SlotLease(spec.slot, spec.bucket, self._member))
+            return None, None, None
+        return run, graph, output
 
     @contextmanager
     def _warmed(self, spec: CGSlotSpec, forwards: int) -> Iterator[WarmedSpec]:
@@ -1151,44 +1554,9 @@ class AcceleratorGraphRunner:
         its first capture needs."""
         walk = spec.bucket.graph_walk
         config = spec.config
-        dummy_rids = self._dummy_rows.ensure(
-            f"{spec.config_idx}_slot{spec.slot}", spec.bs
-        )
-        dummy_inputs = config.get_node_inputs(spec.bs, spec.num_tokens)
-        engine_inputs = self._dummy_engine_inputs(dummy_rids, walk)
-
-        lease = SlotLease(slot=spec.slot, bucket=spec.bucket)
-        step = engine_step(
-            self._submodule,
-            graph_walk=walk, request_ids=dummy_rids, inputs=dummy_inputs,
-            slot_lease=lease, per_request_info=engine_inputs.per_request_info,
-        )
-        if step is not None:
-            step = replace(step, _ctx=StepContext(
-                request_ids=tuple(dummy_rids),
-                graph_walk=walk,
-                slot=spec.slot,
-                capture=True,
-                slot_lease=lease,
-                force_prefill=_is_packed(config),
-            ))
-
-        engine_inputs.step = step
-
-        def prepare() -> dict[str, Any]:
-            if step is not None:
-                outcome = self._step_runner.admit(step)
-                if not outcome.ok:
-                    raise RuntimeError(
-                        f"capture admit failed for {spec.bucket}: {outcome.reason}"
-                    )
-                self._step_runner.plan(step)
-            return self._submodule.preprocess(
-                graph_walk=walk,
-                engine_inputs=engine_inputs,
-                inputs=dummy_inputs,
-            )
-
+        template = self._template(spec)
+        dummy_rids, engine_inputs, step = template.rids, template.engine_inputs, template.step
+        prepare = partial(self._prepare, spec, template)
         try:
             static_inputs = prepare()
             # Intern before capture so every bucket of this config records the
@@ -1215,14 +1583,32 @@ class AcceleratorGraphRunner:
                 else None
             )
 
-            def run_forward():
+            rows = self._rows
+            heads, tails = self._row_pairs(walk) if rows is not None else ({}, {})
+            if heads and (_is_packed(config) or set(config.replay_graph_walks) - {walk}):
+                heads = {}  # one row a request, of one walk
+            def run_forward(in_run: bool = False, select_inputs: Callable[[], None] | None = None):
                 if resident is not None:
                     planner.gather(resident)
+                    if in_run:
+                        planner.run_gather(resident)
+                if select_inputs is not None:
+                    select_inputs()
+                for signal, name in heads.items():
+                    target = static_inputs.get(name)
+                    if isinstance(target, torch.Tensor):
+                        rows.head(spec.bucket, spec.slot, signal, target)
                 out = forward(
                     graph_walk=walk,
                     engine_inputs=engine_inputs,
                     **static_inputs,
                 )
+                if tails:
+                    outputs = BatchedModelOutput.coerce(out)
+                    for signal, name in tails.items():
+                        value = output_named(outputs, name)
+                        if value is not None:
+                            rows.tail(spec.bucket, spec.slot, signal, value)
                 if resident is not None:
                     planner.commit_in_graph(resident)
                 return out
@@ -1230,12 +1616,21 @@ class AcceleratorGraphRunner:
             self._graph_backend.set_device()
             self._graph_backend.synchronize()
             peak = returned = 0
+            output = None
             for _ in range(forwards):
                 # the last forward's peak, not the first's: that one may compile and autotune
                 live = torch.accelerator.memory_allocated(self._device)
                 torch.accelerator.reset_peak_memory_stats(self._device)
+                offset = self._graph_backend.generator_offset()
+                output = None
                 with autocast_scope(self._autocast_dtype, self._device.type, self._submodule_name):
-                    returned = _tensor_bytes(run_forward())
+                    out = run_forward()
+                    returned = _tensor_bytes(out)
+                    if walk in self._run_asks:
+                        output = out
+                    del out
+                if self._graph_backend.generator_offset() != offset:
+                    self._generator_walks.add(walk)
                 peak = torch.accelerator.max_memory_allocated(self._device) - live
                 # back to a clean stream state so the re-plan below (and the
                 # capture after it) sees the same shapes the first prepare did
@@ -1243,6 +1638,13 @@ class AcceleratorGraphRunner:
                 prepare()
             self._graph_backend.synchronize()
 
+            # Sizing already warmed this spec. Capturing it with forwards=0
+            # must still discover the input owner before membership checks,
+            # without executing another forward or gather to rediscover it.
+            row_heads = {
+                signal: name for signal, name in heads.items()
+                if isinstance(target := static_inputs.get(name), torch.Tensor) and rows.covers_head(signal, target)
+            }
             yield WarmedSpec(
                 run=run_forward,
                 static_inputs=static_inputs,
@@ -1251,11 +1653,57 @@ class AcceleratorGraphRunner:
                 dummy_metadata=engine_inputs.per_request_info,
                 peak=peak,
                 returned=returned,
+                row_heads=row_heads,
+                output=output,
+                resident=resident,
             )
         finally:
             # Capture ran the dummy rows as real requests; free their storage
             # now, since replay's padding rows address the sink page and slot.
             self._dummy_rows.reset(dummy_rids, free=True)
+
+    def _template(self, spec: CGSlotSpec) -> CaptureTemplate:
+        """``spec``'s padding rows, inputs and declared step."""
+        walk = spec.bucket.graph_walk
+        dummy_rids = self._dummy_rows.ensure(f"{spec.config_idx}_slot{spec.slot}", spec.bs)
+        dummy_inputs = spec.config.get_node_inputs(spec.bs, spec.num_tokens)
+        engine_inputs = self._dummy_engine_inputs(dummy_rids, walk)
+        lease = SlotLease(slot=spec.slot, bucket=spec.bucket, member=self._member)
+        step = engine_step(
+            self._submodule,
+            graph_walk=walk, request_ids=dummy_rids, inputs=dummy_inputs,
+            slot_lease=lease, per_request_info=engine_inputs.per_request_info,
+        )
+        if step is not None:
+            step = replace(step, _ctx=StepContext(
+                request_ids=tuple(dummy_rids),
+                graph_walk=walk,
+                slot=spec.slot,
+                capture=True,
+                slot_lease=lease,
+                force_prefill=_is_packed(spec.config),
+            ))
+        engine_inputs.step = step
+        return CaptureTemplate(dummy_rids, dummy_inputs, engine_inputs, step)
+
+    def _prepare(self, spec: CGSlotSpec, template: CaptureTemplate) -> dict[str, Any]:
+        """Admit and plan ``template``'s step, and preprocess its inputs."""
+        if template.step is not None:
+            outcome = self._step_runner.admit(template.step)
+            if not outcome.ok:
+                raise RuntimeError(f"capture admit failed for {spec.bucket}: {outcome.reason}")
+            self._step_runner.plan(template.step)
+        columns = {}
+        if getattr(self._submodule, "ITERATION_INPUTS", None):
+            # padding rows all: each takes its capture_fill
+            columns = iteration_columns(self._submodule, [None] * len(template.inputs), 1, self._device)
+            template.engine_inputs.iteration_inputs = columns
+        preprocessed = self._submodule.preprocess(
+            graph_walk=spec.bucket.graph_walk, engine_inputs=template.engine_inputs, inputs=template.inputs,
+        )
+        for name, column in columns.items():
+            preprocessed.setdefault(name, column[:, 0])
+        return preprocessed
 
     def _forward_for(self, spec: CGSlotSpec):
         """The callable this bucket captures, compiled once per config.
@@ -1351,7 +1799,7 @@ class AcceleratorGraphRunner:
 
     def _build_slot_from_capture(
         self, output, graph, static_inputs, static_input_keys,
-        dummy_rids, dummy_metadata, config_idx,
+        dummy_rids, dummy_metadata, config_idx, run=None, row_heads=MappingProxyType({}),
     ) -> AcceleratorGraphSlot:
         """Wrap one slot's capture artifacts into a CudaGraphSlot."""
         return AcceleratorGraphSlot(
@@ -1362,6 +1810,8 @@ class AcceleratorGraphRunner:
             dummy_rids=list(dummy_rids),
             dummy_metadata=dict(dummy_metadata),
             config_idx=config_idx,
+            run=run,
+            row_heads=row_heads,
         )
 
     # ── Replay ──────────────────────────────────────────────────────────
@@ -1488,6 +1938,7 @@ class AcceleratorGraphRunner:
             # capture is dropped whole — so this agrees with `_next_slot`'s wrap
             slot=slot % len(bucket.slots),
             bucket=replace(key, graph_walk=bucket.config.capture_graph_walk),
+            member=self._member,
         )
 
     def slot_for(self, lease: SlotLease) -> AcceleratorGraphSlot:
@@ -1592,10 +2043,307 @@ class AcceleratorGraphRunner:
         # enqueue cost only. GPU-side duration comes from --cuda-graph-trace.
         if self._enable_nvtx:
             profiler.range_push(f"cg.replay.slot[{lease.slot}]")
-        slot.graph.replay()
+        if slot.run is not None:
+            slot.run.launch()
+        else:
+            slot.graph.replay()
         if self._enable_nvtx:
             profiler.range_pop()
         return slot.static_outputs
+
+    def run_part(
+        self, lease: SlotLease, carries: Mapping[str, CarryPair],
+        replay_columns: Collection[tuple[torch.Tensor, torch.Tensor]] = (),
+        iteration: Mapping[str, torch.Tensor] | None = None,
+    ) -> RunPart:
+        """This step's part of a run: every loop-back signal's output copied
+        into the static input it feeds (``carries``) before each replay after
+        the first, each iteration input's column for that replay into its own
+        (``iteration``, ``[rows, repeats, ...]``), and the resources' into
+        theirs (``replay_columns``, column then target)."""
+        slot = self.slot_for(lease)
+        copies = [
+            (output_named(slot.static_outputs, pair.output), slot.static_inputs[pair.input])
+            for pair in carries.values()
+        ]
+        stage = [(column, slot.static_inputs[name]) for name, column in (iteration or {}).items()]
+        return RunPart(slot, copies, [*stage, *replay_columns])
+
+    def repeat(
+        self, parts: Sequence[RunPart], repeats: int, columns: Collection[str] = (),
+        stream: tuple[TokenStream, str] | None = None,
+    ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+        """The rest of a run, after the replay of its last part (this step's,
+        ``parts[-1]``): ``repeats - 1`` rounds, each part in order taking its
+        copies and its columns' entry for that round (``RunPart``) and
+        replaying. Returns the last part's stop buffers, one value a row each,
+        and its row outputs named in ``columns``, ``[rows, ...]`` each, both
+        with a column per replay (``[rows, repeats, ...]``): a replay
+        overwrites what the last one left, so each is copied out on the stream
+        before the next one. Third, the spans of the spanned ones among
+        ``columns`` (``[rows, repeats, 2]``). ``stream``: where each replay's
+        tokens land as it finishes, and the stop buffer that holds them."""
+        slot = parts[-1].slot
+        # a count stop reads no buffer
+        buffers = slot.static_outputs.check_stop_buffers or {}
+        rows_out = {name: slot.static_outputs.row_outputs[name] for name in columns}
+        # a spanned output's spans, a column a replay like the output itself
+        spans = slot.static_outputs.output_spans or {}
+        spans_out = {name: spans[name] for name in columns if name in spans}
+        # two names can share a buffer
+        unique = {id(t): t.reshape(t.shape[0], -1)[:, 0] for t in buffers.values()}
+        unique.update((id(t), t) for t in (*rows_out.values(), *spans_out.values()))
+        wide = {key: t.new_empty(t.shape[0], repeats, *t.shape[1:]) for key, t in unique.items()}
+        # the run, in order: a launch is its slot, a copy its target and source
+        ops: list[tuple[torch.Tensor, torch.Tensor] | AcceleratorGraphSlot] = []
+        for i in range(repeats):
+            if i:
+                for part in parts:
+                    ops.extend((target, source.reshape(target.shape)) for source, target in part.copies)
+                    ops.extend((target, column[:, i].reshape(target.shape)) for column, target in part.columns)
+                    ops.append(part.slot)
+            ops.extend((wide[key][:, i], tensor) for key, tensor in unique.items())
+            if stream is not None:
+                landing, name = stream
+                token = buffers[name].reshape(buffers[name].shape[0], -1)[:, 0]
+                ops.append((landing.tokens[:token.shape[0], i], token))
+                ops.append((landing.landed, landing.counts[i:i + 1]))
+        self._run(ops)
+        return (
+            {key: wide[id(t)] for key, t in buffers.items()},
+            {key: wide[id(t)] for key, t in rows_out.items()},
+            {key: wide[id(t)] for key, t in spans_out.items()},
+        )
+
+    def launch_parts(
+        self, parts: Sequence[RunPart], repeats: int = 1,
+        columns: Sequence[Collection[str]] = (), *, capacity: int | None = None,
+        boundary: Sequence[tuple[torch.Tensor, torch.Tensor]] = (),
+        initial: Sequence[tuple[torch.Tensor, torch.Tensor]] = (),
+    ) -> list[BatchedModelOutput]:
+        """Replay a whole connected unit, retaining each member before the next.
+
+        ``boundary`` is simultaneous assignment between rounds. Its snapshots,
+        the input columns and retained outputs belong to the head capture slot;
+        changing a request's seed or a column's values does not recapture them.
+        The caller stages first-round seeds before entry. Group speculation is
+        disabled, and ordinary completion/output-copy ordering fences reuse.
+        """
+        capacity = repeats if capacity is None else capacity
+        if not parts or repeats < 1 or capacity < repeats or (columns and len(columns) != len(parts)):
+            raise ValueError("a connected run needs members, positive capacity and one column selection per member")
+        slot = parts[0].slot
+        # Describe storage independently of the active width. A different
+        # composition replaces this one slot's buffers rather than growing a cache.
+        needs, retained, staged, copied = [], [], [], []
+        for part, names in zip(parts, columns or [()] * len(parts), strict=True):
+            raw = part.slot.static_outputs
+            buffers = raw.check_stop_buffers or {}
+            rows = {name: raw.row_outputs[name] for name in sorted(names)}
+            spans = {name: raw.output_spans[name] for name in sorted(names) if name in (raw.output_spans or {})}
+            unique = {id(t): t.reshape(t.shape[0], -1)[:, 0] for t in buffers.values()}
+            unique.update((id(t), t) for t in (*rows.values(), *spans.values()))
+            indices = {}
+            if capacity > 1:
+                for key, tensor in unique.items():
+                    indices[key] = len(needs)
+                    needs.append((tensor, (tensor.shape[0], capacity, *tensor.shape[1:])))
+            retained.append((buffers, rows, spans, unique, indices))
+            member_copies = []
+            for source, target in part.copies:
+                index = None
+                if part.slot.row_heads:
+                    index = len(needs)
+                    needs.append((source, tuple(source.shape)))
+                member_copies.append((source, target, index))
+            copied.append(member_copies)
+            member_columns = []
+            for column, target in part.columns:
+                if column.shape[1] < repeats:
+                    raise ValueError("a connected input column is shorter than its run")
+                member_columns.append((column, target, len(needs)))
+                needs.append((column, (column.shape[0], capacity, *column.shape[2:])))
+            staged.append(member_columns)
+        snapshots, seeds = [], []
+        for source, target in initial:
+            seeds.append((source, target, len(needs)))
+            needs.append((source, tuple(source.shape)))
+        for source, target in boundary:
+            if source.numel() != target.numel():
+                raise ValueError("a connected boundary changes the number of elements")
+            snapshots.append((source, target, len(needs)))
+            needs.append((source, tuple(source.shape)))
+        storage_key = tuple((tensor.device, tensor.dtype, shape) for tensor, shape in needs)
+        if slot.composed_buffers_key != storage_key:
+            slot.composed_buffers = [tensor.new_empty(shape) for tensor, shape in needs]
+            slot.composed_buffers_key = storage_key
+        storage = slot.composed_buffers
+        outputs = []
+        for buffers, rows, spans, _, indices in retained:
+            def selected(values, indices=indices):
+                return {name: storage[indices[id(t)]][:, :repeats] if id(t) in indices else t
+                        for name, t in values.items()} or None
+            outputs.append(BatchedModelOutput(
+                check_stop_buffers=selected(buffers), row_outputs=selected(rows), output_spans=selected(spans),
+            ))
+        # Stage request-dependent columns before the composed launch. Captured
+        # operations refer only to the stable slot buffers.
+        for member_columns in staged:
+            for source, _, index in member_columns:
+                storage[index][:, :repeats].copy_(source[:, :repeats], non_blocking=True)
+        for source, _, index in seeds:
+            storage[index].copy_(source, non_blocking=True)
+        for _, target, index in seeds:
+            target.copy_(storage[index].reshape(target.shape), non_blocking=True)
+        ops: list[AcceleratorGraphSlot | tuple[torch.Tensor, torch.Tensor]] = []
+        for iteration in range(repeats):
+            if iteration:
+                ops.extend((storage[index], source) for source, _, index in snapshots)
+                ops.extend((target, storage[index].reshape(target.shape)) for _, target, index in snapshots)
+            for member, part in enumerate(parts):
+                ops.extend((storage[index], source) for source, _, index in copied[member] if index is not None)
+                ops.extend((target, (source if index is None else storage[index]).reshape(target.shape))
+                           for source, target, index in copied[member])
+                ops.extend((target, storage[index][:, iteration].reshape(target.shape))
+                           for _, target, index in staged[member])
+                ops.append(part.slot)
+                _, _, _, unique, indices = retained[member]
+                ops.extend((storage[index][:, iteration], unique[key]) for key, index in indices.items())
+        if self._device.type == "cpu":
+            self._run(ops)
+            return outputs
+        lowered, key = [], []
+        for op in ops:
+            if isinstance(op, tuple):
+                words = copy_words(*op)
+                if words is None:
+                    raise ValueError("connected graph copies need contiguous rows without casts")
+                lowered.append(op)
+                key.append(tuple(words))
+            else:
+                lowered.append(op.graph)
+                key.append(id(op.graph))
+        signature = tuple(key)
+        if slot.composed_graph is None or slot.composed_key != signature:
+            graph = self._graph_backend.compose(lowered)
+            slot.composed_graph, slot.composed_key = graph, signature
+        slot.composed_graph.replay()
+        return outputs
+
+    def captured_output(self, name: str) -> torch.Tensor | None:
+        """A capture's static output ``name``, row i request i; None if no capture has one."""
+        for bucket in self._buckets.values():
+            for slot in bucket.slots:
+                found = output_named(slot.static_outputs, name)
+                if found is not None:
+                    return found
+        return None
+
+    @property
+    def num_slots(self) -> int:
+        return self._num_slots
+
+    def token_stream(self, lease: SlotLease, signal: str, limit: int) -> TokenStream:
+        """Where a run on this slot leaves ``signal``'s tokens as they land."""
+        slot = self.slot_for(lease)
+        if slot.run is not None:
+            return slot.run.state.stream
+        if slot.token_stream is None:
+            rows = slot.static_outputs.check_stop_buffers[signal].shape[0]
+            slot.token_stream = TokenStream(rows, limit, self._device)
+        return slot.token_stream
+
+    def _run(self, ops: Sequence[tuple[torch.Tensor, torch.Tensor] | AcceleratorGraphSlot]) -> None:
+        """A run's launches (a slot, its graph) and copies (target, source), in
+        order: from one Rust call with the GIL released where every slot it
+        launches can (``mstar_rust.launch_run``), else here."""
+        raw = all(op.raw_launch for op in ops if not isinstance(op, tuple))
+        launches = {
+            id(op): self._graph_backend.raw_launch(op.graph) for op in ops if raw and not isinstance(op, tuple)
+        }
+        words = _launch_words([op if isinstance(op, tuple) else launches[id(op)].exec for op in ops]) if raw else None
+        if words is not None and launches:
+            import mstar_rust
+
+            first = next(iter(launches.values()))
+            mstar_rust.launch_run(first.graph_launch, first.memcpy_2d, first.stream, words)
+            return
+        for op in ops:
+            if isinstance(op, tuple):
+                op[0].copy_(op[1], non_blocking=True)
+            else:
+                op.graph.replay()
+
+    def launch_refusal(self, walk: str) -> str | None:
+        """After capture: why a run of ``walk`` can't launch from one Rust call,
+        or None. A raw launch doesn't move torch's generators, so a capture
+        that draws from one would repeat its draws (mstar's samplers pass
+        explicit seeds and offsets)."""
+        if (refusal := self._graph_backend.launch_refusal()) is not None:
+            return f"backend: {refusal}"
+        if walk in self._generator_walks:
+            return "runner: its forward draws from a torch generator, which a raw launch doesn't advance"
+        for bucket in self._buckets.values():
+            if bucket.config.capture_graph_walk == walk:
+                for slot in bucket.slots:
+                    slot.raw_launch = True
+        return None
+
+    def carry_refusal(self, walk: str, carries: Mapping[str, CarryPair]) -> str | None:
+        """Why a run of ``walk``'s captures can't carry each loop-back signal
+        between replays, or None: its output and the static input it feeds
+        must both be buffers the capture holds, the same size."""
+        for bucket in self._buckets.values():
+            if bucket.config.capture_graph_walk != walk:
+                continue
+            for slot in bucket.slots:
+                for signal, pair in sorted(carries.items()):
+                    source = output_named(slot.static_outputs, pair.output)
+                    target = slot.static_inputs.get(pair.input)
+                    if source is None or not isinstance(target, torch.Tensor):
+                        return f"its capture holds no {pair.output!r} -> {pair.input!r} to carry loop-back {signal!r}"
+                    if source.numel() != target.numel():
+                        return (
+                            f"loop-back {signal!r} leaves {tuple(source.shape)} in {pair.output!r}, "
+                            f"but its input {pair.input!r} is {tuple(target.shape)}"
+                        )
+        return None
+
+    def row_refusal(self, walk: str, outputs: Mapping[str, str]) -> str | None:
+        """Why ``walk``'s captures can't keep each loop-back signal's value in
+        a fixed-shape row per request (``outputs``: signal -> the output that
+        holds it), or None: each must be a buffer of every capture, one row
+        per request, the same shape in every bucket."""
+        shapes: dict[str, set[tuple[int, ...]]] = {signal: set() for signal in outputs}
+        for bucket in self._buckets.values():
+            if bucket.config.capture_graph_walk != walk:
+                continue
+            for slot in bucket.slots:
+                for signal, output in sorted(outputs.items()):
+                    value = output_named(slot.static_outputs, output)
+                    if value is None:
+                        return f"its capture holds no {output!r} for loop-back {signal!r}"
+                    shapes[signal].add(tuple(value.shape[1:]))
+        for signal, seen in sorted(shapes.items()):
+            if not seen:
+                return "it has no capture"
+            if len(seen) > 1:
+                return f"loop-back {signal!r} changes shape with the bucket"
+        return None
+
+    def run_column_refusal(self, walk: str, signals: Collection[str]) -> str | None:
+        """Why a run of ``walk``'s captures can't keep a column per replay of
+        each of ``signals``, or None: each must be a row output, row i for
+        request i."""
+        for bucket in self._buckets.values():
+            if bucket.config.capture_graph_walk != walk:
+                continue
+            for slot in bucket.slots:
+                rows = slot.static_outputs.row_outputs or {}
+                missing = sorted(name for name in signals if not isinstance(rows.get(name), torch.Tensor))
+                if missing:
+                    return f"its capture returns {missing} other than as row outputs"
+        return None
 
     def run_forward(
         self, lease: SlotLease, preprocessed: dict[str, Any],
@@ -1805,9 +2553,8 @@ class PiecewiseAcceleratorGraphRunner:
         self._current_slot = 0
 
     def _size_slots(self) -> None:
-        """A region has no pre-plan path, so a second slot buys nothing unless a
-        resource its step touches stages into a reused host buffer behind an
-        async H2D (see ``Resource.force_double_buffer``)."""
+        """Retain the component count for buffers another node can pre-plan,
+        or whose host staging may still be in flight when this region runs."""
         if self._max_slots <= 1:
             return
         for shape in self._config.get_capture_shapes(self._capture_batch_sizes):
@@ -1818,7 +2565,8 @@ class PiecewiseAcceleratorGraphRunner:
                 list(shape.seq_lens),
             )
             if step is not None and any(
-                self._resources[key].force_double_buffer for key in step.steps
+                resource.force_double_buffer or (knobs.pre_plan_enabled() and resource.supports_preplan)
+                for resource in reachable_resources(self._resources, step.steps).values()
             ):
                 self._num_slots = self._max_slots
                 return

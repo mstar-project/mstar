@@ -150,20 +150,17 @@ class WorkerGraphIO:
                 check_next_iter=dest == source_node,
                 allow_streaming=True
             ):
-                # ``loop_name`` is the destination's enclosing loop — that's
-                # what callers need to inspect ``curr_iter`` / ``max_iters`` /
-                # ``_finish_signal`` for the loop-completion filter. Source's
-                # loop is irrelevant once we know which node is the spec target.
+                # A loop-back crosses the source Loop; an inner destination
+                # may still hold the completed state of its previous entry.
                 dest_reg = node._managing_registry
-                dest_loop_name = (
-                    dest_reg.loop.name
-                    if isinstance(dest_reg, LoopStateRegistry)
-                    else None
+                loop_name = (
+                    source_reg.loop.name if dest in next_iter_nodes else
+                    dest_reg.loop.name if isinstance(dest_reg, LoopStateRegistry) else None
                 )
                 ready_for_spec.append(SpeculativeNodeInfo(
                     node_name=dest,
                     is_new_loop_iter=dest in next_iter_nodes,
-                    loop_name=dest_loop_name,
+                    loop_name=loop_name,
                 ))
         return ready_for_spec
 

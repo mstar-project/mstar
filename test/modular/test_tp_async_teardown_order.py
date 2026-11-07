@@ -6,8 +6,8 @@ free, and once the pool is full a follower can refuse an admit rank 0 grants. Ra
 forwards each teardown stamped with the last step it has broadcast. A follower holds it
 until it has popped that step, and reads no message between popping a step and the admit
 fence at the top of the next pass, so it lands after that admit. Rank 0 lands it there too.
-When the follower drops a step it popped, it tears the held ones down before it takes the
-next. A removal deferred behind step N is retried once N is post-processed, when N+1 is
+When the follower drops a step, popped or dropped on arrival, it tears the held ones down
+before it takes the next. A removal deferred behind step N is retried once N is post-processed, when N+1 is
 speculated, broadcast and maybe not yet admitted; but ``_remove_request`` defers it again
 while N is still the step in flight, and the next pass tears it down behind N+1's admit
 fence. A removal that reaches rank 0 once N is done, with nothing in flight, lands before
@@ -33,8 +33,14 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from mstar.engine.resources.kv.cache import PageAllocator  # noqa: E402
+from mstar.model.submodule_base import BatchedModelOutput  # noqa: E402
 from mstar.utils.containers import RecentSet  # noqa: E402
-from mstar.utils.ipc_format import MessageSource, RemoveRequest, WorkerMessageType  # noqa: E402
+from mstar.utils.ipc_format import (  # noqa: E402
+    MessageSource,
+    RemoveRequest,
+    ScheduleTPNode,
+    WorkerMessageType,
+)
 from mstar.worker import worker as worker_mod  # noqa: E402
 from mstar.worker.stream_buffers import StreamBufferManager  # noqa: E402
 from mstar.worker.worker import Worker  # noqa: E402
@@ -55,14 +61,15 @@ class _Stop(BaseException):
 def _batch(seq: int, rids: list[int]):
     """A step's scheduled and executing halves."""
     scheduled = SimpleNamespace(
-        node_name=NODE, graph_walk=WALK, tp_seq=seq,
+        node_name=NODE, graph_walk=WALK, tp_seq=seq, repeats=1,
         request_to_worker_graph={rid: 0 for rid in rids},
         chunk_ranges={}, incomplete_node_rids=set(),
         rids_by_walk=lambda: {WALK: list(rids)},
     )
     executing = SimpleNamespace(
         node_name=NODE, request_ids=list(rids), admit_error=None, failed_requests={},
-        launch_started_event=None, read_check_rids=None,
+        launch_started_event=None, read_check_rids=None, step_context=SimpleNamespace(repeats=1),
+        run_started=None, run_rows={},
     )
     return scheduled, executing
 
@@ -72,7 +79,7 @@ def _speculation(seq: int, rids: list[int]):
     return SimpleNamespace(
         scheduled_batch=scheduled, node_batch=executing, is_yield_away=False,
         plan_future=None, partition="p", is_new_iter=False, loop_name=None,
-        tp_seq=seq, dropped=set(),
+        tp_seq=seq, dropped=set(), continuing_rids=frozenset(rids),
     )
 
 
@@ -97,7 +104,10 @@ class _Scheduler:
         return self.heads[0] if self.heads else None
 
     def pop_tp_follow_head(self):
-        self.last_consumed_tp_seq = self.heads.pop(0).spec_seq
+        self.consume_tp_follow(self.heads.pop(0))
+
+    def consume_tp_follow(self, message):
+        self.last_consumed_tp_seq = message.spec_seq
 
     def take_admit_errors(self):
         return {}
@@ -163,7 +173,8 @@ def _rank(
             log.append(("forward", msg.body.request_id, msg.body.after_tp_seq))
 
     w.engine_manager = SimpleNamespace(
-        warmup_all=lambda: None, remove_request=_tear_down,
+        warmup_all=lambda *args: None, remove_request=_tear_down,
+        get_engine=lambda node: SimpleNamespace(iteration_layouts=lambda node: None),
     )
     w.communicator = SimpleNamespace(send=_send, wait_for_work=lambda timeout: None)
     w.request_state = SimpleNamespace(
@@ -175,7 +186,7 @@ def _rank(
     w.parallel_groups = SimpleNamespace(
         barrier_all=lambda: None, restore_default_timeout=lambda: None,
     )
-    w.wakeup_event = SimpleNamespace(register_future=lambda future: None)
+    w.wakeup_event = SimpleNamespace(register_future=lambda future: None, drain=lambda: False)
 
     def _broadcast(node_batch, **kwargs):
         if tp_rank:
@@ -204,13 +215,15 @@ def _rank(
             torn_down.wait(HOLD_S)
         log.append(("admit", batch.tp_seq))
         node_batch.launch_started_event.set()
-        return {}
+        return BatchedModelOutput()
 
     passes = iter(inbox)
 
     def _process_messages():
-        for body in next(passes, []):
+        bodies = next(passes, [])
+        for body in bodies:
             w._remove_request(body)
+        return bool(bodies)
 
     w._process_messages = _process_messages
     w._build_executing_batch = lambda batch: _batch(
@@ -375,9 +388,107 @@ def test_a_follower_that_drops_a_step_tears_down_before_it_takes_the_next(monkey
     assert log.index(("teardown", "gone")) < log.index(("admit", 2)), log
 
 
-def test_the_admit_fence_waits_out_a_slow_admit(monkeypatch):
+def test_a_removal_taken_in_during_a_run_waits_for_the_step_behind_the_run(monkeypatch):
+    """A run's wait reads messages before N is post-processed, with N+1 already on the GPU
+    thread. N+1 took in "idle" fresh, so N's rows alone don't cover it."""
+    w, log = _rank(monkeypatch, tp_rank=0, inbox=[[], [], [RemoveRequest(request_id="idle")]])
+    w.scheduler.has_ready_excluding = lambda state, key: False
+    w._is_device_run = lambda step: step.tp_seq == 0
+    landed = iter([False, True])
+    build_executing, build_speculation = w._build_executing_batch, w._build_speculation
+
+    def _executing(batch):
+        node_batch = build_executing(batch)
+        node_batch.token_stream = None
+        node_batch.completion_event = SimpleNamespace(query=lambda: next(landed))
+        return node_batch
+
+    def _speculation_taking_idle(pending, consecutive, fair):
+        spec, gave_way = build_speculation(pending, consecutive, fair)
+        if spec is not None:
+            spec.scheduled_batch, spec.node_batch = _batch(1, [HANDLES["idle"]])
+        return spec, gave_way
+
+    w._build_executing_batch = _executing
+    w._build_speculation = _speculation_taking_idle
+    deferred_by_n = []
+    w._finish_step = lambda step, outputs: deferred_by_n.extend(w._pending_removes)
+    _run(w)
+
+    assert deferred_by_n == [HANDLES["idle"]] and ("teardown", "idle") not in log, log
+
+
+def test_a_follower_counts_a_head_it_drops_on_arrival(monkeypatch):
+    """N raises, and rank 0's head from it lands after that, so this rank drops it unqueued.
+    Rank 0 stamped "gone" with that head, and the row "gone" gave up let it send N+2 for a
+    waiting request. N+2 can't take its row here until "gone" goes, so the teardown can't
+    wait for a step past the dropped one: both ranks would sit there for good."""
+    head = ScheduleTPNode(
+        node_name=NODE, graph_walk=WALK, request_ids=["kept"],
+        speculative=True, spec_seq=1, spec_from_seq=0,
+    )
+    removal = RemoveRequest(request_id="gone", source=MessageSource.TP_RANK_0, after_tp_seq=1)
+    w, log = _rank(monkeypatch, tp_rank=1, inbox=[])
+    w.tp_async_sched, w.tp_async_nodes = True, None
+    w.scheduler.heads.clear()
+    w.scheduler.steps += [None, [HANDLES["kept"]]]
+    gpu, next_batch = w._execute_on_gpu_thread, w.scheduler.get_next_batch
+
+    def _raise_on_n(batch, node_batch, plan_future=None):
+        gpu(batch, node_batch, plan_future)
+        if batch.tp_seq == 0:
+            raise RuntimeError("forward failed")
+        return BatchedModelOutput()
+
+    def _row_waits_on_the_teardown(request_state, **kwargs):
+        if w.scheduler.last_consumed_tp_seq < 0 or ("teardown", "gone") in log:
+            return next_batch(request_state, **kwargs)
+        return None
+
+    passes = iter(range(50))
+    undelivered = [head, removal]
+
+    def _process_messages():
+        if next(passes, None) is None:
+            raise _Stop  # the hang: nothing will ever move
+        if 0 in w._tp_nospec and undelivered:
+            w._register_tp_follow(undelivered.pop(0))
+            w._remove_request(undelivered.pop(0))
+
+    def _speculation_or_stop(pending, consecutive, fair):
+        if pending is not None and pending.tp_seq == 2:
+            raise _Stop
+        return None, None
+
+    w._execute_on_gpu_thread = _raise_on_n
+    w.scheduler.get_next_batch = _row_waits_on_the_teardown
+    w._process_messages = _process_messages
+    w._build_speculation = _speculation_or_stop
+    w._handle_main_loop_error = lambda *args: None
+    _run(w)
+
+    assert log.index(("teardown", "gone")) < log.index(("admit", 2)), log
+
+
+def _run_waits_on(w, pending):
+    """A run's wait, with ``pending`` the step behind it (review-r7 G9)."""
+    w._hold_rows = lambda lane, rows: None
+    w.engine_manager = SimpleNamespace(get_engine=lambda node: None)
+    w.scheduler = SimpleNamespace(has_ready_excluding=lambda state, key: False)
+    w.request_state = None
+    run = SimpleNamespace(
+        node_name=NODE, graph_walk=WALK, batch=SimpleNamespace(request_to_worker_graph={}),
+        node_batch=SimpleNamespace(token_stream=None, run_rows={},
+                                   completion_event=SimpleNamespace(query=lambda: True)),
+    )
+    w._await_run(run, pending, [], None)
+
+
+@pytest.mark.parametrize("fence", [Worker._await_admit_settled, _run_waits_on])
+def test_the_admit_fence_waits_out_a_slow_admit(monkeypatch, fence):
     """The fence waits past any number of warning intervals; it never gives up.
-    A lone-rank step (``tp_seq=-1``) is the case that used to."""
+    A lone-rank step (``tp_seq=-1``) is the case that used to. A run's wait
+    holds the same fence, and says so as it waits."""
     tp_seq = -1
     monkeypatch.setattr(worker_mod, "_ADMIT_FENCE_WARN_S", 0.001)
     admitted = threading.Event()
@@ -392,12 +503,15 @@ def test_the_admit_fence_waits_out_a_slow_admit(monkeypatch):
     w = Worker.__new__(Worker)
     w.worker_id = "rank0"
     w._span = lambda name: nullcontext()
-    _, executing = _batch(tp_seq, [HANDLES["kept"]])
+    scheduled, executing = _batch(tp_seq, [HANDLES["kept"]])
     executing.launch_started_event = admitted
     pending = SimpleNamespace(
-        tp_seq=tp_seq, node_name=NODE, graph_walk=WALK, node_batch=executing,
+        tp_seq=tp_seq, node_name=NODE, graph_walk=WALK, batch=scheduled, node_batch=executing,
     )
 
-    w._await_admit_settled(pending)
+    backstop = threading.Timer(2.0, admitted.set)  # a fence that never warns would wait for good
+    backstop.start()
+    fence(w, pending)
+    backstop.cancel()
 
     assert admitted.is_set() and len(warnings) == 3

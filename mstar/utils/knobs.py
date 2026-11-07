@@ -63,11 +63,11 @@ def check(settings: Mapping[str, object] | None) -> dict[str, str]:
 
 
 def _resident_planning_value(value: object) -> str:
-    # yaml reads a bare ``off`` as False
-    text = "off" if value is False else str(value).strip().lower()
-    if text in ("auto", "off"):
+    # yaml reads a bare ``on`` / ``off`` as a bool
+    text = ("on" if value else "off") if isinstance(value, bool) else str(value).strip().lower()
+    if text in ("on", "off", "auto"):
         return text
-    raise ValueError(f"`knobs: resident_planning` must be auto or off, got {value!r}")
+    raise ValueError(f"`knobs: resident_planning` must be on, off or auto, got {value!r}")
 
 
 def _step_thread_core_value(value: object) -> str:
@@ -116,11 +116,11 @@ def device_loopback_enabled() -> bool:
 
 def sampler_ingraph_scatter() -> bool:
     """``sampler_ingraph_scatter`` / ``MSTAR_SAMPLER_INGRAPH_SCATTER`` (default
-    on): the captured sampler gathers its RNG offsets from the slot masters
-    and scatters the advanced offsets and the sampled tokens back inside the
+    on): the captured sampler gathers its state from the slot masters
+    and persists RNG, history and token presence back inside the
     graph, so a replayed step issues none of those launches on the gpu thread
     (each is a GIL release the main thread's postprocess can win). Padding
-    rows then address a trash master row, and the offset and last-token
+    rows then address a trash master row, and the state
     masters are allocated once for ``sampler_slots`` concurrent requests,
     since a captured graph holds their addresses; a request takes its row at
     admission and waits while none is free."""
@@ -242,10 +242,11 @@ def idle_hold() -> str:
     raise ValueError(f"MSTAR_IDLE_HOLD must be qos or off, got {value!r}")
 def resident_planning() -> str:
     """``resident_planning`` / ``MSTAR_RESIDENT_PLANNING`` (default ``auto``):
-    a captured decode step reads its rows off per-request tables held on the
-    device instead of having them rebuilt on the plan thread
-    (``mstar.engine.resources.resident``). ``auto`` turns it on for a node
-    whose submodule names resident walks and every resource of which is
-    resident-capable, and says why at startup when one is not; ``off`` keeps
-    the host plan everywhere."""
+    ``on`` has a captured step read its rows off per-request tables held on
+    the device instead of having them rebuilt on the plan thread
+    (``mstar.engine.resources.resident``), on each walk that runs a node in a
+    Loop where every owner of a fact it needs agrees (its capture, its declared
+    step, each resource, its ``preprocess``); one line per such walk at startup
+    says which. ``off`` keeps the host plan everywhere. ``auto`` is ``on`` for
+    a node whose submodule sets ``resident_by_default`` and ``off`` elsewhere."""
     return _resident_planning_value(_setting("resident_planning", "auto"))

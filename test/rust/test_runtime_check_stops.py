@@ -90,7 +90,7 @@ def test_the_runtime_stops_what_the_policy_does_through_a_speculated_loop(seed, 
         got = w._graph_runtime.check_stops(
             req.partition, req.node_name, req.graph_walk, list(req.wg_ids.keys),
             req.tokens, list(req.row_rids),
-        )
+        ).stops
         assert got == _expected(nb, host_rows)
         stopped += len(got)
         pending = _advance(w, pending, spec)
@@ -102,7 +102,7 @@ def test_limits_are_dropped_with_the_request():
     rt = w._graph_runtime
     (rid,) = _admit(w, 1)
     rt.register_stop_limits(rid, w.request_state.get_fwd_info(rid, PART))
-    assert rt.check_stops(PART, NODE, WALK, [rid], None, []) == {}
+    assert rt.check_stops(PART, NODE, WALK, [rid], None, []).stops == {}
     rt.remove_request(rid)
     w.request_state.remove_request(rid)
     (again,) = _admit(w, 1, start=1)

@@ -33,10 +33,10 @@ from mstar.engine.resources.runner import StepRunner
 from mstar.engine.resources.step import ADMIT_OK, AllocationFailed, Segment, StepContext, SubmoduleStep
 from mstar.graph.base import GraphEdge, GraphNode, Loop
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
-from mstar.model.submodule_base import BatchedModelOutput, DeviceLoopback, NodeSubmodule, TokenStop
+from mstar.model.submodule_base import BatchedModelOutput, NodeSubmodule
 from mstar.utils.device import DeviceCapability
 from mstar.utils.threads import ThreadPool
-from mstar.worker.engine_manager import EngineManager, _refuse_unservable_lanes, node_lanes
+from mstar.worker.engine_manager import EngineManager, _refuse_unservable_lanes, walk_lanes
 from mstar.worker.lanes import Lane, finish_first_to_land
 from mstar.worker.micro_scheduler import CHAIN_LANE, ScheduledBatch
 from mstar.worker.worker import PendingBatch, Worker
@@ -72,6 +72,7 @@ def _step(rids, landed=True, done=True, failed=None, lane=LANE):
     return PendingBatch(
         batch=_batch(rids), node_batch=SimpleNamespace(
             completion_event=SimpleNamespace(query=lambda: landed), failed_requests=dict(failed or {}),
+            token_stream=None,
             admit_error=None,
         ),
         node_name=CODEC[0], partition="Codec", graph_walk=CODEC[1], future=future, lane=lane,
@@ -134,15 +135,21 @@ def test_the_window_collates_on_the_lane_stream_before_the_step_is_submitted():
     assert worker.log == ["enter lane 1", "build", "exit lane 1", "in flight True", "submit"]
 
 
-def test_a_step_that_staged_host_rows_fails():
-    """Host rows stage through a ring the chain's next steps reuse before a
-    step off the chain lands; the startup refusal can't see an undeclared stop buffer."""
-    worker = _worker()
-    worker._execute_on_gpu_thread = lambda *a: SimpleNamespace(host_rows=object(), host_spans=None)
-    lane = Lane(worker, LANE)
+def test_a_lanes_host_rows_stage_through_a_ring_of_its_own():
+    """The chain's next steps reuse the chain's ring before a lane's step lands,
+    so a lane's stop buffers and spans stage through its own."""
+    from mstar.worker.worker import Worker
 
-    with pytest.raises(RuntimeError, match="stop buffers or output spans"):
-        lane.execute(_batch([1]), object(), None)
+    worker = Worker.__new__(Worker)
+    worker._host_rows_slots = {}
+    staged = []
+    worker._copy_to_pinned = lambda buffers, purpose: staged.append(purpose) or dict(buffers)
+    for lane in (CHAIN_LANE, LANE, CHAIN_LANE, CHAIN_LANE, CHAIN_LANE, CHAIN_LANE):
+        worker._stage_host_rows(SimpleNamespace(
+            check_stop_buffers={"tok": torch.zeros(1)}, row_request_ids=[1], output_spans=None,
+        ), lane)
+    lane_ring = {p for p in staged if "lane" in p}
+    assert lane_ring == {f"host_rows_lane{LANE}_1"} and not lane_ring & (set(staged) - lane_ring)
 
 
 def test_the_submitted_step_takes_the_lane_body_and_lifts_the_launch_fence():
@@ -532,6 +539,7 @@ def _state_engine(pool, chain_pool=None):
     resources = {POOL: pool, **({"talker_state": chain_pool} if chain_pool is not None else {})}
     eng = Engine.__new__(Engine)
     eng._device_capability = _Device()
+    eng._walk_lanes = {CODEC: LANE}
     eng._node_lanes = {"Codec": LANE}
     eng._lane_streams = {LANE: _Stream()}
     eng._runner = StepRunner(resources, node_resources={
@@ -629,6 +637,30 @@ def test_a_lane_step_leaves_the_chains_staged_pre_plan_alone():
     assert eng._runner.plan(chain)["talker_state"] is staged, "the chain's step planned afresh"
 
 
+def test_a_step_with_no_resources_leaves_the_chains_staged_pre_plan_alone():
+    """A step that declares no resource (BAGEL's combine_cfg) touches nothing the
+    stage holds, so it neither drops it nor promotes it; and a run of it has no
+    replay columns and nothing to take back."""
+    pool, talker = _pool(), _pool("talker_state", "Talker")
+    eng = _state_engine(pool, talker)
+    eng.add_request(9)
+    chain = SubmoduleStep(segments=[Segment(9, "main", 1)], steps={"talker_state": RecurrentStep()})
+    chain.set_ctx(StepContext(request_ids=(9,), graph_walk="talker_decode", slot=0, capture=False))
+    chain.ctx.is_preplan = True
+    assert eng._runner.pre_admit(chain).ok
+    eng._runner.pre_plan(chain)
+    chain.ctx.is_preplan = False
+    empty = SubmoduleStep(segments=[], steps={})
+    empty.set_ctx(StepContext(request_ids=(5,), graph_walk="combine", slot=0, capture=False, repeats=4))
+
+    assert eng._runner.admit(empty).ok
+    eng._runner.plan(empty)
+
+    assert eng._runner.staged and talker._preplanned, "a step with no resources dropped the chain's stage"
+    assert eng._runner.replay_columns(empty, 4) == [] and eng._runner.replay_columns(None, 4) == []
+    eng._runner.settle_run(None, {5: 2})
+
+
 @pytest.mark.parametrize("stage", ["admit", "plan"])
 def test_a_raise_in_a_lane_steps_admit_or_plan_fails_its_own_rows(monkeypatch, stage):
     pool, talker = _pool(), _pool("talker_state", "Talker")
@@ -706,7 +738,7 @@ def test_a_full_pool_keeps_the_row_queued_while_the_chain_runs_on():
 # ----- the scheduler ---------------------------------------------------------
 
 def _lanes(sched, node=NODE):
-    sched.lane_of = {node: LANE}
+    sched.lane_of = {(node, WALK): LANE}
     return sched
 
 
@@ -736,6 +768,18 @@ def test_a_lane_walks_backlog_stays_on_its_lane():
     assert _next_batch(sched, manager) is None
     second = _next_batch(sched, manager, lane=LANE)
     assert {*first.request_to_worker_graph, *second.request_to_worker_graph} == {1, 2}
+
+
+def test_a_nodes_walk_on_a_lane_leaves_its_other_walks_on_the_chain():
+    """Lanes are per walk: a prompt walk beside the chain, the same node's
+    decode on it."""
+    sched = _scheduler(_Engine())
+    sched.lane_of = {(NODE, "prefill"): LANE}
+
+    assert _next_batch(sched, _Manager([1], walk="prefill")) is None
+    assert sorted(_next_batch(sched, _Manager([1], walk="prefill"), lane=LANE).request_to_worker_graph) == [1]
+    assert _next_batch(sched, _Manager([2]), lane=LANE) is None
+    assert sorted(_next_batch(sched, _Manager([2])).request_to_worker_graph) == [2]
 
 
 def test_a_lane_never_takes_the_chains_keys():
@@ -845,9 +889,6 @@ class _Codec:
     def spanned_outputs(self, walk):
         return frozenset()
 
-    def resident_walks(self):
-        return frozenset()
-
 
 class _Groups:
     def __init__(self, world=1):
@@ -860,52 +901,67 @@ class _Groups:
 def _placed(submodules=None, model=None, nodes=("Codec", "Talker"), lanes=None, groups=None, graph_backend=True):
     return _refuse_unservable_lanes(
         submodules or {"Codec": _Codec(), "Talker": object()}, model or _Model(),
-        nodes, {"Codec": LANE} if lanes is None else lanes, groups or _Groups(), graph_backend,
+        nodes, {CODEC: LANE} if lanes is None else lanes, groups or _Groups(), graph_backend,
     )
 
 
-def test_a_node_placed_off_the_chain_takes_its_lane_with_every_walk():
-    assert _placed() == {"Codec": LANE}
+def test_a_walk_placed_off_the_chain_takes_its_lane():
+    assert _placed() == {CODEC: LANE}
 
 
 def test_two_nodes_take_two_lanes():
     model = _Model({"codec_chunk": _codec_node(), "vocode": _codec_node("Vocoder"),
                     "talker_decode": _codec_node("Talker")})
-    lanes = {"Codec": 1, "Vocoder": 2}
+    lanes = {CODEC: 1, ("Vocoder", "vocode"): 2}
 
     assert _placed({"Codec": _Codec(), "Vocoder": _Codec(), "Talker": object()}, model,
                    ("Codec", "Vocoder", "Talker"), lanes) == lanes
 
 
-def test_the_field_is_read_per_node_and_must_agree():
+def test_a_walk_whose_node_follows_a_chain_node_takes_its_lane_and_the_chain_never_speculates_into_it():
+    """Whisper's prefill is Sequential([encoder, decoder]): with the decoder's
+    prefill on a lane, the encoder's step on the chain hands it rows, which the
+    lane runs; the chain doesn't take them as its next step."""
+    from mstar.graph.base import Sequential
+
+    prefill = Sequential([_codec_node("Encoder"), _codec_node()])
+    model = _Model({"codec_chunk": prefill, "talker_decode": _codec_node("Talker")})
+    assert _placed({"Codec": _Codec(), "Encoder": object(), "Talker": object()}, model,
+                   ("Codec", "Encoder", "Talker")) == {CODEC: LANE}
+
+    ready = [SimpleNamespace(node_name=node, graph_walk="codec_chunk") for node in ("Codec", "Encoder")]
+    worker = Worker.__new__(Worker)
+    worker._graph_runtime = SimpleNamespace(speculate_node=lambda *args: ready)
+    worker.chunk_loops = SimpleNamespace(walks=frozenset())
+    worker._lanes = (object(),)
+    worker.scheduler = SimpleNamespace(lane_of={CODEC: LANE})
+    batch = ScheduledBatch(node_name="Encoder", graph_walk="codec_chunk", request_to_worker_graph={1: 0})
+    assert worker._choose_spec_target(batch).info.node_name == "Encoder"
+    worker.scheduler.lane_of[("Encoder", "codec_chunk")] = LANE
+    assert worker._choose_spec_target(batch) is None
+
+
+def test_the_field_is_read_per_walk_and_must_agree():
+    """A group places its graph_walks, or every walk of its nodes; every walk of
+    a node with one off the chain is listed."""
+    walks = {"Talker": {"talker_decode"}, "Codec": {"codec_chunk", "codec_warm"}, "Vocoder": {"vocode"}}
     groups = [{"node_names": ["Talker"]}, {"node_names": ["Codec"], "lane": 1}, {"node_names": ["Vocoder"], "lane": 0}]
-    assert node_lanes(groups) == {"Codec": 1}
+    assert walk_lanes(groups, walks) == {CODEC: 1, ("Codec", "codec_warm"): 1}
+    split = [{"node_names": ["Codec"], "graph_walks": ["codec_warm"]},
+             {"node_names": ["Codec"], "graph_walks": ["codec_chunk"], "lane": 1}]
+    assert walk_lanes(split, walks) == {CODEC: 1, ("Codec", "codec_warm"): 0}
+    # another worker's decode is no chain here: this worker's only walk of the node is on the lane
+    assert walk_lanes(split, {"Codec": {"codec_chunk"}}) == {CODEC: 1}
+    with pytest.raises(ValueError, match="no chain to run beside"):
+        _placed(nodes=("Codec",), submodules={"Codec": _Codec()}, lanes=walk_lanes(split, {"Codec": {"codec_chunk"}}))
     with pytest.raises(ValueError, match="different lanes"):
-        node_lanes(groups + [{"node_names": ["Codec"], "lane": 2}])
+        walk_lanes(groups + [{"node_names": ["Codec"], "graph_walks": ["codec_chunk"], "lane": 2}], walks)
     for bad in ("yes", True, -1):
         with pytest.raises(ValueError, match="takes a lane id"):
-            node_lanes([{"node_names": ["Codec"], "lane": bad}])
+            walk_lanes([{"node_names": ["Codec"], "lane": bad}], walks)
     # the field it replaced fails loudly rather than leaving the node on the chain
     with pytest.raises(ValueError, match="side_stream was replaced by lane"):
-        node_lanes([{"node_names": ["Codec"], "side_stream": True}])
-
-
-class _Spans(_Codec):
-    def spanned_outputs(self, walk):
-        return frozenset({"audio_chunk"})
-
-
-class _Stops(_Codec):
-    token_stop = TokenStop(loop="decode", buffer="tok", stop_ids=frozenset({0}), sampler="s")
-
-
-class _Loops(_Codec):
-    device_loopback = DeviceLoopback(walk="codec_chunk", signal="tok", sampler="s", buffer="tok")
-
-
-class _Resident(_Codec):
-    def resident_walks(self):
-        return frozenset({"codec_chunk"})
+        walk_lanes([{"node_names": ["Codec"], "side_stream": True}], walks)
 
 
 _LOOP = Loop(name="decode_loop", section=_codec_node(), max_iters=4, outputs=[])
@@ -915,26 +971,15 @@ _LOOP = Loop(name="decode_loop", section=_codec_node(), max_iters=4, outputs=[])
     (dict(groups=_Groups(world=2)), "tensor or sequence parallel"),
     (dict(nodes=("Codec",)), "no chain to run beside"),
     (dict(graph_backend=False), "no accelerator-graph backend"),
-    (dict(model=_Model({"codec_chunk": _codec_node(), "codec_warm": _LOOP})), "speculate into"),
-    (dict(model=_Model({"codec_chunk": _LOOP})), "speculate into"),
-    (dict(submodules={"Codec": _Resident(), "Talker": object()}), "resident tables"),
+    (dict(model=_Model({"codec_chunk": _codec_node(), "codec_warm": _LOOP}),
+          lanes={CODEC: LANE, ("Codec", "codec_warm"): LANE}), "runs a loop"),
+    (dict(model=_Model({"codec_chunk": _LOOP})), "runs a loop"),
     (dict(model=_Model(combined={CODEC: "codec_mixed"})), "combined walk"),
-    (dict(submodules={"Codec": _Spans(), "Talker": object()}), "output spans or a stop check"),
-    (dict(submodules={"Codec": _Stops(), "Talker": object()}), "output spans or a stop check"),
-    (dict(submodules={"Codec": _Loops(), "Talker": object()}), "output spans or a stop check"),
 ])
 def test_what_a_lane_cannot_serve_is_refused_naming_the_field(kwargs, reason):
     with pytest.raises(ValueError, match=reason) as raised:
         _placed(**kwargs)
     assert "placed on lane 1" in str(raised.value) or "off the chain" in str(raised.value)
-
-
-def test_a_resident_walk_takes_the_lane_where_resident_planning_is_off(monkeypatch):
-    from mstar.utils import knobs
-
-    monkeypatch.setattr(knobs, "resident_planning", lambda: "off")
-
-    assert _placed({"Codec": _Resident(), "Talker": object()}) == {"Codec": LANE}
 
 
 class _Owned(Resource):
@@ -959,11 +1004,6 @@ class _Evicting(_Owned):
     @property
     def supports_eviction(self):
         return True
-
-
-class _HostRows(_Owned):
-    def step_host_rows(self):  # pragma: no cover - never called
-        return {}
 
 
 class _Dependent(_Owned):
@@ -1008,7 +1048,6 @@ def test_a_lane_holds_the_resources_of_its_nodes_alone_whatever_their_kind():
                                                                  "state": {"Codec"}}, {}, "depends on .'state'"),
     ({"state": _Owned()}, {"state": {"Codec"}}, dict(prefix_caches={"state"}), "prefix cache"),
     ({"state": _Evicting()}, {"state": {"Codec"}}, {}, "moves its state outside the step"),
-    ({"state": _HostRows()}, {"state": {"Codec"}}, {}, "host rows"),
 ])
 def test_a_resource_a_lane_cannot_hold_alone_is_refused(resources, declared_by, kwargs, reason):
     with pytest.raises(ValueError, match=reason):
@@ -1117,4 +1156,87 @@ def test_a_cpu_build_that_asks_for_the_lane_fails_at_startup():
             transfer_engine_info=TransferEngineInfo(my_entity_id="t", my_session_id="t", transfer_engine=None),
             model=Model(),
             graph_runtime=SimpleNamespace(),
+            my_walks={CODEC, ("Talker", "talker_decode")},
         )
+
+
+@pytest.mark.parametrize("held", [frozenset(), frozenset({"kv"})])
+def test_a_step_off_the_chain_on_the_chains_resources_waits_out_the_plan_threads_stage(held):
+    """The plan thread stages the chain's next step on the node's resources while
+    the GPU thread runs a lane's step; if the lane's node plans those resources
+    too, its step must not overlap that stage. A lane that holds its resources
+    alone doesn't wait."""
+    import threading
+
+    engine = Engine.__new__(Engine)
+    engine._walk_lanes, engine._node_lanes = {("n", "prefill"): 1}, {"n": 1}
+    engine._stage_lock = threading.Lock()
+    engine._submodules = {"n": SimpleNamespace(resources={"kv": object()})}
+    engine._runner = SimpleNamespace(lane_held=held)
+    ran = threading.Event()
+    def execute(batch):
+        ran.set()
+        return BatchedModelOutput()
+
+    engine.exec = execute
+    batch = SimpleNamespace(
+        node_name="n", graph_walk="prefill", admit_error=None, rows_only=True, cached_rids=(), run_started=None,
+    )
+    engine._submodules["n"].submodule = _StateSub.__new__(_StateSub)
+    engine._submodules["n"].device_stops = {}
+    with engine._stage_lock:  # the plan thread, mid-stage
+        step = threading.Thread(target=engine.exec_and_postprocess, args=(batch,))
+        step.start()
+        assert ran.wait(0.2) is bool(held)
+    step.join(2)
+    assert ran.is_set()
+
+
+def test_a_node_with_a_walk_on_the_chain_is_the_chains_and_its_lane_walk_runs_beside_it():
+    """Its captures and resources stay the chain's, so its lane walk's steps run
+    beside the chain (eager, on a lane slot, under the stage lock) even with no
+    resource of the chain's to plan."""
+    from mstar.engine.engine import node_lanes_of
+
+    lanes = {("n", "prefill"): 1, ("n", "decode"): 0, ("m", "chunk"): 2}
+    assert node_lanes_of(lanes) == {"m": 2}
+    engine = Engine.__new__(Engine)
+    engine._walk_lanes, engine._node_lanes = lanes, node_lanes_of(lanes)
+    engine._submodules = {"n": SimpleNamespace(resources={}), "m": SimpleNamespace(resources={})}
+    engine._runner = SimpleNamespace(lane_held=frozenset())
+    assert engine._beside_chain("n", "prefill")
+    assert not engine._beside_chain("n", "decode")
+    assert not engine._beside_chain("m", "chunk")
+
+
+def test_a_lane_walk_beside_the_chain_refuses_a_node_with_piecewise_regions():
+    """A slot past the rotation wraps onto one of the chain's in a region
+    (review-r2 F17). A node wholly on its lane keeps its own rotation."""
+    from mstar.engine.engine import node_lanes_of
+
+    engine = Engine.__new__(Engine)
+    engine._walk_lanes = {("n", "prefill"): 1, ("n", "decode"): 0, ("m", "chunk"): 2}
+    engine._node_lanes = node_lanes_of(engine._walk_lanes)
+    with pytest.raises(ValueError, match="piecewise regions"):
+        engine._refuse_regions_beside_chain("n", {"encoder": object()})
+    engine._refuse_regions_beside_chain("n", {})
+    engine._refuse_regions_beside_chain("m", {"encoder": object()})
+
+
+def test_a_step_beside_the_chain_takes_a_slot_of_its_lanes_and_runs_eager():
+    """Every per-step buffer is keyed by slot (attention workspaces, KV's static
+    plan buffers, position and sampler rows), and the chain holds its rotation:
+    a run in flight on one slot, its next step staged on the other."""
+    engine = Engine.__new__(Engine)
+    engine._walk_lanes, engine._node_lanes = {("n", "prefill"): 1}, {"n": 1}
+    mgmt = SubmoduleManagement.__new__(SubmoduleManagement)
+    mgmt.slot_rotation = SimpleNamespace(count=2, next_slot=0)
+    mgmt.resources = {"kv": object()}
+    engine._submodules = {"n": mgmt}
+    engine._runner = SimpleNamespace(lane_held=frozenset())
+    ctx = StepContext(request_ids=(1,), graph_walk="prefill", slot=None, capture=False, repeats=4)
+    batch = SimpleNamespace(node_name="n", graph_walk="prefill", slot=None, step_context=ctx)
+    batch.set_slot = lambda slot: (setattr(batch, "slot", slot), setattr(ctx, "slot", slot))
+    assert engine.reserve_replay_slot(batch) is None
+    assert (batch.slot, ctx.slot, ctx.repeats) == (2, 2, 1)
+    assert mgmt.next_slot == 0, "the chain's rotation is untouched"

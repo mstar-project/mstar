@@ -22,7 +22,7 @@ The walk sequence is fixed up front from the input modalities and stepped throug
     I2V: encode_text -> encode_image -> video_gen_i2v
 
 The denoise loop is dynamic: ``Loop.max_iters`` is the config ceiling, and the
-request's ``num_inference_steps`` stops it via ``Wan22DitSubmodule.check_stop``.
+request's ``num_inference_steps`` caps it (``get_loop_caps``).
 """
 
 import html
@@ -76,8 +76,7 @@ class Wan22Model(Model):
     VIDEO_GEN_WALK = "video_gen"
     VIDEO_GEN_I2V_WALK = "video_gen_i2v"
 
-    # Denoise loop name — referenced by ``Wan22DitSubmodule.check_stop`` via
-    # ``request_info.dynamic_loop_iter_counts[...]``.
+    # Denoise loop name, capped per request by ``get_loop_caps``.
     DENOISE_LOOP_NAME = DENOISE_LOOP_NAME
 
     def __init__(
@@ -160,6 +159,20 @@ class Wan22Model(Model):
             ),
         ]
 
+    def _resolve_steps(self, model_kwargs: dict) -> int:
+        requested = int(model_kwargs.get("num_inference_steps", self.config.default_num_inference_steps))
+        steps = max(1, min(requested, self.config.max_denoise_steps))
+        if steps != requested:
+            logger.info(
+                "Clamped num_inference_steps from %d to %d (max_denoise_steps=%d)",
+                requested, steps, self.config.max_denoise_steps,
+            )
+        return steps
+
+    def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
+        # the denoise loop runs the request's step count, known at ingest
+        return {DENOISE_LOOP_NAME: self._resolve_steps(model_kwargs)}
+
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         # -- encode_text: UMT5 forward; both CFG embeddings persist at the
         # -- conductor for the video_gen walk.
@@ -220,9 +233,8 @@ class Wan22Model(Model):
                     GraphEdge(next_node="dit", name="unipc_model_outputs"),
                     GraphEdge(next_node="dit", name="unipc_last_sample"),
                 ],
-                # Async scheduling may dispatch an iteration past the stop
-                # check_stop registers; Wan22DitSubmodule.prepare_inputs vetoes
-                # the overshoot (None -> the engine skips that forward).
+                # The loop's cap is the request's steps, so async scheduling
+                # never dispatches past them.
                 enable_async_scheduling=True,
             ),
             # Ceiling only; the request's step count stops the loop early.
@@ -588,15 +600,7 @@ class Wan22Model(Model):
             schedule.append(self.ENCODE_IMAGE_WALK)
         schedule.append(self.VIDEO_GEN_I2V_WALK if is_i2v else self.VIDEO_GEN_WALK)
 
-        requested_steps = int(
-            model_kwargs.get("num_inference_steps", self.config.default_num_inference_steps)
-        )
-        num_inference_steps = max(1, min(requested_steps, self.config.max_denoise_steps))
-        if num_inference_steps != requested_steps:
-            logger.info(
-                "Clamped num_inference_steps from %d to %d (max_denoise_steps=%d)",
-                requested_steps, num_inference_steps, self.config.max_denoise_steps,
-            )
+        num_inference_steps = self._resolve_steps(model_kwargs)
 
         kwargs = {
             "walk_schedule": schedule,

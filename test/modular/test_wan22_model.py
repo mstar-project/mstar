@@ -2,7 +2,7 @@
 
 Structural pieces only — no weights, no GPU, no network: graph walks, engine
 types, the denoise loop's loop-back inventory, persist flags, the schedule-driven
-walk transitions, and the check_stop boundary math. The model is built via
+walk transitions, and the denoise loop's per-request step cap. The model is built via
 ``object.__new__`` with hand-set fields, so the real constructor's lazy-tokenizer
 seam is never exercised.
 """
@@ -220,8 +220,8 @@ def test_wan22_video_gen_walk_structure(walk_name, expect_image_latent):
     assert loop.max_iters == model.config.max_denoise_steps
     body = loop.section
     assert isinstance(body, GraphNode) and body.name == "dit"
-    # Async scheduling on; the speculative overshoot iteration is vetoed by
-    # Wan22DitSubmodule.prepare_inputs returning None.
+    # Async scheduling on; get_loop_caps caps the loop at the request's
+    # steps, so no iteration past them is dispatched.
     assert body.enable_async_scheduling is True
     assert {e.name for e in body.outputs} == LOOP_BACK_NAMES
     assert all(e.next_node == "dit" for e in body.outputs)
@@ -431,7 +431,7 @@ def test_wan22_i2v_transitions_include_encode_image_and_image_latent():
 
 
 # ----------------------------------------------------------------------
-# check_stop boundary math
+# the denoise loop's step cap
 # ----------------------------------------------------------------------
 
 
@@ -455,35 +455,15 @@ def _dit() -> Wan22DitSubmodule:
     return submodule
 
 
-# iter_count reads k while 0-based iteration k is being postprocessed, so
-# stopping at k == N - 1 runs exactly N iterations.
-@pytest.mark.parametrize("requested_steps,iter_count,expect_stop", [
-    (1, 0, True),     # single-step request stops on its only iteration
-    (2, 0, False),
-    (2, 1, True),
-    (50, 0, False),
-    (50, 48, False),  # one before the boundary: keep going
-    (50, 49, True),   # k + 1 == N: exactly N iterations run
-    (50, 50, True),   # deferred-stop overshoot (speculative iter N) still stops
-    (100, 99, True),  # request at the ceiling stops on the loop's last iter
-])
-def test_wan22_check_stop_boundary(requested_steps, iter_count, expect_stop):
-    submodule = _dit()
-    submodule.request_state("r0").add("num_steps", requested_steps)
-    stops = submodule.check_stop("r0", _fwd_info(requested_steps, iter_count), outputs={})
-    assert (DENOISE_LOOP_NAME in stops) == expect_stop
-    if not expect_stop:
-        assert stops == set()
-
-
-def test_wan22_check_stop_without_a_schedule_never_stops():
-    # A missing step count must not stop the loop; max_iters still bounds it.
-    assert _dit().check_stop("r0", _fwd_info(requested_steps=0, iter_count=99), outputs={}) == set()
+@pytest.mark.parametrize("requested,expected", [(1, 1), (50, 50), (0, 1), (10_000, Wan22Config().max_denoise_steps)])
+def test_wan22_loop_caps_the_denoise_loop_at_the_request_steps(requested, expected):
+    # The loop runs exactly the request's (clamped) steps, known at ingest.
+    model = _make_model()
+    assert model.get_loop_caps(num_inference_steps=requested) == {DENOISE_LOOP_NAME: expected}
 
 
 # ----------------------------------------------------------------------
-# prepare_inputs: async-overshoot veto (dit) and no-CFG negative skip
-# (text encoder)
+# prepare_inputs: no-CFG negative skip (text encoder)
 # ----------------------------------------------------------------------
 
 
@@ -497,29 +477,6 @@ def _dit_loop_inputs() -> dict:
         "unipc_model_outputs": [torch.zeros((2, *shape))],
         "unipc_last_sample": [torch.zeros(shape)],
     }
-
-
-def test_wan22_dit_prepare_inputs_vetoes_async_overshoot():
-    # Async scheduling can dispatch iteration N after check_stop fired at
-    # N - 1; prepare_inputs returns None so the engine skips that forward.
-    submodule = _dit()
-    result = submodule.prepare_inputs(
-        graph_walk=Wan22Model.VIDEO_GEN_WALK,
-        fwd_info=_fwd_info(requested_steps=2, iter_count=2),
-        inputs=_dit_loop_inputs(),
-    )
-    assert result is None
-
-
-def test_wan22_dit_prepare_inputs_passes_in_range_iteration():
-    submodule = _dit()
-    node_inputs = submodule.prepare_inputs(
-        graph_walk=Wan22Model.VIDEO_GEN_WALK,
-        fwd_info=_fwd_info(requested_steps=2, iter_count=1),
-        inputs=_dit_loop_inputs(),
-    )
-    assert node_inputs is not None
-    assert node_inputs.tensor_inputs.keys() == {"text_embeds_pos", "text_embeds_neg", "timestep"} | LOOP_BACK_NAMES
 
 
 @pytest.mark.parametrize("guidance,expect_negative", [

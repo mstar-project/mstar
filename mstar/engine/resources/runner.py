@@ -7,10 +7,12 @@ and handing to next. (in fact, maybe `plan` should do this and runner only moves
 
 from __future__ import annotations
 
+import itertools
 import logging
 from collections.abc import Callable, Collection, Mapping
 from contextlib import AbstractContextManager, nullcontext
-from typing import Any
+from types import MappingProxyType
+from typing import TYPE_CHECKING, Any
 
 from mstar.engine.resources.admission import Admission
 from mstar.engine.resources.base import CachedPrefix, CGSlotSpec, PublishedInfo, Resource
@@ -18,10 +20,15 @@ from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig
 from mstar.engine.resources.step import (
     FULL_ADMIT_NOT_READY,
     FULL_ADMIT_OK,
+    AdmitFailedReason,
+    AdmitOutcome,
     FullAdmitOutcome,
     SubmoduleStep,
 )
-from mstar.utils.profiler import phase_end, phase_start, range_pop, range_push
+from mstar.utils.profiler import phase_end, phase_record, phase_start, range_pop, range_push
+
+if TYPE_CHECKING:
+    import torch
 
 logger = logging.getLogger(__name__)
 
@@ -85,6 +92,8 @@ class StepRunner:
         # keyset -> ordered keys; a step's resource set is fixed for a node, so
         # admit/plan/commit reuse this rather than re-filtering _order each call
         self._keys_cache: dict[frozenset[str], list[str]] = {}
+        # (walk, resource key, down to 1) already logged (``_note_narrowed``)
+        self._narrowed: set[tuple[str, str, bool]] = set()
         self._preplan_keys_cache: dict[frozenset[str], list[str]] = {}
         # publish runs per rid per step; most resources inherit the base
         # no-op, so settle who can actually publish once instead of calling
@@ -92,6 +101,11 @@ class StepRunner:
         self._publish_order = [
             key for key in self._order
             if type(self._resources[key]).publish is not Resource.publish
+        ]
+        # and the ones with something to do between the replays of a step that repeats
+        self._replay_column_order = [
+            key for key in self._order
+            if type(self._resources[key]).replay_columns is not Resource.replay_columns
         ]
         # Same for admit_retrieve, which check_ready drives per ready request
         # per scheduler scan — the hottest sweep here. The base returns
@@ -145,6 +159,9 @@ class StepRunner:
         # the step whose pre-plan is staged across the pre-planning resources,
         # as `_step_key` describes it; None when nothing is staged
         self._staged: tuple | None = None
+        # rid -> the generation of the request its handle names (``ingest_request``)
+        self._generations: dict[int, int] = {}
+        self._generation = itertools.count()
         # (step key, ready) of the last pre_admit whose stage is still up
         self._pre_admitted: tuple | None = None
         # Resources a lane off the chain holds (``mstar.worker.lanes``), each with
@@ -374,6 +391,9 @@ class StepRunner:
     ) -> None:
         """open state on all resources; `overrides` are per-resource. All or
         nothing: a resource that raises leaves the request on none of them."""
+        # a handle names another request once this one is gone: a run that lands
+        # after that must not take back the new one's counts (``rewind_run``)
+        self._generations[rid] = next(self._generation)
         for i, key in enumerate(self._order):
             try:
                 with self._on_lane_of(key):
@@ -392,12 +412,17 @@ class StepRunner:
                         )
                 raise
 
+    def request_generation(self, rid: int) -> int:
+        """The existing admission identity; a recycled handle gets a new one."""
+        return self._generations[rid]
+
     def ingest_capture_row(self, rid: str) -> None:
         """open a capture padding row on all resources"""
         for key in self._order:
             self._resources[key].ingest_capture_row(rid)
 
     def remove_request(self, rid: str) -> None:
+        self._generations.pop(rid, None)
         self._admission.remove_request(rid)
         for key in self._order:
             with self._on_lane_of(key):
@@ -529,6 +554,11 @@ class StepRunner:
         return key
 
     @property
+    def lane_held(self) -> frozenset[str]:
+        """The resources a lane off the chain holds, each that lane's alone."""
+        return frozenset(self._on_lane)
+
+    @property
     def staged(self) -> bool:
         """A pre-plan is staged and not yet promoted."""
         return self._staged is not None
@@ -543,13 +573,94 @@ class StepRunner:
             self._resources[key].clear_preplan()
 
     def _beside_stage(self, step: SubmoduleStep) -> bool:
-        """A step off the chain, which leaves the chain's stage alone."""
-        return bool(self._on_lane) and bool(step.keys()) and self._on_lane.keys() >= step.keys()
+        """A step that leaves the chain's stage alone: one off the chain, or one
+        that declares no resource (BAGEL's combine_cfg), which touches nothing
+        the stage holds."""
+        keys = step.keys()
+        return not keys or (bool(self._on_lane) and self._on_lane.keys() >= keys)
+
+    def _settle_repeats(self, step: SubmoduleStep) -> None:
+        """Narrow the step's replays to what its resources allow, before any
+        of them reserves for it. Every resource the step declares answers, not
+        only the pre-planning ones."""
+        ctx = step.ctx
+        ctx.check_tp_repeats()
+        asked = ctx.repeats
+        if asked == 1:
+            return
+        allowed = {
+            key: (self._resources[key] if ctx.resident is None else ctx.resident.bindings[key]).max_repeats(
+                step.get(key), ctx,
+            ) for key in self._keys_for(step)
+        }
+        ctx.repeats = max(1, min([asked, *allowed.values()]))
+        ctx.check_tp_repeats()
+        for key, most in allowed.items():
+            if most < asked:
+                self._note_narrowed(ctx.graph_walk, key, asked, most)
+
+    def _note_narrowed(self, walk: str, key: str, asked: int, most: int) -> None:
+        """The walk's line says "repeats on" from load, so what holds its steps
+        back shows here: what each resource allowed, counted per step, logged
+        once, and once more at 1. A step names no node, so the line lists the
+        nodes that declare the resource."""
+        phase_record(f"repeats.narrowed.{walk}.{key}#", most)
+        note = (walk, key, most <= 1)
+        if note not in self._narrowed:
+            self._narrowed.add(note)
+            nodes = [node for node, keys in (self._node_order or {}).items() if key in keys]
+            logger.info(
+                "walk %s (nodes declaring %s: %s): %s allowed a step %d of %d iterations",
+                walk, key, nodes, key, max(most, 1), asked,
+            )
+
+    def settle_run(self, step: SubmoduleStep | None, counts: Mapping[int, int]) -> None:
+        """Replace provisional counts with actual executions, once per row.
+
+        Validate the complete submitted membership before changing any owner.
+        A recycled request handle never receives the old run's adjustment.
+        """
+        if step is None:
+            return  # a node that declares no step counted nothing
+        counts = dict(counts)
+        ctx = step.ctx
+        members = ctx.counted.keys() if ctx.counted else ctx.request_ids
+        if counts.keys() != set(members):
+            raise ValueError("run counts must cover exactly the submitted requests")
+        deltas: dict[int, set[int]] = {}
+        live = self._generations
+        for rid, count in counts.items():
+            previous = ctx.run_span(1, request_id=rid)
+            if type(count) is not int or count < 0 or count > previous or count > ctx.repeats:
+                raise ValueError(f"invalid execution count {count!r} for request {rid!r}")
+            if count != previous and not ctx.counted:
+                raise ValueError("a shortened run has no committed request generations")
+            gen = ctx.counted.get(rid)
+            if count < previous and gen is not None and live.get(rid) == gen:
+                deltas.setdefault(previous - count, set()).add(rid)
+        for key in self._keys_for(step):
+            for delta, rows in deltas.items():
+                rewind = (self._resources[key].rewind_run if ctx.resident is None
+                          else ctx.resident.bindings[key].rewind_run)
+                rewind(step.get(key), ctx, delta, frozenset(rows))
+        ctx.run_counts = MappingProxyType(counts)
+
+    def replay_columns(self, step: SubmoduleStep | None, repeats: int) -> list[tuple[torch.Tensor, torch.Tensor]]:
+        """Every resource's ``Resource.replay_columns`` for this step; none for
+        a node that declares no step."""
+        columns = []
+        if step is None:
+            return columns
+        for key in self._replay_column_order:
+            if (resource_step := step.get(key)) is not None:
+                columns.extend(self._resources[key].replay_columns(resource_step, step.ctx, repeats))
+        return columns
 
     def admit(self, step: SubmoduleStep) -> FullAdmitOutcome:
         """Reserve capacity for step. A refused admit gives back everything
         the step reserved.
         """
+        step.ctx.check_tp_repeats()
         beside = self._beside_stage(step)
         staged_key = None if beside else self._drop_stale_preplan(step)
         # A step whose ``pre_admit`` ran a step ahead, and whose stage is still
@@ -562,6 +673,58 @@ class StepRunner:
         if pre is not None and staged_key is not None and pre[0] == staged_key:
             covered = self._preplan_keys_for(step)
             ready = pre[1]
+        else:
+            self._settle_repeats(step)
+        return self._admit_resources(step, covered, ready, preserve_stage=beside)
+
+    def admit_rows(self, step: SubmoduleStep) -> FullAdmitOutcome:
+        """Reserve a joining row's whole horizon beside the queued capture.
+
+        No plan or capture buffer is touched. The caller serializes admission,
+        publication and the logical receipt's commit against same-request
+        settlement/teardown, and holds these owners until readers finish. One
+        receipt may span both bounded captures; it commits and settles once.
+        Unlike ordinary admission, this operation never narrows the horizon.
+        """
+        ctx = step.ctx
+        rows = set(ctx.request_ids)
+        if (not rows or len(rows) != len(ctx.request_ids) or any(rid < 0 for rid in rows)
+                or ctx.resident is None or ctx.is_preplan or ctx.unit_id is not None
+                or ctx.capture or ctx.plan_results or ctx.counted or ctx.run_counts is not None):
+            raise ValueError("joining rows need a fresh resident accounting context")
+        ctx.check_tp_repeats()
+        ctx.resident.validate_rows(step, ctx)
+        if self._staged is not None:
+            held = set(self._staged[1])
+            held.update(seg.request_id for _, segments in self._staged[4] for seg in segments)
+            if not rows.isdisjoint(held):
+                raise ValueError("joining rows overlap the already staged step")
+        keys = self._keys_for(step)
+        for key in keys:
+            item = step.get(key)
+            if any(seg.request_id >= 0 and seg.request_id not in rows for seg in item.segments or ()):
+                raise ValueError(f"joining resource {key!r} declares a request outside its context")
+            if key not in ctx.resident.bindings:
+                raise ValueError(f"joining resource {key!r} has no resolved resident binding")
+        # Captured auxiliary owners can read storage without declaring a
+        # mutation step. Validate their addressing/lifetime too, before any
+        # owner reserves. Mutation lifecycle calls still use declared steps.
+        for key, binding in ctx.resident.bindings.items():
+            try:
+                binding.check_horizon(step.get(key), ctx)
+            except ValueError as exc:
+                raise ValueError(f"joining resource {key!r}: {exc}") from exc
+        for key in keys:
+            binding = ctx.resident.bindings[key]
+            if binding.max_repeats(step.get(key), ctx) < ctx.repeats:
+                return FullAdmitOutcome(AdmitOutcome(ok=False, reason=AdmitFailedReason(
+                    f"joining resource {key!r} cannot reserve the full {ctx.repeats}-iteration horizon",
+                )), key)
+        return self._admit_resources(step, [], True, preserve_stage=True)
+
+    def _admit_resources(
+        self, step: SubmoduleStep, covered: list[str], ready: bool, *, preserve_stage: bool,
+    ) -> FullAdmitOutcome:
         admitted: list[str] = []
         for key in self._keys_for(step):
             if key in covered:
@@ -583,7 +746,7 @@ class StepRunner:
                 )
                 self._unwind(step, [*covered, *admitted, key])
                 # the unwind gave back the stage's pages, so a retry must plan afresh
-                if self._staged is not None and not beside:
+                if self._staged is not None and not preserve_stage:
                     self.clear_preplan()
                 return FullAdmitOutcome(outcome, key)
             admitted.append(key)
@@ -638,6 +801,7 @@ class StepRunner:
 
         Unwound on refusal exactly as ``admit`` is.
         """
+        self._settle_repeats(step)
         ready = True
         admitted: list[str] = []
         for key in self._preplan_keys_for(step):
@@ -686,8 +850,11 @@ class StepRunner:
         self._staged = self._step_key(step)
         return results
 
-    def commit(self, step: SubmoduleStep) -> None:
-        """record step consumption"""
+    def commit(self, step: SubmoduleStep, *, track_rows: bool = False) -> None:
+        """Record provisional consumption and identify rows whose execution may shorten."""
+        if step.ctx.repeats > 1 or track_rows:
+            # the requests this run counted for, should it land short (``rewind_run``)
+            step.ctx.counted = {rid: self._generations.get(rid) for rid in step.ctx.request_ids}
         for key in self._keys_for(step):
             if self._nvtx:
                 range_push(f"res.commit.{key}")

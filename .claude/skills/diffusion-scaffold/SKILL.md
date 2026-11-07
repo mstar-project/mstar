@@ -1,13 +1,13 @@
 ---
 name: diffusion-scaffold
-description: Building an image/video flow or diffusion model on M*'s DiT scaffold (mstar/model/components/diffusion/, DenoiseLoopSubmodule) — bucket keys, schedules and seeding, multi-stage recipes, ragged attention spans, compile and per-bucket accelerator graphs, and the async overshoot veto. Use when porting a DiT-style model, writing a DenoiseLoopSubmodule subclass, or changing the scaffold itself.
+description: Building an image/video flow or diffusion model on M*'s DiT scaffold (mstar/model/components/diffusion/, DenoiseLoopSubmodule) — bucket keys, schedules and seeding, multi-stage recipes, ragged attention spans, compile and per-bucket accelerator graphs, and the loop's step cap. Use when porting a DiT-style model, writing a DenoiseLoopSubmodule subclass, or changing the scaffold itself.
 ---
 
 # The DiT scaffold
 
 `mstar/model/components/diffusion/` holds what every text → flow transformer → VAE model shares: sigma schedules and the Euler step (`flow_match`), multi-axis RoPE, joint attention, compile and decode wrappers, weight streaming, and the `DenoiseLoopSubmodule` that runs as the body of a model's `Loop("denoise_loop", dit)`. `flux2_klein` and `z_image` are built on it and are the references to read, and `wan22` runs on it without capture. `cosmos3` predates it; don't copy its self-compiled, uncaptured loop.
 
-Read the module docstring of `denoise_loop.py` first. Its two-column table is the contract: on the left what the base does (step index from the engine's loop counter, per-request schedule and seeded noise, overshoot veto, equal-key batching, stop at the request's own step count, per-key graph buckets, the ragged step declaration), on the right the hooks a model implements. This skill covers the decisions behind those hooks and what has gone wrong.
+Read the module docstring of `denoise_loop.py` first. Its two-column table is the contract: on the left what the base does (per-step schedule scalars cut by the engine, per-request schedule and seeded noise, equal-key batching, per-key graph buckets, the ragged step declaration), on the right the hooks a model implements. This skill covers the decisions behind those hooks and what has gone wrong.
 
 Read the [add-mstar-model skill](../add-mstar-model/SKILL.md) for the port as a whole; this one is about the `dit` node.
 
@@ -24,7 +24,7 @@ Batching rarely buys throughput for a large video DiT: one 544×960×121 row is 
 
 ## Schedules, seeding and per-step scalars
 
-- `schedule_for` returns a `FlowMatchSchedule`; the base stages its tensors on the device once per request, and `STEP_SCALARS` slices `sigma`, `sigma_next` and `timestep` out per step as `[1]` device tensors. Rows at different steps therefore share one forward, and a captured graph reads them from staged buffers. A scheduler that needs another per-step value (a guidance scale) adds a `StepScalar` entry instead of overriding `prepare_inputs`.
+- `schedule_for` returns a `FlowMatchSchedule`; the base stages its tensors on the device once per request, in the request's state, and `ITERATION_INPUTS` (an `IterationInput` per name, `mstar/model/submodule_base.py`) has the engine cut `sigma`, `sigma_next` and `timestep` out per row per step. Rows at different steps therefore share one forward, a captured graph reads them from staged buffers, and a step that repeats reads a column per replay. A scheduler that needs another per-step value (a guidance scale) adds an `IterationInput` entry instead of overriding `prepare_inputs`.
 - **Match the reference's RNG exactly.** `seed_latents` draws from a CPU generator the base seeds per request; draw the same shapes in the same order and dtype as the reference pipeline, or the comparison against the oracle is meaningless from step 0. A recipe that draws more than once (a second stage's noise) has to continue the same generator, not reseed.
 - Seeded noise and the schedule reach the device through `to_device_nonblocking` (`mstar/utils/h2d.py`: one memcpy into pinned memory, one non-blocking copy); `tensor.to(device)` from pageable memory blocks the GPU thread and stalls the pre-plan.
 - `SOLVER_STATE` names extra loop-back edges for a multi-step scheduler; `seed_loop_back` supplies iteration 0's values and `denoise` returns them alongside the sample. For UniPC, subclass `UniPCDenoiseLoopSubmodule` and implement `model_output`: the base carries the state and steps each row by the loop counter from its own tables. `components/diffusion/unipc.py` is the one port of the scheduler; cosmos3 calls it too. Keep its host sigma in `unipc_convert_model_output`: a 0-dim device tensor would round the multiply in the operand's dtype.
@@ -53,13 +53,13 @@ Every attention in the DiT should go through a ragged resource, so the model get
 - `capture_buckets` lists `(graph_walk, bucket_key)` pairs to capture; `capture_request_inputs` supplies one placeholder row per bucket. A bucket is captured per batch size in `capture_batch_sizes`, and each one costs startup, so capture the shapes you serve, not every shape you accept. `replay_walks` lets another walk reuse a captured bucket.
 - The captured graph removes the launch gaps of a compiled-but-eager step. Ragged attention breaks that compiled graph per layer unless the resource sets `compile_op=True` (then `run` traces as the `mstar::ragged_attention` custom op), so measure both before deciding a model needs capture.
 
-## The overshoot veto
+## The step cap
 
-The async worker speculates the next iteration before the current one's stop is known. Flow models know their step count at ingestion, so `prepare_inputs` returns `None` for an iteration past the request's last step and the engine skips the forward. That is the base's job; a subclass that overrides `prepare_inputs` must keep it.
+Flow models know their step count at ingestion, so the model's `get_loop_caps` returns it for the denoise loop and the loop ends there: no `check_stop`, and the async worker never speculates a step past the last. A step reads no loop counter (iteration 0 is the one with no loop-back inputs), so with `step_repeats` it can replay N times on the device; a step that still reads the counter is refused at load.
 
 ## State
 
-Per-request state lives in `self.request_state(fwd_info.rid_handle)`, which the engine frees with the request. It is keyed by the integer handle (the key `check_stop` and cleanup receive), not by the `request_id` string; see invariant 14.
+Per-request state lives in `self.request_state(fwd_info.rid_handle)`, which the engine frees with the request. It is keyed by the integer handle (the key the engine batches and frees by), not by the `request_id` string; see invariant 14.
 
 ## Validating
 

@@ -78,7 +78,7 @@ Keep resident capacity separate from one-step batching: a pool may retain many s
 
 ## Phase 4 — Write it, register it, prove eager parity
 
-`mstar/model/<name>/<name>_model.py` with the graph, resource and partition declarations, prompt/input processing and output processing. Per submodule: `prepare_inputs` (set `input_seq_len`), `preprocess`, `forward`, `postprocess`, `check_stop`, `declare_step`. Write forwards tensor-in/tensor-out from the start (invariant 3) — retrofitting that is far more work than doing it once.
+`mstar/model/<name>/<name>_model.py` with the graph, resource and partition declarations, prompt/input processing and output processing. Per submodule: `prepare_inputs` (set `input_seq_len`), `preprocess`, `forward`, `postprocess`, `check_stop` (with `checks_own_stop = True`), `declare_step`. Write forwards tensor-in/tensor-out from the start (invariant 3) — retrofitting that is far more work than doing it once.
 
 **Register it: [registration.md](references/registration.md) is the checklist.** `test/modular/test_model_registration.py` enforces the registry, the CLI default config and the docs row, so CI catches those three. Forgetting the CLI entry means `mstar serve <model>` exits `unknown model` no matter how correct the code is.
 
@@ -166,7 +166,7 @@ Use the [benchmarking skill](../benchmarking/SKILL.md) for methodology — warmu
 
 ## Phase 8 — Performance tuning
 
-Establish CPU-bound or GPU-bound first; the benchmarking skill covers how (`event_sync` near zero means CPU-bound). That much is settled. Beyond it **there is no established best practice in this repo yet** — current tuning work is iterative and exploratory, so treat any confident-sounding recipe with suspicion, including one you generate yourself. What holds regardless: same harness, same box, two sides adjacent in time, and re-check the workloads you are not targeting before calling a change a win.
+Establish CPU-bound or GPU-bound first; the benchmarking skill covers how (`event_sync`, plus `worker.await_run` where runs go on the device, near zero means CPU-bound). That much is settled. Beyond it **there is no established best practice in this repo yet** — current tuning work is iterative and exploratory, so treat any confident-sounding recipe with suspicion, including one you generate yourself. What holds regardless: same harness, same box, two sides adjacent in time, and re-check the workloads you are not targeting before calling a change a win.
 
 Two things that are settled: a host sync in your `prepare_inputs` hides inside that phase rather than in `event_sync`, and a host-bound step gets faster by deleting work, not by moving it to another thread. Values already known on the host travel in `step_metadata`.
 

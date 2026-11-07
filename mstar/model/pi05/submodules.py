@@ -32,7 +32,14 @@ from mstar.model.pi05.components.paligemma import Pi05PaliGemmaExpert
 from mstar.model.pi05.components.siglip import Pi05SiglipEncoder
 from mstar.model.pi05.config import LLM_ATTN, LLM_KV, LLM_POS, Pi05Config
 from mstar.model.pi05.kernels.image_normalize import normalize_float_images
-from mstar.model.submodule_base import ARNodeInputs, ARNodeSubmodule, ModelInputsFromEngine, NodeInputs, NodeSubmodule
+from mstar.model.submodule_base import (
+    ARNodeInputs,
+    ARNodeSubmodule,
+    BatchedModelOutput,
+    ModelInputsFromEngine,
+    NodeInputs,
+    NodeSubmodule,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -496,8 +503,9 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
             )
             ts = torch.zeros(1, device=device, dtype=torch.long)
         else:
-            noisy = inputs["noisy_actions"][0]
-            ts = inputs["timestep_index"][0]
+            # a batched step hands each row back as its own row of the batch
+            noisy = inputs["noisy_actions"][0].reshape(action_horizon, action_dim)
+            ts = inputs["timestep_index"][0].reshape(1)
 
         seq_len = action_horizon
         return ARNodeInputs(input_seq_len=seq_len,
@@ -644,27 +652,20 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
         fraction: torch.Tensor,
         time_emb_buffer: torch.Tensor,
         **kwargs
-    ) -> dict[str, NameToTensorList]:
-        """Batched action_gen: single action expert forward, then split per-request."""
-
-        horizon = self.config.action_horizon
-
+    ) -> BatchedModelOutput:
+        """Batched action_gen: single action expert forward, its outputs as
+        rows of the batch, row i request i: the static rows a captured step
+        leaves, which a run carries into its next replay."""
+        rows = len(timestep_index)
         next_actions, next_index = self._euler_step(
             noisy_actions, timestep_index,
             fraction=fraction,
             time_emb_buffer=time_emb_buffer,
         )
-
-        # Split back per-request by horizon.
-        result: dict[str, NameToTensorList] = {}
-        for i, rid in enumerate(request_ids):
-            start = i * horizon
-            end = start + horizon
-            result[rid] = {
-                "noisy_actions": [next_actions[start:end]],
-                "timestep_index": [next_index[i:i+1]],
-            }
-        return result
+        return BatchedModelOutput(row_outputs={
+            "noisy_actions": next_actions.view(rows, self.config.action_horizon, -1),
+            "timestep_index": next_index.view(rows, 1),
+        })
 
     def _forward_prefill(
         self,

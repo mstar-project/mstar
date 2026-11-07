@@ -29,6 +29,7 @@ from mstar.engine.resources.step import (
     AdmitRuntimeError,
     FullAdmitOutcome,
 )
+from mstar.graph.loop_indices import LoopLayout
 from mstar.graph.runtime.base import (
     ColumnarEdgeSpecs,
     PopRidsOutput,
@@ -83,6 +84,9 @@ class _Runtime:
 
     def __init__(self, manager: _Manager):
         self._manager = manager
+
+    def loop_layout(self, walk, name):
+        return LoopLayout(name, descendants=("loop",) if name == "outer" else ())
 
     # what the worker constructs the real runtime with
     combined_walk_of: dict = {}
@@ -1277,14 +1281,18 @@ def test_a_chain_crossing_into_another_group_leaves_the_rows_of_its_old_one():
     assert list(batch.request_to_worker_graph) == ["f0", "f1"]
 
 
-def test_a_chain_crossing_into_another_group_takes_that_groups_rows():
-    _, pick, batch = _step_chain(["c0"], ["f0", "w2"], {"c0": 0, "f0": 0, "w2": 2})
-    assert pick.taken == ["c0", "w2"] and list(batch.request_to_worker_graph) == ["w2"]
+@pytest.mark.parametrize("crossed, continuing_step, fresh", [("loop", 0, "w2"), ("outer", 2, "f0")])
+def test_a_chain_crossing_into_another_group_takes_that_groups_rows(crossed, continuing_step, fresh):
+    _, pick, batch = _step_chain(
+        ["c0"], ["f0", "w2"], {"c0": continuing_step, "f0": 0, "w2": 2}, next_iter_of=crossed,
+    )
+    assert pick.taken == ["c0", fresh] and list(batch.request_to_worker_graph) == [fresh]
 
 
 def test_a_chain_yields_by_the_group_it_crosses_into():
     sched = _scheduler(_StepScheduleEngine(max_bs=16))
     steps = {"c0": 0, "f0": 0, "w2": 2}
+    sched.runtime = _StepManager([], steps).runtime
     sched.backlog[(NODE, WALK)] = _batch(["f0"])
     assert sched.backlog_splits_from(_StepManager([], steps), (NODE, WALK), "c0", "loop") is True
     assert sched.backlog_splits_from(_StepManager([], steps), (NODE, WALK), "c0") is False
@@ -1403,6 +1411,33 @@ def test_clearing_a_rid_forgets_its_undelivered_admit_error():
 
 
 # ── engine capture-group gate ───────────────────────────────────────────
+
+
+@pytest.mark.parametrize(("groups", "expected"), [
+    ({"r0": "left", "r1": "right", "r2": "left"}, ["r0"]),
+    ({"r0": "left", "r1": "left", "r2": "left"}, ["r0", "r1"]),
+])
+@pytest.mark.parametrize("consumer_walk", [WALK, "consume"])
+def test_connected_members_share_the_existing_builder_capture_key_and_tightest_cap(groups, expected, consumer_walk):
+    from mstar.graph.runtime.base import ExecutionUnit
+
+    a, b = _Engine(max_bs=8), _Engine(max_bs=2, groups=groups)
+    original_group, original_cap = b.capture_group, b.get_max_batch_size
+    def capture_group(node, walk, *args, **kwargs):
+        assert walk == consumer_walk
+        return original_group(node, walk, *args, **kwargs)
+    def max_batch_size(node, walk):
+        assert walk == consumer_walk
+        return original_cap(node, walk)
+    b.capture_group, b.get_max_batch_size = capture_group, max_batch_size
+    scheduler = _scheduler(a)
+    scheduler.engine_manager.get_engine = lambda name: a if name == NODE else b
+    scheduler.execution_units[NODE, WALK] = ExecutionUnit(
+        (0, 0), (WALK, consumer_walk), (NODE, "b"), ((NODE, "b", "x"),), ((), ()),
+    )
+    manager = _Manager(["r0", "r1", "r2"])
+    batch = _next_batch(scheduler, manager)
+    assert list(batch.request_to_worker_graph) == expected
 
 
 class _Submodule:
