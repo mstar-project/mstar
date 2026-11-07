@@ -1239,6 +1239,7 @@ class _BytesProcessor:
 def test_no_instruction_is_served_as_the_empty_instruction():
     """An empty instruction, which some real robot requests carry, arrives as ``None``
     (FastAPI); refusing it answers them with a 400. A real instruction is the control."""
+    pytest.importorskip("cv2")
     model = _model()
     model.processor = Gr00tN17Preprocessor(_DECODE_KWARGS, _DECODE_STATS, {"bot": 0}, 8, 6, _BytesProcessor())
     frames = [torch.full((180, 320, 3), 40 * i, dtype=torch.uint8) for i in range(2)]
@@ -1282,6 +1283,7 @@ def test_only_a_state_of_one_request_and_the_configured_history_is_served(lead, 
                                     embodiment_tag="bot", state=state)
 
     if lead == (1, history):
+        pytest.importorskip("cv2")
         assert serve()["state"][0].shape == (1, history, 8)
     else:
         with pytest.raises(ValueError, match=rf"`\(1, {history}, D\)`.*'arm'"):
@@ -1371,6 +1373,7 @@ def test_a_camera_whose_frames_differ_in_size_is_named():
 def test_cameras_must_share_an_aspect_ratio_as_the_reference_stacks_them(wrist, accepted):
     """NVIDIA's processor stacks every view's transformed frames, so a camera at another aspect
     ratio fails there (``stack expects each tensor to be equal size``); here it is a 400."""
+    pytest.importorskip("cv2")
     two_cameras = json.loads(json.dumps(_DECODE_KWARGS))
     two_cameras["modality_configs"]["bot"]["video"]["modality_keys"] = ["cam", "wrist"]
     pre = Gr00tN17Preprocessor(two_cameras, _DECODE_STATS, {"bot": 0}, 8, 6, _BytesProcessor())
