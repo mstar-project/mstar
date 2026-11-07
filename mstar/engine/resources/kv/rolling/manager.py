@@ -11,6 +11,7 @@ enough but the free tokens are, the resident regions slide left to join the gaps
 
 from __future__ import annotations
 
+import logging
 import threading
 from typing import NamedTuple
 
@@ -32,6 +33,8 @@ from mstar.engine.resources.step import (
     AdmitRuntimeError,
     StepContext,
 )
+
+logger = logging.getLogger(__name__)
 
 # Tokens a layer of the staging block a region moves through when the gap it
 # slides across is shorter (a rearrange after a small request ends). The
@@ -261,14 +264,19 @@ class RollingKVManager(Resource):
         into one at the end. Runs inside ``admit``, on the stream the steps run on,
         so a region moves only after every step already issued has read it, and
         the next step's plan takes its new offset."""
-        cursor = 0
+        cursor = moved = tokens = 0
         for req in sorted(self._requests.values(), key=lambda r: r.offset):
             if req.offset != cursor:
                 # only what the request holds: its sink and window so far
-                self._move_left(req.offset, cursor, min(req.written, req.capacity))
+                held = min(req.written, req.capacity)
+                self._move_left(req.offset, cursor, held)
                 req.offset = cursor
+                moved, tokens = moved + 1, tokens + held
             cursor += req.capacity
         self._free = [(cursor, self.config.pool_tokens - cursor)] if cursor < self.config.pool_tokens else []
+        # rare (a request that fits no gap), and it stalls the step's stream for the copy
+        logger.info("rolling KV %s: rearranged the pool, moving %d regions (%d tokens a layer)",
+                    self.name, moved, tokens)
 
     # Step lifecycle
 
