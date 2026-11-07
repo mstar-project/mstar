@@ -677,9 +677,10 @@ def test_cuda_every_path_and_split_matches_the_reference(kind, group, path, m, c
 @cuda
 @pytest.mark.parametrize("symmetric, group", [(True, 128), (False, 128), (True, 32)])
 @pytest.mark.parametrize("m", [1, 2, 3])
-def test_cuda_tinygemm_copy_matches_the_reference(symmetric, group, m):
-    """The format's tinygemm copy (built at load on CUDA) runs 1-2 tokens; its bf16 scales and zeros round within a
-    GEMM's tolerance of the reference; 3 tokens take the Triton GEMV."""
+def test_cuda_tinygemm_copy_matches_the_reference(symmetric, group, m, monkeypatch):
+    """Without Marlin, the format's tinygemm copy (built at load on CUDA) runs 1-3 tokens; its bf16 scales and zeros
+    round within a GEMM's tolerance of the reference."""
+    monkeypatch.setenv("MSTAR_W4A16_MARLIN", "0")
     torch.manual_seed(8)
     dev = torch.device("cuda")
     n, k = 1024, 2048
