@@ -14,7 +14,7 @@ import sys
 import threading
 import time
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Collection, Iterable
 from concurrent.futures import CancelledError, Future
 from contextlib import nullcontext as _nullcontext
 from dataclasses import dataclass, field
@@ -2109,6 +2109,30 @@ class TensorCommunicationManager(ABC):
         """``increment_ref_batch`` for a uniform count, which is what the
         safety hold on a stored output batch always is."""
         self.tensor_store.increment_ref_batch_uniform(uuids, n)
+
+    def inflight_read_rids(self, request_ids: Collection[Rid]) -> frozenset[Rid]:
+        """Snapshot outstanding reads once for a batch's completion reports.
+
+        The main thread owns both read admission and output routing, so no
+        new read starts between this snapshot and those reports. Futures may
+        finish meanwhile; a positive snapshot conservatively requests a drain.
+        """
+        if not request_ids or (not self.pending and not self._kept_reads):
+            return frozenset()
+        wanted = set(request_ids)
+        rids = set()
+        for ep in self.pending:
+            if (ep.request_id in wanted and ep.future is not None
+                    and _may_be_reading(ep.future)):
+                rids.add(ep.request_id)
+                wanted.remove(ep.request_id)
+                if not wanted:
+                    return frozenset(rids)
+        rids.update(
+            kept.rid for kept in self._kept_reads
+            if kept.rid in wanted and (kept.future is not None or kept.running)
+        )
+        return frozenset(rids)
 
     def has_inflight_reads(self, request_id: Rid) -> bool:
         """Whether any async read for this request is still touching a remote

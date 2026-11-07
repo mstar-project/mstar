@@ -4,6 +4,7 @@ out of ``_register_outputs`` and the worker's main-loop handler failed every
 request in the batch (#488)."""
 
 import sys
+from concurrent.futures import Future
 from types import SimpleNamespace
 
 import pytest
@@ -23,6 +24,7 @@ from mstar.communication import tensor_store
 from mstar.communication.communicator import BaseCommunicator, CommProtocol
 from mstar.communication.tensors import (
     AsyncMooncakeReader,
+    FutureAndPointers,
     MooncakeCommunicationManager,
     StoredOutputs,
     TensorCommunicationManager,
@@ -245,6 +247,7 @@ def _postprocess_worker(refuse, follower=False):
         dereference_batch_uniform=lambda *a: None,
         register_for_send_uuids=register,
         drop_host_copies=lambda: None,
+        inflight_read_rids=lambda rids: frozenset(),
     )
 
     def route(route_input):
@@ -304,6 +307,33 @@ def _fail_requests_sent(w):
         m for m in w.log.conductor
         if m.message_type == ConductorMessageType.FAIL_REQUESTS
     ]
+
+
+def test_postprocess_snapshots_reads_once_for_the_whole_batch():
+    w = _postprocess_worker(refuse=set())
+    pending, done = Future(), Future()
+    done.set_result(None)
+    w.tensor_manager.pending = [
+        FutureAndPointers(future=pending, graph_edges=[], request_id=0),
+        FutureAndPointers(future=done, graph_edges=[], request_id=1),
+    ]
+    w.tensor_manager._kept_reads = []
+    snapshots, sends = [], []
+
+    def snapshot(rids):
+        result = TensorCommunicationManager.inflight_read_rids(w.tensor_manager, rids)
+        snapshots.append(result)
+        return result
+
+    w.tensor_manager.inflight_read_rids = snapshot
+    w._graph_runtime.send_outputs = lambda send: sends.append(send) or []
+    Worker._postprocess_batch(w, *_decode_step([0, 1]))
+    assert snapshots == [frozenset({0})]
+    assert sends[0].inflight_read_rids == frozenset({0})
+    pending.set_result(None)
+    Worker._postprocess_batch(w, *_decode_step([0, 1]))
+    assert snapshots == [frozenset({0}), frozenset()]
+    assert sends[1].inflight_read_rids == frozenset()
 
 
 def test_the_speculated_next_step_sends_nothing_of_a_refused_request():

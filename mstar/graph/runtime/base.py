@@ -561,6 +561,8 @@ class SendInput(NamedTuple):
     # persist signals or WORKER_GRAPHS_DONE. The worker has already failed
     # them, so the conductor tears them down.
     failed_rids: frozenset[int] = frozenset()
+    # Sparse request-wide read snapshot; only positive reports cross into Rust.
+    inflight_read_rids: frozenset[int] = frozenset()
 
 
 class PostprocessNeed(IntEnum):

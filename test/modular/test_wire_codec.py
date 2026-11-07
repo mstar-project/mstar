@@ -199,6 +199,7 @@ def test_worker_graphs_done_full():
         message_type=ConductorMessageType.WORKER_GRAPHS_DONE,
         body=WorkerGraphsDone(
             request_id="r0", worker_graph_ids=["wg0", "wg1"], is_first_tp_rank=False,
+            worker_id="worker_3", has_inflight_reads=True,
             persist_signals={"kv": [_info("u-a"), _info("u-b")]},
             new_token_counts={"tok": 5},
             resource_publish_info={},
@@ -214,6 +215,8 @@ def test_worker_graphs_done_full():
     body = roundtrip(msg).body
     assert body.worker_graph_ids == ["wg0", "wg1"]
     assert body.is_first_tp_rank is False
+    assert body.worker_id == "worker_3"
+    assert body.has_inflight_reads is True
     assert [i.uuid for i in body.persist_signals["kv"]] == ["u-a", "u-b"]
     assert body.persist_signals["kv"][0].dtype is torch.bfloat16
     assert body.stream_tokens_consumed == {"audio": 12}

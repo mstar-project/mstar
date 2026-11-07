@@ -40,6 +40,7 @@ from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import WorkerGraph
 from mstar.model.submodule_base import StopKind, StopPolicy
 from mstar.utils.containers import ParallelList
+from mstar.utils.ipc_format import ConductorMessageType
 
 WALK, NODE, LOOP, SIG, PART, ME = "decode", "LLM", "decode_loop", "text_inputs", "default", "w0"
 MAX_ITERS = 4
@@ -107,7 +108,7 @@ def _start(rt, n, limits=True):
     return rids
 
 
-def _drive(rt, request, values, model_stops, dropped=()):
+def _drive(rt, request, values, model_stops, dropped=(), inflight_read_rids=frozenset()):
     """One step's postprocess as the worker runs it; each break, summarized."""
     trace = []
     step = rt.begin_postprocess(request)
@@ -131,6 +132,7 @@ def _drive(rt, request, values, model_stops, dropped=()):
                 completion_id=step.route_output.completion_id,
                 per_request_info=ParallelList(info, [None] * len(info)),
                 new_token_counts=ParallelList([], []),
+                inflight_read_rids=inflight_read_rids,
             ))
 
 
@@ -170,7 +172,12 @@ def test_native_matches_reference(tmp_path, mode, dtype, reverse_rows):
             runtime_stops=mode != "model_stops", tokens=column, row_rids=row_rids,
             inline=None if mode == "stored" else InlineColumn(SIG, column),
         )
-        traces = {k: _drive(rt, request, values, model_stops) for k, rt in rts.items()}
+        # Only row 1 has an extra read. A completing row must return through
+        # SEND even when its outputs and stop check otherwise stay in Rust.
+        traces = {
+            k: _drive(rt, request, values, model_stops, inflight_read_rids=frozenset({rids[0][1]}))
+            for k, rt in rts.items()
+        }
         assert traces["native"] == traces["reference"], step
         needs |= {t[0] for t in traces["native"]}
         stopped = set(traces["native"][-1][2])
@@ -186,6 +193,12 @@ def test_native_matches_reference(tmp_path, mode, dtype, reverse_rows):
         got = {k: _collect(boxes[k][peer]) for k in boxes}
         assert got["native"] == got["reference"], peer
         assert got["native"], peer
+        if peer == "conductor":
+            reports = [m.body for m in got["native"]
+                       if m.message_type == ConductorMessageType.WORKER_GRAPHS_DONE]
+            assert reports
+            assert {m.request_id for m in reports if m.has_inflight_reads} == {"r1"}
+            assert all(m.worker_id == ME for m in reports)
     for rt in rts.values():
         assert rt._rust.num_parked_completions() == 0
 

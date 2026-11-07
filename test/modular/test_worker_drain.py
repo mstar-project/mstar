@@ -100,6 +100,7 @@ def _worker(
     w.profile_info = SimpleNamespace(pop_request=lambda rid: None)
     w.tensor_manager = SimpleNamespace(
         has_inflight_reads=lambda rid: inflight_reads,
+        inflight_read_rids=lambda rids: frozenset(rids) if inflight_reads else frozenset(),
         force_cleanup_request=lambda rid: w.forced.append(rid), # noqa: PLW0108
     )
     w.streams = StreamBufferManager(w.request_state, w.tensor_manager, [])
@@ -333,6 +334,19 @@ def test_remove_of_a_never_admitted_rid_clears_its_wire_keyed_state():
     w = _worker(known_rids=(), tp_follow=("X",))
     Worker._remove_request(w, RemoveRequest(request_id="X"))
     assert w.cleared == ["X"]
+
+
+@pytest.mark.parametrize("known_rids", [(), ("X",)], ids=["never-admitted", "removed"])
+@pytest.mark.parametrize("source", [MessageSource.CONDUCTOR, MessageSource.TP_RANK_0])
+def test_late_drain_does_not_recreate_removed_request_state(known_rids, source):
+    w = _worker(known_rids=known_rids)
+    Worker._remove_request(w, RemoveRequest(request_id="X"))
+    Worker._drain_request(w, DrainRequest(request_id="X", source=source))
+
+    assert not w._draining_rids
+    assert not w._pending_drains
+    assert not w._reads_done_sent
+    assert not _reads_done(w)
 
 
 def test_drain_deferred_behind_inflight_gpu_step():

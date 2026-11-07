@@ -349,6 +349,9 @@ class RequestData:
     # set once request_complete goes out; after that the client must never get
     # request_failed
     completion_sent: bool = False
+    # Latest read reports, across all partitions and ranks. Allocate only
+    # when a worker reports reads; a later clear report removes that worker.
+    workers_with_inflight_reads: set[str] | None = None
 
     # Partition state (always populated — single-partition models use a "default" partition)
     partition_states: dict[str, PartitionState] = field(default_factory=dict)
@@ -1810,20 +1813,14 @@ class Conductor:
         if still_persisted:
             self._un_persist_tensors(request_id, still_persisted)
 
-        # Workers are done reading (the graph finished); the only remaining
-        # reader is the preprocess worker still delivering outputs. Defer the
-        # hard RemoveRequest until it signals READS_DONE, so a worker output
-        # isn't unlinked under an in-flight read.
-        # NOTE: "workers done reading" assumes a well-behaved graph. A model bug
-        # that emits extra/erroneous tensors could leave a worker read scheduled
-        # past completion, which this path won't wait for. Gating the happy path
-        # on per-worker READS_DONE too (like abort/fail) would handle that
-        # robustly — TODO once the barrier has proven out. A model with a client
-        # stream already does: the client can append after the model ended the
-        # request, so a chunk can be in a worker's read at any point.
+        # The preprocess worker may still be delivering outputs. Workers
+        # reporting extra reads need the drain barrier too, including every
+        # TP rank: followers only honor their leader's forwarded drain.
+        # Client streams always drain because new input can arrive after a
+        # worker's completion report.
         workers = self._request_workers(request_data)
         expected_acks = {self.PREPROCESS_WORKER}
-        if self._client_streams:
+        if self._client_streams or request_data.workers_with_inflight_reads:
             self._send_drain(request_id, workers)
             expected_acks |= workers
         self._register_draining(
@@ -1877,6 +1874,16 @@ class Conductor:
                 partition_name, body.request_id,
             )
             return []
+
+        # A later report from this worker covers all its reads for the request,
+        # so it can clear an earlier report, even from another partition.
+        # A different rank's clear report must not erase an outstanding read.
+        if body.has_inflight_reads:
+            if request_data.workers_with_inflight_reads is None:
+                request_data.workers_with_inflight_reads = set()
+            request_data.workers_with_inflight_reads.add(body.worker_id)
+        elif request_data.workers_with_inflight_reads:
+            request_data.workers_with_inflight_reads.discard(body.worker_id)
 
         # Any report of the pass may carry it, not only the one that completes
         # the pass: that can be another worker's (an encoder's, say).
