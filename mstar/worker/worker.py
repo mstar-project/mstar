@@ -3064,155 +3064,163 @@ class Worker(RepeatingSteps):
         self._drop_rows_whose_loop_stopped(step)
         _drop_unprepared_rows(step.batch, step.node_batch)
 
+    def _finish_group(self, step: PendingBatch, gpu_executor: ThreadPool | None) -> None:
+        """Close logical member receipts in graph order, retaining physical leases.
+
+        The parent owns release after every receipt's tail and copies complete.
+        A late receipt can borrow those leases without resetting another row.
+        """
+        failed = {}
+        for i, (scheduled, executing) in enumerate(step.group.members):
+            upstream_failed = frozenset(failed)
+            # Every body may already have run. A predecessor's failed
+            # tail still settles later owners, but cannot publish a
+            # successful dependent result or run its ordinary tail.
+            executing.failed_requests.update({rid: error for rid, error in failed.items()
+                                              if rid in executing.request_ids})
+            finished = step.group.finished_rids[i] if step.group.finished_rids else frozenset()
+            if finished:
+                self._graph_runtime.release_execution_unit_member(
+                    step.group.claim, scheduled.node_name, step.group.unit.worker_graph_ids[i], list(finished),
+                )
+                for rid in finished:
+                    scheduled.discard_rid(rid)
+                executing.drop_rids(finished)
+            if not scheduled.request_to_worker_graph:
+                continue
+            if (step.group.unit.streaming_edges and executing.ring_width == 0
+                    and any(maker == scheduled.node_name for maker, _, _ in step.group.unit.streaming_edges)):
+                self.scheduler.clear_batch_limit(
+                    scheduled.node_name, scheduled.graph_walk, len(scheduled.request_to_worker_graph),
+                    walks=scheduled.rids_by_walk(),
+                )
+                self._graph_runtime.release_execution_unit_member(
+                    step.group.claim, scheduled.node_name, step.group.unit.worker_graph_ids[i],
+                    list(scheduled.request_to_worker_graph),
+                )
+                continue
+            member = replace(step, batch=scheduled, node_batch=executing, node_name=scheduled.node_name,
+                             graph_walk=scheduled.graph_walk,
+                             partition=self.request_state.get_partition_for_node(scheduled.node_name),
+                             group=None)
+            if step.group.unit.streaming_edges and RUN_REPLAYS in (executing.outputs.check_stop_buffers or {}):
+                if gpu_executor is None:
+                    raise ValueError("independent member collection needs its execution thread")
+                self._wait_for_step(member)
+                _, host = self._prematerialize_for_check_stop(
+                    executing.outputs, executing.completion_event, request_ids=executing.request_ids,
+                )
+                width = int(host.buffers[RUN_REPLAYS][0])
+                nrows = len(host.request_ids)
+                counts = dict(zip(host.request_ids, host.buffers[RUN_COUNTS][:nrows].tolist(), strict=True))
+                semantic = host.buffers.get(STREAM_COUNTS)
+                pops = ({} if semantic is None else
+                        dict(zip(host.request_ids, semantic[:nrows].tolist(), strict=True)))
+                selected = ({} if semantic is None else
+                            dict(zip(host.request_ids, host.buffers[STREAM_TRANSITION][:nrows].tolist(),
+                                     strict=True)))
+                finals, edges = {}, {}
+                for rid, amount in pops.items():
+                    edge, = executing.stream_windows[rid]
+                    edges[rid] = edge
+                    if amount:
+                        finals[rid] = edge.chunk.reservation.transitions[selected[rid]].chunk
+                    else:
+                        restored = self.streams.restore_edge(rid, edge)
+                        if restored is None:
+                            executing.stream_windows.pop(rid)
+                        else:
+                            executing.stream_windows[rid] = [restored]
+
+                def collect(executing=executing, width=width, counts=counts, pops=pops, selected=selected):
+                    engine = self.engine_manager.get_engine(executing.node_name)
+                    actual_inputs = {rid: selected[rid] for rid, amount in pops.items()
+                                     if amount and counts[rid]}
+                    if actual_inputs:
+                        producer, _, signal = step.group.unit.streaming_edges[0]
+                        engine.materialize_group_inputs(executing, producer, signal, actual_inputs, width)
+                    result = engine.collect_group_outputs(executing, width, counts)
+                    self._stage_host_rows(result, step.lane)
+                    if self.device_capability.is_accelerator:
+                        event = torch.Event(device=self.device)
+                        event.record(torch.accelerator.current_stream(self.device))
+                        executing.completion_event = event
+                    executing.resource_publish_info = engine.finalize_batch(
+                        executing, publish_request_ids=self._publishable_request_ids(executing),
+                    )
+                    return result
+
+                try:
+                    executing.outputs = gpu_executor.submit(collect).result()
+                    failed.update(executing.failed_requests)
+                finally:
+                    # The forward already consumed these chunks, even
+                    # if its ordinary tail failed. Keep their reader
+                    # until that tail and its input copies have landed.
+                    transitions = {}
+                    final_signals = {}
+                    for rid, final in finals.items():
+                        edge = edges[rid]
+                        if rid in upstream_failed:
+                            # A failed producer published no arrival;
+                            # only an original retained reader can close.
+                            restored = self.streams.restore_edge(rid, edge)
+                            if restored is not None:
+                                self.streams.settle_window(rid, restored, 0)
+                            executing.stream_windows.pop(rid, None)
+                        else:
+                            transitions[rid, edge.name] = (pops[rid], selected[rid])
+                            if final.is_final:
+                                final_signals[rid] = {edge.name}
+                    if transitions:
+                        self._settle_stream_windows(
+                            executing, counts, keep={rid for rid, amount in pops.items() if not amount},
+                            transitions=transitions,
+                        )
+                    if final_signals:
+                        done, partition = self.streams.settle_final(scheduled.node_name, final_signals)
+                        executing.final_stream_rids.update(done)
+                        executing.partition_done_rids.update(partition)
+                zero = [rid for rid in executing.request_ids
+                        if not counts[rid] and not pops.get(rid, 0) and rid not in executing.failed_requests]
+                if zero:
+                    engine = self.engine_manager.get_engine(executing.node_name)
+                    for signal, bases in executing.ring_bases.items():
+                        for rid in zero:
+                            if rid in bases:
+                                engine.ring_rows(executing.node_name).ring_skip(
+                                    signal, rid, range(bases[rid], bases[rid] + executing.ring_width),
+                                )
+                    returned = scheduled._sub_batch(zero)
+                    self.scheduler.clear_batch_limit(
+                        scheduled.node_name, scheduled.graph_walk, len(zero), walks=returned.rids_by_walk(),
+                    )
+                    self._graph_runtime.release_execution_unit_member(
+                        step.group.claim, scheduled.node_name, step.group.unit.worker_graph_ids[i], zero,
+                    )
+                    self._clear_in_flight_flag(returned)
+                    remaining = [rid for rid in executing.request_ids if rid not in zero]
+                    if not remaining:
+                        continue
+                    member = self._run_receipt_rows(member, remaining)
+                    scheduled, executing = member.batch, member.node_batch
+                scheduled.repeats = max(1, width)  # zero-compute final flush has no token column
+            if step.group.unit.streaming_edges:
+                self.scheduler.note_ran(scheduled)
+            if i != step.group.trigger:
+                self._clear_in_flight_flag(scheduled)
+            if i != step.group.trigger or step.group.unit.streaming_edges:
+                self._settle_step_rows(member, executing.outputs)
+            self._finish_step(member, executing.outputs)
+
     def _finish_step(
         self, step: PendingBatch, outputs: BatchedModelOutput, *, gpu_executor: ThreadPool | None = None,
     ) -> None:
         """A step that ran, on any lane: its batch limit lifts, its outputs
         are postprocessed and routed, and metrics count it."""
         if step.group is not None and step.group.submitted:
-            failed = {}
             try:
-                for i, (scheduled, executing) in enumerate(step.group.members):
-                    upstream_failed = frozenset(failed)
-                    # Every body may already have run. A predecessor's failed
-                    # tail still settles later owners, but cannot publish a
-                    # successful dependent result or run its ordinary tail.
-                    executing.failed_requests.update({rid: error for rid, error in failed.items()
-                                                      if rid in executing.request_ids})
-                    finished = step.group.finished_rids[i] if step.group.finished_rids else frozenset()
-                    if finished:
-                        self._graph_runtime.release_execution_unit_member(
-                            step.group.claim, scheduled.node_name, step.group.unit.worker_graph_ids[i], list(finished),
-                        )
-                        for rid in finished:
-                            scheduled.discard_rid(rid)
-                        executing.drop_rids(finished)
-                    if not scheduled.request_to_worker_graph:
-                        continue
-                    if (step.group.unit.streaming_edges and executing.ring_width == 0
-                            and any(maker == scheduled.node_name for maker, _, _ in step.group.unit.streaming_edges)):
-                        self.scheduler.clear_batch_limit(
-                            scheduled.node_name, scheduled.graph_walk, len(scheduled.request_to_worker_graph),
-                            walks=scheduled.rids_by_walk(),
-                        )
-                        self._graph_runtime.release_execution_unit_member(
-                            step.group.claim, scheduled.node_name, step.group.unit.worker_graph_ids[i],
-                            list(scheduled.request_to_worker_graph),
-                        )
-                        continue
-                    member = replace(step, batch=scheduled, node_batch=executing, node_name=scheduled.node_name,
-                                     graph_walk=scheduled.graph_walk,
-                                     partition=self.request_state.get_partition_for_node(scheduled.node_name),
-                                     group=None)
-                    if step.group.unit.streaming_edges and RUN_REPLAYS in (executing.outputs.check_stop_buffers or {}):
-                        if gpu_executor is None:
-                            raise ValueError("independent member collection needs its execution thread")
-                        self._wait_for_step(member)
-                        _, host = self._prematerialize_for_check_stop(
-                            executing.outputs, executing.completion_event, request_ids=executing.request_ids,
-                        )
-                        width = int(host.buffers[RUN_REPLAYS][0])
-                        nrows = len(host.request_ids)
-                        counts = dict(zip(host.request_ids, host.buffers[RUN_COUNTS][:nrows].tolist(), strict=True))
-                        semantic = host.buffers.get(STREAM_COUNTS)
-                        pops = ({} if semantic is None else
-                                dict(zip(host.request_ids, semantic[:nrows].tolist(), strict=True)))
-                        selected = ({} if semantic is None else
-                                    dict(zip(host.request_ids, host.buffers[STREAM_TRANSITION][:nrows].tolist(),
-                                             strict=True)))
-                        finals, edges = {}, {}
-                        for rid, amount in pops.items():
-                            edge, = executing.stream_windows[rid]
-                            edges[rid] = edge
-                            if amount:
-                                finals[rid] = edge.chunk.reservation.transitions[selected[rid]].chunk
-                            else:
-                                restored = self.streams.restore_edge(rid, edge)
-                                if restored is None:
-                                    executing.stream_windows.pop(rid)
-                                else:
-                                    executing.stream_windows[rid] = [restored]
-
-                        def collect(executing=executing, width=width, counts=counts, pops=pops, selected=selected):
-                            engine = self.engine_manager.get_engine(executing.node_name)
-                            actual_inputs = {rid: selected[rid] for rid, amount in pops.items()
-                                             if amount and counts[rid]}
-                            if actual_inputs:
-                                producer, _, signal = step.group.unit.streaming_edges[0]
-                                engine.materialize_group_inputs(executing, producer, signal, actual_inputs, width)
-                            result = engine.collect_group_outputs(executing, width, counts)
-                            self._stage_host_rows(result, step.lane)
-                            if self.device_capability.is_accelerator:
-                                event = torch.Event(device=self.device)
-                                event.record(torch.accelerator.current_stream(self.device))
-                                executing.completion_event = event
-                            executing.resource_publish_info = engine.finalize_batch(
-                                executing, publish_request_ids=self._publishable_request_ids(executing),
-                            )
-                            return result
-
-                        try:
-                            executing.outputs = gpu_executor.submit(collect).result()
-                            failed.update(executing.failed_requests)
-                        finally:
-                            # The forward already consumed these chunks, even
-                            # if its ordinary tail failed. Keep their reader
-                            # until that tail and its input copies have landed.
-                            transitions = {}
-                            final_signals = {}
-                            for rid, final in finals.items():
-                                edge = edges[rid]
-                                if rid in upstream_failed:
-                                    # A failed producer published no arrival;
-                                    # only an original retained reader can close.
-                                    restored = self.streams.restore_edge(rid, edge)
-                                    if restored is not None:
-                                        self.streams.settle_window(rid, restored, 0)
-                                    executing.stream_windows.pop(rid, None)
-                                else:
-                                    transitions[rid, edge.name] = (pops[rid], selected[rid])
-                                    if final.is_final:
-                                        final_signals[rid] = {edge.name}
-                            if transitions:
-                                self._settle_stream_windows(
-                                    executing, counts, keep={rid for rid, amount in pops.items() if not amount},
-                                    transitions=transitions,
-                                )
-                            if final_signals:
-                                done, partition = self.streams.settle_final(scheduled.node_name, final_signals)
-                                executing.final_stream_rids.update(done)
-                                executing.partition_done_rids.update(partition)
-                        zero = [rid for rid in executing.request_ids
-                                if not counts[rid] and not pops.get(rid, 0) and rid not in executing.failed_requests]
-                        if zero:
-                            engine = self.engine_manager.get_engine(executing.node_name)
-                            for signal, bases in executing.ring_bases.items():
-                                for rid in zero:
-                                    if rid in bases:
-                                        engine.ring_rows(executing.node_name).ring_skip(
-                                            signal, rid, range(bases[rid], bases[rid] + executing.ring_width),
-                                        )
-                            returned = scheduled._sub_batch(zero)
-                            self.scheduler.clear_batch_limit(
-                                scheduled.node_name, scheduled.graph_walk, len(zero), walks=returned.rids_by_walk(),
-                            )
-                            self._graph_runtime.release_execution_unit_member(
-                                step.group.claim, scheduled.node_name, step.group.unit.worker_graph_ids[i], zero,
-                            )
-                            self._clear_in_flight_flag(returned)
-                            remaining = [rid for rid in executing.request_ids if rid not in zero]
-                            if not remaining:
-                                continue
-                            member = self._run_receipt_rows(member, remaining)
-                            scheduled, executing = member.batch, member.node_batch
-                        scheduled.repeats = max(1, width)  # zero-compute final flush has no token column
-                    if step.group.unit.streaming_edges:
-                        self.scheduler.note_ran(scheduled)
-                    if i != step.group.trigger:
-                        self._clear_in_flight_flag(scheduled)
-                    if i != step.group.trigger or step.group.unit.streaming_edges:
-                        self._settle_step_rows(member, executing.outputs)
-                    self._finish_step(member, executing.outputs)
+                self._finish_group(step, gpu_executor)
             finally:
                 self.engine_manager.get_engine(step.node_name).release_group(step.group)
                 step.group.parts.clear()
