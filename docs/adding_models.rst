@@ -2569,6 +2569,13 @@ also quantize a bf16 checkpoint at load); MoE routed experts take every 4-bit fo
 on H100/H200 and FlashInfer's TRT-LLM FP4 MoE (MXFP4, NVFP4) on B200/B300. ``bench_experts.py`` times the experts'
 formats against the bf16 fused MoE.
 
+A mixed checkpoint is read the same way, tensor by tensor: nvidia/GLM-5.3-NVFP4 (modelopt ``MIXED_PRECISION``)
+serves its routed experts as NVFP4, the dense layers' FFN as fp8 per tensor (gate and up requantized to one scale,
+as modelopt calibrates them apart) and its bf16 attention as bf16, with no ``quantization:`` block; a rule can
+still move any of its bf16 linears to a format at load. An experts layer that takes NVFP4 needs one tensor scale for
+gate and up per expert and one activation scale per layer (modelopt's own convention); the NVFP4 activations are
+quantized against the checkpoint's calibrated ``input_scale``.
+
 Routing across data-parallel replicas
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
