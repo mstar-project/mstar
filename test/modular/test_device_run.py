@@ -43,7 +43,7 @@ class _Loop:
     def new_loop(self, device):
         return 1, 2, torch.zeros(1)
 
-    def stop(self, state, tokens, handle, stream):
+    def stop(self, state, tokens, stream):
         """The test double of the ``run_stop`` kernel, which only CUDA can run."""
         self.state = state
         if state.descriptors is not None:
@@ -60,7 +60,7 @@ class _Loop:
             state.stream.landed[0] = int(state.index) + 1
         state.index += 1
         done = int(state.marks.sum())
-        self.go = (
+        state.continuation[0] = (
             done < len(state.marks) and int(state.index) < int(state.limit)
             and int(state.generation[0]) > int(state.yield_until[0])
             and (int(state.refill) == 0 or done < int(state.refill))
@@ -85,7 +85,7 @@ class _Loop:
             self.on_iteration(i)
             self.body()
             i += 1
-            if not self.go:
+            if not state.continuation.item():
                 return
 
 
@@ -342,6 +342,97 @@ def test_a_step_graph_a_while_body_cant_hold_is_refused(kinds, why):
     assert refusal is None if why is None else why in refusal
 
 
+
+def test_standalone_condition_waits_for_the_entire_captured_body():
+    import ctypes
+
+    cuda = CudaWhile.__new__(CudaWhile)
+    state = RunState(1, None, (), CPU)
+    child_done, condition_set = [], []
+    cuda._add_start = lambda *args: ctypes.c_void_p(4)
+    cuda.add_conditional = lambda *args: (ctypes.c_void_p(5), 6)
+
+    def call(name, *args):
+        if name == "cudaGraphAddChildGraphNode":
+            assert args[1].value == 6
+            args[0]._obj.value = 7
+            child_done.append(7)
+        elif name == "cudaGraphInstantiateWithFlags":
+            assert condition_set == [True]
+            args[0]._obj.value = 8
+        else:
+            pytest.fail(name)
+
+    def set_condition(parent, previous, predicate, handle):
+        assert child_done == [previous.value]
+        assert parent == 6 and predicate is state.continuation and handle == 2
+        condition_set.append(True)
+
+    cuda._call, cuda.add_condition_setter = call, set_condition
+    assert cuda.finish(1, 2, 3, state, torch.tensor([2])) == 8
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="real CUDA captured body reuse")
+def test_one_run_body_reuses_standalone_and_composed_parents():
+    import ctypes
+
+    from mstar.engine.accelerator_graph_backend import GraphConditional, get_accelerator_graph_backend
+    from mstar.engine.accelerator_graph_runner import capture_into_graph
+
+    backend = get_accelerator_graph_backend(torch.device("cuda:0"))
+    cuda, device = backend.while_runtime(), backend.device
+    state = RunState(2, "token", {3, 14}, device)
+    token = torch.zeros(2, dtype=torch.long, device=device)
+    history = torch.zeros((2, 6), dtype=torch.long, device=device)
+    offsets = torch.tensor([1, 11], device=device)
+    tail = torch.zeros_like(state.index)
+    outer, handle, device_handle = cuda.new_loop(device)
+    cuda._load_kernels()
+
+    def body():
+        token.copy_(state.index + offsets)
+        history.scatter_(1, state.index.clamp(0, 5).expand(2, 1), token[:, None])
+        cuda.stop(state, token, backend.raw_stream())
+        tail.copy_(state.index)
+
+    captured = capture_into_graph(body, backend.graph_pool_handle(), device, None, keep_graph=True)[0]
+    standalone = cuda.finish(outer, handle, int(captured.raw_cuda_graph()), state, device_handle)
+    # This graph owns fresh conditional handles. The same capture and all its
+    # bound storage remain leased while either parent executes, never both.
+    composed = backend.compose((GraphConditional("while", state.continuation, (
+        GraphConditional("if", state.continuation, (captured,)),
+    )),))
+    try:
+        for kind, skip in (("standalone", False), ("composed", False),
+                           ("standalone", True), ("composed", True),
+                           ("composed", False), ("standalone", False)):
+            state.stage(2, [False, False], 6)
+            history.zero_()
+            tail.zero_()
+            if kind == "standalone":
+                if skip:
+                    state.request_yield()
+                cuda.launch(standalone, backend.raw_stream())
+            else:
+                # Entry eligibility belongs to this parent, not the previous
+                # launch's continuation or an invented started receipt.
+                state.continuation.fill_(0 if skip else 1)
+                composed.replay()
+            backend.synchronize()
+            assert state.counts.tolist() == ([0, 0] if skip else [3, 4])
+            assert state.index.item() == tail.item() == (0 if skip else 4)
+            assert state.continuation.item() == 0
+            if kind == "standalone":
+                assert state.started.item() == (RUN_SKIPPED if skip else RUN_RAN)
+            else:
+                assert state.started.item() == 0
+            if not skip:
+                assert history.tolist() == [[1, 2, 3, 4, 0, 0], [11, 12, 13, 14, 0, 0]]
+    finally:
+        backend.synchronize()
+        cuda._call("cudaGraphExecDestroy", ctypes.c_void_p(standalone))
+        cuda._call("cudaGraphDestroy", ctypes.c_void_p(outer))
+
 def test_a_run_refuses_a_generator_draw_and_a_walk_with_no_while_node():
     runner = AcceleratorGraphRunner.__new__(AcceleratorGraphRunner)
     runner._run_asks, runner._run_failures, runner._generator_walks = {WALK: object()}, {}, {WALK}
@@ -496,7 +587,7 @@ def test_a_failed_while_capture_settles_its_walk_and_a_plain_capture_serves(monk
             Failing.loops += 1
             return super().new_loop(device)
 
-        def stop(self, state, tokens, handle, stream):
+        def stop(self, state, tokens, stream):
             raise RuntimeError("no such stream")
 
     monkeypatch.setattr(torch.accelerator, "is_available", lambda: False)

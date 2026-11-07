@@ -1517,7 +1517,7 @@ class AcceleratorGraphRunner:
                 target = warmed.static_inputs[pair.input]
                 target.copy_(output_named(output, pair.output).reshape(target.shape))
             tokens = None if ask.token_signal is None else output_named(output, ask.token_signal).to(torch.long)
-            cuda.stop(state, tokens, device_handle, backend.raw_stream())
+            cuda.stop(state, tokens, backend.raw_stream())
             state.retire_rows()
             if window is not None:
                 self._rows.iteration_tail(
