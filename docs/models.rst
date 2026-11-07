@@ -248,13 +248,24 @@ state, prefix chains and generator draws remain boundaries.
 
 Local streaming connections keep each member's graph identity and actual Loop
 progress. The bounded implementation supports two members, one streaming edge,
-one logical and physical row, and fixed membership. It can claim a waiting
+and fixed membership with independent per-row readiness. Finished producers
+can be absent from their member's compact batch while their consumers drain
+retained input. It can claim a waiting
 consumer and compose existing entries and bodies under native IF/WHILE nodes.
 The producer and consumer have independent compute counts. The ordinary chunk
 policy supplies readiness, consumption and final-tail decisions; run-budget
 exhaustion does not finish the stream. Selected history is settled only after
 actual producer output is published. Physical ring reservations and reader
 references remain owned by the stream resources until collection completes.
+
+Frozen policy decisions and semantic progress live in ``IterationTables`` rows
+indexed by retained resident owner slots. A captured physical row gathers its
+current owner's receipt; only selected transitions write progress back. Staging
+a fresh owner never resets a live physical view. The first reservation fixes
+policy and ring-coverage capacities for that capture; larger later snapshots
+refuse before submission. This bounds each bank, not total worker memory.
+Whole-unit live admission remains guarded until publication and collection
+bind every member through the same generation.
 
 Preparation may structurally pack future inputs with real values through
 reshape, transpose, stack, concatenation and constant padding. These operations

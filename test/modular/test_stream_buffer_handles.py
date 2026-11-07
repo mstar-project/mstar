@@ -730,8 +730,13 @@ def test_future_stream_decisions_equal_ordinary_interleaving_and_preserve_later_
     choices = {(parent, end, done): selected for parent, end, done, selected in reservation.decisions}
     owner = IterationTables(torch.device("cpu"))
     lease = SlotLease(0, BucketKey("consume", 2, 2))
-    window = owner.prepare_stream_window(lease, len(reservation.decisions), max(1, len(reservation.transitions)))
-    owner.stage_stream_window(lease, [reservation], [[True] * len(reservation.transitions)])
+    policy_rows = torch.arange(1, lease.bucket.bs + 1, dtype=torch.long, device=torch.device("cpu"))
+    window = owner.prepare_stream_window(
+        lease, len(reservation.decisions), max(1, len(reservation.transitions)),
+        rows=policy_rows, slots=lease.bucket.bs + 2,
+    )
+    owner.stage_stream_window(lease, [1], [reservation], [[True] * len(reservation.transitions)])
+    window.gather()
     parent, count, produced, done = -1, 0, [], False
     chunks, released = [], []
 
@@ -803,10 +808,15 @@ def test_future_stream_empty_final_and_continuing_tail_use_distinct_semantic_rec
     choices = {(parent, end, done): selected for parent, end, done, selected in reservation.decisions}
     owner = IterationTables(torch.device("cpu"))
     lease = SlotLease(0, BucketKey("consume", 1, 1))
-    window = owner.prepare_stream_window(lease, len(reservation.decisions), len(reservation.transitions))
+    policy_rows = torch.arange(1, lease.bucket.bs + 1, dtype=torch.long, device=torch.device("cpu"))
+    window = owner.prepare_stream_window(
+        lease, len(reservation.decisions), len(reservation.transitions),
+        rows=policy_rows, slots=lease.bucket.bs + 2,
+    )
     # These are ordinary preparation outcomes: final flush has no forward;
     # a continuing empty tail does compute. Both have zero input items.
-    owner.stage_stream_window(lease, [reservation], [[continues] * len(reservation.transitions)])
+    owner.stage_stream_window(lease, [1], [reservation], [[continues] * len(reservation.transitions)])
+    window.gather()
     parent, count = -1, 0
     while count < 3:
         parent = choices[parent, 0, True]
@@ -849,41 +859,87 @@ def test_future_stream_empty_final_and_continuing_tail_use_distinct_semantic_rec
     assert source._tail_consumed == (3 if continues else 0)
 
 
-def test_future_policy_capture_bank_reuse_clears_history_and_checks_before_staging():
+@pytest.mark.parametrize("device_name", ["cpu", "cuda"])
+def test_future_policy_capture_bank_reuse_clears_history_and_checks_before_staging(device_name):
+    from mstar.engine.accelerator_graph_backend import get_accelerator_graph_backend
+    from mstar.engine.accelerator_graph_runner import capture_into_graph
     from mstar.engine.resources.iteration_tables import IterationTables
     from mstar.engine.resources.step import BucketKey, SlotLease
 
+    if device_name == "cuda" and not torch.cuda.is_available():
+        pytest.skip("real resident policy owner rebinding")
+    device = torch.device(device_name)
     source = StreamBuffer(RID, EDGE, "LLM", FixedChunkPolicy(1))
     reservation = source.reserve_future_window([0, 1], 2).reservation
-    owner = IterationTables(torch.device("cpu"))
+    replacement = StreamBuffer(RID + 1, EDGE, "LLM", FixedChunkPolicy(2))
+    newer = replacement.reserve_future_window([7, 8], 1).reservation
+    ended = StreamBuffer(RID + 2, EDGE, "LLM", FixedChunkPolicy(1))
+    ended.signal_done(0)
+    empty = ended.reserve_future_window([], 1).reservation
+    receipts = (reservation, newer, empty)
+    owner = IterationTables(device)
     lease = SlotLease(0, BucketKey("consume", 2, 2))
-    window = owner.prepare_stream_window(lease, len(reservation.decisions), len(reservation.transitions))
-    flags = [True] * len(reservation.transitions)
-    owner.stage_stream_window(lease, [reservation], [flags])
-    window.select(torch.tensor([1, 0]), torch.tensor([False, False]), torch.tensor([True, False]))
-    window.advance()
-    before = window.decisions.clone(), window.history.clone(), window.counts.clone()
+    policy_rows = torch.tensor([1, 0], device=device)
+    decisions = max(len(r.decisions) for r in receipts)
+    transitions = max(len(r.transitions) for r in receipts)
+    window = owner.prepare_stream_window(lease, decisions, transitions, 2, rows=policy_rows, slots=5)
+    available = torch.tensor([1, 0], device=device)
+    done = torch.tensor([False, False], device=device)
+    live = torch.tensor([True, False], device=device)
+
+    def execute():
+        window.gather()
+        window.select(available, done, live)
+        window.advance()
+
+    graph = None
+    if device_name == "cuda":
+        backend = get_accelerator_graph_backend(device)
+        graph = capture_into_graph(execute, backend.graph_pool_handle(), device, None, keep_graph=True)[0]
+
+    def run():
+        if graph is None:
+            execute()
+        else:
+            graph.replay()
+            backend.synchronize()
+
+    owner.stage_stream_window(lease, [1], [reservation], [[True] * len(reservation.transitions)], producer_limits=[2])
+    run()
+    assert window.counts.tolist() == [1, 0]
+    old = window.bank.history[1].clone()
+    before = window.bank.decisions.clone(), window.history.clone(), window.counts.clone()
     with pytest.raises(ValueError, match="prepared transitions"):
-        owner.stage_stream_window(lease, [reservation], [flags[:-1]])
-    after = window.decisions, window.history, window.counts
-    assert all(torch.equal(a, b) for a, b in zip(before, after, strict=True))
-    assert owner.prepare_stream_window(lease, len(reservation.decisions), len(reservation.transitions)) is window
-    owner.stage_stream_window(lease, [], [])
-    window.select(torch.tensor([1, 0]), torch.tensor([False, False]), torch.tensor([True, True]))
-    assert window.selected.tolist() == window.history.tolist() == [-1, -1]
-    assert window.counts.tolist() == [0, 0] and window.ready.item() == 0
-    source.cancel_window(reservation)
-    smaller = source.reserve_future_window([0], 1).reservation
-    assert owner.prepare_stream_window(lease, len(smaller.decisions), len(smaller.transitions)) is window
-    owner.stage_stream_window(lease, [smaller], [[True] * len(smaller.transitions)])
-    window.select(torch.tensor([1, 0]), torch.tensor([False, False]), torch.tensor([True, False]))
-    window.advance()
-    window.select(torch.tensor([2, 0]), torch.tensor([False, False]), torch.tensor([True, False]))
-    assert window.counts.tolist() == [1, 0] and window.ready.item() == 0
+        owner.stage_stream_window(lease, [1], [reservation], [[]], producer_limits=[2])
+    assert all(torch.equal(a, b) for a, b in zip(
+        before, (window.bank.decisions, window.history, window.counts), strict=True,
+    ))
+    # A new owner is published while the physical view still belongs to the
+    # old one. Staging cannot reset the old view or its durable receipt.
+    owner.stage_stream_window(lease, [3], [newer], [[True] * len(newer.transitions)], producer_limits=[2])
+    assert window.counts.tolist() == [1, 0] and window.bank.history[1] == old
+    policy_rows.copy_(torch.tensor([3, 1], device=device))
+    available[0] = 2
+    run()
+    assert window.metadata[0, 2] == 2 and window.payload_positions(2)[0].tolist() == [7, 8]
+    assert window.bank.counts[[1, 3]].tolist() == [1, 1]
+    assert window.bank.history[1] == old, "inactive real owners must not receive scratch writeback"
+    policy_rows.copy_(torch.tensor([1, 0], device=device))
+    run()
+    assert window.bank.counts[[1, 3]].tolist() == [2, 1], "physical reuse must retain both receipts"
+    # Empty EOF advances semantic state without any model output descriptor.
+    owner.stage_stream_window(lease, [4], [empty], [[False] * len(empty.transitions)], producer_limits=[0])
+    policy_rows[0] = 4
+    available[0] = 0
+    done[0] = True
+    run()
+    assert window.bank.counts[4] == 1 and window.bank.terminal[4]
+    assert window.compute_ready.item() == 0 and window.bank.counts[1] == 2
+    assert owner.prepare_stream_window(lease, decisions, transitions, 2, rows=policy_rows, slots=5) is window
     with pytest.raises(ValueError):
-        owner.prepare_stream_window(lease, len(reservation.decisions) + 1, len(reservation.transitions))
+        owner.prepare_stream_window(lease, decisions + 1, transitions, 2, rows=policy_rows, slots=5)
     owner.discard_window(lease)
-    assert owner.prepare_stream_window(lease, len(reservation.decisions), len(reservation.transitions)) is not window
+    assert owner.prepare_stream_window(lease, decisions, transitions, 2, rows=policy_rows, slots=5) is not window
 
 
 @pytest.mark.parametrize("factory", [lambda: FixedChunkPolicy(2), lambda: SlidingWindowChunkPolicy(4, 2)])
@@ -910,10 +966,11 @@ def test_future_stream_policy_and_ring_payloads_run_in_one_conditional_graph(fac
     reservation = source.reserve_future_window([3, 4, 5, 6, 7], 8).reservation
     width = max(t.chunk.num_items for t in reservation.transitions)
     lease = SlotLease(0, BucketKey("consume", 1, 1))
+    policy_rows = torch.arange(1, lease.bucket.bs + 1, dtype=torch.long, device=device)
     tables = IterationTables(device)
     window = tables.prepare_stream_window(
         lease, len(reservation.decisions), len(reservation.transitions), len(reservation.positions),
-    )
+     rows=policy_rows, slots=lease.bucket.bs + 2)
     # This synthetic node's ordinary preparation computes only nonempty chunks.
     computes = [t.chunk.num_items > 0 for t in reservation.transitions]
     ctx = StepContext([RID], "produce", 0, False)
@@ -966,7 +1023,8 @@ def test_future_stream_policy_and_ring_payloads_run_in_one_conditional_graph(fac
         ))))
         runtime, launch = backend.while_runtime(), backend.while_runtime().launch
         monkeypatch.setattr(runtime, "launch", lambda *args: (launches.append(args[0]), launch(*args))[-1])
-    tables.stage_stream_window(lease, [reservation], [computes], producer_limits=[5])
+    tables.stage_stream_window(lease, [1], [reservation], [computes], producer_limits=[5])
+    window.gather()
     for value in (a_count, emitted, b_count, done, outputs):
         value.zero_()
     remaining.fill_(12)

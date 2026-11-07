@@ -1149,7 +1149,11 @@ def test_streamed_engine_composes_independent_bodies_and_owner_reads(device_name
         mgmt.device_stops["prefill"] = StopPolicy(StopKind.EOS, "token", frozenset({99}),
                                                   withhold=("x",) if name == "a" else ())
         mgmt.refills["prefill"] = None
-        state = RunState(1, "token", (99,), device)
+        resident_rows = torch.ones(1, dtype=torch.long, device=device)
+        mgmt.resident = SimpleNamespace(max_slots=3, slot_of=lambda rid: 1, covers=lambda bucket: False,
+                                        commit=lambda *args: None)
+        state = RunState(1, "token", (99,), device,
+                         dropping=SimpleNamespace(rows=resident_rows, slots=resident_rows.clone()))
         run = slot.run = DeviceRun(state, {}, lambda: None, 4)
         run.rows["x"] = torch.zeros(1, 4, 2 if name == "a" else 1, device=device)
         run.stops["token"] = torch.zeros(1, 4, dtype=torch.long, device=device)
@@ -1301,7 +1305,10 @@ def test_streamed_engine_composes_independent_bodies_and_owner_reads(device_name
         eng._runner = StepRunner({"unsupported": owner})
         eng._submodules["a"].resources = {"unsupported": owner}
     if mode in {"bank_small", "packing_refuse"}:
-        tables.prepare_stream_window(leases["b"], 1, 1, 1)
+        tables.prepare_stream_window(leases["b"], 1, 1, 1,
+                                     rows=eng._submodules["b"].accelerator_graph_runner.slot_for(
+                                         leases["b"],
+                                     ).run.state.dropping.rows, slots=3)
     output = eng.exec_group(group)
     if mode in {"unsupported", "bank_small", "tail_wide", "producer_tail", "packing_refuse",
                 "direct_missing", "direct_walk", "direct_alias", "direct_spans", "direct_absent",
@@ -1562,6 +1569,7 @@ def test_streamed_row_budgets_preserve_later_chunks_and_staggered_readiness(devi
         owner_rows = [2, 3] + [0] * (size - 2) if retired and name == "a" else [1, 2, 3, 0]
         dropping = SimpleNamespace(rows=torch.tensor(owner_rows, device=device),
                                    slots=torch.tensor(owner_rows, device=device))
+        mgmt.resident = SimpleNamespace(max_slots=5, slot_of={2: 1, 1: 2, 3: 3}.get, covers=lambda bucket: False)
         state = RunState(size, "token", {99}, device, dropping=dropping, independent_rows=True)
         run = runs[name] = slot.run = DeviceRun(state, {}, lambda: None, 4)
         out = torch.zeros(size, 1, device=device)

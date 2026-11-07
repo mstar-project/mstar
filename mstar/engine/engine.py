@@ -2615,6 +2615,7 @@ class Engine:
             return result
 
         def choose():
+            window.gather()
             if source is None:
                 emitted = torch.zeros_like(window.counts)
             else:
@@ -3056,10 +3057,20 @@ class Engine:
                     reservations = [next(edge.chunk.reservation for edge in consumer_batch.stream_windows[rid]
                                          if edge.name == signal) for rid in rows]
                     tables = self._submodules[consumer].submodule.iteration_tables
+                    consumer_state = self._submodules[consumer].accelerator_graph_runner.slot_for(
+                        leases[consumer],
+                    ).run.state
+                    planner = self._submodules[consumer].resident
+                    if planner is None or consumer_state.dropping is None:
+                        guard.refuse("streamed policy needs resident owner bindings")
+                    coverage = max(len(r.positions) for r in reservations)
+                    if coverage > len(self._submodules[maker].loopback_rows.row(signal, rows[0])):
+                        guard.refuse("streamed policy coverage exceeds its retained ring capacity")
                     try:
                         stream_window = tables.prepare_stream_window(
                             leases[consumer], max(len(r.decisions) for r in reservations),
-                            max(len(r.transitions) for r in reservations), max(len(r.positions) for r in reservations),
+                            max(len(r.transitions) for r in reservations), coverage,
+                            rows=consumer_state.dropping.rows, slots=planner.max_slots,
                         )
                     except ValueError as error:
                         guard.refuse(str(error))  # a larger policy snapshot takes the ordinary path
@@ -3067,7 +3078,7 @@ class Engine:
                         guard.refuse("a streamed consumer discarded its future payload")
                     composed = self._compose_stream(group, leases, stream_window, stream_target, guard)
                     tables.stage_stream_window(
-                        leases[consumer], reservations,
+                        leases[consumer], [planner.slot_of(rid) for rid in rows], reservations,
                         [[choice is not None for choice in stream_choices[rid]] for rid in rows],
                         producer_limits=[
                             producer_batch.ring_width if maker in leases and rid in producer_batch.request_ids else 0
