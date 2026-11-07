@@ -29,7 +29,8 @@ from mstar.model.cosmos3.cosmos3_model import (
     Cosmos3Model,
 )
 from mstar.model.cosmos3.submodules import ATTN, KV_CACHE, REASONER_DECODE_LOOP, SAMPLER
-from mstar.model.submodule_base import ARNodeInputs
+from mstar.model.keys import ROPE
+from mstar.model.multimodal import MEDIA_LAYOUT
 
 CONFIGS = Path(__file__).resolve().parents[2] / "configs"
 
@@ -93,7 +94,10 @@ def test_edge_dummy_model_parses_family_and_reasoner(tmp_path) -> None:
     assert isinstance(decode, Loop) and decode.name == REASONER_DECODE_LOOP
     body = decode.section
     assert body.name == REASONER_NODE and set(body.input_names) == {"text_inputs"}
-    assert {e.name for e in body.outputs} == {"new_token", "text_inputs"}
+    # the VLM scaffold's loop: the token loops back and goes to the client as text_inputs
+    assert {(e.next_node, e.name) for e in body.outputs} == {
+        (REASONER_NODE, "text_inputs"), (EMIT_TO_CLIENT, "text_inputs"),
+    }
 
 
 def test_text_request_idles_the_window_decoder_partition(tmp_path) -> None:
@@ -105,7 +109,7 @@ def test_text_request_idles_the_window_decoder_partition(tmp_path) -> None:
     from mstar.model.cosmos3 import constants as C
 
     model = _model(tmp_path, enable_windowed_video=True)
-    signals = {"text_inputs": [], "position_ids": []}
+    signals = {"text_inputs": [object()]}
     mk = {"max_output_tokens": 8}
     dec = model.get_initial_forward_pass_args(C.WINDOW_DECODER_PARTITION, ["text"], ["text"], signals, mk)
     assert dec.full_metadata.graph_walk == C.VIDEO_DECODE_AR_WALK and dec.inputs == []
@@ -146,9 +150,15 @@ def test_edge_resources_shared_between_dit_and_reasoner(tmp_path) -> None:
     assert specs[ATTN].nodes == {DIT_NODE, REASONER_NODE}
     assert specs[SAMPLER].nodes == {REASONER_NODE}
     assert specs[SAMPLER].vocab_size == 131072
+    # the reasoner's position counter is its own; mixed steps split the shared attention
+    assert specs[ROPE].nodes == {REASONER_NODE}
+    assert [split.combined_walk for split in specs[ATTN].config.splits] == ["mixed"]
+    assert model.get_combined_graph_walks() == {REASONER_NODE: {"mixed": {"prefill_text", "decode"}}}
     # Nano-shaped defaults declare no reasoner resources.
     nano = Cosmos3Model(model_path_hf="unused", skip_weight_loading=True)
-    assert SAMPLER not in {s.resource_key for s in nano.get_node_resources()}
+    nano_keys = {s.resource_key for s in nano.get_node_resources()}
+    assert SAMPLER not in nano_keys and ROPE not in nano_keys
+    assert nano.get_combined_graph_walks() == {}
     assert Cosmos3Model.REASONER_DECODE_WALK not in nano.get_graph_walk_graphs()
 
 
@@ -178,24 +188,30 @@ def test_edge_yaml_splits_worker_graphs(tmp_path) -> None:
 
 def test_reasoner_request_state_machine(tmp_path) -> None:
     model = _model(tmp_path)
-    sig = {k: [object()] for k in ("text_inputs", "position_ids", "pixel_values", "vision_grid_thw")}
-    fpa = model.get_initial_forward_pass_args("default", ["image", "text"], ["text"], sig, {"max_output_tokens": 32})
+    sig = {k: [object()] for k in ("text_inputs", "pixel_values", "vision_grid_thw")}
+    layout = {"offset": [3], "tokens": [4], "output": ["vision_embeds"], "grid": [[1, 4, 4]]}
+    fpa = model.get_initial_forward_pass_args(
+        "default", ["image", "text"], ["text"], sig, {"max_output_tokens": 32, MEDIA_LAYOUT: layout},
+    )
     assert fpa.full_metadata.graph_walk == Cosmos3Model.REASONER_PREFILL_VISION_WALK
     assert fpa.full_metadata.is_prefill
     routed = {(e.next_node, e.name) for e in fpa.inputs}
-    assert routed == {(REASONER_NODE, "text_inputs"), (REASONER_NODE, "position_ids"),
+    assert routed == {(REASONER_NODE, "text_inputs"),
                       (VISION_ENCODER_NODE, "pixel_values"), (VISION_ENCODER_NODE, "vision_grid_thw")}
-    # Text-only prompts skip the encoder.
-    text_only = model.get_initial_forward_pass_args(
-        "default", ["text"], ["text"], {"text_inputs": [object()], "position_ids": [object()]},
-    )
+    # the layout rides the prefill step, and not the request's kwargs every decode step copies
+    assert fpa.step_metadata[MEDIA_LAYOUT] == layout and MEDIA_LAYOUT not in fpa.full_metadata.kwargs
+    # Text-only prompts skip the encoder; media without a layout to place them by is refused.
+    text_only = model.get_initial_forward_pass_args("default", ["text"], ["text"], {"text_inputs": [object()]})
     assert text_only.full_metadata.graph_walk == Cosmos3Model.REASONER_PREFILL_WALK
+    with pytest.raises(ValueError, match="no media layout"):
+        model.get_initial_forward_pass_args("default", ["image", "text"], ["text"], sig, {})
 
     token = object()
     nxt = model.get_partition_forward_pass_args("default", fpa.full_metadata, {"new_token": [token]})
     assert nxt.full_metadata.graph_walk == Cosmos3Model.REASONER_DECODE_WALK
     assert not nxt.full_metadata.is_prefill and not nxt.request_done
     assert [(e.next_node, e.name, e.tensor_info) for e in nxt.inputs] == [(REASONER_NODE, "text_inputs", [token])]
+    assert MEDIA_LAYOUT not in nxt.step_metadata
     done = model.get_partition_forward_pass_args("default", nxt.full_metadata, {})
     assert done.request_done
 
@@ -308,83 +324,73 @@ def test_distilled_checkpoint_refuses_stream_video(tmp_path) -> None:
 
 
 def test_reasoner_submodule_step_and_stop(tmp_path) -> None:
+    """The reasoner on the VLM scaffold: a media prompt's row places its own
+    mRoPE positions from the layout and advances the counter to max + 1;
+    the stop id ends the loop (checked by the graph runtime at decode), or
+    the partition when the prefill samples it."""
     import types
 
     from mstar.model.cosmos3.submodules import Cosmos3ReasonerSubmodule
+    from mstar.model.submodule_base import END_PARTITION, StopKind
 
     model = _model(tmp_path)
-    sub = Cosmos3ReasonerSubmodule(transformer=None, config=model.config)
-    assert sub.eos_token_id == 11
+    sub = Cosmos3ReasonerSubmodule(transformer=None, config=model.config, encoders=model._reasoner_encoders())
+    sub.__dict__["_cached_device"] = torch.device("cpu")
+    sub.node_resources = {ROPE: types.SimpleNamespace(position=lambda rid, label: 0)}
+    image_pad = model.config.reasoner.image_token_id
 
-    ids = torch.tensor([5, 6, 7, 19, 19, 8])
-    pos = torch.zeros(3, 6, dtype=torch.long)
-    pos[:, :] = torch.arange(6)
-    fwd = types.SimpleNamespace(request_id="r", rid_handle="r", step_metadata={})
+    # five text tokens, then a 2x2-merged 4x4 image (four pads), then one text token
+    ids = torch.tensor([5, 6, 7, 8, 9, image_pad, image_pad, image_pad, image_pad, 10])
+    layout = {"offset": [5], "tokens": [4], "output": ["vision_embeds"], "grid": [[1, 4, 4]]}
+    fwd = types.SimpleNamespace(request_id="r", rid_handle="r", step_metadata={MEDIA_LAYOUT: layout})
     inp = sub.prepare_inputs(
         Cosmos3Model.REASONER_PREFILL_VISION_WALK, fwd,
-        {"text_inputs": [ids], "position_ids": [pos], "vision_embeds": [torch.zeros(2, 8)]},
+        {"text_inputs": [ids], "vision_embeds": [torch.zeros(4, 8)]},
     )
-    assert inp.input_seq_len == 6
+    assert inp.input_seq_len == 10
+    assert inp.custom_pos_ids.tolist() == [
+        [0, 1, 2, 3, 4, 5, 5, 5, 5, 7],
+        [0, 1, 2, 3, 4, 5, 5, 6, 6, 7],
+        [0, 1, 2, 3, 4, 5, 6, 5, 6, 7],
+    ]
+    # decoding continues at max(position) + 1 = 8
+    assert inp.resource_step_info == 8
     step = sub.declare_step(Cosmos3Model.REASONER_PREFILL_VISION_WALK, ["r"], [inp])
-    assert [(s.request_id, s.label, s.span) for s in step.segments] == [("r", "main", 6)]
+    assert [(s.request_id, s.label, s.span) for s in step.segments] == [("r", "main", 10)]
     assert step.steps[KV_CACHE].commit and step.steps[ATTN].causal
+    assert step.steps[ROPE].advance == (8,)
     assert torch.equal(step.steps[SAMPLER].prefill_tracked_tokens["r"], ids)
+    # a replay would otherwise splice the previous step's rows
+    with pytest.raises(ValueError, match="rows for the prompt's 4 pads"):
+        sub.prepare_inputs(
+            Cosmos3Model.REASONER_PREFILL_VISION_WALK, fwd,
+            {"text_inputs": [ids], "vision_embeds": [torch.zeros(3, 8)]},
+        )
 
-    fwd.dynamic_loop_iter_counts = {}
-    dec = sub.prepare_inputs(Cosmos3Model.REASONER_DECODE_WALK, fwd, {"text_inputs": [torch.tensor([42])]})
-    assert dec.input_seq_len == 1 and dec.tensor_inputs["position_ids"].tolist() == [[6], [6], [6]]
-    # a step prepared again after a refused admit feeds the same position; the next iteration the next one
-    again = sub.prepare_inputs(Cosmos3Model.REASONER_DECODE_WALK, fwd, {"text_inputs": [torch.tensor([42])]})
-    assert again.tensor_inputs["position_ids"].tolist() == [[6], [6], [6]]
-    fwd.dynamic_loop_iter_counts = {REASONER_DECODE_LOOP: 1}
-    nxt = sub.prepare_inputs(Cosmos3Model.REASONER_DECODE_WALK, fwd, {"text_inputs": [torch.tensor([43])]})
-    assert nxt.tensor_inputs["position_ids"].tolist() == [[7], [7], [7]]
-    step = sub.declare_step(Cosmos3Model.REASONER_DECODE_WALK, ["r"], [dec])
-    assert step.steps[SAMPLER].prefill_tracked_tokens == {}
+    # decode rows read their token off the sampler and their positions off the counter
+    assert sub.device_loopback.walk == Cosmos3Model.REASONER_DECODE_WALK
+    policy = sub.get_stop_policies(Cosmos3Model.REASONER_DECODE_WALK)[REASONER_DECODE_LOOP]
+    assert policy.kind == StopKind.EOS and set(policy.eos_tokens) == {11}
 
-    info = types.SimpleNamespace(
-        resource_configs={SAMPLER: types.SimpleNamespace(ignore_eos=False)},
-        dynamic_loop_iter_counts={REASONER_DECODE_LOOP: 3}, max_tokens=100,
-    )
-    assert sub.check_stop("r", info, {"new_token": [torch.tensor([11])]}) == {REASONER_DECODE_LOOP}
-    assert sub.check_stop("r", info, {"new_token": [torch.tensor([12])]}) == set()
-    info.max_tokens = 5
-    assert sub.check_stop("r", info, {"new_token": [torch.tensor([12])]}) == {REASONER_DECODE_LOOP}
-    info.resource_configs[SAMPLER].ignore_eos = True
-    info.max_tokens = 100
-    assert sub.check_stop("r", info, {"new_token": [torch.tensor([11])]}) == set()
+    def info(walk, ignore_eos=False, max_tokens=100):
+        return types.SimpleNamespace(
+            graph_walk=walk, step_metadata={}, max_tokens=max_tokens,
+            resource_configs={SAMPLER: types.SimpleNamespace(ignore_eos=ignore_eos)},
+        )
+
+    decode = Cosmos3Model.REASONER_DECODE_WALK
+    assert sub.check_stop("r", info(decode), {"new_token": [torch.tensor([11])]}) == {REASONER_DECODE_LOOP}
+    assert sub.check_stop("r", info(decode), {"new_token": [torch.tensor([12])]}) == set()
+    # the budget is the loop's cap, which the graph runtime enforces
+    assert sub.check_stop("r", info(decode, max_tokens=5), {"new_token": [torch.tensor([12])]}) == set()
+    assert sub.check_stop("r", info(decode, ignore_eos=True), {"new_token": [torch.tensor([11])]}) == set()
+    # a stop id sampled at prefill, or a one-token budget, ends the reply
+    prefill = Cosmos3Model.REASONER_PREFILL_VISION_WALK
+    assert sub.check_stop("r", info(prefill), {"new_token": [torch.tensor([11])]}) == {END_PARTITION}
+    assert sub.check_stop("r", info(prefill, max_tokens=1), {"new_token": [torch.tensor([12])]}) == {END_PARTITION}
     out = {"new_token": [torch.tensor([12])]}
-    sub.postprocess("r", info, out)
+    sub.postprocess("r", info(decode), out)
     assert out["text_inputs"] is out["new_token"]
-
-
-def test_reasoner_padded_decode_batch_shares_one_device(tmp_path) -> None:
-    """A captured decode pads the batch with the capture config's rows, which
-    live on the model's device; the real rows' position ids must land there
-    too, or the batch concatenation fails (seen on H100 with three concurrent
-    requests filling a bucket of four)."""
-    import types
-
-    from mstar.model.cosmos3.submodules import Cosmos3ReasonerSubmodule
-
-    model = _model(tmp_path)
-    sub = Cosmos3ReasonerSubmodule(transformer=None, config=model.config)
-    fwd = types.SimpleNamespace(request_id="r", rid_handle="r", step_metadata={}, dynamic_loop_iter_counts={})
-    sub.request_state("r").add_all(first_decode_pos=6)
-
-    token = torch.tensor([42])
-    dec = sub.prepare_inputs(Cosmos3Model.REASONER_DECODE_WALK, fwd, {"text_inputs": [token]})
-    assert dec.tensor_inputs["position_ids"].device == token.device
-
-    # Padding rows shaped like the capture config's single-request inputs.
-    pad = ARNodeInputs(
-        input_ids=torch.zeros(1, dtype=torch.long), input_seq_len=1,
-        tensor_inputs={"position_ids": torch.zeros((3, 1), dtype=torch.long)},
-    )
-    out = sub.preprocess(Cosmos3Model.REASONER_DECODE_WALK, None, [dec, pad, pad, pad])
-    assert out["input_ids"].tolist() == [42, 0, 0, 0]
-    assert out["position_ids"].tolist() == [[6, 0, 0, 0]] * 3 and out["seq_lens"] == [1, 1, 1, 1]
-    assert out["input_ids"].device == out["position_ids"].device == token.device
 
 
 def test_edge_chat_adapter(tmp_path) -> None:

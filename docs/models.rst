@@ -1741,7 +1741,11 @@ The decode step is captured into CUDA graphs per batch bucket and, by default,
 compiled first (``compile_reasoner_decode: true``; ``COSMOS3_REASONER_COMPILE=0``
 turns it off): the eager step is over a thousand tiny kernels, and the fused
 step runs at the weight-streaming floor (about twice the uncompiled rate at
-batch size 1 on an H100). Concurrent chat requests share decode steps
+batch size 1 on an H100). The reasoner runs on the VLM scaffold
+(``SampledTokenDecoder``): text prefills, mixed prefill + decode steps and
+image or video prefills (up to four prompts a step, each prompt one row with
+its vision tokens spliced in) are captured too, and a prompt past the largest
+bucket prefills eagerly. Concurrent chat requests share decode steps
 (continuous batching over the captured decode graphs, padded to the next batch
 bucket). Requests never see each other's data, but the batch bucket changes the
 bf16 arithmetic of the step, so a long greedy answer can part from its solo run

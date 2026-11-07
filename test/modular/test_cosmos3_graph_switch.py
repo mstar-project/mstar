@@ -72,7 +72,6 @@ def test_switch_gates_all_cosmos3_captures(monkeypatch, enabled, disable_env):
     monkeypatch.setenv("COSMOS3_GEN_CAPTURE_BS", "1")
     monkeypatch.setenv("COSMOS3_GRAPH_MAX_LATENT_AREA", "2000")
     monkeypatch.setenv("COSMOS3_PREFILL_CAPTURE_BS", "1")
-    monkeypatch.setenv("COSMOS3_REASONER_CAPTURE_BS", "1")
     dit, reasoner = _submodules(enabled)
     dit_configs = dit.get_accelerator_graph_configs(torch.device("cpu"))
     reasoner_configs = reasoner.get_accelerator_graph_configs(torch.device("cpu"))
@@ -80,9 +79,14 @@ def test_switch_gates_all_cosmos3_captures(monkeypatch, enabled, disable_env):
         assert [config.capture_graph_walk for config in dit_configs] == [
             C.IMAGE_GEN_WALK, C.VIDEO_GEN_WALK, C.PREFILL_WALK,
         ]
+        # the VLM scaffold's: decode, packed text prefill, and mixed prefill + decode
         assert [config.capture_graph_walk for config in reasoner_configs] == [
-            C.REASONER_DECODE_WALK,
+            C.REASONER_DECODE_WALK, C.REASONER_PREFILL_WALK, "mixed",
         ]
+        # decode GEMMs on cuBLAS, the rest of the compile at max-autotune
+        decode = next(c for c in reasoner_configs if c.capture_graph_walk == C.REASONER_DECODE_WALK)
+        assert decode.compile_mode == "max-autotune-no-cudagraphs"
+        assert decode.inductor_options == {"max_autotune_gemm_backends": "ATEN"}
     else:
         assert dit_configs == reasoner_configs == []
 

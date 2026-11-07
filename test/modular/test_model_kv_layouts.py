@@ -337,22 +337,16 @@ class _Cosmos3Tokenizer:
         return 2
 
 
-@pytest.mark.parametrize("max_tokens", [1, 64])
-def test_cosmos3_caps_the_reasoners_decode_where_its_stop_check_ends_it(max_tokens):
+@pytest.mark.parametrize("max_tokens", [1, 2, 64])
+def test_cosmos3_reasoner_decode_cap_leaves_the_prefills_token_in_the_budget(max_tokens):
+    """The reasoner's prefill samples the first of max_output_tokens and its
+    decode loop's cap (which alone ends it, ``TokenStop``) is one fewer; a
+    one-token budget ends at the prefill."""
     from mstar.model.cosmos3.cosmos3_model import Cosmos3Model
-    from mstar.model.cosmos3.submodules import REASONER_DECODE_LOOP, Cosmos3ReasonerSubmodule
-
-    reasoner = SimpleNamespace(eos_token_id=None)
-
-    def check_stop(request_id, request_info, outputs):
-        return Cosmos3ReasonerSubmodule.check_stop(reasoner, request_id, request_info, outputs)
+    from mstar.model.cosmos3.submodules import REASONER_DECODE_LOOP
 
     cap = Cosmos3Model.get_loop_caps(object.__new__(Cosmos3Model), max_output_tokens=max_tokens)[REASONER_DECODE_LOOP]
-
-    assert cap == _stops_after(
-        check_stop, REASONER_DECODE_LOOP, "reasoner_decode", 2048,
-        {"new_token": [torch.tensor([NOT_EOS])]}, max_tokens=max_tokens,
-    ), "the cap and the stop check end the reasoner's decode on different iterations"
+    assert cap == max(1, max_tokens - 1)
 
 
 _COSMOS3_COMMITS = {
