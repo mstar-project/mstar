@@ -1810,26 +1810,15 @@ class Conductor:
         if still_persisted:
             self._un_persist_tensors(request_id, still_persisted)
 
-        # Workers are done reading (the graph finished); the only remaining
-        # reader is the preprocess worker still delivering outputs. Defer the
-        # hard RemoveRequest until it signals READS_DONE, so a worker output
-        # isn't unlinked under an in-flight read.
-        # NOTE: "workers done reading" assumes a well-behaved graph. A model bug
-        # that emits extra/erroneous tensors could leave a worker read scheduled
-        # past completion, which this path won't wait for. Gating the happy path
-        # on per-worker READS_DONE too (like abort/fail) would handle that
-        # robustly — TODO once the barrier has proven out. A model with a client
-        # stream already does: the client can append after the model ended the
-        # request, so a chunk can be in a worker's read at any point.
+        # A graph can finish with stray reads outstanding. Drain workers too;
+        # the preprocess worker ACKs itself after delivering all output chunks.
         workers = self._request_workers(request_data)
-        expected_acks = {self.PREPROCESS_WORKER}
-        if self._client_streams:
-            self._send_drain(request_id, workers)
-            expected_acks |= workers
+        self._send_drain(request_id, workers)
+        participants = workers | {self.PREPROCESS_WORKER}
         self._register_draining(
             request_id,
-            expected_acks=expected_acks,
-            participants=workers | {self.PREPROCESS_WORKER},
+            expected_acks=participants,
+            participants=participants,
         )
 
     def _process_worker_graphs_done(

@@ -87,7 +87,10 @@ def _done(c, rid, node):
 
 
 def _reads_done(rid):
-    return _msg(ConductorMessageType.READS_DONE, ReadsDone(request_id=rid, entity_id=PREPROCESS))
+    return [
+        _msg(ConductorMessageType.READS_DONE, ReadsDone(request_id=rid, entity_id=entity))
+        for entity in ("worker_0", "worker_1", PREPROCESS)
+    ]
 
 
 def _to_api_server(c, message_type):
@@ -116,7 +119,7 @@ def test_each_status_reports_the_request_states_and_the_components_still_running
         [_msg(ConductorMessageType.ABORT_REQUEST, AbortRequest("r3"))],
         [_done(c, "r1", "enc")],
         [_done(c, "r1", "llm")],  # r1 completes and drains; r2 still waits for its slot
-        [_reads_done("r1")],  # r1 freed, r2 admitted
+        _reads_done("r1"),  # r1 freed, r2 admitted
     ])
 
     views = [_view(s) for s in _to_api_server(c, "conductor_status")]
@@ -135,7 +138,7 @@ def test_admission_wait_is_zero_on_arrival_and_the_time_queued_otherwise(tmp_pat
     _run(c, [
         [_request("r1"), _request("r2")],
         [_done(c, "r1", "enc"), _done(c, "r1", "llm")],
-        [_reads_done("r1")],
+        _reads_done("r1"),
         [_done(c, "r2", "enc"), _done(c, "r2", "llm")],
     ])
 
@@ -152,7 +155,7 @@ def test_with_metrics_off_nothing_is_sent_or_stamped(tmp_path, monkeypatch):
     _run(c, [
         [_request("r1"), _request("r2")],
         [_done(c, "r1", "enc"), _done(c, "r1", "llm")],
-        [_reads_done("r1")],
+        _reads_done("r1"),
         [_done(c, "r2", "enc"), _done(c, "r2", "llm")],
     ])
 
