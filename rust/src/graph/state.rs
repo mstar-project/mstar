@@ -235,7 +235,7 @@ impl RequestState {
     /// input has arrived, so a streaming chunk can be taken now.
     pub fn is_ready_for_streaming(&self, id: NodeId) -> bool {
         let (w, b) = Self::bit(id);
-        self.ready_streaming[w] >> b & 1 == 1
+        self.ready_streaming[w] >> b & 1 == 1 && self.nodes[id as usize].unit_claim.is_none()
     }
 
     pub fn is_ready(&self, id: NodeId) -> bool {
@@ -479,9 +479,10 @@ impl RequestState {
 
     /// A unit may supply missing internal inputs, never overwrite an input
     /// already queued for this node. All external inputs must already exist.
-    pub fn can_claim_member(&self, node: NodeId, internal: u64) -> bool {
-        if self.is_done {
-            return false;
+    pub fn can_claim_member(&self, node: NodeId, internal: u64, partition_done: bool) -> bool {
+        if self.is_done || partition_done {
+            let st = &self.nodes[node as usize];
+            return partition_done && !st.in_flight && st.unit_claim.is_none();
         }
         let mut enclosing = self.graph.node(node).loop_id;
         while let Some(id) = enclosing {
@@ -492,8 +493,12 @@ impl RequestState {
         }
         let st = &self.nodes[node as usize];
         !st.completed && !st.in_flight && st.unit_claim.is_none()
-            && (st.cur.mask & internal) == 0
+            && (st.cur.mask & internal & !self.graph.node(node).streaming_mask) == 0
             && (st.cur.mask | internal) == self.graph.node(node).full_mask
+    }
+
+    pub fn member_inputs_ready(&self, node: NodeId) -> bool {
+        !self.is_done && self.nodes[node as usize].cur.mask == self.graph.node(node).full_mask
     }
 
     pub fn claim_member(&mut self, node: NodeId, claim: u64) {
@@ -507,11 +512,11 @@ impl RequestState {
         self.nodes[node as usize].unit_claim
     }
 
-    pub fn release_member(&mut self, node: NodeId, refresh: bool) {
+    pub fn release_member(&mut self, node: NodeId) {
         let st = &mut self.nodes[node as usize];
         st.in_flight = false;
         st.unit_claim = None;
-        if refresh {
+        if !self.is_done {
             // Claims preserve their inputs. Unlike push_back after ordinary
             // consumed-input cleanup, a refused or unexecuted member must
             // recompute readiness: an internal-stream consumer may still wait.
@@ -931,7 +936,12 @@ impl RequestState {
     /// Python's `WorkerGraphIO.clear()` — end of a full forward pass.
     pub fn reset(&mut self) {
         for n in self.nodes.iter_mut() {
+            // A connected member's graph can finish before another graph's
+            // receipt lands. Reset graph progress, never the unit's ownership.
+            let claim = n.unit_claim;
             n.clear();
+            n.unit_claim = claim;
+            n.in_flight = claim.is_some();
         }
         for l in self.loops.iter_mut() {
             *l = LoopState { max_iters: l.max_iters, ..LoopState::default() };

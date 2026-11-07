@@ -65,6 +65,8 @@ from mstar.utils.profiler import PHASE_PERIOD, phase_record
 if TYPE_CHECKING:
     import torch
 
+    from mstar.streaming.topology import Connection
+
 # SendInput.profiling's (rx_info, tx_info, graph_timings), by declared type.
 _PROFILING_HINTS = get_args(Profiling)
 
@@ -254,6 +256,7 @@ class RustGraphRuntime(GraphRuntime):
         communicator=None,
         combined_walk_of: dict[tuple[str, str], str] | None = None,
         walk_driven_signals: frozenset[str] = frozenset(),
+        connections: tuple[Connection, ...] = (),
     ):
         mine = {wg.worker_graph_id for wg in my_worker_graphs}
         combined_walk_of = combined_walk_of or {}
@@ -283,6 +286,22 @@ class RustGraphRuntime(GraphRuntime):
             # be sent from there rather than handed back one at a time. None
             # for a communicator built without a socket (the tests' stand-ins).
             communicator=getattr(communicator, "_inner", None),
+            # Resolve the declared connection against the actual routed edge,
+            # once at installation. Dynamic consumer-walk callbacks cannot be
+            # predicted by this bounded cell; they retain ordinary scheduling.
+            stream_connections=[
+                (source.name, source_walk, target.name, target_walk, conn.edge_name)
+                for conn in connections if conn.consumer_walk is None
+                for source_wg in my_worker_graphs
+                for source in source_wg.section.get_nodes().values()
+                if node_to_partition.get(source.name) == conn.from_partition
+                for edge in source.outputs if edge.is_streaming and edge.name == conn.edge_name
+                for target_wg in my_worker_graphs
+                for target in target_wg.section.get_nodes().values()
+                if target.name == edge.next_node and node_to_partition.get(target.name) == conn.to_partition
+                for source_walk in sorted(source_wg.graph_walks)
+                for target_walk in sorted(target_wg.graph_walks)
+            ],
             combined_walks=(
                 [node for node, _ in combined_walk_of],
                 [walk for _, walk in combined_walk_of],
@@ -422,14 +441,15 @@ class RustGraphRuntime(GraphRuntime):
 
     def execution_units(self, graph_walk: str) -> tuple[ExecutionUnit, ...]:
         return tuple(
-            ExecutionUnit(wg, tuple(nodes), tuple(edges), tuple(tuple(s) for s in signals), loop, tuple(back))
-            for wg, nodes, edges, signals, loop, back in self._rust.execution_units(graph_walk)
+            ExecutionUnit(tuple(wgs), tuple(walks), tuple(nodes), tuple(edges),
+                          tuple(tuple(s) for s in signals), loop, tuple(back), tuple(streaming))
+            for wgs, walks, nodes, edges, signals, loop, back, streaming in self._rust.execution_units(graph_walk)
         )
 
     def claim_execution_unit(
-        self, head: str, graph_walk: str, rids: list[int],
+        self, head: str, graph_walk: str, rids: list[int], member_walks: tuple[str, ...] | None = None,
     ) -> tuple[int, tuple[PopRidsOutput, ...]] | None:
-        out = self._rust.claim_execution_unit(head, graph_walk, rids)
+        out = self._rust.claim_execution_unit(head, graph_walk, rids, member_walks)
         if out is None:
             return None
         claim_id, members = out

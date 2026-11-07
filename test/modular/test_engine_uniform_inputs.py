@@ -134,7 +134,8 @@ def _connected_engine(transform=None, *, head_state=False, mixed=False, device="
         return lease
 
     eng.reserve_replay_slot = reserve
-    group = ExecutionGroup(ExecutionUnit(1, ("a", "b"), (("a", "b", "x"),), ((), ("x",))), 1, tuple(members))
+    unit = ExecutionUnit((1, 1), ("prefill", "prefill"), ("a", "b"), (("a", "b", "x"),), ((), ("x",)))
+    group = ExecutionGroup(unit, 1, tuple(members))
     return eng, group, events
 
 

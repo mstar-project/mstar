@@ -392,7 +392,8 @@ class ExecutionUnit:
     Member inputs/outputs retain ordinary node names. Only exclusively
     internal payloads stay in the members' leased capture buffers.
     """
-    worker_graph_id: int
+    worker_graph_ids: tuple[int, ...]
+    graph_walks: tuple[str, ...]
     nodes: tuple[str, ...]
     # (producer node, consumer node, signal)
     edges: tuple[tuple[str, str, str], ...]
@@ -400,6 +401,7 @@ class ExecutionUnit:
     # Present only for one complete, dependency-closed flat Loop body.
     loop_name: str | None = None
     loop_back: tuple[tuple[str, str, str], ...] = ()
+    streaming_edges: tuple[tuple[str, str, str], ...] = ()
 
 
 class RequestWalks(NamedTuple):
@@ -1177,7 +1179,7 @@ class GraphRuntime(PhasedPostprocess, ABC):
 
     @abstractmethod
     def claim_execution_unit(
-        self, head: str, graph_walk: str, rids: list[int],
+        self, head: str, graph_walk: str, rids: list[int], member_walks: tuple[str, ...] | None = None,
     ) -> tuple[int, tuple[PopRidsOutput, ...]] | None:
         """Claim one common row set before execution, all or none.
 

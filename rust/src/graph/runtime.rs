@@ -179,6 +179,7 @@ pub struct GraphRuntime {
     spec_counter: u32,
     /// Claims own ordinary member steps until admission rolls back or the
     /// last member lands. Per-node flags live in RequestState, not Python.
+    units: FxHashMap<(Sym, Sym), Vec<Arc<ExecutionUnit<(WgIndex, NodeId, Sym), (WgIndex, LoopId)>>>>,
     unit_claims: FxHashMap<u64, UnitClaim>,
     unit_counter: u64,
     /// (node, real walk) -> the combined walk the scheduler batches it under;
@@ -205,9 +206,8 @@ pub struct GraphRuntime {
 }
 
 struct UnitClaim {
-    /// Immutable (graph, node, repeated Loop) identities. Node/Loop ids are
-    /// graph-local, so every landing, cancellation and carry uses this owner.
-    members: Vec<(WgIndex, NodeId, Option<LoopId>)>,
+    /// Retain the immutable qualified plan, including its edge/Loop identities.
+    unit: Arc<ExecutionUnit<(WgIndex, NodeId, Sym), (WgIndex, LoopId)>>,
     submitted: bool,
     /// Each row's next member to land; cancellation removes the row here.
     next: FxHashMap<u32, usize>,
@@ -1075,7 +1075,7 @@ struct UnitClaim {
     fn validate_unit_landing(&self, wg: WgIndex, node: NodeId, rid: u32) -> PyResult<()> {
         let Some(id) = self.state(wg, rid).and_then(|s| s.unit_claim(node)) else { return Ok(()) };
         let claim = &self.unit_claims[&id];
-        let (member_wg, member_node, _) = claim.members[claim.next[&rid]];
+        let (member_wg, member_node, _) = claim.unit.nodes[claim.next[&rid]];
         if !claim.submitted || (member_wg, member_node) != (wg, node) {
             return Err(PyValueError::new_err("execution unit members must land once, in graph order, after submission"));
         }
@@ -1089,8 +1089,8 @@ struct UnitClaim {
         let claim = self.unit_claims.get_mut(&id).unwrap();
         let next = claim.next.get_mut(&rid).unwrap();
         *next += 1;
-        let last = *next == claim.members.len();
-        let members = last.then(|| claim.members.clone());
+        let last = *next == claim.unit.nodes.len();
+        let members = last.then(|| claim.unit.nodes.clone());
         if last {
             claim.next.remove(&rid);
         }
@@ -1100,13 +1100,13 @@ struct UnitClaim {
         if let Some(members) = members {
             for (owner, member, _) in members {
                 if let Some(state) = self.state_mut(owner, rid) {
-                    state.release_member(member, false);
+                    state.release_member(member);
                 }
             }
         } else if let Some(state) = self.state_mut(wg, rid) {
             // Keep the claim until every member lands, including members in
             // another graph whose own Loop already advanced independently.
-            state.set_in_flight(node, false);
+            state.claim_member(node, id);
         }
     }
 
@@ -1589,7 +1589,7 @@ impl GraphRuntime {
     #[new]
     #[pyo3(signature = (
         worker_graphs, remote_worker_graphs, sharding, bookkeeping, me,
-        communicator = None, combined_walks = None,
+        communicator = None, combined_walks = None, stream_connections = None,
     ))]
     fn new(
         worker_graphs: Vec<WorkerGraphArg>,
@@ -1603,6 +1603,8 @@ impl GraphRuntime {
         // (nodes, walks, combined) as columns: `walks[i]` of `nodes[i]` is
         // batched under `combined[i]`
         combined_walks: Option<(Vec<String>, Vec<String>, Vec<String>)>,
+        // Resolved topology endpoints (producer, walk, consumer, walk, signal).
+        stream_connections: Option<Vec<(String, String, String, String, String)>>,
     ) -> PyResult<Self> {
         let mut it = StrToId::default();
         let (nodes, walks, combined) = combined_walks.unwrap_or_default();
@@ -1704,6 +1706,79 @@ impl GraphRuntime {
             });
         }
 
+        // Lift every ordinary unit into the same graph-qualified description
+        // that a cross-partition connection uses. There is only one claim path.
+        let mut units: FxHashMap<_, Vec<_>> = FxHashMap::default();
+        for (wg, graph) in graphs.iter().enumerate() {
+            for walk in &worker_graphs[wg].graph_walks {
+                let walk = it.intern(walk);
+                let member = |node| (wg as WgIndex, node, walk);
+                for (head, unit) in ExecutionUnit::compile(&graph.nodes, &graph.loops) {
+                    units.entry((graph.node(head).name, walk)).or_default().push(Arc::new(ExecutionUnit {
+                        nodes: unit.nodes.into_iter().map(member).collect(),
+                        internal_inputs: unit.internal_inputs,
+                        edges: unit.edges.into_iter().map(|(a, b, signal)| (member(a), member(b), signal)).collect(),
+                        output_signals: unit.output_signals,
+                        repeat_loop: unit.repeat_loop.map(|lid| (wg as WgIndex, lid)),
+                        loop_back: unit.loop_back.into_iter().map(|(a, b, signal)| (member(a), member(b), signal)).collect(),
+                        streaming_edges: vec![],
+                    }));
+                }
+            }
+        }
+        for (source, source_walk, dest, dest_walk, signal) in stream_connections.unwrap_or_default() {
+            let (Some(a), Some(aw), Some(b), Some(bw), Some(signal)) =
+                (it.get(&source), it.get(&source_walk), it.get(&dest), it.get(&dest_walk), it.get(&signal))
+                else { return Err(PyValueError::new_err("stream connection names an unknown local endpoint")) };
+            let (Some(&ag), Some(&bg)) = (node_owner.get(&(aw, a)), node_owner.get(&(bw, b)))
+                else { return Err(PyValueError::new_err("stream connection endpoint has no local graph")) };
+            if ag == bg { continue; }
+            let (ga, gb) = (&graphs[ag as usize], &graphs[bg as usize]);
+            let (an, bn) = (ga.by_name[&a], gb.by_name[&b]);
+            let (na, nb) = (ga.node(an), gb.node(bn));
+            if !na.outputs.iter().any(|e| e.name == signal && e.dest_sym == b && e.streaming)
+                || nb.slot_of(signal).is_none_or(|slot| nb.streaming_mask & (1 << slot) == 0) {
+                return Err(PyValueError::new_err("stream connection disagrees with compiled graph edges"));
+            }
+            // First cell: complete one-node Loops, independently counted.
+            // Other local sections keep ordinary scheduling until their exact
+            // boundary/terminal transition can be represented by the capture.
+            if [ga, gb].iter().any(|g| g.nodes.len() != 1 || g.loops.len() != 1
+                || !g.loops[0].complete || !g.loops[0].child_loops.is_empty()) { continue; }
+            let members = [(ag, an, aw), (bg, bn, bw)];
+            let edge = (members[0], members[1], signal);
+            let candidates = units.entry((a, aw)).or_default();
+            if let Some(unit) = candidates.iter_mut().find(|unit| unit.nodes == members) {
+                let unit = Arc::get_mut(unit).unwrap(); // installation, no claims exist yet
+                if !unit.streaming_edges.contains(&edge) {
+                    unit.edges.push(edge);
+                    unit.streaming_edges.push(edge);
+                    unit.internal_inputs[1] |= 1 << nb.slot_of(signal).unwrap();
+                }
+                continue;
+            }
+            let mut loop_back = Vec::new();
+            let outputs = [ga, gb].iter().zip(members).map(|(g, member)| {
+                let mut outputs = Vec::new();
+                for e in &g.node(member.1).outputs {
+                    outputs.push(e.name);
+                    if g.loops[0].loop_back.contains(&(e.name, e.dest_sym)) {
+                        if let Dest::Local(target) = e.dest {
+                            loop_back.push((member, (member.0, target, member.2), e.name));
+                        }
+                    }
+                }
+                outputs.sort_unstable();
+                outputs.dedup();
+                outputs
+            }).collect();
+            candidates.push(Arc::new(ExecutionUnit {
+                nodes: members.to_vec(), internal_inputs: vec![0, 1 << nb.slot_of(signal).unwrap()],
+                edges: vec![edge], output_signals: outputs, repeat_loop: None,
+                loop_back, streaming_edges: vec![edge],
+            }));
+        }
+
         Ok(Self{
             interner: it,
             graphs,
@@ -1722,6 +1797,7 @@ impl GraphRuntime {
             completion_counter: 0,
             staged_specs: FxHashMap::default(),
             spec_counter: 0,
+            units,
             unit_claims: FxHashMap::default(),
             unit_counter: 0,
             combined_walk_of,
@@ -2567,67 +2643,70 @@ impl GraphRuntime {
         Ok(Some(out))
     }
 
-    /// Immutable local units for a walk. Placement and capture eligibility
-    /// are worker/engine concerns; these descriptions never mutate readiness.
-    fn execution_units(&self, graph_walk: &str) -> Vec<(u32, Vec<String>, Vec<(String, String, String)>, Vec<Vec<String>>, Option<String>, Vec<(String, String, String)>)> {
+    /// Immutable local units for a walk. Qualified member identities are
+    /// shared with claims; independent partitions never acquire a common Loop.
+    fn execution_units(&self, graph_walk: &str) -> Vec<(Vec<u32>, Vec<String>, Vec<String>, Vec<(String, String, String)>, Vec<Vec<String>>, Option<String>, Vec<(String, String, String)>, Vec<(String, String, String)>)> {
         let Some(walk) = self.interner.get(graph_walk) else { return vec![] };
-        let mut out = Vec::new();
-        for &wg in self.walk_to_local_wgs.get(&walk).into_iter().flatten() {
-            let g = self.g(wg);
-            let mut heads: Vec<_> = g.units.keys().copied().collect();
-            heads.sort_unstable();
-            for head in heads {
-                let unit = &g.units[&head];
-                let name = |node| self.interner.name(g.node(node).name).to_owned();
-                let outputs = unit.output_signals.iter().map(|signals| {
-                    let mut names: Vec<_> = signals.iter().map(|&s| self.interner.name(s).to_owned()).collect();
-                    names.sort();
-                    names
-                }).collect();
-                out.push((
-                    self.wg_ids[wg as usize], unit.nodes.iter().map(|&n| name(n)).collect(),
-                    unit.edges.iter().map(|&(a, b, s)| (name(a), name(b), self.interner.name(s).to_owned())).collect(),
-                    outputs,
-                    unit.repeat_loop.map(|id| self.interner.name(g.lp(id).name).to_owned()),
-                    unit.loop_back.iter().map(|&(a, b, s)| (name(a), name(b), self.interner.name(s).to_owned())).collect(),
-                ));
-            }
-        }
-        out
+        let name = |(wg, node, _)| self.interner.name(self.g(wg).node(node).name).to_owned();
+        let edges = |es: &Vec<((WgIndex, NodeId, Sym), (WgIndex, NodeId, Sym), Sym)>| es.iter()
+            .map(|&(a, b, s)| (name(a), name(b), self.interner.name(s).to_owned())).collect();
+        let mut heads: Vec<_> = self.units.keys().filter(|(_, w)| *w == walk).copied().collect();
+        heads.sort_unstable();
+        heads.iter().flat_map(|key| self.units[key].iter()).map(|unit| (
+            unit.nodes.iter().map(|m| self.wg_ids[m.0 as usize]).collect(),
+            unit.nodes.iter().map(|m| self.interner.name(m.2).to_owned()).collect(),
+            unit.nodes.iter().map(|&m| name(m)).collect(), edges(&unit.edges),
+            unit.output_signals.iter().map(|signals| {
+                let mut names: Vec<_> = signals.iter().map(|&s| self.interner.name(s).to_owned()).collect();
+                names.sort(); names
+            }).collect(),
+            unit.repeat_loop.map(|(wg, id)| self.interner.name(self.g(wg).lp(id).name).to_owned()),
+            edges(&unit.loop_back), edges(&unit.streaming_edges),
+        )).collect()
     }
 
-    /// Claim one common scheduler-selected row set, all or none, before
-    /// resource admission or a device launch. No internal tensors are staged.
+    /// Claim one common scheduler-selected row set, all or none. A stream
+    /// consumer may wait for internal items, but every other input must exist.
+    #[pyo3(signature = (head, graph_walk, rids, member_walks = None))]
     fn claim_execution_unit(
-        &mut self, head: &str, graph_walk: &str, rids: Vec<u32>,
+        &mut self, head: &str, graph_walk: &str, rids: Vec<u32>, member_walks: Option<Vec<String>>,
     ) -> PyResult<Option<(u64, Vec<PopRidsOut>)>> {
-        if rids.is_empty() {
-            return Ok(None);
-        }
+        if rids.is_empty() { return Ok(None); }
         let distinct: FxHashSet<_> = rids.iter().copied().collect();
         if distinct.len() != rids.len() {
             return Err(PyValueError::new_err("claim_execution_unit: duplicate request"));
         }
-        let Some(wg) = self.owner_of(head, graph_walk) else { return Ok(None) };
-        let Some(head) = self.nid(wg, head) else { return Ok(None) };
-        let g = self.g(wg).clone();
-        let Some(unit) = g.units.get(&head) else { return Ok(None) };
+        let (Some(head), Some(walk)) = (self.interner.get(head), self.interner.get(graph_walk))
+            else { return Ok(None) };
+        let Some(candidates) = self.units.get(&(head, walk)) else { return Ok(None) };
+        let Some(unit) = candidates.iter().find(|unit| match &member_walks {
+            Some(walks) => walks.len() == unit.nodes.len() && walks.iter().zip(&unit.nodes)
+                .all(|(walk, member)| self.interner.name(member.2) == walk),
+            None => unit.streaming_edges.is_empty(),
+        }).cloned() else { return Ok(None) };
         if !rids.iter().all(|&rid| {
-            self.state(wg, rid).is_some_and(|state| unit.nodes.iter().zip(&unit.internal_inputs)
-                .all(|(&node, &internal)| state.can_claim_member(node, internal)))
-                && unit.nodes.iter().all(|&n| self.runs_for_request(rid, g.node(n).name))
-        }) {
-            return Ok(None);
-        }
+            unit.nodes.iter().zip(&unit.internal_inputs).all(|(&(wg, node, walk), &internal)| {
+                let Some(info) = self.info(rid) else { return false };
+                let Some(part) = info.partitions.values().find(|part|
+                    part.graph_walk == walk && part.walk_worker_graphs.contains(&wg)) else { return false };
+                (!part.partition_done || !unit.streaming_edges.is_empty())
+                    && self.state(wg, rid).is_some_and(|state| state.can_claim_member(node, internal, part.partition_done))
+                    && info.node_to_workers.get(&(self.g(wg).node(node).name, walk))
+                        .is_some_and(|workers| workers.contains(&self.shard.me))
+            }) && (unit.streaming_edges.is_empty() || unit.nodes.iter().any(|&(wg, node, walk)|
+                self.info(rid).is_some_and(|info| info.partitions.values().any(|part|
+                    !part.partition_done && part.graph_walk == walk && part.walk_worker_graphs.contains(&wg)))
+                && self.state(wg, rid).is_some_and(|state| state.member_inputs_ready(node))))
+        }) { return Ok(None); }
         self.unit_counter += 1;
         let id = self.unit_counter;
         for &rid in &rids {
-            for &node in &unit.nodes {
+            for &(wg, node, _) in &unit.nodes {
                 self.state_mut(wg, rid).unwrap().claim_member(node, id);
             }
         }
         let mut members = Vec::new();
-        for (i, &node) in unit.nodes.iter().enumerate() {
+        for (i, &(wg, node, _)) in unit.nodes.iter().enumerate() {
             let mut cols = EdgeColumns::default();
             for &rid in &rids {
                 for (name, tensors, final_chunk) in self.state(wg, rid).unwrap().input_tensors(node, false) {
@@ -2644,8 +2723,7 @@ impl GraphRuntime {
             members.push(member);
         }
         self.unit_claims.insert(id, UnitClaim {
-            members: unit.nodes.iter().map(|&node| (wg, node, unit.repeat_loop)).collect(),
-            submitted: false, next: rids.into_iter().map(|r| (r, 0)).collect(),
+            unit, submitted: false, next: rids.into_iter().map(|r| (r, 0)).collect(),
         });
         Ok(Some((id, members)))
     }
@@ -2668,9 +2746,9 @@ impl GraphRuntime {
         }
         let claim = self.unit_claims.remove(&claim_id).unwrap();
         for rid in claim.next.keys() {
-            for &(wg, node, _) in &claim.members {
+            for &(wg, node, _) in &claim.unit.nodes {
                 if let Some(state) = self.state_mut(wg, *rid) {
-                    state.release_member(node, true);
+                    state.release_member(node);
                 }
             }
         }
@@ -2683,14 +2761,14 @@ impl GraphRuntime {
         &mut self, claim_id: u64, node_name: &str, wg_id: u32, rids: Vec<u32>,
     ) -> PyResult<bool> {
         let Some(claim) = self.unit_claims.get(&claim_id) else { return Ok(false) };
-        let Some((wg, node)) = claim.members.iter().find_map(|&(wg, node, _)| {
+        let Some((wg, node)) = claim.unit.nodes.iter().find_map(|&(wg, node, _)| {
             (self.wg_ids[wg as usize] == wg_id && self.interner.name(self.g(wg).node(node).name) == node_name)
                 .then_some((wg, node))
         }) else { return Err(PyValueError::new_err("node is not a member of the execution unit")) };
         let distinct: FxHashSet<_> = rids.iter().copied().collect();
         if distinct.len() != rids.len() || rids.iter().any(|rid| {
             !claim.submitted || claim.next.get(rid).is_none_or(|&next| {
-                let member = claim.members[next];
+                let member = claim.unit.nodes[next];
                 (member.0, member.1) != (wg, node)
             })
         }) {
@@ -2698,9 +2776,6 @@ impl GraphRuntime {
         }
         for rid in rids {
             self.land_unit_member(wg, node, rid, Some(claim_id));
-            if let Some(state) = self.state_mut(wg, rid) {
-                state.release_member(node, true);
-            }
         }
         Ok(true)
     }
@@ -3034,8 +3109,7 @@ impl GraphRuntime {
             let claim_id = state.unit_claim(node);
             let stride = input.loop_strides.as_ref().map_or(1, |s| s[i]);
             let completed = state.complete_strided(&g, node, &out_tensors, stride);
-            let repeat_loop = claim_id.and_then(|id| self.unit_claims.get(&id))
-                .and_then(|claim| claim.members[claim.next[&rid]].2);
+            let unit = claim_id.and_then(|id| self.unit_claims.get(&id)).map(|claim| claim.unit.clone());
             self.land_unit_member(wg, node, rid, claim_id);
             let mut pre_shard_edges = completed.edges;
             // A step that repeated routes a column an iteration, for the
@@ -3043,7 +3117,8 @@ impl GraphRuntime {
             if stride > 1 {
                 for e in pre_shard_edges.iter_mut() {
                     let carried = matches!(e.dest, Dest::Local(d) if d == node)
-                        || repeat_loop.is_some_and(|id| g.loops[id as usize].loop_back.contains(&(e.name, e.dest_sym)));
+                        || unit.as_ref().is_some_and(|unit| unit.loop_back.iter().any(|&(a, b, signal)|
+                            a.0 == wg && a.1 == node && signal == e.name && self.g(b.0).node(b.1).name == e.dest_sym));
                     if carried && !e.streaming && e.tensors.len() > 1 {
                         e.tensors.drain(..e.tensors.len() - 1);
                     }

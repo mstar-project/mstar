@@ -249,6 +249,13 @@ prior members' growth before commit. Shared KV forks, retention and prefix-cache
 conversion remain boundaries, as do resident/conditional captures, captured row
 heads, streaming edges and torch-generator draws.
 
+The graph runtime also describes local streaming connections as qualified
+members: each retains its worker graph, active walk and own Loop progress. A
+claim can reserve a waiting consumer, and an unexecuted member releases its
+claim without a graph completion. These streaming units remain on ordinary
+execution until their policy reservations and conditional capture lowering are
+available; the runtime description alone does not enable streamed fusion.
+
 Preparation may structurally pack future inputs with real values; arithmetic
 on future values, mutable model request state, host reads of future positions,
 and uncaptured producer output transformations use ordinary execution. The

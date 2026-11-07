@@ -1423,7 +1423,9 @@ def test_connected_members_share_the_existing_builder_capture_key_and_tightest_c
     a, b = _Engine(max_bs=8), _Engine(max_bs=2, groups=groups)
     scheduler = _scheduler(a)
     scheduler.engine_manager.get_engine = lambda name: a if name == NODE else b
-    scheduler.execution_units[NODE, WALK] = ExecutionUnit(0, (NODE, "b"), ((NODE, "b", "x"),), ((), ()))
+    scheduler.execution_units[NODE, WALK] = ExecutionUnit(
+        (0, 0), (WALK, WALK), (NODE, "b"), ((NODE, "b", "x"),), ((), ()),
+    )
     manager = _Manager(["r0", "r1", "r2"])
     batch = _next_batch(scheduler, manager)
     assert list(batch.request_to_worker_graph) == expected

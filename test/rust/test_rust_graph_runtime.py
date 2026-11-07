@@ -760,6 +760,137 @@ def test_an_unexecuted_member_releases_its_claim_without_completing_its_graph(pr
     assert set(inputs.signal_names) == ({"x", "y"} if producer_runs else {"in"})
 
 
+def _stream_unit_runtime(*, install_consumer=True, consumer_worker=WORKER, driven=False):
+    from mstar.streaming.chunk_policy import FixedChunkPolicy
+    from mstar.streaming.topology import Connection
+
+    a = GraphNode(name="a", input_names={"seed"}, outputs=[
+        GraphEdge(name="seed", next_node="a"), GraphEdge(name="x", next_node="b", is_streaming=True),
+    ])
+    b = GraphNode(name="b", input_names={"x", "y"}, outputs=[])
+    b._register_streaming({"x"})
+    # Equal graph-local NodeId and LoopId/name intentionally: each member
+    # must still settle its own independent Loop, on its own installed walk.
+    graphs = [WorkerGraph(
+        section=Sequential(sections=[Loop(name="steps", section=node, max_iters=cap, outputs=[])]),
+        graph_walks={walk}, ranks=[0], worker_graph_id=wg,
+    ) for node, cap, walk, wg in ((a, 3, "produce", 7), (b, 5, "consume", 9))]
+    runtime = rust_runtime.RustGraphRuntime(
+        my_worker_id=WORKER, my_worker_graphs=graphs,
+        all_wg_ids_to_graph_walks={7: {"produce"}, 9: {"consume"}},
+        all_wg_ids_to_dyn_loops={7: {"steps"}, 9: {"steps"}},
+        all_wg_ids_to_nodes={7: {"a"}, 9: {"b"}}, node_to_partition={"a": "source", "b": "sink"},
+        sharding_config=ShardingConfig(groups=[], tp_enabled_nodes=set(), shard_dim={}),
+        bookkeeping=RustTensorBookkeeping(),
+        connections=(Connection("source", "sink", "x", lambda: FixedChunkPolicy(2),
+                                consumer_walk=(lambda ctx: "consume") if driven else None),),
+    )
+    assignment = ParallelList([7, 9], [[WORKER], [consumer_worker]])
+    rid = runtime.add_request("r", "source", "produce", [7], assignment, {})
+    if install_consumer:
+        assert runtime.add_request("r", "sink", "consume", [9], assignment, {}) == rid
+    return runtime, rid
+
+
+@pytest.mark.parametrize("install,worker,driven", [
+    (False, WORKER, False), (True, "other_worker", False), (True, WORKER, True),
+])
+def test_stream_unit_requires_installed_local_members_and_a_stable_declared_connection(install, worker, driven):
+    rt, rid = _stream_unit_runtime(install_consumer=install, consumer_worker=worker, driven=driven)
+    rt.ingest_inputs_batch(_ingest_block([rid], [_spec("seed", "a")]))
+    assert rt.claim_execution_unit("a", "produce", [rid], ("produce", "consume")) is None
+    assert [(ready.node_name, ready.rids) for ready in rt.get_ready_nodes(set())] == [("a", [rid])]
+    if driven:
+        assert rt.execution_units("produce") == ()
+
+
+def test_stream_unit_claim_is_atomic_and_cancellation_preserves_a_waiting_consumer():
+    rt, rid = _stream_unit_runtime()
+    unit, = rt.execution_units("produce")
+    assert unit.worker_graph_ids == (7, 9) and unit.graph_walks == ("produce", "consume")
+    assert unit.streaming_edges == (("a", "b", "x"),) and unit.loop_name is None
+    rt.ingest_inputs_batch(_ingest_block([rid], [_spec("seed", "a")]))
+    # A consumer's non-stream input is not something the unit can invent.
+    assert rt.claim_execution_unit("a", "produce", [rid], unit.graph_walks) is None
+    rt.ingest_inputs_batch(_ingest_block([rid], [_spec("y", "b")]))
+    rt.pop_rids("a", "produce", [rid], check_ready=True)
+    claim, members = rt.claim_execution_unit("a", "produce", [rid], unit.graph_walks)
+    assert [member.wg_ids.values for member in members] == [[7], [9]]
+    assert members[1].input_edges.signal_names == ["y"]
+    assert rt.get_ready_nodes(set()) == []
+    # Ordinary streaming ingress must not fill a member reserved by the unit.
+    assert rt.ingest_inputs_batch(_ingest_block([rid], [_spec("x", "b")]), is_streaming=True) == [0]
+    assert rt.cancel_execution_unit(claim)
+    assert [(ready.node_name, ready.rids) for ready in rt.get_ready_nodes(set())] == [("a", [rid])]
+    # Still no fabricated stream chunk or Loop completion on rollback.
+    assert rt.loop_room("a", "produce", "steps", [rid], 0, False) == 3
+    assert rt.loop_room("b", "consume", "steps", [rid], 0, False) == 5
+    claim, _ = rt.claim_execution_unit("a", "produce", [rid], unit.graph_walks)
+    rt.remove_request(rid)
+    assert not rt.submit_execution_unit(claim)
+    assert not rt.cancel_execution_unit(claim)
+
+
+@pytest.mark.parametrize("consumer_runs", [False, True])
+def test_stream_unit_lands_independent_counts_and_releases_zero_work_without_a_fake_step(consumer_runs):
+    rt, rid = _stream_unit_runtime()
+    rt.ingest_inputs_batch(_ingest_block([rid, rid], [_spec("seed", "a"), _spec("y", "b")]))
+    claim, _ = rt.claim_execution_unit("a", "produce", [rid], ("produce", "consume"))
+    rt.submit_execution_unit(claim)
+    rt.complete_and_route_batch(RouteInput(
+        partition="source", graph_walk="produce", node_name="a", output_signals=[],
+        wg_ids=ParallelList([rid], [7]), tensors=[], num_tensors=[], loop_strides=[2],
+    ))
+    # Apply the ordinary stream receipt only when the bounded schedule selected
+    # a consumer chunk. Graph claiming itself never pretends to pop that chunk.
+    if consumer_runs:
+        rt.ingest_inputs_batch(_ingest_block([rid], [_spec("x", "b")]))
+        rt.complete_and_route_batch(RouteInput(
+            partition="sink", graph_walk="consume", node_name="b", output_signals=[],
+            wg_ids=ParallelList([rid], [9]), tensors=[], num_tensors=[], loop_strides=[1],
+        ))
+    else:
+        assert rt.release_execution_unit_member(claim, "b", 9, [rid])
+    assert not rt.cancel_execution_unit(claim)
+    assert rt.loop_room("a", "produce", "steps", [rid], 0, False) == 1
+    assert rt.loop_room("b", "consume", "steps", [rid], 0, False) == (4 if consumer_runs else 5)
+    assert not any(ready.node_name == "b" for ready in rt.get_ready_nodes(set()))
+
+
+def test_stream_unit_drains_after_producer_done_without_advancing_that_producer_again():
+    rt, rid = _stream_unit_runtime()
+    rt.ingest_inputs_batch(_ingest_block([rid, rid], [_spec("seed", "a"), _spec("y", "b")]))
+    walks = ("produce", "consume")
+    claim, _ = rt.claim_execution_unit("a", "produce", [rid], walks)
+    rt.submit_execution_unit(claim)
+    completed = RouteInput(
+        partition="source", graph_walk="produce", node_name="a", output_signals=[],
+        wg_ids=ParallelList([rid], [7]), tensors=[], num_tensors=[], loop_strides=[3],
+    )
+    rt.complete_and_route_batch(completed)
+    # Ending this member's entire Loop clears its subtree. The still-live
+    # qualified claim must survive that clear until the consumer receipt lands.
+    with pytest.raises(ValueError, match="graph order"):
+        rt.complete_and_route_batch(completed)
+    assert rt.release_execution_unit_member(claim, "b", 9, [rid])
+    rt.mark_partition_done(rid, "source")
+    assert rt.graph_passes({rid: 7}) == [1]
+    assert rt.graph_passes({rid: 9}) == [0]
+    assert rt.claim_execution_unit("a", "produce", [rid], walks) is None  # no member ready
+    rt.ingest_inputs_batch(_ingest_block([rid], [_spec("x", "b")]))
+    claim, _ = rt.claim_execution_unit("a", "produce", [rid], walks)
+    rt.submit_execution_unit(claim)
+    assert rt.release_execution_unit_member(claim, "a", 7, [rid])
+    assert rt.get_ready_nodes(set()) == []
+    rt.complete_and_route_batch(RouteInput(
+        partition="sink", graph_walk="consume", node_name="b", output_signals=[],
+        wg_ids=ParallelList([rid], [9]), tensors=[], num_tensors=[], loop_strides=[1],
+    ))
+    assert rt.graph_passes({rid: 7}) == [1]
+    assert rt.graph_passes({rid: 9}) == [0]
+    assert rt.loop_room("b", "consume", "steps", [rid], 0, False) == 4
+
+
 @pytest.mark.parametrize("head", ["a", "b"])
 def test_connected_join_claims_independent_roots_and_restores_each_on_refusal(head):
     rt = _unit_runtime(Sequential(sections=[

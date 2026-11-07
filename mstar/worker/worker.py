@@ -695,6 +695,7 @@ class Worker(RepeatingSteps):
             tensor_manager=self.tensor_manager,
             communicator=self.communicator,
             combined_walk_of=model.combined_walk_of() if model is not None else None,
+            connections=tuple(topology.connections) if topology is not None else (),
             walk_driven_signals=frozenset(
                 conn.edge_name for conn in topology.connections
                 if conn.consumer_walk is not None
@@ -941,7 +942,10 @@ class Worker(RepeatingSteps):
         self.scheduler.execution_units = {
             (unit.nodes[0], walk): unit
             for walk in walk_runs for unit in self._graph_runtime.execution_units(walk)
-            if not (set(unit.nodes) & self.parallel_nodes)
+            # Streaming units have independent readiness/Loop counts. Their
+            # runtime claim is available, but conditional capture lowering is
+            # not yet an eligible engine path.
+            if not unit.streaming_edges and not (set(unit.nodes) & self.parallel_nodes)
             and all(self.scheduler.lane_of.get((node, walk), CHAIN_LANE) == CHAIN_LANE for node in unit.nodes)
         }
 

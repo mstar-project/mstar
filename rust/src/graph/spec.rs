@@ -140,23 +140,22 @@ pub struct CompiledGraph {
     pub loop_by_name: FxHashMap<Sym, LoopId>,
     pub root_nodes: Vec<NodeId>,
     pub root_loops: Vec<LoopId>,
-    /// Connected ordinary steps, indexed by their first node. Execution
-    /// eligibility (captures, placement and resources) is checked at load;
-    /// this is only the immutable graph structure.
-    pub units: FxHashMap<NodeId, ExecutionUnit>,
 }
 
-pub struct ExecutionUnit {
-    pub nodes: Vec<NodeId>,
+/// A connected section. Compilation uses graph-local ids; runtime plans
+/// qualify the same members/edges with graph and walk, without a second claim.
+pub struct ExecutionUnit<N = NodeId, L = LoopId> {
+    pub nodes: Vec<N>,
     /// Inputs supplied by an earlier member, one mask per member.
     pub internal_inputs: Vec<u64>,
     /// (producer, consumer, signal), in graph order.
-    pub edges: Vec<(NodeId, NodeId, Sym)>,
+    pub edges: Vec<(N, N, Sym)>,
     /// Signals requiring ordinary output storage/routing. An exclusively
     /// internal edge needs only its readiness notification at landing.
     pub output_signals: Vec<Vec<Sym>>,
-    pub repeat_loop: Option<LoopId>,
-    pub loop_back: Vec<(NodeId, NodeId, Sym)>,
+    pub repeat_loop: Option<L>,
+    pub loop_back: Vec<(N, N, Sym)>,
+    pub streaming_edges: Vec<(N, N, Sym)>,
 }
 
 impl ExecutionUnit {
@@ -313,7 +312,7 @@ impl ExecutionUnit {
                     }
                 }
             }
-            units.insert(head, Self { nodes: members, internal_inputs, edges, output_signals, repeat_loop, loop_back });
+            units.insert(head, Self { nodes: members, internal_inputs, edges, output_signals, repeat_loop, loop_back, streaming_edges: vec![] });
         }
         units
     }
