@@ -123,6 +123,7 @@ def test_mtp_load_end_to_end_reduced_fp8():
     onto ``mtp.``, with completeness both ways."""
     from test_glm52_moe import BLOCK, _fabricate_checkpoint
 
+    from mstar.model.glm52._testing import planned_load
     from mstar.model.glm52.components.causal_lm import Glm52ForCausalLM
     from mstar.model.glm52.weight_loader import load_glm52_hf_weights
 
@@ -136,12 +137,9 @@ def test_mtp_load_end_to_end_reduced_fp8():
     assert model.mtp.transformer_layer.self_attn.indexer is not None
 
     state, refs = _fabricate_checkpoint(cfg, include_mtp=True)
-    loaded = load_glm52_hf_weights(
-        model, iter(state), cfg.n_routed_experts,
-        quant_config=cfg.quantization_config, fp8_experts=True,
-        dense_fp8=cfg.dense_fp8, fp8_shared_expert=cfg.fp8_shared_expert,
-        num_hidden_layers=cfg.num_hidden_layers, load_mtp=True,
-    )
+    loaded = planned_load(model, state, load=lambda stream: load_glm52_hf_weights(
+        model, stream, cfg.n_routed_experts, num_hidden_layers=cfg.num_hidden_layers, load_mtp=True,
+    ))
 
     # completeness both ways, the mtp.* subtree included
     params = set(dict(model.named_parameters()))
@@ -168,7 +166,7 @@ def test_mtp_load_end_to_end_reduced_fp8():
     shard = cfg.moe_intermediate_size
     g8, _, _ = refs[f"{mtp_p}.mlp.experts.0.gate_proj"]
     u8, _, _ = refs[f"{mtp_p}.mlp.experts.0.up_proj"]
-    got = moe.experts.gate_up_proj_fp8.data[0]
+    got = moe.experts.gate_up_proj.data[0]
     assert torch.equal(got[:shard], g8.view(torch.uint8))
     assert torch.equal(got[shard:], u8.view(torch.uint8))
 

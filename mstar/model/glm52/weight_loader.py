@@ -5,16 +5,11 @@ import logging
 import re
 from collections.abc import Iterable, Iterator
 from pathlib import Path
-from typing import TYPE_CHECKING
 
 import torch
 from torch import nn
 
 from mstar.model.loader.base import StackedParamRule
-from mstar.utils.fp8_block import dequant_fp8_block_stream
-
-if TYPE_CHECKING:
-    from mstar.utils.fp8_block import Fp8BlockQuantConfig
 
 logger = logging.getLogger(__name__)
 
@@ -24,29 +19,7 @@ _EXPERT_RE = re.compile(
     r"\.(weight|weight_scale_inv)$"
 )
 
-_EXPERT_BASE_RE = re.compile(r"\.experts\.\d+\.(gate_proj|up_proj|down_proj)$")
-
 _LAYER_RE = re.compile(r"^model\.layers\.(\d+)\.")
-
-# Non-expert linears that dense_fp8 keeps fp8 (checkpoint names). kv_b_proj is not one: the
-# absorbed MLA folds it into bf16 w_kc / w_vc.
-_DENSE_FP8_BASE_RE = re.compile(
-    r"\.(self_attn\.(q_a_proj|kv_a_proj_with_mqa|q_b_proj|o_proj)"
-    r"|mlp\.(gate_proj|up_proj|down_proj))$"
-)
-_SHARED_EXPERT_BASE_RE = re.compile(r"\.mlp\.shared_experts\.(gate_proj|up_proj|down_proj)$")
-
-
-def _is_routed_expert_base(base: str) -> bool:
-    return _EXPERT_BASE_RE.search(base) is not None
-
-
-def _is_dense_fp8_base(base: str) -> bool:
-    return _DENSE_FP8_BASE_RE.search(base) is not None
-
-
-def _is_shared_expert_base(base: str) -> bool:
-    return _SHARED_EXPERT_BASE_RE.search(base) is not None
 
 
 def glm52_name_remapper(name: str) -> str | None:
@@ -85,52 +58,26 @@ def skip_phase_b_keys(
         )
 
 
-def build_glm52_stacked_params(
-    n_routed_experts: int, fp8_experts: bool = False,
-) -> list[StackedParamRule]:
+def build_glm52_stacked_params(n_routed_experts: int) -> list[StackedParamRule]:
+    """Per-expert gate/up/down onto the stacked expert params; a block-fp8 checkpoint's
+    ``weight_scale_inv`` rides its weight's rule onto ``<param>_scale_inv`` (substring match)."""
     rules: list[StackedParamRule] = []
     for i in range(n_routed_experts):
-        if fp8_experts:
-            # scale_inv rules MUST precede weight rules: matching is
-            # first-win substring, and ".weight" is a prefix of
-            # ".weight_scale_inv".
-            for proj, sid in (("gate_proj", f"gate:{i}"), ("up_proj", f"up:{i}")):
-                rules.append(StackedParamRule(
-                    target_suffix=".experts.gate_up_proj_scale_inv",
-                    source_suffix=f".experts.{proj}.__expert{i}__.weight_scale_inv",
-                    shard_id=sid,
-                ))
-                rules.append(StackedParamRule(
-                    target_suffix=".experts.gate_up_proj_fp8",
-                    source_suffix=f".experts.{proj}.__expert{i}__.weight",
-                    shard_id=sid,
-                ))
-            rules.append(StackedParamRule(
-                target_suffix=".experts.down_proj_scale_inv",
-                source_suffix=f".experts.down_proj.__expert{i}__.weight_scale_inv",
-                shard_id=f"down:{i}",
-            ))
-            rules.append(StackedParamRule(
-                target_suffix=".experts.down_proj_fp8",
-                source_suffix=f".experts.down_proj.__expert{i}__.weight",
-                shard_id=f"down:{i}",
-            ))
-        else:
-            rules.append(StackedParamRule(
-                target_suffix=".experts.gate_up_proj",
-                source_suffix=f".experts.gate_proj.__expert{i}__.weight",
-                shard_id=f"gate:{i}",
-            ))
-            rules.append(StackedParamRule(
-                target_suffix=".experts.gate_up_proj",
-                source_suffix=f".experts.up_proj.__expert{i}__.weight",
-                shard_id=f"up:{i}",
-            ))
-            rules.append(StackedParamRule(
-                target_suffix=".experts.down_proj",
-                source_suffix=f".experts.down_proj.__expert{i}__.weight",
-                shard_id=f"down:{i}",
-            ))
+        rules.append(StackedParamRule(
+            target_suffix=".experts.gate_up_proj",
+            source_suffix=f".experts.gate_proj.__expert{i}__.weight",
+            shard_id=f"gate:{i}",
+        ))
+        rules.append(StackedParamRule(
+            target_suffix=".experts.gate_up_proj",
+            source_suffix=f".experts.up_proj.__expert{i}__.weight",
+            shard_id=f"up:{i}",
+        ))
+        rules.append(StackedParamRule(
+            target_suffix=".experts.down_proj",
+            source_suffix=f".experts.down_proj.__expert{i}__.weight",
+            shard_id=f"down:{i}",
+        ))
     # Dense/shared gate-up rules must follow expert rules because matching is first-win.
     rules.append(StackedParamRule(".gate_up_proj", ".gate_proj", 0))
     rules.append(StackedParamRule(".gate_up_proj", ".up_proj", 1))
@@ -138,9 +85,11 @@ def build_glm52_stacked_params(
 
 
 def restore_fp32_params(module: nn.Module) -> None:
-    """Re-widen params the checkpoint stores fp32 before loading into them."""
+    """Re-widen the params the checkpoint stores fp32 (the router's correction bias) after a
+    bf16 cast. Block scales live in int32 containers (the quantization plan's storage), which
+    no cast touches: an integer param is never widened, which would change its bytes."""
     for name, param in module.named_parameters():
-        if name.endswith("e_score_correction_bias") or name.endswith("_scale_inv"):
+        if name.endswith("e_score_correction_bias") and param.dtype.is_floating_point:
             if param.dtype != torch.float32:
                 param.data = param.data.float()
 
@@ -162,7 +111,8 @@ def build_glm52_read_plan(
 
     if load_indexer is None:
         load_indexer = bool(config.dsa_long_context)
-    fp8_experts = config.quantization_config is not None and config.moe_fp8_resident
+    # a checkpoint's fp8 experts read only this rank's slice; every expert loader takes one
+    fp8_experts = config.quantization_config is not None
     shard_inter = config.moe_intermediate_size // tp_size
     keys: set[str] = set()
     specs: dict[str, tuple[int, int, int]] = {}
@@ -230,42 +180,26 @@ def load_glm52_hf_weights(
     module: nn.Module,
     weights: Iterable[tuple[str, torch.Tensor]],
     n_routed_experts: int,
-    quant_config: "Fp8BlockQuantConfig | None" = None,
-    fp8_experts: bool = False,
     num_hidden_layers: int = 78,
     load_indexer: bool = True,
-    dense_fp8: bool = False,
-    fp8_shared_expert: bool = False,
     load_mtp: bool = False,
 ) -> set[str]:
+    """Load an HF GLM-5.2 stream. Its fp8 linears go where the node's quantization plan says
+    (``mstar.quantization``: stored, dequantized, or quantized); with no plan active, an fp8
+    tensor is refused rather than copied unscaled into a bf16 parameter."""
     from mstar.model.loader import load_hf_weights
+    from mstar.quantization.scope import active_scope
 
     weights = skip_phase_b_keys(
         weights, num_hidden_layers, load_indexer=load_indexer, load_mtp=load_mtp,
     )
-    if quant_config is not None:
-        def keep(base: str) -> bool:
-            return ((fp8_experts and _is_routed_expert_base(base))
-                    or (dense_fp8 and _is_dense_fp8_base(base))
-                    or (fp8_shared_expert and _is_shared_expert_base(base)))
-
-        weights = dequant_fp8_block_stream(
-            weights, quant_config,
-            keep_fp8=keep if fp8_experts or dense_fp8 or fp8_shared_expert else None)
-    elif fp8_experts:
-        raise ValueError("fp8_experts=True requires a quant_config")
-    elif dense_fp8 or fp8_shared_expert:
-        raise ValueError("dense_fp8=True requires a quant_config")
-    else:
+    if active_scope() is None:
         weights = _refuse_fp8(weights)
-
     restore_fp32_params(module)
     return load_hf_weights(
         module,
         weights,
-        stacked_params=build_glm52_stacked_params(
-            n_routed_experts, fp8_experts=fp8_experts,
-        ),
+        stacked_params=build_glm52_stacked_params(n_routed_experts),
         name_remapper=_make_glm52_name_remapper(num_hidden_layers, load_mtp),
     )
 
@@ -281,12 +215,12 @@ def load_weights(
 
 
 def _refuse_fp8(weights: Iterable[tuple[str, torch.Tensor]]):
-    """Without a quant config an fp8 checkpoint loaded clean and served garbage: its e4m3
-    tensors were copied unscaled and its block scales dropped as unmatched."""
+    """Outside a quantization plan an fp8 checkpoint would load clean and serve garbage: its
+    e4m3 tensors copied unscaled and its block scales dropped as unmatched."""
     for name, tensor in weights:
         if name.endswith("_scale_inv") or tensor.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
             raise ValueError(
-                f"{name} is fp8 or a block scale, but no quantization_config was found "
-                "(config.json's, at its top level)"
+                f"{name} is fp8 or a block scale, but no quantization plan is active (load "
+                "through the engine, or mstar.quantization.scope around the load)"
             )
         yield name, tensor
