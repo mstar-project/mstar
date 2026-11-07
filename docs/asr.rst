@@ -62,13 +62,14 @@ requests batch together and are captured per batch size (1 to 64).
 ``<|startofprev|>`` context), ``timestamps`` (``segment`` or ``word``, set
 from ``response_format`` / ``timestamp_granularities``), ``temperature``.
 
-**Long-form audio.** Whisper hears 30 s; the transcription route serves a
-longer upload as consecutive windows (openai-whisper's loop): each window is
-conditioned on the transcript so far, decoded with timestamps so the next
-window starts where the last closed segment ended, and re-decoded (first
-without the prompt, then at rising temperatures) when its text is a
-repetition loop. ``long_form="parallel"`` submits fixed windows at once,
-cut at the quietest point before each boundary. See :doc:`clients`.
+**Long-form audio.** Whisper hears 30 s; the transcription route cuts a longer
+upload into fixed windows, each at the quietest point before its boundary, and
+submits them at once. ``long_form="sequential"`` asks for openai-whisper's loop
+instead: each window is conditioned on the transcript so far, decoded with
+timestamps so the next window starts where the last closed segment ended, and
+re-decoded (first without the prompt, then at rising temperatures) when its text
+is a repetition loop. It is several times slower, and only it has that
+repetition guard. See :doc:`clients`.
 
 Qwen3-ASR
 ---------
@@ -85,8 +86,10 @@ buckets) and decode (captured per batch size) run on paged KV. The model
 writes ``language {Name}<asr_text>{text}``; the adapter reports the
 language as an ISO code and the text alone.
 
-A request hears up to 20 minutes; longer uploads are cut into 20 minute
-windows. The ``context`` (the OpenAI ``prompt``) is the system-turn hint
+A request hears up to 20 minutes, but the route cuts an upload into 30 s windows
+and submits them at once, which is several times faster and holds far fewer KV
+pages. ``window_seconds=1200`` in ``extra_body`` asks for the whole file as one
+request (1.52 % WER against 1.61 % on the windows, at concurrency 16). The ``context`` (the OpenAI ``prompt``) is the system-turn hint
 the reference SDK also takes; ``language`` forces the language;
 ``assistant_prefix`` prefills the assistant turn, which is what streaming
 builds on.
@@ -128,14 +131,14 @@ file holds about 122 pages of 128 tokens for its prompt and up to 32 more for
 its transcript, while a 30 s window holds about 4. ``qwen3_asr.yaml`` sizes
 its pools for an 80 GB H100 (``kv_cache.max_num_pages: 3500``, peaking near
 74300 MiB in all under load, and ``cpu_offload_pages: 1536``) and caps Qwen3-ASR at 64
-concurrent requests, which any mix of windows fits and which is what long-form
-``parallel`` throughput needs.
+concurrent requests, which any mix of windows fits and which is what the
+default long-form throughput needs.
 
 The cap does not bound long whole files. Admission reserves only a request's
 prompt, so more concurrent 20 minute files than the pools hold offload to the
 host pool and, once that is full too, wait on each other until they time out.
-A deployment that takes bursts of long whole files should send them with
-``long_form="parallel"``, lower the cap, or raise the pools with it.
+Only requests that ask for whole files with ``window_seconds`` can do this; one
+that takes bursts of them should lower the cap or raise the pools with it.
 ``qwen3_asr_split.yaml`` keeps its cap of 12.
 
 Both decode loops stream their transcript token by token. A decode step
