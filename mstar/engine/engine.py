@@ -2501,27 +2501,31 @@ class Engine:
         # its body (and hence its resident gather), or the producer is finished.
         ring.plan(LoopbackRowsStep(), dataclasses.replace(binding, resident=None))
         indices = ring.indices(binding.slot_lease.bucket, binding.slot_lease.slot)
-        if indices.numel() != 1 or slot.run.state.counts.numel() != 1:
-            guard.refuse("streamed composition currently needs one physical row per member")
-        if source is not None and source.run.state.counts.numel() != 1:
-            guard.refuse("streamed composition currently needs one physical row per member")
+        capacity = slot.run.state.counts.numel()
+        if indices.numel() != capacity or (source is not None and source.run.state.counts.numel() != capacity):
+            guard.refuse("streamed members need matching physical row capacities")
+        if capacity > 1 and (slot.run.state.active is None or (source is not None and source.run.state.active is None)):
+            guard.refuse("independently ready streamed rows need captured owner masks")
+        if len(payload) != len(batch.request_ids):
+            guard.refuse("each streamed row needs its own owner destination")
         item = ring.row(signal, batch.request_ids[0])
-        prototype, target = payload
-        if prototype.numel() % item[0].numel():
-            guard.refuse("a streamed destination does not hold whole producer items")
-        width = prototype.numel() // item[0].numel()
-        shape = (width, *item.shape[1:])
-        if tuple(prototype.shape) not in (shape, tuple(item.shape[1:]) if width == 1 else shape):
-            guard.refuse("a streamed payload changed its owner's item geometry")
-        try:
-            target = target.view(1, *shape)
-        except RuntimeError:
-            guard.refuse("a streamed destination cannot preserve its owner's item coordinates")
+        targets = []
+        for prototype, target in payload:
+            if prototype.numel() % item[0].numel():
+                guard.refuse("a streamed destination does not hold whole producer items")
+            width = prototype.numel() // item[0].numel()
+            shape = (width, *item.shape[1:])
+            if tuple(prototype.shape) not in (shape, tuple(item.shape[1:]) if width == 1 else shape):
+                guard.refuse("a streamed payload changed its owner's item geometry")
+            try:
+                targets.append(target.view(1, *shape))
+            except RuntimeError:
+                guard.refuse("a streamed destination cannot preserve its owner's item coordinates")
         policy = source_mgmt.device_stops.get(source_batch.graph_walk)
         withheld = policy is not None and signal in policy.withhold
-        if source is not None and withheld and policy.limits(
-            source_batch.per_request_info_wrapped[batch.request_ids[0]],
-        ).ignore_eos:
+        if source is not None and withheld and any(
+            policy.limits(source_batch.per_request_info_wrapped[rid]).ignore_eos for rid in batch.request_ids
+        ):
             guard.refuse("withheld items inside an EOS-immune run need explicit item identities")
         token = None if not withheld or source is None else output_named(source.static_outputs, policy.token_signal)
         direct = signal in source_mgmt.submodule.DIRECT_OUTPUTS.get(source_batch.graph_walk, ())
@@ -2532,37 +2536,50 @@ class Engine:
                 guard.refuse("a direct output needs its same-named unspanned captured row tensor")
         produced = (None if source is None else (source.static_outputs.row_outputs or {}).get(signal) if direct
                     else output_named(source.static_outputs, signal))
-        if source is not None and (produced is None or produced.shape != (1, *item.shape[1:])):
+        if source is not None and (produced is None or produced.shape != (capacity, *item.shape[1:])):
             guard.refuse("a streamed producer must emit one captured item per iteration")
         key = ("stream", id(slot.graph), None if source is None else id(source.graph), id(window),
-               target.data_ptr(), tuple(target.shape), target.stride(), target.storage_offset(),
-               indices.data_ptr(), item.untyped_storage().data_ptr(),
+               tuple((target.data_ptr(), tuple(target.shape), target.stride(), target.storage_offset())
+                     for target in targets), indices.data_ptr(), item.untyped_storage().data_ptr(),
                withheld)
         if slot.composed_graph is not None and slot.composed_key == key:
             return slot.composed_graph
         state = slot.run.state
 
-        def kept():
-            if not withheld:
-                return source.run.state.counts > 0
-            eos = torch.zeros_like(source.run.state.counts, dtype=torch.bool)
+        retained_token = None if source is None or not withheld else source.run.stops.get(policy.token_signal)
+        if source is not None and withheld and capacity > 1 and retained_token is None:
+            guard.refuse("withheld streamed rows need their retained actual stop token")
+
+        def eos(values):
+            stopped = torch.zeros_like(source.run.state.counts, dtype=torch.bool)
             for value in policy.eos_tokens:
-                eos.logical_or_(token.reshape(1) == value)
-            return (source.run.state.counts > 0) & ~eos
+                stopped.logical_or_(values.reshape(capacity) == value)
+            return stopped
+
+        def kept():
+            executed = (source.run.state.counts > 0 if source.run.state.active is None
+                        else source.run.state.active)
+            return executed if not withheld else executed & ~eos(token)
 
         def choose():
             emitted = torch.zeros_like(window.counts) if source is None else source.run.state.counts
             if source is not None and withheld:
-                emitted = emitted - ((emitted > 0) & ~kept()).long()
+                last = (token if retained_token is None else
+                        retained_token.gather(1, (emitted - 1).clamp(min=0)[:, None]))
+                emitted = emitted - ((emitted > 0) & eos(last)).long()
             window.select(window.origins[:, 0] + window.origins[:, 1] + emitted,
                           window.origins[:, 2].bool(), ~state.marks)
             # A semantic empty final flush needs no compute budget. A chunk
             # that does compute is acknowledged only if its body will execute.
             allowed = ((window.selected >= 0)
-                       & ((window.metadata[:, 5] == 0) | (state.continuation != 0)))
+                       & ((window.metadata[:, 5] == 0)
+                          | ((state.continuation != 0) & (state.counts < state.limit))))
             window.selected.copy_(torch.where(allowed, window.selected, -1))
             window.ready.copy_(allowed.any().reshape(1))
-            window.compute_ready.copy_((allowed & (window.metadata[:, 5] != 0)).any().reshape(1))
+            computing = allowed & (window.metadata[:, 5] != 0)
+            window.compute_ready.copy_(computing.any().reshape(1))
+            if state.eligible is not None:
+                state.eligible.copy_(computing)
             running = torch.zeros_like(window.continuation) if source is None else source.run.state.continuation
             window.continuation.copy_((running != 0) | (window.ready != 0))
 
@@ -2570,7 +2587,9 @@ class Engine:
             ring.ring_scatter(signal, indices, window.produced_positions(source.run.state.counts), produced, kept())
 
         def gather():
-            ring.ring_gather(signal, indices, window.payload_positions(width), target)
+            for row, target in enumerate(targets):
+                positions = window.payload_positions(target.shape[1])
+                ring.ring_gather(signal, indices[row:row + 1], positions[row:row + 1], target)
 
         backend = runner._graph_backend
         def capture(fn):
@@ -2895,9 +2914,9 @@ class Engine:
                             keys = tuple(expected.pop(name))
                             routed = destinations(name, guard.copies(value, target, keys, set(keys) - back_keys))
                             if streamed and incoming:
-                                if stream_target is not None or len(routed) != 1:
-                                    guard.refuse("a streamed payload needs one contiguous owner destination")
-                                stream_target = routed[0]
+                                if stream_target is not None or len(routed) != len(rows):
+                                    guard.refuse("each streamed row needs one contiguous owner destination")
+                                stream_target = routed
                             else:
                                 copies.extend(routed)
                             group.initial_copies.extend(destinations(

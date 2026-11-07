@@ -1400,3 +1400,146 @@ def test_streamed_engine_composes_independent_bodies_and_owner_reads(device_name
         assert not tails
     if custom:
         assert batch_tails == ([] if yielded or mode == "tail_error" else [(2,)])
+
+
+@pytest.mark.parametrize("device_name", ["cpu", "cuda"])
+@pytest.mark.parametrize("horizon", [4, 1, "eos"])
+def test_streamed_row_budgets_preserve_later_chunks_and_staggered_readiness(device_name, horizon, monkeypatch):
+    from dataclasses import replace
+
+    from test_device_run import _Loop
+
+    from mstar.engine.accelerator_graph_backend import CUDAGraphBackend
+    from mstar.engine.accelerator_graph_runner import capture_into_graph
+    from mstar.engine.connected_inputs import ConnectedInputs
+    from mstar.engine.device_run import RUN_COUNTS, RUN_REPLAYS, DeviceRun, RunState
+    from mstar.engine.resources.iteration_tables import IterationTables
+    from mstar.engine.resources.loopback_rows import LoopbackRows, LoopbackRowsStep
+    from mstar.model.submodule_base import StopKind, StopPolicy
+    from mstar.streaming.chunk_policy import FixedChunkPolicy
+    from mstar.streaming.stream_buffer import StreamBuffer
+
+    if device_name == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA staggered stream readiness")
+    device = torch.device(device_name)
+    early_eos = horizon == "eos"
+    producer_limit = 4 if early_eos else horizon
+    eng, group, _ = _connected_engine(device=device)
+    group.unit = replace(group.unit, streaming_edges=group.unit.edges)
+    backend = CUDAGraphBackend(device) if device_name == "cuda" else _Loop()
+    stop = backend.while_runtime() if device_name == "cuda" else backend
+    if device_name == "cpu":
+        backend.graph_pool_handle = lambda: None
+        monkeypatch.setattr("mstar.engine.accelerator_graph_runner.capture_into_graph",
+                            lambda fn, *a, **kw: (SimpleNamespace(replay=fn), None))
+    else:
+        stop._load_kernels()
+
+    def capture(fn):
+        return (capture_into_graph(fn, backend.graph_pool_handle(), device, None, keep_graph=True)[0]
+                if device_name == "cuda" else SimpleNamespace(replay=fn))
+
+    ring = LoopbackRows(device, capacity=2)
+    target_owner = LoopbackRows(device, capacity=2)
+    for rid in (2, 1):
+        ring.add(rid)
+        target_owner.add(rid)
+    ring.ask_ring("x", 8)
+    ring.ring_table("x", torch.zeros(2, 1, device=device))
+    ring.ring_reserve("x", [2], 2)
+    ring.ring_write("x", [2], torch.tensor([[[101.], [102.]]], device=device), [0])
+    bases = dict(zip((2, 1), ring.ring_reserve("x", [2, 1], 4), strict=True))
+    ring.ring_write("x", [2], torch.full((1, 4, 1), -777., device=device), [bases[2]])
+    target_owner.write("x", [2, 1], torch.zeros(2, 2, 1, device=device))
+    eng._submodules["a"].loopback_rows = ring
+    eng._submodules["a"].device_stops["prefill"] = StopPolicy(StopKind.EOS, "token", frozenset({99}), withhold=("x",))
+    leases, runs, slots, owner_counts = {}, {}, {}, {}
+    first_values = torch.tensor([21, 11, 0], device=device)
+    eos_row = torch.tensor([True, False, False], device=device)
+    for _, batch in group.members:
+        name = batch.node_name
+        mgmt = eng._submodules[name]
+        runner = mgmt.accelerator_graph_runner
+        runner._graph_backend = backend
+        bucket = next(iter(runner._buckets))
+        lease = leases[name] = SlotLease(0, bucket, name)
+        batch.lease_slot(lease)
+        batch.step_context.set_padded_rids([2, 1, -1])
+        slot = slots[name] = runner.slot_for(lease)
+        dropping = SimpleNamespace(rows=torch.tensor([1, 2, 0], device=device),
+                                   slots=torch.tensor([1, 2, 0], device=device))
+        state = RunState(3, "token", {99}, device, dropping=dropping, independent_rows=True)
+        run = runs[name] = slot.run = DeviceRun(state, {}, lambda: None, 4)
+        out = torch.zeros(3, 1, device=device)
+        token = torch.ones(3, dtype=torch.long, device=device)
+        slot.static_outputs.row_outputs = {"x": out}
+        slot.static_outputs.check_stop_buffers = {"token": token}
+        run.keep({"x": out}, run.rows)
+        run.keep({"token": token}, run.stops)
+        run.sealed = True
+        owner_counts[name] = torch.zeros(3, dtype=torch.long, device=device)
+        if name == "b":
+            slot.static_inputs = {"x": torch.zeros(3, 2, 1, device=device)}
+            target_owner.plan(LoopbackRowsStep(), batch.step_context)
+
+        def body(name=name, state=state, run=run, dropping=dropping, out=out, token=token,
+                 slot=slot, bucket=bucket):
+            state.select_rows()
+            state.head()
+            owner_counts[name].index_add_(0, dropping.slots, torch.ones_like(state.counts))
+            if name == "a":
+                out.copy_((state.counts + first_values)[:, None])
+                if early_eos:
+                    token.copy_(torch.where(eos_row & (state.counts == 0), 99, 1))
+            else:
+                target_owner.head(bucket, 0, "x", slot.static_inputs["x"])
+                out.copy_(slot.static_inputs["x"].sum(dim=1))
+            run.keep({"x": out}, run.rows)
+            run.keep({"token": token}, run.stops)
+            stop.stop(state, token, backend.raw_stream() if device_name == "cuda" else None)
+
+        slot.graph = capture(body)
+        run.entry = capture(lambda state=state: stop.start(
+            state, backend.raw_stream() if device_name == "cuda" else None,
+        ))
+
+    tables = IterationTables(device)
+    streams, snapshots = [], []
+    for rid in (2, 1):
+        stream = StreamBuffer(rid, "x", "a", FixedChunkPolicy(2))
+        if rid == 2:
+            stream.put_positions([0, 1])
+        snapshots.append(stream.reserve_future_window(range(bases[rid], bases[rid] + 4), 2, may_finish=False))
+        streams.append(stream)
+    receipts = [snapshot.reservation for snapshot in snapshots]
+    window = tables.prepare_stream_window(
+        leases["b"], max(len(r.decisions) for r in receipts),
+        max(len(r.transitions) for r in receipts), max(len(r.positions) for r in receipts),
+    )
+    payload = [(ring.row("x", rid)[:2], target_owner.row("x", rid)) for rid in (2, 1)]
+    graph = eng._compose_stream(group, leases, window, payload, ConnectedInputs({}))
+    tables.stage_stream_window(leases["b"], receipts, [[True] * len(r.transitions) for r in receipts],
+                               producer_limits=[4, 4])
+    for name, run in runs.items():
+        run.state.stage(2, [False, False], producer_limit if name == "a" else 1)
+        owner_counts[name].zero_()
+    graph.replay()
+    stops, values, _ = runs["b"].results(1)
+    if device_name == "cuda":
+        backend.synchronize()
+    expected = [1, 1 if producer_limit == 4 else 0, 0]
+    assert stops[RUN_COUNTS].tolist() == expected
+    assert stops[RUN_REPLAYS].tolist() == [1, 1, 1]
+    assert owner_counts["b"][1:].tolist() == expected[:2]
+    assert values["x"].reshape(3).tolist() == [203., 23. if producer_limit == 4 else 0., 0.]
+    assert window.counts.tolist() == expected, "exhausted A must not acknowledge another nonempty policy chunk"
+    for i, (rid, stream, receipt) in enumerate(zip((2, 1), streams, receipts, strict=True)):
+        produced = 0 if early_eos and rid == 2 else producer_limit
+        stream.put_positions(list(range(bases[rid], bases[rid] + produced)))
+        stream.settle_window(receipt, expected[i], final_transition=int(window.history[i]))
+        assert stream._consumed == expected[i] * 2
+        assert list(stream._buffer) == list(range(expected[i] * 2, (2 if rid == 2 else 0) + produced))
+        assert not stream._reservations
+    if early_eos:
+        assert runs["a"].state.counts.tolist() == [1, 4, 0]
+        assert ring.ring_read("x", 2, list(range(bases[2], bases[2] + 4))).eq(-777).all()
