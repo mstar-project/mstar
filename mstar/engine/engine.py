@@ -1458,9 +1458,15 @@ class Engine:
         ):
             return {}
         hits = {}
+        chunks = batch.chunk_ranges
         for rid in batch.request_ids:
             walk = ctx.walk_of(rid)
             if walk not in keyed:
+                continue
+            chunk = chunks.get(rid) if chunks else None
+            if chunk is not None and chunk.stride != chunk.end:
+                # a later chunk (`runs_first_chunk`): the first applied or declined the row's lease,
+                # and one taken again before that chunk commits would restore over what it wrote
                 continue
             leases = self._runner.lease_cached_prefix(rid, batch.node_name, walk)
             if leases:
@@ -2803,7 +2809,11 @@ class Engine:
         cache holds, which ``rid``'s lease keeps until its first chunk applies it.
         A row the cache holds whole measures 0, so the budget never cuts it and
         prepare serves it (`_skip_cached_prefix`): a chunk cut from 0 would
-        write over the lease the walks before it were served from."""
+        write over the lease the walks before it were served from.
+
+        Above one rank the probe answers only from rank 0's lease, so rank 0
+        takes it here, for the step that runs the row to send. A row the step
+        leaves out gives it back (`give_back_cached_prefix`)."""
         submodule = self._submodules[node_name].submodule
         info = submodule.get_input_sequence_len(graph_walk, request_info, inputs)
         policy = self._chunking.policy(node_name, graph_walk)
@@ -2817,13 +2827,30 @@ class Engine:
                 and not policy.reuses_cached_prefix(request_info))
         ):
             return info
+        leads = node_name in self._tp_leader_nodes
+        if leads:
+            self._runner.lease_cached_prefix(rid, node_name, graph_walk)
         prefix = self._runner.resolve_cached_prefix(
             rid, node_name, graph_walk, _MeasuredRow(info.seq_len),
         )
         matched = min(prefix.tokens if prefix is not None else 0, info.seq_len)
         if matched <= 0:
+            if leads:
+                # cut from 0, the row holds nothing while it waits; its first chunk declines
+                # whatever its send leases
+                self._runner.release_cached_prefix(rid, node_name, graph_walk)
             return info
         return InputSeqLenInfo(info.seq_len - matched, cached_prefix=matched)
+
+    def give_back_cached_prefix(self, node_name: str, rid: int, graph_walk: str) -> bool:
+        """For a row measured past a cached prefix that its step left out. On rank 0 of a TP
+        instance, give back the lease `input_sequence_len` took and return True: the step that
+        takes the row measures it again. Held while the row waits, the lease would pin pages on
+        rank 0 alone, and the ranks would evict apart. Elsewhere the lease waits with the row."""
+        if node_name not in self._tp_leader_nodes:
+            return False
+        self._runner.release_cached_prefix(rid, node_name, graph_walk)
+        return True
 
     def check_ready(
         self, node_name: str, request_id: str,

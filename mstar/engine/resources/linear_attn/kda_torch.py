@@ -226,7 +226,14 @@ class TorchKDAKernels:
         return None
 
     @torch.compiler.disable
-    def run_paged(self, qkv, g, beta, plan, conv_state, rec_state, p, gate=None):
+    def run_paged(self, qkv, g, beta, plan, conv_state, rec_state, p, gate=None, out=None):
+        """``out``: ``[T, P]`` memory the result is copied into and returned in."""
+        res = self._run_paged(qkv, g, beta, plan, conv_state, rec_state, p, gate)
+        if out is None:
+            return res
+        return out.view(res.shape).copy_(res)
+
+    def _run_paged(self, qkv, g, beta, plan, conv_state, rec_state, p, gate):
         h, d = p.num_heads, p.head_dim
         t = qkv.shape[0]
         f = F.linear(g, p.f_b) if p.f_b is not None else g
