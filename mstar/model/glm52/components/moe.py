@@ -322,7 +322,10 @@ class Glm52SparseMoeBlock(QuantExperts, nn.Module):
         dev = torch.device(device) if device is not None else torch.device("cpu")
         self._use_fused = (self.fp8_experts and self.kernels == "auto"
                            and fused_fp8_available(dev, self.block_size))
-        self.gate.finalize_weights(topk_kernel=self._use_fused and self._router_kernel)
+        # the router kernels serve any quantized experts on CUDA under kernels: auto, not only the fused fp8 ones
+        fused_router = self._use_fused or (self.experts_packed is not None and dev.type == "cuda"
+                                           and self.kernels == "auto")
+        self.gate.finalize_weights(topk_kernel=fused_router and self._router_kernel)
         if self.experts_packed is not None:
             logger.info("Glm52SparseMoeBlock routed experts: %s, %s", self.experts_packed.name,
                         "FlashInfer TRT-LLM FP4 MoE" if self._experts_kernel is not None else "the reference")
