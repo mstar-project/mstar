@@ -494,6 +494,8 @@ def test_dynamo_worker_exits_nonzero_when_conductor_dies():
                           return_value=(server, conductor, "whisper_large")),
         mock.patch.object(dynamo_worker, "serve"),
         mock.patch("mstar.api_server.entrypoint._shutdown_conductor_process"),
+        # main() would hand pytest's log handlers to a writer thread, which repeats every later record
+        mock.patch("mstar.utils.logging_config.log_off_thread"),
         pytest.raises(SystemExit) as exc,
     ):
         dynamo_worker.main(argv)

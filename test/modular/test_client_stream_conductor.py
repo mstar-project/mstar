@@ -42,6 +42,7 @@ from mstar.streaming.topology import (  # noqa: E402
     client_stream_limits,
     find_client_streams,
 )
+from mstar.testing_utils.model import StubModel  # noqa: E402
 from mstar.utils.ipc_format import (  # noqa: E402
     ClientStreamRoute,
     ConductorMessage,
@@ -82,16 +83,13 @@ class _ScriptDoneError(Exception):
     pass
 
 
-class _DuplexToy(Model):
+class _DuplexToy(StubModel):
     """One partition whose loop consumes a stream the client feeds."""
 
     consumer = "ear"
 
     def __init__(self, consumer_input="audio_in"):
         self._consumer_input = consumer_input
-
-    def get_node_resources(self):
-        return []
 
     def get_graph_walk_graphs(self):
         return {"listen": Loop(name="listen_loop", max_iters=1000, outputs=[], section=GraphNode(
@@ -116,17 +114,8 @@ class _DuplexToy(Model):
                                         incoming_connections=None):
         return _fwd()
 
-    def process_prompt(self, *a, **k):
-        return {}
-
     def process_stream_chunk(self, chunk):
         return {"audio_in": chunk.tensors["audio_inputs"]}
-
-    def postprocess(self, *a, **k):
-        return b""
-
-    def get_submodule(self, *a, **k):
-        return None
 
 
 def _fwd():

@@ -16,7 +16,7 @@ from mstar.api_server.request_types import PreprocessInput  # noqa: E402
 from mstar.communication.codec import default_codec  # noqa: E402
 from mstar.communication.communicator import OutboxCommunicator  # noqa: E402
 from mstar.communication.event import EventWakeup  # noqa: E402
-from mstar.streaming.topology import PartitionTopology  # noqa: E402
+from mstar.testing_utils.model import StubModel  # noqa: E402
 from mstar.utils.ipc_format import ConductorMessageType  # noqa: E402
 
 
@@ -104,10 +104,7 @@ def test_a_peer_that_stays_behind_is_reported_with_its_depth(monkeypatch, caplog
     assert record.args[0] == "worker_0" and record.args[2] == 3
 
 
-class _Model:
-    def get_partition_topology(self):
-        return PartitionTopology(partitions=["default"])
-
+class _Model(StubModel):
     def process_prompt(self, *args, **kwargs):
         return {"text_inputs": [torch.tensor([1, 2, 3])]}
 

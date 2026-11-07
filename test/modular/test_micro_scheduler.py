@@ -160,6 +160,10 @@ class _Runtime:
             walk_output_signals=signals,
         )
 
+    def get_output_signals(self, node_name, graph_walk):
+        del node_name
+        return [f"out_{graph_walk}"]
+
     def get_nodes(self, node_name, rids, wg_ids):
         del wg_ids
         return [SimpleNamespace(name=node_name) for _ in rids]
@@ -271,6 +275,10 @@ class _Engine:
     def get_max_rows_in_combined(self, node_name, graph_walk):
         del node_name
         return self._row_caps.get(graph_walk)
+
+    def batch_cap_varies(self, node_name, graph_walk):
+        del node_name, graph_walk
+        return False
 
     def get_step_order(self, node_name, graph_walk):
         del node_name, graph_walk
@@ -475,12 +483,15 @@ def test_a_backlogged_chunk_is_rechecked_before_going_back_out():
 def test_a_raising_scheduling_pass_fails_the_rows_it_took(path, monkeypatch):
     """The popped rows are in no queue and no step, and a ready row left queued
     would raise the pass again every time, so if the pass raises they fail or
-    their requests hang. The scan raises before it pops the queued row, the
-    chain's step after; a rejection recorded earlier stands."""
-    sched = _scheduler(_Engine(max_bs=4))
+    their requests hang, as a rebuild the log would offer again does. The scan
+    raises before it pops the queued row, the chain's step after; a rejection
+    recorded earlier stands."""
+    sched = _scheduler(_Engine(max_bs=5))
     sched.backlog[(NODE, WALK)] = _batch(["r2", "r3"])
     sched.admit_errors["r2"] = "unservable"
     manager = _Manager(["r4"])
+    monkeypatch.setattr(sched, "_rebuild_rows", lambda *a, **kw: [MidPrefillRow("r5", 0, WALK, 0, 4)])
+    manager.per_request_info["r5"] = object()
 
     def blow_up(*args, **kwargs):
         raise RuntimeError("blew up")
@@ -494,8 +505,8 @@ def test_a_raising_scheduling_pass_fails_the_rows_it_took(path, monkeypatch):
             _chain(sched, manager, ["c0"])
 
     errors = sched.take_admit_errors()
-    assert set(errors) == {"r2", "r3", "r4"} and errors["r2"] == "unservable"
-    assert {"r2", "r3", "r4"} <= sched.failed_rids
+    assert set(errors) == {"r2", "r3", "r4", "r5"} and errors["r2"] == "unservable"
+    assert {"r2", "r3", "r4", "r5"} <= sched.failed_rids
 
 
 def test_an_uncapped_node_can_be_served_from_the_backlog():
@@ -1447,13 +1458,14 @@ class _Submodule:
 
 
 def _capture_group(split=True, captured=(WALK,)):
-    from mstar.engine.engine import Engine
+    from mstar.testing_utils.engine import make_engine, make_mgmt
 
     runner = SimpleNamespace(captures_walk=lambda walk: walk in captured)
-    engine = Engine.__new__(Engine)
-    engine._submodules = {
-        NODE: SimpleNamespace(submodule=_Submodule(split), accelerator_graph_runner=runner, piecewise_runners={}),
-    }
+    engine = make_engine(
+        _submodules={
+            NODE: make_mgmt(_Submodule(split), accelerator_graph_runner=runner),
+        },
+    )
     return engine.capture_group(NODE, WALK, 0, SimpleNamespace(guided=True))
 
 
@@ -1485,15 +1497,15 @@ class _StreamKeyedSubmodule:
 
 
 def _stream_engine():
-    from mstar.engine.engine import Engine
+    from mstar.testing_utils.engine import make_engine, make_mgmt
 
     runner = SimpleNamespace(captures_walk=lambda walk: walk == WALK)
+    grouping = make_engine(_submodules={
+        NODE: make_mgmt(_StreamKeyedSubmodule(), accelerator_graph_runner=runner),
+    })
     engine = _Engine(max_bs=16)  # readiness and the cap; the grouping is the real Engine's
-    engine._submodules = {
-        NODE: SimpleNamespace(submodule=_StreamKeyedSubmodule(), accelerator_graph_runner=runner, piecewise_runners={}),
-    }
-    engine.splits_by_capture_key = lambda node, walk: Engine.splits_by_capture_key(engine, node, walk)
-    engine.capture_group = lambda *a, **kw: Engine.capture_group(engine, *a, **kw)
+    engine.splits_by_capture_key = grouping.splits_by_capture_key
+    engine.capture_group = grouping.capture_group
     return engine
 
 

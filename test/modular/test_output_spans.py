@@ -30,8 +30,10 @@ from mstar.graph.base import GraphEdge, GraphNode, Loop  # noqa: E402
 from mstar.graph.runtime.base import PhasedPostprocess  # noqa: E402
 from mstar.graph.special_destinations import EMIT_TO_CLIENT  # noqa: E402
 from mstar.model.submodule_base import BatchedModelOutput, NodeInputs, NodeSubmodule  # noqa: E402
+from mstar.testing_utils.model import StubModel  # noqa: E402
 from mstar.worker.engine_manager import _refuse_speculated_spans, _refuse_unroutable_withholds  # noqa: E402
 from mstar.worker.micro_scheduler import ScheduledBatch  # noqa: E402
+from mstar.worker.rebuild import Rebuilds  # noqa: E402
 from mstar.worker.worker import PendingBatch, Worker  # noqa: E402
 
 NODE, WALK = "vocoder", "synth"
@@ -169,7 +171,7 @@ def _worker(engine: Engine) -> tuple[Worker, dict]:
         store_and_return_tensor_info_batch=store,
     )
     worker.engine_manager = SimpleNamespace(get_engine=lambda node: engine)
-    worker._innermost_loop_by_node = {}
+    worker._innermost_loop_by_node, worker._rebuilds = {}, Rebuilds({}, {})
     worker._stop_token_signal = {}  # no declared stop policies: check_stop decides
     worker.request_state = SimpleNamespace(buffer_publish_info=lambda *args: None)
     worker.scheduler = SimpleNamespace(failed_rids=set())
@@ -306,7 +308,7 @@ def test_a_step_spanning_only_some_declared_outputs_fails():
         engine.exec_and_postprocess(batch)
 
 
-class _Graph:
+class _Graph(StubModel):
     def __init__(self, section):
         self.section = section
 

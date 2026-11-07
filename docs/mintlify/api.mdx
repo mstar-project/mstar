@@ -1,0 +1,23 @@
+---
+title: "Python API reference"
+description: "Browse the Python module, class, and function reference generated from M* docstrings."
+---
+
+The Python API reference is generated from module docstrings by Sphinx. It follows
+the package layout under `mstar/`, with subpackages, modules, classes, and functions.
+
+<Card title="Open the Python API reference" icon="code" href="https://mstar.stanford.edu/mstar/api.html">
+  Browse the generated reference on the existing documentation site.
+</Card>
+
+The generated reference remains on the Sphinx site while the narrative guides move
+to Mintlify. Python symbol links in these guides open their source module on GitHub.
+
+## Building the reference
+
+Sphinx imports the modules to read their docstrings, so the reference build needs
+the project's runtime environment (`pip install -e ".[dev]"` plus
+`docs/requirements.txt`), including PyTorch and the other core dependencies.
+See [the Sphinx configuration](https://github.com/mstar-project/mstar/blob/main/docs/conf.py)
+and [documentation workflow](https://github.com/mstar-project/mstar/blob/main/.github/workflows/docs.yml)
+for the build configuration.

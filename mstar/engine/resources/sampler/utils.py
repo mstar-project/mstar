@@ -408,24 +408,28 @@ _SPLIT_CHUNK = 16384
 _SPLIT_MAX_BLOCK = 8192
 
 
-def _split_count(batch: int, vocab: int, device: torch.device) -> int:
-    """How many chunks to cut the vocab into.
+def _split_layout(batch: int, vocab: int, device: torch.device) -> tuple[int, int]:
+    """``(nsplit, chunk)``: how many chunks to cut the vocab into, and their width.
 
     The vocab's call alone: any vocab wider than one chunk splits, so for real
     LLM vocabularies the fused kernel is only reached from tests. ``batch`` is
-    accepted for a future rule.
+    accepted for a future rule. 16-aligned chunk starts let the loads vectorize
+    when the vocab (the row stride) is a multiple of 16 too, as Triton
+    specializes ints divisible by 16: an odd chunk (vocab 202,048 in 13 splits)
+    made the prep 3.8x slower.
     """
     del batch, device
-    return max(1, -(-vocab // _SPLIT_CHUNK))
+    nsplit = max(1, triton.cdiv(vocab, _SPLIT_CHUNK))
+    chunk = triton.cdiv(triton.cdiv(vocab, nsplit), 16) * 16
+    return triton.cdiv(vocab, chunk), chunk
 
 
 def _split_v_softmax(
-    logits, temperature, pen_ptr, mask_ptr, probs, nsplit,
+    logits, temperature, pen_ptr, mask_ptr, probs, nsplit, chunk,
     apply_penalty, include_greedy, mask_stride_b, mask_stride_v, hist,
 ):
     """The three-kernel path; see the kernels above for why."""
     B, V = logits.shape
-    chunk = -(-V // nsplit)
     # sized to the chunk: a small block makes a long chunk many serial iterations
     block = min(_SPLIT_MAX_BLOCK, triton.next_power_of_2(chunk))
     hist_args, hist_flags = hist
@@ -511,10 +515,10 @@ def fused_temperature_softmax(
     mask_stride_v = seen_mask.stride(1) if apply_penalty else 0
     hist = _history_kernel_args(history, logits)
 
-    nsplit = _split_count(B, V, logits.device)
+    nsplit, chunk = _split_layout(B, V, logits.device)
     if nsplit > 1:
         _split_v_softmax(
-            logits, temperature, pen_ptr, mask_ptr, probs, nsplit,
+            logits, temperature, pen_ptr, mask_ptr, probs, nsplit, chunk,
             apply_penalty, include_greedy, mask_stride_b, mask_stride_v, hist,
         )
         return probs
@@ -755,6 +759,16 @@ def _fused_sample_kernel(
 FUSED_SAMPLE_MAX_VOCAB = 4096
 
 
+class FusedDrawArgs(NamedTuple):
+    """A step's per-row ``fused_sample`` parameters, for a kernel that draws as it does."""
+
+    temperature: torch.Tensor
+    top_k: torch.Tensor
+    top_p: torch.Tensor
+    seed: torch.Tensor
+    offset: torch.Tensor
+
+
 def fused_sample(
     logits: torch.Tensor, temperature: torch.Tensor, top_k: torch.Tensor, top_p: torch.Tensor,
     seed: torch.Tensor, offset: torch.Tensor,
@@ -910,8 +924,7 @@ def _token_logprobs_cuda(logits: torch.Tensor, tokens: torch.Tensor, temperature
     """``token_logprobs`` in one fp32 pass, on the split-V softmax's partials.
     Plain torch doubled a captured sampler step at bs 128 on a 248k vocab."""
     B, V = logits.shape
-    nsplit = _split_count(B, V, logits.device)
-    chunk = -(-V // nsplit)
+    nsplit, chunk = _split_layout(B, V, logits.device)
     f32 = dict(device=logits.device, dtype=torch.float32)
     cmax = torch.empty((B, nsplit), **f32)
     csum = torch.empty((B, nsplit), **f32)
@@ -1953,6 +1966,23 @@ class AcceleratorGraphableSampler(BaseSampler):
     # Set during graph capture, and used by the cuda graph runner to determine
     # whether requests' seen token buffers should be synced post-replay
     applied_penalty_in_graph: bool = False
+
+    def fused_draw_args(self, apply_filters: bool) -> FusedDrawArgs | None:
+        """What `sample` hands `fused_sample`, or None when `sample` does more than that one draw. The copy to
+        ``last_token_buf`` is left out: the resource decides whether anything reads it."""
+        if (
+            self.offset_buf.device.type != "cuda" or self.min_p_buf is not None or self.history is not None
+            or self.order is not None or self.ingraph_scatter or self.logprob_buf is not None
+            or (self.tp_group is not None and self.tp_group.world_size > 1)
+        ):
+            return None
+        top_k, top_p = self.top_k_buf, self.top_p_buf
+        if not apply_filters:
+            top_k, top_p = torch.zeros_like(top_k), torch.ones_like(top_p)
+        return FusedDrawArgs(self.temperature_buf, top_k, top_p, self.seed_buf, self.offset_buf)
+
+    def advance_offsets(self, draws: int) -> None:
+        self.offset_buf.add_(draws)  # a fused draw runs on CUDA, where a draw takes one offset
 
     def gather_in_graph(self) -> None:
         """Offsets of this step's rows off the master, inside the graph."""
@@ -3075,21 +3105,30 @@ class SamplerBuffers:
             0, self._slot_idx_gpu[cg_slot, :padded_bs] if index is None else index
         )
 
-    def _slots_of(self, request_ids: list[str]) -> torch.Tensor:
+    def _slots_of(
+        self, request_ids: list[str], kept_rids: "frozenset | None" = None,
+    ) -> torch.Tensor:
         slots = [
-            0 if isinstance(rid, int) and rid < 0 else self._rid_to_slot[rid]
+            0 if (isinstance(rid, int) and rid < 0)
+            or (kept_rids is not None and rid not in kept_rids)
+            else self._rid_to_slot[rid]
             for rid in request_ids
         ]
         return torch.tensor(slots, dtype=torch.long, device=self.last_token.master.device)
 
-    def write_last_tokens(self, request_ids: list[str], tokens: torch.Tensor) -> None:
+    def write_last_tokens(
+        self, request_ids: list[str], tokens: torch.Tensor,
+        kept_rids: "frozenset | None" = None,
+    ) -> None:
         """Eager-step write of ``tokens`` (``[len(request_ids)]``) to the
-        requests' master rows. Every request must be registered."""
+        requests' master rows. Every request must be registered. Rows outside
+        ``kept_rids`` go to the trash row, so their master rows stay unchanged."""
         if not request_ids:
             return
         self._sync_device_capacity()
         self.last_token.master.index_copy_(
-            0, self._slots_of(request_ids), tokens.to(self.last_token.master.dtype)
+            0, self._slots_of(request_ids, kept_rids),
+            tokens.to(self.last_token.master.dtype),
         )
 
     def last_tokens_for(self, request_ids: list[str]) -> torch.Tensor:

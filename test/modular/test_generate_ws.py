@@ -452,6 +452,50 @@ def test_data_that_is_not_base64_does_not_travel_back_from_the_pool(frame_pool, 
     assert len(message["files"][0]["data"]) < 16
 
 
+def test_a_socket_closed_while_its_files_decode_leaves_none(monkeypatch, tmp_path):
+    """Closing the socket cancels the message's task while the threadpool is
+    still writing its files, which the task never got to schedule for
+    cleanup: they are removed once the write is done."""
+    monkeypatch.setattr(entrypoint, "api_server", _FakeServer(tmp_path))
+    decoding, closed, unlinked = threading.Event(), threading.Event(), threading.Event()
+    decode, unlink = entrypoint._decode_ws_files, entrypoint.unlink_files
+
+    def slow(files, upload_dir):
+        decoding.set()
+        closed.wait(10)  # the socket closes, and its task is cancelled, first
+        return decode(files, upload_dir)
+
+    def unlink_files(file_paths):
+        unlink(file_paths)
+        unlinked.set()
+
+    monkeypatch.setattr(entrypoint, "_decode_ws_files", slow)
+    monkeypatch.setattr(entrypoint, "unlink_files", unlink_files)
+
+    class _Socket:
+        def __init__(self):
+            self.frames = [{"type": "websocket.receive", "text": json.dumps(
+                {"text": "hi", "files": [_OBS], "request_id": "r"})}]
+
+        async def accept(self):
+            pass
+
+        async def receive(self):
+            if self.frames:
+                return self.frames.pop()
+            await asyncio.to_thread(decoding.wait)
+            return {"type": "websocket.disconnect"}
+
+    async def run():
+        await entrypoint.generate_ws(_Socket())
+        await asyncio.sleep(0)  # the task takes its cancel
+        closed.set()
+        assert await asyncio.to_thread(unlinked.wait, 10), "nothing removed the decoded files"
+
+    asyncio.run(run())
+    assert list(tmp_path.iterdir()) == []
+
+
 class _ListeningFakeServer(_FakeServer):
     """A model with a client stream: requests stay open unless they end their input."""
     takes_stream_input = True
