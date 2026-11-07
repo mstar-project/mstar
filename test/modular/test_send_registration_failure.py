@@ -290,7 +290,7 @@ def _decode_step(rids, final_stream=()):
         per_rid_outputs={r: {"tok": [torch.tensor([r])]} for r in rids},
     )
     pending = SimpleNamespace(
-        batch=batch, node_batch=node_batch, node_name="llm",
+        batch=batch, group=None, node_batch=node_batch, node_name="llm",
         partition="p", graph_walk="decode", loop_name="decode",
         speculative_new_iter=False,
     )

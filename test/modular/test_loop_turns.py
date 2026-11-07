@@ -111,7 +111,7 @@ def _scheduler(runtime: _Runtime, order: StepOrder) -> tuple[MicroScheduler, Sim
 
 def _admitted(sched: MicroScheduler, batch: ScheduledBatch, refused: bool = False) -> None:
     """The worker's turn count once the step's admit has settled."""
-    pending = SimpleNamespace(batch=batch, node_batch=SimpleNamespace(
+    pending = SimpleNamespace(batch=batch, group=None, node_batch=SimpleNamespace(
         admit_error=object() if refused else None,
     ))
     Worker._count_turn(SimpleNamespace(scheduler=sched), pending)
