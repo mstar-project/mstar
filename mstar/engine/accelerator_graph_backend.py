@@ -5,7 +5,7 @@ from abc import ABC, abstractmethod
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from types import ModuleType
-from typing import Any, NamedTuple, Protocol, Sequence
+from typing import Any, Literal, NamedTuple, Protocol, Sequence
 
 import torch
 
@@ -16,6 +16,18 @@ class CapturedGraph(Protocol):
     def reset(self) -> None: ...
 
     def pool(self) -> Any: ...
+
+
+@dataclass(frozen=True)
+class GraphConditional:
+    """A native conditional over captures, reading a caller-owned scalar.
+
+    IF reads the predicate before entry; WHILE also reads it after each body.
+    The operation owns no request state and never launches its members itself.
+    """
+    kind: Literal["if", "while"]
+    predicate: torch.Tensor
+    body: tuple[CapturedGraph | tuple[torch.Tensor, torch.Tensor] | GraphConditional, ...]
 
 
 @dataclass
@@ -90,37 +102,57 @@ class _CUDAComposedGraph:
         self._graph, self._exec = ctypes.c_void_p(), ctypes.c_void_p()
         try:
             self._cuda._call("cudaGraphCreate", ctypes.byref(self._graph), ctypes.c_uint(0))
-            previous = None
-            for op in self._ops:
-                node = ctypes.c_void_p()
-                deps = None if previous is None else ctypes.byref(previous)
-                count = ctypes.c_size_t(int(previous is not None))
-                if isinstance(op, tuple):
-                    target, source = op
-                    words = copy_words(target, source)
-                    if (words is None or source.device != target.device or target.device.type != backend.device.type
-                            or (backend.device.index is not None and target.device.index != backend.device.index)):
-                        raise ValueError("a composed graph needs same-device contiguous-row copies without casts")
-                    dst, dst_pitch, src, src_pitch, width, rows = words
-                    params = _Memcpy3D(
-                        srcPtr=_PitchedPointer(src, src_pitch, width, rows),
-                        dstPtr=_PitchedPointer(dst, dst_pitch, width, rows),
-                        extent=_Dimensions(width, rows, 1), kind=3,  # cudaMemcpyDeviceToDevice
-                    )
-                    self._cuda._call("cudaGraphAddMemcpyNode", ctypes.byref(node), self._graph,
-                                     deps, count, ctypes.byref(params))
-                else:
-                    graph = int(op.raw_cuda_graph())
-                    if reason := self._cuda.node_refusal(graph):
-                        raise ValueError(f"a composed child capture is unsupported: {reason}")
-                    self._cuda._call("cudaGraphAddChildGraphNode", ctypes.byref(node), self._graph,
-                                     deps, count, ctypes.c_void_p(graph))
-                previous = node
+            self._append(self._graph.value, self._ops)
             self._cuda._call("cudaGraphInstantiateWithFlags", ctypes.byref(self._exec), self._graph,
                              ctypes.c_ulonglong(0))
         except BaseException:
             self.reset()
             raise
+
+    def _append(self, graph: int, ops) -> ctypes.c_void_p | None:
+        previous = None
+        for op in ops:
+            node = ctypes.c_void_p()
+            deps = None if previous is None else ctypes.byref(previous)
+            count = ctypes.c_size_t(int(previous is not None))
+            if isinstance(op, GraphConditional):
+                predicate = op.predicate
+                if (op.kind not in ("if", "while") or predicate.dtype != torch.int64 or predicate.numel() != 1
+                        or not self._same_device(predicate)):
+                    raise ValueError("a conditional graph needs IF/WHILE and one same-device int64 predicate")
+                handle = ctypes.c_ulonglong()
+                self._cuda._call("cudaGraphConditionalHandleCreate", ctypes.byref(handle), self._graph,
+                                 ctypes.c_uint(0), ctypes.c_uint(0))
+                setter = self._cuda.add_condition_setter(graph, previous, predicate, handle.value)
+                node, body = self._cuda.add_conditional(graph, setter, handle.value, int(op.kind == "while"))
+                last = self._append(body, op.body)
+                if op.kind == "while":
+                    self._cuda.add_condition_setter(body, last, predicate, handle.value)
+            elif isinstance(op, tuple):
+                target, source = op
+                words = copy_words(target, source)
+                if words is None or source.device != target.device or not self._same_device(target):
+                    raise ValueError("a composed graph needs same-device contiguous-row copies without casts")
+                dst, dst_pitch, src, src_pitch, width, rows = words
+                params = _Memcpy3D(
+                    srcPtr=_PitchedPointer(src, src_pitch, width, rows),
+                    dstPtr=_PitchedPointer(dst, dst_pitch, width, rows),
+                    extent=_Dimensions(width, rows, 1), kind=3,  # cudaMemcpyDeviceToDevice
+                )
+                self._cuda._call("cudaGraphAddMemcpyNode", ctypes.byref(node), ctypes.c_void_p(graph),
+                                 deps, count, ctypes.byref(params))
+            else:
+                child = int(op.raw_cuda_graph())
+                if reason := self._cuda.node_refusal(child):
+                    raise ValueError(f"a composed child capture is unsupported: {reason}")
+                self._cuda._call("cudaGraphAddChildGraphNode", ctypes.byref(node), ctypes.c_void_p(graph),
+                                 deps, count, ctypes.c_void_p(child))
+            previous = node
+        return previous
+
+    def _same_device(self, tensor: torch.Tensor) -> bool:
+        device = self._backend.device
+        return tensor.device.type == device.type and (device.index is None or tensor.device.index == device.index)
 
     def replay(self) -> None:
         self._cuda.launch(self._exec.value, self._backend.raw_stream())
@@ -209,7 +241,9 @@ class AcceleratorGraphBackend(ABC):
         """What ``mstar_rust.launch_run`` needs to launch ``graph`` on the current stream."""
         raise NotImplementedError(self.launch_refusal())
 
-    def compose(self, ops: Sequence[CapturedGraph | tuple[torch.Tensor, torch.Tensor]]) -> CapturedGraph:
+    def compose(
+        self, ops: Sequence[CapturedGraph | tuple[torch.Tensor, torch.Tensor] | GraphConditional],
+    ) -> CapturedGraph:
         """Lower ordered captured members/copies to one backend graph."""
         raise NotImplementedError(f"{type(self).__name__} cannot compose captured members")
 
@@ -318,7 +352,9 @@ class CUDAGraphBackend(_TorchGraphBackend):
     def create_graph(self, keep_graph: bool = False) -> CapturedGraph:
         return self._runtime.CUDAGraph(keep_graph=keep_graph)
 
-    def compose(self, ops: Sequence[CapturedGraph | tuple[torch.Tensor, torch.Tensor]]) -> CapturedGraph:
+    def compose(
+        self, ops: Sequence[CapturedGraph | tuple[torch.Tensor, torch.Tensor] | GraphConditional],
+    ) -> CapturedGraph:
         return _CUDAComposedGraph(self, ops)
 
     def _runtime_entry(self, name: str) -> int:

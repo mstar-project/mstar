@@ -260,6 +260,13 @@ items, including overlap and final tails. Settlement applies only the selected
 history after the actual items and producer completion have been published;
 run-budget exhaustion alone never finishes a stream.
 
+The capture backend can lower nested IF/WHILE operations directly into one
+native graph. Predicates remain caller-owned resident scalar buffers; existing
+member captures remain ordinary child graphs. A conditional executable is
+never embedded as a child. This backend capability alone does not enable a
+streaming execution unit: its policy receipts, owner lifetimes and graph
+completion still have to be wired through the engine.
+
 Preparation may structurally pack future inputs with real values; arithmetic
 on future values, mutable model request state, host reads of future positions,
 and uncaptured producer output transformations use ordinary execution. The

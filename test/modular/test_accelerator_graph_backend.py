@@ -10,6 +10,7 @@ import torch
 from mstar.engine.accelerator_graph_backend import (
     AcceleratorGraphBackend,
     CUDAGraphBackend,
+    GraphConditional,
     XPUGraphBackend,
     get_accelerator_graph_backend,
 )
@@ -410,3 +411,83 @@ def test_composed_cuda_captures_keep_each_round_and_reuse_both_slots(monkeypatch
     for got, want in zip(retained, expected, strict=True):
         for member_got, member_want in zip(got, want, strict=True):
             torch.testing.assert_close(member_got, member_want)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="real CUDA conditional composition")
+def test_one_cuda_launch_gates_members_independently_and_drains_without_producing(monkeypatch):
+    """Nested IFs are constructed in the WHILE body, never launched as child runs."""
+    backend = get_accelerator_graph_backend(torch.device("cuda:0"))
+    device = backend.device
+    produced, consumed, remaining = (torch.zeros(1, device=device, dtype=torch.int64) for _ in range(3))
+    producer_cap, consumer_cap = (torch.ones_like(produced) for _ in range(2))
+    active, producer_ready, consumer_ready = (torch.zeros_like(produced) for _ in range(3))
+    ring, output, order = (torch.zeros(16, device=device, dtype=torch.int64) for _ in range(3))
+    order_count = torch.zeros_like(produced)
+
+    def ready_a():
+        producer_ready.copy_(produced < producer_cap)
+
+    def ready_b():
+        consumer_ready.copy_((consumed < produced) & (consumed < consumer_cap))
+
+    def more():
+        active.copy_(((produced < producer_cap) | ((consumed < produced) & (consumed < consumer_cap)))
+                     & (remaining > 0))
+
+    def producer():
+        ring.scatter_(0, produced.clamp(0, 15), produced + 10)
+        order.scatter_(0, order_count.clamp(0, 15), produced + 100)
+        order_count.add_(1)
+        produced.add_(1)
+
+    def consumer():
+        output.scatter_(0, consumed.clamp(0, 15), ring.gather(0, consumed.clamp(0, 15)) * 2)
+        order.scatter_(0, order_count.clamp(0, 15), consumed + 200)
+        order_count.add_(1)
+        consumed.add_(1)
+
+    def boundary():
+        remaining.sub_(1)
+        more()
+
+    graphs = [capture_into_graph(fn, backend.graph_pool_handle(), device, None, keep_graph=True)[0]
+              for fn in (more, ready_a, producer, ready_b, consumer, boundary)]
+    graph = backend.compose((graphs[0], GraphConditional("while", active, (
+        graphs[1], GraphConditional("if", producer_ready, (graphs[2],)),
+        graphs[3], GraphConditional("if", consumer_ready, (graphs[4],)), graphs[5],
+    ))))
+    launches = []
+    cuda = backend.while_runtime()
+    launch = cuda.launch
+    monkeypatch.setattr(cuda, "launch", lambda *args: (launches.append(args[0]), launch(*args))[-1])
+    # Normal interleaving, independent consumer stop, preexisting consumer-only
+    # drain, empty entry, then a short reservation followed by ordinary reuse.
+    cases = [(0, 3, 3, 8), (0, 4, 2, 8), (2, 2, 2, 8), (0, 0, 0, 8), (0, 4, 4, 2), (0, 1, 1, 8)]
+    for initial, a_limit, b_limit, budget in cases:
+        produced.fill_(initial)
+        consumed.zero_()
+        remaining.fill_(budget)
+        producer_cap.fill_(a_limit)
+        consumer_cap.fill_(b_limit)
+        ring.copy_(torch.arange(16, device=device) + 10)
+        output.zero_()
+        order.zero_()
+        order_count.zero_()
+        graph.replay()
+        backend.synchronize()
+        a, b, turns, expected = initial, 0, 0, []
+        while turns < budget and (a < a_limit or (b < a and b < b_limit)):
+            if a < a_limit:
+                expected.append(100 + a)
+                a += 1
+            if b < a and b < b_limit:
+                expected.append(200 + b)
+                b += 1
+            turns += 1
+        assert (produced.item(), consumed.item(), remaining.item()) == (a, b, budget - turns)
+        assert order[:len(expected)].tolist() == expected
+        assert order_count.item() == len(expected)
+        assert output[:b].tolist() == [2 * (10 + i) for i in range(b)]
+        assert not output[b:].any()
+    assert len(launches) == len(cases) and len(set(launches)) == 1
+    graph.reset()
