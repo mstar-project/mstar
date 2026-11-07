@@ -208,9 +208,9 @@ async def parse_frame(payload: bytes | str, upload_dir: Path):
     """A frame's message. A large frame parses in the pool, its files' data
     already saved under ``upload_dir`` (``SavedUpload``). Raises what the parse
     raises, and ``OSError`` when it could not be handed off, or a pool process
-    died: that fails every frame the pool held, on any socket, and a new pool
-    takes the next."""
-    global _pool
+    died with the frame in the pool: that fails every frame the pool held, on
+    any socket, and a new pool takes the next. A pool found dead at the hand-off
+    held nothing of this frame's, which goes to a new pool."""
     binary = not isinstance(payload, str)
     if len(payload) < (OFF_LOOP_BINARY_BYTES if binary else OFF_LOOP_TEXT_BYTES):
         return parse(payload)
@@ -224,7 +224,12 @@ async def parse_frame(payload: bytes | str, upload_dir: Path):
     try:
         await loop.run_in_executor(None, _write_frame, payload, frame)
         pool = _pool
-        future = pool.submit(_parse_saving_files, frame, binary, str(upload_dir))
+        try:
+            future = pool.submit(_parse_saving_files, frame, binary, str(upload_dir))
+        except BrokenProcessPool:
+            _replace(pool)
+            pool = _pool
+            future = pool.submit(_parse_saving_files, frame, binary, str(upload_dir))
         # Whatever ends the parse (it raised, its result couldn't be sent, its
         # process died), files no message came back to own go with it, also
         # when this frame's socket stopped waiting long before.
@@ -233,14 +238,20 @@ async def parse_frame(payload: bytes | str, upload_dir: Path):
         )
         return await asyncio.wrap_future(future)
     except BrokenProcessPool:
-        if _pool is pool:
-            logger.error("A /generate/ws frame parser process died; starting a new pool")
-            pool.shutdown(wait=False, cancel_futures=True)
-            _pool = None
-            start()
+        _replace(pool)
         raise OSError("the frame's parser process died") from None
     finally:
         _unlink(frame)
+
+
+def _replace(pool: ProcessPoolExecutor) -> None:
+    """Start a new pool in place of broken ``pool``, unless a frame already has."""
+    global _pool
+    if _pool is pool:
+        logger.error("A /generate/ws frame parser process died; starting a new pool")
+        pool.shutdown(wait=False, cancel_futures=True)
+        _pool = None
+        start()
 
 
 def _sweep(upload_dir: Path, stem: str) -> None:

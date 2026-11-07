@@ -299,6 +299,14 @@ def test_uploads_are_cleaned_up(monkeypatch, tmp_path, off_loop):
     assert saved == ["a.png", "b.wav"], saved
 
 
+async def _saved(task: asyncio.Task, upload_dir: Path) -> None:
+    """Until ``task``'s parse has saved its first file, ``a.png``."""
+    deadline = time.monotonic() + 30
+    while not any(p.name.endswith("_a.png") for p in upload_dir.iterdir()):
+        assert not task.done() and time.monotonic() < deadline, "the first file was never saved"
+        await asyncio.sleep(0.001)
+
+
 def test_a_large_frame_parses_while_the_loop_keeps_serving(frame_pool, tmp_path):
     """json.loads and base64 decoding hold the GIL, so a thread can't take a
     large frame off the loop: a 100 MiB message stalled every request for
@@ -334,19 +342,44 @@ def test_a_frame_in_flight_when_a_parser_process_dies_fails_and_a_new_pool_takes
     frame_pool, monkeypatch, tmp_path,
 ):
     _every_frame_off_the_loop(monkeypatch)
+    frame = json.dumps({"files": [
+        {"name": "a.png", "data": "QUJD"},
+        {"name": "b.png", "data": base64.b64encode(bytes(64 << 20)).decode()},
+    ]})
+
+    async def kill_a_process_mid_parse():
+        broken = ws_frames._pool
+        task = asyncio.create_task(ws_frames.parse_frame(frame, tmp_path))
+        await _saved(task, tmp_path)
+        for process in broken._processes.values():
+            process.kill()
+        with pytest.raises(OSError, match="parser process died"):
+            await task
+        assert ws_frames._pool not in (None, broken)
+        return await ws_frames.parse_frame('{"text": "next"}', tmp_path)
+
+    assert asyncio.run(kill_a_process_mid_parse()) == {"text": "next"}
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_a_frame_after_a_parser_process_died_idle_goes_to_a_new_pool(frame_pool, monkeypatch, tmp_path):
+    """The dead pool held nothing of this frame's, so it has no reason to fail."""
+    _every_frame_off_the_loop(monkeypatch)
 
     async def kill_a_process_then_parse():
         broken = ws_frames._pool
         broken.submit(ws_frames.parse, b"\x80").result()  # a process is up
         for process in broken._processes.values():
             process.kill()
-        with pytest.raises(OSError, match="parser process died"):
-            await ws_frames.parse_frame('{"text": "lost"}', tmp_path)
+        deadline = time.monotonic() + 30
+        while not broken._broken:
+            assert time.monotonic() < deadline, "the pool never saw its process die"
+            await asyncio.sleep(0.001)
+        message = await ws_frames.parse_frame('{"text": "next"}', tmp_path)
         assert ws_frames._pool not in (None, broken)
-        return await ws_frames.parse_frame('{"text": "next"}', tmp_path)
+        return message
 
     assert asyncio.run(kill_a_process_then_parse()) == {"text": "next"}
-    assert list(tmp_path.iterdir()) == []
 
 
 def test_a_file_that_cannot_be_saved_refuses_its_message_and_leaves_nothing(monkeypatch, tmp_path, off_loop):
@@ -383,10 +416,7 @@ def test_a_parse_its_socket_stopped_waiting_for_still_takes_its_files_with_it(fr
 
     async def cancel_once_saved():
         task = asyncio.create_task(ws_frames.parse_frame(frame, tmp_path))
-        deadline = time.monotonic() + 30
-        while not any(p.name.endswith("_a.png") for p in tmp_path.iterdir()):
-            assert not task.done() and time.monotonic() < deadline, "the first file was never saved"
-            await asyncio.sleep(0.001)
+        await _saved(task, tmp_path)
         task.cancel()
         for process in ws_frames._pool._processes.values():
             process.kill()
