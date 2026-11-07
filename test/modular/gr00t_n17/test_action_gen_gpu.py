@@ -1,9 +1,9 @@
 """GR00T N1.7's whole ``action_gen`` loop on the GPU, against NVIDIA's reference recordings.
 
 ``test_dit_gpu.py`` pins one DT forward. This file pins the four ``denoise`` iterations
-(``Gr00tN17DenoiseStepSubmodule``) from the seeded noise to the served chunk, then ``unapply`` to
-joint values, and checks that batching two requests, or two rows at different loop iterations,
-changes neither row.
+(``Gr00tN17DenoiseStepSubmodule``) in plain bf16, outside the served autocast, from the seeded noise
+to the action chunk, then ``unapply`` to joint values, and checks that batching two requests, or two
+rows at different loop iterations, changes neither row.
 
 The recordings (outside the repo) are NVIDIA's ``gr00t`` code run on M\\*'s stack, one per DROID
 request: ``oracle_{fp32,bf16}`` from the recorded noise, ``oracle_{fp32,bf16}_seedN`` from the

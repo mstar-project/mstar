@@ -52,11 +52,12 @@ class Gr00tN17VisionEncoderSubmodule(NodeSubmodule):
     the embeddings the LLM scatters onto its image rows plus the three
     DeepStack features it adds after its first three layers.
 
-    Shaped after ``qwen3_5``'s ``VisionEncoderSubmodule``, which drives the same
-    tower: the grid maths runs here rather than in the forward, where a
-    ``.tolist()`` would break the graph and leave h, w as symints inductor
-    cannot codegen from. This node is not captured, so there is no piecewise
-    config, and it takes one request a step (``can_batch`` stays off).
+    The grid maths runs here rather than in the forward, where a ``.tolist()``
+    would break the graph and leave h, w as symints inductor cannot codegen from.
+    That read waits on the device, once per request: ``qwen3_5``, on the same
+    tower, carries its grids in ``step_metadata`` instead. This node is not
+    captured, so there is no piecewise config, and it takes one request a step
+    (``can_batch`` stays off).
     """
 
     def __init__(
