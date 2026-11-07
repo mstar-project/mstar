@@ -702,6 +702,16 @@ class LLMSubmodule(ARNodeSubmodule):
         return super().speculative_input_seq_len(graph_walk, fwd_info, prev_seq_len)
 
 
+class TextOnlyLLMSubmodule(LLMSubmodule):
+    """The LLM node of a text-only deployment (Qwen3.5-MoE): no ``prefill_vision`` walk to capture."""
+
+    def get_accelerator_graph_configs(
+        self, device: torch.device, tp_world_size: int = 1,
+    ) -> list[AcceleratorGraphConfig]:
+        configs = super().get_accelerator_graph_configs(device, tp_world_size)
+        return [c for c in configs if c.capture_graph_walk != "prefill_vision"]
+
+
 # The vision tower's block loop, as a piecewise capture region
 VISION_BLOCK_LOOP = "vision_block_loop"
 

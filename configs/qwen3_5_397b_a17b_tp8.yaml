@@ -1,0 +1,29 @@
+model: "qwen3_5_moe"
+# Qwen3.5-397B-A17B on 8 GPUs, text only (no vision_encoder node). The
+# registry's checkpoint is nvidia/Qwen3.5-397B-A17B-NVFP4-V2 (~230 GB): its
+# routed experts serve NVFP4 (B200 / B300) and its fp8 linears fp8 as stored.
+# model_kwargs.checkpoint_path serves a local snapshot, or another checkpoint
+# of the family (Qwen/Qwen3.5-397B-A17B-FP8 serves block fp8).
+max_seq_len: 4096
+# a 230 GB load can outrun PyTorch's default process-group timeout
+dist_timeout_s: 7200
+# Raise the gen-0 GC threshold: at CPython's 700 a 128-row decode step
+# collects almost every step and runs a full collection every few hundred.
+knobs:
+  gc_gen0_threshold: 50000
+model_kwargs:
+  # checkpoint_path: /path/to/Qwen3.5-397B-A17B-NVFP4-V2
+  # The LLM's 2048-token step budget caps prefill and mixed steps, so no
+  # bucket past 2176 is reached (see configs/qwen3_5_9b_tp2.yaml).
+  prefill_token_buckets: [32, 64, 128, 256, 512, 1024, 2048, 2176]
+quantization: auto
+node_groups:
+  - node_names: [LLM]
+    ranks: [0, 1, 2, 3, 4, 5, 6, 7]
+    tp_size: 8
+
+resources:
+  gdn_state:
+    # 128 requests in flight and the sink
+    max_slots: 129
+    # state_dtype: bfloat16  # default: the checkpoint's mamba_ssm_dtype (float32)

@@ -116,6 +116,7 @@ def _resolve_model_metadata(repo_id: str, cache_dir: str | None) -> str:
             "preprocessor_config.json",
             "video_preprocessor_config.json",
             "tokenizer_config.json",
+            "chat_template.jinja",
             "vocab.json",
             "tokenizer.json",
             "merges.txt",
@@ -158,7 +159,6 @@ IMAGE_GRIDS_KEY, VIDEO_GRIDS_KEY = "image_grids", "video_grids"
 STEP_GRIDS_KEY = "step_grids"
 
 
-# TODO: implement MoE variants
 class Qwen3_5DenseModel(Model):
     # Image preprocessing is a few small ops per request, and a thread per
     # core only slows them: each op waits on whichever thread a co-tenant
@@ -622,12 +622,12 @@ class Qwen3_5DenseModel(Model):
             # the decoded frames are spent; don't hold them for the request's life
             result["video_inputs"] = []
         walk = "prefill_vision" if images or videos else "prefill_text"
-        merge = self.vision_config.spatial_merge_size
         owners = group_owners(groups)
 
         def media(step: PromptPart) -> tuple[Span]:
             # A span is the merged tokens and two sentinels, and each temporal group of a video
             # is placed like a one-frame image.
+            merge = self.vision_config.spatial_merge_size
             video = step.modality == VIDEO
             t, h, w = video_grids[owners[step.index]] if video else image_grids[step.index]
             grid = torch.tensor((1 if video else t, h, w))
@@ -948,12 +948,14 @@ class Qwen3_5DenseModel(Model):
     def get_quantization_roots(self):
         from mstar.model.loader.base import CheckpointRules
         from mstar.model.qwen3_5.components.language_model import QUANTIZABLE_LINEARS
-        from mstar.model.qwen3_5.weight_loader import _STACKED_PARAMS, qwen3_5_name_remapper
+        from mstar.model.qwen3_5.weight_loader import qwen3_5_name_remapper, stacked_params
         from mstar.quantization.resolve import QuantizationRoot
 
         return [QuantizationRoot(
             node="LLM", root_type=Qwen3_5ForCausalLM, linears=QUANTIZABLE_LINEARS,
-            rules=CheckpointRules(stacked_params=tuple(_STACKED_PARAMS), remap=qwen3_5_name_remapper),
+            rules=CheckpointRules(
+                stacked_params=tuple(stacked_params(self.config.num_experts)), remap=qwen3_5_name_remapper,
+            ),
             # the metadata snapshot is the full one once a worker has fetched it
             checkpoint_dir=lambda: getattr(self, "local_dir", None),
             build=lambda comm_group: Qwen3_5ForCausalLM(self.config, comm_group),
@@ -964,10 +966,7 @@ class Qwen3_5DenseModel(Model):
         autocast_dtype: torch.dtype | None = None,
         tp_group=None,
     ) -> NodeSubmodule | None:
-        from mstar.model.qwen3_5.submodules import (
-            LLMSubmodule,
-            VisionEncoderSubmodule,
-        )
+        from mstar.model.qwen3_5.submodules import VisionEncoderSubmodule
 
         if node_name not in ("LLM", "vision_encoder"):
             return None
@@ -1010,6 +1009,11 @@ class Qwen3_5DenseModel(Model):
             # collective over the TP group; every rank builds the LLM here
             tp_group.init_allreduce_fusion(self.config.hidden_size, dtype)
         logger.info("Loaded Qwen3.5 LLM submodule onto %s", device)
+        return self._llm_submodule(model)
+
+    def _llm_submodule(self, model: Qwen3_5ForCausalLM) -> NodeSubmodule:
+        from mstar.model.qwen3_5.submodules import LLMSubmodule
+
         return LLMSubmodule(
             model, self.config, self.vision_config,
             prefill_token_buckets=self.prefill_token_buckets,

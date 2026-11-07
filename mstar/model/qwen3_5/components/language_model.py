@@ -29,6 +29,7 @@ from mstar.model.components.distributed.linear_attn import ParallelGatedDeltaNet
 from mstar.model.components.distributed.mlp import ParallelGatedMLP
 from mstar.model.components.linear_attn import GDNProjLayout
 from mstar.model.components.quant_linear import QuantizableLinears
+from mstar.model.qwen3_5.components.moe import Qwen3_5SparseMoeBlock
 from mstar.model.qwen3_5.components.rope import (
     apply_partial_mrope,
     compute_3d_cos_sin,
@@ -143,6 +144,8 @@ def _norm(config: Qwen3_5Config) -> RMSNorm:
 
 
 def _build_mlp(config: Qwen3_5Config, comm_group: CommGroup) -> nn.Module:
+    if config.is_moe:
+        return Qwen3_5SparseMoeBlock(config, comm_group)
     # fused gate/up; see `weight_loader._STACKED_PARAMS`
     return ParallelGatedMLP(
         hidden_size=config.hidden_size,
@@ -246,7 +249,9 @@ class Qwen3_5LanguageModel(nn.Module):
             mixer = layer.self_attn
             out = mixer.o_proj if hasattr(mixer, "o_proj") else mixer.out_proj
             out.reduce_results = False
-            layer.mlp.down_proj.reduce_results = False
+            if not config.is_moe:
+                # (a MoE block returns its partial sum as built)
+                layer.mlp.down_proj.reduce_results = False
 
     def build_cos_sin(
         self, position_ids_3d: torch.Tensor, dtype: torch.dtype,
@@ -278,8 +283,11 @@ class Qwen3_5LanguageModel(nn.Module):
 # tied checkpoints) stays bf16, as in Qwen's own FP8 checkpoints.
 # The delta net's fused input projection [q|k|v|z|a|pad|b] takes a format on q|k|v|z (128-row multiples per rank)
 # and keeps its a / pad / b gate rows bf16, as Qwen's FP8 checkpoint stores them (vLLM's in_proj_qkvz / in_proj_ba).
+# A MoE layer's routed experts (`mlp.experts`) and shared expert may too; its shared expert's one-row sigmoid gate
+# stays bf16, as both of Qwen3.5-397B's quantized checkpoints keep it (the router is no linear).
 QUANTIZABLE_LINEARS = QuantizableLinears(
-    candidates=("model.layers.*.self_attn.*", "model.layers.*.mlp.*"), keep_bf16=("lm_head",),
+    candidates=("model.layers.*.self_attn.*", "model.layers.*.mlp.*", "model.layers.*.mlp.shared_expert.*"),
+    keep_bf16=("lm_head", "model.layers.*.mlp.shared_expert_gate"),
     bf16_tails={"model.layers.*.self_attn.in_proj_fused": 3},
 )
 
