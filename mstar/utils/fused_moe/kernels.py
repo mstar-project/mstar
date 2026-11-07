@@ -34,6 +34,7 @@ import triton.language as tl
 from mstar.kernels import Impl, KernelOp, TableEntry, Target, Tolerance, register
 from mstar.kernels.registry import on_reset
 from mstar.utils.quant_fp8 import FP8_DTYPE
+from mstar.utils.situ import SiTU
 
 # ---------------------------------------------------------------------------
 # Main grouped-GEMM kernel (used for both gate_up and down projections)
@@ -442,13 +443,15 @@ def _tanh(x):
 
 
 @triton.jit
-def _apply_activation(x, ACTIVATION_TYPE: tl.constexpr):
+def _apply_activation(x, ACTIVATION_TYPE: tl.constexpr, SITU_BETA):
     x = x.to(tl.float32)
     if ACTIVATION_TYPE == "silu":
         return x * tl.sigmoid(x)
     elif ACTIVATION_TYPE == "gelu":
         k = 0.7978845608028654  # sqrt(2/pi)
         return 0.5 * x * (1.0 + _tanh(k * (x + 0.044715 * x * x * x)))
+    elif ACTIVATION_TYPE == "situ":
+        return SITU_BETA * _tanh(x / SITU_BETA) * tl.sigmoid(x)
     else:
         tl.static_assert(False, "Unsupported activation")
         return x
@@ -460,16 +463,20 @@ def act_and_mul_kernel(
     down_input_ptr,
     hidden_size,
     SWIGLU_LIMIT,
+    SITU_BETA,
+    SITU_LINEAR_BETA,
     BLOCK_SIZE: tl.constexpr,
     ACTIVATION_TYPE: tl.constexpr,
     HAS_SWIGLU_CLAMP: tl.constexpr,
+    HAS_SITU_LINEAR_BETA: tl.constexpr,
 ):
-    """Per-slot SwiGLU activation.
+    """Per-slot gated activation.
 
     Input ``gateup_output`` has layout ``(M*topk, 2*inter)`` with the
     gate half in columns ``[0:inter]`` and the up half in columns
     ``[inter:2*inter]``.  Writes ``act(gate) * up`` to ``down_input`` of
-    shape ``(M*topk, inter)``.
+    shape ``(M*topk, inter)``. SiTU (``mstar.utils.situ``) also bends the up
+    half, ``lb * tanh(up / lb)``, and multiplies in fp32 as its reference does.
     """
     in_dtype = gateup_output_ptr.dtype.element_ty
     out_dtype = down_input_ptr.dtype.element_ty
@@ -489,23 +496,31 @@ def act_and_mul_kernel(
         if HAS_SWIGLU_CLAMP:
             gate = tl.minimum(gate, SWIGLU_LIMIT)
             up = tl.maximum(tl.minimum(up, SWIGLU_LIMIT), -SWIGLU_LIMIT)
-        activated = _apply_activation(gate, ACTIVATION_TYPE).to(in_dtype)
-        out = activated * up
+        if ACTIVATION_TYPE == "situ":
+            up32 = up.to(tl.float32)
+            if HAS_SITU_LINEAR_BETA:
+                up32 = SITU_LINEAR_BETA * _tanh(up32 / SITU_LINEAR_BETA)
+            out = _apply_activation(gate, ACTIVATION_TYPE, SITU_BETA) * up32
+        else:
+            activated = _apply_activation(gate, ACTIVATION_TYPE, SITU_BETA).to(in_dtype)
+            out = activated * up
         tl.store(out_row + offset, out.to(out_dtype), mask=mask)
 
 
 def act_and_mul_triton(
     gateup_output: torch.Tensor,
     down_input: torch.Tensor,
-    activation: str = "silu",
+    activation: "str | SiTU" = "silu",
     swiglu_limit: float | None = None,
 ) -> None:
-    """Launch SwiGLU with an optional pre-activation clamp."""
+    """Launch the gated activation (``silu``, ``gelu`` or a ``SiTU`` spec) with an optional
+    pre-activation clamp."""
     assert gateup_output.is_contiguous()
     assert down_input.is_contiguous()
     assert gateup_output.shape[0] == down_input.shape[0]
     assert gateup_output.shape[1] == 2 * down_input.shape[1]
 
+    situ = activation if isinstance(activation, SiTU) else None
     grid = (down_input.shape[0],)
     hidden_size = gateup_output.shape[1]
     act_and_mul_kernel[grid](
@@ -513,9 +528,12 @@ def act_and_mul_triton(
         down_input,
         hidden_size,
         0.0 if swiglu_limit is None else swiglu_limit,
+        1.0 if situ is None else situ.beta,
+        1.0 if situ is None or situ.linear_beta is None else situ.linear_beta,
         BLOCK_SIZE=512,
-        ACTIVATION_TYPE=activation,
+        ACTIVATION_TYPE="situ" if situ is not None else activation,
         HAS_SWIGLU_CLAMP=swiglu_limit is not None,
+        HAS_SITU_LINEAR_BETA=situ is not None and situ.linear_beta is not None,
     )
 
 

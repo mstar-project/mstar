@@ -68,6 +68,7 @@ flag on the block.
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 
 import torch
 import torch.nn.functional as F
@@ -296,6 +297,15 @@ class NoAuxTcRouter(nn.Module):
         return topk_weights, topk_ids, None
 
 
+def _gated(gate_up: torch.Tensor, activation: str | Callable) -> torch.Tensor:
+    """``act(gate) * up`` of a ``(..., 2 * inter)`` gate|up row: ``silu``, or a callable taking
+    both halves (``mstar.utils.situ.SiTU``)."""
+    gate, up = gate_up.chunk(2, dim=-1)
+    if activation == "silu":
+        return F.silu(gate) * up
+    return activation(gate, up)
+
+
 def dispatch_experts_fused(
     hidden_states: torch.Tensor,
     gate_up_proj: torch.Tensor,
@@ -304,6 +314,7 @@ def dispatch_experts_fused(
     selected_experts: torch.Tensor,
     routing_weights: torch.Tensor,
     skip_invalid: bool = False,
+    activation: str | Callable = "silu",
 ) -> torch.Tensor:
     """Naive per-expert dispatch using the fused HF checkpoint layout.
 
@@ -319,6 +330,7 @@ def dispatch_experts_fused(
         routing_weights: ``(tokens, top_k)`` float.
         skip_invalid: set when ``selected_experts`` may hold the EP
             sentinel ``num_experts``; those slots contribute nothing.
+        activation: ``silu`` (SwiGLU) or a callable on the gate and up halves.
     """
     final_hidden_states = torch.zeros_like(hidden_states)
 
@@ -336,8 +348,7 @@ def dispatch_experts_fused(
         current_state = hidden_states[token_idx]
 
         gate_up = torch.mm(current_state, gate_up_proj[expert_idx].T)
-        gate, up = gate_up.chunk(2, dim=-1)
-        current_hidden_states = torch.mm(F.silu(gate) * up, down_proj[expert_idx].T)
+        current_hidden_states = torch.mm(_gated(gate_up, activation), down_proj[expert_idx].T)
         current_hidden_states = current_hidden_states * routing_weights[token_idx, top_k_pos, None]
         final_hidden_states.index_add_(
             0, token_idx, current_hidden_states.to(final_hidden_states.dtype),
@@ -373,16 +384,19 @@ def _dispatch(
     routing_weights: torch.Tensor,
     skip_invalid: bool = False,
     alignment: "MoeAlignment | None" = None,
+    activation: str | Callable = "silu",
 ) -> torch.Tensor:
     """Pick fused-Triton if available, otherwise the naive loop."""
     if _HAS_FUSED and hidden_states.is_cuda:
         return _fused_experts(
             hidden_states, gate_up_proj, down_proj,
             routing_weights, selected_experts, skip_invalid=skip_invalid, alignment=alignment,
+            activation=activation,
         )
     return dispatch_experts_fused(
         hidden_states, gate_up_proj, down_proj,
         num_experts, selected_experts, routing_weights, skip_invalid=skip_invalid,
+        activation=activation,
     )
 
 
@@ -663,7 +677,9 @@ class ParallelSparseMoeBlock(nn.Module):
         norm_topk_prob: bool = True,
         router: nn.Module | None = None,
         comm_group: CommGroup | None = None,
+        activation: str | Callable = "silu",
     ) -> None:
+        """``activation``: the experts' gated activation, ``silu`` or a ``SiTU`` spec."""
         super().__init__()
         if comm_group is None:
             comm_group = CommGroup.trivial()
@@ -675,6 +691,7 @@ class ParallelSparseMoeBlock(nn.Module):
         self.num_experts = num_experts
         self.num_experts_per_tok = num_experts_per_tok
         self.moe_intermediate_size = moe_intermediate_size
+        self.activation = activation
 
         self.gate = router if router is not None else TopKRouter(
             hidden_size=hidden_size,
@@ -722,26 +739,40 @@ class ParallelSparseMoeBlock(nn.Module):
         input_shape = hidden_states.shape
         hidden_dim = hidden_states.shape[-1]
         flat = hidden_states.view(-1, hidden_dim).contiguous()
-        skip = token_valid is not None
-        # the mask below moves experts after routing, and TP's dispatch aligns for itself
-        can_align = not skip and self.comm_group.world_size == 1
+        # the padding mask moves experts after routing, and TP's dispatch aligns for itself
+        can_align = token_valid is None and self.comm_group.world_size == 1
         routing_weights, selected_experts, router_states_next, alignment = _route(
             self.gate, flat, self.experts.gate_up_proj if can_align else None, router_states,
         )
+        out = self.experts_forward(
+            flat, routing_weights, selected_experts, token_valid=token_valid, alignment=alignment,
+        ).view(input_shape)
+        return (out, router_states_next) if return_router_states else out
+
+    def experts_forward(
+        self,
+        flat: torch.Tensor,
+        routing_weights: torch.Tensor,
+        selected_experts: torch.Tensor,
+        *,
+        token_valid: torch.Tensor | None = None,
+        alignment: "MoeAlignment | None" = None,
+    ) -> torch.Tensor:
+        """The routed experts on ``flat (tokens, hidden)`` given each token's top-k, summed over
+        the ranks: ``forward`` after its router, for a block whose router reads another input
+        (a latent MoE routes on the hidden state and runs its experts on a projection of it)."""
+        skip = token_valid is not None
         if skip:
             selected_experts, routing_weights = _mask_padding(
                 selected_experts, routing_weights, token_valid, self.num_experts,
             )
-
         if self.comm_group.world_size == 1:
-            out = _dispatch(
+            return _dispatch(
                 flat, self.experts.gate_up_proj, self.experts.down_proj,
                 self.num_experts, selected_experts, routing_weights, skip_invalid=skip, alignment=alignment,
+                activation=self.activation,
             )
-        else:
-            out = self._dispatch_tp(flat, routing_weights, selected_experts, skip_invalid=skip)
-        out = out.view(input_shape)
-        return (out, router_states_next) if return_router_states else out
+        return self._dispatch_tp(flat, routing_weights, selected_experts, skip_invalid=skip)
 
     def _dispatch_tp(
         self, flat: torch.Tensor,
@@ -749,13 +780,20 @@ class ParallelSparseMoeBlock(nn.Module):
         selected_experts: torch.Tensor,
         skip_invalid: bool = False,
     ) -> torch.Tensor:
+        if not flat.is_cuda:
+            # the naive loop over this rank's slice of every expert (CPU tests)
+            output = dispatch_experts_fused(
+                flat, self.experts.gate_up_proj, self.experts.down_proj, self.num_experts,
+                selected_experts, routing_weights, skip_invalid=skip_invalid, activation=self.activation,
+            )
+            return self.comm_group.all_reduce(output)
         from mstar.utils.fused_moe import fused_experts, moe_sum_reduce_triton
 
         # (tokens, top_k, hidden) — partial results before reduce
         cache3 = fused_experts(
             flat, self.experts.gate_up_proj, self.experts.down_proj,
             routing_weights, selected_experts, reduce_results=False,
-            skip_invalid=skip_invalid,
+            skip_invalid=skip_invalid, activation=self.activation,
         )
         output = torch.empty_like(flat)
         moe_sum_reduce_triton(cache3, output, routed_scaling_factor=1.0)
@@ -955,6 +993,7 @@ class ExpertParallelSparseMoeBlock(nn.Module):
         router: nn.Module | None = None,
         comm_group: CommGroup | None = None,
         track_expert_load: bool = False,
+        activation: str | Callable = "silu",
     ) -> None:
         super().__init__()
         if comm_group is None:
@@ -965,6 +1004,7 @@ class ExpertParallelSparseMoeBlock(nn.Module):
         self.num_experts = num_experts
         self.num_experts_per_tok = num_experts_per_tok
         self.moe_intermediate_size = moe_intermediate_size
+        self.activation = activation
         self.num_local_experts = divide(num_experts, comm_group.world_size)
         self.expert_start = comm_group.rank * self.num_local_experts
         self.track_expert_load = track_expert_load
@@ -1032,7 +1072,19 @@ class ExpertParallelSparseMoeBlock(nn.Module):
         hidden_dim = hidden_states.shape[-1]
         flat = hidden_states.view(-1, hidden_dim).contiguous()
         routing_weights, selected_experts, router_states_next = self.gate(flat, router_states)
+        out = self.experts_forward(flat, routing_weights, selected_experts, token_valid=token_valid)
+        out = out.view(input_shape)
+        return (out, router_states_next) if return_router_states else out
 
+    def experts_forward(
+        self,
+        flat: torch.Tensor,
+        routing_weights: torch.Tensor,
+        selected_experts: torch.Tensor,
+        *,
+        token_valid: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """``forward`` after its router (see ``ParallelSparseMoeBlock.experts_forward``)."""
         if self.track_expert_load:
             ids = selected_experts.flatten()
             if token_valid is None:
@@ -1047,17 +1099,15 @@ class ExpertParallelSparseMoeBlock(nn.Module):
                 selected_experts, routing_weights = _mask_padding(
                     selected_experts, routing_weights, token_valid, self.num_experts,
                 )
-            out = _dispatch(
+            return _dispatch(
                 flat, self.experts.gate_up_proj, self.experts.down_proj,
                 self.num_experts, selected_experts, routing_weights, skip_invalid=skip,
+                activation=self.activation,
             )
-        else:
-            routing_weights, selected_experts = _sync_routing(
-                self.comm_group, routing_weights, selected_experts,
-            )
-            out = self._dispatch_ep(flat, routing_weights, selected_experts, token_valid)
-        out = out.view(input_shape)
-        return (out, router_states_next) if return_router_states else out
+        routing_weights, selected_experts = _sync_routing(
+            self.comm_group, routing_weights, selected_experts,
+        )
+        return self._dispatch_ep(flat, routing_weights, selected_experts, token_valid)
 
     def _dispatch_ep(
         self, flat: torch.Tensor,
@@ -1076,6 +1126,7 @@ class ExpertParallelSparseMoeBlock(nn.Module):
         out = _dispatch(
             flat, self.experts.gate_up_proj, self.experts.down_proj,
             self.num_local_experts, local, routing_weights, skip_invalid=True,
+            activation=self.activation,
         )
         self.comm_group.all_reduce(out)
         return out

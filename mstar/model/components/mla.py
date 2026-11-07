@@ -13,9 +13,12 @@ linears dequantized and the latent prep op by op). The backends:
 
 The decoupled RoPE is the position resource's (``pos_key``; the model's ``PositionConfig`` sets
 its layout and table), at the positions the caller passes. ``mla_use_nope`` (optional) drops the
-decoupled dims (``qk_rope_head_dim`` 0) and with them the position resource (``pos_key=None``);
-the cache row's rope slot, ``mla_cache_kpe`` wide (0, or the 64 FlashInfer's MLA kernel may
-need), is zeros, and its query part ``kpe_query_fill``.
+rotation and with it the position resource (``pos_key=None``). With ``qk_rope_head_dim`` 0 it drops
+the decoupled dims too (GLM-5.3): the cache row's rope slot, ``mla_cache_kpe`` wide (0, or the 64
+FlashInfer's MLA kernel may need), is zeros, and its query part ``kpe_query_fill``. With decoupled
+dims (Kimi K3) they stay, unrotated: the shared key's slot is cached and scored like any other.
+
+``_project_out`` is the output projection (``o_proj``); a model with an output gate overrides it.
 
 ``kv_label`` names the cache stream this layer writes and attends under, and ``cache_layer`` its
 KV layer, where a model packs its attention planes. A model's sparse
@@ -81,8 +84,6 @@ class MLAAttention(nn.Module):
         if self.use_rope and (pos_key is None or self.qk_rope_head_dim == 0):
             raise ValueError("MLAAttention rotates its decoupled dims through a position "
                              "resource: pass pos_key and qk_rope_head_dim, or set mla_use_nope")
-        if not self.use_rope and self.qk_rope_head_dim:
-            raise ValueError("mla_use_nope means no decoupled dims: qk_rope_head_dim must be 0")
         # the rope slot of a cache row: the decoupled key, or zeros without one
         self.mla_cache_kpe = getattr(config, "mla_cache_kpe", self.qk_rope_head_dim)
         # the query's rope part against a zero slot; a model may mark rows with that slot
@@ -160,7 +161,7 @@ class MLAAttention(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Rotate ``q_pe`` / ``k_pe`` at ``position_ids`` through the position resource. Its
         kernel rotates whole rows in place, so the slices split off q and the latent are
-        copied out first. Without decoupled dims (``mla_use_nope``), they pass through."""
+        copied out first. Under ``mla_use_nope`` they pass through unrotated."""
         if not self.use_rope:
             return q_pe, k_pe
         return self._pos.apply_qk(
@@ -228,7 +229,7 @@ class MLAAttention(nn.Module):
         q = q * self.softmax_scale_boost
         attn = self._attend_naive(q, k, v, **sparse)  # (T, H, Dpad)
         attn = attn[..., : self.v_head_dim].reshape(num_tokens, h * self.v_head_dim)
-        return self.o_proj(attn)
+        return self._project_out(attn, hidden_states)
 
     def _attend_naive(self, q, k, v, **sparse) -> torch.Tensor:
         """Naive-path attention of ``q`` over the padded ``k`` / ``v``: the cache's, by default."""
@@ -266,7 +267,12 @@ class MLAAttention(nn.Module):
             attn_latent = self._fused_prep_and_attend(fused, hidden_states, position_ids, **sparse)
         else:
             attn_latent = self._prep_and_attend(fused, hidden_states, position_ids, **sparse)
-        return self.o_proj(self._out(attn_latent))
+        return self._project_out(self._out(attn_latent), hidden_states)
+
+    def _project_out(self, attn: torch.Tensor, hidden_states: torch.Tensor) -> torch.Tensor:
+        """``attn (T, H_local * Dv)`` through ``o_proj``; ``hidden_states`` is the layer input."""
+        del hidden_states
+        return self.o_proj(attn)
 
     def _out(self, attn_latent: torch.Tensor) -> torch.Tensor:
         """``attn_latent (T, H_local, L)`` through ``w_vc``: ``(T, H_local * Dv)``. Eager, bmm
@@ -320,7 +326,7 @@ class MLAAttention(nn.Module):
             q_nope_all.view(n * block, h, -1), latents.view(n * block, -1), None,
             q_pe=q_pe_all.view(n * block, h, -1))
         out = self._out(attn.view(n, block, h, -1)[:, row])
-        return self.o_proj(out)
+        return self._project_out(out, hidden_states)
 
     def _block_row_naive(self, hidden_states, position_ids, row, block, rows):
         """``forward_block_row`` on the naive path: padded per-head K/V rows instead of latents."""
@@ -344,7 +350,7 @@ class MLAAttention(nn.Module):
         attn = self._write_and_attend(
             q_all.view(n * block, h, pad), k_rows.view(n * block, h, pad), v_rows.view(n * block, h, pad))
         attn = attn.view(n, block, h, pad)[:, row, :, : self.v_head_dim]
-        return self.o_proj(attn.reshape(n, h * self.v_head_dim))
+        return self._project_out(attn.reshape(n, h * self.v_head_dim), hidden_states)
 
     def _prep_and_attend(
         self,
