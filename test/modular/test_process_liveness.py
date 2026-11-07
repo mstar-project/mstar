@@ -368,24 +368,50 @@ def test_message_loop_runs_while_the_conductor_lives():
     assert server.fatal_error is None
 
 
-def test_a_failed_message_wait_does_not_end_the_message_loop(monkeypatch, caplog):
-    """A transport error from the idle wait is a failed pass, not the end of
-    the thread that delivers every request's results, and failed passes in a
-    row back off rather than spinning, with one traceback between them."""
+def test_a_failed_message_wait_releases_pending_requests_and_stops_the_server():
+    """The one error the transport raises from the idle wait, a closed wakeup
+    fd, never recovers, so it ends the loop as a dead conductor does: pending
+    requests get a 503 now rather than at their timeout, and the server stops."""
+    stopped = []
     server = _api_server(_Proc(5))
-    waits, sleeps = [], []
-    monkeypatch.setattr(time, "sleep", sleeps.append)
+    server.on_fatal = lambda: stopped.append(True)
+    waiting = _pending_request()
+    server.pending_requests = {"r1": waiting}
+
+    waits = []
 
     def poll(timeout_ms):
         waits.append(timeout_ms)
-        if len(waits) <= 3:
-            raise RuntimeError("socket closed")
-        server.running = False
-        return False
+        if len(waits) > 1:  # a loop that retried: stop it
+            server.running = False
+            return False
+        raise RuntimeError("a registered wakeup fd is closed/invalid")
     server.communicator.poll_for_messages = poll
     server._process_messages()
-    assert len(waits) == 4
-    assert sleeps == [0.01, 0.02, 0.04], "a failed pass went straight into the next one"
+
+    assert len(waits) == 1
+    assert waiting.event.is_set() and waiting.error_status == 503
+    assert "wakeup fd is closed" in waiting.error
+    assert stopped == [True]
+    assert server.fatal_error is not None
+
+
+def test_failing_passes_log_one_traceback(caplog):
+    """A pass that keeps failing (a message it can't route) logs its traceback
+    once, not once a pass, and the loop goes on."""
+    server = _api_server(_Proc(5))
+    passes = []
+
+    def messages():
+        passes.append(True)
+        if len(passes) > 3:
+            server.running = False
+            return []
+        raise RuntimeError("a message it can't route")
+    server.communicator.get_all_new_messages = messages
+    server._process_messages()
+
+    assert len(passes) == 4
     assert sum(r.exc_info is not None for r in caplog.records) == 1
     assert server.fatal_error is None
 
