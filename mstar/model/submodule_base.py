@@ -64,8 +64,8 @@ class TokenStop:
     stop_ids: frozenset[int]
     # resource key of the sampler whose request config carries ``ignore_eos``
     sampler: str
-    # the only walk whose rows can stop the loop; None for every walk
-    walk: str | None = None
+    # the only walk, or walks, whose rows can stop the loop; None for every walk
+    walk: str | frozenset[str] | None = None
     # walks that sample the reply's first token before the loop exists. That
     # token counts toward the budget, so ``get_loop_caps`` gives the loop
     # ``max(1, max_output_tokens - 1)``. A stop id there, or a budget of one
@@ -87,6 +87,11 @@ class TokenStop:
         if self.withhold and self.runtime_check:
             # the runtime's check never calls check_stop, which is what withholds
             raise ValueError("a TokenStop that withholds outputs needs check_stop: drop runtime_check")
+
+    def stops_on(self, graph_walk: str) -> bool:
+        """Whether a row of ``graph_walk`` can stop the loop."""
+        walk = self.walk
+        return walk is None or graph_walk == walk or (isinstance(walk, frozenset) and graph_walk in walk)
 
 
 class DeviceLoopback(NamedTuple):
@@ -821,6 +826,12 @@ class NodeSubmodule(torch.nn.Module, ABC):
     # engines skip compiling such submodules (CUDA-graph capture is unaffected).
     disable_torch_compile: bool = False
 
+    def dynamo_recompile_limit(self) -> int | None:
+        """Entries dynamo may keep per code object of this submodule's compiled forwards, when
+        its captures need more than the engine's ``MSTAR_RECOMPILE_LIMIT``. The engine applies
+        it around this submodule's compiled calls only. None keeps the engine's."""
+        return None
+
     # Set True on a submodule that must run in its own parameter dtype — e.g. a
     # numerically sensitive fp32 vocoder. The engine then neither casts its
     # params to the autocast dtype nor wraps its forward (or capture) in
@@ -1208,6 +1219,12 @@ class NodeSubmodule(torch.nn.Module, ABC):
     def max_batch_size(self, graph_walk: str):
         return None
 
+    def batch_cap_varies(self, graph_walk: str) -> bool:
+        """Whether ``max_batch_size(graph_walk)`` follows state that changes while
+        serving (free slots, say). The scheduler caches every other cap."""
+        del graph_walk
+        return False
+
     def compile_regions(self) -> Mapping[str, Sequence[tuple]]:
         """Parts of this node the engine compiles on their own, for a node
         whose ``forward`` is not compiled whole (``disable_torch_compile``, or
@@ -1261,9 +1278,10 @@ class NodeSubmodule(torch.nn.Module, ABC):
         """Return the piecewise CUDA graph configs this submodule opts into.
 
         ``autocast_dtype`` is this node's resolved dtype, float32 for a node with
-        ``disable_autocast`` — passed so a config's ``make_static_inputs`` can
-        allocate the hidden-state buffer in the dtype the captured region runs
-        under (avoids a copy-time upcast at replay).
+        ``disable_autocast``, passed so a config's ``make_static_inputs`` can
+        allocate each input buffer in the dtype the eager path hands the region,
+        often that one. The replay copies into the buffer and refuses a value the
+        buffer may round.
 
         A piecewise CUDA graph captures ONE inner callable of this submodule's
         forward (e.g. a transformer block loop) as a CUDA graph while the
@@ -1589,7 +1607,7 @@ class ARNodeSubmodule(NodeSubmodule):
         stop = self.token_stop
         if stop is None or not stop.runtime_check or graph_walk in stop.prefill_walks:
             return super().get_stop_policies(graph_walk)
-        if stop.walk is not None and graph_walk != stop.walk:
+        if not stop.stops_on(graph_walk):
             return {}  # as `_token_stops`: only a row of ``walk`` ends the loop
         # the budget is the loop's cap, which the runtime enforces
         return {stop.loop: StopPolicy(
@@ -1651,7 +1669,7 @@ class ARNodeSubmodule(NodeSubmodule):
             if walk in prefill_walks:
                 return self._is_reply_token(info)
             # only a row of ``walk`` ends the loop
-            return stop.walk is None or walk == stop.walk
+            return stop.stops_on(walk)
         # the loop's cap is at least 1, so a one-token budget ends at the prefill
         return bool(prefill_walks) and info.max_tokens <= 1 and (
             info.graph_walk in prefill_walks and self._is_reply_token(info)

@@ -132,6 +132,9 @@ class StepContext:
     # reserve them now (``ChunkingPolicy.reserve_whole_prefill``). Check it
     # before reserving by ``chunk_tokens_after``.
     reserve_whole_prefill: PerReqSetting = ALL_SET
+    # rows that recompute KV their request already had: the step throws their
+    # samples away, and they change no per-request state but the KV
+    rebuild_rids: frozenset[int] = frozenset()
 
     def walk_of(self, rid: int) -> str:
         return self.request_walks.get(rid, self.graph_walk)
@@ -152,6 +155,16 @@ class StepContext:
         if real is None:
             real = self._real_rids = frozenset(self.request_ids)
         return rid in real
+
+    def real_rows(self) -> frozenset | None:
+        """``request_ids`` as a set when the step has padding rows, else None
+        (no row is padding)."""
+        if self._padded_request_ids is None:
+            return None
+        real = self._real_rids
+        if real is None:
+            real = self._real_rids = frozenset(self.request_ids)
+        return real
 
     def is_padding_row(self, rid: str) -> bool:
         """Whether ``rid`` is a replay's padding row rather than a real request.
@@ -278,6 +291,8 @@ class FullAdmitOutcome(NamedTuple):
     failed_resource: str | None = None
     # waits for capacity on its node, until `StepRunner.admit_waiting` admits it
     queued: bool = False
+    # dropped on its node: not ready until a rebuild from its token ids lands
+    rebuild: bool = False
 
     @property
     def ok(self) -> bool:
@@ -296,3 +311,4 @@ FULL_ADMIT_OK = FullAdmitOutcome(ADMIT_OK)
 # admitted, but something it needs has not landed yet: retry, don't fail
 FULL_ADMIT_NOT_READY = FullAdmitOutcome(AdmitOutcome(ok=True, ready=False))
 FULL_ADMIT_QUEUED = FullAdmitOutcome(AdmitOutcome(ok=True, ready=False), queued=True)
+FULL_ADMIT_REBUILD = FullAdmitOutcome(AdmitOutcome(ok=True, ready=False), rebuild=True)

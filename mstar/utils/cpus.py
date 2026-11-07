@@ -23,9 +23,12 @@ of each, so the cores a GPU picks from must hold four per GPU, and no two pinned
 threads share a core; ``siblings`` (``_siblings``) puts a worker on one core's
 hardware threads instead. A mask too small across the host may still do for the
 GPUs this container can open, which are the only ones that can share it, so those
-rank instead; failing that, nothing is pinned. Servers on one GPU can't be told
-apart by rank, so the first holds a lock on it (``claim_gpus``) and the next
-pins nothing.
+rank instead. Failing that, the GPUs this process was given rank, and the mask
+is cut into as many core sets as it holds for them. Servers on one GPU can't be
+told apart by rank, so the first holds a lock on it (``claim_gpus``) and the next
+pins nothing. Under the last rule servers on different GPUs can't either, so
+every server that pins also locks its cores (``claim_cores``), and one that
+finds a set held takes the next.
 
 Pinning can pay where a thread woken on an idle core waits for that core to
 leave a deep idle state, and costs throughput where it doesn't, since the
@@ -39,11 +42,12 @@ a CPU vendor other than Intel, idle states under ``DEEP_IDLE_US``
 from __future__ import annotations
 
 import fcntl
+import logging
 import math
 import os
 import sys
 from collections.abc import Callable, Collection, Iterable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import NamedTuple
 
@@ -56,6 +60,11 @@ _CPUINFO = Path("/proc/cpuinfo")
 _PM_QOS_DEVICE = Path("/dev/cpu_dma_latency")
 # not TMPDIR: every server on the host has to find the same file
 _GPU_LOCK_DIR = Path("/tmp")
+# The core set an API server locked (``claim_cores``), for the workers it starts:
+# they build the same plan, but which set was free only that process knows.
+CORE_SET_ENV = "MSTAR_STEP_CORE_SET"
+
+logger = logging.getLogger(__name__)
 
 PINNABLE = hasattr(os, "sched_setaffinity")
 
@@ -168,6 +177,12 @@ class CpuPlan:
     why: str = "step_thread_core off"
     # auto chose not to pin here, which is no fault of the deployment's
     declined: bool = False
+    # the disjoint core sets the mask holds for this deployment, and the one taken
+    sets: int = 1
+    slot: int = 0
+    # the cores whose locks this process holds (``claim_cores``), for the log:
+    # the workers build the same plan without them
+    locked: str = field(default="", compare=False)
 
     @property
     def pinned(self) -> frozenset[int]:
@@ -205,15 +220,22 @@ class CpuPlan:
 
     @property
     def png_threads(self) -> int:
-        """Threads one PNG deflates on (``image_io.uint8_to_png``)."""
+        """Blocks one PNG deflates in parallel (``image_io.uint8_to_png``)."""
         return min(8, self.left)
 
     @property
     def encode_workers(self) -> int:
-        """Outputs the data worker encodes at once. A PNG deflates on
-        ``png_threads`` of its own, so the pool times that stays within the
+        """Outputs the data worker encodes at once. A PNG deflates
+        ``png_threads`` blocks at once, so the pool times that stays within the
         CPUs left."""
         return max(1, min(4, self.left // self.png_threads))
+
+    @property
+    def deflate_threads(self) -> int:
+        """Threads of the deflate pool every PNG of the process shares
+        (``image_io``): enough for ``encode_workers`` images finishing together
+        to deflate all their blocks at once."""
+        return min(self.left, self.encode_workers * self.png_threads)
 
     @property
     def copy_workers(self) -> int:
@@ -450,13 +472,17 @@ def deployment_plan(
     cluster: Callable[[int], frozenset[int]] = l2_cluster,
     cpu_root: Path = _CPU_ROOT,
     reachable: Collection[str] = (),
+    own: Collection[str] = (),
+    slot: int = 0,
     cpuinfo: Path | None = None,
     idle_hold: str = "off",
 ) -> CpuPlan:
     """The plan for a deployment whose workers' devices sit at PCI
     ``addresses``, in the conductor's worker order (None for a device sysfs
     doesn't place, such as a CPU worker; only ``always`` and ``siblings``
-    read them), and ``reachable`` the GPUs this container can open.
+    read them), ``reachable`` the GPUs this container can open, ``own`` the
+    ones this process was given, and ``slot`` the core set to take when the
+    mask holds more than one (``claim_cores``).
 
     ``off`` pins nothing, and ``auto`` pins nothing and says why. A CPU number
     is the first worker's core; the next workers take the next cores above it,
@@ -487,13 +513,14 @@ def deployment_plan(
         else:
             layout = _Layout(_spread, f"{STEP_CORES + 1} ({STEP_CORES} for its worker's step threads, 1 for its API "
                                       "server)")
-        placed = _by_rank(setting, addresses, mask, cores_of, layout, pci_root, reachable)
+        placed = _by_rank(setting, addresses, mask, cores_of, layout, pci_root, reachable, own, slot)
         if isinstance(placed, str):
             return CpuPlan(mask, usable, why=f"not pinned: {placed}")
-        workers, result, why = placed
+        workers, result, why, sets = placed
     else:
         workers, result, why = _explicit(int(setting), len(addresses), mask, cores)
-    out = CpuPlan(mask, usable, tuple(workers), result, why)
+        sets, slot = 1, 0
+    out = CpuPlan(mask, usable, tuple(workers), result, why, sets=sets, slot=slot)
     if len(out.pinned) >= len(mask):
         reason = (f"{len(addresses)} worker(s) and the API server would pin all {len(mask)} CPU(s) "
                   f"of the process mask {format_cpu_list(mask)}, leaving none for the rest")
@@ -564,10 +591,11 @@ class _Pool(NamedTuple):
         return layout.units(self.cores[:len(self.cores) - self.gpus])
 
 
-def _gpu_pools(gpus, mask, cores_of, layout) -> dict[str, _Pool]:
-    """Each host GPU's pool. A GPU with allowed CPUs on its node picks among
-    those by its rank on the node; the GPUs with none pick, by their rank among
-    themselves, from the cores those ranks leave."""
+def _gpu_pools(gpus, mask, cores_of, layout, sets=1, slot=0) -> dict[str, _Pool]:
+    """Each GPU's pool. A GPU with allowed CPUs on its node picks among those
+    by its rank on the node; the GPUs with none pick, by their rank among
+    themselves, from the cores those ranks leave. A pool holds ``sets`` copies
+    of its GPUs' ranks, and these GPUs take copy ``slot``."""
     nodes: dict[str | None, list[HostGpu]] = {}
     for gpu in gpus:
         nodes.setdefault(gpu.node, []).append(gpu)
@@ -579,42 +607,62 @@ def _gpu_pools(gpus, mask, cores_of, layout) -> dict[str, _Pool]:
         count = len(members)
         where = format_cpu_list(c for core in local for c in core)
         for rank, gpu in enumerate(members):
-            pools[gpu.address] = _Pool(
-                local, rank, count, f"GPU {rank + 1} of {count} on its NUMA node, over its allowed CPUs {where}")
+            pools[gpu.address] = _Pool(local, slot * count + rank, count * sets,
+                                       f"GPU {rank + 1} of {count} on its NUMA node, over its allowed CPUs {where}")
         units = pools[members[0].address].units(layout)
-        if len(units) >= count:
-            claimed.update(core for unit in units[:count] for core in unit.cores)
-            claimed.update(local[len(local) - count:])
+        if len(units) >= count * sets:
+            claimed.update(core for unit in units[:count * sets] for core in unit.cores)
+            claimed.update(local[len(local) - count * sets:])
     spare = [core for core in cores_of(mask) if core not in claimed]
     elsewhere = [gpu for gpu in gpus if gpu.address not in pools]
     for rank, gpu in enumerate(elsewhere):
         pools[gpu.address] = _Pool(
-            spare, rank, len(elsewhere),
+            spare, slot * len(elsewhere) + rank, len(elsewhere) * sets,
             f"no allowed CPU on its NUMA node, so GPU {rank + 1} of {len(elsewhere)} without one, over the cores "
             "the node-local GPUs leave")
     return pools
 
 
-def _by_rank(setting, addresses, mask, cores_of, layout, pci_root, reachable):
-    """``(workers, result, why)``, or why nothing can be pinned."""
+def _by_rank(setting, addresses, mask, cores_of, layout, pci_root, reachable, own=(), slot=0):
+    """``(workers, result, why, sets)``, or why nothing can be pinned."""
     cores = cores_of(mask)
     if not cores or not addresses:
         return "no CPU or no worker to place"
     gpus = next((found for a in addresses if a and (found := host_gpus(a, pci_root))), [])
     unplaced = _Pool(cores, 0, 1, "no sysfs entry for its device, so over the process mask")
 
-    def short_of_cores(group):
-        pools = _gpu_pools(group, mask, cores_of, layout)
+    def short_of_cores(group, sets=1, slot=0):
+        pools = _gpu_pools(group, mask, cores_of, layout, sets, slot)
         homes = [pools.get(a, unplaced) for a in addresses]
         return homes, next((home for home in homes if len(home.units(layout)) < home.gpus), None)
 
-    homes, short = short_of_cores(gpus)
+    group = gpus
+    homes, short = short_of_cores(group)
     within = [gpu for gpu in gpus if gpu.address in reachable]
-    if short is not None and within and len(within) < len(gpus):
-        homes, short = short_of_cores(within)
+    if short is not None and within and len(within) < len(group):
+        group = within
+        homes, short = short_of_cores(group)
+    # Short of that, size by this process's own GPUs. Servers in one container
+    # that hold the same rank among their own GPUs then pick the same cores,
+    # so the mask is cut into as many sets as it holds and the core locks
+    # (``claim_cores``) give each server its own.
+    mine = [gpu for gpu in gpus if gpu.address in own]
+    sets, rule = 1, None
+    if short is not None and mine and len(mine) < len(group) and {a for a in addresses if a} <= set(own):
+        group = mine
+        homes, short = short_of_cores(group)
+        while short is None and sets < len(cores) and short_of_cores(group, sets + 1)[1] is None:
+            sets += 1
+        rule = f"sized by the GPUs this process uses, set {slot + 1} of {sets}"
     if short is not None:
         return (f"{short.why}: {len(short.cores)} core(s) there for {short.gpus} GPU(s), and each needs "
                 f"{layout.need}; widen the mask or name a CPU")
+    if slot >= sets:
+        return f"core set {slot + 1} asked for, and the mask holds {sets} for this deployment"
+    if slot:
+        homes, _ = short_of_cores(group, sets, slot)
+    elif sets > 1:
+        homes, _ = short_of_cores(group, sets)
     first = homes[0]
     result_core = first.cores[len(first.cores) - 1 - first.rank]
     taken = {result_core}
@@ -628,8 +676,9 @@ def _by_rank(setting, addresses, mask, cores_of, layout, pci_root, reachable):
         if unit is None:
             return f"{len(addresses)} worker(s) and the API server need more cores than the mask has"
         taken.update(unit.cores)
-        workers.append(StepCpus(frozenset(unit.cpus), f"{setting}: {home.why}"))
-    return workers, result_core[0], f"{setting}: {first.why} (the first worker's device), from the top"
+        workers.append(StepCpus(frozenset(unit.cpus), f"{setting}: {home.why}" + (f", {rule}" if rule else "")))
+    why = f"{setting}: {first.why} (the first worker's device), from the top; {rule or 'every reachable GPU fits'}"
+    return workers, result_core[0], why, sets
 
 
 def device_addresses(devices: Sequence[str]) -> list[str | None]:
@@ -644,16 +693,22 @@ def device_addresses(devices: Sequence[str]) -> list[str | None]:
     return addresses
 
 
-def devices_plan(setting: str | int, devices: Sequence[str], idle_hold: str = "off") -> CpuPlan:
+def devices_plan(setting: str | int, devices: Sequence[str], idle_hold: str = "off",
+                 slot: int | None = None) -> CpuPlan:
     """``deployment_plan`` for the workers' device strings, in the conductor's
-    worker order: the same call in the API server and in every worker."""
+    worker order: the same call in the API server and in every worker. A
+    worker takes the core set its API server locked (``CORE_SET_ENV``)."""
     # auto, which pins nothing, never asks torch about the devices
     if setting not in PLACED:
         return deployment_plan(setting, [None] * len(devices), idle_hold=idle_hold)
     from mstar.platforms import current_platform
 
+    if slot is None:
+        inherited = os.environ.get(CORE_SET_ENV, "")
+        slot = int(inherited) if inherited.isdigit() else 0
     return deployment_plan(setting, device_addresses(devices), idle_hold=idle_hold,
-                           reachable=current_platform.reachable_pci_addresses())
+                           reachable=current_platform.reachable_pci_addresses(),
+                           own=current_platform.visible_pci_addresses(), slot=slot)
 
 
 # ── one server per GPU ──────────────────────────────────────────────────────
@@ -661,15 +716,20 @@ def devices_plan(setting: str | int, devices: Sequence[str], idle_hold: str = "o
 _gpu_locks: dict[str, int] = {}
 
 
-def _open_lock(path: Path) -> int:
+def _open_lock(path: Path, writable: bool = False) -> int:
+    access = os.O_RDWR if writable else os.O_RDONLY
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+        fd = os.open(path, access | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
     except FileExistsError:
         # another user's file in a sticky directory refuses O_CREAT, and flock
         # needs no write access
-        return os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
-    # The umask narrows the mode above, and every user's servers open this file to lock it.
-    os.fchmod(fd, 0o644)
+        try:
+            return os.open(path, access | os.O_NOFOLLOW)
+        except PermissionError:
+            return os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    # The umask narrows the mode above, and every user's servers open this file
+    # to lock it (and write their pid into a writable one).
+    os.fchmod(fd, 0o666 if writable else 0o644)
     return fd
 
 
@@ -703,3 +763,93 @@ def claim_gpus(addresses: Iterable[str | None]) -> str | None:
         taken[address] = fd
     _gpu_locks.update(taken)
     return None
+
+
+# ── one server per core ─────────────────────────────────────────────────────
+
+_core_locks: dict[Path, int] = {}
+
+
+def _pid_in(fd: int) -> int | None:
+    text = os.pread(fd, 32, 0).decode(errors="replace").strip()
+    return int(text) if text.isdigit() else None
+
+
+def _alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        pass
+    return True
+
+
+def _lock_cores(cores: Iterable[int]) -> str | None:
+    """Lock each physical core (by its first CPU) for the life of this
+    process, writing its pid into the file; if one is held, hold none of them
+    and say by whom."""
+    taken: dict[Path, int] = {}
+    for core in sorted(cores):
+        path = _GPU_LOCK_DIR / f"mstar-core-{core}.lock"
+        if path in _core_locks:
+            continue
+        fd = None
+        try:
+            fd = _open_lock(path, writable=True)
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            pid = _pid_in(fd)
+            holder = f"pid {pid}" if pid is not None and _alive(pid) else "another process"
+            refused = f"core {core} is held by {holder} (its lock is {path})"
+        except OSError as e:
+            refused = f"can't lock core {core}: {e}"
+        else:
+            taken[path] = fd
+            continue
+        for held in [*taken.values(), *([] if fd is None else [fd])]:
+            os.close(held)
+        return refused
+    for path, fd in taken.items():
+        left = _pid_in(fd)
+        if left is not None and left != os.getpid() and not _alive(left):
+            logger.info("step_thread_core: %s names pid %d, which has exited; taking it over", path, left)
+        try:
+            os.ftruncate(fd, 0)
+            os.pwrite(fd, f"{os.getpid()}\n".encode(), 0)
+        except OSError:
+            pass  # a file this user can't write: locked all the same, without the pid
+    _core_locks.update(taken)
+    return None
+
+
+def claim_cores(first: CpuPlan, build: Callable[[int], CpuPlan],
+                siblings: Callable[[int], frozenset[int]] | None = None) -> CpuPlan:
+    """The first of the deployment's core sets (``first`` is set 0's plan,
+    ``build(slot)`` gives the others) whose physical cores this process can
+    lock, holding those locks for its life; else a plan that pins nothing and
+    says who holds them.
+
+    Every plan that pins goes through this, a CPU number and ``siblings``
+    included, so no two servers that share ``_GPU_LOCK_DIR`` pin threads on
+    one core. The kernel drops an ``flock`` however the process exits, and the
+    pid in the file is only for the next server's log: a file naming a process
+    that has exited is taken over. Like the GPU lock, it doesn't reach a server
+    in another container with its own ``/tmp``."""
+    siblings = siblings or smt_siblings
+    plan, refusals = first, []
+    for slot in range(first.sets):
+        if slot:
+            plan = build(slot)
+            if not plan.pinned:
+                refusals.append(f"set {slot + 1}: {plan.why}")
+                continue
+        cores = {min(siblings(cpu)) for cpu in plan.pinned}
+        refused = _lock_cores(cores)
+        if refused is None:
+            return replace(plan, locked=format_cpu_list(cores))
+        refusals.append(f"set {slot + 1} of {first.sets}: {refused}")
+        if slot + 1 < first.sets:
+            logger.info("step_thread_core: %s; trying the next set", refusals[-1])
+    return CpuPlan(first.mask, first.usable,
+                   why=f"not pinned: no core set left in the mask ({'; '.join(refusals)})")

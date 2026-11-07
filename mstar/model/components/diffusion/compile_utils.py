@@ -11,6 +11,7 @@ scaffold rather than in a model package so a model never imports a sibling model
 from __future__ import annotations
 
 import functools
+import inspect
 import logging
 from collections.abc import Iterable, Sequence
 
@@ -86,6 +87,7 @@ def _exact_rms_norm_forward(module: nn.RMSNorm, x: torch.Tensor) -> torch.Tensor
 
 def compile_transformer_forward(
     transformer: nn.Module, eager_rounding: bool = True, exact_ops: ExactOps = False,
+    recompile_limit: int | None = None,
 ) -> None:
     """Compile ``transformer.forward`` in place (one static graph per shape; the graph runner
     captures those kernels). With ``eager_rounding`` inductor rounds every intermediate to the
@@ -96,16 +98,47 @@ def compile_transformer_forward(
     modules on the eager result (``exclude_from_compile``) and compiles the rest — ``True`` for
     all of them, or a list of the op classes to keep (``["norms"]``, ``["activations"]``), since
     every kept module but a 1-D ``torch.nn.RMSNorm`` is a graph break that costs fusion
-    (measured PSNR, and Z-Image's cost: ``compile_exact_ops`` in docs/models.rst)."""
+    (measured PSNR, and Z-Image's cost: ``compile_exact_ops`` in docs/models.rst).
+
+    ``recompile_limit`` replaces the process-wide limit for this forward only, where ``torch.compile`` takes it
+    (torch 2.12 and up); an older torch gets the process-wide limit raised to it instead, since the keyword would
+    raise at load. Past the limit a frame silently runs uncompiled, inside the captured graphs too."""
     types = exact_op_types(exact_ops)
     if types:
         kept = exclude_from_compile(transformer, types)
         logger.info("compiled transformer keeps %d modules (%s) on the eager result", kept,
                     "all classes" if exact_ops is True else ", ".join(exact_ops))
+    kwargs: dict[str, object] = {}
+    if recompile_limit is not None:
+        if _compile_takes_recompile_limit():
+            kwargs["recompile_limit"] = recompile_limit
+        else:
+            import torch._dynamo.config as dynamo_config
+
+            dynamo_config.recompile_limit = max(dynamo_config.recompile_limit, recompile_limit)
+            logger.info("torch.compile on torch %s takes no recompile_limit; the process-wide limit is %d",
+                        torch.__version__, dynamo_config.recompile_limit)
     transformer.forward = with_inductor_rounding(
-        torch.compile(transformer.forward, fullgraph=False, dynamic=False),
+        torch.compile(transformer.forward, fullgraph=False, dynamic=False, **kwargs),
         eager_rounding=bool(eager_rounding),
     )
+
+
+def _compile_takes_recompile_limit() -> bool:
+    """Whether this torch's ``torch.compile`` takes ``recompile_limit`` (added in 2.12)."""
+    params = inspect.signature(torch.compile).parameters
+    return "recompile_limit" in params or any(p.kind is p.VAR_KEYWORD for p in params.values())
+
+
+def step_schedule_recompile_limit(step_dtypes) -> int | None:
+    """The recompile limit for transformers run under a step schedule (``StepDtypes``): one per dtype compiles the
+    same code objects, so Dynamo's entries per frame grow with the dtypes (3 capture sizes x 8 batch sizes is 48
+    entries, 96 with a bf16 twin, past the default 84). None without a schedule."""
+    if step_dtypes is None:
+        return None
+    from mstar.engine import recompile_limit
+
+    return len(step_dtypes.dtypes) * recompile_limit()
 
 
 def with_inductor_rounding(compiled, *, eager_rounding: bool, deterministic: bool = False):

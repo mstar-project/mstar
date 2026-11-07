@@ -458,10 +458,9 @@ class _Encoder:
 
     def declare(self, rids, inputs):
         """The node's declaration, with the leases the engine takes for it first."""
-        from mstar.engine.engine import Engine
+        from mstar.testing_utils.engine import make_engine, make_mgmt
 
-        engine = Engine.__new__(Engine)
-        engine._submodules = {"conformer_encoder": SimpleNamespace(piecewise_runners=self.regions)}
+        engine = make_engine(_submodules={"conformer_encoder": make_mgmt(piecewise_runners=self.regions)})
         ctx = StepContext(request_ids=tuple(rids), graph_walk="encode", slot=0, capture=False)
         engine._maybe_lease_piecewise_regions("conformer_encoder", ctx, inputs)
         return self.node.declare_step("encode", rids, inputs, piecewise_leases=ctx.piecewise_leases)
@@ -806,12 +805,12 @@ def test_encoder_takes_no_batch_wider_than_its_graphs():
     """Its graphs are piecewise regions, which the engine's batch cap does not
     see: a wider step would run every stream eagerly, so the node caps its batch
     at its widest capture and the scheduler splits the rest."""
-    from mstar.engine.engine import Engine
+    from mstar.testing_utils.engine import make_engine, make_mgmt
 
     node = _stream_node()
-    engine = Engine.__new__(Engine)
-    engine._submodules = {"conformer_encoder": SimpleNamespace(submodule=node, accelerator_graph_runner=None,
-                                                               capture_runner=None)}
+    engine = make_engine(
+        _submodules={"conformer_encoder": make_mgmt(node)},
+    )
     assert engine.get_max_batch_size("conformer_encoder", "encode") == max(node.capture_batch_sizes)
 
 

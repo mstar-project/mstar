@@ -16,6 +16,7 @@ from types import SimpleNamespace
 from mstar.api_server.data_worker import PreprocessWorker, PreprocessWorkerThread, ResultQueue
 from mstar.api_server.request_types import PreprocessInput
 from mstar.communication.event import EventWakeup
+from mstar.testing_utils.model import StubModel
 
 
 def _worker_with(received_chunk_counts):
@@ -41,7 +42,7 @@ def test_preprocess_failure_emits_error_chunk():
     """A request rejected during preprocessing (e.g. an invalid model kwarg)
     must produce an "error" chunk so the waiting client is released."""
 
-    class _RejectingModel:
+    class _RejectingModel(StubModel):
         def process_prompt(self, *args, **kwargs):
             raise ValueError("bad knob")
 

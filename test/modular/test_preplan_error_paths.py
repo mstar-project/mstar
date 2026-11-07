@@ -18,7 +18,7 @@ sys.path.insert(0, ".")
 import pytest
 import torch
 
-from mstar.engine.engine import Engine
+from mstar.testing_utils.engine import make_engine, make_mgmt
 from mstar.worker import worker as worker_mod
 from mstar.worker.micro_scheduler import CHAIN_LANE, ScheduledBatch
 from mstar.worker.stream_buffers import StreamBufferManager
@@ -136,7 +136,8 @@ def test_gpu_thread_drops_the_stage_when_prepare_inputs_raises() -> None:
     released = []
     node_batch = SimpleNamespace(
         node_name="dit", launch_started_event=None, preplanned_rids=("a",), read_check_rids=None,
-        request_ids=("a",), release_waiters=lambda: released.append(True),
+        request_ids=("a",), step_context=SimpleNamespace(rebuild_rids=frozenset()),
+        release_waiters=lambda: released.append(True),
         per_request_info={"a": SimpleNamespace(request_id="a")},
     )
     batch = SimpleNamespace(node_name="dit", graph_walk="decode", output_signals=(),
@@ -182,17 +183,14 @@ def test_a_step_the_executor_never_runs_still_lifts_the_fence() -> None:
 
 
 def _exec_fake(runner, raise_with):
-    fake = SimpleNamespace(
-        _enable_nvtx=False, _enable_profile=False, _device=torch.device("cpu"),
-        _submodules={"dit": SimpleNamespace(submodule=object())},
+    return make_engine(
+        _submodules={"dit": make_mgmt(submodule=object())},
         _autocast_dtype_for=lambda submodule: None,
         reserve_replay_slot=lambda batch: None,
         _exec_single=_raiser(raise_with),
         _exec_per_request=_raiser(raise_with),
         _runner=runner,
     )
-    fake.exec = Engine.exec.__get__(fake)
-    return fake
 
 
 def _batch(preplanned) -> SimpleNamespace:
@@ -234,13 +232,10 @@ def test_reset_drops_the_kept_step_of_a_partly_dropped_batch() -> None:
     # exec), then prepare_inputs dropped "b": the stale step must not reach
     # admit, so the reset clears it even though the batch still has inputs
     cleared = []
-    fake = SimpleNamespace(
-        _enable_nvtx=False,
-        _submodules={"dit": SimpleNamespace(accelerator_graph_runner=None)},
+    fake = make_engine(
+        _submodules={"dit": make_mgmt()},
         _runner=SimpleNamespace(clear_preplan=lambda: cleared.append(True)),
     )
-    fake.reset_pre_plan_for_batch = Engine.reset_pre_plan_for_batch.__get__(fake)
-    fake.preplan_is_stale = Engine.preplan_is_stale.__get__(fake)
     batch = SimpleNamespace(
         request_ids=["a"], node_name="dit", inputs=[object()], step=object(),
         preplanned_rids=("a", "b"), preplan_event=object(),
@@ -250,3 +245,83 @@ def test_reset_drops_the_kept_step_of_a_partly_dropped_batch() -> None:
     fake.reset_pre_plan_for_batch(batch)
     assert batch.step is None and batch.preplanned_rids is None and batch.preplan_event is None
     assert cleared == [True]
+
+
+class _FakeEvent:
+    def __init__(self, device=None):
+        self.recorded_on = "unrecorded"
+
+    def record(self, stream=None):
+        self.recorded_on = stream
+
+
+def test_a_pre_plan_records_its_event_even_when_it_raises(monkeypatch) -> None:
+    # a later step may skip a copy into a slot buffer this pre-plan issued,
+    # so its plan-stream copies must be waited on even if it never finishes
+    monkeypatch.setattr(torch, "Event", _FakeEvent)
+    fake = make_engine(
+        _order_after_pre_plans=lambda: None,
+        _runner=SimpleNamespace(
+            pre_admit=lambda step: SimpleNamespace(ok=True),
+            pre_plan=_raiser(RuntimeError("plan failed")),
+        ),
+    )
+    step = SimpleNamespace(set_ctx=lambda ctx: None)
+    submodule = SimpleNamespace(declare_step=lambda **kw: step)
+    cg_runner = SimpleNamespace(
+        declare_inputs_for=lambda lease: [], step_ids=lambda lease, rids: rids,
+        plan_stream=lambda: None,
+    )
+    batch = SimpleNamespace(
+        node_name="dit", inputs=None, request_ids=["a"], per_request_info={},
+        step=None, preplan_event=None, preplanned_rids=None,
+        step_context=SimpleNamespace(
+            graph_walk="decode", padded_request_ids=["a"], is_preplan=False,
+            set_padded_rids=lambda rids: None, resident=None,
+        ),
+    )
+    submodule.step_is_input_free = lambda walk: False
+    mgmt = make_mgmt(submodule)
+    with pytest.raises(RuntimeError):
+        fake._pre_plan_for_batch(batch, mgmt, cg_runner, object())
+    event = fake._pre_plan_done["dit"]
+    assert isinstance(event, _FakeEvent) and event.recorded_on is None
+    assert batch.preplan_event is None
+
+
+def test_a_step_is_ordered_after_every_plan_streams_pre_plans(monkeypatch) -> None:
+    # nodes can share a resource's slot buffers, so every node's latest
+    # pre-plan is waited on, not just the stepping node's
+    waits = []
+    stream = SimpleNamespace(wait_event=waits.append)
+    monkeypatch.setattr(torch.accelerator, "current_stream", lambda device=None: stream)
+    fake = make_engine()
+    fake._order_after_pre_plans()
+    assert waits == []
+    fake._pre_plan_done.update(enc="e1", dec="e2")
+    fake._order_after_pre_plans()
+    assert waits == ["e1", "e2"]
+
+
+def test_an_inline_plan_waits_on_pre_plans_before_the_resident_stage_copies() -> None:
+    # the resident stage copies into the bucket's cells and slots, which a
+    # dropped pre-plan may still be copying into on its plan stream
+    from mstar.engine.resources.step import BucketKey, SlotLease, StepContext, SubmoduleStep
+
+    calls = []
+
+    def plan(step, phase):
+        calls.append("runner")
+        raise NotImplementedError("reached plan")
+
+    engine = make_engine(_runner=SimpleNamespace(plan=plan), _order_after_pre_plans=lambda: calls.append("wait"))
+    lease = SlotLease(slot=0, bucket=BucketKey("decode", 1, 1))
+    ctx = StepContext(request_ids=[1], graph_walk="decode", slot=0, capture=False, slot_lease=lease)
+    ctx.resident = SimpleNamespace(plan=lambda step, ctx: calls.append("resident"))
+    mgmt = make_mgmt()
+    with pytest.raises(NotImplementedError, match="reached plan"):
+        engine._drive_step(
+            SimpleNamespace(node_name="LLM", preplan_event=None), mgmt, [1], [], {},
+            ctx, lease, True, SubmoduleStep(steps={}, cg_key_info=None), False,
+        )
+    assert calls == ["wait", "resident", "runner"]

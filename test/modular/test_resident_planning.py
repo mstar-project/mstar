@@ -19,7 +19,7 @@ sys.path.insert(0, ".")
 
 from mstar.engine.resources import resident as resident_mod  # noqa: E402
 from mstar.engine.resources.attn.config import AttentionConfig, AttentionSpec  # noqa: E402
-from mstar.engine.resources.base import CGSlotKey, Resource  # noqa: E402
+from mstar.engine.resources.base import CGSlotKey, Residency, Resource  # noqa: E402
 from mstar.engine.resources.kv import manager as manager_mod  # noqa: E402
 from mstar.engine.resources.kv.config import KVLayout, KVReqConfig, KVSpec, KVStep, PagedKVConfig  # noqa: E402
 from mstar.engine.resources.kv.manager import KVManager  # noqa: E402
@@ -44,6 +44,7 @@ from mstar.engine.resources.step import (  # noqa: E402
 )
 from mstar.utils import knobs  # noqa: E402
 from mstar.utils.ipc_format import OffloadDelta  # noqa: E402
+from mstar.worker.micro_scheduler import ScheduledBatch  # noqa: E402
 from mstar.worker.worker import Worker  # noqa: E402
 
 PAGE = 4
@@ -165,7 +166,7 @@ def _replay(res, planner, s, promote=True):
             _promote(res, planner, s)
         planner.flush(ctx.resident_plan)
         planner.gather(s.captured)
-    state = res["kv"]._static_plan_state(lease.slot, ("main", 0))
+    state = res["kv"]._static_plan_state(lease.slot, ("main", 0), bucket.num_tokens)
     ck = CGSlotKey(bucket=bucket, slot=lease.slot, label="main")
     s.pages = state.token_to_page[: bucket.bs].tolist()
     s.offsets = state.token_to_cache[: bucket.bs].tolist()
@@ -427,7 +428,7 @@ def test_a_row_whose_pages_moved_is_rewritten():
     stream = kv._streams[1]["main"]
     moved = kv._arena.acquire(len(stream.page_indices))
     kv._arena.release(stream.page_indices)
-    stream.page_indices = moved
+    stream.page_indices.assign(moved)
     kv._touch_plan_cache(1)
     assert 1 in planner._stale
     s = _captured_step(live, planner, [1], slot=1, bs=1)
@@ -895,7 +896,7 @@ def test_a_flush_of_the_largest_step_stages_without_growing(monkeypatch):
     res = _resources(max_num_pages=64)
     planner = ResidentPlanner("n", {WALK}, {k: res[k] for k in ("kv", "pool", "rope")}, CPU, max_bs=4)
     stride = planner._tables[0].stride
-    assert planner._stager._numel >= 4 * stride + 4 * 4
+    assert planner._stager._seg_numel >= 4 * stride + 4 * 4
     monkeypatch.setattr(planner._stager, "_grow", lambda numel: pytest.fail(f"grew to {numel}"))
     rows = [(slot, 0, list(range(stride))) for slot in range(1, 5)]
     plan = SimpleNamespace(writes=SimpleNamespace(rows=rows))
@@ -975,16 +976,12 @@ def _preplan_worker(engine):
 
 
 def _preplan_engine(res, planner):
-    from mstar.engine.engine import Engine
     from mstar.engine.resources.runner import StepRunner
+    from mstar.testing_utils.engine import make_engine, make_mgmt
 
     resources = {k: res[k] for k in ("kv", "pool", "rope")}
-    engine = Engine.__new__(Engine)
-    engine._enable_nvtx = False
-    engine._device = CPU
-    engine._runner = StepRunner(resources)
     runner = SimpleNamespace(
-        plan_stream=lambda: None, pad_inputs=lambda lease, inputs: inputs,
+        plan_stream=lambda: None, pad_inputs=lambda lease, inputs, uniform=None: inputs,
         step_ids=lambda lease, rids: list(rids), release=lambda lease, rows: None,
     )
 
@@ -994,13 +991,22 @@ def _preplan_engine(res, planner):
         keys = {"kv": KVStep(), "pool": RecurrentStep(), "rope": PositionStep()}
         return SubmoduleStep(segments=segments, steps=keys)
 
-    engine._submodules = {"n": SimpleNamespace(
-        submodule=SimpleNamespace(declare_step=declare, step_is_input_free=lambda walk: False),
-        accelerator_graph_runner=runner, piecewise_runners={}, resident=planner,
-    )}
+    engine = make_engine(_runner=StepRunner(resources), _submodules={"n": make_mgmt(
+        SimpleNamespace(declare_step=declare, step_is_input_free=lambda walk: False),
+        accelerator_graph_runner=runner,
+        resident=planner,
+    )})
     engine.can_pre_plan = lambda node: True
     engine.reserve_replay_slot = lambda batch: batch.step_context.slot_lease
     return engine
+
+
+class _RecordedEvent:
+    def __init__(self, device=None):
+        self.recorded = False
+
+    def record(self, stream=None):
+        self.recorded = True
 
 
 def _preplan_batch(planner, rids, bs):
@@ -1010,7 +1016,7 @@ def _preplan_batch(planner, rids, bs):
     ctx.resident = planner
     return SimpleNamespace(
         node_name="n", inputs=[SimpleNamespace() for _ in rids], request_ids=list(rids), per_request_info={},
-        step_context=ctx, preplan_event=None, preplanned_rids=None, step=None,
+        step_context=ctx, preplan_event=None, preplanned_rids=None, step=None, uniform_inputs=None,
     )
 
 
@@ -1030,6 +1036,8 @@ def test_a_raise_in_the_preplan_leaves_the_reservation_for_exec(monkeypatch, rai
     kv, stream = res["kv"], res["kv"]._streams[1]["main"]
     assert stream.stored_len == 4 and len(stream.page_indices) == 1
 
+    # a CPU torch.Event can't be made, and the pre-plan records one even when it raises
+    monkeypatch.setattr(torch, "Event", _RecordedEvent)
     engine = _preplan_engine(res, planner)
     batch = _preplan_batch(planner, [1], 1)
     target = planner if raiser == "resident" else engine._runner
@@ -1044,6 +1052,7 @@ def test_a_raise_in_the_preplan_leaves_the_reservation_for_exec(monkeypatch, rai
     monkeypatch.setattr(target, name, real)
 
     assert batch.preplan_event is None and batch.preplanned_rids is None and batch.step is None
+    assert engine._pre_plan_done["n"].recorded
     assert engine._runner._pre_admitted is None and not engine._runner.staged
     assert not stream.step_in_flight
     assert len(stream.page_indices) == 2
@@ -1104,9 +1113,9 @@ class _HostPagesKV:
         stream = self.kv._streams[rid]["main"]
         if stream.step_in_flight:
             return 0
-        pages = stream.page_indices
+        pages = stream.page_indices.tolist()
         self.kv._touch_plan_cache(rid, row=False)
-        stream.page_indices = []
+        stream.page_indices.clear()
         self.kv._arena.release(pages)
         self.away[rid] = len(pages)
         return len(pages)
@@ -1114,19 +1123,18 @@ class _HostPagesKV:
     def reload(self, rid: int) -> bool:
         self.kv._touch_plan_cache(rid, row=False)
         stream = self.kv._streams[rid]["main"]
-        stream.page_indices = self.kv._arena.acquire(self.away.pop(rid))
+        stream.page_indices.assign(self.kv._arena.acquire(self.away.pop(rid)))
         return True
 
 
 def _offload_engine(resources, planner):
-    from mstar.engine.engine import Engine
+    from mstar.testing_utils.engine import make_engine, make_mgmt
 
-    engine = Engine.__new__(Engine)
-    engine._tp_follower_nodes = set()
-    engine._resident_delta = {}
-    engine._resources = resources
-    engine._submodules = {"n": SimpleNamespace(resources=resources, resident=planner)}
-    engine._graph_runtime = SimpleNamespace(get_rid_string=str, get_rid_handle=int)
+    engine = make_engine(
+        _resources=resources,
+        _submodules={"n": make_mgmt(resources=resources, resident=planner)},
+        _graph_runtime=SimpleNamespace(get_rid_string=str, get_rid_handle=int),
+    )
     return engine
 
 
@@ -1180,12 +1188,12 @@ def test_a_refused_admit_offloads_a_victim_and_its_reload_is_written_whole():
     assert not outcome.ok and isinstance(outcome.reason, AllocationFailed) and outcome.failed_resource == "kv"
 
     worker = _refused_worker(engine, line=[1, 2, 3])
-    batch = SimpleNamespace(node_name="n", graph_walk=WALK, request_to_worker_graph={1: "g", 2: "g"})
+    batch = ScheduledBatch(node_name="n", graph_walk=WALK, request_to_worker_graph={1: "g", 2: "g"})
     worker._handle_allocation_failure(batch, SimpleNamespace(
         node_name="n", admit_error=outcome.reason, failed_resource=outcome.failed_resource,
     ))
     assert worker.pushed == [[1, 2]] and worker.held == [3]
-    assert engine.is_offloaded("n", 3)
+    assert engine.residency("n", 3) is Residency.ON_HOST
     assert planner.slot_of(3) is None and 3 not in planner._stale
 
     # the retry runs on the victim's pages
@@ -1226,13 +1234,13 @@ def test_a_recurrent_pool_refusal_holds_the_request_since_the_pool_cannot_evict(
 
     engine = _offload_engine({k: live[k] for k in ("kv", "pool", "rope")}, planner)
     worker = _refused_worker(engine, line=[1, 2])
-    batch = SimpleNamespace(node_name="n", graph_walk="prefill", request_to_worker_graph={2: "g"})
+    batch = ScheduledBatch(node_name="n", graph_walk="prefill", request_to_worker_graph={2: "g"})
     worker._handle_allocation_failure(batch, SimpleNamespace(
         node_name="n", admit_error=outcome.reason, failed_resource="pool",
     ))
     assert worker.pushed == [[2]]
     assert worker.held == [2]
-    assert not engine.is_offloaded("n", 1)
+    assert engine.residency("n", 1) is Residency.RESIDENT
 
 
 def test_a_follower_replaying_an_offload_gives_the_slot_up_too():
@@ -1335,7 +1343,7 @@ def _decoder_step(res, planner, rids, slot, bs, context_span=0):
     ck = CGSlotKey(bucket=bucket, slot=slot, label="main")
     out.positions = res["rope"]._static_pos_ids[ck][:bs].tolist()
     for key in ("kv", "ctx") if context_span else ("kv",):
-        state = res[key]._static_plan_state(slot, ("main", 0))
+        state = res[key]._static_plan_state(slot, ("main", 0), bucket.num_tokens)
         setattr(out, f"{key}_pages", state.token_to_page[:bs].tolist())
         setattr(out, f"{key}_offsets", state.token_to_cache[:bs].tolist())
     if planner is not None:
@@ -1798,15 +1806,16 @@ def _capture_runner(max_bs=4):
 
 
 def _engine(walks, resources, device=CPU):
-    from mstar.engine.engine import Engine
     from mstar.engine.resources.runner import StepRunner
+    from mstar.testing_utils.engine import make_engine, make_mgmt
 
-    engine = Engine.__new__(Engine)
-    engine._device = device
-    engine._runner = StepRunner(resources)
-    engine._resource_nodes = {key: frozenset({"n"}) for key in resources}
     submodule = SimpleNamespace(resident_walks=lambda: frozenset(walks))
-    engine._submodules = {"n": SimpleNamespace(submodule=submodule, resources=resources, resident=None)}
+    engine = make_engine(
+        _device=device,
+        _runner=StepRunner(resources),
+        _resource_nodes={key: frozenset({"n"}) for key in resources},
+        _submodules={"n": make_mgmt(submodule, resources=resources)},
+    )
     return engine, engine._submodules["n"]
 
 
@@ -1882,19 +1891,20 @@ def test_qwen35_decode_builds_its_rope_in_the_graph_on_every_config(monkeypatch,
 @pytest.mark.parametrize("rows", ["loopback", "own_ids"])
 def test_qwen35_captured_decode_preprocess_reads_nothing_the_tables_fill(rows):
     """The graph fills positions and write locations, after `preprocess`."""
-    submodules, llm = _qwen35_llm()
+    from mstar.model.keys import SAMPLER
+
+    _, llm = _qwen35_llm()
     token = torch.tensor([5, 6])
     inputs = [
         SimpleNamespace(input_embeds=None, input_ids=None if rows == "loopback" else token[:1], custom_pos_ids=None,
                         input_seq_len=0 if rows == "loopback" else 1)
         for _ in range(2)
     ]
-    stub = SimpleNamespace(
-        _rope_in_graph=llm._rope_in_graph, _position_ids_3d=lambda inputs: pytest.fail("read positions"),
-    )
+    node = llm(None, SimpleNamespace(stop_token_ids=(1,)))
+    node._position_ids_3d = lambda inputs: pytest.fail("read positions")
     sampler = SimpleNamespace(loopback_tokens=lambda rids: token)
-    engine_inputs = SimpleNamespace(captured=True, request_ids=[1, 2], resources={submodules.SAMPLER: sampler})
-    out = llm.preprocess(stub, "decode", engine_inputs, inputs)
+    engine_inputs = SimpleNamespace(captured=True, request_ids=[1, 2], resources={SAMPLER: sampler})
+    out = node.preprocess("decode", engine_inputs, inputs)
     assert set(out) == {"input_ids"}
 
 

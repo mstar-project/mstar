@@ -51,6 +51,10 @@ class Platform:
         capability = self.cuda_capability(device)
         return capability is not None and capability >= (major, minor)
 
+    def has_block_scaled_gemm(self, device=None) -> bool:
+        """cuBLASLt's MXFP8 and NVFP4 GEMMs (``torch._scaled_mm``) run on this GPU."""
+        return False
+
     def inductor_overrides(self, num_tokens: int | None = None) -> dict[str, object]:
         """``torch._inductor.config`` values to patch in while the engine
         compiles a forward for ``num_tokens`` tokens, a capture bucket's count,
@@ -84,6 +88,13 @@ class Platform:
         ``CUDA_VISIBLE_DEVICES`` says; empty where the platform doesn't say.
         sysfs lists the host's GPUs even in a container given two of them."""
         return frozenset()
+
+    def visible_pci_addresses(self) -> frozenset[str]:
+        """The PCI addresses of the devices this process was given
+        (``CUDA_VISIBLE_DEVICES``, which ``--gpus`` sets); empty where the
+        platform doesn't report an address."""
+        return frozenset(a for i in range(torch.accelerator.device_count())
+                         if (a := self.pci_address(i)) is not None)
 
     def __repr__(self) -> str:
         return f"{type(self).__name__}()"
@@ -133,6 +144,9 @@ class CudaPlatform(Platform):
         if device is not None and torch.device(device).type != "cuda":
             return None
         return torch.cuda.get_device_capability(device)
+
+    def has_block_scaled_gemm(self, device=None) -> bool:
+        return self.has_cuda_capability(10, 0, device)
 
     def pci_address(self, device_index: int) -> str | None:
         return _torch_pci_address(device_index)

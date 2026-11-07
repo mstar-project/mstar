@@ -18,11 +18,12 @@ from test_send_registration_failure import _decode_step, _postprocess_worker
 
 from mstar.distributed.communication import WorkerParallelGroups
 from mstar.engine import accelerator_graph_runner as runner_module
-from mstar.engine.engine import Engine
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.graph.base import GraphEdge, GraphNode, Loop
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.submodule_base import DeviceLoopback, NodeSubmodule, TokenStop
+from mstar.testing_utils.engine import make_engine
+from mstar.testing_utils.model import StubModel
 from mstar.utils.threads import ThreadPool
 from mstar.worker import side_steps
 from mstar.worker.engine_manager import EngineManager, _side_lane_keys, side_stream_nodes
@@ -85,6 +86,7 @@ def _worker():
     worker.worker_id = "w0"
     worker.device = torch.device("cpu")
     worker._in_flight_rids = set()
+    worker._phase_period = 0
     worker._span = lambda *a, **k: contextlib.nullcontext()
     worker._wait_for_step = lambda step: log.append("wait for step")
     worker._clear_in_flight_flag = lambda batch: log.append("clear in flight")
@@ -486,9 +488,7 @@ class _GraphBackend:
 
 
 def _engine(backend, side=("Codec",)):
-    engine = Engine.__new__(Engine)
-    engine._device_capability = SimpleNamespace(graph_backend=backend)
-    engine._side_stream_nodes = frozenset(side)
+    engine = make_engine(_device_capability=SimpleNamespace(graph_backend=backend), _side_stream_nodes=frozenset(side))
     return engine
 
 
@@ -546,7 +546,7 @@ def _codec_node(name="Codec"):
     )
 
 
-class _Model:
+class _Model(StubModel):
     def __init__(self, walks=None, combined=None):
         if walks is None:
             walks = {"codec_chunk": _codec_node(), "talker_decode": _codec_node("Talker")}

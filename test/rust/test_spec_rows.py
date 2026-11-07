@@ -31,6 +31,7 @@ from mstar.utils.containers import ParallelList
 from mstar.worker.batch_builder import StepPick
 from mstar.worker.micro_scheduler import ChainPick, ScheduledBatch
 from mstar.worker.node_manager_utils import RequestStateManager
+from mstar.worker.rebuild import Rebuilds
 from mstar.worker.spec_rows import DeferredRowInputs
 from mstar.worker.speculation import SpeculationPreparer
 from mstar.worker.stream_buffers import StreamBufferManager
@@ -82,12 +83,14 @@ class _Scheduler:
     def __init__(self):
         self.room = None
         self.fresh: ScheduledBatch | None = None
+        self.rebuilds = Rebuilds({}, {})
 
     def backlog_splits_from(self, *a):
         return False
 
-    def pick_chain_step(self, state, target, continuing, mid_prefill=()):
-        # the chain keeps its rows up to the cap; the fresh rows come from the take
+    def pick_chain_step(self, state, target, continuing, mid_prefill=(), next_iter_of=None):
+        # the chain keeps its rows up to the cap whatever loop it advances; the
+        # fresh rows come from the take
         rows = list(continuing)
         return ChainPick(target, StepPick(
             taken=rows if self.room is None else rows[:self.room], continuing=rows, room=self.room,
@@ -166,6 +169,7 @@ def _worker(max_iters: int = 1 << 20, pair: bool = False, mixed: bool = False) -
     w.parallel_nodes = set()
     w.worker_id = ME
     w._rid_str = rt.get_rid_string
+    w._rebuilds = Rebuilds({}, {})
     return w
 
 

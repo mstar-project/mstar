@@ -62,6 +62,20 @@ def _tl_compute_type(dtype: torch.dtype) -> tl.dtype:
     raise ValueError(f"fused_experts: unsupported dtype {dtype}; use bf16 or fp16")
 
 
+def runs_per_pair(
+    hidden_states: torch.Tensor, w1: torch.Tensor, activation: str = "silu", skip_invalid: bool = False,
+) -> bool:
+    """Whether ``fused_experts``, given no alignment, runs this batch as per-pair GEMVs,
+    which read none: a caller that could precompute one has no use for it then."""
+    if skip_invalid or activation != "silu" or not hidden_states.is_cuda or not current_platform.is_cuda():
+        return False
+    # imported here: it needs triton's CUDA extras, which CPU hosts may lack. Its per-pair
+    # tiles target NVIDIA GPUs (swept on an H100), so ROCm keeps the grouped path.
+    from mstar.utils.fused_moe import decode
+
+    return hidden_states.shape[0] <= decode.ROUTED_MAX_TOKENS and decode.routed_fits(w1.shape[2], w1.shape[1] // 2)
+
+
 def fused_experts(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -131,17 +145,13 @@ def fused_experts(
     top_k = topk_ids.shape[1]
     topk_ids = _align_ids(topk_ids)
     topk_weights = topk_weights.contiguous()
-    if (alignment is None and not skip_invalid and activation == "silu"
-            and hidden_states.is_cuda and current_platform.is_cuda()):
-        # imported here: it needs triton's CUDA extras, which CPU hosts may lack. Its per-pair
-        # tiles target NVIDIA GPUs (swept on an H100), so ROCm keeps the grouped path.
+    if alignment is None and runs_per_pair(hidden_states, w1, activation, skip_invalid):
         from mstar.utils.fused_moe import decode
 
-        if num_tokens <= decode.ROUTED_MAX_TOKENS and decode.routed_fits(hidden, inter):
-            # At a few tokens each expert's GEMM tile is mostly padding rows: per-pair GEMVs
-            # read the same weights without the sort, the padding or a separate SwiGLU and sum.
-            return decode.routed_experts(hidden_states, w1, w2, topk_weights, topk_ids,
-                                         reduce=reduce_results)
+        # At a few tokens each expert's GEMM tile is mostly padding rows: per-pair GEMVs
+        # read the same weights without the sort, the padding or a separate SwiGLU and sum.
+        return decode.routed_experts(hidden_states, w1, w2, topk_weights, topk_ids,
+                                     reduce=reduce_results)
 
     # tuned launch options must reach a compiled launch as constants, and the alignment's torch
     # fallback breaks the graph before it, so a compiled call without the CUDA op runs the default

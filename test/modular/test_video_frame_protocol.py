@@ -37,6 +37,7 @@ from mstar.graph.base import GraphEdge  # noqa: E402
 from mstar.graph.loop_indices import NestedLoopIndices  # noqa: E402
 from mstar.model.waypoint.submodules import PRIME_WALK, ROLLOUT_WALK  # noqa: E402
 from mstar.model.waypoint.waypoint_model import WaypointModel  # noqa: E402
+from mstar.testing_utils.model import StubModel, make_model  # noqa: E402
 
 
 def _metadata(**overrides):
@@ -187,7 +188,7 @@ def test_server_metadata_is_canonical_and_counts_raw_frames():
     }
 
 
-class _FrameModel:
+class _FrameModel(StubModel):
     def postprocess(self, tensor, modality, request_kwargs=None):
         assert modality == "video_frame"
         return tensor.cpu().contiguous().numpy().tobytes()
@@ -398,7 +399,7 @@ def test_data_worker_cleanup_drops_all_frame_protocol_state():
     assert "reused" not in worker.request_output_state
     assert worker.request_output_state["other"].frame_index == 8
 
-    worker.model = SimpleNamespace(process_prompt=lambda *args, **kwargs: {})
+    worker.model = make_model(process_prompt=lambda *args, **kwargs: {})
     worker.device = "cpu"
     worker.enable_prof = False
     worker.timing_requested = threading.Event()
@@ -639,8 +640,8 @@ def test_rollout_harness_requires_worker_schedule_interleaving_and_cleanup_marke
             "DEBUG Executing: dit graph_walk=rollout ('rid-b',)",
             "DEBUG Executing: dit graph_walk=rollout ('rid-a',)",
             "DEBUG Executing: dit graph_walk=rollout ('rid-b',)",
-            "INFO Request cleanup complete: rid-a",
-            "INFO Request cleanup complete: rid-b",
+            "DEBUG Request cleanup complete: rid-a",
+            "DEBUG Request cleanup complete: rid-b",
         ]
     )
 

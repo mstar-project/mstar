@@ -40,6 +40,7 @@ from mstar.worker.micro_scheduler import (  # noqa: E402
     PopReadyResult,
     ScheduledBatch,
 )
+from mstar.worker.rebuild import Rebuilds  # noqa: E402
 from mstar.worker.speculation import SpeculationBuilder, SpeculationContext, SpeculationPreparer  # noqa: E402
 from mstar.worker.stream_buffers import StreamBufferManager  # noqa: E402
 from mstar.worker.worker import SpeculationTarget, Worker  # noqa: E402
@@ -147,11 +148,12 @@ def _leader_speculation(final: bool):
     )
     scheduler = SimpleNamespace(
         backlog_splits_from=lambda *a: False,
-        pick_chain_step=lambda state, target, continuing, mid_prefill=(): ChainPick(target, StepPick(
+        pick_chain_step=lambda state, target, continuing, mid_prefill=(), next_iter_of=None: ChainPick(target, StepPick(
             taken=[*continuing, FRESH], continuing=list(continuing), room=None,
             held_back=set(), ordered=False,
         ), []),
         take_chain_step=lambda state, chain, *_: fresh,
+        rebuilds=Rebuilds({}, {}),
     )
     runtime, target = _runtime()
     worker = _worker(scheduler, runtime)
@@ -174,6 +176,7 @@ def _follower_speculation(final: bool):
         ),
         pop_tp_follow_head=lambda: head,
         combined_walk_of={},
+        rebuilds=Rebuilds({}, {}),
     )
     scheduler._key = MicroScheduler._key.__get__(scheduler)
     runtime, _ = _runtime()
