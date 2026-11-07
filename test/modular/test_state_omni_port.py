@@ -112,7 +112,7 @@ def _reference(c: Qwen3OmniModelConfig) -> list:
         )),
         RaggedAttentionSpec(resource_key=VISION_ATTN, nodes={"vision_encoder"}, config=RaggedAttentionConfig(
             num_qo_heads=c.vision.num_heads, num_kv_heads=c.vision.num_heads, head_dim=c.vision.head_dim,
-            max_segments_per_request=VisionEncoderSubmodule.BLOCK_LOOP_PATCH_BUCKETS[-1] // 256,
+            max_segments_per_step=VisionEncoderSubmodule.BLOCK_LOOP_PATCH_BUCKETS[-1] // 256,
         )),
     ]
 
@@ -129,7 +129,7 @@ def test_specs_equal_the_hand_written_ones():
 def test_specs_equal_the_hand_written_ones_after_yaml_overrides():
     model = _model()
     overrides = {"resources": {
-        THINKER_KV: {"max_seq_len": 1024}, VISION_ATTN: {"max_segments_per_request": 9},
+        THINKER_KV: {"max_seq_len": 1024}, VISION_ATTN: {"max_segments_per_step": 9},
         THINKER_SAMPLER: {"enable_logprobs": True},
     }}
     specs, reference = node_resources(model), _reference(model.config)
@@ -311,7 +311,7 @@ def test_a_vision_encoder_step_equals_the_hand_written_one():
     model = _model()
     sub = VisionEncoderSubmodule(None, model.config)
     sub.bind_node_state(_handles(model, "vision_encoder"))
-    row = NodeInputs(tensor_inputs={"seq_lengths": (4, 4)})
+    row = NodeInputs(input_seq_len=8, resource_step_info={"main": (4, 4)})
     step = state_steps(sub.declare_step("prefill_vision", [1], [row]), sub.state_handles)
     assert list(step.steps[VISION_ATTN].segments) == [Segment(1, "main", 4)] * 2
     assert not step.steps[VISION_ATTN].causal
@@ -326,9 +326,9 @@ def test_the_vision_capture_check_reads_the_ceiling_in_effect():
     model = _model()
     sub = VisionEncoderSubmodule(None, model.config)
     resources = {spec.resource_key: _StubResource() for spec in node_resources(model)}
-    resources[VISION_ATTN].max_segments_per_request = 2
+    resources[VISION_ATTN].max_segments_per_step = 2
     sub.bind_node_state(node_handles(model, "vision_encoder", resources, host_fields=HostFields()))
-    frames = [SimpleNamespace(tensor_inputs={"seq_lengths": (4,) * n}) for n in (2, 3)]
+    frames = [SimpleNamespace(input_seq_len=4 * n, resource_step_info={"main": (4,) * n}) for n in (2, 3)]
     assert sub._fits_capture(frames[:1]) and not sub._fits_capture(frames[1:]), "a YAML override must still hold"
 
 

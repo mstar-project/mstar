@@ -1907,7 +1907,7 @@ def test_qwen3_tts_codec_postprocess_uses_its_own_pass_geometry():
 def test_qwen3_tts_codec_emits_the_same_bytes_through_the_engine():
     """The engine's postprocess emits byte for byte what per-request
     ``postprocess`` alone does: two batched streams, ramp to final."""
-    from mstar.engine.engine import Engine
+    from mstar.testing_utils.engine import make_engine, make_mgmt
 
     config = _tiny_model_config()
     config.codec = _tiny_codec_config(chunk_schedule=(1, 3, 8, 20, 5), chunk_frames=6)
@@ -1925,7 +1925,7 @@ def test_qwen3_tts_codec_emits_the_same_bytes_through_the_engine():
             stream.put(f"t{i}", frames[i])
         stream.signal_done()
         streams[rid] = stream
-    engine = SimpleNamespace(_submodules={"Codec": SimpleNamespace(submodule=submodule, piecewise_runners={})})
+    engine = make_engine(_submodules={"Codec": make_mgmt(submodule)})
     with torch.no_grad():
         while all(stream.has_chunk_ready() for stream in streams.values()):
             chunks = {rid: stream.pop_chunk() for rid, stream in streams.items()}
@@ -1949,7 +1949,7 @@ def test_qwen3_tts_codec_emits_the_same_bytes_through_the_engine():
                 per_request_info_wrapped={rid: None for rid in rids}, failed_requests=failures,
                 register_failure=failures.__setitem__, step_context=SimpleNamespace(graph_walk="codec_chunk"),
             )
-            Engine._postprocess_batch(engine, batch, out)
+            engine._postprocess_batch(batch, out)
             assert not failures
             for rid in rids:
                 got, want = out[rid]["audio_chunk"][0], alone[rid]["audio_chunk"][0]

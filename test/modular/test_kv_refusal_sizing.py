@@ -26,13 +26,13 @@ from test_admit_failure_handling import (
 from test_micro_scheduler import _Manager, _next_batch, _scheduler
 from test_worker_drain import _worker as _teardown_worker
 
-from mstar.engine.engine import Engine
 from mstar.engine.resources.attn.config import AttentionConfig, AttentionSpec
 from mstar.engine.resources.kv import manager as manager_mod
 from mstar.engine.resources.kv.config import KVSpec, KVStep, PagedKVConfig
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.spec import resolve_spec_dependencies
 from mstar.engine.resources.step import AdmitRuntimeError, AllocationFailed, Segment, StepContext
+from mstar.testing_utils.engine import make_engine
 from mstar.utils.ipc_format import RemoveRequest
 from mstar.worker.micro_scheduler import ScheduledBatch
 from mstar.worker.worker import Worker
@@ -366,20 +366,10 @@ def test_a_row_the_cache_served_does_not_make_a_batch_too_big_alone():
 def _engine_manager(**pools: KVManager) -> SimpleNamespace:
     """The worker's engine manager over the real ``Engine.remove_request``,
     with these KV pools as the engine's resources."""
-    from mstar.engine.chunking import ChunkingManagement
-    from mstar.engine.state.host import HostFields
-
-    engine = SimpleNamespace(
-        _loopback_steps={}, _resources=pools, _submodules={},
-        # the real remove_request purges chunk state and host fields too (rid_table.py)
-        _chunking=ChunkingManagement({}), _host_fields=HostFields(),
-        _runner=SimpleNamespace(
-            remove_request=lambda rid: [pool.remove_request(rid) for pool in pools.values()],
-        ),
-    )
-    return SimpleNamespace(
-        remove_request=lambda rid: Engine.remove_request(engine, rid),
-    )
+    engine = make_engine(_resources=pools, _runner=SimpleNamespace(
+        remove_request=lambda rid: [pool.remove_request(rid) for pool in pools.values()],
+    ))
+    return SimpleNamespace(remove_request=engine.remove_request)
 
 
 def _remove(worker, *rids: str) -> None:

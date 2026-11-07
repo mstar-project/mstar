@@ -49,6 +49,8 @@ from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import KVLabel, PrefixKeys, _wrap_node_in_loop
 from mstar.model.submodule_base import ChunkingPolicy
 from mstar.streaming.topology import StreamingGraphEdge
+from mstar.testing_utils.engine import make_engine, make_mgmt
+from mstar.testing_utils.model import StubModel, make_model
 from mstar.validation.resources import _unservable_walks, streamed_partitions
 
 KV = "kv"
@@ -87,7 +89,7 @@ def _stub_transfer(monkeypatch):
     monkeypatch.setattr(manager_mod, "KVTransferManager", _StubTransfer)
 
 
-class _Model:
+class _Model(StubModel):
     """Names a checkpoint and a preprocessing identity, nothing else."""
 
     def __init__(self, checkpoint=None, name="_Model"):
@@ -99,9 +101,6 @@ class _Model:
 
     def preprocess_fingerprint(self):
         return self._name
-
-    def kv_labels(self):
-        return {}
 
 
 class _Declaring(_Model):
@@ -154,8 +153,7 @@ def _root(kv=None, rope=None, model=None, instance=None) -> bytes:
     nodes whose lockstep instances are ``instance`` (one rank by default)."""
     kv = kv or _kv()
     rope = rope or _rope()
-    engine = Engine.__new__(Engine)
-    engine._resources = {KV: kv, ROPE: rope}
+    engine = make_engine(_resources={KV: kv, ROPE: rope})
     specs = {
         KV: KVSpec(resource_key=KV, nodes={"LLM"}, config=kv.config),
         ROPE: PositionSpec(
@@ -415,8 +413,7 @@ class _KeepingSpec(NodeResourceSpec):
 
 
 def _open(resources: dict, specs: dict | None = None) -> None:
-    engine = Engine.__new__(Engine)
-    engine._resources = resources
+    engine = make_engine(_resources=resources)
     kv = resources[KV]
     _open_caches(
         engine, {KV: KVSpec(resource_key=KV, nodes={"LLM"}, config=kv.config), **(specs or {})}, _Model(), {"LLM": 1},
@@ -464,7 +461,7 @@ def _laid_out(text_feeds=EMIT_TO_CLIENT, image_feeds=EMIT_TO_CLIENT, image_walk_
     walks = ("prefill", "prefill_image")
     label = KVLabel(keys=PrefixKeys("text_inputs", walks))
     partition = PartitionDefinition(name="LLM", graph_walks=set(graphs), initial_walk="prefill", producer_partitions=[])
-    return SimpleNamespace(
+    return make_model(
         kv_labels=lambda: {KV: {"main": label}}, get_graph_walk_graphs=lambda: graphs,
         get_partitions=lambda: [partition],
         checkpoint_path=lambda: None, preprocess_fingerprint=lambda: "laid out",
@@ -548,16 +545,13 @@ def test_a_chunked_node_still_names_the_partition_it_streams_into():
 # the model names no checkpoint, so the cache, another engine's, opens only with a salt
 @pytest.mark.parametrize(("salt", "vit"), [("s", True), ("", None)], ids=["salted", "unsalted"])
 def test_only_a_node_whose_output_is_cached_under_a_digest_is_compiled_dynamic(monkeypatch, salt, vit):
-    engine = Engine.__new__(Engine)
-    engine._resources = {}
-    engine._device = torch.device("cuda")
+    engine = make_engine(_device=torch.device("cuda"), _submodules={
+        # "vae" is an encoder that no layout walk runs, like an edit's.
+        name: make_mgmt(submodule=SimpleNamespace(forward=None, forward_batched=None))
+        for name in ("vit", "LLM", "vae")
+    })
     kv = _kv(prefix_cache_salt=salt).config
     _open_caches(engine, {KV: KVSpec(resource_key=KV, nodes={"LLM"}, config=kv)}, _laid_out(), {})
-    # "vae" is an encoder that no layout walk runs, like an edit's.
-    engine._submodules = {
-        name: SimpleNamespace(submodule=SimpleNamespace(forward=None, forward_batched=None))
-        for name in ("vit", "LLM", "vae")
-    }
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch, "compile", lambda fn, dynamic, **kwargs: dynamic)
 
@@ -573,15 +567,14 @@ def test_only_a_node_whose_output_is_cached_under_a_digest_is_compiled_dynamic(m
 def test_an_encoder_that_marks_its_own_dims_compiles_with_the_default_while_its_output_is_cached(monkeypatch):
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch, "compile", lambda fn, dynamic, **kwargs: dynamic)
-    engine = Engine.__new__(Engine)
-    engine._resources = {}
-    engine._device = torch.device("cuda")
+    vit = SimpleNamespace(forward="eager", forward_batched="eager", marks_dynamic_dims=True)
+    engine = make_engine(
+        _device=torch.device("cuda"), _submodules={"vit": make_mgmt(submodule=vit, forward="eager")},
+    )
     spec = KVSpec(resource_key=KV, nodes={"LLM"}, config=PagedKVConfig(
         num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=64,
     ))
     _open_caches(engine, {KV: spec}, _laid_out(), {})
-    vit = SimpleNamespace(forward="eager", forward_batched="eager", marks_dynamic_dims=True)
-    engine._submodules = {"vit": SimpleNamespace(submodule=vit, forward="eager")}
 
     engine._compile_submodules()
 

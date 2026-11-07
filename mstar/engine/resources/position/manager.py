@@ -200,6 +200,13 @@ class RopeManager(PositionManager):
     def reset_request(self, rid: str, free: bool=False):
         self._counters[rid].clear()
 
+    supports_drop = True
+
+    def drop(self, rid: str, tokens: int) -> int:
+        # Recomputing the KV starts positions from zero, and `apply_cached_prefix` never moves a counter back.
+        self.reset_request(rid)
+        return 0
+
     def correct_len(self, rid: str, label: str, delta: int) -> None:
         """Move a stream's position by ``delta``, as ``KVManager.correct_len`` moves its KV
         length after a speculative verify step."""
