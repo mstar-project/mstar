@@ -941,13 +941,13 @@ class Worker(RepeatingSteps):
         if unknown := set(walk_runs) - walk_graphs.keys():
             raise ValueError(f"walk_runs names unknown walks: {sorted(unknown)}")
         self.scheduler.execution_units = {
-            (unit.nodes[0], walk): unit
+            (node, member_walk): unit
             for walk in walk_runs for unit in self._graph_runtime.execution_units(walk)
-            # Streaming units have independent readiness/Loop counts. Their
-            # runtime claim is available, but conditional capture lowering is
-            # not yet an eligible engine path.
-            if not unit.streaming_edges and not (set(unit.nodes) & self.parallel_nodes)
-            and all(self.scheduler.lane_of.get((node, walk), CHAIN_LANE) == CHAIN_LANE for node in unit.nodes)
+            if not (set(unit.nodes) & self.parallel_nodes)
+            and all(self.scheduler.lane_of.get(key, CHAIN_LANE) == CHAIN_LANE
+                    for key in zip(unit.nodes, unit.graph_walks, strict=True))
+            for node, member_walk in (zip(unit.nodes, unit.graph_walks, strict=True) if unit.streaming_edges
+                                      else ((unit.nodes[0], unit.graph_walks[0]),))
         }
 
         for unit in self.scheduler.execution_units.values():
@@ -2945,6 +2945,12 @@ class Worker(RepeatingSteps):
         rid = source.request_ids[0]
         existing = target.stream_windows.get(rid, ())
         if len(existing) > 1 or (existing and existing[0].name != signal):
+            return False
+        metadata = target.per_request_input_metadata.get(rid)
+        if not existing and metadata is not None and signal in metadata.stream_chunks:
+            # An ordinary pop already advanced the policy and released its
+            # ring positions. Its graph input must execute before a future
+            # reader can replace it; only retained pops can be adopted.
             return False
         done = group.finished_rids[group.unit.nodes.index(maker)] if group.finished_rids else frozenset()
         room = 0 if done else engine.ring_room(maker, [rid])
@@ -5699,8 +5705,11 @@ class Worker(RepeatingSteps):
         self.parallel_groups.barrier_all()
         self._verify_tp_async_sched_agrees()
 
-        # a run on the device keeps its columns in its capture, so they are settled before it
-        for key in self._step_repeats.device_stops() if self._step_repeats is not None else ():
+        # Capturing a body for a connected member does not permit that member
+        # to repeat its streamed input alone. Standalone eligibility below is
+        # still settled from the original serving settings and graph edges.
+        capture_runs = self._capture_run_requests()
+        for key in capture_runs:
             self._ask_run_columns(*key)
         # the sampler scores its stops in every capture, so it is asked before them
         self._odds_refusals: dict[tuple[str, str], str | None] = {}
@@ -5712,7 +5721,7 @@ class Worker(RepeatingSteps):
             {(node, walk): self._graph_runtime.loop_layout(walk, loop)
              for (walk, node), loop in self._innermost_loop_by_node.items()},
             self._step_repeats.carried() if self._step_repeats is not None else {},
-            self._step_repeats.device_stops() if self._step_repeats is not None else {},
+            capture_runs,
             self._step_repeats.kept_rows(self.engine_manager.engine.resident_nodes())
             if self._step_repeats is not None else {},
         )

@@ -93,7 +93,7 @@ class _Loop:
 
 def _runner(
     monkeypatch, loop, tokens, bs=2, limit=6, refill_at=None, carries=None, stream_tokens=False, counted=False,
-    progress=False, membership=None, unmanaged=False,
+    progress=False, membership=None, unmanaged=False, ask=None,
 ):
     """A runner holding a captured run whose forward samples ``tokens[iteration]``."""
     monkeypatch.setattr(torch.accelerator, "is_available", lambda: False)
@@ -128,9 +128,9 @@ def _runner(
         rows.resident_binding().bind(planner, "rows")
         resident = SimpleNamespace(bucket=BucketKey(WALK, bs, bs), slot=0, buffers=buffers, slots=buffers.slots)
         runner.test_resource = torch.zeros(capacity + 1)
-    runner.ask_run(WALK, RunAsk(None if counted else "new_token", frozenset() if counted else frozenset({EOS}),
-                                False, limit, carries or {}, ("frame",), ("cond",),
-                                refill_at, stream_tokens, layout, membership))
+    runner.ask_run(WALK, ask or RunAsk(None if counted else "new_token", frozenset() if counted else frozenset({EOS}),
+                                       False, limit, carries or {}, ("frame",), ("cond",),
+                                       refill_at, stream_tokens, layout, membership))
     static = {"cond": torch.zeros(bs)}
     if membership is None or unmanaged:
         static["h"] = torch.zeros(bs)
@@ -1778,3 +1778,104 @@ def test_publication_never_loads_a_new_cas_kernel_for_row_or_descriptor_values()
         (next(descriptor.handle for descriptor in descriptors if descriptor.row == row) << 2) | 2
         if row in (0, 1, 17) else 0 for row in range(18)
     ]
+
+
+@pytest.mark.parametrize("case", ["connected", "absent", "custom", "explicit_stop"])
+def test_connected_capture_selection_preserves_standalone_rules_and_prepares_owners(case, monkeypatch):
+    from mstar.engine.engine import Engine
+    from mstar.worker.step_repeats import StepRepeats
+    from mstar.worker.worker import Worker
+
+    unit = SimpleNamespace(nodes=("a", "n"), graph_walks=("produce", WALK),
+                           streaming_edges=(("a", "n", "x"),))
+    config = RepeatConfig(max=4, device_stop="skip") if case == "explicit_stop" else RepeatConfig()
+    worker = Worker.__new__(Worker)
+    worker._step_repeats = StepRepeats({"n": config}, {("n", WALK): object()})
+    worker.scheduler = SimpleNamespace(execution_units={} if case == "absent" else {("a", "produce"): unit})
+    requests = worker._capture_run_requests()
+    ordinary = worker._step_repeats.device_stops()
+    assert ordinary == ({("n", WALK): config} if case == "explicit_stop" else {})
+    assert worker._step_repeats.config("n") == config and not worker._step_repeats.may_repeat("n", WALK)
+    if case == "absent":
+        assert not requests
+    else:
+        assert set(requests) == {("a", "produce"), ("n", WALK)}
+        assert requests["n", WALK] == config
+    asks, prepared = [], []
+    owner = SimpleNamespace(ask_repeats=prepared.append)
+    engine = Engine.__new__(Engine)
+    engine._device = torch.device("cuda")
+    engine._walk_runs = frozenset() if case == "absent" else frozenset({"produce"})
+    engine._graph_runtime = SimpleNamespace(execution_units=lambda walk: (unit,))
+    engine._submodules = {"n": SimpleNamespace(
+        resources={"owner": owner}, joint_comm_group=SimpleNamespace(world_size=1),
+        device_stops={}, refills={}, loopback_rows=None, run_columns={WALK: frozenset({"frame"})},
+        submodule=SimpleNamespace(repeat_carry=lambda walk, signals: {}),
+    )}
+    def stop_after_owner_preparation():
+        raise RuntimeError()
+    engine._compile_regions = stop_after_owner_preparation
+    with pytest.raises(RuntimeError):
+        engine.warmup(device_stops=requests)
+    assert prepared == ([] if case == "absent" else [WALK])
+    engine.get_stop_policies = lambda node, walk: None if case == "custom" else {}
+    runner = SimpleNamespace(ask_run=lambda walk, ask: asks.append(ask))
+    engine._ask_run("n", runner, WALK, config, ())
+    if case in {"absent", "custom"}:
+        assert not asks
+    else:
+        assert len(asks) == 1 and asks[0].token_signal is None and asks[0].limit == config.max
+        _, run, _, calls = _runner(monkeypatch, _Loop(), [[1]], bs=1, counted=True, ask=asks[0])
+        stops, output, _ = _run(run, 1, 1)
+        assert len(calls) == 1 and stops[RUN_COUNTS].tolist() == [1]
+        assert output["frame"].tolist() == [[2]]
+    if case == "explicit_stop":
+        worker.engine_manager = SimpleNamespace(get_engine=lambda node: engine)
+        with pytest.raises(ValueError):
+            worker._step_repeats.settle(lambda *a: None, lambda *a: "stream input needs its policy",
+                                        {"device stop": worker._device_stop_refusal})
+
+
+@pytest.mark.parametrize("mismatch", [None, "producer", "producer_walk", "consumer_walk", "signal"])
+def test_a_connected_ring_exemption_is_scoped_to_its_exact_members_and_walks(mismatch):
+    from mstar.streaming.chunk_policy import FixedChunkPolicy
+    from mstar.worker.step_repeats import StepRepeats
+    from mstar.worker.worker import Worker
+
+    worker = Worker.__new__(Worker)
+    worker._step_repeats = StepRepeats({"n": RepeatConfig(max=4)}, {("n", WALK): SimpleNamespace(streamed=True)})
+    unit = SimpleNamespace(
+        nodes=("other" if mismatch == "producer" else "a", "n"),
+        graph_walks=("other" if mismatch == "producer_walk" else "produce",
+                     "other" if mismatch == "consumer_walk" else WALK),
+        streaming_edges=(("other" if mismatch == "producer" else "a", "n",
+                          "other" if mismatch == "signal" else "x"),),
+    )
+    worker.scheduler = SimpleNamespace(execution_units={("a", "produce"): unit})
+    worker.streams = SimpleNamespace(
+        connections=[SimpleNamespace(edge_name="x", join_dim=None, chunk_policy_factory=lambda: FixedChunkPolicy(2))],
+        consumer_node={"x": "n"},
+    )
+    refusal = worker._ring_refusal_for("a", "x", 8, {"produce"})
+    assert (refusal is None) is (mismatch is None)
+
+
+
+def test_a_streamed_unit_waits_and_yields_for_its_nontrigger_members(monkeypatch):
+    from mstar.worker.step_repeats import StepRepeats
+
+    worker, log = _waiting_on_a_run(monkeypatch, [{OTHER}])
+    worker._step_repeats = StepRepeats({"a": RepeatConfig(max=4), "n": RepeatConfig(max=4, ready_waits=True)}, {})
+    worker._device_runs = frozenset()  # neither body was requested as a standalone device run
+    worker._spec_peek = True
+    worker._hold_rows = lambda *args: None
+    worker.engine_manager = SimpleNamespace(get_engine=lambda node: SimpleNamespace(yield_runs=log.append))
+    pending = _run_step([1], 1, token_stream=None, step_context=SimpleNamespace(repeats=1))
+    pending.group = SimpleNamespace(
+        submitted=True, unit=SimpleNamespace(streaming_edges=(("a", "n", "x"),)),
+        members=((SimpleNamespace(node_name="a"), SimpleNamespace(step_context=SimpleNamespace(repeats=4))),
+                 (SimpleNamespace(node_name="n"), pending.node_batch)),
+    )
+    assert worker._is_device_run(pending)
+    assert not worker._await_run(pending, None, [], None)
+    assert log.count("a") == 1 and "n" not in log

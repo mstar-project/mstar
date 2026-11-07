@@ -872,6 +872,16 @@ def test_future_policy_capture_bank_reuse_clears_history_and_checks_before_stagi
     window.select(torch.tensor([1, 0]), torch.tensor([False, False]), torch.tensor([True, True]))
     assert window.selected.tolist() == window.history.tolist() == [-1, -1]
     assert window.counts.tolist() == [0, 0] and window.ready.item() == 0
+    source.cancel_window(reservation)
+    smaller = source.reserve_future_window([0], 1).reservation
+    assert owner.prepare_stream_window(lease, len(smaller.decisions), len(smaller.transitions)) is window
+    owner.stage_stream_window(lease, [smaller], [[True] * len(smaller.transitions)])
+    window.select(torch.tensor([1, 0]), torch.tensor([False, False]), torch.tensor([True, False]))
+    window.advance()
+    window.select(torch.tensor([2, 0]), torch.tensor([False, False]), torch.tensor([True, False]))
+    assert window.counts.tolist() == [1, 0] and window.ready.item() == 0
+    with pytest.raises(ValueError):
+        owner.prepare_stream_window(lease, len(reservation.decisions) + 1, len(reservation.transitions))
     owner.discard_window(lease)
     assert owner.prepare_stream_window(lease, len(reservation.decisions), len(reservation.transitions)) is not window
 
@@ -1159,11 +1169,12 @@ def test_a_full_producer_reservation_can_still_drain_consumers_and_preview_is_bo
     assert not source.producer_done and not source.has_chunk_ready()
 
 
-@pytest.mark.parametrize("ingested", [False, True])
+@pytest.mark.parametrize("ingested", [False, True, "ordinary"])
 def test_worker_reserves_and_restores_a_stream_unit_without_consuming_input(ingested, monkeypatch):
     from mstar.engine.engine import Engine, ExecutingBatch, ExecutionGroup
     from mstar.engine.resources.loopback_rows import LoopbackRows
     from mstar.engine.resources.step import StepContext
+    from mstar.model.submodule_base import InputMetadata
     from mstar.worker.micro_scheduler import ScheduledBatch
     from mstar.worker.worker import Worker
 
@@ -1177,7 +1188,8 @@ def test_worker_reserves_and_restores_a_stream_unit_without_consuming_input(inge
     if ingested:
         ring.ring_write(EDGE, [RID], torch.tensor([[[10], [11]]]), ring.ring_reserve(EDGE, [RID], 2))
         source.put_positions([0, 1])
-        original = streams.reserve_edge(source, EDGE, RID, 1)
+        original = (streams._chunk_edge(source.pop_chunk(), EDGE, NODE, RID) if ingested == "ordinary"
+                    else streams.reserve_edge(source, EDGE, RID, 1))
         streams.mark_ingested(RID, original)
     monkeypatch.setattr(ring, "ring_read", lambda *a: pytest.fail("unexecuted ring was read"))
     engine = Engine.__new__(Engine)
@@ -1190,7 +1202,9 @@ def test_worker_reserves_and_restores_a_stream_unit_without_consuming_input(inge
     )) for node, walk, bound in (("producer", "source", 4), (NODE, "sink", 3)))
     a, b = (member for _, member in members)
     if original is not None:
-        b.stream_windows = {RID: [original]}
+        b.per_request_input_metadata = {RID: InputMetadata(stream_chunks={EDGE: original.chunk})}
+        if ingested != "ordinary":
+            b.stream_windows = {RID: [original]}
     group = ExecutionGroup(SimpleNamespace(
         nodes=("producer", NODE), streaming_edges=(("producer", NODE, EDGE),),
     ), 1, members)
@@ -1198,6 +1212,12 @@ def test_worker_reserves_and_restores_a_stream_unit_without_consuming_input(inge
     worker.engine_manager = SimpleNamespace(get_engine=lambda name: engine)
     worker.streams = streams
     before = ring.ring_room(EDGE, RID)
+    if ingested == "ordinary":
+        assert not worker._reserve_group_stream(group)
+        assert not source._reservations and not a.ring_bases
+        assert source._consumed == 1 and ring.ring_room(EDGE, RID) == before
+        assert _consume(streams, tm, original)[0].flatten().tolist() == [10]
+        return
     assert worker._reserve_group_stream(group)
     reader = b.stream_windows[RID][0]
     assert reader.chunk.reservation.decisions

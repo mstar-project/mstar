@@ -257,8 +257,8 @@ class IterationTables(Resource):
             raise ValueError("a captured stream policy needs bounded decision and transition tables")
         key, bs = (lease.bucket, lease.buffer_slot), lease.bucket.bs
         if (window := self._stream_windows.get(key)) is not None:
-            if (window.decisions.shape != (bs, decisions, 4) or window.chunks.shape != (bs, transitions, 6)
-                    or window.positions.shape != (bs, positions)):
+            if (window.decisions.shape[0] != bs or decisions > window.decisions.shape[1]
+                    or transitions > window.chunks.shape[1] or positions > window.positions.shape[1]):
                 raise ValueError("captured stream-policy geometry changed for the same capture")
             return window
         def zeros(*shape, dtype=torch.long):

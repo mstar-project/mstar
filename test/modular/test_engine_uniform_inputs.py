@@ -891,7 +891,7 @@ def test_streamed_alternatives_preserve_host_meaning_and_do_not_read_future_valu
 
 
 @pytest.mark.parametrize("device_name", ["cpu", "cuda"])
-@pytest.mark.parametrize("mode", ["live", "full", "yield", "unsupported"])
+@pytest.mark.parametrize("mode", ["live", "full", "yield", "unsupported", "bank_small"])
 def test_streamed_engine_composes_independent_bodies_and_owner_reads(device_name, mode, monkeypatch):
     from dataclasses import replace
 
@@ -940,6 +940,13 @@ def test_streamed_engine_composes_independent_bodies_and_owner_reads(device_name
     if device_name == "cpu":
         monkeypatch.setattr("mstar.engine.accelerator_graph_runner.capture_into_graph",
                             lambda fn, *a, **kw: (SimpleNamespace(replay=fn), None))
+    else:
+        runtime = backend.while_runtime()
+        launch = runtime.launch
+        def launch_counted(*args):
+            launches.append(1)
+            return launch(*args)
+        monkeypatch.setattr(runtime, "launch", launch_counted)
 
     def capture(fn):
         if device_name == "cpu":
@@ -1050,9 +1057,11 @@ def test_streamed_engine_composes_independent_bodies_and_owner_reads(device_name
         owner = UnsupportedOwner()
         eng._runner = StepRunner({"unsupported": owner})
         eng._submodules["a"].resources = {"unsupported": owner}
+    if mode == "bank_small":
+        tables.prepare_stream_window(leases["b"], 1, 1, 1)
     output = eng.exec_group(group)
-    if mode == "unsupported":
-        assert output is None and "unsupported" in group.refusal
+    if mode in {"unsupported", "bank_small"}:
+        assert output is None and group.refusal is not None
         assert not group.submitted and not launches
         worker._restore_group_stream(group)
         assert not source._reservations and ring.ring_room("x", 2) == 8
@@ -1060,8 +1069,7 @@ def test_streamed_engine_composes_independent_bodies_and_owner_reads(device_name
     assert output is not None, group.refusal
     if device_name == "cuda":
         backend.synchronize()
-    else:
-        assert launches == [1]
+    assert launches == [1]
     if not full:
         assert output[0].check_stop_buffers[RUN_COUNTS].tolist() == [0 if yielded else 3]
     else:

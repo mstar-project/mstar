@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import time
 from collections import Counter
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from contextlib import nullcontext
 from dataclasses import replace
 from typing import TYPE_CHECKING
@@ -258,13 +258,28 @@ class RepeatingSteps:
             return NOT_ASKED
         return engine.rows_refusal(node_name, graph_walk)
 
+    def _capture_run_requests(self):
+        """One startup capture map; standalone settings remain unmodified."""
+        if self._step_repeats is None:
+            return {}
+        requests = dict(self._step_repeats.device_stops())
+        for unit in self.scheduler.execution_units.values():
+            if unit.streaming_edges:
+                for node, walk in zip(unit.nodes, unit.graph_walks, strict=True):
+                    requests.setdefault((node, walk), self._step_repeats.config(node))
+        return requests
+
     def _ask_run_columns(self, node_name: str, graph_walk: str) -> None:
         engine = self.engine_manager.get_engine(node_name)
         inline = (
             engine.inline_client_signals(node_name, graph_walk) if self._graph_runtime.supports_inline_emit else {}
         )
-        edges = self._step_repeats.edges[(node_name, graph_walk)]
-        engine.keep_run_columns(node_name, graph_walk, run_columns(edges, inline))
+        edges = self._step_repeats.edges.get((node_name, graph_walk))
+        # A member outside a Loop executes at most once, but its parent still
+        # records zero/one physical output independently of the other member.
+        columns = (self._graph_runtime.get_output_signals(node_name, graph_walk) if edges is None
+                   else run_columns(edges, inline))
+        engine.keep_run_columns(node_name, graph_walk, columns)
 
     def _stream_refusal(self, node_name: str, graph_walk: str) -> str | None:
         """Why this walk's runs don't send their tokens as they land, or None,
@@ -316,7 +331,7 @@ class RepeatingSteps:
                         walks_of.setdefault(edge.name, set()).add(walk)
             ringed = set()
             for signal, walks in sorted(walks_of.items()):
-                why = self._ring_refusal_for(signal, queue["depth"])
+                why = self._ring_refusal_for(node, signal, queue["depth"], walks)
                 if why is None:
                     rows = engine.ask_ring(node, signal, queue["depth"], walks)
                     if isinstance(rows, str):
@@ -328,7 +343,7 @@ class RepeatingSteps:
                     self._ring_refusals.setdefault((node, walk), why)
             self._ring_signals[node] = frozenset(ringed)
 
-    def _ring_refusal_for(self, signal: str, depth: int) -> str | None:
+    def _ring_refusal_for(self, producer: str, signal: str, depth: int, walks: Collection[str]) -> str | None:
         """Why ``signal``'s items can't stay in a ring ``depth`` deep, or None."""
         conn = next((c for c in self.streams.connections if c.edge_name == signal), None)
         consumer = self.streams.consumer_node.get(signal)
@@ -337,9 +352,14 @@ class RepeatingSteps:
         if conn.join_dim is not None:
             return "consumer: it joins a producer's pieces into one item"
         if any(
-            node == consumer and self._step_repeats.limit(node) > 1
-            and edges.streamed
-            for (node, _), edges in self._step_repeats.edges.items()
+            node == consumer and self._step_repeats.limit(node) > 1 and edges.streamed
+            and not any(
+                (node, walk) in zip(unit.nodes, unit.graph_walks, strict=True)
+                and (producer, node, signal) in unit.streaming_edges
+                and dict(zip(unit.nodes, unit.graph_walks, strict=True))[producer] in walks
+                for unit in self.scheduler.execution_units.values()
+            )
+            for (node, walk), edges in self._step_repeats.edges.items()
         ):
             return "consumer: it reads the stream an item an iteration"
         policy, take = conn.chunk_policy_factory(), 0
@@ -491,6 +511,11 @@ class RepeatingSteps:
             self._fail_step_rows(step, outputs)
 
     def _is_device_run(self, step: PendingBatch) -> bool:
+        if step.group is not None and step.group.submitted and step.group.unit.streaming_edges:
+            return step.node_batch.completion_event is not None and any(
+                executing.step_context.repeats > 1 and not self._step_repeats.config(scheduled.node_name).ready_waits
+                for scheduled, executing in step.group.members
+            )
         return (
             (step.node_name, step.graph_walk) in self._device_runs
             and step.node_batch.step_context.repeats > 1 and step.node_batch.completion_event is not None
@@ -708,8 +733,7 @@ class RepeatingSteps:
                 if batch_N.group is None or not batch_N.group.submitted:
                     engine.yield_runs(batch_N.node_name)
                 else:
-                    for scheduled, _ in batch_N.group.members:
-                        engine.yield_runs(scheduled.node_name)
+                    self._end_run_for_ready_rows(batch_N)
 
         scanned = time.monotonic()
 

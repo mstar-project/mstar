@@ -1111,14 +1111,20 @@ class Engine:
             raise ValueError("walk_runs currently requires CUDA graph composition")
         # the Loop each (node, walk) runs in, whose counter its iteration inputs read
         self._loops = dict(looped) if isinstance(looped, Mapping) else {}
-        for node_name, walk in carried:
+        requests = set(carried) | set(device_stops)
+        owners = {}
+        for node_name, walk in sorted(requests):
             if node_name in self._submodules:
                 for resource in self._submodules[node_name].resources.values():
+                    key = id(resource), walk
                     config = device_stops.get((node_name, walk))
-                    if config is not None and config.join_rows:
-                        resource.ask_repeats(walk, join_rows=True)
-                    else:
-                        resource.ask_repeats(walk)
+                    joining = bool(config is not None and config.join_rows)
+                    owners[key] = resource, walk, joining or (key in owners and owners[key][2])
+        for resource, walk, joining in owners.values():
+            if joining:
+                resource.ask_repeats(walk, join_rows=True)
+            else:
+                resource.ask_repeats(walk)
         # before capture: a region inside a captured graph compiles in its warm-up
         self._compile_regions()
         ag_runners: dict[str, AcceleratorGraphRunner] = {}
@@ -1166,9 +1172,9 @@ class Engine:
             self._build_resident_planner(
                 node_name, ag_runners[node_name], {walk for node, walk in looped if node == node_name},
             )
-        for (node_name, walk), signals in carried.items():
+        for node_name, walk in sorted(requests):
             if node_name in self._submodules:
-                self._probe_carries(node_name, ag_runners[node_name], walk, signals)
+                self._probe_carries(node_name, ag_runners[node_name], walk, carried.get((node_name, walk), ()))
         # after the planners bind: dropping rows writes the row their captures read
         for (node_name, walk), config in device_stops.items():
             if node_name in self._submodules:
@@ -1835,7 +1841,11 @@ class Engine:
         if policies is None:
             return  # a custom host stop cannot be skipped
         policy = next((p for p in policies.values() if p.reads_token), next(iter(policies.values()), None))
-        if policy is None and (not iteration or loop is None):
+        connected = any(
+            unit.streaming_edges and (node_name, graph_walk) in zip(unit.nodes, unit.graph_walks, strict=True)
+            for walk in self._walk_runs for unit in self._graph_runtime.execution_units(walk)
+        )
+        if policy is None and (not iteration or loop is None) and not connected:
             return
         mgmt.device_stops[graph_walk] = policy
         mgmt.refills[graph_walk] = config.refill_at
@@ -2652,6 +2662,8 @@ class Engine:
                     if streamed and mgmt.joint_comm_group.world_size != 1:
                         guard.refuse("streamed composition is single-rank")
                     if streamed:
+                        if why := mgmt.carry_refusals.get(batch.graph_walk):
+                            guard.refuse(f"{batch.node_name}: {why}")
                         internal = {signal for maker, _, signal in group.unit.streaming_edges
                                     if maker == batch.node_name}
                         if set(mgmt.rings) - internal:
@@ -2778,7 +2790,8 @@ class Engine:
                     # dependencies must promise reversible accounting first.
                     for occurrences in owners.values():
                         for key, resource, batch in occurrences:
-                            part = None if batch.step is None else batch.step.get(key)
+                            part = (None if batch.step is None or batch.step_context.resident is not None
+                                    else batch.step.get(key))
                             if why := resource.repeat_refusal(batch.graph_walk, part):
                                 guard.refuse(f"{batch.node_name}/{key}: {why}")
                 if not streamed and repeats > 1:
@@ -2897,10 +2910,13 @@ class Engine:
                     reservation = next(edge.chunk.reservation for edge in consumer_batch.stream_windows[rows[0]]
                                        if edge.name == signal)
                     tables = self._submodules[consumer].submodule.iteration_tables
-                    stream_window = tables.prepare_stream_window(
-                        leases[consumer], len(reservation.decisions), len(reservation.transitions),
-                        len(reservation.positions),
-                    )
+                    try:
+                        stream_window = tables.prepare_stream_window(
+                            leases[consumer], len(reservation.decisions), len(reservation.transitions),
+                            len(reservation.positions),
+                        )
+                    except ValueError as error:
+                        guard.refuse(str(error))  # a larger policy snapshot takes the ordinary path
                     if stream_target is None:
                         guard.refuse("a streamed consumer discarded its future payload")
                     composed = self._compose_stream(group, leases, stream_window, stream_target, guard)
