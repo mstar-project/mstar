@@ -125,3 +125,30 @@ def test_empty_audio_upload_is_refused(tmp_path):
     sf.write(path, np.zeros(0, dtype=np.float32), 16000)
     with pytest.raises(ValueError, match="empty"):
         Model.load_audio(None, str(path), "cpu")
+
+
+@pytest.mark.parametrize("model_name,class_name", [
+    ("fish_s2_pro", "FishS2ProModel"),
+    ("qwen3_tts", "Qwen3TTSModel"),
+    ("omnivoice", "OmniVoiceModel"),
+])
+@pytest.mark.parametrize("bad", ["garbage", "truncated", "empty"])
+def test_reference_loaders_refuse_bad_uploads(tmp_path, video_only_ffmpeg, model_name, class_name, bad):
+    import importlib
+
+    sf = pytest.importorskip("soundfile")
+    cls = getattr(importlib.import_module(f"mstar.model.{model_name}.{model_name}_model"), class_name)
+    model = object.__new__(cls)
+    model.config = types.SimpleNamespace(
+        sample_rate=24000,
+        codec=types.SimpleNamespace(sample_rate=44100, input_sample_rate=24000),
+        reference_min_seconds=1, reference_max_seconds=30,
+    )
+    path = tmp_path / "bad.wav"
+    sf.write(path, np.zeros(0 if bad == "empty" else 24000, dtype=np.float32), 24000)
+    if bad == "garbage":
+        path.write_bytes(b"not audio")
+    elif bad == "truncated":
+        path.write_bytes(path.read_bytes()[:20])
+    with pytest.raises(ValueError):
+        model.load_audio(str(path), "cpu")
