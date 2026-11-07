@@ -215,15 +215,18 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
 
     def _moe_capture_blocked(self, tp_world_size: int) -> bool:
         """The reference MoE dispatch paths (.nonzero() / host loops) are not
-        stream-capturable; only the fused fp8 path is.
+        stream-capturable; the fused fp8 path and 4-bit experts on their own
+        kernel (NVFP4 on FlashInfer's TRT-LLM FP4 MoE) are.
         """
         from mstar.model.glm52.components.moe import Glm52SparseMoeBlock
 
         lm = getattr(self, "language_model", None)
         blocks = [m for m in lm.modules() if isinstance(m, Glm52SparseMoeBlock)] if lm is not None else []
-        # as loaded: the quantization plan decides whether the experts hold fp8
+        # as loaded: the quantization plan decides whether the experts hold fp8 or a 4-bit format
+        packed = [b for b in blocks if b.experts_packed is not None]
         fp8_reference = any(b.fp8_experts for b in blocks) and not self._moe_resolved_fused()
-        naive_tp = tp_world_size > 1 and any(not b.fp8_experts for b in blocks)
+        fp8_reference = fp8_reference or any(b._experts_kernel is None for b in packed)
+        naive_tp = tp_world_size > 1 and any(not b.experts_quantized for b in blocks)
         blocked = fp8_reference or naive_tp
         # getattr: some tests build submodules that never ran __init__
         if blocked and not getattr(self, "_capture_block_warned", False):
