@@ -22,6 +22,7 @@ from mstar.engine.resources.kv import manager as manager_mod  # noqa: E402
 from mstar.engine.resources.kv.config import KVReqConfig, KVStep, PagedKVConfig  # noqa: E402
 from mstar.engine.resources.kv.manager import KVManager  # noqa: E402
 from mstar.engine.resources.resident import TRASH_SLOT, ResidentPlanner, ResidentStream  # noqa: E402
+from mstar.engine.resources.runner import StepRunner  # noqa: E402
 from mstar.engine.resources.sampler import resident as sampler_resident  # noqa: E402
 from mstar.engine.resources.sampler import utils as sampler_utils  # noqa: E402
 from mstar.engine.resources.sampler.config import SamplerStep, SamplingReqConfig  # noqa: E402
@@ -397,7 +398,13 @@ def test_each_replay_reads_sampler_identity_and_contents_from_resident_cells(dra
     for rid in (1, 2, 3):
         node.ingest(rid, _cfg(seed=rid, penalty=1.3))
     node.decode([1, 2], bs=3)
-    node.decode([3], slot=1, bs=3)
+    # Initialize a new owner row without changing this captured batch's plan.
+    # Every later replay must gather its RNG/history identity from the binding.
+    joining = SubmoduleStep({"sampler": SamplerStep()}, segments=[Segment(3, "main", 1)])
+    joining.set_ctx(StepContext((3,), WALK, 0, False, resident=node.planner, repeats=4))
+    assert StepRunner({"sampler": node.sampler}).admit_rows(joining).ok
+    snapshot = node.planner.prepare_rows(joining, joining.ctx)
+    node.planner.flush(snapshot)
     rec, sampler = node.captured[(BucketKey(WALK, 3, 3), 0)]
     owner = node.sampler._rows
     masks = []
@@ -432,6 +439,8 @@ def test_each_replay_reads_sampler_identity_and_contents_from_resident_cells(dra
             assert counts.item() == before_counts[rid - 1].item()
             torch.testing.assert_close(tokens[0], before_tokens[rid - 1])
             torch.testing.assert_close(owner.read_seen(row)[0], before_masks[rid - 1])
+    node.planner.release(3)
+    node.planner.unpin(tuple(snapshot.slots.tolist()))
 
 
 def test_preplanning_a_successor_preserves_the_current_identity_and_kept_rows(drawn, monkeypatch):

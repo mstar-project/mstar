@@ -31,6 +31,11 @@ from mstar.engine.resources.recurrent.config import (
     RecurrentStep,
 )
 from mstar.engine.resources.resident import advance_column, gather_column
+from mstar.engine.resources.resident_hooks import (
+    ResidentBinding,
+    no_resident_effect,
+    unbounded_repeats,
+)
 from mstar.engine.resources.spec import ResourceReqConfig
 from mstar.engine.resources.step import (
     ADMIT_OK,
@@ -1145,7 +1150,29 @@ class RecurrentStatePool(Resource):
     def repeat_refusal(self, walk: str, host_step=None) -> str | None:
         return None  # a row's state is updated in place, at its slot
 
-    def resident_refusal(self, key: str, streams: Mapping[str, "ResidentStream"]) -> str | None:
+    def _check_resident_horizon(self, step, ctx) -> None:
+        if (self.config.prefix_slots or self._kv is not None or step.pre_forks or step.post_forks
+                or any(not self._slots.get(seg.request_id, {}).get(seg.label)
+                       or not self._slots[seg.request_id][seg.label].has_state
+                       for seg in step.segments or ())):
+            raise ValueError("needs existing state without prefix snapshots or forks")
+
+    def resident_binding(self) -> ResidentBinding:
+        return ResidentBinding(
+            check_streams=self._resident_refusal,
+            bind=self._bind_resident,
+            row=self._resident_row,
+            stage=no_resident_effect,
+            gather=self._resident_gather,
+            run_gather=no_resident_effect,
+            commit_in_graph=self._resident_commit,
+            advance=no_resident_effect,
+            check_horizon=self._check_resident_horizon,
+            max_repeats=unbounded_repeats,
+            rewind_run=self.rewind_run,
+        )
+
+    def _resident_refusal(self, key: str, streams: Mapping[str, "ResidentStream"]) -> str | None:
         if self.config.disable_sink_slot:
             return "a pool with no sink slot has nowhere for a padding row"
         if key not in streams:
@@ -1154,18 +1181,18 @@ class RecurrentStatePool(Resource):
             return "a resident step advances its state, not reads it"
         return None
 
-    def bind_resident(self, planner: "ResidentPlanner", key: str) -> None:
+    def _bind_resident(self, planner: "ResidentPlanner", key: str) -> None:
         self._resident = planner
         self._resident_key = key
         self._resident_table = planner.table()
         self._resident_saved = planner.table()
 
-    def resident_row(self, rid: int, slot: int, row: list[int], writes: "ResidentWrites") -> None:
+    def _resident_row(self, rid: int, slot: int, row: list[int], writes: "ResidentWrites") -> None:
         held = self._slots[rid][writes.streams[self._resident_key].label]
         row[self._resident_table.col] = held.index
         row[self._resident_saved.col] = int(held.has_state)
 
-    def resident_gather(self, step: "CapturedResidentStep") -> None:
+    def _resident_gather(self, step: "CapturedResidentStep") -> None:
         stream = step.streams[self._resident_key]
         key = CGSlotKey(bucket=step.bucket, slot=step.buffer_slot, label=stream.label)
         table, store, addressing = self._resident_table, self._resident.store, self._cg_addressing[key]
@@ -1196,7 +1223,7 @@ class RecurrentStatePool(Resource):
                     if decode.replaces is not None:
                         self._decode[key] = decode.replaces
 
-    def resident_commit(self, step: "CapturedResidentStep") -> None:
+    def _resident_commit(self, step: "CapturedResidentStep") -> None:
         # a row's next iteration, replay or step, resumes what this one wrote
         table = self._resident_saved
         advance_column(self._resident.store, step.slots, table.stride, table.col)

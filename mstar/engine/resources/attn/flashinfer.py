@@ -24,7 +24,11 @@ from mstar.engine.resources.attn.wrappers import (
 from mstar.engine.resources.base import CGSlotKey
 from mstar.engine.resources.kv.config import PagedKVConfig
 from mstar.engine.resources.kv.plan import KVPlanOutputs
-from mstar.engine.resources.resident_hooks import ANY_REPEATS
+from mstar.engine.resources.resident_hooks import (
+    ANY_REPEATS,
+    ResidentBinding,
+    no_resident_effect,
+)
 from mstar.engine.resources.spec import CombinedSplit
 from mstar.engine.resources.step import SlotLease, StepContext
 from mstar.utils.profiler import PhaseLaps
@@ -145,19 +149,46 @@ class FlashInferManager(AttentionManager):
             if isinstance(wrapper, FlashInferDecodeWrapper)
         ]
 
-    def resident_refusal(self, key, streams) -> str | None:
+    def _check_resident_horizon(self, step, ctx) -> None:
+        lease = ctx.slot_lease
+        if lease is None:
+            raise ValueError("new attention rows must name their captured addressing")
+        stream = ctx.resident._walk_streams[ctx.graph_walk][self._kv_cache_name]
+        wrapper = self._cg_plan_states.get(CGSlotKey(bucket=lease.bucket, slot=lease.buffer_slot, label=stream.label))
+        if not isinstance(wrapper, FmhaDecodeWrapper):
+            # The fixed-grid FlashInfer operation exists, but its manager has
+            # not yet selected that binding before capture. A host page plan
+            # cannot address a row published after it was submitted.
+            raise ValueError("attention must gather both pages and lengths inside its capture")
+
+    def resident_binding(self) -> ResidentBinding:
+        return ResidentBinding(
+            check_streams=self._resident_refusal,
+            bind=no_resident_effect,
+            row=no_resident_effect,
+            stage=no_resident_effect,
+            gather=self._resident_gather,
+            run_gather=self._resident_run_gather,
+            commit_in_graph=no_resident_effect,
+            advance=no_resident_effect,
+            check_horizon=self._check_resident_horizon,
+            max_repeats=self.max_repeats,
+            rewind_run=no_resident_effect,
+        )
+
+    def _resident_refusal(self, key, streams) -> str | None:
         if self._window_left >= 0:
             return "a sliding window reads pages a resident row no longer holds"
         return None
 
-    def resident_run_gather(self, step: "CapturedResidentStep") -> None:
+    def _resident_run_gather(self, step: "CapturedResidentStep") -> None:
         # the table's lengths: the last run may have ended short of what the plan assumed
         stream = step.streams[self._kv_cache_name]
         wrapper = self._cg_plan_states.get(CGSlotKey(bucket=step.bucket, slot=step.buffer_slot, label=stream.label))
         if isinstance(wrapper, FlashInferDecodeWrapper) and not stream.reads:
             wrapper.gather_lengths(step.buffers.kv_len[self._kv_cache_name])
 
-    def resident_gather(self, step: "CapturedResidentStep") -> None:
+    def _resident_gather(self, step: "CapturedResidentStep") -> None:
         # planned per label of its KV cache's plan, so its wrapper is under that stream's label
         pool, stream = self._kv_cache_name, step.streams[self._kv_cache_name]
         wrapper = self._cg_plan_states.get(CGSlotKey(bucket=step.bucket, slot=step.buffer_slot, label=stream.label))

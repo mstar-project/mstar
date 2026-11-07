@@ -26,7 +26,7 @@ short, a withheld item). A row whose ring is full is not ready
 from __future__ import annotations
 
 import threading
-from collections.abc import Hashable, Mapping, Sequence
+from collections.abc import Hashable, Sequence
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar
@@ -35,6 +35,11 @@ import torch
 
 from mstar.engine.resources.base import EngineResourceInfo, Resource
 from mstar.engine.resources.resident import gather_column
+from mstar.engine.resources.resident_hooks import (
+    ResidentBinding,
+    no_resident_effect,
+    unbounded_repeats,
+)
 from mstar.engine.resources.spec import NodeResourceSpec
 from mstar.engine.resources.step import ADMIT_OK, ASKS, AdmitOutcome, BucketKey, ResourceStep, StepContext
 from mstar.graph.loop_indices import LoopLayout
@@ -45,7 +50,6 @@ if TYPE_CHECKING:
     from mstar.engine.resources.resident import (
         CapturedResidentStep,
         ResidentPlanner,
-        ResidentStream,
         ResidentTable,
         ResidentWrites,
     )
@@ -282,8 +286,20 @@ class LoopbackRows(Resource):
     def repeat_refusal(self, walk: str, host_step=None) -> str | None:
         return None  # a replay reads and writes its rows in the graph
 
-    def resident_refusal(self, key: str, streams: Mapping[str, ResidentStream]) -> str | None:
-        return None  # a request keeps its row, so a slot's cell only names it
+    def resident_binding(self) -> ResidentBinding:
+        return ResidentBinding(
+            check_streams=no_resident_effect,
+            bind=self._bind_resident,
+            row=self._resident_row,
+            stage=no_resident_effect,
+            gather=self._resident_gather,
+            run_gather=no_resident_effect,
+            commit_in_graph=no_resident_effect,
+            advance=no_resident_effect,
+            check_horizon=no_resident_effect,
+            max_repeats=unbounded_repeats,
+            rewind_run=no_resident_effect,
+        )
 
     def build_accelerator_graph_buffers(self, slots, max_bs: int, max_seq_len: int) -> None:
         self._max_bs = max(self._max_bs, max_bs)
@@ -309,14 +325,14 @@ class LoopbackRows(Resource):
                 rows = [self._row_of.get(rid, TRASH_ROW) for rid in rids]
             self._stager.copy_(self.indices(*key)[:len(rows)], rows)
 
-    def bind_resident(self, planner: ResidentPlanner, key: str) -> None:
+    def _bind_resident(self, planner: ResidentPlanner, key: str) -> None:
         self._resident = planner
         self._resident_rows = planner.table()
 
-    def resident_row(self, rid: int, slot: int, row: list[int], writes: ResidentWrites) -> None:
+    def _resident_row(self, rid: int, slot: int, row: list[int], writes: ResidentWrites) -> None:
         row[self._resident_rows.col] = self._row_of.get(rid, TRASH_ROW)
 
-    def resident_gather(self, step: CapturedResidentStep) -> None:
+    def _resident_gather(self, step: CapturedResidentStep) -> None:
         # a padding row reads the trash slot's zero, which is the trash row
         table = self._resident_rows
         gather_column(self._resident.store, step.slots, table.stride, table.col, self.indices(step.bucket, step.slot))

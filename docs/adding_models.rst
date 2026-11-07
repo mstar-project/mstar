@@ -1659,7 +1659,7 @@ model to declare. The engine decides at load, before capture, from
 what each owner already says: the walk has a batched capture; the step its widest capture
 declares has, for each resource, one stream that takes one token per row, or one it only
 reads at span 0 (a cross-attention context), with no forks, retention or sink; every
-resource of the node answers ``Resource.resident_refusal`` with None and none is shared
+resource resolves ``Resource.resident_binding()`` and its binding accepts the streams, and none is shared
 with another node; and its captured ``preprocess`` reads no buffer the graph fills (an
 accessor of one, such as ``RopeManager.pos_ids``, calls ``resident.table_read``). Each KV
 pool of the node keeps its own block table and lengths; positions read the pool their
@@ -1673,6 +1673,25 @@ row id become cells of the row. Each replay gathers that identity before reading
 writing the owner's RNG offset, generation history and packed token presence. With
 ``sampler_ingraph_scatter: false``, the sampler uses ordinary host planning while other
 resources may still use resident tables.
+
+A resource resolves one ``ResidentBinding`` before the planner allocates tables.
+Its required operations cover stream validation, table binding, row initialization,
+staging, gather, in-graph commit, host mirror advance, horizon validation, repeat
+capacity and actual-count rewind. No operation inherits permission from a no-op
+resource hook. Stateless operations explicitly use ``no_resident_effect``. The
+planner filters walks through the binding's pure ``check_streams`` before calling
+``bind`` once. Ordinary admit, commit and rollback remain the resource lifecycle.
+
+Joining a running capture additionally calls every binding's ``check_horizon``
+before any owner reserves. The whole two-window horizon must fit; it never silently
+narrows. This check rejects irreversible provisional effects (such as recurrent
+prefix snapshots) and capture addresses fixed to the old membership. Each receipt
+settles through the same binding's ``rewind_run``. The worker must retain the
+request's allocations and prevent movement until their actual readers finish;
+resident table pins and publication descriptor credits alone do not retain them.
+Prepared-input owners without stable captured windows and attention backends with
+host-fixed page addressing refuse joining even when they support ordinary resident
+steps. A model adds no methods for this contract.
 
 A resident step can also stand for several iterations of its Loop (``step_repeats``
 per node in the serving config): the host plans once and the capture replays, each loop-back
@@ -1706,7 +1725,7 @@ recurrent token counts) it counts with ``StepContext.run_span``, not the declare
 ctx, replays, rows)`` takes the ``replays`` it didn't run back, for ``rows`` only, the step's rows
 still the requests it counted for. What a replay reads that its capture doesn't advance moves in
 ``Resource.replay_columns``, before each replay; in a capture that is a WHILE run's body, where no
-host stands between iterations, ``Resource.resident_run_gather`` does that work in the graph. Each per-iteration output of the node in its
+host stands between iterations, ``ResidentBinding.run_gather`` does that work in the graph. Each per-iteration output of the node in its
 Loop (a client, streaming or accumulated edge) keeps a column per replay, which must be
 a row output of the capture; at STORE each row routes the iterations its stop kept, one
 item each, less an EOS iteration's item of a withheld output. A step that emits a count of

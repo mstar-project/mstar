@@ -588,7 +588,11 @@ class StepRunner:
         asked = ctx.repeats
         if asked == 1:
             return
-        allowed = {key: self._resources[key].max_repeats(step.get(key), ctx) for key in self._keys_for(step)}
+        allowed = {
+            key: (self._resources[key] if ctx.resident is None else ctx.resident.bindings[key]).max_repeats(
+                step.get(key), ctx,
+            ) for key in self._keys_for(step)
+        }
         ctx.repeats = max(1, min([asked, *allowed.values()]))
         ctx.check_tp_repeats()
         for key, most in allowed.items():
@@ -636,7 +640,9 @@ class StepRunner:
                 deltas.setdefault(previous - count, set()).add(rid)
         for key in self._keys_for(step):
             for delta, rows in deltas.items():
-                self._resources[key].rewind_run(step.get(key), ctx, delta, frozenset(rows))
+                rewind = (self._resources[key].rewind_run if ctx.resident is None
+                          else ctx.resident.bindings[key].rewind_run)
+                rewind(step.get(key), ctx, delta, frozenset(rows))
         ctx.run_counts = MappingProxyType(counts)
 
     def replay_columns(self, step: SubmoduleStep | None, repeats: int) -> list[tuple[torch.Tensor, torch.Tensor]]:
@@ -679,14 +685,6 @@ class StepRunner:
         settlement/teardown, and holds these owners until readers finish.
         Unlike ordinary admission, this operation never narrows the horizon.
         """
-        from mstar.engine.resources.attn.flashinfer import FlashInferManager
-        from mstar.engine.resources.kv.manager import KVManager
-        from mstar.engine.resources.loopback_rows import LoopbackRows
-        from mstar.engine.resources.position.config import PosScheme
-        from mstar.engine.resources.position.manager import RopeManager
-        from mstar.engine.resources.recurrent.pool import RecurrentStatePool
-        from mstar.engine.resources.sampler.resource import SamplerResource
-
         ctx = step.ctx
         rows = set(ctx.request_ids)
         if (not rows or len(rows) != len(ctx.request_ids) or any(rid < 0 for rid in rows)
@@ -700,31 +698,17 @@ class StepRunner:
             if not rows.isdisjoint(held):
                 raise ValueError("joining rows overlap the already staged step")
         for key in self._keys_for(step):
-            owner, item = self._resources[key], step.get(key)
+            item = step.get(key)
             if any(seg.request_id >= 0 and seg.request_id not in rows for seg in item.segments or ()):
                 raise ValueError(f"joining resource {key!r} declares a request outside its context")
-            if type(owner) is KVManager:
-                if (owner._index is not None or owner._windows or owner._host_writes is not None
-                        or owner.config.cpu_offload_pages or owner._host_copies or owner._world_size != 1
-                        or len(owner._groups) != 1 or item.pre_forks or item.post_forks
-                        or item.eager_write or item.retention or not item.commit):
-                    raise ValueError(f"joining resource {key!r} needs plain local KV without prefix or host copies")
-            elif type(owner) is RopeManager:
-                if owner._config.scheme != PosScheme.SEQUENTIAL or item.pos_ids is not None:
-                    raise ValueError(f"joining resource {key!r} needs sequential positions")
-            elif type(owner) is RecurrentStatePool:
-                if (owner.config.prefix_slots or owner._kv is not None or item.pre_forks or item.post_forks
-                        or any(not owner._slots.get(seg.request_id, {}).get(seg.label)
-                               or not owner._slots[seg.request_id][seg.label].has_state
-                               for seg in item.segments or ())):
-                    raise ValueError(f"joining resource {key!r} needs existing state without prefix snapshots or forks")
-            elif type(owner) is SamplerResource:
-                if (owner.repeat_refusal(ctx.graph_walk) is not None or owner._cg_buffers is None
-                        or not owner._cg_buffers.ingraph_scatter):
-                    raise ValueError(f"joining resource {key!r} needs captured sampler state updates")
-            elif type(owner) not in (LoopbackRows, FlashInferManager):
-                raise ValueError(f"joining resource {key!r} has no audited owner-only admission contract")
-            if owner.max_repeats(item, ctx) < ctx.repeats:
+            binding = ctx.resident.bindings.get(key)
+            if binding is None:
+                raise ValueError(f"joining resource {key!r} has no resolved resident binding")
+            try:
+                binding.check_horizon(item, ctx)
+            except ValueError as exc:
+                raise ValueError(f"joining resource {key!r}: {exc}") from exc
+            if binding.max_repeats(item, ctx) < ctx.repeats:
                 return FullAdmitOutcome(AdmitOutcome(ok=False, reason=AdmitFailedReason(
                     f"joining resource {key!r} cannot reserve the full {ctx.repeats}-iteration horizon",
                 )), key)

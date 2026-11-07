@@ -38,6 +38,7 @@ import triton
 import triton.language as tl
 
 from mstar.engine.resources.base import Resource
+from mstar.engine.resources.resident_hooks import ResidentBinding
 from mstar.engine.resources.step import BucketKey, SubmoduleStep
 from mstar.utils import knobs
 from mstar.utils.h2d import PinnedStager
@@ -318,7 +319,7 @@ class ResidentPlanner:
 
     def __init__(
         self, node: str, walks: Mapping[str, Mapping[str, ResidentStream]], resources: Mapping[str, Resource],
-        device: torch.device, max_bs: int,
+        device: torch.device, max_bs: int, *, bindings: Mapping[str, ResidentBinding] | None = None,
     ):
         self.node = node
         self.walks = frozenset(walks)
@@ -328,7 +329,13 @@ class ResidentPlanner:
         # request rows plus the trash row
         self.max_slots = 2 * max_bs + 1
         self._keys = tuple(resources)
-        self._owners = tuple(resources.values())
+        self.bindings = dict(bindings) if bindings is not None else {}
+        if bindings is None:
+            for key, owner in resources.items():
+                binding = owner.resident_binding()
+                if isinstance(binding, str):
+                    raise ValueError(f"resource {key!r}: {binding}")
+                self.bindings[key] = binding
         self._tables: list[ResidentTable] = []
         # the KV pools whose stored lengths a capture gathers, as they bind
         self._length_keys: list[str] = []
@@ -362,8 +369,8 @@ class ResidentPlanner:
         self._last_rids: tuple[int, ...] | None = None
         self._last_slots: np.ndarray | None = None
 
-        for key, resource in resources.items():
-            resource.bind_resident(self, key)
+        for key, binding in self.bindings.items():
+            binding.bind(self, key)
         self._seal()
         # the largest flush up front, plus a cells row: growing the stager waits
         # out its copies, which on the GPU thread would be a sync in the step path
@@ -673,8 +680,8 @@ class ResidentPlanner:
                 self._stager.copy_(buffers.rows, slots, pad_value=TRASH_SLOT)
                 buffers.staged = slots
             laps.lap("slot_row")
-            for resource in self._owners:
-                resource.resident_stage(plan)
+            for binding in self.bindings.values():
+                binding.stage(plan)
             laps.lap("stage")
             self._stage_cells(plan, buffers)
             laps.lap("cells")
@@ -690,8 +697,8 @@ class ResidentPlanner:
         row = [0] * self.narrow_cols
         if row:
             writes.run(slot, 0, row)
-        for resource in self._owners:
-            resource.resident_row(rid, slot, row, writes)
+        for binding in self.bindings.values():
+            binding.row(rid, slot, row, writes)
 
     def _stage_cells(self, plan: ResidentPlan, buffers: ResidentBuffers) -> None:
         """One copy, on the plan stream: the graph scatters these first thing."""
@@ -732,8 +739,8 @@ class ResidentPlanner:
 
     def advance(self, plan: ResidentPlan) -> None:
         """Advance owner mirrors after committing this plan's reserved horizon."""
-        for resource in self._owners:
-            resource.resident_advance(plan)
+        for binding in self.bindings.values():
+            binding.advance(plan)
 
     def _note_host_step(self, step: SubmoduleStep, ctx) -> None:
         """A host-planned step moved its rows without their tables. A
@@ -775,18 +782,18 @@ class ResidentPlanner:
             # before the owners' reads: a row that crossed writes into its new
             # page. Only a KV pool queues single cells.
             scatter_cells(self._store, step.buffers.cells)
-        for resource in self._owners:
-            resource.resident_gather(step)
+        for binding in self.bindings.values():
+            binding.gather(step)
         if step.reads_tables and not step.host_planned:
             self.host_plan_free.add(step.bucket)
 
     def run_gather(self, step: CapturedResidentStep) -> None:
-        for resource in self._owners:
-            resource.resident_run_gather(step)
+        for binding in self.bindings.values():
+            binding.run_gather(step)
 
     def commit_in_graph(self, step: CapturedResidentStep) -> None:
-        for resource in self._owners:
-            resource.resident_commit(step)
+        for binding in self.bindings.values():
+            binding.commit_in_graph(step)
 
 
 # what a resource's part of a step may declare that a captured step can't carry
@@ -878,6 +885,7 @@ def build_planner(
             refusal = f"resource {key!r}: it is shared by nodes {sorted(resource_nodes[key])}"
     if refusal is not None:
         return None, dict.fromkeys(steps, refusal)
+    bindings = {key: owner.resident_binding() for key, owner in resources.items()}
     refusals: dict[str, str] = {}
     walks: dict[str, dict[str, ResidentStream]] = {}
     for walk, step in steps.items():
@@ -887,8 +895,8 @@ def build_planner(
         else:
             streams = declared_streams(resources, step)
             refusal = next((
-                f"resource {key!r}: {why}" for key, resource in resources.items()
-                if (why := resource.resident_refusal(key, streams)) is not None
+                f"resource {key!r}: {why}" for key, binding in bindings.items()
+                if (why := binding if isinstance(binding, str) else binding.check_streams(key, streams)) is not None
             ), None)
         if refusal is None:
             refusal = probe(walk)
@@ -898,4 +906,4 @@ def build_planner(
             refusals[walk] = refusal
     if not walks:
         return None, refusals
-    return ResidentPlanner(node, walks, resources, device, max_capture_bs(walks)), refusals
+    return ResidentPlanner(node, walks, resources, device, max_capture_bs(walks), bindings=bindings), refusals

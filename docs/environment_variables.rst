@@ -657,7 +657,7 @@ Worker scheduling
      - ``on`` runs a node's captured steps off per-request tables on the
        device for each walk that runs the node in a Loop, where its capture,
        its declared step, its ``preprocess`` and every resource of the node
-       (``Resource.resident_refusal``) agree; the worker logs one line per
+       (``Resource.resident_binding``) agree; the worker logs one line per
        such walk saying which refused. ``off`` plans every step on the host.
        ``auto`` is ``on`` for a node whose submodule sets ``resident_by_default``
        (Qwen3.5's LLM) and ``off`` elsewhere. The

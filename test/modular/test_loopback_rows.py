@@ -123,19 +123,19 @@ def test_a_resident_step_gathers_its_rows_index_from_the_planners_slots():
     rows.add(7)
     cells = torch.zeros(8, dtype=torch.long)
     planner = SimpleNamespace(store=cells, table=lambda: SimpleNamespace(stride=2, col=1))
-    rows.bind_resident(planner, "rows")
+    rows.resident_binding().bind(planner, "rows")
     cell = [0, 0]
-    rows.resident_row(7, 3, cell, None)
+    rows.resident_binding().row(7, 3, cell, None)
     cells[3 * 2 + 1] = cell[1]
     bucket = BucketKey(WALK, 2, 2)
-    rows.resident_gather(SimpleNamespace(bucket=bucket, slot=0, slots=torch.tensor([3, 0])))
+    rows.resident_binding().gather(SimpleNamespace(bucket=bucket, slot=0, slots=torch.tensor([3, 0])))
     assert rows.indices(bucket, 0).tolist() == [rows._row_of[7], TRASH_ROW]
     step = SimpleNamespace(
         bucket=bucket, slot=0, slots=torch.tensor([0, 0]),
         buffers=SimpleNamespace(rows=torch.tensor([3, 0])),
     )
     assert rows.iteration_rows(step).tolist() == [rows._row_of[7], TRASH_ROW]
-    rows.resident_gather(step)
+    rows.resident_binding().gather(step)
     assert rows.indices(bucket, 0).tolist() == [TRASH_ROW, TRASH_ROW]
 
 

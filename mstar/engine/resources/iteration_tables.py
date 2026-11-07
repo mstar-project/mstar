@@ -22,11 +22,16 @@ from typing import TYPE_CHECKING, NamedTuple
 import torch
 
 from mstar.engine.resources.base import EngineResourceInfo, Resource
+from mstar.engine.resources.resident_hooks import (
+    ResidentBinding,
+    no_resident_effect,
+    unbound_horizon,
+    unbounded_repeats,
+)
 from mstar.engine.resources.spec import NodeResourceSpec
 from mstar.utils.h2d import PinnedStager
 
 if TYPE_CHECKING:
-    from mstar.engine.resources.resident import ResidentStream
     from mstar.model.submodule_base import IterationInput
 
 # a request's rows take a multiple of this, so a freed extent fits the next request of about its size
@@ -98,8 +103,20 @@ class IterationTables(Resource):
     def repeat_refusal(self, walk: str, host_step=None) -> str | None:
         return None  # a step reads its columns before it launches
 
-    def resident_refusal(self, key: str, streams: Mapping[str, ResidentStream]) -> str | None:
-        return None
+    def resident_binding(self) -> ResidentBinding:
+        return ResidentBinding(
+            check_streams=no_resident_effect,
+            bind=no_resident_effect,
+            row=no_resident_effect,
+            stage=no_resident_effect,
+            gather=no_resident_effect,
+            run_gather=no_resident_effect,
+            commit_in_graph=no_resident_effect,
+            advance=no_resident_effect,
+            check_horizon=unbound_horizon,
+            max_repeats=unbounded_repeats,
+            rewind_run=no_resident_effect,
+        )
 
     def remove_request(self, rid: Hashable) -> None:
         with self._lock:

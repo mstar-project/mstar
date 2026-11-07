@@ -1,7 +1,8 @@
 """What a resource overrides to take part in resident planning (`resident.py`)."""
 from __future__ import annotations
 
-from collections.abc import Collection, Mapping
+from collections.abc import Callable, Collection, Mapping
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -15,10 +16,52 @@ if TYPE_CHECKING:
         ResidentStream,
         ResidentWrites,
     )
+    from mstar.engine.resources.step import ResourceStep, StepContext
 
 
 # `max_repeats` for a resource that has no limit of its own
 ANY_REPEATS = 1 << 30
+
+
+def no_resident_effect(*args) -> None:
+    """Explicit choice for a binding operation with no state effect."""
+
+
+def unbounded_repeats(step, ctx) -> int:
+    """Explicit choice for an owner with no per-run capacity limit."""
+    return ANY_REPEATS
+
+
+def unbound_horizon(step, ctx) -> None:
+    """Ordinary resident support without immutable dynamic-row addressing."""
+    raise ValueError("this owner has no execution-time binding for newly admitted rows")
+
+
+@dataclass(frozen=True)
+class ResidentBinding:
+    """One owner's complete resident execution contract, resolved before capture.
+
+    All operations are required. An owner explicitly supplies a no-op only for
+    effects it does not have. check_streams is pure and runs before bind allocates
+    tables; check_horizon validates reversible admission and captured addressing
+    before any owner reserves. Admission/commit/rollback remain Resource's one
+    lifecycle. Actual-count settlement shares its rewind implementation.
+
+    The worker retains request allocations and excludes their movement while
+    readers exist; table pins and descriptor credits do not replace that hold.
+    """
+
+    check_streams: Callable[[str, Mapping[str, ResidentStream]], str | None]
+    bind: Callable[[ResidentPlanner, str], None]
+    row: Callable[[int, int, list[int], ResidentWrites], None]
+    stage: Callable[[ResidentPlan], None]
+    gather: Callable[[CapturedResidentStep], None]
+    run_gather: Callable[[CapturedResidentStep], None]
+    commit_in_graph: Callable[[CapturedResidentStep], None]
+    advance: Callable[[ResidentPlan], None]
+    check_horizon: Callable[[ResourceStep, StepContext], None]
+    max_repeats: Callable[[ResourceStep, StepContext], int]
+    rewind_run: Callable[[ResourceStep, StepContext, int, Collection], None]
 
 
 class ResidentHooks:
@@ -72,49 +115,11 @@ class ResidentHooks:
         ``target`` before replay i. Queued on the step's stream after its first."""
         return []
 
-    def resident_refusal(self, key: str, streams: Mapping[str, ResidentStream]) -> str | None:
-        """Why a walk of a node holding this resource can't run on resident
-        tables, or None if it can, asked at load. ``streams``: each resource's
-        stream on the walk's steps, by resource key; ``key`` is this one's."""
-        del key, streams
+    def resident_binding(self) -> ResidentBinding | str:
+        """Resolve the owner's resident operations once, before table allocation.
+
+        A resource without a complete binding stays host-planned. The binding
+        separately checks whether a resident step can admit new rows beside
+        already submitted captures; resident execution alone does not imply it.
+        """
         return f"{type(self).__name__} keeps no resident table"
-
-    def bind_resident(self, planner: ResidentPlanner, key: str) -> None:
-        """Declare this resource's tables on the node's planner, once, at load.
-        ``key`` is its resource key, under which each step and capture name its
-        stream (`ResidentWrites.streams`, `CapturedResidentStep.streams`)."""
-        return
-
-    def resident_row(self, rid: int, slot: int, row: list[int], writes: ResidentWrites) -> None:
-        """Set this resource's cells of ``rid``'s row: it is new or stale. ``row``
-        has the planner's narrow columns; the owner of a wide table queues its
-        used cells as a run of their own (`ResidentWrites.run`)."""
-        return
-
-    def resident_stage(self, plan: ResidentPlan) -> None:
-        """Queue this step's per-row changes on ``plan.writes``. Host work only:
-        this can run beside a live graph."""
-        return
-
-    def resident_gather(self, step: CapturedResidentStep) -> None:
-        """Record, inside the capture, the reads that fill what the step's forward
-        addresses. Runs at warmup and capture only; a replay repeats the kernels.
-        An attention sets `CapturedResidentStep.reads_tables` or ``host_planned``,
-        for whether its kernel reads its pages off the tables or a host plan."""
-        return
-
-    def resident_run_gather(self, step: CapturedResidentStep) -> None:
-        """As ``resident_gather``, for a capture that is a WHILE run's body: no
-        host stands between its iterations, or tells it how far the last run got.
-        A successor can be planned before its predecessor ends short, so these
-        reads must use the state actually reached on device, not the host's
-        predicted end of the predecessor's full reservation."""
-        return
-
-    def resident_commit(self, step: CapturedResidentStep) -> None:
-        """Record, inside the capture and after the forward, the step's table updates."""
-        return
-
-    def resident_advance(self, plan: ResidentPlan) -> None:
-        """Advance the host's copy of the table by the rule ``resident_commit`` recorded."""
-        return

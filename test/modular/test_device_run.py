@@ -110,7 +110,7 @@ def _runner(
             table=lambda: SimpleNamespace(stride=1, col=0), covers=lambda bucket: True,
             drop_rows=lambda bucket, slot: buffers,
         )
-        rows.bind_resident(planner, "rows")
+        rows.resident_binding().bind(planner, "rows")
         resident = SimpleNamespace(bucket=BucketKey(WALK, bs, bs), slot=0, buffers=buffers, slots=buffers.slots)
         runner.test_resource = torch.zeros(bs + 1)
     runner.ask_run(WALK, RunAsk(None if counted else "new_token", frozenset() if counted else frozenset({EOS}),
@@ -121,7 +121,7 @@ def _runner(
 
     def forward(in_run=False, select_inputs=None):
         if resident is not None:
-            runner._rows.resident_gather(resident)
+            runner._rows.resident_binding().gather(resident)
             static["cond"].fill_(-55)  # input selection must follow resource gathering
         if select_inputs is not None:
             select_inputs()

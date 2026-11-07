@@ -30,6 +30,11 @@ from mstar.engine.resources.linear_attn.mamba2_kernels import (
 )
 from mstar.engine.resources.recurrent.config import Mamba2Geometry
 from mstar.engine.resources.recurrent.pool import NO_SLOT, SINK_SLOT, RecurrentAddressing
+from mstar.engine.resources.resident_hooks import (
+    ResidentBinding,
+    no_resident_effect,
+    unbounded_repeats,
+)
 from mstar.engine.resources.step import Segment, SlotLease, StepContext
 
 logger = logging.getLogger(__name__)
@@ -86,9 +91,21 @@ class Mamba2Manager(LinearAttnManager):
     def repeat_refusal(self, walk: str, host_step=None) -> str | None:
         return None  # decode addresses the pool by slot alone
 
-    def resident_refusal(self, key, streams) -> str | None:
-        # decode addresses the pool by slot alone, which the pool's table holds
-        return None
+    def resident_binding(self) -> ResidentBinding:
+        return ResidentBinding(
+            check_streams=no_resident_effect,
+            bind=no_resident_effect,
+            row=no_resident_effect,
+            stage=no_resident_effect,
+            gather=no_resident_effect,
+            run_gather=no_resident_effect,
+            commit_in_graph=no_resident_effect,
+            advance=no_resident_effect,
+            check_horizon=no_resident_effect,
+            max_repeats=unbounded_repeats,
+            rewind_run=no_resident_effect,
+        )
+
 
     # Step lifecycle
 

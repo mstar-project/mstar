@@ -310,5 +310,5 @@ def test_a_resident_decode_reads_the_plan_its_capture_built():
     manager = Mamba2Manager.__new__(Mamba2Manager)
     manager._preplanned = False
     manager._current = captured = {"main": object()}
-    assert manager.resident_refusal("m", {}) is None and manager.repeat_refusal("decode") is None
+    assert manager.resident_binding().check_streams("m", {}) is None and manager.repeat_refusal("decode") is None
     assert manager.plan(None, SimpleNamespace(is_preplan=False, resident=object())) is captured

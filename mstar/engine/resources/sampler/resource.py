@@ -6,7 +6,11 @@ import torch
 from mstar.distributed.communication import JointGroups
 from mstar.engine.resources.base import CachedPrefix, EngineResourceInfo, Resource
 from mstar.engine.resources.resident import CapturedResidentStep, ResidentPlan, ResidentPlanner, ResidentWrites
-from mstar.engine.resources.resident_hooks import ANY_REPEATS
+from mstar.engine.resources.resident_hooks import (
+    ANY_REPEATS,
+    ResidentBinding,
+    no_resident_effect,
+)
 from mstar.engine.resources.sampler.config import (
     SAMPLED_LOGPROB,
     STOP_ODDS,
@@ -365,11 +369,29 @@ class SamplerResource(Resource):
             return 1
         return ANY_REPEATS
 
-    def resident_refusal(self, key, streams) -> str | None:
-        # never holds a node back: without a planner it stages its rows on the host
-        return None
+    def _check_resident_horizon(self, step, ctx) -> None:
+        if (self.repeat_refusal(ctx.graph_walk) is not None or self._cg_buffers is None
+                or not self._cg_buffers.ingraph_scatter):
+            raise ValueError("needs captured sampler state updates")
+        if not self._logprob_rids.isdisjoint(ctx.request_ids) or self._kept_rids_of(step, ctx) is not None:
+            raise ValueError("new rows cannot require logprobs or discard a sampled draw")
 
-    def bind_resident(self, planner: ResidentPlanner, key: str) -> None:
+    def resident_binding(self) -> ResidentBinding:
+        return ResidentBinding(
+            check_streams=no_resident_effect,
+            bind=self._bind_resident,
+            row=self._resident_row,
+            stage=no_resident_effect,
+            gather=self._resident_gather,
+            run_gather=no_resident_effect,
+            commit_in_graph=no_resident_effect,
+            advance=no_resident_effect,
+            check_horizon=self._check_resident_horizon,
+            max_repeats=self.max_repeats,
+            rewind_run=no_resident_effect,
+        )
+
+    def _bind_resident(self, planner: ResidentPlanner, key: str) -> None:
         if not sampler_ingraph_scatter():
             return
         self._cells = SamplerCells(planner, SamplerBuffers.fields_for(**self._scalar_options()))
@@ -381,11 +403,11 @@ class SamplerResource(Resource):
             planner.node, key, ", ".join(f.name for f in self._cells.fields),
         )
 
-    def resident_row(self, rid: int, slot: int, row: list[int], writes: ResidentWrites) -> None:
+    def _resident_row(self, rid: int, slot: int, row: list[int], writes: ResidentWrites) -> None:
         if self._cells is not None:
             self._cells.row(rid, slot, self._rows.slot_of(rid), row)
 
-    def resident_gather(self, step: CapturedResidentStep) -> None:
+    def _resident_gather(self, step: CapturedResidentStep) -> None:
         if self._cells is None or self._cg_buffers is None:
             return
         self._cells.gather(step)

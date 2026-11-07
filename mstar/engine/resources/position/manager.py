@@ -30,6 +30,11 @@ from mstar.engine.resources.position.rope import (
     rope_apply_qk_inplace,  # noqa: F401  (registers mstar::rope_apply_qk_inplace)
 )
 from mstar.engine.resources.resident import gather_column, table_read
+from mstar.engine.resources.resident_hooks import (
+    ResidentBinding,
+    no_resident_effect,
+    unbounded_repeats,
+)
 from mstar.engine.resources.step import ADMIT_OK, AdmitOutcome, StepContext
 
 if TYPE_CHECKING:
@@ -417,7 +422,26 @@ class RopeManager(PositionManager):
             if advance and segment.request_id in rows:
                 self._counters[segment.request_id][segment.label] -= advance * replays
 
-    def resident_refusal(self, key: str, streams: Mapping[str, "ResidentStream"]) -> str | None:
+    def _check_resident_horizon(self, step, ctx) -> None:
+        if self._config.scheme != PosScheme.SEQUENTIAL or step.pos_ids is not None:
+            raise ValueError("needs sequential positions")
+
+    def resident_binding(self) -> ResidentBinding:
+        return ResidentBinding(
+            check_streams=self._resident_refusal,
+            bind=self._bind_resident,
+            row=self._resident_row,
+            stage=no_resident_effect,
+            gather=self._resident_gather,
+            run_gather=no_resident_effect,
+            commit_in_graph=no_resident_effect,
+            advance=no_resident_effect,
+            check_horizon=self._check_resident_horizon,
+            max_repeats=unbounded_repeats,
+            rewind_run=self.rewind_run,
+        )
+
+    def _resident_refusal(self, key: str, streams: Mapping[str, "ResidentStream"]) -> str | None:
         if self._config.scheme != PosScheme.SEQUENTIAL:
             return f"position scheme {self._config.scheme} doesn't advance with the stream"
         if key not in streams or self._kv_cache_name not in streams:
@@ -431,17 +455,17 @@ class RopeManager(PositionManager):
             )
         return None
 
-    def bind_resident(self, planner: "ResidentPlanner", key: str) -> None:
+    def _bind_resident(self, planner: "ResidentPlanner", key: str) -> None:
         self._resident_store = planner
         self._resident_key = key
         self._resident_delta = planner.table()
 
-    def resident_row(self, rid: int, slot: int, row: list[int], writes: "ResidentWrites") -> None:
+    def _resident_row(self, rid: int, slot: int, row: list[int], writes: "ResidentWrites") -> None:
         # the KV pool binds ahead of this, its dependent, and sets its length first
         label = writes.streams[self._resident_key].label
         row[self._resident_delta.col] = self.position(rid, label) - writes.kv_len[self._kv_cache_name]
 
-    def resident_gather(self, step: "CapturedResidentStep") -> None:
+    def _resident_gather(self, step: "CapturedResidentStep") -> None:
         own = step.streams[self._resident_key]
         key = CGSlotKey(bucket=step.bucket, slot=step.buffer_slot, label=own.label)
         table = self._resident_delta

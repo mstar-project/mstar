@@ -11,6 +11,7 @@ from __future__ import annotations
 import ctypes
 import random
 import sys
+from dataclasses import replace
 from functools import partial
 from types import SimpleNamespace
 
@@ -41,7 +42,13 @@ from mstar.engine.resources.recurrent.config import (  # noqa: E402
 )
 from mstar.engine.resources.recurrent.pool import SINK_SLOT, RecurrentStatePool  # noqa: E402
 from mstar.engine.resources.resident import NOT_ASKED, TRASH_SLOT, ResidentPlanner, build_planner  # noqa: E402
-from mstar.engine.resources.resident_hooks import ANY_REPEATS  # noqa: E402
+from mstar.engine.resources.resident_hooks import (  # noqa: E402
+    ANY_REPEATS,
+    ResidentBinding,
+    no_resident_effect,
+    unbound_horizon,
+    unbounded_repeats,
+)
 from mstar.engine.resources.runner import StepRunner  # noqa: E402
 from mstar.engine.resources.spec import resolve_spec_dependencies  # noqa: E402
 from mstar.engine.resources.step import (  # noqa: E402
@@ -845,7 +852,7 @@ def test_a_kv_pool_says_what_keeps_it_off_the_tables(groups, why):
     kv = KVManager.__new__(KVManager)
     kv._groups = [object()] * groups
     kv._needs_remote_transfer = False
-    refusal = kv.resident_refusal("kv", {"kv": object()})
+    refusal = kv.resident_binding().check_streams("kv", {"kv": object()})
     assert refusal is None if why is None else why in refusal
 
 
@@ -853,9 +860,9 @@ def test_mla_attention_is_resident_on_its_host_plan_and_says_why_it_doesnt_repea
     from mstar.engine.resources.attn.flashinfer_mla import FlashInferMLAManager
 
     mla = FlashInferMLAManager.__new__(FlashInferMLAManager)
-    assert mla.resident_refusal("attn", {}) is None
+    assert mla.resident_binding().check_streams("attn", {}) is None
     step = SimpleNamespace(host_planned=False)
-    mla.resident_gather(step)
+    mla.resident_binding().gather(step)
     assert step.host_planned
     assert "takes each row's length from its plan" in mla.repeat_refusal(WALK)
     assert mla.repeat_refusal(WALK, host_step=object()) is None
@@ -1937,7 +1944,7 @@ def test_joining_horizon_preserves_other_preplans_and_settles_both_receipts(monk
 
     # Full horizon sizing refuses before reserving; it never changes receipts.
     with monkeypatch.context() as patch:
-        patch.setattr(rope, "max_repeats", lambda step, ctx: 3)
+        patch.setitem(planner.bindings, "rope", replace(planner.bindings["rope"], max_repeats=lambda step, ctx: 3))
         assert not runner.admit_rows(joining).ok
     assert joining.ctx.repeats == 4 and kv._arena.num_free == before_pages
     # An owner refusing after KV must release only the new row's pages.
@@ -1978,10 +1985,15 @@ def test_joining_horizon_preserves_other_preplans_and_settles_both_receipts(monk
     kv.assert_pages_conserved()
 
 
-@pytest.mark.parametrize("unsupported", ["recurrent", "host_writes", "foreign_segment"])
+@pytest.mark.parametrize("unsupported", ["recurrent", "host_writes", "foreign_segment", "iteration_inputs", "sampler"])
 def test_joining_rejects_unaudited_owner_effects_before_reserving(unsupported):
     live = _resources(prefix_cache=False, recurrent_prefix_slots=1 if unsupported == "recurrent" else 0)
-    planner = _planner(live, max_bs=4)
+    if unsupported == "iteration_inputs":
+        live["input"] = IterationTables(CPU)
+    elif unsupported == "sampler":
+        from mstar.engine.resources.sampler.resource import SamplerResource
+        live["sampler"] = SamplerResource(vocab_size=8, enable_repetion_penalty=False, device=CPU)
+    planner = _planner(live, max_bs=4, keys=tuple(live))
     runner = StepRunner(live)
     runner.ingest_request(1, {"kv": KVReqConfig()})
     _host_step(live, [1], [3])
@@ -1993,6 +2005,12 @@ def test_joining_rejects_unaudited_owner_effects_before_reserving(unsupported):
         steps["pool"] = RecurrentStep(segments=segments)
     elif unsupported == "host_writes":
         live["kv"]._host_writes = SimpleNamespace()
+    elif unsupported == "iteration_inputs":
+        from mstar.engine.resources.step import ResourceStep
+        steps["input"] = ResourceStep(segments=segments)
+    elif unsupported == "sampler":
+        from mstar.engine.resources.sampler.config import SamplerStep
+        steps["sampler"] = SamplerStep(segments=segments)
     else:
         steps["kv"] = KVStep(segments=(Segment(2, "main", 1),))
     step = SubmoduleStep(steps)
@@ -2306,19 +2324,19 @@ def test_a_plan_that_raises_leaves_its_rows_to_the_next_step(monkeypatch):
     live, ref, planner = _setup({1: 3, 2: 5})
     del ref
     kv = live["kv"]
-    real = kv.resident_row
+    real = planner.bindings["kv"].row
 
     def boom(rid, slot, row, writes):
         if rid == 2:
             raise ValueError("a row that can't be written")
         real(rid, slot, row, writes)
 
-    monkeypatch.setattr(kv, "resident_row", boom)
+    monkeypatch.setitem(planner.bindings, "kv", replace(planner.bindings["kv"], row=boom))
     s = _captured_step(live, planner, [1, 2], slot=0, bs=2, run=False)
     with pytest.raises(ValueError, match="can't be written"):
         planner.plan(s.step, s.ctx)
     assert planner._stale == {1, 2}
-    monkeypatch.setattr(kv, "resident_row", real)
+    monkeypatch.setitem(planner.bindings, "kv", replace(planner.bindings["kv"], row=real))
     _replay(live, planner, s)
     _assert_row(planner, live, 1)
     _assert_row(planner, live, 2)
@@ -2810,8 +2828,8 @@ def test_the_fmha_gather_reads_its_own_pools_table_and_lengths(monkeypatch, pool
     step = SubmoduleStep(steps={"kv": KVStep(), "ctx": KVStep(), "rope": PositionStep()}, segments=segments)
     captured = planner.capture_step(BucketKey(WALK, 2, 2), 0, step)
     for key in ("kv", "ctx"):
-        live[key].resident_gather(captured)
-    manager.resident_gather(captured)
+        live[key].resident_binding().gather(captured)
+    manager.resident_binding().gather(captured)
     assert wrapper.calls == [(captured.buffers.kv_len[pool], live[pool]._resident.block_table.col)]
     assert captured.reads_tables and not captured.host_planned
 
@@ -2827,7 +2845,7 @@ def test_an_fmha_wrapper_over_a_pool_the_step_only_reads_keeps_its_host_plan(mon
     context = (Segment(1, "main", 0), Segment(2, "main", 0))
     steps = {"kv": KVStep(), "ctx": KVStep(segments=context), "rope": PositionStep()}
     captured = planner.capture_step(BucketKey(WALK, 2, 2), 0, SubmoduleStep(steps=steps, segments=segments))
-    manager.resident_gather(captured)
+    manager.resident_binding().gather(captured)
     assert not wrapper.calls and captured.host_planned
 
 
@@ -2863,10 +2881,15 @@ class _Attention(Resource):
     def __init__(self, reads_tables: bool):
         self._reads = reads_tables
 
-    def resident_refusal(self, key, streams):
-        return None
+    def resident_binding(self):
+        return ResidentBinding(
+            check_streams=no_resident_effect, bind=no_resident_effect, row=no_resident_effect,
+            stage=no_resident_effect, gather=self._gather, run_gather=no_resident_effect,
+            commit_in_graph=no_resident_effect, advance=no_resident_effect, check_horizon=unbound_horizon,
+            max_repeats=unbounded_repeats, rewind_run=no_resident_effect,
+        )
 
-    def resident_gather(self, step):
+    def _gather(self, step):
         if self._reads:
             step.reads_tables = True
         else:
@@ -2889,11 +2912,11 @@ def test_cross_attention_over_its_own_context_pool_runs_on_the_planner():
 
     manager = FlashInferCrossManager.__new__(FlashInferCrossManager)
     manager._kv_cache_name, manager._query_kv_cache_name = "ctx", "kv"
-    assert manager.resident_refusal("x", {}) is None
+    assert manager.resident_binding().check_streams("x", {}) is None
     manager._query_kv_cache_name = "ctx"
-    assert "second stream" in manager.resident_refusal("x", {})
+    assert "second stream" in manager.resident_binding().check_streams("x", {})
     step = SimpleNamespace(reads_tables=False, host_planned=False)
-    FlashInferCrossManager.resident_gather(manager, step)
+    manager.resident_binding().gather(step)
     assert step.host_planned and not step.reads_tables
 
 
@@ -2978,7 +3001,7 @@ def test_a_sliding_window_pool_refuses():
 
 def test_block_positions_refuse():
     rope = RopeManager(PositionConfig(kv_cache="kv", scheme=PosScheme.BLOCK), CPU, max_seq_len=512, head_dim=8)
-    assert "doesn't advance" in rope.resident_refusal("rope", {})
+    assert "doesn't advance" in rope.resident_binding().check_streams("rope", {})
 
 
 def test_a_pool_without_a_sink_refuses():
@@ -2986,7 +3009,7 @@ def test_a_pool_without_a_sink_refuses():
         num_layers=1, max_slots=4, blocks={"state": RecurrentBlockConfig(shape=(2,), dtype=torch.float32)},
         disable_sink_slot=True,
     ))
-    assert "sink" in pool.resident_refusal("pool", {})
+    assert "sink" in pool.resident_binding().check_streams("pool", {})
 
 
 @pytest.mark.parametrize("module,name", [
@@ -2999,7 +3022,7 @@ def test_resources_with_no_table_keep_the_base_refusal(module, name):
     import importlib
 
     cls = getattr(importlib.import_module(module), name)
-    assert cls.resident_refusal is Resource.resident_refusal
+    assert cls.resident_binding is Resource.resident_binding
 
 
 def test_flashinfer_refuses_a_sliding_window():
@@ -3007,9 +3030,9 @@ def test_flashinfer_refuses_a_sliding_window():
 
     manager = FlashInferManager.__new__(FlashInferManager)
     manager._window_left = 5
-    assert "sliding window" in manager.resident_refusal("attn", {})
+    assert "sliding window" in manager.resident_binding().check_streams("attn", {})
     manager._window_left = -1
-    assert manager.resident_refusal("attn", {}) is None
+    assert manager.resident_binding().check_streams("attn", {}) is None
 
 
 @pytest.mark.parametrize("field,value", [

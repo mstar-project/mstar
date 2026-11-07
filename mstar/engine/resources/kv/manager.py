@@ -49,7 +49,11 @@ from mstar.engine.resources.kv.plan import (
 )
 from mstar.engine.resources.kv.prefix_index import PrefixIndex
 from mstar.engine.resources.kv.transfer import KVTransferInfo, KVTransferManager, TransferEngineInfo
-from mstar.engine.resources.resident_hooks import ANY_REPEATS
+from mstar.engine.resources.resident_hooks import (
+    ANY_REPEATS,
+    ResidentBinding,
+    no_resident_effect,
+)
 from mstar.engine.resources.step import (
     ADMIT_OK,
     ASKS,
@@ -4806,7 +4810,29 @@ class KVManager(AttentionResource):
         reach = min(self.config.max_seq_len, self.config.request_pages * page_size)
         return max(1, min(page_size, reach - longest - ctx.repeats))
 
-    def resident_refusal(self, key, streams) -> str | None:
+    def _check_resident_horizon(self, step, ctx) -> None:
+        if (self._index is not None or self._windows or self._host_writes is not None
+                or self.config.cpu_offload_pages or self._host_copies or self._world_size != 1
+                or len(self._groups) != 1 or step.pre_forks or step.post_forks
+                or step.eager_write or step.retention or not step.commit):
+            raise ValueError("needs plain local KV without prefix or host copies")
+
+    def resident_binding(self) -> ResidentBinding:
+        return ResidentBinding(
+            check_streams=self._resident_refusal,
+            bind=self._bind_resident,
+            row=self._resident_row,
+            stage=self._resident_stage,
+            gather=self._resident_gather,
+            run_gather=no_resident_effect,
+            commit_in_graph=self._resident_commit,
+            advance=self._resident_advance,
+            check_horizon=self._check_resident_horizon,
+            max_repeats=self.max_repeats,
+            rewind_run=self.rewind_run,
+        )
+
+    def _resident_refusal(self, key, streams) -> str | None:
         if key not in streams:
             return "its step declares it no stream"
         if len(self._groups) > 1:
@@ -4817,7 +4843,7 @@ class KVManager(AttentionResource):
             return "a pool read across nodes takes pages a resident row doesn't track"
         return None
 
-    def bind_resident(self, planner: "ResidentPlanner", key: str) -> None:
+    def _bind_resident(self, planner: "ResidentPlanner", key: str) -> None:
         from mstar.engine.resources.kv.resident import KVResidentTables
 
         page_size = self._groups[0].page_size
@@ -4826,7 +4852,7 @@ class KVManager(AttentionResource):
         width = min(-(-self.config.max_seq_len // page_size), self.config.request_pages)
         self._resident = KVResidentTables(planner, key, page_size, width)
 
-    def resident_row(self, rid: int, slot: int, row: list[int], writes: "ResidentWrites") -> None:
+    def _resident_row(self, rid: int, slot: int, row: list[int], writes: "ResidentWrites") -> None:
         tables = self._resident
         label = writes.streams[tables.key].label
         stream = self._streams[rid][label]
@@ -4837,7 +4863,7 @@ class KVManager(AttentionResource):
             )
         tables.row(stream.stored_len, stream.page_indices, slot, row, writes)
 
-    def resident_stage(self, plan: "ResidentPlan") -> None:
+    def _resident_stage(self, plan: "ResidentPlan") -> None:
         tables, streams = self._resident, self._streams
         stream = plan.writes.streams[tables.key]
         label, planner = stream.label, tables.planner
@@ -4853,7 +4879,7 @@ class KVManager(AttentionResource):
                 held, stored = int(tables.host_len[slot]), streams[rid][label].stored_len
                 assert held == stored, f"KV {self.name}: resident row of {rid} at {held}, its stream at {stored}"
 
-    def resident_gather(self, step: "CapturedResidentStep") -> None:
+    def _resident_gather(self, step: "CapturedResidentStep") -> None:
         tables = self._resident
         stream = step.streams[tables.key]
         if stream.reads:
@@ -4862,7 +4888,7 @@ class KVManager(AttentionResource):
         state = self._static_plan_state(step.buffer_slot, (stream.label, 0), step.bucket.num_tokens)
         tables.gather(step, state.token_to_page, state.token_to_cache)
 
-    def resident_commit(self, step: "CapturedResidentStep") -> None:
+    def _resident_commit(self, step: "CapturedResidentStep") -> None:
         self._resident.commit(step)
 
     def rewind_run(self, step, ctx, replays: int, rows) -> None:
@@ -4875,7 +4901,7 @@ class KVManager(AttentionResource):
                 if self._resident is not None:
                     self._resident.rewind(segment.request_id, segment.span * replays)
 
-    def resident_advance(self, plan: "ResidentPlan") -> None:
+    def _resident_advance(self, plan: "ResidentPlan") -> None:
         self._resident.advance(plan)
 
     def reset_default_cursors(self) -> None:

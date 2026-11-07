@@ -36,6 +36,12 @@ from mstar.engine.resources.kv.plan import (
     PagedIndptrs,
     SequenceView,
 )
+from mstar.engine.resources.resident_hooks import (
+    ResidentBinding,
+    no_resident_effect,
+    unbound_horizon,
+    unbounded_repeats,
+)
 from mstar.engine.resources.step import SlotLease, StepContext
 from mstar.utils.profiler import PhaseLaps
 
@@ -146,12 +152,27 @@ class FlashInferCrossManager(CrossAttentionManager):
         # so one plan serves every replay, whatever the kernel
         return None
 
-    def resident_refusal(self, key, streams) -> str | None:
+    def resident_binding(self) -> ResidentBinding:
+        return ResidentBinding(
+            check_streams=self._resident_refusal,
+            bind=no_resident_effect,
+            row=no_resident_effect,
+            stage=no_resident_effect,
+            gather=self._resident_gather,
+            run_gather=no_resident_effect,
+            commit_in_graph=no_resident_effect,
+            advance=no_resident_effect,
+            check_horizon=unbound_horizon,
+            max_repeats=unbounded_repeats,
+            rewind_run=no_resident_effect,
+        )
+
+    def _resident_refusal(self, key, streams) -> str | None:
         if self._query_kv_cache_name == self._kv_cache_name:
             return "a context in the query's own pool would be a second stream on one resident row"
         return None
 
-    def resident_gather(self, step: "CapturedResidentStep") -> None:
+    def _resident_gather(self, step: "CapturedResidentStep") -> None:
         # the context pool's row is read only, and this plans its views on the host
         step.host_planned = True
 
