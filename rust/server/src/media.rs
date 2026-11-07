@@ -94,10 +94,28 @@ fn decode_b64_lenient(payload: &str) -> Result<Vec<u8>, base64::DecodeError> {
     base64::engine::general_purpose::STANDARD.decode(compact.as_bytes())
 }
 
-fn save_bytes(raw: &[u8], mime: &str, upload_dir: &Path) -> std::io::Result<(String, String)> {
+/// Persist a bounded client basename, cleaning up even a partial write.
+pub fn save_upload(raw: &[u8], filename: &str, upload_dir: &Path) -> std::io::Result<std::path::PathBuf> {
     std::fs::create_dir_all(upload_dir)?;
-    let path = upload_dir.join(format!("{}{}", Uuid::new_v4(), ext_for(mime)));
-    std::fs::write(&path, raw)?;
+    let base = Path::new(filename).file_name().and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty()).unwrap_or("upload.bin");
+    let bounded = if base.len() > 180 {
+        let ext = Path::new(base).extension().and_then(|s| s.to_str())
+            .filter(|s| s.len() <= 15).unwrap_or("bin");
+        format!("upload.{ext}")
+    } else {
+        base.to_string()
+    };
+    let path = upload_dir.join(format!("{}_{}", Uuid::new_v4(), bounded));
+    if let Err(error) = std::fs::write(&path, raw) {
+        let _ = std::fs::remove_file(&path);
+        return Err(error);
+    }
+    Ok(path)
+}
+
+fn save_bytes(raw: &[u8], mime: &str, upload_dir: &Path) -> std::io::Result<(String, String)> {
+    let path = save_upload(raw, &format!("upload{}", ext_for(mime)), upload_dir)?;
     Ok((modality_from_mime(mime).to_string(), path.to_string_lossy().into_owned()))
 }
 
@@ -149,8 +167,7 @@ pub fn save_base64(
     } else {
         format!(".{clean}")
     };
-    let path = upload_dir.join(format!("{}{}", Uuid::new_v4(), ext));
-    std::fs::write(&path, &raw).map_err(|e| e.to_string())?;
+    let path = save_upload(&raw, &format!("upload{ext}"), upload_dir).map_err(|e| e.to_string())?;
     Ok((modality_hint.to_string(), path.to_string_lossy().into_owned()))
 }
 

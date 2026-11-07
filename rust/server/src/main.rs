@@ -1005,14 +1005,12 @@ async fn images_edits(State(st): State<AppState>, mut mp: Multipart) -> Response
     if let Err(e) = std::fs::create_dir_all(&st.upload_dir) {
         return error(500, &e.to_string(), "server_error");
     }
-    let ext = image_filename
-        .as_deref()
-        .and_then(|f| PathBuf::from(f).extension().map(|e| format!(".{}", e.to_string_lossy())))
-        .unwrap_or_else(|| ".png".to_string());
-    let image_path = st.upload_dir.join(format!("{}{}", Uuid::new_v4().simple(), ext));
-    if let Err(e) = std::fs::write(&image_path, &image_bytes) {
-        return error(500, &e.to_string(), "server_error");
-    }
+    let image_path = match media::save_upload(
+        &image_bytes, image_filename.as_deref().unwrap_or("image.png"), &st.upload_dir,
+    ) {
+        Ok(path) => path,
+        Err(e) => return error(500, &e.to_string(), "server_error"),
+    };
 
     let args = match adapter.image_edit_to_request(&prompt, &image_path.to_string_lossy(), extra) {
         Ok(a) => a,
@@ -1159,20 +1157,10 @@ async fn generate(State(st): State<AppState>, req: axum::extract::Request) -> Re
             if let Err(e) = std::fs::create_dir_all(&st.upload_dir) {
                 return detail_error(500, &e.to_string());
             }
-            // Sanitize: take ONLY the final path component of the
-            // client-supplied name. `join` treats embedded separators as
-            // separators, so `../../x` would escape upload_dir (arbitrary
-            // write — and the cleanup filter is component-based, so it would
-            // then arbitrary-delete). file_name() strips any directory parts.
-            let safe = std::path::Path::new(&filename)
-                .file_name()
-                .and_then(|s| s.to_str())
-                .filter(|s| !s.is_empty())
-                .unwrap_or("upload");
-            let save_path = st.upload_dir.join(format!("{}_{}", Uuid::new_v4().simple(), safe));
-            if let Err(e) = std::fs::write(&save_path, &bytes) {
-                return detail_error(500, &e.to_string());
-            }
+            let save_path = match media::save_upload(&bytes, &filename, &st.upload_dir) {
+                Ok(path) => path,
+                Err(e) => return detail_error(500, &e.to_string()),
+            };
             uploads
                 .paths
                 .entry(modality.to_string())
@@ -1715,8 +1703,10 @@ mod tests {
     async fn a_file_refused_mid_form_takes_the_saved_ones_with_it() {
         let mut st = state(None);
         st.upload_dir = socket_dir();
+        let long_name = format!("{}.wav", "é".repeat(2500));
         let req = multipart_request("/generate", &[
             ("files", Some("clip.wav"), b"RIFF"),
+            ("files", Some(&long_name), b"RIFF"),
             ("files", Some("notes.xyz"), b"?"),
         ]);
 
