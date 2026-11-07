@@ -783,6 +783,29 @@ class _TensorCoreDecode(FlashInferDecodeWrapper):
     lengths_move = True
 
 
+def test_resident_decode_grid_tracks_new_owners_and_discards_old_page_ids():
+    # Fixed capture addresses, two queued windows, different resident owners.
+    # Poison unused source columns so reading a prior tenant cannot look valid.
+    store = torch.tensor([[0, 0, 0, 0], [11, 777, 777, 777],
+                          [21, 22, 777, 777], [31, 32, 33, 34]], dtype=torch.long).flatten()
+    wrappers = []
+    for _ in range(2):
+        wrapper = _TensorCoreDecode.__new__(_TensorCoreDecode)
+        wrapper.batch_size, wrapper.page_size, wrapper._resident_pages = 2, 16, 4
+        wrapper._paged_kv_indices_buf = torch.full((8,), 999, dtype=torch.int32)
+        wrapper._paged_kv_last_page_len_buf = torch.zeros(2, dtype=torch.int32)
+        wrappers.append(wrapper)
+    for slots, lengths, expected in (
+        ([1, 2], [15, 16], [[11, 0, 0, 0], [21, 22, 0, 0]]),
+        ([0, 3], [0, 63], [[0, 0, 0, 0], [31, 32, 33, 34]]),
+    ):
+        for wrapper in wrappers:
+            wrapper.gather_resident(store, torch.tensor(slots), torch.tensor(lengths), 4, 0)
+            assert wrapper._paged_kv_indices_buf.reshape(2, 4).tolist() == expected
+            # FlashInfer reconstructs length from the fixed grid plus its tail.
+            assert (wrapper._paged_kv_last_page_len_buf + 48).tolist() == [n + 1 for n in lengths]
+
+
 def _sampler(**attrs):
     from mstar.engine.resources.sampler.resource import SamplerResource
 

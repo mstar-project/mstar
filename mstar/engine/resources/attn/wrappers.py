@@ -459,6 +459,7 @@ class FlashInferDecodeWrapper:
 
     # the tokens of each row's pages before its last, for a run (``stage_page_base``)
     _page_base: torch.Tensor | None = None
+    _resident_pages: int | None = None
 
     def __init__(
         self,
@@ -545,6 +546,8 @@ class FlashInferDecodeWrapper:
 
         Inputs may be on CPU; see prefill wrapper's plan docstring.
         """
+        if self._resident_pages is not None:
+            raise ValueError("resident decode has a fixed page grid; update its owner rows instead of replanning")
         n_req = paged_kv_indptr.shape[0] - 1
         if (
             self.accelerator_graph and paged_kv_indices.device.type != "cuda"
@@ -604,6 +607,57 @@ class FlashInferDecodeWrapper:
         fixes only pages and chunks. The CUDA-core kernel's chunk size underflows
         on a chunk past the row's end."""
         return _decode_direct_variant(self.attn_wrapper) == _TENSOR_CORE_DECODE
+
+    def plan_resident(self, pages_per_row: int, dtype: torch.dtype = torch.bfloat16) -> None:
+        """Plan a fixed page grid whose identities and lengths move in capture.
+
+        This is only for joining rows. The ordinary decode plan keeps its
+        compact page list and its existing cost. Every grid entry is allocated
+        before capture; inactive and unused entries point at the sink page.
+        """
+        if (not self.accelerator_graph or type(pages_per_row) is not int or pages_per_row < 1
+                or pages_per_row * self.batch_size > self._paged_kv_indices_buf.numel()):
+            raise ValueError("resident decode needs a captured full page grid")
+        if self._resident_pages is not None:
+            if self._resident_pages != pages_per_row or self.dtype != dtype:
+                raise ValueError("a resident decode capture cannot change its grid or dtype")
+            return
+        self.plan(
+            torch.arange(self.batch_size + 1, dtype=torch.int32) * pages_per_row,
+            torch.zeros(self.batch_size * pages_per_row, dtype=torch.int32),
+            torch.full((self.batch_size,), self.page_size, dtype=torch.int32),
+            dtype=dtype, kv_lens=torch.full((self.batch_size,), pages_per_row * self.page_size, dtype=torch.int32),
+        )
+        if not self.lengths_move:
+            raise ValueError("resident decode needs the tensor-core kernel with runtime lengths")
+        self._resident_pages = pages_per_row
+        self._page_base = torch.full_like(
+            self._paged_kv_last_page_len_buf, (pages_per_row - 1) * self.page_size,
+        )
+
+    def gather_resident(
+        self, store: torch.Tensor, slots: torch.Tensor, kv_len: torch.Tensor, stride: int, block_col: int,
+    ) -> None:
+        """Read this iteration's immutable membership and its owners' current KV."""
+        width = self._resident_pages
+        if width is None:
+            raise ValueError("resident decode must plan its full page grid before capture")
+        base = (width - 1) * self.page_size
+        if store.is_cuda:
+            _gather_block_rows_kernel[(self.batch_size,)](
+                slots, kv_len, store, self._paged_kv_indices_buf, self._paged_kv_last_page_len_buf,
+                STRIDE=stride, BLOCK=block_col, PAGE=self.page_size, WIDTH=width,
+                TAIL_BASE=base, FULL_TABLE=True, num_warps=1,
+            )
+        else:
+            lengths = kv_len + 1
+            columns = torch.arange(width)
+            pages = (lengths + self.page_size - 1) // self.page_size
+            table = store.view(-1, stride)[slots, block_col:block_col + width]
+            self._paged_kv_indices_buf[:self.batch_size * width].copy_(
+                torch.where(columns[None, :] < pages[:, None], table, 0).flatten(),
+            )
+            self._paged_kv_last_page_len_buf.copy_(lengths - base)
 
     def first_replay(self, last_page_len: torch.Tensor, rows: int, repeats: int) -> torch.Tensor:
         """``last_page_len`` planned for a step's last replay, as its first reads
@@ -712,17 +766,18 @@ class FlashInferDecodeWrapper:
 def _gather_block_rows_kernel(
     slots_ptr, kv_len_ptr, store_ptr, table_ptr, lens_ptr,
     STRIDE: tl.constexpr, BLOCK: tl.constexpr, PAGE: tl.constexpr, WIDTH: tl.constexpr,
+    TAIL_BASE: tl.constexpr = 0, FULL_TABLE: tl.constexpr = False,
 ):
     i = tl.program_id(0)
     n = tl.load(kv_len_ptr + i) + 1
-    tl.store(lens_ptr + i, n.to(tl.int32))
+    tl.store(lens_ptr + i, (n - TAIL_BASE).to(tl.int32))
     row = tl.load(slots_ptr + i) * STRIDE + BLOCK
     pages = (n + PAGE - 1) // PAGE
-    for start in tl.range(0, pages, 32):
+    for start in tl.range(0, WIDTH if FULL_TABLE else pages, 32):
         cols = start + tl.arange(0, 32)
-        keep = cols < pages
+        keep = (cols < pages) & (cols < WIDTH) if FULL_TABLE else cols < pages
         values = tl.load(store_ptr + row + cols, mask=keep, other=0)
-        tl.store(table_ptr + i * WIDTH + cols, values.to(tl.int32), mask=keep)
+        tl.store(table_ptr + i * WIDTH + cols, values.to(tl.int32), mask=cols < WIDTH if FULL_TABLE else keep)
 
 
 class FmhaDecodeWrapper:

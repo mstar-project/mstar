@@ -201,3 +201,56 @@ def test_repeat_plan_clamps_to_each_replays_actual_length(repeats):
         graph.replay()
         expected = single.run(query, cache)
         torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
+
+
+def test_resident_decode_captures_follow_replaced_rows_and_page_boundaries():
+    width = 32
+    rows = 2 * BS + 1
+    cache = torch.randn((rows - 1) * width + 1, 2, PAGE, KV, HD, dtype=torch.bfloat16, device="cuda")
+    cache[0].zero_()
+    query = torch.randn(BS, QO, HD, dtype=torch.bfloat16, device="cuda")
+    store = torch.zeros(rows, width, dtype=torch.long, device="cuda")
+    slots = torch.zeros(BS, dtype=torch.long, device="cuda")
+    lengths = torch.zeros(BS, dtype=torch.long, device="cuda")
+    graphs, outputs, captured = [], [], []
+    for _ in range(2):
+        wrapper = _wrapper(backend="fa2")
+        captured.append(wrapper)
+        wrapper.plan_resident(width)
+        for _ in range(3):
+            wrapper.gather_resident(store.flatten(), slots, lengths, width, 0)
+            wrapper.run(query, cache)
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            wrapper.gather_resident(store.flatten(), slots, lengths, width, 0)
+            output = wrapper.run(query, cache)
+        graphs.append(graph)
+        outputs.append(output)
+    oracle = _wrapper(backend="fa2")
+    desired = np.array([1, 15, 16, 17, 511, 512, 33, 1], dtype=np.int32)
+    page_counts = (desired + PAGE - 1) // PAGE
+    for offset in (0, BS, 0):
+        owners = list(range(offset + 1, offset + BS)) + [0]
+        # Every unused owner cell is poisoned, including old tenants' tails.
+        host = torch.full((rows, width), cache.shape[0] + 99, dtype=torch.long)
+        host[0].zero_()
+        indices = []
+        for row, count in zip(owners, page_counts, strict=True):
+            pages = [0] if row == 0 else list(range((row - 1) * width + 1, (row - 1) * width + 1 + int(count)))
+            host[row, :count] = torch.tensor(pages)
+            indices.extend(pages)
+        store.copy_(host)
+        slots.copy_(torch.tensor(owners))
+        lengths.copy_(torch.from_numpy(desired - 1))
+        for graph in graphs:
+            graph.replay()
+        oracle.plan(
+            torch.from_numpy(np.concatenate(([0], np.cumsum(page_counts))).astype(np.int32)),
+            torch.tensor(indices, dtype=torch.int32), torch.from_numpy((desired - 1) % PAGE + 1),
+            kv_lens=torch.from_numpy(desired),
+        )
+        expected = oracle.run(query, cache)
+        for actual in outputs:
+            assert torch.isfinite(actual).all()
+            torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
