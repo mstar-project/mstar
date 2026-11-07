@@ -41,7 +41,7 @@ class LinearAttnConfig:
     sm_scale: float | None = None
 
     # L2-normalise q and k for the delta rule: in the kernel where it can, by
-    # `GDNManager.run` where it cannot (the SM90 chunked prefill). Qwen3.5 needs
+    # `GDNManager.run` where it cannot (an unstaged SM90 chunked prefill). Qwen3.5 needs
     # it (the HF reference passes it) and skipping it diverges silently.
     qk_l2norm: bool = True
 
