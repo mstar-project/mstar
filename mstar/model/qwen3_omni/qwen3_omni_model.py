@@ -1610,10 +1610,11 @@ class Qwen3OmniModel(Model):
         # We rewrite the name so StackedParamRule suffix matching works:
         # "experts.N.gate_proj.weight" → "experts.gate_proj.__N__.weight"
         # The weight_loader on the fused param extracts the expert index from shard_id.
-        m = re.match(r"(.*)\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight$", name)
+        # (a block-fp8 checkpoint's ``weight_scale_inv`` follows its weight onto ``<param>_scale_inv``)
+        m = re.match(r"(.*)\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)\.(weight|weight_scale_inv)$", name)
         if m:
-            prefix, expert_idx, proj = m.groups()
-            return f"{prefix}.experts.{proj}.__expert{expert_idx}__.weight"
+            prefix, expert_idx, proj, suffix = m.groups()
+            return f"{prefix}.experts.{proj}.__expert{expert_idx}__.{suffix}"
         return name
 
     # MoE stacked param rules: route per-expert projections into fused params.
@@ -1661,6 +1662,27 @@ class Qwen3OmniModel(Model):
         rules.append(StackedParamRule(".qkv_proj", ".v_proj", "v"))
         self._THINKER_STACKED_PARAMS = rules
         return rules
+
+    def get_quantization_roots(self):
+        from mstar.model.components.quant_linear import QuantizableLinears
+        from mstar.model.loader.base import CheckpointRules
+        from mstar.model.qwen3_omni.components.thinker import Qwen3OmniThinkerModel
+        from mstar.quantization.resolve import QuantizationRoot
+
+        # the Thinker's attention projections and routed experts may go low precision; its router and LM head
+        # stay bf16 (the router isn't a linear here)
+        linears = QuantizableLinears(
+            candidates=("model.layers.*.self_attn.*", "model.layers.*.mlp.*"), keep_bf16=("lm_head",),
+        )
+        return [QuantizationRoot(
+            node="Thinker", root_type=Qwen3OmniThinkerModel, linears=linears,
+            rules=CheckpointRules(
+                stacked_params=tuple(self._get_thinker_stacked_params()), remap=self._thinker_remap,
+                prefix="thinker.",
+            ),
+            checkpoint_dir=lambda: getattr(self, "local_dir", None),
+            build=lambda comm_group: Qwen3OmniThinkerModel(self.config, comm_group=comm_group),
+        )]
 
     def _create_thinker_submodule(
         self, device: str, tp_group=None,
