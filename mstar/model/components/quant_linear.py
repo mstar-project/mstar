@@ -40,6 +40,9 @@ BF16 = "bf16"
 _FORMAT_MODULES = {
     "mxfp8": "mstar.model.components.block_scaled",
     "nvfp4": "mstar.model.components.block_scaled",
+    "fp8_tensor": "mstar.model.components.fp8_formats",
+    "fp8_channel": "mstar.model.components.fp8_formats",
+    "fp8_block": "mstar.model.components.fp8_formats",
 }
 LINEAR_DTYPES = (BF16, *_FORMAT_MODULES)
 _FORMATS: dict[str, LinearFormat] = {}
@@ -84,7 +87,9 @@ class LinearFormat:
         raise NotImplementedError
 
     def linear(self, x: torch.Tensor, *buffers: torch.Tensor | None) -> torch.Tensor:
-        """``x [M, K]`` (contiguous) times the stored weight, ``[M, N]`` in ``x``'s dtype."""
+        """``x [M, K]`` (contiguous) times the stored weight, ``[M, N]`` in ``x``'s dtype. ``buffers`` (in
+        ``self.buffers``' order) come viewed as what their bytes stand for (``Storage.stands_for``: e4m3, fp32),
+        whether the layer loaded them from a checkpoint or quantized at load."""
         raise NotImplementedError
 
     def storage(self, n: int, k: int) -> tuple[Storage, ...]:
@@ -451,9 +456,11 @@ class InPlaceQuant:
         fmt.check(n, k, self.weight.dtype)
         buffers = fmt.quantize_weight(self.weight.data, input_amax)
         del self.weight
+        # the format's linear() sees what the bytes stand for, as a layer loaded from a stored checkpoint does
+        stands_for = {st.name: st.stands_for for st in fmt.storage(n, k)}
         self._quant_views = {}
         for name, tensor in buffers.items():
-            self._quant_views[name] = tensor.dtype if tensor.dtype.is_floating_point else None
+            self._quant_views[name] = stands_for.get(name, tensor.dtype if tensor.dtype.is_floating_point else None)
             self.register_parameter(name, nn.Parameter(as_container(tensor), requires_grad=False))
         self.quant_format = fmt
 

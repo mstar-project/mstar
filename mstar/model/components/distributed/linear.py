@@ -5,7 +5,7 @@ from mstar.distributed.communication import CommGroup
 from mstar.distributed.utils import divide, split_tensor_along_last_dim
 from mstar.engine.resources.lora.config import LoraTarget
 from mstar.model.components.lora.capable import LoraBound, LoraCapable, apply_lora
-from mstar.model.components.quant_linear import QuantCapability
+from mstar.model.components.quant_linear import InPlaceQuant, QuantCapability, QuantGeometry, span
 
 
 class _ColumnLora(LoraBound):
@@ -27,7 +27,7 @@ class _RowLora(LoraBound):
         return self._reduce(apply_lora(self.lora_delta, input_parallel, output_parallel))
 
 
-class ColumnParallelLinear(nn.Module, LoraCapable):
+class ColumnParallelLinear(nn.Module, LoraCapable, InPlaceQuant):
     """Linear layer with column parallelism.
 
     The linear layer is defined as Y = XA + b. A is parallelized along
@@ -85,7 +85,8 @@ class ColumnParallelLinear(nn.Module, LoraCapable):
         ``to_empty`` / ``.to(...)`` re-allocates Parameters and drops
         attribute attachments on the old objects.
         """
-        self.weight.weight_loader = self.weight_loader
+        if not self._attach_quant_loaders():
+            self.weight.weight_loader = self.weight_loader
         if self.bias is not None:
             self.bias.weight_loader = self.weight_loader
 
@@ -99,8 +100,12 @@ class ColumnParallelLinear(nn.Module, LoraCapable):
         param: nn.Parameter,
         loaded_weight: torch.Tensor,
         loaded_shard_id: int | str | None = None,
+        units: tuple[int | None, int | None] = (1, 1),
     ):
         """Copy this rank's slice of ``loaded_weight`` into ``param``.
+
+        ``units``: weight rows / columns per index of ``loaded_weight`` (a quantized weight's scales,
+        ``InPlaceQuant``); the slice is the same rows in those units.
 
         For plain ColumnParallelLinear there's a single shard so
         ``loaded_shard_id`` must be None. Subclasses (``MergedColumnParallelLinear``,
@@ -118,8 +123,11 @@ class ColumnParallelLinear(nn.Module, LoraCapable):
             f"got {loaded_shard_id!r}"
         )
         # Partition along dim 0 (output dim).
-        start = self.tp_rank * self.output_size_per_partition
-        shard = loaded_weight.narrow(0, start, self.output_size_per_partition)
+        start, rows = span(
+            self.tp_rank * self.output_size_per_partition, self.output_size_per_partition, units[0],
+            loaded_weight.shape[0],
+        )
+        shard = loaded_weight.narrow(0, start, rows)
         assert param.data.shape == shard.shape, (
             f"weight_loader shape mismatch: param {tuple(param.data.shape)} "
             f"vs shard {tuple(shard.shape)}"
@@ -135,6 +143,8 @@ class ColumnParallelLinear(nn.Module, LoraCapable):
     def _local(self, input_) -> torch.Tensor:
         """This rank's output columns."""
         bias = self.bias if not self.skip_bias_add else None
+        if self.quant_format is not None:
+            return self._quant_local(input_, bias)
         start = self._local_output_start
         if start:
             return torch.nn.functional.pad(
@@ -152,10 +162,15 @@ class ColumnParallelLinear(nn.Module, LoraCapable):
         return output_parallel
 
     def quant_capability(self) -> QuantCapability:
-        return QuantCapability(False, (
-            "a tensor-parallel linear gathers or splits around its own GEMM; a format would apply per shard "
-            "([N / tp, K] here) inside that forward, which takes no format yet"
-        ))
+        if self.quant_format is not None:
+            return QuantCapability(False, f"already {self.quant_format.name}")
+        if getattr(self, "_local_output_start", 0):
+            return QuantCapability(False, "it skips the outputs below output_start, which a format's GEMM can't")
+        return QuantCapability(True)
+
+    def quant_geometry(self) -> QuantGeometry:
+        n, k = self.output_size_per_partition, self.input_size_per_partition
+        return QuantGeometry(n, k, (n,), (k,))
 
     def lora_target(self) -> LoraTarget:
         return LoraTarget(
@@ -203,9 +218,10 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         param: nn.Parameter,
         loaded_weight: torch.Tensor,
         loaded_shard_id: int | None = None,
+        units: tuple[int | None, int | None] = (1, 1),
     ):
         """Copy this rank's slice of one of the merged sub-shards into
-        ``param`` at the correct offset.
+        ``param`` at the correct offset (in ``units``, as ``ColumnParallelLinear``).
 
         ``loaded_weight`` is the full checkpoint tensor for the sub-shard
         identified by ``loaded_shard_id`` (an index into ``output_sizes``).
@@ -219,19 +235,27 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         shard_per_partition = shard_output_size // self.tp_size
 
         # Slice this rank's chunk out of the full checkpoint shard.
-        src_start = self.tp_rank * shard_per_partition
-        src = loaded_weight.narrow(0, src_start, shard_per_partition)
+        src_start, rows = span(
+            self.tp_rank * shard_per_partition, shard_per_partition, units[0], loaded_weight.shape[0],
+        )
+        src = loaded_weight.narrow(0, src_start, rows)
 
         # Find where this sub-shard sits inside the merged param.
-        offset_in_param = sum(
-            s // self.tp_size for s in self.output_sizes[:loaded_shard_id]
+        offset_in_param, _ = span(
+            sum(s // self.tp_size for s in self.output_sizes[:loaded_shard_id]), shard_per_partition,
+            units[0], param.data.shape[0],
         )
-        dst = param.data.narrow(0, offset_in_param, shard_per_partition)
+        dst = param.data.narrow(0, offset_in_param, rows)
         assert dst.shape == src.shape, (
             f"weight_loader shape mismatch for shard {loaded_shard_id}: "
             f"dst {tuple(dst.shape)} vs src {tuple(src.shape)}"
         )
         dst.copy_(src)
+
+    def quant_geometry(self) -> QuantGeometry:
+        rows = tuple(size // self.tp_size for size in self.output_sizes)
+        return QuantGeometry(self.output_size_per_partition, self.input_size_per_partition, rows,
+                             (self.input_size_per_partition,))
 
     def lora_target(self) -> LoraTarget:
         # a slice per sub-shard, named by the index the stacked rules route by
@@ -309,9 +333,10 @@ class QKVParallelLinear(ColumnParallelLinear):
         param: nn.Parameter,
         loaded_weight: torch.Tensor,
         loaded_shard_id: str | None = None,
+        units: tuple[int | None, int | None] = (1, 1),
     ):
         """Copy this rank's q / k / v slice into ``param`` at the right
-        offset within the merged qkv parameter.
+        offset within the merged qkv parameter (in ``units``, as ``ColumnParallelLinear``).
 
         ``loaded_shard_id`` must be one of ``"q"``, ``"k"``, or ``"v"``.
         For GQA where ``tp_size > total_num_kv_heads`` the K / V heads
@@ -346,13 +371,21 @@ class QKVParallelLinear(ColumnParallelLinear):
                 + self.num_kv_heads * self.head_size
             )
 
-        src = loaded_weight.narrow(0, src_start, per_partition)
-        dst = param.data.narrow(0, offset_in_param, per_partition)
+        src_start, rows = span(src_start, per_partition, units[0], loaded_weight.shape[0])
+        offset_in_param, _ = span(offset_in_param, per_partition, units[0], param.data.shape[0])
+        src = loaded_weight.narrow(0, src_start, rows)
+        dst = param.data.narrow(0, offset_in_param, rows)
         assert dst.shape == src.shape, (
             f"weight_loader shape mismatch for {loaded_shard_id!r}: "
             f"dst {tuple(dst.shape)} vs src {tuple(src.shape)}"
         )
         dst.copy_(src)
+
+    def quant_geometry(self) -> QuantGeometry:
+        rows = (self.num_heads * self.head_size, self.num_kv_heads * self.head_size,
+                self.num_kv_heads * self.v_head_size)
+        return QuantGeometry(self.output_size_per_partition, self.input_size_per_partition, rows,
+                             (self.input_size_per_partition,))
 
     def lora_target(self) -> LoraTarget:
         # the checkpoint's widths: K/V heads replicated past their count still count once,
@@ -369,7 +402,7 @@ class QKVParallelLinear(ColumnParallelLinear):
         )
 
 
-class RowParallelLinear(nn.Module, LoraCapable):
+class RowParallelLinear(nn.Module, LoraCapable, InPlaceQuant):
     """Linear layer with row parallelism.
 
     The linear layer is defined as Y = XA + b. A is parallelized along
@@ -432,7 +465,8 @@ class RowParallelLinear(nn.Module, LoraCapable):
         """Re-attach loaders to ``self.weight`` (sharded) and ``self.bias``
         (replicated). Called from ``__init__`` and re-applied after any
         ``_apply`` transform (``to_empty`` / ``.to(...)``)."""
-        self.weight.weight_loader = self.weight_loader
+        if not self._attach_quant_loaders():
+            self.weight.weight_loader = self.weight_loader
         if self.bias is not None:
             self.bias.weight_loader = self._bias_loader
 
@@ -446,17 +480,26 @@ class RowParallelLinear(nn.Module, LoraCapable):
         param: nn.Parameter,
         loaded_weight: torch.Tensor,
         loaded_shard_id: int | str | None = None,
+        units: tuple[int | None, int | None] = (1, 1),
     ):
         """Copy this rank's slice of ``loaded_weight`` into ``param``.
 
-        Partition is along dim 1 (input dim) for the weight.
+        Partition is along dim 1 (input dim) for the weight; ``units`` as
+        ``ColumnParallelLinear.weight_loader`` (a tensor with no column dim is
+        copied whole).
         """
         assert loaded_shard_id is None, (
             f"RowParallelLinear.weight_loader doesn't take a shard id; "
             f"got {loaded_shard_id!r}"
         )
-        start = self.tp_rank * self.input_size_per_partition
-        shard = loaded_weight.narrow(1, start, self.input_size_per_partition)
+        if loaded_weight.dim() < 2:
+            shard = loaded_weight
+        else:
+            start, cols = span(
+                self.tp_rank * self.input_size_per_partition, self.input_size_per_partition, units[1],
+                loaded_weight.shape[1],
+            )
+            shard = loaded_weight.narrow(1, start, cols)
         assert param.data.shape == shard.shape, (
             f"weight_loader shape mismatch: param {tuple(param.data.shape)} "
             f"vs shard {tuple(shard.shape)}"
@@ -495,6 +538,8 @@ class RowParallelLinear(nn.Module, LoraCapable):
         # Only fuse bias add into GEMM for rank 0 (this ensures that
         # bias will not get added more than once in TP>1 case)
         bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
+        if self.quant_format is not None:
+            return input_parallel, self._quant_local(input_parallel, bias_)
         return input_parallel, torch.nn.functional.linear(input_parallel, self.weight, bias_)
 
     def _reduce(self, output_parallel: torch.Tensor) -> torch.Tensor:
@@ -506,10 +551,13 @@ class RowParallelLinear(nn.Module, LoraCapable):
         return output
 
     def quant_capability(self) -> QuantCapability:
-        return QuantCapability(False, (
-            "a tensor-parallel linear all-reduces its partial GEMM; a format would apply per shard ([N, K / tp] "
-            "here, K / tp meeting the format's K alignment) inside that forward, which takes no format yet"
-        ))
+        if self.quant_format is not None:
+            return QuantCapability(False, f"already {self.quant_format.name}")
+        return QuantCapability(True)
+
+    def quant_geometry(self) -> QuantGeometry:
+        n, k = self.output_size_per_partition, self.input_size_per_partition
+        return QuantGeometry(n, k, (n,), (k,))
 
     def lora_target(self) -> LoraTarget:
         return LoraTarget(
@@ -564,6 +612,7 @@ class KVColumnParallelLinear(ColumnParallelLinear):
         param: nn.Parameter,
         loaded_weight: torch.Tensor,
         loaded_shard_id: int | str | None = None,
+        units: tuple[int | None, int | None] = (1, 1),
     ):
         assert loaded_shard_id is None
         per_partition = self.num_kv_heads * self.head_size
@@ -573,7 +622,8 @@ class KVColumnParallelLinear(ColumnParallelLinear):
             if self.num_kv_head_replicas > 1
             else self.tp_rank
         )
-        shard = loaded_weight.narrow(0, index * per_partition, per_partition)
+        start, rows = span(index * per_partition, per_partition, units[0], loaded_weight.shape[0])
+        shard = loaded_weight.narrow(0, start, rows)
         assert param.data.shape == shard.shape, (
             f"weight_loader shape mismatch: param {tuple(param.data.shape)} "
             f"vs shard {tuple(shard.shape)}"

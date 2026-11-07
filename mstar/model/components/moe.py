@@ -75,7 +75,8 @@ from torch import nn
 
 from mstar.distributed.communication import CommGroup
 from mstar.distributed.utils import divide
-from mstar.utils.fp8_block import FP8_DTYPE
+from mstar.model.components.quant_linear import QuantCapability, QuantGeometry
+from mstar.utils.fp8_block import FP8_DTYPE, dequantize_fp8_block_weight, quantize_fp8_block_weight
 
 logger = logging.getLogger(__name__)
 
@@ -644,6 +645,13 @@ def _down_proj_fp8_weight_loader(
     param.data[expert_idx, :, :] = loaded_weight
 
 
+def _f32_container(loader):
+    """``loader`` for an fp32 tensor kept in an int32 container: the checkpoint's scales viewed, not cast."""
+    def load(param, loaded_weight, loaded_shard_id=None):
+        loader(param, loaded_weight.to(torch.float32).view(torch.int32), loaded_shard_id)
+    return load
+
+
 class ParallelSparseMoeBlock(nn.Module):
     """TP-aware Top-K sparse MoE.
 
@@ -691,11 +699,23 @@ class ParallelSparseMoeBlock(nn.Module):
         self.experts.down_proj = nn.Parameter(
             torch.empty(num_experts, hidden_size, shard_inter)
         )
+        # (block_n, block_k) once the experts hold block-scaled e4m3 (``mstar.quantization``)
+        self.experts_fp8_block: tuple[int, int] | None = None
         self._attach_weight_loaders(tp_rank, tp_size, moe_intermediate_size)
 
     def _attach_weight_loaders(self, tp_rank: int, tp_size: int, full_inter: int):
         from functools import partial
 
+        if self.experts_fp8_block is not None:
+            bn, bk = self.experts_fp8_block
+            experts = self.experts
+            experts.gate_up_proj.weight_loader = partial(_gate_up_fp8_weight_loader, tp_rank, tp_size, full_inter, 1)
+            experts.down_proj.weight_loader = partial(_down_proj_fp8_weight_loader, tp_rank, tp_size, full_inter, 1)
+            experts.gate_up_proj_scale_inv.weight_loader = _f32_container(
+                partial(_gate_up_fp8_weight_loader, tp_rank, tp_size, full_inter, bn))
+            experts.down_proj_scale_inv.weight_loader = _f32_container(
+                partial(_down_proj_fp8_weight_loader, tp_rank, tp_size, full_inter, bk))
+            return
         self.experts.gate_up_proj.weight_loader = partial(
             _gate_up_weight_loader, tp_rank, tp_size, full_inter,
         )
@@ -711,6 +731,90 @@ class ParallelSparseMoeBlock(nn.Module):
         )
         return result
 
+    # -- quantization: the routed experts are one layer, ``<block>.experts`` ----------------------
+    def experts_quant_capability(self) -> QuantCapability:
+        if self.experts_fp8_block is not None:
+            return QuantCapability(False, "already fp8_block")
+        return QuantCapability(True)
+
+    def experts_geometry(self) -> QuantGeometry:
+        """gate_up's ``[2I, H]`` per rank, its gate and up halves as row spans (down's K is ``I``)."""
+        _, two_inter, hidden = self.experts.gate_up_proj.shape
+        return QuantGeometry(two_inter, hidden, (two_inter // 2, two_inter // 2), (hidden,))
+
+    def _fp8_storage(self, block: tuple[int, int], data: dict[str, torch.Tensor] | None = None) -> None:
+        """Replace the bf16 experts with e4m3 ``gate_up_proj`` / ``down_proj`` (uint8 containers) and their fp32
+        ``*_scale_inv`` blocks (int32 containers: the engine's node cast would round them), empty or ``data``."""
+        bn, bk = block
+        experts = self.experts
+        e, two_inter, hidden = experts.gate_up_proj.shape
+        inter = two_inter // 2
+        device = experts.gate_up_proj.device
+        shapes = {
+            "gate_up_proj": ((e, two_inter, hidden), torch.uint8),
+            "gate_up_proj_scale_inv": ((e, -(-two_inter // bn), -(-hidden // bk)), torch.int32),
+            "down_proj": ((e, hidden, inter), torch.uint8),
+            "down_proj_scale_inv": ((e, -(-hidden // bn), -(-inter // bk)), torch.int32),
+        }
+        for name, (shape, dtype) in shapes.items():
+            tensor = torch.empty(shape, dtype=dtype, device=device) if data is None else data[name]
+            assert tuple(tensor.shape) == shape and tensor.dtype == dtype, (name, tensor.shape, tensor.dtype)
+            if hasattr(experts, name):
+                delattr(experts, name)
+            setattr(experts, name, nn.Parameter(tensor, requires_grad=False))
+        self.experts_fp8_block = tuple(block)
+        self._attach_weight_loaders(self.comm_group.rank, self.comm_group.world_size, self.moe_intermediate_size)
+
+    def experts_prepare(self, fmt: str, block: tuple[int, int] = (128, 128)) -> None:
+        """Hold the experts as a block-fp8 checkpoint stores them, before it loads."""
+        assert fmt == "fp8_block", fmt
+        self._fp8_storage(block)
+
+    @torch.no_grad()
+    def experts_quantize(self, fmt: str, block: tuple[int, int] = (128, 128)) -> None:
+        """Quantize this rank's loaded bf16 experts to block fp8, one expert at a time (a whole stack's fp32
+        working copy would be several GB)."""
+        assert fmt == "fp8_block", fmt
+        data = {}
+        for name in ("gate_up_proj", "down_proj"):
+            weight = getattr(self.experts, name).data
+            parts = [quantize_fp8_block_weight(weight[i], block) for i in range(weight.shape[0])]
+            data[name] = torch.stack([q for q, _ in parts]).view(torch.uint8)
+            data[f"{name}_scale_inv"] = torch.stack([s for _, s in parts]).contiguous().view(torch.int32)
+        self._fp8_storage(block, data)
+
+    def _dispatch_fp8(
+        self, flat: torch.Tensor, routing_weights: torch.Tensor, selected_experts: torch.Tensor,
+    ) -> torch.Tensor:
+        experts = self.experts
+        tp = self.comm_group.world_size > 1
+        w1, w2 = experts.gate_up_proj, experts.down_proj
+        s1 = experts.gate_up_proj_scale_inv.view(torch.float32)
+        s2 = experts.down_proj_scale_inv.view(torch.float32)
+        if not flat.is_cuda:
+            # the reference: the weights dequantized as a bf16 checkpoint would hold them (tests)
+            bf16 = [
+                torch.stack([dequantize_fp8_block_weight(w[i], s[i], self.experts_fp8_block, flat.dtype)
+                             for i in range(w.shape[0])])
+                for w, s in ((w1, s1), (w2, s2))
+            ]
+            out = dispatch_experts_fused(flat, *bf16, self.num_experts, selected_experts, routing_weights)
+            if tp:
+                self.comm_group.all_reduce(out)
+            return out
+        from mstar.utils.fused_moe import fused_experts_fp8, moe_sum_reduce_triton
+
+        out = fused_experts_fp8(
+            flat, w1, w2, s1, s2, routing_weights, selected_experts,
+            block_size=self.experts_fp8_block, reduce_results=not tp,
+        )
+        if not tp:
+            return out
+        output = torch.empty_like(flat)
+        moe_sum_reduce_triton(out, output, routed_scaling_factor=1.0)
+        self.comm_group.all_reduce(output)
+        return output
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -723,6 +827,13 @@ class ParallelSparseMoeBlock(nn.Module):
         hidden_dim = hidden_states.shape[-1]
         flat = hidden_states.view(-1, hidden_dim).contiguous()
         skip = token_valid is not None
+        if self.experts_fp8_block is not None:
+            routing_weights, selected_experts, router_states_next, _ = _route(self.gate, flat, None, router_states)
+            if skip:
+                # the fp8 kernels take no sentinel expert: padding rows still route, with zero weight
+                routing_weights = torch.where(token_valid[:, None], routing_weights, 0)
+            out = self._dispatch_fp8(flat, routing_weights, selected_experts).view(input_shape)
+            return (out, router_states_next) if return_router_states else out
         # the mask below moves experts after routing, and TP's dispatch aligns for itself
         can_align = not skip and self.comm_group.world_size == 1
         routing_weights, selected_experts, router_states_next, alignment = _route(

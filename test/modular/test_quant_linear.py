@@ -257,10 +257,9 @@ def test_linear_kinds_declare_whether_they_take_a_format():
     replaced = nn.Linear(8, 8)
     replaced.forward = lambda x: x
     assert "replaced on the instance" in quant_capability(replaced).reason
-    # a TP linear says why not; the declaration reads no state
+    # a TP linear takes a format in place of its local GEMM (mstar.quantization); the declaration reads no state
     for kind in (ColumnParallelLinear, RowParallelLinear):
-        capability = quant_capability(kind.__new__(kind))
-        assert capability.capable is False and "tensor-parallel" in capability.reason
+        assert quant_capability(kind.__new__(kind)) == QuantCapability(True)
     assert quant_capability(QuantLinear(torch.zeros(16, 128, dtype=torch.bfloat16), None, MXFP8)).reason == (
         "already mxfp8"
     )
