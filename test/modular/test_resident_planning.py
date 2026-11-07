@@ -1815,6 +1815,15 @@ def test_resident_readers_survive_displacement_and_recycled_handles():
     _assert_row(planner, live, 13)
     _slot_ledger(planner)
 
+    planner.release(13)
+    pinned = planner.pin(tuple(planner._slot_of))
+    free = list(planner._free)
+    with planner._lock, pytest.raises(RuntimeError):
+        planner._take_slots(2, planner._plan_seq + 2)
+    assert planner._free == free
+    planner.unpin(pinned)
+    _slot_ledger(planner)
+
 
 def test_a_step_does_not_displace_its_own_rows_or_the_step_behind_it():
     live, ref, planner = _setup({rid: 3 for rid in range(1, 16)}, max_num_pages=256, pool_slots=20)

@@ -308,11 +308,12 @@ class ResidentPlanner:
     row mirrors host state, so a request can lose its slot whenever no step needs
     it, and it takes another with a whole-row rewrite when it next runs, as a new
     request does. ``2 * max_bs`` slots, ``max_bs`` being the widest capture of a
-    resident walk, always hold a step, on every rank and whatever the commit
+    resident walk, hold an ordinary step, on every rank and whatever the commit
     timing: a slot is free, cooling or held, and a step can take any of them but
     its own rows, at most ``max_bs``, and those of the one earlier step that may
     still commit, at most ``max_bs``. Slot numbers are private to a rank's
-    planner, and no collective reads one.
+    planner, and no collective reads one. Readers retained outside ordinary
+    stream ordering also consume slots until their explicit release.
     """
 
     def __init__(
@@ -432,10 +433,11 @@ class ResidentPlanner:
                 ]
                 self._free.extend(ready)
         free = self._free
-        taken = [free.pop() for _ in range(min(n, len(free)))]
-        if len(taken) < n:
-            taken += self._displace(n - len(taken), settled)
-        return taken
+        from_free = min(n, len(free))
+        # Check displacement before consuming free entries: asynchronous reader
+        # pins can exhaust the cache while some free slots still remain.
+        displaced = self._displace(n - from_free, settled) if n > from_free else []
+        return [free.pop() for _ in range(from_free)] + displaced
 
     def _displace(self, n: int, settled: int) -> list[int]:
         """The slots of the ``n`` least recently run requests. Each loses its
