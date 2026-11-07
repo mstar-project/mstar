@@ -66,6 +66,8 @@ class LayerPlan:
     # what chose `runtime`: a rule's origin, `format`, `auto`, or `model` (the model keeps it bf16)
     origin: str
     block: tuple[int, int] | None = None
+    # trailing sub-blocks of a fused linear that stay bf16 beside the format (``QuantizableLinears.bf16_tails``)
+    tail: int = 0
 
 
 @dataclass
@@ -87,6 +89,14 @@ class QuantPlan:
         for layer in self.layers.values():
             counts[(layer.runtime, layer.action.value)] += 1
         return ", ".join(f"{n} {fmt} ({action})" for (fmt, action), n in sorted(counts.items()))
+
+
+def head_geometry(geometry: Geometry, tail: int) -> Geometry:
+    """``geometry`` less its last ``tail`` sub-blocks: what a format holds when they stay bf16."""
+    if not tail:
+        return geometry
+    rows = geometry.rows[:-tail]
+    return Geometry(sum(rows), geometry.k, rows, geometry.cols, geometry.sharded)
 
 
 def layer_geometry(module: nn.Module, kind: str) -> Geometry | None:
@@ -152,12 +162,13 @@ def discover_layers(root: nn.Module) -> dict[str, tuple[str, nn.Module]]:
 
 def stored_formats(
     ckpt: CheckpointQuant | None, rules: CheckpointRules, layer_paths: set[str],
-    param_names: set[str] | None = None,
+    param_names: set[str] | None = None, by_shard: dict[str, dict] | None = None,
 ) -> tuple[dict[str, set[StoredBase]], dict[str, StoredBase]]:
     """``(per layer path: the stored formats of the checkpoint bases that land on it, per base outside any
     layer that is stored quantized and lands on one of ``param_names``)``. A base is mapped by ``<base>.weight``
     through the rules, so a ``weight_packed`` base maps the way its ``weight`` would; one that lands on no
-    parameter (a layer this deployment doesn't build) never loads, so it doesn't count."""
+    parameter (a layer this deployment doesn't build) never loads, so it doesn't count. ``by_shard``, when given,
+    also gets each layer's stored formats per stacked shard id."""
     per_layer: dict[str, set[StoredBase]] = defaultdict(set)
     stray: dict[str, StoredBase] = {}
     if ckpt is None:
@@ -167,13 +178,32 @@ def stored_formats(
         native = rules.native(base + ".weight")
         if native is None:
             continue
-        target, _ = match(native)
+        target, shard = match(native)
         path = target.rpartition(".")[0]
         if path in layer_paths:
             per_layer[path].add(stored)
+            if by_shard is not None:
+                by_shard.setdefault(path, {}).setdefault(shard, set()).add(stored)
         elif stored.format != BF16 and (param_names is None or target in param_names):
             stray[path] = stored
     return per_layer, stray
+
+
+def _head_stored(module: nn.Module, tail: int, stored: str, block, by_shard: dict) -> tuple[str | None, object]:
+    """The stored format of a fused layer's rows before its ``tail`` sub-blocks, when its tail shards are all
+    bf16 (``_stored_of`` of the rest); None when the layer has no tail or the tail is stored quantized."""
+    blocks_of = getattr(module, "quant_shard_blocks", None)
+    if not tail or blocks_of is None or not by_shard:
+        return None, None
+    first_tail = len(module.quant_geometry().rows) - tail
+    head: set[StoredBase] = set()
+    for shard, formats in by_shard.items():
+        if min(blocks_of(shard)) >= first_tail:
+            if any(s.format != BF16 for s in formats):
+                return None, None
+        else:
+            head |= formats
+    return _stored_of(head)
 
 
 def _stored_of(stored: set[StoredBase]) -> tuple[str, tuple[int, int] | None]:
@@ -196,7 +226,8 @@ def resolve_plan(
     where = f"node {decl.node!r}"
     layers = discover_layers(root)
     params = {name for name, _ in root.named_parameters()}
-    stored_by_layer, stray = stored_formats(ckpt, decl.rules, set(layers), params)
+    by_shard: dict[str, dict] = {}
+    stored_by_layer, stray = stored_formats(ckpt, decl.rules, set(layers), params, by_shard)
 
     for rule in spec.rules:
         if not any(pattern_matches(path, rule.pattern) for path in layers):
@@ -210,6 +241,8 @@ def resolve_plan(
     refused: dict[tuple[str, str, str], list[str]] = defaultdict(list)
     for path, (kind, module) in layers.items():
         stored, block = _stored_of(stored_by_layer.get(path, set()))
+        head_stored, head_block = _head_stored(module, decl.linears.tail_of(path), stored, block,
+                                               by_shard.get(path, {}))
         if stored not in (BF16, MIXED) and stored not in LOADABLE:
             unloadable[stored].append(path)
             continue
@@ -232,17 +265,27 @@ def resolve_plan(
         if runtime == AUTO:
             origin = AUTO
             runtime = stored if stored in LOADABLE and served(stored, kind) else BF16
-            if stored == MIXED:
+            if candidate and head_stored in LOADABLE and served(head_stored, kind) and head_stored != BF16:
+                # a fused layer whose bf16 tail is all that differs: its head serves as stored
+                runtime, block = head_stored, head_block
+            elif stored == MIXED:
                 plan.notes.append(f"{path}: the checkpoint stores its shards in different formats; served bf16")
 
+        tail = decl.linears.tail_of(path) if candidate and runtime not in (BF16, AUTO) else 0
+        if tail and stored != BF16:
+            # the stored rows dequantize and quantize again at load in the format's blocks (block fp8 at 128 x 128
+            # gives back the checkpoint's bytes; hypothesis for other blocks), the tail stays bf16
+            plan.notes.append(f"{path}: re-quantized at load, its last {tail} sub-blocks kept bf16 (stored "
+                              f"{head_stored or stored} with a bf16 tail)")
+            stored = MIXED
         if runtime != BF16:
-            problem = _runtime_problem(module, kind, runtime, stored, block, device_capability)
+            problem = _runtime_problem(module, kind, runtime, stored, block, device_capability, tail)
             if problem is not None:
                 if explicit or (origin == "format" and _always_wrong(problem)):
                     refused[(origin, runtime, problem)].append(path)
                     continue
                 plan.notes.append(f"{path}: stays bf16 ({origin} {runtime}: {problem})")
-                runtime = BF16
+                runtime, tail = BF16, 0
 
         action = _action(stored, runtime)
         if action is Action.DIRECT and kind == LINEAR and not hasattr(module, "quant_prepare"):
@@ -265,7 +308,8 @@ def resolve_plan(
             refused[(origin, runtime, f"it is stored {stored}, and serving one quantized format as another "
                                       f"compounds two roundings; ask for {stored} or bf16 there")].append(path)
             continue
-        plan.layers[path] = LayerPlan(path, kind, stored, runtime, action, origin, block)
+        tail = tail if runtime != BF16 else 0
+        plan.layers[path] = LayerPlan(path, kind, stored, runtime, action, origin, block, tail)
 
     for (origin, runtime, problem), paths in refused.items():
         what = repr(paths[0]) if len(paths) == 1 else f"{len(paths)} layers (e.g. {paths[:2]})"
@@ -290,7 +334,7 @@ def _always_wrong(problem: str) -> bool:
 
 
 def _runtime_problem(
-    module: nn.Module, kind: str, runtime: str, stored: str, block, device_capability,
+    module: nn.Module, kind: str, runtime: str, stored: str, block, device_capability, tail: int = 0,
 ) -> str | None:
     if not served(runtime, kind):
         return f"this build serves {runtime} on no {kind} layer yet"
@@ -304,6 +348,10 @@ def _runtime_problem(
     geometry = layer_geometry(module, kind)
     if geometry is None:
         return "its weight geometry is unknown"
+    if tail:
+        if kind != LINEAR or len(geometry.rows) <= tail or not hasattr(module, "quant_quantize"):
+            return f"a bf16 tail of {tail} sub-blocks needs a merged linear with more; it has {len(geometry.rows)}"
+        geometry = head_geometry(geometry, tail)
     # as stored, the layer keeps the checkpoint's block and layout; quantized here, the format's
     as_stored = stored == runtime
     return geometry_problem(runtime, geometry, direct=False, kind=kind, block=block if as_stored else None,

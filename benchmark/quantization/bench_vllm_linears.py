@@ -38,6 +38,7 @@ def main() -> None:
     parser.add_argument("--shapes", default="qwen3_5_27b", choices=sorted(SHAPES))
     parser.add_argument("--tp", type=int, default=1)
     parser.add_argument("--tokens", default="1,8,16,32,64,256,1024")
+    parser.add_argument("--layers", default="", help="only these of the shape set's layers (comma-separated)")
     parser.add_argument("--iters", type=int, default=50)
     parser.add_argument("--out", default=None)
     args = parser.parse_args()
@@ -54,7 +55,10 @@ def main() -> None:
     device = torch.device("cuda")
     torch.manual_seed(0)
     rows = []
+    only = {name for name in args.layers.split(",") if name}
     for layer, (n, k, kind) in SHAPES[args.shapes].items():
+        if only and layer not in only:
+            continue
         n, k = (n // args.tp, k) if kind == "col" else (n, k // args.tp)
         weight = (torch.randn(n, k, device=device) * 0.02).to(torch.bfloat16)
         wq, ws = _block_quant(weight)

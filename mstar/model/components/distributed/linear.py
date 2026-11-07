@@ -252,6 +252,10 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         )
         dst.copy_(src)
 
+    def quant_shard_blocks(self, shard_id) -> tuple[int, ...]:
+        """The ``output_sizes`` blocks a checkpoint shard (a stacked rule's shard id) loads into."""
+        return (shard_id,)
+
     def quant_geometry(self) -> QuantGeometry:
         rows = tuple(size // self.tp_size for size in self.output_sizes)
         return QuantGeometry(self.output_size_per_partition, self.input_size_per_partition, rows,

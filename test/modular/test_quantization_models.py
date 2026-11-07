@@ -66,9 +66,9 @@ def test_the_boot_check_passes_a_servable_block_and_refuses_the_rest(checkpoints
     assert quantization_problems(model, {**PLACED, "quantization": {"nodes": {"vision_encoder": "fp8_block"}}}) == [
         "quantization.nodes.vision_encoder: Qwen3_5DenseModel declares no quantizable layers there",
     ]
-    problems = quantization_problems(model, {**PLACED, "quantization": {
-        "layers": [{"match": "model.layers.*.self_attn.in_proj_fused", "format": "fp8_block"}]}})
-    assert len(problems) == 1 and "whole 128x128 blocks" in problems[0]
+    # the delta net's fused input takes block fp8 on its q|k|v|z rows, its a / pad / b gate rows staying bf16
+    assert quantization_problems(model, {**PLACED, "quantization": {
+        "layers": [{"match": "model.layers.*.self_attn.in_proj_fused", "format": "fp8_block"}]}}) == []
     fp8 = model_of(checkpoints["fp8"])
     assert quantization_problems(fp8, PLACED) == []
     problems = quantization_problems(fp8, {**PLACED, "quantization": "fp8_channel"})
@@ -81,19 +81,40 @@ def test_qwen3_5_quantizes_its_projections_at_load(checkpoints):
     assert full.self_attn.qkv_proj.quant_format.name == "fp8_block"
     assert full.mlp.down_proj.quant_format.name == "fp8_block"
     assert lm.model.layers[0].self_attn.out_proj.quant_format.name == "fp8_block"
-    assert lm.model.layers[0].self_attn.in_proj_fused.quant_format is None
     assert plan.layers["lm_head"].action is Action.KEEP
+
+
+def test_the_delta_net_input_quantizes_q_k_v_z_and_keeps_its_gate_rows(checkpoints):
+    ref, _ = load_llm(checkpoints["bf16"])
+    lm, plan = load_llm(checkpoints["bf16"], "fp8_block")
+    path = "model.layers.0.self_attn.in_proj_fused"
+    assert (plan.layers[path].action, plan.layers[path].tail) == (Action.QUANTIZE, 3)
+    proj, bf16 = lm.model.layers[0].self_attn.in_proj_fused, ref.model.layers[0].self_attn.in_proj_fused
+    head = sum(proj.output_sizes[:4])  # q|k|v|z
+    assert proj.quant_format.name == "fp8_block" and proj.quant_tail_rows == bf16.weight.shape[0] - head
+    assert proj.weight.shape == (head, bf16.weight.shape[1]) and proj.weight.dtype == torch.uint8
+    assert torch.equal(proj.weight_tail, bf16.weight[head:])
+    x = torch.randn(5, TEXT["hidden_size"], dtype=torch.bfloat16)
+    out, want = proj(x), bf16(x)
+    assert out.shape == want.shape
+    # the gate rows are bf16's exactly; q|k|v|z within e4m3's rounding
+    assert torch.equal(out[:, head:], want[:, head:])
+    err = (out[:, :head].float() - want[:, :head].float()).norm() / want[:, :head].float().norm()
+    assert err < 0.05
 
 
 def test_qwen3_5_loads_its_fp8_checkpoint_as_stored(checkpoints):
     direct, plan = load_llm(checkpoints["fp8"])
     assert plan.layers["model.layers.1.self_attn.qkv_proj"].action is Action.DIRECT
     assert plan.layers["model.layers.0.mlp.gate_up_proj"].action is Action.DIRECT
-    # in_proj_qkv/z fp8 beside bf16 in_proj_a/b: the fused GEMM dequantizes and serves bf16
-    assert plan.layers["model.layers.0.self_attn.in_proj_fused"].action is Action.DEQUANT
+    # in_proj_qkv/z fp8 beside bf16 in_proj_a/b: q|k|v|z serve block fp8 (dequantized and quantized again at
+    # load, which gives back the stored bytes), the gate rows bf16
+    fused = plan.layers["model.layers.0.self_attn.in_proj_fused"]
+    assert (fused.action, fused.runtime, fused.tail) == (Action.REQUANT, "fp8_block", 3)
     fly, _ = load_llm(checkpoints["bf16"], "fp8_block")
+    assert any("in_proj_fused" in name for name, t in direct.state_dict().items() if t.dtype == torch.uint8)
     for name, tensor in direct.state_dict().items():
-        if tensor.dtype in (torch.uint8, torch.int32):
+        if tensor.dtype in (torch.uint8, torch.int32) or name.endswith("weight_tail"):
             assert torch.equal(tensor, fly.state_dict()[name]), name
     x = torch.randn(3, TEXT["hidden_size"], dtype=torch.bfloat16)
     leaf = direct.model.layers[1].mlp.gate_up_proj

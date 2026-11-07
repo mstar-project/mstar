@@ -112,6 +112,41 @@
     },
     {
       "dtype": "float8_e4m3fn",
+      "shape": {"K": 5120, "N": 34816, "glu": 0},
+      "provenance": {"device": "NVIDIA H200", "arch": "sm_90", "date": "2026-11-07", "harness": "benchmark/quantization/bench_linears.py --impls, linears_impls.jsonl", "torch": "2.10.0+cpu", "flashinfer": "none", "note": "fastest measured kernel per token count; the largest count's for '*'"},
+      "rows": {
+        "1": {"impl": "flashinfer"},
+        "2": {"impl": "flashinfer"},
+        "4": {"impl": "flashinfer"},
+        "8": {"impl": "flashinfer"},
+        "16": {"impl": "flashinfer"},
+        "24": {"impl": "flashinfer"},
+        "32": {"impl": "flashinfer"},
+        "48": {"impl": "flashinfer"},
+        "64": {"impl": "flashinfer"},
+        "128": {"impl": "flashinfer"},
+        "256": {"impl": "flashinfer"},
+        "512": {"impl": "cublas"},
+        "*": {"impl": "flashinfer"}
+      },
+      "measured": {
+        "1": {"bf16": 89.0, "w8a16": 79.66, "flashinfer": 51.28, "cublas": 65.82},
+        "2": {"bf16": 89.53, "w8a16": 114.43, "flashinfer": 51.74, "cublas": 66.12},
+        "4": {"bf16": 88.31, "w8a16": 117.56, "flashinfer": 51.73, "cublas": 63.67},
+        "8": {"bf16": 88.81, "w8a16": 117.28, "flashinfer": 52.24, "cublas": 60.53},
+        "16": {"bf16": 89.63, "w8a16": 115.99, "flashinfer": 52.72, "cublas": 65.17},
+        "24": {"bf16": 90.4, "w8a16": 125.66, "flashinfer": 54.16, "cublas": 62.61},
+        "32": {"bf16": 90.95, "w8a16": 126.17, "flashinfer": 54.47, "cublas": 65.81},
+        "48": {"bf16": 95.22, "w8a16": 242.84, "flashinfer": 49.69, "cublas": 67.5},
+        "64": {"bf16": 95.61, "w8a16": 243.0, "flashinfer": 50.48, "cublas": 64.18},
+        "128": {"bf16": 95.16, "w8a16": 451.95, "flashinfer": 56.34, "cublas": 67.23},
+        "256": {"bf16": 127.83, "w8a16": 858.05, "flashinfer": 97.73, "cublas": 101.68},
+        "512": {"bf16": 237.17, "w8a16": 1683.14, "flashinfer": 181.96, "cublas": 171.11},
+        "*": {"bf16": 553.82, "w8a16": 3318.67, "flashinfer": 322.79, "cublas": 327.34}
+      }
+    },
+    {
+      "dtype": "float8_e4m3fn",
       "shape": {"K": 6144, "N": 5120, "glu": 0},
       "provenance": {"device": "NVIDIA H200", "arch": "sm_90", "date": "2026-11-07", "harness": "benchmark/quantization/bench_linears.py --impls, linears_impls.jsonl", "torch": "2.10.0+cpu", "flashinfer": "none", "note": "fastest measured kernel per token count; the largest count's for '*'"},
       "rows": {
@@ -182,8 +217,8 @@
     },
     {
       "dtype": "float8_e4m3fn",
-      "shape": {"N": 34816, "K": 5120, "glu": 0},
-      "provenance": {"device": "NVIDIA H200", "arch": "sm_90", "date": "2026-11-07", "harness": "benchmark/quantization/bench_linears.py --impls, linears_impls.jsonl", "torch": "2.10.0+cpu", "flashinfer": "none", "note": "fastest measured kernel per token count; the largest count's for '*'"},
+      "shape": {"N": 16384, "K": 5120, "glu": 0},
+      "provenance": {"device": "NVIDIA H200", "arch": "sm_90", "date": "2026-11-07", "harness": "benchmark/quantization/bench_linears.py --impls, linears_gdn_in.jsonl", "torch": "2.10.0+cpu", "flashinfer": "none", "note": "fastest measured kernel per token count; the largest count's for '*'"},
       "rows": {
         "1": {"impl": "flashinfer"},
         "2": {"impl": "flashinfer"},
@@ -195,24 +230,24 @@
         "48": {"impl": "flashinfer"},
         "64": {"impl": "flashinfer"},
         "128": {"impl": "flashinfer"},
-        "256": {"impl": "flashinfer"},
+        "256": {"impl": "cublas"},
         "512": {"impl": "cublas"},
         "*": {"impl": "flashinfer"}
       },
       "measured": {
-        "1": {"bf16": 89.0, "w8a16": 79.66, "flashinfer": 51.28, "cublas": 65.82},
-        "2": {"bf16": 89.53, "w8a16": 114.43, "flashinfer": 51.74, "cublas": 66.12},
-        "4": {"bf16": 88.31, "w8a16": 117.56, "flashinfer": 51.73, "cublas": 63.67},
-        "8": {"bf16": 88.81, "w8a16": 117.28, "flashinfer": 52.24, "cublas": 60.53},
-        "16": {"bf16": 89.63, "w8a16": 115.99, "flashinfer": 52.72, "cublas": 65.17},
-        "24": {"bf16": 90.4, "w8a16": 125.66, "flashinfer": 54.16, "cublas": 62.61},
-        "32": {"bf16": 90.95, "w8a16": 126.17, "flashinfer": 54.47, "cublas": 65.81},
-        "48": {"bf16": 95.22, "w8a16": 242.84, "flashinfer": 49.69, "cublas": 67.5},
-        "64": {"bf16": 95.61, "w8a16": 243.0, "flashinfer": 50.48, "cublas": 64.18},
-        "128": {"bf16": 95.16, "w8a16": 451.95, "flashinfer": 56.34, "cublas": 67.23},
-        "256": {"bf16": 127.83, "w8a16": 858.05, "flashinfer": 97.73, "cublas": 101.68},
-        "512": {"bf16": 237.17, "w8a16": 1683.14, "flashinfer": 181.96, "cublas": 171.11},
-        "*": {"bf16": 553.82, "w8a16": 3318.67, "flashinfer": 322.79, "cublas": 327.34}
+        "1": {"bf16": 40.57, "w8a16": 40.84, "flashinfer": 24.98, "cublas": 34.78},
+        "2": {"bf16": 41.4, "w8a16": 61.53, "flashinfer": 24.71, "cublas": 33.51},
+        "4": {"bf16": 41.12, "w8a16": 56.25, "flashinfer": 25.16, "cublas": 31.15},
+        "8": {"bf16": 41.38, "w8a16": 56.36, "flashinfer": 25.31, "cublas": 31.45},
+        "16": {"bf16": 41.48, "w8a16": 55.83, "flashinfer": 25.41, "cublas": 41.0},
+        "24": {"bf16": 41.71, "w8a16": 60.38, "flashinfer": 25.8, "cublas": 32.4},
+        "32": {"bf16": 42.12, "w8a16": 60.86, "flashinfer": 26.71, "cublas": 35.05},
+        "48": {"bf16": 42.42, "w8a16": 115.69, "flashinfer": 26.79, "cublas": 33.21},
+        "64": {"bf16": 42.89, "w8a16": 116.04, "flashinfer": 27.27, "cublas": 33.6},
+        "128": {"bf16": 45.09, "w8a16": 216.52, "flashinfer": 29.37, "cublas": 31.26},
+        "256": {"bf16": 61.38, "w8a16": 422.67, "flashinfer": 42.98, "cublas": 42.11},
+        "512": {"bf16": 114.03, "w8a16": 827.74, "flashinfer": 79.03, "cublas": 78.2},
+        "*": {"bf16": 228.01, "w8a16": 1601.52, "flashinfer": 147.89, "cublas": 150.53}
       }
     }
   ]

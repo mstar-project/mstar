@@ -45,6 +45,7 @@ def test_a_swiglu_with_fp8_activations_counts_and_a_wrong_kernel_does_not(tmp_pa
 def test_the_h200_table_runs_flashinfer_where_vllm_does():
     entries = {tuple(sorted(dict(e.shape).items())): {b: c.impl for b, c in e.rows}
                for e in load_table(TABLE, "fp8_linear")}
-    for n, k, glu in ((14336, 5120, 0), (5120, 6144, 0), (5120, 17408, 0), (17408, 5120, 1)):
+    # qkv, o / delta-net out, down, the fused SwiGLU, the delta net's fp8 input (q|k|v|z)
+    for n, k, glu in ((14336, 5120, 0), (5120, 6144, 0), (5120, 17408, 0), (17408, 5120, 1), (16384, 5120, 0)):
         rows = entries[tuple(sorted({"N": n, "K": k, "glu": glu}.items()))]
         assert all(rows[m] == "flashinfer" for m in (2, 8, 16, 24, 48, 64)), (n, k, glu, rows)

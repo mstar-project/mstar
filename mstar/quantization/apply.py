@@ -158,7 +158,7 @@ def finalize(root: nn.Module, plan: QuantPlan, device: torch.device | str | None
         formats.add(fmt)
         module = root.get_submodule(layer.path)
         if hasattr(module, "quant_quantize"):
-            module.quant_quantize(fmt)
+            module.quant_quantize(fmt, tail_blocks=layer.tail) if layer.tail else module.quant_quantize(fmt)
         else:
             parent_name, _, leaf = layer.path.rpartition(".")
             setattr(root.get_submodule(parent_name), leaf, QuantLinear.from_linear(module, fmt))

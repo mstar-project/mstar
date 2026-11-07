@@ -337,3 +337,37 @@ def test_a_gated_mlp_with_another_linear_kind_runs_as_before():
     x = torch.randn(3, HIDDEN, dtype=torch.bfloat16)
     gate, up = mlp.gate_up_proj(x).chunk(2, dim=-1)
     assert torch.equal(mlp(x), mlp.down_proj(F.silu(gate) * up))
+
+
+@pytest.mark.parametrize("tp", [1, 2])
+def test_a_fused_projection_keeps_its_bf16_tail_on_every_rank(tp):
+    # Qwen3.5's delta-net input [q|k|v|z|a|pad|b]: per rank, q|k|v|z take block fp8, a / pad / b stay bf16
+    from quant_helpers import group
+
+    from mstar.model.components.distributed.linear_attn import _FusedBlockColumnParallelLinear
+    from mstar.model.components.linear_attn import SPLIT_BLOCK_NAMES, SPLIT_SHARD_BLOCKS
+    from mstar.quantization.resolve import geometry_problem, head_geometry
+
+    torch.manual_seed(0)
+    sizes = [256, 256, 512, 512, 8, 8 * tp, 8]  # a, pad (per rank 8), b
+    full = {name: torch.randn(sum(sizes[b] for b in blocks), 256).to(torch.bfloat16) * 0.05
+            for name, blocks in SPLIT_SHARD_BLOCKS.items()}
+    for rank in range(tp):
+        with default_dtype(torch.bfloat16):
+            proj = _FusedBlockColumnParallelLinear(comm_group=group(rank, tp), input_size=256, output_sizes=sizes,
+                                                   bias=False, shard_map=SPLIT_SHARD_BLOCKS,
+                                                   block_names=SPLIT_BLOCK_NAMES)
+        proj.weight.data.zero_()  # the pad block is never loaded (GatedDeltaNet zeroes it the same way)
+        for name, tensor in full.items():
+            proj.weight_loader(proj.weight, tensor, name)
+        geometry = proj.quant_geometry()
+        assert geometry_problem("fp8_block", geometry, direct=False, kind="linear") is not None
+        assert geometry_problem("fp8_block", head_geometry(geometry, 3), direct=False, kind="linear") is None
+        bf16 = proj.weight.data.clone()
+        x = torch.randn(4, 256, dtype=torch.bfloat16)
+        want = F.linear(x, bf16)
+        proj.quant_quantize(linear_format("fp8_block"), tail_blocks=3)
+        head = sum(geometry.rows[:4])
+        assert proj.weight.shape == (head, 256) and torch.equal(proj.weight_tail, bf16[head:])
+        out = proj(x)
+        assert torch.equal(out[:, head:], want[:, head:]) and rel(out[:, :head], want[:, :head]) < 0.05

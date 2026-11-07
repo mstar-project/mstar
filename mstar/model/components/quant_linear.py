@@ -28,6 +28,7 @@ from functools import partial
 from typing import ClassVar, NamedTuple
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from mstar.engine.resources.lora.config import LoraTarget
@@ -305,11 +306,16 @@ class QuantizableLinears:
     new layer can't change dtype silently; ``keep_bf16`` wins where both match.
 
     ``input_amax`` maps patterns to the largest input magnitude measured on those linears, for a format whose
-    activation scale has a range to place (NVFP4's). The first matching pattern counts."""
+    activation scale has a range to place (NVFP4's). The first matching pattern counts.
+
+    ``bf16_tails`` maps patterns of merged (fused) candidates to how many of their trailing sub-blocks stay in the
+    checkpoint's bf16 when the rest takes a format: a fused projection whose last rows are small, sensitive or
+    misaligned (Qwen3.5's delta-net gates). The first matching pattern counts."""
 
     candidates: tuple[str, ...]
     keep_bf16: tuple[str, ...]
     input_amax: Mapping[str, float] = field(default_factory=dict)
+    bf16_tails: Mapping[str, int] = field(default_factory=dict)
 
     def selected(self, name: str, keep: tuple[str, ...] = ()) -> bool:
         if any(matches(name, pattern) for pattern in (*self.keep_bf16, *keep)):
@@ -320,6 +326,9 @@ class QuantizableLinears:
 
     def amax_of(self, name: str) -> float | None:
         return next((amax for pattern, amax in self.input_amax.items() if matches(name, pattern)), None)
+
+    def tail_of(self, name: str) -> int:
+        return next((blocks for pattern, blocks in self.bf16_tails.items() if matches(name, pattern)), 0)
 
 
 class LinearSelection(NamedTuple):
@@ -442,9 +451,13 @@ class InPlaceQuant:
     def quant_geometry(self):
         raise NotImplementedError
 
+    # the trailing weight rows kept bf16 beside the format's (``quant_quantize``'s ``tail_blocks``)
+    quant_tail_rows: int = 0
+
     def _quant_nk(self) -> tuple[int, int]:
+        """The ``[n, k]`` the format holds: this rank's weight less a bf16 tail."""
         geometry = self.quant_geometry()
-        return geometry.n, geometry.k
+        return geometry.n - self.quant_tail_rows, geometry.k
 
     def quant_prepare(self, fmt: LinearFormat) -> None:
         n, k = self._quant_nk()
@@ -461,11 +474,23 @@ class InPlaceQuant:
         self.quant_format = fmt
         self._attach_weight_loaders()
 
-    def quant_quantize(self, fmt: LinearFormat, input_amax: float | None = None) -> None:
+    def quant_quantize(self, fmt: LinearFormat, input_amax: float | None = None, tail_blocks: int = 0) -> None:
+        """Quantize the loaded weight in place; ``tail_blocks``: the last sub-blocks of ``quant_geometry().rows``
+        stay as they are, in ``weight_tail``, and the forward appends their output."""
+        if tail_blocks:
+            rows = self.quant_geometry().rows
+            assert 0 < tail_blocks < len(rows), (tail_blocks, rows)
+            self.quant_tail_rows = sum(rows[-tail_blocks:])
         n, k = self._quant_nk()
-        fmt.check(n, k, self.weight.dtype)
-        buffers = fmt.quantize_weight(self.weight.data, input_amax)
+        weight = self.weight.data
+        if self.quant_tail_rows:
+            tail = weight[n:].clone()
+            weight = weight[:n]
+        fmt.check(n, k, weight.dtype)
+        buffers = fmt.quantize_weight(weight.contiguous(), input_amax)
         del self.weight
+        if self.quant_tail_rows:
+            self.register_parameter("weight_tail", nn.Parameter(tail, requires_grad=False))
         # the format's linear() sees what the bytes stand for, as a layer loaded from a stored checkpoint does
         stands_for = {st.name: st.stands_for for st in fmt.storage(n, k)}
         self._quant_views = {}
@@ -506,6 +531,7 @@ class InPlaceQuant:
     def quant_glu(self, x: torch.Tensor) -> torch.Tensor:
         """The SwiGLU of this rank's ``[gate; up]`` output in one call of the format (``has_glu``); the caller
         checks there is no bias and nothing (LoRA) bound around the GEMM."""
+        assert not self.quant_tail_rows, "a layer with a bf16 tail has no fused SwiGLU"
         rows = x.reshape(-1, x.shape[-1]).contiguous()
         out = self.quant_format.glu_linear(rows, *self._quant_buffers())
         return out.reshape(*x.shape[:-1], out.shape[-1])
@@ -514,6 +540,8 @@ class InPlaceQuant:
         fmt = self.quant_format
         rows = x.reshape(-1, x.shape[-1]).contiguous()
         out = fmt.linear(rows, *self._quant_buffers())
+        if self.quant_tail_rows:
+            out = torch.cat([out, F.linear(rows, self.weight_tail)], dim=-1)
         if bias is not None:
             out = out + bias
         return out.reshape(*x.shape[:-1], out.shape[-1])

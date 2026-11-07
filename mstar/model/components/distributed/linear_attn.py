@@ -94,6 +94,9 @@ class _FusedBlockColumnParallelLinear(MergedColumnParallelLinear):
             slice_align=tuple(align) if any(a > 1 for a in align) else None,
         )
 
+    def quant_shard_blocks(self, shard_id) -> tuple[int, ...]:
+        return (shard_id,) if isinstance(shard_id, int) else self._shard_map[shard_id]
+
     def weight_loader(
         self,
         param: nn.Parameter,

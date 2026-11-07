@@ -27,8 +27,9 @@ import torch.nn.functional as F
 # per-rank [N, K] at TP 1 (divide N for column-parallel, K for row-parallel by --tp)
 SHAPES = {
     # hidden 5120, q 24 heads x 256 x 2 (gated), kv 4 x 256, inter 17408, delta-net value 6144
+    # gdn_in: the delta net's fused input less its bf16 gate rows (q|k|v|z, 2 x 2048 + 2 x 6144)
     "qwen3_5_27b": {"qkv": (14336, 5120, "col"), "o": (5120, 6144, "row"), "gate_up": (34816, 5120, "col"),
-                    "down": (5120, 17408, "row"), "gdn_out": (5120, 6144, "row")},
+                    "down": (5120, 17408, "row"), "gdn_out": (5120, 6144, "row"), "gdn_in": (16384, 5120, "col")},
     "qwen3_5_9b": {"qkv": (6144, 4096, "col"), "o": (4096, 4096, "row"), "gate_up": (24576, 4096, "col"),
                    "down": (4096, 12288, "row")},
     # Qwen3-Omni thinker: attention only (its experts run fused_experts_fp8)
@@ -167,6 +168,7 @@ def main() -> None:
     parser.add_argument("--shapes", default="qwen3_5_27b", choices=sorted(SHAPES))
     parser.add_argument("--tp", type=int, default=1)
     parser.add_argument("--tokens", default="1,16,64,256,1024,4096")
+    parser.add_argument("--layers", default="", help="only these of the shape set's layers (comma-separated)")
     parser.add_argument("--iters", type=int, default=50)
     parser.add_argument("--out", default=None)
     parser.add_argument("--impls", default="", help="fp8_block's kernels to time one by one (w8a16,flashinfer,cublas)")
@@ -192,7 +194,10 @@ def main() -> None:
     device = torch.device("cuda")
     torch.manual_seed(0)
     rows = []
+    only = {name for name in args.layers.split(",") if name}
     for layer, (n, k, kind) in SHAPES[args.shapes].items():
+        if only and layer not in only:
+            continue
         n, k = (n // args.tp, k) if kind == "col" else (n, k // args.tp)
         weight = (torch.randn(n, k, device=device) * 0.02).to(torch.bfloat16)
         for m in (int(t) for t in args.tokens.split(",")):

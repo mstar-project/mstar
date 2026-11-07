@@ -276,8 +276,11 @@ class Qwen3_5LanguageModel(nn.Module):
 
 # ``quantization:``: the decoder layers' projections may go low precision; the LM head (the embedding itself on
 # tied checkpoints) stays bf16, as in Qwen's own FP8 checkpoints.
+# The delta net's fused input projection [q|k|v|z|a|pad|b] takes a format on q|k|v|z (128-row multiples per rank)
+# and keeps its a / pad / b gate rows bf16, as Qwen's FP8 checkpoint stores them (vLLM's in_proj_qkvz / in_proj_ba).
 QUANTIZABLE_LINEARS = QuantizableLinears(
     candidates=("model.layers.*.self_attn.*", "model.layers.*.mlp.*"), keep_bf16=("lm_head",),
+    bf16_tails={"model.layers.*.self_attn.in_proj_fused": 3},
 )
 
 
