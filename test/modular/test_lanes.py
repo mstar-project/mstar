@@ -1174,7 +1174,11 @@ def test_a_step_off_the_chain_on_the_chains_resources_waits_out_the_plan_threads
     engine._submodules = {"n": SimpleNamespace(resources={"kv": object()})}
     engine._runner = SimpleNamespace(lane_held=held)
     ran = threading.Event()
-    engine.exec = lambda batch: ran.set()
+    def execute(batch):
+        ran.set()
+        return BatchedModelOutput()
+
+    engine.exec = execute
     batch = SimpleNamespace(
         node_name="n", graph_walk="prefill", admit_error=None, rows_only=True, cached_rids=(), run_started=None,
     )
