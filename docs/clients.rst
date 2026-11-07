@@ -255,9 +255,10 @@ handshake and has no ``/healthz``. Only the Python frontend serves this route;
 ``--rust-frontend`` logs a warning and serves without it.
 
 ``openpi_client`` sets no size limit on its messages, but the server does:
-``ws_max_message_mb`` (128 MiB by default, see :doc:`serving`). A larger observation closes
-the socket with ``1009`` and no error frame, so a deployment whose robots send several
-raw high-resolution cameras raises it.
+``ws_max_message_mb`` (by default ``MSTAR_MAX_BODY_MB``, see :doc:`serving`). A larger
+observation closes the socket with ``1009`` and no error frame, so a deployment whose robots
+send several raw high-resolution cameras raises it. An observation is parsed on the server's
+event loop, so a very large one holds up the server's other requests while it does.
 
 .. code-block:: python
 

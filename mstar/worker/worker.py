@@ -5464,7 +5464,7 @@ class Worker:
                             range_pop(synchronize=False)
 
                     if speculation is not None and not speculation.is_yield_away and self._step_voids_head(pending):
-                        committed = None  # when the raise is on every rank, every rank voids the head
+                        committed = None  # when the verdict (a raise, say) is on every rank, every rank voids the head
                     laps.skip()
                     # set node._in_flight to false, since
                     # the node has just completed
