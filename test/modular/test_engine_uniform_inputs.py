@@ -209,6 +209,37 @@ def test_connected_head_cannot_mutate_request_state_before_a_later_refusal():
     assert events == []
 
 
+@pytest.mark.parametrize("opaque", [False, True])
+def test_connected_preparation_isolates_request_metadata_before_speculating(opaque):
+    eng, group, events = _connected_engine()
+    original_infos = [batch.per_request_info_wrapped for _, batch in group.members]
+    nested = {"counter": 0}
+
+    class Owned:
+        def __deepcopy__(self, memo):
+            raise AssertionError("opaque owner copying must never be attempted")
+
+    for _, batch in group.members:
+        for info in batch.per_request_info.values():
+            info.step_metadata = {"state": Owned() if opaque else nested}
+    node = eng._submodules["a"].submodule
+    prepare = node.prepare_inputs
+    calls = []
+
+    def changing(**kwargs):
+        calls.append(1)
+        kwargs["fwd_info"].step_metadata["state"]["counter"] += 1
+        return prepare(**kwargs)
+
+    node.prepare_inputs = changing
+    assert eng.exec_group(group) is None and not group.submitted
+    assert nested == {"counter": 0}
+    assert not calls if opaque else calls
+    assert all(batch.per_request_info_wrapped is old
+               for (_, batch), old in zip(group.members, original_infos, strict=True))
+    assert not any(event in {"a", "b"} for event in events)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA graphs")
 def test_connected_cuda_launch_copies_future_values_and_preserves_external_outputs(monkeypatch):
     eng, group, events = _connected_engine(mixed=True, device="cuda")

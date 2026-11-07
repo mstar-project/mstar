@@ -8,6 +8,8 @@ operations on real tensors must keep doing real work.
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import fields, is_dataclass
+from enum import Enum
+from types import MappingProxyType, SimpleNamespace
 from typing import Any, Collection, Iterator
 
 import torch
@@ -37,6 +39,57 @@ class ConnectedInputs(FakeTensorMode):
             yield
         finally:
             _ACTIVE.reset(token)
+
+    @contextmanager
+    def isolated_info(self, batch: Any) -> Iterator[None]:
+        """Certify preparation on copied data, never opaque request-owned objects.
+
+        Alternative chunks cannot apply speculative host mutations. Only
+        unchanged plain metadata is eligible; owner/generator state is refused
+        before calling preparation, without invoking custom copy/equality hooks.
+        """
+        names = ("per_request_info", "per_request_info_wrapped", "per_request_input_metadata")
+        original = tuple(getattr(batch, name) for name in names)
+
+        def copy_data(value, active):
+            kind = type(value)
+            if (value is None or kind in (bool, int, float, str, bytes, torch.dtype, torch.device)
+                    or isinstance(value, Enum)):
+                return value, (kind, value)
+            if id(value) in active:
+                self.refuse("connected preparation metadata contains a cycle")
+            active = active | {id(value)}
+            if kind in (dict, MappingProxyType):
+                entries = [(copy_data(k, active), copy_data(v, active)) for k, v in value.items()]
+                copied = {k[0]: v[0] for k, v in entries}
+                return (MappingProxyType(copied) if kind is MappingProxyType else copied,
+                        (kind, tuple((k[1], v[1]) for k, v in entries)))
+            if kind in (list, tuple, set, frozenset) or (isinstance(value, tuple) and hasattr(kind, "_fields")):
+                entries = [copy_data(item, active) for item in value]
+                copied = ([entry[0] for entry in entries] if kind is list else
+                          kind(*(entry[0] for entry in entries)) if hasattr(kind, "_fields") else
+                          kind(entry[0] for entry in entries))
+                return copied, (kind, tuple(entry[1] for entry in entries))
+            if is_dataclass(value) and not isinstance(value, type) or kind is SimpleNamespace:
+                entries = [(name, copy_data(getattr(value, name), active)) for name in
+                           (vars(value) if kind is SimpleNamespace else (f.name for f in fields(value)))]
+                copied = object.__new__(kind) if kind is not SimpleNamespace else SimpleNamespace()
+                for name, entry in entries:
+                    object.__setattr__(copied, name, entry[0])
+                return copied, (kind, tuple((name, entry[1]) for name, entry in entries))
+            self.refuse(f"connected preparation cannot isolate metadata of type {kind.__name__}")
+
+        copied, before = copy_data(original, set())
+        for name, value in zip(names, copied, strict=True):
+            setattr(batch, name, value)
+        try:
+            yield
+            _, after = copy_data(copied, set())
+            if after != before:
+                self.refuse("connected preparation mutates request metadata")
+        finally:
+            for name, value in zip(names, original, strict=True):
+                setattr(batch, name, value)
 
     def refuse(self, reason: str) -> None:
         self.reason = reason

@@ -2424,7 +2424,9 @@ class Engine:
         back_keys, boundary_fields = set(), []
         boundary = []
         try:
-            with torch.no_grad(), guard.preparing():
+            with torch.no_grad(), guard.preparing(), ExitStack() as preparation:
+                for _, batch in group.members:
+                    preparation.enter_context(guard.isolated_info(batch))
                 repeats = group.members[0][1].step_context.repeats
                 if any(batch.step_context.repeats != repeats for _, batch in group.members):
                     guard.refuse("members requested different iteration counts")
