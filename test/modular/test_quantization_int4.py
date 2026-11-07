@@ -816,6 +816,8 @@ def test_cuda_dequant_gemm_matches_the_reference(kind, group, m):
     ("dot8", 40, {"BN": 64, "TB": 64, "NB": 2, "SPLIT_K": 1, "STAGES": 3, "num_warps": 4}),
 ])
 def test_cuda_every_path_and_split_matches_the_reference(kind, group, path, m, cfg, monkeypatch):
+    if path == "dot8" and cfg["TB"] == 64 and torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 10:
+        pytest.skip("dot8 with 64 tokens a tile needs 520 tensor-memory columns, Blackwell has 512 (config() takes 32)")
     """Each path at a tile the built-in rule may not pick (the benchmark sweeps them)."""
     from mstar.utils import w4a16
 

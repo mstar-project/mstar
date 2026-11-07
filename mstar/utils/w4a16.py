@@ -341,6 +341,13 @@ def _tb(m: int) -> int:
     return 16 if m <= 16 else 32 if m <= 32 else 64
 
 
+@lru_cache(maxsize=None)
+def _tmem_bound() -> bool:
+    """Blackwell (sm_100 / sm_103) holds a dot's accumulators in tensor memory, 512 fp32 columns a CTA; ``dot8``
+    with 64 tokens a tile needs 520, so there it takes 32."""
+    return torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 10
+
+
 def config(m: int, n: int, k: int, group: int, kind: int, sms: int) -> tuple[str, dict]:
     """The built-in Triton path and tile for ``m`` tokens of an ``[n, k]`` weight where Marlin isn't built: the
     winners of ``bench_w4a16``'s H200 sweep at Qwen3.5-27B's shapes (job 1508, ``res/w4r4``; tinygemm takes int4's
@@ -351,6 +358,8 @@ def config(m: int, n: int, k: int, group: int, kind: int, sms: int) -> tuple[str
     if m >= DEQUANT_M or (kind == KIND_INT4_ZP and m > 64):
         return "dequant", {}
     tb = _tb(m)
+    if tb == 64 and kind != KIND_INT4_ZP and _tmem_bound():
+        tb = 32
     if tb == 64:
         path, bn, warps = ("dot", 64, 4) if kind == KIND_INT4_ZP else ("dot8", 64, 4) if kind == KIND_E2M1 else (
             "dot8", 128, 8)
