@@ -371,3 +371,15 @@ def test_a_fused_projection_keeps_its_bf16_tail_on_every_rank(tp):
         assert proj.weight.shape == (head, 256) and torch.equal(proj.weight_tail, bf16[head:])
         out = proj(x)
         assert torch.equal(out[:, head:], want[:, head:]) and rel(out[:, :head], want[:, :head]) < 0.05
+
+
+def test_node_precision_leaves_the_quantized_storage(checkpoints):
+    # NodePrecision casts floating params to param_dtype; a format's weight and scales sit in integer containers
+    # (the scales stand for fp32), so the cast passes them by and only the bf16 rest follows the policy
+    from mstar.engine.precision import NodePrecision, apply_precision
+
+    root, _ = load(checkpoints["fp8"])
+    before = {k: v.clone() for k, v in state(root).items()}
+    apply_precision(root, NodePrecision(torch.float16))
+    assert all(torch.equal(before[k], v) for k, v in state(root).items())
+    assert root.lm_head.weight.dtype == torch.float16

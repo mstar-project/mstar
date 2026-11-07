@@ -31,9 +31,10 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
-from mstar.quantization.formats import AUTO, BF16, FORMATS, KV_CACHE_FORMATS
+from mstar.quantization.formats import AUTO, BF16, FORMATS
 
-_NODE_KEYS = ("format", "layers", "keep_bf16", "kv_cache")
+# weights only: a KV cache's storage is its resource's (``resources.<key>.quant``)
+_NODE_KEYS = ("format", "layers", "keep_bf16")
 _TOP_KEYS = (*_NODE_KEYS, "nodes")
 _RULE_KEYS = ("match", "format")
 REGEX_PREFIX = "re:"
@@ -66,11 +67,10 @@ class NodeQuantSpec:
 
     format: str = AUTO
     rules: tuple[Rule, ...] = ()
-    kv_cache: str = AUTO
 
     @property
     def is_default(self) -> bool:
-        return self.format == AUTO and not self.rules and self.kv_cache == AUTO
+        return self.format == AUTO and not self.rules
 
     def rule_for(self, path: str) -> Rule | None:
         return next((rule for rule in self.rules if rule.matches(path)), None)
@@ -141,14 +141,14 @@ def _parse_block(raw: Any, where: str, problems: list[str], keys=_NODE_KEYS) -> 
     if not isinstance(raw, Mapping):
         problems.append(f"{where} must be a format name or a mapping, got {raw!r}")
         return None
-    unknown = sorted(set(raw) - set(keys))
+    if "kv_cache" in raw:
+        problems.append(f"{where}.kv_cache: a KV cache's storage is set on its resource, resources.<key>.quant")
+    unknown = sorted(set(raw) - set(keys) - {"kv_cache"})
     if unknown:
         problems.append(f"{where} has unknown key(s) {unknown}; known: {list(keys)}")
     out: dict[str, Any] = {}
     if "format" in raw:
         out["format"] = _check_format(raw["format"], f"{where}.format", problems)
-    if "kv_cache" in raw:
-        out["kv_cache"] = _check_format(raw["kv_cache"], f"{where}.kv_cache", problems, KV_CACHE_FORMATS)
     rules: list[Rule] = []
     layers = raw.get("layers", [])
     if not isinstance(layers, list):
@@ -189,7 +189,7 @@ def parse_quantization(raw: Any) -> QuantizationSpec:
         raise QuantizationSpecError(problems)
     top_values, top_rules = parsed
     top = NodeQuantSpec(
-        format=top_values.get("format") or AUTO, rules=tuple(top_rules), kv_cache=top_values.get("kv_cache") or AUTO,
+        format=top_values.get("format") or AUTO, rules=tuple(top_rules),
     )
     nodes: dict[str, NodeQuantSpec] = {}
     raw_nodes = raw.get("nodes", {}) if isinstance(raw, Mapping) else {}
@@ -204,7 +204,6 @@ def parse_quantization(raw: Any) -> QuantizationSpec:
         nodes[str(node)] = NodeQuantSpec(
             format=values.get("format") or top.format,
             rules=(*rules, *top.rules),
-            kv_cache=values.get("kv_cache") or top.kv_cache,
         )
     if problems:
         raise QuantizationSpecError(problems)

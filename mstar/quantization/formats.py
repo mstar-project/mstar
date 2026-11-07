@@ -53,7 +53,6 @@ _CATALOG = (
 FORMATS: dict[str, FormatInfo] = {info.name: info for info in _CATALOG}
 QUANTIZED = tuple(FORMATS)
 # the KV cache's own dtype; only the model's dtype is served today
-KV_CACHE_FORMATS: dict[str, str] = {"fp8_e4m3": "e4m3 pages with per-head scales (not served yet)"}
 
 
 def info(name: str) -> FormatInfo:

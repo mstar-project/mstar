@@ -61,10 +61,6 @@ def quantization_problems(model: Any, config: Mapping[str, Any]) -> list[str]:
     top_asks = spec.top.format not in (AUTO, BF16) or spec.top.rules
     if spec.given and top_asks and not roots:
         problems.append(f"quantization: {type(model).__name__} declares no quantizable layers on any placed node")
-    for node_spec_owner in [spec.top, *spec.nodes.values()]:
-        if node_spec_owner.kv_cache not in (AUTO, BF16):
-            problems.append(f"quantization.kv_cache: {node_spec_owner.kv_cache} is catalogued, not served yet")
-            break
     capability = _local_capability()
     for decl in roots:
         node_spec = spec.for_node(decl.node)

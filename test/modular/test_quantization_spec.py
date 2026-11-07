@@ -79,7 +79,7 @@ def test_patterns_name_module_paths(path, pattern, hit):
     # a bare string would iterate as one-character patterns, and its `*` would match everything
     ({"keep_bf16": "lm_head"}, "keep_bf16 must be a list"),
     ({"keep_bf16": [""]}, "non-empty module-path pattern"),
-    ({"kv_cache": "fp8_block"}, "quantization.kv_cache must be one of"),
+    ({"kv_cache": "fp8_e4m3"}, "resources.<key>.quant"),
     ({"nodes": ["LLM"]}, "nodes must map node names"),
     ({"nodes": {"LLM": {"format": "int3"}}}, "quantization.nodes.LLM.format"),
     (["fp8_block"], "must be a format name or a mapping"),
