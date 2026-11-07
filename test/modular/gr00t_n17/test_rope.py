@@ -29,13 +29,11 @@ def _prompt(spec: list) -> tuple[torch.Tensor, torch.Tensor]:
     return torch.tensor(tokens), torch.tensor(grids, dtype=torch.long).reshape(-1, 3)
 
 
-# ----------------------------------------------------------------------------
 # Inline reference: `Qwen3VLModel.get_rope_index` (`models/qwen3_vl/modeling_qwen3_vl.py`)
 # for a single unpadded sequence. It walks the grids rather than the prompt: each one
 # finds the next image token, the text before it gets `arange + st_idx`, and the block
 # itself gets the (t, h', w') meshgrid offset past that text. `st_idx` is one past the
 # largest index the previous block reached, which is what couples the three grids.
-# ----------------------------------------------------------------------------
 
 
 def _reference(input_ids: torch.Tensor, image_grid_thw: torch.Tensor) -> torch.Tensor:

@@ -63,9 +63,7 @@ def _encoder(embedding_dim: int = _EMBED, seed: int = 0) -> TimestepEncoder:
     return encoder
 
 
-# ----------------------------------------------------------------------------
 # The action encoder's sinusoid against an inline reference
-# ----------------------------------------------------------------------------
 
 # The convention a reader might expect instead; this module has no weights, so it would load and run.
 _WRONG_DIVISOR = "half_dim - 1"  # the usual form, and the one the DT's own encoding uses
@@ -114,9 +112,7 @@ def test_the_sinusoid_is_diffusers_ladder_unflipped_and_unshifted(embedding_dim)
     assert torch.equal(ours, theirs(_flat()))
 
 
-# ----------------------------------------------------------------------------
 # `TimestepEncoder`: the DT's conditioning path
-# ----------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("embedding_dim", [_EMBED, 16], ids=["a small DT width", "a smaller one"])
@@ -170,12 +166,10 @@ def test_the_projection_is_rounded_to_the_weights_dtype_before_the_embedder():
     assert not torch.equal(bf16(timesteps), fp32(timesteps).to(torch.bfloat16))
 
 
-# ----------------------------------------------------------------------------
 # `MultiEmbodimentActionEncoder`: the noisy action and the denoising time in
 #
 # Synthetic weights: only slots 24-27 of the checkpoint's 32 embodiments are trained, so a
 # real-weights test on another slot multiplies by noise.
-# ----------------------------------------------------------------------------
 
 _CATEGORIES = 4
 _ACTION_DIM = 5  # a different number from the width, so the two cannot be confused
@@ -306,9 +300,7 @@ def test_the_encoder_and_decoder_are_sized_from_the_config():
     assert decoder.layer2.W.shape == (_CATEGORIES, config.hidden_size, _ACTION_DIM)
 
 
-# ----------------------------------------------------------------------------
 # `AdaLayerNorm` against an inline reference
-# ----------------------------------------------------------------------------
 
 # A tiny DT with every width distinct: block 12, attention 3 x 5 = 15, bridge rows 7.
 _DT_DIM = 12
@@ -380,9 +372,7 @@ def test_adalayernorm_is_the_reference_block(shape):
     assert not torch.equal(out, _adaln_reference(norm, x, temb, _WRONG_SHIFT_FIRST))
 
 
-# ----------------------------------------------------------------------------
 # One DT block against an inline reference
-# ----------------------------------------------------------------------------
 
 # Wider than 0.1 so the attention's contribution is comparable to the residual; at 0.1 a
 # dropped attention residual moves the answer about 1%, which reads as rounding.
@@ -472,9 +462,7 @@ def test_the_block_is_the_reference_block(cross, requests, queries):
     assert not torch.equal(out, _block_reference(block, hidden, temb, encoder, _WRONG_NO_ATTN_RESIDUAL))
 
 
-# ----------------------------------------------------------------------------
 # The DT's output head and the stack it sits on, against an inline reference
-# ----------------------------------------------------------------------------
 
 # `DiT` builds every block at `stack.inner_dim`; the stack's width, the bridge's rows, the output
 # width and the position table's stay distinct.
@@ -676,9 +664,7 @@ def test_a_dit_batch_can_hold_requests_at_different_denoising_steps():
     assert not torch.equal(after[1], out[1])
 
 
-# ----------------------------------------------------------------------------
 # The alternation, the two spans it divides into, and the attention each is read with
-# ----------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("depth", [1, 2, 3, 4])
@@ -770,9 +756,7 @@ def test_each_block_is_handed_the_attention_its_own_span_asked_for():
     assert torch.equal(out, _dit_reference(dit, hidden, text, image, timestep))
 
 
-# ----------------------------------------------------------------------------
 # `ActionPositionEmbedding`
-# ----------------------------------------------------------------------------
 
 _POS_ROWS = {
     "the action horizon": _ACTION_ROWS,  # 40 rows in the real model

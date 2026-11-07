@@ -80,9 +80,7 @@ _BASE_CONFIG = Gr00tN17Config(
 )
 
 
-# ----------------------------------------------------------------------------
 # The node, built shallow
-# ----------------------------------------------------------------------------
 
 
 def _config(depth: int = _DEPTH) -> Gr00tN17Config:
@@ -166,9 +164,7 @@ def _scalars(step: int) -> dict:
     }
 
 
-# ----------------------------------------------------------------------------
 # The ragged resources' stand-in
-# ----------------------------------------------------------------------------
 
 
 class _SpanAttention:
@@ -242,9 +238,7 @@ def _by_hand(node: Gr00tN17DenoiseStepSubmodule, latents: torch.Tensor, cond: di
     return node.action_decoder(out, cat_ids)[:, -_HORIZON:]
 
 
-# ----------------------------------------------------------------------------
 # The schedule: GR00T's time, read the other way round
-# ----------------------------------------------------------------------------
 
 
 def test_the_schedule_is_four_ascending_sigmas_and_the_references_buckets():
@@ -277,9 +271,7 @@ def test_the_steps_scalars_come_off_our_schedule_at_every_step():
     ) is None
 
 
-# ----------------------------------------------------------------------------
 # The two counts: 41 rows into the DT, 40 rows of latents
-# ----------------------------------------------------------------------------
 
 
 def test_the_41_rows_reach_the_dt_and_the_40_come_back():
@@ -304,9 +296,7 @@ def test_the_41_rows_reach_the_dt_and_the_40_come_back():
     assert node.num_tokens(Gr00tN17Shape(_TXT * 3, _IMG * 7)) == _ROWS
 
 
-# ----------------------------------------------------------------------------
 # The loop state's dtype: the weights', because the reference's is
-# ----------------------------------------------------------------------------
 
 
 def _ref_euler(actions: torch.Tensor, velocity: torch.Tensor) -> torch.Tensor:
@@ -368,9 +358,7 @@ def test_four_bf16_iterations_are_the_references_arithmetic_to_the_bit():
     assert not torch.equal(ours.float(), fp32_carry)
 
 
-# ----------------------------------------------------------------------------
 # The bucket key, read off the request's step metadata
-# ----------------------------------------------------------------------------
 
 
 def test_the_bucket_key_is_the_two_span_counts_off_step_metadata():
@@ -430,9 +418,7 @@ def test_the_node_asks_the_scheduler_to_batch_each_prompt_length_apart():
     assert keys == [Gr00tN17Shape(13, 448), Gr00tN17Shape(21, 448), Gr00tN17Shape(13, 448)]
 
 
-# ----------------------------------------------------------------------------
 # The conditioning: no batch dim, and the capture's twin of it
-# ----------------------------------------------------------------------------
 
 # rank of each conditioning entry for one request; a leading 1 would reach `denoise` as a spurious axis
 _REQUEST_RANKS = {"vl_text": 2, "vl_image": 2, "state": 2, "embodiment_id": 0}
@@ -529,9 +515,7 @@ def test_the_captures_placeholders_are_the_shapes_and_dtypes_a_real_row_brings()
     assert wide["vl_image"].shape == (448, node.config.backbone_embedding_dim)
 
 
-# ----------------------------------------------------------------------------
 # The attention callables: one per span, one set per binding
-# ----------------------------------------------------------------------------
 
 
 def test_the_attention_callables_are_memoised_per_binding_and_dropped_on_rebinding():
@@ -585,9 +569,7 @@ def test_the_two_resources_planned_from_the_step_are_the_sdpa_fallback_at_one_re
     assert torch.equal(ragged, sdpa)
 
 
-# ----------------------------------------------------------------------------
 # The step declaration: both DT resources, and the spans each one plans
-# ----------------------------------------------------------------------------
 
 
 def test_the_step_names_both_dt_resources_with_the_spans_each_one_plans():
@@ -621,9 +603,7 @@ def test_the_step_names_both_dt_resources_with_the_spans_each_one_plans():
     assert _declare(node, ("r2", "r3"))[1].cg_key_info == _SHAPE  # equal lengths share the bucket's key
 
 
-# ----------------------------------------------------------------------------
 # The checkpoint's own numbers
-# ----------------------------------------------------------------------------
 
 
 @needs_checkpoint

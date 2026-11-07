@@ -80,13 +80,11 @@ def _loaded_model(config: Gr00tN17Config, weights: dict[str, torch.Tensor], tmp_
     return model
 
 
-# ----------------------------------------------------------------------------
 # Inline reference: one Qwen3-VL decoder layer
 # (transformers `models/qwen3_vl/modeling_qwen3_vl.py`), with q, k and v as three
 # separate linears and the gated MLP's gate and up as two, the way the checkpoint
 # stores them. Pre-norm, two residuals, qk-norm over head_dim before the rotation,
 # and GQA by repeating each KV head over the queries it serves.
-# ----------------------------------------------------------------------------
 
 
 class RefRMSNorm(nn.Module):
@@ -204,9 +202,7 @@ def _run(model: Gr00tN17LanguageModel, layers: list[RefDecoderLayer], tokens: in
     return ours, hidden
 
 
-# ----------------------------------------------------------------------------
 # The layer against the reference
-# ----------------------------------------------------------------------------
 
 # Our q/k/v are one GEMM where the reference has three, and gate/up one where it has two, so
 # the two stacks differ by the BLAS's rounding rather than by their maths. The worst
@@ -252,9 +248,7 @@ def test_the_fused_projection_holds_q_then_k_then_v_one_block_per_head(tmp_path)
         assert torch.equal(fused[offset:offset + checkpoint.shape[0]], checkpoint)
 
 
-# ----------------------------------------------------------------------------
 # DeepStack injection
-# ----------------------------------------------------------------------------
 
 # Two image blocks with text between them. A single contiguous block still lines up with
 # itself over most of its length after a roll or a reversal, so it hides a row-ordering
@@ -364,9 +358,7 @@ def test_row_k_of_a_feature_lands_on_image_row_k(tmp_path, permute):
     assert relative_gap(case.ours(), case.theirs(rows=permute(case.rows))) > 1000 * _BAR
 
 
-# ----------------------------------------------------------------------------
 # The attention resource
-# ----------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("resources", [{}, {"vision_attn": object()}], ids=["nothing bound", "the wrong key"])
@@ -379,9 +371,7 @@ def test_an_unbound_attention_names_the_resource_it_wanted(resources):
         model(torch.zeros(2, model.config.hidden_size), *model.build_cos_sin(torch.zeros(3, 2)))
 
 
-# ----------------------------------------------------------------------------
 # Shapes and parameters
-# ----------------------------------------------------------------------------
 
 
 def test_build_cos_sin_turns_three_grids_of_positions_into_one_row_per_token():
@@ -419,9 +409,7 @@ def test_the_parameters_are_the_checkpoints_tensors_after_fusing(tmp_path):
     assert not any(name.startswith(("norm.", "lm_head.")) for name, _ in model.named_parameters())
 
 
-# ----------------------------------------------------------------------------
 # The node: `Gr00tN17LLMSubmodule`, driven the way the engine drives it
-# ----------------------------------------------------------------------------
 
 _WALK = "prefill"
 _FWD = CurrentForwardPassInfo(request_id="r0", graph_walk=_WALK, fwd_index=0, random_seed=0, max_tokens=0)

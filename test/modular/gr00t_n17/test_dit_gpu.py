@@ -92,9 +92,7 @@ _WORKSPACE = 128 << 20  # FlashInfer's scratch, per wrapper
 _OUTPUT_RMS = (0.05, 1.0)
 
 
-# ----------------------------------------------------------------------------
 # The reference, and the checkpoint's own weights
-# ----------------------------------------------------------------------------
 
 
 def _reference_module():
@@ -138,9 +136,7 @@ def _build_reference(config: Gr00tN17Config) -> torch.nn.Module:
     return reference.to(_DEVICE).eval()
 
 
-# ----------------------------------------------------------------------------
 # One input layout, the reference's answer for it, and the floor it sets
-# ----------------------------------------------------------------------------
 
 
 @dataclass
@@ -225,9 +221,7 @@ def _mean_error(got: torch.Tensor, want: torch.Tensor) -> float:
     return (got.float() - want.float()).abs().mean().item()
 
 
-# ----------------------------------------------------------------------------
 # The ragged kernels, bound to the three spans
-# ----------------------------------------------------------------------------
 
 
 def _cu(lengths: list[int]) -> torch.Tensor:
@@ -269,9 +263,7 @@ class _Spans:
         }
 
 
-# ----------------------------------------------------------------------------
 # The one build: the reference, the floor, and ours sharing its tensors
-# ----------------------------------------------------------------------------
 
 
 @dataclass
@@ -309,9 +301,7 @@ def stacks() -> _Stacks:
     torch.cuda.empty_cache()
 
 
-# ----------------------------------------------------------------------------
 # The packing is the mask
-# ----------------------------------------------------------------------------
 
 
 def test_the_packed_spans_are_the_reference_mask(stacks: _Stacks):
@@ -365,9 +355,7 @@ def test_two_buckets_are_the_reference_padded_to_the_longest(stacks: _Stacks):
         )
 
 
-# ----------------------------------------------------------------------------
 # The negative control: which rows a block reads
-# ----------------------------------------------------------------------------
 
 
 def test_swapping_the_text_and_image_spans_breaks_the_bar(stacks: _Stacks):

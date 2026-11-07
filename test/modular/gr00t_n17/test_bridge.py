@@ -58,9 +58,7 @@ def _bind(bridge: Gr00tN17VLBridge, resources: dict) -> None:
     NodeSubmodule.bind_node_resources(node, resources)
 
 
-# ----------------------------------------------------------------------------
 # Inline reference: the bridge, written from its description
-# ----------------------------------------------------------------------------
 
 # A deliberate deviation: every shape still fits, and only filled norms can tell the two apart.
 _WRONG_NORMS_SWAPPED = "norm1 and norm3 swapped"
@@ -143,9 +141,7 @@ def _bridge(config: Gr00tN17Config, tokens: int, seed: int = 0) -> Gr00tN17VLBri
     return bridge
 
 
-# ----------------------------------------------------------------------------
 # The bridge against the reference
-# ----------------------------------------------------------------------------
 
 # Not exact: the stand-in's SDPA blocks its reductions differently from the reference's
 # written-out matmul-softmax-matmul. The worst relative gap over geometries, token counts, weight
@@ -186,9 +182,7 @@ def test_the_layer_norms_use_eps_1e_5_and_not_1e_6():
     assert relative_gap(ours(near_constant), wrong(near_constant)) > 1000 * _BAR
 
 
-# ----------------------------------------------------------------------------
 # Parameters
-# ----------------------------------------------------------------------------
 
 
 def test_a_block_has_no_norm2_and_carries_the_reference_names():
@@ -206,9 +200,7 @@ def test_a_block_has_no_norm2_and_carries_the_reference_names():
     assert not any("norm2" in name for name in names)
 
 
-# ----------------------------------------------------------------------------
 # The attention resource
-# ----------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize(
@@ -225,9 +217,7 @@ def test_an_unbound_attention_names_the_resource_it_wanted(resources):
         bridge(torch.zeros(2, config.backbone_embedding_dim))
 
 
-# ----------------------------------------------------------------------------
 # The node: `Gr00tN17VLBridgeSubmodule`, driven the way the engine drives it
-# ----------------------------------------------------------------------------
 
 _WALK = "prefill"
 _FWD = CurrentForwardPassInfo(

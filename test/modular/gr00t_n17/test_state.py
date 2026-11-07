@@ -97,9 +97,7 @@ def test_the_state_encoder_is_sized_from_the_config(history):
     assert encoder.layer2.b.shape == (_CATEGORIES, _OUTPUT)
 
 
-# ----------------------------------------------------------------------------
 # The node: `Gr00tN17StateEncoderSubmodule`, driven the way the engine drives it
-# ----------------------------------------------------------------------------
 
 _WALK = "prefill"
 _FWD = CurrentForwardPassInfo(request_id="r0", graph_walk=_WALK, fwd_index=0, random_seed=0, max_tokens=0)

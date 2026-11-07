@@ -263,10 +263,8 @@ def test_call_feeds_the_processor_in_reference_order():
     assert out["embodiment_id"].tolist() == [7, 7] and out["action_mask"].shape == (2, 6)
 
 
-# ----------------------------------------------------------------------------
 # The decode: `unapply`. An inverse of the wrong thing still returns plausible commands
 # of the right shape, so each test pins one choice and, where tempting, the wrong answer.
-# ----------------------------------------------------------------------------
 
 # (9,) XYZ_ROT6D poses (position, then a rotation matrix's first two rows): the identity
 # frame, and a quarter turn about z at (1, 2, 3).

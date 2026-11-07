@@ -113,9 +113,7 @@ _REAL = {
 }
 
 
-# ----------------------------------------------------------------------------
 # A config with no two widths alike, and a model built around it
-# ----------------------------------------------------------------------------
 
 # Every head count and head dim differs, and none is the checkpoint's, so a hardcoded geometry cannot match.
 _VISION_HEADS, _VISION_WIDTH = 5, 20
@@ -215,9 +213,7 @@ def _edges(section) -> list[GraphEdge]:
     return [edge for node in _nodes(section).values() for edge in node.outputs]
 
 
-# ----------------------------------------------------------------------------
 # The four walks
-# ----------------------------------------------------------------------------
 
 
 def test_the_walks_are_four_over_five_nodes():
@@ -310,9 +306,7 @@ def test_the_loops_terminal_output_is_named_for_the_sections_loop_back_edge():
     )
 
 
-# ----------------------------------------------------------------------------
 # What each node takes and emits
-# ----------------------------------------------------------------------------
 
 
 def test_each_node_declares_the_contract_its_submodule_reads():
@@ -361,9 +355,7 @@ def test_every_internal_edge_lands_on_an_input_its_destination_declares():
         }, walk_name
 
 
-# ----------------------------------------------------------------------------
 # The join across the walk boundary
-# ----------------------------------------------------------------------------
 
 
 def test_action_gens_conditioning_inputs_are_exactly_what_prefill_persists():
@@ -388,9 +380,7 @@ def test_action_gens_conditioning_inputs_are_exactly_what_prefill_persists():
     assert needs == node_persisted | request_persisted | {_CARRIED}
 
 
-# ----------------------------------------------------------------------------
 # The reuse walks
-# ----------------------------------------------------------------------------
 
 
 def test_the_reuse_walks_expose_the_nodes_prefill_already_contains():
@@ -529,9 +519,7 @@ def test_the_reuse_walk_node_sets_match_the_graphs():
     assert set(Gr00tN17Model.REUSE_WALK_NODES) == set(walks) - {_PREFILL, _ACTION_GEN}
 
 
-# ----------------------------------------------------------------------------
 # The five resource specs
-# ----------------------------------------------------------------------------
 
 
 def _specs(model: Gr00tN17Model) -> dict[str, RaggedAttentionConfig]:
@@ -597,9 +585,7 @@ def test_every_head_geometry_is_read_off_the_config(scale):
     assert len({geometry(key) for key in specs}) == 4  # the DT's two are equal by design
 
 
-# ----------------------------------------------------------------------------
 # The ViT's segment bound, a property of the checkpoint
-# ----------------------------------------------------------------------------
 
 
 # per-tag views and timesteps -> a request's most frames
@@ -622,9 +608,7 @@ def test_the_vit_segment_bound_is_a_requests_most_frames(video_keys, steps, fram
     assert model.max_input_files() == {"image": frames}
 
 
-# ----------------------------------------------------------------------------
 # The request's two hops
-# ----------------------------------------------------------------------------
 
 
 def test_a_request_starts_in_prefill_with_each_input_at_the_node_that_takes_it():
@@ -709,9 +693,7 @@ def test_the_walk_flips_prefill_then_action_gen_then_done(text_rows, image_rows)
     assert done.full_metadata.graph_walk == _ACTION_GEN
 
 
-# ----------------------------------------------------------------------------
 # `get_submodule`
-# ----------------------------------------------------------------------------
 
 _SUBMODULES = {
     VISION_ENCODER: Gr00tN17VisionEncoderSubmodule,
@@ -918,9 +900,7 @@ def test_the_opted_out_bridge_hands_the_loop_bf16_spans(tmp_path):
         assert {t.dtype for t in spans(torch.bfloat16)} == {torch.float32}
 
 
-# ----------------------------------------------------------------------------
 # accelerator graphs
-# ----------------------------------------------------------------------------
 
 _SERVING = Path(__file__).resolve().parents[3] / "configs" / "gr00t_n17.yaml"
 
@@ -999,9 +979,7 @@ def test_the_shipped_yaml_sizes_the_dt_cross_attention_for_its_widest_capture_sp
     assert ceiling is not None and ceiling >= max(max(shape) for shape in model.capture_shapes)
 
 
-# ----------------------------------------------------------------------------
 # postprocess
-# ----------------------------------------------------------------------------
 
 # One embodiment, two groups: `arm` is relative with [-1, 1] bounds (chunk + state),
 # `grip` absolute with q01 == q99 == 5 (always 5), so the group order is visible.
@@ -1337,9 +1315,7 @@ def test_a_reuse_walks_tensor_comes_back_exactly_with_its_dtype_and_shape(shape)
     assert np.array_equal(rebuilt, features.float().numpy())
 
 
-# ----------------------------------------------------------------------------
 # Against the checkpoint
-# ----------------------------------------------------------------------------
 
 
 @needs_checkpoint

@@ -44,9 +44,7 @@ def test_the_deepstack_merger_normalises_after_the_shuffle():
     assert torch.equal(merger(x), reference(x))
 
 
-# ----------------------------------------------------------------------------
 # The block loop and the taps
-# ----------------------------------------------------------------------------
 
 
 class _ConstantBlock(nn.Module):
@@ -132,9 +130,7 @@ def test_the_patch_embed_is_nvidias_conv():
     assert not torch.equal(VisionPatchEmbed.forward(embed, x), conv)
 
 
-# ----------------------------------------------------------------------------
 # The node: `Gr00tN17VisionEncoderSubmodule`, driven the way the engine drives it
-# ----------------------------------------------------------------------------
 
 _WALK = "prefill_vision"
 _FWD = CurrentForwardPassInfo(request_id="r0", graph_walk=_WALK, fwd_index=0, random_seed=0, max_tokens=0)
@@ -211,9 +207,7 @@ def test_driving_the_node_runs_the_encoders_own_forward():
     assert [tuple(t.shape) for t in out["vision_embeds"] + out["deepstack_embeds"]] == [shape] * 4
 
 
-# ----------------------------------------------------------------------------
 # The rope the blocks get
-# ----------------------------------------------------------------------------
 
 
 @torch.no_grad()

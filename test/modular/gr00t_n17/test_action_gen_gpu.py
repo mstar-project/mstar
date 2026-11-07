@@ -74,9 +74,7 @@ _MIXED_ITERS = (1, 3)
 _WRONG_NOISE_CHUNK, _WRONG_NOISE_DECODED = 50, 2.5
 
 
-# ----------------------------------------------------------------------------
 # One recorded request: its conditioning, its answer, and its floor
-# ----------------------------------------------------------------------------
 
 
 @dataclass
@@ -132,9 +130,7 @@ def _load(
     )
 
 
-# ----------------------------------------------------------------------------
 # The one build: the denoise step, its schedule, and the decode
-# ----------------------------------------------------------------------------
 
 
 @dataclass
@@ -217,9 +213,7 @@ def pair(requests: list[_Request]) -> tuple[_Request, _Request]:
     return shared[0], shared[1]
 
 
-# ----------------------------------------------------------------------------
 # Driving the loop
-# ----------------------------------------------------------------------------
 
 
 def _run(loop: _Loop, batch: list[_Request], iters: tuple[int, ...] | None = None) -> torch.Tensor:
@@ -307,9 +301,7 @@ def _decoded_error(
     return worst, floor, per_group
 
 
-# ----------------------------------------------------------------------------
 # The loop against the reference
-# ----------------------------------------------------------------------------
 
 
 def test_the_four_step_loop_matches_the_oracle_on_every_recorded_request(
@@ -407,9 +399,7 @@ def test_every_recorded_bucket_is_one_the_shipped_yaml_captures(requests: list[_
     assert {request.bucket for request in requests} <= captured, captured
 
 
-# ----------------------------------------------------------------------------
 # Batching two requests of the same shape
-# ----------------------------------------------------------------------------
 
 
 def test_batching_two_requests_of_one_shape_costs_only_the_gemm_re_blocking(
@@ -457,9 +447,7 @@ def test_a_rows_result_does_not_depend_on_who_shares_its_batch(
             )
 
 
-# ----------------------------------------------------------------------------
 # Rows at different loop iterations
-# ----------------------------------------------------------------------------
 
 
 def test_rows_at_different_loop_iterations_match_each_row_run_alone(
