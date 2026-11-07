@@ -2772,6 +2772,15 @@ class Engine:
                         resource_step = None if batch.step is None else batch.step.get(key)
                         if why := resource.connected_refusal(resource_step, batch.step_context):
                             guard.refuse(f"{batch.node_name}/{key}: {why}")
+                if streamed:
+                    # Every member may end early or run zero iterations, even
+                    # when its compute ask is one. Its actual declaration and
+                    # dependencies must promise reversible accounting first.
+                    for occurrences in owners.values():
+                        for key, resource, batch in occurrences:
+                            part = None if batch.step is None else batch.step.get(key)
+                            if why := resource.repeat_refusal(batch.graph_walk, part):
+                                guard.refuse(f"{batch.node_name}/{key}: {why}")
                 if not streamed and repeats > 1:
                     for occurrences in owners.values():
                         for key, resource, batch in occurrences:

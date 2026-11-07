@@ -891,7 +891,7 @@ def test_streamed_alternatives_preserve_host_meaning_and_do_not_read_future_valu
 
 
 @pytest.mark.parametrize("device_name", ["cpu", "cuda"])
-@pytest.mark.parametrize("mode", ["live", "full", "yield"])
+@pytest.mark.parametrize("mode", ["live", "full", "yield", "unsupported"])
 def test_streamed_engine_composes_independent_bodies_and_owner_reads(device_name, mode, monkeypatch):
     from dataclasses import replace
 
@@ -1039,7 +1039,24 @@ def test_streamed_engine_composes_independent_bodies_and_owner_reads(device_name
         ring.ring_write("x", [2], torch.arange(10, 18, device=device).reshape(1, 8, 1).expand(1, 8, 2), [0])
         source.put_positions(list(range(8)))
     assert worker._reserve_group_stream(group)
+    if mode == "unsupported":
+        from mstar.engine.resources.base import Resource
+        from mstar.engine.resources.runner import StepRunner
+
+        class UnsupportedOwner(Resource):
+            @classmethod
+            def build(cls, spec, info):
+                return cls()
+        owner = UnsupportedOwner()
+        eng._runner = StepRunner({"unsupported": owner})
+        eng._submodules["a"].resources = {"unsupported": owner}
     output = eng.exec_group(group)
+    if mode == "unsupported":
+        assert output is None and "unsupported" in group.refusal
+        assert not group.submitted and not launches
+        worker._restore_group_stream(group)
+        assert not source._reservations and ring.ring_room("x", 2) == 8
+        return
     assert output is not None, group.refusal
     if device_name == "cuda":
         backend.synchronize()
