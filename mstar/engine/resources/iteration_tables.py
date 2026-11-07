@@ -83,6 +83,31 @@ class StreamWindow:
     metadata: torch.Tensor
     ready: torch.Tensor
     compute_ready: torch.Tensor
+    # Ring locations of the retained coverage; no payload is copied here.
+    positions: torch.Tensor
+    # Absolute stream origin, initially available items, already-proved EOF.
+    origins: torch.Tensor
+    continuation: torch.Tensor
+
+    def payload_positions(self, width: int) -> torch.Tensor:
+        """Resolve the selected ordinary chunk through its retained ring coverage."""
+        if width < 1 or self.positions.shape[1] == 0:
+            raise ValueError("a streamed payload needs nonempty captured position coverage")
+        item = torch.arange(width, device=self.positions.device)[None, :]
+        offsets = self.metadata[:, 0:1] - self.origins[:, 0:1] + item
+        valid = ((self.selected[:, None] >= 0) & (item < self.metadata[:, 2:3])
+                 & (offsets >= 0) & (offsets < self.positions.shape[1]))
+        physical = self.positions.gather(1, offsets.clamp(0, self.positions.shape[1] - 1))
+        return torch.where(valid, physical, -1)
+
+    def produced_positions(self, counts: torch.Tensor) -> torch.Tensor:
+        """The newly produced item, using the same snapshot as its consumer."""
+        if self.positions.shape[1] == 0 or counts.shape != self.history.shape:
+            raise ValueError("producer counts need the captured rows and ring coverage")
+        offsets = self.origins[:, 1] + counts - 1
+        valid = (counts > 0) & (offsets >= 0) & (offsets < self.positions.shape[1])
+        physical = self.positions.gather(1, offsets.clamp(0, self.positions.shape[1] - 1)[:, None]).squeeze(1)
+        return torch.where(valid, physical, -1)
 
     def select(self, available: torch.Tensor, done: torch.Tensor, live: torch.Tensor) -> None:
         choices = self.decisions
@@ -219,13 +244,16 @@ class IterationTables(Resource):
         self._window_fills.pop(key, None)
         self._stream_windows.pop(key, None)
 
-    def prepare_stream_window(self, lease: SlotLease, decisions: int, transitions: int) -> StreamWindow:
+    def prepare_stream_window(
+        self, lease: SlotLease, decisions: int, transitions: int, positions: int = 0,
+    ) -> StreamWindow:
         """One bounded policy bank per leased capture; no payload ownership changes."""
-        if not 0 < decisions <= 4096 or not 0 < transitions <= 4096:
+        if not 0 < decisions <= 4096 or not 0 < transitions <= 4096 or positions < 0:
             raise ValueError("a captured stream policy needs bounded decision and transition tables")
         key, bs = (lease.bucket, lease.buffer_slot), lease.bucket.bs
         if (window := self._stream_windows.get(key)) is not None:
-            if window.decisions.shape != (bs, decisions, 4) or window.chunks.shape != (bs, transitions, 6):
+            if (window.decisions.shape != (bs, decisions, 4) or window.chunks.shape != (bs, transitions, 6)
+                    or window.positions.shape != (bs, positions)):
                 raise ValueError("captured stream-policy geometry changed for the same capture")
             return window
         def zeros(*shape, dtype=torch.long):
@@ -235,12 +263,14 @@ class IterationTables(Resource):
             zeros(bs, transitions, 6), torch.full((bs,), -1, dtype=torch.long, device=self._device),
             zeros(bs), zeros(bs), zeros(bs, dtype=torch.bool),
             torch.full((bs,), -1, dtype=torch.long, device=self._device), zeros(bs, 6), zeros(1), zeros(1),
+            torch.full((bs, positions), -1, dtype=torch.long, device=self._device), zeros(bs, 3), zeros(1),
         )
         self._stream_windows[key] = window
         return window
 
     def stage_stream_window(
         self, lease: SlotLease, reservations: Sequence[StreamReservation], computes: Sequence[Sequence[bool]],
+        *, producer_limits: Sequence[int] | None = None,
     ) -> None:
         """Before launch, freeze ordinary policy and prepared-tail decisions.
 
@@ -251,8 +281,10 @@ class IterationTables(Resource):
         window = self._stream_windows[lease.bucket, lease.buffer_slot]
         if len(reservations) != len(computes) or len(reservations) > lease.bucket.bs:
             raise ValueError("stream-policy snapshots do not fit the captured rows")
-        decisions, chunks, limits = [], [], []
-        for reservation, flags in zip(reservations, computes, strict=True):
+        decisions, chunks, limits, positions, origins = [], [], [], [], []
+        if window.positions.shape[1] and (producer_limits is None or len(producer_limits) != len(reservations)):
+            raise ValueError("captured payload coverage needs each producer's reserved horizon")
+        for index, (reservation, flags) in enumerate(zip(reservations, computes, strict=True)):
             if (len(flags) != len(reservation.transitions) or any(type(flag) is not bool for flag in flags)
                     or len(reservation.parents) != len(reservation.transitions)
                     or len(reservation.decisions) > window.decisions.shape[1]
@@ -267,14 +299,31 @@ class IterationTables(Resource):
                 for t, compute in zip(reservation.transitions, flags, strict=True)
             ), *[(0,) * 6] * (window.chunks.shape[1] - len(reservation.transitions))])
             limits.append(reservation.bound)
+            if window.positions.shape[1]:
+                produced = producer_limits[index]
+                coverage = reservation.positions
+                if (type(produced) is not int or not 0 <= produced <= len(coverage)
+                        or len(coverage) > window.positions.shape[1]
+                        or any(type(position) is not int or position < 0 for position in coverage)):
+                    raise ValueError("stream payload coverage exceeds its captured bank or producer reservation")
+                positions.extend([*coverage, *[-1] * (window.positions.shape[1] - len(coverage))])
+                done = bool(reservation.decisions) and all(key[2] for key in reservation.decisions)
+                if done and produced:
+                    raise ValueError("a completed producer cannot reserve new output positions")
+                origins.extend((reservation.origin, len(coverage) - produced, int(done)))
         padding = lease.bucket.bs - len(reservations)
         decisions.extend([(-1, -1, -1, -1)] * (padding * window.decisions.shape[1]))
         chunks.extend([(0,) * 6] * (padding * window.chunks.shape[1]))
         limits.extend([0] * padding)
+        positions.extend([-1] * (padding * window.positions.shape[1]))
+        origins.extend([0] * (padding * 3))
         # All snapshots have been checked before changing any capture binding.
         self._stager.copy_(window.decisions.view(-1), [v for row in decisions for v in row])
         self._stager.copy_(window.chunks.view(-1), [v for row in chunks for v in row])
         self._stager.copy_(window.limits, limits)
+        if window.positions.shape[1]:
+            self._stager.copy_(window.positions.view(-1), positions)
+            self._stager.copy_(window.origins.view(-1), origins)
         window.history.fill_(-1)
         window.counts.zero_()
         window.terminal.zero_()
@@ -282,6 +331,7 @@ class IterationTables(Resource):
         window.metadata.zero_()
         window.ready.zero_()
         window.compute_ready.zero_()
+        window.continuation.zero_()
 
     def stage_window(
         self, lease: SlotLease, slots: Sequence[int], snapshot: IterationWindow,

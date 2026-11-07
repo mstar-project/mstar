@@ -879,15 +879,15 @@ def test_future_stream_policy_and_ring_payloads_run_in_one_conditional_graph(fac
     width = max(t.chunk.num_items for t in reservation.transitions)
     lease = SlotLease(0, BucketKey("consume", 1, 1))
     tables = IterationTables(device)
-    window = tables.prepare_stream_window(lease, len(reservation.decisions), len(reservation.transitions))
+    window = tables.prepare_stream_window(
+        lease, len(reservation.decisions), len(reservation.transitions), len(reservation.positions),
+    )
     # This synthetic node's ordinary preparation computes only nonempty chunks.
     computes = [t.chunk.num_items > 0 for t in reservation.transitions]
     ctx = StepContext([RID], "produce", 0, False)
     ctx.slot_lease = lease
     ring.plan(LoopbackRowsStep(), ctx)
     rows = ring.indices(lease.bucket, lease.slot)
-    positions = torch.tensor([[0, 2, 3, 4, 5, 6, 7]], device=device)
-    offsets = torch.arange(width, device=device)[None, :]
     inputs = torch.zeros(1, width, 1, dtype=torch.long, device=device)
     a_count, emitted, b_count, done, a_ready, go, remaining = (
         torch.zeros(1, dtype=torch.long, device=device) for _ in range(7)
@@ -896,7 +896,7 @@ def test_future_stream_policy_and_ring_payloads_run_in_one_conditional_graph(fac
     outputs = torch.zeros(8, dtype=torch.long, device=device)
 
     def choose():
-        window.select(2 + emitted, done, live)
+        window.select(window.origins[:, 0] + window.origins[:, 1] + emitted, done, live)
 
     def more():
         choose()
@@ -907,16 +907,13 @@ def test_future_stream_policy_and_ring_payloads_run_in_one_conditional_graph(fac
         # Third model execution stops and withholds its item. The consumer
         # sees EOF with exactly two actual future positions, not five reserved.
         keeps = a_count < 2
-        ring.ring_scatter(EDGE, rows, 3 + emitted, (100 + a_count)[:, None], keeps)
+        ring.ring_scatter(EDGE, rows, window.produced_positions(a_count + 1), (100 + a_count)[:, None], keeps)
         emitted.add_(keeps)
         a_count.add_(1)
         done.copy_(a_count == 3)
 
     def consume():
-        logical = window.metadata[:, :1] + offsets
-        picked = positions.gather(1, logical.clamp(0, positions.shape[1] - 1))
-        picked = torch.where(offsets < window.metadata[:, 2:3], picked, -1)
-        ring.ring_gather(EDGE, rows, picked, inputs)
+        ring.ring_gather(EDGE, rows, window.payload_positions(width), inputs)
         outputs.scatter_(0, window.counts.clamp_max(7), inputs.sum(dim=(1, 2)))
         b_count.add_(1)
 
@@ -937,7 +934,7 @@ def test_future_stream_policy_and_ring_payloads_run_in_one_conditional_graph(fac
         ))))
         runtime, launch = backend.while_runtime(), backend.while_runtime().launch
         monkeypatch.setattr(runtime, "launch", lambda *args: (launches.append(args[0]), launch(*args))[-1])
-    tables.stage_stream_window(lease, [reservation], [computes])
+    tables.stage_stream_window(lease, [reservation], [computes], producer_limits=[5])
     for value in (a_count, emitted, b_count, done, outputs):
         value.zero_()
     remaining.fill_(12)

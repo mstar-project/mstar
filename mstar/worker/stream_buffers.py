@@ -285,7 +285,7 @@ class StreamBufferManager:
 
     def reserve_connected_edge(
         self, request_id: int, edge_name: str, future_positions: Sequence[int], bound: int,
-        consumer_walk: str | None = None, *, ingested: StreamingEdge | None = None,
+        consumer_walk: str | None = None, *, ingested: StreamingEdge | None = None, may_finish: bool = True,
     ) -> tuple[StreamingEdge, StreamChunk] | None:
         """Under a unit claim, retain a new future reader or extend its ingested one.
 
@@ -304,7 +304,9 @@ class StreamBufferManager:
             or sbuf.ingested_chunk is None or sbuf.ingested_chunk.reservation is not adopt
         ):
             return None
-        snapshot = sbuf.reserve_future_window(future_positions, bound, consumer_walk, adopt=adopt)
+        snapshot = sbuf.reserve_future_window(
+            future_positions, bound, consumer_walk, adopt=adopt, may_finish=may_finish,
+        )
         if snapshot is None:
             return None
         if ingested is None:

@@ -27,6 +27,10 @@ class StreamReservation:
     # An unsubmitted graph-ingested reader replaced by a future window. Its
     # first frozen pop stays authoritative; cancellation restores this reader.
     replaced: tuple[StreamReservation, int] | None = None
+    # A connected reader's immutable ring coverage. Semantic offsets need not
+    # equal physical positions: unused producer reservations can leave holes.
+    positions: tuple[int, ...] = ()
+    origin: int = 0
 
 
 @dataclass
@@ -633,16 +637,16 @@ class StreamBuffer:
             bound, 0, self._executed_chunks, tuple(transitions), tuple(parents),
             tuple((*key, selected) for key, selected in decisions.items()),
             None if adopt is None else (adopt, self._reservations[adopt]),
+            positions=(*self._buffer, *future_positions), origin=self._consumed,
         )
         if adopt is None:
             self._chunks_popped += 1
         else:
             del self._reservations[adopt]
         self._reservations[reservation] = bound
-        items = [*self._buffer, *future_positions]
         return StreamChunk(
-            data=self._collate(items), chunk_index=reservation.chunk_index,
-            start_offset=self._consumed, num_items=len(items), reservation=reservation,
+            data=self._collate(list(reservation.positions)), chunk_index=reservation.chunk_index,
+            start_offset=reservation.origin, num_items=len(reservation.positions), reservation=reservation,
             tail_offset=self._tail_consumed,
         )
 
