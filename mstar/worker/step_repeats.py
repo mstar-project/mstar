@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING, ClassVar
 from mstar.engine.resources.resident import NOT_ASKED
 from mstar.graph.base import EdgeKind, LoopEdges, loop_edges
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
+from mstar.model.submodule_base import chunk_loop_name
 from mstar.utils.profiler import phase_record
 
 if TYPE_CHECKING:
@@ -136,11 +137,10 @@ def parse_step_repeats(
         raise ValueError(f"step_repeats names {unknown}, which are not nodes of the model")
     configs = {node: RepeatConfig.parse(node, settings) for node, settings in block.items()}
     if walks is not None:
+        loops = walk_edges(walks, ((node, walk) for node in configs for walk in walks))
         for node, config in configs.items():
-            if config.device_stop != "off" and not any(
-                loop_edges(section, node) is not None for section in walks.values()
-            ):
-                raise ValueError(f"{node}: requested device_stop cannot run: the node has no Loop")
+            if config.device_stop != "off" and not any(n == node for n, _ in loops):
+                raise ValueError(f"{node}: requested device_stop cannot run: the node has no non-chunk Loop")
     return configs
 
 
@@ -384,10 +384,17 @@ class StepRepeats:
 
 
 def walk_edges(walks: Mapping[str, object], pairs: Iterable[tuple[str, str]]) -> dict[tuple[str, str], LoopEdges]:
-    """``loop_edges`` for each (node, walk) of ``pairs`` that runs in a Loop."""
+    """The computation Loops of ``pairs``, excluding scheduler-sized chunks.
+
+    A chunk Loop advances by the next prompt slice's token count, not by one
+    captured iteration. A node's repeat settings apply to its computation
+    Loops; chunking its prefill does not ask that prefill to repeat too.
+    """
     out = {}
     for node, walk in pairs:
         section = walks.get(walk)
+        if section is not None and chunk_loop_name(node, walk) in section.get_loops():
+            continue
         edges = None if section is None else loop_edges(section, node)
         if edges is not None:
             out[(node, walk)] = edges

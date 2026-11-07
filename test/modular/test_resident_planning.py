@@ -1009,6 +1009,9 @@ def test_an_eager_tp_fallback_cannot_change_a_broadcast_count(fallback, authorit
 
 def test_explicit_device_stop_requires_a_loop_in_the_whole_model():
     from mstar.graph.base import GraphNode, Loop
+    from mstar.model.base import Model
+    from mstar.model.submodule_base import ChunkingPolicy
+    from mstar.worker.step_repeats import walk_edges
 
     node = GraphNode(name="n", input_names=[], outputs=[])
     config = {"n": {"max": 4, "device_stop": "skip"}}
@@ -1017,6 +1020,19 @@ def test_explicit_device_stop_requires_a_loop_in_the_whole_model():
     # A prefill-only worker still accepts a node whose loop runs elsewhere.
     walks = {"prefill": node, "decode": Loop(section=node, max_iters=8, outputs=[])}
     assert parse_step_repeats(config, {"n"}, walks=walks)["n"].device_stop == "skip"
+    # Chunked prefill is a scheduler-owned token Loop, not another requested
+    # device run. Use the same graph transformation as a served model.
+    model = SimpleNamespace(get_chunking_policies=lambda: {
+        "n": (ChunkingPolicy(walks=("prefill",), chunkable=True),),
+    })
+    walks = Model.apply_chunking(model, walks)
+    edges = walk_edges(walks, (("n", walk) for walk in walks))
+    repeats = StepRepeats(parse_step_repeats(config, {"n"}, walks=walks), edges)
+    assert set(repeats.device_stops()) == {("n", "decode")}
+    repeats.settle(lambda *key: None, lambda *key: None, {"device stop": lambda *key: None})
+    assert repeats.may_repeat("n", "decode") and not repeats.may_repeat("n", "prefill")
+    with pytest.raises(ValueError, match="device_stop.*Loop"):
+        parse_step_repeats(config, {"n"}, walks={"prefill": walks["prefill"]})
 
 
 def test_each_node_asks_for_its_own_repeats():
