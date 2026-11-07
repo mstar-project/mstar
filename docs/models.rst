@@ -61,6 +61,14 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
      - GLM-5.3-Flash (320B/18B): hybrid KDA linear-attention + MLA MoE causal
        LM, text in / text out, fp8 checkpoint, TP8. ``configs/glm5_next_tp8_mtp.yaml``
        drafts with MTP k=3 (greedy only).
+   * - ``kimi_k31`` / ``kimi_k3`` *(Beta)*
+     - ``moonshotai/Kimi-K3.1-Pro`` / ``moonshotai/Kimi-K3``
+     - Kimi K3.1 Pro and K3 (2.8T): 69 KDA linear-attention + 24 gated MLA layers on block
+       attention residuals, a 896-expert latent MoE with SiTU-GLU, text in / text out. K3.1's
+       MLA layers carry a DSA indexer: served within 2048 tokens (dense MLA is exact DSA there),
+       or past it with ``model_kwargs.dsa_long_context`` (eager, decode-only past 2048). The
+       release's MXFP4 experts need the quantization API's ``mxfp4`` experts format. TP8 or EP8
+       experts on 8x B300.
    * - ``kokoro``
      - ``hexgrad/Kokoro-82M``
      - TTS (82M, not autoregressive): misaki G2P + PL-BERT prosody + iSTFTNet

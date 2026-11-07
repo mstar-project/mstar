@@ -1,0 +1,30 @@
+model: "kimi_k3"
+# Kimi K3 on 8x B300, tensor parallel, as kimi_k31_tp8.yaml: K3 has no indexer, so dense MLA
+# serves any length and the KV pool sets the bound. MXFP4 experts as stored (the quantization
+# API's mxfp4 format), ~195 GB/rank of weights.
+max_seq_len: 32768
+# One request per KDA slot below; decode steps take up to 64 rows (the default graph ladder's top).
+max_concurrent_requests: 64
+tp_allreduce: "flashinfer"
+tp_allreduce_max_kb: 32768
+tp_async_sched: true
+model_kwargs:
+  max_seq_len: 32768
+  kda_max_requests: 64
+resources:
+  kv_cache:
+    # 64 requests x 256 pages of 128 tokens + the sink, 24 layers x 576 bf16 = ~27.6 KB/token/rank
+    # (the latent is replicated): ~58 GB/rank. With ~195 GB of weights and 3.7 GB of KDA state,
+    # ~257 GB of 288; if a B300 boot runs short, 12289 pages (~43 GB) still holds any one
+    # request at 32K and the 64 at 24K on average.
+    max_num_pages: 16385
+    page_size: 128
+  kda_state:
+    # 64 requests plus the sink: 69 layers x 12 heads x 128 x 128 fp32 + the conv tails,
+    # ~56 MB/slot/rank, ~3.7 GB/rank.
+    max_slots: 65
+node_groups:
+  - node_names: [LLM]
+    ranks: [0, 1, 2, 3, 4, 5, 6, 7]
+    tp_size: 8
+    graph_walks: [prefill, decode]

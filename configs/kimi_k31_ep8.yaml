@@ -1,0 +1,24 @@
+model: "kimi_k31"
+# kimi_k31_tp8.yaml with the routed experts expert parallel: each rank holds 896 / 8 = 112
+# whole experts, every rank routes every token (rank 0's choice, broadcast) and one all-reduce
+# sums the latent. Attention, the dense layer and the shared experts stay tensor parallel.
+max_seq_len: 2048
+max_concurrent_requests: 64
+tp_allreduce: "flashinfer"
+tp_allreduce_max_kb: 32768
+tp_async_sched: true
+model_kwargs:
+  max_seq_len: 2048
+  kda_max_requests: 64
+  moe_expert_parallel: true
+resources:
+  kv_cache:
+    max_num_pages: 1025
+    page_size: 128
+  kda_state:
+    max_slots: 65
+node_groups:
+  - node_names: [LLM]
+    ranks: [0, 1, 2, 3, 4, 5, 6, 7]
+    tp_size: 8
+    graph_walks: [prefill, decode]

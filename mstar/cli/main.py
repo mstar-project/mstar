@@ -80,6 +80,8 @@ DEFAULT_CONFIGS: dict[str, str] = {
     "z_image_turbo": "z_image_turbo.yaml",
     "glm52": "glm52_tp8.yaml",
     "glm5_next": "glm5_next_tp8.yaml",
+    "kimi_k3": "kimi_k3_tp8.yaml",
+    "kimi_k31": "kimi_k31_tp8.yaml",
 }
 
 # qwen 3.5 series (dense)
