@@ -100,7 +100,7 @@ def test_save_base64_audio_accepts_unpadded(raw, tmp_path):
         assert f.read() == raw
 
 
-@pytest.mark.parametrize("raw", [b"R", b"RI", b"RIFFfake"])
+@pytest.mark.parametrize("raw", [b"R", b"RI", b"RIFFfake", b"R" * 49153])
 @pytest.mark.parametrize("padded", [True, False])
 @pytest.mark.parametrize("wrap", [0, 4, 76])
 @pytest.mark.parametrize("trailing", ["", "\n", "\r\n"])
@@ -173,3 +173,10 @@ def test_non_media_data_url_is_refused_without_saving(tmp_path):
     with pytest.raises(ValueError, match="media"):
         media_io.save_data_url("data:text/plain;base64,YQ==", tmp_path)
     assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("payload", ["A" * 65535 + "?", "A" * 65534 + "==AAAA", "A" * 65533 + "==="])
+def test_base64_refuses_invalid_data_across_decode_chunks(payload, tmp_path):
+    with pytest.raises(ValueError):
+        media_io.save_base64(payload, "wav", "audio", tmp_path)
+    assert not list(tmp_path.iterdir())

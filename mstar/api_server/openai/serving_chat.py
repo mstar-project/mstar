@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import base64
 
+import anyio
 from fastapi import HTTPException
 
 from mstar.api_server import media_io
@@ -21,7 +22,9 @@ from mstar.utils.utf8_stream import Utf8Stream
 
 async def create_chat_completion(api, model_name, adapter, req, raw_request=None):
     """The response dict, or for ``req.stream`` the SSE response itself."""
-    args = adapter.chat_to_request(req, api.upload_dir)
+    # Adapters decode and write attachments. Keep that work off the loop
+    # serving other requests' token streams; do not abandon the worker on cancellation.
+    args = await anyio.to_thread.run_sync(adapter.chat_to_request, req, api.upload_dir)
     request_id = rid("chatcmpl")
     sample_rate = api.model.get_output_sample_rate("audio") if api.model is not None else 24000
 

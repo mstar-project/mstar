@@ -967,3 +967,33 @@ def test_video_stream_refusal_keeps_http_error_status(client_and_stub):
     })
     assert response.status_code == 400
     assert "multiple frames" in response.json()["error"]["message"]
+
+
+def test_chat_attachment_write_does_not_block_other_loop_work(monkeypatch):
+    import threading
+
+    from mstar.api_server import media_io
+    from mstar.api_server.openai.adapters import BagelAdapter
+    from mstar.api_server.openai.protocol import ChatCompletionRequest
+    from mstar.api_server.openai.serving_chat import create_chat_completion
+
+    async def serve():
+        loop = asyncio.get_running_loop()
+        progressed = threading.Event()
+        save = media_io.save_upload
+
+        def write(*args, **kwargs):
+            loop.call_soon_threadsafe(progressed.set)
+            assert progressed.wait(1), "attachment write blocked the event loop"
+            return save(*args, **kwargs)
+
+        monkeypatch.setattr(media_io, "save_upload", write)
+        api = _StubAPI()
+        req = ChatCompletionRequest(messages=[{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,YQ=="}},
+        ]}])
+        response = await create_chat_completion(api, "bagel", BagelAdapter(), req)
+        assert response["choices"][0]["finish_reason"] == "stop"
+        assert api.last_submit["input_modalities"] == ["image"]
+
+    asyncio.run(serve())

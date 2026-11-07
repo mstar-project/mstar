@@ -129,7 +129,7 @@ def _ext_for(mime: str, fallback: str = ".bin") -> str:
 # Inbound: persist request media into upload_dir, return (modality, path)
 # ---------------------------------------------------------------------------
 
-def save_upload(raw: bytes, filename: str, upload_dir: Path) -> str:
+def save_upload(raw: bytes | bytearray, filename: str, upload_dir: Path) -> str:
     """Save a client upload with a bounded basename; remove a partial write on failure.
 
     Use string paths for request-specific names: Python 3.12's pathlib interns
@@ -150,29 +150,45 @@ def save_upload(raw: bytes, filename: str, upload_dir: Path) -> str:
     return path
 
 
-def _save_bytes(raw: bytes, mime: str, upload_dir: Path) -> tuple[str, str]:
+def _save_bytes(raw: bytes | bytearray, mime: str, upload_dir: Path) -> tuple[str, str]:
     return modality_from_mime(mime), save_upload(raw, "upload" + _ext_for(mime), upload_dir)
 
 
-def _decode_base64_payload(payload: str) -> bytes:
-    """Decode client-provided base64 after normalizing common wire variants."""
-    # OpenAI-compatible clients may omit padding or wrap the payload at a
-    # fixed column width. Normalize both forms before asking the decoder to
-    # validate the alphabet, so malformed requests fail as client errors.
-    cleaned = "".join(payload.split())
-    padded = cleaned + "=" * (-len(cleaned) % 4)
-    return base64.b64decode(padded, validate=True)
+def _decode_base64_payload(payload: str, start: int = 0) -> bytearray:
+    """Decode wrapped/unpadded base64 in bounded calls that release the GIL
+    between chunks when intake runs in a worker thread."""
+    decoded = bytearray()
+    pending = ""
+    padded = False
+    for offset in range(start, len(payload), 65536):
+        pending += "".join(payload[offset:offset + 65536].split())
+        if padded:
+            if len(pending) > 4:
+                raise ValueError("Excess data after base64 padding")
+            continue
+        pad = pending.find("=")
+        end = (pad if pad >= 0 else len(pending)) // 4 * 4
+        if end:
+            decoded.extend(base64.b64decode(pending[:end], validate=True))
+        pending = pending[end:]
+        padded = pad >= 0
+        if padded and len(pending) > 4:
+            raise ValueError("Excess data after base64 padding")
+    if pending:
+        decoded.extend(base64.b64decode(pending + "=" * (-len(pending) % 4), validate=True))
+    return decoded
 
 
 def save_data_url(data_url: str, upload_dir: Path) -> tuple[str, str]:
     """Persist a ``data:<mime>;base64,<payload>`` URL. Returns (modality, path)."""
-    header, _, payload = data_url.partition(",")
-    if not payload:
+    comma = data_url.find(",")
+    if comma < 0 or comma + 1 == len(data_url):
         raise ValueError("Malformed data URL: missing payload")
+    header = data_url[:comma]
     mime = header[len("data:"):].split(";", 1)[0] or "application/octet-stream"
     if modality_from_mime(mime) == "unknown":
         raise ValueError("data URL must contain image, audio or video media")
-    raw = _decode_base64_payload(payload)
+    raw = _decode_base64_payload(data_url, start=comma + 1)
     return _save_bytes(raw, mime, upload_dir)
 
 

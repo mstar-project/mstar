@@ -2118,7 +2118,7 @@ def _decode_ws_files(
                 data = media_io._decode_base64_payload(data)
             if not isinstance(data, (bytes, bytearray)):
                 raise ValueError(f"file {name!r} carries no data")
-            save_path = media_io.save_upload(bytes(data), name, upload_dir)
+            save_path = media_io.save_upload(data, name, upload_dir)
             saved.append(save_path)
             paths = file_paths.setdefault(modality, [])
             parts.append(PromptPart(modality=modality, index=len(paths)))
