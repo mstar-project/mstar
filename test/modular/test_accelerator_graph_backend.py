@@ -345,48 +345,68 @@ def test_chatterbox_shape_graphs_keep_results_across_replays(graph_device):
     torch.testing.assert_close(third.cpu(), (host_source + 20) * 2 + 1)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="real CUDA graph composition")
-def test_composed_cuda_captures_keep_each_round_and_reuse_both_slots(monkeypatch):
-    """Two slots, three A→B rounds, strided output columns, one launch per unit."""
-    device = torch.device("cuda")
-    backend = get_accelerator_graph_backend(device)
+@pytest.mark.parametrize("device_name", ["cpu", "cuda"])
+def test_composed_cuda_captures_keep_each_round_and_reuse_both_slots(monkeypatch, device_name):
+    """Per-member outputs, parallel carries and varying tails use bounded slot buffers."""
+    from mstar.engine.accelerator_graph_runner import AcceleratorGraphRunner, AcceleratorGraphSlot, RunPart
+    from mstar.model.submodule_base import BatchedModelOutput
+
+    if device_name == "cuda" and not torch.cuda.is_available():
+        pytest.skip("real CUDA graph composition")
+    device = torch.device(device_name)
+    backend = None if device_name == "cpu" else get_accelerator_graph_backend(device)
+    runner = AcceleratorGraphRunner.__new__(AcceleratorGraphRunner)
+    runner._device, runner._graph_backend = device, backend
+
+    def capture(fn):
+        if backend is not None:
+            return capture_into_graph(fn, backend.graph_pool_handle(), device, None, keep_graph=True)
+        value = fn()
+        return SimpleNamespace(replay=lambda: value.copy_(fn())), value
+
     slots = []
     for _ in range(2):
         x = torch.zeros(3, device=device)
-        b_input = torch.zeros_like(x)
-        graph_a, a = capture_into_graph(lambda x=x: x + 1, backend.graph_pool_handle(), device, None, keep_graph=True)
-        graph_b, b = capture_into_graph(
-            lambda b_input=b_input: b_input * 2, backend.graph_pool_handle(), device, None, keep_graph=True,
-        )
-        columns = torch.empty(3, 3, device=device)
-        ops = []
-        for i in range(3):
-            ops.extend([graph_a, (b_input, a), graph_b, (columns[:, i], b)])
-            if i != 2:
-                ops.append((x, b))
-        slots.append((x, columns, backend.compose(ops)))
+        z, delta, b_input = (torch.zeros_like(x) for _ in range(3))
+        graph_a, a = capture(lambda x=x, z=z, delta=delta: x + z + delta)
+        graph_b, b = capture(lambda b_input=b_input: b_input * 2)
+        def slot(graph, output):
+            return AcceleratorGraphSlot(graph, {}, (), BatchedModelOutput(row_outputs={"value": output}), [], {}, 0)
+        slots.append((x, z, delta, b_input, slot(graph_a, a), slot(graph_b, b), a, b))
     launches = []
-    runtime = backend.while_runtime()
-    launch = runtime.launch
-
-    def counted_launch(*args):
-        launches.append(args[0])
-        return launch(*args)
-
-    monkeypatch.setattr(runtime, "launch", counted_launch)
-    retained, expected = [], []
-    for wave in range(2):
-        for slot, (x, columns, graph) in enumerate(slots):
-            value = torch.arange(3, device=device, dtype=torch.float32) + 10 * wave + slot
-            x.copy_(value)
-            graph.replay()
-            retained.append(columns.clone())
-            want = []
-            for _ in range(3):
-                value = (value + 1) * 2
-                want.append(value)
-            expected.append(torch.stack(want, dim=1))
-    backend.synchronize()
-    assert len(launches) == 4 and launches[0:2] == launches[2:4]
+    if backend is not None:
+        runtime = backend.while_runtime()
+        launch = runtime.launch
+        def counted_launch(*args):
+            launches.append(args[0])
+            return launch(*args)
+        monkeypatch.setattr(runtime, "launch", counted_launch)
+    storage_addresses, retained, expected = {}, [], []
+    for wave, width in enumerate((3, 3, 1, 3)):
+        for index, (x, z, delta, b_input, a_slot, b_slot, a, b) in enumerate(slots):
+            initial = torch.arange(3, device=device, dtype=torch.float32) + 10 * wave + index
+            x.copy_(initial)
+            z.fill_(2)
+            values = torch.arange(3, device=device, dtype=torch.float32).expand(3, 3).clone() + wave
+            outputs = runner.launch_parts(
+                [RunPart(a_slot, [], [(values, delta)]), RunPart(b_slot, [(a, b_input)], [])],
+                width, [("value",), ("value",)], capacity=3, boundary=[(b, x), (x, z)],
+            )
+            addresses = tuple(t.data_ptr() for t in a_slot.composed_buffers)
+            assert storage_addresses.setdefault(index, addresses) == addresses
+            retained.append([out.row_outputs["value"].clone() for out in outputs])
+            want_a, want_b = [], []
+            previous, other = initial, torch.full_like(initial, 2)
+            for iteration in range(width):
+                value_a = previous + other + values[:, iteration]
+                value_b = value_a * 2
+                want_a.append(value_a)
+                want_b.append(value_b)
+                previous, other = value_b, previous
+            expected.append([torch.stack(want_a, dim=1), torch.stack(want_b, dim=1)])
+    if backend is not None:
+        backend.synchronize()
+        assert len(launches) == 8 and launches[:2] == launches[2:4]
     for got, want in zip(retained, expected, strict=True):
-        torch.testing.assert_close(got, want)
+        for member_got, member_want in zip(got, want, strict=True):
+            torch.testing.assert_close(member_got, member_want)

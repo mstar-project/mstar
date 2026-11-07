@@ -731,6 +731,10 @@ class AcceleratorGraphSlot:
     # The latest compatible connected unit anchored on this leased slot.
     composed_key: tuple = ()
     composed_graph: CapturedGraph | None = None
+    # Bounded scratch for this slot: retained outputs, input columns and
+    # parallel-assignment snapshots. A tail run reuses the configured capacity.
+    composed_buffers_key: tuple = ()
+    composed_buffers: list[torch.Tensor] = field(default_factory=list)
 
 
 class RunPart(NamedTuple):
@@ -2038,16 +2042,85 @@ class AcceleratorGraphRunner:
             {key: wide[id(t)] for key, t in spans_out.items()},
         )
 
-    def launch_parts(self, parts: Sequence[RunPart]) -> None:
-        """Submit a connected unit as one graph, reusing this capture slot's bindings."""
+    def launch_parts(
+        self, parts: Sequence[RunPart], repeats: int = 1,
+        columns: Sequence[Collection[str]] = (), *, capacity: int | None = None,
+        boundary: Sequence[tuple[torch.Tensor, torch.Tensor]] = (),
+    ) -> list[BatchedModelOutput]:
+        """Replay a whole connected unit, retaining each member before the next.
+
+        ``boundary`` is simultaneous assignment between rounds. Its snapshots,
+        the input columns and retained outputs belong to the head capture slot;
+        changing a request's seed or a column's values does not recapture them.
+        The caller stages first-round seeds before entry. Group speculation is
+        disabled, and ordinary completion/output-copy ordering fences reuse.
+        """
+        capacity = repeats if capacity is None else capacity
+        if not parts or repeats < 1 or capacity < repeats or (columns and len(columns) != len(parts)):
+            raise ValueError("a connected run needs members, positive capacity and one column selection per member")
+        slot = parts[0].slot
+        # Describe storage independently of the active width. A different
+        # composition replaces this one slot's buffers rather than growing a cache.
+        needs, retained, staged = [], [], []
+        for part, names in zip(parts, columns or [()] * len(parts), strict=True):
+            raw = part.slot.static_outputs
+            buffers = raw.check_stop_buffers or {}
+            rows = {name: raw.row_outputs[name] for name in sorted(names)}
+            spans = {name: raw.output_spans[name] for name in sorted(names) if name in (raw.output_spans or {})}
+            unique = {id(t): t.reshape(t.shape[0], -1)[:, 0] for t in buffers.values()}
+            unique.update((id(t), t) for t in (*rows.values(), *spans.values()))
+            indices = {}
+            if capacity > 1:
+                for key, tensor in unique.items():
+                    indices[key] = len(needs)
+                    needs.append((tensor, (tensor.shape[0], capacity, *tensor.shape[1:])))
+            retained.append((buffers, rows, spans, unique, indices))
+            member_columns = []
+            for column, target in part.columns:
+                if column.shape[1] < repeats:
+                    raise ValueError("a connected input column is shorter than its run")
+                member_columns.append((column, target, len(needs)))
+                needs.append((column, (column.shape[0], capacity, *column.shape[2:])))
+            staged.append(member_columns)
+        snapshots = []
+        for source, target in boundary:
+            if source.numel() != target.numel():
+                raise ValueError("a connected boundary changes the number of elements")
+            snapshots.append((source, target, len(needs)))
+            needs.append((source, tuple(source.shape)))
+        storage_key = tuple((tensor.device, tensor.dtype, shape) for tensor, shape in needs)
+        if slot.composed_buffers_key != storage_key:
+            slot.composed_buffers = [tensor.new_empty(shape) for tensor, shape in needs]
+            slot.composed_buffers_key = storage_key
+        storage = slot.composed_buffers
+        outputs = []
+        for buffers, rows, spans, _, indices in retained:
+            def selected(values, indices=indices):
+                return {name: storage[indices[id(t)]][:, :repeats] if id(t) in indices else t
+                        for name, t in values.items()} or None
+            outputs.append(BatchedModelOutput(
+                check_stop_buffers=selected(buffers), row_outputs=selected(rows), output_spans=selected(spans),
+            ))
+        # Stage request-dependent columns before the composed launch. Captured
+        # operations refer only to the stable slot buffers.
+        for member_columns in staged:
+            for source, _, index in member_columns:
+                storage[index][:, :repeats].copy_(source[:, :repeats], non_blocking=True)
         ops: list[AcceleratorGraphSlot | tuple[torch.Tensor, torch.Tensor]] = []
-        for part in parts:
-            ops.extend((target, source.reshape(target.shape)) for source, target in part.copies)
-            ops.extend((target, column[:, 0].reshape(target.shape)) for column, target in part.columns)
-            ops.append(part.slot)
+        for iteration in range(repeats):
+            if iteration:
+                ops.extend((storage[index], source) for source, _, index in snapshots)
+                ops.extend((target, storage[index].reshape(target.shape)) for _, target, index in snapshots)
+            for member, part in enumerate(parts):
+                ops.extend((target, source.reshape(target.shape)) for source, target in part.copies)
+                ops.extend((target, storage[index][:, iteration].reshape(target.shape))
+                           for _, target, index in staged[member])
+                ops.append(part.slot)
+                _, _, _, unique, indices = retained[member]
+                ops.extend((storage[index][:, iteration], unique[key]) for key, index in indices.items())
         if self._device.type == "cpu":
             self._run(ops)
-            return
+            return outputs
         lowered, key = [], []
         for op in ops:
             if isinstance(op, tuple):
@@ -2059,12 +2132,12 @@ class AcceleratorGraphRunner:
             else:
                 lowered.append(op.graph)
                 key.append(id(op.graph))
-        slot = parts[0].slot
         signature = tuple(key)
         if slot.composed_graph is None or slot.composed_key != signature:
             graph = self._graph_backend.compose(lowered)
             slot.composed_graph, slot.composed_key = graph, signature
         slot.composed_graph.replay()
+        return outputs
 
     def captured_output(self, name: str) -> torch.Tensor | None:
         """A capture's static output ``name``, row i request i; None if no capture has one."""
