@@ -1084,7 +1084,7 @@ def test_postprocess_skips_a_rid_whose_forward_raised():
     batch = _exec_batch(["a", "b"])
     batch.register_failure("b", ValueError("forward failed for b"))
 
-    Engine._postprocess_batch(engine, batch, {"a": {"token": 1}, "b": {}})
+    Engine._postprocess_batch(engine, batch, BatchedModelOutput(per_rid_outputs={"a": {"token": 1}, "b": {}}))
 
     assert submodule.postprocessed == ["a"]
     assert batch.failed_requests == {"b": "ValueError: forward failed for b"}

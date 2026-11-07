@@ -29,7 +29,7 @@ from mstar.model.audio_watermark import (
     _watermark_precision,
     import_audioseal,
 )
-from mstar.model.submodule_base import NodeSubmodule
+from mstar.model.submodule_base import BatchedModelOutput, NodeSubmodule
 
 # -- config -------------------------------------------------------------------
 
@@ -132,7 +132,7 @@ def test_batch_tail_runs_once_on_the_requests_postprocess_kept():
     runners = {"watermark_1920": object()}
     engine = SimpleNamespace(_submodules={"Codec": SimpleNamespace(submodule=tail, piecewise_runners=runners)})
     batch = _batch(["a", "bad", "c"])
-    Engine._postprocess_batch(engine, batch, {"a": {}, "bad": {}, "c": {}})
+    Engine._postprocess_batch(engine, batch, BatchedModelOutput(per_rid_outputs={"a": {}, "bad": {}, "c": {}}))
     # the node's captured regions come along, as the forward gets them
     assert tail.calls == [(["a", "c"], ["in-a", "in-c"], runners)]
     assert set(batch.failed_requests) == {"bad"}
@@ -142,7 +142,7 @@ def test_batch_tail_failure_fails_its_requests_only():
     tail = _Tail(fail=True)
     engine = SimpleNamespace(_submodules={"Codec": SimpleNamespace(submodule=tail, piecewise_runners={})})
     batch = _batch(["a", "bad", "c"])
-    Engine._postprocess_batch(engine, batch, {})
+    Engine._postprocess_batch(engine, batch, BatchedModelOutput())
     assert set(batch.failed_requests) == {"a", "bad", "c"}
     assert "tail failed" in batch.failed_requests["a"]
 
