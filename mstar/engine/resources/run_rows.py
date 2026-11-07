@@ -108,6 +108,18 @@ class RunRowsSnapshot:
         self.owner.boundary(self.ids, self.bindings)
         torch.ne(self.ids, self._previous, out=self.changed)
 
+    def copy_from(self, accepted: RunRowsSnapshot) -> None:
+        """Install one parent's accepted view into another retained member.
+
+        Captured bodies keep their own fixed scratch addresses. Only the
+        parent accepts publication; every member consumes its same change mask.
+        """
+        if accepted.owner is not self.owner or accepted.ids.shape != self.ids.shape:
+            raise ValueError("captured members must share one membership owner and row capacity")
+        self.ids.copy_(accepted.ids)
+        self.bindings.copy_(accepted.bindings)
+        self.changed.copy_(accepted.changed)
+
     def retire(self, completed: torch.Tensor) -> None:
         self.owner.stop(self.ids, completed)
 

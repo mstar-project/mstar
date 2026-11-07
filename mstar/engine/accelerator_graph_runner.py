@@ -1449,7 +1449,7 @@ class AcceleratorGraphRunner:
         state = RunState(
             spec.bucket.bs, ask.token_signal, ask.stop_ids, self._device, dropping, stream,
             membership=None if ask.membership is None else RunRowsSnapshot(ask.membership, spec.bucket.bs),
-            width=ask.limit, independent_rows=ask.independent_rows,
+            width=ask.limit, independent_rows=ask.independent_rows, member=ask.member,
         )
         shapes = {name: value for name, value in warmed.static_inputs.items() if name in ask.iteration}
         window = None

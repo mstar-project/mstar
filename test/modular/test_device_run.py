@@ -98,7 +98,7 @@ class _Loop:
 
 def _runner(
     monkeypatch, loop, tokens, bs=2, limit=6, refill_at=None, carries=None, stream_tokens=False, counted=False,
-    progress=False, membership=None, unmanaged=False, ask=None, independent=False, owned=False,
+    progress=False, membership=None, unmanaged=False, ask=None, independent=False, owned=False, member=0,
 ):
     """A runner holding a captured run whose forward samples ``tokens[iteration]``."""
     monkeypatch.setattr(torch.accelerator, "is_available", lambda: False)
@@ -136,7 +136,7 @@ def _runner(
         runner.test_resource = torch.zeros(capacity + 1)
     runner.ask_run(WALK, ask or RunAsk(None if counted else "new_token", frozenset() if counted else frozenset({EOS}),
                                        False, limit, carries or {}, ("frame",), ("cond",),
-                                       refill_at, stream_tokens, layout, membership, independent))
+                                       refill_at, stream_tokens, layout, membership, independent, member))
     static = {"cond": torch.zeros(bs)}
     if membership is None or unmanaged:
         static["h"] = torch.zeros(bs)
@@ -1632,18 +1632,19 @@ def test_one_membership_snapshot_preserves_member_eos_until_the_whole_row_retire
         pytest.skip("CUDA shared membership snapshot")
     device = torch.device(device_name, 0) if device_name == "cuda" else CPU
     owner = RunRows(device, rows=2, capacity=4, binding_width=6)
-    snapshot, other = (RunRowsSnapshot(owner, 2) for _ in range(2))
+    snapshot, consumer_snapshot, other = (RunRowsSnapshot(owner, 2) for _ in range(3))
     members = [RunState(
         2, None, (99,), device,
         SimpleNamespace(rows=torch.zeros(2, dtype=torch.long, device=device),
                         slots=torch.zeros(2, dtype=torch.long, device=device)),
-        membership=snapshot, member=i, width=6, independent_rows=True,
-    ) for i in range(2)]
+        membership=member_snapshot, member=i, width=6, independent_rows=True,
+    ) for i, member_snapshot in enumerate((snapshot, consumer_snapshot))]
     for state in members:
         state.stage(2, [False, False], 6)
 
     def accept():
         snapshot.accept()
+        consumer_snapshot.copy_from(snapshot)
         for state in members:
             state.install_rows()
 
@@ -1796,22 +1797,28 @@ def test_a_joining_capture_refuses_an_unbound_owner_before_serving(monkeypatch):
     assert "context" in runner._run_failures[WALK]
 
 
-def test_captured_membership_uses_one_owner_snapshot_and_keeps_output_identity_through_eos_reuse(monkeypatch):
+@pytest.mark.parametrize("member", [0, 1])
+def test_captured_membership_uses_one_owner_snapshot_and_keeps_output_identity_through_eos_reuse(monkeypatch, member):
     from mstar.engine.resources.run_rows import RunRows
 
-    membership = RunRows(CPU, rows=3, capacity=4, binding_width=3)
+    membership = RunRows(CPU, rows=3, capacity=4, binding_width=6)
     _, refused, _, _ = _runner(monkeypatch, _Loop(), [[0, 0]], bs=2, limit=5,
                                progress=True, membership=membership, unmanaged=True)
     assert refused is None  # a live join must not inherit an incumbent's private static input
     loop = _Loop()
     runner, run, _, _ = _runner(monkeypatch, loop, [[0, 0]], bs=2, limit=5,
-                              progress=True, stream_tokens=True, membership=membership)
+                              progress=True, stream_tokens=True, membership=membership, member=member)
     assert run is not None
+    def binding(slot, immune):
+        parts = [(0, 0, 0), (0, 0, 0)]
+        parts[member] = (slot, immune, 5)
+        return (*parts[0], *parts[1])
+
     owner, lease, _ = run.test_inputs
     runner.test_resource.zero_()  # discard the warm-up forward's owner writes
     # The first physical row is empty. The other one keeps the run alive.
-    incumbent = membership.reserve_row(1, 1, 1, (1, 0, 5))
-    late = membership.reserve_row(2, 1, 0, (2, 0, 5))
+    incumbent = membership.reserve_row(1, 1, 1, binding(1, 0))
+    late = membership.reserve_row(2, 1, 0, binding(2, 0))
     membership.retain(late)  # its outputs survive replacement on the physical row
     membership.publish_row(incumbent)
     columns = IterationWindow(
@@ -1831,7 +1838,7 @@ def test_captured_membership_uses_one_owner_snapshot_and_keeps_output_identity_t
         if iteration == 3:
             membership.acknowledge(membership.control.tolist())
             assert not membership.release(late)
-            row = membership.reserve_row(3, 2, 0, (3, 1, 5))
+            row = membership.reserve_row(3, 2, 0, binding(3, 1))
             membership.publish_row(row)
             replacement.append(row)
 
@@ -1865,7 +1872,7 @@ def test_captured_membership_uses_one_owner_snapshot_and_keeps_output_identity_t
     # Such an iteration reads trash and never publishes an output identity.
     membership.drain()
     membership.acknowledge(membership.control.tolist())
-    stopped = membership.reserve_row(2, 1, 0, (2, 0, 5))
+    stopped = membership.reserve_row(2, 1, 0, binding(2, 0))
     membership.publish_row(stopped)
     run.state.stream.begin([])
     before = runner.test_resource[1:].clone()

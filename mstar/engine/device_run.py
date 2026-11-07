@@ -133,6 +133,8 @@ class RunAsk(NamedTuple):
     # Internal capture requirement, derived from independently ready graph rows.
     # No serving option: the Engine must prove the resource/output coverage.
     independent_rows: bool = False
+    # Canonical binding ordinal within the shared publication owner.
+    member: int = 0
 
 
 class IterationWindow(NamedTuple):
