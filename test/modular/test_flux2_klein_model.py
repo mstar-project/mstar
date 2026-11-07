@@ -764,6 +764,7 @@ def test_a_dropped_guidance_scale_is_always_reported(caplog):
 
 def test_truncated_reference_image_is_a_client_error(tmp_path):
     import io
+
     import numpy as np
     from PIL import Image
 
@@ -773,3 +774,9 @@ def test_truncated_reference_image_is_a_client_error(tmp_path):
     path.write_bytes(data.getvalue()[:200])
     with pytest.raises(ValueError, match="image"):
         _make_model().load_image(str(path), "cpu")
+
+
+@pytest.mark.parametrize("modality", ["audio", "video"])
+def test_unsupported_upload_is_not_silently_dropped(modality):
+    with pytest.raises(ValueError, match="input"):
+        _make_model().process_prompt("a cat", ["text", modality], ["image"])

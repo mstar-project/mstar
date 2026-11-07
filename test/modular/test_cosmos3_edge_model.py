@@ -161,7 +161,7 @@ def test_enable_reasoner_false_serves_generator_only(tmp_path) -> None:
 
 
 def test_edge_yaml_splits_worker_graphs(tmp_path) -> None:
-    model = _model(tmp_path)
+    model = _model(tmp_path, enable_windowed_video=True)
     graphs = model.get_worker_graphs(str(CONFIGS / "cosmos3_edge.yaml"))
     by_walk = {}
     for wg in graphs:
@@ -432,3 +432,12 @@ def test_forward_pass_args_type(tmp_path) -> None:
         "default", ["text"], ["text"], {"text_inputs": [object()], "position_ids": [object()]},
     )
     assert isinstance(fpa, ForwardPassArgs)
+
+
+@pytest.mark.parametrize("mode,outputs", [
+    (None, ["action"]), ("policy", ["video"]),
+    ("inverse_dynamics", ["video"]), ("forward_dynamics", ["action"]),
+])
+def test_action_mode_matches_output(tmp_path, mode, outputs):
+    with pytest.raises(ValueError, match="action_mode"):
+        _model(tmp_path)._resolve_gen_params({"action_mode": mode}, ["text"], outputs)

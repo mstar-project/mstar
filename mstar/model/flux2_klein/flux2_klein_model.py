@@ -342,6 +342,8 @@ class Flux2KleinModel(Model):
             raise ValueError(f"FLUX.2 klein only generates images; got output modality {output_modalities!r}")
         if prompt is None or not prompt.strip():
             raise ValueError("FLUX.2 klein requires a non-empty text prompt")
+        if set(input_modalities) - {"text", "image"}:
+            raise ValueError("FLUX.2 klein supports only text and image inputs")
         images = (tensors or {}).get(IMAGE_INPUTS) or []
         if "image" in input_modalities and not images:
             raise ValueError("request declared an image input but no image arrived; editing needs the reference image")

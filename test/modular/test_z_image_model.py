@@ -245,3 +245,9 @@ def test_fused_qk_norm_rope_matches_the_eager_modules():
             diff = (apply_rotary_complex(norm(x), freqs).float() - out.float()).abs()
             assert out.is_contiguous() and (diff > 0).float().mean() < 1e-4
             assert diff.max() <= 2 ** -6 * apply_rotary_complex(norm(x), freqs).float().abs().max()
+
+
+@pytest.mark.parametrize("modality", ["audio", "video"])
+def test_unsupported_upload_is_not_silently_dropped(modality):
+    with pytest.raises(ValueError, match="input"):
+        _make_model().process_prompt("a cat", ["text", modality], ["image"])

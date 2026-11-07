@@ -1073,12 +1073,17 @@ class Model(ABC):
     def load_video(self, filepath: str, device: str):
         from torchcodec.decoders import VideoDecoder
 
-        decoder = VideoDecoder(filepath, device=device, num_ffmpeg_threads=video_decode_threads())
         budget = VideoBudget()
         frames = []
-        for frame in decoder:
-            budget.add(*frame.shape[-2:])
-            frames.append(frame)
+        try:
+            decoder = VideoDecoder(filepath, device=device, num_ffmpeg_threads=video_decode_threads())
+            for frame in decoder:
+                budget.add(*frame.shape[-2:])
+                frames.append(frame)
+        except (RuntimeError, OSError) as exc:
+            raise ValueError("Unable to decode video upload") from exc
+        if not frames:
+            raise ValueError("video upload has no frames")
         video = torch.stack(frames)
         del frames
         video = video.float().div_(255.0)

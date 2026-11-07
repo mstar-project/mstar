@@ -754,3 +754,18 @@ def test_omni_audio_only_container_is_not_a_video(tmp_path, monkeypatch):
         f.writeframes(bytes(3200))
     with pytest.raises(ValueError, match="video"):
         read_video_whole_budgeted({"video": str(path)})
+
+
+@pytest.mark.parametrize("failure", ["open", "frames", "empty"])
+def test_base_video_decode_failure_is_a_client_error(monkeypatch, failure):
+    def decode(*args, **kwargs):
+        if failure == "open":
+            raise RuntimeError("invalid container")
+        def frames():
+            if failure == "frames":
+                yield torch.zeros(3, 8, 8, dtype=torch.uint8)
+                raise RuntimeError("truncated frame")
+        return frames()
+    monkeypatch.setitem(sys.modules, "torchcodec.decoders", types.SimpleNamespace(VideoDecoder=decode))
+    with pytest.raises(ValueError, match="video"):
+        Model.load_video(None, "bad.mp4", "cpu")

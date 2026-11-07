@@ -226,6 +226,8 @@ class ZImageModel(Model):
             raise ValueError("Z-Image requires a non-empty text prompt")
         if "image" in input_modalities:
             raise ValueError("Z-Image-Turbo is text-to-image only; reference images are not supported")
+        if set(input_modalities) - {"text"}:
+            raise ValueError("Z-Image-Turbo supports only text inputs")
         self._resolve_size(kwargs)
         self._resolve_steps(kwargs)
         image_output_format(kwargs)  # fail a bad output knob now, not after the denoise

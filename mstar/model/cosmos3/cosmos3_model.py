@@ -1286,6 +1286,12 @@ class Cosmos3Model(Model):
                     f"Unsupported Cosmos3 action_mode={mk.get('action_mode')!r}; "
                     f"expected one of {sorted(ACTION_MODES)}."
                 )
+        if "action" in (output_modalities or []) and action_mode is None:
+            raise ValueError("Cosmos3 action output requires action_mode")
+        if action_mode is not None:
+            expected = "video" if action_mode == ACTION_MODE_FORWARD_DYNAMICS else "action"
+            if (output_modalities or []) != [expected]:
+                raise ValueError(f"Cosmos3 action_mode={action_mode} requires {expected} output")
         if state_dim and action_mode != ACTION_MODE_POLICY:
             raise ValueError("Cosmos3 robot_state is the input of a policy request (action_mode=policy).")
 
