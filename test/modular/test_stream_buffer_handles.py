@@ -1076,7 +1076,7 @@ def test_extending_an_ingested_ring_edge_preserves_its_graph_reference_and_fallb
     def no_future_read(*args):
         pytest.fail("an unexecuted producer's ring must not be materialized on the host")
     monkeypatch.setattr(ring, "ring_read", no_future_read)
-    extended, snapshot = streams.extend_edge(RID, original, [2, 3], 3)
+    extended, snapshot = streams.reserve_connected_edge(RID, EDGE, [2, 3], 3, ingested=original)
     assert extended.uuids is original.uuids
     assert extended.chunk._replace(reservation=original.chunk.reservation) == original.chunk
     assert source.ingested_chunk is extended.chunk
@@ -1089,6 +1089,33 @@ def test_extending_an_ingested_ring_edge_preserves_its_graph_reference_and_fallb
     streams.settle_window(RID, restored, 1)
     assert not any(tm.tensor_store.check_uuid_presence(uuid) for uuid in original.uuids)
     assert source._consumed == 1 and ring.ring_room(EDGE, RID) == 5
+
+
+def test_a_waiting_connected_consumer_reserves_future_positions_without_fabricating_an_input(monkeypatch):
+    from mstar.engine.resources.loopback_rows import LoopbackRows
+
+    streams, tm, source = _window_consumer()
+    ring = LoopbackRows(torch.device("cpu"), capacity=1)
+    ring.ask_ring(EDGE, 8)
+    ring.ring_table(EDGE, torch.zeros(1, 1, dtype=torch.long))
+    ring.add(RID)
+    streams.rings[EDGE] = ring
+    assert ring.ring_reserve(EDGE, [RID], 2) == [0]
+    monkeypatch.setattr(ring, "ring_read", lambda *a: pytest.fail("unproduced input was materialized"))
+    receipt, snapshot = streams.reserve_connected_edge(RID, EDGE, [0, 1], 2)
+    assert receipt.uuids == [] and source.ingested_chunk is None
+    assert snapshot.data == {"data": [0, 1]} and not source.has_chunk_ready()
+    assert streams.restore_edge(RID, receipt) is None
+    assert not source._reservations and source._consumed == source._executed_chunks == 0
+    receipt, snapshot = streams.reserve_connected_edge(RID, EDGE, [0, 1], 2)
+    ring.ring_write(EDGE, [RID], torch.tensor([[[10], [11]]]), [0])
+    streams.push_positions(RID, EDGE, [0, 1], None)
+    choices = {(parent, end, done): index for parent, end, done, index in snapshot.reservation.decisions}
+    first = choices[-1, 1, False]
+    second = choices[first, 2, False]
+    streams.settle_window(RID, receipt, 2, final_transition=second)
+    assert source._consumed == source._executed_chunks == 2
+    assert ring.ring_room(EDGE, RID) == 8 and not source._reservations
 
 
 def test_a_full_producer_reservation_can_still_drain_consumers_and_preview_is_bounded():

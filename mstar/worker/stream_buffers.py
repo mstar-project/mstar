@@ -283,37 +283,47 @@ class StreamBufferManager:
             return None
         return self._chunk_edge(chunk, edge_name, self.consumer_node.get(edge_name, ""), request_id)
 
-    def extend_edge(
-        self, request_id: int, edge: StreamingEdge, future_positions: Sequence[int], bound: int,
-        consumer_walk: str | None = None,
+    def reserve_connected_edge(
+        self, request_id: int, edge_name: str, future_positions: Sequence[int], bound: int,
+        consumer_walk: str | None = None, *, ingested: StreamingEdge | None = None,
     ) -> tuple[StreamingEdge, StreamChunk] | None:
-        """Under an unsubmitted unit claim, extend its ingested retained reader.
+        """Under a unit claim, retain a new future reader or extend its ingested one.
 
-        Keep the graph's exact UUIDs and first-chunk metadata. Future payloads
-        are bound directly to the ring; they must not be read or minted as
-        tensors before the producer runs. No reference count changes here.
+        An existing reader keeps its exact UUIDs and frozen first chunk. A
+        waiting consumer gets only a semantic receipt: future payloads bind
+        directly to the ring, without reading or minting graph input tensors.
         """
-        if edge.name not in self.rings or edge.chunk.reservation is None:
+        req_info = self._request_state.per_request_info.get(request_id)
+        sbuf = None if req_info is None else req_info.stream_buffers.get(edge_name)
+        consumer = self.consumer_node.get(edge_name)
+        if sbuf is None or edge_name not in self.rings or consumer is None:
             return None
-        sbuf = self._window_buffer(request_id, edge)
-        if (sbuf.ingested_chunk is None or sbuf.ingested_chunk.reservation is not edge.chunk.reservation
-                or self.consumer_node.get(edge.name) != edge.next_node):
+        adopt = None if ingested is None else ingested.chunk.reservation
+        if ingested is not None and (
+            adopt is None or ingested.name != edge_name or ingested.next_node != consumer
+            or sbuf.ingested_chunk is None or sbuf.ingested_chunk.reservation is not adopt
+        ):
             return None
-        snapshot = sbuf.reserve_future_window(future_positions, bound, consumer_walk, adopt=edge.chunk.reservation)
+        snapshot = sbuf.reserve_future_window(future_positions, bound, consumer_walk, adopt=adopt)
         if snapshot is None:
             return None
-        extended = edge._replace(chunk=edge.chunk._replace(reservation=snapshot.reservation))
-        self.mark_ingested(request_id, extended)
-        return extended, snapshot
+        if ingested is None:
+            receipt = StreamingEdge(edge_name, consumer, [], snapshot.info)
+        else:
+            receipt = ingested._replace(chunk=ingested.chunk._replace(reservation=snapshot.reservation))
+            self.mark_ingested(request_id, receipt)
+        return receipt, snapshot
 
-    def restore_edge(self, request_id: int, edge: StreamingEdge) -> StreamingEdge:
-        """Undo an unsubmitted extension while the graph still holds its reader."""
+    def restore_edge(self, request_id: int, edge: StreamingEdge) -> StreamingEdge | None:
+        """Cancel a connected reader; restore its ordinary edge if one was ingested."""
         sbuf = self._window_buffer(request_id, edge)
         reservation = edge.chunk.reservation
-        if reservation.replaced is None:
-            raise ValueError("only an extended ingested reader can be restored")
-        original = edge._replace(chunk=edge.chunk._replace(reservation=reservation.replaced[0]))
+        if not reservation.decisions:
+            raise ValueError("only a connected future reader can be restored")
         sbuf.cancel_window(reservation)
+        if reservation.replaced is None:
+            return None
+        original = edge._replace(chunk=edge.chunk._replace(reservation=reservation.replaced[0]))
         self.mark_ingested(request_id, original)
         return original
 
