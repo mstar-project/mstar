@@ -269,8 +269,9 @@ def test_yaml_overrides_size_the_pool_and_refuse_nonsense():
                          config=RollingKVConfig(num_layers=1, num_heads=1, head_dim=1, pool_tokens=4))
     spec.apply_yaml_overrides(pool_tokens=64)
     assert spec.config.pool_tokens == 64
-    with pytest.raises(ValueError, match="pool_tokens"):
-        spec.apply_yaml_overrides(pool_tokens=0)
+    for bad in (0, -1, True, "64", 64.0):
+        with pytest.raises(ValueError, match="pool_tokens must be an integer >= 1"):
+            spec.apply_yaml_overrides(pool_tokens=bad)
     with pytest.raises(TypeError):
         spec.apply_yaml_overrides(max_slots=2)  # the store has no slots
 
