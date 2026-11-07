@@ -203,7 +203,8 @@ def test_repeat_plan_clamps_to_each_replays_actual_length(repeats):
         torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
 
 
-def test_resident_decode_captures_follow_replaced_rows_and_page_boundaries():
+@pytest.mark.parametrize("append", [0, 1])
+def test_resident_decode_captures_follow_replaced_rows_and_page_boundaries(append):
     width = 32
     rows = 2 * BS + 1
     cache = torch.randn((rows - 1) * width + 1, 2, PAGE, KV, HD, dtype=torch.bfloat16, device="cuda")
@@ -218,12 +219,12 @@ def test_resident_decode_captures_follow_replaced_rows_and_page_boundaries():
         captured.append(wrapper)
         wrapper.plan_resident(width)
         for _ in range(3):
-            wrapper.gather_resident(store.flatten(), slots, lengths, width, 0)
+            wrapper.gather_resident(store.flatten(), slots, lengths, width, 0, append=append)
             wrapper.run(query, cache)
         torch.cuda.synchronize()
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            wrapper.gather_resident(store.flatten(), slots, lengths, width, 0)
+            wrapper.gather_resident(store.flatten(), slots, lengths, width, 0, append=append)
             output = wrapper.run(query, cache)
         graphs.append(graph)
         outputs.append(output)
@@ -236,13 +237,20 @@ def test_resident_decode_captures_follow_replaced_rows_and_page_boundaries():
         host = torch.full((rows, width), cache.shape[0] + 99, dtype=torch.long)
         host[0].zero_()
         indices = []
-        for row, count in zip(owners, page_counts, strict=True):
-            pages = [0] if row == 0 else list(range((row - 1) * width + 1, (row - 1) * width + 1 + int(count)))
-            host[row, :count] = torch.tensor(pages)
+        for i, (row, count) in enumerate(zip(owners, page_counts, strict=True)):
+            empty = append == 0 and i == 0
+            pages = [0] if row == 0 or empty else list(
+                range((row - 1) * width + 1, (row - 1) * width + 1 + int(count)),
+            )
+            if not empty:
+                host[row, :count] = torch.tensor(pages)
             indices.extend(pages)
         store.copy_(host)
         slots.copy_(torch.tensor(owners))
-        lengths.copy_(torch.from_numpy(desired - 1))
+        stored = desired - append
+        if append == 0:
+            stored[0] = 0
+        lengths.copy_(torch.from_numpy(stored))
         for graph in graphs:
             graph.replay()
         oracle.plan(

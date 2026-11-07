@@ -790,7 +790,8 @@ class _TensorCoreDecode(FlashInferDecodeWrapper):
     lengths_move = True
 
 
-def test_resident_decode_grid_tracks_new_owners_and_discards_old_page_ids():
+@pytest.mark.parametrize("append", [0, 1])
+def test_resident_decode_grid_tracks_new_owners_and_discards_old_page_ids(append):
     # Fixed capture addresses, two queued windows, different resident owners.
     # Poison unused source columns so reading a prior tenant cannot look valid.
     store = torch.tensor([[0, 0, 0, 0], [11, 777, 777, 777],
@@ -803,14 +804,14 @@ def test_resident_decode_grid_tracks_new_owners_and_discards_old_page_ids():
         wrapper._paged_kv_last_page_len_buf = torch.zeros(2, dtype=torch.int32)
         wrappers.append(wrapper)
     for slots, lengths, expected in (
-        ([1, 2], [15, 16], [[11, 0, 0, 0], [21, 22, 0, 0]]),
-        ([0, 3], [0, 63], [[0, 0, 0, 0], [31, 32, 33, 34]]),
+        ([1, 2], [16 - append, 17 - append], [[11, 0, 0, 0], [21, 22, 0, 0]]),
+        ([1, 3], [0, 64 - append], [[11 if append else 0, 0, 0, 0], [31, 32, 33, 34]]),
     ):
         for wrapper in wrappers:
-            wrapper.gather_resident(store, torch.tensor(slots), torch.tensor(lengths), 4, 0)
+            wrapper.gather_resident(store, torch.tensor(slots), torch.tensor(lengths), 4, 0, append=append)
             assert wrapper._paged_kv_indices_buf.reshape(2, 4).tolist() == expected
             # FlashInfer reconstructs length from the fixed grid plus its tail.
-            assert (wrapper._paged_kv_last_page_len_buf + 48).tolist() == [n + 1 for n in lengths]
+            assert (wrapper._paged_kv_last_page_len_buf + 48).tolist() == [max(n + append, 1) for n in lengths]
 
 
 def _sampler(**attrs):
@@ -2093,6 +2094,7 @@ def test_joining_horizon_preserves_other_preplans_and_settles_both_receipts(monk
 
 @pytest.mark.parametrize("unsupported", [
     "recurrent", "host_writes", "foreign_segment", "iteration_inputs", "sampler", "span", "walk",
+    "missing", "duplicate",
 ])
 def test_joining_rejects_unaudited_owner_effects_before_reserving(unsupported):
     live = _resources(prefix_cache=False, recurrent_prefix_slots=1 if unsupported == "recurrent" else 0)
@@ -2106,7 +2108,8 @@ def test_joining_rejects_unaudited_owner_effects_before_reserving(unsupported):
     runner.ingest_request(1, {"kv": KVReqConfig()})
     _host_step(live, [1], [3])
     segments = (Segment(1, "main", 1),)
-    steps = {"kv": KVStep(segments=segments)}
+    steps = {"kv": KVStep(segments=segments), "rope": PositionStep(segments=segments),
+             "pool": RecurrentStep(segments=segments)}
     if unsupported == "recurrent":
         # A provisional first receipt ends at a page boundary and may snapshot
         # state. Repeat support alone cannot authorize this owner-only path.
@@ -2123,6 +2126,10 @@ def test_joining_rejects_unaudited_owner_effects_before_reserving(unsupported):
         steps["kv"] = KVStep(segments=(Segment(1, "main", 2),))
     elif unsupported == "walk":
         pass
+    elif unsupported == "missing":
+        steps["kv"] = KVStep(segments=())
+    elif unsupported == "duplicate":
+        steps["kv"] = KVStep(segments=segments * 2)
     else:
         steps["kv"] = KVStep(segments=(Segment(2, "main", 1),))
     step = SubmoduleStep(steps)
@@ -2624,11 +2631,11 @@ def test_a_follower_replaying_an_offload_gives_the_slot_up_too():
 
 # ---- two KV pools on a node ----
 
-def _pool(name: str, max_seq_len: int = 512, max_num_pages: int = 64) -> KVManager:
+def _pool(name: str, max_seq_len: int = 512, max_num_pages: int = 64, *, prefix_cache: bool = True) -> KVManager:
     kv = KVManager(
         cfg=PagedKVConfig(
             num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=max_seq_len,
-            max_num_pages=max_num_pages, page_size=PAGE,
+            max_num_pages=max_num_pages, page_size=PAGE, prefix_cache=prefix_cache,
         ),
         name=name, joint_comm_group=None, transfer_engine_info=None, device=CPU, dtype=torch.float32,
     )
@@ -2854,6 +2861,46 @@ def test_a_context_the_step_only_reads_never_advances():
     assert "ctx" in s.captured.block_tables and "kv" in s.captured.block_tables
 
 
+@pytest.mark.parametrize("actual", [0, 2])
+def test_a_joining_receipt_retains_its_readonly_context_when_it_ends_short(actual):
+    resources = {key: _pool(key, prefix_cache=False) for key in ("kv", "ctx")}
+    planner = ResidentPlanner("n", _walk("kv", "ctx", reads=("ctx",)), resources, CPU, max_bs=2)
+    runner = StepRunner(resources)
+    runner.ingest_request(1, {key: KVReqConfig() for key in resources})
+    prefill = SubmoduleStep({
+        "kv": KVStep(segments=(Segment(1, "main", 3),)),
+        "ctx": KVStep(segments=(Segment(1, "main", 16),)),
+    })
+    prefill.set_ctx(StepContext((1,), "prefill", 0, False))
+    assert runner.admit(prefill).ok
+    runner.plan(prefill)
+    runner.commit(prefill, track_rows=True)
+    context = resources["ctx"]._streams[1]["main"]
+    pages = tuple(context.page_indices)
+    joining = SubmoduleStep({
+        "kv": KVStep(segments=(Segment(1, "main", 1),)),
+        "ctx": KVStep(segments=(Segment(1, "main", 0),)),
+    })
+    ctx = StepContext((1,), WALK, 0, False, resident=planner, repeats=4)
+    joining.set_ctx(ctx)
+    assert runner.admit_rows(joining).ok
+    snapshot = planner.prepare_rows(joining, ctx)
+    planner.flush(snapshot)
+    runner.commit(joining, track_rows=True)
+    planner.advance(snapshot)
+    runner.settle_run(joining, {1: actual})
+    assert resources["kv"]._streams[1]["main"].stored_len == 3 + actual
+    assert context.stored_len == 16 and tuple(context.page_indices) == pages
+    slot = planner.slot_of(1)
+    assert resources["ctx"]._resident.host_len[slot] == 16
+    assert resources["ctx"]._resident.kv_len.view[slot, 0].item() == 16
+    planner.release(1)
+    assert planner._readers[slot] == 1 and slot not in planner._free
+    planner.unpin((slot,))
+    for owner in resources.values():
+        owner.assert_pages_conserved()
+
+
 @pytest.mark.parametrize("positions", ["kv", "ctx"])
 def test_positions_follow_the_pool_their_config_names(positions):
     """Two pools that both append, at different lengths: the position offset is
@@ -3025,10 +3072,11 @@ def test_cross_attention_over_its_own_context_pool_runs_on_the_planner():
 
     manager = FlashInferCrossManager.__new__(FlashInferCrossManager)
     manager._kv_cache_name, manager._query_kv_cache_name = "ctx", "kv"
+    manager._context_label = "context"
     assert manager.resident_binding().check_streams("x", {}) is None
     manager._query_kv_cache_name = "ctx"
     assert "second stream" in manager.resident_binding().check_streams("x", {})
-    step = SimpleNamespace(reads_tables=False, host_planned=False)
+    step = SimpleNamespace(reads_tables=False, host_planned=False, bucket=None, buffer_slot=0, streams={})
     manager.resident_binding().gather(step)
     assert step.host_planned and not step.reads_tables
 
@@ -4287,7 +4335,7 @@ def test_joining_checks_undeclared_capture_owners_before_declared_owner_reservat
 
     auxiliary.admit = auxiliary.rollback_admit = cannot_mutate
     planner.bindings["aux"] = replace(planner.bindings["aux"], check_horizon=check)
-    step = SubmoduleStep({"kv": KVStep(segments=(Segment(1, "main", 1),))})
+    step = SubmoduleStep({"kv": KVStep(segments=(Segment(1, "main", 1),))}, segments=[Segment(1, "main", 1)])
     step.set_ctx(StepContext((1,), WALK, 0, False, resident=planner, repeats=4))
     free = live["kv"]._arena.num_free
     if refuse:

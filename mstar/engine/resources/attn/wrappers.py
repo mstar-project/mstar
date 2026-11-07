@@ -637,6 +637,7 @@ class FlashInferDecodeWrapper:
 
     def gather_resident(
         self, store: torch.Tensor, slots: torch.Tensor, kv_len: torch.Tensor, stride: int, block_col: int,
+        *, append: int = 1,
     ) -> None:
         """Read this iteration's immutable membership and its owners' current KV."""
         width = self._resident_pages
@@ -647,15 +648,16 @@ class FlashInferDecodeWrapper:
             _gather_block_rows_kernel[(self.batch_size,)](
                 slots, kv_len, store, self._paged_kv_indices_buf, self._paged_kv_last_page_len_buf,
                 STRIDE=stride, BLOCK=block_col, PAGE=self.page_size, WIDTH=width,
-                TAIL_BASE=base, FULL_TABLE=True, num_warps=1,
+                TAIL_BASE=base, FULL_TABLE=True, APPEND=append, num_warps=1,
             )
         else:
-            lengths = kv_len + 1
+            stored = kv_len + append
+            lengths = stored.clamp_min(1)
             columns = torch.arange(width)
             pages = (lengths + self.page_size - 1) // self.page_size
             table = store.view(-1, stride)[slots, block_col:block_col + width]
             self._paged_kv_indices_buf[:self.batch_size * width].copy_(
-                torch.where(columns[None, :] < pages[:, None], table, 0).flatten(),
+                torch.where((columns[None, :] < pages[:, None]) & (stored[:, None] > 0), table, 0).flatten(),
             )
             self._paged_kv_last_page_len_buf.copy_(lengths - base)
 
@@ -767,16 +769,18 @@ def _gather_block_rows_kernel(
     slots_ptr, kv_len_ptr, store_ptr, table_ptr, lens_ptr,
     STRIDE: tl.constexpr, BLOCK: tl.constexpr, PAGE: tl.constexpr, WIDTH: tl.constexpr,
     TAIL_BASE: tl.constexpr = 0, FULL_TABLE: tl.constexpr = False,
+    APPEND: tl.constexpr = 1,
 ):
     i = tl.program_id(0)
-    n = tl.load(kv_len_ptr + i) + 1
+    stored = tl.load(kv_len_ptr + i) + APPEND
+    n = tl.maximum(stored, 1)
     tl.store(lens_ptr + i, (n - TAIL_BASE).to(tl.int32))
     row = tl.load(slots_ptr + i) * STRIDE + BLOCK
     pages = (n + PAGE - 1) // PAGE
     for start in tl.range(0, WIDTH if FULL_TABLE else pages, 32):
         cols = start + tl.arange(0, 32)
         keep = (cols < pages) & (cols < WIDTH) if FULL_TABLE else cols < pages
-        values = tl.load(store_ptr + row + cols, mask=keep, other=0)
+        values = tl.load(store_ptr + row + cols, mask=keep & (stored > 0), other=0)
         tl.store(table_ptr + i * WIDTH + cols, values.to(tl.int32), mask=cols < WIDTH if FULL_TABLE else keep)
 
 

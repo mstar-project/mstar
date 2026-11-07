@@ -39,7 +39,6 @@ from mstar.engine.resources.kv.plan import (
 from mstar.engine.resources.resident_hooks import (
     ResidentBinding,
     no_resident_effect,
-    unbound_horizon,
     unbounded_repeats,
 )
 from mstar.engine.resources.step import SlotLease, StepContext
@@ -119,6 +118,7 @@ class FlashInferCrossManager(CrossAttentionManager):
         self._kv_cache_name = kv_cache
         self._query_kv_cache_name = query_kv_cache
         self._decode_tensor_cores = decode_tensor_cores
+        self._joining_walks: set[str] = set()
         self._context_label = context_label
         self._device = device
         self._dtype = dtype
@@ -152,6 +152,10 @@ class FlashInferCrossManager(CrossAttentionManager):
         # so one plan serves every replay, whatever the kernel
         return None
 
+    def ask_repeats(self, walk: str, *, join_rows: bool = False) -> None:
+        if join_rows:
+            self._joining_walks.add(walk)
+
     def resident_binding(self) -> ResidentBinding:
         return ResidentBinding(
             check_streams=self._resident_refusal,
@@ -162,7 +166,7 @@ class FlashInferCrossManager(CrossAttentionManager):
             run_gather=no_resident_effect,
             commit_in_graph=no_resident_effect,
             advance=no_resident_effect,
-            check_horizon=unbound_horizon,
+            check_horizon=self._check_resident_horizon,
             max_repeats=unbounded_repeats,
             rewind_run=no_resident_effect,
         )
@@ -173,8 +177,45 @@ class FlashInferCrossManager(CrossAttentionManager):
         return None
 
     def _resident_gather(self, step: "CapturedResidentStep") -> None:
-        # the context pool's row is read only, and this plans its views on the host
-        step.host_planned = True
+        wrapper = self._resident_wrapper(step.bucket, step.buffer_slot, step.streams)
+        if wrapper is None:
+            step.host_planned = True
+            return
+        table = step.block_tables[self._kv_cache_name]
+        if table.width != wrapper._resident_pages:
+            raise ValueError("cross attention grid must match its context owner's table")
+        wrapper.gather_resident(
+            step.store, step.slots, step.buffers.kv_len[self._kv_cache_name], table.stride, table.col, append=0,
+        )
+        step.reads_tables = True
+
+    def _resident_wrapper(self, bucket, buffer_slot, streams) -> FlashInferDecodeWrapper | None:
+        context = streams.get(self._kv_cache_name)
+        if context is None or context.label != self._context_label or not context.reads:
+            return None
+        query = streams.get(self._query_kv_cache_name)
+        if self._query_kv_cache_name is not None and (query is None or query.reads):
+            return None
+        matches = [wrapper for key, wrapper in self._cg_plan_states.items()
+                   if key.bucket == bucket and key.slot == buffer_slot and (query is None or key.label == query.label)]
+        if len(matches) != 1:
+            return None
+        wrapper = matches[0]
+        pages = min(
+            (self._kv_config.max_seq_len + self._kv_config.tokens_per_page - 1) // self._kv_config.tokens_per_page,
+            self._kv_config.request_pages,
+        )
+        if (not isinstance(wrapper, FlashInferDecodeWrapper) or wrapper._resident_pages != pages
+                or wrapper.batch_size != bucket.bs):
+            return None
+        return wrapper
+
+    def _check_resident_horizon(self, step, ctx) -> None:
+        lease = ctx.slot_lease
+        if (lease is None or self._resident_wrapper(
+                lease.bucket, lease.buffer_slot, ctx.resident._walk_streams[ctx.graph_walk],
+        ) is None):
+            raise ValueError("cross attention must gather its context pages and lengths in this exact capture")
 
     def depends_on(self):
         # a query side with no cache contributes no dependency: its packing
@@ -226,16 +267,24 @@ class FlashInferCrossManager(CrossAttentionManager):
 
         plan_states.clear()
         packings = self._query_packings(step, ctx)
+        joining = lease is not None and lease.bucket.graph_walk in self._joining_walks
+        if joining and len(packings) != 1:
+            raise ValueError("joining cross attention needs one query label")
         laps.lap("packing")
         for plan_label, packing in packings.items():
             qo_indptr = tuple(packing.qo_indptr.tolist())
             num_rows = len(qo_indptr) - 1
             # every row queries one token (a span-0 row does not)
             decode = not ctx.force_prefill and qo_indptr == tuple(range(num_rows + 1))
+            if joining and (not decode or tuple(packing.request_ids) != tuple(ctx.padded_request_ids)):
+                raise ValueError("joining cross attention needs one ordered query token per request")
             state_key, wrapper = self._wrapper_for(
                 plan_label, lease, num_rows=num_rows, slot=ctx.slot, decode=decode,
             )
             request_ids = tuple(packing.request_ids)
+            if joining:
+                plan_states[plan_label] = wrapper
+                continue
             last = self._last_plans.get(state_key)
             if (
                 last is not None and last.context is context_out
@@ -461,7 +510,20 @@ class FlashInferCrossManager(CrossAttentionManager):
                 # built on first plan for the key; see FlashInferManager._cg_wrapper
                 workspace = self._workspaces.get(plan_label, lease.buffer_slot)
                 if decode:
-                    wrapper = self._decode_wrapper(workspace, batch_size=num_rows, accelerator_graph=True)
+                    joining = lease.bucket.graph_walk in self._joining_walks
+                    options = {}
+                    if joining:
+                        pages = min(
+                            (self._kv_config.max_seq_len + self._kv_config.tokens_per_page - 1)
+                            // self._kv_config.tokens_per_page,
+                            self._kv_config.request_pages,
+                        )
+                        options = {"max_num_pages": num_rows * pages, "use_tensor_cores": True}
+                    wrapper = self._decode_wrapper(
+                        workspace, batch_size=num_rows, accelerator_graph=True, **options,
+                    )
+                    if joining:
+                        wrapper.plan_resident(pages, self._dtype)
                 else:
                     wrapper = FlashInferPrefillWrapper(
                         workspace_buffer=workspace,
@@ -487,14 +549,9 @@ class FlashInferCrossManager(CrossAttentionManager):
         return key, wrapper
 
     def _decode_wrapper(self, workspace: Workspace, **kwargs) -> FlashInferDecodeWrapper:
-        kv = self._wrapper_kv_kwargs
         return FlashInferDecodeWrapper(
             workspace_buffer=workspace,
-            num_qo_heads=kv["num_qo_heads"], num_kv_heads=kv["num_kv_heads"],
-            head_dim=kv["head_dim"], page_size=kv["page_size"],
-            max_num_pages=kv["max_num_pages"], device=kv["device"], backend=kv["backend"],
-            use_tensor_cores=self._decode_tensor_cores,
-            **kwargs,
+            **{**self._wrapper_kv_kwargs, "use_tensor_cores": self._decode_tensor_cores, **kwargs},
         )
 
     def run(

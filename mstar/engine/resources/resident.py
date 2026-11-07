@@ -579,6 +579,10 @@ class ResidentPlanner:
             raise ValueError(f"walk {ctx.graph_walk!r} has no resident binding on {self.node}")
         if not rids or len(set(rids)) != len(rids) or any(rid < 0 for rid in rids):
             raise ValueError("resident row publication needs distinct real requests")
+        for key in streams:
+            actual = tuple(segment.request_id for segment in _segments(key, step) if segment.request_id >= 0)
+            if actual != rids:
+                raise ValueError(f"resident row publication needs one ordered segment per request on {key!r}")
         if (refusal := _row_refusal(step, streams, set(rids))) is not None:
             raise ValueError(f"resident walk {ctx.graph_walk!r} on {self.node}: {refusal}")
 
