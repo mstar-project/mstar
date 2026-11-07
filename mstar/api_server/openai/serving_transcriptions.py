@@ -54,7 +54,6 @@ import asyncio
 import math
 import os
 import threading
-import uuid
 import zlib
 from dataclasses import dataclass
 from pathlib import Path
@@ -106,16 +105,7 @@ def save_upload(audio_bytes: bytes, filename: str | None, upload_dir: Path) -> s
     embedded ``../`` cannot escape the directory; the extension is kept
     because the data worker's decoder sniffs the container by it.
     """
-    upload_dir = Path(upload_dir)
-    upload_dir.mkdir(parents=True, exist_ok=True)
-    base = os.path.basename(filename or "") or "audio.wav"
-    if len(base.encode("utf-8")) > 180:
-        ext = os.path.splitext(base)[1]
-        base = "audio" + (ext if len(ext.encode("utf-8")) <= 16 else ".bin")
-    path = os.path.join(upload_dir, f"{uuid.uuid4()}_{base}")
-    with open(path, "wb") as output:
-        output.write(audio_bytes)
-    return path
+    return media_io.save_upload(audio_bytes, filename or "audio.wav", upload_dir)
 
 
 def audio_duration_seconds(path: str) -> float | None:
@@ -268,11 +258,11 @@ class WindowPlanner:
         return self._audio
 
     def _write(self, piece, offset: float) -> Window:
-        stem = Path(self.audio_path).stem
-        path = media_io.write_wav(piece, str(self.upload_dir / f"{stem}_w{self._count:04d}.wav"), SAMPLE_RATE)
+        stem = os.path.splitext(os.path.basename(self.audio_path))[0]
+        path = media_io.write_wav(piece, os.path.join(self.upload_dir, f"{stem}_w{self._count:04d}.wav"), SAMPLE_RATE)
         with self._lock:
             if self._closed:
-                Path(path).unlink(missing_ok=True)
+                media_io.remove_uploads({"audio": [path]}, self.upload_dir)
                 raise RuntimeError("the request was closed while its upload was being cut")
             self.files.append(path)
         self._count += 1
@@ -283,7 +273,7 @@ class WindowPlanner:
             self._closed = True
             files, self.files = self.files, []
         for path in files:
-            Path(path).unlink(missing_ok=True)
+            media_io.remove_uploads({"audio": [path]}, self.upload_dir)
 
 
 def plan_windows(audio_path: str, max_seconds: float | None, upload_dir: Path) -> list[Window]:

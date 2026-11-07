@@ -329,14 +329,15 @@ def test_images(client_and_stub):
     assert base64.b64decode(body["data"][0]["b64_json"]) == png
 
 
-def test_images_edits(client_and_stub):
+@pytest.mark.parametrize("filename", ["in.png", "in." + "x" * 400])
+def test_images_edits(client_and_stub, filename):
     client, stub = client_and_stub
     stub.model_name = "bagel"
     edited = b"\x89PNGedited"
     stub.next_chunks = [_Chunk("image", edited)]
     resp = client.post(
         "/v1/images/edits",
-        files={"image": ("in.png", b"\x89PNGinput", "image/png")},
+        files={"image": (filename, b"\x89PNGinput", "image/png")},
         data={"prompt": "make it neon", "cfg_img_scale": "2.0", "cfg_interval": "[0.0, 1.0]"},
     )
     body = resp.json()

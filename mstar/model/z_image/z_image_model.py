@@ -190,8 +190,11 @@ class ZImageModel(Model):
         return enc["input_ids"][0].to(torch.long)
 
     def _resolve_size(self, model_kwargs: dict) -> tuple[int, int]:
-        height = int(model_kwargs.get("height", self.config.default_height))
-        width = int(model_kwargs.get("width", self.config.default_width))
+        try:
+            height = int(model_kwargs.get("height", self.config.default_height))
+            width = int(model_kwargs.get("width", self.config.default_width))
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError("Z-Image dimensions must be finite integers") from None
         align = self.config.spatial_alignment
         # the rotary table has one row per token along each image axis (axes 1 and 2)
         axes = self.config.transformer.axes_lens

@@ -131,12 +131,29 @@ def _ext_for(mime: str, fallback: str = ".bin") -> str:
 # Inbound: persist request media into upload_dir, return (modality, path)
 # ---------------------------------------------------------------------------
 
+def save_upload(raw: bytes, filename: str, upload_dir: Path) -> str:
+    """Save a client upload with a bounded basename; remove a partial write on failure.
+
+    Use string paths for request-specific names: Python 3.12's pathlib interns
+    their components for the lifetime of the process.
+    """
+    os.makedirs(upload_dir, exist_ok=True)
+    base = os.path.basename(filename) or "upload.bin"
+    if len(base.encode("utf-8")) > 180:
+        ext = os.path.splitext(base)[1]
+        base = "upload" + (ext if len(ext.encode("utf-8")) <= 16 else ".bin")
+    path = os.path.join(upload_dir, f"{uuid4()}_{base}")
+    try:
+        with open(path, "wb") as output:
+            output.write(raw)
+    except BaseException:
+        remove_uploads({"upload": [path]}, upload_dir)
+        raise
+    return path
+
+
 def _save_bytes(raw: bytes, mime: str, upload_dir: Path) -> tuple[str, str]:
-    upload_dir = Path(upload_dir)
-    upload_dir.mkdir(parents=True, exist_ok=True)
-    path = upload_dir / f"{uuid4()}{_ext_for(mime)}"
-    path.write_bytes(raw)
-    return modality_from_mime(mime), str(path)
+    return modality_from_mime(mime), save_upload(raw, "upload" + _ext_for(mime), upload_dir)
 
 
 def _decode_base64_payload(payload: str) -> bytes:
@@ -161,16 +178,10 @@ def save_data_url(data_url: str, upload_dir: Path) -> tuple[str, str]:
 
 def save_base64(b64: str, fmt: str, modality_hint: str, upload_dir: Path) -> tuple[str, str]:
     """Persist a bare base64 blob with a known ``fmt`` (e.g. ``"wav"``)."""
-    upload_dir = Path(upload_dir)
-    upload_dir.mkdir(parents=True, exist_ok=True)
     raw = _decode_base64_payload(b64)
-    # Sanitize the client-controlled fmt: alphanumerics only, so it cannot
-    # inject path separators into the upload path.
     clean = "".join(c for c in fmt.lstrip(".") if c.isalnum())
     ext = "." + clean if clean else ".bin"
-    path = upload_dir / f"{uuid4()}{ext}"
-    path.write_bytes(raw)
-    return modality_hint, str(path)
+    return modality_hint, save_upload(raw, "upload" + ext, upload_dir)
 
 
 # Telephone band, the lowest rate speech is recorded or coded at. A clip below it
@@ -243,10 +254,10 @@ def check_ref_audio(path: str, decoder: str) -> None:
             except Exception:  # noqa: BLE001 — not a libsndfile container; the loader tries FFmpeg
                 _check_ref_audio_torchcodec(path)
     except RefAudioTooLongError:
-        Path(path).unlink(missing_ok=True)
+        remove_uploads({"audio": [path]}, os.path.dirname(path))
         raise
     except Exception as exc:  # noqa: BLE001 — not loadable here, so the model cannot load it either
-        Path(path).unlink(missing_ok=True)
+        remove_uploads({"audio": [path]}, os.path.dirname(path))
         raise ValueError(
             f"ref_audio must be audio the model can decode, at {MIN_REF_AUDIO_SAMPLE_RATE} Hz or more"
         ) from exc
@@ -311,7 +322,7 @@ def save_remote_url(url: str, upload_dir: Path, timeout: float = 30.0) -> tuple[
         mime = resp.headers.get_content_type() if resp.headers else ""
     if not mime:
         # Infer from the URL path extension.
-        suffix = Path(urlparse(url).path).suffix.lower()
+        suffix = os.path.splitext(urlparse(url).path)[1].lower()
         rev = {v: k for k, v in _MIME_TO_EXT.items()}
         mime = rev.get(suffix, "application/octet-stream")
     return _save_bytes(raw, mime, upload_dir)
@@ -345,14 +356,13 @@ def remove_uploads(file_paths: dict[str, list[str]] | None, upload_dir: Path) ->
     """Delete a request's files under ``upload_dir`` now. A path elsewhere is
     left alone: no route puts one in ``file_paths`` today, and a file the
     server did not save is never the request's to delete."""
-    root = Path(upload_dir).resolve()
+    root = os.path.realpath(upload_dir)
     for paths in (file_paths or {}).values():
         for path in paths:
-            p = Path(path)
-            if not p.resolve().is_relative_to(root):
+            if os.path.commonpath((root, os.path.realpath(path))) != root:
                 continue
             try:
-                p.unlink(missing_ok=True)
+                os.unlink(path)
             except OSError:
                 pass
 
@@ -618,7 +628,8 @@ def write_wav(audio, path: str, sample_rate: int = 16000) -> str:
     sample."""
     scaled = np.rint(np.asarray(audio, dtype=np.float64) * 32768.0)
     pcm = np.clip(scaled, -32768, 32767).astype("<i2").tobytes()
-    Path(path).write_bytes(pcm16_to_wav_bytes(pcm, sample_rate))
+    with open(path, "wb") as output:
+        output.write(pcm16_to_wav_bytes(pcm, sample_rate))
     return path
 
 

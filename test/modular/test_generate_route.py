@@ -168,3 +168,15 @@ def test_a_refused_generate_leaves_no_upload_behind(monkeypatch, tmp_path, files
     assert (response.status_code, response.json()) == (400, {"detail": detail})
     assert server.streaming is None
     assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("name", ["x" * 300 + ".png", "é" * 200 + ".png"])
+def test_generate_long_upload_name(monkeypatch, tmp_path, name):
+    server = _UploadServer(tmp_path)
+    monkeypatch.setattr(entrypoint, "api_server", server)
+    response = TestClient(entrypoint.app).post(
+        "/generate", files=[("files", ("first.png", b"png")), ("files", (name, b"png"))],
+        data={"model_kwargs": "{"},
+    )
+    assert response.status_code == 400
+    assert list(tmp_path.iterdir()) == []

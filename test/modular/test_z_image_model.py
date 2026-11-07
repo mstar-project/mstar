@@ -159,6 +159,8 @@ def test_requests_above_max_image_area_are_rejected():
     small.set_config(ZImageConfig())
     with pytest.raises(ValueError, match="max_image_area"):
         small._resolve_size(dict(height=1024, width=1040))
+    with pytest.raises(ValueError, match="dimensions"):
+        model._resolve_size(dict(width=float("inf")))
     # a side past the rotary table (512 tokens of 16 px) indexed past its end, inside the area cap
     assert model._resolve_size(dict(height=16, width=8192)) == (16, 8192)
     with pytest.raises(ValueError, match="8192"):

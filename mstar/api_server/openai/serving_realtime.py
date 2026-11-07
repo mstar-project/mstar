@@ -68,11 +68,11 @@ import itertools
 import json
 import logging
 import math
+import os
 import re
 import reprlib
 import uuid
 from dataclasses import dataclass, field
-from pathlib import Path
 
 import numpy as np
 from fastapi import HTTPException, WebSocket, WebSocketDisconnect
@@ -457,7 +457,7 @@ async def _run_step(api, adapter, session: RealtimeSession, prefix: str) -> str:
     # id is still draining when the next step goes out
     request_id = rid(f"rt-{session.session_id}")
     path = media_io.write_wav(
-        session.audio_so_far(), str(Path(api.upload_dir) / f"{request_id}.wav"), SAMPLE_RATE,
+        session.audio_so_far(), os.path.join(api.upload_dir, f"{request_id}.wav"), SAMPLE_RATE,
     )
     try:
         args = adapter.realtime_step_request(session.request, path, prefix)
@@ -481,7 +481,7 @@ async def _run_step(api, adapter, session: RealtimeSession, prefix: str) -> str:
             # a request the engine failed: the status says whose fault it was
             raise StepError(str(exc.detail), exc.status_code) from exc
     finally:
-        Path(path).unlink(missing_ok=True)
+        media_io.remove_uploads({"audio": [path]}, api.upload_dir)
     text = decode_joined(c.data for c in chunks if c.modality == "text")
     errors = [c for c in chunks if c.modality == "error"]
     if errors:

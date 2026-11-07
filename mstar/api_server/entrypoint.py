@@ -2125,7 +2125,7 @@ def _decode_ws_files(
         raise ValueError("files must be a list of {name, data} objects")
     file_paths: dict[str, list[str]] = {}
     parts: list[PromptPart] = []
-    saved: list[Path] = []
+    saved: list[str] = []
     try:
         for entry in files or []:
             if not isinstance(entry, dict) or not isinstance(entry.get("name"), str):
@@ -2141,16 +2141,13 @@ def _decode_ws_files(
                 data = media_io._decode_base64_payload(data)
             if not isinstance(data, (bytes, bytearray)):
                 raise ValueError(f"file {name!r} carries no data")
-            base = os.path.basename(name) or "upload"
-            save_path = upload_dir / f"{uuid.uuid4()}_{base}"
-            save_path.write_bytes(bytes(data))
+            save_path = media_io.save_upload(bytes(data), name, upload_dir)
             saved.append(save_path)
             paths = file_paths.setdefault(modality, [])
             parts.append(PromptPart(modality=modality, index=len(paths)))
             paths.append(str(save_path))
     except Exception:
-        for path in saved:
-            path.unlink(missing_ok=True)
+        media_io.remove_uploads({"upload": saved}, upload_dir)
         raise
     return file_paths, parts
 
@@ -2677,27 +2674,24 @@ async def generate(
     # --- save uploaded files, grouped by modality ----------------
     file_paths: dict[str, list[str]] = {}
     parts: list[PromptPart] = []
-    if files:
-        for f in files:
+    try:
+        for f in files or []:
             modality = _detect_modality(f.filename or "")
             if modality == "unknown":
-                # a refused request is never submitted, so the deferred cleanup
-                # below never sees what it saved
-                _remove_uploads(file_paths)
                 raise HTTPException(
                     status_code=400,
                     detail=f"Cannot determine modality for file: {f.filename}",
                 )
-            # Sanitize: only the final path component of the client name;
-            # embedded separators (../) would escape upload_dir.
-            base = os.path.basename(f.filename or "") or "upload"
-            save_name = f"{uuid.uuid4()}_{base}"
-            save_path = api_server.upload_dir / save_name
             content = await f.read()
-            await run_in_threadpool(save_path.write_bytes, content)
+            save_path = await run_in_threadpool(
+                media_io.save_upload, content, f.filename or "upload", api_server.upload_dir,
+            )
             paths = file_paths.setdefault(modality, [])
             parts.append(PromptPart(modality=modality, index=len(paths)))
-            paths.append(str(save_path))
+            paths.append(save_path)
+    except BaseException:
+        _remove_uploads(file_paths)
+        raise
     if text:
         parts.append(PromptPart(modality="text", text=text))
 
