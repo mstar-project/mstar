@@ -405,9 +405,8 @@ class Qwen3_5DenseModel(MultimodalDecoderModel):
 
     def kv_layout(self, layout: dict, length: int, advance: int | None = None) -> dict:
         # an image spans max(h', w') MRoPE positions, not its t * h' * w' tokens
-        merge = self.vision_config.spatial_merge_size
         advance = length + sum(
-            vision_position_advance(torch.tensor(grid), merge) - tokens
+            vision_position_advance(torch.tensor(grid), self._merge()) - tokens
             for tokens, grid in zip(layout.get("tokens", ()), layout.get("grid", ()), strict=True)
         )
         return super().kv_layout(layout, length, advance)
