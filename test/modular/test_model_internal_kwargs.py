@@ -147,6 +147,14 @@ def test_a_clients_value_for_a_model_internal_key_never_reaches_the_model_or_con
     ({"layer_penalty_factor": "steep"}, "layer_penalty_factor"),
     # parsed at the conductor, where the raise hangs the client
     ({"num_step": "many"}, "num_step"),
+    ({"t_shift": -1}, "t_shift"),
+    ({"t_shift": 1e308}, "t_shift"),
+    ({"duration": 0}, "duration"),
+    ({"duration": -1}, "duration"),
+    ({"duration": 1e308}, "duration"),
+    ({"language": 5}, "language"),
+    ({"instruct": 5}, "instruct"),
+    ({"ref_text": 5}, "ref_text"),
 ])
 def test_omnivoice_refuses_a_bad_request_value_before_it_generates(kwargs, field):
     """``postprocess`` shapes the waveform after the whole unmask loop, which

@@ -123,7 +123,12 @@ def unmask_knobs(kwargs: dict, defaults) -> dict[str, float]:
     fails the request before it generates. A finite value extreme enough to
     overflow the reveal's scores is not caught here: MASK cells it leaves on the
     canvas fail the request in ``postprocess``, after the loop."""
-    return {key: _finite_number(key, kwargs.get(key, getattr(defaults, key))) for key in UNMASK_KNOBS}
+    knobs = {key: _finite_number(key, kwargs.get(key, getattr(defaults, key))) for key in UNMASK_KNOBS}
+    # The float32 ramp divides by 1 + (shift - 1) * t, including t=1.
+    limits = torch.finfo(torch.float32)
+    if not limits.eps <= knobs["t_shift"] <= limits.max:
+        raise ValueError("t_shift must produce a finite float32 timestep ramp")
+    return knobs
 
 
 class OmniVoiceModel(Model):
@@ -395,6 +400,17 @@ class OmniVoiceModel(Model):
         requested_num_step(kwargs, self.config.generation)
         unmask_knobs(kwargs, self.config.generation)
 
+        for key in ("language", "instruct", "ref_text"):
+            if kwargs.get(key) is not None and not isinstance(kwargs[key], str):
+                raise ValueError(f"{key} must be a string")
+        duration = kwargs.get("duration")
+        if duration is not None:
+            duration = _finite_number("duration", duration)
+            if not 0 < duration <= self.config.max_target_seconds:
+                raise ValueError(f"duration must be in (0, {self.config.max_target_seconds}] seconds")
+            if self.config.target_tokens_for_seconds(duration) < 1:
+                raise ValueError("duration must span at least one audio token")
+
         self._ensure_data_worker_assets()
 
         # The data worker keys loaded media by modality: an uploaded reference
@@ -431,9 +447,8 @@ class OmniVoiceModel(Model):
                 )
 
         speed = float(kwargs.get("speed") or 1.0)
-        duration = kwargs.get("duration")
         if duration is not None:
-            target_len = self.config.target_tokens_for_seconds(float(duration))
+            target_len = self.config.target_tokens_for_seconds(duration)
         else:
             target_len = self._estimate_target_tokens(
                 prompt, ref_text, num_ref_tokens, speed
