@@ -383,3 +383,21 @@ def test_connected_refuses_unstaged_captured_state_before_launch(unsupported):
     assert eng.exec_group(group) is None
     assert not group.submitted
     assert events == ["release:a"]
+
+
+@pytest.mark.parametrize("replacement", ["per_request", "unpacked"])
+def test_connected_preserves_ordinary_output_precedence(replacement, monkeypatch):
+    eng, group, events = _connected_engine()
+    mgmt = eng._submodules["a"]
+    slot = next(iter(mgmt.accelerator_graph_runner._buckets.values())).slots[0]
+    changed = {2: {"x": [torch.full((1, 2), 42.)]}}
+    if replacement == "per_request":
+        slot.static_outputs.per_rid_outputs = {slot.dummy_rids[0]: changed[2]}
+    else:
+        monkeypatch.setattr(type(mgmt.submodule), "unpack_packed_outputs", lambda *a, **kw: changed)
+    assert eng.exec_group(group) is None
+    assert not group.submitted and events == ["release:a"]
+    batch = group.members[0][1]
+    ordinary = eng._collect_step(batch, mgmt, batch.step_context.slot_lease, slot.static_outputs,
+                                 batch.inputs, batch.per_request_info_wrapped)
+    assert ordinary.per_rid_outputs[2]["x"][0].tolist() == [[42., 42.]]

@@ -2383,6 +2383,8 @@ class Engine:
                         if (maker_type.postprocess is not NodeSubmodule.postprocess
                                 or maker_type.batch_postprocess is not NodeSubmodule.batch_postprocess
                                 or maker_type.filter_batched_output is not NodeSubmodule.filter_batched_output
+                                or maker_type.unpack_packed_outputs is not NodeSubmodule.unpack_packed_outputs
+                                or maker_slot.static_outputs.per_rid_outputs
                                 or maker_mgmt.submodule.spanned_outputs(batch.graph_walk)
                                 or maker_mgmt.submodule.get_stop_policies(batch.graph_walk) is None):
                             guard.refuse("a producer changes its routed outputs outside capture")
