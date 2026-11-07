@@ -6,6 +6,8 @@ the retention rule: the stream's first ``sink`` tokens and its last ``window``,
 the step's included.
 """
 
+import logging
+import random
 from types import SimpleNamespace
 
 import pytest
@@ -167,7 +169,7 @@ def test_a_request_that_declared_nothing_fails_at_its_first_step():
     assert "RollingKVReqConfig" in outcome.reason.message and store.num_free_tokens() == 30
 
 
-def test_rearranging_joins_the_gaps_and_keeps_every_requests_tokens():
+def test_rearranging_joins_the_gaps_and_keeps_every_requests_tokens(caplog):
     """Free tokens split across two gaps: the regions slide left so a request that
     needs both fits, and the requests already there attend what they did."""
     store = _store(30)
@@ -179,8 +181,12 @@ def test_rearranging_joins_the_gaps_and_keeps_every_requests_tokens():
     store.remove_request(3)
     assert store._free == [(0, 10), (20, 10)]
     newcomer = _run(store, 4, [4] * 4, 2, 18, base=4000)  # 20 tokens: neither gap holds it
-    total, keys, _ = next(newcomer)
+    with caplog.at_level(logging.INFO, logger=manager_module.__name__):
+        total, keys, _ = next(newcomer)
     assert store._requests[2].offset == 0 and store._requests[4].offset == 10 and store._free == []
+    # serve_concurrent.py counts this line in the server log
+    assert [r.getMessage() for r in caplog.records] == [
+        "rolling KV rolling_kv: rearranged the pool, moving 1 regions (10 tokens a layer)"]
     assert keys == _expected(total, 2, 18, base=4000)
     for total, keys, _ in streams[2]:  # request 2 carries on from its moved region
         assert keys == _expected(total, 2, 8, base=2000)
@@ -226,6 +232,129 @@ def test_regions_that_slide_across_a_one_token_gap_keep_their_streams(monkeypatc
     for rid, stream in streams.items():
         for total, keys, _ in stream:
             assert keys == _expected(total, 2, 8, base=1000 * rid)
+
+
+@pytest.mark.parametrize("stage", [2, 8])
+def test_two_regions_with_a_gap_between_them_both_slide_and_keep_their_streams(monkeypatch, stage):
+    """[gap 1][A][gap 3][B][tail]: a newcomer that fits no gap makes A slide by 1 and
+    B by 4, onto tokens A held, while both are mid-stream. With a 2-token staging
+    block both move in place; with 8, A's short move is staged."""
+    monkeypatch.setattr(manager_module, "STAGE_TOKENS", stage)
+    store = _store(36)
+    store._stage.fill_(-7)
+    one = _run(store, 1, [1] * 3, 0, 1, base=1000)
+    a = _run(store, 2, [4] * 6, 2, 8, base=2000)
+    three = _run(store, 3, [3] * 3, 0, 3, base=3000)
+    b = _run(store, 4, [4] * 6, 2, 8, base=4000)
+    for stream in (one, a, three, b):
+        next(stream)  # opens them in this order: offsets 0, 1, 11, 14
+    for _ in range(2):  # A and B hold 12 tokens each: the sink and a full, shifted window
+        next(a), next(b)
+    store.remove_request(1)
+    store.remove_request(3)
+    assert store._free == [(0, 1), (11, 3), (24, 12)]
+    newcomer = _run(store, 5, [4] * 4, 2, 12, base=5000)  # 14 tokens: no gap holds it
+    total, keys, _ = next(newcomer)
+    assert [store._requests[r].offset for r in (2, 4, 5)] == [0, 10, 20] and store._free == [(34, 2)]
+    assert bool((store._stage != -7).any()) == (stage == 8)
+    assert keys == _expected(total, 2, 12, base=5000)
+    for rid, stream in ((2, a), (4, b)):
+        for total, keys, values in stream:
+            assert keys == values == _expected(total, 2, 8, base=1000 * rid)
+    for total, keys, _ in newcomer:
+        assert keys == _expected(total, 2, 12, base=5000)
+
+
+class _NoSelfOverlap:
+    """Stands in for the pool's word view in ``_move_left``: a copy within the pool
+    must read and write disjoint tokens, since a GPU copies them in parallel. (On
+    CPU, an overlapping copy to the left runs front to back and comes out right
+    anyway, so the streams alone would not show it.)"""
+
+    def __init__(self, words: torch.Tensor, counts: dict):
+        self.words, self.counts = words, counts
+
+    def _tokens(self, t: torch.Tensor) -> range | None:
+        if t.untyped_storage().data_ptr() != self.words.untyped_storage().data_ptr():
+            return None  # the staging block
+        start = (t.storage_offset() - self.words.storage_offset()) // self.words.stride(2)
+        return range(start, start + t.shape[2])
+
+    def __getitem__(self, key):
+        return self.words[key]
+
+    def __setitem__(self, key, value):
+        src, dst = self._tokens(value), self._tokens(self.words[key])
+        if src is None:
+            self.counts["staged"] += 1
+        else:
+            assert src.stop <= dst.start or dst.stop <= src.start, f"a copy reads and writes {src} -> {dst}"
+        self.words[key] = value
+
+
+def _random_workload(rng: random.Random, counts: dict) -> None:
+    """Requests of random sizes open, step (up to three in one step) and end, in
+    random order; every step's rows must attend exactly their retention."""
+    store = _store(rng.randint(12, 64))
+    store._words = _NoSelfOverlap(store._words, counts)
+    rearrange = store._rearrange
+
+    def counted_rearrange():
+        counts["rearranges"] += 1
+        rearrange()
+
+    store._rearrange = counted_rearrange
+    reqs, waiting, running = {}, [], []
+    for _ in range(rng.randint(30, 150)):
+        r = rng.random()
+        if r < 0.25:
+            rid = len(reqs) + 1
+            sink = rng.randint(0, 4)
+            reqs[rid] = SimpleNamespace(sink=sink, window=rng.randint(1, min(15, store.config.pool_tokens - sink)),
+                                        written=0)
+            store.ingest_request(rid, RollingKVReqConfig(tokens=sink + reqs[rid].window))
+            waiting.append(rid)
+        elif r < 0.35 and (running or waiting):
+            gone = rng.choice(running + waiting)
+            store.remove_request(gone)
+            (running if gone in running else waiting).remove(gone)
+        while waiting and store.reserve(waiting[0], "dit", "rollout", None) is None:  # arrival order
+            running.append(waiting.pop(0))
+        if not running:
+            continue
+        rows = rng.sample(running, rng.randint(1, min(3, len(running))))
+        spans = [rng.randint(1, reqs[rid].window) for rid in rows]
+        step = RollingKVStep(
+            segments=tuple(Segment(rid, "main", span) for rid, span in zip(rows, spans, strict=True)),
+            positions={rid: RollingPosition(reqs[rid].written, reqs[rid].sink, reqs[rid].window) for rid in rows})
+        ctx = StepContext(request_ids=tuple(rows), graph_walk="rollout", slot=0, capture=False)
+        assert store.admit(step, ctx).ok
+        store.plan(step, ctx)
+        tags = torch.full((len(rows), max(spans), HEADS, DIM), -1.0)
+        for i, (rid, span) in enumerate(zip(rows, spans, strict=True)):
+            tags[i, :span, 0, 0] = 1000 * rid + torch.arange(reqs[rid].written, reqs[rid].written + span)
+        for layer in range(LAYERS):
+            store.write(layer, tags, tags)
+        store.commit(step, ctx)
+        for i, (rid, span) in enumerate(zip(rows, spans, strict=True)):
+            req = reqs[rid]
+            req.written += span
+            for layer in range(LAYERS):
+                k, v = store.window(layer, row=i)
+                assert k.flatten().tolist() == v.flatten().tolist() == \
+                    _expected(req.written, req.sink, req.window, base=1000 * rid)
+
+
+@pytest.mark.parametrize("seed", range(4))
+def test_random_requests_keep_their_streams_through_every_rearrange(monkeypatch, seed):
+    """The pool fragments, and rearranges slide several regions by different
+    distances across gaps of every size, staged and in place."""
+    rng = random.Random(seed)
+    counts = {"rearranges": 0, "staged": 0}
+    for _ in range(50):
+        monkeypatch.setattr(manager_module, "STAGE_TOKENS", rng.choice([2, 4, 8, 16]))
+        _random_workload(rng, counts)
+    assert counts["rearranges"] and counts["staged"], counts  # both paths ran
 
 
 def test_a_refused_step_gives_back_its_region_and_sets_the_room_aside_again():
