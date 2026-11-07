@@ -243,16 +243,9 @@ class W4A16Format(LinearFormat):
         return out
 
     def _dequantize_marlin(self, buffers) -> torch.Tensor:
-        from mstar.utils import marlin
-
         kind = KIND_INT4_SYM if self.symmetric else KIND_INT4_ZP
-        held = {name: buffers[name] for name in buffers if name.startswith("marlin_")}
-        if held["marlin_scale"].dtype == _I16:  # the module's container: Marlin's scales are bf16
-            held["marlin_scale"] = held["marlin_scale"].view(torch.bfloat16)
-        codes, scale, *zero = marlin.unprepare(kind, held)
-        n, k = codes.shape
-        zero = zero[0].float()[..., None] if zero else 8.0
-        return ((codes.float().view(n, -1, self.group) - zero) * scale.float()[..., None]).view(n, k)
+        return dequantize_marlin(buffers["marlin_weight"], buffers["marlin_scale"], buffers.get("marlin_zero"),
+                                 self.group, kind)
 
     def after_load(self, tensors):
         """One 4-bit copy: Marlin's where it builds (the checkpoint layout's placeholders empty), else the Triton
@@ -275,15 +268,13 @@ class W4A16Format(LinearFormat):
         n, k = packed.shape[0], packed.shape[1] * 8
         kind = KIND_INT4_SYM if self.symmetric else KIND_INT4_ZP
         names = ("marlin_weight", "marlin_scale") + (() if self.symmetric else ("marlin_zero",))
-        if packed.is_cuda:
-            from mstar.utils import marlin
+        from mstar.utils import marlin
 
-            if marlin.shape_reason(kind, self.group, n, k) is None and marlin.available(kind, self.group,
-                                                                                         packed.device):
-                scale = tensors["weight_scale"]
-                scale = scale.view(self.scale_dtype) if scale.dtype == _I16 else scale
-                zero = None if self.symmetric else unpack_int4(tensors["weight_zero_point"].view(_I32), dim=0)[:n]
-                return marlin.prepare(kind, unpack_int4(packed.view(_I32)), scale, zero)
+        if marlin.shape_reason(kind, self.group, n, k) is None and marlin.available(kind, self.group, packed.device):
+            scale = tensors["weight_scale"]
+            scale = scale.view(self.scale_dtype) if scale.dtype == _I16 else scale
+            zero = None if self.symmetric else unpack_int4(tensors["weight_zero_point"].view(_I32), dim=0)[:n]
+            return marlin.prepare(kind, unpack_int4(packed.view(_I32)), scale, zero)
         return {name: torch.empty(0, dtype=_I32, device=packed.device) for name in names}
 
     def _tinygemm(self, tensors, skip: bool = False) -> dict[str, torch.Tensor]:
@@ -389,13 +380,12 @@ class Mxfp4Format(LinearFormat):
         n, k = packed.shape[0], packed.shape[1] * 2
         empty = torch.empty(0, dtype=_I32, device=packed.device)
         out.update(marlin_weight=empty, marlin_scale=empty)
-        if packed.is_cuda:
-            from mstar.utils import marlin
+        from mstar.utils import marlin
 
-            if marlin.shape_reason(KIND_E2M1, 32, n, k) is None and marlin.available(KIND_E2M1, 32, packed.device):
-                # one copy: Marlin's, the planes layout and its scales left empty
-                out.update(marlin.prepare(KIND_E2M1, unpack_fp4(packed), tensors["weight_scale"].view(_U8)))
-                out.update(weight_planes=empty, weight_scale=torch.empty(0, dtype=_U8, device=packed.device))
+        if marlin.shape_reason(KIND_E2M1, 32, n, k) is None and marlin.available(KIND_E2M1, 32, packed.device):
+            # one copy: Marlin's, the planes layout and its scales left empty
+            out.update(marlin.prepare(KIND_E2M1, unpack_fp4(packed), tensors["weight_scale"].view(_U8)))
+            out.update(weight_planes=empty, weight_scale=torch.empty(0, dtype=_U8, device=packed.device))
         return out
 
     def quantize_storage(self, weight):
@@ -458,16 +448,43 @@ def w4a16_linear(
     marlin_zero: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """``x [M, K]`` times a 4-bit weight (uint8 ``[N, K/2]`` in the planes layout, its group scales, zero points for
-    ``KIND_INT4_ZP``; optionally tinygemm's or Marlin's copy of it) dequantized to ``x``'s dtype: ``[M, N]``.
-    Off CUDA, the reference."""
-    w = dequantize_kind(weight, scale, zero_point, group, kind).to(x.dtype)
-    return F.linear(x, w)
+    ``KIND_INT4_ZP``; optionally tinygemm's copy) or, where a layer keeps only Marlin's copy, ``weight`` empty and
+    the weight in ``marlin_*``: ``[M, N]`` in ``x``'s dtype. Off CUDA, the reference."""
+    if weight.numel():
+        w = dequantize_kind(weight, scale, zero_point, group, kind)
+    else:
+        w = dequantize_marlin(marlin_weight, marlin_scale, marlin_zero, group, kind)
+    return F.linear(x, w.to(x.dtype))
+
+
+def _out_features(weight: torch.Tensor, marlin_weight: torch.Tensor | None) -> int:
+    """N from the planes layout ``[N, K/2]`` or, with only Marlin's copy, from it (``[K/16, 2N]`` int32)."""
+    return weight.shape[0] if weight.numel() else marlin_weight.shape[1] // 2
+
+
+def dequantize_marlin(marlin_weight, marlin_scale, marlin_zero, group: int, kind: int) -> torch.Tensor:
+    """fp32 ``[N, K]`` from Marlin's copy (``mstar.utils.marlin.unprepare``): the one-copy layers' reference."""
+    from mstar.utils import marlin
+
+    held = {"marlin_weight": marlin_weight, "marlin_scale": marlin_scale}
+    if kind == KIND_INT4_ZP:
+        held["marlin_zero"] = marlin_zero
+    if kind != KIND_E2M1 and marlin_scale.dtype == _I16:
+        held["marlin_scale"] = marlin_scale.view(torch.bfloat16)
+    codes, scale, *zero = marlin.unprepare(kind, held)
+    n, k = codes.shape
+    if kind == KIND_E2M1:
+        values, scale = e2m1_values(codes), torch.exp2(scale.view(_U8).float() - 127.0)
+    else:
+        values = codes.float().view(n, -1, group) - (zero[0].float()[..., None] if zero else 8.0)
+        scale = scale.float()
+    return (values.view(n, -1, group) * scale[..., None]).view(n, k)
 
 
 @w4a16_linear.register_fake
 def _(x, weight, scale, zero_point, group, kind, tinygemm_weight=None, tinygemm_scale_zero=None, marlin_weight=None,
       marlin_scale=None, marlin_zero=None):
-    return x.new_empty((x.shape[0], weight.shape[0]))
+    return x.new_empty((x.shape[0], _out_features(weight, marlin_weight)))
 
 
 W4A16 = register_format(W4A16Format())

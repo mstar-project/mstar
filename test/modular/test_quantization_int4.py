@@ -627,6 +627,129 @@ def test_one_marlin_copy_holds_the_whole_weight(kind, group):
     assert torch.equal(fmt.dequantize(one_copy), fmt.dequantize(fmt.after_load(dict(stored))))
 
 
+ONE_COPY_TOKENS = (1, 64, 256, 1024)
+
+
+def _stub_marlin(monkeypatch):
+    """Stand a reference in for the CUDA Marlin op (built nowhere on a CPU box): ``available`` says built, so the
+    formats' after_load takes the branch a GPU takes (Marlin's copy only, the others empty), and ``gemm`` computes
+    from that copy. Returns the list each Marlin call appends its token count to."""
+    from mstar.utils import marlin, w4a16
+
+    calls = []
+
+    def gemm(lib, x, weight, scale, zero, kind, n, fp32_reduce=True, atomic_add=False):
+        calls.append(x.shape[0])
+        group = 32 if kind == I.KIND_E2M1 else weight.shape[0] * 16 // scale.shape[0]
+        return F.linear(x, I.dequantize_marlin(weight, scale, zero, group, kind).to(x.dtype))
+
+    monkeypatch.setattr(marlin, "available", lambda kind, group, device: "stub")
+    monkeypatch.setattr(marlin, "gemm", gemm)
+    monkeypatch.setattr(w4a16, "_marlin_lib", lambda kind, group, device: "stub")
+    return calls
+
+
+@pytest.mark.parametrize("layout, group", [("ct-asym", 32), ("awq-asym", 32), ("gptq-sym", 128), ("mxfp4", 32)])
+def test_one_copy_layers_serve_every_token_count_after_load(stored, layout, group, monkeypatch):
+    """Where Marlin is taken a layer keeps only Marlin's copy. Job 1551 served that into a crash: the op's fake
+    (what torch.compile traces) read N from the empty planes layout, ``(M, 0)``. Loaded with Marlin standing in, every
+    4-bit linear of the tiny root holds one copy, reads back the checkpoint's weight (Marlin's scales in bf16: fp16
+    scales round once), and at 1 / 64 / 256 / 1024 tokens its fake has the real output's shape and its output,
+    eager and compiled, matches that weight."""
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    _stub_marlin(monkeypatch)
+    path, refs = stored[(layout, group)]
+    root, _ = load(path)
+    torch.manual_seed(11)
+    for layer in range(LAYERS):
+        for kind, rel in PATHS.items():
+            module = root.get_submodule(f"layers.{layer}.{rel}")
+            assert module.weight_planes.numel() == 0 and module.marlin_weight.numel() > 0, (layer, kind)
+            want = _expected(refs, layer, kind, 0, 1)
+            weight = _linear_weight(f"layers.{layer}.{rel}", root)
+            assert ((weight - want).norm() / want.norm()).item() < 4e-3, (layer, kind)
+            compiled = torch.compile(module._quant_local, backend="eager", fullgraph=True, dynamic=False)
+            for m in ONE_COPY_TOKENS:
+                x = torch.randn(m, want.shape[1], dtype=torch.bfloat16)
+                with FakeTensorMode(allow_non_fake_inputs=True) as mode:
+                    fake = module._quant_local(mode.from_tensor(x), None)
+                assert fake.shape == (m, want.shape[0]), (layer, kind, m, fake.shape)
+                ref = F.linear(x.float(), weight)
+                for out in (module._quant_local(x, None), compiled(x, None)):
+                    assert out.shape == (m, want.shape[0])
+                    assert ((out.float() - ref).norm() / ref.norm()).item() < 1e-2, (layer, kind, m)
+
+
+_ONE_COPY_DISPATCH = """
+import sys, torch
+import torch.nn.functional as F
+from mstar.model.components import int4_formats as I
+from mstar.utils import marlin, w4a16
+marlin_calls, dequant_calls = [], []
+def gemm(lib, x, weight, scale, zero, kind, n, fp32_reduce=True, atomic_add=False):
+    marlin_calls.append(x.shape[0])
+    group = 32 if kind == I.KIND_E2M1 else weight.shape[0] * 16 // scale.shape[0]
+    return F.linear(x, I.dequantize_marlin(weight, scale, zero, group, kind).to(x.dtype))
+marlin.gemm, marlin.available = gemm, (lambda kind, group, device: "stub")
+w4a16._marlin_lib = lambda kind, group, device: "stub"
+real_dequant = w4a16.marlin_dequantize
+def spy(*a, **kw):
+    dequant_calls.append(1)
+    return real_dequant(*a, **kw)
+w4a16.marlin_dequantize = spy
+torch.manual_seed(0)
+n, k = 192, 512
+for kind, group in ((I.KIND_INT4_SYM, 128), (I.KIND_INT4_ZP, 32), (I.KIND_E2M1, 32)):
+    if kind == I.KIND_E2M1:
+        fmt = I.MXFP4
+        stored = fmt.quantize_storage(torch.randn(n, k) * 0.05)
+    else:
+        fmt = I.W4A16Format(group=group, symmetric=kind == I.KIND_INT4_SYM, scale_dtype=torch.float16)
+        stored = fmt.quantize_storage((torch.randn(n, k) * 0.05).to(torch.bfloat16))
+        if kind == I.KIND_INT4_ZP:
+            stored["weight_zero_point"] = I.pack_int4(torch.randint(0, 16, (n, k // group), dtype=torch.uint8), dim=0)
+    held = fmt.after_load(stored)
+    assert held["weight_planes"].numel() == 0 and held["marlin_weight"].numel() > 0
+    ref_w = fmt.dequantize(held)
+    for m in (1, 64, 256, 1024):
+        marlin_calls.clear(); dequant_calls.clear()
+        x = torch.randn(m, k).to(torch.bfloat16)
+        got = w4a16.gemm(x, held["weight_planes"].view(torch.uint8), held["weight_scale"],
+                         held.get("weight_zero_point"), fmt.group, kind, held.get("tinygemm_weight"),
+                         held.get("tinygemm_scale_zero"), held["marlin_weight"], held["marlin_scale"],
+                         held.get("marlin_zero"))
+        ref = F.linear(x.float(), ref_w)
+        err = ((got.float() - ref).norm() / ref.norm()).item()
+        assert got.shape == (m, n) and err < 1e-2, (kind, m, got.shape, err)
+        want_marlin = m < w4a16.MARLIN_M
+        assert (marlin_calls == [m]) == want_marlin and bool(dequant_calls) == (not want_marlin), (kind, m)
+    # the large-M dequant's lookup tables are copied to the device once, not per call (job 1551: a host copy
+    # inside CUDA-graph capture)
+    assert marlin.tables(torch.device("cpu")) is marlin.tables(torch.device("cpu"))
+print("ok")
+"""
+
+
+def test_one_copy_dispatch_runs_marlin_then_dequantizes_its_copy():
+    """``w4a16.gemm`` on one-copy buffers, Marlin standing in and the Marlin-layout dequant kernel in Triton's CPU
+    interpreter (a subprocess: the interpreter is chosen at import): Marlin below ``MARLIN_M`` tokens, the
+    dequant + GEMM from it at and above, both matching the reference at 1 / 64 / 256 / 1024 tokens for int4
+    symmetric g128, zero points g32 and MXFP4."""
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    pytest.importorskip("triton")
+    root = Path(__file__).resolve().parents[2]
+    env = {**os.environ, "TRITON_INTERPRET": "1", "OMP_NUM_THREADS": "2",
+           "PYTHONPATH": os.pathsep.join([str(root), os.environ.get("PYTHONPATH", "")])}
+    run = subprocess.run([sys.executable, "-c", _ONE_COPY_DISPATCH], env=env, capture_output=True, text=True,
+                         check=False, timeout=600)
+    assert run.returncode == 0 and run.stdout.strip().endswith("ok"), (run.stdout[-2000:], run.stderr[-4000:])
+
+
 def test_marlin_takes_the_shapes_it_was_built_for():
     from mstar.utils import marlin
 
@@ -762,19 +885,22 @@ def test_cuda_marlin_matches_the_reference(kind, group):
     m_zero = buffers.get("marlin_zero")
     assert torch.equal(w4a16.marlin_dequantize(buffers["marlin_weight"], buffers["marlin_scale"], m_zero, group, kind,
                                                torch.float32), ref_w32)
-    for m in (1, 5, 16, 33, 64, 100, w4a16.MARLIN_M - 1, w4a16.MARLIN_M + 44):
+    args = [buffers[b] for b in fmt.buffers]
+    compiled = torch.compile(fmt.linear, fullgraph=True, dynamic=False)
+    for m in (1, 5, 16, 33, 64, 100, w4a16.MARLIN_M - 1, w4a16.MARLIN_M, 1024):
         x = torch.randn(m, k, device=dev, dtype=torch.bfloat16)
-        got = fmt.linear(x, *(buffers[b] for b in fmt.buffers))
+        got = fmt.linear(x, *args)
         ref = F.linear(x.float(), ref_w.float())
         assert ((got.float() - ref).norm() / ref.norm()).item() < 5e-3, m
-    graph = torch.cuda.CUDAGraph()
-    x = torch.randn(16, k, device=dev, dtype=torch.bfloat16)
-    eager = fmt.linear(x, *(buffers[b] for b in fmt.buffers))
-    with torch.cuda.graph(graph):
-        out = fmt.linear(x, *(buffers[b] for b in fmt.buffers))
-    graph.replay()
-    torch.cuda.synchronize()
-    assert torch.equal(out, eager)
+        if m in (1, 64, w4a16.MARLIN_M, 1024):
+            # captured and replayed (job 1551: a host copy inside capture at 256+), and compiled (its fake)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                out = fmt.linear(x, *args)
+            graph.replay()
+            torch.cuda.synchronize()
+            assert torch.equal(out, got), m
+            assert torch.equal(compiled(x, *args), got), m
 
 
 @cuda

@@ -111,6 +111,7 @@ def prepare(kind: int, codes_nk: torch.Tensor, scale_ng: torch.Tensor, zero_ng: 
     codes), its group scales ``[N, K / group]`` (e8m0 bytes for MXFP4) and, for zero points, ``[N, K / group]``
     ints: ``marlin_weight``, ``marlin_scale`` (``dtype``, the activations'; uint8 e8m0 for MXFP4) and, with zero
     points, ``marlin_zero``."""
+    tables(codes_nk.device)  # the large-M dequant's lookup tables, on the device before any graph capture
     out = {"marlin_weight": repack_codes(codes_nk.t().contiguous())}
     s = scale_ng.t().contiguous()
     if kind == KIND_E2M1:
@@ -146,8 +147,17 @@ def _tables() -> dict[str, torch.Tensor]:
             "zero": (((sinv // 8) << 5) | (4 * il_inv[sinv % 8])).to(torch.int32)}
 
 
+_DEVICE_TABLES: dict[torch.device, dict[str, torch.Tensor]] = {}
+
+
 def tables(device: torch.device) -> dict[str, torch.Tensor]:
-    return {name: t.to(device) for name, t in _tables().items()}
+    """``_tables`` on ``device``, copied there once (``prepare`` does it at load): a call inside CUDA-graph capture
+    must not copy from the host (job 1551's marlin_dequant rows failed on exactly that)."""
+    device = torch.device(device)
+    held = _DEVICE_TABLES.get(device)
+    if held is None:
+        held = _DEVICE_TABLES[device] = {name: t.to(device) for name, t in _tables().items()}
+    return held
 
 
 def unprepare(kind: int, buffers: dict[str, torch.Tensor]) -> tuple[torch.Tensor, ...]:
