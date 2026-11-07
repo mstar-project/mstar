@@ -596,13 +596,17 @@ def test_an_out_of_place_all_reduce_result_is_kept(fp8, fused_allreduce):
     assert torch.equal(out_of_place(x), 2 * in_place(x))
 
 
-@pytest.mark.parametrize("path", ["decode", "prefill", "fused"])
+@pytest.mark.parametrize("path", ["decode", "prefill", "fused", "trtllm"])
 def test_the_fused_paths_keep_an_out_of_place_all_reduce_result(monkeypatch, path):
     """The same for the reductions behind the fused kernels, which stand-ins replace here:
-    the decode chain's one partial, the prefill kernels' and the runner's routed output."""
+    the decode chain's one partial, the prefill kernels', the runner's and Blackwell's
+    trtllm kernel's routed output."""
     def setup(block):
         block._use_fused = True
-        if path == "decode":
+        if path == "trtllm":
+            block._trtllm = True
+            monkeypatch.setattr(block, "_dispatch_trtllm", lambda flat, weights, ids: flat * 3.0)
+        elif path == "decode":
             monkeypatch.setattr(block, "_use_decode", lambda flat: True)
             monkeypatch.setattr(block, "_forward_decode", lambda flat: flat * 3.0)
         elif path == "prefill":
