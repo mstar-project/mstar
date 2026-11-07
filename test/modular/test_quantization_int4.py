@@ -937,10 +937,25 @@ def test_blackwell_fp4_experts_match_the_reference(stored, layout, group, tol):
     h = torch.randn(33, HIDDEN, dtype=torch.bfloat16)
     weights, ids, _ = block.gate(h)
     ref = block._experts_reference(h, weights, ids, False)
+    # the dequantized experts on bf16 activations, read before the kernel's layout replaces the checkpoint's
+    gate_up, down = _expert_weights(block)
+    exact = torch.zeros(h.shape)
+    for t in range(h.shape[0]):
+        for slot in range(ids.shape[1]):
+            e = int(ids[t, slot])
+            g, u = (gate_up[e].float() @ h[t].float()).chunk(2)
+            exact[t] += float(weights[t, slot]) * (down[e].float() @ (F.silu(g) * u).bfloat16().float())
     root.to("cuda")
     block.experts_after_load()
     assert block._experts_kernel is not None
     got = block._experts_quant(h.cuda(), weights.cuda(), ids.cuda(), False).cpu()
+    if layout == "nvfp4":
+        # the kernel rounds an activation block's e4m3 scale to nearest (TRT-LLM / modelopt), the reference rounds
+        # it up, so their activation roundings are independent (~0.18 apart on random data): bound the kernel by
+        # the reference's own distance from the bf16-activation output
+        err = lambda y: ((y.float() - exact).norm() / exact.norm()).item()  # noqa: E731
+        assert err(got) <= 1.05 * err(ref), (err(got), err(ref))
+        return
     rel = ((got.float() - ref.float()).norm() / ref.float().norm()).item()
     assert rel < tol, rel
 
