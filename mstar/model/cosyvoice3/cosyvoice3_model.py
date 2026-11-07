@@ -117,7 +117,8 @@ LM_PARTITION = "LM"
 TOKEN2WAV_PARTITION = "Token2Wav"
 
 _LM_KNOBS = ("temperature", "top_p", "top_k", "ras_window", "ras_tau", "ignore_eos")
-_FLOW_KNOBS = ("n_cfm_timesteps",)
+# ``ignore_eos`` is the LM's, but its stop policy reads the info of every partition on the worker
+_FLOW_KNOBS = ("n_cfm_timesteps", "ignore_eos")
 # settled by process_prompt and folded into model_kwargs, so the nodes read
 # them from step_metadata instead of from device tensors
 _LM_FACTS = (MIN_SPEECH_TOKENS, MAX_SPEECH_TOKENS, VOICE_KEY)
