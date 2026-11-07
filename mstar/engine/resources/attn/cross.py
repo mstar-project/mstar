@@ -184,11 +184,12 @@ class FlashInferCrossManager(CrossAttentionManager):
         if wrapper is None:
             step.host_planned = True
             return
-        table = step.block_tables[self._kv_cache_name]
+        table = step.block_tables[self._kv_cache_name, self._context_label]
         if table.width != wrapper._resident_pages:
             raise ValueError("cross attention grid must match its context owner's table")
         wrapper.gather_resident(
-            step.store, step.slots, step.buffers.kv_len[self._kv_cache_name], table.stride, table.col, append=0,
+            step.store, step.slots, step.buffers.kv_len[self._kv_cache_name, self._context_label],
+            table.stride, table.col, append=0,
         )
         step.reads_tables = True
 

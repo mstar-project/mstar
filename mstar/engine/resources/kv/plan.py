@@ -314,6 +314,38 @@ class KVPlanOutputs(dict[str, KVPlanOutput]):
         # the labels' plans in each group of the pool past the first (`PagedKVConfig.groups`)
         self.later_groups = later_groups
 
+    def resident_slices(self, width: int) -> dict[str, dict[str, slice]]:
+        """Source streams' physical row ranges in this plan's packed order.
+
+        Every source stream addresses the same logical request row once; a
+        combined plan may order those streams differently from the declaration.
+        Only immutable row identities are read, never recycled pinned indptrs.
+        """
+        if width < 1:
+            raise ValueError("resident packing needs logical request rows")
+        request_ids = None
+        packed = {}
+        for label, output in self.items():
+            rows = output.rows
+            if rows is None:
+                rows = [(view.request_id, view.label, view.to_compute) for view in output.views]
+            if not rows or len(rows) % width:
+                raise ValueError("resident KV packing has incomplete source rows")
+            if request_ids is None:
+                request_ids = tuple(row[0] for row in rows[:width])
+                if len(set(request_ids)) != width:
+                    raise ValueError("resident packing needs distinct logical request rows")
+            slices = packed[label] = {}
+            for start in range(0, len(rows), width):
+                source = rows[start:start + width]
+                source_label = source[0][1]
+                if (tuple(row[0] for row in source) != request_ids
+                        or any(row[1] != source_label or row[2] != source[0][2] for row in source)
+                        or source[0][2] not in (0, 1) or source_label in slices):
+                    raise ValueError("resident KV packing needs one ordered segment per source stream")
+                slices[source_label] = slice(start, start + width)
+        return packed
+
     @property
     def groups(self) -> tuple[dict[str, KVPlanOutput], ...]:
         """The labels' plans in each group: these, then ``later_groups``, as `CacheStream.groups`

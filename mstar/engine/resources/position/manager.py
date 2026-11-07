@@ -448,35 +448,36 @@ class RopeManager(PositionManager):
             return f"position scheme {self._config.scheme} doesn't advance with the stream"
         if key not in streams or self._kv_cache_name not in streams:
             return "its step declares it no stream"
-        if len(streams[key]) != 1 or len(streams[self._kv_cache_name]) != 1:
-            return "resident positions need one labelled stream per request"
-        own, pool = streams[key][0], streams[self._kv_cache_name][0]
-        if own.label != pool.label or own.reads or pool.reads:
-            # the offset holds only while both advance a token a step, as one stream
-            return (
-                f"positions on stream {own.label!r} over {self._kv_cache_name!r}'s {pool.label!r} don't "
-                "advance with the stream their KV cache appends to"
-            )
+        own, pool = streams[key], streams[self._kv_cache_name]
+        if own != pool or any(stream.reads for stream in (*own, *pool)):
+            return "positions must advance with the stream their KV cache appends to"
         return None
 
     def _bind_resident(self, planner: "ResidentPlanner", key: str) -> None:
         self._resident_store = planner
         self._resident_key = key
-        self._resident_delta = planner.table()
+        labels = dict.fromkeys(stream.label for streams in planner._walk_streams.values()
+                               for stream in streams.get(key, ()))
+        self._resident_delta = {label: planner.table() for label in labels}
 
     def _resident_row(self, rid: int, slot: int, row: list[int], writes: "ResidentWrites") -> None:
-        # the KV pool binds ahead of this, its dependent, and sets its length first
-        label = writes.streams[self._resident_key][0].label
-        row[self._resident_delta.col] = self.position(rid, label) - writes.kv_len[self._kv_cache_name]
+        for stream in writes.streams[self._resident_key]:
+            label = stream.label
+            row[self._resident_delta[label].col] = self.position(rid, label) - writes.kv_len[self._kv_cache_name, label]
 
     def _resident_gather(self, step: "CapturedResidentStep") -> None:
-        own = step.streams[self._resident_key][0]
-        key = CGSlotKey(bucket=step.bucket, slot=step.buffer_slot, label=own.label)
-        table = self._resident_delta
-        gather_column(
-            self._resident_store.store, step.slots, table.stride, table.col,
-            self._static_buffer(key, step.bucket.num_tokens), plus=step.buffers.kv_len[self._kv_cache_name],
-        )
+        outputs = step.buffers.plan_results[self._kv_cache_name]
+        for plan_label, sources in outputs.resident_slices(step.bucket.bs).items():
+            key = CGSlotKey(bucket=step.bucket, slot=step.buffer_slot, label=plan_label)
+            positions = self._static_buffer(key, step.bucket.num_tokens)
+            if max(part.stop for part in sources.values()) > positions.numel():
+                raise ValueError("resident source rows exceed captured position addressing")
+            for label, part in sources.items():
+                table = self._resident_delta[label]
+                gather_column(
+                    self._resident_store.store, step.slots, table.stride, table.col, positions[part],
+                    plus=step.buffers.kv_len[self._kv_cache_name, label],
+                )
 
     def commit(self, step: PositionStep, ctx: StepContext):
         if ctx.unit_id is not None:

@@ -637,16 +637,21 @@ class FlashInferDecodeWrapper:
 
     def gather_resident(
         self, store: torch.Tensor, slots: torch.Tensor, kv_len: torch.Tensor, stride: int, block_col: int,
-        *, append: int = 1,
+        *, append: int = 1, row_start: int = 0,
     ) -> None:
         """Read this iteration's immutable membership and its owners' current KV."""
         width = self._resident_pages
         if width is None:
             raise ValueError("resident decode must plan its full page grid before capture")
+        rows = slots.numel()
+        if row_start < 0 or row_start + rows > self.batch_size or kv_len.numel() != rows:
+            raise ValueError("resident rows exceed captured attention addressing")
+        indices = self._paged_kv_indices_buf[row_start * width:(row_start + rows) * width]
+        lengths_out = self._paged_kv_last_page_len_buf[row_start:row_start + rows]
         base = (width - 1) * self.page_size
         if store.is_cuda:
-            _gather_block_rows_kernel[(self.batch_size,)](
-                slots, kv_len, store, self._paged_kv_indices_buf, self._paged_kv_last_page_len_buf,
+            _gather_block_rows_kernel[(rows,)](
+                slots, kv_len, store, indices, lengths_out,
                 STRIDE=stride, BLOCK=block_col, PAGE=self.page_size, WIDTH=width,
                 TAIL_BASE=base, FULL_TABLE=True, APPEND=append, num_warps=1,
             )
@@ -656,10 +661,10 @@ class FlashInferDecodeWrapper:
             columns = torch.arange(width)
             pages = (lengths + self.page_size - 1) // self.page_size
             table = store.view(-1, stride)[slots, block_col:block_col + width]
-            self._paged_kv_indices_buf[:self.batch_size * width].copy_(
+            indices.copy_(
                 torch.where((columns[None, :] < pages[:, None]) & (stored[:, None] > 0), table, 0).flatten(),
             )
-            self._paged_kv_last_page_len_buf.copy_(lengths - base)
+            lengths_out.copy_(lengths - base)
 
     def first_replay(self, last_page_len: torch.Tensor, rows: int, repeats: int) -> torch.Tensor:
         """``last_page_len`` planned for a step's last replay, as its first reads
@@ -678,12 +683,15 @@ class FlashInferDecodeWrapper:
         pages = paged_kv_indptr[1:] - paged_kv_indptr[:-1]
         self._page_base[:pages.shape[0]].copy_((pages - 1) * self.page_size, non_blocking=True)
 
-    def gather_lengths(self, kv_len: torch.Tensor) -> None:
+    def gather_lengths(self, kv_len: torch.Tensor, *, row_start: int = 0) -> None:
         """Inside a run's capture: ``last_page_len`` off each row's stored length,
         so a plan made for a longer row reads what's there."""
         lengths = self._paged_kv_last_page_len_buf
-        rows = min(lengths.shape[0], kv_len.shape[0])
-        lengths[:rows].copy_(kv_len[:rows] + 1 - self._page_base[:rows])
+        rows = kv_len.numel()
+        if row_start < 0 or row_start + rows > lengths.numel():
+            raise ValueError("resident lengths exceed captured attention rows")
+        part = slice(row_start, row_start + rows)
+        lengths[part].copy_(kv_len + 1 - self._page_base[part])
 
     def replay_column(self, repeats: int) -> tuple[torch.Tensor, torch.Tensor]:
         """Each replay's ``last_page_len``: one more than the replay before it."""
@@ -872,12 +880,17 @@ class FmhaDecodeWrapper:
 
     def gather_resident(
         self, store: torch.Tensor, slots: torch.Tensor, kv_len: torch.Tensor, stride: int, block_col: int,
+        *, row_start: int = 0,
     ) -> None:
         """Inside a resident step's capture: this step's rows off the tables,
         into the table and lengths the kernel holds the addresses of. Only the
         columns a row reads; the rest of the table is never looked at."""
-        _gather_block_rows_kernel[(self.batch_size,)](
-            slots, kv_len, store, self._table, self._lens,
+        rows = slots.numel()
+        if row_start < 0 or row_start + rows > self.batch_size or kv_len.numel() != rows:
+            raise ValueError("resident rows exceed captured attention addressing")
+        part = slice(row_start, row_start + rows)
+        _gather_block_rows_kernel[(rows,)](
+            slots, kv_len, store, self._table[part], self._lens[part],
             STRIDE=stride, BLOCK=block_col, PAGE=self._page_size, WIDTH=self._table.shape[1], num_warps=1,
         )
 

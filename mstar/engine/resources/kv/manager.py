@@ -77,7 +77,6 @@ from mstar.utils.knobs import kv_chain_lazy_steps, kv_pinned_indptrs, kv_plan_ca
 from mstar.utils.profiler import PhaseLaps
 
 if TYPE_CHECKING:
-    from mstar.engine.resources.kv.resident import KVResidentTables
     from mstar.engine.resources.resident import (
         CapturedResidentStep,
         ResidentPlan,
@@ -545,7 +544,7 @@ class _DecodePlanCache:
 class KVManager(AttentionResource):
     prefix_skip_safe = True
     # this pool's resident tables, once a node's planner bound them
-    _resident: "KVResidentTables | None" = None
+    _resident: "ResidentPlanner | None" = None
     # tokens a commit can run ahead of what has been read back and keyed: the
     # extra iterations of the step before it, still in flight, and its own
     _run_lag: int = 0
@@ -2310,7 +2309,7 @@ class KVManager(AttentionResource):
         for rid in rows:
             self._touch_plan_cache(rid, row=False)
         if self._resident is not None:
-            self._resident.planner.drop_stage(rows)
+            self._resident.drop_stage(rows)
         with self._lock:
             if ctx.unit_id is not None:
                 self._unit_steps.pop((ctx.unit_id, ctx.unit_member), None)
@@ -2780,13 +2779,13 @@ class KVManager(AttentionResource):
         if cache is not None and (rid is None or any(rid == seg[0] for seg in cache.real_segments)):
             self._plan_epoch += 1
         if row and rid is not None and self._resident is not None:
-            self._resident.planner.mark_stale(rid)
+            self._resident.mark_stale(rid)
 
     def _drop_resident_stage(self) -> None:
         """Pages a staged step reserved go back: the resident stage that names
         them goes too, as the runner's own does."""
         if self._resident is not None:
-            self._resident.planner.drop_stage()
+            self._resident.drop_stage()
 
     def _split_padding(self, step: KVStep, ctx: StepContext):
         """``(n_real, (n_pad, span))`` of a step whose real segments come
@@ -3117,6 +3116,14 @@ class KVManager(AttentionResource):
         )
         laps = PhaseLaps(f"{ctx.plan_phase}.{self.name}.")
         self.reset_default_cursors()
+        if ctx.resident is not None:
+            buffers = ctx.resident.buffers(ctx.slot_lease.bucket, ctx.slot_lease.slot)
+            expected = buffers.plan_results[self._resident_key].resident_slices(ctx.slot_lease.bucket.bs)
+            actual = group_by_plan_label(step.segments, step.combined_labels)
+            if {label: tuple(dict.fromkeys(seg.label for seg in rows)) for label, rows in actual.items()} != {
+                label: tuple(sources) for label, sources in expected.items()
+            }:
+                raise ValueError("resident KV plan packing differs from its capture")
         if ctx.resident is not None and ctx.slot_lease.bucket in ctx.resident.host_plan_free:
             # nothing reads a plan of this step, and its graph fills the addressing
             return KVPlanOutputs({})
@@ -4796,7 +4803,8 @@ class KVManager(AttentionResource):
         teardown), so it doesn't narrow there: the ranks must settle alike."""
         if ctx.resident is None:
             return ANY_REPEATS if not step.commit else 1
-        rows = max(len(ctx.request_ids), 1)
+        rows = max(len({(s.request_id, s.label) for s in step.segments
+                        if s.span and s.request_id in ctx.request_ids}), 1)
         page_size = self._groups[0].page_size
         if self._world_size == 1:
             evictable = 0 if self._index is None else len(self._index.evictable())
@@ -4837,8 +4845,8 @@ class KVManager(AttentionResource):
     def _resident_refusal(self, key, streams) -> str | None:
         if key not in streams:
             return "its step declares it no stream"
-        if len(streams[key]) != 1:
-            return "resident addressing needs one labelled stream per request"
+        if len(streams[key]) > 1 and any(stream.reads for stream in streams[key]):
+            return "multiple resident KV streams must all append"
         if len(self._groups) > 1:
             # a table per group would hold the pages; what's missing is the release: a group frees its
             # front pages at commit, a step behind the device, so a planned step's row would point at them
@@ -4854,59 +4862,72 @@ class KVManager(AttentionResource):
         # the pool's own context or override (not the serving config's top-level
         # `max_seq_len`), and a stream's pages are distinct pages of the pool
         width = min(-(-self.config.max_seq_len // page_size), self.config.request_pages)
-        self._resident = KVResidentTables(planner, key, page_size, width)
+        self._resident = planner
+        self._resident_key = key
+        labels = dict.fromkeys(stream.label for streams in planner._walk_streams.values()
+                               for stream in streams.get(key, ()))
+        self._resident_tables = {label: KVResidentTables(planner, key, label, page_size, width) for label in labels}
 
     def _resident_row(self, rid: int, slot: int, row: list[int], writes: "ResidentWrites") -> None:
-        tables = self._resident
-        label = writes.streams[tables.key][0].label
-        stream = self._streams[rid][label]
-        if stream.released:
-            raise ValueError(
-                f"KV {self.name}: {rid}/{label} released {stream.released} tokens, "
-                "which a block table row can't address"
-            )
-        tables.row(stream.stored_len, stream.page_indices, slot, row, writes)
+        for descriptor in writes.streams[self._resident_key]:
+            label = descriptor.label
+            stream = self._streams[rid][label]
+            if stream.released:
+                raise ValueError(f"KV {self.name}: {rid}/{label} released pages outside its resident table")
+            self._resident_tables[label].row(stream.stored_len, stream.page_indices, slot, row, writes)
 
     def _resident_stage(self, plan: "ResidentPlan") -> None:
-        tables, streams = self._resident, self._streams
-        stream = plan.writes.streams[tables.key][0]
-        label, planner = stream.label, tables.planner
-        if not stream.reads:
-            for rid in plan.moved:
-                tables.refresh_len(streams[rid][label].stored_len, planner.slot_of(rid), plan.writes)
-        tables.stage_step(
-            plan, lambda rid: streams[rid][label].stored_len, lambda rid: streams[rid][label].page_indices,
-            planner.rewrite,
-        )
-        if _DEBUG_ASSERTS:
-            for rid, slot in zip(plan.rids, plan.slots.tolist(), strict=True):
-                held, stored = int(tables.host_len[slot]), streams[rid][label].stored_len
-                assert held == stored, f"KV {self.name}: resident row of {rid} at {held}, its stream at {stored}"
+        streams, planner = self._streams, self._resident
+        for descriptor in plan.writes.streams[self._resident_key]:
+            label = descriptor.label
+            tables = self._resident_tables[label]
+            if not descriptor.reads:
+                for rid in plan.moved:
+                    tables.refresh_len(streams[rid][label].stored_len, planner.slot_of(rid), plan.writes)
+            tables.stage_step(
+                plan, lambda rid, label=label: streams[rid][label].stored_len,
+                lambda rid, label=label: streams[rid][label].page_indices,
+                planner.rewrite,
+            )
+            if _DEBUG_ASSERTS:
+                for rid, slot in zip(plan.rids, plan.slots.tolist(), strict=True):
+                    held, stored = int(tables.host_len[slot]), streams[rid][label].stored_len
+                    assert held == stored, f"KV {self.name}: resident {rid}/{label} at {held}, stream at {stored}"
 
     def _resident_gather(self, step: "CapturedResidentStep") -> None:
-        tables = self._resident
-        stream = step.streams[tables.key][0]
-        if stream.reads:
-            tables.gather(step, None, None)
-            return
-        state = self._static_plan_state(step.buffer_slot, (stream.label, 0), step.bucket.num_tokens)
-        tables.gather(step, state.token_to_page, state.token_to_cache)
+        outputs = step.buffers.plan_results[self._resident_key]
+        slices = outputs.resident_slices(step.bucket.bs)
+        descriptors = {stream.label: stream for stream in step.streams[self._resident_key]}
+        for plan_label, sources in slices.items():
+            state = None
+            for label, part in sources.items():
+                table = self._resident_tables[label]
+                if descriptors[label].reads:
+                    table.gather(step, None, None)
+                    continue
+                if state is None:
+                    state = self._static_plan_state(step.buffer_slot, (plan_label, 0), step.bucket.num_tokens)
+                if part.stop > state.token_to_page.numel():
+                    raise ValueError("resident source rows exceed captured KV write addressing")
+                table.gather(step, state.token_to_page[part], state.token_to_cache[part])
 
     def _resident_commit(self, step: "CapturedResidentStep") -> None:
-        self._resident.commit(step)
+        for stream in step.streams[self._resident_key]:
+            self._resident_tables[stream.label].commit(step)
 
     def rewind_run(self, step, ctx, replays: int, rows) -> None:
-        # its reserved pages stay: the row's next run takes them
+        # Reserved pages stay; each source stream settles the same logical count once.
         for segment in step.segments or ():
             labels = self._streams.get(segment.request_id) if segment.request_id in rows else None
             stream = labels.get(segment.label) if labels else None
             if stream is not None and step.commit and segment.span > 0:
                 stream.stored_len -= segment.span * replays
                 if self._resident is not None:
-                    self._resident.rewind(segment.request_id, segment.span * replays)
+                    self._resident_tables[segment.label].rewind(segment.request_id, segment.span * replays)
 
     def _resident_advance(self, plan: "ResidentPlan") -> None:
-        self._resident.advance(plan)
+        for stream in plan.writes.streams[self._resident_key]:
+            self._resident_tables[stream.label].advance(plan)
 
     def reset_default_cursors(self) -> None:
         super().reset_default_cursors()

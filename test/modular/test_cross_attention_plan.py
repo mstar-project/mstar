@@ -196,8 +196,8 @@ def test_joining_cross_attention_uses_its_context_owner_and_exact_query_capture(
     lengths = torch.tensor([16, 0])
     captured = SimpleNamespace(
         bucket=lease.bucket, buffer_slot=lease.buffer_slot, streams=streams,
-        block_tables={CTX_KV: SimpleNamespace(width=width, stride=width + 2, col=2)},
-        store=store.flatten(), slots=torch.tensor([1, 2]), buffers=SimpleNamespace(kv_len={CTX_KV: lengths}),
+        block_tables={(CTX_KV, CONTEXT): SimpleNamespace(width=width, stride=width + 2, col=2)},
+        store=store.flatten(), slots=torch.tensor([1, 2]), buffers=SimpleNamespace(kv_len={(CTX_KV, CONTEXT): lengths}),
         reads_tables=False, host_planned=False,
     )
     manager.resident_binding().gather(captured)

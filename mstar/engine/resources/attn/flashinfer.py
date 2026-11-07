@@ -137,10 +137,11 @@ class FlashInferManager(AttentionManager):
         lease = ctx.slot_lease
         if ctx.resident is None or lease.bucket in ctx.resident.host_plan_free:
             return ANY_REPEATS
-        # a resident walk plans one stream, under its segments' label
-        key = CGSlotKey(bucket=lease.bucket, slot=lease.buffer_slot, label=step.segments[0].label)
-        wrapper = self._cg_plan_states.get(key)
-        return ANY_REPEATS if isinstance(wrapper, FlashInferDecodeWrapper) and wrapper.lengths_move else 1
+        outputs = ctx.resident.buffers(lease.bucket, lease.slot).plan_results[self._kv_cache_name]
+        wrappers = [self._cg_plan_states.get(CGSlotKey(lease.bucket, lease.buffer_slot, label)) for label in outputs]
+        return ANY_REPEATS if wrappers and all(
+            isinstance(wrapper, FlashInferDecodeWrapper) and wrapper.lengths_move for wrapper in wrappers
+        ) else 1
 
     def replay_columns(self, step, ctx, repeats: int) -> list[tuple[torch.Tensor, torch.Tensor]]:
         if ctx.resident is None:
@@ -156,11 +157,14 @@ class FlashInferManager(AttentionManager):
         lease = ctx.slot_lease
         if lease is None:
             raise ValueError("new attention rows must name their captured addressing")
-        stream = ctx.resident._walk_streams[ctx.graph_walk][self._kv_cache_name][0]
-        wrapper = self._cg_plan_states.get(CGSlotKey(bucket=lease.bucket, slot=lease.buffer_slot, label=stream.label))
-        if not (isinstance(wrapper, FmhaDecodeWrapper)
-                or isinstance(wrapper, FlashInferDecodeWrapper) and wrapper._resident_pages is not None):
-            raise ValueError("attention must gather both pages and lengths inside its capture")
+        outputs = ctx.resident.buffers(lease.bucket, lease.slot).plan_results[self._kv_cache_name]
+        if not outputs:
+            raise ValueError("attention needs its captured KV packing")
+        for label in outputs:
+            wrapper = self._cg_plan_states.get(CGSlotKey(lease.bucket, lease.buffer_slot, label))
+            if not (isinstance(wrapper, FmhaDecodeWrapper)
+                    or isinstance(wrapper, FlashInferDecodeWrapper) and wrapper._resident_pages is not None):
+                raise ValueError("attention must gather both pages and lengths inside its capture")
 
     def resident_binding(self) -> ResidentBinding:
         return ResidentBinding(
@@ -178,31 +182,37 @@ class FlashInferManager(AttentionManager):
         )
 
     def _resident_refusal(self, key, streams) -> str | None:
-        if any(len(streams.get(owner, ())) > 1 for owner in (key, self._kv_cache_name)):
-            return "resident attention needs one labelled stream per request"
         if self._window_left >= 0:
             return "a sliding window reads pages a resident row no longer holds"
         return None
 
     def _resident_run_gather(self, step: "CapturedResidentStep") -> None:
-        # the table's lengths: the last run may have ended short of what the plan assumed
-        stream = step.streams[self._kv_cache_name][0]
-        wrapper = self._cg_plan_states.get(CGSlotKey(bucket=step.bucket, slot=step.buffer_slot, label=stream.label))
-        if isinstance(wrapper, FlashInferDecodeWrapper) and not stream.reads:
-            wrapper.gather_lengths(step.buffers.kv_len[self._kv_cache_name])
+        pool = self._kv_cache_name
+        descriptors = {stream.label: stream for stream in step.streams[pool]}
+        for plan_label, sources in step.buffers.plan_results[pool].resident_slices(step.bucket.bs).items():
+            wrapper = self._cg_plan_states.get(CGSlotKey(step.bucket, step.buffer_slot, plan_label))
+            if isinstance(wrapper, FlashInferDecodeWrapper):
+                for label, part in sources.items():
+                    if not descriptors[label].reads:
+                        wrapper.gather_lengths(step.buffers.kv_len[pool, label], row_start=part.start)
 
     def _resident_gather(self, step: "CapturedResidentStep") -> None:
-        # planned per label of its KV cache's plan, so its wrapper is under that stream's label
-        pool, stream = self._kv_cache_name, step.streams[self._kv_cache_name][0]
-        wrapper = self._cg_plan_states.get(CGSlotKey(bucket=step.bucket, slot=step.buffer_slot, label=stream.label))
-        resident = (isinstance(wrapper, FmhaDecodeWrapper)
-                    or isinstance(wrapper, FlashInferDecodeWrapper) and wrapper._resident_pages is not None)
-        if resident and not stream.reads:
-            table = step.block_tables[pool]
-            wrapper.gather_resident(step.store, step.slots, step.buffers.kv_len[pool], table.stride, table.col)
-            step.reads_tables = True
-        else:
-            step.host_planned = True
+        pool = self._kv_cache_name
+        descriptors = {stream.label: stream for stream in step.streams[pool]}
+        for plan_label, sources in step.buffers.plan_results[pool].resident_slices(step.bucket.bs).items():
+            wrapper = self._cg_plan_states.get(CGSlotKey(step.bucket, step.buffer_slot, plan_label))
+            resident = (isinstance(wrapper, FmhaDecodeWrapper)
+                        or isinstance(wrapper, FlashInferDecodeWrapper) and wrapper._resident_pages is not None)
+            if resident and all(not descriptors[label].reads for label in sources):
+                for label, part in sources.items():
+                    table = step.block_tables[pool, label]
+                    wrapper.gather_resident(
+                        step.store, step.slots, step.buffers.kv_len[pool, label], table.stride, table.col,
+                        row_start=part.start,
+                    )
+                step.reads_tables = True
+            else:
+                step.host_planned = True
 
     def _check_layer(self, layer_idx: int) -> None:
         """Over a pool of more than one group, ``layer_idx`` must be a layer this attention runs,

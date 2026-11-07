@@ -41,14 +41,19 @@ class KVResidentTables:
     columns a row holds, which is how the host sees a crossing.
     """
 
-    def __init__(self, planner: ResidentPlanner, key: str, page_size: int, max_pages: int):
+    def __init__(self, planner: ResidentPlanner, key: str, label: str, page_size: int, max_pages: int):
         self.planner = planner
         self.key = key
+        self.label = label
+        self.identity = (key, label)
         self.page_size = page_size
         self.block_table = planner.table(max_pages)
-        self.kv_len = planner.length_table(key)
+        self.kv_len = planner.length_table(self.identity)
         self.host_len = np.zeros(planner.max_slots, dtype=np.int64)
         self.host_cols = np.zeros(planner.max_slots, dtype=np.int64)
+
+    def stream(self, streams):
+        return next(stream for stream in streams[self.key] if stream.label == self.label)
 
     def row(self, stored_len: int, pages: list[int], slot: int, row: list[int], writes: ResidentWrites) -> None:
         """The cells of a stream about to append one token, or to be read. Its
@@ -58,10 +63,10 @@ class KVResidentTables:
             raise ValueError(f"{len(pages)} pages of a stream don't fit a block table row of {self.block_table.width}")
         page = self.page_size
         # a stream that appends holds the pages its next tokens go to, too
-        reads = writes.streams[self.key][0].reads
+        reads = self.stream(writes.streams).reads
         cols = -(-stored_len // page) if reads else (stored_len + writes.repeats - 1) // page + 1
         row[self.kv_len.col] = stored_len
-        writes.kv_len[self.key] = stored_len
+        writes.kv_len[self.identity] = stored_len
         if cols:
             writes.run(slot, self.block_table.col, pages[:cols])
         self.host_len[slot] = stored_len
@@ -83,7 +88,7 @@ class KVResidentTables:
         A stream the step only reads moves only under a host-planned step, so
         just the rows one moved are compared, and one that changed is
         rewritten whole."""
-        if plan.writes.streams[self.key][0].reads:
+        if self.stream(plan.writes.streams).reads:
             slot_of = self.planner.slot_of
             for rid in plan.moved:
                 slot = slot_of(rid)
@@ -106,13 +111,13 @@ class KVResidentTables:
                 rewrite(rid, slot, plan.writes)
             else:
                 plan.writes.put(self.block_table.cell(slot, last), stream_pages(rid)[last])
-        plan.crossed[self.key] = (rows, need[rows])
+        plan.crossed[self.identity] = (rows, need[rows])
 
     def advance(self, plan: ResidentPlan) -> None:
-        if plan.writes.streams[self.key][0].reads:
+        if self.stream(plan.writes.streams).reads:
             return
         self.host_len[plan.slots] += plan.writes.repeats
-        crossed = plan.crossed.get(self.key)
+        crossed = plan.crossed.get(self.identity)
         if crossed is not None:
             rows, need = crossed
             self.host_cols[plan.slots[rows]] = need
@@ -130,10 +135,10 @@ class KVResidentTables:
         reads. The planner has scattered the step's single cells already."""
         store, table = self.planner.store, self.block_table
         stride, page_size = table.stride, self.page_size
-        step.block_tables[self.key] = table
-        kv_len = step.buffers.kv_len[self.key]
+        step.block_tables[self.identity] = table
+        kv_len = step.buffers.kv_len[self.identity]
         gather_column(store, step.slots, stride, self.kv_len.col, kv_len)
-        if step.streams[self.key][0].reads:
+        if self.stream(step.streams).reads:
             return
         if store.is_cuda:
             _gather_write_slots_kernel[(step.bucket.bs,)](
@@ -147,5 +152,5 @@ class KVResidentTables:
         token_to_cache[:bs].copy_(kv_len - col * page_size)
 
     def commit(self, step: CapturedResidentStep) -> None:
-        if not step.streams[self.key][0].reads:
+        if not self.stream(step.streams).reads:
             advance_column(self.planner.store, step.slots, self.kv_len.stride, self.kv_len.col)

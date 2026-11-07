@@ -30,6 +30,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from itertools import chain
+from types import MappingProxyType
 from typing import NamedTuple
 
 import numpy as np
@@ -224,7 +225,7 @@ class ResidentWrites:
         self.cells: list[int] = []
         self.values: list[int] = []
         # each KV pool's stored length of the row being rewritten, for the owners after it
-        self.kv_len: dict[str, int] = {}
+        self.kv_len: dict[tuple[str, str], int] = {}
 
     def put(self, cell: int, value: int) -> None:
         self.cells.append(cell)
@@ -254,12 +255,14 @@ class ResidentBuffers:
     # the row the host stages: ``slots``, unless a capture that drops stopped
     # rows (``ResidentPlanner.drop_rows``) writes ``slots`` from it each replay
     rows: torch.Tensor
-    # each KV pool's stored lengths of the rows this step, by resource key: the
+    # each KV source stream's stored lengths of the rows this step: the
     # graph writes them, for what reads them after
-    kv_len: dict[str, torch.Tensor]
+    kv_len: dict[tuple[str, str], torch.Tensor]
     # the host row ``slots`` holds: a steady batch keeps one array, so no H2D and no compare
     staged: np.ndarray | None = None
     dirty: bool = False
+    # The capture's owner plans, not a later host-plan-free step's empty results.
+    plan_results: Mapping | None = None
 
 
 @dataclass(slots=True)
@@ -275,7 +278,7 @@ class ResidentPlan:
     taken: set[int]
     moved: set[int]
     # each KV pool's (rows, pages after the step) of its crossings, for `resident_advance`
-    crossed: dict[str, tuple[np.ndarray, np.ndarray]] = field(default_factory=dict)
+    crossed: dict[tuple[str, str], tuple[np.ndarray, np.ndarray]] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -288,8 +291,8 @@ class CapturedResidentStep:
     store: torch.Tensor
     # each resource's stream, by resource key
     streams: Mapping[str, tuple[ResidentStream, ...]]
-    # each KV pool's block table, by resource key, for attention that reads a row's pages itself
-    block_tables: dict[str, ResidentTable] = field(default_factory=dict)
+    # each KV source stream's block table, for attention reading its pages directly
+    block_tables: dict[tuple[str, str], ResidentTable] = field(default_factory=dict)
     # How each attention read its pages: off the tables alone, or through a
     # host plan of the step. Nothing plans the bucket only if none needed one.
     reads_tables: bool = False
@@ -338,7 +341,7 @@ class ResidentPlanner:
                 self.bindings[key] = binding
         self._tables: list[ResidentTable] = []
         # the KV pools whose stored lengths a capture gathers, as they bind
-        self._length_keys: list[str] = []
+        self._length_keys: list[tuple[str, str]] = []
         self._store: torch.Tensor | None = None
         # columns of the one-cell tables, which a rewritten row always covers
         self.narrow_cols = 0
@@ -386,7 +389,7 @@ class ResidentPlanner:
         self._tables.append(table)
         return table
 
-    def length_table(self, key: str) -> ResidentTable:
+    def length_table(self, key: tuple[str, str]) -> ResidentTable:
         """KV pool ``key``'s table of stored lengths, which each capture
         gathers into a buffer of its own (`ResidentBuffers.kv_len`)."""
         self._length_keys.append(key)
@@ -790,6 +793,8 @@ class ResidentPlanner:
             # once per bucket: each of its captures, and every step it replays, reads these
             streams = self._streams[bucket] = want
         buffers = self.buffers(bucket, slot)
+        if buffers.plan_results is None:
+            buffers.plan_results = MappingProxyType(dict(step.ctx.plan_results) if step.ctx is not None else {})
         lease = step.ctx.slot_lease if step.ctx is not None else None
         return CapturedResidentStep(bucket, slot, buffers.slots, buffers, self._store, streams,
                                     member=lease.member if lease is not None else "")

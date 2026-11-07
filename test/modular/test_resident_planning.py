@@ -32,7 +32,7 @@ from mstar.engine.resources.iteration_tables import IterationTables  # noqa: E40
 from mstar.engine.resources.kv import manager as manager_mod  # noqa: E402
 from mstar.engine.resources.kv.config import KVLayout, KVReqConfig, KVSpec, KVStep, PagedKVConfig  # noqa: E402
 from mstar.engine.resources.kv.manager import KVManager  # noqa: E402
-from mstar.engine.resources.kv.plan import SINK_PAGE  # noqa: E402
+from mstar.engine.resources.kv.plan import SINK_PAGE, KVPlanOutput, KVPlanOutputs  # noqa: E402
 from mstar.engine.resources.position.config import PositionConfig, PositionStep, PosScheme  # noqa: E402
 from mstar.engine.resources.position.manager import RopeManager  # noqa: E402
 from mstar.engine.resources.recurrent.config import (  # noqa: E402
@@ -115,7 +115,7 @@ def _stub_transfer(monkeypatch):
 
 def _resources(
     cpu_offload_pages: int = 0, max_num_pages: int = 64, pool_slots: int = 9,
-    prefix_cache=True, recurrent_prefix_slots=0,
+    prefix_cache=True, recurrent_prefix_slots=0, device=CPU,
 ):
     kv = KVManager(
         cfg=PagedKVConfig(
@@ -123,15 +123,15 @@ def _resources(
             max_num_pages=max_num_pages, page_size=PAGE, cpu_offload_pages=cpu_offload_pages,
             prefix_cache=prefix_cache,
         ),
-        name="kv", joint_comm_group=None, transfer_engine_info=None, device=CPU, dtype=torch.float32,
+        name="kv", joint_comm_group=None, transfer_engine_info=None, device=device, dtype=torch.float32,
     )
     kv._cg_max_seq_len = 64
-    pool = RecurrentStatePool(device=CPU, config=RecurrentStateConfig(
+    pool = RecurrentStatePool(device=device, config=RecurrentStateConfig(
         num_layers=1, max_slots=pool_slots, blocks={"state": RecurrentBlockConfig(shape=(2,), dtype=torch.float32)},
         prefix_slots=recurrent_prefix_slots,
     ))
     pool.bind_kv(kv)
-    rope = RopeManager(PositionConfig(kv_cache="kv"), CPU, max_seq_len=512, head_dim=8)
+    rope = RopeManager(PositionConfig(kv_cache="kv"), device, max_seq_len=512, head_dim=8)
     # page-locked memory needs a GPU, and nothing here copies out of it asynchronously
     rope._pinned_pos_ids_buffer = lambda key, n: torch.empty(n, dtype=torch.long)
     return {"kv": kv, "pool": pool, "rope": rope}
@@ -184,7 +184,9 @@ def _captured_step(res, planner: ResidentPlanner | None, rids, slot, bs, preplan
         res["rope"].plan(rope, first)
     captured = None
     if planner is not None:
+        step.set_ctx(first)
         captured = planner.capture_step(bucket, slot, step)
+        step.set_ctx(ctx)
         ctx.resident = planner
     if planner is None or preplan:
         ctx.is_preplan = preplan
@@ -262,7 +264,7 @@ def _same(a, b, real: int):
 
 
 def _row(planner: ResidentPlanner, live, rid: int):
-    tables = live["kv"]._resident
+    tables = live["kv"]._resident_tables["main"]
     slot = planner.slot_of(rid)
     n = int(tables.kv_len.view[slot, 0])
     cols = n // PAGE + (1 if n % PAGE else 0)
@@ -295,7 +297,7 @@ def test_steps_with_crossings_match_the_host_plan_and_the_host_lengths():
         a = _captured_step(live, planner, rids, slot=t % 2, bs=4)
         b = _captured_step(ref, None, rids, slot=t % 2, bs=4)
         _same(a, b, 3)
-    tables = live["kv"]._resident
+    tables = live["kv"]._resident_tables["main"]
     for rid in rids:
         _assert_row(planner, live, rid)
         slot = planner.slot_of(rid)
@@ -321,7 +323,7 @@ def test_a_repeated_step_addresses_each_replay_as_host_plans_would(repeats):
             for row, rid in enumerate(rids):
                 page = live["kv"]._streams[rid]["main"].page_indices[replay.positions[row] // PAGE]
                 assert replay.pages[row] == page
-    tables = live["kv"]._resident
+    tables = live["kv"]._resident_tables["main"]
     for rid in rids:
         _assert_row(planner, live, rid)
         assert tables.host_len[planner.slot_of(rid)] == live["kv"]._streams[rid]["main"].stored_len
@@ -364,7 +366,7 @@ def test_a_stopped_row_leaves_its_kv_and_recurrent_state_where_its_stop_left_the
     _replay(live, planner, s, head=head)
     assert [replay.pool_slots[0] == s.replays[0].pool_slots[0] for replay in s.replays] == [True, False, waiting]
     assert s.replays[0].pool_slots[1] == s.replays[2].pool_slots[1], "the other row keeps its slot"
-    lengths = live["kv"]._resident.kv_len
+    lengths = live["kv"]._resident_tables["main"].kv_len
     row, other = planner.slot_of(1), planner.slot_of(2)
 
     def stored(slot):
@@ -391,7 +393,7 @@ def test_a_run_that_ends_short_gives_back_what_its_commit_counted():
     for key, step in (("kv", s.kv), ("pool", s.pool), ("rope", s.rope)):
         live[key].rewind_run(step, s.ctx, 2, {1})
     assert stream.stored_len == 4
-    assert live["kv"]._resident.host_len[planner.slot_of(1)] == 4
+    assert live["kv"]._resident_tables["main"].host_len[planner.slot_of(1)] == 4
     assert live["pool"]._slots[1]["main"].tokens == 4
 
 
@@ -1067,9 +1069,12 @@ def test_cached_pages_are_room_for_a_step_that_repeats():
     kv._index = SimpleNamespace(evictable=lambda: {5, 6})
     kv.config = SimpleNamespace(max_seq_len=10 * PAGE, request_pages=100)
     kv._streams = {}
-    step = SimpleNamespace(segments=())
+    step = SimpleNamespace(segments=tuple(Segment(rid, "main", 1) for rid in (1, 2, 3, 4)))
     assert kv.max_repeats(step, SimpleNamespace(request_ids=(1, 2, 3), repeats=2, resident=object())) == PAGE
     assert kv.max_repeats(step, SimpleNamespace(request_ids=(1, 2, 3, 4), repeats=2, resident=object())) == 1
+
+    step = SimpleNamespace(segments=tuple(Segment(rid, label, 1) for label in ("main", "uncond") for rid in (1, 2)))
+    assert kv.max_repeats(step, SimpleNamespace(request_ids=(1, 2), repeats=2, resident=object())) == 1
 
 
 def test_under_tp_a_steps_repeats_never_narrow_on_a_ranks_own_free_pages():
@@ -1354,7 +1359,7 @@ def test_padding_rows_read_the_trash_row_and_leave_it_alone():
         assert a.offsets[1:] == [0] * 3
         assert a.pool_slots[1:] == [SINK_SLOT] * 3
         assert a.positions[1:] == [0] * 3
-    tables = live["kv"]._resident
+    tables = live["kv"]._resident_tables["main"]
     assert int(tables.kv_len.view[TRASH_SLOT, 0]) == 0
     assert tables.block_table.view[TRASH_SLOT].eq(SINK_PAGE).all()
     assert int(live["pool"]._resident_table.view[TRASH_SLOT, 0]) == SINK_SLOT
@@ -1664,8 +1669,9 @@ def test_the_captured_kernels_match_the_torch_ops():
         gather_column(store, slots, 7, 1, out)
         gather_column(store, slots, 7, 2, small, plus=out)
         advance_column(store, slots, 7, 1)
-        tables = SimpleNamespace(
-            planner=SimpleNamespace(store=store), page_size=4, key="kv",
+        tables = KVResidentTables.__new__(KVResidentTables)
+        tables.__dict__.update(
+            planner=SimpleNamespace(store=store), page_size=4, key="kv", label="main", identity=("kv", "main"),
             block_table=SimpleNamespace(stride=7, col=3), kv_len=SimpleNamespace(stride=7, col=1),
         )
         store[slots * 7 + 1] = torch.tensor([9, 5, 0, 0], device=device)
@@ -1673,7 +1679,7 @@ def test_the_captured_kernels_match_the_torch_ops():
         offsets = torch.zeros(4, dtype=torch.long, device=device)
         step = SimpleNamespace(
             slots=slots, bucket=SimpleNamespace(bs=4), buffers=SimpleNamespace(
-                cells=torch.zeros((2, 8), dtype=torch.long, device=device), kv_len={"kv": out},
+                cells=torch.zeros((2, 8), dtype=torch.long, device=device), kv_len={("kv", "main"): out},
             ), streams={"kv": (resident_mod.ResidentStream("main", reads=False),)}, block_tables={},
         )
         KVResidentTables.gather(tables, step, pages, offsets)
@@ -1849,7 +1855,7 @@ def test_a_displaced_row_is_written_whole_with_its_lengths():
     assert planner.slot_of(1) is None
     assert planner.slot_of(9) == victim_slot
     assert s.ctx.resident_plan.taken == {9}
-    tables = live["kv"]._resident
+    tables = live["kv"]._resident_tables["main"]
     assert tables.host_len[victim_slot] == live["kv"]._streams[9]["main"].stored_len
     _assert_row(planner, live, 9)
     # the next victims are the rest of the oldest step, in the order they took slots
@@ -1938,7 +1944,7 @@ def test_fresh_resident_rows_preserve_a_queued_capture_and_ordinary_sequence(mon
     if cached:
         assert slot == old_slot
     assert planner._readers[slot] == 1
-    tables = live["kv"]._resident
+    tables = live["kv"]._resident_tables["main"]
     assert tables.host_len[slot] == before_length
     assert tables.host_cols[slot] == 2
     assert tables.block_table.view[slot, :2].tolist() == live["kv"]._streams[2]["main"].page_indices[:2]
@@ -1978,7 +1984,8 @@ def test_joining_reuses_cached_rows_only_after_their_commit_and_last_reader():
     snapshot = planner.prepare_rows(queued.step, queued.ctx)
     planner.flush(snapshot)
     assert snapshot.slots.tolist() == [original_slot]
-    assert live["kv"]._resident.kv_len.view[original_slot, 0].item() == live["kv"]._streams[1]["main"].stored_len
+    assert (live["kv"]._resident_tables["main"].kv_len.view[original_slot, 0].item()
+            == live["kv"]._streams[1]["main"].stored_len)
     planner.unpin(tuple(snapshot.slots.tolist()))
     _slot_ledger(planner)
 
@@ -2180,7 +2187,7 @@ def test_joining_horizon_preserves_other_preplans_and_settles_both_receipts(monk
     runner.settle_run(receipts[1], {2: 2})
     expected = 5 + first_count
     assert kv._streams[2]["main"].stored_len == rope.position(2, "main") == expected
-    assert kv._resident.host_len[planner.slot_of(2)] == expected
+    assert kv._resident_tables["main"].host_len[planner.slot_of(2)] == expected
     assert live["pool"]._slots[2]["main"].tokens == expected
     assert live["pool"]._slots[2]["main"].has_state
     assert (runner._staged, runner._pre_admitted, kv._preplan_key, kv._cached_plan_output, planner._staged) == original
@@ -2410,19 +2417,19 @@ def _kv(max_seq_len: int, max_num_pages: int) -> KVManager:
 def test_a_row_is_as_wide_as_the_pool_when_the_context_is_wider():
     kv = _kv(max_seq_len=1 << 20, max_num_pages=64)
     ResidentPlanner("n", _walk("kv"), {"kv": kv}, CPU, max_bs=1)
-    assert kv._resident.block_table.width == kv.config.request_pages == 63
+    assert kv._resident_tables["main"].block_table.width == kv.config.request_pages == 63
 
 
 def test_a_row_is_as_wide_as_the_context_when_the_pool_is_wider():
     kv = _kv(max_seq_len=4 * 10 + 1, max_num_pages=64)
     ResidentPlanner("n", _walk("kv"), {"kv": kv}, CPU, max_bs=1)
-    assert kv._resident.block_table.width == 11
+    assert kv._resident_tables["main"].block_table.width == 11
 
 
 def test_a_stream_wider_than_a_row_raises():
     kv = _kv(max_seq_len=8, max_num_pages=64)
     planner = ResidentPlanner("n", _walk("kv"), {"kv": kv}, CPU, max_bs=1)
-    tables = kv._resident
+    tables = kv._resident_tables["main"]
     assert tables.block_table.width == 2
     writes = resident_mod.ResidentWrites({"kv": (resident_mod.ResidentStream("main", reads=False),)})
     with pytest.raises(ValueError, match="fit a block table row"):
@@ -2687,7 +2694,7 @@ def test_a_refused_admit_offloads_a_victim_and_its_reload_is_written_whole():
     assert s.ctx.resident_plan.taken == {3}
     stream = kv._streams[3]["main"]
     assert stream.stored_len == 13
-    assert kv._resident.host_len[planner.slot_of(3)] == stream.stored_len
+    assert kv._resident_tables["main"].host_len[planner.slot_of(3)] == stream.stored_len
     _assert_step_read_its_streams(live, s, [3])
     _assert_row(planner, live, 3)
 
@@ -2807,9 +2814,11 @@ def _decoder_step(res, planner, rids, slot, bs, context_span=0):
         first.plan_results["kv"] = res["kv"].plan(kv, first)
         first.plan_results["ctx"] = res["ctx"].plan(cx, first)
         res["rope"].plan(rope, first)
+        step.set_ctx(first)
     captured = None
     if planner is not None:
         captured = planner.capture_step(bucket, slot, step)
+        step.set_ctx(ctx)
         ctx.resident = planner
         planner.plan(step, ctx)
     ctx.plan_results["kv"] = res["kv"].plan(kv, ctx)
@@ -2826,7 +2835,7 @@ def _decoder_step(res, planner, rids, slot, bs, context_span=0):
         setattr(out, f"{key}_pages", state.token_to_page[:bs].tolist())
         setattr(out, f"{key}_offsets", state.token_to_cache[:bs].tolist())
     if planner is not None:
-        out.lens = {key: lens[:bs].tolist() for key, lens in captured.buffers.kv_len.items()}
+        out.lens = {key: lens[:bs].tolist() for (key, label), lens in captured.buffers.kv_len.items()}
         planner.commit_in_graph(captured)
     for key, resource_step in (("kv", kv), ("ctx", cx), ("rope", rope)):
         res[key].commit(resource_step, ctx)
@@ -2838,7 +2847,7 @@ def _decoder_step(res, planner, rids, slot, bs, context_span=0):
 def _assert_pool_row(planner, live, key: str, rid: int) -> None:
     """``key``'s cells of ``rid``'s row hold its stream: the stored length, and
     every page holding a token."""
-    tables, stream = live[key]._resident, live[key]._streams[rid]["main"]
+    tables, stream = live[key]._resident_tables["main"], live[key]._streams[rid]["main"]
     slot = planner.slot_of(rid)
     n = int(tables.kv_len.view[slot, 0])
     assert n == stream.stored_len
@@ -2847,19 +2856,19 @@ def _assert_pool_row(planner, live, key: str, rid: int) -> None:
 
 def _assert_trash_row(live) -> None:
     for key in ("kv", "ctx"):
-        tables = live[key]._resident
+        tables = live[key]._resident_tables["main"]
         assert int(tables.kv_len.view[TRASH_SLOT, 0]) == 0
         assert tables.block_table.view[TRASH_SLOT].eq(SINK_PAGE).all()
 
 
 def test_two_pools_lay_out_a_span_each_after_the_narrow_columns():
     live, _, planner = _decoder_setup({})
-    kv, ctx = live["kv"]._resident, live["ctx"]._resident
+    kv, ctx = live["kv"]._resident_tables["main"], live["ctx"]._resident_tables["main"]
     assert planner.narrow_cols == 3
     assert kv.block_table.col == 3 and kv.block_table.width == 63
     assert ctx.block_table.col == 3 + 63 and ctx.block_table.width == 16
     assert planner._stride == 3 + 63 + 16
-    assert {kv.kv_len.col, ctx.kv_len.col, live["rope"]._resident_delta.col} == {0, 1, 2}
+    assert {kv.kv_len.col, ctx.kv_len.col, live["rope"]._resident_delta["main"].col} == {0, 1, 2}
     for table in (kv.block_table, ctx.block_table, kv.kv_len, ctx.kv_len):
         assert table.view.data_ptr() == planner.store.data_ptr() + 8 * table.col
 
@@ -2881,13 +2890,13 @@ def test_a_self_attention_pool_and_a_context_pool_run_through_captured_steps():
         assert a.lens == {"kv": before + [0], "ctx": contexts + [0]}
         # the padding row
         assert (a.kv_pages[3], a.kv_offsets[3], a.positions[3]) == (SINK_PAGE, 0, 0)
-        assert set(a.plan.crossed) <= {"kv"}
-        crossed += "kv" in a.plan.crossed
+        assert set(a.plan.crossed) <= {("kv", "main")}
+        crossed += ("kv", "main") in a.plan.crossed
         for rid in rids:
             _assert_pool_row(planner, live, "kv", rid)
             _assert_pool_row(planner, live, "ctx", rid)
         _assert_trash_row(live)
-    ctx = live["ctx"]._resident
+    ctx = live["ctx"]._resident_tables["main"]
     assert [int(ctx.host_len[planner.slot_of(rid)]) for rid in rids] == contexts
     assert crossed >= 3
 
@@ -2897,12 +2906,12 @@ def test_a_crossing_on_the_appending_pool_writes_its_table_alone():
     del ref
     for t in range(2):
         _decoder_step(live, planner, [1], slot=t % 2, bs=1)
-    kv, ctx = live["kv"]._resident, live["ctx"]._resident
+    kv, ctx = live["kv"]._resident_tables["main"], live["ctx"]._resident_tables["main"]
     slot = planner.slot_of(1)
     held = planner.store.view(planner.max_slots, planner._stride)[slot].clone()
     # stored 4 of a page of 4: this step's token goes to the row's second page
     s = _decoder_step(live, planner, [1], slot=0, bs=1)
-    assert list(s.plan.crossed) == ["kv"]
+    assert list(s.plan.crossed) == [("kv", "main")]
     assert s.plan.writes.cells == [kv.block_table.cell(slot, 1)]
     row = planner.store.view(planner.max_slots, planner._stride)[slot]
     changed = (row != held).nonzero().flatten().tolist()
@@ -2918,7 +2927,7 @@ def test_a_stale_row_is_rewritten_whole_with_both_spans():
     for t in range(3):
         _decoder_step(live, planner, [1, 2], slot=t % 2, bs=2)
     slot = planner.slot_of(2)
-    kv, ctx = live["kv"]._resident, live["ctx"]._resident
+    kv, ctx = live["kv"]._resident_tables["main"], live["ctx"]._resident_tables["main"]
     # whatever the device row held, a stale row comes back from the streams
     planner.store.view(planner.max_slots, planner._stride)[slot].fill_(77)
     planner.mark_stale(2)
@@ -2928,7 +2937,7 @@ def test_a_stale_row_is_rewritten_whole_with_both_spans():
     assert kv.block_table.col == 3
     _assert_pool_row(planner, live, "kv", 2)
     _assert_pool_row(planner, live, "ctx", 2)
-    assert int(live["rope"]._resident_delta.view[slot, 0]) == 0
+    assert int(live["rope"]._resident_delta["main"].view[slot, 0]) == 0
     _assert_pool_row(planner, live, "kv", 1)
 
 
@@ -2955,14 +2964,14 @@ def test_a_context_moved_by_a_host_step_is_rewritten_and_an_unmoved_one_is_not()
 def test_a_context_the_step_only_reads_never_advances():
     live, ref, planner = _decoder_setup({1: (3, 7)})
     del ref
-    ctx = live["ctx"]._resident
+    ctx = live["ctx"]._resident_tables["main"]
     for t in range(6):
         s = _decoder_step(live, planner, [1], slot=t % 2, bs=2)
     slot = planner.slot_of(1)
     assert int(ctx.kv_len.view[slot, 0]) == int(ctx.host_len[slot]) == 7
     assert int(ctx.host_cols[slot]) == 2
     assert s.captured.streams["ctx"][0].reads and not s.captured.streams["kv"][0].reads
-    assert "ctx" in s.captured.block_tables and "kv" in s.captured.block_tables
+    assert ("ctx", "main") in s.captured.block_tables and ("kv", "main") in s.captured.block_tables
 
 
 @pytest.mark.parametrize("actual", [0, 2])
@@ -2996,8 +3005,8 @@ def test_a_joining_receipt_retains_its_readonly_context_when_it_ends_short(actua
     assert resources["kv"]._streams[1]["main"].stored_len == 3 + actual
     assert context.stored_len == 16 and tuple(context.page_indices) == pages
     slot = planner.slot_of(1)
-    assert resources["ctx"]._resident.host_len[slot] == 16
-    assert resources["ctx"]._resident.kv_len.view[slot, 0].item() == 16
+    assert resources["ctx"]._resident_tables["main"].host_len[slot] == 16
+    assert resources["ctx"]._resident_tables["main"].kv_len.view[slot, 0].item() == 16
     planner.release(1)
     assert planner._readers[slot] == 1 and slot not in planner._free
     planner.unpin((slot,))
@@ -3050,7 +3059,7 @@ def test_labelled_streams_are_declared_but_unmigrated_owners_refuse_them():
     }
     res = _resources()
     planner, why = _build({"kv": res["kv"]}, step=step)
-    assert planner is None and "one labelled stream" in why
+    assert planner is None and "must all append" in why
     # The generic declaration does not choose KV's combined-plan ordering.
     step.steps["kv"] = replace(step.steps["kv"], combined_labels={("aux", "main"): "combined"})
     assert resident_mod.declared_streams(("kv",), step)["kv"] == (
@@ -3064,6 +3073,145 @@ def test_labelled_streams_are_declared_but_unmigrated_owners_refuse_them():
     ):
         step.steps["kv"] = KVStep(segments=(*rows, *auxiliary))
         assert resident_mod.step_refusal(("kv", "rope"), step) is not None
+
+
+@pytest.mark.parametrize("device_name", ["cpu", "cuda"])
+@pytest.mark.parametrize("full_grid", [False, True])
+@pytest.mark.parametrize("combined", [False, True])
+def test_labelled_histories_keep_logical_rows_through_a_short_run_and_queued_successor(
+    combined, full_grid, device_name,
+):
+    if device_name == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA is unavailable")
+    device = torch.device(device_name)
+    live = _resources(prefix_cache=False, device=device)
+    runner = StepRunner(live)
+    lengths = {1: {"main": 3, "uncond": 6}, 2: {"main": 8, "uncond": 2}}
+    for rid, labels in lengths.items():
+        runner.ingest_request(rid, {"kv": KVReqConfig()})
+        _host_step(live, [rid], [labels["main"]])
+        segments = (Segment(rid, "uncond", labels["uncond"]),)
+        warm = SubmoduleStep({"kv": KVStep(segments=segments), "rope": PositionStep(segments=segments)})
+        warm.set_ctx(StepContext((rid,), "prefill", 0, False))
+        assert runner.admit(warm).ok
+        runner.plan(warm)
+        runner.commit(warm)
+        live["rope"]._counters[rid]["uncond"] += 7
+    descriptors = (resident_mod.ResidentStream("main", False), resident_mod.ResidentStream("uncond", False))
+    planner = ResidentPlanner("n", {WALK: {"kv": descriptors, "rope": descriptors, "pool": descriptors[:1]}},
+                              live, device, max_bs=3)
+    bucket = BucketKey(WALK, 3, 6)
+    padded = (1, 2, -1)
+    segments = tuple(Segment(rid, label, 1) for label in ("main", "uncond") for rid in padded)
+    grouping = {("uncond", "main"): "cfg"} if combined else {}
+    main = tuple(segment for segment in segments if segment.label == "main")
+    packing = ({"cfg": {"uncond": slice(0, 3), "main": slice(3, 6)}} if combined else
+               {"main": {"main": slice(0, 3)}, "uncond": {"uncond": slice(0, 3)}})
+
+    def declared(slot, repeats, capture=False):
+        step = SubmoduleStep({"kv": KVStep(segments=segments, combined_labels=grouping),
+                              "rope": PositionStep(segments=segments), "pool": RecurrentStep(segments=main)},
+                             segments=list(segments))
+        ctx = StepContext(padded if capture else (1, 2), WALK, slot, capture,
+                          slot_lease=SlotLease(slot, bucket), repeats=repeats)
+        ctx.set_padded_rids(padded)
+        step.set_ctx(ctx)
+        return step
+
+    first = declared(0, 4)
+    first.ctx.resident = planner
+    # Reserve the first window before creating the two ordinary capture slots.
+    assert runner.admit(first).ok and first.ctx.repeats == 4
+    captures = []
+    attention = FlashInferManager.__new__(FlashInferManager)
+    attention._kv_cache_name, attention._cg_plan_states = "kv", {}
+    for slot in (0, 1):
+        template = declared(slot, 1, capture=True)
+        runner.plan(template)
+        captures.append(planner.capture_step(bucket, slot, template))
+        for plan_label, sources in packing.items():
+            physical = max(part.stop for part in sources.values())
+            wrapper = FlashInferDecodeWrapper.__new__(FlashInferDecodeWrapper)
+            wrapper.batch_size, wrapper.page_size, wrapper._resident_pages = physical, PAGE, 32 if full_grid else None
+            wrapper._paged_kv_indices_buf = torch.zeros(physical * 32, dtype=torch.int32, device=device)
+            wrapper._paged_kv_last_page_len_buf = torch.zeros(physical, dtype=torch.int32, device=device)
+            wrapper._page_base = torch.full((physical,), 31 * PAGE, dtype=torch.int32, device=device)
+            attention._cg_plan_states[CGSlotKey(bucket, slot, plan_label)] = wrapper
+        # The capture retained the mapping even when the caller reuses its result dict.
+        template.ctx.plan_results.clear()
+    planner.bindings["attn"] = attention.resident_binding()
+    first.ctx.resident = planner
+    planner.plan(first, first.ctx)
+    runner.plan(first)
+    planner.flush(first.ctx.resident_plan)
+    runner.commit(first)
+    planner.commit(first, first.ctx)
+    second = declared(1, 3)
+    second.ctx.resident = planner
+    assert runner.admit(second).ok and second.ctx.repeats == 3
+    planner.plan(second, second.ctx)
+    runner.plan(second)
+
+    graphs = {}
+
+    def body(captured):
+        planner.gather(captured)
+        planner.run_gather(captured)
+        planner.commit_in_graph(captured)
+
+    def execute(captured, executed):
+        if device_name == "cuda":
+            if captured.slot not in graphs:
+                saved = planner.store.clone()
+                body(captured)
+                torch.cuda.synchronize()
+                planner.store.copy_(saved)
+                graph = graphs[captured.slot] = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    body(captured)
+            graphs[captured.slot].replay()
+        else:
+            body(captured)
+        for plan_label, sources in packing.items():
+            state = live["kv"]._static_plan_state(captured.slot, (plan_label, 0), bucket.num_tokens)
+            positions = live["rope"]._static_pos_ids[CGSlotKey(bucket, captured.slot, plan_label)]
+            wrapper = attention._cg_plan_states[CGSlotKey(bucket, captured.slot, plan_label)]
+            for label, part in sources.items():
+                want = [lengths[rid][label] + executed for rid in (1, 2)]
+                assert state.token_to_cache[part][:2].tolist() == [n % PAGE for n in want]
+                assert state.token_to_page[part][:2].tolist() == [
+                    live["kv"]._streams[rid][label].page_indices[n // PAGE] for rid, n in zip((1, 2), want, strict=True)
+                ]
+                if full_grid:
+                    pages = wrapper._paged_kv_indices_buf.reshape(-1, 32)[part][:2].tolist()
+                    for rid, length, row in zip((1, 2), want, pages, strict=True):
+                        used = (length + 1 + PAGE - 1) // PAGE
+                        assert row[:used] == list(live["kv"]._streams[rid][label].page_indices[:used])
+                        assert row[used:] == [0] * (32 - used)
+                assert positions[part][:2].tolist() == [n + (7 if label == "uncond" else 0) for n in want]
+                assert wrapper._paged_kv_last_page_len_buf[part][:2].tolist() == [n + 1 - 31 * PAGE for n in want]
+        recurrent = live["pool"]._cg_addressing[CGSlotKey(bucket, captured.slot, "main")].slot_indices
+        assert recurrent.numel() == 3
+        assert recurrent[:2].tolist() == [live["pool"]._slots[r]["main"].index for r in (1, 2)]
+        assert recurrent[-1].item() == SINK_SLOT
+
+    execute(captures[0], 0)
+    execute(captures[0], 1)
+    runner.settle_run(first, {1: 2, 2: 2})
+    for label, tables in live["kv"]._resident_tables.items():
+        assert [tables.host_len[planner.slot_of(r)] for r in (1, 2)] == [lengths[r][label] + 2 for r in (1, 2)]
+    planner.flush(second.ctx.resident_plan)
+    for executed in range(2, 5):
+        execute(captures[1], executed)
+    runner.commit(second)
+    planner.commit(second, second.ctx)
+    for rid in (1, 2):
+        for label in ("main", "uncond"):
+            assert live["kv"]._streams[rid][label].stored_len == lengths[rid][label] + 5
+    # A different combined label order cannot reuse this capture's addresses.
+    changed = replace(second.steps["kv"], combined_labels={("main", "uncond"): "changed"})
+    with pytest.raises(ValueError, match="packing differs"):
+        live["kv"].plan(changed, second.ctx)
 
 
 def test_a_bucket_that_declares_other_streams_than_its_walk_stops_the_worker():
@@ -3080,7 +3228,7 @@ class _Fmha:
     def __init__(self):
         self.calls = []
 
-    def gather_resident(self, store, slots, kv_len, stride, block_col):
+    def gather_resident(self, store, slots, kv_len, stride, block_col, *, row_start=0):
         self.calls.append((kv_len, block_col))
 
 
@@ -3104,11 +3252,16 @@ def test_the_fmha_gather_reads_its_own_pools_table_and_lengths(monkeypatch, pool
     segments = [Segment(1, "main", 1), Segment(2, "main", 1)]
     # both pools append here, so either can be read off the tables
     step = SubmoduleStep(steps={"kv": KVStep(), "ctx": KVStep(), "rope": PositionStep()}, segments=segments)
+    step.set_ctx(StepContext(request_ids=(1, 2), graph_walk=WALK, slot=0, capture=True))
+    step.ctx.plan_results = {key: KVPlanOutputs({"main": KVPlanOutput(None, rows=[
+        (rid, "main", 1) for rid in (1, 2)
+    ])}) for key in ("kv", "ctx")}
     captured = planner.capture_step(BucketKey(WALK, 2, 2), 0, step)
     for key in ("kv", "ctx"):
         live[key].resident_binding().gather(captured)
     manager.resident_binding().gather(captured)
-    assert wrapper.calls == [(captured.buffers.kv_len[pool], live[pool]._resident.block_table.col)]
+    table = live[pool]._resident_tables["main"]
+    assert wrapper.calls == [(captured.buffers.kv_len[pool, "main"], table.block_table.col)]
     assert captured.reads_tables and not captured.host_planned
 
 
@@ -3122,7 +3275,12 @@ def test_an_fmha_wrapper_over_a_pool_the_step_only_reads_keeps_its_host_plan(mon
     segments = [Segment(1, "main", 1), Segment(2, "main", 1)]
     context = (Segment(1, "main", 0), Segment(2, "main", 0))
     steps = {"kv": KVStep(), "ctx": KVStep(segments=context), "rope": PositionStep()}
-    captured = planner.capture_step(BucketKey(WALK, 2, 2), 0, SubmoduleStep(steps=steps, segments=segments))
+    step = SubmoduleStep(steps=steps, segments=segments)
+    step.set_ctx(StepContext(request_ids=(1, 2), graph_walk=WALK, slot=0, capture=True))
+    step.ctx.plan_results = {"ctx": KVPlanOutputs({"main": KVPlanOutput(None, rows=[
+        (rid, "main", 0) for rid in (1, 2)
+    ])})}
+    captured = planner.capture_step(BucketKey(WALK, 2, 2), 0, step)
     manager.resident_binding().gather(captured)
     assert not wrapper.calls and captured.host_planned
 
@@ -3351,13 +3509,11 @@ def test_a_walk_declaring_forks_or_a_sink_is_refused_at_load(field, value):
     assert planner is None and field in why
 
 
-@pytest.mark.parametrize("segments", [
-    [Segment(1, "main", 2)], [Segment(1, "a", 1), Segment(1, "b", 1)],
-], ids=["two_tokens", "two_labels"])
-def test_a_walk_that_isnt_one_token_a_row_in_one_stream_is_refused_at_load(segments):
+def test_a_walk_that_isnt_one_token_a_row_is_refused_at_load():
+    segments = [Segment(1, "main", 2)]
     res = _resources()
     planner, why = _build({"kv": res["kv"]}, step=SubmoduleStep(steps={}, segments=segments))
-    assert planner is None and ("not one token a row" in why or "one labelled stream" in why)
+    assert planner is None and "not one token a row" in why
 
 
 # ---- the engine ----

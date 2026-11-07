@@ -191,13 +191,15 @@ class _Node:
                     self.sampler.ingest_capture_row(rid)
             cap = StepContext(request_ids=padded, graph_walk=WALK, slot=slot, capture=True, slot_lease=lease)
             if kv is not None:
-                self.kv.plan(kv, cap)
+                cap.plan_results["kv"] = self.kv.plan(kv, cap)
             self.sampler.plan(smp, cap)
+            step.set_ctx(cap)
             rec = self.planner.capture_step(bucket, slot, step) if self.planner is not None else None
             if rec is not None:
                 self.planner.gather(rec)
             # the sampler the captured forward sampled with: its views are what a replay reads
             self.captured[key] = (rec, self.sampler._cg_sampler)
+        step.set_ctx(ctx)
         rec, graph_sampler = self.captured[key]
         if self.planner is not None:
             ctx.resident = self.planner
@@ -540,7 +542,7 @@ def test_other_owners_keep_their_cells(drawn, ingraph):
         node.ingest(rid, _cfg(seed=rid), prompt=5)
     for i, rids in enumerate([(1, 2), (3, 1), (2, 3), (1, 2)]):
         node.decode(list(rids), slot=i % 2)
-    tables = node.kv._resident
+    tables = node.kv._resident_tables["main"]
     cols = [t.col for t in node.sampler._cells._tables] if ingraph else []
     if ingraph:
         assert cols == list(range(cols[0], cols[0] + len(cols)))
