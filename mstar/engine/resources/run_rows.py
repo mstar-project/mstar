@@ -124,7 +124,7 @@ class RunRows(Resource):
     def build(cls, spec: RunRowsSpec, info: EngineResourceInfo) -> RunRows:
         return cls(info.device, spec.rows, spec.capacity, spec.binding_width)
 
-    def reserve(
+    def reserve_row(
         self, request_id: int, request_generation: int, row: int, bindings: Sequence[int],
     ) -> RunRow | None:
         """Take a descriptor credit; exhaustion leaves ordinary readiness intact."""
@@ -180,7 +180,7 @@ class RunRows(Resource):
         if self.publication_stream is not None and torch.cuda.current_stream(self.device) != self.publication_stream:
             raise ValueError("run membership writes must use its publication stream")
 
-    def publish(self, descriptor: RunRow) -> None:
+    def publish_row(self, descriptor: RunRow) -> None:
         """On the publication stream, after all new owner writes are queued."""
         self._check(descriptor)
         self._check_publication_stream()

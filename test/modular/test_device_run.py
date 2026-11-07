@@ -1269,6 +1269,9 @@ def test_run_membership_keeps_old_readers_across_captured_row_reuse(device_name)
         pytest.skip("CUDA membership publication")
     device = torch.device(device_name, 0) if device_name == "cuda" else CPU
     rows = RunRows(device, rows=1, capacity=2, binding_width=2)
+    from mstar.engine.resources.runner import StepRunner
+
+    assert StepRunner({"membership": rows}).publish([7]) == {7: {}}
     snapshots = [(torch.zeros(1, dtype=torch.long, device=device),
                   torch.zeros((1, 2), dtype=torch.long, device=device)) for _ in range(2)]
     stopped = torch.ones(1, dtype=torch.bool, device=device)
@@ -1299,10 +1302,10 @@ def test_run_membership_keeps_old_readers_across_captured_row_reuse(device_name)
             rows.publication_stream.wait_stream(torch.cuda.current_stream())
         return rows.release(descriptor)
 
-    first = rows.reserve(7, 1, 0, (11, 21))
+    first = rows.reserve_row(7, 1, 0, (11, 21))
     rows.retain(first)  # the first run's output reader outlives later runs
     with publication():
-        rows.publish(first)
+        rows.publish_row(first)
     ids, bindings = execute(0)
     old_ids, old_bindings = ids.clone(), bindings.clone()
     assert ids.tolist() == [first.handle] and bindings.tolist() == [[11, 21]]
@@ -1312,16 +1315,16 @@ def test_run_membership_keeps_old_readers_across_captured_row_reuse(device_name)
     # Both captures existed before either generation was published. A long-lived
     # output reader retains one credit while the other cycles through new rows.
     for generation in (2, 3, 4):
-        next_row = rows.reserve(7, generation, 0, (10 + generation, 20 + generation))
+        next_row = rows.reserve_row(7, generation, 0, (10 + generation, 20 + generation))
         assert next_row is not None and next_row.handle != first.handle
         with publication():
-            rows.publish(next_row)
+            rows.publish_row(next_row)
         ids, bindings = execute(generation % 2)
         assert ids.tolist() == [next_row.handle]
         assert bindings.tolist() == [[10 + generation, 20 + generation]]
         rows.retain(next_row)
         assert not retire(next_row, ids)
-        assert rows.reserve(8, 1, 0, (8, 8)) is None  # readers hold both credits
+        assert rows.reserve_row(8, 1, 0, (8, 8)) is None  # readers hold both credits
         assert rows.release(next_row)
     assert old_ids.tolist() == [first.handle] and old_bindings.tolist() == [[11, 21]]
     assert rows.release(first)
@@ -1346,9 +1349,9 @@ def test_run_membership_retracts_zero_work_and_cancels_accepted_rows(cancel_at, 
             method(*args)
         if device.type == "cuda":
             torch.cuda.current_stream().wait_stream(rows.publication_stream)
-    descriptor = rows.reserve(3, 1, 0, (17,))
+    descriptor = rows.reserve_row(3, 1, 0, (17,))
     if cancel_at != "unpublished":
-        publish_call(rows.publish, descriptor)
+        publish_call(rows.publish_row, descriptor)
     if cancel_at == "active":
         rows.boundary(ids, bindings)
         assert ids.tolist() == [descriptor.handle]
@@ -1362,9 +1365,9 @@ def test_run_membership_retracts_zero_work_and_cancels_accepted_rows(cancel_at, 
             assert ids.tolist() == [0] and bindings.tolist() == [[0]]
     rows.acknowledge(rows.control.tolist())
     assert rows.release(descriptor)
-    replacement = rows.reserve(3, 2, 0, (23,))
+    replacement = rows.reserve_row(3, 2, 0, (23,))
     assert replacement.handle != descriptor.handle
-    publish_call(rows.publish, replacement)
+    publish_call(rows.publish_row, replacement)
     rows.boundary(ids, bindings)
     assert ids.tolist() == [replacement.handle] and bindings.tolist() == [[23]]
     with pytest.raises(ValueError):
