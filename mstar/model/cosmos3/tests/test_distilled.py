@@ -83,7 +83,7 @@ def test_distilled_request_resolution(tmp_path) -> None:
         ({"generate_sound": True, "num_frames": 33}, ["text"]),
         ({"action_mode": "policy", "domain_name": "droid_lerobot", "raw_action_dim": 10}, ["image", "text"]),
     ):
-        out_mods = ["video"] if "num_frames" in bad or "action_mode" in bad else ["image"]
+        out_mods = ["action"] if "action_mode" in bad else ["video"] if "num_frames" in bad else ["image"]
         with pytest.raises(ValueError, match="distilled"):
             model._resolve_gen_params(bad, mods, out_mods)
     with pytest.raises(ValueError, match="distilled"):

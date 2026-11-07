@@ -678,13 +678,18 @@ def test_video_streaming_ndjson_lines() -> None:
     """stream_video turns the video handler into an NDJSON generator: indexed
     video lines closed by a done line, an in-band error line terminal instead
     on failure, and the non-streaming path collecting as before."""
+    from mstar.api_server.entrypoint import APIServer
     from mstar.api_server.openai.adapters import get_adapter
     from mstar.api_server.openai.protocol import VideoGenerationRequest
     from mstar.api_server.openai.serving_videos import create_videos
     from mstar.api_server.request_types import ResultChunk
 
     class _Api:
+        open_result_stream = APIServer.open_result_stream
         upload_dir = "/tmp"
+
+        def release_request(self, request_id):
+            pass
 
         def __init__(self, chunks):
             self._chunks = chunks
@@ -900,8 +905,12 @@ def test_session_in_flight_is_pinned_and_exclusive(monkeypatch) -> None:
     sub._sessions.capacity = 1
     _prefill(sub, "r1", _SESSION_MD)
     assert sub._sessions.live("w") == "r1"
-    with pytest.raises(ValueError, match="in use by request 'r1'"):
+    from fastapi import HTTPException
+
+    with pytest.raises(HTTPException) as busy:
         _prefill(sub, "r2", _SESSION_MD)
+    assert busy.value.status_code == 409
+    assert "r1" not in busy.value.detail
     shape = sub._window_latent_shape(64, 64, 4)
     for sid in ("x", "y"):
         st = sub.request_state(f"r-{sid}")

@@ -811,7 +811,11 @@ async def _stream(api, adapter, req, planner: WindowPlanner, mode: str, raw_requ
                 raw += decoder.flush()
                 # A language/control prefix may have held all the text back.
                 # At EOF the final parse can distinguish it from spoken words.
-                delta, emitted = _stream_delta(adapter.parse_transcript(raw, window_req).text, emitted)
+                final_text = (
+                    adapter.stream_text(raw) if emitted
+                    else adapter.parse_transcript(raw, window_req).text
+                )
+                delta, emitted = _stream_delta(final_text, emitted)
                 if delta:
                     if gap:
                         started = True
