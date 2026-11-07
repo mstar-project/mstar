@@ -461,3 +461,23 @@ def test_the_encoders_are_not_compiled_while_their_output_is_cached(monkeypatch,
     engine._compile_submodules()
 
     assert not compiled and engine._submodules[node].forward == "eager"
+
+
+@pytest.mark.parametrize("walk", ["prefill_text", "prefill_audio", "prefill_vision"])
+def test_a_request_with_no_audio_output_builds_no_talker_masks(thinker, walk):
+    inputs = {
+        "prefill_text": {"text_inputs": [torch.arange(8, 12)]},
+        "prefill_audio": {"audio_embeds": [torch.randn(6, HIDDEN)], "text_inputs": [torch.arange(8, 12)]},
+        "prefill_vision": {
+            "vision_embeds": [torch.randn(6, HIDDEN)], "deepstack": [torch.randn(6, HIDDEN)] * 2,
+            "image_grid_thw": [torch.tensor([1, 4, 6])], "text_inputs": [torch.arange(8, 12)],
+        },
+    }[walk]
+    thinker.node_resources[THINKER_POS]._counters[RID] = {"main": 0}
+    info = SimpleNamespace(rid_handle=RID, step_metadata={"text_before": 1, "audio_output": False})
+
+    row = thinker.prepare_inputs(walk, info, inputs)
+
+    assert "masks_for_talker" not in row.tensor_inputs
+    cut = thinker.split_inputs(walk, info, row, 2, row.input_seq_len)
+    assert "masks_for_talker" not in cut.tensor_inputs, "a chunk cuts what the row has"
