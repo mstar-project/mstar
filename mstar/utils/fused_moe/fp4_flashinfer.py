@@ -113,6 +113,7 @@ class TrtllmFp4Experts:
     def __call__(self, flat: torch.Tensor, routing_weights: torch.Tensor, selected_experts: torch.Tensor,
                  skip_invalid: bool) -> torch.Tensor:
         from flashinfer.fused_moe.core import trtllm_fp4_block_scale_routed_moe
+        from flashinfer.tllm_enums import SfLayout
 
         experts = self.block.experts
         e, two_inter, _ = self.block._experts_dims()
@@ -127,4 +128,7 @@ class TrtllmFp4Experts:
             w2, experts.down_proj_scale.view(torch.float8_e4m3fn), None, out1, out1_gate, out2,
             e + 1 if skip_invalid else e, selected_experts.shape[1], None, None, two_inter // 2, 0, e, None,
             do_finalize=True,
+            # said, not inferred: FlashInfer guesses the layout from the scales' size, and at a multiple of 128 tokens
+            # the linear layout has exactly the 128x4-swizzled one's size (it read our scales as swizzled: garbage)
+            hidden_states_scale_layout=SfLayout.layout_linear,
         )[0]

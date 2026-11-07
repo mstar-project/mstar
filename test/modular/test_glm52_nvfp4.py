@@ -287,7 +287,8 @@ def _blackwell() -> bool:
 
 
 @pytest.mark.skipif(not _blackwell(), reason="FlashInfer's TRT-LLM FP4 MoE: B200 / B300 with flashinfer")
-@pytest.mark.parametrize("tokens", [1, 7, 64, 300])
+# 128 and 256: FlashInfer can't tell a linear activation-scale layout from a 128x4-swizzled one at a multiple of 128
+@pytest.mark.parametrize("tokens", [1, 7, 64, 128, 256, 300])
 def test_blackwell_experts_kernel_matches_the_reference(tokens):
     """The checkpoint's experts, converted in place to the TRT-LLM kernel's layout at load, on GLM's own routing.
 
