@@ -15,6 +15,7 @@ in ``admit``, so a view taken in a step is good for that step and no longer.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import threading
 from typing import NamedTuple
@@ -79,12 +80,13 @@ class RequestPool(Resource):
         self._size = size
         # Empty: a buffer is only read once its request has written it. Started on an
         # ALIGN boundary, so every buffer is aligned whatever the allocator hands back.
-        raw = torch.empty(size + ALIGN, dtype=torch.uint8, device=self._device)
-        lead = -raw.data_ptr() % ALIGN
-        self._bytes = raw[lead:lead + size]
-        # moved as 8-byte words, which a copy streams at far more of the bandwidth than bytes
-        self._words = self._bytes.view(torch.int64)
-        self._stage = torch.empty(min(STAGE_BYTES, size) // WORD, dtype=torch.int64, device=self._device)
+        with self.writing():
+            raw = torch.empty(size + ALIGN, dtype=torch.uint8, device=self._device)
+            lead = -raw.data_ptr() % ALIGN
+            self._bytes = raw[lead:lead + size]
+            # moved as 8-byte words, which a copy streams at far more of the bandwidth than bytes
+            self._words = self._bytes.view(torch.int64)
+            self._stage = torch.empty(min(STAGE_BYTES, size) // WORD, dtype=torch.int64, device=self._device)
         # free gaps ``(start, length)`` in bytes, by start, adjacent ones merged
         self._free: list[tuple[int, int]] = [(0, size)] if size else []
         self._regions: dict[int, _Region] = {}
@@ -107,6 +109,11 @@ class RequestPool(Resource):
     def can_capture(self) -> bool:
         # regions move when the pool is rearranged, so a step that declares the pool runs eager
         return False
+
+    def writing(self):
+        """The context a write into the pool runs in: inference mode for a pool of
+        inference tensors (``RequestPoolConfig.inference_tensors``), else none."""
+        return torch.inference_mode() if self.config.inference_tensors else contextlib.nullcontext()
 
     # Model- and dependent-facing
 
@@ -135,7 +142,9 @@ class RequestPool(Resource):
         n = 1
         for d in shape:
             n *= d
-        return self._bytes[start:start + n * dtype.itemsize].view(dtype).view(shape)
+        # made under ``writing()``: a view taken outside inference mode is no inference tensor
+        with self.writing():
+            return self._bytes[start:start + n * dtype.itemsize].view(dtype).view(shape)
 
     def has_buffer(self, rid, name: str, shape: tuple[int, ...], dtype: torch.dtype) -> bool:
         region = self._regions.get(rid)
@@ -251,15 +260,16 @@ class RequestPool(Resource):
             return
         pool, stage = self._words, self._stage
         block = stage.numel()
-        if 4 * gap >= min(length, block):
-            for i in range(0, length, gap):
-                n = min(gap, length - i)
-                pool[dst + i:dst + i + n] = pool[src + i:src + i + n]
-            return
-        for i in range(0, length, block):
-            n = min(block, length - i)
-            stage[:n] = pool[src + i:src + i + n]
-            pool[dst + i:dst + i + n] = stage[:n]
+        with self.writing():
+            if 4 * gap >= min(length, block):
+                for i in range(0, length, gap):
+                    n = min(gap, length - i)
+                    pool[dst + i:dst + i + n] = pool[src + i:src + i + n]
+                return
+            for i in range(0, length, block):
+                n = min(block, length - i)
+                stage[:n] = pool[src + i:src + i + n]
+                pool[dst + i:dst + i + n] = stage[:n]
 
     # Step lifecycle
 

@@ -32,8 +32,8 @@ class Pair:
     """A request pool and the rolling window over it, stepped as the engine steps
     them: the pool admits and plans first (the window depends on it)."""
 
-    def __init__(self, pool_tokens: int):
-        config = RequestPoolConfig(pool_bytes=pool_tokens * TOKEN)
+    def __init__(self, pool_tokens: int, inference_tensors: bool = False):
+        config = RequestPoolConfig(pool_bytes=pool_tokens * TOKEN, inference_tensors=inference_tensors)
         self.pool = RequestPool(config, torch.device("cpu"), name="pool")
         config = RollingKVConfig(num_layers=LAYERS, num_heads=HEADS, head_dim=DIM, pool="pool", dtype=torch.float32)
         self.store = RollingKVManager(config, torch.device("cpu"), name="kv")
@@ -99,9 +99,11 @@ def _run(pair: Pair, rid, spans, sink, window, passes=1, base=0):
         yield written, k[0, :, 0, 0].tolist(), v[0, :, 0, 0].tolist()
 
 
+@pytest.mark.parametrize("inference_tensors", [False, True])
 @pytest.mark.parametrize("sink,window,span", [(6, 12, 4), (18, 36, 12), (0, 8, 4), (3, 5, 5), (2, 7, 3), (5, 40, 4)])
-def test_a_step_attends_the_sink_and_the_latest_window_in_stream_order(sink, window, span):
-    pair = Pair(sink + window)
+def test_a_step_attends_the_sink_and_the_latest_window_in_stream_order(sink, window, span, inference_tensors):
+    """Over a pool of inference tensors too: the window writes and shifts in inference mode."""
+    pair = Pair(sink + window, inference_tensors)
     for total, keys, values in _run(pair, 1, [span] * 12, sink, window, passes=5):
         assert keys == values == _expected(total, sink, window)
 

@@ -39,6 +39,13 @@ def aligned(nbytes: int) -> int:
 class RequestPoolConfig:
     # bytes the pool reserves at startup, shared by every request's region
     pool_bytes: int
+    # Allocate the pool in inference mode, so every view of it is an inference
+    # tensor, as the tensors a forward run in ``torch.inference_mode()`` makes are.
+    # A compiled graph guards on its inputs' dispatch keys, so a model whose forward
+    # runs in inference mode passes views of such a pool to its compiled graphs as
+    # they are. Writes into the pool must then happen in inference mode too
+    # (``RequestPool.writing``).
+    inference_tensors: bool = False
 
     def __post_init__(self):
         check_sizes({"pool_bytes": self.pool_bytes})

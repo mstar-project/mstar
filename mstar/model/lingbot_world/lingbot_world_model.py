@@ -108,13 +108,15 @@ class LingBotWorldModel(Model):
     # ------------------------------------------------------------------
 
     def get_node_resources(self) -> list[NodeResourceSpec]:
-        """The request pool that holds each rollout's rolling K/V, the rolling K/V
-        window over them, and the ragged attention over the window unless
+        """The request pool that holds each rollout's rolling K/V and text K/V, the
+        rolling K/V window over the former, and the ragged attention over both unless
         ``reference_numerics`` attends with the reference's FA2 instead."""
         cfg = self.config
         specs: list[NodeResourceSpec] = [
+            # inference tensors: the dit's forward runs in inference mode, and its compiled
+            # blocks take views of the pool (the text K/V) as they are
             RequestPoolSpec(resource_key=DIT_POOL, nodes={"dit"},
-                            config=RequestPoolConfig(pool_bytes=self.default_pool_bytes())),
+                            config=RequestPoolConfig(pool_bytes=self.default_pool_bytes(), inference_tensors=True)),
             RollingKVSpec(resource_key=DIT_KV, nodes={"dit"}, config=rolling_config(cfg)),
         ]
         if not cfg.reference_numerics:
@@ -144,22 +146,20 @@ class LingBotWorldModel(Model):
     def validate_config_yaml(self, config: dict, config_path: str) -> None:
         """Refuse to serve more than one rollout at a time.
 
-        The pool bounds each rollout's rolling K/V, not how many rollouts run: at
-        small output sizes it admits many. Each one's text K/V and VAE caches are
-        allocated by the dit outside the engine's resources, so until they are
+        The pool bounds each rollout's rolling K/V and text K/V, not how many
+        rollouts run: at small output sizes it admits many. Each one's VAE caches
+        are allocated by the dit outside the engine's resources, so until they are
         resources, the conductor's admit queue, which exists only when
         ``max_concurrent_requests`` is set, has to hold them to one rollout.
         """
         limit = config.get("max_concurrent_requests")
         if type(limit) is int and limit == 1:
             return
-        cfg = self.config
-        text_kv_mib = cfg.num_layers * 2 * cfg.text_len * cfg.dim * torch.bfloat16.itemsize / 2**20
         raise ValueError(
             f"LingBot-World requires `max_concurrent_requests: 1` in {config_path}; got {limit!r}. "
-            f"The rolling K/V pool bounds each rollout's K/V, not how many run, and each rollout's "
-            f"text K/V ({text_kv_mib:.0f} MiB) and VAE caches are allocated by the dit outside the "
-            "engine's resources, so the admit queue that this key enables is the only bound on them."
+            "The request pool bounds each rollout's K/V, not how many run, and each rollout's VAE "
+            "caches are allocated by the dit outside the engine's resources, so the admit queue "
+            "that this key enables is the only bound on them."
         )
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:

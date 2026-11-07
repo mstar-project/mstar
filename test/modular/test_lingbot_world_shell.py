@@ -6,6 +6,7 @@ reference are the oracle-gated parity harness's job
 (``test/lingbot_world/run_parity.py``).
 """
 
+import math
 import sys
 
 import numpy as np
@@ -43,6 +44,7 @@ from mstar.model.lingbot_world.submodules import (  # noqa: E402
     DIT_POOL,
     ROLLOUT_LOOP_NAME,
     ROLLOUT_WALK,
+    TEXT_KV,
     EncoderStream,
     LingBotDitSubmodule,
     encode_condition_chunk,
@@ -530,7 +532,7 @@ def test_the_engine_attention_dit_builds_without_flash_attn(monkeypatch):
 def test_the_dit_declares_a_request_pool_the_rolling_kv_over_it_and_a_ragged_cross_attention(model):
     pool, kv, attn = model.get_node_resources()
     assert isinstance(pool, RequestPoolSpec) and pool.resource_key == DIT_POOL and pool.nodes == {"dit"}
-    assert pool.config.pool_bytes == model.default_pool_bytes()
+    assert pool.config.pool_bytes == model.default_pool_bytes() and pool.config.inference_tensors
     assert isinstance(kv, RollingKVSpec) and kv.resource_key == DIT_KV and kv.nodes == {"dit"}
     assert (kv.config.num_layers, kv.config.num_heads, kv.config.head_dim) == (30, 12, 128)
     assert kv.config.dtype == torch.bfloat16 and kv.config.pool == DIT_POOL and kv.depends_on() == {DIT_POOL}
@@ -543,16 +545,21 @@ def test_the_dit_declares_a_request_pool_the_rolling_kv_over_it_and_a_ragged_cro
     assert isinstance(ref_pool, RequestPoolSpec) and isinstance(ref_kv, RollingKVSpec) and ref_kv.resource_key == DIT_KV
 
 
-def test_the_default_pool_holds_the_window_of_the_largest_area_at_any_aspect(model):
-    """18 latent frames of at most max_area / 256 tokens: an 11.1 GiB bf16 pool, which
-    holds one rollout at 720x1280 or two at the default 464x832 (4.7 GiB each)."""
+def test_the_default_pool_holds_one_rollout_at_the_largest_area_or_two_at_the_default(model):
+    """A rollout keeps its rolling K/V (18 latent frames of at most max_area / 256 tokens,
+    whatever the aspect; 11.1 GiB at 720x1280, 4.7 GiB at the default 464x832) and its
+    text K/V (90 MiB) in the pool. The default pool, 11.2 GiB, holds one at 720x1280 or
+    two at 464x832."""
     cfg = model.config
     assert model.max_window_tokens() == 18 * (720 * 1280 // 256)
-    assert round(model.default_pool_bytes() / 2**30, 1) == 11.1
+    assert round(model.default_pool_bytes() / 2**30, 1) == 11.2
     sub = _bare_dit_submodule(model, {})
     first = sub.chunk_spans(0, (464, 832)).position
-    default = RequestPoolReqConfig.of(rollout_state_buffers(cfg, first.sink + first.window)).nbytes()
-    assert round(default / 2**30, 1) == 4.7 and model.default_pool_bytes() // default == 2
+    buffers = rollout_state_buffers(cfg, first.sink + first.window)
+    assert round(math.prod(buffers[DIT_KV][0]) * 2 / 2**30, 1) == 4.7
+    assert round(math.prod(buffers[TEXT_KV][0]) * 2 / 2**20) == 90
+    default = RequestPoolReqConfig.of(buffers).nbytes()
+    assert model.default_pool_bytes() // default == 2
     for image_hw in [(720, 1280), (1280, 720), (960, 960), (408, 2256), (2256, 408), (480, 832)]:
         lat = model.geometry(image_hw, 720, 1280)
         last = sub.chunk_spans(cfg.max_chunks - 1, (lat[0] * 8, lat[1] * 8)).position
@@ -679,14 +686,14 @@ def test_the_fast_config_only_adds_the_autotuned_compile():
 
 
 def test_a_config_must_run_one_rollout_at_a_time(model):
-    """The pool doesn't bound the rollouts' text K/V and VAE caches, so until
-    they are engine resources the conductor runs one rollout at a time."""
+    """The pool doesn't bound the rollouts' VAE caches, so until they are engine
+    resources the conductor runs one rollout at a time."""
     model.validate_config_yaml({"max_concurrent_requests": 1}, "lingbot.yaml")
     for limit in (None, 0, 2, 16, True, "1", 1.0):
         config = {"max_concurrent_requests": limit} if limit is not None else {}
         with pytest.raises(ValueError, match="requires `max_concurrent_requests: 1`") as err:
             model.validate_config_yaml(config, "lingbot.yaml")
-    assert "text K/V (90 MiB) and VAE caches" in str(err.value)
+    assert "VAE caches are allocated by the dit outside" in str(err.value)
 
 
 def test_the_shipped_config_runs_one_rollout_at_a_time_over_the_default_pool(model):

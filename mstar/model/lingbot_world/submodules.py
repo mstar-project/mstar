@@ -16,17 +16,17 @@
     dit          -> LingBotDitSubmodule (one chunk per rollout iteration: the
                     chunk's I2V condition and Plucker rays, the DiT, the decode)
 
-The rolling self-attention K/V live in each request's region of the engine's
-request pool (``DIT_POOL``), declared when the request opens
-(``rollout_state_buffers``) so it waits in line for room. The rolling KV window
-(``DIT_KV``) keeps their sink plus latest window compacted in that buffer, so a
-chunk's keys are one contiguous range; the attention over them is a ragged
-cross-attention (``DIT_ATTN``) whose step pairs the chunk's queries with that
-range and with the text. The text K/V (computed once per request) and the VAE
-encoder's and decoder's causal-conv caches stay in the request's
-``PerRequestState``, outside the pool. Nothing in the engine counts them, and at
-small output sizes the pool admits many rollouts, so the model refuses a config
-that runs more than one at a time (``LingBotWorldModel.validate_config_yaml``).
+The rolling self-attention K/V and the text K/V (computed once per request)
+live in each request's region of the engine's request pool (``DIT_POOL``),
+declared when the request opens (``rollout_state_buffers``) so it waits in line
+for room. The rolling KV window (``DIT_KV``) keeps the K/V's sink plus latest
+window compacted in their buffer, so a chunk's keys are one contiguous range;
+the attention over them is a ragged cross-attention (``DIT_ATTN``) whose step
+pairs the chunk's queries with that range and with the text. The VAE encoder's
+and decoder's causal-conv caches stay in the request's ``PerRequestState``,
+outside the pool. Nothing in the engine counts them, and at small output sizes
+the pool admits many rollouts, so the model refuses a config that runs more than
+one at a time (``LingBotWorldModel.validate_config_yaml``).
 
 Numerics are the model's, not the engine's: ``LingBotWorldModel.get_autocast_dtype``
 returns None, the DiT enters the reference's bf16 autocast itself, and the VAE
@@ -68,8 +68,10 @@ ROLLOUT_WALK = "rollout"
 
 DIT_ATTN = "dit_attn"
 DIT_KV = "dit_kv"
-# the request pool whose regions hold each rollout's state: its rolling K/V (the DIT_KV buffer)
+# the request pool whose regions hold each rollout's state: its rolling K/V (the
+# DIT_KV buffer) and its text K/V
 DIT_POOL = "dit_pool"
+TEXT_KV = "text_kv"
 CHUNK_SPAN, WINDOW_SPAN, TEXT_SPAN = "chunk", "window", "text"
 DIT_ATTN_PAIRS = ((CHUNK_SPAN, WINDOW_SPAN), (CHUNK_SPAN, TEXT_SPAN))
 
@@ -115,8 +117,12 @@ def rolling_config(cfg: LingBotWorldConfig) -> RollingKVConfig:
 
 
 def rollout_state_buffers(cfg: LingBotWorldConfig, kv_tokens: int) -> dict[str, tuple[tuple[int, ...], torch.dtype]]:
-    """What a rollout keeps in the pool between chunks: its rolling K/V, ``kv_tokens`` a layer."""
-    return {DIT_KV: rolling_config(cfg).buffer(kv_tokens)}
+    """What a rollout keeps in the pool between chunks: its rolling K/V (``kv_tokens``
+    a layer) and its text K/V (every block's, keys then values)."""
+    return {
+        DIT_KV: rolling_config(cfg).buffer(kv_tokens),
+        TEXT_KV: ((cfg.num_layers, 2, 1, cfg.text_len, cfg.num_heads, cfg.head_dim), torch.bfloat16),
+    }
 
 
 def first_frame_mask(num_latent_frames: int, lat_h: int, lat_w: int, device) -> torch.Tensor:
@@ -362,6 +368,13 @@ class LingBotDitSubmodule(_SingleRequestMixin, NodeSubmodule):
             steps[DIT_ATTN] = RaggedCrossAttentionStep(segments=tuple(segments), pairs=DIT_ATTN_PAIRS)
         return SubmoduleStep(steps=steps) if steps else None
 
+    def state_pool(self):
+        """The engine's ``DIT_POOL``: the rollout's state lives in its region."""
+        pool = self.node_resources.get(DIT_POOL)
+        if pool is None:
+            raise RuntimeError(f"LingBot dit: no {DIT_POOL} resource is bound; the rollout's state lives there")
+        return pool
+
     def kv_store(self):
         """The rolling K/V the DiT writes and attends, the engine's ``DIT_KV``."""
         store = self.node_resources.get(DIT_KV)
@@ -377,15 +390,17 @@ class LingBotDitSubmodule(_SingleRequestMixin, NodeSubmodule):
         generator = torch.Generator(device=device)
         generator.manual_seed(seed)
         noise = torch.randn(cfg.out_dim, lat_f, lat_h, lat_w, dtype=torch.float32, generator=generator, device=device)
-        # inference tensors, as the warmup's are: the compiled blocks guard on the dispatch keys
+        text_kv = self.state_pool().view(TEXT_KV)
         with torch.inference_mode():
-            text_kv = self.dit.text_kv(context)
+            keys, values = self.dit.text_kv(context)
+            for i, (k, v) in enumerate(zip(keys, values, strict=True)):
+                text_kv[i, 0].copy_(k)
+                text_kv[i, 1].copy_(v)
         state.add_all(
             chunk=0,
             frame_seqlen=frame_seqlen,
             generator=generator,
             noise=noise,
-            text_kv=text_kv,
             encoder_stream=EncoderStream(self.encoder_vae) if self.encoder_vae is not None else None,
             feat_cache=wan_vae.new_feat_cache(self.vae) if self.vae is not None else None,
         )
@@ -402,7 +417,7 @@ class LingBotDitSubmodule(_SingleRequestMixin, NodeSubmodule):
         image = image.to(device)
         context = text_embeds.to(device)
         context = context[0] if context.dim() == 3 else context
-        if "text_kv" not in state:
+        if "chunk" not in state:
             self._seed_request(state, info.step_metadata, info.random_seed, image, context, device)
         chunk = int(state["chunk"])
         frame_seqlen = int(state["frame_seqlen"])
@@ -416,7 +431,12 @@ class LingBotDitSubmodule(_SingleRequestMixin, NodeSubmodule):
             height // cfg.vae_stride[1], width // cfg.vae_stride[2],
         ).to(torch.bfloat16)
         store = self.kv_store()
-        text_kv = state["text_kv"]
+        # Every block's text K/V, views of the pool good for this step (a rearrange can move
+        # the region); taken in inference mode, as the warmup's are, since the compiled
+        # blocks guard on their inputs' dispatch keys.
+        with torch.inference_mode():
+            text = self.state_pool().view(TEXT_KV)
+            text_kv = (list(text[:, 0].unbind(0)), list(text[:, 1].unbind(0)))
         generator = state["generator"]
         # the attention step declared the window from the chunk index; the store's plan must agree
         kept = store.window(0)[0].shape[1]

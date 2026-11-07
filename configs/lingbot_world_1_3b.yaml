@@ -1,7 +1,7 @@
 model: "lingbot_world_1_3b"
 
 # max_seq_len only satisfies the conductor's config check and matches the UMT5
-# text length; the dit's rolling K/V live in its request pool (below).
+# text length; the dit's rolling K/V and text K/V live in its request pool (below).
 max_seq_len: 512
 
 # Numerics (model_kwargs), shown at their defaults. reference_numerics: true runs
@@ -15,14 +15,14 @@ max_seq_len: 512
 #   reference_numerics: false
 #   dit_compile_autotune: false
 
-# One rollout at a time; the model refuses any other value. Each rollout's text
-# K/V (90 MiB) and VAE caches live outside the request pool below, so this is
-# their only bound until they are engine resources.
+# One rollout at a time; the model refuses any other value. Each rollout's VAE
+# caches live outside the request pool below, so this is their only bound until
+# they are engine resources.
 max_concurrent_requests: 1
 
-# The dit's request pool, reserved at startup, holds each rollout's rolling K/V.
-# The default, 11.1 GiB, holds one rollout at the largest size (720x1280); one at
-# the default size (464x832) takes 4.7 GiB. To change it, set
+# The dit's request pool, reserved at startup, holds each rollout's rolling K/V
+# and text K/V. The default, 11.2 GiB, holds one rollout at the largest size
+# (720x1280); one at the default size (464x832) takes 4.7 GiB. To change it, set
 #   resources:
 #     dit_pool:
 #       pool_bytes: 17179869184   # 16 GiB

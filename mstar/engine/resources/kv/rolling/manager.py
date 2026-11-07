@@ -152,10 +152,11 @@ class RollingKVManager(Resource):
         plan = self.current
         if k.shape[0] != len(plan.rows):
             raise ValueError(f"rolling KV step has {len(plan.rows)} rows; write was given {k.shape[0]}")
-        for i, (row, kv) in enumerate(zip(plan.rows, plan.kv, strict=True)):
-            span = row.write_stop - row.write_start
-            kv[layer_idx, 0, row.write_start:row.write_stop] = k[i, :span]
-            kv[layer_idx, 1, row.write_start:row.write_stop] = v[i, :span]
+        with self._pool.writing():
+            for i, (row, kv) in enumerate(zip(plan.rows, plan.kv, strict=True)):
+                span = row.write_stop - row.write_start
+                kv[layer_idx, 0, row.write_start:row.write_stop] = k[i, :span]
+                kv[layer_idx, 1, row.write_start:row.write_stop] = v[i, :span]
 
     def window(self, layer_idx: int, row: int = 0) -> tuple[torch.Tensor, torch.Tensor]:
         """Row ``row``'s keys and values for this step, ``[1, kept, H, D]`` views
@@ -259,15 +260,16 @@ class RollingKVManager(Resource):
             return
         words, stage = kv.view(self._word), self._stage
         block = stage.shape[2]
-        if 4 * gap >= min(length, block):
-            for i in range(0, length, gap):
-                n = min(gap, length - i)
-                words[:, :, dst + i:dst + i + n] = words[:, :, src + i:src + i + n]
-            return
-        for i in range(0, length, block):
-            n = min(block, length - i)
-            stage[:, :, :n] = words[:, :, src + i:src + i + n]
-            words[:, :, dst + i:dst + i + n] = stage[:, :, :n]
+        with self._pool.writing():
+            if 4 * gap >= min(length, block):
+                for i in range(0, length, gap):
+                    n = min(gap, length - i)
+                    words[:, :, dst + i:dst + i + n] = words[:, :, src + i:src + i + n]
+                return
+            for i in range(0, length, block):
+                n = min(block, length - i)
+                stage[:, :, :n] = words[:, :, src + i:src + i + n]
+                words[:, :, dst + i:dst + i + n] = stage[:, :, :n]
 
     def commit(self, step: RollingKVStep, ctx: StepContext) -> None:
         if ctx.capture:

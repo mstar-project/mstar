@@ -322,3 +322,23 @@ def test_a_request_that_declares_no_buffer_is_refused_when_it_opens():
     with pytest.raises(ValueError, match="declares at least one buffer"):
         RequestPoolReqConfig.of({}).validate(spec)
     _wants(1).validate(spec)
+
+
+def test_a_pool_of_inference_tensors_hands_out_inference_views_and_rearranges():
+    """For a model whose forward runs in inference mode: its compiled graphs take the
+    pool's views as they are. Writes go through ``writing()``; a rearrange does."""
+    pool = RequestPool(RequestPoolConfig(pool_bytes=30 * UNIT, inference_tensors=True), torch.device("cpu"))
+    for rid in (1, 2, 3):
+        _open(pool, rid, 10)
+    _admit(pool, 1, 2, 3)
+    assert pool.view("b0").is_inference() and pool.buffer(2, "b0").is_inference()
+    with pytest.raises(RuntimeError, match="[Ii]nference"):
+        pool.buffer(1, "b0").fill_(1.0)  # outside inference mode
+    with pool.writing():
+        for rid in (1, 2, 3):
+            _fill(pool, rid, float(rid))
+    pool.remove_request(1)
+    pool.remove_request(3)
+    _open(pool, 4, 20)
+    _admit(pool, 4)
+    assert _regions(pool)[2] == (0, 10) and _holds(pool, 2, 2.0)

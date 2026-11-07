@@ -1177,9 +1177,13 @@ spec's ``depends_on``) and reads the request's buffer directly in its own ``plan
 ``buffer(rid, name)``, not through the pool's plan: a region can hold many buffers and the
 resource needs one. Rolling K/V (below) is one. How many requests run at once is then the pool's to decide, as long as
 the model keeps no other per-request state outside it. A step that declares the pool runs
-eager (no capture yet), and the pool does not shard across ranks yet. LingBot-World keeps
-each rollout's rolling K/V in one (``DIT_POOL``); its text K/V and VAE caches are still
-the model's, so it requires ``max_concurrent_requests: 1``.
+eager (no capture yet), and the pool does not shard across ranks yet. A model whose forward
+runs in inference mode declares ``RequestPoolConfig(inference_tensors=True)``: the pool is
+allocated, viewed and written in inference mode (writes go through ``writing()``), so its
+views are inference tensors and pass to the model's compiled graphs as they are, since
+those guard on their inputs' dispatch keys. LingBot-World keeps each rollout's rolling K/V
+and text K/V in one (``DIT_POOL``); its VAE caches are still the model's, so it requires
+``max_concurrent_requests: 1``.
 
 Rolling (compacted) caches
 ^^^^^^^^^^^^^^^^^^^^^^^^^^
