@@ -1062,9 +1062,12 @@ class Model(ABC):
         # libsndfile first, so WAV, FLAC, OGG and MP3 do not depend on the
         # FFmpeg build torchcodec happens to load (some base images ship a
         # video-only one); torchcodec for the other containers.
-        from mstar.model.components.audio_features import load_audio_file
+        from mstar.api_server.media_io import MAX_AUDIO_SECONDS
+        from mstar.model.components.audio_features import load_speech_file
 
-        audio = load_audio_file(filepath, sample_rate=16000)
+        audio = load_speech_file(filepath, sample_rate=16000, max_seconds=MAX_AUDIO_SECONDS)
+        if audio.numel() == 0:
+            raise ValueError("audio upload is empty")
         return TensorAndMetadata(data=audio, metadata=dict(sample_rate=16000, num_channels=1))
 
     def load_video(self, filepath: str, device: str):

@@ -90,7 +90,7 @@ def test_a_crafted_header_rate_is_refused_before_resampling(tmp_path, video_only
 def test_other_containers_still_go_to_torchcodec(tmp_path, video_only_ffmpeg):
     path = tmp_path / "clip.m4a"
     path.write_bytes(b"\x00\x00\x00\x18ftypM4A " + b"\x00" * 64)
-    with pytest.raises(RuntimeError, match="Invalid data"):
+    with pytest.raises(ValueError, match="decode"):
         Model.load_audio(None, str(path), "cpu")
     assert video_only_ffmpeg.calls == [str(path)]
 
@@ -117,3 +117,11 @@ def test_omnivoice_reads_a_wav_reference_without_ffmpeg(tmp_path, video_only_ffm
     assert video_only_ffmpeg.calls == []
     assert out.metadata == {"sample_rate": 24_000, "num_channels": 1}
     assert out.data.numel() == 24_000
+
+
+def test_empty_audio_upload_is_refused(tmp_path):
+    sf = pytest.importorskip("soundfile")
+    path = tmp_path / "empty.wav"
+    sf.write(path, np.zeros(0, dtype=np.float32), 16000)
+    with pytest.raises(ValueError, match="empty"):
+        Model.load_audio(None, str(path), "cpu")
