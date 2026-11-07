@@ -2644,7 +2644,7 @@ class Engine:
             # that does compute is acknowledged only if its body will execute.
             allowed = ((window.selected >= 0)
                        & ((window.metadata[:, 5] == 0)
-                          | ((state.continuation != 0) & (state.counts < state.limit))))
+                          | ((state.continuation != 0) & (state.counts < state.row_limits))))
             window.selected.copy_(torch.where(allowed, window.selected, -1))
             window.ready.copy_(allowed.any().reshape(1))
             computing = allowed & (window.metadata[:, 5] != 0)

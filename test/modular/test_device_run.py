@@ -49,18 +49,19 @@ class _Loop:
             state.eligible.fill_(True)
             state.active.zero_()
         skip = int(state.limit) > 1 and int(state.generation[0]) <= int(state.yield_until[0])
+        state.halted[0] = skip
         state.started[0] = RUN_SKIPPED if skip else RUN_RAN
         state.continuation[0] = not skip
 
     def stop(self, state, tokens, stream):
         """The test double of the ``run_stop`` kernel, which only CUDA can run."""
         self.state = state
+        active = ~state.marks if state.active is None else state.active
         if state.descriptors is not None:
-            identities = torch.where(state.marks, 0, state.identities)
+            identities = torch.where(active, state.identities, 0)
             state.descriptors[:, int(state.index)] = identities
             if state.stream is not None:
                 state.stream.identities[:, int(state.index)] = identities
-        active = ~state.marks if state.active is None else state.active
         state.counts += active
         token = None if tokens is None else tokens.reshape(len(state.marks), -1)[:, 0]
         if token is not None:
@@ -69,13 +70,12 @@ class _Loop:
             state.stream.tokens[:, int(state.index)] = token
             state.stream.landed[0] = int(state.index) + 1
         state.index += 1
-        done = int((state.marks | (state.counts >= state.limit)).sum() if state.active is not None
-                   else state.marks.sum())
-        state.continuation[0] = (
-            done < len(state.marks) and (state.active is not None or int(state.index) < int(state.limit))
-            and int(state.generation[0]) > int(state.yield_until[0])
-            and (int(state.refill) == 0 or done < int(state.refill))
-        )
+        done = int((state.marks | (state.counts >= state.row_limits)).sum())
+        full = ((state.active is None and int(state.index) >= int(state.limit))
+                or (state.descriptors is not None and int(state.index) >= state.descriptors.shape[1]))
+        state.halted[0] = (full or int(state.generation[0]) <= int(state.yield_until[0])
+                           or (int(state.refill) != 0 and done >= int(state.refill)))
+        state.continuation[0] = done < len(state.marks) and not bool(state.halted)
 
     def node_refusal(self, graph):
         return None
@@ -403,6 +403,7 @@ def test_one_run_body_reuses_standalone_and_composed_parents():
             assert state.counts.tolist() == [min(count, 3), count]
             assert state.index.item() == tail.item() == count
             assert state.continuation.item() == 0
+            assert bool(state.halted) == (skip or width == 1)
             assert state.started.item() == (RUN_SKIPPED if skip else RUN_RAN)
             assert history.tolist() == [
                 list(range(1, count + 1)) + [0] * (6 - count),
@@ -1621,7 +1622,8 @@ def test_run_membership_keeps_old_readers_across_captured_row_reuse(device_name)
 
 
 @pytest.mark.parametrize("device_name", ["cpu", "cuda"])
-def test_one_membership_snapshot_preserves_member_eos_until_the_whole_row_retires(device_name):
+@pytest.mark.parametrize("physical_tail", [False, True])
+def test_one_membership_snapshot_preserves_member_eos_until_the_whole_row_retires(device_name, physical_tail):
     from contextlib import nullcontext
 
     from mstar.engine.resources.run_rows import RunRows, RunRowsSnapshot
@@ -1632,11 +1634,13 @@ def test_one_membership_snapshot_preserves_member_eos_until_the_whole_row_retire
     owner = RunRows(device, rows=2, capacity=4, binding_width=6)
     snapshot, other = (RunRowsSnapshot(owner, 2) for _ in range(2))
     members = [RunState(
-        2, None, (), device,
+        2, None, (99,), device,
         SimpleNamespace(rows=torch.zeros(2, dtype=torch.long, device=device),
                         slots=torch.zeros(2, dtype=torch.long, device=device)),
-        membership=snapshot, member=i, width=6,
+        membership=snapshot, member=i, width=6, independent_rows=True,
     ) for i in range(2)]
+    for state in members:
+        state.stage(2, [False, False], 6)
 
     def accept():
         snapshot.accept()
@@ -1702,6 +1706,33 @@ def test_one_membership_snapshot_preserves_member_eos_until_the_whole_row_retire
     assert producer.dropping.rows.tolist() == [13, 12]
     assert consumer.dropping.rows.tolist() == [23, 22]
     assert owner.release(first)
+    # A member's logical budget may end while its parent still has physical
+    # room. Unlike that completion, a simultaneous yield/EOS ends the parent.
+    cuda = CudaWhile() if graph is not None else _Loop()
+    stream = torch.cuda.current_stream().cuda_stream if graph is not None else 0
+    if physical_tail:
+        consumer.index.fill_(5)  # old tenants already used the other physical columns
+    consumer.eligible[1] = False
+    consumer.select_rows()
+    cuda.stop(consumer, None, stream)
+    if physical_tail:
+        assert consumer.counts.tolist() == [1, 0]
+        assert consumer.halted.item() and not consumer.continuation.item()
+        assert consumer.index.item() == 6
+        assert consumer.descriptors[:, 5].tolist() == [replacement.handle, 0]
+        return
+    assert consumer.counts.tolist() == [1, 0] and consumer.continuation.item()
+    consumer.eligible.fill_(True)
+    consumer.select_rows()
+    cuda.stop(consumer, None, stream)
+    assert consumer.counts.tolist() == [1, 1]
+    assert not consumer.continuation.item() and not consumer.halted.item()
+    assert consumer.descriptors[:, :2].tolist() == [[replacement.handle, 0], [0, sibling.handle]]
+    producer.request_yield()
+    producer.select_rows()
+    cuda.stop(producer, torch.full((2,), 99, dtype=torch.long, device=device), stream)
+    assert producer.marks.tolist() == [False, True]  # row zero ignores EOS
+    assert producer.halted.item() and not producer.continuation.item()
 
 
 @pytest.mark.parametrize("device_name", ["cpu", "cuda"])
@@ -2014,14 +2045,11 @@ def test_independently_ready_rows_keep_actual_progress_and_last_values(monkeypat
     assert values["frame"].flatten().tolist() == [2, 4, 18]
 
 
-@pytest.mark.parametrize("unsupported", ["owners", "stream", "carry", "membership"])
+@pytest.mark.parametrize("unsupported", ["owners", "stream", "carry"])
 def test_independent_row_capture_refuses_uncovered_effects(monkeypatch, unsupported):
-    from mstar.engine.resources.run_rows import RunRows
-
     runner, run, _, _ = _runner(
         monkeypatch, _Loop(), [[1, 1]], independent=True, progress=unsupported != "owners",
         stream_tokens=unsupported == "stream", carries={"h": CarryPair("h", "h")} if unsupported == "carry" else {},
-        membership=RunRows(CPU, 2, 8, 2) if unsupported == "membership" else None,
     )
     assert run is None and WALK in runner._run_failures
 

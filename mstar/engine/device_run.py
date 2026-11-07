@@ -51,7 +51,8 @@ extern "C" __global__ void run_stop(
     const long long* refill, const long long* generation, const volatile long long* yield_until,
     long long* continuation,
     long long* host_tokens, volatile int* landed, int host_width, long long* counts,
-    const long long* identities, long long* descriptors, int width, long long* host_descriptors
+    const long long* identities, long long* descriptors, int width, long long* host_descriptors,
+    const long long* row_limits, int limit_stride, long long* halted
 ) {
     int done = 0;
     long long at = *index;
@@ -67,7 +68,7 @@ extern "C" __global__ void run_stop(
                 if (tokens[row * stride] == stop_ids[i]) marks[row] = 1;
             }
         }
-        done += marks[row] || (active && counts[row] >= *limit);
+        done += marks[row] || counts[row] >= row_limits[row * limit_stride];
     }
     long long next = at + 1;
     *index = next;
@@ -75,21 +76,23 @@ extern "C" __global__ void run_stop(
         __threadfence_system();
         *landed = (int)next;
     }
-    bool go = done < rows && (active || next < *limit) && *generation > *yield_until
-              && (*refill == 0 || done < *refill);
+    bool full = (!active && next >= *limit) || (descriptors && next >= width);
+    *halted = full || *generation <= *yield_until || (*refill != 0 && done >= *refill);
+    bool go = done < rows && !*halted;
     *continuation = go ? 1 : 0;
 }
 
 extern "C" __global__ void run_start(
     const long long* limit, const long long* generation, const volatile long long* yield_until,
     long long* continuation, volatile int* started,
-    unsigned char* eligible, unsigned char* active, int rows
+    unsigned char* eligible, unsigned char* active, int rows, long long* halted
 ) {
     for (int row = 0; eligible && row < rows; ++row) {
         eligible[row] = 1;
         active[row] = 0;
     }
     bool skip = *limit > 1 && *generation <= *yield_until;
+    *halted = skip ? 1 : 0;
     *continuation = skip ? 0 : 1;
     *started = skip ? RUN_SKIPPED : RUN_RAN;
     __threadfence_system();
@@ -230,14 +233,17 @@ class RunState:
         # Entry writes eligibility; each executed body writes continuation.
         # Neither is producer EOF or proof that a row executed.
         self.continuation = torch.zeros(1, dtype=torch.long, device=device)
+        # EOS/budget completion may be revived by a new descriptor; a yielded
+        # or physically full parent may not. Only captured entry clears this.
+        self.halted = torch.zeros_like(self.continuation)
         self.limit = torch.ones(1, dtype=torch.long, device=device)
         # the marks a run ends at, ``refill_at`` of its rows; 0 is off
         self.refill = torch.zeros(1, dtype=torch.long, device=device)
         self.immune = torch.zeros(bs, dtype=torch.bool, device=device)
         self._immune_stager = PinnedStager(torch.bool, numel=bs)
         self.marks = torch.zeros(bs, dtype=torch.bool, device=device)
-        if independent_rows and (dropping is None or stream is not None or membership is not None):
-            raise ValueError("independently ready rows need fixed resident writes and no live token stream")
+        if independent_rows and (dropping is None or stream is not None):
+            raise ValueError("independently ready rows need resident writes and no live token stream")
         self.eligible = torch.ones_like(self.marks) if independent_rows else None
         self.active = torch.zeros_like(self.marks) if independent_rows else None
         self.counts = torch.zeros(bs, dtype=torch.long, device=device)
@@ -287,6 +293,10 @@ class RunState:
     def identities(self) -> torch.Tensor | None:
         return None if self.snapshot is None else self.snapshot.ids
 
+    @property
+    def row_limits(self) -> torch.Tensor:
+        return self.limit if self.snapshot is None else self.snapshot.bindings[:, self._member * 3 + 2]
+
     def install_rows(self) -> None:
         """Install this member of the parent's already accepted snapshot.
 
@@ -300,7 +310,7 @@ class RunState:
             self.immune.copy_(bindings[:, 1])
             self.counts.masked_fill_(snapshot.changed, 0)
             self.marks.masked_fill_(snapshot.changed, False)
-            self.marks.logical_or_((snapshot.ids == 0) | (self.counts >= bindings[:, 2]))
+            self.marks.logical_or_((snapshot.ids == 0) | (self.counts >= self.row_limits))
             if self.active is not None:
                 self.active.masked_fill_(snapshot.changed, False)
 
@@ -309,7 +319,7 @@ class RunState:
         if self.active is None:
             return ~self.marks
         torch.logical_and(self.eligible, ~self.marks, out=self.active)
-        self.active.logical_and_(self.counts < self.limit)
+        self.active.logical_and_(self.counts < self.row_limits)
         return self.active
 
     def head(self) -> None:
@@ -396,6 +406,7 @@ class CudaWhile:
             ctypes.c_void_p(state.started.data_ptr()),
             ctypes.c_void_p(None if state.eligible is None else state.eligible.data_ptr()),
             ctypes.c_void_p(None if state.active is None else state.active.data_ptr()), ctypes.c_int(len(state.marks)),
+            ctypes.c_void_p(state.halted.data_ptr()),
         ]
         args = (ctypes.c_void_p * len(values))(*(ctypes.cast(ctypes.byref(v), ctypes.c_void_p) for v in values))
         self._driver_call(
@@ -405,6 +416,7 @@ class CudaWhile:
     def stop(self, state: RunState, tokens: torch.Tensor | None, stream: int) -> None:
         """Inside the step's capture: ``run_stop`` on ``stream``."""
         row = None if tokens is None else tokens.reshape(len(state.marks), -1)
+        limits = state.row_limits
         values = [
             ctypes.c_void_p(None if row is None else row.data_ptr()),
             ctypes.c_int(0 if row is None else row.stride(0)), ctypes.c_int(len(state.marks)),
@@ -424,6 +436,8 @@ class CudaWhile:
             ctypes.c_int(state.descriptors.shape[1] if state.descriptors is not None else 0),
             ctypes.c_void_p(state.stream.identities.data_ptr()
                             if state.stream is not None and state.stream.identities is not None else None),
+            ctypes.c_void_p(limits.data_ptr()), ctypes.c_int(0 if state.snapshot is None else limits.stride(0)),
+            ctypes.c_void_p(state.halted.data_ptr()),
         ]
         args = (ctypes.c_void_p * len(values))(*(ctypes.cast(ctypes.byref(v), ctypes.c_void_p) for v in values))
         self._driver_call(
