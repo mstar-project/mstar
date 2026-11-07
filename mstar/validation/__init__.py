@@ -70,6 +70,9 @@ def validate_deployment(
     if not isinstance(config, Mapping):
         raise DeploymentError(config_path, [f"the config must be a YAML mapping; got {config!r}"])
     problems = list(check_knobs())
+    limit = config.get("max_concurrent_requests")
+    if limit is not None and (isinstance(limit, bool) or not isinstance(limit, int) or limit < 1):
+        problems.append("max_concurrent_requests must be a positive integer or null")
     if "max_seq_len" not in config:
         problems.append("the config must define `max_seq_len`")
     try:
