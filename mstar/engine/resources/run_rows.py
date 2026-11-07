@@ -23,7 +23,7 @@ _OFFERED, _ACTIVE, _CANCELLED, _RETIRED = range(4)
 
 @triton.jit
 def _change(Control, row, expected, replacement):
-    tl.atomic_cas(Control + row, expected, replacement, sem="acq_rel", scope="gpu")
+    tl.atomic_cas(Control + row, expected.to(tl.int64), replacement.to(tl.int64), sem="acq_rel", scope="gpu")
 
 
 @triton.jit
