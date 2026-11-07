@@ -98,7 +98,7 @@ class _Loop:
 
 def _runner(
     monkeypatch, loop, tokens, bs=2, limit=6, refill_at=None, carries=None, stream_tokens=False, counted=False,
-    progress=False, membership=None, unmanaged=False, ask=None, independent=False,
+    progress=False, membership=None, unmanaged=False, ask=None, independent=False, owned=False,
 ):
     """A runner holding a captured run whose forward samples ``tokens[iteration]``."""
     monkeypatch.setattr(torch.accelerator, "is_available", lambda: False)
@@ -114,7 +114,7 @@ def _runner(
         raw_stream=lambda: 0, synchronize=lambda: None, compose=loop.compose,
     )
     resident = layout = None
-    if progress:
+    if progress or owned:
         from mstar.engine.resources.loopback_rows import LoopbackRows
         from mstar.graph.loop_indices import LoopLayout
 
@@ -1812,6 +1812,7 @@ def test_connected_capture_selection_preserves_standalone_rules_and_prepares_own
     asks, prepared = [], []
     owner = SimpleNamespace(ask_repeats=prepared.append)
     engine = Engine.__new__(Engine)
+    engine._runner = SimpleNamespace(prefix_chain_keys=lambda node: ())
     engine._device = torch.device("cuda")
     engine._walk_runs = frozenset() if case == "absent" else frozenset({"produce"})
     engine._graph_runtime = SimpleNamespace(execution_units=lambda walk: (unit,))
@@ -1833,7 +1834,7 @@ def test_connected_capture_selection_preserves_standalone_rules_and_prepares_own
         assert not asks
     else:
         assert len(asks) == 1 and asks[0].token_signal is None and asks[0].limit == config.max
-        _, run, _, calls = _runner(monkeypatch, _Loop(), [[1]], bs=1, counted=True, ask=asks[0])
+        _, run, _, calls = _runner(monkeypatch, _Loop(), [[1]], bs=1, counted=True, ask=asks[0], owned=True)
         stops, output, _ = _run(run, 1, 1)
         assert len(calls) == 1 and stops[RUN_COUNTS].tolist() == [1]
         assert output["frame"].tolist() == [[2]]

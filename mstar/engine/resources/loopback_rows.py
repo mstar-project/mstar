@@ -247,6 +247,7 @@ class LoopbackRows(Resource):
 
     def ring_gather(
         self, name: str, rows: torch.Tensor, positions: torch.Tensor, target: torch.Tensor,
+        active: torch.Tensor | None = None,
     ) -> None:
         """Inside a capture, read reserved positions from this owner's fixed ring.
 
@@ -264,7 +265,12 @@ class LoopbackRows(Resource):
         indices = rows[:, None] * depth + positions.clamp_min(0).remainder(depth)
         source = table.flatten(0, 1).index_select(0, indices.reshape(-1)).reshape_as(target)
         mask = valid.reshape(*valid.shape, *([1] * (target.ndim - 2)))
-        target.copy_(torch.where(mask, source, 0))
+        value = torch.where(mask, source, 0)
+        if active is not None:
+            if active.dtype != torch.bool or active.shape != rows.shape or active.device != table.device:
+                raise ValueError("captured ring reads need one eligibility flag per owner row")
+            value = torch.where(active.reshape(-1, *([1] * (target.ndim - 1))), value, target)
+        target.copy_(value)
 
     def ring_scatter(
         self, name: str, rows: torch.Tensor, positions: torch.Tensor, items: torch.Tensor,

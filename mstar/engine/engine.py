@@ -1879,6 +1879,9 @@ class Engine:
             return
         mgmt.device_stops[graph_walk] = policy
         mgmt.refills[graph_walk] = config.refill_at
+        if connected and self._runner.prefix_chain_keys(node_name):
+            runner.refuse_run(graph_walk, "resource: independently ready rows cannot key a prefix chain")
+            return
         if config.join_rows and self._runner.prefix_chain_keys(node_name):
             runner.refuse_run(graph_walk, "resource: joining rows cannot key a prefix chain")
             return
@@ -1911,6 +1914,7 @@ class Engine:
             frozenset(getattr(mgmt.submodule, "ITERATION_INPUTS", None) or ()), config.refill_at,
             config.stream_tokens, loop=loop,
             membership=mgmt.resources[run_rows_key(node_name)] if config.join_rows else None,
+            independent_rows=connected and not config.join_rows,
         ))
 
     def ask_ring(self, node_name: str, signal: str, depth: int, walks: Collection[str]) -> LoopbackRows | str:
@@ -2619,7 +2623,8 @@ class Engine:
         def gather():
             for row, target in enumerate(targets):
                 positions = window.payload_positions(target.shape[1])
-                ring.ring_gather(signal, indices[row:row + 1], positions[row:row + 1], target)
+                ring.ring_gather(signal, indices[row:row + 1], positions[row:row + 1], target,
+                                 None if state.eligible is None else state.eligible[row:row + 1])
 
         backend = runner._graph_backend
         def capture(fn):
@@ -2675,9 +2680,9 @@ class Engine:
                 metadata_preparation = ExitStack()
                 if not active or any(finished[batch.node_name] for _, batch in active):
                     guard.refuse("connected member retirement needs a uniform claimed row set")
-                if streamed and (len(rows) != 1 or len(group.members) != 2 or len(group.unit.streaming_edges) != 1
+                if streamed and (len(group.members) != 2 or len(group.unit.streaming_edges) != 1
                                  or group.unit.edges != group.unit.streaming_edges):
-                    guard.refuse("streamed composition currently needs two members and one logical row")
+                    guard.refuse("streamed composition needs two members and one internal edge")
                 for _, batch in active:
                     preparation.enter_context(guard.isolated_info(batch))
                 preparation.enter_context(metadata_preparation)
@@ -2741,21 +2746,34 @@ class Engine:
                     if stream_incoming:
                         maker, signal = stream_incoming[0]
                         source = self._submodules[maker].loopback_rows
-                        stream_choices = self._prepare_stream_choices(
-                            batch, maker, signal, source.row(signal, rows[0]), guard, rows[0],
-                        )
-                        reference = next((choice for choice in stream_choices if choice is not None), None)
-                        if reference is None:
+                        stream_choices = {
+                            rid: self._prepare_stream_choices(batch, maker, signal, source.row(signal, rid), guard, rid)
+                            for rid in rows
+                        }
+                        references = {
+                            rid: next((choice for choice in choices if choice is not None), None)
+                            for rid, choices in stream_choices.items()
+                        }
+                        if any(reference is None for reference in references.values()):
                             guard.refuse("a final stream tail with no computation completes on its ordinary path")
-                        batch.per_request_input_tensors = reference.per_request_input_tensors
-                        batch.per_request_input_metadata = reference.per_request_input_metadata
-                        batch.per_request_info_wrapped = reference.per_request_info_wrapped
-                        batch.inputs, batch.prepared_rids = reference.inputs, reference.prepared_rids
-                        batch.kept_rows = reference.kept_rows
-                        batch.final_stream_rids = reference.final_stream_rids
+                        batch.per_request_input_tensors = {
+                            rid: ref.per_request_input_tensors[rid] for rid, ref in references.items()
+                        }
+                        batch.per_request_input_metadata = {
+                            rid: ref.per_request_input_metadata[rid] for rid, ref in references.items()
+                        }
+                        batch.per_request_info_wrapped = {
+                            rid: ref.per_request_info_wrapped[rid] for rid, ref in references.items()
+                        }
+                        batch.register_prepare_batch([references[rid].inputs[0] for rid in rows])
+                        batch.prepared_rids = rows
+                        batch.kept_rows = ([references[rid].kept_rows[0] for rid in rows]
+                                           if all(ref.kept_rows is not None for ref in references.values()) else None)
+                        batch.final_stream_rids = set().union(*(ref.final_stream_rids for ref in references.values()))
                         metadata_preparation.enter_context(guard.stream_metadata(batch, {
-                            rows[0]: {signal: tuple(choice.per_request_input_metadata[rows[0]].stream_chunks[signal]
-                                                   for choice in stream_choices if choice is not None)},
+                            rid: {signal: tuple(choice.per_request_input_metadata[rid].stream_chunks[signal]
+                                                for choice in choices if choice is not None)}
+                            for rid, choices in stream_choices.items()
                         }))
                         batch.running_batched = submodule.can_batch(batch=batch, model_inputs=batch.inputs)
                     for maker, signal in (() if stream_incoming else incoming):
@@ -2835,8 +2853,10 @@ class Engine:
                     if lease.bucket.graph_walk in runner._generator_walks:
                         guard.refuse("a composed member draws from a torch generator")
                     if streamed:
-                        if (slot.run is None or slot.run.state.membership is not None or lease.bucket.bs != 1):
-                            guard.refuse("streamed composition needs captured fixed-membership one-row bodies")
+                        if slot.run is None or slot.run.state.membership is not None:
+                            guard.refuse("streamed composition needs captured fixed-membership bodies")
+                        if lease.bucket.bs > 1 and slot.run.state.active is None:
+                            guard.refuse("batched streamed bodies need captured owner masks")
                         if self._custom_output_tail(submodule) and batch.node_name not in direct_producers and (
                             not stream_incoming or batch.step_context.repeats != 1
                         ):
@@ -2992,13 +3012,13 @@ class Engine:
                     maker, consumer, signal = group.unit.streaming_edges[0]
                     batches = {batch.node_name: batch for _, batch in group.members}
                     consumer_batch, producer_batch = batches[consumer], batches[maker]
-                    reservation = next(edge.chunk.reservation for edge in consumer_batch.stream_windows[rows[0]]
-                                       if edge.name == signal)
+                    reservations = [next(edge.chunk.reservation for edge in consumer_batch.stream_windows[rid]
+                                         if edge.name == signal) for rid in rows]
                     tables = self._submodules[consumer].submodule.iteration_tables
                     try:
                         stream_window = tables.prepare_stream_window(
-                            leases[consumer], len(reservation.decisions), len(reservation.transitions),
-                            len(reservation.positions),
+                            leases[consumer], max(len(r.decisions) for r in reservations),
+                            max(len(r.transitions) for r in reservations), max(len(r.positions) for r in reservations),
                         )
                     except ValueError as error:
                         guard.refuse(str(error))  # a larger policy snapshot takes the ordinary path
@@ -3006,8 +3026,9 @@ class Engine:
                         guard.refuse("a streamed consumer discarded its future payload")
                     composed = self._compose_stream(group, leases, stream_window, stream_target, guard)
                     tables.stage_stream_window(
-                        leases[consumer], [reservation], [[choice is not None for choice in stream_choices]],
-                        producer_limits=[producer_batch.ring_width if maker in leases else 0],
+                        leases[consumer], reservations,
+                        [[choice is not None for choice in stream_choices[rid]] for rid in rows],
+                        producer_limits=[producer_batch.ring_width if maker in leases else 0] * len(rows),
                     )
                 elif repeats > 1:
                     row_of = {rid: i for i, rid in enumerate(rows)}
@@ -3126,36 +3147,45 @@ class Engine:
                 or kind.unpack_packed_outputs is not NodeSubmodule.unpack_packed_outputs)
 
     def materialize_group_inputs(self, batch: ExecutingBatch, producer: str, signal: str,
-                                 selected: int, width: int) -> None:
-        """Give a single ordinary tail its actual, still-retained stream input."""
+                                 selected: Mapping[int, int], width: int) -> None:
+        """Give each ordinary tail its actual, still-retained stream input."""
         if not width or not self._custom_output_tail(self._submodules[batch.node_name].submodule):
             return
-        if width != 1 or batch.step_context.repeats != 1 or len(batch.request_ids) != 1:
+        if width != 1 or batch.step_context.repeats != 1:
             raise ValueError("a custom connected tail needs exactly one ordinary consumer compute")
-        rid = batch.request_ids[0]
-        edge, = batch.stream_windows[rid]
-        receipt = edge.chunk.reservation
-        chunks = [receipt.transitions[index].chunk for index in receipt.selected_indices(selected)
-                  if receipt.transitions[index].chunk.num_items]
-        if len(chunks) != 1 or edge.name != signal:
-            raise ValueError("a landed consumer does not name its one actual input chunk")
-        chunk, = chunks
-        start = chunk.start_offset - receipt.origin
-        positions = receipt.positions[start:start + chunk.num_items]
-        if start < 0 or len(positions) != chunk.num_items:
-            raise ValueError("a landed consumer input is outside its retained source coverage")
-        items = self._submodules[producer].loopback_rows.ring_read(signal, rid, positions)
-        value = items[0] if chunk.num_items == 1 else items
-        batch.inputs = ConnectedInputs.materialize(batch.inputs, {(producer, batch.node_name, signal, rid): value})
+        bindings = {}
+        tensors = dict(batch.per_request_input_tensors)
+        metadata = dict(batch.per_request_input_metadata)
+        infos = dict(batch.per_request_info_wrapped)
+        for rid, transition in selected.items():
+            if rid in batch.failed_requests:
+                continue
+            edge, = batch.stream_windows[rid]
+            receipt = edge.chunk.reservation
+            chunks = [receipt.transitions[index].chunk for index in receipt.selected_indices(transition)
+                      if receipt.transitions[index].chunk.num_items]
+            if len(chunks) != 1 or edge.name != signal:
+                raise ValueError("a landed consumer does not name its one actual input chunk")
+            chunk, = chunks
+            start = chunk.start_offset - receipt.origin
+            positions = receipt.positions[start:start + chunk.num_items]
+            if start < 0 or len(positions) != chunk.num_items:
+                raise ValueError("a landed consumer input is outside its retained source coverage")
+            items = self._submodules[producer].loopback_rows.ring_read(signal, rid, positions)
+            value = items[0] if chunk.num_items == 1 else items
+            bindings[producer, batch.node_name, signal, rid] = value
+            tensors[rid] = {**tensors.get(rid, {}), signal: [value]}
+            info = metadata.get(rid, EMPTY_INPUT_METADATA)
+            metadata[rid] = info._replace(
+                stream_chunks={**info.stream_chunks, signal: chunk._replace(reservation=None)},
+            )
+            infos[rid] = dataclasses.replace(infos[rid], metadata=metadata[rid])
+        batch.inputs = [ConnectedInputs.materialize(inp, bindings)
+                        if rid in selected and rid not in batch.failed_requests else inp
+                        for rid, inp in zip(batch.request_ids, batch.inputs, strict=True)]
         batch.uniform_inputs = None
-        batch.per_request_input_tensors = {rid: {**batch.per_request_input_tensors.get(rid, {}), signal: [value]}}
-        metadata = batch.per_request_input_metadata.get(rid, EMPTY_INPUT_METADATA)
-        batch.per_request_input_metadata = {rid: metadata._replace(
-            stream_chunks={**metadata.stream_chunks, signal: chunk._replace(reservation=None)},
-        )}
-        batch.per_request_info_wrapped = {rid: dataclasses.replace(
-            batch.per_request_info_wrapped[rid], metadata=batch.per_request_input_metadata[rid],
-        )}
+        batch.per_request_input_tensors, batch.per_request_input_metadata = tensors, metadata
+        batch.per_request_info_wrapped = infos
 
     def collect_group_outputs(self, batch: ExecutingBatch, width: int, counts: Mapping[int, int]):
         """Close one independently executed member after its actual count lands.
