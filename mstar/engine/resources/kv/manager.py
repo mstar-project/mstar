@@ -2000,12 +2000,13 @@ class KVManager(AttentionResource):
                 # further down the resource order unwinds. Falling through to the
                 # clear below would leak them.
                 return ADMIT_OK
-            # a different step arrived first (see `plan`): drop the staged
-            # plan and reserve for this step normally. The staged step's own
-            # span pages stay with its stream, where its re-admit finds them.
-            # Its reservation went with ``clear_preplan``, so the record of it is
-            # stale and the clear below is right for this path.
-            self.clear_preplan()
+            # Ordinary StepRunner admission already dropped a different stage.
+            # Owner-only admission beside it may reserve disjoint joining rows;
+            # their pages and rollback must leave the queued plan untouched.
+            rows = set(ctx.request_ids)
+            rows.update(seg.request_id for seg in step.segments)
+            if not {seg.request_id for seg in self._preplan_key[0]}.isdisjoint(rows):
+                self.clear_preplan()
         if (step.pre_forks or step.post_forks) and len(self._groups) > 1:
             # A step declares its forks, so this is the first place to see them. Refused before
             # this resource reserves anything, and terminal, so the runner unwinds the step.
@@ -2300,8 +2301,12 @@ class KVManager(AttentionResource):
         only be dropped off the tail. If something else has extended the stream
         since, the tail can no longer be safely removed.
         """
-        self._touch_plan_cache()
-        self._drop_resident_stage()
+        rows = set(ctx.request_ids)
+        rows.update(seg.request_id for seg in step.segments)
+        for rid in rows:
+            self._touch_plan_cache(rid, row=False)
+        if self._resident is not None:
+            self._resident.planner.drop_stage(rows)
         with self._lock:
             if ctx.unit_id is not None:
                 self._unit_steps.pop((ctx.unit_id, ctx.unit_member), None)

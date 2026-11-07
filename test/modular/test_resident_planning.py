@@ -106,11 +106,12 @@ def _stub_transfer(monkeypatch):
     monkeypatch.setattr(manager_mod, "KVTransferManager", _StubTransfer)
 
 
-def _resources(cpu_offload_pages: int = 0, max_num_pages: int = 64, pool_slots: int = 9):
+def _resources(cpu_offload_pages: int = 0, max_num_pages: int = 64, pool_slots: int = 9, prefix_cache=True):
     kv = KVManager(
         cfg=PagedKVConfig(
             num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=512,
             max_num_pages=max_num_pages, page_size=PAGE, cpu_offload_pages=cpu_offload_pages,
+            prefix_cache=prefix_cache,
         ),
         name="kv", joint_comm_group=None, transfer_engine_info=None, device=CPU, dtype=torch.float32,
     )
@@ -1823,6 +1824,155 @@ def test_resident_readers_survive_displacement_and_recycled_handles():
     assert planner._free == free
     planner.unpin(pinned)
     _slot_ledger(planner)
+
+
+def test_fresh_resident_rows_preserve_a_queued_capture_and_ordinary_sequence(monkeypatch):
+    from mstar.utils.h2d import PinnedStager
+
+    live, _, planner = _setup({1: 3, 2: 3})
+    _captured_step(live, planner, [1], slot=0, bs=4)
+    # Reserve the joining horizon first. Its publication must not use ordinary
+    # planning, which would replace the capture staged for request 1 below.
+    joining = _captured_step(live, planner, [2], slot=0, bs=4, repeats=4, run=False)
+    queued = _captured_step(live, planner, [1], slot=1, bs=4, preplan=True, run=False)
+    staged = planner._staged
+    stamps = planner._plan_seq, planner._commits, planner._committed_seq
+    before = {key: (buf.rows.clone(), buf.cells.clone(), buf.staged) for key, buf in planner._buffers.items()}
+    rewrite = planner.rewrite
+    with monkeypatch.context() as patch:
+        def fail_row(*args):
+            rewrite(*args)
+            raise ValueError("owner row refused")
+        patch.setattr(planner, "rewrite", fail_row)
+        for _ in range(planner.max_slots + 1):
+            with pytest.raises(ValueError, match="owner row refused"):
+                planner.prepare_rows(joining.step, joining.ctx)
+    assert planner.slot_of(2) is None
+    _slot_ledger(planner)
+
+    snapshot = planner.prepare_rows(joining.step, joining.ctx)
+    planner.flush(snapshot, stager=PinnedStager(torch.int64))
+    slot = planner.slot_of(2)
+    assert planner._readers[slot] == 1
+    tables = live["kv"]._resident
+    assert tables.host_len[slot] == 3
+    assert tables.host_cols[slot] == 2
+    assert tables.block_table.view[slot, :2].tolist() == live["kv"]._streams[2]["main"].page_indices[:2]
+    assert tables.kv_len.view[slot, 0].item() == 3
+    planner.advance(snapshot)
+    assert tables.host_len[slot] == 7
+    assert tables.kv_len.view[slot, 0].item() == 3, "only executed iterations advance device state"
+    assert planner._staged is staged
+    assert (planner._plan_seq, planner._commits, planner._committed_seq) == stamps
+    for key, (rows, cells, identity) in before.items():
+        buf = planner._buffers[key]
+        assert torch.equal(buf.rows, rows) and torch.equal(buf.cells, cells)
+        assert buf.staged is identity
+    _replay(live, planner, queued)
+    _assert_step_read_its_streams(live, queued, [1])
+    planner.release(2)
+    planner.unpin(tuple(snapshot.slots.tolist()))
+    _slot_ledger(planner)
+
+
+@pytest.mark.parametrize("first_count", [0, 1, 2])
+def test_joining_horizon_preserves_other_preplans_and_settles_both_receipts(monkeypatch, first_count):
+    from mstar.engine.resources.step import AdmitFailedReason, AdmitOutcome
+
+    live = _resources(prefix_cache=False)
+    kv, rope = live["kv"], live["rope"]
+    planner = _planner(live, max_bs=4, keys=("kv", "rope"))
+    runner = StepRunner({"kv": kv, "rope": rope})
+    for rid in (1, 2):
+        runner.ingest_request(rid, {"kv": KVReqConfig()})
+        live["pool"].ingest_request(rid, None)
+        _host_step(live, [rid], [3])
+    _captured_step(live, planner, [1], slot=0, bs=4)
+    bucket = BucketKey(WALK, 4, 4)
+    ctx = StepContext((1,), WALK, 0, False, resident=planner, is_preplan=True,
+                      slot_lease=SlotLease(0, bucket))
+    ctx.set_padded_rids((1, -1, -2, -3))
+    segments = tuple(Segment(rid, "main", 1) for rid in ctx.padded_request_ids)
+    queued = SubmoduleStep({"kv": KVStep(segments=segments), "rope": PositionStep(segments=segments)})
+    queued.set_ctx(ctx)
+    assert runner.pre_admit(queued).ok
+    planner.plan(queued, ctx)
+    runner.pre_plan(queued)
+    ctx.is_preplan = False
+    original = runner._staged, runner._pre_admitted, kv._preplan_key, kv._cached_plan_output, planner._staged
+    marked = list(kv._preplan_marked)
+    before_pages = kv._arena.num_free
+    items = (Segment(2, "main", 1),)
+    joining = SubmoduleStep({"kv": KVStep(segments=items), "rope": PositionStep(segments=items)})
+    joining.set_ctx(StepContext((2,), WALK, 0, False, resident=planner, repeats=4))
+
+    # Full horizon sizing refuses before reserving; it never changes receipts.
+    with monkeypatch.context() as patch:
+        patch.setattr(rope, "max_repeats", lambda step, ctx: 3)
+        assert not runner.admit_rows(joining).ok
+    assert joining.ctx.repeats == 4 and kv._arena.num_free == before_pages
+    # An owner refusing after KV must release only the new row's pages.
+    with monkeypatch.context() as patch:
+        patch.setattr(rope, "admit", lambda step, ctx: AdmitOutcome(False, reason=AdmitFailedReason("busy")))
+        assert not runner.admit_rows(joining).ok
+    assert kv._arena.num_free == before_pages
+    assert (runner._staged, runner._pre_admitted, kv._preplan_key, kv._cached_plan_output, planner._staged) == original
+    assert kv._preplan_marked == marked and kv._streams[1]["main"].step_in_flight
+    assert not kv._streams[2]["main"].step_in_flight
+    assert runner.admit_rows(joining).ok
+    snapshot = planner.prepare_rows(joining, joining.ctx)
+    receipts = []
+    for _ in range(2):
+        receipt = SubmoduleStep(joining.steps)
+        receipt.set_ctx(StepContext((2,), WALK, 0, False, resident=planner, repeats=2))
+        runner.commit(receipt, track_rows=True)
+        receipts.append(receipt)
+    planner.advance(snapshot)
+    assert kv._streams[2]["main"].stored_len == rope.position(2, "main") == 7
+    runner.settle_run(receipts[0], {2: first_count})
+    runner.settle_run(receipts[1], {2: 2})
+    expected = 5 + first_count
+    assert kv._streams[2]["main"].stored_len == rope.position(2, "main") == expected
+    assert kv._resident.host_len[planner.slot_of(2)] == expected
+    assert (runner._staged, runner._pre_admitted, kv._preplan_key, kv._cached_plan_output, planner._staged) == original
+    # The ordinary successor still promotes the plan it reserved before the join.
+    assert runner.admit(queued).ok
+    planner.plan(queued, ctx)
+    assert ctx.resident_plan is original[-1]
+    assert runner.plan(queued)["kv"] is original[3]
+    runner.commit(queued)
+    planner.commit(queued, ctx)
+    planner.release(2)
+    planner.unpin(tuple(snapshot.slots.tolist()))
+    kv.assert_pages_conserved()
+
+
+@pytest.mark.parametrize("unsupported", ["recurrent", "host_writes", "foreign_segment"])
+def test_joining_rejects_unaudited_owner_effects_before_reserving(unsupported):
+    live = _resources(prefix_cache=False)
+    planner = _planner(live, max_bs=4)
+    runner = StepRunner(live)
+    runner.ingest_request(1, {"kv": KVReqConfig()})
+    _host_step(live, [1], [3])
+    segments = (Segment(1, "main", 1),)
+    steps = {"kv": KVStep(segments=segments)}
+    if unsupported == "recurrent":
+        # A provisional first receipt ends at a page boundary and may snapshot
+        # state. Repeat support alone cannot authorize this owner-only path.
+        steps["pool"] = RecurrentStep(segments=segments)
+    elif unsupported == "host_writes":
+        live["kv"]._host_writes = SimpleNamespace()
+    else:
+        steps["kv"] = KVStep(segments=(Segment(2, "main", 1),))
+    step = SubmoduleStep(steps)
+    step.set_ctx(StepContext((1,), WALK, 0, False, resident=planner, repeats=4))
+    free = live["kv"]._arena.num_free
+    with pytest.raises(ValueError):
+        runner.admit_rows(step)
+    assert live["kv"]._arena.num_free == free
+    assert not live["kv"]._admit_reserved_pages
+    assert live["kv"]._streams[1]["main"].stored_len == 3
+    assert not planner._slot_of
 
 
 def test_a_step_does_not_displace_its_own_rows_or_the_step_behind_it():

@@ -20,6 +20,8 @@ from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig
 from mstar.engine.resources.step import (
     FULL_ADMIT_NOT_READY,
     FULL_ADMIT_OK,
+    AdmitFailedReason,
+    AdmitOutcome,
     FullAdmitOutcome,
     SubmoduleStep,
 )
@@ -667,6 +669,63 @@ class StepRunner:
             ready = pre[1]
         else:
             self._settle_repeats(step)
+        return self._admit_resources(step, covered, ready, preserve_stage=beside)
+
+    def admit_rows(self, step: SubmoduleStep) -> FullAdmitOutcome:
+        """Reserve a joining row's whole horizon beside the queued capture.
+
+        No plan or capture buffer is touched. The caller serializes admission,
+        publication and both ordinary receipt commits against same-request
+        settlement/teardown, and holds these owners until readers finish.
+        Unlike ordinary admission, this operation never narrows the horizon.
+        """
+        from mstar.engine.resources.attn.flashinfer import FlashInferManager
+        from mstar.engine.resources.kv.manager import KVManager
+        from mstar.engine.resources.loopback_rows import LoopbackRows
+        from mstar.engine.resources.position.config import PosScheme
+        from mstar.engine.resources.position.manager import RopeManager
+        from mstar.engine.resources.sampler.resource import SamplerResource
+
+        ctx = step.ctx
+        rows = set(ctx.request_ids)
+        if (not rows or len(rows) != len(ctx.request_ids) or any(rid < 0 for rid in rows)
+                or ctx.resident is None or ctx.is_preplan or ctx.unit_id is not None
+                or ctx.capture or ctx.plan_results or ctx.counted or ctx.run_counts is not None):
+            raise ValueError("joining rows need a fresh resident accounting context")
+        ctx.check_tp_repeats()
+        if self._staged is not None:
+            held = set(self._staged[1])
+            held.update(seg.request_id for _, segments in self._staged[4] for seg in segments)
+            if not rows.isdisjoint(held):
+                raise ValueError("joining rows overlap the already staged step")
+        for key in self._keys_for(step):
+            owner, item = self._resources[key], step.get(key)
+            if any(seg.request_id >= 0 and seg.request_id not in rows for seg in item.segments or ()):
+                raise ValueError(f"joining resource {key!r} declares a request outside its context")
+            if type(owner) is KVManager:
+                if (owner._index is not None or owner._windows or owner._host_writes is not None
+                        or owner.config.cpu_offload_pages or owner._host_copies or owner._world_size != 1
+                        or len(owner._groups) != 1 or item.pre_forks or item.post_forks
+                        or item.eager_write or item.retention or not item.commit):
+                    raise ValueError(f"joining resource {key!r} needs plain local KV without prefix or host copies")
+            elif type(owner) is RopeManager:
+                if owner._config.scheme != PosScheme.SEQUENTIAL or item.pos_ids is not None:
+                    raise ValueError(f"joining resource {key!r} needs sequential positions")
+            elif type(owner) is SamplerResource:
+                if (owner.repeat_refusal(ctx.graph_walk) is not None or owner._cg_buffers is None
+                        or not owner._cg_buffers.ingraph_scatter):
+                    raise ValueError(f"joining resource {key!r} needs captured sampler state updates")
+            elif type(owner) not in (LoopbackRows, FlashInferManager):
+                raise ValueError(f"joining resource {key!r} has no audited owner-only admission contract")
+            if owner.max_repeats(item, ctx) < ctx.repeats:
+                return FullAdmitOutcome(AdmitOutcome(ok=False, reason=AdmitFailedReason(
+                    f"joining resource {key!r} cannot reserve the full {ctx.repeats}-iteration horizon",
+                )), key)
+        return self._admit_resources(step, [], True, preserve_stage=True)
+
+    def _admit_resources(
+        self, step: SubmoduleStep, covered: list[str], ready: bool, *, preserve_stage: bool,
+    ) -> FullAdmitOutcome:
         admitted: list[str] = []
         for key in self._keys_for(step):
             if key in covered:
@@ -688,7 +747,7 @@ class StepRunner:
                 )
                 self._unwind(step, [*covered, *admitted, key])
                 # the unwind gave back the stage's pages, so a retry must plan afresh
-                if self._staged is not None and not beside:
+                if self._staged is not None and not preserve_stage:
                     self.clear_preplan()
                 return FullAdmitOutcome(outcome, key)
             admitted.append(key)

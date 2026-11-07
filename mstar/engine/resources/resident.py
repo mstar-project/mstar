@@ -564,10 +564,52 @@ class ResidentPlanner:
         if ctx.is_preplan:
             self._staged = plan
 
-    def drop_stage(self) -> None:
+    def prepare_rows(self, step: SubmoduleStep, ctx) -> ResidentPlan:
+        """Retain fresh rows without changing an already staged capture.
+
+        The caller has admitted the entire outstanding horizon and holds the
+        requests and their resources through all device readers. Flush this
+        snapshot on the publication stream before making its slots visible;
+        release its pins only after the last reader. No ordinary plan/commit
+        sequence advances here.
+        """
+        rids = tuple(ctx.request_ids)
+        streams = self._walk_streams[ctx.graph_walk]
+        if not rids or len(set(rids)) != len(rids) or any(rid < 0 for rid in rids):
+            raise ValueError("resident row publication needs distinct real requests")
+        if (refusal := _row_refusal(step, streams, set(rids))) is not None:
+            raise ValueError(f"resident walk {ctx.graph_walk!r} on {self.node}: {refusal}")
+        with self._lock:
+            if any(rid in self._slot_of for rid in rids):
+                raise ValueError("resident row publication needs previously unheld requests")
+            slots = np.array(self._take_slots(len(rids), self._plan_seq), dtype=np.int64)
+            self._slot_of.update(zip(rids, slots.tolist(), strict=True))
+            # Only the explicit pins retain these readers; no ordinary step
+            # has read the new rows. A refused snapshot can be reused at once.
+            self._last_read[slots] = self._committed_seq
+            self._readers[slots] += 1
+            # Taking slots can displace a row in the last ordinary batch.
+            self._last_rids = None
+        plan = ResidentPlan(
+            (rids, None, None), rids, slots, self._plan_seq, self._commits,
+            ResidentWrites(streams, ctx.repeats), set(rids), set(),
+        )
+        try:
+            for rid, slot in zip(rids, slots, strict=True):
+                self.rewrite(rid, int(slot), plan.writes)
+        except BaseException:
+            for rid in rids:
+                self.release(rid)
+            self.unpin(tuple(slots.tolist()))
+            raise
+        return plan
+
+    def drop_stage(self, request_ids: Collection[int] | None = None) -> None:
         """The pages a pre-plan's stage names were given back (a refused admit,
         an abandoned pre-plan): a retry over the same rows reserves its own, so
         it plans afresh instead of promoting cells that name the old ones."""
+        if request_ids is not None and (self._staged is None or set(request_ids).isdisjoint(self._staged.rids)):
+            return
         staged, self._staged = self._staged, None
         if staged is not None:
             self._restore(staged)
@@ -663,15 +705,19 @@ class ResidentPlanner:
         buffers.dirty = bool(cells)
         self._stager.copy_(buffers.cells, staged)
 
-    def flush(self, plan: ResidentPlan) -> None:
+    def flush(self, plan: ResidentPlan, *, stager: PinnedStager | None = None) -> None:
         """The rows `plan` rewrites, on the step's stream: behind every earlier
-        step, ahead of this one. On the GPU thread, right before the replay."""
+        step, ahead of this one. On the GPU thread, right before the replay.
+        Fresh-row publication supplies its own stager so arena reuse cannot
+        wait on a copy queued behind an executing run."""
         rows = plan.writes.rows
         if not rows:
             return
         stride, store = self._stride, self._store
         dsts = [store[slot * stride + col: slot * stride + col + len(cells)] for slot, col, cells in rows]
-        self._stager.copy_runs_(dsts, np.fromiter(chain.from_iterable(c for _, _, c in rows), dtype=np.int64))
+        (self._stager if stager is None else stager).copy_runs_(
+            dsts, np.fromiter(chain.from_iterable(c for _, _, c in rows), dtype=np.int64),
+        )
 
     def commit(self, step: SubmoduleStep, ctx) -> None:
         """After the resources' commit, before the step's commit event: the
@@ -681,9 +727,13 @@ class ResidentPlanner:
         if plan is None:
             self._note_host_step(step, ctx)
             return
+        self.advance(plan)
+        self._committed_seq = plan.seq
+
+    def advance(self, plan: ResidentPlan) -> None:
+        """Advance owner mirrors after committing this plan's reserved horizon."""
         for resource in self._owners:
             resource.resident_advance(plan)
-        self._committed_seq = plan.seq
 
     def _note_host_step(self, step: SubmoduleStep, ctx) -> None:
         """A host-planned step moved its rows without their tables. A
