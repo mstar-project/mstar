@@ -4811,6 +4811,8 @@ class KVManager(AttentionResource):
         return max(1, min(page_size, reach - longest - ctx.repeats))
 
     def _check_resident_horizon(self, step, ctx) -> None:
+        if step is None:
+            raise ValueError("captured state updates need their declared row step")
         if (self._index is not None or self._windows or self._host_writes is not None
                 or self.config.cpu_offload_pages or self._host_copies or self._world_size != 1
                 or len(self._groups) != 1 or step.pre_forks or step.post_forks

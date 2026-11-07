@@ -423,6 +423,8 @@ class RopeManager(PositionManager):
                 self._counters[segment.request_id][segment.label] -= advance * replays
 
     def _check_resident_horizon(self, step, ctx) -> None:
+        if step is None:
+            raise ValueError("captured state updates need their declared row step")
         if self._config.scheme != PosScheme.SEQUENTIAL or step.pos_ids is not None:
             raise ValueError("needs sequential positions")
 

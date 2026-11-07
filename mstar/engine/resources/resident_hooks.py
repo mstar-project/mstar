@@ -44,7 +44,9 @@ class ResidentBinding:
     All operations are required. An owner explicitly supplies a no-op only for
     effects it does not have. check_streams is pure and runs before bind allocates
     tables; check_horizon validates reversible admission and captured addressing
-    before any owner reserves. Admission/commit/rollback remain Resource's one
+    before any owner reserves, including auxiliary capture owners with no
+    mutation step (None). Those checks also enforce any auxiliary horizon
+    capacity. Admission/commit/rollback remain Resource's one
     lifecycle. Actual-count settlement shares its rewind implementation.
 
     The worker retains request allocations and excludes their movement while
@@ -59,7 +61,7 @@ class ResidentBinding:
     run_gather: Callable[[CapturedResidentStep], None]
     commit_in_graph: Callable[[CapturedResidentStep], None]
     advance: Callable[[ResidentPlan], None]
-    check_horizon: Callable[[ResourceStep, StepContext], None]
+    check_horizon: Callable[[ResourceStep | None, StepContext], None]
     max_repeats: Callable[[ResourceStep, StepContext], int]
     rewind_run: Callable[[ResourceStep, StepContext, int, Collection], None]
 

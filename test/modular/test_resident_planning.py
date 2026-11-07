@@ -4154,3 +4154,38 @@ def test_iteration_stream_packs_frozen_policy_windows_without_reinterpreting_ite
     torch.testing.assert_close(retry, expected[1:])
     with pytest.raises(ValueError, match="declared iteration shape"):
         _window_tables([IterationInput("text", shape=(3,), streamed=True)], {"text": [values]}, metadata)
+
+
+@pytest.mark.parametrize("refuse", [False, True])
+def test_joining_checks_undeclared_capture_owners_before_declared_owner_reservation(refuse):
+    live = _resources(prefix_cache=False, recurrent_prefix_slots=0)
+    auxiliary = live["aux"] = _Attention(True)
+    planner = _planner(live, 4, keys=("kv", "aux"))
+    runner = StepRunner(live)
+    runner.ingest_request(1, {"kv": KVReqConfig()})
+    _host_step(live, [1], [3])
+    seen = []
+
+    def check(step, ctx):
+        seen.append((step, ctx.repeats))
+        if refuse:
+            raise ValueError("captured auxiliary storage is not ready")
+
+    def cannot_mutate(*args):
+        raise AssertionError("an undeclared auxiliary must not be admitted or rolled back")
+
+    auxiliary.admit = auxiliary.rollback_admit = cannot_mutate
+    planner.bindings["aux"] = replace(planner.bindings["aux"], check_horizon=check)
+    step = SubmoduleStep({"kv": KVStep(segments=(Segment(1, "main", 1),))})
+    step.set_ctx(StepContext((1,), WALK, 0, False, resident=planner, repeats=4))
+    free = live["kv"]._arena.num_free
+    if refuse:
+        with pytest.raises(ValueError, match="auxiliary storage"):
+            runner.admit_rows(step)
+        assert live["kv"]._arena.num_free == free
+        assert not live["kv"]._admit_reserved_pages
+    else:
+        assert runner.admit_rows(step).ok
+        runner.rollback_admit(step)
+        assert live["kv"]._arena.num_free == free
+    assert seen == [(None, 4)]

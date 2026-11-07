@@ -698,18 +698,24 @@ class StepRunner:
             held.update(seg.request_id for _, segments in self._staged[4] for seg in segments)
             if not rows.isdisjoint(held):
                 raise ValueError("joining rows overlap the already staged step")
-        for key in self._keys_for(step):
+        keys = self._keys_for(step)
+        for key in keys:
             item = step.get(key)
             if any(seg.request_id >= 0 and seg.request_id not in rows for seg in item.segments or ()):
                 raise ValueError(f"joining resource {key!r} declares a request outside its context")
-            binding = ctx.resident.bindings.get(key)
-            if binding is None:
+            if key not in ctx.resident.bindings:
                 raise ValueError(f"joining resource {key!r} has no resolved resident binding")
+        # Captured auxiliary owners can read storage without declaring a
+        # mutation step. Validate their addressing/lifetime too, before any
+        # owner reserves. Mutation lifecycle calls still use declared steps.
+        for key, binding in ctx.resident.bindings.items():
             try:
-                binding.check_horizon(item, ctx)
+                binding.check_horizon(step.get(key), ctx)
             except ValueError as exc:
                 raise ValueError(f"joining resource {key!r}: {exc}") from exc
-            if binding.max_repeats(item, ctx) < ctx.repeats:
+        for key in keys:
+            binding = ctx.resident.bindings[key]
+            if binding.max_repeats(step.get(key), ctx) < ctx.repeats:
                 return FullAdmitOutcome(AdmitOutcome(ok=False, reason=AdmitFailedReason(
                     f"joining resource {key!r} cannot reserve the full {ctx.repeats}-iteration horizon",
                 )), key)

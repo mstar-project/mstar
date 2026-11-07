@@ -370,6 +370,8 @@ class SamplerResource(Resource):
         return ANY_REPEATS
 
     def _check_resident_horizon(self, step, ctx) -> None:
+        if step is None:
+            raise ValueError("captured state updates need their declared row step")
         if (self.repeat_refusal(ctx.graph_walk) is not None or self._cg_buffers is None
                 or not self._cg_buffers.ingraph_scatter):
             raise ValueError("needs captured sampler state updates")

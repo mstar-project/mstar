@@ -1151,6 +1151,8 @@ class RecurrentStatePool(Resource):
         return None  # a row's state is updated in place, at its slot
 
     def _check_resident_horizon(self, step, ctx) -> None:
+        if step is None:
+            raise ValueError("captured state updates need their declared row step")
         if (self.config.prefix_slots or self._kv is not None or step.pre_forks or step.post_forks
                 or any(not self._slots.get(seg.request_id, {}).get(seg.label)
                        or not self._slots[seg.request_id][seg.label].has_state
