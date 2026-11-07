@@ -1267,6 +1267,29 @@ _STATE_LEADS = {
 }
 
 
+def test_a_prompt_past_max_text_tokens_is_a_400():
+    """Text rows count against the cap, and image rows don't: a wide frame serves today."""
+    pytest.importorskip("cv2")
+
+    class WithImageRows(_BytesProcessor):
+        def __call__(self, text, images, **kwargs):
+            out = super().__call__(text, images, **kwargs)
+            return {**out, "input_ids": torch.cat([torch.full((1, 100), 5), out["input_ids"]], dim=1)}
+
+    model = _model(dataclasses.replace(_config(), max_text_tokens=16))
+    model.processor = Gr00tN17Preprocessor(_DECODE_KWARGS, _DECODE_STATS, {"bot": 0}, 8, 6, WithImageRows())
+    frames = [torch.full((180, 320, 3), 40 * i, dtype=torch.uint8) for i in range(2)]
+    state = {"arm": np.zeros((1, 1, 2), np.float32), "grip": np.zeros((1, 1, 1), np.float32)}
+
+    def serve(text):
+        return model.process_prompt(text, ["text", "image"], ["action"], tensors={"image_inputs": frames},
+                                    embodiment_tag="bot", state=state)
+
+    assert serve("a" * 10)["input_ids"][0].shape[1] == 116  # 100 image rows, "<user>" and the text
+    with pytest.raises(ValueError, match="17 text rows.*at most 16"):
+        serve("a" * 11)
+
+
 @pytest.mark.parametrize("history", [1, 2])
 @pytest.mark.parametrize("lead", list(_STATE_LEADS.values()), ids=list(_STATE_LEADS))
 def test_only_a_state_of_one_request_and_the_configured_history_is_served(lead, history):

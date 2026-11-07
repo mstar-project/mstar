@@ -549,6 +549,14 @@ class Gr00tN17Model(Model):
             language=[prompt or ""],
             state=kwargs["state"],
         )
+        # text rows only: a frame's image rows are bounded by the pixel budget, and nothing
+        # else stops a long instruction running unchunked on the GPU every robot shares
+        rows = int((out["input_ids"] != self.config.text.image_token_id).sum())
+        if rows > self.config.max_text_tokens:
+            raise ValueError(
+                f"gr00t_n17's prompt is {rows} text rows; a request takes at most "
+                f"{self.config.max_text_tokens} (max_text_tokens). Send a shorter instruction"
+            )
         return {name: [tensor] for name, tensor in out.items()}
 
     def request_kwargs(self) -> frozenset[str]:

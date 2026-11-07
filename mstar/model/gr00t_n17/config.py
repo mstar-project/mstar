@@ -100,6 +100,8 @@ class Gr00tN17Config:
     max_num_embodiments: int = 32
     state_history_length: int = 1
     max_seq_len: int = 1024
+    # a robot instruction's text rows, template included; the recorded DROID prompts top out at 25
+    max_text_tokens: int = 256
     num_inference_timesteps: int = 4
     num_timestep_buckets: int = 1000
     attend_text_every_n_blocks: int = 2

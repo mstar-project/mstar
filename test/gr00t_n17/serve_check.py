@@ -132,10 +132,12 @@ def malformed(url: str, obs, seed: int) -> dict[str, int]:
         # a wrong JSON type reaches `.items()`/`.lower()`; it must still be a 400
         "state a list, not an object": (frames, json.dumps({**kwargs, "state": [1.0], "seed": seed})),
         "embodiment_tag a number": (frames, json.dumps({**kwargs, "embodiment_tag": 3, "seed": seed})),
+        "an instruction past max_text_tokens": (frames, json.dumps({**kwargs, "seed": seed})),
     }
     status = {}
     for name, (files, mk) in cases.items():
-        r = requests.post(f"{url}/generate", data={"text": text, "output_modalities": "action",
+        prompt = "a " * 300 if "past" in name else text
+        r = requests.post(f"{url}/generate", data={"text": prompt, "output_modalities": "action",
                                                    "streaming": "false", "model_kwargs": mk},
                           files=[("files", f) for f in files], timeout=600)
         status[name] = r.status_code
