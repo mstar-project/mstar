@@ -2418,7 +2418,7 @@ class Engine:
                         guard.refuse("a member has no capture for the common rows")
                     leases[batch.node_name] = lease
                     slot = runner.slot_for(lease)
-                    if batch.graph_walk in runner._generator_walks:
+                    if lease.bucket.graph_walk in runner._generator_walks:
                         guard.refuse("a composed member draws from a torch generator")
                     if slot.run is not None or batch.step_context.resident is not None:
                         guard.refuse("connected resident runs need their shared run state staged before launch")

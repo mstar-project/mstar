@@ -1314,7 +1314,9 @@ class AcceleratorGraphRunner:
                 graph, output = capture_into_graph(
                     warmed.run, self._memory_pool, self._device, self._autocast_dtype,
                     node_name=self._submodule_name, stream=self._capture_stream,
-                    keep_graph=self._device.type == "cuda" and spec.bucket.graph_walk in self._connected_walks,
+                    keep_graph=self._device.type == "cuda" and not self._connected_walks.isdisjoint(
+                        spec.config.replay_graph_walks,
+                    ),
                 )
             return self._build_slot_from_capture(
                 output=BatchedModelOutput.coerce(output),
