@@ -1,6 +1,7 @@
 """The 4-bit formats against real checkpoints' headers (``quant_checkpoint_headers.json``: names, dtypes and shapes
 read through the HF API at pinned revisions, a few layers each, plus a census of the whole checkpoint): each one is
-classified as what it is, the Qwen3.5 int4 checkpoints resolve against M*'s Qwen3.5 at TP 1/2/4 as expected, and the
+classified as what it is, the Qwen3.5 int4 checkpoints resolve against M*'s Qwen3.5 at TP 1/2/4 as expected (and the
+modelopt NVFP4 one on Blackwell), and the
 routed experts of Kimi K3.1 (MXFP4), Kimi K2.6 (int4 g32) and GLM-5.3-Flash / Kimi K3 (modelopt NVFP4) land on the
 experts' 4-bit storage, shape for shape, at TP 1/2/4/8."""
 
@@ -128,6 +129,32 @@ def test_qwen3_5_int4_checkpoints_resolve_against_m_star_qwen3_5(repo, tp):
     # served on an H200 as stored, refused nowhere; the mixed delta-net input says why it is bf16
     if any(a == "dequant" for a in actions.values()):
         assert any("different formats" in n for n in plan.notes)
+
+
+@pytest.mark.parametrize("tp", [1, 4])
+def test_qwen3_5_nvfp4_modelopt_checkpoint_serves_as_stored_on_blackwell_only(tp):
+    """AxionML/Qwen3.5-27B-NVFP4 (modelopt NVFP4, every linear; B300 item 12w's checkpoint): on sm_100 the MLPs and
+    attention load as stored; the delta net's fused input (q/k/v/z, then the 48-row b/a heads and a pad block, which
+    the checkpoint doesn't store as one) is re-quantized to NVFP4 at load with b/pad/a kept bf16; on an H200 the
+    stored NVFP4 is refused by name, not served dequantized behind the user's back."""
+    repo = "AxionML/Qwen3.5-27B-NVFP4"
+    ckpt = ckpt_of(repo)
+    assert ckpt.method == "modelopt"
+    decl = qwen_root(repo)
+    with torch.device("meta"):
+        root = decl.build(CommGroup(my_global_rank=0, my_group_rank=0, group_members=list(range(tp))))
+    plan = resolve_plan(root, decl, parse_quantization(None).for_node("LLM"), ckpt, (10, 0))
+    assert plan.problems == []
+    for layer in (1, 3):
+        for rel in ("mlp.gate_up_proj", "mlp.down_proj"):
+            entry = plan.layers[f"model.layers.{layer}.{rel}"]
+            assert (entry.action, entry.runtime, entry.source.layout) == (Action.DIRECT, "nvfp4", "modelopt"), entry
+    assert plan.layers["model.layers.1.self_attn.out_proj"].action is Action.DIRECT
+    assert {plan.layers[f"model.layers.3.self_attn.{x}"].action for x in ("qkv_proj", "o_proj")} == {Action.DIRECT}
+    fused = plan.layers["model.layers.1.self_attn.in_proj_fused"]
+    assert (fused.action, fused.runtime, fused.tail) == (Action.REQUANT, "nvfp4", 3), fused
+    hopper = resolve_plan(root, decl, parse_quantization(None).for_node("LLM"), ckpt, (9, 0))
+    assert hopper.problems and all("needs compute capability 10.0" in p for p in hopper.problems)
 
 
 # routed experts: checkpoint names -> the stacked experts storage of a TP block
