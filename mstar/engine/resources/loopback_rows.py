@@ -454,6 +454,39 @@ class LoopbackRows(Resource):
             values = values.index_select(0, picked)
         self.write(name, rids, values[:len(positions)])
 
+    def input_copies(
+        self, name: str, rids: Sequence[Hashable], target: torch.Tensor,
+        copies: Sequence[tuple[torch.Tensor, torch.Tensor]],
+    ) -> list[tuple[torch.Tensor, torch.Tensor]]:
+        """Redirect copies into a captured head's input to its owning rows.
+
+        The head overwrites its static input, so an earlier member or round
+        boundary must write the table it reads. Return views without writing:
+        an unsubmitted group may still refuse or need to snapshot its seeds.
+        """
+        table = self._table(name)
+        width = table[0].numel()
+        if (not target.is_contiguous() or target.numel() != len(rids) * width
+                or target.dtype != table.dtype or target.device != table.device):
+            raise ValueError("a captured row input does not match its owning rows")
+        with self._lock:
+            rows = [self._row_of.get(rid, TRASH_ROW) for rid in rids]
+        redirected = []
+        for source, destination in copies:
+            start = destination.storage_offset() - target.storage_offset()
+            if (source.numel() != destination.numel() or not destination.is_contiguous()
+                    or destination.untyped_storage().data_ptr() != target.untyped_storage().data_ptr()
+                    or start < 0 or start + destination.numel() > target.numel()):
+                raise ValueError("a captured row copy falls outside its input")
+            source = source.reshape(-1)
+            offset = 0
+            while offset < source.numel():
+                row, column = divmod(start + offset, width)
+                size = min(width - column, source.numel() - offset)
+                redirected.append((source.narrow(0, offset, size), table[rows[row]].view(-1).narrow(0, column, size)))
+                offset += size
+        return redirected
+
     def read(self, name: str, rids: Sequence[Hashable]) -> torch.Tensor:
         """``[len(rids), *shape]``: each rid's row of ``name``."""
         return self._table(name).index_select(0, self._index(rids))

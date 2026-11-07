@@ -2062,7 +2062,7 @@ class AcceleratorGraphRunner:
         slot = parts[0].slot
         # Describe storage independently of the active width. A different
         # composition replaces this one slot's buffers rather than growing a cache.
-        needs, retained, staged = [], [], []
+        needs, retained, staged, copied = [], [], [], []
         for part, names in zip(parts, columns or [()] * len(parts), strict=True):
             raw = part.slot.static_outputs
             buffers = raw.check_stop_buffers or {}
@@ -2076,6 +2076,14 @@ class AcceleratorGraphRunner:
                     indices[key] = len(needs)
                     needs.append((tensor, (tensor.shape[0], capacity, *tensor.shape[1:])))
             retained.append((buffers, rows, spans, unique, indices))
+            member_copies = []
+            for source, target in part.copies:
+                index = None
+                if part.slot.row_heads:
+                    index = len(needs)
+                    needs.append((source, tuple(source.shape)))
+                member_copies.append((source, target, index))
+            copied.append(member_copies)
             member_columns = []
             for column, target in part.columns:
                 if column.shape[1] < repeats:
@@ -2120,7 +2128,9 @@ class AcceleratorGraphRunner:
                 ops.extend((storage[index], source) for source, _, index in snapshots)
                 ops.extend((target, storage[index].reshape(target.shape)) for _, target, index in snapshots)
             for member, part in enumerate(parts):
-                ops.extend((target, source.reshape(target.shape)) for source, target in part.copies)
+                ops.extend((storage[index], source) for source, _, index in copied[member] if index is not None)
+                ops.extend((target, (source if index is None else storage[index]).reshape(target.shape))
+                           for source, target, index in copied[member])
                 ops.extend((target, storage[index][:, iteration].reshape(target.shape))
                            for _, target, index in staged[member])
                 ops.append(part.slot)

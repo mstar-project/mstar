@@ -2864,8 +2864,6 @@ class Worker(RepeatingSteps):
         """Publish the GPU thread's irreversible boundary on the main thread."""
         if group.claim:
             if group.submitted:
-                for scheduled, executing in group.members:
-                    scheduled.repeats = executing.step_context.repeats
                 self._graph_runtime.submit_execution_unit(group.claim)
             else:
                 self._graph_runtime.cancel_execution_unit(group.claim)

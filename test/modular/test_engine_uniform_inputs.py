@@ -430,7 +430,7 @@ def test_connected_completion_keeps_ordinary_last_member_metadata(kept):
     assert eng._loopback_rows(group.members[1][1]) == ([False, True] if kept else None)
 
 
-@pytest.mark.parametrize("unsupported", ["run", "resident", "row_heads", "generator", "generator_alias", "early_stop"])
+@pytest.mark.parametrize("unsupported", ["run", "resident", "generator", "generator_alias", "early_stop"])
 def test_connected_refuses_unstaged_captured_state_before_launch(unsupported):
     eng, group, events = _connected_engine()
     batch = group.members[0][1]
@@ -446,8 +446,6 @@ def test_connected_refuses_unstaged_captured_state_before_launch(unsupported):
         runner._generator_walks.add("prefill")
         if unsupported == "generator_alias":
             batch.step_context.graph_walk = "alias"
-    else:
-        slot.row_heads = {"x": "x"}
     assert eng.exec_group(group) is None
     assert not group.submitted
     assert events == ["release:a"]
@@ -588,3 +586,93 @@ def test_connected_round_count_settles_before_admit_and_late_narrowing_unwinds_e
         assert admitted == [(0, 2), (1, 2)] and rolled_back == []
         assert events == ["a", "b"] * 2 + ["release:b", "release:a"]
         assert all(batch.step_context.repeats == 2 for _, batch in group.members)
+
+
+@pytest.mark.parametrize("repeats,refuse,packed,device", [
+    (1, False, False, "cpu"), (3, False, False, "cpu"), (1, True, False, "cpu"), (1, False, True, "cpu"),
+    (3, False, False, "cuda"),
+])
+def test_connected_inputs_reach_captured_row_owners_only_after_submission(repeats, refuse, packed, device):
+    from dataclasses import replace
+
+    from mstar.engine.resources.loopback_rows import LoopbackRows
+
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("real captured row ownership")
+    eng, group, events = _connected_engine(device=device)
+    owners = []
+    for name in ("a", "b"):
+        mgmt = eng._submodules[name]
+        bucket, captures = next(iter(mgmt.accelerator_graph_runner._buckets.items()))
+        slot = captures.slots[0]
+        rows = mgmt.loopback_rows = LoopbackRows(torch.device(device), capacity=4)
+        for rid in (1, 2):  # allocation order differs from the batch order
+            rows.add(rid)
+        rows.write("x", (2, 1), torch.full((2, 2), -50., device=device))
+        rows.indices(bucket, 0).copy_(torch.tensor([rows._row_of[2], rows._row_of[1], 0], device=device))
+        slot.row_heads = {"x": "x"}
+        replay = slot.graph.replay
+
+        def replay_rows(rows=rows, bucket=bucket, slot=slot, replay=replay):
+            rows.head(bucket, 0, "x", slot.static_inputs["x"])
+            replay()
+            rows.tail(bucket, 0, "x", slot.static_outputs.row_outputs["x"])
+
+        if device == "cuda":
+            from mstar.engine.accelerator_graph_runner import capture_into_graph
+
+            replay_rows()
+            backend = mgmt.accelerator_graph_runner._graph_backend
+            slot.graph, _ = capture_into_graph(
+                replay_rows, backend.graph_pool_handle(), torch.device(device), None, keep_graph=True,
+            )
+        else:
+            slot.graph.replay = replay_rows
+        owners.append(rows)
+    for _, batch in group.members:
+        batch.step_context.repeats = repeats
+        eng._submodules[batch.node_name].run_columns[batch.graph_walk] = frozenset({"x"})
+    if repeats > 1:
+        group.unit = replace(group.unit, loop_name="loop", loop_back=(("b", "a", "x"),))
+        group.capacity = repeats
+        # Aliased initial owner rows must be snapshotted before either write.
+        owners[0].write("x", (2, 1), torch.tensor([[1., 1.], [2., 2.]], device=device))
+        group.members[0][1].per_request_input_tensors = {
+            2: {"x": [owners[0].row("x", 1).unsqueeze(0)]},
+            1: {"x": [owners[0].row("x", 2).unsqueeze(0)]},
+        }
+    else:
+        # A carried row already lives in the owner; its placeholder is not a seed.
+        eng._loopback_steps = {1: ("a", "prefill")}
+        group.members[0][1].per_request_input_tensors[1]["x"] = [torch.full((1, 2), -1000., device=device)]
+        owners[0].write("x", (1,), torch.ones(1, 2, device=device))
+    if packed:
+        def preprocess(graph_walk, engine_inputs, inputs):
+            a, b = (inp.tensor_inputs["x"].view(-1) for inp in inputs[:2])
+            # A future span crosses two owner rows, with real spans at either end.
+            padding = torch.full((1,), 9., device=device)
+            return {"x": torch.cat((padding, a, b, padding)).view(3, 2)}
+
+        eng._submodules["b"].submodule.preprocess = preprocess
+    if refuse:
+        node = eng._submodules["b"].submodule
+        preprocess = node.preprocess
+
+        def arithmetic(*args, **kwargs):
+            values = preprocess(*args, **kwargs)
+            return {"x": values["x"] + 1}
+
+        node.preprocess = arithmetic
+        before = [owner.read("x", (2, 1)).clone() for owner in owners]
+        assert eng.exec_group(group) is None and not group.submitted
+        assert not any(event in {"a", "b"} for event in events)
+        assert all(torch.equal(owner.read("x", (2, 1)), values) for owner, values in zip(owners, before, strict=True))
+        return
+    outputs = eng.exec_group(group)
+    assert group.submitted and group.refusal is None
+    for rid in (2, 1):
+        expected = torch.tensor([[rid + 110 * (i + 1)] * 2 for i in range(repeats)])
+        if packed:
+            expected = torch.tensor([[109., 112.]] if rid == 2 else [[112., 111.]])
+        assert torch.equal(outputs[1].per_rid_outputs[rid]["x"][0].reshape(repeats, 2).cpu(), expected)
+        assert torch.equal(owners[1].row("x", rid).cpu(), expected[-1])

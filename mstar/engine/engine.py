@@ -2444,8 +2444,6 @@ class Engine:
                         guard.refuse("a composed member draws from a torch generator")
                     if slot.run is not None or batch.step_context.resident is not None:
                         guard.refuse("connected resident runs need their shared run state staged before launch")
-                    if slot.row_heads:
-                        guard.refuse("connected inputs need their captured row owner's destination")
                     batch.step_context.unit_id = group.claim
                     batch.step_context.unit_member = member
                     inputs, info = self._pad_batch(batch, mgmt, lease)
@@ -2502,6 +2500,19 @@ class Engine:
                     guard.require_real(batch.step_context.plan_results, "resource plans")
                     runner = mgmt.accelerator_graph_runner
                     slot = runner.slot_for(lease)
+                    row_inputs = {name: signal for signal, name in slot.row_heads.items()}
+
+                    def destinations(name, copies, mgmt=mgmt, slot=slot, batch=batch, row_inputs=row_inputs):
+                        signal = row_inputs.get(name)
+                        if signal is None:
+                            return copies
+                        try:
+                            return mgmt.loopback_rows.input_copies(
+                                signal, batch.step_context.padded_request_ids, slot.static_inputs[name], copies,
+                            )
+                        except ValueError as error:
+                            guard.refuse(str(error))
+
                     carries = mgmt.submodule.repeat_carry(batch.graph_walk, {signal for _, signal in incoming})
                     expected = {}
                     for maker, signal in incoming:
@@ -2521,17 +2532,29 @@ class Engine:
                                 guard.refuse(f"future field {name} exceeds its captured destination")
                             target = target.narrow(dim, 0, value.shape[dim])
                             keys = tuple(expected.pop(name))
-                            copies.extend(guard.copies(value, target, keys, set(keys) - back_keys))
-                            group.initial_copies.extend(guard.copies(value, target, keys, bindings.keys() - set(keys)))
+                            copies.extend(destinations(name, guard.copies(value, target, keys, set(keys) - back_keys)))
+                            group.initial_copies.extend(destinations(
+                                name, guard.copies(value, target, keys, bindings.keys() - set(keys)),
+                            ))
                             if back_keys.intersection(keys):
-                                group.initial_copies.extend(guard.copies(value, target, keys, back_keys))
-                                boundary_fields.append((value, target, keys))
+                                group.initial_copies.extend(destinations(
+                                    name, guard.copies(value, target, keys, back_keys),
+                                ))
+                                boundary_fields.append((value, target, keys, name, destinations))
                         else:
                             real[name] = value
+                            if name in row_inputs and isinstance(value, torch.Tensor):
+                                kept = batch.kept_rows
+                                target = slot.static_inputs[name]
+                                routed = [(value[i], target[i]) for i in range(len(rows))
+                                          if kept is None or not kept[i]]
+                                group.initial_copies.extend(destinations(name, routed))
                     if expected:
                         guard.refuse("preprocess discarded a future input")
                     if (batch.iteration_columns or {}).keys() & {pair.input for pair in carries.values()}:
                         guard.refuse("an iteration column overwrites a connected input")
+                    if (batch.iteration_columns or {}).keys() & row_inputs.keys():
+                        guard.refuse("an iteration column needs its captured row owner's destination")
                     runner._stage(lease, real)
                     columns = [
                         *((column, slot.static_inputs[name])
@@ -2551,10 +2574,12 @@ class Engine:
                             guard.refuse(f"{maker}/{signal} has no captured Loop carry")
                         row = row_of[rid]
                         guard.rebind((maker, consumer, signal, rid), source[row:row + 1])
-                    boundary = [copy for value, target, keys in boundary_fields
-                                for copy in guard.copies(value, target, keys, back_keys)]
+                    boundary = [copy for value, target, keys, name, destinations in boundary_fields
+                                for copy in destinations(name, guard.copies(value, target, keys, back_keys))]
             # Every binding has been checked. This is the irreversible point;
             # the main thread publishes it to Rust before landing members.
+            for scheduled, batch in group.members:
+                scheduled.repeats = batch.step_context.repeats
             group.submitted = True
             head = group.members[0][1]
             if head.launch_started_event is not None:
