@@ -1185,6 +1185,10 @@ async fn generate(State(st): State<AppState>, req: axum::extract::Request) -> Re
                     return detail_error(status, &msg);
                 }
             };
+            // Starlette's multipart parser caps non-file parts at 1 MiB.
+            if val.len() > 1 << 20 {
+                return detail_error(400, "Part exceeded maximum size of 1024KB.");
+            }
             match name.as_str() {
                 "text" => text = Some(val),
                 "input_modalities" => in_mods_raw = Some(val),
@@ -1283,6 +1287,7 @@ async fn generate_finish(
     let model_kwargs: Map<String, Value> = match mk_raw {
         Some(raw) if !raw.is_empty() => match serde_json::from_str::<Value>(&raw) {
             Ok(Value::Object(m)) => m,
+            Ok(Value::Null) => Map::new(),
             Ok(_) => return detail_error(400, "model_kwargs must be a JSON object"),
             Err(e) => return detail_error(400, &format!("model_kwargs JSON: {e}")),
         },
@@ -1926,6 +1931,16 @@ mod tests {
         let (status, _, _) = body(images_edits(State(st), mp).await).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(read.load(Ordering::SeqCst), expected);
+    }
+
+    #[tokio::test]
+    async fn generate_form_limits_match_python() {
+        let st = state(None);
+        let req = multipart_request("/generate", &[("model_kwargs", None, b"null")]);
+        assert_eq!(body(generate(State(st.clone()), req).await).await.0, StatusCode::OK);
+        let large = vec![b'x'; (1 << 20) + 1];
+        let req = multipart_request("/generate", &[("text", None, &large)]);
+        assert_eq!(body(generate(State(st), req).await).await.0, StatusCode::BAD_REQUEST);
     }
 
 }
