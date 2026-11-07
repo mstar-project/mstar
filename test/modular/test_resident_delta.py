@@ -30,6 +30,7 @@ from mstar.engine.engine import Engine
 from mstar.engine.resources import Residency
 from mstar.engine.resources.step import FULL_ADMIT_OK, StepContext
 from mstar.testing_utils.engine import make_engine, make_mgmt
+from mstar.testing_utils.resource import StubResource
 from mstar.utils.containers import RecentSet
 from mstar.utils.ipc_format import (
     OffloadDelta,
@@ -126,10 +127,8 @@ def test_an_empty_delta_is_falsy():
 # --- the engine's journal and replay ----------------------------------------
 
 
-class _Resource:
+class _Resource(StubResource):
     supports_eviction = True
-    supports_preplan = False
-    force_double_buffer = False
 
     def __init__(self):
         self.offloaded: set[str] = set()

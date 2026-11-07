@@ -24,7 +24,7 @@ from mstar.engine.resources.attn.config import (
 )
 from mstar.engine.resources.attn.flashinfer import FlashInferManager
 from mstar.engine.resources.attn.workspace import WorkspacePool
-from mstar.engine.resources.base import EngineResourceInfo, Resource
+from mstar.engine.resources.base import EngineResourceInfo
 from mstar.engine.resources.kv.config import (
     DEFAULT_PAGE_SIZE,
     KVGroup,
@@ -40,6 +40,7 @@ from mstar.engine.resources.kv.plan import KVPlanOutput, KVPlanOutputs, Sequence
 from mstar.engine.resources.runner import StepRunner
 from mstar.engine.resources.spec import CombinedSplit, resolve_spec_dependencies
 from mstar.engine.resources.step import BucketKey, Segment, SlotLease, StepContext, SubmoduleStep
+from mstar.testing_utils.resource import StubResource
 
 # A captured plan stages its host arrays behind a CUDA event.
 CAPTURED = (False, True) if torch.cuda.is_available() else (False,)
@@ -191,13 +192,9 @@ class SlidingWindowTests(unittest.TestCase):
         ctx = context([7, 5], [7, 5])
         kv_output = ctx.plan_results.pop("kv")
 
-        class RecordingKV(Resource):
+        class RecordingKV(StubResource):
             plans = 0
             commits = 0
-
-            @classmethod
-            def build(cls, spec, info):
-                return cls()
 
             @property
             def supports_preplan(self):

@@ -15,23 +15,19 @@ from collections.abc import Collection
 sys.path.insert(0, ".")
 
 from mstar.engine.resources import StepRunner
-from mstar.engine.resources.base import Resource
 from mstar.engine.resources.step import ADMIT_OK, ASKS, AdmitOutcome, AdmitRuntimeError
+from mstar.testing_utils.resource import StubResource
 
 NODE, WALK = "llm", "prefill"
 
 
-class _StubPool(Resource):
+class _StubPool(StubResource):
     """Hands out one unit of capacity per request unless ``needs`` says more, refuses the requests in
     ``refuses``, and counts the calls it gets."""
 
     def __init__(self, units: int, needs: dict[str, int] | None = None, refuses: Collection[str] = ()):
         self.free, self.held, self.calls, self.retrieved = units, set(), Counter(), []
         self.needs, self.refuses, self.published = needs or {}, refuses, []
-
-    @classmethod
-    def build(cls, spec, info):
-        raise NotImplementedError
 
     def ask(self, rid, node_name, graph_walk):
         self.calls["ask"] += 1

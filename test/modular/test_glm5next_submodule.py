@@ -42,6 +42,7 @@ from mstar.model.glm5_next.glm5_next_model import Glm5NextModel, process_weights
 from mstar.model.glm5_next.submodules import Glm5NextLLMSubmodule
 from mstar.model.submodule_base import END_PARTITION, ARNodeInputs, HostRows, ModelInputsFromEngine
 from mstar.testing_utils.engine import make_engine, make_mgmt
+from mstar.testing_utils.resource import StubResource
 
 MAX_SLOTS = 4
 DEVICE = torch.device("cpu")
@@ -50,13 +51,9 @@ DEVICE = torch.device("cpu")
 # --- stubs ------------------------------------------------------------------
 
 
-class _GreedySampler(Resource):
+class _GreedySampler(StubResource):
     """Argmax in place of the Triton sampler; the Resource hooks are no-ops,
     so the runner sweeps its step like the real one's."""
-
-    @classmethod
-    def build(cls, spec, info):
-        return cls()
 
     def sample(self, request_ids, logits, **kwargs):
         return logits.argmax(-1)
