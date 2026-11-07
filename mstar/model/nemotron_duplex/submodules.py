@@ -587,8 +587,8 @@ class EarTTSTalkerSubmodule(ARNodeSubmodule):
         self, device: torch.device, tp_world_size: int = 1,
     ) -> list[AcceleratorGraphConfig]:
         """Capture the steady-state step (one token per label per session).
-        ``preprocess`` (text conditioning, noise, warm-up assembly) runs eagerly
-        before the graph; the captured region is the 2N-row backbone over the
+        ``preprocess`` (text conditioning and noise) runs eagerly before the
+        graph; the captured region fuses previous codes and runs the 2N-row backbone over the
         pool and the MaskGIT sampling loop."""
         return [
             BatchedAcceleratorGraphConfig(
@@ -606,36 +606,36 @@ class EarTTSTalkerSubmodule(ARNodeSubmodule):
         ]
 
     def preprocess(self, graph_walk, engine_inputs, inputs):
-        cfg, talker = self.config, self.talker
+        talker = self.talker
         dev = talker.embed_code.weight.device
         rids = list(engine_inputs.request_ids)
         ids = torch.cat([inp.input_ids.reshape(-1)[:1] for inp in inputs]).to(dev)
-        # One D2H read per step for the host-built char conditioning. It waits for
-        # the queued kernels, but the alternatives were worse: a side-stream read
-        # is not ordered against the producer, and a device-side char table
-        # changes the conditioning by a bf16 ulp, which moves the talker's
-        # turn-taking on some clips.
-        tokens = ids.tolist()
-        firsts = [bool(inp.kwargs.get("first", False)) for inp in inputs]
-        warm_c, warm_u, _ = self.warmup()
-        prev_codes = torch.stack([inp.tensor_inputs["prev_codes"].reshape(-1).to(dev) for inp in inputs])  # [N, Q]
-        conds = talker.text_conditioning_from_ids(tokens, self._s2c, self._char_pad)   # [N, 1, H]
-        frame_c, frame_u = talker.frame_inputs(prev_codes, conds, ids, cfg.text_eos_id)  # [N, H] each
-        if any(firsts):
-            # a first step's rows carry the warm-up positions before the frame
-            rows_c = [torch.cat([warm_c, frame_c[i:i + 1]]) if f else frame_c[i:i + 1] for i, f in enumerate(firsts)]
-            rows_u = [torch.cat([warm_u, frame_u[i:i + 1]]) if f else frame_u[i:i + 1] for i, f in enumerate(firsts)]
-            x = torch.cat(rows_c + rows_u)                              # [total_tokens, H], label-major
-        else:
-            x = torch.cat([frame_c, frame_u])                           # [2N, H]
+        # Exact character-width conditioning and native per-request noise remain
+        # host-prepared until their execution-time input contracts are available.
+        conds = talker.text_conditioning_from_ids(ids.tolist(), self._s2c, self._char_pad)
+        previous = torch.stack([inp.tensor_inputs["prev_codes"].reshape(-1).to(dev) for inp in inputs])
         gens = [self._generator(rid, dev) for rid in rids]
-        return {"x": x, "spans": [inp.input_seq_len for inp in inputs], **self._noise(gens, dev)}
+        return {
+            "input_ids": ids, "prev_codes": previous, "conds": conds,
+            "firsts": [bool(inp.kwargs.get("first", False)) for inp in inputs],
+            "spans": [inp.input_seq_len for inp in inputs], **self._noise(gens, dev),
+        }
 
-    def forward_batched(self, graph_walk, engine_inputs, x=None, spans=None, noise_u=None, noise_eps=None,
-                        **kwargs) -> BatchedModelOutput:
+    def forward_batched(self, graph_walk, engine_inputs, input_ids=None, prev_codes=None, conds=None,
+                        firsts=None, spans=None, noise_u=None, noise_eps=None, **kwargs) -> BatchedModelOutput:
         e = self.config.eartts
         rids = list(engine_inputs.request_ids)
         n = len(rids)
+        frame_c, frame_u = self.talker.frame_inputs(prev_codes, conds, input_ids, self.config.text_eos_id)
+        if any(firsts):
+            warm_c, warm_u, _ = self.warmup()
+            rows_c = [torch.cat([warm_c, frame_c[i:i + 1]]) if first else frame_c[i:i + 1]
+                      for i, first in enumerate(firsts)]
+            rows_u = [torch.cat([warm_u, frame_u[i:i + 1]]) if first else frame_u[i:i + 1]
+                      for i, first in enumerate(firsts)]
+            x = torch.cat(rows_c + rows_u)
+        else:
+            x = torch.cat([frame_c, frame_u])
         hidden = self.talker.backbone_pooled(x, TALKER_CFG_LABEL)         # [total_tokens, H]
         if all(s == 1 for s in spans):
             last = hidden                                                 # [2N, H]: cond rows, uncond rows

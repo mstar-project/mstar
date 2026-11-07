@@ -122,7 +122,9 @@ class _Talker:
                                               resources={CODEC_STATE: self.pool}, step=step)
         with torch.no_grad():
             out = self.node.forward_batched(
-                "talker_decode", engine_inputs, x=torch.zeros(2 * m, e.hidden_size), spans=[1] * m,
+                "talker_decode", engine_inputs, input_ids=torch.zeros(m, dtype=torch.long),
+                prev_codes=torch.zeros(m, e.num_quantizers, dtype=torch.long),
+                conds=torch.zeros(m, 1, e.hidden_size), firsts=[False] * m, spans=[1] * m,
                 noise_u=torch.zeros(m, e.inference_num_iter, 1, e.mog_num_predictions),
                 noise_eps=torch.zeros(m, e.inference_num_iter, 1, e.code_dim))
         self.runner.commit(step)

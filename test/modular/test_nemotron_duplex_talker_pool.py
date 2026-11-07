@@ -158,29 +158,46 @@ def test_step_declares_both_streams_in_one_combined_plan():
     ]
 
 
-def test_preprocess_packs_rows_label_major_and_draws_noise_per_row():
+def test_frame_fusion_reads_prepared_previous_codes_inside_forward(monkeypatch):
     sub = make_sub()
     e = TINY
     inputs = [
         sub.prepare_inputs("talker_decode", fwd("a"), {"new_token": [torch.tensor([5])]}),
         sub.prepare_inputs("talker_decode", fwd("b", 1), {
-            "new_token": [torch.tensor([7])], "codec_tokens": [torch.zeros(TINY.num_quantizers, dtype=torch.long)],
+            "new_token": [torch.tensor([7])], "codec_tokens": [torch.zeros(e.num_quantizers, dtype=torch.long)],
         }),
     ]
-    eng = SimpleNamespace(request_ids=["a", "b"], resources={}, per_request_states=None)
-    pre = sub.preprocess("talker_decode", eng, inputs)
-    total = (P + 1) + 1
-    assert pre["x"].shape == (2 * total, e.hidden_size)     # [a cond (38), b cond (1), a uncond (38), b uncond (1)]
-    assert pre["spans"] == [P + 1, 1]
-    assert pre["noise_u"].shape == (2, e.inference_num_iter, 1, e.mog_num_predictions)   # rows first
-    assert pre["noise_eps"].shape == (2, e.inference_num_iter, 1, e.code_dim)
-    # a steady-state batch is exactly two rows per session
-    inputs2 = [sub.prepare_inputs("talker_decode", fwd("b", 1), {
-        "new_token": [torch.tensor([7])], "codec_tokens": [torch.zeros(TINY.num_quantizers, dtype=torch.long)],
-    })]
-    pre2 = sub.preprocess("talker_decode", SimpleNamespace(request_ids=["b"], resources={}, per_request_states=None),
-                          inputs2)
-    assert pre2["x"].shape == (2, e.hidden_size) and pre2["spans"] == [1]
+    backbone = []
+    sub.talker.backbone_pooled = lambda x, label: backbone.append(x.clone()) or x
+    sub.talker.generate_step = lambda hidden, **kwargs: torch.zeros(len(hidden), 1, e.num_quantizers, dtype=torch.long)
+    monkeypatch.setattr("mstar.model.nemotron_duplex.submodules.codec_step", lambda codec, pool, codes: SimpleNamespace(
+        final=torch.zeros(len(codes), 1), end_before=torch.zeros(len(codes), 1), end_after=torch.zeros(len(codes), 1),
+    ))
+    for current in (inputs, inputs[1:]):
+        n = len(current)
+        eng = SimpleNamespace(request_ids=["a", "b"][:n], per_request_states=None, resources={
+            CODEC_STATE: object(),
+            TALKER_ATTN: SimpleNamespace(
+                select_last_hidden=lambda hidden, label, n=n: torch.zeros(2 * n, e.hidden_size)),
+        })
+        pre = sub.preprocess("talker_decode", eng, current)
+        assert pre["noise_u"].shape == (n, e.inference_num_iter, 1, e.mog_num_predictions)
+        assert pre["noise_eps"].shape == (n, e.inference_num_iter, 1, e.code_dim)
+        warm_c, warm_u, _ = sub.warmup()
+        frame_c, frame_u = sub.talker.frame_inputs(
+            pre["prev_codes"], pre["conds"], pre["input_ids"], sub.config.text_eos_id,
+        )
+        expected = torch.cat([
+            torch.cat([warm, frame[i:i + 1]]) if inp.kwargs["first"] else frame[i:i + 1]
+            for warm, frame in ((warm_c, frame_c), (warm_u, frame_u))
+            for i, inp in enumerate(current)
+        ])
+        sub.forward_batched("talker_decode", eng, **pre)
+        torch.testing.assert_close(backbone[-1], expected, rtol=0, atol=0)
+        # A replay's new codes must affect the captured fusion, without another preprocess.
+        pre["prev_codes"].fill_(1)
+        sub.forward_batched("talker_decode", eng, **pre)
+        assert not torch.equal(backbone[-1], expected)
 
 
 def test_decode_capture_config_commits_two_labels_per_row():
@@ -209,7 +226,7 @@ def test_the_next_frame_reads_its_supplied_codes_before_previous_postprocess():
     template = cfg.single_request_inputs
     torch.testing.assert_close(template.tensor_inputs["prev_codes"], sub.warmup()[2])
     prepared = sub.preprocess("talker_decode", SimpleNamespace(request_ids=["a", "pad"]), [later, template])
-    assert prepared["x"].shape == (4, TINY.hidden_size) and prepared["spans"] == [1, 1]
+    assert prepared["prev_codes"].shape == (2, TINY.num_quantizers) and prepared["spans"] == [1, 1]
 
 
 class _DenseAttend:
