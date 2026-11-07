@@ -276,6 +276,111 @@ pub fn check_audio_format(fmt: &str, stream: bool) -> Result<String, String> {
     ))
 }
 
+/// Is `response_format` one this frontend can stream — `media_io.audio_formats
+/// (stream=True)`, which is `("wav", "pcm")` on both frontends? Read by the
+/// speech route to answer Python's `stream_format` rule: the switch only forces
+/// streaming for a format that is actually streamable, so the SDK's default mp3
+/// still falls back to one whole body.
+pub fn is_streamable_audio_format(fmt: &str) -> bool {
+    let fmt = if fmt.is_empty() { "wav".to_string() } else { fmt.to_lowercase() };
+    matches!(fmt.as_str(), "wav" | "pcm")
+}
+
+/// Python's `repr` of a JSON value, for a refusal that quotes a client's value
+/// of whatever type as the Python frontend's `{value!r}` does (`stream_format`
+/// reaches `create_speech` as whatever pydantic parsed into `model_extra`).
+///
+/// Exact for a string, a bool, `null`, an integer `serde_json` holds as one,
+/// and a float it parsed to the same bits Python's parser would. What is left
+/// is serde_json's number model, crate-wide and not this function's to change,
+/// and only reachable through a container or an absurd number in a field whose
+/// every accepted value is a short string: an integer outside `i64`/`u64`
+/// arrives here as an `f64`, as does `-0` (Python keeps both exactly, and as an
+/// `int`); a float whose decimal needs 17 digits can land one ULP off, since
+/// the crate's `float_roundtrip` is not on; and an object's keys come out
+/// sorted, `Value` being a `BTreeMap` without `preserve_order`.
+pub fn py_repr_json(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::Null => "None".to_string(),
+        serde_json::Value::Bool(true) => "True".to_string(),
+        serde_json::Value::Bool(false) => "False".to_string(),
+        // serde keeps the integer/float split JSON made, so an int prints as an int
+        serde_json::Value::Number(n) => match (n.as_i64(), n.as_u64(), n.as_f64()) {
+            (None, None, Some(f)) => py_repr_f64(f),
+            _ => n.to_string(),
+        },
+        serde_json::Value::String(s) => py_repr(s),
+        serde_json::Value::Array(items) => format!(
+            "[{}]",
+            items.iter().map(py_repr_json).collect::<Vec<_>>().join(", ")
+        ),
+        serde_json::Value::Object(map) => format!(
+            "{{{}}}",
+            map.iter()
+                .map(|(k, v)| format!("{}: {}", py_repr(k), py_repr_json(v)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
+/// Python's `repr` of a float: the shortest digits that round-trip, written
+/// positionally while the decimal exponent is in `-4..16` and always with a
+/// point, otherwise `<mantissa>e<sign><2+ digits>`. `{}` alone diverges on the
+/// notation — `0.00001` for Python's `1e-05`, `10000000000000000` for its
+/// `1e+16` — and `{:e}` on the digits, see [`shortest_digits`].
+fn py_repr_f64(f: f64) -> String {
+    if f.is_nan() {
+        return "nan".to_string();
+    }
+    if f.is_infinite() {
+        return if f < 0.0 { "-inf".to_string() } else { "inf".to_string() };
+    }
+    let formatted = shortest_digits(f); // "1.5e0", "1e-5", "-1.25e16"
+    let (mantissa, exponent) = formatted.split_once('e').expect("an exponent is written");
+    let exponent: i32 = exponent.parse().expect("a decimal exponent is written");
+    let (sign, mantissa) = match mantissa.strip_prefix('-') {
+        Some(rest) => ("-", rest),
+        None => ("", mantissa),
+    };
+    if exponent < -4 || exponent >= 16 {
+        let e_sign = if exponent < 0 { '-' } else { '+' };
+        return format!("{sign}{mantissa}e{e_sign}{:02}", exponent.abs());
+    }
+    let digits: String = mantissa.chars().filter(|c| *c != '.').collect();
+    let mut out = String::from(sign);
+    if exponent < 0 {
+        out.push_str("0.");
+        out.push_str(&"0".repeat((-exponent - 1) as usize));
+        out.push_str(&digits);
+    } else if digits.len() > exponent as usize + 1 {
+        let (whole, fraction) = digits.split_at(exponent as usize + 1);
+        out.push_str(whole);
+        out.push('.');
+        out.push_str(fraction);
+    } else {
+        out.push_str(&digits);
+        out.push_str(&"0".repeat(exponent as usize + 1 - digits.len()));
+        out.push_str(".0");
+    }
+    out
+}
+
+/// The shortest decimal that parses back to `f`, correctly rounded: the digits
+/// Python's `repr` picks, in `{:e}`'s shape. `{:e}` alone is shortest too, but
+/// where two equally short strings both round-trip it can break the tie the
+/// other way (`1000000000000000.3` for Python's `1000000000000000.2`), so ask
+/// for each precision in turn and take the first that round-trips.
+fn shortest_digits(f: f64) -> String {
+    for precision in 0..=16 {
+        let candidate = format!("{f:.precision$e}");
+        if candidate.parse::<f64>().map(f64::to_bits) == Ok(f.to_bits()) {
+            return candidate;
+        }
+    }
+    format!("{f:.17e}")
+}
+
 /// Python's `repr` of a str, for a refusal that quotes the client's value as
 /// the Python frontend's does.
 fn py_repr(s: &str) -> String {
@@ -372,6 +477,75 @@ mod tests {
             ("海 é", "'海 é'"),
         ] {
             assert_eq!(py_repr(s), want, "{s:?}");
+        }
+    }
+
+    /// `media_io.audio_formats(stream=True)` is `("wav", "pcm")`; an unset
+    /// `response_format` reads as `wav`, as `(req.response_format or "wav")` does.
+    #[test]
+    fn only_wav_and_pcm_can_be_streamed() {
+        for fmt in ["wav", "WAV", "pcm", "PCM", ""] {
+            assert!(is_streamable_audio_format(fmt), "{fmt:?}");
+        }
+        for fmt in ["mp3", "MP3", "flac", "opus", "aac", "ogg", "nonsense"] {
+            assert!(!is_streamable_audio_format(fmt), "{fmt:?}");
+        }
+    }
+
+    /// `repr` of a value of any JSON type, for a 400 that quotes what the
+    /// client sent the way Python's `{value!r}` does.
+    #[test]
+    fn repr_of_a_json_value_reads_as_pythons() {
+        for (body, want) in [
+            ("null", "None"),
+            ("true", "True"),
+            ("false", "False"),
+            ("7", "7"),
+            ("-7", "-7"),
+            ("9223372036854775807", "9223372036854775807"),
+            ("18446744073709551615", "18446744073709551615"),
+            (r#""sse""#, "'sse'"),
+            (r#"["sse",1,null]"#, "['sse', 1, None]"),
+            ("[]", "[]"),
+            (r#"{"a":1,"b":[true]}"#, "{'a': 1, 'b': [True]}"),
+            ("{}", "{}"),
+        ] {
+            let v: serde_json::Value = serde_json::from_str(body).unwrap();
+            assert_eq!(py_repr_json(&v), want, "{body}");
+        }
+    }
+
+    /// `repr(float)`: the switch between positional and exponent form, and the
+    /// signed two-digit exponent, both of which `{}` gets wrong.
+    #[test]
+    fn repr_of_a_float_reads_as_pythons() {
+        for (f, want) in [
+            (1.0, "1.0"),
+            (-1.0, "-1.0"),
+            (0.0, "0.0"),
+            (-0.0, "-0.0"),
+            (1.5, "1.5"),
+            (1e3, "1000.0"),
+            (1234.5, "1234.5"),
+            (0.0001, "0.0001"),
+            (1e-5, "1e-05"),
+            (1.5e-7, "1.5e-07"),
+            (1e15, "1000000000000000.0"),
+            (1e16, "1e+16"),
+            (1.25e16, "1.25e+16"),
+            (-1e16, "-1e+16"),
+            (1e100, "1e+100"),
+            (1e-100, "1e-100"),
+            (0.1 + 0.2, "0.30000000000000004"),
+            (f64::MAX, "1.7976931348623157e+308"),
+            (f64::MIN_POSITIVE, "2.2250738585072014e-308"),
+            (5e-324, "5e-324"), // the smallest subnormal
+            // Two shortest strings round-trip to these, and `{:e}` picks the
+            // other one of each pair; repr picks the nearer.
+            (f64::from_bits(0x430c_6bf5_2634_0002), "1000000000000000.2"),
+            (f64::from_bits(0x42d6_bcc4_1e90_0008), "100000000000000.12"),
+        ] {
+            assert_eq!(py_repr_f64(f), want, "{f}");
         }
     }
 }
