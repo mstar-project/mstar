@@ -26,9 +26,10 @@ from mstar.model.nemotron_duplex.submodules import EarTTSTalkerSubmodule
 P = 37   # speaker warm-up positions
 
 
-def fwd(handle: str) -> SimpleNamespace:
+def fwd(handle: str, iteration: int = 0) -> SimpleNamespace:
     """The engine keys request state by the worker-local handle, not the wire id."""
-    return SimpleNamespace(rid_handle=handle, request_id=f"wire-{handle}")
+    return SimpleNamespace(rid_handle=handle, request_id=f"wire-{handle}",
+                           dynamic_loop_iter_counts={"talker_decode_loop": iteration})
 
 
 def make_sub() -> EarTTSTalkerSubmodule:
@@ -112,10 +113,9 @@ def test_each_step_emits_its_frame_and_the_last_the_calls_right_edge(final, toke
     after it."""
     sub = make_sub()
     edge = sub.codec.stream_edge
-    if not first:
-        sub.request_state("a").add(sub.PREV_CODES_KEY, torch.zeros(TINY.num_quantizers, dtype=torch.long))
-    inputs = {"new_token": [torch.tensor([5])] if token else []}
-    ni = sub.prepare_inputs("talker_decode", fwd("a"), inputs, is_final_stream_chunk=final)
+    inputs = {"new_token": [torch.tensor([5])] if token else [],
+              "codec_tokens": [torch.zeros(TINY.num_quantizers, dtype=torch.long)]}
+    ni = sub.prepare_inputs("talker_decode", fwd("a", 0 if first else 1), inputs, is_final_stream_chunk=final)
     frame = torch.arange(100, dtype=torch.int16).view(1, -1)
     end = torch.arange(-1, -2 * edge - 1, -1, dtype=torch.int16).view(1, -1)        # before | after
     out = {"codec_tokens": [torch.arange(TINY.num_quantizers)], "audio_chunk": [frame], "audio_end": [end]}
@@ -137,8 +137,9 @@ def test_step_declares_both_streams_in_one_combined_plan():
     sub = make_sub()
     # first step of "a" (warm-up + frame), steady state for "b"
     first = sub.prepare_inputs("talker_decode", fwd("a"), {"new_token": [torch.tensor([5])]})
-    sub.request_state("b").add(sub.PREV_CODES_KEY, torch.zeros(TINY.num_quantizers, dtype=torch.long))
-    later = sub.prepare_inputs("talker_decode", fwd("b"), {"new_token": [torch.tensor([7])]})
+    later = sub.prepare_inputs("talker_decode", fwd("b", 1), {
+        "new_token": [torch.tensor([7])], "codec_tokens": [torch.zeros(TINY.num_quantizers, dtype=torch.long)],
+    })
     assert first.input_seq_len == P + 1 and first.kwargs["first"] is True
     assert later.input_seq_len == 1 and later.kwargs["first"] is False
     step = sub.declare_step("talker_decode", ["a", "b"], [first, later])
@@ -160,10 +161,11 @@ def test_step_declares_both_streams_in_one_combined_plan():
 def test_preprocess_packs_rows_label_major_and_draws_noise_per_row():
     sub = make_sub()
     e = TINY
-    sub.request_state("b").add(sub.PREV_CODES_KEY, torch.zeros(e.num_quantizers, dtype=torch.long))
     inputs = [
         sub.prepare_inputs("talker_decode", fwd("a"), {"new_token": [torch.tensor([5])]}),
-        sub.prepare_inputs("talker_decode", fwd("b"), {"new_token": [torch.tensor([7])]}),
+        sub.prepare_inputs("talker_decode", fwd("b", 1), {
+            "new_token": [torch.tensor([7])], "codec_tokens": [torch.zeros(TINY.num_quantizers, dtype=torch.long)],
+        }),
     ]
     eng = SimpleNamespace(request_ids=["a", "b"], resources={}, per_request_states=None)
     pre = sub.preprocess("talker_decode", eng, inputs)
@@ -173,7 +175,9 @@ def test_preprocess_packs_rows_label_major_and_draws_noise_per_row():
     assert pre["noise_u"].shape == (2, e.inference_num_iter, 1, e.mog_num_predictions)   # rows first
     assert pre["noise_eps"].shape == (2, e.inference_num_iter, 1, e.code_dim)
     # a steady-state batch is exactly two rows per session
-    inputs2 = [sub.prepare_inputs("talker_decode", fwd("b"), {"new_token": [torch.tensor([7])]})]
+    inputs2 = [sub.prepare_inputs("talker_decode", fwd("b", 1), {
+        "new_token": [torch.tensor([7])], "codec_tokens": [torch.zeros(TINY.num_quantizers, dtype=torch.long)],
+    })]
     pre2 = sub.preprocess("talker_decode", SimpleNamespace(request_ids=["b"], resources={}, per_request_states=None),
                           inputs2)
     assert pre2["x"].shape == (2, e.hidden_size) and pre2["spans"] == [1]
@@ -188,11 +192,24 @@ def test_decode_capture_config_commits_two_labels_per_row():
     assert cfgs[0].single_request_inputs.kwargs["first"] is False
 
 
-def test_postprocess_carries_the_codes_into_the_next_frame():
+def test_the_next_frame_reads_its_supplied_codes_before_previous_postprocess():
     sub = make_sub()
     codes = torch.arange(TINY.num_quantizers)
-    sub.postprocess("a", None, {"codec_tokens": [codes]})
-    torch.testing.assert_close(sub.request_state("a")[sub.PREV_CODES_KEY], codes)
+    later = sub.prepare_inputs("talker_decode", fwd("a", 1),
+                               {"new_token": [torch.tensor([5])], "codec_tokens": [codes]})
+    assert later.input_seq_len == 1 and later.kwargs["first"] is False
+    torch.testing.assert_close(later.tensor_inputs["prev_codes"], codes)
+    sub.postprocess("a", None, {"codec_tokens": [torch.zeros_like(codes)]})
+    torch.testing.assert_close(later.tensor_inputs["prev_codes"], codes)
+    with pytest.raises(ValueError, match="previous codec tokens"):
+        sub.prepare_inputs("talker_decode", fwd("a", 1), {"new_token": [torch.tensor([5])]})
+    # Capture and padding bypass prepare_inputs, so their declared tensor is
+    # also a valid previous frame rather than a hidden request-state fallback.
+    (cfg,) = sub.get_accelerator_graph_configs(torch.device("cpu"))
+    template = cfg.single_request_inputs
+    torch.testing.assert_close(template.tensor_inputs["prev_codes"], sub.warmup()[2])
+    prepared = sub.preprocess("talker_decode", SimpleNamespace(request_ids=["a", "pad"]), [later, template])
+    assert prepared["x"].shape == (4, TINY.hidden_size) and prepared["spans"] == [1, 1]
 
 
 class _DenseAttend:
@@ -240,19 +257,23 @@ def test_forward_pooled_pads_qkv_to_the_kv_head_dim_exactly(kv_head_dim):
 
 
 def test_warmup_steps_run_eager_and_steady_state_steps_hit_the_decode_capture():
-    """The decode capture has a fixed shape (two tokens per session); a session's
-    first step prefills its 38-token warm-up, so any batch containing one runs
-    eager. cg_key_info() (asked before prepare_inputs) and declare_step() must
-    agree, and both must name the key the capture config was captured under."""
-    sub = make_sub()
-    sub.request_state("b").add(sub.PREV_CODES_KEY, torch.zeros(TINY.num_quantizers, dtype=torch.long))
-    infos = {"a": fwd("a"), "b": fwd("b")}
-    first = sub.prepare_inputs("talker_decode", infos["a"], {"new_token": [torch.tensor([5])]})
-    later = sub.prepare_inputs("talker_decode", infos["b"], {"new_token": [torch.tensor([7])]})
+    """Capture selection and preparation use the same snapshotted iteration,
+    even when the mutable request has advanced or not yet postprocessed."""
+    from mstar.engine.engine import ForwardPassInfoWrapper
+    from mstar.model.submodule_base import InputMetadata
 
-    # "a" is on its warm-up step; the engine also passes per_request_input_metadata
-    assert sub.cg_key_info("talker_decode", infos, per_request_input_metadata={}) is None
+    sub = make_sub()
+    infos = {
+        "a": ForwardPassInfoWrapper(fwd("a", 4), InputMetadata(dynamic_loop_iter_counts={"talker_decode_loop": 0})),
+        "b": ForwardPassInfoWrapper(fwd("b", 0), InputMetadata(dynamic_loop_iter_counts={"talker_decode_loop": 1})),
+    }
+    first = sub.prepare_inputs("talker_decode", infos["a"], {"new_token": [torch.tensor([5])]})
+    later = sub.prepare_inputs("talker_decode", infos["b"], {
+        "new_token": [torch.tensor([7])], "codec_tokens": [torch.zeros(TINY.num_quantizers, dtype=torch.long)],
+    })
+    assert sub.cg_key_info("talker_decode", infos) is None
     assert sub.declare_step("talker_decode", ["a", "b"], [first, later]).cg_key_info is None
+    assert first.input_seq_len == P + 1 and later.input_seq_len == 1
     assert sub.cg_key_info("talker_decode", {"b": infos["b"]}) == sub.DECODE_KEY
     assert sub.declare_step("talker_decode", ["b"], [later]).cg_key_info == sub.DECODE_KEY
     (cfg,) = sub.get_accelerator_graph_configs(torch.device("cpu"))

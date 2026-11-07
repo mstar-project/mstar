@@ -151,13 +151,18 @@ class _Talker:
             rids, inputs, codes = [], [], []
             for rid, call in calls.items():
                 k, n = t - starts[rid], len(call)
-                info = SimpleNamespace(rid_handle=rid)
+                info = SimpleNamespace(rid_handle=rid, dynamic_loop_iter_counts={"talker_decode_loop": max(k, 0)})
+                previous = [call[k - 1]] if k > 0 and k <= n else [torch.empty(0, dtype=torch.long)]
                 if 0 <= k < n:
-                    inputs.append(self.node.prepare_inputs("talker_decode", info, {"new_token": [torch.tensor([5])]},
-                                                           is_final_stream_chunk=k == n - 1 and not end_on_empty[rid]))
+                    inputs.append(self.node.prepare_inputs(
+                        "talker_decode", info, {"new_token": [torch.tensor([5])], "codec_tokens": previous},
+                        is_final_stream_chunk=k == n - 1 and not end_on_empty[rid],
+                    ))
                     codes.append(call[k])
                 elif k == n and end_on_empty[rid]:
-                    inputs.append(self.node.prepare_inputs("talker_decode", info, {}, is_final_stream_chunk=True))
+                    inputs.append(self.node.prepare_inputs(
+                        "talker_decode", info, {"codec_tokens": previous}, is_final_stream_chunk=True,
+                    ))
                     codes.append(codes_for(self.real, 1)[0])
                 else:
                     continue
@@ -203,7 +208,7 @@ def test_a_call_with_no_frame_emits_nothing():
     """A token stream that ends before its first token reaches the talker runs
     one PAD frame to end the loop, and the call gets no audio, as offline."""
     talker = _Talker(captured=False)
-    info = SimpleNamespace(rid_handle="a")
+    info = SimpleNamespace(rid_handle="a", dynamic_loop_iter_counts={})
     inp = talker.node.prepare_inputs("talker_decode", info, {}, is_final_stream_chunk=True)
     assert talker.step(["a"], [inp], codes_for(talker.real, 1))["a"] == {}
 

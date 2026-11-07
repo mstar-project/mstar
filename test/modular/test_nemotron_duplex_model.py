@@ -395,27 +395,32 @@ def test_duplex_worker_graphs_derive_all_walks():
     # lets the worker overlap another node's step with it
     encoder_node = by_walk["encode"].section.section                 # Loop -> GraphNode
     assert encoder_node.name == "conformer_encoder" and encoder_node.enable_async_scheduling is True
-    # the talker's next step reads the codes its previous step stored in
-    # postprocess: it must not be built speculatively while that step runs
+    # Previous codes now travel on the ordinary self-edge; eager noise and
+    # value-dependent conditioning still prohibit speculative preparation.
     talker_node = by_walk["talker_decode"].section.section          # Loop -> GraphNode
     assert talker_node.name == "eartts_talker" and talker_node.enable_async_scheduling is False
     # it decodes its codes in the same step: each frame's PCM goes straight to the client
-    (audio,) = talker_node.outputs
+    audio, feedback = talker_node.outputs
+    assert (feedback.next_node, feedback.name) == ("eartts_talker", "codec_tokens")
+    assert "codec_tokens" in talker_node.input_names
     assert (audio.next_node, audio.name, audio.output_modality) == ("emit_to_client", "audio_chunk", "audio")
     assert by_walk["decode"].section.section.enable_async_scheduling is True
 
 
 def test_duplex_initial_partition_routing():
     model = _make_model()
-    sig = {"text_inputs": ["t"], "has_prompt": ["h"], "prev_text": ["p"], "prev_func": ["f"]}
+    sig = {"text_inputs": ["t"], "has_prompt": ["h"], "prev_text": ["p"], "prev_func": ["f"], "codec_tokens": ["c"]}
     expected = {"Encoder": "encode", "LLM": "decode",
                 "Talker": "talker_decode"}
     for pname, walk in expected.items():
         fpa = model.get_initial_forward_pass_args(pname, ["audio"], ["audio", "text"], sig)
         assert fpa.full_metadata.graph_walk == walk
-        if pname != "LLM":
-            # self-triggered: the Encoder by the client's audio stream
+        if pname == "Encoder":
             assert fpa.inputs == [] and fpa.request_done is False
+        elif pname == "Talker":
+            seed, = fpa.inputs
+            assert (seed.next_node, seed.name, seed.tensor_info) == ("eartts_talker", "codec_tokens", ["c"])
+            assert fpa.unpersist_tensors == ["c"] and fpa.request_done is False
     # with a system prompt the LLM's first step is prompt + frame: flagged so the
     # worker keeps it off the fixed-shape decode capture; the prompt rides the loop
     fpa = model.get_initial_forward_pass_args("LLM", ["audio", "text"], ["audio", "text"], sig)
@@ -473,6 +478,7 @@ def test_duplex_process_prompt_seeds_frame0_feedback():
         tensors={"audio_inputs": [torch.zeros(16000)]},
     ).new_input_tensors
     assert "audio_in" in out                     # an uploaded clip is the stream's first chunk
+    assert len(out["codec_tokens"]) == 1 and out["codec_tokens"][0].shape == (0,)
     assert int(out["prev_text"][0].item()) == model.config.text_bos_id
     assert int(out["prev_func"][0].item()) == model.config.text_pad_id
     assert out["text_inputs"][0].tolist() == [-1] and "has_prompt" not in out   # no prompt: the sentinel

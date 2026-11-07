@@ -449,7 +449,6 @@ class EarTTSTalkerSubmodule(ARNodeSubmodule):
 
     disable_torch_compile = True
 
-    PREV_CODES_KEY = "talker_prev_codes"
     GEN_KEY = "talker_gen"
     DECODE_KEY = "decode"            # the steady-state capture's bucket key (cg_key_info)
     SPEAKER = "Aria"
@@ -512,19 +511,17 @@ class EarTTSTalkerSubmodule(ARNodeSubmodule):
 
     # -- engine contract -------------------------------------------------
 
-    def _is_first_step(self, rid: str) -> bool:
-        return self.request_state(rid).get(self.PREV_CODES_KEY) is None
-
     def cg_key_info(
         self, graph_walk: str, per_request_info: Mapping[str, Any], **kwargs: Any
     ) -> str | None:
         """Which capture serves this batch: the steady-state decode capture
         (``DECODE_KEY``) when every session is past its first step, None (run
         eager) when any session prefills its warm-up this step. The engine
-        leases the slot before ``prepare_inputs`` runs, so this answers from
-        the request state, like ``declare_step`` does."""
+        leases the slot before ``prepare_inputs`` runs; both read the same
+        snapshotted graph loop count rather than previous postprocessing."""
         del graph_walk
-        return None if any(self._is_first_step(rid) for rid in per_request_info) else self.DECODE_KEY
+        return (None if any(info.dynamic_loop_iter_counts.get("talker_decode_loop", 0) == 0
+                            for info in per_request_info.values()) else self.DECODE_KEY)
 
     def prepare_inputs(self, graph_walk, fwd_info, inputs, is_final_stream_chunk=False, **kwargs) -> ARNodeInputs:
         # The LLM streams the sampled agent text token under "new_token". A
@@ -539,10 +536,17 @@ class EarTTSTalkerSubmodule(ARNodeSubmodule):
             # breaks the stop; it only ends the loop, so postprocess drops it.
             dev = self.talker.embed_code.weight.device
             tok = torch.tensor([self.config.text_pad_id], dtype=torch.long, device=dev)
-        first = self._is_first_step(fwd_info.rid_handle)
+        first = fwd_info.dynamic_loop_iter_counts.get("talker_decode_loop", 0) == 0
+        if first:
+            previous = self.warmup()[2]
+        else:
+            previous = inputs.get("codec_tokens")
+            if not previous or len(previous) != 1 or previous[0].numel() != self.config.eartts.num_quantizers:
+                raise ValueError("a continuing Talker frame needs its previous codec tokens")
+            previous = previous[0].reshape(-1)
         span = self.warmup_len + 1 if first else 1
         final = bool(is_final_stream_chunk)
-        return ARNodeInputs(input_ids=tok, input_seq_len=span,
+        return ARNodeInputs(input_ids=tok, input_seq_len=span, tensor_inputs={"prev_codes": previous},
                             kwargs={"first": first, "final": final, "ends_loop": final and not chunk})
 
     def declare_step(
@@ -591,7 +595,7 @@ class EarTTSTalkerSubmodule(ARNodeSubmodule):
                 capture_graph_walk="talker_decode",
                 single_request_inputs=ARNodeInputs(
                     input_ids=torch.tensor([self.config.text_pad_id], dtype=torch.long, device=device),
-                    input_seq_len=1, kwargs={"first": False},
+                    input_seq_len=1, kwargs={"first": False}, tensor_inputs={"prev_codes": self.warmup()[2]},
                 ),
                 capture_batch_sizes=self.DECODE_CAPTURE_BATCH_SIZES,
                 # each request commits one token on each of its two labels
@@ -613,12 +617,8 @@ class EarTTSTalkerSubmodule(ARNodeSubmodule):
         # turn-taking on some clips.
         tokens = ids.tolist()
         firsts = [bool(inp.kwargs.get("first", False)) for inp in inputs]
-        warm_c, warm_u, warm_prev = self.warmup()
-        prev_codes = torch.stack([
-            warm_prev if first or self.request_state(rid).get(self.PREV_CODES_KEY) is None
-            else self.request_state(rid)[self.PREV_CODES_KEY].reshape(-1)
-            for rid, first in zip(rids, firsts, strict=True)
-        ])                                                              # [N, Q]
+        warm_c, warm_u, _ = self.warmup()
+        prev_codes = torch.stack([inp.tensor_inputs["prev_codes"].reshape(-1).to(dev) for inp in inputs])  # [N, Q]
         conds = talker.text_conditioning_from_ids(tokens, self._s2c, self._char_pad)   # [N, 1, H]
         frame_c, frame_u = talker.frame_inputs(prev_codes, conds, ids, cfg.text_eos_id)  # [N, H] each
         if any(firsts):
@@ -674,10 +674,6 @@ class EarTTSTalkerSubmodule(ARNodeSubmodule):
             if end and not flags.get("first"):
                 outputs["audio_chunk"] = [end[0][..., :self.codec.stream_edge]]
             return
-        # This frame's codes are the next frame's ``prev_codes`` (metadata only:
-        # the tensor is already a copy out of the graph's output buffer).
-        if "codec_tokens" in outputs:
-            self.request_state(request_id).add(self.PREV_CODES_KEY, outputs["codec_tokens"][0])
         if "audio_chunk" in outputs and (flags.get("first") or flags.get("final")):
             # the full decode trims the overlap-add's left edge, and ends on the
             # samples after the last frame's final ones

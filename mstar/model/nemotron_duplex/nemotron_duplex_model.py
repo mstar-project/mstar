@@ -704,17 +704,20 @@ class NemotronDuplexModel(Model):
         # Talker: each streamed agent token -> RVQ codes -> that frame's PCM, to
         # the client. The codec decodes in the talker's step (no stream hop, no
         # step of its own), against each call's stream state in codec_state.
-        # No speculative scheduling here. The talker keeps the previous frame's
-        # codes in per-request state written by postprocess, so a step built
-        # while the previous one is still running would read the wrong frame.
+        # Previous codes are ordinary loop-back data. Noise generation and
+        # value-dependent conditioning still run in preprocess, so speculative
+        # scheduling remains disabled until their execution-time owners exist.
         talker_decode = Loop(
             name="talker_decode_loop",
             section=GraphNode(
                 name="eartts_talker",
-                input_names=["new_token"],
+                input_names=["new_token", "codec_tokens"],
                 consumes_stream=True,
                 enable_async_scheduling=False,
-                outputs=[GraphEdge(next_node=EMIT_TO_CLIENT, name="audio_chunk", output_modality="audio")],
+                outputs=[
+                    GraphEdge(next_node=EMIT_TO_CLIENT, name="audio_chunk", output_modality="audio"),
+                    GraphEdge(next_node="eartts_talker", name="codec_tokens"),
+                ],
             ),
             max_iters=self.get_max_output_tokens(),
             outputs=[],
@@ -816,6 +819,9 @@ class NemotronDuplexModel(Model):
         first_prev = self.config.text_pad_id if prompt else self.config.text_bos_id
         out["prev_text"] = [torch.tensor([first_prev], dtype=torch.long)]
         out["prev_func"] = [torch.tensor([self.config.text_pad_id], dtype=torch.long)]
+        # One empty tensor makes the first Talker step ready. Iteration zero
+        # substitutes its immutable speaker warm-up; later frames carry codes.
+        out["codec_tokens"] = [torch.empty(0, dtype=torch.long)]
         # The prompt rides the decode loop as a fed-back token; -1 = no prompt.
         # ``has_prompt`` lets the routing know before any tensor is readable.
         if prompt:
@@ -945,9 +951,11 @@ class NemotronDuplexModel(Model):
                 step_metadata={"prompt_pending": has_prompt},
             )
         if partition_name == "Talker":
+            seed = GraphEdge(next_node="eartts_talker", name="codec_tokens")
+            seed.tensor_info = input_signals.get("codec_tokens", [])
             return ForwardPassArgs(
                 full_metadata=self._meta(input_modalities, output_modalities, "talker_decode", False),
-                inputs=[], unpersist_tensors=[], request_done=False,
+                inputs=[seed], unpersist_tensors=seed.tensor_info, request_done=False,
             )
         raise ValueError(f"Unknown partition: {partition_name!r}")
 

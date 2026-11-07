@@ -819,6 +819,57 @@ def test_real_talker_loop_and_plain_codec_derive_one_stream_unit():
     assert runtime.execution_units("talker_prefill") == ()
 
 
+@pytest.mark.parametrize("had_frame", [False, True])
+def test_duplex_talker_feedback_seeds_readiness_and_empty_final_ends_without_codes(had_frame):
+    from pathlib import Path
+
+    from mstar.model.nemotron_duplex.config import NemotronDuplexConfig
+    from mstar.model.nemotron_duplex.nemotron_duplex_model import NemotronDuplexModel
+
+    model = object.__new__(NemotronDuplexModel)
+    model.config = NemotronDuplexConfig()
+    graphs = model.get_worker_graphs(str(Path(__file__).resolve().parents[2] / "configs/nemotron_duplex.yaml"))
+    talker = next(g for g in graphs if "talker_decode" in g.graph_walks)
+    book = RustTensorBookkeeping()
+    rt = rust_runtime.RustGraphRuntime(
+        my_worker_id=WORKER, my_worker_graphs=graphs,
+        all_wg_ids_to_graph_walks={g.worker_graph_id: g.graph_walks for g in graphs},
+        all_wg_ids_to_dyn_loops={g.worker_graph_id: set(g.section.get_loops()) for g in graphs},
+        all_wg_ids_to_nodes={g.worker_graph_id: set(g.section.get_nodes()) for g in graphs},
+        node_to_partition={"conformer_encoder": "Encoder", "nano_llm": "LLM", "eartts_talker": "Talker"},
+        sharding_config=ShardingConfig(groups=[], tp_enabled_nodes=set(), shard_dim={}),
+        bookkeeping=book, connections=tuple(model.get_partition_topology().connections),
+    )
+    rid = rt.add_request("r", "Talker", "talker_decode", [talker.worker_graph_id],
+                         ParallelList([g.worker_graph_id for g in graphs], [[WORKER] for _ in graphs]), {})
+    for uuid in (71, 72):
+        book.put_tensor(uuid, _tensor_info(uuid))
+    rt.ingest_inputs_batch(_ingest_block([rid], [_spec("new_token", "eartts_talker")]))
+    assert rt.get_ready_nodes(set()) == [], "the first frame also needs its ordinary code seed"
+    rt.ingest_inputs_batch(_ingest_block([rid], [_spec("codec_tokens", "eartts_talker", [71])]))
+    assert [(item.node_name, item.rids) for item in rt.get_ready_nodes(set())] == [("eartts_talker", [rid])]
+
+    def land(signals, tensors, counts):
+        return rt.complete_and_route_batch(RouteInput(
+            partition="Talker", graph_walk="talker_decode", node_name="eartts_talker",
+            output_signals=signals, wg_ids=ParallelList([rid], [talker.worker_graph_id]),
+            tensors=tensors, num_tensors=counts,
+        ))
+    rt.pop_rids("eartts_talker", "talker_decode", [rid], check_ready=True)
+    if had_frame:
+        land(["codec_tokens"], [72], [1])
+        assert rt.get_ready_nodes(set()) == [], "feedback cannot invent the next streamed token"
+        rt.ingest_inputs_batch(_ingest_block([rid], [_spec("new_token", "eartts_talker", final=True)]))
+        rt.pop_rids("eartts_talker", "talker_decode", [rid], check_ready=True)
+    # The worker stops a final streamed row before routing its ordinary tail.
+    # Empty-final postprocess clears codec_tokens, so no replacement edge exists.
+    assert rt.stop_loops_batched("Talker", "talker_decode", "eartts_talker",
+                                ParallelList([rid], [["talker_decode_loop"]])) == [rid]
+    ended = land([], [], [])
+    assert rt.get_ready_nodes(set()) == []
+    assert ended.rids_needing_request_info == frozenset({rid}), "the conductor receives graph completion"
+
+
 @pytest.mark.parametrize("install,worker,driven", [
     (False, WORKER, False), (True, "other_worker", False), (True, WORKER, True),
 ])
