@@ -1854,3 +1854,124 @@ def test_streamed_row_budgets_preserve_later_chunks_and_staggered_readiness(devi
     if early_eos:
         assert runs["a"].state.counts.tolist() == [1, 4, 1, 0]
         assert ring.ring_read("x", 2, list(range(bases[2], bases[2] + 4))).eq(-777).all()
+
+
+def test_stream_parent_replaces_one_complete_unit_while_its_sibling_runs(monkeypatch):
+    """The production parent lowers one publication into both captured bodies.
+
+    Host publication is injected at a completed CPU boundary; CUDA concurrency
+    and worker claim ownership remain separate acceptance gates.
+    """
+    from dataclasses import replace
+
+    from test_device_run import _Loop
+
+    from mstar.engine.connected_inputs import ConnectedInputs
+    from mstar.engine.device_run import DeviceRun, RunState
+    from mstar.engine.resources.iteration_tables import IterationTables
+    from mstar.engine.resources.loopback_rows import LoopbackRows
+    from mstar.engine.resources.run_rows import RunRows, RunRowsSnapshot
+    from mstar.model.submodule_base import BatchedModelOutput, StopKind, StopPolicy
+    from mstar.streaming.chunk_policy import FixedChunkPolicy
+    from mstar.streaming.stream_buffer import StreamBuffer
+
+    device = torch.device("cpu")
+    eng, group, _ = _connected_engine(device=device)
+    group.unit = replace(group.unit, streaming_edges=group.unit.edges)
+    backend = _Loop()
+    backend.graph_pool_handle = lambda: None
+    def capture(fn):
+        return SimpleNamespace(replay=fn)
+    monkeypatch.setattr("mstar.engine.accelerator_graph_runner.capture_into_graph",
+                        lambda fn, *a, **kw: (capture(fn), None))
+    owner = RunRows(device, 2, 8, 6)
+    ring = LoopbackRows(device, capacity=3)
+    for rid in (1, 2, 3):
+        ring.add(rid)
+    ring.ask_ring("x", 8)
+    ring.ring_table("x", torch.zeros(2, 1))
+    eng._submodules["a"].loopback_rows = ring
+    eng._submodules["a"].device_stops["prefill"] = StopPolicy(
+        StopKind.EOS, "token", frozenset({99}), withhold=("x",),
+    )
+    _resident_owner(ring, {1: 2, 2: 1, 3: 3})
+    leases, slots, states = {}, {}, {}
+    for member, name in enumerate(("a", "b")):
+        mgmt = eng._submodules[name]
+        runner = mgmt.accelerator_graph_runner
+        runner._graph_backend = backend
+        bucket = BucketKey("prefill", 2, 0)
+        leases[name] = SlotLease(0, bucket, name)
+        next(batch for _, batch in group.members if batch.node_name == name).lease_slot(leases[name])
+        previous = next(iter(runner._buckets.values()))
+        runner._buckets = {bucket: previous}
+        slot = slots[name] = previous.slots[0]
+        slot.static_inputs = {"x": torch.zeros(2, 2, 1)}
+        out, token = torch.zeros(2, 1), torch.zeros(2, dtype=torch.long)
+        slot.static_outputs = BatchedModelOutput(row_outputs={"x": out}, check_stop_buffers={"token": token})
+        dropping = SimpleNamespace(rows=torch.zeros(2, dtype=torch.long), slots=torch.zeros(2, dtype=torch.long))
+        state = states[name] = RunState(2, "token", {99}, device, dropping=dropping,
+                                        membership=RunRowsSnapshot(owner, 2), member=member,
+                                        width=6, independent_rows=True)
+        run = slot.run = DeviceRun(state, {}, lambda: None, 6)
+        run.keep({"x": out}, run.rows)
+        run.keep({"token": token}, run.stops)
+        run.sealed = True
+        state.stage(2, [False, False], 2 if name == "a" else 1)
+        run.entry = capture(lambda state=state: backend.start(state, None))
+        def body(name=name, state=state, run=run, out=out, token=token, slot=slot):
+            state.select_rows()
+            state.head()
+            if name == "a":
+                out.copy_((state.dropping.slots * 10 + state.counts + 1)[:, None])
+                token.copy_(torch.where((state.dropping.slots == 3) & (state.counts == 2), 99, 1))
+            else:
+                out.copy_(slot.static_inputs["x"].sum(1))
+                token.fill_(1)
+            run.keep({"x": out}, run.rows)
+            run.keep({"token": token}, run.stops)
+            backend.stop(state, token, None)
+        slot.graph = capture(body)
+    tables = IterationTables(device)
+    reservations, sources = [], []
+    for rid, count in ((1, 2), (2, 5), (3, 3)):
+        ring.ring_reserve("x", [rid], count)
+        source = StreamBuffer(rid, "x", "a", FixedChunkPolicy(2))
+        reservations.append(source.reserve_future_window(list(range(count)), 1).reservation)
+        sources.append(source)
+    window = tables.prepare_stream_window(
+        leases["b"], max(len(r.decisions) for r in reservations),
+        max(len(r.transitions) for r in reservations), 5, rows=states["b"].dropping.rows, slots=4,
+    )
+    for rid, slot, reservation, count in zip((1, 2, 3), (2, 1, 3), reservations, (2, 5, 3), strict=True):
+        tables.stage_stream_window(leases["b"], [slot], [reservation],
+                                   [[True] * len(reservation.transitions)],
+                                   source_rows=ring.retained_rows([rid]), producer_limits=[count])
+    descriptors = [owner.reserve_row(1, 1, 0, (2, 0, 2, 2, 0, 1)),
+                   owner.reserve_row(2, 1, 1, (1, 0, 5, 1, 0, 1))]
+    for descriptor in descriptors:
+        owner.publish_row(descriptor)
+    snapshot = states["b"].snapshot
+    retire = snapshot.retire
+    def replace_completed(completed):
+        retire(completed)
+        owner.acknowledge(owner.control.tolist())
+        if len(descriptors) == 2 and 0 in owner.available_rows(2):
+            descriptor = owner.reserve_row(3, 1, 0, (3, 0, 3, 3, 0, 1))
+            descriptors.append(descriptor)
+            owner.publish_row(descriptor)
+    snapshot.retire = replace_completed
+    target = slots["b"].static_inputs["x"]
+    payload = ("x", None, [(target[row], target[row]) for row in range(2)])
+    graph = eng._compose_stream(group, leases, window, payload, ConnectedInputs({}))
+    graph.replay()
+    first, sibling, replacement = (descriptor.handle for descriptor in descriptors)
+    assert states["a"].descriptors.tolist() == [[first, first, replacement, replacement, replacement, 0],
+                                                [sibling] * 5 + [0]]
+    assert states["b"].descriptors.tolist() == [[first, replacement, 0, 0, 0, 0],
+                                                [sibling, 0, 0, 0, 0, 0]]
+    assert slots["b"].run.rows["x"][0, :2, 0].tolist() == [43., 63.]
+    assert slots["b"].run.rows["x"][1, 0, 0].item() == 23
+    assert window.bank.counts.tolist() == [0, 1, 1, 1]
+    assert ring.ring_read("x", 3, [0, 1]).flatten().tolist() == [31., 32.]
+    assert all(owner.release(descriptor) for descriptor in descriptors)

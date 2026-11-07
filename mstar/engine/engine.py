@@ -2597,6 +2597,15 @@ class Engine:
         if not set(source_rows) <= set(target_rows):
             guard.refuse("every live producer needs a claimed consumer row")
         correspondence = tuple(target_rows.index(rid) for rid in source_rows)
+        state = slot.run.state
+        snapshot = state.snapshot
+        if snapshot is not None:
+            if source is not None and (source.run.state.membership is not state.membership
+                                       or source.run.state.counts.shape != state.counts.shape):
+                guard.refuse("a joining stream needs one publication and equal physical member capacity")
+            # The shared descriptor coordinate replaces initial compact rows;
+            # absent logical members have zero budgets and trash owner slots.
+            correspondence = tuple(range(state.counts.numel()))
         # Input coverage owns its source address independently of whether the
         # producer still has a resident execution slot.
         lease = batch.step_context.slot_lease
@@ -2637,6 +2646,16 @@ class Engine:
                 targets.append(target.view(1, *shape))
             except RuntimeError:
                 guard.refuse("a streamed destination cannot preserve its owner's item coordinates")
+        if snapshot is not None:
+            # Dynamic ownership may fill padding rows later. Preserve the
+            # certified payload geometry on the declared capture row axis.
+            if destination_input.shape[0] != capacity or any(
+                target.data_ptr() != destination_input[row].data_ptr()
+                or target.numel() != destination_input[row].numel()
+                for row, target in enumerate(targets)
+            ):
+                guard.refuse("joining payloads need a whole captured row destination")
+            targets = [destination_input[row].view_as(targets[0]) for row in range(capacity)]
         policy = source_mgmt.device_stops.get(source_batch.graph_walk)
         withheld = policy is not None and signal in policy.withhold
         if source is not None and withheld and any(
@@ -2658,11 +2677,10 @@ class Engine:
                input_name, owner_signal,
                tuple((target.data_ptr(), tuple(target.shape), target.stride(), target.storage_offset())
                      for target in targets), indices.data_ptr(), item.untyped_storage().data_ptr(),
-               withheld, correspondence, None if source_indices is None else source_indices.data_ptr())
+               withheld, correspondence, None if source_indices is None else source_indices.data_ptr(),
+               None if snapshot is None else id(snapshot))
         if slot.composed_graph is not None and slot.composed_key == key:
             return slot.composed_graph
-        state = slot.run.state
-
         retained_token = None if source is None or not withheld else source.run.stops.get(policy.token_signal)
         if source is not None and withheld and source_capacity > 1 and retained_token is None:
             guard.refuse("withheld streamed rows need their retained actual stop token")
@@ -2679,7 +2697,7 @@ class Engine:
             return executed if not withheld else executed & ~eos(token)
 
         def project(values):
-            if source_capacity == capacity and correspondence == tuple(range(len(target_rows))):
+            if source_capacity == capacity and correspondence == tuple(range(capacity)):
                 return values
             result = torch.zeros_like(window.counts)
             for row, target in enumerate(correspondence):
@@ -2693,8 +2711,15 @@ class Engine:
             else:
                 count = source.run.state.counts
                 if withheld:
-                    last = (token if retained_token is None else
-                            retained_token.gather(1, (count - 1).clamp(min=0)[:, None]))
+                    if retained_token is None:
+                        last = token
+                    else:
+                        column = (count - 1).clamp(min=0)
+                        if snapshot is not None:
+                            identities = source.run.state.descriptors
+                            physical = torch.arange(identities.shape[1], device=identities.device)
+                            column = torch.where(identities == snapshot.ids[:, None], physical, -1).amax(1).clamp_min(0)
+                        last = retained_token.gather(1, column[:, None])
                     count = count - ((count > 0) & eos(last)).long()
                 emitted = project(count)
             window.select(window.origins[:, 0] + window.origins[:, 1] + emitted,
@@ -2712,12 +2737,15 @@ class Engine:
                 state.eligible.copy_(computing)
             running = torch.zeros_like(window.continuation) if source is None else source.run.state.continuation
             window.continuation.copy_((running != 0) | (window.ready != 0))
+            if snapshot is not None:
+                halted = state.halted if source is None else state.halted | source.run.state.halted
+                window.continuation.logical_and_(halted == 0)
 
         def publish():
             ring.gather_rows(source_lease.bucket, source_lease.buffer_slot, source.run.state.dropping.rows)
             positions = window.produced_positions(project(source.run.state.counts))
             active = kept()
-            if source_capacity == capacity and correspondence == tuple(range(len(target_rows))):
+            if source_capacity == capacity and correspondence == tuple(range(capacity)):
                 ring.ring_scatter(signal, source_indices, positions, produced, active)
             else:
                 for row, target in enumerate(correspondence):
@@ -2750,10 +2778,41 @@ class Engine:
         entry = []
         if source is not None:
             entry.append(source.run.entry)
+        entry.append(slot.run.entry)
+        if snapshot is not None:
+            def accept():
+                snapshot.accept()
+                states = (state,) if source is None else (source.run.state, state)
+                for member_state in states:
+                    if member_state.snapshot is not snapshot:
+                        member_state.snapshot.copy_from(snapshot)
+                    member_state.install_rows()
+                    member_state.continuation.copy_(
+                        (~member_state.marks).any().reshape(1) & (member_state.halted == 0)
+                        & (member_state.index < member_state.descriptors.shape[1]),
+                    )
+
+            def retire():
+                # An exhausted consumer must not pop further ordinary chunks;
+                # a producer finishing first retains its descriptor until the
+                # consumer's already-reserved work has finished too.
+                finished = (state.marks | (state.counts >= state.row_limits)
+                            | window.terminal | (window.counts >= window.limits))
+                if source is not None:
+                    source_state = source.run.state
+                    finished = finished & (source_state.marks | (source_state.counts >= source_state.row_limits))
+                snapshot.retire(finished)
+
+            accepted, retired = capture(accept), capture(retire)
+            entry.extend((accepted, select))
+        else:
+            entry.append(select)
+        if source is not None:
             body.append(GraphConditional("if", source.run.state.continuation, (source.graph, capture(publish))))
-        entry.extend((slot.run.entry, select))
         body.extend((select, GraphConditional("if", window.compute_ready, (read, slot.graph)),
                      GraphConditional("if", window.ready, (advance,)), select))
+        if snapshot is not None:
+            body.extend((retired, accepted, select))
         graph = backend.compose((*entry, GraphConditional("while", window.continuation, tuple(body))))
         slot.composed_graph, slot.composed_key = graph, key
         return graph
