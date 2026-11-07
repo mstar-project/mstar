@@ -370,14 +370,18 @@ def _rss_mib() -> float:
         return int(f.read().split()[1]) * os.sysconf("SC_PAGE_SIZE") / 2**20
 
 
-def test_a_transcription_whose_decode_fails_in_the_frontend_answers_with_an_error_id(
-    monkeypatch, tmp_path, caplog,
+@pytest.mark.parametrize("decoder_available", [True, False])
+def test_transcription_decode_failure_distinguishes_bad_file_from_missing_decoder(
+    monkeypatch, tmp_path, caplog, decoder_available,
 ):
     """A header longer than the model's window makes the frontend decode the
-    upload (``WindowPlanner.prepare``). When that decode fails with an
-    unexpected error, here the FFmpeg fallback naming the saved upload as
-    torchcodec does, the client gets an error id and the upload is deleted."""
+    upload (``WindowPlanner.prepare``). Invalid audio is a client error; a
+    missing decoder is a server error. Neither exposes the saved upload path,
+    and both delete the upload."""
     from mstar.api_server import media_io
+    from mstar.model.components import audio_features
+
+    monkeypatch.setattr(audio_features, "_ffmpeg_decoder_loads", lambda: decoder_available)
 
     seen = []
 
@@ -391,11 +395,14 @@ def test_a_transcription_whose_decode_fails_in_the_frontend_answers_with_an_erro
     )
 
     assert len(seen) == 1, "the frontend decode did not run"
-    assert response.status_code == 500
+    assert response.status_code == (400 if decoder_available else 500)
     _assert_clean(response.text)
     assert SECRET not in response.text and "lecture" not in response.text
     message = response.json()["error"]["message"]
-    assert seen[0] in _logged(caplog, _error_id(message)).getMessage()
+    if decoder_available:
+        assert message == "could not decode the audio upload"
+    else:
+        assert seen[0] in _logged(caplog, _error_id(message)).getMessage()
     assert os.listdir(tmp_path) == []
 
 

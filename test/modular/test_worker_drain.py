@@ -27,6 +27,8 @@ from mstar.utils.ipc_format import (
     InputSignals,
     MessageSource,
     RemoveRequest,
+    WorkerMessage,
+    WorkerMessageType,
 )
 from mstar.worker.micro_scheduler import ScheduledBatch
 from mstar.worker.rebuild import Rebuilds
@@ -672,3 +674,34 @@ def test_inflight_follower_removal_does_not_block_an_unrelated_request():
     assert list(w._pending_removes) == ["X", "Y"]
     w._apply_pending_removes_safe_to_drop(set())
     assert removed == ["Z", "X", "Y"]
+
+
+def test_cancelled_producers_missing_file_does_not_drop_an_innocent_message(tmp_path):
+    from dataclasses import replace
+
+    w, _, _ = _input_worker(known_rids=("X", "innocent"), in_flight=("innocent",))
+    w.scheduler.read_failed_rids = set()
+    w.request_state.per_request_info["innocent"].stream_buffers = {}
+    missing = tmp_path / "cancelled-producer"
+    missing.write_bytes(b"tensor")
+    missing.unlink()  # producer removed before its queued peer message arrived
+    reads = []
+
+    def read(rid, edges, graph_walk=None):
+        if rid == "X":
+            missing.read_bytes()
+        reads.append(rid)
+        return []
+
+    w.tensor_manager.start_read_tensors = read
+    healthy = _input(2, False)
+    healthy = replace(healthy, request_id="innocent", request_info=replace(
+        healthy.request_info, request_id="innocent",
+    ))
+    w._process_message_list([
+        WorkerMessage(WorkerMessageType.INPUT_SIGNALS, _input(1, True)),
+        WorkerMessage(WorkerMessageType.INPUT_SIGNALS, healthy),
+    ])
+    assert reads == ["innocent"]
+    assert w.failed == {"X"} and w._in_flight_rids == {"innocent"}
+    assert set(w.sent[0][1].body.errors) == {"X"}

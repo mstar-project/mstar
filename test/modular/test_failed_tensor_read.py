@@ -225,8 +225,8 @@ def test_the_worker_fails_a_request_once_when_its_input_read_fails(tmp_path):
     assert sent[1].message_type == ConductorMessageType.FAIL_REQUESTS
     assert list(sent[1].body.errors) == ["r1"]
     assert re.fullmatch(
-        r"Error in worker: input tensor read failed: internal error \(error id [0-9a-f]{12}\)",
-        sent[1].body.errors["r1"],
+        r"internal error \(error id [0-9a-f]{12}\)",
+        sent[1].body.errors["r1"].message,
     )
     assert w.scheduler.failed_rids == {"r1"}
 
