@@ -87,11 +87,11 @@ class DeferredRowInputs(MutableMapping):
 
 
 def loop_counter_snapshots(
-    infos: list[CurrentForwardPassInfo], loop: LoopLayout | None, n_next_iter: int,
+    infos: list[CurrentForwardPassInfo], loop: LoopLayout | None, n_next_iter: int, stride: int = 1,
 ) -> list[InputMetadata]:
     """Per row, ``InputMetadata`` carrying its own copy of the loop counters.
 
-    The first ``n_next_iter`` rows run one iteration past the shared
+    The first ``n_next_iter`` rows run ``stride`` iterations past the shared
     counters in ``loop``; the rest run at them. A copy, not a view: the
     shared counters move when the in-flight step is routed, which can happen
     while this step is being prepared.
@@ -99,7 +99,7 @@ def loop_counter_snapshots(
     if loop is None:
         counts = list(map(dict.copy, map(_LOOP_COUNTS, infos)))
     else:
-        counts = list(map(loop.advance, map(_LOOP_COUNTS, infos[:n_next_iter])))
+        counts = list(map(loop.advance, map(_LOOP_COUNTS, infos[:n_next_iter]), repeat(stride)))
         counts.extend(map(dict.copy, map(_LOOP_COUNTS, infos[n_next_iter:])))
     return list(map(
         tuple.__new__, repeat(InputMetadata), zip(repeat(_NO_STREAM_CHUNKS), counts, repeat(None), repeat(None)),

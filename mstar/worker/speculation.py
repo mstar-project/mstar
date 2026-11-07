@@ -14,6 +14,7 @@ state, scheduler and stream buffers.
 """
 from __future__ import annotations
 
+from collections.abc import Mapping
 from concurrent.futures import Future
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
@@ -85,6 +86,7 @@ class SpeculationContext:
     streams: StreamBufferManager
     # orders a mixed step's rows for its split kernels
     engine_manager: EngineManager | None = None
+    loop_by_node: Mapping[tuple[str, str], str] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -223,6 +225,14 @@ class SpeculationBuilder:
         # (node, walk) -> its output signals, also structural
         self._walk_signals_cache: dict[tuple[str, str], list[str]] = {}
 
+    def _successor_stride(self, pending: PendingBatch, target: SpeculationOutput) -> int:
+        # Replaying the inner Loop does not repeat a crossed outer transition.
+        if target.is_new_loop_iter and self._ctx.loop_by_node.get(
+            (target.graph_walk, pending.node_name),
+        ) == target.loop_name:
+            return pending.batch.repeats
+        return 1
+
     def build(
         self, pending: PendingBatch, spec_target: SpeculationOutput,
         prep: PreparedSpeculation, other_walks: dict[int, str],
@@ -323,6 +333,7 @@ class SpeculationBuilder:
             increment_loop_rids=continuing if spec_target.is_new_loop_iter else None,
             increment_loop=(ctx.graph_runtime.loop_layout(spec_target.graph_walk, spec_target.loop_name)
                             if spec_target.is_new_loop_iter else None),
+            increment_loop_stride=self._successor_stride(pending, spec_target),
         )
         if ctx.engine_manager is not None:
             stamp_iteration_context(
@@ -393,7 +404,7 @@ class SpeculationBuilder:
         metadata = loop_counter_snapshots(
             infos,
             self._ctx.graph_runtime.loop_layout(walk, spec_target.loop_name) if spec_target.is_new_loop_iter else None,
-            n_next_iter=len(continuing),
+            n_next_iter=len(continuing), stride=self._successor_stride(pending, spec_target),
         )
         inputs = DeferredRowInputs(request_ids)
         for rid, rid_inputs in fresh_inputs.items():

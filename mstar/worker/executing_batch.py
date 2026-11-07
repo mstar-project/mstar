@@ -25,9 +25,10 @@ def input_metadata_and_fwd_info(
     per_request_inputs: dict[int, NameToTensorList],
     increment_loop_rids: list[int] | None = None,
     increment_loop: LoopLayout | None = None,
+    increment_loop_stride: int = 1,
 ) -> tuple[dict[int, InputMetadata], dict[int, CurrentForwardPassInfo]]:
     """Per row, its forward-pass info and an ``InputMetadata`` with its own
-    copy of the loop counters (one iteration on for ``increment_loop_rids``)
+    copy of the loop counters (the pending run ahead for ``increment_loop_rids``)
     and the stream chunks it consumes."""
     meta = {}
     fwd_info = {}
@@ -41,7 +42,7 @@ def input_metadata_and_fwd_info(
             stream_chunks = chunks
         counts = req_info.dynamic_loop_iter_counts
         projected = (
-            increment_loop.advance(counts)
+            increment_loop.advance(counts, increment_loop_stride)
             if increment_loop is not None and rid in continuing
             else counts.copy()
         )

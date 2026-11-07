@@ -3545,6 +3545,7 @@ class Worker(RepeatingSteps):
             graph_runtime=self._graph_runtime, tensor_manager=self.tensor_manager,
             request_state=self.request_state, scheduler=self.scheduler,
             streams=self.streams, engine_manager=self.engine_manager,
+            loop_by_node=self._innermost_loop_by_node,
         )
 
     @cached_property
