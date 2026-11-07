@@ -24,10 +24,6 @@ model_kwargs:
   # graph runs eager, and a batch of 3, 5, 6 or 7 replays the next captured size.
   # DROID's demo instructions give 13 text rows (no instruction), 21 and 25; a
   # deployment captures its own prompts' lengths.
-  # Graph mode holds one FlashInfer workspace per attention label per slot (the
-  # denoise step alone: 3 labels x 2 slots), at MSTAR_WORKSPACE_BUFFER_MB each,
-  # 512 by default. On a 12-16 GB card set it to 128, or the card fills before
-  # the first request.
   accelerator_graph: true
   capture_shapes: [[13, 448], [21, 448], [25, 448]]
   capture_batch_sizes: [1, 2, 4, 8]

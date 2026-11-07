@@ -223,6 +223,8 @@ class Gr00tN17Model(Model):
                     num_kv_heads=dit.num_attention_heads,
                     head_dim=dit.attention_head_dim,
                     dtype=torch.bfloat16,
+                    # the DT's three labels x two slots: 3 GB at the 512 MB default
+                    workspace_mb=128,
                 ),
             ),
             RaggedCrossAttentionSpec(
@@ -232,6 +234,7 @@ class Gr00tN17Model(Model):
                     num_kv_heads=dit.num_attention_heads,
                     head_dim=dit.attention_head_dim,
                     dtype=torch.bfloat16,
+                    workspace_mb=128,
                     # `max_segments_per_request` stays at its default 1: the cross
                     # resource plans one wrapper per `(q_label, kv_label)` pair
                     # (`_RaggedCrossManagerBase._plan_layouts`), and each pair sees one
