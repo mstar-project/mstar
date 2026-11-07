@@ -31,7 +31,15 @@ from mstar.engine.accelerator_graph_runner import (
 )
 from mstar.engine.chunking import DEFAULT_MIN_CHUNK_TOKENS, ChunkingManagement, ChunkRange
 from mstar.engine.connected_inputs import ConnectedInputs, active_guard
-from mstar.engine.device_run import IterationWindow, RunAsk, TokenStream, run_item
+from mstar.engine.device_run import (
+    RUN_COUNTS,
+    RUN_DESCRIPTORS,
+    RUN_REPLAYS,
+    IterationWindow,
+    RunAsk,
+    TokenStream,
+    run_item,
+)
 from mstar.engine.fp32_precision import Fp32Precision, cudnn_benchmark, fp32_precision_scope, node_fp32_precision
 from mstar.engine.node_dtype import resolve_node_dtype
 from mstar.engine.resources import (
@@ -2682,6 +2690,67 @@ class Engine:
                 range_pop()
         self._add_resource_host_rows(submodule_mgmt, out, batch.step_context.repeats)
         return out
+
+    @staticmethod
+    def _run_row_output(
+        records: Sequence[tuple[BatchedModelOutput, Sequence[Sequence[int]]]], descriptor: int, width: int,
+    ) -> BatchedModelOutput | None:
+        """Compact one logical row from completed, descriptor-stamped runs.
+
+        The caller retains each capture until this copy finishes and supplies
+        identity columns from the same completed publication as the outputs.
+        Physical row/launch boundaries do not define this request's ordinal.
+        Zero execution has no output to collect or pass to a model tail.
+        """
+        if descriptor <= 0 or width < 1:
+            raise ValueError("a run row needs a positive descriptor and logical width")
+        selected = []
+        shapes = []
+        metadata = {RUN_COUNTS, RUN_REPLAYS, RUN_DESCRIPTORS}
+        for index, (raw, identities) in enumerate(records):
+            if raw.per_rid_outputs or raw.packed_outputs:
+                raise ValueError("joining outputs must retain row-addressed iteration columns")
+            columns = len(identities[0]) if identities else 0
+            if any(len(row) != columns for row in identities):
+                raise ValueError("run identity rows must have one common width")
+            shapes.append((len(identities), columns))
+            for column in range(columns):
+                rows = [row for row, ids in enumerate(identities) if ids[column] == descriptor]
+                if len(rows) > 1:
+                    raise ValueError("a descriptor executed on two physical rows in one iteration")
+                selected.extend((index, row, column) for row in rows)
+        if not selected:
+            return None
+        if len(selected) > width:
+            raise ValueError("a run row executed beyond its admitted logical horizon")
+
+        def gather(attribute: str, excluded=frozenset()) -> dict[str, torch.Tensor]:
+            sources = [getattr(raw, attribute) or {} for raw, _ in records]
+            names = sources[0].keys() - excluded
+            if any(source.keys() - excluded != names for source in sources):
+                raise ValueError("queued runs changed their retained output names")
+            output = {}
+            for name in names:
+                values = [source[name] for source in sources]
+                if any(not isinstance(value, torch.Tensor) or value.ndim < 2
+                       or tuple(value.shape[:2]) != shape for value, shape in zip(values, shapes, strict=True)):
+                    raise ValueError(f"run output {name!r} has no matching row/iteration columns")
+                pieces = [values[index][row:row + 1, column:column + 1] for index, row, column in selected]
+                # Preserve ordinary repeated-step tail semantics; actual counts
+                # below distinguish these padding values from executed work.
+                pieces.extend([pieces[-1]] * (width - len(pieces)))
+                output[name] = torch.cat(pieces, dim=1)
+            return output
+
+        stops = gather("check_stop_buffers", metadata)
+        rows = gather("row_outputs")
+        spans = gather("output_spans")
+        anchor = next(iter(stops.values()), next(iter(rows.values()), next(iter(spans.values()), None)))
+        if anchor is None:
+            raise ValueError("a joining run retained no row-addressed outputs")
+        count = anchor.new_full((1,), len(selected), dtype=torch.long)
+        stops.update({RUN_COUNTS: count, RUN_REPLAYS: count})
+        return BatchedModelOutput(check_stop_buffers=stops, row_outputs=rows or None, output_spans=spans or None)
 
     @staticmethod
     def _add_resource_host_rows(

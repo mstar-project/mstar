@@ -87,3 +87,46 @@ def test_an_unbatched_step_clears_rows_only(rids):
     eng.exec(batch)
     assert seen["rows_only"] is False and batch.rows_only is False
     assert eng._loopback_steps == {}
+
+
+def test_run_row_collection_uses_descriptor_order_and_the_late_requests_metadata():
+    import torch
+
+    from mstar.engine.device_run import RUN_COUNTS, RUN_REPLAYS
+
+    def raw(values):
+        values = torch.tensor([values])
+        spans = torch.stack((values, values + 1), dim=-1)
+        return BatchedModelOutput(row_outputs={"frame": values}, output_spans={"frame": spans},
+                                  check_stop_buffers={"token": values, RUN_COUNTS: torch.tensor([99]),
+                                                      RUN_REPLAYS: torch.tensor([99])})
+
+    first, second = raw([11, 12, 21]), raw([22, 31, 32])
+    records = [(first, [[7, 7, 8]]), (second, [[8, 9, 9]])]
+    late = Engine._run_row_output(records, 8, 4)
+    assert late.row_outputs["frame"].tolist() == [[21, 22, 22, 22]]
+    assert late.output_spans["frame"].tolist() == [[[21, 22], [22, 23], [22, 23], [22, 23]]]
+    assert late.check_stop_buffers["token"].tolist() == [[21, 22, 22, 22]]
+    assert late.check_stop_buffers[RUN_COUNTS].tolist() == [2]
+    assert Engine._run_row_output(records, 10, 4) is None
+    with pytest.raises(ValueError, match="admitted logical horizon"):
+        Engine._run_row_output(records, 8, 1)
+
+    class Filtered(_Plain):
+        def filter_batched_output(self, info, outputs):
+            return {info.signal: outputs["frame"]}
+
+        def spanned_outputs(self, walk):
+            return {"frame"}
+
+    sub = Filtered.__new__(Filtered)
+    eng = _engine(sub)
+    collected = eng._collect_outputs(
+        eng._submodules["llm"], None, late, [None], {44: SimpleNamespace(signal="late")},
+        request_ids=[44], step_request_ids=(44,), graph_walk="decode",
+    )
+    assert collected.per_rid_outputs[44]["late"][0].tolist() == [[21, 22, 22, 22]]
+    assert collected.row_request_ids == (44,) and collected.span_request_ids == (44,)
+    first.row_outputs["frame"].fill_(-1)
+    second.row_outputs["frame"].fill_(-2)
+    assert collected.per_rid_outputs[44]["late"][0].tolist() == [[21, 22, 22, 22]]
