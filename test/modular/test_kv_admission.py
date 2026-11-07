@@ -476,7 +476,9 @@ def _cfg_parallel_pool(node: str, world_size: int = 1, rank: int = 0, shared_pre
         spec.config.prefix_cache = spec.config.prefix_cache_tp = True
     group = None if world_size == 1 else SimpleNamespace(rank=rank, world_size=world_size)
     return KVManager.build(spec, EngineResourceInfo(
-        device=torch.device("cpu"), kv_dtype=torch.float32, nodes=frozenset({node}), joint_comm_group=group,
+        device=torch.device("cpu"), kv_dtype=torch.float32,
+        nodes=frozenset(spec.nodes if shared_prefix else {node}), joint_comm_group=group,
+        needs_remote_transfer=not shared_prefix,
     ))
 
 
