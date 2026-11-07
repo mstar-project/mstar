@@ -85,12 +85,13 @@ def kv_configs(config, model_path=None):
 
 
 def manager(cfg, shards=1, device="cuda"):
-    # Built at one rank, so above one it is told not to lead: like a pool there, it then
-    # doesn't decide admission (`KVManager._decides`).
+    # Model rank zero's admission without starting a collective group. Shared
+    # TP prefix-cache pools still do not reserve peak footprints.
     return KVManager(
         cfg=cfg, name="kv", joint_comm_group=None,
         transfer_engine_info=TransferEngineInfo("h", "h", LocalTransferEngine("h")),
-        device=torch.device(device), dtype=torch.bfloat16, leads=shards == 1,
+        device=torch.device(device), dtype=torch.bfloat16,
+        leads=shards == 1 or not (cfg.prefix_cache and cfg.prefix_cache_tp),
     )
 
 
@@ -105,8 +106,7 @@ def step(m, rid, span):
 
 
 def admitted(m, rid, prompt, decode):
-    """Whether admission lets ``rid`` in: a pool that decides allots it its prompt's pages,
-    and one that doesn't asks nothing."""
+    """Whether admission can reserve the request's prompt and declared decode growth."""
     layout = StreamLayout(spans=(PrefixSpan(prompt, prompt, "walk"),), growth=(("decode", 1),))
     m.ingest_request(rid, KVReqConfig(kv_layout={"main": layout}, loop_caps={"decode": decode}))
     asked = m.ask(rid, "node", "walk")

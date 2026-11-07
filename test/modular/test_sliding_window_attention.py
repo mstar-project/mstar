@@ -315,15 +315,15 @@ class SlidingWindowTests(unittest.TestCase):
 
     def test_capacity_benchmark_counts_what_admission_lets_in(self):
         """At one rank `benchmark/kv_capacity.py` stops at the request admission makes wait. A
-        request reserves decode growth too. Multi-rank pools still do not reserve
-        that peak, so their optimistic admitted count is higher."""
+        request reserves decode growth too, on rank zero of a multi-rank pool
+        as well as on a single rank."""
         from benchmark import kv_capacity
 
         def requests(shards):
             cfg = window_pool(num_qo_heads=1, num_kv_heads=1, head_dim=4)
             return kv_capacity.fill(cfg, 64, shards=shards, decode=16, device="cpu")["requests"]
 
-        self.assertEqual([requests(1), requests(2)], [1, 2])
+        self.assertEqual([requests(1), requests(2)], [1, 1])
 
     def test_window_pool_refusals(self):
         # what depends on the device is refused as the attention builds: FlashInfer's fa3 is SM90's only

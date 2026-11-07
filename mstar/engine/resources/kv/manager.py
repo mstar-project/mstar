@@ -659,10 +659,10 @@ class KVManager(AttentionResource):
         self._rank = joint_comm_group.rank if joint_comm_group is not None else 0
         self._world_size = joint_comm_group.world_size if joint_comm_group is not None else 1
         self._comm_group = joint_comm_group
-        # Only a deciding pool asks and keeps allotments. With more than one rank none decides.
-        # Rank 0 would allot at readiness, after the step goes to the other ranks and before its
-        # admit, so a grant could pass on one rank and fail on another.
-        self._decides = self._world_size == 1 and leads
+        # Full peaks reserve running requests' growth before their first step,
+        # so a later grant cannot make rank 0 refuse a step peers already run.
+        # Shared TP prefix credits still need agreement across ranks.
+        self._decides = leads and (self._world_size == 1 or (self._rank == 0 and not tp_cache))
         # An allotment covers the labels `_nodes` open.
         # `_asks` holds the peak pages of each request that asked and has no allotment yet.
         # `_unused` counts the pages admitted requests were allotted and haven't used yet.

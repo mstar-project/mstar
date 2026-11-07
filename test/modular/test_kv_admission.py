@@ -467,20 +467,26 @@ def test_a_request_one_pool_holds_back_keeps_no_allotment_in_another_on_its_node
     assert decode.ok, "requests waiting on the cross pool kept the room the running request decodes into"
 
 
-def _cfg_parallel_pool(node: str, world_size: int = 1) -> KVManager:
+def _cfg_parallel_pool(node: str, world_size: int = 1, rank: int = 0, shared_prefix: bool = False) -> KVManager:
     spec = KVSpec(
         resource_key="kv", nodes={"LLM", "LLM_cfg_text", "LLM_cfg_img"}, leader="LLM",
         config=PagedKVConfig(num_layers=1, num_kv_heads=2, head_dim=8, max_seq_len=4096, max_num_pages=9, page_size=16),
     )
-    group = None if world_size == 1 else SimpleNamespace(rank=0, world_size=world_size)
+    if shared_prefix:
+        spec.config.prefix_cache = spec.config.prefix_cache_tp = True
+    group = None if world_size == 1 else SimpleNamespace(rank=rank, world_size=world_size)
     return KVManager.build(spec, EngineResourceInfo(
         device=torch.device("cpu"), kv_dtype=torch.float32, nodes=frozenset({node}), joint_comm_group=group,
     ))
 
 
-def test_only_the_leaders_pool_holds_a_request_back_and_none_above_one_rank():
-    for node, world_size, holds in (("LLM", 1, True), ("LLM_cfg_text", 1, False), ("LLM", 2, False)):
-        kv = _cfg_parallel_pool(node, world_size)
+def test_only_the_leaders_rank_zero_pool_holds_a_request_back():
+    for node, world_size, rank, shared_prefix, holds in (
+        ("LLM", 1, 0, False, True), ("LLM_cfg_text", 1, 0, False, False),
+        ("LLM", 2, 0, False, True), ("LLM", 2, 1, False, False), ("LLM_cfg_text", 2, 0, False, False),
+        ("LLM", 2, 0, True, False),
+    ):
+        kv = _cfg_parallel_pool(node, world_size, rank, shared_prefix)
         for rid in ("a", "b"):
             _laid_out(kv, rid, list(range(80)))
 
@@ -759,3 +765,33 @@ def test_decode_growth_cannot_fill_the_pool_with_requests_that_cannot_finish():
         _grow(kv, "waiting", 1)
     _remove(kv, "waiting")
     kv.assert_pages_conserved()
+
+
+def test_tp_peak_admission_keeps_a_later_request_out_of_an_inflight_steps_growth():
+    pools = [KVManager(
+        cfg=PagedKVConfig(
+            num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=4096,
+            max_num_pages=5, page_size=PAGE_SIZE, prefix_cache=False,
+        ), name="kv", joint_comm_group=SimpleNamespace(rank=rank, world_size=2),
+        transfer_engine_info=None, device=torch.device("cpu"), dtype=torch.float32,
+    ) for rank in range(2)]
+    leader, follower = pools
+    for pool in pools:
+        for rid in ("first", "waiting"):
+            pool.ingest_request(rid, KVReqConfig(
+                kv_layout={"main": StreamLayout(
+                    spans=(PrefixSpan(PAGE_SIZE, PAGE_SIZE, WALK),), growth=(("decode", 1),),
+                )}, loop_caps={"decode": 2 * PAGE_SIZE},
+            ))
+    assert _ready(leader, "first")
+    # Readiness can run before the follower allocates the already selected step.
+    assert not _ready(leader, "waiting")
+    for rid in ("first", "waiting"):
+        assert _ready(leader, rid)
+        for size in (PAGE_SIZE, *([1] * (2 * PAGE_SIZE))):
+            for pool in pools:
+                _grow(pool, rid, size)
+            assert leader._arena.num_free == follower._arena.num_free
+        for pool in pools:
+            _remove(pool, rid)
+            pool.assert_pages_conserved()
