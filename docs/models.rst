@@ -1266,6 +1266,9 @@ VoxCPM2 notes
 - ``configs/voxcpm2.yaml`` runs the VAE decoder's windows on the worker's side
   lane (``side_stream: true``), beside the Talker's steps rather than taking
   turns with them.
+- The streaming VAE decoder is ``torch.compile``'d at start-up, about a
+  quarter faster per window batch; ``model_kwargs: {compile_vae: false}``
+  decodes eagerly.
 - A request may hold the whole 8,192-position context, and nothing preempts a
   request once a KV cache is full, so each LM's cache defaults to 2,049 pages
   (32 such requests and the sink page, about 9.7 GB for both) and the YAML sets

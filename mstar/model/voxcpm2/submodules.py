@@ -643,15 +643,29 @@ class VAEDecoderSubmodule(ARNodeSubmodule):
     # 90 ms, and capturing up to 32 rows would hold about 4 GB more graph memory
     CAPTURE_BATCH_SIZES = [1, 2, 4]
 
-    def __init__(self, vae: AudioVAE, config: VoxCPM2Config, window_buckets: Sequence[int] = ()):
+    def __init__(
+        self, vae: AudioVAE, config: VoxCPM2Config, window_buckets: Sequence[int] = (), compile_decoder: bool = True,
+    ):
         """``window_buckets``: window widths, in patches, to capture the decode
         at; a window is padded at the end to the next one, and a wider window
-        decodes eagerly."""
+        decodes eagerly. ``compile_decoder``: the decoder compiled (see
+        ``compile_regions``)."""
         super().__init__()
         self.vae = vae
         self.config = config
         self.window_buckets = sorted(set(window_buckets))
+        self.compile_decoder = compile_decoder
         self._sr_index = vae.output_rate_index(next(vae.parameters()).device)
+
+    def compile_regions(self) -> Mapping[str, Sequence[tuple]]:
+        """The decoder compiled: the elementwise work around its convolutions fused, about
+        a quarter faster than the eager decode at stream batch sizes, within a few PCM16 steps."""
+        if not self.compile_decoder:
+            return {}
+        cfg = self.config
+        param = next(self.vae.parameters())
+        latents = torch.zeros(2, cfg.feat_dim, 2 * cfg.patch_size, device=param.device, dtype=param.dtype)
+        return {"vae.decoder": [(latents, self._sr_index.expand(2))]}
 
     def prepare_inputs(
         self,

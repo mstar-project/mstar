@@ -1549,3 +1549,16 @@ def test_adapter_takes_data_urls_and_gated_urls(media_dirs, monkeypatch):
     assert checked == ["soundfile", "soundfile"]
     with pytest.raises(ValueError, match="base64 string"):
         adapter.speech_to_request(SpeechRequest(model="voxcpm2", input="hi", ref_audio=["x"]), uploads)
+
+
+def test_compile_vae_switch_reaches_the_decoder_region(model, checkpoint):
+    config = model.config
+    for compiled, regions in ((True, ["vae.decoder"]), (False, [])):
+        node = VAEDecoderSubmodule(_random_vae(config), config, compile_decoder=compiled)
+        assert list(node.compile_regions()) == regions
+    (latents, rate), = VAEDecoderSubmodule(_random_vae(config), config).compile_regions()["vae.decoder"]
+    assert latents.shape == (2, config.feat_dim, 2 * config.patch_size) and rate.shape == (2,)
+    assert VoxCPM2Model(model_path_hf=str(checkpoint)).compile_vae is True
+    assert VoxCPM2Model(model_path_hf=str(checkpoint), compile_vae=False).compile_vae is False
+    with pytest.raises(ValueError, match="compile_vae"):
+        VoxCPM2Model(model_path_hf=str(checkpoint), compile_vae="no")
