@@ -1,7 +1,9 @@
-"""GLM-5.2 fine-grained MoE: the noaux_tc router (components/moe.py) + FP8-resident experts.
+"""GLM-5.2 fine-grained MoE: the noaux_tc router (components/moe.py) + quantized routed experts.
 
-The routed experts are one quantizable layer (``Fp8Experts``): built bf16-shaped, they take the checkpoint's
-block-fp8 storage from the node's quantization plan, and this block's fused prefill / decode kernels read it."""
+The routed experts are one quantizable layer (``QuantExperts``): built bf16-shaped, they take the checkpoint's
+storage from the node's quantization plan. Block fp8 (zai-org's checkpoints) runs this block's fused prefill /
+decode kernels; NVFP4 (nvidia/GLM-5.3-NVFP4) runs the format's own experts kernel (FlashInfer's TRT-LLM FP4 MoE
+on B200/B300) on this block's routing."""
 from __future__ import annotations
 
 import logging
@@ -14,8 +16,8 @@ from mstar.distributed.communication import CommGroup
 from mstar.distributed.utils import divide
 from mstar.model.components.distributed import ParallelGatedMLP
 from mstar.model.components.moe import (
-    Fp8Experts,
     NoAuxTcRouter,
+    QuantExperts,
     _dispatch,
     _down_proj_fp8_weight_loader,
     _down_proj_weight_loader,
@@ -49,7 +51,7 @@ def fused_fp8_available(device: torch.device, block_size: tuple[int, int]) -> bo
 _DECODE_MAX_TOKENS = 64
 
 
-class Glm52SparseMoeBlock(Fp8Experts, nn.Module):
+class Glm52SparseMoeBlock(QuantExperts, nn.Module):
     """Routed experts + ungated shared expert (DeepSeek-V3 block shape)."""
 
     @property
@@ -133,8 +135,8 @@ class Glm52SparseMoeBlock(Fp8Experts, nn.Module):
         from functools import partial
 
         full_inter = self.moe_intermediate_size
-        if self.fp8_experts:
-            self._attach_fp8_loaders(
+        if self.experts_quantized:
+            self._attach_quant_loaders(
                 lambda unit: partial(_gate_up_fp8_weight_loader, self.tp_rank, self.tp_size, full_inter, unit),
                 lambda unit: partial(_down_proj_fp8_weight_loader, self.tp_rank, self.tp_size, full_inter, unit),
             )
@@ -173,7 +175,11 @@ class Glm52SparseMoeBlock(Fp8Experts, nn.Module):
 
         # topk_weights stay fp32 into the combine, as in HF's experts.
         topk_weights, topk_ids, _ = self.gate(flat)
-        if self.fp8_experts:
+        if self.experts_packed is not None:
+            routed = self._experts_4bit(flat, topk_weights, topk_ids, skip_invalid=False)
+            if self.tp_size > 1 and not self._sum_partials:
+                routed = self.comm_group.all_reduce(routed)
+        elif self.fp8_experts:
             if self._use_fused and self._prefill_kernel and flat.shape[0] > _DECODE_MAX_TOKENS:
                 routed = self._dispatch_prefill(flat, topk_weights, topk_ids)
                 if self.tp_size > 1 and not self._sum_partials:
@@ -317,6 +323,10 @@ class Glm52SparseMoeBlock(Fp8Experts, nn.Module):
         self._use_fused = (self.fp8_experts and self.kernels == "auto"
                            and fused_fp8_available(dev, self.block_size))
         self.gate.finalize_weights(topk_kernel=self._use_fused and self._router_kernel)
+        if self.experts_packed is not None:
+            logger.info("Glm52SparseMoeBlock routed experts: %s, %s", self.experts_packed.name,
+                        "FlashInfer TRT-LLM FP4 MoE" if self._experts_kernel is not None else "the reference")
+            return
         if not self.fp8_experts:
             return
         global _BACKEND_LOGGED

@@ -13,10 +13,12 @@ from mstar.model.loader.base import StackedParamRule
 
 logger = logging.getLogger(__name__)
 
-# Keep the expert index attached while remapping both fp8 and bf16 sub-keys.
+# Keep the expert index attached while remapping every stored tensor of an expert: bf16, block fp8's
+# ``weight_scale_inv``, NVFP4's (modelopt) block scale, tensor scale and input scale (which the quantization
+# plan renames ``weight_input_scale`` for an experts layer, so the ``.weight`` stacked rule carries it).
 _EXPERT_RE = re.compile(
     r"(.*)\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)"
-    r"\.(weight|weight_scale_inv)$"
+    r"\.(weight|weight_scale_inv|weight_scale|weight_scale_2|weight_input_scale|input_scale)$"
 )
 
 _LAYER_RE = re.compile(r"^model\.layers\.(\d+)\.")
@@ -111,8 +113,10 @@ def build_glm52_read_plan(
 
     if load_indexer is None:
         load_indexer = bool(config.dsa_long_context)
-    # a checkpoint's fp8 experts read only this rank's slice; every expert loader takes one
+    checkpoint_keys = list(checkpoint_keys)
+    # a checkpoint's fp8 / NVFP4 experts read only this rank's slice; every expert loader takes one
     fp8_experts = config.quantization_config is not None
+    nvfp4 = {key.rpartition(".")[0] for key in checkpoint_keys if key.endswith(".weight_scale_2")}
     shard_inter = config.moe_intermediate_size // tp_size
     keys: set[str] = set()
     specs: dict[str, tuple[int, int, int]] = {}
@@ -136,12 +140,24 @@ def build_glm52_read_plan(
             continue
         keys.add(key)
 
-        if not fp8_experts:
-            continue
         m = _EXPERT_RE.match(key)
         if not m:
             continue
-        _, _, proj, suffix = m.groups()
+        prefix, expert, proj, suffix = m.groups()
+        if f"{prefix}.experts.{expert}.{proj}" in nvfp4:
+            # e2m1 bytes and row-major e4m3 scales; the fp32 scalars are read whole
+            if suffix == "weight":
+                unit = 1 if proj != "down_proj" else 2
+            elif suffix == "weight_scale":
+                unit = 1 if proj != "down_proj" else 16
+            else:
+                continue
+            dim = 1 if proj == "down_proj" else 0
+            span = shard_inter // unit
+            specs[key] = (dim, tp_rank * span, (tp_rank + 1) * span)
+            continue
+        if not fp8_experts:
+            continue
         is_scale = suffix == "weight_scale_inv"
         if proj in ("gate_proj", "up_proj"):
             unit = bo if is_scale else 1
