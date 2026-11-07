@@ -1673,3 +1673,66 @@ def test_run_moves_the_main_gpu_and_plan_threads_to_their_cpus(monkeypatch, intr
     # no other thread of the process landed on a step CPU, the intra-op pool
     # the plan thread just used included (looked at while it was alive)
     assert seen["plan"][2] == []
+
+
+# ── step_threads: serial ────────────────────────────────────────────────────
+
+
+def _serial_worker(**attrs):
+    from mstar.worker.worker import Worker
+
+    worker = Worker.__new__(Worker)
+    worker.worker_id = "w"
+    worker.parallel_nodes = frozenset()
+    worker._side_steps = None
+    for name, value in attrs.items():
+        setattr(worker, name, value)
+    return worker
+
+
+def test_serial_steps_run_on_the_caller_and_hand_back_a_finished_future(monkeypatch):
+    from mstar.utils import knobs
+    from mstar.worker.worker import Worker
+
+    knobs.configure({"step_threads": "serial"})
+    monkeypatch.setattr(Worker, "_init_engine_thread", lambda self: seen.append("init"))
+    seen: list[str] = []
+    worker = _serial_worker()
+    worker._read_step_threads()
+    pool = worker._engine_thread_pool("mstar-gpu")
+
+    done = pool.submit(threading.get_ident)
+    assert seen == ["init"]
+    assert done.done() and done.result() == threading.get_ident()
+    called = []
+    done.add_done_callback(called.append)
+    assert called == [done]
+
+    failed = pool.submit(lambda: 1 / 0)
+    assert isinstance(failed.exception(timeout=0), ZeroDivisionError)
+    pool.shutdown()
+    knobs.configure(None)
+
+
+@pytest.mark.parametrize("attrs", [{"parallel_nodes": frozenset({"llm"})}, {"_side_steps": object()}])
+def test_serial_steps_refuse_what_needs_the_gpu_thread_beside_the_main_thread(attrs):
+    from mstar.utils import knobs
+
+    knobs.configure({"step_threads": "serial"})
+    with pytest.raises(ValueError, match="step_threads: serial"):
+        _serial_worker(**attrs)._read_step_threads()
+    knobs.configure(None)
+
+
+def test_threaded_steps_keep_a_real_pool(monkeypatch):
+    from mstar.utils import knobs
+    from mstar.worker.worker import Worker
+
+    knobs.configure(None)
+    monkeypatch.setattr(Worker, "_init_engine_thread", lambda self: None)
+    worker = _serial_worker()
+    worker._read_step_threads()
+    pool = worker._engine_thread_pool("mstar-gpu")
+    assert pool.submit(threading.get_ident).result() != threading.get_ident()
+    pool.shutdown()
+

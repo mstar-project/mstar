@@ -106,7 +106,7 @@ from mstar.utils.profiler import (
     range_push,
     set_step_key,
 )
-from mstar.utils.threads import ThreadPool, pin_thread
+from mstar.utils.threads import InlineExecutor, ThreadPool, pin_thread
 from mstar.worker.batch_builder import BatchBuilderType
 from mstar.worker.chunk_loops import ChunkLoops
 from mstar.worker.engine_manager import EngineManager, refuse_combined_walks_across_tp_groups
@@ -499,6 +499,8 @@ class Worker:
     _step_cpus: cpus.StepCpus | None = None
     # Walks that run beside the main chain, when this worker has any
     _side_steps: SideStepLane | None = None
+    # ``knobs: step_threads: serial``: the GPU and plan threads' work runs on the main thread
+    _serial_steps: bool = False
     # lane -> the rows its step in flight holds (``_hold_rows``); replaced,
     # never updated in place
     _rows_by_lane: Mapping[int, frozenset[int]] = MappingProxyType({})
@@ -2310,10 +2312,21 @@ class Worker:
         engine = self.engine_manager.get_engine(spec_node_batch.node_name)
         engine.reset_pre_plan_for_batch(spec_node_batch)
 
-    def _engine_thread_pool(self, name: str) -> ThreadPool:
+    def _read_step_threads(self) -> None:
+        self._serial_steps = knobs.step_threads() == "serial"
+        if self._serial_steps and (self.parallel_nodes or self._side_steps is not None):
+            raise ValueError(
+                f"Worker {self.worker_id}: step_threads: serial has not been tested with "
+                "lockstep-parallel nodes or a side lane",
+            )
+
+    def _engine_thread_pool(self, name: str) -> ThreadPool | InlineExecutor:
         """A one-thread pool for the GPU or plan thread, started here: before torch 2.12 dynamo's
         config is process-wide, so an initializer that ran at the first step could reset a
         recompile limit the other thread's compiled call had raised (``with_recompile_limit``)."""
+        if self._serial_steps:
+            self._init_engine_thread()
+            return InlineExecutor()
         pool = ThreadPool(
             max_workers=1, thread_name_prefix=f"{name}-{self.worker_id}",
             initializer=self._init_engine_thread,
@@ -5187,10 +5200,11 @@ class Worker:
         # the main loop can overlap queue/tensor polling and post-processing
         # with GPU execution. Run the engine unconditionally on a dedicated
         # 1-worker GPU thread.
+        self._read_step_threads()
         gpu_executor = self._engine_thread_pool("mstar-gpu")
         logger.info(
-            "Worker %s: engine runs on dedicated GPU thread",
-            self.worker_id,
+            "Worker %s: engine runs %s", self.worker_id,
+            "on the main thread (step_threads: serial)" if self._serial_steps else "on dedicated GPU thread",
         )
         # Dedicated thread that pre-plans FlashInfer attention for the
         # speculatively-built next batch. Runs concurrent with main thread's
@@ -5210,11 +5224,12 @@ class Worker:
         plan_executor = None
         if pre_plan_spec:
             plan_executor = self._engine_thread_pool("mstar-plan")
-            logger.info(
-                "Worker %s: plan_executor enabled — speculative plan() "
-                "pre-runs on a dedicated thread",
-                self.worker_id,
-            )
+            if not self._serial_steps:
+                logger.info(
+                    "Worker %s: plan_executor enabled — speculative plan() "
+                    "pre-runs on a dedicated thread",
+                    self.worker_id,
+                )
         # In-flight: (batch, node_batch, batch_partition, future) | None.
         pending: PendingBatch | None = None
 
