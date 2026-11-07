@@ -536,11 +536,30 @@ class LoopbackRows(Resource):
             rows = [self._row_of.get(rid, TRASH_ROW) for rid in rids]
         redirected = []
         for source, destination in copies:
+            span = 1
+            for stride, size in sorted(zip(destination.stride(), destination.shape, strict=True)):
+                if size > 1:
+                    if stride < span:
+                        raise ValueError("a captured row copy overlaps its own destination")
+                    span += (size - 1) * stride
             start = destination.storage_offset() - target.storage_offset()
-            if (source.numel() != destination.numel() or not destination.is_contiguous()
+            end = start + sum((size - 1) * stride for size, stride in
+                              zip(destination.shape, destination.stride(), strict=True)) + 1
+            if (source.numel() != destination.numel()
                     or destination.untyped_storage().data_ptr() != target.untyped_storage().data_ptr()
-                    or start < 0 or start + destination.numel() > target.numel()):
+                    or start < 0 or end > target.numel()
+                    or any(stride < 0 or (size > 1 and stride == 0)
+                           for size, stride in zip(destination.shape, destination.stride(), strict=True))):
                 raise ValueError("a captured row copy falls outside its input")
+            if destination.numel() and start // width == (end - 1) // width:
+                row, column = divmod(start, width)
+                owned = table[rows[row]]
+                redirected.append((source, owned.as_strided(
+                    destination.shape, destination.stride(), owned.storage_offset() + column,
+                )))
+                continue
+            if not destination.is_contiguous():
+                raise ValueError("a strided captured input crosses owning rows")
             source = source.reshape(-1)
             offset = 0
             while offset < source.numel():

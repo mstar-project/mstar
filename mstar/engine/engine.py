@@ -2485,7 +2485,7 @@ class Engine:
             choices.append(candidate)
         return choices
 
-    def _compose_stream(self, group, leases, window, target, guard):
+    def _compose_stream(self, group, leases, window, payload, guard):
         """Lower the claimed stream through the existing capture entries/bodies.
 
         Policy selection and payload access belong to the retained owners;
@@ -2514,10 +2514,17 @@ class Engine:
         if source is not None and source.run.state.counts.numel() != 1:
             guard.refuse("streamed composition currently needs one physical row per member")
         item = ring.row(signal, batch.request_ids[0])
-        if target.numel() % item[0].numel():
+        prototype, target = payload
+        if prototype.numel() % item[0].numel():
             guard.refuse("a streamed destination does not hold whole producer items")
-        width = target.numel() // item[0].numel()
-        target = target.reshape(1, width, *item.shape[1:])
+        width = prototype.numel() // item[0].numel()
+        shape = (width, *item.shape[1:])
+        if tuple(prototype.shape) not in (shape, tuple(item.shape[1:]) if width == 1 else shape):
+            guard.refuse("a streamed payload changed its owner's item geometry")
+        try:
+            target = target.view(1, *shape)
+        except RuntimeError:
+            guard.refuse("a streamed destination cannot preserve its owner's item coordinates")
         policy = source_mgmt.device_stops.get(source_batch.graph_walk)
         withheld = policy is not None and signal in policy.withhold
         if source is not None and withheld and policy.limits(
@@ -2529,7 +2536,8 @@ class Engine:
         if source is not None and (produced is None or produced.shape != (1, *item.shape[1:])):
             guard.refuse("a streamed producer must emit one captured item per iteration")
         key = ("stream", id(slot.graph), None if source is None else id(source.graph), id(window),
-               target.data_ptr(), tuple(target.shape), indices.data_ptr(), item.untyped_storage().data_ptr(),
+               target.data_ptr(), tuple(target.shape), target.stride(), target.storage_offset(),
+               indices.data_ptr(), item.untyped_storage().data_ptr(),
                withheld)
         if slot.composed_graph is not None and slot.composed_key == key:
             return slot.composed_graph
@@ -2866,7 +2874,7 @@ class Engine:
                             if streamed and incoming:
                                 if stream_target is not None or len(routed) != 1:
                                     guard.refuse("a streamed payload needs one contiguous owner destination")
-                                stream_target = routed[0][1]
+                                stream_target = routed[0]
                             else:
                                 copies.extend(routed)
                             group.initial_copies.extend(destinations(
@@ -2936,6 +2944,20 @@ class Engine:
                         guard.rebind((maker, consumer, signal, rid), source[row:row + 1])
                     boundary = [copy for value, target, keys, name, destinations in boundary_fields
                                 for copy in destinations(name, guard.copies(value, target, keys, back_keys))]
+            if not streamed and self._device.type != "cpu":
+                from mstar.engine.accelerator_graph_backend import copy_words
+
+                # Native composition only accepts its existing memcpy layouts.
+                # Refuse before any seed staging or irreversible submission.
+                pairs = [*group.initial_copies, *boundary,
+                         *(pair for part in group.parts for pair in part.copies)]
+                for source, target in pairs:
+                    try:
+                        source = source.view(target.shape)
+                    except RuntimeError:
+                        guard.refuse("connected graph copies cannot reshape a strided source")
+                    if copy_words(target, source) is None:
+                        guard.refuse("connected graph copies need contiguous rows without casts")
             # Every binding has been checked. This is the irreversible point;
             # the main thread publishes it to Rust before landing members.
             for scheduled, batch in group.members:

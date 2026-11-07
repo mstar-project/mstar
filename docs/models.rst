@@ -241,42 +241,37 @@ The worker selects common rows, prepares and admits all members, and submits
 their captures and internal copies in one CUDA graph launch, in graph order.
 The composed graph and its stable bindings stay with the capture slot; ordinary
 external inputs are staged before launch. An unsubmitted refusal runs the
-ordinary head. Eligible sections run on one CUDA GPU, including one iteration
-of a Loop. A member that can stop before later members remains a boundary.
-Shared resources qualify through their own ``connected_refusal`` checks;
-KV, positions and FlashInfer plans retain separate member buffers and project
-prior members' growth before commit. Shared KV forks, retention and prefix-cache
-conversion remain boundaries, as do resident/conditional captures, captured row
-heads, streaming edges and torch-generator draws.
+ordinary head. Eligible sections run on one CUDA GPU. Shared resources qualify
+through their own ``connected_refusal`` checks; their member-qualified buffers
+retain plans and project prior members' growth before commit. Unsupported shared
+state, prefix chains and generator draws remain boundaries.
 
-The graph runtime also describes local streaming connections as qualified
-members: each retains its worker graph, active walk and own Loop progress. A
-claim can reserve a waiting consumer, and an unexecuted member releases its
-claim without a graph completion. These streaming units remain on ordinary
-execution until their policy reservations are wired to conditional capture
-lowering; the runtime description alone does not enable streamed fusion. The
-stream buffer can freeze the ordinary policy decisions for future producer
-items, including overlap and final tails. Settlement applies only the selected
-history after the actual items and producer completion have been published;
-run-budget exhaustion alone never finishes a stream.
+Local streaming connections keep each member's graph identity and actual Loop
+progress. The bounded implementation supports two members, one streaming edge,
+one logical and physical row, and fixed membership. It can claim a waiting
+consumer and compose existing entries and bodies under native IF/WHILE nodes.
+The producer and consumer have independent compute counts. The ordinary chunk
+policy supplies readiness, consumption and final-tail decisions; run-budget
+exhaustion does not finish the stream. Selected history is settled only after
+actual producer output is published. Physical ring reservations and reader
+references remain owned by the stream resources until collection completes.
 
-The input owner can retain a captured table of those policy decisions, their
-chunk metadata and selected semantic history. It exposes separate predicates
-for a policy pop and model computation, so an empty terminal flush need not
-execute a model. The payload owner supplies captured reads/writes of reserved
-ring positions; reads do not release the buffer's references or permit reuse.
+Preparation may structurally pack future inputs with real values through
+reshape, transpose, stack, concatenation and constant padding. These operations
+lower to copies into the existing capture or resource-owned destination; an
+inverse reshape that would allocate, value-dependent work or unsupported native
+copy layout refuses before launch. Alternative chunks must preserve prepared
+host meaning, declarations and independent staged values. Arithmetic on future
+values, mutable model request state and host reads of future positions remain
+boundaries.
 
-The capture backend can lower nested IF/WHILE operations directly into one
-native graph. Predicates remain caller-owned resident scalar buffers; existing
-member captures remain ordinary child graphs. A conditional executable is
-never embedded as a child. This backend capability alone does not enable a
-streaming execution unit: its policy receipts, owner lifetimes and graph
-completion still have to be wired through the engine.
-
-Preparation may structurally pack future inputs with real values; arithmetic
-on future values, mutable model request state, host reads of future positions,
-and uncaptured producer output transformations use ordinary execution. The
-phase trace records ``connected.members#`` and each member's real row count.
+A custom consumer tail is eligible only for a requested single compute. Its
+selected real input is reconstructed from retained owner storage before the
+ordinary tail runs, and its reader is released afterward, including on failure.
+A zero-compute consumer runs no tail. Custom producer output transformations
+remain a boundary. These eligibility rules do not by themselves establish that
+every served model's preparation and resources qualify. The phase trace records
+``connected.members#`` and each member's real row count.
 
 OmniVoice notes
 ~~~~~~~~~~~~~~~

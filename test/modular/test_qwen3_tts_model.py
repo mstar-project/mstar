@@ -2142,6 +2142,32 @@ def test_qwen3_tts_codec_takes_every_item_as_a_frame_and_pads_to_capture_shape()
         "request": InputMetadata(stream_chunks={"codec_tokens": StreamChunkInfo(1, 1, 3, True)}),
     }) == 3
 
+    # Ordinary preparation supplies the same transpose/pad recipe for future
+    # payloads. Landing must use the real owner values, not their prototype.
+    key = ("Talker", "Codec", "codec_tokens", "request")
+    future = ConnectedInputs({})
+    alternatives = []
+    for frames in (2, 3):
+        future.bindings[key] = codes[:frames]
+        with future.preparing():
+            item = submodule.prepare_inputs(
+                "codec_chunk", SimpleNamespace(rid_handle="request"), {"codec_tokens": [future.unknown(key)]},
+                input_metadata=InputMetadata(stream_chunks={"codec_tokens": StreamChunkInfo(0, 0, frames, False)}),
+            )
+            values = submodule.preprocess(
+                "codec_chunk", ModelInputsFromEngine(request_ids=[], per_request_info={}), [item],
+            )
+        landed = ConnectedInputs.materialize(values, {key: codes[:frames] + 20})
+        want = torch.nn.functional.pad(codes[:frames] + 20, (0, 0, 0, 3 - frames)).t().unsqueeze(0)
+        assert torch.equal(landed["codec_tokens"], want)
+        assert landed["lengths"].tolist() == [frames]
+        assert "request" not in submodule.request_states
+        alternatives.append(values["codec_tokens"])
+    assert alternatives[0].shape == alternatives[1].shape
+    assert not future.same(*alternatives), "padding cannot hide a changed future chunk's geometry"
+    restored = ConnectedInputs.materialize(alternatives[0], {key: codes[:2] + 30})
+    assert torch.equal(restored, torch.nn.functional.pad(codes[:2] + 30, (0, 0, 0, 1)).t().unsqueeze(0))
+
     # A stream whose only frame was a withheld EOS ends with an empty chunk: no audio.
     empty = submodule.prepare_inputs(
         "codec_chunk", SimpleNamespace(request_id="empty", rid_handle="empty"), {},

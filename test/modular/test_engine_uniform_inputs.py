@@ -242,6 +242,23 @@ def test_connected_actual_preparation_refuses_before_launch_without_failing_rows
     assert all(not batch.failed_requests for _, batch in group.members)
 
 
+def test_connected_native_copy_refuses_strided_packing_before_staging_or_submission():
+    eng, group, events = _connected_engine()
+    # Exercise accelerator copy eligibility without needing to submit a GPU graph.
+    eng._device = torch.device("cuda")
+    node = eng._submodules["b"].submodule
+    node.preprocess = lambda graph_walk, engine_inputs, inputs: {
+        "x": torch.cat([item.tensor_inputs["x"] for item in inputs[:2]]).t(),
+    }
+    slots = [next(iter(m.accelerator_graph_runner._buckets.values())).slots[0]
+             for m in eng._submodules.values()]
+    before = [slot.static_inputs["x"].clone() for slot in slots]
+    assert eng.exec_group(group) is None and not group.submitted
+    assert "copies" in group.refusal
+    assert not any(event in {"a", "b"} for event in events)
+    assert torch.equal(slots[1].static_inputs["x"], before[1])
+
+
 def test_connected_head_cannot_mutate_request_state_before_a_later_refusal():
     eng, group, events = _connected_engine(head_state=True)
     assert eng.exec_group(group) is None
@@ -892,7 +909,8 @@ def test_streamed_alternatives_preserve_host_meaning_and_do_not_read_future_valu
 
 @pytest.mark.parametrize("device_name", ["cpu", "cuda"])
 @pytest.mark.parametrize("mode", ["live", "full", "yield", "unsupported", "bank_small",
-                                  "tail", "tail_error", "tail_zero", "tail_wide", "producer_tail"])
+                                  "tail", "tail_error", "tail_zero", "tail_wide", "producer_tail",
+                                  "packing", "packing_refuse"])
 def test_streamed_engine_composes_independent_bodies_and_owner_reads(device_name, mode, monkeypatch):
     from dataclasses import replace
 
@@ -909,7 +927,8 @@ def test_streamed_engine_composes_independent_bodies_and_owner_reads(device_name
         pytest.skip("real Engine streamed composition")
     device = torch.device(device_name)
     full, yielded = mode == "full", mode in {"yield", "tail_zero"}
-    custom = mode.startswith("tail") or mode == "producer_tail"
+    packing = mode.startswith("packing")
+    custom = mode.startswith("tail") or mode == "producer_tail" or packing
     tails, batch_tails = [], []
     eng, group, events = _connected_engine(device=device)
     group.unit = replace(group.unit, streaming_edges=group.unit.edges)
@@ -984,7 +1003,8 @@ def test_streamed_engine_composes_independent_bodies_and_owner_reads(device_name
         runner._graph_backend = backend
         old_bucket = next(iter(runner._buckets.values()))
         slot = old_bucket.slots[0]
-        slot.static_inputs = {"x": torch.zeros(1, width, device=device)}
+        input_shape = (1, 2, 3) if packing and name == "b" else (1, width)
+        slot.static_inputs = {"x": torch.zeros(input_shape, device=device)}
         slot.static_outputs = BatchedModelOutput(
             row_outputs={"x": torch.zeros(1, 2 if name == "a" else 1, device=device)},
             check_stop_buffers={"token": torch.zeros(1, dtype=torch.long, device=device)},
@@ -992,7 +1012,7 @@ def test_streamed_engine_composes_independent_bodies_and_owner_reads(device_name
         slot.dummy_rids, slot.dummy_metadata = [-1], {}
         config = BatchedAcceleratorGraphConfig(
             capture_graph_walk="prefill", single_request_inputs=NodeInputs(
-                tensor_inputs={"x": torch.ones(1, width, device=device)},
+                tensor_inputs={"x": torch.ones(input_shape, device=device)},
             ),
         )
         bucket = BucketKey("prefill", 1, 0)
@@ -1010,17 +1030,24 @@ def test_streamed_engine_composes_independent_bodies_and_owner_reads(device_name
         if name == "b":
             owner = mgmt.loopback_rows = LoopbackRows(device, capacity=1)
             owner.add(2)
-            owner.write("x", [2], torch.full((1, 4), -100., device=device))
+            owner.write("x", [2], torch.full(input_shape, -100., device=device))
             owner.indices(bucket, 0).fill_(1)
             slot.row_heads = {"x": "x"}
             ordinary = mgmt.submodule.prepare_inputs
             def prepare(ordinary=ordinary, **kwargs):
                 result = ordinary(**kwargs)
-                result.tensor_inputs["x"] = result.tensor_inputs["x"].reshape(1, -1)
+                shape = (-1, 2) if packing else (1, -1)
+                result.tensor_inputs["x"] = result.tensor_inputs["x"].reshape(shape)
                 if custom:
                     result.kwargs["context"] = 1
                 return result
             mgmt.submodule.prepare_inputs = prepare
+            if packing:
+                def preprocess(graph_walk, engine_inputs, inputs):
+                    return {"x": torch.stack([
+                        torch.nn.functional.pad(item.tensor_inputs["x"], (0, 0, 0, 1)).t() for item in inputs
+                    ])}
+                mgmt.submodule.preprocess = preprocess
 
         def entry(state=state, name=name):
             state.index.zero_()
@@ -1085,12 +1112,14 @@ def test_streamed_engine_composes_independent_bodies_and_owner_reads(device_name
         owner = UnsupportedOwner()
         eng._runner = StepRunner({"unsupported": owner})
         eng._submodules["a"].resources = {"unsupported": owner}
-    if mode == "bank_small":
+    if mode in {"bank_small", "packing_refuse"}:
         tables.prepare_stream_window(leases["b"], 1, 1, 1)
     output = eng.exec_group(group)
-    if mode in {"unsupported", "bank_small", "tail_wide", "producer_tail"}:
+    if mode in {"unsupported", "bank_small", "tail_wide", "producer_tail", "packing_refuse"}:
         assert output is None and group.refusal is not None
         assert not group.submitted and not launches
+        if packing:
+            assert owner.row("x", 2).eq(-100).all(), "unsubmitted padding cannot alter its owning row"
         worker._restore_group_stream(group)
         assert not source._reservations and ring.ring_room("x", 2) == 8
         return
@@ -1098,6 +1127,8 @@ def test_streamed_engine_composes_independent_bodies_and_owner_reads(device_name
     if device_name == "cuda":
         backend.synchronize()
     assert launches == [1]
+    if packing:
+        assert owner.row("x", 2).tolist() == [[10, 11, 0], [10, 11, 0]]
     if not full:
         assert output[0].check_stop_buffers[RUN_COUNTS].tolist() == [0 if yielded else 3]
     else:

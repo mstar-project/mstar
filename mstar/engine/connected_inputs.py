@@ -1,7 +1,7 @@
 """Certify preparation of inputs whose producing capture has not run yet.
 
-Only ordered structural packing is allowed. The result is a list of ordinary
-copies from leased outputs and real inputs; a fake tensor is never staged.
+Only reversible structural packing is allowed. It lowers to ordinary copies
+from leased outputs and real inputs; a fake tensor is never staged.
 This scope deliberately does not enter a torch dispatch mode: independent
 operations on real tensors must keep doing real work.
 """
@@ -13,7 +13,7 @@ from types import MappingProxyType, SimpleNamespace
 from typing import Any, Collection, Iterator
 
 import torch
-from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode
+from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode, unset_fake_temporarily
 
 from mstar.streaming.stream_buffer import StreamChunkInfo
 
@@ -25,14 +25,14 @@ def active_guard() -> "ConnectedInputs | None":
 
 
 class ConnectedInputs(FakeTensorMode):
-    """One unsubmitted attempt's unknown values and their ordered copy spans."""
+    """One unsubmitted attempt's unknown values and their structural copies."""
 
     def __init__(self, bindings: dict[Any, torch.Tensor]):
         super().__init__(allow_fallback_kernels=False, allow_non_fake_inputs=True)
         self.bindings = bindings
         self.reason: str | None = None
         # Keep the fake alive too: Python may otherwise reuse its id.
-        self._spans: dict[int, tuple[torch.Tensor, tuple[Any, ...]]] = {}
+        self._recipes: dict[int, tuple[torch.Tensor, tuple]] = {}
 
     @contextmanager
     def preparing(self) -> Iterator[None]:
@@ -107,20 +107,25 @@ class ConnectedInputs(FakeTensorMode):
             self.refuse("a future row is not contiguous")
         meta = torch.empty_strided(source.shape, source.stride(), dtype=source.dtype, device="meta")
         value = FakeTensor(self, meta, source.device)
-        self._spans[id(value)] = value, (key,)
+        self._recipes[id(value)] = value, ("leaf", key, tuple(source.shape), source.dtype, source.device)
         return value
 
-    def _parts(self, tensor: torch.Tensor) -> tuple[Any, ...]:
+    def _recipe(self, tensor: torch.Tensor) -> tuple:
         if isinstance(tensor, FakeTensor):
-            entry = self._spans.get(id(tensor))
+            entry = self._recipes.get(id(tensor))
             if entry is None:
                 self.refuse("an unknown value has no certified source")
             return entry[1]
-        if not tensor.is_contiguous():
-            self.refuse("a packed real input is not contiguous")
         key = ("real", id(tensor))
         self.bindings[key] = tensor
-        return (key,)
+        return "leaf", key, tuple(tensor.shape), tensor.dtype, tensor.device
+
+    def _parts(self, tensor: torch.Tensor) -> tuple[Any, ...]:
+        def leaves(recipe):
+            if recipe[0] == "leaf":
+                return (recipe[1],)
+            return tuple(key for child in recipe[2] for key in leaves(child))
+        return leaves(self._recipe(tensor))
 
     def dispatch(self, func, types, args=(), kwargs=None):
         kwargs = kwargs or {}
@@ -130,28 +135,60 @@ class ConnectedInputs(FakeTensorMode):
             "aten._unsafe_view.default", "aten.unsqueeze.default",
             "aten.squeeze.default", "aten.squeeze.dim", "aten.squeeze.dims",
             "aten.as_strided.default", "prims.view_of.default", "prims.split_dim.default",
-            "prims.collapse_view.default",
+            "prims.collapse_view.default", "aten.clone.default",
         }
+        source = args[0]
         if name in aliases:
-            source = args[0]
-            if not source.is_contiguous():
-                self.refuse(f"{name} would change future storage order")
-            spans = self._parts(source)
+            recipe = ("view", tuple(source.shape), (self._recipe(source),))
+        elif name in {"aten.t.default", "aten.transpose.int", "aten.permute.default"}:
+            axes = list(range(source.ndim))
+            if name == "aten.t.default":
+                if source.ndim > 2:
+                    self.refuse("transpose needs at most two dimensions")
+                axes.reverse()
+            elif name == "aten.transpose.int":
+                i, j = args[1] % source.ndim, args[2] % source.ndim
+                axes[i], axes[j] = axes[j], axes[i]
+            else:
+                axes = [axis % source.ndim for axis in args[1]]
+            recipe = ("permute", tuple(axes.index(i) for i in range(source.ndim)), (self._recipe(source),))
         elif name in {"aten.stack.default", "aten.cat.default"}:
             dim = args[1] if len(args) > 1 else kwargs.get("dim", 0)
-            if dim != 0:
-                self.refuse(f"{name} packs future rows on an unsupported axis")
-            spans = tuple(key for tensor in args[0] for key in self._parts(tensor))
+            stack = name == "aten.stack.default"
+            dim %= source[0].ndim + int(stack)
+            recipe = ("stack" if stack else "cat", (dim, tuple(t.shape[dim] for t in source) if not stack else ()),
+                      tuple(self._recipe(t) for t in source))
+        elif name == "aten.slice.Tensor":
+            dim = args[1] if len(args) > 1 else 0
+            start = args[2] if len(args) > 2 else 0
+            end = args[3] if len(args) > 3 else None
+            step = args[4] if len(args) > 4 else 1
+            if slice(start, end, step).indices(source.shape[dim]) != (0, source.shape[dim], 1):
+                self.refuse("preparation slices a future row")
+            recipe = ("view", tuple(source.shape), (self._recipe(source),))
+        elif name == "aten.constant_pad_nd.default":
+            padding = tuple(args[1])
+            if any(pad < 0 for pad in padding):
+                self.refuse("preparation crops a future row")
+            fill = args[2] if len(args) > 2 else kwargs.get("value", 0)
+            recipe = ("pad", padding, (self._recipe(source),))
         else:
             self.refuse(f"preparation needs future values for {name}")
         value = super().dispatch(func, types, args, kwargs)
-        if not isinstance(value, FakeTensor) or not value.is_contiguous():
-            self.refuse(f"{name} did not preserve contiguous future rows")
-        if name in aliases and value.storage_offset() != source.storage_offset():
-            self.refuse(f"{name} shifted a future row")
-        if sum(self.bindings[key].numel() for key in spans) != value.numel():
-            self.refuse(f"{name} changed the future row span")
-        self._spans[id(value)] = value, spans
+        if not isinstance(value, FakeTensor):
+            self.refuse(f"{name} did not preserve a future tensor")
+        if name == "aten.as_strided.default" and (
+            not source.is_contiguous() or not value.is_contiguous()
+            or source.storage_offset() != value.storage_offset() or source.numel() != value.numel()
+        ):
+            self.refuse("preparation changes future storage addressing")
+        if recipe[0] == "pad":
+            # An independent leaf, staged once before the interior writes.
+            # Certification itself never writes a leased destination.
+            with unset_fake_temporarily():
+                constant = torch.full(tuple(value.shape), fill, dtype=value.dtype, device=value.device)
+            recipe = ("pad", recipe[1], (self._recipe(constant), *recipe[2]))
+        self._recipes[id(value)] = value, recipe
         return value
 
     def contains(self, value: Any) -> bool:
@@ -175,12 +212,18 @@ class ConnectedInputs(FakeTensorMode):
         if type(left) is not type(right):
             return False
         if isinstance(left, FakeTensor):
-            a, b = self._parts(left), self._parts(right)
+            def equal(a, b):
+                if a[0] != b[0]:
+                    return False
+                if a[0] == "leaf":
+                    return a[2:] == b[2:] and (
+                        self.same(self.bindings[a[1]], self.bindings[b[1]])
+                        if a[1][0] == b[1][0] == "real" else a[1] == b[1]
+                    )
+                return (a[1] == b[1] and len(a[2]) == len(b[2])
+                        and all(equal(x, y) for x, y in zip(a[2], b[2], strict=True)))
             return (left.shape == right.shape and left.dtype == right.dtype and left.device == right.device
-                    and len(a) == len(b) and all(
-                        self.same(self.bindings[x], self.bindings[y]) if x[0] == y[0] == "real" else x == y
-                        for x, y in zip(a, b, strict=True)
-                    ))
+                    and equal(self._recipe(left), self._recipe(right)))
         if isinstance(left, torch.Tensor):
             return (left.shape == right.shape and left.dtype == right.dtype and left.device == right.device
                     and torch.equal(left, right))
@@ -205,23 +248,17 @@ class ConnectedInputs(FakeTensorMode):
     def materialize(value: Any, bindings: dict[Any, torch.Tensor]) -> Any:
         """An admitted ordinary input, now backed by its retained real values.
 
-        Each fake keeps the guard that certified its contiguous packing. Real
-        inputs stay unchanged; future bindings are supplied by their owner,
-        never by the prototype used while exploring alternative chunks.
+        Each fake keeps the certificate that prepared it. Real inputs stay
+        unchanged; landed future bindings come from their retained owner.
         """
         if isinstance(value, FakeTensor):
             mode = value.fake_mode
             if not isinstance(mode, ConnectedInputs):
                 raise ValueError("a future input has no connected preparation certificate")
-            parts = []
-            for key in mode._parts(value):
-                expected = mode.bindings[key]
-                actual = expected if key[0] == "real" else bindings.get(key)
-                if (actual is None or actual.shape != expected.shape or actual.dtype != expected.dtype
-                        or actual.device != expected.device or not actual.is_contiguous()):
-                    raise ValueError("a landed input disagrees with its certified future span")
-                parts.append(actual.reshape(-1))
-            return torch.cat(parts).reshape(value.shape)
+            target = torch.empty(tuple(value.shape), dtype=value.dtype, device=value.device)
+            for _, source, destination in mode._lower(mode._recipe(value), target, bindings):
+                destination.copy_(source)
+            return target
         if isinstance(value, dict):
             return {key: ConnectedInputs.materialize(item, bindings) for key, item in value.items()}
         if isinstance(value, list):
@@ -241,26 +278,47 @@ class ConnectedInputs(FakeTensorMode):
             self.refuse("a Loop carry disagrees with its first iteration's seed")
         self.bindings[key] = source
 
+    def _lower(self, recipe: tuple, target: torch.Tensor, bindings: dict | None = None):
+        kind = recipe[0]
+        if kind == "leaf":
+            _, key, shape, dtype, device = recipe
+            source = self.bindings[key] if key[0] == "real" or bindings is None else bindings.get(key)
+            if (source is None or tuple(source.shape) != shape or source.dtype != dtype
+                    or source.device != device or tuple(target.shape) != shape):
+                self.refuse("a landed input disagrees with its certified future geometry")
+            return [(key, source, target)]
+        args, children = recipe[1:]
+        if kind == "view":
+            try:
+                views = (target.view(args),)
+            except RuntimeError:
+                self.refuse("future packing cannot invert a reshape without copying")
+        elif kind == "permute":
+            views = (target.permute(args),)
+        elif kind == "stack":
+            views = target.unbind(args[0])
+        elif kind == "cat":
+            views = target.split(args[1], dim=args[0])
+        else:
+            slices = [slice(None)] * target.ndim
+            for i in range(len(args) // 2):
+                start, end = args[2 * i:2 * i + 2]
+                slices[-1 - i] = slice(start, target.shape[-1 - i] - end)
+            views = (target, target[tuple(slices)])
+        return [copy for child, view in zip(children, views, strict=True)
+                for copy in self._lower(child, view, bindings)]
+
     def copies(
         self, value: torch.Tensor, target: torch.Tensor, expected: tuple[Any, ...],
         keys: Collection[Any] | None = None,
     ) -> list[tuple[torch.Tensor, torch.Tensor]]:
-        """Lower a certified mixed real/future field to existing RunPart copies."""
-        spans = self._parts(value)
-        future = tuple(key for key in spans if key[0] != "real")
+        """Pure lowering to existing copies, including strided owner views."""
+        future = tuple(key for key in self._parts(value) if key[0] != "real")
         if future != expected:
             self.refuse("future rows were omitted, duplicated, or reordered")
         if value.shape != target.shape or value.dtype != target.dtype or value.device != target.device:
             self.refuse("future packing disagrees with its captured destination")
         if not target.is_contiguous():
             self.refuse("a future destination is not contiguous")
-        flat, offset, copies = target.view(-1), 0, []
-        for key in spans:
-            source = self.bindings[key]
-            if source.dtype != target.dtype or source.device != target.device:
-                self.refuse("future packing casts a source")
-            size = source.numel()
-            if keys is None or key in keys:
-                copies.append((source.view(-1), flat.narrow(0, offset, size)))
-            offset += size
-        return copies
+        return [(source, destination) for key, source, destination in self._lower(self._recipe(value), target)
+                if keys is None or key in keys]
