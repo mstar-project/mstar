@@ -372,17 +372,17 @@ class ThinkerSubmodule(ARNodeSubmodule):
             seq_len = text_ids.shape[0]
             # A text row leaves its positions to the plan, which starts from the
             # counter a cache hit has already moved.
-            masks_for_talker = torch.stack([
-                torch.zeros(text_ids.shape, dtype=torch.bool, device=device), # multimodal
-                talker_text_mask(text_ids, self.config) # text inclusion
-            ])
+            tensor_inputs = {}
+            if fwd_info.step_metadata.get("audio_output", True):
+                tensor_inputs["masks_for_talker"] = torch.stack([
+                    torch.zeros(text_ids.shape, dtype=torch.bool, device=device), # multimodal
+                    talker_text_mask(text_ids, self.config) # text inclusion
+                ])
             return ARNodeInputs(
                 input_seq_len=seq_len,
                 input_embeds=embeds,
                 input_ids=text_ids,
-                tensor_inputs={
-                    "masks_for_talker": masks_for_talker
-                }
+                tensor_inputs=tensor_inputs,
             )
 
         # an audio or vision row's own positions start from the stream's counter
@@ -397,7 +397,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
             vision_embeds = inputs["vision_embeds"][0].to(device)
             vision_len = vision_embeds.shape[0]
 
-            mm_mask = self._media_mask(vision_len)
+            mm_mask = self._media_mask(vision_len, fwd_info)
 
             wrapped_embeds = self._wrap_vision_input(vision_embeds)
             # Vision tokens use spatial 3D positions (temporal constant,
@@ -452,9 +452,12 @@ class ThinkerSubmodule(ARNodeSubmodule):
             row.tensor_inputs["deepstack"] = deepstack
             return row
 
-    def _media_mask(self, media_len: int) -> torch.Tensor:
-        """Which rows of an attachment and its two sentinels are media. ``fill_``
-        on a view: an index write of a Python scalar syncs with the host."""
+    def _media_mask(self, media_len: int, fwd_info: CurrentForwardPassInfo) -> torch.Tensor | None:
+        """Which rows of an attachment and its two sentinels are media, for the
+        Talker; None for a request with no audio output, which never reads it.
+        ``fill_`` on a view: an index write of a Python scalar syncs with the host."""
+        if not fwd_info.step_metadata.get("audio_output", True):
+            return None
         mask = torch.ones(media_len + 2, dtype=torch.bool, device=self.get_device())
         mask[0].fill_(False)
         mask[-1].fill_(False)
@@ -489,50 +492,55 @@ class ThinkerSubmodule(ARNodeSubmodule):
         ids[p + clip:].copy_(after)
         embeds = self.model.model.embed_tokens(ids)
         embeds[p + 1:p + clip - 1].copy_(audio)
-        # row 0 marks the clip's rows, row 1 the rows the Talker keeps of the text and sentinels
-        masks = torch.zeros((2, n), dtype=torch.bool, device=device)
-        masks[0, p + 1:p + clip - 1].fill_(True)
-        masks[1, p:p + clip].copy_(~masks[0, p:p + clip])
-        masks[1, :p].copy_(talker_text_mask(before, self.config))
-        masks[1, p + clip:].copy_(talker_text_mask(after, self.config))
+        tensor_inputs = {"mrope_pos_advance": n, "text_token_ids": torch.cat([before, after])}
+        if fwd_info.step_metadata.get("audio_output", True):
+            # row 0 marks the clip's rows, row 1 the rows the Talker keeps of the text and sentinels
+            masks = torch.zeros((2, n), dtype=torch.bool, device=device)
+            masks[0, p + 1:p + clip - 1].fill_(True)
+            masks[1, p:p + clip].copy_(~masks[0, p:p + clip])
+            masks[1, :p].copy_(talker_text_mask(before, self.config))
+            masks[1, p + clip:].copy_(talker_text_mask(after, self.config))
+            tensor_inputs["masks_for_talker"] = masks
         return ARNodeInputs(
             input_seq_len=n,
             input_embeds=embeds,
             custom_pos_ids=(torch.arange(n, dtype=torch.float, device=device) + float(start_pos)).expand(3, -1),
-            tensor_inputs={
-                "masks_for_talker": masks,
-                "mrope_pos_advance": n,
-                "text_token_ids": torch.cat([before, after]),
-            },
+            tensor_inputs=tensor_inputs,
         )
 
     def _spliced_row(
         self, before: torch.Tensor, after: torch.Tensor, media_embeds: torch.Tensor, media_pos_ids: torch.Tensor,
-        mm_mask: torch.Tensor, start_pos: int, media_advance: int,
+        mm_mask: torch.Tensor | None, start_pos: int, media_advance: int,
     ) -> ARNodeInputs:
         """One prefill row of an attachment between the text around it. The row
         places its own positions and declares its own advance: a prefix match cuts
         it, but only passing the whole row moves the counter, so a step prepared
         again starts from the same position."""
-        embeds, pos_ids, multimodal, included = [media_embeds], [media_pos_ids], [mm_mask], [~mm_mask]
+        embeds, pos_ids = [media_embeds], [media_pos_ids]
         if before.numel():
             embeds.insert(0, self.model.model.embed_tokens(before))
             pos_ids.insert(0, get_rope_index_text(before.shape[0], start_pos, before.device))
-            multimodal.insert(0, torch.zeros_like(before, dtype=torch.bool))
-            included.insert(0, talker_text_mask(before, self.config))
         if after.numel():
             embeds.append(self.model.model.embed_tokens(after))
             after_pos = start_pos + before.shape[0] + media_advance
             pos_ids.append(get_rope_index_text(after.shape[0], after_pos, after.device))
-            multimodal.append(torch.zeros_like(after, dtype=torch.bool))
-            included.append(talker_text_mask(after, self.config))
         input_embeds = torch.cat(embeds, dim=0)
+        masks = {}
+        if mm_mask is not None:
+            multimodal, included = [mm_mask], [~mm_mask]
+            if before.numel():
+                multimodal.insert(0, torch.zeros_like(before, dtype=torch.bool))
+                included.insert(0, talker_text_mask(before, self.config))
+            if after.numel():
+                multimodal.append(torch.zeros_like(after, dtype=torch.bool))
+                included.append(talker_text_mask(after, self.config))
+            masks["masks_for_talker"] = torch.stack([torch.cat(multimodal), torch.cat(included)])
         return ARNodeInputs(
             input_seq_len=input_embeds.shape[0],
             input_embeds=input_embeds,
             custom_pos_ids=torch.cat(pos_ids, dim=1),
             tensor_inputs={
-                "masks_for_talker": torch.stack([torch.cat(multimodal), torch.cat(included)]),
+                **masks,
                 "mrope_pos_advance": before.shape[0] + media_advance + after.shape[0],
                 # Ids cannot ride `input_ids`: the row is packed by embeds
                 "text_token_ids": torch.cat([before, after]),
@@ -555,7 +563,9 @@ class ThinkerSubmodule(ARNodeSubmodule):
         if unknown:
             raise NotImplementedError(f"Thinker cannot cut tensor inputs {sorted(unknown)}")
         cut = super().split_inputs(graph_walk, fwd_info, replace(inputs, tensor_inputs={}), start, end)
-        cut.tensor_inputs = {"masks_for_talker": tensors["masks_for_talker"][:, start:end]}
+        cut.tensor_inputs = {}
+        if "masks_for_talker" in tensors:
+            cut.tensor_inputs["masks_for_talker"] = tensors["masks_for_talker"][:, start:end]
         if graph_walk == "prefill_vision":
             cut.tensor_inputs["deepstack"] = [layer[start:end] for layer in tensors["deepstack"]]
         if graph_walk != "prefill_text":
