@@ -309,3 +309,21 @@ def test_blackwell_experts_kernel_matches_the_reference(tokens):
     assert _rel(got, want) < 0.05, _rel(got, want)
     assert _rel(got, fp32) <= 1.05 * _rel(want, fp32), (_rel(got, fp32), _rel(want, fp32))
     assert F.cosine_similarity(got.float().flatten(), fp32.flatten(), dim=0) > 0.98
+
+
+@pytest.mark.parametrize("mla_absorb", [True, False])
+def test_its_resources_resolve_a_dtype_under_its_own_precision(mla_absorb):
+    """GLM keeps the dtypes it was built in (NodePrecision(None)), so the engine finds no compute dtype for its
+    resources: each one that stores or plans in a dtype must declare it (B300: every glm52 deployment refused to
+    start with "resource 'kv' declares no dtype")."""
+    from mstar.engine.resources.base import EngineResourceInfo
+    from mstar.model.glm52.glm52_model import Glm52Model
+
+    model = Glm52Model("unused", config_variant="reduced", tokenizer_mode="byte")
+    model.config.mla_absorb = mla_absorb
+    node_dtype = model.get_node_precision("LLM").param_dtype
+    info = EngineResourceInfo(device=torch.device("cpu"), compute_dtype=node_dtype, node_dtypes={"LLM": node_dtype})
+    declared = [s for s in model.get_node_resources() if hasattr(getattr(s, "config", None), "dtype")]
+    assert {s.resource_key for s in declared} >= {"kv", "attn"}
+    for spec in declared:
+        assert info.resolve_dtype(spec.config.dtype, spec.resource_key) == torch.bfloat16, spec.resource_key
