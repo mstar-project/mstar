@@ -206,3 +206,28 @@ def test_fresh_rid_without_a_final_chunk_keeps_its_stream_open():
         assert FRESH in spec.scheduled_batch.request_to_worker_graph
         assert not spec.node_batch.final_stream_rids
         assert not spec.node_batch.partition_done_rids
+
+
+def test_budget_that_excludes_every_parent_row_yields_an_independent_step():
+    from mstar.worker.speculation import PreparedSpeculation
+
+    fresh = ScheduledBatch(node_name=NODE, graph_walk=WALK, request_to_worker_graph={FRESH: 0},
+                           input_edges=_fresh_edges(False))
+    # There was a parent row mid-prefill when the chain was picked, but the
+    # actual token budget selected only a fresh row for the next step.
+    scheduler = SimpleNamespace(
+        backlog_splits_from=lambda *a: False,
+        pick_chain_step=lambda *a: ChainPick((NODE, WALK), StepPick(
+            taken=[FRESH], continuing=[], room=0, held_back=set(), ordered=False,
+        ), specs=[], mid_prefill=[SimpleNamespace(request_id=CONTINUING)]),
+        take_chain_step=lambda *a: fresh,
+        rebuilds=Rebuilds({}, {}),
+    )
+    runtime, target = _runtime()
+    runtime.commit_speculation = lambda *a: None
+    worker = _worker(scheduler, runtime)
+    worker._spec_preparer = SimpleNamespace(prepare=lambda *a: PreparedSpeculation([], 0, None))
+    yielded = SimpleNamespace(is_yield_away=True)
+    worker._yield_away_speculation = lambda batch, gave_way: yielded if batch is fresh and gave_way else None
+    result = worker._try_speculate_next(_pending(), SpeculationTarget(target, [CONTINUING]))
+    assert result is yielded, "TP followers cannot follow a speculative head with no row from its parent"

@@ -3260,6 +3260,19 @@ class Worker:
         )
         laps.lap("fresh_schedule")
 
+        if not continuing and (
+            fresh_batch is None
+            or fresh_batch.request_to_worker_graph.keys().isdisjoint(batch_N.request_to_worker_graph)
+        ):
+            # The token budget can exclude every mid-prefill parent after the
+            # initial pick. This step then has no dependency on N: sending it
+            # as N's speculative head strands a TP follower looking for a parent.
+            self._graph_runtime.commit_speculation(prep.spec_id, False)
+            for rid, edges in prep.consumed_streaming_edges.items():
+                for edge in edges:
+                    self.streams.return_edge(rid, edge)
+            return None if fresh_batch is None else self._yield_away_speculation(fresh_batch, gave_way=True)
+
         if fresh_batch is not None:
             # The merge below relabels these node objects with the spec
             # target's name/walk, so a batch for any other node must not be
