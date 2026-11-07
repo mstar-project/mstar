@@ -841,3 +841,207 @@ def test_dynamic_run_retains_capture_until_identity_resolved_collection_finishes
     assert events.count("release:a") == 1 and batch.outputs is ordinary
     with pytest.raises(ValueError, match="finish once"):
         eng.finish_run_outputs(batch, ordinary)
+
+
+@pytest.mark.parametrize("change", ["none", "host", "real", "empty"])
+def test_streamed_alternatives_preserve_host_meaning_and_do_not_read_future_values(change):
+    from mstar.engine.connected_inputs import ConnectedInputs
+    from mstar.streaming.chunk_policy import FixedChunkPolicy
+    from mstar.streaming.stream_buffer import StreamBuffer, StreamingEdge
+
+    eng, group, events = _connected_engine()
+    batch = group.members[1][1]
+    batch.request_ids = [2]
+    batch.per_request_info = {2: batch.per_request_info[2]}
+    source = StreamBuffer(2, "x", "a", FixedChunkPolicy(2))
+    if change == "empty":
+        source.signal_done(0)
+    snapshot = source.reserve_future_window([] if change == "empty" else range(4), 3, may_finish=False)
+    batch.stream_windows = {2: [StreamingEdge("x", "b", [], snapshot.info)]}
+    node = eng._submodules["b"].submodule
+    ordinary = node.prepare_inputs
+    seen = []
+
+    def prepare(**kwargs):
+        chunk = kwargs["input_metadata"].stream_chunks["x"]
+        assert chunk.reservation is None, "model preparation cannot mutate the stream owner's policy"
+        seen.append(chunk.start_offset)
+        if chunk.num_items == 0:
+            return None
+        inputs = ordinary(**kwargs)
+        if change == "host":
+            inputs.kwargs["offset"] = chunk.start_offset
+        elif change == "real":
+            inputs.tensor_inputs["independent"] = torch.tensor([chunk.start_offset])
+        return inputs
+
+    node.prepare_inputs = prepare
+    guard = ConnectedInputs({})
+    with guard.preparing():
+        if change in ("host", "real"):
+            with pytest.raises(ValueError, match="prepared host inputs"):
+                eng._prepare_stream_choices(batch, "a", "x", torch.empty(4, 2), guard)
+        else:
+            choices = eng._prepare_stream_choices(batch, "a", "x", torch.empty(4, 2), guard)
+            assert all(choice is None for choice in choices) if change == "empty" else all(choices)
+    assert seen and events == []
+    assert source._executed_chunks == 0 and source.owns_window(snapshot.reservation)
+    assert batch.request_ids == [2] and batch.inputs is None
+    assert not batch.failed_requests and not batch.skipped_rids
+
+
+@pytest.mark.parametrize("device_name", ["cpu", "cuda"])
+def test_streamed_engine_composes_independent_bodies_and_owner_reads(device_name, monkeypatch):
+    from dataclasses import replace
+
+    from mstar.engine.accelerator_graph_backend import CUDAGraphBackend, GraphConditional
+    from mstar.engine.accelerator_graph_runner import capture_into_graph
+    from mstar.engine.device_run import RUN_COUNTS, DeviceRun, RunState
+    from mstar.engine.resources.iteration_tables import STREAM_COUNTS, STREAM_TRANSITION, IterationTables
+    from mstar.engine.resources.loopback_rows import LoopbackRows
+    from mstar.model.submodule_base import BatchedModelOutput, NodeInputs, StopKind, StopPolicy
+    from mstar.streaming.chunk_policy import FixedChunkPolicy
+    from mstar.streaming.stream_buffer import StreamBuffer, StreamingEdge
+
+    if device_name == "cuda" and not torch.cuda.is_available():
+        pytest.skip("real Engine streamed composition")
+    device = torch.device(device_name)
+    eng, group, events = _connected_engine(device=device)
+    group.unit = replace(group.unit, streaming_edges=group.unit.edges)
+    source = StreamBuffer(2, "x", "a", FixedChunkPolicy(2))
+    ring = LoopbackRows(device, capacity=1)
+    ring.add(2)
+    ring.ask_ring("x", 8)
+    ring.ring_table("x", torch.zeros(1, 2, device=device))
+    tables = IterationTables(device)
+    eng._submodules["a"].loopback_rows = ring
+    eng._submodules["a"].rings = {"x": {"prefill"}}
+    eng._submodules["b"].submodule.iteration_tables = tables
+    leases, slots, launches = {}, {}, []
+
+    def cpu_compose(ops):
+        def execute(ops):
+            for op in ops:
+                if isinstance(op, GraphConditional):
+                    if op.kind == "if":
+                        if op.predicate.item():
+                            execute(op.body)
+                    else:
+                        while op.predicate.item():
+                            execute(op.body)
+                else:
+                    op.replay()
+        return SimpleNamespace(replay=lambda: (launches.append(1), execute(ops))[-1])
+
+    backend = (CUDAGraphBackend(device) if device_name == "cuda" else
+               SimpleNamespace(compose=cpu_compose, graph_pool_handle=lambda: None))
+    if device_name == "cpu":
+        monkeypatch.setattr("mstar.engine.accelerator_graph_runner.capture_into_graph",
+                            lambda fn, *a, **kw: (SimpleNamespace(replay=fn), None))
+
+    def capture(fn):
+        if device_name == "cpu":
+            return SimpleNamespace(replay=fn)
+        return capture_into_graph(fn, backend.graph_pool_handle(), device, None, keep_graph=True)[0]
+
+    for name, width in (("a", 2), ("b", 4)):
+        mgmt = eng._submodules[name]
+        runner = mgmt.accelerator_graph_runner
+        runner._graph_backend = backend
+        old_bucket = next(iter(runner._buckets.values()))
+        slot = old_bucket.slots[0]
+        slot.static_inputs = {"x": torch.zeros(1, width, device=device)}
+        slot.static_outputs = BatchedModelOutput(
+            row_outputs={"x": torch.zeros(1, 2 if name == "a" else 1, device=device)},
+            check_stop_buffers={"token": torch.zeros(1, dtype=torch.long, device=device)},
+        )
+        slot.dummy_rids, slot.dummy_metadata = [-1], {}
+        config = BatchedAcceleratorGraphConfig(
+            capture_graph_walk="prefill", single_request_inputs=NodeInputs(
+                tensor_inputs={"x": torch.ones(1, width, device=device)},
+            ),
+        )
+        bucket = BucketKey("prefill", 1, 0)
+        leases[name] = SlotLease(0, bucket, name)
+        runner._buckets = {bucket: SimpleNamespace(config=config, slots=[slot])}
+        mgmt.joint_comm_group = SimpleNamespace(world_size=1)
+        mgmt.run_columns["prefill"] = frozenset({"x"})
+        mgmt.device_stops["prefill"] = StopPolicy(StopKind.EOS, "token", frozenset({99}),
+                                                  withhold=("x",) if name == "a" else ())
+        mgmt.refills["prefill"] = None
+        state = RunState(1, "token", (99,), device)
+        run = slot.run = DeviceRun(state, {}, lambda: None, 4)
+        run.rows["x"] = torch.zeros(1, 4, 2 if name == "a" else 1, device=device)
+        run.stops["token"] = torch.zeros(1, 4, dtype=torch.long, device=device)
+        if name == "b":
+            owner = mgmt.loopback_rows = LoopbackRows(device, capacity=1)
+            owner.add(2)
+            owner.write("x", [2], torch.full((1, 4), -100., device=device))
+            owner.indices(bucket, 0).fill_(1)
+            slot.row_heads = {"x": "x"}
+            ordinary = mgmt.submodule.prepare_inputs
+            def prepare(ordinary=ordinary, **kwargs):
+                result = ordinary(**kwargs)
+                result.tensor_inputs["x"] = result.tensor_inputs["x"].reshape(1, -1)
+                return result
+            mgmt.submodule.prepare_inputs = prepare
+
+        def entry(state=state):
+            state.index.zero_()
+            state.counts.zero_()
+            state.marks.zero_()
+            state.continuation.fill_(1)
+
+        def body(name=name, slot=slot, run=run, state=state, mgmt=mgmt, bucket=bucket):
+            if name == "a":
+                slot.static_outputs.row_outputs["x"].copy_((state.index + 10).expand(1, 2))
+                slot.static_outputs.check_stop_buffers["token"].copy_(torch.where(state.index == 2, 99, 1))
+            else:
+                mgmt.loopback_rows.head(bucket, 0, "x", slot.static_inputs["x"])
+                slot.static_outputs.row_outputs["x"].copy_(slot.static_inputs["x"].sum().reshape(1, 1))
+                slot.static_outputs.check_stop_buffers["token"].fill_(1)
+            run.keep(slot.static_outputs.row_outputs, run.rows)
+            run.keep(slot.static_outputs.check_stop_buffers, run.stops)
+            state.index.add_(1)
+            state.counts.add_(1)
+            state.marks.copy_(slot.static_outputs.check_stop_buffers["token"] == 99)
+            state.continuation.copy_((state.index < state.limit) & ~state.marks)
+
+        run.entry, slot.graph = capture(entry), capture(body)
+        slots[name] = slot
+        scheduled, batch = next(pair for pair in group.members if pair[1].node_name == name)
+        batch.request_ids = [2]
+        batch.per_request_info = {2: batch.per_request_info[2]}
+        batch.per_request_info_wrapped = {2: batch.per_request_info_wrapped[2]}
+        batch.step_context.repeats = scheduled.repeats = 4 if name == "a" else 3
+        scheduled.request_to_worker_graph = {2: 1}
+
+    def reserve(batch):
+        lease = leases[batch.node_name]
+        batch.lease_slot(lease)
+        return lease
+    eng.reserve_replay_slot = reserve
+    a, b = (pair[1] for pair in group.members)
+    eng._reserve_rings(eng._submodules["a"], a)
+    snapshot = source.reserve_future_window(range(4), 3, may_finish=False)
+    b.stream_windows = {2: [StreamingEdge("x", "b", [], snapshot.info)]}
+    output = eng.exec_group(group)
+    assert output is not None, group.refusal
+    if device_name == "cuda":
+        backend.synchronize()
+    else:
+        assert launches == [1]
+    assert output[0].check_stop_buffers[RUN_COUNTS].tolist() == [3]
+    assert output[1].check_stop_buffers[RUN_COUNTS].tolist() == [1]
+    assert output[1].check_stop_buffers[STREAM_COUNTS].tolist() == [1]
+    assert output[1].row_outputs["x"][0, 0].item() == 42
+    source.put_positions([0, 1])
+    final = int(output[1].check_stop_buffers[STREAM_TRANSITION][0])
+    consumed = source.settle_window(snapshot.reservation, 1, final_transition=final)
+    assert consumed.released == [0, 1] and not consumed.is_final
+    a_output = eng.collect_group_outputs(a, 3, {2: 3})
+    b_output = eng.collect_group_outputs(b, 1, {2: 1})
+    assert a_output.per_rid_outputs[2]["x"][0].shape[1] == 3
+    assert b_output.per_rid_outputs[2]["x"][0].item() == 42
+    eng.release_group(group)
+    assert not source.producer_done, "a stopped producer Loop is not conductor EOF"

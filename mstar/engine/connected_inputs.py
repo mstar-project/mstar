@@ -15,6 +15,8 @@ from typing import Any, Collection, Iterator
 import torch
 from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode
 
+from mstar.streaming.stream_buffer import StreamChunkInfo
+
 _ACTIVE: ContextVar["ConnectedInputs | None"] = ContextVar("connected_inputs", default=None)
 
 
@@ -52,6 +54,10 @@ class ConnectedInputs(FakeTensorMode):
         original = tuple(getattr(batch, name) for name in names)
 
         def copy_data(value, active):
+            # Preparation sees ordinary chunk metadata, never the owner's
+            # mutable policy snapshots. The real receipt remains on the batch.
+            if isinstance(value, StreamChunkInfo):
+                value = value._replace(reservation=None)
             kind = type(value)
             if (value is None or kind in (bool, int, float, str, bytes, torch.dtype, torch.device)
                     or isinstance(value, Enum)):
@@ -123,7 +129,8 @@ class ConnectedInputs(FakeTensorMode):
             "aten.alias.default", "aten.detach.default", "aten.view.default",
             "aten._unsafe_view.default", "aten.unsqueeze.default",
             "aten.squeeze.default", "aten.squeeze.dim", "aten.squeeze.dims",
-            "aten.as_strided.default", "prims.view_of.default",
+            "aten.as_strided.default", "prims.view_of.default", "prims.split_dim.default",
+            "prims.collapse_view.default",
         }
         if name in aliases:
             source = args[0]
@@ -157,6 +164,38 @@ class ConnectedInputs(FakeTensorMode):
         if is_dataclass(value) and not isinstance(value, type):
             return any(self.contains(getattr(value, f.name)) for f in fields(value))
         return False
+
+    def same(self, left: Any, right: Any) -> bool:
+        """Whether two prepared choices have the same host meaning and real values.
+
+        Future tensors are equal only as structural recipes over the same
+        bindings. Independent tensors must actually agree, not merely fit the
+        same capture. Opaque equality methods are never called speculatively.
+        """
+        if type(left) is not type(right):
+            return False
+        if isinstance(left, FakeTensor):
+            a, b = self._parts(left), self._parts(right)
+            return (left.shape == right.shape and left.dtype == right.dtype and left.device == right.device
+                    and len(a) == len(b) and all(
+                        self.same(self.bindings[x], self.bindings[y]) if x[0] == y[0] == "real" else x == y
+                        for x, y in zip(a, b, strict=True)
+                    ))
+        if isinstance(left, torch.Tensor):
+            return (left.shape == right.shape and left.dtype == right.dtype and left.device == right.device
+                    and torch.equal(left, right))
+        if (left is None or type(left) in (bool, int, float, str, bytes, torch.dtype, torch.device)
+                or isinstance(left, Enum)):
+            return left == right
+        if type(left) in (dict, MappingProxyType):
+            return left.keys() == right.keys() and all(self.same(left[k], right[k]) for k in left)
+        if isinstance(left, (tuple, list)):
+            return len(left) == len(right) and all(self.same(a, b) for a, b in zip(left, right, strict=True))
+        if is_dataclass(left) and not isinstance(left, type):
+            return all(self.same(getattr(left, f.name), getattr(right, f.name)) for f in fields(left))
+        if type(left) in (set, frozenset) and all(type(v) in (str, int) for v in left | right):
+            return left == right
+        self.refuse(f"connected alternatives cannot compare {type(left).__name__}")
 
     def require_real(self, value: Any, where: str) -> None:
         if self.contains(value):

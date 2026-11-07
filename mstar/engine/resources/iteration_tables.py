@@ -39,6 +39,11 @@ if TYPE_CHECKING:
 # a request's rows take a multiple of this, so a freed extent fits the next request of about its size
 _EXTENT_ROWS = 64
 
+# Semantic stream progress travels with the ordinary completed host-row copy;
+# model execution counts remain DeviceRun's separate resource receipt.
+STREAM_COUNTS = "__stream_counts__"
+STREAM_TRANSITION = "__stream_transition__"
+
 
 @dataclass
 class IterationTablesSpec(NodeResourceSpec):
