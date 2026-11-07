@@ -36,6 +36,8 @@ from mstar.engine.resources.kv.cache import PageAllocator  # noqa: E402
 from mstar.utils.containers import RecentSet  # noqa: E402
 from mstar.utils.ipc_format import MessageSource, RemoveRequest, WorkerMessageType  # noqa: E402
 from mstar.worker import worker as worker_mod  # noqa: E402
+from mstar.worker.micro_scheduler import ScheduledBatch  # noqa: E402
+from mstar.worker.rebuild import Rebuilds  # noqa: E402
 from mstar.worker.stream_buffers import StreamBufferManager  # noqa: E402
 from mstar.worker.worker import Worker  # noqa: E402
 
@@ -54,11 +56,8 @@ class _Stop(BaseException):
 
 def _batch(seq: int, rids: list[int]):
     """A step's scheduled and executing halves."""
-    scheduled = SimpleNamespace(
-        node_name=NODE, graph_walk=WALK, tp_seq=seq,
-        request_to_worker_graph={rid: 0 for rid in rids},
-        chunk_ranges={}, incomplete_node_rids=set(),
-        rids_by_walk=lambda: {WALK: list(rids)},
+    scheduled = ScheduledBatch(
+        node_name=NODE, graph_walk=WALK, tp_seq=seq, request_to_worker_graph={rid: 0 for rid in rids},
     )
     executing = SimpleNamespace(
         node_name=NODE, request_ids=list(rids), admit_error=None, failed_requests={},
@@ -140,6 +139,7 @@ def _rank(
     w._pending_drains, w._draining_rids, w._reads_done_sent = set(), set(), set()
     w._removed_rids, w._unprocessed_messages = RecentSet(16), {}
     w.streaming_buffers = {}
+    w._rebuilds = Rebuilds({}, {})
     w._tp_broadcast_seq = 0
     w._tp_nospec = RecentSet(16)
     if serial:

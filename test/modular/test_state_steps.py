@@ -66,6 +66,7 @@ from mstar.engine.state.calls import ArrayHandle, SamplerHandle
 from mstar.engine.state.within_step import WithinStepHandle
 from mstar.model.base import LabelLayout, Model
 from mstar.model.submodule_base import ARNodeSubmodule, DeviceLoopback, NodeInputs, NodeSubmodule, engine_step
+from mstar.testing_utils.model import make_model
 
 SEGMENTS = [Segment(1, "main", 4), Segment(2, "main", 1)]
 _READ = Read(mask=Causal(), op=Attend(q_heads=4))
@@ -755,8 +756,7 @@ def _load_engine(monkeypatch, node, model):
 
 def test_the_engine_binds_a_nodes_handles_when_it_loads_a_model(monkeypatch):
     node = _EngineNode()
-    model = SimpleNamespace(checkpoint_path=lambda: None, preprocess_fingerprint=str, kv_labels=dict)
-    _load_engine(monkeypatch, node, model)
+    _load_engine(monkeypatch, node, make_model(checkpoint_path=lambda: None))
     assert node.declared_handles == {"kv": "LLM"}
 
 
@@ -767,7 +767,7 @@ def test_the_engine_binds_nothing_when_it_loads_no_model(monkeypatch):
 
 
 def test_a_model_that_declares_nothing_builds_no_handles():
-    assert node_handles(SimpleNamespace(declare_state=list), "LLM", {}) == {}
+    assert node_handles(make_model(), "LLM", {}) == {}
 
 
 # The label check over a real pool

@@ -22,6 +22,7 @@ from mstar.engine.resources.step import Segment, StepContext, SubmoduleStep
 from mstar.engine.state import Array, ArrayStep, Attend, Causal, KVEntry, PagedNHD, PagedNHDTarget, Read, state_op
 from mstar.engine.state.calls import ArrayHandle
 from mstar.model.submodule_base import NodeSubmodule
+from mstar.testing_utils.model import make_model
 from mstar.utils.device import DeviceCapability
 
 HEADS, DIM, PAGES, PAGE = 2, 4, 3, 8
@@ -187,7 +188,7 @@ def test_the_engine_binds_a_nodes_state_ops_with_its_handles(monkeypatch):
     engine.load_model(
         {"llm": _Node()}, [], WorkerParallelGroups(num_workers=1, global_rank=0), torch.device("cpu"),
         transfer_engine_info=None,
-        model=SimpleNamespace(checkpoint_path=lambda: None, preprocess_fingerprint=lambda: "", kv_labels=dict),
+        model=make_model(checkpoint_path=lambda: None),
     )
     assert order == [("ops", {"kv"}), ("submodule", {"kv"})]
 
