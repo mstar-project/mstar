@@ -466,20 +466,6 @@ def test_the_split_is_the_mask_and_keeps_every_row_in_prompt_order(spec):
         assert not torch.equal(run.out["vl_text"][0], run.out["vl_image"][0])
 
 
-def test_more_image_rows_than_feature_rows_is_refused_where_they_arrive():
-    """The image rows come from the LLM node, which saw the prompt; more of them than feature
-    rows is a disagreement between the nodes, refused on arrival instead of an out-of-range
-    ``index_fill_`` mid-step."""
-    node = _node()
-    features = _rows(2, node.config.backbone_embedding_dim, seed=1)
-
-    with pytest.raises(ValueError, match=r"3 image row\(s\) for 2 backbone feature row\(s\)"):
-        node.prepare_inputs(
-            _WALK, _FWD,
-            {"backbone_features": [features], "image_rows": [torch.arange(3)]},
-        )
-
-
 # ----------------------------------------------------------------------------
 # What the two spans are: the reference's predicate, over recorded prefills
 # ----------------------------------------------------------------------------

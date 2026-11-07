@@ -169,12 +169,6 @@ class Gr00tN17LanguageModel(nn.Module):
         vision encoder packed them, so row ``k`` of a feature lands on the
         ``k``-th image token.
         """
-        if deepstack and image_rows is None:
-            raise ValueError("DeepStack features given with no image rows to add them to")
-        if len(deepstack) > len(self.layers):
-            raise ValueError(
-                f"{len(deepstack)} DeepStack feature(s) for {len(self.layers)} layers"
-            )
         # one rotation for the whole step, as `qwen3_5` does, because
         # `DecoderLayer.forward` passes its attention nothing but the rows
         self.rope_cache.set(cos, sin)

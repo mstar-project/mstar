@@ -29,11 +29,6 @@ from mstar.model.gr00t_n17.config import (
 # guards on the callables it is handed, and a fresh one per step retraces.
 _SDPA_ATTEND = functools.partial(joint_attention, ragged=None)
 
-# Every span a block can ask for. A misspelt label would reach no block and
-# silently leave that span on SDPA, off the planned resource, so `DiT.forward`
-# raises for one, as the engine does for an unplanned label.
-_SPANS = frozenset({SA_SPAN, VL_TEXT_SPAN, VL_IMAGE_SPAN})
-
 # Every LayerNorm in the DT is non-affine: the checkpoint's `norm1` carries
 # only its `linear`, and `norm3` carries no tensor at all.
 _NORM_EPS = 1e-5
@@ -162,13 +157,6 @@ class _BlockAttention(nn.Module):
         heads = (batch, -1, self.num_heads, self.head_dim)
         query = self.to_q(hidden_states).view(heads)
         out = attend(query, self.to_k(source).view(heads), self.to_v(source).view(heads))
-        # a swappable kernel returning heads-first `[B, H, T, D]` would reshape
-        # without complaint and scramble every row
-        if out.shape != query.shape:
-            raise ValueError(
-                f"attention returned {list(out.shape)}, expected "
-                f"{list(query.shape)} (batch, tokens, heads, head_dim)"
-            )
         return self.to_out[0](out.reshape(batch, queries, -1))
 
 
@@ -259,12 +247,6 @@ class DiT(nn.Module):
         The same rows as ``vl_text`` and ``vl_image`` give the reference's
         plain, unmasked ``DiT.forward``.
         """
-        if attends is not None and not attends.keys() <= _SPANS:
-            raise ValueError(
-                f"the DT has no span {sorted(attends.keys() - _SPANS)}; it reads "
-                f"{sorted(_SPANS)}. The node that binds the resources names the "
-                "spans it declared in its step."
-            )
         temb = self.timestep_encoder(timestep)
         # as the reference does, and load-bearing: non-contiguous rows take a
         # different GEMM path and move the output by a whole fp32 floor

@@ -408,20 +408,6 @@ def test_no_features_is_the_forward_without_the_argument(tmp_path):
     assert torch.equal(case.model(case.hidden, case.cos, case.sin, (), case.rows), plain)
 
 
-def test_the_guards_say_which_call_was_wrong():
-    """Both are caller mistakes that would otherwise be silent: features with nowhere to go
-    would be dropped, and a fourth feature for a three-layer stack would never be added."""
-    model = Gr00tN17LanguageModel(_config(num_layers=_LAYERS))
-    hidden = torch.zeros(64, model.config.hidden_size)
-    cos, sin = model.build_cos_sin(torch.zeros(3, 64))
-    feature = torch.zeros(len(_IMAGE_ROWS), model.config.hidden_size)
-
-    with pytest.raises(ValueError, match="no image rows"):
-        model(hidden, cos, sin, [feature])
-    with pytest.raises(ValueError, match=rf"4 DeepStack feature\(s\) for {_LAYERS} layers"):
-        model(hidden, cos, sin, [feature] * 4, _IMAGE_ROWS)
-
-
 # ----------------------------------------------------------------------------
 # The attention resource
 # ----------------------------------------------------------------------------

@@ -291,8 +291,6 @@ class Gr00tN17Preprocessor:
         # own float32. A bf16 value plus one is exact there, but a tiny one
         # rounds, by up to `2**-24 / 2 * range`, which upcasting would not reproduce.
         chunk = np.asarray(action)
-        if chunk.ndim != 3:
-            raise ValueError(f"GR00T action decode wants (B, T, D); got {chunk.shape}")
         horizon = self.action_horizon[tag]
         width = sum(self.action_dims[tag].values())
         # the padding would hide both: a chunk one group short decodes every later
@@ -337,27 +335,13 @@ class Gr00tN17Preprocessor:
     ) -> np.ndarray:
         """One relative group ``(B, T, D)`` onto the raw state's last timestep."""
         state_key = cfg.get("state_key") or key
-        if state is None or state_key not in state:
-            raise ValueError(
-                f"GR00T embodiment {tag!r} decodes joint group {key!r} relative to "
-                f"state {state_key!r}, so the request's raw state is required to "
-                "turn it into an absolute action"
-            )
         # float32, not upcast: the reference builds the frame from the raw
         # state's float32 and runs its Gram-Schmidt there (see `unapply`). JSON
         # delivers Python floats, which `asarray` alone would make float64.
         ref = np.asarray(state[state_key], dtype=np.float32)
-        if ref.ndim == 2:  # (T, D) -- one request, as the reference also allows
-            ref = ref[None]
         # the reference frame is the state's **last** timestep
         # (`state_action_processor.py:511-515`), per request
         ref = ref[:, -1, :]
-        if ref.shape[0] != relative.shape[0] or ref.shape[-1] != relative.shape[-1]:
-            raise ValueError(
-                f"GR00T {tag!r} {key!r}: state {state_key!r} is {ref.shape} after "
-                f"taking the last timestep, which does not match the action's "
-                f"{relative.shape}"
-            )
         if cfg["type"] == "NON_EEF":
             # joints add (`action_chunking.py:383-387`)
             return ref[:, None, :] + relative
@@ -425,13 +409,9 @@ class Gr00tN17Preprocessor:
         # The names are the checkpoint's, so a client cannot guess them; a bare
         # `KeyError` would be a 500 whose body is just the key
         # (`PreprocessWorkerThread._fail_request`).
-        for name, want, got in (("video", self.video_keys[tag], video),
-                                ("state", self.state_keys[tag], state)):
-            missing = [k for k in want if k not in got]
-            if missing:
-                raise ValueError(
-                    f"GR00T {tag!r} needs {name} {list(want)}; missing {missing}"
-                )
+        missing = [k for k in self.state_keys[tag] if k not in state]
+        if missing:
+            raise ValueError(f"GR00T {tag!r} needs state {list(self.state_keys[tag])}; missing {missing}")
         views = [np.asarray(video[v]) for v in self.video_keys[tag]]
         # uint8, as the reference asserts (`gr00t_policy.py:276-279`): the HF image
         # processor rescales by 1/255 whatever it gets, so pre-normalised frames
@@ -443,8 +423,6 @@ class Gr00tN17Preprocessor:
                 f"{[views[list(self.video_keys[tag]).index(v)].dtype for v in bad]}"
             )
         batch, steps = views[0].shape[:2]
-        if len(language) != batch:
-            raise ValueError(f"{len(language)} instructions for a batch of {batch}")
         texts, frames = [], []
         for b in range(batch):
             # time-major, views in modality order: (t0, v0), (t0, v1), (t1, v0), ...

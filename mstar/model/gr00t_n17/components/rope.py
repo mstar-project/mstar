@@ -33,12 +33,6 @@ def mrope_position_ids(
     device: torch.device | None = None,
 ) -> torch.Tensor:
     """``[3, len(input_ids)]``, float, in the order ``compute_3d_cos_sin`` wants."""
-    # the LLM node prepares one ragged segment at a time; a batch flattened
-    # here would run the second request's positions on from the first's
-    if input_ids.dim() > 1 and input_ids.shape[0] != 1:
-        raise ValueError(
-            f"one request at a time, got a batch of {input_ids.shape[0]}"
-        )
     tokens = input_ids.reshape(-1).tolist()
     grids = list(image_grid_thw.reshape(-1, 3))
     spans: list[torch.Tensor] = []

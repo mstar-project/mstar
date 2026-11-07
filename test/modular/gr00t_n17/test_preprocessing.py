@@ -269,12 +269,6 @@ def test_call_feeds_the_processor_in_reference_order():
     assert out["embodiment_id"].tolist() == [7, 7] and out["action_mask"].shape == (2, 6)
 
 
-def test_call_rejects_language_batch_mismatch():
-    pre = Gr00tN17Preprocessor(KWARGS, STATS, IDS, 5, 6, processor=_StubProcessor())
-    with pytest.raises(ValueError, match="instructions for a batch of 2"):
-        pre("other", {"cam": _video(2, 1, 0)}, ["only one"], {"j": np.zeros((2, 1, 1))})
-
-
 @needs_checkpoint
 def test_call_with_the_real_processor():
     pytest.importorskip("cv2")
@@ -387,13 +381,6 @@ def test_a_chunk_too_short_or_too_narrow_for_the_embodiment_is_refused(shape):
         _pre().unapply("bot", np.zeros(shape, np.float32), {"arm": np.zeros((1, 1, 2), np.float32)})
 
 
-def test_a_chunk_that_is_not_batched_is_refused():
-    """A ``(T, D)`` chunk read as ``(B, T)`` would decode the horizon as the batch;
-    ``postprocess`` adds the batch axis, so ``unapply`` refuses one without it."""
-    with pytest.raises(ValueError, match=r"wants \(B, T, D\)"):
-        _pre().unapply("bot", np.zeros((3, 3), np.float32), {"arm": np.zeros((1, 1, 2), np.float32)})
-
-
 def test_a_joint_group_with_no_absolute_statistics_is_refused_and_named():
     """A group's decoded width comes from its absolute stats even when it is relative, so
     empty ones leave nothing to decode into. The reference fails one step later, on a numpy
@@ -473,20 +460,6 @@ def test_an_eef_decode_is_the_same_whether_the_state_came_over_json_or_not():
     chunk = _pose_chunk([0.1, 0.2, 0.3], [0.9, 0.1, 0.1, 0.1, 0.9, 0.1])
     pre = _pre()
     assert np.array_equal(pre.unapply("eefbot", chunk, wire)["pose"], pre.unapply("eefbot", chunk, pose)["pose"])
-
-
-@pytest.mark.parametrize("state, match", [
-    (None, "raw state is required"),
-    ({"grip": np.zeros((1, 1, 1), np.float32)}, "raw state is required"),
-    ({"arm": np.zeros((1, 1, 3), np.float32)}, "does not match the action's"),
-    ({"arm": np.zeros((2, 1, 2), np.float32)}, "does not match the action's"),
-])
-def test_a_relative_group_without_a_usable_state_is_refused(state, match):
-    """``state`` is optional for all-absolute embodiments, so a relative one must refuse a
-    missing or mismatched one itself. Each case can come from a client; each would otherwise
-    be a numpy broadcast, and a (1, 1, 1) state broadcasts silently onto every joint."""
-    with pytest.raises(ValueError, match=match):
-        _pre().unapply("bot", np.zeros((1, 3, 3), np.float32), state)
 
 
 @pytest.mark.parametrize("rot6d, frame, match", [

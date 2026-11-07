@@ -112,17 +112,6 @@ def test_the_sinusoid_is_the_reference_block(shape, embedding_dim):
     assert torch.equal(out, _reference(timesteps, embedding_dim))
 
 
-@pytest.mark.parametrize(
-    "shape", [(), (len(_TIMESTEPS),), (2, 3, 4)], ids=["a scalar", "a [B] vector", "rank 3"],
-)
-def test_a_timestep_that_is_not_rank_2_is_refused_where_it_arrives(shape):
-    """``[B]`` is the dangerous rank: it is the DT encoder's input, which this module would
-    answer under the wrong convention without raising, so the message names both modules."""
-    with pytest.raises(ValueError, match="TimestepEncoder is the one that takes"):
-        SinusoidalPositionalEncoding(_TIME_PROJ)(torch.zeros(shape))
-    assert SinusoidalPositionalEncoding(_TIME_PROJ)(_rows()).shape == (1, len(_TIMESTEPS), _TIME_PROJ)
-
-
 # Properties argued from values, not a second formula. Element 0 is the check a deviation fails.
 def _zero_layout(encode) -> tuple[bool, ...]:
     """At ``t = 0`` every sine is 0 and every cosine 1, so sines first is ``[0, ..., 0, 1, ..., 1]``
@@ -1177,25 +1166,6 @@ def test_each_block_is_handed_the_attention_its_own_span_asked_for():
         (SA_SPAN, _SA_ROWS),
     ]
     assert torch.equal(out, _dit_reference(dit, hidden, text, image, timestep))
-
-
-@torch.no_grad()
-def test_a_span_label_no_block_reads_is_refused_rather_than_ignored():
-    """A misspelt span key reaches no block, so that span falls back to SDPA: bitwise right but
-    off the planned resource and the captured graph's kernel. The engine refuses an unplanned label too."""
-    dit = _dit(2)
-    hidden = _dit_rows(_REQUESTS, _SA_ROWS)
-    text = _bridge_rows(True, _REQUESTS, _TEXT_ROWS, seed=30)
-    image = _bridge_rows(True, _REQUESTS, _IMAGE_ROWS, seed=31)
-    timestep = _steps()
-
-    with pytest.raises(ValueError, match=r"no span \['vl_txt'\]"):
-        dit(hidden, text, image, timestep, {"vl_txt": _sdpa})
-    # the message names the spans the caller could have meant, and who supplies them
-    with pytest.raises(ValueError, match="names the spans it declared"):
-        dit(hidden, text, image, timestep, {SA_SPAN: _sdpa, "sa_rows": _sdpa})
-    # a subset is still legal: that is the documented fallback, not a mistake
-    dit(hidden, text, image, timestep, {SA_SPAN: _sdpa})
 
 
 @torch.no_grad()

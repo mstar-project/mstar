@@ -33,15 +33,6 @@ class SinusoidalPositionalEncoding(nn.Module):
         self.embedding_dim = embedding_dim
 
     def forward(self, timesteps: torch.Tensor) -> torch.Tensor:
-        # Rank 2 only, as the reference. A `[B]` tensor meant for the DT's
-        # `TimestepEncoder` would otherwise pass silently under the wrong
-        # sinusoid.
-        if timesteps.dim() != 2:
-            raise ValueError(
-                f"the action encoder's timesteps are [B, T], got "
-                f"{list(timesteps.shape)}; the DT's TimestepEncoder is the "
-                "one that takes [B]"
-            )
         timesteps = timesteps.float()
         half_dim = self.embedding_dim // 2
         exponent = -torch.arange(

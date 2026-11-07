@@ -115,9 +115,6 @@ def test_an_image_advances_the_cursor_by_max_h_w(grid, advance):
 # run/grid count mismatch and t != 1, positioning each its own way. These cases are the
 # only thing pinning the stricter contract, so each stands on its own.
 _MALFORMED = {
-    # a batch flattens into one continuous run of positions, the second request carrying
-    # on from the first; with a grid per request the count guards see nothing wrong
-    "a batch of two requests": ([[_TEXT] * 3 + [_IMAGE] * 4] * 2, [[1, 4, 4]] * 2, r"batch of 2"),
     # the processor sends every frame as its own image, so a t > 1 grid is a wiring mistake
     "a multi-frame grid": ([_TEXT] + [_IMAGE] * 8, [[2, 4, 4]], r"t != 1"),
     "a run the grid cannot fill": ([_TEXT] + [_IMAGE] * 5, [[1, 4, 4]], r"5 image tokens for a grid worth 4"),

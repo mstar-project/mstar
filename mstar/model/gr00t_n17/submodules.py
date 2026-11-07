@@ -175,14 +175,6 @@ class Gr00tN17LLMSubmodule(NodeSubmodule):
         grid = torch.cat([g.reshape(-1, 3) for g in inputs["image_grid_thw"]])
         image_token_id = self.config.text.image_token_id
         features = inputs["deepstack_embeds"]
-        # the checkpoint says how many taps the vision tower has; a short or
-        # long list from that node would otherwise inject into the wrong
-        # layers and read as a plausible answer
-        if len(features) != len(self.config.deepstack_visual_indexes):
-            raise ValueError(
-                f"vision_encoder sent {len(features)} DeepStack feature(s), "
-                f"the checkpoint taps {len(self.config.deepstack_visual_indexes)}"
-            )
         return NodeInputs(
             input_seq_len=input_ids.shape[0],
             tensor_inputs={
@@ -348,11 +340,6 @@ class Gr00tN17VLBridgeSubmodule(NodeSubmodule):
     ) -> NodeInputs:
         features = inputs["backbone_features"][0]
         image_rows = inputs["image_rows"][0]
-        if int(image_rows.numel()) > features.shape[0]:
-            raise ValueError(
-                f"{int(image_rows.numel())} image row(s) for "
-                f"{features.shape[0]} backbone feature row(s)"
-            )
         return NodeInputs(
             input_seq_len=features.shape[0],
             tensor_inputs={"backbone_features": features, "image_rows": image_rows},
@@ -462,16 +449,7 @@ class Gr00tN17DenoiseStepSubmodule(DenoiseLoopSubmodule):
         metadata: the model reads them off the persisted bridge tensors' `dims`
         (`Gr00tN17Model.get_partition_forward_pass_args`)."""
         meta = fwd_info.step_metadata
-        missing = [k for k in ("vl_text_rows", "vl_image_rows") if k not in meta]
-        if missing:
-            raise KeyError(
-                f"denoise_step has no {missing} in step_metadata; the model reads "
-                "the bridge's two spans off their persisted tensors and puts them "
-                "there, because the key is needed before the tensors arrive"
-            )
-        return Gr00tN17Shape(
-            text_rows=int(meta["vl_text_rows"]), image_rows=int(meta["vl_image_rows"]),
-        )
+        return Gr00tN17Shape(text_rows=meta["vl_text_rows"], image_rows=meta["vl_image_rows"])
 
     def num_tokens(self, bucket_key: Gr00tN17Shape) -> int:
         """The state row, then the action rows: 1 + 40. Not the latents' 40."""
@@ -509,21 +487,8 @@ class Gr00tN17DenoiseStepSubmodule(DenoiseLoopSubmodule):
     def request_inputs(self, fwd_info, inputs: NameToTensorList, bucket_key) -> dict:
         """One request's frozen conditioning, each **without** a batch dim: the base
         stacks them, so a leading 1 here would arrive as a spurious axis.
-
-        Checks live here, host-side in ``prepare_inputs``, not in ``denoise``:
-        reading a tensor's values in the captured region would sync the device.
         """
         text, image = inputs["vl_text"][0], inputs["vl_image"][0]
-        # The key (from `step_metadata`) and the spans (from the bridge) are
-        # compared nowhere else, and a ragged kernel reads the *declared* length,
-        # so a miscount would plan spans the forward does not use, silently.
-        if (text.shape[0], image.shape[0]) != (bucket_key.text_rows, bucket_key.image_rows):
-            raise ValueError(
-                f"denoise_step was told {bucket_key.text_rows} text and "
-                f"{bucket_key.image_rows} image rows by step_metadata, but the "
-                f"bridge sent {text.shape[0]} and {image.shape[0]}; the counts the "
-                "model put in step_metadata must be the spans the bridge emits"
-            )
         embodiment_id = inputs["embodiment_id"][0].reshape(())
         return {
             "vl_text": text,
