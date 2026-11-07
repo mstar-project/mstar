@@ -1018,6 +1018,9 @@ def test_streamed_engine_composes_independent_bodies_and_owner_reads(device_name
                 mgmt.submodule.REPEAT_CARRIES = {"x": CarryPair("other", "x")}
         if mode == "direct_error" and name == "b":
             class DependentTail(type(mgmt.submodule)):
+                def filter_batched_output(self, *args, **kwargs):
+                    pytest.fail("failed predecessor cannot run a dependent output filter")
+
                 def postprocess(self, *args, **kwargs):
                     pytest.fail("failed predecessor cannot run a successful dependent tail")
             mgmt.submodule.__class__ = DependentTail

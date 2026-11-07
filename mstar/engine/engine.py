@@ -3114,7 +3114,7 @@ class Engine:
             batch.request_ids, node_name=batch.node_name,
             graph_walk=batch.graph_walk, request_walks=batch.step_context.request_walks,
         )
-        if width == 0:
+        if width == 0 or all(rid in batch.failed_requests for rid in batch.request_ids):
             batch.outputs = BatchedModelOutput(check_stop_buffers=semantic, row_request_ids=tuple(batch.request_ids))
             return batch.outputs
         mgmt, lease = self._submodules[batch.node_name], batch.step_context.slot_lease
