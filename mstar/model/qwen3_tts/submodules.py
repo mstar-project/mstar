@@ -1041,7 +1041,6 @@ class CodecSubmodule(ARNodeSubmodule):
         """
         del graph_walk, kwargs
         chunk = self._codec_chunk(input_metadata)
-        state = self.request_state(fwd_info.rid_handle)
         received = inputs.get("codec_tokens")
         if received:
             codes = received[0].to(device=self.get_device(), dtype=torch.long)
@@ -1057,7 +1056,11 @@ class CodecSubmodule(ARNodeSubmodule):
         frames = codes.shape[0]
         context = min(chunk.context_items if chunk is not None else 0, frames)
         bucket = self._bucket(max(frames, 1))
-        state.add("codec_bucket", bucket)   # graph-key fallback when a caller has no stream chunk info
+        if chunk is None:
+            # Only unannotated callers need the legacy graph-key fallback.
+            # A real stream chunk already owns its bucket facts; preparing an
+            # alternative must not overwrite unrelated request state.
+            self.request_state(fwd_info.rid_handle).add("codec_bucket", bucket)
         # The chunk's geometry rides with this pass: under speculative
         # scheduling the next chunk of the same request is prepared before
         # this one is postprocessed, so request state would be overwritten.

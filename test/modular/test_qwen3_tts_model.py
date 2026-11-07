@@ -2107,6 +2107,8 @@ def test_qwen3_tts_fused_snake_reads_a_4d_input_in_any_layout():
 
 
 def test_qwen3_tts_codec_takes_every_item_as_a_frame_and_pads_to_capture_shape():
+    from mstar.engine.connected_inputs import ConnectedInputs
+
     config = _tiny_model_config()
     submodule = _tiny_codec(config)
     codes = torch.tensor([
@@ -2115,14 +2117,15 @@ def test_qwen3_tts_codec_takes_every_item_as_a_frame_and_pads_to_capture_shape()
         [9, 10, 11, 12],
     ])
 
-    prepared = submodule.prepare_inputs(
-        "codec_chunk",
-        SimpleNamespace(request_id="request", rid_handle="request"),
-        {"codec_tokens": [codes]},
-        input_metadata=InputMetadata(stream_chunks={"codec_tokens": StreamChunkInfo(
-            start_offset=1, context_items=1, num_items=3, is_final=True,
-        )}),
-    )
+    with ConnectedInputs({}).preparing():
+        prepared = submodule.prepare_inputs(
+            "codec_chunk",
+            SimpleNamespace(request_id="request", rid_handle="request"),
+            {"codec_tokens": [codes]},
+            input_metadata=InputMetadata(stream_chunks={"codec_tokens": StreamChunkInfo(
+                start_offset=1, context_items=1, num_items=3, is_final=True,
+            )}),
+        )
 
     # Three frames take the smallest captured width (3), the one
     # `cg_key_info` picks from the chunk info alone; preprocess lays the
@@ -2134,7 +2137,7 @@ def test_qwen3_tts_codec_takes_every_item_as_a_frame_and_pads_to_capture_shape()
     )["codec_tokens"]
     assert packed.shape == (1, 4, 3)
     assert packed[0].t().tolist() == codes.tolist()
-    assert submodule.request_state("request")["codec_bucket"] == 3
+    assert "request" not in submodule.request_states
     assert submodule.cg_key_info("codec_chunk", {"request": None}, {
         "request": InputMetadata(stream_chunks={"codec_tokens": StreamChunkInfo(1, 1, 3, True)}),
     }) == 3
