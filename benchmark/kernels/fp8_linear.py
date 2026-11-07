@@ -2,8 +2,9 @@
 
 Each bucket times every kernel that runs on this GPU (w8a16 at its built-in tile and at candidate tiles up to
 ``W8A16_SWEEP_MAX`` tokens, flashinfer's swapAB GEMM and cuBLAS's block-scaled GEMM on SM90, flashinfer's groupwise
-GEMM on sm_100 / sm_103 for a shape in whole 128-row blocks) inside a CUDA graph that calls
-the linear once per weight copy in a rotation, so the weights come from HBM rather than L2, as in a decode step.
+GEMM on sm_100 / sm_103 for a shape in whole 128-row blocks, the weight dequantized to bf16 for cuBLAS) inside a CUDA
+graph that calls the linear once per weight copy in a rotation, so the weights come from HBM rather than L2, as in a
+decode step.
 A candidate competes only when its output is within ``MAX_REL_L2`` of the bf16 product of the dequantized weight
 (the kernels that quantize activations to e4m3 per 128 columns sit a few percent away; a broken tile far more).
 
@@ -77,7 +78,8 @@ class Fp8LinearSweep:
 
     def _runs(self, choice: Choice) -> bool:
         whole = (self.n * (2 if self.glu else 1)) % 128 == 0
-        return (choice.impl == "w8a16" or (choice.impl == "flashinfer" and dense_fp8._FI_OK.get(self.device))
+        return (choice.impl in ("w8a16", "dequant")
+                or (choice.impl == "flashinfer" and dense_fp8._FI_OK.get(self.device))
                 or (choice.impl == "cublas" and dense_fp8._W8A8_OK.get(self.device))
                 or (choice.impl == "groupwise" and dense_fp8._BW_OK.get(self.device) and whole))
 
@@ -113,7 +115,7 @@ class Fp8LinearSweep:
 
         result = BucketResult(bucket=m, current=current, current_us=us_of(current), default_us=us_of(default),
                               best=None, best_us=float("nan"))
-        options = [Choice("w8a16"), Choice("flashinfer"), Choice("cublas"), Choice("groupwise")]
+        options = [Choice("w8a16"), Choice("flashinfer"), Choice("cublas"), Choice("groupwise"), Choice("dequant")]
         if m <= W8A16_SWEEP_MAX:
             options += [Choice("w8a16", cfg) for cfg in w8a16_candidates(m, self.k, self.quick)]
         for choice in options:

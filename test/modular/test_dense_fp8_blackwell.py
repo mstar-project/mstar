@@ -16,6 +16,7 @@ DEV = torch.device("cuda", 0)
 def blackwell(monkeypatch):
     """A device whose probes found only the groupwise GEMM (sm_100), with no table rows for it."""
     monkeypatch.setitem(dense_fp8._BW_OK, DEV, True)
+    monkeypatch.setitem(dense_fp8._BLACKWELL, DEV, True)
     monkeypatch.setitem(dense_fp8._FI_OK, DEV, False)
     monkeypatch.setitem(dense_fp8._W8A8_OK, DEV, False)
     monkeypatch.setattr(dense_fp8, "_table_rows", lambda *a: None)
@@ -30,6 +31,40 @@ def test_blackwell_takes_the_groupwise_gemm_at_every_token_count(blackwell, m):
 def test_a_partial_row_block_and_another_block_keep_w8a16(blackwell):
     assert dense_fp8._choose(DEV, 2624, 6144, False, 8) == ("w8a16", None)  # GLM's q_a + kv_a, 2624 rows
     assert dense_fp8._choose(DEV, 6144, 2048, False, 8, block_size=(32, 32)) == ("w8a16", None)
+    # above the threshold they take the dequantized bf16 GEMM instead
+    assert dense_fp8._choose(DEV, 2624, 6144, False, 512) == ("dequant", None)
+
+
+CPU = torch.device("cpu")
+
+
+@pytest.mark.parametrize("right", ["K", "MN", None], ids=["K-major", "MN-major", "neither"])
+def test_the_probe_takes_the_first_scale_layout_that_matches_the_dequantized_product(monkeypatch, right):
+    """The probe runs the GEMM in each layout against the dequantized product (activations quantized as the
+    kernel's caller does) and records the first within its bound; a kernel that runs but is wrong in every
+    layout (B300: ~20% off) is refused, as is one that raises."""
+    from mstar.utils.fp8_block import dequantize_fp8_block_weight
+
+    def fake_bw(x, w, s, glu, layout):
+        if layout == "K" and right is None:
+            raise RuntimeError("no cubin")
+        groups = x.float().reshape(x.shape[0], -1, 128)
+        xs = groups.abs().amax(dim=-1, keepdim=True).clamp_min(1e-10) / 448.0
+        xq = ((groups / xs).clamp(-448, 448).to(FP8_DTYPE).float() * xs).reshape(x.shape)
+        out = xq @ dequantize_fp8_block_weight(w.view(FP8_DTYPE), s, (128, 128), torch.float32).T
+        return out if layout == right else out * 1.2
+
+    monkeypatch.setattr(dense_fp8, "_bw", fake_bw)
+    monkeypatch.setitem(dense_fp8._BLACKWELL, CPU, True)
+    monkeypatch.setattr(dense_fp8, "_BW_LAYOUT", {})
+    assert dense_fp8._probe_bw(CPU) is (right is not None)
+    assert dense_fp8._BW_LAYOUT.get(CPU) == right
+
+
+def test_the_probe_never_runs_off_blackwell(monkeypatch):
+    monkeypatch.setitem(dense_fp8._BLACKWELL, CPU, False)
+    monkeypatch.setattr(dense_fp8, "_bw", lambda *a: pytest.fail("probed off Blackwell"))
+    assert dense_fp8._probe_bw(CPU) is False
 
 
 def test_without_the_groupwise_gemm_the_dispatch_is_unchanged(monkeypatch):

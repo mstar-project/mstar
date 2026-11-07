@@ -41,9 +41,17 @@ _FI_MAX_TOKENS = 512
 _W8A8_API = hasattr(F, "scaled_mm") and hasattr(F, "ScalingType")
 _W8A8_OK: dict[torch.device, bool] = {}
 _FI_OK: dict[torch.device, bool] = {}
-# flashinfer's Blackwell (sm_100 / sm_103) groupwise fp8 GEMM, probed per device: neither of the SM90 paths above
-# (flashinfer's swapAB GEMM, cuBLAS's block-scaled scaled_mm) runs there, so without it Blackwell is all w8a16
+# flashinfer's Blackwell (sm_100 / sm_103) groupwise fp8 GEMM, probed per device against the dequantized product
+# (a wrong layout runs and is off by ~20%): neither SM90 path above runs there. _BW_LAYOUT holds the scale
+# layout that passed.
 _BW_OK: dict[torch.device, bool] = {}
+_BW_LAYOUT: dict[torch.device, str] = {}
+# Blackwell (sm_100 / sm_103), set per device by reserve(): neither block-fp8 GEMM above runs there, and w8a16
+# is ~10x slower than bf16 from 512 tokens (B300: Qwen3.5-27B's 5120 x 4352 down, 187 vs 17 us). So above
+# _DEQUANT_MIN_TOKENS the weight is dequantized to bf16 per call and cuBLAS runs it: exact up to the fp8 weights,
+# a transient bf16 copy of one weight, no resident one.
+_BLACKWELL: dict[torch.device, bool] = {}
+_DEQUANT_MIN_TOKENS = 64
 # Split-K arrival counters, one per output tile; every launch leaves them at zero.
 _COUNTERS: dict[torch.device, torch.Tensor] = {}
 _MAX_TILES = 4096
@@ -79,6 +87,8 @@ FP8_LINEAR = register(KernelOp(
         Impl("groupwise", _bw_unavailable,
              doc="flashinfer's Blackwell (sm_100 / sm_103) groupwise GEMM, x quantized per 128 columns; N in "
                  "whole 128-row blocks"),
+        Impl("dequant", _w8a16_unavailable,
+             doc="the weight dequantized to bf16 per call, then cuBLAS's bf16 GEMM (exact up to the fp8 weights)"),
     ),
     doc="a block-fp8 (128 x 128 scales) dense linear: N outputs (per half with glu), K inputs, glu 1 for "
         "a [gate; up] weight's SwiGLU; rows by token count",
@@ -273,6 +283,8 @@ def reserve(device: torch.device | str) -> None:
         _COUNTERS[device] = torch.zeros(_MAX_TILES, dtype=torch.int32, device=device)
         _FI_OK[device] = _probe_fi(device)
         _W8A8_OK[device] = _probe_w8a8(device)
+        capability = current_platform.cuda_capability(device)
+        _BLACKWELL[device] = capability is not None and capability[0] == 10
         _BW_OK[device] = _probe_bw(device)
 
 
@@ -291,19 +303,52 @@ def _probe_w8a8(device: torch.device) -> bool:
         return False
 
 
+# Scale layouts the groupwise GEMM may take, tried in order by its probe. "K": the activation scales (M, K / 128)
+# and the weight's (N / 128, K / 128), both row-major; "MN": both transposed, (K / 128, M) and (K / 128, N / 128).
+_BW_LAYOUTS = ("K", "MN")
+# The probe's bound: its reference quantizes the activations as the kernel does, so a right layout is off by
+# rounding only (~1e-3) and a wrong one by ~20% (B300, item 01b).
+_BW_PROBE_MAX_REL_L2 = 0.02
+
+
 def _probe_bw(device: torch.device) -> bool:
-    """flashinfer's Blackwell groupwise fp8 GEMM runs here (and is JIT-loaded before any capture)."""
-    capability = current_platform.cuda_capability(device)
-    if capability is None or capability[0] != 10:
+    """flashinfer's Blackwell groupwise fp8 GEMM runs here and matches the dequantized product in one of
+    _BW_LAYOUTS (recorded in _BW_LAYOUT); loaded before any capture. Else Blackwell takes w8a16 up to
+    _DEQUANT_MIN_TOKENS and the dequantized bf16 GEMM above."""
+    if not _BLACKWELL.get(device):
         return False
-    try:
-        x = torch.zeros(4, 128, dtype=torch.bfloat16, device=device)
-        _bw(x, torch.zeros(128, 128, dtype=torch.uint8, device=device), torch.ones(1, 1, device=device), False)
-        return True
-    except Exception as exc:  # noqa: BLE001 - not built for this GPU / flashinfer version: w8a16 instead
-        logger.warning("flashinfer's Blackwell groupwise fp8 GEMM unavailable (%r); dense fp8 takes the w8a16 "
-                       "kernel at every token count", exc)
-        return False
+    from mstar.utils.fp8_block import dequantize_fp8_block_weight
+
+    fp8_max = torch.finfo(FP8_DTYPE).max
+    gen = torch.Generator(device=device).manual_seed(0)
+    n, k = 256, 512
+    tiles = (torch.randn(n, k, generator=gen, device=device) * 0.02).reshape(n // 128, 128, k // 128, 128)
+    scale = (tiles.abs().amax(dim=(1, 3)) / fp8_max).clamp_min(1e-12).contiguous()
+    q = (tiles / scale[:, None, :, None]).to(FP8_DTYPE).reshape(n, k)
+    x = torch.randn(5, k, generator=gen, device=device).to(torch.bfloat16)  # 5 rows: the padding path too
+    # x quantized per 128 columns as the kernel's caller does (amax / e4m3 max, an eps floor)
+    groups = x.float().reshape(5, k // 128, 128)
+    xs = groups.abs().amax(dim=-1, keepdim=True).clamp_min(1e-10) / fp8_max
+    xq = ((groups / xs).clamp(-fp8_max, fp8_max).to(FP8_DTYPE).float() * xs).reshape(5, k)
+    want = xq @ dequantize_fp8_block_weight(q, scale, (128, 128), torch.float32).T
+    outcome = {}
+    for layout in _BW_LAYOUTS:
+        try:
+            got = _bw(x, q.view(torch.uint8), scale, False, layout).float()
+            err = ((got - want).norm() / want.norm()).item() if torch.isfinite(got).all() else float("inf")
+        except Exception as exc:  # noqa: BLE001 - not built for this GPU / flashinfer version
+            outcome[layout] = repr(exc)[:200]
+            continue
+        outcome[layout] = round(err, 5)
+        if err <= _BW_PROBE_MAX_REL_L2:
+            _BW_LAYOUT[device] = layout
+            logger.info("flashinfer's Blackwell groupwise fp8 GEMM passed its probe on %s with %s-major scales "
+                        "(relative error %.2g)", device, layout, err)
+            return True
+    logger.warning("flashinfer's Blackwell groupwise fp8 GEMM failed its probe on %s (relative error by scale "
+                   "layout: %s); dense fp8 takes w8a16 up to %d tokens and the dequantized bf16 GEMM above",
+                   device, outcome, _DEQUANT_MIN_TOKENS)
+    return False
 
 
 def _probe_fi(device: torch.device) -> bool:
@@ -441,22 +486,24 @@ def _w8a8(x, w, s, block_size, glu):
     return out
 
 
-def _bw(x, w, s, glu):
+def _bw(x, w, s, glu, layout=None):
     """flashinfer's Blackwell groupwise fp8 GEMM (CUTLASS, sm_100 / sm_103): x group-quantized to e4m3 per 128
-    columns, its scales K-major and column-major ``(M, K / 128)`` as the kernel wants them (the token count padded
-    to a multiple of 4), the weight's ``(N / 128, K / 128)`` scales row-major as stored. Two SMs per MMA from 256
-    tokens, as flashinfer recommends."""
+    columns (the token count padded to a multiple of 4), the scales in ``layout`` (default: the one the device's
+    probe passed, see _BW_LAYOUTS). Two SMs per MMA from 256 tokens, as flashinfer recommends."""
     from flashinfer.gemm import gemm_fp8_nt_groupwise
 
     from mstar.utils.fused_moe.kernels import act_and_mul_triton
     from mstar.utils.fused_moe.prefill import _group_quant
 
+    layout = layout or _BW_LAYOUT.get(x.device, "K")
     M = x.shape[0]
     xp = F.pad(x, (0, 0, 0, -M % 4)) if M % 4 else x
     a, a_scale = _group_quant(xp, 128)
-    h = gemm_fp8_nt_groupwise(a, w.view(FP8_DTYPE), a_scale.t().contiguous().t(), s,
-                              scale_major_mode="K", mma_sm=2 if M >= 256 else 1,
-                              scale_granularity_mnk=(1, 128, 128), out_dtype=x.dtype)[:M]
+    if layout == "MN":
+        a_scale, s = a_scale.t().contiguous(), s.t().contiguous()
+    h = gemm_fp8_nt_groupwise(a, w.view(FP8_DTYPE), a_scale, s, scale_major_mode=layout,
+                              mma_sm=2 if M >= 256 else 1, scale_granularity_mnk=(1, 128, 128),
+                              out_dtype=x.dtype)[:M]
     if not glu:
         return h
     out = torch.empty(M, h.shape[1] // 2, dtype=x.dtype, device=x.device)
@@ -478,6 +525,42 @@ def _fi(x, w, s, glu):
     return out
 
 
+@triton.jit
+def _dequant_kernel(w, s, out, N, K: tl.constexpr, KB: tl.constexpr, BO: tl.constexpr, BI: tl.constexpr,
+                    BN: tl.constexpr, BK: tl.constexpr):
+    """``out[n, k] = e4m3(w[n, k]) * s[n // BO, k // BI]`` over one (BN, BK) tile."""
+    n = tl.program_id(0) * BN + tl.arange(0, BN)
+    k = tl.program_id(1) * BK + tl.arange(0, BK)
+    live = (n[:, None] < N) & (k[None, :] < K)
+    q = tl.load(w + n[:, None] * K + k[None, :], mask=live, other=0).to(tl.float8e4nv, bitcast=True)
+    sc = tl.load(s + (n[:, None] // BO) * KB + k[None, :] // BI, mask=live, other=0.0)
+    tl.store(out + n[:, None] * K + k[None, :], (q.to(tl.float32) * sc).to(out.dtype.element_ty), mask=live)
+
+
+def dequantize(w, s, block_size, dtype=torch.bfloat16):
+    """A block-fp8 weight ``(N, K)`` (uint8 or e4m3) with its fp32 scales as ``dtype``."""
+    w = w.view(torch.uint8)
+    rows, k = w.shape
+    bo, bi = block_size
+    out = torch.empty(rows, k, dtype=dtype, device=w.device)
+    bn, bk = 64, 128
+    _dequant_kernel[(triton.cdiv(rows, bn), triton.cdiv(k, bk))](
+        w, s, out, rows, K=k, KB=triton.cdiv(k, bi), BO=bo, BI=bi, BN=bn, BK=bk, num_warps=4)
+    return out
+
+
+def _dequant_linear(x, w, s, block_size, glu):
+    """The weight dequantized to x's dtype, then cuBLAS; SwiGLU after it with glu, as on the other paths."""
+    h = F.linear(x, dequantize(w, s, block_size, x.dtype))
+    if not glu:
+        return h
+    from mstar.utils.fused_moe.kernels import act_and_mul_triton
+
+    out = torch.empty(x.shape[0], h.shape[1] // 2, dtype=x.dtype, device=x.device)
+    act_and_mul_triton(h, out, activation="silu")
+    return out
+
+
 def _table_rows(device: torch.device, n: int, k: int, glu: bool):
     """The fp8_linear table's rows for this shape on ``device``, looked up once, or None."""
     key = (device, n, k, glu)
@@ -490,10 +573,13 @@ def _table_rows(device: torch.device, n: int, k: int, glu: bool):
 def _builtin(device: torch.device, n: int, k: int, glu: bool, m: int) -> str:
     """GLM-5.2's dispatch on any GPU: w8a16 up to its token limit, flashinfer to _FI_MAX_TOKENS
     where it runs, then cuBLAS where it runs, else w8a16. On Blackwell, where neither SM90 path
-    runs, flashinfer's groupwise GEMM takes every token count of a shape in whole 128-row blocks
-    (a table row for the GPU overrides it per token count)."""
+    runs, flashinfer's groupwise GEMM (where its numerics probe passed) takes every token count of a
+    shape in whole 128-row blocks; otherwise dequant above _DEQUANT_MIN_TOKENS (a table row for the
+    GPU overrides either per token count)."""
     if _BW_OK.get(device) and (n * (2 if glu else 1)) % 128 == 0:
         return "groupwise"
+    if _BLACKWELL.get(device) and m > _DEQUANT_MIN_TOKENS:
+        return "dequant"
     if m <= _W8A16_MAX_TOKENS_BY_SHAPE.get((n, k, glu), _W8A16_MAX_TOKENS):
         return "w8a16"
     if m <= _FI_MAX_TOKENS and _FI_OK.get(device):
@@ -506,12 +592,12 @@ def _choose(device: torch.device, n: int, k: int, glu: bool, m: int, block_size=
     on ``device`` (a w8a16 row without a config takes the built-in tile), else the built-in rule.
     The table is keyed by 128 x 128 scale blocks; any other block runs w8a16."""
     if tuple(block_size) != (128, 128):
-        return "w8a16", None
+        return ("dequant" if _BLACKWELL.get(device) and m > _DEQUANT_MIN_TOKENS else "w8a16"), None
     rows = _table_rows(device, n, k, glu) if device.type == "cuda" else None
     if rows is not None:
         bounds, choices = rows
         choice = choices[bisect.bisect_left(bounds, m)]
-        if (choice.impl == "w8a16" or (choice.impl == "flashinfer" and _FI_OK.get(device))
+        if (choice.impl in ("w8a16", "dequant") or (choice.impl == "flashinfer" and _FI_OK.get(device))
                 or (choice.impl == "cublas" and _W8A8_OK.get(device))
                 or (choice.impl == "groupwise" and _BW_OK.get(device) and (n * (2 if glu else 1)) % 128 == 0)):
             return choice.impl, choice.config
@@ -527,6 +613,8 @@ def _linear(x, w, s, block_size, glu):
     if M == 0:
         return x.new_empty(0, N)
     impl, config = _choose(x.device, N, K, glu, M, block_size)
+    if impl == "dequant":
+        return _dequant_linear(x, w, s, block_size, glu)
     if impl == "flashinfer":
         return _fi(x, w, s, glu)
     if impl == "cublas":
