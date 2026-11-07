@@ -734,6 +734,30 @@ def test_qwen3_5_takes_each_rows_last_token_on_a_prefill_only(monkeypatch, walk,
     assert logits.shape[0] == (1 if last_token else 3)
 
 
+def _qwen3_5_open_step(llm) -> SubmoduleStep:
+    step = engine_step(llm, graph_walk="decode", request_ids=[1], inputs=[ARNodeInputs(input_seq_len=1)])
+    step.set_ctx(StepContext((1,), "decode", 0, True))
+    step.begin_calls()
+    return step
+
+
+def test_a_qwen3_5_step_that_never_samples_through_its_handle_is_refused():
+    step = _qwen3_5_open_step(_qwen3_5_llm(_qwen3_5(**QWEN3_5["9B"])))
+    with pytest.raises(ValueError, match=r"Sampler 'sampler': a step listing it sampled 0 times, and draws is 1"):
+        step.check_calls()
+    step.end_calls()
+
+
+def test_a_qwen3_5_step_counts_the_scaffolds_draw_through_its_handle():
+    llm = _qwen3_5_llm(_qwen3_5(**QWEN3_5["9B"]))
+    llm.sampler.resource = SimpleNamespace(sample=lambda rows, logits: logits)
+    step = _qwen3_5_open_step(llm)
+    llm.sample_tokens(None, torch.zeros(1, 4))
+    step.check_calls()
+    assert llm.sampler._drawn == 1, "the scaffold's forward should sample through the handle"
+    step.end_calls()
+
+
 _FIXTURE = Path("mstar/model/command_a_plus/tests/fixtures/tiny_config.json")
 _LOCAL_ATTN, _GLOBAL_ATTN = command_a_plus_config.LOCAL_ATTN, command_a_plus_config.GLOBAL_ATTN
 # The published geometry (CohereLabs/command-a-plus-05-2026-bf16 `config.json`), so these tests need no download.
