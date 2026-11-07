@@ -120,9 +120,9 @@ def _expected(logits, temperature):
 
 def test_the_eager_sampler_scores_the_rows_that_asked():
     res = _resource()
-    res.ingest_request(0, SamplingReqConfig(temperature=0.7, return_logprobs=True))
-    res.ingest_request(1, SamplingReqConfig(temperature=0.7))
-    res.ingest_request(2, SamplingReqConfig(temperature=0.0, return_logprobs=True))
+    _ingest(res, 0, SamplingReqConfig(temperature=0.7, return_logprobs=True))
+    _ingest(res, 1, SamplingReqConfig(temperature=0.7))
+    _ingest(res, 2, SamplingReqConfig(temperature=0.0, return_logprobs=True))
     logits = _logits()
 
     rows = _step(res, [0, 1, 2], logits)[SAMPLED_LOGPROB]
@@ -137,9 +137,9 @@ def test_no_rows_reach_the_host_unless_a_request_asked(graph):
     res = _resource(graph=graph)
     padded_bs = 4 if graph else None
     logits = _logits()[:1].expand(4 if graph else 1, -1)
-    res.ingest_request(0, SamplingReqConfig(temperature=1.0))
+    _ingest(res, 0, SamplingReqConfig(temperature=1.0))
     assert _step(res, [0], logits, padded_bs=padded_bs) == {}
-    res.ingest_request(1, SamplingReqConfig(temperature=1.0, return_logprobs=True))
+    _ingest(res, 1, SamplingReqConfig(temperature=1.0, return_logprobs=True))
     rows = _step(res, [0], logits, padded_bs=padded_bs)
     if graph:
         # a resident request asked, none of the step's rows: all NaN
@@ -153,7 +153,7 @@ def test_no_rows_reach_the_host_unless_a_request_asked(graph):
 def test_a_node_without_the_capability_refuses_at_ingest():
     res = _resource(enable=False)
     with pytest.raises(ValueError, match="enable_logprobs=False"):
-        res.ingest_request(0, SamplingReqConfig(return_logprobs=True))
+        _ingest(res, 0, SamplingReqConfig(return_logprobs=True))
     assert 0 not in res._sampler._sampling_config
 
 
@@ -176,11 +176,11 @@ def test_a_recycled_slot_does_not_inherit_the_previous_requests_flag():
     _ingest(res, 9, SamplingReqConfig(temperature=1.0, return_logprobs=True))
     logits = torch.cat([_logits(), _logits()[:1]])
     assert not _step(res, [0], logits, padded_bs=4)[SAMPLED_LOGPROB][0].isnan()
-    slot = res._cg_buffers._rid_to_slot[0]
+    slot = res._cg_buffers.rows._rid_to_slot[0]
     res.remove_request(0)
 
     _ingest(res, 1, SamplingReqConfig(temperature=1.0))
-    assert res._cg_buffers._rid_to_slot[1] == slot
+    assert res._cg_buffers.rows._rid_to_slot[1] == slot
     assert _step(res, [1], logits, padded_bs=4)[SAMPLED_LOGPROB][0].isnan()
 
 
@@ -211,7 +211,7 @@ def test_a_step_that_repeats_takes_no_rows_from_a_request_that_arrived_after_it_
     """Log-prob rows would send the step down the store path, which reads one
     iteration, so every other row of it would lose the rest of its tokens."""
     res = _resource()
-    res.ingest_request(0, SamplingReqConfig(return_logprobs=True))
+    _ingest(res, 0, SamplingReqConfig(return_logprobs=True))
     assert SAMPLED_LOGPROB in _step(res, [0], _logits()[:1])
     assert SAMPLED_LOGPROB not in res.step_host_rows(2)
 
@@ -228,7 +228,7 @@ def test_resource_rows_with_nowhere_to_go_raise():
 
 def test_a_second_sample_in_one_step_raises_while_logprobs_are_on():
     res = _resource()
-    res.ingest_request(0, SamplingReqConfig(return_logprobs=True))
+    _ingest(res, 0, SamplingReqConfig(return_logprobs=True))
     _step(res, [0], _logits()[:1])
     with pytest.raises(RuntimeError, match="one sample"):
         res.sample([0], _logits()[:1])
@@ -248,7 +248,7 @@ def test_a_sample_scores_each_rows_stop_ids_greedy_or_not():
     res = _resource(enable=False)
     res.ask_stop_odds("w", {2, 3})
     for rid in (0, 1):
-        res.ingest_request(rid, SamplingReqConfig(temperature=0.0))
+        _ingest(res, rid, SamplingReqConfig(temperature=0.0))
     logits = torch.tensor([[0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 10.0, -100.0]])
     assert _step(res, [0, 1], logits)[STOP_ODDS][:2].tolist() == pytest.approx([0.5, 1.0], abs=1e-3)
 
@@ -263,7 +263,7 @@ def test_stop_odds_are_only_the_asked_walks_and_an_eager_steps_rows_only_its_own
     res.ask_stop_odds("w", {2})
     res._odds = torch.zeros(2)  # the capture's rows: 2
     for rid in range(3):
-        res.ingest_request(rid, SamplingReqConfig(temperature=0.0))
+        _ingest(res, rid, SamplingReqConfig(temperature=0.0))
     wide = torch.tensor([[0.0, 0.0, 10.0, -100.0]] * 3)
     assert _step(res, [0, 1, 2], wide)[STOP_ODDS].tolist() == pytest.approx([1.0] * 3, abs=1e-3)
     # a replay: plan only, the graph wrote the capture's rows

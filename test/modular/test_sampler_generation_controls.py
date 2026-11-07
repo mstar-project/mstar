@@ -43,6 +43,7 @@ from mstar.engine.resources.sampler.utils import (  # noqa: E402
     GenerationHistory,
     HistoryRows,
     SamplerBuffers,
+    SamplerRows,
     SamplingConfig,
     advance_history,
     apply_min_tokens_floor,
@@ -153,7 +154,7 @@ def _logits(bs: int, step: int, device) -> torch.Tensor:
 
 def _resource(**kwargs) -> SamplerResource:
     return SamplerResource(
-        vocab_size=None, enable_repetion_penalty=True, device=CPU, **kwargs,
+        vocab_size=VOCAB, enable_repetion_penalty=True, device=CPU, **kwargs,
     )
 
 
@@ -174,9 +175,9 @@ def test_ingest_refuses_what_the_spec_cannot_do(cfg, spec, match):
     with pytest.raises(ValueError, match=match):
         res.ingest_request("r", SamplingReqConfig(**{"repetition_penalty": 1.2, **cfg}))
     assert "r" not in res._sampler._sampling_config
-    assert "r" not in res._penalty_rids
+    assert not res._rows.has_slot("r")
     if res._history is not None:
-        assert "r" not in res._history._rid_to_slot
+        assert not res._rows.has_slot("r")
 
 
 def test_cpu_device_refuses_the_cuda_only_features():
@@ -189,7 +190,7 @@ def test_cpu_device_refuses_the_cuda_only_features():
 
 def test_defaults_build_nothing_new():
     res = _resource()
-    assert res._history is None and res._sampler.history is None
+    assert res._history is None and res._sampler.rows.history is None
     res.ingest_request("r", SamplingReqConfig())
     cfg = res._sampler._sampling_config["r"]
     assert not cfg.uses_history and not cfg.uses_filter_order
@@ -206,7 +207,7 @@ def test_the_filter_order_alone_keeps_no_history():
 def test_spec_forwards_the_capabilities():
     info = SimpleNamespace(device=CPU, joint_comm_group=None)
     spec = SamplerSpec(
-        resource_key="s", nodes={"tts"}, vocab_size=None,
+        resource_key="s", nodes={"tts"}, vocab_size=VOCAB,
         max_repetition_window=16, min_tokens_stop_ids=(EOS,), enable_top_p_first=True,
     )
     res = SamplerResource.build(spec, info)
@@ -220,7 +221,7 @@ def test_a_windowed_penalty_does_not_engage_the_presence_mask():
     res._sampler.device = torch.device("cuda")  # past the CUDA-only refusal
     res.ingest_request("w", SamplingReqConfig(repetition_window=16, repetition_penalty=1.05))
     res.ingest_request("p", SamplingReqConfig(repetition_penalty=1.2))
-    assert res._penalty_rids == {"p"}
+    assert res._sampler._sampling_config["w"].presence_penalty == 1.0
 
     bufs = SamplerBuffers.allocate(
         max_batch_size=4, device=CPU, history=GenerationHistory(16, CPU),
@@ -235,24 +236,107 @@ def test_a_windowed_penalty_does_not_engage_the_presence_mask():
 
 
 def test_history_slots_are_recycled_with_their_count_zeroed():
-    hist = GenerationHistory(window=4, device=CPU, capacity=2)  # one usable slot + scratch
-    hist.register("a")
-    rows, tokens, count = hist.read(["a"])
+    hist = GenerationHistory(window=4, device=CPU)
+    owner = SamplerRows(CPU, hist)
+    owner.register_request("a")
+    owner.sync()
+    rows = owner.indices(["a"])
+    tokens, count = hist.read(rows)
     h = HistoryRows(count=count, tokens=tokens, window=torch.tensor([3], dtype=torch.int32))
     for tok in (5, 6, 7, 8):
         advance_history(h, torch.tensor([tok]))
     hist.write(rows, h.tokens, h.count)
-    assert hist.read(["a"])[2].tolist() == [4]
-    # a ring of the request's window (3) inside the node's (4): 8 overwrote 5
-    assert hist.read(["a"])[1].tolist() == [[8, 6, 7, -1]]
+    assert hist.read(rows)[1].tolist() == [4]
+    # The complete node-width ring survives later request-window changes.
+    assert hist.read(rows)[0].tolist() == [[5, 6, 7, 8]]
 
-    hist.register("b")  # grows past the initial capacity
-    hist.unregister("a")
-    hist.register("c")  # takes a's slot back
-    assert hist._rid_to_slot["c"] == 1
-    assert hist.read(["c", "b"])[2].tolist() == [0, 0]
-    assert hist.read(["c"])[1].tolist() == [[-1, -1, -1, -1]]  # a's tokens are gone
-    assert 0 not in hist._rid_to_slot.values()  # the scratch row stays unowned
+    owner.register_request("b")  # grows past the initial capacity
+    owner.unregister_request("a")
+    owner.register_request("c")  # takes a's slot back
+    owner.sync()
+    assert owner.slot_of("c") == 1
+    assert hist.read(owner.indices(["c", "b"]))[1].tolist() == [0, 0]
+    assert hist.read(owner.indices(["c"]))[0].tolist() == [[-1, -1, -1, -1]]
+    assert 0 not in owner._rid_to_slot.values()  # the scratch row stays unowned
+
+
+@pytest.mark.parametrize("ingraph", [False, True])
+def test_owned_history_survives_replays_preplans_and_inert_settings(monkeypatch, ingraph):
+    from mstar.engine.resources.sampler import utils
+
+    monkeypatch.setenv("MSTAR_SAMPLER_INGRAPH_SCATTER", "1" if ingraph else "0")
+    monkeypatch.setenv("MSTAR_SAMPLER_SLOTS", "2")
+    monkeypatch.setattr(utils, "sample_tokens", lambda logits, **kw: logits.argmax(-1))
+    monkeypatch.setattr(utils, "sample_accelerator_graphable_gpu", lambda logits, *a, **kw: logits.argmax(-1))
+    res = SamplerResource(vocab_size=None, enable_repetion_penalty=False, device=CPU, max_repetition_window=4)
+    res.build_accelerator_graph_buffers([SimpleNamespace(slot=0), SimpleNamespace(slot=1)], 2, 1)
+    res.seal_capture_buffers()
+    for rid in (1, 2):
+        res.ingest_request(rid)
+        if ingraph:
+            assert res.reserve(rid, "n", "decode", None) is None
+    kind = SamplerStep(apply_penalty=False)
+
+    def context(rids, slot=None, preplan=False):
+        lease = None if slot is None else SlotLease(slot, BucketKey("decode", 2, 2))
+        return StepContext(tuple(rids), "decode", 0, False, slot_lease=lease, is_preplan=preplan)
+
+    def draw(rids, tokens):
+        logits = torch.zeros(len(rids), 16)
+        logits.scatter_(1, torch.tensor(tokens).unsqueeze(1), 1.)
+        res.sample(rids, logits)
+
+    eager = context((1, 2))
+    res.plan(kind, eager)
+    draw([1, 2], [5, 6])
+    res.commit(kind, eager)
+    owner, hist, bufs = res._rows, res._history, res._cg_buffers
+    masters = owner.offset, hist.count, hist.tokens
+    first = context((1, 2), 0)
+    res.plan(kind, first)
+    # The next capture is planned while the first still has draws to run.
+    res._sampler.set_config(1, repetition_window=2, repetition_penalty=1.1)
+    bufs.update_request_config(1, res._sampler._sampling_config[1])
+    res.plan(kind, context((2, 1), 1, preplan=True))
+    draw([1, 2], [7, 8])
+    draw([1, 2], [9, 10])
+    assert hist.read(owner.indices((1, 2)))[1].tolist() == ([3, 3] if ingraph else [1, 1])
+    res.commit(kind, first)
+    second = context((2, 1), 1)
+    res.plan(kind, second)
+    draw([2, 1], [11, 12])
+    res.commit(kind, second)
+    res._sampler.set_config(1, repetition_window=4)
+    res.plan(kind, eager)
+    draw([1, 2], [13, 14])
+    res.commit(kind, eager)
+    tokens, count = hist.read(owner.indices((1, 2)))
+    assert count.tolist() == [5, 5] and owner.offset[owner.indices((1, 2))].tolist() == [5, 5]
+    assert tokens.tolist() == [[13, 7, 9, 12], [14, 8, 10, 11]]
+    assert bufs.sampler_for(2, 0).history.count.data_ptr() != bufs.sampler_for(2, 1).history.count.data_ptr()
+    dropped = SamplerStep(apply_penalty=False, kept_rids=frozenset({2}))
+    res.plan(dropped, first)
+    draw([1, 2], [3, 4])
+    res.commit(dropped, first)
+    kept_tokens, kept_count = hist.read(owner.indices((1, 2)))
+    assert kept_count.tolist() == [5, 6] and owner.offset[owner.indices((1, 2))].tolist() == [5, 6]
+    assert torch.equal(kept_tokens[0], tokens[0]) and kept_tokens[1, 1].item() == 4
+    if ingraph:
+        res.ingest_request(3)
+        assert res.reserve(3, "n", "decode", None) == 0 and not owner.has_slot(3)
+    old_row = owner.slot_of(1)
+    res.remove_request(1)
+    if not ingraph:
+        res.ingest_request(3)
+    else:
+        assert res.reserve(3, "n", "decode", None) is None
+    assert owner.slot_of(3) == old_row and hist.count[old_row].item() == 5
+    # Preparing the next draw drains the owner's deferred reuse reset.
+    res.plan(kind, context((3, 2), 0))
+    tokens, count = hist.read(owner.indices((3, 2)))
+    assert count.tolist() == [0, 6] and tokens[0].tolist() == [-1] * 4
+    assert owner.offset[old_row].item() == 0
+    assert all(a is b for a, b in zip(masters, (owner.offset, hist.count, hist.tokens), strict=True))
 
 
 @needs_cuda
@@ -277,8 +361,7 @@ def test_softmax_kernel_penalty_and_greedy_floor_match_upstream(vocab):
     ring = torch.full((len(rows), width), -1, dtype=torch.long)
     for i, r in enumerate(rows):
         for t, tok in enumerate(r.generated):
-            if r.window:
-                ring[i, t % r.window] = tok
+            ring[i, t % width] = tok
     h = HistoryRows(
         count=torch.tensor([len(r.generated) for r in rows], dtype=torch.int32, device=dev),
         tokens=ring.to(dev),
@@ -331,7 +414,7 @@ class _ProbsSpy:
 
 def _capable(device) -> SamplerResource:
     return SamplerResource(
-        vocab_size=None, enable_repetion_penalty=True, device=device,
+        vocab_size=VOCAB, enable_repetion_penalty=True, device=device,
         max_repetition_window=WINDOW, min_tokens_stop_ids=(EOS,),
         enable_top_p_first=True,
     )
@@ -386,13 +469,15 @@ def test_eager_matches_upstream_step_by_step(monkeypatch):
 
 
 @needs_cuda
-def test_captured_graph_matches_upstream_step_by_step(monkeypatch):
+@pytest.mark.parametrize("ingraph", [False, True])
+def test_captured_graph_matches_upstream_step_by_step(monkeypatch, ingraph):
     """Buckets of 4 holding 3 real rows, double-buffered over two slots with
     each step pre-planned ahead and promoted, as the async worker runs it. A
     row is swapped out mid-run for a fresh request, which must start from an
     empty history in the reused slot. Each request's first token is drawn
     eagerly, as a prefill's would be."""
     pytest.importorskip("flashinfer")
+    monkeypatch.setenv("MSTAR_SAMPLER_INGRAPH_SCATTER", "1" if ingraph else "0")
     dev = torch.device("cuda")
     spy = _ProbsSpy(monkeypatch)
     res = _capable(dev)
@@ -400,14 +485,19 @@ def test_captured_graph_matches_upstream_step_by_step(monkeypatch):
     res.build_accelerator_graph_buffers(
         [SimpleNamespace(slot=0), SimpleNamespace(slot=1)], max_bs=bs, max_seq_len=1,
     )
+    res.seal_capture_buffers()
     rows = _tts_rows()
     live = ["tts", "short_floor", "greedy"]
     for rid in live:
         res.ingest_request(rid, rows[rid].config())
+        if ingraph:
+            assert res.reserve(rid, "n", "decode", None) is None
     step_kind = SamplerStep(apply_penalty=False)
     bucket = BucketKey(graph_walk="decode", bs=bs, num_tokens=bs)
     leases = [SlotLease(slot=i, bucket=bucket) for i in range(2)]
-    padded = live + ["__pad__"]
+    capture_rids = list(range(-bs, 0))
+    for rid in capture_rids:
+        res.ingest_capture_row(rid)
 
     def advance(rids, tokens):
         for rid, tok in zip(rids, tokens, strict=False):
@@ -427,25 +517,32 @@ def test_captured_graph_matches_upstream_step_by_step(monkeypatch):
     static = torch.zeros(bs, VOCAB, device=dev)
     graphs, outs, probs = [], [], []
     for lease in leases:
-        res.plan(step_kind, _ctx(live, lease))
+        res.plan(step_kind, _ctx(capture_rids, lease))
         side = torch.cuda.Stream()
         side.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(side):
-            res.sample(padded, static)  # warmup: autotune, lazy init
+            res.sample(capture_rids, static)  # warmup: autotune, lazy init
         torch.cuda.current_stream().wait_stream(side)
-        # the warmup advanced the per-step rows; regather before capturing
-        res.plan(step_kind, _ctx(live, lease))
+        res.plan(step_kind, _ctx(capture_rids, lease))
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            outs.append(res.sample(padded, static))
+            outs.append(res.sample(capture_rids, static))
         graphs.append(graph)
         probs.append(spy.seen[-1])
 
     for step in range(1, STEPS):
+        if step in (17, 35, 50):
+            # Keep the full history while settings are inert or the window
+            # shrinks, then read a larger window after the ring has wrapped.
+            rows["tts"].window = {17: 0, 35: 4, 50: WINDOW}[step]
+            res._sampler.set_config("tts", repetition_window=rows["tts"].window)
+            res._cg_buffers.update_request_config("tts", res._sampler._sampling_config["tts"])
         if step == 25:  # swap a row: the new request reuses the freed slot
             res.remove_request("short_floor")
             live[1] = "top_k_first"
             res.ingest_request("top_k_first", rows["top_k_first"].config())
+            if ingraph:
+                assert res.reserve("top_k_first", "n", "decode", None) is None
             eager_step(step)
             continue
         i = step % 2
@@ -465,7 +562,7 @@ def test_captured_graph_matches_upstream_step_by_step(monkeypatch):
         _check(probs[i], live, rows, logits, step)
         advance(live, tokens)
     assert len(rows["top_k_first"].generated) == STEPS - 25
-    counts = res._history.read(live)[2].tolist()
+    counts = res._history.read(res._rows.indices(live))[1].tolist()
     assert counts == [len(rows[r].generated) for r in live]
 
 
@@ -513,6 +610,8 @@ def test_unfiltered_steps_skip_top_k_and_top_p(monkeypatch, captured):
         res.build_accelerator_graph_buffers([SimpleNamespace(slot=0)], max_bs=bs, max_seq_len=1)
     for rid in live:
         res.ingest_request(rid, rows[rid].config())
+        if res._rows.limit is not None:
+            assert res.reserve(rid, "n", "decode", None) is None
     unfiltered, filtered = SamplerStep(apply_penalty=False, apply_filters=False), SamplerStep(apply_penalty=False)
 
     def check_and_advance(probs, logits, tokens, step):
@@ -526,16 +625,19 @@ def test_unfiltered_steps_skip_top_k_and_top_p(monkeypatch, captured):
     if captured:
         lease = SlotLease(slot=0, bucket=BucketKey(graph_walk="decode", bs=bs, num_tokens=bs))
         static = torch.zeros(bs, VOCAB, device=dev)
-        res.plan(unfiltered, _ctx(live, lease))
+        capture_rids = list(range(-bs, 0))
+        for rid in capture_rids:
+            res.ingest_capture_row(rid)
+        res.plan(unfiltered, _ctx(capture_rids, lease))
         side = torch.cuda.Stream()
         side.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(side):
-            res.sample(live, static)  # warmup
+            res.sample(capture_rids, static)  # warmup
         torch.cuda.current_stream().wait_stream(side)
-        res.plan(unfiltered, _ctx(live, lease))
+        res.plan(unfiltered, _ctx(capture_rids, lease))
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            out = res.sample(live, static)
+            out = res.sample(capture_rids, static)
         probs = spy.seen[-1]  # the graph's buffer: after a replay, the replay's distribution
         res.plan(unfiltered, StepContext(
             request_ids=tuple(live), graph_walk="decode", slot=0, capture=False,

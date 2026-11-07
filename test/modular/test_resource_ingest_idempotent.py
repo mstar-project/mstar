@@ -77,8 +77,9 @@ def _step(runner: StepRunner, span: int) -> list[int]:
 
 def _sampled(sampler, token: int = 5) -> int:
     """What one sampled step leaves behind (sampling itself needs CUDA or XPU)."""
-    sampler.get_token_mask(RID).add_tokens(token)
-    sampler._step_offset[RID] += 1
+    sampler.rows.seed_seen(RID, torch.tensor([token]))
+    rows, offset = sampler.rows.eager_offsets([RID])
+    sampler.rows.advance_offsets(rows, offset, 1)
     return token
 
 
@@ -100,6 +101,6 @@ def test_remove_then_ingest_still_starts_fresh():
 
     res.ingest_request(RID, SamplingReqConfig(temperature=0.5))
 
-    assert res._sampler._step_offset[RID] == 0
+    assert res._rows.eager_offsets([RID])[1].item() == 0
     assert res._sampler._sampling_config[RID].temperature == pytest.approx(0.5)
-    assert RID not in res._penalty_rids
+    assert not res._rows.read_seen(res._rows.indices([RID])).any()

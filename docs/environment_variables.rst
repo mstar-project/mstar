@@ -699,12 +699,12 @@ Worker scheduling
        on its own.
    * - ``MSTAR_SAMPLER_INGRAPH_SCATTER``
      - config's ``knobs: sampler_ingraph_scatter``, else ``1``
-     - The captured sampler gathers its RNG offsets from the slot master
-       and scatters the advanced offsets back inside the graph, so a replayed decode step issues none of those launches on
+     - The captured sampler gathers its state from the slot masters
+       and persists RNG offsets, history and token presence inside the graph, so a replayed decode step issues none of those launches on
        the gpu thread afterwards (each one is a GIL release the main thread's
        postprocess wins). Padding rows, and the rows a step drops
-       (``SamplerStep.kept_rids``), write a trash master row. The offset
-       master, which the captured graphs index, is allocated
+       (``SamplerStep.kept_rids``), write a trash master row. The state
+       masters, which the captured graphs index, are allocated
        once for ``MSTAR_SAMPLER_SLOTS`` requests, and a request takes its row
        when the runner admits it (``SamplerResource.reserve``): past them it
        waits, as for a recurrent state slot, until a removed request frees
@@ -717,7 +717,8 @@ Worker scheduling
      - Request rows of the sampler masters a captured graph indexes when
        ``MSTAR_SAMPLER_INGRAPH_SCATTER`` is on (at least the node's largest
        capture batch): the most requests admitted at once on such a node; the
-       rest wait to be admitted. Read by ``knobs.sampler_slots``.
+       rest wait to be admitted. Presence-capable samplers use four bytes per
+       32 vocabulary tokens per row, plus capture scratch. Read by ``knobs.sampler_slots``.
    * - ``MSTAR_RUST_SEND_TIMING``
      - unset
      - ``1`` makes the Rust runtime print, every 500 calls, how long the

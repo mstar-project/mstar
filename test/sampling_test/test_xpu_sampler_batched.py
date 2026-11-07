@@ -7,7 +7,7 @@ import torch
 
 from mstar.engine.resources.sampler.config import SamplerStep, SamplingReqConfig
 from mstar.engine.resources.sampler.resource import SamplerResource
-from mstar.engine.resources.sampler.utils import Sampler, sample_tokens
+from mstar.engine.resources.sampler.utils import Sampler, SamplerRows, sample_tokens
 from mstar.engine.resources.step import SlotLease, StepContext
 
 pytestmark = pytest.mark.skipif(not torch.xpu.is_available(), reason="requires Intel XPU")
@@ -81,17 +81,18 @@ def test_mixed_settings_are_invariant_to_batch_order_and_padding(device):
 @pytest.mark.parametrize("top_ks", [(32, 32, 32), (0, 32, 0)])
 def test_request_rng_offsets_survive_reordered_decode_batches(device, top_ks):
     logits, _, _ = _inputs(device, batch=3)
-    serial, batched = Sampler(device), Sampler(device)
+    serial, batched = Sampler(device, SamplerRows(device)), Sampler(device, SamplerRows(device))
     for sampler in (serial, batched):
         for rid in range(3):
             sampler.add_request(rid)
+            sampler.rows.register_request(rid)
             sampler.set_config(rid, temperature=0.8, top_k=top_ks[rid], top_p=0.9)
             sampler._sampling_config[rid].set_seed(777 + rid)
     for order in ([0, 1, 2], [2, 0, 1], [1, 2, 0]):
         expected = torch.cat([serial.sample([rid], logits[rid:rid + 1]) for rid in order])
         actual = batched.sample(order, logits[order])
         torch.testing.assert_close(actual, expected, atol=0, rtol=0)
-    assert serial._step_offset == batched._step_offset == {rid: 3 * logits.shape[1] for rid in range(3)}
+    assert serial.rows.offset[1:].tolist()[:3] == batched.rows.offset[1:].tolist()[:3] == [3 * logits.shape[1]] * 3
 
 
 def test_unseeded_sampling_advances_default_generator_and_reproduces_after_reset(device):
@@ -147,10 +148,11 @@ def test_explicit_rng_sampling_captures_and_advances_in_xpu_graph(device, top_k,
 
 
 @pytest.mark.parametrize("top_ks", [(0, 32, 0, 32), (0, 0, 0, 0)])
-def test_captured_sampler_resource_matches_eager_with_padding_and_dropped_rows(device, top_ks):
+@pytest.mark.parametrize("ingraph", [False, True])
+def test_captured_sampler_resource_matches_eager_with_padding_and_dropped_rows(device, top_ks, ingraph, monkeypatch):
+    monkeypatch.setenv("MSTAR_SAMPLER_INGRAPH_SCATTER", "1" if ingraph else "0")
     logits, _, _ = _inputs(device, batch=8)
     rids = tuple(range(4))
-    padded_rids = [*rids, -1, -2, -3, -4]
     eager = SamplerResource(
         logits.shape[1], enable_repetion_penalty=True, device=device, enable_min_p=True,
     )
@@ -170,6 +172,8 @@ def test_captured_sampler_resource_matches_eager_with_padding_and_dropped_rows(d
                     repetition_penalty=1.3, _seed=777 + rid,
                 ),
             )
+            if resource._rows.limit is not None:
+                assert resource.reserve(rid, "n", "decode", None) is None
     eager_ctx = StepContext(request_ids=rids, graph_walk="decode", slot=0, capture=False)
     captured_ctx = StepContext(
         request_ids=rids, graph_walk="decode", slot=0, capture=False,
@@ -180,13 +184,21 @@ def test_captured_sampler_resource_matches_eager_with_padding_and_dropped_rows(d
     })
     eager.plan(prompt, eager_ctx)
     captured.plan(prompt, captured_ctx)
+    capture_rids = list(range(-8, 0))
+    for rid in capture_rids:
+        captured.ingest_capture_row(rid)
+    capture_ctx = StepContext(
+        request_ids=tuple(capture_rids), graph_walk="decode", slot=0, capture=True,
+        slot_lease=captured_ctx.slot_lease,
+    )
+    captured.plan(SamplerStep(), capture_ctx)
     for _ in range(2):
-        captured.sample(padded_rids, logits)
-    captured.plan(SamplerStep(), captured_ctx)
+        captured.sample(capture_rids, logits)
+    captured.plan(SamplerStep(), capture_ctx)
     torch.xpu.synchronize(device)
     graph = torch.xpu.XPUGraph()
     with torch.xpu.graph(graph):
-        tokens = captured.sample(padded_rids, logits)
+        tokens = captured.sample(capture_rids, logits)
 
     for kept in (None, frozenset({0, 2}), frozenset(), None):
         step = SamplerStep(kept_rids=kept)
@@ -198,10 +210,10 @@ def test_captured_sampler_resource_matches_eager_with_padding_and_dropped_rows(d
         torch.xpu.synchronize(device)
         torch.testing.assert_close(tokens[:len(rids)], expected, atol=0, rtol=0)
         for rid in rids:
-            slot = captured._cg_buffers._rid_to_slot[rid]
-            assert captured._cg_buffers.offset.master[slot].item() == eager._sampler._step_offset[rid]
+            slot = captured._cg_buffers.rows._rid_to_slot[rid]
+            assert captured._cg_buffers.rows.offset[slot].item() == eager._rows.offset[eager._rows.slot_of(rid)].item()
             torch.testing.assert_close(
-                captured._sampler.get_token_mask(rid)._seen_token_mask,
-                eager._sampler.get_token_mask(rid)._seen_token_mask,
+                captured._rows.read_seen(captured._rows.indices([rid]))[0],
+                eager._rows.read_seen(eager._rows.indices([rid]))[0],
                 atol=0, rtol=0,
             )

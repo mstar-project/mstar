@@ -16,6 +16,7 @@ from mstar.engine.resources import SamplingReqConfig
 from mstar.engine.resources.sampler.config import SamplerSpec, derive_seed
 from mstar.engine.resources.sampler.utils import (
     Sampler,
+    SamplerRows,
     canonical_sampling_values,
     sample_tokens,
 )
@@ -71,7 +72,7 @@ def test_tiny_temperatures_are_greedy_and_greedy_turns_filters_off():
 
 
 def test_none_keeps_the_current_value():
-    sampler = Sampler(device=torch.device("cpu"))
+    sampler = Sampler(device=torch.device("cpu"), rows=SamplerRows(torch.device("cpu")))
     sampler.add_request("r")
     sampler.set_config("r", temperature=0.9, top_k=40, top_p=0.8)
     sampler.set_config("r", temperature=None, top_k=None, top_p=None, min_p=None,

@@ -111,15 +111,31 @@ def test_a_recycled_slot_starts_at_zero(drawn, ingraph):
     res = _resource(torch.device("cpu"), ingraph)
     _ingest(res, RID, seed=1)
     _run(res, RID, "ECE")
-    slot = res._cg_buffers._rid_to_slot[RID]
+    slot = res._cg_buffers.rows._rid_to_slot[RID]
     res.remove_request(RID)
     for first in "EC":
         drawn.clear()
         _ingest(res, RID + 1, seed=2)
-        assert res._cg_buffers._rid_to_slot[RID + 1] == slot
+        assert res._cg_buffers.rows._rid_to_slot[RID + 1] == slot
         _run(res, RID + 1, first + "EC")
         assert [offset for _, offset in drawn] == [0, 1, 2]
         res.remove_request(RID + 1)
+
+
+def test_capture_sizing_cannot_replace_a_live_samplers_inputs(drawn, ingraph):
+    res = _resource(torch.device("cpu"), ingraph)
+    res.seal_capture_buffers()
+    _ingest(res, RID, seed=1)
+    _run(res, RID, "C")
+    sampler = res._cg_sampler
+    with pytest.raises(ValueError, match="sealed"):
+        res.build_accelerator_graph_buffers([SimpleNamespace(slot=0)], max_bs=2, max_seq_len=1)
+    # A redundant sizing call is harmless, and the existing capture view still
+    # reads this request's latest offset on the next plan.
+    res.build_accelerator_graph_buffers([SimpleNamespace(slot=0)], max_bs=1, max_seq_len=1)
+    _run(res, RID, "C")
+    assert res._cg_sampler is sampler
+    assert [offset for _, offset in drawn] == [0, 1]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="FlashInfer sampling needs CUDA")
@@ -179,7 +195,10 @@ def test_consecutive_draws_are_independent(ingraph, monkeypatch, first_step):
             res.commit(step, ctx)
         else:
             first = captured(i)
-        same += int(first == captured(i))
+        second = captured(i)
+        same += int(first == second)
+        mask = res._rows.read_seen(res._rows.indices([i]))[0]
+        assert mask.nonzero().flatten().tolist() == sorted({first, second})
         res.remove_request(i)
     # independent: ~n/V = 1 expected; the shared offset gave n
     assert same <= 8, f"{same}/{n} consecutive token pairs equal"

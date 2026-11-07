@@ -116,11 +116,11 @@ def device_loopback_enabled() -> bool:
 
 def sampler_ingraph_scatter() -> bool:
     """``sampler_ingraph_scatter`` / ``MSTAR_SAMPLER_INGRAPH_SCATTER`` (default
-    on): the captured sampler gathers its RNG offsets from the slot masters
-    and scatters the advanced offsets and the sampled tokens back inside the
+    on): the captured sampler gathers its state from the slot masters
+    and persists RNG, history and token presence back inside the
     graph, so a replayed step issues none of those launches on the gpu thread
     (each is a GIL release the main thread's postprocess can win). Padding
-    rows then address a trash master row, and the offset and last-token
+    rows then address a trash master row, and the state
     masters are allocated once for ``sampler_slots`` concurrent requests,
     since a captured graph holds their addresses; a request takes its row at
     admission and waits while none is free."""

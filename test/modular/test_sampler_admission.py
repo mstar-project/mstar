@@ -18,7 +18,7 @@ sys.path.insert(0, ".")
 import torch
 
 from mstar.engine.resources import StepRunner
-from mstar.engine.resources.sampler.config import SamplerStep
+from mstar.engine.resources.sampler.config import SamplerStep, SamplingReqConfig
 from mstar.engine.resources.sampler.resource import SamplerResource
 from mstar.engine.resources.step import ASKS, SlotLease, StepContext
 
@@ -42,31 +42,34 @@ def _waiting(rid, node_name):
 def test_a_request_waits_for_a_row_and_takes_the_one_a_removed_request_frees(monkeypatch):
     res = _resource(monkeypatch, slots=2, max_bs=1)
     bufs = res._cg_buffers
-    offset = bufs.offset.master
+    offset = bufs.rows.offset
     runner = StepRunner({"sampler": res}, node_resources={NODE: ["sampler"]})
     for rid in ("a", "b", "c"):
         res.ingest_request(rid)
-    assert not bufs.has_slot("a"), "ingest took a row before admission"
+    assert not bufs.rows.has_slot("a"), "ingest took a row before admission"
 
     assert runner.admit_retrieve("a", NODE, WALK).ready
     assert runner.admit_retrieve("b", NODE, WALK).ready, "the second row, past the grown masters, wasn't free"
     assert runner.admit_retrieve("c", NODE, WALK).queued
-    assert runner.admit_waiting(_waiting) == [] and not bufs.has_slot("c")
+    assert runner.admit_waiting(_waiting) == [] and not bufs.rows.has_slot("c")
 
-    freed = bufs._rid_to_slot["a"]
+    freed = bufs.rows._rid_to_slot["a"]
     runner.remove_request("a")
     assert runner.admit_waiting(_waiting) == [(NODE, "c")]
-    assert bufs._rid_to_slot["c"] == freed and bufs.free_rows == 0
-    assert bufs.offset.master is offset
+    assert bufs.rows._rid_to_slot["c"] == freed and bufs.rows.free_rows == 0
+    assert bufs.rows.offset is offset
 
 
 def test_a_row_taken_for_a_request_another_resource_holds_back_is_given_back(monkeypatch):
     res = _resource(monkeypatch, slots=2, max_bs=2)
-    res.ingest_request("a")
-    assert res.reserve("a", NODE, WALK, None) is None and res._cg_buffers.has_slot("a")
+    res.ingest_request("a", SamplingReqConfig(temperature=0.25))
+    assert res.reserve("a", NODE, WALK, None) is None and res._cg_buffers.rows.has_slot("a")
     res.unreserve("a")
-    assert not res._cg_buffers.has_slot("a") and res._cg_buffers.free_rows == 2
+    assert not res._cg_buffers.rows.has_slot("a") and res._cg_buffers.rows.free_rows == 2
     assert res.ask("a", NODE, WALK) is ASKS
+    assert res.reserve("a", NODE, WALK, None) is None
+    res._cg_buffers.gather_static(["a"], 2, 0)
+    assert res._cg_buffers.sampler_for(2, 0).temperature_buf[0].item() == 0.25
 
 
 def test_without_fixed_rows_the_sampler_admits_every_request(monkeypatch):
@@ -75,7 +78,7 @@ def test_without_fixed_rows_the_sampler_admits_every_request(monkeypatch):
     assert not bufs.ingraph_scatter
     for rid in ("a", "b", "c"):
         res.ingest_request(rid)
-        assert res.ask(rid, NODE, WALK) is None and bufs.has_slot(rid)
+        assert res.ask(rid, NODE, WALK) is None and bufs.rows.has_slot(rid)
     assert bufs._master_capacity >= 3, "the growing masters didn't grow"
 
 
@@ -98,7 +101,7 @@ def test_a_dropped_rows_offset_stays_uncommitted_through_plan_and_commit(monkeyp
         res.ingest_request(rid)
         assert runner.admit_retrieve(rid, NODE, WALK).ready
     bufs = res._cg_buffers
-    slots = [bufs._rid_to_slot[rid] for rid in (1, 2)]
+    slots = [bufs.rows._rid_to_slot[rid] for rid in (1, 2)]
 
     def step(kept):
         sampler_step = SamplerStep(kept_rids=kept)
@@ -115,6 +118,6 @@ def test_a_dropped_rows_offset_stays_uncommitted_through_plan_and_commit(monkeyp
         res.commit(sampler_step, ctx)
 
     step(frozenset({1}))
-    assert bufs.offset.master[slots].tolist() == [1, 0], "the dropped row's offset was committed"
+    assert bufs.rows.offset[slots].tolist() == [1, 0], "the dropped row's offset was committed"
     step(None)
-    assert bufs.offset.master[slots].tolist() == [2, 1]
+    assert bufs.rows.offset[slots].tolist() == [2, 1]

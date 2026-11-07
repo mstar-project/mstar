@@ -7,14 +7,13 @@ a config update marks it stale. A captured step gathers them itself, off the
 row of planner slots, so a resident step stages none of them on the host.
 
 What only the device knows stays by the sampler's own row, which a request
-keeps from registration to removal (`SamplerBuffers`): the RNG offset, the
-seen-token mask and the generation history.
+keeps from registration to removal (`SamplerRows`): the RNG offset, packed
+token presence and the generation history.
 A slot is a cache and a request can lose it, so none of that can live on the
-planner's rows. A resident step reads them by an index row of its sampler
-rows, gathered on the host from what each planner slot holds and uploaded
-when the planner's slot row changes, not every step. The offset is gathered
-off its master, advanced and scattered back inside the graph through that
-row, the in-graph scatter host-planned steps use, with no copy to keep in step.
+planner's rows. A resident cell holds the sampler row id, gathered alongside
+its scalars on every replay. The sampler reads and writes its owner through
+that id after the resident gather. Host-scatter mode uses ordinary host
+sampler planning while other owners may remain resident.
 """
 from __future__ import annotations
 
@@ -32,7 +31,7 @@ from mstar.engine.resources.sampler.utils import SamplingConfig, ScalarField, sc
 from mstar.utils.h2d import H2DMirror, PinnedStager
 
 if TYPE_CHECKING:
-    from mstar.engine.resources.resident import CapturedResidentStep, ResidentPlan, ResidentPlanner
+    from mstar.engine.resources.resident import CapturedResidentStep, ResidentPlanner
     from mstar.engine.resources.sampler.utils import AcceleratorGraphableSampler, SamplerBuffers
     from mstar.engine.resources.step import BucketKey
 
@@ -101,14 +100,11 @@ class _IndexRow:
     """One (bucket, slot) capture's sampler rows: the gather half, then the
     scatter half the in-graph scatter writes by, where a dropped draw's row
     is the trash row."""
-    rows: torch.Tensor  # [2 * bs]
+    rows: torch.Tensor  # [2 * bs], written by the resident gather
+    keep: torch.Tensor  # [bs], this capture's kept-draw decision
     host: np.ndarray
     mirror: H2DMirror = field(default_factory=H2DMirror)
-    # the planner's slot row these are the sampler rows of; a steady batch keeps one array
-    staged: np.ndarray | None = None
     dropped: bool = False
-    # rows -> the gather half's first ``rows``, for the scatters after a replay
-    real: dict[int, torch.Tensor] = field(default_factory=dict)
 
 
 class SamplerCells:
@@ -117,22 +113,21 @@ class SamplerCells:
 
     def __init__(self, planner: ResidentPlanner, fields: tuple[ScalarField, ...]):
         self._planner = planner
-        self.fields = fields
+        # The final field is internal identity, supplied by row(), not config.
+        self.fields = (*fields, ScalarField("sampler_row", torch.long, SAMPLER_TRASH_ROW))
         # one narrow table a field, side by side: a row's cells join its narrow run
-        self._tables = [planner.table() for _ in fields]
+        self._tables = [planner.table() for _ in self.fields]
         self._encoders = [_encoder(f.dtype) for f in fields]
-        self._defaults = [enc(f.default) for enc, f in zip(self._encoders, fields, strict=True)]
+        self._defaults = [enc(f.default) for enc, f in zip(self._encoders, fields, strict=True)] + [SAMPLER_TRASH_ROW]
         # for the torch path, made once: a capture can't copy one up
         self._default_cells = torch.tensor(self._defaults, dtype=torch.long, device=planner.device)
-        self._sizes = tuple(torch.empty((), dtype=f.dtype).element_size() for f in fields)
+        self._sizes = tuple(torch.empty((), dtype=f.dtype).element_size() for f in self.fields)
         # rid -> its cells, set on the thread that registers or updates it.
         # Handle-keyed: `drop` purges it.
         self._cells: dict[int, list[int]] = {}
-        # planner slot -> the sampler row of the request it was last written for
-        self._row_of_slot = np.zeros(planner.max_slots, dtype=np.int64)
         self._rows: dict[BucketKey, _ScalarRow] = {}
         self._index: dict[tuple[BucketKey, int], _IndexRow] = {}
-        self._stager = PinnedStager(torch.long)
+        self._stager = PinnedStager(torch.bool)
 
     @property
     def node(self) -> str:
@@ -145,7 +140,7 @@ class SamplerCells:
         the next step that reads it. Set before the mark, so a rewrite racing
         the update reads the new cells or is followed by one that does."""
         values = scalar_values(cfg, windowed)
-        self._cells[rid] = [enc(values[f.name]) for enc, f in zip(self._encoders, self.fields, strict=True)]
+        self._cells[rid] = [enc(values[f.name]) for enc, f in zip(self._encoders, self.fields[:-1], strict=True)]
         if stale:
             self._planner.mark_stale(rid)
 
@@ -154,9 +149,9 @@ class SamplerCells:
 
     def row(self, rid: int, slot: int, sampler_row: int, row: list[int]) -> None:
         """``rid``'s cells into its row, and the sampler row its slot now stands for."""
-        for table, cell in zip(self._tables, self._cells.get(rid, self._defaults), strict=True):
+        for table, cell in zip(self._tables[:-1], self._cells.get(rid, self._defaults[:-1]), strict=True):
             row[table.col] = cell
-        self._row_of_slot[slot] = sampler_row
+        row[self._tables[-1].col] = sampler_row
 
     # The step's sampler rows
 
@@ -166,44 +161,22 @@ class SamplerCells:
         if index is None:
             # every row the trash row until staged
             rows = torch.full((2 * bucket.bs,), SAMPLER_TRASH_ROW, dtype=torch.long, device=self._planner.device)
-            index = self._index[key] = _IndexRow(rows, np.full(2 * bucket.bs, SAMPLER_TRASH_ROW, dtype=np.int64))
+            keep = torch.ones(bucket.bs, dtype=torch.bool, device=self._planner.device)
+            index = self._index[key] = _IndexRow(rows, keep, np.ones(bucket.bs, dtype=bool))
         return index
 
-    def stage(self, plan: ResidentPlan) -> None:
-        """The step's sampler rows, from what each of its planner slots holds,
-        both halves in one copy; nothing when the planner's slot row didn't
-        change. Host work only, after the step's rows were written."""
-        _, bucket, slot = plan.key
+    def stage_keep(self, bucket: BucketKey, slot: int, request_ids, kept: frozenset | None) -> None:
+        """Inline before replay; None/all restores a previous subset's writes."""
         index = self.index_row(bucket, slot)
-        if index.staged is plan.slots and not index.dropped:
-            return
-        bs, n, host = bucket.bs, len(plan.slots), index.host
-        np.take(self._row_of_slot, plan.slots, out=host[:n])
-        host[n:bs] = SAMPLER_TRASH_ROW
-        host[bs:] = host[:bs]
-        self._stager.copy_(index.rows, host, mirror=index.mirror)
-        index.staged, index.dropped = plan.slots, False
-
-    def drop_draws(self, bucket: BucketKey, slot: int, request_ids, kept: frozenset) -> None:
-        """Send the draws ``kept`` leaves out to the trash row in the scatter
-        half, so their offsets and tokens stay as they were. After `stage`."""
-        index = self.index_row(bucket, slot)
-        keep = np.fromiter((rid in kept for rid in request_ids), dtype=bool, count=len(request_ids))
-        if keep.all():
-            return
-        bs, n, host = bucket.bs, len(request_ids), index.host
-        host[bs: bs + n] = np.where(keep, host[:n], SAMPLER_TRASH_ROW)
-        self._stager.copy_(index.rows, host, mirror=index.mirror)
-        index.dropped = True
-
-    def gather_view(self, bucket: BucketKey, slot: int, rows: int | None = None) -> torch.Tensor:
-        """The gather half, or its first ``rows``: a step's real rows."""
-        index = self.index_row(bucket, slot)
-        rows = bucket.bs if rows is None else rows
-        view = index.real.get(rows)
-        if view is None:
-            view = index.real[rows] = index.rows[:rows]
-        return view
+        index.host.fill(True)
+        if kept is not None:
+            index.host[:len(request_ids)] = np.fromiter(
+                (rid in kept for rid in request_ids), dtype=bool, count=len(request_ids),
+            )
+        dropped = not index.host.all()
+        if dropped or index.dropped:
+            self._stager.copy_(index.keep, index.host, mirror=index.mirror)
+        index.dropped = dropped
 
     # The capture
 
@@ -231,6 +204,10 @@ class SamplerCells:
             step.store, step.slots, tables[0].stride, col, row, self.fields, self._sizes,
             self._defaults, self._default_cells,
         )
+        index = self.index_row(step.bucket, step.slot)
+        identity = row.views["sampler_row"]
+        index.rows[:step.bucket.bs].copy_(identity)
+        index.rows[step.bucket.bs:].copy_(torch.where(index.keep, identity, SAMPLER_TRASH_ROW))
 
 
 def gather_cells(

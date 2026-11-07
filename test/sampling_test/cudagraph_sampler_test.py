@@ -86,7 +86,7 @@ def main() -> int:
         # copy of that increment must not be double-counted in the reference
         expected = _eager(logits, sampler)
         graph.replay()
-        bufs.scatter_offset(SLOT)  # persist the in-graph-advanced offsets
+        bufs.scatter_state(SLOT)  # persist the in-graph-advanced offsets
         torch.cuda.synchronize()
         if not torch.equal(graphed, expected):
             mismatches += 1

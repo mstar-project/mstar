@@ -758,10 +758,11 @@ The spec types are:
        model never applies RoPE.
    * - ``SamplerSpec(vocab_size=..., enable_repetion_penalty=...)``
      - A sampler with its own per-request parameter buffers, philox stream, and optional
-       seen-token mask. ``enable_repetion_penalty`` declares a capability, not an
-       intention. It selects which kernel variant is recorded into the captured graph.
-       Whether the penalty runs on a given step is decided from the
-       ``repetition_penalty`` values of the resident requests.
+       token-presence state. ``enable_repetion_penalty`` requires a positive
+       ``vocab_size`` equal to the logit width and selects the captured kernel's
+       capability. Per-request ``repetition_penalty`` controls its strength.
+       Packed presence bits share the sampler's admitted rows with its RNG and
+       generation history; captured draws read and update that owner every replay.
        ``enable_min_p``, ``max_repetition_window``, ``min_tokens_stop_ids`` and
        ``enable_top_p_first`` are capabilities of the same kind. See
        ``SamplingReqConfig`` above.
@@ -1667,9 +1668,11 @@ capability, ``on``, ``off: not asked for`` or ``off: <owner>: <reason>``. A resi
 didn't take fails the step's rows, and so does a row that declares other streams than its walk's
 capture: the tables advance every row on the walk's streams. Steps of other walks, and eager steps, keep the host plan and leave the row
 stale, so the first resident step after them writes it. The sampler takes part on its
-own: its per-request scalars (temperature, top-k, top-p, seed, penalties) become cells
-of the row, so a resident step stages none of them, while the RNG offset, the last token
-and the repetition-penalty mask stay by the sampler's own row of each request.
+own: its per-request scalars (temperature, top-k, top-p, seed, penalties) and its owner
+row id become cells of the row. Each replay gathers that identity before reading and
+writing the owner's RNG offset, generation history and packed token presence. With
+``sampler_ingraph_scatter: false``, the sampler uses ordinary host planning while other
+resources may still use resident tables.
 
 A resident step can also stand for several iterations of its Loop (``step_repeats``
 per node in the serving config): the host plans once and the capture replays, each loop-back
@@ -1789,7 +1792,10 @@ resource key:
 - ``SamplerStep(apply_penalty=, prefill_tracked_tokens=)``.
   ``prefill_tracked_tokens`` initializes the repetition-penalty mask with the prompt
   tokens. Only the prefill step passes them, because the sampler tracks every token it
-  samples afterwards.
+  samples afterwards. Prompt tracking respects ``penalize_prompt``. Generated-token
+  presence is recorded only for kept draws of steps with ``apply_penalty=True``,
+  including when the current penalty multiplier is 1; later settings therefore
+  read the same accumulated state on eager and captured paths.
 
 The Orpheus declaration is the simplest form. It uses one label, computes spans directly
 from the prepared inputs, and steps all four resources together:

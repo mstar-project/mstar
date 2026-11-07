@@ -15,5 +15,3 @@ def test_sampler_for_is_cached_per_bucket_and_slot():
     assert a.temperature_buf.data_ptr() == buffers.temperature.slot_view(0, 4).data_ptr()
     assert b.temperature_buf.data_ptr() == buffers.temperature.slot_view(1, 4).data_ptr()
     assert a.temperature_buf.shape[0] == 4 and c.temperature_buf.shape[0] == 8
-    a.applied_penalty_in_graph = True
-    assert buffers.sampler_for(4, 0).applied_penalty_in_graph is False

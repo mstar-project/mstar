@@ -53,7 +53,7 @@ def _prefill(resource: SamplerResource, tracked: torch.Tensor) -> None:
 
 
 def _seen(resource: SamplerResource) -> list[int]:
-    mask = resource._sampler.get_token_mask(RID)._seen_token_mask
+    mask = resource._rows.read_seen(resource._rows.indices([RID]))[0]
     return mask.nonzero().flatten().tolist()
 
 
@@ -117,7 +117,7 @@ def test_a_walk_without_token_ids_keeps_nothing():
     )
 
 
-def test_an_inert_penalty_leaves_the_mask_alone():
+def test_an_inert_penalty_keeps_the_prefix_for_later_settings():
     resource = _sampler(penalty=1.0)
     resource.apply_cached_prefix(
         RID, NODE, WALK,
@@ -126,9 +126,7 @@ def test_an_inert_penalty_leaves_the_mask_alone():
 
     _prefill(resource, PROMPT[MATCHED:])
 
-    assert _seen(resource) == [], (
-        "a request nobody penalises paid for the mask traffic anyway"
-    )
+    assert _seen(resource) == PROMPT.tolist()
 
 
 def test_a_preplan_folds_nothing_in():

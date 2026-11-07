@@ -43,7 +43,7 @@ def test_plan_thread_row_init_survives_a_concurrent_host_regrow(monkeypatch):
     t.start()
     bufs.register_request("c")  # grows the host masters on the main thread
     t.join()
-    assert bufs.temperature.master[bufs._rid_to_slot["a"]] == 0.0
+    assert bufs.temperature.master[bufs.rows._rid_to_slot["a"]] == 0.0
 
 
 def _ingraph(max_bs=4, cg_slots=2, slots=8):
@@ -59,21 +59,21 @@ def test_ingraph_scatter_rows_land_by_slot_and_padding_hits_the_trash_row():
     padding rows read and write the trash row only."""
     bufs = _ingraph()
     assert bufs.ingraph_scatter and bufs._trash_slot == 0
-    assert bufs.offset.master.shape[0] == 9
+    assert bufs.rows.offset.shape[0] == 9
     for rid in ("a", "b", "c"):
         bufs.register_request(rid)
     bufs.gather_static(["b", "a"], 4, 1)
     bufs.gather_dynamic(["b", "a"], 4, 1)  # uploads the index row, no offset gather
     # (a fresh slot's offset reset ran there; an advanced offset survives)
-    bufs.offset.master[bufs._rid_to_slot["a"]] = 10
+    bufs.rows.offset[bufs.rows._rid_to_slot["a"]] = 10
     assert bufs._slot_idx_gpu[1, :4].tolist()[2:] == [0, 0]
     s = bufs.sampler_for(4, 1)
-    assert s.ingraph_scatter and s.slot_idx_view.tolist()[:2] == [bufs._rid_to_slot[r] for r in ("b", "a")]
+    assert s.ingraph_scatter and s.slot_idx_view.tolist()[:2] == [bufs.rows._rid_to_slot[r] for r in ("b", "a")]
     s.gather_in_graph()
     assert s.offset_buf.tolist()[1] == 10
     s.offset_buf += 1
     s.scatter_in_graph()
-    assert bufs.offset.master[bufs._rid_to_slot["a"]].item() == 11
+    assert bufs.rows.offset[bufs.rows._rid_to_slot["a"]].item() == 11
 
 
 def test_ingraph_scatter_graph_masters_never_grow():
@@ -84,35 +84,37 @@ def test_ingraph_scatter_graph_masters_never_grow():
         max_batch_size=2, device=torch.device("cpu"), vocab_size=16,
         ingraph_scatter=True, slots=4,
     )
-    offset = bufs.offset.master
+    offset = bufs.rows.offset
     assert offset.shape[0] == 5
-    assert bufs.temperature.master.shape[0] == bufs.seen_tokens.master.shape[0] == 3
-    assert bufs.free_rows == 4
+    assert bufs.temperature.master.shape[0] == 3
+    masks = bufs.rows.seen_words
+    assert masks.shape[0] == 5
+    assert bufs.rows.free_rows == 4
     for rid in ("a", "b", "c", "d"):
         bufs.register_request(rid)
-    assert bufs.free_rows == 0
-    bufs._sync_device_capacity()  # a gpu-thread access grows the device rows
-    assert bufs.temperature.master.shape[0] == bufs.seen_tokens.master.shape[0] == 5
-    assert bufs.offset.master is offset
-    with pytest.raises(RuntimeError, match="MSTAR_SAMPLER_SLOTS"):
+    assert bufs.rows.free_rows == 0
+    bufs.rows.sync()  # a gpu-thread access grows the device rows
+    assert bufs.temperature.master.shape[0] == 5 and bufs.rows.seen_words is masks
+    assert bufs.rows.offset is offset
+    with pytest.raises(ValueError, match="MSTAR_SAMPLER_SLOTS"):
         bufs.register_request("e")
     # the default path still grows
     plain = SamplerBuffers.allocate(max_batch_size=2, device=torch.device("cpu"))
     for rid in ("a", "b", "c"):
         plain.register_request(rid)
-    plain._sync_device_capacity()  # a gpu-thread access grows the device rows
-    assert plain.offset.master.shape[0] >= 3 and not plain.ingraph_scatter
+    plain.rows.sync()  # a gpu-thread access grows the device rows
+    assert plain.rows.offset.shape[0] >= 3 and not plain.ingraph_scatter
 
 
 def test_capture_padding_rows_take_no_slot():
     bufs = _buffers()
-    free = len(bufs._free_slots)
+    free = len(bufs.rows._free_slots)
     for rid in (-2, -3, -4):
         bufs.register_request(rid)
-    assert len(bufs._free_slots) == free and not bufs.has_slot(-2)
+    assert len(bufs.rows._free_slots) == free and not bufs.rows.has_slot(-2)
     # padding rows read slot 0
     bufs.register_request("a")
-    assert bufs._slots_of([-2, "a"]).tolist() == [0, bufs._rid_to_slot["a"]]
+    assert bufs.rows.indices([-2, "a"]).tolist() == [0, bufs.rows._rid_to_slot["a"]]
 
 
 def test_a_dropped_row_keeps_its_offset_in_graph():
@@ -121,10 +123,10 @@ def test_a_dropped_row_keeps_its_offset_in_graph():
     bufs = _ingraph()
     for rid in ("a", "b"):
         bufs.register_request(rid)
-    slot_a, slot_b = bufs._rid_to_slot["a"], bufs._rid_to_slot["b"]
+    slot_a, slot_b = bufs.rows._rid_to_slot["a"], bufs.rows._rid_to_slot["b"]
     bufs.gather_static(["a", "b"], 4, 1)
     bufs.gather_dynamic(["a", "b"], 4, 1, kept=frozenset({"a"}))
-    bufs.offset.master[slot_a], bufs.offset.master[slot_b] = 10, 20
+    bufs.rows.offset[slot_a], bufs.rows.offset[slot_b] = 10, 20
     s = bufs.sampler_for(4, 1)
     assert s.slot_idx_view.tolist() == [slot_a, slot_b, 0, 0]
     assert s.scatter_idx_view.tolist() == [slot_a, 0, 0, 0]
@@ -132,7 +134,7 @@ def test_a_dropped_row_keeps_its_offset_in_graph():
     assert s.offset_buf.tolist()[:2] == [10, 20]
     s.offset_buf += 1
     s.scatter_in_graph()
-    assert bufs.offset.master[[slot_a, slot_b]].tolist() == [11, 20]
+    assert bufs.rows.offset[[slot_a, slot_b]].tolist() == [11, 20]
     # the next step keeps every row, and stages that into the same views
     bufs.gather_dynamic(["a", "b"], 4, 1)
     assert s.scatter_idx_view.tolist() == [slot_a, slot_b, 0, 0]
