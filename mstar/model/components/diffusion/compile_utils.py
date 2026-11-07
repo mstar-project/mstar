@@ -14,6 +14,7 @@ import functools
 import inspect
 import logging
 from collections.abc import Iterable, Sequence
+from typing import Any
 
 import torch
 from torch import nn
@@ -141,25 +142,16 @@ def step_schedule_recompile_limit(step_dtypes) -> int | None:
     return len(step_dtypes.dtypes) * recompile_limit()
 
 
-def with_inductor_rounding(compiled, *, eager_rounding: bool, deterministic: bool = False):
+def with_inductor_rounding(compiled, *, eager_rounding: bool):
     """Wrap a compiled callable so ``emulate_precision_casts`` is in effect for the
     traces it builds, and only for those. This works with torch.compile's lazy
     compilation, and post-torch 2.12 per-thread config behavior, without introducing
-    a global config change. ``deterministic`` also builds them with the engine's
-    deterministic compile option (``accelerator_graph_runner.
-    deterministic_inductor_options``): no on-device benchmarking that changes
-    numerics, so every process compiles the same kernels.
+    a global config change.
     """
     import torch._inductor.config as inductor_config
 
-    options = {"emulate_precision_casts": eager_rounding}
-    if deterministic:
-        from mstar.engine.accelerator_graph_runner import deterministic_inductor_options
-
-        options.update(deterministic_inductor_options())
-
     def forward(*args, **kwargs):
-        with inductor_config.patch(**options):
+        with inductor_config.patch(emulate_precision_casts=eager_rounding):
             return compiled(*args, **kwargs)
 
     return forward
@@ -180,7 +172,25 @@ def compile_blocks(blocks: Iterable[nn.Module], *, autotune: bool = False, **com
 
         compile_kwargs = {**level_kwargs(None), **compile_kwargs}
     compile_kwargs = {"fullgraph": False, "dynamic": False, **compile_kwargs}
+    if compile_kwargs.get("backend", "inductor") == "inductor":
+        compile_kwargs["options"] = _inductor_options(compile_kwargs, deterministic=not autotune)
     for block in blocks:
-        block.forward = with_inductor_rounding(
-            torch.compile(block.forward, **compile_kwargs), eager_rounding=True, deterministic=not autotune,
-        )
+        block.forward = torch.compile(block.forward, **compile_kwargs)
+
+
+def _inductor_options(compile_kwargs: dict[str, Any], *, deterministic: bool) -> dict[str, Any]:
+    """``torch.compile``'s ``options`` for ``compile_blocks``, its ``mode`` folded in.
+    Passed as options, they hold in every graph a block compiles into; a config patch
+    around the call lost ``deterministic`` in blocks with a graph break (torch 2.12.1),
+    whose reduction configs were then timed per process."""
+    from torch._inductor import list_mode_options
+
+    mode = compile_kwargs.pop("mode", None)
+    options = {} if mode in (None, "default") else dict(list_mode_options(mode, compile_kwargs["dynamic"]))
+    options.update(compile_kwargs.pop("options", None) or {})
+    options["emulate_precision_casts"] = True
+    if deterministic:
+        from mstar.engine.accelerator_graph_runner import deterministic_inductor_options
+
+        options.update(deterministic_inductor_options())
+    return options
