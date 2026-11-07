@@ -160,3 +160,34 @@ def test_run_row_collection_uses_descriptor_order_and_the_late_requests_metadata
     first.row_outputs["frame"].fill_(-1)
     second.row_outputs["frame"].fill_(-2)
     assert collected.per_rid_outputs[44]["late"][0].tolist() == [[21, 22, 22, 22]]
+
+
+@pytest.mark.parametrize("captured,rows_only", [(False, False), (True, False), (True, True)])
+def test_logical_subset_collection_projects_original_rows_before_tail(captured, rows_only):
+    import torch
+
+    class Spanned(_Plain):
+        def spanned_outputs(self, walk):
+            return {"frame"}
+
+    eng = _engine(Spanned.__new__(Spanned))
+    mgmt = eng._submodules["llm"]
+    mgmt.accelerator_graph_runner = SimpleNamespace(slot_for=lambda lease: SimpleNamespace(dummy_rids=(-1, -2, -3)))
+    values = torch.tensor([[10, 11], [20, 21], [30, 31]])
+    raw = BatchedModelOutput(
+        row_outputs={"frame": values}, check_stop_buffers={"token": values, "semantic": torch.tensor([0, 1, 2])},
+        output_spans={"frame": torch.tensor([[0, 2], [1, 2], [0, 1]])}, row_request_ids=(40, 50, 60),
+        per_rid_outputs={} if rows_only else {(-3 if captured else 60): {"keyed": [torch.tensor([600])]}},
+    )
+    result = eng._collect_outputs(
+        mgmt, object() if captured else None, raw, [None], {60: None},
+        request_ids=[60], step_request_ids=(40, 50, 60), graph_walk="decode", rows_only=rows_only,
+    )
+    assert result.row_request_ids == (60,)
+    assert result.check_stop_buffers["token"].tolist() == [[30, 31]]
+    assert result.check_stop_buffers["semantic"].tolist() == [2]
+    if not rows_only:
+        assert result.per_rid_outputs[60]["frame"][0].tolist() == [[30, 31]]
+        assert result.per_rid_outputs[60]["keyed"][0].tolist() == [600]
+        assert result.output_spans["frame"].tolist() == [[0, 1]]
+    assert raw.row_request_ids == (40, 50, 60) and raw.check_stop_buffers["semantic"].tolist() == [0, 1, 2]

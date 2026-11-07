@@ -4412,6 +4412,37 @@ class Engine:
         ``request_ids[i]`` on either path.
         """
         submodule = submodule_mgmt.submodule
+        out_ids = None
+        original = raw_outputs.row_request_ids
+        if original is not None and tuple(request_ids) != original[:len(request_ids)]:
+            if len(set(original)) != len(original) or len(set(request_ids)) != len(request_ids):
+                raise ValueError("logical output rows must have unique request identities")
+            positions = {rid: index for index, rid in enumerate(original)}
+            if any(rid not in positions for rid in request_ids) or raw_outputs.packed_outputs:
+                raise ValueError("logical output selection needs known row-addressed values")
+            selected = [positions[rid] for rid in request_ids]
+            capture_ids = (step_request_ids if lease is None
+                           else submodule_mgmt.accelerator_graph_runner.slot_for(lease).dummy_rids)
+            out_ids = [capture_ids[index] for index in selected]
+            indices = {}
+
+            def project(values):
+                if values is None:
+                    return None
+                result = {}
+                for name, value in values.items():
+                    if not isinstance(value, torch.Tensor) or not value.ndim or value.shape[0] < len(original):
+                        raise ValueError(f"output {name!r} has no original request-row dimension")
+                    if value.device not in indices:
+                        indices[value.device] = to_device_nonblocking(selected, value.device, dtype=torch.long)
+                    result[name] = value.index_select(0, indices[value.device])
+                return result
+
+            raw_outputs = dataclasses.replace(
+                raw_outputs, row_outputs=project(raw_outputs.row_outputs),
+                check_stop_buffers=project(raw_outputs.check_stop_buffers),
+                output_spans=project(raw_outputs.output_spans), row_request_ids=tuple(request_ids),
+            )
         if (
             rows_only
             and raw_outputs.check_stop_buffers is not None
@@ -4430,10 +4461,9 @@ class Engine:
                 row_request_ids=tuple(request_ids),
                 rows_only=True,
             )
-        out_ids = (
-            step_request_ids if lease is None
-            else submodule_mgmt.accelerator_graph_runner.slot_for(lease).dummy_rids
-        )
+        if out_ids is None:
+            out_ids = (step_request_ids if lease is None
+                       else submodule_mgmt.accelerator_graph_runner.slot_for(lease).dummy_rids)
         outputs: dict[str, NameToTensorList] = {}
 
         row_clones, row_views = self._merge_per_rid(
