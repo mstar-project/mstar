@@ -35,6 +35,7 @@ from mstar.engine.resources.step import (  # noqa: E402
 from mstar.model.components.lora.modules import ModuleLoraMap  # noqa: E402
 from mstar.model.loader.base import CheckpointRules, StackedParamRule  # noqa: E402
 from mstar.testing_utils.model import make_model
+from mstar.testing_utils.resource import StubResource
 
 HIDDEN, Q_OUT, KV_OUT, LAYERS = 16, 16, 8, 2
 QKV = LoraTarget(
@@ -785,15 +786,11 @@ def test_two_missing_adapters_cannot_both_take_the_last_slot(adapters):
     assert run_step(pool, ["r2", "r3", "r4"]).ok and pool.slot_of("r2") == pool.slot_of("r4")
 
 
-class _Pages(Resource):
+class _Pages(StubResource):
     """KV-like capacity: a unit per request, reserved at admission."""
 
     def __init__(self, units: int):
         self.free, self.held = units, set()
-
-    @classmethod
-    def build(cls, spec, info):
-        raise NotImplementedError
 
     def ask(self, rid, node_name, graph_walk):
         return None if rid in self.held else ASKS

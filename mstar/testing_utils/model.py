@@ -9,6 +9,7 @@ Use ``make_model(get_node_resources=lambda: [kv])`` for a few fixed answers, and
 subclass ``StubModel`` for a stand-in with state or helpers of its own.
 """
 from mstar.model.base import Model
+from mstar.testing_utils._overrides import stub_with
 
 
 class StubModel(Model):
@@ -34,26 +35,8 @@ class StubModel(Model):
         raise NotImplementedError(f"{type(self).__name__} does not define process_prompt")
 
 
-def _bound(value):
-    """``value`` as a class attribute: a callable takes the call's arguments without ``self``."""
-    if not callable(value):
-        return value
-
-    def method(self, *args, **kwargs):
-        del self
-        return value(*args, **kwargs)
-    return method
-
-
 def make_model(**overrides) -> StubModel:
-    """A ``StubModel`` with ``overrides`` replacing its methods and attributes by name.
-
-    A name ``Model`` does not have raises ``TypeError``, so a test cannot go on
-    overriding a method that has been renamed. The overrides go on a new class rather
-    than the instance, since ``names_checkpoint`` and the chunk wrapping of
-    ``get_graph_walk_graphs`` read the class, as they do for a real model.
-    """
-    for name in overrides:
-        if not hasattr(StubModel, name):
-            raise TypeError(f"Model has no attribute {name!r}")
-    return type("StubModel", (StubModel,), {name: _bound(value) for name, value in overrides.items()})()
+    """A ``StubModel`` with ``overrides`` replacing its methods and attributes by name;
+    a name ``Model`` does not have raises ``TypeError``. A real class holds them, so the
+    chunk wrapping of ``get_graph_walk_graphs`` applies as it does for a real model."""
+    return stub_with(StubModel, overrides)

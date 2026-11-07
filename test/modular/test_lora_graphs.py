@@ -15,7 +15,7 @@ pytest.importorskip("safetensors")
 import test_lora_pool as P  # noqa: E402
 
 from mstar.engine.accelerator_graph_config import PackedAcceleratorGraphConfig  # noqa: E402
-from mstar.engine.resources.base import EngineResourceInfo, Resource  # noqa: E402
+from mstar.engine.resources.base import EngineResourceInfo  # noqa: E402
 from mstar.engine.resources.lora import LoraBaseOnly, LoraStep  # noqa: E402
 from mstar.engine.resources.lora.ops import LoraOpsBackend, lora_apply_, lora_expand_, lora_shrink  # noqa: E402
 from mstar.engine.resources.lora.pool import LoraAdapterPool  # noqa: E402
@@ -30,6 +30,7 @@ from mstar.engine.resources.step import (  # noqa: E402
     SubmoduleStep,
 )
 from mstar.model.submodule_base import ARNodeInputs  # noqa: E402
+from mstar.testing_utils.resource import StubResource
 
 F64 = torch.float64
 CPU = torch.device("cpu")
@@ -57,13 +58,11 @@ def test_custom_ops_pass_opcheck():
 
 # --- the async worker and the compute scope -------------------------------------------------
 
-class _Plain(Resource):
+class _Plain(StubResource):
     """Admits and records what the runner drives; does not track compute."""
 
     def __init__(self, preplan=False):
         self._preplan, self.calls = preplan, []
-
-    build = None
 
     @property
     def supports_preplan(self):
@@ -386,11 +385,6 @@ def test_a_piecewise_region_inside_a_base_only_step_hands_its_state_back(adapter
             call(x, y)
 
 
-class _Attn(Resource):
-    build = None
-    force_double_buffer = False
-
-
 def _region_runner(pool, **config):
     from mstar.engine.accelerator_graph_config import PiecewisePackedConfig
     from mstar.engine.accelerator_graph_runner import PiecewiseAcceleratorGraphRunner
@@ -403,7 +397,7 @@ def _region_runner(pool, **config):
     step_runner = SimpleNamespace(built=[])
     step_runner.build_accelerator_graph_buffers = lambda specs, **kwargs: step_runner.built.extend(specs)
     return PiecewiseAcceleratorGraphRunner(
-        label="N_region", config=config, resources={"attn": _Attn(), "lora": pool},
+        label="N_region", config=config, resources={"attn": StubResource(), "lora": pool},
         step_runner=step_runner,
         device=CPU, autocast_dtype=None, num_slots=2, node_name="N", lora_keys=("lora",),
     )

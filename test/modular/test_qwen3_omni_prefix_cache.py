@@ -8,7 +8,7 @@ import pytest
 import torch
 from torch import nn
 
-from mstar.engine.resources import PositionStep, Resource, StepContext, StepRunner
+from mstar.engine.resources import PositionStep, StepContext, StepRunner
 from mstar.engine.resources.base import CachedPrefix
 from mstar.engine.resources.kv.config import PrefixSpan
 from mstar.engine.resources.kv.manager import SpanCursor
@@ -20,6 +20,7 @@ from mstar.model.qwen3_omni.config import TALKER_KV, THINKER_KV, THINKER_MIXED, 
 from mstar.model.qwen3_omni.qwen3_omni_model import TEXT_BEFORE, Qwen3OmniModel, image_span
 from mstar.model.qwen3_omni.submodules import AudioEncoderSubmodule, ThinkerSubmodule, VisionEncoderSubmodule
 from mstar.testing_utils.engine import make_engine, make_mgmt
+from mstar.testing_utils.resource import StubResource
 
 RID = "r0"
 NODE = "Thinker"
@@ -32,16 +33,12 @@ class _StubThinker(nn.Module):
         self.model.embed_tokens = nn.Embedding(16, HIDDEN)
 
 
-class _Holding(Resource):
+class _Holding(StubResource):
 
     supports_preplan = True
 
     def __init__(self, tokens: int, position: int):
         self._prefix = CachedPrefix("main", tokens, position)
-
-    @classmethod
-    def build(cls, spec, info):
-        raise NotImplementedError
 
     def resolve_cached_prefix(self, rid, node_name, graph_walk, inputs):
         return self._prefix

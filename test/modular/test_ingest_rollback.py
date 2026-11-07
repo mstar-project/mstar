@@ -7,10 +7,11 @@ import pytest
 pytest.importorskip("torch")
 
 from mstar.engine.resources.runner import StepRunner  # noqa: E402
+from mstar.testing_utils.resource import StubResource  # noqa: E402
 from mstar.worker.worker import Worker  # noqa: E402
 
 
-class _Res:
+class _Res(StubResource):
     def __init__(self, name, log, fail=False):
         self.name, self.log, self.fail = name, log, fail
 
