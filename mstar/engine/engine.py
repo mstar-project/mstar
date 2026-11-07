@@ -2267,7 +2267,8 @@ class Engine:
     def _finish_outputs(self, batch: ExecutingBatch) -> None:
         """Publish ordinary completion metadata before the outputs become ready."""
         if batch.admit_error is None:
-            self._record_loopback(batch)
+            if RUN_DESCRIPTORS not in (batch.outputs.check_stop_buffers or {}):
+                self._record_loopback(batch)
             batch.outputs.loopback_rids = batch.loopback_rids
             if batch.step_context.repeats > 1:
                 batch.outputs.run_columns = self.run_columns(batch.node_name, batch.step_context.graph_walk)
@@ -2307,6 +2308,7 @@ class Engine:
 
         inputs, req_info = self._pad_batch(batch, submodule_mgmt, lease)
         laps.lap("pad")
+        retained = False
 
         try:
             admit, batch.step = self._declare_and_admit(
@@ -2337,6 +2339,14 @@ class Engine:
             # Commit first: releasing `commit_done` here is what lets a pre-plan
             # of N+1 overlap this step's per-request tail.
             batch.commit_done.set()
+            if RUN_DESCRIPTORS in (raw.check_stop_buffers or {}):
+                # The worker closes publication and collects each descriptor
+                # under its own logical receipt before releasing this lease.
+                # Enqueue-time fixed-rid collection/ring writes would attribute
+                # a later tenant's values to the capture's original row.
+                batch.outputs = raw
+                retained = True
+                return raw
             if submodule_mgmt.rings:
                 self._write_rings(submodule_mgmt, batch, raw)
             out = self._collect_step(batch, submodule_mgmt, lease, raw, inputs, req_info)
@@ -2361,7 +2371,7 @@ class Engine:
             return out
         finally:
             laps.skip()
-            if lease is not None:
+            if lease is not None and not retained:
                 cg_runner.release(lease, real_bs)
             laps.lap("release")
 
@@ -2673,6 +2683,8 @@ class Engine:
         inputs: list[NodeInputs], req_info: Mapping[int, CurrentForwardPassInfo],
     ) -> BatchedModelOutput:
         """Collect one ordinary member's outputs after its resource commit."""
+        if RUN_DESCRIPTORS in (raw.check_stop_buffers or {}):
+            return raw  # its output owners are fixed only when publication closes
         if self._enable_nvtx:
             range_push("engine.collect_outputs")
         t0 = phase_start()
@@ -2690,6 +2702,23 @@ class Engine:
                 range_pop()
         self._add_resource_host_rows(submodule_mgmt, out, batch.step_context.repeats)
         return out
+
+    def finish_run_outputs(self, batch: ExecutingBatch, outputs: BatchedModelOutput) -> None:
+        """Finish a retained capture after all descriptor copies are enqueued.
+
+        Runs on the same execution stream as collection. The worker keeps the
+        capture out of scheduling until this transition and retains owner/
+        descriptor readers until the collection completion event lands.
+        """
+        if (RUN_DESCRIPTORS not in (batch.outputs.check_stop_buffers or {})
+                or RUN_DESCRIPTORS in (outputs.check_stop_buffers or {})):
+            raise ValueError("a retained run must finish once with identity-resolved outputs")
+        lease = batch.step_context.slot_lease
+        if lease is None:
+            raise ValueError("a retained run has no capture lease")
+        self._submodules[batch.node_name].accelerator_graph_runner.release(lease, len(batch.request_ids))
+        batch.outputs = outputs
+        self._finish_outputs(batch)
 
     @staticmethod
     def _run_row_output(
@@ -3425,6 +3454,8 @@ class Engine:
 
     def _postprocess_outputs(self, batch: ExecutingBatch, outputs: BatchedModelOutput) -> BatchedModelOutput:
         """The ordinary host tail, shared by independent and grouped steps."""
+        if RUN_DESCRIPTORS in (outputs.check_stop_buffers or {}):
+            return outputs  # descriptor grouping precedes every identity-dependent tail
         laps = PhaseLaps("engine.")
         # A failed admit means no forward ran and every rid's outputs are empty,
         # so the tail has nothing to consume; the worker re-drives the step.

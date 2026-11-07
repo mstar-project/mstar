@@ -92,7 +92,7 @@ def test_an_unbatched_step_clears_rows_only(rids):
 def test_run_row_collection_uses_descriptor_order_and_the_late_requests_metadata():
     import torch
 
-    from mstar.engine.device_run import RUN_COUNTS, RUN_REPLAYS
+    from mstar.engine.device_run import RUN_COUNTS, RUN_DESCRIPTORS, RUN_REPLAYS
 
     def raw(values):
         values = torch.tensor([values])
@@ -102,6 +102,8 @@ def test_run_row_collection_uses_descriptor_order_and_the_late_requests_metadata
                                                       RUN_REPLAYS: torch.tensor([99])})
 
     first, second = raw([11, 12, 21]), raw([22, 31, 32])
+    first.check_stop_buffers[RUN_DESCRIPTORS] = torch.tensor([[7, 7, 8]])
+    second.check_stop_buffers[RUN_DESCRIPTORS] = torch.tensor([[8, 9, 9]])
     records = [(first, [[7, 7, 8]]), (second, [[8, 9, 9]])]
     late = Engine._run_row_output(records, 8, 4)
     assert late.row_outputs["frame"].tolist() == [[21, 22, 22, 22]]
@@ -121,12 +123,19 @@ def test_run_row_collection_uses_descriptor_order_and_the_late_requests_metadata
 
     sub = Filtered.__new__(Filtered)
     eng = _engine(sub)
+    pending = _batch(rows_only=False)
+    eng.exec = lambda batch: first
+    assert eng.exec_and_postprocess(pending) is first
+    assert eng._collect_step(pending, eng._submodules["llm"], None, first, [], {}) is first
+    assert eng.per_request_tails == []
     collected = eng._collect_outputs(
         eng._submodules["llm"], None, late, [None], {44: SimpleNamespace(signal="late")},
         request_ids=[44], step_request_ids=(44,), graph_walk="decode",
     )
     assert collected.per_rid_outputs[44]["late"][0].tolist() == [[21, 22, 22, 22]]
     assert collected.row_request_ids == (44,) and collected.span_request_ids == (44,)
+    eng._postprocess_outputs(pending, collected)
+    assert eng.per_request_tails == [pending]
     first.row_outputs["frame"].fill_(-1)
     second.row_outputs["frame"].fill_(-2)
     assert collected.per_rid_outputs[44]["late"][0].tolist() == [[21, 22, 22, 22]]

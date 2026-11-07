@@ -682,3 +682,24 @@ def test_connected_inputs_reach_captured_row_owners_only_after_submission(repeat
             expected = torch.tensor([[109., 112.]] if rid == 2 else [[112., 111.]])
         assert torch.equal(outputs[1].per_rid_outputs[rid]["x"][0].reshape(repeats, 2).cpu(), expected)
         assert torch.equal(owners[1].row("x", rid).cpu(), expected[-1])
+
+
+def test_dynamic_run_retains_capture_until_identity_resolved_collection_finishes(monkeypatch):
+    from mstar.engine.device_run import RUN_DESCRIPTORS
+    from mstar.model.submodule_base import BatchedModelOutput
+
+    eng, group, events = _connected_engine()
+    batch = group.members[0][1]
+    eng.prepare_inputs(batch)
+    eng.reserve_replay_slot(batch)
+    raw = BatchedModelOutput(row_outputs={"x": torch.tensor([[[1.], [2.]]])},
+                             check_stop_buffers={RUN_DESCRIPTORS: torch.tensor([[7, 8]])})
+    monkeypatch.setattr(eng, "_drive_step", lambda *args, **kwargs: (raw, batch.step))
+    assert eng._exec_single(batch) is raw
+    assert batch.outputs is raw and "release:a" not in events
+    assert eng._postprocess_outputs(batch, raw) is raw
+    ordinary = BatchedModelOutput(per_rid_outputs={batch.request_ids[0]: {"x": [torch.tensor([[1.]])]}})
+    eng.finish_run_outputs(batch, ordinary)
+    assert events.count("release:a") == 1 and batch.outputs is ordinary
+    with pytest.raises(ValueError, match="finish once"):
+        eng.finish_run_outputs(batch, ordinary)
