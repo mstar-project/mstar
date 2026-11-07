@@ -2398,6 +2398,10 @@ class _ChunkingEngine(_SizedEngine):
         cached = self.cached.get(rid, 0)
         return InputSeqLenInfo(10 - cached, cached_prefix=cached)
 
+    def give_back_cached_prefix(self, node_name, rid, graph_walk):
+        # one rank: the lease waits with the row
+        return False
+
 
 def _chunking_scheduler(engine, mixes=None) -> MicroScheduler:
     """A scheduler whose node runs ``prefill`` in a chunk Loop."""
@@ -2589,6 +2593,46 @@ def test_a_chunked_row_starts_past_its_cached_prefix():
     manager.land(first)
     manager.queues["wg0"]._ready.update({"p0": {NODE}, "d0": {NODE}, "d1": {NODE}})
     assert _next_batch(sched, manager).chunk_ranges == {"p0": (6, 8, 10, 2)}
+
+
+class _TPLeaderEngine(_ChunkingEngine):
+    """Rank 0 of a TP instance, whose measure of a row past a cached prefix leases it."""
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.measured_rows = []
+        self.given_back = []
+
+    def input_sequence_len(self, node_name, graph_walk, request_info, inputs, rid=None):
+        if graph_walk == "prefill":
+            self.measured_rows.append(rid)
+        return super().input_sequence_len(node_name, graph_walk, request_info, inputs, rid)
+
+    def give_back_cached_prefix(self, node_name, rid, graph_walk):
+        self.given_back.append(rid)
+        return True
+
+
+@pytest.mark.usefixtures("no_chunk_floor")
+def test_on_a_tp_leader_a_row_its_step_leaves_out_gives_back_its_lease_and_is_measured_again():
+    """Held while the row waits, rank 0's lease would pin pages its followers don't, and the
+    ranks would evict apart. The step that takes the row measures it, and leases, again."""
+    engine = _TPLeaderEngine(max_bs=8, cached={"p0": 4, "p1": 4})
+    sched = _chunking_scheduler(engine)
+    manager = _Manager(["p0", "p1"], walks={"p0": "prefill", "p1": "prefill"})
+
+    first = _next_batch(sched, manager)
+
+    assert first.chunk_ranges == {"p0": (4, 8, 10, 8)}
+    assert engine.given_back == ["p1"] and not sched.cached_prefix
+
+    manager.land(first)
+    manager.queues["wg0"]._ready.update({"p0": {NODE}})
+    second = _next_batch(sched, manager)
+
+    assert second.chunk_ranges == {"p0": (8, 10, 10, 2), "p1": (4, 6, 10, 6)}
+    assert engine.measured_rows == ["p0", "p1", "p1"]
+    assert engine.given_back == ["p1"]
 
 
 def test_a_row_the_cache_holds_whole_is_not_chunked():

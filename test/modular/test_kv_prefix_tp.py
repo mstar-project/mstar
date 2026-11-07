@@ -120,7 +120,7 @@ def _engine(kv: KVManager) -> Engine:
 def _batch(rid: str, walk: str = WALK) -> SimpleNamespace:
     return SimpleNamespace(
         node_name=NODE, request_ids=(rid,), step_context=_ctx(rid, walk),
-        per_request_info_wrapped={rid: None}, cached_rids=set(),
+        per_request_info_wrapped={rid: None}, cached_rids=set(), chunk_ranges={},
     )
 
 
