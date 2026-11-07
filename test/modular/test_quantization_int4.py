@@ -75,7 +75,7 @@ def layout_tensors(w, layout, group, tensor_scale=None):
     """One linear's checkpoint tensors in ``layout`` (by suffix) and the fp32 weight they stand for (NVFP4: in units
     of ``tensor_scale``, shared by the shards of a fused layer as modelopt calibrates them)."""
     if layout == "mxfp4":
-        q = I.MXFP4.quantize_weight(w, None)
+        q = I.MXFP4.quantize_storage(w)
         codes = torch.stack([q["weight_packed"] & 15, q["weight_packed"] >> 4], -1).view(w.shape)
         table = torch.tensor(I.E2M1_VALUES)
         values = torch.where(codes & 8 != 0, -table[(codes & 7).long()], table[(codes & 7).long()])
@@ -365,18 +365,26 @@ TP_LAYOUTS = [("ct-sym", 32, 4), ("ct-asym", 32, 4), ("awq-asym", 32, 4), ("gptq
 def test_each_rank_holds_the_slices_of_the_unsharded_tensors(stored, layout, group, tp):
     path, refs = stored[(layout, group)]
     full, _ = load(path)
+    # the dense 4-bit kernels take K in 128-column blocks: down's 64 a rank at TP 4 serves bf16, said at boot
+    narrow = layout != "nvfp4" and (INTER // tp) % 128 != 0
     for rank in range(tp):
         root, plan = load(path, None, rank, tp)
-        assert {l.action for l in plan.layers.values()} == {Action.DIRECT, Action.KEEP}, (rank, plan.notes)
+        bf16 = {name for name, l in plan.layers.items() if l.action is Action.DEQUANT}
+        assert bf16 == ({f"layers.{i}.mlp.down_proj" for i in range(LAYERS)} if narrow else set()), plan.notes
+        assert not narrow or all("K in blocks of 128" in note for note in plan.notes), plan.notes
+        assert {l.action for l in plan.layers.values()} - {Action.DEQUANT} == {Action.DIRECT, Action.KEEP}
         for layer in range(LAYERS):
             for kind, rel in PATHS.items():
+                if narrow and kind == "down":
+                    continue
                 got = _linear_weight(f"layers.{layer}.{rel}", root)
                 assert torch.equal(got, _expected(refs, layer, kind, rank, tp)), (rank, layer, kind)
             # raw storage too: column-parallel rows / row-parallel columns of rank 0's full tensors
             if layout not in ("nvfp4",):
                 gu, fgu = root.layers[layer].mlp.gate_up_proj, full.layers[layer].mlp.gate_up_proj
                 rows = INTER // tp
-                for name in ("weight_packed", "weight_scale"):
+                # (the planes layout the kernels read shuffles within a row)
+                for name in ("weight_planes", "weight_scale"):
                     a, b = getattr(gu, name), getattr(fgu, name)
                     assert torch.equal(a, torch.cat([b[:INTER][rank * rows:(rank + 1) * rows],
                                                      b[INTER:][rank * rows:(rank + 1) * rows]])), name
@@ -426,7 +434,7 @@ def test_quantized_at_load_equals_the_same_weights_stored(tmp_path, fmt, tp):
             tensors[name] = w
             continue
         stored = {st.name for st in fmt_.storage(*w.shape)}
-        tensors.update({f"{base}.{s}": t for s, t in fmt_.quantize_weight(w, None).items() if s in stored})
+        tensors.update({f"{base}.{s}": t for s, t in fmt_.quantize_storage(w).items() if s in stored})
     save_file(tensors, str(stored_dir / "model.safetensors"))
     method = {"w4a16": QUANT_CONFIG["ct"], "mxfp4": QUANT_CONFIG["mxfp4"]}[fmt]
     (stored_dir / "config.json").write_text(json.dumps({"quantization_config": method}))
@@ -510,13 +518,16 @@ def _compile_cases():
     dims = {name: "i32" for name in ("M", "N", "K", "stride_xm", "stride_wn", "stride_sn", "stride_zn", "stride_os",
                                        "stride_om")}
     dense = {**ptrs, **dims}
-    yield "dot", w4a16._w4_dot_kernel, dense, dict(GROUP=128, BN=64, TB=16, BK=128, SB=128, SPLIT_K=1, STAGES=2)
-    yield "dot8", w4a16._w4_dot8_kernel, dense, dict(GROUP=32, BN=64, TB=16, BW=16, SPLIT_K=2, STAGES=2)
-    yield "gemv", w4a16._w4_gemv_kernel, dense, dict(GROUP=128, BN=32, BW=64, SPLIT_K=1, MB=1)
+    yield "dot", w4a16._w4_dot_kernel, dense, dict(GROUP=128, BN=64, TB=16, NB=2, SPLIT_K=1, STAGES=2)
+    yield "dot_g32", w4a16._w4_dot_kernel, dense, dict(GROUP=32, BN=128, TB=32, NB=1, SPLIT_K=2, STAGES=3)
+    yield "dot8", w4a16._w4_dot8_kernel, dense, dict(GROUP=32, BN=64, TB=16, NB=1, SPLIT_K=2, STAGES=2)
+    yield "dot8_g128", w4a16._w4_dot8_kernel, dense, dict(GROUP=128, BN=64, TB=64, NB=2, SPLIT_K=1, STAGES=3)
+    yield "gemv", w4a16._w4_gemv_kernel, dense, dict(GROUP=128, BN=32, NB=4, SPLIT_K=1, MB=1)
+    yield "gemv_g32", w4a16._w4_gemv_kernel, dense, dict(GROUP=32, BN=16, NB=2, SPLIT_K=2, MB=4)
     yield "dequant", w4a16._w4_dequant_kernel, {
         "w_ptr": "*i32", "s_ptr": "*bf16", "z_ptr": "*i32", "out_ptr": "*bf16",
         **{name: "i32" for name in ("N", "K", "stride_wn", "stride_sn", "stride_zn", "stride_on")}}, dict(
-        GROUP=32, BN=32, BK=128, NG=4, GS=32)
+        GROUP=32, BN=32)
     yield "experts", moe.fused_moe_w4a16_kernel, {
         "a_ptr": "*bf16", "b_ptr": "*i32", "s_ptr": "*bf16", "z_ptr": "*i32", "c_ptr": "*bf16",
         "topk_weights_ptr": "*fp32", "sorted_token_ids_ptr": "*i32", "expert_ids_ptr": "*i32",
@@ -528,7 +539,7 @@ def _compile_cases():
 
 
 @pytest.mark.parametrize("kind", [I.KIND_INT4_SYM, I.KIND_INT4_ZP, I.KIND_E2M1])
-@pytest.mark.parametrize("case", ["dot", "dot8", "gemv", "dequant", "experts"])
+@pytest.mark.parametrize("case", ["dot", "dot_g32", "dot8", "dot8_g128", "gemv", "gemv_g32", "dequant", "experts"])
 def test_every_kernel_compiles_for_hopper(case, kind):
     """Triton's compiler, not its CPU interpreter, type-checks a kernel: a helper returning a tensor zero point in
     one constexpr branch and a scalar in another compiled for no GPU (job 1479's CompilationError) while the
@@ -558,11 +569,11 @@ def _kernel_case(kind, n, k, group, device):
     w = torch.randn(n, k) * 0.05
     if kind == I.KIND_E2M1:
         q = I.MXFP4.quantize_weight(w, None)
-        return q["weight_packed"].to(device), q["weight_scale"].to(device), None
+        return q["weight_planes"].view(torch.uint8).to(device), q["weight_scale"].to(device), None
     fmt = I.W4A16Format(group=group, symmetric=kind == I.KIND_INT4_SYM)
     q = fmt.quantize_weight(w, None)
     zp = None if kind == I.KIND_INT4_SYM else I.pack_int4(torch.randint(4, 12, (n, k // group)), dim=0).to(device)
-    return q["weight_packed"].view(torch.uint8).to(device), q["weight_scale"].to(device), zp
+    return q["weight_planes"].view(torch.uint8).to(device), q["weight_scale"].to(device), zp
 
 
 @cuda
@@ -596,12 +607,12 @@ def test_cuda_dequant_gemm_matches_the_reference(kind, group, m):
 @cuda
 @pytest.mark.parametrize("kind, group", [(I.KIND_INT4_SYM, 128), (I.KIND_INT4_ZP, 32), (I.KIND_E2M1, 32)])
 @pytest.mark.parametrize("path, m, cfg", [
-    ("gemv", 1, {"BN": 32, "BW": 64, "SPLIT_K": 1, "num_warps": 4}),
-    ("gemv", 4, {"BN": 64, "BW": 16, "SPLIT_K": 3, "num_warps": 4}),
-    ("dot", 5, {"BN": 64, "TB": 16, "BK": 128, "SPLIT_K": 2, "STAGES": 3, "num_warps": 4}),
-    ("dot", 200, {"BN": 128, "TB": 128, "BK": 64, "SPLIT_K": 1, "STAGES": 2, "num_warps": 8}),
-    ("dot8", 9, {"BN": 64, "TB": 16, "BW": 16, "SPLIT_K": 2, "STAGES": 2, "num_warps": 4}),
-    ("dot8", 40, {"BN": 64, "TB": 64, "BW": 32, "SPLIT_K": 1, "STAGES": 3, "num_warps": 4}),
+    ("gemv", 1, {"BN": 32, "NB": 4, "SPLIT_K": 1, "num_warps": 4}),
+    ("gemv", 4, {"BN": 16, "NB": 2, "SPLIT_K": 3, "num_warps": 4}),
+    ("dot", 5, {"BN": 64, "TB": 16, "NB": 2, "SPLIT_K": 2, "STAGES": 3, "num_warps": 4}),
+    ("dot", 200, {"BN": 64, "TB": 64, "NB": 1, "SPLIT_K": 1, "STAGES": 3, "num_warps": 8}),
+    ("dot8", 9, {"BN": 128, "TB": 16, "NB": 1, "SPLIT_K": 2, "STAGES": 2, "num_warps": 8}),
+    ("dot8", 40, {"BN": 64, "TB": 64, "NB": 2, "SPLIT_K": 1, "STAGES": 3, "num_warps": 4}),
 ])
 def test_cuda_every_path_and_split_matches_the_reference(kind, group, path, m, cfg, monkeypatch):
     """Each path at a tile the built-in rule may not pick (the benchmark sweeps them)."""
@@ -629,10 +640,10 @@ def test_cuda_tinygemm_copy_matches_the_reference(symmetric, group, m):
     dev = torch.device("cuda")
     n, k = 1024, 2048
     fmt = I.W4A16Format(group=group, symmetric=symmetric, scale_dtype=torch.float16)
-    buffers = fmt.quantize_weight((torch.randn(n, k, device=dev) * 0.05).to(torch.bfloat16), None)
+    stored = fmt.quantize_storage((torch.randn(n, k, device=dev) * 0.05).to(torch.bfloat16))
     if not symmetric:
-        buffers["weight_zero_point"] = I.pack_int4(torch.randint(2, 14, (n, k // group), device=dev), dim=0)
-        buffers.update(fmt._tinygemm(buffers))
+        stored["weight_zero_point"] = I.pack_int4(torch.randint(2, 14, (n, k // group), device=dev), dim=0)
+    buffers = fmt.after_load(stored)
     assert buffers["tinygemm_weight"].numel() > 0
     ref_w = fmt.dequantize(buffers).to(torch.bfloat16)
     x = torch.randn(m, k, device=dev, dtype=torch.bfloat16)

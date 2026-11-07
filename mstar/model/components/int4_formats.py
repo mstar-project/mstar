@@ -95,6 +95,28 @@ def e2m1_codes(u: torch.Tensor) -> torch.Tensor:
     return code.to(_U8)
 
 
+# The kernels' layout ("planes"): in each 128-column block (16 words), word i's nibble j holds column 16j + i, so the
+# j-th nibble of every word is 16 contiguous columns, whose activations a kernel reads as one slice. Built from the
+# compressed-tensors layout at load; the scales and zero points don't move (a 16-column slice sits in one group).
+PLANE_BLOCK = 128
+
+
+def to_planes(packed: torch.Tensor) -> torch.Tensor:
+    """Compressed-tensors' int32 ``[N, K/8]`` (or an MXFP4 weight's uint8 ``[N, K/2]``) as the planes layout, int32
+    ``[N, K/8]``; K a multiple of 128."""
+    words = packed.view(_I32) if packed.dtype == _U8 else packed
+    n, w = words.shape
+    codes = unpack_int4(words).view(n, w // 16, 8, 16)  # [n, block, j, i]: column 16j + i
+    return pack_int4(codes.transpose(-1, -2).reshape(n, w * 8))
+
+
+def from_planes(planes: torch.Tensor) -> torch.Tensor:
+    """The inverse of ``to_planes``: int32 ``[N, K/8]`` in compressed-tensors' order."""
+    n, w = planes.shape
+    codes = unpack_int4(planes).view(n, w // 16, 16, 8)  # [n, block, i, j]
+    return pack_int4(codes.transpose(-1, -2).reshape(n, w * 8))
+
+
 def _as_int16(t: torch.Tensor) -> torch.Tensor:
     return t.contiguous().view(_I16) if t.dtype.is_floating_point else t
 
@@ -111,7 +133,8 @@ class W4A16Format(LinearFormat):
         self.group, self.symmetric, self.scale_dtype = group, symmetric, scale_dtype
         self.layout, self.zero_offset = layout, zero_offset
         # tinygemm_*: torch's int4 GEMM's copy of the weight (1-2 tokens, CUDA), built at load; empty elsewhere
-        self.buffers = (("weight_packed", "weight_scale") + (() if symmetric else ("weight_zero_point",))
+        # weight_planes: the checkpoint's weight_packed in the kernels' layout (``to_planes``), built at load
+        self.buffers = (("weight_planes", "weight_scale") + (() if symmetric else ("weight_zero_point",))
                         + ("tinygemm_weight", "tinygemm_scale_zero"))
 
     def __repr__(self) -> str:
@@ -131,8 +154,9 @@ class W4A16Format(LinearFormat):
     def check(self, out_features, in_features, dtype):
         if dtype not in (torch.bfloat16, torch.float16):
             raise ValueError(f"w4a16 replaces a bf16 GEMM; this linear's weight is {dtype}")
-        if in_features % self.group or in_features % 8:
-            raise ValueError(f"w4a16 needs K a multiple of its group ({self.group}); this linear's K is {in_features}")
+        if in_features % self.group or in_features % PLANE_BLOCK:
+            raise ValueError(f"w4a16 runs K in blocks of {PLANE_BLOCK} and groups of {self.group}; this linear's K "
+                             f"is {in_features}")
         if not self.symmetric and out_features % 8:
             raise ValueError(f"asymmetric w4a16 packs zero points 8 rows a word; this linear's N is {out_features}")
 
@@ -186,7 +210,8 @@ class W4A16Format(LinearFormat):
         return suffix, tensor
 
     def dequantize(self, buffers: Mapping[str, torch.Tensor]) -> torch.Tensor:
-        u = unpack_int4(buffers["weight_packed"]).float()
+        packed = buffers["weight_packed"] if "weight_packed" in buffers else from_planes(buffers["weight_planes"])
+        u = unpack_int4(packed).float()
         n, k = u.shape
         scale = buffers["weight_scale"]
         scale = (scale.view(self.scale_dtype) if scale.dtype == _I16 else scale).float()
@@ -197,7 +222,11 @@ class W4A16Format(LinearFormat):
         return ((u.view(n, -1, self.group) - zero[..., None]) * scale[..., None]).view(n, k)
 
     def quantize_weight(self, weight, input_amax):
-        """Symmetric round-to-nearest in groups (compressed-tensors' and GPTQ's scale ``amax / 7.5``)."""
+        return self.after_load(self.quantize_storage(weight))
+
+    def quantize_storage(self, weight):
+        """Symmetric round-to-nearest in groups (compressed-tensors' and GPTQ's scale ``amax / 7.5``), as a
+        checkpoint stores it."""
         n, k = weight.shape
         groups = weight.float().view(n, k // self.group, self.group)
         scale = (groups.abs().amax(-1) / 7.5).clamp_min(torch.finfo(torch.float32).tiny).to(self.scale_dtype)
@@ -206,10 +235,15 @@ class W4A16Format(LinearFormat):
         if not self.symmetric:
             out["weight_zero_point"] = pack_int4(torch.full((n, k // self.group), 8, dtype=_U8,
                                                             device=weight.device), dim=0)
-        return {**out, **self._tinygemm(out)}
+        return out
 
     def after_load(self, tensors):
-        return {**tensors, **self._tinygemm(tensors)}
+        """The checkpoint's weight in the kernels' layout (``weight_planes``) and tinygemm's copy of it."""
+        if "weight_planes" in tensors:
+            return dict(tensors)
+        out = {name: t for name, t in tensors.items() if name != "weight_packed"}
+        out["weight_planes"] = to_planes(tensors["weight_packed"])
+        return {**out, **self._tinygemm(tensors)}
 
     def _tinygemm(self, tensors) -> dict[str, torch.Tensor]:
         """torch's int4 GEMM's copy of the weight (``aten._convert_weight_to_int4pack``: uint8 ``[N, K/2]`` with the
@@ -242,13 +276,13 @@ class W4A16Format(LinearFormat):
         if device.type == "cuda":
             from mstar.utils import w4a16  # noqa: F401  (registers the CUDA kernel before any compile)
 
-    def linear(self, x, weight_packed, weight_scale, *rest):
+    def linear(self, x, weight_planes, weight_scale, *rest):
         zero_point, tg_weight, tg_scale_zero = (None, *rest) if self.symmetric else rest
         scale = weight_scale.view(self.scale_dtype) if weight_scale.dtype == _I16 else weight_scale
         if tg_scale_zero.dtype == _I16:
             tg_scale_zero = tg_scale_zero.view(torch.bfloat16)
         kind = KIND_INT4_SYM if zero_point is None else KIND_INT4_ZP
-        return torch.ops.mstar.w4a16_linear(x, weight_packed.view(_U8), scale, zero_point, self.group, kind,
+        return torch.ops.mstar.w4a16_linear(x, weight_planes.view(_U8), scale, zero_point, self.group, kind,
                                             tg_weight, tg_scale_zero)
 
 
@@ -261,14 +295,15 @@ class Mxfp4Format(LinearFormat):
     """e2m1 codes two a byte, one e8m0 scale per 32 along K (OCP MX)."""
 
     name = "mxfp4"
-    buffers = ("weight_packed", "weight_scale")
+    # weight_planes: the checkpoint's weight_packed in the kernels' layout (``to_planes``), built at load
+    buffers = ("weight_planes", "weight_scale")
     group = 32
 
     def check(self, out_features, in_features, dtype):
         if dtype not in (torch.bfloat16, torch.float16):
             raise ValueError(f"mxfp4 replaces a bf16 GEMM; this linear's weight is {dtype}")
-        if in_features % 32:
-            raise ValueError(f"mxfp4 needs K a multiple of 32; this linear's K is {in_features}")
+        if in_features % PLANE_BLOCK:
+            raise ValueError(f"mxfp4 runs K in blocks of {PLANE_BLOCK}; this linear's K is {in_features}")
 
     def unavailable_reason(self, device):
         return _triton_reason(device, self.name)
@@ -281,12 +316,25 @@ class Mxfp4Format(LinearFormat):
         return tensor.view(_U8) if tensor.dtype != _U8 and tensor.element_size() == 1 else tensor
 
     def dequantize(self, buffers):
-        codes = unpack_fp4(buffers["weight_packed"].view(_U8))
+        if "weight_packed" in buffers:
+            codes = unpack_fp4(buffers["weight_packed"].view(_U8))
+        else:
+            codes = unpack_int4(from_planes(buffers["weight_planes"].view(_I32)))
         n, k = codes.shape
         scale = torch.exp2(buffers["weight_scale"].view(_U8).float() - 127.0)
         return (e2m1_values(codes).view(n, -1, 32) * scale[..., None]).view(n, k)
 
     def quantize_weight(self, weight, input_amax):
+        return self.after_load(self.quantize_storage(weight))
+
+    def after_load(self, tensors):
+        if "weight_planes" in tensors:
+            return dict(tensors)
+        out = {name: t for name, t in tensors.items() if name != "weight_packed"}
+        out["weight_planes"] = to_planes(tensors["weight_packed"].view(_U8))
+        return out
+
+    def quantize_storage(self, weight):
         """A group's scale is the smallest power of two at or above ``amax / 6``, so nothing clips."""
         n, k = weight.shape
         groups = weight.float().view(n, k // 32, 32)
@@ -302,8 +350,8 @@ class Mxfp4Format(LinearFormat):
         if device.type == "cuda":
             from mstar.utils import w4a16  # noqa: F401
 
-    def linear(self, x, weight_packed, weight_scale):
-        return torch.ops.mstar.w4a16_linear(x, weight_packed.view(_U8), weight_scale.view(_U8), None, 32,
+    def linear(self, x, weight_planes, weight_scale):
+        return torch.ops.mstar.w4a16_linear(x, weight_planes.view(_U8), weight_scale.view(_U8), None, 32,
                                             KIND_E2M1, None, None)
 
 
@@ -324,9 +372,10 @@ KIND_INT4_SYM, KIND_INT4_ZP, KIND_E2M1 = 0, 1, 2
 
 
 def dequantize_kind(packed_u8: torch.Tensor, scale: torch.Tensor, zero_point: torch.Tensor | None, group: int,
-                    kind: int) -> torch.Tensor:
-    """fp32 ``[N, K]`` from the op's operands (``packed_u8 [N, K/2]``): the reference both kernels match."""
-    codes = unpack_fp4(packed_u8)
+                    kind: int, planes: bool = True) -> torch.Tensor:
+    """fp32 ``[N, K]`` from the op's operands (``packed_u8 [N, K/2]``, in the planes layout unless ``planes`` is
+    False, as the experts hold it): the reference the kernels match."""
+    codes = unpack_int4(from_planes(packed_u8.view(_I32))) if planes else unpack_fp4(packed_u8)
     n, k = codes.shape
     if kind == KIND_E2M1:
         values, scale = e2m1_values(codes), torch.exp2(scale.view(_U8).float() - 127.0)
@@ -342,9 +391,9 @@ def w4a16_linear(
     x: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor, zero_point: torch.Tensor | None, group: int,
     kind: int, tinygemm_weight: torch.Tensor | None = None, tinygemm_scale_zero: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """``x [M, K]`` times a 4-bit weight (uint8 ``[N, K/2]``, its group scales, zero points for ``KIND_INT4_ZP``;
-    optionally tinygemm's copy of it, for 1-2 tokens) dequantized to ``x``'s dtype: ``[M, N]``. Off CUDA, the
-    reference."""
+    """``x [M, K]`` times a 4-bit weight (uint8 ``[N, K/2]`` in the planes layout, its group scales, zero points for
+    ``KIND_INT4_ZP``; optionally tinygemm's copy of it, for 1-2 tokens) dequantized to ``x``'s dtype: ``[M, N]``.
+    Off CUDA, the reference."""
     w = dequantize_kind(weight, scale, zero_point, group, kind).to(x.dtype)
     return F.linear(x, w)
 

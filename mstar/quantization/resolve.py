@@ -136,6 +136,9 @@ def _group_problem(fmt: str, geometry: Geometry, direct: bool, kind: str, source
     for k in ks:
         if k % group or k % 8:
             return f"{fmt} runs K in whole groups of {group} per rank; this layer's K is {k}"
+    if fmt in ("w4a16", "mxfp4") and kind == LINEAR and geometry.k % 128:
+        # the dense kernels' planes layout (``int4_formats.to_planes``) takes K in 128-column blocks
+        return f"{fmt} runs K in blocks of 128 per rank; this layer's K is {geometry.k}"
     if fmt == "nvfp4" and kind == LINEAR and (geometry.k % 64 or geometry.n % 16):
         return f"nvfp4 needs K a multiple of 64 and N of 16 per rank; this layer is {geometry.n} x {geometry.k}"
     if direct:

@@ -1,27 +1,29 @@
 # SPDX-License-Identifier: Apache-2.0
 # The int4 decode follows the int4 (``use_int4_w4a16``) branch of SGLang's / vLLM's ``fused_moe_kernel_gptq_awq`` and
-# vLLM's ``awq_triton.py`` (Apache-2.0, Copyright the vLLM and SGLang authors). Changed here: the compressed-tensors
-# layout read in its own orientation, weight rows on the MMA's M side, one dot per scale group, a CUDA-core GEMV for
-# a few tokens, and an e2m1 + e8m0 (MXFP4) decode beside the int4 one.
+# vLLM's ``awq_triton.py`` (Apache-2.0, Copyright the vLLM and SGLang authors). Changed here: a weight layout
+# shuffled at load, weight rows on the MMA's M side, scales and zero points applied after the dot, a CUDA-core GEMV
+# for a few tokens, and an e2m1 + e8m0 (MXFP4) decode beside the int4 one.
 """The CUDA kernels of ``mstar::w4a16_linear`` (``model.components.int4_formats``): ``x @ W.T`` for a 4-bit ``W``.
 
-``W`` is compressed-tensors' ``[N, K/8]`` int32 words (an MXFP4 weight's ``[N, K/2]`` bytes read the same way), and
-every kernel loads a ``[rows, words]`` block along K, the way it lies in memory. An int4 code becomes ``code - zero``
-in fp32 without a conversion instruction (``code | 0x4B000000`` is the float ``2**23 + code``); scales apply once per
-word or per group, not per weight. Paths:
+``W`` is int32 ``[N, K/8]`` in the planes layout (``int4_formats.to_planes``, built at load from compressed-tensors'
+or an MXFP4 checkpoint's order): in each 128-column block of a row, word i's nibble j is column 16 j + i, so one
+nibble of a block's 16 words is 16 contiguous columns. Machete and Marlin shuffle a weight at load into their MMA's
+operand order for the same reason: the kernel decodes the weight where the dot reads it, and x's slice for it is
+contiguous. An int4 code becomes ``code - 8`` in fp32 without a conversion instruction (``code | 0x4B000000`` is the
+float ``2**23 + code``), and scales and zero points apply to the dot's output, ``scale * (dot + (8 - zero) *
+sum(x))``, so the decode feeding a dot has no per-row operand. Paths:
 
 - ``tinygemm`` (1-2 tokens): torch's int4 GEMM (``aten._weight_int4pack_mm``) on its own copy of the weight, which
   ``int4_formats`` builds at load for a symmetric or zero-point int4 weight in groups of 32-256;
-- ``gemv`` (a few tokens): CUDA-core FMAs over a word's 8 nibbles in turn (no unpacking reshape), each weight decoded
-  once for all tokens, reduced once at the end; split along K;
+- ``gemv`` (a few tokens): CUDA-core FMAs over a word's 8 nibbles in turn, each weight decoded once for all tokens,
+  reduced once at the end; split along K;
 - ``dot`` / ``dot8``: weight rows on the MMA's M side and tokens (padded to 16) on its N side; ``dot`` unpacks a
-  block and runs one dot per scale group, ``dot8`` runs one dot per nibble position (K in another order, which a sum
-  doesn't mind); split along K;
+  block in column order and runs one dot per scale group, ``dot8`` one dot per nibble position with no unpacking;
+  split along K;
 - ``dequant``: past ``DEQUANT_M`` tokens, the weight dequantized to the activation's dtype and cuBLAS runs it.
 
-Which path and tile runs at a token count is ``config``'s built-in rule, set from ``bench_w4a16``'s H200 sweep at
-Qwen3.5-27B's shapes (``res/w4r2``, job 1479); a hypothesis for other GPUs and shapes. Every path matches the
-reference op (``int4_formats.dequantize_kind`` then a GEMM) to fp32 accumulation order.
+Which path and tile runs at a token count is ``config``'s built-in rule, a hypothesis for other GPUs and shapes.
+Every path matches the reference op (``int4_formats.dequantize_kind`` then a GEMM) to fp32 accumulation order.
 """
 
 from __future__ import annotations
@@ -82,14 +84,44 @@ def _group_zero(z_ptr, n, live, g, stride_zn):
 
 
 @triton.jit
+def _plane_params(s_ptr, z_ptr, n, live, g, stride_sn, stride_zn, KIND: tl.constexpr):
+    """Rows ``n``'s scale and ``2**23 + zero`` at group ``g`` (the zero a float constant without zero points)."""
+    scale = _group_scale(s_ptr, n, live, g, stride_sn, KIND)
+    if KIND == 1:
+        return scale, _group_zero(z_ptr, n, live, g, stride_zn)
+    return scale, scale * 0.0 + 8388616.0
+
+
+@triton.jit
+def _plane_codes(words, j0: tl.constexpr, P: tl.constexpr, BN: tl.constexpr):
+    """Nibbles j0 .. j0 + P - 1 of a block's words ``[BN, 16]`` as codes ``[BN, 16 P]`` in column order (the planes
+    layout puts nibble j of word i at column 16 j + i)."""
+    shifts = 4 * (j0 + tl.arange(0, P))
+    return tl.reshape((words[:, None, :] >> shifts[None, :, None]) & 0xF, (BN, 16 * P))
+
+
+@triton.jit
+def _chunk_update(acc, part, xsum, s_ptr, z_ptr, n, live_n, g, stride_sn, stride_zn, KIND: tl.constexpr):
+    """``acc + scale * (part + (8 - zero) * xsum)`` for one scale group's partial ``part = (code - 8) @ x`` and
+    ``xsum`` its x columns' sum (``[BN, TB]``, each row the same; the zero term only with zero points): scales and
+    zero points meet the dot's output, so the weight decode before the dot has no per-row operand."""
+    scale = _group_scale(s_ptr, n, live_n, g, stride_sn, KIND)
+    if KIND == 1:
+        part = part + (8388616.0 - _group_zero(z_ptr, n, live_n, g, stride_zn))[:, None] * xsum
+    return acc + part * scale[:, None]
+
+
+@triton.jit
 def _w4_dot_kernel(
     x_ptr, w_ptr, s_ptr, z_ptr, out_ptr, M, N, K,
     stride_xm, stride_wn, stride_sn, stride_zn, stride_os, stride_om,
-    KIND: tl.constexpr, GROUP: tl.constexpr, BN: tl.constexpr, TB: tl.constexpr, BK: tl.constexpr,
-    SB: tl.constexpr, SPLIT_K: tl.constexpr, STAGES: tl.constexpr,
+    KIND: tl.constexpr, GROUP: tl.constexpr, BN: tl.constexpr, TB: tl.constexpr, NB: tl.constexpr,
+    SPLIT_K: tl.constexpr, STAGES: tl.constexpr,
 ):
-    """``out[pid_k, t, n]`` for BN weight rows x TB tokens: steps of BK columns made of BK / SB dots, one scale group
-    each (SB = min(BK, GROUP)); split ``pid_k`` takes steps pid_k, pid_k + SPLIT_K, ..."""
+    """``out[pid_k, t, n]`` for BN weight rows x TB tokens. A step is NB 128-column blocks of the planes layout (16
+    words a row each); a block is one dot per scale group (K = min(GROUP, 128)) of its codes, unpacked in column
+    order, against x's contiguous columns. Split ``pid_k`` takes steps pid_k, pid_k + SPLIT_K, ..."""
+    P: tl.constexpr = 8 if GROUP >= 128 else GROUP // 16
     pid_n = tl.program_id(0)
     pid_t = tl.program_id(1)
     pid_k = tl.program_id(2)
@@ -99,21 +131,25 @@ def _w4_dot_kernel(
     live_t = t < M
     w_rows = w_ptr + n[:, None].to(tl.int64) * stride_wn
     x_rows = x_ptr + t[:, None].to(tl.int64) * stride_xm
-    sub = tl.arange(0, SB)
+    i16 = tl.arange(0, 16)
+    cols = tl.arange(0, 16 * P)
     acc = tl.zeros((BN, TB), dtype=tl.float32)
-    for k0 in tl.range(pid_k * BK, K, SPLIT_K * BK, num_stages=STAGES):
-        for j in tl.static_range(BK // SB):
-            k = k0 + j * SB
-            live_k = k < K
-            words = tl.load(w_rows + (k // 8 + tl.arange(0, SB // 8))[None, :], mask=live_n[:, None] & live_k, other=0)
-            scale = _group_scale(s_ptr, n, live_n & live_k, k // GROUP, stride_sn, KIND)
-            if KIND == 1:
-                zf = _group_zero(z_ptr, n, live_n & live_k, k // GROUP, stride_zn)
-                v = _values(_codes(words, BN, SB), zf[:, None], KIND)
-            else:
-                v = _values(_codes(words, BN, SB), 8388616.0, KIND)
-            xk = tl.load(x_rows + (k + sub)[None, :], mask=live_t[:, None] & live_k, other=0.0)
-            acc += tl.dot(v.to(xk.dtype), tl.trans(xk)) * scale[:, None]
+    for k0 in tl.range(pid_k * NB * 128, K, SPLIT_K * NB * 128, num_stages=STAGES):
+        for b in tl.static_range(NB):
+            kb = k0 + 128 * b
+            words = tl.load(w_rows + (kb // 8 + i16)[None, :], mask=live_n[:, None], other=0)
+            for c in tl.static_range(8 // P):
+                kc = kb + 16 * P * c
+                v = _values(_plane_codes(words, P * c, P, BN), 8388616.0, KIND)
+                xk = tl.load(x_rows + (kc + cols)[None, :], mask=live_t[:, None], other=0.0)
+                part = tl.dot(v.to(xk.dtype), tl.trans(xk))
+                xsum = part
+                if KIND == 1:
+                    # x's column sums broadcast over the rows, from the tensor cores (a reduction across the
+                    # tile's threads measured ~80-320 shuffles a block in its PTX)
+                    xsum = tl.dot(tl.full((BN, 16 * P), 1.0, tl.float32).to(xk.dtype), tl.trans(xk))
+                acc = _chunk_update(acc, part, xsum, s_ptr, z_ptr, n, live_n, kc // GROUP, stride_sn, stride_zn,
+                                    KIND)
     out = out_ptr + pid_k * stride_os + t[None, :].to(tl.int64) * stride_om + n[:, None]
     tl.store(out, acc.to(out_ptr.dtype.element_ty), mask=live_n[:, None] & live_t[None, :])
 
@@ -122,12 +158,13 @@ def _w4_dot_kernel(
 def _w4_dot8_kernel(
     x_ptr, w_ptr, s_ptr, z_ptr, out_ptr, M, N, K,
     stride_xm, stride_wn, stride_sn, stride_zn, stride_os, stride_om,
-    KIND: tl.constexpr, GROUP: tl.constexpr, BN: tl.constexpr, TB: tl.constexpr, BW: tl.constexpr,
+    KIND: tl.constexpr, GROUP: tl.constexpr, BN: tl.constexpr, TB: tl.constexpr, NB: tl.constexpr,
     SPLIT_K: tl.constexpr, STAGES: tl.constexpr,
 ):
-    """``dot`` with one dot per nibble position: a step of BW words (8 BW columns) is 8 dots of K = BW, nibble j of
-    every word against columns 8i + j of x. With a group at least the step, the scale applies to the step's partial;
-    with smaller groups, to each weight before its dot."""
+    """``dot`` with one dot per nibble position (K = 16): nibble j of a block's words is the weight of x's 16
+    contiguous columns 16 j.., so the words go to the dot's register layout once and every nibble decodes in place
+    (no unpacking reshape), at the price of eight small dots a block."""
+    P: tl.constexpr = 8 if GROUP >= 128 else GROUP // 16
     pid_n = tl.program_id(0)
     pid_t = tl.program_id(1)
     pid_k = tl.program_id(2)
@@ -137,35 +174,26 @@ def _w4_dot8_kernel(
     live_t = t < M
     w_rows = w_ptr + n[:, None].to(tl.int64) * stride_wn
     x_rows = x_ptr + t[:, None].to(tl.int64) * stride_xm
-    wi = tl.arange(0, BW)
+    i16 = tl.arange(0, 16)
     acc = tl.zeros((BN, TB), dtype=tl.float32)
-    for k0 in tl.range(pid_k * BW * 8, K, SPLIT_K * BW * 8, num_stages=STAGES):
-        kw = k0 + 8 * wi
-        live_w = live_n[:, None] & (kw < K)[None, :]
-        words = tl.load(w_rows + (k0 // 8 + wi)[None, :], mask=live_w, other=0)
-        if GROUP >= 8 * BW:
-            scale = _group_scale(s_ptr, n, live_n & (k0 < K), k0 // GROUP, stride_sn, KIND)
-            if KIND == 1:
-                zf = _group_zero(z_ptr, n, live_n & (k0 < K), k0 // GROUP, stride_zn)[:, None]
-            else:
-                zf = 8388616.0
-        else:
-            scale = _group_scale(s_ptr, n[:, None], live_w, (kw // GROUP)[None, :], stride_sn, KIND)
-            if KIND == 1:
-                zf = _group_zero(z_ptr, n[:, None], live_w, (kw // GROUP)[None, :], stride_zn)
-            else:
-                zf = 8388616.0
-        part = tl.zeros((BN, TB), dtype=tl.float32)
-        for j in tl.static_range(8):
-            v = _values((words >> (4 * j)) & 0xF, zf, KIND)
-            if GROUP < 8 * BW:
-                v = v * scale
-            xj = tl.load(x_rows + (kw + j)[None, :], mask=live_t[:, None] & (kw < K)[None, :], other=0.0)
-            part += tl.dot(v.to(xj.dtype), tl.trans(xj))
-        if GROUP >= 8 * BW:
-            acc += part * scale[:, None]
-        else:
-            acc += part
+    for k0 in tl.range(pid_k * NB * 128, K, SPLIT_K * NB * 128, num_stages=STAGES):
+        for b in tl.static_range(NB):
+            kb = k0 + 128 * b
+            words = tl.load(w_rows + (kb // 8 + i16)[None, :], mask=live_n[:, None], other=0)
+            for c in tl.static_range(8 // P):
+                part = tl.zeros((BN, TB), dtype=tl.float32)
+                xsum = tl.zeros((TB, 16), dtype=tl.float32)
+                for p in tl.static_range(P):
+                    j = P * c + p
+                    v = _values((words >> (4 * j)) & 0xF, 8388616.0, KIND)
+                    xj = tl.load(x_rows + (kb + 16 * j + i16)[None, :], mask=live_t[:, None], other=0.0)
+                    part = tl.dot(v.to(xj.dtype), tl.trans(xj), part)
+                    if KIND == 1:
+                        xsum += xj.to(tl.float32)
+                if KIND == 1:
+                    xsum = tl.broadcast_to(tl.sum(xsum, axis=1)[None, :], (BN, TB))
+                acc = _chunk_update(acc, part, xsum, s_ptr, z_ptr, n, live_n, (kb + 16 * P * c) // GROUP, stride_sn,
+                                    stride_zn, KIND)
     out = out_ptr + pid_k * stride_os + t[None, :].to(tl.int64) * stride_om + n[:, None]
     tl.store(out, acc.to(out_ptr.dtype.element_ty), mask=live_n[:, None] & live_t[None, :])
 
@@ -174,63 +202,88 @@ def _w4_dot8_kernel(
 def _w4_gemv_kernel(
     x_ptr, w_ptr, s_ptr, z_ptr, out_ptr, M, N, K,
     stride_xm, stride_wn, stride_sn, stride_zn, stride_os, stride_om,
-    KIND: tl.constexpr, GROUP: tl.constexpr, BN: tl.constexpr, BW: tl.constexpr, SPLIT_K: tl.constexpr,
+    KIND: tl.constexpr, GROUP: tl.constexpr, BN: tl.constexpr, NB: tl.constexpr, SPLIT_K: tl.constexpr,
     MB: tl.constexpr,
 ):
-    """``out[pid_k, m, n]`` for BN weight rows and MB (>= M) tokens on CUDA cores. A step loads BW words a row and
-    takes their 8 nibbles in turn against the matching strided columns of x, summing each word's 8 products before
-    its one scale multiply; the accumulator keeps the word axis and is reduced once after the loop."""
+    """``out[pid_k, m, n]`` for BN weight rows and up to 4 tokens on CUDA cores. A step loads 16 NB words a row (NB
+    128-column blocks); nibble j of every word meets x's columns 128 (w // 16) + 16j + w % 16, contiguous by 16.
+    Accumulators keep the word axis (one per token, 2-D, no broadcast between layouts) and are reduced once after
+    the loop; with a group of at least 128, a step's products are summed before their one scale multiply."""
     pid_n = tl.program_id(0)
     pid_k = tl.program_id(1)
     n = pid_n * BN + tl.arange(0, BN)
     live_n = n < N
     w_rows = w_ptr + n[:, None].to(tl.int64) * stride_wn
-    wi = tl.arange(0, BW)
-    rows_m = tl.arange(0, MB)
-    x_rows = x_ptr + rows_m[:, None] * stride_xm
-    live_m = rows_m[:, None] < M
-    acc = tl.zeros((MB, BN, BW), dtype=tl.float32)
-    for k0 in range(pid_k * BW * 8, K, SPLIT_K * BW * 8):
-        kw = k0 + 8 * wi
-        live_w = live_n[:, None] & (kw < K)[None, :]
-        words = tl.load(w_rows + (k0 // 8 + wi)[None, :], mask=live_w, other=0)
-        scale = _group_scale(s_ptr, n[:, None], live_w, (kw // GROUP)[None, :], stride_sn, KIND)
-        if KIND == 1:
-            zf = _group_zero(z_ptr, n[:, None], live_w, (kw // GROUP)[None, :], stride_zn)
+    wi = tl.arange(0, 16 * NB)
+    col = ((wi // 16) * 128 + wi % 16)[None, :]
+    acc0 = tl.zeros((BN, 16 * NB), dtype=tl.float32)
+    acc1 = tl.zeros((BN, 16 * NB), dtype=tl.float32)
+    acc2 = tl.zeros((BN, 16 * NB), dtype=tl.float32)
+    acc3 = tl.zeros((BN, 16 * NB), dtype=tl.float32)
+    for k0 in range(pid_k * NB * 128, K, SPLIT_K * NB * 128):
+        words = tl.load(w_rows + (k0 // 8 + wi)[None, :], mask=live_n[:, None], other=0)
+        if GROUP >= 128:
+            scale, zf = _plane_params(s_ptr, z_ptr, n[:, None], live_n[:, None], (k0 + col - col % 128) // GROUP,
+                                      stride_sn, stride_zn, KIND)
+            p0 = tl.zeros((BN, 16 * NB), dtype=tl.float32)
+            p1 = tl.zeros((BN, 16 * NB), dtype=tl.float32)
+            p2 = tl.zeros((BN, 16 * NB), dtype=tl.float32)
+            p3 = tl.zeros((BN, 16 * NB), dtype=tl.float32)
+            for j in tl.static_range(8):
+                v = _values((words >> (4 * j)) & 0xF, zf, KIND)
+                xo = x_ptr + k0 + col + 16 * j
+                p0 += v * tl.load(xo, mask=0 < M, other=0.0).to(tl.float32)
+                if MB > 1:
+                    p1 += v * tl.load(xo + stride_xm, mask=1 < M, other=0.0).to(tl.float32)
+                if MB > 2:
+                    p2 += v * tl.load(xo + 2 * stride_xm, mask=2 < M, other=0.0).to(tl.float32)
+                    p3 += v * tl.load(xo + 3 * stride_xm, mask=3 < M, other=0.0).to(tl.float32)
+            acc0 += p0 * scale
+            if MB > 1:
+                acc1 += p1 * scale
+            if MB > 2:
+                acc2 += p2 * scale
+                acc3 += p3 * scale
         else:
-            zf = 8388616.0
-        part = tl.zeros((MB, BN, BW), dtype=tl.float32)
-        for j in tl.static_range(8):
-            v = _values((words >> (4 * j)) & 0xF, zf, KIND)
-            xj = tl.load(x_rows + (kw + j)[None, :], mask=live_m & (kw < K)[None, :], other=0.0).to(tl.float32)
-            part += v[None, :, :] * xj[:, None, :]
-        acc += part * scale[None, :, :]
-    out = out_ptr + pid_k * stride_os + rows_m[:, None] * stride_om + n[None, :]
-    tl.store(out, tl.sum(acc, axis=2).to(out_ptr.dtype.element_ty), mask=live_m & live_n[None, :])
+            for j in tl.static_range(8):
+                scale, zf = _plane_params(s_ptr, z_ptr, n[:, None], live_n[:, None],
+                                          (k0 + col - col % 128 + 16 * j) // GROUP, stride_sn, stride_zn, KIND)
+                v = _values((words >> (4 * j)) & 0xF, zf, KIND) * scale
+                xo = x_ptr + k0 + col + 16 * j
+                acc0 += v * tl.load(xo, mask=0 < M, other=0.0).to(tl.float32)
+                if MB > 1:
+                    acc1 += v * tl.load(xo + stride_xm, mask=1 < M, other=0.0).to(tl.float32)
+                if MB > 2:
+                    acc2 += v * tl.load(xo + 2 * stride_xm, mask=2 < M, other=0.0).to(tl.float32)
+                    acc3 += v * tl.load(xo + 3 * stride_xm, mask=3 < M, other=0.0).to(tl.float32)
+    out = out_ptr + pid_k * stride_os + n
+    dtype = out_ptr.dtype.element_ty
+    tl.store(out, tl.sum(acc0, axis=1).to(dtype), mask=live_n)
+    if MB > 1:
+        tl.store(out + stride_om, tl.sum(acc1, axis=1).to(dtype), mask=live_n & (1 < M))
+    if MB > 2:
+        tl.store(out + 2 * stride_om, tl.sum(acc2, axis=1).to(dtype), mask=live_n & (2 < M))
+        tl.store(out + 3 * stride_om, tl.sum(acc3, axis=1).to(dtype), mask=live_n & (3 < M))
 
 
 @triton.jit
 def _w4_dequant_kernel(
     w_ptr, s_ptr, z_ptr, out_ptr, N, K, stride_wn, stride_sn, stride_zn, stride_on,
-    KIND: tl.constexpr, GROUP: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, NG: tl.constexpr,
-    GS: tl.constexpr,
+    KIND: tl.constexpr, GROUP: tl.constexpr, BN: tl.constexpr,
 ):
+    """One 128-column block of BN rows from the planes layout, nibble j to columns 16j..16j + 15."""
     n = tl.program_id(0) * BN + tl.arange(0, BN)
-    k0 = tl.program_id(1) * BK
+    kb = tl.program_id(1) * 128
     live_n = n < N
-    words = tl.load(w_ptr + n[:, None].to(tl.int64) * stride_wn + (k0 // 8 + tl.arange(0, BK // 8))[None, :],
-                    mask=live_n[:, None], other=0)
-    groups = k0 // GROUP + tl.arange(0, NG)[None, :]
-    scale = _group_scale(s_ptr, n[:, None], live_n[:, None], groups, stride_sn, KIND)
-    if KIND == 1:
-        zf = tl.reshape(tl.broadcast_to(_group_zero(z_ptr, n[:, None], live_n[:, None], groups, stride_zn)[:, :, None],
-                                        (BN, NG, GS)), (BN, BK))
-        v = _values(_codes(words, BN, BK), zf, KIND)
-    else:
-        v = _values(_codes(words, BN, BK), 8388616.0, KIND)
-    v = tl.reshape(v, (BN, NG, GS)) * scale[:, :, None]
-    tl.store(out_ptr + n[:, None].to(tl.int64) * stride_on + (k0 + tl.arange(0, BK))[None, :],
-             tl.reshape(v, (BN, BK)).to(out_ptr.dtype.element_ty), mask=live_n[:, None])
+    i16 = tl.arange(0, 16)
+    words = tl.load(w_ptr + n[:, None].to(tl.int64) * stride_wn + (kb // 8 + i16)[None, :], mask=live_n[:, None],
+                    other=0)
+    for j in tl.static_range(8):
+        kc = kb + 16 * j
+        scale, zf = _plane_params(s_ptr, z_ptr, n, live_n, kc // GROUP, stride_sn, stride_zn, KIND)
+        v = _values((words >> (4 * j)) & 0xF, zf[:, None], KIND) * scale[:, None]
+        tl.store(out_ptr + n[:, None].to(tl.int64) * stride_on + (kc + i16)[None, :],
+                 v.to(out_ptr.dtype.element_ty), mask=live_n[:, None])
 
 
 @lru_cache(maxsize=None)
@@ -238,47 +291,43 @@ def _sm_count(index: int) -> int:
     return torch.cuda.get_device_properties(index).multi_processor_count
 
 
-def _block_k(group: int, k: int, want: int) -> int:
-    """A K step that divides the group or is whole groups, and divides K."""
-    for bk in (want, 512, 256, 128, 64, 32):
-        if bk <= k and k % bk == 0 and (bk % group == 0 or group % bk == 0):
-            return bk
-    raise ValueError(f"no K step for K={k}, group={group}")
-
-
 def _split(ctas: int, k_steps: int, sms: int, waves: int) -> int:
     return max(1, min(16, k_steps, (waves * sms) // max(ctas, 1)))
 
 
 def _tb(m: int) -> int:
-    return 16 if m <= 16 else 32 if m <= 32 else 64 if m <= 64 else 128
+    return 16 if m <= 16 else 32 if m <= 32 else 64
+
+
+def _nb(blocks: int, want: int) -> int:
+    """The largest of want, want / 2, ..., 1 dividing ``blocks`` (a step must not run past K)."""
+    while blocks % want:
+        want //= 2
+    return want
 
 
 def config(m: int, n: int, k: int, group: int, kind: int, sms: int) -> tuple[str, dict]:
-    """The built-in path and tile for ``m`` tokens of an ``[n, k]`` weight. From the H200 sweep at Qwen3.5-27B's
-    shapes (job 1479): a GEMV step of 512 columns was 2-5x faster than 128-256 at one token; the dot path took
-    64 x 16 tiles with 256-column steps for up to 16 tokens (128-row tiles, 8 warps, for the N = 5120 layers), 32 and
-    64 tokens their own TB, and dequant + cuBLAS overtook every tile at 256."""
+    """The built-in path and tile for ``m`` tokens of an ``[n, k]`` weight: the H200 winners of ``bench_w4a16`` at
+    Qwen3.5-27B's shapes for the compressed-tensors layout (job 1492, ``res/w4r3k``) carried over to the planes
+    layout, so a hypothesis until a sweep of these kernels: the GEMV at one token (MXFP4 to four; tinygemm takes
+    int4's one and two), ``dot`` with 16 tokens a tile and 128 rows (8 warps) for N under ~128 tiles or 64 rows and
+    two blocks a step above, 64 rows for more tokens (tiles of up to 64), and dequant + cuBLAS from ``DEQUANT_M``
+    tokens."""
     if m >= DEQUANT_M:
         return "dequant", {}
-    if m <= GEMV_MAX:
-        # (a step reads each word's own group, and masks the columns past K)
-        bn, bw = 32, 64 if k >= 512 else 16
-        return "gemv", {"BN": bn, "BW": bw, "SPLIT_K": _split(triton.cdiv(n, bn), k // (8 * bw), sms, 4),
+    blocks = k // 128
+    if m == 1 or (kind == KIND_E2M1 and m <= GEMV_MAX):
+        nb = _nb(blocks, 4)
+        return "gemv", {"BN": 16, "NB": nb, "SPLIT_K": _split(triton.cdiv(n, 16), blocks // nb, sms, 4),
                         "num_warps": 4}
     tb = _tb(m)
-    if tb == 128:
-        bn, bk, st, w = 64, 64, 4, 4
-    elif n <= 8192 and tb == 16:
-        bn, bk, st, w = 128, 128, 3, 8
-    elif tb == 16:
-        bn, bk, st, w = 64, 256, 2, 4
-    else:
-        bn, bk, st, w = 64, 128, 3, 4
-    bk = _block_k(group, k, bk)
+    wide = tb == 16 and triton.cdiv(n, 128) < sms
+    # 64 x 64 tiles spill at 4 warps (255 registers in the sm_90 PTX), not at 8
+    bn, warps = (128, 8) if wide else (64, 8 if tb == 64 else 4)
+    nb = _nb(blocks, 2) if tb == 16 and not wide else 1
     ctas = triton.cdiv(n, bn) * triton.cdiv(m, tb)
-    return "dot", {"BN": bn, "TB": tb, "BK": bk, "SPLIT_K": _split(ctas, k // bk, sms, 2),
-                   "STAGES": 2 if kind == KIND_E2M1 else st, "num_warps": w}
+    return "dot", {"BN": bn, "TB": tb, "NB": nb, "SPLIT_K": _split(ctas, blocks // nb, sms, 2),
+                   "STAGES": 2 if nb == 2 else 3, "num_warps": warps}
 
 
 # a stand-in for ``config`` (the benchmark sweeps tiles through it); None runs the built-in rule
@@ -299,15 +348,15 @@ def _scale_zero(scale, zero_point):
 
 def dequantize(weight: torch.Tensor, scale: torch.Tensor, zero_point: torch.Tensor | None, group: int, kind: int,
                dtype: torch.dtype) -> torch.Tensor:
-    """The ``[N, K]`` weight in ``dtype`` (the large-M path's scratch, and tests)."""
+    """The ``[N, K]`` weight (planes layout in) in ``dtype``: the large-M path's scratch, and tests."""
     words = _words(weight)
     n, k = words.shape[0], words.shape[1] * 8
     out = torch.empty((n, k), dtype=dtype, device=weight.device)
-    bn, bk = 32, _block_k(group, k, 128)
     s, ssn, z, szn = _scale_zero(scale, zero_point)
-    _w4_dequant_kernel[(triton.cdiv(n, bn), k // bk)](
-        words, s, z, out, n, k, words.stride(0), ssn, szn, out.stride(0),
-        KIND=kind, GROUP=group, BN=bn, BK=bk, NG=max(bk // group, 1), GS=min(group, bk), num_warps=4,
+    bn = 32
+    _w4_dequant_kernel[(triton.cdiv(n, bn), k // 128)](
+        words, s, z, out, n, k, words.stride(0), ssn, szn, out.stride(0), KIND=kind, GROUP=group, BN=bn,
+        num_warps=4,
     )
     return out
 
@@ -315,10 +364,11 @@ def dequantize(weight: torch.Tensor, scale: torch.Tensor, zero_point: torch.Tens
 def gemm(x: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor, zero_point: torch.Tensor | None, group: int,
          kind: int, tinygemm_weight: torch.Tensor | None = None,
          tinygemm_scale_zero: torch.Tensor | None = None) -> torch.Tensor:
+    """``x @ W.T`` for ``W`` in the planes layout (uint8 ``[N, K/2]`` or int32 ``[N, K/8]``), K a multiple of 128."""
     words = _words(weight)
     m, k = x.shape
     n = words.shape[0]
-    assert words.shape[1] * 8 == k and words.is_contiguous(), (tuple(weight.shape), k)
+    assert words.shape[1] * 8 == k and k % 128 == 0 and words.is_contiguous(), (tuple(weight.shape), k)
     assert kind != KIND_INT4_ZP or zero_point is not None
     if (CONFIG_OVERRIDE is None and m <= TINYGEMM_MAX and tinygemm_weight is not None and tinygemm_weight.numel()
             and x.dtype == tinygemm_scale_zero.dtype):
@@ -329,23 +379,20 @@ def gemm(x: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor, zero_point:
     if path == "dequant":
         return torch.nn.functional.linear(x, dequantize(weight, scale, zero_point, group, kind, x.dtype))
     split = cfg["SPLIT_K"]
+    assert (k // 128) % cfg["NB"] == 0, (k, cfg)  # a step of NB blocks never runs past K
     out = torch.empty((split, m, n), dtype=torch.float32 if split > 1 else x.dtype, device=x.device)
     s, ssn, z, szn = _scale_zero(scale, zero_point)
     common = (x, words, s, z, out, m, n, k, x.stride(0), words.stride(0), ssn, szn, out.stride(0), out.stride(1))
     if path == "gemv":
+        assert m <= 4, m
         _w4_gemv_kernel[(triton.cdiv(n, cfg["BN"]), split)](
-            *common, KIND=kind, GROUP=group, BN=cfg["BN"], BW=cfg["BW"], SPLIT_K=split,
-            MB=triton.next_power_of_2(m), num_warps=cfg["num_warps"],
-        )
-    elif path == "dot8":
-        _w4_dot8_kernel[(triton.cdiv(n, cfg["BN"]), triton.cdiv(m, cfg["TB"]), split)](
-            *common, KIND=kind, GROUP=group, BN=cfg["BN"], TB=cfg["TB"], BW=cfg["BW"], SPLIT_K=split,
-            STAGES=cfg["STAGES"], num_warps=cfg["num_warps"],
+            *common, KIND=kind, GROUP=group, BN=cfg["BN"], NB=cfg["NB"], SPLIT_K=split,
+            MB=1 if m == 1 else 2 if m == 2 else 4, num_warps=cfg["num_warps"],
         )
     else:
-        bk = cfg["BK"]
-        _w4_dot_kernel[(triton.cdiv(n, cfg["BN"]), triton.cdiv(m, cfg["TB"]), split)](
-            *common, KIND=kind, GROUP=group, BN=cfg["BN"], TB=cfg["TB"], BK=bk, SB=min(bk, group), SPLIT_K=split,
+        kernel = _w4_dot8_kernel if path == "dot8" else _w4_dot_kernel
+        kernel[(triton.cdiv(n, cfg["BN"]), triton.cdiv(m, cfg["TB"]), split)](
+            *common, KIND=kind, GROUP=group, BN=cfg["BN"], TB=cfg["TB"], NB=cfg["NB"], SPLIT_K=split,
             STAGES=cfg["STAGES"], num_warps=cfg["num_warps"],
         )
     return out[0] if split == 1 else out.sum(0).to(x.dtype)

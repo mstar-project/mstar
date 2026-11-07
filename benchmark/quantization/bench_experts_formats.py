@@ -29,7 +29,9 @@ SHAPES = {
 
 
 def _stack(fmt, w):
-    parts = [fmt.quantize_weight(w[i], None) for i in range(w.shape[0])]
+    # experts keep the checkpoint's layout (the dense kernels' planes layout is built for linears only)
+    quantize = getattr(fmt, "quantize_storage", None) or (lambda t: fmt.quantize_weight(t, None))
+    parts = [quantize(w[i]) for i in range(w.shape[0])]
     return {k: torch.stack([p[k] for p in parts]) for k in parts[0]}
 
 
