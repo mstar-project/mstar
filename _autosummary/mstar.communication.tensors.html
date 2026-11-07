@@ -55,7 +55,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Nov 06, 2026"/>
+    <meta name="docbuild:last-update" content="Nov 07, 2026"/>
   
     
     <script src="../_static/searchtools.js"></script>
@@ -1397,6 +1397,10 @@ errors defaults to ‘strict’.</p>
 <span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.communication.tensors.</span></span><span class="sig-name descname"><span class="pre">SharedMemoryCommunicationManager</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">my_entity_id</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">hostname</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">device</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">communicator</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">shm_dir</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">enable_prof</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/communication/tensors.html#SharedMemoryCommunicationManager"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.communication.tensors.SharedMemoryCommunicationManager" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference internal" href="#mstar.communication.tensors.TensorCommunicationManager" title="mstar.communication.tensors.TensorCommunicationManager"><code class="xref py py-class docutils literal notranslate"><span class="pre">TensorCommunicationManager</span></code></a></p>
 <p>Tensor transport via file I/O to a tmpfs directory (<code class="docutils literal notranslate"><span class="pre">/dev/shm</span></code>).</p>
+<p>The base of <code class="docutils literal notranslate"><span class="pre">ArenaShmCommunicationManager</span></code> and its spill path: a tensor
+the arena has no room for goes to a per-uuid file written and read here.
+Nothing in <code class="docutils literal notranslate"><span class="pre">mstar</span></code> builds this class on its own; the SHM protocol is the
+arena.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
@@ -2345,14 +2349,12 @@ Retries and the deadline are the sync read’s.</p>
 <dt class="sig sig-object py" id="mstar.communication.tensors.create_tensor_communication_manager">
 <span class="sig-prename descclassname"><span class="pre">mstar.communication.tensors.</span></span><span class="sig-name descname"><span class="pre">create_tensor_communication_manager</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">protocol</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">my_entity_id</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">hostname</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">device</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">communicator</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">metadata_server</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">'P2PHANDSHAKE'</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">tcp_transfer_device</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">''</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">shm_dir</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">enable_prof</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">copy_workers</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">1</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/communication/tensors.html#create_tensor_communication_manager"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.communication.tensors.create_tensor_communication_manager" title="Link to this definition">#</a></dt>
 <dd><p>Select tensor transport backend based on protocol.</p>
-<p>For the SHM protocol, <code class="docutils literal notranslate"><span class="pre">MSTAR_SHM_ARENA</span></code> selects the implementation
-(see <code class="docutils literal notranslate"><span class="pre">docs/environment_variables.rst</span></code>): <code class="docutils literal notranslate"><span class="pre">0</span></code> (default) — per-uuid
-files; <code class="docutils literal notranslate"><span class="pre">1</span></code> — the Rust shared-memory arena (raises if the
-<code class="docutils literal notranslate"><span class="pre">mstar_rust</span></code> extension is missing); <code class="docutils literal notranslate"><span class="pre">AUTO</span></code> — the arena when the
-extension imports, files otherwise. The flag must match across the
-deployment: the arena location rides in the tensor descriptors, so a
-file-transport consumer cannot read an arena producer. <code class="docutils literal notranslate"><span class="pre">copy_workers</span></code>
-is the width of the arena’s CPU reads (<code class="docutils literal notranslate"><span class="pre">host_copy.HostCopier</span></code>).</p>
+<p>The SHM protocol is the Rust shared-memory arena
+(<code class="docutils literal notranslate"><span class="pre">ArenaShmCommunicationManager</span></code>), which spills a tensor it has no room
+for to a per-uuid file. An entity on a device other than CPU or CUDA, or
+one whose first segment cannot be created, has no arena and sends every
+tensor that way. <code class="docutils literal notranslate"><span class="pre">copy_workers</span></code> is the width of the arena’s CPU reads
+(<code class="docutils literal notranslate"><span class="pre">host_copy.HostCopier</span></code>).</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
@@ -2617,7 +2619,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Nov 06, 2026.
+  Last updated on Nov 07, 2026.
   <br/>
 </p>
   </div>

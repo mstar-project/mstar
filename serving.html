@@ -55,7 +55,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Nov 06, 2026"/>
+    <meta name="docbuild:last-update" content="Nov 07, 2026"/>
   
     
     <script src="_static/searchtools.js"></script>
@@ -1870,7 +1870,9 @@ walks or nodes) is one read per producing node, with its read time split between
 bytes.
 <code class="docutils literal notranslate"><span class="pre">api_server</span></code> stands for the request’s inputs (as <code class="docutils literal notranslate"><span class="pre">src</span></code>) and its results (as <code class="docutils literal notranslate"><span class="pre">dst</span></code>),
 which the API server’s data worker sends and reads. <code class="docutils literal notranslate"><span class="pre">transport</span></code> is the protocol:
-<code class="docutils literal notranslate"><span class="pre">SHM</span></code> (per-tensor files or the arena, see <code class="docutils literal notranslate"><span class="pre">MSTAR_SHM_ARENA</span></code>), <code class="docutils literal notranslate"><span class="pre">TCP</span></code> or <code class="docutils literal notranslate"><span class="pre">RDMA</span></code>. A
+<code class="docutils literal notranslate"><span class="pre">SHM</span></code> (the arena on CUDA and CPU, and the tensors it spills to files; other
+accelerators send every tensor as a file until the arena is measured there), <code class="docutils literal notranslate"><span class="pre">TCP</span></code>
+or <code class="docutils literal notranslate"><span class="pre">RDMA</span></code>. A
 tensor already on the reader (one it made, or one it read once
 for two of its nodes) moves nothing and is not counted. With tensor parallelism every
 rank counts its own read, of its slice or of the whole tensor when the edge is
@@ -2031,7 +2033,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Nov 06, 2026.
+  Last updated on Nov 07, 2026.
   <br/>
 </p>
   </div>

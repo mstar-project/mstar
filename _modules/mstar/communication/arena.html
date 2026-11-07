@@ -410,7 +410,7 @@ window.runMermaid = runMermaid;</script>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Nov 06, 2026"/>
+    <meta name="docbuild:last-update" content="Nov 07, 2026"/>
   
     
     <script src="../../../_static/searchtools.js"></script>
@@ -1026,14 +1026,26 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">(workers + the api-server data worker), /dev/shm demand can reach</span>
 <span class="sd">``MAX_SEGMENTS x SEGMENT_MB x E`` and pinned host RAM approx</span>
 <span class="sd">``PIN_MAX_MB x E`` (consumers pin peer segments too, so one process can pin</span>
-<span class="sd">more than its own arena holds). Construction fails fast when one entity's</span>
-<span class="sd">ceiling already exceeds /dev/shm, and warns when it exceeds current free</span>
-<span class="sd">space or when the pin budget is an outsized share of physical RAM.</span>
+<span class="sd">more than its own arena holds). With neither ``MAX_SEGMENTS`` nor</span>
+<span class="sd">``SEGMENT_MB`` set, the API server sizes every arena of its deployment once,</span>
+<span class="sd">before any exists (``export_arena_plan``): /dev/shm's free space split among</span>
+<span class="sd">the deployment's arenas plus one share kept for spill files. Each entity</span>
+<span class="sd">measuring free space for itself would give the ones that start later less,</span>
+<span class="sd">since a first segment's pages are committed when it is created. An entity</span>
+<span class="sd">started without that plan falls back to its own measurement. Set by hand,</span>
+<span class="sd">construction fails fast when one entity's ceiling already exceeds /dev/shm.</span>
+<span class="sd">Either way it warns when the ceiling exceeds current free space or when the</span>
+<span class="sd">pin budget is an outsized share of physical RAM.</span>
 
-<span class="sd">Selection: ``create_tensor_communication_manager`` picks this manager for</span>
-<span class="sd">the SHM protocol when ``MSTAR_SHM_ARENA`` is ``1`` (require) or ``AUTO``</span>
-<span class="sd">(use if the ``mstar_rust`` extension imports); default ``0`` keeps the file</span>
-<span class="sd">transport. See :doc:`environment_variables` for all knobs.</span>
+<span class="sd">An entity can also run without an arena of its own: when its first segment</span>
+<span class="sd">cannot be created (or /dev/shm is too small for a 16 MiB share), and on</span>
+<span class="sd">devices other than CPU and CUDA (``_arena_supported``), which use the file</span>
+<span class="sd">path until the arena is measured there. It then sends every tensor as a per-uuid file and</span>
+<span class="sd">still reads its peers' arenas, so it mixes with entities that have one.</span>
+
+<span class="sd">Selection: ``create_tensor_communication_manager`` builds this manager for</span>
+<span class="sd">the SHM protocol; the file transport it extends is its spill path. See</span>
+<span class="sd">:doc:`environment_variables` for the knobs.</span>
 <span class="sd">"""</span>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">__future__</span><span class="w"> </span><span class="kn">import</span> <span class="n">annotations</span>
@@ -1055,11 +1067,14 @@ window.runMermaid = runMermaid;</script>
     <span class="n">FutureAndPointers</span><span class="p">,</span>
     <span class="n">Rid</span><span class="p">,</span>
     <span class="n">SharedMemoryCommunicationManager</span><span class="p">,</span>
+    <span class="n">_default_shm_dir</span><span class="p">,</span>
     <span class="n">_deserialize_tensor</span><span class="p">,</span>
     <span class="n">_nullcontext</span><span class="p">,</span>
     <span class="n">_serialize_tensor</span><span class="p">,</span>
+    <span class="n">_sweep_dead_namespaces</span><span class="p">,</span>
 <span class="p">)</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.graph.base</span><span class="w"> </span><span class="kn">import</span> <span class="n">GraphEdge</span><span class="p">,</span> <span class="n">TensorPointerInfo</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.platforms</span><span class="w"> </span><span class="kn">import</span> <span class="n">current_platform</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.utils.containers</span><span class="w"> </span><span class="kn">import</span> <span class="n">ParallelList</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.utils.host_copy</span><span class="w"> </span><span class="kn">import</span> <span class="n">HostCopier</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.utils.threads</span><span class="w"> </span><span class="kn">import</span> <span class="n">Thread</span>
@@ -1067,6 +1082,133 @@ window.runMermaid = runMermaid;</script>
 <span class="n">logger</span> <span class="o">=</span> <span class="n">logging</span><span class="o">.</span><span class="n">getLogger</span><span class="p">(</span><span class="vm">__name__</span><span class="p">)</span>
 
 <span class="n">_CUDA_HOST_ALREADY_REGISTERED</span> <span class="o">=</span> <span class="mi">712</span>
+<span class="n">_sizing_logged</span> <span class="o">=</span> <span class="kc">False</span>
+
+<span class="c1">#: ``&lt;segment MiB&gt;x&lt;max segments&gt;`` for every arena of one deployment, ``0x0``</span>
+<span class="c1">#: for none; set by ``export_arena_plan`` and inherited by the processes the</span>
+<span class="c1">#: API server starts.</span>
+<span class="n">ARENA_PLAN_ENV</span> <span class="o">=</span> <span class="s2">"MSTAR_SHM_ARENA_PLAN"</span>
+<span class="c1">#: Without a plan an entity takes a quarter of the free space it finds: its</span>
+<span class="c1">#: arena and two others, plus the spill share.</span>
+<span class="n">_UNPLANNED_ENTITIES</span> <span class="o">=</span> <span class="mi">3</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">_default_sizing</span><span class="p">(</span><span class="n">budget</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">entities</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""(segment MiB, max segments) for each of ``entities`` arenas sharing</span>
+<span class="sd">    ``budget`` bytes, with one more share left for the files sends spill to:</span>
+<span class="sd">    256 MiB segments, 1 to 32 of them, or where a share is under 256 MiB, one</span>
+<span class="sd">    segment of the largest power-of-two MiB that fits. None where a share is</span>
+<span class="sd">    under 16 MiB: the entities send by files."""</span>
+    <span class="n">share_mb</span> <span class="o">=</span> <span class="p">(</span><span class="n">budget</span> <span class="o">&gt;&gt;</span> <span class="mi">20</span><span class="p">)</span> <span class="o">//</span> <span class="p">(</span><span class="n">entities</span> <span class="o">+</span> <span class="mi">1</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">share_mb</span> <span class="o">&lt;</span> <span class="mi">16</span><span class="p">:</span>
+        <span class="k">return</span> <span class="kc">None</span>
+    <span class="n">segment_mb</span> <span class="o">=</span> <span class="mi">256</span> <span class="k">if</span> <span class="n">share_mb</span> <span class="o">&gt;=</span> <span class="mi">256</span> <span class="k">else</span> <span class="mi">1</span> <span class="o">&lt;&lt;</span> <span class="p">(</span><span class="n">share_mb</span><span class="o">.</span><span class="n">bit_length</span><span class="p">()</span> <span class="o">-</span> <span class="mi">1</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">segment_mb</span><span class="p">,</span> <span class="nb">min</span><span class="p">(</span><span class="mi">32</span><span class="p">,</span> <span class="n">share_mb</span> <span class="o">//</span> <span class="n">segment_mb</span><span class="p">)</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">_shm_space</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span><span class="p">,</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span><span class="p">]:</span>
+<span class="w">    </span><span class="sd">"""/dev/shm's total and free bytes, or Nones where it cannot be read."""</span>
+    <span class="k">try</span><span class="p">:</span>
+        <span class="n">st</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">statvfs</span><span class="p">(</span><span class="s2">"/dev/shm"</span><span class="p">)</span>
+    <span class="k">except</span> <span class="ne">OSError</span><span class="p">:</span>
+        <span class="k">return</span> <span class="kc">None</span><span class="p">,</span> <span class="kc">None</span>
+    <span class="k">return</span> <span class="n">st</span><span class="o">.</span><span class="n">f_frsize</span> <span class="o">*</span> <span class="n">st</span><span class="o">.</span><span class="n">f_blocks</span><span class="p">,</span> <span class="n">st</span><span class="o">.</span><span class="n">f_frsize</span> <span class="o">*</span> <span class="n">st</span><span class="o">.</span><span class="n">f_bavail</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">_sweep_orphan_segments</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""A SIGKILLed server never runs Drop, orphaning up to its full</span>
+<span class="sd">    arena in /dev/shm until reboot. Names embed the owning pid, so a</span>
+<span class="sd">    startup sweep can reclaim any segment whose owner is gone. Files we</span>
+<span class="sd">    cannot judge (foreign naming) or cannot remove (another user's)</span>
+<span class="sd">    are left with a debug note."""</span>
+    <span class="k">try</span><span class="p">:</span>
+        <span class="n">names</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">listdir</span><span class="p">(</span><span class="s2">"/dev/shm"</span><span class="p">)</span>
+    <span class="k">except</span> <span class="ne">OSError</span><span class="p">:</span>
+        <span class="k">return</span>
+    <span class="k">for</span> <span class="n">name</span> <span class="ow">in</span> <span class="n">names</span><span class="p">:</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">name</span><span class="o">.</span><span class="n">startswith</span><span class="p">(</span><span class="s2">"mstar_arena_"</span><span class="p">):</span>
+            <span class="k">continue</span>
+        <span class="n">parts</span> <span class="o">=</span> <span class="n">name</span><span class="o">.</span><span class="n">split</span><span class="p">(</span><span class="s2">"."</span><span class="p">)[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">rsplit</span><span class="p">(</span><span class="s2">"_"</span><span class="p">,</span> <span class="mi">2</span><span class="p">)</span>
+        <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">parts</span><span class="p">)</span> <span class="o">!=</span> <span class="mi">3</span> <span class="ow">or</span> <span class="ow">not</span> <span class="n">parts</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span><span class="o">.</span><span class="n">isdigit</span><span class="p">():</span>
+            <span class="k">continue</span>   <span class="c1"># pre-uniquification or foreign naming: skip</span>
+        <span class="k">if</span> <span class="n">os</span><span class="o">.</span><span class="n">path</span><span class="o">.</span><span class="n">exists</span><span class="p">(</span><span class="sa">f</span><span class="s2">"/proc/</span><span class="si">{</span><span class="n">parts</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span><span class="si">}</span><span class="s2">"</span><span class="p">):</span>
+            <span class="k">continue</span>   <span class="c1"># owner alive</span>
+        <span class="k">try</span><span class="p">:</span>
+            <span class="n">os</span><span class="o">.</span><span class="n">unlink</span><span class="p">(</span><span class="sa">f</span><span class="s2">"/dev/shm/</span><span class="si">{</span><span class="n">name</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+            <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span><span class="s2">"ARENA: swept orphaned segment </span><span class="si">%s</span><span class="s2"> "</span>
+                        <span class="s2">"(owner pid </span><span class="si">%s</span><span class="s2"> is gone)"</span><span class="p">,</span> <span class="n">name</span><span class="p">,</span> <span class="n">parts</span><span class="p">[</span><span class="mi">1</span><span class="p">])</span>
+        <span class="k">except</span> <span class="ne">OSError</span> <span class="k">as</span> <span class="n">e</span><span class="p">:</span>
+            <span class="n">logger</span><span class="o">.</span><span class="n">debug</span><span class="p">(</span><span class="s2">"ARENA: cannot sweep </span><span class="si">%s</span><span class="s2">: </span><span class="si">%s</span><span class="s2">"</span><span class="p">,</span> <span class="n">name</span><span class="p">,</span> <span class="n">e</span><span class="p">)</span>
+
+
+<div class="viewcode-block" id="export_arena_plan">
+<a class="viewcode-back" href="../../../_autosummary/mstar.communication.arena.html#mstar.communication.arena.export_arena_plan">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">export_arena_plan</span><span class="p">(</span><span class="n">worker_devices</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""Size every arena of this deployment once, from /dev/shm's free space</span>
+<span class="sd">    before any of them exists, and hand the sizes to the processes the caller</span>
+<span class="sd">    starts (``ARENA_PLAN_ENV``). Called by the API server, which holds one</span>
+<span class="sd">    arena itself, for its workers on ``worker_devices``; None (no deployment</span>
+<span class="sd">    config) drops a plan an earlier server in this process left."""</span>
+    <span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="n">ARENA_PLAN_ENV</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">worker_devices</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="c1"># a dead run's segments and files count against the free space until</span>
+        <span class="c1"># they are gone, and a restart would size itself around them</span>
+        <span class="n">_sweep_orphan_segments</span><span class="p">()</span>
+        <span class="n">_sweep_dead_namespaces</span><span class="p">(</span><span class="n">_default_shm_dir</span><span class="p">(),</span> <span class="s2">""</span><span class="p">)</span>
+    <span class="n">_</span><span class="p">,</span> <span class="n">avail</span> <span class="o">=</span> <span class="n">_shm_space</span><span class="p">()</span>
+    <span class="k">if</span> <span class="n">worker_devices</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="n">avail</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">return</span>
+    <span class="n">entities</span> <span class="o">=</span> <span class="mi">1</span> <span class="o">+</span> <span class="nb">sum</span><span class="p">(</span><span class="nb">map</span><span class="p">(</span><span class="n">_arena_supported</span><span class="p">,</span> <span class="n">worker_devices</span><span class="p">))</span>
+    <span class="n">sizes</span> <span class="o">=</span> <span class="n">_default_sizing</span><span class="p">(</span><span class="n">avail</span><span class="p">,</span> <span class="n">entities</span><span class="p">)</span> <span class="ow">or</span> <span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span>
+    <span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="p">[</span><span class="n">ARENA_PLAN_ENV</span><span class="p">]</span> <span class="o">=</span> <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">sizes</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="si">}</span><span class="s2">x</span><span class="si">{</span><span class="n">sizes</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span><span class="si">}</span><span class="s2">"</span>
+    <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span>
+        <span class="s2">"ARENA: /dev/shm has </span><span class="si">%d</span><span class="s2"> MiB free for </span><span class="si">%d</span><span class="s2"> arenas and their spill files; "</span>
+        <span class="s2">"each arena grows to </span><span class="si">%d</span><span class="s2"> segments of </span><span class="si">%d</span><span class="s2"> MiB (MSTAR_SHM_ARENA_MAX_SEGMENTS "</span>
+        <span class="s2">"and _SEGMENT_MB override)"</span><span class="p">,</span> <span class="n">avail</span> <span class="o">&gt;&gt;</span> <span class="mi">20</span><span class="p">,</span> <span class="n">entities</span><span class="p">,</span> <span class="n">sizes</span><span class="p">[</span><span class="mi">1</span><span class="p">],</span> <span class="n">sizes</span><span class="p">[</span><span class="mi">0</span><span class="p">])</span></div>
+
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">_arena_sizing</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">,</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span><span class="p">,</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span><span class="p">]:</span>
+<span class="w">    </span><span class="sd">"""Segment MiB, max segments, and /dev/shm's total and free bytes. Knobs</span>
+<span class="sd">    the user set are taken as given (the constructor fails fast if they do not</span>
+<span class="sd">    fit); with neither set the deployment's plan applies, and without one the</span>
+<span class="sd">    sizes come from /dev/shm's free space now. Either way a small or busy</span>
+<span class="sd">    tmpfs (a Kubernetes pod gets 64 MiB) runs a small arena, or none (0</span>
+<span class="sd">    segments of 0 MiB), and spills to files instead of refusing to start."""</span>
+    <span class="k">global</span> <span class="n">_sizing_logged</span>
+    <span class="n">total</span><span class="p">,</span> <span class="n">avail</span> <span class="o">=</span> <span class="n">_shm_space</span><span class="p">()</span>
+    <span class="n">segment_env</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"MSTAR_SHM_ARENA_SEGMENT_MB"</span><span class="p">)</span>
+    <span class="n">max_env</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"MSTAR_SHM_ARENA_MAX_SEGMENTS"</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">segment_env</span> <span class="ow">or</span> <span class="n">max_env</span><span class="p">:</span>
+        <span class="n">segment_mb</span><span class="p">,</span> <span class="n">max_segments</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="n">segment_env</span> <span class="ow">or</span> <span class="mi">256</span><span class="p">),</span> <span class="nb">int</span><span class="p">(</span><span class="n">max_env</span> <span class="ow">or</span> <span class="mi">32</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">segment_mb</span> <span class="o">&lt;</span> <span class="mi">1</span> <span class="ow">or</span> <span class="n">max_segments</span> <span class="o">&lt;</span> <span class="mi">1</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">"MSTAR_SHM_ARENA_SEGMENT_MB and _MAX_SEGMENTS "</span>
+                             <span class="s2">"must be at least 1"</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">segment_mb</span><span class="p">,</span> <span class="n">max_segments</span><span class="p">,</span> <span class="n">total</span><span class="p">,</span> <span class="n">avail</span>
+    <span class="k">if</span> <span class="n">plan</span> <span class="o">:=</span> <span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">ARENA_PLAN_ENV</span><span class="p">):</span>
+        <span class="n">segment_mb</span><span class="p">,</span> <span class="n">_</span><span class="p">,</span> <span class="n">max_segments</span> <span class="o">=</span> <span class="n">plan</span><span class="o">.</span><span class="n">partition</span><span class="p">(</span><span class="s2">"x"</span><span class="p">)</span>
+        <span class="k">return</span> <span class="nb">int</span><span class="p">(</span><span class="n">segment_mb</span><span class="p">),</span> <span class="nb">int</span><span class="p">(</span><span class="n">max_segments</span><span class="p">),</span> <span class="n">total</span><span class="p">,</span> <span class="n">avail</span>
+    <span class="k">if</span> <span class="n">avail</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">return</span> <span class="mi">256</span><span class="p">,</span> <span class="mi">32</span><span class="p">,</span> <span class="n">total</span><span class="p">,</span> <span class="n">avail</span>
+    <span class="n">sizes</span> <span class="o">=</span> <span class="n">_default_sizing</span><span class="p">(</span><span class="n">avail</span><span class="p">,</span> <span class="n">_UNPLANNED_ENTITIES</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">sizes</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">return</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="n">total</span><span class="p">,</span> <span class="n">avail</span>
+    <span class="n">segment_mb</span><span class="p">,</span> <span class="n">max_segments</span> <span class="o">=</span> <span class="n">sizes</span>
+    <span class="k">if</span> <span class="ow">not</span> <span class="n">_sizing_logged</span><span class="p">:</span>
+        <span class="n">_sizing_logged</span> <span class="o">=</span> <span class="kc">True</span>
+        <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span>
+            <span class="s2">"ARENA: /dev/shm has </span><span class="si">%d</span><span class="s2"> MiB free; each entity's arena grows "</span>
+            <span class="s2">"to </span><span class="si">%d</span><span class="s2"> segments of </span><span class="si">%d</span><span class="s2"> MiB (MSTAR_SHM_ARENA_MAX_SEGMENTS and "</span>
+            <span class="s2">"_SEGMENT_MB override)"</span><span class="p">,</span> <span class="n">avail</span> <span class="o">&gt;&gt;</span> <span class="mi">20</span><span class="p">,</span> <span class="n">max_segments</span><span class="p">,</span> <span class="n">segment_mb</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">segment_mb</span><span class="p">,</span> <span class="n">max_segments</span><span class="p">,</span> <span class="n">total</span><span class="p">,</span> <span class="n">avail</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">_arena_supported</span><span class="p">(</span><span class="n">device</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""Whether an entity on ``device`` stages its sends in an arena: CPU, and</span>
+<span class="sd">    CUDA. ROCm (``_pin`` loads libcudart), XPU (no copy streams) and the rest</span>
+<span class="sd">    send by per-uuid files until the arena is ported and measured there."""</span>
+    <span class="n">kind</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">device</span><span class="p">(</span><span class="n">device</span><span class="p">)</span><span class="o">.</span><span class="n">type</span>
+    <span class="k">return</span> <span class="n">kind</span> <span class="o">==</span> <span class="s2">"cpu"</span> <span class="ow">or</span> <span class="p">(</span><span class="n">kind</span> <span class="o">==</span> <span class="s2">"cuda"</span> <span class="ow">and</span> <span class="n">current_platform</span><span class="o">.</span><span class="n">is_cuda</span><span class="p">())</span>
 
 
 <span class="k">class</span><span class="w"> </span><span class="nc">_Placements</span><span class="p">(</span><span class="n">NamedTuple</span><span class="p">):</span>
@@ -1236,7 +1378,11 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="ArenaShmCommunicationManager">
 <a class="viewcode-back" href="../../../_autosummary/mstar.communication.arena.html#mstar.communication.arena.ArenaShmCommunicationManager">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">ArenaShmCommunicationManager</span><span class="p">(</span><span class="n">SharedMemoryCommunicationManager</span><span class="p">):</span>
-<span class="w">    </span><span class="sd">"""Tensor transport via the Rust shared-memory arena (``mstar_rust``)."""</span>
+<span class="w">    </span><span class="sd">"""Tensor transport via the Rust shared-memory arena (``mstar_rust``).</span>
+
+<span class="sd">    ``_arena`` is None when this entity has none of its own (see the module</span>
+<span class="sd">    docstring): every send then spills to a per-uuid file.</span>
+<span class="sd">    """</span>
 
     <span class="n">_namespace_file_dirs</span> <span class="o">=</span> <span class="p">(</span><span class="s2">"/dev/shm"</span><span class="p">,)</span>
 
@@ -1267,13 +1413,15 @@ window.runMermaid = runMermaid;</script>
         <span class="bp">self</span><span class="o">.</span><span class="n">_host_copier</span> <span class="o">=</span> <span class="n">HostCopier</span><span class="p">(</span><span class="n">copy_workers</span><span class="p">)</span>
 
         <span class="bp">self</span><span class="o">.</span><span class="n">_ShmArena</span> <span class="o">=</span> <span class="n">ShmArena</span>
-        <span class="n">segment_mb</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="n">os</span><span class="o">.</span><span class="n">getenv</span><span class="p">(</span><span class="s2">"MSTAR_SHM_ARENA_SEGMENT_MB"</span><span class="p">,</span> <span class="s2">"256"</span><span class="p">))</span>
-        <span class="n">max_segments</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="n">os</span><span class="o">.</span><span class="n">getenv</span><span class="p">(</span><span class="s2">"MSTAR_SHM_ARENA_MAX_SEGMENTS"</span><span class="p">,</span> <span class="s2">"32"</span><span class="p">))</span>
+        <span class="n">supported</span> <span class="o">=</span> <span class="n">_arena_supported</span><span class="p">(</span><span class="n">device</span><span class="p">)</span>
+        <span class="n">segment_mb</span><span class="p">,</span> <span class="n">max_segments</span><span class="p">,</span> <span class="n">shm_total</span><span class="p">,</span> <span class="n">shm_avail</span> <span class="o">=</span> <span class="p">(</span>
+            <span class="n">_arena_sizing</span><span class="p">()</span> <span class="k">if</span> <span class="n">supported</span> <span class="k">else</span> <span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="kc">None</span><span class="p">,</span> <span class="kc">None</span><span class="p">))</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_full_timeout_s</span> <span class="o">=</span> <span class="nb">float</span><span class="p">(</span>
             <span class="n">os</span><span class="o">.</span><span class="n">getenv</span><span class="p">(</span><span class="s2">"MSTAR_SHM_ARENA_FULL_TIMEOUT_S"</span><span class="p">,</span> <span class="s2">"30"</span><span class="p">))</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_pin_segments</span> <span class="o">=</span> <span class="p">(</span>
             <span class="n">os</span><span class="o">.</span><span class="n">getenv</span><span class="p">(</span><span class="s2">"MSTAR_SHM_ARENA_PIN"</span><span class="p">,</span> <span class="s2">"1"</span><span class="p">)</span> <span class="o">==</span> <span class="s2">"1"</span>
             <span class="ow">and</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">is_available</span><span class="p">()</span> <span class="ow">and</span> <span class="nb">str</span><span class="p">(</span><span class="n">device</span><span class="p">)</span> <span class="o">!=</span> <span class="s2">"cpu"</span>
+            <span class="ow">and</span> <span class="n">supported</span>
         <span class="p">)</span>
         <span class="c1"># Pinned host memory is a system-wide resource (pages come out of the</span>
         <span class="c1"># OS's pageable pool), so it gets its own budget, distinct from the</span>
@@ -1333,12 +1481,6 @@ window.runMermaid = runMermaid;</script>
         <span class="c1"># its own arena). Check the static tmpfs ceiling NOW instead of</span>
         <span class="c1"># surfacing as ENOSPC on a growth mid-run.</span>
         <span class="n">per_entity_max</span> <span class="o">=</span> <span class="p">(</span><span class="n">segment_mb</span> <span class="o">&lt;&lt;</span> <span class="mi">20</span><span class="p">)</span> <span class="o">*</span> <span class="n">max_segments</span>
-        <span class="k">try</span><span class="p">:</span>
-            <span class="n">st</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">statvfs</span><span class="p">(</span><span class="s2">"/dev/shm"</span><span class="p">)</span>
-            <span class="n">shm_total</span> <span class="o">=</span> <span class="n">st</span><span class="o">.</span><span class="n">f_frsize</span> <span class="o">*</span> <span class="n">st</span><span class="o">.</span><span class="n">f_blocks</span>
-            <span class="n">shm_avail</span> <span class="o">=</span> <span class="n">st</span><span class="o">.</span><span class="n">f_frsize</span> <span class="o">*</span> <span class="n">st</span><span class="o">.</span><span class="n">f_bavail</span>
-        <span class="k">except</span> <span class="ne">OSError</span><span class="p">:</span>
-            <span class="n">shm_total</span> <span class="o">=</span> <span class="n">shm_avail</span> <span class="o">=</span> <span class="kc">None</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_shm_total</span> <span class="o">=</span> <span class="n">shm_total</span>
         <span class="k">if</span> <span class="n">shm_total</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
             <span class="k">if</span> <span class="n">per_entity_max</span> <span class="o">&gt;</span> <span class="n">shm_total</span><span class="p">:</span>
@@ -1378,13 +1520,31 @@ window.runMermaid = runMermaid;</script>
         <span class="c1"># pid in the name drives the orphan sweep below.</span>
         <span class="kn">import</span><span class="w"> </span><span class="nn">secrets</span>
 
-        <span class="bp">self</span><span class="o">.</span><span class="n">_sweep_orphans</span><span class="p">()</span>
+        <span class="n">_sweep_orphan_segments</span><span class="p">()</span>
         <span class="n">ns</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_shm_namespace</span>
         <span class="n">base</span> <span class="o">=</span> <span class="p">(</span><span class="sa">f</span><span class="s2">"mstar_</span><span class="si">{</span><span class="n">ns</span><span class="si">}</span><span class="s2">_arena_</span><span class="si">{</span><span class="n">my_entity_id</span><span class="si">}</span><span class="s2">_</span><span class="si">{</span><span class="n">secrets</span><span class="o">.</span><span class="n">token_hex</span><span class="p">(</span><span class="mi">4</span><span class="p">)</span><span class="si">}</span><span class="s2">"</span>
                 <span class="k">if</span> <span class="n">ns</span> <span class="k">else</span> <span class="sa">f</span><span class="s2">"mstar_arena_</span><span class="si">{</span><span class="n">my_entity_id</span><span class="si">}</span><span class="s2">_</span><span class="si">{</span><span class="n">os</span><span class="o">.</span><span class="n">getpid</span><span class="p">()</span><span class="si">}</span><span class="s2">_"</span>
                 <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">secrets</span><span class="o">.</span><span class="n">token_hex</span><span class="p">(</span><span class="mi">4</span><span class="p">)</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">_arena</span> <span class="o">=</span> <span class="n">SegmentedShmArena</span><span class="o">.</span><span class="n">create</span><span class="p">(</span>
-            <span class="n">base</span><span class="p">,</span> <span class="n">segment_mb</span> <span class="o">&lt;&lt;</span> <span class="mi">20</span><span class="p">,</span> <span class="n">max_segments</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_arena</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">supported</span><span class="p">:</span>
+            <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span>
+                <span class="s2">"ARENA: not used on </span><span class="si">%s</span><span class="s2"> (</span><span class="si">%s</span><span class="s2">); this entity sends by per-uuid "</span>
+                <span class="s2">"files and reads its peers' arenas"</span><span class="p">,</span> <span class="n">device</span><span class="p">,</span>
+                <span class="n">current_platform</span><span class="o">.</span><span class="n">name</span><span class="p">)</span>
+        <span class="k">elif</span> <span class="ow">not</span> <span class="n">segment_mb</span><span class="p">:</span>
+            <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span>
+                <span class="s2">"ARENA: /dev/shm has </span><span class="si">%s</span><span class="s2"> MiB free, too little for a 16 MiB "</span>
+                <span class="s2">"arena per entity and room for spill files; this entity sends "</span>
+                <span class="s2">"by per-uuid files"</span><span class="p">,</span>
+                <span class="s2">"?"</span> <span class="k">if</span> <span class="n">shm_avail</span> <span class="ow">is</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">shm_avail</span> <span class="o">&gt;&gt;</span> <span class="mi">20</span><span class="p">)</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="k">try</span><span class="p">:</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_arena</span> <span class="o">=</span> <span class="n">SegmentedShmArena</span><span class="o">.</span><span class="n">create</span><span class="p">(</span>
+                    <span class="n">base</span><span class="p">,</span> <span class="n">segment_mb</span> <span class="o">&lt;&lt;</span> <span class="mi">20</span><span class="p">,</span> <span class="n">max_segments</span><span class="p">)</span>
+            <span class="k">except</span> <span class="p">(</span><span class="ne">RuntimeError</span><span class="p">,</span> <span class="ne">OSError</span><span class="p">)</span> <span class="k">as</span> <span class="n">e</span><span class="p">:</span>
+                <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span>
+                    <span class="s2">"ARENA: cannot create this entity's first segment (</span><span class="si">%s</span><span class="s2">); "</span>
+                    <span class="s2">"its sends spill to per-uuid files"</span><span class="p">,</span> <span class="n">e</span><span class="p">)</span>
         <span class="c1"># Guaranteed exit-time unlink: weakref.finalize runs at interpreter</span>
         <span class="c1"># shutdown even when the manager is still referenced (the worker</span>
         <span class="c1"># case — no explicit cleanup path runs there, so the Rust Drop</span>
@@ -1443,31 +1603,6 @@ window.runMermaid = runMermaid;</script>
 
     <span class="c1"># -- segments --------------------------------------------------------</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">_sweep_orphans</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
-<span class="w">        </span><span class="sd">"""A SIGKILLed server never runs Drop, orphaning up to its full</span>
-<span class="sd">        arena in /dev/shm until reboot. Names embed the owning pid, so a</span>
-<span class="sd">        startup sweep can reclaim any segment whose owner is gone. Files we</span>
-<span class="sd">        cannot judge (foreign naming) or cannot remove (another user's)</span>
-<span class="sd">        are left with a debug note."""</span>
-        <span class="k">try</span><span class="p">:</span>
-            <span class="n">names</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">listdir</span><span class="p">(</span><span class="s2">"/dev/shm"</span><span class="p">)</span>
-        <span class="k">except</span> <span class="ne">OSError</span><span class="p">:</span>
-            <span class="k">return</span>
-        <span class="k">for</span> <span class="n">name</span> <span class="ow">in</span> <span class="n">names</span><span class="p">:</span>
-            <span class="k">if</span> <span class="ow">not</span> <span class="n">name</span><span class="o">.</span><span class="n">startswith</span><span class="p">(</span><span class="s2">"mstar_arena_"</span><span class="p">):</span>
-                <span class="k">continue</span>
-            <span class="n">parts</span> <span class="o">=</span> <span class="n">name</span><span class="o">.</span><span class="n">split</span><span class="p">(</span><span class="s2">"."</span><span class="p">)[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">rsplit</span><span class="p">(</span><span class="s2">"_"</span><span class="p">,</span> <span class="mi">2</span><span class="p">)</span>
-            <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">parts</span><span class="p">)</span> <span class="o">!=</span> <span class="mi">3</span> <span class="ow">or</span> <span class="ow">not</span> <span class="n">parts</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span><span class="o">.</span><span class="n">isdigit</span><span class="p">():</span>
-                <span class="k">continue</span>   <span class="c1"># pre-uniquification or foreign naming: skip</span>
-            <span class="k">if</span> <span class="n">os</span><span class="o">.</span><span class="n">path</span><span class="o">.</span><span class="n">exists</span><span class="p">(</span><span class="sa">f</span><span class="s2">"/proc/</span><span class="si">{</span><span class="n">parts</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span><span class="si">}</span><span class="s2">"</span><span class="p">):</span>
-                <span class="k">continue</span>   <span class="c1"># owner alive</span>
-            <span class="k">try</span><span class="p">:</span>
-                <span class="n">os</span><span class="o">.</span><span class="n">unlink</span><span class="p">(</span><span class="sa">f</span><span class="s2">"/dev/shm/</span><span class="si">{</span><span class="n">name</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
-                <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span><span class="s2">"ARENA: swept orphaned segment </span><span class="si">%s</span><span class="s2"> "</span>
-                            <span class="s2">"(owner pid </span><span class="si">%s</span><span class="s2"> is gone)"</span><span class="p">,</span> <span class="n">name</span><span class="p">,</span> <span class="n">parts</span><span class="p">[</span><span class="mi">1</span><span class="p">])</span>
-            <span class="k">except</span> <span class="ne">OSError</span> <span class="k">as</span> <span class="n">e</span><span class="p">:</span>
-                <span class="n">logger</span><span class="o">.</span><span class="n">debug</span><span class="p">(</span><span class="s2">"ARENA: cannot sweep </span><span class="si">%s</span><span class="s2">: </span><span class="si">%s</span><span class="s2">"</span><span class="p">,</span> <span class="n">name</span><span class="p">,</span> <span class="n">e</span><span class="p">)</span>
-
     <span class="k">def</span><span class="w"> </span><span class="nf">_maybe_pin</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">ptr</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">nbytes</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">"""Pin an own segment within budget; returns the bytes actually</span>
 <span class="sd">        pinned (0 if skipped/failed). Runs under _pin_lock: _pin releases</span>
@@ -1503,6 +1638,8 @@ window.runMermaid = runMermaid;</script>
         <span class="k">return</span> <span class="mi">0</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">_sync_segments</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_arena</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">return</span>
         <span class="n">grew</span> <span class="o">=</span> <span class="kc">False</span>
         <span class="n">old_len</span> <span class="o">=</span> <span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_seg_views</span><span class="p">)</span>
         <span class="k">while</span> <span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_seg_views</span><span class="p">)</span> <span class="o">&lt;</span> <span class="bp">self</span><span class="o">.</span><span class="n">_arena</span><span class="o">.</span><span class="n">num_segments</span><span class="p">:</span>
@@ -1539,9 +1676,10 @@ window.runMermaid = runMermaid;</script>
 <span class="w">        </span><span class="sd">"""Occupancy/fragmentation snapshot (named apart from the raw</span>
 <span class="sd">        ``SegmentedShmArena.stats`` tuple). The fragmentation signature is</span>
 <span class="sd">        `largest_free_block` collapsing while `free_bytes` stays high."""</span>
-        <span class="n">total</span><span class="p">,</span> <span class="n">free</span><span class="p">,</span> <span class="n">largest</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_arena</span><span class="o">.</span><span class="n">stats</span><span class="p">()</span>
+        <span class="n">arena</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_arena</span>
+        <span class="n">total</span><span class="p">,</span> <span class="n">free</span><span class="p">,</span> <span class="n">largest</span> <span class="o">=</span> <span class="n">arena</span><span class="o">.</span><span class="n">stats</span><span class="p">()</span> <span class="k">if</span> <span class="n">arena</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span>
         <span class="k">return</span> <span class="p">{</span>
-            <span class="s2">"segments"</span><span class="p">:</span> <span class="bp">self</span><span class="o">.</span><span class="n">_arena</span><span class="o">.</span><span class="n">num_segments</span><span class="p">,</span>
+            <span class="s2">"segments"</span><span class="p">:</span> <span class="n">arena</span><span class="o">.</span><span class="n">num_segments</span> <span class="k">if</span> <span class="n">arena</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="mi">0</span><span class="p">,</span>
             <span class="s2">"total_bytes"</span><span class="p">:</span> <span class="n">total</span><span class="p">,</span>
             <span class="s2">"free_bytes"</span><span class="p">:</span> <span class="n">free</span><span class="p">,</span>
             <span class="s2">"largest_free_block"</span><span class="p">:</span> <span class="n">largest</span><span class="p">,</span>
@@ -1652,7 +1790,9 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">        so the caller SPILLS this tensor to the per-uuid file transport —</span>
 <span class="sd">        slower, never fails, exactly the old manager's saturation behavior.</span>
 <span class="sd">        MSTAR_SHM_ARENA_SPILL=0 keeps strict backpressure for the full</span>
-<span class="sd">        timeout, then raises."""</span>
+<span class="sd">        timeout, then raises. Without an arena, every tensor spills."""</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_arena</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">return</span> <span class="kc">None</span>
         <span class="n">grace</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_spill_after_s</span> <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_spill</span> <span class="k">else</span> <span class="bp">self</span><span class="o">.</span><span class="n">_full_timeout_s</span>
         <span class="n">deadline</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">monotonic</span><span class="p">()</span> <span class="o">+</span> <span class="n">grace</span>
         <span class="n">warned</span> <span class="o">=</span> <span class="kc">False</span>
@@ -2097,7 +2237,9 @@ window.runMermaid = runMermaid;</script>
         <span class="n">flat</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">frombuffer</span><span class="p">(</span>
             <span class="n">view</span><span class="p">[</span><span class="n">start</span><span class="p">:</span><span class="n">start</span> <span class="o">+</span> <span class="n">info</span><span class="o">.</span><span class="n">nbytes</span><span class="p">],</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">uint8</span><span class="p">)</span>
         <span class="n">t</span> <span class="o">=</span> <span class="n">flat</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="n">info</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span><span class="o">.</span><span class="n">reshape</span><span class="p">(</span><span class="n">info</span><span class="o">.</span><span class="n">dims</span><span class="p">)</span>
-        <span class="k">return</span> <span class="n">t</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">device</span><span class="p">,</span> <span class="n">non_blocking</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+        <span class="c1"># Async only when the h2d stream's event gates the ACK: with no copy</span>
+        <span class="c1"># stream (XPU) nothing would wait for the copy before the slot is freed.</span>
+        <span class="k">return</span> <span class="n">t</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">device</span><span class="p">,</span> <span class="n">non_blocking</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_h2d_stream</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">)</span>
 
     <span class="c1"># -- reclaim ----------------------------------------------------------</span>
 
@@ -2239,7 +2381,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Nov 06, 2026.
+  Last updated on Nov 07, 2026.
   <br/>
 </p>
   </div>

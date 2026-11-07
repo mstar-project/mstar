@@ -410,7 +410,7 @@ window.runMermaid = runMermaid;</script>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Nov 06, 2026"/>
+    <meta name="docbuild:last-update" content="Nov 07, 2026"/>
   
     
     <script src="../../../_static/searchtools.js"></script>
@@ -3838,7 +3838,13 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="SharedMemoryCommunicationManager">
 <a class="viewcode-back" href="../../../_autosummary/mstar.communication.tensors.html#mstar.communication.tensors.SharedMemoryCommunicationManager">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">SharedMemoryCommunicationManager</span><span class="p">(</span><span class="n">TensorCommunicationManager</span><span class="p">):</span>
-<span class="w">    </span><span class="sd">"""Tensor transport via file I/O to a tmpfs directory (``/dev/shm``)."""</span>
+<span class="w">    </span><span class="sd">"""Tensor transport via file I/O to a tmpfs directory (``/dev/shm``).</span>
+
+<span class="sd">    The base of ``ArenaShmCommunicationManager`` and its spill path: a tensor</span>
+<span class="sd">    the arena has no room for goes to a per-uuid file written and read here.</span>
+<span class="sd">    Nothing in ``mstar`` builds this class on its own; the SHM protocol is the</span>
+<span class="sd">    arena.</span>
+<span class="sd">    """</span>
 
     <span class="c1">#: Directories besides ``shm_dir`` that hold this transport's</span>
     <span class="c1">#: ``mstar_&lt;namespace&gt;_*`` files; each gets its own namespace lock.</span>
@@ -4094,9 +4100,9 @@ window.runMermaid = runMermaid;</script>
                     <span class="k">if</span> <span class="n">info</span><span class="o">.</span><span class="n">shm_segment</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
                         <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span>
                             <span class="sa">f</span><span class="s2">"tensor </span><span class="si">{</span><span class="n">producer_uuid</span><span class="si">}</span><span class="s2"> from </span><span class="si">{</span><span class="n">info</span><span class="o">.</span><span class="n">source_entity</span><span class="si">}</span><span class="s2"> "</span>
-                            <span class="s2">"was staged in an SHM arena but this consumer "</span>
-                            <span class="s2">"runs the file transport — MSTAR_SHM_ARENA must "</span>
-                            <span class="s2">"match across the deployment"</span><span class="p">)</span>
+                            <span class="s2">"was staged in an SHM arena, which only "</span>
+                            <span class="s2">"ArenaShmCommunicationManager reads; this manager "</span>
+                            <span class="s2">"reads the per-uuid files the arena spills"</span><span class="p">)</span>
                     <span class="n">path</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_shm_path</span><span class="p">(</span><span class="n">info</span><span class="o">.</span><span class="n">source_entity</span><span class="p">,</span> <span class="n">producer_uuid</span><span class="p">)</span>
                     <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="n">path</span><span class="p">,</span> <span class="s2">"rb"</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
                         <span class="n">f</span><span class="o">.</span><span class="n">seek</span><span class="p">(</span><span class="n">info</span><span class="o">.</span><span class="n">offset</span><span class="p">)</span>
@@ -4181,47 +4187,25 @@ window.runMermaid = runMermaid;</script>
 <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">TensorCommunicationManager</span><span class="p">:</span>
 <span class="w">    </span><span class="sd">"""Select tensor transport backend based on protocol.</span>
 
-<span class="sd">    For the SHM protocol, ``MSTAR_SHM_ARENA`` selects the implementation</span>
-<span class="sd">    (see ``docs/environment_variables.rst``): ``0`` (default) — per-uuid</span>
-<span class="sd">    files; ``1`` — the Rust shared-memory arena (raises if the</span>
-<span class="sd">    ``mstar_rust`` extension is missing); ``AUTO`` — the arena when the</span>
-<span class="sd">    extension imports, files otherwise. The flag must match across the</span>
-<span class="sd">    deployment: the arena location rides in the tensor descriptors, so a</span>
-<span class="sd">    file-transport consumer cannot read an arena producer. ``copy_workers``</span>
-<span class="sd">    is the width of the arena's CPU reads (``host_copy.HostCopier``).</span>
+<span class="sd">    The SHM protocol is the Rust shared-memory arena</span>
+<span class="sd">    (``ArenaShmCommunicationManager``), which spills a tensor it has no room</span>
+<span class="sd">    for to a per-uuid file. An entity on a device other than CPU or CUDA, or</span>
+<span class="sd">    one whose first segment cannot be created, has no arena and sends every</span>
+<span class="sd">    tensor that way. ``copy_workers`` is the width of the arena's CPU reads</span>
+<span class="sd">    (``host_copy.HostCopier``).</span>
 <span class="sd">    """</span>
     <span class="k">if</span> <span class="n">protocol</span> <span class="o">==</span> <span class="n">CommProtocol</span><span class="o">.</span><span class="n">SHM</span><span class="p">:</span>
-        <span class="n">choice</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">getenv</span><span class="p">(</span><span class="s2">"MSTAR_SHM_ARENA"</span><span class="p">,</span> <span class="s2">"0"</span><span class="p">)</span><span class="o">.</span><span class="n">upper</span><span class="p">()</span>
-        <span class="k">if</span> <span class="n">choice</span> <span class="ow">not</span> <span class="ow">in</span> <span class="p">(</span><span class="s2">"0"</span><span class="p">,</span> <span class="s2">"1"</span><span class="p">,</span> <span class="s2">"AUTO"</span><span class="p">):</span>
-            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
-                <span class="sa">f</span><span class="s2">"MSTAR_SHM_ARENA must be 0, 1, or AUTO; got </span><span class="si">{</span><span class="n">choice</span><span class="si">!r}</span><span class="s2">"</span><span class="p">)</span>
-        <span class="k">if</span> <span class="n">choice</span> <span class="o">!=</span> <span class="s2">"0"</span><span class="p">:</span>
-            <span class="k">try</span><span class="p">:</span>
-                <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.communication.arena</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span>
-                    <span class="n">ArenaShmCommunicationManager</span><span class="p">,</span>
-                <span class="p">)</span>
-            <span class="k">except</span> <span class="ne">ImportError</span><span class="p">:</span>
-                <span class="k">if</span> <span class="n">choice</span> <span class="o">==</span> <span class="s2">"1"</span><span class="p">:</span>
-                    <span class="k">raise</span>
-                <span class="n">logger</span><span class="o">.</span><span class="n">debug</span><span class="p">(</span><span class="s2">"MSTAR_SHM_ARENA=AUTO: mstar_rust not "</span>
-                             <span class="s2">"installed, using the file transport"</span><span class="p">)</span>
-            <span class="k">else</span><span class="p">:</span>
-                <span class="k">return</span> <span class="n">ArenaShmCommunicationManager</span><span class="p">(</span>
-                    <span class="n">my_entity_id</span><span class="o">=</span><span class="n">my_entity_id</span><span class="p">,</span>
-                    <span class="n">hostname</span><span class="o">=</span><span class="n">hostname</span><span class="p">,</span>
-                    <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">,</span>
-                    <span class="n">communicator</span><span class="o">=</span><span class="n">communicator</span><span class="p">,</span>
-                    <span class="n">shm_dir</span><span class="o">=</span><span class="n">shm_dir</span><span class="p">,</span>
-                    <span class="n">enable_prof</span><span class="o">=</span><span class="n">enable_prof</span><span class="p">,</span>
-                    <span class="n">copy_workers</span><span class="o">=</span><span class="n">copy_workers</span><span class="p">,</span>
-                <span class="p">)</span>
-        <span class="k">return</span> <span class="n">SharedMemoryCommunicationManager</span><span class="p">(</span>
+        <span class="c1"># Imported here: arena.py builds on this module's file manager.</span>
+        <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.communication.arena</span><span class="w"> </span><span class="kn">import</span> <span class="n">ArenaShmCommunicationManager</span>
+
+        <span class="k">return</span> <span class="n">ArenaShmCommunicationManager</span><span class="p">(</span>
             <span class="n">my_entity_id</span><span class="o">=</span><span class="n">my_entity_id</span><span class="p">,</span>
             <span class="n">hostname</span><span class="o">=</span><span class="n">hostname</span><span class="p">,</span>
             <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">,</span>
             <span class="n">communicator</span><span class="o">=</span><span class="n">communicator</span><span class="p">,</span>
             <span class="n">shm_dir</span><span class="o">=</span><span class="n">shm_dir</span><span class="p">,</span>
-            <span class="n">enable_prof</span><span class="o">=</span><span class="n">enable_prof</span>
+            <span class="n">enable_prof</span><span class="o">=</span><span class="n">enable_prof</span><span class="p">,</span>
+            <span class="n">copy_workers</span><span class="o">=</span><span class="n">copy_workers</span><span class="p">,</span>
         <span class="p">)</span>
     <span class="k">return</span> <span class="n">MooncakeCommunicationManager</span><span class="p">(</span>
         <span class="n">my_entity_id</span><span class="o">=</span><span class="n">my_entity_id</span><span class="p">,</span>
@@ -4281,7 +4265,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Nov 06, 2026.
+  Last updated on Nov 07, 2026.
   <br/>
 </p>
   </div>

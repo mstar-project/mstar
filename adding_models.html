@@ -54,7 +54,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Nov 06, 2026"/>
+    <meta name="docbuild:last-update" content="Nov 07, 2026"/>
   
     
     <script src="_static/searchtools.js"></script>
@@ -3214,8 +3214,8 @@ frame inside PyAV. A PyAV mp4 should be written with
 <code class="docutils literal notranslate"><span class="pre">mstar.model.components.video_encode.encode_mp4</span></code>, which takes the model’s x264 options,
 rate and padding, and converts the frames to the encoder’s pixel format on a thread a few
 frames ahead of the encoder, so x264 gets the frames the plain <code class="docutils literal notranslate"><span class="pre">stream.encode</span></code> loop
-would hand it without waiting on the conversion between them. The arena’s CPU read of an
-output (<code class="docutils literal notranslate"><span class="pre">MSTAR_SHM_ARENA</span></code>) slices a large copy over threads of its own
+would hand it without waiting on the conversion between them. The SHM arena’s CPU read of an
+output slices a large copy over threads of its own
 (<code class="docutils literal notranslate"><span class="pre">mstar.utils.host_copy.HostCopier</span></code>), one encode’s share of the CPUs.</p>
 </section>
 <section id="tensor-parallelism-sharding">
@@ -4124,7 +4124,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Nov 06, 2026.
+  Last updated on Nov 07, 2026.
   <br/>
 </p>
   </div>

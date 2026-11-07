@@ -55,7 +55,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Nov 06, 2026"/>
+    <meta name="docbuild:last-update" content="Nov 07, 2026"/>
   
     
     <script src="_static/searchtools.js"></script>
@@ -1902,7 +1902,7 @@ H100): input-to-token lag p50 48 ms with one call and about 100-120 ms with
 8, which keep up; from 24 calls up the server fell behind real time, so lag
 grew over the call. Capturing the encoder’s live step (below) took its host
 time at 32 calls from 23.6 to 8.4 ms and cut live lag 2-6x at 16-32 calls
-(paced runs interleaved against the uncaptured encoder, <code class="docutils literal notranslate"><span class="pre">MSTAR_SHM_ARENA=1</span></code>);
+(paced runs interleaved against the uncaptured encoder, on the SHM arena);
 32 calls staggered over 2 s all finish, heard latency p50 2.1-2.3 s (from the
 user stopping to agent audio playable without gaps). With the codec in the
 talker’s step, on one H200: 16 live calls keep real time whether they start
@@ -2891,7 +2891,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Nov 06, 2026.
+  Last updated on Nov 07, 2026.
   <br/>
 </p>
   </div>

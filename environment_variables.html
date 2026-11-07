@@ -55,7 +55,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Nov 06, 2026"/>
+    <meta name="docbuild:last-update" content="Nov 07, 2026"/>
   
     
     <script src="_static/searchtools.js"></script>
@@ -780,15 +780,7 @@ could not be captured, instead of serving that bucket eagerly at
 10-20x the latency. Off by default: a failed capture is logged at
 ERROR with a per-runner summary and the rest keeps running.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_SHM_ARENA</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">0</span></code></p></td>
-<td><p>SHM tensor-transport implementation. <code class="docutils literal notranslate"><span class="pre">0</span></code>: per-uuid files.
-<code class="docutils literal notranslate"><span class="pre">1</span></code>: the Rust shared-memory arena (requires the <code class="docutils literal notranslate"><span class="pre">rust/</span></code>
-extension; raises if missing). <code class="docutils literal notranslate"><span class="pre">AUTO</span></code>: the arena when the
-extension imports, files otherwise. Must match across the
-deployment — arena locations ride in the tensor descriptors.</p></td>
-</tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_DEPLOYMENT_TOKEN</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_DEPLOYMENT_TOKEN</span></code></p></td>
 <td><p>random per launch</p></td>
 <td><p>Mixed into the namespace of the SHM tensor files and arena segments,
 so no two launches share names: not a restart on the same socket
@@ -805,7 +797,7 @@ a reused value would let it do to the next launch’s files).
 The API server logs a warning whenever it keeps a value the launcher
 set.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_KV_SHM_DIR</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_KV_SHM_DIR</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">/dev/shm</span></code> (or <code class="docutils literal notranslate"><span class="pre">/tmp</span></code> if unavailable)</p></td>
 <td><p>Base directory for host-staged KV snapshots when remote KV transfer
 uses SHM (<code class="docutils literal notranslate"><span class="pre">make_deployment_kv_shm_dir</span></code>). Each deployment creates a
@@ -819,8 +811,8 @@ filesystem. The lock is <code class="docutils literal notranslate"><span class="
 different nodes at one shared directory there: each would sweep the
 other’s live directories.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_SHM_ARENA_SEGMENT_MB</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">256</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_SHM_ARENA_SEGMENT_MB</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">256</span></code>, less on a small or crowded /dev/shm</p></td>
 <td><p>Size of each arena segment. The arena grows segment by segment;
 existing segments never move (registrations stay valid). A
 segment’s /dev/shm pages are committed when it is created (pinned
@@ -829,14 +821,36 @@ segment counts against /dev/shm, as do spill files, which land in
 /dev/shm by default. A segment /dev/shm cannot hold counts as arena
 full (sends spill, see <code class="docutils literal notranslate"><span class="pre">MSTAR_SHM_ARENA_SPILL</span></code>).</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_SHM_ARENA_MAX_SEGMENTS</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">32</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_SHM_ARENA_MAX_SEGMENTS</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">32</span></code>, fewer on a small or crowded /dev/shm</p></td>
 <td><p>Growth cap PER ENTITY. Every entity (workers + the api-server data
-worker) creates its own arena, so node-wide /dev/shm demand can
-reach <code class="docutils literal notranslate"><span class="pre">MAX_SEGMENTS</span> <span class="pre">x</span> <span class="pre">SEGMENT_MB</span> <span class="pre">x</span> <span class="pre">num_entities</span></code> — size against
-<code class="docutils literal notranslate"><span class="pre">df</span> <span class="pre">-h</span> <span class="pre">/dev/shm</span></code> (tmpfs defaults to ~50% of RAM). Construction
+worker) on CUDA or CPU creates its own arena, so node-wide /dev/shm
+demand can reach <code class="docutils literal notranslate"><span class="pre">MAX_SEGMENTS</span> <span class="pre">x</span> <span class="pre">SEGMENT_MB</span> <span class="pre">x</span> <span class="pre">num_entities</span></code> — size
+against <code class="docutils literal notranslate"><span class="pre">df</span> <span class="pre">-h</span> <span class="pre">/dev/shm</span></code> (tmpfs defaults to ~50% of RAM). With
+neither this nor <code class="docutils literal notranslate"><span class="pre">MSTAR_SHM_ARENA_SEGMENT_MB</span></code> set, the API server
+sizes every arena of the deployment once, before any exists (see
+<code class="docutils literal notranslate"><span class="pre">MSTAR_SHM_ARENA_PLAN</span></code>): /dev/shm’s free space split evenly among
+the arenas, plus one share left for spill files. Each gets 256 MiB
+segments, 1 to 32 of them, or where a share is under 256 MiB, one
+segment of the largest power-of-two MiB that fits (16 MiB at least),
+logged at startup. An entity started without the API server takes a
+quarter of the free space it finds. Where a share is under 16 MiB, or
+when its first segment cannot be created, the entity has no arena and
+sends every tensor as a file (it still reads its peers’ arenas); a
+warning says why. Entities on other accelerators (ROCm, XPU) do the
+same until the arena is measured there. Set by hand, construction
 fails fast if one entity’s ceiling exceeds /dev/shm. At the cap,
 sends spill (see <code class="docutils literal notranslate"><span class="pre">MSTAR_SHM_ARENA_SPILL</span></code>).</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_SHM_ARENA_PLAN</span></code></p></td>
+<td><p>set by the API server</p></td>
+<td><p>Internal: <code class="docutils literal notranslate"><span class="pre">&lt;segment</span> <span class="pre">MiB&gt;x&lt;max</span> <span class="pre">segments&gt;</span></code> for every arena of the
+deployment (<code class="docutils literal notranslate"><span class="pre">0x0</span></code>: none, send by files), written by
+<a class="reference internal" href="_autosummary/mstar.communication.arena.html#mstar.communication.arena.export_arena_plan" title="mstar.communication.arena.export_arena_plan"><code class="xref py py-func docutils literal notranslate"><span class="pre">mstar.communication.arena.export_arena_plan()</span></code></a> before any arena
+exists, measured after a dead run’s files are swept, and inherited by the conductor and workers, so each arena gets
+the same size whatever order the processes start in. Read by
+<code class="docutils literal notranslate"><span class="pre">_arena_sizing</span></code>; <code class="docutils literal notranslate"><span class="pre">MSTAR_SHM_ARENA_SEGMENT_MB</span></code> and
+<code class="docutils literal notranslate"><span class="pre">_MAX_SEGMENTS</span></code> take precedence. Not meant to be set by hand.</p></td>
 </tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_SHM_ARENA_FULL_TIMEOUT_S</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">30</span></code></p></td>
@@ -850,7 +864,8 @@ per-uuid file protocol instead — slower, never fails, matching the
 file transport’s saturation behavior. <code class="docutils literal notranslate"><span class="pre">0</span></code> restores strict
 backpressure + timeout — only meaningful where ANOTHER thread
 drains consumer ACKs (the threaded api-server); on a worker the
-ACKs arrive on the very thread that would be waiting.</p></td>
+ACKs arrive on the very thread that would be waiting. An entity
+without an arena spills every send either way.</p></td>
 </tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_SHM_ARENA_SPILL_AFTER_S</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">0</span></code></p></td>
@@ -1771,7 +1786,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Nov 06, 2026.
+  Last updated on Nov 07, 2026.
   <br/>
 </p>
   </div>

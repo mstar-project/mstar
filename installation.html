@@ -55,7 +55,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Nov 06, 2026"/>
+    <meta name="docbuild:last-update" content="Nov 07, 2026"/>
   
     
     <script src="_static/searchtools.js"></script>
@@ -1201,10 +1201,11 @@ tensor bookkeeper, and needs the msgpack codec.</p></li>
 messages on. Each process logs it at startup (<code class="docutils literal notranslate"><span class="pre">control</span> <span class="pre">mesh</span> <span class="pre">transport:</span>
 <span class="pre">rust</span> <span class="pre">&lt;version&gt;</span> <span class="pre">from</span> <span class="pre">&lt;path&gt;</span></code>) and refuses an extension of another version
 than the one its <code class="docutils literal notranslate"><span class="pre">mstar</span></code> expects.</p></li>
-<li><p><strong>SHM tensor arena</strong> — <code class="docutils literal notranslate"><span class="pre">MSTAR_SHM_ARENA</span></code>: replaces the per-tensor file
-transport; requires the extension, interoperates on the same descriptor
-wire (and depends on the transport above only in the sense that both ship
-in the same extension).</p></li>
+<li><p><strong>SHM tensor arena</strong>: the SHM tensor transport on CUDA and CPU. Each
+process stages its tensors in <code class="docutils literal notranslate"><span class="pre">/dev/shm</span></code> segments sized from its free
+space (the <code class="docutils literal notranslate"><span class="pre">MSTAR_SHM_ARENA_*</span></code> knobs), and a tensor that does not fit
+spills to a per-tensor file. Other accelerators use the per-tensor files
+until the arena is measured there.</p></li>
 <li><p><strong>Message encoding</strong> — <code class="docutils literal notranslate"><span class="pre">MSTAR_WIRE_CODEC</span></code>: typed msgpack rather than
 pickle, which is what lets one end of an edge be Rust. On by default,
 extension or not. The legacy <code class="docutils literal notranslate"><span class="pre">pickle</span></code> codec is no longer supported.
@@ -1436,7 +1437,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Nov 06, 2026.
+  Last updated on Nov 07, 2026.
   <br/>
 </p>
   </div>

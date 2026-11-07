@@ -55,7 +55,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Nov 06, 2026"/>
+    <meta name="docbuild:last-update" content="Nov 07, 2026"/>
   
     
     <script src="_static/searchtools.js"></script>
@@ -827,13 +827,12 @@ the event loop and transport threads. On a 192-core H200 host the cap matched
 <code class="docutils literal notranslate"><span class="pre">OMP_WAIT_POLICY=PASSIVE</span></code> on RTFx and latency at concurrency 1 to 64 for both
 models, where the default pool lost 4-9 % (up to 29 % with the server pinned
 to 16 cores), so no launch setting is needed.</p>
-<p>Serve with the shared-memory arena, <code class="docutils literal notranslate"><span class="pre">MSTAR_SHM_ARENA=1</span></code> (needs the <code class="docutils literal notranslate"><span class="pre">rust/</span></code>
-extension; see <a class="reference internal" href="environment_variables.html"><span class="doc">Environment variables</span></a>). The default SHM transport creates
-and removes one file per tensor, and a transcription moves its audio, encoder
-states and output tokens as many small tensors; the arena places them in
-preallocated segments instead. Qwen3-ASR 1.7B in one run: RTFx 81, 218, 350 and
-412 at concurrency 1, 8, 32 and 64 on the file transport, 87, 252, 494 and 558
-on the arena, with the same 1.41 % WER.</p>
+<p>A transcription moves its audio, encoder states and output tokens as many small
+tensors. The SHM transport places them in the shared-memory arena’s
+preallocated segments; the file per tensor it used before cost throughput.
+Qwen3-ASR 1.7B in one run: RTFx 81, 218, 350 and 412 at concurrency 1, 8, 32
+and 64 with a file per tensor, 87, 252, 494 and 558 on the arena, with the same
+1.41 % WER.</p>
 <p>Every ASR config sets <code class="docutils literal notranslate"><span class="pre">max_concurrent_requests</span></code>. Whisper’s decoder caches
 hold 64 requests (12 cross-attention pages and 4 self-attention pages each),
 and the model refuses at startup a cap they cannot hold. Requests past the cap
@@ -976,7 +975,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Nov 06, 2026.
+  Last updated on Nov 07, 2026.
   <br/>
 </p>
   </div>

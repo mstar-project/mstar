@@ -410,7 +410,7 @@ window.runMermaid = runMermaid;</script>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Nov 06, 2026"/>
+    <meta name="docbuild:last-update" content="Nov 07, 2026"/>
   
     
     <script src="../../../_static/searchtools.js"></script>
@@ -1037,9 +1037,9 @@ window.runMermaid = runMermaid;</script>
     <span class="n">source_tp_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1</span>
     <span class="n">source_tp_rank</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span>
 
-    <span class="c1"># SHM-arena transport (MSTAR_SHM_ARENA): the producer wrote this tensor's</span>
-    <span class="c1"># bytes at `shm_offset` inside the named arena segment. None for the</span>
-    <span class="c1"># other transports (per-uuid files, Mooncake).</span>
+    <span class="c1"># SHM arena: the producer wrote this tensor's bytes at `shm_offset` inside</span>
+    <span class="c1"># the named arena segment. None for a tensor the arena spilled to a</span>
+    <span class="c1"># per-uuid file, and for Mooncake.</span>
     <span class="n">shm_segment</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
     <span class="n">shm_offset</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span>
 
@@ -2146,7 +2146,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Nov 06, 2026.
+  Last updated on Nov 07, 2026.
   <br/>
 </p>
   </div>

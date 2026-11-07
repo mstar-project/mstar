@@ -55,7 +55,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Nov 06, 2026"/>
+    <meta name="docbuild:last-update" content="Nov 07, 2026"/>
   
     
     <script src="../_static/searchtools.js"></script>
@@ -708,6 +708,7 @@
             </div>
             <nav aria-label="Page">
                 <ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.arena.ARENA_PLAN_ENV"><code class="docutils literal notranslate"><span class="pre">ARENA_PLAN_ENV</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.arena.ArenaShmCommunicationManager"><code class="docutils literal notranslate"><span class="pre">ArenaShmCommunicationManager</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.arena.ArenaShmCommunicationManager.cleanup_collectable"><code class="docutils literal notranslate"><span class="pre">ArenaShmCommunicationManager.cleanup_collectable()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.arena.ArenaShmCommunicationManager.close"><code class="docutils literal notranslate"><span class="pre">ArenaShmCommunicationManager.close()</span></code></a></li>
@@ -720,6 +721,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.arena.ArenaShmCommunicationManager.unlink_owned_files"><code class="docutils literal notranslate"><span class="pre">ArenaShmCommunicationManager.unlink_owned_files()</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.arena.export_arena_plan"><code class="docutils literal notranslate"><span class="pre">export_arena_plan()</span></code></a></li>
 </ul>
             </nav>
         </div>
@@ -757,13 +759,42 @@ periodically.</p>
 (workers + the api-server data worker), /dev/shm demand can reach
 <code class="docutils literal notranslate"><span class="pre">MAX_SEGMENTS</span> <span class="pre">x</span> <span class="pre">SEGMENT_MB</span> <span class="pre">x</span> <span class="pre">E</span></code> and pinned host RAM approx
 <code class="docutils literal notranslate"><span class="pre">PIN_MAX_MB</span> <span class="pre">x</span> <span class="pre">E</span></code> (consumers pin peer segments too, so one process can pin
-more than its own arena holds). Construction fails fast when one entity’s
-ceiling already exceeds /dev/shm, and warns when it exceeds current free
-space or when the pin budget is an outsized share of physical RAM.</p>
-<p>Selection: <code class="docutils literal notranslate"><span class="pre">create_tensor_communication_manager</span></code> picks this manager for
-the SHM protocol when <code class="docutils literal notranslate"><span class="pre">MSTAR_SHM_ARENA</span></code> is <code class="docutils literal notranslate"><span class="pre">1</span></code> (require) or <code class="docutils literal notranslate"><span class="pre">AUTO</span></code>
-(use if the <code class="docutils literal notranslate"><span class="pre">mstar_rust</span></code> extension imports); default <code class="docutils literal notranslate"><span class="pre">0</span></code> keeps the file
-transport. See <span class="xref std std-doc">environment_variables</span> for all knobs.</p>
+more than its own arena holds). With neither <code class="docutils literal notranslate"><span class="pre">MAX_SEGMENTS</span></code> nor
+<code class="docutils literal notranslate"><span class="pre">SEGMENT_MB</span></code> set, the API server sizes every arena of its deployment once,
+before any exists (<code class="docutils literal notranslate"><span class="pre">export_arena_plan</span></code>): /dev/shm’s free space split among
+the deployment’s arenas plus one share kept for spill files. Each entity
+measuring free space for itself would give the ones that start later less,
+since a first segment’s pages are committed when it is created. An entity
+started without that plan falls back to its own measurement. Set by hand,
+construction fails fast when one entity’s ceiling already exceeds /dev/shm.
+Either way it warns when the ceiling exceeds current free space or when the
+pin budget is an outsized share of physical RAM.</p>
+<p>An entity can also run without an arena of its own: when its first segment
+cannot be created (or /dev/shm is too small for a 16 MiB share), and on
+devices other than CPU and CUDA (<code class="docutils literal notranslate"><span class="pre">_arena_supported</span></code>), which use the file
+path until the arena is measured there. It then sends every tensor as a per-uuid file and
+still reads its peers’ arenas, so it mixes with entities that have one.</p>
+<p>Selection: <code class="docutils literal notranslate"><span class="pre">create_tensor_communication_manager</span></code> builds this manager for
+the SHM protocol; the file transport it extends is its spill path. See
+<span class="xref std std-doc">environment_variables</span> for the knobs.</p>
+<p class="rubric">Module Attributes</p>
+<div class="pst-scrollable-table-container"><table class="autosummary longtable table">
+<tbody>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.communication.arena.ARENA_PLAN_ENV" title="mstar.communication.arena.ARENA_PLAN_ENV"><code class="xref py py-obj docutils literal notranslate"><span class="pre">ARENA_PLAN_ENV</span></code></a></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">&lt;segment</span> <span class="pre">MiB&gt;x&lt;max</span> <span class="pre">segments&gt;</span></code> for every arena of one deployment, <code class="docutils literal notranslate"><span class="pre">0x0</span></code> for none; set by <code class="docutils literal notranslate"><span class="pre">export_arena_plan</span></code> and inherited by the processes the API server starts.</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p class="rubric">Functions</p>
+<div class="pst-scrollable-table-container"><table class="autosummary longtable table">
+<tbody>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.communication.arena.export_arena_plan" title="mstar.communication.arena.export_arena_plan"><code class="xref py py-obj docutils literal notranslate"><span class="pre">export_arena_plan</span></code></a>(worker_devices)</p></td>
+<td><p>Size every arena of this deployment once, from /dev/shm's free space before any of them exists, and hand the sizes to the processes the caller starts (<code class="docutils literal notranslate"><span class="pre">ARENA_PLAN_ENV</span></code>).</p></td>
+</tr>
+</tbody>
+</table>
+</div>
 <p class="rubric">Classes</p>
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
 <tbody>
@@ -773,11 +804,21 @@ transport. See <span class="xref std std-doc">environment_variables</span> for a
 </tbody>
 </table>
 </div>
+<dl class="py data">
+<dt class="sig sig-object py" id="mstar.communication.arena.ARENA_PLAN_ENV">
+<span class="sig-prename descclassname"><span class="pre">mstar.communication.arena.</span></span><span class="sig-name descname"><span class="pre">ARENA_PLAN_ENV</span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">'MSTAR_SHM_ARENA_PLAN'</span></span><a class="headerlink" href="#mstar.communication.arena.ARENA_PLAN_ENV" title="Link to this definition">#</a></dt>
+<dd><p><code class="docutils literal notranslate"><span class="pre">&lt;segment</span> <span class="pre">MiB&gt;x&lt;max</span> <span class="pre">segments&gt;</span></code> for every arena of one deployment, <code class="docutils literal notranslate"><span class="pre">0x0</span></code>
+for none; set by <code class="docutils literal notranslate"><span class="pre">export_arena_plan</span></code> and inherited by the processes the
+API server starts.</p>
+</dd></dl>
+
 <dl class="py class">
 <dt class="sig sig-object py" id="mstar.communication.arena.ArenaShmCommunicationManager">
 <span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.communication.arena.</span></span><span class="sig-name descname"><span class="pre">ArenaShmCommunicationManager</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">my_entity_id</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">hostname</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">device</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">communicator</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">shm_dir</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">enable_prof</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">copy_workers</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">1</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/communication/arena.html#ArenaShmCommunicationManager"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.communication.arena.ArenaShmCommunicationManager" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference internal" href="mstar.communication.tensors.html#mstar.communication.tensors.SharedMemoryCommunicationManager" title="mstar.communication.tensors.SharedMemoryCommunicationManager"><code class="xref py py-class docutils literal notranslate"><span class="pre">SharedMemoryCommunicationManager</span></code></a></p>
 <p>Tensor transport via the Rust shared-memory arena (<code class="docutils literal notranslate"><span class="pre">mstar_rust</span></code>).</p>
+<p><code class="docutils literal notranslate"><span class="pre">_arena</span></code> is None when this entity has none of its own (see the module
+docstring): every send then spills to a per-uuid file.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
@@ -919,6 +960,24 @@ gone, and unlinks any segment grown after this call.</p>
 
 </dd></dl>
 
+<dl class="py function">
+<dt class="sig sig-object py" id="mstar.communication.arena.export_arena_plan">
+<span class="sig-prename descclassname"><span class="pre">mstar.communication.arena.</span></span><span class="sig-name descname"><span class="pre">export_arena_plan</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">worker_devices</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/communication/arena.html#export_arena_plan"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.communication.arena.export_arena_plan" title="Link to this definition">#</a></dt>
+<dd><p>Size every arena of this deployment once, from /dev/shm’s free space
+before any of them exists, and hand the sizes to the processes the caller
+starts (<code class="docutils literal notranslate"><span class="pre">ARENA_PLAN_ENV</span></code>). Called by the API server, which holds one
+arena itself, for its workers on <code class="docutils literal notranslate"><span class="pre">worker_devices</span></code>; None (no deployment
+config) drops a plan an earlier server in this process left.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>worker_devices</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>] </em><em>| </em><em>None</em>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p>None</p>
+</dd>
+</dl>
+</dd></dl>
+
 </section>
 
 
@@ -968,6 +1027,7 @@ gone, and unlinks any segment grown after this call.</p>
   </div>
   <nav id="pst-page-toc-nav" class="page-toc" aria-labelledby="pst-page-navigation-heading-2">
     <ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.arena.ARENA_PLAN_ENV"><code class="docutils literal notranslate"><span class="pre">ARENA_PLAN_ENV</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.arena.ArenaShmCommunicationManager"><code class="docutils literal notranslate"><span class="pre">ArenaShmCommunicationManager</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.arena.ArenaShmCommunicationManager.cleanup_collectable"><code class="docutils literal notranslate"><span class="pre">ArenaShmCommunicationManager.cleanup_collectable()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.arena.ArenaShmCommunicationManager.close"><code class="docutils literal notranslate"><span class="pre">ArenaShmCommunicationManager.close()</span></code></a></li>
@@ -980,6 +1040,7 @@ gone, and unlinks any segment grown after this call.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.arena.ArenaShmCommunicationManager.unlink_owned_files"><code class="docutils literal notranslate"><span class="pre">ArenaShmCommunicationManager.unlink_owned_files()</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.arena.export_arena_plan"><code class="docutils literal notranslate"><span class="pre">export_arena_plan()</span></code></a></li>
 </ul>
   </nav></div>
 
@@ -1013,7 +1074,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Nov 06, 2026.
+  Last updated on Nov 07, 2026.
   <br/>
 </p>
   </div>
