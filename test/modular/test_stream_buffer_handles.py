@@ -707,8 +707,13 @@ class _HistoryChunkPolicy(FixedChunkPolicy):
 
 @pytest.mark.parametrize("factory", [lambda: FixedChunkPolicy(2), lambda: SlidingWindowChunkPolicy(4, 2),
                                       _HistoryChunkPolicy])
-@pytest.mark.parametrize("stop,withheld", [(None, False), (1, True), (3, False), (5, True)])
-def test_future_stream_decisions_equal_ordinary_interleaving_and_preserve_later_arrivals(factory, stop, withheld):
+@pytest.mark.parametrize("stop,withheld,finished", [
+    (None, False, False), (1, True, True), (3, False, True), (5, True, True),
+    (1, False, False), (3, False, False), (1, True, False),
+])
+def test_future_stream_decisions_equal_ordinary_interleaving_and_preserve_later_arrivals(
+    factory, stop, withheld, finished,
+):
     from mstar.engine.resources.iteration_tables import IterationTables
     from mstar.engine.resources.step import BucketKey, SlotLease
 
@@ -755,12 +760,12 @@ def test_future_stream_decisions_equal_ordinary_interleaving_and_preserve_later_
         if not (step == stop and withheld):
             produced.append(item)
             oracle.put_positions([item])
-        if step == stop:
+        if step == stop and finished:
             done = True
             oracle.signal_done(3 + len(produced))
         if count < bound:
             pop()
-        if done:
+        if step == stop:
             break
     while count < bound and oracle.has_chunk_ready():
         if not pop():

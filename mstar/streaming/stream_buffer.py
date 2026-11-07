@@ -557,9 +557,10 @@ class StreamBuffer:
         # storage inside its existing preview_copy implementation.
         max_previews = 4096
         producers = len(future_positions)
-        # Each producer has two terminal drain branches and one continuation;
-        # include their independent snapshots as well as every possible pop.
-        preview_work = 3 * producers + 1 + (2 * producers + 1) * bound
+        # Each producer has two terminal drains, a continuing drain (a run
+        # can yield without EOF), and its ordinary sweep continuation. Include
+        # an initially skipped producer and every possible policy pop too.
+        preview_work = 4 * producers + 2 + (3 * producers + 2) * bound
         if preview_work > max_previews:
             return None
         transitions: list[StreamTransition] = []
@@ -610,6 +611,7 @@ class StreamBuffer:
         if self._producer_done_and_all_read():
             drain(primary, parent, 0, count, True)
         else:
+            drain(primary._preview(), parent, 0, count, False)
             for produced, position in enumerate(future_positions):
                 if may_finish:
                     # A stop withholds this iteration's item, or emits it.
@@ -622,7 +624,10 @@ class StreamBuffer:
                     selected = pop(primary, parent, produced + 1, False)
                     if selected is not None:
                         parent, count = selected, count + 1
-            drain(primary, parent, len(future_positions), count, False)
+                # A short run does not prove the producer partition ended.
+                # Its consumer can still drain what actually arrived before
+                # any later producer step or conductor EOF notification.
+                drain(primary._preview(), parent, produced + 1, count, False)
         reservation = StreamReservation(
             self._chunks_popped if adopt is None else adopt.chunk_index,
             bound, 0, self._executed_chunks, tuple(transitions), tuple(parents),
