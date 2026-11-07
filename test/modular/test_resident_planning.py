@@ -1938,11 +1938,13 @@ def test_fresh_resident_rows_preserve_a_queued_capture_and_ordinary_sequence(mon
     _slot_ledger(planner)
 
 
-@pytest.mark.parametrize("actual,routed,changed_flag", [
-    (actual, routed, False) for actual in (0, 2, 4) for routed in (False, True)
-] + [(2, False, True)])
-def test_engine_prepares_one_logical_joining_receipt_without_replanning(actual, routed, changed_flag, monkeypatch):
-    from mstar.engine.engine import Engine, ExecutingBatch
+@pytest.mark.parametrize("actual,routed,changed_flag,member", [
+    (actual, routed, False, 0) for actual in (0, 2, 4) for routed in (False, True)
+] + [(2, False, True, 0), (2, False, False, 1)])
+def test_engine_prepares_one_logical_joining_receipt_without_replanning(
+    actual, routed, changed_flag, member, monkeypatch,
+):
+    from mstar.engine.engine import Engine, ExecutingBatch, RunLayout
     from mstar.engine.resources.run_rows import RunRows
 
     live = _resources(prefix_cache=False)
@@ -1952,7 +1954,7 @@ def test_engine_prepares_one_logical_joining_receipt_without_replanning(actual, 
         runner.ingest_request(rid, {"kv": KVReqConfig()})
         _host_step(live, [rid], [3])
     incumbent = _captured_step(live, planner, [1], slot=0, bs=4, repeats=4)
-    membership = RunRows(torch.device("cpu"), 4, 8, 3)
+    membership = RunRows(torch.device("cpu"), 4, 8, 3 * (member + 1))
     slot = SimpleNamespace(run=SimpleNamespace(state=SimpleNamespace(membership=membership), window=None),
                            row_heads={}, static_inputs={"flag": False}, dummy_rids=(-1, -2, -3, -4))
     from mstar.engine.resources.loopback_rows import LoopbackRows
@@ -1969,6 +1971,8 @@ def test_engine_prepares_one_logical_joining_receipt_without_replanning(actual, 
     })
     eng = Engine.__new__(Engine)
     eng._runner, eng._enable_nvtx = runner, False
+    if member:
+        eng._run_layouts = {"decode": RunLayout(("producer", "decode"), 4)}
     eng._submodules = {"decode": SimpleNamespace(
         resident=planner, submodule=submodule, device_stops={WALK: None}, loopback_rows=owner,
         resources=live, piecewise_runners={}, rings={"frame": {WALK}},
@@ -2032,10 +2036,10 @@ def test_engine_prepares_one_logical_joining_receipt_without_replanning(actual, 
     eng.settle_run(candidate, actual, {2: actual})
     assert live["kv"]._streams[2]["main"].stored_len == live["rope"].position(2, "main") == 3 + actual
     assert membership.release(descriptor)
-    planner.unpin((descriptor.bindings[0],))
+    eng.release_run_row(candidate, descriptor)
     for incumbent_descriptor in active.run_rows.values():
         assert membership.release(incumbent_descriptor)
-        planner.unpin((incumbent_descriptor.bindings[0],))
+        eng.release_run_row(active, incumbent_descriptor)
     assert membership.idle
     _slot_ledger(planner)
 
@@ -3147,6 +3151,31 @@ def test_a_pool_shared_by_nodes_refuses():
     res = _resources()
     planner, why = _build({"kv": res["kv"]}, nodes={"kv": ("a", "b")})
     assert planner is None and "shared by nodes" in why
+
+
+def test_shared_publication_keeps_each_nodes_tables_and_checks_independent(monkeypatch):
+    from mstar.engine.resources.run_rows import RunRows
+
+    shared = RunRows(CPU, 4, 20, 6)
+    planners = []
+    for node in ("a", "b"):
+        resources = {"kv": _resources()["kv"], "membership": shared}
+        planner, refused = build_planner(node, {WALK: _ONE_TOKEN}, resources,
+                                         {"membership": ("a", "b")}, CPU, lambda walks: 4)
+        assert planner is not None and not refused
+        planners.append(planner)
+        # Sharing the auxiliary owner must not bypass its admission check.
+        with pytest.raises(ValueError, match="capture"):
+            planner.bindings["membership"].check_horizon(None, SimpleNamespace(slot_lease=None))
+    assert planners[0].store.data_ptr() != planners[1].store.data_ptr()
+    planners[0].store.fill_(17)
+    assert not torch.count_nonzero(planners[1].store)
+    binding = shared.resident_binding()
+    calls = []
+    monkeypatch.setattr(shared, "resident_binding", lambda: replace(binding, bind=lambda *args: calls.append(args)))
+    planner, why = _build({"membership": shared}, nodes={"membership": ("a", "b")})
+    assert planner is None and "shared by nodes" in why
+    assert calls == []  # refuse before rebinding either node's state
 
 
 def test_a_pool_read_across_nodes_refuses():
@@ -4404,3 +4433,36 @@ def test_publication_input_staging_does_not_overwrite_an_execution_streams_queue
     owner.stage_window(lease, [1], snapshot(10., 1))
     assert bank.columns["cond"].tolist() == [[-1.] * 4, [10.] * 4, [20.] * 4]
     assert bank.entries.tolist() == [[-1, -1], [1, 0], [2, 0]]
+
+
+def test_a_joining_unit_shares_one_publication_and_serializes_subset_parents():
+    from mstar.engine.engine import Engine
+    from mstar.graph.runtime.base import ExecutionUnit
+    from mstar.worker.step_repeats import RepeatConfig, StepRepeats
+    from mstar.worker.worker import Worker
+
+    unit = ExecutionUnit((1, 2), ("produce", "consume"), ("a", "b"), (("a", "b", "x"),),
+                         (("x",), ("y",)), streaming_edges=(("a", "b", "x"),))
+    engine = Engine.__new__(Engine)
+    engine._device, engine._walk_runs = torch.device("cuda"), frozenset({"produce"})
+    engine._graph_runtime = SimpleNamespace(execution_units=lambda walk: (unit,))
+    submodules = dict.fromkeys(unit.nodes, SimpleNamespace(get_accelerator_graph_configs=lambda *args: (
+        SimpleNamespace(capture_batch_sizes=[1, 4]),
+    )))
+    ranks = SimpleNamespace(get_joint_group_for_node=lambda node: SimpleNamespace(world_size=1))
+    specs = engine._membership_specs(submodules, {"a": 4, "b": 2}, ranks)
+    assert len(specs) == 1 and specs[0].nodes == {"a", "b"}
+    assert engine._run_layouts["a"] is engine._run_layouts["b"]
+    layout = engine._run_layouts["b"]
+    assert layout.binding("b", 9, False, 1) == (0, 0, 0, 9, 0, 1)
+    # A consumer-only fallback still shares the active publication owner.
+    # It must close before any speculative producer/consumer parent is queued.
+    worker = Worker.__new__(Worker)
+    worker._joining_nodes = engine.joining_nodes()
+    worker._step_repeats = StepRepeats({"a": RepeatConfig(max=4, device_stop="skip", join_rows=True)}, {})
+    for node in unit.nodes:
+        assert worker._build_speculation(SimpleNamespace(node_name=node, group=None), 0, None) == (None, None)
+    for walk in ("consume", "another_walk"):
+        engine._walk_lanes = {("b", walk): 1}
+        with pytest.raises(ValueError, match="main chain"):
+            engine._membership_specs(submodules, {"a": 4}, ranks)

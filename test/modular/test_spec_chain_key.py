@@ -28,7 +28,7 @@ def _worker(target, other_ready=True, speculation=None, mid_prefill_walks=frozen
         chunk_loops=SimpleNamespace(speculated=mid_prefill_walks),
         _choose_spec_target=lambda batch: target,
         _try_speculate_next=lambda pending, target, owes_run=False: speculation,
-        _step_repeats=StepRepeats({}, {}),
+        _step_repeats=StepRepeats({}, {}), _joining_nodes=frozenset(),
         maybe_send_zmq_to_tp_followers=lambda node_batch, **kw: -1,
         _tp_lead_needs_marker=lambda pending, speculation: False,
         _span=lambda name: _Span(),

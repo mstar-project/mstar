@@ -607,7 +607,7 @@ class RepeatingSteps:
                     for descriptor in batch.run_rows.values():
                         if not membership.release(descriptor):
                             raise ValueError("a closed run still has a live descriptor reader")
-                        batch.step_context.resident.unpin((descriptor.bindings[0],))
+                        engine.release_run_row(batch, descriptor)
                     batch.run_rows.clear()
             gpu_executor.submit(release).result()
 

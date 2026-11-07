@@ -484,6 +484,8 @@ class Worker(RepeatingSteps):
     computation via engines.
     """
 
+    _joining_nodes: frozenset[str] = frozenset()
+
     # This worker's chunk Loops, set at load. Empty here so a worker built
     # without one -- any test fake -- chunks nowhere rather than raising from
     # postprocess.
@@ -950,6 +952,7 @@ class Worker(RepeatingSteps):
                                       else ((unit.nodes[0], unit.graph_walks[0]),))
         }
 
+        self._joining_nodes = self.engine_manager.engine.joining_nodes()
         for unit in self.scheduler.execution_units.values():
             self._group_repeat_config(unit)
 
@@ -5602,8 +5605,7 @@ class Worker(RepeatingSteps):
         and the (node, walk) to exclude on the non-speculative path."""
         if pending is not None and pending.group is not None:
             return None, None
-        if (pending is not None and self._step_repeats is not None
-                and self._step_repeats.config(pending.node_name).join_rows):
+        if pending is not None and pending.node_name in self._joining_nodes:
             return None, None  # one closed publication window owns the next graph step
         speculation = None
         yield_away_from_target = None

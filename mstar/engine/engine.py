@@ -713,7 +713,28 @@ class ExecutionGroup:
     capacity: int = 1
 
 
+@dataclass(frozen=True)
+class RunLayout:
+    """The canonical owner bindings and physical horizon of one publication."""
+    nodes: tuple[str, ...]
+    limit: int
+
+    @property
+    def key(self) -> str:
+        return run_rows_key(self.nodes[0])
+
+    def binding(self, node: str, resident: int, immune: bool, limit: int) -> tuple[int, ...]:
+        values = [0] * (3 * len(self.nodes))
+        offset = 3 * self.nodes.index(node)
+        values[offset:offset + 3] = (resident, int(immune), limit)
+        return tuple(values)
+
+    def resident(self, node: str, descriptor: RunRow) -> int:
+        return descriptor.bindings[3 * self.nodes.index(node)]
+
+
 class Engine:
+    _run_layouts: Mapping[str, RunLayout] = MappingProxyType({})
     _walk_runs: frozenset[str] = frozenset()
     # node -> its lane, for nodes off the chain, and each such lane's stream;
     # set at construction and load, empty for an engine with no lanes
@@ -815,18 +836,7 @@ class Engine:
         }
         specs = [*specs, *self._row_specs(submodules, row_nodes),
                  *self._iteration_specs(submodules, streamed_consumers)]
-        for node, limit in (joining or {}).items():
-            if node not in submodules:
-                continue
-            if device.type != "cuda" or parallel_groups.get_joint_group_for_node(node).world_size != 1:
-                raise ValueError(f"{node}: join_rows needs one CUDA rank")
-            configs = submodules[node].get_accelerator_graph_configs(device, 1)
-            rows = max((max(c.capture_batch_sizes or AcceleratorGraphRunner.CAPTURE_BATCH_SIZES)
-                        for c in configs), default=0)
-            if not rows:
-                raise ValueError(f"{node}: join_rows needs whole-forward captures")
-            specs.append(RunRowsSpec(resource_key=run_rows_key(node), nodes={node}, rows=rows,
-                                     capacity=rows * (limit + 1), binding_width=3))
+        specs.extend(self._membership_specs(submodules, joining or {}, parallel_groups))
         specs_by_key = resolve_spec_dependencies(specs)
         instance = {node: parallel_groups.get_joint_group_for_node(node).world_size for node in node_names}
         checkpoint = model.checkpoint_path() if model is not None else None
@@ -927,6 +937,50 @@ class Engine:
                 submodule.iteration_tables = resources[key]
 
         self._share_slot_rotations()
+
+    def _membership_specs(self, submodules, joining, parallel_groups) -> list[RunRowsSpec]:
+        """One publication owner per requested node or registered streamed unit."""
+        layouts, specs = {}, []
+        units = set(unit for walk in self._walk_runs for unit in self._graph_runtime.execution_units(walk)
+                    if unit.streaming_edges)
+        for node, limit in joining.items():
+            if node not in submodules:
+                continue
+            candidates = [unit for unit in units if node in unit.nodes]
+            if len(candidates) > 1:
+                raise ValueError(f"{node}: joining cannot share overlapping execution units")
+            unit = candidates[0] if candidates else None
+            nodes = unit.nodes if unit is not None else (node,)
+            limit = max(joining.get(member, 1) for member in nodes)
+            layout = RunLayout(nodes, limit)
+            if any(member in layouts and layouts[member] != layout for member in nodes):
+                raise ValueError("joining execution units have overlapping publication owners")
+            if node in layouts:
+                continue
+            if not set(nodes) <= submodules.keys():
+                raise ValueError("a joining unit must be held by one engine")
+            if unit is not None and any(lane != 0 for (member, _), lane in self._walk_lanes.items()
+                                        if member in nodes):
+                raise ValueError("a joining unit must stay on the worker's main chain")
+            rows = 0
+            for member in nodes:
+                if self._device.type != "cuda" or parallel_groups.get_joint_group_for_node(member).world_size != 1:
+                    raise ValueError(f"{member}: join_rows needs one CUDA rank")
+                configs = submodules[member].get_accelerator_graph_configs(self._device, 1)
+                capacity = max((max(c.capture_batch_sizes or AcceleratorGraphRunner.CAPTURE_BATCH_SIZES)
+                                for c in configs), default=0)
+                if not capacity:
+                    raise ValueError(f"{member}: join_rows needs whole-forward captures")
+                rows = max(rows, capacity)
+                layouts[member] = layout
+            specs.append(RunRowsSpec(resource_key=layout.key, nodes=set(nodes), rows=rows,
+                                     capacity=rows * (limit + 1), binding_width=3 * len(nodes)))
+        self._run_layouts = MappingProxyType(layouts)
+        return specs
+
+    def joining_nodes(self) -> frozenset[str]:
+        """Members whose standalone parent also shares a publication window."""
+        return frozenset(self._run_layouts)
 
     @staticmethod
     def _row_specs(submodules: Mapping[str, NodeSubmodule], row_nodes: Collection[str]) -> list[LoopbackRowsSpec]:
@@ -1153,7 +1207,7 @@ class Engine:
                 for resource in self._submodules[node_name].resources.values():
                     key = id(resource), walk
                     config = device_stops.get((node_name, walk))
-                    joining = bool(config is not None and config.join_rows)
+                    joining = node_name in self._run_layouts or bool(config is not None and config.join_rows)
                     owners[key] = resource, walk, joining or (key in owners and owners[key][2])
         for resource, walk, joining in owners.values():
             if joining:
@@ -1870,6 +1924,7 @@ class Engine:
         mgmt = self._submodules[node_name]
         if mgmt.joint_comm_group.world_size > 1:
             return  # the stop must match on every rank, and NCCL in a WHILE body is untested
+        layout = self._run_layouts.get(node_name)
         iteration = bool(getattr(mgmt.submodule, "ITERATION_INPUTS", None))
         loop = self._loops.get((node_name, graph_walk)) if iteration else None
         policies = self.get_stop_policies(node_name, graph_walk)
@@ -1887,7 +1942,7 @@ class Engine:
         if connected and self._runner.prefix_chain_keys(node_name):
             runner.refuse_run(graph_walk, "resource: independently ready rows cannot key a prefix chain")
             return
-        if config.join_rows and self._runner.prefix_chain_keys(node_name):
+        if layout is not None and self._runner.prefix_chain_keys(node_name):
             runner.refuse_run(graph_walk, "resource: joining rows cannot key a prefix chain")
             return
         if iteration:
@@ -1913,13 +1968,14 @@ class Engine:
         carries = mgmt.submodule.repeat_carry(graph_walk, signals)
         runner.ask_run(graph_walk, RunAsk(
             None if policy is None else policy.token_signal, () if policy is None else policy.eos_tokens,
-            config.device_stop == "drop_rows", config.max,
+            config.device_stop == "drop_rows", config.max if layout is None else layout.limit,
             {signal: pair for signal, pair in carries.items() if signal not in heads},
             mgmt.run_columns.get(graph_walk, frozenset()),
             frozenset(getattr(mgmt.submodule, "ITERATION_INPUTS", None) or ()), config.refill_at,
             config.stream_tokens, loop=loop,
-            membership=mgmt.resources[run_rows_key(node_name)] if config.join_rows else None,
-            independent_rows=connected and not config.join_rows,
+            membership=None if layout is None else mgmt.resources[layout.key],
+            independent_rows=connected,
+            member=0 if layout is None else layout.nodes.index(node_name),
         ))
 
     def ask_ring(self, node_name: str, signal: str, depth: int, walks: Collection[str]) -> LoopbackRows | str:
@@ -3406,6 +3462,18 @@ class Engine:
             self._add_resource_host_rows(submodule_mgmt, out, batch.step_context.repeats)
         return out
 
+    def _row_binding(self, node: str, resident: int, immune: bool, limit: int) -> tuple[int, ...]:
+        layout = self._run_layouts.get(node)
+        return ((resident, int(immune), limit) if layout is None
+                else layout.binding(node, resident, immune, limit))
+
+    def release_run_row(self, batch: ExecutingBatch, descriptor: RunRow) -> None:
+        """Release this logical member's pin after its descriptor reader closes."""
+        layout = self._run_layouts.get(batch.node_name)
+        slot = descriptor.bindings[0] if layout is None else layout.resident(batch.node_name, descriptor)
+        if slot:
+            batch.step_context.resident.unpin((slot,))
+
     def _seed_run_rows(self, batch: ExecutingBatch, slot, immune: Sequence[bool]) -> None:
         """Pin and publish incumbents before launching an empty membership window."""
         membership = slot.run.state.membership
@@ -3425,7 +3493,8 @@ class Engine:
             with publication:
                 for row, (rid, resident, ignore) in enumerate(zip(batch.request_ids, pins, immune, strict=True)):
                     descriptor = membership.reserve_row(
-                        rid, self._runner.request_generation(rid), row, (resident, int(ignore), ctx.repeats),
+                        rid, self._runner.request_generation(rid), row,
+                        self._row_binding(batch.node_name, resident, ignore, ctx.repeats),
                     )
                     if descriptor is None:
                         raise ValueError("a fresh membership window lacks descriptor credits")
@@ -3517,7 +3586,8 @@ class Engine:
             policy = mgmt.device_stops[batch.graph_walk]
             immune = policy is not None and policy.limits(batch.per_request_info_wrapped[rid]).ignore_eos
             descriptor = membership.reserve_row(
-                rid, self._runner.request_generation(rid), row, (int(plan.slots[0]), int(immune), ctx.repeats),
+                rid, self._runner.request_generation(rid), row,
+                self._row_binding(batch.node_name, int(plan.slots[0]), immune, ctx.repeats),
             )
             if descriptor is None:
                 return None
