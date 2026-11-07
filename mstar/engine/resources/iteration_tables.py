@@ -34,6 +34,7 @@ from mstar.utils.h2d import PinnedStager
 
 if TYPE_CHECKING:
     from mstar.model.submodule_base import IterationInput
+    from mstar.streaming.stream_buffer import StreamReservation
 
 # a request's rows take a multiple of this, so a freed extent fits the next request of about its size
 _EXTENT_ROWS = 64
@@ -62,6 +63,45 @@ class _Extent(NamedTuple):
     size: int
     # rows of its table proper: reading past them is an error where there's no pad
     padless_rows: int | None
+
+
+@dataclass
+class StreamWindow:
+    """A captured view of ordinary stream-policy decisions, owned by IterationTables.
+
+    Selection never executes a policy: it looks up the frozen predecessor,
+    available end and producer-done key. Semantic pops and model computation
+    have separate predicates; an ordinary empty final flush can do only the former.
+    """
+    decisions: torch.Tensor
+    chunks: torch.Tensor
+    history: torch.Tensor
+    counts: torch.Tensor
+    limits: torch.Tensor
+    terminal: torch.Tensor
+    selected: torch.Tensor
+    metadata: torch.Tensor
+    ready: torch.Tensor
+    compute_ready: torch.Tensor
+
+    def select(self, available: torch.Tensor, done: torch.Tensor, live: torch.Tensor) -> None:
+        choices = self.decisions
+        matches = ((choices[:, :, 0] == self.history[:, None])
+                   & (choices[:, :, 1] == available[:, None]) & (choices[:, :, 2] == done[:, None]))
+        allowed = live & ~self.terminal & (self.counts < self.limits)
+        selected = torch.where(matches & allowed[:, None], choices[:, :, 3], -1).amax(dim=1)
+        self.selected.copy_(selected)
+        index = selected.clamp_min(0)[:, None, None].expand(-1, 1, self.chunks.shape[2])
+        self.metadata.copy_(torch.where((selected >= 0)[:, None], self.chunks.gather(1, index).squeeze(1), 0))
+        self.ready.copy_((selected >= 0).any().reshape(1))
+        self.compute_ready.copy_(((selected >= 0) & (self.metadata[:, 5] != 0)).any().reshape(1))
+
+    def advance(self) -> None:
+        """After selected semantic work, including a prepared zero-compute tail."""
+        kept = self.selected >= 0
+        self.history.copy_(torch.where(kept, self.selected, self.history))
+        self.counts.add_(kept)
+        self.terminal.logical_or_(kept & (self.metadata[:, 3] != 0))
 
 
 class _Table:
@@ -101,6 +141,7 @@ class IterationTables(Resource):
         self._windows: dict[tuple, IterationWindow] = {}
         self._window_indices: dict[tuple, torch.Tensor] = {}
         self._window_fills: dict[tuple, Mapping[str, float | int]] = {}
+        self._stream_windows: dict[tuple, StreamWindow] = {}
 
     @classmethod
     def build(cls, spec: IterationTablesSpec, info: EngineResourceInfo) -> IterationTables:
@@ -176,6 +217,71 @@ class IterationTables(Resource):
         self._windows.pop(key, None)
         self._window_indices.pop(key, None)
         self._window_fills.pop(key, None)
+        self._stream_windows.pop(key, None)
+
+    def prepare_stream_window(self, lease: SlotLease, decisions: int, transitions: int) -> StreamWindow:
+        """One bounded policy bank per leased capture; no payload ownership changes."""
+        if not 0 < decisions <= 4096 or not 0 < transitions <= 4096:
+            raise ValueError("a captured stream policy needs bounded decision and transition tables")
+        key, bs = (lease.bucket, lease.buffer_slot), lease.bucket.bs
+        if (window := self._stream_windows.get(key)) is not None:
+            if window.decisions.shape != (bs, decisions, 4) or window.chunks.shape != (bs, transitions, 6):
+                raise ValueError("captured stream-policy geometry changed for the same capture")
+            return window
+        def zeros(*shape, dtype=torch.long):
+            return torch.zeros(shape, dtype=dtype, device=self._device)
+        window = StreamWindow(
+            torch.full((bs, decisions, 4), -1, dtype=torch.long, device=self._device),
+            zeros(bs, transitions, 6), torch.full((bs,), -1, dtype=torch.long, device=self._device),
+            zeros(bs), zeros(bs), zeros(bs, dtype=torch.bool),
+            torch.full((bs,), -1, dtype=torch.long, device=self._device), zeros(bs, 6), zeros(1), zeros(1),
+        )
+        self._stream_windows[key] = window
+        return window
+
+    def stage_stream_window(
+        self, lease: SlotLease, reservations: Sequence[StreamReservation], computes: Sequence[Sequence[bool]],
+    ) -> None:
+        """Before launch, freeze ordinary policy and prepared-tail decisions.
+
+        ``computes`` comes from ordinary preparation for each transition; neither
+        the policy nor the captured selector infers it from an empty chunk.
+        This stages a whole fixed-membership bank on the execution stream.
+        """
+        window = self._stream_windows[lease.bucket, lease.buffer_slot]
+        if len(reservations) != len(computes) or len(reservations) > lease.bucket.bs:
+            raise ValueError("stream-policy snapshots do not fit the captured rows")
+        decisions, chunks, limits = [], [], []
+        for reservation, flags in zip(reservations, computes, strict=True):
+            if (len(flags) != len(reservation.transitions) or any(type(flag) is not bool for flag in flags)
+                    or len(reservation.parents) != len(reservation.transitions)
+                    or len(reservation.decisions) > window.decisions.shape[1]
+                    or len(reservation.transitions) > window.chunks.shape[1]
+                    or reservation.bound < 1):
+                raise ValueError("stream-policy snapshot exceeds its captured bank or lacks prepared transitions")
+            decisions.extend([*reservation.decisions, *[(-1, -1, -1, -1)]
+                              * (window.decisions.shape[1] - len(reservation.decisions))])
+            chunks.extend([*(
+                (t.chunk.start_offset, t.chunk.context_items, t.chunk.num_items,
+                 int(t.chunk.is_final), t.chunk.tail_offset, int(compute))
+                for t, compute in zip(reservation.transitions, flags, strict=True)
+            ), *[(0,) * 6] * (window.chunks.shape[1] - len(reservation.transitions))])
+            limits.append(reservation.bound)
+        padding = lease.bucket.bs - len(reservations)
+        decisions.extend([(-1, -1, -1, -1)] * (padding * window.decisions.shape[1]))
+        chunks.extend([(0,) * 6] * (padding * window.chunks.shape[1]))
+        limits.extend([0] * padding)
+        # All snapshots have been checked before changing any capture binding.
+        self._stager.copy_(window.decisions.view(-1), [v for row in decisions for v in row])
+        self._stager.copy_(window.chunks.view(-1), [v for row in chunks for v in row])
+        self._stager.copy_(window.limits, limits)
+        window.history.fill_(-1)
+        window.counts.zero_()
+        window.terminal.zero_()
+        window.selected.fill_(-1)
+        window.metadata.zero_()
+        window.ready.zero_()
+        window.compute_ready.zero_()
 
     def stage_window(
         self, lease: SlotLease, slots: Sequence[int], snapshot: IterationWindow,

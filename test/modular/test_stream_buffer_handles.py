@@ -709,6 +709,9 @@ class _HistoryChunkPolicy(FixedChunkPolicy):
                                       _HistoryChunkPolicy])
 @pytest.mark.parametrize("stop,withheld", [(None, False), (1, True), (3, False), (5, True)])
 def test_future_stream_decisions_equal_ordinary_interleaving_and_preserve_later_arrivals(factory, stop, withheld):
+    from mstar.engine.resources.iteration_tables import IterationTables
+    from mstar.engine.resources.step import BucketKey, SlotLease
+
     source = StreamBuffer(RID, EDGE, "LLM", factory())
     oracle = StreamBuffer(RID, EDGE, "LLM", factory())
     source.put_positions([0, 1, 2])
@@ -720,18 +723,30 @@ def test_future_stream_decisions_equal_ordinary_interleaving_and_preserve_later_
     assert source.policy.items_consumed == 0 and source._buffer == [0, 1, 2]
     assert source.reserve_window(1) is None
     choices = {(parent, end, done): selected for parent, end, done, selected in reservation.decisions}
+    owner = IterationTables(torch.device("cpu"))
+    lease = SlotLease(0, BucketKey("consume", 2, 2))
+    window = owner.prepare_stream_window(lease, len(reservation.decisions), max(1, len(reservation.transitions)))
+    owner.stage_stream_window(lease, [reservation], [[True] * len(reservation.transitions)])
     parent, count, produced, done = -1, 0, [], False
     chunks, released = [], []
 
     def pop():
         nonlocal parent, count
         selected = choices[parent, 3 + len(produced), done]
+        window.select(torch.tensor([3 + len(produced), -1]), torch.tensor([done, False]),
+                      torch.tensor([True, False]))
+        assert window.selected.tolist() == [selected, -1]
+        assert bool(window.ready.item()) == (selected >= 0)
         if not oracle.has_chunk_ready():
             assert selected == -1
             return False
         chunk = oracle.pop_chunk()
         assert selected >= 0 and reservation.transitions[selected].chunk == chunk.info
         parent, count = selected, count + 1
+        assert window.metadata[0, :5].tolist() == [chunk.start_offset, chunk.context_items, chunk.num_items,
+                                                 int(chunk.is_final), chunk.tail_offset]
+        window.advance()
+        assert window.history.tolist() == [parent, -1] and window.counts.tolist() == [count, 0]
         chunks.append(chunk.info)
         released.extend(chunk.released)
         return not chunk.is_final
@@ -772,23 +787,66 @@ def test_future_stream_decisions_equal_ordinary_interleaving_and_preserve_later_
 
 @pytest.mark.parametrize("continues", [False, True])
 def test_future_stream_empty_final_and_continuing_tail_use_distinct_semantic_receipts(continues):
+    from mstar.engine.resources.iteration_tables import IterationTables
+    from mstar.engine.resources.step import BucketKey, SlotLease
+
     source = StreamBuffer(RID, EDGE, "LLM", FixedChunkPolicy(1, continue_after_done=continues))
     source.signal_done(0)
     reservation = source.reserve_future_window([], 3).reservation
     choices = {(parent, end, done): selected for parent, end, done, selected in reservation.decisions}
+    owner = IterationTables(torch.device("cpu"))
+    lease = SlotLease(0, BucketKey("consume", 1, 1))
+    window = owner.prepare_stream_window(lease, len(reservation.decisions), len(reservation.transitions))
+    # These are ordinary preparation outcomes: final flush has no forward;
+    # a continuing empty tail does compute. Both have zero input items.
+    owner.stage_stream_window(lease, [reservation], [[continues] * len(reservation.transitions)])
     parent, count = -1, 0
     while count < 3:
         parent = choices[parent, 0, True]
+        window.select(torch.tensor([0]), torch.tensor([True]), torch.tensor([True]))
+        assert window.selected.item() == parent and window.ready.item() == 1
+        assert bool(window.compute_ready.item()) == continues
         assert parent >= 0
         chunk = reservation.transitions[parent].chunk
         assert chunk.num_items == 0 and chunk.is_final is not continues
         count += 1
+        window.advance()
+        assert window.counts.item() == count and window.history.item() == parent
         if chunk.is_final:
             break
+    window.select(torch.tensor([0]), torch.tensor([True]), torch.tensor([True]))
+    assert window.selected.item() == -1 and window.ready.item() == window.compute_ready.item() == 0
     result = source.settle_window(reservation, count, final_transition=parent)
     assert result.released == [] and result.is_final is not continues
     assert source._executed_chunks == (3 if continues else 1)
     assert source._tail_consumed == (3 if continues else 0)
+
+
+def test_future_policy_capture_bank_reuse_clears_history_and_checks_before_staging():
+    from mstar.engine.resources.iteration_tables import IterationTables
+    from mstar.engine.resources.step import BucketKey, SlotLease
+
+    source = StreamBuffer(RID, EDGE, "LLM", FixedChunkPolicy(1))
+    reservation = source.reserve_future_window([0, 1], 2).reservation
+    owner = IterationTables(torch.device("cpu"))
+    lease = SlotLease(0, BucketKey("consume", 2, 2))
+    window = owner.prepare_stream_window(lease, len(reservation.decisions), len(reservation.transitions))
+    flags = [True] * len(reservation.transitions)
+    owner.stage_stream_window(lease, [reservation], [flags])
+    window.select(torch.tensor([1, 0]), torch.tensor([False, False]), torch.tensor([True, False]))
+    window.advance()
+    before = window.decisions.clone(), window.history.clone(), window.counts.clone()
+    with pytest.raises(ValueError, match="prepared transitions"):
+        owner.stage_stream_window(lease, [reservation], [flags[:-1]])
+    after = window.decisions, window.history, window.counts
+    assert all(torch.equal(a, b) for a, b in zip(before, after, strict=True))
+    assert owner.prepare_stream_window(lease, len(reservation.decisions), len(reservation.transitions)) is window
+    owner.stage_stream_window(lease, [], [])
+    window.select(torch.tensor([1, 0]), torch.tensor([False, False]), torch.tensor([True, True]))
+    assert window.selected.tolist() == window.history.tolist() == [-1, -1]
+    assert window.counts.tolist() == [0, 0] and window.ready.item() == 0
+    owner.discard_window(lease)
+    assert owner.prepare_stream_window(lease, len(reservation.decisions), len(reservation.transitions)) is not window
 
 
 def test_future_stream_settlement_requires_actual_publication_and_preserves_zero_work_retry():
