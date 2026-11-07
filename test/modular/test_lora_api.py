@@ -49,6 +49,7 @@ from mstar.engine.resources.lora.store import check_adapter_file, check_adapters
 from mstar.engine.resources.spec import apply_yaml_overrides  # noqa: E402
 from mstar.engine.resources.step import AdmitRuntimeError  # noqa: E402
 from mstar.model.base import KVLabel, PrefixKeys  # noqa: E402
+from mstar.testing_utils.model import make_model
 from mstar.utils.ipc_format import InputSignals, WorkerMessage, WorkerMessageType  # noqa: E402
 
 BASE = "qwen3_5_0.8b"
@@ -73,7 +74,7 @@ def paths(tmp_path):
 class _StubAPI:
     def __init__(self, config):
         self.model_name = BASE
-        self.model = SimpleNamespace(get_output_sample_rate=lambda modality="audio": 24000)
+        self.model = make_model(get_output_sample_rate=lambda modality="audio": 24000)
         self.served_models = ServedModels.of(BASE, config)
         self.upload_dir = Path(tempfile.mkdtemp())
         self.last_submit = None
@@ -183,9 +184,8 @@ def test_a_deployment_without_lora_leaves_its_resources_block_to_the_conductor(r
     served = ServedModels.of(BASE, config)
     assert not served.lora and served.adapters == ()
     assert lora_specs(object(), config) == []
-    keyed = SimpleNamespace(
+    keyed = make_model(
         kv_labels=lambda: {"kv": {"main": KVLabel(keys=PrefixKeys("ids", ("prefill",)))}},
-        get_node_resources=list,
     )
     assert adapter_prefix_roots(keyed, config) is None
 
@@ -257,10 +257,7 @@ def test_startup_refuses_every_bad_configured_adapter(tmp_path):
     LoraAdapterPool(make_spec({"good": good, "wide": wide}, cpu_capacity=1), "cpu")
     # the conductor runs the check when the API server did not
     conductor = object.__new__(Conductor)
-    conductor.model = SimpleNamespace(
-        declare_state=list, kernel_settings=dict,
-        get_node_resources=lambda: [], get_lora_specs=lambda: [make_spec({})],
-    )
+    conductor.model = make_model(get_lora_specs=lambda: [make_spec({})])
     conductor.model_config = {"resources": {"lora": {"adapters": {"good": good, "wide": wide}}}}
     with pytest.raises(ValueError, match="'wide'"):
         conductor._settle_lora_adapters(None)

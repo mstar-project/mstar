@@ -12,9 +12,11 @@ import numpy as np
 import pytest
 import torch
 
+from mstar.model.multimodal import vision_encoder
+from mstar.model.muse.submodules import LLMSubmodule as GlimmerLLMSubmodule
 from mstar.model.orpheus.submodules import OrpheusLLMSubmodule
 from mstar.model.orpheus.submodules import token_stop as orpheus_token_stop
-from mstar.model.qwen3_5.submodules import LLMSubmodule, token_stop
+from mstar.model.qwen3_5.submodules import LLMSubmodule
 
 LOOP = "decode_loop"
 EOS = (7, 9)
@@ -22,14 +24,21 @@ EOS = (7, 9)
 MODELS = {
     # (submodule, its config, its walks, its TokenStop if it declares one)
     "qwen3_5": (LLMSubmodule, SimpleNamespace(stop_token_ids=frozenset(EOS)),
-                ("decode", "prefill_text", "prefill_vision"), token_stop(EOS)),
+                ("decode", "prefill_text", "prefill_vision"),
+                LLMSubmodule(None, SimpleNamespace(stop_token_ids=frozenset(EOS)),
+                             encoders=(vision_encoder((5,)),)).token_stop),
     "orpheus": (OrpheusLLMSubmodule, SimpleNamespace(stop_token_id=EOS[0]), ("prefill", "decode"),
                 orpheus_token_stop(EOS[0])),
+    # the shared VLM decoder's stop, as Muse Glimmer serves it
+    "muse_glimmer": (GlimmerLLMSubmodule, SimpleNamespace(stop_token_ids=frozenset(EOS)),
+                     ("decode", "prefill_text", "prefill_vision"),
+                     GlimmerLLMSubmodule(None, SimpleNamespace(stop_token_ids=frozenset(EOS)),
+                                         (vision_encoder((5,)),)).token_stop),
 }
 
 
 def _sampler_key(cls):
-    return __import__(cls.__module__, fromlist=["SAMPLER"]).SAMPLER
+    return getattr(cls, "SAMPLER", None) or __import__(cls.__module__, fromlist=["SAMPLER"]).SAMPLER
 
 
 def _info(rng, walk, sampler):

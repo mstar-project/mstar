@@ -134,6 +134,9 @@ class StepContext:
     # reserve them now (``ChunkingPolicy.reserve_whole_prefill``). Check it
     # before reserving by ``chunk_tokens_after``.
     reserve_whole_prefill: PerReqSetting = ALL_SET
+    # rows that recompute KV their request already had: the step throws their
+    # samples away, and they change no per-request state but the KV
+    rebuild_rids: frozenset[int] = frozenset()
 
     @property
     def replays(self) -> bool:
@@ -341,6 +344,8 @@ class FullAdmitOutcome(NamedTuple):
     failed_resource: str | None = None
     # waits for capacity on its node, until `StepRunner.admit_waiting` admits it
     queued: bool = False
+    # dropped on its node: not ready until a rebuild from its token ids lands
+    rebuild: bool = False
 
     @property
     def ok(self) -> bool:
@@ -359,3 +364,4 @@ FULL_ADMIT_OK = FullAdmitOutcome(ADMIT_OK)
 # admitted, but something it needs has not landed yet: retry, don't fail
 FULL_ADMIT_NOT_READY = FullAdmitOutcome(AdmitOutcome(ok=True, ready=False))
 FULL_ADMIT_QUEUED = FullAdmitOutcome(AdmitOutcome(ok=True, ready=False), queued=True)
+FULL_ADMIT_REBUILD = FullAdmitOutcome(AdmitOutcome(ok=True, ready=False), rebuild=True)

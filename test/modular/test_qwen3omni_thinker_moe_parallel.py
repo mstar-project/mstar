@@ -29,6 +29,7 @@ from mstar.model.components import (
 from mstar.model.qwen3_omni.components.thinker import Qwen3OmniThinkerLayer, Qwen3OmniThinkerModel
 from mstar.model.qwen3_omni.config import Qwen3OmniModelConfig
 from mstar.model.submodule_base import ModelInputsFromEngine
+from mstar.testing_utils.model import make_model
 
 NUM_EXPERTS = 8
 _LOGGER = "mstar.model.components.moe_parallel"
@@ -189,7 +190,7 @@ def test_node_configs_reject_per_walk_disagreement():
 def _sharding_config(tmp_path, node_groups):
     path = tmp_path / "config.yaml"
     path.write_text(yaml.safe_dump({"node_groups": node_groups}))
-    model = SimpleNamespace(get_default_sharding_config=lambda: ShardingConfig(
+    model = make_model(get_default_sharding_config=lambda: ShardingConfig(
         groups=[], tp_enabled_nodes={"Thinker", "Talker"}, shard_dim={},
         ep_enabled_nodes={"Thinker"},
     ))
