@@ -110,7 +110,9 @@ class W4A16Format(LinearFormat):
                  layout: str = "compressed-tensors", zero_offset: int = 0):
         self.group, self.symmetric, self.scale_dtype = group, symmetric, scale_dtype
         self.layout, self.zero_offset = layout, zero_offset
-        self.buffers = ("weight_packed", "weight_scale") + (() if symmetric else ("weight_zero_point",))
+        # tinygemm_*: torch's int4 GEMM's copy of the weight (1-2 tokens, CUDA), built at load; empty elsewhere
+        self.buffers = (("weight_packed", "weight_scale") + (() if symmetric else ("weight_zero_point",))
+                        + ("tinygemm_weight", "tinygemm_scale_zero"))
 
     def __repr__(self) -> str:
         return (f"w4a16(g{self.group}, {'sym' if self.symmetric else 'asym'}, {self.scale_dtype}, "
@@ -202,18 +204,52 @@ class W4A16Format(LinearFormat):
         q = torch.round(groups / scale.float()[..., None]).clamp(-8, 7) + 8
         out = {"weight_packed": pack_int4(q.view(n, k).to(_U8)), "weight_scale": scale}
         if not self.symmetric:
-            out["weight_zero_point"] = pack_int4(torch.full((n, k // self.group), 8, dtype=_U8), dim=0)
-        return out
+            out["weight_zero_point"] = pack_int4(torch.full((n, k // self.group), 8, dtype=_U8,
+                                                            device=weight.device), dim=0)
+        return {**out, **self._tinygemm(out)}
+
+    def after_load(self, tensors):
+        return {**tensors, **self._tinygemm(tensors)}
+
+    def _tinygemm(self, tensors) -> dict[str, torch.Tensor]:
+        """torch's int4 GEMM's copy of the weight (``aten._convert_weight_to_int4pack``: uint8 ``[N, K/2]`` with the
+        even column in the high nibble; scales and zeros ``[K/g, N, 2]`` bf16 for ``(q - 8) * scale + zero``, so a
+        zero point z is ``(8 - z) * scale``), on CUDA for groups of 32-256; empty placeholders elsewhere. It doubles
+        the layer's 4-bit bytes for tinygemm's 1.6-1.9x over bf16 at 1-2 tokens on an H200 (job 1479), where the
+        Triton GEMV reached ~1x."""
+        packed = tensors["weight_packed"]
+        n, k = packed.shape[0], packed.shape[1] * 8
+        usable = (packed.is_cuda and self.group in (32, 64, 128, 256) and k % 128 == 0 and n % 8 == 0
+                  and hasattr(torch.ops.aten, "_convert_weight_to_int4pack"))
+        if not usable:
+            return {"tinygemm_weight": torch.empty(0, dtype=_I32, device=packed.device),
+                    "tinygemm_scale_zero": torch.empty(0, dtype=torch.bfloat16, device=packed.device)}
+        codes = unpack_int4(packed.view(_I32))
+        u8 = ((codes[:, 0::2] << 4) | codes[:, 1::2]).contiguous()
+        scale = tensors["weight_scale"]
+        scale = (scale.view(self.scale_dtype) if scale.dtype == _I16 else scale).float()
+        if self.symmetric:
+            zero = torch.zeros_like(scale)
+        else:
+            z = unpack_int4(tensors["weight_zero_point"].view(_I32), dim=0)[:n].float()
+            zero = (8.0 - z) * scale
+        scale_zero = torch.stack([scale.t(), zero.t()], dim=-1).to(torch.bfloat16).contiguous()
+        return {"tinygemm_weight": torch.ops.aten._convert_weight_to_int4pack(u8, 8),
+                "tinygemm_scale_zero": scale_zero}
 
     # -- the GEMM ------------------------------------------------------------------------------------------
     def prepare_device(self, device):
         if device.type == "cuda":
             from mstar.utils import w4a16  # noqa: F401  (registers the CUDA kernel before any compile)
 
-    def linear(self, x, weight_packed, weight_scale, weight_zero_point=None):
+    def linear(self, x, weight_packed, weight_scale, *rest):
+        zero_point, tg_weight, tg_scale_zero = (None, *rest) if self.symmetric else rest
         scale = weight_scale.view(self.scale_dtype) if weight_scale.dtype == _I16 else weight_scale
-        kind = KIND_INT4_SYM if weight_zero_point is None else KIND_INT4_ZP
-        return torch.ops.mstar.w4a16_linear(x, weight_packed.view(_U8), scale, weight_zero_point, self.group, kind)
+        if tg_scale_zero.dtype == _I16:
+            tg_scale_zero = tg_scale_zero.view(torch.bfloat16)
+        kind = KIND_INT4_SYM if zero_point is None else KIND_INT4_ZP
+        return torch.ops.mstar.w4a16_linear(x, weight_packed.view(_U8), scale, zero_point, self.group, kind,
+                                            tg_weight, tg_scale_zero)
 
 
 @lru_cache(maxsize=None)
@@ -268,7 +304,7 @@ class Mxfp4Format(LinearFormat):
 
     def linear(self, x, weight_packed, weight_scale):
         return torch.ops.mstar.w4a16_linear(x, weight_packed.view(_U8), weight_scale.view(_U8), None, 32,
-                                            KIND_E2M1)
+                                            KIND_E2M1, None, None)
 
 
 def _triton_reason(device: torch.device, name: str) -> str | None:
@@ -304,16 +340,17 @@ def dequantize_kind(packed_u8: torch.Tensor, scale: torch.Tensor, zero_point: to
 @torch.library.custom_op("mstar::w4a16_linear", mutates_args=())
 def w4a16_linear(
     x: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor, zero_point: torch.Tensor | None, group: int,
-    kind: int,
+    kind: int, tinygemm_weight: torch.Tensor | None = None, tinygemm_scale_zero: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """``x [M, K]`` times a 4-bit weight (uint8 ``[N, K/2]``, its group scales, zero points for ``KIND_INT4_ZP``)
-    dequantized to ``x``'s dtype: ``[M, N]``. Off CUDA, the reference."""
+    """``x [M, K]`` times a 4-bit weight (uint8 ``[N, K/2]``, its group scales, zero points for ``KIND_INT4_ZP``;
+    optionally tinygemm's copy of it, for 1-2 tokens) dequantized to ``x``'s dtype: ``[M, N]``. Off CUDA, the
+    reference."""
     w = dequantize_kind(weight, scale, zero_point, group, kind).to(x.dtype)
     return F.linear(x, w)
 
 
 @w4a16_linear.register_fake
-def _(x, weight, scale, zero_point, group, kind):
+def _(x, weight, scale, zero_point, group, kind, tinygemm_weight=None, tinygemm_scale_zero=None):
     return x.new_empty((x.shape[0], weight.shape[0]))
 
 

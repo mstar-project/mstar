@@ -22,7 +22,7 @@ import triton.language as tl
 from mstar.model.components.int4_formats import KIND_E2M1, KIND_INT4_SYM, KIND_INT4_ZP  # noqa: F401
 from mstar.utils.fused_moe.align import moe_align_block_size
 from mstar.utils.fused_moe.kernels import _grid_rows, act_and_mul_triton, get_default_config, moe_sum_reduce_triton
-from mstar.utils.w4a16 import _codes, _group_params, _values
+from mstar.utils.w4a16 import _codes, _group_scale, _group_zero, _values
 
 
 @triton.jit
@@ -73,10 +73,12 @@ def fused_moe_w4a16_kernel(
             live_k = k < K
             words = tl.load(w_rows + (k // 8 + tl.arange(0, SB // 8))[None, :], mask=live_n[:, None] & live_k,
                             other=0)
-            scale, z = _group_params(s_base, z_base, n, live_n & live_k, k // GROUP, stride_sn, stride_zn, KIND)
+            scale = _group_scale(s_base, n, live_n & live_k, k // GROUP, stride_sn, KIND)
             if KIND == 1:
-                z = z[:, None]
-            v = _values(_codes(words, BLOCK_SIZE_N, SB), z, KIND)
+                zf = _group_zero(z_base, n, live_n & live_k, k // GROUP, stride_zn)
+                v = _values(_codes(words, BLOCK_SIZE_N, SB), zf[:, None], KIND)
+            else:
+                v = _values(_codes(words, BLOCK_SIZE_N, SB), 8388616.0, KIND)
             a = tl.load(a_rows + (k + sub)[None, :], mask=token_mask[:, None] & live_k, other=0.0)
             acc += tl.dot(v.to(compute_type), tl.trans(a)) * scale[:, None]
 

@@ -22,10 +22,12 @@ import torch.nn.functional as F
 
 from benchmark.quantization.bench_linears import SHAPES, _time
 
-GEMV = [{"BN": bn, "BK": bk, "num_warps": w} for bn, bk, w in
-        ((16, 256, 4), (32, 256, 4), (32, 128, 4), (64, 128, 4), (32, 512, 4), (64, 256, 8))]
+GEMV = [{"BN": bn, "BW": bw, "num_warps": w} for bn, bw, w in
+        ((32, 64, 4), (16, 128, 4), (32, 128, 8), (64, 32, 4), (64, 64, 8), (16, 64, 4), (32, 32, 4), (128, 16, 4))]
 DOT = [{"BN": bn, "BK": bk, "STAGES": st, "num_warps": w} for bn, bk, st, w in
-       ((64, 128, 3, 4), (128, 128, 3, 8), (64, 64, 4, 4), (128, 64, 3, 4), (32, 128, 3, 4), (64, 256, 2, 4))]
+       ((64, 128, 3, 4), (128, 128, 3, 8), (64, 64, 4, 4), (32, 128, 3, 4), (64, 256, 2, 4), (128, 64, 4, 8))]
+DOT8 = [{"BN": bn, "BW": bw, "STAGES": st, "num_warps": w} for bn, bw, st, w in
+        ((64, 16, 3, 4), (64, 32, 3, 4), (128, 16, 3, 8), (128, 32, 3, 8), (64, 64, 2, 4))]
 
 
 def _weights(kind: str, n: int, k: int, device):
@@ -99,22 +101,24 @@ def main() -> None:
                     cands += [("gemv", ("gemv", {**c, "SPLIT_K": 0})) for c in GEMV]
                 if m <= 1024:
                     cands += [("dot", ("dot", {**c, "SPLIT_K": 0})) for c in DOT]
+                    cands += [("dot8", ("dot8", {**c, "SPLIT_K": 0})) for c in DOT8]
                 cands.append(("dequant", ("dequant", {})))
                 timed = []
                 for name, (path, cfg) in cands:
                     cfg = dict(cfg)
                     try:
                         if path != "dequant":
-                            bk = w4a16._block_k(group, k, cfg["BK"])
-                            cfg["BK"] = bk
-                            if path == "dot":
-                                cfg.setdefault("TB", 16 if m <= 16 else 32 if m <= 32 else 64 if m <= 64 else 128)
+                            bk = w4a16._block_k(group, k, cfg["BK"]) if "BK" in cfg else 8 * cfg["BW"]
+                            if "BK" in cfg:
+                                cfg["BK"] = bk
+                            if path in ("dot", "dot8"):
+                                cfg.setdefault("TB", w4a16._tb(m))
                                 ctas = -(-n // cfg["BN"]) * -(-m // cfg["TB"])
                                 waves = 2
                             else:
                                 ctas, waves = -(-n // cfg["BN"]), 4
                             if not cfg.get("SPLIT_K"):
-                                cfg["SPLIT_K"] = w4a16._split(ctas, k // bk, sms, waves)
+                                cfg["SPLIT_K"] = w4a16._split(ctas, -(-k // bk), sms, waves)
                         w4a16.CONFIG_OVERRIDE = lambda *a, p=path, c=cfg: (p, c)
                         run = lambda: w4a16.gemm(x, packed, scale, zp, group, code)  # noqa: E731,B023
                         out = run()

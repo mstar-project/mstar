@@ -896,7 +896,8 @@ class QuantExperts(Fp8Experts):
         for proj in ("gate_up_proj", "down_proj"):
             weight = getattr(self.experts, proj).data
             parts = [fmt_.quantize_weight(weight[i], None) for i in range(weight.shape[0])]
-            for key in parts[0]:
+            # the storage a checkpoint would fill (not a linear kernel's extra copies, e.g. tinygemm's)
+            for key in (st.name for st in fmt_.storage(*weight.shape[1:])):
                 data[proj + _EXPERT_SUFFIX[key]] = torch.stack([as_container(p[key]) for p in parts])
         self._packed_storage(fmt_, data)
 

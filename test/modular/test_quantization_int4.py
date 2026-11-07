@@ -425,7 +425,8 @@ def test_quantized_at_load_equals_the_same_weights_stored(tmp_path, fmt, tp):
         if base == "lm_head" or base.endswith("moe.gate"):
             tensors[name] = w
             continue
-        tensors.update({f"{base}.{s}": t for s, t in fmt_.quantize_weight(w, None).items()})
+        stored = {st.name for st in fmt_.storage(*w.shape)}
+        tensors.update({f"{base}.{s}": t for s, t in fmt_.quantize_weight(w, None).items() if s in stored})
     save_file(tensors, str(stored_dir / "model.safetensors"))
     method = {"w4a16": QUANT_CONFIG["ct"], "mxfp4": QUANT_CONFIG["mxfp4"]}[fmt]
     (stored_dir / "config.json").write_text(json.dumps({"quantization_config": method}))
@@ -500,6 +501,58 @@ def test_an_int4_scale_that_never_arrives_is_refused(stored):
             scope.finish(root)
 
 
+# ---------------------------------------------------------------- the kernels compile for Hopper (no GPU needed)
+def _compile_cases():
+    from mstar.utils import w4a16
+    from mstar.utils.fused_moe import w4a16 as moe
+
+    ptrs = {"x_ptr": "*bf16", "w_ptr": "*i32", "s_ptr": "*bf16", "z_ptr": "*i32", "out_ptr": "*bf16"}
+    dims = {name: "i32" for name in ("M", "N", "K", "stride_xm", "stride_wn", "stride_sn", "stride_zn", "stride_os",
+                                       "stride_om")}
+    dense = {**ptrs, **dims}
+    yield "dot", w4a16._w4_dot_kernel, dense, dict(GROUP=128, BN=64, TB=16, BK=128, SB=128, SPLIT_K=1, STAGES=2)
+    yield "dot8", w4a16._w4_dot8_kernel, dense, dict(GROUP=32, BN=64, TB=16, BW=16, SPLIT_K=2, STAGES=2)
+    yield "gemv", w4a16._w4_gemv_kernel, dense, dict(GROUP=128, BN=32, BW=64, SPLIT_K=1, MB=1)
+    yield "dequant", w4a16._w4_dequant_kernel, {
+        "w_ptr": "*i32", "s_ptr": "*bf16", "z_ptr": "*i32", "out_ptr": "*bf16",
+        **{name: "i32" for name in ("N", "K", "stride_wn", "stride_sn", "stride_zn", "stride_on")}}, dict(
+        GROUP=32, BN=32, BK=128, NG=4, GS=32)
+    yield "experts", moe.fused_moe_w4a16_kernel, {
+        "a_ptr": "*bf16", "b_ptr": "*i32", "s_ptr": "*bf16", "z_ptr": "*i32", "c_ptr": "*bf16",
+        "topk_weights_ptr": "*fp32", "sorted_token_ids_ptr": "*i32", "expert_ids_ptr": "*i32",
+        "num_tokens_post_padded_ptr": "*i32",
+        **{name: "i32" for name in ("N", "K", "EM", "num_valid_tokens", "stride_am", "stride_be", "stride_bn",
+                                    "stride_se", "stride_sn", "stride_ze", "stride_zn", "stride_cm")}}, dict(
+        BLOCK_SIZE_M=16, BLOCK_SIZE_N=64, BLOCK_SIZE_K=128, SB=128, GROUP_SIZE_M=1, MUL_ROUTED_WEIGHT=True, top_k=1,
+        compute_type=None, GROUP=128, STAGES=2)
+
+
+@pytest.mark.parametrize("kind", [I.KIND_INT4_SYM, I.KIND_INT4_ZP, I.KIND_E2M1])
+@pytest.mark.parametrize("case", ["dot", "dot8", "gemv", "dequant", "experts"])
+def test_every_kernel_compiles_for_hopper(case, kind):
+    """Triton's compiler, not its CPU interpreter, type-checks a kernel: a helper returning a tensor zero point in
+    one constexpr branch and a scalar in another compiled for no GPU (job 1479's CompilationError) while the
+    interpreter, plain Python, ran it. This compiles every kernel for every weight kind for sm_90, on any host."""
+    triton = pytest.importorskip("triton")
+    import triton.language as tl
+    from triton.backends.compiler import GPUTarget
+    from triton.compiler import ASTSource
+
+    name, fn, signature, constexprs = next(c for c in _compile_cases() if c[0] == case)
+    constexprs = {**constexprs, "KIND": kind}
+    if "compute_type" in constexprs:
+        constexprs["compute_type"] = tl.bfloat16
+    src = ASTSource(fn=fn, signature={**signature, **{c: "constexpr" for c in constexprs}}, constexprs=constexprs)
+    try:
+        triton.compile(src, target=GPUTarget("cuda", 90, 32))
+    except triton.CompilationError:
+        raise
+    except Exception as e:  # noqa: BLE001  (a host without the CUDA backend's tools: the frontend still ran)
+        if "CompilationError" in type(e).__name__:
+            raise
+        pytest.skip(f"no CUDA backend toolchain here: {type(e).__name__}: {e}"[:200])
+
+
 # ---------------------------------------------------------------- CUDA: the kernels against the reference
 def _kernel_case(kind, n, k, group, device):
     w = torch.randn(n, k) * 0.05
@@ -543,10 +596,12 @@ def test_cuda_dequant_gemm_matches_the_reference(kind, group, m):
 @cuda
 @pytest.mark.parametrize("kind, group", [(I.KIND_INT4_SYM, 128), (I.KIND_INT4_ZP, 32), (I.KIND_E2M1, 32)])
 @pytest.mark.parametrize("path, m, cfg", [
-    ("gemv", 1, {"BN": 32, "BK": 256, "SPLIT_K": 1, "num_warps": 4}),
-    ("gemv", 4, {"BN": 64, "BK": 128, "SPLIT_K": 3, "num_warps": 4}),
+    ("gemv", 1, {"BN": 32, "BW": 64, "SPLIT_K": 1, "num_warps": 4}),
+    ("gemv", 4, {"BN": 64, "BW": 16, "SPLIT_K": 3, "num_warps": 4}),
     ("dot", 5, {"BN": 64, "TB": 16, "BK": 128, "SPLIT_K": 2, "STAGES": 3, "num_warps": 4}),
     ("dot", 200, {"BN": 128, "TB": 128, "BK": 64, "SPLIT_K": 1, "STAGES": 2, "num_warps": 8}),
+    ("dot8", 9, {"BN": 64, "TB": 16, "BW": 16, "SPLIT_K": 2, "STAGES": 2, "num_warps": 4}),
+    ("dot8", 40, {"BN": 64, "TB": 64, "BW": 32, "SPLIT_K": 1, "STAGES": 3, "num_warps": 4}),
 ])
 def test_cuda_every_path_and_split_matches_the_reference(kind, group, path, m, cfg, monkeypatch):
     """Each path at a tile the built-in rule may not pick (the benchmark sweeps them)."""
@@ -561,6 +616,28 @@ def test_cuda_every_path_and_split_matches_the_reference(kind, group, path, m, c
     x = torch.randn(m, k, device=dev, dtype=torch.bfloat16)
     got = w4a16.gemm(x, packed, scale, zp, group, kind)
     ref = F.linear(x.float(), ref_w.to(dev).to(torch.bfloat16).float())
+    assert ((got.float() - ref).norm() / ref.norm()).item() < 5e-3
+
+
+@cuda
+@pytest.mark.parametrize("symmetric, group", [(True, 128), (False, 128), (True, 32)])
+@pytest.mark.parametrize("m", [1, 2, 3])
+def test_cuda_tinygemm_copy_matches_the_reference(symmetric, group, m):
+    """The format's tinygemm copy (built at load on CUDA) runs 1-2 tokens; its bf16 scales and zeros round within a
+    GEMM's tolerance of the reference; 3 tokens take the Triton GEMV."""
+    torch.manual_seed(8)
+    dev = torch.device("cuda")
+    n, k = 1024, 2048
+    fmt = I.W4A16Format(group=group, symmetric=symmetric, scale_dtype=torch.float16)
+    buffers = fmt.quantize_weight((torch.randn(n, k, device=dev) * 0.05).to(torch.bfloat16), None)
+    if not symmetric:
+        buffers["weight_zero_point"] = I.pack_int4(torch.randint(2, 14, (n, k // group), device=dev), dim=0)
+        buffers.update(fmt._tinygemm(buffers))
+    assert buffers["tinygemm_weight"].numel() > 0
+    ref_w = fmt.dequantize(buffers).to(torch.bfloat16)
+    x = torch.randn(m, k, device=dev, dtype=torch.bfloat16)
+    got = fmt.linear(x, *(buffers[b] for b in fmt.buffers))
+    ref = F.linear(x.float(), ref_w.float())
     assert ((got.float() - ref).norm() / ref.norm()).item() < 5e-3
 
 
