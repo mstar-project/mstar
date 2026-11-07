@@ -689,10 +689,13 @@ class StepRunner:
         ctx = step.ctx
         rows = set(ctx.request_ids)
         if (not rows or len(rows) != len(ctx.request_ids) or any(rid < 0 for rid in rows)
-                or ctx.resident is None or ctx.is_preplan or ctx.unit_id is not None
+                or ctx.resident is None or ctx.is_preplan
                 or ctx.capture or ctx.plan_results or ctx.counted or ctx.run_counts is not None):
             raise ValueError("joining rows need a fresh resident accounting context")
         ctx.check_tp_repeats()
+        if ctx.unit_id is not None and (type(ctx.unit_id) is not int or ctx.unit_id < 0
+                                        or type(ctx.unit_member) is not int or ctx.unit_member < 0):
+            raise ValueError("joining unit needs its checked claim and member identity")
         ctx.resident.validate_rows(step, ctx)
         if self._staged is not None:
             held = set(self._staged[1])

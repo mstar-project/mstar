@@ -877,7 +877,7 @@ def test_ready_row_is_owned_by_the_graph_before_live_publication(admitted):
     worker = Worker.__new__(Worker)
     owned, holds, ready = set(), set(), {2, 3}
     worker._is_tearing_down = lambda rid: False
-    worker.request_state = object()
+    worker.request_state = SimpleNamespace(get_partition_for_node=lambda node: "p")
     worker._build_executing_batch = lambda scheduled: late
     worker._set_in_flight_flag = lambda scheduled, value: owned.update(scheduled.request_to_worker_graph)
     worker._hold_rows = lambda lane, rids: (holds.clear(), holds.update(rids))

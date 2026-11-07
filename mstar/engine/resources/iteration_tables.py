@@ -413,7 +413,10 @@ class IterationTables(Resource):
         Only explicitly retained owner slots change. In particular late staging
         never clears a physical view that an executing graph may still read.
         """
-        window = self._stream_windows[lease.bucket, lease.buffer_slot].bank
+        captured = self._stream_windows.get((lease.bucket, lease.buffer_slot))
+        if captured is None:
+            raise ValueError("stream-policy publication needs an existing captured owner bank")
+        window = captured.bank
         if (len(reservations) != len(computes) or len(slots) != len(reservations)
                 or len(slots) > lease.bucket.bs or len(set(slots)) != len(slots)
                 or any(type(slot) is not int or not 0 < slot < len(window.counts) for slot in slots)):

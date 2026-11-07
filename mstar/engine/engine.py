@@ -3062,6 +3062,86 @@ class Engine:
                 ))
             yield prepared
 
+    def _certify_group_values(self, part: PreparedMember, values, group, guard, *, streamed, back_keys):
+        """Resolve ordinary preprocessing into checked capture/owner destinations.
+
+        This records copy descriptions only; late admission uses the same
+        certification while staging its private owners instead of these views.
+        """
+        batch, mgmt, lease, _, _, incoming, _, _ = part
+        rows = tuple(batch.request_ids)
+        runner = mgmt.accelerator_graph_runner
+        slot = runner.slot_for(lease)
+        bindings = guard.bindings
+        stream_target, boundary_fields = None, []
+        row_inputs = {name: signal for signal, name in slot.row_heads.items()}
+
+        def destinations(name, copies, mgmt=mgmt, slot=slot, batch=batch, row_inputs=row_inputs):
+            signal = row_inputs.get(name)
+            if signal is None:
+                return copies
+            try:
+                return mgmt.loopback_rows.input_copies(
+                    signal, batch.step_context.padded_request_ids, slot.static_inputs[name], copies,
+                )
+            except ValueError as error:
+                guard.refuse(str(error))
+
+        carries = mgmt.submodule.repeat_carry(batch.graph_walk, {signal for _, signal in incoming})
+        expected = {}
+        for maker, signal in incoming:
+            expected.setdefault(carries[signal].input, []).extend(
+                (maker, batch.node_name, signal, rid) for rid in rows
+            )
+        copies, real = [], {}
+        for name, value in values.items():
+            if guard.contains(value):
+                if name not in expected or not isinstance(value, torch.Tensor):
+                    guard.refuse(f"future values escaped into preprocess field {name}")
+                target = slot.static_inputs.get(name)
+                if not isinstance(target, torch.Tensor) or name not in slot.static_input_keys:
+                    guard.refuse(f"no captured destination for {name}")
+                dim = runner._static_buffer_seq_dims.get((slot.config_idx, name), 0)
+                if value.ndim != target.ndim or value.shape[dim] > target.shape[dim]:
+                    guard.refuse(f"future field {name} exceeds its captured destination")
+                target = target.narrow(dim, 0, value.shape[dim])
+                keys = tuple(expected.pop(name))
+                static_copies = guard.copies(value, target, keys, set(keys) - back_keys)
+                # Certification still checks row bounds/strides even
+                # when capture keeps static rather than owner views.
+                routed = destinations(name, static_copies)
+                if streamed and incoming:
+                    if stream_target is not None or len(routed) != len(rows):
+                        guard.refuse("each streamed row needs one contiguous owner destination")
+                    stream_target = (name, row_inputs.get(name), static_copies)
+                else:
+                    copies.extend(routed)
+                group.initial_copies.extend(destinations(
+                    name, guard.copies(value, target, keys, bindings.keys() - set(keys)),
+                ))
+                if back_keys.intersection(keys):
+                    group.initial_copies.extend(destinations(
+                        name, guard.copies(value, target, keys, back_keys),
+                    ))
+                    boundary_fields.append((value, target, keys, name, destinations))
+            else:
+                real[name] = value
+                if name in row_inputs and isinstance(value, torch.Tensor):
+                    kept = batch.kept_rows
+                    target = slot.static_inputs[name]
+                    routed = [(value[i], target[i]) for i in range(len(rows))
+                              if kept is None or not kept[i]]
+                    group.initial_copies.extend(destinations(name, routed))
+        if expected:
+            guard.refuse("preprocess discarded a future input")
+        iteration = (batch.iteration_columns.columns if isinstance(batch.iteration_columns, IterationWindow)
+                     else batch.iteration_columns or {})
+        if iteration.keys() & {pair.input for pair in carries.values()}:
+            guard.refuse("an iteration column overwrites a connected input")
+        if iteration.keys() & row_inputs.keys():
+            guard.refuse("an iteration column needs its captured row owner's destination")
+        return real, copies, stream_target, boundary_fields
+
     def exec_group(self, group: ExecutionGroup) -> list[BatchedModelOutput] | None:
         """Prepare all ordinary members, then submit their captures together.
 
@@ -3161,72 +3241,15 @@ class Engine:
                     guard.require_real(batch.step_context.plan_results, "resource plans")
                     runner = mgmt.accelerator_graph_runner
                     slot = runner.slot_for(lease)
-                    row_inputs = {name: signal for signal, name in slot.row_heads.items()}
-
-                    def destinations(name, copies, mgmt=mgmt, slot=slot, batch=batch, row_inputs=row_inputs):
-                        signal = row_inputs.get(name)
-                        if signal is None:
-                            return copies
-                        try:
-                            return mgmt.loopback_rows.input_copies(
-                                signal, batch.step_context.padded_request_ids, slot.static_inputs[name], copies,
-                            )
-                        except ValueError as error:
-                            guard.refuse(str(error))
-
-                    carries = mgmt.submodule.repeat_carry(batch.graph_walk, {signal for _, signal in incoming})
-                    expected = {}
-                    for maker, signal in incoming:
-                        expected.setdefault(carries[signal].input, []).extend(
-                            (maker, batch.node_name, signal, rid) for rid in rows
-                        )
-                    copies, real = [], {}
-                    for name, value in values.items():
-                        if guard.contains(value):
-                            if name not in expected or not isinstance(value, torch.Tensor):
-                                guard.refuse(f"future values escaped into preprocess field {name}")
-                            target = slot.static_inputs.get(name)
-                            if not isinstance(target, torch.Tensor) or name not in slot.static_input_keys:
-                                guard.refuse(f"no captured destination for {name}")
-                            dim = runner._static_buffer_seq_dims.get((slot.config_idx, name), 0)
-                            if value.ndim != target.ndim or value.shape[dim] > target.shape[dim]:
-                                guard.refuse(f"future field {name} exceeds its captured destination")
-                            target = target.narrow(dim, 0, value.shape[dim])
-                            keys = tuple(expected.pop(name))
-                            static_copies = guard.copies(value, target, keys, set(keys) - back_keys)
-                            # Certification still checks row bounds/strides even
-                            # when capture keeps static rather than owner views.
-                            routed = destinations(name, static_copies)
-                            if streamed and incoming:
-                                if stream_target is not None or len(routed) != len(rows):
-                                    guard.refuse("each streamed row needs one contiguous owner destination")
-                                stream_target = (name, row_inputs.get(name), static_copies)
-                            else:
-                                copies.extend(routed)
-                            group.initial_copies.extend(destinations(
-                                name, guard.copies(value, target, keys, bindings.keys() - set(keys)),
-                            ))
-                            if back_keys.intersection(keys):
-                                group.initial_copies.extend(destinations(
-                                    name, guard.copies(value, target, keys, back_keys),
-                                ))
-                                boundary_fields.append((value, target, keys, name, destinations))
-                        else:
-                            real[name] = value
-                            if name in row_inputs and isinstance(value, torch.Tensor):
-                                kept = batch.kept_rows
-                                target = slot.static_inputs[name]
-                                routed = [(value[i], target[i]) for i in range(len(rows))
-                                          if kept is None or not kept[i]]
-                                group.initial_copies.extend(destinations(name, routed))
-                    if expected:
-                        guard.refuse("preprocess discarded a future input")
-                    iteration = (batch.iteration_columns.columns if isinstance(batch.iteration_columns, IterationWindow)
-                                 else batch.iteration_columns or {})
-                    if iteration.keys() & {pair.input for pair in carries.values()}:
-                        guard.refuse("an iteration column overwrites a connected input")
-                    if iteration.keys() & row_inputs.keys():
-                        guard.refuse("an iteration column needs its captured row owner's destination")
+                    real, copies, target, fields = self._certify_group_values(
+                        PreparedMember(batch, mgmt, lease, inputs, info, incoming, None, None), values,
+                        group, guard, streamed=streamed, back_keys=back_keys,
+                    )
+                    if target is not None:
+                        if stream_target is not None:
+                            guard.refuse("a streamed unit has more than one payload destination")
+                        stream_target = target
+                    boundary_fields.extend(fields)
                     runner._stage(lease, real)
                     if streamed:
                         staged, immune = self._stage_capture(
@@ -3234,6 +3257,8 @@ class Engine:
                         )
                         if staged.run.state.membership is not None:
                             publications.append((batch, staged, immune))
+                    iteration = (batch.iteration_columns.columns if isinstance(batch.iteration_columns, IterationWindow)
+                                 else batch.iteration_columns or {})
                     columns = [] if streamed else [
                         *((column, slot.static_inputs[name]) for name, column in iteration.items()),
                         *self._runner.replay_columns(batch.step, repeats),
@@ -3669,6 +3694,149 @@ class Engine:
             for planner, held in reversed(pins):
                 planner.unpin(held)
             raise
+
+    def admit_group_rows(self, group: ExecutionGroup, active: ExecutionGroup, row: int) -> RunRow | None:
+        """Admit one existing unit claim into an already captured parent.
+
+        Preparation owns only fresh resource rows. The worker owns the graph
+        claim and attaches this receipt before calling; it publishes the returned
+        descriptor only after all commits. Borrowed capture leases never release
+        here, including a refusal or an exception inside a resource commit.
+        """
+        if group.submitted or group.unit != active.unit or not active.submitted:
+            raise ValueError("joining needs a fresh claim of the retained unit")
+        retained = {batch.node_name: batch for _, batch in active.members if batch.step_context.slot_lease is not None}
+        membership = next((self.run_membership(batch) for batch in retained.values() if batch.run_rows), None)
+        if membership is None or not 0 <= row < membership.rows:
+            raise ValueError("joining unit has no retained publication row")
+        membership._check_publication_stream()
+        rids = {rid for _, batch in group.members for rid in batch.request_ids}
+        if len(rids) != 1:
+            raise ValueError("one unit publication needs exactly one logical request")
+        rid, = rids
+        guard = ConnectedInputs({})
+        admitted, plans = [], []
+        descriptor = None
+        try:
+            for member, (_, batch) in enumerate(group.members):
+                if not batch.request_ids or (batch.node_name == group.unit.streaming_edges[0][0]
+                                             and batch.ring_width == 0):
+                    continue
+                old = retained.get(batch.node_name)
+                if old is None:
+                    guard.refuse("a late claim needs a member body absent from its retained parent")
+                mgmt, ctx = self._submodules[batch.node_name], batch.step_context
+                lease = old.step_context.slot_lease
+                slot = mgmt.accelerator_graph_runner.slot_for(lease)
+                if (ctx.slot_lease is not None or batch.run_rows or batch.committed is not None
+                        or slot.run is None or slot.run.state.membership is not membership
+                        or row >= lease.bucket.bs or not 1 <= ctx.repeats <= slot.run.limit
+                        or mgmt.resident is None):
+                    guard.refuse("late member does not fit its retained capture and owners")
+                ctx.slot, ctx.slot_lease, ctx.resident = lease.slot, lease, mgmt.resident
+                ctx.unit_id, ctx.unit_member = group.claim, member
+            with self._prepare_group_inputs(group, guard) as prepared:
+                if not any(part.choices is not None for part in prepared):
+                    guard.refuse("a joining unit needs its retained ordinary stream policy")
+                for part in prepared:
+                    batch, mgmt, lease, inputs, infos, _, preview, _ = part
+                    ctx = batch.step_context
+                    # Real request declarations reserve no captured dummy state.
+                    step = batch.step = self._declare_step(
+                        batch, batch.request_ids, batch.inputs, mgmt.submodule, ctx, batch.step,
+                    )
+                    if (step is None or step.cg_key_info != node_capture_key(lease.bucket.cg_key_info)
+                            or (preview is not None and preview.cg_key_info != step.cg_key_info)):
+                        guard.refuse("late declaration changes its captured specialization")
+                    step.set_ctx(ctx)
+                    guard.require_real(step.steps, "resource declarations")
+                    outcome = self._runner.admit_rows(step)
+                    if not outcome.ok:
+                        guard.refuse("a joining member refused its full horizon")
+                    admitted.append(step)
+                    if not outcome.ready:
+                        guard.refuse("a joining member needs ordinary admission recovery")
+                    plan = ctx.resident.prepare_rows(step, ctx)
+                    plans.append((batch, plan))
+                    ctx.resident_plan = plan
+                    with autocast_scope(self._autocast_dtype_for(batch.node_name), device_type=self._device.type,
+                                        node_name=batch.node_name):
+                        engine_inputs, values = self._preprocess_step(
+                            batch, mgmt, batch.request_ids, inputs, infos, ctx, lease, step,
+                        )
+                    real, _, _, _ = self._certify_group_values(
+                        part, values, group, guard, streamed=True, back_keys=set(),
+                    )
+                    slot = mgmt.accelerator_graph_runner.slot_for(lease)
+                    for name, captured in slot.static_inputs.items():
+                        if not isinstance(captured, torch.Tensor) and real.get(name) != captured:
+                            guard.refuse("late preprocessing changes a captured non-tensor specialization")
+                    self._write_routed_rows(batch, mgmt, slot, engine_inputs, real, stager=membership.stager)
+                    if slot.run.window is not None:
+                        if not isinstance(batch.iteration_columns, IterationWindow):
+                            guard.refuse("late iteration inputs have no prepared owner window")
+                        mgmt.submodule.iteration_tables.stage_window(
+                            lease, plan.slots.tolist(), batch.iteration_columns, stager=membership.stager,
+                        )
+                    if slot.run.prepared is not None:
+                        slot.run.prepared.stage(plan.slots.tolist(), real)
+                    ctx.resident.flush(plan, stager=membership.stager)
+            # No fallible metadata scope survives the first irreversible commit.
+            maker, consumer, signal = group.unit.streaming_edges[0]
+            source = next(batch for _, batch in group.members if batch.node_name == maker)
+            target = next(part for part in prepared if part.batch.node_name == consumer)
+            batch, mgmt, lease = target.batch, target.mgmt, target.lease
+            reservation, = [edge.chunk.reservation for edge in batch.stream_windows[rid] if edge.name == signal]
+            mgmt.submodule.iteration_tables.stage_stream_window(
+                lease, batch.step_context.resident_plan.slots.tolist(), [reservation],
+                [[choice is not None for choice in target.choices[rid]]],
+                source_rows=self._submodules[maker].loopback_rows.retained_rows([rid]),
+                producer_limits=[source.ring_width if rid in source.ring_bases.get(signal, {}) else 0],
+                stager=membership.stager,
+            )
+            bindings = [0] * membership.binding_width
+            for part in prepared:
+                batch, mgmt, ctx = part.batch, part.mgmt, part.batch.step_context
+                policy = mgmt.device_stops[batch.graph_walk]
+                immune = policy is not None and policy.limits(batch.per_request_info_wrapped[rid]).ignore_eos
+                for i, value in enumerate(self._row_binding(
+                    batch.node_name, int(ctx.resident_plan.slots[0]), immune, ctx.repeats,
+                )):
+                    bindings[i] += value
+            descriptor = membership.reserve_row(rid, self._runner.request_generation(rid), row, bindings)
+            if descriptor is None:
+                guard.refuse("the retained parent has no descriptor credit")
+            for part in prepared:
+                part.batch.run_rows[rid] = descriptor
+                part.batch.run_started = retained[part.batch.node_name].run_started
+            group.submitted = True
+            for part in prepared:
+                batch, ctx = part.batch, part.batch.step_context
+                self._runner.commit(batch.step, track_rows=True)
+                batch.committed = batch.step
+                ctx.resident.advance(ctx.resident_plan)
+                batch.commit_done.set()
+            return descriptor
+        except ValueError:
+            if group.submitted or guard.reason is None:
+                raise
+            group.refusal = guard.reason
+            return None
+        finally:
+            if not group.submitted:
+                if membership.publication_stream is not None:
+                    membership.publication_stream.synchronize()
+                if descriptor is not None:
+                    membership.cancel(descriptor)
+                    membership.release(descriptor)
+                for batch, plan in reversed(plans):
+                    batch.step_context.resident.release(rid)
+                    batch.step_context.resident.unpin(tuple(plan.slots.tolist()))
+                    batch.step_context.resident_plan = None
+                for step in reversed(admitted):
+                    self._runner.rollback_admit(step)
+                for _, batch in group.members:
+                    batch.step_context.slot_lease = None  # borrowed; never release the parent
 
     def admit_run_row(self, batch: ExecutingBatch, active: ExecutingBatch, row: int) -> RunRow | None:
         """Prepare one ordinary logical step beside an active capture.

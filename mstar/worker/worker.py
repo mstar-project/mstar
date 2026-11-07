@@ -5519,9 +5519,12 @@ class Worker(RepeatingSteps):
                     self.worker_id, stale.node_name,
                 )
             if stale.group is not None:
-                self._settle_group_claim(stale.group)
-                self.engine_manager.get_engine(stale.node_name).release_group(stale.group)
-                stale.group.parts.clear()
+                if stale.node_batch.run_rows:
+                    self._discard_live_group(stale)
+                else:
+                    self._settle_group_claim(stale.group)
+                    self.engine_manager.get_engine(stale.node_name).release_group(stale.group)
+                    stale.group.parts.clear()
         if batch is not None:
             failed_rids.update(batch.request_to_worker_graph)
             self._clear_in_flight_flag(batch)

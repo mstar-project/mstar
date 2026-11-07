@@ -647,14 +647,59 @@ class RepeatingSteps:
                 else:
                     engine.release_group(active.group)
                     active.group.parts.clear()
-                for descriptor in descriptors.values():
-                    if not membership.release(descriptor):
-                        raise ValueError("a closed run still has a live descriptor reader")
-                for batch, rows in claims:
-                    for descriptor in rows.values():
-                        engine.release_run_row(batch, descriptor)
-                    batch.run_rows.clear()
+                self._release_run_readers(engine, membership, claims)
             gpu_executor.submit(release).result()
+
+    @staticmethod
+    def _release_run_readers(engine, membership, claims) -> None:
+        descriptors = {row.handle: row for _, rows in claims for row in rows.values()}
+        for descriptor in descriptors.values():
+            if not membership.release(descriptor):
+                raise ValueError("a closed run still has a live descriptor reader")
+        for batch, rows in claims:
+            for descriptor in rows.values():
+                engine.release_run_row(batch, descriptor)
+            batch.run_rows.clear()
+
+    def _discard_live_group(self, active: PendingBatch) -> None:
+        """Fence a failed physical parent, then release all claimed readers.
+
+        A resource commit can fail partway through its resource list. Every
+        touched request follows ordinary failure/teardown; no blanket rewind
+        or admission rollback pretends those commits were atomic.
+        """
+        engine = self.engine_manager.get_engine(active.node_name)
+        membership = engine.run_membership(active.node_batch)
+        claims = []
+        for receipt in (active, *active.joined):
+            if receipt.future is not None:
+                try:
+                    receipt.future.result()
+                except Exception:
+                    pass  # the caller reports the original request failure
+            if receipt.group is not None:
+                self._settle_group_claim(receipt.group)
+                members = [batch for _, batch in receipt.group.members]
+            else:
+                members = [receipt.node_batch]
+            claims.extend((batch, dict(batch.run_rows)) for batch in members if batch.run_rows)
+        stream = membership.publication_stream
+        with torch.cuda.stream(stream) if stream is not None else nullcontext():
+            for _, rows in claims:
+                for descriptor in rows.values():
+                    membership.cancel(descriptor)
+        for _, batch in active.group.members:
+            engine.yield_runs(batch.node_name)
+        if active.node_batch.completion_event is not None:
+            active.node_batch.completion_event.synchronize()
+        with torch.cuda.stream(stream) if stream is not None else nullcontext():
+            membership.drain()
+        if stream is not None:
+            stream.synchronize()
+        membership.acknowledge(membership.control.cpu().tolist())
+        engine.release_group(active.group)
+        active.group.parts.clear()
+        self._release_run_readers(engine, membership, claims)
 
     def _offer_run_row(self, active: PendingBatch, gpu_executor: ThreadPool) -> bool:
         """Take one ordinary ready step and publish it only after owner admission."""
@@ -670,14 +715,19 @@ class RepeatingSteps:
                     for rid, descriptor in batch.run_rows.items():
                         if self._is_tearing_down(rid):
                             membership.cancel(descriptor)
-        if active.group is not None:
-            return False  # late offers must admit a complete unit before publication
         available = membership.available_rows(lease.bucket.bs)
         if not available or active.node_batch.completion_event.query():
             return False
-        target = active.node_name, active.graph_walk
-        chain = self.scheduler.pick_chain_step(self.request_state, target, ())
-        if not chain.pick.taken:
+        targets = ((active.node_name, active.graph_walk),) if active.group is None else tuple(zip(
+            active.group.unit.nodes, active.group.unit.graph_walks, strict=True,
+        ))
+        chain = None
+        for target in targets:
+            candidate = self.scheduler.pick_chain_step(self.request_state, target, ())
+            if candidate.pick.taken:
+                chain = candidate
+                break
+        if chain is None:
             return False
         # The existing scheduler owns ordering, capture groups and backlog.
         # One logical receipt reserves one descriptor; unchosen rows stay there.
@@ -687,15 +737,29 @@ class RepeatingSteps:
         scheduled = self.scheduler.take_chain_step(self.request_state, chain._replace(pick=pick))
         if scheduled is None:
             return False
-        horizon = active.node_batch.step_context.repeats
         node_batch = self._build_executing_batch(scheduled)
-        if (scheduled.graph_walk != active.graph_walk or scheduled.request_walks or scheduled.chunk_ranges
-                or node_batch.step_context.repeats < horizon):
-            self._push_back_batch(scheduled)
-            return False
-        node_batch.step_context.repeats = scheduled.repeats = horizon
+        group = None
+        if active.group is not None:
+            group = self._claim_group(scheduled, node_batch)
+            if group is None:
+                self._push_back_batch(scheduled)
+                return False
+            scheduled, node_batch = group.members[group.trigger]
+        else:
+            horizon = active.node_batch.step_context.repeats
+            if (scheduled.graph_walk != active.graph_walk or scheduled.request_walks or scheduled.chunk_ranges
+                    or node_batch.step_context.repeats < horizon):
+                self._push_back_batch(scheduled)
+                return False
+            node_batch.step_context.repeats = scheduled.repeats = horizon
         self._set_in_flight_flag(scheduled, True)
-        receipt = replace(active, batch=scheduled, node_batch=node_batch, future=None, joined=[])
+        from mstar.worker.worker import PendingBatch
+
+        receipt = PendingBatch(
+            scheduled, node_batch, scheduled.node_name,
+            self.request_state.get_partition_for_node(scheduled.node_name), scheduled.graph_walk,
+            None, lane=active.lane, group=group,
+        )
         active.joined.append(receipt)
         held = {rid for part in (active, *active.joined) for rid in part.batch.request_to_worker_graph}
         self._hold_rows(active.lane, held)
@@ -703,14 +767,21 @@ class RepeatingSteps:
         def prepare():
             stream = membership.publication_stream
             with torch.cuda.stream(stream) if stream is not None else nullcontext():
-                node_batch.rows_only = self._all_on_device(
-                    engine, scheduled.node_name, scheduled.graph_walk, scheduled.output_signals,
-                )
-                engine.prepare_inputs(node_batch)
+                members = ([batch for _, batch in group.members] if group is not None else [node_batch])
+                for batch in members:
+                    batch.rows_only = self._all_on_device(
+                        engine, batch.node_name, batch.graph_walk,
+                        next(item.output_signals for item, member in group.members if member is batch)
+                        if group is not None else scheduled.output_signals,
+                    )
                 try:
-                    descriptor = engine.admit_run_row(node_batch, active.node_batch, available[0])
+                    if group is None:
+                        engine.prepare_inputs(node_batch)
+                        descriptor = engine.admit_run_row(node_batch, active.node_batch, available[0])
+                    else:
+                        descriptor = engine.admit_group_rows(group, active.group, available[0])
                 except ValueError:
-                    if node_batch.committed is not None:
+                    if node_batch.committed is not None or (group is not None and group.submitted):
                         raise
                     descriptor = None  # this request needs an ordinary step
                 if stream is not None:
@@ -719,10 +790,16 @@ class RepeatingSteps:
                 return descriptor
 
         receipt.future = gpu_executor.submit(prepare)
-        descriptor = receipt.future.result()
+        try:
+            descriptor = receipt.future.result()
+        finally:
+            if group is not None:
+                self._settle_group_claim(group)
         if descriptor is None:
             active.joined.remove(receipt)
-            self._return_unexecuted(receipt, BatchedModelOutput())
+            if group is not None:
+                self._restore_group_stream(group)
+            self._return_unexecuted(replace(receipt, group=None), BatchedModelOutput())
             self._hold_rows(active.lane, held - set(scheduled.request_to_worker_graph))
             return False
         # Graph in-flight state, request holds and the committed H-step are all

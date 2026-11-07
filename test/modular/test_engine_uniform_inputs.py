@@ -1913,6 +1913,251 @@ def test_streamed_row_budgets_preserve_later_chunks_and_staggered_readiness(devi
         assert ring.ring_read("x", 2, list(range(bases[2], bases[2] + 4))).eq(-777).all()
 
 
+@pytest.mark.parametrize("failure", [None, "consumer", "metadata", "capacity", "missing_body", "admit", "commit"])
+def test_late_unit_admission_stages_private_owners_before_one_complete_publication(failure, monkeypatch):
+    from dataclasses import replace
+
+    from mstar.engine.device_run import DeviceRun, RunState
+    from mstar.engine.engine import RunLayout
+    from mstar.engine.resources.iteration_tables import IterationTables
+    from mstar.engine.resources.loopback_rows import LoopbackRows
+    from mstar.engine.resources.resident import ResidentPlanner
+    from mstar.engine.resources.run_rows import RunRows, RunRowsSnapshot
+    from mstar.engine.resources.runner import StepRunner
+    from mstar.engine.resources.step import ADMIT_OK, AdmitFailedReason, AdmitOutcome, ResourceStep, SubmoduleStep
+    from mstar.model.submodule_base import NodeInputs, StopKind, StopPolicy
+    from mstar.streaming.chunk_policy import FixedChunkPolicy
+    from mstar.streaming.stream_buffer import StreamBuffer
+    from mstar.worker.stream_buffers import StreamBufferManager
+    from mstar.worker.worker import Worker
+
+    eng, group, events = _connected_engine()
+    group.unit = replace(group.unit, streaming_edges=group.unit.edges)
+    eng._run_layouts = dict.fromkeys(("a", "b"), RunLayout(("a", "b"), 4))
+    membership = RunRows(torch.device("cpu"), 3, 12, 6)
+    resources, retained, captures = {}, [], []
+    for member, (scheduled, batch) in enumerate(group.members):
+        name, mgmt = batch.node_name, eng._submodules[batch.node_name]
+        runner = mgmt.accelerator_graph_runner
+        bucket = next(iter(runner._buckets))
+        lease = SlotLease(0, bucket, name)
+        slot = runner.slot_for(lease)
+        runner._buckets[bucket].config.single_request_inputs = NodeInputs(
+            tensor_inputs={"x": torch.ones(1, 2 if name == "a" else 4)},
+        )
+        rows = mgmt.loopback_rows = LoopbackRows(torch.device("cpu"), capacity=2)
+        for rid in (1, 2):
+            rows.add(rid)
+        rows.write("seed" if name == "a" else "x", [1, 2], torch.full((2, 1, 2 if name == "a" else 4), -777.))
+        slot.static_inputs["x"] = torch.full((3, 2 if name == "a" else 4), -991.)
+        slot.row_heads = {"seed" if name == "a" else "x": "x"}
+        mgmt.joint_comm_group = SimpleNamespace(world_size=1)
+        mgmt.resources = {"membership": membership, name: rows}
+        resources.update(mgmt.resources)
+        planner = mgmt.resident = ResidentPlanner(name, {"prefill": {}}, mgmt.resources, torch.device("cpu"), 3)
+        planner._streams[bucket] = {}
+        mgmt.submodule.declare_step = lambda name=name, **kw: SubmoduleStep(steps={name: ResourceStep()})
+        mgmt.device_stops["prefill"] = StopPolicy(StopKind.EOS, "token", frozenset({99}))
+        state = RunState(3, "token", {99}, torch.device("cpu"),
+                         dropping=SimpleNamespace(rows=torch.ones(3, dtype=torch.long),
+                                                  slots=torch.ones(3, dtype=torch.long)),
+                         membership=RunRowsSnapshot(membership, 3), member=member, width=4,
+                         independent_rows=True)
+        slot.run = DeviceRun(state, {}, lambda: None, 4)
+        old = replace(batch, step_context=replace(batch.step_context, request_ids=[1], slot_lease=lease,
+                                                  resident=planner, repeats=4 if name == "a" else 1))
+        old.step = SubmoduleStep(segments=[], steps={})
+        old.step.set_ctx(old.step_context)
+        old.step_context.resident_plan = planner.prepare_rows(old.step, old.step_context)
+        planner.flush(old.step_context.resident_plan)
+        retained.append((replace(scheduled, request_to_worker_graph={1: 1}), old))
+        batch.request_ids = [2]
+        batch.per_request_info = {2: batch.per_request_info[2]}
+        batch.per_request_info_wrapped = {2: batch.per_request_info_wrapped[2]}
+        batch.step_context.repeats = scheduled.repeats = 4 if name == "a" else 1
+        scheduled.request_to_worker_graph = {2: 1}
+        if name == "a":
+            mgmt.rings = {"x": {"prefill"}}
+            rows.ask_ring("x", 8)
+            rows.ring_table("x", torch.zeros(1, 2))
+        else:
+            ordinary = mgmt.submodule.prepare_inputs
+            def prepare(ordinary=ordinary, **kwargs):
+                value = ordinary(**kwargs)
+                value.tensor_inputs["x"] = value.tensor_inputs["x"].reshape(1, -1)
+                return value
+            mgmt.submodule.prepare_inputs = prepare
+            mgmt.submodule.iteration_tables = IterationTables(torch.device("cpu"))
+        captures.extend((slot.static_inputs["x"], state.dropping.rows, state.dropping.slots,
+                         rows.indices(bucket, lease.buffer_slot)))
+    eng._runner = StepRunner(resources)
+    eng._runner.ingest_request(2)
+    active = replace(group, claim=11, members=tuple(retained), submitted=True)
+    descriptor = membership.reserve_row(1, 1, 0, (1, 0, 4, 1, 0, 1))
+    membership.publish_row(descriptor)
+    for _, batch in active.members:
+        batch.run_rows = {1: descriptor}
+    if failure == "missing_body":
+        active.members[0][1].step_context.slot_lease = None
+    engine_reserve = eng.reserve_replay_slot
+    eng.reserve_replay_slot = lambda batch, **kw: batch.step_context.slot_lease or engine_reserve(batch, **kw)
+    source = StreamBuffer(2, "x", "a", FixedChunkPolicy(2))
+    worker = Worker.__new__(Worker)
+    worker.engine_manager = SimpleNamespace(get_engine=lambda name: eng)
+    worker.streams = StreamBufferManager(SimpleNamespace(
+        per_request_info={2: SimpleNamespace(stream_buffers={"x": source})},
+    ), None, [])
+    worker.streams.consumer_node = {"x": "b"}
+    worker.streams.rings = {"x": eng._submodules["a"].loopback_rows}
+    if failure == "consumer":
+        group.members[0][1].request_ids = []
+        rows = eng._submodules["a"].loopback_rows
+        rows.ring_reserve("x", [2], 2)
+        rows.ring_write("x", [2], torch.ones(1, 2, 2), [0])
+        source.put_positions([0, 1])
+    assert worker._reserve_group_stream(group)
+    target = group.members[1][1]
+    reservation = target.stream_windows[2][0].chunk.reservation
+    lease = active.members[1][1].step_context.slot_lease
+    mgmt = eng._submodules["b"]
+    window = mgmt.submodule.iteration_tables.prepare_stream_window(
+        lease, 1 if failure == "capacity" else len(reservation.decisions),
+        1 if failure == "capacity" else len(reservation.transitions), len(reservation.positions),
+        rows=mgmt.accelerator_graph_runner.slot_for(lease).run.state.dropping.rows, slots=mgmt.resident.max_slots,
+    )
+    captures.extend((window.positions, window.counts, window.bank.decisions[1], window.bank.counts[1]))
+    before = [value.clone() for value in captures]
+    if failure == "metadata":
+        target.per_request_info[2].step_metadata = {"counter": 0}
+        ordinary = mgmt.submodule.preprocess
+        def preprocess(*args, **kwargs):
+            kwargs["engine_inputs"].per_request_info[2].step_metadata["counter"] += 1
+            return ordinary(*args, **kwargs)
+        mgmt.submodule.preprocess = preprocess
+    if failure == "admit":
+        admitted_resources = []
+        monkeypatch.setattr(resources["a"], "admit", lambda step, ctx: (admitted_resources.append("a"), ADMIT_OK)[1])
+        monkeypatch.setattr(resources["a"], "rollback_admit", lambda step, ctx: admitted_resources.remove("a"))
+        monkeypatch.setattr(resources["b"], "admit", lambda step, ctx: AdmitOutcome(
+            False, reason=AdmitFailedReason("second member unavailable"),
+        ))
+    if failure == "commit":
+        committed_resources = []
+        def fail_second(step, ctx):
+            committed_resources.append("b")
+            raise ValueError("second member commit failed after mutating its owner")
+        monkeypatch.setattr(resources["b"], "commit", fail_second)
+        monkeypatch.setattr(resources["a"], "commit", lambda step, ctx: committed_resources.append("a"))
+        monkeypatch.setattr(eng._runner, "rollback_admit", lambda *args: pytest.fail("committed owner rolled back"))
+    if failure in {"capacity", "commit"}:
+        with pytest.raises(ValueError, match="snapshot|commit"):
+            eng.admit_group_rows(group, active, 1)
+        offered = None
+    elif failure in {None, "consumer"}:
+        from concurrent.futures import ThreadPoolExecutor
+
+        from mstar.worker.batch_builder import StepPick
+        from mstar.worker.micro_scheduler import ChainPick
+        from mstar.worker.worker import PendingBatch
+
+        # The producer-triggered parent discovers a later consumer-ready pick
+        # through the existing scheduler and the real _claim_group path.
+        worker._restore_group_stream(group)
+        worker._step_repeats = None
+        worker.request_state = SimpleNamespace(get_partition_for_node=lambda node: f"partition:{node}")
+        worker._is_tearing_down = lambda rid: False
+        worker._set_in_flight_flag = lambda *args: None
+        worker._all_on_device = lambda *args: False
+        worker._count_turn = lambda receipt: None
+        worker._push_back_batch = lambda batch: pytest.fail("eligible unit returned before admission")
+        worker._return_unexecuted = lambda *args: pytest.fail("eligible unit refused")
+        holds, picks, claims = [], [], []
+        worker._hold_rows = lambda lane, rows: holds.append(set(rows))
+        def pick(state, key, excluded):
+            picks.append(key)
+            return ChainPick(key, StepPick([2] if key[0] == "b" else [], [], None, set(), False), [])
+        worker.scheduler = SimpleNamespace(
+            execution_units={(node, "prefill"): group.unit for node in ("a", "b")},
+            pick_chain_step=pick, take_chain_step=lambda state, chain: group.members[1][0],
+        )
+        pending_batches = {batch.node_name: batch for _, batch in group.members}
+        worker._build_executing_batch = lambda scheduled: pending_batches[scheduled.node_name]
+        for mgmt in eng._submodules.values():
+            mgmt.accelerator_graph_runner.launch_refusal = lambda walk: None
+        def claim(*args):
+            claims.append(args)
+            return 23, [SimpleNamespace(
+                wg_ids=SimpleNamespace(keys=[2], values=[1]),
+                input_edges=group.members[0][0].input_edges, output_signals=["x"],
+                finished_rids={2} if failure == "consumer" and node == "a" else set(),
+            ) for node in ("a", "b")]
+        worker._graph_runtime = SimpleNamespace(
+            claim_execution_unit=claim, submit_execution_unit=lambda claim: events.append(("submitted", claim)),
+            cancel_execution_unit=lambda claim: pytest.fail("eligible claim cancelled"),
+        )
+        active.members[0][1].completion_event = SimpleNamespace(query=lambda: False)
+        pending = PendingBatch(active.members[0][0], active.members[0][1], "a", "partition:a", "prefill", None,
+                               group=active)
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            assert worker._offer_run_row(pending, executor)
+        assert picks == [("a", "prefill"), ("b", "prefill")] and len(claims) == 1
+        receipt, = pending.joined
+        assert receipt.node_name == "b" and receipt.partition == "partition:b" and holds == [{1, 2}]
+        group = receipt.group
+        offered = group.members[1][1].run_rows[2]
+        assert ("submitted", 23) in events and int(membership.control[1]) >> 2 == offered.handle
+    else:
+        offered = eng.admit_group_rows(group, active, 1)
+    for value, old in zip(captures, before, strict=True):
+        torch.testing.assert_close(value, old)
+    assert "release:a" not in events and "release:b" not in events
+    if failure not in {None, "consumer", "commit"}:
+        assert offered is None and not group.submitted
+        assert all(not batch.run_rows and batch.committed is None for _, batch in group.members)
+        assert all(mgmt.resident._readers.sum() == 1 for mgmt in eng._submodules.values())
+        worker._restore_group_stream(group)
+        assert not source._reservations
+        if failure == "admit":
+            assert not admitted_resources
+        return
+    assert group.submitted, group.refusal
+    a, b = (batch for _, batch in group.members)
+    offered = b.run_rows[2]
+    assert offered.bindings == ((0, 0, 0, 2, 0, 1) if failure == "consumer" else (2, 0, 4, 2, 0, 1))
+    if failure == "consumer":
+        assert not a.run_rows and a.step is None
+    else:
+        assert a.run_rows[2] is offered and a.committed is a.step
+    assert group.submitted
+    if failure == "commit":
+        assert int(membership.control[1]) == 0, "partial commits cannot publish a descriptor"
+        assert b.committed is None
+    else:
+        assert b.committed is b.step
+    assert all(batch.step.ctx.unit_id == group.claim and batch.step.ctx.request_ids == [2]
+               for _, batch in group.members if batch.step is not None)
+    assert eng._submodules["a"].resident._readers.sum() == (1 if failure == "consumer" else 2)
+    assert eng._submodules["b"].resident._readers.sum() == 2
+    # The held logical receipt owns these pins even if the later commit failed.
+    # No rollback or physical-lease release may pretend that admission was atomic.
+    assert len(source._reservations) == 1
+    if failure == "commit":
+        from mstar.worker.worker import PendingBatch
+
+        assert committed_resources == ["a", "b"]
+        worker._settle_group_claim = lambda claim: events.append(("submitted", claim.claim))
+        eng.yield_runs = lambda node: events.append(("yield", node))
+        incumbent = PendingBatch(active.members[0][0], active.members[0][1], "a", "a", "prefill", None,
+                                 group=active)
+        incumbent.joined = [PendingBatch(group.members[0][0], a, "a", "a", "prefill", None, group=group)]
+        incumbent.node_batch.completion_event = SimpleNamespace(synchronize=lambda: events.append("fenced"))
+        worker._discard_live_group(incumbent)
+        assert membership.idle and all(not mgmt.resident._readers.any() for mgmt in eng._submodules.values())
+        assert events.index("fenced") < events.index("release:b")
+        assert not a.run_rows and not b.run_rows
+        assert committed_resources == ["a", "b"], "failure cleanup never fabricates a resource rewind"
+
+
 def test_stream_parent_replaces_one_complete_unit_while_its_sibling_runs(monkeypatch):
     """The production parent lowers one publication into both captured bodies.
 
