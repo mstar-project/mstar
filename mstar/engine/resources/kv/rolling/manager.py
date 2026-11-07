@@ -33,6 +33,11 @@ from mstar.engine.resources.step import (
     StepContext,
 )
 
+# Tokens a layer of the staging block a region moves through when the gap it
+# slides across is shorter (a rearrange after a small request ends). The
+# per-chunk shift moves by a whole chunk, so it copies in place.
+STAGE_TOKENS = 512
+
 
 class RollingRow(NamedTuple):
     rid: int
@@ -112,6 +117,10 @@ class RollingKVManager(Resource):
         row_bytes = c.head_dim * self._pool.element_size()
         word = next(t for t in (torch.int64, torch.int32, torch.int16, torch.uint8) if row_bytes % t.itemsize == 0)
         self._words = self._pool.view(word)
+        # Staging for a region that slides across a short gap (see ``_move_left``),
+        # reserved with the pool so a rearrange allocates nothing.
+        stage_shape = (c.num_layers, 2, min(STAGE_TOKENS, c.pool_tokens), c.num_heads, c.head_dim)
+        self._stage = torch.empty(stage_shape, dtype=dtype, device=self._device).view(word)
         # free gaps ``(start, length)``, by start, adjacent ones merged
         self._free: list[tuple[int, int]] = [(0, c.pool_tokens)]
         self._requests: dict[int, _Request] = {}
@@ -351,15 +360,25 @@ class RollingKVManager(Resource):
         """Move pool tokens ``[src, src + length)`` to ``dst < src`` in every layer.
         The ranges may overlap: copied left to right in blocks no longer than the
         distance moved, no block reads what an earlier one wrote, so no temporary
-        is needed (half the traffic of a clone). Each block is one strided copy
-        across all layers, keys and values."""
+        is needed (half the traffic of a clone). Across a gap under a quarter of
+        the staging block those copies are small enough to be launch-bound
+        (measured), so the move goes through the staging block instead, two
+        copies a block. Each copy is one strided copy across all layers, keys and
+        values."""
         gap = src - dst
         if length <= 0 or gap <= 0:
             return
-        pool = self._words
-        for i in range(0, length, gap):
-            n = min(gap, length - i)
-            pool[:, :, dst + i:dst + i + n] = pool[:, :, src + i:src + i + n]
+        pool, stage = self._words, self._stage
+        block = stage.shape[2]
+        if 4 * gap >= min(length, block):
+            for i in range(0, length, gap):
+                n = min(gap, length - i)
+                pool[:, :, dst + i:dst + i + n] = pool[:, :, src + i:src + i + n]
+            return
+        for i in range(0, length, block):
+            n = min(block, length - i)
+            stage[:, :, :n] = pool[:, :, src + i:src + i + n]
+            pool[:, :, dst + i:dst + i + n] = stage[:, :, :n]
 
     def commit(self, step: RollingKVStep, ctx: StepContext) -> None:
         if ctx.capture:
