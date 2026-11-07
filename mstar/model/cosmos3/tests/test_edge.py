@@ -574,17 +574,18 @@ def test_edge_reasoner_video_prompt() -> None:
     )
     out = processed.new_input_tensors
     ids = out["text_inputs"][0]
-    grid = out["vision_grid_thw"][0]
-    assert grid.shape == (1, 3) and int(grid[0, 0]) == 6
-    per_frame = int(grid[0, 1] * grid[0, 2]) // 4
+    # one layout run per frame, each with its (1, h, w) patch grid
+    layout = processed.metadata[MEDIA_LAYOUT]
+    assert len(layout["grid"]) == 6 and len({tuple(g) for g in layout["grid"]}) == 1
+    _, h, w = layout["grid"][0]
+    per_frame = h * w // 4
+    assert layout["tokens"] == [per_frame] * 6
     assert int((ids == r.video_token_id).sum()) == 6 * per_frame
     assert int((ids == r.vision_start_token_id).sum()) == 6
-    assert out["pixel_values"][0].shape[0] == int(grid[0].prod())
-    # one layout run per frame; the positions placed from it are the reference's
-    layout = processed.metadata[MEDIA_LAYOUT]
-    assert len(layout["offset"]) == 6 and all(n == per_frame for n in layout["tokens"])
+    assert out["pixel_values"][0].shape[0] == 6 * h * w
+    # the positions placed from the layout are the reference's
     pos, advance = layout_position_ids(0, layout, ids.numel(), r.vision.spatial_merge_size)
-    frame = MediaGrid(t=6, h=int(grid[0, 1]), w=int(grid[0, 2]))
+    frame = MediaGrid(t=6, h=h, w=w)
     ref, next_pos = mrope_position_ids(ids, r, [], [frame])
     assert torch.equal(pos, ref) and advance == next_pos
     starts = (ids == r.vision_start_token_id).nonzero().flatten().tolist()
@@ -599,8 +600,8 @@ def test_edge_reasoner_video_prompt() -> None:
         None, ["video", "text"], ["text"], tensors={"video_inputs": [video]},
         prompt_parts=[PromptPart("video", None, 0), PromptPart("text", "What happens?")],
         input_metadata={"video_inputs": [{"average_fps": 10.0}]}, video_num_frames=4,
-    ).new_input_tensors
-    assert int(out2["vision_grid_thw"][0][0, 0]) == 4
+    )
+    assert len(out2.metadata[MEDIA_LAYOUT]["grid"]) == 4
 
 
 @needs_edge

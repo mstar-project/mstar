@@ -78,6 +78,7 @@ from mstar.engine.resources import (
     SamplerSpec,
     SamplingReqConfig,
 )
+from mstar.engine.resources.attn.ragged.config import RaggedAttentionConfig, RaggedAttentionSpec
 from mstar.engine.resources.position.config import PositionConfig, PositionSpec
 from mstar.engine.windowing import WindowSchedule
 from mstar.graph.base import (
@@ -128,7 +129,7 @@ from mstar.model.cosmos3.submodules import (
     latent_frames,
     sound_frames,
 )
-from mstar.model.keys import ROPE
+from mstar.model.keys import ROPE, VISION_ATTN
 from mstar.model.media_limits import UndecodableMediaError, VideoBudget
 from mstar.model.multimodal import (
     MEDIA_LAYOUT,
@@ -353,6 +354,7 @@ class Cosmos3Model(Model):
             specs.append(PositionSpec(
                 resource_key=ROPE, nodes={REASONER_NODE}, config=PositionConfig(kv_cache=KV_CACHE),
             ))
+            specs.append(self._vision_attention_spec())
         if self.config.attention_backend == "dense_gen":
             specs.append(AttentionSpec(
                 resource_key=ATTN_GEN,
@@ -375,6 +377,26 @@ class Cosmos3Model(Model):
             return {KV_CACHE: {COND_LABEL: uncond, UNCOND_LABEL: uncond}}
         main = KVLabel(growth=((self.REASONER_DECODE_WALK, REASONER_DECODE_LOOP),))
         return {KV_CACHE: {COND_LABEL: main, UNCOND_LABEL: uncond}}
+
+    def _vision_attention_spec(self) -> RaggedAttentionSpec:
+        """The vision tower's attention, a segment per image or video frame."""
+        from mstar.model.cosmos3.submodules import Cosmos3VisionEncoderSubmodule
+
+        reasoner = self.config.reasoner
+        vision = reasoner.vision
+        # the smallest frame the processors make bounds a replay's segments
+        min_patches = min(
+            reasoner.image_processor.min_pixels, reasoner.video_processor.min_pixels,
+        ) // vision.patch_size ** 2
+        return RaggedAttentionSpec(
+            resource_key=VISION_ATTN, nodes={VISION_ENCODER_NODE},
+            config=RaggedAttentionConfig(
+                num_qo_heads=vision.num_attention_heads,
+                num_kv_heads=vision.num_attention_heads,
+                head_dim=vision.hidden_size // vision.num_attention_heads,
+                max_segments_per_step=Cosmos3VisionEncoderSubmodule.BLOCK_LOOP_PATCH_BUCKETS[-1] // max(min_patches, 1),
+            ),
+        )
 
     def get_combined_graph_walks(self) -> dict[str, dict[str, set[str]]]:
         # the reasoner's text prefill and decode rows share a step
@@ -798,7 +820,7 @@ class Cosmos3Model(Model):
         video pads alike."""
         reasoner = self.config.reasoner
         return (MediaEncoder(
-            "vision", VISION_ENCODER_NODE, ("pixel_values", "vision_grid_thw"), "vision_embeds",
+            "vision", VISION_ENCODER_NODE, ("pixel_values",), "vision_embeds",
             (reasoner.image_token_id, reasoner.video_token_id),
         ),)
 
@@ -1002,10 +1024,10 @@ class Cosmos3Model(Model):
         encoder pass.
 
         Returns ``text_inputs`` (the token ids) and, with attachments, the
-        packed ``pixel_values`` + ``vision_grid_thw`` the vision_encoder node
-        consumes; and the prompt's ``MEDIA_LAYOUT`` (each image's or video
-        frame's pad run and patch grid), from which the reasoner places its
-        mRoPE positions."""
+        packed ``pixel_values`` the vision_encoder node consumes; and the
+        prompt's ``MEDIA_LAYOUT`` (each image's or video frame's pad run and
+        patch grid), from which the vision encoder plans its frames and the
+        reasoner places its mRoPE positions."""
         from mstar.model.cosmos3.components.reasoner import (
             IMAGE,
             VIDEO,
@@ -1051,20 +1073,17 @@ class Cosmos3Model(Model):
             )
             patches.append(pv)
             video_grids.append(grid)
-        # Media patches are packed in prompt order (images, then videos, as
-        # the parts list them); the vision encoder returns tokens in that
-        # order and the placeholders are expanded in the same order.
+        # Media patches are packed in prompt order (images and videos as the
+        # parts list them), the order the placeholders are expanded in: the
+        # layout's runs, which the vision encoder plans its frames by, follow it.
         ordered_patches: list[torch.Tensor] = []
-        ordered_grids: list[tuple[int, int, int]] = []
         img_i = vid_i = 0
         for part in parts:
             if part.modality == IMAGE:
                 ordered_patches.append(patches[img_i])
-                ordered_grids.append(image_grids[img_i].thw)
                 img_i += 1
             elif part.modality == VIDEO:
                 ordered_patches.append(patches[len(image_grids) + vid_i])
-                ordered_grids.append(video_grids[vid_i].thw)
                 vid_i += 1
 
         text = render_chat(
@@ -1086,7 +1105,6 @@ class Cosmos3Model(Model):
         out: NameToTensorList = {"text_inputs": [ids]}
         if ordered_patches:
             out["pixel_values"] = [torch.cat(ordered_patches, dim=0)]
-            out["vision_grid_thw"] = [torch.tensor(ordered_grids, dtype=torch.long)]
         walk = self.REASONER_PREFILL_VISION_WALK if ordered_patches else self.REASONER_PREFILL_WALK
         main = LabelLayout(
             # media rows fill the expanded placeholders, so the span is rows, not ids

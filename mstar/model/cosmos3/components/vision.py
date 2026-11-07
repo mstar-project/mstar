@@ -14,9 +14,11 @@ Parameter names follow ``vision_encoder/model.safetensors`` with its leading
 checkpoint loads by name. Shapes and the packed patch order come from the
 Hugging Face ``Cosmos3EdgeVisionModel`` / ``Cosmos3EdgePatchMerger``.
 
-Frames of one video share a grid, and an image is a single frame, so the
-attention runs one batched SDPA per distinct frame size instead of a
-block-diagonal mask over the whole pack.
+Served, the attention runs on the node's ragged attention resource (one
+segment per frame) and the block loop replays as a captured region
+(``Cosmos3VisionEncoderSubmodule``): ``embed`` / ``encode`` / ``project``. The
+reference ``forward``, for the parity tests, runs one batched SDPA per
+distinct frame size instead of a block-diagonal mask over the whole pack.
 """
 
 from __future__ import annotations
@@ -26,6 +28,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from mstar.model.cosmos3.config import Cosmos3ReasonerConfig, Cosmos3VisionEncoderConfig
+from mstar.model.keys import VISION_ATTN
 
 
 def _activation(name: str):
@@ -126,14 +129,29 @@ class Cosmos3VisionAttention(nn.Module):
         self.k_proj = nn.Linear(dim, dim)
         self.v_proj = nn.Linear(dim, dim)
         self.out_proj = nn.Linear(dim, dim)
+        self.ragged_attn = None
 
-    def forward(self, x: torch.Tensor, frame_lens: list[int]) -> torch.Tensor:
+    def bind_resources(self, resources: dict) -> None:
+        """See ``NodeSubmodule.bind_node_resources``."""
+        self.ragged_attn = resources.get(VISION_ATTN)
+
+    def forward(self, x: torch.Tensor, frame_lens: list[int] | None = None) -> torch.Tensor:
+        """Attention within each frame: over the packed ``frame_lens`` (the
+        reference path), or, with none, the frames the step planned on the
+        ragged attention resource."""
         n = x.shape[0]
         q = self.q_proj(x).view(n, self.num_heads, self.head_dim)
         k = self.k_proj(x).view(n, self.num_heads, self.head_dim)
         v = self.v_proj(x).view(n, self.num_heads, self.head_dim)
-        out = frame_attention(q, k, v, frame_lens).reshape(n, -1)
-        return self.out_proj(out)
+        if frame_lens is not None:
+            out = frame_attention(q, k, v, frame_lens)
+        elif self.ragged_attn is not None:
+            out = self.ragged_attn.run(q, k, v)
+        else:
+            raise ValueError(
+                f"the vision tower has no attention plan: declare a RaggedAttentionSpec under {VISION_ATTN!r}"
+            )
+        return self.out_proj(out.reshape(n, -1))
 
 
 class Cosmos3VisionMLP(nn.Module):
@@ -155,7 +173,7 @@ class Cosmos3VisionEncoderLayer(nn.Module):
         self.layer_norm2 = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.mlp = Cosmos3VisionMLP(config)
 
-    def forward(self, x: torch.Tensor, frame_lens: list[int]) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, frame_lens: list[int] | None = None) -> torch.Tensor:
         x = x + self.self_attn(self.layer_norm1(x), frame_lens)
         return x + self.mlp(self.layer_norm2(x))
 
@@ -165,7 +183,7 @@ class Cosmos3VisionEncoder(nn.Module):
         super().__init__()
         self.layers = nn.ModuleList(Cosmos3VisionEncoderLayer(config) for _ in range(config.num_hidden_layers))
 
-    def forward(self, x: torch.Tensor, frame_lens: list[int]) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, frame_lens: list[int] | None = None) -> torch.Tensor:
         for layer in self.layers:
             x = layer(x, frame_lens)
         return x
@@ -235,3 +253,33 @@ class Cosmos3VisionModel(nn.Module):
     def forward(self, pixel_values: torch.Tensor, grid_thw: list[tuple[int, int, int]]) -> torch.Tensor:
         features = self.visual(pixel_values, grid_thw)
         return self.projector(features)
+
+    # The served path, split around the block loop for `PackedBlockLoopEncoder`
+
+    @property
+    def head_dim(self) -> int:
+        return self.config.vision.hidden_size // self.config.vision.num_attention_heads
+
+    def position_table(self, h: int, w: int) -> torch.Tensor:
+        """One ``h x w`` frame's position embeddings ``[h * w, hidden]``, in
+        pack order: the learned grid resized as the reference does."""
+        emb = self.visual.embeddings
+        grid = emb.position_embedding.weight.reshape(emb.grid_side, emb.grid_side, -1)
+        return resize_position_grid(grid, [(1, h, w)], self.config.vision.spatial_merge_size)
+
+    def embed(
+        self, pixel_values: torch.Tensor, pos_embeds: torch.Tensor, **_: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Patch embedding plus the packed position tables; the block loop's
+        cos / sin buffers stay zero (SigLIP2 has no rotary)."""
+        embeds = self.visual.embeddings.patch_embedding
+        hidden = embeds(pixel_values.to(embeds.weight.dtype)) + pos_embeds.to(embeds.weight.dtype)
+        rope = hidden.new_zeros(()).expand(hidden.shape[0], self.head_dim)
+        return hidden, rope, rope
+
+    def encode(self, hidden: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+        """The encoder blocks over the planned frames, and the post norm."""
+        return self.visual.post_layernorm(self.visual.encoder(hidden))
+
+    def project(self, encoded: torch.Tensor, **_: torch.Tensor) -> torch.Tensor:
+        return self.projector(encoded)

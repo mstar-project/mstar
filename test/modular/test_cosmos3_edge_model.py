@@ -152,6 +152,9 @@ def test_edge_resources_shared_between_dit_and_reasoner(tmp_path) -> None:
     assert specs[SAMPLER].vocab_size == 131072
     # the reasoner's position counter is its own; mixed steps split the shared attention
     assert specs[ROPE].nodes == {REASONER_NODE}
+    # the vision tower's attention: a segment per frame, down to the smallest video frame (16 patches)
+    assert specs["vision_attn"].nodes == {VISION_ENCODER_NODE}
+    assert specs["vision_attn"].config.max_segments_per_step == 16384 // 16
     assert [split.combined_walk for split in specs[ATTN].config.splits] == ["mixed"]
     assert model.get_combined_graph_walks() == {REASONER_NODE: {"mixed": {"prefill_text", "decode"}}}
     # Nano-shaped defaults declare no reasoner resources.
@@ -188,7 +191,7 @@ def test_edge_yaml_splits_worker_graphs(tmp_path) -> None:
 
 def test_reasoner_request_state_machine(tmp_path) -> None:
     model = _model(tmp_path)
-    sig = {k: [object()] for k in ("text_inputs", "pixel_values", "vision_grid_thw")}
+    sig = {k: [object()] for k in ("text_inputs", "pixel_values")}
     layout = {"offset": [3], "tokens": [4], "output": ["vision_embeds"], "grid": [[1, 4, 4]]}
     fpa = model.get_initial_forward_pass_args(
         "default", ["image", "text"], ["text"], sig, {"max_output_tokens": 32, MEDIA_LAYOUT: layout},
@@ -196,8 +199,7 @@ def test_reasoner_request_state_machine(tmp_path) -> None:
     assert fpa.full_metadata.graph_walk == Cosmos3Model.REASONER_PREFILL_VISION_WALK
     assert fpa.full_metadata.is_prefill
     routed = {(e.next_node, e.name) for e in fpa.inputs}
-    assert routed == {(REASONER_NODE, "text_inputs"),
-                      (VISION_ENCODER_NODE, "pixel_values"), (VISION_ENCODER_NODE, "vision_grid_thw")}
+    assert routed == {(REASONER_NODE, "text_inputs"), (VISION_ENCODER_NODE, "pixel_values")}
     # the layout rides the prefill step, and not the request's kwargs every decode step copies
     assert fpa.step_metadata[MEDIA_LAYOUT] == layout and MEDIA_LAYOUT not in fpa.full_metadata.kwargs
     # Text-only prompts skip the encoder; media without a layout to place them by is refused.
