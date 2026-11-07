@@ -139,6 +139,17 @@ class Nvfp4Format(BlockScaledFormat):
     # a 16-block's largest magnitude a unit tensor scale holds: e4m3's top code times e2m1's top
     UNIT_RANGE = 6.0 * 448.0
 
+    def __init__(self, nearest: bool = False):
+        # how an activation block's e4m3 scale rounds: up (nothing clips; the input scales this module places) or
+        # to nearest, as modelopt calibrates a checkpoint's input_scale and FlashInfer's FP4 MoE quantizes
+        self.nearest = nearest
+
+    def for_stored(self, stored) -> Nvfp4Format:
+        """A checkpoint's NVFP4 linears quantize their activations as its calibration assumed: to nearest."""
+        if stored is None or stored.format != self.name:
+            return self
+        return NVFP4_STORED
+
     @classmethod
     def input_scale(cls, input_amax: float | None) -> float:
         """An input's tensor scale: the smallest power of two whose range holds ``input_amax``, never below one.
@@ -157,9 +168,10 @@ class Nvfp4Format(BlockScaledFormat):
         )
         return code.to(torch.uint8)
 
-    def quantize(self, x, tensor_scale=None) -> BlockQuant:
-        """A block's scale is the e4m3 at or above ``amax / 6`` in units of ``tensor_scale`` (default: the tensor's
-        own ``amax / (6 * 448)``, which gives the largest block the top of e4m3's range)."""
+    def quantize(self, x, tensor_scale=None, nearest: bool = False) -> BlockQuant:
+        """A block's scale is the e4m3 at or above ``amax / 6`` (``nearest``: nearest to it) in units of
+        ``tensor_scale`` (default: the tensor's own ``amax / (6 * 448)``, which gives the largest block the top of
+        e4m3's range)."""
         rows, k = x.shape
         blocks, amax = self._blocks(x)
         if tensor_scale is None:
@@ -167,7 +179,9 @@ class Nvfp4Format(BlockScaledFormat):
         tensor_scale = torch.as_tensor(tensor_scale, dtype=torch.float32, device=x.device).reshape(1)
         want = amax / tensor_scale / self.data_max
         code = want.to(FP8_DTYPE).view(torch.uint8).int()
-        code = (code + (code.to(torch.uint8).view(FP8_DTYPE).float() < want).int()).clamp(1, _E4M3_MAX_FINITE)
+        if not nearest:
+            code = code + (code.to(torch.uint8).view(FP8_DTYPE).float() < want).int()
+        code = code.clamp(1, _E4M3_MAX_FINITE)
         code = code.to(torch.uint8)
         scale = code.view(FP8_DTYPE).float() * tensor_scale
         nibbles = self._codes((blocks / scale[..., None]).view(rows, k)).view(rows, k // 2, 2)
@@ -190,7 +204,7 @@ class Nvfp4Format(BlockScaledFormat):
         return {"weight": q.data, "weight_scale": q.scale, "weight_scale_2": q.tensor_scale, "input_scale": scale}
 
     def linear(self, x, weight, weight_scale, weight_scale_2, input_scale):
-        return torch.ops.mstar.nvfp4_linear(x, weight, weight_scale, weight_scale_2, input_scale)
+        return torch.ops.mstar.nvfp4_linear(x, weight, weight_scale, weight_scale_2, input_scale, self.nearest)
 
     # -- a modelopt checkpoint, as stored ----------------------------------------------------------------
     def storage(self, n, k):
@@ -228,7 +242,8 @@ class Nvfp4Format(BlockScaledFormat):
     def reference_stored(self, x: torch.Tensor, buffers) -> torch.Tensor:
         """What the GEMM computes on a layer's buffers: ``x`` quantized in units of its ``input_scale``, times the
         dequantized weight (tests, the experts' reference)."""
-        return self.reference_linear(self.quantize(x, _f32(buffers["input_scale"])[:1]), self._as_blockquant(buffers))
+        return self.reference_linear(self.quantize(x, _f32(buffers["input_scale"])[:1], self.nearest),
+                                     self._as_blockquant(buffers))
 
     @staticmethod
     def _as_blockquant(buffers) -> BlockQuant:
@@ -246,6 +261,8 @@ def _f32(t: torch.Tensor) -> torch.Tensor:
 
 MXFP8 = register_format(Mxfp8Format())
 NVFP4 = register_format(Nvfp4Format())
+# a checkpoint's NVFP4, as stored (``Nvfp4Format.for_stored``): its activations round to nearest
+NVFP4_STORED = Nvfp4Format(nearest=True)
 
 
 def _out(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
@@ -276,24 +293,25 @@ def _(x, weight, weight_scale):
 @torch.library.custom_op("mstar::nvfp4_linear", mutates_args=())
 def nvfp4_linear(
     x: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor, weight_scale_2: torch.Tensor,
-    input_scale: torch.Tensor,
+    input_scale: torch.Tensor, nearest: bool = False,
 ) -> torch.Tensor:
-    """``x [M, K]`` bf16 times an NVFP4 weight ``[N, K // 2]``, ``x`` quantized in units of ``input_scale``."""
+    """``x [M, K]`` bf16 times an NVFP4 weight ``[N, K // 2]``, ``x`` quantized in units of ``input_scale`` (its
+    block scales rounded up, or to ``nearest``)."""
     return NVFP4.reference_linear(
-        NVFP4.quantize(x, input_scale), BlockQuant(weight, weight_scale, weight_scale_2),
+        NVFP4.quantize(x, input_scale, nearest), BlockQuant(weight, weight_scale, weight_scale_2),
     )
 
 
 @nvfp4_linear.register_fake
-def _(x, weight, weight_scale, weight_scale_2, input_scale):
+def _(x, weight, weight_scale, weight_scale_2, input_scale, nearest=False):
     return _out(x, weight)
 
 
 @nvfp4_linear.register_kernel("cuda")
-def _(x, weight, weight_scale, weight_scale_2, input_scale):
+def _(x, weight, weight_scale, weight_scale_2, input_scale, nearest=False):
     from mstar.utils.quant_fp8 import quant_nvfp4
 
-    q = quant_nvfp4(x, input_scale)
+    q = quant_nvfp4(x, input_scale, nearest)
     ops = torch.nn.functional
     recipe = [ops.ScalingType.BlockWise1x16.value, ops.ScalingType.TensorWise.value]
     swizzle = [ops.SwizzleType.SWIZZLE_32_4_4.value, ops.SwizzleType.NO_SWIZZLE.value]

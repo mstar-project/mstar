@@ -291,10 +291,9 @@ def _blackwell() -> bool:
 def test_blackwell_experts_kernel_matches_the_reference(tokens):
     """The checkpoint's experts, converted in place to the TRT-LLM kernel's layout at load, on GLM's own routing.
 
-    The kernel rounds an activation block's e4m3 scale to nearest (TRT-LLM's and modelopt's convention), the CPU
-    reference rounds it up (nothing clips), so the two round the activations independently and sit ~0.18 apart on
-    random data, each ~0.17 from the fp32 weights' output. The check: the kernel is no further from the fp32-weight
-    output than the reference is (a swapped gate/up or a misplaced scale is ~1.0 off)."""
+    Both round an activation block's e4m3 scale to nearest (a stored checkpoint's ``Nvfp4Format.for_stored``), so
+    the kernel sits within its accumulation order of the CPU reference; both are ~0.16 from the fp32 weights'
+    output on random data (a swapped gate/up or a misplaced scale is ~1.0 off)."""
     torch.manual_seed(2)
     cfg = _reduced_config()
     cfg.hidden_size, cfg.moe_intermediate_size, cfg.n_routed_experts = 512, 256, 8
@@ -307,5 +306,6 @@ def test_blackwell_experts_kernel_matches_the_reference(tokens):
     fp32 = _dequantized_routed(experts, flat, weights, ids)
     want = reference._experts_4bit(flat, weights, ids, skip_invalid=False)
     got = moe._experts_4bit(flat.cuda(), weights.cuda(), ids.cuda(), skip_invalid=False).cpu()
+    assert _rel(got, want) < 0.05, _rel(got, want)
     assert _rel(got, fp32) <= 1.05 * _rel(want, fp32), (_rel(got, fp32), _rel(want, fp32))
     assert F.cosine_similarity(got.float().flatten(), fp32.flatten(), dim=0) > 0.98

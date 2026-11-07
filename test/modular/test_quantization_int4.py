@@ -323,7 +323,8 @@ def test_every_layout_loads_as_stored_and_runs_the_weights_it_stands_for(stored,
             xi = x[:, :want.shape[1]].contiguous()
             got = module._quant_local(xi, None)
             if layout == "nvfp4":
-                ref = NVFP4.reference_linear(NVFP4.quantize(xi, torch.tensor([0.5])),
+                # a stored checkpoint's activations round their block scales to nearest (modelopt's rule)
+                ref = NVFP4.reference_linear(NVFP4.quantize(xi, torch.tensor([0.5]), nearest=True),
                                              NVFP4._as_blockquant(_buffers(module)))
             else:
                 ref = F.linear(xi, want.to(torch.bfloat16))
@@ -951,15 +952,11 @@ def test_blackwell_fp4_experts_match_the_reference(stored, layout, group, tol):
     block.experts_after_load()
     assert block._experts_kernel is not None
     got = block._experts_quant(h.cuda(), weights.cuda(), ids.cuda(), False).cpu()
-    if layout == "nvfp4":
-        # the kernel rounds an activation block's e4m3 scale to nearest (TRT-LLM / modelopt), the reference rounds
-        # it up, so their activation roundings are independent (~0.18 apart on random data): bound the kernel by
-        # the reference's own distance from the bf16-activation output
-        err = lambda y: ((y.float() - exact).norm() / exact.norm()).item()  # noqa: E731
-        assert err(got) <= 1.05 * err(ref), (err(got), err(ref))
-        return
     rel = ((got.float() - ref.float()).norm() / ref.float().norm()).item()
     assert rel < tol, rel
+    # and no further than the reference from the dequantized experts on bf16 activations (NVFP4 rounds them too)
+    err = lambda y: ((y.float() - exact).norm() / exact.norm()).item()  # noqa: E731
+    assert err(got) <= 1.05 * err(ref) + 1e-3, (err(got), err(ref))
 
 
 @blackwell

@@ -144,9 +144,11 @@ def _mxfp8_quant_kernel(
 @triton.jit
 def _nvfp4_quant_kernel(
     y_ptr, q_ptr, s_ptr, ts_ptr, rows, k, col_tiles, ROWS: tl.constexpr, BLOCKS: tl.constexpr, BLOCK: tl.constexpr,
+    NEAREST: tl.constexpr,
 ):
     """One scale tile's ``[ROWS, BLOCKS * BLOCK]`` values: packed e2m1 data, e4m3 scales in units of the tensor scale
-    at ``ts_ptr``, rounded up. One read per value."""
+    at ``ts_ptr``, rounded up (nothing clips) or, ``NEAREST``, to nearest (modelopt's and TRT-LLM's rule, which a
+    calibrated checkpoint's input scale assumes; a block's top value may then saturate at 6). One read per value."""
     g = tl.program_id(0).to(tl.int64)
     col_tile = tl.program_id(1).to(tl.int64)
     row = g * ROWS + tl.arange(0, ROWS)
@@ -156,7 +158,8 @@ def _nvfp4_quant_kernel(
     tensor_scale = tl.load(ts_ptr)
     want = tl.max(tl.abs(y), axis=2) / 6.0 / tensor_scale
     code = want.to(tl.float8e4nv).to(tl.uint8, bitcast=True).to(tl.int32)
-    code = code + (code.to(tl.uint8).to(tl.float8e4nv, bitcast=True).to(tl.float32) < want).to(tl.int32)
+    if not NEAREST:
+        code = code + (code.to(tl.uint8).to(tl.float8e4nv, bitcast=True).to(tl.float32) < want).to(tl.int32)
     code = tl.minimum(tl.maximum(code, 1), 0x7E)
     scale = code.to(tl.uint8).to(tl.float8e4nv, bitcast=True).to(tl.float32) * tensor_scale
     u = y / scale[:, :, None]
@@ -195,14 +198,16 @@ def quant_mxfp8(x: torch.Tensor) -> BlockQuant:
     return BlockQuant(data, scale.view(E8M0_DTYPE))
 
 
-def quant_nvfp4(x: torch.Tensor, tensor_scale: torch.Tensor) -> BlockQuant:
+def quant_nvfp4(x: torch.Tensor, tensor_scale: torch.Tensor, nearest: bool = False) -> BlockQuant:
     """A contiguous bf16 ``[rows, K]`` activation as NVFP4: packed e2m1 data, one e4m3 scale per 16 values in units
     of ``tensor_scale`` (a ``[1]`` fp32 on the device, the linear's: reading the activation twice for its own
-    maximum costs as much as quantizing it). ``block_scaled.Nvfp4Format.quantize`` is the host-side reference."""
+    maximum costs as much as quantizing it), rounded up or ``nearest``. ``block_scaled.Nvfp4Format.quantize`` is the
+    host-side reference."""
     rows, k = x.shape
     grid, col_tiles, scale = _block_grid(x, 16)
     packed = torch.empty(rows, k // 2, dtype=torch.uint8, device=x.device)
     _nvfp4_quant_kernel[grid](
         x, packed, scale, tensor_scale, rows, k, col_tiles, ROWS=_BLOCK_QUANT_ROWS, BLOCKS=BLOCKS_PER_TILE, BLOCK=16,
+        NEAREST=nearest,
     )
     return BlockQuant(packed.view(FP4_DTYPE), scale.view(FP8_DTYPE), tensor_scale)

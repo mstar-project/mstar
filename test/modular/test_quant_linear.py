@@ -204,7 +204,7 @@ def test_quantizer_host_contract(monkeypatch, fmt, kernel, block, stored):
     assert q.scale.dtype == fmt.scale_dtype and q.scale.numel() == 128 * (k // block)
     (call,) = rec.calls
     assert call["grid"] == (3, k // block // 4)
-    assert call["kwargs"] == {"ROWS": 32, "BLOCKS": 4, "BLOCK": block}
+    assert call["kwargs"] == {"ROWS": 32, "BLOCKS": 4, "BLOCK": block, **({} if fmt is MXFP8 else {"NEAREST": False})}
     if fmt is NVFP4:
         assert call["args"][3] is tensor_scale and q.tensor_scale is tensor_scale
     else:
