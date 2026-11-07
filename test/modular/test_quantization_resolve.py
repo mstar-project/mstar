@@ -137,12 +137,13 @@ def test_specs_the_build_cant_serve_are_refused(quantization, ckpt, capability, 
 
 
 def test_a_checkpoint_format_without_a_loader_is_refused_by_name():
-    # compressed-tensors' NVFP4 (inverted global scales) has no loader yet
+    # compressed-tensors' NVFP4 (inverted global scales) has no loader yet; modelopt's has
     tensors = {"layers.0.mlp.gate_proj.weight_packed": TensorInfo("U8", (INTER, HIDDEN // 2)),
                "layers.0.mlp.gate_proj.weight_scale": TensorInfo("F8_E4M3", (INTER, HIDDEN // 16)),
                "layers.0.mlp.gate_proj.weight_global_scale": TensorInfo("F32", (1,))}
     plan = plan_for(None, CheckpointQuant.from_tensors(tensors, {"quant_method": "compressed-tensors"}))
-    assert any("as nvfp4" in p and "no loader for nvfp4" in p for p in plan.problems), plan.problems
+    assert any("as nvfp4 (compressed-tensors)" in p and "no loader for nvfp4 (compressed-tensors)" in p
+               for p in plan.problems), plan.problems
 
 
 def test_a_linear_the_model_didnt_declare_is_a_problem_not_a_silent_skip():

@@ -41,8 +41,9 @@ _CATALOG = (
                "fused_experts_fp8"),
     FormatInfo("mxfp8", 8, "mxfp8", (1, 32), (10, 0), True, False,
                "e4m3, one e8m0 scale per 32 along K; cuBLASLt block-scaled GEMM"),
-    FormatInfo("nvfp4", 4, "nvfp4", (1, 16), (10, 0), True, False,
-               "e2m1, one e4m3 scale per 16 along K plus an fp32 tensor scale; cuBLASLt / FlashInfer FP4 GEMM"),
+    FormatInfo("nvfp4", 4, "nvfp4", (1, 16), (10, 0), True, True,
+               "e2m1, one e4m3 scale per 16 along K plus an fp32 tensor scale (modelopt nvidia/*-NVFP4 as stored, or "
+               "quantized at load); cuBLASLt FP4 GEMM, experts FlashInfer's TRT-LLM FP4 MoE"),
     FormatInfo("mxfp4", 4, "bf16", (1, 32), (8, 0), True, True,
                "e2m1, one e8m0 scale per 32 along K (compressed-tensors mxfp4-pack-quantized: Kimi K3's routed "
                "experts); H100/H200: Triton, dequantized to bf16 in registers; B200/B300 experts: FlashInfer's "

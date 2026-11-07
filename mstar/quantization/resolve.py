@@ -30,7 +30,7 @@ from mstar.quantization.spec import NodeQuantSpec, pattern_matches
 LINEAR, EXPERTS, OTHER = "linear", "experts", "other"
 MIXED = "mixed"
 # stored formats the loader reads directly or dequantizes as it loads, and the checkpoint layouts it reads them in
-LOADABLE = ("fp8_block", "fp8_channel", "fp8_tensor", "w4a16", "mxfp4")
+LOADABLE = ("fp8_block", "fp8_channel", "fp8_tensor", "w4a16", "mxfp4", "nvfp4")
 LOADABLE_LAYOUTS = {"w4a16": ("compressed-tensors", "awq", "gptq"), "mxfp4": ("compressed-tensors",),
                     "nvfp4": ("modelopt",)}
 # the 4-bit formats' group along K (w4a16's is the checkpoint's own)
