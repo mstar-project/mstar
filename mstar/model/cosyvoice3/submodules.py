@@ -77,8 +77,11 @@ from mstar.model.cosyvoice3.config import (
 from mstar.model.submodule_base import (
     ARNodeInputs,
     ARNodeSubmodule,
+    BatchedModelOutput,
     NodeInputs,
     NodeSubmodule,
+    StopKind,
+    StopPolicy,
 )
 from mstar.utils.h2d import PinnedStager
 
@@ -94,7 +97,6 @@ MEL = "mel"  # newly settled mel frames
 MEL_FINAL = "mel_final"  # [1] bool: the stream has ended
 AUDIO_CHUNK = "audio_chunk"
 DECODE_LOOP = "decode_loop"
-STEP_INDEX = "lm_step"  # [1] the LM step that produced the token, for check_stop
 
 # Request facts process_prompt settles, carried in step_metadata
 MIN_SPEECH_TOKENS = "min_speech_tokens"
@@ -229,6 +231,10 @@ class LMRequestKnobs:
 CAPTURE_KNOBS = LMRequestKnobs(
     seed=0, temperature=1.0, top_p=0.8, top_k=25, window=1, threshold=1.0, ignore_eos=False, min_len=0, max_len=1
 )
+
+
+def _ignores_eos(fwd_info: CurrentForwardPassInfo) -> bool:
+    return bool((fwd_info.step_metadata or {}).get("ignore_eos", False))
 
 
 class LMSubmodule(ARNodeSubmodule):
@@ -442,17 +448,12 @@ class LMSubmodule(ARNodeSubmodule):
         )
 
     def forward(self, graph_walk, engine_inputs, **kwargs) -> NameToTensorList:
-        tokens = self._forward(graph_walk, engine_inputs, **kwargs)
-        return {SPEECH_TOKENS: [tokens.reshape(-1)[:1]], STEP_INDEX: [kwargs["step"].reshape(-1)[:1].clone()]}
+        return {SPEECH_TOKENS: [self._forward(graph_walk, engine_inputs, **kwargs).reshape(-1)[:1]]}
 
-    def forward_batched(self, graph_walk, engine_inputs, **kwargs) -> dict[str, NameToTensorList]:
-        tokens = self._forward(graph_walk, engine_inputs, **kwargs).reshape(-1)
-        # a copy: under graph replay ``step`` is the static input the next step overwrites
-        steps = kwargs["step"].reshape(-1).clone()
-        return {
-            rid: {SPEECH_TOKENS: [tokens[i : i + 1]], STEP_INDEX: [steps[i : i + 1]]}
-            for i, rid in enumerate(engine_inputs.request_ids)
-        }
+    def forward_batched(self, graph_walk, engine_inputs, **kwargs) -> BatchedModelOutput:
+        # row i is request i, and one host copy of the rows serves the stop check
+        tokens = self._forward(graph_walk, engine_inputs, **kwargs).reshape(-1, 1)
+        return BatchedModelOutput(row_outputs={SPEECH_TOKENS: tokens}, check_stop_buffers={SPEECH_TOKENS: tokens})
 
     def postprocess(self, request_id, request_info, outputs, inputs: NodeInputs | None = None, **kwargs) -> None:
         del request_info, kwargs
@@ -464,17 +465,28 @@ class LMSubmodule(ARNodeSubmodule):
         if inputs is not None and HISTORY in inputs.tensor_inputs:
             state.add(HISTORY, inputs.tensor_inputs[HISTORY])
 
+    def get_stop_policies(self, graph_walk: str) -> dict[str, StopPolicy] | None:
+        if graph_walk != "decode":
+            return None  # the prefill's token can spend a one-token budget
+        # the budget is the loop's cap (``get_loop_caps``), which the runtime enforces
+        return {
+            DECODE_LOOP: StopPolicy(
+                StopKind.EOS,
+                token_signal=SPEECH_TOKENS,
+                eos_tokens=range(self.lm.speech_token_size, self.lm.speech_vocab_size),
+                ignores_eos=_ignores_eos,
+            )
+        }
+
     def check_stop(self, request_id, request_info, outputs) -> set[str]:
-        del request_info
         if SPEECH_TOKENS not in outputs:
             return set()
         token = int(outputs[SPEECH_TOKENS][0].reshape(-1)[0].item())
-        # this step's own index, not ``generated``: a speculative next step may
-        # already have been postprocessed
-        generated = int(outputs[STEP_INDEX][0].reshape(-1)[0].item()) + 1
         knobs: LMRequestKnobs = self.request_state(request_id)[KNOBS]
-        stopped = not knobs.ignore_eos and token >= self.lm.speech_token_size
-        if stopped or generated >= knobs.max_len:
+        if not knobs.ignore_eos and token >= self.lm.speech_token_size:
+            return {DECODE_LOOP}
+        # the prefill's token is the first of the budget; decode's cap covers the rest
+        if request_info.graph_walk in PREFILL_WALKS and knobs.max_len <= 1:
             return {DECODE_LOOP}
         return set()
 
