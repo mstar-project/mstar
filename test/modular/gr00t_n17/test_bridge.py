@@ -292,7 +292,7 @@ def _drive(spec: tuple) -> _Run:
     # the engine plans the resource from the declaration, so the stand-in is planned from it
     step = node.declare_step(_WALK, ["r0"], [prepared])
     node.bind_node_resources(
-        {BRIDGE_ATTN: SegmentAttention(tuple(seg.span for seg in step.segments))}
+        {BRIDGE_ATTN: SegmentAttention(tuple(seg.span for seg in step.steps[BRIDGE_ATTN].segments))}
     )
     tensors = node.preprocess(_WALK, _ENGINE, [prepared])
     text = [row for row in range(rows) if row not in set(image)]

@@ -525,7 +525,7 @@ def _drive(tmp_path, spec: list) -> _Run:
     prepared = node.prepare_inputs(_WALK, _FWD, walk)
     # the engine plans the resource from the declaration, so the stand-in is planned from it too
     step = node.declare_step(_WALK, ["r0"], [prepared])
-    spans = tuple(seg.span for seg in step.segments)
+    spans = tuple(seg.span for seg in step.steps[LLM_ATTN].segments)
     node.bind_node_resources({LLM_ATTN: SegmentAttention(spans, causal=True, gqa=True)})
     tensors = node.preprocess(_WALK, _ENGINE, [prepared])
     return _Run(node, ids, grid, walk, prepared, tensors, node.forward(_WALK, _ENGINE, **tensors))

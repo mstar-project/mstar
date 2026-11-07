@@ -976,7 +976,9 @@ def test_the_shipped_yaml_sizes_the_dt_cross_attention_for_its_widest_capture_sp
     specs = model.get_node_resources()
     apply_yaml_overrides(specs, serving)
     ceiling = next(spec for spec in specs if spec.resource_key == DT_XATTN).config.max_tokens_per_request
-    assert ceiling is not None and ceiling >= max(max(shape) for shape in model.capture_shapes)
+    widest = lambda m: max(max(shape) for shape in m.capture_shapes)  # noqa: E731
+    wider = _constructed(tmp_path, **{**serving["model_kwargs"], "capture_shapes": [[13, ceiling + 1]]})
+    assert ceiling is not None and widest(model) <= ceiling < widest(wider)
 
 
 # postprocess
@@ -1357,6 +1359,7 @@ def test_the_checkpoints_tensors_name_and_shape_each_nodes_parameters(node):
     checkpoint's shape, and every parameter gets one; shapes come off the safetensors
     headers, so no tensor is read."""
     built = _meta_node(node)
+    assert all(p.device.type == "meta" for p in built.parameters())
     weight_map = json.loads((GR00T / "model.safetensors.index.json").read_text())["weight_map"]
     remap = _remapper(node)
     checkpoint = {}
