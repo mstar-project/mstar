@@ -2704,7 +2704,9 @@ class Engine:
                     incoming = [(a, signal) for a, b, signal in group.unit.edges
                                 if b == batch.node_name and (not finished[a] or streamed)]
                     tensors = {rid: dict(batch.per_request_input_tensors.get(rid, {})) for rid in rows}
-                    stream_incoming = incoming if streamed else ()
+                    # Loop-back inputs are added below. They do not make the
+                    # producer a stream consumer or replace its preparation.
+                    stream_incoming = tuple(incoming) if streamed else ()
                     if stream_incoming:
                         maker, signal = stream_incoming[0]
                         source = self._submodules[maker].loopback_rows
@@ -2913,7 +2915,7 @@ class Engine:
                             target = target.narrow(dim, 0, value.shape[dim])
                             keys = tuple(expected.pop(name))
                             routed = destinations(name, guard.copies(value, target, keys, set(keys) - back_keys))
-                            if streamed and incoming:
+                            if streamed and any(key[:3] in group.unit.streaming_edges for key in keys):
                                 if stream_target is not None or len(routed) != len(rows):
                                     guard.refuse("each streamed row needs one contiguous owner destination")
                                 stream_target = routed

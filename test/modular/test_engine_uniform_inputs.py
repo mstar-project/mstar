@@ -1024,7 +1024,9 @@ def test_streamed_engine_composes_independent_bodies_and_owner_reads(device_name
     custom = mode.startswith("tail") or mode == "producer_tail" or packing
     tails, batch_tails, producer_tails, producer_views = [], [], [], []
     eng, group, events = _connected_engine(device=device)
-    group.unit = replace(group.unit, streaming_edges=group.unit.edges)
+    # A real repeating producer has its own Loop edge as well as the stream.
+    # It is not a consumer of that stream and still needs ordinary preparation.
+    group.unit = replace(group.unit, streaming_edges=group.unit.edges, loop_back=(("a", "a", "x"),))
     source = StreamBuffer(2, "x", "a", FixedChunkPolicy(2))
     ring = LoopbackRows(device, capacity=1)
     ring.add(2)
