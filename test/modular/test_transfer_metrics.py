@@ -36,13 +36,14 @@ from mstar.graph.base import GraphEdge  # noqa: E402
 from mstar.graph.loop_indices import NestedLoopIndices  # noqa: E402
 from mstar.observability import catalog  # noqa: E402
 from mstar.observability.recorders import EdgeTransfers  # noqa: E402
-from mstar.streaming.topology import PartitionTopology  # noqa: E402
+from mstar.testing_utils.model import StubModel  # noqa: E402
 from mstar.utils.ipc_format import (  # noqa: E402
     ConductorMessageType,
     EnableMetrics,
     WorkerMessage,
     WorkerMessageType,
 )
+from mstar.worker.rebuild import Rebuilds  # noqa: E402
 from mstar.worker.worker import Worker  # noqa: E402
 
 DATA_WORKER = "api_server_preprocess_worker"
@@ -321,6 +322,7 @@ def _bare_worker(tmp_path):
     worker.worker_id = "worker_1"
     worker.parallel_leader_nodes = set()
     worker.engine_manager = SimpleNamespace(engine=SimpleNamespace(paged_kv_caches=list))
+    worker._rebuilds = Rebuilds({}, {})
     worker.communicator = _Sink()
     worker.tensor_manager = _shm("worker_1", tmp_path)
     return worker
@@ -361,12 +363,9 @@ def test_a_rank_leading_no_node_reports_its_transfers_once_per_interval(tmp_path
 
 # ── the data worker ──────────────────────────────────────────────────────────
 
-class _TextModel:
+class _TextModel(StubModel):
     def postprocess(self, output, modality, request_kwargs=None):
         return f"<{int(output[0])}>".encode()
-
-    def get_partition_topology(self):
-        return PartitionTopology(partitions=["default"])
 
 
 def test_the_data_worker_loop_publishes_the_results_it_reads(tmp_path, monkeypatch):

@@ -13,6 +13,7 @@ Two stubs that exist purely so test imports survive on local macOS dev:
 
 And one autouse fixture that clears the cached platform around every test.
 """
+import os
 import sys
 import types
 from typing import NamedTuple
@@ -138,3 +139,16 @@ def _fresh_platform():
     resolve_platform.cache_clear()
     yield
     resolve_platform.cache_clear()
+
+
+# --- host GPUs -----------------------------------------------------------------
+
+@pytest.fixture
+def no_host_gpus(monkeypatch, tmp_path):
+    """Make ``nvidia-smi`` fail, as on a host with no GPU. For tests whose eval jobs start
+    only fake servers, which would otherwise wait on another process's GPU memory."""
+    bin_dir = tmp_path / "no_host_gpus"
+    bin_dir.mkdir()
+    (bin_dir / "nvidia-smi").write_text("#!/bin/sh\nexit 1\n")
+    (bin_dir / "nvidia-smi").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")

@@ -36,7 +36,7 @@ def _signals(tensors: dict[str, list[torch.Tensor]]) -> dict[str, list[TensorPoi
 
 
 @pytest.mark.parametrize("prompt", [None, "", "pick up the mug"])
-@pytest.mark.parametrize("out_mod,kwargs", [("action", POLICY), ("image", {})], ids=["action", "image"])
+@pytest.mark.parametrize("out_mod,kwargs", [("action", POLICY), ("video", {"num_frames": 17})], ids=["action", "i2v"])
 def test_prefill_nodes_ready_without_prompt(prompt, out_mod, kwargs) -> None:
     model = Cosmos3Model(model_path_hf="unused", skip_weight_loading=True)
     in_mods = ["image", "text"] if prompt else ["image"]

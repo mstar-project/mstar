@@ -414,6 +414,14 @@ def test_qwen3_tts_process_prompt_matches_official_template():
     }
 
 
+def test_qwen3_tts_process_prompt_drops_leading_whitespace():
+    # the tokenizer merges "assistant\n" with a leading "\n" into one token, which changes the
+    # ChatML prefix the text span is sized from (a 400); leading whitespace carries no speech
+    model = _make_model()
+    model.process_prompt("\n 你好", input_modalities=["text"], output_modalities=["audio"])
+    assert model.tokenizer.last_text == "<|im_start|>assistant\n你好<|im_end|>\n<|im_start|>assistant\n"
+
+
 def test_qwen3_tts_process_prompt_rejects_a_changed_chatml_wrapper(monkeypatch):
     model = _make_model()
     monkeypatch.setattr(
@@ -1843,7 +1851,7 @@ def test_qwen3_tts_codec_without_watermark_emits_the_same_bytes_through_the_engi
     """Watermark off, the engine's postprocess (batch tail included) emits byte
     for byte what per-request ``postprocess`` alone does, which is all the
     engine ran before the tail existed: two batched streams, ramp to final."""
-    from mstar.engine.engine import Engine
+    from mstar.testing_utils.engine import make_engine, make_mgmt
 
     config = _tiny_model_config()
     config.codec = _tiny_codec_config(chunk_schedule=(1, 3, 8, 20, 5), chunk_frames=6)
@@ -1862,7 +1870,7 @@ def test_qwen3_tts_codec_without_watermark_emits_the_same_bytes_through_the_engi
             stream.put(f"t{i}", frames[i])
         stream.signal_done()
         streams[rid] = stream
-    engine = SimpleNamespace(_submodules={"Codec": SimpleNamespace(submodule=submodule, piecewise_runners={})})
+    engine = make_engine(_submodules={"Codec": make_mgmt(submodule)})
     finals = 0
     with torch.no_grad():
         while all(stream.has_chunk_ready() for stream in streams.values()):
@@ -1888,7 +1896,7 @@ def test_qwen3_tts_codec_without_watermark_emits_the_same_bytes_through_the_engi
                 per_request_info_wrapped={rid: None for rid in rids}, failed_requests=failures,
                 register_failure=failures.__setitem__, step_context=SimpleNamespace(graph_walk="codec_chunk"),
             )
-            Engine._postprocess_batch(engine, batch, out)
+            engine._postprocess_batch(batch, out)
             assert not failures
             for rid in rids:
                 got, want = out[rid]["audio_chunk"][0], alone[rid]["audio_chunk"][0]
