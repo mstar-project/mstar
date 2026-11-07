@@ -147,6 +147,7 @@ class Cosmos3Model(Model):
     """NVIDIA Cosmos3 generator implementation."""
 
     PREPROCESS_ONLY_KWARGS = ("action", "robot_state")
+    REPLICA_AFFINITY_KWARG = "session_id"
     # The width of a policy request's robot_state, which process_prompt hands
     # the conductor (the values themselves ride the action_inputs edge).
     INTERNAL_KWARGS = ("robot_state_dim", "action_shape")

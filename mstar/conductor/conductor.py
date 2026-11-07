@@ -1399,7 +1399,10 @@ class Conductor:
         groups_run = self._router.groups_run(
             name for name, fwd_args in partition_fwd_args.items() if not fwd_args.request_done
         )
-        placement = self._router.pick(resource_configs, groups_run)
+        affinity = model_kwargs.get(self.model.REPLICA_AFFINITY_KWARG)
+        placement = self._router.pick(
+            resource_configs, groups_run, affinity=None if affinity is None else str(affinity),
+        )
         worker_graph_to_workers = self._assign_worker_graphs_to_workers(placement.replicas)
 
         # Build per-connection streaming state. None for a client stream: the

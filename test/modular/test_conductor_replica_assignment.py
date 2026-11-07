@@ -566,3 +566,21 @@ def test_the_kv_mirror_predicts_the_hits_the_real_cache_serves(monkeypatch):
         kv.commit(step, ctx)
     assert any(served), "no request hit, so the sequence pins nothing"
     assert predicted == served
+
+
+@pytest.mark.parametrize("sp_size", [1, 2])
+def test_session_affinity_survives_load_changes_and_keeps_lockstep_groups_together(sp_size):
+    graphs = [_wg(0, [0, 1, 2, 3], sp_size=sp_size),
+              _wg(1, [0, 1, 2, 3], sp_size=sp_size, nodes=("decoder",))]
+    router = ReplicaRouter(_Model(keyed={}), graphs)
+    groups = frozenset({0, 1})
+    first = router.pick({}, groups, affinity="session-a")
+    assert first.replicas[0] == first.replicas[1]
+    held = [router.add(first, {}, groups) for _ in range(5)]
+    assert router.pick({}, groups).replicas != first.replicas
+    assert router.pick({}, groups, affinity="session-a").replicas == first.replicas
+    for handle in held:
+        router.remove(handle, [])
+    assert router.pick({}, groups, affinity="session-a").replicas == first.replicas
+    fresh = ReplicaRouter(_Model(keyed={}), graphs)
+    assert fresh.pick({}, groups, affinity="session-a").replicas == first.replicas

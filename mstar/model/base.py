@@ -627,6 +627,10 @@ class Model(ABC):
     # values to the conductor alongside their tensor descriptors.
     PREPROCESS_ONLY_KWARGS: tuple[str, ...] = ()
 
+    # Requests sharing this kwarg must reach the same copy of every node,
+    # because their session state lives on that replica.
+    REPLICA_AFFINITY_KWARG: str | None = None
+
     # Keys only this model's process_prompt sets (prompt layouts, stream
     # leads) for the conductor to read back from model_kwargs. The data
     # worker drops a client's values for them before process_prompt.
