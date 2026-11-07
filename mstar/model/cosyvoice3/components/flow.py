@@ -40,6 +40,8 @@ Ported from ``cosyvoice/flow/flow.py`` (``CausalMaskedDiffWithDiT``),
 
 from __future__ import annotations
 
+import contextlib
+import threading
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from typing import NamedTuple
@@ -53,6 +55,31 @@ from mstar.model.chatterbox.loader import load_component
 from mstar.model.cosyvoice3.components.dit import DiT, PackedRows, chunk_attention_mask
 from mstar.model.cosyvoice3.config import FlowConfig
 from mstar.utils.h2d import PinnedStager
+
+_native_lock = threading.Lock()
+_native_holders = 0
+_native_saved = True
+
+
+@contextlib.contextmanager
+def native_convolutions():
+    """Convolutions off cuDNN within the block. ``cudnn.enabled`` is process-wide and
+    the reference encoder runs on the main thread while the GPU thread convolves, so
+    windows nest by count rather than each restoring what it saw on entry, and only
+    ``enabled`` changes (``cudnn.flags`` would also reset TF32 and benchmark mode)."""
+    global _native_holders, _native_saved
+    with _native_lock:
+        if _native_holders == 0:
+            _native_saved = torch.backends.cudnn.enabled
+            torch.backends.cudnn.enabled = False
+        _native_holders += 1
+    try:
+        yield
+    finally:
+        with _native_lock:
+            _native_holders -= 1
+            if _native_holders == 0:
+                torch.backends.cudnn.enabled = _native_saved
 
 
 @dataclass
@@ -119,7 +146,7 @@ class PreLookaheadLayer(nn.Module):
         # B * L under about 500, cuDNN picks a plan that reserves about 40 GiB
         # of workspace and takes about 155 ms a call (H200, cuDNN 9); the
         # native convolution takes about 0.1 ms and is as close to float64.
-        with torch.backends.cudnn.flags(enabled=False):
+        with native_convolutions():
             x = F.leaky_relu(self.conv1(x))
             x = self.conv2(F.pad(x, (self.conv2.kernel_size[0] - 1, 0)))
         return x.transpose(1, 2) + inputs
