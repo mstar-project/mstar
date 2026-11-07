@@ -761,6 +761,12 @@ class BagelModel(Model):
             # under 16 pixels a side (the VAE's 8x times the 2x2 patch) it has no latent patch,
             # and the loop would fail mid-request
             sides = images[0].shape[-2:] if images else (params["height"], params["width"])
+            max_side = self.config.max_latent_size * self.config.latent_downsample
+            if any(side > max_side for side in sides):
+                raise ValueError(
+                    f"BAGEL's position table supports at most {max_side} pixels a side, "
+                    f"got {list(sides)} (h, w)"
+                )
             if any(side < 16 for side in sides):
                 raise ValueError(f"BAGEL's output image must be at least 16 pixels a side, got {list(sides)} (h, w)")
         if tensors is None:

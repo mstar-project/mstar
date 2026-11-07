@@ -78,3 +78,11 @@ def test_an_edit_input_is_downsized_as_pil_does():
     expected = torch.from_numpy(np.asarray(reference)).permute(2, 0, 1).float() / 255
     assert ours.shape == expected.shape
     assert (ours - expected).abs().max() < 2 / 255
+
+
+@pytest.mark.parametrize("width,height", [(1024, 1040), (1040, 1024), (1040, 16)])
+def test_image_outside_position_table_fails_at_intake(width, height):
+    model = _model()
+    with pytest.raises(ValueError, match="position table"):
+        model.process_prompt(None, [], ["image"], width=width, height=height)
+    model.process_prompt(None, [], ["image"], width=1024, height=1024)
