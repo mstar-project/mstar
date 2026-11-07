@@ -921,7 +921,9 @@ def test_retained_input_banks_are_budgeted_before_selecting_captures(measured):
     assert plan_captures({"n": plain}, free=free).buckets == {"n": {bucket}}
     owner = IterationTables(torch.device("cpu"))
     runner._resources = {"iteration_tables:Thinker": owner}
-    runner._run_asks = {"decode": SimpleNamespace(loop=SimpleNamespace(ancestors=()), limit=4, iteration={"cond"})}
+    runner._run_asks = {"decode": SimpleNamespace(
+        loop=SimpleNamespace(ancestors=()), limit=4, iteration={"cond"}, membership=None,
+    )}
     runner._resident = SimpleNamespace(max_slots=16)
     runner.static_inputs = {"cond": torch.empty(1, 32768)}
     retained = runner.size_captures()

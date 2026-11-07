@@ -10,6 +10,7 @@ from mstar.engine import accelerator_graph_runner as runner_mod
 from mstar.engine.accelerator_graph_runner import AcceleratorGraphRunner
 from mstar.engine.device_run import (
     RUN_COUNTS,
+    RUN_DESCRIPTORS,
     RUN_RAN,
     RUN_REPLAYS,
     RUN_SKIPPED,
@@ -44,6 +45,11 @@ class _Loop:
     def stop(self, state, tokens, handle, stream):
         """The test double of the ``run_stop`` kernel, which only CUDA can run."""
         self.state = state
+        if state.descriptors is not None:
+            identities = torch.where(state.marks, 0, state.identities)
+            state.descriptors[:, int(state.index)] = identities
+            if state.stream is not None:
+                state.stream.identities[:, int(state.index)] = identities
         state.counts += ~state.marks
         token = None if tokens is None else tokens.reshape(len(state.marks), -1)[:, 0]
         if token is not None:
@@ -84,7 +90,7 @@ class _Loop:
 
 def _runner(
     monkeypatch, loop, tokens, bs=2, limit=6, refill_at=None, carries=None, stream_tokens=False, counted=False,
-    progress=False,
+    progress=False, membership=None,
 ):
     """A runner holding a captured run whose forward samples ``tokens[iteration]``."""
     monkeypatch.setattr(torch.accelerator, "is_available", lambda: False)
@@ -105,21 +111,22 @@ def _runner(
         from mstar.graph.loop_indices import LoopLayout
 
         layout = LoopLayout("decode", (), ())
-        rows = runner._rows = LoopbackRows(CPU, capacity=bs)
-        for rid in range(1, bs + 1):
+        capacity = bs if membership is None else max(bs, membership.capacity)
+        rows = runner._rows = LoopbackRows(CPU, capacity=capacity)
+        for rid in range(1, capacity + 1):
             rows.add(rid)
         buffers = SimpleNamespace(rows=torch.arange(1, bs + 1), slots=torch.arange(1, bs + 1))
         planner = runner._resident = SimpleNamespace(
-            store=torch.tensor([0] + [rows._row_of[rid] for rid in range(1, bs + 1)]),
+            store=torch.tensor([0] + [rows._row_of[rid] for rid in range(1, capacity + 1)]),
             table=lambda: SimpleNamespace(stride=1, col=0), covers=lambda bucket: True,
-            drop_rows=lambda bucket, slot: buffers, max_slots=bs + 1,
+            drop_rows=lambda bucket, slot: buffers, max_slots=capacity + 1,
         )
         rows.resident_binding().bind(planner, "rows")
         resident = SimpleNamespace(bucket=BucketKey(WALK, bs, bs), slot=0, buffers=buffers, slots=buffers.slots)
-        runner.test_resource = torch.zeros(bs + 1)
+        runner.test_resource = torch.zeros(capacity + 1)
     runner.ask_run(WALK, RunAsk(None if counted else "new_token", frozenset() if counted else frozenset({EOS}),
                                 False, limit, carries or {}, ("frame",), ("cond",),
-                                refill_at, stream_tokens, layout))
+                                refill_at, stream_tokens, layout, membership))
     static = {"cond": torch.zeros(bs), "h": torch.zeros(bs)}
     calls = []
 
@@ -1388,3 +1395,79 @@ def test_run_membership_retracts_zero_work_and_cancels_accepted_rows(cancel_at, 
     assert ids.tolist() == [replacement.handle] and bindings.tolist() == [[23]]
     with pytest.raises(ValueError):
         publish_call(rows.cancel, descriptor)
+
+
+def test_captured_membership_uses_one_owner_snapshot_and_keeps_output_identity_through_eos_reuse(monkeypatch):
+    from mstar.engine.resources.run_rows import RunRows
+
+    membership = RunRows(CPU, rows=3, capacity=4, binding_width=2)
+    loop = _Loop()
+    runner, run, _, _ = _runner(monkeypatch, loop, [[0, 0]], bs=2, limit=5,
+                              progress=True, stream_tokens=True, membership=membership)
+    assert run is not None
+    owner, lease, _ = run.test_inputs
+    runner.test_resource.zero_()  # discard the warm-up forward's owner writes
+    # The first physical row is empty. The other one keeps the run alive.
+    incumbent = membership.reserve_row(1, 1, 1, (1, 0))
+    late = membership.reserve_row(2, 1, 0, (2, 0))
+    membership.retain(late)  # its outputs survive replacement on the physical row
+    membership.publish_row(incumbent)
+    columns = IterationWindow(
+        {"cond": torch.tensor([[1., 2., 3., 4., 5.], [7., EOS, 0., 0., 0.]])},
+        torch.tensor([0, 0]), torch.tensor([[1, 0], [1, 0]]),
+    )
+    replacement_columns = IterationWindow(
+        {"cond": torch.tensor([[float(EOS), 12., 13., 14., 15.], [0., 0., 0., 0., 0.]])},
+        torch.tensor([0, 0]), torch.tensor([[2, 0], [0, 0]]),
+    )
+    owner.stage_window(lease, [3], replacement_columns)
+    replacement = []
+
+    def arrive(iteration):
+        if iteration == 1:
+            membership.publish_row(late)
+        if iteration == 3:
+            membership.acknowledge(membership.control.tolist())
+            assert not membership.release(late)
+            row = membership.reserve_row(3, 2, 0, (3, 1))
+            membership.publish_row(row)
+            replacement.append(row)
+
+    loop.on_iteration = arrive
+    run.state.stream.begin([1])  # dynamic rows are not limited by the original rid list
+    stops, outputs, _ = _run(run, 1, 5, columns=columns)
+    current = replacement[0]
+    assert stops[RUN_DESCRIPTORS].tolist() == [
+        [0, late.handle, late.handle, current.handle, current.handle], [incumbent.handle] * 5,
+    ]
+    assert outputs["frame"][0, 1:].tolist() == [14., 18., 18., 24.]
+    assert runner.test_resource[1:4].tolist() == [15., 16., 21.]
+    seen = []
+
+    def take(identity, ordinal, token):
+        seen.append((identity, ordinal, token))
+        return True, identity == late.handle and token == EOS
+
+    ids, tokens = run.state.stream.take(take)
+    assert [(ordinal, token) for identity, ordinal, token in seen if identity == current.handle] == [(0, EOS), (1, 12)]
+    assert len(ids) == len(tokens) == 9 and 0 not in ids
+    assert run.state.stream.take(take) == ([], [])
+    assert membership.release(late)
+    # Unexecuted columns are identity zero even when ordinary values pad the last replay.
+    run.state.stage(1, [False], 5)
+    run.state.request_yield()
+    run.launch()
+    assert not run.results(5)[0][RUN_DESCRIPTORS].any()
+    # A descriptor can be accepted but its same Loop entry is already stopped.
+    # Such an iteration reads trash and never publishes an output identity.
+    membership.drain()
+    membership.acknowledge(membership.control.tolist())
+    stopped = membership.reserve_row(2, 1, 0, (2, 0))
+    membership.publish_row(stopped)
+    run.state.stream.begin([])
+    before = runner.test_resource[1:].clone()
+    stopped_outputs = _run(run, 1, 5, columns=columns)[0]
+    assert not stopped_outputs[RUN_DESCRIPTORS].any()
+    assert not stopped_outputs[RUN_COUNTS].any()
+    assert torch.equal(runner.test_resource[1:], before)
+    assert run.state.stream.take(take) == ([], [])

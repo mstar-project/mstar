@@ -1074,9 +1074,12 @@ class AcceleratorGraphRunner:
 
     def _input_bank_bytes(self, spec: CGSlotSpec, inputs: Mapping[str, Any]) -> int:
         ask = self._run_asks.get(spec.bucket.graph_walk)
-        if ask is None or ask.loop is None:
+        if ask is None:
             return 0
-        return IterationTables.window_bytes(
+        membership = 8 * spec.bucket.bs * (3 + ask.limit) if ask.membership is not None else 0
+        if ask.loop is None:
+            return membership
+        return membership + IterationTables.window_bytes(
             self._resident.max_slots, ask.limit, 2 + len(ask.loop.ancestors),
             {name: value for name, value in inputs.items() if name in ask.iteration}, spec.bucket.bs,
         )
@@ -1404,7 +1407,7 @@ class AcceleratorGraphRunner:
             self._run_failures[walk] = "graph: a counted run has no token signal to stream"
             return None, None, None
         dropping = None
-        if ask.drop_rows or ask.loop is not None:
+        if ask.drop_rows or ask.loop is not None or ask.membership is not None:
             if self._resident is None or not self._resident.covers(spec.bucket):
                 self._run_failures[walk] = "planner: the walk isn't resident, which dropping rows needs"
                 return None, None, None
@@ -1412,13 +1415,25 @@ class AcceleratorGraphRunner:
         if ask.loop is not None and (self._rows is None or warmed.resident is None):
             self._run_failures[walk] = "planner: actual Loop progress needs resident loop-back rows"
             return None, None, None
+        if ask.membership is not None:
+            if ask.carries:
+                self._run_failures[walk] = "resource: joining rows require owner-backed carries"
+                return None, None, None
+            if ask.iteration and ask.loop is None:
+                self._run_failures[walk] = "graph: joining iteration inputs need their actual Loop cursor"
+                return None, None, None
+            if ask.refill_at is not None:
+                self._run_failures[walk] = "graph: joining membership has no fixed refill row count"
+                return None, None, None
         if ask.loop is not None:
             self._rows.prepare_iteration(walk, ask.loop)
         cuda = backend.while_runtime()
         outer, handle, device_handle = cuda.new_loop(self._device)
-        stream = TokenStream(spec.bucket.bs, ask.limit, self._device) if ask.stream_tokens else None
+        stream = (TokenStream(spec.bucket.bs, ask.limit, self._device, membership=ask.membership is not None)
+                  if ask.stream_tokens else None)
         state = RunState(
             spec.bucket.bs, ask.token_signal, ask.stop_ids, self._device, dropping, stream,
+            membership=ask.membership, width=ask.limit,
         )
         shapes = {name: value for name, value in warmed.static_inputs.items() if name in ask.iteration}
         window = None
@@ -1452,6 +1467,7 @@ class AcceleratorGraphRunner:
         backend.synchronize()
 
         def body() -> Any:
+            state.acquire_rows()
             position = active = None
             if window is not None:
                 indices = self._rows.iteration_rows(warmed.resident)
@@ -1487,6 +1503,7 @@ class AcceleratorGraphRunner:
                 target.copy_(output_named(output, pair.output).reshape(target.shape))
             tokens = None if ask.token_signal is None else output_named(output, ask.token_signal).to(torch.long)
             cuda.stop(state, tokens, device_handle, backend.raw_stream())
+            state.retire_rows()
             if window is not None:
                 self._rows.iteration_tail(
                     walk, ask.loop, self._rows.indices(spec.bucket, spec.slot), position, active, state.marks,

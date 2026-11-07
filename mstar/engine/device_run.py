@@ -21,7 +21,7 @@ import ctypes
 import os
 from collections.abc import Callable, Collection, Mapping, Sequence
 from contextlib import nullcontext
-from typing import Any, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import torch
 
@@ -29,10 +29,15 @@ from mstar.engine.resources.resident import TRASH_SLOT
 from mstar.graph.loop_indices import LoopLayout
 from mstar.utils.h2d import PinnedStager
 
+if TYPE_CHECKING:
+    from mstar.engine.resources.run_rows import RunRows
+
 # a stop buffer of a run that repeats: the iterations it ran, on every row
 RUN_REPLAYS = "__run_replays__"
 # Logical executions per row, excluding padding and iterations after its stop.
 RUN_COUNTS = "__run_counts__"
+# Immutable membership identity per executed physical row/column; zero is no work.
+RUN_DESCRIPTORS = "__run_descriptors__"
 
 _STOP_SOURCE = r"""
 typedef unsigned long long cudaGraphConditionalHandle;
@@ -43,11 +48,15 @@ extern "C" __global__ void run_stop(
     const unsigned char* immune, unsigned char* marks, long long* index, const long long* limit,
     const long long* refill, const long long* generation, const volatile long long* yield_until,
     const unsigned long long* handle,
-    long long* host_tokens, volatile int* landed, int host_width, long long* counts
+    long long* host_tokens, volatile int* landed, int host_width, long long* counts,
+    const long long* identities, long long* descriptors, int width, long long* host_descriptors
 ) {
     int done = 0;
     long long at = *index;
     for (int row = 0; row < rows; ++row) {
+        long long identity = identities && !marks[row] ? identities[row] : 0;
+        if (descriptors) descriptors[row * width + at] = identity;
+        if (host_descriptors) host_descriptors[row * host_width + at] = identity;
         if (!marks[row]) counts[row] += 1;
         if (host_tokens) host_tokens[row * host_width + at] = tokens[row * stride];
         if (tokens && !marks[row] && !immune[row]) {
@@ -101,6 +110,8 @@ class RunAsk(NamedTuple):
     stream_tokens: bool = False
     # Actual Loop progress selects inputs across queued, possibly short runs.
     loop: LoopLayout | None = None
+    # Declared membership owner shared by the bounded pair of captures.
+    membership: RunRows | None = None
 
 
 class IterationWindow(NamedTuple):
@@ -120,37 +131,50 @@ class TokenStream:
     ``landed``, and the host sends what has landed while it waits. What it
     sent, by request, the landing skips."""
 
-    def __init__(self, rows: int, limit: int, device: torch.device):
+    def __init__(self, rows: int, limit: int, device: torch.device, *, membership: bool = False):
         pinned = device.type != "cpu"
         self.tokens = torch.zeros(rows, limit, dtype=torch.long, pin_memory=pinned)
         self.landed = torch.zeros(1, dtype=torch.int32, pin_memory=pinned)
+        self.identities = torch.zeros_like(self.tokens, pin_memory=pinned) if membership else None
         # what ``landed`` takes after each replay of a host loop
         self.counts = torch.arange(1, limit + 1, dtype=torch.int32, device=device)
         self.rids: Sequence[int] = ()
         self.sent: dict[int, int] = {}
         self.done: set[int] = set()
         self.columns = 0
+        self.ordinals: dict[int, int] = {}
 
     def begin(self, rids: Sequence[int]) -> None:
         """Before a run, on the host."""
         self.landed.zero_()
         self.rids, self.sent, self.done, self.columns = rids, {}, set(), 0
+        self.ordinals = {}
 
     def take(self, decide: Callable[[int, int, int], tuple[bool, bool]]) -> tuple[list[int], list[int]]:
         """What landed since the last call, as rows and tokens in order.
-        ``decide(rid, column, token)`` says whether the token goes and whether
-        it is the row's last: nothing of the row goes after that."""
+        ``decide(identity, ordinal, token)`` says whether the token goes and
+        whether it is the row's last. Ordinary identities are rids; membership
+        streams use immutable descriptors and local executed ordinals. A pair's
+        consumer combines the two streams' local ordinals before applying stops.
+        """
         landed = int(self.landed[0])
         rids: list[int] = []
         values: list[int] = []
         if landed == self.columns:
             return rids, values
-        rows = self.tokens[:len(self.rids), self.columns:landed].tolist()
+        count = len(self.rids) if self.identities is None else self.tokens.shape[0]
+        rows = self.tokens[:count, self.columns:landed].tolist()
+        identities = None if self.identities is None else self.identities[:, self.columns:landed].tolist()
         for offset in range(landed - self.columns):
-            for rid, row in zip(self.rids, rows, strict=True):
-                if rid in self.done:
+            for index, row in enumerate(rows):
+                rid = self.rids[index] if identities is None else identities[index][offset]
+                if (identities is not None and rid == 0) or rid in self.done:
                     continue
-                send, last = decide(rid, self.columns + offset, row[offset])
+                ordinal = self.columns + offset
+                if identities is not None:
+                    ordinal = self.ordinals.get(rid, 0)
+                    self.ordinals[rid] = ordinal + 1
+                send, last = decide(rid, ordinal, row[offset])
                 if send:
                     rids.append(rid)
                     values.append(row[offset])
@@ -169,12 +193,20 @@ class RunState:
     def __init__(
         self, bs: int, token_signal: str | None, stop_ids: Collection[int], device: torch.device,
         dropping: Any = None, stream: TokenStream | None = None,
+        *, membership: RunRows | None = None, width: int = 1,
     ):
         self.token_signal = token_signal
         # where its tokens land as it goes, for a walk that streams them
         self.stream = stream
         # a capture that also sends a stopped row's reads and writes to the trash slot
         self.dropping = dropping
+        if membership is not None and (dropping is None or membership.binding_width != 2
+                                       or membership.device != device or not 0 < bs <= membership.rows or width < 1):
+            raise ValueError("run membership needs resident rows and (slot, stop-immunity) bindings")
+        self.membership = membership
+        self.identities = torch.zeros(bs, dtype=torch.long, device=device) if membership is not None else None
+        self.bindings = torch.zeros((bs, 2), dtype=torch.long, device=device) if membership is not None else None
+        self.descriptors = torch.zeros((bs, width), dtype=torch.long, device=device) if membership is not None else None
         self.index = torch.zeros(1, dtype=torch.long, device=device)
         self.limit = torch.ones(1, dtype=torch.long, device=device)
         # the marks a run ends at, ``refill_at`` of its rows; 0 is off
@@ -203,6 +235,8 @@ class RunState:
         self.generation.fill_(self._generation)
         self.index.zero_()
         self.counts.zero_()
+        if self.descriptors is not None:
+            self.descriptors.zero_()
         self.started.zero_()
         key = (real, tuple(immune), limit, refill_at)
         if key != self._staged:
@@ -217,6 +251,19 @@ class RunState:
         """End every launch already staged on this state; later stages are
         independent. The host generation increment is the cutoff boundary."""
         self.yield_until[0] = self._generation
+
+    def acquire_rows(self) -> None:
+        """Snapshot membership once, before any owner reads this iteration."""
+        if self.membership is not None:
+            self.membership.boundary(self.identities, self.bindings)
+            self.dropping.rows.copy_(self.bindings[:, 0])
+            self.immune.copy_(self.bindings[:, 1])
+            torch.eq(self.identities, 0, out=self.marks)
+
+    def retire_rows(self) -> None:
+        """The stop/output identity belongs to the snapshot taken at entry."""
+        if self.membership is not None:
+            self.membership.stop(self.identities, self.marks)
 
     def head(self) -> None:
         """Before a replay's forward: a stopped row reads and writes the trash slot."""
@@ -316,6 +363,11 @@ class CudaWhile:
             ctypes.c_void_p(state.stream.landed.data_ptr() if state.stream else None),
             ctypes.c_int(state.stream.tokens.shape[1] if state.stream else 0),
             ctypes.c_void_p(state.counts.data_ptr()),
+            ctypes.c_void_p(state.identities.data_ptr() if state.identities is not None else None),
+            ctypes.c_void_p(state.descriptors.data_ptr() if state.descriptors is not None else None),
+            ctypes.c_int(state.descriptors.shape[1] if state.descriptors is not None else 0),
+            ctypes.c_void_p(state.stream.identities.data_ptr()
+                            if state.stream is not None and state.stream.identities is not None else None),
         ]
         args = (ctypes.c_void_p * len(values))(*(ctypes.cast(ctypes.byref(v), ctypes.c_void_p) for v in values))
         self._driver_call(
@@ -445,6 +497,8 @@ class DeviceRun:
             column[:, :repeats] = column.index_select(1, ran)
         stops = {name: column[:, :repeats] for name, column in self.stops.items()}
         stops.update(self.execution_counts())
+        if state.descriptors is not None:
+            stops[RUN_DESCRIPTORS] = state.descriptors[:, :repeats]
         return (
             stops, {name: column[:, :repeats] for name, column in self.rows.items()},
             {name: column[:, :repeats] for name, column in self.spans.items()},

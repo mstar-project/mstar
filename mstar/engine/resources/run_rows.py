@@ -204,18 +204,18 @@ class RunRows(Resource):
 
     def boundary(self, ids: torch.Tensor, bindings: torch.Tensor) -> None:
         """Snapshot one membership generation for all members of this iteration."""
-        if (ids.shape != (self.rows,) or bindings.shape != (self.rows, self.binding_width)
+        if (ids.ndim != 1 or not 0 < len(ids) <= self.rows or bindings.shape != (len(ids), self.binding_width)
                 or ids.dtype != torch.long or bindings.dtype != torch.long
                 or ids.device != self.device or bindings.device != self.device
                 or not ids.is_contiguous() or not bindings.is_contiguous()):
             raise ValueError("run boundary buffers do not match its membership layout")
         if self.device.type == "cuda":
-            _boundary[(self.rows,)](
+            _boundary[(len(ids),)](
                 self.control, self.bindings, self.copied, ids, bindings,
                 self.capacity, self.binding_width, num_warps=1,
             )
             return
-        for row, word in enumerate(self.control.tolist()):
+        for row, word in enumerate(self.control[:len(ids)].tolist()):
             handle, phase = word >> 2, word & 3
             if handle and phase == _OFFERED:
                 self.control[row] = (handle << 2) | _ACTIVE
@@ -232,13 +232,13 @@ class RunRows(Resource):
                 bindings[row].zero_()
 
     def stop(self, ids: torch.Tensor, stops: torch.Tensor) -> None:
-        if (ids.shape != (self.rows,) or stops.shape != (self.rows,)
+        if (ids.ndim != 1 or not 0 < len(ids) <= self.rows or stops.shape != ids.shape
                 or ids.dtype != torch.long or stops.dtype != torch.bool
                 or ids.device != self.device or stops.device != self.device
                 or not ids.is_contiguous() or not stops.is_contiguous()):
             raise ValueError("run stop buffers do not match its membership layout")
         if self.device.type == "cuda":
-            _stop[(self.rows,)](self.control, ids, stops, num_warps=1)
+            _stop[(len(ids),)](self.control, ids, stops, num_warps=1)
         else:
             for row, (handle, stop) in enumerate(zip(ids.tolist(), stops.tolist(), strict=True)):
                 if handle and stop:
