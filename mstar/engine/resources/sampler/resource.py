@@ -377,6 +377,19 @@ class SamplerResource(Resource):
             raise ValueError("needs captured sampler state updates")
         if not self._logprob_rids.isdisjoint(ctx.request_ids) or self._kept_rids_of(step, ctx) is not None:
             raise ValueError("new rows cannot require logprobs or discard a sampled draw")
+        lease = ctx.slot_lease
+        index = None if self._cells is None or lease is None else self._cells._index.get((lease.bucket, lease.slot))
+        flags = step.apply_filters, self._track_seen_tokens and step.apply_penalty
+        if index is None or index.flags != flags or index.dropped:
+            raise ValueError("new sampler rows need matching captured flags and an all-kept draw mask")
+        with self._rows._lock:
+            for rid in ctx.request_ids:
+                slot = self._rows.slot_of(rid)
+                if not slot or slot in self._rows._pending_reset:
+                    raise ValueError("new sampler row still needs its ordinary state initialization")
+                if (self._track_seen_tokens and self._sampler._sampling_config[rid].penalize_prompt
+                        and (rid in step.prefill_tracked_tokens or self._cached_prefix.get(rid))):
+                    raise ValueError("new sampler row still needs prompt-penalty initialization")
 
     def resident_binding(self) -> ResidentBinding:
         return ResidentBinding(
@@ -467,6 +480,11 @@ class SamplerResource(Resource):
     def plan(self, step: SamplerStep, ctx: StepContext):
         laps = PhaseLaps(f"{ctx.plan_phase}.sampler.")
         self._set_step_flags(step, ctx)
+        if ctx.capture and self._cells is not None and ctx.slot_lease is not None:
+            lease = ctx.slot_lease
+            self._cells.index_row(lease.bucket, lease.slot).flags = (
+                step.apply_filters, self._track_seen_tokens and step.apply_penalty,
+            )
         if not ctx.is_preplan:
             self._kept_rids = self._kept_rids_of(step, ctx)
             self._sampled_this_step = False

@@ -105,6 +105,8 @@ class _IndexRow:
     host: np.ndarray
     mirror: H2DMirror = field(default_factory=H2DMirror)
     dropped: bool = False
+    # Python specialization of the forward recorded for this capture.
+    flags: tuple[bool, bool] | None = None
 
 
 class SamplerCells:

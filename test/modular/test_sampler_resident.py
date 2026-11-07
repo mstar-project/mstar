@@ -401,7 +401,8 @@ def test_each_replay_reads_sampler_identity_and_contents_from_resident_cells(dra
     # Initialize a new owner row without changing this captured batch's plan.
     # Every later replay must gather its RNG/history identity from the binding.
     joining = SubmoduleStep({"sampler": SamplerStep()}, segments=[Segment(3, "main", 1)])
-    joining.set_ctx(StepContext((3,), WALK, 0, False, resident=node.planner, repeats=4))
+    joining.set_ctx(StepContext((3,), WALK, 0, False, resident=node.planner, repeats=4,
+                               slot_lease=SlotLease(0, BucketKey(WALK, 3, 3))))
     assert StepRunner({"sampler": node.sampler}).admit_rows(joining).ok
     snapshot = node.planner.prepare_rows(joining, joining.ctx)
     node.planner.flush(snapshot)
@@ -609,3 +610,32 @@ def test_a_loop_back_free_sampler_drawing_fifteen_times_a_replay_may_repeat(draw
     offsets = [row[0][4] for row in drawn]
     assert offsets == [i * STRIDE for i in range(60)]
     assert _offset(node, 1) == 60 * STRIDE
+
+
+@pytest.mark.parametrize("unsafe", ["reset", "prompt", "cached_prefix", "filters", "dropped_draw"])
+def test_joining_sampler_requires_initialized_owner_and_matching_capture(unsafe, monkeypatch, drawn):
+    monkeypatch.setenv("MSTAR_SAMPLER_INGRAPH_SCATTER", "1")
+    node = _Node(max_bs=2, with_kv=False)
+    node.ingest(1, _cfg(11))
+    node.decode([1], bs=2)
+    node.ingest(2, _cfg(12))
+    sampler = node.sampler
+    lease = SlotLease(0, BucketKey(WALK, 2, 2))
+    ctx = StepContext((2,), WALK, 0, False, slot_lease=lease, resident=node.planner, repeats=4)
+    step = SamplerStep()
+    if unsafe != "reset":
+        sampler._rows.sync()
+    if unsafe == "prompt":
+        step = SamplerStep(prefill_tracked_tokens={2: torch.tensor([3])})
+    elif unsafe == "cached_prefix":
+        sampler._cached_prefix[2] = {0: torch.tensor([3])}
+    elif unsafe == "filters":
+        step = SamplerStep(apply_filters=False)
+    elif unsafe == "dropped_draw":
+        sampler._cells.stage_keep(lease.bucket, lease.slot, (1,), frozenset())
+    with pytest.raises(ValueError):
+        sampler.resident_binding().check_horizon(step, ctx)
+    sampler._rows.sync()
+    sampler._cached_prefix.clear()
+    sampler._cells.stage_keep(lease.bucket, lease.slot, (1,), None)
+    sampler.resident_binding().check_horizon(SamplerStep(), ctx)
