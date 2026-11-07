@@ -13,7 +13,7 @@ sys.path.insert(0, ".")
 import pytest
 
 from mstar.distributed.base import ShardingConfig
-from mstar.graph.base import GraphEdge, GraphNode, Loop, Sequential
+from mstar.graph.base import GraphEdge, GraphNode, Loop, Parallel, Sequential
 from mstar.model.base import WorkerGraph
 from mstar.utils.containers import ParallelList
 
@@ -682,6 +682,10 @@ def _two_node_runtime(a_outputs=(), b_outputs=(), communicator=None, loop=False)
             name="steps", section=section, max_iters=2,
             outputs=[GraphEdge(name="x", next_node=EMIT_TO_CLIENT, output_modality="text")],
         )])
+    return _unit_runtime(section, {"steps"} if loop else set(), communicator)
+
+
+def _unit_runtime(section, loops=(), communicator=None):
     wg = WorkerGraph(
         section=section,
         graph_walks={WALK}, ranks=[0], worker_graph_id=WG_ID,
@@ -690,9 +694,9 @@ def _two_node_runtime(a_outputs=(), b_outputs=(), communicator=None, loop=False)
     runtime = rust_runtime.RustGraphRuntime(
         my_worker_id=WORKER, my_worker_graphs=[wg],
         all_wg_ids_to_graph_walks={WG_ID: {WALK}},
-        all_wg_ids_to_dyn_loops={WG_ID: {"steps"} if loop else set()},
-        all_wg_ids_to_nodes={WG_ID: {"a", "b"}},
-        node_to_partition={"a": "default", "b": "default"},
+        all_wg_ids_to_dyn_loops={WG_ID: set(loops)},
+        all_wg_ids_to_nodes={WG_ID: set(section.get_nodes())},
+        node_to_partition={node: "default" for node in section.get_nodes()},
         sharding_config=ShardingConfig(
             groups=[], tp_enabled_nodes=set(), shard_dim={},
         ),
@@ -726,6 +730,36 @@ def test_unit_claim_preserves_common_rows_and_refusal_returns_readiness_once():
     # Refused admission never consumed the original inputs.
     retry = rt.pop_rids("a", WALK, [b, a], check_ready=True)
     assert retry.input_edges.edge_tuples() == [(b, "in", [], False), (a, "in", [], False)]
+
+
+@pytest.mark.parametrize("head", ["a", "b"])
+def test_connected_join_claims_independent_roots_and_restores_each_on_refusal(head):
+    rt = _unit_runtime(Sequential(sections=[
+        Parallel(sections=[
+            GraphNode(name=name, input_names={"seed"}, outputs=[GraphEdge(name=name, next_node="join")])
+            for name in ("a", "b")
+        ]),
+        GraphNode(name="join", input_names={"a", "b"}, outputs=[]),
+    ]))
+    rid = _admit(rt)
+    rt.ingest_inputs_batch(_ingest_block([rid], [_spec("seed", head)]))
+    assert rt.claim_execution_unit(head, WALK, [rid]) is None
+    other = "b" if head == "a" else "a"
+    rt.ingest_inputs_batch(_ingest_block([rid], [_spec("seed", other)]))
+    units = {unit.nodes[0]: unit for unit in rt.execution_units(WALK)}
+    assert units[head].nodes == (head, other, "join")
+    rt.pop_rids(head, WALK, [rid], check_ready=True)
+    claim, members = rt.claim_execution_unit(head, WALK, [rid])
+    assert len(members) == 3 and rt.get_ready_nodes(set()) == []
+    assert rt.cancel_execution_unit(claim)
+    assert not rt.cancel_execution_unit(claim)
+    assert {spec.node_name for spec in rt.get_ready_nodes(set())} == {"a", "b"}
+    claim, _ = rt.claim_execution_unit(head, WALK, [rid])
+    rt.submit_execution_unit(claim)
+    for name in (head, other, "join"):
+        _route(rt, [rid], name, [], [[]])
+        assert rt.get_ready_nodes(set()) == []
+    assert not rt.cancel_execution_unit(claim)
 
 
 @pytest.mark.parametrize("submitted", [False, True])

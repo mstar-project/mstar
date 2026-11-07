@@ -180,37 +180,68 @@ impl ExecutionUnit {
             }
             false
         };
+        let forward: Vec<Vec<NodeId>> = nodes.iter().enumerate().map(|(source, node)| {
+            let mut targets: Vec<_> = node.outputs.iter().filter_map(|edge| match edge.dest {
+                Dest::Local(next) if !edge.streaming && !is_loopback(source as NodeId, edge)
+                    && node.streaming_mask == 0 && nodes[next as usize].streaming_mask == 0 => Some(next),
+                _ => None,
+            }).collect();
+            targets.sort_unstable();
+            targets.dedup();
+            targets
+        }).collect();
         let mut units = FxHashMap::default();
         for head in 0..nodes.len() as NodeId {
-            let mut members = Vec::new();
-            let mut current = head;
+            // An already scheduled head must stay first. Its predecessors
+            // supply ordinary external inputs, while independent branches
+            // feeding its downstream joins can be claimed alongside it.
+            let mut ancestors = vec![false; nodes.len()];
             loop {
-                let node = &nodes[current as usize];
-                // Forward dependencies define the order inside a Loop too.
-                // A declared back edge belongs to the next iteration.
-                if node.streaming_mask != 0 || members.contains(&current) {
-                    break;
+                let mut changed = false;
+                for (source, targets) in forward.iter().enumerate() {
+                    if !ancestors[source] && targets.iter().any(|&dest| dest == head || ancestors[dest as usize]) {
+                        ancestors[source] = true;
+                        changed = true;
+                    }
                 }
-                members.push(current);
-                let mut targets: Vec<_> = node.outputs.iter().filter_map(|edge| match edge.dest {
-                    Dest::Local(next) if !edge.streaming && !is_loopback(current, edge) => Some(next),
-                    _ => None,
-                }).collect();
-                targets.sort_unstable();
-                targets.dedup();
-                if targets.len() != 1 {
-                    break;
-                }
-                current = targets[0];
+                if !changed { break; }
             }
-            if members.len() < 2 {
+            if ancestors[head as usize] || nodes[head as usize].streaming_mask != 0 {
                 continue;
             }
-            // An undeclared cycle remains a boundary.
-            if members.iter().enumerate().any(|(i, &source)| nodes[source as usize].outputs.iter().any(|e| {
-                matches!(e.dest, Dest::Local(dest) if members[..=i].contains(&dest))
-                    && !is_loopback(source, e)
-            })) {
+            let mut included = vec![false; nodes.len()];
+            included[head as usize] = true;
+            loop {
+                let mut changed = false;
+                for (source, targets) in forward.iter().enumerate() {
+                    if ancestors[source] { continue; }
+                    for &dest in targets {
+                        if ancestors[dest as usize] { continue; }
+                        if included[source] != included[dest as usize] {
+                            included[source] = true;
+                            included[dest as usize] = true;
+                            changed = true;
+                        }
+                    }
+                }
+                if !changed { break; }
+            }
+            let count = included.iter().filter(|&&yes| yes).count();
+            if count < 2 {
+                continue;
+            }
+            let mut members = vec![head];
+            while members.len() < count {
+                let next = (0..nodes.len() as NodeId).find(|&node| {
+                    included[node as usize] && !members.contains(&node)
+                        && forward.iter().enumerate().all(|(source, targets)| {
+                            !included[source] || !targets.contains(&node) || members.contains(&(source as NodeId))
+                        })
+                });
+                let Some(next) = next else { break };
+                members.push(next);
+            }
+            if members.len() != count {
                 continue;
             }
             let mut internal_inputs = vec![0; members.len()];

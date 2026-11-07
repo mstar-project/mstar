@@ -518,9 +518,11 @@ impl RequestState {
             st.unit_claim = None;
         }
         if retry {
-            // The scheduler already popped the head; its inputs stayed here.
-            // Downstream members had missing internal inputs before the claim.
-            self.push_back(unit.nodes[0]);
+            // Every independent root was ready before the claim. Members
+            // with internal inputs still wait for their producers to land.
+            for (&node, &internal) in unit.nodes.iter().zip(&unit.internal_inputs) {
+                if internal == 0 { self.push_back(node); }
+            }
         }
     }
 
