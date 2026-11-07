@@ -95,7 +95,7 @@ def region_gib(image: str, session: Session) -> float:
     lat_h, lat_w = model.geometry((height, width), session.height or cfg.default_height,
                                   session.width or cfg.default_width)
     tokens = sum(rolling_extent(cfg, (lat_h * cfg.vae_stride[1], lat_w * cfg.vae_stride[2])))
-    return round(RequestPoolReqConfig.of(rollout_state_buffers(cfg, tokens)).nbytes() / 2**30, 2)
+    return round(RequestPoolReqConfig.of(rollout_state_buffers(cfg, (lat_h, lat_w), tokens)).nbytes() / 2**30, 2)
 
 
 def rollout(client: MStarClient, image: str, request_id: str, session: Session, t0: float) -> dict:

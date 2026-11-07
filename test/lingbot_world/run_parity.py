@@ -126,11 +126,14 @@ def bind_resources(model, sub, overrides: dict | None = None) -> StepRunner:
 
 def open_request(sub, runner: StepRunner, rid: int, image: torch.Tensor, num_latent_frames: int) -> None:
     """Open ``rid`` as the worker does: ingest the state it declares in the pool (its
-    rolling K/V at the output size, as ``get_request_resource_configs`` returns), then
-    admit it through the engine's queue, which sets that room aside."""
+    rolling K/V, text K/V and encoder cache at the output size, as
+    ``get_request_resource_configs`` returns), then admit it through the engine's
+    queue, which sets that room aside."""
     cfg = sub.config
-    tokens = sum(rolling_extent(cfg, tuple(image.shape[-2:]), num_latent_frames))
-    runner.ingest_request(rid, {DIT_POOL: RequestPoolReqConfig.of(rollout_state_buffers(cfg, tokens))})
+    hw = tuple(image.shape[-2:])
+    tokens = sum(rolling_extent(cfg, hw, num_latent_frames))
+    lat_hw = (hw[0] // cfg.vae_stride[1], hw[1] // cfg.vae_stride[2])
+    runner.ingest_request(rid, {DIT_POOL: RequestPoolReqConfig.of(rollout_state_buffers(cfg, lat_hw, tokens))})
     admitted = runner.admit_retrieve(rid, "dit", ROLLOUT_WALK)
     if not (admitted.outcome.ok and admitted.outcome.ready):
         raise RuntimeError(f"request {rid} was not admitted: {admitted.outcome.reason}")

@@ -16,17 +16,19 @@
     dit          -> LingBotDitSubmodule (one chunk per rollout iteration: the
                     chunk's I2V condition and Plucker rays, the DiT, the decode)
 
-The rolling self-attention K/V and the text K/V (computed once per request)
-live in each request's region of the engine's request pool (``DIT_POOL``),
-declared when the request opens (``rollout_state_buffers``) so it waits in line
-for room. The rolling KV window (``DIT_KV``) keeps the K/V's sink plus latest
-window compacted in their buffer, so a chunk's keys are one contiguous range;
-the attention over them is a ragged cross-attention (``DIT_ATTN``) whose step
-pairs the chunk's queries with that range and with the text. The VAE encoder's
-and decoder's causal-conv caches stay in the request's ``PerRequestState``,
-outside the pool. Nothing in the engine counts them, and at small output sizes
-the pool admits many rollouts, so the model refuses a config that runs more than
-one at a time (``LingBotWorldModel.validate_config_yaml``).
+The rolling self-attention K/V, the text K/V (computed once per request) and
+the VAE encoder's causal-conv cache live in each request's region of the
+engine's request pool (``DIT_POOL``), declared when the request opens
+(``rollout_state_buffers``) so it waits in line for room. The rolling KV window
+(``DIT_KV``) keeps the K/V's sink plus latest window compacted in their buffer,
+so a chunk's keys are one contiguous range; the attention over them is a ragged
+cross-attention (``DIT_ATTN``) whose step pairs the chunk's queries with that
+range and with the text. The encoder writes its cache straight into the pool
+(``wan_vae.PoolFeatCache``, ``wan_vae.encoder_saves_uncopied``). The VAE
+decoder's causal-conv cache stays in the request's ``PerRequestState``, outside
+the pool. Nothing in the engine counts it, and at small output sizes the pool
+admits many rollouts, so the model refuses a config that runs more than one at
+a time (``LingBotWorldModel.validate_config_yaml``).
 
 Numerics are the model's, not the engine's: ``LingBotWorldModel.get_autocast_dtype``
 returns None, the DiT enters the reference's bf16 autocast itself, and the VAE
@@ -69,9 +71,11 @@ ROLLOUT_WALK = "rollout"
 DIT_ATTN = "dit_attn"
 DIT_KV = "dit_kv"
 # the request pool whose regions hold each rollout's state: its rolling K/V (the
-# DIT_KV buffer) and its text K/V
+# DIT_KV buffer), its text K/V, and the VAE encoder's causal-conv cache (its slots,
+# then the one output it keeps once it settles)
 DIT_POOL = "dit_pool"
 TEXT_KV = "text_kv"
+ENCODER_OUT = "enc.out"
 CHUNK_SPAN, WINDOW_SPAN, TEXT_SPAN = "chunk", "window", "text"
 DIT_ATTN_PAIRS = ((CHUNK_SPAN, WINDOW_SPAN), (CHUNK_SPAN, TEXT_SPAN))
 
@@ -116,13 +120,65 @@ def rolling_config(cfg: LingBotWorldConfig) -> RollingKVConfig:
                            pool=DIT_POOL, dtype=torch.bfloat16)
 
 
-def rollout_state_buffers(cfg: LingBotWorldConfig, kv_tokens: int) -> dict[str, tuple[tuple[int, ...], torch.dtype]]:
-    """What a rollout keeps in the pool between chunks: its rolling K/V (``kv_tokens``
-    a layer) and its text K/V (every block's, keys then values)."""
-    return {
+class CacheSlot(NamedTuple):
+    """One causal conv's cache slot once its stream is past its first call:
+    ``[1, channels, frames, h, w]``, where ``h2`` and ``w2`` are ``h`` and ``w``
+    at a 2x2 latent; every slot scales with the latent's size."""
+
+    channels: int
+    frames: int
+    h2: int
+    w2: int
+
+    def shape(self, lat_h: int, lat_w: int) -> tuple[int, ...]:
+        return (1, self.channels, self.frames, self.h2 * lat_h // 2, self.w2 * lat_w // 2)
+
+
+class EncoderCacheLayout(NamedTuple):
+    slots: tuple[CacheSlot | None, ...]
+    # one encoder call's output, which the stream keeps once its cache settles
+    out: CacheSlot
+
+
+@functools.cache
+def encoder_cache_layout() -> EncoderCacheLayout:
+    """The Wan2.1 VAE encoder's cache slots, found by running the stock-config VAE
+    (the checkpoint's config is the class default) on the meta device at a 2x2
+    latent: no weights and no memory, so the conductor can size a rollout's state
+    before any worker has the VAE. A slot no call fills is None."""
+    from diffusers import AutoencoderKLWan
+
+    with torch.device("meta"):
+        vae = AutoencoderKLWan()
+    with torch.inference_mode():
+        stream = EncoderStream(vae)
+        vae.encoder(torch.empty(1, 3, 1, 16, 16, device="meta"), feat_cache=stream.cache, feat_idx=[0])
+        out = vae.encoder(torch.empty(1, 3, 4, 16, 16, device="meta"), feat_cache=stream.cache, feat_idx=[0])
+    return EncoderCacheLayout(tuple(CacheSlot(*t.shape[1:]) if torch.is_tensor(t) else None for t in stream.cache),
+                              CacheSlot(*out.shape[1:]))
+
+
+def encoder_slot_name(i: int) -> str:
+    return f"enc.{i}"
+
+
+def rollout_state_buffers(
+    cfg: LingBotWorldConfig, lat_hw: tuple[int, int], kv_tokens: int,
+) -> dict[str, tuple[tuple[int, ...], torch.dtype]]:
+    """What a rollout at a ``lat_hw`` latent keeps in the pool between chunks: its
+    rolling K/V (``kv_tokens`` a layer), its text K/V (every block's, keys then
+    values), and each slot of its VAE encoder's cache plus the output it keeps
+    once settled, in fp32 as the encode runs."""
+    buffers = {
         DIT_KV: rolling_config(cfg).buffer(kv_tokens),
         TEXT_KV: ((cfg.num_layers, 2, 1, cfg.text_len, cfg.num_heads, cfg.head_dim), torch.bfloat16),
     }
+    layout = encoder_cache_layout()
+    for i, slot in enumerate(layout.slots):
+        if slot is not None:
+            buffers[encoder_slot_name(i)] = (slot.shape(*lat_hw), torch.float32)
+    buffers[ENCODER_OUT] = (layout.out.shape(*lat_hw), torch.float32)
+    return buffers
 
 
 def first_frame_mask(num_latent_frames: int, lat_h: int, lat_w: int, device) -> torch.Tensor:
@@ -151,15 +207,30 @@ class EncoderStream:
         self.cache: list | None = [None] * num_convs
         self.steady: torch.Tensor | None = None
 
+    @classmethod
+    def over(cls, cache: list | None, steady: torch.Tensor | None) -> "EncoderStream":
+        """A stream continuing from a kept cache (or, once settled, a kept output)."""
+        stream = cls.__new__(cls)
+        stream.cache, stream.steady = cache, steady
+        return stream
+
     def encode_black(self, vae: nn.Module, x: torch.Tensor) -> torch.Tensor:
         """One encoder call on black frames. When a call leaves every cache
         slot equal to what it held before, the next call sees the same input
         and the same cache, so it, and every call after it, returns this
-        call's output; the cache is dropped from then on. The encoder replaces
-        its slots rather than writing into them; a slot it wrote in place
-        never counts as unchanged."""
+        call's output; the cache is dropped from then on. A ``PoolFeatCache``
+        compares each slot as it is overwritten, on the device, and the answer
+        is read once a call (``PoolFeatCache.watch``); with a plain list the
+        encoder replaces its slots, and they are compared after the call (a
+        slot written in place never counts as unchanged)."""
         if self.steady is not None:
             return self.steady
+        if isinstance(self.cache, wan_vae.PoolFeatCache):
+            self.cache.watch()
+            out = vae.encoder(x, feat_cache=self.cache, feat_idx=[0])
+            if self.cache.unchanged():
+                self.steady, self.cache = out, None
+            return out
         before = list(self.cache)
         out = vae.encoder(x, feat_cache=self.cache, feat_idx=[0])
         if all(_same_slot(a, b) for a, b in zip(before, self.cache, strict=True)):
@@ -251,6 +322,9 @@ class LingBotDitSubmodule(_SingleRequestMixin, NodeSubmodule):
         self.schedule = make_fast_schedule(config.sample_shift, config.timesteps_index, config.num_train_timesteps)
         fast = not config.reference_numerics
         self._decode_dtype = torch.float32
+        if encoder_vae is not None:
+            # each call saves its cache straight into the request's pool region (same math)
+            wan_vae.encoder_saves_uncopied(encoder_vae)
         if encoder_vae is not None and fast:
             wan_vae.encoder_to_channels_last(encoder_vae)
         if vae is not None and fast:
@@ -401,7 +475,9 @@ class LingBotDitSubmodule(_SingleRequestMixin, NodeSubmodule):
             frame_seqlen=frame_seqlen,
             generator=generator,
             noise=noise,
-            encoder_stream=EncoderStream(self.encoder_vae) if self.encoder_vae is not None else None,
+            # the encode stream (its cache, slots in the pool) and where in the pool its views were taken
+            encoder_stream=None,
+            encoder_stream_at=None,
             feat_cache=wan_vae.new_feat_cache(self.vae) if self.vae is not None else None,
         )
 
@@ -424,7 +500,9 @@ class LingBotDitSubmodule(_SingleRequestMixin, NodeSubmodule):
         cs = cfg.chunk_size
         frames = slice(chunk * cs, (chunk + 1) * cs)
         latent = state["noise"][:, frames]
-        y = encode_condition_chunk(self.encoder_vae, image, state["encoder_stream"], chunk * cs, cs, cfg)
+        stream = self._encoder_stream(state)
+        y = encode_condition_chunk(self.encoder_vae, image, stream, chunk * cs, cs, cfg)
+        self._keep_settled_output(state, stream)
         _, height, width = image.shape
         plucker = plucker_embedding(
             camera_poses[frames].float().to(device), intrinsics.float(), height, width,
@@ -513,6 +591,44 @@ class LingBotDitSubmodule(_SingleRequestMixin, NodeSubmodule):
         # the de-normalize in fp32 whatever the decode's dtype
         z = (latents[None].float() / self._latents_inv_std + self._latents_mean).to(self._decode_dtype)
         return self._decoder.decode_stream(z, state["feat_cache"], clip_start=clip_start)
+
+    def _encoder_stream(self, state) -> EncoderStream:
+        """The rollout's encode stream, its cache's slots views of the request's pool
+        buffers. Kept between chunks, and taken again when the pool has moved the
+        region (a rearrange copies it elsewhere, so the old views no longer point at it)."""
+        pool = self.state_pool()
+        slots = encoder_cache_layout().slots
+        stream = state["encoder_stream"]
+        with torch.inference_mode():
+            anchor = pool.view(ENCODER_OUT)
+            if stream is not None and state["encoder_stream_at"] == anchor.data_ptr():
+                return stream
+            if stream is not None and stream.cache is None:
+                # settled: the output it keeps, at the start of its buffer
+                stream = EncoderStream.over(None, anchor.as_strided(stream.steady.shape, stream.steady.stride()))
+            else:
+                buffers = [None if slot is None else pool.view(encoder_slot_name(i)) for i, slot in enumerate(slots)]
+                old = stream.cache if stream is not None else [None] * len(slots)
+                # a filled slot sits at the start of its buffer (PoolFeatCache)
+                items = [b.as_strided(t.shape, t.stride()) if torch.is_tensor(t) else t
+                         for b, t in zip(buffers, old, strict=True)]
+                stream = EncoderStream.over(wan_vae.PoolFeatCache(items, buffers), None)
+        state.add_all(encoder_stream=stream, encoder_stream_at=anchor.data_ptr())
+        return stream
+
+    def _keep_settled_output(self, state, stream: EncoderStream) -> None:
+        """Once the stream settles, keep the output it returns from then on in the
+        pool, where the cache was: copied there once."""
+        steady = stream.steady
+        if steady is None:
+            return
+        with torch.inference_mode():
+            buf = self.state_pool().view(ENCODER_OUT)
+            if steady.data_ptr() == buf.data_ptr():
+                return
+            kept = buf.as_strided(steady.shape, wan_vae._compact_strides(steady))
+            kept.copy_(steady)
+        state.add("encoder_stream", EncoderStream.over(None, kept))
 
     def check_stop(self, request_id, request_info: CurrentForwardPassInfo, outputs) -> set[str]:
         done = request_info.dynamic_loop_iter_counts.get(ROLLOUT_LOOP_NAME, 0)

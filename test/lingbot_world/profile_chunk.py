@@ -86,7 +86,8 @@ def instrument(sub, runner) -> list[str]:
         if hasattr(subm, name):
             setattr(subm, name, wrapped(name, getattr(subm, name)))
             done.append(name)
-    for name in ("_decode", "_encoder_stream", "_keep_encoder_stream", "_seed_request"):
+    for name in ("_decode", "_decoder_cache", "_encoder_stream", "_keep_encoder_stream", "_keep_settled_output",
+                 "_seed_request"):
         if hasattr(sub, name):
             setattr(sub, name, wrapped(name, getattr(sub, name)))
             done.append(name)

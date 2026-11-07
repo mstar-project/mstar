@@ -122,7 +122,7 @@ def main():
 
     cfg.local_attn_size = -1
     # keeping every frame takes more than the windowed bound: a pool for this one rollout
-    state = submodules.rollout_state_buffers(cfg, lat_f * frame_seqlen)
+    state = submodules.rollout_state_buffers(cfg, (lat_h, lat_w), lat_f * frame_seqlen)
     full = bind_resources(model, sub, {submodules.DIT_POOL: {"pool_bytes": RequestPoolReqConfig.of(state).nbytes()}})
     lat_full, _, _, _ = timed_rollout(sub, full, text, image, cond, poses, intr, md, rid=13)
     cfg.local_attn_size = 18

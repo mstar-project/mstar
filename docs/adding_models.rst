@@ -1171,8 +1171,9 @@ copies.
 
 A step declares the pool with a ``RequestPoolStep`` naming its rows. The model reaches a
 row's buffer with ``view(name, row)``, a tensor into the pool that is good for that step
-only: a rearrange moves regions, so a view is asked for again each step and never kept in
-per-request state. A resource that needs rules over a buffer depends on the pool (its
+only: a rearrange moves regions. A model that keeps views between steps, to save taking
+them again, checks each step that the region has not moved (a fresh view's address) and
+takes them again when it has. A resource that needs rules over a buffer depends on the pool (its
 spec's ``depends_on``) and reads the request's buffer directly in its own ``plan`` with
 ``buffer(rid, name)``, not through the pool's plan: a region can hold many buffers and the
 resource needs one. Rolling K/V (below) is one. How many requests run at once is then the pool's to decide, as long as
@@ -1181,9 +1182,10 @@ eager (no capture yet), and the pool does not shard across ranks yet. A model wh
 runs in inference mode declares ``RequestPoolConfig(inference_tensors=True)``: the pool is
 allocated, viewed and written in inference mode (writes go through ``writing()``), so its
 views are inference tensors and pass to the model's compiled graphs as they are, since
-those guard on their inputs' dispatch keys. LingBot-World keeps each rollout's rolling K/V
-and text K/V in one (``DIT_POOL``); its VAE caches are still the model's, so it requires
-``max_concurrent_requests: 1``.
+those guard on their inputs' dispatch keys. LingBot-World keeps each rollout's rolling K/V,
+text K/V and VAE encoder cache in one (``DIT_POOL``); the encoder writes its cache straight
+into it (``wan_vae.PoolFeatCache`` with ``wan_vae.encoder_saves_uncopied``). Its VAE decoder
+cache is still the model's, so it requires ``max_concurrent_requests: 1``.
 
 Rolling (compacted) caches
 ^^^^^^^^^^^^^^^^^^^^^^^^^^

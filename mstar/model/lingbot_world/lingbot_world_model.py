@@ -108,9 +108,9 @@ class LingBotWorldModel(Model):
     # ------------------------------------------------------------------
 
     def get_node_resources(self) -> list[NodeResourceSpec]:
-        """The request pool that holds each rollout's rolling K/V and text K/V, the
-        rolling K/V window over the former, and the ragged attention over both unless
-        ``reference_numerics`` attends with the reference's FA2 instead."""
+        """The request pool that holds each rollout's rolling K/V, text K/V and encoder
+        cache, the rolling K/V window over the first, and the ragged attention over the
+        K/V unless ``reference_numerics`` attends with the reference's FA2 instead."""
         cfg = self.config
         specs: list[NodeResourceSpec] = [
             # inference tensors: the dit's forward runs in inference mode, and its compiled
@@ -138,28 +138,38 @@ class LingBotWorldModel(Model):
         frames = cfg.local_attn_size if cfg.local_attn_size > -1 else cfg.max_chunks * cfg.chunk_size
         return frames * (cfg.max_area // cell)
 
+    def largest_latent(self) -> tuple[int, int]:
+        """A latent with the most pixels any output aspect has at the area limit
+        (90 x 160 = 14400), as square as the VAE allows: the VAE caches scale with
+        the latent's pixels, whatever its aspect."""
+        cfg = self.config
+        side = cfg.max_area // (cfg.vae_stride[1] * cfg.vae_stride[2])
+        lat_w = 2 * int(np.sqrt(side / 4))
+        return (side // lat_w) // 2 * 2, lat_w
+
     def default_pool_bytes(self) -> int:
-        """Room for one rollout at the largest area (``max_window_tokens``), or
-        several smaller ones."""
-        return RequestPoolReqConfig.of(rollout_state_buffers(self.config, self.max_window_tokens())).nbytes()
+        """Room for one rollout at the largest area: its K/V at the most tokens any
+        aspect keeps, its caches at the most latent pixels any aspect has."""
+        buffers = rollout_state_buffers(self.config, self.largest_latent(), self.max_window_tokens())
+        return RequestPoolReqConfig.of(buffers).nbytes()
 
     def validate_config_yaml(self, config: dict, config_path: str) -> None:
         """Refuse to serve more than one rollout at a time.
 
-        The pool bounds each rollout's rolling K/V and text K/V, not how many
-        rollouts run: at small output sizes it admits many. Each one's VAE caches
-        are allocated by the dit outside the engine's resources, so until they are
-        resources, the conductor's admit queue, which exists only when
-        ``max_concurrent_requests`` is set, has to hold them to one rollout.
+        The pool bounds each rollout's K/V and encoder cache, not how many
+        rollouts run: at small output sizes it admits many. Each one's VAE decoder
+        cache is allocated by the dit outside the engine's resources, so until it
+        is a resource, the conductor's admit queue, which exists only when
+        ``max_concurrent_requests`` is set, has to hold it to one rollout.
         """
         limit = config.get("max_concurrent_requests")
         if type(limit) is int and limit == 1:
             return
         raise ValueError(
             f"LingBot-World requires `max_concurrent_requests: 1` in {config_path}; got {limit!r}. "
-            "The request pool bounds each rollout's K/V, not how many run, and each rollout's VAE "
-            "caches are allocated by the dit outside the engine's resources, so the admit queue "
-            "that this key enables is the only bound on them."
+            "The request pool bounds each rollout's K/V and encoder cache, not how many run, and each "
+            "rollout's VAE decoder cache is allocated by the dit outside the engine's resources, so the "
+            "admit queue that this key enables is the only bound on it."
         )
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
@@ -364,6 +374,7 @@ class LingBotWorldModel(Model):
             kwargs={
                 "walk_step": 0, "num_latent_frames": lat_f,
                 "dit_kv_tokens": sum(rolling_extent(self.config, (int(height), int(width)), lat_f)),
+                "dit_lat_hw": [int(height) // self.config.vae_stride[1], int(width) // self.config.vae_stride[2]],
             },
         )
         inputs = self._walk_inputs(_SCHEDULE[0], input_signals)
@@ -381,9 +392,11 @@ class LingBotWorldModel(Model):
         engine's queue for room, and a size the pool can never hold is a 400."""
         del model_kwargs
         for fwd in partition_fwd_args.values():
-            tokens = fwd.full_metadata.kwargs.get("dit_kv_tokens")
-            if tokens is not None:
-                return {DIT_POOL: RequestPoolReqConfig.of(rollout_state_buffers(self.config, int(tokens)))}
+            kwargs = fwd.full_metadata.kwargs
+            tokens, lat_hw = kwargs.get("dit_kv_tokens"), kwargs.get("dit_lat_hw")
+            if tokens is not None and lat_hw is not None:
+                buffers = rollout_state_buffers(self.config, tuple(lat_hw), int(tokens))
+                return {DIT_POOL: RequestPoolReqConfig.of(buffers)}
         return {}
 
     def get_partition_forward_pass_args(
