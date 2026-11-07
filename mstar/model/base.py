@@ -627,6 +627,9 @@ class Model(ABC):
     # values to the conductor alongside their tensor descriptors.
     PREPROCESS_ONLY_KWARGS: tuple[str, ...] = ()
 
+    # KV resource and label whose prepared spans count the logical chat prompt.
+    TOKEN_USAGE_LAYOUT: tuple[str, str] | None = None
+
     # Requests sharing this kwarg must reach the same copy of every node,
     # because their session state lives on that replica.
     REPLICA_AFFINITY_KWARG: str | None = None

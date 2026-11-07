@@ -92,13 +92,19 @@ def _build_response(model_name, request_id, chunks, sample_rate) -> dict:
             parts.append({"type": "image_url", "image_url": {"url": media_io.png_to_data_url(img)}})
         message["content"] = parts
 
+    prompt_tokens = next((c.metadata["prompt_tokens"] for c in chunks if "prompt_tokens" in c.metadata), None)
+    completion_tokens = sum(c.metadata.get("completion_tokens", 0) for c in chunks)
+    usage = None if prompt_tokens is None else {
+        "prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
+        "total_tokens": prompt_tokens + completion_tokens,
+    }
     return {
         "id": request_id,
         "object": "chat.completion",
         "created": now(),
         "model": model_name,
         "choices": [{"index": 0, "message": message, "finish_reason": "stop"}],
-        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        "usage": usage,
     }
 
 

@@ -62,7 +62,10 @@ logger = logging.getLogger(__name__)
 
 
 class Glm5NextModel(Model):
+
     """GLM-5.3-Flash: 320B hybrid KDA/MLA MoE causal LM, text in / text out."""
+
+    TOKEN_USAGE_LAYOUT = (KV_CACHE, "main")
 
     # the conductor builds the fused-MoE align op before spawning the workers
     prebuild_fused_moe = True

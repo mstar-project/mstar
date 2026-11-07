@@ -668,7 +668,13 @@ fn build_chat_response(
     let mut text_bytes: Vec<u8> = Vec::new();
     let mut audio_pcm: Vec<u8> = Vec::new();
     let mut images: Vec<Vec<u8>> = Vec::new();
+    let mut prompt_tokens = None;
+    let mut completion_tokens = 0u64;
     for c in &chunks {
+        if prompt_tokens.is_none() {
+            prompt_tokens = c.metadata.get("prompt_tokens").and_then(Value::as_u64);
+        }
+        completion_tokens += c.metadata.get("completion_tokens").and_then(Value::as_u64).unwrap_or(0);
         match c.modality.as_str() {
             "text" => text_bytes.extend_from_slice(&c.data),
             "audio" => audio_pcm.extend_from_slice(&c.data),
@@ -700,13 +706,18 @@ fn build_chat_response(
         message["content"] = Value::Array(parts);
     }
 
+    let usage = prompt_tokens.map(|prompt| json!({
+        "prompt_tokens": prompt,
+        "completion_tokens": completion_tokens,
+        "total_tokens": prompt + completion_tokens,
+    }));
     json!({
         "id": request_id,
         "object": "chat.completion",
         "created": now(),
         "model": model,
         "choices": [{"index": 0, "message": message, "finish_reason": "stop"}],
-        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        "usage": usage,
     })
 }
 
@@ -1852,8 +1863,12 @@ mod tests {
 
     #[test]
     fn chat_response_joins_text_before_decoding() {
-        let resp = build_chat_response("m", "r", split_text_chunks(), 24000);
+        let mut chunks = split_text_chunks();
+        chunks[0].metadata = json!({"prompt_tokens": 17, "completion_tokens": 2});
+        chunks[1].metadata = json!({"completion_tokens": 3});
+        let resp = build_chat_response("m", "r", chunks, 24000);
         assert_eq!(resp["choices"][0]["message"]["content"], "中文 😀");
+        assert_eq!(resp["usage"], json!({"prompt_tokens": 17, "completion_tokens": 5, "total_tokens": 22}));
     }
 
     #[test]

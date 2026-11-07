@@ -291,6 +291,7 @@ def _load_into(
 # ---------------------------------------------------------------------------
 
 class BagelModel(Model):
+
     """
     BAGEL unified multimodal model (ByteDance).
 
@@ -307,6 +308,8 @@ class BagelModel(Model):
     Prefill steps are constructed as a sequential schedule that walks
     through interleaved text and image inputs.
     """
+
+    TOKEN_USAGE_LAYOUT = ("kv", "main")
 
 
     INTERNAL_KWARGS = (CFG_WINDOW, ROLE_TURNS)

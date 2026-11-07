@@ -144,7 +144,10 @@ REASONER_NODE = "reasoner"
 
 
 class Cosmos3Model(Model):
+
     """NVIDIA Cosmos3 generator implementation."""
+
+    TOKEN_USAGE_LAYOUT = (KV_CACHE, REASONER_LABEL)
 
     PREPROCESS_ONLY_KWARGS = ("action", "robot_state")
     REPLICA_AFFINITY_KWARG = "session_id"
