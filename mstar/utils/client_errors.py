@@ -67,6 +67,20 @@ class RequestError:
 
     @classmethod
     def from_exception(cls, exc: BaseException, what: str, *, log=logger, traceback=True):
+        from torch import AcceleratorError
+
+        # Device-runtime faults poison subsequent work. Ordinary OOM is a
+        # separate torch.OutOfMemoryError and remains request-local.
+        fatal = isinstance(exc, AcceleratorError) or (
+            isinstance(exc, RuntimeError) and any(text in str(exc).lower() for text in (
+                "cuda error: an illegal memory access",
+                "cuda error: device-side assert triggered",
+                "cuda error: unspecified launch failure",
+            ))
+        )
+        if fatal:
+            log.error("%s: fatal device error", what, exc_info=exc)
+            raise SystemExit(f"{what}: fatal device error ({exc})") from exc
         message, _ = client_error_text(exc, what, log=log, traceback=traceback)
         status = exc.status_code if isinstance(exc, HTTPException) else (
             400 if isinstance(exc, (ValueError, TypeError)) else 500

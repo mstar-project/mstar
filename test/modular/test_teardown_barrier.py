@@ -149,6 +149,7 @@ def test_second_abort_while_draining_is_ignored():
 
 
 @pytest.mark.parametrize("error,status", [(ValueError("bad request"), 400), (RuntimeError("broken forward"), 500),
+     (torch.OutOfMemoryError("CUDA out of memory"), 500),
      (HTTPException(409, "session is in use"), 409)])
 def test_fail_defers_client_notification_until_barrier_completes(error, status):
     c = _conductor({"r1": _request_data()})

@@ -327,7 +327,16 @@ def _worker_process_target(
         logger.exception("Worker %s failed to initialize: %s", worker_id, str(e))
         raise e
     built.append(worker)
-    _run_worker(worker)
+    try:
+        _run_worker(worker)
+    except SystemExit as exc:
+        if exc.code is None or exc.code == 0:
+            raise
+        # _run_worker has unlinked our owned SHM. A peer may still be in a
+        # collective on a non-daemon executor thread: Python shutdown would
+        # join it forever, hiding this fatal failure from conductor liveness.
+        logger.error("Worker %s stopped: %s", worker_id, exc)
+        os._exit(exc.code if isinstance(exc.code, int) else 1)
 
 
 @dataclass

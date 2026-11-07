@@ -589,3 +589,32 @@ def test_a_stop_while_the_handlers_are_saved_still_unlinks_and_keeps_the_error(m
     finally:
         setsignal(signal.SIGTERM, old[0])
         setsignal(signal.SIGINT, old[1])
+
+
+class _PoisonedWorker(_InFlightWorker):
+    def run(self):
+        from mstar.engine.engine import ExecutingBatch
+
+        # Another rank/step can be stuck forever in a collective. Interpreter
+        # shutdown would join this non-daemon executor thread indefinitely.
+        threading.Thread(target=threading.Event().wait, daemon=False).start()
+        type(self).ready.set()
+        batch = SimpleNamespace(failed_requests={}, node_name="node", graph_walk="walk")
+        ExecutingBatch.register_failure(batch, 0, torch.AcceleratorError("illegal memory access"))
+
+
+def test_poisoned_worker_exits_without_waiting_for_collective_threads(tmp_path):
+    shm_dir, prefix = _dirs(tmp_path)
+    ctx = mp.get_context("spawn")
+    ready = ctx.Event()
+    process = ctx.Process(target=_spawned_worker, args=(shm_dir, prefix, True, ready, _PoisonedWorker))
+    process.start()
+    try:
+        assert ready.wait(30), "worker did not start"
+        process.join(timeout=5)
+        assert process.exitcode == 1, "fatal device error left the worker alive or looking healthy"
+        assert _namespace_files(shm_dir, prefix) == []
+    finally:
+        if process.is_alive():
+            process.kill()
+        process.join(timeout=5)
