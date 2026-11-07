@@ -262,7 +262,43 @@ def test_a_selecting_step_stages_its_page_tables_once(monkeypatch):
     assert len(calls) == 1  # dense: nothing to stage
 
 
-def test_plan_refuses_a_prefill_past_topk():
-    dsa = _manager(topk=4)
-    with pytest.raises(RuntimeError, match="decode-only"):
-        _plan(dsa, [SequenceView("r0", "main", [1, 2], length=7, to_compute=2)])
+def test_prefill_rows_past_topk_select_and_attend_over_their_request(monkeypatch):
+    """A prefill span past topk (several rows of one request, beside another request's decode
+    row): every row scores its request's keys up to its own position and attends its pick over its
+    request's pages, as it would alone; chunked rows (a tiny scratch budget) give the same."""
+    torch.manual_seed(5)
+    page_size, heads, rank, rope, d, topk = 4, 2, 16, 8, 8, 3
+    cache = torch.randn(12, page_size, rank + rope)
+    views = [SequenceView("r0", "main", [7, 2, 9], length=10, to_compute=4, start=1),
+             SequenceView("r1", "main", [4, 0], length=6, to_compute=1)]
+    keys = {"r0": torch.randn(10, d), "r1": torch.randn(6, d)}
+    q = torch.randn(5, 4, d)
+    w = torch.randn(5, 4)
+    q_nope, q_pe = torch.randn(5, heads, rank), torch.randn(5, heads, rope)
+
+    def run():
+        dsa = _manager(topk=topk, page_size=page_size)
+        _plan(dsa, views)
+        dsa.keys.append("r0", 0, keys["r0"][:6], start_pos=0)
+        dsa.keys.append("r1", 0, keys["r1"][:5], start_pos=0)
+        dsa.store_keys(0, torch.cat([keys["r0"][6:], keys["r1"][5:]]))
+        sel = dsa.select(0, q, w)
+        return sel, dsa.attend(sel, q_nope, q_pe, cache, 0.3)
+
+    sel, out = run()
+    rows = [("r0", 6 + i, views[0]) for i in range(4)] + [("r1", 5, views[1])]
+    for r, (rid, pos, view) in enumerate(rows):
+        want = index_topk(q[r:r + 1], w[r:r + 1], keys[rid][:pos + 1], torch.tensor([pos]), topk)
+        assert torch.equal(sel[r], want[0])
+        pages = torch.tensor(view.page_idxs)
+        slot = torch.arange(view.length) + view.start
+        flat = cache[pages[slot // page_size], slot % page_size]
+        ref = _independent_masked_reference(
+            flat.unsqueeze(1), torch.arange(view.length), 1, view.length, sel[r],
+            torch.cat([q_nope, q_pe], dim=-1)[r], 0.3, rank)
+        torch.testing.assert_close(out[r], ref, rtol=1e-6, atol=1e-6)
+    monkeypatch.setattr(dsa_manager, "_SELECT_BUDGET", 1)
+    monkeypatch.setattr(dsa_manager, "_ATTEND_BUDGET", 1)
+    sel_chunked, out_chunked = run()
+    assert torch.equal(sel_chunked, sel)
+    torch.testing.assert_close(out_chunked, out, rtol=0, atol=0)
