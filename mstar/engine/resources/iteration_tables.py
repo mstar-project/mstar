@@ -129,7 +129,7 @@ class IterationTables(Resource):
     def window_bytes(slots: int, limit: int, entries: int, inputs: Mapping[str, torch.Tensor], bs: int) -> int:
         """Persistent bytes per captured bank, before capture selection."""
         columns = sum(value[0].numel() * value.element_size() for value in inputs.values())
-        return slots * (2 * limit * columns + 8 * (1 + entries)) + 8 * bs
+        return slots * (2 * limit * columns + 8 * (1 + entries)) + 16 * bs
 
     def prepare_window(
         self, lease: SlotLease, inputs: Mapping[str, torch.Tensor], limit: int,
@@ -154,7 +154,9 @@ class IterationTables(Resource):
             torch.full((slots, entries), -1, dtype=torch.long, device=self._device),
         )
         self._windows[key] = window
-        self._window_indices[key] = torch.empty(lease.bucket.bs, dtype=torch.long, device=self._device)
+        # Ordinary staging can still be queued on the execution stream when
+        # a fresh row is initialized on the independent publication stream.
+        self._window_indices[key] = torch.empty((2, lease.bucket.bs), dtype=torch.long, device=self._device)
         self._window_fills[key] = dict(fills)
         return window
 
@@ -165,12 +167,16 @@ class IterationTables(Resource):
         self._window_indices.pop(key, None)
         self._window_fills.pop(key, None)
 
-    def stage_window(self, lease: SlotLease, slots: Sequence[int], snapshot: IterationWindow) -> None:
-        """On the execution stream, after the previous use of this capture.
+    def stage_window(
+        self, lease: SlotLease, slots: Sequence[int], snapshot: IterationWindow,
+        *, stager: PinnedStager | None = None,
+    ) -> None:
+        """Stage selected resident rows on the caller's stream.
 
-        Preplanning never calls this. Validate every input before any copy, then
-        write only the selected resident rows. This staging scratch belongs to
-        the capture's submission stream; live publication must not borrow it.
+        Ordinary staging follows the capture's previous execution. Publication
+        supplies its independent pinned stager and uses a second index scratch;
+        its caller must hold fresh resident slots until every reader finishes.
+        Validate every input before any copy. Preplanning never calls this.
         """
         key = (lease.bucket, lease.buffer_slot)
         target = self._windows.get(key)
@@ -193,8 +199,8 @@ class IterationTables(Resource):
                 raise ValueError(f"iteration input {name!r} exceeds its captured owner bank")
         if not n:
             return
-        indices = self._window_indices[key][:n]
-        self._stager.copy_(indices, slots)
+        indices = self._window_indices[key][int(stager is not None), :n]
+        (self._stager if stager is None else stager).copy_(indices, slots)
         for name, column in snapshot.columns.items():
             bank = target.columns[name]
             width = column.shape[1]

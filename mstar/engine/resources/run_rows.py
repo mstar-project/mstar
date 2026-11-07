@@ -110,7 +110,7 @@ class RunRows(Resource):
         self.publication_stream = torch.cuda.Stream(device=device) if device.type == "cuda" else None
         if self.publication_stream is not None:
             self.publication_stream.wait_stream(torch.cuda.current_stream(device))
-        self._stager = PinnedStager(torch.long, numel=capacity * binding_width)
+        self.stager = PinnedStager(torch.long, numel=capacity * binding_width)
         self._free = list(range(capacity - 1, -1, -1))
         self._generation = [0] * capacity
         self._descriptors: dict[int, RunRow] = {}
@@ -188,7 +188,7 @@ class RunRows(Resource):
         if handle in self._published or handle in self._retired:
             raise ValueError("run row was already published or withdrawn")
         slot = (handle - 1) % self.capacity
-        self._stager.copy_(self.bindings[slot], descriptor.bindings)
+        self.stager.copy_(self.bindings[slot], descriptor.bindings)
         self._change(descriptor.row, self._observed[descriptor.row], handle << 2)
         self._published.add(handle)
 

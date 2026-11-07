@@ -681,8 +681,9 @@ class StepRunner:
         """Reserve a joining row's whole horizon beside the queued capture.
 
         No plan or capture buffer is touched. The caller serializes admission,
-        publication and both ordinary receipt commits against same-request
-        settlement/teardown, and holds these owners until readers finish.
+        publication and the logical receipt's commit against same-request
+        settlement/teardown, and holds these owners until readers finish. One
+        receipt may span both bounded captures; it commits and settles once.
         Unlike ordinary admission, this operation never narrows the horizon.
         """
         ctx = step.ctx

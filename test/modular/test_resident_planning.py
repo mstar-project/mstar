@@ -4189,3 +4189,29 @@ def test_joining_checks_undeclared_capture_owners_before_declared_owner_reservat
         runner.rollback_admit(step)
         assert live["kv"]._arena.num_free == free
     assert seen == [(None, 4)]
+
+
+def test_publication_input_staging_does_not_overwrite_an_execution_streams_queued_indices(monkeypatch):
+    from mstar.engine.device_run import IterationWindow
+    from mstar.engine.resources.run_rows import RunRows
+
+    owner = IterationTables(CPU)
+    lease = SlotLease(0, BucketKey("decode", 1, 1))
+    bank = owner.prepare_window(lease, {"cond": torch.zeros(1)}, 2, 2, 3, {"cond": -1})
+    membership = RunRows(CPU, 1, 2, 2)
+
+    def snapshot(value, entry):
+        return IterationWindow({"cond": torch.full((1, 4), value)}, torch.tensor([0]), torch.tensor([[entry, 0]]))
+
+    copy = owner._stager.copy_
+
+    def interleave(target, values):
+        copy(target, values)
+        # Model publication landing after the queued ordinary index copy, but
+        # before its index_copy_ reads that destination on the other stream.
+        owner.stage_window(lease, [2], snapshot(20., 2), stager=membership.stager)
+
+    monkeypatch.setattr(owner._stager, "copy_", interleave)
+    owner.stage_window(lease, [1], snapshot(10., 1))
+    assert bank.columns["cond"].tolist() == [[-1.] * 4, [10.] * 4, [20.] * 4]
+    assert bank.entries.tolist() == [[-1, -1], [1, 0], [2, 0]]
