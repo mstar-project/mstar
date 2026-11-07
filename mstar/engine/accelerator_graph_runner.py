@@ -37,6 +37,7 @@ from mstar.engine.resources.loopback_rows import LoopbackRows
 from mstar.engine.resources.lora.config import LoraBaseOnly
 from mstar.engine.resources.resident import CapturedResidentStep, ResidentPlanner, watched_counts
 from mstar.engine.resources.resident_hooks import unbound_horizon
+from mstar.engine.resources.run_rows import RunRowsSnapshot
 from mstar.engine.resources.step import PIECEWISE_WALK, SubmoduleStep
 from mstar.model.submodule_base import (
     BatchedModelOutput,
@@ -1447,7 +1448,8 @@ class AcceleratorGraphRunner:
                   if ask.stream_tokens else None)
         state = RunState(
             spec.bucket.bs, ask.token_signal, ask.stop_ids, self._device, dropping, stream,
-            membership=ask.membership, width=ask.limit, independent_rows=ask.independent_rows,
+            membership=None if ask.membership is None else RunRowsSnapshot(ask.membership, spec.bucket.bs),
+            width=ask.limit, independent_rows=ask.independent_rows,
         )
         shapes = {name: value for name, value in warmed.static_inputs.items() if name in ask.iteration}
         window = None
@@ -1485,7 +1487,6 @@ class AcceleratorGraphRunner:
         backend.synchronize()
 
         def body() -> Any:
-            state.acquire_rows()
             position = None
             active = state.select_rows() if window is not None or state.active is not None else None
             if window is not None:
@@ -1530,7 +1531,6 @@ class AcceleratorGraphRunner:
                 target.copy_(output_named(output, pair.output).reshape(target.shape))
             tokens = None if ask.token_signal is None else output_named(output, ask.token_signal).to(torch.long)
             cuda.stop(state, tokens, backend.raw_stream())
-            state.retire_rows()
             if window is not None:
                 self._rows.iteration_tail(
                     walk, ask.loop, self._rows.indices(spec.bucket, warmed.resident.buffer_slot),
@@ -1554,7 +1554,21 @@ class AcceleratorGraphRunner:
                 lambda: cuda.start(state, backend.raw_stream()), self._memory_pool, self._device, None,
                 keep_graph=True, node_name=self._submodule_name, stream=self._capture_stream,
             )
-            composed = backend.compose((entry, GraphConditional("while", state.continuation, (graph,))))
+            bodies = (graph,)
+            if state.snapshot is not None:
+                def accept():
+                    state.snapshot.accept()
+                    state.install_rows()
+
+                def retire():
+                    state.snapshot.retire(state.marks)
+
+                boundaries = [capture_into_graph(
+                    fn, self._memory_pool, self._device, None, keep_graph=True,
+                    node_name=self._submodule_name, stream=self._capture_stream,
+                )[0] for fn in (accept, retire)]
+                bodies = (boundaries[0], graph, boundaries[1])
+            composed = backend.compose((entry, GraphConditional("while", state.continuation, bodies)))
             run.entry, run.launch = entry, composed.replay
         except Exception as error:
             self._run_failures[walk] = f"runner: its capture into a WHILE body failed: {error}"

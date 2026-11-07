@@ -1952,7 +1952,7 @@ def test_engine_prepares_one_logical_joining_receipt_without_replanning(actual, 
         runner.ingest_request(rid, {"kv": KVReqConfig()})
         _host_step(live, [rid], [3])
     incumbent = _captured_step(live, planner, [1], slot=0, bs=4, repeats=4)
-    membership = RunRows(torch.device("cpu"), 4, 8, 2)
+    membership = RunRows(torch.device("cpu"), 4, 8, 3)
     slot = SimpleNamespace(run=SimpleNamespace(state=SimpleNamespace(membership=membership), window=None),
                            row_heads={}, static_inputs={"flag": False}, dummy_rids=(-1, -2, -3, -4))
     from mstar.engine.resources.loopback_rows import LoopbackRows

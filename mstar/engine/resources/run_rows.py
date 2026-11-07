@@ -86,6 +86,32 @@ class RunRow:
     bindings: tuple[int, ...]
 
 
+class RunRowsSnapshot:
+    """One retained capture's view of an atomic membership boundary.
+
+    Every member consumes the same identity change, before any body executes.
+    The resource may serve another retained capture, so this scratch belongs
+    to the parent capture rather than to the resource's publication table.
+    """
+
+    def __init__(self, owner: RunRows, rows: int):
+        if not 0 < rows <= owner.rows or owner.binding_width % 3:
+            raise ValueError("run members need (resident slot, immunity, bound) bindings")
+        self.owner = owner
+        self.ids = torch.zeros(rows, dtype=torch.long, device=owner.device)
+        self.bindings = torch.zeros((rows, owner.binding_width), dtype=torch.long, device=owner.device)
+        self.changed = torch.zeros(rows, dtype=torch.bool, device=owner.device)
+        self._previous = torch.zeros_like(self.ids)
+
+    def accept(self) -> None:
+        self._previous.copy_(self.ids)
+        self.owner.boundary(self.ids, self.bindings)
+        torch.ne(self.ids, self._previous, out=self.changed)
+
+    def retire(self, completed: torch.Tensor) -> None:
+        self.owner.stop(self.ids, completed)
+
+
 @dataclass
 class RunRowsSpec(NodeResourceSpec):
     rows: int = 1

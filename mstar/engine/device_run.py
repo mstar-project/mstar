@@ -31,7 +31,7 @@ from mstar.utils.h2d import PinnedStager
 
 if TYPE_CHECKING:
     from mstar.engine.accelerator_graph_backend import CapturedGraph
-    from mstar.engine.resources.run_rows import RunRows
+    from mstar.engine.resources.run_rows import RunRows, RunRowsSnapshot
 
 # a stop buffer of a run that repeats: the iterations it ran, on every row
 RUN_REPLAYS = "__run_replays__"
@@ -211,19 +211,20 @@ class RunState:
     def __init__(
         self, bs: int, token_signal: str | None, stop_ids: Collection[int], device: torch.device,
         dropping: Any = None, stream: TokenStream | None = None,
-        *, membership: RunRows | None = None, width: int = 1, independent_rows: bool = False,
+        *, membership: RunRowsSnapshot | None = None, member: int = 0,
+        width: int = 1, independent_rows: bool = False,
     ):
         self.token_signal = token_signal
         # where its tokens land as it goes, for a walk that streams them
         self.stream = stream
         # a capture that also sends a stopped row's reads and writes to the trash slot
         self.dropping = dropping
-        if membership is not None and (dropping is None or membership.binding_width != 2
-                                       or membership.device != device or not 0 < bs <= membership.rows or width < 1):
-            raise ValueError("run membership needs resident rows and (slot, stop-immunity) bindings")
-        self.membership = membership
-        self.identities = torch.zeros(bs, dtype=torch.long, device=device) if membership is not None else None
-        self.bindings = torch.zeros((bs, 2), dtype=torch.long, device=device) if membership is not None else None
+        if membership is not None and (dropping is None or membership.ids.shape != (bs,)
+                                       or membership.ids.device != device or width < 1
+                                       or not 0 <= member < membership.owner.binding_width // 3):
+            raise ValueError("run membership needs its capture snapshot and resident member bindings")
+        self.snapshot = membership
+        self._member = member
         self.descriptors = torch.zeros((bs, width), dtype=torch.long, device=device) if membership is not None else None
         self.index = torch.zeros(1, dtype=torch.long, device=device)
         # Entry writes eligibility; each executed body writes continuation.
@@ -278,18 +279,30 @@ class RunState:
         independent. The host generation increment is the cutoff boundary."""
         self.yield_until[0] = self._generation
 
-    def acquire_rows(self) -> None:
-        """Snapshot membership once, before any owner reads this iteration."""
-        if self.membership is not None:
-            self.membership.boundary(self.identities, self.bindings)
-            self.dropping.rows.copy_(self.bindings[:, 0])
-            self.immune.copy_(self.bindings[:, 1])
-            torch.eq(self.identities, 0, out=self.marks)
+    @property
+    def membership(self) -> RunRows | None:
+        return None if self.snapshot is None else self.snapshot.owner
 
-    def retire_rows(self) -> None:
-        """The stop/output identity belongs to the snapshot taken at entry."""
-        if self.membership is not None:
-            self.membership.stop(self.identities, self.marks)
+    @property
+    def identities(self) -> torch.Tensor | None:
+        return None if self.snapshot is None else self.snapshot.ids
+
+    def install_rows(self) -> None:
+        """Install this member of the parent's already accepted snapshot.
+
+        Same-generation EOS survives while another member drains. Replacing
+        the physical tenant resets logical progress, never output columns.
+        """
+        snapshot = self.snapshot
+        if snapshot is not None:
+            bindings = snapshot.bindings[:, self._member * 3:(self._member + 1) * 3]
+            self.dropping.rows.copy_(bindings[:, 0])
+            self.immune.copy_(bindings[:, 1])
+            self.counts.masked_fill_(snapshot.changed, 0)
+            self.marks.masked_fill_(snapshot.changed, False)
+            self.marks.logical_or_((snapshot.ids == 0) | (self.counts >= bindings[:, 2]))
+            if self.active is not None:
+                self.active.masked_fill_(snapshot.changed, False)
 
     def select_rows(self) -> torch.Tensor:
         """Snapshot this body's executions before entry or owner state changes."""

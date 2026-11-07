@@ -826,7 +826,7 @@ class Engine:
             if not rows:
                 raise ValueError(f"{node}: join_rows needs whole-forward captures")
             specs.append(RunRowsSpec(resource_key=run_rows_key(node), nodes={node}, rows=rows,
-                                     capacity=rows * (limit + 1), binding_width=2))
+                                     capacity=rows * (limit + 1), binding_width=3))
         specs_by_key = resolve_spec_dependencies(specs)
         instance = {node: parallel_groups.get_joint_group_for_node(node).world_size for node in node_names}
         checkpoint = model.checkpoint_path() if model is not None else None
@@ -3428,7 +3428,7 @@ class Engine:
             with publication:
                 for row, (rid, resident, ignore) in enumerate(zip(batch.request_ids, pins, immune, strict=True)):
                     descriptor = membership.reserve_row(
-                        rid, self._runner.request_generation(rid), row, (resident, int(ignore)),
+                        rid, self._runner.request_generation(rid), row, (resident, int(ignore), ctx.repeats),
                     )
                     if descriptor is None:
                         raise ValueError("a fresh membership window lacks descriptor credits")
@@ -3520,7 +3520,7 @@ class Engine:
             policy = mgmt.device_stops[batch.graph_walk]
             immune = policy is not None and policy.limits(batch.per_request_info_wrapped[rid]).ignore_eos
             descriptor = membership.reserve_row(
-                rid, self._runner.request_generation(rid), row, (int(plan.slots[0]), int(immune)),
+                rid, self._runner.request_generation(rid), row, (int(plan.slots[0]), int(immune), ctx.repeats),
             )
             if descriptor is None:
                 return None

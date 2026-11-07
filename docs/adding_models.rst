@@ -1693,6 +1693,14 @@ Prepared-input owners without stable captured windows and attention backends wit
 host-fixed page addressing refuse joining even when they support ordinary resident
 steps. A model adds no methods for this contract.
 
+The captured parent accepts a membership identity before its body reads any owner,
+and retires it after the body. Each retained parent has its own snapshot; the
+publication resource may be shared with another retained parent. A member's EOS
+and logical progress survive repeated reads of the same identity. Only a new
+identity resets them, while physical output columns remain monotone. Standalone
+joining uses this boundary today; live admission to a whole connected unit remains
+refused until every member's admission and collection share the same receipt.
+
 A resident step can also stand for several iterations of its Loop (``step_repeats``
 per node in the serving config): the host plans once and the capture replays, each loop-back
 signal carried from one replay to the next by copying the output it left into the static input

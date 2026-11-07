@@ -1621,6 +1621,90 @@ def test_run_membership_keeps_old_readers_across_captured_row_reuse(device_name)
 
 
 @pytest.mark.parametrize("device_name", ["cpu", "cuda"])
+def test_one_membership_snapshot_preserves_member_eos_until_the_whole_row_retires(device_name):
+    from contextlib import nullcontext
+
+    from mstar.engine.resources.run_rows import RunRows, RunRowsSnapshot
+
+    if device_name == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA shared membership snapshot")
+    device = torch.device(device_name, 0) if device_name == "cuda" else CPU
+    owner = RunRows(device, rows=2, capacity=4, binding_width=6)
+    snapshot, other = (RunRowsSnapshot(owner, 2) for _ in range(2))
+    members = [RunState(
+        2, None, (), device,
+        SimpleNamespace(rows=torch.zeros(2, dtype=torch.long, device=device),
+                        slots=torch.zeros(2, dtype=torch.long, device=device)),
+        membership=snapshot, member=i, width=6,
+    ) for i in range(2)]
+
+    def accept():
+        snapshot.accept()
+        for state in members:
+            state.install_rows()
+
+    graph = None
+    accept()
+    if device.type == "cuda":
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            accept()
+
+    def execute():
+        if graph is not None:
+            torch.cuda.current_stream().wait_stream(owner.publication_stream)
+            graph.replay()
+        else:
+            accept()
+
+    def publish(descriptor):
+        with torch.cuda.stream(owner.publication_stream) if graph is not None else nullcontext():
+            owner.publish_row(descriptor)
+
+    first = owner.reserve_row(1, 1, 0, (11, 0, 4, 21, 1, 1))
+    sibling = owner.reserve_row(2, 1, 1, (12, 0, 4, 22, 0, 1))
+    publish(first)
+    publish(sibling)
+    execute()
+    assert members[0].dropping.rows.tolist() == [11, 12]
+    assert members[1].dropping.rows.tolist() == [21, 22]
+    producer, consumer = members
+    producer.counts.copy_(torch.tensor([2, 1], device=device))
+    producer.marks[0] = True  # EOS while the consumer is still waiting
+    producer.index.fill_(3)
+    execute()
+    assert producer.marks.tolist() == [True, False]
+    assert producer.counts.tolist() == [2, 1]
+    assert consumer.marks.tolist() == [False, False]
+    snapshot.retire(producer.marks & consumer.marks)
+    owner.acknowledge(owner.control.tolist())
+    assert not owner.available_rows(2)
+
+    consumer.counts[0] = 1
+    execute()  # its own bound ends the consumer, without reviving the producer
+    assert consumer.marks.tolist() == [True, False]
+    other.accept()
+    saved = other.ids.clone()
+    owner.retain(first)
+    snapshot.retire(producer.marks & consumer.marks)
+    owner.acknowledge(owner.control.tolist())
+    assert not owner.release(first)
+    if graph is not None:
+        owner.publication_stream.wait_stream(torch.cuda.current_stream())
+    replacement = owner.reserve_row(3, 1, 0, (13, 1, 4, 23, 0, 1))
+    publish(replacement)
+    execute()
+    assert snapshot.ids.tolist() == [replacement.handle, sibling.handle]
+    assert torch.equal(other.ids, saved), "another retained capture owns a separate boundary snapshot"
+    assert producer.counts.tolist() == [0, 1] and consumer.counts.tolist() == [0, 0]
+    assert not producer.marks.any() and not consumer.marks.any()
+    assert producer.index.item() == 3, "a new tenant cannot reset physical output columns"
+    assert producer.dropping.rows.tolist() == [13, 12]
+    assert consumer.dropping.rows.tolist() == [23, 22]
+    assert owner.release(first)
+
+
+@pytest.mark.parametrize("device_name", ["cpu", "cuda"])
 @pytest.mark.parametrize("cancel_at", ["unpublished", "offered", "active", "closed"])
 def test_run_membership_retracts_zero_work_and_cancels_accepted_rows(cancel_at, device_name):
     from contextlib import nullcontext
@@ -1675,7 +1759,7 @@ def test_a_joining_capture_refuses_an_unbound_owner_before_serving(monkeypatch):
         runner._resident.bindings["context"] = SimpleNamespace(check_horizon=unbound_horizon)
 
     monkeypatch.setattr(AcceleratorGraphRunner, "ask_run", ask)
-    membership = RunRows(CPU, rows=2, capacity=4, binding_width=2)
+    membership = RunRows(CPU, rows=2, capacity=4, binding_width=3)
     runner, run, _, calls = _runner(monkeypatch, _Loop(), [[0, 0]], progress=True, membership=membership)
     assert run is None and not calls
     assert "context" in runner._run_failures[WALK]
@@ -1684,7 +1768,7 @@ def test_a_joining_capture_refuses_an_unbound_owner_before_serving(monkeypatch):
 def test_captured_membership_uses_one_owner_snapshot_and_keeps_output_identity_through_eos_reuse(monkeypatch):
     from mstar.engine.resources.run_rows import RunRows
 
-    membership = RunRows(CPU, rows=3, capacity=4, binding_width=2)
+    membership = RunRows(CPU, rows=3, capacity=4, binding_width=3)
     _, refused, _, _ = _runner(monkeypatch, _Loop(), [[0, 0]], bs=2, limit=5,
                                progress=True, membership=membership, unmanaged=True)
     assert refused is None  # a live join must not inherit an incumbent's private static input
@@ -1695,8 +1779,8 @@ def test_captured_membership_uses_one_owner_snapshot_and_keeps_output_identity_t
     owner, lease, _ = run.test_inputs
     runner.test_resource.zero_()  # discard the warm-up forward's owner writes
     # The first physical row is empty. The other one keeps the run alive.
-    incumbent = membership.reserve_row(1, 1, 1, (1, 0))
-    late = membership.reserve_row(2, 1, 0, (2, 0))
+    incumbent = membership.reserve_row(1, 1, 1, (1, 0, 5))
+    late = membership.reserve_row(2, 1, 0, (2, 0, 5))
     membership.retain(late)  # its outputs survive replacement on the physical row
     membership.publish_row(incumbent)
     columns = IterationWindow(
@@ -1716,7 +1800,7 @@ def test_captured_membership_uses_one_owner_snapshot_and_keeps_output_identity_t
         if iteration == 3:
             membership.acknowledge(membership.control.tolist())
             assert not membership.release(late)
-            row = membership.reserve_row(3, 2, 0, (3, 1))
+            row = membership.reserve_row(3, 2, 0, (3, 1, 5))
             membership.publish_row(row)
             replacement.append(row)
 
@@ -1750,7 +1834,7 @@ def test_captured_membership_uses_one_owner_snapshot_and_keeps_output_identity_t
     # Such an iteration reads trash and never publishes an output identity.
     membership.drain()
     membership.acknowledge(membership.control.tolist())
-    stopped = membership.reserve_row(2, 1, 0, (2, 0))
+    stopped = membership.reserve_row(2, 1, 0, (2, 0, 5))
     membership.publish_row(stopped)
     run.state.stream.begin([])
     before = runner.test_resource[1:].clone()
