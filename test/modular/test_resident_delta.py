@@ -29,6 +29,7 @@ from mstar.engine import engine as engine_mod
 from mstar.engine.engine import Engine
 from mstar.engine.resources import Residency
 from mstar.engine.resources.step import FULL_ADMIT_OK, StepContext
+from mstar.testing_utils.engine import make_engine
 from mstar.utils.containers import RecentSet
 from mstar.utils.ipc_format import (
     OffloadDelta,
@@ -186,17 +187,8 @@ class _Rids:
         return handle if handle in self._live else None
 
 
-class _Engine:
+class _Engine(Engine):
     """``Engine``'s eviction surface over one stub resource."""
-
-    apply_resident_delta = Engine.apply_resident_delta
-    check_ready = Engine.check_ready
-    residency = Engine.residency
-    offload_request = Engine.offload_request
-    _release_resident_slot = Engine._release_resident_slot
-    reclaimable = Engine.reclaimable
-    reload_request = Engine.reload_request
-    take_resident_delta = Engine.take_resident_delta
 
     def decide_cached_prefix(self, batch):
         return {}
@@ -209,6 +201,7 @@ class _Engine:
         sharded node — decides and journals), ``follower`` (another rank of one —
         replays only), or ``solo`` (not sharded — owns its own eviction)."""
         assert role in ("leader", "follower", "solo"), role
+        super().__init__(graph_runtime=_Rids())
         self.resource = _Resource()
         self._resources = {"kv": self.resource}
         self._submodules = {
@@ -219,7 +212,6 @@ class _Engine:
             {"node": OffloadDelta.new()} if role == "leader" else {}
         )
         self._tp_follower_nodes = {"node"} if role == "follower" else set()
-        self._graph_runtime = _Rids()
 
 
 def _info():
@@ -547,9 +539,8 @@ class _Groups:
 
 
 def _roles(layout):
-    engine = _Engine.__new__(_Engine)
-    engine._resident_delta = {}
-    Engine._classify_tp_roles(engine, set(layout), _Groups(layout))
+    engine = make_engine()
+    engine._classify_tp_roles(set(layout), _Groups(layout))
     return engine
 
 

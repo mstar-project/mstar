@@ -19,7 +19,6 @@ import pytest
 import torch
 from packaging.version import Version
 
-from mstar.engine.engine import Engine
 from mstar.model.audio_watermark import (
     DEFAULT_DETECTOR,
     DEFAULT_GENERATOR,
@@ -30,6 +29,7 @@ from mstar.model.audio_watermark import (
     import_audioseal,
 )
 from mstar.model.submodule_base import NodeSubmodule
+from mstar.testing_utils.engine import make_engine
 
 # -- config -------------------------------------------------------------------
 
@@ -130,9 +130,9 @@ def _batch(rids):
 def test_batch_tail_runs_once_on_the_requests_postprocess_kept():
     tail = _Tail()
     runners = {"watermark_1920": object()}
-    engine = SimpleNamespace(_submodules={"Codec": SimpleNamespace(submodule=tail, piecewise_runners=runners)})
+    engine = make_engine(_submodules={"Codec": SimpleNamespace(submodule=tail, piecewise_runners=runners)})
     batch = _batch(["a", "bad", "c"])
-    Engine._postprocess_batch(engine, batch, {"a": {}, "bad": {}, "c": {}})
+    engine._postprocess_batch(batch, {"a": {}, "bad": {}, "c": {}})
     # the node's captured regions come along, as the forward gets them
     assert tail.calls == [(["a", "c"], ["in-a", "in-c"], runners)]
     assert set(batch.failed_requests) == {"bad"}
@@ -140,9 +140,9 @@ def test_batch_tail_runs_once_on_the_requests_postprocess_kept():
 
 def test_batch_tail_failure_fails_its_requests_only():
     tail = _Tail(fail=True)
-    engine = SimpleNamespace(_submodules={"Codec": SimpleNamespace(submodule=tail, piecewise_runners={})})
+    engine = make_engine(_submodules={"Codec": SimpleNamespace(submodule=tail, piecewise_runners={})})
     batch = _batch(["a", "bad", "c"])
-    Engine._postprocess_batch(engine, batch, {})
+    engine._postprocess_batch(batch, {})
     assert set(batch.failed_requests) == {"a", "bad", "c"}
     assert "tail failed" in batch.failed_requests["a"]
 

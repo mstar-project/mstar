@@ -181,8 +181,8 @@ def test_a_warm_up_outside_any_step_runs_a_bound_module_as_a_base_only_step(comp
     from lora_module_helpers import pool as lora_pool
     from lora_module_helpers import serve
 
-    from mstar.engine.engine import Engine
     from mstar.model.components.lora.modules import bind_module_lora, module_lora_spec
+    from mstar.testing_utils.engine import make_engine
 
     real = torch.compile
     monkeypatch.setattr(torch, "compile", (lambda fn, **kw: real(fn, backend="eager", **kw)) if compiled
@@ -192,10 +192,10 @@ def test_a_warm_up_outside_any_step_runs_a_bound_module_as_a_base_only_step(comp
         spec = module_lora_spec(_Warmed(), resource_key="lora", nodes={"N"}, root_path="")
     node, pool = _Warmed(), lora_pool(serve(spec, {}))
     bind_module_lora(node, {"lora": pool})
-    engine = object.__new__(Engine)
-    engine._device, engine._device_capability = CPU, SimpleNamespace(is_available=True)
-    engine._submodules = {"N": SimpleNamespace(submodule=node, fp32_precision=None, node_dtype=None,
-                                               lora_pools=(pool,))}
+    engine = make_engine(
+        _device_capability=SimpleNamespace(is_available=True),
+        _submodules={"N": SimpleNamespace(submodule=node, fp32_precision=None, node_dtype=None, lora_pools=(pool,))},
+    )
     engine._compile_regions()
     assert pool._current is None and pool.active
     with pytest.raises(RuntimeError, match="no plan"):
@@ -249,7 +249,7 @@ def test_every_bucket_is_captured_again_under_a_base_only_key_beside_the_nodes_o
 
 def _engine_with(pool, captured_keys, model_key="cfg"):
     """An engine whose node keys captures ``model_key`` and has ``captured_keys``; and what it asks."""
-    from mstar.engine.engine import Engine
+    from mstar.testing_utils.engine import make_engine
 
     asked = []
 
@@ -257,12 +257,13 @@ def _engine_with(pool, captured_keys, model_key="cfg"):
         asked.append(cg_key_info)
         return SlotLease(slot, BucketKey(graph_walk, 8, 8, cg_key_info)) if cg_key_info in captured_keys else None
 
-    engine = object.__new__(Engine)
-    engine._submodules = {"LLM": SimpleNamespace(
-        submodule=SimpleNamespace(cg_key_info=lambda walk, info, **kw: model_key), lora_pools=(pool,),
-        accelerator_graph_runner=SimpleNamespace(lease_slot=lease_slot, is_packed=lambda lease: False),
-        resident=None,
-    )}
+    engine = make_engine(
+        _submodules={"LLM": SimpleNamespace(
+            submodule=SimpleNamespace(cg_key_info=lambda walk, info, **kw: model_key), lora_pools=(pool,),
+            accelerator_graph_runner=SimpleNamespace(lease_slot=lease_slot, is_packed=lambda lease: False),
+            resident=None,
+        )},
+    )
     return engine, asked
 
 
@@ -294,14 +295,13 @@ def test_the_lease_takes_the_base_only_capture_only_when_no_row_names_an_adapter
 def test_the_declaration_check_still_compares_the_nodes_own_key():
     """The engine's lease/declare_step check unwraps only the pool's part: a model whose
     declare_step disagrees with its cg_key_info still fails under a base-only lease."""
-    from mstar.engine.engine import Engine
 
     def plan(step, phase):
         raise NotImplementedError("reached plan")
 
-    engine = object.__new__(Engine)
-    engine._enable_nvtx, engine._runner = False, SimpleNamespace(plan=plan)
-    engine._pre_plan_done = {}
+    from mstar.testing_utils.engine import make_engine
+
+    engine = make_engine(_runner=SimpleNamespace(plan=plan))
     lease = SlotLease(slot=0, bucket=BucketKey("decode", 1, 1, LoraBaseOnly("cfg")))
     ctx = StepContext(request_ids=[1], graph_walk="decode", slot=0, capture=False, slot_lease=lease)
     mgmt = SimpleNamespace(accelerator_graph_runner=None, submodule=None)

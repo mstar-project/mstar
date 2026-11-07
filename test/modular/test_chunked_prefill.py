@@ -203,15 +203,9 @@ def _engine_with(submodule, policies=None):
     """``policies`` is the model's ``chunking_policy_of()``: (node, walk) -> policy."""
     from types import SimpleNamespace
 
-    from mstar.engine.chunking import ChunkingManagement
-    from mstar.engine.engine import Engine
+    from mstar.testing_utils.engine import make_engine
 
-    engine = Engine.__new__(Engine)
-    engine._tp_follower_nodes = set()
-    engine._submodules = {"LLM": SimpleNamespace(submodule=submodule, resources={}, resident=None)}
-    engine._keyed_walks = {}
-    engine._resources = {}
-    engine._chunking = ChunkingManagement(engine._submodules)
+    engine = make_engine(_submodules={"LLM": SimpleNamespace(submodule=submodule, resources={}, resident=None)})
     engine._chunking.set_policies(policies or {})
     return engine
 
@@ -479,8 +473,6 @@ def test_the_mismatched_row_fails_and_the_rest_of_the_step_runs():
             return super().prepare_inputs(**kwargs)
 
     engine = _engine_with(_Sub(10))
-    engine._enable_nvtx = False
-    engine._loopback_steps = {}
     batch = ExecutingBatch(
         node_name="LLM",
         per_request_info={1: 1, 2: 2},
@@ -547,13 +539,10 @@ def test_a_continuing_decode_row_is_estimated_at_one_token():
 def _budgeted_engine():
     from types import SimpleNamespace
 
-    from mstar.engine.chunking import ChunkingManagement
-    from mstar.engine.engine import Engine
     from mstar.model.submodule_base import ChunkingPolicy
+    from mstar.testing_utils.engine import make_engine
 
-    engine = Engine.__new__(Engine)
-    engine._submodules = {"LLM": SimpleNamespace(submodule=SimpleNamespace())}
-    engine._chunking = ChunkingManagement(engine._submodules)
+    engine = make_engine(_submodules={"LLM": SimpleNamespace(submodule=SimpleNamespace())})
     engine.set_chunking_policies({
         ("LLM", "prefill"): ChunkingPolicy(walks=("prefill",), max_batch_tokens=512),
         ("LLM", "vision"): ChunkingPolicy(walks=("vision",), max_batch_tokens=2048),

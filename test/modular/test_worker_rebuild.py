@@ -18,10 +18,11 @@ import torch
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.chunking import ChunkRange
-from mstar.engine.engine import Engine, ExecutingBatch
+from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import Residency, StepContext
 from mstar.model.rebuild import RebuildPolicy
 from mstar.model.submodule_base import BatchedModelOutput
+from mstar.testing_utils.engine import make_engine
 from mstar.testing_utils.model import make_model
 from mstar.worker.host_pool import HostCopy, HostPool, HostSlice
 from mstar.worker.micro_scheduler import CHAIN_LANE, ScheduledBatch
@@ -323,12 +324,12 @@ def _step(rids=(R, A), walk=PREFILL, node=NODE, rebuild=R, **fields) -> Executin
 
 @pytest.mark.parametrize("branch", ["rows_only", "mixed", "tensor"])
 def test_a_rebuild_row_leaves_its_requests_loopback_entry(branch):
-    engine = SimpleNamespace(_loopback_steps={R: (NODE, DECODE), A: (NODE, DECODE)})
+    engine = make_engine(_loopback_steps={R: (NODE, DECODE), A: (NODE, DECODE)})
     batch = _step(rows_only=branch == "rows_only", loopback_rids=frozenset({A} if branch == "mixed" else ()))
     if branch == "mixed":
         batch.step_context.request_walks = {R: PREFILL, A: DECODE}
 
-    Engine._record_loopback(engine, batch)
+    engine._record_loopback(batch)
 
     assert engine._loopback_steps[R] == (NODE, DECODE), "the resumed decode would not read the last kept id"
 

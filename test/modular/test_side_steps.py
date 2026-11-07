@@ -18,11 +18,11 @@ from test_send_registration_failure import _decode_step, _postprocess_worker
 
 from mstar.distributed.communication import WorkerParallelGroups
 from mstar.engine import accelerator_graph_runner as runner_module
-from mstar.engine.engine import Engine
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.graph.base import GraphEdge, GraphNode, Loop
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.submodule_base import DeviceLoopback, NodeSubmodule, TokenStop
+from mstar.testing_utils.engine import make_engine
 from mstar.testing_utils.model import StubModel
 from mstar.utils.threads import ThreadPool
 from mstar.worker import side_steps
@@ -488,9 +488,7 @@ class _GraphBackend:
 
 
 def _engine(backend, side=("Codec",)):
-    engine = Engine.__new__(Engine)
-    engine._device_capability = SimpleNamespace(graph_backend=backend)
-    engine._side_stream_nodes = frozenset(side)
+    engine = make_engine(_device_capability=SimpleNamespace(graph_backend=backend), _side_stream_nodes=frozenset(side))
     return engine
 
 

@@ -21,8 +21,7 @@ sys.path.insert(0, ".")
 import pytest
 import torch
 
-from mstar.engine.chunking import ChunkingManagement
-from mstar.engine.engine import Engine, ExecutingBatch
+from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import Resource, StepContext, StepRunner
 from mstar.engine.resources.base import CachedPrefix
 from mstar.model.submodule_base import (
@@ -30,6 +29,7 @@ from mstar.model.submodule_base import (
     ARNodeSubmodule,
     NodeInputs,
 )
+from mstar.testing_utils.engine import make_engine
 
 RID = "r0"
 NODE = "LLM"
@@ -73,18 +73,17 @@ class _Submodule:
 
 
 def _engine(resources: dict[str, Resource], node_resources: dict[str, list[str]]):
-    engine = Engine.__new__(Engine)
-    engine._resources = resources
-    engine._runner = StepRunner(resources, node_resources=node_resources)
-    engine._submodules = {
-        node: SimpleNamespace(submodule=_Submodule())
-        for node in node_resources
-    }
-    # every node keys WALK, as a declaration would name it
-    engine._keyed_walks = {node: {WALK} for node in node_resources}
-    engine._chunking = ChunkingManagement(engine._submodules)
-    engine._prefix_model = "_Model"
-    engine._loopback_steps = {}
+    engine = make_engine(
+        _resources=resources,
+        _runner=StepRunner(resources, node_resources=node_resources),
+        _submodules={
+            node: SimpleNamespace(submodule=_Submodule())
+            for node in node_resources
+        },
+        # every node keys WALK, as a declaration would name it
+        _keyed_walks={node: {WALK} for node in node_resources},
+        _prefix_model="_Model",
+    )
     return engine
 
 

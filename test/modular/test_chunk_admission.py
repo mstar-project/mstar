@@ -16,8 +16,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from mstar.engine.chunking import ChunkingManagement, ChunkRange
-from mstar.engine.engine import Engine
+from mstar.engine.chunking import ChunkRange
 from mstar.engine.resources.kv import manager as manager_mod
 from mstar.engine.resources.kv.config import KVStep, PagedKVConfig
 from mstar.engine.resources.kv.manager import KVManager
@@ -34,6 +33,7 @@ from mstar.engine.resources.step import (
     SubmoduleStep,
 )
 from mstar.model.submodule_base import ARNodeInputs, ChunkingPolicy
+from mstar.testing_utils.engine import make_engine
 
 PAGE = 16
 
@@ -198,10 +198,7 @@ def _declare(sub: "_Sub", other_walk_row: bool = False):
     """``_declare_and_admit`` over one non-final chunk, one final one and one
     unchunked row, plus a non-final chunk of walk ``other`` if asked; returns
     the ctx the runner was admitted with."""
-    eng = Engine.__new__(Engine)
-    eng._runner = _Runner()
-    eng._submodules = {"LLM": SimpleNamespace(piecewise_runners={}, submodule=sub)}
-    eng._chunking = ChunkingManagement(eng._submodules)
+    eng = make_engine(_runner=_Runner(), _submodules={"LLM": SimpleNamespace(piecewise_runners={}, submodule=sub)})
     eng._chunking.set_policies({("LLM", "prefill"): sub.policy, ("LLM", "other"): sub.other})
     rids = [1, 2, 3, 4] if other_walk_row else [1, 2, 3]
     ctx = StepContext(
