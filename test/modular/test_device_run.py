@@ -929,6 +929,43 @@ def test_a_run_that_ends_short_repeats_its_last_iteration_in_the_columns_it_neve
     assert run.results(4)[1]["t"].tolist() == [[1, 2, 3, 4]]
 
 
+def test_joining_results_only_expose_views_while_the_device_run_is_active():
+    from torch.utils._python_dispatch import TorchDispatchMode
+    from torch.utils._pytree import tree_leaves
+
+    class ViewsOnly(TorchDispatchMode):
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            assert not func._schema.is_mutable, "results must not queue device writes"
+            result = func(*args, **(kwargs or {}))
+            inputs = [v for v in tree_leaves((args, kwargs)) if isinstance(v, torch.Tensor)]
+            for value in tree_leaves(result):
+                if isinstance(value, torch.Tensor):
+                    assert any(torch._C._is_alias_of(value, old) for old in inputs), "results allocated device data"
+            return result
+
+    state = RunState(2, "t", {9}, CPU)
+    state.descriptors = torch.tensor([[1, 2, 0, 0], [3, 3, 0, 0]])
+    state.index.fill_(2)
+    state.counts.fill_(2)
+    run = DeviceRun(state, {}, lambda: None, 4, torch.zeros(1, dtype=torch.long))
+    run.rows["t"] = torch.tensor([[5, 6, -1, -2], [7, 8, -3, -4]])
+    run.stops["t"] = run.rows["t"].clone()
+    run.spans["t"] = torch.ones(2, 4, dtype=torch.long)
+    with ViewsOnly():
+        stops, rows, spans = run.results(4)
+    assert rows["t"].tolist() == [[5, 6, -1, -2], [7, 8, -3, -4]]
+    assert stops[RUN_DESCRIPTORS].tolist() == [[1, 2, 0, 0], [3, 3, 0, 0]]
+    # The metadata was requested before completion; the already-returned views
+    # must observe the device's later writes without another results call.
+    state.index.fill_(3)
+    state.counts[1] = 3
+    state.descriptors[1, 2] = 3
+    run.rows["t"][1, 2] = 9
+    assert stops[RUN_REPLAYS].tolist() == [3, 3]
+    assert stops[RUN_COUNTS].tolist() == [2, 3]
+    assert rows["t"][1, 2].item() == 9 and spans["t"].shape == (2, 4)
+
+
 @pytest.mark.parametrize("refusal", [
     None, "cap_only", "custom", "missing_loop", "other_stop", "past_cap", "prefix", "rows", "resident", "ranks",
 ])

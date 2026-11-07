@@ -220,7 +220,6 @@ class RunState:
         self.immune = torch.zeros(bs, dtype=torch.bool, device=device)
         self._immune_stager = PinnedStager(torch.bool, numel=bs)
         self.marks = torch.zeros(bs, dtype=torch.bool, device=device)
-        self.replays = torch.zeros(bs, dtype=torch.long, device=device)
         self.counts = torch.zeros(bs, dtype=torch.long, device=device)
         # Each stage publishes its identity on the execution stream, behind
         # any previous launch using this state. The host cutoff never clears:
@@ -509,8 +508,7 @@ class DeviceRun:
 
     def execution_counts(self) -> dict[str, torch.Tensor]:
         """The launched width and each row's logical executions, including width one."""
-        self.state.replays.copy_(self.state.index.expand_as(self.state.replays))
-        return {RUN_REPLAYS: self.state.replays, RUN_COUNTS: self.state.counts}
+        return {RUN_REPLAYS: self.state.index.expand_as(self.state.counts), RUN_COUNTS: self.state.counts}
 
     def results(self, repeats: int) -> tuple[dict, dict, dict]:
         """After the launch: what ``AcceleratorGraphRunner.repeat`` returns, and
@@ -518,12 +516,17 @@ class DeviceRun:
         of ``repeats`` (a stop, a yield, ``refill_at``) never wrote its columns
         past them: each repeats its last written one there, so whatever reads
         a column's last (the loop-back of the step speculated meanwhile, a
-        node's ``postprocess``) reads the last iteration that ran."""
+        node's ``postprocess``) reads the last iteration that ran. Joining runs
+        retain physical columns unchanged; descriptors select their valid cells."""
         state = self.state
-        # a skipped run wrote nothing, and nothing reads its columns; the index has to hold
-        ran = torch.minimum(self._columns[:repeats], (state.index - 1).clamp(min=0))
-        for column in (*self.rows.values(), *self.stops.values()):
-            column[:, :repeats] = column.index_select(1, ran)
+        # Joining collectors read only cells with an executed descriptor. Return
+        # their views without launching kernels or allocating after the WHILE
+        # launch: first-use CUDA work here can block publication until it ends.
+        if state.descriptors is None:
+            # A skipped run wrote nothing, and nothing reads its columns.
+            ran = torch.minimum(self._columns[:repeats], (state.index - 1).clamp(min=0))
+            for column in (*self.rows.values(), *self.stops.values()):
+                column[:, :repeats] = column.index_select(1, ran)
         stops = {name: column[:, :repeats] for name, column in self.stops.items()}
         stops.update(self.execution_counts())
         if state.descriptors is not None:
