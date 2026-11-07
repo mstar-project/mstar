@@ -331,7 +331,8 @@ def test_connected_head_cannot_mutate_request_state_before_a_later_refusal():
 
 
 @pytest.mark.parametrize("opaque", [False, True])
-def test_connected_preparation_isolates_request_metadata_before_speculating(opaque):
+@pytest.mark.parametrize("phase", ["prepare", "preprocess"])
+def test_connected_preparation_isolates_request_metadata_before_speculating(opaque, phase):
     eng, group, events = _connected_engine()
     original_infos = [batch.per_request_info_wrapped for _, batch in group.members]
     nested = {"counter": 0}
@@ -352,8 +353,19 @@ def test_connected_preparation_isolates_request_metadata_before_speculating(opaq
         kwargs["fwd_info"].step_metadata["state"]["counter"] += 1
         return prepare(**kwargs)
 
-    node.prepare_inputs = changing
+    if phase == "prepare":
+        node.prepare_inputs = changing
+    else:
+        preprocess = node.preprocess
+        def changing_preprocess(graph_walk, engine_inputs, inputs):
+            calls.append(1)
+            engine_inputs.per_request_info[2].step_metadata["state"]["counter"] += 1
+            return preprocess(graph_walk, engine_inputs, inputs)
+        node.preprocess = changing_preprocess
+    committed = []
+    eng._commit_step = lambda *a: committed.append(a)
     assert eng.exec_group(group) is None and not group.submitted
+    assert not committed
     assert nested == {"counter": 0}
     assert not calls if opaque else calls
     assert all(batch.per_request_info_wrapped is old

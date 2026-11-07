@@ -713,6 +713,18 @@ class ExecutionGroup:
     capacity: int = 1
 
 
+class PreparedMember(NamedTuple):
+    """A member's certified input geometry, before its caller commits it."""
+    batch: ExecutingBatch
+    mgmt: SubmoduleManagement
+    lease: SlotLease
+    inputs: list[NodeInputs]
+    info: Mapping[int, CurrentForwardPassInfo]
+    incoming: tuple[tuple[str, str], ...]
+    preview: SubmoduleStep | None
+    choices: Mapping[int, Sequence[ExecutingBatch | None]] | None
+
+
 @dataclass(frozen=True)
 class RunLayout:
     """The canonical owner bindings and physical horizon of one publication."""
@@ -2817,6 +2829,234 @@ class Engine:
         slot.composed_graph, slot.composed_key = graph, key
         return graph
 
+    @contextmanager
+    def _prepare_group_inputs(self, group: ExecutionGroup, guard: ConnectedInputs):
+        """Certify ordinary member inputs while their metadata remains isolated.
+
+        Callers finish declarations, admission and preprocessing inside this
+        scope, and cross their commit boundary only after its exit checks.
+        A prebound member lease is the retained capture's ordinary lease.
+        """
+        bindings = guard.bindings
+        prepared = []
+        rows = tuple(group.members[group.trigger][1].request_ids)
+        common_rows = rows
+        member_walks = dict(zip(group.unit.nodes, group.unit.graph_walks, strict=True))
+        finished = dict(zip(group.unit.nodes, group.finished_rids or [frozenset()] * len(group.members), strict=True))
+        active = [(scheduled, batch) for scheduled, batch in group.members
+                  if batch.request_ids and not set(batch.request_ids) <= finished[batch.node_name]]
+        leases = {}
+        slots = {}
+        streamed = bool(group.unit.streaming_edges and any(
+            edge.chunk.reservation is not None and edge.chunk.reservation.decisions
+            for _, batch in active for edges in batch.stream_windows.values() for edge in edges
+        ))
+        idle_sources = ({maker for maker, _, _ in group.unit.streaming_edges
+                         for _, batch in group.members if batch.node_name == maker and batch.ring_width == 0}
+                        if streamed else set())
+        active = [(scheduled, batch) for scheduled, batch in active if batch.node_name not in idle_sources]
+        stream_choices = None
+        with torch.no_grad(), guard.preparing(), ExitStack() as preparation:
+            metadata_preparation = ExitStack()
+            if not active or any(set(batch.request_ids) & finished[batch.node_name] for _, batch in active):
+                guard.refuse("finished member rows must be removed before preparation")
+            if streamed and (len(group.members) != 2 or len(group.unit.streaming_edges) != 1
+                             or group.unit.edges != group.unit.streaming_edges):
+                guard.refuse("streamed composition needs two members and one internal edge")
+            if streamed:
+                maker, consumer, _ = group.unit.streaming_edges[0]
+                layouts = {batch.node_name: set(batch.request_ids) for _, batch in group.members}
+                if not layouts[maker] <= layouts[consumer]:
+                    guard.refuse("every live producer needs a claimed consumer row")
+            for _, batch in active:
+                preparation.enter_context(guard.isolated_info(batch))
+            preparation.enter_context(metadata_preparation)
+            repeats = active[0][1].step_context.repeats
+            if not streamed and any(batch.step_context.repeats != repeats for _, batch in active):
+                guard.refuse("members requested different iteration counts")
+            if not streamed and repeats > 1 and group.unit.loop_name is None:
+                guard.refuse("the graph did not certify a complete connected Loop")
+            if not streamed and repeats > 1 and any(
+                len(batch.per_request_input_tensors.get(rid, {}).get(signal, ())) != 1
+                for _, batch in group.members for _, consumer, signal in group.unit.loop_back
+                if consumer == batch.node_name for rid in rows
+            ):
+                repeats = 1  # the first ordinary iteration produces an empty seed
+                for _, batch in group.members:
+                    batch.step_context.repeats = 1
+            # Streamed members already carry and count their own Loops
+            # inside DeviceRun. Only a shared fixed-count Loop needs
+            # these inter-member boundary copies and seed checks.
+            loop_back = group.unit.loop_back if not streamed and repeats > 1 else ()
+            direct_producers = set()
+            for maker in {a for a, _, _ in (*group.unit.edges, *loop_back)}:
+                if not any(batch.node_name == maker for _, batch in active):
+                    continue
+                producer = self._submodules[maker].submodule
+                kind = type(producer)
+                walk = member_walks[maker]
+                if (kind.batch_postprocess is not NodeSubmodule.batch_postprocess
+                        or kind.filter_batched_output is not NodeSubmodule.filter_batched_output
+                        or kind.unpack_packed_outputs is not NodeSubmodule.unpack_packed_outputs
+                        or producer.spanned_outputs(walk) or producer.get_stop_policies(walk) is None):
+                    guard.refuse("a producer changes its routed outputs outside capture")
+                if kind.postprocess is not NodeSubmodule.postprocess:
+                    signals = {signal for a, _, signal in group.unit.edges if a == maker}
+                    if not streamed or not signals <= producer.DIRECT_OUTPUTS.get(walk, frozenset()):
+                        guard.refuse("a custom producer needs declared direct outputs")
+                    direct_producers.add(maker)
+            for member, (_, batch) in enumerate(group.members):
+                if not any(batch is live for _, live in active):
+                    continue
+                rows = tuple(batch.request_ids)
+                if not streamed and rows != common_rows:
+                    guard.refuse("fixed-count connected members need matching logical rows")
+                mgmt = self._submodules[batch.node_name]
+                runner, submodule = mgmt.accelerator_graph_runner, mgmt.submodule
+                if runner is None or batch.chunk_ranges or batch.step_context.request_walks:
+                    guard.refuse("a member has no whole capture or has chunked/mixed rows")
+                if (batch.graph_walk in self._keyed_walks.get(batch.node_name, ())
+                        or (mgmt.rings and not streamed)):
+                    guard.refuse("a member prepares cached prefixes or stream windows")
+                if streamed and mgmt.joint_comm_group.world_size != 1:
+                    guard.refuse("streamed composition is single-rank")
+                if streamed:
+                    if why := mgmt.carry_refusals.get(batch.graph_walk):
+                        guard.refuse(f"{batch.node_name}: {why}")
+                    internal = {signal for maker, _, signal in group.unit.streaming_edges
+                                if maker == batch.node_name}
+                    if set(mgmt.rings) - internal:
+                        guard.refuse("a streamed member has output rings outside the composed edge")
+                incoming = [(a, signal) for a, b, signal in group.unit.edges
+                            if b == batch.node_name and (not finished[a] or streamed)]
+                tensors = {rid: dict(batch.per_request_input_tensors.get(rid, {})) for rid in rows}
+                stream_incoming = incoming if streamed else ()
+                if stream_incoming:
+                    maker, signal = stream_incoming[0]
+                    source = self._submodules[maker].loopback_rows
+                    stream_choices = {
+                        rid: self._prepare_stream_choices(batch, maker, signal, source.row(signal, rid), guard, rid)
+                        for rid in rows
+                    }
+                    references = {
+                        rid: next((choice for choice in choices if choice is not None), None)
+                        for rid, choices in stream_choices.items()
+                    }
+                    if any(reference is None for reference in references.values()):
+                        guard.refuse("a final stream tail with no computation completes on its ordinary path")
+                    batch.per_request_input_tensors = {
+                        rid: ref.per_request_input_tensors[rid] for rid, ref in references.items()
+                    }
+                    batch.per_request_input_metadata = {
+                        rid: ref.per_request_input_metadata[rid] for rid, ref in references.items()
+                    }
+                    batch.per_request_info_wrapped = {
+                        rid: ref.per_request_info_wrapped[rid] for rid, ref in references.items()
+                    }
+                    batch.register_prepare_batch([references[rid].inputs[0] for rid in rows])
+                    batch.prepared_rids = rows
+                    batch.kept_rows = ([references[rid].kept_rows[0] for rid in rows]
+                                       if all(ref.kept_rows is not None for ref in references.values()) else None)
+                    batch.final_stream_rids = set().union(*(ref.final_stream_rids for ref in references.values()))
+                    metadata_preparation.enter_context(guard.stream_metadata(batch, {
+                        rid: {signal: tuple(choice.per_request_input_metadata[rid].stream_chunks[signal]
+                                            for choice in choices if choice is not None)}
+                        for rid, choices in stream_choices.items()
+                    }))
+                    batch.running_batched = submodule.can_batch(batch=batch, model_inputs=batch.inputs)
+                for maker, signal in (() if stream_incoming else incoming):
+                    maker_mgmt = self._submodules[maker]
+                    maker_slot = maker_mgmt.accelerator_graph_runner.slot_for(leases[maker])
+                    if maker_slot.static_outputs.per_rid_outputs:
+                        guard.refuse("a producer changes its routed outputs outside capture")
+                    output = maker_mgmt.submodule.repeat_carry(member_walks[maker], {signal})[signal].output
+                    source = (maker_slot.static_outputs.row_outputs or {}).get(output)
+                    if source is None or source.ndim == 0 or source.shape[0] < len(rows):
+                        guard.refuse(f"{maker}/{signal} has no captured row output")
+                    for i, rid in enumerate(rows):
+                        key = maker, batch.node_name, signal, rid
+                        # Ordinary collect gives the consumer split(1)
+                        # views, retaining the row axis.
+                        bindings[key] = source[i:i + 1]
+                        tensors[rid][signal] = [guard.unknown(key)]
+                for maker, consumer, signal in loop_back:
+                    if consumer != batch.node_name:
+                        continue
+                    incoming.append((maker, signal))
+                    for rid in rows:
+                        key = maker, consumer, signal, rid
+                        bindings[key] = tensors[rid][signal][0]
+                        tensors[rid][signal] = [guard.unknown(key)]
+                if not stream_incoming:
+                    batch.per_request_input_tensors = tensors
+                    with autocast_scope(self._autocast_dtype_for(batch.node_name), device_type=self._device.type,
+                                        node_name=batch.node_name):
+                        self.prepare_inputs(batch)
+                if tuple(batch.request_ids) != rows:
+                    guard.refuse("a member changed the common row set")
+                for inp in batch.inputs:
+                    for f in dataclasses.fields(inp):
+                        value = getattr(inp, f.name)
+                        # ARNodeInputs also exposes input_ids/input_embeds
+                        # as tensor fields. Only host/declaration fields
+                        # must be entirely real at this stage; final
+                        # staging still certifies every future tensor.
+                        if f.name != "tensor_inputs" and not isinstance(value, torch.Tensor):
+                            guard.require_real(value, f"NodeInputs.{f.name}")
+                # The same rotation can serve several node captures.
+                # Lease it once so a large group cannot wrap back onto a
+                # still-live component slot from the preceding step.
+                if batch.step_context.slot_lease is None and mgmt.slot_rotation in slots:
+                    batch.set_slot(slots[mgmt.slot_rotation])
+                preview = None
+                if stream_incoming:
+                    if mgmt.piecewise_runners:
+                        guard.refuse("streamed capture selection needs a whole-step declaration")
+                    # The existing declaration derives the capture key
+                    # from certified inputs, without reading an arbitrary
+                    # policy alternative in cg_key_info. This unpadded
+                    # preview is never admitted or planned.
+                    with watch_table_reads() as reads:
+                        preview = engine_step(
+                            submodule, graph_walk=batch.graph_walk, request_ids=batch.request_ids,
+                            inputs=batch.inputs, slot_lease=None, piecewise_leases={},
+                            per_request_info=batch.per_request_info,
+                        )
+                    _refuse_counter_read(batch.node_name, batch.step_context, reads, "declare_step")
+                    guard.require_real(preview, "streamed capture declaration")
+                lease = (self.reserve_replay_slot(batch, capture_step=preview) if preview is not None
+                         else self.reserve_replay_slot(batch))
+                if lease is None:
+                    guard.refuse("a member has no capture for the common rows")
+                slots.setdefault(mgmt.slot_rotation, lease.slot)
+                leases[batch.node_name] = lease
+                slot = runner.slot_for(lease)
+                if not streamed and (member + 1 < len(group.members) or repeats > 1):
+                    policies = submodule.get_stop_policies(batch.graph_walk)
+                    if (policies is None or (repeats > 1 and not set(policies) <= {group.unit.loop_name})
+                            or (policies and (member + 1 < len(group.members)
+                                              or any(p.reads_token for p in policies.values())))):
+                        guard.refuse("a member can end its Loop before later members execute")
+                if lease.bucket.graph_walk in runner._generator_walks:
+                    guard.refuse("a composed member draws from a torch generator")
+                if streamed:
+                    if slot.run is None or slot.run.state.membership is not None:
+                        guard.refuse("streamed composition needs captured fixed-membership bodies")
+                    if lease.bucket.bs > 1 and slot.run.state.active is None:
+                        guard.refuse("batched streamed bodies need captured owner masks")
+                    if self._custom_output_tail(submodule) and batch.node_name not in direct_producers and (
+                        not stream_incoming or batch.step_context.repeats != 1
+                    ):
+                        guard.refuse("a custom streamed tail needs one consumer compute and no producer transform")
+                elif slot.run is not None or batch.step_context.resident is not None:
+                    guard.refuse("connected resident runs need their shared run state staged before launch")
+                inputs, info = self._pad_batch(batch, mgmt, lease)
+                prepared.append(PreparedMember(
+                    batch, mgmt, lease, inputs, info, tuple(incoming), preview,
+                    stream_choices if stream_incoming else None,
+                ))
+            yield prepared
+
     def exec_group(self, group: ExecutionGroup) -> list[BatchedModelOutput] | None:
         """Prepare all ordinary members, then submit their captures together.
 
@@ -2826,232 +3066,29 @@ class Engine:
         """
         bindings: dict[Any, torch.Tensor] = {}
         guard = ConnectedInputs(bindings)
-        prepared = []
         admitted = []
-        rows = tuple(group.members[group.trigger][1].request_ids)
-        common_rows = rows
-        member_walks = dict(zip(group.unit.nodes, group.unit.graph_walks, strict=True))
-        finished = dict(zip(group.unit.nodes, group.finished_rids or [frozenset()] * len(group.members), strict=True))
-        active = [(scheduled, batch) for scheduled, batch in group.members
-                  if batch.request_ids and not set(batch.request_ids) <= finished[batch.node_name]]
-        leases = {}
-        slots = {}
-        owners = {}
-        back_keys, boundary_fields = set(), []
-        boundary = []
-        streamed = bool(group.unit.streaming_edges and any(
-            edge.chunk.reservation is not None and edge.chunk.reservation.decisions
-            for _, batch in active for edges in batch.stream_windows.values() for edge in edges
-        ))
-        idle_sources = ({maker for maker, _, _ in group.unit.streaming_edges
-                         for _, batch in group.members if batch.node_name == maker and batch.ring_width == 0}
-                        if streamed else set())
-        active = [(scheduled, batch) for scheduled, batch in active if batch.node_name not in idle_sources]
-        stream_choices, stream_target, stream_window = None, None, None
+        owners, leases = {}, {}
+        boundary, boundary_fields = [], []
         composed = None
+        stream_target = None
+        member_walks = dict(zip(group.unit.nodes, group.unit.graph_walks, strict=True))
         try:
-            with torch.no_grad(), guard.preparing(), ExitStack() as preparation:
-                metadata_preparation = ExitStack()
-                if not active or any(set(batch.request_ids) & finished[batch.node_name] for _, batch in active):
-                    guard.refuse("finished member rows must be removed before preparation")
-                if streamed and (len(group.members) != 2 or len(group.unit.streaming_edges) != 1
-                                 or group.unit.edges != group.unit.streaming_edges):
-                    guard.refuse("streamed composition needs two members and one internal edge")
-                if streamed:
-                    maker, consumer, _ = group.unit.streaming_edges[0]
-                    layouts = {batch.node_name: set(batch.request_ids) for _, batch in group.members}
-                    if not layouts[maker] <= layouts[consumer]:
-                        guard.refuse("every live producer needs a claimed consumer row")
-                for _, batch in active:
-                    preparation.enter_context(guard.isolated_info(batch))
-                preparation.enter_context(metadata_preparation)
-                repeats = active[0][1].step_context.repeats
-                if not streamed and any(batch.step_context.repeats != repeats for _, batch in active):
-                    guard.refuse("members requested different iteration counts")
-                if not streamed and repeats > 1 and group.unit.loop_name is None:
-                    guard.refuse("the graph did not certify a complete connected Loop")
-                if not streamed and repeats > 1 and any(
-                    len(batch.per_request_input_tensors.get(rid, {}).get(signal, ())) != 1
-                    for _, batch in group.members for _, consumer, signal in group.unit.loop_back
-                    if consumer == batch.node_name for rid in rows
-                ):
-                    repeats = 1  # the first ordinary iteration produces an empty seed
-                    for _, batch in group.members:
-                        batch.step_context.repeats = 1
-                # Streamed members already carry and count their own Loops
-                # inside DeviceRun. Only a shared fixed-count Loop needs
-                # these inter-member boundary copies and seed checks.
-                loop_back = group.unit.loop_back if not streamed and repeats > 1 else ()
-                direct_producers = set()
-                for maker in {a for a, _, _ in (*group.unit.edges, *loop_back)}:
-                    if not any(batch.node_name == maker for _, batch in active):
-                        continue
-                    producer = self._submodules[maker].submodule
-                    kind = type(producer)
-                    walk = member_walks[maker]
-                    if (kind.batch_postprocess is not NodeSubmodule.batch_postprocess
-                            or kind.filter_batched_output is not NodeSubmodule.filter_batched_output
-                            or kind.unpack_packed_outputs is not NodeSubmodule.unpack_packed_outputs
-                            or producer.spanned_outputs(walk) or producer.get_stop_policies(walk) is None):
-                        guard.refuse("a producer changes its routed outputs outside capture")
-                    if kind.postprocess is not NodeSubmodule.postprocess:
-                        signals = {signal for a, _, signal in group.unit.edges if a == maker}
-                        if not streamed or not signals <= producer.DIRECT_OUTPUTS.get(walk, frozenset()):
-                            guard.refuse("a custom producer needs declared direct outputs")
-                        direct_producers.add(maker)
-                for member, (_, batch) in enumerate(group.members):
-                    if not any(batch is live for _, live in active):
-                        continue
-                    rows = tuple(batch.request_ids)
-                    if not streamed and rows != common_rows:
-                        guard.refuse("fixed-count connected members need matching logical rows")
-                    mgmt = self._submodules[batch.node_name]
-                    runner, submodule = mgmt.accelerator_graph_runner, mgmt.submodule
-                    if runner is None or batch.chunk_ranges or batch.step_context.request_walks:
-                        guard.refuse("a member has no whole capture or has chunked/mixed rows")
-                    if (batch.graph_walk in self._keyed_walks.get(batch.node_name, ())
-                            or (mgmt.rings and not streamed)):
-                        guard.refuse("a member prepares cached prefixes or stream windows")
-                    if streamed and mgmt.joint_comm_group.world_size != 1:
-                        guard.refuse("streamed composition is single-rank")
-                    if streamed:
-                        if why := mgmt.carry_refusals.get(batch.graph_walk):
-                            guard.refuse(f"{batch.node_name}: {why}")
-                        internal = {signal for maker, _, signal in group.unit.streaming_edges
-                                    if maker == batch.node_name}
-                        if set(mgmt.rings) - internal:
-                            guard.refuse("a streamed member has output rings outside the composed edge")
-                    incoming = [(a, signal) for a, b, signal in group.unit.edges
-                                if b == batch.node_name and (not finished[a] or streamed)]
-                    tensors = {rid: dict(batch.per_request_input_tensors.get(rid, {})) for rid in rows}
-                    stream_incoming = incoming if streamed else ()
-                    if stream_incoming:
-                        maker, signal = stream_incoming[0]
-                        source = self._submodules[maker].loopback_rows
-                        stream_choices = {
-                            rid: self._prepare_stream_choices(batch, maker, signal, source.row(signal, rid), guard, rid)
-                            for rid in rows
-                        }
-                        references = {
-                            rid: next((choice for choice in choices if choice is not None), None)
-                            for rid, choices in stream_choices.items()
-                        }
-                        if any(reference is None for reference in references.values()):
-                            guard.refuse("a final stream tail with no computation completes on its ordinary path")
-                        batch.per_request_input_tensors = {
-                            rid: ref.per_request_input_tensors[rid] for rid, ref in references.items()
-                        }
-                        batch.per_request_input_metadata = {
-                            rid: ref.per_request_input_metadata[rid] for rid, ref in references.items()
-                        }
-                        batch.per_request_info_wrapped = {
-                            rid: ref.per_request_info_wrapped[rid] for rid, ref in references.items()
-                        }
-                        batch.register_prepare_batch([references[rid].inputs[0] for rid in rows])
-                        batch.prepared_rids = rows
-                        batch.kept_rows = ([references[rid].kept_rows[0] for rid in rows]
-                                           if all(ref.kept_rows is not None for ref in references.values()) else None)
-                        batch.final_stream_rids = set().union(*(ref.final_stream_rids for ref in references.values()))
-                        metadata_preparation.enter_context(guard.stream_metadata(batch, {
-                            rid: {signal: tuple(choice.per_request_input_metadata[rid].stream_chunks[signal]
-                                                for choice in choices if choice is not None)}
-                            for rid, choices in stream_choices.items()
-                        }))
-                        batch.running_batched = submodule.can_batch(batch=batch, model_inputs=batch.inputs)
-                    for maker, signal in (() if stream_incoming else incoming):
-                        maker_mgmt = self._submodules[maker]
-                        maker_slot = maker_mgmt.accelerator_graph_runner.slot_for(leases[maker])
-                        if maker_slot.static_outputs.per_rid_outputs:
-                            guard.refuse("a producer changes its routed outputs outside capture")
-                        output = maker_mgmt.submodule.repeat_carry(member_walks[maker], {signal})[signal].output
-                        source = (maker_slot.static_outputs.row_outputs or {}).get(output)
-                        if source is None or source.ndim == 0 or source.shape[0] < len(rows):
-                            guard.refuse(f"{maker}/{signal} has no captured row output")
-                        for i, rid in enumerate(rows):
-                            key = maker, batch.node_name, signal, rid
-                            # Ordinary collect gives the consumer split(1)
-                            # views, retaining the row axis.
-                            bindings[key] = source[i:i + 1]
-                            tensors[rid][signal] = [guard.unknown(key)]
-                    for maker, consumer, signal in loop_back:
-                        if consumer != batch.node_name:
-                            continue
-                        incoming.append((maker, signal))
-                        for rid in rows:
-                            key = maker, consumer, signal, rid
-                            bindings[key] = tensors[rid][signal][0]
-                            back_keys.add(key)
-                            tensors[rid][signal] = [guard.unknown(key)]
-                    if not stream_incoming:
-                        batch.per_request_input_tensors = tensors
-                        with autocast_scope(self._autocast_dtype_for(batch.node_name), device_type=self._device.type,
-                                            node_name=batch.node_name):
-                            self.prepare_inputs(batch)
-                    if tuple(batch.request_ids) != rows:
-                        guard.refuse("a member changed the common row set")
-                    for inp in batch.inputs:
-                        for f in dataclasses.fields(inp):
-                            value = getattr(inp, f.name)
-                            # ARNodeInputs also exposes input_ids/input_embeds
-                            # as tensor fields. Only host/declaration fields
-                            # must be entirely real at this stage; final
-                            # staging still certifies every future tensor.
-                            if f.name != "tensor_inputs" and not isinstance(value, torch.Tensor):
-                                guard.require_real(value, f"NodeInputs.{f.name}")
-                    # The same rotation can serve several node captures.
-                    # Lease it once so a large group cannot wrap back onto a
-                    # still-live component slot from the preceding step.
-                    if mgmt.slot_rotation in slots:
-                        batch.set_slot(slots[mgmt.slot_rotation])
-                    preview = None
-                    if stream_incoming:
-                        if mgmt.piecewise_runners:
-                            guard.refuse("streamed capture selection needs a whole-step declaration")
-                        # The existing declaration derives the capture key
-                        # from certified inputs, without reading an arbitrary
-                        # policy alternative in cg_key_info. This unpadded
-                        # preview is never admitted or planned.
-                        with watch_table_reads() as reads:
-                            preview = engine_step(
-                                submodule, graph_walk=batch.graph_walk, request_ids=batch.request_ids,
-                                inputs=batch.inputs, slot_lease=None, piecewise_leases={},
-                                per_request_info=batch.per_request_info,
-                            )
-                        _refuse_counter_read(batch.node_name, batch.step_context, reads, "declare_step")
-                        guard.require_real(preview, "streamed capture declaration")
-                    lease = (self.reserve_replay_slot(batch, capture_step=preview) if preview is not None
-                             else self.reserve_replay_slot(batch))
-                    if lease is None:
-                        guard.refuse("a member has no capture for the common rows")
-                    slots.setdefault(mgmt.slot_rotation, lease.slot)
-                    leases[batch.node_name] = lease
-                    slot = runner.slot_for(lease)
-                    if not streamed and (member + 1 < len(group.members) or repeats > 1):
-                        policies = submodule.get_stop_policies(batch.graph_walk)
-                        if (policies is None or (repeats > 1 and not set(policies) <= {group.unit.loop_name})
-                                or (policies and (member + 1 < len(group.members)
-                                                  or any(p.reads_token for p in policies.values())))):
-                            guard.refuse("a member can end its Loop before later members execute")
-                    if lease.bucket.graph_walk in runner._generator_walks:
-                        guard.refuse("a composed member draws from a torch generator")
-                    if streamed:
-                        if slot.run is None or slot.run.state.membership is not None:
-                            guard.refuse("streamed composition needs captured fixed-membership bodies")
-                        if lease.bucket.bs > 1 and slot.run.state.active is None:
-                            guard.refuse("batched streamed bodies need captured owner masks")
-                        if self._custom_output_tail(submodule) and batch.node_name not in direct_producers and (
-                            not stream_incoming or batch.step_context.repeats != 1
-                        ):
-                            guard.refuse("a custom streamed tail needs one consumer compute and no producer transform")
-                    elif slot.run is not None or batch.step_context.resident is not None:
-                        guard.refuse("connected resident runs need their shared run state staged before launch")
+            with self._prepare_group_inputs(group, guard) as prepared:
+                streamed = any(part.choices is not None for part in prepared)
+                repeats = prepared[0].batch.step_context.repeats
+                leases = {part.batch.node_name: part.lease for part in prepared}
+                direct_producers = {part.batch.node_name for part in prepared
+                                    if any(maker == part.batch.node_name for maker, _, _ in group.unit.edges)
+                                    if type(part.mgmt.submodule).postprocess is not NodeSubmodule.postprocess}
+                back_keys = ({(a, b, signal, rid) for a, b, signal in group.unit.loop_back
+                              for rid in group.members[group.trigger][1].request_ids}
+                             if not streamed and repeats > 1 else set())
+                for batch, mgmt, _, inputs, _, _, preview, _ in prepared:
                     batch.step_context.unit_id = group.claim
-                    batch.step_context.unit_member = member
-                    inputs, info = self._pad_batch(batch, mgmt, lease)
-                    prepared.append((batch, mgmt, lease, inputs, info, incoming))
+                    batch.step_context.unit_member = group.unit.nodes.index(batch.node_name)
                     with watch_table_reads() as reads:
                         batch.step = self._declare_step(batch, batch.step_context.padded_request_ids, inputs,
-                                                        submodule, batch.step_context, batch.step)
+                                                        mgmt.submodule, batch.step_context, batch.step)
                     _refuse_counter_read(batch.node_name, batch.step_context, reads, "declare_step")
                     if batch.step is not None:
                         batch.step.set_ctx(batch.step_context)
@@ -3098,7 +3135,7 @@ class Engine:
                     repeats = max(1, repeats)
                     for _, batch in group.members:
                         batch.step_context.repeats = repeats
-                for batch, _, _, inputs, _, _ in prepared:
+                for batch, _, _, inputs, _, _, _, _ in prepared:
                     admit = self._admit_step(batch, batch.step_context.padded_request_ids, inputs,
                                              batch.step_context, batch.step)
                     if not admit.ok:
@@ -3107,7 +3144,7 @@ class Engine:
                         admitted.append(batch.step)
                     if not streamed and batch.step_context.repeats != repeats:
                         guard.refuse("a member changed the common iteration count during admission")
-                for batch, mgmt, lease, inputs, info, incoming in prepared:
+                for batch, mgmt, lease, inputs, info, incoming, _, _ in prepared:
                     rows = tuple(batch.request_ids)
                     with autocast_scope(self._autocast_dtype_for(batch.node_name), device_type=self._device.type,
                                         node_name=batch.node_name):
@@ -3190,61 +3227,58 @@ class Engine:
                         *self._runner.replay_columns(batch.step, repeats),
                     ]
                     group.parts.append(RunPart(slot, copies, columns))
-                # Model preparation is over. Owner staging below reads the
-                # retained policy receipts themselves, not a model-visible
-                # representative of an unresolved decision.
-                metadata_preparation.close()
-                if streamed:
-                    maker, consumer, signal = group.unit.streaming_edges[0]
-                    batches = {batch.node_name: batch for _, batch in group.members}
-                    consumer_batch, producer_batch = batches[consumer], batches[maker]
-                    rows = tuple(consumer_batch.request_ids)
-                    reservations = [next(edge.chunk.reservation for edge in consumer_batch.stream_windows[rid]
-                                         if edge.name == signal) for rid in rows]
-                    tables = self._submodules[consumer].submodule.iteration_tables
-                    consumer_state = self._submodules[consumer].accelerator_graph_runner.slot_for(
-                        leases[consumer],
-                    ).run.state
-                    planner = self._submodules[consumer].resident
-                    if planner is None or consumer_state.dropping is None:
-                        guard.refuse("streamed policy needs resident owner bindings")
-                    coverage = max(len(r.positions) for r in reservations)
-                    if coverage > len(self._submodules[maker].loopback_rows.row(signal, rows[0])):
-                        guard.refuse("streamed policy coverage exceeds its retained ring capacity")
-                    try:
-                        stream_window = tables.prepare_stream_window(
-                            leases[consumer], max(len(r.decisions) for r in reservations),
-                            max(len(r.transitions) for r in reservations), coverage,
-                            rows=consumer_state.dropping.rows, slots=planner.max_slots,
-                        )
-                    except ValueError as error:
-                        guard.refuse(str(error))  # a larger policy snapshot takes the ordinary path
-                    if stream_target is None:
-                        guard.refuse("a streamed consumer discarded its future payload")
-                    composed = self._compose_stream(group, leases, stream_window, stream_target, guard)
-                    tables.stage_stream_window(
-                        leases[consumer], [planner.slot_of(rid) for rid in rows], reservations,
-                        [[choice is not None for choice in stream_choices[rid]] for rid in rows],
-                        source_rows=self._submodules[maker].loopback_rows.retained_rows(rows),
-                        producer_limits=[
-                            producer_batch.ring_width if maker in leases and rid in producer_batch.request_ids else 0
-                            for rid in rows
-                        ],
+            if streamed:
+                maker, consumer, signal = group.unit.streaming_edges[0]
+                stream_choices = next(part.choices for part in prepared if part.batch.node_name == consumer)
+                batches = {batch.node_name: batch for _, batch in group.members}
+                consumer_batch, producer_batch = batches[consumer], batches[maker]
+                rows = tuple(consumer_batch.request_ids)
+                reservations = [next(edge.chunk.reservation for edge in consumer_batch.stream_windows[rid]
+                                     if edge.name == signal) for rid in rows]
+                tables = self._submodules[consumer].submodule.iteration_tables
+                consumer_state = self._submodules[consumer].accelerator_graph_runner.slot_for(
+                    leases[consumer],
+                ).run.state
+                planner = self._submodules[consumer].resident
+                if planner is None or consumer_state.dropping is None:
+                    guard.refuse("streamed policy needs resident owner bindings")
+                coverage = max(len(r.positions) for r in reservations)
+                if coverage > len(self._submodules[maker].loopback_rows.row(signal, rows[0])):
+                    guard.refuse("streamed policy coverage exceeds its retained ring capacity")
+                try:
+                    stream_window = tables.prepare_stream_window(
+                        leases[consumer], max(len(r.decisions) for r in reservations),
+                        max(len(r.transitions) for r in reservations), coverage,
+                        rows=consumer_state.dropping.rows, slots=planner.max_slots,
                     )
-                elif repeats > 1:
-                    row_of = {rid: i for i, rid in enumerate(rows)}
-                    for maker, consumer, signal, rid in back_keys:
-                        mgmt = self._submodules[maker]
-                        slot = mgmt.accelerator_graph_runner.slot_for(leases[maker])
-                        name = mgmt.submodule.repeat_carry(member_walks[maker], {signal})[signal].output
-                        source = (slot.static_outputs.row_outputs or {}).get(name)
-                        if (slot.static_outputs.per_rid_outputs or source is None or source.ndim == 0
-                                or source.shape[0] < len(rows)):
-                            guard.refuse(f"{maker}/{signal} has no captured Loop carry")
-                        row = row_of[rid]
-                        guard.rebind((maker, consumer, signal, rid), source[row:row + 1])
-                    boundary = [copy for value, target, keys, name, destinations in boundary_fields
-                                for copy in destinations(name, guard.copies(value, target, keys, back_keys))]
+                except ValueError as error:
+                    guard.refuse(str(error))  # a larger policy snapshot takes the ordinary path
+                if stream_target is None:
+                    guard.refuse("a streamed consumer discarded its future payload")
+                composed = self._compose_stream(group, leases, stream_window, stream_target, guard)
+                tables.stage_stream_window(
+                    leases[consumer], [planner.slot_of(rid) for rid in rows], reservations,
+                    [[choice is not None for choice in stream_choices[rid]] for rid in rows],
+                    source_rows=self._submodules[maker].loopback_rows.retained_rows(rows),
+                    producer_limits=[
+                        producer_batch.ring_width if maker in leases and rid in producer_batch.request_ids else 0
+                        for rid in rows
+                    ],
+                )
+            elif repeats > 1:
+                row_of = {rid: i for i, rid in enumerate(rows)}
+                for maker, consumer, signal, rid in back_keys:
+                    mgmt = self._submodules[maker]
+                    slot = mgmt.accelerator_graph_runner.slot_for(leases[maker])
+                    name = mgmt.submodule.repeat_carry(member_walks[maker], {signal})[signal].output
+                    source = (slot.static_outputs.row_outputs or {}).get(name)
+                    if (slot.static_outputs.per_rid_outputs or source is None or source.ndim == 0
+                            or source.shape[0] < len(rows)):
+                        guard.refuse(f"{maker}/{signal} has no captured Loop carry")
+                    row = row_of[rid]
+                    guard.rebind((maker, consumer, signal, rid), source[row:row + 1])
+                boundary = [copy for value, target, keys, name, destinations in boundary_fields
+                            for copy in destinations(name, guard.copies(value, target, keys, back_keys))]
             if not streamed and self._device.type != "cpu":
                 from mstar.engine.accelerator_graph_backend import copy_words
 
@@ -3272,7 +3306,7 @@ class Engine:
                     target.copy_(source.reshape_as(target), non_blocking=True)
                 composed.replay()
                 retained = []
-                for batch, mgmt, lease, _, _, _ in prepared:
+                for batch, mgmt, lease, _, _, _, _, _ in prepared:
                     run = mgmt.accelerator_graph_runner.slot_for(lease).run
                     stops, values, spans = run.results(batch.step_context.repeats)
                     if batch.node_name == group.unit.streaming_edges[0][1]:
@@ -3284,12 +3318,12 @@ class Engine:
                         output_spans={**(raw.output_spans or {}), **spans} or None,
                     ))
             else:
-                retained = prepared[0][1].accelerator_graph_runner.launch_parts(
+                retained = prepared[0].mgmt.accelerator_graph_runner.launch_parts(
                     group.parts, repeats,
-                    [mgmt.run_columns.get(batch.graph_walk, ()) for batch, mgmt, _, _, _, _ in prepared],
+                    [mgmt.run_columns.get(batch.graph_walk, ()) for batch, mgmt, _, _, _, _, _, _ in prepared],
                     capacity=max(repeats, group.capacity), boundary=boundary, initial=group.initial_copies,
                 )
-            for batch, mgmt, _, _, _, _ in prepared:
+            for batch, mgmt, _, _, _, _, _, _ in prepared:
                 self._commit_step(batch, mgmt, batch.step, batch.step_context)
                 # A later member can advance the same owner. Preserve what
                 # this member publishes now; the worker still decides which
@@ -3299,7 +3333,7 @@ class Engine:
                     graph_walk=batch.graph_walk, request_walks=batch.step_context.request_walks,
                 )
                 batch.commit_done.set()
-            for (batch, mgmt, lease, inputs, info, _), columns in zip(prepared, retained, strict=True):
+            for (batch, mgmt, lease, inputs, info, _, _, _), columns in zip(prepared, retained, strict=True):
                 if streamed:
                     # Independent counts and policy receipts resolve before a
                     # model tail or graph completion can see these columns.
