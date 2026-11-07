@@ -959,7 +959,7 @@ class _WaveSoundfile(types.ModuleType):
 
     def info(self, path):
         with wave.open(str(path)) as wf:
-            return types.SimpleNamespace(frames=wf.getnframes(), samplerate=wf.getframerate())
+            return types.SimpleNamespace(format="WAV", frames=wf.getnframes(), samplerate=wf.getframerate())
 
     def read(self, path, dtype="float32", always_2d=False):
         data, rate = self._open(path)
