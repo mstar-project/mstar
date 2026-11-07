@@ -258,7 +258,7 @@ handshake and has no ``/healthz``. Only the Python frontend serves this route;
 ``ws_max_message_mb`` (by default ``MSTAR_MAX_BODY_MB``, see :doc:`serving`). A larger
 observation closes the socket with ``1009`` and no error frame, so a deployment whose robots
 send several raw high-resolution cameras raises it. An observation is parsed on the server's
-event loop, so a very large one holds up the server's other requests while it does.
+event loop, so a very large one holds up the server's other requests while it is parsed.
 
 .. code-block:: python
 
