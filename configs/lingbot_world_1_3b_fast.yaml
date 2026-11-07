@@ -13,14 +13,14 @@ model_kwargs:
 # text length; the dit's rolling K/V live in its own store (resources below).
 max_seq_len: 512
 
-# One rollout at a time. Raise this to run several rollouts at once; each one
-# also needs room in the K/V pool below, and waits for it when the pool is full
-# (the wait counts against the API server's request timeout, --timeout).
+# One rollout at a time; the model refuses any other value. Each rollout's text
+# K/V (90 MiB) and VAE caches live outside the K/V pool below, so this is their
+# only bound until they are engine resources.
 max_concurrent_requests: 1
 
-# K/V memory for the DiT, reserved at startup and shared by all rollouts.
-# 64800 tokens = 11.1 GiB: room for one rollout at the largest size (720x1280),
-# or two at the default size (464x832, 4.7 GiB each).
+# K/V memory for the DiT, reserved at startup. 64800 tokens = 11.1 GiB: room for
+# one rollout at the largest size (720x1280); one at the default size (464x832)
+# takes 4.7 GiB.
 resources:
   dit_kv:
     pool_tokens: 64800

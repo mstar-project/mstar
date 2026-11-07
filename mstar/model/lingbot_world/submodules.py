@@ -24,7 +24,8 @@ pairs the chunk's queries with that range and with the text. The text K/V
 (computed once per request) and the VAE encoder's and decoder's causal-conv
 caches stay in the request's ``PerRequestState``, outside the pool. Nothing in
 the engine counts them, and at small output sizes the pool admits many
-rollouts, so ``max_concurrent_requests`` is what bounds them.
+rollouts, so the model refuses a config that runs more than one at a time
+(``LingBotWorldModel.validate_config_yaml``).
 
 Numerics are the model's, not the engine's: ``LingBotWorldModel.get_autocast_dtype``
 returns None, the DiT enters the reference's bf16 autocast itself, and the VAE
