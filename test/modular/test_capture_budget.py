@@ -77,6 +77,8 @@ class _StubMeasuredRunner:
         self._device = device
         self._autocast_dtype = None
         self._submodule_name = "Thinker"
+        self._member = ""
+        self._connected_walks = frozenset()
         self._resident = None
         self._num_slots = 2
         self._capture_costs = {}
@@ -87,7 +89,8 @@ class _StubMeasuredRunner:
         self.forwards: list[int] = []
 
     def prepare_for_capture(self):
-        return [CGSlotSpec(bucket=b, slot=s, config=SimpleNamespace()) for b in self._steps for s in (0, 1)]
+        return [CGSlotSpec(bucket=b, slot=s, config=SimpleNamespace(replay_graph_walks=[b.graph_walk]))
+                for b in self._steps for s in (0, 1)]
 
     @contextmanager
     def _warmed(self, spec, forwards):
