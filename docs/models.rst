@@ -241,7 +241,8 @@ The worker selects common rows, prepares and admits all members, and submits
 their captures and internal copies in one CUDA graph launch, in graph order.
 The composed graph and its stable bindings stay with the capture slot; ordinary
 external inputs are staged before launch. An unsubmitted refusal runs the
-ordinary head. Currently eligible sections are acyclic and on one CUDA GPU.
+ordinary head. Eligible sections run on one CUDA GPU, including one iteration
+of a Loop. A member that can stop before later members remains a boundary.
 Shared resources qualify through their own ``connected_refusal`` checks;
 KV, positions and FlashInfer plans retain separate member buffers and project
 prior members' growth before commit. Shared KV forks, retention and prefix-cache

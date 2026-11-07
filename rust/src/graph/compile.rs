@@ -200,7 +200,7 @@ pub fn compile_one(
 
     let by_name = node_specs.iter().enumerate().map(|(i, n)| (n.name, i as NodeId)).collect();
     let loop_by_name = loop_specs.iter().enumerate().map(|(i, l)| (l.name, i as LoopId)).collect();
-    let units = ExecutionUnit::compile(&node_specs);
+    let units = ExecutionUnit::compile(&node_specs, &loop_specs);
     Ok(Arc::new(CompiledGraph {
         nodes: node_specs, loops: loop_specs, by_name, loop_by_name, root_nodes, root_loops, units,
     }))

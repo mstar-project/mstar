@@ -1081,8 +1081,10 @@ struct UnitClaim {
         Ok(())
     }
 
-    fn land_unit_member(&mut self, wg: WgIndex, node: NodeId, rid: u32) {
-        let Some(id) = self.state(wg, rid).and_then(|s| s.unit_claim(node)) else { return };
+    fn land_unit_member(&mut self, wg: WgIndex, node: NodeId, rid: u32, claim_id: Option<u64>) {
+        // Completing the last member can finish a Loop and clear its node
+        // subtree. Keep the claim identity captured before that transition.
+        let Some(id) = claim_id else { return };
         let g = self.g(wg).clone();
         let claim = self.unit_claims.get_mut(&id).unwrap();
         let unit = &g.units[&claim.head];
@@ -2990,9 +2992,10 @@ impl GraphRuntime {
             };
             // Before complete(), which clears the flag.
             let was_speculative = state.is_in_flight(node) && state.unit_claim(node).is_none();
+            let claim_id = state.unit_claim(node);
             let stride = input.loop_strides.as_ref().map_or(1, |s| s[i]);
             let completed = state.complete_strided(&g, node, &out_tensors, stride);
-            self.land_unit_member(wg, node, rid);
+            self.land_unit_member(wg, node, rid, claim_id);
             let mut pre_shard_edges = completed.edges;
             // A step that repeated routes a column an iteration, for the
             // edges that take items. The loop-back reads the last one only.

@@ -2404,6 +2404,10 @@ class Engine:
                     slots.setdefault(mgmt.slot_rotation, lease.slot)
                     leases[batch.node_name] = lease
                     slot = runner.slot_for(lease)
+                    if member + 1 < len(group.members):
+                        policies = submodule.get_stop_policies(batch.graph_walk)
+                        if policies is None or policies:
+                            guard.refuse("a member can end its Loop before later members execute")
                     if lease.bucket.graph_walk in runner._generator_walks:
                         guard.refuse("a composed member draws from a torch generator")
                     if slot.run is not None or batch.step_context.resident is not None:

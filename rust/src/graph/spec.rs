@@ -157,21 +157,43 @@ pub struct ExecutionUnit {
 }
 
 impl ExecutionUnit {
-    pub fn compile(nodes: &[NodeSpec]) -> FxHashMap<NodeId, Self> {
+    pub fn compile(nodes: &[NodeSpec], loops: &[LoopSpec]) -> FxHashMap<NodeId, Self> {
+        let is_loopback = |source: NodeId, edge: &EdgeSpec| {
+            let mut enclosing = nodes[source as usize].loop_id;
+            while let Some(id) = enclosing {
+                let lp = &loops[id as usize];
+                if lp.loop_back.contains(&(edge.name, edge.dest_sym)) {
+                    return true;
+                }
+                enclosing = lp.parent;
+            }
+            false
+        };
+        let cached_by_loop = |source: NodeId, signal: Sym| {
+            let mut enclosing = nodes[source as usize].loop_id;
+            while let Some(id) = enclosing {
+                let lp = &loops[id as usize];
+                if lp.output_names.contains(&signal) || lp.accum_names.contains(&signal) {
+                    return true;
+                }
+                enclosing = lp.parent;
+            }
+            false
+        };
         let mut units = FxHashMap::default();
         for head in 0..nodes.len() as NodeId {
             let mut members = Vec::new();
             let mut current = head;
             loop {
                 let node = &nodes[current as usize];
-                // Loops and streaming policies need their own lowering, not
-                // a guessed order over their member names.
-                if node.loop_id.is_some() || node.streaming_mask != 0 || members.contains(&current) {
+                // Forward dependencies define the order inside a Loop too.
+                // A declared back edge belongs to the next iteration.
+                if node.streaming_mask != 0 || members.contains(&current) {
                     break;
                 }
                 members.push(current);
                 let mut targets: Vec<_> = node.outputs.iter().filter_map(|edge| match edge.dest {
-                    Dest::Local(next) if !edge.streaming => Some(next),
+                    Dest::Local(next) if !edge.streaming && !is_loopback(current, edge) => Some(next),
                     _ => None,
                 }).collect();
                 targets.sort_unstable();
@@ -184,9 +206,10 @@ impl ExecutionUnit {
             if members.len() < 2 {
                 continue;
             }
-            // A back edge, even outside an explicit Loop, is a boundary.
+            // An undeclared cycle remains a boundary.
             if members.iter().enumerate().any(|(i, &source)| nodes[source as usize].outputs.iter().any(|e| {
                 matches!(e.dest, Dest::Local(dest) if members[..=i].contains(&dest))
+                    && !is_loopback(source, e)
             })) {
                 continue;
             }
@@ -197,7 +220,9 @@ impl ExecutionUnit {
                 let mut stored = Vec::new();
                 for edge in &nodes[source as usize].outputs {
                     let internal = match edge.dest {
-                        Dest::Local(dest) if !edge.streaming => members.iter().position(|&n| n == dest),
+                        Dest::Local(dest) if !edge.streaming && !is_loopback(source, edge) => {
+                            members.iter().position(|&n| n == dest)
+                        },
                         _ => None,
                     };
                     if let Some(i) = internal {
@@ -207,7 +232,7 @@ impl ExecutionUnit {
                             edges.push(binding);
                         }
                     }
-                    if internal.is_none() || edge.persist || edge.new_token {
+                    if internal.is_none() || edge.persist || edge.new_token || cached_by_loop(source, edge.name) {
                         stored.push(edge.name);
                     }
                 }

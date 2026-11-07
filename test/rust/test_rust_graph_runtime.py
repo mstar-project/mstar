@@ -657,7 +657,7 @@ def test_prep_respects_room_for_continuing(runtime):
     ).ready_rids == [rid]
 
 
-def _two_node_runtime(a_outputs=(), b_outputs=(), communicator=None):
+def _two_node_runtime(a_outputs=(), b_outputs=(), communicator=None, loop=False):
     """a -> b, where b ALSO needs an input a does not produce.
 
     A same-node loop-back is a poor subject for not-ready: its held external
@@ -666,21 +666,31 @@ def _two_node_runtime(a_outputs=(), b_outputs=(), communicator=None):
     cross-node target checks the current slot, which is the case the prep
     filters actually see.
     """
-    wg = WorkerGraph(
-        section=Sequential(sections=[
-            GraphNode(
-                name="a", input_names={"in"},
-                outputs=[GraphEdge(name="x", next_node="b"), *a_outputs],
-            ),
-            GraphNode(name="b", input_names={"x", "y"}, outputs=list(b_outputs)),
+    section = Sequential(sections=[
+        GraphNode(
+            name="a", input_names={"x" if loop else "in"},
+            outputs=[GraphEdge(name="x", next_node="b"), *a_outputs],
+        ),
+        GraphNode(name="b", input_names={"x", "y"}, outputs=[
+            *b_outputs, *([GraphEdge(name="x", next_node="a")] if loop else []),
         ]),
+    ])
+    if loop:
+        from mstar.graph.special_destinations import EMIT_TO_CLIENT
+
+        section = Sequential(sections=[Loop(
+            name="steps", section=section, max_iters=2,
+            outputs=[GraphEdge(name="x", next_node=EMIT_TO_CLIENT, output_modality="text")],
+        )])
+    wg = WorkerGraph(
+        section=section,
         graph_walks={WALK}, ranks=[0], worker_graph_id=WG_ID,
     )
     book = RustTensorBookkeeping()
     runtime = rust_runtime.RustGraphRuntime(
         my_worker_id=WORKER, my_worker_graphs=[wg],
         all_wg_ids_to_graph_walks={WG_ID: {WALK}},
-        all_wg_ids_to_dyn_loops={WG_ID: set()},
+        all_wg_ids_to_dyn_loops={WG_ID: {"steps"} if loop else set()},
         all_wg_ids_to_nodes={WG_ID: {"a", "b"}},
         node_to_partition={"a": "default", "b": "default"},
         sharding_config=ShardingConfig(
@@ -834,6 +844,58 @@ def test_unit_lands_in_graph_order_with_internal_readiness_and_external_outputs_
     assert conductor.recv_timeout(0) is None
     assert not rt.cancel_execution_unit(claim)
     assert rt.get_ready_nodes(set()) == []
+
+
+def test_connected_loop_iterations_keep_cached_outputs_and_release_the_claim_on_finish(tmp_path):
+    from types import SimpleNamespace
+
+    from mstar_rust import ZmqCommunicator
+
+    import mstar.communication.wire_types  # noqa: F401 -- register real wire messages
+    from mstar.communication.wire import decode
+
+    comm = ZmqCommunicator(WORKER, str(tmp_path))
+    client = ZmqCommunicator("api_server", str(tmp_path))
+    conductor = ZmqCommunicator("conductor", str(tmp_path))
+    rt = _two_node_runtime(communicator=SimpleNamespace(_inner=comm), loop=True)
+    rid = _admit(rt)
+    rt.ingest_inputs_batch(_ingest_block([rid, rid], [_spec("x", "a"), _spec("y", "b")]))
+    unit, = rt.execution_units(WALK)
+    assert unit.edges == (("a", "b", "x"),)
+    # x is consumed internally AND retained by the Loop's output cache.
+    assert unit.output_signals == (("x",), ("x",))
+    for uuid in (903, 904):
+        claim, _ = rt.claim_execution_unit("a", WALK, [rid])
+        assert rt.submit_execution_unit(claim)
+        rt._bookkeeping_for_test.put_tensor(uuid, _tensor_info(uuid))
+        rt._bookkeeping_for_test.increment_ref(uuid)
+        first = _route(rt, [rid], "a", ["x"], [[[uuid]]])
+        rt.send_outputs(_send_input(rid, first.completion_id))
+        last = _route(rt, [rid], "b", ["x"], [[[]]])
+        rt.send_outputs(_send_input(rid, last.completion_id))
+        assert not rt.cancel_execution_unit(claim)
+        if uuid == 903:
+            assert client.recv_timeout(0) is None
+            assert rt.get_ready_nodes(set())[0].node_name == "a"
+    emitted = decode(client.recv_timeout(1000))
+    assert emitted.body.graph_edge.tensor_info[0].uuid == 904
+    assert client.recv_timeout(0) is None
+    assert conductor.recv_timeout(1000) is not None
+    assert rt.get_ready_nodes(set()) == []
+    assert rt.claim_execution_unit("a", WALK, [rid]) is None
+
+
+def test_connected_prefix_enters_a_loop_through_ordinary_completion(runtime):
+    rid = _admit(runtime)
+    runtime.ingest_inputs_batch(_ingest_block([rid], [_spec("prompt", "prefill")]))
+    unit, = runtime.execution_units(WALK)
+    assert unit.nodes == ("prefill", "ar_decode")
+    claim, _ = runtime.claim_execution_unit("prefill", WALK, [rid])
+    assert runtime.submit_execution_unit(claim)
+    _route(runtime, [rid], "prefill", [], [[]])
+    _route(runtime, [rid], "ar_decode", ["token", "kv_cache"], [[[], []]])
+    assert not runtime.cancel_execution_unit(claim)
+    assert runtime.get_ready_nodes(set())[0].node_name == "ar_decode"
 
 
 def _ab(rids, room=None):

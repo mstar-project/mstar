@@ -428,7 +428,7 @@ def test_connected_completion_keeps_ordinary_last_member_metadata(kept):
     assert eng._loopback_rows(group.members[1][1]) == ([False, True] if kept else None)
 
 
-@pytest.mark.parametrize("unsupported", ["run", "resident", "row_heads", "generator", "generator_alias"])
+@pytest.mark.parametrize("unsupported", ["run", "resident", "row_heads", "generator", "generator_alias", "early_stop"])
 def test_connected_refuses_unstaged_captured_state_before_launch(unsupported):
     eng, group, events = _connected_engine()
     batch = group.members[0][1]
@@ -438,6 +438,8 @@ def test_connected_refuses_unstaged_captured_state_before_launch(unsupported):
         batch.step_context.resident = object()
     elif unsupported == "run":
         slot.run = object()
+    elif unsupported == "early_stop":
+        eng._submodules["a"].submodule.get_stop_policies = lambda walk: {"loop": object()}
     elif unsupported in {"generator", "generator_alias"}:
         runner._generator_walks.add("prefill")
         if unsupported == "generator_alias":

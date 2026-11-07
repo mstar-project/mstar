@@ -480,7 +480,17 @@ impl RequestState {
     /// A unit may supply missing internal inputs, never overwrite an input
     /// already queued for this node. All external inputs must already exist.
     pub fn can_claim_unit(&self, unit: &ExecutionUnit) -> bool {
+        if self.is_done {
+            return false;
+        }
         unit.nodes.iter().zip(&unit.internal_inputs).all(|(&node, &internal)| {
+            let mut enclosing = self.graph.node(node).loop_id;
+            while let Some(id) = enclosing {
+                if self.loops[id as usize].done {
+                    return false;
+                }
+                enclosing = self.graph.lp(id).parent;
+            }
             let st = &self.nodes[node as usize];
             !st.completed && !st.in_flight && st.unit_claim.is_none()
                 && (st.cur.mask & internal) == 0
