@@ -2818,26 +2818,23 @@ class Engine:
             if not outcome.ready:
                 return None
             plan = ctx.resident.prepare_rows(step, ctx)
+            inputs, infos = self._pad_batch(batch, mgmt, lease)
+            engine_inputs, preprocessed = self._preprocess_step(
+                batch, mgmt, [rid], inputs, infos, ctx, lease, step,
+            )
+            for name, captured in slot.static_inputs.items():
+                if not isinstance(captured, torch.Tensor) and preprocessed.get(name) != captured:
+                    raise ValueError("joining inputs change a captured non-tensor specialization")
             if slot.row_heads:
-                inputs, infos = self._pad_batch(batch, mgmt, lease)
-                engine_inputs, preprocessed = self._preprocess_step(
-                    batch, mgmt, [rid], inputs, infos, ctx, lease, step,
-                )
-                for name, captured in slot.static_inputs.items():
-                    if not isinstance(captured, torch.Tensor) and preprocessed.get(name) != captured:
-                        raise ValueError("joining inputs change a captured non-tensor specialization")
                 if batch.kept_rows != [True] and any(
                     not isinstance(preprocessed.get(name), torch.Tensor) for name in slot.row_heads.values()
                 ):
                     raise ValueError("joining row has no routed value for a captured input owner")
                 self._write_routed_rows(batch, mgmt, slot, engine_inputs, preprocessed, stager=membership.stager)
             if slot.run.window is not None:
-                loop = self._loops[batch.node_name, batch.graph_walk]
-                padded = [rid, *slot.dummy_rids[1:]]
-                snapshot = batch.iteration_columns or self._iteration_columns(
-                    batch.node_name, mgmt.submodule, ctx, padded, batch.per_request_info_wrapped,
-                    batch.per_request_input_tensors, actual_loop=loop,
-                )
+                snapshot = batch.iteration_columns
+                if not isinstance(snapshot, IterationWindow):
+                    raise ValueError("joining iteration inputs need their prepared owner window")
                 mgmt.submodule.iteration_tables.stage_window(
                     lease, plan.slots.tolist(), snapshot, stager=membership.stager,
                 )

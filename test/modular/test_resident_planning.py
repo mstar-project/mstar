@@ -1914,9 +1914,10 @@ def test_fresh_resident_rows_preserve_a_queued_capture_and_ordinary_sequence(mon
     _slot_ledger(planner)
 
 
-@pytest.mark.parametrize("actual", [0, 2, 4])
-@pytest.mark.parametrize("routed", [False, True])
-def test_engine_prepares_one_logical_joining_receipt_without_replanning(actual, routed, monkeypatch):
+@pytest.mark.parametrize("actual,routed,changed_flag", [
+    (actual, routed, False) for actual in (0, 2, 4) for routed in (False, True)
+] + [(2, False, True)])
+def test_engine_prepares_one_logical_joining_receipt_without_replanning(actual, routed, changed_flag, monkeypatch):
     from mstar.engine.engine import Engine, ExecutingBatch
     from mstar.engine.resources.run_rows import RunRows
 
@@ -1929,7 +1930,7 @@ def test_engine_prepares_one_logical_joining_receipt_without_replanning(actual, 
     incumbent = _captured_step(live, planner, [1], slot=0, bs=4, repeats=4)
     membership = RunRows(torch.device("cpu"), 4, 8, 2)
     slot = SimpleNamespace(run=SimpleNamespace(state=SimpleNamespace(membership=membership), window=None),
-                           row_heads={}, dummy_rids=(-1, -2, -3, -4))
+                           row_heads={}, static_inputs={"flag": False}, dummy_rids=(-1, -2, -3, -4))
     from mstar.engine.resources.loopback_rows import LoopbackRows
     owner = LoopbackRows(CPU)
     for rid in (1, 2):
@@ -1937,9 +1938,9 @@ def test_engine_prepares_one_logical_joining_receipt_without_replanning(actual, 
     owner.write("token", [1, 2], torch.tensor([11, 22]))
     if routed:
         slot.row_heads = {"token": "input_ids"}
-        slot.static_inputs = {"input_ids": torch.zeros(4, dtype=torch.long)}
+        slot.static_inputs["input_ids"] = torch.zeros(4, dtype=torch.long)
     submodule = SimpleNamespace(preprocess=lambda walk, engine_inputs, inputs: {
-        "input_ids": torch.tensor([inp.token for inp in inputs]),
+        "input_ids": torch.tensor([inp.token for inp in inputs]), "flag": changed_flag,
     })
     eng = Engine.__new__(Engine)
     eng._runner, eng._enable_nvtx = runner, False
@@ -1973,6 +1974,13 @@ def test_engine_prepares_one_logical_joining_receipt_without_replanning(actual, 
                           "pool": RecurrentStep(segments=segments)})
     candidate = ExecutingBatch("decode", {}, ctx, inputs=[SimpleNamespace(input_seq_len=1, token=42)], step=step,
                                kept_rows=[False] if routed else None)
+    if changed_flag:
+        with pytest.raises(ValueError, match="non-tensor specialization"):
+            eng.admit_run_row(candidate, active, 1)
+        assert planner.slot_of(2) is None and candidate.committed is None and not candidate.run_rows
+        assert live["kv"]._streams[2]["main"].stored_len == live["rope"].position(2, "main") == 3
+        assert owner.read("token", [1, 2]).tolist() == [11, 22]
+        return
     stamps = planner._plan_seq, planner._commits, planner._committed_seq
     buffers = {key: (buf.rows.clone(), buf.cells.clone()) for key, buf in planner._buffers.items()}
     with monkeypatch.context() as patch:
