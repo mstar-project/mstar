@@ -382,8 +382,9 @@ def gemm(x: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor, zero_point:
     n = words.shape[0]
     assert words.shape[1] * 8 == k and k % 128 == 0 and words.is_contiguous(), (tuple(weight.shape), k)
     assert kind != KIND_INT4_ZP or zero_point is not None
+    # Marlin reads x in 16-byte vectors: rows contiguous and aligned
     marlin = (marlin_weight is not None and marlin_weight.numel() > 0 and x.dtype == torch.bfloat16
-              and x.stride(1) == 1 and x.stride(0) % 8 == 0)
+              and x.stride(1) == 1 and x.stride(0) % 8 == 0 and x.data_ptr() % 16 == 0)
     if CONFIG_OVERRIDE is None and m < DEQUANT_M and marlin:
         path, cfg = "marlin", {}
     elif (CONFIG_OVERRIDE is None and m <= TINYGEMM_MAX and tinygemm_weight is not None and tinygemm_weight.numel()
