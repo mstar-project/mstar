@@ -190,6 +190,8 @@ class Glm52Model(Model):
             1 if self.config.mtp_num_draft_tokens > 0 else 0
         )
         nodes = {"LLM"}
+        # the node keeps its build dtypes (NodePrecision(None)), so its caches and plans say theirs: bf16
+        dtype = torch.bfloat16
         if self.config.mla_absorb:
             kv = PagedKVConfig(
                 num_layers=num_kv_layers,
@@ -197,6 +199,7 @@ class Glm52Model(Model):
                 head_dim=self.config.cache_latent_dim,
                 max_seq_len=self.context_limit(),
                 num_qo_heads=self.config.num_attention_heads,
+                dtype=dtype,
                 layout=KVLayout.MLA,
                 kv_lora_rank=self.config.kv_lora_rank,
                 qk_rope_head_dim=self.config.qk_rope_head_dim,
@@ -207,6 +210,7 @@ class Glm52Model(Model):
                     kv_cache=KV_RESOURCE,
                     backend=AttnBackend.FLASHINFER_MLA,
                     sm_scale=self.config.softmax_scale,
+                    dtype=dtype,
                 ),
             )
         else:
@@ -218,10 +222,11 @@ class Glm52Model(Model):
                 head_dim=self.config.padded_head_dim,
                 max_seq_len=self.context_limit(),
                 num_qo_heads=self.config.num_attention_heads,
+                dtype=dtype,
             )
             attn = AttentionSpec(
                 resource_key=ATTN_RESOURCE, nodes=nodes,
-                config=AttentionConfig(kv_cache=KV_RESOURCE),
+                config=AttentionConfig(kv_cache=KV_RESOURCE, dtype=dtype),
             )
         specs = [
             KVSpec(resource_key=KV_RESOURCE, nodes=nodes, config=kv),
