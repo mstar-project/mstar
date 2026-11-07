@@ -19,8 +19,8 @@ forward) and then hangs in the collective. So:
   drops a head without building it (the verdicts on which the leader clears
   its own speculation before threading), unless the prefix cache is open,
   where the leader pre-planned the head and the follower builds it too;
-* a step whose forward raised is closed (``_close_tp_follow_step``): its head
-  is dropped, queued or arriving.
+* a whole-step exception can be asymmetric; that worker stops so a peer
+  inside a collective cannot leave the deployment serving as healthy.
 
 Drives the real ``Worker`` methods unbound on a minimal stub with a real
 ``MicroScheduler`` for the FIFO, the pattern ``test_worker_message_handling``
@@ -39,7 +39,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from test_loop_turns import _looping_worker, _Runtime, _scheduler, _StopLoopError  # noqa: E402
 
 from mstar.engine.resources.step import FULL_ADMIT_OK  # noqa: E402
-from mstar.model.submodule_base import StepOrder  # noqa: E402
+from mstar.model.submodule_base import BatchedModelOutput, StepOrder  # noqa: E402
 from mstar.utils.containers import RecentSet  # noqa: E402
 from mstar.utils.ipc_format import ScheduleTPNode, TPNoSpeculation  # noqa: E402
 from mstar.worker.micro_scheduler import MicroScheduler  # noqa: E402
@@ -88,6 +88,7 @@ class _Communicator:
 def _stub(cache_open: bool = False):
     stub = types.SimpleNamespace()
     stub.worker_id = "w1"
+    stub.parallel_nodes = {NODE}
     stub.tp_async_sched = True
     stub.tp_async_nodes = None
     stub._tp_async_for = lambda n: Worker._tp_async_for(stub, n)
@@ -264,11 +265,11 @@ def test_only_the_leader_of_a_lockstep_node_owes_a_marker():
     assert not ld._tp_lead_needs_marker(_pending(4), None)
 
 
-def _tp_loop(monkeypatch, follower=False, forward_raises=()):
+def _tp_loop(monkeypatch, follower=False, failed_rows=()):
     """The real ``Worker.run`` on one rank of a TP instance (``_looping_worker``),
     rows 0 and 1 ready and one row per step. Step 0's seq is 0. Records the
     rows each forward ran, the markers sent, the rows failed and what reached
-    the loop's error handler. A forward of a row in ``forward_raises`` raises."""
+    the loop's error handler. A row in ``failed_rows`` has an attributed failure verdict."""
     runtime = _Runtime()
     sched, state = _scheduler(runtime, StepOrder.TURNS)
     for rid in (0, 1):
@@ -295,8 +296,11 @@ def _tp_loop(monkeypatch, follower=False, forward_raises=()):
     def gpu(batch, node_batch, plan_future):
         rids = list(batch.request_to_worker_graph)
         rec.ran.append(rids)
-        if set(rids) & set(forward_raises):
-            raise RuntimeError("CUDA error")
+        if set(rids) & set(failed_rows):
+            from mstar.utils.client_errors import RequestError
+
+            node_batch.failed_requests.update({rid: RequestError("failed row") for rid in rids})
+            return BatchedModelOutput()
         return forward(batch, node_batch, plan_future)
 
     w._execute_on_gpu_thread = gpu
@@ -360,12 +364,12 @@ def _raises_once(after=0):
 
 
 @pytest.mark.parametrize("head", [False, True], ids=["yield-away", "head"])
-def test_a_forward_that_raised_fails_its_rows_and_the_loop_goes_on(monkeypatch, head):
-    """Step 0's forward raises on every rank alike. Its rows fail as its
-    verdict, which voids a head built on it on every rank, while a yield-away
+def test_attributed_row_failures_void_the_head_and_the_loop_goes_on(monkeypatch, head):
+    """Step 0 reports failed rows on every rank alike. Its failure
+    verdict which voids a head built on it on every rank, while a yield-away
     step (independent of step 0, and run by the followers whatever its
     verdict) still runs. Nothing reaches the error handler or stops."""
-    w, sched, state, rec = _tp_loop(monkeypatch, forward_raises={0})
+    w, sched, state, rec = _tp_loop(monkeypatch, failed_rows={0})
     w._build_speculation = _builds_step_1(w, sched, state, head=head)
     with pytest.raises(_StopLoopError):
         w.run()
@@ -407,7 +411,7 @@ def test_a_leader_that_drops_a_step_it_broadcast_on_the_serial_path_stops(monkey
 def test_a_leader_goes_on_after_a_raise_past_a_head_every_rank_voided(monkeypatch, raise_in):
     """Step 0 failed, so no rank runs head 1, and a raise that follows, even
     while the leader is still dropping the head, costs step 0's rows alone."""
-    w, sched, state, rec = _tp_loop(monkeypatch, forward_raises={0})
+    w, sched, state, rec = _tp_loop(monkeypatch, failed_rows={0})
     w._build_speculation = _builds_step_1(w, sched, state, head=True)
     if raise_in == "post-processing":
         w._finish_step = _raises
@@ -687,21 +691,18 @@ def test_await_treats_a_later_head_at_the_front_the_same_way():
     assert s.scheduler.peek_tp_follow() is later
 
 
-def test_a_forward_that_raised_is_the_steps_verdict_and_voids_its_head():
-    """N's forward raised: every row of N fails and the head built on N is
-    dropped, as the leader drops it on the same verdict, instead of the raise
-    reaching the loop's handler."""
+@pytest.mark.parametrize("head_sent", [False, True])
+def test_a_follower_with_an_uncaught_step_error_stops_without_a_leader_verdict(head_sent):
     s = _stub()
-    s.scheduler.register_tp_follow(_head(["r0"], seq=5, from_seq=4))
+    if head_sent:
+        s.scheduler.register_tp_follow(_head(["r0"], seq=5, from_seq=4))
 
     def raises():
-        raise RuntimeError("CUDA error")
+        raise RuntimeError("injected one-rank forward error")
 
     p = _pending(4, types.SimpleNamespace(done=lambda: True, result=raises))
-    outputs, spec = _await(s, p)
-    assert spec is None and not outputs.per_rid_outputs
-    assert set(p.node_batch.failed_requests) == {"r0"}
-    assert s.scheduler.peek_tp_follow() is None
+    with pytest.raises(SystemExit, match="lockstep step failed"):
+        _await(s, p)
 
 
 def test_await_never_returns_without_a_decision_once_N_finished():

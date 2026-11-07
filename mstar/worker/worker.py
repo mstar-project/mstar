@@ -3675,14 +3675,20 @@ class Worker:
         return None
 
     def _step_result(self, pending: PendingBatch) -> BatchedModelOutput:
-        """N's outputs. A forward that raised becomes N's verdict instead: no
-        outputs and every row failed (``failed_requests``), which voids a head
-        built on N and lets a step independent of N run, on every rank alike.
-        Dropping such a step on one rank only would leave the others in its
-        collectives."""
+        """N's outputs, or a failed-row verdict on a single-rank node.
+
+        An uncaught lockstep error may be asymmetric: another rank can still
+        be inside the step's collective and cannot send its next-step verdict.
+        Stop this worker so conductor liveness shuts down its peers.
+        """
         try:
             return pending.future.result()
         except Exception as exc:
+            if pending.node_name in self.parallel_nodes:
+                raise SystemExit(
+                    f"Worker {self.worker_id}: lockstep step failed "
+                    f"{pending.node_name}/{pending.graph_walk} ({exc!r})"
+                ) from exc
             err = RequestError.from_exception(
                 exc, f"Worker {self.worker_id} step {pending.node_name}/{pending.graph_walk} failed",
                 log=logger,

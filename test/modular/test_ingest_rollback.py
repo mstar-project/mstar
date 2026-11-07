@@ -84,6 +84,6 @@ def test_the_worker_fails_only_the_request_whose_ingest_raised(raises_in):
     )
     Worker._add_new_request(w, body)
     assert registered == [5] and len(failed) == 1 and list(failed[0]) == [5]
-    assert failed[0][5].startswith("Error in worker: internal error (error id ")
+    assert failed[0][5].message.startswith("internal error (error id ")
     # messages parked before the NEW still go through (a parked REMOVE among them)
     assert processed == ["parked"] and "wire" not in w._unprocessed_messages

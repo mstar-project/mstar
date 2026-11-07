@@ -106,7 +106,7 @@ def test_main_loop_error_drops_an_armed_unsubmitted_speculation() -> None:
     assert sorted(w.despeculated) == ["a", "b"]
     assert w.pushed_back == ["b"]
     assert list(w.failed[0]) == ["a"] and len(w.failed) == 1
-    assert w.failed[0]["a"].startswith("Error in worker: internal error (error id ")
+    assert w.failed[0]["a"].message.startswith("internal error (error id ")
     # The step never ran, so its staged stream chunks are un-ingested and go
     # back to their buffers -- the fresh rid pushed back above would otherwise
     # hold one in a slot the next ingest can overtake.
