@@ -347,6 +347,8 @@ class ResidentPlanner:
         # (slot, seq of the last step that read it), freed under a step not yet committed
         self._cooling: list[tuple[int, int]] = []
         self._last_read = np.zeros(self.max_slots, dtype=np.int64)
+        # Readers on another stream can outlive both host commit and handle release.
+        self._readers = np.zeros(self.max_slots, dtype=np.int64)
         # Handle-keyed, like `_slot_of`. Rows to write whole, and rows a
         # host-planned step only advanced as a resident one would have.
         self._stale: set[int] = set()
@@ -423,9 +425,11 @@ class ResidentPlanner:
         still be waiting on one, however many before it never ran."""
         settled = max(self._committed_seq, seq - 2)
         if self._cooling:
-            ready = [slot for slot, read in self._cooling if read <= settled]
+            ready = [slot for slot, read in self._cooling if read <= settled and not self._readers[slot]]
             if ready:
-                self._cooling = [(slot, read) for slot, read in self._cooling if read > settled]
+                self._cooling = [
+                    (slot, read) for slot, read in self._cooling if read > settled or self._readers[slot]
+                ]
                 self._free.extend(ready)
         free = self._free
         taken = [free.pop() for _ in range(min(n, len(free)))]
@@ -441,8 +445,9 @@ class ResidentPlanner:
         history picks the same requests. Nothing depends on that: a displaced
         row is host state and one H2D, and no collective sees it."""
         held = self._slot_of
-        reads = self._last_read[np.fromiter(held.values(), dtype=np.int64, count=len(held))]
-        open_rows = np.flatnonzero(reads <= settled)
+        held_slots = np.fromiter(held.values(), dtype=np.int64, count=len(held))
+        reads = self._last_read[held_slots]
+        open_rows = np.flatnonzero((reads <= settled) & (self._readers[held_slots] == 0))
         if open_rows.size < n:
             raise RuntimeError(
                 f"resident planning on {self.node}: {n} rows found no slot among {self.max_slots - 1}, "
@@ -473,10 +478,34 @@ class ResidentPlanner:
             if self._staged is not None and rid in self._staged.rids:
                 self._staged.commits = -1
             seq = int(self._last_read[slot])
-            if seq <= self._committed_seq:
+            if seq <= self._committed_seq and not self._readers[slot]:
                 self._free.append(slot)
             else:
                 self._cooling.append((slot, seq))
+
+    def pin(self, rids: Collection[int]) -> tuple[int, ...]:
+        """Retain resident storage for readers outside ordinary step ordering.
+
+        The returned slots survive handle release/reuse. This protects only
+        resident tables; callers also retain the resources those tables name.
+        """
+        with self._lock:
+            slots = tuple(self._slot_of[rid] for rid in rids)
+            for slot in slots:
+                self._readers[slot] += 1
+            return slots
+
+    def unpin(self, slots: tuple[int, ...]) -> None:
+        """Release one completed reader's retained slots."""
+        with self._lock:
+            counts = {}
+            for slot in slots:
+                counts[slot] = counts.get(slot, 0) + 1
+            if any(slot <= TRASH_SLOT or slot >= self.max_slots or self._readers[slot] < n
+                   for slot, n in counts.items()):
+                raise ValueError("resident reader released an unretained slot")
+            for slot, n in counts.items():
+                self._readers[slot] -= n
 
     def mark_stale(self, rid: int) -> None:
         """Something other than a resident commit changed ``rid``'s row."""

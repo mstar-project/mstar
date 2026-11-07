@@ -1786,6 +1786,36 @@ def test_a_displaced_row_is_written_whole_with_its_lengths():
     assert tables.host_len[planner.slot_of(1)] == live["kv"]._streams[1]["main"].stored_len
 
 
+def test_resident_readers_survive_displacement_and_recycled_handles():
+    live, _, planner = _setup({rid: 3 for rid in range(1, 16)}, max_num_pages=256, pool_slots=20)
+    _captured_step(live, planner, [1, 2, 3, 4], slot=0, bs=4)
+    first = planner.pin([1])
+    second = planner.pin([1])
+    retained = planner.store.view(planner.max_slots, -1)[first[0]].clone()
+    _captured_step(live, planner, [5, 6, 7, 8], slot=1, bs=4)
+    _captured_step(live, planner, [9], slot=0, bs=4)
+    assert planner.slot_of(1) == first[0]
+    assert planner.slot_of(2) is None
+
+    # Handle reuse gets a different row even after the original step committed.
+    planner.release(1)
+    _captured_step(live, planner, [1], slot=1, bs=4)
+    assert planner.slot_of(1) != first[0]
+    planner.unpin(first)
+    for rid in (10, 11, 12):
+        _captured_step(live, planner, [rid], slot=rid % 2, bs=4)
+        assert planner.slot_of(rid) != first[0]
+    assert torch.equal(planner.store.view(planner.max_slots, -1)[first[0]], retained)
+    _slot_ledger(planner)
+
+    # Only the last reader makes the released row available to a new request.
+    planner.unpin(second)
+    _captured_step(live, planner, [13], slot=0, bs=4)
+    assert planner.slot_of(13) == first[0]
+    _assert_row(planner, live, 13)
+    _slot_ledger(planner)
+
+
 def test_a_step_does_not_displace_its_own_rows_or_the_step_behind_it():
     live, ref, planner = _setup({rid: 3 for rid in range(1, 16)}, max_num_pages=256, pool_slots=20)
     del ref
