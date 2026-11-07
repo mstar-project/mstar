@@ -60,7 +60,9 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
      - ``zai-org/GLM-5.3-Flash``
      - GLM-5.3-Flash (320B/18B): hybrid KDA linear-attention + MLA MoE causal
        LM, text in / text out, fp8 checkpoint, on 8x or 4x H200, plain or with greedy MTP k=3. See
-       `GLM-5.3-Flash and GLM-5.2`_ for the configs and the long-context override.
+       `GLM-5.3-Flash and GLM-5.2`_ for the configs and the long-context override. Prompts are
+       keyed for prefix reuse (the MLA and index pages, and KDA snapshots at page boundaries);
+       replies too without MTP at one rank.
    * - ``kokoro``
      - ``hexgrad/Kokoro-82M``
      - TTS (82M, not autoregressive): misaki G2P + PL-BERT prosody + iSTFTNet
@@ -671,10 +673,11 @@ GLM-5.3-Flash serves its native 1M tokens:
        max_num_pages: 8960
    # A prefill step past the captured 8192 tokens runs eager, 8192 at a time, and compiles
    # its kernels on first use: two and three windows' prompts take those compiles before the
-   # server binds.
+   # server binds, each its own text, since one that hit the other's cached prefix would skip
+   # the windows it is for.
    warmup_requests:
      - {text: "The quick brown fox jumps over the lazy dog. ", repeat: 1250, model_kwargs: {max_output_tokens: 4}}
-     - {text: "The quick brown fox jumps over the lazy dog. ", repeat: 2000, model_kwargs: {max_output_tokens: 4}}
+     - {text: "Pack my box with five dozen liquor jugs now. ", repeat: 2000, model_kwargs: {max_output_tokens: 4}}
 
 GLM-5.2 serves 256k (the model's own window is 1M; the pool is what 141 GB GPUs hold beside
 ~96 GB/rank of weights):
@@ -719,8 +722,11 @@ pools from free memory yet):
   the sink (``kda_state.max_slots: 65``), so a prefill never waits in the worker for a slot.
 - KV pages = requests x the rows a request books / 128 + the sink page: 64 x 2048 / 128 + 1
   = 1025, ~1.5 GB/rank for GLM-5.3 and ~11.8 GB/rank for GLM-5.2 (the MTP override's
-  arithmetic is above). More pages hold nothing at 2048 tokens: under TP the prefix cache is
-  off. At TP4 GLM-5.3 leaves ~50 GB/rank unused (53.7 GB free after capture, 4096 ladder).
+  arithmetic is above). GLM-5.3's configs open the prefix cache under TP (``prefix_cache_tp``):
+  finished prompts' pages stay cached in what live requests leave free, and the KDA pool keeps
+  64 snapshots (``kda_state.prefix_slots``, one request slot's memory each). GLM-5.2's stays
+  off under TP, so more pages would hold nothing at 2048 tokens. At TP4 GLM-5.3 leaves
+  ~50 GB/rank unused (53.7 GB free after capture, 4096 ladder).
 
 **Prefill graphs.** A GLM-5.3 prefill step takes up to 4 prompts (the largest capture batch),
 so its ladder runs to 4 x 2048 = 8192 tokens and no step runs eager; with long context a

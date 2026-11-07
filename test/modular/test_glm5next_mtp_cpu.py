@@ -24,7 +24,7 @@ from mstar.engine.resources.kv import manager as kv_mod
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.engine.resources.step import StepContext
 from mstar.model.glm5_next.components.causal_lm import Glm5NextForCausalLM
-from mstar.model.glm5_next.config import KDA_STATE, KV_CACHE, MTP_LEN, SAMPLER, Glm5NextModelConfig
+from mstar.model.glm5_next.config import KDA_STATE, KV_CACHE, LABEL, MTP_LEN, SAMPLER, Glm5NextModelConfig
 from mstar.model.glm5_next.glm5_next_model import Glm5NextModel, process_weights_after_loading
 from mstar.model.glm5_next.submodules import Glm5NextLLMSubmodule
 from mstar.model.submodule_base import InputMetadata
@@ -545,6 +545,77 @@ def test_long_context_mtp_pass_keys_every_prompt_row_on_its_own_plane():
     keys = torch.stack([plane[pages[p // size], p % size, :d] for p in range(len(prompt["a"]))])
     assert bool(keys.abs().sum(-1).gt(0).all())
     engine.remove_request("a")
+
+
+def test_long_context_draft_passes_attend_the_seed_passes_selection(monkeypatch):
+    """index_share_for_mtp_iteration: a verify step's draft passes attend exactly the keys the
+    last step's seed pass attended at the row before the block (vLLM's first draft pass), every
+    row of the block alike, rather than selecting their own."""
+    engine, sub, cfg = _build_engine(3, long_context=True)
+    assert cfg.mtp_shares_selection
+    attn = sub.language_model.mtp.transformer_layer.self_attn
+    kv, pool, block = engine._resources[KV_CACHE], engine._resources[KDA_STATE], sub.mtp_block
+    size = kv.kv_cache.page_size
+    order: list[str] = []
+    calls = []  # per MTP-layer attention: (a draft pass?, each row's (request, keys attended))
+    drafting = False
+
+    def keys(rid, slots):
+        pages = [int(p) for p in kv._streams[rid]["main"].page_indices]
+        return frozenset(pages.index(s // size) * size + s % size for s in slots.tolist())
+
+    block_row, attend = attn.forward_block_row, attn._attend_selected
+
+    def spy_block_row(*args, **kwargs):
+        nonlocal drafting
+        drafting = True
+        try:
+            return block_row(*args, **kwargs)
+        finally:
+            drafting = False
+
+    def spy_attend(slots, *args, **kwargs):
+        ctx = attn._dsa.current(LABEL)
+        rows = [(order[q], keys(order[q], slots[r, :n]))
+                for r, (q, n) in enumerate(zip(ctx.row_req.tolist(), ctx.attn_lens(), strict=True))]
+        calls.append((drafting, rows))
+        return attend(slots, *args, **kwargs)
+
+    monkeypatch.setattr(attn, "forward_block_row", spy_block_row)
+    monkeypatch.setattr(attn, "_attend_selected", spy_attend)
+    prompts = dict(LONG_PROMPTS)
+    order[:] = list(prompts)
+    for rid in prompts:
+        engine.add_request(rid, {SAMPLER: SamplingReqConfig(temperature=0.0)})
+    out, stops = _step(engine, "prefill", prompts, LONG_MAX_TOKENS)
+    # the prefill's last MTP pass: each request's last row again, with its sampled token
+    seed = dict(calls[-1][1])
+    assert set(seed) == set(prompts)
+    nxt = {rid: out[rid]["text_inputs"][0] for rid in prompts}
+    live, step, sparse = [rid for rid in prompts if not stops.get(rid)], 0, 0
+    while live:
+        order[:] = live
+        base = {rid: int(pool.block(MTP_LEN)[pool._slots[rid]["main"].index, 0]) for rid in live}
+        calls.clear()
+        out, stops = _step(engine, "decode", {rid: nxt[rid] for rid in live}, LONG_MAX_TOKENS,
+                           step)
+        drafts = [rows for is_draft, rows in calls if is_draft]
+        assert len(drafts) == sub.mtp_k - 1
+        for rows in drafts:
+            assert [rid for rid, _ in rows] == [rid for rid in live for _ in range(block)]
+            for rid, attended in rows:
+                assert attended == seed[rid], (rid, step)
+                assert max(attended) < base[rid]  # nothing of the block
+                sparse += len(attended) < base[rid]
+        seed_rows = calls[-1][1]  # the step's seed pass, over the block
+        for i, (rid, (_, accepted)) in enumerate(zip(live, sub._read_verdicts(live), strict=True)):
+            seed[rid] = seed_rows[i * block + accepted][1]
+            nxt[rid] = out[rid]["text_inputs"][0]
+        live = [rid for rid in live if not stops.get(rid)]
+        step += 1
+    assert sparse  # past index_topk: the drafts attend a selection, not the whole context
+    for rid in prompts:
+        engine.remove_request(rid)
 
 
 def test_long_context_decode_stops_while_the_next_block_fits():

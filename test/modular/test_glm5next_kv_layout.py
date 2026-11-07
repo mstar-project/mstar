@@ -80,7 +80,7 @@ def test_a_request_that_asks_no_length_fills_the_cache_rows(tmp_path, monkeypatc
     model = _model(mtp_num_draft_tokens=k)
     rows, block = model.config.kv_rows, k + 1
 
-    new_request = _dispatched(_conduct(model, _preprocess(model, {}), tmp_path, monkeypatch))
+    new_request = _dispatched(_conduct(model, _preprocess(model, {}, KV_CACHE), tmp_path, monkeypatch))
 
     cap = new_request.loop_caps["decode_loop"]
     assert PROMPT + block * cap <= rows < PROMPT + block * (cap + 1)
@@ -95,7 +95,7 @@ def test_the_most_tokens_the_context_holds_are_admitted(tmp_path, monkeypatch, k
     model = _model(mtp_num_draft_tokens=k)
     max_tokens = model.config.index_topk - PROMPT - (2 * (k + 1) - 1 if k else 0)
 
-    sent = _conduct(model, _preprocess(model, {"max_output_tokens": max_tokens}), tmp_path, monkeypatch)
+    sent = _conduct(model, _preprocess(model, {"max_output_tokens": max_tokens}, KV_CACHE), tmp_path, monkeypatch)
 
     assert _failed(sent) == []
     # the prefill emits the first token
@@ -147,7 +147,7 @@ def test_max_tokens_past_the_rows_its_prompt_leaves_is_a_400(tmp_path, monkeypat
     # the prompt's rows and a row per decode step fill the cache; the last token is never stored
     fits = model.config.kv_rows - PROMPT + 1
 
-    sent = _conduct(model, _preprocess(model, {"max_output_tokens": fits + past}), tmp_path, monkeypatch)
+    sent = _conduct(model, _preprocess(model, {"max_output_tokens": fits + past}, KV_CACHE), tmp_path, monkeypatch)
 
     assert _failed(sent) == ([400] if past else []), f"max_tokens {fits + past}"
     if not past:

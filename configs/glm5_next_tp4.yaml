@@ -18,9 +18,11 @@ resources:
     # 64 x 2048 / 128 + 1, as in glm5_next_tp8.yaml: ~1.5 GB/rank
     max_num_pages: 1025
     page_size: 128
+    prefix_cache_tp: true
   kda_state:
-    # ~37 MB/slot/rank at TP4: ~2.4 GB/rank
+    # ~37 MB/slot/rank at TP4: ~2.4 GB/rank, and as much again for the prefix snapshots
     max_slots: 65
+    prefix_slots: 64
 node_groups:
   - node_names: [LLM]
     ranks: [0, 1, 2, 3]
