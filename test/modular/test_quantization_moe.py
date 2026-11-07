@@ -173,10 +173,10 @@ def test_the_fused_fp8_dispatch_matches_the_reference_and_skips_padding(checkpoi
     cpu = {block: getattr(root.layers[0], block)(x) for block in ("shared", "ep")}
     cpu_masked = root.layers[0].ep(x, token_valid=valid)
     root.to("cuda")
-    # fused_experts_fp8 rounds the activations to e4m3 (W8A8) where the CPU reference keeps them bf16; the shared
-    # block measured 0.033 on an H200
+    # fused_experts_fp8 rounds the activations to e4m3 (W8A8) where the CPU reference keeps them bf16; on an H200
+    # the shared block measured 0.033, the masked EP block 0.044
     for block, ref in cpu.items():
         assert _rel(getattr(root.layers[0], block)(x.cuda()).cpu(), ref) < 0.05, block
     masked = root.layers[0].ep(x.cuda(), token_valid=valid.cuda()).cpu()
     assert torch.equal(masked[~valid], torch.zeros_like(masked[~valid]))
-    assert _rel(masked[valid], cpu_masked[valid]) < 0.03
+    assert _rel(masked[valid], cpu_masked[valid]) < 0.05
