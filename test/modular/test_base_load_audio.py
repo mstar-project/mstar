@@ -107,7 +107,7 @@ def test_omnivoice_reads_a_wav_reference_without_ffmpeg(tmp_path, video_only_ffm
     clip = tmp_path / "ref.wav"
     sf.write(clip, _tone(24_000, seconds=1.0), 24_000, subtype="PCM_16")
     uploads = tmp_path / "uploads"
-    uploads.mkdir()
+    uploads.mkdir(mode=0o700)
     req = SpeechRequest(input="hi", ref_audio=base64.b64encode(clip.read_bytes()).decode(), ref_text="hi")
     (path,) = adapters.OmniVoiceAdapter().speech_to_request(req, uploads).file_paths["audio"]
 

@@ -66,6 +66,8 @@ from mstar.api_server import media_io
 from mstar.api_server.openai._util import SSE_DONE, error_type, rid, sse
 from mstar.api_server.openai.adapters import Transcript
 from mstar.api_server.streaming_response import ReleasingStreamingResponse
+from mstar.utils.client_errors import client_error_text
+from mstar.utils.runtime_dir import ensure_private_dir, write_private_file
 from mstar.utils.utf8_stream import Utf8Stream
 
 _TIMED_FORMATS = ("verbose_json", "srt", "vtt")
@@ -106,11 +108,10 @@ def save_upload(audio_bytes: bytes, filename: str | None, upload_dir: Path) -> s
     embedded ``../`` cannot escape the directory; the extension is kept
     because the data worker's decoder sniffs the container by it.
     """
-    upload_dir = Path(upload_dir)
-    upload_dir.mkdir(parents=True, exist_ok=True)
+    upload_dir = ensure_private_dir(upload_dir)
     base = os.path.basename(filename or "") or "audio.wav"
     path = upload_dir / f"{uuid.uuid4()}_{base}"
-    path.write_bytes(audio_bytes)
+    write_private_file(path, audio_bytes)
     return str(path)
 
 
@@ -728,9 +729,14 @@ def _error_event(message: str, status: int | None) -> str:
 def _cutting_error_event(exc: Exception) -> str:
     """In band, since the stream has sent its 200: cutting the upload failed
     for the upload's reason (an HTTPException) or the server's (no FFmpeg, no
-    memory)."""
+    memory, a refused upload dir)."""
     if isinstance(exc, HTTPException):
         return _error_event(str(exc.detail), exc.status_code)
+    if isinstance(exc, OSError):
+        # a runtime-dir refusal names the path and both uids, and a failed
+        # window write names the file; the client gets the error id only
+        text, _ = client_error_text(exc, "cutting the upload failed", type_name=False)
+        return _error_event(text, 500)
     return _error_event(f"the server could not decode the upload ({type(exc).__name__})", 500)
 
 
@@ -744,7 +750,7 @@ async def _stream(api, adapter, req, planner: WindowPlanner, mode: str, raw_requ
         if mode == "parallel" or planner.single:
             try:
                 windows = planner.fixed() if planner.single else await asyncio.to_thread(planner.fixed)
-            except (HTTPException, ImportError, MemoryError) as exc:
+            except (HTTPException, ImportError, MemoryError, OSError) as exc:
                 yield _cutting_error_event(exc)
                 yield SSE_DONE
                 return
@@ -802,7 +808,7 @@ async def _stream(api, adapter, req, planner: WindowPlanner, mode: str, raw_requ
                         yield sse({"type": "transcript.text.delta", "delta": window.transcript.text})
                         spoken = True
                     await asyncio.sleep(0)
-            except (HTTPException, ImportError, MemoryError) as exc:
+            except (HTTPException, ImportError, MemoryError, OSError) as exc:
                 yield _cutting_error_event(exc)
                 yield SSE_DONE
                 return
