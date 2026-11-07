@@ -191,3 +191,85 @@ def test_logical_subset_collection_projects_original_rows_before_tail(captured, 
         assert result.per_rid_outputs[60]["keyed"][0].tolist() == [600]
         assert result.output_spans["frame"].tolist() == [[0, 1]]
     assert raw.row_request_ids == (40, 50, 60) and raw.check_stop_buffers["semantic"].tolist() == [0, 1, 2]
+
+
+@pytest.mark.parametrize("producer", [False, True])
+def test_connected_tails_select_positive_rows_but_settle_the_complete_receipt(producer):
+    import torch
+
+    from mstar.engine.device_run import RUN_COUNTS, RUN_REPLAYS
+    from mstar.engine.engine import ExecutingBatch
+    from mstar.engine.resources.base import Resource
+    from mstar.engine.resources.iteration_tables import STREAM_COUNTS, STREAM_TRANSITION
+    from mstar.engine.resources.runner import StepRunner
+    from mstar.engine.resources.step import ResourceStep
+    from mstar.model.submodule_base import NodeInputs, SubmoduleStep
+
+    rids, requested = [40, 50, 60], 4 if producer else 1
+    counts = {40: 0, 50: 2 if producer else 1, 60: 1}
+    lengths = dict.fromkeys(rids, requested)
+    tails, batch_tails, rewinds = [], [], []
+
+    class Owner(Resource):
+        @classmethod
+        def build(cls, spec, info):
+            return cls()
+
+        def rewind_run(self, step, ctx, delta, selected):
+            rewinds.append((delta, set(selected)))
+            for rid in selected:
+                lengths[rid] -= delta
+
+        def step_host_rows(self, repeats):
+            return {"owned": torch.tensor([400, 500, 600])}
+
+    class Tail(_Plain):
+        def postprocess(self, request_id, request_info, outputs, inputs):
+            assert request_id != 40, "semantic completion cannot invoke an ordinary model tail"
+            assert inputs.kwargs["rid"] == request_id and request_info.tag == request_id
+            expected = requested if producer else counts[request_id]
+            assert lengths[request_id] == expected
+            assert outputs["frame"][0].flatten().tolist() == [request_id] * (requested if producer else 1)
+            tails.append(request_id)
+            if request_id == 60:
+                raise ValueError("tail failed after actual computation")
+
+        def batch_postprocess(self, outputs, request_infos, inputs, piecewise_runners=None):
+            batch_tails.append(tuple(request_infos))
+
+    eng = _engine(Tail.__new__(Tail))
+    eng._enable_nvtx = False
+    eng.postprocess_batch = lambda batch, outputs: Engine._postprocess_batch(eng, batch, outputs)
+    owner = Owner()
+    eng._runner = StepRunner({"owned": owner})
+    eng._runner._generations = dict.fromkeys(rids, 1)
+    mgmt = eng._submodules["llm"]
+    mgmt.resources, mgmt.carries, mgmt.rings = {"owned": owner}, {}, {}
+    mgmt.accelerator_graph_runner = None
+    mgmt.run_columns = {"decode": frozenset({"frame"})}
+    ctx = StepContext(rids, "decode", 0, False, repeats=requested, counted=dict.fromkeys(rids, 1))
+    batch = ExecutingBatch("llm", dict.fromkeys(rids, SimpleNamespace()), ctx,
+                           inputs=[NodeInputs(kwargs={"rid": rid}) for rid in rids], prepared_rids=tuple(rids))
+    batch.per_request_info_wrapped = {rid: SimpleNamespace(tag=rid) for rid in rids}
+    batch.step = SubmoduleStep(steps={"owned": ResourceStep()})
+    batch.step.set_ctx(ctx)
+    if producer:
+        batch.ring_bases = {"frame": dict.fromkeys(rids, 0)}
+    values = torch.tensor(rids).view(3, 1, 1).expand(3, requested, 1)
+    batch.outputs = BatchedModelOutput(
+        row_outputs={"frame": values}, row_request_ids=tuple(rids),
+        check_stop_buffers={"token": values[..., 0], RUN_REPLAYS: torch.tensor([max(counts.values())]),
+                            RUN_COUNTS: torch.tensor(list(counts.values())),
+                            STREAM_COUNTS: torch.tensor([1, 1, 1]), STREAM_TRANSITION: torch.tensor([0, 1, 2])},
+    )
+    result = eng.collect_group_outputs(batch, max(counts.values()), counts)
+    assert tails == [50, 60] and batch_tails == [(50,)]
+    assert lengths == counts and batch.step_context.run_counts == counts
+    assert set(batch.failed_requests) == {60}
+    assert 40 not in result.per_rid_outputs
+    assert result.row_request_ids == tuple(rids)
+    assert result.check_stop_buffers[STREAM_COUNTS].tolist() == [1, 1, 1]
+    assert result.check_stop_buffers[STREAM_TRANSITION].tolist() == [0, 1, 2]
+    assert result.check_stop_buffers["owned"].tolist() == [0, 500, 600]
+    assert sum(delta * len(rows) for delta, rows in rewinds) == 3 * requested - sum(counts.values())
+    assert batch.request_ids == rids and len(batch.inputs) == 3 and not batch.run_rows

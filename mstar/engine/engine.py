@@ -648,6 +648,36 @@ class ExecutingBatch:
             if rid not in rids
         }
 
+    def select_rows(self, rids: Sequence[int]) -> "ExecutingBatch":
+        """A logical collection view; the original admitted receipt keeps its owners."""
+        wanted = set(rids)
+        inputs = dict(zip(self.request_ids, self.inputs, strict=True))
+        view = dataclasses.replace(
+            self, step_context=dataclasses.replace(self.step_context, request_ids=list(rids),
+                                                  _padded_request_ids=None, _real_rids=None),
+            inputs=[inputs[rid] for rid in rids], prepared_rids=tuple(rids), _seq_lens=None,
+            per_request_info={rid: self.per_request_info[rid] for rid in rids},
+            per_request_input_tensors={rid: value for rid, value in self.per_request_input_tensors.items()
+                                       if rid in wanted},
+            per_request_input_metadata={rid: value for rid, value in self.per_request_input_metadata.items()
+                                        if rid in wanted},
+            final_stream_rids=self.final_stream_rids & wanted,
+            partition_done_rids=self.partition_done_rids & wanted,
+            cached_rids=self.cached_rids & wanted,
+            failed_requests={rid: error for rid, error in self.failed_requests.items() if rid in wanted},
+            run_rows={rid: row for rid, row in self.run_rows.items() if rid in wanted},
+            stream_windows={rid: edges for rid, edges in self.stream_windows.items() if rid in wanted},
+            ring_bases={name: {rid: base for rid, base in bases.items() if rid in wanted}
+                        for name, bases in self.ring_bases.items()},
+            loopback_rids=self.loopback_rids & wanted,
+            kept_rows=None if self.kept_rows is None else [
+                dict(zip(self.request_ids, self.kept_rows, strict=True))[rid] for rid in rids
+            ],
+        )
+        view.step_context.run_counts = self.step_context.run_counts
+        view.per_request_info_wrapped = {rid: self.per_request_info_wrapped[rid] for rid in rids}
+        return view
+
     def register_admit_error(
         self, reason: AdmitFailedReason, failed_resource: str | None = None,
     ):
@@ -3138,7 +3168,8 @@ class Engine:
             raise ValueError("independent member collection needs uncollected run outputs")
         mgmt, lease = self._submodules[batch.node_name], batch.step_context.slot_lease
         custom = self._custom_output_tail(mgmt.submodule)
-        empty = width == 0 or all(rid in batch.failed_requests for rid in batch.request_ids)
+        live = [rid for rid in batch.request_ids if counts[rid] and rid not in batch.failed_requests]
+        empty = not live
         # A producing member owns the internal output ring. Its tail sees the
         # ordinary standalone representation: requested-one has no iteration
         # axis; requested-N keeps N columns (last-valid padding included), even
@@ -3178,13 +3209,40 @@ class Engine:
             buffers = {name: value[:, 0] if name not in semantic and value.ndim > 1
                        and value.shape[1] == reserved else value for name, value in buffers.items()}
         raw = dataclasses.replace(raw, check_stop_buffers=buffers, row_outputs=values, output_spans=spans or None)
+        selected = batch if len(live) == len(batch.request_ids) else batch.select_rows(live)
+        if selected is not batch:
+            selected.rows_only = False  # only actual logical rows are routed from this view
         try:
-            inputs, info = self._pad_batch(batch, mgmt, lease)
-            output = self._collect_step(batch, mgmt, lease, raw, inputs, info)
+            inputs, info = self._pad_batch(selected, mgmt, lease)
+            output = self._collect_step(selected, mgmt, lease, raw, inputs, info)
             output.run_columns = frozenset() if ordinary else columns
+            selected.outputs = output
+            self._finish_outputs(selected)
+            output = self._postprocess_outputs(selected, output)
+            if selected is not batch:
+                batch.failed_requests.update(selected.failed_requests)
+                positions = [batch.request_ids.index(rid) for rid in live]
+
+                def restore(values, original):
+                    if not values:
+                        return original
+                    restored = dict(original or {})
+                    for name, value in values.items():
+                        old = restored.get(name)
+                        full = (old.clone() if old is not None else
+                                value.new_zeros((len(batch.request_ids), *value.shape[1:])))
+                        indices = to_device_nonblocking(positions, value.device, dtype=torch.long)
+                        full.index_copy_(0, indices, value[:len(live)])
+                        restored[name] = full
+                    return restored
+
+                output = dataclasses.replace(
+                    output, check_stop_buffers=restore(output.check_stop_buffers, buffers),
+                    output_spans=restore(output.output_spans, spans) or None,
+                    row_request_ids=tuple(batch.request_ids), row_views=None,
+                    span_request_ids=tuple(batch.request_ids) if spans or output.output_spans else None,
+                )
             batch.outputs = output
-            self._finish_outputs(batch)
-            batch.outputs = self._postprocess_outputs(batch, output)
         finally:
             if producer_repeat:
                 settle()  # ordinary producer tail precedes resource rewind
@@ -3212,6 +3270,10 @@ class Engine:
         if self._enable_nvtx:
             range_push("engine.collect_outputs")
         t0 = phase_start()
+        selecting = raw.row_request_ids is not None and tuple(batch.request_ids) != raw.row_request_ids
+        if selecting:
+            raw = dataclasses.replace(raw, check_stop_buffers=dict(raw.check_stop_buffers or {}))
+            self._add_resource_host_rows(submodule_mgmt, raw, batch.step_context.repeats)
         try:
             out = self._collect_outputs(
                 submodule_mgmt, lease, raw, inputs, req_info,
@@ -3224,7 +3286,8 @@ class Engine:
             phase_end("engine.collect_outputs", t0)
             if self._enable_nvtx:
                 range_pop()
-        self._add_resource_host_rows(submodule_mgmt, out, batch.step_context.repeats)
+        if not selecting:
+            self._add_resource_host_rows(submodule_mgmt, out, batch.step_context.repeats)
         return out
 
     def _seed_run_rows(self, batch: ExecutingBatch, slot, immune: Sequence[bool]) -> None:
@@ -4449,14 +4512,14 @@ class Engine:
         submodule = submodule_mgmt.submodule
         out_ids = None
         original = raw_outputs.row_request_ids
-        if original is not None and tuple(request_ids) != original[:len(request_ids)]:
+        if original is not None and tuple(request_ids) != original:
             if len(set(original)) != len(original) or len(set(request_ids)) != len(request_ids):
                 raise ValueError("logical output rows must have unique request identities")
             positions = {rid: index for index, rid in enumerate(original)}
             if any(rid not in positions for rid in request_ids) or raw_outputs.packed_outputs:
                 raise ValueError("logical output selection needs known row-addressed values")
             selected = [positions[rid] for rid in request_ids]
-            capture_ids = (step_request_ids if lease is None
+            capture_ids = (original if lease is None
                            else submodule_mgmt.accelerator_graph_runner.slot_for(lease).dummy_rids)
             out_ids = [capture_ids[index] for index in selected]
             indices = {}

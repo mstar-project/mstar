@@ -525,25 +525,10 @@ class RepeatingSteps:
     def _run_receipt_rows(step: PendingBatch, rids: list[int]) -> PendingBatch:
         """An output/retry view after the original resource receipt settled once."""
         original = step.node_batch
-        wanted = set(rids)
         scheduled = step.batch._sub_batch(rids)
         scheduled.repeats = max((original.step_context.run_counts[rid] for rid in rids), default=0)
-        ctx = replace(original.step_context, request_ids=rids, repeats=scheduled.repeats,
-                      _padded_request_ids=None, _real_rids=None)
-        ctx.run_counts = original.step_context.run_counts
-        inputs = dict(zip(original.request_ids, original.inputs, strict=True))
-        view = replace(
-            original, step_context=ctx, inputs=[inputs[rid] for rid in rids], prepared_rids=tuple(rids),
-            per_request_info={rid: original.per_request_info[rid] for rid in rids},
-            final_stream_rids=original.final_stream_rids & wanted,
-            partition_done_rids=original.partition_done_rids & wanted,
-            failed_requests={rid: error for rid, error in original.failed_requests.items() if rid in wanted},
-            run_rows={rid: original.run_rows[rid] for rid in rids},
-            stream_windows={rid: edges for rid, edges in original.stream_windows.items() if rid in wanted},
-            ring_bases={name: {rid: base for rid, base in bases.items() if rid in wanted}
-                        for name, bases in original.ring_bases.items()},
-            loopback_rids=original.loopback_rids & wanted,
-        )
+        view = original.select_rows(rids)
+        view.step_context.repeats = scheduled.repeats
         return replace(step, batch=scheduled, node_batch=view, joined=[])
 
     def _finish_live_run(self, active: PendingBatch, gpu_executor: ThreadPool) -> None:
