@@ -888,6 +888,7 @@ def test_stream_unit_drains_after_producer_done_without_advancing_that_producer_
     unit, = rt.execution_units("produce")
     worker = Worker.__new__(Worker)
     worker._graph_runtime, worker._step_repeats = rt, None
+    worker._reserve_group_stream = lambda group: True  # this fixture exercises graph claim/closure only
     worker.scheduler = SimpleNamespace(execution_units={("b", "consume"): unit})
     checked = []
     engine = SimpleNamespace(_submodules={node: SimpleNamespace(accelerator_graph_runner=SimpleNamespace(

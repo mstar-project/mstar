@@ -59,6 +59,20 @@ class RepeatingSteps:
         return config
 
     def _stamp_group_repeats(self, group) -> None:
+        if group.unit.streaming_edges:
+            if self._step_repeats is None:
+                return
+            for i, (scheduled, executing) in enumerate(group.members):
+                if group.finished_rids and group.finished_rids[i]:
+                    continue
+                key = scheduled.node_name, scheduled.graph_walk
+                loop = self._innermost_loop_by_node.get((scheduled.graph_walk, scheduled.node_name))
+                if loop is None:
+                    continue
+                room = self._graph_runtime.loop_room(*key, loop, list(executing.request_ids), 0, False)
+                count, _ = self._step_repeats._most(key, lambda room=room: room)
+                scheduled.repeats = executing.step_context.repeats = count
+            return
         config = self._group_repeat_config(group.unit)
         if config is None:
             return
@@ -418,8 +432,11 @@ class RepeatingSteps:
 
     def _end_run_for_ready_rows(self, step: PendingBatch) -> None:
         """``step``'s run on the device ends at its next iteration, not at its count."""
-        if step.node_batch.step_context.repeats > 1 and not self._step_repeats.config(step.node_name).ready_waits:
-            self.engine_manager.get_engine(step.node_name).yield_runs(step.node_name)
+        members = (((step.node_name, step.node_batch),) if step.group is None or not step.group.submitted else
+                   ((scheduled.node_name, executing) for scheduled, executing in step.group.members))
+        for node, executing in members:
+            if executing.step_context.repeats > 1 and not self._step_repeats.config(node).ready_waits:
+                self.engine_manager.get_engine(node).yield_runs(node)
 
     def _landed_skipped(self, step: PendingBatch) -> bool:
         """Whether ``step``'s run began covered by a yield and ran nothing, landed
@@ -429,8 +446,8 @@ class RepeatingSteps:
         that can retry wait as a refused step's do: the runtime still holds their
         inputs."""
         node_batch = step.node_batch
-        if node_batch.run_rows:
-            return False  # descriptor closure also releases readers for proved-zero rows
+        if node_batch.run_rows or (step.group is not None and step.group.submitted):
+            return False  # logical member closure also handles proved-zero runs
         started = node_batch.run_started
         if started is None or node_batch.step_context.repeats <= 1:
             return False
@@ -688,7 +705,11 @@ class RepeatingSteps:
                 (self._spec_peek and has_ready(state, chain)) or (not waiting and has_ready(state, None))
             ):
                 yielded = True
-                engine.yield_runs(batch_N.node_name)
+                if batch_N.group is None or not batch_N.group.submitted:
+                    engine.yield_runs(batch_N.node_name)
+                else:
+                    for scheduled, _ in batch_N.group.members:
+                        engine.yield_runs(scheduled.node_name)
 
         scanned = time.monotonic()
 

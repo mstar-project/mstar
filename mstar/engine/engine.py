@@ -2598,6 +2598,10 @@ class Engine:
             edge.chunk.reservation is not None and edge.chunk.reservation.decisions
             for _, batch in active for edges in batch.stream_windows.values() for edge in edges
         ))
+        idle_sources = ({maker for maker, _, _ in group.unit.streaming_edges
+                         for _, batch in group.members if batch.node_name == maker and batch.ring_width == 0}
+                        if streamed else set())
+        active = [(scheduled, batch) for scheduled, batch in active if batch.node_name not in idle_sources]
         stream_choices, stream_target, stream_window = None, None, None
         composed = None
         try:
@@ -2636,7 +2640,7 @@ class Engine:
                             or producer.spanned_outputs(walk) or producer.get_stop_policies(walk) is None):
                         guard.refuse("a producer changes its routed outputs outside capture")
                 for member, (_, batch) in enumerate(group.members):
-                    if finished[batch.node_name]:
+                    if finished[batch.node_name] or batch.node_name in idle_sources:
                         continue
                     mgmt = self._submodules[batch.node_name]
                     runner, submodule = mgmt.accelerator_graph_runner, mgmt.submodule

@@ -612,7 +612,7 @@ def _skipped_step(worker, log, words, rows=(1, 2), **node_batch):
     )
     batch = ScheduledBatch(node_name="n", graph_walk=WALK, request_to_worker_graph=dict.fromkeys(rows, 0))
     return SimpleNamespace(
-        node_name="n", graph_walk=WALK, batch=batch, speculative_new_iter=True, loop_name="loop",
+        node_name="n", graph_walk=WALK, batch=batch, speculative_new_iter=True, loop_name="loop", group=None,
         future=SimpleNamespace(done=lambda: False, result=lambda: "outputs"),
         node_batch=SimpleNamespace(**{
             "run_started": Word(), "step_context": SimpleNamespace(repeats=8), "completion_event": None,
@@ -624,16 +624,18 @@ def _skipped_step(worker, log, words, rows=(1, 2), **node_batch):
 
 
 @pytest.mark.parametrize("begun, skipped", [(RUN_SKIPPED, True), (RUN_RAN, False)])
-@pytest.mark.parametrize("membership", [False, True])
-def test_a_skipped_run_lands_as_a_step_that_never_ran(begun, skipped, membership):
+@pytest.mark.parametrize("owner", ["ordinary", "membership", "unit", "refused_unit"])
+def test_a_skipped_run_lands_as_a_step_that_never_ran(begun, skipped, owner):
     """Nothing it counted happened and it has no outputs: what admit counted goes back
     and its rows wait with the inputs they had, with no postprocess at all. The word
     can still be 0 at first: the step before has only just landed."""
     from mstar.worker.worker import Worker
 
     worker, log = Worker.__new__(Worker), []
-    step = _skipped_step(worker, log, iter([0, begun]), run_rows={1: object()} if membership else {})
-    skipped = skipped and not membership  # descriptor closure owns its reader/pin release
+    step = _skipped_step(worker, log, iter([0, begun]), run_rows={1: object()} if owner == "membership" else {})
+    if owner in {"unit", "refused_unit"}:
+        step.group = SimpleNamespace(submitted=owner == "unit")
+    skipped = skipped and owner in {"ordinary", "refused_unit"}  # logical closure owns its reader/pin release
     assert worker._landed_skipped(step) is skipped
     assert log == ([("rewound", 0), ("flag", [1, 2]), ("queued", [1, 2])] if skipped else [])
 
@@ -1092,7 +1094,7 @@ def _waiting_on_a_run(monkeypatch, ready):
 def _run_step(rows, looks, **node_batch):
     landed = iter([False] * looks + [True])
     return SimpleNamespace(
-        node_name="n", graph_walk=WALK, batch=SimpleNamespace(request_to_worker_graph=dict.fromkeys(rows)),
+        node_name="n", graph_walk=WALK, group=None, batch=SimpleNamespace(request_to_worker_graph=dict.fromkeys(rows)),
         node_batch=SimpleNamespace(completion_event=SimpleNamespace(query=lambda: next(landed)),
                                    run_rows={}, **node_batch),
     )

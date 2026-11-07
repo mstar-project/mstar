@@ -1157,3 +1157,65 @@ def test_a_full_producer_reservation_can_still_drain_consumers_and_preview_is_bo
     result = source.settle_window(reservation, 2, final_transition=second)
     assert result.released == [0, 1, 2, 3] and not result.is_final
     assert not source.producer_done and not source.has_chunk_ready()
+
+
+@pytest.mark.parametrize("ingested", [False, True])
+def test_worker_reserves_and_restores_a_stream_unit_without_consuming_input(ingested, monkeypatch):
+    from mstar.engine.engine import Engine, ExecutingBatch, ExecutionGroup
+    from mstar.engine.resources.loopback_rows import LoopbackRows
+    from mstar.engine.resources.step import StepContext
+    from mstar.worker.micro_scheduler import ScheduledBatch
+    from mstar.worker.worker import Worker
+
+    streams, tm, source = _window_consumer()
+    ring = LoopbackRows(torch.device("cpu"), capacity=1)
+    ring.ask_ring(EDGE, 8)
+    ring.ring_table(EDGE, torch.zeros(1, 1, dtype=torch.long))
+    ring.add(RID)
+    streams.rings[EDGE] = ring
+    original = None
+    if ingested:
+        ring.ring_write(EDGE, [RID], torch.tensor([[[10], [11]]]), ring.ring_reserve(EDGE, [RID], 2))
+        source.put_positions([0, 1])
+        original = streams.reserve_edge(source, EDGE, RID, 1)
+        streams.mark_ingested(RID, original)
+    monkeypatch.setattr(ring, "ring_read", lambda *a: pytest.fail("unexecuted ring was read"))
+    engine = Engine.__new__(Engine)
+    engine._submodules = {
+        "producer": SimpleNamespace(rings={EDGE: {"source"}}, loopback_rows=ring),
+        NODE: SimpleNamespace(rings={}),
+    }
+    members = tuple((ScheduledBatch(node, walk, {RID: 1}), ExecutingBatch(
+        node, {}, StepContext([RID], walk, 0, False, repeats=bound),
+    )) for node, walk, bound in (("producer", "source", 4), (NODE, "sink", 3)))
+    a, b = (member for _, member in members)
+    if original is not None:
+        b.stream_windows = {RID: [original]}
+    group = ExecutionGroup(SimpleNamespace(
+        nodes=("producer", NODE), streaming_edges=(("producer", NODE, EDGE),),
+    ), 1, members)
+    worker = Worker.__new__(Worker)
+    worker.engine_manager = SimpleNamespace(get_engine=lambda name: engine)
+    worker.streams = streams
+    before = ring.ring_room(EDGE, RID)
+    assert worker._reserve_group_stream(group)
+    reader = b.stream_windows[RID][0]
+    assert reader.chunk.reservation.decisions
+    assert reader.uuids == ([] if original is None else original.uuids)
+    assert source._consumed == source._executed_chunks == 0
+    assert ring.ring_room(EDGE, RID) == before - 4
+    worker._restore_group_stream(group)
+    assert not a.ring_bases
+    assert b.stream_windows == ({} if original is None else {RID: [original]})
+    assert source._consumed == source._executed_chunks == 0
+    if original is not None:
+        assert source.ingested_chunk.reservation is original.chunk.reservation
+        assert all(tm.tensor_store.check_uuid_presence(uuid) for uuid in original.uuids)
+        assert _consume(streams, tm, original)[0].flatten().tolist() == [10]
+        streams.settle_window(RID, original, 1)
+        monkeypatch.undo()  # an ordinary settled chunk may now read its real payload
+        second = streams.reserve_edge(source, EDGE, RID, 1)
+        streams.mark_ingested(RID, second)
+        assert _consume(streams, tm, second)[0].flatten().tolist() == [11]
+        streams.settle_window(RID, second, 1)
+    assert ring.ring_room(EDGE, RID) == 8

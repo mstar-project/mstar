@@ -36,9 +36,10 @@ from mstar.distributed.base import ShardingConfig
 from mstar.distributed.communication import WorkerParallelGroups
 from mstar.engine import apply_dynamo_config
 from mstar.engine.chunking import ChunkRange
-from mstar.engine.device_run import RUN_DESCRIPTORS, RUN_REPLAYS, RUN_SKIPPED, run_item
+from mstar.engine.device_run import RUN_COUNTS, RUN_DESCRIPTORS, RUN_REPLAYS, RUN_SKIPPED, run_item
 from mstar.engine.engine import ExecutingBatch, ExecutionGroup
 from mstar.engine.resources import AdmitFailedReason, AllocationFailed, StepContext
+from mstar.engine.resources.iteration_tables import STREAM_COUNTS, STREAM_TRANSITION
 from mstar.engine.resources.kv.config import without_layouts
 from mstar.engine.resources.kv.transfer import (
     TransferEngineInfo,
@@ -2661,8 +2662,18 @@ class Worker(RepeatingSteps):
                 "worker.gpu_thread.exec", cpu="worker.gpu_thread.exec.cpu",
             ):
                 if group is not None:
-                    group_outputs = engine.exec_group(group)
+                    try:
+                        group_outputs = engine.exec_group(group)
+                    except Exception:
+                        if group.unit.streaming_edges and not group.submitted:
+                            self._restore_group_stream(group)
+                        raise
                     if group_outputs is None:
+                        if group.unit.streaming_edges:
+                            self._restore_group_stream(group)
+                            original.stream_windows = node_batch.stream_windows
+                            original.ring_bases = node_batch.ring_bases
+                            original.ring_width = node_batch.ring_width
                         node_batch.__dict__.update(original.__dict__)
                         engine.prepare_inputs(node_batch)
                     elif self._phase_period:
@@ -2905,10 +2916,86 @@ class Worker(RepeatingSteps):
                 finished_rids=tuple(frozenset(part.finished_rids) for part in popped),
             )
             self._stamp_group_repeats(group)
+            if unit.streaming_edges and not self._reserve_group_stream(group):
+                self._graph_runtime.cancel_execution_unit(claim)
+                return None
         except Exception:
             self._graph_runtime.cancel_execution_unit(claim)
             raise
         return group
+
+    def _reserve_group_stream(self, group: ExecutionGroup) -> bool:
+        """Retain policy inputs and ring capacity under the existing unit claim."""
+        if len(group.members) != 2 or len(group.unit.streaming_edges) != 1:
+            return False
+        maker, consumer, signal = group.unit.streaming_edges[0]
+        members = {batch.node_name: (scheduled, batch) for scheduled, batch in group.members}
+        source_schedule, source = members[maker]
+        _, target = members[consumer]
+        if len(source.request_ids) != 1 or tuple(target.request_ids) != tuple(source.request_ids):
+            return False
+        engine = self.engine_manager.get_engine(maker)
+        mgmt = engine._submodules[maker]
+        if (set(mgmt.rings) != {signal} or engine._submodules[consumer].rings
+                or self.streams.consumer_node.get(signal) != consumer
+                or self.streams.rings.get(signal) is not mgmt.loopback_rows):
+            return False
+        if source.ring_bases:
+            raise ValueError("a connected producer already reserved its output ring")
+        rid = source.request_ids[0]
+        existing = target.stream_windows.get(rid, ())
+        if len(existing) > 1 or (existing and existing[0].name != signal):
+            return False
+        done = group.finished_rids[group.unit.nodes.index(maker)] if group.finished_rids else frozenset()
+        room = 0 if done else engine.ring_room(maker, [rid])
+        if room is None:
+            return False
+        source.ring_width = min(source.step_context.repeats, room)
+        if source.ring_width:
+            source_schedule.repeats = source.step_context.repeats = source.ring_width
+            engine._reserve_rings(mgmt, source)
+        positions = () if not source.ring_width else range(
+            source.ring_bases[signal][rid], source.ring_bases[signal][rid] + source.ring_width,
+        )
+        try:
+            retained = self.streams.reserve_connected_edge(
+                rid, signal, positions, target.step_context.repeats, target.graph_walk,
+                ingested=existing[0] if existing else None, may_finish=False,
+            )
+            if retained is None:
+                self._restore_group_stream(group)
+                return False
+            edge, _ = retained
+            target.stream_windows = {rid: [edge]}
+            return True
+        except Exception:
+            self._restore_group_stream(group)
+            raise
+
+    def _restore_group_stream(self, group: ExecutionGroup) -> None:
+        """Undo an unsubmitted unit's readers before releasing producer slots."""
+        for _, executing in reversed(group.members):
+            restored = {}
+            for rid, edges in executing.stream_windows.items():
+                old = []
+                for edge in edges:
+                    reservation = edge.chunk.reservation
+                    if reservation is not None and reservation.decisions:
+                        edge = self.streams.restore_edge(rid, edge)
+                    if edge is not None:
+                        old.append(edge)
+                if old:
+                    restored[rid] = old
+            executing.stream_windows = restored
+        for _, executing in group.members:
+            engine = self.engine_manager.get_engine(executing.node_name)
+            for signal, bases in executing.ring_bases.items():
+                for rid, base in bases.items():
+                    engine.ring_rows(executing.node_name).ring_skip(
+                        signal, rid, range(base, base + executing.ring_width),
+                    )
+            executing.ring_bases = {}
+            executing.ring_width = 1
 
     def _settle_group_claim(self, group: ExecutionGroup) -> None:
         """Publish the GPU thread's irreversible boundary on the main thread."""
@@ -2968,7 +3055,9 @@ class Worker(RepeatingSteps):
         self._drop_rows_whose_loop_stopped(step)
         _drop_unprepared_rows(step.batch, step.node_batch)
 
-    def _finish_step(self, step: PendingBatch, outputs: BatchedModelOutput) -> None:
+    def _finish_step(
+        self, step: PendingBatch, outputs: BatchedModelOutput, *, gpu_executor: ThreadPool | None = None,
+    ) -> None:
         """A step that ran, on any lane: its batch limit lifts, its outputs
         are postprocessed and routed, and metrics count it."""
         if step.group is not None and step.group.submitted:
@@ -2984,12 +3073,84 @@ class Worker(RepeatingSteps):
                         executing.drop_rids(finished)
                     if not scheduled.request_to_worker_graph:
                         continue
-                    if step.group.unit.streaming_edges:
-                        self.scheduler.note_ran(scheduled)
+                    if (step.group.unit.streaming_edges and executing.ring_width == 0
+                            and any(maker == scheduled.node_name for maker, _, _ in step.group.unit.streaming_edges)):
+                        self.scheduler.clear_batch_limit(
+                            scheduled.node_name, scheduled.graph_walk, len(scheduled.request_to_worker_graph),
+                            walks=scheduled.rids_by_walk(),
+                        )
+                        self._graph_runtime.release_execution_unit_member(
+                            step.group.claim, scheduled.node_name, step.group.unit.worker_graph_ids[i],
+                            list(scheduled.request_to_worker_graph),
+                        )
+                        continue
                     member = replace(step, batch=scheduled, node_batch=executing, node_name=scheduled.node_name,
                                      graph_walk=scheduled.graph_walk,
                                      partition=self.request_state.get_partition_for_node(scheduled.node_name),
                                      group=None)
+                    if step.group.unit.streaming_edges and RUN_REPLAYS in (executing.outputs.check_stop_buffers or {}):
+                        if gpu_executor is None:
+                            raise ValueError("independent member collection needs its execution thread")
+                        self._wait_for_step(member)
+                        _, host = self._prematerialize_for_check_stop(
+                            executing.outputs, executing.completion_event, request_ids=executing.request_ids,
+                        )
+                        width = int(host.buffers[RUN_REPLAYS][0])
+                        counts = dict(zip(host.request_ids, host.buffers[RUN_COUNTS].tolist(), strict=True))
+                        semantic = host.buffers.get(STREAM_COUNTS)
+                        pops = 0 if semantic is None else int(semantic[0])
+                        final = None
+                        if semantic is not None:
+                            rid = executing.request_ids[0]
+                            edge = executing.stream_windows[rid][0]
+                            receipt = edge.chunk.reservation
+                            selected = int(host.buffers[STREAM_TRANSITION][0])
+                            if pops:
+                                final = receipt.transitions[selected].chunk
+                                self._settle_stream_windows(
+                                    executing, counts, transitions={(rid, edge.name): (pops, selected)},
+                                )
+                                if final.is_final:
+                                    done, partition = self.streams.settle_final(scheduled.node_name, {rid: {edge.name}})
+                                    executing.final_stream_rids.update(done)
+                                    executing.partition_done_rids.update(partition)
+                            else:
+                                restored = self.streams.restore_edge(rid, edge)
+                                executing.stream_windows = {} if restored is None else {rid: [restored]}
+
+                        def collect(executing=executing, width=width, counts=counts):
+                            engine = self.engine_manager.get_engine(executing.node_name)
+                            result = engine.collect_group_outputs(executing, width, counts)
+                            self._stage_host_rows(result, step.lane)
+                            if self.device_capability.is_accelerator:
+                                event = torch.Event(device=self.device)
+                                event.record(torch.accelerator.current_stream(self.device))
+                                executing.completion_event = event
+                            executing.resource_publish_info = engine.finalize_batch(
+                                executing, publish_request_ids=self._publishable_request_ids(executing),
+                            )
+                            return result
+
+                        executing.outputs = gpu_executor.submit(collect).result()
+                        if width == 0 and pops == 0:
+                            engine = self.engine_manager.get_engine(executing.node_name)
+                            for signal, bases in executing.ring_bases.items():
+                                for rid, base in bases.items():
+                                    engine.ring_rows(executing.node_name).ring_skip(
+                                        signal, rid, range(base, base + executing.ring_width),
+                                    )
+                            self.scheduler.clear_batch_limit(
+                                scheduled.node_name, scheduled.graph_walk, len(scheduled.request_to_worker_graph),
+                                walks=scheduled.rids_by_walk(),
+                            )
+                            self._graph_runtime.release_execution_unit_member(
+                                step.group.claim, scheduled.node_name, step.group.unit.worker_graph_ids[i],
+                                list(scheduled.request_to_worker_graph),
+                            )
+                            continue
+                        scheduled.repeats = max(1, width)  # zero-compute final flush has no token column
+                    if step.group.unit.streaming_edges:
+                        self.scheduler.note_ran(scheduled)
                     if i != step.group.trigger:
                         self._clear_in_flight_flag(scheduled)
                         self._settle_step_rows(member, executing.outputs)
@@ -4406,6 +4567,10 @@ class Worker(RepeatingSteps):
             column = None if signal is None else _host_column(host_rows, client[signal])
             if column is not None:
                 inline = InlineColumn(signal, column)
+        strides = batch.loop_strides(rids)
+        if host_rows is not None and STREAM_COUNTS in host_rows.buffers:
+            semantic_counts = dict(host_rows.first_values(STREAM_COUNTS, rids))
+            strides = [semantic_counts[rid] for rid in rids]
         return PostprocessRequest(
             partition=batch_N.partition, node_name=batch_N.node_name, graph_walk=walks[0],
             output_signals=signals,
@@ -4418,7 +4583,7 @@ class Worker(RepeatingSteps):
             # done, so it rides the WGD that also counts this pass's last chunks
             partition_done=list(batch_N.node_batch.partition_done_rids),
             python_send=self.enable_prof,
-            loop_strides=batch.loop_strides(rids),
+            loop_strides=strides,
             token_width=batch.repeats,
             emit_skip=stream.sent if (stream := batch_N.node_batch.token_stream) is not None else None,
         )
@@ -6006,7 +6171,10 @@ class Worker(RepeatingSteps):
                                 finished = self._await_run(pending, spec_pending, lanes, gpu_executor)
                             laps.skip()
                         if not finished:
-                            self._finish_step(pending, outputs)
+                            if pending.group is not None and pending.group.unit.streaming_edges:
+                                self._finish_step(pending, outputs, gpu_executor=gpu_executor)
+                            else:
+                                self._finish_step(pending, outputs)
                         laps.skip()
 
                     # After N, while N+1 runs: the same thread, but not ahead of

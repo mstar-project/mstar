@@ -891,21 +891,23 @@ def test_streamed_alternatives_preserve_host_meaning_and_do_not_read_future_valu
 
 
 @pytest.mark.parametrize("device_name", ["cpu", "cuda"])
-def test_streamed_engine_composes_independent_bodies_and_owner_reads(device_name, monkeypatch):
+@pytest.mark.parametrize("mode", ["live", "full", "yield"])
+def test_streamed_engine_composes_independent_bodies_and_owner_reads(device_name, mode, monkeypatch):
     from dataclasses import replace
 
     from mstar.engine.accelerator_graph_backend import CUDAGraphBackend, GraphConditional
     from mstar.engine.accelerator_graph_runner import capture_into_graph
     from mstar.engine.device_run import RUN_COUNTS, DeviceRun, RunState
-    from mstar.engine.resources.iteration_tables import STREAM_COUNTS, STREAM_TRANSITION, IterationTables
+    from mstar.engine.resources.iteration_tables import STREAM_COUNTS, IterationTables
     from mstar.engine.resources.loopback_rows import LoopbackRows
     from mstar.model.submodule_base import BatchedModelOutput, NodeInputs, StopKind, StopPolicy
     from mstar.streaming.chunk_policy import FixedChunkPolicy
-    from mstar.streaming.stream_buffer import StreamBuffer, StreamingEdge
+    from mstar.streaming.stream_buffer import StreamBuffer
 
     if device_name == "cuda" and not torch.cuda.is_available():
         pytest.skip("real Engine streamed composition")
     device = torch.device(device_name)
+    full, yielded = mode == "full", mode == "yield"
     eng, group, events = _connected_engine(device=device)
     group.unit = replace(group.unit, streaming_edges=group.unit.edges)
     source = StreamBuffer(2, "x", "a", FixedChunkPolicy(2))
@@ -986,11 +988,11 @@ def test_streamed_engine_composes_independent_bodies_and_owner_reads(device_name
                 return result
             mgmt.submodule.prepare_inputs = prepare
 
-        def entry(state=state):
+        def entry(state=state, name=name):
             state.index.zero_()
             state.counts.zero_()
             state.marks.zero_()
-            state.continuation.fill_(1)
+            state.continuation.fill_(0 if yielded and name == "a" else 1)
 
         def body(name=name, slot=slot, run=run, state=state, mgmt=mgmt, bucket=bucket):
             if name == "a":
@@ -1022,26 +1024,67 @@ def test_streamed_engine_composes_independent_bodies_and_owner_reads(device_name
         return lease
     eng.reserve_replay_slot = reserve
     a, b = (pair[1] for pair in group.members)
-    eng._reserve_rings(eng._submodules["a"], a)
-    snapshot = source.reserve_future_window(range(4), 3, may_finish=False)
-    b.stream_windows = {2: [StreamingEdge("x", "b", [], snapshot.info)]}
+    from mstar.worker.stream_buffers import StreamBufferManager
+    from mstar.worker.worker import PendingBatch, Worker
+
+    worker = Worker.__new__(Worker)
+    worker.engine_manager = SimpleNamespace(get_engine=lambda name: eng)
+    worker.streams = StreamBufferManager(SimpleNamespace(
+        per_request_info={2: SimpleNamespace(stream_buffers={"x": source})},
+    ), None, [])
+    worker.streams.consumer_node = {"x": "b"}
+    worker.streams.rings = {"x": ring}
+    if full:
+        ring.ring_reserve("x", [2], 8)
+        ring.ring_write("x", [2], torch.arange(10, 18, device=device).reshape(1, 8, 1).expand(1, 8, 2), [0])
+        source.put_positions(list(range(8)))
+    assert worker._reserve_group_stream(group)
     output = eng.exec_group(group)
     assert output is not None, group.refusal
     if device_name == "cuda":
         backend.synchronize()
     else:
         assert launches == [1]
-    assert output[0].check_stop_buffers[RUN_COUNTS].tolist() == [3]
-    assert output[1].check_stop_buffers[RUN_COUNTS].tolist() == [1]
-    assert output[1].check_stop_buffers[STREAM_COUNTS].tolist() == [1]
-    assert output[1].row_outputs["x"][0, 0].item() == 42
-    source.put_positions([0, 1])
-    final = int(output[1].check_stop_buffers[STREAM_TRANSITION][0])
-    consumed = source.settle_window(snapshot.reservation, 1, final_transition=final)
-    assert consumed.released == [0, 1] and not consumed.is_final
-    a_output = eng.collect_group_outputs(a, 3, {2: 3})
-    b_output = eng.collect_group_outputs(b, 1, {2: 1})
-    assert a_output.per_rid_outputs[2]["x"][0].shape[1] == 3
-    assert b_output.per_rid_outputs[2]["x"][0].item() == 42
-    eng.release_group(group)
+    if not full:
+        assert output[0].check_stop_buffers[RUN_COUNTS].tolist() == [0 if yielded else 3]
+    else:
+        assert not output[0].check_stop_buffers and not a.step
+    b_count = 0 if yielded else 3 if full else 1
+    assert output[1].check_stop_buffers[RUN_COUNTS].tolist() == [b_count]
+    assert output[1].check_stop_buffers[STREAM_COUNTS].tolist() == [b_count]
+    if not yielded:
+        assert output[1].row_outputs["x"][0, 0].item() == 42
+    from concurrent.futures import ThreadPoolExecutor
+    from contextlib import nullcontext
+
+    completed, released = [], []
+    worker._graph_runtime = SimpleNamespace(release_execution_unit_member=lambda *args: released.append(args))
+    worker.scheduler = SimpleNamespace(note_ran=lambda batch: None, clear_batch_limit=lambda *a, **kw: None)
+    worker.request_state = SimpleNamespace(get_partition_for_node=lambda node: node)
+    worker._phase_period, worker._metrics = 0, None
+    worker._span = lambda *a, **kw: nullcontext()
+    worker._wait_for_step = lambda step: None  # synchronized above on the accelerator
+    worker._stage_host_rows = lambda outputs, lane: None
+    worker._clear_in_flight_flag = lambda batch: None
+    worker._settle_step_rows = lambda *a: False
+    worker._publishable_request_ids = lambda batch: batch.request_ids
+    worker.device_capability = SimpleNamespace(is_accelerator=False)
+
+    def close_member(step, outputs, **kwargs):
+        completed.append((step.node_name, step.batch.repeats, dict(step.node_batch.step_context.run_counts)))
+        if step.node_name == "a":
+            assert outputs.per_rid_outputs[2]["x"][0].shape[1] == 3
+            source.put_positions([0, 1])  # the ordinary producer route publishes only kept items
+            ring.ring_skip("x", 2, [2, 3])
+        else:
+            assert source._consumed == (6 if full else 2) and not source._reservations
+            assert outputs.per_rid_outputs[2]["x"][0].flatten().tolist() == ([42, 50, 58] if full else [42])
+    worker._postprocess_batch = close_member
+    pending = PendingBatch(group.members[0][0], a, "a", "a", "prefill", None, group=group)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        worker._finish_step(pending, output[0], gpu_executor=executor)
+    assert completed == ([] if yielded else [("b", 3, {2: 3})] if full else
+                         [("a", 3, {2: 3}), ("b", 1, {2: 1})])
+    assert len(released) == (2 if yielded else 1 if full else 0)
+    assert ring.ring_room("x", 2) == (6 if full else 8) and not b.stream_windows
     assert not source.producer_done, "a stopped producer Loop is not conductor EOF"
