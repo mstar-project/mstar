@@ -15,7 +15,6 @@ import torch
 from mstar.communication.tensors import NameToTensorList, TensorCommunicationManager
 from mstar.graph.base import GraphEdge, GraphSection
 from mstar.graph.runtime.base import ColumnarEdgeSpecs, EdgeSpec, InputTensors
-from mstar.streaming.chunk_policy import FixedChunkPolicy
 from mstar.streaming.stream_buffer import StreamBuffer, StreamChunkInfo, StreamingEdge, collate
 from mstar.streaming.topology import Connection
 from mstar.worker.node_manager_utils import RequestStateManager
@@ -109,12 +108,11 @@ class StreamBufferManager:
             inputs = retained.get(node, frozenset())
             for walk, edge in inputs:
                 policy = policies.get(edge)
-                if (self.consumer_node.get(edge) != node or type(policy) is not FixedChunkPolicy
-                        or policy.window_size() != 1 or not policy.continues_in(walk)):
-                    raise ValueError(
-                        f"{node}/{walk}: device iteration input {edge!r} requires fixed one-item chunks "
-                        "that continue after the producer ends in this walk"
-                    )
+                if self.consumer_node.get(edge) != node or policy is None:
+                    raise ValueError(f"{node}/{walk}: device iteration input {edge!r} has no matching stream")
+                preview = policy.preview_copy()
+                if preview is policy:
+                    raise ValueError(f"{node}/{walk}: iteration input {edge!r} needs independent policy preview state")
             configured[node] = StreamWindowConfig(limit, inputs)
         self.windows = configured
 

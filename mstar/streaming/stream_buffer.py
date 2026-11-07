@@ -1,11 +1,14 @@
+from __future__ import annotations
+
 from collections import deque
 from collections.abc import Callable
+from copy import copy
 from dataclasses import dataclass, field
 from typing import NamedTuple
 
 import torch
 
-from mstar.streaming.chunk_policy import ChunkPolicy, FixedChunkPolicy
+from mstar.streaming.chunk_policy import ChunkPolicy
 
 
 @dataclass(frozen=True, eq=False)
@@ -14,6 +17,8 @@ class StreamReservation:
     chunk_index: int
     bound: int
     predecessor_bound: int
+    start_iteration: int = 0
+    transitions: tuple[StreamTransition, ...] = ()
 
 
 @dataclass
@@ -50,6 +55,16 @@ class StreamChunkInfo(NamedTuple):
     is_final: bool
     reservation: StreamReservation | None = None
     tail_offset: int = 0
+
+
+class StreamTransition(NamedTuple):
+    """One frozen ordinary policy pop and its resulting semantic progress."""
+    chunk: StreamChunkInfo
+    policy: ChunkPolicy
+    consumed: int
+    tail_consumed: int
+    delivered_end: int
+    final_chunk_emitted: bool
 
 
 class StreamingEdge(NamedTuple):
@@ -108,6 +123,8 @@ class StreamBuffer:
     # at settlement. Returned ordinary chunks keep their snapshotted offset.
     _tail_consumed: int = 0
     _chunks_popped: int = 0
+    # Semantic iterations, distinct from the IDs assigned to retained readers.
+    _executed_chunks: int = 0
     # Submitted readers may overlap; only settlement advances the source.
     _reservations: dict[StreamReservation, int] = field(default_factory=dict)
     # global position just past the last item ever handed out; everything
@@ -358,6 +375,7 @@ class StreamBuffer:
         )
         self._delivered_end = max(self._delivered_end, offset + len(items))
         self._chunks_popped += 1
+        self._executed_chunks += 1
         return chunk
 
     def pop_window(self, n: int) -> StreamChunk:
@@ -393,39 +411,105 @@ class StreamBuffer:
             released=[item for c in chunks for item in c.released], tail_offset=first.tail_offset,
         )
 
+    def _preview(self) -> StreamBuffer:
+        """Copy semantic containers only; arrived items keep their identities.
+
+        Pending arrivals are not replayed, so preview never invokes a joiner or
+        touches transport/graph references. Registered/written totals still
+        prevent an early producer-done flush while arrivals are outstanding.
+        """
+        preview = copy(self)
+        preview.policy = self.policy.preview_copy()
+        if preview.policy is self.policy:
+            raise ValueError("stream reservations need independent policy preview state")
+        preview._buffer = list(self._buffer)
+        preview._walk_runs = deque(run.copy() for run in self._walk_runs)
+        preview._tensor_ids_in_order = deque()
+        preview._id_to_tensor = {}
+        preview._waiting_graph_edges = deque()
+        preview._reservations = {}
+        return preview
+
+    def _apply_transition(self, transition: StreamTransition) -> list:
+        """Apply frozen consumption while preserving later producer arrivals."""
+        consumed = transition.consumed - self._consumed
+        if consumed < 0 or consumed > len(self._buffer):
+            raise ValueError("stream transition no longer matches its retained source")
+        policy = transition.policy.preview_copy()
+        released, self._buffer = self._buffer[:consumed], self._buffer[consumed:]
+        left = consumed
+        while self._walk_runs and left:
+            run = self._walk_runs[0]
+            take = min(run[1], left)
+            run[1] -= take
+            left -= take
+            if run[1] == 0:
+                self._walk_runs.popleft()
+        self.policy = policy
+        self._consumed = transition.consumed
+        self._tail_consumed = transition.tail_consumed
+        self._delivered_end = transition.delivered_end
+        self._final_chunk_emitted = transition.final_chunk_emitted
+        self._executed_chunks += 1
+        return released
+
     def reserve_window(self, bound: int, consumer_walk: str | None = None) -> StreamChunk | None:
-        """Snapshot inputs without consuming them, including every possible
-        predecessor exit. Only one-item, non-overlapping chunks may reserve.
-        The caller gives the snapshot its own graph-reader references.
+        """Retain ordinary policy decisions over every possible predecessor exit.
+
+        Only shape-compatible pops share a run. A changed window/context needs
+        its ordinary next capture; no policy type is special to this backend.
+        The graph separately retains every source item used by the snapshot.
         """
         if type(bound) is not int or bound < 1:
             raise ValueError("a stream run bound must be a positive integer")
         self._update_buffer()
-        ready = self._walk_run_len()
-        # A ramp can begin at one item and grow after the first execution.
-        # Reservation settlement must not change the policy's chunk geometry.
-        if type(self.policy) is not FixedChunkPolicy or self.policy.window_size() != 1:
-            raise ValueError("stream run reservations need fixed one-item chunks")
         if self._waiting_graph_edges:
             raise ValueError("cannot reserve past an unconsumed graph edge")
         if len(self._reservations) >= 2:
             return None
+        if self._buffer and self.walk_tagged and self.peek_walk() != consumer_walk:
+            return None
         predecessor = sum(self._reservations.values())
-        ended = self._producer_done_and_all_read() and ready == len(self._buffer)
-        tail = ended and self.policy.continues_in(consumer_walk)
-        if not tail:
-            bound = min(bound, ready - predecessor)
+        preview = self._preview()
+        transitions = []
+        if self._reservations:
+            earlier = next(iter(self._reservations))
+            prefix = self._executed_chunks - earlier.start_iteration
+            # Do not recompute this prefix against newly arrived items: sizing
+            # may depend on buffer_len even when its captured shape is stable.
+            transitions.extend(earlier.transitions[prefix:prefix + predecessor])
+            for transition in transitions:
+                preview._apply_transition(transition)
+        geometry = next(((t.chunk.num_items, t.chunk.context_items) for t in transitions if t.chunk.num_items), None)
+        while len(transitions) < predecessor + bound and preview.has_chunk_ready(consumer_walk):
+            if preview._buffer and preview.walk_tagged and preview.peek_walk() != consumer_walk:
+                break
+            chunk = preview.pop_chunk()
+            shape = (chunk.num_items, chunk.context_items)
+            if chunk.num_items and geometry is not None and shape != geometry:
+                break
+            if chunk.num_items:
+                geometry = shape
+            transitions.append(StreamTransition(
+                chunk.info, preview.policy.preview_copy(), preview._consumed, preview._tail_consumed,
+                preview._delivered_end, preview._final_chunk_emitted,
+            ))
+            if chunk.is_final:
+                break
+        bound = min(bound, len(transitions) - predecessor)
         if bound <= 0:
             return None
-        if ready and self.walk_tagged and self.peek_walk() != consumer_walk:
-            return None
-        reservation = StreamReservation(self._chunks_popped, bound, predecessor)
+        reservation = StreamReservation(
+            self._chunks_popped, bound, predecessor, self._executed_chunks, tuple(transitions),
+        )
         self._chunks_popped += 1
         self._reservations[reservation] = bound
-        items = self._buffer[:min(ready, predecessor + bound)]
+        end = max(t.chunk.start_offset + t.chunk.num_items for t in transitions)
+        items = self._buffer[:end - self._consumed]
         return StreamChunk(
             data=self._collate(items), chunk_index=reservation.chunk_index,
-            start_offset=self._consumed, num_items=len(items), reservation=reservation, tail_offset=self._tail_consumed,
+            start_offset=self._consumed, context_items=transitions[0].chunk.context_items,
+            num_items=len(items), reservation=reservation, tail_offset=self._tail_consumed,
         )
 
     def owns_window(self, reservation: StreamReservation) -> bool:
@@ -443,7 +527,7 @@ class StreamBuffer:
         reservation = chunk.reservation
         if reservation is None or reservation not in self._reservations:
             raise ValueError("a retained stream snapshot needs its live reservation")
-        prefix = self._consumed + self._tail_consumed - chunk.start_offset - chunk.tail_offset
+        prefix = self._executed_chunks - reservation.start_iteration
         if not 0 <= prefix <= reservation.predecessor_bound:
             raise ValueError("stream progress is outside its retained predecessor span")
         return prefix
@@ -477,28 +561,19 @@ class StreamBuffer:
         if next(iter(self._reservations)) is not reservation:
             raise ValueError("stream reservations must settle in submission order")
         self._update_buffer()
-        consumed = min(executed, self._walk_run_len())
-        items = self._buffer[:consumed]
-        self._buffer = self._buffer[consumed:]
-        origin = self._consumed
-        self._consumed += consumed
-        self._tail_consumed += executed - consumed
-        for i in range(executed):
-            self.policy.register_chunk(int(i < consumed))
-        if self._walk_runs and consumed:
-            self._walk_runs[0][1] -= consumed
-            if self._walk_runs[0][1] == 0:
-                self._walk_runs.popleft()
-        self._delivered_end = max(self._delivered_end, self._consumed)
-        final = bool(executed and self._producer_done_and_all_read() and not self._buffer
-                     and not self.policy.continue_after_producer_done())
-        if final:
-            self._final_chunk_emitted = True
+        prefix = self._executed_chunks - reservation.start_iteration
+        selected = reservation.transitions[prefix:prefix + executed]
+        if prefix < 0 or prefix > reservation.predecessor_bound or len(selected) != executed:
+            raise ValueError("stream execution is outside its frozen policy transitions")
+        origin, items = self._consumed, []
+        for transition in selected:
+            items.extend(self._apply_transition(transition))
+        final = bool(selected and selected[-1].chunk.is_final)
         del self._reservations[reservation]
         self.maybe_ready = True
         return StreamChunk(
             data=self._collate(items), chunk_index=reservation.chunk_index, start_offset=origin,
-            num_items=consumed, is_final=final, released=items,
+            num_items=len(items), is_final=final, released=items,
         )
 
     def store_uningested_edge(self, streaming_edge: StreamingEdge, first: bool = False):

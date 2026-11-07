@@ -4123,3 +4123,34 @@ def test_captured_input_banks_hold_two_windows_after_source_growth_and_validate_
     owner.stage_window(lease, [1], good)
     assert banks[0].columns["cond"][1].tolist() == [99., -9., -9., -9.]
     assert torch.equal(banks[0].columns["cond"][2], before["cond"][2])
+
+
+@pytest.mark.parametrize("overlap", [False, True])
+def test_iteration_stream_packs_frozen_policy_windows_without_reinterpreting_items(overlap):
+    from mstar.engine.engine import _window_tables
+    from mstar.model.submodule_base import InputMetadata
+    from mstar.streaming.chunk_policy import FixedChunkPolicy, SlidingWindowChunkPolicy
+    from mstar.streaming.stream_buffer import StreamBuffer
+
+    policy = SlidingWindowChunkPolicy(4, 2) if overlap else FixedChunkPolicy(4)
+    buf = StreamBuffer(1, "text", "producer", policy)
+    buf.put_positions(list(range(24)))
+    if overlap:
+        buf.pop_chunk()  # subsequent overlap/context geometry is stable
+    first = buf.reserve_window(2)
+    second = buf.reserve_window(2)
+    assert first.reservation.bound == second.reservation.bound == 2
+    values = torch.tensor(second.data["data"]).float()
+    spec = IterationInput("text", shape=(4,), streamed=True)
+    metadata = InputMetadata(stream_chunks={"text": second.info})
+    packed = _window_tables([spec], {"text": [values]}, metadata)["text"].items
+    stride, start = (2, 2) if overlap else (4, 0)
+    expected = torch.tensor([list(range(start + i * stride, start + i * stride + 4)) for i in range(4)]).float()
+    torch.testing.assert_close(packed, expected)
+    # A short first run selects the retained prefix by iterations, not item count.
+    buf.settle_window(first.reservation, 1)
+    assert buf.retained_prefix(second.info) == 1
+    retry = _window_tables([spec], {"text": [values]}, metadata, start=1)["text"].items
+    torch.testing.assert_close(retry, expected[1:])
+    with pytest.raises(ValueError, match="declared iteration shape"):
+        _window_tables([IterationInput("text", shape=(3,), streamed=True)], {"text": [values]}, metadata)

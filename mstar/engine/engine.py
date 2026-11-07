@@ -2,6 +2,7 @@
 
 import dataclasses
 import logging
+import math
 import os
 import threading
 import time
@@ -334,11 +335,31 @@ def _window_tables(
         tensors = inputs.get(spec.source)
         chunk = chunks.get(spec.source)
         if chunk is not None:
-            table = tensors[0].reshape(chunk.num_items, *spec.shape) if tensors and chunk.num_items else None
-            prefix = start if chunk.reservation is not None else 0
-            if table is not None:
-                table = table[prefix:]
-            out[spec.source] = IterationStream(table, chunk.tail_offset + max(0, prefix - chunk.num_items))
+            if chunk.reservation is not None:
+                transitions = chunk.reservation.transitions[start:]
+                if not transitions:
+                    raise ValueError("retained stream input has no frozen policy transitions")
+                table = tensors[0].reshape(chunk.num_items, -1) if tensors and chunk.num_items else None
+                values = []
+                empty = False
+                for transition in transitions:
+                    part = transition.chunk
+                    if not part.num_items:
+                        empty = True
+                        continue
+                    if empty or table is None:
+                        raise ValueError("retained stream inputs cannot have data after an empty tail")
+                    offset = part.start_offset - chunk.start_offset
+                    value = table[offset:offset + part.num_items]
+                    if value.numel() != math.prod(spec.shape):
+                        raise ValueError(f"stream input {spec.source!r} does not fit its declared iteration shape")
+                    values.append(value.reshape(spec.shape))
+                packed = torch.stack(values) if values else None
+                tail = transitions[0].chunk.tail_offset if transitions else chunk.tail_offset
+                out[spec.source] = IterationStream(packed, tail)
+            else:
+                table = tensors[0].reshape(chunk.num_items, *spec.shape) if tensors and chunk.num_items else None
+                out[spec.source] = IterationStream(table, chunk.tail_offset)
     return out
 
 

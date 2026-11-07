@@ -423,14 +423,15 @@ def test_ring_reservations_keep_copied_windows_after_positions_are_released_and_
     assert not any(tm.tensor_store.check_uuid_presence(u) for u in first.uuids + second.uuids)
 
 
-@pytest.mark.parametrize("policy", [FixedChunkPolicy(2), RampChunkPolicy(1, 4)])
-def test_run_reservations_refuse_policies_that_do_not_stay_one_item(policy):
+@pytest.mark.parametrize("factory,bound", [(lambda: FixedChunkPolicy(2), 4), (lambda: RampChunkPolicy(1, 4), 1)])
+def test_run_reservations_stop_at_changed_input_geometry(factory, bound):
+    policy = factory()
     buf = StreamBuffer(RID, EDGE, "LLM", policy)
     buf.put_positions(list(range(8)), "decode")
-    with pytest.raises(ValueError, match="one-item"):
-        buf.reserve_window(4, "decode")
+    chunk = buf.reserve_window(4, "decode")
+    assert chunk.reservation.bound == bound
     assert buf._consumed == policy.items_consumed == 0
-    assert not buf._reservations
+    assert buf.window_bound(chunk.reservation) == bound
 
 
 def test_only_executed_tail_reservations_spend_pad_rows_even_at_width_one():
@@ -455,15 +456,14 @@ def test_only_executed_tail_reservations_spend_pad_rows_even_at_width_one():
     assert buf._consumed == buf.policy.items_consumed == 2
 
 
-@pytest.mark.parametrize("policy", [
-    lambda: FixedChunkPolicy(1),
-    lambda: FixedChunkPolicy(1, frozenset({"prefill"})),
-    lambda: FixedChunkPolicy(2, True),
-])
-def test_retained_iteration_inputs_reject_noncontinuing_or_multi_item_policies(policy):
+def test_retained_iteration_inputs_require_an_independent_policy_preview():
+    class Aliased(FixedChunkPolicy):
+        def preview_copy(self):
+            return self
+
     streams, _, _ = _consumer(1, 1)
-    streams.connections = [Connection("Thinker", "Talker", EDGE, policy)]
-    with pytest.raises(ValueError, match="fixed one-item chunks"):
+    streams.connections = [Connection("Thinker", "Talker", EDGE, lambda: Aliased(1))]
+    with pytest.raises(ValueError, match="independent policy preview"):
         streams.configure_windows({NODE: 4}, {NODE: frozenset({("decode", EDGE)})})
 
 
@@ -621,3 +621,69 @@ def test_an_ordinary_window_leaves_eos_for_its_empty_step_and_returns_the_same_t
     assert retry.chunk is eos.chunk and buf._tail_consumed == 1
     pad = streams.pop_edge(buf, EDGE, RID, window=8)
     assert pad.chunk.tail_offset == 1
+
+
+@pytest.mark.parametrize("factory,prime", [
+    (lambda: FixedChunkPolicy(3), 0),
+    (lambda: SlidingWindowChunkPolicy(4, 2), 0),
+    (lambda: LeftContextChunkPolicy(4, 2), 0),
+    (lambda: ScheduledLeftContextChunkPolicy([2, 4], 4, 2), 3),
+    (lambda: RampChunkPolicy(1, 2, growth=2, max_chunk=4), 0),
+    (lambda: FixedChunkPolicy(2, frozenset({"decode"})), 0),
+])
+def test_retained_policy_transitions_match_ordinary_pops_through_context_final_and_tail(factory, prime):
+    live = StreamBuffer(RID, EDGE, "LLM", factory(), walk_tagged=True)
+    oracle = StreamBuffer(RID, EDGE, "LLM", factory(), walk_tagged=True)
+    for buf in (live, oracle):
+        if prime:
+            buf.prime_context(prime)
+        buf.put_positions(list(range(21)), "decode")
+        buf.signal_done(21)
+    executed = 0
+    while executed < 20 and oracle.has_chunk_ready("decode"):
+        before = (live._consumed, live.policy.items_consumed, [run.copy() for run in live._walk_runs])
+        chunk = live.reserve_window(3, "decode")
+        assert chunk is not None
+        assert (live._consumed, live.policy.items_consumed, list(live._walk_runs)) == before
+        transitions = chunk.reservation.transitions
+        count = min(len(transitions), 20 - executed)
+        expected_released = []
+        for transition in transitions[:count]:
+            expected = oracle.pop_chunk()
+            assert transition.chunk == expected.info
+            expected_released.extend(expected.released)
+        landed = live.settle_window(chunk.reservation, count)
+        assert landed.released == expected_released
+        assert (live._consumed, live._tail_consumed, live._delivered_end, live._final_chunk_emitted) == (
+            oracle._consumed, oracle._tail_consumed, oracle._delivered_end, oracle._final_chunk_emitted,
+        )
+        assert vars(live.policy) == vars(oracle.policy)
+        assert live._buffer == oracle._buffer and list(live._walk_runs) == list(oracle._walk_runs)
+        executed += count
+    assert executed > 1
+
+
+@pytest.mark.parametrize("ran", [0, 1, 2])
+def test_successor_keeps_frozen_policy_prefix_when_arrivals_change_chunk_stride(ran):
+    class SamplingPolicy(FixedChunkPolicy):
+        # A single output item per iteration, sampling every other source item
+        # when the queue is long. Policy behavior depends on arrivals.
+        def next_chunk_size(self, buffer_len):
+            return 2 if buffer_len >= 8 else 1
+
+    buf = StreamBuffer(RID, EDGE, "LLM", SamplingPolicy(1), walk_tagged=True)
+    buf.put_positions(list(range(6)), "decode")
+    first = buf.reserve_window(2, "decode")
+    assert [t.consumed for t in first.reservation.transitions] == [1, 2]
+    buf.put_positions(list(range(6, 12)), "decode")
+    second = buf.reserve_window(2, "decode")
+    assert [t.consumed for t in second.reservation.transitions] == [1, 2, 4, 6]
+    assert buf._consumed == buf.policy.items_consumed == 0
+    assert list(buf._walk_runs) == [["decode", 12]]
+    buf.settle_window(first.reservation, ran)
+    assert buf.retained_prefix(second.info) == ran  # iterations, not consumed items
+    expected = second.reservation.transitions[ran + 1].consumed
+    buf.settle_window(second.reservation, 2)
+    assert buf._buffer == list(range(expected, 12))
+    assert buf._consumed == buf.policy.items_consumed == expected
+    assert buf._executed_chunks == ran + 2
