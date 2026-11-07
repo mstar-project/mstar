@@ -199,6 +199,7 @@ def _declare(sub: "_Sub", other_walk_row: bool = False):
     unchunked row, plus a non-final chunk of walk ``other`` if asked; returns
     the ctx the runner was admitted with."""
     eng = Engine.__new__(Engine)
+    eng._enable_nvtx = False
     eng._runner = _Runner()
     eng._submodules = {"LLM": SimpleNamespace(piecewise_runners={}, submodule=sub)}
     eng._chunking = ChunkingManagement(eng._submodules)

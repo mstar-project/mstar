@@ -41,5 +41,5 @@ def replay_run(
     ))
     runner = AcceleratorGraphRunner.__new__(AcceleratorGraphRunner)
     runner.slot_for = lambda lease: slot
-    stops, rows, _ = runner.repeat(None, carries, repeats, (), columns, iteration)
+    stops, rows, _ = runner.repeat([runner.run_part(None, carries, iteration=iteration)], repeats, columns)
     return stops, rows
