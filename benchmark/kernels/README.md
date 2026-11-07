@@ -84,5 +84,7 @@ gets faster on a GPU without a change to model code.
   alone runs the grouped GEMMs at every count. The sweep times fp8 only, so a bf16 entry is
   measured end to end, its provenance naming how.
 - `fp8_linear`: the block-fp8 dense linear's kernel by token count (`mstar.utils.dense_fp8`:
-  `w8a16`, `flashinfer` or `cublas`; `--shape N=...,K=...,glu=0|1`, N per half with glu). Tables
-  only for now: its sweep is not ported.
+  `w8a16` at its built-in tile or a swept one, `flashinfer` or `cublas` on SM90, `groupwise` on
+  sm_100 / sm_103; `--dtype float8_e4m3fn --shape N=...,K=...,glu=0|1`, N per half with glu).
+  `benchmark/quantization/fp8_rows.py` gathers every shape a server logged without rows (or a named
+  per-rank set) into one sweep.
