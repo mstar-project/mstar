@@ -31,3 +31,9 @@ def test_bad_values_name_the_field(bad):
 def test_none_and_empty_pass():
     assert checked_request_kwargs(None) == {}
     assert checked_request_kwargs({"temperature": None, "language": None}) == {"temperature": None, "language": None}
+
+
+@pytest.mark.parametrize("seed", [2**53 + 1, 2**63 - 1, -2**63])
+@pytest.mark.parametrize("as_string", [False, True])
+def test_int64_seed_does_not_round_through_float(seed, as_string):
+    assert checked_request_kwargs({"seed": str(seed) if as_string else seed})["seed"] == seed
