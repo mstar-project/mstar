@@ -170,6 +170,10 @@ class PackedBlockLoopEncoder(NodeSubmodule):
             )
         }
 
+    def max_segments_per_step(self) -> int:
+        """The ceiling on segments per step of the vision attention resource under ``VISION_ATTN``."""
+        return self.node_resources[VISION_ATTN].max_segments_per_step
+
     def _fits_capture(self, inputs: list[NodeInputs]) -> bool:
         """Whether the batch fits one replay (`_fits_replay`), under every
         label."""
@@ -185,7 +189,7 @@ class PackedBlockLoopEncoder(NodeSubmodule):
         # the whole step replays as one row (`one_row_per_step`)
         return (
             patches <= self.BLOCK_LOOP_PATCH_BUCKETS[-1]
-            and segments <= self.node_resources[VISION_ATTN].max_segments_per_step
+            and segments <= self.max_segments_per_step()
         )
 
     def _capture_block_loop(self, inp: PiecewiseCallInputs) -> dict[str, torch.Tensor]:

@@ -406,7 +406,6 @@ def test_vision_walk_matches_get_rope_index(model, processor, rope_model, layout
     """The schedule and the LLM's media row, against transformers: the
     spliced row's token order and its 3D positions, plus where decode
     resumes."""
-    from mstar.model.keys import ROPE
     from mstar.model.multimodal import splice_media
     from mstar.model.qwen3_5.config import KV_CACHE
     from mstar.model.qwen3_5.submodules import LLMSubmodule
@@ -430,7 +429,7 @@ def test_vision_walk_matches_get_rope_index(model, processor, rope_model, layout
     llm = LLMSubmodule(nn.Linear(1, 1), model.config, model.vision_config, model.encoders)
     # the stream's counter is keyed by the worker's handle, not the wire id (AGENTS.md invariant 14)
     start = 5
-    llm.node_resources = {ROPE: SimpleNamespace(position=lambda rid, label: {7: start}.get(rid, 0))}
+    llm.kv = SimpleNamespace(positions=SimpleNamespace(position=lambda rid, label: {7: start}.get(rid, 0)))
     fwd_info = SimpleNamespace(request_id="r", rid_handle=7, step_metadata=step.metadata)
     (ids,) = step.input_tensors[("LLM", "text_inputs")]
     row = llm._media_inputs(fwd_info, {"text_inputs": [ids], "vision_embeds": [marks]})
@@ -518,7 +517,7 @@ def _encoder(max_segments: int):
         num_position_embeddings=16, out_hidden_size=64,
     )
     encoder = VisionEncoderSubmodule(nn.Linear(1, 1), config, "vision_embeds", (torch.zeros(1), torch.ones(1)))
-    encoder.node_resources = {VISION_ATTN: SimpleNamespace(max_segments_per_step=max_segments)}
+    encoder.vision = SimpleNamespace(reads={VISION_ATTN: SimpleNamespace(max_segments_per_step=max_segments)})
     return encoder
 
 

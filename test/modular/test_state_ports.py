@@ -504,7 +504,7 @@ def test_qwen3_5_vision_region_steps_equal_the_hand_written_ones(monkeypatch):
 
 def test_qwen3_5_vision_capture_check_reads_the_ceiling_in_effect(monkeypatch):
     encoder = _qwen3_5_encoder(monkeypatch)
-    encoder.node_resources = {VISION_ATTN: SimpleNamespace(max_segments_per_step=2)}
+    encoder.vision.reads[VISION_ATTN].max_segments_per_step = 2
     assert encoder._fits_replay(16, 2) and not encoder._fits_replay(16, 3), "a YAML override should hold"
 
 
@@ -724,14 +724,13 @@ def test_the_frame_around_qwen3_5s_stack_is_marked_for_dynamo_to_skip():
 def test_qwen3_5_takes_each_rows_last_token_on_a_prefill_only(monkeypatch, walk, last_token):
     llm = LLMSubmodule(None, SimpleNamespace(stop_token_ids=frozenset()))
     llm.model = Mock(return_value=torch.randn(3, 4), embed=lambda ids: ids, logits=lambda x: x)
+    llm.kv, llm.sampler = object(), object()
     monkeypatch.setattr(LLMSubmodule, "_rope_in_graph", lambda *args: False)
     taken = []
-    engine_inputs = SimpleNamespace(request_ids=[1], resources={
-        ATTN: SimpleNamespace(select_last_hidden=lambda x: taken.append(x) or x[-1:]),
-        SAMPLER: SimpleNamespace(sample=lambda rids, logits: logits),
-    })
-    logits = llm._forward(walk, engine_inputs, torch.tensor([1, 2, 3]), cos_3d=torch.ones(1), sin_3d=torch.ones(1))
-    assert bool(taken) is last_token
+    monkeypatch.setattr("mstar.model.qwen3_5.submodules.at_last_token", lambda h, x: taken.append(h) or x[-1:])
+    monkeypatch.setattr("mstar.model.qwen3_5.submodules.sample", lambda s, logits: logits)
+    logits = llm._forward(walk, None, torch.tensor([1, 2, 3]), cos_3d=torch.ones(1), sin_3d=torch.ones(1))
+    assert (taken == [llm.kv]) is last_token
     assert logits.shape[0] == (1 if last_token else 3)
 
 

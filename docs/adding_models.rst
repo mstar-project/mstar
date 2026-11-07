@@ -2034,8 +2034,7 @@ the signal, so the worker routes it without a tensor and sends the client's copy
 ``preprocess`` reads the tokens with ``self.loopback_inputs(engine_inputs, inputs)``. A
 row whose last step did not keep its value on the device (its first decode step, after
 the prefill) still brings it routed, and that read puts it over the slot's. Qwen3.5,
-Higgs Audio, Qwen3-ASR and Whisper declare it. A model on the state contract reads the tokens with
-``last_sampled``.
+Higgs Audio, Qwen3-ASR and Whisper declare it. Qwen3.5 reads the tokens with ``last_sampled``.
 
 On such a node a captured step writes each row's token and RNG offset back to the request's
 row inside the graph (``knobs: sampler_ingraph_scatter``, on by default). Those rows are
@@ -3335,7 +3334,9 @@ writes:
 Its decoder module provides ``embed(ids)``, ``forward(input_embeds, *, label, **kw)``
 (the stack through its final norm), ``logits(hidden)`` and ``embed_dtype``, as
 ``Qwen3_5ForCausalLM`` does (``Qwen3DenseLM`` has the first three). The sampler and
-position resources are declared under ``mstar.model.keys``' ``SAMPLER`` and ``ROPE``.
+position resources are declared under ``mstar.model.keys``' ``SAMPLER`` and ``ROPE``. A
+model on the state contract overrides ``node_step``, ``next_position``, ``loopback_tokens``,
+``last_token_hidden`` and ``sample_tokens`` with its handle calls, as Qwen3.5 does.
 ``MSTAR_DECODE_BUCKETS`` sets the default decode ladder, and ``MIXED_MAX_PREFILL_ROWS``
 caps a mixed step's prompt rows.
 

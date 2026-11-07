@@ -10,7 +10,6 @@ counter here; the 3D ids are built in this module and passed in as cos/sin.
 import logging
 import os
 from collections.abc import Mapping, Sequence
-from dataclasses import replace
 from typing import Any
 
 import torch
@@ -18,7 +17,18 @@ import torch
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.accelerator_graph_config import DETERMINISTIC_COMPILE_MODE
-from mstar.engine.state import ArrayStep, SubmoduleStep, positions
+from mstar.engine.state import (
+    ArrayStep,
+    SampleStep,
+    Segment,
+    SubmoduleStep,
+    at_last_token,
+    kernel_setting,
+    last_sampled,
+    position,
+    positions,
+    sample,
+)
 from mstar.model.components.block_loop_encoder import PackedBlockLoopEncoder
 from mstar.model.components.mrope import mrope_position_ids
 from mstar.model.components.qwen3_vit import (
@@ -30,7 +40,7 @@ from mstar.model.components.qwen3_vit import (
     vision_position_ids as vision_grid_position_ids,
 )
 from mstar.model.components.sampled_token_decoder import SampledTokenDecoder
-from mstar.model.keys import MIXED, ROPE
+from mstar.model.keys import MIXED
 from mstar.model.multimodal import MediaEncoder
 from mstar.model.qwen3_5.components.language_model import Qwen3_5ForCausalLM
 from mstar.model.qwen3_5.components.rope import (
@@ -39,9 +49,10 @@ from mstar.model.qwen3_5.components.rope import (
     vision_position_ids,
 )
 from mstar.model.qwen3_5.config import (
-    ATTN,
     GDN_STATE,
     KV_CACHE,
+    SAMPLER,
+    VISION_ATTN,
     VISION_TOKENS,
     Qwen3_5Config,
     Qwen3_5VisionConfig,
@@ -61,8 +72,6 @@ def _mixed_token_buckets(prefill_buckets) -> list[int]:
 
 
 class LLMSubmodule(SampledTokenDecoder):
-    ATTN_KEY = ATTN
-
     # An eager 8k prefill is launch-bound (~1,100 kernel launches, the GPU
     # idle half the time: 78 ms of wall for 36 ms of kernels on 0.8B), so the
     # ladder runs past 8192. The powers of two stay, since a batch of prompts
@@ -130,23 +139,31 @@ class LLMSubmodule(SampledTokenDecoder):
 
     def bind_state(self, handles: Mapping[str, Any]) -> None:
         self.kv = handles[KV_CACHE]
+        self.sampler = handles[SAMPLER]
 
-    def layer_steps(self) -> dict[str, Any]:
-        # `declare_step` declares the layers' state
-        return {}
-
-    def declare_step(
-        self,
-        graph_walk: str,
-        request_ids: list[str],
-        inputs: list[ARNodeInputs],
-        per_request_info: Mapping[int, CurrentForwardPassInfo] | None = None,
-        **kwargs,
+    def node_step(
+        self, segments: list[Segment], prefill_tokens: Mapping[int, torch.Tensor], advance: tuple[int, ...] | None,
     ) -> SubmoduleStep:
-        step = super().declare_step(graph_walk, request_ids, inputs, per_request_info, **kwargs)
-        # The sampler keeps the scaffold's step, since the scaffold's forward samples off the resource and a step that
-        # lists the sampler refuses to end with no draw through its handle.
-        return replace(step, state={KV_CACHE: ArrayStep(advance=step.get(ROPE).advance), GDN_STATE: ArrayStep()})
+        return SubmoduleStep(
+            segments=segments,
+            state={
+                KV_CACHE: ArrayStep(advance=advance),
+                GDN_STATE: ArrayStep(),
+                SAMPLER: SampleStep(prompt_tokens=prefill_tokens),
+            },
+        )
+
+    def next_position(self, rid_handle: int) -> int:
+        return position(self.kv, rid_handle, "main")
+
+    def loopback_tokens(self, engine_inputs: ModelInputsFromEngine) -> torch.Tensor:
+        return last_sampled(self.sampler)
+
+    def last_token_hidden(self, engine_inputs: ModelInputsFromEngine, hidden: torch.Tensor) -> torch.Tensor:
+        return at_last_token(self.kv, hidden)
+
+    def sample_tokens(self, engine_inputs: ModelInputsFromEngine, logits: torch.Tensor) -> torch.Tensor:
+        return sample(self.sampler, logits)
 
     # ------------------------------------------------------------------
     # MRoPE
@@ -296,8 +313,14 @@ class VisionEncoderSubmodule(PackedBlockLoopEncoder):
         # per-column (mean, std) for byte patches; see `Qwen3_5DenseModel.pixel_normalizer`
         self._pixel_normalizer = pixel_normalizer
 
+    def bind_state(self, handles: Mapping[str, Any]) -> None:
+        self.vision = handles[VISION_TOKENS]
+
     def _declare(self, rows: Sequence[tuple[Any, Mapping[str, Sequence[int]]]]) -> SubmoduleStep:
         return SubmoduleStep(segments=super()._declare(rows).segments, state={VISION_TOKENS: ArrayStep()})
+
+    def max_segments_per_step(self) -> int:
+        return kernel_setting(self.vision, VISION_ATTN, "max_segments_per_step")
 
     def prepare_inputs(
         self,

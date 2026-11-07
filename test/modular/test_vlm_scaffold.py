@@ -10,7 +10,7 @@ import pytest
 import torch
 
 from mstar.graph.base import Parallel
-from mstar.model.keys import MIXED, ROPE, SAMPLER
+from mstar.model.keys import KV_CACHE, MIXED, SAMPLER
 from mstar.model.multimodal import (
     MEDIA_LAYOUT,
     MediaEncoder,
@@ -229,11 +229,11 @@ def test_a_media_prompt_hands_its_advance_and_ids_to_the_resources():
         for n, advance in ((10, 6), (4, 4))
     ]
     step = llm.declare_step("prefill_vision", [0, 1], rows)
-    assert step.steps[ROPE].advance == (6, 4)
-    assert step.steps[SAMPLER].prefill_tracked_tokens[0] is rows[0].input_ids
+    assert step.state[KV_CACHE].advance == (6, 4)
+    assert step.state[SAMPLER].prompt_tokens[0] is rows[0].input_ids
     # a mixed step never carries media rows
     assert llm.declare_step(MIXED, [0], [ARNodeInputs(input_seq_len=1, input_ids=torch.tensor([1]))]) \
-        .steps[ROPE].advance is None
+        .state[KV_CACHE].advance is None
 
 
 def test_a_padded_media_step_moves_no_position_for_its_padding_rows():
@@ -258,7 +258,7 @@ def test_a_padded_media_step_moves_no_position_for_its_padding_rows():
     runner._buckets = {bucket: SimpleNamespace(config=config)}
     padded = runner.pad_inputs(SlotLease(slot=0, bucket=bucket), rows)
     step = llm.declare_step("prefill_vision", [0, 1, 2, 3], padded)
-    assert step.steps[ROPE].advance == (6, 4, 5, 0)
+    assert step.state[KV_CACHE].advance == (6, 4, 5, 0)
 
 
 def test_a_media_row_with_the_wrong_row_count_fails_its_request():
@@ -267,7 +267,7 @@ def test_a_media_row_with_the_wrong_row_count_fails_its_request():
     starts = []
     llm.prompt_positions = lambda start, layout, n: starts.append(start) or (None, None)
     # the stream's counter is keyed by the worker's handle, not the wire id
-    llm.node_resources = {ROPE: SimpleNamespace(position=lambda rid, label: {(7, "main"): 5}[rid, label])}
+    llm.kv = SimpleNamespace(positions=SimpleNamespace(position=lambda rid, label: {(7, "main"): 5}[rid, label]))
     ids = torch.tensor([1, AUDIO_PAD, AUDIO_PAD])
     layout = {"offset": [1], "tokens": [2], "output": ["audio_embeds"], "grid": [[]]}
     fwd_info = SimpleNamespace(request_id="r", rid_handle=7, step_metadata={MEDIA_LAYOUT: layout})
