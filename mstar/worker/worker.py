@@ -1894,6 +1894,7 @@ class Worker(RepeatingSteps):
         self, node_name: str, graph_walk: str, batch_ids: set[int],
         affected_resources: set[str] | None= None,
         inside_only: bool = False,
+        referenced_rids: frozenset[int] = frozenset(),
     ) -> int | None:
         """Offload one request's state for a refused step of ``(node_name,
         graph_walk)``, freeing room to retry.
@@ -1901,7 +1902,8 @@ class Worker(RepeatingSteps):
         Prefers a victim outside *batch_ids*; falls back to one inside it (the
         caller then excludes it from execution). ``inside_only`` takes only
         the latter. Returns the victim, or None when nothing could be
-        reclaimed.
+        reclaimed. A row retained by an executing step or output reader cannot
+        move, even if it is outside this refused batch.
         """
         engine = self.engine_manager.get_engine(node_name)
         # quietly: a resource that never evicts (a LoRA pool) ran out, which is
@@ -1911,7 +1913,8 @@ class Worker(RepeatingSteps):
 
         active = [
             rid for rid in self.scheduler.arrival
-            if not engine.is_offloaded(node_name, rid)
+            if rid not in referenced_rids
+            and not engine.is_offloaded(node_name, rid)
             and (not inside_only or rid in batch_ids)
         ]
 
@@ -2903,7 +2906,8 @@ class Worker(RepeatingSteps):
         refused = step.node_batch.admit_error is not None
         if refused:
             self._handle_admit_failure(
-                step.batch, step.node_batch, referenced_rids=self._speculated_rids(speculation),
+                step.batch, step.node_batch,
+                referenced_rids=self._speculated_rids(speculation) | frozenset(self._held_beside(step.lane)),
             )
         if step.node_batch.failed_requests:
             self._fail_step_rows(step, outputs)
@@ -3072,9 +3076,9 @@ class Worker(RepeatingSteps):
         # rid torn down here cannot be pushed onto queues that have just been dismantled.
         self._apply_removes_whose_step_landed()
 
-        # ``referenced_rids``: what a speculation still touches. Empty in practice —
-        # nothing is speculated on a refusal — so it only guards a future caller
-        # that broadcasts something here. This step's own rids stay in
+        # ``referenced_rids``: what the successor or another lane still reads.
+        # Protect those rows from both teardown and movement. This refused
+        # step's own rids stay in
         # ``_in_flight_rids`` until the loop clears the pending step, and their
         # removals wait for that.
         self._apply_pending_removes_safe_to_drop(referenced_rids)
@@ -3098,7 +3102,7 @@ class Worker(RepeatingSteps):
         victim_id = self._try_offload_cold_request(
             node_batch.node_name, batch.graph_walk, batch_ids,
             affected_resources=None if failed is None else {failed},
-            inside_only=too_big,
+            inside_only=too_big, referenced_rids=referenced_rids,
         )
 
         if victim_id is not None:

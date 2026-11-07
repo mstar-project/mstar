@@ -231,9 +231,11 @@ class _HoldingWorker:
     def _apply_pending_removes_safe_to_drop(self, in_flight_rids):
         del in_flight_rids
 
-    def _try_offload_cold_request(self, node_name, graph_walk, batch_ids, affected_resources=None, inside_only=False):
+    def _try_offload_cold_request(
+        self, node_name, graph_walk, batch_ids, affected_resources=None, inside_only=False, referenced_rids=frozenset(),
+    ):
         # no victim
-        del node_name, graph_walk, batch_ids, affected_resources, inside_only
+        del node_name, graph_walk, batch_ids, affected_resources, inside_only, referenced_rids
 
 
 def _hold(worker, monkeypatch, at: float, walk: str = "walk") -> None:
@@ -620,6 +622,28 @@ def test_a_row_inside_the_batch_goes_only_when_none_is_outside_it_under_turns():
 
     assert worker._try_offload_cold_request(SCHED_NODE, SCHED_WALK, {"r0", "r1"}) == "outside"
     assert worker._try_offload_cold_request(SCHED_NODE, SCHED_WALK, {"r0", "r1"}) == "r1"
+
+
+@pytest.mark.parametrize("protected", [frozenset(), frozenset({"r1"}), frozenset({"r0", "r1"})])
+def test_oom_preserves_actual_readers_but_can_evict_a_refused_steps_own_rows(protected):
+    worker = _EvictingWorker(["outside", "r0", "r1"])
+    worker.scheduler.could_refill = _NO_LIMITS["could_refill"]
+    batch, node_batch = _batches(_sized_refusal("r1", rows_fit=1, rows_fit_alone=1))
+    node_batch.failed_resource = "kv"
+    batch.node_name = node_batch.node_name = SCHED_NODE
+    # The refused receipt retains these only for teardown; r1 can also have
+    # a real reader on another lane or in the already submitted successor.
+    worker._in_flight_rids = {"r0", "r1"}
+    worker._handle_allocation_failure(batch, node_batch, referenced_rids=protected)
+    assert worker.offloaded == ([] if len(protected) == 2 else ["r0" if protected else "r1"])
+
+
+def test_a_successor_reader_outside_the_refused_batch_cannot_be_offloaded():
+    worker = _EvictingWorker(["cold", "live"], _scheduler(_SchedEngine(order=StepOrder.TURNS)))
+    assert worker._try_offload_cold_request(
+        SCHED_NODE, SCHED_WALK, {"other"}, referenced_rids=frozenset({"live"}),
+    ) == "cold"
+    assert worker._try_offload_cold_request(SCHED_NODE, SCHED_WALK, {"other"}) == "live"
 
 
 def test_a_step_of_one_walk_lifts_its_combined_walks_limit():
