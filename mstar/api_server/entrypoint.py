@@ -23,12 +23,13 @@ from pathlib import Path
 from typing import Any, NamedTuple, Optional, Protocol
 
 import msgpack
+import torch
 import uvicorn
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, PlainTextResponse, Response
 from starlette.concurrency import run_in_threadpool
 
 from mstar.api_server import media_io
@@ -42,6 +43,7 @@ from mstar.api_server.auth import (
 )
 from mstar.api_server.body_limit import BodyLimitMiddleware
 from mstar.api_server.data_worker import PreprocessWorker, unlink_files
+from mstar.api_server.openpi import OpenpiPolicy, serve_connection
 from mstar.api_server.request_types import (
     APIServerMessage,
     ClientAppend,
@@ -56,6 +58,7 @@ from mstar.conductor.workers import accelerator_type, deployment_workers
 from mstar.engine.resources.lora.config import lora_enabled
 from mstar.engine.resources.lora.serving import lora_specs
 from mstar.engine.resources.lora.store import check_adapters
+from mstar.model.media_limits import RAW_INPUT_CHARGES
 from mstar.model.multimodal import PromptPart
 from mstar.model.registry import model_init_kwargs
 from mstar.observability.catalog import STATUS_INTERVAL_S
@@ -412,6 +415,24 @@ def _file_bytes(file_paths: dict[str, list[str]] | None) -> int:
     return sum(os.path.getsize(path) for paths in (file_paths or {}).values() for path in paths)
 
 
+def _check_raw_inputs(
+    raw_inputs: dict[str, list[torch.Tensor]], file_paths: dict[str, list[str]] | None,
+) -> None:
+    """Refuse a modality that can't arrive decoded, one sent both decoded and as
+    files (whose order among each other nothing would say), and an image that
+    isn't RGB uint8 ``[3, H, W]``."""
+    for modality, items in raw_inputs.items():
+        if modality not in RAW_INPUT_CHARGES:
+            raise ValueError(f"{modality} inputs arrive only as files; raw_inputs takes {sorted(RAW_INPUT_CHARGES)}")
+        if modality in (file_paths or {}):
+            raise ValueError(f"a request sends its {modality} inputs either decoded or as files, not both")
+        if modality == "image" and not all(
+            isinstance(item, torch.Tensor) and item.dtype == torch.uint8 and item.ndim == 3 and item.shape[0] == 3
+            for item in items
+        ):
+            raise ValueError("a decoded image is an RGB uint8 tensor of shape [3, H, W]")
+
+
 class DeadConductorError(RuntimeError):
     """The conductor process exited before the workers finished setup (it
     exits when a worker dies during init), so the server must not bind."""
@@ -466,6 +487,11 @@ class APIServer:
         self.model_name = model_name
         # what an OpenAI request's `model` field may name: the base model, or an adapter
         self.served_models = ServedModels.of(model_name, model_config)
+        # The openpi WebSocket at `/`, when the config maps robot observations to this model.
+        openpi_block = (model_config or {}).get("openpi")
+        self.openpi_policy = (
+            None if openpi_block is None else OpenpiPolicy.from_config(openpi_block, model)
+        )
         specs = lora_specs(model, model_config)
         lora_spec = specs[0] if specs else None
         # Every adapter the serving config names, checked against every LoRA spec and
@@ -710,6 +736,7 @@ class APIServer:
         model: str | None = None,
         end_input: bool | Collection[str] = True,
         file_streams: dict[str, list[str | None]] | None = None,
+        raw_inputs: dict[str, list[torch.Tensor]] | None = None,
     ) -> str:
         """Build a :class:`NewRequestConductor` and send it to the conductor.
 
@@ -739,7 +766,14 @@ class APIServer:
         in :meth:`stream_input`: one the model lacks is refused with a 400.
         ``process_prompt`` routes the opening's files, so a name is only
         checked.
+
+        ``raw_inputs`` are inputs already decoded, by modality and in order,
+        in place of that modality's files (images, as RGB uint8 ``[3, H, W]``):
+        the model loads them with ``Model.load_decoded_<modality>``, so nothing
+        is written or decoded.
         """
+        if raw_inputs is not None:
+            _check_raw_inputs(raw_inputs, file_paths)
         if request_id is None:
             request_id = str(uuid.uuid4())
         check_request_id(request_id)
@@ -812,6 +846,7 @@ class APIServer:
             model_kwargs=model_kwargs,
             prompt_parts=prompt_parts,
             ends=ending,
+            raw_inputs=raw_inputs,
         ))
 
         logger.info(
@@ -2034,7 +2069,9 @@ app.add_middleware(BodyLimitMiddleware)
 # answers browser preflights (which carry no credentials) and still stamps its
 # headers on a 401, and an unauthenticated request is refused before its body
 # is read.
-api_key_guard = APIKeyGuard(resolve_api_key())
+api_key_guard = APIKeyGuard(
+    resolve_api_key(), serves_openpi=lambda: getattr(api_server, "openpi_policy", None) is not None,
+)
 app.add_middleware(APIKeyMiddleware, guard=api_key_guard)
 # Outside the key check and the body limit, which refuse before routing, and
 # inside CORS, so a browser preflight is not counted. ``routes`` must list
@@ -2771,6 +2808,27 @@ async def health_check():
     return {"status": "healthy"}
 
 
+@app.get("/healthz", include_in_schema=False)
+async def healthz():
+    """``/health`` as openpi's policy server answers its probe, on a server that
+    serves the openpi socket; elsewhere there is no such route."""
+    if getattr(api_server, "openpi_policy", None) is None:
+        raise HTTPException(status_code=404, detail="Not Found")
+    await health_check()
+    return PlainTextResponse("OK\n")
+
+
+@app.websocket("/")
+async def openpi_ws(websocket: WebSocket):
+    """openpi's policy protocol (see :mod:`mstar.api_server.openpi`), where
+    ``openpi_client`` connects: the server's root. Refused unless the config
+    has an ``openpi:`` block."""
+    if api_server is None:
+        await websocket.close(code=1013, reason="Server not ready")
+        return
+    await serve_connection(websocket, api_server)
+
+
 @app.get("/metrics", include_in_schema=False)
 async def metrics():
     """Prometheus metrics, when the server runs with ``--enable-metrics``."""
@@ -2825,6 +2883,16 @@ def deployment_cpu_plan(config: dict) -> cpus.CpuPlan:
     return cpus.CpuPlan(plan.mask, plan.usable, why=f"not pinned: {refused}")
 
 
+def _ws_max_size(config: dict) -> int:
+    """The config's ``ws_max_message_mb``, in bytes: the largest WebSocket
+    message the server reads (16 MiB, uvicorn's own, by default). A larger one
+    closes its socket with 1009."""
+    mb = config.get("ws_max_message_mb", 16)
+    if isinstance(mb, bool) or not isinstance(mb, (int, float)) or not 0 < mb < math.inf:
+        raise ValueError(f"ws_max_message_mb must be a positive number of MiB, not {mb!r}")
+    return int(mb * (1 << 20))
+
+
 def _uvicorn_config(app, host: str, port: int, config: dict) -> uvicorn.Config:
     # Per-message deflate is negotiated server-wide, for every WebSocket route,
     # so it is the deployment's to turn off (see ws_per_message_deflate in
@@ -2833,6 +2901,7 @@ def _uvicorn_config(app, host: str, port: int, config: dict) -> uvicorn.Config:
     return uvicorn.Config(
         app, host=host, port=port, access_log=False, log_config=None,
         ws_per_message_deflate=bool(config.get("ws_per_message_deflate", True)),
+        ws_max_size=_ws_max_size(config),
     )
 
 
@@ -2850,8 +2919,6 @@ def _set_preprocess_threads(model, config: dict) -> None:
             return
     else:
         threads = model.PREPROCESS_TORCH_THREADS or cpus.plan().preprocess_threads
-    import torch
-
     torch.set_num_threads(int(threads))
 
 
@@ -2960,11 +3027,18 @@ def main(argv: list[str] | None = None):
             "LoRA adapters (`resources: lora:` in the serving config) are served by the "
             "Python frontend only; drop --rust-frontend"
         )
+    try:
+        _ws_max_size(config)  # here, not at the bind after the workers' compile
+    except ValueError as e:
+        raise SystemExit(f"mstar: {e}") from None
     if args.rust_frontend:
         from mstar.api_server.rust_frontend import find_server_binary
 
         # Before anything loads, so a missing or stale binary fails fast.
         rust_frontend_bin = find_server_binary(args.rust_frontend_bin)
+        if config.get("openpi") is not None:
+            logger.warning("The openpi WebSocket (`openpi:` in the config) is served by the Python frontend only; "
+                           "--rust-frontend serves without it")
 
     model_name = config.get("model", "dummy")
     # Forward yaml-level model_kwargs to the API-server-side lightweight

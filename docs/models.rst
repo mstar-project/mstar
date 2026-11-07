@@ -95,7 +95,9 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
        ``configs/pi05.yaml``). Cameras it leaves out are masked, as openpi does, and more
        images than that are a 400.
        ``configs/pi05_droid.yaml`` serves the DROID fine-tune (``lerobot/pi05_droid``) with
-       openpi's DROID normalization: raw joint state in, joint velocities out.
+       openpi's DROID normalization: raw joint state in, joint velocities out. It also
+       serves openpi's policy WebSocket, so openpi's DROID client connects unchanged
+       (see :doc:`clients`).
    * - ``qwen3_5_{0.8,2,4,9,27}b``
      - ``Qwen/Qwen3.5-4B``
      - Hybrid-attention VLM (text + image in, text out): gated DeltaNet linear
