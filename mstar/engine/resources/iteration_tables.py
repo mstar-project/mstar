@@ -85,6 +85,7 @@ class StreamPolicyBank:
     terminal: torch.Tensor
     positions: torch.Tensor
     origins: torch.Tensor
+    source_rows: torch.Tensor
 
 
 @dataclass
@@ -106,11 +107,12 @@ class StreamWindow:
     compute_ready: torch.Tensor
     positions: torch.Tensor
     origins: torch.Tensor
+    source_rows: torch.Tensor
     continuation: torch.Tensor
 
     def gather(self) -> None:
         """After installing owner bindings, before reading this iteration."""
-        for name in ("history", "counts", "limits", "terminal", "positions", "origins"):
+        for name in ("history", "counts", "limits", "terminal", "positions", "origins", "source_rows"):
             getattr(self, name).copy_(getattr(self.bank, name).index_select(0, self.rows))
 
     def payload_positions(self, width: int) -> torch.Tensor:
@@ -284,8 +286,8 @@ class IterationTables(Resource):
         """Allocate fixed owner storage and a view over current resident bindings.
 
         For S owner slots, D decisions, T transitions and P positions the bank
-        takes 8*S*(4*D + 6*T + P + 6) + S bytes. The physical view adds
-        8*bs*(P + 13) + bs + 24 bytes, excluding its borrowed row bindings.
+        takes 8*S*(4*D + 6*T + P + 7) + S bytes. The physical view adds
+        8*bs*(P + 14) + bs + 24 bytes, excluding its borrowed row bindings.
         Geometry is frozen by the first accepted reservation, not a global
         memory quota; a larger later snapshot must take the ordinary path.
         """
@@ -309,21 +311,21 @@ class IterationTables(Resource):
             torch.full((slots, decisions, 4), -1, dtype=torch.long, device=self._device),
             zeros(slots, transitions, 6), torch.full((slots,), -1, dtype=torch.long, device=self._device),
             zeros(slots), zeros(slots), zeros(slots, dtype=torch.bool),
-            torch.full((slots, positions), -1, dtype=torch.long, device=self._device), zeros(slots, 3),
+            torch.full((slots, positions), -1, dtype=torch.long, device=self._device), zeros(slots, 3), zeros(slots),
         )
         window = StreamWindow(
             bank, rows, torch.full((bs,), -1, dtype=torch.long, device=self._device),
             zeros(bs), zeros(bs), zeros(bs, dtype=torch.bool),
             torch.full((bs,), -1, dtype=torch.long, device=self._device), zeros(bs, 6), zeros(1), zeros(1),
-            torch.full((bs, positions), -1, dtype=torch.long, device=self._device), zeros(bs, 3), zeros(1),
+            torch.full((bs, positions), -1, dtype=torch.long, device=self._device), zeros(bs, 3), zeros(bs), zeros(1),
         )
         self._stream_windows[key] = window
         return window
 
     def stage_stream_window(
         self, lease: SlotLease, slots: Sequence[int], reservations: Sequence[StreamReservation],
-        computes: Sequence[Sequence[bool]], *, producer_limits: Sequence[int] | None = None,
-        stager: PinnedStager | None = None,
+        computes: Sequence[Sequence[bool]], *, source_rows: Sequence[int] = (),
+        producer_limits: Sequence[int] | None = None, stager: PinnedStager | None = None,
     ) -> None:
         """Before launch, freeze ordinary policy and prepared-tail decisions.
 
@@ -339,8 +341,12 @@ class IterationTables(Resource):
             raise ValueError("stream-policy snapshots do not fit the captured rows")
         stager = self._stager if stager is None else stager
         decisions, chunks, limits, positions, origins = [], [], [], [], []
-        if window.positions.shape[1] and (producer_limits is None or len(producer_limits) != len(reservations)):
-            raise ValueError("captured payload coverage needs each producer's reserved horizon")
+        if window.positions.shape[1] and (
+            producer_limits is None or len(producer_limits) != len(reservations)
+            or len(source_rows) != len(reservations)
+            or any(type(row) is not int or row <= 0 for row in source_rows)
+        ):
+            raise ValueError("captured payload coverage needs retained source rows and reserved producer horizons")
         for index, (reservation, flags) in enumerate(zip(reservations, computes, strict=True)):
             if (len(flags) != len(reservation.transitions) or any(type(flag) is not bool for flag in flags)
                     or len(reservation.parents) != len(reservation.transitions)
@@ -380,6 +386,7 @@ class IterationTables(Resource):
             if npos:
                 stager.copy_(window.positions[slot], positions[index * npos:(index + 1) * npos])
                 stager.copy_(window.origins[slot], origins[index * 3:(index + 1) * 3])
+                stager.copy_(window.source_rows[slot:slot + 1], source_rows[index:index + 1])
             window.history[slot].fill_(-1)
             window.counts[slot].zero_()
             window.terminal[slot].zero_()

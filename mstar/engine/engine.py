@@ -2520,7 +2520,6 @@ class Engine:
         """
         from mstar.engine.accelerator_graph_backend import GraphConditional
         from mstar.engine.accelerator_graph_runner import capture_into_graph
-        from mstar.engine.resources.loopback_rows import LoopbackRowsStep
 
         maker, consumer, signal = group.unit.streaming_edges[0]
         batches = {batch.node_name: batch for _, batch in group.members}
@@ -2537,11 +2536,10 @@ class Engine:
         if not set(source_rows) <= set(target_rows):
             guard.refuse("every live producer needs a claimed consumer row")
         correspondence = tuple(target_rows.index(rid) for rid in source_rows)
-        # Retired producers have no live member slot. Their existing ring
-        # readers retain a fixed address; live entries are refreshed below.
-        ring.plan(LoopbackRowsStep(), dataclasses.replace(batch.step_context, resident=None))
+        # Input coverage owns its source address independently of whether the
+        # producer still has a resident execution slot.
         lease = batch.step_context.slot_lease
-        indices = ring.indices(lease.bucket, lease.buffer_slot)
+        indices = window.source_rows
         source_lease = None if source is None else source_batch.step_context.slot_lease
         source_indices = (None if source is None else
                           ring.indices(source_lease.bucket, source_lease.buffer_slot))
@@ -2654,14 +2652,8 @@ class Engine:
             running = torch.zeros_like(window.continuation) if source is None else source.run.state.continuation
             window.continuation.copy_((running != 0) | (window.ready != 0))
 
-        def source_addresses():
-            if source is not None:
-                ring.gather_rows(source_lease.bucket, source_lease.buffer_slot, source.run.state.dropping.rows)
-                for row, target in enumerate(correspondence):
-                    indices[target:target + 1].copy_(source_indices[row:row + 1])
-
         def publish():
-            source_addresses()
+            ring.gather_rows(source_lease.bucket, source_lease.buffer_slot, source.run.state.dropping.rows)
             positions = window.produced_positions(project(source.run.state.counts))
             active = kept()
             if source_capacity == capacity and correspondence == tuple(range(len(target_rows))):
@@ -2672,7 +2664,6 @@ class Engine:
                                       produced[row:row + 1], active[row:row + 1])
 
         def gather():
-            source_addresses()
             destination_indices = None
             if destination_owner is not None:
                 destination_indices = destination_owner.gather_rows(
@@ -3114,6 +3105,7 @@ class Engine:
                     tables.stage_stream_window(
                         leases[consumer], [planner.slot_of(rid) for rid in rows], reservations,
                         [[choice is not None for choice in stream_choices[rid]] for rid in rows],
+                        source_rows=self._submodules[maker].loopback_rows.retained_rows(rows),
                         producer_limits=[
                             producer_batch.ring_width if maker in leases and rid in producer_batch.request_ids else 0
                             for rid in rows

@@ -904,19 +904,21 @@ def test_future_policy_capture_bank_reuse_clears_history_and_checks_before_stagi
             graph.replay()
             backend.synchronize()
 
-    owner.stage_stream_window(lease, [1], [reservation], [[True] * len(reservation.transitions)], producer_limits=[2])
+    owner.stage_stream_window(lease, [1], [reservation], [[True] * len(reservation.transitions)],
+                              source_rows=[1], producer_limits=[2])
     run()
     assert window.counts.tolist() == [1, 0]
     old = window.bank.history[1].clone()
     before = window.bank.decisions.clone(), window.history.clone(), window.counts.clone()
     with pytest.raises(ValueError, match="prepared transitions"):
-        owner.stage_stream_window(lease, [1], [reservation], [[]], producer_limits=[2])
+        owner.stage_stream_window(lease, [1], [reservation], [[]], source_rows=[1], producer_limits=[2])
     assert all(torch.equal(a, b) for a, b in zip(
         before, (window.bank.decisions, window.history, window.counts), strict=True,
     ))
     # A new owner is published while the physical view still belongs to the
     # old one. Staging cannot reset the old view or its durable receipt.
-    owner.stage_stream_window(lease, [3], [newer], [[True] * len(newer.transitions)], producer_limits=[2])
+    owner.stage_stream_window(lease, [3], [newer], [[True] * len(newer.transitions)],
+                              source_rows=[1], producer_limits=[2])
     assert window.counts.tolist() == [1, 0] and window.bank.history[1] == old
     policy_rows.copy_(torch.tensor([3, 1], device=device))
     available[0] = 2
@@ -928,7 +930,8 @@ def test_future_policy_capture_bank_reuse_clears_history_and_checks_before_stagi
     run()
     assert window.bank.counts[[1, 3]].tolist() == [2, 1], "physical reuse must retain both receipts"
     # Empty EOF advances semantic state without any model output descriptor.
-    owner.stage_stream_window(lease, [4], [empty], [[False] * len(empty.transitions)], producer_limits=[0])
+    owner.stage_stream_window(lease, [4], [empty], [[False] * len(empty.transitions)],
+                              source_rows=[1], producer_limits=[0])
     policy_rows[0] = 4
     available[0] = 0
     done[0] = True
@@ -1023,7 +1026,8 @@ def test_future_stream_policy_and_ring_payloads_run_in_one_conditional_graph(fac
         ))))
         runtime, launch = backend.while_runtime(), backend.while_runtime().launch
         monkeypatch.setattr(runtime, "launch", lambda *args: (launches.append(args[0]), launch(*args))[-1])
-    tables.stage_stream_window(lease, [1], [reservation], [computes], producer_limits=[5])
+    tables.stage_stream_window(lease, [1], [reservation], [computes],
+                              source_rows=ring.retained_rows([RID]), producer_limits=[5])
     window.gather()
     for value in (a_count, emitted, b_count, done, outputs):
         value.zero_()
@@ -1297,3 +1301,70 @@ def test_worker_reserves_and_restores_a_stream_unit_without_consuming_input(inge
         assert _consume(streams, tm, second)[0].flatten().tolist() == [11]
         streams.settle_window(RID, second, 1)
     assert ring.ring_room(EDGE, RID) == 8
+
+
+@pytest.mark.parametrize("device_name", ["cpu", "cuda"])
+def test_finished_stream_sources_follow_replaced_consumer_owners(device_name):
+    from mstar.engine.accelerator_graph_backend import get_accelerator_graph_backend
+    from mstar.engine.accelerator_graph_runner import capture_into_graph
+    from mstar.engine.resources.iteration_tables import IterationTables
+    from mstar.engine.resources.loopback_rows import LoopbackRows
+    from mstar.engine.resources.step import BucketKey, SlotLease
+
+    if device_name == "cuda" and not torch.cuda.is_available():
+        pytest.skip("real retained source rebinding")
+    device = torch.device(device_name)
+    # Finished producers have no resident execution slots. Their ordinary
+    # stream readers still retain the ring allocation and physical positions.
+    ring = LoopbackRows(device, capacity=2)
+    ring.ask_ring(EDGE, 4)
+    ring.ring_table(EDGE, torch.zeros(1, 1, dtype=torch.long, device=device))
+    sources, reservations = [], []
+    for rid, values in ((101, [11, 12]), (202, [21, 22])):
+        ring.add(rid)
+        bases = ring.ring_reserve(EDGE, [rid], 2)
+        ring.ring_write(EDGE, [rid], torch.tensor([[values]], device=device).reshape(1, 2, 1), bases)
+        source = StreamBuffer(rid, EDGE, "producer", FixedChunkPolicy(2))
+        source.put_positions([0, 1])
+        source.signal_done(2)
+        reservations.append(source.reserve_future_window([], 1).reservation)
+        sources.append(source)
+    tables = IterationTables(device)
+    lease = SlotLease(0, BucketKey("consumer", 1, 1))
+    rows = torch.tensor([2], device=device)  # consumer slots need not equal source rows
+    window = tables.prepare_stream_window(
+        lease, max(len(r.decisions) for r in reservations), max(len(r.transitions) for r in reservations),
+        2, rows=rows, slots=4,
+    )
+    available = torch.tensor([2], device=device)
+    done, live = torch.ones(1, dtype=torch.bool, device=device), torch.ones(1, dtype=torch.bool, device=device)
+    output = torch.zeros(1, 2, 1, dtype=torch.long, device=device)
+
+    def execute():
+        window.gather()
+        window.select(available, done, live)
+        ring.ring_gather(EDGE, window.source_rows, window.payload_positions(2), output)
+        window.advance()
+
+    graph = None
+    if device_name == "cuda":
+        backend = get_accelerator_graph_backend(device)
+        graph = capture_into_graph(execute, backend.graph_pool_handle(), device, None, keep_graph=True)[0]
+    for slot, rid, reservation, expected in zip((2, 1), (101, 202), reservations, ([11, 12], [21, 22]), strict=True):
+        tables.stage_stream_window(
+            lease, [slot], [reservation], [[True] * len(reservation.transitions)],
+            source_rows=ring.retained_rows([rid]), producer_limits=[0],
+        )
+        rows.fill_(slot)
+        if graph is None:
+            execute()
+        else:
+            graph.replay()
+            backend.synchronize()
+        assert output.reshape(-1).tolist() == expected
+        assert window.bank.counts[slot] == 1
+    # Replacement does not release or overwrite the old reader's address.
+    retained = torch.zeros_like(output)
+    ring.ring_gather(EDGE, window.bank.source_rows[2:3], window.bank.positions[2:3], retained)
+    assert retained.reshape(-1).tolist() == [11, 12]
+    assert all(source.owns_window(reservation) for source, reservation in zip(sources, reservations, strict=True))

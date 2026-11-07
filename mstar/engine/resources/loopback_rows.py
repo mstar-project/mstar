@@ -245,6 +245,17 @@ class LoopbackRows(Resource):
             stream.synchronize()
         return window
 
+    def retained_rows(self, rids: Sequence[Hashable]) -> list[int]:
+        """Snapshot ring addresses while the ordinary stream readers retain them.
+
+        A finished producer may have no resident planner slot. Its stream
+        reader still owns this row until the consumer releases the input.
+        """
+        with self._lock:
+            if any(rid not in self._row_of for rid in rids):
+                raise ValueError("a captured stream input needs its retained producer row")
+            return [self._row_of[rid] for rid in rids]
+
     def ring_gather(
         self, name: str, rows: torch.Tensor, positions: torch.Tensor, target: torch.Tensor,
         active: torch.Tensor | None = None,
