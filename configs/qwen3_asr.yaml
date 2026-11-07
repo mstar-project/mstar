@@ -6,6 +6,9 @@ max_seq_len: 65536
 # filling the pool and stalling. A deployment that only serves short audio can
 # raise it (64 roughly doubles throughput there; see docs/asr.rst).
 max_concurrent_requests: 12
+knobs:
+  # A schedutil host keeps work split across threads near its lowest clock.
+  uclamp_min: 1024
 resources:
   kv_cache:
     max_num_pages: 2048

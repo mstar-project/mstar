@@ -4,6 +4,7 @@ max_seq_len: 32768
 knobs:
   kv_plan_cache: 1
   gc_gen0_threshold: 50000
+  uclamp_min: 1024
 node_groups:
   # Text, images and video. Colocated: the
   # encoder runs once per request, then idles.
