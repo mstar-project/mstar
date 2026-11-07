@@ -760,7 +760,7 @@ def test_an_unexecuted_member_releases_its_claim_without_completing_its_graph(pr
     assert set(inputs.signal_names) == ({"x", "y"} if producer_runs else {"in"})
 
 
-def _stream_unit_runtime(*, install_consumer=True, consumer_worker=WORKER, driven=False):
+def _stream_unit_runtime(*, install_consumer=True, consumer_worker=WORKER, driven=False, plain_consumer=False):
     from mstar.streaming.chunk_policy import FixedChunkPolicy
     from mstar.streaming.topology import Connection
 
@@ -772,13 +772,14 @@ def _stream_unit_runtime(*, install_consumer=True, consumer_worker=WORKER, drive
     # Equal graph-local NodeId and LoopId/name intentionally: each member
     # must still settle its own independent Loop, on its own installed walk.
     graphs = [WorkerGraph(
-        section=Sequential(sections=[Loop(name="steps", section=node, max_iters=cap, outputs=[])]),
+        section=Sequential(sections=[node if plain_consumer and node is b
+                                     else Loop(name="steps", section=node, max_iters=cap, outputs=[])]),
         graph_walks={walk}, ranks=[0], worker_graph_id=wg,
     ) for node, cap, walk, wg in ((a, 3, "produce", 7), (b, 5, "consume", 9))]
     runtime = rust_runtime.RustGraphRuntime(
         my_worker_id=WORKER, my_worker_graphs=graphs,
         all_wg_ids_to_graph_walks={7: {"produce"}, 9: {"consume"}},
-        all_wg_ids_to_dyn_loops={7: {"steps"}, 9: {"steps"}},
+        all_wg_ids_to_dyn_loops={7: {"steps"}, 9: set() if plain_consumer else {"steps"}},
         all_wg_ids_to_nodes={7: {"a"}, 9: {"b"}}, node_to_partition={"a": "source", "b": "sink"},
         sharding_config=ShardingConfig(groups=[], tp_enabled_nodes=set(), shard_dim={}),
         bookkeeping=RustTensorBookkeeping(),
@@ -790,6 +791,32 @@ def _stream_unit_runtime(*, install_consumer=True, consumer_worker=WORKER, drive
     if install_consumer:
         assert runtime.add_request("r", "sink", "consume", [9], assignment, {}) == rid
     return runtime, rid
+
+
+def test_real_talker_loop_and_plain_codec_derive_one_stream_unit():
+    from pathlib import Path
+
+    from mstar.model.qwen3_tts.config import Qwen3TTSModelConfig
+    from mstar.model.qwen3_tts.qwen3_tts_model import Qwen3TTSModel
+
+    model = object.__new__(Qwen3TTSModel)
+    model.config = Qwen3TTSModelConfig()
+    graphs = model.get_worker_graphs(str(Path(__file__).resolve().parents[2] / "configs/qwen3tts.yaml"))
+    runtime = rust_runtime.RustGraphRuntime(
+        my_worker_id=WORKER, my_worker_graphs=graphs,
+        all_wg_ids_to_graph_walks={g.worker_graph_id: g.graph_walks for g in graphs},
+        all_wg_ids_to_dyn_loops={g.worker_graph_id: set(g.section.get_loops()) for g in graphs},
+        all_wg_ids_to_nodes={g.worker_graph_id: set(g.section.get_nodes()) for g in graphs},
+        node_to_partition={"Talker": "Talker", "Codec": "Codec"},
+        sharding_config=ShardingConfig(groups=[], tp_enabled_nodes=set(), shard_dim={}),
+        bookkeeping=RustTensorBookkeeping(), connections=tuple(model.get_partition_topology().connections),
+    )
+    unit, = runtime.execution_units("talker_decode")
+    assert unit.nodes == ("Talker", "Codec")
+    assert unit.graph_walks == ("talker_decode", "codec_chunk")
+    assert unit.streaming_edges == (("Talker", "Codec", "codec_tokens"),)
+    assert unit.loop_name is None
+    assert runtime.execution_units("talker_prefill") == ()
 
 
 @pytest.mark.parametrize("install,worker,driven", [
@@ -804,8 +831,9 @@ def test_stream_unit_requires_installed_local_members_and_a_stable_declared_conn
         assert rt.execution_units("produce") == ()
 
 
-def test_stream_unit_claim_is_atomic_and_cancellation_preserves_a_waiting_consumer():
-    rt, rid = _stream_unit_runtime()
+@pytest.mark.parametrize("plain_consumer", [False, True])
+def test_stream_unit_claim_is_atomic_and_cancellation_preserves_a_waiting_consumer(plain_consumer):
+    rt, rid = _stream_unit_runtime(plain_consumer=plain_consumer)
     unit, = rt.execution_units("produce")
     assert unit.worker_graph_ids == (7, 9) and unit.graph_walks == ("produce", "consume")
     assert unit.streaming_edges == (("a", "b", "x"),) and unit.loop_name is None
@@ -824,7 +852,8 @@ def test_stream_unit_claim_is_atomic_and_cancellation_preserves_a_waiting_consum
     assert [(ready.node_name, ready.rids) for ready in rt.get_ready_nodes(set())] == [("a", [rid])]
     # Still no fabricated stream chunk or Loop completion on rollback.
     assert rt.loop_room("a", "produce", "steps", [rid], 0, False) == 3
-    assert rt.loop_room("b", "consume", "steps", [rid], 0, False) == 5
+    if not plain_consumer:
+        assert rt.loop_room("b", "consume", "steps", [rid], 0, False) == 5
     claim, _ = rt.claim_execution_unit("a", "produce", [rid], unit.graph_walks)
     rt.remove_request(rid)
     assert not rt.submit_execution_unit(claim)
@@ -832,8 +861,9 @@ def test_stream_unit_claim_is_atomic_and_cancellation_preserves_a_waiting_consum
 
 
 @pytest.mark.parametrize("consumer_runs", [False, True])
-def test_stream_unit_lands_independent_counts_and_releases_zero_work_without_a_fake_step(consumer_runs):
-    rt, rid = _stream_unit_runtime()
+@pytest.mark.parametrize("plain_consumer", [False, True])
+def test_stream_unit_lands_independent_counts_and_releases_zero_work_without_a_fake_step(consumer_runs, plain_consumer):
+    rt, rid = _stream_unit_runtime(plain_consumer=plain_consumer)
     rt.ingest_inputs_batch(_ingest_block([rid, rid], [_spec("seed", "a"), _spec("y", "b")]))
     claim, _ = rt.claim_execution_unit("a", "produce", [rid], ("produce", "consume"))
     rt.submit_execution_unit(claim)
@@ -853,11 +883,23 @@ def test_stream_unit_lands_independent_counts_and_releases_zero_work_without_a_f
         assert rt.release_execution_unit_member(claim, "b", 9, [rid])
     assert not rt.cancel_execution_unit(claim)
     assert rt.loop_room("a", "produce", "steps", [rid], 0, False) == 1
-    assert rt.loop_room("b", "consume", "steps", [rid], 0, False) == (4 if consumer_runs else 5)
+    if not plain_consumer:
+        assert rt.loop_room("b", "consume", "steps", [rid], 0, False) == (4 if consumer_runs else 5)
+    else:
+        assert rt.graph_passes({rid: 9}) == [int(consumer_runs)]
+        # Plain completion resets the graph; a zero receipt preserves its
+        # external input. Neither path fabricates another ready stream chunk.
+        if consumer_runs:
+            rt.ingest_inputs_batch(_ingest_block([rid], [_spec("y", "b")]))
     assert not any(ready.node_name == "b" for ready in rt.get_ready_nodes(set()))
+    if plain_consumer:
+        rt.ingest_inputs_batch(_ingest_block([rid], [_spec("x", "b")]))
+        ready, = (ready for ready in rt.get_ready_nodes(set()) if ready.node_name == "b")
+        assert ready.node_name == "b" and ready.rids == [rid]
 
 
-def test_stream_unit_drains_after_producer_done_without_advancing_that_producer_again():
+@pytest.mark.parametrize("plain_consumer", [False, True])
+def test_stream_unit_drains_after_producer_done_without_advancing_that_producer_again(plain_consumer):
     from types import SimpleNamespace
 
     from mstar.engine.engine import ExecutingBatch
@@ -865,7 +907,7 @@ def test_stream_unit_drains_after_producer_done_without_advancing_that_producer_
     from mstar.worker.micro_scheduler import ScheduledBatch
     from mstar.worker.worker import Worker
 
-    rt, rid = _stream_unit_runtime()
+    rt, rid = _stream_unit_runtime(plain_consumer=plain_consumer)
     rt.ingest_inputs_batch(_ingest_block([rid, rid], [_spec("seed", "a"), _spec("y", "b")]))
     walks = ("produce", "consume")
     claim, _ = rt.claim_execution_unit("a", "produce", [rid], walks)
@@ -942,8 +984,9 @@ def test_stream_unit_drains_after_producer_done_without_advancing_that_producer_
     worker._finish_step(pending, output)
     assert turns == [("b", "consume")] and closed == [claim]
     assert rt.graph_passes({rid: 7}) == [1]
-    assert rt.graph_passes({rid: 9}) == [0]
-    assert rt.loop_room("b", "consume", "steps", [rid], 0, False) == 4
+    assert rt.graph_passes({rid: 9}) == [int(plain_consumer)]
+    if not plain_consumer:
+        assert rt.loop_room("b", "consume", "steps", [rid], 0, False) == 4
 
 
 @pytest.mark.parametrize("head", ["a", "b"])

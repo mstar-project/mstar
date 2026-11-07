@@ -1742,11 +1742,12 @@ impl GraphRuntime {
                 || nb.slot_of(signal).is_none_or(|slot| nb.streaming_mask & (1 << slot) == 0) {
                 return Err(PyValueError::new_err("stream connection disagrees with compiled graph edges"));
             }
-            // First cell: complete one-node Loops, independently counted.
-            // Other local sections keep ordinary scheduling until their exact
-            // boundary/terminal transition can be represented by the capture.
-            if [ga, gb].iter().any(|g| g.nodes.len() != 1 || g.loops.len() != 1
-                || !g.loops[0].complete || !g.loops[0].child_loops.is_empty()) { continue; }
+            // The producer is a complete one-node Loop. Its consumer may
+            // instead be a single pass: it gets a zero/one receipt, and ordinary
+            // graph completion resets it for the next streamed chunk.
+            if [ga, gb].iter().any(|g| g.nodes.len() != 1 || g.loops.len() > 1
+                || g.loops.first().is_some_and(|lp| !lp.complete || !lp.child_loops.is_empty()))
+                || ga.loops.is_empty() { continue; }
             let members = [(ag, an, aw), (bg, bn, bw)];
             let edge = (members[0], members[1], signal);
             let candidates = units.entry((a, aw)).or_default();
@@ -1764,7 +1765,7 @@ impl GraphRuntime {
                 let mut outputs = Vec::new();
                 for e in &g.node(member.1).outputs {
                     outputs.push(e.name);
-                    if g.loops[0].loop_back.contains(&(e.name, e.dest_sym)) {
+                    if g.loops.first().is_some_and(|lp| lp.loop_back.contains(&(e.name, e.dest_sym))) {
                         if let Dest::Local(target) = e.dest {
                             loop_back.push((member, (member.0, target, member.2), e.name));
                         }
