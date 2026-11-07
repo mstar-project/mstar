@@ -2151,7 +2151,7 @@ def test_late_unit_admission_stages_private_owners_before_one_complete_publicati
                                  group=active)
         incumbent.joined = [PendingBatch(group.members[0][0], a, "a", "a", "prefill", None, group=group)]
         incumbent.node_batch.completion_event = SimpleNamespace(synchronize=lambda: events.append("fenced"))
-        worker._discard_live_group(incumbent)
+        worker._discard_live_run(incumbent)
         assert membership.idle and all(not mgmt.resident._readers.any() for mgmt in eng._submodules.values())
         assert events.index("fenced") < events.index("release:b")
         assert not a.run_rows and not b.run_rows

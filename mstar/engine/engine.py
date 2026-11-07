@@ -3915,15 +3915,18 @@ class Engine:
             if mgmt.rings:
                 self._reserve_rings(mgmt, batch)
             ctx.resident.flush(plan, stager=membership.stager)
-            self._runner.commit(step, track_rows=True)
-            batch.committed = step
+            # A resource commit can mutate before a later resource raises.
+            # Attach its unpublished receipt/pins first so failure teardown
+            # fences this owner instead of retrying an admission rollback.
             batch.run_started = active.run_started
             ctx.resident_plan = plan
             batch.run_rows[rid] = descriptor
+            self._runner.commit(step, track_rows=True)
+            batch.committed = step
             ctx.resident.advance(plan)
             return descriptor
         finally:
-            if batch.committed is None:
+            if not batch.run_rows:
                 # Failed preparation may have queued writes into the candidate's
                 # private rows. Finish those before releasing/reusing owners.
                 if membership.publication_stream is not None:

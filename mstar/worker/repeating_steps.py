@@ -661,7 +661,7 @@ class RepeatingSteps:
                 engine.release_run_row(batch, descriptor)
             batch.run_rows.clear()
 
-    def _discard_live_group(self, active: PendingBatch) -> None:
+    def _discard_live_run(self, active: PendingBatch) -> None:
         """Fence a failed physical parent, then release all claimed readers.
 
         A resource commit can fail partway through its resource list. Every
@@ -688,7 +688,9 @@ class RepeatingSteps:
             for _, rows in claims:
                 for descriptor in rows.values():
                     membership.cancel(descriptor)
-        for _, batch in active.group.members:
+        members = ([batch for _, batch in active.group.members] if active.group is not None
+                   else [active.node_batch])
+        for batch in members:
             engine.yield_runs(batch.node_name)
         if active.node_batch.completion_event is not None:
             active.node_batch.completion_event.synchronize()
@@ -697,8 +699,11 @@ class RepeatingSteps:
         if stream is not None:
             stream.synchronize()
         membership.acknowledge(membership.control.cpu().tolist())
-        engine.release_group(active.group)
-        active.group.parts.clear()
+        if active.group is None:
+            engine.finish_run_outputs(active.node_batch, BatchedModelOutput())
+        else:
+            engine.release_group(active.group)
+            active.group.parts.clear()
         self._release_run_readers(engine, membership, claims)
 
     def _offer_run_row(self, active: PendingBatch, gpu_executor: ThreadPool) -> bool:
@@ -781,7 +786,8 @@ class RepeatingSteps:
                     else:
                         descriptor = engine.admit_group_rows(group, active.group, available[0])
                 except ValueError:
-                    if node_batch.committed is not None or (group is not None and group.submitted):
+                    if (node_batch.run_rows or node_batch.committed is not None
+                            or (group is not None and group.submitted)):
                         raise
                     descriptor = None  # this request needs an ordinary step
                 if stream is not None:

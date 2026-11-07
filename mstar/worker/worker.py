@@ -5518,10 +5518,10 @@ class Worker(RepeatingSteps):
                     "Worker %s discarding failed batch for node %s",
                     self.worker_id, stale.node_name,
                 )
-            if stale.group is not None:
+            if stale.group is not None or stale.joined:
                 if stale.node_batch.run_rows:
-                    self._discard_live_group(stale)
-                else:
+                    self._discard_live_run(stale)
+                elif stale.group is not None:
                     self._settle_group_claim(stale.group)
                     self.engine_manager.get_engine(stale.node_name).release_group(stale.group)
                     stale.group.parts.clear()

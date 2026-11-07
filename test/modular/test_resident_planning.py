@@ -1972,7 +1972,7 @@ def test_joining_reuses_cached_rows_only_after_their_commit_and_last_reader():
 
 @pytest.mark.parametrize("actual,routed,changed_flag,member", [
     (actual, routed, False, 0) for actual in (0, 2, 4) for routed in (False, True)
-] + [(2, False, True, 0), (2, False, False, 1)])
+] + [(2, False, True, 0), (2, False, False, 1), ("commit", False, False, 0)])
 def test_engine_prepares_one_logical_joining_receipt_without_replanning(
     actual, routed, changed_flag, member, monkeypatch,
 ):
@@ -2042,6 +2042,37 @@ def test_engine_prepares_one_logical_joining_receipt_without_replanning(
         assert planner.slot_of(2) is None and candidate.committed is None and not candidate.run_rows
         assert live["kv"]._streams[2]["main"].stored_len == live["rope"].position(2, "main") == 3
         assert owner.read("token", [1, 2]).tolist() == [11, 22]
+        return
+    if actual == "commit":
+        from mstar.engine.device_run import RUN_DESCRIPTORS
+        from mstar.model.submodule_base import BatchedModelOutput
+        from mstar.worker.worker import PendingBatch, Worker
+
+        commit = live["kv"].commit
+        def fail_commit(resource_step, ctx):
+            commit(resource_step, ctx)
+            raise ValueError("commit failed after mutation")
+        monkeypatch.setattr(live["kv"], "commit", fail_commit)
+        monkeypatch.setattr(runner, "rollback_admit", lambda *args: pytest.fail("partial commit rolled back"))
+        with pytest.raises(ValueError, match="after mutation"):
+            eng.admit_run_row(candidate, active, 1)
+        assert candidate.committed is None and candidate.run_rows and ctx.resident_plan is not None
+        assert not membership.control[1:].any(), "partial owner accounting cannot become visible"
+        assert live["kv"]._streams[2]["main"].stored_len == 7
+        events = []
+        active.outputs = BatchedModelOutput(check_stop_buffers={RUN_DESCRIPTORS: torch.zeros(4, 4)})
+        active.completion_event = SimpleNamespace(synchronize=lambda: events.append("fenced"))
+        eng.yield_runs = lambda node: events.append("yield")
+        eng._submodules["decode"].accelerator_graph_runner.release = lambda *args: events.append("release")
+        worker = Worker.__new__(Worker)
+        worker.engine_manager = SimpleNamespace(get_engine=lambda node: eng)
+        pending = PendingBatch(None, active, "decode", "p", WALK, None)
+        pending.joined = [PendingBatch(None, candidate, "decode", "p", WALK, None)]
+        worker._discard_live_run(pending)
+        assert events == ["yield", "fenced", "release"]
+        assert membership.idle and not planner._readers.any()
+        assert not candidate.run_rows and not active.run_rows
+        assert live["kv"]._streams[2]["main"].stored_len == 7, "teardown must not fabricate a full-resource rewind"
         return
     stamps = planner._plan_seq, planner._commits, planner._committed_seq
     buffers = {key: (buf.rows.clone(), buf.cells.clone()) for key, buf in planner._buffers.items()}

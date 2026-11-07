@@ -854,7 +854,7 @@ def test_worker_closes_reused_physical_rows_as_separate_logical_receipts():
     assert membership.idle and not active.node_batch.run_rows and not joined.node_batch.run_rows
 
 
-@pytest.mark.parametrize("admitted", [False, True])
+@pytest.mark.parametrize("admitted", [False, True, "commit_error"])
 def test_ready_row_is_owned_by_the_graph_before_live_publication(admitted):
     from concurrent.futures import ThreadPoolExecutor
 
@@ -903,12 +903,20 @@ def test_ready_row_is_owned_by_the_graph_before_live_publication(admitted):
             return None
         descriptor = owner.reserve_row(2, 2, row, (2, 0))
         candidate.run_rows[2] = descriptor
+        if admitted == "commit_error":
+            raise ValueError("partially committed owner")
         candidate.committed = object()
         return descriptor
     engine = SimpleNamespace(run_membership=lambda batch: owner, prepare_inputs=lambda batch: None,
                              admit_run_row=admit)
     worker.engine_manager = SimpleNamespace(get_engine=lambda node: engine)
     with ThreadPoolExecutor(max_workers=1) as executor:
+        if admitted == "commit_error":
+            with pytest.raises(ValueError, match="partially committed"):
+                worker._offer_run_row(active, executor)
+            assert len(active.joined) == 1 and late.run_rows and holds == {1, 2} and ready == {3}
+            assert owner.control[1].item() == 0
+            return
         assert worker._offer_run_row(active, executor) is admitted
     if admitted:
         ids, bindings = torch.zeros(2, dtype=torch.long), torch.zeros((2, 2), dtype=torch.long)
