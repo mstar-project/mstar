@@ -1002,6 +1002,95 @@ def test_future_stream_settlement_requires_actual_publication_and_preserves_zero
     assert source.pop_chunk().data == {"data": [10]}
 
 
+def test_future_window_adopts_the_ingested_first_pop_and_restores_it_on_refusal():
+    source = StreamBuffer(RID, EDGE, "LLM", _HistoryChunkPolicy())
+    oracle = StreamBuffer(RID, EDGE, "LLM", _HistoryChunkPolicy())
+    source.put_positions([0, 1, 2])
+    oracle.put_positions([0, 1, 2])
+    original = source.reserve_window(2)
+    first = oracle.pop_chunk()  # ordinary polling already fixed this chunk
+    assert first.num_items == 2 and first.released == [0]
+    reader = original.reservation
+    admitted = source.window_bound(reader)
+    assigned = source._chunks_popped
+    extended = source.reserve_future_window([3, 4], 4, adopt=reader)
+    assert extended.chunk_index == original.chunk_index
+    assert not source.owns_window(reader) and source.owns_window(extended.reservation)
+    assert source._chunks_popped == assigned and source._executed_chunks == 0
+    source.cancel_window(extended.reservation)
+    assert source.owns_window(reader) and source.window_bound(reader) == admitted
+    assert source._buffer == [0, 1, 2] and source.policy.history == []
+    extended = source.reserve_future_window([3, 4], 4, adopt=reader)
+    reservation = extended.reservation
+    choices = {(parent, end, done): selected for parent, end, done, selected in reservation.decisions}
+    # A emits and stops before B consumes its already-ingested chunk. Re-running
+    # readiness against four items would choose a different, two-item stride.
+    parent = choices[-1, 4, True]
+    assert reservation.transitions[parent].chunk == first.info
+    assert reservation.transitions[parent].consumed == 1
+    assert reservation.transitions[parent].policy.history == [3]
+    assert not reservation.transitions[parent].chunk.is_final
+    oracle.put_positions([3])
+    oracle.signal_done(4)
+    count = 1
+    while oracle.has_chunk_ready():
+        chunk = oracle.pop_chunk()
+        parent = choices[parent, 4, True]
+        assert reservation.transitions[parent].chunk == chunk.info
+        count += 1
+    source.put_positions([3])
+    source.signal_done(4)
+    source.settle_window(reservation, count, final_transition=parent)
+    assert source.policy.history == oracle.policy.history
+    assert source._executed_chunks == oracle._executed_chunks == count
+    assert source._buffer == oracle._buffer and source._consumed == oracle._consumed
+    assert not source.owns_window(reader) and not source.owns_window(reservation)
+
+
+def test_future_window_cannot_adopt_a_reader_after_another_reservation_or_semantic_progress():
+    source = StreamBuffer(RID, EDGE, "LLM", FixedChunkPolicy(1))
+    source.put_positions([0, 1, 2, 3])
+    first = source.reserve_window(2).reservation
+    second = source.reserve_window(2).reservation
+    assert source.reserve_future_window([4], 2, adopt=first) is None
+    assert source.reserve_future_window([4], 2, adopt=second) is None
+    source.settle_window(first, 1)
+    assert source.reserve_future_window([4], 2, adopt=second) is None
+    assert source.owns_window(second) and source._executed_chunks == 1
+
+
+def test_extending_an_ingested_ring_edge_preserves_its_graph_reference_and_fallback(monkeypatch):
+    from mstar.engine.resources.loopback_rows import LoopbackRows
+
+    streams, tm, source = _window_consumer()
+    ring = LoopbackRows(torch.device("cpu"), capacity=1)
+    ring.ask_ring(EDGE, 8)
+    ring.ring_table(EDGE, torch.zeros(1, 1, dtype=torch.long))
+    ring.add(RID)
+    ring.ring_write(EDGE, [RID], torch.tensor([[[10], [11]]]), ring.ring_reserve(EDGE, [RID], 2))
+    source.put_positions([0, 1])
+    streams.rings[EDGE] = ring
+    original = streams.reserve_edge(source, EDGE, RID, 1)
+    streams.mark_ingested(RID, original)
+    assert ring.ring_reserve(EDGE, [RID], 2) == [2]
+    def no_future_read(*args):
+        pytest.fail("an unexecuted producer's ring must not be materialized on the host")
+    monkeypatch.setattr(ring, "ring_read", no_future_read)
+    extended, snapshot = streams.extend_edge(RID, original, [2, 3], 3)
+    assert extended.uuids is original.uuids
+    assert extended.chunk._replace(reservation=original.chunk.reservation) == original.chunk
+    assert source.ingested_chunk is extended.chunk
+    assert snapshot.data == {"data": [0, 1, 2, 3]}
+    restored = streams.restore_edge(RID, extended)
+    assert restored == original and source.ingested_chunk is restored.chunk
+    assert source._executed_chunks == 0 and ring.ring_room(EDGE, RID) == 4
+    # Original ordinary fallback consumes its existing graph reference once.
+    assert _consume(streams, tm, restored)[0].flatten().tolist() == [10]
+    streams.settle_window(RID, restored, 1)
+    assert not any(tm.tensor_store.check_uuid_presence(uuid) for uuid in original.uuids)
+    assert source._consumed == 1 and ring.ring_room(EDGE, RID) == 5
+
+
 def test_a_full_producer_reservation_can_still_drain_consumers_and_preview_is_bounded():
     source = StreamBuffer(RID, EDGE, "LLM", FixedChunkPolicy(2))
     source.put_positions([0, 1, 2, 3])

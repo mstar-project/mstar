@@ -6,7 +6,7 @@ chunks a step did not keep, and settles which streams a step ends.
 """
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from functools import partial
 from typing import NamedTuple
 
@@ -15,7 +15,7 @@ import torch
 from mstar.communication.tensors import NameToTensorList, TensorCommunicationManager
 from mstar.graph.base import GraphEdge, GraphSection
 from mstar.graph.runtime.base import ColumnarEdgeSpecs, EdgeSpec, InputTensors
-from mstar.streaming.stream_buffer import StreamBuffer, StreamChunkInfo, StreamingEdge, collate
+from mstar.streaming.stream_buffer import StreamBuffer, StreamChunk, StreamChunkInfo, StreamingEdge, collate
 from mstar.streaming.topology import Connection
 from mstar.worker.node_manager_utils import RequestStateManager
 
@@ -283,6 +283,40 @@ class StreamBufferManager:
             return None
         return self._chunk_edge(chunk, edge_name, self.consumer_node.get(edge_name, ""), request_id)
 
+    def extend_edge(
+        self, request_id: int, edge: StreamingEdge, future_positions: Sequence[int], bound: int,
+        consumer_walk: str | None = None,
+    ) -> tuple[StreamingEdge, StreamChunk] | None:
+        """Under an unsubmitted unit claim, extend its ingested retained reader.
+
+        Keep the graph's exact UUIDs and first-chunk metadata. Future payloads
+        are bound directly to the ring; they must not be read or minted as
+        tensors before the producer runs. No reference count changes here.
+        """
+        if edge.name not in self.rings or edge.chunk.reservation is None:
+            return None
+        sbuf = self._window_buffer(request_id, edge)
+        if (sbuf.ingested_chunk is None or sbuf.ingested_chunk.reservation is not edge.chunk.reservation
+                or self.consumer_node.get(edge.name) != edge.next_node):
+            return None
+        snapshot = sbuf.reserve_future_window(future_positions, bound, consumer_walk, adopt=edge.chunk.reservation)
+        if snapshot is None:
+            return None
+        extended = edge._replace(chunk=edge.chunk._replace(reservation=snapshot.reservation))
+        self.mark_ingested(request_id, extended)
+        return extended, snapshot
+
+    def restore_edge(self, request_id: int, edge: StreamingEdge) -> StreamingEdge:
+        """Undo an unsubmitted extension while the graph still holds its reader."""
+        sbuf = self._window_buffer(request_id, edge)
+        reservation = edge.chunk.reservation
+        if reservation.replaced is None:
+            raise ValueError("only an extended ingested reader can be restored")
+        original = edge._replace(chunk=edge.chunk._replace(reservation=reservation.replaced[0]))
+        sbuf.cancel_window(reservation)
+        self.mark_ingested(request_id, original)
+        return original
+
     def _window_buffer(self, request_id: int, edge: StreamingEdge) -> StreamBuffer:
         req_info = self._request_state.per_request_info.get(request_id)
         sbuf = None if req_info is None else req_info.stream_buffers.get(edge.name)
@@ -296,7 +330,9 @@ class StreamBufferManager:
     def retained_prefix(self, request_id: int, edge: StreamingEdge) -> int:
         return self._window_buffer(request_id, edge).retained_prefix(edge.chunk)
 
-    def settle_window(self, request_id: int, edge: StreamingEdge, executed: int) -> StreamChunkInfo | None:
+    def settle_window(
+        self, request_id: int, edge: StreamingEdge, executed: int, *, final_transition: int | None = None,
+    ) -> StreamChunkInfo | None:
         """Release the source owner's consumed prefix; the graph independently
         releases the snapshot references after its last submitted reader.
         """
@@ -308,7 +344,7 @@ class StreamBufferManager:
             raise ValueError("a stream window needs a run reservation to settle")
         if not sbuf.owns_window(edge.chunk.reservation):
             return None
-        chunk = sbuf.settle_window(edge.chunk.reservation, executed)
+        chunk = sbuf.settle_window(edge.chunk.reservation, executed, final_transition=final_transition)
         if chunk.released:
             ring = self.rings.get(edge.name)
             if ring is None:

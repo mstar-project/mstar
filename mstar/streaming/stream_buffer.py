@@ -24,6 +24,9 @@ class StreamReservation:
     # Empty columns retain the linear, already-arrived predecessor window.
     parents: tuple[int, ...] = ()
     decisions: tuple[tuple[int, int, bool, int], ...] = ()
+    # An unsubmitted graph-ingested reader replaced by a future window. Its
+    # first frozen pop stays authoritative; cancellation restores this reader.
+    replaced: tuple[StreamReservation, int] | None = None
 
 
 @dataclass
@@ -519,7 +522,7 @@ class StreamBuffer:
 
     def reserve_future_window(
         self, future_positions: Sequence[int], bound: int, consumer_walk: str | None = None,
-        *, may_finish: bool = True,
+        *, may_finish: bool = True, adopt: StreamReservation | None = None,
     ) -> StreamChunk | None:
         """Freeze ordinary policy pops for an A-then-B connected sweep.
 
@@ -528,11 +531,21 @@ class StreamBuffer:
         acquires only actual emitted items at ordinary output publication.
         Once the producer stops or exhausts its reservation, B may drain.
         Exhausting the reservation never signals producer done.
+
+        ``adopt`` requires the caller's exclusive unsubmitted graph claim. It
+        replaces one retained reader without changing its first frozen pop;
+        cancel_window restores that reader for ordinary fallback.
         """
         if type(bound) is not int or bound < 1:
             raise ValueError("a stream run bound must be a positive integer")
         self._update_buffer()
-        if (self._reservations or self._waiting_graph_edges or self._tensor_ids_in_order
+        if adopt is not None and (
+            list(self._reservations) != [adopt] or adopt.decisions or adopt.predecessor_bound
+            or adopt.start_iteration != self._executed_chunks or not adopt.transitions
+            or self._reservations[adopt] <= 0
+        ):
+            return None
+        if ((self._reservations and adopt is None) or self._waiting_graph_edges or self._tensor_ids_in_order
                 or self._num_buffer_writes < self._num_tensors_registered
                 or (self.walk_tagged and self._walk_run_len() != len(self._buffer))
                 or (self._buffer and self.walk_tagged and self.peek_walk() != consumer_walk)):
@@ -561,15 +574,22 @@ class StreamBuffer:
                 if selected >= 0:
                     preview._apply_transition(transitions[selected])
                 return None if selected < 0 else selected
-            if not preview.has_chunk_ready(consumer_walk):
+            if parent == -1 and adopt is not None:
+                # The graph already ingested this first chunk. New producer
+                # items/EOF cannot change its frozen size, history or finality.
+                transition = adopt.transitions[0]
+                preview._apply_transition(transition)
+            elif not preview.has_chunk_ready(consumer_walk):
                 decisions[key] = -1
                 return None
-            chunk = preview.pop_chunk()
+            else:
+                chunk = preview.pop_chunk()
+                transition = StreamTransition(
+                    chunk.info, preview.policy.preview_copy(), preview._consumed, preview._tail_consumed,
+                    preview._delivered_end, preview._final_chunk_emitted,
+                )
             selected = len(transitions)
-            transitions.append(StreamTransition(
-                chunk.info, preview.policy.preview_copy(), preview._consumed, preview._tail_consumed,
-                preview._delivered_end, preview._final_chunk_emitted,
-            ))
+            transitions.append(transition)
             parents.append(parent)
             decisions[key] = selected
             return selected
@@ -604,10 +624,15 @@ class StreamBuffer:
                         parent, count = selected, count + 1
             drain(primary, parent, len(future_positions), count, False)
         reservation = StreamReservation(
-            self._chunks_popped, bound, 0, self._executed_chunks, tuple(transitions), tuple(parents),
+            self._chunks_popped if adopt is None else adopt.chunk_index,
+            bound, 0, self._executed_chunks, tuple(transitions), tuple(parents),
             tuple((*key, selected) for key, selected in decisions.items()),
+            None if adopt is None else (adopt, self._reservations[adopt]),
         )
-        self._chunks_popped += 1
+        if adopt is None:
+            self._chunks_popped += 1
+        else:
+            del self._reservations[adopt]
         self._reservations[reservation] = bound
         items = [*self._buffer, *future_positions]
         return StreamChunk(
@@ -652,6 +677,9 @@ class StreamBuffer:
         if not self._reservations or next(reversed(self._reservations)) is not reservation:
             raise ValueError("stream reservations must roll back from the newest reader")
         del self._reservations[reservation]
+        if reservation.replaced is not None:
+            original, bound = reservation.replaced
+            self._reservations[original] = bound
         self.maybe_ready = True
 
     def settle_window(
