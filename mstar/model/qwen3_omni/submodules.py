@@ -421,10 +421,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
             audio_embeds = inputs["audio_embeds"][0].to(device)  # (audio_tokens, hidden)
             audio_len = audio_embeds.shape[0]
 
-            mm_mask = torch.ones(audio_len + 2, dtype=torch.bool, device=device)
-            # scalar writes: a list index uploads from pageable memory, a host sync
-            mm_mask[0] = False
-            mm_mask[-1] = False
+            mm_mask = self._media_mask(audio_len)
 
             wrapped_embeds = self._wrap_audio_input(audio_embeds)
             seq_len = audio_len + 2
@@ -454,10 +451,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
             vision_embeds = inputs["vision_embeds"][0].to(device)
             vision_len = vision_embeds.shape[0]
 
-            mm_mask = torch.ones(vision_len + 2, dtype=torch.bool, device=device)
-            # scalar writes: a list index uploads from pageable memory, a host sync
-            mm_mask[0] = False
-            mm_mask[-1] = False
+            mm_mask = self._media_mask(vision_len)
 
             wrapped_embeds = self._wrap_vision_input(vision_embeds)
             # Vision tokens use spatial 3D positions (temporal constant,
@@ -511,6 +505,14 @@ class ThinkerSubmodule(ARNodeSubmodule):
                 deepstack.append(full_deepstack)
             row.tensor_inputs["deepstack"] = deepstack
             return row
+
+    def _media_mask(self, media_len: int) -> torch.Tensor:
+        """Which rows of an attachment and its two sentinels are media. ``fill_``
+        on a view: an index write of a Python scalar syncs with the host."""
+        mask = torch.ones(media_len + 2, dtype=torch.bool, device=self.get_device())
+        mask[0].fill_(False)
+        mask[-1].fill_(False)
+        return mask
 
     def _text_around(
         self, fwd_info: CurrentForwardPassInfo, inputs: NameToTensorList,
