@@ -19,6 +19,7 @@ the same server:
 * the same request twice returns identical bytes;
 * the streamed action, read off the binary frames, equals the non-streamed one;
 * malformed requests are a 400, and the next good request still returns the first answer;
+* a storm of dropped requests leaves nothing held, and the same request still returns the first answer;
 * noise that does not match its oracle misses the bar, or the bar measures nothing.
 
     python test/gr00t_n17/serve_check.py --dump ~/gr00t-runs/dump \\
@@ -35,6 +36,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import msgpack
@@ -42,6 +44,7 @@ import numpy as np
 import requests
 import torch
 from PIL import Image
+from urllib3.exceptions import ReadTimeoutError
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
@@ -49,9 +52,11 @@ sys.path.insert(0, str(REPO))
 from mstar.client import MStarClient  # noqa: E402
 from mstar.client.media import BINARY_STREAM_MEDIA_TYPE, iter_binary_frames  # noqa: E402
 from mstar.model.gr00t_n17.preprocessing import Gr00tN17Preprocessor  # noqa: E402
+from mstar.observability.catalog import STATUS_INTERVAL_S  # noqa: E402
 
 BAR = 1.2
 GR00T_REPO = "nvidia/GR00T-N1.7-3B"
+ANSWER = 600.0  # seconds: long enough that `burst` waits for the answer
 
 
 def observation(dump: dict) -> tuple[str, list[tuple[str, bytes]], dict]:
@@ -90,7 +95,7 @@ def send_walk(client: MStarClient, obs, walk: str) -> np.ndarray:
     return np.frombuffer(e["data"], e["dtype"]).reshape(e["shape"])
 
 
-def send_streamed(url: str, obs, seed: int) -> bytes:
+def send_streamed(url: str, obs, seed: int, timeout: float | tuple[float, float] = 600) -> bytes:
     """The streamed action off the binary frames. ``MStarClient.stream`` cannot carry it:
     its event fallback decodes an action's bytes as UTF-8 (``MStarClient._to_event``)."""
     text, frames, kwargs = obs
@@ -98,7 +103,7 @@ def send_streamed(url: str, obs, seed: int) -> bytes:
             "model_kwargs": json.dumps({**kwargs, "seed": seed})}
     with requests.post(f"{url}/generate", data=data, files=[("files", f) for f in frames], stream=True,
                        headers={"Accept": BINARY_STREAM_MEDIA_TYPE, "Accept-Encoding": "identity"},
-                       timeout=600) as resp:
+                       timeout=timeout) as resp:
         resp.raise_for_status()
         assert resp.headers["content-type"].startswith(BINARY_STREAM_MEDIA_TYPE), resp.headers
         chunks = [f["bytes"] for f in iter_binary_frames(resp.raw) if f["modality"] == "action"]
@@ -144,6 +149,48 @@ def malformed(url: str, obs, seed: int) -> dict[str, int]:
     return status
 
 
+def metric(url: str, name: str, label: str = "") -> float:
+    """``name`` off the server's metrics page, summed over its series that carry ``label``. A missing
+    series raises: read as zero, it would pass the leak check."""
+    page = requests.get(f"{url}/metrics", timeout=30).text
+    rows = [float(line.rsplit(" ", 1)[1]) for line in page.splitlines()
+            if line.startswith(name + "{") and label in line]
+    if not rows:
+        raise RuntimeError(f"no {name} {label} on the metrics page")
+    return sum(rows)
+
+
+def burst(url: str, obs, seed: int, afters: list[float]) -> int:
+    """One streamed request per entry of ``afters``, all at once, each dropped if no answer came in
+    that many seconds. How many were dropped."""
+    def dropped(after: float) -> bool:
+        try:
+            send_streamed(url, obs, seed, timeout=(30, after))
+        except (requests.ReadTimeout, ReadTimeoutError):  # before the headers, or in the body
+            return True
+        return False
+
+    with ThreadPoolExecutor(len(afters)) as pool:
+        return sum(pool.map(dropped, afters))
+
+
+def abort_storm(url: str, obs, seed: int, n: int = 48) -> dict:
+    """``n`` requests dropped 20 ms apart: queued, in prefill, parked between the walks, in the loop.
+    Free GPU memory is reported, not barred: torch's pool hides a small leak, so the counts decide."""
+    held = lambda: metric(url, "mstar_requests_in_flight") + metric(url, "mstar_conductor_requests")  # noqa: E731
+    ended = lambda outcome: metric(url, "mstar_requests_total", f'outcome="{outcome}"')  # noqa: E731
+    burst(url, obs, seed, [ANSWER] * n)  # the same load served whole, so the pool's growth is not a leak
+    free, aborts, errors = torch.cuda.mem_get_info()[0], ended("abort"), ended("error")
+    dropped = burst(url, obs, seed, [0.02 * (i + 1) for i in range(n)])
+    done = time.time()
+    # the conductor's counts come from its last status: only one from after the drops can clear them
+    fresh = lambda: metric(url, "mstar_conductor_status_age_seconds") < time.time() - done  # noqa: E731
+    while not (fresh() and not held()) and time.time() < done + 60:
+        time.sleep(STATUS_INTERVAL_S)
+    return {"sent": n, "dropped": dropped, "aborted": ended("abort") - aborts, "errors": ended("error") - errors,
+            "held": held(), "status_fresh": fresh(), "gpu_free_mib": [free >> 20, torch.cuda.mem_get_info()[0] >> 20]}
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--dump", type=Path, required=True)
@@ -170,7 +217,7 @@ def main() -> int:
          "--config", str(REPO / "configs/gr00t_n17.yaml"),
          "--port", str(args.port), "--host", "127.0.0.1", "--socket-path-prefix", str(workdir / "sock"),
          "--upload-dir", str(workdir / "uploads"), "--tensor-comm-protocol", "SHM", "--log-level", "INFO",
-         "--timeout", "600"],
+         "--timeout", "600", "--enable-metrics"],
         stdout=log, stderr=subprocess.STDOUT, cwd=REPO,
     )
     url = f"http://127.0.0.1:{args.port}"
@@ -231,10 +278,15 @@ def main() -> int:
                 failures.append(f"walk {walk}: {report['walks'][walk]}")
         report["malformed_status"] = malformed(url, obs, seed)
         report["serves_after_malformed"] = send(client, obs, seed) == payload
-        for key in ("repeat_identical", "stream_identical", "serves_after_malformed"):
+        storm = report["abort_storm"] = abort_storm(url, obs, seed)
+        report["serves_after_aborts"] = client.health() and send(client, obs, seed) == payload
+        for key in ("repeat_identical", "stream_identical", "serves_after_malformed", "serves_after_aborts"):
             if not report[key]:
                 failures.append(key)
         failures += [f"{k}: {v}, not 400" for k, v in report["malformed_status"].items() if v != 400]
+        if (storm["dropped"] <= storm["sent"] / 2 or not storm["aborted"] or storm["errors"] or storm["held"]
+                or not storm["status_fresh"]):
+            failures.append(f"abort storm: {storm}")
     finally:
         proc.terminate()
         try:
