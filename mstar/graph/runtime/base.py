@@ -1198,6 +1198,13 @@ class GraphRuntime(PhasedPostprocess, ABC):
         pass
 
     @abstractmethod
+    def release_execution_unit_member(
+        self, claim_id: int, node_name: str, worker_graph_id: int, rids: list[int],
+    ) -> bool:
+        """Release a submitted member that did no work, without completing it."""
+        raise NotImplementedError
+
+    @abstractmethod
     def pop_rids(
         self, node_name: str,
         graph_walk: str,

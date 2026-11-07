@@ -9,7 +9,7 @@
 //!   (reset_for_iter is only ever called on a LoopStateRegistry).
 
 use crate::graph::spec::{
-    CompiledGraph, Dest, EdgeSpec, ExecutionUnit, GraphRef, LoopId, NodeId, Sym,
+    CompiledGraph, Dest, EdgeSpec, GraphRef, LoopId, NodeId, Sym,
 };
 use serde::Serialize;
 
@@ -479,50 +479,44 @@ impl RequestState {
 
     /// A unit may supply missing internal inputs, never overwrite an input
     /// already queued for this node. All external inputs must already exist.
-    pub fn can_claim_unit(&self, unit: &ExecutionUnit) -> bool {
+    pub fn can_claim_member(&self, node: NodeId, internal: u64) -> bool {
         if self.is_done {
             return false;
         }
-        unit.nodes.iter().zip(&unit.internal_inputs).all(|(&node, &internal)| {
-            let mut enclosing = self.graph.node(node).loop_id;
-            while let Some(id) = enclosing {
-                if self.loops[id as usize].done {
-                    return false;
-                }
-                enclosing = self.graph.lp(id).parent;
+        let mut enclosing = self.graph.node(node).loop_id;
+        while let Some(id) = enclosing {
+            if self.loops[id as usize].done {
+                return false;
             }
-            let st = &self.nodes[node as usize];
-            !st.completed && !st.in_flight && st.unit_claim.is_none()
-                && (st.cur.mask & internal) == 0
-                && (st.cur.mask | internal) == self.graph.node(node).full_mask
-        })
+            enclosing = self.graph.lp(id).parent;
+        }
+        let st = &self.nodes[node as usize];
+        !st.completed && !st.in_flight && st.unit_claim.is_none()
+            && (st.cur.mask & internal) == 0
+            && (st.cur.mask | internal) == self.graph.node(node).full_mask
     }
 
-    pub fn claim_unit(&mut self, unit: &ExecutionUnit, claim: u64) {
-        for &node in &unit.nodes {
-            self.take_for_schedule(node);
-            let st = &mut self.nodes[node as usize];
-            st.in_flight = true;
-            st.unit_claim = Some(claim);
-        }
+    pub fn claim_member(&mut self, node: NodeId, claim: u64) {
+        self.take_for_schedule(node);
+        let st = &mut self.nodes[node as usize];
+        st.in_flight = true;
+        st.unit_claim = Some(claim);
     }
 
     pub fn unit_claim(&self, node: NodeId) -> Option<u64> {
         self.nodes[node as usize].unit_claim
     }
 
-    pub fn release_unit(&mut self, unit: &ExecutionUnit, retry: bool) {
-        for &node in &unit.nodes {
-            let st = &mut self.nodes[node as usize];
-            st.in_flight = false;
-            st.unit_claim = None;
-        }
-        if retry {
-            // Every independent root was ready before the claim. Members
-            // with internal inputs still wait for their producers to land.
-            for (&node, &internal) in unit.nodes.iter().zip(&unit.internal_inputs) {
-                if internal == 0 { self.push_back(node); }
-            }
+    pub fn release_member(&mut self, node: NodeId, refresh: bool) {
+        let st = &mut self.nodes[node as usize];
+        st.in_flight = false;
+        st.unit_claim = None;
+        if refresh {
+            // Claims preserve their inputs. Unlike push_back after ordinary
+            // consumed-input cleanup, a refused or unexecuted member must
+            // recompute readiness: an internal-stream consumer may still wait.
+            self.refresh_ready(node);
+            self.note_ingested_for_streaming(node);
         }
     }
 

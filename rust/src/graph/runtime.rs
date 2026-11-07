@@ -205,8 +205,9 @@ pub struct GraphRuntime {
 }
 
 struct UnitClaim {
-    wg: WgIndex,
-    head: NodeId,
+    /// Immutable (graph, node, repeated Loop) identities. Node/Loop ids are
+    /// graph-local, so every landing, cancellation and carry uses this owner.
+    members: Vec<(WgIndex, NodeId, Option<LoopId>)>,
     submitted: bool,
     /// Each row's next member to land; cancellation removes the row here.
     next: FxHashMap<u32, usize>,
@@ -1074,8 +1075,8 @@ struct UnitClaim {
     fn validate_unit_landing(&self, wg: WgIndex, node: NodeId, rid: u32) -> PyResult<()> {
         let Some(id) = self.state(wg, rid).and_then(|s| s.unit_claim(node)) else { return Ok(()) };
         let claim = &self.unit_claims[&id];
-        let unit = &self.g(wg).units[&claim.head];
-        if !claim.submitted || unit.nodes[claim.next[&rid]] != node {
+        let (member_wg, member_node, _) = claim.members[claim.next[&rid]];
+        if !claim.submitted || (member_wg, member_node) != (wg, node) {
             return Err(PyValueError::new_err("execution unit members must land once, in graph order, after submission"));
         }
         Ok(())
@@ -1085,24 +1086,27 @@ struct UnitClaim {
         // Completing the last member can finish a Loop and clear its node
         // subtree. Keep the claim identity captured before that transition.
         let Some(id) = claim_id else { return };
-        let g = self.g(wg).clone();
         let claim = self.unit_claims.get_mut(&id).unwrap();
-        let unit = &g.units[&claim.head];
         let next = claim.next.get_mut(&rid).unwrap();
         *next += 1;
-        let last = *next == unit.nodes.len();
+        let last = *next == claim.members.len();
+        let members = last.then(|| claim.members.clone());
         if last {
             claim.next.remove(&rid);
         }
         if claim.next.is_empty() {
             self.unit_claims.remove(&id);
         }
-        if let Some(state) = self.state_mut(wg, rid) {
-            if last {
-                state.release_unit(unit, false);
-            } else {
-                state.set_in_flight(node, false);
+        if let Some(members) = members {
+            for (owner, member, _) in members {
+                if let Some(state) = self.state_mut(owner, rid) {
+                    state.release_member(member, false);
+                }
             }
+        } else if let Some(state) = self.state_mut(wg, rid) {
+            // Keep the claim until every member lands, including members in
+            // another graph whose own Loop already advanced independently.
+            state.set_in_flight(node, false);
         }
     }
 
@@ -2609,7 +2613,8 @@ impl GraphRuntime {
         let g = self.g(wg).clone();
         let Some(unit) = g.units.get(&head) else { return Ok(None) };
         if !rids.iter().all(|&rid| {
-            self.state(wg, rid).is_some_and(|state| state.can_claim_unit(unit))
+            self.state(wg, rid).is_some_and(|state| unit.nodes.iter().zip(&unit.internal_inputs)
+                .all(|(&node, &internal)| state.can_claim_member(node, internal)))
                 && unit.nodes.iter().all(|&n| self.runs_for_request(rid, g.node(n).name))
         }) {
             return Ok(None);
@@ -2617,7 +2622,9 @@ impl GraphRuntime {
         self.unit_counter += 1;
         let id = self.unit_counter;
         for &rid in &rids {
-            self.state_mut(wg, rid).unwrap().claim_unit(unit, id);
+            for &node in &unit.nodes {
+                self.state_mut(wg, rid).unwrap().claim_member(node, id);
+            }
         }
         let mut members = Vec::new();
         for (i, &node) in unit.nodes.iter().enumerate() {
@@ -2637,7 +2644,8 @@ impl GraphRuntime {
             members.push(member);
         }
         self.unit_claims.insert(id, UnitClaim {
-            wg, head, submitted: false, next: rids.into_iter().map(|r| (r, 0)).collect(),
+            members: unit.nodes.iter().map(|&node| (wg, node, unit.repeat_loop)).collect(),
+            submitted: false, next: rids.into_iter().map(|r| (r, 0)).collect(),
         });
         Ok(Some((id, members)))
     }
@@ -2659,10 +2667,39 @@ impl GraphRuntime {
             return Err(PyValueError::new_err("cannot retry a submitted execution unit"));
         }
         let claim = self.unit_claims.remove(&claim_id).unwrap();
-        let g = self.g(claim.wg).clone();
         for rid in claim.next.keys() {
-            if let Some(state) = self.state_mut(claim.wg, *rid) {
-                state.release_unit(&g.units[&claim.head], true);
+            for &(wg, node, _) in &claim.members {
+                if let Some(state) = self.state_mut(wg, *rid) {
+                    state.release_member(node, true);
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    /// A submitted section may select no work for a reserved member. Release
+    /// only its claim receipt: no completion, Loop progress or input consumption.
+    fn release_execution_unit_member(
+        &mut self, claim_id: u64, node_name: &str, wg_id: u32, rids: Vec<u32>,
+    ) -> PyResult<bool> {
+        let Some(claim) = self.unit_claims.get(&claim_id) else { return Ok(false) };
+        let Some((wg, node)) = claim.members.iter().find_map(|&(wg, node, _)| {
+            (self.wg_ids[wg as usize] == wg_id && self.interner.name(self.g(wg).node(node).name) == node_name)
+                .then_some((wg, node))
+        }) else { return Err(PyValueError::new_err("node is not a member of the execution unit")) };
+        let distinct: FxHashSet<_> = rids.iter().copied().collect();
+        if distinct.len() != rids.len() || rids.iter().any(|rid| {
+            !claim.submitted || claim.next.get(rid).is_none_or(|&next| {
+                let member = claim.members[next];
+                (member.0, member.1) != (wg, node)
+            })
+        }) {
+            return Err(PyValueError::new_err("unexecuted members must release once, in graph order, after submission"));
+        }
+        for rid in rids {
+            self.land_unit_member(wg, node, rid, Some(claim_id));
+            if let Some(state) = self.state_mut(wg, rid) {
+                state.release_member(node, true);
             }
         }
         Ok(true)
@@ -2998,7 +3035,7 @@ impl GraphRuntime {
             let stride = input.loop_strides.as_ref().map_or(1, |s| s[i]);
             let completed = state.complete_strided(&g, node, &out_tensors, stride);
             let repeat_loop = claim_id.and_then(|id| self.unit_claims.get(&id))
-                .and_then(|claim| g.units[&claim.head].repeat_loop);
+                .and_then(|claim| claim.members[claim.next[&rid]].2);
             self.land_unit_member(wg, node, rid, claim_id);
             let mut pre_shard_edges = completed.edges;
             // A step that repeated routes a column an iteration, for the

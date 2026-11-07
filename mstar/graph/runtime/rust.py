@@ -444,6 +444,11 @@ class RustGraphRuntime(GraphRuntime):
     def cancel_execution_unit(self, claim_id: int) -> bool:
         return self._rust.cancel_execution_unit(claim_id)
 
+    def release_execution_unit_member(
+        self, claim_id: int, node_name: str, worker_graph_id: int, rids: list[int],
+    ) -> bool:
+        return self._rust.release_execution_unit_member(claim_id, node_name, worker_graph_id, rids)
+
     # --------- pending loop stops ----------
 
     def has_pending_loop_stop(

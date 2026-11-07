@@ -732,6 +732,34 @@ def test_unit_claim_preserves_common_rows_and_refusal_returns_readiness_once():
     assert retry.input_edges.edge_tuples() == [(b, "in", [], False), (a, "in", [], False)]
 
 
+@pytest.mark.parametrize("producer_runs", [False, True])
+def test_an_unexecuted_member_releases_its_claim_without_completing_its_graph(producer_runs):
+    rt = _two_node_runtime()
+    rid = _admit(rt)
+    rt.ingest_inputs_batch(_ingest_block([rid, rid], [_spec("in", "a"), _spec("y", "b")]))
+    claim, _ = rt.claim_execution_unit("a", WALK, [rid])
+    with pytest.raises(ValueError, match="after submission"):
+        rt.release_execution_unit_member(claim, "a", WG_ID, [rid])
+    rt.submit_execution_unit(claim)
+    with pytest.raises(ValueError, match="graph order"):
+        rt.release_execution_unit_member(claim, "b", WG_ID, [rid])
+    if producer_runs:
+        _route(rt, [rid], "a", [], [[]])
+        # Ordinary routing hands the produced value to the reserved member.
+        rt.ingest_inputs_batch(_ingest_block([rid], [_spec("x", "b")]))
+    else:
+        assert rt.release_execution_unit_member(claim, "a", WG_ID, [rid])
+    assert rt.release_execution_unit_member(claim, "b", WG_ID, [rid])
+    assert not rt.release_execution_unit_member(claim, "b", WG_ID, [rid])
+    ready, = rt.get_ready_nodes(set())
+    assert ready.node_name == ("b" if producer_runs else "a")
+    assert ready.rids == [rid]
+    # The ready member's original input is still there: release did not run
+    # ordinary completion or consume an input to fabricate a zero-work step.
+    inputs = rt.pop_rids(ready.node_name, WALK, [rid], check_ready=True).input_edges
+    assert set(inputs.signal_names) == ({"x", "y"} if producer_runs else {"in"})
+
+
 @pytest.mark.parametrize("head", ["a", "b"])
 def test_connected_join_claims_independent_roots_and_restores_each_on_refusal(head):
     rt = _unit_runtime(Sequential(sections=[
