@@ -20,7 +20,7 @@ the same server:
 * the streamed action, read off the binary frames, equals the non-streamed one;
 * malformed requests are a 400, and the next good request still returns the first answer;
 * a storm of dropped requests leaves nothing held, and the same request still returns the first answer;
-* a prompt length no graph holds answers too, alone and batched;
+* shapes no graph holds answer too, alone and batched: another prompt length, and three cameras;
 * noise that does not match its oracle misses the bar, or the bar measures nothing.
 
     python test/gr00t_n17/serve_check.py --dump ~/gr00t-runs/dump \\
@@ -58,6 +58,7 @@ from mstar.observability.catalog import STATUS_INTERVAL_S  # noqa: E402
 BAR = 1.2
 GR00T_REPO = "nvidia/GR00T-N1.7-3B"
 ANSWER = 600.0  # seconds: long enough that `burst` waits for the answer
+THREE_CAMERAS = "real_r1_pro_sharpa_relative_eef"
 
 
 def observation(dump: dict) -> tuple[str, list[tuple[str, bytes]], dict]:
@@ -148,6 +149,16 @@ def malformed(url: str, obs, seed: int) -> dict[str, int]:
                           files=[("files", f) for f in files], timeout=600)
         status[name] = r.status_code
     return status
+
+
+def three_cameras(pre: Gr00tN17Preprocessor, obs) -> tuple:
+    """``obs`` as a three-camera robot sends it, the widest shape the checkpoint ships. Its end-effector
+    state is the recorded one: all zeros is a degenerate rotation, which the decode refuses."""
+    text, frames, kwargs = obs
+    views, steps = pre.frame_layout(THREE_CAMERAS)
+    state = {k: kwargs["state"]["eef_9d"] if "eef" in k else [[[0.0] * pre.action_dims[THREE_CAMERAS][k]]]
+             for k in pre.state_keys[THREE_CAMERAS]}
+    return text, frames[:1] * (len(views) * steps), {"embodiment_tag": THREE_CAMERAS, "state": state}
 
 
 def metric(url: str, name: str, label: str = "") -> float:
@@ -281,12 +292,15 @@ def main() -> int:
         report["serves_after_malformed"] = send(client, obs, seed) == payload
         storm = report["abort_storm"] = abort_storm(url, obs, seed)
         report["serves_after_aborts"] = client.health() and send(client, obs, seed) == payload
-        # a length no graph holds runs eager, on the workspaces capture sealed: a plan there can't grow them
-        uncaptured = ("pick up the banana and place it in the bowl", *obs[1:])
-        burst(url, uncaptured, seed, [ANSWER] * 8)
-        report["uncaptured_finite"] = all(np.isfinite(g).all() for g in decode(send(client, uncaptured, seed)).values())
-        for key in ("repeat_identical", "stream_identical", "serves_after_malformed", "serves_after_aborts",
-                    "uncaptured_finite"):
+        # a shape no graph holds runs eager, on the workspaces capture sealed: a plan there can't grow them
+        report["uncaptured"] = {}
+        for shape in (("pick up the banana and place it in the bowl", *obs[1:]), three_cameras(pre, obs)):
+            burst(url, shape, seed, [ANSWER] * 8)
+            got, tag = decode(send(client, shape, seed)), shape[2]["embodiment_tag"].lower()
+            report["uncaptured"][tag] = {k: list(v.shape) for k, v in got.items()}
+            if list(got) != list(pre.action_dims[tag]) or not all(np.isfinite(v).all() for v in got.values()):
+                failures.append(f"uncaptured {tag}: {report['uncaptured'][tag]}")
+        for key in ("repeat_identical", "stream_identical", "serves_after_malformed", "serves_after_aborts"):
             if not report[key]:
                 failures.append(key)
         failures += [f"{k}: {v}, not 400" for k, v in report["malformed_status"].items() if v != 400]
