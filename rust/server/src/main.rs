@@ -284,6 +284,11 @@ async fn admission(
     // free the slot while the stream is still being served — the cap would
     // not bound concurrent streams at all. Moving it into the body drops it
     // at end-of-body, uniformly for streaming and non-streaming handlers.
+    // A partial upload must not hold an admission slot forever. This is a
+    // body inactivity timeout, so it does not limit model execution time.
+    let (parts, body) = req.into_parts();
+    let body = tower_http::timeout::TimeoutBody::new(std::time::Duration::from_secs(30), body);
+    let req = axum::http::Request::from_parts(parts, Body::new(body));
     let resp = next.run(req).await;
     let (parts, body) = resp.into_parts();
     let guarded = body.into_data_stream().map(move |chunk| {
@@ -935,10 +940,6 @@ async fn videos_generations(
 }
 
 async fn images_edits(State(st): State<AppState>, mut mp: Multipart) -> Response {
-    let adapter = match resolve(&st, Surface::Images) {
-        Ok(a) => a,
-        Err(r) => return r,
-    };
     // Multipart (image file + prompt + passthrough fields), parsed manually so
     // arbitrary model knobs (e.g. cfg_*_scale) flow through as model_kwargs.
     // `size` is kept: the adapter maps "WxH" onto the model's width / height
@@ -996,6 +997,13 @@ async fn images_edits(State(st): State<AppState>, mut mp: Multipart) -> Response
             extra.insert(name, parsed);
         }
     }
+
+    // Read the multipart body before an early model refusal; leaving it
+    // unread can reset the TCP connection while the client is still uploading.
+    let adapter = match resolve(&st, Surface::Images) {
+        Ok(a) => a,
+        Err(r) => return r,
+    };
 
     let image_bytes = match image_bytes {
         Some(b) if !b.is_empty() => b,
@@ -1874,4 +1882,50 @@ mod tests {
         assert_eq!(events[n - 2]["choices"][0]["delta"]["content"], "\u{FFFD}");
         assert_eq!(events[n - 1]["choices"][0]["finish_reason"], "stop");
     }
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_request_body_releases_admission() {
+        use tower::ServiceExt;
+        let permits = Arc::new(tokio::sync::Semaphore::new(1));
+        let app = Router::new().route("/generate", post(generate))
+            .route_layer(axum::middleware::from_fn_with_state(permits.clone(), admission))
+            .with_state(state(None));
+        let request = axum::http::Request::builder().method("POST").uri("/generate")
+            .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(Body::from_stream(futures::stream::pending::<Result<axum::body::Bytes, std::io::Error>>()))
+            .unwrap();
+        let pending = tokio::spawn(app.oneshot(request));
+        tokio::task::yield_now().await;
+        assert_eq!(permits.available_permits(), 0);
+        tokio::time::advance(std::time::Duration::from_secs(31)).await;
+        tokio::task::yield_now().await;
+        assert!(pending.is_finished(), "an idle upload must not hold admission indefinitely");
+        let (status, _, _) = body(pending.await.unwrap().unwrap()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(permits.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_unsupported_edit_consumes_its_body_before_refusing() {
+        use std::sync::atomic::AtomicUsize;
+        let st = state(None);
+        let req = multipart_request("/v1/images/edits", &[
+            ("image", Some("input.png"), &[1; 4096]), ("prompt", None, b"edit"),
+        ]);
+        let (parts, raw) = req.into_parts();
+        let data = axum::body::to_bytes(raw, usize::MAX).await.unwrap();
+        let expected = data.len();
+        let read = Arc::new(AtomicUsize::new(0));
+        let count = read.clone();
+        let chunks: Vec<_> = data.chunks(64).map(axum::body::Bytes::copy_from_slice).collect();
+        let streamed = futures::stream::iter(chunks).map(move |chunk| {
+            count.fetch_add(chunk.len(), Ordering::SeqCst);
+            Ok::<_, std::io::Error>(chunk)
+        });
+        let req = axum::http::Request::from_parts(parts, Body::from_stream(streamed));
+        let mp = Multipart::from_request(req, &st).await.unwrap();
+        let (status, _, _) = body(images_edits(State(st), mp).await).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(read.load(Ordering::SeqCst), expected);
+    }
+
 }
