@@ -36,6 +36,7 @@ from mstar.engine.resources.sampler.config import SamplingReqConfig
 from mstar.engine.resources.sampler.resource import SamplerResource
 from mstar.engine.resources.step import FULL_ADMIT_NOT_READY, FULL_ADMIT_REBUILD, Segment, StepContext
 from mstar.model.base import LabelLayout, Span
+from mstar.testing_utils.model import StubModel, make_model
 
 PAGE_SIZE = 16
 WALK = "prefill"
@@ -306,10 +307,10 @@ def _boot_engine(resources: dict, split: frozenset = frozenset()) -> Engine:
     return engine
 
 
-def _model(combined: dict | None = None) -> SimpleNamespace:
+def _model(combined: dict | None = None) -> StubModel:
     """Declares a rebuild policy on ``NODE`` and, given ``combined``, batches its walks under a combined walk."""
     policy = SimpleNamespace(walk=WALK, ids_input="text_inputs", sample_output="new_token", loop="decode_loop")
-    return SimpleNamespace(rebuild_policies=lambda: {NODE: policy}, combined_walk_of=lambda: combined or {})
+    return make_model(rebuild_policies=lambda: {NODE: policy}, combined_walk_of=lambda: combined or {})
 
 
 def test_a_resource_supports_no_drop_unless_it_opts_in():

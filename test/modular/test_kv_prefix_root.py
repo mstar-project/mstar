@@ -49,6 +49,7 @@ from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import KVLabel, PrefixKeys, _wrap_node_in_loop
 from mstar.model.submodule_base import ChunkingPolicy
 from mstar.streaming.topology import StreamingGraphEdge
+from mstar.testing_utils.model import StubModel, make_model
 from mstar.validation.resources import _unservable_walks, streamed_partitions
 
 KV = "kv"
@@ -87,7 +88,7 @@ def _stub_transfer(monkeypatch):
     monkeypatch.setattr(manager_mod, "KVTransferManager", _StubTransfer)
 
 
-class _Model:
+class _Model(StubModel):
     """Names a checkpoint and a preprocessing identity, nothing else."""
 
     def __init__(self, checkpoint=None, name="_Model"):
@@ -99,9 +100,6 @@ class _Model:
 
     def preprocess_fingerprint(self):
         return self._name
-
-    def kv_labels(self):
-        return {}
 
 
 class _Declaring(_Model):
@@ -464,7 +462,7 @@ def _laid_out(text_feeds=EMIT_TO_CLIENT, image_feeds=EMIT_TO_CLIENT, image_walk_
     walks = ("prefill", "prefill_image")
     label = KVLabel(keys=PrefixKeys("text_inputs", walks))
     partition = PartitionDefinition(name="LLM", graph_walks=set(graphs), initial_walk="prefill", producer_partitions=[])
-    return SimpleNamespace(
+    return make_model(
         kv_labels=lambda: {KV: {"main": label}}, get_graph_walk_graphs=lambda: graphs,
         get_partitions=lambda: [partition],
         checkpoint_path=lambda: None, preprocess_fingerprint=lambda: "laid out",

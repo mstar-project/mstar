@@ -22,6 +22,7 @@ from mstar.engine.engine import Engine, ExecutingBatch
 from mstar.engine.resources import Residency, StepContext
 from mstar.model.rebuild import RebuildPolicy
 from mstar.model.submodule_base import BatchedModelOutput
+from mstar.testing_utils.model import make_model
 from mstar.worker.host_pool import HostCopy, HostPool, HostSlice
 from mstar.worker.micro_scheduler import CHAIN_LANE, ScheduledBatch
 from mstar.worker.rebuild import KeptIds, RebuildCursor, Rebuilds
@@ -148,7 +149,7 @@ def test_a_request_whose_kept_ids_dont_rebuild_what_its_kv_holds_is_never_droppe
 
 
 def test_a_lockstep_node_keeps_no_ids_and_sets_no_pool_aside():
-    model = SimpleNamespace(rebuild_policies=lambda: {NODE: POLICY}, get_graph_walk_graphs=_graphs)
+    model = make_model(rebuild_policies=lambda: {NODE: POLICY}, get_graph_walk_graphs=_graphs)
 
     rebuilds = _make_rebuilds(model, {"rebuild_host_mb": 1}, {NODE}, {NODE}, torch.device("cpu"))
 

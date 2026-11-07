@@ -40,7 +40,7 @@ from mstar.engine.resources.step import StepContext  # noqa: E402
 from mstar.model.submodule_base import ARNodeInputs  # noqa: E402
 from mstar.observability import catalog  # noqa: E402
 from mstar.observability.recorders import EdgeTransfers, MetricSnapshot  # noqa: E402
-from mstar.streaming.topology import PartitionTopology  # noqa: E402
+from mstar.testing_utils.model import StubModel  # noqa: E402
 from mstar.utils.ipc_format import (  # noqa: E402
     ConductorMessage,
     ConductorMessageType,
@@ -553,12 +553,9 @@ def test_the_data_worker_sends_enable_metrics_before_any_later_request(tmp_path)
     from mstar.api_server.request_types import PreprocessInput
     from mstar.communication.event import EventWakeup
 
-    class _Model:
+    class _Model(StubModel):
         def process_prompt(self, *args, **kwargs):
             return None
-
-        def get_partition_topology(self):
-            return PartitionTopology(partitions=["default"])
 
     sent = []
     facade = PreprocessWorker.__new__(PreprocessWorker)

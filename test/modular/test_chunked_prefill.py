@@ -15,6 +15,7 @@ import torch
 
 from mstar.engine.chunking import ChunkRange
 from mstar.model.submodule_base import ChunkingPolicy, NodeSubmodule
+from mstar.testing_utils.model import make_model
 from mstar.worker.batch_builder import fill_token_budget, fill_token_budget_in_start_order
 
 # ── the token budget ────────────────────────────────────────────────────
@@ -748,7 +749,7 @@ class _Unmeasured(_Chunker):
 
 
 def _chunking_model():
-    return SimpleNamespace(chunking_policy_of=lambda: {
+    return make_model(chunking_policy_of=lambda: {
         ("LLM", "prefill"): ChunkingPolicy(
             walks=("prefill",), chunkable=True, max_batch_tokens=512),
     })

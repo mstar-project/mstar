@@ -23,6 +23,7 @@ from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.graph.base import GraphEdge, GraphNode, Loop
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.submodule_base import DeviceLoopback, NodeSubmodule, TokenStop
+from mstar.testing_utils.model import StubModel
 from mstar.utils.threads import ThreadPool
 from mstar.worker import side_steps
 from mstar.worker.engine_manager import EngineManager, _side_lane_keys, side_stream_nodes
@@ -547,7 +548,7 @@ def _codec_node(name="Codec"):
     )
 
 
-class _Model:
+class _Model(StubModel):
     def __init__(self, walks=None, combined=None):
         if walks is None:
             walks = {"codec_chunk": _codec_node(), "talker_decode": _codec_node("Talker")}
