@@ -2420,6 +2420,7 @@ class Engine:
         prepared = []
         admitted = []
         rows = tuple(group.members[0][1].request_ids)
+        member_walks = dict(zip(group.unit.nodes, group.unit.graph_walks, strict=True))
         leases = {}
         slots = {}
         owners = {}
@@ -2446,7 +2447,7 @@ class Engine:
                 for maker in {a for a, _, _ in (*group.unit.edges, *loop_back)}:
                     producer = self._submodules[maker].submodule
                     kind = type(producer)
-                    walk = group.members[0][1].graph_walk
+                    walk = member_walks[maker]
                     if (kind.postprocess is not NodeSubmodule.postprocess
                             or kind.batch_postprocess is not NodeSubmodule.batch_postprocess
                             or kind.filter_batched_output is not NodeSubmodule.filter_batched_output
@@ -2467,7 +2468,7 @@ class Engine:
                         maker_slot = maker_mgmt.accelerator_graph_runner.slot_for(leases[maker])
                         if maker_slot.static_outputs.per_rid_outputs:
                             guard.refuse("a producer changes its routed outputs outside capture")
-                        output = maker_mgmt.submodule.repeat_carry(batch.graph_walk, {signal})[signal].output
+                        output = maker_mgmt.submodule.repeat_carry(member_walks[maker], {signal})[signal].output
                         source = (maker_slot.static_outputs.row_outputs or {}).get(output)
                         if source is None or source.ndim == 0 or source.shape[0] < len(rows):
                             guard.refuse(f"{maker}/{signal} has no captured row output")
@@ -2645,7 +2646,7 @@ class Engine:
                     for maker, consumer, signal, rid in back_keys:
                         mgmt = self._submodules[maker]
                         slot = mgmt.accelerator_graph_runner.slot_for(leases[maker])
-                        name = mgmt.submodule.repeat_carry(group.members[0][1].graph_walk, {signal})[signal].output
+                        name = mgmt.submodule.repeat_carry(member_walks[maker], {signal})[signal].output
                         source = (slot.static_outputs.row_outputs or {}).get(name)
                         if (slot.static_outputs.per_rid_outputs or source is None or source.ndim == 0
                                 or source.shape[0] < len(rows)):

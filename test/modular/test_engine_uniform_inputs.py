@@ -18,7 +18,8 @@ from mstar.engine.resources.step import BucketKey, SlotLease  # noqa: E402
 from mstar.model.submodule_base import ARNodeInputs  # noqa: E402
 
 
-def _connected_engine(transform=None, *, head_state=False, mixed=False, device="cpu", width=2):
+def _connected_engine(transform=None, *, head_state=False, mixed=False, device="cpu", width=2,
+                      walks=("prefill", "prefill")):
     """Real ordinary preparation/plan/collect, with replay standing in for CUDA."""
     from mstar.engine.accelerator_graph_runner import AcceleratorGraphSlot
     from mstar.engine.engine import ExecutingBatch, ExecutionGroup, SubmoduleManagement
@@ -72,17 +73,17 @@ def _connected_engine(transform=None, *, head_state=False, mixed=False, device="
     eng._submodules = {}
     members = []
     leases = {}
-    for name in ("a", "b"):
+    for name, walk in zip(("a", "b"), walks, strict=True):
         # Three captured rows, two real rows: stale producer padding must
         # never replace the consumer template's padding.
         config = BatchedAcceleratorGraphConfig(
-            capture_graph_walk="prefill",
+            capture_graph_walk=walk,
             single_request_inputs=(ARNodeInputs(input_embeds=torch.ones(1, width, device=device).mul(9))
                                    if mixed and name == "b" else
                                    NodeInputs(tensor_inputs={"x": torch.ones(1, width, device=device).mul(9)})),
         )
         runner = AcceleratorGraphRunner.__new__(AcceleratorGraphRunner)
-        bucket = BucketKey("prefill", 3, 0)
+        bucket = BucketKey(walk, 3, 0)
         leases[name] = SlotLease(0, bucket, name)
         inputs = torch.zeros(4 if name == "b" and mixed else 3, width, device=device)
         output = torch.full_like(inputs, -999)
@@ -119,13 +120,13 @@ def _connected_engine(transform=None, *, head_state=False, mixed=False, device="
         eng._submodules[name] = mgmt
         batch = ExecutingBatch(
             node_name=name, per_request_info={rid: SimpleNamespace(request_id=rid) for rid in (2, 1)},
-            step_context=StepContext((2, 1), "prefill", 0, False),
+            step_context=StepContext((2, 1), walk, 0, False),
             per_request_input_tensors=(
                 {rid: {"x": [torch.full((1, width), rid * 1., device=device)]} for rid in (2, 1)}
                 if name == "a" else {}
             ),
         )
-        members.append((ScheduledBatch(name, "prefill", {2: 1, 1: 1}), batch))
+        members.append((ScheduledBatch(name, walk, {2: 1, 1: 1}), batch))
     eng._chunking = ChunkingManagement(eng._submodules)
 
     def reserve(batch):
@@ -134,7 +135,7 @@ def _connected_engine(transform=None, *, head_state=False, mixed=False, device="
         return lease
 
     eng.reserve_replay_slot = reserve
-    unit = ExecutionUnit((1, 1), ("prefill", "prefill"), ("a", "b"), (("a", "b", "x"),), ((), ("x",)))
+    unit = ExecutionUnit((1, 1), walks, ("a", "b"), (("a", "b", "x"),), ((), ("x",)))
     group = ExecutionGroup(unit, 1, tuple(members))
     return eng, group, events
 
@@ -185,6 +186,21 @@ def test_connected_members_launch_once_with_ordered_real_and_future_rows(mixed, 
     group.parts[0].slot.static_outputs.row_outputs["x"].fill_(-1)
     assert outputs[0].per_rid_outputs[2]["x"][0].tolist() == [[12., 12.]]
 
+
+
+def test_connected_output_binding_uses_the_producers_own_walk():
+    from mstar.model.submodule_base import CarryPair
+
+    eng, group, events = _connected_engine(walks=("producer", "consumer"))
+    producer = eng._submodules["a"].submodule
+    producer.repeat_carry = lambda walk, signals: {
+        signal: CarryPair("x" if walk == "producer" else "absent", signal) for signal in signals
+    }
+    outputs = eng.exec_group(group)
+    eng.release_group(group)
+    assert group.submitted and group.refusal is None
+    assert outputs[1].per_rid_outputs[2]["x"][0].tolist() == [[112., 112.]]
+    assert events == ["a", "b", "release:b", "release:a"]
 
 @pytest.mark.parametrize("transform,width", [
     (lambda x: x + 1, 2),
