@@ -41,6 +41,9 @@ _FI_MAX_TOKENS = 512
 _W8A8_API = hasattr(F, "scaled_mm") and hasattr(F, "ScalingType")
 _W8A8_OK: dict[torch.device, bool] = {}
 _FI_OK: dict[torch.device, bool] = {}
+# flashinfer's Blackwell (sm_100 / sm_103) groupwise fp8 GEMM, probed per device: neither of the SM90 paths above
+# (flashinfer's swapAB GEMM, cuBLAS's block-scaled scaled_mm) runs there, so without it Blackwell is all w8a16
+_BW_OK: dict[torch.device, bool] = {}
 # Split-K arrival counters, one per output tile; every launch leaves them at zero.
 _COUNTERS: dict[torch.device, torch.Tensor] = {}
 _MAX_TILES = 4096
@@ -53,6 +56,11 @@ def _w8a16_unavailable(target) -> str | None:
 def _fi_unavailable(target) -> str | None:
     reserve(target.device)
     return None if _FI_OK.get(target.device) else "flashinfer's SM90 block-scale GEMM does not run here"
+
+
+def _bw_unavailable(target) -> str | None:
+    reserve(target.device)
+    return None if _BW_OK.get(target.device) else "flashinfer's Blackwell groupwise fp8 GEMM does not run here"
 
 
 def _cublas_unavailable(target) -> str | None:
@@ -68,6 +76,9 @@ FP8_LINEAR = register(KernelOp(
                  "none for the built-in tile of the token count"),
         Impl("flashinfer", _fi_unavailable, doc="flashinfer's SM90 block-scale GEMM, x quantized per 128 columns"),
         Impl("cublas", _cublas_unavailable, doc="cuBLAS's block-scaled GEMM, x quantized per 128 columns"),
+        Impl("groupwise", _bw_unavailable,
+             doc="flashinfer's Blackwell (sm_100 / sm_103) groupwise GEMM, x quantized per 128 columns; N in "
+                 "whole 128-row blocks"),
     ),
     doc="a block-fp8 (128 x 128 scales) dense linear: N outputs (per half with glu), K inputs, glu 1 for "
         "a [gate; up] weight's SwiGLU; rows by token count",
@@ -262,6 +273,7 @@ def reserve(device: torch.device | str) -> None:
         _COUNTERS[device] = torch.zeros(_MAX_TILES, dtype=torch.int32, device=device)
         _FI_OK[device] = _probe_fi(device)
         _W8A8_OK[device] = _probe_w8a8(device)
+        _BW_OK[device] = _probe_bw(device)
 
 
 def _probe_w8a8(device: torch.device) -> bool:
@@ -276,6 +288,21 @@ def _probe_w8a8(device: torch.device) -> bool:
     except Exception as exc:  # noqa: BLE001 - NotImplementedError off SM90 / old cuBLASLt
         logger.warning("cuBLAS block-scaled fp8 GEMM unavailable (%r); dense fp8 above %d "
                        "tokens takes the w8a16 kernel", exc, _FI_MAX_TOKENS)
+        return False
+
+
+def _probe_bw(device: torch.device) -> bool:
+    """flashinfer's Blackwell groupwise fp8 GEMM runs here (and is JIT-loaded before any capture)."""
+    capability = current_platform.cuda_capability(device)
+    if capability is None or capability[0] != 10:
+        return False
+    try:
+        x = torch.zeros(4, 128, dtype=torch.bfloat16, device=device)
+        _bw(x, torch.zeros(128, 128, dtype=torch.uint8, device=device), torch.ones(1, 1, device=device), False)
+        return True
+    except Exception as exc:  # noqa: BLE001 - not built for this GPU / flashinfer version: w8a16 instead
+        logger.warning("flashinfer's Blackwell groupwise fp8 GEMM unavailable (%r); dense fp8 takes the w8a16 "
+                       "kernel at every token count", exc)
         return False
 
 
@@ -414,6 +441,29 @@ def _w8a8(x, w, s, block_size, glu):
     return out
 
 
+def _bw(x, w, s, glu):
+    """flashinfer's Blackwell groupwise fp8 GEMM (CUTLASS, sm_100 / sm_103): x group-quantized to e4m3 per 128
+    columns, its scales K-major and column-major ``(M, K / 128)`` as the kernel wants them (the token count padded
+    to a multiple of 4), the weight's ``(N / 128, K / 128)`` scales row-major as stored. Two SMs per MMA from 256
+    tokens, as flashinfer recommends."""
+    from flashinfer.gemm import gemm_fp8_nt_groupwise
+
+    from mstar.utils.fused_moe.kernels import act_and_mul_triton
+    from mstar.utils.fused_moe.prefill import _group_quant
+
+    M = x.shape[0]
+    xp = F.pad(x, (0, 0, 0, -M % 4)) if M % 4 else x
+    a, a_scale = _group_quant(xp, 128)
+    h = gemm_fp8_nt_groupwise(a, w.view(FP8_DTYPE), a_scale.t().contiguous().t(), s,
+                              scale_major_mode="K", mma_sm=2 if M >= 256 else 1,
+                              scale_granularity_mnk=(1, 128, 128), out_dtype=x.dtype)[:M]
+    if not glu:
+        return h
+    out = torch.empty(M, h.shape[1] // 2, dtype=x.dtype, device=x.device)
+    act_and_mul_triton(h, out, activation="silu")
+    return out
+
+
 def _fi(x, w, s, glu):
     """flashinfer's SM90 block-scale GEMM; it group-quantizes x per 128 columns itself."""
     from flashinfer.gemm import fp8_blockscale_gemm_sm90
@@ -439,7 +489,11 @@ def _table_rows(device: torch.device, n: int, k: int, glu: bool):
 
 def _builtin(device: torch.device, n: int, k: int, glu: bool, m: int) -> str:
     """GLM-5.2's dispatch on any GPU: w8a16 up to its token limit, flashinfer to _FI_MAX_TOKENS
-    where it runs, then cuBLAS where it runs, else w8a16."""
+    where it runs, then cuBLAS where it runs, else w8a16. On Blackwell, where neither SM90 path
+    runs, flashinfer's groupwise GEMM takes every token count of a shape in whole 128-row blocks
+    (a table row for the GPU overrides it per token count)."""
+    if _BW_OK.get(device) and (n * (2 if glu else 1)) % 128 == 0:
+        return "groupwise"
     if m <= _W8A16_MAX_TOKENS_BY_SHAPE.get((n, k, glu), _W8A16_MAX_TOKENS):
         return "w8a16"
     if m <= _FI_MAX_TOKENS and _FI_OK.get(device):
@@ -458,7 +512,8 @@ def _choose(device: torch.device, n: int, k: int, glu: bool, m: int, block_size=
         bounds, choices = rows
         choice = choices[bisect.bisect_left(bounds, m)]
         if (choice.impl == "w8a16" or (choice.impl == "flashinfer" and _FI_OK.get(device))
-                or (choice.impl == "cublas" and _W8A8_OK.get(device))):
+                or (choice.impl == "cublas" and _W8A8_OK.get(device))
+                or (choice.impl == "groupwise" and _BW_OK.get(device) and (n * (2 if glu else 1)) % 128 == 0)):
             return choice.impl, choice.config
     return _builtin(device, n, k, glu, m), None
 
@@ -476,6 +531,8 @@ def _linear(x, w, s, block_size, glu):
         return _fi(x, w, s, glu)
     if impl == "cublas":
         return _w8a8(x, w, s, block_size, glu)
+    if impl == "groupwise":
+        return _bw(x, w, s, glu)
     return _w8a16(x, w, s, block_size, glu, config)
 
 
