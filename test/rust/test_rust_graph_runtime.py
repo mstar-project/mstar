@@ -1023,6 +1023,7 @@ def test_worker_claim_runs_the_ordinary_engine_members_and_settles_rust_once(ref
                 loop_strides=[2 if loop else 1] * 2,
             ))
         assert rt.get_ready_nodes(set()) == []
+        eng.release_group(group)
         assert events == ["a", "b"] * (2 if loop else 1) + ["release:b", "release:a"]
         assert all(scheduled.repeats == (2 if loop else 1) for scheduled, _ in group.members)
         assert not worker._step_repeats or not worker._step_repeats.may_repeat("b", WALK)
