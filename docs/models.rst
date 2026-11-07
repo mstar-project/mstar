@@ -761,6 +761,8 @@ CosyVoice3 notes
   back to re-solving every frame. The default pool holds that for 32 requests,
   about 41 GiB. ``flow_cache_frames: 0`` turns it off, and so does a float32
   estimator, which FlashInfer's kernels can't run.
+- ``configs/cosyvoice3_split.yaml`` runs the flow and vocoder on their own
+  worker on the same GPU, with MPS and batches of 16, for throughput.
 - Keep the reference clip short, a few seconds like CosyVoice's own 3.5 s
   prompt clip: with a 23 s clip as the preset, round-trip word error rate rose
   from 1.4% to 13.4%, with words dropped mid-sentence.
