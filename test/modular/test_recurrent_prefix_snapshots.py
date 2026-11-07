@@ -38,6 +38,7 @@ from mstar.engine.resources.spec import CombinedSplit, NodeResourceSpec
 from mstar.engine.resources.step import Segment, StepContext
 from mstar.graph.base import GraphNode
 from mstar.model.base import KVLabel, PrefixKeys
+from mstar.testing_utils.model import StubModel
 from mstar.validation.resources import _unskippable_resources
 
 NODE, WALK, PAGE = "llm", "prefill", 4
@@ -299,11 +300,8 @@ class _StubTransfer:
         pass
 
 
-class _Keyed:
+class _Keyed(StubModel):
     """Keys ``main`` on ``kv`` from the prompt walk, decode extending it."""
-
-    def checkpoint_path(self):
-        return None
 
     def preprocess_fingerprint(self):
         return "_Keyed"

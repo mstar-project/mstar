@@ -35,6 +35,7 @@ from mstar.api_server.request_types import (
 )
 from mstar.communication.event import EventWakeup
 from mstar.profile.format import RequestProfile, RequestTiming
+from mstar.testing_utils.model import StubModel
 from mstar.utils.ipc_format import ConductorMessageType, FailRequests
 from mstar.worker.micro_scheduler import CHAIN_LANE, MicroScheduler, ScheduledBatch
 from mstar.worker.worker import PendingBatch, Worker
@@ -283,7 +284,7 @@ def test_output_postprocess_failure_becomes_an_error_chunk():
     """A model that blows up postprocessing a result tensor must fail that
     request, not silently drop the chunk and leave the client hanging."""
 
-    class _BadModel:
+    class _BadModel(StubModel):
         def postprocess(self, tensor, modality, request_kwargs=None):
             raise RuntimeError("decode failed")
 
@@ -314,7 +315,7 @@ def test_a_failed_output_releases_the_outputs_held_behind_it():
     fails, its error chunk must take slot 0 so 1 is released in order; emitted
     around the buffer, 1 would sit in ``pending`` until the API server's TTL."""
 
-    class _BadModel:
+    class _BadModel(StubModel):
         def postprocess(self, tensor, modality, request_kwargs=None):
             raise RuntimeError("decode failed")
 

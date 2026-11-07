@@ -28,6 +28,7 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 from mstar.api_server.entrypoint import APIServer  # noqa: E402
 from mstar.api_server.served_models import ServedModels  # noqa: E402
+from mstar.testing_utils.model import StubModel  # noqa: E402
 
 
 class _Chunk:
@@ -37,7 +38,7 @@ class _Chunk:
         self.metadata = metadata or {}
 
 
-class _StubModel:
+class _StubModel(StubModel):
     def get_output_sample_rate(self, modality="audio"):
         return 24000
 
