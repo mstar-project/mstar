@@ -31,17 +31,14 @@ ALLOWED = {
     ("mstar.engine.accelerator_graph_config", name): _CAPTURE
     for name in (
         "AcceleratorGraphConfig", "BatchedAcceleratorGraphConfig", "DETERMINISTIC_COMPILE_MODE",
-        "PackedAcceleratorGraphConfig", "PiecewiseAcceleratorGraphConfig", "PiecewiseCallInputs",
-        "PiecewiseCaptureShape", "PiecewisePackedConfig", "decode_rows_then_prompt", "geometric_batch_sizes",
+        "PackedAcceleratorGraphConfig", "PiecewiseCallInputs", "geometric_batch_sizes",
     )
 } | {
-    ("mstar.engine.resources.spec", "CombinedSplit"): "a value of kernel_settings(), until the engine picks kernels",
     ("mstar.engine.engine", "ExecutingBatch"): "the annotation of `NodeSubmodule.can_batch`, a base class's hook",
     ("mstar.engine.resources.lora.checkpoint", "LoraFile"): "a model's static LoRA merge at load, which holds no state",
 }
 # Graph breaks a ported package keeps, by file and function, since no state call sits behind them.
 ALLOWED_BREAKS = {
-    ("mstar/model/qwen3_omni/submodules.py", "_replay_block_loop"): "a captured region's replay, which is eager whole",
     ("mstar/model/qwen3_omni/components/code2wav.py", "forward"): "the vocoder's transformer, which keeps no state",
 }
 
@@ -122,9 +119,9 @@ def test_the_lint_passes_the_contract_itself():
 
 
 def test_the_lint_lets_a_named_function_keep_its_break_and_no_other():
-    source = "@torch.compiler.disable\ndef _replay_block_loop(): pass\n@torch.compiler.disable\ndef other(): pass\n"
-    found, used = _violations(source, "mstar/model/qwen3_omni/submodules.py")
-    assert used == {("mstar/model/qwen3_omni/submodules.py", "_replay_block_loop")}
+    source = "@torch.compiler.disable\ndef forward(): pass\n@torch.compiler.disable\ndef other(): pass\n"
+    found, used = _violations(source, "mstar/model/qwen3_omni/components/code2wav.py")
+    assert used == {("mstar/model/qwen3_omni/components/code2wav.py", "forward")}
     assert len(found) == 1 and "at line 3" in found[0]
 
 

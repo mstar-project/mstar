@@ -36,6 +36,7 @@ from mstar.graph.runtime.base import ColumnarEdgeSpecs, RouteInput, SendInput
 from mstar.model.base import ForwardPassArgs, WorkerGraph
 from mstar.streaming.chunk_policy import FixedChunkPolicy
 from mstar.streaming.stream_buffer import StreamBuffer
+from mstar.testing_utils.model import StubModel
 from mstar.utils.containers import ParallelList
 from mstar.utils.ipc_format import (
     ConductorMessageType,
@@ -129,7 +130,7 @@ class _Producer:
         return to_consumer[0], to_conductor[0]
 
 
-class _EndsLLM:
+class _EndsLLM(StubModel):
     """The LLM partition ends on its ``passes``-th pass."""
 
     def __init__(self, passes):

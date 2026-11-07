@@ -41,7 +41,8 @@ from mstar.model.base import (
 )
 from mstar.model.orpheus.config import OrpheusModelConfig
 from mstar.model.orpheus.orpheus_model import OrpheusModel
-from mstar.streaming.topology import PartitionTopology, StreamingGraphEdge
+from mstar.streaming.topology import StreamingGraphEdge
+from mstar.testing_utils.model import StubModel
 from mstar.utils.ipc_format import NewRequestConductor
 
 PAGE_SIZE = 16
@@ -74,8 +75,7 @@ class _StubTensorManager:
         pass
 
 
-class _Model:
-
+class _Model(StubModel):
     def __init__(
         self, declares: bool = True, metadata: dict | None = None,
         decode_walk: str | None = None, lays_out: bool = True,
@@ -85,9 +85,6 @@ class _Model:
         self._decode_walk = decode_walk
         self._lays_out = lays_out
 
-    def get_partition_topology(self):
-        return PartitionTopology(partitions=["default"])
-
     def kv_labels(self):
         if not self._declares:
             return {}
@@ -95,9 +92,6 @@ class _Model:
         return {"kv": {"main": KVLabel(growth=growth, keys=PrefixKeys(
             "text_inputs", ("prefill",), growth=self._decode_walk is not None,
         ))}}
-
-    def max_input_files(self):
-        return {}
 
     def checkpoint_path(self):
         # a model that names no checkpoint and sets no salt keys nothing
@@ -346,7 +340,7 @@ def test_each_resource_config_is_handed_only_its_own_chain():
 
 
 def test_a_cache_every_engine_holding_it_keeps_shut_is_not_keyed():
-    class _Thinker:
+    class _Thinker(StubModel):
         """A cache on a two-rank node without prefix_cache_tp, so its engines keep it shut."""
 
         def declare_state(self):
